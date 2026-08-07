@@ -40,6 +40,9 @@ comptime MAX_HIDDEN = 8192
 # zabiera zajętość WSZYSTKIM kernelom dp4a, a `ffn_down` na ścieżce dp4a zyskuje
 # przy tym 0,1 tok/s — bilans wychodzi mocno na minus.
 comptime X_MAX = 16384
+
+# Superblocks whose weight loads a decode dot issues before consuming any.
+comptime DOT_UNROLL = 4
 comptime XDS_MAX = X_MAX // 32 * 2
 comptime XDS_HID = MAX_HIDDEN // 32 * 2
 
@@ -293,21 +296,66 @@ def _dot_q4k_i8(
     var acc: Float32 = 0.0
     var min_acc: Float32 = 0.0
     var b = lane // 16
+
+    # DOT_UNROLL superblocks' worth of weight loads are issued before any of
+    # them is consumed. The profiler charged this dot 53,14 stalled
+    # instructions per issue to `long_scoreboard` at 11,8% issue activity: a
+    # decode GEMV is not short of bandwidth, it is short of REQUESTS IN FLIGHT,
+    # and one superblock at a time keeps only four or five per warp against the
+    # dozens the latency needs. The accumulation order is unchanged — the
+    # unrolled body adds b, then b + 2, in that order — so the answer is bit for
+    # bit what the rolled loop gave.
+    while b + (DOT_UNROLL - 1) * 2 < blocks_per_row:
+        var dm = InlineArray[SIMD[DType.float16, 2], DOT_UNROLL](
+            fill=SIMD[DType.float16, 2](0)
+        )
+        var v0 = InlineArray[Int32, DOT_UNROLL](fill=0)
+        var v1 = InlineArray[Int32, DOT_UNROLL](fill=0)
+        var scs = InlineArray[SIMD[DType.float32, 2], DOT_UNROLL](
+            fill=SIMD[DType.float32, 2](0)
+        )
+        var mns = InlineArray[SIMD[DType.float32, 2], DOT_UNROLL](
+            fill=SIMD[DType.float32, 2](0)
+        )
+        comptime for u in range(DOT_UNROLL):
+            off = row_base + (b + u * 2) * 144
+            dm[u] = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
+            qp = (w + off + 16 + j * 32 + 4 * w4).bitcast[Int32]()
+            v0[u] = qp[0]
+            v1[u] = qp[4]
+            scs[u], mns[u] = _q4k_scale_pair(w, off, j)
+        comptime for u in range(DOT_UNROLL):
+            seg = (b + u * 2) * 8 + 2 * j
+            u0a = xqi[seg * 8 + w4]
+            u0b = xqi[seg * 8 + w4 + 4]
+            u1a = xqi[seg * 8 + 8 + w4]
+            u1b = xqi[seg * 8 + 12 + w4]
+            s_lo = _dp4a(v1[u] & 0x0F0F0F0F, u0b, _dp4a(v0[u] & 0x0F0F0F0F, u0a, 0))
+            s_hi = _dp4a(
+                (v1[u] >> 4) & 0x0F0F0F0F, u1b, _dp4a((v0[u] >> 4) & 0x0F0F0F0F, u1a, 0)
+            )
+            d = Float32(dm[u][0])
+            acc += d * scs[u][0] * xds[2 * seg] * Float32(s_lo)
+            acc += d * scs[u][1] * xds[2 * seg + 2] * Float32(s_hi)
+            if w4 == 0:
+                min_acc += Float32(dm[u][1]) * (
+                    mns[u][0] * xds[2 * seg + 1] + mns[u][1] * xds[2 * seg + 3]
+                )
+        b += DOT_UNROLL * 2
+
     while b < blocks_per_row:
         off = row_base + b * 144
-        dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
-        d = Float32(dm[0])
-        dmin = Float32(dm[1])
+        dm1 = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
+        d = Float32(dm1[0])
+        dmin = Float32(dm1[1])
         sc, mn = _q4k_scale_pair(w, off, j)
         qp = (w + off + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-        v0 = qp[0]
-        v1 = qp[4]
         # Low nibbles = segment 2j, high nibbles = segment 2j+1 of the
         # 32-byte chunk; each lane dots 2x8 int8 columns of each.
-        lo0 = v0 & 0x0F0F0F0F
-        lo1 = v1 & 0x0F0F0F0F
-        hi0 = (v0 >> 4) & 0x0F0F0F0F
-        hi1 = (v1 >> 4) & 0x0F0F0F0F
+        lo0 = qp[0] & 0x0F0F0F0F
+        lo1 = qp[4] & 0x0F0F0F0F
+        hi0 = (qp[0] >> 4) & 0x0F0F0F0F
+        hi1 = (qp[4] >> 4) & 0x0F0F0F0F
         seg = b * 8 + 2 * j
         u0a = xqi[seg * 8 + w4]
         u0b = xqi[seg * 8 + w4 + 4]
@@ -625,7 +673,8 @@ def gemv_q4_k_dp4a_f16(
         y[row] = Float16(total)
 
 
-def gemv_q4_k_dp4a_persist_f16(
+@always_inline
+def gemv_q4_k_dp4a_persist_impl[XCAP: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
@@ -650,10 +699,10 @@ def gemv_q4_k_dp4a_persist_f16(
     """
     tid = Int(thread_idx.x)
     xq = stack_allocation[
-        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+        XCAP, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
     xds = stack_allocation[
-        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+        XCAP // 32 * 2, Float32, address_space = AddressSpace.SHARED
     ]()
     _stage_quant_global(x, xq, xds, n_cols, tid)
     lane = tid % WARP
@@ -665,6 +714,15 @@ def gemv_q4_k_dp4a_persist_f16(
         if lane == 0:
             y[row] = Float16(total)
         row += stride
+
+
+# The staging array is what decides how many blocks an SM holds: sized for the
+# widest activation this path allows it reserves 20 KiB a block, and every model
+# measured here needs a quarter of that. The narrow variant is not a different
+# kernel — same arithmetic, same bit-for-bit answer — it just does not reserve
+# what its shape cannot use.
+comptime gemv_q4_k_dp4a_persist_f16 = gemv_q4_k_dp4a_persist_impl[X_MAX]
+comptime gemv_q4_k_dp4a_persist_x4k_f16 = gemv_q4_k_dp4a_persist_impl[4096]
 
 
 def gemv_q4_k_dp4a_f16_gidx(

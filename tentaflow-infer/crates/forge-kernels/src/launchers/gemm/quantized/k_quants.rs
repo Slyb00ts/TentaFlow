@@ -815,8 +815,15 @@ impl Kernels {
         let persist = tiles > PERSIST_GRID
             && tiles <= 2048
             && self.artifacts.get("gemv_q4_k_dp4a_persist_f16").is_ok();
+        // The narrow staging variant reserves a quarter of the shared memory
+        // and so lets an SM hold four times the blocks — which at decode, where
+        // the dot waits on memory rather than on arithmetic, is the same thing
+        // as four times the requests in flight.
         let k = if persist {
-            self.artifacts.get("gemv_q4_k_dp4a_persist_f16")?
+            match self.artifacts.get("gemv_q4_k_dp4a_persist_x4k_f16") {
+                Ok(narrow) if cols <= 4096 => narrow,
+                _ => self.artifacts.get("gemv_q4_k_dp4a_persist_f16")?,
+            }
         } else {
             self.artifacts.get("gemv_q4_k_dp4a_f16")?
         };

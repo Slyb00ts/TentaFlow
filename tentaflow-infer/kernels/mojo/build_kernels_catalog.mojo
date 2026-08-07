@@ -456,6 +456,7 @@ from src.decode_dp4a import (
     gemv_q4_k_dp4a_out_f32,
     gemv_q8_0_dp4a_out_f32,
     gemv_q4_k_dp4a_f16_gidx,
+    gemv_q4_k_dp4a_persist_x4k_f16,
     gemv_q4_k_dp4a_f16_gidx_batch,
     gemv_q6_k_dp4a_f16_gidx,
     gemv_q6_k_dp4a_f16_gidx_batch,
@@ -2888,6 +2889,12 @@ def main() raises:
         gemv_q8_0_dp4a_out_f32, dump_asm=Path("gemv_q8_0_dp4a_out_f32.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_q8_0_dp4a_out_f32"))
+
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_persist_x4k_f16,
+        dump_asm=Path("gemv_q4_k_dp4a_persist_x4k_f16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_persist_x4k_f16"))
 
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_f16_gidx, dump_asm=Path("gemv_q4_k_dp4a_f16_gidx.ptx")

@@ -6,16 +6,16 @@
 .target sm_121a
 .address_size 64
 
-	// .globl	src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f
-// src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_$__global_alloc_0_$__gpu_shared_mem has been demoted
-// src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_$__global_alloc_1_$__gpu_shared_mem has been demoted
+	// .globl	src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad
+// src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_$__global_alloc_0_$__gpu_shared_mem has been demoted
+// src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_$__global_alloc_1_$__gpu_shared_mem has been demoted
 
-.visible .entry src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f(
-	.param .u64 .ptr .align 1 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_0,
-	.param .u64 .ptr .align 1 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_1,
-	.param .u64 .ptr .align 1 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_2,
-	.param .u64 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_3,
-	.param .u64 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_4
+.visible .entry src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad(
+	.param .u64 .ptr .align 1 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_0,
+	.param .u64 .ptr .align 1 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_1,
+	.param .u64 .ptr .align 1 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_2,
+	.param .u64 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_3,
+	.param .u64 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_4
 )
 {
 	.reg .pred 	%p<15>;
@@ -23,11 +23,11 @@
 	.reg .b32 	%r<562>;
 	.reg .b64 	%rd<113>;
 	// demoted variable
-	.shared .align 64 .b8 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_$__global_alloc_0_$__gpu_shared_mem[16384];
+	.shared .align 64 .b8 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_$__global_alloc_0_$__gpu_shared_mem[4096];
 	// demoted variable
-	.shared .align 4 .b8 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_$__global_alloc_1_$__gpu_shared_mem[4096];
-	ld.param.b64 	%rd42, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_4];
-	ld.param.b64 	%rd41, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_3];
+	.shared .align 4 .b8 src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_$__global_alloc_1_$__gpu_shared_mem[1024];
+	ld.param.b64 	%rd42, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_4];
+	ld.param.b64 	%rd41, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_3];
 	mov.u32 	%r39, %tid.x;
 	cvt.u64.u32 	%rd4, %r39;
 	shr.s64 	%rd5, %rd41, 63;
@@ -40,10 +40,10 @@
 	add.s64 	%rd6, %rd50, %rd48;
 	setp.le.s64 	%p2, %rd6, %rd4;
 	cvt.u32.u64 	%r532, %rd4;
-	mov.b32 	%r533, src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_$__global_alloc_0_$__gpu_shared_mem;
-	mov.b32 	%r534, src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_$__global_alloc_1_$__gpu_shared_mem;
+	mov.b32 	%r533, src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_$__global_alloc_0_$__gpu_shared_mem;
+	mov.b32 	%r534, src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_$__global_alloc_1_$__gpu_shared_mem;
 	@%p2 bra 	$L__BB0_5;
-	ld.param.b64 	%rd44, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_2];
+	ld.param.b64 	%rd44, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_2];
 	cvta.to.global.u64 	%rd1, %rd44;
 	shl.b64 	%rd51, %rd4, 6;
 	add.s64 	%rd104, %rd1, %rd51;
@@ -405,8 +405,8 @@ $L__BB0_5:
 	add.s64 	%rd108, %rd85, %rd84;
 	setp.ge.s64 	%p5, %rd108, %rd42;
 	@%p5 bra 	$L__BB0_41;
-	ld.param.b64 	%rd43, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_0];
-	ld.param.b64 	%rd45, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_7def82dff6db148f_param_1];
+	ld.param.b64 	%rd43, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_0];
+	ld.param.b64 	%rd45, [src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_b3445cdad351e5ad_param_1];
 	cvta.to.global.u64 	%rd2, %rd45;
 	cvta.to.global.u64 	%rd3, %rd43;
 	and.b64 	%rd23, %rd4, 31;
