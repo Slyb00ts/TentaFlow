@@ -1319,3 +1319,40 @@ DOT_UNROLL superbloków przed konsumpcją któregokolwiek. Dla dwóch i dla
 czterech superbloków: 43,3 -> 43,3 i 43,2 tok/s, liczba rejestrów bez zmian
 (56), czyli kompilator i tak nie utrzymał zapowiedzianych odczytów w locie.
 Kod wrócił do postaci zwiniętej.
+
+## Q8_0: gdzie leży następny duży zysk i dlaczego go dziś nie ma
+
+Dekod hybrydy dzieli się tak (`nsys`, 64 kroki): 30,3% `gemv_mxfp4_f16_gidx`,
+28,4% `gemv_q8_0_f16_v2`, **14,1% JEDNO uruchomienie `gemv_q8_0_dp4a` na krok
+(2,36 ms — głowa logitów)** i 12,7% `gemv_q8_0_dp4a` drobnych. Głowa logitów
+sama jest 15% kroku i idzie około 140 GB/s, czyli 59% osiągalnego pasma.
+
+Powód widać w PTX jednym poleceniem:
+
+    gemv_q8_0_dp4a_out_f32:  17 x ld.global.b16,  2 x ld.global.v8.b32
+    gemv_q4_k_dp4a_persist:  15 x b16, 3 x b32, 2 x v2.b64, 1 x v4.b32, 2 x v8.b32
+
+Blok Q8_0 ma 34 bajty, więc ŻADEN blok nie zaczyna się na granicy szesnastu
+bajtów i lane, który go posiada, czyta swoje trzydzieści dwa bajty ładunku
+SZESNASTOMA odczytami dwubajtowymi: sześćdziesiąt cztery bajty na instrukcję
+warpa tam, gdzie `v4.b32` rusza pięćset dwanaście. To ośmiokrotność.
+
+Wyrównać da się dopiero OSIEM bloków: 8 x 34 = 272 = 17 x 16, a `34k mod 16 = 0`
+zachodzi tylko dla `k` podzielnych przez osiem. Grupa ośmiu bloków ma więc
+wszystkie pola pod stałymi przesunięciami i ładunek pojedynczego bloku wycina
+się z trzech wyrównanych kawałków przesunięciami, które kompilator zna.
+Zaimplementowane i zmierzone: 17 x `b16` schodzi do 13 x `v4.b32` + 4 x
+`v2.b64`, rejestry rosną 56 -> 66.
+
+**I to nie weszło, bo rozbija się o mapowanie warp-wiersz.** Lane, który bierze
+całą grupę, obsługuje osiem bloków, więc warp obejmuje 256 bloków = 8192
+kolumny. Głowa logitów tego modelu ma 2048 kolumn, czyli 64 bloki = OSIEM grup:
+osiem lane'ów miałoby pracę, dwadzieścia cztery stałyby. Zmierzone jako brak
+zmiany (62,5 wobec 62,5 tok/s), bo warunek wejścia w tę ścieżkę nigdy nie
+zachodzi na realnym kształcie.
+
+Żeby to wykorzystać, `_dot_q8_0_i8` musiałby oddać jednemu WARPOWI CZTERY
+WIERSZE po osiem lane'ów, a nie jeden wiersz — czyli zmienić kontrakt funkcji
+(dziś zwraca sumę zredukowaną po całym warpie) i redukcję na segmentową.
+To jest następny duży, dobrze umiejscowiony zysk w tym silniku: 27% kroku
+dekodu hybrydy liczone jednym ósmym osiągalnej sprawności instrukcji.
