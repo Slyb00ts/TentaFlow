@@ -2763,10 +2763,12 @@ impl Model {
         // projekcji — bufory muszą pomieścić najszerszą z nich.
         let q_dim = p.max_q_dim();
         let kv_dim = p.max_kv_dim();
+        // Krok partiala to `head_dim + 4` (wektor, maksimum, mianownik i wyrównanie),
+        // a nie `+ 2` — przy 32 partycjach ta różnica wychodzi poza bufor.
         let attn_parts_bytes = p
             .n_heads
             .checked_mul(ATTN_DECODE_GQA_SPLITS)
-            .and_then(|elements| elements.checked_mul(p.head_dim.checked_add(2)?))
+            .and_then(|elements| elements.checked_mul(p.head_dim.checked_add(4)?))
             .and_then(|elements| elements.checked_mul(4))
             .ok_or_else(|| {
                 ForgeError::Format("przepełnienie bufora partiali attention GQA".into())

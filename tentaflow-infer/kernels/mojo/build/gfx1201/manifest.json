@@ -141,9 +141,21 @@
       "entry": "src_attention_attn_decode_spli6A6A6A6A_1639bce33ad8acd5",
       "file": "attn_decode_split_fp8_hd64.hsaco"
     },
+    "attn_decode_split_gqa2_f16_hd256": {
+      "entry": "src_attention_gqa_hd256_attn_d6A6A6A6A_e199686ea8622b88",
+      "file": "attn_decode_split_gqa2_f16_hd256.hsaco"
+    },
+    "attn_decode_split_gqa3_f16_hd256": {
+      "entry": "src_attention_gqa_hd256_attn_d6A6A6A6A_4d8f4080f68edc64",
+      "file": "attn_decode_split_gqa3_f16_hd256.hsaco"
+    },
     "attn_decode_split_gqa4_f16_hd128": {
       "entry": "src_attention_gqa_attn_decode_6A6A6A6A_04ebcfec9b7af78a",
       "file": "attn_decode_split_gqa4_f16_hd128.hsaco"
+    },
+    "attn_decode_split_gqa6_f16_hd256": {
+      "entry": "src_attention_gqa_hd256_attn_d6A6A6A6A_4b51ddb7e9ca465a",
+      "file": "attn_decode_split_gqa6_f16_hd256.hsaco"
     },
     "attn_full_f16_hd128": {
       "entry": "src_attn_full_attn_full_f166A6A6A6AcB6A6A_373175aaa4d9fea7",

@@ -1379,11 +1379,32 @@ impl Kernels {
             !matches!(plan, AttnDecodePlan::Generic(_)),
         )?;
         if !matches!(plan, AttnDecodePlan::Generic(_)) {
-            let partial = self
-                .artifacts
-                .get(&format!("attn_decode_split8_f16_{split_suffix}"))?;
+            // Wariant rozdzielny czyta cache KV RAZ NA GŁOWICĘ Q, więc przy GQA
+            // przemiata go tyle razy, ile głowic ma grupa. Wariant dzielony ma tę
+            // samą matematykę i ten sam układ partiali, tylko siatkę po głowicach
+            // KV — zmierzone na 32k kontekstu: 22 ms na token w samym dekodzie
+            // uwagi, czyli ~95 GB/s przy 551 GB/s osiągalnych.
+            let group = (n_q_heads / n_kv_heads.max(1)).min(n_q_heads);
+            let shared = (head_dim == 256 && n_q_heads.is_multiple_of(n_kv_heads.max(1)))
+                .then(|| format!("attn_decode_split_gqa{group}_f16_hd256"))
+                .filter(|name| self.artifacts.has(name));
+            let partial = match &shared {
+                Some(name) => self.artifacts.get(name)?,
+                None => self
+                    .artifacts
+                    .get(&format!("attn_decode_split8_f16_{split_suffix}"))?,
+            };
             let partial_config = LaunchConfig {
-                grid: (grid_x, grid_y, ATTN_HD256_SPLITS as u32),
+                // Siatka wariantu dzielonego idzie po głowicach KV, bo jedna grupa
+                // robocza obsługuje całą grupę Q.
+                grid: (
+                    grid_x,
+                    match shared {
+                        Some(_) => (n_kv_heads as u32).max(1),
+                        None => grid_y,
+                    },
+                    ATTN_HD256_SPLITS as u32,
+                ),
                 block: (ATTN_HD256_BLOCK, 1, 1),
                 shared_mem_bytes: 0,
             };

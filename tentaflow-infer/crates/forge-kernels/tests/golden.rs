@@ -3027,3 +3027,104 @@ fn gpu_pack_nvfp4_wspolpracuje_z_fp8_gemm_i_gemv() {
         }
     }
 }
+
+/// Dekod uwagi HD256 przy GQA 6:1, czyli geometrii, w której jedna grupa
+/// robocza liczy sześć głowic Q na jednym odczycie K/V.
+///
+/// Wariant rozdzielny czytał cache KV raz na głowicę Q, więc przemiatał go
+/// sześciokrotnie; ten kernel czyta go raz. Test pilnuje matematyki, bo pomyłka
+/// w mapowaniu głowic nie daje błędu — daje ciche liczenie na cudzych danych.
+#[test]
+fn attn_decode_gqa6_hd256_matches_reference() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+
+    let (n_seqs, n_q_heads, n_kv_heads, head_dim) = (2usize, 12usize, 2usize, 256usize);
+    let (page_size, max_pages, n_pages) = (16usize, 4usize, 4usize);
+    let seq_lens = [7i32, 40i32];
+    let scale = 1.0 / (head_dim as f32).sqrt();
+
+    // Strony celowo porozrzucane, żeby test objął też tablicę stron.
+    let mut pt = vec![-1i32; n_seqs * max_pages];
+    pt[0] = 3;
+    pt[max_pages] = 1;
+    pt[max_pages + 1] = 0;
+    pt[max_pages + 2] = 2;
+    let page_of = |s: usize, pos: usize| -> usize {
+        match (s, pos / page_size) {
+            (0, _) => 3,
+            (_, 0) => 1,
+            (_, 1) => 0,
+            _ => 2,
+        }
+    };
+
+    let q: Vec<f32> = (0..n_seqs * n_q_heads * head_dim)
+        .map(|i| f16::from_f32(fill(i) * 0.2).to_f32())
+        .collect();
+    let kv_elems = n_pages * n_kv_heads * page_size * head_dim;
+    let kc: Vec<f32> = (0..kv_elems)
+        .map(|i| f16::from_f32(fill(i + 3) * 0.2).to_f32())
+        .collect();
+    let vc: Vec<f32> = (0..kv_elems)
+        .map(|i| f16::from_f32(fill(i + 11) * 0.2).to_f32())
+        .collect();
+
+    let qb = upload_f16(dev.as_ref(), &q);
+    let ob = upload_f16(dev.as_ref(), &vec![0.0; n_seqs * n_q_heads * head_dim]);
+    let kb = upload_f16(dev.as_ref(), &kc);
+    let vb = upload_f16(dev.as_ref(), &vc);
+    let ptb = dev
+        .alloc(pt.len() * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(bytemuck::cast_slice(&pt), &ptb, 0).unwrap();
+    let slb = dev.alloc(8, MemKind::Device, Pool::Weights).unwrap();
+    dev.write(bytemuck::cast_slice(&seq_lens), &slb, 0).unwrap();
+    let parts = dev
+        .alloc(
+            n_seqs * n_q_heads * 8 * (head_dim + 4) * 4,
+            MemKind::Device,
+            Pool::Weights,
+        )
+        .unwrap();
+    kernels
+        .attn_decode_f16(
+            &ob, &parts, &qb, &kb, &vb, &ptb, &slb, n_seqs, n_q_heads, n_kv_heads, head_dim,
+            page_size, max_pages, scale, 0, &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let got = download_f16(dev.as_ref(), &ob, n_seqs * n_q_heads * head_dim);
+    for (s, &sl) in seq_lens.iter().enumerate() {
+        let ctx_len = sl as usize;
+        for h in 0..n_q_heads {
+            let kvh = h / (n_q_heads / n_kv_heads);
+            let qb_off = (s * n_q_heads + h) * head_dim;
+            let kv_at = |pos: usize| {
+                ((page_of(s, pos) * n_kv_heads + kvh) * page_size + pos % page_size) * head_dim
+            };
+            let scores: Vec<f32> = (0..ctx_len)
+                .map(|pos| {
+                    let kv_off = kv_at(pos);
+                    (0..head_dim).map(|e| q[qb_off + e] * kc[kv_off + e]).sum::<f32>() * scale
+                })
+                .collect();
+            let m = scores.iter().cloned().fold(f32::MIN, f32::max);
+            let denom: f32 = scores.iter().map(|v| (v - m).exp()).sum();
+            for e in 0..head_dim {
+                let num: f32 = (0..ctx_len)
+                    .map(|pos| (scores[pos] - m).exp() * vc[kv_at(pos) + e])
+                    .sum();
+                let want = num / denom;
+                let g = got[qb_off + e];
+                assert!(
+                    (g - want).abs() < 0.01,
+                    "seq {s} head {h} elem {e}: got {g} want {want}"
+                );
+            }
+        }
+    }
+}
+
