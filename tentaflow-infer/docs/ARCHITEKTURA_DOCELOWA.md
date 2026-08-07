@@ -973,3 +973,86 @@ ten sam plik, przed i po:
 
 Dlatego każde porównanie musi pochodzić z JEDNEGO stanu maszyny. Baseline
 odniesienia to teraz `/opt/repos/llama.cpp` 3ef2369 (2026-05-28, ma FP4 MMA).
+
+### Szerokość etapu, a nie szerokość odczytu, była wiązaniem kafla int8
+
+Poszerzenie samego ODCZYTU wagi do 128 ciągłych bajtów nic nie dało: czas 2,29
+ms bez zmian, a ruch L2 stanął na 1,64 GB. Licznik sektorów poszedł nawet w
+górę (10,7 M -> 18,7 M), bo 32-bajtowy odczyt pod adresem podzielnym przez 16
+dotyka dwóch sektorów tam, gdzie ośmiobajtowy dotykał jednego. Wniosek z
+poprzedniej sekcji był więc BŁĘDNY w części przyczynowej: L1 już wcześniej
+pochłaniał krótkie odczyty chunków i to nie one generowały ruch do L2.
+
+Właściwą przyczynę pokazały dopiero liczniki przestojów. Jednostka macierzowa
+pracowała na 6,06% mocy przy 19% aktywności wydawania, a przestoje rozkładały
+się tak (instrukcji na wydanie): `long_scoreboard` 3,93, `barrier` 3,65,
+`mio_throttle` 2,90, `short_scoreboard` 1,76. Kafel nie był głodny pasma ani
+arytmetyki — był głodny PRACY MIĘDZY SYNCHRONIZACJAMI. Przy jednym podbloku na
+etap przechodził barierę co 32 kolumny.
+
+llama.cpp stawia CZTERY bariery na 256 kolumn (`MMQ_ITER_K = 256`, kafel wagi
+sztaplowany raz na superblok, kafel aktywacji dwa razy po 128 kolumn) i NIE MA
+podwójnego buforowania. My mieliśmy osiem barier na te same 256 kolumn.
+
+Etap ma teraz cztery podbloki (128 kolumn) i jeden bufor: dwie bariery na etap,
+czyli 32 na 2048 kolumn zamiast 64, przy tym samym budżecie 48 KiB pamięci
+współdzielonej i dwóch blokach na SM. Q4_K wchodzi w to naturalnie, bo
+superblok ma 144 CIĄGŁE bajty i ośmiu podblokom wystarczy jeden nagłówek —
+czwórka wątków bierze po ćwiartce. Q8_0 zostaje przy jednym podbloku: jego blok
+ma 34 bajty i własną skalę, więc nie ma czego poszerzać.
+
+Pomiar: mieszanka 1638 -> 2227 tok/s (+36%), czas kernela 2,29 -> 1,34 ms, ruch
+L2 1,64 GB -> 989 MB, jednostka macierzowa 6,06% -> 10,46%. Bramka referencyjna
+0,310% rozpiętości, ten sam argmax.
+
+Po tej zmianie czołowym przestojem stał się `mio_throttle` (6,04) — kolejka
+przed potokiem pamięci współdzielonej. Dwanaście z szesnastu odczytów na etap
+było KSIĘGOWANIEM SKAL, nie danymi. Skale trzymane PARAMI — `(d, d*suma)` na
+token, `(d*skala, dmin*min)` na wiersz — zbijają to o połowę (10,69 M -> 5,35 M
+odczytów, `mio_throttle` 6,04 -> 1,58). Czas się nie zmienił, bo zysk zjadła
+zajętość: pary kosztowały 33 rejestry i drugi blok na SM. Zwinięcie pętli
+podbloków odzyskuje 16 z nich, ale mierzy się gorzej (2219 wobec 2236) —
+rozwinięcie zostaje.
+
+### Dekod: 15,7% czasu karta stoi, a same GEMV-y są blisko sufitu
+
+Osobne rozbicie kroku dekodu (`nsys`, Qwen3-30B Q4_K, 32 kroki) mówi coś
+innego, niż mówił prefill. Przepustowości pojedynczych kerneli są DOBRE:
+
+    MoE gate/up Q4_K   96x8    3,51 ms/token   194 GB/s
+    MoE down Q6_K     256x8    1,97 ms/token   126 GB/s
+    MoE down Q4_K     256x8    0,96 ms/token   177 GB/s
+    lm_head Q6_K    18992x1    1,48 ms/token   173 GB/s
+    uwaga Q4_K        256x1 i 384x1            144-175 GB/s
+
+Sufit strumienia na tej karcie to około 215 GB/s, więc gate/up jest na 90% —
+tam nie ma czego szukać. Za to KROK JAKO CAŁOŚĆ osiąga ~110 GB/s, bo:
+
+  * 15,7% czasu ściany to PRZERWY MIĘDZY KERNELAMI. 29 295 przerw, mediana
+    2,24 us, p99 3,01 us, maksimum 14,8 us — rozkład jest płaski, więc to nie
+    są synchronizacje, tylko stały koszt uruchomienia. `cuLaunchKernel`
+    kosztuje 2,35 us po stronie CPU przy 39 660 wywołaniach.
+  * krok emituje ~860 uruchomień na token (143 rmsnorm, 240 GEMV, 72
+    `cast_f16_f32`, 71 `residual_add`, 48 `silu_mul`, 48 topk, 48 combine...).
+
+Stąd dwa kolejne kroki, w tej kolejności wartości: GRAFY CUDA dla kroku dekodu
+(HAL ma `begin_capture`/`end_capture`/`ExecGraph`, używa ich `forge-engine`, a
+ścieżka `CudaExec` — czyli ta docelowa — nie używa ich wcale) i dopiero potem
+zrastanie drobnych kerneli. Warunkiem przechwycenia jest, żeby pozycja w
+sekwencji i adresy stron KV szły przez BUFOR URZĄDZENIA, a nie przez argument
+uruchomienia; inaczej graf trzeba by przechwytywać co krok.
+
+Q6_K na `ffn_down` (126 GB/s przy 177 GB/s wariantu Q4_K tego samego kształtu)
+to osobny, mniejszy dług — 0,57 ms na token.
+
+### Stan wobec llama.cpp, jeden stan maszyny, 2026-08-07
+
+`/opt/repos/llama.cpp` 6db1304 wobec FORGE `58e5a887`:
+
+                        llama pp512  FORGE pp512   llama tg32  FORGE tg32
+    Qwen3.6-35B MXFP4      2521,9      2337,8         62,86      54,9
+    Qwen3-30B Q4_K         2296,9      2239,0         82,30      63,0
+    Bielik 7B Q4_K         2625,1      4867,0         43,05      36,2
+
+Prefill mieszanki przeszedł z 0,71x na 0,975x. Dekod stoi na 0,77-0,87x we
+wszystkich trzech i to jest teraz największy dług.
