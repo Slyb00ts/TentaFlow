@@ -1542,6 +1542,39 @@ zaczyna sie w dowolnym miejscu, a czytamy od WYROWNANEGO dolu."""
 comptime MXFP4_STAGE_ROW = MXFP4_PASS_CHUNKS * 16
 
 
+@always_inline
+def _mxfp4_half_acc(
+    swu: UnsafePointer[
+        UInt32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    q: Int,
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    col: Int,
+) -> Float32:
+    """Osiem bajtow kodow spod DOWOLNEGO adresu w LDS — wklad ich szesnastu wartosci.
+
+    Bajt `j` bloku MXFP4 trzyma kolumne `j` w mlodszym polbajcie i `j+16` w
+    starszym, wiec te osiem bajtow to kolumny `col..col+8` i `col+16..col+24`.
+
+    Adres jest dowolny, bo blok ma siedemnascie bajtow. Odczyt niewyrownany
+    wprost z LDS schodzil do przestrzeni generycznej (`ld.v4.b32` bez
+    kwalifikatora) — i wolno, i dla takiego adresu niezdefiniowane — wiec osiem
+    bajtow sklada sie z TRZECH WYROWNANYCH SLOW przesunieciem lejkowym.
+    """
+    words = swu + (q >> 2)
+    sh = UInt64((q & 3) << 3)
+    var v = SIMD[DType.uint32, 2](0)
+    comptime for j in range(2):
+        pair = UInt64(words[j]) | (UInt64(words[j + 1]) << 32)
+        v[j] = UInt32((pair >> sh) & 0xFFFFFFFF)
+    codes = bitcast[DType.uint8, 8](v)
+    xa = (x + col).load[width=8, alignment=16]()
+    xb = (x + col + 16).load[width=8, alignment=16]()
+    return (_e2m1x8_f16(codes & 0x0F) * xa).cast[DType.float32]().reduce_add() + (
+        _e2m1x8_f16(codes >> 4) * xb
+    ).cast[DType.float32]().reduce_add()
+
+
 def gemv_mxfp4_f16_gidx(
     y: UnsafePointer[Float16, MutAnyOrigin],
     wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
@@ -1581,6 +1614,14 @@ def gemv_mxfp4_f16_gidx(
     w = wtab[Int(ids[sel])]
     blocks_per_row = n_cols // 32
     stride = blocks_per_row * 17
+    # Wiersz `down` ma szesnascie blokow na trzydziesci dwie linie fali, wiec
+    # przy jednym bloku na linie polowa fali nie ma czego liczyc — a ten kernel
+    # jest zwiazany DEKODOWANIEM, nie pasmem: dwukrotne ograniczenie sciaganych
+    # bajtow nie zmienilo mu tempa (73,4 wobec 75,3 GB/s). Gdy wiersz jest
+    # krotszy niz fala, blok idzie na DWIE linie po osiem bajtow kodow.
+    var split = 1
+    if blocks_per_row * 2 <= WARP:
+        split = 2
     row0 = Int(block_idx.x) * ROWS_PER_BLOCK
     # Ostatni legalny wyrownany kawalek stosu tego eksperta: okno ostatniego
     # przejscia siega do szesnastu bajtow za wiersz, a czytanie za koniec
@@ -1611,43 +1652,26 @@ def gemv_mxfp4_f16_gidx(
             i += nthreads
         barrier()
 
-        b = first + lane
-        if b < blocks_per_row:
-            win = lrow * stride + first * 17
-            skew = win - (win // 16) * 16
-            base = wid * MXFP4_STAGE_ROW + skew + lane * 17
-            # Blok zaczyna sie pod dowolnym bajtem kafla, wiec szesnaste bajty
-            # ladunku sklada sie z PIECIU WYROWNANYCH SLOW. Odczyt niewyrownany
-            # wprost schodzil do przestrzeni generycznej (`ld.v4.b32` bez
-            # kwalifikatora), co jest i wolne, i dla adresu niewyrownanego
-            # niezdefiniowane.
-            q = base + 1
-            words = swu + (q >> 2)
-            sh = UInt64((q & 3) << 3)
-            var v = SIMD[DType.uint32, 4](0)
-            comptime for j in range(4):
-                pair = UInt64(words[j]) | (UInt64(words[j + 1]) << 32)
-                v[j] = UInt32((pair >> sh) & 0xFFFFFFFF)
-            codes = bitcast[DType.uint8, 16](v)
-            col = b * 32
-            x0 = (x + col).load[width=8, alignment=16]()
-            x1 = (x + col + 8).load[width=8, alignment=16]()
-            x2 = (x + col + 16).load[width=8, alignment=16]()
-            x3 = (x + col + 24).load[width=8, alignment=16]()
-            lo = codes.slice[8]()
-            hi = codes.slice[8, offset=8]()
-            acc += _e8m0_pow2(sw[base]) * (
-                (_e2m1x8_f16(lo & 0x0F) * x0).cast[DType.float32]().reduce_add()
-                + (_e2m1x8_f16(hi & 0x0F) * x1)
-                .cast[DType.float32]()
-                .reduce_add()
-                + (_e2m1x8_f16(lo >> 4) * x2)
-                .cast[DType.float32]()
-                .reduce_add()
-                + (_e2m1x8_f16(hi >> 4) * x3)
-                .cast[DType.float32]()
-                .reduce_add()
-            )
+        win = lrow * stride + first * 17
+        skew = win - (win // 16) * 16
+        if split == 1:
+            b = first + lane
+            if b < blocks_per_row:
+                base = wid * MXFP4_STAGE_ROW + skew + lane * 17
+                col = b * 32
+                acc += _e8m0_pow2(sw[base]) * (
+                    _mxfp4_half_acc(swu, base + 1, x, col)
+                    + _mxfp4_half_acc(swu, base + 9, x, col + 8)
+                )
+        else:
+            b = first + (lane >> 1)
+            if b < blocks_per_row:
+                half = (lane & 1) * 8
+                base = wid * MXFP4_STAGE_ROW + skew + (lane >> 1) * 17
+                col = b * 32 + half
+                acc += _e8m0_pow2(sw[base]) * _mxfp4_half_acc(
+                    swu, base + 1 + half, x, col
+                )
         barrier()
         first += MXFP4_PASS_BLOCKS
 

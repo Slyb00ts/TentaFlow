@@ -75,8 +75,8 @@ hal_boundary	crates/forge-model/tests/cuda_vs_reference.rs	1
 hal_boundary	crates/forge-model/tests/decode_vs_mlx.rs	1
 hal_boundary	crates/forge-model/tests/generate_vs_mlx.rs	1
 hal_boundary	crates/forge-model/tests/gguf_loads.rs	1
-hal_boundary	crates/forge-model/tests/qwen3_moe.rs	1
 hal_boundary	crates/forge-model/tests/qwen36_hybrid.rs	1
+hal_boundary	crates/forge-model/tests/qwen3_moe.rs	1
 hal_boundary	crates/forge-onnx/src/gpu.rs	2
 hal_boundary	crates/forge-onnx/src/lib.rs	1
 hal_boundary	crates/forge-onnx/tests/silero_vad.rs	2
@@ -125,7 +125,7 @@ size	crates/forge-formats/src/arch.rs	2743
 size	crates/forge-formats/src/iq_tables.rs	3969
 size	crates/forge-kernels/src/launchers/attention.rs	2163
 size	crates/forge-kernels/src/launchers/deltanet.rs	1963
-size	crates/forge-kernels/src/launchers/gemm/nvfp4.rs	1712
+size	crates/forge-kernels/src/launchers/gemm/nvfp4.rs	1710
 size	crates/forge-kernels/src/launchers/gemm/quantized/i_quants.rs	2038
 size	crates/forge-kernels/src/launchers/gemm/quantized/k_quants.rs	2026
 size	crates/forge-kernels/src/launchers/mod.rs	3530
