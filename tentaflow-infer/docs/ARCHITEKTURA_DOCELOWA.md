@@ -1377,3 +1377,39 @@ tak, jak już czyta aktywację), trzydzieści dwa lane'y pokrywają kilobajt ci�
 a równoległość zostaje nietknięta. To samo dotyczy Q6_K (210 bajtów) i MXFP4
 (17 bajtów): jeden mechanizm rozwiązuje wszystkie trzy. Koszt: przepakowanie w
 loaderze i przejście na nowy układ we WSZYSTKICH czytelnikach danego formatu.
+
+## Zmierzony sufit przepakowania MXFP4: +39% na prefillu hybrydy
+
+`_mxfp4_word` składa każde z dziewięciu słów fragmentu z DWÓCH wyrównanych
+odczytów i przesunięcia 64-bitowego, bo blok MXFP4 ma siedemnaście bajtów.
+Ile to kosztuje, dało się zmierzyć bez robienia całej przeprowadzki: kernel
+zbudowany z JEDNYM odczytem zamiast pary (wynik celowo błędny, chodzi wyłącznie
+o czas i wzorzec dostępu) daje na Qwen3.6-35B MXFP4:
+
+    pp512 obecnie  2328 tok/s     llama.cpp 2502 (0,93x)
+    pp512 z jednym odczytem  3234 tok/s   (1,29x)
+
+**+38,9%.** Ten jeden szczegół układu bajtów jest całą różnicą między jedynym
+pomiarem, w którym przegrywamy, a przewagą o niemal trzydzieści procent.
+(Pomiar był w ogóle możliwy dopiero po dopisaniu `.maxntid` — bez niego wariant
+brał 72 rejestry i nie startował.)
+
+Przepakowanie na płaszczyzny daje dokładnie ten wzorzec dostępu, tylko z
+poprawnym wynikiem: para bloków to 32 ciągłe bajty `qs` pod adresem podzielnym
+przez 32 (słowa 1..8 wyrównane do czterech) plus dwubajtowa para skal z
+płaszczyzny `e`. Suma bajtów bez zmian.
+
+Układ, który NIE rusza żadnej arytmetyki wskaźników na zewnątrz kernela:
+płaszczyzny na EKSPERTA (czy szerzej — na stos wierszy), czyli `[qs][e]` w
+obrębie tego samego bloku pamięci. Krok eksperta zostaje `rows * bpr * 17`, więc
+`wtab[e]`, okna wierszy i `_at` liczą się jak dziś; zmienia się wyłącznie to,
+jak kernel liczy adres bloku — `qs` pod `base + blk * 16`, skala pod
+`base + rows * bpr * 16 + blk`.
+
+Do przejścia (nie zaczęte): `put_quant` w `cuda_exec/mod.rs` dzieli bajty przy
+wgraniu, `Quantized` niesie przesunięcie płaszczyzny, i piętnaście miejsc
+adresowania w czterech plikach Mojo — `gemm_fp4.mojo` (`_mxfp4_word`),
+`gemv2.mojo` (siedem miejsc, w tym sztaplowanie do LDS), `decode_fused.mojo`,
+`gemm.mojo` — plus fikstury MXFP4 w `tests/golden.rs`, które budują bloki
+siedemnastobajtowe ręcznie. Trzynaście kerneli w katalogu czyta ten format.
+Ta sama przeprowadzka, tym samym mechanizmem, czeka Q8_0 i Q6_K.
