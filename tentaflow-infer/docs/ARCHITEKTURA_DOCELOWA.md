@@ -1351,8 +1351,29 @@ osiem lane'ów miałoby pracę, dwadzieścia cztery stałyby. Zmierzone jako bra
 zmiany (62,5 wobec 62,5 tok/s), bo warunek wejścia w tę ścieżkę nigdy nie
 zachodzi na realnym kształcie.
 
-Żeby to wykorzystać, `_dot_q8_0_i8` musiałby oddać jednemu WARPOWI CZTERY
-WIERSZE po osiem lane'ów, a nie jeden wiersz — czyli zmienić kontrakt funkcji
-(dziś zwraca sumę zredukowaną po całym warpie) i redukcję na segmentową.
-To jest następny duży, dobrze umiejscowiony zysk w tym silniku: 27% kroku
-dekodu hybrydy liczone jednym ósmym osiągalnej sprawności instrukcji.
+Odczyt grupowy jest napisany i zmierzony w OBU mapowaniach, i OBA są wolniejsze:
+
+    cztery wiersze na warp, wszystkie 32 lane'y zajete   56,1 tok/s
+    jeden wiersz na warp, osiem lane'ow zajetych         56,2 tok/s
+    stan obecny (lane na blok, 16 odczytow dwubajtowych) 62,5 tok/s
+
+Zbieżność tych dwóch liczb jest odpowiedzią: mapowanie nie ma znaczenia, bo oba
+robią TO SAMO — lane obejmuje osiem bloków zamiast jednego, więc wiersz liczy
+się CZTEROKROTNIE MNIEJSZĄ liczbą lane'ów (albo tyloma samo, ale przy czterech
+razy mniejszej liczbie warpów). Kernel jest związany opóźnieniem, nie
+przepustowością instrukcji, a ośmiokrotnie szerszy odczyt nie odrabia
+czterokrotnej straty na liczbie żądań w locie. PTX potwierdza, że odczyt
+faktycznie się poszerzył (17 x `b16` znika, zostaje 13 x `v4.b32` + 4 x
+`v2.b64`), więc zmierzone jest to, co miało być zmierzone.
+
+Wniosek jest ostry i wskazuje jedyne wyjście: **34-bajtowego bloku Q8_0 nie da
+się czytać szeroko bez oddania czterokrotnie mniejszej równoległości, a to
+kosztuje więcej, niż szerokość przynosi.** Zysk jest osiągalny wyłącznie przez
+PRZEPAKOWANIE wagi przy wczytaniu na dwie płaszczyzny — `qs` (32 bajty na blok,
+ciągle, więc każdy blok zaczyna się na granicy trzydziestu dwóch bajtów) i `d`
+(2 bajty na blok) — o tej samej sumie bajtów. Wtedy lane zostaje przy JEDNYM
+bloku, czyta swoje trzydzieści dwa bajty jednym `ld.global.v8.b32` (dokładnie
+tak, jak już czyta aktywację), trzydzieści dwa lane'y pokrywają kilobajt ciągły,
+a równoległość zostaje nietknięta. To samo dotyczy Q6_K (210 bajtów) i MXFP4
+(17 bajtów): jeden mechanizm rozwiązuje wszystkie trzy. Koszt: przepakowanie w
+loaderze i przejście na nowy układ we WSZYSTKICH czytelnikach danego formatu.
