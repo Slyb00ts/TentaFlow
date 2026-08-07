@@ -311,18 +311,7 @@ impl Kernels {
         selections: usize,
         stream: &Stream,
     ) -> Result<()> {
-        // Wierszy wyjścia na blok — właściwość WYBRANEGO kafla, więc idzie
-        // razem z jego nazwą, a nie osobno.
-        let (name, block, bn) = match quant {
-            QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256u32, 64usize),
-            QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64),
-            QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128, 64),
-            other => {
-                return Err(ForgeError::Unsupported(format!(
-                    "{other:?}: stos ekspertów nie ma zgrupowanego GEMM-u"
-                )))
-            }
-        };
+        let (name, block, bn, _) = self.grouped_variant(quant)?;
         let kernel = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
             grid: (rows.div_ceil(bn) as u32, tiles.count as u32, 1),
@@ -449,6 +438,28 @@ pub const GROUPED_TILE_ROWS: usize = 64;
 pub const GROUPED_TILE_ROWS_MIN: usize = 16;
 
 impl Kernels {
+    /// Kernel, block width, output rows per block and TOKENS per tile for a
+    /// grouped stack of this format.
+    pub(crate) fn grouped_variant(
+        &self,
+        quant: QuantKind,
+    ) -> Result<(&'static str, u32, usize, usize)> {
+        Ok(match quant {
+            QuantKind::MXFP4 => {
+                let (name, tokens, threads) = self.mxf4_grouped_variant();
+                (name, threads, 128, tokens)
+            }
+            QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256, 64, 64),
+            QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64, 64),
+            QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128, 64, 64),
+            other => {
+                return Err(ForgeError::Unsupported(format!(
+                    "{other:?}: stos ekspertów nie ma zgrupowanego GEMM-u"
+                )))
+            }
+        })
+    }
+
     /// Rows of one expert's block that this format's grouped tile computes in a
     /// single launch.
     ///
@@ -457,9 +468,8 @@ impl Kernels {
     /// this stride — built wider, the rows past it belong to no launch and are
     /// folded into their tokens as whatever the scratch last held.
     pub fn grouped_tile_rows(&self, quant: QuantKind) -> usize {
-        match quant {
-            QuantKind::MXFP4 => self.mxf4_grouped_tile_rows(),
-            _ => GROUPED_TILE_ROWS,
-        }
+        self.grouped_variant(quant)
+            .map(|(_, _, _, tokens)| tokens)
+            .unwrap_or(GROUPED_TILE_ROWS)
     }
 }

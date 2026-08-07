@@ -298,7 +298,7 @@ impl Kernels {
     /// Jego SZEROKOSC W TOKENACH jest tu wyjsciem, a nie warunkiem wyboru: kafel
     /// nie petli po tokenach, wiec tablica kafli musi byc budowana dokladnie tym
     /// krokiem. Zbudowana szerszym zostawialaby wiersze, ktorych nikt nie liczy.
-    fn mxf4_grouped_variant(&self) -> (&'static str, usize, u32) {
+    pub(crate) fn mxf4_grouped_variant(&self) -> (&'static str, usize, u32) {
         GROUPED_TILE
             .iter()
             .copied()
