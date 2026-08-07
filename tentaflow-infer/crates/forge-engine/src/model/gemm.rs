@@ -1,5 +1,6 @@
 // ===== File: model/gemm.rs — projekcje i mnozenia na poziomie modelu =====
 use super::*;
+use forge_kernels::GroupedTiles;
 
 impl Model {
     /// Wykonuje kilka pełnych projekcji GGUF NVFP4 ze wspólną kwantyzacją
@@ -543,6 +544,43 @@ impl Model {
             ),
             _ => self.gemm_rows(y, w, x, 1, row_off, n_rows, stream),
         }
+    }
+
+    /// One projection of EVERY expert over the block of grouped rows that chose
+    /// it, in one grid. `tiles` says per block which expert it reads and which
+    /// rows are its own, so the tile itself is the ungrouped tile — grouping
+    /// picks the block's placement rather than the launch's.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn gemm_grouped_stack(
+        &self,
+        y: &DevBuffer,
+        stack: &ExpertStack,
+        x: &DevBuffer,
+        tiles: &GroupedTiles<'_>,
+        n_rows: usize,
+        selections: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let w = stack.representative();
+        let quant = w.block_quant().ok_or_else(|| {
+            ForgeError::Unsupported("gemm_grouped_stack called for a blockless expert".into())
+        })?;
+        self.kernels.gemm_grouped_experts(
+            quant,
+            y,
+            stack.table(),
+            x,
+            GroupedTiles {
+                expert: tiles.expert,
+                first: tiles.first,
+                end: tiles.end,
+                count: tiles.count,
+            },
+            n_rows,
+            w.cols(),
+            selections,
+            stream,
+        )
     }
 
     /// Every selection of a routed step through one stack, in ONE launch.

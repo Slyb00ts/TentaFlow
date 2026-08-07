@@ -31,6 +31,24 @@ pub(crate) struct MoeBufs {
     /// its own row in the router's order, so this is the identity — the combine
     /// takes a table because a path that reorders rows has one to invert.
     pub(crate) identity: DevBuffer,
+    /// A prefill chunk's selections gathered into expert order: the activation
+    /// each selection reads, the two feed-forward halves and the down output.
+    /// f16 [chunk * top_k * hidden] / [chunk * top_k * moe_inter].
+    pub(crate) grouped_x: DevBuffer,
+    pub(crate) grouped_gate: DevBuffer,
+    pub(crate) grouped_up: DevBuffer,
+    pub(crate) grouped_out: DevBuffer,
+    /// `order[p]` is the token whose row the gather puts at position `p`;
+    /// `slots[sel]` says where that selection landed, which is what puts the
+    /// answers back. i32 [chunk * top_k].
+    pub(crate) order: DevBuffer,
+    pub(crate) slots: DevBuffer,
+    /// One entry per tile of the grouped launch: which expert it reads, and
+    /// where that expert's block of rows begins and ends. i32, bounded by one
+    /// tile per expert plus one per selection.
+    pub(crate) tile_expert: DevBuffer,
+    pub(crate) tile_first: DevBuffer,
+    pub(crate) tile_end: DevBuffer,
     /// Pinned-host landing for the shared-expert gate logit (f16), read back in
     /// the same sync as the router top-k (fallback readback path only).
     pub(crate) pinned_shared: DevBuffer,
@@ -58,6 +76,15 @@ impl MoeBufs {
             sel_gate: dev(sel_ffn)?,
             sel_up: dev(sel_ffn)?,
             sel_out: dev(top_k * hidden * 2)?,
+            grouped_x: dev(idw * hidden * 2)?,
+            grouped_gate: dev(idw * moe.moe_intermediate_size * 2)?,
+            grouped_up: dev(idw * moe.moe_intermediate_size * 2)?,
+            grouped_out: dev(idw * hidden * 2)?,
+            order: dev(idw * 4)?,
+            slots: dev(idw * 4)?,
+            tile_expert: dev((moe.n_experts + idw) * 4)?,
+            tile_first: dev((moe.n_experts + idw) * 4)?,
+            tile_end: dev((moe.n_experts + idw) * 4)?,
             identity: {
                 let slots = dev(top_k * 4)?;
                 let rows: Vec<u8> = (0..top_k as i32).flat_map(|j| j.to_le_bytes()).collect();

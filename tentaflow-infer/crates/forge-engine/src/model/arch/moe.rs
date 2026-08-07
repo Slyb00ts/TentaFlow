@@ -1,5 +1,6 @@
 // ===== File: model/arch/moe.rs — mieszanka ekspertow i ich rezydencja =====
 use super::super::*;
+use forge_kernels::GroupedTiles;
 
 impl Model {
     /// Whether `stack` is a routed-expert stack the device-side grouped dispatch
@@ -727,10 +728,162 @@ impl Model {
         Ok(())
     }
 
+    /// Whether this layer's routed stacks multiply as ONE grid over every
+    /// expert.
+    ///
+    /// A shared expert is a dense feed-forward over every row and has no
+    /// grouped form here, so a layer carrying one keeps the per-token loop. So
+    /// does a paged stack: a grid spanning every expert has no address for a
+    /// block that sits on disk.
+    fn moe_grouped_capable(kernels: &Kernels, moe: &MoeFfn) -> bool {
+        moe.shared.is_none()
+            && [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+                .into_iter()
+                .all(|stack| {
+                    stack.fully_resident()
+                        && stack
+                            .representative()
+                            .block_quant()
+                            .is_some_and(|quant| kernels.supports_grouped_experts(quant))
+                })
+    }
+
+    /// Routed experts of a prefill chunk, every expert in ONE grid.
+    ///
+    /// The per-token loop this replaces launched five kernels per selected
+    /// expert per token: at 512 tokens and eight experts, a quarter of a
+    /// million launches of a tile that covers seven blocks of a card with
+    /// dozens of multiprocessors. Here each expert reads the block of rows that
+    /// chose it, and the whole layer is three launches plus the gate.
+    fn moe_grouped_prefill(
+        &self,
+        moe: &MoeFfn,
+        ids: &[i32],
+        t: usize,
+        inter: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
+        let (k, experts) = (moe.n_experts_used, moe.n_experts);
+        let selections = t * k;
+
+        // A counting sort over experts. `order[p]` is the token whose row the
+        // gather puts at position p; `slots[sel]` says where that selection
+        // landed, which is what puts the answers back afterwards.
+        let mut starts = vec![0u32; experts + 1];
+        for id in ids {
+            let e = *id as usize;
+            if e >= experts {
+                return Err(ForgeError::Kernel(format!(
+                    "router wybrał eksperta {e} przy {experts} w stosie"
+                )));
+            }
+            starts[e + 1] += 1;
+        }
+        for e in 0..experts {
+            starts[e + 1] += starts[e];
+        }
+        let mut cursor = starts.clone();
+        let mut order = vec![0i32; selections];
+        let mut slots = vec![0i32; selections];
+        for (sel, id) in ids.iter().enumerate() {
+            let at = &mut cursor[*id as usize];
+            order[*at as usize] = (sel / k) as i32;
+            slots[sel] = *at as i32;
+            *at += 1;
+        }
+        self.device
+            .write(bytemuck::cast_slice(&order), &mb.order, 0)?;
+        self.device
+            .write(bytemuck::cast_slice(&slots), &mb.slots, 0)?;
+
+        // The stride is the NARROWEST tile among the three projections: a tile
+        // covers its own width from `tile_first` and does not loop past it, and
+        // the three need not share a format — Q4_K_M puts six bits on
+        // `ffn_down` and four on the other two. Built wider, the rows past the
+        // narrow tile's end belong to no launch.
+        let stride = [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+            .into_iter()
+            .filter_map(|stack| stack.representative().block_quant())
+            .map(|quant| self.kernels.grouped_tile_rows(quant))
+            .min()
+            .expect("three projections of a routed layer");
+        let (mut tile_expert, mut tile_first, mut tile_end) = (Vec::new(), Vec::new(), Vec::new());
+        for e in 0..experts {
+            let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
+            let mut at = from;
+            while at < to {
+                tile_expert.push(e as i32);
+                tile_first.push(at as i32);
+                tile_end.push(to as i32);
+                at += stride;
+            }
+        }
+        for (host, dev) in [
+            (&tile_expert, &mb.tile_expert),
+            (&tile_first, &mb.tile_first),
+            (&tile_end, &mb.tile_end),
+        ] {
+            self.device.write(bytemuck::cast_slice(host), dev, 0)?;
+        }
+        let tiles = GroupedTiles {
+            expert: &mb.tile_expert,
+            first: &mb.tile_first,
+            end: &mb.tile_end,
+            count: tile_expert.len(),
+        };
+
+        self.kernels.gather_rows_f16(
+            &mb.grouped_x,
+            &pb.x,
+            &mb.order,
+            selections,
+            hidden,
+            stream,
+        )?;
+        for (stack, y) in [
+            (&moe.gate_exps, &mb.grouped_gate),
+            (&moe.up_exps, &mb.grouped_up),
+        ] {
+            self.gemm_grouped_stack(y, stack, &mb.grouped_x, &tiles, inter, selections, stream)?;
+        }
+        // Elementwise, so the whole grouped block goes at once — the gate
+        // function does not care which expert produced which row.
+        self.kernels.glu_mul_f16(
+            self.ffn_act(),
+            &mb.grouped_gate,
+            &mb.grouped_gate,
+            &mb.grouped_up,
+            selections * inter,
+            stream,
+        )?;
+        self.gemm_grouped_stack(
+            &mb.grouped_out,
+            &moe.down_exps,
+            &mb.grouped_gate,
+            &tiles,
+            hidden,
+            selections,
+            stream,
+        )?;
+        self.kernels.moe_combine_f16(
+            &pb.down,
+            &mb.grouped_out,
+            &mb.slots,
+            &mb.weights,
+            t,
+            hidden,
+            k,
+            true,
+            stream,
+        )
+    }
+
     /// Routed experts for a prefill chunk: route all `t` tokens at once, then
     /// apply each token's top-k experts, writing `[t, hidden]` into `pb.down`.
-    /// Correctness-first per-token loop (grouped-GEMM permute/unpermute is a
-    /// tracked perf follow-up); the router readback is one sync per layer.
+    /// The router readback is one sync per layer.
     pub(crate) fn moe_prefill_ffn(
         &self,
         moe: &MoeFfn,
@@ -765,6 +918,9 @@ impl Model {
         // ekspertów. Ściągnięcie sumy całego kawałka jednym zgłoszeniem zamienia
         // `t` rund odczytu na jedną; gdy suma nie mieści się w slotach, zostaje
         // stronicowanie per token — wtedy i tak trzeba by ich wypierać nawzajem.
+        if Self::moe_grouped_capable(&self.kernels, moe) {
+            return self.moe_grouped_prefill(moe, ids, t, inter, hidden, stream);
+        }
         let chunk_union = self.chunk_expert_union(ids);
         let union_fits = self.expert_union_fits(moe, chunk_union.len());
         if union_fits {

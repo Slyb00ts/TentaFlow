@@ -551,9 +551,7 @@ impl Kernels {
             QuantKind::Q4K => "gemv_q4_k_dp4a_f16_gidx_batch",
             // The integer route stages the activation in shared memory, so it
             // is the wide step that cannot take it — not the format.
-            QuantKind::Q6K if cols <= Self::DP4A_MAX_COLS => {
-                "gemv_q6_k_dp4a_f16_gidx_batch"
-            }
+            QuantKind::Q6K if cols <= Self::DP4A_MAX_COLS => "gemv_q6_k_dp4a_f16_gidx_batch",
             QuantKind::Q6K => "gemv_q6_k_f16_gidx_batch",
             QuantKind::MXFP4 => "gemv_mxfp4_f16_gidx_batch",
             other => {
@@ -625,6 +623,19 @@ impl Kernels {
                 )))
             }
         })
+    }
+
+    /// Whether a stack of this format multiplies as ONE grid over every expert
+    /// through `gemm_grouped_experts`.
+    ///
+    /// MXFP4 has a grouped tile of its own, but it reads a quantized activation
+    /// pair and is launched by `gemm_mxf4_grouped` — a different call with
+    /// different arguments, so it is not part of this answer.
+    pub fn supports_grouped_experts(&self, quant: QuantKind) -> bool {
+        matches!(quant, QuantKind::Q4K | QuantKind::Q8_0 | QuantKind::Q6K)
+            && self
+                .grouped_variant(quant)
+                .is_ok_and(|(name, ..)| self.artifacts.has(name))
     }
 
     /// Rows of one expert's block that this format's grouped tile computes in a
