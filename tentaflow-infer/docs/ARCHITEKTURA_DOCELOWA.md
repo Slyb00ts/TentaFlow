@@ -885,3 +885,42 @@ około trzydziestokrotnie. Reżim przeskakuje na PASMO PAMIĘCI, i tam lepsza
 jednostka macierzowa nie kupuje nic — liczy się wyłącznie to, jak szybko
 osiemnaście gigabajtów przechodzi przez magistralę. Dlatego z pracy nad gęstym
 przenosi się zajętość, sztaplowanie i wyrównanie, a nie sama arytmetyka.
+
+### Co robi llama.cpp w MMQ, czego nie robimy my
+
+Przeczytane z `ggml/src/ggml-cuda/mmq*.cuh` na masterze (91d2fc387). Sześć
+rzeczy, z których pięć jest u nas nieobecnych.
+
+**Instrukcja jest ta sama.** `mma.cuh` woła
+`mma.sync.aligned.kind::mxf4.block_scale.scale_vec::2X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue8m0`
+oraz wariant `mxf4nvf4` ze skalami `ue4m3` — dokładnie to, czym liczy nasz
+kafel FP4. Na MXFP4 nie przegrywamy sprzętem.
+
+**Iteracja `k` obejmuje CAŁY superblok, nie trzydzieści dwie kolumny.**
+`MMQ_ITER_K = 256`, a dla FP4 `MMQ_ITER_K_FP4 = 512`. Stąd
+`threads_per_row = MMQ_ITER_K / (4 * QR4_K) = 32`: jedna pełna fala czyta 128
+bajtów `qs` jednego wiersza w JEDNYM scalonym dostępie i z tego samego odczytu
+rozpakowuje OBA półbajty do pamięci współdzielonej. Nasze sztaplowanie bierze
+cztery linie na wiersz po osiem bajtów i powtarza to osiem razy na superblok.
+
+**Kernel jest kompilowany OSOBNO dla każdej szerokości tokenów.** `J` przyjmuje
+8, 16, 24, ... 128, a `mul_mat_q_switch_J` wybiera tę, która daje najmniej
+kafli. To jest dokładnie ten kompromis, który dziś zmierzyłem — kafel 32-tokenowy
+2343 tok/s wobec 64-tokenowego 2181 — tyle że oni go nie zawierają, tylko
+specjalizują.
+
+**`occupancy = 1`.** Jeden blok na multiprocesor z wielkim kaflem w pamięci
+współdzielonej (I=128 wierszy na 256 kolumn `k`). To inny punkt projektowy niż
+nasz: my stroiliśmy w stronę wielu małych bloków.
+
+**Dekompozycja stream-K** (`stream_k = true` dla Q4_K i MXFP4). Blok bierze
+ciągły wycinek spłaszczonej przestrzeni pracy `(i, j, k)`, liczy wynik
+częściowy, a osobne przejście `fixup` je składa. To jest lekarstwo na nierówne
+bloki ekspertów — i wprost na naszą zapaść przy kroku generacji, gdzie osiem
+selekcji dawało trzydzieści dwa bloki i 222 us zamiast 35 us.
+
+**Tablicy kafli nie ma w ogóle.** Ścieżka MMQ czyta `expert_bounds` (sumy
+prefiksowe) NA URZĄDZENIU, a blok, dla którego `jt*J >= col_diff`, po prostu
+wraca. Nasza `moe_grouped` buduje tablicę na hoście i płaci za to synchronizacją
+na warstwę — a to właśnie sprzężenie kroku tablicy z szerokością kafla było
+źródłem dzisiejszego błędu gubionych wierszy.
