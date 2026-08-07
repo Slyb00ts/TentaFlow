@@ -924,3 +924,52 @@ prefiksowe) NA URZĄDZENIU, a blok, dla którego `jt*J >= col_diff`, po prostu
 wraca. Nasza `moe_grouped` buduje tablicę na hoście i płaci za to synchronizacją
 na warstwę — a to właśnie sprzężenie kroku tablicy z szerokością kafla było
 źródłem dzisiejszego błędu gubionych wierszy.
+
+### Zmierzone wiązanie kafla zgrupowanego Q4_K: linia L2, a nie kształt
+
+Strojenie kształtu tego kafla jest WYCZERPANE — pięć wariantów, każdy gorszy od
+obecnego `[64, 64, 8]` (1639 tok/s): `[64,128,8]` 1593, `[64,128,16]` 1582,
+`[32,128,16]` 1365, `[32,128,8]` 1236. To, co na kaflu MXFP4 dało +24%, tu nie
+daje nic, i Nsight Compute mówi dlaczego.
+
+Jedno uruchomienie (`--set detailed` plus liczniki bajtów):
+
+    Memory Throughput   79%       Compute (SM)        31%
+    L1/TEX Hit Rate     77,5%     L2 Hit Rate         92,8%
+    Rejestry/wątek      84        Block Limit Registers  2
+                                  Block Limit Shared Mem 5
+    Zajętość osiągnięta 33%       spill lokalny          0
+
+    l1tex__t_bytes                                    2,05 GB
+    lts__t_bytes                                      1,65 GB
+    l1tex__t_sectors_pipe_lsu_mem_global_op_ld  10 692 480 (342 MB)
+
+Trzysta czterdzieści dwa megabajty żądań globalnych wobec 1,65 GB ruchu L2 to
+4,8x wzmocnienia. Powód jest w mapie sztaplowania: wątek czyta OSIEM BAJTÓW,
+czwórka wątków pokrywa trzydzieści dwa bajty wiersza i skacze o `blocks_per_row
+* 144` dalej. Każdy taki dostęp dotyka jednego sektora, ale ciągnie linię L2, z
+której zużywamy ćwiartkę. llama.cpp czyta 128 bajtów wiersza PEŁNĄ FALĄ
+(`threads_per_row = MMQ_ITER_K / (4 * QR4_K) = 32`) — jedna linia, w całości
+zużyta.
+
+Zajętość jest przy tym związana REJESTRAMI (dwa bloki, choć pamięć współdzielona
+pozwoliłaby na pięć), ale to wiązanie drugorzędne: przy 79% przepustowości
+pamięci i 31% obliczeń więcej bloków tylko mocniej dobijałoby L2.
+
+Wniosek jest jednoznaczny i zgodny z tym, co robi MMQ: trzeba POSZERZYĆ ITERACJĘ
+`k` do całego superbloku, żeby czwórka wątków czytała 128 ciągłych bajtów. Przy
+etapie 32-kolumnowym jest to niemożliwe — wątek `part` musiałby trzymać dane
+etapu, którego akurat nie liczy.
+
+### Pomiary sprzed i po restarcie maszyny NIE SĄ porównywalne
+
+Restart (włączenie liczników) przesunął oba silniki naraz. Ta sama komenda,
+ten sam plik, przed i po:
+
+                        llama.cpp pp512   llama.cpp tg32
+    Qwen3.6-35B MXFP4    2639,9 -> 2541,9   68,15 -> 63,96
+    Qwen3-30B Q4_K       2804,1 -> 2307,3   91,47 -> 86,05
+    Bielik 7B Q4_K       3135,0 -> 2642,9   42,72 -> 45,44
+
+Dlatego każde porównanie musi pochodzić z JEDNEGO stanu maszyny. Baseline
+odniesienia to teraz `/opt/repos/llama.cpp` 3ef2369 (2026-05-28, ma FP4 MMA).
