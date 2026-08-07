@@ -2415,6 +2415,10 @@ struct BatchBufs {
 struct MoeBufs {
     /// Selected expert ids, i32 [MAX_PREFILL_CHUNK * top_k].
     ids: DevBuffer,
+    /// Router logits, f32 [MAX_PREFILL_CHUNK * n_experts]. The projection that
+    /// fills it is an ordinary multiply and runs as one, so the selection that
+    /// follows is the only part that is genuinely one block per token.
+    logits: DevBuffer,
     /// Routing weights, f32 [MAX_PREFILL_CHUNK * top_k].
     weights: DevBuffer,
     pinned_ids: DevBuffer,
@@ -2847,6 +2851,11 @@ impl Model {
                 let idw = MAX_PREFILL_CHUNK * top_k;
                 Some(MoeBufs {
                     ids: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
+                    logits: device.alloc(
+                        MAX_PREFILL_CHUNK * m.n_experts * 4,
+                        MemKind::Device,
+                        Pool::Activations,
+                    )?,
                     weights: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
                     pinned_ids: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
                     pinned_weights: device.alloc(

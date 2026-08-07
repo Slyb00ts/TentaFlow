@@ -346,6 +346,53 @@ impl Model {
     /// input, `b.down` receives the weighted sum of the selected experts'
     /// SwiGLU outputs (plus the shared expert if present). The top-k experts
     /// are read back to the host to index the stacked expert weights.
+    /// Routes `t` tokens: the projection first, then the selection.
+    ///
+    /// `moe_router_f16` does both in a single launch of one block per token,
+    /// which at generation pushes the whole router matrix — a megabyte of
+    /// weight — through one of the card's dozens of multiprocessors. The
+    /// projection is an ordinary `experts x hidden` multiply and runs as one;
+    /// only the selection is genuinely one block per token.
+    fn moe_route(
+        &self,
+        moe: &MoeFfn,
+        x: &DevBuffer,
+        t: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let DevWeight::F16 { buf: router, .. } = &moe.router else {
+            return Err(ForgeError::Unsupported("MoE router must be f16".into()));
+        };
+        if t == 1 {
+            self.kernels
+                .gemv_f16_out_f32(&mb.logits, router, x, moe.n_experts, hidden, stream)?;
+        } else {
+            self.kernels.gemm_f16_out_f32_at(
+                &mb.logits,
+                router,
+                0,
+                x,
+                moe.n_experts,
+                hidden,
+                t,
+                stream,
+            )?;
+        }
+        self.kernels.moe_topk_f32(
+            &mb.ids,
+            &mb.weights,
+            &mb.logits,
+            moe.usage.counts(),
+            t,
+            moe.n_experts,
+            moe.n_experts_used,
+            moe.norm_topk,
+            stream,
+        )
+    }
+
     pub(crate) fn moe_decode_ffn(
         &self,
         moe: &MoeFfn,
@@ -357,12 +404,6 @@ impl Model {
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
         let inter = moe.moe_inter;
         let k = moe.n_experts_used;
-        let DevWeight::F16 {
-            buf: router_buf, ..
-        } = &moe.router
-        else {
-            return Err(ForgeError::Unsupported("MoE router must be f16".into()));
-        };
 
         // Device-side grouped dispatch: the router's selected ids/weights stay
         // ON the device and drive the expert GEMVs + accumulate through the
@@ -375,19 +416,7 @@ impl Model {
                 self.kernels
                     .moe_sigmoid_f16_to_f32(&mb.shared_scale, &mb.tmp, 1, stream)?;
             }
-            self.kernels.moe_router_f16(
-                &mb.ids,
-                &mb.weights,
-                &b.x,
-                router_buf,
-                moe.usage.counts(),
-                1,
-                hidden,
-                moe.n_experts,
-                k,
-                moe.norm_topk,
-                stream,
-            )?;
+            self.moe_route(moe, &b.x, 1, hidden, stream)?;
             return self
                 .moe_experts_accumulate_device(moe, &b.x, &b.down, 0, inter, hidden, k, stream);
         }
@@ -403,19 +432,7 @@ impl Model {
             self.device
                 .copy(&mb.tmp, 0, &mb.pinned_shared, 0, 2, stream)?;
         }
-        self.kernels.moe_router_f16(
-            &mb.ids,
-            &mb.weights,
-            &b.x,
-            router_buf,
-            moe.usage.counts(),
-            1,
-            hidden,
-            moe.n_experts,
-            k,
-            moe.norm_topk,
-            stream,
-        )?;
+        self.moe_route(moe, &b.x, 1, hidden, stream)?;
         self.device
             .copy(&mb.ids, 0, &mb.pinned_ids, 0, k * 4, stream)?;
         self.device
@@ -665,25 +682,7 @@ impl Model {
         let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
         let inter = moe.moe_inter;
         let k = moe.n_experts_used;
-        let DevWeight::F16 {
-            buf: router_buf, ..
-        } = &moe.router
-        else {
-            return Err(ForgeError::Unsupported("MoE router must be f16".into()));
-        };
-        self.kernels.moe_router_f16(
-            &mb.ids,
-            &mb.weights,
-            &pb.x,
-            router_buf,
-            moe.usage.counts(),
-            t,
-            hidden,
-            moe.n_experts,
-            k,
-            moe.norm_topk,
-            stream,
-        )?;
+        self.moe_route(moe, &pb.x, t, hidden, stream)?;
         self.device
             .copy(&mb.ids, 0, &mb.pinned_ids, 0, t * k * 4, stream)?;
         self.device
