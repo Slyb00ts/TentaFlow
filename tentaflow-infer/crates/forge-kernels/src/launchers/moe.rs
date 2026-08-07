@@ -438,4 +438,28 @@ pub struct GroupedTiles<'a> {
 }
 
 /// Rows of the grouped activation one tile of a grouped launch covers.
+///
+/// The value the int8 and Q6_K tiles use, and the WIDEST any tile uses — so it
+/// is the right size for the tile table, and the wrong stride to build it with
+/// unless every projection of the layer is that wide. See `grouped_tile_rows`.
 pub const GROUPED_TILE_ROWS: usize = 64;
+
+/// The narrowest tile any format has, and therefore the bound on how many tiles
+/// a grouped launch can need.
+pub const GROUPED_TILE_ROWS_MIN: usize = 16;
+
+impl Kernels {
+    /// Rows of one expert's block that this format's grouped tile computes in a
+    /// single launch.
+    ///
+    /// A tile does NOT loop over tokens: it covers its own width from
+    /// `tile_first` and stops. So the tile table has to be built with exactly
+    /// this stride — built wider, the rows past it belong to no launch and are
+    /// folded into their tokens as whatever the scratch last held.
+    pub fn grouped_tile_rows(&self, quant: QuantKind) -> usize {
+        match quant {
+            QuantKind::MXFP4 => self.mxf4_grouped_tile_rows(),
+            _ => GROUPED_TILE_ROWS,
+        }
+    }
+}

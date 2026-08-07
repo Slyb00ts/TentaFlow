@@ -3126,10 +3126,16 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
                 nsb = sidx // 8
                 nsub = sidx % 8
                 nchunk = nsub // 2
-                wcodes[p] = (
-                    w + wrow_base[p] + nsb * 144 + 16 + nchunk * 32 + part * 8
-                ).load[width=8, alignment=8]()
-                if part == 0:
+                # Kawałek kodów obsługuje DWA etapy — młodsze półbajty i
+                # starsze — a nagłówek superbloku OSIEM. Czytanie ich co etap
+                # ściągało 384 bajty na 144 bajty wagi, czyli 2,67 raza więcej,
+                # niż ten kafel zużywa. Rejestr zapowiedzi trzyma jedno i drugie
+                # przez cały ich zakres, bo pętla przechodzi etapy po kolei.
+                if nsub % 2 == 0:
+                    wcodes[p] = (
+                        w + wrow_base[p] + nsb * 144 + 16 + nchunk * 32 + part * 8
+                    ).load[width=8, alignment=8]()
+                if part == 0 and nsub == 0:
                     whdr[p] = (w + wrow_base[p] + nsb * 144).load[
                         width=16, alignment=16
                     ]()

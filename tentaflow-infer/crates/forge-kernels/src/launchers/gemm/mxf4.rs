@@ -293,6 +293,24 @@ impl Kernels {
     }
 
     /// Wszyscy eksperci MXFP4 kroku w JEDNYM uruchomieniu.
+    /// Wariant kafla zgrupowanego, ktorym ta karta policzy stos MXFP4.
+    ///
+    /// Jego SZEROKOSC W TOKENACH jest tu wyjsciem, a nie warunkiem wyboru: kafel
+    /// nie petli po tokenach, wiec tablica kafli musi byc budowana dokladnie tym
+    /// krokiem. Zbudowana szerszym zostawialaby wiersze, ktorych nikt nie liczy.
+    fn mxf4_grouped_variant(&self) -> (&'static str, usize, u32) {
+        GROUPED_TILE
+            .iter()
+            .copied()
+            .find(|(name, _, _)| self.artifacts.has(name))
+            .unwrap_or(GROUPED_TILE[GROUPED_TILE.len() - 1])
+    }
+
+    /// Wierszy zgrupowanego bloku na jedno uruchomienie kafla MXFP4.
+    pub fn mxf4_grouped_tile_rows(&self) -> usize {
+        self.mxf4_grouped_variant().1
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_mxf4_grouped(
         &self,
@@ -311,16 +329,7 @@ impl Kernels {
                 "gemm_mxf4_grouped wymaga cols % 64 == 0, otrzymano rows={rows}, cols={cols}"
             )));
         }
-        // Kafel szerszy w tokenach liczylby zera: przy 256 ekspertach na
-        // jednego przypada kilkanascie wierszy, a `GROUPED_TILE_ROWS` jest
-        // gorna granica, nie srednia.
-        let (name, _, threads) = GROUPED_TILE
-            .iter()
-            .copied()
-            .find(|(name, tokens, _)| {
-                crate::launchers::moe::GROUPED_TILE_ROWS >= *tokens && self.artifacts.has(name)
-            })
-            .unwrap_or(GROUPED_TILE[1]);
+        let (name, _, threads) = self.mxf4_grouped_variant();
         let k = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
             grid: (

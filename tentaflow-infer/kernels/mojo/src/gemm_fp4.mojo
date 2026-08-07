@@ -341,8 +341,13 @@ comptime gemm_mxf4_grouped_f16_bm128_bn16 = gemm_mxf4_grouped_impl[4, 1, 2, 2, 1
 """Wariant dla tablicy kafli wezszej niz trzydziesci dwa wiersze."""
 
 comptime gemm_mxf4_grouped_f16_bm128_bn32_w32 = gemm_mxf4_grouped_impl[8, 4, 1, 1, 2]
-"""Ten sam kafel wyjscia policzony TRZYDZIESTOMA DWOMA osnowami przy dwoch
-blokach `k` na przejscie.
+"""Kafel policzony TRZYDZIESTOMA DWOMA osnowami przy dwoch blokach `k`.
+
+Szeroki na TRZYDZIESCI DWA tokeny, i tyle samo musi wynosic krok tablicy kafli,
+bo kafel nie petli po tokenach. Szerszy kafel czytalby wage goracego eksperta
+raz zamiast dwa, ale liczylby dopelnienie dla zimnych, ktorych jest wiekszosc:
+przy 256 ekspertach na jednego przypada okolo szesnastu wierszy, a kafel
+szescdziesieciocztero-tokenowy zmierzyl 2181 tok/s wobec 2343.
 
 Ksztalt kafla i jego arytmetyka sa te same, co w wariancie czterech osnow —
 zmienia sie, ile linii go liczy, a przez to ile rejestrow zapowiedzi przypada na

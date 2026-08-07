@@ -22,7 +22,7 @@ use forge_formats::FfnActivation;
 use forge_graph::{Act, Shared, Step, WeightId};
 use forge_hal::{DevBuffer, Pool};
 
-use crate::launchers::moe::{GroupedTiles, GROUPED_TILE_ROWS};
+use crate::launchers::moe::{GroupedTiles, GROUPED_TILE_ROWS_MIN};
 use forge_types::{ForgeError, MemKind, QuantKind, Result};
 
 /// Rows below which grouping cannot pay for itself.
@@ -68,9 +68,9 @@ impl CudaExec {
             // One entry per tile of the grouped launch. The worst case is one
             // tile per expert plus one per full tile of selections, which is
             // what an even split and a maximally uneven one each cost.
-            tile_expert: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
-            tile_first: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
-            tile_end: dev((experts + selections / GROUPED_TILE_ROWS + 1) * 4)?,
+            tile_expert: dev((experts + selections / GROUPED_TILE_ROWS_MIN + 1) * 4)?,
+            tile_first: dev((experts + selections / GROUPED_TILE_ROWS_MIN + 1) * 4)?,
+            tile_end: dev((experts + selections / GROUPED_TILE_ROWS_MIN + 1) * 4)?,
             identity: dev(selections * 4)?,
             grouped_x: dev(selections * hidden * 2)?,
             grouped_gate: dev(selections * inter * 2)?,
@@ -610,10 +610,20 @@ impl CudaExec {
         self.device
             .write(bytemuck::cast_slice(&slots), &moe.slots, 0)?;
 
-        // One entry per tile of `GROUPED_TILE_ROWS` rows, saying which expert
-        // that tile reads and where its expert's block begins and ends. Built
-        // here because this is where the row counts are known, and uploaded once
-        // for all three projections.
+        // One entry per tile, saying which expert that tile reads and where its
+        // expert's block begins and ends. Built here because this is where the
+        // row counts are known, and uploaded once for all three projections.
+        //
+        // The STRIDE is the narrowest tile among those three, because a tile
+        // covers its own width from `tile_first` and does not loop past it. The
+        // three projections of one layer need not share a format — Q4_K_M puts
+        // six bits on `ffn_down` and four on the other two — so the table has to
+        // fit the narrowest of them or the widest one drops rows.
+        let stride = [gate, up, down]
+            .iter()
+            .map(|w| self.kernels.grouped_tile_rows(w.quant))
+            .min()
+            .expect("three projections");
         let mut tile_expert = Vec::new();
         let mut tile_first = Vec::new();
         let mut tile_end = Vec::new();
@@ -624,7 +634,7 @@ impl CudaExec {
                 tile_expert.push(e as i32);
                 tile_first.push(at as i32);
                 tile_end.push(to as i32);
-                at += GROUPED_TILE_ROWS;
+                at += stride;
             }
         }
         for (host, dev) in [
