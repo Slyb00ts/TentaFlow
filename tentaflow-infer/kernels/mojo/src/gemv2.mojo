@@ -1274,6 +1274,28 @@ comptime MXFP4_VALS = SIMD[DType.float32, 16](
 )
 
 
+def mxfp4_vals[W: Int](nib: SIMD[DType.uint8, W]) -> SIMD[DType.float32, W]:
+    """`MXFP4_VALS` złożone z bitów zamiast odczytane z tablicy.
+
+    Indeksowanie tablicy wartością Z REJESTRU wypycha ją do pamięci lokalnej, i
+    to osobną kopią na każdą pozycję wektora — szesnaście kodów razy osiem
+    pozycji to pół kilobajta zapisów na jeden odczyt wagi. Wykładnik e2m1 jest
+    funkcją liniową kodu, więc ta sama liczba powstaje z kilku operacji na
+    rejestrach i nie dotyka pamięci ani razu. Wynik jest bitowo tą samą
+    czwórką bajtów co odczyt z tablicy.
+    """
+    c = nib.cast[DType.uint32]()
+    lo = c & 7
+    # Kolejne pary kodów 1,2|3,4|6,8|12 dzielą wykładnik, stąd `lo >> 1`.
+    var bits = ((lo >> 1) + 0x7F) << 23
+    # Bit mantysy niosą kody 3, 5 i 7 — te trzy pozycje daje maska 0xA8.
+    bits |= ((SIMD[DType.uint32, W](0xA8) >> lo) & 1) << 22
+    bits |= (c & 8) << 28
+    # Kod zerowy jest dodatni w obu połówkach tablicy, więc znika z nim znak.
+    nonzero = (lo + 7) >> 3
+    return bitcast[DType.float32, W](bits & (SIMD[DType.uint32, W](0) - nonzero))
+
+
 def _init_lut16(
     lut: UnsafePointer[
         Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED

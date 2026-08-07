@@ -29,7 +29,7 @@ from std.gpu.compute.mma import mma, ld_matrix
 from std.sys import _RegisterPackType
 from std.sys._assembly import inlined_assembly
 from src.gemv2 import _e2m1x8, _f8e4m3s, _q4k_scale_min, _q3k_scales8
-from src.gemv2 import _iq4xs_scale, _e8m0_half, IQ4NL_VALS, MXFP4_VALS
+from src.gemv2 import _iq4xs_scale, _e8m0_half, IQ4NL_VALS, mxfp4_vals
 from src.gemv2 import _signs8
 from src.gemv2 import IQ1S_DELTA
 
@@ -1636,10 +1636,7 @@ def gemm_mxfp4_gguf_tile_impl[BM: Int, NW: Int](
                 nib = qv[wp] >> 4
             else:
                 nib = qv[wp] & 0x0F
-            var vals = SIMD[DType.float32, 8]()
-            comptime for j in range(8):
-                vals[j] = MXFP4_VALS[Int(nib[j])]
-            wv = (vals * dl[wp]).cast[DType.float16]()
+            wv = (mxfp4_vals[8](nib) * dl[wp]).cast[DType.float16]()
             (wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW).store[
                 width=8, alignment=16
             ](wv)
