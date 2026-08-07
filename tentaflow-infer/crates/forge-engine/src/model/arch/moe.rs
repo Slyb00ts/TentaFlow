@@ -10,7 +10,7 @@ impl Model {
     fn expert_stack_gidx(stack: &ExpertStack) -> bool {
         match stack.representative() {
             DevWeight::Q4K { cols, .. } => *cols <= Kernels::DP4A_MAX_COLS,
-            DevWeight::Q6K { .. } => true,
+            DevWeight::Q6K { .. } | DevWeight::Mxfp4 { .. } => true,
             _ => false,
         }
     }
