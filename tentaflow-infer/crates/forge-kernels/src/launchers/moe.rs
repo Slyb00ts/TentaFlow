@@ -311,11 +311,12 @@ impl Kernels {
         selections: usize,
         stream: &Stream,
     ) -> Result<()> {
-        const BN: usize = 64;
-        let (name, block) = match quant {
-            QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256u32),
-            QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256),
-            QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128),
+        // Wierszy wyjścia na blok — właściwość WYBRANEGO kafla, więc idzie
+        // razem z jego nazwą, a nie osobno.
+        let (name, block, bn) = match quant {
+            QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256u32, 64usize),
+            QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64),
+            QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128, 64),
             other => {
                 return Err(ForgeError::Unsupported(format!(
                     "{other:?}: stos ekspertów nie ma zgrupowanego GEMM-u"
@@ -324,7 +325,7 @@ impl Kernels {
         };
         let kernel = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
-            grid: (rows.div_ceil(BN) as u32, tiles.count as u32, 1),
+            grid: (rows.div_ceil(bn) as u32, tiles.count as u32, 1),
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };

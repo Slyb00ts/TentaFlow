@@ -825,3 +825,29 @@ Ta sama diagnoza czeka na `gemm_i8mma_grouped` (63% prefillu mieszanki, 66
 GB/s): przy `BN=64` i czterech liniach na wiersz jedna linia sztapluje CZTERY I
 PÓŁ BAJTA Q4_K na przejście. Głębsze przejście wymaga tam przebudowy
 podwójnego buforowania, więc nie jest zmianą jednego parametru.
+
+### Wiązaniem kafla zgrupowanego były REJESTRY ZAPOWIEDZI, a nie pasmo
+
+Kafel MXFP4 wydawał 12,6 TFLOP/s przy suficie instrukcji 488 i przenosił wagi
+ekspertów z prędkością 122 GB/s przy 215 GB/s, które ta sama karta osiąga w
+generacji na gęstym Q8_0. Liczył go blok CZTERECH OSNÓW, w którym każda linia
+trzymała osiemnaście słów zapowiedzi kolejnego kafla.
+
+`WARPS_TOK` dzieli kolumnę tokenów między osnowy, więc kształt kafla i jego
+arytmetyka zostają te same — zmienia się tylko, ile linii go liczy, a przez to
+ile rejestrów zapowiedzi przypada na jedną. Prefill 512 tokenów:
+
+    4 osnowy, k1   1989 tok/s        8 osnów,  k2   2245
+    4 osnowy, k2   2119              16 osnów, k2   2426
+    4 osnowy, k4   1904              16 osnów, k4   2358
+                                     32 osnowy, k2  2470
+
+Widać na tym, że dwie dźwignie są SPRZĘŻONE: przy czterech osnowach głębsze
+przejście przegrywa (k4 gorsze od k2), a przy szesnastu nadal przegrywa, bo
+zapowiedź wraca do rejestrów. Kafel skończył przy 182 GB/s.
+
+To samo zastosowane do `gemm_q4_k_i8mma_grouped` NIE DZIAŁA i powód jest w jego
+sztaplowaniu: `W_ROWS_PER_PASS = NTHREADS / 4` wiąże liczbę wątków z `BN`, więc
+szesnastu osnów nie da się dołożyć bez rozszerzenia kafla do `BN=128`, a to
+połowi liczbę bloków. Zmierzone 1365 zamiast 1613 tok/s. Ten kafel wymaga
+przepisania mapy sztaplowania, nie zmiany parametru.
