@@ -193,3 +193,56 @@ fn compare(what: &str, gpu: &Dense<CudaExec>, cpu: &Dense<HostExec>) {
     // different expert would land orders of magnitude outside it.
     common::agrees(what, &got, &want, 0.02);
 }
+
+/// A step recorded at one width, after the buffers it names were replaced.
+///
+/// The executor records a decode step once and replays it, which makes the
+/// recording a set of ADDRESSES. The mixture's scratch is sized for the widest
+/// step seen so far and REPLACED when a wider one arrives, so a long prompt
+/// that follows a short conversation frees exactly the buffers the recorded
+/// decode step launches over.
+///
+/// Held by the RECORDING COUNT rather than by tokens, deliberately. The
+/// released region stays mapped, so a stale recording reads and writes its own
+/// now-unowned scratch and keeps answering correctly — right up until that
+/// memory is handed to something else. A token comparison would pass today and
+/// say nothing about the invariant that has to hold.
+#[test]
+#[ignore = "wymaga karty NVIDIA i checkpointu Qwen3-MoE"]
+fn a_recorded_step_does_not_outlive_the_buffers_it_names() {
+    let Some(path) = checkpoint() else {
+        eprintln!("pomijam: brak checkpointu Qwen3-MoE");
+        return;
+    };
+    let Some(device) = device() else { return };
+    let mut model = Dense::load(&path, |spec| CudaExec::new(device.clone() as Arc<_>, spec))
+        .expect("wczytanie Qwen3-MoE na CUDA");
+
+    let prompt = vec![1u32, 991, 302, 15, 4234];
+    // Long enough that a step is recorded rather than only warmed up.
+    model.reset(SLOT).expect("reset");
+    let before = model.generate(SLOT, &prompt, 8).expect("przebieg samotny");
+    assert_eq!(
+        model.exec_mut().recorded_steps(),
+        1,
+        "krok dekodowania nie został w ogóle nagrany"
+    );
+
+    // Wider than anything the short prompt asked for, so the mixture sizes its
+    // scratch again: 64 tokens is 512 selections against the 40 of five.
+    let long: Vec<u32> = prompt.iter().cycle().take(64).copied().collect();
+    model.reset(1).expect("reset drugiego slotu");
+    model.prefill(1, &long).expect("długi prefill");
+    assert_eq!(
+        model.exec_mut().recorded_steps(),
+        0,
+        "nagranie przeżyło bufory, które nazywa"
+    );
+
+    model.reset(SLOT).expect("reset");
+    let after = model.generate(SLOT, &prompt, 8).expect("przebieg samotny");
+    assert_eq!(
+        before, after,
+        "ten sam prompt po szerszym kroku poszedł inaczej: {before:?} wobec {after:?}"
+    );
+}

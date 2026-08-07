@@ -100,6 +100,7 @@ impl CudaExec {
             rows,
             chunk,
         };
+        self.forget_graphs();
         *held = Some(fresh.clone());
         Ok(fresh)
     }

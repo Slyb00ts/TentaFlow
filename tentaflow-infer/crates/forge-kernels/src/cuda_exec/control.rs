@@ -8,7 +8,7 @@
 use std::cell::Cell;
 
 use forge_graph::Step;
-use forge_hal::{DevBuffer, Device, Event};
+use forge_hal::{DevBuffer, Device};
 use forge_types::{ForgeError, Result};
 
 use super::CudaExec;
@@ -16,10 +16,9 @@ use super::CudaExec;
 /// One control buffer's pinned host mirror and the fence behind its last copy.
 pub(super) struct Staging {
     host: DevBuffer,
-    copied: Event,
-    /// False until the first copy is recorded — an event that was never
-    /// recorded cannot be waited on.
-    live: Cell<bool>,
+    /// Bytes the last write put there, which is the length of the copy that
+    /// has to carry it.
+    bytes: Cell<usize>,
 }
 
 impl Staging {
@@ -30,8 +29,7 @@ impl Staging {
                 forge_types::MemKind::PinnedHost,
                 forge_hal::Pool::Activations,
             )?,
-            copied: device.create_event()?,
-            live: Cell::new(false),
+            bytes: Cell::new(0),
         })
     }
 }
@@ -44,53 +42,108 @@ pub(super) const STAGE_PAGES: usize = 3;
 pub(super) const STAGE_LENGTHS: usize = 4;
 
 impl CudaExec {
-    /// Stages the small i32 control data — ids, positions, page tables — a step
-    /// needs.
+    /// Puts this step's control values in their pinned mirrors.
     ///
-    /// A HAL write lands on the legacy stream while this executor's stream is
+    /// HOST SIDE ONLY — nothing is sent here. The split matters: a replayed
+    /// step does not run a single one of its operations, so whatever computes
+    /// these values has to sit outside the recording, while the copies that
+    /// carry them have to sit inside it.
+    pub(super) fn stage_values(&self, tokens: &[u32], step: &Step) -> Result<()> {
+        // The mirrors are the SOURCE of copies the previous step queued, so
+        // they may not be rewritten until those copies have read them. The
+        // fence behind the previous step is what says they have.
+        if self.fence_live.get() {
+            self.control_fence.synchronize()?;
+        }
+        self.map_pages(step)?;
+        self.put(STAGE_IDS, tokens.iter().map(|&t| t as i32).collect())?;
+        // Pozycje są bezwzględne, po jednej na wiersz kroku.
+        self.put(
+            STAGE_POSITIONS,
+            step.lanes()
+                .iter()
+                .flat_map(|l| (0..step.tokens()).map(move |t| (l.pos + t) as i32))
+                .collect(),
+        )?;
+        self.put(
+            STAGE_BASES,
+            step.lanes().iter().map(|l| l.pos as i32).collect(),
+        )?;
+        self.put(
+            STAGE_LENGTHS,
+            step.lanes().iter().map(|l| (l.pos + 1) as i32).collect(),
+        )
+    }
+
+    /// Sends every mirror, on this executor's stream, ahead of the kernels that
+    /// read it.
+    ///
+    /// A HAL write lands on the legacy stream while this stream is
     /// non-blocking, so it is NOT ordered against work already queued: a write
     /// issued now can overwrite bytes a queued kernel has not read yet. Draining
     /// the stream first made that safe and cost a full pipeline refill four
     /// times per decode step. A copy FROM PINNED MEMORY ON THIS STREAM is
     /// ordered against those kernels by construction, so nothing has to drain —
-    /// and it is a graph node rather than a host call, which is what lets a
-    /// step be captured at all.
+    /// and it is a graph node rather than a host call, which is what lets a step
+    /// be recorded at all.
+    pub(super) fn copy_control(&self) -> Result<()> {
+        let table = [
+            (STAGE_IDS, &self.scratch.ids),
+            (STAGE_POSITIONS, &self.scratch.positions),
+            (STAGE_BASES, &self.scratch.bases),
+            (STAGE_PAGES, &self.scratch.pages),
+            (STAGE_LENGTHS, &self.scratch.lengths),
+        ];
+        for (mirror, dst) in table {
+            let stage = &self.stage_host[mirror];
+            let bytes = stage.bytes.get();
+            if bytes == 0 {
+                continue;
+            }
+            self.device.copy(&stage.host, 0, dst, 0, bytes, &self.stream)?;
+        }
+        Ok(())
+    }
+
+    /// Marks the point past which this step's copies have certainly been read.
     ///
-    /// The mirror stays: the page table alone is read by eighty kernels a step
-    /// and moves for none of them.
-    pub(super) fn stage_i32(&self, dst: &DevBuffer, mirror: usize, values: Vec<i32>) -> Result<()> {
+    /// Recorded OUTSIDE any recording, so a replayed step fences the same way a
+    /// run one does. It fences the whole step rather than only the copies, and
+    /// that costs nothing: a step is built after its predecessor's logits have
+    /// been read back, so the wait in `stage_values` never actually waits.
+    pub(super) fn fence_control(&self) -> Result<()> {
+        self.device.record_event(&self.control_fence, &self.stream)?;
+        self.fence_live.set(true);
+        Ok(())
+    }
+
+    /// One mirror's worth, written only when it actually moved — the page table
+    /// alone is read by eighty kernels a step and moves for none of them.
+    fn put(&self, mirror: usize, values: Vec<i32>) -> Result<()> {
+        let stage = &self.stage_host[mirror];
+        stage.bytes.set(std::mem::size_of_val(&values[..]));
         let held = &self.staged[mirror];
         if *held.borrow() == values {
             return Ok(());
         }
-        let stage = &self.stage_host[mirror];
-        // The pinned buffer is the SOURCE of a copy that may still be queued,
-        // so it may not be rewritten until that copy has read it. In practice
-        // the fence is long past — a step reads its logits back before the next
-        // one is built — but the wait is what makes that a fact rather than an
-        // assumption about the caller.
-        if stage.live.get() {
-            stage.copied.synchronize()?;
-        }
-        let bytes = std::mem::size_of_val(&values[..]);
         let ptr = stage.host.host_ptr().ok_or_else(|| {
             ForgeError::Other("bufor sztaplowania nie jest pamięcią hosta".into())
         })?;
-        // SAFETY: `ptr` owns `MAX_CONTROL_I32 * 4` pinned bytes and `bytes` is
-        // bounded by that allocation; the regions cannot overlap.
+        // SAFETY: `ptr` owns the widest control buffer's bytes and `values` is
+        // never wider than that; the regions cannot overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, ptr, bytes);
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr() as *const u8,
+                ptr,
+                stage.bytes.get(),
+            );
         }
-        self.device
-            .copy(&stage.host, 0, dst, 0, bytes, &self.stream)?;
-        self.device.record_event(&stage.copied, &self.stream)?;
-        stage.live.set(true);
         *held.borrow_mut() = values;
         Ok(())
     }
 
-    /// Gives every lane of this step the pages its context needs, and stages
-    /// the table the kernels read.
+    /// Gives every lane of this step the pages its context needs, and puts the
+    /// table the kernels read in its mirror.
     ///
     /// A lane starting at position zero is a sequence starting over, so it
     /// gives back whatever it no longer needs. Inferred from the position
@@ -137,7 +190,7 @@ impl CudaExec {
         }
         drop(seqs);
         drop(kv);
-        self.stage_i32(&self.scratch.pages, STAGE_PAGES, table)
+        self.put(STAGE_PAGES, table)
     }
 
     /// Pages one lane holds, as a table of its own — that is what the

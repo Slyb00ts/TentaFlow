@@ -89,6 +89,7 @@ impl CudaExec {
         let identity: Vec<i32> = (0..selections as i32).collect();
         self.device
             .write(bytemuck::cast_slice(&identity), &fresh.identity, 0)?;
+        self.forget_graphs();
         *held = Some(fresh.clone());
         Ok(fresh)
     }

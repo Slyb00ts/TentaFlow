@@ -396,6 +396,21 @@ pub enum Op {
 pub trait Executor {
     fn run(&self, op: &Op) -> Result<()>;
 
+    /// One whole step's worth of operations, in order.
+    ///
+    /// The same work as running them one by one, and that is the default. It
+    /// exists because a step is the unit some executors can do something WITH:
+    /// knowing the sequence in advance is what lets one be recorded once and
+    /// replayed, instead of being described to the driver again every token.
+    /// An executor that has nothing to gain from the wider view simply keeps
+    /// this.
+    fn run_step(&self, ops: &[Op]) -> Result<()> {
+        for op in ops {
+            self.run(op)?;
+        }
+        Ok(())
+    }
+
     /// Czeka na wszystko, co zostało zlecone.
     fn sync(&self) -> Result<()>;
 

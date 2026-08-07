@@ -538,30 +538,33 @@ impl<E: Executor + WeightStore> Dense<E> {
             )));
         }
 
-        self.exec.run(&Op::Embed {
+        // The step is handed over WHOLE rather than operation by operation.
+        // Building the list costs one allocation a step and buys the executor
+        // the only thing it cannot reconstruct afterwards: what is coming.
+        let mut ops = Vec::with_capacity(2 + self.layers.len() * 12);
+        ops.push(Op::Embed {
             table: self.embed,
             tokens: tokens.to_vec(),
             step: step.clone(),
-        })?;
+        });
         for index in 0..self.layers.len() {
-            for op in fuse(&self.layer_ops(index, step)) {
-                self.exec.run(&op)?;
-            }
+            ops.extend(fuse(&self.layer_ops(index, step)));
         }
-        self.exec.run(&Op::RmsNorm {
+        ops.push(Op::RmsNorm {
             out: Act::Norm,
             x: Act::Hidden,
             w: self.final_norm,
             step: step.clone(),
-        })?;
+        });
         // Logity tylko dla ostatniego tokenu każdego lane'a: pozostałe wiersze
         // służą wyłącznie zapełnieniu cache'u, a głowa wyjściowa jest z 32
         // tysiącami wierszy najdroższą pojedynczą macierzą w modelu.
-        self.exec.run(&Op::LogitsOfLast {
+        ops.push(Op::LogitsOfLast {
             w: self.lm_head,
             x: Act::Norm,
             step: step.clone(),
-        })?;
+        });
+        self.exec.run_step(&ops)?;
         // Liczniki pozycji przechodzą przez to jedno miejsce. Drugi kafel
         // prefillu musi zacząć tam, gdzie skończył pierwszy, a odejmowanie
         // jedynki „na koniec" jest poprawne wyłącznie dla ostatniego z nich.

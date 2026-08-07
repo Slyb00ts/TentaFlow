@@ -19,8 +19,8 @@
 //     docs/ZADANIE_CUDA_EXECUTOR.md asks, and the answer is yes: paging needs
 //     nothing from the vocabulary, and it needs only one implementation.
 
-use std::cell::RefCell;
-use std::collections::HashMap;
+use std::cell::{Cell, RefCell};
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use half::f16;
@@ -29,19 +29,19 @@ use forge_formats::FfnActivation;
 use forge_graph::{
     Act, ExecSpec, Executor, Layout, Op, QuantWeight, SsmShape, Step, Tile, WeightId, WeightStore,
 };
-use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 use forge_state::kv::{KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
 use forge_state::recurrent::{RecurrentConfig, RecurrentState};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
 use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
 
-use control::{STAGE_BASES, STAGE_IDS, STAGE_LENGTHS, STAGE_POSITIONS};
 
 mod control;
 mod delta;
 mod formats;
 mod fp8;
+mod graph;
 mod moe;
 
 /// Activation rows carried through the layers in one pass — lanes times tokens.
@@ -217,11 +217,18 @@ pub struct CudaExec {
     /// kolejce, a tablica stron jest ta sama dla wszystkich czterdziestu warstw
     /// kroku.
     staged: [RefCell<Vec<i32>>; 5],
-    /// Pinned mirror of each control buffer, plus the event that says its last
-    /// copy has been read. The copy is STREAM-ORDERED against the kernels that
-    /// read the buffer, which is what lets the write happen without draining
-    /// the pipeline first.
+    /// Pinned mirror of each control buffer. The copy out of it is
+    /// STREAM-ORDERED against the kernels that read the buffer, which is what
+    /// lets the write happen without draining the pipeline first.
     stage_host: [control::Staging; 5],
+    /// Fence behind the last step's control copies. See `stage_values`.
+    control_fence: Event,
+    fence_live: Cell<bool>,
+    /// Decode steps already recorded, by lane count.
+    graphs: RefCell<HashMap<u32, ExecGraph>>,
+    /// Lane counts that have run once. The first step of a shape allocates
+    /// what is still lazy, so the second one is the one worth recording.
+    warmed: RefCell<HashSet<u32>>,
     shape: DenseShape,
     /// Dtype the source keeps its normalization weights in. GGUF says f32 and
     /// the kernels read f16, so the conversion happens on upload — and a source
@@ -284,6 +291,7 @@ impl CudaExec {
         // them: five allocations of a few kilobytes, made once, so that no step
         // ever copies out of pageable memory.
         let control_i32 = (n).max(MAX_LANES * per_lane as u32) as usize;
+        let control_fence = device.create_event()?;
         let stage_host: [control::Staging; 5] = {
             let mut made = Vec::with_capacity(5);
             for _ in 0..5 {
@@ -356,6 +364,10 @@ impl CudaExec {
             scratch,
             staged: std::array::from_fn(|_| RefCell::new(Vec::new())),
             stage_host,
+            control_fence,
+            fence_live: Cell::new(false),
+            graphs: RefCell::new(HashMap::new()),
+            warmed: RefCell::new(HashSet::new()),
             shape,
             norm_weights: spec.norm_weights,
         })
@@ -505,6 +517,10 @@ impl WeightStore for CudaExec {
 }
 
 impl Executor for CudaExec {
+    fn run_step(&self, ops: &[Op]) -> Result<()> {
+        self.run_whole_step(ops)
+    }
+
     fn run(&self, op: &Op) -> Result<()> {
         let step = match op {
             Op::Embed { step, .. }
@@ -787,11 +803,6 @@ impl CudaExec {
 
     fn op_embed(&self, table: WeightId, tokens: &[u32]) -> Result<()> {
         let w = self.quant(table)?;
-        self.stage_i32(
-            &self.scratch.ids,
-            STAGE_IDS,
-            tokens.iter().map(|&t| t as i32).collect(),
-        )?;
         // Zbieranie wierszy ma kernel NA FORMAT, a nie jeden na wszystkie —
         // tablica osadzeń w formacie bez takiego kernela zatrzyma się tutaj, bo
         // jej wiersza nie ma czym przeczytać. NVFP4 z compressed-tensors nie
@@ -863,16 +874,6 @@ impl CudaExec {
     }
 
     fn op_rope(&self, act: Act, heads: u32, step: &Step) -> Result<()> {
-        // Pozycje są bezwzględne i idą przez bufor urządzenia, bo kernel czyta
-        // je stamtąd — jeden zapis na krok, nie jeden na wiersz.
-        self.stage_i32(
-            &self.scratch.positions,
-            STAGE_POSITIONS,
-            step.lanes()
-                .iter()
-                .flat_map(|l| (0..step.tokens()).map(move |t| (l.pos + t) as i32))
-                .collect(),
-        )?;
         // A partial rotary is a DIFFERENT kernel, not the same one told to stop
         // early: it pairs dimension j with j + rot/2 and derives the frequency
         // from `rot`, so running the full kernel over a narrower slice would
@@ -904,12 +905,6 @@ impl CudaExec {
     /// Klucz i wartość kroku na swoje strony w cache'u warstwy.
     fn op_kv_append(&self, layer: usize, step: &Step) -> Result<()> {
         let s = self.shape;
-        self.map_pages(step)?;
-        self.stage_i32(
-            &self.scratch.bases,
-            STAGE_BASES,
-            step.lanes().iter().map(|l| l.pos as i32).collect(),
-        )?;
         // Uchwyt cache'u żyje do końca uruchomienia, bo kernel czyta jego
         // bufory; `map_pages` skończyło swoje zapożyczenie wyżej.
         let kv = self.kv.borrow();
@@ -945,11 +940,6 @@ impl CudaExec {
         let per_lane = kv.cfg.max_pages_per_seq;
         let (kc, vc) = layer_slabs(&kv, layer)?;
         if step.tokens() == 1 {
-            self.stage_i32(
-                &self.scratch.lengths,
-                STAGE_LENGTHS,
-                step.lanes().iter().map(|l| (l.pos + 1) as i32).collect(),
-            )?;
             return self.kernels.attn_decode_f16(
                 &self.scratch.attn,
                 &self.scratch.parts,
