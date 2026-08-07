@@ -23,6 +23,7 @@
 	.param .u64 src_gemm_fp4_gemm_mxf4_grouped6A6A6A6A_348aaafe18b15459_param_9,
 	.param .f32 src_gemm_fp4_gemm_mxf4_grouped6A6A6A6A_348aaafe18b15459_param_10
 )
+.maxntid 1024, 1, 1
 {
 	.reg .pred 	%p<43>;
 	.reg .b16 	%rs<64>;

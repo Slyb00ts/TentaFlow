@@ -254,13 +254,47 @@ def with_max_registers(text, artifact):
     return f"{text[:open_brace]}.maxnreg {cap}\n{text[open_brace:]}"
 
 
+# Watkow w bloku, ktorym kernel JEST uruchamiany.
+#
+# To nie jest strojenie, tylko warunek WYSTARTOWANIA. `ptxas` nie wie, jak
+# szeroki bedzie blok, wiec alokuje rejestry swobodnie; przy 1024 watkach plik
+# rejestrow multiprocesora (65536) daje 64 rejestry na watek i kazda zmiana,
+# ktora wezmie 65, konczy sie `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` W CZASIE
+# DZIALANIA, bo build przechodzi bez slowa. `.maxntid` przekazuje ta liczbe
+# asemblerowi, wiec sam celuje w limit — i wywala sie glosno, gdyby launcher
+# zamowil kiedys szerszy blok, niz kernel deklaruje.
+PTX_BLOCK_THREADS = {
+    # 8 x 4 osnowy. Bez tej deklaracji kernel wychodzil na 64 rejestry
+    # PRZYPADKIEM i stal jeden rejestr od nieuruchamialnosci; z nia `ptxas`
+    # trafia w 64 sam, bez ani bajtu spillu.
+    "gemm_mxf4_grouped_f16_bm128_bn32_w32": 1024,
+}
+
+
+def with_block_size(text, artifact):
+    """Dopisuje `.maxntid` do wejscia kernela o zadeklarowanym rozmiarze bloku."""
+    threads = PTX_BLOCK_THREADS.get(artifact)
+    if threads is None:
+        return text
+    if ".maxntid" in text:
+        return text
+    marker = ".visible .entry "
+    start = text.find(marker)
+    if start < 0:
+        raise RuntimeError(f"brak wpisu .visible .entry w {artifact}.ptx")
+    open_brace = text.find("{", start)
+    if open_brace < 0:
+        raise RuntimeError(f"brak ciala kernela w {artifact}.ptx")
+    return f"{text[:open_brace]}.maxntid {threads}, 1, 1\n{text[open_brace:]}"
+
+
 def normalized_ptx(text, artifact, portable_nvfp4):
     if artifact in portable_nvfp4 or ("fp8" not in artifact and "nvfp4" not in artifact):
         text = text.replace(".target sm_89", ".target sm_80")
     if artifact.startswith("gemm_fp8"):
         for version in ("8.0", "8.1", "8.2", "8.3"):
             text = text.replace(f".version {version}", ".version 8.4")
-    return with_max_registers(text, artifact)
+    return with_block_size(with_max_registers(text, artifact), artifact)
 
 
 # --- AMD (AMDGCN) -----------------------------------------------------------
