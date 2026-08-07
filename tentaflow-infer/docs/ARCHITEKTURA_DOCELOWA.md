@@ -1437,3 +1437,59 @@ znaczy, że zmienić się musi POSTAĆ ZAPISANEJ WAGI, nie kernel. To samo wysz�
 przy Q8_0 od drugiej strony: tam szersze odczyty wymagały oddania
 czterokrotnej równoległości. Trzy formaty, trzy różne obejścia, ta sama
 odpowiedź — płaszczyzny.
+
+## Silnik i wykonawca grafowy rozeszły się na mieszance ekspertów
+
+Optymalizacje MoE z lipca i sierpnia trafiały do `CudaExec`, a `forge-engine`
+zostawał przy pierwszej, poprawnościowej wersji. `bench`, `serve` i `run`
+uruchamiają WYŁĄCZNIE silnik — `CudaExec` nie ma z nich ani jednego wywołania —
+więc każdy pomiar zrobiony przez `forge-model` opisywał kod, którego użytkownik
+nie dostaje. Rozjazd urósł do 24× na prefillu i 1,6× na dekodowaniu, zanim
+ktokolwiek go zobaczył, bo model gęsty (Bielik) odtwarzał się co do procenta i
+niczego nie sygnalizował.
+
+Trzy rzeczy istniały w `forge-kernels` z testami i nie miały wołającego poza
+`CudaExec`: rozdzielony router (`moe_topk_f32`), wsadowa rozsyłka wyboru
+(`gemv_gidx_batch`, `gemv_silu_gidx_batch`) i zgrupowany GEMM
+(`gemm_grouped_experts`). Wpięcie ich w silnik dało na RTX GB10 dla
+Qwen3-30B-A3B Q4_K: prefill 94,8 → 2330,6 tok/s, dekodowanie 41,8 → 68,1 tok/s,
+przy wyjściu bitowo niezmienionym na każdym kroku.
+
+Wniosek na przyszłość: pomiar ze ścieżki grafowej NIE jest pomiarem produktu,
+dopóki `forge-engine` nie zniknie. Każdą liczbę podawaną jako wynik FORGE
+trzeba brać z `forge bench`.
+
+## Budżet rezydencji ekspertów liczył sklejony tensor tyle razy, ilu jest ekspertów
+
+`byte_len(name.replace("{expert}", "0")) * n_experts` jest poprawne dla
+safetensors, gdzie każdy ekspert ma własny tensor, i błędne dla GGUF, gdzie
+`blk.N.ffn_gate_exps.weight` niesie już cały stos. Qwen3.6-35B-A3B raportował
+4 177 920 MiB ekspertów wobec 58 GiB VRAM i 1,4% rezydencji zamiast 16 320 MiB
+i 100%. Nie to było wąskim gardłem prefillu, ale każda decyzja o stronicowaniu
+opierała się na liczbie 256 razy za dużej.
+
+## Prefill hybrydy odrzuca MoE i schodzi do prędkości dekodowania
+
+`hybrid_batched_prefill_capable` ma warunek `!self.weights.is_moe()`, a droga
+layer-major wymaga `LayerFfn::Dense`. Model hybrydowy z mieszanką ekspertów nie
+przechodzi przez żadną z nich i liczy prefill token po tokenie — tą samą
+warstwą co dekodowanie. Stąd Qwen3.6-35B-A3B MXFP4 ma prefill 6,4 tok/s przy
+dekodowaniu 6,3: to nie zbieżność, to ta sama pętla. Profil: 92,6% czasu GPU w
+`gemm_mxfp4_gguf_impl`, router wołany 20480 razy zamiast raz na warstwę.
+
+Wpięcie tu `moe_prefill_ffn` nie wystarczy. Bufory routera i grupowania są
+wymiarowane na `MAX_PREFILL_CHUNK`, a arena layer-major dobiera segmenty do
+T2048/T4096, więc segment dla modelu MoE musiałby być osobno ograniczony.
+Zgrupowany kafel MXFP4 jest też innym wywołaniem niż `gemm_grouped_experts`
+(`gemm_mxf4_grouped`, kwantyzowana para aktywacji) i wg pomiaru w
+`launchers/moe.rs` przegrywa 1,3× z rozsyłką per ekspert — dla tego formatu
+grupowanie ma dotyczyć WIERSZY, nie siatki.
+
+## Sufit dekodowania Qwen3-30B-A3B na GB10
+
+Na token: 1,18 GB wag ekspertów (8 z 128, trzy projekcje, 48 warstw), 0,51 GB
+projekcji uwagi, 0,26 GB głowy. Razem 1,94 GB, co przy zmierzonych 237 GB/s
+daje 8,2 ms i 122 tok/s. FORGE jest na 14,7 ms (56% sufitu), llama.cpp na
+12,3 ms (67%). Sam FFN ekspertów zajmuje 5,99 ms wobec 4,96 ms wynikających z
+bajtów, czyli 83% pasma — tam nie ma już zapasu. Reszta różnicy siedzi w
+projekcjach uwagi i głowie, rozdrobniona.
