@@ -1261,3 +1261,61 @@ porównywane są logity regułą remisu tej samej postaci co `common::agrees` �
 z tą różnicą, że pierwsze miejsce też jej podlega, bo tu obie strony są nasze i
 żadna nie jest wzorcem. Zgodne lane'y dają 1,6% rozpiętości, podstawiony cudzy
 token daje 14,7%: reguła nie jest poluzowaniem, tylko właściwą miarą.
+
+## Prefill hybrydy: trzy ślepe uliczki i jedna prawdziwa ściana
+
+Prefill hybrydy (0,93x wobec llama.cpp) rozkłada się tak (`nsys`, pp512,
+`--cuda-graph-trace=node`): **48% w `gemm_mxf4_grouped`** (240 uruchomień,
+mediana 888 us), 17,6% w `gemm_i8mma`, 9,7% w skanie DeltaNet. Poprawa prefillu
+to więc poprawa jednego kernela.
+
+`ncu` na nim: 54,4 cykla między wydaniami, z tego **28,3 na `long_scoreboard`
+i 18,7 na `barrier`**, przepustowość pamięci 27%, obliczeń 27%. Wygląda to na
+podręcznikowy przypadek podwójnego buforowania — i nim nie jest.
+
+**Zajętość jest już maksymalna i nie da się jej podnieść ŻADNYM kształtem
+bloku.** Kernel bierze 64 rejestry, a plik rejestrów multiprocesora ma 65536,
+więc mieści się dokładnie 1024 wątki — niezależnie od tego, czy to jeden blok
+po 1024, dwa po 512, czy trzy po 256. Wariant 768-wątkowy (`bm96_bn32_w24`,
+te same akumulatory na wątek) wyszedł na 72 rejestry, czyli JEDEN blok na
+multiprocesor i 50% zajętości zamiast 66,7%. Blok 1024/64 jest optymalny, a nie
+przypadkowy: wykorzystuje cały plik rejestrów.
+
+**Podwójne buforowanie kafla nie dało nic.** Dwa komplety pamięci współdzielonej
+na przemian zdejmują jedną z dwóch barier iteracji (zapis następnego kompletu
+nie może wejść na wciąż czytany, jeśli idzie do drugiego). Zmierzone:
+2325,3 wobec 2328,1 tok/s. Bariera nie była tym, co trzymało — czas i tak
+schodzi na `long_scoreboard`.
+
+**Kernel stoi JEDEN REJESTR od niewystartowania, i nikt tego nie pilnuje.**
+`ptxas` nie zna rozmiaru bloku (Mojo nie emituje `.maxntid`), więc alokuje
+rejestry swobodnie i wylądował na 64 przypadkiem. Każda zmiana, która doda
+choć jeden — podwójny bufor daje 69-72, `KSTEP = 4` dawało 104 — kończy się
+`CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES` W CZASIE DZIAŁANIA, bo build przechodzi.
+Zweryfikowane lekarstwo: `.maxntid 1024, 1, 1` w PTX sprawia, że `ptxas` celuje
+w 64 rejestry sam (0 bajtów zrzutów na obecnym kernelu, 8 na podwójnie
+buforowanym) i wariant, który wcześniej nie startował, startuje. Wstrzyknięcie
+tej dyrektywy należałoby do `normalized_ptx` w
+`scripts/build_kernel_catalog.py`, z rozmiarem bloku zadeklarowanym w katalogu
+obok kernela — nie zrobione, bo dziś nic nie przyspiesza, ale to jedyna droga
+do jakiejkolwiek zmiany rejestrochłonnej w tym kaflu.
+
+Prawdziwym kosztem jest więc `long_scoreboard`, a jego źródłem `_mxfp4_word`:
+blok MXFP4 ma 17 bajtów, więc każde słowo fragmentu składa się z DWÓCH
+wyrównanych odczytów i przesunięcia 64-bitowego. To dwa razy tyle żądań, ile
+niesie bajtów. Usunięcie drugiego odczytu (pomiar na celowo błędnym wyniku) nie
+zmniejszyło rejestrów — podniosło je do 72, bo harmonogram zrobił się luźniejszy
+— więc zysk musiałby przyjść z PRZEPAKOWANIA wagi przy wczytaniu do układu
+36-bajtowego fragmentu, kosztem 5,9% bajtów. To jedyna niesprawdzona hipoteza,
+jaka tu została.
+
+## Dekod Q6_K: rozwinięcie po superblokach nie działa
+
+Q6_K jest po zmianie Q4_K najsłabszym miejscem dekodu gęstego: ten sam
+`ffn_down` liczy się 209 us w Q6_K i 121 us w Q4_K, czyli 179 wobec 213 GB/s.
+Szerokich odczytów nie da się tam zrobić (superblok ma 210 bajtów), więc
+próbowane było to samo, co przy Q4_K pomogło wcześniej: wydanie odczytów
+DOT_UNROLL superbloków przed konsumpcją któregokolwiek. Dla dwóch i dla
+czterech superbloków: 43,3 -> 43,3 i 43,2 tok/s, liczba rejestrów bez zmian
+(56), czyli kompilator i tak nie utrzymał zapowiedzianych odczytów w locie.
+Kod wrócił do postaci zwiniętej.
