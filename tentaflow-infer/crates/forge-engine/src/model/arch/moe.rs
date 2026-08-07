@@ -498,24 +498,85 @@ impl Model {
     ) -> Result<()> {
         let b = &self.bufs;
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
-        for j in 0..k {
-            self.gemv_rows_gidx(&b.gate, &moe.gate_exps, x_in, &mb.ids, j, inter, stream)?;
-            self.gemv_rows_gidx(&b.up, &moe.up_exps, x_in, &mb.ids, j, inter, stream)?;
-            self.kernels
-                .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)?;
-            self.gemv_rows_gidx(&mb.tmp, &moe.down_exps, &b.act, &mb.ids, j, hidden, stream)?;
-            self.kernels.moe_scale_add_gidx_f16(
-                out,
-                out_off,
-                &mb.tmp,
-                0,
-                hidden,
-                &mb.weights,
-                j,
-                j == 0,
+        // Gate and up multiply the SAME activation by two matrices of one
+        // expert, so a kernel that takes both tables stages that activation once
+        // and folds the gate function into its epilogue.
+        let gate_stack = moe.gate_exps.representative();
+        let up_stack = moe.up_exps.representative();
+        let fused = gate_stack.block_quant() == up_stack.block_quant()
+            && gate_stack.cols() == up_stack.cols()
+            && gate_stack.block_quant().is_some_and(|quant| {
+                self.kernels
+                    .gemv_silu_gidx_batch(
+                        quant,
+                        &mb.sel_gate,
+                        moe.gate_exps.table(),
+                        moe.up_exps.table(),
+                        x_in,
+                        inter,
+                        gate_stack.cols(),
+                        &mb.ids,
+                        k,
+                        k,
+                        stream,
+                    )
+                    .unwrap_or(false)
+            });
+        if !fused {
+            self.gemv_rows_gidx_batch(
+                &mb.sel_gate,
+                &moe.gate_exps,
+                x_in,
+                &mb.ids,
+                k,
+                k,
+                inter,
+                stream,
+            )?;
+            self.gemv_rows_gidx_batch(
+                &mb.sel_up,
+                &moe.up_exps,
+                x_in,
+                &mb.ids,
+                k,
+                k,
+                inter,
+                stream,
+            )?;
+            self.kernels.glu_mul_f16(
+                self.ffn_act(),
+                &mb.sel_gate,
+                &mb.sel_gate,
+                &mb.sel_up,
+                k * inter,
                 stream,
             )?;
         }
+        // One, not `k`: the half read here was written per SELECTION above, so
+        // every selection already owns its row.
+        self.gemv_rows_gidx_batch(
+            &mb.sel_out,
+            &moe.down_exps,
+            &mb.sel_gate,
+            &mb.ids,
+            k,
+            1,
+            hidden,
+            stream,
+        )?;
+        // Every selection sits at its own row, in the router's order, so the
+        // slot table IS the identity over selections — nothing was reordered.
+        self.kernels.moe_combine_f16(
+            out,
+            &mb.sel_out,
+            &mb.identity,
+            &mb.weights,
+            1,
+            hidden,
+            k,
+            true,
+            stream,
+        )?;
         if let Some(sh) = &moe.shared {
             let sh_inter = sh.down.cols();
             match &sh.gate_up {
@@ -736,5 +797,4 @@ impl Model {
         }
         Ok(())
     }
-
 }

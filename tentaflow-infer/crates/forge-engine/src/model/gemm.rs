@@ -2,7 +2,6 @@
 use super::*;
 
 impl Model {
-
     /// Wykonuje kilka pełnych projekcji GGUF NVFP4 ze wspólną kwantyzacją
     /// aktywacji Q8_1. Zwraca `false`, gdy choć jedna waga ma inny format.
     /// Wykonuje kilka projekcji Q8_0 jednym uruchomieniem. Zwraca `false`, gdy
@@ -68,7 +67,8 @@ impl Model {
         if cols > Kernels::DP4A_MAX_COLS {
             return Ok(false);
         }
-        self.kernels.gemv_q4_k_dp4a_group_f16(&group, x, cols, stream)
+        self.kernels
+            .gemv_q4_k_dp4a_group_f16(&group, x, cols, stream)
     }
 
     /// Grupa projekcji o RÓŻNYCH formatach — jedno uruchomienie.
@@ -166,10 +166,12 @@ impl Model {
         Ok(true)
     }
 
-
-
-
-    pub(crate) fn logits_gemv(&self, y_f32: &DevBuffer, x: &DevBuffer, stream: &Stream) -> Result<()> {
+    pub(crate) fn logits_gemv(
+        &self,
+        y_f32: &DevBuffer,
+        x: &DevBuffer,
+        stream: &Stream,
+    ) -> Result<()> {
         // Głowa NIE korzysta z paczki `fp8_lm_head`, choć ta jest budowana razem
         // z paczkami FFN. e4m3 ma 3-bitową mantysę w warstwie, która wprost
         // wybiera token: użycie jej TYLKO tutaj dawało inny strumień greedy w
@@ -213,7 +215,6 @@ impl Model {
         }
         Ok(())
     }
-
 
     pub(crate) fn gemm(
         &self,
@@ -351,9 +352,11 @@ impl Model {
             ProjectionPlan::W4A8(w) => self.gemm_w4a8(y, w, x, rows, stream),
             ProjectionPlan::Fp8(w) if shared_act => self.gemm_fp8_prequant(y, w, rows, stream),
             ProjectionPlan::Fp8(w) => self.gemm_fp8(y, w, x, rows, stream),
-            ProjectionPlan::Rows { w, row_off, rows: n } => {
-                self.gemm_rows(y, w, x, rows, *row_off, *n, stream)
-            }
+            ProjectionPlan::Rows {
+                w,
+                row_off,
+                rows: n,
+            } => self.gemm_rows(y, w, x, rows, *row_off, *n, stream),
         }
     }
 
@@ -390,19 +393,55 @@ impl Model {
         }
         match &layer.attn().attn_qkv {
             QkvWeights::Fused(w) => [
-                ProjectionPlan::Rows { w, row_off: 0, rows: q_rows },
-                ProjectionPlan::Rows { w, row_off: q_rows, rows: kv_rows },
-                ProjectionPlan::Rows { w, row_off: q_rows + kv_rows, rows: kv_rows },
+                ProjectionPlan::Rows {
+                    w,
+                    row_off: 0,
+                    rows: q_rows,
+                },
+                ProjectionPlan::Rows {
+                    w,
+                    row_off: q_rows,
+                    rows: kv_rows,
+                },
+                ProjectionPlan::Rows {
+                    w,
+                    row_off: q_rows + kv_rows,
+                    rows: kv_rows,
+                },
             ],
             QkvWeights::FusedQk { qk, v } => [
-                ProjectionPlan::Rows { w: qk, row_off: 0, rows: q_rows },
-                ProjectionPlan::Rows { w: qk, row_off: q_rows, rows: kv_rows },
-                ProjectionPlan::Rows { w: v, row_off: 0, rows: v.rows() },
+                ProjectionPlan::Rows {
+                    w: qk,
+                    row_off: 0,
+                    rows: q_rows,
+                },
+                ProjectionPlan::Rows {
+                    w: qk,
+                    row_off: q_rows,
+                    rows: kv_rows,
+                },
+                ProjectionPlan::Rows {
+                    w: v,
+                    row_off: 0,
+                    rows: v.rows(),
+                },
             ],
             QkvWeights::Split { q, k, v } => [
-                ProjectionPlan::Rows { w: q, row_off: 0, rows: q.rows() },
-                ProjectionPlan::Rows { w: k, row_off: 0, rows: k.rows() },
-                ProjectionPlan::Rows { w: v, row_off: 0, rows: v.rows() },
+                ProjectionPlan::Rows {
+                    w: q,
+                    row_off: 0,
+                    rows: q.rows(),
+                },
+                ProjectionPlan::Rows {
+                    w: k,
+                    row_off: 0,
+                    rows: k.rows(),
+                },
+                ProjectionPlan::Rows {
+                    w: v,
+                    row_off: 0,
+                    rows: v.rows(),
+                },
             ],
         }
     }
@@ -465,7 +504,6 @@ impl Model {
             .gemm_fp8_modular_prequant(y, &w.qweight, &w.scales, w.rows, w.cols, n_tokens, stream)
     }
 
-
     /// Single-token GEMV over a row window of `w` (`y = W[row_off..+n_rows]·x`).
     /// The routed-MoE expert path uses this instead of the batched `gemm_rows`:
     /// a decode step feeds one token, and the GEMM tile (BM=64) then launches
@@ -507,43 +545,43 @@ impl Model {
         }
     }
 
-    /// Single-token GEMV over the expert selected on-device by `ids[sel]`: the
-    /// device analog of `gemv_rows`, resolving that expert's weight base from
-    /// the stack's device-resident pointer table inside the kernel.
-    /// Bit-identical to `gemv_rows(y, stack.expert(ids[sel]), x, 0, n_rows, ..)`.
+    /// Every selection of a routed step through one stack, in ONE launch.
+    ///
+    /// The device analog of `gemv_rows`: each selection's weight base is
+    /// resolved from the stack's device-resident pointer table inside the
+    /// kernel, so nothing is read back to the host. The selection is a grid
+    /// dimension rather than a launch of its own. `share` is how many
+    /// selections read the same row of `x` — `top_k` while the activation is
+    /// still per token, one once every selection owns its row.
     /// Only the quants `expert_stack_gidx` accepts reach here.
     #[allow(clippy::too_many_arguments)]
-    pub(crate) fn gemv_rows_gidx(
+    pub(crate) fn gemv_rows_gidx_batch(
         &self,
         y: &DevBuffer,
         stack: &ExpertStack,
         x: &DevBuffer,
         ids: &DevBuffer,
-        sel: usize,
+        selections: usize,
+        share: usize,
         n_rows: usize,
         stream: &Stream,
     ) -> Result<()> {
-        match stack.representative() {
-            DevWeight::Q4K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
-                .kernels
-                .gemv_q4_k_dp4a_f16_gidx(y, stack.table(), x, n_rows, *cols, ids, sel, stream),
-            DevWeight::Q6K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
-                .kernels
-                .gemv_q6_k_dp4a_f16_gidx(y, stack.table(), x, n_rows, *cols, ids, sel, stream),
-            DevWeight::Q6K { cols, .. } => self.kernels.gemv_q6_k_f16_gidx(
-                y,
-                stack.table(),
-                x,
-                n_rows,
-                *cols,
-                ids,
-                sel,
-                stream,
-            ),
-            _ => Err(ForgeError::Unsupported(
-                "gemv_rows_gidx called for a non-gidx expert quant".into(),
-            )),
-        }
+        let w = stack.representative();
+        let quant = w.block_quant().ok_or_else(|| {
+            ForgeError::Unsupported("gemv_rows_gidx_batch called for a blockless expert".into())
+        })?;
+        self.kernels.gemv_gidx_batch(
+            quant,
+            y,
+            stack.table(),
+            x,
+            n_rows,
+            w.cols(),
+            ids,
+            selections,
+            share,
+            stream,
+        )
     }
 
     /// Batchowa głowa logitów: y[b, vocab] f32 = lm_head · x[b, hidden].
@@ -612,5 +650,4 @@ impl Model {
             )),
         }
     }
-
 }

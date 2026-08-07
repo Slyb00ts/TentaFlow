@@ -17,8 +17,8 @@ use forge_formats::source::{GgufSource, HostWeight, StSource, TensorSource};
 use forge_formats::w4a8::{col_absmax, smoothing_scale, w4a8_pack_smoothed, W4A8_GROUP};
 use forge_formats::MtpWeightRole;
 use forge_formats::{
-    dequantize_to_f32, BlockMatrix, Gguf, HfConfig, LayerKind, ModelDescriptor,
-    RoleShard, TpShard, WeightRole,
+    dequantize_to_f32, BlockMatrix, Gguf, HfConfig, LayerKind, ModelDescriptor, RoleShard, TpShard,
+    WeightRole,
 };
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::{Kernels, Nvfp4GgufLayout};
@@ -370,7 +370,7 @@ impl DevWeight {
     /// zostaje na swojej ścieżce.
     pub fn fp8_repack_source(&self) -> Option<(&DevBuffer, usize, usize, QuantKind, f32)> {
         match self {
-        DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K, 1.0)),
+            DevWeight::Q4K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q4K, 1.0)),
             DevWeight::Q6K { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q6K, 1.0)),
             DevWeight::Q8_0 { buf, rows, cols } => Some((buf, *rows, *cols, QuantKind::Q8_0, 1.0)),
             // Paker czyta surowe bloki 36 B, więc przepakowany układ kafelkowy
@@ -869,8 +869,6 @@ pub struct ModelWeights {
     pub nvfp4_repacked_weights: usize,
 }
 
-
-
 struct SourceMtpLoader<'a> {
     device: &'a dyn Device,
     source: &'a dyn TensorSource,
@@ -941,8 +939,6 @@ fn pack_q8_0(values: &[f32]) -> Vec<u8> {
     }
     out
 }
-
-
 
 const NVFP4_CT_STAGING_BYTES: usize = 8 * 1024 * 1024;
 
@@ -1425,11 +1421,6 @@ fn finish_nvfp4_ct_load<T>(load: Result<T>, reset: Result<()>) -> Result<T> {
     }
 }
 
-
-
-
-
-
 fn f32s_to_f16_bytes(vals: &[f32]) -> Vec<u8> {
     let mut out = Vec::with_capacity(vals.len() * 2);
     for &v in vals {
@@ -1634,7 +1625,10 @@ fn upload_norm_shard(
         )));
     }
     let mut out = Vec::with_capacity(
-        ranges.iter().map(|(_, count)| count * row_width).sum::<usize>(),
+        ranges
+            .iter()
+            .map(|(_, count)| count * row_width)
+            .sum::<usize>(),
     );
     for &(first, count) in ranges {
         let from = first * row_width;
@@ -1649,10 +1643,6 @@ fn upload_norm_shard(
     }
     upload(device, &f32s_to_f16_bytes(&out))
 }
-
-
-
-
 
 /// Przestawia wiersze Q/K tak, żeby kernel RoPE w stylu NeoX policzył rotację
 /// PRZEPLATANĄ, której wymaga rodzina Llama.
@@ -2220,17 +2210,9 @@ fn expert_residency_budget(
         for (role, name) in layer {
             match role {
                 WeightRole::FfnGateExps | WeightRole::FfnUpExps | WeightRole::FfnDownExps => {
-                    // Ta rola przychodzi w dwóch postaciach. Safetensors trzyma
-                    // eksperta w osobnym tensorze, więc nazwa jest SZABLONEM:
-                    // rozmiar bierzemy z eksperta zerowego i mnożymy, bo wszyscy
-                    // są równi. GGUF skleja ich w jeden tensor, który JUŻ niesie
-                    // komplet — pomnożony jeszcze raz kazałby silnikowi wierzyć,
-                    // że eksperci są setki razy więksi niż pamięć, i stronicować
-                    // model, który mieści się w niej w całości.
+                    // Szablon safetensors niesie jednego eksperta, sklejony tensor GGUF cały stos.
                     expert_bytes += match name.split_once("{expert}") {
-                        Some((head, tail)) => {
-                            src.byte_len(&format!("{head}0{tail}"))? * n_experts?
-                        }
+                        Some((h, t)) => src.byte_len(&format!("{h}0{t}"))? * n_experts?,
                         None => src.byte_len(name)?,
                     };
                 }
@@ -4732,7 +4714,9 @@ mod tests {
 /// format bez kernela z wyjściem f32 — wtedy zostaje w całości na karcie modelu.
 /// Głowa jest czytana raz na token, więc jej podział liczy się w dekodowaniu tyle
 /// samo co kilka warstw FFN.
-pub fn load_lm_head_shard_source(path: &Path) -> Result<Option<(Vec<u8>, usize, usize, QuantKind)>> {
+pub fn load_lm_head_shard_source(
+    path: &Path,
+) -> Result<Option<(Vec<u8>, usize, usize, QuantKind)>> {
     let gguf = Gguf::open(path)?;
     let descriptor = ModelDescriptor::detect(&gguf)?;
     let Some(name) = descriptor.globals.get(&WeightRole::LmHead) else {
@@ -4755,8 +4739,14 @@ pub fn load_lm_head_shard_source(path: &Path) -> Result<Option<(Vec<u8>, usize, 
 /// Wpis `None` znaczy „ta warstwa nie jest DeltaNetem".
 pub fn load_delta_projection_source(
     path: &Path,
-) -> Result<Vec<Option<(crate::tensor_parallel::DeltaMatrix, crate::tensor_parallel::DeltaMatrix)>>>
-{
+) -> Result<
+    Vec<
+        Option<(
+            crate::tensor_parallel::DeltaMatrix,
+            crate::tensor_parallel::DeltaMatrix,
+        )>,
+    >,
+> {
     let gguf = Gguf::open(path)?;
     let descriptor = ModelDescriptor::detect(&gguf)?;
     let src = GgufSource(&gguf);
@@ -4940,7 +4930,6 @@ pub fn load_ffn_shards_gguf(
     }
     Ok(out)
 }
-
 
 #[cfg(test)]
 mod rope_permute_tests {

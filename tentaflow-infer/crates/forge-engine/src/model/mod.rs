@@ -23,9 +23,8 @@ use forge_hal::{DevBuffer, Device, Event, ExecGraph, Pool, Stream};
 pub use forge_kernels::Nvfp4GgufLayout;
 
 use forge_kernels::{
-    MixedQuant,
-    nvfp4_ct_physical_m, DeltaStateLayout, DensePrefillLogitsKind, Kernels, Nvfp4CtProjection,
-    Nvfp4CtS0View, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection,
+    nvfp4_ct_physical_m, DeltaStateLayout, DensePrefillLogitsKind, Kernels, MixedQuant,
+    Nvfp4CtProjection, Nvfp4CtS0View, Nvfp4GgufQ8Projection, Q8ActPrepared, Q8PreparedProjection,
 };
 
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result, Vendor};
@@ -50,9 +49,9 @@ use crate::tier::{KvTierConfig, TierManager, STAGE_SLOTS};
 use crate::weight_tier::{TieredWeightDevice, WeightResidency};
 
 use crate::weights::{
-    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8Layer, Fp8Weight,
-    GateUpWeights, LayerFfn, LayerMixer, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy,
-    NvFp4CtStorage, QkvWeights, W4A8Weight, W4A8Layer, LayerWeights, Fp8FfnLayer,
+    AttnWeights, CalibStats, DeltaNetWeights, DevWeight, Fp8FfnLayer, Fp8Layer, Fp8Weight,
+    GateUpWeights, LayerFfn, LayerMixer, LayerWeights, ModelWeights, MoeFfn, NvFp4CtLayoutPolicy,
+    NvFp4CtStorage, QkvWeights, W4A8Layer, W4A8Weight,
 };
 
 /// Largest token count `prefill_chunk` accepts per call; callers split longer
@@ -2410,33 +2409,6 @@ struct BatchBufs {
     nvfp4_ct_workspace: Option<DevBuffer>,
 }
 
-/// MoE scratch (allocated only for Mixture-of-Experts models). The router
-/// output is sized for a full prefill chunk; decode uses the first row.
-struct MoeBufs {
-    /// Selected expert ids, i32 [MAX_PREFILL_CHUNK * top_k].
-    ids: DevBuffer,
-    /// Router logits, f32 [MAX_PREFILL_CHUNK * n_experts]. The projection that
-    /// fills it is an ordinary multiply and runs as one, so the selection that
-    /// follows is the only part that is genuinely one block per token.
-    logits: DevBuffer,
-    /// Routing weights, f32 [MAX_PREFILL_CHUNK * top_k].
-    weights: DevBuffer,
-    pinned_ids: DevBuffer,
-    pinned_weights: DevBuffer,
-    /// One token's FFN-normed hidden, f16 [hidden] — prefill copies a row here
-    /// so the per-expert GEMV reads a contiguous single-token activation.
-    xrow: DevBuffer,
-    /// One expert's down-projection output, f16 [hidden].
-    tmp: DevBuffer,
-    /// Pinned-host landing for the shared-expert gate logit (f16), read back in
-    /// the same sync as the router top-k (fallback readback path only).
-    pinned_shared: DevBuffer,
-    /// Device-resident shared-expert sigmoid gate scale (f32, one element). The
-    /// device dispatch path computes it on-GPU so folding the shared expert
-    /// needs no host round-trip.
-    shared_scale: DevBuffer,
-}
-
 pub(crate) fn hybrid_prefill_b2_backend_capable(vendor: Vendor, warp_size: u32) -> bool {
     forge_types::nvidia_warp32(vendor, warp_size)
 }
@@ -2520,13 +2492,14 @@ pub(crate) enum ProjectionPlan<'w> {
     },
 }
 
-
 mod arch;
 mod debug;
 mod gemm;
 mod graph;
 mod kv;
 mod loader;
+mod moe_bufs;
+use moe_bufs::MoeBufs;
 mod mtp;
 mod quant_dispatch;
 mod sample;
@@ -2662,44 +2635,44 @@ impl Model {
                 // Blok etykietowany zamiast wczesnego `return`: jesteśmy w środku
                 // konstruktora, model jeszcze nie istnieje.
                 'pack: {
-                let Some((source, rows, cols)) = source else {
-                    break 'pack;
-                };
-                let bytes = rows
-                    .checked_mul(cols / 64)
-                    .and_then(|blocks| blocks.checked_mul(36))
-                    .ok_or_else(|| {
-                        ForgeError::Format("przepełnienie rozmiaru headu draftu NVFP4".into())
-                    })?;
-                if let Some(available) = device.pool_available(Pool::Weights) {
-                    if bytes > available {
-                        if strict_nvfp4 {
-                            return Err(ForgeError::OutOfMemory {
-                                requested: bytes,
-                                available,
-                            });
-                        }
-                        tracing::info!(
-                            "head draftu MTP zostaje Q8_0: brak {bytes} B w puli wag \
-                             (dostępne {available} B)"
-                        );
+                    let Some((source, rows, cols)) = source else {
                         break 'pack;
+                    };
+                    let bytes = rows
+                        .checked_mul(cols / 64)
+                        .and_then(|blocks| blocks.checked_mul(36))
+                        .ok_or_else(|| {
+                            ForgeError::Format("przepełnienie rozmiaru headu draftu NVFP4".into())
+                        })?;
+                    if let Some(available) = device.pool_available(Pool::Weights) {
+                        if bytes > available {
+                            if strict_nvfp4 {
+                                return Err(ForgeError::OutOfMemory {
+                                    requested: bytes,
+                                    available,
+                                });
+                            }
+                            tracing::info!(
+                                "head draftu MTP zostaje Q8_0: brak {bytes} B w puli wag \
+                             (dostępne {available} B)"
+                            );
+                            break 'pack;
+                        }
                     }
-                }
-                let packed = device.alloc(bytes, MemKind::Device, Pool::Weights)?;
-                kernels.pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)?;
-                device.synchronize()?;
-                weights
-                    .mtp
-                    .as_mut()
-                    .expect("sprawdzono head MTP")
-                    .draft_output = Some(DevWeight::NvFp4Gguf {
-                    buf: packed,
-                    output_scale: 1.0,
-                    rows,
-                    cols,
-                    layout: Nvfp4GgufLayout::RowMajor36,
-                });
+                    let packed = device.alloc(bytes, MemKind::Device, Pool::Weights)?;
+                    kernels.pack_q8_0_nvfp4_gguf(&packed, &source, rows, cols, &stream)?;
+                    device.synchronize()?;
+                    weights
+                        .mtp
+                        .as_mut()
+                        .expect("sprawdzono head MTP")
+                        .draft_output = Some(DevWeight::NvFp4Gguf {
+                        buf: packed,
+                        output_scale: 1.0,
+                        rows,
+                        cols,
+                        layout: Nvfp4GgufLayout::RowMajor36,
+                    });
                 }
             }
             value => {
@@ -2846,36 +2819,7 @@ impl Model {
             )?,
         };
         let moe_bufs = match &weights.descriptor.params.moe {
-            Some(m) => {
-                let top_k = m.n_experts_used;
-                let idw = MAX_PREFILL_CHUNK * top_k;
-                Some(MoeBufs {
-                    ids: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
-                    logits: device.alloc(
-                        MAX_PREFILL_CHUNK * m.n_experts * 4,
-                        MemKind::Device,
-                        Pool::Activations,
-                    )?,
-                    weights: device.alloc(idw * 4, MemKind::Device, Pool::Activations)?,
-                    pinned_ids: device.alloc(idw * 4, MemKind::PinnedHost, Pool::Activations)?,
-                    pinned_weights: device.alloc(
-                        idw * 4,
-                        MemKind::PinnedHost,
-                        Pool::Activations,
-                    )?,
-                    xrow: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
-                    tmp: device.alloc(hidden * 2, MemKind::Device, Pool::Activations)?,
-                    pinned_shared: device.alloc(2, MemKind::PinnedHost, Pool::Activations)?,
-                    shared_scale: {
-                        // Seed 1.0 so a shared expert without a per-token gate
-                        // (no shared_gate) folds in unscaled; the device sigmoid
-                        // kernel overwrites this each layer when a gate exists.
-                        let sc = device.alloc(4, MemKind::Device, Pool::Activations)?;
-                        device.write(&1.0f32.to_le_bytes(), &sc, 0)?;
-                        sc
-                    },
-                })
-            }
+            Some(m) => Some(MoeBufs::new(&*device, m, hidden)?),
             None => None,
         };
 
@@ -3452,9 +3396,7 @@ impl Model {
         self.batch_cap = cap;
         Ok(())
     }
-
 }
-
 
 #[cfg(test)]
 mod verify_rollback_tests {
