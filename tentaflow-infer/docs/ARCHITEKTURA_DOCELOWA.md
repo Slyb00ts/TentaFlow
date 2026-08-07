@@ -1413,3 +1413,27 @@ adresowania w czterech plikach Mojo — `gemm_fp4.mojo` (`_mxfp4_word`),
 `gemm.mojo` — plus fikstury MXFP4 w `tests/golden.rs`, które budują bloki
 siedemnastobajtowe ręcznie. Trzynaście kerneli w katalogu czyta ten format.
 Ta sama przeprowadzka, tym samym mechanizmem, czeka Q8_0 i Q6_K.
+
+## Przeniesienie sklejania do LDS nie działa: kafel stoi na ścianie rejestrów
+
+Zysk z przepakowania MXFP4 (+39%) bierze się z tego, że `_mxfp4_word` robi DWA
+wyrównane odczyty na cztery użyteczne bajty — nie z niewyrównania jako takiego,
+bo oba odczyty SĄ wyrównane. Nasuwa się więc tańsza droga niż przeprowadzka
+formatu: wgrać do pamięci współdzielonej SUROWE bajty źródła (odczytami
+wyrównanymi i w pełni scalonymi), a sklejanie przenieść na stronę LDS, gdzie
+drugi odczyt kosztuje kilkanaście cykli zamiast kilkuset.
+
+Zrobione i zmierzone. Strona globalna faktycznie się wyprostowała — z pary
+odczytów na słowo zostaje ciąg wyrównanych `ld.global.b32` — ale wynik jest
+GORSZY: 2286 wobec 2323 tok/s. Powód widać w `ptxas`: **80 bajtów zrzutu**.
+Kernel bierze 64 rejestry przy 1024 wątkach, czyli cały plik rejestrów
+multiprocesora, więc każda dodatkowa praca na odczyt nie ma gdzie zamieszkać i
+ląduje w pamięci lokalnej. Uproszczenie sklejania do przesunięć 32-bitowych i
+policzenie cofnięcia okna z samej parzystości niczego nie odzyskało.
+
+Wniosek domyka temat: **zysku nie da się wziąć przez PRZENIESIENIE pracy —
+tylko przez jej USUNIĘCIE.** Odczyt musi być pojedynczy i bez składania, a to
+znaczy, że zmienić się musi POSTAĆ ZAPISANEJ WAGI, nie kernel. To samo wyszło
+przy Q8_0 od drugiej strony: tam szersze odczyty wymagały oddania
+czterokrotnej równoległości. Trzy formaty, trzy różne obejścia, ta sama
+odpowiedź — płaszczyzny.
