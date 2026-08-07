@@ -3012,17 +3012,17 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     wq = stack_allocation[
         BN * TILE_K, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
-    xd = stack_allocation[
-        KS * BM, Float32, address_space = AddressSpace.SHARED
+    # Scales in PAIRS — (d, d*sum) per token, (d*scale, dmin*min) per row —
+    # because the tile reads them together and the shared pipe counts
+    # INSTRUCTIONS. Kept apart, twelve of the sixteen shared reads per stage
+    # were scale bookkeeping against four of actual matrix data, and the
+    # profiler charged 6,04 stalled instructions per issue to the queue in
+    # front of that pipe. Paired, one load fetches what two used to.
+    xds = stack_allocation[
+        2 * KS * BM, Float32, alignment=16, address_space = AddressSpace.SHARED
     ]()
-    xsm = stack_allocation[
-        KS * BM, Float32, address_space = AddressSpace.SHARED
-    ]()
-    wdsc = stack_allocation[
-        KS * BN, Float32, address_space = AddressSpace.SHARED
-    ]()
-    wdmn = stack_allocation[
-        KS * BN, Float32, address_space = AddressSpace.SHARED
+    wdm = stack_allocation[
+        2 * KS * BN, Float32, alignment=16, address_space = AddressSpace.SHARED
     ]()
 
     var xtok_c = InlineArray[Int, X_PASSES](fill=0)
@@ -3138,15 +3138,17 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
                 sb = u // BM
                 tk = u % BM
                 (xq + sb * BM * 32 + tk * 32).store[alignment=32](xcodes[p])
-                xd[sb * BM + tk] = xdv[p]
-                comptime if FMT == 1:
-                    xsm[sb * BM + tk] = xsv_g[p]
+                (xds + (sb * BM + tk) * 2).store[alignment=8](
+                    SIMD[DType.float32, 2](xdv[p], xsv_g[p])
+                )
 
         comptime for p in range(W_PASSES):
             rl = p * W_ROWS_PER_PASS + row_l
             comptime if FMT == 0:
                 if part == 0:
-                    wdsc[rl] = Float32(wsc[p])
+                    (wdm + rl * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](Float32(wsc[p]), 0.0)
+                    )
                 (wq + rl * 32 + part * 8).store[alignment=8](
                     bitcast[DType.int8, W_CODES](wcodes[p])
                 )
@@ -3167,10 +3169,16 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
                     )
                     sc0, mn0 = _q4k_scale_min(whdr[p], part * 2)
                     sc1, mn1 = _q4k_scale_min(whdr[p], part * 2 + 1)
-                    wdsc[kk * BN + rl] = Float32(dm[0]) * sc0
-                    wdmn[kk * BN + rl] = Float32(dm[1]) * mn0
-                    wdsc[(kk + 1) * BN + rl] = Float32(dm[0]) * sc1
-                    wdmn[(kk + 1) * BN + rl] = Float32(dm[1]) * mn1
+                    (wdm + (kk * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            Float32(dm[0]) * sc0, Float32(dm[1]) * mn0
+                        )
+                    )
+                    (wdm + ((kk + 1) * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            Float32(dm[0]) * sc1, Float32(dm[1]) * mn1
+                        )
+                    )
 
     gl(0)
 
@@ -3205,25 +3213,26 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
             comptime for mi in range(MT_PER_WARP):
                 a_base = Af + (mi * 16 + (sub % 2) * 8 + lr) * 16 + (sub // 2) * 8
                 ai[mi] = bitcast[DType.uint32, 4](ld_matrix[8](a_base))
-                dx_a = xd[kk * BM + mt0 + mi * 16 + g]
-                dx_b = xd[kk * BM + mt0 + mi * 16 + g + 8]
-                dxv[mi] = SIMD[DType.float32, 4](dx_a, dx_a, dx_b, dx_b)
+                pa = (xds + (kk * BM + mt0 + mi * 16 + g) * 2).load[width=2]()
+                pb = (
+                    xds + (kk * BM + mt0 + mi * 16 + g + 8) * 2
+                ).load[width=2]()
+                dxv[mi] = SIMD[DType.float32, 4](pa[0], pa[0], pb[0], pb[0])
                 comptime if FMT == 1:
-                    xs_a = xsm[kk * BM + mt0 + mi * 16 + g]
-                    xs_b = xsm[kk * BM + mt0 + mi * 16 + g + 8]
-                    xsv[mi] = SIMD[DType.float32, 4](xs_a, xs_a, xs_b, xs_b)
+                    xsv[mi] = SIMD[DType.float32, 4](pa[1], pa[1], pb[1], pb[1])
 
             comptime for nti in range(NT_PER_WARP):
                 nb = (nbase + nti) * 8
                 Bf = (wq + kk * BN * 32 + nb * 32).bitcast[Float16]()
                 b_base = Bf + lr * 16 + (sub % 2) * 8
                 bi = bitcast[DType.uint32, 2](ld_matrix[4](b_base))
-                dw2 = (wdsc + kk * BN + nb + 2 * tt).load[width=2]()
-                dwv = SIMD[DType.float32, 4](dw2[0], dw2[1], dw2[0], dw2[1])
+                q4 = (wdm + (kk * BN + nb + 2 * tt) * 2).load[
+                    width=4, alignment=16
+                ]()
+                dwv = SIMD[DType.float32, 4](q4[0], q4[2], q4[0], q4[2])
                 var mnv = SIMD[DType.float32, 4](0)
                 comptime if FMT == 1:
-                    mn2 = (wdmn + kk * BN + nb + 2 * tt).load[width=2]()
-                    mnv = SIMD[DType.float32, 4](mn2[0], mn2[1], mn2[0], mn2[1])
+                    mnv = SIMD[DType.float32, 4](q4[1], q4[3], q4[1], q4[3])
                 comptime for mi in range(MT_PER_WARP):
                     mres = _mma_s8(
                         ai[mi][0], ai[mi][1], ai[mi][2], ai[mi][3],
