@@ -169,6 +169,48 @@ impl CudaExec {
     /// goes to the four-bit matrix unit and takes the grouped shape with it —
     /// reading the SAME bytes, assembled into fragments as the tile is staged.
     #[allow(clippy::too_many_arguments)]
+    /// One projection of every expert on the four-bit matrix unit, or `false`
+    /// when this weight has no such form.
+    ///
+    /// Separate from `project_experts` because a STEP reaches it without any of
+    /// the surrounding sort: the tile table of a step is constant, so there are
+    /// no per-expert row counts to hand it.
+    #[allow(clippy::too_many_arguments)]
+    fn mxf4_grouped(
+        &self,
+        id: WeightId,
+        w: &Quantized,
+        y: &DevBuffer,
+        moe: &MoeScratch,
+        tiles: &GroupedTiles<'_>,
+        experts: usize,
+        rows: usize,
+        selections: usize,
+    ) -> Result<bool> {
+        if w.quant != QuantKind::MXFP4 || !self.kernels.supports_mxf4_grouped() {
+            return Ok(false);
+        }
+        let table = self.expert_table(id, w, experts)?;
+        self.kernels.gemm_mxf4_grouped(
+            y,
+            &table,
+            &moe.grouped_xq,
+            &moe.grouped_xs,
+            GroupedTiles {
+                expert: tiles.expert,
+                first: tiles.first,
+                end: tiles.end,
+                count: tiles.count,
+            },
+            rows,
+            w.cols,
+            selections,
+            &self.stream,
+        )?;
+        Ok(true)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn project_experts(
         &self,
         id: WeightId,
@@ -182,25 +224,10 @@ impl CudaExec {
         rows: usize,
         selections: usize,
     ) -> Result<()> {
-        let table = self.expert_table(id, w, experts)?;
-        if w.quant == QuantKind::MXFP4 && self.kernels.supports_mxf4_grouped() {
-            return self.kernels.gemm_mxf4_grouped(
-                y,
-                &table,
-                &moe.grouped_xq,
-                &moe.grouped_xs,
-                GroupedTiles {
-                    expert: tiles.expert,
-                    first: tiles.first,
-                    end: tiles.end,
-                    count: tiles.count,
-                },
-                rows,
-                w.cols,
-                selections,
-                &self.stream,
-            );
+        if self.mxf4_grouped(id, w, y, moe, tiles, experts, rows, selections)? {
+            return Ok(());
         }
+        let table = self.expert_table(id, w, experts)?;
         if w.quant != QuantKind::MXFP4 {
             return self.kernels.gemm_grouped_experts(
                 w.quant,

@@ -771,3 +771,27 @@ Blok Q8_0 ma trzydzieści cztery bajty, czyli daje linii adres wyrównany do
 DWÓCH, a nie — jak siedemnastobajtowy blok MXFP4 — nieparzysty. Dwa bajty
 scalaczowi wystarczają, więc koszt kafla i barier przewyższa zysk. Wyrównanie
 jest odpowiedzią na NIEPARZYSTY krok, a nie na każdy krok niebędący potęgą dwójki.
+
+### Krótki wiersz dzieli się na dwie linie, a jednostka macierzowa nie zastąpi wektorowej
+
+`down` miał połowę tempa `gate/up` przy tej samej liczbie bajtów. Pierwsza
+hipoteza — że kafel o stałej szerokości ściąga dla niego dwa razy więcej, niż
+przeczyta — jest ZMIERZONA I NIEPRAWDZIWA: ograniczenie sztaplowania do
+faktycznej liczby bloków dało 73,4 zamiast 75,3 GB/s, bo nadmiarowe kawałki
+sąsiednich wierszy i tak leżały w L2. Kosztowało za to `gate/up` 6,5% na
+dzieleniu przez wartość nieznaną w czasie kompilacji.
+
+Prawdziwym powodem jest zajętość fali: wiersz `down` ma szesnaście bloków na
+trzydzieści dwie linie. Kernel jest związany DEKODOWANIEM, a nie pasmem, więc
+bezczynna połowa fali to wprost połowa tempa. Blok idzie teraz na dwie linie po
+osiem bajtów kodów każda: 75,3 -> 115,6 GB/s, przy `gate/up` bez zmian.
+
+Kuszące było oddać dekodowanie sprzętowi — blokowo-skalowane FP4 MMA rozpakowuje
+`e2m1` samo, a przy prefillu `gemm_mxf4_grouped` przenosi te same bajty ekspertów
+z prędkością 199 GB/s wobec 126 GB/s formy wektorowej. Przy kroku to NIE DZIAŁA i
+różnica jest ilościowa, nie jakościowa: osiem selekcji to osiem kafli, a przy
+BM128 daje to trzydzieści dwa bloki na całą kartę. Zmierzone 222 us na wywołanie
+wobec 35 us formy wektorowej, czyli 20 GB/s; generacja spadła z 49,3 do 26,4
+tok/s. Tamte 199 GB/s pochodzą z wywołania obejmującego wszystkich 256 ekspertów
+i nie przenoszą się na osiem. Kafel macierzowy potrzebuje pracy w wymiarze
+tokenów, a krok jej nie ma.
