@@ -1110,3 +1110,48 @@ token — nie ma mieszanki.
 
 Hybryda zrównała się w dekodzie (0,995x). Zostaje dekod mieszanki (0,88x) i
 gęstego (0,88x) oraz prefill mieszanki (0,97x) i hybrydy (0,92x).
+
+### Dekod: co czytanie kodu llama.cpp dało wprost
+
+Trzy zmiany, wszystkie wzięte z porównania z ich kernelami.
+
+**Q6_K ekspertów zszedł na ścieżkę całkowitą.** Q4_K_M dzieli JEDNEGO eksperta
+między dwa formaty: sześć bitów na `ffn_down`, cztery na gate i up. Ścieżka
+adresowana na urządzeniu (`_gidx`) istniała tylko dla czterech bitów, więc
+połowa projekcji `down` szła wariantem f16, który dekwantyzuje superblok przed
+mnożeniem — zmierzone 126 GB/s wobec 179 dla czterobitowej połowy TEGO SAMEGO
+kształtu, przy suficie strumienia około 215. Doszedł
+`gemv_q6_k_dp4a_f16_gidx` (+ wariant wsadowy), matematyka to istniejący
+`_dot_q6k_i8`.
+
+**Gate i up mnożą się razem.** llama.cpp zrasta `{MUL_MAT_ID, MUL_MAT_ID, GLU}`
+w jeden kernel; my mieliśmy trzy uruchomienia. Osobno KAŻDY blok kwantyzował tę
+samą aktywację do pamięci współdzielonej dwa razy — 3,1 MB sztaplowanych
+odczytów na 7,1 MB wagi w uruchomieniu, czyli jedna trzecia ruchu była połową,
+która nie musiała się wydarzyć. Razem: sztaplowanie raz, oba wyniki spotykają
+się w rejestrach, a bramka SiLU jest epilogiem zamiast osobnego uruchomienia.
+Dla gęstego FFN taki kernel już istniał (`gemv_norm_silu_q4_k_dp4a_f16`) —
+brakowało wariantu z tablicą ekspertów, więc `_dot2_q4k_i8`/`_dot2_q6k_i8`
+przyjmują teraz DWA wskaźniki bazowe (gęsty stos podaje ten sam dwa razy).
+
+**`rmsnorm_f16` dostał rozwinięcie, które miał już wariant rezydualny.** Przy
+dekodzie liczy JEDEN wiersz kilku kilobajtów na jednym multiprocesorze, więc
+jest to opóźnienie, nie pasmo; jedyną pozostałą równoległością jest liczba
+odczytów, które wątek trzyma w locie.
+
+Pomiar dekodu: mieszanka 71,7 -> 78,0 tok/s, hybryda 61,9 -> 62,4, gęsty
+37,4 -> 37,7. Rozrzut wobec wzorca hostowego nawet się poprawił (krok
+0,260% -> 0,240%), bo dp4a liczy iloczyny dokładnie zamiast przez f16.
+
+### Stan wobec llama.cpp, jeden stan maszyny, 2026-08-07 (po zrostach)
+
+`/opt/repos/llama.cpp` 6db1304 wobec FORGE `d6a30f0`:
+
+                        llama pp512  FORGE pp512   llama tg32  FORGE tg32
+    Qwen3.6-35B MXFP4      2492,8      2322,8         64,10      62,4
+    Qwen3-30B Q4_K         2272,7      2239,2         81,28      78,0
+    Bielik 7B Q4_K         2630,8      5147,5         41,48      37,7
+
+Licząc od początku dnia: prefill mieszanki 0,71x -> 0,985x, dekod mieszanki
+0,77x -> 0,96x, dekod hybrydy 0,87x -> 0,97x, gęsty prefill 1,82x -> 1,96x.
+Zostaje prefill hybrydy (0,93x) i dekod gęstego (0,91x).
