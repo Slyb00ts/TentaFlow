@@ -19,7 +19,7 @@
 //     docs/ZADANIE_CUDA_EXECUTOR.md asks, and the answer is yes: paging needs
 //     nothing from the vocabulary, and it needs only one implementation.
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -29,7 +29,7 @@ use forge_formats::FfnActivation;
 use forge_graph::{
     Act, ExecSpec, Executor, Layout, Op, QuantWeight, SsmShape, Step, Tile, WeightId, WeightStore,
 };
-use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Event, Pool, Stream};
 use forge_state::kv::{KvCache, KvConfig, KvLayerMap, KvQuant, SeqKv};
 use forge_state::recurrent::{RecurrentConfig, RecurrentState};
 use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
@@ -214,11 +214,25 @@ pub struct CudaExec {
     /// kolejce, a tablica stron jest ta sama dla wszystkich czterdziestu warstw
     /// kroku.
     staged: [RefCell<Vec<i32>>; 5],
+    /// Pinned mirror of each control buffer, plus the event that says its last
+    /// copy has been read. The copy is STREAM-ORDERED against the kernels that
+    /// read the buffer, which is what lets the write happen without draining
+    /// the pipeline first.
+    stage_host: [Staging; 5],
     shape: DenseShape,
     /// Dtype the source keeps its normalization weights in. GGUF says f32 and
     /// the kernels read f16, so the conversion happens on upload — and a source
     /// that says something else is refused rather than reinterpreted.
     norm_weights: DType,
+}
+
+/// One control buffer's pinned host mirror and the fence behind its last copy.
+struct Staging {
+    host: DevBuffer,
+    copied: Event,
+    /// False until the first copy is recorded — an event that was never
+    /// recorded cannot be waited on.
+    live: Cell<bool>,
 }
 
 /// Which staged buffer a mirror belongs to.
@@ -277,6 +291,23 @@ impl CudaExec {
             choice: i32b(MAX_LANES.max(2))?,
             sample_vals: i32b(SAMPLE_SCRATCH_PAIRS as u32)?,
             sample_idx: i32b(SAMPLE_SCRATCH_PAIRS as u32)?,
+        };
+
+        // One pinned mirror per control buffer, each as wide as the widest of
+        // them: five allocations of a few kilobytes, made once, so that no step
+        // ever copies out of pageable memory.
+        let control_i32 = (n).max(MAX_LANES * per_lane as u32) as usize;
+        let stage_host: [Staging; 5] = {
+            let mut made = Vec::with_capacity(5);
+            for _ in 0..5 {
+                made.push(Staging {
+                    host: device.alloc(control_i32 * 4, MemKind::PinnedHost, Pool::Activations)?,
+                    copied: device.create_event()?,
+                    live: Cell::new(false),
+                });
+            }
+            made.try_into()
+                .map_err(|_| ForgeError::Other("pięć buforów sztaplowania".into()))?
         };
 
         // Only the layers that ATTEND get a slab. A page costs its bytes in
@@ -341,6 +372,7 @@ impl CudaExec {
             seqs: RefCell::new(seqs),
             scratch,
             staged: std::array::from_fn(|_| RefCell::new(Vec::new())),
+            stage_host,
             shape,
             norm_weights: spec.norm_weights,
         })
@@ -766,19 +798,43 @@ impl CudaExec {
     ///
     /// A HAL write lands on the legacy stream while this executor's stream is
     /// non-blocking, so it is NOT ordered against work already queued: a write
-    /// issued now can overwrite bytes a queued kernel has not read yet. That
-    /// content changes at most once per step, so the answer is to notice when
-    /// it changes and drain then — the page table alone is read by eighty
-    /// kernels a step and moves for none of them.
+    /// issued now can overwrite bytes a queued kernel has not read yet. Draining
+    /// the stream first made that safe and cost a full pipeline refill four
+    /// times per decode step. A copy FROM PINNED MEMORY ON THIS STREAM is
+    /// ordered against those kernels by construction, so nothing has to drain —
+    /// and it is a graph node rather than a host call, which is what lets a
+    /// step be captured at all.
+    ///
+    /// The mirror stays: the page table alone is read by eighty kernels a step
+    /// and moves for none of them.
     fn stage_i32(&self, dst: &DevBuffer, mirror: usize, values: Vec<i32>) -> Result<()> {
-        let mirror = &self.staged[mirror];
-        if *mirror.borrow() == values {
+        let held = &self.staged[mirror];
+        if *held.borrow() == values {
             return Ok(());
         }
-        self.stream.synchronize()?;
-        let raw: Vec<u8> = values.iter().flat_map(|v| v.to_le_bytes()).collect();
-        self.device.write(&raw, dst, 0)?;
-        *mirror.borrow_mut() = values;
+        let stage = &self.stage_host[mirror];
+        // The pinned buffer is the SOURCE of a copy that may still be queued,
+        // so it may not be rewritten until that copy has read it. In practice
+        // the fence is long past — a step reads its logits back before the next
+        // one is built — but the wait is what makes that a fact rather than an
+        // assumption about the caller.
+        if stage.live.get() {
+            stage.copied.synchronize()?;
+        }
+        let bytes = std::mem::size_of_val(&values[..]);
+        let ptr = stage.host.host_ptr().ok_or_else(|| {
+            ForgeError::Other("bufor sztaplowania nie jest pamięcią hosta".into())
+        })?;
+        // SAFETY: `ptr` owns `MAX_CONTROL_I32 * 4` pinned bytes and `bytes` is
+        // bounded by that allocation; the regions cannot overlap.
+        unsafe {
+            std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, ptr, bytes);
+        }
+        self.device
+            .copy(&stage.host, 0, dst, 0, bytes, &self.stream)?;
+        self.device.record_event(&stage.copied, &self.stream)?;
+        stage.live.set(true);
+        *held.borrow_mut() = values;
         Ok(())
     }
 
