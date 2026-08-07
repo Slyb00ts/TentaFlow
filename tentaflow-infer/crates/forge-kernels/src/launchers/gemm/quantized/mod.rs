@@ -3,6 +3,7 @@ use super::super::*;
 
 mod i_quants;
 mod k_gather;
+mod persist;
 mod k_quants;
 mod legacy;
 mod mixed;

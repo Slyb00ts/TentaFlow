@@ -1,13 +1,9 @@
 // ===== File: k_quants.rs — GGUF k-kwantyzacje: Q2_K..Q6_K =====
 use super::*;
-
-/// Siatka trwałego GEMV dekodowania. Wąskie macierze (`ssm_out`, `attn_output`
-/// — 640 kafli) kończą się niepełną ostatnią falą grup roboczych, a blok, który
-/// przechodzi po kaflach krokiem siatki, staje w jednej fali i kwantyzuje
-/// aktywację raz zamiast raz na kafel. Zmierzone na R9700 jako optimum sweepu.
-const PERSIST_GRID: u32 = 384;
+use super::persist::persist_wave;
 
 const GEMV_Q4K_GROUP4: &str = "gemv_q4_k_dp4a_group4_f16";
+
 
 impl Kernels {
     /// y = W·x with W in GGML Q4_K superblocks, x/y f16. Warp per row.
@@ -720,9 +716,9 @@ impl Kernels {
         // Powyżej ~2048 kafli kernel trwa dość długo, żeby rozbieg pamięci się
         // zamortyzował, a sweep pokazał tam remis — zysk jest wyłącznie na
         // wąskich macierzach, więc tylko one schodzą na siatkę trwałą.
-        let persist = tiles > PERSIST_GRID
-            && tiles <= 2048
-            && self.artifacts.get("gemv_q4_k_dp4a_persist_f16").is_ok();
+        let wave = persist_wave(self.device.caps().sm_count, tiles);
+        let persist =
+            wave.is_some() && self.artifacts.get("gemv_q4_k_dp4a_persist_f16").is_ok();
         // Narrow staging when the activation fits it: same arithmetic, a
         // quarter of the shared memory, so an SM can hold more of these blocks.
         let k = match persist {
@@ -736,7 +732,7 @@ impl Kernels {
             false => self.artifacts.get("gemv_q4_k_dp4a_f16")?,
         };
         let cfg = LaunchConfig {
-            grid: (if persist { PERSIST_GRID } else { tiles }, 1, 1),
+            grid: (if persist { wave.unwrap_or(tiles) } else { tiles }, 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
