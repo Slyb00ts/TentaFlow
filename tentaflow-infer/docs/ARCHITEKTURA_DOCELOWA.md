@@ -851,3 +851,37 @@ sztaplowaniu: `W_ROWS_PER_PASS = NTHREADS / 4` wiąże liczbę wątków z `BN`, 
 szesnastu osnów nie da się dołożyć bez rozszerzenia kafla do `BN=128`, a to
 połowi liczbę bloków. Zmierzone 1365 zamiast 1613 tok/s. Ten kafel wymaga
 przepisania mapy sztaplowania, nie zmiany parametru.
+
+### Kafel MXFP4 gubił wiersze gorących ekspertów
+
+Tablica kafli zgrupowanych powstawała krokiem `GROUPED_TILE_ROWS = 64`, a kafel
+MXFP4 liczy TRZYDZIEŚCI DWA tokeny i nie pętli po nich — pisze swoją szerokość
+od `tile_first` i kończy. Blok eksperta dłuższy niż trzydzieści dwa wiersze
+tracił ogon: nikt go nie liczył, a `moe_combine` wkładał tokenom to, co akurat
+zostało w scratchu. Przy 512 tokenach po ośmiu ekspertach z 256 średnia to
+szesnaście wierszy na eksperta, więc dotyczyło to wyłącznie gorących — i
+dlatego bramka wzorca, na krótszym prompcie, tego nie łapała.
+
+Krok tablicy jest teraz WYNIKIEM wybranego kafla (`grouped_tile_rows`), a nie
+stałą, i bierze się minimum z trzech projekcji warstwy — bo Q4_K_M daje sześć
+bitów na `ffn_down` i cztery na pozostałe dwie, więc formaty w jednej warstwie
+nie muszą być te same.
+
+Poprawka KOSZTUJE, i to jest uczciwa cena za policzenie tego, co było pomijane:
+2510 -> 2343 tok/s. Gorący ekspert dzieli się teraz na dwa kafle, a każdy czyta
+całą wagę swoich wierszy. Szerszy kafel usunąłby to podwójne czytanie, ale
+liczyłby dopełnienie dla zimnych ekspertów, których jest większość — zmierzone
+2181 tok/s przy kaflu 64-tokenowym. Wąski kafel z pasującym krokiem wygrywa.
+
+### Dlaczego gęsty wygrywa, a mieszanka nie — to są dwa różne reżimy
+
+Gęsty prefill czyta wagę RAZ i używa jej dla 512 tokenów, więc na element wagi
+przypada 1024 operacje: jest związany JEDNOSTKĄ MACIERZOWĄ. Tam wygrywamy o
+1,64x i wygrywamy właśnie kaflami int8/FP4.
+
+Mieszanka rozdaje te same 512 tokenów po ośmiu ekspertach ze 128 albo 256, więc
+na eksperta przypada kilkanaście wierszy, a intensywność arytmetyczna spada
+około trzydziestokrotnie. Reżim przeskakuje na PASMO PAMIĘCI, i tam lepsza
+jednostka macierzowa nie kupuje nic — liczy się wyłącznie to, jak szybko
+osiemnaście gigabajtów przechodzi przez magistralę. Dlatego z pracy nad gęstym
+przenosi się zajętość, sztaplowanie i wyrównanie, a nie sama arytmetyka.
