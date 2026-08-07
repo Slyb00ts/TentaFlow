@@ -1056,3 +1056,57 @@ to osobny, mniejszy dług — 0,57 ms na token.
 
 Prefill mieszanki przeszedł z 0,71x na 0,975x. Dekod stoi na 0,77-0,87x we
 wszystkich trzech i to jest teraz największy dług.
+
+### Krok dekodu nagrany raz i odtwarzany
+
+Dwie zmiany, i pierwsza jest warunkiem drugiej.
+
+**Sztaplowanie bez drenażu.** Zapis HAL-a ląduje na strumieniu zastanym, a nasz
+jest nieblokujący, więc nie jest uporządkowany względem tego, co już stoi w
+kolejce. Dotąd rozwiązywał to pełny `synchronize` przed każdym zapisem — cztery
+opróżnienia potoku na krok dekodu. Teraz każdy z pięciu buforów sterujących ma
+przypięte lustro, a kopia idzie NA TYM STRUMIENIU: jest uporządkowana z
+konstrukcji i jest węzłem grafu, a nie wywołaniem hosta. Zysk sam w sobie
+niewielki (+0,6% mieszanka, +1% gęsty), ale bez tego nie da się nic przechwycić.
+
+**Nagranie.** `Executor` dostał `run_step(&[Op])` z domyślną implementacją
+„po kolei"; model buduje listę operacji kroku i oddaje ją w całości. `CudaExec`
+nadpisuje to nagraniem: pierwszy krok danego kształtu wykonuje się zwyczajnie
+(to on tworzy tablice ekspertów, scratch mieszanki i spakowane formy wag),
+drugi jest nagrywany, każdy kolejny to jedno uruchomienie grafu.
+
+Trzy warunki i miejsce, gdzie każdy jest egzekwowany:
+
+  * Ciąg operacji musi się powtarzać — klucz to liczba lane'ów kroku
+    jednotokenowego. Kafel promptu nigdy nie jest nagrywany.
+  * Krok z lane'em na POZYCJI ZERO nie jest ani nagrywany, ani odtwarzany.
+    Sekwencja, która się zaczyna, oddaje strony i zeruje stan rekurencyjny —
+    to inny ciąg operacji. Nagranie go zerowałoby stan co token, a odtworzenie
+    zwykłego w jego miejsce nie zerowałoby nigdy. Bramka hybrydowa złapała to
+    natychmiast (`CUDA_ERROR_STREAM_CAPTURE_UNSUPPORTED` na zapisie zerującym).
+  * Nagranie NAZYWA bufory. Scratch mieszanki i mixera rekurencyjnego jest
+    wymieniany, gdy przyjdzie szerszy krok, więc wymiana kasuje nagrania.
+
+Ten ostatni błąd jest UTAJONY i dlatego test trzyma go licznikiem nagrań, a nie
+tokenami: zwolniony obszar zostaje zmapowany, więc nieaktualne nagranie czyta i
+pisze do własnego, już nieswojego scratcha i odpowiada poprawnie — do chwili,
+gdy tę pamięć dostanie ktoś inny. Sprawdzone: bez kasowania test pada, z nim
+przechodzi (`a_recorded_step_does_not_outlive_the_buffers_it_names`).
+
+Pomiar. Bezczynność GPU między kernelami spadła z 15,7% na 4,6%, mediana
+przerwy z 2,24 us na 0,10 us (`nsys --cuda-graph-trace=node`). Dekod:
+mieszanka 63,0 -> 71,7 tok/s (+13,8%), hybryda 55,1 -> 61,9 (+12,3%), gęsty
+36,2 -> 37,4 (+3,3%). Gęsty zyskuje najmniej, bo ma najmniej uruchomień na
+token — nie ma mieszanki.
+
+### Stan wobec llama.cpp, jeden stan maszyny, 2026-08-07 (po grafach)
+
+`/opt/repos/llama.cpp` 6db1304 wobec FORGE `64cbbc64`:
+
+                        llama pp512  FORGE pp512   llama tg32  FORGE tg32
+    Qwen3.6-35B MXFP4      2513,5      2319,2         62,21      61,9
+    Qwen3-30B Q4_K         2301,3      2233,1         81,84      71,7
+    Bielik 7B Q4_K         2653,8      5043,8         42,42      37,4
+
+Hybryda zrównała się w dekodzie (0,995x). Zostaje dekod mieszanki (0,88x) i
+gęstego (0,88x) oraz prefill mieszanki (0,97x) i hybrydy (0,92x).
