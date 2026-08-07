@@ -402,44 +402,6 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Routed-MoE Q6_K expert GEMV whose expert is selected ON DEVICE from
-    /// `ids[sel]` (no host readback). `w_table` is a device array of per-expert
-    /// weight base pointers, so experts may sit in different memory tiers and
-    /// move independently. Bit-identical to `gemv_q6_k_f16_at` launched against
-    /// that expert's own block.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q6_k_f16_gidx(
-        &self,
-        y: &DevBuffer,
-        w_table: &DevBuffer,
-        x: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        ids: &DevBuffer,
-        sel: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        if !cols.is_multiple_of(256) {
-            return Err(ForgeError::Kernel(format!(
-                "gemv_q6_k_f16_gidx requires cols % 256 == 0, got {cols}"
-            )));
-        }
-        let k = self.artifacts.get("gemv_q6_k_f16_gidx")?;
-        let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), 1, 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf(w_table)
-            .buf(x)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .buf(ids)
-            .scalar(sel as i64);
-        self.device.launch(k, &cfg, &args, stream)
-    }
 
     /// Logit GEMV over Q6_K weights → f32 logits.
     #[allow(clippy::too_many_arguments)]
@@ -903,78 +865,7 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
-    /// Routed-MoE Q4_K expert GEMV whose expert is selected ON DEVICE from
-    /// `ids[sel]` (no host readback of the router selection). `w_table` is a
-    /// device array of per-expert weight base pointers, so experts may sit in
-    /// different memory tiers and move independently. Writes the per-expert
-    /// `[rows]` output at `y[0..]`, bit-identical to `gemv_q4_k_dp4a_f16_at`
-    /// launched against that expert's own block.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q4_k_dp4a_f16_gidx(
-        &self,
-        y: &DevBuffer,
-        w_table: &DevBuffer,
-        x: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        ids: &DevBuffer,
-        sel: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_f16_gidx")?;
-        let k = self.artifacts.get("gemv_q4_k_dp4a_f16_gidx")?;
-        let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), 1, 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf(w_table)
-            .buf(x)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .buf(ids)
-            .scalar(sel as i64);
-        self.device.launch(k, &cfg, &args, stream)
-    }
 
-    /// Routed-MoE Q6_K expert GEMV on the integer path.
-    ///
-    /// The six-bit twin of `gemv_q4_k_dp4a_f16_gidx`, and it exists because
-    /// Q4_K_M splits ONE expert between the two: six bits on `ffn_down`, four
-    /// on gate and up. Without it half a mixture's down projections took the
-    /// f16 route, which dequantizes a superblock before multiplying — measured
-    /// 126 GB/s against 179 for the four-bit half of the same shape.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gemv_q6_k_dp4a_f16_gidx(
-        &self,
-        y: &DevBuffer,
-        w_table: &DevBuffer,
-        x: &DevBuffer,
-        rows: usize,
-        cols: usize,
-        ids: &DevBuffer,
-        sel: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        Self::check_dp4a_cols(cols, 256, "gemv_q6_k_dp4a_f16_gidx")?;
-        let k = self.artifacts.get("gemv_q6_k_dp4a_f16_gidx")?;
-        let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), 1, 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(y)
-            .buf(w_table)
-            .buf(x)
-            .scalar(cols as i64)
-            .scalar(rows as i64)
-            .buf(ids)
-            .scalar(sel as i64);
-        self.device.launch(k, &cfg, &args, stream)
-    }
 
     /// Q4_K logit GEMV (f32 out) with dp4a dots.
     #[allow(clippy::too_many_arguments)]
