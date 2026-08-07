@@ -110,15 +110,17 @@ impl CudaExec {
     /// insides. Same kernels and the same format table, though; a recurrent
     /// layer's projections are quantized like every other.
     ///
-    /// And unlike every other, they do NOT take the e4m3 form a prompt-width
-    /// projection normally gets. Both halves of that were measured. It buys
-    /// nothing — 69 tok/s against 68 on Qwen3.6-35B, because what costs here is
-    /// the sequential fold and not these four multiplications — and it costs a
-    /// great deal: the reference comparison went from 0,545% of logit spread to
-    /// 2,931% with a genuine swap in the leading five. A recurrence composes its
-    /// input over the whole sequence, so four bits of mantissa lost at the front
-    /// come back multiplied; attention has no such lever, which is why the same
-    /// trade is right there and wrong here.
+    /// And unlike every other, they do NOT quantize the ACTIVATION — neither to
+    /// e4m3 for a prompt nor to int8 for a step, which is why this is not
+    /// `gemv_decode`. Both halves of both were measured. Neither buys anything —
+    /// e4m3 gave 69 tok/s against 68, int8 48,7 against 48,8, because what costs
+    /// here is the sequential fold and not these four multiplications — and both
+    /// cost accuracy: e4m3 took the reference comparison from 0,545% of logit
+    /// spread to 2,931% with a genuine swap in the leading five, int8 took the
+    /// step-by-step one from 0,443% to 0,573%. A recurrence composes its input
+    /// over the whole sequence, so mantissa lost at the front comes back
+    /// multiplied; attention has no such lever, which is why the same trade is
+    /// right there and wrong here.
     fn project(&self, w: &Quantized, y: &DevBuffer, x: &DevBuffer, rows: usize) -> Result<()> {
         if rows == 1 {
             return self.gemv_by_kind(w.quant, y, &w.blocks, x, w.rows, w.cols, w.output_scale);

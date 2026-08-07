@@ -9,6 +9,7 @@
 from std.gpu import block_dim, block_idx, thread_idx, global_idx
 from std.gpu.sync import barrier
 from std.gpu.primitives import warp
+from std.gpu.primitives.warp import shuffle_xor
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
@@ -21,6 +22,9 @@ from src.reduce import block_reduce_max, block_reduce_sum
 comptime MOE_MAX_HIDDEN = 8192
 comptime MOE_MAX_EXPERTS = 256
 comptime NEG_BIG: Float32 = -3.0e38
+comptime WARP = 32
+comptime MOE_TOPK_SLOTS = MOE_MAX_EXPERTS // WARP
+"""Ekspertow na linie fali: limit kernela podzielony przez szerokosc fali."""
 
 
 def moe_router_f16(
@@ -238,99 +242,103 @@ def moe_topk_f32(
     top_k: Int,
     norm_topk: Int,
 ):
-    """Softmax i wybór top-k z GOTOWYCH logitów routera.
+    """Softmax i wybor top-k z GOTOWYCH logitow routera. grid=(tokeny), block=32.
 
-    `moe_router_f16` liczył iloczyny ekspertów i wybór w jednym bloku na token.
-    Przy generacji token jest JEDEN, więc cała projekcja routera — dla 256
-    ekspertów i 2048 kanałów milion bajtów wagi — szła przez jeden
-    multiprocesor. Iloczyny są zwykłym GEMV, więc liczy je GEMV; tutaj zostaje
-    wyłącznie to, co naprawdę jest jednym blokiem na token.
+    `moe_router_f16` liczyl iloczyny ekspertow i wybor w jednym bloku na token.
+    Przy generacji token jest JEDEN, wiec cala projekcja routera — dla 256
+    ekspertow i 2048 kanalow milion bajtow wagi — szla przez jeden
+    multiprocesor. Iloczyny sa zwyklym GEMV, wiec liczy je GEMV; tutaj zostaje
+    wylacznie to, co naprawde jest jednym blokiem na token.
 
-    Wybór idzie PRZEZ CAŁY BLOK, nie przez zerowy wątek. Osiem rund po
-    dwieście pięćdziesiąt sześć ekspertów to na jednym wątku kilka tysięcy
-    iteracji szeregowych — zmierzone 45,7 us na warstwę, czyli 8,8% kroku
-    generacji. Drzewiasta redukcja robi z tego osiem rund po dziewięć kroków.
-    Remisy rozstrzyga NIŻSZY INDEKS, tak samo jak wzorzec: to jest część
-    porównania, a nie szczegół implementacji.
+    Caly wybor miesci sie w JEDNEJ FALI, i to jest tu jedyna decyzja. Osiem rund
+    po dwiescie piecdziesiat szesc ekspertow na jednym watku to kilka tysiecy
+    iteracji szeregowych — zmierzone 45,7 us na warstwe. Drzewiasta redukcja
+    przez blok 256 watkow zrobila z tego 14,3 us, ale zostawila SZESCDZIESIAT
+    CZTERY bariery na token, ktore przy jednym bloku na calej karcie nie maja
+    czym sie ukryc. Fala trzyma po osiem ekspertow na linie w rejestrach i
+    redukuje przetasowaniem, wiec barier nie ma ani jednej.
+
+    Remisy rozstrzyga NIZSZY INDEKS, tak samo jak wzorzec: to jest czesc
+    porownania, a nie szczegol implementacji.
     """
     token = Int(block_idx.x)
-    tid = Int(thread_idx.x)
-    nthreads = Int(block_dim.x)
-
-    val = stack_allocation[
-        MOE_MAX_EXPERTS, Float32, address_space = AddressSpace.SHARED
-    ]()
-    rv = stack_allocation[
-        MOE_MAX_EXPERTS, Float32, address_space = AddressSpace.SHARED
-    ]()
-    ri = stack_allocation[
-        MOE_MAX_EXPERTS, Int32, address_space = AddressSpace.SHARED
-    ]()
-
+    lane = Int(thread_idx.x)
     base = token * n_expert
-    var local_max = NEG_BIG
-    var i = tid
-    while i < n_expert:
-        v = logits_ptr[base + i]
-        val[i] = v
-        if v > local_max:
-            local_max = v
-        i += nthreads
-    mx = block_reduce_max(local_max)
 
-    var local_sum: Float32 = 0.0
-    i = tid
-    while i < n_expert:
-        e = exp(val[i] - mx)
-        val[i] = e
-        local_sum += e
-        i += nthreads
-    denom = block_reduce_sum(local_sum)
-    inv_denom = 1.0 / denom
-    i = tid
-    while i < n_expert:
-        val[i] = val[i] * inv_denom
-        i += nthreads
-    barrier()
+    var v = SIMD[DType.float32, MOE_TOPK_SLOTS](NEG_BIG)
+    comptime for s in range(MOE_TOPK_SLOTS):
+        idx = lane + s * WARP
+        if idx < n_expert:
+            v[s] = logits_ptr[base + idx]
+
+    var local_max = NEG_BIG
+    comptime for s in range(MOE_TOPK_SLOTS):
+        if v[s] > local_max:
+            local_max = v[s]
+    mx = warp.max(local_max)
+
+    comptime for s in range(MOE_TOPK_SLOTS):
+        if lane + s * WARP < n_expert:
+            v[s] = exp(v[s] - mx)
+        else:
+            v[s] = 0.0
+
+    # Mianownik sumuje sie DOKLADNIE w tej kolejnosci, co redukcja przez blok
+    # 256 watkow, ktora tu byla. To nie jest ostroznosc: ten model sklada wejscie
+    # przez czterdziesci osiem warstw rekurencyjnych i wybiera ekspertow
+    # progiem, wiec jeden ulp mianownika przewraca wybor na bliskim remisie, a
+    # ten wybor jest skokiem. Zmierzone: suma szeregowa po slotach dala 1,428%
+    # rozpietosci logitow zamiast 0,967%, a zrownowazone drzewo po slotach
+    # PRZEWROCILO piatke czolowa i wywalilo bramke wzorca.
+    #
+    # Tamta redukcja liczyla najpierw motyla fali nad kazda trzydziestodwojka
+    # ekspertow, a potem motyla nad osmioma czesciami. Slot `s` tej fali trzyma
+    # dokladnie ekspertow `32s..32s+32`, wiec `warp.sum` na slocie odtwarza
+    # pierwszy poziom, a jawne pary drugi.
+    var p = SIMD[DType.float32, MOE_TOPK_SLOTS](0.0)
+    comptime for s in range(MOE_TOPK_SLOTS):
+        p[s] = warp.sum(v[s])
+    inv_denom = 1.0 / (
+        ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]))
+    )
+    comptime for s in range(MOE_TOPK_SLOTS):
+        if lane + s * WARP < n_expert:
+            v[s] = v[s] * inv_denom
+        else:
+            v[s] = NEG_BIG
 
     var wsum: Float32 = 0.0
     var kk = 0
     while kk < top_k:
-        var best_v = NEG_BIG
-        var best_i: Int32 = 0
-        i = tid
-        while i < n_expert:
-            if val[i] > best_v:
-                best_v = val[i]
-                best_i = Int32(i)
-            i += nthreads
-        rv[tid] = best_v
-        ri[tid] = best_i
-        barrier()
-        var span = nthreads // 2
-        while span > 0:
-            if tid < span:
-                other = tid + span
-                take = rv[other] > rv[tid] or (
-                    rv[other] == rv[tid] and ri[other] < ri[tid]
-                )
-                if take:
-                    rv[tid] = rv[other]
-                    ri[tid] = ri[other]
-            barrier()
-            span //= 2
-        pick = Int(ri[0])
-        if tid == 0:
-            ids_ptr[token * top_k + kk] = Int32(pick)
-            _ = Atomic.fetch_add(counts_ptr + pick, Int32(1))
-            weights_ptr[token * top_k + kk] = rv[0]
-            val[pick] = NEG_BIG
-        wsum += rv[0]
-        barrier()
+        # Kolejnosc slotow linii rosnie po indeksie eksperta, a `>` przepuszcza
+        # tylko ostro wieksza wartosc, wiec remis w linii bierze nizszy indeks
+        # sam z siebie; miedzy liniami trzeba go rozstrzygnac jawnie.
+        var bv = NEG_BIG
+        var bi: Int32 = 0
+        comptime for s in range(MOE_TOPK_SLOTS):
+            if v[s] > bv:
+                bv = v[s]
+                bi = Int32(lane + s * WARP)
+        comptime for d in range(5):
+            span = 1 << d
+            ov = shuffle_xor(bv, UInt32(span))
+            oi = shuffle_xor(bi, UInt32(span))
+            if ov > bv or (ov == bv and oi < bi):
+                bv = ov
+                bi = oi
+
+        if lane == 0:
+            ids_ptr[token * top_k + kk] = bi
+            weights_ptr[token * top_k + kk] = bv
+            _ = Atomic.fetch_add(counts_ptr + Int(bi), Int32(1))
+        wsum += bv
+        comptime for s in range(MOE_TOPK_SLOTS):
+            if lane + s * WARP == Int(bi):
+                v[s] = NEG_BIG
         kk += 1
 
-    if tid == 0 and norm_topk != 0 and wsum > 0.0:
-        var inv = 1.0 / wsum
+    if lane == 0 and norm_topk != 0 and wsum > 0.0:
+        inv = 1.0 / wsum
         kk = 0
         while kk < top_k:
             weights_ptr[token * top_k + kk] = (

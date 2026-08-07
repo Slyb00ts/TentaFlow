@@ -89,9 +89,11 @@ impl Kernels {
             ));
         }
         let k = self.artifacts.get("moe_topk_f32")?;
+        // JEDNA FALA na token: kernel trzyma ekspertów w rejestrach linii i
+        // redukuje przetasowaniem, więc szerszy blok tylko by próżnował.
         let cfg = LaunchConfig {
             grid: (n_tokens as u32, 1, 1),
-            block: (BLOCK, 1, 1),
+            block: (32, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()

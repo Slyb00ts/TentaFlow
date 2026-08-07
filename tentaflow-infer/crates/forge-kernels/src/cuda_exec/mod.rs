@@ -68,7 +68,7 @@ const PAGE: u32 = 256;
 const DECODE_SPLITS: u32 = 8;
 
 /// A quantized weight, in the blocks the source packed and the kernels read.
-struct Quantized {
+pub(super) struct Quantized {
     blocks: DevBuffer,
     /// Skalar całego tensora, gdy kernele formatu go biorą. Jedynka dla
     /// pozostałych — trzymany osobno, bo to on dzieli tabelę na dwie sekcje.
@@ -1394,6 +1394,36 @@ impl CudaExec {
     /// separate sequences, because that tile is built for hundreds of rows and
     /// four cannot fill its waves. The batch form knows widths 2/4/8/16 and
     /// refuses outside them, so three lanes fall back to the tile.
+    /// Jeden wiersz przez wagę: forma z aktywacją w int8, gdy format ją ma i
+    /// szerokość się mieści, inaczej tablica formatów.
+    ///
+    /// `rows` jest osobnym argumentem, bo warstwa rekurencyjna liczy oknem
+    /// węższym niż cała waga.
+    pub(super) fn gemv_decode(
+        &self,
+        w: &Quantized,
+        y: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+    ) -> Result<()> {
+        if w.cols <= Kernels::DP4A_MAX_COLS {
+            let s = &self.stream;
+            match w.quant {
+                QuantKind::Q8_0 => {
+                    return self.kernels.gemv_q8_0_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                }
+                QuantKind::Q6K => {
+                    return self.kernels.gemv_q6_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                }
+                QuantKind::Q4K => {
+                    return self.kernels.gemv_q4_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                }
+                _ => {}
+            }
+        }
+        self.gemv_by_kind(w.quant, y, &w.blocks, x, rows, w.cols, w.output_scale)
+    }
+
     fn matmul(&self, out: &DevBuffer, id: WeightId, x: &DevBuffer, rows: u32) -> Result<()> {
         let w = self.quant(id)?;
         // A prompt-width step multiplies through the e4m3 form when this weight
@@ -1402,7 +1432,6 @@ impl CudaExec {
             return Ok(());
         }
         let (r, c) = (w.rows, w.cols);
-        let q6 = w.quant != QuantKind::Q4K;
         // Aktywacja idzie do int8 w blokach po 32, a kernel adresuje te bloki
         // typem, który kończy się na tej szerokości. Szersza projekcja zostaje
         // przy f16 — wolniej, ale to jedyna z tych trzech form, która nie ma
@@ -1413,22 +1442,7 @@ impl CudaExec {
         let dp4a =
             matches!(w.quant, QuantKind::Q4K | QuantKind::Q6K | QuantKind::Q8_0) && int8_fits;
         if rows == 1 {
-            if dp4a && w.quant == QuantKind::Q8_0 {
-                return self
-                    .kernels
-                    .gemv_q8_0_dp4a_f16(out, &w.blocks, x, r, c, &self.stream);
-            }
-            return match (dp4a, q6) {
-                (true, true) => {
-                    self.kernels
-                        .gemv_q6_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
-                }
-                (true, false) => {
-                    self.kernels
-                        .gemv_q4_k_dp4a_f16(out, &w.blocks, x, r, c, &self.stream)
-                }
-                _ => self.gemv_by_kind(w.quant, out, &w.blocks, x, r, c, w.output_scale),
-            };
+            return self.gemv_decode(w, out, x, r);
         }
         if matches!(w.quant, QuantKind::Q4K | QuantKind::Q6K)
             && dp4a
@@ -1440,7 +1454,7 @@ impl CudaExec {
                 r,
                 c,
                 rows as usize,
-                q6,
+                w.quant != QuantKind::Q4K,
                 &self.stream,
             )?
         {

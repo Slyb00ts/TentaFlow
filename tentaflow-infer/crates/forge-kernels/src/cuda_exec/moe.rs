@@ -284,7 +284,7 @@ impl CudaExec {
         }
         let project = |w: &Quantized, y: &DevBuffer, x: &DevBuffer, r: usize| -> Result<()> {
             if rows == 1 {
-                return self.gemv_by_kind(w.quant, y, &w.blocks, x, r, w.cols, w.output_scale);
+                return self.gemv_decode(w, y, x, r);
             }
             self.gemm_by_kind(w.quant, y, &w.blocks, 0, x, r, w.cols, rows, w.output_scale)
         };
