@@ -369,6 +369,56 @@ impl Kernels {
     /// them to a tile built for hundreds; these are the kernels written for a
     /// single row, launched once instead of `top_k` times.
     #[allow(clippy::too_many_arguments)]
+    /// Gate, up and the gate function of every selection, in ONE launch.
+    ///
+    /// `false` when this format has no such kernel, and the caller then runs
+    /// the two projections and the elementwise gate separately — the same
+    /// answer for three times the launches and twice the activation staging.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_silu_gidx_batch(
+        &self,
+        quant: QuantKind,
+        act: &DevBuffer,
+        table_gate: &DevBuffer,
+        table_up: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ids: &DevBuffer,
+        selections: usize,
+        share: usize,
+        stream: &Stream,
+    ) -> Result<bool> {
+        const ROWS_PER_BLOCK: u32 = 8;
+        if cols > Self::DP4A_MAX_COLS {
+            return Ok(false);
+        }
+        let name = match quant {
+            QuantKind::Q4K => "gemv_silu_q4_k_dp4a_f16_gidx_batch",
+            QuantKind::Q6K => "gemv_silu_q6_k_dp4a_f16_gidx_batch",
+            _ => return Ok(false),
+        };
+        let Ok(k) = self.artifacts.get(name) else {
+            return Ok(false);
+        };
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(ROWS_PER_BLOCK), selections as u32, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(act)
+            .buf(table_gate)
+            .buf(table_up)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .buf(ids)
+            .scalar(share as i64);
+        self.device.launch(k, &cfg, &args, stream)?;
+        Ok(true)
+    }
+
     pub fn gemv_gidx_batch(
         &self,
         quant: QuantKind,
@@ -387,6 +437,11 @@ impl Kernels {
         const ROWS_PER_BLOCK: u32 = 8;
         let name = match quant {
             QuantKind::Q4K => "gemv_q4_k_dp4a_f16_gidx_batch",
+            // The integer route stages the activation in shared memory, so it
+            // is the wide step that cannot take it — not the format.
+            QuantKind::Q6K if cols <= Self::DP4A_MAX_COLS => {
+                "gemv_q6_k_dp4a_f16_gidx_batch"
+            }
             QuantKind::Q6K => "gemv_q6_k_f16_gidx_batch",
             QuantKind::MXFP4 => "gemv_mxfp4_f16_gidx_batch",
             other => {

@@ -490,32 +490,53 @@ impl CudaExec {
         let [gate, up, down] = stacks.map(|id| self.quant(id));
         let (gate, up, down) = (gate?, up?, down?);
 
-        for (id, w, y, width) in [
-            (stacks[0], gate, &moe.grouped_gate, inter),
-            (stacks[1], up, &moe.grouped_up, inter),
-        ] {
-            let table = self.expert_table(id, w, experts)?;
-            self.kernels.gemv_gidx_batch(
-                w.quant,
-                y,
-                &table,
+        let table_gate = self.expert_table(stacks[0], gate, experts)?;
+        let table_up = self.expert_table(stacks[1], up, experts)?;
+        // Gate and up multiply the SAME activation by two matrices of one
+        // expert, so a kernel that takes both tables stages that activation
+        // once and folds the gate function into its epilogue.
+        let fused = gate.quant == up.quant
+            && gate.cols == up.cols
+            && self.kernels.gemv_silu_gidx_batch(
+                gate.quant,
+                &moe.grouped_gate,
+                &table_gate,
+                &table_up,
                 self.buf(x),
-                width,
-                w.cols,
+                inter,
+                gate.cols,
                 &moe.ids,
                 selections,
                 top_k,
                 &self.stream,
             )?;
+        if !fused {
+            for (w, table, y) in [
+                (gate, &table_gate, &moe.grouped_gate),
+                (up, &table_up, &moe.grouped_up),
+            ] {
+                self.kernels.gemv_gidx_batch(
+                    w.quant,
+                    y,
+                    table,
+                    self.buf(x),
+                    inter,
+                    w.cols,
+                    &moe.ids,
+                    selections,
+                    top_k,
+                    &self.stream,
+                )?;
+            }
+            self.kernels.glu_mul_f16(
+                FfnActivation::SiLU,
+                &moe.grouped_gate,
+                &moe.grouped_gate,
+                &moe.grouped_up,
+                selections * inter,
+                &self.stream,
+            )?;
         }
-        self.kernels.glu_mul_f16(
-            FfnActivation::SiLU,
-            &moe.grouped_gate,
-            &moe.grouped_gate,
-            &moe.grouped_up,
-            selections * inter,
-            &self.stream,
-        )?;
         let down_table = self.expert_table(stacks[2], down, experts)?;
         self.kernels.gemv_gidx_batch(
             down.quant,

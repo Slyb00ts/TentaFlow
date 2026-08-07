@@ -457,6 +457,10 @@ from src.decode_dp4a import (
     gemv_q8_0_dp4a_out_f32,
     gemv_q4_k_dp4a_f16_gidx,
     gemv_q4_k_dp4a_f16_gidx_batch,
+    gemv_q6_k_dp4a_f16_gidx,
+    gemv_q6_k_dp4a_f16_gidx_batch,
+    gemv_silu_q4_k_dp4a_f16_gidx_batch,
+    gemv_silu_q6_k_dp4a_f16_gidx_batch,
 )
 from src.decode_dp4a import (
     gemv_norm_q8_0_dp4a_f16,
@@ -2891,6 +2895,11 @@ def main() raises:
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_f16_gidx"))
 
     _ = ctx.compile_function[
+        gemv_q6_k_dp4a_f16_gidx, dump_asm=Path("gemv_q6_k_dp4a_f16_gidx.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_f16_gidx"))
+
+    _ = ctx.compile_function[
         gemv_q6_k_f16_gidx, dump_asm=Path("gemv_q6_k_f16_gidx.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemv_q6_k_f16_gidx"))
@@ -3271,6 +3280,24 @@ def main() raises:
         dump_asm=Path("gemv_q4_k_dp4a_f16_gidx_batch.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_f16_gidx_batch"))
+
+    _ = ctx.compile_function[
+        gemv_q6_k_dp4a_f16_gidx_batch,
+        dump_asm=Path("gemv_q6_k_dp4a_f16_gidx_batch.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q6_k_dp4a_f16_gidx_batch"))
+
+    _ = ctx.compile_function[
+        gemv_silu_q4_k_dp4a_f16_gidx_batch,
+        dump_asm=Path("gemv_silu_q4_k_dp4a_f16_gidx_batch.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_silu_q4_k_dp4a_f16_gidx_batch"))
+
+    _ = ctx.compile_function[
+        gemv_silu_q6_k_dp4a_f16_gidx_batch,
+        dump_asm=Path("gemv_silu_q6_k_dp4a_f16_gidx_batch.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_silu_q6_k_dp4a_f16_gidx_batch"))
 
     _ = ctx.compile_function[
         gemv_q6_k_f16_gidx_batch, dump_asm=Path("gemv_q6_k_f16_gidx_batch.ptx")

@@ -1853,6 +1853,14 @@
       "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_9c8b4648f98e2627",
       "file": "gemv_q6_k_dp4a_f16.ptx"
     },
+    "gemv_q6_k_dp4a_f16_gidx": {
+      "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_a9cf4cc816d460ae",
+      "file": "gemv_q6_k_dp4a_f16_gidx.ptx"
+    },
+    "gemv_q6_k_dp4a_f16_gidx_batch": {
+      "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_16c4b41998fbed67",
+      "file": "gemv_q6_k_dp4a_f16_gidx_batch.ptx"
+    },
     "gemv_q6_k_dp4a_out_f32": {
       "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_84ba89e7dc396c66",
       "file": "gemv_q6_k_dp4a_out_f32.ptx"
@@ -2004,6 +2012,14 @@
     "gemv_residual_q8_0_f16": {
       "entry": "src_decode_fused_gemv_residual6A6A6A6A_603b010378a1d358",
       "file": "gemv_residual_q8_0_f16.ptx"
+    },
+    "gemv_silu_q4_k_dp4a_f16_gidx_batch": {
+      "entry": "src_decode_dp4a_gemv_silu_q4_k6A6A6A6A_5d58c2552566775c",
+      "file": "gemv_silu_q4_k_dp4a_f16_gidx_batch.ptx"
+    },
+    "gemv_silu_q6_k_dp4a_f16_gidx_batch": {
+      "entry": "src_decode_dp4a_gemv_silu_q6_k6A6A6A6A_0c8b18affc93fd63",
+      "file": "gemv_silu_q6_k_dp4a_f16_gidx_batch.ptx"
     },
     "hadamard_bf16_f16": {
       "entry": "src_deepseek_hadamard_bf16_f166A6A6A6A_87ff85434e5a8fb1",

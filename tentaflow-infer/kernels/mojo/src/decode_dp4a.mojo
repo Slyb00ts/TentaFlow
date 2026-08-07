@@ -324,8 +324,9 @@ def _dot_q4k_i8(
 
 
 def _dot2_q4k_i8(
-    w: UnsafePointer[UInt8, MutAnyOrigin],
+    w_g: UnsafePointer[UInt8, MutAnyOrigin],
     row_g: Int,
+    w_u: UnsafePointer[UInt8, MutAnyOrigin],
     row_u: Int,
     xq: UnsafePointer[
         Int8, MutUntrackedOrigin, address_space = AddressSpace.SHARED
@@ -338,7 +339,10 @@ def _dot2_q4k_i8(
 ) -> SIMD[DType.float32, 2]:
     # Two-row Q4_K mmvq dot (gate/up pair): per-row math and accumulation
     # order identical to _dot_q4k_i8, u loads shared and the two rows' weight
-    # loads overlapped in the memory pipeline.
+    # loads overlapped in the memory pipeline. Two BASE POINTERS, because a
+    # dense FFN stacks gate and up in one tensor and a mixture keeps them in
+    # two — same arithmetic, and the dense caller passes the same pointer
+    # twice.
     blocks_per_row = n_cols // 256
     base_g = row_g * blocks_per_row * 144
     base_u = row_u * blocks_per_row * 144
@@ -355,12 +359,12 @@ def _dot2_q4k_i8(
     while b < blocks_per_row:
         off_g = base_g + b * 144
         off_u = base_u + b * 144
-        dm_g = (w + off_g).bitcast[Float16]().load[width=2, alignment=4]()
-        dm_u = (w + off_u).bitcast[Float16]().load[width=2, alignment=4]()
-        sc_g, mn_g = _q4k_scale_pair(w, off_g, j)
-        sc_u, mn_u = _q4k_scale_pair(w, off_u, j)
-        qp_g = (w + off_g + 16 + j * 32 + 4 * w4).bitcast[Int32]()
-        qp_u = (w + off_u + 16 + j * 32 + 4 * w4).bitcast[Int32]()
+        dm_g = (w_g + off_g).bitcast[Float16]().load[width=2, alignment=4]()
+        dm_u = (w_u + off_u).bitcast[Float16]().load[width=2, alignment=4]()
+        sc_g, mn_g = _q4k_scale_pair(w_g, off_g, j)
+        sc_u, mn_u = _q4k_scale_pair(w_u, off_u, j)
+        qp_g = (w_g + off_g + 16 + j * 32 + 4 * w4).bitcast[Int32]()
+        qp_u = (w_u + off_u + 16 + j * 32 + 4 * w4).bitcast[Int32]()
         v0g = qp_g[0]
         v1g = qp_g[4]
         v0u = qp_u[0]
@@ -455,8 +459,9 @@ def _dot_q6k_i8(
 
 
 def _dot2_q6k_i8(
-    w: UnsafePointer[UInt8, MutAnyOrigin],
+    w_g: UnsafePointer[UInt8, MutAnyOrigin],
     row_g: Int,
+    w_u: UnsafePointer[UInt8, MutAnyOrigin],
     row_u: Int,
     xq: UnsafePointer[
         Int8, MutUntrackedOrigin, address_space = AddressSpace.SHARED
@@ -485,28 +490,28 @@ def _dot2_q6k_i8(
     while b < blocks_per_row:
         off_g = base_g + b * 210
         off_u = base_u + b * 210
-        d_g = Float32((w + off_g + 208).bitcast[Float16]()[0])
-        d_u = Float32((w + off_u + 208).bitcast[Float16]()[0])
+        d_g = Float32((w_g + off_g + 208).bitcast[Float16]()[0])
+        d_u = Float32((w_u + off_u + 208).bitcast[Float16]()[0])
         vl_g = bitcast[DType.int32, 1](
-            (w + off_g + 4 * lane).bitcast[UInt16]().load[width=2]()
+            (w_g + off_g + 4 * lane).bitcast[UInt16]().load[width=2]()
         )[0]
         vl_u = bitcast[DType.int32, 1](
-            (w + off_u + 4 * lane).bitcast[UInt16]().load[width=2]()
+            (w_u + off_u + 4 * lane).bitcast[UInt16]().load[width=2]()
         )[0]
         vh_g = (
             bitcast[DType.int32, 1](
-                (w + off_g + 128 + 4 * qh_w).bitcast[UInt16]().load[width=2]()
+                (w_g + off_g + 128 + 4 * qh_w).bitcast[UInt16]().load[width=2]()
             )[0]
             >> Int32(qh_shift)
         )
         vh_u = (
             bitcast[DType.int32, 1](
-                (w + off_u + 128 + 4 * qh_w).bitcast[UInt16]().load[width=2]()
+                (w_u + off_u + 128 + 4 * qh_w).bitcast[UInt16]().load[width=2]()
             )[0]
             >> Int32(qh_shift)
         )
-        sp_g = (w + off_g + 192 + sc_off).bitcast[Int8]()
-        sp_u = (w + off_u + 192 + sc_off).bitcast[Int8]()
+        sp_g = (w_g + off_g + 192 + sc_off).bitcast[Int8]()
+        sp_u = (w_u + off_u + 192 + sc_off).bitcast[Int8]()
         sc0_g = Float32(Int(sp_g[0]))
         sc1_g = Float32(Int(sp_g[4]))
         sc0_u = Float32(Int(sp_u[0]))
@@ -750,6 +755,46 @@ def gemv_q6_k_dp4a_f16(
         y[row] = Float16(total)
 
 
+def gemv_q6_k_dp4a_f16_gidx(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    sel: Int,
+):
+    """Routed-MoE Q6_K expert GEMV, on the same integer path as its Q4_K twin.
+
+    Q4_K_M puts six bits on `ffn_down` and four on the other two projections of
+    the same expert, so half a mixture's down projections came here and half
+    went to `gemv_q4_k_dp4a_f16_gidx`. Without this the six-bit half had only
+    the f16 route, which dequantizes a superblock to sixteen-bit values before
+    multiplying: measured 126 GB/s against 179 for the four-bit half of the
+    SAME shape, on a card whose stream tops out around 215.
+
+    Expert chosen ON DEVICE from `ids[sel]`, and `wtab[e]` is that expert's own
+    base pointer — see `gemv_q4_k_dp4a_f16_gidx` for why the table and not the
+    stack. Bit-identical to `gemv_q6_k_dp4a_f16` on that expert's block."""
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if lrow >= n_rows:
+        return
+    w = wtab[Int(ids[sel])]
+    total = _dot_q6k_i8(w, lrow, xq, xds, n_cols, lane)
+    if lane == 0:
+        y[lrow] = Float16(total)
+
+
 def gemv_q6_k_dp4a_out_f32(
     y: UnsafePointer[Float32, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
@@ -944,7 +989,7 @@ def gemv_norm_silu_q4_k_dp4a_f16(
     for i in range(rows_per_warp):
         row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
         if row < inter:
-            gu = _dot2_q4k_i8(w, row, inter + row, xq, xds, n_cols, lane)
+            gu = _dot2_q4k_i8(w, row, w, inter + row, xq, xds, n_cols, lane)
             if lane == 0:
                 g = Float32(Float16(gu[0]))
                 act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(gu[1])))
@@ -974,7 +1019,7 @@ def gemv_norm_silu_q6_k_dp4a_f16(
     for i in range(rows_per_warp):
         row = (Int(block_idx.x) * rows_per_warp + i) * ROWS_PER_BLOCK + wid
         if row < inter:
-            gu = _dot2_q6k_i8(w, row, inter + row, xq, xds, n_cols, lane)
+            gu = _dot2_q6k_i8(w, row, w, inter + row, xq, xds, n_cols, lane)
             if lane == 0:
                 g = Float32(Float16(gu[0]))
                 act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(gu[1])))
@@ -1318,6 +1363,109 @@ def gemv_q8_0_dp4a_group4_f16(
         if lane == 0:
             y3[row3] = Float16(total3)
 
+
+
+def gemv_q6_k_dp4a_f16_gidx_batch(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Every selection of a routed step in one launch — the Q6_K half."""
+    sel = Int(block_idx.y)
+    gemv_q6_k_dp4a_f16_gidx(
+        y + sel * n_rows,
+        wtab,
+        x + (sel // share) * n_cols,
+        n_cols,
+        n_rows,
+        ids + sel,
+        0,
+    )
+
+
+def gemv_silu_q4_k_dp4a_f16_gidx_batch(
+    act: UnsafePointer[Float16, MutAnyOrigin],
+    wtab_g: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    wtab_u: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Gate, up and the gate function of one routed step, in ONE launch.
+
+    Gate and up multiply the SAME activation by two matrices of the same
+    expert, so run apart each block quantized that activation into shared
+    memory twice — measured at 3,1 MB of staged reads against 7,1 MB of weight
+    per launch, so a third of the traffic was the half that did not have to
+    happen. Run together the staging is paid once, the two answers meet in
+    registers, and the elementwise gate that used to be its own launch is the
+    epilogue. Same decomposition llama.cpp fuses as {MUL_MAT_ID, MUL_MAT_ID,
+    GLU}.
+
+    Arithmetic per row is `_dot2_q4k_i8`, which is `_dot_q4k_i8` twice in the
+    same accumulation order — so the answer is what the two separate launches
+    gave, not merely close to it."""
+    sel = Int(block_idx.y)
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x + (sel // share) * n_cols, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    e = Int(ids[sel])
+    gu = _dot2_q4k_i8(wtab_g[e], row, wtab_u[e], row, xq, xds, n_cols, lane)
+    if lane == 0:
+        g = Float32(Float16(gu[0]))
+        act[sel * n_rows + row] = Float16(
+            g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
+        )
+
+
+def gemv_silu_q6_k_dp4a_f16_gidx_batch(
+    act: UnsafePointer[Float16, MutAnyOrigin],
+    wtab_g: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    wtab_u: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """The six-bit twin of `gemv_silu_q4_k_dp4a_f16_gidx_batch`."""
+    sel = Int(block_idx.y)
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x + (sel // share) * n_cols, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    e = Int(ids[sel])
+    gu = _dot2_q6k_i8(wtab_g[e], row, wtab_u[e], row, xq, xds, n_cols, lane)
+    if lane == 0:
+        g = Float32(Float16(gu[0]))
+        act[sel * n_rows + row] = Float16(
+            g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
+        )
 
 
 def gemv_q4_k_dp4a_f16_gidx_batch(

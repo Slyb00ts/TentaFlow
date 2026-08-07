@@ -21,24 +21,53 @@ def rmsnorm_f16(
     n_cols: Int,
     eps: Float32,
 ):
-    """out[row] = x[row] / rms(x[row]) * weight, one block per row."""
+    """out[row] = x[row] / rms(x[row]) * weight, one block per row.
+
+    A decode step runs this on ONE row of a few kilobytes, so it is latency and
+    not bandwidth: one block on one multiprocessor, and the only parallelism
+    left is how many loads a thread keeps in flight. Both passes therefore
+    issue NORM_UNROLL grid-strided accesses before consuming any of them, the
+    same way `rmsnorm_residual_f16` does — the scalar loop below still finishes
+    a row whose width is not a multiple of the unroll.
+
+    The stride stays `block_dim.x`, so every thread visits the same columns in
+    the same order as the scalar form."""
     row = Int(block_idx.x)
     base = row * n_cols
+    stride = Int(block_dim.x)
 
     var ss: Float32 = 0.0
     var i = Int(thread_idx.x)
+    while i + (NORM_UNROLL - 1) * stride < n_cols:
+        var v = InlineArray[Float32, NORM_UNROLL](fill=0.0)
+        comptime for u in range(NORM_UNROLL):
+            v[u] = Float32(x[base + i + u * stride])
+        comptime for u in range(NORM_UNROLL):
+            ss += v[u] * v[u]
+        i += NORM_UNROLL * stride
     while i < n_cols:
         v = Float32(x[base + i])
         ss += v * v
-        i += Int(block_dim.x)
+        i += stride
 
     total = block_reduce_sum(ss)
     inv = rsqrt(total / Float32(n_cols) + eps)
 
     i = Int(thread_idx.x)
+    while i + (NORM_UNROLL - 1) * stride < n_cols:
+        var v = InlineArray[Float32, NORM_UNROLL](fill=0.0)
+        comptime for u in range(NORM_UNROLL):
+            v[u] = (
+                Float32(x[base + i + u * stride])
+                * inv
+                * Float32(weight[i + u * stride])
+            )
+        comptime for u in range(NORM_UNROLL):
+            out_ptr[base + i + u * stride] = Float16(v[u])
+        i += NORM_UNROLL * stride
     while i < n_cols:
         out_ptr[base + i] = Float16(Float32(x[base + i]) * inv * Float32(weight[i]))
-        i += Int(block_dim.x)
+        i += stride
 
 
 def rmsnorm_residual_f16(

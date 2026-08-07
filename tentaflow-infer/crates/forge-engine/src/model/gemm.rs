@@ -527,6 +527,9 @@ impl Model {
             DevWeight::Q4K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
                 .kernels
                 .gemv_q4_k_dp4a_f16_gidx(y, stack.table(), x, n_rows, *cols, ids, sel, stream),
+            DevWeight::Q6K { cols, .. } if *cols <= Kernels::DP4A_MAX_COLS => self
+                .kernels
+                .gemv_q6_k_dp4a_f16_gidx(y, stack.table(), x, n_rows, *cols, ids, sel, stream),
             DevWeight::Q6K { cols, .. } => self.kernels.gemv_q6_k_f16_gidx(
                 y,
                 stack.table(),

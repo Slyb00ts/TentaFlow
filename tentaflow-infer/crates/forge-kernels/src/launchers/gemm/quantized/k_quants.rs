@@ -939,6 +939,43 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Routed-MoE Q6_K expert GEMV on the integer path.
+    ///
+    /// The six-bit twin of `gemv_q4_k_dp4a_f16_gidx`, and it exists because
+    /// Q4_K_M splits ONE expert between the two: six bits on `ffn_down`, four
+    /// on gate and up. Without it half a mixture's down projections took the
+    /// f16 route, which dequantizes a superblock before multiplying — measured
+    /// 126 GB/s against 179 for the four-bit half of the same shape.
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemv_q6_k_dp4a_f16_gidx(
+        &self,
+        y: &DevBuffer,
+        w_table: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        ids: &DevBuffer,
+        sel: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        Self::check_dp4a_cols(cols, 256, "gemv_q6_k_dp4a_f16_gidx")?;
+        let k = self.artifacts.get("gemv_q6_k_dp4a_f16_gidx")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_table)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64)
+            .buf(ids)
+            .scalar(sel as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// Q4_K logit GEMV (f32 out) with dp4a dots.
     #[allow(clippy::too_many_arguments)]
     pub fn gemv_q4_k_dp4a_out_f32(
