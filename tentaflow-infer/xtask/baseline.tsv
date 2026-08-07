@@ -127,7 +127,7 @@ size	crates/forge-kernels/src/launchers/attention.rs	2163
 size	crates/forge-kernels/src/launchers/deltanet.rs	1963
 size	crates/forge-kernels/src/launchers/gemm/nvfp4.rs	1710
 size	crates/forge-kernels/src/launchers/gemm/quantized/i_quants.rs	2038
-size	crates/forge-kernels/src/launchers/gemm/quantized/k_quants.rs	1954
+size	crates/forge-kernels/src/launchers/gemm/quantized/k_quants.rs	1869
 size	crates/forge-kernels/src/launchers/mod.rs	3530
 size	crates/forge-kernels/tests/golden.rs	3029
 vendor_gate	crates/forge-kernels/src/launchers/mod.rs	2

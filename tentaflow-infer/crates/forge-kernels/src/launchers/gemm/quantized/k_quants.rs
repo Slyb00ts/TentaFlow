@@ -10,98 +10,6 @@ const PERSIST_GRID: u32 = 384;
 const GEMV_Q4K_GROUP4: &str = "gemv_q4_k_dp4a_group4_f16";
 
 impl Kernels {
-    /// Dekwantyzuje staged embedding row z tied Q4_K według ID na GPU.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gather_q4_k_row_f16(
-        &self,
-        output: &DevBuffer,
-        weights: &DevBuffer,
-        token: &DevBuffer,
-        status: &DevBuffer,
-        status_offset: usize,
-        vocab_size: usize,
-        hidden_size: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        if vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(256) {
-            return Err(ForgeError::Kernel(
-                "gather_q4_k_row_f16: niepoprawny kształt".into(),
-            ));
-        }
-        let output_bytes = checked_buffer_bytes("gather_q4_k_row_f16 output", &[hidden_size], 2)?;
-        let weight_bytes = checked_buffer_bytes(
-            "gather_q4_k_row_f16 weights",
-            &[vocab_size, hidden_size / 256],
-            144,
-        )?;
-        if output.len() < output_bytes
-            || weights.len() < weight_bytes
-            || token.len() < 4
-            || status_offset
-                .checked_add(4)
-                .is_none_or(|end| end > status.len())
-        {
-            return Err(ForgeError::Kernel(
-                "gather_q4_k_row_f16: zbyt mały bufor".into(),
-            ));
-        }
-        let kernel = self.artifacts.get("gather_q4_k_row_f16")?;
-        let config = LaunchConfig::linear(hidden_size as u32, BLOCK);
-        let args = LaunchArgs::new()
-            .buf(output)
-            .buf(weights)
-            .buf(token)
-            .buf_at(status, status_offset)?
-            .scalar(vocab_size as i64)
-            .scalar(hidden_size as i64);
-        self.device.launch(kernel, &config, &args, stream)
-    }
-
-    /// Dekwantyzuje batch wierszy target embeddingu Q4_K według ID na GPU.
-    #[allow(clippy::too_many_arguments)]
-    pub fn gather_q4_k_rows_f16(
-        &self,
-        output: &DevBuffer,
-        weights: &DevBuffer,
-        ids: &DevBuffer,
-        rows: usize,
-        vocab_size: usize,
-        hidden_size: usize,
-        stream: &Stream,
-    ) -> Result<()> {
-        if rows == 0 || vocab_size == 0 || hidden_size == 0 || !hidden_size.is_multiple_of(256) {
-            return Err(ForgeError::Kernel(
-                "gather_q4_k_rows_f16: niepoprawny kształt".into(),
-            ));
-        }
-        let output_bytes =
-            checked_buffer_bytes("gather_q4_k_rows_f16 output", &[rows, hidden_size], 2)?;
-        let weight_bytes = checked_buffer_bytes(
-            "gather_q4_k_rows_f16 weights",
-            &[vocab_size, hidden_size / 256],
-            144,
-        )?;
-        if output.len() < output_bytes || weights.len() < weight_bytes || ids.len() < rows * 4 {
-            return Err(ForgeError::Kernel(
-                "gather_q4_k_rows_f16: zbyt mały bufor".into(),
-            ));
-        }
-        let kernel = self.artifacts.get("gather_q4_k_rows_f16")?;
-        let config = LaunchConfig {
-            grid: ((hidden_size as u32).div_ceil(BLOCK), rows as u32, 1),
-            block: (BLOCK, 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(output)
-            .buf(weights)
-            .buf(ids)
-            .scalar(rows as i64)
-            .scalar(vocab_size as i64)
-            .scalar(hidden_size as i64);
-        self.device.launch(kernel, &config, &args, stream)
-    }
-
     /// y = W·x with W in GGML Q4_K superblocks, x/y f16. Warp per row.
     pub fn gemv_q4_k_f16(
         &self,
@@ -815,17 +723,17 @@ impl Kernels {
         let persist = tiles > PERSIST_GRID
             && tiles <= 2048
             && self.artifacts.get("gemv_q4_k_dp4a_persist_f16").is_ok();
-        // The narrow staging variant reserves a quarter of the shared memory
-        // and so lets an SM hold four times the blocks — which at decode, where
-        // the dot waits on memory rather than on arithmetic, is the same thing
-        // as four times the requests in flight.
-        let k = if persist {
-            match self.artifacts.get("gemv_q4_k_dp4a_persist_x4k_f16") {
-                Ok(narrow) if cols <= 4096 => narrow,
-                _ => self.artifacts.get("gemv_q4_k_dp4a_persist_f16")?,
-            }
-        } else {
-            self.artifacts.get("gemv_q4_k_dp4a_f16")?
+        // Narrow staging when the activation fits it: same arithmetic, a
+        // quarter of the shared memory, so an SM can hold more of these blocks.
+        let k = match persist {
+            true => match (cols <= 4096)
+                .then(|| self.artifacts.get("gemv_q4_k_dp4a_persist_x4k_f16").ok())
+                .flatten()
+            {
+                Some(n) => n,
+                None => self.artifacts.get("gemv_q4_k_dp4a_persist_f16")?,
+            },
+            false => self.artifacts.get("gemv_q4_k_dp4a_f16")?,
         };
         let cfg = LaunchConfig {
             grid: (if persist { PERSIST_GRID } else { tiles }, 1, 1),
