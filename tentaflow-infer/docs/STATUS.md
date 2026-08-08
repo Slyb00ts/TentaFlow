@@ -1444,7 +1444,11 @@ Ostatnia aktualizacja: 2026-07-25.
 - ✅ **Formaty**: GGUF v2/v3 (WSZYSTKIE kwantyzacje natywnie w VRAM: Q2-Q8_K,
   Q4/5_0/1, IQ1-IQ4, MXFP4), safetensors (NVFP4, FP8, BF16, sharding)
 - ✅ **Tokenizery + chat templating**: HF + GGUF-BPE, minijinja HF-compat,
-  streaming detok UTF-8, stop-holdback
+  streaming detok UTF-8, stop-holdback. Żądanie dokłada własne zmienne szablonu
+  (`chat_template_kwargs`, jak w vLLM/SGLang) i wygrywa z tymi z checkpointu, bo
+  `bos_token` opisuje model, a `enable_thinking` jedną rozmowę: Qwen3.6-35B
+  odpowiada na „Say hi." preambułą rozumowania domyślnie, a „Hi! How can I help
+  you today?" przy `enable_thinking: false`
 - ✅ **Kernele Mojo** (AOT→PTX): rmsnorm/layernorm, rope, silu, fused dequant
   GEMV+GEMM (wszystkie quanty + dp4a int8 + mma tensor-core), paged flash
   attention (decode split-K + prefill, GQA), conv1d/gelu (Whisper), sampling GPU,
@@ -1998,7 +2002,11 @@ Ostatnia aktualizacja: 2026-07-25.
   opisują tylko attention. Pożyczka staje wyłącznie na węźle z checkpointem,
   prefill utrwala stan co `HYBRID_STATE_CHECKPOINT_STRIDE`=512 tokenów i na
   końcu promptu, a checkpointy biorą sloty z TEJ SAMEJ puli co żywe sekwencje
-  (`HYBRID_STATE_CACHE_SLOTS`=8) — nie ma proporcji do strojenia. Strony i
+  (`HYBRID_STATE_CACHE_SLOTS`=16) — nie ma proporcji do strojenia. DEKODOWANIE
+  też oddaje swoje strony: sekwencja prowadzi JEDEN toczący się checkpoint,
+  nadpisywany na każdej granicy strony za promptem, więc wygenerowana odpowiedź
+  jest prefiksem następnej tury zamiast być dla drzewa niewidoczna (koszt to
+  jedna kopia D2D co 32 kroki, niezależnie od długości odpowiedzi). Strony i
   checkpointy mają osobne listy LRU: checkpoint wolno eksmitować z dowolnego
   węzła, strony tylko od liścia, a liść bez checkpointu idzie PIERWSZY, bo dla
   hybrydy jest stroną, do której żadna pożyczka nie dosięgnie. Dowód
@@ -2006,8 +2014,14 @@ Ostatnia aktualizacja: 2026-07-25.
   sam korpus z innym pytaniem 86 ms, tokeny bit-identyczne z zimnym; pięć pytań
   do jednego inwentarza 3592/1557/94/82/89 ms. Bramka
   `hybrid_prefix_gpu.rs`: 992/1001 tok. z cache'u, prefill 507→58 ms, ten sam
-  ciąg 24 tokenów, a rozjazd w połowie promptu pożycza checkpoint pośredni (512).
-  MTP/spekulacja pozostaje wykluczona z prefiksem, tak samo jak dotąd. Usage
+  ciąg 24 tokenów, a rozjazd w połowie promptu pożycza checkpoint pośredni (512),
+  a następna tura sięga 1088/1097 tok. — poza prompt, w odpowiedź. Kontynuacja
+  promptu 3008 tok. jego własnym dopełnieniem 400 tok. idzie z cache'u w 3392 z
+  3419 zamiast 3008, TTFT 407,5→98,2 ms. `fp8` też: Bielik-7B Q8_0 z
+  `--kv-cache fp8`, trzy pytania na wspólnym inwentarzu 1302/82/82 ms wobec
+  1305/1306/1307 ms z `--prefix-cache off`, hashe odpowiedzi identyczne.
+  Natywne MTP pozostaje wykluczone z prefiksem (własny verifier i cache draftu —
+  para niezmierzona); n-gram działa obok prefiksu. Usage
   `prompt_tokens_details.cached_tokens`. Współdzielenie CAŁYCH stron → borrower
   nigdy nie pisze do współdzielonej strony (bez CoW granicznej strony). Dowód
   (RTX 4090, qwen3-0.6b): wspólny prefiks 2048 tok. → `cache_read=2016`, prefill
