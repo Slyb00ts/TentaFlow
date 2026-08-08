@@ -114,6 +114,23 @@ impl SpeculativeConfig {
         self.draft_tokens
     }
 
+    /// Czy drafty pochodzą z głowy NextN samego modelu, a nie z hosta.
+    pub fn is_native_mtp(&self) -> bool {
+        matches!(
+            self.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        )
+    }
+
+    /// Czy prefiks współdzielony może działać obok tej spekulacji.
+    ///
+    /// Draft hostowy idzie na OGON sekwencji, a rollback zwalnia strony tylko
+    /// od końca — pożyczonych nie tyka. Natywne MTP prowadzi własny verifier i
+    /// cache draftu; ta para nie jest zmierzona, więc prefiks jej ustępuje.
+    pub fn allows_prefix_cache(&self) -> bool {
+        !self.is_native_mtp()
+    }
+
     /// Rozróżnia wyłączoną spekulację, proposer hostowy i natywne MTP modelu.
     pub fn kind(&self) -> SpeculationKind {
         match self.proposers.as_slice() {

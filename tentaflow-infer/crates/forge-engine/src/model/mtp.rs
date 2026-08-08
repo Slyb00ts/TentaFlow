@@ -1624,11 +1624,8 @@ impl Model {
                 "speculative verification does not support KV tiering".into(),
             ));
         }
-        // Prefiks współdzielony NIE jest tu przeszkodą. Draft dopisuje się na
-        // ogonie sekwencji, a `KvCache::rollback` zwalnia strony wyłącznie od
-        // końca i nigdy nie schodzi poniżej `shared_pages`; darowizna obejmuje
-        // tylko `prefilled_len`, więc żadna strona zapisana przez verifier nie
-        // trafia do drzewa.
+        // Prefiks NIE jest tu przeszkodą: rollback zwalnia strony wyłącznie od
+        // końca, a darowizna obejmuje tylko `prefilled_len`.
         if !matches!(
             self.weights.lm_head,
             DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
@@ -1662,8 +1659,7 @@ impl Model {
                 "hybrydowy verifier spekulacyjny wymaga cache KV F16".into(),
             ));
         }
-        // Hybrydowy verifier prowadzi obok siebie stan DeltaNet i cache draftu
-        // MTP; z pożyczonym prefiksem nie jest zmierzony, więc zostaje poza.
+        // Hybrydowy verifier z pożyczonym prefiksem nie jest zmierzony.
         if self.tier.is_some() || self.prefix_cache.is_some() {
             return Err(ForgeError::Unsupported(
                 "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache".into(),

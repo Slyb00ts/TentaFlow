@@ -737,12 +737,7 @@ fn resolve_max_active(
     hybrid_model: bool,
 ) -> Result<usize> {
     let max_active = usize::from(max_active.unwrap_or_else(|| {
-        if hybrid_model
-            || matches!(
-                spec.kind(),
-                SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-            )
-        {
+        if hybrid_model || spec.is_native_mtp() {
             1
         } else {
             8
@@ -896,22 +891,6 @@ fn parse_tp_cards(spec: Option<&str>) -> Result<Vec<forge_hal::gpu::DeviceId>> {
         out.push(id);
     }
     Ok(out)
-}
-
-/// Czy prefiks współdzielony może żyć obok tej spekulacji.
-///
-/// Proposer hostowy (n-gram) dokłada tylko draft na OGON sekwencji i cofa go
-/// `KvCache::rollback`, który zwalnia strony wyłącznie od końca — pożyczone
-/// strony prefiksu leżą poniżej i nigdy nie są ruszane, a darowizna obejmuje
-/// tylko `prefilled_len`, czyli to, co policzył prefill. Natywne MTP prowadzi
-/// własny verifier i cache draftu, których z pożyczonym prefiksem nie
-/// zmierzyliśmy, więc dla nich prefiks nadal schodzi.
-fn prefix_cache_with(prefix_cache: bool, spec: &SpeculativeConfig) -> bool {
-    prefix_cache
-        && !matches!(
-            spec.kind(),
-            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-        )
 }
 
 fn parse_prefix_cache(s: &str) -> Result<bool> {
@@ -1729,7 +1708,7 @@ fn cmd_serve(
     spec: SpeculativeConfig,
     tp_cards: Vec<forge_hal::gpu::DeviceId>,
 ) -> Result<()> {
-    let prefix_cache = prefix_cache_with(prefix_cache, &spec);
+    let prefix_cache = prefix_cache && spec.allows_prefix_cache();
     if spec.is_enabled() && !prefix_cache {
         tracing::info!("natywne MTP prowadzi własny cache draftu; prefiks wyłączony");
     }
@@ -1747,10 +1726,7 @@ fn cmd_serve(
         ctx,
         hot_pages,
         prefix_cache,
-        matches!(
-            spec.kind(),
-            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-        ),
+        spec.is_native_mtp(),
         Nvfp4GgufLayout::RowMajor36,
     )?;
     enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
@@ -2000,7 +1976,7 @@ fn cmd_run(
     );
 
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache_with(prefix_cache, &spec);
+    let prefix_cache = prefix_cache && spec.allows_prefix_cache();
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -2012,10 +1988,7 @@ fn cmd_run(
         kv_pages,
         hot_pages,
         prefix_cache,
-        matches!(
-            spec.kind(),
-            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-        ),
+        spec.is_native_mtp(),
         Nvfp4GgufLayout::RowMajor36,
         tp_world,
     )?;
@@ -2388,7 +2361,7 @@ fn cmd_bench(
         bail!("--reps must be at least 1");
     }
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache_with(prefix_cache, &spec);
+    let prefix_cache = prefix_cache && spec.allows_prefix_cache();
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -2400,10 +2373,7 @@ fn cmd_bench(
         kv_pages,
         hot_pages,
         prefix_cache,
-        matches!(
-            spec.kind(),
-            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
-        ),
+        spec.is_native_mtp(),
         resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
         tp_world,
     )?;

@@ -1717,71 +1717,6 @@ fn native_mtp_greedy_decision(draft: &[u32], predictions: &[i32]) -> (usize, u32
     (accepted, predictions[accepted] as u32)
 }
 
-/// Ile tokenów sekwencja miała zapisane, zanim verify tknął jej bufory.
-#[derive(Clone, Copy)]
-struct RecordedTokens {
-    tokens: usize,
-    prefilled: usize,
-}
-
-impl RecordedTokens {
-    fn of(seq: &SeqKv) -> Self {
-        Self {
-            tokens: seq.tokens.len(),
-            prefilled: seq.prefilled_len,
-        }
-    }
-}
-
-/// Zamyka weryfikację draftu: cofa KV do zaakceptowanej długości i unieważnia
-/// tabelę stron.
-///
-/// Verify jedzie ścieżką prefillu, a ta zapisuje `tokens`/`prefilled_len` dla
-/// darowizny prefiksu — tyle że draft nie jest promptem i za chwilę zniknie.
-/// Ten zapis jest więc tu cofany razem ze stronami: bez tego `prefilled_len`
-/// rósł o każdy zweryfikowany token, a darowizna sięgała po strony, których
-/// sekwencja nigdy nie miała.
-fn finish_greedy_verification(
-    kv: &mut KvCache,
-    page_table_seq: &mut u64,
-    seq: &mut SeqKv,
-    base: usize,
-    recorded: RecordedTokens,
-    result: Result<(usize, u32)>,
-) -> Result<(usize, u32)> {
-    let result = match result {
-        Ok((accepted, correction)) => {
-            let target_len = accepted
-                .checked_add(1)
-                .and_then(|retained| base.checked_add(retained));
-            match target_len {
-                Some(target_len) if target_len <= seq.len => {
-                    kv.rollback(seq, target_len);
-                    Ok((accepted, correction))
-                }
-                _ => {
-                    if seq.len >= base {
-                        kv.rollback(seq, base);
-                    }
-                    Err(ForgeError::Scheduler(
-                        "invalid speculative verification rollback target".into(),
-                    ))
-                }
-            }
-        }
-        Err(error) => {
-            if seq.len >= base {
-                kv.rollback(seq, base);
-            }
-            Err(error)
-        }
-    };
-    seq.tokens.truncate(recorded.tokens);
-    seq.prefilled_len = recorded.prefilled;
-    *page_table_seq = 0;
-    result
-}
-
 fn logical_kv_regions(
     pages: &[i32],
     seq_len: usize,
@@ -1964,7 +1899,9 @@ mod sample;
 mod scratch;
 mod state_cache;
 mod tp;
+mod verify_txn;
 pub(crate) use state_cache::{HybridStatePool, SsmState};
+pub(crate) use verify_txn::{finish_greedy_verification, RecordedTokens};
 
 impl Model {
     pub(crate) fn finish(
