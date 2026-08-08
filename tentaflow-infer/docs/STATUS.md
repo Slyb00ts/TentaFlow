@@ -1992,7 +1992,22 @@ Ostatnia aktualizacja: 2026-07-25.
   strony pożyczonego prefiksu są nadal rozliczane konserwatywnie w pełnym budżecie
   requestu, więc współdzielenie może nie przyspieszyć admission. Cache jest
   aktywny dla verbatim `f16`/`fp8` bez
-  tieringu i arch nie-hybrydowej (`--prefix-cache on|off`, default on). Usage
+  tieringu (`--prefix-cache on|off`, default on). Arch hybrydowa też, o ile ma
+  jedną rangę: węzeł drzewa niesie wtedy dodatkowo CHECKPOINT stanu DeltaNet
+  (okno splotu + macierz stanu każdej warstwy rekurencyjnej), bo same strony
+  opisują tylko attention. Pożyczka staje wyłącznie na węźle z checkpointem,
+  prefill utrwala stan co `HYBRID_STATE_CHECKPOINT_STRIDE`=512 tokenów i na
+  końcu promptu, a checkpointy biorą sloty z TEJ SAMEJ puli co żywe sekwencje
+  (`HYBRID_STATE_CACHE_SLOTS`=8) — nie ma proporcji do strojenia. Strony i
+  checkpointy mają osobne listy LRU: checkpoint wolno eksmitować z dowolnego
+  węzła, strony tylko od liścia, a liść bez checkpointu idzie PIERWSZY, bo dla
+  hybrydy jest stroną, do której żadna pożyczka nie dosięgnie. Dowód
+  (GB10, Qwen3.6-35B MXFP4): powtórzony prompt 2000 tok. 1505→88 ms TTFT, ten
+  sam korpus z innym pytaniem 86 ms, tokeny bit-identyczne z zimnym; pięć pytań
+  do jednego inwentarza 3592/1557/94/82/89 ms. Bramka
+  `hybrid_prefix_gpu.rs`: 992/1001 tok. z cache'u, prefill 507→58 ms, ten sam
+  ciąg 24 tokenów, a rozjazd w połowie promptu pożycza checkpoint pośredni (512).
+  MTP/spekulacja pozostaje wykluczona z prefiksem, tak samo jak dotąd. Usage
   `prompt_tokens_details.cached_tokens`. Współdzielenie CAŁYCH stron → borrower
   nigdy nie pisze do współdzielonej strony (bez CoW granicznej strony). Dowód
   (RTX 4090, qwen3-0.6b): wspólny prefiks 2048 tok. → `cache_read=2016`, prefill
