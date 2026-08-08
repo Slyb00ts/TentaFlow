@@ -21,8 +21,11 @@ pub fn weights_pool(path: &Path, free: usize, other_pools: usize, reason: &str) 
         }
     };
     // Rezydentne wagi bywają szersze od pliku: przepakowania i wyrównanie slabów
-    // do granulacji alokatora. Ósemka pokrywa oba z zapasem.
-    let wanted = file + (file / 8) + (256 << 20);
+    // do granulacji alokatora. Ósemka pokrywa oba z zapasem, a płaski gigabajt
+    // to, co model bierze z TEJ SAMEJ puli, a czego w pliku nie ma — u hybrydy
+    // sloty stanu DeltaNet, po kilkadziesiąt megabajtów każdy. Bez tego zapasu
+    // cache checkpointów po cichu nie dostaje ani jednego slotu.
+    let wanted = file + (file / 8) + (1 << 30);
     let budget = free.max(reclaimable());
     let host_reserve = budget / 8;
     if wanted + other_pools + host_reserve > budget {

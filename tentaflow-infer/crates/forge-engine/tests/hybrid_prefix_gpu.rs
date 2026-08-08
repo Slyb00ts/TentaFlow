@@ -178,5 +178,35 @@ fn pozyczony_prefiks_daje_ten_sam_ciag_co_zimny() -> TestResult<()> {
         sibling_read >= 512,
         "rozjazd w połowie powinien pożyczyć checkpoint pośredni, wziął {sibling_read}"
     );
+
+    // Kolejna tura rozmowy: prompt to poprzedni prompt PLUS to, co model sam
+    // wygenerował. Strony tej odpowiedzi zapisał decode, nie prefill, więc bez
+    // toczącego się checkpointu byłyby dla drzewa niewidoczne i każda tura
+    // liczyłaby od nowa własną poprzednią wypowiedź.
+    let mut turn = model.new_seq();
+    let borrowed = model.acquire_prefix(&mut turn, &tokens);
+    let mut logits = Vec::new();
+    for chunk in tokens[borrowed..].chunks(MAX_PREFILL_CHUNK) {
+        logits = model.prefill_chunk(&mut turn, chunk)?;
+    }
+    let mut generated = vec![argmax(&logits)];
+    while generated.len() < 96 {
+        let next = model.step(&mut turn, *generated.last().expect("niepusty ciąg"))?;
+        generated.push(argmax(&next));
+    }
+    model.release_seq(&mut turn);
+
+    let mut next_prompt = tokens.clone();
+    next_prompt.extend_from_slice(&generated);
+    let (_, next_read, next_s) = greedy(&mut model, &next_prompt)?;
+    println!(
+        "następna tura: {next_read}/{} tok z cache'u (sam prompt to {}), prefill {next_s:.3} s",
+        next_prompt.len(),
+        tokens.len()
+    );
+    assert!(
+        next_read > tokens.len(),
+        "pożyczka ma sięgnąć w wygenerowaną odpowiedź, wzięła {next_read}"
+    );
     Ok(())
 }

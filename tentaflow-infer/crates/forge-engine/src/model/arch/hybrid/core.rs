@@ -58,7 +58,11 @@ impl Model {
         // Borrowed prefix: the pages are already attached, and this is where the
         // recurrent half of that prefix lands. It runs after `activate`, whose
         // zeroing of a reused slot would otherwise wipe the checkpoint.
-        self.restore_hybrid_checkpoint(seq)
+        self.restore_hybrid_checkpoint(seq)?;
+        // Ten sam punkt obsługuje drugi kierunek: stan stoi teraz dokładnie na
+        // `seq.len`, więc jeśli to granica strony, jest co utrwalić — niezależnie
+        // od tego, która ścieżka (decode, batch, verify) po niego przyszła.
+        self.roll_hybrid_checkpoint(seq)
     }
 
     pub(crate) fn active_ssm(&self) -> &[Option<SsmState>] {

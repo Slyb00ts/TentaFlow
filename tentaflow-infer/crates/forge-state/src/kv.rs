@@ -239,6 +239,9 @@ pub struct SeqKv {
     /// Checkpoint pożyczony przy przyjęciu, wgrywany w stan tej sekwencji przy
     /// jej pierwszej aktywacji.
     pub state_restore: Option<crate::prefix::StateSlot>,
+    /// Toczący się checkpoint dekodowania: JEDEN slot, nadpisywany na każdej
+    /// kolejnej granicy strony, żeby wygenerowana odpowiedź też dała się oddać.
+    pub state_rolling: Option<(usize, crate::prefix::StateSlot)>,
 }
 
 impl SeqKv {
@@ -403,6 +406,7 @@ impl KvCache {
             state_target: 0,
             state_checkpoints: Vec::new(),
             state_restore: None,
+            state_rolling: None,
         }
     }
 

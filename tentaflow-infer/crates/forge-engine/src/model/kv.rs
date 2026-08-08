@@ -178,17 +178,18 @@ impl Model {
     fn finalize_prefix(&mut self, seq: &mut SeqKv) {
         let ps = self.kv.cfg.page_size;
         let hybrid = self.is_hybrid();
-        let states = std::mem::take(&mut seq.state_checkpoints);
+        let mut states = std::mem::take(&mut seq.state_checkpoints);
+        states.extend(seq.state_rolling.take());
         // A hybrid prefix is worth exactly as much as its checkpoint: pages past
         // it describe tokens no borrow can resume from, and pages donated
         // without one could never be borrowed at all. Both are simply not
         // offered, so the tree never holds KV that nothing can reach.
-        let reached = seq.prefilled_len >= seq.state_target;
+        // Prefiks hybrydy sięga dokładnie tak daleko, jak jej ostatni checkpoint:
+        // strony za nim opisują tokeny, których wkładu rekurencyjnego nikt nie
+        // zapisał, a strony bez checkpointu byłyby dla drzewa martwe.
+        let last_state = states.iter().map(|&(pos, _)| pos).max().unwrap_or(0);
         let n_full = match hybrid {
-            true if reached && (!states.is_empty() || seq.prefix_node.is_some()) => {
-                seq.state_target / ps
-            }
-            true => 0,
+            true => (last_state / ps).max(seq.shared_pages),
             // Gęsta ścieżka oddaje też strony zapisane przez dekodowanie:
             // odpowiedź poprzedniej tury jest prefiksem następnego promptu, a
             // bez niej każda tura czatu przelicza od nowa wszystko, co model

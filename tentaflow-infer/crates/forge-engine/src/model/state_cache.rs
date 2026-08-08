@@ -16,7 +16,7 @@ use super::*;
 /// sekwencji i sloty checkpointów pochodzą z jednej puli, więc rosnąca
 /// współbieżność sama odbiera je cache'owi, a `--prefix-cache off` wyłącza go
 /// w całości.
-pub(crate) const HYBRID_STATE_CACHE_SLOTS: usize = 8;
+pub(crate) const HYBRID_STATE_CACHE_SLOTS: usize = 16;
 
 /// Co ile tokenów prefill zatrzymuje się, żeby utrwalić stan.
 ///
@@ -789,9 +789,55 @@ impl Model {
         if seq.state_checkpoints.iter().any(|&(pos, _)| pos == at) {
             return Ok(());
         }
-        let Some(lease) = seq.hybrid_state else {
+        let Some(slot) = self.claim_state_slot()? else {
             return Ok(());
         };
+        if let Err(error) = self.write_state_slot(seq, slot) {
+            self.release_state_slot(slot);
+            return Err(error);
+        }
+        seq.state_checkpoints.push((at, slot));
+        Ok(())
+    }
+
+    /// Przesuwa TOCZĄCY SIĘ checkpoint dekodowania na bieżącą granicę strony.
+    ///
+    /// Wygenerowana odpowiedź jest prefiksem następnej tury, ale strony hybrydy
+    /// są osiągalne wyłącznie z checkpointu — bez tego cała odpowiedź byłaby
+    /// dla drzewa niewidoczna. Slot jest JEDEN na sekwencję i nadpisywany co
+    /// stronę, więc długi dekod nie zjada puli; kopia D2D co 32 tokeny to
+    /// ułamek kroku dekodowania.
+    pub(crate) fn roll_hybrid_checkpoint(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let at = seq.len;
+        if self.prefix_cache.is_none()
+            || at <= seq.state_target
+            || !at.is_multiple_of(self.kv.cfg.page_size)
+        {
+            return Ok(());
+        }
+        if seq.state_rolling.is_some_and(|(pos, _)| pos == at) {
+            return Ok(());
+        }
+        // Slot wychodzi ze śledzenia na czas zapisu, żeby nieudany zrzut wracał
+        // do puli dokładnie raz — i przy pierwszym checkpoincie, i przy każdym
+        // kolejnym nadpisaniu tego samego slotu.
+        let slot = match seq.state_rolling.take() {
+            Some((_, slot)) => slot,
+            None => match self.claim_state_slot()? {
+                Some(slot) => slot,
+                None => return Ok(()),
+            },
+        };
+        if let Err(error) = self.write_state_slot(seq, slot) {
+            self.release_state_slot(slot);
+            return Err(error);
+        }
+        seq.state_rolling = Some((at, slot));
+        Ok(())
+    }
+
+    /// Bierze slot pod checkpoint, w razie potrzeby odbierając go drzewu.
+    fn claim_state_slot(&mut self) -> Result<Option<usize>> {
         let mut reclaimed = None;
         let pool = self
             .hybrid_states
@@ -815,20 +861,19 @@ impl Model {
             pool.put_cache_slot(free);
             slot = pool.take_cache_slot()?;
         }
-        let Some(slot) = slot else {
+        Ok(slot)
+    }
+
+    /// Zrzuca stan sekwencji do wskazanego slotu.
+    fn write_state_slot(&mut self, seq: &SeqKv, slot: usize) -> Result<()> {
+        let Some(lease) = seq.hybrid_state else {
             return Ok(());
         };
         let stream = self.stream.clone();
-        let pool = self
-            .hybrid_states
+        self.hybrid_states
             .as_mut()
-            .expect("model hybrydowy ma pulę stanów");
-        if let Err(error) = pool.snapshot(lease, slot, &stream) {
-            pool.put_cache_slot(slot);
-            return Err(error);
-        }
-        seq.state_checkpoints.push((at, slot));
-        Ok(())
+            .expect("model hybrydowy ma pulę stanów")
+            .snapshot(lease, slot, &stream)
     }
 
     /// Wgrywa checkpoint pożyczony przy przyjęciu w stan tej sekwencji.
@@ -847,16 +892,17 @@ impl Model {
 
     /// Oddaje puli sloty, które drzewo właśnie zwolniło.
     pub(crate) fn return_state_slots(&mut self, slots: Vec<usize>) {
-        if slots.is_empty() {
-            return;
-        }
-        let pool = self
-            .hybrid_states
-            .as_mut()
-            .expect("checkpointy istnieją tylko dla modelu hybrydowego");
         for slot in slots {
-            pool.put_cache_slot(slot);
+            self.release_state_slot(slot);
         }
+    }
+
+    /// Oddaje puli jeden slot checkpointu.
+    fn release_state_slot(&mut self, slot: usize) {
+        self.hybrid_states
+            .as_mut()
+            .expect("checkpointy istnieją tylko dla modelu hybrydowego")
+            .put_cache_slot(slot);
     }
 }
 
