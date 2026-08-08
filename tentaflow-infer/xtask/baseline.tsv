@@ -119,11 +119,11 @@ size	crates/forge-cli/src/main.rs	2847
 size	crates/forge-engine/src/model/arch/dense.rs	2702
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2024
 size	crates/forge-engine/src/model/mod.rs	3667
-size	crates/forge-engine/src/model/mtp.rs	3149
+size	crates/forge-engine/src/model/mtp.rs	3132
 size	crates/forge-engine/src/server.rs	3259
 size	crates/forge-engine/src/tensor_parallel.rs	1661
 size	crates/forge-engine/src/weights.rs	5031
-size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3611
+size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3514
 size	crates/forge-formats/src/arch.rs	2743
 size	crates/forge-formats/src/iq_tables.rs	3969
 size	crates/forge-kernels/src/launchers/deltanet.rs	1963

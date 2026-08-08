@@ -866,7 +866,7 @@ impl Model {
         self.weights.fp8_ffn = Some(layers);
         self.weights.fp8_modular = crate::weights::fp8_ffn_modular_enabled();
         self.decode_graph = None;
-        self.decode_hybrid_graph = None;
+        self.decode_hybrid_graph.clear();
         self.decode_moe_graph = None;
         self.decode_rot_graph = None;
         self.batch_graphs.clear();

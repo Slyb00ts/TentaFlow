@@ -139,31 +139,23 @@ impl Model {
         }
     }
 
+    /// Czy batchowany target policzy TE SAME tokeny co seryjny.
+    ///
+    /// To nie jest pytanie o to, czy kernel batchowy istnieje — istnieje dla
+    /// każdego formatu. Dekodowanie idzie rodziną GEMV, batch kaflem GEMM, a to
+    /// jest inne zaokrąglenie i inny wygenerowany tekst (patrz `ffn_dense_block`).
+    /// Parity daje więc tylko format z DOKŁADNYM kernelem małego batcha: NVFP4
+    /// liczy B1 tą samą matematyką co B2-B4, a Q8_0 ma `gemm_q8_0_f16_exact`.
+    /// K-kwanty nie mają żadnego z nich — ich batch kwantyzuje aktywacje do q8_1
+    /// i rozjeżdża się z seryjnym. Zmierzone na ThinkingCap-Qwen3.6-27B Q4_K_M
+    /// (GB10): `mtp.hidden` max_abs 0,18 wobec tolerancji 0,125, a wygenerowane
+    /// ID rozchodzą się na piątej pozycji.
     pub(crate) fn hybrid_batch_weights_capable(&self) -> bool {
-        fn full_rows(weight: &DevWeight) -> bool {
+        fn exact_batch(weight: &DevWeight) -> bool {
             matches!(
                 weight,
                 DevWeight::F16 { .. }
                     | DevWeight::Q8_0 { .. }
-                    | DevWeight::Q4K { .. }
-                    | DevWeight::Q6K { .. }
-                    | DevWeight::Q5K { .. }
-                    | DevWeight::Q3K { .. }
-                    | DevWeight::Q2K { .. }
-                    | DevWeight::Q4_0 { .. }
-                    | DevWeight::Q4_1 { .. }
-                    | DevWeight::Q5_0 { .. }
-                    | DevWeight::Q5_1 { .. }
-                    | DevWeight::Iq4Nl { .. }
-                    | DevWeight::Iq4Xs { .. }
-                    | DevWeight::Mxfp4 { .. }
-                    | DevWeight::Iq2Xs { .. }
-                    | DevWeight::Iq2S { .. }
-                    | DevWeight::Iq3S { .. }
-                    | DevWeight::Iq2Xxs { .. }
-                    | DevWeight::Iq3Xxs { .. }
-                    | DevWeight::Iq1S { .. }
-                    | DevWeight::Iq1M { .. }
                     | DevWeight::NvFp4 {
                         storage: NvFp4CtStorage::RowMajorE4M3 { .. },
                         ..
@@ -172,25 +164,24 @@ impl Model {
             )
         }
 
-        fn window_rows(weight: &DevWeight) -> bool {
-            full_rows(weight) && !matches!(weight, DevWeight::NvFp4Gguf { .. })
+        // Scalone `gate_up` czyta batch oknem, a NVFP4 w układzie GGUF nie ma
+        // wariantu okienkowego.
+        fn exact_batch_window(weight: &DevWeight) -> bool {
+            exact_batch(weight) && !matches!(weight, DevWeight::NvFp4Gguf { .. })
         }
 
         self.is_hybrid()
             && self.tier.is_none()
-            && matches!(
-                self.weights.lm_head,
-                DevWeight::F16 { .. } | DevWeight::Q8_0 { .. } | DevWeight::NvFp4Gguf { .. }
-            )
+            && batched_head_supported(&self.weights.lm_head, HYBRID_BATCH_LANES).is_ok()
             && self.weights.layers.iter().all(|layer| {
                 let LayerFfn::Dense(ffn) = &layer.ffn else {
                     return false;
                 };
                 let gate_up = match &ffn.gate_up {
-                    GateUpWeights::Fused(weight) => window_rows(weight),
-                    GateUpWeights::Split { gate, up } => full_rows(gate) && full_rows(up),
+                    GateUpWeights::Fused(weight) => exact_batch_window(weight),
+                    GateUpWeights::Split { gate, up } => exact_batch(gate) && exact_batch(up),
                 };
-                gate_up && full_rows(&ffn.down)
+                gate_up && exact_batch(&ffn.down)
             })
     }
 

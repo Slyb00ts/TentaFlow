@@ -764,9 +764,6 @@ fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usiz
     (q_dim * 2).max(conv_dim).max(hidden_size * 2)
 }
 
-fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: bool) -> bool {
-    mode == Some("device") && shares_target_embedding
-}
 
 fn validate_mtp_routed_inputs(
     vocab: usize,
@@ -1177,7 +1174,9 @@ pub struct Model {
     /// Przechwycony krok dekodowania modelu hybrydowego (qwen35/DeltaNet).
     /// Wstawienie embeddingu zostaje poza grafem, bo jako jedyne zależy od
     /// `token_id`; reszta czyta pozycję i długość z buforów urządzenia.
-    decode_hybrid_graph: Option<ExecGraph>,
+    /// Graf kroku hybrydy per SLOT stanu DeltaNet: przechwycenie zapieka
+    /// bufory slotu aktywnego w tamtej chwili, a slot należy do sekwencji.
+    decode_hybrid_graph: HashMap<usize, ExecGraph>,
     /// Captured non-hybrid MoE decode step (fully device-side grouped expert
     /// dispatch — no host readback), replayed per token like `decode_graph`.
     decode_moe_graph: Option<ExecGraph>,
@@ -1896,6 +1895,7 @@ use moe_bufs::MoeBufs;
 mod mtp;
 mod quant_dispatch;
 mod caps;
+pub(crate) use caps::{batched_head_supported, native_mtp_b2_device_embedding, HYBRID_BATCH_LANES};
 mod sample;
 mod scratch;
 mod state_cache;
@@ -2279,7 +2279,7 @@ impl Model {
             tp: None,
             tp_partial,
             decode_graph: None,
-            decode_hybrid_graph: None,
+            decode_hybrid_graph: HashMap::new(),
             decode_moe_graph: None,
             decode_rot_graph: None,
             batch_bufs: None,

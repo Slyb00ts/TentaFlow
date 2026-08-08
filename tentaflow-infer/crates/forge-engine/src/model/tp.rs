@@ -235,7 +235,7 @@ impl Model {
         // Krok dekodowania przestaje być jednokartowy, więc przechwycone grafy
         // przestają go opisywać — dotyczy to obu ścieżek, gęstej i hybrydowej.
         self.decode_graph = None;
-        self.decode_hybrid_graph = None;
+        self.decode_hybrid_graph.clear();
         self.hybrid_verify_graphs.clear();
         Ok(())
     }

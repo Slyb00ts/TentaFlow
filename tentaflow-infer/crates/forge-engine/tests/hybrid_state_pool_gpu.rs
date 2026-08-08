@@ -24,7 +24,6 @@ use forge_formats::Gguf;
 use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
 use forge_tokenize::Tokenizer;
-use half::f16;
 
 mod common;
 
@@ -162,6 +161,9 @@ fn run_native_mtp_b2_full_id_parity(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
     };
+    if !common::exact_batch(&model, "pełne ID MTP B2") {
+        return Ok(());
+    }
     model.preflight_hybrid_state_slots(2)?;
     let vocab = model.weights.descriptor.params.vocab_size;
     let prompts = [prompt(vocab, 613, 8), prompt(vocab, 829, 8)];
@@ -233,6 +235,9 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
     };
+    if !common::exact_batch(&model, "macierz retained MTP+n-gram B2") {
+        return Ok(());
+    }
     model.preflight_hybrid_state_slots(2)?;
     let vocab = model.weights.descriptor.params.vocab_size;
     let prompts = [prompt(vocab, 941, 8), prompt(vocab, 1171, 8)];
@@ -296,12 +301,12 @@ fn run_mtp_ngram_b2_retained_matrix(path: &Path) -> TestResult<()> {
                     expected_next_drafts[1],
                     "następny draft lane1 K={budget}, retained={retained:?}"
                 );
-                assert_mtp_snapshot_close(
+                common::assert_mtp_snapshot_close(
                     &model.debug_mtp_state_snapshot(&first)?,
                     &expected_states[0],
                     &format!("lane0 K={budget}, retained={retained:?}"),
                 );
-                assert_mtp_snapshot_close(
+                common::assert_mtp_snapshot_close(
                     &model.debug_mtp_state_snapshot(&second)?,
                     &expected_states[1],
                     &format!("lane1 K={budget}, retained={retained:?}"),
@@ -318,6 +323,9 @@ fn run_mtp_routed_b2_source_masks(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
     };
+    if !common::exact_batch(&model, "maski źródeł routed B2") {
+        return Ok(());
+    }
     model.preflight_hybrid_state_slots(2)?;
     let vocab = model.weights.descriptor.params.vocab_size;
     let prompts = [prompt(vocab, 1301, 8), prompt(vocab, 1601, 8)];
@@ -394,14 +402,14 @@ fn run_mtp_routed_b2_source_masks(path: &Path) -> TestResult<()> {
                         actual, expected,
                         "source_mask={source_mask:02b}, K={budget}, retained={retained:?}"
                     );
-                    assert_mtp_snapshot_eq(
+                    common::assert_mtp_snapshot_eq(
                         &model.debug_mtp_state_snapshot(&first)?,
                         &expected_states[0],
                         &format!(
                             "lane0 source_mask={source_mask:02b}, K={budget}, retained={retained:?}"
                         ),
                     );
-                    assert_mtp_snapshot_eq(
+                    common::assert_mtp_snapshot_eq(
                         &model.debug_mtp_state_snapshot(&second)?,
                         &expected_states[1],
                         &format!(
@@ -421,6 +429,9 @@ fn run_mtp_ngram_b2_retained_one_lane_orders(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
     };
+    if !common::exact_batch(&model, "zamiana lane MTP+n-gram B2") {
+        return Ok(());
+    }
     model.preflight_hybrid_state_slots(2)?;
     let vocab = model.weights.descriptor.params.vocab_size;
     let source_prompts = [prompt(vocab, 941, 8), prompt(vocab, 1171, 8)];
@@ -462,12 +473,12 @@ fn run_mtp_ngram_b2_retained_one_lane_orders(path: &Path) -> TestResult<()> {
             [&drafts[0], &drafts[1]],
         )?;
         assert_eq!(actual, expected_results, "kolejność lane={order:?}");
-        assert_mtp_snapshot_eq(
+        common::assert_mtp_snapshot_eq(
             &model.debug_mtp_state_snapshot(&first)?,
             &expected_states[0],
             &format!("lane0 retained=[1,1], kolejność={order:?}"),
         );
-        assert_mtp_snapshot_eq(
+        common::assert_mtp_snapshot_eq(
             &model.debug_mtp_state_snapshot(&second)?,
             &expected_states[1],
             &format!("lane1 retained=[1,1], kolejność={order:?}"),
@@ -476,135 +487,6 @@ fn run_mtp_ngram_b2_retained_one_lane_orders(path: &Path) -> TestResult<()> {
         model.release_seq(&mut second);
     }
     Ok(())
-}
-
-fn assert_mtp_snapshot_eq(
-    actual: &[(String, usize, Vec<u8>)],
-    expected: &[(String, usize, Vec<u8>)],
-    context: &str,
-) {
-    assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
-    for (
-        (actual_name, actual_element_bytes, actual_bytes),
-        (expected_name, expected_element_bytes, expected_bytes),
-    ) in actual.iter().zip(expected)
-    {
-        assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
-        assert_eq!(
-            actual_element_bytes, expected_element_bytes,
-            "rozmiar elementu {actual_name} {context}"
-        );
-        assert_eq!(
-            actual_bytes.len(),
-            expected_bytes.len(),
-            "długość {actual_name} {context}"
-        );
-        if let Some(index) = actual_bytes
-            .iter()
-            .zip(expected_bytes)
-            .position(|(actual_byte, expected_byte)| actual_byte != expected_byte)
-        {
-            panic!(
-                "pierwsza różnica {actual_name} {context}: bajt {index}, actual={}, expected={}",
-                actual_bytes[index], expected_bytes[index]
-            );
-        }
-    }
-}
-
-fn assert_mtp_snapshot_close(
-    actual: &[(String, usize, Vec<u8>)],
-    expected: &[(String, usize, Vec<u8>)],
-    context: &str,
-) {
-    assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
-    for (
-        (actual_name, actual_element_bytes, actual_bytes),
-        (expected_name, expected_element_bytes, expected_bytes),
-    ) in actual.iter().zip(expected)
-    {
-        assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
-        assert_eq!(
-            actual_element_bytes, expected_element_bytes,
-            "rozmiar elementu {actual_name} {context}"
-        );
-        assert_eq!(
-            actual_bytes.len(),
-            expected_bytes.len(),
-            "długość {actual_name} {context}"
-        );
-        if actual_name == "mtp.page_table" {
-            assert_eq!(
-                normalized_page_table(actual_bytes),
-                normalized_page_table(expected_bytes),
-                "logiczne mapowanie {actual_name} {context}"
-            );
-        } else if matches!(actual_name.as_str(), "mtp.hidden" | "mtp.k" | "mtp.v") {
-            let (max_abs, rmse, _) =
-                numeric_diff(actual_bytes, expected_bytes, *actual_element_bytes);
-            assert!(
-                max_abs <= 0.125 && rmse <= 0.01,
-                "różnica numeryczna {actual_name} {context}: max_abs={max_abs}, rmse={rmse}"
-            );
-        } else {
-            assert_eq!(
-                actual_bytes, expected_bytes,
-                "zawartość {actual_name} {context}"
-            );
-        }
-    }
-}
-
-fn normalized_page_table(bytes: &[u8]) -> Vec<usize> {
-    let mut physical = Vec::new();
-    bytes
-        .chunks_exact(4)
-        .map(|value| i32::from_le_bytes(value.try_into().unwrap()))
-        .map(|page| {
-            assert!(
-                page >= 0,
-                "fizyczny identyfikator strony nie może być ujemny"
-            );
-            if let Some(index) = physical.iter().position(|&seen| seen == page) {
-                index
-            } else {
-                physical.push(page);
-                physical.len() - 1
-            }
-        })
-        .collect()
-}
-
-fn numeric_diff(actual: &[u8], expected: &[u8], element_bytes: usize) -> (f32, f32, f32) {
-    assert_eq!(actual.len(), expected.len());
-    let mut max_abs = 0.0f32;
-    let mut max_rel = 0.0f32;
-    let mut squared_error = 0.0f64;
-    let mut elements = 0usize;
-    for (actual, expected) in actual
-        .chunks_exact(element_bytes)
-        .zip(expected.chunks_exact(element_bytes))
-    {
-        let actual = match element_bytes {
-            2 => f16::from_le_bytes(actual.try_into().unwrap()).to_f32(),
-            4 => f32::from_le_bytes(actual.try_into().unwrap()),
-            _ => unreachable!(),
-        };
-        let expected = match element_bytes {
-            2 => f16::from_le_bytes(expected.try_into().unwrap()).to_f32(),
-            4 => f32::from_le_bytes(expected.try_into().unwrap()),
-            _ => unreachable!(),
-        };
-        assert!(actual.is_finite() && expected.is_finite());
-        let absolute = (actual - expected).abs();
-        let relative = absolute / expected.abs().max(1e-3);
-        max_abs = max_abs.max(absolute);
-        max_rel = max_rel.max(relative);
-        squared_error += f64::from(absolute) * f64::from(absolute);
-        elements += 1;
-    }
-    let rmse = (squared_error / elements.max(1) as f64).sqrt() as f32;
-    (max_abs, rmse, max_rel)
 }
 
 fn merge_diff(total: &mut (f32, f32, f32), current: (f32, f32, f32)) {
@@ -617,6 +499,9 @@ fn run_mtp_grouped_proposer_parity(path: &Path) -> TestResult<()> {
     let Some(mut model) = load_model(path, true) else {
         return Ok(());
     };
+    if !common::exact_batch(&model, "parity grupowego proposera B2") {
+        return Ok(());
+    }
     model.preflight_hybrid_state_slots(2)?;
     let vocab = model.weights.descriptor.params.vocab_size;
     let (mut first, _, first_next) = prepare(&mut model, &prompt(vocab, 401, 8))?;
@@ -1069,6 +954,9 @@ fn run_server_hybrid_width(path: &Path, width: usize) -> TestResult<()> {
     let Some(oracle_model) = load_model(path, false) else {
         return Ok(());
     };
+    if !common::exact_batch(&oracle_model, "parowanie targetu hybrydowego") {
+        return Ok(());
+    }
     let vocab = oracle_model.weights.descriptor.params.vocab_size;
     let prompts = (0..width)
         .map(|lane| prompt(vocab, 811 + lane * 137, 8))
@@ -1769,11 +1657,6 @@ fn measure_serial_round_robin(path: &Path, width: usize) -> TestResult<f64> {
     Ok(aggregate)
 }
 
-fn median(mut samples: Vec<f64>) -> f64 {
-    samples.sort_by(f64::total_cmp);
-    samples[samples.len() / 2]
-}
-
 #[test]
 fn cuda_przeplatanie_release_reuse_cancel_i_error_zachowuja_stan() -> TestResult<()> {
     let Some(path) = std::env::var_os("FORGE_TEST_HYBRID_GGUF").map(PathBuf::from) else {
@@ -1973,6 +1856,9 @@ fn native_mtp_b2_przycina_k3_do_k2_przy_jednym_pelnym_kafelku_kv() -> TestResult
     let Some(mut model) = load_model_sized(&path, true, 32, 2) else {
         return Ok(());
     };
+    if !common::exact_batch(&model, "przycięcie K3 do K2 przy pełnym kaflu KV") {
+        return Ok(());
+    }
     model.preflight_hybrid_state_slots(2)?;
     let vocab = model.weights.descriptor.params.vocab_size;
     let (mut first, _, first_fed) = prepare(&mut model, &prompt(vocab, 701, 29))?;
@@ -2076,14 +1962,14 @@ fn hybrid_prefill_b2_t32_jest_numerycznie_zgodny_z_dwoma_serialnymi_lane() -> Te
             if batch.0.starts_with("seq.") {
                 assert_eq!(batch.2, serial.2, "metadane {}", batch.0);
             } else if batch.0.ends_with(".conv") {
-                merge_diff(&mut conv, numeric_diff(&batch.2, &serial.2, batch.1));
+                merge_diff(&mut conv, common::numeric_diff(&batch.2, &serial.2, batch.1));
             } else if batch.0.ends_with(".state") {
-                merge_diff(&mut state, numeric_diff(&batch.2, &serial.2, batch.1));
+                merge_diff(&mut state, common::numeric_diff(&batch.2, &serial.2, batch.1));
             } else {
-                merge_diff(&mut kv, numeric_diff(&batch.2, &serial.2, batch.1));
+                merge_diff(&mut kv, common::numeric_diff(&batch.2, &serial.2, batch.1));
             }
         }
-        let logits = numeric_diff(
+        let logits = common::numeric_diff(
             bytemuck::cast_slice(&batch_logits[lane]),
             bytemuck::cast_slice(&serial_logits[lane]),
             4,
@@ -2206,7 +2092,7 @@ fn layer_major_rollback_przywraca_target_i_mtp_bitowo() -> TestResult<()> {
             target_before,
             "rollback targetu po błędzie {expected}"
         );
-        assert_mtp_snapshot_eq(
+        common::assert_mtp_snapshot_eq(
             &model.debug_mtp_state_snapshot(&seq)?,
             &mtp_before,
             &format!("rollback MTP po błędzie {expected}"),
@@ -2276,6 +2162,9 @@ fn hybrid_prefill_t128_zachowuje_numeryczna_zgodnosc_z_serialnym_prefill() -> Te
         let Some(mut model) = load_model_sized(&path, true, 128, 8) else {
             return Ok(());
         };
+        if !common::exact_batch(&model, "parity prefill T128") {
+            return Ok(());
+        }
         #[cfg(feature = "test-hooks")]
         model.debug_hybrid_prefill_triplet_contract(128)?;
         let tokens = prompt(model.weights.descriptor.params.vocab_size, 1709, 128);
@@ -2306,14 +2195,14 @@ fn hybrid_prefill_t128_zachowuje_numeryczna_zgodnosc_z_serialnym_prefill() -> Te
             if batched.0.starts_with("seq.") {
                 assert_eq!(batched.2, serial.2, "metadane {}", batched.0);
             } else if batched.0.ends_with(".conv") {
-                merge_diff(&mut conv, numeric_diff(&batched.2, &serial.2, batched.1));
+                merge_diff(&mut conv, common::numeric_diff(&batched.2, &serial.2, batched.1));
             } else if batched.0.ends_with(".state") {
-                merge_diff(&mut state, numeric_diff(&batched.2, &serial.2, batched.1));
+                merge_diff(&mut state, common::numeric_diff(&batched.2, &serial.2, batched.1));
             } else {
-                merge_diff(&mut kv, numeric_diff(&batched.2, &serial.2, batched.1));
+                merge_diff(&mut kv, common::numeric_diff(&batched.2, &serial.2, batched.1));
             }
         }
-        let logits = numeric_diff(
+        let logits = common::numeric_diff(
             bytemuck::cast_slice(&batched_logits),
             bytemuck::cast_slice(&serial_logits),
             4,
@@ -2521,7 +2410,7 @@ fn hybrid_prefill_mtp_catchup_b2_przywraca_pare_po_bledzie_lane() -> TestResult<
             .expect_err("test wymusza błąd catch-up MTP");
         assert!(error.to_string().contains(&format!("lane {failed_lane}")));
         for lane in 0..2 {
-            assert_mtp_snapshot_eq(
+            common::assert_mtp_snapshot_eq(
                 &model.debug_mtp_state_snapshot(lanes[lane])?,
                 &before[lane],
                 &format!("rollback catch-up lane {lane} po błędzie {failed_lane}"),
@@ -2953,17 +2842,31 @@ fn server_mtp_k3_eos_w_zaakceptowanym_prefiksie_zachowuje_reuse() -> TestResult<
         return Ok(());
     };
     let vocab = oracle_model.weights.descriptor.params.vocab_size;
-    let prompt = prompt(vocab, 419, 8);
-    let (mut oracle_seq, _, fed) = prepare(&mut oracle_model, &prompt)?;
-    let (draft, accepted, _) = oracle_model.native_mtp_step(&mut oracle_seq, fed, 3)?;
-    assert!(
-        accepted >= 2,
-        "test EOS wymaga co najmniej dwóch zaakceptowanych tokenów draftu K3"
-    );
-    let eos_id = draft[1];
-    oracle_model.release_seq(&mut oracle_seq);
+    // Scenariusz wymaga draftu K3, z którego model przyjmie co najmniej dwa
+    // tokeny — a to zależy od CHECKPOINTU, nie od poprawności silnika: prompt
+    // jest losowy, więc na jednych wagach trafia od razu, a na innych nie.
+    // Szukamy więc promptu spełniającego założenie zamiast zakładać, że
+    // pierwszy trafi.
+    let mut found = None;
+    for seed in [419usize, 631, 887, 1213, 1607, 2003] {
+        let candidate = prompt(vocab, seed, 8);
+        let (mut seq, _, fed) = prepare(&mut oracle_model, &candidate)?;
+        let (draft, accepted, _) = oracle_model.native_mtp_step(&mut seq, fed, 3)?;
+        oracle_model.release_seq(&mut seq);
+        if accepted >= 2 {
+            found = Some((candidate, fed, draft[0], draft[1], accepted));
+            break;
+        }
+    }
+    let Some((prompt, fed, first_draft, eos_id, accepted)) = found else {
+        eprintln!(
+            "pominięto E2E EOS MTP: żaden prompt nie dał draftu K3 z dwoma \
+             zaakceptowanymi tokenami na tym checkpoincie"
+        );
+        return Ok(());
+    };
     let oracle = generate(&mut oracle_model, &prompt, STEPS)?;
-    assert_eq!([fed, draft[0], eos_id], oracle[..3]);
+    assert_eq!([fed, first_draft, eos_id], oracle[..3]);
     drop(oracle_model);
 
     let Some(model) = load_model(&path, true) else {
@@ -3598,8 +3501,8 @@ fn benchmark_server_hybrid_target_b1_kontra_b2() -> TestResult<()> {
             measurement.itl_ms,
         );
         if max_active >= 3 {
-            let serial = median(serial_samples.clone());
-            let paired = median(paired_samples.clone());
+            let serial = common::median(serial_samples.clone());
+            let paired = common::median(paired_samples.clone());
             println!(
                 "hybrid target B={max_active}: serial samples={serial_samples:?}, paired samples={paired_samples:?}, serial median={serial:.2} tok/s, paired median={paired:.2} tok/s, difference={:.2}%, speedup={:.3}x",
                 (paired / serial - 1.0) * 100.0,

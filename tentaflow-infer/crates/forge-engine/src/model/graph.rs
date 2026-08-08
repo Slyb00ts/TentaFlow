@@ -74,13 +74,17 @@ impl Model {
             if self.tp_ffn.is_some() || self.tp.is_some() || !hybrid_decode_graph_requested() {
                 return self.hybrid_forward_staged(true, AttnSrc::Paged);
             }
-            if self.decode_hybrid_graph.is_none() {
+            let slot = seq
+                .hybrid_state
+                .expect("aktywna sekwencja hybrydowa ma przypisany slot")
+                .slot;
+            if !self.decode_hybrid_graph.contains_key(&slot) {
                 let graph = self.capture_hybrid_step()?;
-                self.decode_hybrid_graph = Some(graph);
+                self.decode_hybrid_graph.insert(slot, graph);
             }
             let graph = self
                 .decode_hybrid_graph
-                .as_ref()
+                .get(&slot)
                 .expect("captured above")
                 .clone();
             return self.device.launch_graph(&graph, &self.stream);

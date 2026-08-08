@@ -2,6 +2,8 @@
 
 use std::path::Path;
 
+use half::f16;
+
 /// Pula wag wielkości SAMEGO checkpointu, a nie całej wolnej pamięci.
 ///
 /// Na karcie z własnym VRAM-em zabranie wszystkiego, co wolne, nic nie kosztuje:
@@ -51,4 +53,161 @@ fn reclaimable() -> usize {
         .and_then(|value| value.split_whitespace().next())
         .and_then(|kb| kb.parse::<usize>().ok())
         .map_or(0, |kb| kb * 1024)
+}
+
+/// Czy batch tego checkpointu liczy to samo co ścieżka seryjna.
+///
+/// Zależy to od FORMATU wag, nie od poprawności kodu: dekodowanie idzie rodziną
+/// GEMV, batch kaflem GEMM, a zgadzają się tylko tam, gdzie batch ma dokładny
+/// kernel małego batcha (F16, Q8_0, NVFP4). K-kwanty kwantyzują aktywacje do
+/// q8_1 i rozjeżdżają się o rząd wielkości ponad tolerancję. GGUF bez takiego
+/// formatu nie jest błędem — jest innym checkpointem, więc test go pomija
+/// zamiast padać, i mówi dlaczego.
+#[allow(dead_code)]
+pub fn exact_batch(model: &forge_engine::model::Model, what: &str) -> bool {
+    if model.hybrid_batch_capable() {
+        return true;
+    }
+    eprintln!(
+        "pominięto {what}: checkpoint nie ma dokładnego kernela małego batcha \
+         (arch={}, mtp_embedding={:?}) — kontrakt B2 wymaga wag F16, Q8_0 albo NVFP4",
+        model.weights.descriptor.arch,
+        model.mtp_embedding_mode(),
+    );
+    false
+}
+
+#[allow(dead_code)]
+pub fn assert_mtp_snapshot_eq(
+    actual: &[(String, usize, Vec<u8>)],
+    expected: &[(String, usize, Vec<u8>)],
+    context: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
+    for (
+        (actual_name, actual_element_bytes, actual_bytes),
+        (expected_name, expected_element_bytes, expected_bytes),
+    ) in actual.iter().zip(expected)
+    {
+        assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
+        assert_eq!(
+            actual_element_bytes, expected_element_bytes,
+            "rozmiar elementu {actual_name} {context}"
+        );
+        assert_eq!(
+            actual_bytes.len(),
+            expected_bytes.len(),
+            "długość {actual_name} {context}"
+        );
+        if let Some(index) = actual_bytes
+            .iter()
+            .zip(expected_bytes)
+            .position(|(actual_byte, expected_byte)| actual_byte != expected_byte)
+        {
+            panic!(
+                "pierwsza różnica {actual_name} {context}: bajt {index}, actual={}, expected={}",
+                actual_bytes[index], expected_bytes[index]
+            );
+        }
+    }
+}
+#[allow(dead_code)]
+pub fn assert_mtp_snapshot_close(
+    actual: &[(String, usize, Vec<u8>)],
+    expected: &[(String, usize, Vec<u8>)],
+    context: &str,
+) {
+    assert_eq!(actual.len(), expected.len(), "liczba buforów {context}");
+    for (
+        (actual_name, actual_element_bytes, actual_bytes),
+        (expected_name, expected_element_bytes, expected_bytes),
+    ) in actual.iter().zip(expected)
+    {
+        assert_eq!(actual_name, expected_name, "nazwa bufora {context}");
+        assert_eq!(
+            actual_element_bytes, expected_element_bytes,
+            "rozmiar elementu {actual_name} {context}"
+        );
+        assert_eq!(
+            actual_bytes.len(),
+            expected_bytes.len(),
+            "długość {actual_name} {context}"
+        );
+        if actual_name == "mtp.page_table" {
+            assert_eq!(
+                normalized_page_table(actual_bytes),
+                normalized_page_table(expected_bytes),
+                "logiczne mapowanie {actual_name} {context}"
+            );
+        } else if matches!(actual_name.as_str(), "mtp.hidden" | "mtp.k" | "mtp.v") {
+            let (max_abs, rmse, _) =
+                numeric_diff(actual_bytes, expected_bytes, *actual_element_bytes);
+            assert!(
+                max_abs <= 0.125 && rmse <= 0.01,
+                "różnica numeryczna {actual_name} {context}: max_abs={max_abs}, rmse={rmse}"
+            );
+        } else {
+            assert_eq!(
+                actual_bytes, expected_bytes,
+                "zawartość {actual_name} {context}"
+            );
+        }
+    }
+}
+#[allow(dead_code)]
+pub fn normalized_page_table(bytes: &[u8]) -> Vec<usize> {
+    let mut physical = Vec::new();
+    bytes
+        .chunks_exact(4)
+        .map(|value| i32::from_le_bytes(value.try_into().unwrap()))
+        .map(|page| {
+            assert!(
+                page >= 0,
+                "fizyczny identyfikator strony nie może być ujemny"
+            );
+            if let Some(index) = physical.iter().position(|&seen| seen == page) {
+                index
+            } else {
+                physical.push(page);
+                physical.len() - 1
+            }
+        })
+        .collect()
+}
+#[allow(dead_code)]
+pub fn numeric_diff(actual: &[u8], expected: &[u8], element_bytes: usize) -> (f32, f32, f32) {
+    assert_eq!(actual.len(), expected.len());
+    let mut max_abs = 0.0f32;
+    let mut max_rel = 0.0f32;
+    let mut squared_error = 0.0f64;
+    let mut elements = 0usize;
+    for (actual, expected) in actual
+        .chunks_exact(element_bytes)
+        .zip(expected.chunks_exact(element_bytes))
+    {
+        let actual = match element_bytes {
+            2 => f16::from_le_bytes(actual.try_into().unwrap()).to_f32(),
+            4 => f32::from_le_bytes(actual.try_into().unwrap()),
+            _ => unreachable!(),
+        };
+        let expected = match element_bytes {
+            2 => f16::from_le_bytes(expected.try_into().unwrap()).to_f32(),
+            4 => f32::from_le_bytes(expected.try_into().unwrap()),
+            _ => unreachable!(),
+        };
+        assert!(actual.is_finite() && expected.is_finite());
+        let absolute = (actual - expected).abs();
+        let relative = absolute / expected.abs().max(1e-3);
+        max_abs = max_abs.max(absolute);
+        max_rel = max_rel.max(relative);
+        squared_error += f64::from(absolute) * f64::from(absolute);
+        elements += 1;
+    }
+    let rmse = (squared_error / elements.max(1) as f64).sqrt() as f32;
+    (max_abs, rmse, max_rel)
+}
+#[allow(dead_code)]
+pub fn median(mut samples: Vec<f64>) -> f64 {
+    samples.sort_by(f64::total_cmp);
+    samples[samples.len() / 2]
 }

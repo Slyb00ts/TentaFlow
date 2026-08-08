@@ -200,3 +200,40 @@ pub(crate) fn admit(
     }
     Ok(())
 }
+
+/// Ile linii naraz łączy batchowany target hybrydowy.
+///
+/// B3 i B4 składają się z par plus seryjny ogon, więc szerokość, na którą
+/// kontrakt musi odpowiadać, jest jedna.
+pub(crate) const HYBRID_BATCH_LANES: usize = 2;
+
+/// Czy `logits_gemm` policzy tę głowę wsadowo dla `n_tokens` naraz.
+///
+/// Q6_K idzie batchowym przemiatem dp4a z wyjściem f32, Q4_K przemiatem per
+/// token. Bez tych dwóch KAŻDY GGUF Q4_K_M odpadał, bo llama.cpp z konwencji
+/// daje im właśnie głowę Q6_K. NVFP4 nie ma przemiatnięcia per token, którym
+/// K-kwanty domykają resztę — jego kernel batchowy ma stałe szerokości, więc
+/// pytanie o format bez szerokości nie ma tu sensownej odpowiedzi.
+pub(crate) fn batched_head_supported(head: &DevWeight, n_tokens: usize) -> Result<()> {
+    let supported = match head {
+        DevWeight::F16 { .. }
+        | DevWeight::Q8_0 { .. }
+        | DevWeight::Q4K { .. }
+        | DevWeight::Q6K { .. } => true,
+        DevWeight::NvFp4Gguf {
+            layout: Nvfp4GgufLayout::RowMajor36,
+            ..
+        } => matches!(n_tokens, 2 | 4 | 8 | 16),
+        _ => false,
+    };
+    match supported {
+        true => Ok(()),
+        false => Err(ForgeError::Unsupported(format!(
+            "batchowa głowa nie liczy tego formatu dla {n_tokens} tokenów naraz"
+        ))),
+    }
+}
+
+pub(crate) fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: bool) -> bool {
+    mode == Some("device") && shares_target_embedding
+}

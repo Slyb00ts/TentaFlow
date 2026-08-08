@@ -1,23 +1,6 @@
 // ===== File: model/mtp.rs — natywne MTP/NextN: propozycja, weryfikacja, catch-up =====
 use super::*;
 
-/// Czy `logits_gemm` policzy tę głowę wsadowo, dla T tokenów naraz.
-///
-/// Q6_K idzie batchowym przemiatem dp4a z wyjściem f32, Q4_K przemiatem per
-/// token. Bez tych dwóch KAŻDY GGUF Q4_K_M odpadał, bo llama.cpp z konwencji
-/// daje im właśnie głowę Q6_K.
-fn batched_head_supported(head: &DevWeight) -> Result<()> {
-    match head {
-        DevWeight::F16 { .. }
-        | DevWeight::Q8_0 { .. }
-        | DevWeight::Q4K { .. }
-        | DevWeight::Q6K { .. } => Ok(()),
-        _ => Err(ForgeError::Unsupported(
-            "batchowa głowa verifiera wymaga F16, Q8_0, Q4_K lub Q6_K".into(),
-        )),
-    }
-}
-
 impl Model {
     fn take_mtp_runtime(
         &mut self,
@@ -1637,7 +1620,7 @@ impl Model {
         }
         // Prefiks NIE jest tu przeszkodą: rollback zwalnia strony wyłącznie od
         // końca, a darowizna obejmuje tylko `prefilled_len`.
-        batched_head_supported(&self.weights.lm_head)
+        batched_head_supported(&self.weights.lm_head, draft_tokens + 1)
     }
 
     pub fn validate_hybrid_speculation_target(&self) -> Result<()> {
@@ -1671,7 +1654,7 @@ impl Model {
                 "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu".into(),
             ));
         }
-        batched_head_supported(&self.weights.lm_head)
+        batched_head_supported(&self.weights.lm_head, HYBRID_BATCH_LANES)
     }
 
     fn ensure_mtp_b2_bufs(&mut self) -> Result<()> {
