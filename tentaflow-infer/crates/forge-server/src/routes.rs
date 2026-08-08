@@ -205,7 +205,12 @@ fn render_chat_prompt(
 }
 
 pub(crate) enum GenInput {
-    Chat(Vec<ChatMessage>, Option<serde_json::Value>),
+    /// Wiadomości, narzędzia i zmienne szablonu — komplet tego, co czyta jinja.
+    Chat(
+        Vec<ChatMessage>,
+        Option<serde_json::Value>,
+        Option<serde_json::Map<String, serde_json::Value>>,
+    ),
     Text(String),
     /// Pre-tokenized prompt (completions `prompt` given as token ids).
     Tokens(Vec<u32>),
@@ -266,13 +271,16 @@ pub(crate) async fn start_generation(
             let mut per_input = Vec::with_capacity(inputs.len());
             for input in &inputs {
                 let prompt_tokens = match input {
-                    GenInput::Chat(messages, tools) => {
-                        let prompt = render_chat_prompt(
-                            &st.chat_template,
-                            &st.template_vars,
-                            messages,
-                            tools.as_ref(),
-                        )?;
+                    GenInput::Chat(messages, tools, kwargs) => {
+                        let mut vars = st.template_vars.clone();
+                        // Żądanie dokłada swoje zmienne i wygrywa z domyślnymi:
+                        // `bos_token`/`eos_token` opisują model, a te opisują tę
+                        // jedną rozmowę.
+                        if let Some(kwargs) = kwargs {
+                            vars.extend(kwargs.clone());
+                        }
+                        let prompt =
+                            render_chat_prompt(&st.chat_template, &vars, messages, tools.as_ref())?;
                         st.tokenizer
                             .encode(&prompt, true)
                             .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?
@@ -730,7 +738,7 @@ pub async fn chat_completions(
     }
     let gen = match start_generation(
         &state,
-        vec![GenInput::Chat(req.messages, tools)],
+        vec![GenInput::Chat(req.messages, tools, req.chat_template_kwargs)],
         spec,
         grammar,
     )

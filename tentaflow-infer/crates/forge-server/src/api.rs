@@ -108,6 +108,12 @@ pub struct ChatCompletionRequest {
     /// GBNF/EBNF grammar passthrough (non-standard; constrains the output).
     #[serde(default)]
     pub grammar: Option<String>,
+    /// Zmienne podawane szablonowi jinja modelu obok `messages`/`tools` —
+    /// tak samo jak w vLLM i SGLang. Rodzina Qwen3 czyta stąd
+    /// `enable_thinking`, Granite `controls`; bez tego jedynym sposobem na
+    /// wyłączenie rozumowania jest doklejanie `/no_think` do treści.
+    #[serde(default)]
+    pub chat_template_kwargs: Option<serde_json::Map<String, serde_json::Value>>,
 }
 
 /// A tool the model must call (from `tool_choice` "required" / named).

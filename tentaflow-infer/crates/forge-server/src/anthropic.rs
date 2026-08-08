@@ -204,8 +204,8 @@ pub async fn messages(
         Err(e) => return e.into_response(),
     };
 
-    let gen = match start_generation(&state, vec![GenInput::Chat(messages, None)], spec, None).await
-    {
+    let input = vec![GenInput::Chat(messages, None, None)];
+    let gen = match start_generation(&state, input, spec, None).await {
         Ok(g) => g,
         Err(e) => return e.into_response(),
     };
