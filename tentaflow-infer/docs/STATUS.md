@@ -1996,7 +1996,8 @@ Ostatnia aktualizacja: 2026-07-25.
   strony pożyczonego prefiksu są nadal rozliczane konserwatywnie w pełnym budżecie
   requestu, więc współdzielenie może nie przyspieszyć admission. Cache jest
   aktywny dla verbatim `f16`/`fp8` bez
-  tieringu (`--prefix-cache on|off`, default on). Arch hybrydowa też, o ile ma
+  tieringu (hybryda tylko `f16`: jej kernele uwagi i prefillu nie mają wariantu
+  fp8, a `attn_prefill_fp8` istnieje dla head_dim 64/128, nie 256) (`--prefix-cache on|off`, default on). Arch hybrydowa też, o ile ma
   jedną rangę: węzeł drzewa niesie wtedy dodatkowo CHECKPOINT stanu DeltaNet
   (okno splotu + macierz stanu każdej warstwy rekurencyjnej), bo same strony
   opisują tylko attention. Pożyczka staje wyłącznie na węźle z checkpointem,
@@ -2020,8 +2021,14 @@ Ostatnia aktualizacja: 2026-07-25.
   3419 zamiast 3008, TTFT 407,5→98,2 ms. `fp8` też: Bielik-7B Q8_0 z
   `--kv-cache fp8`, trzy pytania na wspólnym inwentarzu 1302/82/82 ms wobec
   1305/1306/1307 ms z `--prefix-cache off`, hashe odpowiedzi identyczne.
-  Natywne MTP pozostaje wykluczone z prefiksem (własny verifier i cache draftu —
-  para niezmierzona); n-gram działa obok prefiksu. Usage
+  Natywne MTP działa OBOK prefiksu (ThinkingCap-Qwen3.6-27B Q4_K_M, GB10:
+  1070 ms TTFT powtórki i 28,2 tok/s decode, wobec 6392 ms/29,7 przy samym MTP i
+  1076 ms/10,9 przy samym prefiksie, hashe identyczne we wszystkich trzech).
+  Wymagały tego trzy rzeczy: reset stanu draftu MTP przeniesiony do czyszczenia
+  slotu (sekwencja z pożyczki nie przechodzi przez pozycję zerową), unieważnianie
+  toczącego się checkpointu przy rollbacku weryfikacji oraz niebranie checkpointu
+  z pozycji, do której `len` wyprzedził listę tokenów. Hybrydowy verifier odmawia
+  już tylko tieringu. n-gram działa obok prefiksu tak jak dotąd. Usage
   `prompt_tokens_details.cached_tokens`. Współdzielenie CAŁYCH stron → borrower
   nigdy nie pisze do współdzielonej strony (bez CoW granicznej strony). Dowód
   (RTX 4090, qwen3-0.6b): wspólny prefiks 2048 tok. → `cache_read=2016`, prefill
