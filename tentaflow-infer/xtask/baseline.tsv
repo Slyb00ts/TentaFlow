@@ -48,6 +48,7 @@ hal_boundary	crates/forge-engine/examples/mtp_smoke.rs	2
 hal_boundary	crates/forge-engine/src/cluster.rs	19
 hal_boundary	crates/forge-engine/src/deepseek.rs	1
 hal_boundary	crates/forge-engine/src/model/mod.rs	4
+hal_boundary	crates/forge-engine/src/model/state_cache.rs	1
 hal_boundary	crates/forge-engine/src/model/tp.rs	2
 hal_boundary	crates/forge-engine/src/moe_residency.rs	2
 hal_boundary	crates/forge-engine/src/mtp.rs	2
@@ -66,6 +67,7 @@ hal_boundary	crates/forge-engine/tests/deepseek_v4_gate_gpu.rs	3
 hal_boundary	crates/forge-engine/tests/deepseek_v4_layer_load.rs	3
 hal_boundary	crates/forge-engine/tests/deepseek_v4_model_gpu.rs	3
 hal_boundary	crates/forge-engine/tests/gpu_sampling.rs	2
+hal_boundary	crates/forge-engine/tests/hybrid_prefix_gpu.rs	2
 hal_boundary	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	2
 hal_boundary	crates/forge-engine/tests/kv_rollback.rs	2
 hal_boundary	crates/forge-engine/tests/kv_tier.rs	2
@@ -116,7 +118,7 @@ placeholder	crates/forge-onnx/src/interp.rs	1
 size	crates/forge-cli/src/main.rs	2866
 size	crates/forge-engine/src/model/arch/dense.rs	2820
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2033
-size	crates/forge-engine/src/model/mod.rs	4169
+size	crates/forge-engine/src/model/mod.rs	3756
 size	crates/forge-engine/src/model/mtp.rs	3157
 size	crates/forge-engine/src/server.rs	3259
 size	crates/forge-engine/src/tensor_parallel.rs	1661

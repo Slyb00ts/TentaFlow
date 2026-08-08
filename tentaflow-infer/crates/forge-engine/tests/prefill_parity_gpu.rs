@@ -113,7 +113,7 @@ fn prefill_zgadza_sie_z_krokiem_po_kroku() -> TestResult<()> {
     // Jedna sekwencja naraz. Model hybrydowy trzyma stan rekurencyjny DeltaNet w
     // puli per sekwencja, więc dwie żywe naraz mierzyłyby politykę tej puli, a
     // nie prefill.
-    let mut walk = |model: &mut Model, seq: &mut _, first: &[f32]| -> TestResult<Vec<u32>> {
+    let walk = |model: &mut Model, seq: &mut _, first: &[f32]| -> TestResult<Vec<u32>> {
         let mut ids = vec![argmax(first)];
         for _ in 1..CONTINUATION {
             let next = model.step(seq, *ids.last().expect("niepusty ciąg"))?;
