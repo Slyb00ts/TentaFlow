@@ -17,6 +17,7 @@ fn pre_residual_norm(
 }
 
 impl Model {
+
     /// Nieliniowość bramkowanego FFN tego modelu.
     pub(crate) fn ffn_act(&self) -> forge_formats::FfnActivation {
         self.weights.descriptor.params.ffn_activation
@@ -2124,13 +2125,12 @@ impl Model {
         for l in 0..n_layers {
             let layer = &self.weights.layers[l];
 
-            // Fused QKV projects with one gemv_norm into the fused buffer;
-            // split layers (mixed formats) run one gemv_norm per projection —
-            // per-row math is identical, only the block-level norm recompute
-            // repeats. Both feed attn_decode_split via buffer + byte offset.
+            // Per-row math is identical whichever way the norm is taken; only
+            // where it is computed differs. All of these feed attn_decode_split
+            // through a buffer and a byte offset.
             let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w_qkv) => {
-                    self.gemv_norm(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+                    self.decode_project_normed(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
                     if l == 0 {
                         self.trace_f16("Qcur-0", &b.qkv, 0, q_dim);
                     }
@@ -2348,14 +2348,12 @@ impl Model {
             self.gemv_residual(&layer.attn().attn_o, &b.attn_out, stream)?;
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {
-                    self.gemv_norm_silu(&b.act, w, &layer.ffn_norm, eps, stream)?;
+                    self.decode_gate_up_fused(w, &layer.ffn_norm, eps, stream)?;
                 }
                 GateUpWeights::Split { gate, up } => {
-                    // Mixed-format gate/up: two gemv_norm launches (same
-                    // per-row math as the fused silu kernels, the norm
-                    // recompute repeats) + the elementwise SwiGLU combine.
-                    // Rounding matches gemv_norm_silu: both projections are
-                    // stored as f16 before silu_mul reads them.
+                    // Mixed-format gate/up: one gemv_norm per projection, then
+                    // the elementwise combine. Rounding matches the fused silu
+                    // kernel — both halves are f16 before it reads them.
                     self.gemv_norm(&b.gate, gate, &layer.ffn_norm, false, eps, stream)?;
                     self.gemv_norm(&b.up, up, &layer.ffn_norm, false, eps, stream)?;
                     kernels.glu_mul_f16(

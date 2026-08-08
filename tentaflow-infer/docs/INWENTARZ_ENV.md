@@ -19,7 +19,7 @@ ona jest mierzona bramką `env` w `cargo xtask lint`.
 | zmienna | miejsca użycia |
 |---|---|
 | `FORGE_ATTN` | crates/forge-kernels/src/launchers/mod.rs:1471<br>crates/forge-kernels/src/launchers/mod.rs:1476<br>crates/forge-kernels/src/launchers/mod.rs:1761<br>crates/forge-kernels/src/registry.rs:70 |
-| `FORGE_ATTN_GQA` | crates/forge-engine/src/model/arch/dense.rs:2155 |
+| `FORGE_ATTN_GQA` | crates/forge-engine/src/model/arch/dense.rs:2198 |
 | `FORGE_BATCH_MIN` | crates/forge-engine/src/server.rs:659<br>crates/forge-engine/src/server.rs:666 |
 | `FORGE_BM16_AUDIT_BATCH` | crates/forge-server/tests/nvfp4_bm16_audit.rs:503 |
 | `FORGE_BM16_AUDIT_DIR` | crates/forge-server/tests/nvfp4_bm16_audit.rs:194 |
@@ -44,7 +44,7 @@ ona jest mierzona bramką `env` w `cargo xtask lint`.
 | `FORGE_HYBRID_LAYER_MAJOR_SCAN` | crates/forge-engine/src/model/mod.rs:228<br>crates/forge-engine/src/model/mod.rs:235 |
 | `FORGE_HYBRID_PREFILL_BATCH` | crates/forge-engine/src/server.rs:340<br>crates/forge-engine/src/server.rs:358<br>crates/forge-engine/src/server.rs:362<br>crates/forge-engine/src/server.rs:702 |
 | `FORGE_HYBRID_PREFILL_CHUNK` | crates/forge-engine/src/model/mod.rs:209<br>crates/forge-engine/src/model/mod.rs:214<br>crates/forge-engine/src/model/mod.rs:274<br>crates/forge-engine/src/model/mod.rs:279 |
-| `FORGE_HYBRID_VERIFY_GRAPH` | crates/forge-engine/src/model/arch/hybrid/verify.rs:771<br>crates/forge-engine/src/model/mtp.rs:2712 |
+| `FORGE_HYBRID_VERIFY_GRAPH` | crates/forge-engine/src/model/arch/hybrid/verify.rs:780<br>crates/forge-engine/src/model/mtp.rs:2712 |
 | `FORGE_KERNEL_DIR` | crates/forge-kernels/build.rs:5<br>crates/forge-kernels/src/registry.rs:196<br>crates/forge-kernels/src/registry.rs:201<br>crates/forge-kernels/src/registry.rs:216 |
 | `FORGE_MIXED_STEP` | crates/forge-engine/src/server.rs:842<br>crates/forge-engine/src/server.rs:843 |
 | `FORGE_MTP_DRAFT_HEAD` | crates/forge-engine/src/model/mod.rs:2616<br>crates/forge-engine/src/model/mod.rs:2625<br>crates/forge-engine/src/model/mod.rs:2630<br>crates/forge-engine/src/model/mod.rs:2680 |
@@ -109,7 +109,7 @@ ona jest mierzona bramką `env` w `cargo xtask lint`.
 | `FORGE_TEST_HYBRID_PREFILL_EXPECT_B2` | crates/forge-engine/tests/hybrid_state_pool_gpu.rs:3105 |
 | `FORGE_TEST_HYBRID_PREFILL_PRIORITY` | crates/forge-engine/tests/hybrid_state_pool_gpu.rs:3235 |
 | `FORGE_TEST_HYBRID_PREFILL_SERVER` | crates/forge-engine/tests/hybrid_state_pool_gpu.rs:3034<br>crates/forge-engine/tests/hybrid_state_pool_gpu.rs:3035<br>crates/forge-engine/tests/hybrid_state_pool_gpu.rs:3184 |
-| `FORGE_TEST_MOE_GGUF` | crates/forge-engine/tests/moe_prefill_gpu.rs:4<br>crates/forge-engine/tests/moe_prefill_gpu.rs:79<br>crates/forge-engine/tests/moe_prefill_gpu.rs:80<br>crates/forge-engine/tests/moe_prefill_gpu.rs:83 |
 | `FORGE_TEST_MTP_NGRAM_MIXED_SERVER` | crates/forge-engine/tests/hybrid_state_pool_gpu.rs:3016 |
+| `FORGE_TEST_PARITY_GGUF` | crates/forge-engine/tests/prefill_parity_gpu.rs:4<br>crates/forge-engine/tests/prefill_parity_gpu.rs:103<br>crates/forge-engine/tests/prefill_parity_gpu.rs:104<br>crates/forge-engine/tests/prefill_parity_gpu.rs:107 |
 | `FORGE_TP_TEST_MODEL` | crates/forge-engine/tests/tp_shard_load.rs:11<br>crates/forge-engine/tests/tp_shard_load.rs:25<br>crates/forge-engine/tests/tp_shard_load.rs:56 |
 

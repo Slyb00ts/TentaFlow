@@ -2,6 +2,81 @@
 use super::*;
 
 impl Model {
+    /// Powyżej tylu wierszy projekcji opłaca się policzyć normę RAZ.
+    ///
+    /// Kernel scalony przelicza ją w KAŻDYM bloku, więc jego narzut rośnie z
+    /// wysokością projekcji; policzenie normy osobno kosztuje jedno
+    /// uruchomienie i zapis znormalizowanego wektora, niezależnie od
+    /// wysokości. Zmierzone na GB10, Bielik-7B, tg32: projekcja QKV o 6144
+    /// wierszach jest szybsza scalona (47,2 wobec 46,6 tok/s), a gate/up o
+    /// 22528 wierszach szybsza z normą osobno (47,2 wobec 44,1). Prefill i tak
+    /// zawsze liczy normę raz, więc to zbliża dekodowanie do niego, a nie
+    /// oddala.
+    const NORM_ONCE_ROWS: usize = 12288;
+
+    pub(crate) fn norm_once_pays(rows: usize) -> bool {
+        rows >= Self::NORM_ONCE_ROWS
+    }
+
+    /// Jedna projekcja dekodowania z normą wejścia, liczoną tam, gdzie taniej.
+    pub(crate) fn decode_project_normed(
+        &self,
+        y: &DevBuffer,
+        w: &DevWeight,
+        norm_w: &DevBuffer,
+        from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if Self::norm_once_pays(w.rows()) {
+            self.decode_norm(norm_w, from_h16, eps, stream)?;
+            return self.gemv(y, w, &self.bufs.x, stream);
+        }
+        self.gemv_norm(y, w, norm_w, from_h16, eps, stream)
+    }
+
+    /// Scalona para gate|up dekodowania wraz z bramką SwiGLU.
+    pub(crate) fn decode_gate_up_fused(
+        &self,
+        w: &DevWeight,
+        norm_w: &DevBuffer,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let b = &self.bufs;
+        let inter = self.weights.descriptor.params.intermediate_size;
+        if !Self::norm_once_pays(w.rows()) {
+            return self.gemv_norm_silu(&b.act, w, norm_w, eps, stream);
+        }
+        self.decode_norm(norm_w, false, eps, stream)?;
+        self.gemv_rows(&b.gate, w, &b.x, 0, inter, stream)?;
+        self.gemv_rows(&b.up, w, &b.x, inter, inter, stream)?;
+        self.kernels
+            .glu_mul_f16(self.ffn_act(), &b.act, &b.gate, &b.up, inter, stream)
+    }
+
+    /// Znormalizowany strumień rezydualny dekodowania w `b.x`.
+    ///
+    /// `from_h16` mówi, że f32-owe lustro rezyduału jeszcze nie istnieje — tak
+    /// jest wyłącznie przed pierwszą warstwą.
+    pub(crate) fn decode_norm(
+        &self,
+        norm_w: &DevBuffer,
+        from_h16: bool,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let b = &self.bufs;
+        let hidden = self.weights.descriptor.params.hidden_size;
+        if from_h16 {
+            self.kernels
+                .rmsnorm_f16(&b.x, &b.h, norm_w, 1, hidden, eps, stream)
+        } else {
+            self.kernels
+                .rmsnorm_h32_f16(&b.x, &b.h, &b.h32, norm_w, 1, hidden, eps, stream)
+        }
+    }
+
     pub(crate) fn ensure_prefill_bufs(&mut self) -> Result<()> {
         for index in 0..self.tp_rank_count() {
             let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];

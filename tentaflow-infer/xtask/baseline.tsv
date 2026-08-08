@@ -69,7 +69,7 @@ hal_boundary	crates/forge-engine/tests/gpu_sampling.rs	2
 hal_boundary	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	2
 hal_boundary	crates/forge-engine/tests/kv_rollback.rs	2
 hal_boundary	crates/forge-engine/tests/kv_tier.rs	2
-hal_boundary	crates/forge-engine/tests/moe_prefill_gpu.rs	2
+hal_boundary	crates/forge-engine/tests/prefill_parity_gpu.rs	2
 hal_boundary	crates/forge-engine/tests/prefix_cache.rs	2
 hal_boundary	crates/forge-engine/tests/tp_shard_load.rs	1
 hal_boundary	crates/forge-model/tests/cuda_vs_reference.rs	1
@@ -114,7 +114,7 @@ kernel_geometry	kernels/mojo/build/sm_89/manifest.json	57
 placeholder	crates/forge-engine/src/speculation/config.rs	1
 placeholder	crates/forge-onnx/src/interp.rs	1
 size	crates/forge-cli/src/main.rs	2866
-size	crates/forge-engine/src/model/arch/dense.rs	2822
+size	crates/forge-engine/src/model/arch/dense.rs	2820
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2033
 size	crates/forge-engine/src/model/mod.rs	4736
 size	crates/forge-engine/src/model/mtp.rs	3157

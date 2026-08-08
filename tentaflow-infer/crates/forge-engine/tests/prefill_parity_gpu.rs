@@ -1,7 +1,7 @@
 // =============================================================================
-// Plik: moe_prefill_gpu.rs
-// Opis: Porównuje logity prefillu mieszanki z krokiem po kroku po tych samych tokenach.
-// Przykład: FORGE_TEST_MOE_GGUF=model.gguf cargo test -p forge-engine --release --test moe_prefill_gpu -- --nocapture
+// Plik: prefill_parity_gpu.rs
+// Opis: Porównuje logity prefillu z krokiem po kroku po tych samych tokenach.
+// Przykład: FORGE_TEST_PARITY_GGUF=model.gguf cargo test -p forge-engine --release --test prefill_parity_gpu -- --nocapture
 // =============================================================================
 
 use std::error::Error;
@@ -18,7 +18,7 @@ mod common;
 
 type TestResult<T> = Result<T, Box<dyn Error>>;
 
-const SKIP: &str = "parity prefillu mieszanki";
+const SKIP: &str = "parity prefillu";
 
 const CONTINUATION: usize = 16;
 
@@ -99,19 +99,15 @@ fn load(path: &Path) -> Option<Model> {
 /// się tego zobaczyć po samych wygenerowanych tokenach, bo argmax długo maskuje
 /// przesunięty rozkład.
 #[test]
-fn prefill_mieszanki_zgadza_sie_z_krokiem_po_kroku() -> TestResult<()> {
-    let Some(path) = std::env::var_os("FORGE_TEST_MOE_GGUF").map(PathBuf::from) else {
-        eprintln!("pominięto {SKIP}: brak FORGE_TEST_MOE_GGUF");
+fn prefill_zgadza_sie_z_krokiem_po_kroku() -> TestResult<()> {
+    let Some(path) = std::env::var_os("FORGE_TEST_PARITY_GGUF").map(PathBuf::from) else {
+        eprintln!("pominięto {SKIP}: brak FORGE_TEST_PARITY_GGUF");
         return Ok(());
     };
-    assert!(path.is_file(), "FORGE_TEST_MOE_GGUF nie wskazuje pliku");
+    assert!(path.is_file(), "FORGE_TEST_PARITY_GGUF nie wskazuje pliku");
     let Some(mut model) = load(&path) else {
         return Ok(());
     };
-    assert!(
-        model.weights.is_moe(),
-        "FORGE_TEST_MOE_GGUF musi wskazywać model z mieszanką ekspertów"
-    );
     let tokens = prompt(&path)?;
 
     // Jedna sekwencja naraz. Model hybrydowy trzyma stan rekurencyjny DeltaNet w
