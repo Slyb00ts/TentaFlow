@@ -137,7 +137,7 @@ impl Model {
             && self.hybrid_batch_weights_capable()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
-            && self.prefix_cache.is_none()
+            // Prefiks jak w B1: rollback pary rusza tylko pulę draftu MTP.
             && native_mtp_b2_device_embedding(
                 self.mtp_embedding_mode(),
                 self.weights

@@ -989,7 +989,6 @@ fn nvfp4_gguf_dispatch(
     is_nvidia: bool,
     wmma_available: bool,
     wmma_bn128_available: bool,
-    int8_batch_available: bool,
     warp_size: u32,
     max_threads: u32,
 ) -> Result<Nvfp4GgufDispatch> {
@@ -998,15 +997,14 @@ fn nvfp4_gguf_dispatch(
             "gemm_nvfp4_gguf_f16 wymaga co najmniej dwóch tokenów".into(),
         ));
     }
+    // Rodzina `gemv_nvfp4_gguf_q8_1_b*` stała tu dla T=2-8 i jest STĄD USUNIĘTA.
+    // Kwantuje aktywację do q8_1, a pojedynczy token liczy w f16 — więc tokeny
+    // sekwencji zależały od tego, czy akurat trafiła w parę, co dla serwera jest
+    // nie do przyjęcia. Izolowany kernel był szybszy (63 us wobec 152 us przy
+    // T=4), ale `prequant_q8_1` na każdą projekcję każdej warstwy zjada to z
+    // nawiązką: ThinkingCap-Qwen3.6-27B NVFP4 na GB10, MTP K3, decode 24,4 wobec
+    // 33,8 tok/s. Powrót wymaga, żeby TA SAMA matematyka liczyła też T=1.
     let (kernel, token_tile, row_tile, block_threads) = match n_tokens {
-        // Weryfikacja MTP liczy 2-4 tokeny naraz. Rodzina `b*` ma właściwą
-        // strukturę (fala na wiersz), ale idzie ścieżką f16 — przy T=4 mierzyła
-        // 152 us wobec 63 us GEMV-a int8 na tym samym kształcie, mimo że czyta
-        // TE SAME wagi. Wariant int8 dekoduje wagę raz na falę i używa jej dla
-        // wszystkich tokenów.
-        2 if int8_batch_available => ("gemv_nvfp4_gguf_q8_1_b2_f16", 2, 8, Some(BLOCK)),
-        3..=4 if int8_batch_available => ("gemv_nvfp4_gguf_q8_1_b4_f16", 4, 8, Some(BLOCK)),
-        5..=8 if int8_batch_available => ("gemv_nvfp4_gguf_q8_1_b8_f16", 8, 8, Some(BLOCK)),
         2 => ("gemm_nvfp4_gguf_f16_b2", 2, 1, Some(warp_size)),
         3 if is_nvidia && warp_size == 32 => (
             "gemm_nvfp4_gguf_f16_b3_nvidia",
@@ -1120,7 +1118,6 @@ fn nvfp4_gguf_layout_dispatch(
     is_nvidia: bool,
     wmma_available: bool,
     wmma_bn128_available: bool,
-    int8_batch_available: bool,
     warp_size: u32,
     max_threads: u32,
 ) -> Result<Nvfp4GgufDispatch> {
@@ -1135,7 +1132,6 @@ fn nvfp4_gguf_layout_dispatch(
             is_nvidia,
             wmma_available,
             wmma_bn128_available,
-            int8_batch_available,
             warp_size,
             max_threads,
         ),
@@ -2054,7 +2050,6 @@ mod nvfp4_gguf_dispatch_tests {
             false,
             false,
             is_nvidia,
-            false,
             false,
             false,
             warp_size,
@@ -3303,21 +3298,21 @@ mod nvfp4_gguf_dispatch_tests {
     #[test]
     fn wybiera_bn128_i_sync1_z_regresyjnym_wyjatkiem() {
         let large = nvfp4_gguf_dispatch_impl(
-            2048, 5120, 6144, true, true, true, true, false, false, false, 32, 1024,
+            2048, 5120, 6144, true, true, true, true, false, false, 32, 1024,
         )
         .unwrap();
         assert_eq!(large.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn128");
         assert_eq!((large.row_tile, large.block_threads), (128, 256));
 
         let m128 = nvfp4_gguf_dispatch_impl(
-            128, 5120, 5120, true, true, true, true, false, false, false, 32, 1024,
+            128, 5120, 5120, true, true, true, true, false, false, 32, 1024,
         )
         .unwrap();
         assert_eq!(m128.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1");
         assert_eq!((m128.row_tile, m128.block_threads), (64, 256));
 
         let regression = nvfp4_gguf_dispatch_impl(
-            128, 17408, 5120, true, true, true, true, false, false, false, 32, 1024,
+            128, 17408, 5120, true, true, true, true, false, false, 32, 1024,
         )
         .unwrap();
         assert_eq!(regression.kernel, "gemm_nvfp4_gguf_mma_f16_bm128_prefetch");
@@ -3336,7 +3331,6 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             true,
             true,
-            false,
             false,
             false,
             32,
@@ -3366,7 +3360,6 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             false,
-            false,
             32,
             1024,
         )
@@ -3387,7 +3380,6 @@ mod nvfp4_gguf_dispatch_tests {
             true,
             false,
             true,
-            false,
             false,
             false,
             32,
@@ -3413,7 +3405,6 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 false,
                 false,
-                false,
                 32,
                 1024,
             ),
@@ -3430,7 +3421,6 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 false,
                 false,
-                false,
                 32,
                 1024,
             ),
@@ -3444,7 +3434,6 @@ mod nvfp4_gguf_dispatch_tests {
                 true,
                 true,
                 true,
-                false,
                 false,
                 false,
                 false,

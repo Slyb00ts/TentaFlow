@@ -1007,8 +1007,6 @@ impl Kernels {
                 && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm32"),
             self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm256_bn128")
                 && self.artifacts.has("gemm_nvfp4_gguf_wmma_f16_bm512_bn128"),
-            raw_nvfp4_dp4a_supported(caps.warp_size)
-                && self.artifacts.has("gemv_nvfp4_gguf_q8_1_b4_f16"),
             caps.warp_size,
             caps.max_threads_per_block,
         )?;
@@ -1039,21 +1037,6 @@ impl Kernels {
             block: (dispatch.block_threads, 1, 1),
             shared_mem_bytes: 0,
         };
-        // Warianty int8 biorą aktywację JUŻ SKWANTOWANĄ (kody + skale
-        // blok-major), a nie f16 — kwantujemy ją tu, w tym samym strumieniu.
-        if dispatch.kernel.starts_with("gemv_nvfp4_gguf_q8_1_b") {
-            let (xq, xd, _) = self.prequant_q8_1(x, cols as usize, n_tokens as usize, stream)?;
-            let args = LaunchArgs::new()
-                .buf(y)
-                .buf(weights)
-                .buf(&xq)
-                .buf(&xd)
-                .scalar(cols)
-                .scalar(rows)
-                .scalar(n_tokens)
-                .scalar(output_scale);
-            return self.device.launch(kernel, &config, &args, stream);
-        }
         let args = LaunchArgs::new()
             .buf(y)
             .buf(weights)

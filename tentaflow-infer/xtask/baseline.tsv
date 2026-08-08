@@ -127,9 +127,9 @@ size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3514
 size	crates/forge-formats/src/arch.rs	2743
 size	crates/forge-formats/src/iq_tables.rs	3969
 size	crates/forge-kernels/src/launchers/deltanet.rs	1963
-size	crates/forge-kernels/src/launchers/gemm/nvfp4.rs	1710
+size	crates/forge-kernels/src/launchers/gemm/nvfp4.rs	1693
 size	crates/forge-kernels/src/launchers/gemm/quantized/i_quants.rs	2038
 size	crates/forge-kernels/src/launchers/gemm/quantized/k_quants.rs	1861
-size	crates/forge-kernels/src/launchers/mod.rs	3530
+size	crates/forge-kernels/src/launchers/mod.rs	3519
 size	crates/forge-kernels/tests/golden.rs	2953
 vendor_gate	crates/forge-kernels/src/launchers/mod.rs	2
