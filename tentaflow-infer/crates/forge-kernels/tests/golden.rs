@@ -430,12 +430,12 @@ fn gemm_q6_k_matches_formats_dequant() {
     }
     dev.synchronize().unwrap();
 
-    // Kafel `dot4` kwantyzuje aktywacje do int8 przed mnożeniem, kafel WMMA
-    // mnoży je w f16 — referencja musi iść tą samą drogą co dispatch.
-    let xref = if kernels.has_artifact("gemm_q6_k_wmma_f16_bm32") {
-        x.clone()
-    } else {
+    // Referencja musi iść tą samą drogą co dispatch, a droga zależy od
+    // architektury — pytamy więc launcher, zamiast zgadywać po artefakcie.
+    let xref = if kernels.gemm_q6_k_quantizes_activations(rows, n_tokens) {
         quantize_act_q8_1_host(&x, cols)
+    } else {
+        x.clone()
     };
     let got = download_f16(dev.as_ref(), &yb, n_tokens * rows);
     for t in 0..n_tokens {

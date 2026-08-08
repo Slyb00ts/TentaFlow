@@ -512,6 +512,45 @@ impl Kernels {
     /// ma takiego artefaktu — wtedy wołający zostaje na swojej dotychczasowej
     /// ścieżce.
     #[allow(clippy::too_many_arguments)]
+    /// Czy `gemm_q6_k_f16` policzy ten kształt kaflem int8.
+    ///
+    /// Kafel int8 kwantyzuje aktywacje do q8_1 przed mnożeniem, a kafel WMMA i
+    /// zapasowa ścieżka f16 mnożą je w f16 — wzorzec porównawczy musi wiedzieć,
+    /// którą drogą poszedł dispatch, zamiast zgadywać po obecności artefaktu.
+    pub fn gemm_q6_k_quantizes_activations(&self, rows: usize, n_tokens: usize) -> bool {
+        self.gemm_kblock_wmma_tile("gemm_q6_k_wmma_f16", rows, n_tokens)
+            .is_none()
+            && self
+                .gemm_dot4_tile("gemm_q6_k_i8mma", false, rows, n_tokens)
+                .is_some()
+    }
+
+    /// Kafel WMMA dla tego kształtu, o ile jego artefakt zbudowano.
+    ///
+    /// Wydzielone z uruchomienia, bo o wybór trzeba móc ZAPYTAĆ: kafel WMMA
+    /// mnoży aktywacje w f16, a kafel int8 kwantyzuje je wcześniej, więc każdy
+    /// wzorzec porównawczy musi iść tą samą drogą co dispatch.
+    pub(crate) fn gemm_kblock_wmma_tile(
+        &self,
+        family: &str,
+        rows: usize,
+        n_tokens: usize,
+    ) -> Option<(String, usize, usize, u32)> {
+        let has = |s: &str| self.artifacts.has(&format!("{family}{s}"));
+        let narrow = rows <= 64;
+        let (suffix, bm, bn, block) = if n_tokens <= 32 || narrow {
+            ("_bm32", 32usize, 64usize, 128u32)
+        } else if n_tokens >= 512 && has("_bm512_bn128") {
+            ("_bm512_bn128", 512usize, 128usize, 512u32)
+        } else if has("_bm256_bn128") {
+            ("_bm256_bn128", 256usize, 128usize, 256u32)
+        } else {
+            ("_bm256", 256usize, 64usize, 256u32)
+        };
+        let name = format!("{family}{suffix}");
+        self.artifacts.has(&name).then_some((name, bm, bn, block))
+    }
+
     pub(crate) fn gemm_kblock_wmma(
         &self,
         family: &str,
@@ -541,21 +580,10 @@ impl Kernels {
         // karcie o 64 CU. Zmierzone: 222 us na wywołanie, 96 wywołań na prefill
         // 27B, czyli 21 ms zmarnowane na 2,6% prefillu. Mały kafel ma tam 32
         // bloki zamiast dwóch.
-        let has = |s: &str| self.artifacts.has(&format!("{family}{s}"));
-        let narrow = rows <= 64;
-        let (suffix, bm, bn, block) = if n_tokens <= 32 || narrow {
-            ("_bm32", 32usize, 64usize, 128u32)
-        } else if n_tokens >= 512 && has("_bm512_bn128") {
-            ("_bm512_bn128", 512usize, 128usize, 512u32)
-        } else if has("_bm256_bn128") {
-            ("_bm256_bn128", 256usize, 128usize, 256u32)
-        } else {
-            ("_bm256", 256usize, 64usize, 256u32)
-        };
-        let name = format!("{family}{suffix}");
-        if !self.artifacts.has(&name) {
+        let Some((name, bm, bn, block)) = self.gemm_kblock_wmma_tile(family, rows, n_tokens)
+        else {
             return Ok(false);
-        }
+        };
         let kernel = self.artifacts.get(&name)?;
         let config = LaunchConfig {
             grid: (rows.div_ceil(bn) as u32, n_tokens.div_ceil(bm) as u32, 1),

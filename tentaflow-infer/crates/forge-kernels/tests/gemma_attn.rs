@@ -295,13 +295,12 @@ fn gemm_q6_k_matches_canonical_dequant_shapes() {
         let x: Vec<f32> = (0..n_tokens * cols)
             .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
             .collect();
-        // Kafel `dot4` kwantyzuje aktywacje do int8 przed mnożeniem, kafel WMMA
-        // mnoży je w f16 — referencja musi iść tą samą drogą co dispatch,
-        // inaczej mierzy kwantyzację aktywacji zamiast kernela.
-        let xq = if kernels.has_artifact("gemm_q6_k_wmma_f16_bm32") {
-            x.clone()
-        } else {
+        // Referencja musi iść tą samą drogą co dispatch, inaczej mierzy
+        // kwantyzację aktywacji zamiast kernela.
+        let xq = if kernels.gemm_q6_k_quantizes_activations(rows, n_tokens) {
             quantize_act_q8_1_host(&x, cols)
+        } else {
+            x.clone()
         };
         let wb = dev.alloc(raw.len(), MemKind::Device, Pool::Weights).unwrap();
         dev.write(&raw, &wb, 0).unwrap();
