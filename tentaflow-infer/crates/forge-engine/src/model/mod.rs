@@ -2675,7 +2675,7 @@ impl Model {
     /// to an untiered run.
     pub(crate) fn step_streamed(&mut self, seq: &mut SeqKv, token_id: u32) -> Result<()> {
         let pos = seq.len;
-        seq.tokens.push(token_id);
+        self.record_token(seq, token_id);
         self.kv.grow(seq)?;
         self.upload_decode_inputs(token_id, pos)?;
         self.tier

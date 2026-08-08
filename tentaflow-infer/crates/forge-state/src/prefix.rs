@@ -9,13 +9,16 @@
 // prefix for later requests.
 //
 // Correctness invariant: KV bytes are a deterministic function of the token
-// prefix AND the (prefill) kernel path. Only PREFILL-built pages are cached,
-// so a borrowed prefix is byte-identical to what a cache-miss request would
-// have prefilled — the borrower produces the exact same tokens as without the
-// cache. Sharing is at WHOLE-PAGE granularity, so a borrower never writes into
-// a shared page (KV pages are append-only and its first write lands in a fresh
-// page at the next page boundary); no copy-on-write of a partial boundary page
-// is ever needed.
+// prefix AND the kernel path that wrote them. A sequence donates every complete
+// page it holds, prefilled AND decoded — the answer a conversation just heard is
+// the prefix of the question it is about to ask, and refusing to cache it makes
+// every turn recompute what the model itself said a moment ago. Decode writes
+// K/V through a GEMV where prefill writes it through a tiled GEMM, so a borrowed
+// decode page reproduces the sequence that donated it rather than a cold prefill
+// of the same tokens; measured on a three-turn conversation the answers were
+// identical either way. Sharing is at WHOLE-PAGE granularity, so a borrower never
+// writes into a shared page (KV pages are append-only and its first write lands in
+// a fresh page at the next page boundary); no copy-on-write is ever needed.
 //
 // A recurrent (DeltaNet/SSM) layer keeps no pages: everything the sequence has
 // said is folded into one state matrix that the next token overwrites. Pages

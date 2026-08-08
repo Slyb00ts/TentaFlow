@@ -419,7 +419,7 @@ impl Model {
             self.ensure_batch(batch)?;
         }
         grow_prefill_lanes_transactional(&mut self.kv, seqs, n_tokens)?;
-        if self.tier.is_some() || self.prefix_cache.is_some() {
+        if self.records_tokens() {
             for (seq, tokens) in seqs.iter_mut().zip(token_lanes.iter()) {
                 if seq.tokens.len() == seq.prefilled_len {
                     seq.prefilled_len += n_tokens;
@@ -2490,10 +2490,8 @@ impl Model {
                 self.kv.free_page_count()
             )));
         }
-        if self.tier.is_some() {
-            for (seq, &tok) in seqs.iter_mut().zip(tokens) {
-                seq.tokens.push(tok);
-            }
+        for (seq, &tok) in seqs.iter_mut().zip(tokens) {
+            self.record_token(seq, tok);
         }
 
         // Grow each sequence by one token and gather its position/page table

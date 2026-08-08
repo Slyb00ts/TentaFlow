@@ -92,6 +92,21 @@ impl Model {
         self.tier.is_some()
     }
 
+    /// Czy sekwencja ma zapamiętywać swoje tokeny.
+    ///
+    /// Tiering trzyma je pod recompute, prefiks pod darowiznę — a darowizna
+    /// obejmuje też strony zapisane przez dekodowanie, więc token wygenerowany
+    /// liczy się tak samo jak token promptu.
+    pub(crate) fn records_tokens(&self) -> bool {
+        self.tier.is_some() || self.prefix_cache.is_some()
+    }
+
+    pub(crate) fn record_token(&self, seq: &mut SeqKv, token: u32) {
+        if self.records_tokens() {
+            seq.tokens.push(token);
+        }
+    }
+
     /// Whether the radix prefix cache is active for this model.
     pub fn prefix_enabled(&self) -> bool {
         self.prefix_cache.is_some()
@@ -174,7 +189,11 @@ impl Model {
                 seq.state_target / ps
             }
             true => 0,
-            false => seq.prefilled_len / ps,
+            // Gęsta ścieżka oddaje też strony zapisane przez dekodowanie:
+            // odpowiedź poprzedniej tury jest prefiksem następnego promptu, a
+            // bez niej każda tura czatu przelicza od nowa wszystko, co model
+            // sam przed chwilą powiedział.
+            false => seq.len / ps,
         };
         let node = seq.prefix_node.take();
         let donation = {

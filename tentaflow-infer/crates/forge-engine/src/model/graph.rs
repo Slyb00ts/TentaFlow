@@ -39,8 +39,8 @@ impl Model {
                     return self.step_streamed(seq, token_id);
                 }
             }
-            seq.tokens.push(token_id);
         }
+        self.record_token(seq, token_id);
 
         let page_boundary = seq.len.is_multiple_of(self.kv.cfg.page_size);
         if page_boundary {
