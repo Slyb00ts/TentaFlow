@@ -2021,6 +2021,16 @@ Ostatnia aktualizacja: 2026-07-25.
   3419 zamiast 3008, TTFT 407,5→98,2 ms. `fp8` też: Bielik-7B Q8_0 z
   `--kv-cache fp8`, trzy pytania na wspólnym inwentarzu 1302/82/82 ms wobec
   1305/1306/1307 ms z `--prefix-cache off`, hashe odpowiedzi identyczne.
+  Dispatch NVFP4 małych batchy NIE używa już rodziny `gemv_nvfp4_gguf_q8_1_b*`:
+  kwantowała aktywację do q8_1, podczas gdy pojedynczy token liczy w f16, więc
+  tokeny sekwencji zależały od tego, czy scheduler sparował ją z inną. Artefakty
+  istnieją tylko dla sm_121a, więc 4090 nie mogło tego zobaczyć. Usunięcie jest
+  też SZYBSZE: `prequant_q8_1` na projekcję na warstwę kosztuje przy T=2-4 więcej,
+  niż daje jednokrotny dekod wag — ThinkingCap-Qwen3.6-27B NVFP4 na GB10, MTP K3:
+  decode 33,8 zamiast 24,4 tok/s (+39%), hashe identyczne. `hybrid_state_pool_gpu`
+  na NVFP4: 29/32 (było 25/32); zostają trzy porównania stanu DRAFTU B1 wobec B2
+  przy K=2 — pełne ID już się zgadzają, więc różnica dotyczy trafności propozycji,
+  nie wyjścia modelu.
   Graf kroku hybrydy jest kluczowany SLOTEM stanu DeltaNet: przechwycenie
   zapieka bufory slotu aktywnego w tamtej chwili, więc jeden graf odtwarzany dla
   wszystkich liczył drugą sekwencję na cudzym stanie rekurencyjnym (dowód:
