@@ -49,13 +49,16 @@ pub(crate) struct MoeBufs {
     pub(crate) tile_expert: DevBuffer,
     pub(crate) tile_first: DevBuffer,
     pub(crate) tile_end: DevBuffer,
-    /// Pinned-host landing for the shared-expert gate logit (f16), read back in
-    /// the same sync as the router top-k (fallback readback path only).
-    pub(crate) pinned_shared: DevBuffer,
-    /// Device-resident shared-expert sigmoid gate scale (f32, one element). The
-    /// device dispatch path computes it on-GPU so folding the shared expert
-    /// needs no host round-trip.
+    /// Shared-expert gate logits, f16 [MAX_PREFILL_CHUNK] — `ffn_gate_inp_shexp · x`
+    /// for every token of the chunk (decode fills the first element only).
+    pub(crate) shared_logits: DevBuffer,
+    /// Device-resident shared-expert sigmoid gate scales, f32
+    /// [MAX_PREFILL_CHUNK]. The device dispatch path reads element 0 straight
+    /// from here, so folding the shared expert needs no host round-trip.
     pub(crate) shared_scale: DevBuffer,
+    /// Pinned-host landing for `shared_scale`, read back in the same sync as
+    /// the router top-k (the host-dispatch paths only).
+    pub(crate) pinned_shared: DevBuffer,
 }
 
 impl MoeBufs {
@@ -91,15 +94,19 @@ impl MoeBufs {
                 device.write(&rows, &slots, 0)?;
                 slots
             },
-            pinned_shared: pinned(2)?,
+            shared_logits: dev(MAX_PREFILL_CHUNK * 2)?,
             shared_scale: {
                 // Seed 1.0 so a shared expert without a per-token gate (no
-                // shared_gate) folds in unscaled; the device sigmoid kernel
-                // overwrites this each layer when a gate exists.
-                let sc = dev(4)?;
-                device.write(&1.0f32.to_le_bytes(), &sc, 0)?;
+                // shared_gate) folds in unscaled; the sigmoid kernel overwrites
+                // these each layer when a gate exists.
+                let sc = dev(MAX_PREFILL_CHUNK * 4)?;
+                let ones: Vec<u8> = std::iter::repeat_n(1.0f32.to_le_bytes(), MAX_PREFILL_CHUNK)
+                    .flatten()
+                    .collect();
+                device.write(&ones, &sc, 0)?;
                 sc
             },
+            pinned_shared: pinned(MAX_PREFILL_CHUNK * 4)?,
         })
     }
 }

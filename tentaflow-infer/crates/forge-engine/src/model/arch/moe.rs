@@ -394,6 +394,55 @@ impl Model {
         )
     }
 
+    /// Per-token sigmoid gate of the shared expert (`ffn_gate_inp_shexp · x`)
+    /// for `t` tokens, left on the device in `mb.shared_scale`.
+    fn moe_shared_gate(
+        &self,
+        gate: &DevWeight,
+        x: &DevBuffer,
+        t: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        if t == 1 {
+            self.gemv(&mb.shared_logits, gate, x, stream)?;
+        } else {
+            self.gemm(&mb.shared_logits, gate, x, t, stream)?;
+        }
+        self.kernels
+            .moe_sigmoid_f16_to_f32(&mb.shared_scale, &mb.shared_logits, t, stream)
+    }
+
+    /// Puts `t` shared-expert scales on their way to the host, for the dispatch
+    /// paths that read the router back anyway — the copy rides that same sync.
+    ///
+    /// Without a shared-expert gate (OLMoE / Qwen3-MoE) the device buffer keeps
+    /// the 1.0 seeded at load, so the expert folds in unscaled and the readback
+    /// stays one code path.
+    fn moe_stage_shared_scales(
+        &self,
+        moe: &MoeFfn,
+        x: &DevBuffer,
+        t: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if moe.shared.is_none() {
+            return Ok(());
+        }
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        if let Some(gate) = &moe.shared_gate {
+            self.moe_shared_gate(gate, x, t, stream)?;
+        }
+        self.device
+            .copy(&mb.shared_scale, 0, &mb.pinned_shared, 0, t * 4, stream)
+    }
+
+    /// The `t` staged scales, once the caller's sync has landed them.
+    fn moe_shared_scales(mb: &MoeBufs, t: usize) -> &[f32] {
+        let host = mb.pinned_shared.host_ptr().expect("pinned host mapping");
+        unsafe { std::slice::from_raw_parts(host as *const f32, t) }
+    }
+
     pub(crate) fn moe_decode_ffn(
         &self,
         moe: &MoeFfn,
@@ -413,9 +462,7 @@ impl Model {
         // model constant (not data-dependent), so the launch sequence is static.
         if Self::moe_gidx_capable(moe) {
             if let Some(sg) = &moe.shared_gate {
-                self.gemv(&mb.tmp, sg, &b.x, stream)?;
-                self.kernels
-                    .moe_sigmoid_f16_to_f32(&mb.shared_scale, &mb.tmp, 1, stream)?;
+                self.moe_shared_gate(sg, &b.x, 1, stream)?;
             }
             self.moe_route(moe, &b.x, 1, hidden, stream)?;
             return self
@@ -428,11 +475,7 @@ impl Model {
         // Enqueue the shared-expert gate GEMV (when the arch has one) BEFORE the
         // router readback so its logit rides the SAME single sync as the top-k,
         // rather than forcing a second per-layer host round-trip.
-        if let Some(sg) = &moe.shared_gate {
-            self.gemv(&mb.tmp, sg, &b.x, stream)?;
-            self.device
-                .copy(&mb.tmp, 0, &mb.pinned_shared, 0, 2, stream)?;
-        }
+        self.moe_stage_shared_scales(moe, &b.x, 1, stream)?;
         self.moe_route(moe, &b.x, 1, hidden, stream)?;
         self.device
             .copy(&mb.ids, 0, &mb.pinned_ids, 0, k * 4, stream)?;
@@ -451,16 +494,7 @@ impl Model {
                 k,
             )
         };
-        // Per-token sigmoid gate for the shared expert (`ffn_gate_inp_shexp · x`);
-        // 1.0 when the arch declares no shared-expert gate (OLMoE / Qwen3-MoE).
-        let shared_scale = if moe.shared_gate.is_some() {
-            let sp = mb.pinned_shared.host_ptr().expect("pinned host mapping");
-            let bytes = unsafe { *(sp as *const [u8; 2]) };
-            let logit = f16::from_le_bytes(bytes).to_f32();
-            1.0 / (1.0 + (-logit).exp())
-        } else {
-            1.0
-        };
+        let shared_scale = Self::moe_shared_scales(mb, 1).first().copied().unwrap_or(1.0);
         self.fault_in_experts(moe, layer, ids)?;
         self.moe_experts_accumulate(
             moe,
@@ -896,6 +930,7 @@ impl Model {
         let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
         let inter = moe.moe_inter;
         let k = moe.n_experts_used;
+        self.moe_stage_shared_scales(moe, &pb.x, t, stream)?;
         self.moe_route(moe, &pb.x, t, hidden, stream)?;
         self.device
             .copy(&mb.ids, 0, &mb.pinned_ids, 0, t * k * 4, stream)?;
@@ -921,6 +956,7 @@ impl Model {
         if Self::moe_grouped_capable(&self.kernels, moe) {
             return self.moe_grouped_prefill(moe, ids, t, inter, hidden, stream);
         }
+        let shared_scales = Self::moe_shared_scales(mb, t);
         let chunk_union = self.chunk_expert_union(ids);
         let union_fits = self.expert_union_fits(moe, chunk_union.len());
         if union_fits {
@@ -947,7 +983,7 @@ impl Model {
                 hidden,
                 &ids[ti * k..(ti + 1) * k],
                 &weights[ti * k..(ti + 1) * k],
-                1.0,
+                shared_scales.get(ti).copied().unwrap_or(1.0),
                 stream,
             )?;
         }
