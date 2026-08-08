@@ -466,6 +466,15 @@ impl Model {
         self.row_parallel_gemm(&pb.o_out, &delta.out_proj, &hv.normed, t, stream)
     }
 
+    /// Powyżej tylu zapytań uwagę liczy kafel zrównoleglony po TOKENACH.
+    ///
+    /// Kernel dekodowy dzieli KONTEKST między bloki i jest szybszy, dopóki
+    /// zapytań jest za mało, żeby zapełnić kartę. Kafel prefillowy bierze
+    /// szesnaście zapytań na blok, więc przy tej liczbie ma ich już więcej niż
+    /// karta ma multiprocesorów, a każde dodatkowe zapytanie jest dla niego
+    /// darmowe zamiast być kolejnym przebiegiem po kontekście.
+    const HYBRID_ATTN_TOKEN_PARALLEL: usize = 64;
+
     pub(crate) fn hybrid_verify_attention_layer(
         &self,
         layer_index: usize,
@@ -575,7 +584,7 @@ impl Model {
             1.0 / (p.head_dim as f32).sqrt(),
             stream,
         )? {
-        } else if self.device.caps().vendor == Vendor::Nvidia {
+        } else if self.device.caps().vendor == Vendor::Nvidia && t < Self::HYBRID_ATTN_TOKEN_PARALLEL {
             kernels.attn_decode_batch_exact_f16_hd256(
                 &pb.attn_out,
                 &hv.qc,

@@ -26,7 +26,7 @@ mod registry;
 pub mod variant;
 
 pub use launchers::gemm::mxf4::{MmaKind, MMA_RATE_OPS};
-pub use launchers::moe::GroupedTiles;
+pub use launchers::moe::{GroupedAct, GroupedTiles};
 pub use launchers::{
     nvfp4_ct_physical_m, DeltaStateLayout, DensePrefillLogitsKind, Kernels, MixedQuant,
     Nvfp4CtProjection, Nvfp4CtS0View, Nvfp4GgufLayout, Nvfp4GgufQ8Projection, Q8ActPrepared,

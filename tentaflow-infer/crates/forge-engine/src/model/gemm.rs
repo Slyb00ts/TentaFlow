@@ -1,6 +1,6 @@
 // ===== File: model/gemm.rs — projekcje i mnozenia na poziomie modelu =====
 use super::*;
-use forge_kernels::GroupedTiles;
+use forge_kernels::{GroupedAct, GroupedTiles};
 
 impl Model {
     /// Wykonuje kilka pełnych projekcji GGUF NVFP4 ze wspólną kwantyzacją
@@ -551,25 +551,31 @@ impl Model {
     /// rows are its own, so the tile itself is the ungrouped tile — grouping
     /// picks the block's placement rather than the launch's.
     #[allow(clippy::too_many_arguments)]
+    /// Format wspólny dla trzech projekcji warstwy, żeby aktywację przygotować
+    /// raz na jej postać, a nie raz na stos.
+    pub(crate) fn grouped_stack_quant(stack: &ExpertStack) -> Result<QuantKind> {
+        stack.representative().block_quant().ok_or_else(|| {
+            ForgeError::Unsupported("gemm_grouped_stack called for a blockless expert".into())
+        })
+    }
+
     pub(crate) fn gemm_grouped_stack(
         &self,
         y: &DevBuffer,
         stack: &ExpertStack,
-        x: &DevBuffer,
+        act: &GroupedAct<'_>,
         tiles: &GroupedTiles<'_>,
         n_rows: usize,
         selections: usize,
         stream: &Stream,
     ) -> Result<()> {
         let w = stack.representative();
-        let quant = w.block_quant().ok_or_else(|| {
-            ForgeError::Unsupported("gemm_grouped_stack called for a blockless expert".into())
-        })?;
+        let quant = Self::grouped_stack_quant(stack)?;
         self.kernels.gemm_grouped_experts(
             quant,
             y,
             stack.table(),
-            x,
+            act,
             GroupedTiles {
                 expert: tiles.expert,
                 first: tiles.first,

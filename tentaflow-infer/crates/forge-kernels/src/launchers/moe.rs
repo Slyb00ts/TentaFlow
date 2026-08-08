@@ -296,26 +296,51 @@ impl Kernels {
     /// AGAINST grouping — for a single decode step, where a grid touching every
     /// expert loses more in locality than it gains in occupancy. A prompt is
     /// the opposite shape and the same tile wins there.
+    /// A grouped block's activation in whatever form the stack's format reads.
+    ///
+    /// Separate from the launch because it belongs to the ACTIVATION, not to
+    /// the weight: a layer's gate and up projections read the same rows, so
+    /// preparing per launch converted the identical bytes twice.
+    pub fn prepare_grouped_act<'a>(
+        &self,
+        quant: QuantKind,
+        x: &'a DevBuffer,
+        cols: usize,
+        selections: usize,
+        stream: &Stream,
+    ) -> Result<GroupedAct<'a>> {
+        Ok(match quant {
+            // Four bits on BOTH sides: the block-scaled unit's operands are
+            // e2m1 with a ue8m0 scale, so the activation goes through the same
+            // form as the weight. That is the arithmetic, not a shortcut.
+            QuantKind::MXFP4 => {
+                let (xq, xs) = self.prequant_mxf4(x, cols, selections, stream)?;
+                GroupedAct::Fp4 { xq, xs }
+            }
+            QuantKind::Q4K | QuantKind::Q8_0 => {
+                let (xq, xd, xsm) = self.prequant_q8_1(x, cols, selections, stream)?;
+                GroupedAct::Int8 { xq, xd, xsm }
+            }
+            _ => GroupedAct::F16(x),
+        })
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_grouped_experts(
         &self,
         quant: QuantKind,
         y: &DevBuffer,
         table: &DevBuffer,
-        x: &DevBuffer,
+        act: &GroupedAct<'_>,
         tiles: GroupedTiles<'_>,
         rows: usize,
         cols: usize,
         selections: usize,
         stream: &Stream,
     ) -> Result<()> {
-        // Four bits on BOTH sides: the block-scaled unit's operands are e2m1
-        // with a ue8m0 scale, so the activation goes through the same form as
-        // the weight. That is the arithmetic, not a shortcut around it.
-        if quant == QuantKind::MXFP4 {
-            let (xq, xs) = self.prequant_mxf4(x, cols, selections, stream)?;
+        if let GroupedAct::Fp4 { xq, xs } = act {
             return self
-                .gemm_mxf4_grouped(y, table, &xq, &xs, tiles, rows, cols, selections, stream);
+                .gemm_mxf4_grouped(y, table, xq, xs, tiles, rows, cols, selections, stream);
         }
         let (name, block, bn, _) = self.grouped_variant(quant)?;
         let kernel = self.artifacts.get(name)?;
@@ -324,20 +349,17 @@ impl Kernels {
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        // Q6_K reads f16 activations; the int8 tiles read the q8_1 form, which
-        // is quantized ONCE for the whole grouped block rather than once per
-        // expert — that repetition was its own line in the profile.
-        let int8 = matches!(quant, QuantKind::Q4K | QuantKind::Q8_0);
-        let args = if !int8 {
-            LaunchArgs::new().buf(y).buf(table).buf(x)
-        } else {
-            let (xq, xd, xsm) = self.prequant_q8_1(x, cols, selections, stream)?;
-            LaunchArgs::new()
+        // Q6_K reads f16 activations; the int8 tiles read the q8_1 form.
+        let int8 = matches!(act, GroupedAct::Int8 { .. });
+        let args = match act {
+            GroupedAct::F16(x) => LaunchArgs::new().buf(y).buf(table).buf(*x),
+            GroupedAct::Int8 { xq, xd, xsm } => LaunchArgs::new()
                 .buf(y)
                 .buf(table)
-                .buf(&xq)
-                .buf(&xd)
-                .buf(&xsm)
+                .buf(xq)
+                .buf(xd)
+                .buf(xsm),
+            GroupedAct::Fp4 { .. } => unreachable!("wariant czterobitowy wyszedł wyżej"),
         };
         let args = args
             .buf(tiles.expert)
@@ -599,6 +621,20 @@ pub struct GroupedTiles<'a> {
 
 /// Rows of the grouped activation one tile of a grouped launch covers.
 ///
+/// A grouped block's activation, converted once for every stack that reads it.
+pub enum GroupedAct<'a> {
+    F16(&'a DevBuffer),
+    Int8 {
+        xq: DevBuffer,
+        xd: DevBuffer,
+        xsm: DevBuffer,
+    },
+    Fp4 {
+        xq: DevBuffer,
+        xs: DevBuffer,
+    },
+}
+
 /// The value the int8 and Q6_K tiles use, and the WIDEST any tile uses — so it
 /// is the right size for the tile table, and the wrong stride to build it with
 /// unless every projection of the layer is that wide. See `grouped_tile_rows`.

@@ -874,11 +874,20 @@ impl Model {
             hidden,
             stream,
         )?;
+        // Gate i up czytają TE SAME wiersze, więc aktywacja idzie przez swoją
+        // postać raz, a nie raz na projekcję.
+        let ffn_act = self.kernels.prepare_grouped_act(
+            Self::grouped_stack_quant(&moe.gate_exps)?,
+            &mb.grouped_x,
+            hidden,
+            selections,
+            stream,
+        )?;
         for (stack, y) in [
             (&moe.gate_exps, &mb.grouped_gate),
             (&moe.up_exps, &mb.grouped_up),
         ] {
-            self.gemm_grouped_stack(y, stack, &mb.grouped_x, &tiles, inter, selections, stream)?;
+            self.gemm_grouped_stack(y, stack, &ffn_act, &tiles, inter, selections, stream)?;
         }
         // Elementwise, so the whole grouped block goes at once — the gate
         // function does not care which expert produced which row.
@@ -890,10 +899,17 @@ impl Model {
             selections * inter,
             stream,
         )?;
+        let down_act = self.kernels.prepare_grouped_act(
+            Self::grouped_stack_quant(&moe.down_exps)?,
+            &mb.grouped_gate,
+            inter,
+            selections,
+            stream,
+        )?;
         self.gemm_grouped_stack(
             &mb.grouped_out,
             &moe.down_exps,
-            &mb.grouped_gate,
+            &down_act,
             &tiles,
             hidden,
             selections,
