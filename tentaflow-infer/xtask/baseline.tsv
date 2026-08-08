@@ -69,6 +69,7 @@ hal_boundary	crates/forge-engine/tests/gpu_sampling.rs	2
 hal_boundary	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	2
 hal_boundary	crates/forge-engine/tests/kv_rollback.rs	2
 hal_boundary	crates/forge-engine/tests/kv_tier.rs	2
+hal_boundary	crates/forge-engine/tests/moe_prefill_gpu.rs	2
 hal_boundary	crates/forge-engine/tests/prefix_cache.rs	2
 hal_boundary	crates/forge-engine/tests/tp_shard_load.rs	1
 hal_boundary	crates/forge-model/tests/cuda_vs_reference.rs	1
@@ -120,7 +121,7 @@ size	crates/forge-engine/src/model/mtp.rs	3157
 size	crates/forge-engine/src/server.rs	3259
 size	crates/forge-engine/src/tensor_parallel.rs	1661
 size	crates/forge-engine/src/weights.rs	5031
-size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3617
+size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3611
 size	crates/forge-formats/src/arch.rs	2743
 size	crates/forge-formats/src/iq_tables.rs	3969
 size	crates/forge-kernels/src/launchers/attention.rs	2163
