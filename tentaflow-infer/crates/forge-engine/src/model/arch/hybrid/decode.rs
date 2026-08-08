@@ -74,25 +74,30 @@ impl Model {
             p.rms_norm_eps,
             &self.stream,
         )?;
-        let LayerFfn::Dense(ffn) = &layer.ffn else {
-            return Err(ForgeError::Unsupported(
-                "hybrydowy verifier MTP nie obsługuje jeszcze targetu MoE".into(),
-            ));
-        };
-        self.ffn_dense_block(
-            layer_index,
-            ffn,
-            FfnBlockBufs {
-                x: &pb.x,
-                gate: &pb.gate,
-                up: &pb.up,
-                act: &pb.act,
-                out: &pb.down,
-                gate_up: None,
-            },
-            t,
-            &self.stream,
-        )
+        match &layer.ffn {
+            LayerFfn::Dense(ffn) => self.ffn_dense_block(
+                layer_index,
+                ffn,
+                FfnBlockBufs {
+                    x: &pb.x,
+                    gate: &pb.gate,
+                    up: &pb.up,
+                    act: &pb.act,
+                    out: &pb.down,
+                    gate_up: None,
+                },
+                t,
+                &self.stream,
+            ),
+            // The same pair of buffers as the dense block: `pb.x` the normed
+            // input, `pb.down` the [t, hidden] output. Reading the router back
+            // to the host rules out graph capture, so the speculative verifier
+            // refuses a MoE target before it gets here
+            // (`validate_hybrid_speculation_target`).
+            LayerFfn::Moe(moe) => {
+                self.moe_prefill_ffn(moe, layer_index, t, p.hidden_size, &self.stream)
+            }
+        }
     }
 
     /// Część 3 chunka: rezyduum FFN i norma wejścia następnej warstwy.

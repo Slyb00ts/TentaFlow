@@ -27,9 +27,12 @@ pub(crate) struct MoeBufs {
     pub(crate) sel_gate: DevBuffer,
     pub(crate) sel_up: DevBuffer,
     pub(crate) sel_out: DevBuffer,
-    /// Slot table for the combine, i32 [top_k]. Every selection already sits at
-    /// its own row in the router's order, so this is the identity — the combine
-    /// takes a table because a path that reorders rows has one to invert.
+    /// Slot table for the combine, i32 [MAX_PREFILL_CHUNK]. Every selection of
+    /// a decode step already sits at its own row in the router's order, so its
+    /// first `top_k` entries are what that combine needs; the shared expert of
+    /// a prefill chunk reads one entry per token from the same table. The
+    /// combine takes a table because a path that reorders rows has one to
+    /// invert.
     pub(crate) identity: DevBuffer,
     /// A prefill chunk's selections gathered into expert order: the activation
     /// each selection reads, the two feed-forward halves and the down output.
@@ -89,8 +92,10 @@ impl MoeBufs {
             tile_first: dev((moe.n_experts + idw) * 4)?,
             tile_end: dev((moe.n_experts + idw) * 4)?,
             identity: {
-                let slots = dev(top_k * 4)?;
-                let rows: Vec<u8> = (0..top_k as i32).flat_map(|j| j.to_le_bytes()).collect();
+                let slots = dev(MAX_PREFILL_CHUNK * 4)?;
+                let rows: Vec<u8> = (0..MAX_PREFILL_CHUNK as i32)
+                    .flat_map(|j| j.to_le_bytes())
+                    .collect();
                 device.write(&rows, &slots, 0)?;
                 slots
             },

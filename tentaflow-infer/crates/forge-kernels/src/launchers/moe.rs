@@ -292,12 +292,10 @@ impl Kernels {
     /// NOT every format wants this, and the two answers are opposite enough
     /// that only measurement settles it. On GB10 at a 512-token prompt the one
     /// grid is worth 7,6× for the int8 tiles (Qwen3-30B: 1473 against 194 tok/s
-    /// launching the same kernel tile by tile) and COSTS 1,3× for MXFP4
-    /// (Qwen3.6-35B: 52,8 against 68,7). The int8 tiles are limited by how much
-    /// of the card is busy, which one grid fixes; the MXFP4 tile dequantizes to
-    /// f16 and is limited by memory instead, and there a grid that touches every
-    /// expert at once loses more in locality than it gains in occupancy. So
-    /// MXFP4 keeps the per-expert dispatch and refuses here by name.
+    /// launching the same kernel tile by tile). MXFP4 was measured at 1,3×
+    /// AGAINST grouping — for a single decode step, where a grid touching every
+    /// expert loses more in locality than it gains in occupancy. A prompt is
+    /// the opposite shape and the same tile wins there.
     #[allow(clippy::too_many_arguments)]
     pub fn gemm_grouped_experts(
         &self,
@@ -610,10 +608,7 @@ impl Kernels {
         quant: QuantKind,
     ) -> Result<(&'static str, u32, usize, usize)> {
         Ok(match quant {
-            QuantKind::MXFP4 => {
-                let (name, tokens, threads) = self.mxf4_grouped_variant();
-                (name, threads, 128, tokens)
-            }
+            QuantKind::MXFP4 => ("gemm_mxfp4_gguf_f16_grouped", 128, 64, 64),
             QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256, 64, 64),
             QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64, 64),
             QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128, 64, 64),
@@ -628,11 +623,15 @@ impl Kernels {
     /// Whether a stack of this format multiplies as ONE grid over every expert
     /// through `gemm_grouped_experts`.
     ///
-    /// MXFP4 has a grouped tile of its own, but it reads a quantized activation
-    /// pair and is launched by `gemm_mxf4_grouped` — a different call with
-    /// different arguments, so it is not part of this answer.
+    /// MXFP4 answers on the f16 tile here. It has a four-bit tile as well, on
+    /// the block-scaled matrix unit — but that unit takes four bits on BOTH
+    /// sides, so it would quantize the activation too, and this call is the one
+    /// whose contract is that grouping changes no arithmetic.
     pub fn supports_grouped_experts(&self, quant: QuantKind) -> bool {
-        matches!(quant, QuantKind::Q4K | QuantKind::Q8_0 | QuantKind::Q6K)
+        matches!(
+            quant,
+            QuantKind::Q4K | QuantKind::Q8_0 | QuantKind::Q6K | QuantKind::MXFP4
+        )
             && self
                 .grouped_variant(quant)
                 .is_ok_and(|(name, ..)| self.artifacts.has(name))

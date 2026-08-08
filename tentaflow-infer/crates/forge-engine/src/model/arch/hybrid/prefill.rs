@@ -22,7 +22,6 @@ impl Model {
     pub(crate) fn hybrid_batched_prefill_capable(&self) -> bool {
         self.is_hybrid()
             && self.weights.descriptor.params.head_dim == 256
-            && !self.weights.is_moe()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
             && self.prefix_cache.is_none()

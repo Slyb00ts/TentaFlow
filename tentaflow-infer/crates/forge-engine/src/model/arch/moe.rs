@@ -765,21 +765,18 @@ impl Model {
     /// Whether this layer's routed stacks multiply as ONE grid over every
     /// expert.
     ///
-    /// A shared expert is a dense feed-forward over every row and has no
-    /// grouped form here, so a layer carrying one keeps the per-token loop. So
-    /// does a paged stack: a grid spanning every expert has no address for a
-    /// block that sits on disk.
+    /// A paged stack keeps the per-token loop: a grid spanning every expert has
+    /// no address for a block that sits on disk.
     fn moe_grouped_capable(kernels: &Kernels, moe: &MoeFfn) -> bool {
-        moe.shared.is_none()
-            && [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
-                .into_iter()
-                .all(|stack| {
-                    stack.fully_resident()
-                        && stack
-                            .representative()
-                            .block_quant()
-                            .is_some_and(|quant| kernels.supports_grouped_experts(quant))
-                })
+        [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+            .into_iter()
+            .all(|stack| {
+                stack.fully_resident()
+                    && stack
+                        .representative()
+                        .block_quant()
+                        .is_some_and(|quant| kernels.supports_grouped_experts(quant))
+            })
     }
 
     /// Routed experts of a prefill chunk, every expert in ONE grid.
@@ -911,6 +908,55 @@ impl Model {
             hidden,
             k,
             true,
+            stream,
+        )?;
+        self.moe_grouped_shared(moe, t, hidden, stream)
+    }
+
+    /// The always-on expert of a prefill chunk: a dense SwiGLU over all `t`
+    /// rows, added on top of the routed sum.
+    ///
+    /// It runs AFTER the combine, which is what lets it borrow `mb.grouped_out`
+    /// as its `[t, hidden]` landing — the routed answers have been folded into
+    /// `pb.down` by then and that scratch is free. Each row is scaled by its own
+    /// gate, still on the device, so nothing here reads back.
+    fn moe_grouped_shared(
+        &self,
+        moe: &MoeFfn,
+        t: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let Some(sh) = &moe.shared else {
+            return Ok(());
+        };
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
+        let sh_inter = sh.down.cols();
+        match &sh.gate_up {
+            GateUpWeights::Fused(w) => {
+                self.gemm_rows(&pb.gate, w, &pb.x, t, 0, sh_inter, stream)?;
+                self.gemm_rows(&pb.up, w, &pb.x, t, sh_inter, sh_inter, stream)?;
+            }
+            GateUpWeights::Split { gate, up } => {
+                self.gemm_rows(&pb.gate, gate, &pb.x, t, 0, gate.rows(), stream)?;
+                self.gemm_rows(&pb.up, up, &pb.x, t, 0, up.rows(), stream)?;
+            }
+        }
+        self.kernels
+            .glu_mul_f16(self.ffn_act(), &pb.gate, &pb.gate, &pb.up, t * sh_inter, stream)?;
+        self.gemm(&mb.grouped_out, &sh.down, &pb.gate, t, stream)?;
+        // One expert per token, its row at its own index: the combine with
+        // `top_k = 1` over the identity IS `pb.down[r] += gate[r] · shared[r]`.
+        self.kernels.moe_combine_f16(
+            &pb.down,
+            &mb.grouped_out,
+            &mb.identity,
+            &mb.shared_scale,
+            t,
+            hidden,
+            1,
+            false,
             stream,
         )
     }
