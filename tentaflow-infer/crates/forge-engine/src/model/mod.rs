@@ -1895,6 +1895,7 @@ mod moe_bufs;
 use moe_bufs::MoeBufs;
 mod mtp;
 mod quant_dispatch;
+mod caps;
 mod sample;
 mod scratch;
 mod state_cache;
@@ -1913,62 +1914,7 @@ impl Model {
         spill: Option<ExpertSpill>,
     ) -> Result<Self> {
         let p = weights.descriptor.params.clone();
-        // head_dim 256 has an f16-only attention specialization (qwen35moe
-        // gated attention layers); the hybrid arch always uses the f16 cache.
-        // 512 to warstwy globalne rodziny Gemma 4 (16 głowic Q na jedną KV).
-        if p.head_dim != 64 && p.head_dim != 128 && p.head_dim != 256 && p.head_dim != 512 {
-            return Err(ForgeError::Unsupported(format!(
-                "head_dim {} has no attention specialization",
-                p.head_dim
-            )));
-        }
-        if weights.is_moe() {
-            // The routed decode path is a dedicated, non-graph-captured chain
-            // over the f16 paged cache; low-bit KV modes and tiering are tracked
-            // follow-ups (they need the fused decode kernels MoE bypasses).
-            if !matches!(cfg.kv_quant, KvQuant::F16) {
-                return Err(ForgeError::Unsupported(
-                    "MoE models currently support only the f16 KV cache".into(),
-                ));
-            }
-            // The hybrid `qwen35moe` arch (attention + Gated-DeltaNet MoE) DOES
-            // tier: only its ~10 attention layers hold a paged KV cache, and
-            // that cache spills/restores/streams through the same tier manager
-            // as the dense path. The DeltaNet layers keep a small resident
-            // recurrent state that is never paged. Non-hybrid MoE (OLMoE,
-            // Qwen3-MoE) still lacks a staged-attention decode chain.
-            let hybrid = weights.descriptor.params.ssm.is_some();
-            if cfg.kv_tier.enabled() && !hybrid {
-                return Err(ForgeError::Unsupported(
-                    "non-hybrid MoE models do not support KV tiering yet".into(),
-                ));
-            }
-        }
-        match cfg.kv_quant {
-            KvQuant::F16 => {}
-            KvQuant::Fp8 => {
-                // The non-fused decode chain (qkv_post + attn_decode) has no
-                // fp8 cache kernels; fp8 decode goes through attn_decode_split
-                // exclusively.
-                if !Self::fused_decode_available(&weights, device.caps().vendor) {
-                    return Err(ForgeError::Unsupported(
-                        "kv_dtype fp8 requires the fused decode path; this model's weight \
-                         formats fall back to the separate decode kernels"
-                            .into(),
-                    ));
-                }
-            }
-            KvQuant::Rot { bits, .. } => {
-                if bits != 3 && bits != 4 {
-                    return Err(ForgeError::Unsupported(format!(
-                        "rotational KV supports 3 or 4 bits, got {bits}"
-                    )));
-                }
-                // Rot decode reads the packed store through attn_decode_rot;
-                // prefill stays on the bit-exact f16 slab. Only head_dim 64/128
-                // have compiled specializations (already checked above).
-            }
-        }
+        caps::admit(device.as_ref(), &weights, &cfg)?;
         let max_pages_per_seq = cfg.max_seq_len.div_ceil(cfg.kv_page_size);
         if weights.descriptor.layer_kinds.len() != p.block_count {
             return Err(ForgeError::Format(format!(
