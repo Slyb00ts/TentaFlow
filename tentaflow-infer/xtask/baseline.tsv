@@ -116,7 +116,7 @@ placeholder	crates/forge-onnx/src/interp.rs	1
 size	crates/forge-cli/src/main.rs	2866
 size	crates/forge-engine/src/model/arch/dense.rs	2820
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2033
-size	crates/forge-engine/src/model/mod.rs	4736
+size	crates/forge-engine/src/model/mod.rs	4169
 size	crates/forge-engine/src/model/mtp.rs	3157
 size	crates/forge-engine/src/server.rs	3259
 size	crates/forge-engine/src/tensor_parallel.rs	1661
