@@ -2021,6 +2021,14 @@ Ostatnia aktualizacja: 2026-07-25.
   3419 zamiast 3008, TTFT 407,5→98,2 ms. `fp8` też: Bielik-7B Q8_0 z
   `--kv-cache fp8`, trzy pytania na wspólnym inwentarzu 1302/82/82 ms wobec
   1305/1306/1307 ms z `--prefix-cache off`, hashe odpowiedzi identyczne.
+  Graf kroku hybrydy jest kluczowany SLOTEM stanu DeltaNet: przechwycenie
+  zapieka bufory slotu aktywnego w tamtej chwili, więc jeden graf odtwarzany dla
+  wszystkich liczył drugą sekwencję na cudzym stanie rekurencyjnym (dowód:
+  `FORGE_HYBRID_DECODE_GRAPH=0` naprawiał przeplot, a graf jest domyślnie
+  włączony). Kontrakt batcha wymaga formatu z DOKŁADNYM kernelem małego batcha
+  (F16, Q8_0, NVFP4) — K-kwanty kwantyzują aktywacje do q8_1 i rozjeżdżają się z
+  seryjnym o 0,18 przy tolerancji 0,125. `hybrid_state_pool_gpu` na
+  ThinkingCap-Qwen3.6-27B Q4_K_M (GB10): 32/32.
   Natywne MTP działa OBOK prefiksu (ThinkingCap-Qwen3.6-27B Q4_K_M, GB10:
   1070 ms TTFT powtórki i 28,2 tok/s decode, wobec 6392 ms/29,7 przy samym MTP i
   1076 ms/10,9 przy samym prefiksie, hashe identyczne we wszystkich trzech).
