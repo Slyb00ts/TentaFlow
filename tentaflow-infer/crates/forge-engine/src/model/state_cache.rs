@@ -351,6 +351,13 @@ impl HybridStatePool {
                     stream,
                 )?;
             }
+            // Stan draftu MTP należy do TEGO SAMEGO slotu, więc czyści się z
+            // nim razem. Wcześniej kasował go prefill przy pozycji zerowej —
+            // sekwencja zaczynająca od pożyczonego prefiksu nigdy tam nie
+            // trafia i odziedziczyłaby cudze strony draftu.
+            if let (Some(state), Some(kv)) = (slot.mtp.as_mut(), self.mtp_kv.as_mut()) {
+                state.reset(kv, stream)?;
+            }
             slot.initialized_generation = lease.generation;
         }
         self.active = Some(lease);
@@ -808,11 +815,23 @@ impl Model {
     /// stronę, więc długi dekod nie zjada puli; kopia D2D co 32 tokeny to
     /// ułamek kroku dekodowania.
     pub(crate) fn roll_hybrid_checkpoint(&mut self, seq: &mut SeqKv) -> Result<()> {
+        // Sloty unieważnione przez rollback wracają do puli tutaj: to pierwszy
+        // punkt po każdym cofnięciu, w którym pula jest osiągalna.
+        if !seq.state_orphans.is_empty() {
+            self.return_state_slots(std::mem::take(&mut seq.state_orphans));
+        }
         let at = seq.len;
         if self.prefix_cache.is_none()
             || at <= seq.state_target
             || !at.is_multiple_of(self.kv.cfg.page_size)
         {
+            return Ok(());
+        }
+        // Drzewo kluczuje stronę jej tokenami, a weryfikacja spekulacyjna
+        // wysuwa `len` przed listę tokenów: dopóki draft nie jest rozstrzygnięty,
+        // te pozycje nie mają właściciela, więc checkpoint stamtąd byłby nie do
+        // zaadresowania.
+        if seq.tokens.len() < at {
             return Ok(());
         }
         if seq.state_rolling.is_some_and(|(pos, _)| pos == at) {

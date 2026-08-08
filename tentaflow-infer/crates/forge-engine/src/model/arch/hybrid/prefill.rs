@@ -1235,9 +1235,6 @@ impl Model {
         let mut last_logits = Vec::new();
         for (i, &tok) in tokens.iter().enumerate() {
             let pos = seq.len;
-            if pos == 0 {
-                self.reset_mtp_runtime(seq)?;
-            }
             if pos >= p.max_position_embeddings {
                 return Err(ForgeError::Scheduler(format!(
                     "position {pos} exceeds model context {}",
@@ -1348,9 +1345,6 @@ impl Model {
         }
         self.ensure_hybrid_verify_bufs(4)?;
         self.ensure_hybrid_layer_major_bufs(tokens.len())?;
-        if seq.len == 0 {
-            self.reset_mtp_runtime(seq)?;
-        }
         let arena = self
             .hybrid_layer_major_bufs
             .as_ref()
@@ -1889,9 +1883,6 @@ impl Model {
                 seq.len + tokens.len() - 1,
                 p.max_position_embeddings
             )));
-        }
-        if seq.len == 0 {
-            self.reset_mtp_runtime(seq)?;
         }
         self.ensure_hybrid_bufs()?;
         self.ensure_prefill_bufs()?;

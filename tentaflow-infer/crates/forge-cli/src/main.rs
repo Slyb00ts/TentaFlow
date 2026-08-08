@@ -280,7 +280,6 @@ enum Command {
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        /// Natywne MTP wymusza `--prefix-cache off`; n-gram nie.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
         /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
@@ -394,7 +393,6 @@ enum Command {
         #[arg(long = "prefix-cache", default_value = "off")]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        /// Natywne MTP wymusza `--prefix-cache off`; n-gram nie.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
         /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
@@ -1708,10 +1706,6 @@ fn cmd_serve(
     spec: SpeculativeConfig,
     tp_cards: Vec<forge_hal::gpu::DeviceId>,
 ) -> Result<()> {
-    let prefix_cache = prefix_cache && spec.allows_prefix_cache();
-    if spec.is_enabled() && !prefix_cache {
-        tracing::info!("natywne MTP prowadzi własny cache draftu; prefiks wyłączony");
-    }
     let descriptor = read_descriptor(model_path)?;
     let max_active = resolve_max_active(max_active, &spec, descriptor.params.ssm.is_some())?;
     let t0 = Instant::now();
@@ -1976,7 +1970,6 @@ fn cmd_run(
     );
 
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache && spec.allows_prefix_cache();
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -2361,7 +2354,6 @@ fn cmd_bench(
         bail!("--reps must be at least 1");
     }
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache && spec.allows_prefix_cache();
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,

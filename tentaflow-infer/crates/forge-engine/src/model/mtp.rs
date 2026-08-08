@@ -491,15 +491,6 @@ impl Model {
         self.finish_mtp_runtime(lease, state, mtp_kv, result)
     }
 
-    pub(crate) fn reset_mtp_runtime(&mut self, seq: &mut SeqKv) -> Result<()> {
-        if !self.has_native_mtp() {
-            return Ok(());
-        }
-        let (lease, mut state, mut mtp_kv) = self.take_mtp_runtime(seq)?;
-        let result = state.reset(&mut mtp_kv, &self.stream);
-        self.finish_mtp_runtime(lease, state, mtp_kv, result)
-    }
-
     pub(crate) fn mtp_catchup_token(&mut self, seq: &mut SeqKv, token: u32) -> Result<()> {
         if !self.has_native_mtp() {
             return Ok(());
@@ -1671,10 +1662,13 @@ impl Model {
                 "hybrydowy verifier spekulacyjny wymaga cache KV F16".into(),
             ));
         }
-        // Hybrydowy verifier z pożyczonym prefiksem nie jest zmierzony.
-        if self.tier.is_some() || self.prefix_cache.is_some() {
+        // Prefiks NIE jest tu przeszkodą, tak samo jak w gęstym verifierze:
+        // rollback zwalnia strony wyłącznie od końca i nigdy pożyczonych, a
+        // toczący się checkpoint stanu jest przy każdym cofnięciu unieważniany,
+        // więc drzewo nie zobaczy stanu opisującego cofnięte tokeny.
+        if self.tier.is_some() {
             return Err(ForgeError::Unsupported(
-                "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache".into(),
+                "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu".into(),
             ));
         }
         batched_head_supported(&self.weights.lm_head)

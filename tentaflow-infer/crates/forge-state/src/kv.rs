@@ -242,6 +242,10 @@ pub struct SeqKv {
     /// Toczący się checkpoint dekodowania: JEDEN slot, nadpisywany na każdej
     /// kolejnej granicy strony, żeby wygenerowana odpowiedź też dała się oddać.
     pub state_rolling: Option<(usize, crate::prefix::StateSlot)>,
+    /// Sloty, którym rollback odebrał ważność. Wołający oddaje je puli — tu
+    /// nie ma do niej dostępu, a zostawienie ich w `state_rolling` oznaczałoby
+    /// darowiznę stanu opisującego tokeny, których sekwencja już nie ma.
+    pub state_orphans: Vec<crate::prefix::StateSlot>,
 }
 
 impl SeqKv {
@@ -407,6 +411,7 @@ impl KvCache {
             state_checkpoints: Vec::new(),
             state_restore: None,
             state_rolling: None,
+            state_orphans: Vec::new(),
         }
     }
 
@@ -474,6 +479,12 @@ impl KvCache {
             if page >= 0 {
                 self.free_pages.push(page);
             }
+        }
+        // Checkpoint opisuje stan PO tokenach, które właśnie znikły — od tej
+        // chwili nie odpowiada żadnemu prefiksowi tej sekwencji.
+        if seq.state_rolling.is_some_and(|(pos, _)| pos > new_len) {
+            let (_, slot) = seq.state_rolling.take().expect("sprawdzone wyżej");
+            seq.state_orphans.push(slot);
         }
         seq.len = new_len;
     }

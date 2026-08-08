@@ -84,6 +84,7 @@ impl Model {
         }
         if self.prefix_cache.is_some() {
             self.finalize_prefix(seq);
+            self.return_state_slots(std::mem::take(&mut seq.state_orphans));
         }
         self.kv.release(seq);
     }
