@@ -435,7 +435,11 @@ impl Kernels {
             return ("gemm_fp8_wmma_bm256_bn128".into(), 256, 128, 256);
         }
         let big_blocks = rows.div_ceil(128) * n_tokens.div_ceil(128);
-        if n_tokens >= 1024 && big_blocks >= 256 {
+        let wide_fits = self
+            .artifacts
+            .get("gemm_fp8_f16_big")
+            .is_ok_and(|kernel| Self::block_fits(kernel, 512));
+        if n_tokens >= 1024 && big_blocks >= 256 && wide_fits {
             ("gemm_fp8_f16_big".into(), 128, 128, 512)
         } else if n_tokens >= 256 {
             ("gemm_fp8_f16".into(), 128, 64, 256)

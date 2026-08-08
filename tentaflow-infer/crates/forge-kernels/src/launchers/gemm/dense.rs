@@ -763,8 +763,7 @@ impl Kernels {
             return self.device.launch(gk, &cfg, &args, stream);
         }
 
-        let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
-        let gk = self.artifacts.get(&format!("{kernel_base}{suffix}"))?;
+        let (gk, bm, bn, threads) = self.gemm_i8mma_tile(kernel_base, rows, n_tokens)?;
         let cfg = LaunchConfig {
             grid: (
                 (rows as u32).div_ceil(bn),
@@ -934,15 +933,33 @@ impl Kernels {
     /// a pure perf gate. Measured on the RTX 4090: Mistral-7B Q4_K 4096 prefill
     /// 2588 -> 2827 tok/s (+9%), 8192 2246 -> 2343 (+4%); Qwen3-0.6B and the 512
     /// prefill stay on the committed kernel (no regression).
-    pub(crate) fn gemm_i8mma_tile(rows: usize, n_tokens: usize) -> (&'static str, u32, u32, u32) {
+    /// Czy TA funkcja uruchomi się z blokiem `threads`.
+    ///
+    /// Liczba rejestrów na wątek jest własnością skompilowanego kernela, nie
+    /// karty, więc szeroki kafel strojony pod większy budżet rejestrów potrafi
+    /// nie wystartować gdzie indziej — i wtedy launch zwraca błąd zamiast
+    /// czegokolwiek policzyć. Backend bez odpowiedzi nie blokuje wyboru.
+    pub(crate) fn block_fits(kernel: &KernelHandle, threads: u32) -> bool {
+        kernel.max_block_threads().is_none_or(|limit| limit >= threads)
+    }
+
+    pub(crate) fn gemm_i8mma_tile(
+        &self,
+        base: &str,
+        rows: usize,
+        n_tokens: usize,
+    ) -> Result<(&KernelHandle, u32, u32, u32)> {
         let big_blocks = rows.div_ceil(128) * n_tokens.div_ceil(128);
         if n_tokens >= 1024 && big_blocks >= 256 {
-            ("_big", 128, 128, 512)
-        } else if n_tokens >= 256 {
-            ("", 128, 64, 256)
-        } else {
-            ("_bm64", 64, 64, 256)
+            let wide = self.artifacts.get(&format!("{base}_big"))?;
+            if Self::block_fits(wide, 512) {
+                return Ok((wide, 128, 128, 512));
+            }
         }
+        if n_tokens >= 256 {
+            return Ok((self.artifacts.get(base)?, 128, 64, 256));
+        }
+        Ok((self.artifacts.get(&format!("{base}_bm64"))?, 64, 64, 256))
     }
 
     /// Rows each warp computes in the norm-recomputing fused decode kernels.

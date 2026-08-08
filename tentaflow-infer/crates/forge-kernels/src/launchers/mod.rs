@@ -10,7 +10,7 @@ use std::sync::OnceLock;
 
 use std::sync::{Arc, Mutex};
 
-use forge_hal::{DevBuffer, Device, Event, LaunchArgs, LaunchConfig, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
 
 use forge_types::{DType, ForgeError, MemKind, QuantKind, Result};
 

@@ -228,6 +228,16 @@ pub trait ModuleImpl: Send + Sync {
 
 pub trait KernelImpl: Send + Sync {
     fn name(&self) -> &str;
+    /// Największy blok, z jakim TA funkcja się uruchomi.
+    ///
+    /// To nie jest limit karty: liczba rejestrów na wątek jest własnością
+    /// skompilowanego kernela, więc kafel strojony na kartę o większym budżecie
+    /// rejestrów potrafi przekroczyć limit gdzie indziej — i wtedy launch
+    /// zwraca błąd zamiast policzyć cokolwiek. `None`, gdy backend nie umie
+    /// odpowiedzieć; wołający ma wtedy zachować dotychczasowy wybór.
+    fn max_block_threads(&self) -> Option<u32> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -302,6 +312,13 @@ handle!(
     ExecGraph,
     GraphImpl
 );
+
+impl KernelHandle {
+    /// Największy blok, z jakim ta funkcja się uruchomi; `None` bez odpowiedzi.
+    pub fn max_block_threads(&self) -> Option<u32> {
+        self.0.max_block_threads()
+    }
+}
 
 impl DevBuffer {
     pub fn len(&self) -> usize {

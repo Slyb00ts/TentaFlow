@@ -514,9 +514,9 @@ impl Kernels {
                     .scalar(n_tokens_i64),
             )
         } else {
-            let (suffix, bm, bn, threads) = Self::gemm_i8mma_tile(rows, n_tokens);
+            let (gk, bm, bn, threads) = self.gemm_i8mma_tile("gemm_q8_0_i8mma", rows, n_tokens)?;
             (
-                self.artifacts.get(&format!("gemm_q8_0_i8mma{suffix}"))?,
+                gk,
                 LaunchConfig {
                     grid: (rows_u32.div_ceil(bn), (n_tokens as u32).div_ceil(bm), 1),
                     block: (threads, 1, 1),

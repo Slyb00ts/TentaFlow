@@ -315,6 +315,21 @@ impl KernelImpl for CudaKernelImpl {
         &self.name
     }
 
+    fn max_block_threads(&self) -> Option<u32> {
+        let mut value: i32 = 0;
+        let status = unsafe {
+            sys::cuFuncGetAttribute(
+                &mut value,
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                self.func,
+            )
+        };
+        if status != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        u32::try_from(value).ok().filter(|threads| *threads > 0)
+    }
+
     fn as_any(&self) -> &dyn Any {
         self
     }
