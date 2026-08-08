@@ -465,6 +465,15 @@ macro_rules! block_quant_gemv_families {
                 // >=64-token tile the GEMM kernels pad to.
                 DevWeight::Q4K { buf, cols, .. } => {
                     let off = row_bytes()?;
+                    // Ten sam wniosek co dla Q8_0 wyżej, i ta sama liczba: kafel
+                    // i8mma dopełnia do >=64 tokenów, więc przy jednym liczy
+                    // sześćdziesiąt trzy puste wiersze. W profilu dekodowania
+                    // Qwen3-30B stał za 28% kroku.
+                    if n_tokens == 1 {
+                        return self
+                            .kernels
+                            .gemv_q4_k_dp4a_f16_at(y, buf, off, x, n_rows, *cols, stream);
+                    }
                     if self
                         .kernels
                         .gemm_qk_dp4a_batch_at(y, buf, off, x, n_rows, *cols, n_tokens, false, stream)?
