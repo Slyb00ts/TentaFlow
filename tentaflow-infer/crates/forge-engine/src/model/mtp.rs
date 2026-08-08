@@ -1,6 +1,23 @@
 // ===== File: model/mtp.rs — natywne MTP/NextN: propozycja, weryfikacja, catch-up =====
 use super::*;
 
+/// Czy `logits_gemm` policzy tę głowę wsadowo, dla T tokenów naraz.
+///
+/// Q6_K idzie batchowym przemiatem dp4a z wyjściem f32, Q4_K przemiatem per
+/// token. Bez tych dwóch KAŻDY GGUF Q4_K_M odpadał, bo llama.cpp z konwencji
+/// daje im właśnie głowę Q6_K.
+fn batched_head_supported(head: &DevWeight) -> Result<()> {
+    match head {
+        DevWeight::F16 { .. }
+        | DevWeight::Q8_0 { .. }
+        | DevWeight::Q4K { .. }
+        | DevWeight::Q6K { .. } => Ok(()),
+        _ => Err(ForgeError::Unsupported(
+            "batchowa głowa verifiera wymaga F16, Q8_0, Q4_K lub Q6_K".into(),
+        )),
+    }
+}
+
 impl Model {
     fn take_mtp_runtime(
         &mut self,
@@ -1609,6 +1626,9 @@ impl Model {
             }
             return self.validate_hybrid_speculation_target();
         }
+        // MoE działa, tylko przegrywa: verify liczy T tokenów ścieżką prefillu
+        // (sort, gather, grupowe GEMM-y), a decode MoE siedzi w grafie i jest
+        // tani. Qwen3-30B-A3B Q4_K_M, GB10: 2,75-2,83 s wobec 2,29-2,33 s.
         if self.weights.is_moe() {
             return Err(ForgeError::Unsupported(
                 "speculative verification does not support routed MoE models".into(),
@@ -1626,15 +1646,7 @@ impl Model {
         }
         // Prefiks NIE jest tu przeszkodą: rollback zwalnia strony wyłącznie od
         // końca, a darowizna obejmuje tylko `prefilled_len`.
-        if !matches!(
-            self.weights.lm_head,
-            DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
-        ) {
-            return Err(ForgeError::Unsupported(
-                "speculative verification requires an F16 or Q8_0 language-model head".into(),
-            ));
-        }
-        Ok(())
+        batched_head_supported(&self.weights.lm_head)
     }
 
     pub fn validate_hybrid_speculation_target(&self) -> Result<()> {
@@ -1665,20 +1677,7 @@ impl Model {
                 "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache".into(),
             ));
         }
-        // `logits_gemm` obsługuje też głowy K-kwantowe: Q6_K batchowym
-        // przemiatem dp4a z wyjściem f32, Q4_K przemiatem per token.
-        if !matches!(
-            self.weights.lm_head,
-            DevWeight::F16 { .. }
-                | DevWeight::Q8_0 { .. }
-                | DevWeight::Q4K { .. }
-                | DevWeight::Q6K { .. }
-        ) {
-            return Err(ForgeError::Unsupported(
-                "batchowy head hybrydowego targetu wymaga F16, Q8_0, Q4_K lub Q6_K".into(),
-            ));
-        }
-        Ok(())
+        batched_head_supported(&self.weights.lm_head)
     }
 
     fn ensure_mtp_b2_bufs(&mut self) -> Result<()> {
