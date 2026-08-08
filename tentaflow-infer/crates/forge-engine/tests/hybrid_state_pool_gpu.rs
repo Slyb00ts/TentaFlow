@@ -26,6 +26,8 @@ use forge_hal::Device;
 use forge_tokenize::Tokenizer;
 use half::f16;
 
+mod common;
+
 #[link(name = "dl")]
 unsafe extern "C" {
     fn dlopen(filename: *const std::ffi::c_char, flags: std::ffi::c_int) -> *mut std::ffi::c_void;
@@ -803,15 +805,7 @@ fn load_model_sized_with_tier(
             }
         });
     let kv_cache = 256usize << 20;
-    let reserve = std::env::var("FORGE_TEST_POOL_RESERVE_MB")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(512)
-        << 20;
-    let Some(weights) = free.checked_sub(activations + kv_cache + reserve) else {
-        eprintln!("pominięto test puli hybrydowej: za mało wolnego VRAM");
-        return None;
-    };
+    let weights = common::weights_pool(path, free, activations + kv_cache, "test puli hybrydowej")?;
     let device: Arc<dyn Device> = match gpu::open(
         0,
         PoolSizes {
