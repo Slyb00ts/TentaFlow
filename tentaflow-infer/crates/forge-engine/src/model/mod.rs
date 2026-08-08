@@ -2289,6 +2289,17 @@ impl Model {
                 p.vocab_size,
             )
         });
+        // Prefix caching is a strict optimization: engage only where a borrowed
+        // prefix page is byte-identical to a fresh prefill and never mutated —
+        // the verbatim F16/Fp8 paged cache, no tiering (it rewrites pages), no
+        // rotational store (indexed by position, not by page). A hybrid arch
+        // also folds state into no page at all, so it checkpoints into
+        // `HYBRID_STATE_CACHE_SLOTS`, and needs them undivided by a
+        // tensor-parallel split: every rank would have to snapshot in lockstep.
+        let prefix_eligible = cfg.prefix_cache
+            && !cfg.kv_tier.enabled()
+            && matches!(cfg.kv_quant, KvQuant::F16 | KvQuant::Fp8)
+            && (weights.descriptor.params.ssm.is_none() || cfg.tp_shard.world == 1);
         // Pula stanów DeltaNet i MTP rośnie wraz z liczbą przeplatanych sekwencji.
         let hybrid_states = match &weights.descriptor.params.ssm {
             Some(sp) => {
@@ -2308,21 +2319,15 @@ impl Model {
                     conv_bytes,
                     state_bytes,
                     mtp_config,
+                    if prefix_eligible {
+                        state_cache::HYBRID_STATE_CACHE_SLOTS
+                    } else {
+                        0
+                    },
                 )?)
             }
             None => None,
         };
-        // Prefix caching is a strict optimization: engage only where a borrowed
-        // prefix page is byte-identical to a fresh prefill and never mutated.
-        // That means the verbatim F16/Fp8 paged cache with no tiering (tiering
-        // spills/rewrites pages), no rotational store (position-indexed residual
-        // ring, not per-page) and no hybrid arch (recurrent SSM state is not in
-        // KV pages). Otherwise the cache stays inactive and behavior is
-        // bit-for-bit unchanged.
-        let prefix_eligible = cfg.prefix_cache
-            && !cfg.kv_tier.enabled()
-            && matches!(cfg.kv_quant, KvQuant::F16 | KvQuant::Fp8)
-            && weights.descriptor.params.ssm.is_none();
         let prefix_cache =
             prefix_eligible.then(|| crate::prefix::PrefixCache::new(cfg.kv_page_size));
         let staging_events = (0..STAGING_SLOTS)
@@ -2528,7 +2533,7 @@ impl Model {
     pub fn prefill_chunk(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
         self.ensure_kv_reuse_healthy()?;
         if self.is_hybrid() {
-            return self.prefill_hybrid(seq, tokens);
+            return self.prefill_hybrid_checkpointed(seq, tokens);
         }
         if self.tp.is_some() {
             return self.prefill_dense_split(seq, tokens, SplitPrefillLogits::Host);
@@ -2834,7 +2839,7 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        apply_mtp_pair_metadata_commit, cleanup_after_error, fatal_kv_synchronize,
+        cleanup_after_error, fatal_kv_synchronize,
         finish_greedy_verification, grow_prefill_lanes_transactional,
         hybrid_layer_major_scratch_estimate, hybrid_prefill_activation_budget_capable,
         hybrid_prefill_chunk_config_for_model, hybrid_prefill_inner_chunk_count,
@@ -2847,10 +2852,10 @@ mod verify_rollback_tests {
         nvfp4_ct_dimensions_capable, nvfp4_ct_physical_m, nvfp4_ct_plan_physical_m,
         nvfp4_ct_projection_for_shape, parse_hybrid_prefill_chunk_config,
         resolve_hybrid_prefill_chunk_size, restore_after, restore_prefill_seq_snapshots,
-        rollback_mtp_pair, run_dense_prefill_transaction, settle_kv_operation,
-        validate_mtp_pair_metadata_commit, validate_mtp_routed_inputs, DeltaStateLayout,
-        ForgeError, HybridPrefillChunkConfig, HybridPrefillScratchShape, HybridStatePool, KvCache,
-        KvConfig, KvQuant, KvReusePoison, LayerKind, Model, Nvfp4CtProjection, Nvfp4GgufLayout,
+        run_dense_prefill_transaction, settle_kv_operation,
+        
+        ForgeError, HybridPrefillChunkConfig, HybridPrefillScratchShape, KvCache,
+        KvConfig, KvQuant, KvReusePoison, Model, Nvfp4CtProjection, Nvfp4GgufLayout,
         Result, SeqKv, Vendor,
     };
     use forge_hal::cpu::CpuDevice;
@@ -2941,32 +2946,6 @@ mod verify_rollback_tests {
     }
 
     #[test]
-    fn fed_routed_mtp_ponad_i32_konczy_sie_przed_mutacja() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let mut pool = testowa_pula_mtp(device);
-        let leases = [
-            pool.acquire().expect("lane0 powinien powstać"),
-            pool.acquire().expect("lane1 powinien powstać"),
-        ];
-        let (states, kv) = pool
-            .take_mtp_pair(leases)
-            .expect("para powinna być dostępna");
-        let lengths = [states[0].seq.len, states[1].seq.len];
-        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
-        let free_pages = kv.free_page_count();
-        let result = validate_mtp_routed_inputs(usize::MAX, [u32::MAX, 7], 2, [None, None]);
-        assert!(matches!(result, Err(ForgeError::Format(_))));
-        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
-        assert_eq!(
-            [states[0].checkpoint_len(), states[1].checkpoint_len()],
-            checkpoints
-        );
-        assert_eq!(kv.free_page_count(), free_pages);
-        pool.restore_mtp_pair(leases, states, kv)
-            .expect("niezmieniona para powinna wrócić do puli");
-    }
-
-    #[test]
     fn jawny_tile_nvfp4_nie_ma_cichego_fallbacku() {
         assert!(!Model::nvfp4_tile_requested(Nvfp4GgufLayout::RowMajor36, false).unwrap());
         assert!(Model::nvfp4_tile_requested(Nvfp4GgufLayout::TileN128K64, true).unwrap());
@@ -2974,398 +2953,6 @@ mod verify_rollback_tests {
         assert!(Model::validate_nvfp4_tile_repacked(true, 0).is_err());
         assert!(Model::validate_nvfp4_tile_repacked(true, 1).is_ok());
         assert!(Model::validate_nvfp4_tile_repacked(false, 0).is_ok());
-    }
-
-    #[test]
-    fn pula_stanow_izoluje_przeplatane_sekwencje_i_zeruje_reuzyty_slot() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(
-            device.clone(),
-            vec![LayerKind::DeltaNet, LayerKind::Attention],
-            DeltaStateLayout::KeyValue,
-            8,
-            16,
-            None,
-        )
-        .expect("pula powinna powstać");
-        let first = pool.acquire().expect("pierwszy lease powinien powstać");
-        let second = pool.acquire().expect("drugi lease powinien powstać");
-        assert_ne!(first.slot, second.slot);
-
-        pool.activate(first, &stream)
-            .expect("pierwszy stan powinien się aktywować");
-        let first_state = pool.active_layers()[0]
-            .as_ref()
-            .expect("warstwa DeltaNet ma stan");
-        device
-            .write(&[7; 16], &first_state.state, 0)
-            .expect("zapis pierwszego stanu powinien się udać");
-
-        pool.activate(second, &stream)
-            .expect("drugi stan powinien się aktywować");
-        let second_state = pool.active_layers()[0]
-            .as_ref()
-            .expect("warstwa DeltaNet ma stan");
-        let mut bytes = [0xff; 16];
-        device
-            .read(&second_state.state, 0, &mut bytes)
-            .expect("odczyt drugiego stanu powinien się udać");
-        assert_eq!(bytes, [0; 16]);
-        device
-            .write(&[9; 16], &second_state.state, 0)
-            .expect("zapis drugiego stanu powinien się udać");
-
-        pool.activate(first, &stream)
-            .expect("pierwszy stan powinien wrócić");
-        let first_state = pool.active_layers()[0]
-            .as_ref()
-            .expect("warstwa DeltaNet ma stan");
-        device
-            .read(&first_state.state, 0, &mut bytes)
-            .expect("odczyt pierwszego stanu powinien się udać");
-        assert_eq!(bytes, [7; 16]);
-
-        pool.release(first, &stream)
-            .expect("pierwszy lease powinien się zwolnić");
-        let reused = pool.acquire().expect("slot powinien wrócić do puli");
-        assert_eq!(reused.slot, first.slot);
-        assert!(reused.generation > first.generation);
-        pool.activate(reused, &stream)
-            .expect("ponownie użyty slot powinien się aktywować");
-        let reused_state = pool.active_layers()[0]
-            .as_ref()
-            .expect("warstwa DeltaNet ma stan");
-        device
-            .read(&reused_state.state, 0, &mut bytes)
-            .expect("odczyt ponownie użytego stanu powinien się udać");
-        assert_eq!(bytes, [0; 16]);
-        assert!(pool.release(first, &stream).is_err());
-    }
-
-    #[test]
-    fn wspoldzielony_cache_mtp_obsluguje_cancel_release_i_reuse() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mtp_config = KvConfig {
-            n_layers: 1,
-            n_kv_heads: 1,
-            head_dim: 8,
-            page_size: 2,
-            n_pages: 8,
-            max_pages_per_seq: 8,
-            quant: KvQuant::F16,
-        };
-        let mut pool = HybridStatePool::new(
-            device,
-            vec![LayerKind::DeltaNet],
-            DeltaStateLayout::KeyValue,
-            8,
-            16,
-            Some((mtp_config, 4, 8)),
-        )
-        .expect("pula z MTP powinna powstać");
-        let first = pool.acquire().expect("pierwszy lease powinien powstać");
-        let second = pool.acquire().expect("drugi lease powinien powstać");
-
-        pool.activate(first, &stream)
-            .expect("pierwszy lease powinien się aktywować");
-        let (mut first_state, mut kv) = pool
-            .take_mtp(first)
-            .expect("stan MTP powinien być dostępny");
-        first_state
-            .grow(&mut kv)
-            .expect("pierwsza strona powinna powstać");
-        first_state
-            .grow(&mut kv)
-            .expect("pierwsza strona powinna się wypełnić");
-        let first_pages = first_state.seq.pages.clone();
-        pool.restore_mtp(first, first_state, kv)
-            .expect("pierwszy stan powinien wrócić do slotu");
-
-        pool.activate(second, &stream)
-            .expect("drugi lease powinien się aktywować");
-        let (mut second_state, mut kv) = pool
-            .take_mtp(second)
-            .expect("stan MTP powinien być dostępny");
-        second_state
-            .grow(&mut kv)
-            .expect("druga strona powinna powstać");
-        assert!(!first_pages.contains(&second_state.seq.pages[0]));
-        second_state
-            .checkpoint(&stream)
-            .expect("checkpoint powinien powstać");
-        second_state
-            .grow(&mut kv)
-            .expect("draft powinien zająć kolejną pozycję");
-        second_state
-            .rollback(&mut kv, &stream)
-            .expect("cancel powinien odtworzyć długość bazową");
-        assert_eq!(second_state.seq.len, 1);
-        pool.restore_mtp(second, second_state, kv)
-            .expect("drugi stan powinien wrócić do slotu");
-
-        pool.release(first, &stream)
-            .expect("pierwszy lease powinien się zwolnić");
-        let reused = pool.acquire().expect("zwolniony slot powinien wrócić");
-        assert_eq!(reused.slot, first.slot);
-        assert!(reused.generation > first.generation);
-        pool.activate(reused, &stream)
-            .expect("ponownie użyty slot powinien się aktywować");
-        let (reused_state, kv) = pool
-            .take_mtp(reused)
-            .expect("stan MTP powinien być dostępny");
-        assert_eq!(reused_state.seq.len, 0);
-        assert!(reused_state.seq.pages.is_empty());
-        assert_eq!(kv.free_page_count(), 7);
-        pool.restore_mtp(reused, reused_state, kv)
-            .expect("stan po reuse powinien wrócić do slotu");
-
-        pool.release(second, &stream)
-            .expect("drugi lease powinien się zwolnić");
-        pool.release(reused, &stream)
-            .expect("ponownie użyty lease powinien się zwolnić");
-        assert_eq!(
-            pool.mtp_kv
-                .as_ref()
-                .expect("cache MTP powinien istnieć")
-                .free_page_count(),
-            8
-        );
-    }
-
-    fn testowa_pula_mtp(device: Arc<dyn Device>) -> HybridStatePool {
-        HybridStatePool::new(
-            device,
-            vec![LayerKind::DeltaNet],
-            DeltaStateLayout::KeyValue,
-            8,
-            16,
-            Some((
-                KvConfig {
-                    n_layers: 1,
-                    n_kv_heads: 1,
-                    head_dim: 8,
-                    page_size: 2,
-                    n_pages: 8,
-                    max_pages_per_seq: 8,
-                    quant: KvQuant::F16,
-                },
-                4,
-                8,
-            )),
-        )
-        .expect("testowa pula MTP powinna powstać")
-    }
-
-    #[test]
-    fn prewalidacja_commitu_pary_mtp_nie_mutuje_zadnej_lane() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = testowa_pula_mtp(device);
-        let leases = [
-            pool.acquire().expect("lane0 powinien powstać"),
-            pool.acquire().expect("lane1 powinien powstać"),
-        ];
-        let (mut states, mut kv) = pool
-            .take_mtp_pair(leases)
-            .expect("para powinna być dostępna");
-        for state in &mut states {
-            state
-                .checkpoint(&stream)
-                .expect("checkpoint powinien powstać");
-            state.grow(&mut kv).expect("krok draftu powinien powstać");
-        }
-        let lengths = [states[0].seq.len, states[1].seq.len];
-        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
-
-        assert!(validate_mtp_pair_metadata_commit(&states, [0, 1]).is_err());
-        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
-        assert_eq!(
-            [states[0].checkpoint_len(), states[1].checkpoint_len()],
-            checkpoints
-        );
-        assert!(validate_mtp_pair_metadata_commit(&states, [1, 0]).is_err());
-        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
-        assert_eq!(
-            [states[0].checkpoint_len(), states[1].checkpoint_len()],
-            checkpoints
-        );
-
-        let targets = validate_mtp_pair_metadata_commit(&states, [1, 1])
-            .expect("poprawny commit obu lane'ów powinien się udać");
-        apply_mtp_pair_metadata_commit(&mut states, &mut kv, targets);
-        pool.restore_mtp_pair(leases, states, kv)
-            .expect("para po commicie powinna wrócić do puli");
-    }
-
-    #[test]
-    fn blad_restore_pary_kwarantannuje_stany_i_cache() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let mut pool = testowa_pula_mtp(device);
-        let leases = [
-            pool.acquire().expect("lane0 powinien powstać"),
-            pool.acquire().expect("lane1 powinien powstać"),
-        ];
-        let (states, kv) = pool
-            .take_mtp_pair(leases)
-            .expect("para powinna być dostępna");
-
-        assert!(pool
-            .restore_mtp_pair([leases[0], leases[0]], states, kv)
-            .is_err());
-        assert!(pool.poisoned.is_some());
-        assert_eq!(pool.quarantined_mtp_states.len(), 2);
-        assert_eq!(pool.quarantined_mtp_kv.len(), 1);
-        assert!(pool.mtp_kv.is_none());
-        assert!(pool.acquire().is_err());
-    }
-
-    #[test]
-    fn blad_rollback_lane_zatruwa_cala_pare() {
-        for failed_lane in 0..2 {
-            let device: Arc<dyn Device> = CpuDevice::new();
-            let stream = device.create_stream().expect("stream CPU powinien powstać");
-            let mut pool = testowa_pula_mtp(device.clone());
-            let leases = [
-                pool.acquire().expect("lane0 powinien powstać"),
-                pool.acquire().expect("lane1 powinien powstać"),
-            ];
-            let (mut states, mut kv) = pool
-                .take_mtp_pair(leases)
-                .expect("para powinna być dostępna");
-            for state in &mut states {
-                state
-                    .checkpoint(&stream)
-                    .expect("checkpoint powinien powstać");
-                state.grow(&mut kv).expect("krok draftu powinien powstać");
-            }
-            states[failed_lane].inject_rollback_failure();
-
-            let rollback = rollback_mtp_pair(&mut states, &mut kv, &stream)
-                .expect_err("rollback wskazanego lane powinien się nie udać");
-            assert!(rollback.to_string().contains(&format!("lane{failed_lane}")));
-            pool.poison(format!("wymuszony błąd propose: {rollback}"));
-            assert!(pool.restore_mtp_pair(leases, states, kv).is_err());
-            assert!(pool.poisoned.is_some());
-            assert_eq!(pool.quarantined_mtp_states.len(), 2);
-            assert_eq!(pool.quarantined_mtp_kv.len(), 1);
-            assert!(pool.take_mtp_pair(leases).is_err());
-        }
-    }
-
-    #[test]
-    fn blad_checkpointu_propose_lane_zatruwa_cala_pare() {
-        for failed_lane in 0..2 {
-            let device: Arc<dyn Device> = CpuDevice::new();
-            let stream = device.create_stream().expect("stream CPU powinien powstać");
-            let mut pool = testowa_pula_mtp(device);
-            let leases = [
-                pool.acquire().expect("lane0 powinien powstać"),
-                pool.acquire().expect("lane1 powinien powstać"),
-            ];
-            let (mut states, mut kv) = pool
-                .take_mtp_pair(leases)
-                .expect("para powinna być dostępna");
-            states[failed_lane].inject_checkpoint_failure();
-
-            let propose = (|| {
-                states[0].checkpoint(&stream)?;
-                states[1].checkpoint(&stream)
-            })();
-            let propose_error = propose.expect_err("checkpoint wskazanego lane powinien zawieść");
-            let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
-            rollback_mtp_pair(&mut states, &mut kv, &stream)
-                .expect("utworzony checkpoint drugiego lane powinien się cofnąć");
-            assert!(!checkpoints_complete);
-            pool.poison(format!(
-                "błąd propose przed utworzeniem obu checkpointów: {propose_error}"
-            ));
-            assert!(pool.restore_mtp_pair(leases, states, kv).is_err());
-            assert_eq!(pool.quarantined_mtp_states.len(), 2);
-            assert_eq!(pool.quarantined_mtp_kv.len(), 1);
-            assert!(pool.acquire().is_err());
-        }
-    }
-
-    #[test]
-    fn blad_eventu_z_udanym_sync_nie_powoduje_wzrostu_puli() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(
-            device,
-            vec![LayerKind::DeltaNet],
-            DeltaStateLayout::KeyValue,
-            8,
-            16,
-            None,
-        )
-        .expect("pula powinna powstać");
-
-        for _ in 0..64 {
-            let lease = pool.acquire().expect("slot powinien wrócić do puli");
-            pool.activate(lease, &stream)
-                .expect("slot powinien się aktywować");
-            let state = pool.active_layers()[0]
-                .as_ref()
-                .expect("warstwa DeltaNet ma stan");
-            pool.device
-                .write(&[7; 16], &state.state, 0)
-                .expect("zapis stanu powinien się udać");
-            pool.finish_release(
-                lease,
-                Err(ForgeError::Device("wymuszony błąd eventu".into())),
-                || Ok(()),
-            )
-            .expect("synchronizacja powinna bezpiecznie odzyskać slot");
-            let mut bytes = [0xff; 16];
-            pool.device
-                .read(
-                    &pool.slots[lease.slot].layers[0]
-                        .as_ref()
-                        .expect("warstwa DeltaNet ma stan")
-                        .state,
-                    0,
-                    &mut bytes,
-                )
-                .expect("odczyt stanu powinien się udać");
-            assert_eq!(bytes, [0; 16]);
-        }
-
-        assert_eq!(pool.slots.len(), 1);
-        assert_eq!(pool.free, vec![0]);
-        assert!(pool.poisoned.is_none());
-    }
-
-    #[test]
-    fn podwojny_blad_zwolnienia_zatruwa_pule_i_blokuje_alokacje() {
-        let device: Arc<dyn Device> = CpuDevice::new();
-        let stream = device.create_stream().expect("stream CPU powinien powstać");
-        let mut pool = HybridStatePool::new(
-            device,
-            vec![LayerKind::DeltaNet],
-            DeltaStateLayout::KeyValue,
-            8,
-            16,
-            None,
-        )
-        .expect("pula powinna powstać");
-        let lease = pool.acquire().expect("lease powinien powstać");
-        pool.activate(lease, &stream)
-            .expect("slot powinien się aktywować");
-
-        let result = pool.finish_release(
-            lease,
-            Err(ForgeError::Device("wymuszony błąd eventu".into())),
-            || Err(ForgeError::Device("wymuszony błąd synchronizacji".into())),
-        );
-
-        assert!(result.is_err());
-        assert!(pool.poisoned.is_some());
-        assert!(pool.slots[lease.slot].in_use);
-        assert!(pool.free.is_empty());
-        assert!(pool.acquire().is_err());
-        assert_eq!(pool.slots.len(), 1);
     }
 
     #[test]

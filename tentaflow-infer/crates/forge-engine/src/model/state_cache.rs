@@ -8,6 +8,36 @@
 // ma proporcji do strojenia: rosnaca wspolbieznosc odbiera sloty cache'owi.
 use super::*;
 
+/// Sloty, jakie pula odda pod checkpointy prefiksu — ponad te, które trzymają
+/// żywe sekwencje.
+///
+/// To jest CAŁY budżet cache'u i celowo nie jest pokrętłem. Podział pamięci
+/// między stan a strony nie jest tu proporcją do zgadnięcia: sloty żywych
+/// sekwencji i sloty checkpointów pochodzą z jednej puli, więc rosnąca
+/// współbieżność sama odbiera je cache'owi, a `--prefix-cache off` wyłącza go
+/// w całości.
+pub(crate) const HYBRID_STATE_CACHE_SLOTS: usize = 8;
+
+/// Co ile tokenów prefill zatrzymuje się, żeby utrwalić stan.
+///
+/// Checkpoint na końcu promptu obsługuje POWTÓRZENIE tego promptu — kolejną turę
+/// rozmowy. Nie obsługuje żądania, które dzieli prompt systemowy i kończy się
+/// innym pytaniem, bo tam rozjazd wypada PRZED tym checkpointem. Dlatego stoją
+/// też pośrednie, a ich cena to krótsze chunki prefillu.
+pub(crate) const HYBRID_STATE_CHECKPOINT_STRIDE: usize = 512;
+
+/// Ile tokenów przepuścić, zanim sekwencja stojąca na `at` dojdzie do najbliższej
+/// pozycji wartej utrwalenia.
+fn hybrid_checkpoint_step(at: usize, target: usize, remaining: usize) -> usize {
+    let stride = HYBRID_STATE_CHECKPOINT_STRIDE;
+    let next_stride = (at / stride + 1) * stride;
+    let boundary = match target > at {
+        true => next_stride.min(target),
+        false => next_stride,
+    };
+    remaining.min(boundary - at).max(1)
+}
+
 /// One DeltaNet layer's resident recurrent state for the active sequence.
 pub(crate) struct SsmState {
     /// Causal conv window `[conv_dim, d_conv-1]` f16 (oldest sample first).
@@ -42,6 +72,10 @@ pub(crate) struct HybridStatePool {
     mtp_shape: Option<(usize, usize)>,
     pub(crate) quarantined_mtp_states: Vec<MtpDraftState>,
     pub(crate) quarantined_mtp_kv: Vec<KvCache>,
+    /// Sloty, jakie pula odda pod checkpointy prefiksu. Zero = cache wyłączony.
+    cache_limit: usize,
+    /// Sloty trzymane teraz w tej roli — ani wolne, ani wydzierżawione.
+    cached: usize,
 }
 
 impl HybridStatePool {
@@ -52,6 +86,7 @@ impl HybridStatePool {
         conv_bytes: usize,
         state_bytes: usize,
         mtp_config: Option<(KvConfig, usize, usize)>,
+        cache_limit: usize,
     ) -> Result<Self> {
         let zero_conv = device.alloc(conv_bytes, MemKind::PinnedHost, Pool::Activations)?;
         let zero_state = device.alloc(state_bytes, MemKind::PinnedHost, Pool::Activations)?;
@@ -90,6 +125,8 @@ impl HybridStatePool {
             mtp_shape,
             quarantined_mtp_states: Vec::new(),
             quarantined_mtp_kv: Vec::new(),
+            cache_limit,
+            cached: 0,
         };
         pool.allocate_slot()?;
         Ok(pool)
@@ -146,25 +183,20 @@ impl HybridStatePool {
 
     pub(crate) fn ensure_capacity(&mut self, slots: usize) -> Result<()> {
         self.ensure_healthy()?;
-        let additional = slots.saturating_sub(self.slots.len());
+        // Sloty trzymane pod checkpointy nie liczą się do pojemności żywych
+        // sekwencji — preflight ma zapewnić miejsce na `slots` lease'ów, a nie
+        // na `slots` slotów w ogóle.
+        let additional = slots.saturating_sub(self.slots.len() - self.cached);
         if additional == 0 {
             return Ok(());
         }
-        let delta_layers = self
-            .layer_kinds
-            .iter()
-            .filter(|kind| matches!(kind, LayerKind::DeltaNet))
-            .count();
+        let weights_per_slot = self.slot_weight_bytes()?;
         let reserve = |bytes: usize| {
             bytes
                 .max(1)
                 .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
                 .ok_or_else(|| ForgeError::Scheduler("przepełnienie wyrównania alokacji".into()))
         };
-        let weights_per_slot = reserve(self.conv_bytes)?
-            .checked_add(reserve(self.state_bytes)?)
-            .and_then(|bytes| bytes.checked_mul(delta_layers))
-            .ok_or_else(|| ForgeError::Scheduler("przepełnienie rozmiaru slotu SSM".into()))?;
         let activations_per_slot = match (self.mtp_shape, self.mtp_kv.as_ref()) {
             (Some((hidden, vocab)), Some(kv)) => {
                 let hidden_bytes = hidden.checked_mul(2).ok_or_else(|| {
@@ -233,7 +265,7 @@ impl HybridStatePool {
         }
         let first = self.slots.len();
         self.slots.extend(allocated);
-        self.free.extend(first..slots);
+        self.free.extend(first..first + additional);
         Ok(())
     }
 
@@ -574,5 +606,698 @@ impl HybridStatePool {
             .filter_map(|slot| slot.mtp.as_ref())
             .map(MtpDraftState::host_embedding_gathers)
             .sum()
+    }
+}
+
+impl HybridStatePool {
+    /// Bajty puli `Weights`, jakie zajmuje jeden slot stanu.
+    fn slot_weight_bytes(&self) -> Result<usize> {
+        let delta_layers = self
+            .layer_kinds
+            .iter()
+            .filter(|kind| matches!(kind, LayerKind::DeltaNet))
+            .count();
+        let reserve = |bytes: usize| {
+            bytes
+                .max(1)
+                .checked_next_multiple_of(DEVICE_ALLOC_ALIGN)
+                .ok_or_else(|| ForgeError::Scheduler("przepełnienie wyrównania alokacji".into()))
+        };
+        reserve(self.conv_bytes)?
+            .checked_add(reserve(self.state_bytes)?)
+            .and_then(|bytes| bytes.checked_mul(delta_layers))
+            .ok_or_else(|| ForgeError::Scheduler("przepełnienie rozmiaru slotu SSM".into()))
+    }
+
+    /// Zajmuje slot pod checkpoint prefiksu.
+    ///
+    /// `Ok(None)` znaczy „nie teraz": limit wyczerpany albo pula `Weights` nie
+    /// ma miejsca na kolejny slot. Cache jest optymalizacją, więc brak slotu
+    /// zostawia sekwencję na zwykłej ścieżce zamiast przewracać żądanie.
+    pub(crate) fn take_cache_slot(&mut self) -> Result<Option<usize>> {
+        self.ensure_healthy()?;
+        if self.cached >= self.cache_limit {
+            return Ok(None);
+        }
+        let slot = match self.free.pop() {
+            Some(slot) => slot,
+            None => {
+                let need = self.slot_weight_bytes()?;
+                if self
+                    .device
+                    .pool_available(Pool::Weights)
+                    .is_some_and(|available| need > available)
+                {
+                    return Ok(None);
+                }
+                let slot = self.allocate_slot()?;
+                self.free
+                    .pop()
+                    .expect("świeży slot trafia na listę wolnych");
+                slot
+            }
+        };
+        self.slots[slot].in_use = true;
+        self.cached += 1;
+        Ok(Some(slot))
+    }
+
+    /// Oddaje slot checkpointu z powrotem na listę wolnych.
+    pub(crate) fn put_cache_slot(&mut self, slot: usize) {
+        debug_assert!(self.cached > 0, "zwrot slotu bez pobrania");
+        self.cached = self.cached.saturating_sub(1);
+        self.slots[slot].in_use = false;
+        self.free.push(slot);
+    }
+
+    /// Kopiuje stan wydzierżawionego slotu do slotu checkpointu (D2D).
+    pub(crate) fn snapshot(
+        &mut self,
+        lease: HybridStateLease,
+        slot: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.validate(lease)?;
+        self.await_slot(slot, stream)?;
+        self.copy_layers(lease.slot, slot, stream)
+    }
+
+    /// Kopiuje checkpoint w stan wydzierżawionego slotu (D2D).
+    pub(crate) fn restore(
+        &mut self,
+        lease: HybridStateLease,
+        slot: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        self.validate(lease)?;
+        self.await_slot(slot, stream)?;
+        self.copy_layers(slot, lease.slot, stream)?;
+        self.slots[lease.slot].initialized_generation = lease.generation;
+        Ok(())
+    }
+
+    /// Czeka na pracę zakolejkowaną przez POPRZEDNIEGO właściciela slotu.
+    /// Slot wraca na listę wolnych z zapisanym eventem, a checkpoint pisze do
+    /// niego z innej generacji niż ta, która go zwolniła.
+    fn await_slot(&mut self, slot: usize, stream: &Stream) -> Result<()> {
+        let held = self
+            .slots
+            .get_mut(slot)
+            .ok_or_else(|| ForgeError::Scheduler("slot checkpointu poza zakresem".into()))?;
+        if held.ready_recorded {
+            self.device.wait_event(stream, &held.ready)?;
+            self.slots[slot].ready_recorded = false;
+        }
+        Ok(())
+    }
+
+    fn copy_layers(&self, from: usize, to: usize, stream: &Stream) -> Result<()> {
+        if from == to {
+            return Err(ForgeError::Scheduler(
+                "kopia stanu DeltaNet w ten sam slot".into(),
+            ));
+        }
+        for (src, dst) in self.slots[from]
+            .layers
+            .iter()
+            .zip(self.slots[to].layers.iter())
+        {
+            let (Some(src), Some(dst)) = (src, dst) else {
+                continue;
+            };
+            self.device
+                .copy(&src.conv, 0, &dst.conv, 0, self.conv_bytes, stream)?;
+            self.device
+                .copy(&src.state, 0, &dst.state, 0, self.state_bytes, stream)?;
+        }
+        Ok(())
+    }
+}
+
+impl Model {
+    /// Prefill hybrydy, który po drodze utrwala stan rekurencyjny.
+    ///
+    /// Prefiks wspoldzielony jest całostronicowy, więc checkpoint musi stanąć
+    /// dokładnie na granicy strony — inaczej strony i stan opisywałyby dwie
+    /// różne pozycje. Chunk, który taką granicę przekracza, jest w niej dzielony.
+    pub(crate) fn prefill_hybrid_checkpointed(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+    ) -> Result<Vec<f32>> {
+        if self.prefix_cache.is_none() {
+            return self.prefill_hybrid(seq, tokens);
+        }
+        let mut logits = Vec::new();
+        let mut done = 0;
+        while done < tokens.len() {
+            let take = hybrid_checkpoint_step(seq.len, seq.state_target, tokens.len() - done);
+            logits = self.prefill_hybrid_recorded(seq, &tokens[done..done + take])?;
+            done += take;
+            self.snapshot_hybrid_state(seq)?;
+        }
+        Ok(logits)
+    }
+
+    /// Prefill jednego chunka z zapisem tokenów, na których stoi darowizna.
+    ///
+    /// Zapis idzie PO przebiegu, nie przed: rollback layer-major przywraca
+    /// `tokens`/`prefilled_len` do wartości sprzed chunka, a te wartości bierze
+    /// przy wejściu — dopisanie wcześniej zapisałoby tokeny, których nieudany
+    /// chunk nigdy nie policzył.
+    fn prefill_hybrid_recorded(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
+        let logits = self.prefill_hybrid(seq, tokens)?;
+        if seq.tokens.len() == seq.prefilled_len {
+            seq.prefilled_len += tokens.len();
+        }
+        seq.tokens.extend_from_slice(tokens);
+        Ok(logits)
+    }
+
+    /// Utrwala stan sekwencji, gdy stoi ona na granicy strony.
+    ///
+    /// Granularność jest ta, którą i tak wyznacza scheduler: kwant prefillu jest
+    /// wielokrotnością strony, więc każda granica chunka poza ostatnią wypada na
+    /// stronie za darmo. Jedyny wymuszony podział to ten na `state_target`, a
+    /// pośrednie checkpointy są tym, co pozwala pożyczyć wspólny prompt
+    /// systemowy pytaniu, które kończy się inaczej.
+    fn snapshot_hybrid_state(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let at = seq.len;
+        if at == 0 || at > seq.state_target || !at.is_multiple_of(self.kv.cfg.page_size) {
+            return Ok(());
+        }
+        if seq.state_checkpoints.iter().any(|&(pos, _)| pos == at) {
+            return Ok(());
+        }
+        let Some(lease) = seq.hybrid_state else {
+            return Ok(());
+        };
+        let mut reclaimed = None;
+        let pool = self
+            .hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów");
+        let mut slot = pool.take_cache_slot()?;
+        if slot.is_none() {
+            // Pula nie ma czym płacić, więc płaci najzimniejszy checkpoint
+            // drzewa. To jest cała „elastyczność" tego podziału: sloty żywych
+            // sekwencji i sloty cache'u pochodzą z jednego zbioru.
+            reclaimed = self
+                .prefix_cache
+                .as_mut()
+                .and_then(|pc| pc.evict_states(1).pop());
+        }
+        if let Some(free) = reclaimed {
+            let pool = self
+                .hybrid_states
+                .as_mut()
+                .expect("model hybrydowy ma pulę stanów");
+            pool.put_cache_slot(free);
+            slot = pool.take_cache_slot()?;
+        }
+        let Some(slot) = slot else {
+            return Ok(());
+        };
+        let stream = self.stream.clone();
+        let pool = self
+            .hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów");
+        if let Err(error) = pool.snapshot(lease, slot, &stream) {
+            pool.put_cache_slot(slot);
+            return Err(error);
+        }
+        seq.state_checkpoints.push((at, slot));
+        Ok(())
+    }
+
+    /// Wgrywa checkpoint pożyczony przy przyjęciu w stan tej sekwencji.
+    pub(crate) fn restore_hybrid_checkpoint(&mut self, seq: &mut SeqKv) -> Result<()> {
+        let (Some(lease), Some(slot)) = (seq.hybrid_state, seq.state_restore) else {
+            return Ok(());
+        };
+        let stream = self.stream.clone();
+        self.hybrid_states
+            .as_mut()
+            .expect("model hybrydowy ma pulę stanów")
+            .restore(lease, slot, &stream)?;
+        seq.state_restore = None;
+        Ok(())
+    }
+
+    /// Oddaje puli sloty, które drzewo właśnie zwolniło.
+    pub(crate) fn return_state_slots(&mut self, slots: Vec<usize>) {
+        if slots.is_empty() {
+            return;
+        }
+        let pool = self
+            .hybrid_states
+            .as_mut()
+            .expect("checkpointy istnieją tylko dla modelu hybrydowego");
+        for slot in slots {
+            pool.put_cache_slot(slot);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use forge_hal::cpu::CpuDevice;
+
+    #[test]
+    fn krok_prefillu_zatrzymuje_sie_na_kolejnym_checkpoincie() {
+        let stride = HYBRID_STATE_CHECKPOINT_STRIDE;
+        // Od zera do pierwszego stride'u, choćby chunk był dłuższy.
+        assert_eq!(hybrid_checkpoint_step(0, 4096, 4096), stride);
+        // Cel promptu wygrywa, gdy wypada wcześniej niż kolejny stride.
+        assert_eq!(hybrid_checkpoint_step(stride, stride + 96, 4096), 96);
+        // Za celem nie ma już czego dzielić — zostaje ogon strony.
+        assert_eq!(hybrid_checkpoint_step(stride + 96, stride + 96, 17), 17);
+        // Krok nigdy nie jest zerowy, nawet stojąc dokładnie na celu.
+        assert_eq!(hybrid_checkpoint_step(stride, stride, 3), 3);
+    }
+
+    #[test]
+    fn pula_stanow_izoluje_przeplatane_sekwencje_i_zeruje_reuzyty_slot() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(
+            device.clone(),
+            vec![LayerKind::DeltaNet, LayerKind::Attention],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+            0,
+        )
+        .expect("pula powinna powstać");
+        let first = pool.acquire().expect("pierwszy lease powinien powstać");
+        let second = pool.acquire().expect("drugi lease powinien powstać");
+        assert_ne!(first.slot, second.slot);
+
+        pool.activate(first, &stream)
+            .expect("pierwszy stan powinien się aktywować");
+        let first_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .write(&[7; 16], &first_state.state, 0)
+            .expect("zapis pierwszego stanu powinien się udać");
+
+        pool.activate(second, &stream)
+            .expect("drugi stan powinien się aktywować");
+        let second_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        let mut bytes = [0xff; 16];
+        device
+            .read(&second_state.state, 0, &mut bytes)
+            .expect("odczyt drugiego stanu powinien się udać");
+        assert_eq!(bytes, [0; 16]);
+        device
+            .write(&[9; 16], &second_state.state, 0)
+            .expect("zapis drugiego stanu powinien się udać");
+
+        pool.activate(first, &stream)
+            .expect("pierwszy stan powinien wrócić");
+        let first_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .read(&first_state.state, 0, &mut bytes)
+            .expect("odczyt pierwszego stanu powinien się udać");
+        assert_eq!(bytes, [7; 16]);
+
+        pool.release(first, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let reused = pool.acquire().expect("slot powinien wrócić do puli");
+        assert_eq!(reused.slot, first.slot);
+        assert!(reused.generation > first.generation);
+        pool.activate(reused, &stream)
+            .expect("ponownie użyty slot powinien się aktywować");
+        let reused_state = pool.active_layers()[0]
+            .as_ref()
+            .expect("warstwa DeltaNet ma stan");
+        device
+            .read(&reused_state.state, 0, &mut bytes)
+            .expect("odczyt ponownie użytego stanu powinien się udać");
+        assert_eq!(bytes, [0; 16]);
+        assert!(pool.release(first, &stream).is_err());
+    }
+
+    #[test]
+    fn wspoldzielony_cache_mtp_obsluguje_cancel_release_i_reuse() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mtp_config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 8,
+            page_size: 2,
+            n_pages: 8,
+            max_pages_per_seq: 8,
+            quant: KvQuant::F16,
+        };
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            Some((mtp_config, 4, 8)),
+            0,
+        )
+        .expect("pula z MTP powinna powstać");
+        let first = pool.acquire().expect("pierwszy lease powinien powstać");
+        let second = pool.acquire().expect("drugi lease powinien powstać");
+
+        pool.activate(first, &stream)
+            .expect("pierwszy lease powinien się aktywować");
+        let (mut first_state, mut kv) = pool
+            .take_mtp(first)
+            .expect("stan MTP powinien być dostępny");
+        first_state
+            .grow(&mut kv)
+            .expect("pierwsza strona powinna powstać");
+        first_state
+            .grow(&mut kv)
+            .expect("pierwsza strona powinna się wypełnić");
+        let first_pages = first_state.seq.pages.clone();
+        pool.restore_mtp(first, first_state, kv)
+            .expect("pierwszy stan powinien wrócić do slotu");
+
+        pool.activate(second, &stream)
+            .expect("drugi lease powinien się aktywować");
+        let (mut second_state, mut kv) = pool
+            .take_mtp(second)
+            .expect("stan MTP powinien być dostępny");
+        second_state
+            .grow(&mut kv)
+            .expect("druga strona powinna powstać");
+        assert!(!first_pages.contains(&second_state.seq.pages[0]));
+        second_state
+            .checkpoint(&stream)
+            .expect("checkpoint powinien powstać");
+        second_state
+            .grow(&mut kv)
+            .expect("draft powinien zająć kolejną pozycję");
+        second_state
+            .rollback(&mut kv, &stream)
+            .expect("cancel powinien odtworzyć długość bazową");
+        assert_eq!(second_state.seq.len, 1);
+        pool.restore_mtp(second, second_state, kv)
+            .expect("drugi stan powinien wrócić do slotu");
+
+        pool.release(first, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let reused = pool.acquire().expect("zwolniony slot powinien wrócić");
+        assert_eq!(reused.slot, first.slot);
+        assert!(reused.generation > first.generation);
+        pool.activate(reused, &stream)
+            .expect("ponownie użyty slot powinien się aktywować");
+        let (reused_state, kv) = pool
+            .take_mtp(reused)
+            .expect("stan MTP powinien być dostępny");
+        assert_eq!(reused_state.seq.len, 0);
+        assert!(reused_state.seq.pages.is_empty());
+        assert_eq!(kv.free_page_count(), 7);
+        pool.restore_mtp(reused, reused_state, kv)
+            .expect("stan po reuse powinien wrócić do slotu");
+
+        pool.release(second, &stream)
+            .expect("drugi lease powinien się zwolnić");
+        pool.release(reused, &stream)
+            .expect("ponownie użyty lease powinien się zwolnić");
+        assert_eq!(
+            pool.mtp_kv
+                .as_ref()
+                .expect("cache MTP powinien istnieć")
+                .free_page_count(),
+            8
+        );
+    }
+
+    fn testowa_pula_mtp(device: Arc<dyn Device>) -> HybridStatePool {
+        HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            Some((
+                KvConfig {
+                    n_layers: 1,
+                    n_kv_heads: 1,
+                    head_dim: 8,
+                    page_size: 2,
+                    n_pages: 8,
+                    max_pages_per_seq: 8,
+                    quant: KvQuant::F16,
+                },
+                4,
+                8,
+            )),
+            0,
+        )
+        .expect("testowa pula MTP powinna powstać")
+    }
+
+    #[test]
+    fn prewalidacja_commitu_pary_mtp_nie_mutuje_zadnej_lane() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (mut states, mut kv) = pool
+            .take_mtp_pair(leases)
+            .expect("para powinna być dostępna");
+        for state in &mut states {
+            state
+                .checkpoint(&stream)
+                .expect("checkpoint powinien powstać");
+            state.grow(&mut kv).expect("krok draftu powinien powstać");
+        }
+        let lengths = [states[0].seq.len, states[1].seq.len];
+        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
+
+        assert!(validate_mtp_pair_metadata_commit(&states, [0, 1]).is_err());
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!(
+            [states[0].checkpoint_len(), states[1].checkpoint_len()],
+            checkpoints
+        );
+        assert!(validate_mtp_pair_metadata_commit(&states, [1, 0]).is_err());
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!(
+            [states[0].checkpoint_len(), states[1].checkpoint_len()],
+            checkpoints
+        );
+
+        let targets = validate_mtp_pair_metadata_commit(&states, [1, 1])
+            .expect("poprawny commit obu lane'ów powinien się udać");
+        apply_mtp_pair_metadata_commit(&mut states, &mut kv, targets);
+        pool.restore_mtp_pair(leases, states, kv)
+            .expect("para po commicie powinna wrócić do puli");
+    }
+
+    #[test]
+    fn blad_restore_pary_kwarantannuje_stany_i_cache() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (states, kv) = pool
+            .take_mtp_pair(leases)
+            .expect("para powinna być dostępna");
+
+        assert!(pool
+            .restore_mtp_pair([leases[0], leases[0]], states, kv)
+            .is_err());
+        assert!(pool.poisoned.is_some());
+        assert_eq!(pool.quarantined_mtp_states.len(), 2);
+        assert_eq!(pool.quarantined_mtp_kv.len(), 1);
+        assert!(pool.mtp_kv.is_none());
+        assert!(pool.acquire().is_err());
+    }
+
+    #[test]
+    fn blad_rollback_lane_zatruwa_cala_pare() {
+        for failed_lane in 0..2 {
+            let device: Arc<dyn Device> = CpuDevice::new();
+            let stream = device.create_stream().expect("stream CPU powinien powstać");
+            let mut pool = testowa_pula_mtp(device.clone());
+            let leases = [
+                pool.acquire().expect("lane0 powinien powstać"),
+                pool.acquire().expect("lane1 powinien powstać"),
+            ];
+            let (mut states, mut kv) = pool
+                .take_mtp_pair(leases)
+                .expect("para powinna być dostępna");
+            for state in &mut states {
+                state
+                    .checkpoint(&stream)
+                    .expect("checkpoint powinien powstać");
+                state.grow(&mut kv).expect("krok draftu powinien powstać");
+            }
+            states[failed_lane].inject_rollback_failure();
+
+            let rollback = rollback_mtp_pair(&mut states, &mut kv, &stream)
+                .expect_err("rollback wskazanego lane powinien się nie udać");
+            assert!(rollback.to_string().contains(&format!("lane{failed_lane}")));
+            pool.poison(format!("wymuszony błąd propose: {rollback}"));
+            assert!(pool.restore_mtp_pair(leases, states, kv).is_err());
+            assert!(pool.poisoned.is_some());
+            assert_eq!(pool.quarantined_mtp_states.len(), 2);
+            assert_eq!(pool.quarantined_mtp_kv.len(), 1);
+            assert!(pool.take_mtp_pair(leases).is_err());
+        }
+    }
+
+    #[test]
+    fn blad_checkpointu_propose_lane_zatruwa_cala_pare() {
+        for failed_lane in 0..2 {
+            let device: Arc<dyn Device> = CpuDevice::new();
+            let stream = device.create_stream().expect("stream CPU powinien powstać");
+            let mut pool = testowa_pula_mtp(device);
+            let leases = [
+                pool.acquire().expect("lane0 powinien powstać"),
+                pool.acquire().expect("lane1 powinien powstać"),
+            ];
+            let (mut states, mut kv) = pool
+                .take_mtp_pair(leases)
+                .expect("para powinna być dostępna");
+            states[failed_lane].inject_checkpoint_failure();
+
+            let propose = (|| {
+                states[0].checkpoint(&stream)?;
+                states[1].checkpoint(&stream)
+            })();
+            let propose_error = propose.expect_err("checkpoint wskazanego lane powinien zawieść");
+            let checkpoints_complete = states.iter().all(|state| state.checkpoint_len().is_some());
+            rollback_mtp_pair(&mut states, &mut kv, &stream)
+                .expect("utworzony checkpoint drugiego lane powinien się cofnąć");
+            assert!(!checkpoints_complete);
+            pool.poison(format!(
+                "błąd propose przed utworzeniem obu checkpointów: {propose_error}"
+            ));
+            assert!(pool.restore_mtp_pair(leases, states, kv).is_err());
+            assert_eq!(pool.quarantined_mtp_states.len(), 2);
+            assert_eq!(pool.quarantined_mtp_kv.len(), 1);
+            assert!(pool.acquire().is_err());
+        }
+    }
+
+    #[test]
+    fn blad_eventu_z_udanym_sync_nie_powoduje_wzrostu_puli() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+            0,
+        )
+        .expect("pula powinna powstać");
+
+        for _ in 0..64 {
+            let lease = pool.acquire().expect("slot powinien wrócić do puli");
+            pool.activate(lease, &stream)
+                .expect("slot powinien się aktywować");
+            let state = pool.active_layers()[0]
+                .as_ref()
+                .expect("warstwa DeltaNet ma stan");
+            pool.device
+                .write(&[7; 16], &state.state, 0)
+                .expect("zapis stanu powinien się udać");
+            pool.finish_release(
+                lease,
+                Err(ForgeError::Device("wymuszony błąd eventu".into())),
+                || Ok(()),
+            )
+            .expect("synchronizacja powinna bezpiecznie odzyskać slot");
+            let mut bytes = [0xff; 16];
+            pool.device
+                .read(
+                    &pool.slots[lease.slot].layers[0]
+                        .as_ref()
+                        .expect("warstwa DeltaNet ma stan")
+                        .state,
+                    0,
+                    &mut bytes,
+                )
+                .expect("odczyt stanu powinien się udać");
+            assert_eq!(bytes, [0; 16]);
+        }
+
+        assert_eq!(pool.slots.len(), 1);
+        assert_eq!(pool.free, vec![0]);
+        assert!(pool.poisoned.is_none());
+    }
+
+    #[test]
+    fn podwojny_blad_zwolnienia_zatruwa_pule_i_blokuje_alokacje() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut pool = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+            0,
+        )
+        .expect("pula powinna powstać");
+        let lease = pool.acquire().expect("lease powinien powstać");
+        pool.activate(lease, &stream)
+            .expect("slot powinien się aktywować");
+
+        let result = pool.finish_release(
+            lease,
+            Err(ForgeError::Device("wymuszony błąd eventu".into())),
+            || Err(ForgeError::Device("wymuszony błąd synchronizacji".into())),
+        );
+
+        assert!(result.is_err());
+        assert!(pool.poisoned.is_some());
+        assert!(pool.slots[lease.slot].in_use);
+        assert!(pool.free.is_empty());
+        assert!(pool.acquire().is_err());
+        assert_eq!(pool.slots.len(), 1);
+    }
+
+    #[test]
+    fn fed_routed_mtp_ponad_i32_konczy_sie_przed_mutacja() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let mut pool = testowa_pula_mtp(device);
+        let leases = [
+            pool.acquire().expect("lane0 powinien powstać"),
+            pool.acquire().expect("lane1 powinien powstać"),
+        ];
+        let (states, kv) = pool
+            .take_mtp_pair(leases)
+            .expect("para powinna być dostępna");
+        let lengths = [states[0].seq.len, states[1].seq.len];
+        let checkpoints = [states[0].checkpoint_len(), states[1].checkpoint_len()];
+        let free_pages = kv.free_page_count();
+        let result = validate_mtp_routed_inputs(usize::MAX, [u32::MAX, 7], 2, [None, None]);
+        assert!(matches!(result, Err(ForgeError::Format(_))));
+        assert_eq!([states[0].seq.len, states[1].seq.len], lengths);
+        assert_eq!(
+            [states[0].checkpoint_len(), states[1].checkpoint_len()],
+            checkpoints
+        );
+        assert_eq!(kv.free_page_count(), free_pages);
+        pool.restore_mtp_pair(leases, states, kv)
+            .expect("niezmieniona para powinna wrócić do puli");
     }
 }

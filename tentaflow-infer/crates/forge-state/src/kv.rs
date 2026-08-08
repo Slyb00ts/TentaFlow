@@ -229,6 +229,16 @@ pub struct SeqKv {
     pub prefix_node: Option<crate::prefix::NodeId>,
     /// Slot stanu DeltaNet; `None` do pierwszego przebiegu modelu hybrydowego.
     pub hybrid_state: Option<HybridStateLease>,
+    /// Pozycja (wielokrotność strony), na której sekwencja hybrydowa utrwala
+    /// swój stan rekurencyjny, żeby zaprefillowany prefiks dał się pożyczyć.
+    /// 0 = nic do utrwalenia.
+    pub state_target: usize,
+    /// Checkpointy stanu jako `(pozycja w tokenach, slot)`, rosnąco, oddawane
+    /// drzewu przy zamknięciu sekwencji.
+    pub state_checkpoints: Vec<(usize, crate::prefix::StateSlot)>,
+    /// Checkpoint pożyczony przy przyjęciu, wgrywany w stan tej sekwencji przy
+    /// jej pierwszej aktywacji.
+    pub state_restore: Option<crate::prefix::StateSlot>,
 }
 
 impl SeqKv {
@@ -390,6 +400,9 @@ impl KvCache {
             shared_pages: 0,
             prefix_node: None,
             hybrid_state: None,
+            state_target: 0,
+            state_checkpoints: Vec::new(),
+            state_restore: None,
         }
     }
 
@@ -472,6 +485,7 @@ impl KvCache {
         seq.prefilled_len = 0;
         seq.shared_pages = 0;
         seq.prefix_node = None;
+        seq.state_target = 0;
     }
 
     pub fn free_page_count(&self) -> usize {

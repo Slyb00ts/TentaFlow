@@ -16,15 +16,14 @@ impl Model {
     /// nalezy do verifiera, ktory liczy logity dla T pozycji naraz batchowym
     /// headem. Zwiazanie tych dwoch rzeczy jednym warunkiem kosztowalo bardzo
     /// duzo: GGUF Q4_K_M ma glowe Q6_K (konwencja llama.cpp), wiec KAZDY taki
-    /// model hybrydowy schodzil na prefill token po tokenie — na dowolnej
-    /// karcie. Qwen3.6-27B Q4_K_M: 28,4 wobec 200,2 tok/s prefillu, przy
-    /// wyjsciu identycznym co do bajtu.
+    /// model hybrydowy schodzil na prefill token po tokenie. Qwen3.6-27B Q4_K_M:
+    /// 28,4 wobec 200,2 tok/s prefillu, przy wyjsciu identycznym co do bajtu.
     pub(crate) fn hybrid_batched_prefill_capable(&self) -> bool {
+        // Pozyczony prefiks znaczy tylko niezerowy `seq.len` — prefill dopisuje.
         self.is_hybrid()
             && self.weights.descriptor.params.head_dim == 256
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
-            && self.prefix_cache.is_none()
     }
 
     fn ensure_hybrid_prefill_b2_bufs(&mut self) -> Result<()> {
@@ -438,6 +437,7 @@ impl Model {
             && !self.weights.is_moe()
             && matches!(self.kv.cfg.quant, KvQuant::F16)
             && self.tier.is_none()
+            // Para B2 rolluje sie razem; z pozyczka niemierzona.
             && self.prefix_cache.is_none()
             && device_embedding
             && split_layout

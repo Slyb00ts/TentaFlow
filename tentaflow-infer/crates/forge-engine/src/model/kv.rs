@@ -103,7 +103,7 @@ impl Model {
     pub fn prefix_match_len(&self, prompt: &[u32]) -> usize {
         match &self.prefix_cache {
             Some(pc) if prompt.len() > self.kv.cfg.page_size => {
-                pc.match_len(prompt, prompt.len() - 1)
+                pc.match_len(prompt, prompt.len() - 1, self.is_hybrid())
             }
             _ => 0,
         }
@@ -116,19 +116,29 @@ impl Model {
     /// (`cache_read_tokens`). At least one token is always left to prefill.
     pub fn acquire_prefix(&mut self, seq: &mut SeqKv, prompt: &[u32]) -> usize {
         let ps = self.kv.cfg.page_size;
+        let hybrid = self.is_hybrid();
         let Some(pc) = self.prefix_cache.as_mut() else {
             return 0;
         };
         if prompt.len() <= ps {
             return 0;
         }
-        let (pages, node, shared) = pc.acquire(prompt, prompt.len() - 1);
+        // Recurrent state only ever stands for a whole number of pages, so the
+        // position this sequence will checkpoint at is fixed here, before a
+        // single token is prefilled — and it holds whether or not the borrow
+        // below finds anything.
+        if hybrid {
+            seq.state_target = prompt.len() / ps * ps;
+        }
+        let borrow = pc.acquire(prompt, prompt.len() - 1, hybrid);
+        let shared = borrow.tokens;
         if shared == 0 {
             return 0;
         }
-        seq.pages = pages;
+        seq.pages = borrow.pages;
         seq.shared_pages = seq.pages.len();
-        seq.prefix_node = node;
+        seq.prefix_node = borrow.node;
+        seq.state_restore = borrow.state;
         seq.len = shared;
         // Keep `tokens` page-aligned with `pages` so the completion-time
         // donation indexes shared + private pages uniformly. The borrowed pages
@@ -152,35 +162,42 @@ impl Model {
     /// sequence's remaining private (partial + decode) pages.
     fn finalize_prefix(&mut self, seq: &mut SeqKv) {
         let ps = self.kv.cfg.page_size;
-        let Some(node) = seq.prefix_node.take() else {
-            // No borrow — but the sequence may still have prefilled a brand-new
-            // prefix worth caching (cache miss). Donate from the root.
-            let n_full = seq.prefilled_len / ps;
-            if n_full == 0 {
-                return;
+        let hybrid = self.is_hybrid();
+        let states = std::mem::take(&mut seq.state_checkpoints);
+        // A hybrid prefix is worth exactly as much as its checkpoint: pages past
+        // it describe tokens no borrow can resume from, and pages donated
+        // without one could never be borrowed at all. Both are simply not
+        // offered, so the tree never holds KV that nothing can reach.
+        let reached = seq.prefilled_len >= seq.state_target;
+        let n_full = match hybrid {
+            true if reached && (!states.is_empty() || seq.prefix_node.is_some()) => {
+                seq.state_target / ps
             }
-            let (dups, consumed) = {
-                let pc = self.prefix_cache.as_mut().expect("prefix path");
-                pc.donate(crate::prefix::ROOT, 0, n_full, &seq.tokens, &seq.pages)
-            };
-            for p in dups {
-                self.kv.push_free(p);
-            }
-            seq.pages.drain(0..consumed.min(seq.pages.len()));
-            seq.shared_pages = 0;
-            return;
+            true => 0,
+            false => seq.prefilled_len / ps,
         };
-        let n_full = seq.prefilled_len / ps;
-        let (dups, consumed) = {
+        let node = seq.prefix_node.take();
+        let donation = {
             let pc = self.prefix_cache.as_mut().expect("prefix path");
-            let r = pc.donate(node, seq.shared_pages, n_full, &seq.tokens, &seq.pages);
-            pc.release(node);
-            r
+            let from = node.unwrap_or(crate::prefix::ROOT);
+            let shared = node.map_or(0, |_| seq.shared_pages);
+            let donation = (n_full > 0)
+                .then(|| pc.donate(from, shared, n_full, &seq.tokens, &seq.pages, &states))
+                .unwrap_or_else(|| crate::prefix::Donation {
+                    dup_pages: Vec::new(),
+                    consumed: 0,
+                    dup_states: states.iter().map(|&(_, slot)| slot).collect(),
+                });
+            if let Some(node) = node {
+                pc.release(node);
+            }
+            donation
         };
-        for p in dups {
+        for p in donation.dup_pages {
             self.kv.push_free(p);
         }
-        seq.pages.drain(0..consumed.min(seq.pages.len()));
+        self.return_state_slots(donation.dup_states);
+        seq.pages.drain(0..donation.consumed.min(seq.pages.len()));
         seq.shared_pages = 0;
     }
 
@@ -192,10 +209,11 @@ impl Model {
             return 0;
         };
         let freed = pc.evict(need);
-        let n = freed.len();
-        for p in freed {
+        let n = freed.pages.len();
+        for p in freed.pages {
             self.kv.push_free(p);
         }
+        self.return_state_slots(freed.states);
         n
     }
 
@@ -283,7 +301,11 @@ impl Model {
     /// Spill this sequence's coldest pages until the pool can absorb
     /// `new_tokens` more tokens plus the watermark reserve. No-op with
     /// tiering off (the pool then errors on exhaustion, as before).
-    pub(crate) fn tier_ensure_capacity(&mut self, seq: &mut SeqKv, new_tokens: usize) -> Result<()> {
+    pub(crate) fn tier_ensure_capacity(
+        &mut self,
+        seq: &mut SeqKv,
+        new_tokens: usize,
+    ) -> Result<()> {
         let Some(tier) = &mut self.tier else {
             return Ok(());
         };
@@ -371,7 +393,11 @@ impl Model {
     /// Dzielniki częstotliwości rope dla warstwy `l` — tylko warstwy globalne
     /// architektur z naprzemienną uwagą (Gemma 4) i tylko gdy model niesie
     /// tensor `rope_freqs`.
-    pub(crate) fn rope_freqs_at(&self, p: &forge_formats::Hyperparams, l: usize) -> Option<&DevBuffer> {
+    pub(crate) fn rope_freqs_at(
+        &self,
+        p: &forge_formats::Hyperparams,
+        l: usize,
+    ) -> Option<&DevBuffer> {
         if p.rope_proportional_at(l) {
             self.weights.rope_freqs.as_ref()
         } else {
@@ -442,5 +468,4 @@ impl Model {
         }
         s.min(self.batch_cap).max(1)
     }
-
 }
