@@ -1499,7 +1499,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 16, "gemv_norm_nvfp4")?;
         let k = self.artifacts.get("gemv_norm_nvfp4_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(16 * rpw as u32), 1, 1),
             block: (512, 1, 1),
@@ -1537,7 +1537,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(weights.cols, 128, "gemv_norm_nvfp4_ct_s0")?;
         let k = self.artifacts.get("gemv_norm_nvfp4_ct_s0_f16")?;
-        let rpw = Self::fused_rows_per_warp(weights.rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((weights.rows as u32).div_ceil(16 * rpw as u32), 1, 1),
             block: (512, 1, 1),

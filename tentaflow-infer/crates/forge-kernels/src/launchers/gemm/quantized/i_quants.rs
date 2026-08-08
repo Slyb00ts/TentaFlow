@@ -134,7 +134,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 32, "gemv_norm_iq4_nl")?;
         let k = self.artifacts.get("gemv_norm_iq4_nl_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -170,7 +170,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 32, "gemv_norm_silu_iq4_nl")?;
         let k = self.artifacts.get("gemv_norm_silu_iq4_nl_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -354,7 +354,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq4_xs")?;
         let k = self.artifacts.get("gemv_norm_iq4_xs_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -390,7 +390,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq4_xs")?;
         let k = self.artifacts.get("gemv_norm_silu_iq4_xs_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -579,7 +579,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq2_xs")?;
         let k = self.artifacts.get("gemv_norm_iq2_xs_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -617,7 +617,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq2_xs")?;
         let k = self.artifacts.get("gemv_norm_silu_iq2_xs_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -807,7 +807,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq2_s")?;
         let k = self.artifacts.get("gemv_norm_iq2_s_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -844,7 +844,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq2_s")?;
         let k = self.artifacts.get("gemv_norm_silu_iq2_s_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1032,7 +1032,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq3_s")?;
         let k = self.artifacts.get("gemv_norm_iq3_s_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1069,7 +1069,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq3_s")?;
         let k = self.artifacts.get("gemv_norm_silu_iq3_s_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1260,7 +1260,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq2_xxs")?;
         let k = self.artifacts.get("gemv_norm_iq2_xxs_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1298,7 +1298,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq2_xxs")?;
         let k = self.artifacts.get("gemv_norm_silu_iq2_xxs_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1491,7 +1491,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq3_xxs")?;
         let k = self.artifacts.get("gemv_norm_iq3_xxs_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1529,7 +1529,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq3_xxs")?;
         let k = self.artifacts.get("gemv_norm_silu_iq3_xxs_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1719,7 +1719,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq1_s")?;
         let k = self.artifacts.get("gemv_norm_iq1_s_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1756,7 +1756,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq1_s")?;
         let k = self.artifacts.get("gemv_norm_silu_iq1_s_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1944,7 +1944,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_iq1_m")?;
         let k = self.artifacts.get("gemv_norm_iq1_m_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1981,7 +1981,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 256, "gemv_norm_silu_iq1_m")?;
         let k = self.artifacts.get("gemv_norm_silu_iq1_m_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),

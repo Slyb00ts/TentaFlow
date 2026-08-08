@@ -946,11 +946,18 @@ impl Kernels {
     }
 
     /// Rows each warp computes in the norm-recomputing fused decode kernels.
-    /// Fewer blocks means fewer redundant per-block norm recomputes (h32/h/
-    /// norm-weight traffic), which pays off once the projection is tall
-    /// enough to keep the GPU busy anyway; per-row math is unchanged.
-    pub(crate) fn fused_rows_per_warp(rows: usize) -> usize {
-        (rows / 2048).clamp(1, 8)
+    ///
+    /// One, because the redundant per-block norm this was widened to avoid is
+    /// far cheaper than the block count it costs. The norm re-reads the hidden
+    /// state — eight kilobytes, and hot in cache after the first block — while
+    /// halving the blocks halves the memory parallelism available to hide this
+    /// card's latency. Measured on GB10, Bielik-7B decode: 44,1 tok/s at one
+    /// row, 43,0 at two, 41,9 at four, against 42,2 for the old
+    /// `(rows / 2048).clamp(1, 8)`, which gave the 11264-row gate/up
+    /// projection five. The two mixtures measured are unchanged, their tall
+    /// projections being routed rather than dense.
+    pub(crate) fn fused_rows_per_warp() -> usize {
+        1
     }
 
     /// Guard shared by the norm-recomputing fused decode kernels: the normed
@@ -981,7 +988,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 8, "gemv_norm_f16")?;
         let k = self.artifacts.get("gemv_norm_f16")?;
-        let rpw = Self::fused_rows_per_warp(rows);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
@@ -1017,7 +1024,7 @@ impl Kernels {
     ) -> Result<()> {
         Self::check_fused_hidden(cols, 8, "gemv_norm_silu_f16")?;
         let k = self.artifacts.get("gemv_norm_silu_f16")?;
-        let rpw = Self::fused_rows_per_warp(inter);
+        let rpw = Self::fused_rows_per_warp();
         let cfg = LaunchConfig {
             grid: ((inter as u32).div_ceil(8 * rpw as u32), 1, 1),
             block: (BLOCK, 1, 1),
