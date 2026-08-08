@@ -1717,8 +1717,8 @@ impl IqTables {
     }
 }
 
-
 mod attention;
+mod attention_kv;
 mod compressor;
 mod deltanet;
 mod elementwise;

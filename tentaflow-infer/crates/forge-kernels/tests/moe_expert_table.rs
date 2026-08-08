@@ -18,6 +18,9 @@ use forge_kernels::Kernels;
 use forge_types::MemKind;
 use half::f16;
 
+mod common;
+use common::{build_q4k, build_q6k};
+
 /// Test MUST run on a real device — no GPU is a failure, not a skip.
 fn device() -> Option<Arc<dyn Device>> {
     forge_hal::gpu::open(
@@ -50,43 +53,6 @@ fn download_f16(dev: &dyn Device, buf: &DevBuffer, n: usize) -> Vec<f32> {
         .chunks_exact(2)
         .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
         .collect()
-}
-
-/// Deterministic Q4_K stream (144-byte superblocks).
-fn build_q4k(rows: usize, cols: usize) -> Vec<u8> {
-    let blocks_per_row = cols / 256;
-    let mut wq = Vec::with_capacity(rows * blocks_per_row * 144);
-    for r in 0..rows {
-        for b in 0..blocks_per_row {
-            let d = f16::from_f32(0.008 + ((r + b) % 7) as f32 * 0.004);
-            let dmin = f16::from_f32(0.005 + ((r + 2 * b) % 5) as f32 * 0.003);
-            wq.extend_from_slice(&d.to_le_bytes());
-            wq.extend_from_slice(&dmin.to_le_bytes());
-            for i in 0..12 {
-                wq.push(((r * 53 + b * 19 + i * 41 + 7) % 256) as u8);
-            }
-            for i in 0..128 {
-                wq.push(((r * 31 + b * 17 + i * 13) % 256) as u8);
-            }
-        }
-    }
-    wq
-}
-
-/// Deterministic Q6_K stream (210-byte superblocks).
-fn build_q6k(rows: usize, cols: usize) -> Vec<u8> {
-    let blocks_per_row = cols / 256;
-    let mut wq = Vec::with_capacity(rows * blocks_per_row * 210);
-    for r in 0..rows {
-        for b in 0..blocks_per_row {
-            for i in 0..208 {
-                wq.push(((r * 37 + b * 23 + i * 11 + 5) % 256) as u8);
-            }
-            let d = f16::from_f32(0.006 + ((r + b) % 7) as f32 * 0.003);
-            wq.extend_from_slice(&d.to_le_bytes());
-        }
-    }
-    wq
 }
 
 fn write_bytes(dev: &dyn Device, kind: MemKind, bytes: &[u8]) -> DevBuffer {
