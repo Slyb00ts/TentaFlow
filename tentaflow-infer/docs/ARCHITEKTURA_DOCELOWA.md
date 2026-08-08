@@ -1494,29 +1494,44 @@ daje 8,2 ms i 122 tok/s. FORGE jest na 14,7 ms (56% sufitu), llama.cpp na
 bajtów, czyli 83% pasma — tam nie ma już zapasu. Reszta różnicy siedzi w
 projekcjach uwagi i głowie, rozdrobniona.
 
-### Co blokuje MoE w prefillu hybrydy — sprawdzone wykonawczo
+### Co blokuje MoE w prefillu hybrydy — zmierzone
 
 Samo wpięcie jest małe: `hybrid_batch_ffn` czyta `pb.x` i pisze `pb.down`,
 czyli dokładnie te bufory, których używa `moe_prefill_ffn`, a `chunk_size`
 jest z definicji ograniczony do `MAX_PREFILL_CHUNK`, więc bufory routera i
 grupowania są już właściwego rozmiaru. Wystarczy `match` na `LayerFfn` i
-zdjęcie `!is_moe()` z bramki. Blokują dwie inne rzeczy.
+zdjęcie `!is_moe()` z bramki. Zrobione i **cofnięte** — poniżej dlaczego.
 
-**Ekspert współdzielony.** Qwen3.6-35B-A3B ma
-`qwen35moe.expert_shared_feed_forward_length`, a `moe_grouped_capable` odrzuca
-warstwę z `moe.shared`. Po wpięciu ścieżki wsadowej FFN nadal leciał token po
-tokenie i prefill wzrósł 6,4 → 7,0 tok/s zamiast setek. Zgrupowany prefill musi
-najpierw policzyć eksperta współdzielonego wsadowo: to gęste SwiGLU po
-wszystkich `t` wierszach, dokładane do wyniku ze skalą 1,0 — tak jak robi to
-dzisiejsza pętla per token, która przekazuje `shared_scale = 1.0`.
+**Bramka poprawności jest.** `tests/moe_prefill_gpu.rs` liczy ten sam prompt
+wsadowo i krokiem po kroku, po czym porównuje logity i argmax. Wcześniejsze
+podejście porównywało SHA wygenerowanych tokenów i nie umiało rozstrzygnąć,
+która wersja jest poprawna; logity pod teacher forcingiem umieją, bo obie
+ścieżki liczą wtedy tę samą funkcję. Poziom szumu tej maszyny: Qwen3-30B-A3B
+Q4_K `max_abs` 0,30 na 96 tokenach i 48 warstwach.
 
-**Ścieżka wsadowa zmienia wyjście.** Po zdjęciu bramki SHA wygenerowanych
-tokenów zmieniło się z `eaf6c66a` na `fa62d2f2`. Dla modeli gęstych wariant
-wsadowy jest udokumentowany jako identyczny co do bajtu; dla MoE nie jest, a
-wyroczni rozstrzygającej, która wersja jest poprawna, nie ma. Zanim to
-włączymy, potrzebna jest bramka porównująca wsadowy prefill MoE z pętlą per
-token — inaczej włączamy ścieżkę, która po cichu liczy co innego.
+**Ekspert współdzielony był realnym błędem, nie brakiem.** Po włączeniu
+ścieżki wsadowej bramka pokazała `max_abs` 14,3 i inny token szczytowy:
+prefill dokładał eksperta współdzielonego ze skalą 1,0, a decode ze
+`sigmoid(ffn_gate_inp_shexp · x)`. Po policzeniu bramki per token dla całego
+kawałka rozjazd spadł do 0,29, czyli do poziomu szumu. To jest naprawione.
 
-Kafel MXFP4 wymaga przy okazji grupowania WIERSZY, nie siatki: `gemm_mxf4_grouped`
-to inne wywołanie niż `gemm_grouped_experts`, a pomiar w `launchers/moe.rs`
-daje mu 1,3× straty wobec rozsyłki per ekspert.
+**Właściwa blokada to koszt, nie poprawność.** Przy identycznym SHA tokenów
+prefill P512 spadł z **69,1 do 7,1 tok/s** — dziesięciokrotnie. Powód: dzisiejszy
+prefill „token po tokenie" wcale nie jest wolny, bo idzie przez
+`moe_decode_ffn`, czyli rozsyłkę adresowaną na urządzeniu (`_gidx`) — jedno
+uruchomienie na projekcję dla wszystkich ośmiu ekspertów, zero synchronizacji
+z hostem. Ścieżka wsadowa oddaje to za `moe_prefill_ffn`, który dla MXFP4 nie
+ma wariantu zgrupowanego i schodzi na pętlę pięciu uruchomień na eksperta na
+token, plus odczyt routera na hosta co warstwę. Wsadowe są tylko miksery.
+
+Kolejność jest więc odwrotna niż zakładaliśmy: **najpierw zgrupowany GEMM
+ekspertów dla MXFP4**, dopiero potem wpięcie. `supports_grouped_experts` zna
+Q4_K, Q8_0 i Q6_K; MXFP4 ma `gemm_mxf4_grouped`, ale to inne wywołanie niż
+`gemm_grouped_experts` (grupuje WIERSZE, nie siatkę, i bierze parę
+skwantowanych aktywacji), a pomiar w `launchers/moe.rs` daje mu 1,3× straty
+wobec rozsyłki per ekspert — dla jednego tokenu. Dla 512 wierszy ten pomiar nic
+nie mówi i trzeba go powtórzyć.
+
+Osobno: `moe_grouped_capable` nadal odrzuca warstwę z `moe.shared`, więc nawet
+z kernelem MXFP4 zgrupowany prefill wymaga wsadowego SwiGLU eksperta
+współdzielonego po wszystkich `t` wierszach.
