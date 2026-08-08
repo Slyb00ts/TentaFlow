@@ -169,10 +169,14 @@ fn prefill_mieszanki_zgadza_sie_z_krokiem_po_kroku() -> TestResult<()> {
         top1(&serial_logits),
         "prefill i decode wskazują inny token"
     );
-    // The grouped path keeps the sum in f32 across all top_k and rounds once,
-    // where the per-token route rounded after each expert, and a tile reduces in
-    // a different order than a GEMV — so the two agree to rounding, not to the
-    // bit. Measured on this machine over this prompt: Qwen3-30B-A3B Q4_K 0,30.
-    assert!(max_abs <= 0.9, "logity rozjeżdżają się o {max_abs}");
+    // A loose bound on purpose — the sharp half of this gate is the greedy walk
+    // above. Two things widen it. The grouped path keeps the sum in f32 across
+    // all top_k and rounds once, where the per-token route rounded after each
+    // expert, and a tile reduces in a different order than a GEMV. And a
+    // four-bit stack multiplies on the block-scaled unit, whose operands are
+    // e2m1 on BOTH sides, so its activation is four-bit as well — the same
+    // arithmetic llama.cpp runs for this format on this card. Measured over
+    // this prompt: Qwen3-30B-A3B Q4_K 0,29; Qwen3.6-35B MXFP4 1,17.
+    assert!(max_abs <= 1.5, "logity rozjeżdżają się o {max_abs}");
     Ok(())
 }

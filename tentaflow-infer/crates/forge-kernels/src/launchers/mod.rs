@@ -1490,7 +1490,7 @@ struct PrequantScratch {
     xq: Option<DevBuffer>,
     xd: Option<DevBuffer>,
     xsm: Option<DevBuffer>,
-    /// Current int8-code capacity (elements) of `xq`.
+    /// Capacity of `xq` in BYTES: one per int8 code, or the smaller four-bit form.
     cap_codes: usize,
     /// Current f32 capacity (elements) of `xd`/`xsm`.
     cap_blocks: usize,

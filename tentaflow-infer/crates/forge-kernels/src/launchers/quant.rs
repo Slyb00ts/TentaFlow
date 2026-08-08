@@ -376,6 +376,57 @@ impl Kernels {
         Ok((xq, xd, xsm))
     }
 
+    /// The same activation in four-bit block-scaled form, quantized ONCE for a
+    /// whole grouped block.
+    ///
+    /// The block-scaled instruction takes four bits on BOTH sides, so a stack
+    /// that reaches the matrix unit needs its activation there too. Quantizing
+    /// per expert would repeat identical work as many times as the layer has
+    /// experts.
+    pub(crate) fn prequant_mxf4(
+        &self,
+        x: &DevBuffer,
+        cols: usize,
+        n_tokens: usize,
+        stream: &Stream,
+    ) -> Result<(DevBuffer, DevBuffer)> {
+        if !cols.is_multiple_of(64) {
+            return Err(ForgeError::Kernel(format!(
+                "prequant_mxf4 wymaga cols % 64 == 0, otrzymano {cols}"
+            )));
+        }
+        // Shares the int8 scratch: 36 bytes per 64 values is under one byte per
+        // value, and one e8m0 row scale is under one f32 per 32-value block, so
+        // both fit what the q8_1 form already asks for. Neither is live past the
+        // launch that consumes it, exactly as the three projections of a layer
+        // already reuse this buffer between them.
+        let need_bytes = n_tokens * (cols / 64) * 36;
+        let mut sc = self.prequant.lock().expect("prequant scratch poisoned");
+        if sc.cap_codes < need_bytes {
+            sc.xq = Some(
+                self.device
+                    .alloc(need_bytes, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_codes = need_bytes;
+        }
+        if sc.cap_blocks < n_tokens {
+            sc.xd = Some(
+                self.device
+                    .alloc(n_tokens * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.xsm = Some(
+                self.device
+                    .alloc(n_tokens * 4, MemKind::Device, Pool::Activations)?,
+            );
+            sc.cap_blocks = n_tokens;
+        }
+        let xq = sc.xq.as_ref().expect("xq allocated").clone();
+        let xs = sc.xd.as_ref().expect("xd allocated").clone();
+        drop(sc);
+        self.quantize_act_mxf4(&xq, &xs, x, cols, n_tokens, stream)?;
+        Ok((xq, xs))
+    }
+
     /// Przepakowuje zakres wierszy rezydentnej macierzy NVFP4 do E4M3 na GPU.
     #[allow(clippy::too_many_arguments)]
     pub fn pack_nvfp4_fp8(

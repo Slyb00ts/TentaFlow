@@ -309,6 +309,14 @@ impl Kernels {
         selections: usize,
         stream: &Stream,
     ) -> Result<()> {
+        // Four bits on BOTH sides: the block-scaled unit's operands are e2m1
+        // with a ue8m0 scale, so the activation goes through the same form as
+        // the weight. That is the arithmetic, not a shortcut around it.
+        if quant == QuantKind::MXFP4 {
+            let (xq, xs) = self.prequant_mxf4(x, cols, selections, stream)?;
+            return self
+                .gemm_mxf4_grouped(y, table, &xq, &xs, tiles, rows, cols, selections, stream);
+        }
         let (name, block, bn, _) = self.grouped_variant(quant)?;
         let kernel = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
@@ -316,9 +324,9 @@ impl Kernels {
             block: (block, 1, 1),
             shared_mem_bytes: 0,
         };
-        // Q6_K and MXFP4 read f16 activations; the int8 tiles read the q8_1
-        // form, which is quantized ONCE for the whole grouped block rather than
-        // once per expert — that repetition was its own line in the profile.
+        // Q6_K reads f16 activations; the int8 tiles read the q8_1 form, which
+        // is quantized ONCE for the whole grouped block rather than once per
+        // expert — that repetition was its own line in the profile.
         let int8 = matches!(quant, QuantKind::Q4K | QuantKind::Q8_0);
         let args = if !int8 {
             LaunchArgs::new().buf(y).buf(table).buf(x)
@@ -608,7 +616,10 @@ impl Kernels {
         quant: QuantKind,
     ) -> Result<(&'static str, u32, usize, usize)> {
         Ok(match quant {
-            QuantKind::MXFP4 => ("gemm_mxfp4_gguf_f16_grouped", 128, 64, 64),
+            QuantKind::MXFP4 => {
+                let (name, tokens, threads) = self.mxf4_grouped_variant();
+                (name, threads, 128, tokens)
+            }
             QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256, 64, 64),
             QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64, 64),
             QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128, 64, 64),
@@ -623,15 +634,13 @@ impl Kernels {
     /// Whether a stack of this format multiplies as ONE grid over every expert
     /// through `gemm_grouped_experts`.
     ///
-    /// MXFP4 answers on the f16 tile here. It has a four-bit tile as well, on
-    /// the block-scaled matrix unit — but that unit takes four bits on BOTH
-    /// sides, so it would quantize the activation too, and this call is the one
-    /// whose contract is that grouping changes no arithmetic.
+    /// MXFP4 answers on the block-scaled matrix unit, which needs its
+    /// quantizer as well as its tile — hence a capability of its own.
     pub fn supports_grouped_experts(&self, quant: QuantKind) -> bool {
-        matches!(
-            quant,
-            QuantKind::Q4K | QuantKind::Q8_0 | QuantKind::Q6K | QuantKind::MXFP4
-        )
+        if quant == QuantKind::MXFP4 {
+            return self.supports_mxf4_grouped();
+        }
+        matches!(quant, QuantKind::Q4K | QuantKind::Q8_0 | QuantKind::Q6K)
             && self
                 .grouped_variant(quant)
                 .is_ok_and(|(name, ..)| self.artifacts.has(name))
