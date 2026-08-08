@@ -280,7 +280,7 @@ enum Command {
         #[arg(long = "prefix-cache", default_value = "on")]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        /// Włączenie wymusza `--prefix-cache off`.
+        /// Natywne MTP wymusza `--prefix-cache off`; n-gram nie.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
         /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
@@ -394,7 +394,7 @@ enum Command {
         #[arg(long = "prefix-cache", default_value = "off")]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        /// Włączenie wymusza `--prefix-cache off`.
+        /// Natywne MTP wymusza `--prefix-cache off`; n-gram nie.
         #[arg(long = "speculative", default_value = "off")]
         speculative: String,
         /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
@@ -896,6 +896,22 @@ fn parse_tp_cards(spec: Option<&str>) -> Result<Vec<forge_hal::gpu::DeviceId>> {
         out.push(id);
     }
     Ok(out)
+}
+
+/// Czy prefiks współdzielony może żyć obok tej spekulacji.
+///
+/// Proposer hostowy (n-gram) dokłada tylko draft na OGON sekwencji i cofa go
+/// `KvCache::rollback`, który zwalnia strony wyłącznie od końca — pożyczone
+/// strony prefiksu leżą poniżej i nigdy nie są ruszane, a darowizna obejmuje
+/// tylko `prefilled_len`, czyli to, co policzył prefill. Natywne MTP prowadzi
+/// własny verifier i cache draftu, których z pożyczonym prefiksem nie
+/// zmierzyliśmy, więc dla nich prefiks nadal schodzi.
+fn prefix_cache_with(prefix_cache: bool, spec: &SpeculativeConfig) -> bool {
+    prefix_cache
+        && !matches!(
+            spec.kind(),
+            SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+        )
 }
 
 fn parse_prefix_cache(s: &str) -> Result<bool> {
@@ -1713,12 +1729,9 @@ fn cmd_serve(
     spec: SpeculativeConfig,
     tp_cards: Vec<forge_hal::gpu::DeviceId>,
 ) -> Result<()> {
-    // Speculation appends + rolls back draft KV on the plain paged cache; the
-    // radix prefix cache donates/borrows pages and is mutually exclusive with
-    // it, so enabling speculation forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.is_enabled();
-    if spec.is_enabled() {
-        tracing::info!("speculative decoding enabled; prefix cache disabled");
+    let prefix_cache = prefix_cache_with(prefix_cache, &spec);
+    if spec.is_enabled() && !prefix_cache {
+        tracing::info!("natywne MTP prowadzi własny cache draftu; prefiks wyłączony");
     }
     let descriptor = read_descriptor(model_path)?;
     let max_active = resolve_max_active(max_active, &spec, descriptor.params.ssm.is_some())?;
@@ -1987,9 +2000,7 @@ fn cmd_run(
     );
 
     let t0 = Instant::now();
-    // Speculation is mutually exclusive with the radix prefix cache (both manage
-    // paged KV ownership); enabling it forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.is_enabled();
+    let prefix_cache = prefix_cache_with(prefix_cache, &spec);
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,
@@ -2377,7 +2388,7 @@ fn cmd_bench(
         bail!("--reps must be at least 1");
     }
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache && !spec.is_enabled();
+    let prefix_cache = prefix_cache_with(prefix_cache, &spec);
     let mut loaded = load_auto(
         model_path,
         weights_pool_gb,

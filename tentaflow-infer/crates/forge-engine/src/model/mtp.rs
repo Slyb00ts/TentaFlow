@@ -1624,11 +1624,11 @@ impl Model {
                 "speculative verification does not support KV tiering".into(),
             ));
         }
-        if self.prefix_cache.is_some() {
-            return Err(ForgeError::Unsupported(
-                "speculative verification requires the prefix cache to be disabled".into(),
-            ));
-        }
+        // Prefiks współdzielony NIE jest tu przeszkodą. Draft dopisuje się na
+        // ogonie sekwencji, a `KvCache::rollback` zwalnia strony wyłącznie od
+        // końca i nigdy nie schodzi poniżej `shared_pages`; darowizna obejmuje
+        // tylko `prefilled_len`, więc żadna strona zapisana przez verifier nie
+        // trafia do drzewa.
         if !matches!(
             self.weights.lm_head,
             DevWeight::F16 { .. } | DevWeight::Q8_0 { .. }
@@ -1662,6 +1662,8 @@ impl Model {
                 "hybrydowy verifier spekulacyjny wymaga cache KV F16".into(),
             ));
         }
+        // Hybrydowy verifier prowadzi obok siebie stan DeltaNet i cache draftu
+        // MTP; z pożyczonym prefiksem nie jest zmierzony, więc zostaje poza.
         if self.tier.is_some() || self.prefix_cache.is_some() {
             return Err(ForgeError::Unsupported(
                 "hybrydowy verifier spekulacyjny wymaga wyłączonego tieringu i prefix cache".into(),
@@ -2959,6 +2961,7 @@ impl Model {
         self.ensure_verify_bufs(t)?;
 
         let base = seq.len;
+        let recorded = RecordedTokens::of(seq);
         let mut batch = Vec::with_capacity(t);
         batch.push(fed);
         batch.extend_from_slice(draft);
@@ -2997,7 +3000,7 @@ impl Model {
             Ok((accepted, correction))
         })();
 
-        finish_greedy_verification(&mut self.kv, &mut self.pt_seq, seq, base, result)
+        finish_greedy_verification(&mut self.kv, &mut self.pt_seq, seq, base, recorded, result)
     }
 
     /// Odtwarza stany MTP po target-only prefill B2 macierzowo, lane po lane.

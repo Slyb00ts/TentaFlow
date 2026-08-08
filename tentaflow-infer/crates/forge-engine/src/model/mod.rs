@@ -1717,11 +1717,36 @@ fn native_mtp_greedy_decision(draft: &[u32], predictions: &[i32]) -> (usize, u32
     (accepted, predictions[accepted] as u32)
 }
 
+/// Ile tokenów sekwencja miała zapisane, zanim verify tknął jej bufory.
+#[derive(Clone, Copy)]
+struct RecordedTokens {
+    tokens: usize,
+    prefilled: usize,
+}
+
+impl RecordedTokens {
+    fn of(seq: &SeqKv) -> Self {
+        Self {
+            tokens: seq.tokens.len(),
+            prefilled: seq.prefilled_len,
+        }
+    }
+}
+
+/// Zamyka weryfikację draftu: cofa KV do zaakceptowanej długości i unieważnia
+/// tabelę stron.
+///
+/// Verify jedzie ścieżką prefillu, a ta zapisuje `tokens`/`prefilled_len` dla
+/// darowizny prefiksu — tyle że draft nie jest promptem i za chwilę zniknie.
+/// Ten zapis jest więc tu cofany razem ze stronami: bez tego `prefilled_len`
+/// rósł o każdy zweryfikowany token, a darowizna sięgała po strony, których
+/// sekwencja nigdy nie miała.
 fn finish_greedy_verification(
     kv: &mut KvCache,
     page_table_seq: &mut u64,
     seq: &mut SeqKv,
     base: usize,
+    recorded: RecordedTokens,
     result: Result<(usize, u32)>,
 ) -> Result<(usize, u32)> {
     let result = match result {
@@ -1751,6 +1776,8 @@ fn finish_greedy_verification(
             Err(error)
         }
     };
+    seq.tokens.truncate(recorded.tokens);
+    seq.prefilled_len = recorded.prefilled;
     *page_table_seq = 0;
     result
 }
@@ -2839,7 +2866,7 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        cleanup_after_error, fatal_kv_synchronize,
+        cleanup_after_error, RecordedTokens, fatal_kv_synchronize,
         finish_greedy_verification, grow_prefill_lanes_transactional,
         hybrid_layer_major_scratch_estimate, hybrid_prefill_activation_budget_capable,
         hybrid_prefill_chunk_config_for_model, hybrid_prefill_inner_chunk_count,
@@ -2968,13 +2995,14 @@ mod verify_rollback_tests {
         seq: &mut SeqKv,
     ) -> Result<()> {
         let base = seq.len;
+        let recorded = RecordedTokens::of(seq);
         let result: Result<(usize, u32)> = (|| {
             for _ in 0..6 {
                 kv.grow(seq)?;
             }
             Err(ForgeError::Kernel("wymuszony błąd weryfikacji".into()))
         })();
-        finish_greedy_verification(kv, page_table_seq, seq, base, result).map(|_| ())
+        finish_greedy_verification(kv, page_table_seq, seq, base, recorded, result).map(|_| ())
     }
 
     #[test]
