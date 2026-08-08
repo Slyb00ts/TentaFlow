@@ -442,13 +442,26 @@ impl CudaDevice {
             .map_err(|e| cu_err("cuMemGetInfo", e))
     }
 
-    /// Free VRAM in bytes without retaining a device — for sizing pools before
-    /// the arenas (which grab their whole budget up front) are created.
+    /// Memory an arena may claim, without retaining a device — for sizing pools
+    /// before the arenas (which grab their whole budget up front) are created.
+    ///
+    /// On an integrated device the GPU's memory IS the host's, so the free
+    /// figure counts memory the kernel still needs; asking for all of it fails
+    /// the allocation outright. GB10 measured: 127,6 GB total, ~124 GB free,
+    /// and a 122 GB pool is refused where 100 GB is granted — hence the eighth
+    /// left to the host, which no discrete card gives up.
     pub fn free_vram(ordinal: usize) -> Result<usize> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
-        Ok(free)
+        let (free, total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let integrated = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            .map_err(|e| cu_err("cuDeviceGetAttribute", e))?
+            != 0;
+        Ok(match integrated {
+            true => free.saturating_sub(total / 8),
+            false => free,
+        })
     }
 
     fn pool(&self, pool: Pool) -> &Arc<CudaPool> {
