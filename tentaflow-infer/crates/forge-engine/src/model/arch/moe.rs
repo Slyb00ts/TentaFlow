@@ -1025,7 +1025,10 @@ impl Model {
         let k = moe.n_experts_used;
         self.moe_stage_shared_scales(moe, &bb.x, n, stream)?;
         self.moe_route(moe, &bb.x, n, hidden, stream)?;
-        if Self::moe_gidx_capable(moe) {
+        // Poniżej progu selekcje rozkładają się rzadko po ekspertach i tańsze
+        // jest adresowanie per selekcja; powyżej każdy ekspert jest wybierany
+        // wielokrotnie i powtórzone odczyty jego wag zaczynają dominować.
+        if n <= 16 && Self::moe_gidx_capable(moe) {
             return self.moe_batch_gidx_ffn(moe, n, hidden, stream);
         }
         self.device

@@ -2426,9 +2426,9 @@ impl Model {
             self.record_hybrid_batch_forward(seqs, tokens)?;
             self.pt_seq = 0;
         } else if self.weights.is_moe() {
-            // Adresowanie ekspertów na urządzeniu zdjęło z kroku odczyt routera
-            // i synchronizację, więc daje się on wreszcie nagrać jak gęsty.
-            if self.moe_fully_gidx() {
+            // Wąski krok adresuje eksperty na urządzeniu i daje się nagrać;
+            // szeroki grupuje, a to czyta router na hoście — czego graf zabrania.
+            if bucket <= 16 && self.moe_fully_gidx() {
                 self.replay_batch_graph(bucket)?;
             } else {
                 self.record_batch_forward(b, b, &[])?;
