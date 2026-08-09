@@ -1,5 +1,6 @@
 // ===== File: model/caps.rs — co ten model wolno uruchomić na tym urządzeniu =====
 use super::*;
+pub(crate) mod tuning;
 
 impl Model {
     /// True when `w` can be consumed by the fused decode kernels
@@ -246,9 +247,13 @@ pub(crate) fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_e
 /// ścieżka nie ma zmierzonego, więc tam jest granica grupy.
 /// Zmierzone na ThinkingCap-Qwen3.6-27B (RTX 4090, prompt 85, out 128):
 /// C=6 69,1 · C=10 67,8 · C=12 68,9 · C=16 71,3 tok/s.
-pub(crate) fn hybrid_group_size(pending: usize) -> usize {
-    const MAX_GROUP: usize = 16;
-    pending.min(MAX_GROUP)
+impl Model {
+    pub(crate) fn hybrid_group_size(&self, pending: usize) -> usize {
+        let cap = self
+            .tuned(tuning::Knob::MaxDecodeGroup)
+            .expect("szerokość grupy ma wartość dla każdej karty");
+        pending.min(cap)
+    }
 }
 
 impl Model {
@@ -284,21 +289,11 @@ impl Model {
 
 impl Model {
     /// Decode concurrency at which this model's batched forward starts to win.
-    ///
-    /// Three regimes, each measured: a path with small-batch kernels (hybrid,
-    /// NVFP4/K-quant dense) wins from two; grouped MoE pays a counting sort and
-    /// one router readback per routed layer, which two lanes do not cover
-    /// (Qwen3-30B-A3B, GB10, P512: 73 tok/s batched vs 87 serialized) but four
-    /// do (114); everything else goes through a token tile that only amortizes
-    /// near twelve.
+    /// Resolved through the tuning cascade — the crossover moves with BOTH the
+    /// model's kernel family and the card's bandwidth-to-launch ratio.
     pub(crate) fn batch_min_default(&self) -> usize {
-        if self.hybrid_batch_capable() || self.weights.small_batch_decode_capable() {
-            return 2;
-        }
-        if self.moe_batch_capable() {
-            return 4;
-        }
-        12
+        self.tuned(tuning::Knob::BatchMin)
+            .expect("każda klasa modelu ma próg batcha")
     }
 }
 

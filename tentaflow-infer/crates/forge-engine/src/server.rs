@@ -17,7 +17,6 @@ use forge_types::{ForgeError, Result, Vendor};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::metrics::{EngineMetrics, SeqTiming};
-use crate::model::caps::hybrid_group_size;
 use crate::model::{hybrid_prefill_b2_backend_capable, Model, PrefillProfile, MAX_PREFILL_CHUNK};
 use crate::sample::{
     apply_logit_bias, apply_penalties, compute_logprob, suppress_eos, GpuSampler, Sampler,
@@ -1816,7 +1815,7 @@ fn batch_gpu_decode(
         // Szerokość grupy musi trafiać w kernel — patrz `hybrid_group_size`.
         let mut rest = feed_idx.as_slice();
         while rest.len() >= 2 {
-            let take = hybrid_group_size(rest.len());
+            let take = model.hybrid_group_size(rest.len());
             decode_gpu_group(model, active, &rest[..take]);
             EngineMetrics::inc(&metrics.hybrid_decode_batch_steps_total);
             EngineMetrics::add(&metrics.hybrid_decode_batch_lanes_total, take as u64);

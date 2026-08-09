@@ -120,7 +120,7 @@ size	crates/forge-engine/src/model/arch/dense.rs	2683
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2024
 size	crates/forge-engine/src/model/mod.rs	3667
 size	crates/forge-engine/src/model/mtp.rs	3132
-size	crates/forge-engine/src/server.rs	3251
+size	crates/forge-engine/src/server.rs	3250
 size	crates/forge-engine/src/tensor_parallel.rs	1661
 size	crates/forge-engine/src/weights.rs	5031
 size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3514
