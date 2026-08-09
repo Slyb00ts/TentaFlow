@@ -2333,10 +2333,10 @@ impl Model {
         let mut order: Vec<usize> = (0..b).collect();
         order.sort_by_key(|&i| !seqs[i].spilled.is_empty());
         let resident = seqs.iter().filter(|s| s.spilled.is_empty()).count();
-        // Grupowany MoE czyta wybór routera na hoście: nie da się go przechwycić
-        // do grafu, a martwe linie kafla weszłyby do sortowania po ekspertach.
-        let mixed = resident < b || self.weights.is_moe();
-        let bucket = if mixed { b } else { self.bucket_for(b) };
+        let mixed = resident < b;
+        // MoE liczy dokładną szerokością: martwe linie weszłyby do sortu ekspertów.
+        let exact_width = mixed || self.weights.is_moe();
+        let bucket = if exact_width { b } else { self.bucket_for(b) };
         if b > self.batch_cap {
             return Err(ForgeError::Scheduler(format!(
                 "batch {b} exceeds provisioned cap {}",
@@ -2374,7 +2374,7 @@ impl Model {
         }
         // Dead lanes replay sequence 0's inputs so they compute harmlessly
         // (captured path only; the mixed path runs at its exact size).
-        if !mixed {
+        if !exact_width {
             let lane0_pt: Vec<i32> = pt[..mpp].to_vec();
             for i in b..bucket {
                 meta[i] = meta[0];

@@ -767,7 +767,7 @@ impl Model {
     ///
     /// A paged stack keeps the per-token loop: a grid spanning every expert has
     /// no address for a block that sits on disk.
-    fn moe_grouped_capable(kernels: &Kernels, moe: &MoeFfn) -> bool {
+    pub(crate) fn moe_grouped_capable(kernels: &Kernels, moe: &MoeFfn) -> bool {
         [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
             .into_iter()
             .all(|stack| {

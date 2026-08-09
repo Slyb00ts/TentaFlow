@@ -98,13 +98,11 @@ Wygrywamy:
 - Skalowanie Bielika Q8: 188 wobec 181 tok/s przy ośmiu sekwencjach.
 
 Przegrywamy, w kolejności rozmiaru luki:
-1. **MoE hybrydowe nie ma wsadowego dekodowania.** Czysty MoE (`qwen3moe`) dostał
-   grupowaną dyspozycję ekspertów w batchu: Qwen3-30B przy ośmiu sekwencjach
-   poszedł z 88 na 174 tok/s wobec 238 u llama.cpp, czyli luka zeszła z 2,7x do
-   1,37x. Hybrydowe MoE (`qwen35moe`, MXFP4) nadal stoi na 60 wobec 228: jego
-   batch idzie bramką hybrydy, a scratch prefillu hybrydy jest wymiarowany na
-   rozmiar chunka, nie na szerokość batcha — wpięcie grupowanej ścieżki bez
-   własnego wymiarowania kończy sekwencje natychmiast (sprawdzone).
+1. **MoE nadrobiło większość dystansu, ale go nie zamknęło.** Grupowana dyspozycja
+   ekspertów działa teraz także w dekodowaniu, dla obu rodzin. Przy ośmiu
+   sekwencjach, prompt 512: Qwen3-30B 88 -> 174 tok/s wobec 238 u llama.cpp
+   (luka 2,7x -> 1,37x), a hybrydowe MXFP4 60 -> 128 wobec 228 (3,8x -> 1,78x).
+   Reszta dystansu jest nadal otwarta.
 2. **Hybryda w K-kwantach nie ma dokładnego kernela małego batcha**, więc
    `hybrid_batch_weights_capable` odrzuca ją i batch nie wchodzi: 13 wobec 60 tok/s
    przy ośmiu. Ten sam model w NVFP4 skaluje się 10,7 → 49,3 (4,6x).

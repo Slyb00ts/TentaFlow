@@ -174,8 +174,11 @@ impl Model {
             && self.tier.is_none()
             && batched_head_supported(&self.weights.lm_head, HYBRID_BATCH_LANES).is_ok()
             && self.weights.layers.iter().all(|layer| {
-                let LayerFfn::Dense(ffn) = &layer.ffn else {
-                    return false;
+                let ffn = match &layer.ffn {
+                    LayerFfn::Moe(moe) => {
+                        return Self::moe_grouped_capable(&self.kernels, moe);
+                    }
+                    LayerFfn::Dense(ffn) => ffn,
                 };
                 let gate_up = match &ffn.gate_up {
                     GateUpWeights::Fused(weight) => exact_batch_window(weight),
@@ -536,6 +539,18 @@ impl Model {
                 eps,
                 &self.stream,
             )?;
+            if let LayerFfn::Moe(moe) = &layer.ffn {
+                self.moe_batch_ffn(moe, n, hidden, &self.stream)?;
+                let next_norm = if layer_index + 1 < self.weights.layers.len() {
+                    &self.weights.layers[layer_index + 1].attn_norm
+                } else {
+                    &self.weights.output_norm
+                };
+                self.kernels.rmsnorm_residual_f16(
+                    &bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, &self.stream,
+                )?;
+                continue;
+            }
             let ffn = layer.dense_ffn()?;
             match &ffn.gate_up {
                 GateUpWeights::Fused(weight) => {
