@@ -261,3 +261,38 @@ Wnioski dla dalszej pracy:
 3. Eksperci gate+up to największa pojedyncza pozycja w liczbach bezwzględnych.
    Zgłaszają 503 GB/s, a licząc po bajtach RÓŻNYCH ekspertów 142 GB/s — czyli
    cache faktycznie pochłania powtórzone odczyty i realny zapas jest w tych 60%.
+
+## Stan po serii zmian dekodowania
+
+Qwen3-30B-A3B Q4_K_M, prompt 512, agregat tok/s, ten sam protokół co wyżej:
+
+| linie | wyjściowo | teraz | llama.cpp |
+|---:|---:|---:|---:|
+| 1 | 85,6 | 85,9 | 72,4 |
+| 2 | 85,8 | 121,3 | 116,0 |
+| 4 | 87,0 | 178,5-182,1 | 172,0 |
+| 8 | 174,0 | 222,8-225,6 | 238,0 |
+
+Wygrywamy przy jednej, dwóch i czterech liniach; przy ośmiu zostaje około 1,05x.
+
+Co dało ten ruch, w kolejności wielkości:
+
+1. Adresowanie eksperta per selekcja zamiast grupowania, czyli kernele GEMV
+   zamiast kafla MMA ze stagingiem: 174 -> 190.
+2. Jeden staging aktywacji na osiem wierszy wyjścia zamiast na jeden — najpierw
+   w scalonym gate/up, potem w `down`. Blok kwantował całą aktywację przy
+   wejściu, a liczył jeden wiersz na warp: przy 2048 wierszach te same 768
+   elementów szło do pamięci współdzielonej 256 razy na warstwę. Razem
+   196,6 -> 225,6.
+3. Nagranie kroku wsadowego jako grafu, możliwe dopiero po zdjęciu odczytu
+   routera i synchronizacji: 187,9 -> 196,6.
+4. Głowa logitów liczona na szerokości, dla której istnieje przemiat wsadowy,
+   oraz `batch_min` 4 -> 2.
+
+Każda z tych zmian zachowuje wygenerowany tekst co do tokena względem ścieżki,
+którą zastąpiła.
+
+Otwarte, wprost z bilansu kroku: projekcje uwagi q/k/v/o siedzą na 34% sufitu
+pasma, czyli mają najgorszy współczynnik w całym kroku. Mechanizm z punktu 2 ich
+NIE dotyczy — `gemv_q4_k_dp4a_batch_impl` nie stage'uje aktywacji, czyta ją
+wprost z globalnej, więc przyczyna jest tam inna i wymaga osobnego rozpoznania.
