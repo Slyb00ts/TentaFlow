@@ -1106,7 +1106,8 @@ impl Model {
         self.profile_target_end()
     }
 
-    /// Sprawdza pełny kontrakt równego dense prefill dla kubełka B4/B8/B16.
+    /// Kontrakt równego prefillu B4/B8/B16. Mieszanka kwalifikuje się jak model
+    /// gęsty: routing widzi wiersze, granice sekwencji zna segmentowana uwaga.
     pub fn dense_prefill_batch_capable(&self, batch: usize, n_tokens: usize) -> bool {
         let logits = match &self.weights.lm_head {
             DevWeight::F16 { rows, cols, .. } => DensePrefillLogitsKind::F16 {
@@ -1143,7 +1144,6 @@ impl Model {
                 .checked_mul(n_tokens)
                 .is_some_and(|total| total <= MAX_PREFILL_CHUNK)
             && !self.is_hybrid()
-            && !self.weights.is_moe()
             && self.tier.is_none()
             && self.kv.cfg.dtype() == DType::F16
             && self
