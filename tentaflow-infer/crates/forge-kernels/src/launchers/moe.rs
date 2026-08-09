@@ -342,7 +342,10 @@ impl Kernels {
             return self
                 .gemm_mxf4_grouped(y, table, xq, xs, tiles, rows, cols, selections, stream);
         }
-        let (name, block, bn, _) = self.grouped_variant(quant)?;
+        // The table was built with one stride for all three projections, so the
+        // tile this launch picks has to be the one that stride belongs to.
+        let wide = tiles.rows > self.grouped_tile_rows(quant, false);
+        let (name, block, bn, _) = self.grouped_variant(quant, wide)?;
         let kernel = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
             grid: (rows.div_ceil(bn) as u32, tiles.count as u32, 1),
@@ -624,6 +627,9 @@ pub struct GroupedTiles<'a> {
     pub first: &'a DevBuffer,
     pub end: &'a DevBuffer,
     pub count: usize,
+    /// Rows one tile covers — the stride the table was built with, and so the
+    /// tile the launch has to pick. One table serves all three projections.
+    pub rows: usize,
 }
 
 /// Rows of the grouped activation one tile of a grouped launch covers.
@@ -654,14 +660,19 @@ pub const GROUPED_TILE_ROWS_MIN: usize = 16;
 impl Kernels {
     /// Kernel, block width, output rows per block and TOKENS per tile for a
     /// grouped stack of this format.
+    ///
+    /// `wide` asks for the tile built for a prefill chunk, where an expert owns
+    /// a hundred rows rather than a handful. It is a request, not a promise:
+    /// only the formats whose wide tile is present answer with it.
     pub(crate) fn grouped_variant(
         &self,
         quant: QuantKind,
+        wide: bool,
     ) -> Result<(&'static str, u32, usize, usize)> {
-        Ok(match quant {
+        let narrow = match quant {
             QuantKind::MXFP4 => {
                 let (name, tokens, threads) = self.mxf4_grouped_variant();
-                (name, threads, 128, tokens)
+                return Ok((name, threads, 128, tokens));
             }
             QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256, 64, 64),
             QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64, 64),
@@ -671,7 +682,63 @@ impl Kernels {
                     "{other:?}: stos ekspertów nie ma zgrupowanego GEMM-u"
                 )))
             }
+        };
+        if !wide {
+            return Ok(narrow);
+        }
+        let (name, block) = match quant {
+            QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped_bm128_bn64", 256),
+            QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped_bm128_bn64", 256),
+            _ => ("gemm_q6_k_f16_grouped_bm128_bn64", 256),
+        };
+        Ok(if self.artifacts.has(name) {
+            (name, block, narrow.2, 128)
+        } else {
+            narrow
         })
+    }
+
+    /// Whether every projection of a routed layer can take the wide tile — the
+    /// three have to share one tile table, so one missing artifact keeps all
+    /// three narrow.
+    fn supports_grouped_wide(&self, quants: [QuantKind; 3]) -> bool {
+        quants.into_iter().all(|quant| {
+            self.grouped_variant(quant, true)
+                .is_ok_and(|(_, _, _, tokens)| tokens > self.grouped_tile_rows(quant, false))
+        })
+    }
+
+    /// Tokens per tile for a layer whose experts hold `starts` selections each.
+    ///
+    /// A wide tile computes a row about 1,75x faster, because a staged weight
+    /// sub-block is multiplied by twice as many tokens before it is dropped. So
+    /// it wins as long as its padding does not inflate the row count by more
+    /// than that — and the test keeps most of that margin as slack, since the
+    /// ratio was measured on one card against one mixture.
+    pub fn grouped_tile_stride(&self, starts: &[u32], quants: [QuantKind; 3]) -> usize {
+        let rows_at = |wide: bool| {
+            let tile = quants
+                .iter()
+                .map(|quant| self.grouped_tile_rows(*quant, wide))
+                .min()
+                .expect("three projections of a routed layer");
+            let rows: usize = starts
+                .windows(2)
+                .map(|pair| (pair[1] - pair[0]) as usize)
+                .map(|count| count.div_ceil(tile) * tile)
+                .sum();
+            (tile, rows)
+        };
+        let (narrow, narrow_rows) = rows_at(false);
+        if !self.supports_grouped_wide(quants) {
+            return narrow;
+        }
+        let (wide, wide_rows) = rows_at(true);
+        if wide_rows * 2 <= narrow_rows * 3 {
+            wide
+        } else {
+            narrow
+        }
     }
 
     /// Whether a stack of this format multiplies as ONE grid over every expert
@@ -685,7 +752,7 @@ impl Kernels {
         }
         matches!(quant, QuantKind::Q4K | QuantKind::Q8_0 | QuantKind::Q6K)
             && self
-                .grouped_variant(quant)
+                .grouped_variant(quant, false)
                 .is_ok_and(|(name, ..)| self.artifacts.has(name))
     }
 
@@ -696,8 +763,8 @@ impl Kernels {
     /// `tile_first` and stops. So the tile table has to be built with exactly
     /// this stride — built wider, the rows past it belong to no launch and are
     /// folded into their tokens as whatever the scratch last held.
-    pub fn grouped_tile_rows(&self, quant: QuantKind) -> usize {
-        self.grouped_variant(quant)
+    pub fn grouped_tile_rows(&self, quant: QuantKind, wide: bool) -> usize {
+        self.grouped_variant(quant, wide)
             .map(|(_, _, _, tokens)| tokens)
             .unwrap_or(GROUPED_TILE_ROWS)
     }

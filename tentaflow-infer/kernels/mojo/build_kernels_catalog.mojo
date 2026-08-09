@@ -291,8 +291,11 @@ from src.gemm import gemm_q4_k_f16, gemm_q4_k_f16_bm64
 from src.gemm import (
     gemm_mxfp4_gguf_f16_grouped,
     gemm_q4_k_i8mma_grouped,
+    gemm_q4_k_i8mma_grouped_bm128_bn64,
     gemm_q6_k_f16_grouped,
+    gemm_q6_k_f16_grouped_bm128_bn64,
     gemm_q8_0_i8mma_grouped,
+    gemm_q8_0_i8mma_grouped_bm128_bn64,
     gemm_q8_0_i8mma,
     gemm_q8_0_i8mma_bm64,
     gemm_q8_0_i8mma_big,
@@ -3320,6 +3323,24 @@ def main() raises:
         gemm_q4_k_i8mma_grouped, dump_asm=Path("gemm_q4_k_i8mma_grouped.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_k_i8mma_grouped"))
+
+    _ = ctx.compile_function[
+        gemm_q4_k_i8mma_grouped_bm128_bn64,
+        dump_asm=Path("gemm_q4_k_i8mma_grouped_bm128_bn64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_k_i8mma_grouped_bm128_bn64"))
+
+    _ = ctx.compile_function[
+        gemm_q6_k_f16_grouped_bm128_bn64,
+        dump_asm=Path("gemm_q6_k_f16_grouped_bm128_bn64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_f16_grouped_bm128_bn64"))
+
+    _ = ctx.compile_function[
+        gemm_q8_0_i8mma_grouped_bm128_bn64,
+        dump_asm=Path("gemm_q8_0_i8mma_grouped_bm128_bn64.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_grouped_bm128_bn64"))
 
     _ = ctx.compile_function[
         gemm_q8_0_i8mma_grouped, dump_asm=Path("gemm_q8_0_i8mma_grouped.ptx")

@@ -836,13 +836,17 @@ impl Model {
         // covers its own width from `tile_first` and does not loop past it, and
         // the three need not share a format — Q4_K_M puts six bits on
         // `ffn_down` and four on the other two. Built wider, the rows past the
-        // narrow tile's end belong to no launch.
-        let stride = [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+        // narrow tile's end belong to no launch. How wide that narrowest tile is
+        // depends on how many rows the experts actually hold, which is why the
+        // counting sort has to have run first.
+        let quants = [&moe.gate_exps, &moe.up_exps, &moe.down_exps]
+            .map(|stack| Self::grouped_stack_quant(stack))
             .into_iter()
-            .filter_map(|stack| stack.representative().block_quant())
-            .map(|quant| self.kernels.grouped_tile_rows(quant))
-            .min()
-            .expect("three projections of a routed layer");
+            .collect::<Result<Vec<_>>>()?;
+        let stride = self.kernels.grouped_tile_stride(
+            &starts,
+            [quants[0], quants[1], quants[2]],
+        );
         let (mut tile_expert, mut tile_first, mut tile_end) = (Vec::new(), Vec::new(), Vec::new());
         for e in 0..experts {
             let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
@@ -866,6 +870,7 @@ impl Model {
             first: &mb.tile_first,
             end: &mb.tile_end,
             count: tile_expert.len(),
+            rows: stride,
         };
 
         self.kernels.gather_rows_f16(

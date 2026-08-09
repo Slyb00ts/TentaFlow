@@ -202,6 +202,7 @@ impl CudaExec {
                 first: tiles.first,
                 end: tiles.end,
                 count: tiles.count,
+                rows: tiles.rows,
             },
             rows,
             w.cols,
@@ -243,6 +244,7 @@ impl CudaExec {
                     first: tiles.first,
                     end: tiles.end,
                     count: tiles.count,
+                    rows: tiles.rows,
                 },
                 rows,
                 w.cols,
@@ -644,11 +646,9 @@ impl CudaExec {
         // three projections of one layer need not share a format — Q4_K_M puts
         // six bits on `ffn_down` and four on the other two — so the table has to
         // fit the narrowest of them or the widest one drops rows.
-        let stride = [gate, up, down]
-            .iter()
-            .map(|w| self.kernels.grouped_tile_rows(w.quant))
-            .min()
-            .expect("three projections");
+        let stride = self
+            .kernels
+            .grouped_tile_stride(&starts, [gate.quant, up.quant, down.quant]);
         let mut tile_expert = Vec::new();
         let mut tile_first = Vec::new();
         let mut tile_end = Vec::new();
@@ -674,6 +674,7 @@ impl CudaExec {
             first: &moe.tile_first,
             end: &moe.tile_end,
             count: tile_expert.len(),
+            rows: stride,
         };
 
         self.kernels.gather_rows_f16(

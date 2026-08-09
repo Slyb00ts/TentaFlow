@@ -3461,6 +3461,16 @@ comptime gemm_q6_k_f16_grouped = gemm_q6_k_grouped_impl[64, 4]
 comptime gemm_q8_0_i8mma_grouped = gemm_i8mma_grouped_impl[64, 64, 8, 0]
 comptime gemm_q4_k_i8mma_grouped = gemm_i8mma_grouped_impl[64, 64, 8, 1]
 
+# A decode step gives a tile three or four rows, a prefill chunk gives it a
+# hundred — and at that width the tile stops being short of rows and starts
+# being short of arithmetic per unpacked byte. A weight sub-block is staged
+# once and multiplied by every token in the tile, so twice the tokens halves
+# what the unpacking costs per row: measured 1,75x per row on the mixture's
+# projections, which is why the wide tile wins even when it pads more.
+comptime gemm_q8_0_i8mma_grouped_bm128_bn64 = gemm_i8mma_grouped_impl[128, 64, 8, 0]
+comptime gemm_q4_k_i8mma_grouped_bm128_bn64 = gemm_i8mma_grouped_impl[128, 64, 8, 1]
+comptime gemm_q6_k_f16_grouped_bm128_bn64 = gemm_q6_k_grouped_impl[128, 8]
+
 comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 64, 8, 0]
 comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 0]
 comptime gemm_q8_0_i8mma_big = gemm_i8mma_impl[128, 128, 16, 0]

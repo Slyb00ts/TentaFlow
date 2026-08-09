@@ -581,6 +581,7 @@ impl Model {
                 first: tiles.first,
                 end: tiles.end,
                 count: tiles.count,
+                rows: tiles.rows,
             },
             n_rows,
             w.cols(),
