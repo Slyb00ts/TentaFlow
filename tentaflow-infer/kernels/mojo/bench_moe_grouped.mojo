@@ -7,7 +7,15 @@
 from std.gpu.host import DeviceContext
 from std.time import perf_counter_ns
 from src.gemm import gemm_q4_k_i8mma_grouped
+from src.decode_dp4a import gemv_q4_k_dp4a_f16_gidx_batch
 from src.gemm import quantize_act_q8_1
+
+
+def _first(t: Int) -> Int:
+    var at = 0
+    for i in range(t):
+        at += 6 if i < 4 else (3 if i < 10 else 2)
+    return at
 
 
 def _run(ctx: DeviceContext, K: Int, N: Int, TILES: Int, SEL: Int) raises:
@@ -78,9 +86,41 @@ def _run(ctx: DeviceContext, K: Int, N: Int, TILES: Int, SEL: Int) raises:
     ctx.synchronize()
     w64 = Float64(perf_counter_ns() - t0) / Float64(ITERS)
 
+    # llama.cpp's shape for the same work: one block per (row-block, selection),
+    # the expert read from ids on device, no staging and no grouping — the
+    # duplicate expert reads are left to the cache.
+    var xh = ctx.enqueue_create_buffer[DType.float16](SEL * K)
+    var yg = ctx.enqueue_create_buffer[DType.float16](SEL * N)
+    var idb = ctx.enqueue_create_buffer[DType.int32](SEL)
+    with idb.map_to_host() as h:
+        for t in range(TILES):
+            var take = 6 if t < 4 else (3 if t < 10 else 2)
+            for j in range(take):
+                idx = _first(t) + j
+                if idx < SEL:
+                    h[idx] = Int32(t)
+    for _ in range(30):
+        ctx.enqueue_function[gemv_q4_k_dp4a_f16_gidx_batch](
+            yg.unsafe_ptr(), tab.unsafe_ptr().bitcast[UnsafePointer[UInt8, MutAnyOrigin]](),
+            xh.unsafe_ptr(), K, N, idb.unsafe_ptr(), 8,
+            grid_dim=((N + 7) // 8, SEL), block_dim=256,
+        )
+    ctx.synchronize()
+    t2 = perf_counter_ns()
+    for _ in range(ITERS):
+        ctx.enqueue_function[gemv_q4_k_dp4a_f16_gidx_batch](
+            yg.unsafe_ptr(), tab.unsafe_ptr().bitcast[UnsafePointer[UInt8, MutAnyOrigin]](),
+            xh.unsafe_ptr(), K, N, idb.unsafe_ptr(), 8,
+            grid_dim=((N + 7) // 8, SEL), block_dim=256,
+        )
+    ctx.synchronize()
+    wg = Float64(perf_counter_ns() - t2) / Float64(ITERS)
+
     print(
         "K", K, "N", N, "tiles", TILES, "sel", SEL,
-        "|", Int(w64 / 1000.0), "us", Int(bytes_read / w64), "GB/s",
+        "| grouped", Int(w64 / 1000.0), "us", Int(bytes_read / w64), "GB/s",
+        "| gidx", Int(wg / 1000.0), "us", Int(bytes_read / wg), "GB/s",
+        "| speedup", w64 / wg,
     )
 
 

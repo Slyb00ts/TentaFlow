@@ -995,18 +995,24 @@ impl Model {
             && self.moe_bufs.is_some()
             && self.weights.layers.iter().all(|layer| match &layer.ffn {
                 LayerFfn::Dense(_) => true,
-                LayerFfn::Moe(moe) => Self::moe_grouped_capable(&self.kernels, moe),
+                LayerFfn::Moe(moe) => {
+                    Self::moe_gidx_capable(moe) || Self::moe_grouped_capable(&self.kernels, moe)
+                }
             })
     }
 
-    /// Routed experts for a decode batch: identical grouped dispatch to the
-    /// prefill chunk, over the batch's `n` rows instead of a chunk's tokens.
+    /// Routed experts for a decode batch.
     ///
-    /// The router readback is what keeps this off the captured graph — the
-    /// counting sort that groups selections by expert is host work, and the
-    /// selection is data, not a model constant. One sync per routed layer buys
-    /// every expert's weights being read once for all the lanes that chose it,
-    /// instead of once per lane.
+    /// A decode batch spreads its selections thin: eight lanes picking eight of
+    /// 128 experts land on about eighteen distinct ones, so a grouped tile built
+    /// for 64 rows owns three or four. Measured on the decode shape, addressing
+    /// the expert per selection on device beats grouping by 1,9x on gate/up —
+    /// the tile's staging pipeline costs more than the duplicate expert reads
+    /// the grouping saves, and those duplicates are cache hits anyway.
+    ///
+    /// So the whole layer runs off `mb.ids`: no counting sort, no gather, no
+    /// scatter, and no `synchronize` — which is also what lets the step be
+    /// recorded as a graph. Grouping stays where its tile is full: prefill.
     pub(crate) fn moe_batch_ffn(
         &self,
         moe: &MoeFfn,
@@ -1019,6 +1025,9 @@ impl Model {
         let k = moe.n_experts_used;
         self.moe_stage_shared_scales(moe, &bb.x, n, stream)?;
         self.moe_route(moe, &bb.x, n, hidden, stream)?;
+        if Self::moe_gidx_capable(moe) {
+            return self.moe_batch_gidx_ffn(moe, n, hidden, stream);
+        }
         self.device
             .copy(&mb.ids, 0, &mb.pinned_ids, 0, n * k * 4, stream)?;
         self.device.synchronize()?;
@@ -1029,6 +1038,100 @@ impl Model {
             )
         };
         self.moe_grouped_ffn(moe, ids, n, moe.moe_inter, hidden, &bb.x, &bb.down, stream)
+    }
+
+    /// The device-addressed expert chain over a whole decode batch: every one of
+    /// the `n * k` selections is a row of its own, and `share = k` is what tells
+    /// a selection which lane's activation it reads. The down projection takes
+    /// `share = 1` because by then each selection already owns its row.
+    fn moe_batch_gidx_ffn(
+        &self,
+        moe: &MoeFfn,
+        n: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        let (k, inter) = (moe.n_experts_used, moe.moe_inter);
+        let selections = n * k;
+        let gate_stack = moe.gate_exps.representative();
+        let up_stack = moe.up_exps.representative();
+        // Gate and up multiply the SAME activation, so one kernel that takes
+        // both tables reads it once and folds the gate function in.
+        let fused = gate_stack.block_quant() == up_stack.block_quant()
+            && gate_stack.cols() == up_stack.cols()
+            && gate_stack.block_quant().is_some_and(|quant| {
+                self.kernels
+                    .gemv_silu_gidx_batch(
+                        quant,
+                        &mb.grouped_gate,
+                        moe.gate_exps.table(),
+                        moe.up_exps.table(),
+                        &bb.x,
+                        inter,
+                        gate_stack.cols(),
+                        &mb.ids,
+                        selections,
+                        k,
+                        stream,
+                    )
+                    .unwrap_or(false)
+            });
+        if !fused {
+            self.gemv_rows_gidx_batch(
+                &mb.grouped_gate,
+                &moe.gate_exps,
+                &bb.x,
+                &mb.ids,
+                selections,
+                k,
+                inter,
+                stream,
+            )?;
+            self.gemv_rows_gidx_batch(
+                &mb.grouped_up,
+                &moe.up_exps,
+                &bb.x,
+                &mb.ids,
+                selections,
+                k,
+                inter,
+                stream,
+            )?;
+            self.kernels.glu_mul_f16(
+                self.ffn_act(),
+                &mb.grouped_gate,
+                &mb.grouped_gate,
+                &mb.grouped_up,
+                selections * inter,
+                stream,
+            )?;
+        }
+        self.gemv_rows_gidx_batch(
+            &mb.grouped_out,
+            &moe.down_exps,
+            &mb.grouped_gate,
+            &mb.ids,
+            selections,
+            1,
+            hidden,
+            stream,
+        )?;
+        // Selections sit in the router's order, so the slot table IS the
+        // identity over them — nothing was reordered on the way here.
+        self.kernels.moe_combine_f16(
+            &bb.down,
+            &mb.grouped_out,
+            &mb.identity,
+            &mb.weights,
+            n,
+            hidden,
+            k,
+            true,
+            stream,
+        )?;
+        self.moe_grouped_shared(moe, n, hidden, &bb.x, &bb.down, stream)
     }
 
     /// Routed experts for a prefill chunk: route all `t` tokens at once, then
