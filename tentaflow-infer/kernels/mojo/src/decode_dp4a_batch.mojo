@@ -39,21 +39,25 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
 
     blocks_per_row = n_cols // 256
     row_base = row * blocks_per_row * 144
-    p = lane % 8
-    c = p // 2
-    half = p % 2
+    # Szesnaście wątków na superblok, nie osiem. Przy ośmiu każdy brał
+    # szesnastobajtowy kawałek i miał dwa razy dłuższy łańcuch zależności przy
+    # połowie ładowań w locie — a ten kernel siedział na 34% pasma i nie
+    # reagował ani na liczbę warpów w bloku, ani na liczbę wierszy na warp.
+    p = lane % 16
+    c = p // 4
+    quarter = p % 4
 
     var acc = InlineArray[Float32, token_tile](fill=0.0)
     var mins = InlineArray[Float32, token_tile](fill=0.0)
-    var b = lane // 8
+    var b = lane // 16
     while b < blocks_per_row:
         off = row_base + b * 144
         dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
         d = Float32(dm[0])
         dmin = Float32(dm[1])
         sc, mn = _q4k_scale_pair(w, off, c)
-        qv = (w + off + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
-            width=4, alignment=16
+        qv = (w + off + 16 + c * 32 + quarter * 8).bitcast[UInt32]().load[
+            width=2, alignment=8
         ]()
         seg = b * 8 + 2 * c
         comptime for token in range(token_tile):
@@ -61,11 +65,15 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
                 xqi = (xq_g + token * n_cols).bitcast[Int32]()
                 var s_lo: Int32 = 0
                 var s_hi: Int32 = 0
-                comptime for t in range(4):
+                comptime for t in range(2):
                     q = Int32(qv[t])
-                    s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
+                    s_lo = _dp4a(
+                        q & 0x0F0F0F0F, xqi[seg * 8 + quarter * 2 + t], s_lo
+                    )
                     s_hi = _dp4a(
-                        (q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + half * 4 + t], s_hi
+                        (q >> 4) & 0x0F0F0F0F,
+                        xqi[seg * 8 + 8 + quarter * 2 + t],
+                        s_hi,
                     )
                 acc[token] += d * sc[0] * xd[seg * n_tokens + token] * Float32(
                     s_lo
@@ -73,12 +81,12 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
                 acc[token] += d * sc[1] * xd[
                     (seg + 1) * n_tokens + token
                 ] * Float32(s_hi)
-                if half == 0:
+                if quarter == 0:
                     mins[token] += dmin * (
                         mn[0] * xs[seg * n_tokens + token]
                         + mn[1] * xs[(seg + 1) * n_tokens + token]
                     )
-        b += 4
+        b += 2
 
     comptime for token in range(token_tile):
         total = warp.sum(acc[token] - mins[token])
