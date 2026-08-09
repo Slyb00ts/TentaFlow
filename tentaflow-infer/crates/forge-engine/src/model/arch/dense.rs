@@ -2426,7 +2426,13 @@ impl Model {
             self.record_hybrid_batch_forward(seqs, tokens)?;
             self.pt_seq = 0;
         } else if self.weights.is_moe() {
-            self.record_batch_forward(b, b, &[])?;
+            // Adresowanie ekspertów na urządzeniu zdjęło z kroku odczyt routera
+            // i synchronizację, więc daje się on wreszcie nagrać jak gęsty.
+            if self.moe_fully_gidx() {
+                self.replay_batch_graph(bucket)?;
+            } else {
+                self.record_batch_forward(b, b, &[])?;
+            }
         } else if mixed {
             let tier = self.tier.as_mut().expect("mixed batch requires tiering");
             for &i in &order[resident..] {
@@ -2439,13 +2445,7 @@ impl Model {
                 .collect();
             self.record_batch_forward(b, resident, &streamed)?;
         } else {
-            // Replay the bucket's forward+logits graph (capture on first use).
-            if !self.batch_graphs.contains_key(&bucket) {
-                let g = self.capture_batch_forward(bucket)?;
-                self.batch_graphs.insert(bucket, g);
-            }
-            let graph = self.batch_graphs.get(&bucket).expect("captured").clone();
-            self.device.launch_graph(&graph, &self.stream)?;
+            self.replay_batch_graph(bucket)?;
         }
 
         // Sample the B live rows on the GPU (outside the graph so the per-seq

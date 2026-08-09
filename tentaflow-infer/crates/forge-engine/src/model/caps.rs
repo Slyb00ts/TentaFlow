@@ -224,6 +224,19 @@ pub(crate) const HYBRID_BATCH_LANES: usize = 2;
 /// więcej kosztuje tyle co nic; wiersze ponad `n_tokens` niosą nieużywane
 /// aktywacje, a ich logitów nikt nie czyta.
 impl Model {
+    /// Odtwarza nagrany forward+logity dla tej szerokości batcha, nagrywając go
+    /// przy pierwszym użyciu. Jedno miejsce dla ścieżki gęstej i routowanej.
+    pub(crate) fn replay_batch_graph(&mut self, bucket: usize) -> Result<()> {
+        if !self.batch_graphs.contains_key(&bucket) {
+            let g = self.capture_batch_forward(bucket)?;
+            self.batch_graphs.insert(bucket, g);
+        }
+        let graph = self.batch_graphs.get(&bucket).expect("captured").clone();
+        self.device.launch_graph(&graph, &self.stream)
+    }
+}
+
+impl Model {
     /// Czy uwaga dekodująca może pójść kernelem dzielącym jeden odczyt K/V
     /// między cztery głowice Q. Liczy się KROTNOŚĆ czwórki, nie dokładnie 4:1:
     /// przy GQA 8:1 dwie grupy dzielą strumień i czytają go dwa razy zamiast
