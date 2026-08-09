@@ -116,3 +116,29 @@ Przegrywamy, w kolejności rozmiaru luki:
 Dekodowanie jednym strumieniem jest w granicach kilku procent wszędzie poza MoE
 (-5…-8% na MXFP4, +12…+25% na Qwen3-30B). Przepustowość dekodowania 27B jest
 ograniczona pasmem: 18 GB wag przez 237 GB/s to sufit 13,1 tok/s, a mierzymy 10,8.
+
+## Gdzie leży reszta dystansu na MoE (profil nsys, 8 sekwencji)
+
+Rozkład czasu GPU dla Qwen3-30B-A3B Q4_K_M przy ośmiu równoległych sekwencjach:
+
+| kernel | udział | wywołań | na wywołanie |
+|---|---:|---:|---:|
+| `gemm_i8mma_grouped` (gate/up ekspertów) | 41,2% | 71 648 | 147,6 us |
+| `gemm_q6_k_grouped` (down ekspertów) | 19,7% | 14 332 | 353,6 us |
+| `gemv_q4_k_dp4a_batch` (projekcje uwagi) | 13,3% | 85 860 | 39,7 us |
+| `attn_decode_split` | 11,1% | 26 260 | 108,9 us |
+
+Grupowane GEMM ekspertów to **61% czasu**. Kafel ma 64 tokeny, a przy ośmiu
+liniach i 128 ekspertach na eksperta przypada zwykle jedna selekcja — pierwsza
+hipoteza była więc taka, że marnujemy 63/64 kafla. Rachunek jej nie potwierdza:
+jedno uruchomienie `i8mma_grouped` czyta wagi kilkudziesięciu RÓŻNYCH ekspertów,
+co przy 147 us odpowiada mniej więcej nominalnemu pasmu karty. Ten kernel jest
+ograniczony ruchem wag, a nie mocą obliczeniową — pusty kafel kosztuje moc,
+której i tak nie brakuje.
+
+Konsekwencja dla dalszej pracy: dopóki routing rozrzuca osiem tokenów po
+kilkudziesięciu ekspertach, ruch wag rośnie prawie liniowo z liczbą sekwencji i
+to on wyznacza sufit. Widoczny wyjątek to wariant Q6_K (projekcja `down`): 353 us
+na wywołanie wobec 147 us dla i8mma przy tej samej klasie kształtu — to jedyny
+z czterech dominujących kerneli, który wyraźnie odstaje od reszty i jest
+pierwszym miejscem do sprawdzenia.
