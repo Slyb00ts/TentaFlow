@@ -128,17 +128,48 @@ Rozkład czasu GPU dla Qwen3-30B-A3B Q4_K_M przy ośmiu równoległych sekwencja
 | `gemv_q4_k_dp4a_batch` (projekcje uwagi) | 13,3% | 85 860 | 39,7 us |
 | `attn_decode_split` | 11,1% | 26 260 | 108,9 us |
 
-Grupowane GEMM ekspertów to **61% czasu**. Kafel ma 64 tokeny, a przy ośmiu
-liniach i 128 ekspertach na eksperta przypada zwykle jedna selekcja — pierwsza
-hipoteza była więc taka, że marnujemy 63/64 kafla. Rachunek jej nie potwierdza:
-jedno uruchomienie `i8mma_grouped` czyta wagi kilkudziesięciu RÓŻNYCH ekspertów,
-co przy 147 us odpowiada mniej więcej nominalnemu pasmu karty. Ten kernel jest
-ograniczony ruchem wag, a nie mocą obliczeniową — pusty kafel kosztuje moc,
-której i tak nie brakuje.
+Grupowane GEMM ekspertów to **61% czasu**.
 
-Konsekwencja dla dalszej pracy: dopóki routing rozrzuca osiem tokenów po
-kilkudziesięciu ekspertach, ruch wag rośnie prawie liniowo z liczbą sekwencji i
-to on wyznacza sufit. Widoczny wyjątek to wariant Q6_K (projekcja `down`): 353 us
-na wywołanie wobec 147 us dla i8mma przy tej samej klasie kształtu — to jedyny
-z czterech dominujących kerneli, który wyraźnie odstaje od reszty i jest
-pierwszym miejscem do sprawdzenia.
+Wcześniejsza wersja tej sekcji twierdziła, że `i8mma_grouped` czyta wagi
+kilkudziesięciu ekspertów i przy 147 us siedzi mniej więcej na nominalnym paśmie
+karty. To było liczone z ZAŁOŻONEJ liczby odrębnych ekspertów i jest nieprawdą.
+Zmierzona liczba kafli (log z `moe_grouped_ffn`, osiem linii, prompt 512) ma
+medianę **18**, nie kilkadziesiąt: osiem sekwencji o wspólnym prefiksie routuje
+się bardzo zbieżnie. Przy 18 ekspertach jedno uruchomienie czyta 15,9 MiB wag,
+co przy 147,6 us daje **108 GB/s**, a wariant Q6_K — 66 GB/s.
+
+Sufit urządzenia zmierzony osobno (`bw.cu`, odczyt 4 GiB): **237 GB/s**. Ten sam
+wzorzec dostępu co w kernelu (128 B z każdego wiersza o skoku 1152 B, footprint
+1 GiB) osiąga **239 GB/s**, czyli układ wag NIE ogranicza niczego. Grupowany GEMM
+ma więc ponad dwukrotny zapas do pasma.
+
+`bench_moe_grouped.mojo` mierzy ten kernel izolowanie na kształcie decode
+(K=2048, N=768, 18 kafli, 64 selekcje). Wychodzi **~125 GB/s przy danych
+rezydentnych w cache** — czyli kernel nie dobija do pasma nawet wtedy, gdy pamięć
+jest za darmo. Ogranicza go własny potok, nie ruch danych.
+
+Cztery strukturalne wyjaśnienia zostały sprawdzone pomiarem i ODPADAJĄ:
+
+| zmiana | oczekiwanie | wynik |
+|---|---|---|
+| `BM` 64 -> 32 | połowa pracy MMA, połowa ruchu aktywacji | 0,99x (bez zmian) |
+| podwójny bufor shared | zapisy stagingu pod MMA zamiast przed nim | 0,95x (gorzej) |
+| `BN` 64 -> 128 | dwa niezależne ładowania na wątek | 0,90x (gorzej) |
+| zajętość 16,7% -> 33,3% | więcej warpów do ukrycia opóźnień | bez zmian |
+
+Ostatni wiersz jest najmocniejszy: `BM=32` realnie schodzi ze 136 do 102
+rejestrów i z 20,48 do 15,36 KiB shared, przez co mieści DWA bloki na SM zamiast
+jednego — i nie zmienia to czasu ani o procent. Zajętość, praca macierzowa,
+przeplot i równoległość kafli są więc wykluczone jako przyczyna.
+
+Co zostaje zmierzone, ale niewyjaśnione: `Warp Cycles Per Issued Instruction`
+13,07 przy `Mem Pipes Busy` 19,8% i `Max Bandwidth` 50%. Kernel czeka, ale nie na
+pasmo i nie na brak warpów. Rozstrzygnięcie wymaga sampling profile'u po
+instrukcjach (`--section SourceCounters`), którego ncu na tej maszynie nie
+domyka — replay zawiesza się na unified memory.
+
+Dwie rzeczy pozostają policzone i pewne, niezależnie od powyższego:
+jeden `device.synchronize()` na warstwę routowaną (28 477 przerw po ~39,5 us w
+profilu, dokładnie jedna na `moe_topk`) to **4% ściany**, a przerwy
+międzykernelowe 2-10 us to kolejne **2,9%** — obie znikają razem z hostowym
+odczytem routera, bo dopiero on pozwala nagrać ten krok jako graf.
