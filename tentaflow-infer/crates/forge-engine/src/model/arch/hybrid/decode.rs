@@ -216,7 +216,8 @@ impl Model {
             LayerMixer::Attention(a) => self.hybrid_attn_mixer(l, a, src),
             LayerMixer::DeltaNet(d) => {
                 self.hybrid_delta_projections(l, d, &b.x, 1)?;
-                self.hybrid_delta_mixer(l, d, 0)
+                self.hybrid_delta_mixer(l, d, 0)?;
+                self.hybrid_delta_out_projection(d, &b.o_out, 1)
             }
         }
     }
@@ -460,19 +461,21 @@ impl Model {
             for (lane, seq) in seqs.iter_mut().enumerate() {
                 self.activate_hybrid_sequence(seq)?;
                 let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
-                self.device.copy(
-                    &bb.x,
-                    lane * hidden * 2,
-                    &self.bufs.x,
-                    0,
-                    hidden * 2,
-                    &self.stream,
-                )?;
                 match &self.weights.layers[layer_index].mixer {
                     LayerMixer::DeepseekAttention(_) => {
                         unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
                     }
                     LayerMixer::Attention(attention) => {
+                        // Mikser uwagi liczy własne projekcje z jednowierszowego
+                        // `bufs`, więc ta linia musi tam trafić w całości.
+                        self.device.copy(
+                            &bb.x,
+                            lane * hidden * 2,
+                            &self.bufs.x,
+                            0,
+                            hidden * 2,
+                            &self.stream,
+                        )?;
                         self.device.copy(
                             &bb.positions,
                             lane * 4,
@@ -498,20 +501,27 @@ impl Model {
                             &self.stream,
                         )?;
                         self.hybrid_attn_mixer(layer_index, attention, &AttnSrc::Paged)?;
+                        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                        self.device.copy(
+                            &self.bufs.o_out,
+                            0,
+                            &bb.o_out,
+                            lane * hidden * 2,
+                            hidden * 2,
+                            &self.stream,
+                        )?;
                     }
+                    // DeltaNet czyta wyłącznie batchowe wejścia projekcji i swój
+                    // stan, a wynik zostawia w wierszu `normed` tej linii — bez
+                    // przelotu przez jednowierszowe `bufs`.
                     LayerMixer::DeltaNet(delta) => {
                         self.hybrid_delta_mixer(layer_index, delta, lane)?;
                     }
                 }
+            }
+            if let LayerMixer::DeltaNet(delta) = &self.weights.layers[layer_index].mixer {
                 let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
-                self.device.copy(
-                    &self.bufs.o_out,
-                    0,
-                    &bb.o_out,
-                    lane * hidden * 2,
-                    hidden * 2,
-                    &self.stream,
-                )?;
+                self.hybrid_delta_out_projection(delta, &bb.o_out, n)?;
             }
 
             let layer = &self.weights.layers[layer_index];

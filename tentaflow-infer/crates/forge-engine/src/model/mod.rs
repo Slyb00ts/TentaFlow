@@ -1894,7 +1894,7 @@ mod moe_bufs;
 use moe_bufs::MoeBufs;
 mod mtp;
 mod quant_dispatch;
-mod caps;
+pub(crate) mod caps;
 pub(crate) use caps::{batched_head_supported, native_mtp_b2_device_embedding, HYBRID_BATCH_LANES};
 mod sample;
 mod scratch;

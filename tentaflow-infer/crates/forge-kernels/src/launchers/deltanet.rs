@@ -1770,9 +1770,11 @@ impl Kernels {
     #[allow(clippy::too_many_arguments)]
     /// `deltanet_gated_rmsnorm_f16` czytający bramkę `z` z przesunięcia lane'a.
     #[allow(clippy::too_many_arguments)]
+    #[allow(clippy::too_many_arguments)]
     pub fn deltanet_gated_rmsnorm_f16_at(
         &self,
         out: &DevBuffer,
+        out_byte_off: usize,
         o_in: &DevBuffer,
         z_in: &DevBuffer,
         z_byte_off: usize,
@@ -1789,7 +1791,7 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(out)
+            .buf_at(out, out_byte_off)?
             .buf(o_in)
             .buf_at(z_in, z_byte_off)?
             .buf(weight)
@@ -1809,20 +1811,9 @@ impl Kernels {
         eps: f32,
         stream: &Stream,
     ) -> Result<()> {
-        let k = self.artifacts.get("deltanet_gated_rmsnorm_f16")?;
-        let cfg = LaunchConfig {
-            grid: (n_v_heads as u32, 1, 1),
-            block: ((d_state as u32).clamp(32, 1024), 1, 1),
-            shared_mem_bytes: 0,
-        };
-        let args = LaunchArgs::new()
-            .buf(out)
-            .buf(o_in)
-            .buf(z_in)
-            .buf(weight)
-            .scalar(d_state as i64)
-            .scalar(eps);
-        self.device.launch(k, &cfg, &args, stream)
+        self.deltanet_gated_rmsnorm_f16_at(
+            out, 0, o_in, z_in, 0, weight, n_v_heads, d_state, eps, stream,
+        )
     }
 
     /// Per-head DeltaNet log-decay g = softplus(alpha + dt_bias)·a (f32 out).

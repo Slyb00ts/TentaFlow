@@ -318,9 +318,8 @@ impl CudaExec {
                 // across heads, so the chunk's tokens flatten into the head axis
                 // rather than needing a pass of their own.
                 self.kernels.deltanet_gated_rmsnorm_f16_at(
-                    &self
-                        .device
-                        .sub_buffer(&s.normed, row * value * 2, take * value * 2)?,
+                    &s.normed,
+                    row * value * 2,
                     &s.o,
                     &s.z,
                     row * value * 2,

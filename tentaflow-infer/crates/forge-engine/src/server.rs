@@ -17,6 +17,7 @@ use forge_types::{ForgeError, Result, Vendor};
 use crate::generate::FinishReason;
 use crate::kv::SeqKv;
 use crate::metrics::{EngineMetrics, SeqTiming};
+use crate::model::caps::hybrid_group_size;
 use crate::model::{hybrid_prefill_b2_backend_capable, Model, PrefillProfile, MAX_PREFILL_CHUNK};
 use crate::sample::{
     apply_logit_bias, apply_penalties, compute_logprob, suppress_eos, GpuSampler, Sampler,
@@ -668,7 +669,10 @@ fn default_batch_min_for(model: &Model) -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&v| v >= 2)
         .unwrap_or_else(|| {
-            if model.weights.small_batch_decode_capable() {
+            // Hybryda nie przechodzi przez token-tile GEMM, którego dotyczy próg
+            // 12, a `small_batch_decode_capable` odrzuca ją zawsze (każda warstwa
+            // DeltaNet), więc bez tego jej batch nie włączał się nigdy.
+            if model.hybrid_batch_capable() || model.weights.small_batch_decode_capable() {
                 2
             } else {
                 12
@@ -693,6 +697,12 @@ pub fn spawn_engine_batched(
     } else {
         batch_min
     };
+    // Bez tego „batch nie wchodzi" i „batch nie pomaga" wyglądają identycznie:
+    // płaska przepustowość zbiorcza przy rosnącej liczbie sekwencji.
+    if model.is_hybrid() {
+        let batched_decode = model.hybrid_batch_capable();
+        tracing::info!(batched_decode, "hybrydowy batch dekodowania");
+    }
     let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
     let mtp_ngram_mode =
         parse_mtp_ngram_batch(std::env::var("FORGE_MTP_NGRAM_BATCH").ok().as_deref())?;
@@ -1815,6 +1825,8 @@ fn batch_gpu_decode(
         while rest.len() >= 2 {
             let take = hybrid_group_size(rest.len());
             decode_gpu_group(model, active, &rest[..take]);
+            EngineMetrics::inc(&metrics.hybrid_decode_batch_steps_total);
+            EngineMetrics::add(&metrics.hybrid_decode_batch_lanes_total, take as u64);
             rest = &rest[take..];
         }
         if let Some(&tail) = rest.first() {
@@ -2098,19 +2110,6 @@ fn mixed_gpu_group(
             true
         }
     }
-}
-
-/// Szerokość jednej hybrydowej grupy decode. Każda szerokość 2..=16 trafia w
-/// strojony kernel NVFP4 GGUF (b2/b3/b4 dokładnie, 5..8 przez b8, 9..16 przez
-/// b16 — ten ostatni dopiero od dodania wariantu `_nvidia`; wcześniej szerokości
-/// 9..16 spadały na przenośny kernel i grupa 10 dawała 37,5 tok/s wobec 67,8 po
-/// naprawie). Powyżej 16 dispatch przechodzi na kafel MMA bm32, którego ta
-/// ścieżka nie ma zmierzonego, więc tam jest granica grupy.
-/// Zmierzone na ThinkingCap-Qwen3.6-27B (RTX 4090, prompt 85, out 128):
-/// C=6 69,1 · C=10 67,8 · C=12 68,9 · C=16 71,3 tok/s.
-fn hybrid_group_size(pending: usize) -> usize {
-    const MAX_GROUP: usize = 16;
-    pending.min(MAX_GROUP)
 }
 
 fn decode_gpu_group(model: &mut Model, active: &mut [ActiveSeq<'_>], feed_idx: &[usize]) {

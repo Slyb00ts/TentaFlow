@@ -179,6 +179,18 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
     );
     counter(
         &mut out,
+        "forge_engine_hybrid_decode_batch_steps_total",
+        "Decode steps executed by the shared hybrid batched forward.",
+        load(&engine.hybrid_decode_batch_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_decode_batch_lanes_total",
+        "Lanes served by those steps; lanes/steps is the realised group width.",
+        load(&engine.hybrid_decode_batch_lanes_total),
+    );
+    counter(
+        &mut out,
         "forge_engine_mtp_ngram_b2_steps_total",
         "MTP+n-gram verifies executed by the paired N/N B2 fast path.",
         load(&engine.mtp_ngram_b2_steps_total),

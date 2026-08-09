@@ -237,3 +237,16 @@ pub(crate) fn batched_head_supported(head: &DevWeight, n_tokens: usize) -> Resul
 pub(crate) fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: bool) -> bool {
     mode == Some("device") && shares_target_embedding
 }
+
+/// Szerokość jednej hybrydowej grupy decode. Każda szerokość 2..=16 trafia w
+/// strojony kernel NVFP4 GGUF (b2/b3/b4 dokładnie, 5..8 przez b8, 9..16 przez
+/// b16 — ten ostatni dopiero od dodania wariantu `_nvidia`; wcześniej szerokości
+/// 9..16 spadały na przenośny kernel i grupa 10 dawała 37,5 tok/s wobec 67,8 po
+/// naprawie). Powyżej 16 dispatch przechodzi na kafel MMA bm32, którego ta
+/// ścieżka nie ma zmierzonego, więc tam jest granica grupy.
+/// Zmierzone na ThinkingCap-Qwen3.6-27B (RTX 4090, prompt 85, out 128):
+/// C=6 69,1 · C=10 67,8 · C=12 68,9 · C=16 71,3 tok/s.
+pub(crate) fn hybrid_group_size(pending: usize) -> usize {
+    const MAX_GROUP: usize = 16;
+    pending.min(MAX_GROUP)
+}

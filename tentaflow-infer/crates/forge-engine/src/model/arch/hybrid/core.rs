@@ -333,7 +333,7 @@ impl Model {
             g: a32(nv)?,
             beta_f: a32(nv)?,
             o: a16(value_dim)?,
-            normed: a16(value_dim)?,
+            normed: a16(rows * value_dim)?,
             pinned_embed: device.alloc(
                 STAGING_SLOTS * p.hidden_size * 2,
                 MemKind::PinnedHost,
@@ -837,7 +837,6 @@ impl Model {
         let z_off = lane * ssm.value_dim() * 2;
         let kernels = &self.kernels;
         let stream = &self.stream;
-        let b = &self.bufs;
         let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
 
         // Rank-1 gated-delta recurrence (advances the state matrix in place).
@@ -851,9 +850,13 @@ impl Model {
                 stream,
             )?,
         }
-        // Output gated RMSNorm then the value-dim → hidden out projection.
+        // Output gated RMSNorm into this lane's row. The value-dim → hidden out
+        // projection is NOT done here: `out_proj` is read once for the whole
+        // group by `hybrid_delta_out_projection`, so a second lane costs
+        // recurrence work but not another pass over the weight.
         kernels.deltanet_gated_rmsnorm_f16_at(
             &hb.normed,
+            lane * ssm.value_dim() * 2,
             &hb.o,
             &hb.batched_z,
             z_off,
@@ -863,8 +866,23 @@ impl Model {
             eps,
             stream,
         )?;
-        self.row_parallel_gemv(&b.o_out, &d.out_proj, &hb.normed, stream)?;
         Ok(())
+    }
+
+    /// Value-dim → hidden output projection for a whole decode group: one pass
+    /// over `out_proj` for `n_rows` lanes whose gated norms already sit in
+    /// `hybrid_bufs.normed`.
+    pub(crate) fn hybrid_delta_out_projection(
+        &self,
+        d: &DeltaNetWeights,
+        out: &DevBuffer,
+        n_rows: usize,
+    ) -> Result<()> {
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        if n_rows == 1 {
+            return self.row_parallel_gemv(out, &d.out_proj, &hb.normed, &self.stream);
+        }
+        self.hybrid_project(out, &d.out_proj, &hb.normed, n_rows)
     }
 
     pub(crate) fn checkpoint_hybrid_layer_major(&self, seq: &SeqKv) -> Result<HybridLayerMajorCheckpoint> {
