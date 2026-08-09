@@ -173,3 +173,49 @@ jeden `device.synchronize()` na warstwę routowaną (28 477 przerw po ~39,5 us w
 profilu, dokładnie jedna na `moe_topk`) to **4% ściany**, a przerwy
 międzykernelowe 2-10 us to kolejne **2,9%** — obie znikają razem z hostowym
 odczytem routera, bo dopiero on pozwala nagrać ten krok jako graf.
+
+## Po przejściu na dyspozycję adresowaną na urządzeniu
+
+llama.cpp nie grupuje selekcji. Dla `ne2 <= MMVQ_MAX_BATCH_SIZE` (8) `MUL_MAT_ID`
+idzie do `mul_mat_vec_q_moe`: siatka `(wiersze / c_rows_per_block, n_expert_used)`,
+blok `(32, n_tokens)`, jeden warp na token, ekspert czytany w kernelu z
+`ids[slot + token * stride]`. Zero pamięci współdzielonej, zero barier, zero
+redukcji między warpami, zero sortowania i zero synchronizacji z hostem —
+duplikaty odczytów eksperta zostawiają cache'owi. Sortowanie z
+`cudaStreamSynchronize` jest u nich ścieżką AWARYJNĄ, nie główną.
+
+Zmierzone u nas na kształcie decode (`bench_moe_grouped.mojo`, 18 ekspertów,
+64 selekcje): kafel grupowany 123 us, dyspozycja per selekcja **63 us** dla
+gate/up (1,94x) i 112 us dla `down` (1,10x). Kernele `gemv_*_gidx_batch` już
+istniały dla kroku jednotokenowego — selekcji brakowało tylko informacji, czyją
+aktywację czyta (`share = k`, token to `sel / k`).
+
+Qwen3-30B-A3B Q4_K_M, prompt 512, agregat decode: **174 -> 190 tok/s** przy
+ośmiu liniach (llama.cpp 238; luka 1,37x -> 1,25x) i 157,6 przy czterech
+(llama.cpp 172). Wyjście osiemnastu równoległych żądań pozostaje spójne.
+
+Rozkład czasu GPU PO zmianie (ten sam protokół, 779 kroków w oknie):
+
+| kernel | udział | na krok | na wywołanie |
+|---|---:|---:|---:|
+| `attn_decode_split` | 22,0% | 48 | 226,5 us |
+| `gemv_silu_q4_k` gidx (gate+up) | 20,0% | 48 | 206,3 us |
+| `gemv_q6_k_dp4a` (głowa logitów) | 18,2% | **7** | 1287,8 us |
+| `gemm_i8mma_impl` (projekcje) | 13,5% | 168 | 39,9 us |
+| `gemv_q6_k_dp4a_gidx_batch` (down Q6_K) | 11,0% | 24 | 227,0 us |
+| `gemv_q4_k_dp4a_gidx_batch` (down Q4_K) | 7,9% | 24 | 163,0 us |
+
+Grupowane GEMM-y zniknęły z profilu, co potwierdza przełączenie. Down w Q6_K i
+w Q4_K mają tę samą efektywność na bajt (364 i 347 GB/s liczone po bajtach
+zgłoszonych), więc sześć bitów nie jest tu winne.
+
+OTWARTY TROP, nierozstrzygnięty. Głowa logitów to `output.weight` Q6_K
+2048 x 151936, czyli 255 MiB na odczyt — dokładnie te 1287,8 us. W profilu pada
+SIEDEM razy na krok, nie raz, co odpowiada liczbie linii: `logits_gemm` ma
+wsadowy przemiat tylko dla szerokości 2, 4 i 8, a poza nimi pętli po liniach.
+Zaokrąglenie szerokości samej głowy w górę do 8 (artefakty `b2/b4/b8` są
+zbudowane dla sm_121a, warunki `cols % 256` i warp 32 spełnione) NIE zmieniło
+przepustowości ani o promil (190,0 -> 190,3), więc przyczyna leży gdzie indziej
+niż w samym progu szerokości i ta zmiana nie została zachowana. Dopóki nie
+wskażę miejsca wywołania, które te siedem uruchomień generuje, jest to 18%
+czasu GPU leżące odłogiem.
