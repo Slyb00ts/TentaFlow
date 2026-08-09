@@ -708,6 +708,20 @@ Ostatnia aktualizacja: 2026-07-25.
   lever: workloady zdominowane długimi promptami zyskują ~5% na
   `FORGE_MIXED_STEP=0`, kosztem 4% TTFT. NIE dodawałem heurystyki wyłączającej
   mixed po długości promptu — to byłoby strojenie bez zrozumienia przyczyny.
+- ❌ **Natywne FP4 w prefillu GGUF: ZMIERZONE I ODRZUCONE (2026-08-09).** GB10
+  retiruje `mma...kind::mxf4nvf4.block_scale` w tym samym czasie co `m16n8k16.f16`
+  (4,358 wobec 4,350 ms, sonda `mma_rate`), więc cztery bity to 504,5 wobec
+  126,4 TFLOP/s — czterokrotność, bo `k` jest 64 zamiast 16. Kernel
+  `gemm_nvfp4_mma_f16` bierze wagi WPROST z bloków GGUF i na kształtach
+  ThinkingCap 27B jest 1,07-1,58x szybszy od `gemm_nvfp4_gguf_f16` (bench
+  `gemm_fp4_bench`, kwantyzacja aktywacji wliczona). ALE instrukcja wymaga
+  czterech bitów PO OBU STRONACH: aktywacja schodzi do NVFP4 i kosztuje
+  **14,18% rozpiętości wyniku** (`gemm_fp4.rs`), przy błędzie samego kafla
+  0,04%. To nie jest zaokrąglenie, tylko inny model — 20% prefillu nie jest tego
+  warte. Prawdziwy zapas leży gdzie indziej: ten sam GEMM osiąga 57 TFLOP/s przy
+  suficie f16 126 TFLOP/s i rusza 31 GB/s przy paśmie 237, więc nie jest ani
+  compute-, ani memory-bound — ogranicza go coś w kaflu, a `ncu` na tej maszynie
+  nie ma.
 - ❌ **Głowa logitów FP8 w batchowym decode: ZMIERZONA I ODRZUCONA
   (2026-07-25).** Profil B=32 pokazał głowę F16 jako 5% czasu GPU przy 465 GB/s
   (262 MB na krok), a paczka `fp8_lm_head` już istnieje — kusząco. Implementacja
