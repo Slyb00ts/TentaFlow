@@ -1003,9 +1003,11 @@ impl CudaExec {
             && weight.quant == QuantKind::Q6K
             && self.kernels.gemv_q6_k_dp4a_batch_out_f32_at(
                 &self.scratch.logits,
+                0,
                 &weight.blocks,
                 0,
                 self.buf(x),
+                0,
                 weight.rows,
                 weight.cols,
                 step.lanes().len(),

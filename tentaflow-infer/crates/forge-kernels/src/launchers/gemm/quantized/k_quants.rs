@@ -814,9 +814,11 @@ impl Kernels {
     pub fn gemv_q6_k_dp4a_batch_out_f32_at(
         &self,
         y_f32: &DevBuffer,
+        y_byte_off: usize,
         w: &DevBuffer,
         w_byte_off: usize,
         x: &DevBuffer,
+        x_byte_off: usize,
         rows: usize,
         cols: usize,
         n_tokens: usize,
@@ -837,20 +839,18 @@ impl Kernels {
         let weight_end = w_byte_off
             .checked_add(weight_bytes)
             .ok_or_else(|| ForgeError::Kernel("q6_k batch head: przepełnienie wag".into()))?;
-        let output_bytes = checked_buffer_bytes("q6_k batch head output", &[n_tokens, rows], 4)?;
-        if y_f32.len() < output_bytes || w.len() < weight_end {
-            return Err(ForgeError::Kernel(
-                "q6_k batch head: bufor wyjścia lub wag jest za mały".into(),
-            ));
+        let out_bytes = checked_buffer_bytes("q6_k batch head output", &[n_tokens, rows], 4)?;
+        if y_f32.len() < y_byte_off + out_bytes || w.len() < weight_end {
+            return Err(ForgeError::Kernel("q6_k batch head: bufor za mały".into()));
         }
-        let sc = self.qk_batch_quantize(x, 0, cols, n_tokens, stream)?;
+        let sc = self.qk_batch_quantize(x, x_byte_off, cols, n_tokens, stream)?;
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(4), 1, 1),
             block: (128, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()
-            .buf(y_f32)
+            .buf_at(y_f32, y_byte_off)?
             .buf_at(w, w_byte_off)?
             .buf(sc.xq.as_ref().expect("xq allocated"))
             .buf(sc.xd.as_ref().expect("xd allocated"))

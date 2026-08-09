@@ -665,9 +665,42 @@ impl Model {
             // Q6_K ma batchowy przemiat z wyjściem f32: jeden odczyt wag na
             // cały batch. Q4_K głowy go nie ma, więc zostaje przy przemiatnięciu
             // per token (patrz niżej).
+            // Przemiat istnieje do ośmiu linii, więc szerszy krok jedzie ÓSEMKAMI:
+            // przy 64 liniach osiem odczytów wag głowy zamiast sześćdziesięciu.
+            DevWeight::Q6K { buf, rows, cols } if n_tokens > 8 => {
+                let mut done = 0usize;
+                while done + 8 <= n_tokens {
+                    if !self.kernels.gemv_q6_k_dp4a_batch_out_f32_at(
+                        y_f32,
+                        done * *rows * 4,
+                        buf,
+                        0,
+                        x,
+                        done * *cols * 2,
+                        *rows,
+                        *cols,
+                        8,
+                        stream,
+                    )? {
+                        break;
+                    }
+                    done += 8;
+                }
+                for lane in done..n_tokens {
+                    self.logits_weight_gemv(
+                        y_f32,
+                        lane * *rows * 4,
+                        x,
+                        lane * *cols * 2,
+                        &self.weights.lm_head,
+                        stream,
+                    )?;
+                }
+                Ok(())
+            }
             DevWeight::Q6K { buf, rows, cols }
                 if self.kernels.gemv_q6_k_dp4a_batch_out_f32_at(
-                    y_f32, buf, 0, x, *rows, *cols, n_tokens, stream,
+                    y_f32, 0, buf, 0, x, 0, *rows, *cols, n_tokens, stream,
                 )? =>
             {
                 Ok(())
