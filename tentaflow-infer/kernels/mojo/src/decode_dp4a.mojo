@@ -32,6 +32,12 @@ from src.reduce import block_reduce_sum
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
+# Ile wierszy wyjścia liczy JEDEN warp, zanim blok się skończy. Staging
+# aktywacji jest kosztem wejścia do bloku, nie kosztem wiersza: przy 768
+# wierszach i ośmiu na blok te same 2048 elementów kwantowało się do pamięci
+# współdzielonej 96 razy na warstwę. Cztery wiersze na warp płacą je 24 razy,
+# a każdy wiersz liczy się osobno, więc wynik jest ten sam co do bitu.
+comptime ROWS_PER_WARP = 8
 comptime MAX_HIDDEN = 8192
 # Column bound for the kernels that stage x from GLOBAL memory (plain +
 # residual variants): 16 KiB int8 + 4 KiB scale/sum pairs of shared memory.
@@ -1484,16 +1490,18 @@ def gemv_silu_q4_k_dp4a_f16_gidx_batch(
     _stage_quant_global(x + (sel // share) * n_cols, xq, xds, n_cols, tid)
     lane = tid % WARP
     wid = tid // WARP
-    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
-    if row >= n_rows:
-        return
+    row0 = Int(block_idx.x) * (ROWS_PER_BLOCK * ROWS_PER_WARP) + wid * ROWS_PER_WARP
     e = Int(ids[sel])
-    gu = _dot2_q4k_i8(wtab_g[e], row, wtab_u[e], row, xq, xds, n_cols, lane)
-    if lane == 0:
-        g = Float32(Float16(gu[0]))
-        act[sel * n_rows + row] = Float16(
-            g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
-        )
+    for r in range(ROWS_PER_WARP):
+        row = row0 + r
+        if row >= n_rows:
+            break
+        gu = _dot2_q4k_i8(wtab_g[e], row, wtab_u[e], row, xq, xds, n_cols, lane)
+        if lane == 0:
+            g = Float32(Float16(gu[0]))
+            act[sel * n_rows + row] = Float16(
+                g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
+            )
 
 
 def gemv_silu_q6_k_dp4a_f16_gidx_batch(
@@ -1518,16 +1526,18 @@ def gemv_silu_q6_k_dp4a_f16_gidx_batch(
     _stage_quant_global(x + (sel // share) * n_cols, xq, xds, n_cols, tid)
     lane = tid % WARP
     wid = tid // WARP
-    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
-    if row >= n_rows:
-        return
+    row0 = Int(block_idx.x) * (ROWS_PER_BLOCK * ROWS_PER_WARP) + wid * ROWS_PER_WARP
     e = Int(ids[sel])
-    gu = _dot2_q6k_i8(wtab_g[e], row, wtab_u[e], row, xq, xds, n_cols, lane)
-    if lane == 0:
-        g = Float32(Float16(gu[0]))
-        act[sel * n_rows + row] = Float16(
-            g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
-        )
+    for r in range(ROWS_PER_WARP):
+        row = row0 + r
+        if row >= n_rows:
+            break
+        gu = _dot2_q6k_i8(wtab_g[e], row, wtab_u[e], row, xq, xds, n_cols, lane)
+        if lane == 0:
+            g = Float32(Float16(gu[0]))
+            act[sel * n_rows + row] = Float16(
+                g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
+            )
 
 
 def gemv_q4_k_dp4a_f16_gidx_batch(

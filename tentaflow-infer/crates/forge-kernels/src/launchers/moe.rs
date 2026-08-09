@@ -529,7 +529,8 @@ impl Kernels {
         share: usize,
         stream: &Stream,
     ) -> Result<bool> {
-        const ROWS_PER_BLOCK: u32 = 8;
+        // Kernel scalony liczy cztery wiersze na warp z jednego stagingu.
+        const ROWS_PER_BLOCK: u32 = 64;
         if cols > Self::DP4A_MAX_COLS {
             return Ok(false);
         }
