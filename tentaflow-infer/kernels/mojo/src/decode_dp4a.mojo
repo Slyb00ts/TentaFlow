@@ -764,13 +764,15 @@ def gemv_q4_k_dp4a_f16_gidx(
     _stage_quant_global(x, xq, xds, n_cols, tid)
     lane = tid % WARP
     wid = tid // WARP
-    lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
-    if lrow >= n_rows:
-        return
+    row0 = Int(block_idx.x) * (ROWS_PER_BLOCK * ROWS_PER_WARP) + wid * ROWS_PER_WARP
     w = wtab[Int(ids[sel])]
-    total = _dot_q4k_i8(w, lrow, xq, xds, n_cols, lane)
-    if lane == 0:
-        y[lrow] = Float16(total)
+    for r in range(ROWS_PER_WARP):
+        lrow = row0 + r
+        if lrow >= n_rows:
+            break
+        total = _dot_q4k_i8(w, lrow, xq, xds, n_cols, lane)
+        if lane == 0:
+            y[lrow] = Float16(total)
 
 
 def gemv_q4_k_dp4a_out_f32(
@@ -854,13 +856,15 @@ def gemv_q6_k_dp4a_f16_gidx(
     _stage_quant_global(x, xq, xds, n_cols, tid)
     lane = tid % WARP
     wid = tid // WARP
-    lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
-    if lrow >= n_rows:
-        return
+    row0 = Int(block_idx.x) * (ROWS_PER_BLOCK * ROWS_PER_WARP) + wid * ROWS_PER_WARP
     w = wtab[Int(ids[sel])]
-    total = _dot_q6k_i8(w, lrow, xq, xds, n_cols, lane)
-    if lane == 0:
-        y[lrow] = Float16(total)
+    for r in range(ROWS_PER_WARP):
+        lrow = row0 + r
+        if lrow >= n_rows:
+            break
+        total = _dot_q6k_i8(w, lrow, xq, xds, n_cols, lane)
+        if lane == 0:
+            y[lrow] = Float16(total)
 
 
 def gemv_q6_k_dp4a_out_f32(

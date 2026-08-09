@@ -418,7 +418,7 @@ impl Kernels {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_f16_gidx")?;
         let k = self.artifacts.get("gemv_q4_k_dp4a_f16_gidx")?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), 1, 1),
+            grid: ((rows as u32).div_ceil(64), 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -455,7 +455,7 @@ impl Kernels {
         Self::check_dp4a_cols(cols, 256, "gemv_q6_k_dp4a_f16_gidx")?;
         let k = self.artifacts.get("gemv_q6_k_dp4a_f16_gidx")?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(8), 1, 1),
+            grid: ((rows as u32).div_ceil(64), 1, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
@@ -574,8 +574,14 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         // Rows one block covers, mirroring the single-selection launchers these
-        // wrap — the batched kernel only adds a grid dimension.
-        const ROWS_PER_BLOCK: u32 = 8;
+        // wrap — the batched kernel only adds a grid dimension. Ścieżki dp4a
+        // liczą osiem wierszy na warp z jednego stagingu aktywacji, pozostałe
+        // po jednym.
+        let rows_per_block: u32 = match quant {
+            QuantKind::Q4K => 64,
+            QuantKind::Q6K if cols <= Self::DP4A_MAX_COLS => 64,
+            _ => 8,
+        };
         let name = match quant {
             QuantKind::Q4K => "gemv_q4_k_dp4a_f16_gidx_batch",
             // The integer route stages the activation in shared memory, so it
@@ -591,7 +597,7 @@ impl Kernels {
         };
         let k = self.artifacts.get(name)?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(ROWS_PER_BLOCK), selections as u32, 1),
+            grid: ((rows as u32).div_ceil(rows_per_block), selections as u32, 1),
             block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
