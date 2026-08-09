@@ -531,7 +531,9 @@ impl Model {
                 .rmsnorm_residual_f16(&bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, stream)?;
         }
 
-        self.logits_gemm(&bb.logits, &bb.x, n, stream)
+        // Głowa liczy się na szerokości, dla której istnieje wsadowy przemiat:
+        // jej wagi czyta się wtedy raz, a nie raz na linię.
+        self.logits_gemm(&bb.logits, &bb.x, super::caps::head_batch_width(n), stream)
     }
 
     /// Capture `record_batch_forward(bucket)` into a replayable graph.

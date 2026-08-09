@@ -209,13 +209,27 @@ Grupowane GEMM-y zniknęły z profilu, co potwierdza przełączenie. Down w Q6_K
 w Q4_K mają tę samą efektywność na bajt (364 i 347 GB/s liczone po bajtach
 zgłoszonych), więc sześć bitów nie jest tu winne.
 
-OTWARTY TROP, nierozstrzygnięty. Głowa logitów to `output.weight` Q6_K
-2048 x 151936, czyli 255 MiB na odczyt — dokładnie te 1287,8 us. W profilu pada
-SIEDEM razy na krok, nie raz, co odpowiada liczbie linii: `logits_gemm` ma
-wsadowy przemiat tylko dla szerokości 2, 4 i 8, a poza nimi pętli po liniach.
-Zaokrąglenie szerokości samej głowy w górę do 8 (artefakty `b2/b4/b8` są
-zbudowane dla sm_121a, warunki `cols % 256` i warp 32 spełnione) NIE zmieniło
-przepustowości ani o promil (190,0 -> 190,3), więc przyczyna leży gdzie indziej
-niż w samym progu szerokości i ta zmiana nie została zachowana. Dopóki nie
-wskażę miejsca wywołania, które te siedem uruchomień generuje, jest to 18%
-czasu GPU leżące odłogiem.
+### Głowa logitów przy szerokości spoza 2/4/8
+
+Kernel z tego profilu (`84ba89e7dc396c66`) to `gemv_q6_k_dp4a_out_f32`, czyli
+pętla głowy PER LINIA. Głowa to `output.weight` Q6_K 2048 x 151936 — 255 MiB na
+jeden odczyt, dokładnie te 1287,8 us. Wsadowe przemiaty istnieją dla szerokości
+2, 4 i 8; krok o pięciu, sześciu czy siedmiu liniach nie trafiał w żaden i
+czytał wagi głowy raz na linię.
+
+Pierwsza próba wyglądała na nieskuteczną, bo mierzyłem ją ośmioma identycznymi
+żądaniami — tam krok ma osiem linii przez niemal cały przebieg, a szerokości
+pośrednie występują wyłącznie na ogonie. Okno tamtego profilu trafiło właśnie
+w ogon, stąd 18,2%.
+
+Test rozstrzygający to SIEDEM klientów, bo wtedy krok ma siedem linii przez cały
+czas. Qwen3-30B-A3B Q4_K_M, prompt 512, 192 tokeny na linię: **146,6 -> 172,2
+tok/s** zbiorczo, 22,10 -> 26,18 na sekwencję. Licznik ścieżek potwierdza
+mechanizm: 187 wywołań pętli per linia przed zmianą, zero po niej (189
+przemiatów wsadowych szerokości 8).
+
+Przed poprawką SIEDEM klientów dawało mniej NA SEKWENCJĘ niż osiem. Teraz szereg
+jest monotoniczny: 5 -> 30,4, 6 -> 28,1, 7 -> 26,2, 8 -> 25,0 tok/s na
+sekwencję. Wiersze ponad `n_tokens` niosą nieużywane aktywacje, a ich logitów
+nikt nie czyta; głowa jest ograniczona odczytem wag, więc kilka wierszy więcej
+kosztuje tyle co nic.

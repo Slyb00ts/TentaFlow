@@ -215,6 +215,22 @@ pub(crate) const HYBRID_BATCH_LANES: usize = 2;
 /// daje im właśnie głowę Q6_K. NVFP4 nie ma przemiatnięcia per token, którym
 /// K-kwanty domykają resztę — jego kernel batchowy ma stałe szerokości, więc
 /// pytanie o format bez szerokości nie ma tu sensownej odpowiedzi.
+/// Szerokość, na której liczymy głowę logitów dla kroku o `n_tokens` liniach.
+///
+/// Wsadowe przemiaty głowy istnieją dla 2, 4 i 8. Krok o siedmiu liniach nie
+/// trafiał w żaden i spadał na pętlę per linia, czyli PEŁNY odczyt wag głowy
+/// razy liczba linii — na Qwen3-30B-A3B Q4_K_M to 255 MiB siedem razy zamiast
+/// raz. Głowa jest ograniczona odczytem wag, więc policzenie kilku wierszy
+/// więcej kosztuje tyle co nic; wiersze ponad `n_tokens` niosą nieużywane
+/// aktywacje, a ich logitów nikt nie czyta.
+pub(crate) fn head_batch_width(n_tokens: usize) -> usize {
+    match n_tokens {
+        3 => 4,
+        5..=7 => 8,
+        other => other,
+    }
+}
+
 pub(crate) fn batched_head_supported(head: &DevWeight, n_tokens: usize) -> Result<()> {
     let supported = match head {
         DevWeight::F16 { .. }
@@ -304,7 +320,8 @@ impl Model {
     /// scratch's gate/up rows for the shared expert — and the first decode can
     /// come before any prefill has allocated them.
     pub(crate) fn ensure_batch_scratch(&mut self, cap: usize) -> Result<()> {
-        self.ensure_batch(cap)?;
+        // Głowa liczy się na `head_batch_width`, która bywa szersza niż krok.
+        self.ensure_batch(head_batch_width(cap))?;
         if self.weights.is_moe() {
             self.ensure_prefill_bufs()?;
         }
