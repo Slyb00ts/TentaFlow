@@ -2304,9 +2304,9 @@ impl Model {
                     .into(),
             ));
         }
-        // MoE routing chooses experts per token from a host readback, so the
-        // batched forward cannot be graph-captured; MoE decodes one sequence at
-        // a time (batched grouped-GEMM MoE is a tracked follow-up).
+        // `run_step_moe` is single-row throughout and has no batched twin.
+        // Routing is not the blocker (`moe_route` takes a row count, `_gidx`
+        // dispatches on device); the grouped GEMM per expert is what is missing.
         if self.weights.is_moe() {
             return Err(ForgeError::Unsupported(
                 "MoE models support single-stream decode only; disable batching".into(),
