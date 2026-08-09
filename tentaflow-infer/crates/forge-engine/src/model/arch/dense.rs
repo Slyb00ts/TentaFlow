@@ -2288,30 +2288,7 @@ impl Model {
                 "batched_decode: seqs/tokens/params length mismatch".into(),
             ));
         }
-        if self.is_hybrid() && !self.hybrid_batch_capable() {
-            return Err(ForgeError::Unsupported(
-                "hybrydowy batch nie spełnia kontraktu modelu lub pamięci KV".into(),
-            ));
-        }
-        // Rot modes commit each appended token into the packed low-bit store on
-        // the single-stream decode path only; the batched path would append to
-        // the f16 slab without packing, leaving the packed store stale. Refuse
-        // rather than read a stale store. (Batched rot decode is a follow-up.)
-        if self.kv.cfg.quant.is_rot() {
-            return Err(ForgeError::Unsupported(
-                "rotational KV (rot4/rot3) supports single-stream decode only; \
-                 disable batching for this model"
-                    .into(),
-            ));
-        }
-        // `run_step_moe` is single-row throughout and has no batched twin.
-        // Routing is not the blocker (`moe_route` takes a row count, `_gidx`
-        // dispatches on device); the grouped GEMM per expert is what is missing.
-        if self.weights.is_moe() {
-            return Err(ForgeError::Unsupported(
-                "MoE models support single-stream decode only; disable batching".into(),
-            ));
-        }
+        self.batched_decode_admits()?;
         let p = self.weights.descriptor.params.clone();
         for (seq, &token) in seqs.iter().zip(tokens) {
             if seq.len >= p.max_position_embeddings {
@@ -2346,7 +2323,7 @@ impl Model {
             }
             self.tier_balance(seqs, b)?;
         }
-        self.ensure_batch(b)?;
+        self.ensure_batch_scratch(b)?;
         // Streamed lanes (spilled KV) pack at the tail of the lane order: the
         // batch-wide paged attention launch covers exactly the leading
         // resident lanes, and each streamed lane attends over the staging
@@ -2356,7 +2333,9 @@ impl Model {
         let mut order: Vec<usize> = (0..b).collect();
         order.sort_by_key(|&i| !seqs[i].spilled.is_empty());
         let resident = seqs.iter().filter(|s| s.spilled.is_empty()).count();
-        let mixed = resident < b;
+        // Grupowany MoE czyta wybór routera na hoście: nie da się go przechwycić
+        // do grafu, a martwe linie kafla weszłyby do sortowania po ekspertach.
+        let mixed = resident < b || self.weights.is_moe();
         let bucket = if mixed { b } else { self.bucket_for(b) };
         if b > self.batch_cap {
             return Err(ForgeError::Scheduler(format!(
@@ -2450,6 +2429,8 @@ impl Model {
             }
             self.record_hybrid_batch_forward(seqs, tokens)?;
             self.pt_seq = 0;
+        } else if self.weights.is_moe() {
+            self.record_batch_forward(b, b, &[])?;
         } else if mixed {
             let tier = self.tier.as_mut().expect("mixed batch requires tiering");
             for &i in &order[resident..] {

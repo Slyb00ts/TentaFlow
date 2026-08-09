@@ -786,17 +786,19 @@ impl Model {
     /// million launches of a tile that covers seven blocks of a card with
     /// dozens of multiprocessors. Here each expert reads the block of rows that
     /// chose it, and the whole layer is three launches plus the gate.
-    fn moe_grouped_prefill(
+    #[allow(clippy::too_many_arguments)]
+    fn moe_grouped_ffn(
         &self,
         moe: &MoeFfn,
         ids: &[i32],
         t: usize,
         inter: usize,
         hidden: usize,
+        x: &DevBuffer,
+        out: &DevBuffer,
         stream: &Stream,
     ) -> Result<()> {
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
-        let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
         let (k, experts) = (moe.n_experts_used, moe.n_experts);
         let selections = t * k;
 
@@ -868,7 +870,7 @@ impl Model {
 
         self.kernels.gather_rows_f16(
             &mb.grouped_x,
-            &pb.x,
+            x,
             &mb.order,
             selections,
             hidden,
@@ -916,7 +918,7 @@ impl Model {
             stream,
         )?;
         self.kernels.moe_combine_f16(
-            &pb.down,
+            out,
             &mb.grouped_out,
             &mb.slots,
             &mb.weights,
@@ -926,7 +928,7 @@ impl Model {
             true,
             stream,
         )?;
-        self.moe_grouped_shared(moe, t, hidden, stream)
+        self.moe_grouped_shared(moe, t, hidden, x, out, stream)
     }
 
     /// The always-on expert of a prefill chunk: a dense SwiGLU over all `t`
@@ -936,27 +938,33 @@ impl Model {
     /// as its `[t, hidden]` landing — the routed answers have been folded into
     /// `pb.down` by then and that scratch is free. Each row is scaled by its own
     /// gate, still on the device, so nothing here reads back.
+    #[allow(clippy::too_many_arguments)]
     fn moe_grouped_shared(
         &self,
         moe: &MoeFfn,
         t: usize,
         hidden: usize,
+        x: &DevBuffer,
+        out: &DevBuffer,
         stream: &Stream,
     ) -> Result<()> {
         let Some(sh) = &moe.shared else {
             return Ok(());
         };
         let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        // Gate i up idą przez scratch prefillu także w batchu dekodowania: jest
+        // wymiarowany na pełny chunk, więc mieści każdą szerokość batcha, a
+        // własny bufor dublowałby tę samą pamięć.
         let pb = self.prefill_bufs.as_ref().expect("prefill bufs allocated");
         let sh_inter = sh.down.cols();
         match &sh.gate_up {
             GateUpWeights::Fused(w) => {
-                self.gemm_rows(&pb.gate, w, &pb.x, t, 0, sh_inter, stream)?;
-                self.gemm_rows(&pb.up, w, &pb.x, t, sh_inter, sh_inter, stream)?;
+                self.gemm_rows(&pb.gate, w, x, t, 0, sh_inter, stream)?;
+                self.gemm_rows(&pb.up, w, x, t, sh_inter, sh_inter, stream)?;
             }
             GateUpWeights::Split { gate, up } => {
-                self.gemm_rows(&pb.gate, gate, &pb.x, t, 0, gate.rows(), stream)?;
-                self.gemm_rows(&pb.up, up, &pb.x, t, 0, up.rows(), stream)?;
+                self.gemm_rows(&pb.gate, gate, x, t, 0, gate.rows(), stream)?;
+                self.gemm_rows(&pb.up, up, x, t, 0, up.rows(), stream)?;
             }
         }
         self.kernels
@@ -965,7 +973,7 @@ impl Model {
         // One expert per token, its row at its own index: the combine with
         // `top_k = 1` over the identity IS `pb.down[r] += gate[r] · shared[r]`.
         self.kernels.moe_combine_f16(
-            &pb.down,
+            out,
             &mb.grouped_out,
             &mb.identity,
             &mb.shared_scale,
@@ -975,6 +983,52 @@ impl Model {
             false,
             stream,
         )
+    }
+
+    /// Whether a decode batch may run this model's routed FFN as one grouped
+    /// dispatch: every routed layer needs the grouped kernels and a fully
+    /// resident expert stack. The scratch it borrows is allocated on demand and
+    /// is deliberately NOT part of the answer — the engine asks this before the
+    /// first prefill has run, and a `false` there would pin `batch_min` at 12.
+    pub fn moe_batch_capable(&self) -> bool {
+        self.weights.is_moe()
+            && self.moe_bufs.is_some()
+            && self.weights.layers.iter().all(|layer| match &layer.ffn {
+                LayerFfn::Dense(_) => true,
+                LayerFfn::Moe(moe) => Self::moe_grouped_capable(&self.kernels, moe),
+            })
+    }
+
+    /// Routed experts for a decode batch: identical grouped dispatch to the
+    /// prefill chunk, over the batch's `n` rows instead of a chunk's tokens.
+    ///
+    /// The router readback is what keeps this off the captured graph — the
+    /// counting sort that groups selections by expert is host work, and the
+    /// selection is data, not a model constant. One sync per routed layer buys
+    /// every expert's weights being read once for all the lanes that chose it,
+    /// instead of once per lane.
+    pub(crate) fn moe_batch_ffn(
+        &self,
+        moe: &MoeFfn,
+        n: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let mb = self.moe_bufs.as_ref().expect("MoE model has moe_bufs");
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        let k = moe.n_experts_used;
+        self.moe_stage_shared_scales(moe, &bb.x, n, stream)?;
+        self.moe_route(moe, &bb.x, n, hidden, stream)?;
+        self.device
+            .copy(&mb.ids, 0, &mb.pinned_ids, 0, n * k * 4, stream)?;
+        self.device.synchronize()?;
+        let ids = unsafe {
+            std::slice::from_raw_parts(
+                mb.pinned_ids.host_ptr().expect("pinned host mapping") as *const i32,
+                n * k,
+            )
+        };
+        self.moe_grouped_ffn(moe, ids, n, moe.moe_inter, hidden, &bb.x, &bb.down, stream)
     }
 
     /// Routed experts for a prefill chunk: route all `t` tokens at once, then
@@ -1016,7 +1070,7 @@ impl Model {
         // `t` rund odczytu na jedną; gdy suma nie mieści się w slotach, zostaje
         // stronicowanie per token — wtedy i tak trzeba by ich wypierać nawzajem.
         if Self::moe_grouped_capable(&self.kernels, moe) {
-            return self.moe_grouped_prefill(moe, ids, t, inter, hidden, stream);
+            return self.moe_grouped_ffn(moe, ids, t, inter, hidden, &pb.x, &pb.down, stream);
         }
         let shared_scales = Self::moe_shared_scales(mb, t);
         let chunk_union = self.chunk_expert_union(ids);

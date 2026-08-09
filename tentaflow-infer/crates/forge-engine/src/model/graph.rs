@@ -440,6 +440,21 @@ impl Model {
                 stream,
             )?;
 
+            // Warstwa routowana idzie jednym grupowanym zgłoszeniem: ekspert
+            // czyta swoje wagi raz dla wszystkich linii, które go wybrały.
+            if let LayerFfn::Moe(moe) = &layer.ffn {
+                self.moe_batch_ffn(moe, n, hidden, stream)?;
+                let next_norm = if l + 1 < n_layers {
+                    &self.weights.layers[l + 1].attn_norm
+                } else {
+                    &self.weights.output_norm
+                };
+                kernels.rmsnorm_residual_f16(
+                    &bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, stream,
+                )?;
+                continue;
+            }
+
             let mut segmented_gate_up = false;
             match &layer.dense_ffn()?.gate_up {
                 GateUpWeights::Fused(w) => {

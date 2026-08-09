@@ -250,3 +250,69 @@ pub(crate) fn hybrid_group_size(pending: usize) -> usize {
     const MAX_GROUP: usize = 16;
     pending.min(MAX_GROUP)
 }
+
+impl Model {
+    /// Whether this model's shape admits a batched decode forward at all.
+    ///
+    /// Three independent contracts, each with its own reason to refuse:
+    /// the hybrid needs exact small-batch kernels and resident KV; rot KV packs
+    /// appended tokens only on the single-stream path, so a batch would leave
+    /// the packed store stale; and a routed layer batches only through the
+    /// grouped dispatch — without it every lane re-reads its experts anyway,
+    /// which is what the serial path already does.
+    pub(crate) fn batched_decode_admits(&self) -> Result<()> {
+        if self.is_hybrid() && !self.hybrid_batch_capable() {
+            return Err(ForgeError::Unsupported(
+                "hybrydowy batch nie spełnia kontraktu modelu lub pamięci KV".into(),
+            ));
+        }
+        if self.kv.cfg.quant.is_rot() {
+            return Err(ForgeError::Unsupported(
+                "rotational KV (rot4/rot3) supports single-stream decode only; \
+                 disable batching for this model"
+                    .into(),
+            ));
+        }
+        if self.weights.is_moe() && !self.moe_batch_capable() {
+            return Err(ForgeError::Unsupported(
+                "ten model MoE nie ma grupowanej ścieżki ekspertów; batch wyłączony".into(),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Model {
+    /// Decode concurrency at which this model's batched forward starts to win.
+    ///
+    /// Three regimes, each measured: a path with small-batch kernels (hybrid,
+    /// NVFP4/K-quant dense) wins from two; grouped MoE pays a counting sort and
+    /// one router readback per routed layer, which two lanes do not cover
+    /// (Qwen3-30B-A3B, GB10, P512: 73 tok/s batched vs 87 serialized) but four
+    /// do (114); everything else goes through a token tile that only amortizes
+    /// near twelve.
+    pub(crate) fn batch_min_default(&self) -> usize {
+        if self.hybrid_batch_capable() || self.weights.small_batch_decode_capable() {
+            return 2;
+        }
+        if self.moe_batch_capable() {
+            return 4;
+        }
+        12
+    }
+}
+
+impl Model {
+    /// Scratch a decode batch of `cap` lanes needs before its forward runs.
+    ///
+    /// Beyond the batch buffers themselves, a grouped MoE borrows the prefill
+    /// scratch's gate/up rows for the shared expert — and the first decode can
+    /// come before any prefill has allocated them.
+    pub(crate) fn ensure_batch_scratch(&mut self, cap: usize) -> Result<()> {
+        self.ensure_batch(cap)?;
+        if self.weights.is_moe() {
+            self.ensure_prefill_bufs()?;
+        }
+        Ok(())
+    }
+}

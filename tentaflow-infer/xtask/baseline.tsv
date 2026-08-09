@@ -116,11 +116,11 @@ kernel_geometry	kernels/mojo/build/sm_89/manifest.json	57
 placeholder	crates/forge-engine/src/speculation/config.rs	1
 placeholder	crates/forge-onnx/src/interp.rs	1
 size	crates/forge-cli/src/main.rs	2847
-size	crates/forge-engine/src/model/arch/dense.rs	2702
+size	crates/forge-engine/src/model/arch/dense.rs	2683
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2024
 size	crates/forge-engine/src/model/mod.rs	3667
 size	crates/forge-engine/src/model/mtp.rs	3132
-size	crates/forge-engine/src/server.rs	3258
+size	crates/forge-engine/src/server.rs	3251
 size	crates/forge-engine/src/tensor_parallel.rs	1661
 size	crates/forge-engine/src/weights.rs	5031
 size	crates/forge-engine/tests/hybrid_state_pool_gpu.rs	3514

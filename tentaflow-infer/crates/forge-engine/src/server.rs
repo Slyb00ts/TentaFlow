@@ -669,14 +669,7 @@ fn default_batch_min_for(model: &Model) -> usize {
         .and_then(|v| v.parse().ok())
         .filter(|&v| v >= 2)
         .unwrap_or_else(|| {
-            // Hybryda nie przechodzi przez token-tile GEMM, którego dotyczy próg
-            // 12, a `small_batch_decode_capable` odrzuca ją zawsze (każda warstwa
-            // DeltaNet), więc bez tego jej batch nie włączał się nigdy.
-            if model.hybrid_batch_capable() || model.weights.small_batch_decode_capable() {
-                2
-            } else {
-                12
-            }
+            model.batch_min_default()
         })
 }
 
@@ -1785,7 +1778,7 @@ fn batch_gpu_decode(
     }
 
     let hybrid_batch = model.hybrid_batch_capable() && feed_idx.len() >= 2;
-    let serial_only = model.weights.is_moe()
+    let serial_only = (model.weights.is_moe() && !model.moe_batch_capable())
         || model.kv.cfg.quant.is_rot()
         || (model.is_hybrid() && !hybrid_batch);
     // Mixed step: fold this decode step into the oldest pending sequence's
@@ -1808,8 +1801,8 @@ fn batch_gpu_decode(
     // size (the GEMMs process a fixed token tile). Serializing them here keeps
     // single-stream and low-concurrency latency from regressing; the batched
     // path engages once the flat cost amortizes across enough sequences.
-    // MoE i rot utrzymują wiele aktywnych sekwencji, ale dekodują je pojedynczo,
-    // ponieważ ich stan nie ma jeszcze batchowego kernela forward.
+    // Rot i MoE bez grupowanych ekspertów utrzymują wiele aktywnych sekwencji,
+    // ale dekodują je pojedynczo — nie mają batchowego forwardu.
     if (!hybrid_batch && feed_idx.len() < batch_min.max(2)) || serial_only {
         for &i in &feed_idx {
             serial_step(model, &mut active[i]);
