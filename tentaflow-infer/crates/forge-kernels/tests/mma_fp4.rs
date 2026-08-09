@@ -397,3 +397,61 @@ fn the_block_scaled_op_applies_per_16_scales() {
         );
     }
 }
+
+/// Ile mnożeń-dodawań na sekundę oddaje jednostka macierzowa dla każdej
+/// szerokości operandu.
+///
+/// Pytanie jest jedno: czy cztery bity idą szybciej niż osiem i niż szesnaście.
+/// Odpowiedź decyduje, czy warto budować kafel FP4 dla wag w układzie GGUF,
+/// które dziś dekwantyzują się do f16 i mnożą kaflem f16. Mierzone jest samo
+/// TEMPO WYDAWANIA instrukcji, z operandami w rejestrach — kafel wniósłby ruch
+/// pamięci, którego te rodziny nie dzielą, więc zaciemniłby porównanie.
+#[test]
+#[ignore = "pomiar przepustowości; wymaga GPU z blokowo-skalowanym FP4"]
+fn tempo_mma_wedlug_szerokosci_operandu() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    if !kernels.supports_mxf4_block_scale() {
+        eprintln!("pomijam tempo MMA: karta nie ma blokowo-skalowanego FP4");
+        return;
+    }
+    let stream = dev.create_stream().unwrap();
+    let (blocks, threads) = (2048u32, 128u32);
+    // `_RATE_STEPS * _RATE_MMAS` z `src/mma_fp4.mojo`: tyle instrukcji wydaje
+    // każdy warp, ta sama liczba dla każdej rodziny.
+    const ITERS: u64 = 2048 * 8;
+    let d = dev
+        .alloc((blocks * threads) as usize * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let a = dev.alloc(32 * 16, MemKind::Device, Pool::Weights).unwrap();
+
+    for kind in [
+        forge_kernels::MmaKind::F16,
+        forge_kernels::MmaKind::E4m3,
+        forge_kernels::MmaKind::Mxf4,
+        forge_kernels::MmaKind::Nvf4,
+    ] {
+        if kernels.mma_rate(kind, &d, &a, blocks, threads, &stream).is_err() {
+            eprintln!("{kind:?}: brak artefaktu");
+            continue;
+        }
+        dev.synchronize().unwrap();
+        let reps = 20;
+        let t0 = std::time::Instant::now();
+        for _ in 0..reps {
+            kernels
+                .mma_rate(kind, &d, &a, blocks, threads, &stream)
+                .unwrap();
+        }
+        dev.synchronize().unwrap();
+        let sec = t0.elapsed().as_secs_f64() / f64::from(reps);
+        // Jedna instrukcja na warp; `threads/32` warpów na blok.
+        let warps = u64::from(blocks) * u64::from(threads / 32);
+        let macs = warps * ITERS * kind.macs();
+        println!(
+            "{kind:?}: {:.3} ms, {:.1} TFLOP/s (2 flopy na MAC)",
+            sec * 1e3,
+            2.0 * macs as f64 / sec / 1e12
+        );
+    }
+}
