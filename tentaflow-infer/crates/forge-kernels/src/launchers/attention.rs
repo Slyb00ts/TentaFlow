@@ -1153,6 +1153,8 @@ impl Kernels {
         k_byte_off: usize,
         v_in: &DevBuffer,
         v_byte_off: usize,
+        q_norm: Option<&DevBuffer>,
+        k_norm: Option<&DevBuffer>,
         k_cache: &DevBuffer,
         v_cache: &DevBuffer,
         page_table: &DevBuffer,
@@ -1169,19 +1171,22 @@ impl Kernels {
         scale: f32,
         stream: &Stream,
     ) -> Result<()> {
-        let expected_q_heads = n_kv_heads.checked_mul(4).ok_or_else(|| {
-            ForgeError::Kernel("attn_decode_split_gqa4: liczba głowic przekracza zakres".into())
-        })?;
+        // Blok liczy CZTERY głowice Q z jednego odczytu K/V, więc stosunek GQA
+        // musi być wielokrotnością czwórki — przy 8:1 dwie grupy dzielą jeden
+        // strumień i czytają go dwa razy zamiast ośmiu.
+        let heads_per_kv = if n_kv_heads == 0 { 0 } else { n_q_heads / n_kv_heads };
         if n_seqs == 0
             || n_q_heads == 0
             || n_kv_heads == 0
-            || n_q_heads != expected_q_heads
+            || !n_q_heads.is_multiple_of(n_kv_heads.max(1))
+            || heads_per_kv < 4
+            || !heads_per_kv.is_multiple_of(4)
             || page_size == 0
             || max_pages == 0
             || n_splits == 0
         {
             return Err(ForgeError::Kernel(format!(
-                "attn_decode_split_gqa4 wymaga niezerowych wymiarów i GQA 4:1, otrzymano seqs={n_seqs}, heads={n_q_heads}:{n_kv_heads}, page={page_size}, max_pages={max_pages}, splits={n_splits}"
+                "attn_decode_split_gqa4 wymaga niezerowych wymiarów i GQA o krotności 4:1, otrzymano seqs={n_seqs}, heads={n_q_heads}:{n_kv_heads}, page={page_size}, max_pages={max_pages}, splits={n_splits}"
             )));
         }
         if !q_byte_off.is_multiple_of(2)
@@ -1235,8 +1240,8 @@ impl Kernels {
         let grid_x = u32::try_from(n_seqs).map_err(|_| {
             ForgeError::Kernel("attn_decode_split_gqa4: n_seqs przekracza zakres siatki".into())
         })?;
-        let grid_y = u32::try_from(n_kv_heads).map_err(|_| {
-            ForgeError::Kernel("attn_decode_split_gqa4: n_kv_heads przekracza zakres siatki".into())
+        let grid_y = u32::try_from(n_q_heads / 4).map_err(|_| {
+            ForgeError::Kernel("attn_decode_split_gqa4: liczba grup przekracza zakres siatki".into())
         })?;
         let grid_z = u32::try_from(n_splits).map_err(|_| {
             ForgeError::Kernel("attn_decode_split_gqa4: n_splits przekracza zakres siatki".into())
@@ -1267,8 +1272,8 @@ impl Kernels {
             .buf_at(q_in, q_byte_off)?
             .buf_at(k_in, k_byte_off)?
             .buf_at(v_in, v_byte_off)?
-            .buf(q_in)
-            .buf(k_in)
+            .buf(q_norm.unwrap_or(q_in))
+            .buf(k_norm.unwrap_or(q_in))
             .buf(k_cache)
             .buf(v_cache)
             .buf(page_table)
@@ -1279,8 +1284,8 @@ impl Kernels {
             .scalar(page_size_i64)
             .scalar(max_pages_i64)
             .scalar(n_splits_i64)
-            .scalar(0i64)
-            .scalar(0i64)
+            .scalar(i64::from(q_norm.is_some()))
+            .scalar(i64::from(k_norm.is_some()))
             .scalar(eps)
             .scalar(theta_base)
             .scalar(scale);

@@ -223,6 +223,25 @@ pub(crate) const HYBRID_BATCH_LANES: usize = 2;
 /// raz. Głowa jest ograniczona odczytem wag, więc policzenie kilku wierszy
 /// więcej kosztuje tyle co nic; wiersze ponad `n_tokens` niosą nieużywane
 /// aktywacje, a ich logitów nikt nie czyta.
+impl Model {
+    /// Czy uwaga dekodująca może pójść kernelem dzielącym jeden odczyt K/V
+    /// między cztery głowice Q. Liczy się KROTNOŚĆ czwórki, nie dokładnie 4:1:
+    /// przy GQA 8:1 dwie grupy dzielą strumień i czytają go dwa razy zamiast
+    /// ośmiu. To jedyny człon kroku, który rośnie wprost z liczbą linii, więc
+    /// nadmiarowość akurat tutaj kosztuje najwięcej przy równoległości.
+    pub(crate) fn attn_gqa_shared(&self) -> bool {
+        let p = &self.weights.descriptor.params;
+        let heads_per_kv = p.n_heads.checked_div(p.n_kv_heads).unwrap_or(0);
+        self.device.caps().vendor == forge_types::Vendor::Nvidia
+            && self.kernels.supports_attn_decode_gqa4_f16_hd128()
+            && self.kv.cfg.dtype() == forge_types::DType::F16
+            && p.head_dim == 128
+            && p.n_heads == heads_per_kv * p.n_kv_heads
+            && heads_per_kv >= 4
+            && heads_per_kv.is_multiple_of(4)
+    }
+}
+
 pub(crate) fn head_batch_width(n_tokens: usize) -> usize {
     match n_tokens {
         3 => 4,

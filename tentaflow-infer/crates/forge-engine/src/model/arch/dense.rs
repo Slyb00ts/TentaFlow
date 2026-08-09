@@ -2035,15 +2035,7 @@ impl Model {
                     (&b.q, 0usize, &b.k, 0usize, &b.v, 0usize)
                 }
             };
-            let gqa_q_heads = p.n_kv_heads.checked_mul(4);
-            let use_gqa = std::env::var("FORGE_ATTN_GQA").ok().as_deref() != Some("0")
-                && self.device.caps().vendor == Vendor::Nvidia
-                && kernels.supports_attn_decode_gqa4_f16_hd128()
-                && self.kv.cfg.dtype() == forge_types::DType::F16
-                && p.head_dim == 128
-                && gqa_q_heads == Some(p.n_heads)
-                && layer.attn().q_norm.is_none()
-                && layer.attn().k_norm.is_none();
+            let use_gqa = self.attn_gqa_shared();
             let attn_splits = if use_gqa {
                 ATTN_DECODE_GQA_SPLITS
             } else {
@@ -2060,6 +2052,8 @@ impl Model {
                             k_off,
                             v_buf,
                             v_off,
+                            layer.attn().q_norm.as_ref(),
+                            layer.attn().k_norm.as_ref(),
                             &self.kv.k[self.target_kv_layer(l)],
                             &self.kv.v[self.target_kv_layer(l)],
                             &self.page_table_dev,
@@ -2133,6 +2127,8 @@ impl Model {
                             k_off,
                             v_buf,
                             v_off,
+                            layer.attn().q_norm.as_ref(),
+                            layer.attn().k_norm.as_ref(),
                             &tb.slots[s].stage[0],
                             &tb.slots[s].stage[1],
                             &tb.identity_pt,

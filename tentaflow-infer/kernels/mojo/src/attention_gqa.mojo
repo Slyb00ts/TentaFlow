@@ -1,15 +1,16 @@
 # =============================================================================
 # Plik: attention_gqa.mojo
-# Opis: Split attention współdzielący K/V między czterema głowicami GQA.
+# Opis: Split attention współdzielący K/V między GROUP głowicami Q.
 # Przykład: siatka [sekwencja, głowica KV, split], blok 256 wątków.
 # =============================================================================
 
 from std.gpu import block_dim, block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.gpu.primitives import warp
+from src.reduce import block_reduce_sum
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
-from std.math import exp, cos, sin, pow
+from std.math import exp, cos, sin, pow, rsqrt
 
 comptime WARP = 32
 comptime MAX_WARPS = 8
@@ -42,9 +43,17 @@ def attn_decode_split_gqa4_f16_hd128(
     theta_base: Float32,
     scale: Float32,
 ):
-    """Liczy cztery głowice Q współdzielące jeden strumień K/V."""
+    """Liczy GROUP głowic Q współdzielących jeden strumień K/V.
+
+    `block_idx.y` numeruje GRUPĘ, nie głowicę KV, więc stosunek GQA nie musi
+    równać się GROUP: przy 8:1 dwie grupy dzielą jeden strumień K/V i każda
+    czyta go raz, zamiast ośmiu odczytów po jednym na głowicę Q. Nowe K/V
+    zapisuje każda grupa tą samą wartością — dokładnie tak, jak już robią to
+    bloki kolejnych splitów."""
     seq = Int(block_idx.x)
-    kvh = Int(block_idx.y)
+    qh0 = Int(block_idx.y) * GROUP
+    heads_per_kv = n_q_heads // n_kv_heads
+    kvh = qh0 // heads_per_kv
     split = Int(block_idx.z)
     tid = Int(thread_idx.x)
     lane = tid % WARP
@@ -62,12 +71,32 @@ def attn_decode_split_gqa4_f16_hd128(
     ]()
     staged_k = stack_allocation[HD, Float16, address_space = AddressSpace.SHARED]()
 
-    # Pierwszy prototyp jest routowany wyłącznie dla modeli bez Q/K norm.
+    # Norma Q/K jest per głowicę, więc każda z nich potrzebuje własnej redukcji;
+    # `block_reduce_sum` musi widzieć CAŁY blok, dlatego pętla po grupie biegnie
+    # jednakowo we wszystkich wątkach, a nie tylko w tych z `tid < HD`.
+    for g in range(GROUP):
+        var q_raw: Float32 = 0.0
+        if tid < HD:
+            q_raw = Float32(q_in[(seq * n_q_heads + qh0 + g) * HD + tid])
+        var q_val = q_raw
+        if has_q_norm == 1:
+            total = block_reduce_sum(q_raw * q_raw)
+            inv = rsqrt(total / Float32(HD) + eps)
+            if tid < HD:
+                q_val = q_raw * inv * Float32(q_norm_w[tid])
+        if tid < HD:
+            staged_q[g * HD + tid] = Float16(q_val)
+    var k_raw: Float32 = 0.0
     if tid < HD:
-        for g in range(GROUP):
-            qh = kvh * GROUP + g
-            staged_q[g * HD + tid] = q_in[(seq * n_q_heads + qh) * HD + tid]
-        staged_k[tid] = k_in[(seq * n_kv_heads + kvh) * HD + tid]
+        k_raw = Float32(k_in[(seq * n_kv_heads + kvh) * HD + tid])
+    var k_val = k_raw
+    if has_k_norm == 1:
+        total = block_reduce_sum(k_raw * k_raw)
+        inv = rsqrt(total / Float32(HD) + eps)
+        if tid < HD:
+            k_val = k_raw * inv * Float32(k_norm_w[tid])
+    if tid < HD:
+        staged_k[tid] = Float16(k_val)
     barrier()
 
     if tid < HD // 2:
@@ -159,8 +188,7 @@ def attn_decode_split_gqa4_f16_hd128(
                 l_star += shared_l[w * GROUP + g] * f
                 comptime for e in range(EPL):
                     outfrag[e] += shared_acc[(w * GROUP + g) * HD + e * WARP + lane] * f
-            qh = kvh * GROUP + g
-            base = ((seq * n_q_heads + qh) * n_splits + split) * (HD + 2)
+            base = ((seq * n_q_heads + qh0 + g) * n_splits + split) * (HD + 2)
             comptime for e in range(EPL):
                 parts[base + e * WARP + lane] = outfrag[e]
             if lane == 0:

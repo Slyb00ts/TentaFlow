@@ -20,7 +20,6 @@ batch_antipattern	kernels/mojo/test_pack_nvfp4_fp8.mojo	3
 batch_antipattern	kernels/mojo/test_q8_0_batch.mojo	4
 env	crates/forge-cli/src/hf.rs	3
 env	crates/forge-cli/src/main.rs	7
-env	crates/forge-engine/src/model/arch/dense.rs	1
 env	crates/forge-engine/src/model/arch/hybrid/core.rs	3
 env	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2
 env	crates/forge-engine/src/model/arch/hybrid/verify.rs	1
@@ -116,7 +115,7 @@ kernel_geometry	kernels/mojo/build/sm_89/manifest.json	57
 placeholder	crates/forge-engine/src/speculation/config.rs	1
 placeholder	crates/forge-onnx/src/interp.rs	1
 size	crates/forge-cli/src/main.rs	2847
-size	crates/forge-engine/src/model/arch/dense.rs	2683
+size	crates/forge-engine/src/model/arch/dense.rs	2679
 size	crates/forge-engine/src/model/arch/hybrid/prefill.rs	2024
 size	crates/forge-engine/src/model/mod.rs	3667
 size	crates/forge-engine/src/model/mtp.rs	3132

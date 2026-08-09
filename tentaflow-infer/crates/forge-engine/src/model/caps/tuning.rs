@@ -96,14 +96,16 @@ const RULES: &[Rule] = &[
         value: 2,
         measured_on: "GB10",
     },
-    // Grupowany MoE płaci sortowanie po ekspertach i jeden odczyt routera na
-    // warstwę routowaną. Dwie linie tego nie pokrywają (73 tok/s wsadowo wobec
-    // 87 po kolei), cztery już tak (114). Qwen3-30B-A3B, prompt 512.
+    // Ten próg stał na 4, bo grupowany MoE płacił sortowanie po ekspertach i
+    // odczyt routera na każdą warstwę — dwie linie tego nie pokrywały (73 tok/s
+    // wsadowo wobec 87 po kolei). Dyspozycja adresowana na urządzeniu nie ma
+    // ani sortowania, ani tego odczytu, więc dwie linie już się opłacają:
+    // 109,8 wobec 85,8 po kolei. Qwen3-30B-A3B Q4_K_M, prompt 512.
     Rule {
         knob: Knob::BatchMin,
         model: Some(ModelClass::MoeGrouped),
         device: DeviceScope::Any,
-        value: 4,
+        value: 2,
         measured_on: "GB10",
     },
     // Kafel tokenów jest płaski, więc amortyzuje się dopiero przy kilkunastu
