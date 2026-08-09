@@ -188,9 +188,43 @@ impl Model {
             })
     }
 
-    /// Sprawdza pełny, niemutujący kontrakt batchowanego targetu hybrydowego.
+    /// Kontrakt zwykłego batcha dekodowania — LUŹNIEJSZY niż
+    /// `hybrid_batch_weights_capable`, bo nie żąda bitowej zgodności z serialem.
+    ///
+    /// Ta zgodność jest wymagana tam, gdzie jej brak psuje coś poza tekstem:
+    /// prefill B2 i MTP porównują stan drafta, więc trzymają tamten predykat.
+    /// Zwykłe dekodowanie porównuje tylko wyjście, a to i tak już zależy od
+    /// obciążenia na ścieżce gęstej i w warstwach routowanych. Trzymanie tu
+    /// dokładności kosztowało K-kwanty CAŁE skalowanie: hybryda Q4_K_M stała na
+    /// 13 tok/s przy ośmiu sekwencjach, bo batch nie włączał się nigdy.
     pub fn hybrid_batch_capable(&self) -> bool {
-        self.weights.token_embd_host.is_some() && self.hybrid_batch_weights_capable()
+        // Scalone `gate_up` czyta batch oknem, którego NVFP4 w układzie GGUF nie
+        // ma — to brak kernela, nie kwestia zaokrągleń, więc zostaje.
+        fn window_capable(weight: &DevWeight) -> bool {
+            !matches!(weight, DevWeight::NvFp4Gguf { .. })
+        }
+        fn batchable(weight: &DevWeight) -> bool {
+            !matches!(weight, DevWeight::Fp8Row { .. })
+        }
+        self.is_hybrid()
+            && self.tier.is_none()
+            && self.weights.token_embd_host.is_some()
+            && batched_head_supported(&self.weights.lm_head, HYBRID_BATCH_LANES).is_ok()
+            && self.weights.layers.iter().all(|layer| {
+                let ffn = match &layer.ffn {
+                    LayerFfn::Moe(moe) => {
+                        return Self::moe_grouped_capable(&self.kernels, moe);
+                    }
+                    LayerFfn::Dense(ffn) => ffn,
+                };
+                let gate_up = match &ffn.gate_up {
+                    GateUpWeights::Fused(weight) => {
+                        window_capable(weight) && batchable(weight)
+                    }
+                    GateUpWeights::Split { gate, up } => batchable(gate) && batchable(up),
+                };
+                gate_up && batchable(&ffn.down)
+            })
     }
 
     /// Jedna warstwa kroku dekodowania modelu hybrydowego.

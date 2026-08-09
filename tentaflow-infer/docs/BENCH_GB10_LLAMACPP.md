@@ -103,9 +103,12 @@ Przegrywamy, w kolejności rozmiaru luki:
    sekwencjach, prompt 512: Qwen3-30B 88 -> 174 tok/s wobec 238 u llama.cpp
    (luka 2,7x -> 1,37x), a hybrydowe MXFP4 60 -> 128 wobec 228 (3,8x -> 1,78x).
    Reszta dystansu jest nadal otwarta.
-2. **Hybryda w K-kwantach nie ma dokładnego kernela małego batcha**, więc
-   `hybrid_batch_weights_capable` odrzuca ją i batch nie wchodzi: 13 wobec 60 tok/s
-   przy ośmiu. Ten sam model w NVFP4 skaluje się 10,7 → 49,3 (4,6x).
+2. **Hybryda w K-kwantach** przestała stać w miejscu: 13 -> 38 tok/s przy ośmiu
+   sekwencjach wobec 60 u llama.cpp (4,6x -> 1,57x). Batch dekodowania dostał
+   własny kontrakt, luźniejszy niż ten dla prefillu B2 i MTP, bo wsadowy dp4a
+   Q4_K różni się od seryjnego GEMV wyłącznie zaokrągleniem (względne L2 1,2e-4,
+   pilnuje tego `batch_exactness.rs`), a to samo już wcześniej dotyczyło ścieżki
+   gęstej. Bitowa zgodność została tam, gdzie jej brak psuje coś poza tekstem.
 3. **Bielik Q4_K przy ośmiu sekwencjach**: 144 wobec 259. Wariant Q8 tego nie ma
    (188 wobec 181), więc to sprawa ścieżki Q4_K w batchu, nie samego batcha.
 4. **Prefill hybrydy w Q4_K_M**: -32…-42%.
