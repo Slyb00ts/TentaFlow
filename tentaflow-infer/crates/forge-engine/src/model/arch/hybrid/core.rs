@@ -320,6 +320,7 @@ impl Model {
             batched_z: a16(rows * value_dim)?,
             batched_alpha: a16(rows * nv)?,
             batched_beta_raw: a16(rows * nv)?,
+            batched_q_full: a16(rows * q_full)?,
             q_full: a16(q_full)?,
             qc: a16(q_dim)?,
             gatec: a16(q_dim)?,
@@ -453,6 +454,28 @@ impl Model {
     /// projection is gated (`[q, gate]` interleaved per head), so q/gate are
     /// de-interleaved, per-head QK-norm + partial RoPE applied, causal decode
     /// attention run, then `out = attn ⊙ sigmoid(gate)` before the O projection.
+    /// Projekcje Q/K/V warstwy uwagi dla WSZYSTKICH lane'ów naraz.
+    ///
+    /// Ten sam wniosek co przy wejściach DeltaNet: projekcje są bezstanowe, a
+    /// liczone per lane każą karcie przeczytać wagi tyle razy, ile jest linii.
+    pub(crate) fn hybrid_attn_projections(
+        &self,
+        a: &AttnWeights,
+        x: &DevBuffer,
+        n: usize,
+    ) -> Result<()> {
+        let QkvWeights::Split { q, k, v } = &a.attn_qkv else {
+            return Err(ForgeError::Unsupported(
+                "hybrid attention expects split q/k/v weights".into(),
+            ));
+        };
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
+        let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+        self.gemm(&hb.batched_q_full, q, x, n, &self.stream)?;
+        self.gemm(&bb.k, k, x, n, &self.stream)?;
+        self.gemm(&bb.v, v, x, n, &self.stream)
+    }
+
     pub(crate) fn hybrid_attn_mixer(&self, l: usize, a: &AttnWeights, src: &AttnSrc) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let head_dim = p.head_dim;
@@ -486,6 +509,32 @@ impl Model {
             self.gemv(&b.k, wk, &b.x, stream)?;
             self.gemv(&b.v, wv, &b.x, stream)?;
         }
+        self.hybrid_attn_mixer_from_qkv(l, a, src)
+    }
+
+    /// Druga połowa miksera uwagi: wszystko po projekcjach Q/K/V.
+    ///
+    /// Batch liczy te projekcje RAZ dla wszystkich lane'ów i wkłada wiersz
+    /// swojej linii do jednotokenowego scratchu, więc wchodzi tutaj.
+    pub(crate) fn hybrid_attn_mixer_from_qkv(
+        &self,
+        l: usize,
+        a: &AttnWeights,
+        src: &AttnSrc,
+    ) -> Result<()> {
+        let p = &self.weights.descriptor.params;
+        let head_dim = p.head_dim;
+        let n_heads = p.n_heads;
+        let n_kv = p.n_kv_heads;
+        let q_dim = n_heads * head_dim;
+        let eps = p.rms_norm_eps;
+        let theta = p.rope_theta;
+        let n_rot = self.hybrid_n_rot();
+        let scale = p.attn_scale_at(l);
+        let kernels = &self.kernels;
+        let stream = &self.stream;
+        let b = &self.bufs;
+        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs allocated");
         // Rozplecenie bramki, obie normy głowic i oba częściowe RoPE mieszczą
         // się w jednym uruchomieniu, gdy obie normy istnieją — same kernele
         // czytają po kilkadziesiąt kB, więc ich koszt to niemal wyłącznie

@@ -1304,15 +1304,15 @@ impl CalibAccum {
 struct HybridBufs {
     /// Liczba wierszy, na jaką starczy `batched_*`. Rośnie razem z batch cap.
     projection_rows: usize,
-    /// Projekcje wejściowe DeltaNet policzone RAZ dla wszystkich lane'ów.
-    /// Są bezstanowe, więc wiersze mogą pochodzić z różnych sekwencji, a jeden
-    /// przebieg po wagach zastępuje jeden przebieg na lane (gate_proj to około
-    /// 21 MB na warstwę — przy ośmiu lane'ach to była największa pozycja kroku).
+    /// Projekcje miksera policzone RAZ dla wszystkich lane'ów — są bezstanowe,
+    /// więc wiersze mogą pochodzić z różnych sekwencji, a jeden przebieg po
+    /// wagach zastępuje jeden na lane (gate_proj to ~21 MB na warstwę).
     batched_qkv_mixed: DevBuffer,
     batched_z: DevBuffer,
     batched_alpha: DevBuffer,
     batched_beta_raw: DevBuffer,
-    /// Gated Q projection output `[2*n_heads*head_dim]` f16.
+    batched_q_full: DevBuffer,
+    /// Gated Q projection output `[2*n_heads*head_dim]` f16, jeden token.
     q_full: DevBuffer,
     /// De-interleaved query `[n_heads*head_dim]` f16.
     qc: DevBuffer,

@@ -491,9 +491,16 @@ impl Model {
         for layer_index in 0..self.weights.layers.len() {
             // Projekcje DeltaNet są bezstanowe, więc lecą raz dla całego batcha
             // z `bb.x` — jeden przebieg po wagach zamiast jednego na lane.
-            if let LayerMixer::DeltaNet(delta) = &self.weights.layers[layer_index].mixer {
-                let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
-                self.hybrid_delta_projections(layer_index, delta, &bb.x, n)?;
+            match &self.weights.layers[layer_index].mixer {
+                LayerMixer::DeltaNet(delta) => {
+                    let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                    self.hybrid_delta_projections(layer_index, delta, &bb.x, n)?;
+                }
+                LayerMixer::Attention(attention) => {
+                    let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
+                    self.hybrid_attn_projections(attention, &bb.x, n)?;
+                }
+                LayerMixer::DeepseekAttention(_) => {}
             }
             for (lane, seq) in seqs.iter_mut().enumerate() {
                 self.activate_hybrid_sequence(seq)?;
@@ -503,16 +510,27 @@ impl Model {
                         unreachable!("ścieżka hybrydowa trafiła na warstwę DeepSeeka V4")
                     }
                     LayerMixer::Attention(attention) => {
-                        // Mikser uwagi liczy własne projekcje z jednowierszowego
-                        // `bufs`, więc ta linia musi tam trafić w całości.
+                        // Projekcje policzył jeden przebieg po wagach wyżej, więc
+                        // do jednotokenowego scratchu wchodzi już ich wynik.
+                        let hb = self.hybrid_bufs.as_ref().expect("hybrid bufs");
+                        let (q_dim, kv_dim) = (
+                            self.weights.descriptor.params.n_heads
+                                * self.weights.descriptor.params.head_dim,
+                            self.weights.descriptor.params.n_kv_heads
+                                * self.weights.descriptor.params.head_dim,
+                        );
                         self.device.copy(
-                            &bb.x,
-                            lane * hidden * 2,
-                            &self.bufs.x,
+                            &hb.batched_q_full,
+                            lane * q_dim * 4,
+                            &hb.q_full,
                             0,
-                            hidden * 2,
+                            q_dim * 4,
                             &self.stream,
                         )?;
+                        for (from, to) in [(&bb.k, &self.bufs.k), (&bb.v, &self.bufs.v)] {
+                            self.device
+                                .copy(from, lane * kv_dim * 2, to, 0, kv_dim * 2, &self.stream)?;
+                        }
                         self.device.copy(
                             &bb.positions,
                             lane * 4,
@@ -537,7 +555,7 @@ impl Model {
                             mpp * 4,
                             &self.stream,
                         )?;
-                        self.hybrid_attn_mixer(layer_index, attention, &AttnSrc::Paged)?;
+                        self.hybrid_attn_mixer_from_qkv(layer_index, attention, &AttnSrc::Paged)?;
                         let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
                         self.device.copy(
                             &self.bufs.o_out,
