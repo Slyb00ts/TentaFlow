@@ -233,3 +233,31 @@ jest monotoniczny: 5 -> 30,4, 6 -> 28,1, 7 -> 26,2, 8 -> 25,0 tok/s na
 sekwencję. Wiersze ponad `n_tokens` niosą nieużywane aktywacje, a ich logitów
 nikt nie czyta; głowa jest ograniczona odczytem wag, więc kilka wierszy więcej
 kosztuje tyle co nic.
+
+## Pełny bilans kroku dekodowania przy ośmiu liniach
+
+Profil CAŁEGO przebiegu (nie okna), 1536 tokenów, znormalizowany do 131 kroków
+wsadowych — liczba wyprowadzona z licznika uruchomień na warstwę, nie zgadnięta.
+Qwen3-30B-A3B Q4_K_M, prompt 512.
+
+| pozycja | ms/krok | bajty/krok | % z 237 GB/s |
+|---|---:|---:|---:|
+| eksperci gate+up (gidx) | 10,8 | 1,53 GiB | 60% |
+| eksperci down (Q6_K + Q4_K) | 10,0 | ~1,0 GiB | ~50% |
+| projekcje uwagi q/k/v/o | 6,3 | 509 MiB | 34% |
+| rdzeń uwagi | 5,2 | ~470 MiB | 38% |
+
+Suma kerneli to 29,9 ms przy kroku 42,8 ms sprzed grafu — reszta była narzutem
+uruchomień i to ją zdjęło nagranie kroku (187,9 -> 196,6 tok/s).
+
+Wnioski dla dalszej pracy:
+
+1. Nic tu nie jest bliskie sufitu pasma; wszystko siedzi w 34-60%. Sufit kroku
+   przy pełnym wysyceniu to około 14 ms, czyli ponad dwa razy mniej niż mamy.
+2. Projekcje uwagi są najmniej wydajne (34%) i przy tym NIE rosną z liczbą
+   linii — czytają te same wagi dla wszystkich. Loader scala już q/k/v na tyle,
+   na ile pozwalają formaty (`fuse_rows`; Q4_K_M daje `FusedQk` + osobne v w
+   Q6_K), więc zysk musi wyjść z samego kernela wsadowego GEMV, nie z układu wag.
+3. Eksperci gate+up to największa pojedyncza pozycja w liczbach bezwzględnych.
+   Zgłaszają 503 GB/s, a licząc po bajtach RÓŻNYCH ekspertów 142 GB/s — czyli
+   cache faktycznie pochłania powtórzone odczyty i realny zapas jest w tych 60%.
