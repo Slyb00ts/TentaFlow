@@ -1069,13 +1069,12 @@ fn pool_reserve_bytes(kv_bytes: usize, activation_bytes: usize) -> Result<usize>
         .context("suma pul KV, aktywacji i rezerwy przekracza zakres usize")
 }
 
-/// Ładuje model w stałym układzie pul `serve`.
-#[allow(clippy::too_many_arguments)]
 /// Baza plus część rosnąca z liczbą linii: verifier i prefill trzymają bufory na
 /// sekwencję, a stała nie zależała od niczego — przy 32 liniach brakowało pamięci.
-fn activation_pool_bytes(_native_mtp: bool, hybrid: bool, max_active: usize) -> usize {
-    let base = if hybrid { 9usize << 27 } else { 1usize << 30 };
-    base + max_active.saturating_sub(8) * (16usize << 20)
+/// Pierścień nie zwalnia, więc podłoga rośnie do 1/32 wolnej pamięci karty.
+fn activation_pool_bytes(hybrid: bool, max_active: usize, free_vram: usize) -> usize {
+    (if hybrid { 9usize << 27 } else { 1usize << 30 }).max(free_vram / 32)
+        + max_active.saturating_sub(8) * (16usize << 20)
 }
 
 fn resolve_nvfp4_ct_layout(value: &str) -> Result<NvFp4CtLayoutPolicy> {
@@ -1137,10 +1136,10 @@ fn load_for_serve(
     } else {
         0
     };
-    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some(), max_active);
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = gpu::free_vram(0).context("query free VRAM")?;
+    let activations = activation_pool_bytes(desc.params.ssm.is_some(), max_active, free);
     let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
     let weights = if weights_pool_gb > 0.0 {
         ((weights_pool_gb * (1u64 << 30) as f64) as usize)
@@ -1337,7 +1336,7 @@ fn load_auto(
         kv_quant,
         native_mtp,
     )?;
-    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some(), max_active);
+    let activations = activation_pool_bytes(desc.params.ssm.is_some(), max_active, gpu::free_vram(0)?);
     // Automatycznie dobrany kontekst NIE MOZE zaglodzic wag. Kazdy token czyta
     // cale wagi, a strony KV zapelniaja sie dopiero wraz z dlugoscia sekwencji,
     // wiec oddanie rezydentnych wag za wiekszy kontekst jest zawsze zla
@@ -2840,8 +2839,9 @@ mod speculation_cli_tests {
 
     #[test]
     fn pula_aktywacji_rosnie_z_liczba_linii() {
-        assert_eq!(activation_pool_bytes(true, true, 8), 1152 << 20);
-        assert_eq!(activation_pool_bytes(true, false, 8), 1 << 30);
-        assert_eq!(activation_pool_bytes(true, true, 32), (1152 << 20) + 24 * (16 << 20));
+        assert_eq!(activation_pool_bytes(true, 8, 24 << 30), 1152 << 20);
+        assert_eq!(activation_pool_bytes(false, 8, 24 << 30), 1 << 30);
+        assert_eq!(activation_pool_bytes(true, 32, 24 << 30), (1152 << 20) + 24 * (16 << 20));
+        assert_eq!(activation_pool_bytes(true, 8, 128 << 30), 4 << 30);
     }
 }

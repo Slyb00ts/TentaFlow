@@ -296,34 +296,32 @@ impl Model {
         })
     }
 
-    pub(crate) fn hybrid_prefill_extended_structural_capable(&self) -> bool {
+    /// Kształt wymagany przez OBIE macierzowe ścieżki prefillu. Postać wagi do
+    /// niego nie należy: projekcje liczą `gemm` i `ffn_dense_block`, a te
+    /// rozpoznają format same.
+    pub(crate) fn hybrid_prefill_shape_capable(&self) -> bool {
         let caps = self.device.caps();
         hybrid_prefill_t128_backend_capable(caps.vendor, caps.warp_size)
             && caps.max_threads_per_block >= 512
             && self.weights.descriptor.arch == "qwen35"
             && self.weights.token_embd_host.is_some()
             && self.validate_hybrid_speculation_target().is_ok()
-            && self
-                .weights
-                .descriptor
-                .params
-                .ssm
-                .as_ref()
+            && self.weights.layers.iter().all(|l| matches!(l.ffn, LayerFfn::Dense(_)))
+            && (self.weights.descriptor.params.ssm.as_ref())
                 .is_some_and(|ssm| ssm.d_state == 128)
+    }
+
+    /// Dodatkowo cały FFN w NVFP4 — tego wymaga dobór chunka NVFP4, nie kernele.
+    pub(crate) fn hybrid_prefill_extended_structural_capable(&self) -> bool {
+        self.hybrid_prefill_shape_capable()
             && self.weights.layers.iter().all(|layer| {
-                let LayerFfn::Dense(ffn) = &layer.ffn else {
-                    return false;
-                };
+                let nvfp4 = |w: &DevWeight| matches!(w, DevWeight::NvFp4Gguf { .. });
+                let LayerFfn::Dense(ffn) = &layer.ffn else { return false };
                 let gate_up = match &ffn.gate_up {
-                    GateUpWeights::Fused(weight) => {
-                        matches!(weight, DevWeight::NvFp4Gguf { .. })
-                    }
-                    GateUpWeights::Split { gate, up } => {
-                        matches!(gate, DevWeight::NvFp4Gguf { .. })
-                            && matches!(up, DevWeight::NvFp4Gguf { .. })
-                    }
+                    GateUpWeights::Fused(w) => nvfp4(w),
+                    GateUpWeights::Split { gate, up } => nvfp4(gate) && nvfp4(up),
                 };
-                gate_up && matches!(ffn.down, DevWeight::NvFp4Gguf { .. })
+                gate_up && nvfp4(&ffn.down)
             })
     }
 

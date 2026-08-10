@@ -130,7 +130,8 @@ impl Model {
 
     pub(crate) fn hybrid_layer_major_route_capable(&self) -> bool {
         hybrid_layer_major_prefill_requested()
-            && self.hybrid_prefill_t128_structural_capable()
+            && self.hybrid_prefill_shape_capable()
+            && self.kernels.hybrid_prefill_t128_artifacts_capable()
             && self.hybrid_layer_major_attention_backend().is_ok()
             && hybrid_layer_major_persistent_scan_requested().is_ok()
     }
@@ -143,7 +144,7 @@ impl Model {
         {
             return Ok(());
         }
-        if !self.hybrid_prefill_extended_structural_capable() {
+        if !self.hybrid_prefill_shape_capable() {
             return Err(ForgeError::Unsupported(
                 "arena layer-major wymaga zweryfikowanego targetu hybrydowego NVIDIA".into(),
             ));
