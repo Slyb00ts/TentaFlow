@@ -57,6 +57,31 @@ rzecz: czy ten kernel MA działać na tej karcie.
 Nie zgaduj zasięgu z tego, że coś się nie kompiluje. To dwie różne rzeczy i
 mylenie ich jest dokładnie tym, co ten mechanizm ma wykluczyć.
 
+### Grouped GEMM dla MoE
+
+Warianty NVIDIA dla Q4_K, Q6_K i Q8_0 używają `ldmatrix`/`mma`. AMD ich nie
+obsługuje, więc oznaczenie `# arch: nvidia` jest deklaracją rzeczywistej
+zależności, a nie sztuczną bramką builda. Nie należy zdejmować zakresu NVIDII
+z istniejących kerneli.
+
+AMD od `gfx11+` ma natywne warianty WMMA dla Q4_K, Q6_K i Q8_0. Każdy format
+ma kafel 64-wierszowy i `bm128_bn64` dla prefillu. Dyspozytor wybiera szeroki
+wariant tylko wtedy, gdy jego artefakt jest obecny; w przeciwnym razie używa
+wąskiego. Poprawność sprawdzają testy golden względem niezależnych referencji
+CPU dla wszystkich trzech formatów.
+
+Apple nie ma jeszcze grouped GEMM dla tych formatów MoE. Wymaga osobnej
+implementacji Metal opartej na `simdgroup_matrix`, rejestracji i testów golden
+na sprzęcie Apple; nie może wykorzystywać ani wariantów NVIDIA, ani AMD WMMA.
+
+### Profile dekodowania Q4_K
+
+`gemv_q4_k_dp4a_amd_u4_*` jest wariantem dla `amd:gfx12`, nie przenośnym
+kernelem AMD. `DOT_UNROLL=4` należy do tego artefaktu i profil wybiera go tylko
+dla dokładnego klucza `AMD/gfx1201 + Q4_K + decode`; pozostałe GPU zachowują
+przenośny artefakt. Nowy unroll wymaga nowego artefaktu oraz osobnego wpisu
+profilu z pomiarem na docelowej karcie.
+
 ## 2. Wpisz listę artefaktów do binarki
 
 ```bash

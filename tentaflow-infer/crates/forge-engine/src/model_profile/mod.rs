@@ -154,7 +154,10 @@ pub fn identify(path: &std::path::Path) -> ModelIdentity {
         .or_else(|| gguf.get_str("general.name"))
         .unwrap_or_default();
     ModelIdentity {
-        arch: gguf.get_str("general.architecture").unwrap_or_default().to_string(),
+        arch: gguf
+            .get_str("general.architecture")
+            .unwrap_or_default()
+            .to_string(),
         name: name.to_string(),
     }
 }
@@ -203,7 +206,9 @@ mod tests {
     #[test]
     fn gemma_ogranicza_kontekst() {
         // Pełne okno Gemmy 4 każe pulom zażądać ponad 100 GB VRAM.
-        assert!(resolve(&id("gemma4", "gemma-4-12B-it")).default_ctx.is_some());
+        assert!(resolve(&id("gemma4", "gemma-4-12B-it"))
+            .default_ctx
+            .is_some());
     }
 
     #[test]

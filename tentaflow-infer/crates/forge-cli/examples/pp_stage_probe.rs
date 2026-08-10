@@ -9,7 +9,7 @@
 //   PP_REF_GIB=6       pula wag odniesienia (caly model na jednej karcie)
 //   PP_WEIGHTS_GIB=2   pula wag JEDNEGO etapu
 use forge_engine::model::{Model, ModelConfig};
-use forge_hal::{PoolSizes, gpu};
+use forge_hal::{gpu, PoolSizes};
 
 fn pools(var: &str, default_gib: usize) -> PoolSizes {
     PoolSizes {
@@ -64,7 +64,10 @@ fn main() {
         .split(',')
         .map(|s| s.trim().parse().expect("indeks karty"))
         .collect();
-    assert!(pick.len() >= 2, "pipeline potrzebuje co najmniej dwoch etapow");
+    assert!(
+        pick.len() >= 2,
+        "pipeline potrzebuje co najmniej dwoch etapow"
+    );
     assert!(
         pick.iter().all(|&d| d < ids.len()),
         "wskazano karte, ktorej nie ma"
@@ -128,7 +131,8 @@ fn main() {
 
     let mut stages: Vec<Model> = Vec::with_capacity(pick.len());
     for (index, &(first, count)) in ranges.iter().enumerate() {
-        let device = gpu::open_id(ids[pick[index]], pools("PP_WEIGHTS_GIB", 4)).expect("otwarcie karty");
+        let device =
+            gpu::open_id(ids[pick[index]], pools("PP_WEIGHTS_GIB", 4)).expect("otwarcie karty");
         let name = device.caps().name.clone();
         let model =
             Model::load_gguf(device, &path, cfg(Some((first, count)))).expect("wczytanie etapu");

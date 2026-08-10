@@ -330,6 +330,46 @@ impl Model {
             && self.kernels.hybrid_prefill_t128_artifacts_capable()
     }
 
+    pub(crate) fn hybrid_layer_major_q4k_artifacts_capable(&self, tokens: usize) -> bool {
+        let capable = |weight: &DevWeight| match weight {
+            DevWeight::Q4K { rows, .. } => self
+                .kernels
+                .q4_k_wmma_prefill_artifacts_capable(*rows, tokens),
+            _ => true,
+        };
+        self.weights.layers.iter().all(|layer| {
+            let mixer = match &layer.mixer {
+                LayerMixer::Attention(attention) => {
+                    let qkv = match &attention.attn_qkv {
+                        QkvWeights::Fused(weight) => capable(weight),
+                        QkvWeights::FusedQk { qk, v } => capable(qk) && capable(v),
+                        QkvWeights::Split { q, k, v } => capable(q) && capable(k) && capable(v),
+                    };
+                    qkv && capable(&attention.attn_o)
+                }
+                LayerMixer::DeltaNet(delta) => {
+                    capable(&delta.in_proj)
+                        && capable(&delta.gate_proj)
+                        && capable(&delta.alpha_proj)
+                        && capable(&delta.beta_proj)
+                        && capable(&delta.out_proj)
+                }
+                LayerMixer::DeepseekAttention(_) => false,
+            };
+            let ffn = match &layer.ffn {
+                LayerFfn::Dense(ffn) => {
+                    let gate_up = match &ffn.gate_up {
+                        GateUpWeights::Fused(weight) => capable(weight),
+                        GateUpWeights::Split { gate, up } => capable(gate) && capable(up),
+                    };
+                    gate_up && capable(&ffn.down)
+                }
+                LayerFfn::Moe(_) => false,
+            };
+            mixer && ffn
+        })
+    }
+
     pub(crate) fn hybrid_prefill_extended_budget_capable(&self, chunk: usize) -> bool {
         let Some(shape) = self.hybrid_prefill_scratch_shape() else {
             return false;
@@ -447,23 +487,17 @@ impl Model {
             return None;
         }
         let shape = self.hybrid_prefill_scratch_shape()?;
-        let available = self.device.pool_available(Pool::Activations)?.checked_add(
-            self.hybrid_layer_major_bufs
-                .as_ref()
-                .map_or(0, |bufs| bufs.device_bytes),
-        )?;
-        let budget_limit = [4096, 2048, 1024, 512, 128, 32]
-            .into_iter()
-            .find(|&tokens| {
-                hybrid_layer_major_scratch_estimate(shape, tokens)
-                    .ok()
-                    .and_then(|bytes| bytes.checked_add(HYBRID_PREFILL_ACTIVATION_RESERVE))
-                    .is_some_and(|required| required <= available)
-            });
-        budget_limit
-            .into_iter()
-            .chain(self.hybrid_layer_major_bufs.as_ref().map(|bufs| bufs.cap))
-            .max()
+        let available = self.device.pool_available(Pool::Activations)?;
+        hybrid_layer_major_prefill_limit_for_available(shape, available, |tokens| {
+            self.hybrid_layer_major_q4k_artifacts_capable(tokens)
+        })
+    }
+
+    fn hybrid_layer_major_execution_limit(&self) -> Option<usize> {
+        self.hybrid_layer_major_bufs
+            .as_ref()
+            .map(|bufs| bufs.cap)
+            .or_else(|| self.hybrid_layer_major_prefill_limit())
     }
 
     /// Wykonuje atomowy target-only prefill dwóch segmentów T32 bez catch-up MTP.
@@ -1213,7 +1247,9 @@ impl Model {
         // przechodzi przez te punkty i podział go używa.
         let split = self.tp.is_some();
         if !split && tokens.len() >= 32 && self.hybrid_layer_major_route_capable() {
-            return self.prefill_hybrid_layer_major(seq, tokens);
+            if let Some(limit) = self.hybrid_layer_major_execution_limit() {
+                return self.prefill_hybrid_layer_major(seq, tokens, limit);
+            }
         }
         let batched_enabled =
             std::env::var("FORGE_HYBRID_BATCH_PREFILL").map_or(true, |value| value != "0");
@@ -1302,8 +1338,25 @@ impl Model {
 
     /// Wykonuje prefill hybrydowego targetu w macierzowych chunkach i zatwierdza
     /// ostatni checkpoint rekurencji po każdym chunku.
-    fn prefill_hybrid_layer_major(&mut self, seq: &mut SeqKv, tokens: &[u32]) -> Result<Vec<f32>> {
-        self.prefill_hybrid_layer_major_inner(seq, tokens, None, false, false)
+    fn prefill_hybrid_layer_major(
+        &mut self,
+        seq: &mut SeqKv,
+        tokens: &[u32],
+        limit: usize,
+    ) -> Result<Vec<f32>> {
+        let mut logits = Vec::new();
+        let mut offset = 0;
+        for chunk in hybrid_layer_major_chunk_plan(tokens.len(), limit) {
+            logits = self.prefill_hybrid_layer_major_inner(
+                seq,
+                &tokens[offset..offset + chunk],
+                None,
+                false,
+                false,
+            )?;
+            offset += chunk;
+        }
+        Ok(logits)
     }
 
     pub(crate) fn prefill_hybrid_layer_major_inner(
@@ -1340,6 +1393,11 @@ impl Model {
                     )));
                 }
             }
+        }
+        if !self.hybrid_layer_major_q4k_artifacts_capable(tokens.len()) {
+            return Err(ForgeError::Unsupported(
+                "layer-major nie ma artefaktu Q4_K WMMA dla kształtu prefillu".into(),
+            ));
         }
         self.ensure_hybrid_verify_bufs(4)?;
         self.ensure_hybrid_layer_major_bufs(tokens.len())?;
@@ -2018,5 +2076,4 @@ impl Model {
             }
         })
     }
-
 }

@@ -135,12 +135,8 @@ impl EngineHandle {
         }
         match self.stop() {
             Some(Ok(())) => Ok(()),
-            Some(Err(_)) => Err(ForgeError::Scheduler(
-                "worker zakończył się panic".into(),
-            )),
-            None => Err(ForgeError::Scheduler(
-                "worker został już zatrzymany".into(),
-            )),
+            Some(Err(_)) => Err(ForgeError::Scheduler("worker zakończył się panic".into())),
+            None => Err(ForgeError::Scheduler("worker został już zatrzymany".into())),
         }
     }
 
@@ -667,9 +663,7 @@ fn default_batch_min_for(model: &Model) -> usize {
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|&v| v >= 2)
-        .unwrap_or_else(|| {
-            model.batch_min_default()
-        })
+        .unwrap_or_else(|| model.batch_min_default())
 }
 
 /// `spawn_engine` with an explicit batched-path engagement threshold.
@@ -781,8 +775,7 @@ pub fn spawn_engine_batched(
         // Pula aktywacji nie zwalnia buforów, więc leniwy wzrost zostawiał w niej
         // każdy poprzedni komplet — wymiar bierzemy raz, z najszerszego kawałka.
         model.ensure_hybrid_prefill_capacity(prefill_chunk.min(MAX_PREFILL_CHUNK))?;
-        if max_active >= 2 && spec.kind() == SpeculationKind::Off && model.hybrid_batch_capable()
-        {
+        if max_active >= 2 && spec.kind() == SpeculationKind::Off && model.hybrid_batch_capable() {
             model.ensure_batch(max_active)?;
         }
     }
@@ -869,13 +862,11 @@ fn worker<'t>(
             if dense_prefill_batch && max_active >= 4 {
                 let started = Instant::now();
                 loop {
-                    let IdleCoalescingDecision::Wait(timeout) =
-                        idle_dense_coalescing_decision(
-                            started.elapsed(),
-                            waiting.len(),
-                            max_active,
-                        )
-                    else {
+                    let IdleCoalescingDecision::Wait(timeout) = idle_dense_coalescing_decision(
+                        started.elapsed(),
+                        waiting.len(),
+                        max_active,
+                    ) else {
                         break;
                     };
                     match rx.recv_timeout(timeout) {
@@ -2058,8 +2049,14 @@ fn mixed_gpu_group(
         None
     };
 
-    let result =
-        model.mixed_prefill_decode_step(&mut seqs, &tokens, &params, &mut pf.seq, &chunk, final_params);
+    let result = model.mixed_prefill_decode_step(
+        &mut seqs,
+        &tokens,
+        &params,
+        &mut pf.seq,
+        &chunk,
+        final_params,
+    );
     drop(seqs);
     let pf_result = match &result {
         Ok((_, final_id)) => Some(*final_id),
@@ -2709,10 +2706,10 @@ mod tests {
     use super::parse_mtp_ngram_mixed_batch;
     use super::{
         dense_prefill_auto_backend_capable, dense_prefill_batch_plan, dense_prefill_batch_route,
-        drain_poisoned_worker, hybrid_prefill_batch_plan, parse_dense_prefill_batch,
-        parse_hybrid_prefill_batch, resolve_dense_prefill_batch, resolve_hybrid_prefill_batch,
-        ActiveSeq, DensePrefillBatchMode, EngineEvent, EngineRequest, HybridPrefillBatchMode,
-        Submission, dense_prefill_scheduler_quantum,
+        dense_prefill_scheduler_quantum, drain_poisoned_worker, hybrid_prefill_batch_plan,
+        parse_dense_prefill_batch, parse_hybrid_prefill_batch, resolve_dense_prefill_batch,
+        resolve_hybrid_prefill_batch, ActiveSeq, DensePrefillBatchMode, EngineEvent, EngineRequest,
+        HybridPrefillBatchMode, Submission,
     };
     use super::{
         first_actionable_index, full_mtp_ngram_draft_fits, mtp_ngram_auto_backend,
@@ -2722,11 +2719,11 @@ mod tests {
     };
     use crate::metrics::EngineMetrics;
     use crate::model::hybrid_prefill_b2_backend_capable;
-    use std::time::Duration;
     use crate::speculation::{ProposerKind, SpeculationKind, SpeculativeConfig};
     use forge_types::Vendor;
     use std::collections::VecDeque;
     use std::sync::mpsc;
+    use std::time::Duration;
     use std::time::Instant;
 
     #[test]
@@ -2860,41 +2857,17 @@ mod tests {
         assert!(parse_dense_prefill_batch(Some("true")).is_err());
         assert!(parse_dense_prefill_batch(Some("auto")).is_err());
         assert!(parse_dense_prefill_batch(Some("")).is_err());
-        assert!(resolve_dense_prefill_batch(
-            DensePrefillBatchMode::Auto,
-            32,
-            1024,
-            true,
-        )
-        .unwrap());
-        assert!(!resolve_dense_prefill_batch(
-            DensePrefillBatchMode::Auto,
-            32,
-            1024,
-            false,
-        )
-        .unwrap());
-        assert!(!resolve_dense_prefill_batch(
-            DensePrefillBatchMode::Off,
-            32,
-            1024,
-            true,
-        )
-        .unwrap());
-        assert!(resolve_dense_prefill_batch(
-            DensePrefillBatchMode::ForceOn,
-            32,
-            1024,
-            true,
-        )
-        .unwrap());
-        assert!(resolve_dense_prefill_batch(
-            DensePrefillBatchMode::ForceOn,
-            32,
-            1024,
-            false,
-        )
-        .is_err());
+        assert!(resolve_dense_prefill_batch(DensePrefillBatchMode::Auto, 32, 1024, true,).unwrap());
+        assert!(
+            !resolve_dense_prefill_batch(DensePrefillBatchMode::Auto, 32, 1024, false,).unwrap()
+        );
+        assert!(!resolve_dense_prefill_batch(DensePrefillBatchMode::Off, 32, 1024, true,).unwrap());
+        assert!(
+            resolve_dense_prefill_batch(DensePrefillBatchMode::ForceOn, 32, 1024, true,).unwrap()
+        );
+        assert!(
+            resolve_dense_prefill_batch(DensePrefillBatchMode::ForceOn, 32, 1024, false,).is_err()
+        );
         assert!(dense_prefill_batch_route(true, true));
         assert!(!dense_prefill_batch_route(true, false));
         assert!(!dense_prefill_batch_route(false, true));
@@ -2906,11 +2879,9 @@ mod tests {
         assert!(dense_prefill_auto_backend_capable(32, 1024));
         assert!(!dense_prefill_auto_backend_capable(64, 1024));
         assert!(!dense_prefill_auto_backend_capable(32, 128));
-        for (warp_size, max_threads, rollout_capable) in [
-            (64, 1024, true),
-            (32, 128, true),
-            (32, 1024, false),
-        ] {
+        for (warp_size, max_threads, rollout_capable) in
+            [(64, 1024, true), (32, 128, true), (32, 1024, false)]
+        {
             assert!(!resolve_dense_prefill_batch(
                 DensePrefillBatchMode::Auto,
                 warp_size,

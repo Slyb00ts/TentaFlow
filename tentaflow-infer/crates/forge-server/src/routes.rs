@@ -738,7 +738,11 @@ pub async fn chat_completions(
     }
     let gen = match start_generation(
         &state,
-        vec![GenInput::Chat(req.messages, tools, req.chat_template_kwargs)],
+        vec![GenInput::Chat(
+            req.messages,
+            tools,
+            req.chat_template_kwargs,
+        )],
         spec,
         grammar,
     )

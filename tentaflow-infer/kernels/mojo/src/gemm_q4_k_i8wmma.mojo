@@ -49,7 +49,7 @@ def _weight_frag_i8(
     return bitcast[DType.int32, 4](nibbles.cast[DType.int8]())
 
 
-def gemm_q4_k_i8wmma_impl[
+def gemm_q4_k_i8wmma_tile_impl[
     WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int
 ](
     y: UnsafePointer[Float16, MutAnyOrigin],
@@ -59,7 +59,9 @@ def gemm_q4_k_i8wmma_impl[
     xsm: UnsafePointer[Float32, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
-    n_tokens: Int,
+    tile_first: Int,
+    tile_end: Int,
+    activation_tokens: Int,
 ):
     """GEMM Q4_K na WMMA int8: Y[t, r] = dot(w[r], x[t]).
 
@@ -79,7 +81,7 @@ def gemm_q4_k_i8wmma_impl[
     var wave = Int(thread_idx.x) // 32
     var tid = Int(thread_idx.x)
     var threads = Int(block_dim.x)
-    var base_m = Int(block_idx.y) * BM + (wave // WAVES_N) * MTILE * TILE
+    var base_m = tile_first + (wave // WAVES_N) * MTILE * TILE
     var base_n = Int(block_idx.x) * BN + (wave % WAVES_N) * NTILE * TILE
 
     var superblocks = n_cols // SUPERBLOCK
@@ -88,8 +90,8 @@ def gemm_q4_k_i8wmma_impl[
     var x_base = InlineArray[Int, MTILE](fill=0)
     comptime for mt in range(MTILE):
         var m = base_m + mt * TILE + lane % 16
-        if m > n_tokens - 1:
-            m = n_tokens - 1
+        if m > tile_end - 1:
+            m = tile_end - 1
         x_base[mt] = m * n_cols
 
     ws = stack_allocation[BN * 32, Int8, address_space = AddressSpace.SHARED]()
@@ -143,10 +145,10 @@ def gemm_q4_k_i8wmma_impl[
         comptime for mt in range(MTILE):
             comptime for i in range(8):
                 var m = base_m + mt * TILE + wmma_acc_row(lane, i)
-                if m > n_tokens - 1:
-                    m = n_tokens - 1
-                act_d[mt][i] = xd[b * n_tokens + m]
-                act_s[mt][i] = xsm[b * n_tokens + m]
+                if m > tile_end - 1:
+                    m = tile_end - 1
+                act_d[mt][i] = xd[b * activation_tokens + m]
+                act_s[mt][i] = xsm[b * activation_tokens + m]
 
         var a_lo = InlineArray[SIMD[DType.int32, 4], MTILE](
             fill=SIMD[DType.int32, 4](0)
@@ -187,9 +189,68 @@ def gemm_q4_k_i8wmma_impl[
             comptime for i in range(8):
                 var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 var n = base_n + nt * TILE + lane % 16
-                if m < n_tokens and n < n_rows:
+                if m < tile_end and n < n_rows:
                     y[m * n_rows + n] = Float16(acc[mt * NTILE + nt][i])
+
+
+def gemm_q4_k_i8wmma_impl[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    comptime BM = WAVES_M * MTILE * TILE
+    gemm_q4_k_i8wmma_tile_impl[WAVES_M, WAVES_N, MTILE, NTILE](
+        y,
+        weights,
+        xq,
+        xd,
+        xsm,
+        n_cols,
+        n_rows,
+        Int(block_idx.y) * BM,
+        n_tokens,
+        n_tokens,
+    )
+
+
+def gemm_q4_k_i8wmma_grouped_impl[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    var tile = Int(block_idx.y)
+    gemm_q4_k_i8wmma_tile_impl[WAVES_M, WAVES_N, MTILE, NTILE](
+        y,
+        wtab[Int(tile_expert[tile])],
+        xq,
+        xd,
+        xsm,
+        n_cols,
+        n_rows,
+        Int(tile_first[tile]),
+        Int(tile_end[tile]),
+        n_tokens,
+    )
 
 
 comptime gemm_q4_k_i8wmma_f16_bm32 = gemm_q4_k_i8wmma_impl[2, 2, 1, 2]
 comptime gemm_q4_k_i8wmma_f16_bm256 = gemm_q4_k_i8wmma_impl[4, 2, 4, 2]
+comptime gemm_q4_k_i8wmma_f16_grouped = gemm_q4_k_i8wmma_grouped_impl[2, 2, 2, 2]
+comptime gemm_q4_k_i8wmma_f16_grouped_bm128_bn64 = gemm_q4_k_i8wmma_grouped_impl[4, 2, 2, 2]

@@ -12,7 +12,10 @@ impl Model {
         }
     }
 
-    pub(crate) fn validate_nvfp4_tile_repacked(requested: bool, repacked_weights: usize) -> Result<()> {
+    pub(crate) fn validate_nvfp4_tile_repacked(
+        requested: bool,
+        repacked_weights: usize,
+    ) -> Result<()> {
         if requested && repacked_weights == 0 {
             return Err(ForgeError::Unsupported(
                 "TileN128K64 wymaga co najmniej jednej kwalifikującej się wagi GGUF NVFP4".into(),
@@ -309,7 +312,6 @@ impl Model {
         self.weights.w4a8 = Some(layers);
         Ok(())
     }
-
 
     /// Build the fp8 (e4m3) prefill packs from the resident GGUF weights. No
     /// calibration pass is needed (e4m3's exponent captures the per-row range),
@@ -799,8 +801,8 @@ impl Model {
                     self.fp8_build_step(self.pack_nvfp4_rows(q, 0, q.rows()))?
                 }
             };
-            let kv_rows = self.weights.descriptor.params.n_kv_heads
-                * self.weights.descriptor.params.head_dim;
+            let kv_rows =
+                self.weights.descriptor.params.n_kv_heads * self.weights.descriptor.params.head_dim;
             let (k, v) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w) => (
                     self.fp8_build_step(self.pack_nvfp4_rows(w, q_rows, kv_rows))?,
@@ -872,5 +874,4 @@ impl Model {
         self.batch_graphs.clear();
         Ok(Fp8PackOutcome::Built)
     }
-
 }

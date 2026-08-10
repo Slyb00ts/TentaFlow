@@ -8,8 +8,8 @@ use std::sync::Arc;
 use forge_engine::generate::{generate, GenerateRequest, StreamEvent};
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::SamplingParams;
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::Tokenizer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {

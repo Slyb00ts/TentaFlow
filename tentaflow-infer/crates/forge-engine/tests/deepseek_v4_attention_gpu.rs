@@ -27,7 +27,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 /// Zrzut oracle'a: interesują nas `x` (wejście warstwy) i `attn_full` (wyjście
@@ -179,7 +181,11 @@ fn attention_prefill_matches_the_reference_implementation() {
 
     let x = upload_f16(dev.as_ref(), &oracle.x);
     let out = dev
-        .alloc(oracle.seqlen * oracle.dim * 2, MemKind::Device, Pool::Activations)
+        .alloc(
+            oracle.seqlen * oracle.dim * 2,
+            MemKind::Device,
+            Pool::Activations,
+        )
         .unwrap();
     attention_prefill(
         &kernels,

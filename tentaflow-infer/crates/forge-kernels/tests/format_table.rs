@@ -311,10 +311,8 @@ fn every_format_agrees_with_the_cpu_reference() {
         // root, so this puts the reference output near one whatever magnitude
         // the format's blocks decoded to.
         let peak = w.iter().fold(0.0f32, |m, v| m.max(v.abs()));
-        let (table_bytes, table) = embedding(
-            0x9E37_79B9_7F4A_7C15,
-            1.0 / (peak * (WIDTH as f32).sqrt()),
-        );
+        let (table_bytes, table) =
+            embedding(0x9E37_79B9_7F4A_7C15, 1.0 / (peak * (WIDTH as f32).sqrt()));
 
         let mut exec = CudaExec::new(
             device.clone() as Arc<_>,
@@ -361,7 +359,9 @@ fn every_format_agrees_with_the_cpu_reference() {
         let head = spread_error(&exec.read(Act::Logits, WIDTH).expect("logity"), &want);
 
         // Tile form: many rows at once, a different kernel over the same bytes.
-        let tokens: Vec<u32> = (0..TILE_TOKENS).map(|t| (t * 3 + 1) % WIDTH as u32).collect();
+        let tokens: Vec<u32> = (0..TILE_TOKENS)
+            .map(|t| (t * 3 + 1) % WIDTH as u32)
+            .collect();
         let tile_step = Step::single(1, 0, TILE_TOKENS).expect("krok kafla");
         exec.run(&Op::Embed {
             table: embed,
@@ -376,7 +376,9 @@ fn every_format_agrees_with_the_cpu_reference() {
             step: tile_step,
         })
         .unwrap_or_else(|e| panic!("{quant:?}: GEMM odmówił: {e}"));
-        let tiled = exec.read(Act::Query, WIDTH * TILE_TOKENS as usize).expect("odczyt kafla");
+        let tiled = exec
+            .read(Act::Query, WIDTH * TILE_TOKENS as usize)
+            .expect("odczyt kafla");
         let gemm = tokens
             .iter()
             .enumerate()
@@ -415,7 +417,10 @@ fn every_format_agrees_with_the_cpu_reference() {
                 0.02
             };
             if !(err < bound) {
-                failures.push(format!("{quant:?} {family}: {:.3}% rozpiętości", err * 100.0));
+                failures.push(format!(
+                    "{quant:?} {family}: {:.3}% rozpiętości",
+                    err * 100.0
+                ));
             }
         }
     }

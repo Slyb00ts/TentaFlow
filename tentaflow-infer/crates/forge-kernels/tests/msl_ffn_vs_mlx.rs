@@ -192,7 +192,11 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_name(msl::Bits::Four, scales, OutDtype::F16))
+        .kernel(&msl::qmv_affine_name(
+            msl::Bits::Four,
+            scales,
+            OutDtype::F16,
+        ))
         .unwrap();
     let norm_src = msl::rmsnorm_source(scales);
     let rmsnorm = gpu
@@ -252,12 +256,12 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
     let y = gpu.empty(hidden as usize * 2);
 
     let gemv = |out: &DevBuffer,
-                    w: &DevBuffer,
-                    s: &DevBuffer,
-                    b: &DevBuffer,
-                    input: &DevBuffer,
-                    rows: u32,
-                    cols: u32| {
+                w: &DevBuffer,
+                s: &DevBuffer,
+                b: &DevBuffer,
+                input: &DevBuffer,
+                rows: u32,
+                cols: u32| {
         let args = LaunchArgs::new()
             .buf(out)
             .buf(w)
@@ -315,13 +319,19 @@ fn a_whole_ffn_block_matches_mlx_stage_by_stage() {
         "gate",
         &gpu.read_f16(&g, inter as usize),
         &f.f64s("g_true"),
-        &f.f32s("g_mlx").iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        &f.f32s("g_mlx")
+            .iter()
+            .map(|v| *v as f64)
+            .collect::<Vec<_>>(),
     );
     check(
         "up",
         &gpu.read_f16(&u, inter as usize),
         &f.f64s("u_true"),
-        &f.f32s("u_mlx").iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        &f.f32s("u_mlx")
+            .iter()
+            .map(|v| *v as f64)
+            .collect::<Vec<_>>(),
     );
     check(
         "bramka",
@@ -370,7 +380,11 @@ fn each_kernel_is_also_checked_in_isolation() {
         .dev
         .load_module(qmv_src.as_bytes())
         .unwrap()
-        .kernel(&msl::qmv_affine_name(msl::Bits::Four, scales, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(
+            msl::Bits::Four,
+            scales,
+            OutDtype::F32,
+        ))
         .unwrap();
     let (hidden, inter) = (f.hidden, f.inter);
 
@@ -408,6 +422,9 @@ fn each_kernel_is_also_checked_in_isolation() {
         "down",
         &gpu.read_f32(&y, hidden as usize),
         &f.f64s("y_true"),
-        &f.f32s("y_mlx").iter().map(|v| *v as f64).collect::<Vec<_>>(),
+        &f.f32s("y_mlx")
+            .iter()
+            .map(|v| *v as f64)
+            .collect::<Vec<_>>(),
     );
 }

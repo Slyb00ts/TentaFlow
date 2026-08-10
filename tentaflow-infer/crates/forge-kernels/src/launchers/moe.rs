@@ -339,8 +339,7 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         if let GroupedAct::Fp4 { xq, xs } = act {
-            return self
-                .gemm_mxf4_grouped(y, table, xq, xs, tiles, rows, cols, selections, stream);
+            return self.gemm_mxf4_grouped(y, table, xq, xs, tiles, rows, cols, selections, stream);
         }
         // The table was built with one stride for all three projections, so the
         // tile this launch picks has to be the one that stride belongs to.
@@ -356,12 +355,9 @@ impl Kernels {
         let int8 = matches!(act, GroupedAct::Int8 { .. });
         let args = match act {
             GroupedAct::F16(x) => LaunchArgs::new().buf(y).buf(table).buf(*x),
-            GroupedAct::Int8 { xq, xd, xsm } => LaunchArgs::new()
-                .buf(y)
-                .buf(table)
-                .buf(xq)
-                .buf(xd)
-                .buf(xsm),
+            GroupedAct::Int8 { xq, xd, xsm } => {
+                LaunchArgs::new().buf(y).buf(table).buf(xq).buf(xd).buf(xsm)
+            }
             GroupedAct::Fp4 { .. } => unreachable!("wariant czterobitowy wyszedł wyżej"),
         };
         let args = args
@@ -674,8 +670,17 @@ impl Kernels {
                 let (name, tokens, threads) = self.mxf4_grouped_variant();
                 return Ok((name, threads, 128, tokens));
             }
+            QuantKind::Q4K if self.device.caps().vendor == forge_types::Vendor::Amd => {
+                ("gemm_q4_k_i8wmma_f16_grouped", 128, 64, 64)
+            }
             QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped", 256, 64, 64),
+            QuantKind::Q8_0 if self.device.caps().vendor == forge_types::Vendor::Amd => {
+                ("gemm_q8_0_wmma_f16_grouped", 128, 64, 64)
+            }
             QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped", 256, 64, 64),
+            QuantKind::Q6K if self.device.caps().vendor == forge_types::Vendor::Amd => {
+                ("gemm_q6_k_wmma_f16_grouped", 256, 64, 64)
+            }
             QuantKind::Q6K => ("gemm_q6_k_f16_grouped", 128, 64, 64),
             other => {
                 return Err(ForgeError::Unsupported(format!(
@@ -687,8 +692,17 @@ impl Kernels {
             return Ok(narrow);
         }
         let (name, block) = match quant {
+            QuantKind::Q4K if self.device.caps().vendor == forge_types::Vendor::Amd => {
+                ("gemm_q4_k_i8wmma_f16_grouped_bm128_bn64", 256)
+            }
             QuantKind::Q4K => ("gemm_q4_k_i8mma_grouped_bm128_bn64", 256),
+            QuantKind::Q8_0 if self.device.caps().vendor == forge_types::Vendor::Amd => {
+                ("gemm_q8_0_wmma_f16_grouped_bm128_bn64", 256)
+            }
             QuantKind::Q8_0 => ("gemm_q8_0_i8mma_grouped_bm128_bn64", 256),
+            QuantKind::Q6K if self.device.caps().vendor == forge_types::Vendor::Amd => {
+                ("gemm_q6_k_wmma_f16_grouped_bm128_bn64", 256)
+            }
             _ => ("gemm_q6_k_f16_grouped_bm128_bn64", 256),
         };
         Ok(if self.artifacts.has(name) {

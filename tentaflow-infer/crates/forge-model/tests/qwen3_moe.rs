@@ -99,7 +99,11 @@ fn the_mixture_continues_a_factual_prompt() {
     let t = std::time::Instant::now();
     let _ = model.prefill(SLOT, &long).expect("prefill długi");
     let took = t.elapsed().as_secs_f64();
-    eprintln!("prefill {} tokenów = {:.0} tok/s", long.len(), long.len() as f64 / took);
+    eprintln!(
+        "prefill {} tokenów = {:.0} tok/s",
+        long.len(),
+        long.len() as f64 / took
+    );
     model.reset(SLOT).expect("reset");
     let t = std::time::Instant::now();
     let out = model.generate(SLOT, &prompt, 20).expect("generacja");

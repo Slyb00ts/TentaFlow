@@ -73,7 +73,8 @@ def _wmma_q8_tile[
     xd: UnsafePointer[Float32, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
-    n_tokens: Int,
+    tile_end: Int,
+    activation_tokens: Int,
     row0: Int,
     token0: Int,
 ):
@@ -92,8 +93,8 @@ def _wmma_q8_tile[
     var x_base = InlineArray[Int, MTILE](fill=0)
     comptime for mt in range(MTILE):
         var m = base_m + mt * TILE + lane % 16
-        if m > n_tokens - 1:
-            m = n_tokens - 1
+        if m > tile_end - 1:
+            m = tile_end - 1
         x_base[mt] = m * n_cols
     var w_base = InlineArray[Int, NTILE](fill=0)
     comptime for nt in range(NTILE):
@@ -128,10 +129,10 @@ def _wmma_q8_tile[
                 comptime for i in range(8):
                     # (m, n) tego pola: m = i*2 + lane//16, n = lane % 16.
                     var m = base_m + mt * TILE + wmma_acc_row(lane, i)
-                    if m > n_tokens - 1:
-                        m = n_tokens - 1
+                    if m > tile_end - 1:
+                        m = tile_end - 1
                     acc[mt * NTILE + nt][i] += (
-                        Float32(block_acc[i]) * dw * xd[b * n_tokens + m]
+                        Float32(block_acc[i]) * dw * xd[b * activation_tokens + m]
                     )
 
     comptime for mt in range(MTILE):
@@ -139,7 +140,7 @@ def _wmma_q8_tile[
             comptime for i in range(8):
                 var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 var n = base_n + nt * TILE + lane % 16
-                if m < n_tokens and n < n_rows:
+                if m < tile_end and n < n_rows:
                     y[m * n_rows + n] = acc[mt * NTILE + nt][i].cast[OUT]()
 
 
@@ -178,8 +179,40 @@ def gemm_q8_0_wmma_impl[WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, OUT:
     comptime BM = WAVES_M * MTILE * TILE
     comptime BN = WAVES_N * NTILE * TILE
     _wmma_q8_tile[WAVES_M, WAVES_N, MTILE, NTILE, OUT](
-        y, w, xq, xd, n_cols, n_rows, n_tokens,
+        y, w, xq, xd, n_cols, n_rows, n_tokens, n_tokens,
         Int(block_idx.x) * BN, Int(block_idx.y) * BM,
+    )
+
+
+def gemm_q8_0_wmma_grouped_impl[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Jeden grid WMMA Q8_0 dla wszystkich ekspertów routowanego kroku."""
+    _ = xsm
+    var tile = Int(block_idx.y)
+    _wmma_q8_tile[WAVES_M, WAVES_N, MTILE, NTILE, DType.float16](
+        y,
+        wtab[Int(tile_expert[tile])],
+        xq,
+        xd,
+        n_cols,
+        n_rows,
+        Int(tile_end[tile]),
+        n_tokens,
+        Int(block_idx.x) * WAVES_N * NTILE * TILE,
+        Int(tile_first[tile]),
     )
 
 
@@ -236,3 +269,5 @@ comptime gemm_q8_0_wmma_out_f32_64x128 = gemm_q8_0_wmma_impl[2, 2, 2, 4, DType.f
 comptime gemm_q8_0_wmma_128x128 = gemm_q8_0_wmma_impl[4, 2, 2, 4, DType.float16]
 comptime gemm_q8_0_wmma_16x64 = gemm_q8_0_wmma_impl[1, 4, 1, 1, DType.float16]
 comptime gemm_q8_0_wmma_out_f32_16x64 = gemm_q8_0_wmma_impl[1, 4, 1, 1, DType.float32]
+comptime gemm_q8_0_wmma_f16_grouped = gemm_q8_0_wmma_grouped_impl[2, 2, 2, 2]
+comptime gemm_q8_0_wmma_f16_grouped_bm128_bn64 = gemm_q8_0_wmma_grouped_impl[4, 2, 2, 2]

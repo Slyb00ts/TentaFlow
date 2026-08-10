@@ -64,8 +64,7 @@ fn write_bytes(dev: &dyn Device, kind: MemKind, bytes: &[u8]) -> DevBuffer {
 /// Device table of per-expert weight base addresses.
 fn pointer_table(dev: &dyn Device, experts: &[DevBuffer]) -> DevBuffer {
     let addrs: Vec<u64> = experts.iter().map(|b| b.device_ptr()).collect();
-    let bytes =
-        unsafe { std::slice::from_raw_parts(addrs.as_ptr() as *const u8, addrs.len() * 8) };
+    let bytes = unsafe { std::slice::from_raw_parts(addrs.as_ptr() as *const u8, addrs.len() * 8) };
     write_bytes(dev, MemKind::Device, bytes)
 }
 
@@ -156,7 +155,15 @@ fn check_q4k(case: &Case, host_expert: Option<usize>) {
                 &stream,
             )
             .unwrap();
-        assert_bit_identical(dev.as_ref(), &stream, &y_table, &y_window, rows, e, kinds[e]);
+        assert_bit_identical(
+            dev.as_ref(),
+            &stream,
+            &y_table,
+            &y_window,
+            rows,
+            e,
+            kinds[e],
+        );
     }
 }
 
@@ -209,7 +216,15 @@ fn check_q6k(case: &Case, host_expert: Option<usize>) {
                 &stream,
             )
             .unwrap();
-        assert_bit_identical(dev.as_ref(), &stream, &y_table, &y_window, rows, e, kinds[e]);
+        assert_bit_identical(
+            dev.as_ref(),
+            &stream,
+            &y_table,
+            &y_window,
+            rows,
+            e,
+            kinds[e],
+        );
     }
 }
 

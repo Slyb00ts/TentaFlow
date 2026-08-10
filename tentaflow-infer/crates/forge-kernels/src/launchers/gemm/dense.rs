@@ -13,6 +13,10 @@ impl Kernels {
         has_hybrid_prefill_t128_artifacts(nvidia, |name| self.artifacts.has(name))
     }
 
+    pub fn q4_k_wmma_prefill_artifacts_capable(&self, rows: usize, n_tokens: usize) -> bool {
+        q4_k_wmma_prefill_artifacts_capable(rows, n_tokens, |name| self.artifacts.has(name))
+    }
+
     /// Sprawdza pełny backend i artefakty równego dense prefill.
     pub fn dense_prefill_batch_capable(
         &self,
@@ -580,8 +584,7 @@ impl Kernels {
         // karcie o 64 CU. Zmierzone: 222 us na wywołanie, 96 wywołań na prefill
         // 27B, czyli 21 ms zmarnowane na 2,6% prefillu. Mały kafel ma tam 32
         // bloki zamiast dwóch.
-        let Some((name, bm, bn, block)) = self.gemm_kblock_wmma_tile(family, rows, n_tokens)
-        else {
+        let Some((name, bm, bn, block)) = self.gemm_kblock_wmma_tile(family, rows, n_tokens) else {
             return Ok(false);
         };
         let kernel = self.artifacts.get(&name)?;
@@ -968,7 +971,9 @@ impl Kernels {
     /// nie wystartować gdzie indziej — i wtedy launch zwraca błąd zamiast
     /// czegokolwiek policzyć. Backend bez odpowiedzi nie blokuje wyboru.
     pub(crate) fn block_fits(kernel: &KernelHandle, threads: u32) -> bool {
-        kernel.max_block_threads().is_none_or(|limit| limit >= threads)
+        kernel
+            .max_block_threads()
+            .is_none_or(|limit| limit >= threads)
     }
 
     pub(crate) fn gemm_i8mma_tile(
@@ -1228,5 +1233,4 @@ impl Kernels {
         self.device.launch(&gk, &cfg, &args, stream)?;
         Ok(true)
     }
-
 }

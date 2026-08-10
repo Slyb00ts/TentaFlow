@@ -12,7 +12,7 @@
 //   TP_WEIGHTS_GIB=10 pula wag karty modelu
 //   TP_SHARD_GIB=8    pula wag kart dodatkowych
 use forge_engine::model::{Model, ModelConfig};
-use forge_hal::{PoolSizes, gpu};
+use forge_hal::{gpu, PoolSizes};
 use std::time::Instant;
 
 fn pools(var: &str, default_gib: usize) -> PoolSizes {
@@ -79,8 +79,7 @@ fn greedy(model: &mut Model, prompt: &[u32], count: usize) -> Vec<u32> {
 fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "warn".into()),
+            tracing_subscriber::EnvFilter::try_from_default_env().unwrap_or_else(|_| "warn".into()),
         )
         .init();
     let path = std::path::PathBuf::from(std::env::args().nth(1).expect("ścieżka do gguf"));
@@ -172,7 +171,10 @@ fn main() {
                 n += ((x - y) as f64).powi(2);
                 d += (*x as f64).powi(2);
             }
-            println!("  krok {step}: względne L2 {:.2e}", (n / d.max(1e-12)).sqrt());
+            println!(
+                "  krok {step}: względne L2 {:.2e}",
+                (n / d.max(1e-12)).sqrt()
+            );
         }
         for (x, y) in a.iter().zip(b.iter()) {
             // Część modeli maskuje nieużywane wpisy słownika minus nieskończonością

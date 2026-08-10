@@ -2966,6 +2966,43 @@ def quantize_act_q8_1(
         xsm[sidx] = d * Float32(sumq)
 
 
+def quantize_act_q8_1_xsum(
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    xsum: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    """Q8_1 pre-pass retaining both d*sum(q) and the exact f32 input sum."""
+    nb = n_cols // 32
+    idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= n_tokens * nb:
+        return
+    tok = idx // nb
+    blk = idx % nb
+    off = tok * n_cols + blk * 32
+    sidx = blk * n_tokens + tok
+    xf = (x + off).load[width=32, alignment=64]().cast[DType.float32]()
+    exact_sum = xf.reduce_add()
+    amax = abs(xf).reduce_max()
+    xsum[sidx] = exact_sum
+    if amax == 0.0:
+        (xq + off).store[alignment=32](SIMD[DType.int8, 32](0))
+        xd[sidx] = 0.0
+        xsm[sidx] = 0.0
+    else:
+        d = amax * (1.0 / 127.0)
+        q = round(xf * (127.0 / amax)).cast[DType.int8]()
+        (xq + off).store[alignment=32](q)
+        xd[sidx] = d
+        var sumq: Int32 = 0
+        comptime for e in range(32):
+            sumq += Int32(q[e])
+        xsm[sidx] = d * Float32(sumq)
+
+
 @always_inline
 def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],

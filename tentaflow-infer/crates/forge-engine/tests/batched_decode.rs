@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 
 const STEPS: usize = 24;
 
@@ -43,7 +43,7 @@ fn load() -> Option<Model> {
     let dev: Arc<dyn Device> = device;
     let cfg = ModelConfig {
         weight_host_budget: 0,
-weight_spill_dir: None,
+        weight_spill_dir: None,
         kv_pages: 256,
         ..ModelConfig::default()
     };

@@ -273,19 +273,55 @@ impl<E: Executor + WeightStore> Dense<E> {
             let mixer = if l.contains_key(&WeightRole::SsmInProj) {
                 let g = ssm.ok_or_else(|| {
                     ForgeError::Unsupported(
-                        "warstwa jest rekurencyjna, a checkpoint nie podał geometrii miksera".into(),
+                        "warstwa jest rekurencyjna, a checkpoint nie podał geometrii miksera"
+                            .into(),
                     )
                 })?;
                 Mixer::Delta(DeltaWeights {
-                    qkv: quant(&mut exec, src, name(WeightRole::SsmInProj), g.mixed_width(), h, None)?,
-                    gate: quant(&mut exec, src, name(WeightRole::SsmGate), g.value_width(), h, None)?,
+                    qkv: quant(
+                        &mut exec,
+                        src,
+                        name(WeightRole::SsmInProj),
+                        g.mixed_width(),
+                        h,
+                        None,
+                    )?,
+                    gate: quant(
+                        &mut exec,
+                        src,
+                        name(WeightRole::SsmGate),
+                        g.value_width(),
+                        h,
+                        None,
+                    )?,
                     conv: plain(&mut exec, src, name(WeightRole::SsmConv1d))?,
-                    alpha: quant(&mut exec, src, name(WeightRole::SsmAlpha), g.v_heads, h, None)?,
-                    beta: quant(&mut exec, src, name(WeightRole::SsmBeta), g.v_heads, h, None)?,
+                    alpha: quant(
+                        &mut exec,
+                        src,
+                        name(WeightRole::SsmAlpha),
+                        g.v_heads,
+                        h,
+                        None,
+                    )?,
+                    beta: quant(
+                        &mut exec,
+                        src,
+                        name(WeightRole::SsmBeta),
+                        g.v_heads,
+                        h,
+                        None,
+                    )?,
                     dt_bias: plain(&mut exec, src, name(WeightRole::SsmDt))?,
                     a: plain(&mut exec, src, name(WeightRole::SsmA))?,
                     norm: plain(&mut exec, src, name(WeightRole::SsmNorm))?,
-                    out: quant(&mut exec, src, name(WeightRole::SsmOut), h, g.value_width(), None)?,
+                    out: quant(
+                        &mut exec,
+                        src,
+                        name(WeightRole::SsmOut),
+                        h,
+                        g.value_width(),
+                        None,
+                    )?,
                 })
             } else {
                 let (q, q_gate) = query(
@@ -324,9 +360,30 @@ impl<E: Executor + WeightStore> Dense<E> {
                         // The stacks arrive three-dimensional and are addressed
                         // as one flat row range per expert, which is how the
                         // kernels index them.
-                        gate: quant(&mut exec, src, name(WeightRole::FfnGateExps), n * inter, h, None)?,
-                        up: quant(&mut exec, src, name(WeightRole::FfnUpExps), n * inter, h, None)?,
-                        down: quant(&mut exec, src, name(WeightRole::FfnDownExps), n * h, inter, None)?,
+                        gate: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnGateExps),
+                            n * inter,
+                            h,
+                            None,
+                        )?,
+                        up: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnUpExps),
+                            n * inter,
+                            h,
+                            None,
+                        )?,
+                        down: quant(
+                            &mut exec,
+                            src,
+                            name(WeightRole::FfnDownExps),
+                            n * h,
+                            inter,
+                            None,
+                        )?,
                         experts: n,
                         top_k: m.n_experts_used as u32,
                         norm_topk: m.norm_topk_prob,
@@ -618,14 +675,17 @@ impl<E: Executor + WeightStore> Dense<E> {
                     a.q_norm.map(|w| (w, Act::Query, s.heads)),
                     a.k_norm.map(|w| (w, Act::Key, s.kv_heads)),
                 ];
-                ops.extend(head_norms.into_iter().flatten().map(|(w, act, heads)| {
-                    Op::HeadNorm {
-                        act,
-                        w,
-                        heads,
-                        step: step.clone(),
-                    }
-                }));
+                ops.extend(
+                    head_norms
+                        .into_iter()
+                        .flatten()
+                        .map(|(w, act, heads)| Op::HeadNorm {
+                            act,
+                            w,
+                            heads,
+                            step: step.clone(),
+                        }),
+                );
                 ops.extend([
                     Op::Rope {
                         act: Act::Query,
@@ -836,7 +896,14 @@ fn shared_expert<E: WeightStore>(
         up: quant(exec, src, name(WeightRole::FfnUpShExp), w, hidden, None)?,
         down: quant(exec, src, name(WeightRole::FfnDownShExp), hidden, w, None)?,
         // One row: the gate is a per-token logit, not a per-expert one.
-        router: quant(exec, src, name(WeightRole::FfnGateInpShExp), 1, hidden, None)?,
+        router: quant(
+            exec,
+            src,
+            name(WeightRole::FfnGateInpShExp),
+            1,
+            hidden,
+            None,
+        )?,
     }))
 }
 
@@ -1049,11 +1116,8 @@ const DELTA_ROLES: &[WeightRole] = &[
 ];
 
 /// The feed-forward roles of a dense block.
-const DENSE_FFN_ROLES: &[WeightRole] = &[
-    WeightRole::FfnGate,
-    WeightRole::FfnUp,
-    WeightRole::FfnDown,
-];
+const DENSE_FFN_ROLES: &[WeightRole] =
+    &[WeightRole::FfnGate, WeightRole::FfnUp, WeightRole::FfnDown];
 
 /// The feed-forward roles of a mixture block. The router is what tells the two
 /// apart, so it is the role looked at first.

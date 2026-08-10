@@ -429,7 +429,9 @@ pub fn deepseek_fp8_to_row_scaled(
         let mut max_code = 0u8;
         for &code in tile_row {
             if code == 0xFF {
-                return Err(fmt_err(format!("fp8: skala kafla w wierszu {row} jest NaN")));
+                return Err(fmt_err(format!(
+                    "fp8: skala kafla w wierszu {row} jest NaN"
+                )));
             }
             max_code = max_code.max(code);
         }
@@ -463,7 +465,11 @@ fn e4m3_shift_down(byte: u8, shift: u8) -> Result<u8> {
     }
     // Zejście poniżej zakresu normalnego: mantysa dostaje wiodącą jedynkę i
     // jest przesuwana, z zaokrągleniem do najbliższej parzystej.
-    let significand = if exponent == 0 { mantissa } else { mantissa + 8 };
+    let significand = if exponent == 0 {
+        mantissa
+    } else {
+        mantissa + 8
+    };
     let drop = 1 - shifted;
     if drop > 4 {
         return Ok(sign);
@@ -564,9 +570,13 @@ mod tests {
     #[test]
     fn the_gguf_repack_decodes_to_the_same_numbers() {
         let (rows, cols) = (2usize, 128usize);
-        let packed: Vec<u8> = (0..rows * cols / 2).map(|i| ((i * 37 + 11) % 256) as u8).collect();
+        let packed: Vec<u8> = (0..rows * cols / 2)
+            .map(|i| ((i * 37 + 11) % 256) as u8)
+            .collect();
         // Skale E4M3 bez bitu znaku i bez NaN — konwersja odrzuca oba jawnie.
-        let scales: Vec<u8> = (0..rows * cols / 16).map(|i| (0x30 + (i % 16)) as u8).collect();
+        let scales: Vec<u8> = (0..rows * cols / 16)
+            .map(|i| (0x30 + (i % 16)) as u8)
+            .collect();
         let global = 0.125f32;
 
         let direct = dequantize_nvfp4(&packed, &scales, global, rows, cols, 16).expect("wprost");

@@ -15,8 +15,8 @@ use std::time::Instant;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::{StreamDecoder, Tokenizer};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -64,7 +64,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let kv_pages = if kv_pages == 0 { ctx_pages } else { kv_pages };
     let cfg = ModelConfig {
         weight_host_budget: 0,
-weight_spill_dir: None,
+        weight_spill_dir: None,
         kv_page_size: page_size,
         kv_pages,
         max_seq_len: ctx,

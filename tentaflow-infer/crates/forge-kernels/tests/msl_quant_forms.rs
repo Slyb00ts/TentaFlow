@@ -43,7 +43,9 @@ fn weight(bits: u32, group: usize) -> Weight {
     // Pełny zakres kodu tej szerokości. Przy sześciu bitach każda waga, której
     // starsze dwa bity są niezerowe, wyjdzie inna, jeśli kernel ich nie czyta.
     let span = if bits == 6 { 64 } else { 16 };
-    let codes: Vec<u8> = (0..ROWS * COLS).map(|i| ((i * 7 + 11) % span) as u8).collect();
+    let codes: Vec<u8> = (0..ROWS * COLS)
+        .map(|i| ((i * 7 + 11) % span) as u8)
+        .collect();
     let groups = ROWS * COLS / group;
     let mut packed = vec![0u32; ROWS * COLS / 8];
     let mut high = vec![0u32; ROWS * COLS / 16];
@@ -97,7 +99,10 @@ struct Gpu {
 
 impl Gpu {
     fn up(&self, bytes: &[u8]) -> DevBuffer {
-        let buf = self.dev.alloc(bytes.len(), MemKind::Device, Pool::Weights).unwrap();
+        let buf = self
+            .dev
+            .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
         self.dev.write(bytes, &buf, 0).unwrap();
         buf
     }
@@ -151,7 +156,10 @@ impl Form {
 
     fn grid(self, tokens: u32) -> ((u32, u32), u32) {
         match self {
-            Form::Vector => ((msl::qmv_affine_4bit_groups(ROWS as u32), 1), msl::QMV_THREADS),
+            Form::Vector => (
+                (msl::qmv_affine_4bit_groups(ROWS as u32), 1),
+                msl::QMV_THREADS,
+            ),
             Form::Blocked => (
                 msl::qmm_affine_4bit_groups(ROWS as u32, tokens),
                 msl::QMM_THREADS,
@@ -251,7 +259,11 @@ fn every_form_computes_every_width_and_group() {
             // luźniejszy. Ale wszystkie trzy liczą TĘ SAMĄ wagę: pomylone
             // wyłuskanie kodu albo pomylona grupa dają błąd rzędu jedności, nie
             // tysięcznych. Ten próg rozstrzyga o adresowaniu, nie o precyzji.
-            let limit = if matches!(form, Form::Matrix) { 5e-3 } else { 1e-3 };
+            let limit = if matches!(form, Form::Matrix) {
+                5e-3
+            } else {
+                1e-3
+            };
             assert!(
                 err <= limit,
                 "{bits}/{group} przez {}: {err:.3e} zakresu",

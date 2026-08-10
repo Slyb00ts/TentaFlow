@@ -16,8 +16,8 @@ fn main() {
     let out_dir = std::env::var("OUT_DIR").unwrap();
     let out_path = Path::new(&out_dir).join("embedded_artifacts.rs");
 
-    let kernel_build_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-        .join("../../kernels/mojo/build");
+    let kernel_build_dir =
+        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../kernels/mojo/build");
 
     let architectures = vec!["sm_89", "sm_121a", "gfx1030", "gfx1100", "gfx1201"];
     let mut generated_code = String::new();
@@ -58,7 +58,10 @@ fn main() {
         let kernels = match manifest.get("kernels") {
             Some(serde_json::Value::Object(k)) => k,
             _ => {
-                eprintln!("warning: malformed manifest for {}: no kernels object", arch);
+                eprintln!(
+                    "warning: malformed manifest for {}: no kernels object",
+                    arch
+                );
                 continue;
             }
         };
@@ -70,7 +73,10 @@ fn main() {
             let file_name = match kernel_entry.get("file") {
                 Some(serde_json::Value::String(f)) => f.clone(),
                 _ => {
-                    eprintln!("warning: kernel {} in {} has no file field", kernel_name, arch);
+                    eprintln!(
+                        "warning: kernel {} in {} has no file field",
+                        kernel_name, arch
+                    );
                     all_exist = false;
                     break;
                 }
@@ -100,11 +106,18 @@ fn main() {
         }
 
         // Determine file extension based on architecture
-        let ext = if arch.starts_with("sm_") { ".ptx" } else { ".hsaco" };
+        let ext = if arch.starts_with("sm_") {
+            ".ptx"
+        } else {
+            ".hsaco"
+        };
 
         // Generate the include_bytes! calls and const definition
         let const_name = format!("EMBEDDED_{}", arch.to_uppercase().replace(".", "_"));
-        let manifest_const = format!("EMBEDDED_MANIFEST_{}", arch.to_uppercase().replace(".", "_"));
+        let manifest_const = format!(
+            "EMBEDDED_MANIFEST_{}",
+            arch.to_uppercase().replace(".", "_")
+        );
 
         generated_code.push_str(&format!(
             r#"

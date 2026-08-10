@@ -29,8 +29,12 @@ Ostatnia aktualizacja: 2026-07-25.
   ms**, przy niezmienionej zajętości kerneli (30,65 -> 30,35 ms), bo te fuzje nie
   przyspieszają liczenia, tylko zdejmują podatek od dyspozycji. Obie fuzje są
   bitowo zgodne (blok ma tyle wątków, ile redukcja miała wartości). Wynik przy
-  niezmienionej sumie SHA `0bf2b86b…` we wszystkich komórkach: Q4_K_M
-  **30,0 -> 31,0**, NVFP4 **30,0 -> 30,9**, MTP 58,8 -> 58,9 i 70,3 -> 70,4,
+  niezmienionej sumie SHA `0bf2b86b…` we wszystkich komórkach: wcześniejszy
+  wynik Q4_K_M **31,0 tok/s** nie jest już wynikiem referencyjnym. Niezależny
+  oracle ujawnił błąd wspólnego rdzenia Q4_K DP4A; po jego korekcie, bez
+  ekstrapolacji, Qwen3.6-27B Q4_K na HIP/R9700 osiąga przy p1024/tg1000 po
+  rozgrzewce trzy wyniki **30,9 / 30,8 / 30,7 tok/s** (mediana **30,8 tok/s**).
+  NVFP4 **30,0 -> 30,9**, MTP 58,8 -> 58,9 i 70,3 -> 70,4,
   dwie karty 39,7 -> 40,0. Zostało 128 uruchomień w zasięgu tej samej metody
   (`silu_mul`, `gated_rmsnorm`, `sigmoid_mul`), warte ~0,5 ms; **34 tok/s na
   jednej karcie dla tego checkpointu nie jest osiągalne** i przez tę ścianę

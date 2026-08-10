@@ -127,4 +127,3 @@ fn gemv_q4_k_dp4a_batch_rozni_sie_od_seryjnego_tylko_zaokragleniem() {
         );
     }
 }
-

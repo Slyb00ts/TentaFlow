@@ -1,7 +1,7 @@
 // ===== File: gemma4_tokenizer.rs — round-trip tokenizera Gemma 4 z realnego GGUF =====
 
-use forge_tokenize::gguf_vocab;
 use forge_formats::gguf::Gguf;
+use forge_tokenize::gguf_vocab;
 use forge_tokenize::Tokenizer;
 
 const MODEL: &str = "../../test-models/gguf/gemma-4-12b-it-qat-q4_0.gguf";

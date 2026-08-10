@@ -62,7 +62,10 @@ impl Model {
         self.tp_partial.is_none()
             && Self::fused_decode_available(&self.weights, self.device.caps().vendor)
     }
-    pub(crate) fn fused_decode_available(weights: &ModelWeights, vendor: forge_types::Vendor) -> bool {
+    pub(crate) fn fused_decode_available(
+        weights: &ModelWeights,
+        vendor: forge_types::Vendor,
+    ) -> bool {
         let p = &weights.descriptor.params;
         // Kernele `gemv_norm_*` przeliczaja norme w KAZDEJ grupie roboczej i sa
         // strojone pod NVIDIA. Na gfx1030 profiler pokazal 182,95 us na wywolanie
@@ -124,16 +127,13 @@ impl Model {
     }
 }
 
+
 /// Odmowy, które muszą paść PRZED alokacją czegokolwiek.
 ///
 /// Wszystkie czytają wyłącznie opis modelu, konfigurację i urządzenie, więc
 /// stoją w jednym miejscu zamiast być rozsiane po `finish` — a `finish` woła je
 /// zanim weźmie choć jedną stronę pamięci.
-pub(crate) fn admit(
-    device: &dyn Device,
-    weights: &ModelWeights,
-    cfg: &ModelConfig,
-) -> Result<()> {
+pub(crate) fn admit(device: &dyn Device, weights: &ModelWeights, cfg: &ModelConfig) -> Result<()> {
     let p = &weights.descriptor.params;
     // head_dim 256 has an f16-only attention specialization (qwen35moe
     // gated attention layers); the hybrid arch always uses the f16 cache.
@@ -283,7 +283,10 @@ pub(crate) fn batched_head_supported(head: &DevWeight, n_tokens: usize) -> Resul
     }
 }
 
-pub(crate) fn native_mtp_b2_device_embedding(mode: Option<&str>, shares_target_embedding: bool) -> bool {
+pub(crate) fn native_mtp_b2_device_embedding(
+    mode: Option<&str>,
+    shares_target_embedding: bool,
+) -> bool {
     mode == Some("device") && shares_target_embedding
 }
 

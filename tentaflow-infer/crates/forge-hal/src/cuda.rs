@@ -29,7 +29,6 @@ fn cu_err(context: &str, err: DriverError) -> ForgeError {
 // utrzymuje istniejące ścieżki `forge_hal::cuda::PoolSizes`.
 pub use crate::PoolSizes;
 
-
 // --- Pools ----------------------------------------------------------------------
 
 enum PoolArena {

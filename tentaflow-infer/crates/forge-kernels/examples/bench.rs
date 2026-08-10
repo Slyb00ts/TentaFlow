@@ -42,9 +42,15 @@ fn main() {
         eprintln!("użycie: bench <gguf|katalog> [tokeny promptu] [tokeny generacji] [powtórzenia]");
         std::process::exit(2);
     };
-    let prompt_tokens: usize = args.next().map_or(512, |v| v.parse().expect("tokeny promptu"));
-    let gen_tokens: usize = args.next().map_or(128, |v| v.parse().expect("tokeny generacji"));
-    let reps: usize = args.next().map_or(5, |v| v.parse().expect("liczba powtórzeń"));
+    let prompt_tokens: usize = args
+        .next()
+        .map_or(512, |v| v.parse().expect("tokeny promptu"));
+    let gen_tokens: usize = args
+        .next()
+        .map_or(128, |v| v.parse().expect("tokeny generacji"));
+    let reps: usize = args
+        .next()
+        .map_or(5, |v| v.parse().expect("liczba powtórzeń"));
 
     let device = CudaDevice::new(0, pools()).expect("urządzenie CUDA");
     let t = std::time::Instant::now();

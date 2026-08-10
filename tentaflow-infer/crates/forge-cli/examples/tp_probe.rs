@@ -48,11 +48,20 @@ fn main() {
         .map(|i| if i % 2 == 0 { (i % 251) as u8 } else { 0x2C })
         .collect();
 
-    let shards = upload_row_split(&cluster, &caps, &data, ROWS, row_bytes, WorkKind::MemoryBound)
-        .expect("podzial");
+    let shards = upload_row_split(
+        &cluster,
+        &caps,
+        &data,
+        ROWS,
+        row_bytes,
+        WorkKind::MemoryBound,
+    )
+    .expect("podzial");
     println!(
         "podzial wierszy: {:?} (razem {})",
-        (0..cluster.len()).map(|i| shards.rows_on(i)).collect::<Vec<_>>(),
+        (0..cluster.len())
+            .map(|i| shards.rows_on(i))
+            .collect::<Vec<_>>(),
         shards.total_rows()
     );
 
@@ -60,26 +69,42 @@ fn main() {
     let mut y_parts = Vec::new();
     for index in 0..cluster.len() {
         let entry = cluster.device(index).unwrap();
-        let x = entry.device.alloc(COLS * 2, MemKind::Device, Pool::Activations).unwrap();
+        let x = entry
+            .device
+            .alloc(COLS * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
         entry.device.write(&x_host, &x, 0).unwrap();
         let rows = shards.rows_on(index).max(1);
-        let y = entry.device.alloc(rows * 4, MemKind::Device, Pool::Activations).unwrap();
+        let y = entry
+            .device
+            .alloc(rows * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
         x_copies.push(x);
         y_parts.push(y);
     }
     let y_full = cluster
-        .device(0).unwrap()
-        .device.alloc(ROWS * 4, MemKind::Device, Pool::Activations).unwrap();
+        .device(0)
+        .unwrap()
+        .device
+        .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
 
     gemv_q8_0_row_split(&cluster, &shards, &x_copies, &y_parts, &y_full, COLS, 0).expect("gemv");
     cluster.synchronize().unwrap();
 
     // Referencja: cala macierz na karcie 0.
     let entry0 = cluster.device(0).unwrap();
-    let w_all = entry0.device.alloc(data.len(), MemKind::Device, Pool::Weights).unwrap();
+    let w_all = entry0
+        .device
+        .alloc(data.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
     entry0.device.write(&data, &w_all, 0).unwrap();
-    let y_ref = entry0.device.alloc(ROWS * 4, MemKind::Device, Pool::Activations).unwrap();
-    entry0.kernels
+    let y_ref = entry0
+        .device
+        .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    entry0
+        .kernels
         .gemv_q8_0_out_f32(&y_ref, &w_all, &x_copies[0], ROWS, COLS, &entry0.stream)
         .unwrap();
     entry0.stream.synchronize().unwrap();
@@ -89,7 +114,9 @@ fn main() {
     entry0.device.read(&y_full, 0, &mut split).unwrap();
     entry0.device.read(&y_ref, 0, &mut single).unwrap();
     let to_f32 = |b: &[u8]| -> Vec<f32> {
-        b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+        b.chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
     };
     let a = to_f32(&split);
     let b = to_f32(&single);
@@ -118,7 +145,8 @@ fn main() {
 
     let started = Instant::now();
     for _ in 0..ITERS {
-        entry0.kernels
+        entry0
+            .kernels
             .gemv_q8_0_out_f32(&y_ref, &w_all, &x_copies[0], ROWS, COLS, &entry0.stream)
             .unwrap();
     }

@@ -52,7 +52,9 @@ fn main() {
     let caps: Vec<DeviceCapability> = cluster.calibrate(QuantKind::Q8_0).expect("kalibracja");
     println!(
         "pasma: {:?} GB/s",
-        caps.iter().map(|c| (c.stream_bytes_per_s / 1e9) as u32).collect::<Vec<_>>()
+        caps.iter()
+            .map(|c| (c.stream_bytes_per_s / 1e9) as u32)
+            .collect::<Vec<_>>()
     );
 
     // Cztery macierze warstwy. QKV i gate/up dzielone po WIERSZACH (kolumnowo
@@ -62,10 +64,42 @@ fn main() {
     let w_gate_up = synth(2 * FFN, HIDDEN, 0x3333);
     let w_down = synth(HIDDEN, FFN, 0x4444);
 
-    let s_qkv = upload_row_split(&cluster, &caps, &w_qkv, QKV, q8_row_bytes(HIDDEN), WorkKind::MemoryBound).unwrap();
-    let s_o = upload_row_split(&cluster, &caps, &w_o, HIDDEN, q8_row_bytes(HIDDEN), WorkKind::MemoryBound).unwrap();
-    let s_gu = upload_row_split(&cluster, &caps, &w_gate_up, 2 * FFN, q8_row_bytes(HIDDEN), WorkKind::MemoryBound).unwrap();
-    let s_dn = upload_row_split(&cluster, &caps, &w_down, HIDDEN, q8_row_bytes(FFN), WorkKind::MemoryBound).unwrap();
+    let s_qkv = upload_row_split(
+        &cluster,
+        &caps,
+        &w_qkv,
+        QKV,
+        q8_row_bytes(HIDDEN),
+        WorkKind::MemoryBound,
+    )
+    .unwrap();
+    let s_o = upload_row_split(
+        &cluster,
+        &caps,
+        &w_o,
+        HIDDEN,
+        q8_row_bytes(HIDDEN),
+        WorkKind::MemoryBound,
+    )
+    .unwrap();
+    let s_gu = upload_row_split(
+        &cluster,
+        &caps,
+        &w_gate_up,
+        2 * FFN,
+        q8_row_bytes(HIDDEN),
+        WorkKind::MemoryBound,
+    )
+    .unwrap();
+    let s_dn = upload_row_split(
+        &cluster,
+        &caps,
+        &w_down,
+        HIDDEN,
+        q8_row_bytes(FFN),
+        WorkKind::MemoryBound,
+    )
+    .unwrap();
     println!(
         "podzial QKV {:?}, gate/up {:?}",
         (0..2).map(|i| s_qkv.rows_on(i)).collect::<Vec<_>>(),
@@ -73,13 +107,21 @@ fn main() {
     );
 
     let alloc = |dev: usize, bytes: usize| -> DevBuffer {
-        cluster.device(dev).unwrap().device
-            .alloc(bytes, MemKind::Device, Pool::Activations).unwrap()
+        cluster
+            .device(dev)
+            .unwrap()
+            .device
+            .alloc(bytes, MemKind::Device, Pool::Activations)
+            .unwrap()
     };
     let x: Vec<DevBuffer> = (0..2).map(|d| alloc(d, HIDDEN * 2)).collect();
     let xf: Vec<DevBuffer> = (0..2).map(|d| alloc(d, FFN * 2)).collect();
-    let out_qkv: Vec<DevBuffer> = (0..2).map(|d| alloc(d, s_qkv.rows_on(d).max(1) * 4)).collect();
-    let out_gu: Vec<DevBuffer> = (0..2).map(|d| alloc(d, s_gu.rows_on(d).max(1) * 4)).collect();
+    let out_qkv: Vec<DevBuffer> = (0..2)
+        .map(|d| alloc(d, s_qkv.rows_on(d).max(1) * 4))
+        .collect();
+    let out_gu: Vec<DevBuffer> = (0..2)
+        .map(|d| alloc(d, s_gu.rows_on(d).max(1) * 4))
+        .collect();
     let part: Vec<DevBuffer> = (0..2).map(|d| alloc(d, HIDDEN * 4)).collect();
     let peer = alloc(0, HIDDEN * 4);
     let sum = alloc(0, HIDDEN * 4);
@@ -98,9 +140,20 @@ fn main() {
                 };
                 for d in 0..2 {
                     let rows = stage.rows_on(d);
-                    if rows == 0 { continue; }
+                    if rows == 0 {
+                        continue;
+                    }
                     let e = cluster.device(d).unwrap();
-                    e.kernels.gemv_q8_0_out_f32(&outs[d], stage.shard(d).unwrap(), &src[d], rows, cols, &e.stream).unwrap();
+                    e.kernels
+                        .gemv_q8_0_out_f32(
+                            &outs[d],
+                            stage.shard(d).unwrap(),
+                            &src[d],
+                            rows,
+                            cols,
+                            &e.stream,
+                        )
+                        .unwrap();
                 }
                 // Projekcja wierszowo-rownolegla: kazda karta liczy CALY wynik
                 // ze swojego fragmentu wejscia, wiec potem trzeba je dodac.
@@ -111,17 +164,32 @@ fn main() {
                 };
                 for d in 0..2 {
                     let rows = proj.rows_on(d);
-                    if rows == 0 { continue; }
+                    if rows == 0 {
+                        continue;
+                    }
                     let e = cluster.device(d).unwrap();
-                    e.kernels.gemv_q8_0_out_f32(&part[d], proj.shard(d).unwrap(), &input[d], rows, cols_in, &e.stream).unwrap();
+                    e.kernels
+                        .gemv_q8_0_out_f32(
+                            &part[d],
+                            proj.shard(d).unwrap(),
+                            &input[d],
+                            rows,
+                            cols_in,
+                            &e.stream,
+                        )
+                        .unwrap();
                 }
                 // JEDNA wymiana + redukcja na koniec bloku. Przy `ffn_only`
                 // blok uwagi (block == 0) jej nie potrzebuje.
                 if !(ffn_only && block == 0) {
-                    cluster.exchange(1, &part[1], 0, 0, &peer, 0, HIDDEN * 4).unwrap();
+                    cluster
+                        .exchange(1, &part[1], 0, 0, &peer, 0, HIDDEN * 4)
+                        .unwrap();
                     cluster.wait_for(0, 1).unwrap();
                     let e0 = cluster.device(0).unwrap();
-                    e0.kernels.add_f32(&sum, &part[0], &peer, HIDDEN, &e0.stream).unwrap();
+                    e0.kernels
+                        .add_f32(&sum, &part[0], &peer, HIDDEN, &e0.stream)
+                        .unwrap();
                 }
             }
             cluster.synchronize().unwrap();
@@ -136,7 +204,10 @@ fn main() {
     // Referencja: cala warstwa na mocniejszej karcie.
     let e1 = cluster.device(1).unwrap();
     let full = |data: &[u8], rows: usize, cols: usize| -> DevBuffer {
-        let b = e1.device.alloc(data.len(), MemKind::Device, Pool::Weights).unwrap();
+        let b = e1
+            .device
+            .alloc(data.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
         e1.device.write(data, &b, 0).unwrap();
         let _ = (rows, cols);
         b
@@ -145,14 +216,25 @@ fn main() {
     let f_o = full(&w_o, HIDDEN, HIDDEN);
     let f_gu = full(&w_gate_up, 2 * FFN, HIDDEN);
     let f_dn = full(&w_down, HIDDEN, FFN);
-    let big = e1.device.alloc(2 * FFN * 4, MemKind::Device, Pool::Activations).unwrap();
+    let big = e1
+        .device
+        .alloc(2 * FFN * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     let single = |iters: usize| -> f64 {
         let started = Instant::now();
         for _ in 0..iters {
-            e1.kernels.gemv_q8_0_out_f32(&big, &f_qkv, &x[1], QKV, HIDDEN, &e1.stream).unwrap();
-            e1.kernels.gemv_q8_0_out_f32(&part[1], &f_o, &x[1], HIDDEN, HIDDEN, &e1.stream).unwrap();
-            e1.kernels.gemv_q8_0_out_f32(&big, &f_gu, &x[1], 2 * FFN, HIDDEN, &e1.stream).unwrap();
-            e1.kernels.gemv_q8_0_out_f32(&part[1], &f_dn, &xf[1], HIDDEN, FFN, &e1.stream).unwrap();
+            e1.kernels
+                .gemv_q8_0_out_f32(&big, &f_qkv, &x[1], QKV, HIDDEN, &e1.stream)
+                .unwrap();
+            e1.kernels
+                .gemv_q8_0_out_f32(&part[1], &f_o, &x[1], HIDDEN, HIDDEN, &e1.stream)
+                .unwrap();
+            e1.kernels
+                .gemv_q8_0_out_f32(&big, &f_gu, &x[1], 2 * FFN, HIDDEN, &e1.stream)
+                .unwrap();
+            e1.kernels
+                .gemv_q8_0_out_f32(&part[1], &f_dn, &xf[1], HIDDEN, FFN, &e1.stream)
+                .unwrap();
             e1.stream.synchronize().unwrap();
         }
         started.elapsed().as_secs_f64() / iters as f64 * 1e6

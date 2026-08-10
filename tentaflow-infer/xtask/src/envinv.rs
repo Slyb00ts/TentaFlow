@@ -95,7 +95,10 @@ pub fn run(root: &Path, write_report: bool) -> std::io::Result<()> {
         "  oprzyrządowanie      : {}",
         counts[Class::Instrumentation as usize]
     );
-    println!("  testy                : {}", counts[Class::TestHook as usize]);
+    println!(
+        "  testy                : {}",
+        counts[Class::TestHook as usize]
+    );
 
     if !write_report {
         return Ok(());

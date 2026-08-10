@@ -223,7 +223,11 @@ fn the_per_head_norm_matches_the_formula_on_both_executors() {
 
     let host_err = spread_error(&host_q, &want);
     let cuda_err = spread_error(&cuda_q, &want);
-    eprintln!("wzorzec {:.4}%, CUDA {:.4}%", host_err * 100.0, cuda_err * 100.0);
+    eprintln!(
+        "wzorzec {:.4}%, CUDA {:.4}%",
+        host_err * 100.0,
+        cuda_err * 100.0
+    );
     assert!(host_err < 0.01, "wzorzec: {:.4}%", host_err * 100.0);
     assert!(cuda_err < 0.02, "CUDA: {:.4}%", cuda_err * 100.0);
 

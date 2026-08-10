@@ -350,8 +350,14 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
     } else {
         let gguf = Gguf::open(path)?;
         let bundle = load_tokenizer_gguf(&gguf)?;
+        let identity = gguf
+            .get_str("general.basename")
+            .or_else(|| gguf.get_str("general.name"))
+            .unwrap_or_default()
+            .to_string();
         drop(gguf);
-        let model = Model::load_gguf(device, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut model = Model::load_gguf(device, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        model.set_gguf_identity(&identity);
         (model, bundle)
     };
     let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
@@ -374,8 +380,14 @@ pub fn load_model_tp(
     }
     let gguf = Gguf::open(path)?;
     let bundle = load_tokenizer_gguf(&gguf)?;
+    let identity = gguf
+        .get_str("general.basename")
+        .or_else(|| gguf.get_str("general.name"))
+        .unwrap_or_default()
+        .to_string();
     drop(gguf);
-    let model = Model::load_tp(devices, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut model = Model::load_tp(devices, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    model.set_gguf_identity(&identity);
     let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
     Ok(LoadedModel {
         model,

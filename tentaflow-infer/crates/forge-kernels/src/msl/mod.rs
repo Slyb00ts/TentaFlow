@@ -83,9 +83,9 @@ impl Bits {
     fn high_row(self, rows_expr: &str) -> String {
         match self {
             Bits::Four => String::new(),
-            Bits::Six => format!(
-                "    device const uint* hi = high + {rows_expr} * (n_cols / 16u);\n"
-            ),
+            Bits::Six => {
+                format!("    device const uint* hi = high + {rows_expr} * (n_cols / 16u);\n")
+            }
         }
     }
 
@@ -105,7 +105,9 @@ impl Bits {
     fn high_word(self, col0: &str) -> String {
         match self {
             Bits::Four => String::new(),
-            Bits::Six => format!("const uint hw = hi[({col0}) / 16u]; const uint hb = (({col0}) % 16u) * 2u;"),
+            Bits::Six => format!(
+                "const uint hw = hi[({col0}) / 16u]; const uint hb = (({col0}) % 16u) * 2u;"
+            ),
         }
     }
 
@@ -114,7 +116,9 @@ impl Bits {
         match self {
             Bits::Four => format!("((bits >> ({j} * 4u)) & 0xFu)"),
             Bits::Six => {
-                format!("(((bits >> ({j} * 4u)) & 0xFu) | (((hw >> (hb + {j} * 2u)) & 0x3u) << 4u))")
+                format!(
+                    "(((bits >> ({j} * 4u)) & 0xFu) | (((hw >> (hb + {j} * 2u)) & 0x3u) << 4u))"
+                )
             }
         }
     }
@@ -932,7 +936,10 @@ mod tests {
         // Krok pętli MUSI być tą samą liczbą co w nazwie: rozjazd zostawiłby
         // część kanałów niepoliczonych, bez żadnego błędu.
         assert!(src.contains(&format!("i += {RMSNORM_THREADS}u")));
-        assert!(src.contains(&format!("threadgroup float partial[{}]", RMSNORM_THREADS / 32)));
+        assert!(src.contains(&format!(
+            "threadgroup float partial[{}]",
+            RMSNORM_THREADS / 32
+        )));
     }
 
     #[test]
@@ -996,19 +1003,19 @@ mod tests {
         // teksty i przechodził niezależnie od tego, co robi generator.
         let strip = |src: &str, out: OutDtype| {
             let ty = out.msl();
-            src.replace(
-                &format!("device {ty}*      y"),
-                "device OUT_T*      y",
-            )
-            .replace(
-                &format!("y[row] = {ty}(total)"),
-                "y[row] = OUT_T(total)",
-            )
-            .replace(&qmv_affine_name(Bits::Four, ScaleDtype::Bf16, out), "ENTRY")
+            src.replace(&format!("device {ty}*      y"), "device OUT_T*      y")
+                .replace(&format!("y[row] = {ty}(total)"), "y[row] = OUT_T(total)")
+                .replace(&qmv_affine_name(Bits::Four, ScaleDtype::Bf16, out), "ENTRY")
         };
         let stripped_a = strip(&a, OutDtype::F32);
-        assert!(stripped_a.contains("device OUT_T*      y"), "podmiana nie trafiła");
-        assert!(stripped_a.contains("y[row] = OUT_T(total)"), "podmiana nie trafiła");
+        assert!(
+            stripped_a.contains("device OUT_T*      y"),
+            "podmiana nie trafiła"
+        );
+        assert!(
+            stripped_a.contains("y[row] = OUT_T(total)"),
+            "podmiana nie trafiła"
+        );
         assert_eq!(stripped_a, strip(&b, OutDtype::F16));
     }
 
@@ -1024,7 +1031,10 @@ mod tests {
     #[test]
     fn embedding_lookup_indexes_by_token_in_both_arrays() {
         let src = embed_gather_source(ScaleDtype::Bf16);
-        assert_eq!(embed_gather_name(ScaleDtype::Bf16), "embed_gather_4bit_bf16");
+        assert_eq!(
+            embed_gather_name(ScaleDtype::Bf16),
+            "embed_gather_4bit_bf16"
+        );
         // Wiersz wybiera token — i w upakowanych bitach, i w skalach. Pominięcie
         // przesunięcia w którejkolwiek z tych tablic daje wektor o poprawnym
         // kształcie zbudowany z cudzych liczb.
@@ -1049,14 +1059,16 @@ mod tests {
         assert!(bf16.contains("device const bfloat*    scales"));
         // Poza nazwą i typem skal źródła muszą być identyczne: dwie ręcznie
         // pisane kopie rozjeżdżają się przy pierwszej poprawce.
-        let norm = |s: &str, ty: &str, name: &str| {
-            s.replace(ty, "SCALE_T").replace(name, "ENTRY")
-        };
+        let norm = |s: &str, ty: &str, name: &str| s.replace(ty, "SCALE_T").replace(name, "ENTRY");
         assert_eq!(
-            norm(&f16, "half*    scales", &qmv_affine_name(Bits::Four, ScaleDtype::F16, OutDtype::F32))
-                .replace("half*    biases", "SCALE_T biases")
-                .replace("const half* s", "const SCALE_T s")
-                .replace("const half* b", "const SCALE_T b"),
+            norm(
+                &f16,
+                "half*    scales",
+                &qmv_affine_name(Bits::Four, ScaleDtype::F16, OutDtype::F32)
+            )
+            .replace("half*    biases", "SCALE_T biases")
+            .replace("const half* s", "const SCALE_T s")
+            .replace("const half* b", "const SCALE_T b"),
             norm(
                 &bf16,
                 "bfloat*    scales",

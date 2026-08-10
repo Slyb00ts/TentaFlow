@@ -160,9 +160,17 @@ impl Link {
         let peer = Self::handshake(addr, listen, local)?;
         if unsafe { forge_rdma_connect(ep, &peer) } != 0 {
             unsafe { forge_rdma_close(ep) };
-            return Err(ForgeError::Device("przejscie kolejki w RTR/RTS nieudane".into()));
+            return Err(ForgeError::Device(
+                "przejscie kolejki w RTR/RTS nieudane".into(),
+            ));
         }
-        Ok(Self { ep, mr, buf, len, peer })
+        Ok(Self {
+            ep,
+            mr,
+            buf,
+            len,
+            peer,
+        })
     }
 
     /// Jednorazowa wymiana adresow po TCP. Obie strony wysylaja swoj adres, po

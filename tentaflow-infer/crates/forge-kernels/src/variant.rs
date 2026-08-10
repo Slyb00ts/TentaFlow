@@ -82,12 +82,9 @@ impl<K: Copy + 'static> Registry<K> {
     /// Whether the last entry serves this problem — i.e. whether the fallback
     /// really is one.
     pub fn fallback_covers(&self, problem: &Problem) -> bool {
-        self.variants
-            .last()
-            .is_some_and(|v| (v.applies)(problem))
+        self.variants.last().is_some_and(|v| (v.applies)(problem))
     }
 }
-
 
 /// Predykat wpisu koncowego: obsluguje kazdy problem. Rejestr bez takiego wpisu
 /// nie jest totalny, wiec jakis ksztalt zostalby bez formy.
@@ -359,8 +356,14 @@ mod metal_forms {
                         ATTENTION_FORMS.pick(&p).is_some(),
                         "uwaga: {p:?} bez wariantu"
                     );
-                    assert!(MATMUL_FORMS.fallback_covers(&p), "mnożenie: ostatni wariant nie jest uniwersalny");
-                    assert!(ATTENTION_FORMS.fallback_covers(&p), "uwaga: ostatni wariant nie jest uniwersalny");
+                    assert!(
+                        MATMUL_FORMS.fallback_covers(&p),
+                        "mnożenie: ostatni wariant nie jest uniwersalny"
+                    );
+                    assert!(
+                        ATTENTION_FORMS.fallback_covers(&p),
+                        "uwaga: ostatni wariant nie jest uniwersalny"
+                    );
                 }
             }
         }
@@ -477,12 +480,7 @@ mod metal_forms {
                 .variants
                 .iter()
                 .map(|v| (v.name, v.because))
-                .chain(
-                    ATTENTION_FORMS
-                        .variants
-                        .iter()
-                        .map(|v| (v.name, v.because)),
-                )
+                .chain(ATTENTION_FORMS.variants.iter().map(|v| (v.name, v.because)))
                 .collect();
             for (name, because) in named {
                 assert!(
@@ -536,7 +534,9 @@ mod cuda_registry_tests {
     /// tracic polowy pracy na rozpakowywanie.
     #[test]
     fn prefill_prefers_the_faster_kernel_today() {
-        let f = NVFP4_MATMUL.pick(&problem(2048, 11264, 4096)).expect("forma");
+        let f = NVFP4_MATMUL
+            .pick(&problem(2048, 11264, 4096))
+            .expect("forma");
         assert_eq!(f.form, Nvfp4MatmulForm::Fp8Repacked);
     }
 }

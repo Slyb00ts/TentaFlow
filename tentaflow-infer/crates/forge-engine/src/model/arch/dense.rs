@@ -17,7 +17,6 @@ fn pre_residual_norm(
 }
 
 impl Model {
-
     /// Nieliniowość bramkowanego FFN tego modelu.
     pub(crate) fn ffn_act(&self) -> forge_formats::FfnActivation {
         self.weights.descriptor.params.ffn_activation
@@ -174,12 +173,11 @@ impl Model {
                     &self.stream,
                 )?;
                 self.device.synchronize()?;
-                let lp = self
-                    .bufs
-                    .pinned_logits
-                    .host_ptr()
-                    .expect("pinned buffer has host mapping")
-                    as *const f32;
+                let lp =
+                    self.bufs
+                        .pinned_logits
+                        .host_ptr()
+                        .expect("pinned buffer has host mapping") as *const f32;
                 last_logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
             }
         }
@@ -477,14 +475,8 @@ impl Model {
             // buffers — same weight bytes, no second copy in VRAM.
             // Format wag i uklad QKV rozstrzygniete raz; dalej trzy identyczne
             // wywolania zamiast dwunastu kombinacji rozpisanych recznie.
-            let projs = self.qkv_projections(
-                layer,
-                w4a8_layer,
-                fp8_layer,
-                fp8_ffn_layer,
-                q_dim,
-                kv_dim,
-            );
+            let projs =
+                self.qkv_projections(layer, w4a8_layer, fp8_layer, fp8_ffn_layer, q_dim, kv_dim);
             let shared_act = fp8mod_fuse || fp8mod_ffn_fuse;
             self.project(&pb.q, &projs[0], &pb.x, rows, shared_act, stream)?;
             self.project(&pb.k, &projs[1], &pb.x, rows, shared_act, stream)?;
@@ -1708,25 +1700,22 @@ impl Model {
                 match (aw.q_norm.as_ref(), aw.k_norm.as_ref(), aw.v_norm.as_ref()) {
                     (Some(qn), Some(kn), Some(vn)) => {
                         kernels.rmsnorm_qkv_f16(
-                            &b.q, &b.k, &b.v, qn, kn, vn, p.n_heads, n_kv_heads, head_dim,
-                            eps, stream,
+                            &b.q, &b.k, &b.v, qn, kn, vn, p.n_heads, n_kv_heads, head_dim, eps,
+                            stream,
                         )?;
                     }
                     _ => {
                         if let Some(qn) = aw.q_norm.as_ref() {
-                            kernels.rmsnorm_f16(
-                                &b.q, &b.q, qn, p.n_heads, head_dim, eps, stream,
-                            )?;
+                            kernels
+                                .rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, head_dim, eps, stream)?;
                         }
                         if let Some(kn) = aw.k_norm.as_ref() {
-                            kernels.rmsnorm_f16(
-                                &b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream,
-                            )?;
+                            kernels
+                                .rmsnorm_f16(&b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream)?;
                         }
                         if let Some(vn) = aw.v_norm.as_ref() {
-                            kernels.rmsnorm_f16(
-                                &b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream,
-                            )?;
+                            kernels
+                                .rmsnorm_f16(&b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream)?;
                         }
                     }
                 }
@@ -2037,7 +2026,14 @@ impl Model {
             // through a buffer and a byte offset.
             let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w_qkv) => {
-                    self.decode_project_normed(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+                    self.decode_project_normed(
+                        &b.qkv,
+                        w_qkv,
+                        &layer.attn_norm,
+                        l == 0,
+                        eps,
+                        stream,
+                    )?;
                     if l == 0 {
                         self.trace_f16("Qcur-0", &b.qkv, 0, q_dim);
                     }
@@ -2698,5 +2694,4 @@ impl Model {
         };
         Ok((out, final_id))
     }
-
 }

@@ -376,6 +376,47 @@ def _dot_q4k_i8(
     return warp.sum(acc - min_acc)
 
 
+def _dot_q4k_i8_global(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    lane: Int,
+) -> Float32:
+    """Q4_K dot against global prepared q8_1 buffers without LDS staging."""
+    blocks_per_row = n_cols // 256
+    row_base = row * blocks_per_row * 144
+    p = lane % 16
+    c = p // 4
+    quarter = p % 4
+    xqi = xq.bitcast[Int32]()
+    var acc: Float32 = 0.0
+    var min_acc: Float32 = 0.0
+    var b = lane // 16
+    while b < blocks_per_row:
+        off = row_base + b * 144
+        dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
+        sc, mn = _q4k_scale_pair(w, off, c)
+        qv = (w + off + 16 + c * 32 + quarter * 8).bitcast[UInt32]().load[
+            width=2, alignment=8
+        ]()
+        seg = b * 8 + 2 * c
+        var s_lo: Int32 = 0
+        var s_hi: Int32 = 0
+        comptime for t in range(2):
+            q = Int32(qv[t])
+            s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + quarter * 2 + t], s_lo)
+            s_hi = _dp4a((q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + quarter * 2 + t], s_hi)
+        acc += Float32(dm[0]) * sc[0] * xd[seg] * Float32(s_lo)
+        acc += Float32(dm[0]) * sc[1] * xd[seg + 2] * Float32(s_hi)
+        if quarter == 0:
+            min_acc += Float32(dm[1]) * (mn[0] * xsm[seg] + mn[1] * xsm[seg + 2])
+        b += 2
+    return warp.sum(acc - min_acc)
+
+
 def _dot2_q4k_i8(
     w_g: UnsafePointer[UInt8, MutAnyOrigin],
     row_g: Int,
@@ -681,6 +722,110 @@ def gemv_q4_k_dp4a_f16(
     total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
     if lane == 0:
         y[row] = Float16(total)
+
+
+def _stage_prepared_q8_global(
+    xq_global: UnsafePointer[Int8, MutAnyOrigin],
+    xd_global: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_global: UnsafePointer[Float32, MutAnyOrigin],
+    xq: UnsafePointer[
+        Int8, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    xds: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    tid: Int,
+):
+    """Copies a prepared q8_1 activation into the dot-product LDS layout."""
+    segs = n_cols // 32
+    var s_i = tid
+    while s_i < segs:
+        (xq + s_i * 32).store[alignment=32](
+            (xq_global + s_i * 32).load[width=32, alignment=32]()
+        )
+        xds[2 * s_i] = xd_global[s_i]
+        xds[2 * s_i + 1] = xsm_global[s_i]
+        s_i += Int(block_dim.x)
+    barrier()
+
+
+def gemv_q4_k_dp4a_prepared_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_i8: UnsafePointer[Int8, MutAnyOrigin],
+    xd_f32: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_f32: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Q4_K GEMV consuming a previously quantized single-token activation."""
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_prepared_q8_global(xq_i8, xd_f32, xsm_f32, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
+    if lane == 0:
+        y[row] = Float16(total)
+
+
+def gemv_q4_k_dp4a_prepared_global_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_i8: UnsafePointer[Int8, MutAnyOrigin],
+    xd_f32: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_f32: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Prepared Q4_K GEMV reading q8_1 directly from global memory."""
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = _dot_q4k_i8_global(w, row, xq_i8, xd_f32, xsm_f32, n_cols, lane)
+    if lane == 0:
+        y[row] = Float16(total)
+
+
+def gemv_q4_k_dp4a_prepared_persist_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_i8: UnsafePointer[Int8, MutAnyOrigin],
+    xd_f32: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_f32: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Prepared Q4_K GEMV with resident row tiles."""
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space = AddressSpace.SHARED
+    ]()
+    _stage_prepared_q8_global(xq_i8, xd_f32, xsm_f32, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    var row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    stride = Int(grid_dim.x) * ROWS_PER_BLOCK
+    while row < n_rows:
+        total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
+        if lane == 0:
+            y[row] = Float16(total)
+        row += stride
 
 
 @always_inline

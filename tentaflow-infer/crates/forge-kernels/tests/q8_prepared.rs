@@ -6,9 +6,9 @@
 
 use std::sync::Arc;
 
-use forge_hal::{PoolSizes, gpu};
+use forge_hal::{gpu, PoolSizes};
 use forge_hal::{Device, Pool};
-use forge_kernels::Kernels;
+use forge_kernels::{Kernels, Q4kDecodeModelFamily};
 use forge_types::MemKind;
 use half::f16;
 
@@ -36,6 +36,18 @@ fn weights(rows: usize, cols: usize, seed: usize) -> Vec<u8> {
         block[..2].copy_from_slice(&f16::from_f32(0.0078125).to_bits().to_le_bytes());
         for (byte, value) in block[2..].iter_mut().enumerate() {
             *value = ((index * 17 + byte * 13 + seed * 29) & 0xff) as u8;
+        }
+    }
+    data
+}
+
+fn q4k_weights(rows: usize, cols: usize) -> Vec<u8> {
+    let mut data = vec![0u8; rows * (cols / 256) * 144];
+    for (index, superblock) in data.chunks_exact_mut(144).enumerate() {
+        superblock[0..2].copy_from_slice(&f16::from_f32(0.015625).to_bits().to_le_bytes());
+        superblock[2..4].copy_from_slice(&f16::from_f32(0.0078125).to_bits().to_le_bytes());
+        for (byte, value) in superblock[4..].iter_mut().enumerate() {
+            *value = ((index * 31 + byte * 17 + 11) & 0xff) as u8;
         }
     }
     data
@@ -293,6 +305,96 @@ fn prepared_q8_zachowuje_bity_canary_i_top1_dla_t6_i_t8() {
 }
 
 #[test]
+fn prepared_q4k_t1_jest_zgodny_z_nieprzygotowanym_i_chroni_canary() {
+    let Some(device) = device() else { return };
+    if device.caps().vendor != forge_types::Vendor::Amd || device.caps().arch != "gfx1201" {
+        return;
+    }
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let cols = 512usize;
+    let rows = 37usize;
+    let guard = 29usize;
+    let host_x = activations(1, cols);
+    let host_w = q4k_weights(rows, cols);
+    let x = device
+        .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let w = device
+        .alloc(host_w.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+        .unwrap();
+    device.write(&host_w, &w, 0).unwrap();
+
+    let initial = vec![f16::from_bits(0x7bcd); rows + guard];
+    let baseline = device
+        .alloc(initial.len() * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let prepared_output = device
+        .alloc(initial.len() * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice::<f16, u8>(&initial), &baseline, 0)
+        .unwrap();
+    device
+        .write(
+            bytemuck::cast_slice::<f16, u8>(&initial),
+            &prepared_output,
+            0,
+        )
+        .unwrap();
+    kernels
+        .gemv_q4_k_dp4a_f16(
+            &baseline,
+            &w,
+            &x,
+            rows,
+            cols,
+            Q4kDecodeModelFamily::Any,
+            &stream,
+        )
+        .unwrap();
+    let mut prepared = kernels.prepare_q8_1(&x, cols, 1, &stream).unwrap();
+    kernels
+        .gemv_q4_k_dp4a_prepared_f16(&prepared_output, &w, &mut prepared, rows, cols)
+        .unwrap();
+    drop(prepared);
+    stream.synchronize().unwrap();
+
+    let mut baseline_bytes = vec![0u8; initial.len() * 2];
+    let mut prepared_bytes = vec![0u8; initial.len() * 2];
+    device.read(&baseline, 0, &mut baseline_bytes).unwrap();
+    device
+        .read(&prepared_output, 0, &mut prepared_bytes)
+        .unwrap();
+    let output_bytes = rows * 2;
+    for row in 0..rows {
+        let offset = row * 2;
+        let prepared_value = f16::from_bits(u16::from_le_bytes([
+            prepared_bytes[offset],
+            prepared_bytes[offset + 1],
+        ]))
+        .to_f32();
+        let baseline_value = f16::from_bits(u16::from_le_bytes([
+            baseline_bytes[offset],
+            baseline_bytes[offset + 1],
+        ]))
+        .to_f32();
+        assert!(
+            (prepared_value - baseline_value).abs() <= 0.125,
+            "prepared Q4_K T=1 odbiega od DP4A, row={row}, prepared={prepared_value}, baseline={baseline_value}"
+        );
+    }
+    assert_eq!(
+        &prepared_bytes[output_bytes..],
+        bytemuck::cast_slice::<f16, u8>(&initial[rows..]),
+        "prepared Q4_K T=1 narusza canary za końcem wyjścia"
+    );
+}
+
+#[test]
 fn prepared_q8_chroni_scratch_miedzy_dwoma_streamami() {
     let Some(device) = device() else { return };
     let kernels = Kernels::load(device.clone()).unwrap();
@@ -489,6 +591,107 @@ fn measure(
 fn median(mut samples: Vec<f64>) -> f64 {
     samples.sort_by(f64::total_cmp);
     samples[samples.len() / 2]
+}
+
+#[test]
+#[ignore]
+fn bench_prepared_q4k_t1_para_gate_up() {
+    let Some(device) = device() else { return };
+    if device.caps().vendor != forge_types::Vendor::Amd || device.caps().arch != "gfx1201" {
+        return;
+    }
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let cols = 5120usize;
+    let rows = 14_336usize;
+    let host_x = activations(1, cols);
+    let x = device
+        .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+        .unwrap();
+    let mut weights_q4k = Vec::with_capacity(2);
+    let mut outputs = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let host_w = q4k_weights(rows, cols);
+        let weight = device
+            .alloc(host_w.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        device.write(&host_w, &weight, 0).unwrap();
+        weights_q4k.push(weight);
+        outputs.push(
+            device
+                .alloc(rows * 2, MemKind::Device, Pool::Activations)
+                .unwrap(),
+        );
+    }
+    let projections = [
+        (&outputs[0], &weights_q4k[0], rows),
+        (&outputs[1], &weights_q4k[1], rows),
+    ];
+    let baseline = median(
+        (0..3)
+            .map(|_| {
+                measure(device.as_ref(), &stream, 32, || {
+                    assert!(kernels
+                        .gemv_q4_k_dp4a_group_f16(
+                            &projections,
+                            &x,
+                            cols,
+                            Q4kDecodeModelFamily::Qwen35,
+                            &stream,
+                        )
+                        .unwrap());
+                })
+            })
+            .collect(),
+    );
+    let current = median(
+        (0..3)
+            .map(|_| {
+                measure(device.as_ref(), &stream, 32, || {
+                    for (output, weight, projection_rows) in projections {
+                        kernels
+                            .gemv_q4_k_dp4a_f16(
+                                output,
+                                weight,
+                                &x,
+                                projection_rows,
+                                cols,
+                                Q4kDecodeModelFamily::Bielik,
+                                &stream,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect(),
+    );
+    let prepared = median(
+        (0..3)
+            .map(|_| {
+                measure(device.as_ref(), &stream, 32, || {
+                    let mut activation = kernels.prepare_q8_1(&x, cols, 1, &stream).unwrap();
+                    for (output, weight, projection_rows) in projections {
+                        kernels
+                            .gemv_q4_k_dp4a_prepared_f16(
+                                output,
+                                weight,
+                                &mut activation,
+                                projection_rows,
+                                cols,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect(),
+    );
+    println!(
+        "q4k_gate_up grouped_us={baseline:.3} current_us={current:.3} prepared_us={prepared:.3} group_speedup={:.3}",
+        current / baseline
+    );
 }
 
 #[test]

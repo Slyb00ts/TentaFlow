@@ -12,8 +12,8 @@ use forge_engine::kv::KvQuant;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 
 /// One test at a time: they share the GPU's primary context, and a decode
 /// graph capture in one test invalidates a concurrent synchronize in another.
@@ -47,7 +47,7 @@ fn load(kv_pages: usize, tier: KvTierConfig, quant: KvQuant) -> Option<Model> {
     let dev: Arc<dyn Device> = device;
     let cfg = ModelConfig {
         weight_host_budget: 0,
-weight_spill_dir: None,
+        weight_spill_dir: None,
         kv_pages,
         kv_tier: tier,
         kv_quant: quant,

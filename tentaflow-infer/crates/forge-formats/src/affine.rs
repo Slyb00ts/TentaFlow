@@ -420,7 +420,11 @@ mod tests {
             for row in 0..HEAD_DIM {
                 let src = (head * 2 * HEAD_DIM + row) * COLS;
                 let dst = (head * HEAD_DIM + row) * COLS;
-                assert_eq!(&got_q[dst..dst + COLS], &whole[src..src + COLS], "q {head}/{row}");
+                assert_eq!(
+                    &got_q[dst..dst + COLS],
+                    &whole[src..src + COLS],
+                    "q {head}/{row}"
+                );
                 let src = src + HEAD_DIM * COLS;
                 assert_eq!(
                     &got_gate[dst..dst + COLS],

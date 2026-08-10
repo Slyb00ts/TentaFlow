@@ -123,7 +123,11 @@ impl RecurrentState {
             )?;
             let zeros = vec![0u8; self.cfg.conv_bytes().max(self.cfg.state_bytes())];
             for slot in 0..self.cfg.slots {
-                device.write(&zeros[..self.cfg.conv_bytes()], &conv, slot * self.cfg.conv_bytes())?;
+                device.write(
+                    &zeros[..self.cfg.conv_bytes()],
+                    &conv,
+                    slot * self.cfg.conv_bytes(),
+                )?;
                 device.write(
                     &zeros[..self.cfg.state_bytes()],
                     &state,
@@ -162,5 +166,4 @@ impl RecurrentState {
             slot * self.cfg.state_bytes(),
         )
     }
-
 }

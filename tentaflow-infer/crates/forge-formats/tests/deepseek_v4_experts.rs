@@ -12,7 +12,9 @@
 
 use std::path::PathBuf;
 
-use forge_formats::nvfp4::{deepseek_expert_to_gguf, e2m1_to_f32, f8e4m3_to_f32, DeepseekNvFp4Names};
+use forge_formats::nvfp4::{
+    deepseek_expert_to_gguf, e2m1_to_f32, f8e4m3_to_f32, DeepseekNvFp4Names,
+};
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_types::{DType, QuantKind};
 
@@ -142,7 +144,11 @@ fn fp8_row_scaling_barely_changes_the_projection() {
         let scales = st.data(&scale_name).unwrap();
         let tile = cols / scale_info.shape[1];
         let scale_cols = scale_info.shape[1];
-        assert_eq!(rows / scale_info.shape[0], tile, "{name}: kafel nie jest kwadratowy");
+        assert_eq!(
+            rows / scale_info.shape[0],
+            tile,
+            "{name}: kafel nie jest kwadratowy"
+        );
 
         let (bytes, row_scales) =
             forge_formats::nvfp4::deepseek_fp8_to_row_scaled(weight, scales, rows, cols, tile)
@@ -187,7 +193,5 @@ fn row_scaling_rejects_nan_tile_scale() {
     let weight = vec![0x38u8; 64];
     let mut scales = vec![127u8; 2];
     scales[1] = 0xFF;
-    assert!(
-        forge_formats::nvfp4::deepseek_fp8_to_row_scaled(&weight, &scales, 1, 64, 32).is_err()
-    );
+    assert!(forge_formats::nvfp4::deepseek_fp8_to_row_scaled(&weight, &scales, 1, 64, 32).is_err());
 }

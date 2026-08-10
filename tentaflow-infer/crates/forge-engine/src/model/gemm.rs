@@ -68,8 +68,13 @@ impl Model {
         if cols > Kernels::DP4A_MAX_COLS {
             return Ok(false);
         }
-        self.kernels
-            .gemv_q4_k_dp4a_group_f16(&group, x, cols, stream)
+        self.kernels.gemv_q4_k_dp4a_group_f16(
+            &group,
+            x,
+            cols,
+            self.q4k_decode_model_family(),
+            stream,
+        )
     }
 
     /// Grupa projekcji o RÓŻNYCH formatach — jedno uruchomienie.

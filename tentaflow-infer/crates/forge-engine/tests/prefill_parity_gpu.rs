@@ -11,8 +11,8 @@ use std::sync::Arc;
 use forge_engine::model::{Model, ModelConfig};
 use forge_formats::Gguf;
 use forge_hal::Device;
-use forge_hal::{PoolSizes, gpu};
-use forge_tokenize::{Tokenizer, gguf_vocab};
+use forge_hal::{gpu, PoolSizes};
+use forge_tokenize::{gguf_vocab, Tokenizer};
 
 mod common;
 
@@ -46,7 +46,9 @@ fn argmax(logits: &[f32]) -> u32 {
 fn prompt(path: &Path) -> TestResult<Vec<u32>> {
     let gguf = Gguf::open(path)?;
     let tokenizer = Tokenizer::from_gguf_vocab(&gguf_vocab(&gguf)?)?;
-    let tokens = tokenizer.encode(PROMPT_TEXT, true).map_err(|e| e.to_string())?;
+    let tokens = tokenizer
+        .encode(PROMPT_TEXT, true)
+        .map_err(|e| e.to_string())?;
     assert!(tokens.len() >= 32, "prompt testowy jest za krótki");
     Ok(tokens)
 }

@@ -24,7 +24,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 struct Oracle {
@@ -132,7 +134,10 @@ fn expert_swiglu_matches_the_reference_on_gpu() {
         0,
     )
     .unwrap();
-    let alloc = |n: usize| dev.alloc(n * 2, MemKind::Device, Pool::Activations).unwrap();
+    let alloc = |n: usize| {
+        dev.alloc(n * 2, MemKind::Device, Pool::Activations)
+            .unwrap()
+    };
     let (gate, up, act, out) = (
         alloc(inter),
         alloc(inter),

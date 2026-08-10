@@ -426,11 +426,7 @@ pub struct AltAttnParams {
 /// Wzorce w GGUF są KRÓTKIE i powtarzalne: Gemma 4 ma 48 warstw, ale
 /// `sliding_window_pattern` liczy 6 pozycji, a `head_count_kv` też 6 — trzeba je
 /// rozwinąć modulo długość, inaczej wychodzi zła geometria od siódmej warstwy.
-fn parse_alt_attn(
-    gguf: &Gguf,
-    arch: &str,
-    block_count: usize,
-) -> Option<AltAttnParams> {
+fn parse_alt_attn(gguf: &Gguf, arch: &str, block_count: usize) -> Option<AltAttnParams> {
     let key = |suffix: &str| format!("{arch}.{suffix}");
     let pattern = gguf.get_array(&key("attention.sliding_window_pattern"))?;
     if pattern.is_empty() {
@@ -448,7 +444,11 @@ fn parse_alt_attn(
     // Liczba głowic KV jest tablicą o tej samej długości co wzorzec: pozycje
     // lokalne i globalne mają różne wartości (u Gemmy 8 wobec 1).
     let kv = gguf.get_array(&key("attention.head_count_kv"))?;
-    let kv: Vec<usize> = kv.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect();
+    let kv: Vec<usize> = kv
+        .iter()
+        .filter_map(|v| v.as_u64())
+        .map(|v| v as usize)
+        .collect();
     if kv.len() != flags.len() {
         return None;
     }
@@ -896,7 +896,6 @@ impl ModelDescriptor {
         Ok(())
     }
 
-
     /// Czy model używa RoPE PRZEPLATANEGO (pary `(2i, 2i+1)`) zamiast NeoX
     /// (pary `(i, i + d/2)`).
     ///
@@ -909,7 +908,6 @@ impl ModelDescriptor {
     pub fn rope_interleaved(&self) -> bool {
         matches!(self.arch.as_str(), "llama" | "mistral")
     }
-
 
     /// Detect the architecture of a parsed GGUF file and resolve its weight map.
     pub fn detect(gguf: &Gguf) -> Result<Self> {
@@ -967,9 +965,7 @@ impl ModelDescriptor {
             .get_u64(&key("attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(hidden_size / n_heads.max(1));
-        let final_logit_softcap = gguf
-            .get_f32(&key("final_logit_softcapping"))
-            .unwrap_or(0.0);
+        let final_logit_softcap = gguf.get_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
         // GGUF nie nosi typu aktywacji; rodzina Gemma ma GeGLU z tanh, reszta
         // obsługiwanych architektur SwiGLU.
         let ffn_activation = if spec.gguf_arch.starts_with("gemma") {
@@ -1121,19 +1117,24 @@ impl ModelDescriptor {
                 v_rms_norm: spec.gguf_arch.starts_with("gemma"),
                 suppress_tokens: gguf
                     .get_array("tokenizer.ggml.suppress_tokens")
-                    .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
-            ffn_activation,
-            alt_attn,
-            rope_sliding_only: arch == "muse-glimmer",
-            final_logit_softcap,
-            attn_logit_scale,
-            embd_scale,
-            deepseek_v4: None,
+                ffn_activation,
+                alt_attn,
+                rope_sliding_only: arch == "muse-glimmer",
+                final_logit_softcap,
+                attn_logit_scale,
+                embd_scale,
+                deepseek_v4: None,
             },
             globals,
             layers,
@@ -1270,12 +1271,12 @@ impl ModelDescriptor {
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
-            ffn_activation: FfnActivation::SiLU,
-            alt_attn: None,
-            rope_sliding_only: false,
-            final_logit_softcap: 0.0,
-            attn_logit_scale: None,
-            embd_scale: None,
+                ffn_activation: FfnActivation::SiLU,
+                alt_attn: None,
+                rope_sliding_only: false,
+                final_logit_softcap: 0.0,
+                attn_logit_scale: None,
+                embd_scale: None,
             },
             globals,
             layers,
@@ -1591,7 +1592,12 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             v_rms_norm: false,
             suppress_tokens: gguf
                 .get_array("tokenizer.ggml.suppress_tokens")
-                .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .collect()
+                })
                 .unwrap_or_default(),
             ssm: Some(ssm),
             rope_sections,
@@ -2258,7 +2264,9 @@ mod tp_shard_tests {
     #[test]
     fn dwie_rangi_dziela_glowice_qwen35() {
         let shard = TpShard::new(1, 2).expect("ranga w zasięgu");
-        let ssm = qwen35_ssm().shard(shard).expect("qwen35 dzieli się na dwie");
+        let ssm = qwen35_ssm()
+            .shard(shard)
+            .expect("qwen35 dzieli się na dwie");
         assert_eq!(ssm.n_group, 8);
         assert_eq!(ssm.dt_rank, 24);
         assert_eq!(ssm.d_inner, 24 * 128);
@@ -2386,8 +2394,12 @@ impl BlockMatrix<'_> {
     /// błędu — daje cudze wagi pod właściwą głowicą.
     pub fn take_rows(&self, ranges: &[(usize, usize)]) -> Result<Vec<u8>> {
         let (_, _, row_bytes) = self.geometry()?;
-        let mut out =
-            Vec::with_capacity(ranges.iter().map(|(_, count)| count * row_bytes).sum::<usize>());
+        let mut out = Vec::with_capacity(
+            ranges
+                .iter()
+                .map(|(_, count)| count * row_bytes)
+                .sum::<usize>(),
+        );
         for &(first, count) in ranges {
             let end = first
                 .checked_add(count)
@@ -2588,9 +2600,10 @@ impl TpShard {
             | WeightRole::SsmDt
             | WeightRole::SsmConv1d
             | WeightRole::SsmOut => {
-                let ssm = p.ssm.as_ref().ok_or_else(|| {
-                    fmt_err("podział: rola DeltaNet w modelu bez parametrów SSM")
-                })?;
+                let ssm = p
+                    .ssm
+                    .as_ref()
+                    .ok_or_else(|| fmt_err("podział: rola DeltaNet w modelu bez parametrów SSM"))?;
                 let d_state = ssm.d_state;
                 let n_k = ssm.n_k_heads();
                 let n_v = ssm.n_v_heads();
@@ -2600,10 +2613,7 @@ impl TpShard {
                 // Głowice V rangi to `n_v / n_k` ciągłych przebiegów po `per_k`
                 // głowic; zwijamy je z listy indeksów, żeby wycinek był kilkoma
                 // zakresami zamiast kilkudziesięcioma.
-                let runs: Vec<usize> = v_order
-                    .chunks(per_k)
-                    .map(|run| run[0])
-                    .collect();
+                let runs: Vec<usize> = v_order.chunks(per_k).map(|run| run[0]).collect();
                 let v_rows = |width: usize, base: usize| -> Vec<(usize, usize)> {
                     runs.iter()
                         .map(|&first| (base + first * width, per_k * width))
@@ -2736,9 +2746,7 @@ mod role_shard_tests {
     fn wejsciowa_projekcja_trzyma_kolejnosc_q_k_v() {
         let p = qwen35();
         let shard = TpShard::new(1, 2).expect("ranga 1");
-        let RoleShard::Rows(ranges) = shard
-            .role_shard(&p, WeightRole::SsmInProj)
-            .expect("plan")
+        let RoleShard::Rows(ranges) = shard.role_shard(&p, WeightRole::SsmInProj).expect("plan")
         else {
             panic!("in_proj dzieli się po wierszach");
         };

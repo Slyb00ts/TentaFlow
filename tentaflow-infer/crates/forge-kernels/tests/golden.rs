@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use forge_hal::cuda::PoolSizes;
 use forge_hal::{DevBuffer, Device, Pool};
-use forge_kernels::{Kernels, Nvfp4GgufQ8Projection};
+use forge_kernels::{Kernels, Nvfp4GgufQ8Projection, Q4kDecodeModelFamily};
 use forge_types::MemKind;
 use forge_types::{DType, QuantKind};
 use half::f16;
@@ -2037,8 +2037,8 @@ fn gqa_decode_odrzuca_zbyt_male_bufory_i_overflow() {
 
     assert!(kernels
         .attn_decode_split_gqa4_f16_hd128(
-            &tiny, &tiny, 0, &tiny, 0, &tiny, 0, &tiny, &tiny, &tiny, &tiny, &tiny, 1, 4, 1, 1, 1,
-            1, 1e-5, 10_000.0, 0.125, &stream,
+            &tiny, &tiny, 0, &tiny, 0, &tiny, 0, None, None, &tiny, &tiny, &tiny, &tiny, &tiny, 1,
+            4, 1, 1, 1, 1, 1e-5, 10_000.0, 0.125, &stream,
         )
         .is_err());
     assert!(kernels
@@ -2114,7 +2114,15 @@ fn gemv_q4_k_dp4a_matches_formats_dequant() {
     dev.write(&wq, &wb, 0).unwrap();
 
     kernels
-        .gemv_q4_k_dp4a_f16(&yb, &wb, &xb, rows, cols, &stream)
+        .gemv_q4_k_dp4a_f16(
+            &yb,
+            &wb,
+            &xb,
+            rows,
+            cols,
+            Q4kDecodeModelFamily::Any,
+            &stream,
+        )
         .unwrap();
     dev.synchronize().unwrap();
 
@@ -2144,6 +2152,65 @@ fn gemv_q4_k_dp4a_matches_formats_dequant() {
             "row {r}: f32 and f16 dp4a outputs diverge"
         );
     }
+}
+
+#[test]
+fn bielik_q4k_wide_persistent_matches_plain_and_preserves_output_guard() {
+    let Some(dev) = device() else { return };
+    if dev.caps().vendor != forge_types::Vendor::Amd || dev.caps().arch != "gfx1201" {
+        return;
+    }
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (rows, cols, guard) = (28672usize, 5120usize, 17usize);
+    let wq = build_q4k(rows, cols);
+    let wb = dev.alloc(wq.len(), MemKind::Device, Pool::Weights).unwrap();
+    dev.write(&wq, &wb, 0).unwrap();
+    let x: Vec<f32> = (0..cols)
+        .map(|i| f16::from_f32(fill(i) * 0.1).to_f32())
+        .collect();
+    let xb = upload_f16(dev.as_ref(), &x);
+    let canary = f16::from_bits(0x7bcd);
+    let initial = vec![canary; rows + guard];
+    let plain = dev
+        .alloc(initial.len() * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let persistent = dev
+        .alloc(initial.len() * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(bytemuck_cast(&initial), &plain, 0).unwrap();
+    dev.write(bytemuck_cast(&initial), &persistent, 0).unwrap();
+
+    kernels
+        .gemv_q4_k_dp4a_f16(
+            &plain,
+            &wb,
+            &xb,
+            rows,
+            cols,
+            Q4kDecodeModelFamily::Dense,
+            &stream,
+        )
+        .unwrap();
+    kernels
+        .gemv_q4_k_dp4a_f16(
+            &persistent,
+            &wb,
+            &xb,
+            rows,
+            cols,
+            Q4kDecodeModelFamily::Bielik,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let plain_values = download_f16(dev.as_ref(), &plain, rows + guard);
+    let persistent_values = download_f16(dev.as_ref(), &persistent, rows + guard);
+    assert_eq!(plain_values[..rows], persistent_values[..rows]);
+    assert!(persistent_values[rows..]
+        .iter()
+        .all(|value| value.to_bits() == canary.to_f32().to_bits()));
 }
 
 // Weight-stationary small-batch dp4a GEMV (T=2/4/8/16): every token's row
@@ -2182,7 +2249,7 @@ fn gemv_q6_k_batch_out_f32_matches_f16_variant() {
             continue;
         }
         if !kernels
-            .gemv_q6_k_dp4a_batch_out_f32_at(&y32, &wb, 0, &xb, rows, cols, n_tokens, &stream)
+            .gemv_q6_k_dp4a_batch_out_f32_at(&y32, 0, &wb, 0, &xb, 0, rows, cols, n_tokens, &stream)
             .unwrap()
         {
             eprintln!("pomijam T={n_tokens}: brak kernela f32");
@@ -2931,7 +2998,10 @@ fn attn_decode_gqa6_hd256_matches_reference() {
             let scores: Vec<f32> = (0..ctx_len)
                 .map(|pos| {
                     let kv_off = kv_at(pos);
-                    (0..head_dim).map(|e| q[qb_off + e] * kc[kv_off + e]).sum::<f32>() * scale
+                    (0..head_dim)
+                        .map(|e| q[qb_off + e] * kc[kv_off + e])
+                        .sum::<f32>()
+                        * scale
                 })
                 .collect();
             let m = scores.iter().cloned().fold(f32::MIN, f32::max);
@@ -2950,4 +3020,3 @@ fn attn_decode_gqa6_hd256_matches_reference() {
         }
     }
 }
-

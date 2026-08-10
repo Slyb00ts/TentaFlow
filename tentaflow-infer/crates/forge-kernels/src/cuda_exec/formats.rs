@@ -182,13 +182,25 @@ impl CudaExec {
             let s = &self.stream;
             match w.quant {
                 QuantKind::Q8_0 => {
-                    return self.kernels.gemv_q8_0_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                    return self
+                        .kernels
+                        .gemv_q8_0_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
                 }
                 QuantKind::Q6K => {
-                    return self.kernels.gemv_q6_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                    return self
+                        .kernels
+                        .gemv_q6_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
                 }
                 QuantKind::Q4K => {
-                    return self.kernels.gemv_q4_k_dp4a_f16(y, &w.blocks, x, rows, w.cols, s);
+                    return self.kernels.gemv_q4_k_dp4a_f16(
+                        y,
+                        &w.blocks,
+                        x,
+                        rows,
+                        w.cols,
+                        crate::Q4kDecodeModelFamily::Dense,
+                        s,
+                    );
                 }
                 _ => {}
             }

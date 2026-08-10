@@ -105,7 +105,11 @@ fn decode_attention_matches_mlx_with_grouped_heads() {
     let k = upload(&f.blobs["k"]);
     let v = upload(&f.blobs["v"]);
     let out = dev
-        .alloc((f.heads * f.dim) as usize * 2, MemKind::Device, Pool::Activations)
+        .alloc(
+            (f.heads * f.dim) as usize * 2,
+            MemKind::Device,
+            Pool::Activations,
+        )
         .unwrap();
 
     let source = msl::attn_decode_source(f.dim);
@@ -235,10 +239,18 @@ fn a_length_past_the_cache_capacity_is_refused() {
     let stream = dev.create_stream().unwrap();
 
     let q = dev
-        .alloc((f.heads * f.dim) as usize * 2, MemKind::Device, Pool::Weights)
+        .alloc(
+            (f.heads * f.dim) as usize * 2,
+            MemKind::Device,
+            Pool::Weights,
+        )
         .unwrap();
     let out = dev
-        .alloc((f.heads * f.dim) as usize * 2, MemKind::Device, Pool::Activations)
+        .alloc(
+            (f.heads * f.dim) as usize * 2,
+            MemKind::Device,
+            Pool::Activations,
+        )
         .unwrap();
     dev.write(&vec![0u8; (f.heads * f.dim) as usize * 2], &out, 0)
         .unwrap();
@@ -311,7 +323,9 @@ fn blocked_attention_agrees_with_the_per_token_form() {
             .collect()
     };
 
-    let q_host: Vec<f32> = (0..(TOKENS * HEADS * DIM) as usize).map(|_| next()).collect();
+    let q_host: Vec<f32> = (0..(TOKENS * HEADS * DIM) as usize)
+        .map(|_| next())
+        .collect();
     let mut k_host = vec![0f32; (KV_HEADS * CAP * DIM) as usize];
     let mut v_host = vec![0f32; (KV_HEADS * CAP * DIM) as usize];
     for h in 0..KV_HEADS as usize {
@@ -431,5 +445,8 @@ fn blocked_attention_agrees_with_the_per_token_form() {
         .zip(last)
         .map(|(x, y)| (*x as f64 - *y as f64).abs())
         .sum();
-    assert!(diff > 1.0, "wyniki nie zależą od pozycji — maska nie działa");
+    assert!(
+        diff > 1.0,
+        "wyniki nie zależą od pozycji — maska nie działa"
+    );
 }

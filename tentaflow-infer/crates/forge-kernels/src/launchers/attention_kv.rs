@@ -1,6 +1,6 @@
 // ===== File: attention_kv.rs — RoPE, zapisy cache'u K/V i ścieżka rot =====
-use super::*;
 use super::attention::ATTN_BLOCK;
+use super::*;
 
 impl Kernels {
     /// In-place neox RoPE over [n_tokens, n_heads, head_dim] f16.

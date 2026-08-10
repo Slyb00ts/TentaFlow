@@ -9,5 +9,9 @@ pub fn entries() -> Vec<ProfileEntry> {
     deepseek.chat_template = true;
     deepseek.default_ctx = Some(4096);
 
-    vec![ProfileEntry { arch: "deepseek_v4", name_needle: "", profile: deepseek }]
+    vec![ProfileEntry {
+        arch: "deepseek_v4",
+        name_needle: "",
+        profile: deepseek,
+    }]
 }

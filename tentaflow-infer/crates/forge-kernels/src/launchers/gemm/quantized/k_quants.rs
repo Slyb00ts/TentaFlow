@@ -1,8 +1,10 @@
 // ===== File: k_quants.rs — GGUF k-kwantyzacje: Q2_K..Q6_K =====
-use super::*;
 use super::persist::persist_wave;
-
-const GEMV_Q4K_GROUP4: &str = "gemv_q4_k_dp4a_group4_f16";
+use super::q4k_decode_profile::{
+    group4_artifact, persistent_artifact, plain_artifact, q4k_decode_profile, rows_per_block,
+    uses_profiled_persistent_grid, Q4kDecodeModelFamily,
+};
+use super::*;
 
 impl Kernels {
     /// y = W·x with W in GGML Q4_K superblocks, x/y f16. Warp per row.
@@ -655,12 +657,19 @@ impl Kernels {
         projections: &[(&DevBuffer, &DevBuffer, usize)],
         x: &DevBuffer,
         cols: usize,
+        model: Q4kDecodeModelFamily,
         stream: &Stream,
     ) -> Result<bool> {
-        if !(2..=4).contains(&projections.len()) || !self.artifacts.has(GEMV_Q4K_GROUP4) {
+        if !(2..=4).contains(&projections.len()) {
             return Ok(false);
         }
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_group")?;
+        let Some(artifact) = group4_artifact(self.device.caps(), model, cols) else {
+            return Ok(false);
+        };
+        if !self.artifacts.has(artifact) {
+            return Ok(false);
+        }
         let mut grid_x = 0u32;
         for &(_, _, rows) in projections {
             grid_x = grid_x
@@ -694,7 +703,7 @@ impl Kernels {
             shared_mem_bytes: 0,
         };
         self.device
-            .launch(self.artifacts.get(GEMV_Q4K_GROUP4)?, &cfg, &args, stream)?;
+            .launch(self.artifacts.get(artifact)?, &cfg, &args, stream)?;
         Ok(true)
     }
 
@@ -706,9 +715,14 @@ impl Kernels {
         x: &DevBuffer,
         rows: usize,
         cols: usize,
+        model: Q4kDecodeModelFamily,
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
+        let profile = q4k_decode_profile(self.device.caps(), model);
+        if uses_profiled_persistent_grid(profile) {
+            return self.gemv_q4_k_dp4a_profiled_f16(profile, y, w_q4k, x, rows, cols, stream);
+        }
         // Narrow staging when the activation fits it: same arithmetic, a
         // quarter of the shared memory, and a block of four warps rather than
         // eight — so a multiprocessor holds the same warps in more, and
@@ -743,6 +757,86 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    /// Q4_K GEMV z pojedynczą aktywacją Q8_1 przygotowaną poza kernelem.
+    pub fn gemv_q4_k_dp4a_prepared_f16(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        prepared: &mut Q8ActPrepared<'_>,
+        rows: usize,
+        cols: usize,
+    ) -> Result<()> {
+        if !prepared.valid {
+            return Err(ForgeError::Kernel(
+                "prepared Q8 handle jest nieważny po błędzie markera".into(),
+            ));
+        }
+        let caps = self.device.caps();
+        if caps.vendor != forge_types::Vendor::Amd || caps.arch != "gfx1201" {
+            return Err(ForgeError::Unsupported(
+                "prepared Q4_K GEMV wymaga AMD gfx1201".into(),
+            ));
+        }
+        if prepared.cols != cols || prepared.n_tokens != 1 || rows == 0 {
+            return Err(ForgeError::Kernel(format!(
+                "prepared Q4_K wymaga zgodnych wymiarów T=1 i rows > 0, otrzymano rows={rows}, cols={cols}, T={}",
+                prepared.n_tokens
+            )));
+        }
+        Self::check_dp4a_cols(cols, 256, "prepared Q4_K")?;
+        const PLAIN_ARTIFACT: &str = "gemv_q4_k_dp4a_prepared_global_f16";
+        const PERSISTENT_ARTIFACT: &str = "gemv_q4_k_dp4a_prepared_persist_f16";
+        if !self.artifacts.has(PLAIN_ARTIFACT) {
+            return Err(ForgeError::Unsupported(
+                "prepared Q4_K GEMV wymaga artefaktu dla AMD gfx1201".into(),
+            ));
+        }
+        let output_bytes = checked_buffer_bytes("prepared Q4_K output", &[rows], 2)?;
+        let weight_bytes = checked_buffer_bytes("prepared Q4_K weights", &[rows, cols / 256], 144)?;
+        if y.len() < output_bytes || w_q4k.len() < weight_bytes {
+            return Err(ForgeError::Kernel(
+                "prepared Q4_K: bufor wyjścia lub wag jest za mały".into(),
+            ));
+        }
+        let rows_u32 = u32::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("prepared Q4_K: rows przekracza u32".into()))?;
+        let cols_i64 = i64::try_from(cols)
+            .map_err(|_| ForgeError::Kernel("prepared Q4_K: cols przekracza i64".into()))?;
+        let rows_i64 = i64::try_from(rows)
+            .map_err(|_| ForgeError::Kernel("prepared Q4_K: rows przekracza i64".into()))?;
+        let tiles = rows_u32.div_ceil(8);
+        let persistent_grid = self.device.caps().sm_count.saturating_mul(6);
+        let (kernel, grid) = if persistent_grid != 0
+            && tiles > persistent_grid
+            && self.artifacts.has(PERSISTENT_ARTIFACT)
+        {
+            (self.artifacts.get(PERSISTENT_ARTIFACT)?, persistent_grid)
+        } else {
+            (self.artifacts.get(PLAIN_ARTIFACT)?, tiles)
+        };
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
+            .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
+            .buf(prepared.scratch.xsum.as_ref().expect("xsum prepared"))
+            .scalar(cols_i64)
+            .scalar(rows_i64);
+        self.device.launch(kernel, &cfg, &args, prepared.stream)?;
+        if let Err(error) =
+            mark_prepared_q8_ready(self.device.as_ref(), &mut prepared.scratch, prepared.stream)
+        {
+            prepared.valid = false;
+            return Err(error);
+        }
+        Ok(())
+    }
+
     /// `gemv_q4_k_dp4a_f16` over a row window of `w_q4k` (`w_byte_off` addresses
     /// the window's first row). Used for the routed MoE gate/up projections so a
     /// single-token expert GEMV launches per-row blocks instead of a starved
@@ -759,7 +853,8 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
-        let k = self.artifacts.get("gemv_q4_k_dp4a_f16")?;
+        let profile = q4k_decode_profile(self.device.caps(), Q4kDecodeModelFamily::Any);
+        let k = self.artifacts.get(plain_artifact(profile))?;
         let cfg = LaunchConfig {
             grid: ((rows as u32).div_ceil(8), 1, 1),
             block: (BLOCK, 1, 1),
@@ -772,6 +867,46 @@ impl Kernels {
             .scalar(cols as i64)
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
+    }
+
+    fn gemv_q4_k_dp4a_profiled_f16(
+        &self,
+        profile: super::q4k_decode_profile::Profile,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let rows_per_block = rows_per_block(profile);
+        let tiles = (rows as u32).div_ceil(rows_per_block);
+        let wave =
+            q4k_decode_profile::persistent_grid(profile, self.device.caps(), rows, cols, tiles);
+        let persistent = persistent_artifact(profile, cols).ok_or_else(|| {
+            ForgeError::Kernel("profil Q4_K decode nie wskazuje artefaktu trwałej siatki".into())
+        })?;
+        let one_wave = match wave {
+            Some(grid) => Some((grid, self.artifacts.get(persistent)?)),
+            None => None,
+        };
+        let plain = self.artifacts.get(plain_artifact(profile));
+        let (grid, kernel) = match one_wave {
+            Some(plan) => plan,
+            None => (tiles, plain?),
+        };
+        let cfg = LaunchConfig {
+            grid: (grid, 1, 1),
+            block: (BLOCK, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(kernel, &cfg, &args, stream)
     }
 
     /// Q4_K logit GEMV (f32 out) with dp4a dots.

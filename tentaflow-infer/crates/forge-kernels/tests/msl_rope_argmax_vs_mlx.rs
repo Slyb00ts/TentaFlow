@@ -93,7 +93,9 @@ fn rope_matches_mlx_on_the_half_split_convention() {
         return;
     };
     let n = (f.heads * f.dims) as usize;
-    let buf = dev.alloc(n * 2, MemKind::Device, Pool::Activations).unwrap();
+    let buf = dev
+        .alloc(n * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
     dev.write(&f.blobs["q"], &buf, 0).unwrap();
 
     let module = dev

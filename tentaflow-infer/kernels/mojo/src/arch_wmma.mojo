@@ -25,6 +25,18 @@ def _wave_half() -> Int:
 
 
 @always_inline
+def wmma_acc_row_rdna3(lane: Int, i: Int) -> Int:
+    """Wiersz kafla 16x16 dla ukladu akumulatora RDNA3."""
+    return i * 2 + lane // 16
+
+
+@always_inline
+def wmma_acc_row_rdna4(lane: Int, i: Int) -> Int:
+    """Wiersz kafla 16x16 dla ukladu akumulatora RDNA4."""
+    return 8 * (lane // 16) + i
+
+
+@always_inline
 def wmma_acc_row(lane: Int, i: Int) -> Int:
     """Wiersz kafla 16x16, ktory niesie `i`-ty akumulator danej linii.
 
@@ -38,9 +50,9 @@ def wmma_acc_row(lane: Int, i: Int) -> Int:
     blad wzgledny 42.
     """
     comptime if _accelerator_arch().startswith("amdgpu:gfx12"):
-        return 8 * (lane // 16) + i
+        return wmma_acc_row_rdna4(lane, i)
     else:
-        return wmma_acc_row(lane, i)
+        return wmma_acc_row_rdna3(lane, i)
 
 
 @always_inline

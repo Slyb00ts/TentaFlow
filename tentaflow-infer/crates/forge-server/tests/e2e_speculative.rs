@@ -28,8 +28,8 @@ use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
     spawn_engine_batched, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
 };
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_tokenize::Tokenizer;
 

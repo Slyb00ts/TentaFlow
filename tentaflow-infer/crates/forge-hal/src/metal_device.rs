@@ -321,7 +321,9 @@ impl Device for MetalDevice {
     fn write(&self, src: &[u8], dst: &DevBuffer, dst_offset: usize) -> Result<()> {
         crate::check_sub_range(dst.len(), dst_offset, src.len())?;
         let to = dst.downcast::<MetalDevBuffer>()?;
-        unsafe { std::ptr::copy_nonoverlapping(src.as_ptr(), to.host().add(dst_offset), src.len()) };
+        unsafe {
+            std::ptr::copy_nonoverlapping(src.as_ptr(), to.host().add(dst_offset), src.len())
+        };
         Ok(())
     }
 

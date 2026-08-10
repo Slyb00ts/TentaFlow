@@ -15,5 +15,9 @@ pub fn entries() -> Vec<ProfileEntry> {
     bielik.add_bos = Some(true);
     bielik.stop = &["<|im_end|>"];
 
-    vec![ProfileEntry { arch: "llama", name_needle: "bielik", profile: bielik }]
+    vec![ProfileEntry {
+        arch: "llama",
+        name_needle: "bielik",
+        profile: bielik,
+    }]
 }

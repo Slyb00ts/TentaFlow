@@ -111,7 +111,6 @@ fn supports_sm89_cubin(arch: &str) -> bool {
 // only those with complete artifact sets. See build.rs for generation logic.
 include!(concat!(env!("OUT_DIR"), "/embedded_artifacts.rs"));
 
-
 /// Pokolenie NVIDII i to, czy nazwa opisuje wariant ZAWĘŻONY do architektury.
 ///
 /// `sm_89` → (89, false), `sm_121a` → (121, true). Litera oznacza zestaw

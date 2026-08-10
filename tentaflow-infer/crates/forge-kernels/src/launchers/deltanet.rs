@@ -153,7 +153,10 @@ impl Kernels {
             &[n_k_heads * 2 + n_v_heads, d_state],
             2,
         )?;
-        if x_byte_off.checked_add(conv_span).is_none_or(|end| end > x_new.len()) {
+        if x_byte_off
+            .checked_add(conv_span)
+            .is_none_or(|end| end > x_new.len())
+        {
             return Err(ForgeError::Kernel(
                 "deltanet_step_prepare_f16: okno wejścia wykracza poza bufor".into(),
             ));
@@ -1950,5 +1953,4 @@ impl Kernels {
             .scalar(if apply_gelu { 1i64 } else { 0i64 });
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

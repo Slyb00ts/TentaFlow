@@ -23,8 +23,14 @@ use forge_types::{DType, QuantKind};
 /// scales, convolution weights left unquantized and the `.bias` / `.biases`
 /// name collision.
 const FIXTURES: &[(&str, &[u8])] = &[
-    ("bielik-7b", include_bytes!("fixtures/mlx_affine_bielik.bin")),
-    ("whisper-large-v3-turbo", include_bytes!("fixtures/mlx_affine_whisper.bin")),
+    (
+        "bielik-7b",
+        include_bytes!("fixtures/mlx_affine_bielik.bin"),
+    ),
+    (
+        "whisper-large-v3-turbo",
+        include_bytes!("fixtures/mlx_affine_whisper.bin"),
+    ),
 ];
 
 /// Scales as stored in the file, kept in their own type.
@@ -154,103 +160,103 @@ fn load(fixture: &'static [u8]) -> (MlxQuantConfig, Vec<Case>) {
 #[test]
 fn unpacking_matches_mlx_bit_exact() {
     for (model, fixture) in FIXTURES {
-    let (cfg, cases) = load(fixture);
-    assert!(!cases.is_empty(), "{model}: fikstura jest pusta");
+        let (cfg, cases) = load(fixture);
+        assert!(!cases.is_empty(), "{model}: fikstura jest pusta");
 
-    for c in &cases {
-        let ones = c.scales.ones();
-        let zeros = c.biases.zeros();
-        let t = MlxAffineTensor {
-            packed: &c.packed,
-            scales: ones.view(),
-            biases: zeros.view(),
-            rows: c.rows,
-            cols: c.cols,
-        };
-        let mut out = vec![0f32; c.rows * c.cols];
-        dequantize_affine(&t, &cfg, &mut out).unwrap();
+        for c in &cases {
+            let ones = c.scales.ones();
+            let zeros = c.biases.zeros();
+            let t = MlxAffineTensor {
+                packed: &c.packed,
+                scales: ones.view(),
+                biases: zeros.view(),
+                rows: c.rows,
+                cols: c.cols,
+            };
+            let mut out = vec![0f32; c.rows * c.cols];
+            dequantize_affine(&t, &cfg, &mut out).unwrap();
 
-        assert_eq!(out.len(), c.raw_q.len(), "{}: rozmiar wyniku", c.name);
-        for (i, (got, want)) in out.iter().zip(&c.raw_q).enumerate() {
-            assert_eq!(
-                got.to_bits(),
-                want.to_bits(),
-                "{}: element {i} — rozpakowanie różni się od MLX ({got} wobec {want})",
-                c.name
+            assert_eq!(out.len(), c.raw_q.len(), "{}: rozmiar wyniku", c.name);
+            for (i, (got, want)) in out.iter().zip(&c.raw_q).enumerate() {
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "{}: element {i} — rozpakowanie różni się od MLX ({got} wobec {want})",
+                    c.name
+                );
+            }
+
+            // Every stored integer must fit the declared bit width; a decoder that
+            // shifts by the wrong amount can still land inside the mask, so this is
+            // a second, independent way for a packing error to show up.
+            let max = ((1u32 << cfg.bits) - 1) as f32;
+            assert!(
+                out.iter().all(|v| *v >= 0.0 && *v <= max),
+                "{}: wartość poza zakresem {} bitów",
+                c.name,
+                cfg.bits
             );
         }
-
-        // Every stored integer must fit the declared bit width; a decoder that
-        // shifts by the wrong amount can still land inside the mask, so this is
-        // a second, independent way for a packing error to show up.
-        let max = ((1u32 << cfg.bits) - 1) as f32;
-        assert!(
-            out.iter().all(|v| *v >= 0.0 && *v <= max),
-            "{}: wartość poza zakresem {} bitów",
-            c.name,
-            cfg.bits
-        );
-    }
     }
 }
 
 #[test]
 fn affine_decode_matches_mlx() {
     for (_model, fixture) in FIXTURES {
-    let (cfg, cases) = load(fixture);
+        let (cfg, cases) = load(fixture);
 
-    for c in &cases {
-        let t = MlxAffineTensor {
-            packed: &c.packed,
-            scales: c.scales.view(),
-            biases: c.biases.view(),
-            rows: c.rows,
-            cols: c.cols,
-        };
-        let mut out = vec![0f32; c.rows * c.cols];
-        dequantize_affine(&t, &cfg, &mut out).unwrap();
-
-        // The decoder works in f32; MLX returns the checkpoint dtype. Comparing
-        // raw f32 bits would measure the width of the accumulator, not the
-        // correctness of the formula, so the comparison happens after one
-        // rounding to bf16 — and there it must be EXACT. A bias applied with
-        // the wrong sign or a scale applied by division cannot survive this.
-        let mut mismatches = 0usize;
-        let mut worst = 0f32;
-        let mut worst_at = 0usize;
-        for (i, (got, want)) in out.iter().zip(&c.expected).enumerate() {
-            let round = |v: f32| match &c.scales {
-                Params::Bf16(_) => bf16::from_f32(v).to_f32(),
-                Params::F16(_) => f16::from_f32(v).to_f32(),
+        for c in &cases {
+            let t = MlxAffineTensor {
+                packed: &c.packed,
+                scales: c.scales.view(),
+                biases: c.biases.view(),
+                rows: c.rows,
+                cols: c.cols,
             };
-            if round(*got).to_bits() != round(*want).to_bits() {
-                mismatches += 1;
-            }
-            let denom = want.abs().max(1e-6);
-            let rel = (got - want).abs() / denom;
-            if rel > worst {
-                worst = rel;
-                worst_at = i;
-            }
-        }
+            let mut out = vec![0f32; c.rows * c.cols];
+            dequantize_affine(&t, &cfg, &mut out).unwrap();
 
-        assert_eq!(
-            mismatches, 0,
-            "{}: {mismatches} wartości różni się po zaokrągleniu do typu checkpointu; \
+            // The decoder works in f32; MLX returns the checkpoint dtype. Comparing
+            // raw f32 bits would measure the width of the accumulator, not the
+            // correctness of the formula, so the comparison happens after one
+            // rounding to bf16 — and there it must be EXACT. A bias applied with
+            // the wrong sign or a scale applied by division cannot survive this.
+            let mut mismatches = 0usize;
+            let mut worst = 0f32;
+            let mut worst_at = 0usize;
+            for (i, (got, want)) in out.iter().zip(&c.expected).enumerate() {
+                let round = |v: f32| match &c.scales {
+                    Params::Bf16(_) => bf16::from_f32(v).to_f32(),
+                    Params::F16(_) => f16::from_f32(v).to_f32(),
+                };
+                if round(*got).to_bits() != round(*want).to_bits() {
+                    mismatches += 1;
+                }
+                let denom = want.abs().max(1e-6);
+                let rel = (got - want).abs() / denom;
+                if rel > worst {
+                    worst = rel;
+                    worst_at = i;
+                }
+            }
+
+            assert_eq!(
+                mismatches, 0,
+                "{}: {mismatches} wartości różni się po zaokrągleniu do typu checkpointu; \
              największy błąd względny {worst:.3e} na elemencie {worst_at} \
              (got {}, want {})",
-            c.name, out[worst_at], c.expected[worst_at]
-        );
+                c.name, out[worst_at], c.expected[worst_at]
+            );
 
-        // Second, independent bound: even before rounding the difference must
-        // stay inside one bf16 ulp, otherwise the agreement above would be
-        // luck rather than arithmetic.
-        assert!(
-            worst <= 8.0e-3,
-            "{}: największy błąd względny {worst:.3e} na elemencie {worst_at}",
-            c.name
-        );
-    }
+            // Second, independent bound: even before rounding the difference must
+            // stay inside one bf16 ulp, otherwise the agreement above would be
+            // luck rather than arithmetic.
+            assert!(
+                worst <= 8.0e-3,
+                "{}: największy błąd względny {worst:.3e} na elemencie {worst_at}",
+                c.name
+            );
+        }
     }
 }
 
@@ -280,13 +286,8 @@ fn repacking_to_q4_1_changes_the_layout_and_nothing_else() {
             dequantize_affine(&t, &cfg, &mut want).unwrap();
 
             let blocks = repack_affine_to_q4_1(&t, &cfg).unwrap();
-            let got = dequantize_to_f32(
-                DType::F16,
-                QuantKind::Q4_1,
-                &blocks,
-                c.rows * c.cols,
-            )
-            .unwrap();
+            let got =
+                dequantize_to_f32(DType::F16, QuantKind::Q4_1, &blocks, c.rows * c.cols).unwrap();
 
             assert_eq!(got.len(), want.len(), "{}: rozmiar", c.name);
             for (i, (g, w)) in got.iter().zip(&want).enumerate() {
@@ -300,7 +301,10 @@ fn repacking_to_q4_1_changes_the_layout_and_nothing_else() {
 
             // Kontrola samego porównania: gdyby wagi były stałe, każdy błąd
             // przestawienia nibbli byłby niewidoczny.
-            let distinct = want.iter().map(|v| v.to_bits()).collect::<std::collections::HashSet<_>>();
+            let distinct = want
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<std::collections::HashSet<_>>();
             assert!(
                 distinct.len() > 8,
                 "{}: fikstura ma za mało różnych wartości, żeby wykryć przestawienie",

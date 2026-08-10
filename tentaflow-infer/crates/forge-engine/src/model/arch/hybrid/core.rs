@@ -153,25 +153,16 @@ impl Model {
             ForgeError::Unsupported("arena layer-major wymaga parametrów SSM".into())
         })?;
         let device_bytes = hybrid_layer_major_scratch_estimate(shape, cap)?;
-        let required = device_bytes
-            .checked_add(HYBRID_PREFILL_ACTIVATION_RESERVE)
-            .ok_or_else(|| ForgeError::Scheduler("przepełnienie budżetu layer-major".into()))?;
+        let required = hybrid_layer_major_activation_required(shape, cap)?;
         let available = self
             .device
             .pool_available(Pool::Activations)
             .ok_or_else(|| {
                 ForgeError::Unsupported("backend nie raportuje budżetu areny layer-major".into())
             })?;
-        let reclaimable = self
-            .hybrid_layer_major_bufs
-            .as_ref()
-            .map_or(0, |bufs| bufs.device_bytes);
-        let effective_available = available.checked_add(reclaimable).ok_or_else(|| {
-            ForgeError::Scheduler("przepełnienie dostępnego budżetu layer-major".into())
-        })?;
-        if required > effective_available {
+        if required > available {
             return Err(ForgeError::Unsupported(format!(
-                "arena layer-major wymaga {required} bajtów, dostępne {effective_available}"
+                "arena layer-major wymaga {required} bajtów, dostępne {available}"
             )));
         }
         drop(self.hybrid_layer_major_bufs.take());
@@ -1132,5 +1123,4 @@ impl Model {
         }
         restore_result
     }
-
 }

@@ -11,7 +11,6 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use forge_tokenize::gguf_vocab;
 use forge_engine::kv::SeqKv;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
@@ -21,8 +20,9 @@ use forge_engine::speculation::{
 };
 use forge_engine::tier::{KvTierConfig, KvTierMode};
 use forge_formats::Gguf;
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
+use forge_tokenize::gguf_vocab;
 use forge_tokenize::Tokenizer;
 
 mod common;
@@ -712,7 +712,7 @@ fn load_model_sized_with_tier(
             path,
             ModelConfig {
                 weight_host_budget: 0,
-weight_spill_dir: None,
+                weight_spill_dir: None,
                 kv_page_size: 32,
                 kv_pages,
                 max_seq_len,
@@ -1962,9 +1962,15 @@ fn hybrid_prefill_b2_t32_jest_numerycznie_zgodny_z_dwoma_serialnymi_lane() -> Te
             if batch.0.starts_with("seq.") {
                 assert_eq!(batch.2, serial.2, "metadane {}", batch.0);
             } else if batch.0.ends_with(".conv") {
-                merge_diff(&mut conv, common::numeric_diff(&batch.2, &serial.2, batch.1));
+                merge_diff(
+                    &mut conv,
+                    common::numeric_diff(&batch.2, &serial.2, batch.1),
+                );
             } else if batch.0.ends_with(".state") {
-                merge_diff(&mut state, common::numeric_diff(&batch.2, &serial.2, batch.1));
+                merge_diff(
+                    &mut state,
+                    common::numeric_diff(&batch.2, &serial.2, batch.1),
+                );
             } else {
                 merge_diff(&mut kv, common::numeric_diff(&batch.2, &serial.2, batch.1));
             }
@@ -2195,11 +2201,20 @@ fn hybrid_prefill_t128_zachowuje_numeryczna_zgodnosc_z_serialnym_prefill() -> Te
             if batched.0.starts_with("seq.") {
                 assert_eq!(batched.2, serial.2, "metadane {}", batched.0);
             } else if batched.0.ends_with(".conv") {
-                merge_diff(&mut conv, common::numeric_diff(&batched.2, &serial.2, batched.1));
+                merge_diff(
+                    &mut conv,
+                    common::numeric_diff(&batched.2, &serial.2, batched.1),
+                );
             } else if batched.0.ends_with(".state") {
-                merge_diff(&mut state, common::numeric_diff(&batched.2, &serial.2, batched.1));
+                merge_diff(
+                    &mut state,
+                    common::numeric_diff(&batched.2, &serial.2, batched.1),
+                );
             } else {
-                merge_diff(&mut kv, common::numeric_diff(&batched.2, &serial.2, batched.1));
+                merge_diff(
+                    &mut kv,
+                    common::numeric_diff(&batched.2, &serial.2, batched.1),
+                );
             }
         }
         let logits = common::numeric_diff(

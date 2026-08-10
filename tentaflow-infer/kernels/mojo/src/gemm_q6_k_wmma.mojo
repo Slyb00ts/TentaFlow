@@ -100,7 +100,7 @@ def _weight_frag(
     return (q6.cast[DType.int16]() - 32).cast[DType.float16]() * scale
 
 
-def gemm_q6_k_wmma_impl[
+def gemm_q6_k_wmma_tile_impl[
     WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, PAD: Int = 0
 ](
     y: UnsafePointer[Float16, MutAnyOrigin],
@@ -108,7 +108,8 @@ def gemm_q6_k_wmma_impl[
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
-    n_tokens: Int,
+    tile_first: Int,
+    tile_end: Int,
 ):
     """GEMM Q6_K na WMMA: Y[t, r] = dot(w[r], x[t]).
 
@@ -122,7 +123,7 @@ def gemm_q6_k_wmma_impl[
 
     var lane = Int(thread_idx.x) % 32
     var wave = Int(thread_idx.x) // 32
-    var base_m = Int(block_idx.y) * BM + (wave // WAVES_N) * MTILE * TILE
+    var base_m = tile_first + (wave // WAVES_N) * MTILE * TILE
     var base_n = Int(block_idx.x) * BN + (wave % WAVES_N) * NTILE * TILE
 
     var superblocks = n_cols // SUPERBLOCK
@@ -132,8 +133,8 @@ def gemm_q6_k_wmma_impl[
     var x_base = InlineArray[Int, MTILE](fill=0)
     comptime for mt in range(MTILE):
         var m = base_m + mt * TILE + lane % 16
-        if m > n_tokens - 1:
-            m = n_tokens - 1
+        if m > tile_end - 1:
+            m = tile_end - 1
         x_base[mt] = m * n_cols
 
     var acc = InlineArray[SIMD[DType.float32, 8], MTILE * NTILE](
@@ -200,8 +201,53 @@ def gemm_q6_k_wmma_impl[
             comptime for i in range(8):
                 var m = base_m + mt * TILE + wmma_acc_row(lane, i)
                 var n = base_n + nt * TILE + lane % 16
-                if m < n_tokens and n < n_rows:
+                if m < tile_end and n < n_rows:
                     y[m * n_rows + n] = Float16(acc[mt * NTILE + nt][i])
+
+
+def gemm_q6_k_wmma_impl[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, PAD: Int = 0
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    gemm_q6_k_wmma_tile_impl[WAVES_M, WAVES_N, MTILE, NTILE, PAD](
+        y,
+        weights,
+        x,
+        n_cols,
+        n_rows,
+        Int(block_idx.y) * WAVES_M * MTILE * TILE,
+        n_tokens,
+    )
+
+
+def gemm_q6_k_wmma_grouped_impl[
+    WAVES_M: Int, WAVES_N: Int, MTILE: Int, NTILE: Int, PAD: Int = 0
+](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    var tile = Int(block_idx.y)
+    gemm_q6_k_wmma_tile_impl[WAVES_M, WAVES_N, MTILE, NTILE, PAD](
+        y,
+        wtab[Int(tile_expert[tile])],
+        x,
+        n_cols,
+        n_rows,
+        Int(tile_first[tile]),
+        Int(tile_end[tile]),
+    )
 
 
 # Kafle dobrane pomiarem na R9700 (`bench-amd/bench_q6k_wmma_tiles.mojo`,
@@ -215,3 +261,5 @@ comptime gemm_q6_k_wmma_f16_bm32 = gemm_q6_k_wmma_impl[2, 2, 1, 2, LDS_PAD]
 comptime gemm_q6_k_wmma_f16_bm256 = gemm_q6_k_wmma_impl[4, 2, 4, 2, LDS_PAD]
 comptime gemm_q6_k_wmma_f16_bm256_bn128 = gemm_q6_k_wmma_impl[4, 2, 4, 4, LDS_PAD]
 comptime gemm_q6_k_wmma_f16_bm512_bn128 = gemm_q6_k_wmma_impl[8, 2, 4, 4, LDS_PAD]
+comptime gemm_q6_k_wmma_f16_grouped = gemm_q6_k_wmma_grouped_impl[4, 2, 1, 2, LDS_PAD]
+comptime gemm_q6_k_wmma_f16_grouped_bm128_bn64 = gemm_q6_k_wmma_grouped_impl[4, 2, 2, 2, LDS_PAD]

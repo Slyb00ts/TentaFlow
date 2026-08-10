@@ -34,14 +34,18 @@ fn layers() -> usize {
 
 /// Katalog na plik zrzutu wag ekspertów; bez niego brak pamięci jest błędem.
 fn spill_dir() -> Option<PathBuf> {
-    std::env::var("FORGE_DEEPSEEK_V4_SPILL").ok().map(PathBuf::from)
+    std::env::var("FORGE_DEEPSEEK_V4_SPILL")
+        .ok()
+        .map(PathBuf::from)
 }
 
 fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 fn device() -> Arc<dyn Device> {

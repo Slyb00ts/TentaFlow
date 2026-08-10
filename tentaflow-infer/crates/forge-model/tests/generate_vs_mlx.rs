@@ -153,7 +153,8 @@ fn greedy_generation_matches_mlx_lm_token_for_token() {
         let margin = oracle.margins[i];
         if margin >= 0.05 {
             assert_eq!(
-                ours, theirs,
+                ours,
+                theirs,
                 "token {i}: margines MLX {:.1}% rozpiętości, a wybory są różne \
                  ({ours} wobec {theirs})",
                 margin * 100.0
@@ -171,7 +172,10 @@ fn greedy_generation_matches_mlx_lm_token_for_token() {
     }
     eprintln!("kroków rozstrzygniętych remisem: {ties} z {}", got.len());
     // Gdyby remisów nie było wcale, powyższy podział niczego by nie sprawdzał.
-    assert!(ties > 0, "fikstura nie zawiera ani jednego wąskiego marginesu");
+    assert!(
+        ties > 0,
+        "fikstura nie zawiera ani jednego wąskiego marginesu"
+    );
 }
 
 #[test]
@@ -191,7 +195,9 @@ fn generate_agrees_with_stepping_by_hand() {
     let mut model = open(device, &dir);
 
     let steps = 3usize;
-    let via_api = model.generate(SLOT, &oracle.prompt_ids, steps).expect("generacja");
+    let via_api = model
+        .generate(SLOT, &oracle.prompt_ids, steps)
+        .expect("generacja");
     assert_eq!(via_api.len(), steps);
     assert_eq!(
         model.position(SLOT).expect("pozycja") as usize,
@@ -208,7 +214,12 @@ fn generate_agrees_with_stepping_by_hand() {
     }
     by_hand.push(next);
     for _ in 1..steps {
-        next = model.decode(&[Feed { slot: SLOT, token: next }]).expect("krok")[0];
+        next = model
+            .decode(&[Feed {
+                slot: SLOT,
+                token: next,
+            }])
+            .expect("krok")[0];
         by_hand.push(next);
     }
 
@@ -446,7 +457,13 @@ fn no_batch_size_falls_off_a_cliff() {
     // 5 186 dla 64 — ten sam blok pracy, dwa razy drożej. To jest asercja na
     // decyzję, nie na kernel: pilnuje, żeby próg formy macierzowej nie wrócił
     // do wysokości bloku.
-    let at = |n: usize| per_token.iter().find(|(s, _)| *s == n).expect("rozmiar w zestawie").1;
+    let at = |n: usize| {
+        per_token
+            .iter()
+            .find(|(s, _)| *s == n)
+            .expect("rozmiar w zestawie")
+            .1
+    };
     assert!(
         at(63) <= at(64) * 1.5,
         "wsad 63 kosztuje {:.1} us/token przy {:.1} dla pełnego bloku — forma \
@@ -535,7 +552,8 @@ fn the_cpu_share_computes_the_same_thing_as_the_gpu_alone() {
     eprintln!("margines zwycięzcy: {:.1}% rozpiętości", margin * 100.0);
     if margin >= 0.05 {
         assert_eq!(
-            got, want,
+            got,
+            want,
             "przy marginesie {:.1}% podział wskazał inny token",
             margin * 100.0
         );

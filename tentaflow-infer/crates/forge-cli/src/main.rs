@@ -24,7 +24,8 @@ use forge_formats::PoolingType;
 use forge_hal::Device;
 use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{
-    kv_pool_bytes, load_model, load_model_tp, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
+    kv_pool_bytes, load_model, load_model_tp, read_descriptor, resolve_normalize, resolve_pooling,
+    LoadedModel,
 };
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{EmbedModel, ServerConfig, ServerState, SharedEmbed};
@@ -1336,7 +1337,8 @@ fn load_auto(
         kv_quant,
         native_mtp,
     )?;
-    let activations = activation_pool_bytes(desc.params.ssm.is_some(), max_active, gpu::free_vram(0)?);
+    let activations =
+        activation_pool_bytes(desc.params.ssm.is_some(), max_active, gpu::free_vram(0)?);
     // Automatycznie dobrany kontekst NIE MOZE zaglodzic wag. Kazdy token czyta
     // cale wagi, a strony KV zapelniaja sie dopiero wraz z dlugoscia sekwencji,
     // wiec oddanie rezydentnych wag za wiekszy kontekst jest zawsze zla
@@ -2110,16 +2112,38 @@ fn cmd_caps() -> Result<()> {
         let c = device.caps();
         println!("{} ({:?}, {})", c.name, c.vendor, c.arch);
         println!("  pamiec                {} MiB", c.total_memory >> 20);
-        println!("  SM / warp / watki     {} / {} / {}", c.sm_count, c.warp_size, c.max_threads_per_block);
-        println!("  pamiec wspoldzielona  {} KiB na blok", c.max_shared_mem_per_block >> 10);
+        println!(
+            "  SM / warp / watki     {} / {} / {}",
+            c.sm_count, c.warp_size, c.max_threads_per_block
+        );
+        println!(
+            "  pamiec wspoldzielona  {} KiB na blok",
+            c.max_shared_mem_per_block >> 10
+        );
         println!("  bf16                  {}", tak_nie(c.bf16_native));
         println!("  fp8 (e4m3/e5m2)       {}", tak_nie(c.fp8_native));
-        println!("  fp4 blokowe ue8m0     {}   (MXFP4)", tak_nie(c.fp4_block_scale_ue8m0));
-        println!("  fp4 blokowe e4m3      {}   (NVFP4 natywnie)", tak_nie(c.fp4_block_scale_e4m3));
-        println!("  wgmma                 {}   (rdzen FlashAttention-3)", tak_nie(c.wgmma));
-        println!("  tcgen05 + TMEM        {}   (rdzen FlashAttention-4)", tak_nie(c.tcgen05));
+        println!(
+            "  fp4 blokowe ue8m0     {}   (MXFP4)",
+            tak_nie(c.fp4_block_scale_ue8m0)
+        );
+        println!(
+            "  fp4 blokowe e4m3      {}   (NVFP4 natywnie)",
+            tak_nie(c.fp4_block_scale_e4m3)
+        );
+        println!(
+            "  wgmma                 {}   (rdzen FlashAttention-3)",
+            tak_nie(c.wgmma)
+        );
+        println!(
+            "  tcgen05 + TMEM        {}   (rdzen FlashAttention-4)",
+            tak_nie(c.tcgen05)
+        );
         println!("  TMA                   {}", tak_nie(c.tma));
-        println!("  grafy / P2P           {} / {}", tak_nie(c.supports_graph_capture), tak_nie(c.supports_p2p));
+        println!(
+            "  grafy / P2P           {} / {}",
+            tak_nie(c.supports_graph_capture),
+            tak_nie(c.supports_p2p)
+        );
     }
     Ok(())
 }
@@ -2841,7 +2865,10 @@ mod speculation_cli_tests {
     fn pula_aktywacji_rosnie_z_liczba_linii() {
         assert_eq!(activation_pool_bytes(true, 8, 24 << 30), 1152 << 20);
         assert_eq!(activation_pool_bytes(false, 8, 24 << 30), 1 << 30);
-        assert_eq!(activation_pool_bytes(true, 32, 24 << 30), (1152 << 20) + 24 * (16 << 20));
+        assert_eq!(
+            activation_pool_bytes(true, 32, 24 << 30),
+            (1152 << 20) + 24 * (16 << 20)
+        );
         assert_eq!(activation_pool_bytes(true, 8, 128 << 30), 4 << 30);
     }
 }

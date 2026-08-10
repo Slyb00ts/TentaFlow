@@ -454,7 +454,12 @@ impl Executor for HostExec {
             // The same formula as above, except a row is a HEAD. Computed in
             // place, so the slot does not change size — and were it to, the
             // attention would read rows from a different split.
-            Op::HeadNorm { act, w, heads, step } => {
+            Op::HeadNorm {
+                act,
+                w,
+                heads,
+                step,
+            } => {
                 let weight = self.plain(*w)?.to_vec();
                 let n = s.head_dim as usize;
                 let rows = step.rows() as usize * *heads as usize;
@@ -744,7 +749,8 @@ impl Executor for HostExec {
                         for c in 0..mixed_width {
                             let window = &carried.0[c * win..(c + 1) * win];
                             let taps_c = &conv_w[c * taps..(c + 1) * taps];
-                            convolved[c] = dn::silu(dn::causal_conv1d_step(window, mixed[c], taps_c));
+                            convolved[c] =
+                                dn::silu(dn::causal_conv1d_step(window, mixed[c], taps_c));
                         }
                         for c in 0..mixed_width {
                             let window = &mut carried.0[c * win..(c + 1) * win];
@@ -901,16 +907,22 @@ impl Executor for HostExec {
                         let base = e * hidden;
                         for (h, a) in acc.iter_mut().enumerate() {
                             down_w.row_into(base + h, &mut row[..inter])?;
-                            let v: f32 =
-                                row[..inter].iter().zip(&activated).map(|(w, z)| w * z).sum();
+                            let v: f32 = row[..inter]
+                                .iter()
+                                .zip(&activated)
+                                .map(|(w, z)| w * z)
+                                .sum();
                             *a += weight * v;
                         }
                     }
                     // The always-on expert lands ON TOP of the routed sum, with
                     // its own per-token gate rather than a routing weight.
                     if let Some(sh) = shared {
-                        let (sg, su, sd) =
-                            (self.quant(sh.gate)?, self.quant(sh.up)?, self.quant(sh.down)?);
+                        let (sg, su, sd) = (
+                            self.quant(sh.gate)?,
+                            self.quant(sh.up)?,
+                            self.quant(sh.down)?,
+                        );
                         // This expert's width is its own, and only the stacks'
                         // shapes state it. The shape's `inter` is the WIDEST
                         // feed-forward in the model, so it bounds the scratch

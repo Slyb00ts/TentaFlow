@@ -434,5 +434,4 @@ impl Kernels {
             .scalar(step);
         self.device.launch(kf, &cfg, &args, stream)
     }
-
 }

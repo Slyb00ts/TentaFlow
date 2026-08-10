@@ -174,7 +174,8 @@ impl Device for TieredWeightDevice {
         bytes: usize,
         stream: &Stream,
     ) -> Result<()> {
-        self.inner.copy(src, src_offset, dst, dst_offset, bytes, stream)
+        self.inner
+            .copy(src, src_offset, dst, dst_offset, bytes, stream)
     }
     fn write(&self, src: &[u8], dst: &DevBuffer, dst_offset: usize) -> Result<()> {
         self.inner.write(src, dst, dst_offset)

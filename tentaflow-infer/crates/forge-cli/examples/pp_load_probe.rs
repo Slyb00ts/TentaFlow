@@ -3,12 +3,10 @@
 // To jest warunek pipeline parallel — model wiekszy od jednej karty ma sie
 // zmiescic na kilku.
 use forge_engine::model::{Model, ModelConfig};
-use forge_hal::{PoolSizes, gpu};
+use forge_hal::{gpu, PoolSizes};
 
 fn main() {
-    let path = std::path::PathBuf::from(
-        std::env::args().nth(1).expect("sciezka do gguf"),
-    );
+    let path = std::path::PathBuf::from(std::env::args().nth(1).expect("sciezka do gguf"));
     let total: usize = std::env::args()
         .nth(2)
         .expect("liczba warstw modelu")

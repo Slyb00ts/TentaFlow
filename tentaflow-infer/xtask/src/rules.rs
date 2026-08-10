@@ -238,7 +238,9 @@ fn tokens_with_tile_prefix(line: &str, prefix: &str) -> Vec<String> {
         if raw.len() < prefix.len() + 1 {
             continue;
         }
-        let Some(pos) = raw.find(prefix) else { continue };
+        let Some(pos) = raw.find(prefix) else {
+            continue;
+        };
         let after = &raw[pos + prefix.len()..];
         if after.chars().next().is_some_and(|c| c.is_ascii_digit()) {
             out.push(raw.to_string());
@@ -261,11 +263,10 @@ fn eval_batch_antipattern(f: &SourceFile) -> Measure {
             //     (row group, token) makes every token re-read the entire
             //     weight matrix. A token axis divided by a tile constant is the
             //     correct shape and must not be flagged.
-            let untiled_tokens = axes
-                .iter()
-                .any(|a| mentions_token_axis(a) && !is_tiled(a));
+            let untiled_tokens = axes.iter().any(|a| mentions_token_axis(a) && !is_tiled(a));
             // (2) One workgroup per output row, no tiling at all.
-            let untiled_rows = axes.len() == 1 && mentions_row_axis(&axes[0]) && !is_tiled(&axes[0]);
+            let untiled_rows =
+                axes.len() == 1 && mentions_row_axis(&axes[0]) && !is_tiled(&axes[0]);
 
             if untiled_tokens || untiled_rows {
                 metric += 1;
@@ -290,7 +291,9 @@ fn eval_batch_antipattern(f: &SourceFile) -> Measure {
 fn grid_tuple(code: &str) -> Option<String> {
     const MARKERS: &[&str] = &["grid_dim=", "grid_dim =", "grid=", "grid =", "blocks="];
     let lower = code.to_ascii_lowercase();
-    let marker = MARKERS.iter().find_map(|m| lower.find(m).map(|p| (p, m.len())))?;
+    let marker = MARKERS
+        .iter()
+        .find_map(|m| lower.find(m).map(|p| (p, m.len())))?;
     let rest = lower[marker.0 + marker.1..].trim_start();
 
     // The grid expression runs to the first comma at depth zero, so that a
@@ -435,8 +438,14 @@ mod tests {
 
     #[test]
     fn one_workgroup_per_row_is_reported() {
-        assert_eq!(measure("kernels/mojo/a.mojo", "grid_dim=rows, block_dim=256)"), 1);
-        assert_eq!(measure("kernels/mojo/a.mojo", "grid_dim=(n_rows,), block_dim=256,"), 1);
+        assert_eq!(
+            measure("kernels/mojo/a.mojo", "grid_dim=rows, block_dim=256)"),
+            1
+        );
+        assert_eq!(
+            measure("kernels/mojo/a.mojo", "grid_dim=(n_rows,), block_dim=256,"),
+            1
+        );
     }
 
     #[test]
@@ -465,7 +474,10 @@ mod tests {
         let narrow = SourceFile {
             rel: "crates/a/src/b.rs".to_string(),
             lang: Lang::Rust,
-            lines: vec!["if caps.vendor == Vendor::Nvidia {".to_string(), "}".to_string()],
+            lines: vec![
+                "if caps.vendor == Vendor::Nvidia {".to_string(),
+                "}".to_string(),
+            ],
         };
         assert_eq!(eval_vendor_gate(&narrow).metric, 0);
 
@@ -494,8 +506,12 @@ mod tests {
 fn eval_hal_boundary(file: &SourceFile) -> Measure {
     // Regula opisuje graf crate'ow, a `xtask` w nim nie lezy — bez tego lapie
     // wlasny kod wykrywajacy.
-    if !file.rel.starts_with("crates/") || HAL_IS_ALLOWED_IN.iter().any(|c| file.rel.starts_with(c)) {
-        return Measure { metric: 0, samples: Vec::new() };
+    if !file.rel.starts_with("crates/") || HAL_IS_ALLOWED_IN.iter().any(|c| file.rel.starts_with(c))
+    {
+        return Measure {
+            metric: 0,
+            samples: Vec::new(),
+        };
     }
     let mut hits = Vec::new();
     for (i, line) in file.lines.iter().enumerate() {

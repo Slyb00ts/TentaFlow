@@ -74,8 +74,12 @@ fn hip_memory_roundtrip_and_device_copy() {
     let stream = dev.create_stream().unwrap();
     let source: Vec<u8> = (0..4096u32).map(|i| (i % 251) as u8).collect();
 
-    let a = dev.alloc(source.len(), MemKind::Device, Pool::Activations).unwrap();
-    let b = dev.alloc(source.len(), MemKind::Device, Pool::Activations).unwrap();
+    let a = dev
+        .alloc(source.len(), MemKind::Device, Pool::Activations)
+        .unwrap();
+    let b = dev
+        .alloc(source.len(), MemKind::Device, Pool::Activations)
+        .unwrap();
     dev.write(&source, &a, 0).unwrap();
     dev.copy(&a, 0, &b, 0, source.len(), &stream).unwrap();
     stream.synchronize().unwrap();
@@ -85,7 +89,9 @@ fn hip_memory_roundtrip_and_device_copy() {
     assert_eq!(back, source, "kopia D2D nie odtworzyła danych");
 
     // Pinned host jest adresowalny z hosta i widoczny dla kerneli (UVA).
-    let pinned = dev.alloc(64, MemKind::PinnedHost, Pool::Activations).unwrap();
+    let pinned = dev
+        .alloc(64, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
     assert!(pinned.host_ptr().is_some());
     assert!(dev.read(&b, 0, &mut vec![0u8; source.len() + 1]).is_err());
 }
@@ -140,8 +146,12 @@ extern "C" __global__ void scale_add(float* out, const float* in, float k, int n
     const N: usize = 1024;
     let input: Vec<f32> = (0..N).map(|i| i as f32 * 0.5).collect();
     let stream = dev.create_stream().unwrap();
-    let din = dev.alloc(N * 4, MemKind::Device, Pool::Activations).unwrap();
-    let dout = dev.alloc(N * 4, MemKind::Device, Pool::Activations).unwrap();
+    let din = dev
+        .alloc(N * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let dout = dev
+        .alloc(N * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     dev.write(bytemuck_cast(&input), &din, 0).unwrap();
 
     let cfg = LaunchConfig {
@@ -193,7 +203,9 @@ fn hip_pools_report_budgets_and_recycle_activations() {
     assert_eq!(dev.pool_available(Pool::Weights).unwrap(), after_alloc);
 
     // Pierścień: aktywacje wracają dopiero po `reset_activations`.
-    let a = dev.alloc(1 << 20, MemKind::Device, Pool::Activations).unwrap();
+    let a = dev
+        .alloc(1 << 20, MemKind::Device, Pool::Activations)
+        .unwrap();
     assert!(dev.pool_available(Pool::Activations).unwrap() < acts_before);
     drop(a);
     dev.reset_activations().unwrap();
@@ -212,14 +224,20 @@ fn hip_pools_report_budgets_and_recycle_activations() {
 #[test]
 fn hip_captures_and_replays_a_graph() {
     let Some(dev) = device() else { return };
-    let Some((module, _dir)) = build_test_module(&dev) else { return };
+    let Some((module, _dir)) = build_test_module(&dev) else {
+        return;
+    };
     let kernel = module.kernel("scale_add").unwrap();
 
     const N: usize = 256;
     let input: Vec<f32> = (0..N).map(|i| i as f32).collect();
     let stream = dev.create_stream().unwrap();
-    let din = dev.alloc(N * 4, MemKind::Device, Pool::Activations).unwrap();
-    let dout = dev.alloc(N * 4, MemKind::Device, Pool::Activations).unwrap();
+    let din = dev
+        .alloc(N * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let dout = dev
+        .alloc(N * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     dev.write(bytemuck_cast(&input), &din, 0).unwrap();
 
     let cfg = LaunchConfig {
@@ -253,7 +271,10 @@ fn hip_captures_and_replays_a_graph() {
             .collect();
         for (i, (value, source)) in got.iter().zip(&input).enumerate() {
             let want = source * 2.0 + 1.0;
-            assert!((value - want).abs() < 1e-5, "element {i}: {value} != {want}");
+            assert!(
+                (value - want).abs() < 1e-5,
+                "element {i}: {value} != {want}"
+            );
         }
     }
 }
@@ -287,7 +308,11 @@ extern "C" __global__ void scale_add(float* out, const float* in, float k, int n
         .arg(&obj)
         .output()
         .expect("uruchomienie hipcc");
-    assert!(build.status.success(), "{}", String::from_utf8_lossy(&build.stderr));
+    assert!(
+        build.status.success(),
+        "{}",
+        String::from_utf8_lossy(&build.stderr)
+    );
     let image = std::fs::read(&obj).unwrap();
     Some((dev.load_module(&image).unwrap(), dir))
 }
@@ -372,7 +397,8 @@ fn mojo_artifact_launches() {
     dev.read(&out, 0, &mut got).unwrap();
     for token in 0..2 {
         for i in 0..cols {
-            let bits = u16::from_le_bytes([got[(token * cols + i) * 2], got[(token * cols + i) * 2 + 1]]);
+            let bits =
+                u16::from_le_bytes([got[(token * cols + i) * 2], got[(token * cols + i) * 2 + 1]]);
             assert_eq!(bits, 0x3C00, "token {token}, element {i}: {bits:#06x}");
         }
     }

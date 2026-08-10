@@ -3,7 +3,12 @@
 from std.gpu.host import DeviceContext
 from std.random import random_si64, seed
 
-from src.gemm_q4_k_i8wmma import gemm_q4_k_i8wmma_f16_bm32, gemm_q4_k_i8wmma_f16_bm256
+from src.gemm_q4_k_i8wmma import (
+    gemm_q4_k_i8wmma_f16_bm32,
+    gemm_q4_k_i8wmma_f16_bm256,
+    gemm_q4_k_i8wmma_f16_grouped,
+    gemm_q4_k_i8wmma_f16_grouped_bm128_bn64,
+)
 
 comptime SB_BYTES = 144
 comptime SUPERBLOCK = 256
@@ -76,12 +81,22 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, big: Bool) 
             xdh[b * n_tokens + t] = d
             xsh[b * n_tokens + t] = d * Float32(sumq)
 
+    var wh_alt = ctx.enqueue_create_host_buffer[DType.uint8](n_rows * sbs * SB_BYTES)
+    for i in range(n_rows * sbs * SB_BYTES):
+        wh_alt[i] = wh[i]
+    for r in range(n_rows):
+        for s in range(sbs):
+            base = r * sbs * SB_BYTES + s * SB_BYTES + 16
+            wh_alt[base] = (wh_alt[base] & 0xF0) | ((wh_alt[base] + 3) & 0x0F)
+
     var w = ctx.enqueue_create_buffer[DType.uint8](n_rows * sbs * SB_BYTES)
+    var w_alt = ctx.enqueue_create_buffer[DType.uint8](n_rows * sbs * SB_BYTES)
     var xq = ctx.enqueue_create_buffer[DType.int8](n_tokens * n_cols)
     var xd = ctx.enqueue_create_buffer[DType.float32](nb * n_tokens)
     var xs = ctx.enqueue_create_buffer[DType.float32](nb * n_tokens)
     var y = ctx.enqueue_create_buffer[DType.float16](n_tokens * n_rows)
     ctx.enqueue_copy(w, wh)
+    ctx.enqueue_copy(w_alt, wh_alt)
     ctx.enqueue_copy(xq, xqh)
     ctx.enqueue_copy(xd, xdh)
     ctx.enqueue_copy(xs, xsh)
@@ -105,8 +120,63 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, big: Bool) 
             grid_dim=((n_rows + BN - 1) // BN, (n_tokens + BM - 1) // BM),
             block_dim=128,
         )
+    ctx.synchronize()
+
+    tiles = (n_tokens + 63) // 64
+    var grouped = ctx.enqueue_create_buffer[DType.float16](n_tokens * n_rows)
+    var table = ctx.enqueue_create_buffer[DType.uint64](2)
+    var tile_expert = ctx.enqueue_create_buffer[DType.int32](tiles)
+    var tile_first = ctx.enqueue_create_buffer[DType.int32](tiles)
+    var tile_end = ctx.enqueue_create_buffer[DType.int32](tiles)
+    with table.map_to_host() as host:
+        host[0] = UInt64(Int(w.unsafe_ptr()))
+        host[1] = UInt64(Int(w_alt.unsafe_ptr()))
+    with tile_expert.map_to_host() as expert, tile_first.map_to_host() as first, tile_end.map_to_host() as end:
+        for tile in range(tiles):
+            expert[tile] = Int32(tile % 2)
+            first[tile] = Int32(tile * 64)
+            end[tile] = Int32(min((tile + 1) * 64, n_tokens))
+    ctx.enqueue_function[gemm_q4_k_i8wmma_f16_grouped](
+        grouped.unsafe_ptr(),
+        table.unsafe_ptr().bitcast[UnsafePointer[UInt8, MutAnyOrigin]](),
+        xq.unsafe_ptr(),
+        xd.unsafe_ptr(),
+        xs.unsafe_ptr(),
+        tile_expert.unsafe_ptr(),
+        tile_first.unsafe_ptr(),
+        tile_end.unsafe_ptr(),
+        n_cols,
+        n_rows,
+        n_tokens,
+        grid_dim=((n_rows + 63) // 64, tiles),
+        block_dim=128,
+    )
+    ctx.synchronize()
+    wide_tiles = (n_tokens + 127) // 128
+    var grouped_wide = ctx.enqueue_create_buffer[DType.float16](n_tokens * n_rows)
+    var wide_expert = ctx.enqueue_create_buffer[DType.int32](wide_tiles)
+    var wide_first = ctx.enqueue_create_buffer[DType.int32](wide_tiles)
+    var wide_end = ctx.enqueue_create_buffer[DType.int32](wide_tiles)
+    with wide_expert.map_to_host() as expert, wide_first.map_to_host() as first, wide_end.map_to_host() as end:
+        for tile in range(wide_tiles):
+            expert[tile] = Int32(tile % 2)
+            first[tile] = Int32(tile * 128)
+            end[tile] = Int32(min((tile + 1) * 128, n_tokens))
+    ctx.enqueue_function[gemm_q4_k_i8wmma_f16_grouped_bm128_bn64](
+        grouped_wide.unsafe_ptr(),
+        table.unsafe_ptr().bitcast[UnsafePointer[UInt8, MutAnyOrigin]](),
+        xq.unsafe_ptr(), xd.unsafe_ptr(), xs.unsafe_ptr(),
+        wide_expert.unsafe_ptr(), wide_first.unsafe_ptr(), wide_end.unsafe_ptr(),
+        n_cols, n_rows, n_tokens,
+        grid_dim=((n_rows + 63) // 64, wide_tiles), block_dim=256,
+    )
+    ctx.synchronize()
     var yh = ctx.enqueue_create_host_buffer[DType.float16](n_tokens * n_rows)
+    var grouped_h = ctx.enqueue_create_host_buffer[DType.float16](n_tokens * n_rows)
+    var grouped_wide_h = ctx.enqueue_create_host_buffer[DType.float16](n_tokens * n_rows)
     ctx.enqueue_copy(yh, y)
+    ctx.enqueue_copy(grouped_h, grouped)
+    ctx.enqueue_copy(grouped_wide_h, grouped_wide)
     ctx.synchronize()
 
     var worst: Float64 = 0.0
@@ -119,6 +189,18 @@ def run(ctx: DeviceContext, n_rows: Int, n_cols: Int, n_tokens: Int, big: Bool) 
                 xv = xdh[(c // 32) * n_tokens + t] * Float32(Int(xqh[t * n_cols + c]))
                 acc += weight(wh.unsafe_ptr(), r, c, n_cols) * xv
             got = Float64(Float32(yh[t * n_rows + r]))
+            narrow_w = wh.unsafe_ptr() if (t // 64) % 2 == 0 else wh_alt.unsafe_ptr()
+            wide_w = wh.unsafe_ptr() if (t // 128) % 2 == 0 else wh_alt.unsafe_ptr()
+            var narrow_acc: Float32 = 0.0
+            var wide_acc: Float32 = 0.0
+            for c in range(n_cols):
+                xv = xdh[(c // 32) * n_tokens + t] * Float32(Int(xqh[t * n_cols + c]))
+                narrow_acc += weight(narrow_w, r, c, n_cols) * xv
+                wide_acc += weight(wide_w, r, c, n_cols) * xv
+            if abs(Float32(grouped_h[t * n_rows + r]) - narrow_acc) > 1.1:
+                raise Error("grouped narrow Q4_K WMMA rozni sie od referencji")
+            if abs(Float32(grouped_wide_h[t * n_rows + r]) - wide_acc) > 1.1:
+                raise Error("grouped wide Q4_K WMMA rozni sie od referencji")
             if abs(Float64(acc)) > max_ref:
                 max_ref = abs(Float64(acc))
             diff = abs(got - Float64(acc))

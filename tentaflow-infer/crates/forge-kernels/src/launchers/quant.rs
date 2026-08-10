@@ -2,6 +2,10 @@
 use super::*;
 
 impl Kernels {
+    fn prepared_q8_activation_tokens(n_tokens: usize) -> bool {
+        matches!(n_tokens, 1 | 6 | 8) || n_tokens >= 32
+    }
+
     /// Czy backend uciągnie kaflowe Q8_0 i8mma dla T>=32.
     ///
     /// Warianty batchowe (`_b2`..`_b16`) są przenośne, ale kafle dla T>=32 stoją
@@ -236,9 +240,12 @@ impl Kernels {
         n_tokens: usize,
         stream: &'a Stream,
     ) -> Result<Q8ActPrepared<'a>> {
-        if !(matches!(n_tokens, 6 | 8) || n_tokens >= 32) || cols == 0 || !cols.is_multiple_of(32) {
+        if !Self::prepared_q8_activation_tokens(n_tokens)
+            || cols == 0
+            || !cols.is_multiple_of(32)
+        {
             return Err(ForgeError::Kernel(format!(
-                "prepare_q8_1 wymaga T=6/8 lub T>=32 i cols > 0 podzielnego przez 32, otrzymano T={n_tokens}, cols={cols}"
+                "prepare_q8_1 wymaga T=1/6/8 lub T>=32 i cols > 0 podzielnego przez 32, otrzymano T={n_tokens}, cols={cols}"
             )));
         }
         if n_tokens >= 32 && !self.prepared_q8_tiled_capable() {
@@ -293,17 +300,23 @@ impl Kernels {
                 MemKind::Device,
                 Pool::Activations,
             )?);
+            scratch.xsum = Some(self.device.alloc(
+                scale_bytes,
+                MemKind::Device,
+                Pool::Activations,
+            )?);
             scratch.cap_blocks = need_blocks;
         }
         if scratch.ready.is_none() {
             scratch.ready = Some(self.device.create_event()?);
         }
-        let qk = self.artifacts.get("quantize_act_q8_1")?;
+        let qk = self.artifacts.get("quantize_act_q8_1_xsum")?;
         let qcfg = LaunchConfig::linear(blocks_u32, BLOCK);
         let qargs = LaunchArgs::new()
             .buf(scratch.xq.as_ref().expect("xq allocated"))
             .buf(scratch.xd.as_ref().expect("xd allocated"))
             .buf(scratch.xsm.as_ref().expect("xsm allocated"))
+            .buf(scratch.xsum.as_ref().expect("xsum allocated"))
             .buf(x)
             .scalar(cols_i64)
             .scalar(n_tokens_i64);
@@ -779,5 +792,18 @@ impl Kernels {
             .scalar(output_scale);
         self.device.launch(gk, &cfg, &args, stream)
     }
+}
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn prepared_q8_activation_contract_admits_single_token_only_for_prequant() {
+        assert!(Kernels::prepared_q8_activation_tokens(1));
+        assert!(Kernels::prepared_q8_activation_tokens(6));
+        assert!(Kernels::prepared_q8_activation_tokens(8));
+        assert!(Kernels::prepared_q8_activation_tokens(32));
+        assert!(!Kernels::prepared_q8_activation_tokens(2));
+    }
 }

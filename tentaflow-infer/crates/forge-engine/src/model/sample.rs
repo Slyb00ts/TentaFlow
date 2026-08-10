@@ -510,5 +510,4 @@ impl Model {
             stream,
         )
     }
-
 }

@@ -453,14 +453,29 @@ mod tests {
         let mut cb = ctx.command_buffer().unwrap();
         // b = a*2+1 = 3, then a = b*2+1 = 7, then b = a*2+1 = 15.
         let two = MetalArg::Scalar(2.0f32.to_bits() as u64);
-        cb.dispatch(&pipe, &[MetalArg::Buffer(&b, 0), MetalArg::Buffer(&a, 0), two], 1, 256)
-            .unwrap();
+        cb.dispatch(
+            &pipe,
+            &[MetalArg::Buffer(&b, 0), MetalArg::Buffer(&a, 0), two],
+            1,
+            256,
+        )
+        .unwrap();
         let two = MetalArg::Scalar(2.0f32.to_bits() as u64);
-        cb.dispatch(&pipe, &[MetalArg::Buffer(&a, 0), MetalArg::Buffer(&b, 0), two], 1, 256)
-            .unwrap();
+        cb.dispatch(
+            &pipe,
+            &[MetalArg::Buffer(&a, 0), MetalArg::Buffer(&b, 0), two],
+            1,
+            256,
+        )
+        .unwrap();
         let two = MetalArg::Scalar(2.0f32.to_bits() as u64);
-        cb.dispatch(&pipe, &[MetalArg::Buffer(&b, 0), MetalArg::Buffer(&a, 0), two], 1, 256)
-            .unwrap();
+        cb.dispatch(
+            &pipe,
+            &[MetalArg::Buffer(&b, 0), MetalArg::Buffer(&a, 0), two],
+            1,
+            256,
+        )
+        .unwrap();
         assert_eq!(cb.dispatch_count(), 3);
         cb.commit_and_wait().unwrap();
 

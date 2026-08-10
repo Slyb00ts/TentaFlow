@@ -433,7 +433,13 @@ pub fn attention_prefill(
         )?;
     }
     // Druga norma RMS: per głowica i BEZ wagi.
-    kernels.rmsnorm_head_f16(&bufs.q, shape.head_dim, tokens * shape.n_heads, shape.eps, stream)?;
+    kernels.rmsnorm_head_f16(
+        &bufs.q,
+        shape.head_dim,
+        tokens * shape.n_heads,
+        shape.eps,
+        stream,
+    )?;
     for token in 0..tokens {
         kernels.rope_interleaved_f16(
             &bufs.q,
@@ -483,7 +489,15 @@ pub fn attention_prefill(
         stream,
     )?;
     // Kwantyzacja QAT obejmuje wymiary BEZ rope; ogon rope zostaje w f16.
-    kernels.act_quant_fp8_f16(&bufs.kv_all, shape.head_dim, 0, shape.nope(), 64, tokens, stream)?;
+    kernels.act_quant_fp8_f16(
+        &bufs.kv_all,
+        shape.head_dim,
+        0,
+        shape.nope(),
+        64,
+        tokens,
+        stream,
+    )?;
 
     // --- strumień skompresowany ---
     // Przy stopniu kompresji 128 i krótkim prompcie żadne okno się nie domyka,
@@ -713,7 +727,14 @@ fn index_topk(
         )?;
     }
     kernels.hadamard_bf16_f16(&bufs.index_q, d, tokens * shape.index_n_heads, stream)?;
-    kernels.act_quant_fp4_f16(&bufs.index_q, d, d, 32, tokens * shape.index_n_heads, stream)?;
+    kernels.act_quant_fp4_f16(
+        &bufs.index_q,
+        d,
+        d,
+        32,
+        tokens * shape.index_n_heads,
+        stream,
+    )?;
     kernels.index_score_f16(
         &bufs.index_score,
         &bufs.index_q,
@@ -964,8 +985,19 @@ pub fn ffn_prefill(
                 }
             };
             run_expert(
-                kernels, gate_w, up_w, &shared.down, shape, bufs, x, x_off, out, out_off, 1.0,
-                false, stream,
+                kernels,
+                gate_w,
+                up_w,
+                &shared.down,
+                shape,
+                bufs,
+                x,
+                x_off,
+                out,
+                out_off,
+                1.0,
+                false,
+                stream,
             )?;
         }
     }
@@ -1007,12 +1039,7 @@ pub struct HyperConnectionBufs {
 }
 
 impl HyperConnectionBufs {
-    pub fn new(
-        device: &dyn Device,
-        hidden: usize,
-        hc: usize,
-        max_tokens: usize,
-    ) -> Result<Self> {
+    pub fn new(device: &dyn Device, hidden: usize, hc: usize, max_tokens: usize) -> Result<Self> {
         let mix_hc = (2 + hc) * hc;
         let f16b = |elems: usize| device.alloc(elems * 2, MemKind::Device, Pool::Activations);
         let f32b = |elems: usize| device.alloc(elems * 4, MemKind::Device, Pool::Activations);
@@ -1086,8 +1113,24 @@ pub fn hc_enter(
         tokens,
         stream,
     )?;
-    kernels.hc_reduce_f16(&bufs.reduced, residual, &bufs.pre, hidden, hc, tokens, stream)?;
-    kernels.rmsnorm_f16(&bufs.normed, &bufs.reduced, norm, tokens, hidden, eps, stream)
+    kernels.hc_reduce_f16(
+        &bufs.reduced,
+        residual,
+        &bufs.pre,
+        hidden,
+        hc,
+        tokens,
+        stream,
+    )?;
+    kernels.rmsnorm_f16(
+        &bufs.normed,
+        &bufs.reduced,
+        norm,
+        tokens,
+        hidden,
+        eps,
+        stream,
+    )
 }
 
 /// Rozprowadzenie wyjścia podbloku z powrotem na kopie strumienia.
@@ -1103,15 +1146,7 @@ pub fn hc_leave(
     stream: &Stream,
 ) -> Result<()> {
     kernels.hc_expand_f16(
-        out,
-        block_out,
-        residual,
-        &bufs.post,
-        &bufs.comb,
-        hidden,
-        bufs.hc,
-        tokens,
-        stream,
+        out, block_out, residual, &bufs.post, &bufs.comb, hidden, bufs.hc, tokens, stream,
     )
 }
 
@@ -1300,11 +1335,7 @@ pub struct DeepseekModelBufs {
 }
 
 impl DeepseekModelBufs {
-    pub fn new(
-        device: &dyn Device,
-        shape: &DeepseekModelShape,
-        max_tokens: usize,
-    ) -> Result<Self> {
+    pub fn new(device: &dyn Device, shape: &DeepseekModelShape, max_tokens: usize) -> Result<Self> {
         let hc = shape.hc.hc;
         let mut blocks = Vec::with_capacity(shape.attn.len());
         for (layer, attn) in shape.attn.iter().enumerate() {

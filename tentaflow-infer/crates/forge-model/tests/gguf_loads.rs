@@ -22,7 +22,6 @@ fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<Me
     Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
 }
 
-
 const GGUF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../.runtime/models/bielik-minitron-7b-v3-gguf/minitron-Bielik-7B-v3.0-Instruct-Q4_K_M.gguf"
@@ -90,7 +89,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
             env!("CARGO_MANIFEST_DIR"),
             "/../../../.runtime/models/models--agentGreg--Bielik-Minitron-7B-v3.0-Instruct-MLX-4bit/snapshots"
         ));
-        let Some(dir) = std::fs::read_dir(&snapshots).ok().and_then(|mut d| d.next()) else {
+        let Some(dir) = std::fs::read_dir(&snapshots)
+            .ok()
+            .and_then(|mut d| d.next())
+        else {
             eprintln!("pomijam: brak checkpointu MLX");
             return;
         };
@@ -159,7 +161,12 @@ fn the_two_formats_of_the_same_model_side_by_side() {
         let mut tok = first;
         let mut out = vec![first];
         for _ in 0..15 {
-            tok = m.decode(&[Feed { slot: SLOT, token: tok }]).expect("krok")[0];
+            tok = m
+                .decode(&[Feed {
+                    slot: SLOT,
+                    token: tok,
+                }])
+                .expect("krok")[0];
             out.push(tok);
         }
         let decode = t.elapsed().as_secs_f64();
@@ -170,7 +177,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
             prompt.len() as f64 / prefill,
             15.0 / decode
         );
-        eprintln!("        {:?}", tokenizer.decode(&out, true).unwrap_or_default());
+        eprintln!(
+            "        {:?}",
+            tokenizer.decode(&out, true).unwrap_or_default()
+        );
         out
     };
 
@@ -186,7 +196,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
     // przechodzą każdy test na „tokeny są różne i w słowniku".
     for (label, out) in [("MLX", &mlx), ("GGUF", &gguf_out)] {
         let text = tokenizer.decode(out, true).expect("detokenizacja");
-        let letters = text.chars().filter(|c| c.is_alphabetic() || *c == ' ').count();
+        let letters = text
+            .chars()
+            .filter(|c| c.is_alphabetic() || *c == ' ')
+            .count();
         assert!(
             letters * 10 >= text.chars().count() * 6,
             "{label}: {letters} liter na {} znaków — to nie jest tekst: {text:?}",

@@ -14,7 +14,15 @@ pub fn entries() -> Vec<ProfileEntry> {
     moe.label = "qwen35moe";
 
     vec![
-        ProfileEntry { arch: "qwen35", name_needle: "", profile: qwen35 },
-        ProfileEntry { arch: "qwen35moe", name_needle: "", profile: moe },
+        ProfileEntry {
+            arch: "qwen35",
+            name_needle: "",
+            profile: qwen35,
+        },
+        ProfileEntry {
+            arch: "qwen35moe",
+            name_needle: "",
+            profile: moe,
+        },
     ]
 }

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use forge_hal::{PoolSizes, gpu};
+use forge_hal::{gpu, PoolSizes};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;

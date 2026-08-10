@@ -27,7 +27,6 @@ fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<Me
     Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
 }
 
-
 #[test]
 fn decode_loop_matches_mlx_lm_step_by_step() {
     let oracle = common::load();
@@ -66,7 +65,8 @@ fn decode_loop_matches_mlx_lm_step_by_step() {
         // Token jest jedyną liczbą, która wychodzi z modelu na zewnątrz, więc
         // to on jest kontraktem.
         assert_eq!(
-            ours[0], theirs[0],
+            ours[0],
+            theirs[0],
             "krok {}: inny token; nasza piątka {ours:?}, MLX {theirs:?}",
             step + 1
         );
@@ -74,7 +74,12 @@ fn decode_loop_matches_mlx_lm_step_by_step() {
         // Pierwsze trzy w tej samej kolejności. Czwarte i piąte bywają
         // remisem co do trzeciego miejsca po przecinku i wymaganie od nich
         // kolejności robiłoby z testu loterię — ale ZBIÓR piątki musi się zgadzać.
-        assert_eq!(ours[..3], theirs[..3], "krok {}: kolejność czołówki", step + 1);
+        assert_eq!(
+            ours[..3],
+            theirs[..3],
+            "krok {}: kolejność czołówki",
+            step + 1
+        );
         let mut a = ours.clone();
         let mut b = theirs.clone();
         a.sort_unstable();
@@ -132,7 +137,10 @@ fn a_context_past_the_cache_capacity_is_refused() {
     let mut model = open(device, &dir);
     assert_eq!(model.position(SLOT).expect("pozycja"), 0);
     model
-        .decode(&[Feed { slot: SLOT, token: 1 }])
+        .decode(&[Feed {
+            slot: SLOT,
+            token: 1,
+        }])
         .expect("pierwszy krok");
     assert_eq!(model.position(SLOT).expect("pozycja"), 1);
     model.reset(SLOT).expect("reset");
@@ -171,7 +179,10 @@ fn hidden_state_tracks_mlx_at_every_depth() {
             .sum::<f64>()
             .sqrt();
         let rel = (norm - expected).abs() / expected;
-        eprintln!("po {layers:2} warstwach: {norm:.4} wobec {expected:.4} ({:.2}%)", rel * 100.0);
+        eprintln!(
+            "po {layers:2} warstwach: {norm:.4} wobec {expected:.4} ({:.2}%)",
+            rel * 100.0
+        );
         // Ten model ma „masywne aktywacje": kilka kanałów niesie wartości o rząd
         // wielkości większe od reszty, więc sama norma jest nimi zdominowana i
         // zgadza się nawet wtedy, gdy treść już się rozjeżdża. Próg jest tu

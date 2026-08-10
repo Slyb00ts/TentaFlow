@@ -14,12 +14,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use forge_engine::deepseek::{hc_enter, hc_leave, HyperConnectionBufs};
+use forge_engine::weights::HyperConnectionWeights;
 use forge_formats::safetensors::ShardedSafeTensors;
 use forge_hal::cuda::PoolSizes;
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::{DType, MemKind};
-use forge_engine::weights::HyperConnectionWeights;
 use half::f16;
 
 const LAYER: usize = 2;
@@ -28,7 +28,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 struct Oracle {
@@ -47,7 +49,8 @@ fn load_oracle() -> Option<Oracle> {
         .chunks_exact(4)
         .map(|c| i32::from_le_bytes([c[0], c[1], c[2], c[3]]))
         .collect();
-    let (seqlen, dim, n_heads, head_dim) = (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
+    let (seqlen, dim, n_heads, head_dim) =
+        (h[0] as usize, h[1] as usize, h[2] as usize, h[3] as usize);
     let (topk, ratio) = (h[6] as usize, h[10] as usize);
     let (index_head_dim, n_topk, hc) = (h[12] as usize, h[14] as usize, h[15] as usize);
     let (decode_steps, vocab) = (h[16] as usize, h[17] as usize);
@@ -79,7 +82,10 @@ fn load_oracle() -> Option<Oracle> {
         at += n * 4;
     }
     let hc_in = floats(at, seqlen * hc * dim);
-    at += (seqlen * hc * dim + seqlen * dim + seqlen * dim + seqlen * hc * dim
+    at += (seqlen * hc * dim
+        + seqlen * dim
+        + seqlen * dim
+        + seqlen * hc * dim
         + decode_steps * dim
         + head_dim
         + seqlen * dim
@@ -185,7 +191,11 @@ fn hyper_connections_wrap_the_attention_subblock() {
         base: upload_f32_named(dev.as_ref(), &st, &format!("layers.{LAYER}.hc_attn_base")),
         scale: upload_f32_named(dev.as_ref(), &st, &format!("layers.{LAYER}.hc_attn_scale")),
     };
-    let attn_norm = upload_f32_named(dev.as_ref(), &st, &format!("layers.{LAYER}.attn_norm.weight"));
+    let attn_norm = upload_f32_named(
+        dev.as_ref(),
+        &st,
+        &format!("layers.{LAYER}.attn_norm.weight"),
+    );
     // Norma RMS czyta wagę w f16, tak jak pozostałe warstwy silnika.
     let attn_norm_f16 = {
         let mut bytes = vec![0u8; oracle.dim * 4];
@@ -220,7 +230,10 @@ fn hyper_connections_wrap_the_attention_subblock() {
     let normed = download_f16(dev.as_ref(), bufs.normed(), oracle.seqlen * oracle.dim);
     let enter_err = relative_l2(&normed, &oracle.normed_attn);
     eprintln!("hc_enter: względne L2 = {enter_err:.3e}");
-    assert!(enter_err < 1e-2, "wejście podbloku rozjeżdża się o {enter_err:.3e}");
+    assert!(
+        enter_err < 1e-2,
+        "wejście podbloku rozjeżdża się o {enter_err:.3e}"
+    );
 
     // Wyjście podbloku to zwalidowane wcześniej wyjście uwagi.
     let block_out = upload_f16(dev.as_ref(), &oracle.attn_full);
@@ -247,7 +260,10 @@ fn hyper_connections_wrap_the_attention_subblock() {
     let expanded = download_f16(dev.as_ref(), &out, oracle.seqlen * oracle.hc * oracle.dim);
     let leave_err = relative_l2(&expanded, &oracle.block_state);
     eprintln!("hc_leave: względne L2 = {leave_err:.3e}");
-    assert!(leave_err < 1e-2, "wyjście bloku rozjeżdża się o {leave_err:.3e}");
+    assert!(
+        leave_err < 1e-2,
+        "wyjście bloku rozjeżdża się o {leave_err:.3e}"
+    );
     assert_eq!(
         expanded.iter().filter(|v| !v.is_finite()).count(),
         0,

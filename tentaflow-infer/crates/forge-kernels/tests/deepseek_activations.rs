@@ -106,9 +106,8 @@ fn rope_interleaved_rotates_adjacent_pairs() {
     let freqs: Vec<f32> = (0..rope_dim / 2)
         .map(|i| 1.0 / 160_000f32.powf(2.0 * i as f32 / rope_dim as f32))
         .collect();
-    let freq_bytes = unsafe {
-        std::slice::from_raw_parts(freqs.as_ptr() as *const u8, freqs.len() * 4)
-    };
+    let freq_bytes =
+        unsafe { std::slice::from_raw_parts(freqs.as_ptr() as *const u8, freqs.len() * 4) };
     let freq_buf = dev
         .alloc(freq_bytes.len(), MemKind::Device, Pool::Activations)
         .unwrap();
@@ -138,7 +137,12 @@ fn rope_interleaved_rotates_adjacent_pairs() {
                 want[at + 1] = a * sin + b * cos;
             }
         }
-        assert_close(&got, &want, 3e-3, if inverse { "rope odwrotne" } else { "rope" });
+        assert_close(
+            &got,
+            &want,
+            3e-3,
+            if inverse { "rope odwrotne" } else { "rope" },
+        );
 
         // Wymiary poza wycinkiem muszą zostać nietknięte.
         for row in 0..n_rows {
@@ -291,7 +295,8 @@ fn round_e4m3(x: f32) -> f32 {
 }
 
 fn upload_i32(dev: &dyn Device, values: &[i32]) -> DevBuffer {
-    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
     let buf = dev
         .alloc(bytes.len(), MemKind::Device, Pool::Activations)
         .unwrap();
@@ -300,7 +305,8 @@ fn upload_i32(dev: &dyn Device, values: &[i32]) -> DevBuffer {
 }
 
 fn upload_f32(dev: &dyn Device, values: &[f32]) -> DevBuffer {
-    let bytes = unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
+    let bytes =
+        unsafe { std::slice::from_raw_parts(values.as_ptr() as *const u8, values.len() * 4) };
     let buf = dev
         .alloc(bytes.len(), MemKind::Device, Pool::Activations)
         .unwrap();
@@ -347,7 +353,9 @@ fn compressor_pool_matches_the_cpu_reference() {
         .unwrap();
 
     kernels
-        .compressor_pool_f16(&out, &kv_buf, &sc_buf, &slot_buf, head_dim, window, n_blocks, &stream)
+        .compressor_pool_f16(
+            &out, &kv_buf, &sc_buf, &slot_buf, head_dim, window, n_blocks, &stream,
+        )
         .unwrap();
     stream.synchronize().unwrap();
     let got = download_f16(dev.as_ref(), &out, n_blocks * head_dim);
@@ -391,7 +399,13 @@ fn sparse_attention_matches_the_cpu_reference() {
     let kv = pattern(n_kv * head_dim, 47);
     // Część indeksów zamaskowana — muszą zostać pominięte, a nie odczytane.
     let idxs: Vec<i32> = (0..n_idx)
-        .map(|i| if i % 4 == 3 { -1 } else { ((i * 3) % n_kv) as i32 })
+        .map(|i| {
+            if i % 4 == 3 {
+                -1
+            } else {
+                ((i * 3) % n_kv) as i32
+            }
+        })
         .collect();
 
     let q_buf = upload_f16(dev.as_ref(), &q);
@@ -417,7 +431,11 @@ fn sparse_attention_matches_the_cpu_reference() {
         let r = |v: f32| f16::from_f32(v).to_f32();
         let mut want = vec![0f32; n_heads * head_dim];
         for head in 0..n_heads {
-            let valid: Vec<usize> = idxs.iter().filter(|i| **i >= 0).map(|i| *i as usize).collect();
+            let valid: Vec<usize> = idxs
+                .iter()
+                .filter(|i| **i >= 0)
+                .map(|i| *i as usize)
+                .collect();
             let scores: Vec<f32> = valid
                 .iter()
                 .map(|k| {
@@ -445,7 +463,10 @@ fn sparse_attention_matches_the_cpu_reference() {
             // Kotwica dominuje mianownik, więc wyjście musi zdążyć do zera —
             // gdyby wchodziła też do licznika, zostałoby duże.
             let peak = got.iter().fold(0f32, |m, v| m.max(v.abs()));
-            assert!(peak < 1e-2, "kotwica nie wygasiła wyjścia (szczyt {peak:.3e})");
+            assert!(
+                peak < 1e-2,
+                "kotwica nie wygasiła wyjścia (szczyt {peak:.3e})"
+            );
         }
     }
 }
@@ -536,7 +557,9 @@ fn hc_sinkhorn_matches_the_cpu_reference() {
         for _ in 0..iters - 1 {
             for j in 0..hc {
                 let sum: f32 = want[j * hc..(j + 1) * hc].iter().sum();
-                want[j * hc..(j + 1) * hc].iter_mut().for_each(|v| *v /= sum + eps);
+                want[j * hc..(j + 1) * hc]
+                    .iter_mut()
+                    .for_each(|v| *v /= sum + eps);
             }
             norm_cols(&mut want);
         }
@@ -551,8 +574,12 @@ fn hc_sinkhorn_matches_the_cpu_reference() {
 
         // Własność docelowa: sumy wierszy i kolumn bliskie jedności.
         for j in 0..hc {
-            let row: f32 = (0..hc).map(|k| got_comb[token * hc * hc + j * hc + k]).sum();
-            let col: f32 = (0..hc).map(|k| got_comb[token * hc * hc + k * hc + j]).sum();
+            let row: f32 = (0..hc)
+                .map(|k| got_comb[token * hc * hc + j * hc + k])
+                .sum();
+            let col: f32 = (0..hc)
+                .map(|k| got_comb[token * hc * hc + k * hc + j])
+                .sum();
             assert!(
                 (row - 1.0).abs() < 1e-2 && (col - 1.0).abs() < 1e-2,
                 "macierz nie jest podwójnie stochastyczna: wiersz {row}, kolumna {col}"
@@ -572,8 +599,14 @@ fn hc_reduce_and_expand_match_the_cpu_reference() {
 
     let x = pattern(n_tokens * hc * dim, 61);
     let block_out = pattern(n_tokens * dim, 73);
-    let pre = pattern(n_tokens * hc, 17).iter().map(|v| v.abs() + 0.1).collect::<Vec<f32>>();
-    let post = pattern(n_tokens * hc, 19).iter().map(|v| v.abs() + 0.1).collect::<Vec<f32>>();
+    let pre = pattern(n_tokens * hc, 17)
+        .iter()
+        .map(|v| v.abs() + 0.1)
+        .collect::<Vec<f32>>();
+    let post = pattern(n_tokens * hc, 19)
+        .iter()
+        .map(|v| v.abs() + 0.1)
+        .collect::<Vec<f32>>();
     // Macierz niesymetryczna, żeby transpozycja była wykrywalna.
     let comb: Vec<f32> = (0..n_tokens * hc * hc)
         .map(|i| ((i * 13 % 7) as f32 + 1.0) * 0.11)

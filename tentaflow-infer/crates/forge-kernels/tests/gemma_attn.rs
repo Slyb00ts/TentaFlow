@@ -5,9 +5,9 @@
 // więc mają tu własną referencję CPU.
 
 use forge_hal::{DevBuffer, Device, Pool};
-use forge_types::MemKind;
 use forge_kernels::Kernels;
 use forge_types::DType;
+use forge_types::MemKind;
 use half::f16;
 use std::sync::Arc;
 
@@ -31,9 +31,12 @@ fn device() -> Option<Arc<dyn Device>> {
 
 fn upload(dev: &dyn Device, v: &[f32]) -> DevBuffer {
     let h: Vec<f16> = v.iter().map(|&x| f16::from_f32(x)).collect();
-    let bytes =
-        unsafe { std::slice::from_raw_parts(h.as_ptr() as *const u8, std::mem::size_of_val(&h[..])) };
-    let buf = dev.alloc(bytes.len(), MemKind::Device, Pool::Activations).unwrap();
+    let bytes = unsafe {
+        std::slice::from_raw_parts(h.as_ptr() as *const u8, std::mem::size_of_val(&h[..]))
+    };
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Activations)
+        .unwrap();
     dev.write(bytes, &buf, 0).unwrap();
     buf
 }
@@ -113,7 +116,11 @@ fn attn_prefill_matches_reference_for_gemma_shapes() {
     let page_size = 32usize;
 
     // (head_dim, n_q_heads, n_kv_heads, window) — globalna i okienna warstwa.
-    for &(head_dim, n_q, n_kv, window) in &[(512usize, 16usize, 1usize, 0usize), (256, 16, 8, 1024), (256, 4, 2, 3)] {
+    for &(head_dim, n_q, n_kv, window) in &[
+        (512usize, 16usize, 1usize, 0usize),
+        (256, 16, 8, 1024),
+        (256, 4, 2, 3),
+    ] {
         let n_tokens = 20usize;
         let pages = n_tokens.div_ceil(page_size);
         let ctx = pages * page_size;
@@ -137,8 +144,21 @@ fn attn_prefill_matches_reference_for_gemma_shapes() {
 
         kernels
             .attn_prefill(
-                &ob, &qb, &kb, &vb, &ptb, 0, n_tokens, n_q, n_kv, head_dim, page_size,
-                DType::F16, 1.0, window, &stream,
+                &ob,
+                &qb,
+                &kb,
+                &vb,
+                &ptb,
+                0,
+                n_tokens,
+                n_q,
+                n_kv,
+                head_dim,
+                page_size,
+                DType::F16,
+                1.0,
+                window,
+                &stream,
             )
             .unwrap();
         dev.synchronize().unwrap();
@@ -199,7 +219,9 @@ fn gemm_q4_0_matches_cpu_for_gemma_projections() {
         let (raw, deq) = build_q4_0(rows, cols);
         let x: Vec<f32> = (0..n_tokens * cols).map(|i| fill(i) * 0.1).collect();
 
-        let wb = dev.alloc(raw.len(), MemKind::Device, Pool::Weights).unwrap();
+        let wb = dev
+            .alloc(raw.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
         dev.write(&raw, &wb, 0).unwrap();
         let xb = upload(dev.as_ref(), &x);
         let yb = upload(dev.as_ref(), &vec![0.0; n_tokens * rows]);
@@ -213,9 +235,7 @@ fn gemm_q4_0_matches_cpu_for_gemma_projections() {
         // Kilka wierszy na token wystarcza, a pełne 3840x11 na CPU byłoby wolne.
         for t in [0usize, 1, n_tokens - 1] {
             for r in [0usize, 1, 2, rows / 2, rows - 1] {
-                let want: f32 = (0..cols)
-                    .map(|c| deq[r * cols + c] * x[t * cols + c])
-                    .sum();
+                let want: f32 = (0..cols).map(|c| deq[r * cols + c] * x[t * cols + c]).sum();
                 let rel = (got[t * rows + r] - want).abs() / (want.abs() + 1.0);
                 assert!(
                     rel < 0.03,
@@ -226,7 +246,6 @@ fn gemm_q4_0_matches_cpu_for_gemma_projections() {
         }
     }
 }
-
 
 /// Odtwarza kwantyzacje aktywacji q8_1 (skala na 32 kolumny, `d = amax/127`),
 /// ktora ścieżka int8 wykonuje przed GEMM. Referencja MUSI ja uwzgledniac —
@@ -302,7 +321,9 @@ fn gemm_q6_k_matches_canonical_dequant_shapes() {
         } else {
             x.clone()
         };
-        let wb = dev.alloc(raw.len(), MemKind::Device, Pool::Weights).unwrap();
+        let wb = dev
+            .alloc(raw.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
         dev.write(&raw, &wb, 0).unwrap();
         let xb = upload(dev.as_ref(), &x);
         let yb = upload(dev.as_ref(), &vec![0.0; n_tokens * rows]);
@@ -336,7 +357,10 @@ fn gemm_q6_k_matches_canonical_dequant_shapes() {
         // `want` 1,8e-3 przy członach rzędu 1 — daje to kilka procent błędu
         // WZGLĘDNEGO bez żadnej usterki kernela, więc ostrzejszy próg mierzyłby
         // cancellation, a nie kernel.
-        assert!(worst < 0.05, "rows={rows} cols={cols} T={n_tokens} rel={worst}");
+        assert!(
+            worst < 0.05,
+            "rows={rows} cols={cols} T={n_tokens} rel={worst}"
+        );
     }
 }
 
@@ -388,23 +412,27 @@ fn attn_decode_split_matches_generic() {
 
             kernels
                 .attn_decode_f16(
-                    &ob, &parts, &qb, &kb, &vb, &pt, &lens, 1, n_q, n_kv, head_dim,
-                    page_size, pages, 1.0, window, &stream,
+                    &ob, &parts, &qb, &kb, &vb, &pt, &lens, 1, n_q, n_kv, head_dim, page_size,
+                    pages, 1.0, window, &stream,
                 )
                 .unwrap();
             dev.synchronize().unwrap();
             let got = download(dev.as_ref(), &ob, n_q * head_dim);
 
             // Referencja: pełna uwaga po widocznym oknie, liczona na hoście.
-            let first = if window > 0 && ctx > window { ctx - window } else { 0 };
+            let first = if window > 0 && ctx > window {
+                ctx - window
+            } else {
+                0
+            };
             let per_kv = n_q / n_kv;
             let mut want = vec![0.0f32; n_q * head_dim];
             for h in 0..n_q {
                 let kvh = h / per_kv;
                 let mut scores = Vec::new();
                 for pos in first..ctx {
-                    let base = ((pos / page_size * n_kv + kvh) * page_size + pos % page_size)
-                        * head_dim;
+                    let base =
+                        ((pos / page_size * n_kv + kvh) * page_size + pos % page_size) * head_dim;
                     let dot: f32 = (0..head_dim)
                         .map(|d| q[h * head_dim + d] * k[base + d])
                         .sum();
@@ -416,8 +444,7 @@ fn attn_decode_split_matches_generic() {
                 for d in 0..head_dim {
                     let mut acc = 0.0f32;
                     for (i, pos) in (first..ctx).enumerate() {
-                        let base = ((pos / page_size * n_kv + kvh) * page_size
-                            + pos % page_size)
+                        let base = ((pos / page_size * n_kv + kvh) * page_size + pos % page_size)
                             * head_dim;
                         acc += exps[i] * v[base + d];
                     }

@@ -58,7 +58,10 @@ fn the_hybrid_checkpoint_describes_itself() {
     // autoregressive stack does not run.
     assert_eq!(desc.layers.len(), 40);
     assert_eq!(desc.layer_kinds.len(), 40);
-    assert!(desc.mtp.is_some(), "głowa MTP ma być OPISANA, choć nieliczona");
+    assert!(
+        desc.mtp.is_some(),
+        "głowa MTP ma być OPISANA, choć nieliczona"
+    );
 
     // Every fourth block mixes with attention, the rest with DeltaNet. Checked
     // as the whole sequence rather than as a count: thirty DeltaNet layers in

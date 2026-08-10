@@ -12,8 +12,8 @@ use std::time::{Duration, Instant};
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
 use forge_engine::speculation::{SpeculationCoordinator, SpeculativeConfig, SpeculativeState};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::Tokenizer;
 use half::f16;
 
@@ -737,7 +737,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         &path,
         ModelConfig {
             weight_host_budget: 0,
-weight_spill_dir: None,
+            weight_spill_dir: None,
             kv_page_size: 32,
             kv_pages: max_seq_len.div_ceil(32) + 2,
             max_seq_len,

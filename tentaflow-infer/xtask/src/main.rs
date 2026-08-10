@@ -79,7 +79,8 @@ fn lint(root: &Path, update: bool) -> ExitCode {
             for file in files {
                 scanned += 1;
                 let measured = (rule.eval)(file);
-                let allowed = baseline::allowance(&base, rule.id, &file.rel, rule.default_allowance);
+                let allowed =
+                    baseline::allowance(&base, rule.id, &file.rel, rule.default_allowance);
 
                 if measured.metric > allowed {
                     violations.push(Violation {
@@ -138,7 +139,9 @@ fn report(
         println!("\n=== {} [{}] ===", rule.title, rule.id);
         println!("    dlaczego: {}", rule.why);
         if rule.review_only {
-            println!("    UWAGA: reguła heurystyczna — wynik wymaga przeglądu, nie jest dowodem usterki");
+            println!(
+                "    UWAGA: reguła heurystyczna — wynik wymaga przeglądu, nie jest dowodem usterki"
+            );
         }
         for v in hits.iter().take(25) {
             println!(

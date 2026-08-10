@@ -9,7 +9,15 @@ pub fn entries() -> Vec<ProfileEntry> {
     llama.chat_template = true;
 
     vec![
-        ProfileEntry { arch: "llama", name_needle: "mistral", profile: mistral },
-        ProfileEntry { arch: "llama", name_needle: "", profile: llama },
+        ProfileEntry {
+            arch: "llama",
+            name_needle: "mistral",
+            profile: mistral,
+        },
+        ProfileEntry {
+            arch: "llama",
+            name_needle: "",
+            profile: llama,
+        },
     ]
 }

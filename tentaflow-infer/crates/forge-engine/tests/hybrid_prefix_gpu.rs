@@ -12,8 +12,8 @@ use std::time::Instant;
 use forge_engine::model::{Model, ModelConfig, MAX_PREFILL_CHUNK};
 use forge_formats::Gguf;
 use forge_hal::Device;
-use forge_hal::{PoolSizes, gpu};
-use forge_tokenize::{Tokenizer, gguf_vocab};
+use forge_hal::{gpu, PoolSizes};
+use forge_tokenize::{gguf_vocab, Tokenizer};
 
 mod common;
 
@@ -138,12 +138,22 @@ fn pozyczony_prefiks_daje_ten_sam_ciag_co_zimny() -> TestResult<()> {
         "hybryda z jedną rangą ma mieć aktywny prefiks współdzielony"
     );
     const LEAD: &str = "This inventory describes one machine. ";
-    let tokens = prompt(&path, LEAD, 12, "In one sentence, what does the last paragraph say?")?;
+    let tokens = prompt(
+        &path,
+        LEAD,
+        12,
+        "In one sentence, what does the last paragraph say?",
+    )?;
 
     // Rozgrzewka łapie kompilację grafów i zegar karty, ale MUSI iść innym
     // tekstem od pierwszego tokenu — inaczej to ona zapełniłaby drzewo i
     // „zimny" przebieg zaczynałby od pożyczki.
-    let warmup = prompt(&path, "A different machine entirely. ", 9, "Name one property.")?;
+    let warmup = prompt(
+        &path,
+        "A different machine entirely. ",
+        9,
+        "Name one property.",
+    )?;
     greedy(&mut model, &warmup)?;
 
     let (cold, cold_read, cold_s) = greedy(&mut model, &tokens)?;
@@ -171,7 +181,12 @@ fn pozyczony_prefiks_daje_ten_sam_ciag_co_zimny() -> TestResult<()> {
     // Rodzeństwo: ten sam początek, rozjazd w POŁOWIE — dokładnie ten przypadek,
     // dla którego jeden checkpoint na końcu promptu jest bezużyteczny. Pożyczka
     // musi tu stanąć na checkpoincie pośrednim.
-    let sibling = prompt(&path, LEAD, 8, "In one sentence, what is a mixture of experts?")?;
+    let sibling = prompt(
+        &path,
+        LEAD,
+        8,
+        "In one sentence, what is a mixture of experts?",
+    )?;
     let (_, sibling_read, sibling_s) = greedy(&mut model, &sibling)?;
     println!("rodzeństwo prefiksu: {sibling_read} tok z cache'u, prefill {sibling_s:.3} s");
     assert!(
