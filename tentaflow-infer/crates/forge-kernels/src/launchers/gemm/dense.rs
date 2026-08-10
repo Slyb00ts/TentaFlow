@@ -1167,10 +1167,19 @@ impl Kernels {
         if self.device.caps().warp_size != 32 {
             return Ok(false);
         }
-        let name = if q6 {
-            format!("gemv_q6_k_dp4a_batch_b{n_tokens}")
+        // Dwa wiersze na warp dzielą JEDEN odczyt aktywacji. Przemiat czyta
+        // aktywację raz na blok, a bloków jest tyle co wierszy przez cztery —
+        // izolowany pomiar GB10 dawał 102 GB/s pasma wag przy jednym wierszu
+        // na warp i 139 GB/s przy dwóch.
+        let (name, rows_per_block) = if q6 {
+            (format!("gemv_q6_k_dp4a_batch_b{n_tokens}"), 4u32)
         } else {
-            format!("gemv_q4_k_dp4a_batch_b{n_tokens}")
+            let wide = format!("gemv_q4_k_dp4a_batch_r2_b{n_tokens}");
+            if self.artifacts.has(&wide) {
+                (wide, 8)
+            } else {
+                (format!("gemv_q4_k_dp4a_batch_b{n_tokens}"), 4)
+            }
         };
         let Ok(gk) = self.artifacts.get(&name) else {
             return Ok(false);
@@ -1189,7 +1198,7 @@ impl Kernels {
         }
         let sc = self.qk_batch_quantize(x, 0, cols, n_tokens, stream)?;
         let cfg = LaunchConfig {
-            grid: ((rows as u32).div_ceil(4), 1, 1),
+            grid: ((rows as u32).div_ceil(rows_per_block), 1, 1),
             block: (128, 1, 1),
             shared_mem_bytes: 0,
         };

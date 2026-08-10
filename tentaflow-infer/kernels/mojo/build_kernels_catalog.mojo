@@ -714,6 +714,10 @@ from src.decode_dp4a_batch import (
     gemv_q4_k_dp4a_batch_b4,
     gemv_q4_k_dp4a_batch_b8,
     gemv_q4_k_dp4a_batch_b16,
+    gemv_q4_k_dp4a_batch_r2_b2,
+    gemv_q4_k_dp4a_batch_r2_b4,
+    gemv_q4_k_dp4a_batch_r2_b8,
+    gemv_q4_k_dp4a_batch_r2_b16,
     gemv_q6_k_dp4a_batch_b2,
     gemv_q6_k_dp4a_batch_b4,
     gemv_q6_k_dp4a_batch_b8,
@@ -1777,6 +1781,26 @@ def main() raises:
         dump_asm=Path("gemv_q4_k_dp4a_batch_b8.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_b8"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_r2_b2,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_r2_b2.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_r2_b2"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_r2_b4,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_r2_b4.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_r2_b4"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_r2_b8,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_r2_b8.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_r2_b8"))
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_batch_r2_b16,
+        dump_asm=Path("gemv_q4_k_dp4a_batch_r2_b16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_batch_r2_b16"))
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_batch_b16,
         dump_asm=Path("gemv_q4_k_dp4a_batch_b16.ptx"),

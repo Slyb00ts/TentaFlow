@@ -1777,6 +1777,22 @@
       "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_7c99911747f39c6e",
       "file": "gemv_q4_k_dp4a_batch_b8.ptx"
     },
+    "gemv_q4_k_dp4a_batch_r2_b16": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_0790f76426826860",
+      "file": "gemv_q4_k_dp4a_batch_r2_b16.ptx"
+    },
+    "gemv_q4_k_dp4a_batch_r2_b2": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_3a36d1c60f86ca44",
+      "file": "gemv_q4_k_dp4a_batch_r2_b2.ptx"
+    },
+    "gemv_q4_k_dp4a_batch_r2_b4": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_c1a69f43915b4c11",
+      "file": "gemv_q4_k_dp4a_batch_r2_b4.ptx"
+    },
+    "gemv_q4_k_dp4a_batch_r2_b8": {
+      "entry": "src_decode_dp4a_batch_gemv_q4_6A6A6A6A_67b8f79c174fb1e7",
+      "file": "gemv_q4_k_dp4a_batch_r2_b8.ptx"
+    },
     "gemv_q4_k_dp4a_f16": {
       "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_3c3287a0806d4cf4",
       "file": "gemv_q4_k_dp4a_f16.ptx"

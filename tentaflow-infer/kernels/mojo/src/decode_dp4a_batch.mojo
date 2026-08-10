@@ -41,8 +41,8 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
     row_base = row * blocks_per_row * 144
     # Szesnaście wątków na superblok, nie osiem. Przy ośmiu każdy brał
     # szesnastobajtowy kawałek i miał dwa razy dłuższy łańcuch zależności przy
-    # połowie ładowań w locie — a ten kernel siedział na 34% pasma i nie
-    # reagował ani na liczbę warpów w bloku, ani na liczbę wierszy na warp.
+    # połowie ładowań w locie. Dopiero po tym podziale opłaciło się dawać
+    # warpowi więcej niż jeden wiersz — patrz wariant `_r2`.
     p = lane % 16
     c = p // 4
     quarter = p % 4
@@ -92,6 +92,93 @@ def gemv_q4_k_dp4a_batch_impl[token_tile: Int](
         total = warp.sum(acc[token] - mins[token])
         if lane == 0 and token < n_tokens:
             y[token * n_rows + row] = Float16(total)
+
+
+def gemv_q4_k_dp4a_batch_r2_impl[token_tile: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xs: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Two weight rows per warp, one activation read for both.
+
+    The sweep spends more of its memory pipe re-reading the activation than
+    reading weights — every block reads the whole thing, and there are as many
+    blocks as there are rows over four. Two rows in one warp use the SAME
+    activation words, so the read is issued once and serves both.
+    """
+    comptime R = 2
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    row0 = Int(block_idx.x) * (ROWS_PER_BLOCK * R) + wid * R
+    if row0 >= n_rows:
+        return
+
+    blocks_per_row = n_cols // 256
+    p = lane % 16
+    c = p // 4
+    quarter = p % 4
+
+    var acc = InlineArray[Float32, R * token_tile](fill=0.0)
+    var mins = InlineArray[Float32, R * token_tile](fill=0.0)
+    var xv = InlineArray[Int32, 4 * token_tile](fill=0)
+    var b = lane // 16
+    while b < blocks_per_row:
+        seg = b * 8 + 2 * c
+        comptime for token in range(token_tile):
+            if token < n_tokens:
+                xqi = (xq_g + token * n_cols).bitcast[Int32]()
+                comptime for t in range(2):
+                    xv[token * 4 + t] = xqi[seg * 8 + quarter * 2 + t]
+                    xv[token * 4 + 2 + t] = xqi[seg * 8 + 8 + quarter * 2 + t]
+        comptime for r in range(R):
+            if row0 + r < n_rows:
+                off = (row0 + r) * blocks_per_row * 144 + b * 144
+                dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
+                d = Float32(dm[0])
+                dmin = Float32(dm[1])
+                sc, mn = _q4k_scale_pair(w, off, c)
+                qv = (w + off + 16 + c * 32 + quarter * 8).bitcast[
+                    UInt32
+                ]().load[width=2, alignment=8]()
+                comptime for token in range(token_tile):
+                    if token < n_tokens:
+                        var s_lo: Int32 = 0
+                        var s_hi: Int32 = 0
+                        comptime for t in range(2):
+                            q = Int32(qv[t])
+                            s_lo = _dp4a(
+                                q & 0x0F0F0F0F, xv[token * 4 + t], s_lo
+                            )
+                            s_hi = _dp4a(
+                                (q >> 4) & 0x0F0F0F0F,
+                                xv[token * 4 + 2 + t],
+                                s_hi,
+                            )
+                        i = r * token_tile + token
+                        acc[i] += d * sc[0] * xd[
+                            seg * n_tokens + token
+                        ] * Float32(s_lo)
+                        acc[i] += d * sc[1] * xd[
+                            (seg + 1) * n_tokens + token
+                        ] * Float32(s_hi)
+                        if quarter == 0:
+                            mins[i] += dmin * (
+                                mn[0] * xs[seg * n_tokens + token]
+                                + mn[1] * xs[(seg + 1) * n_tokens + token]
+                            )
+        b += 2
+
+    comptime for r in range(R):
+        comptime for token in range(token_tile):
+            total = warp.sum(acc[r * token_tile + token] - mins[r * token_tile + token])
+            if lane == 0 and token < n_tokens and row0 + r < n_rows:
+                y[token * n_rows + row0 + r] = Float16(total)
 
 
 def gemv_q6_k_dp4a_batch_impl[token_tile: Int, OUT: DType](
@@ -168,6 +255,10 @@ def gemv_q6_k_dp4a_batch_impl[token_tile: Int, OUT: DType](
 comptime gemv_q4_k_dp4a_batch_b2 = gemv_q4_k_dp4a_batch_impl[2]
 comptime gemv_q4_k_dp4a_batch_b4 = gemv_q4_k_dp4a_batch_impl[4]
 comptime gemv_q4_k_dp4a_batch_b8 = gemv_q4_k_dp4a_batch_impl[8]
+comptime gemv_q4_k_dp4a_batch_r2_b2 = gemv_q4_k_dp4a_batch_r2_impl[2]
+comptime gemv_q4_k_dp4a_batch_r2_b4 = gemv_q4_k_dp4a_batch_r2_impl[4]
+comptime gemv_q4_k_dp4a_batch_r2_b8 = gemv_q4_k_dp4a_batch_r2_impl[8]
+comptime gemv_q4_k_dp4a_batch_r2_b16 = gemv_q4_k_dp4a_batch_r2_impl[16]
 comptime gemv_q4_k_dp4a_batch_b16 = gemv_q4_k_dp4a_batch_impl[16]
 comptime gemv_q6_k_dp4a_batch_b2 = gemv_q6_k_dp4a_batch_impl[2, DType.float16]
 comptime gemv_q6_k_dp4a_batch_b4 = gemv_q6_k_dp4a_batch_impl[4, DType.float16]
