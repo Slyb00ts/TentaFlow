@@ -1037,6 +1037,10 @@
       "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_ff33767d47de9a9c",
       "file": "gemm_q4_k_i8mma_bm64.ptx"
     },
+    "gemm_q4_k_i8mma_bn128": {
+      "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_8f62544f2db5336a",
+      "file": "gemm_q4_k_i8mma_bn128.ptx"
+    },
     "gemm_q4_k_i8mma_grouped": {
       "entry": "src_gemm_gemm_i8mma_grouped_im6A6A6A6A_0c26c8eba26625df",
       "file": "gemm_q4_k_i8mma_grouped.ptx"
@@ -1193,6 +1197,10 @@
       "entry": "src_gemm_gemm_q6_k_grouped_imp6A6A6A6A_c3198060855b4ff4",
       "file": "gemm_q6_k_f16_grouped_bm128_bn64.ptx"
     },
+    "gemm_q6_k_i8mma": {
+      "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_4a52bb97426f9b79",
+      "file": "gemm_q6_k_i8mma.ptx"
+    },
     "gemm_q8_0_dot4_128x128": {
       "entry": "src_gemm_dot_gemm_q8_0_dot4_im6A6A6A6A_2291ef814d618ce4",
       "file": "gemm_q8_0_dot4_128x128.ptx"
@@ -1280,6 +1288,10 @@
     "gemm_q8_0_i8mma_bm64": {
       "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_42b019b94dbff7fb",
       "file": "gemm_q8_0_i8mma_bm64.ptx"
+    },
+    "gemm_q8_0_i8mma_bn128": {
+      "entry": "src_gemm_gemm_i8mma_impl_SIM6A6A6A6AcB6A6A_9a04668d37aa926f",
+      "file": "gemm_q8_0_i8mma_bn128.ptx"
     },
     "gemm_q8_0_i8mma_grouped": {
       "entry": "src_gemm_gemm_i8mma_grouped_im6A6A6A6A_02a7d3521c96dbd0",

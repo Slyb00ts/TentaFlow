@@ -2902,6 +2902,30 @@ def _mma_s8(
     return SIMD[DType.int32, 4](r[0], r[1], r[2], r[3])
 
 
+def _mma_s8_k16(
+    a0: UInt32,
+    a1: UInt32,
+    b0: UInt32,
+    c: SIMD[DType.int32, 4],
+) -> SIMD[DType.int32, 4]:
+    """Half-k twin of `_mma_s8`, for a format whose scale changes every 16 columns.
+
+    The two share their operands exactly: registers {a0,a1} of the k=32 A
+    fragment are the k=16 fragment of columns 0..15 and {a2,a3} the fragment of
+    columns 16..31, with b0/b1 splitting the same way. So a Q6_K tile stages and
+    reads shared memory like a Q4_K one and only pays a second mma issue."""
+    var r = inlined_assembly[
+        (
+            "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {$0, $1, $2,"
+            " $3}, {$4, $5}, {$6}, {$7, $8, $9, $10};"
+        ),
+        _RegisterPackType[Int32, Int32, Int32, Int32],
+        constraints="=r,=r,=r,=r,r,r,r,r,r,r,r",
+        has_side_effect=False,
+    ](a0, a1, b0, c[0], c[1], c[2], c[3])
+    return SIMD[DType.int32, 4](r[0], r[1], r[2], r[3])
+
+
 def quantize_act_q8_1(
     xq: UnsafePointer[Int8, MutAnyOrigin],
     xd: UnsafePointer[Float32, MutAnyOrigin],
@@ -2975,7 +2999,7 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     comptime N_WARPS = NW // M_WARPS
     comptime NT_PER_WARP = (BN // 8) // N_WARPS
     comptime NTHREADS = NW * 32
-    comptime BLK_BYTES = 34 if FMT == 0 else 144
+    comptime BLK_BYTES = 34 if FMT == 0 else (210 if FMT == 2 else 144)
     comptime BPR_DIV = 32 if FMT == 0 else 256
     # Sub-blocks of 32 columns staged, and computed, between two barriers.
     #
@@ -2995,7 +3019,7 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     # W staging: 4 threads per row -> NTHREADS/4 rows per pass.
     comptime W_ROWS_PER_PASS = NTHREADS // 4
     comptime W_PASSES = BN // W_ROWS_PER_PASS
-    comptime W_CODES = 8 if FMT == 0 else 32
+    comptime W_CODES = 8 if FMT == 0 else (16 if FMT == 2 else 32)
     comptime W_WORDS = W_CODES // 4
     comptime W_QOFF = 2 if FMT == 0 else 16
     # X staging unit = one token's 32 columns; the block covers BM*KS of them.
@@ -3073,6 +3097,14 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
         fill=SIMD[DType.uint32, W_WORDS](0)
     )
     var wsc = InlineArray[Float16, W_PASSES](fill=Float16(0))
+    # Q6_K splits its codes over two planes (ql nibbles) plus a two-bit plane in
+    # qh, and carries eight signed scales per half superblock.
+    var wqh = InlineArray[SIMD[DType.uint32, 4], W_PASSES](
+        fill=SIMD[DType.uint32, 4](0)
+    )
+    var wsix = InlineArray[SIMD[DType.uint8, 8], W_PASSES](
+        fill=SIMD[DType.uint8, 8](0)
+    )
     var whdr = InlineArray[SIMD[DType.uint8, 16], W_PASSES](
         fill=SIMD[DType.uint8, 16](0)
     )
@@ -3094,7 +3126,31 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
                 comptime if FMT == 1:
                     xsv_g[p] = xsm_g[(sidx * KS + sb) * n_tokens + xtok_c[p]]
         comptime for p in range(W_PASSES):
-            comptime if FMT == 0:
+            comptime if FMT == 2:
+                # One stage is one half superblock, so every staging thread reads
+                # its own sixteen ql bytes and the sixteen qh bytes that carry
+                # their top two bits. A 210-byte block is only 2-aligned, hence
+                # the uint16 loads.
+                nhalf = sidx % 2
+                nsb6 = sidx // 2
+                base6 = wrow_base[p] + nsb6 * 210
+                wcodes[p] = bitcast[DType.uint32, W_WORDS](
+                    (w + base6 + nhalf * 64 + 16 * part)
+                    .bitcast[UInt16]()
+                    .load[width=8, alignment=2]()
+                )
+                wqh[p] = bitcast[DType.uint32, 4](
+                    (w + base6 + 128 + nhalf * 32 + 16 * (part % 2))
+                    .bitcast[UInt16]()
+                    .load[width=8, alignment=2]()
+                )
+                wsix[p] = (w + base6 + 192 + nhalf * 8).load[
+                    width=8, alignment=2
+                ]()
+                wsc[p] = (w + base6 + 208).bitcast[Float16]().load[
+                    width=1, alignment=2
+                ]()[0]
+            elif FMT == 0:
                 wcodes[p] = bitcast[DType.uint32, W_WORDS](
                     (
                         w + wrow_base[p] + sidx * 34 + W_QOFF + part * W_CODES
@@ -3141,7 +3197,44 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
 
         comptime for p in range(W_PASSES):
             rl = p * W_ROWS_PER_PASS + row_l
-            comptime if FMT == 0:
+            comptime if FMT == 2:
+                # `part` owns sub-blocks mlo and mlo+2 over sixteen columns each:
+                # the low nibble of its ql bytes plus one two-bit field of qh,
+                # then the high nibble plus the field two positions up. Codes go
+                # to shared already biased by -32, so the mma needs no fixup.
+                mlo = part // 2
+                col0 = 16 * (part % 2)
+                ql8 = bitcast[DType.uint8, 16](wcodes[p])
+                qh8 = bitcast[DType.uint8, 16](wqh[p])
+                var clo = SIMD[DType.int8, 16](0)
+                var chi = SIMD[DType.int8, 16](0)
+                comptime for i in range(16):
+                    hb = Int(qh8[i])
+                    qb6 = Int(ql8[i])
+                    lo = (qb6 & 0x0F) | (((hb >> (2 * mlo)) & 3) << 4)
+                    hi = (qb6 >> 4) | (((hb >> (2 * mlo + 4)) & 3) << 4)
+                    clo[i] = Int8(lo - 32)
+                    chi[i] = Int8(hi - 32)
+                (wq + mlo * BN * 32 + rl * 32 + col0).store[alignment=16](clo)
+                (wq + (mlo + 2) * BN * 32 + rl * 32 + col0).store[alignment=16](
+                    chi
+                )
+                if part % 2 == 0:
+                    dsix = Float32(wsc[p])
+                    sc8 = bitcast[DType.int8, 8](wsix[p])
+                    (wdm + (mlo * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            dsix * Float32(Int(sc8[2 * mlo])),
+                            dsix * Float32(Int(sc8[2 * mlo + 1])),
+                        )
+                    )
+                    (wdm + ((mlo + 2) * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            dsix * Float32(Int(sc8[2 * mlo + 4])),
+                            dsix * Float32(Int(sc8[2 * mlo + 5])),
+                        )
+                    )
+            elif FMT == 0:
                 if part == 0:
                     (wdm + rl * 2).store[alignment=8](
                         SIMD[DType.float32, 2](Float32(wsc[p]), 0.0)
@@ -3228,18 +3321,34 @@ def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
                 ]()
                 dwv = SIMD[DType.float32, 4](q4[0], q4[2], q4[0], q4[2])
                 var mnv = SIMD[DType.float32, 4](0)
-                comptime if FMT == 1:
+                comptime if FMT != 0:
                     mnv = SIMD[DType.float32, 4](q4[1], q4[3], q4[1], q4[3])
                 comptime for mi in range(MT_PER_WARP):
-                    mres = _mma_s8(
-                        ai[mi][0], ai[mi][1], ai[mi][2], ai[mi][3],
-                        bi[0], bi[1], SIMD[DType.int32, 4](0),
-                    )
-                    acc[mi * NT_PER_WARP + nti] += (
-                        dxv[mi] * dwv * mres.cast[DType.float32]()
-                    )
-                    comptime if FMT == 1:
-                        acc[mi * NT_PER_WARP + nti] -= mnv * xsv[mi]
+                    comptime if FMT == 2:
+                        # Two scales per 32 columns, so two half-k products on
+                        # the same fragments; `dwv`/`mnv` carry the pair.
+                        rlo = _mma_s8_k16(
+                            ai[mi][0], ai[mi][1], bi[0],
+                            SIMD[DType.int32, 4](0),
+                        )
+                        rhi = _mma_s8_k16(
+                            ai[mi][2], ai[mi][3], bi[1],
+                            SIMD[DType.int32, 4](0),
+                        )
+                        acc[mi * NT_PER_WARP + nti] += dxv[mi] * (
+                            dwv * rlo.cast[DType.float32]()
+                            + mnv * rhi.cast[DType.float32]()
+                        )
+                    else:
+                        mres = _mma_s8(
+                            ai[mi][0], ai[mi][1], ai[mi][2], ai[mi][3],
+                            bi[0], bi[1], SIMD[DType.int32, 4](0),
+                        )
+                        acc[mi * NT_PER_WARP + nti] += (
+                            dxv[mi] * dwv * mres.cast[DType.float32]()
+                        )
+                        comptime if FMT == 1:
+                            acc[mi * NT_PER_WARP + nti] -= mnv * xsv[mi]
         s += 1
 
     comptime for mi in range(MT_PER_WARP):
@@ -3474,9 +3583,13 @@ comptime gemm_q6_k_f16_grouped_bm128_bn64 = gemm_q6_k_grouped_impl[128, 8]
 comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 64, 8, 0]
 comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 0]
 comptime gemm_q8_0_i8mma_big = gemm_i8mma_impl[128, 128, 16, 0]
+comptime gemm_q8_0_i8mma_bn128 = gemm_i8mma_impl[128, 128, 8, 0]
 comptime gemm_q4_k_i8mma = gemm_i8mma_impl[128, 64, 8, 1]
 comptime gemm_q4_k_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 1]
 comptime gemm_q4_k_i8mma_big = gemm_i8mma_impl[128, 128, 16, 1]
+comptime gemm_q4_k_i8mma_bn128 = gemm_i8mma_impl[128, 128, 8, 1]
+comptime gemm_q6_k_i8mma = gemm_i8mma_impl[128, 64, 8, 2]
+comptime gemm_q6_k_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 2]
 
 
 comptime gemm_f16_out_f32 = gemm_f16_out_f32_impl[128, 8]

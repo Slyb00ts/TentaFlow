@@ -372,11 +372,8 @@ impl Kernels {
                 "gemm_q6_k requires cols % 256 == 0, got {cols}"
             )));
         }
-        // Kafel WMMA czytający surowe superbloki Q6_K. Q6_K był jedynym
-        // K-kwantem bez wariantu macierzowego i schodził na `dot4`: profil
-        // prefillu 27B Q4_K_M na R9700 pokazał 25,4% czasu w `ffn_down`,
-        // 4,66 ms wobec 1,43 ms typowej projekcji Q4_K o tej samej liczbie
-        // mnożeń.
+        // Kafel WMMA czytający surowe superbloki Q6_K: na R9700 `ffn_down`
+        // schodził bez niego na `dot4` i zabierał 25,4% prefillu 27B.
         if self.gemm_kblock_wmma(
             "gemm_q6_k_wmma_f16",
             y,
@@ -390,13 +387,15 @@ impl Kernels {
         )? {
             return Ok(());
         }
-        // Rodzina `gemm_q6_k_f16` dekwantyzuje wagi do f16 i mnoży na mma.
-        // Karta bez jednostki macierzowej idzie zamiast tego kaflem int8, co
-        // wymaga wcześniejszej kwantyzacji aktywacji — tym zajmuje się
-        // `gemm_i8mma_run`, a właściwy kafel wybiera `gemm_dot4_tile`.
-        if self
-            .gemm_dot4_tile("gemm_q6_k_i8mma", false, rows, n_tokens)
-            .is_some()
+        // Kafel int8: ten sam staging co Q4_K, ale skala zmienia się co
+        // szesnaście kolumn, więc mma idzie dwoma połowami k. Bez niego Q6_K
+        // jako jedyny format prefillu dekwantyzował wagi do f16: na GB10
+        // `ffn_down` kosztował 3,50 ms wobec 1,45 ms Q4_K o tylu samych
+        // mnożeniach. Próg to najwęższy wsad z pełną geometrią BM=128.
+        if (n_tokens >= 256 && self.artifacts.has("gemm_q6_k_i8mma"))
+            || self
+                .gemm_dot4_tile("gemm_q6_k_i8mma", false, rows, n_tokens)
+                .is_some()
         {
             return self.gemm_i8mma_run(
                 "gemm_q6_k_i8mma",

@@ -310,6 +310,8 @@ from src.q8_single_big_poststage import (
 )
 from src.gemm import quantize_act_q8_1
 from src.gemm import gemm_q4_k_i8mma, gemm_q4_k_i8mma_bm64, gemm_q4_k_i8mma_big
+from src.gemm import gemm_q4_k_i8mma_bn128, gemm_q8_0_i8mma_bn128
+from src.gemm import gemm_q6_k_i8mma
 from src.gemm_fp8 import (
     silu_mul_quant_fp8,
     gemm_fp8_f16,
@@ -2722,6 +2724,24 @@ def main() raises:
         gemm_q4_k_i8mma_big, dump_asm=Path("gemm_q4_k_i8mma_big.ptx")
     ]()
     entries.append(_finalize(out_dir, "gemm_q4_k_i8mma_big"))
+
+    # arch: nvidia
+    _ = ctx.compile_function[
+        gemm_q4_k_i8mma_bn128, dump_asm=Path("gemm_q4_k_i8mma_bn128.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q4_k_i8mma_bn128"))
+
+    # arch: nvidia
+    _ = ctx.compile_function[
+        gemm_q8_0_i8mma_bn128, dump_asm=Path("gemm_q8_0_i8mma_bn128.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q8_0_i8mma_bn128"))
+
+    # arch: nvidia
+    _ = ctx.compile_function[
+        gemm_q6_k_i8mma, dump_asm=Path("gemm_q6_k_i8mma.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "gemm_q6_k_i8mma"))
 
     _ = ctx.compile_function[
         attn_decode_split_f16_hd64,

@@ -978,13 +978,24 @@ impl Kernels {
         n_tokens: usize,
     ) -> Result<(&KernelHandle, u32, u32, u32)> {
         let big_blocks = rows.div_ceil(128) * n_tokens.div_ceil(128);
-        if n_tokens >= 1024 && big_blocks >= 256 {
-            let wide = self.artifacts.get(&format!("{base}_big"))?;
+        let wide_name = format!("{base}_big");
+        if n_tokens >= 1024 && big_blocks >= 256 && self.artifacts.has(&wide_name) {
+            let wide = self.artifacts.get(&wide_name)?;
             if Self::block_fits(wide, 512) {
                 return Ok((wide, 128, 128, 512));
             }
         }
         if n_tokens >= 256 {
+            // Ta sama geometria co `_big`, ale w ośmiu warpach zamiast
+            // szesnastu: karta, której rejestry nie mieszczą bloku 512-wątkowego,
+            // schodziła przez to na BN=64 i czytała aktywację dwa razy częściej.
+            let half_warps = format!("{base}_bn128");
+            if self.artifacts.has(&half_warps) {
+                let wide = self.artifacts.get(&half_warps)?;
+                if Self::block_fits(wide, 256) {
+                    return Ok((wide, 128, 128, 256));
+                }
+            }
             return Ok((self.artifacts.get(base)?, 128, 64, 256));
         }
         Ok((self.artifacts.get(&format!("{base}_bm64"))?, 64, 64, 256))
