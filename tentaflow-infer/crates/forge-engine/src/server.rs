@@ -689,12 +689,6 @@ pub fn spawn_engine_batched(
     } else {
         batch_min
     };
-    // Bez tego „batch nie wchodzi" i „batch nie pomaga" wyglądają identycznie:
-    // płaska przepustowość zbiorcza przy rosnącej liczbie sekwencji.
-    if model.is_hybrid() {
-        let batched_decode = model.hybrid_batch_capable();
-        tracing::info!(batched_decode, "hybrydowy batch dekodowania");
-    }
     let native_mtp_b2 = parse_native_mtp_b2(std::env::var("FORGE_NATIVE_MTP_B2").ok().as_deref())?;
     let mtp_ngram_mode =
         parse_mtp_ngram_batch(std::env::var("FORGE_MTP_NGRAM_BATCH").ok().as_deref())?;
@@ -780,7 +774,13 @@ pub fn spawn_engine_batched(
         );
     }
     if model.is_hybrid() {
+        // Inaczej „batch nie wchodzi" i „batch nie pomaga" wyglądają identycznie.
+        let batched_decode = model.hybrid_batch_capable();
+        tracing::info!(batched_decode, "hybrydowy batch dekodowania");
         model.preflight_hybrid_state_slots(max_active)?;
+        // Pula aktywacji nie zwalnia buforów, więc leniwy wzrost zostawiał w niej
+        // każdy poprzedni komplet — wymiar bierzemy raz, z najszerszego kawałka.
+        model.ensure_hybrid_prefill_capacity(prefill_chunk.min(MAX_PREFILL_CHUNK))?;
         if max_active >= 2 && spec.kind() == SpeculationKind::Off && model.hybrid_batch_capable()
         {
             model.ensure_batch(max_active)?;

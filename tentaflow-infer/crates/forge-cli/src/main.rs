@@ -1071,12 +1071,11 @@ fn pool_reserve_bytes(kv_bytes: usize, activation_bytes: usize) -> Result<usize>
 
 /// Ładuje model w stałym układzie pul `serve`.
 #[allow(clippy::too_many_arguments)]
-fn activation_pool_bytes(_native_mtp: bool, hybrid: bool) -> usize {
-    if hybrid {
-        9usize << 27
-    } else {
-        1usize << 30
-    }
+/// Baza plus część rosnąca z liczbą linii: verifier i prefill trzymają bufory na
+/// sekwencję, a stała nie zależała od niczego — przy 32 liniach brakowało pamięci.
+fn activation_pool_bytes(_native_mtp: bool, hybrid: bool, max_active: usize) -> usize {
+    let base = if hybrid { 9usize << 27 } else { 1usize << 30 };
+    base + max_active.saturating_sub(8) * (16usize << 20)
 }
 
 fn resolve_nvfp4_ct_layout(value: &str) -> Result<NvFp4CtLayoutPolicy> {
@@ -1099,6 +1098,7 @@ fn resolve_nvfp4_ct_layout_from_env() -> Result<NvFp4CtLayoutPolicy> {
 #[allow(clippy::too_many_arguments)]
 fn load_for_serve(
     path: &Path,
+    max_active: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
     weight_host_gb: f64,
@@ -1137,7 +1137,7 @@ fn load_for_serve(
     } else {
         0
     };
-    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some(), max_active);
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
     let free = gpu::free_vram(0).context("query free VRAM")?;
@@ -1305,6 +1305,7 @@ fn default_spill_dir() -> Result<std::path::PathBuf> {
 
 fn load_auto(
     path: &Path,
+    max_active: usize,
     weights_pool_gb: f64,
     weight_host_gb: f64,
     weight_spill_dir: Option<std::path::PathBuf>,
@@ -1336,7 +1337,7 @@ fn load_auto(
         kv_quant,
         native_mtp,
     )?;
-    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some());
+    let activations = activation_pool_bytes(native_mtp, desc.params.ssm.is_some(), max_active);
     // Automatycznie dobrany kontekst NIE MOZE zaglodzic wag. Kazdy token czyta
     // cale wagi, a strony KV zapelniaja sie dopiero wraz z dlugoscia sekwencji,
     // wiec oddanie rezydentnych wag za wiekszy kontekst jest zawsze zla
@@ -1534,6 +1535,7 @@ fn cmd_embed(
     let t0 = Instant::now();
     let loaded = load_auto(
         model_path,
+        1,
         weights_pool_gb,
         weight_host_gb,
         weight_spill_dir,
@@ -1711,6 +1713,7 @@ fn cmd_serve(
     let t0 = Instant::now();
     let (mut loaded, kv_pages, max_seq_len) = load_for_serve(
         model_path,
+        max_active,
         kv_pages,
         weights_pool_gb,
         weight_host_gb,
@@ -1867,17 +1870,11 @@ fn cmd_serve(
         .block_on(forge_server::serve(state, cfg.bind))
 }
 
-/// Drive one engine request to completion, invoking `on_text` per emitted
-/// piece. Returns counts, first visible token, completion and profil benchmarku.
-/// Token counts come from the engine's `Done` usage, not from counting text
-/// pieces. `first_token_at` is the first VISIBLE text event: the engine only
-/// emits `Token` for non-empty decoded pieces, so UTF-8/stop-holdback in the
-/// stream decoder can shift it a decode step or two past the true first
-/// sampled token.
-/// Wynik jednego przebiegu żądania. `cache_read_tokens` jest tu celowo
-/// widoczny: benchmark musi wiedzieć, ile tokenów promptu NIE zostało
-/// policzonych, bo inaczej raportuje przepustowość prefillu za prompt, którego
-/// nigdy nie przeliczył.
+/// Wynik jednego przebiegu żądania. Liczniki pochodzą z `Done` silnika, nie z
+/// liczenia kawałków tekstu, a `first_token_at` jest pierwszym WIDOCZNYM
+/// zdarzeniem, więc holdback dekodera może je przesunąć o krok czy dwa.
+/// `cache_read_tokens` jest widoczny celowo: bez niego benchmark raportuje
+/// przepustowość prefillu za prompt, którego nigdy nie przeliczył.
 struct DrainOutcome {
     generated: usize,
     prompt_tokens: usize,
@@ -1972,6 +1969,7 @@ fn cmd_run(
     let t0 = Instant::now();
     let mut loaded = load_auto(
         model_path,
+        1,
         weights_pool_gb,
         weight_host_gb,
         weight_spill_dir,
@@ -2141,6 +2139,7 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
     let t0 = Instant::now();
     let mut loaded = load_auto(
         model_path,
+        1,
         0.0,
         0.0,
         None,
@@ -2356,6 +2355,7 @@ fn cmd_bench(
     let t0 = Instant::now();
     let mut loaded = load_auto(
         model_path,
+        1,
         weights_pool_gb,
         weight_host_gb,
         weight_spill_dir,
@@ -2839,9 +2839,9 @@ mod speculation_cli_tests {
     }
 
     #[test]
-    fn model_hybrydowy_dostaje_pule_aktywacji_1152_mib() {
-        assert_eq!(activation_pool_bytes(true, true), 1152 << 20);
-        assert_eq!(activation_pool_bytes(false, true), 1152 << 20);
-        assert_eq!(activation_pool_bytes(true, false), 1 << 30);
+    fn pula_aktywacji_rosnie_z_liczba_linii() {
+        assert_eq!(activation_pool_bytes(true, true, 8), 1152 << 20);
+        assert_eq!(activation_pool_bytes(true, false, 8), 1 << 30);
+        assert_eq!(activation_pool_bytes(true, true, 32), (1152 << 20) + 24 * (16 << 20));
     }
 }
