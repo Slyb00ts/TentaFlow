@@ -16,6 +16,9 @@ impl Kernels {
         freq_factors: Option<&DevBuffer>,
         stream: &Stream,
     ) -> Result<()> {
+        if theta_base == 0.0 {
+            return Ok(());
+        }
         let k = self.artifacts.get(match freq_factors {
             // Rope proporcjonalne (warstwy globalne Gemmy) dzieli częstotliwość
             // każdej pary przez współczynnik z tensora `rope_freqs`.
@@ -54,6 +57,9 @@ impl Kernels {
         freq_factors: Option<&DevBuffer>,
         stream: &Stream,
     ) -> Result<()> {
+        if theta_base == 0.0 {
+            return Ok(());
+        }
         let k = self.artifacts.get(match freq_factors {
             // Rope proporcjonalne (warstwy globalne Gemmy) dzieli częstotliwość
             // każdej pary przez współczynnik z tensora `rope_freqs`.

@@ -490,6 +490,10 @@ impl Model {
             self.project(&pb.k, &projs[1], &pb.x, rows, shared_act, stream)?;
             self.project(&pb.v, &projs[2], &pb.x, rows, shared_act, stream)?;
 
+            if let Some(gate) = layer.attn().attn_gate.as_ref() {
+                self.gemm(&pb.o_out, gate, &pb.x, rows, stream)?;
+            }
+
             if l == 0 {
                 self.trace_f16("Qcur-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
                 self.trace_f16("Kcur-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
@@ -857,6 +861,16 @@ impl Model {
                     &pb.attn_out,
                     t * q_dim * 2,
                     m.b * q_dim * 2,
+                    stream,
+                )?;
+            }
+
+            if layer.attn().attn_gate.is_some() {
+                self.kernels.sigmoid_mul_f16(
+                    &pb.attn_out,
+                    &pb.attn_out,
+                    &pb.o_out,
+                    rows * q_dim,
                     stream,
                 )?;
             }
@@ -1605,6 +1619,10 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let layer = &self.weights.layers[l];
+
+        if let Some(gate) = layer.attn().attn_gate.as_ref() {
+            self.gemv(&b.o_out, gate, &b.x, stream)?;
+        }
         // Geometria bywa różna per warstwa (Gemma 4), więc szerokości i
         // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
         // policzone raz dla całego modelu wskazywały poza bufor warstwy.
@@ -1799,6 +1817,11 @@ impl Model {
                     stream,
                 )?;
             }
+        }
+
+        if layer.attn().attn_gate.is_some() {
+            self.kernels
+                .sigmoid_mul_f16(&b.attn_out, &b.attn_out, &b.o_out, q_dim, stream)?;
         }
 
         self.row_parallel_gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;

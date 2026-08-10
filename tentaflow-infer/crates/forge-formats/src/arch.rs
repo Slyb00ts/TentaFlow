@@ -53,6 +53,8 @@ pub enum WeightRole {
     AttnO,
     AttnQNorm,
     AttnKNorm,
+    /// Muse Glimmer's separate sigmoid gate over the attention output.
+    AttnGate,
     AttnNorm,
     FfnGate,
     FfnUp,
@@ -228,6 +230,16 @@ impl Hyperparams {
     /// Podstawa rope warstwy `layer`. Gemma 4 ma dwie: 1e4 dla warstw okiennych
     /// i 1e6 dla globalnych.
     pub fn rope_theta_at(&self, layer: usize) -> f32 {
+        if self.rope_sliding_only
+            && !self
+                .alt_attn
+                .as_ref()
+                .and_then(|alt| alt.sliding.get(layer))
+                .copied()
+                .unwrap_or(true)
+        {
+            return 0.0;
+        }
         match &self.alt_attn {
             Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.rope_theta_swa,
             _ => self.rope_theta,
@@ -241,6 +253,16 @@ impl Hyperparams {
             Some(alt) => !alt.sliding.get(layer).copied().unwrap_or(false),
             None => false,
         }
+    }
+
+    pub fn uses_rope_at(&self, layer: usize) -> bool {
+        !self.rope_sliding_only
+            || self
+                .alt_attn
+                .as_ref()
+                .and_then(|alt| alt.sliding.get(layer))
+                .copied()
+                .unwrap_or(true)
     }
 
     /// Czy warstwa `layer` w ogóle ma projekcję V. Warstwy globalne Gemmy 4 jej
@@ -349,6 +371,7 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/qwen35.ron"),
     include_str!("../arch/gemma4.ron"),
     include_str!("../arch/deepseek_v4.ron"),
+    include_str!("../arch/muse_glimmer.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -561,6 +584,8 @@ pub struct Hyperparams {
     /// Naprzemienna geometria uwagi (okno przesuwne + własny head_dim/KV);
     /// `None`, gdy wszystkie warstwy mają tę samą geometrię.
     pub alt_attn: Option<AltAttnParams>,
+    /// Muse Glimmer applies RoPE only on sliding-attention layers.
+    pub rope_sliding_only: bool,
     /// Ograniczenie logitów `softcap * tanh(x / softcap)` przed samplingiem
     /// (Gemma). 0 = wyłączone.
     pub final_logit_softcap: f32,
@@ -1104,6 +1129,7 @@ impl ModelDescriptor {
                 attn_gated: false,
             ffn_activation,
             alt_attn,
+            rope_sliding_only: arch == "muse-glimmer",
             final_logit_softcap,
             attn_logit_scale,
             embd_scale,
@@ -1246,6 +1272,7 @@ impl ModelDescriptor {
                 attn_gated: false,
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
+            rope_sliding_only: false,
             final_logit_softcap: 0.0,
             attn_logit_scale: None,
             embd_scale: None,
@@ -1572,6 +1599,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             attn_gated: true,
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
+            rope_sliding_only: false,
             final_logit_softcap: 0.0,
             attn_logit_scale: None,
             deepseek_v4: None,
@@ -1770,7 +1798,7 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 10);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
@@ -1780,6 +1808,7 @@ mod tests {
         assert_eq!(specs[6].name, "qwen35");
         assert_eq!(specs[7].name, "gemma4");
         assert_eq!(specs[8].name, "deepseek_v4");
+        assert_eq!(specs[9].name, "muse_glimmer");
         // The MoE specs carry the router + stacked-expert roles.
         assert!(specs[3]
             .roles
@@ -2658,6 +2687,7 @@ mod role_shard_tests {
             attn_gated: true,
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
+            rope_sliding_only: false,
             final_logit_softcap: 0.0,
             attn_logit_scale: None,
             deepseek_v4: None,

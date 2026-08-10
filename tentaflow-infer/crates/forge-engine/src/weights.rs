@@ -716,6 +716,8 @@ pub struct AttnWeights {
     /// Gemma normalizuje V czystą normą RMS, bez wyuczonej wagi. Trzymamy tu
     /// wektor jedynek zamiast osobnego kernela bez wagi — wynik jest ten sam.
     pub v_norm: Option<DevBuffer>,
+    /// Optional separate sigmoid gate used by Muse Glimmer.
+    pub attn_gate: Option<DevWeight>,
     pub attn_qkv: QkvWeights,
     pub attn_o: DevWeight,
 }
@@ -3541,6 +3543,15 @@ impl ModelWeights {
                     } else {
                         None
                     },
+                    attn_gate: match layer_map.get(&WeightRole::AttnGate) {
+                        Some(n) => Some(upload_target_weight(
+                            device,
+                            fetch_matrix(src, n)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?),
+                        None => None,
+                    },
                     attn_qkv,
                     attn_o: upload_target_weight(device, attn_o, target_tile, nvfp4_ct)?,
                 })),
@@ -3788,10 +3799,23 @@ impl ModelWeights {
                         target_tile,
                         nvfp4_ct,
                     )?;
+                    let attn_gate = descriptor
+                        .layers[idx]
+                        .get(&WeightRole::AttnGate)
+                        .map(|_| {
+                            upload_target_weight(
+                                device,
+                                sharded(WeightRole::AttnGate)?,
+                                target_tile,
+                                nvfp4_ct,
+                            )
+                        })
+                        .transpose()?;
                     LayerMixer::Attention(Box::new(AttnWeights {
                         q_norm: Some(upload_norm(device, src, name(WeightRole::AttnQNorm)?)?),
                         k_norm: Some(upload_norm(device, src, name(WeightRole::AttnKNorm)?)?),
                         v_norm: None,
+                        attn_gate,
                         attn_qkv: QkvWeights::Split { q, k, v },
                         attn_o,
                     }))
