@@ -1781,10 +1781,21 @@ fn cmd_serve(
     // The engine caps a sequence at the configured context; the model's own
     // positional limit is already folded into max_seq_len by resolve_ctx.
     let max_context = max_seq_len;
+    let chat_template = if matches!(
+        loaded.model.weights.descriptor.arch.as_str(),
+        "muse-glimmer" | "muse_glimmer"
+    ) {
+        // The GGUF template uses Jinja type tests and mapping helpers that the
+        // portable Forge template engine deliberately does not implement.
+        // Muse's text protocol only needs the role/content envelope here.
+        "{{ bos_token }}{% for message in messages %}<|start|>{{ message['role'] }}<|message|>{{ message['content'] }}<|eot|>{% endfor %}<|start|>assistant<|message|>".to_string()
+    } else {
+        loaded.chat_template.clone()
+    };
     let tool_parser = ToolParserKind::resolve(
         tool_call_parser.as_deref(),
         &loaded.model.weights.descriptor.arch,
-        &loaded.chat_template,
+        &chat_template,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     tracing::info!("tool-call parser: {tool_parser:?}");
@@ -1857,7 +1868,7 @@ fn cmd_serve(
         tokenizer,
         template_vars,
         eos_ids,
-        loaded.chat_template,
+        chat_template,
         max_context,
         max_active,
         tool_parser,
