@@ -70,7 +70,10 @@ impl Model {
                 let rank = &mut self.tp.as_mut().expect("podział sprawdzony").ranks[index];
                 let stream = rank.stream.clone();
                 if let Some(pool) = rank.hybrid_states.as_mut() {
-                    if let Err(error) = pool.release(lease, &stream) {
+                    let release = pool
+                        .lease_for_slot(lease.slot)
+                        .and_then(|rank_lease| pool.release(rank_lease, &stream));
+                    if let Err(error) = release {
                         tracing::error!(
                             "nie można zwolnić stanu hybrydowego rangi {}: {error}",
                             index + 1

@@ -275,6 +275,28 @@ impl HybridStatePool {
             self.allocate_slot()?;
         }
         let slot = self.free.pop().expect("wolny slot został przygotowany");
+        self.lease_slot(slot)
+    }
+
+    pub(crate) fn acquire_exact_slot(&mut self, slot: usize) -> Result<HybridStateLease> {
+        self.ensure_healthy()?;
+        while self.slots.len() <= slot {
+            self.allocate_slot()?;
+        }
+        let free = self
+            .free
+            .iter()
+            .position(|candidate| *candidate == slot)
+            .ok_or_else(|| {
+                ForgeError::Scheduler(format!(
+                    "slot stanu hybrydowego {slot} nie jest wolny na tej randze"
+                ))
+            })?;
+        self.free.remove(free);
+        self.lease_slot(slot)
+    }
+
+    fn lease_slot(&mut self, slot: usize) -> Result<HybridStateLease> {
         let state = &mut self.slots[slot];
         state.generation = state.generation.checked_add(1).ok_or_else(|| {
             ForgeError::Scheduler("licznik generacji stanu hybrydowego został wyczerpany".into())
@@ -298,6 +320,23 @@ impl HybridStatePool {
             ));
         }
         Ok(())
+    }
+
+    pub(crate) fn lease_for_slot(&self, slot: usize) -> Result<HybridStateLease> {
+        self.ensure_healthy()?;
+        let state = self
+            .slots
+            .get(slot)
+            .ok_or_else(|| ForgeError::Scheduler("nieprawidłowy slot stanu hybrydowego".into()))?;
+        if !state.in_use {
+            return Err(ForgeError::Scheduler(
+                "slot stanu hybrydowego nie ma aktywnego lease".into(),
+            ));
+        }
+        Ok(HybridStateLease {
+            slot,
+            generation: state.generation,
+        })
     }
 
     pub(crate) fn ensure_healthy(&self) -> Result<()> {
@@ -1009,6 +1048,64 @@ mod tests {
             .expect("odczyt ponownie użytego stanu powinien się udać");
         assert_eq!(bytes, [0; 16]);
         assert!(pool.release(first, &stream).is_err());
+    }
+
+    #[test]
+    fn dokladny_slot_ma_lokalna_generacje_na_niezaleznej_randze() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().expect("stream CPU powinien powstać");
+        let mut first = HybridStatePool::new(
+            device.clone(),
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+            0,
+        )
+        .expect("pierwsza pula powinna powstać");
+        let mut second = HybridStatePool::new(
+            device,
+            vec![LayerKind::DeltaNet],
+            DeltaStateLayout::KeyValue,
+            8,
+            16,
+            None,
+            0,
+        )
+        .expect("druga pula powinna powstać");
+
+        let old = first.acquire().expect("pierwszy lease powinien powstać");
+        first
+            .release(old, &stream)
+            .expect("pierwszy lease powinien się zwolnić");
+        let _ = first.acquire().expect("pierwszy slot powinien być zajęty");
+        let second_slot = first.acquire().expect("drugi slot powinien powstać");
+        first
+            .release(second_slot, &stream)
+            .expect("drugi slot powinien się zwolnić");
+        let rank_zero = first.acquire().expect("drugi slot powinien dać się przejąć");
+        let rank_one = second
+            .acquire_exact_slot(rank_zero.slot)
+            .expect("druga ranga powinna wydzierżawić ten sam slot");
+
+        assert_eq!(rank_one.slot, rank_zero.slot);
+        assert_ne!(rank_one.generation, rank_zero.generation);
+        assert_eq!(
+            second
+                .lease_for_slot(rank_zero.slot)
+                .expect("druga ranga powinna odczytać lokalny lease"),
+            rank_one
+        );
+        second
+            .release(
+                second
+                    .lease_for_slot(rank_zero.slot)
+                    .expect("lokalny lease powinien dać się zwolnić"),
+                &stream,
+            )
+            .expect("zwolnienie lokalnej generacji powinno przejść");
+        assert!(second.free.contains(&rank_zero.slot));
     }
 
     #[test]

@@ -45,15 +45,12 @@ impl Model {
                 ForgeError::Scheduler("ranga podziału nie ma puli stanów DeltaNet".into())
             })?;
             if fresh {
-                let mirrored = pool.acquire()?;
-                if mirrored != lease {
-                    return Err(ForgeError::Scheduler(format!(
-                        "ranga {} wzięła inny slot stanu DeltaNet niż ranga zerowa",
-                        index + 1
-                    )));
-                }
+                let mirrored = pool.acquire_exact_slot(lease.slot)?;
+                pool.activate(mirrored, &rank.stream)?;
+                continue;
             }
-            pool.activate(lease, &rank.stream)?;
+            let mirrored = pool.lease_for_slot(lease.slot)?;
+            pool.activate(mirrored, &rank.stream)?;
         }
         // Borrowed prefix: the pages are already attached, and this is where the
         // recurrent half of that prefix lands. It runs after `activate`, whose

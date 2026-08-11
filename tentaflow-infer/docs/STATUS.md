@@ -43,8 +43,10 @@ Ostatnia aktualizacja: 2026-07-25.
   przekroczył limit testu i nie jest wpisany jako wynik.
 
   `forge serve --tp 2` przeszedł realny POST HTTP 200 na GPU0+GPU1 (`world=2`)
-  dla Bielika. Brak P2P nie blokuje tej ścieżki, ale wynik TP2 nie był jeszcze
-  częścią powyższej macierzy przepustowości.
+  dla Bielika; P2P przechodzi z przepustowością 28,0 GB/s. Qwen 3.6 27B TP2
+  używa exact-slot dla lokalnych pul DeltaNet. HTTP C2: decode suma 72,82 tok/s,
+  TTFT suma 40,18 s i 126 lane; C4: decode suma 100,01 tok/s, TTFT 161,33 s i 252
+  lane. Wynik jednokartowy Qwen C1 wynosi 45,44 tok/s.
 
 - ✅ **Muse Glimmer: globalna uwaga i kanały odpowiedzi są rozdzielone (2026-08-11).**
   Loader nie zakłada już `V = K` na podstawie geometrii warstwy: wybiera własną
