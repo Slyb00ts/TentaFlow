@@ -2986,9 +2986,29 @@ fn fetch_embedding_host(
             *value *= output_scale;
         }
     }
-    let f16s = f32s.iter().map(|&v| f16::from_f32(v)).collect();
+    let f16s = f32s_to_f16_parallel(&f32s);
     let weight = quant_host_weight(name, data, dtype, quant, rows, cols, output_scale)?;
     Ok((f16s, weight, rows, cols))
+}
+
+fn f32s_to_f16_parallel(values: &[f32]) -> Vec<f16> {
+    const MIN_PARALLEL_VALUES: usize = 1 << 20;
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    if values.len() < MIN_PARALLEL_VALUES || workers < 2 {
+        return values.iter().map(|&value| f16::from_f32(value)).collect();
+    }
+    let chunk_len = values.len().div_ceil(workers);
+    let mut output = vec![f16::ZERO; values.len()];
+    std::thread::scope(|scope| {
+        for (input, output) in values.chunks(chunk_len).zip(output.chunks_mut(chunk_len)) {
+            scope.spawn(move || {
+                for (source, target) in input.iter().zip(output) {
+                    *target = f16::from_f32(*source);
+                }
+            });
+        }
+    });
+    output
 }
 
 /// Upload the embedding table as f16 regardless of storage quant.
@@ -4324,6 +4344,21 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_embedding_f16_conversion_matches_serial_for_tails() {
+        for len in [0usize, 1, 31, 32, 1_048_575, 1_048_576, 1_048_577] {
+            let values: Vec<f32> = (0..len)
+                .map(|index| f32::from_bits((index as u32).wrapping_mul(0x9e37_79b9)))
+                .collect();
+            let serial: Vec<f16> = values.iter().map(|&value| f16::from_f32(value)).collect();
+            let parallel = f32s_to_f16_parallel(&values);
+            assert!(parallel
+                .iter()
+                .zip(&serial)
+                .all(|(left, right)| left.to_bits() == right.to_bits()), "length {len}");
+        }
+    }
     use forge_formats::source::{Fp8Host, NvFp4Host, TensorFetch};
 
     struct Nvfp4EmbeddingSource {
