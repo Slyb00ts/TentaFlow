@@ -46,7 +46,12 @@ Ostatnia aktualizacja: 2026-07-25.
   dla Bielika; P2P przechodzi z przepustowością 28,0 GB/s. Qwen 3.6 27B TP2
   używa exact-slot dla lokalnych pul DeltaNet. HTTP C2: decode suma 72,82 tok/s,
   TTFT suma 40,18 s i 126 lane; C4: decode suma 100,01 tok/s, TTFT 161,33 s i 252
-  lane. Wynik jednokartowy Qwen C1 wynosi 45,44 tok/s.
+  lane. Wynik jednokartowy Qwen C1 wynosi 45,44 tok/s i TTFT 10,02 s.
+
+  Cache q8_1 aktywacji batch decode, mierzony na GPU1 dla Bielika Q4 tym samym
+  promptem i samplerem HTTP, dał C1/C2/C4 odpowiednio 64,03/108,87/148,17 tok/s
+  wobec 64,15/106,80/146,08 tok/s poprzedniej binarki. To jest pomiar małego
+  zysku współbieżnego, nie deklaracja uniwersalnej poprawy wszystkich modeli.
 
 - ✅ **Muse Glimmer: globalna uwaga i kanały odpowiedzi są rozdzielone (2026-08-11).**
   Loader nie zakłada już `V = K` na podstawie geometrii warstwy: wybiera własną

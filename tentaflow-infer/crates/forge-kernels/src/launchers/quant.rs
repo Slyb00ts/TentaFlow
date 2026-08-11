@@ -695,6 +695,7 @@ impl Kernels {
             .qk_batch
             .lock()
             .map_err(|_| ForgeError::Kernel("dp4a batch scratch poisoned".into()))?;
+        let key = (x.device_ptr(), x_byte_off, cols, n_tokens);
         if sc.cap_codes < need_codes {
             sc.xq = Some(
                 self.device
@@ -714,6 +715,9 @@ impl Kernels {
             )?);
             sc.cap_blocks = need_blocks;
         }
+        if sc.key == Some(key) {
+            return Ok(sc);
+        }
         let qk = self.artifacts.get("quantize_act_q8_1")?;
         let quant_blocks = u32::try_from(n_tokens * (cols / 32))
             .map_err(|_| ForgeError::Kernel("dp4a batch: liczba bloków przekracza u32".into()))?;
@@ -726,7 +730,17 @@ impl Kernels {
             .scalar(cols as i64)
             .scalar(n_tokens as i64);
         self.device.launch(qk, &qcfg, &qargs, stream)?;
+        sc.key = Some(key);
         Ok(sc)
+    }
+
+    pub fn qk_batch_invalidate(&self) -> Result<()> {
+        let mut sc = self
+            .qk_batch
+            .lock()
+            .map_err(|_| ForgeError::Kernel("dp4a batch scratch poisoned".into()))?;
+        sc.key = None;
+        Ok(())
     }
 
     /// Pack a resident GGUF projection (row window) straight to e4m3 fp8 on

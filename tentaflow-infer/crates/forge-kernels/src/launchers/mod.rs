@@ -1667,6 +1667,7 @@ struct Q4kNativeScratch {
 /// captured (no events — all users share the model stream's ordering).
 #[derive(Default)]
 pub(crate) struct QkBatchScratch {
+    key: Option<(u64, usize, usize, usize)>,
     /// int8 q8_1 codes [16, cols].
     xq: Option<DevBuffer>,
     /// Block-major per-32 activation scale d [cols/32, 16].
