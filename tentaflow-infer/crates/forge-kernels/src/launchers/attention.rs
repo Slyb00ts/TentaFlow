@@ -532,7 +532,11 @@ impl Kernels {
             _ => None,
         }
         .filter(|name| self.artifacts.has(name));
-        if kv_dtype == DType::F16 && window == 0 && wmma_variant.is_some() {
+        if kv_dtype == DType::F16
+            && window == 0
+            && wmma_variant.is_some()
+            && !matches!(self.attn, AttnBackend::Scalar)
+        {
             let k = self
                 .artifacts
                 .get(wmma_variant.expect("wariant sprawdzony"))?;

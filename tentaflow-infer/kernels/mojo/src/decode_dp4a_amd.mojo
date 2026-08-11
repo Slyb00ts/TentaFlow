@@ -13,7 +13,7 @@ from src.decode_dp4a import _dp4a, _q4k_scale_pair, _stage_quant_global
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
-comptime X_MAX = 16384
+comptime X_MAX = 24576
 comptime XDS_MAX = X_MAX // 32 * 2
 # Ten wariant jest zbudowany wyłącznie dla gfx12; profil gfx1201 wybiera unroll=4.
 comptime DOT_UNROLL = 4

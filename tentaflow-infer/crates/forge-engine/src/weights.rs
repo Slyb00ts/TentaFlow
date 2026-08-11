@@ -3307,10 +3307,10 @@ impl ModelWeights {
                 shard_host_weight(q, &plan(WeightRole::AttnQ)?)?,
                 shard_host_weight(k, &plan(WeightRole::AttnK)?)?,
             );
-            // Brak projekcji V oznacza wariant, w którym V = K (warstwy
-            // globalne Gemmy 4); wtedy fuzja bierze K drugi raz.
-            let v = if p.has_v_proj(idx) {
-                let v = fetch_matrix(src, name(WeightRole::AttnV)?)?;
+            // Brak tensora V oznacza wariant, w którym V = K (warstwy
+            // globalne Gemmy 4); geometria uwagi nie wystarcza do tej decyzji.
+            let v = if let Some(v_name) = layer_map.get(&WeightRole::AttnV) {
+                let v = fetch_matrix(src, v_name)?;
                 expect(&at("attn_v"), &v, kv_dim, p.hidden_size)?;
                 shard_host_weight(v, &plan(WeightRole::AttnV)?)?
             } else {

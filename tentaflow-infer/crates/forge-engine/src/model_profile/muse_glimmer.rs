@@ -8,7 +8,7 @@ pub fn entries() -> Vec<ProfileEntry> {
     profile.top_p = 0.95;
     profile.top_k = 64;
     profile.chat_template = true;
-    profile.stop = &["<|im_end|>"];
+    profile.stop = &["<|eot|>"];
 
     vec![ProfileEntry {
         arch: "muse-glimmer",

@@ -91,6 +91,16 @@ def scale_f16(
         buf[i] = Float16(Float32(buf[i]) * factor)
 
 
+def scale_f32(
+    buf: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+    factor: Float32,
+):
+    i = Int(global_idx.x)
+    if i < n:
+        buf[i] *= factor
+
+
 def softcap_f32(
     logits: UnsafePointer[Float32, MutAnyOrigin],
     n: Int,

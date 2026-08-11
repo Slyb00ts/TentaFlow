@@ -246,16 +246,16 @@ def gemm_q8_0_wmma_triplet_bm64(
     t0 = Int(block_idx.y) * BM
     if tile < blocks0:
         _wmma_q8_tile[2, 2, 2, 2, DType.float16](
-            y0, w0, xq_g, xd_g, n_cols, n_rows0, n_tokens, tile * BN, t0
+            y0, w0, xq_g, xd_g, n_cols, n_rows0, n_tokens, n_tokens, tile * BN, t0
         )
     elif tile < blocks0 + blocks1:
         _wmma_q8_tile[2, 2, 2, 2, DType.float16](
-            y1, w1, xq_g, xd_g, n_cols, n_rows1, n_tokens,
+            y1, w1, xq_g, xd_g, n_cols, n_rows1, n_tokens, n_tokens,
             (tile - blocks0) * BN, t0,
         )
     else:
         _wmma_q8_tile[2, 2, 2, 2, DType.float16](
-            y2, w2, xq_g, xd_g, n_cols, n_rows2, n_tokens,
+            y2, w2, xq_g, xd_g, n_cols, n_rows2, n_tokens, n_tokens,
             (tile - blocks0 - blocks1) * BN, t0,
         )
 

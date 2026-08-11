@@ -4,7 +4,7 @@
 // warstwy okienne 256 z oknem 1024. Te kształty pojawiły się dopiero z Gemmą,
 // więc mają tu własną referencję CPU.
 
-use forge_hal::{DevBuffer, Device, Pool};
+use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool};
 use forge_kernels::Kernels;
 use forge_types::DType;
 use forge_types::MemKind;
@@ -176,6 +176,97 @@ fn attn_prefill_matches_reference_for_gemma_shapes() {
             err < 0.02,
             "hd={head_dim} n_q={n_q} n_kv={n_kv} window={window} max_err={err}"
         );
+    }
+}
+
+#[test]
+fn muse_gqa16_hd128_wmma_i_scalar_match_reference() {
+    let dev = device().expect("Muse GQA 16:1 wymaga dostępnego GPU");
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let (n_tokens, n_q_heads, n_kv_heads, head_dim, page_size) =
+        (60usize, 32usize, 2usize, 128usize, 32usize);
+    let pages = n_tokens.div_ceil(page_size);
+    let q: Vec<f32> = (0..n_tokens * n_q_heads * head_dim).map(fill).collect();
+    let k: Vec<f32> = (0..pages * page_size * n_kv_heads * head_dim)
+        .map(|i| fill(i + 7))
+        .collect();
+    let v: Vec<f32> = (0..pages * page_size * n_kv_heads * head_dim)
+        .map(|i| fill(i + 13))
+        .collect();
+    let page_table: Vec<i32> = (0..pages as i32).collect();
+    let q_buf = upload(dev.as_ref(), &q);
+    let k_buf = upload(dev.as_ref(), &k);
+    let v_buf = upload(dev.as_ref(), &v);
+    let out_scalar = upload(dev.as_ref(), &vec![0.0; n_tokens * n_q_heads * head_dim]);
+    let out_wmma = upload(dev.as_ref(), &vec![0.0; n_tokens * n_q_heads * head_dim]);
+    let page_table_buf = dev
+        .alloc(page_table.len() * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(bytemuck::cast_slice(&page_table), &page_table_buf, 0)
+        .unwrap();
+    let scale = 1.0 / (head_dim as f32).sqrt();
+    let scalar_args = LaunchArgs::new()
+        .buf(&out_scalar)
+        .buf(&q_buf)
+        .buf(&k_buf)
+        .buf(&v_buf)
+        .buf(&page_table_buf)
+        .scalar(0i64)
+        .scalar(n_q_heads as i64)
+        .scalar(n_kv_heads as i64)
+        .scalar(page_size as i64)
+        .scalar(scale)
+        .scalar(n_tokens as i64)
+        .scalar(0i64);
+    dev.launch(
+        kernels.artifacts().get("attn_prefill_f16_hd128").unwrap(),
+        &LaunchConfig {
+            grid: (n_tokens.div_ceil(16) as u32, n_q_heads as u32, 1),
+            block: (256, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &scalar_args,
+        &stream,
+    )
+    .unwrap();
+    let wmma_args = LaunchArgs::new()
+        .buf(&out_wmma)
+        .buf(&q_buf)
+        .buf(&k_buf)
+        .buf(&v_buf)
+        .buf(&page_table_buf)
+        .scalar(0i64)
+        .scalar(n_q_heads as i64)
+        .scalar(n_kv_heads as i64)
+        .scalar(page_size as i64)
+        .scalar(scale)
+        .scalar(n_tokens as i64);
+    dev.launch(
+        kernels.artifacts().get("attn_prefill_wmma_hd128").unwrap(),
+        &LaunchConfig {
+            grid: (n_tokens.div_ceil(64) as u32, n_q_heads as u32, 1),
+            block: (128, 1, 1),
+            shared_mem_bytes: 0,
+        },
+        &wmma_args,
+        &stream,
+    )
+    .unwrap();
+    dev.synchronize().unwrap();
+    let want = reference(
+        &q, &k, &v, n_tokens, n_q_heads, n_kv_heads, head_dim, page_size, n_tokens, scale, 0,
+    );
+    for (name, got) in [
+        ("scalar", download(dev.as_ref(), &out_scalar, want.len())),
+        ("wmma", download(dev.as_ref(), &out_wmma, want.len())),
+    ] {
+        let max_error = got
+            .iter()
+            .zip(&want)
+            .map(|(got, want)| (got - want).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_error < 0.03, "{name} Muse GQA 16:1 max_err={max_error}");
     }
 }
 

@@ -2,6 +2,23 @@
 use super::*;
 
 impl Kernels {
+    pub fn scale_f32(
+        &self,
+        buf: &DevBuffer,
+        offset: usize,
+        n: usize,
+        factor: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        let k = self.artifacts.get("scale_f32")?;
+        let cfg = LaunchConfig::linear(n as u32, BLOCK);
+        let args = LaunchArgs::new()
+            .buf_at(buf, offset * std::mem::size_of::<f32>())?
+            .scalar(n as i64)
+            .scalar(factor);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// out = act(gate) * up nad n elementami f16 (bramkowany FFN).
     ///
     /// Nieliniowość jest parametrem, bo rodziny modeli różnią się nią przy

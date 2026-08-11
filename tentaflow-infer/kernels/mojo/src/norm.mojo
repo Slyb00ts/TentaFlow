@@ -70,6 +70,31 @@ def rmsnorm_f16(
         i += stride
 
 
+def rmsnorm_weightless_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    eps: Float32,
+):
+    """out[row] = x[row] / rms(x[row]) bez mnożnika wagowego."""
+    row = Int(block_idx.x)
+    base = row * n_cols
+    stride = Int(block_dim.x)
+
+    var ss: Float32 = 0.0
+    var i = Int(thread_idx.x)
+    while i < n_cols:
+        v = Float32(x[base + i])
+        ss += v * v
+        i += stride
+
+    inv = rsqrt(block_reduce_sum(ss) / Float32(n_cols) + eps)
+    i = Int(thread_idx.x)
+    while i < n_cols:
+        out_ptr[base + i] = Float16(Float32(x[base + i]) * inv)
+        i += stride
+
+
 def rmsnorm_residual_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     residual_io: UnsafePointer[Float16, MutAnyOrigin],

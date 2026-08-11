@@ -740,7 +740,12 @@ impl Model {
         self.gemm(y, w, x, n_rows, &self.stream)
     }
 
-    pub(crate) fn hybrid_delta_mixer(&self, l: usize, d: &DeltaNetWeights, lane: usize) -> Result<()> {
+    pub(crate) fn hybrid_delta_mixer(
+        &self,
+        l: usize,
+        d: &DeltaNetWeights,
+        lane: usize,
+    ) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let ssm = p.ssm.as_ref().expect("hybrid has ssm params");
         let eps = p.rms_norm_eps;
@@ -926,7 +931,10 @@ impl Model {
         self.hybrid_project(out, &d.out_proj, &hb.normed, n_rows)
     }
 
-    pub(crate) fn checkpoint_hybrid_layer_major(&self, seq: &SeqKv) -> Result<HybridLayerMajorCheckpoint> {
+    pub(crate) fn checkpoint_hybrid_layer_major(
+        &self,
+        seq: &SeqKv,
+    ) -> Result<HybridLayerMajorCheckpoint> {
         let verifier = self.hybrid_verify_bufs.as_ref().ok_or_else(|| {
             ForgeError::Scheduler("layer-major nie ma workspace verifiera do rollbacku".into())
         })?;

@@ -21,10 +21,24 @@ pub fn sampling_from_profile(
     }
 }
 
-pub fn chat_template(arch: &str, template: String) -> String {
+pub fn chat_template(arch: &str, template: String) -> anyhow::Result<String> {
     if matches!(arch, "muse-glimmer" | "muse_glimmer") {
-        "{{ bos_token }}{% for message in messages %}<|start|>{{ message['role'] }}<|message|>{{ message['content'] }}<|eot|>{% endfor %}<|start|>assistant<|message|>".to_string()
+        forge_tokenize::builtin_chat_template("muse_glimmer")
+            .map(str::to_owned)
+            .ok_or_else(|| anyhow::anyhow!("brak wbudowanego szablonu Muse"))
     } else {
-        template
+        Ok(template)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::chat_template;
+
+    #[test]
+    fn muse_uses_builtin_template() {
+        let template = chat_template("muse_glimmer", "LOCAL".into()).unwrap();
+        assert!(template.contains("<|start|>assistant"));
+        assert!(!template.contains("LOCAL"));
     }
 }

@@ -135,16 +135,12 @@ const RULES: &[Rule] = &[
 
 impl Model {
     pub fn set_gguf_identity(&mut self, name: &str) {
-        self.q4k_decode_model = if is_bielik_q4k_identity(
-            &self.weights.descriptor.arch,
-            name,
-            false,
-            false,
-        ) {
-            forge_kernels::Q4kDecodeModelFamily::Bielik
-        } else {
-            forge_kernels::Q4kDecodeModelFamily::Dense
-        };
+        self.q4k_decode_model =
+            if is_bielik_q4k_identity(&self.weights.descriptor.arch, name, false, false) {
+                forge_kernels::Q4kDecodeModelFamily::Bielik
+            } else {
+                forge_kernels::Q4kDecodeModelFamily::Dense
+            };
     }
 
     pub(crate) fn q4k_decode_model_family(&self) -> forge_kernels::Q4kDecodeModelFamily {
@@ -160,7 +156,10 @@ impl Model {
         if self.weights.descriptor.arch == "qwen35" {
             return forge_kernels::Q4kDecodeModelFamily::Qwen35;
         }
-        if matches!(self.q4k_decode_model, forge_kernels::Q4kDecodeModelFamily::Bielik) {
+        if matches!(
+            self.q4k_decode_model,
+            forge_kernels::Q4kDecodeModelFamily::Bielik
+        ) {
             return forge_kernels::Q4kDecodeModelFamily::Bielik;
         }
         match self.model_class() {
@@ -250,15 +249,29 @@ mod tests {
 
     #[test]
     fn bielik_identity_accepts_only_the_exact_dense_single_gpu_route() {
-        assert!(is_bielik_q4k_identity("llama", "Bielik-11B-v3.0", false, false));
+        assert!(is_bielik_q4k_identity(
+            "llama",
+            "Bielik-11B-v3.0",
+            false,
+            false
+        ));
     }
 
     #[test]
     fn bielik_identity_rejects_other_llama_and_parallel_or_moe_routes() {
-        assert!(!is_bielik_q4k_identity("llama", "Mistral-11B", false, false));
+        assert!(!is_bielik_q4k_identity(
+            "llama",
+            "Mistral-11B",
+            false,
+            false
+        ));
         assert!(!is_bielik_q4k_identity("llama", "Bielik-11B", true, false));
         assert!(!is_bielik_q4k_identity("llama", "Bielik-11B", false, true));
-        assert!(!is_bielik_q4k_identity("qwen35", "Bielik-11B", false, false));
+        assert!(!is_bielik_q4k_identity(
+            "qwen35",
+            "Bielik-11B",
+            false,
+            false
+        ));
     }
-
 }

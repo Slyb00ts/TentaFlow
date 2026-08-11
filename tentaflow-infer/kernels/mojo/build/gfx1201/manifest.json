@@ -1338,7 +1338,7 @@
       "file": "gemv_q4_k_dp4a_amd_u4_group4_f16.hsaco"
     },
     "gemv_q4_k_dp4a_amd_u4_persist_f16": {
-      "entry": "src_decode_dp4a_amd_gemv_q4_k_6A6A6A6A_0ed66d4604240e31",
+      "entry": "src_decode_dp4a_amd_gemv_q4_k_6A6A6A6A_4842ac18a8be5097",
       "file": "gemv_q4_k_dp4a_amd_u4_persist_f16.hsaco"
     },
     "gemv_q4_k_dp4a_amd_u4_persist_x4k_f16": {
@@ -1378,7 +1378,7 @@
       "file": "gemv_q4_k_dp4a_out_f32.hsaco"
     },
     "gemv_q4_k_dp4a_persist_f16": {
-      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_e4d4d6c006af8990",
+      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_ff0ed55bc0a7896b",
       "file": "gemv_q4_k_dp4a_persist_f16.hsaco"
     },
     "gemv_q4_k_dp4a_prepared_f16": {
@@ -1456,6 +1456,14 @@
     "gemv_q6_k_dp4a_f16": {
       "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_7ccf82b4a2bf38d5",
       "file": "gemv_q6_k_dp4a_f16.hsaco"
+    },
+    "gemv_q6_k_dp4a_f16_gidx": {
+      "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_b7be71e27bc1ded1",
+      "file": "gemv_q6_k_dp4a_f16_gidx.hsaco"
+    },
+    "gemv_q6_k_dp4a_f16_gidx_batch": {
+      "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_d10e4d8e7f63c796",
+      "file": "gemv_q6_k_dp4a_f16_gidx_batch.hsaco"
     },
     "gemv_q6_k_dp4a_out_f32": {
       "entry": "src_decode_dp4a_gemv_q6_k_dp4a6A6A6A6A_6d5b209d3fd09722",
@@ -1826,7 +1834,7 @@
       "file": "pow_f32.hsaco"
     },
     "qkv_post_f16": {
-      "entry": "src_qkv_post_qkv_post_f16_Po6A6A6A6AoA6A6A_58d752da1d0c71ad",
+      "entry": "src_qkv_post_qkv_post_f16_Po6A6A6A6AoA6A6A_2218e61c705cd8dd",
       "file": "qkv_post_f16.hsaco"
     },
     "quantize_act_fp8": {
@@ -1893,6 +1901,10 @@
       "entry": "src_norm_rmsnorm_residual_fp86A6A6A6AoA_419ae6be042e80ff",
       "file": "rmsnorm_residual_fp8.hsaco"
     },
+    "rmsnorm_weightless_f16": {
+      "entry": "src_norm_rmsnorm_weightless_f16A6A6A6A_3bdeaafc3eb524bf",
+      "file": "rmsnorm_weightless_f16.hsaco"
+    },
     "rope_interleaved_f16": {
       "entry": "src_deepseek_rope_interleaved_6A6A6A6A_1ed013938272c38a",
       "file": "rope_interleaved_f16.hsaco"
@@ -1909,9 +1921,17 @@
       "entry": "src_rope_rope_neox_partial_f166A6A6A6A_9826f64eca47f6e1",
       "file": "rope_neox_partial_f16.hsaco"
     },
+    "rope_norm_f16": {
+      "entry": "src_rope_rope_norm_f16_Point6A6A6A6AoA6A6A_bf6565e0b0fea177",
+      "file": "rope_norm_f16.hsaco"
+    },
     "scale_f16": {
       "entry": "src_activation_scale_f16_Poi6A6A6A6AoA6A6A_47ddc170ace423e5",
       "file": "scale_f16.hsaco"
+    },
+    "scale_f32": {
+      "entry": "src_activation_scale_f32_Poi6A6A6A6AoA6A6A_9925dcaf0bd2b1b6",
+      "file": "scale_f32.hsaco"
     },
     "sigmoid_f32": {
       "entry": "src_onnx_ops_sigmoid_f32_Poi6A6A6A6AoA6A6A_e59f3e802948401e",

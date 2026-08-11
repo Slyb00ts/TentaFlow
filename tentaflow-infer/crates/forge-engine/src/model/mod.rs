@@ -824,7 +824,6 @@ fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usiz
     (q_dim * 2).max(conv_dim).max(hidden_size * 2)
 }
 
-
 fn validate_mtp_routed_inputs(
     vocab: usize,
     fed: [u32; 2],
@@ -1885,11 +1884,12 @@ fn close_block(
     next_norm: &DevBuffer,
     rows: usize,
     hidden: usize,
-    eps: f32,
+    post_norm_eps: f32,
+    next_norm_eps: f32,
     stream: &Stream,
 ) -> Result<()> {
     match delta_norm {
-        Some(dn) => kernels.rmsnorm_delta_residual_f16(
+        Some(dn) if post_norm_eps == next_norm_eps => kernels.rmsnorm_delta_residual_f16(
             x_out,
             h,
             delta,
@@ -1897,12 +1897,35 @@ fn close_block(
             next_norm,
             rows,
             hidden,
-            eps,
+            next_norm_eps,
             layer_scale.unwrap_or(1.0),
             stream,
         ),
+        Some(dn) => {
+            kernels.rmsnorm_f16(delta, delta, dn, rows, hidden, post_norm_eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                x_out,
+                h,
+                delta,
+                next_norm,
+                rows,
+                hidden,
+                next_norm_eps,
+                stream,
+            )?;
+            layer_output_scale(kernels, layer_scale, h, rows * hidden, stream)
+        }
         None => {
-            kernels.rmsnorm_residual_f16(x_out, h, delta, next_norm, rows, hidden, eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                x_out,
+                h,
+                delta,
+                next_norm,
+                rows,
+                hidden,
+                next_norm_eps,
+                stream,
+            )?;
             layer_output_scale(kernels, layer_scale, h, rows * hidden, stream)
         }
     }
@@ -1953,9 +1976,9 @@ mod kv;
 mod loader;
 mod moe_bufs;
 use moe_bufs::MoeBufs;
+pub(crate) mod caps;
 mod mtp;
 mod quant_dispatch;
-pub(crate) mod caps;
 pub(crate) use caps::{batched_head_supported, native_mtp_b2_device_embedding, HYBRID_BATCH_LANES};
 mod sample;
 mod scratch;
@@ -2811,15 +2834,13 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        cleanup_after_error, RecordedTokens, fatal_kv_synchronize,
-        finish_greedy_verification, grow_prefill_lanes_transactional,
-        hybrid_layer_major_activation_budget_capable, hybrid_layer_major_activation_required,
-        hybrid_layer_major_chunk_plan,
-        hybrid_layer_major_prefill_limit_for_available,
-        hybrid_layer_major_scratch_estimate, hybrid_prefill_activation_budget_capable,
-        hybrid_prefill_chunk_config_for_model, hybrid_prefill_inner_chunk_count,
-        hybrid_prefill_nvfp4_chunk_limit, hybrid_prefill_profile_spans,
-        hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
+        cleanup_after_error, fatal_kv_synchronize, finish_greedy_verification,
+        grow_prefill_lanes_transactional, hybrid_layer_major_activation_budget_capable,
+        hybrid_layer_major_activation_required, hybrid_layer_major_chunk_plan,
+        hybrid_layer_major_prefill_limit_for_available, hybrid_layer_major_scratch_estimate,
+        hybrid_prefill_activation_budget_capable, hybrid_prefill_chunk_config_for_model,
+        hybrid_prefill_inner_chunk_count, hybrid_prefill_nvfp4_chunk_limit,
+        hybrid_prefill_profile_spans, hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
         hybrid_prefill_t128_backend_capable, hybrid_q_full_cols,
         hybrid_verify_attention_parts_bytes, hybrid_verify_dedicated_z_bytes,
         hybrid_verify_delta_scratch_instances, hybrid_verify_scratch_estimate, logical_kv_regions,
@@ -2827,11 +2848,10 @@ mod verify_rollback_tests {
         nvfp4_ct_dimensions_capable, nvfp4_ct_physical_m, nvfp4_ct_plan_physical_m,
         nvfp4_ct_projection_for_shape, parse_hybrid_prefill_chunk_config,
         resolve_hybrid_prefill_chunk_size, restore_after, restore_prefill_seq_snapshots,
-        run_dense_prefill_transaction, settle_kv_operation,
-        
-        ForgeError, HybridPrefillChunkConfig, HybridPrefillScratchShape, KvCache,
-        KvConfig, KvQuant, KvReusePoison, Model, Nvfp4CtProjection, Nvfp4GgufLayout,
-        Result, SeqKv, Vendor, HYBRID_ACTIVATION_RING_ALIGN, HYBRID_PREFILL_ACTIVATION_RESERVE,
+        run_dense_prefill_transaction, settle_kv_operation, ForgeError, HybridPrefillChunkConfig,
+        HybridPrefillScratchShape, KvCache, KvConfig, KvQuant, KvReusePoison, Model,
+        Nvfp4CtProjection, Nvfp4GgufLayout, RecordedTokens, Result, SeqKv, Vendor,
+        HYBRID_ACTIVATION_RING_ALIGN, HYBRID_PREFILL_ACTIVATION_RESERVE,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
@@ -3734,8 +3754,12 @@ mod verify_rollback_tests {
             2048,
             Some(available_after_p512)
         ));
-        assert!(hybrid_layer_major_prefill_limit_for_available(shape, available_after_p512, |_| true)
-            .is_some_and(|limit| limit < 2048));
+        assert!(hybrid_layer_major_prefill_limit_for_available(
+            shape,
+            available_after_p512,
+            |_| true
+        )
+        .is_some_and(|limit| limit < 2048));
     }
 
     #[test]

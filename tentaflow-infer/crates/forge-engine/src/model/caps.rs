@@ -263,12 +263,16 @@ pub(crate) fn head_batch_width(n_tokens: usize) -> usize {
     }
 }
 
+fn batched_k_quant_head_supported(quant: QuantKind) -> bool {
+    matches!(quant, QuantKind::Q4K | QuantKind::Q5K | QuantKind::Q6K)
+}
+
 pub(crate) fn batched_head_supported(head: &DevWeight, n_tokens: usize) -> Result<()> {
     let supported = match head {
-        DevWeight::F16 { .. }
-        | DevWeight::Q8_0 { .. }
-        | DevWeight::Q4K { .. }
-        | DevWeight::Q6K { .. } => true,
+        DevWeight::F16 { .. } | DevWeight::Q8_0 { .. } => true,
+        DevWeight::Q4K { .. } => batched_k_quant_head_supported(QuantKind::Q4K),
+        DevWeight::Q5K { .. } => batched_k_quant_head_supported(QuantKind::Q5K),
+        DevWeight::Q6K { .. } => batched_k_quant_head_supported(QuantKind::Q6K),
         DevWeight::NvFp4Gguf {
             layout: Nvfp4GgufLayout::RowMajor36,
             ..
@@ -280,6 +284,16 @@ pub(crate) fn batched_head_supported(head: &DevWeight, n_tokens: usize) -> Resul
         false => Err(ForgeError::Unsupported(format!(
             "batchowa głowa nie liczy tego formatu dla {n_tokens} tokenów naraz"
         ))),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn q5k_head_is_allowed_for_batched_logits() {
+        assert!(batched_k_quant_head_supported(QuantKind::Q5K));
     }
 }
 

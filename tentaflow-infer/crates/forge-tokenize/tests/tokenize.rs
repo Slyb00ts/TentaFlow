@@ -799,6 +799,47 @@ fn template_resolution_priority() {
     assert!(resolve_chat_template(None, None, None, None).is_err());
 }
 
+#[test]
+fn muse_template_uses_builtin_source() {
+    let resolved = resolve_chat_template(
+        None,
+        None,
+        None,
+        Some("muse_glimmer"),
+    )
+    .unwrap();
+    let rendered = ChatTemplateEngine::new()
+        .render(
+            resolved,
+            &[ChatMessage::text("user", "test")],
+            None,
+            true,
+            false,
+            &serde_json::Map::new(),
+        )
+        .unwrap();
+    assert!(rendered.contains("<|start|>user<|message|>test<|eot|>"));
+    assert!(rendered.ends_with("<|start|>assistant to=user<|message|>"));
+}
+
+#[test]
+fn chat_template_supports_conditional_keyword_arguments() {
+    let rendered = ChatTemplateEngine::new()
+        .render(
+            "{%- set state = namespace(name=tcid if tcid else '') -%}{{ state.name }}",
+            &[],
+            None,
+            false,
+            false,
+            &serde_json::json!({"tcid": "ok"})
+                .as_object()
+                .cloned()
+                .unwrap(),
+        )
+        .unwrap();
+    assert_eq!(rendered, "ok");
+}
+
 // Some checkpoints ship tokenizer.json with baked-in truncation (Bielik:
 // max_length 2048). from_file must strip it — context limits belong to the
 // engine, and silent prompt clipping corrupts long requests.

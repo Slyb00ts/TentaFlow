@@ -15,6 +15,7 @@ from src.norm import (
     rmsnorm_delta_residual_f16,
     rmsnorm_qkv_f16,
     rmsnorm_f16,
+    rmsnorm_weightless_f16,
     rmsnorm_residual_f16,
     rmsnorm_fp8,
     rmsnorm_residual_fp8,
@@ -23,6 +24,7 @@ from src.activation import (
     silu_mul_f16,
     gelu_mul_f16,
     scale_f16,
+    scale_f32,
     softcap_f32,
     sigmoid_mul_f16,
     deinterleave_gate_f16,
@@ -31,7 +33,7 @@ from src.activation import (
     add_f32_out_f16,
     residual_add_f16,
 )
-from src.rope import rope_neox_f16, rope_neox_ff_f16, attn_prepare_qk_f16
+from src.rope import rope_neox_f16, rope_norm_f16, rope_neox_ff_f16, attn_prepare_qk_f16
 from src.gemv import gemv_q8_0_f16, gemv_f16
 from src.attention import (
     attn_decode_f16_hd128,
@@ -972,6 +974,11 @@ def main() raises:
     entries.append(_finalize(out_dir, "rmsnorm_f16"))
 
     _ = ctx.compile_function[
+        rmsnorm_weightless_f16, dump_asm=Path("rmsnorm_weightless_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "rmsnorm_weightless_f16"))
+
+    _ = ctx.compile_function[
         rmsnorm_residual_f16, dump_asm=Path("rmsnorm_residual_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "rmsnorm_residual_f16"))
@@ -999,6 +1006,8 @@ def main() raises:
     entries.append(_finalize(out_dir, "gelu_mul_f16"))
     _ = ctx.compile_function[scale_f16, dump_asm=Path("scale_f16.ptx")]()
     entries.append(_finalize(out_dir, "scale_f16"))
+    _ = ctx.compile_function[scale_f32, dump_asm=Path("scale_f32.ptx")]()
+    entries.append(_finalize(out_dir, "scale_f32"))
     _ = ctx.compile_function[cast_f16_f32, dump_asm=Path("cast_f16_f32.ptx")]()
     entries.append(_finalize(out_dir, "cast_f16_f32"))
     _ = ctx.compile_function[cast_f32_f16, dump_asm=Path("cast_f32_f16.ptx")]()
@@ -1028,6 +1037,10 @@ def main() raises:
         rope_neox_f16, dump_asm=Path("rope_neox_f16.ptx")
     ]()
     entries.append(_finalize(out_dir, "rope_neox_f16"))
+    _ = ctx.compile_function[
+        rope_norm_f16, dump_asm=Path("rope_norm_f16.ptx")
+    ]()
+    entries.append(_finalize(out_dir, "rope_norm_f16"))
     _ = ctx.compile_function[
         rope_neox_ff_f16, dump_asm=Path("rope_neox_ff_f16.ptx")
     ]()

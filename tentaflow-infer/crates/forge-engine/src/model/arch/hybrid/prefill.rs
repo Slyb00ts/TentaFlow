@@ -306,9 +306,12 @@ impl Model {
             && self.weights.descriptor.arch == "qwen35"
             && self.weights.token_embd_host.is_some()
             && self.validate_hybrid_speculation_target().is_ok()
-            && self.weights.layers.iter().all(|l| matches!(l.ffn, LayerFfn::Dense(_)))
-            && (self.weights.descriptor.params.ssm.as_ref())
-                .is_some_and(|ssm| ssm.d_state == 128)
+            && self
+                .weights
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, LayerFfn::Dense(_)))
+            && (self.weights.descriptor.params.ssm.as_ref()).is_some_and(|ssm| ssm.d_state == 128)
     }
 
     /// Dodatkowo cały FFN w NVFP4 — tego wymaga dobór chunka NVFP4, nie kernele.
@@ -316,7 +319,9 @@ impl Model {
         self.hybrid_prefill_shape_capable()
             && self.weights.layers.iter().all(|layer| {
                 let nvfp4 = |w: &DevWeight| matches!(w, DevWeight::NvFp4Gguf { .. });
-                let LayerFfn::Dense(ffn) = &layer.ffn else { return false };
+                let LayerFfn::Dense(ffn) = &layer.ffn else {
+                    return false;
+                };
                 let gate_up = match &ffn.gate_up {
                     GateUpWeights::Fused(w) => nvfp4(w),
                     GateUpWeights::Split { gate, up } => nvfp4(gate) && nvfp4(up),
@@ -383,7 +388,10 @@ impl Model {
         )
     }
 
-    pub(crate) fn resolve_hybrid_prefill_chunk_size(&self, config: HybridPrefillChunkConfig) -> Result<usize> {
+    pub(crate) fn resolve_hybrid_prefill_chunk_size(
+        &self,
+        config: HybridPrefillChunkConfig,
+    ) -> Result<usize> {
         if !self.is_hybrid() {
             return Ok(HYBRID_PREFILL_PORTABLE_CHUNK);
         }

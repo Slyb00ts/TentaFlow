@@ -12,6 +12,20 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Muse Glimmer: globalna uwaga i kanały odpowiedzi są rozdzielone (2026-08-11).**
+  Loader nie zakłada już `V = K` na podstawie geometrii warstwy: wybiera własną
+  projekcję V wyłącznie wtedy, gdy mapa wag zawiera `AttnV`. To przywraca prawidłowe
+  V w globalnych warstwach Muse, a zachowuje `V = K` dla warstw Gemmy bez tensora V.
+  GPU1 oracle dla `T=60`, `Q=32`, `KV=2`, `head_dim=128`, `page=32` przeszedł dla
+  scalar i WMMA względem niezależnej referencji CPU. Parser Muse przekazuje
+  `assistant to=self` do `reasoning_content`, pierwszy kanał użytkownika do
+  `content`, a kolejne kanały użytkownika po reasoning ignoruje, aby repetycja nie
+  trafiała do odpowiedzi API. Wspólny builtin Jinja Muse jest używany przez `serve`,
+  `run` i API; kończy się `<|start|>assistant to=user<|message|>`, więc kanał
+  odpowiedzi jest ustalony przed generacją. HTTP na GPU1, prompt 67 tokenów: przy
+  `max_tokens=512` i `2048` `content` zawiera koherentną dwuzdaniową odpowiedź po
+  polsku, a `reasoning_content` pozostaje osobno.
+
 - ✅ **Sufit dekodowania na R9700 jest ZMIERZONY i nie jest tam, gdzie zakładał
   rachunek pasma (2026-07-31).** Rachunek `16,1 GB / 552 GB/s = 34,1 tok/s`
   milcząco zakładał, że każdy bajt idzie pełnym pasmem. Nie idzie: mikrobenchmark

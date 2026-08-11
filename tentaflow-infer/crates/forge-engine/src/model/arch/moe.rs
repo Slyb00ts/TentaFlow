@@ -307,6 +307,7 @@ impl Model {
                 &layer.ffn_norm,
                 1,
                 hidden,
+                p.post_norm_eps,
                 eps,
                 stream,
             )?;
@@ -335,6 +336,7 @@ impl Model {
                 next_norm,
                 1,
                 hidden,
+                p.post_norm_eps,
                 eps,
                 stream,
             )?;

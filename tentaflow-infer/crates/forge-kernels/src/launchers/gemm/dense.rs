@@ -1139,7 +1139,7 @@ impl Kernels {
 
     /// Column bound of the dp4a kernels that quantize x from global memory
     /// into shared int8 (plain + residual variants; X_MAX in decode_dp4a.mojo).
-    pub const DP4A_MAX_COLS: usize = 16384;
+    pub const DP4A_MAX_COLS: usize = 24576;
 
     pub(crate) fn check_dp4a_cols(cols: usize, quant_mult: usize, name: &str) -> Result<()> {
         if cols > Self::DP4A_MAX_COLS || !cols.is_multiple_of(quant_mult) {

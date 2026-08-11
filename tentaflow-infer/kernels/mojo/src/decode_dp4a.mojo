@@ -45,7 +45,7 @@ comptime MAX_HIDDEN = 8192
 # kolumn): zmierzone 29,2 -> 28,1 tok/s na Qwen3.6-27B Q4_K_M. Większy bufor
 # zabiera zajętość WSZYSTKIM kernelom dp4a, a `ffn_down` na ścieżce dp4a zyskuje
 # przy tym 0,1 tok/s — bilans wychodzi mocno na minus.
-comptime X_MAX = 16384
+comptime X_MAX = 24576
 
 # Superblocks whose weight loads a decode dot issues before consuming any.
 comptime DOT_UNROLL = 2

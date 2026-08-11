@@ -41,6 +41,26 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn rope_norm_f16(
+        &self,
+        x_io: &DevBuffer,
+        positions: &DevBuffer,
+        n_tokens: usize,
+        n_heads: usize,
+        head_dim: usize,
+        theta_base: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if theta_base == 0.0 {
+            return Ok(());
+        }
+        let k = self.artifacts.get("rope_norm_f16")?;
+        let cfg = LaunchConfig { grid: (n_tokens as u32, n_heads as u32, 1), block: ((head_dim as u32 / 2).clamp(32, 256), 1, 1), shared_mem_bytes: 0 };
+        let args = LaunchArgs::new().buf(x_io).buf(positions).scalar(n_heads as i64).scalar(head_dim as i64).scalar(theta_base);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// `rope_neox_f16` over a section of a fused buffer, addressed by byte
     /// offset. Used by the rot decode path to rope the q/k slices of a fused
     /// qkv buffer in place.
@@ -289,6 +309,7 @@ impl Kernels {
         page_size: usize,
         eps: f32,
         theta_base: f32,
+        apply_rope: bool,
         stream: &Stream,
     ) -> Result<()> {
         // One element per thread: block = head_dim (MAX_HEAD_DIM in
@@ -324,7 +345,8 @@ impl Kernels {
             .scalar(if q_norm.is_some() { 1i64 } else { 0i64 })
             .scalar(if k_norm.is_some() { 1i64 } else { 0i64 })
             .scalar(eps)
-            .scalar(theta_base);
+            .scalar(theta_base)
+            .scalar(if apply_rope { 1i64 } else { 0i64 });
         self.device.launch(k, &cfg, &args, stream)
     }
 

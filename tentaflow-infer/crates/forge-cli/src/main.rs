@@ -1806,7 +1806,7 @@ fn cmd_serve(
     let chat_template = config::chat_template(
         &loaded.model.weights.descriptor.arch,
         loaded.chat_template.clone(),
-    );
+    )?;
     let tool_parser = ToolParserKind::resolve(
         tool_call_parser.as_deref(),
         &loaded.model.weights.descriptor.arch,
@@ -2041,7 +2041,7 @@ fn cmd_run(
                 &config::chat_template(
                     &loaded.model.weights.descriptor.arch,
                     loaded.chat_template.clone(),
-                ),
+                )?,
                 &[ChatMessage::text("user", prompt)],
                 None,
                 true,
@@ -2055,9 +2055,12 @@ fn cmd_run(
 
     let eos_ids = loaded.bundle.eos_ids.clone();
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
-    let prompt_tokens = tokenizer
-        .encode(&prompt_text, true)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let prompt_tokens = (if chat {
+        tokenizer.encode_chat_template(&prompt_text)
+    } else {
+        tokenizer.encode(&prompt_text, true)
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
     // Single sequence: full-size prefill chunks, no other decode ITL to protect.
     let engine = forge_engine::server::spawn_engine_batched(
         loaded.model,
@@ -2666,7 +2669,6 @@ mod speculation_cli_tests {
     use forge_engine::tier::{KvTierConfig, KvTierMode};
     use forge_engine::weights::NvFp4CtLayoutPolicy;
     use forge_formats::{HfConfig, LayerKind, ModelDescriptor};
-
     fn qwen_hybrid_descriptor() -> ModelDescriptor {
         let config: HfConfig = serde_json::from_str(
             r#"{

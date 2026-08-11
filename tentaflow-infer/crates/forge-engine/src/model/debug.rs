@@ -10,6 +10,13 @@ fn layer_trace_enabled() -> bool {
     *ON.get_or_init(|| std::env::var("FORGE_LAYER_TRACE").is_ok_and(|v| v == "1"))
 }
 
+/// Katalog dla surowych zrzutów f16 pojedynczego wiersza śledzenia.
+fn layer_dump_dir() -> Option<&'static str> {
+    static DIR: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
+    DIR.get_or_init(|| std::env::var("FORGE_LAYER_DUMP_DIR").ok())
+        .as_deref()
+}
+
 impl Model {
     /// Wypisuje, ile wag zostało w VRAM, a ile jest czytane z pamięci hosta
     /// przez PCIe — bez tego łatwo nie zauważyć, że model cicho zszedł na
@@ -770,6 +777,11 @@ impl Model {
         if self.device.read(buf, byte_offset, &mut bytes).is_err() {
             return;
         }
+        if let Some(dir) = layer_dump_dir() {
+            if let Err(error) = std::fs::write(format!("{dir}/{label}.f16"), &bytes) {
+                eprintln!("TRACE {label}: nie zapisano zrzutu: {error}");
+            }
+        }
         let values: Vec<f32> = bytes
             .chunks_exact(2)
             .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -783,4 +795,5 @@ impl Model {
             values[len - 1]
         );
     }
+
 }

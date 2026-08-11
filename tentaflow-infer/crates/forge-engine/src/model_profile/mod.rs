@@ -236,5 +236,6 @@ mod tests {
         assert_eq!(muse.top_p, 0.95);
         assert_eq!(muse.top_k, 64);
         assert!(muse.chat_template);
+        assert_eq!(muse.stop, &["<|eot|>"]);
     }
 }
