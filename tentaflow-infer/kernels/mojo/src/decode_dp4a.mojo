@@ -49,6 +49,7 @@ comptime X_MAX = 24576
 
 # Superblocks whose weight loads a decode dot issues before consuming any.
 comptime DOT_UNROLL = 2
+comptime GLOBAL_DOT_UNROLL = 8
 comptime XDS_MAX = X_MAX // 32 * 2
 comptime XDS_HID = MAX_HIDDEN // 32 * 2
 
@@ -435,6 +436,54 @@ def _dot_q4k_i8_global_gfx1201(
     var acc: Float32 = 0.0
     var min_acc: Float32 = 0.0
     var b = lane // 8
+    while b + (GLOBAL_DOT_UNROLL - 1) * 4 < blocks_per_row:
+        var dms = InlineArray[SIMD[DType.float16, 2], GLOBAL_DOT_UNROLL](
+            fill=SIMD[DType.float16, 2](0)
+        )
+        var qvs = InlineArray[SIMD[DType.uint32, 4], GLOBAL_DOT_UNROLL](
+            fill=SIMD[DType.uint32, 4](0)
+        )
+        var scs = InlineArray[SIMD[DType.float32, 2], GLOBAL_DOT_UNROLL](
+            fill=SIMD[DType.float32, 2](0)
+        )
+        var mns = InlineArray[SIMD[DType.float32, 2], GLOBAL_DOT_UNROLL](
+            fill=SIMD[DType.float32, 2](0)
+        )
+        var xdvs = InlineArray[SIMD[DType.float32, 2], GLOBAL_DOT_UNROLL](
+            fill=SIMD[DType.float32, 2](0)
+        )
+        var xsmvs = InlineArray[SIMD[DType.float32, 2], GLOBAL_DOT_UNROLL](
+            fill=SIMD[DType.float32, 2](0)
+        )
+        comptime for u in range(GLOBAL_DOT_UNROLL):
+            off = row_base + (b + u * 4) * 144
+            dms[u] = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
+            qvs[u] = (w + off + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+                width=4, alignment=16
+            ]()
+            scs[u], mns[u] = _q4k_scale_pair(w, off, c)
+            seg = (b + u * 4) * 8 + 2 * c
+            xdvs[u] = (xd + seg).load[width=2, alignment=8]()
+            xsmvs[u] = (xsm + seg).load[width=2, alignment=8]()
+        comptime for u in range(GLOBAL_DOT_UNROLL):
+            seg = (b + u * 4) * 8 + 2 * c
+            var s_lo: Int32 = 0
+            var s_hi: Int32 = 0
+            comptime for t in range(4):
+                q = Int32(qvs[u][t])
+                s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
+                s_hi = _dp4a(
+                    (q >> 4) & 0x0F0F0F0F,
+                    xqi[seg * 8 + 8 + half * 4 + t],
+                    s_hi,
+                )
+            acc += Float32(dms[u][0]) * scs[u][0] * xdvs[u][0] * Float32(s_lo)
+            acc += Float32(dms[u][0]) * scs[u][1] * xdvs[u][1] * Float32(s_hi)
+            if half == 0:
+                min_acc += Float32(dms[u][1]) * (
+                    mns[u][0] * xsmvs[u][0] + mns[u][1] * xsmvs[u][1]
+                )
+        b += GLOBAL_DOT_UNROLL * 4
     while b < blocks_per_row:
         off = row_base + b * 144
         dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
@@ -450,17 +499,11 @@ def _dot_q4k_i8_global_gfx1201(
         comptime for t in range(4):
             q = Int32(qv[t])
             s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
-            s_hi = _dp4a(
-                (q >> 4) & 0x0F0F0F0F,
-                xqi[seg * 8 + 8 + half * 4 + t],
-                s_hi,
-            )
+            s_hi = _dp4a((q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + half * 4 + t], s_hi)
         acc += Float32(dm[0]) * sc[0] * xdv[0] * Float32(s_lo)
         acc += Float32(dm[0]) * sc[1] * xdv[1] * Float32(s_hi)
         if half == 0:
-            min_acc += Float32(dm[1]) * (
-                mn[0] * xsmv[0] + mn[1] * xsmv[1]
-            )
+            min_acc += Float32(dm[1]) * (mn[0] * xsmv[0] + mn[1] * xsmv[1])
         b += 4
     return warp.sum(acc - min_acc)
 
