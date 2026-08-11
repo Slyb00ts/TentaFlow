@@ -57,7 +57,7 @@ static bool ends_with(const std::string & value, const std::string & suffix) {
 static bool detect_thinking_forced_open(const common_chat_params & params) {
     return params.supports_thinking
         && !params.thinking_start_tag.empty()
-        && !params.thinking_end_tag.empty()
+        && !params.thinking_end_tags.empty()
         && ends_with(params.generation_prompt, params.thinking_start_tag);
 }
 
