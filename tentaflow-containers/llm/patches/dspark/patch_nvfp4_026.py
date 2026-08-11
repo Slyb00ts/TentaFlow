@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-# ===== File: llm/patches/dspark/patch_nvfp4_026.py — nvfp4_ds_mla for vLLM 0.26 =====
+# ===== File: llm/patches/dspark/patch_nvfp4_026.py — nvfp4_ds_mla for vLLM 0.27 =====
 # Adds the `nvfp4_ds_mla` KV-cache dtype, the one piece of the DSpark runtime
 # upstream still does not carry. Everything else the old recipe overlay provided
 # — the DSpark speculator, the DeepSeek V4 draft model, the B12X MoE backend —
-# is in vLLM 0.26 already, so this replaces ~24k lines of copied files.
+# is in vLLM 0.27 already, so this replaces ~24k lines of copied files.
 #
 # The 0.21-era patch also had to force the page envelope back to 584 bytes.
 # Upstream now computes exactly that for deepseek_v4 (448B NoPE + 128B RoPE +

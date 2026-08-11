@@ -6,6 +6,8 @@
 # sie na jednym Sparku; deploy uzywa natywnego multi-node vLLM
 # (`--nnodes/--node-rank/--headless`, worker-first), NIE Raya — patrz
 # `cluster_launch = "vllm-mp"` i `services/deploy/distributed.rs`.
+# Ten profil pozostaje legacy, bo zewnetrzny obraz i overlay nie sa zgodne z vLLM
+# 0.27.0. Aktualizowana sciezka zrodlowa znajduje sie w `vllm-dspark-src`.
 
 [engine]
 id = "vllm-dspark"

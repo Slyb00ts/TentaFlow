@@ -18,10 +18,10 @@ RUN pip install --no-cache-dir --upgrade pip wheel
 
 RUN pip install --no-cache-dir \
       --extra-index-url https://download.pytorch.org/whl/cu130 \
-      torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+      torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
     && pip install --no-cache-dir \
       --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
-      vllm==0.26.0
+      vllm==0.27.0
 
 RUN pip install --no-cache-dir "huggingface_hub[cli,hf_transfer]"
 ENV HF_HUB_ENABLE_HF_TRANSFER=1

@@ -195,6 +195,15 @@ The renderer validates public URLs before navigation and aborts private/local su
 requests inside Playwright routing, so Core can use it without exposing local node networks to
 web pages.
 
+Wersje silników LLM są utrzymywane w manifestach kontenerów: vLLM 0.27.0 używa PyTorch
+2.13.0 i torchvision 0.28.0, a SGLang 0.5.17 używa PyTorch 2.11.0. Warianty vLLM dla
+ROCm korzystają z oficjalnego indeksu wheeli ROCm. DGX Spark buduje vLLM 0.27.0 ze źródeł;
+wariant DeepSeek DSpark nakłada tylko lokalną łatkę `nvfp4_ds_mla`, ponieważ obsługa DSpark
+została już włączona upstream.
+Profil `vllm-dspark` pozostaje legacy i korzysta z zewnętrznego obrazu vLLM 0.24 oraz
+starego overlayu; dla vLLM 0.27.0 należy używać `vllm-dspark-src`, ponieważ stary overlay
+nie nakłada się na aktualne źródła.
+
 ## ML Studio training tors
 
 `tentaflow-core/src/ml_studio/` drives three vision tors off ONE COCO dataset, each with its

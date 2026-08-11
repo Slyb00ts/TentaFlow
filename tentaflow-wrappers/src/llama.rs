@@ -978,6 +978,7 @@ fn detect_quantization(path: &Path) -> Option<String> {
 
 #[cfg(feature = "llama")]
 pub(crate) fn build_sampler_chain(
+    n_vocab: i32,
     repeat_penalty: f32,
     top_k: u32,
     top_p: f32,
@@ -992,7 +993,9 @@ pub(crate) fn build_sampler_chain(
     let mut sampler = LlamaSamplerGuard { raw: chain };
 
     if repeat_penalty > 1.0 {
-        sampler.add(unsafe { sys::llama_sampler_init_penalties(64, repeat_penalty, 0.0, 0.0) })?;
+        sampler.add(unsafe {
+            sys::llama_sampler_init_penalties(n_vocab, 64, repeat_penalty, 0.0, 0.0)
+        })?;
     }
     if top_k > 0 {
         sampler.add(unsafe { sys::llama_sampler_init_top_k(top_k as i32) })?;
