@@ -12,6 +12,33 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **HTTP na R9700 ma rozdzielony pomiar prefillu i decode (2026-08-11).**
+  Vulkan: llama.cpp v290, GPU1, Vulkan1. Forge: GPU0, HIP, cache/spec off.
+  Prefill to prompt tok/s z pierwszego eventu SSE (C=1); decode to agregat
+  completion tok/s dla C=1/2/4. Wszystkie żądania miały dokładne usage.
+
+  | model / prompt | Vulkan prefill | Forge prefill | Vulkan decode C1/C2/C4 | Forge decode C1/C2/C4 |
+  |---|---:|---:|---:|---:|
+  | Bielik Q4, 512 | 2659,5 | 4209,5 | 104,7 / 190,9 / 328,4 | 76,9 / 75,3 / 74,5 |
+  | Bielik Q4, 2048 | 3287,2 | 3397,6 | 97,9 / 169,5 / 267,9 | 65,3 / 64,2 / 63,7 |
+  | Qwen 3.6 27B Q4, 512 | 848,9 | 1314,1 | 30,6 / 54,6 / 88,2 | 27,7 / 27,7 / 27,7 |
+  | Qwen 3.6 27B Q4, 2048 | 970,4 | 1474,2 | 30,7 / 55,2 / 89,8 | 27,6 / 27,6 / 27,6 |
+  | Qwen 3.5 MoE Q4, 512 | 2163,0 | 3774,7 | 118,1 / 170,6 / 257,3 | 104,0 / 105,8 / 104,3 |
+  | Qwen 3.5 MoE Q4, 2048 | 3334,9 | 4899,5 | 122,2 / 185,9 / 256,1 | 102,7 / 51,6 / 101,8 |
+  | Muse Glimmer Q4, 512 | 749,5 | 1415,4 | 32,0 / 59,1 / 103,8 | 20,8 / 21,1 / timeout |
+  | Muse Glimmer Q4, 2048 | 957,8 | 1353,8 | 32,4 / 61,3 / 108,5 | 20,4 / 20,5 / timeout |
+
+  Wartości Vulkan pochodzą z tej samej macierzy HTTP co C=1/2/4; Forge
+  decode dla modeli gęstych pochodzi z tej samej macierzy, a MoE z ponownego
+  przebiegu po dobudowaniu artefaktów gfx1201 `moe_topk_f32`, `moe_combine_f16`
+  i `gemv_q4_k_dp4a_f16_gidx_batch`. Prefill Forge mierzono osobnym SSE z
+  `max_tokens=1`, aby TTFT nie mieszał się z długim decode. Muse C=4 Forge
+  przekroczył limit testu i nie jest wpisany jako wynik.
+
+  `forge serve --tp 2` przeszedł realny POST HTTP 200 na GPU0+GPU1 (`world=2`)
+  dla Bielika. Brak P2P nie blokuje tej ścieżki, ale wynik TP2 nie był jeszcze
+  częścią powyższej macierzy przepustowości.
+
 - ✅ **Muse Glimmer: globalna uwaga i kanały odpowiedzi są rozdzielone (2026-08-11).**
   Loader nie zakłada już `V = K` na podstawie geometrii warstwy: wybiera własną
   projekcję V wyłącznie wtedy, gdy mapa wag zawiera `AttnV`. To przywraca prawidłowe
