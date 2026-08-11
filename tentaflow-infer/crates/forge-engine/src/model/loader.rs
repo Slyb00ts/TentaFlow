@@ -117,7 +117,11 @@ impl Model {
         Self::report_residency(sink.residency());
         Self::validate_nvfp4_tile_repacked(target_tile, repacked_weights.get())?;
         weights.nvfp4_repacked_weights = repacked_weights.get();
-        Self::finish(sink_dev, weights, cfg, kernels, stream, spill)
+        let mut model = Self::finish(sink_dev, weights, cfg, kernels, stream, spill)?;
+        if let Some(name) = path.file_name().and_then(|value| value.to_str()) {
+            model.set_gguf_identity(name);
+        }
+        Ok(model)
     }
 
     pub fn load_safetensors_dir(

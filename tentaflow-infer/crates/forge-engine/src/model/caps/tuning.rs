@@ -258,6 +258,16 @@ mod tests {
     }
 
     #[test]
+    fn bielik_gguf_basename_selects_bielik_family() {
+        assert!(is_bielik_q4k_identity(
+            "llama",
+            "bielik-7b-Q4_K_M.gguf",
+            false,
+            false
+        ));
+    }
+
+    #[test]
     fn bielik_identity_rejects_other_llama_and_parallel_or_moe_routes() {
         assert!(!is_bielik_q4k_identity(
             "llama",
