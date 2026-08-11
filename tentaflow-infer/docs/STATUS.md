@@ -2455,3 +2455,5 @@ HTTP GPU1, prompt 512, completion 64, identyczny SHA: C1 69,154 tok/s vs 64,895 
 Wąska ścieżka prepared global-Q8 obejmuje wyłącznie AMD gfx1201 oraz projekcje Bielik Q4_K `11264×4096`; offset wag jest walidowany przed uruchomieniem. Oracle z canary przeszedł, a release HIP przechodzi sprawdzenie. Sanity HTTP GPU1 (`prompt=821`, `completion=64`) zwróciło poprawną odpowiedź.
 
 Ścieżka `4096×4096` dla Bielika (`fb1c2a16`) została sprawdzona oracle GPU1 5/5 oraz przez rocprof właściwego symbolu. HTTP GPU1: **74,77 → 87,39 tok/s** (**+16,9%**).
+
+Wariant `unroll8` (`7eb369af`) przeszedł oracle GPU1; ten sam HTTP zwiększył decode **86,67 → 87,75 tok/s**, a rocprof skrócił średni czas gorącego GEMV **53,906 → 52,114 µs**.
