@@ -719,6 +719,15 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
+        if self.device.caps().vendor == forge_types::Vendor::Amd
+            && self.device.caps().arch == "gfx1201"
+            && matches!(model, Q4kDecodeModelFamily::Bielik)
+            && matches!(rows, 11_264 | 22_528)
+            && cols == 4096
+        {
+            let mut prepared = self.prepare_q8_1(x, cols, 1, stream)?;
+            return self.gemv_q4_k_dp4a_prepared_f16(y, w_q4k, 0, &mut prepared, rows, cols);
+        }
         if uses_portable32_bielik(self.device.caps(), model, rows, cols) {
             return self.gemv_q4_k_dp4a_amd_portable32_f16(y, w_q4k, x, rows, cols, stream);
         }
@@ -803,6 +812,7 @@ impl Kernels {
         &self,
         y: &DevBuffer,
         w_q4k: &DevBuffer,
+        w_byte_off: usize,
         prepared: &mut Q8ActPrepared<'_>,
         rows: usize,
         cols: usize,
@@ -826,15 +836,28 @@ impl Kernels {
         }
         Self::check_dp4a_cols(cols, 256, "prepared Q4_K")?;
         const PLAIN_ARTIFACT: &str = "gemv_q4_k_dp4a_prepared_global_f16";
+        const GFX1201_ARTIFACT: &str = "gemv_q4_k_dp4a_prepared_global_gfx1201_f16";
         const PERSISTENT_ARTIFACT: &str = "gemv_q4_k_dp4a_prepared_persist_f16";
-        if !self.artifacts.has(PLAIN_ARTIFACT) {
+        let exact_gfx1201 = caps.vendor == forge_types::Vendor::Amd
+            && caps.arch == "gfx1201"
+            && matches!(rows, 11_264 | 22_528)
+            && cols == 4096;
+        let plain_artifact = if exact_gfx1201 {
+            GFX1201_ARTIFACT
+        } else {
+            PLAIN_ARTIFACT
+        };
+        if !self.artifacts.has(plain_artifact) {
             return Err(ForgeError::Unsupported(
                 "prepared Q4_K GEMV wymaga artefaktu dla AMD gfx1201".into(),
             ));
         }
         let output_bytes = checked_buffer_bytes("prepared Q4_K output", &[rows], 2)?;
         let weight_bytes = checked_buffer_bytes("prepared Q4_K weights", &[rows, cols / 256], 144)?;
-        if y.len() < output_bytes || w_q4k.len() < weight_bytes {
+        let weight_end = w_byte_off
+            .checked_add(weight_bytes)
+            .ok_or_else(|| ForgeError::Kernel("prepared Q4_K: offset wag przekracza usize".into()))?;
+        if y.len() < output_bytes || w_q4k.len() < weight_end {
             return Err(ForgeError::Kernel(
                 "prepared Q4_K: bufor wyjścia lub wag jest za mały".into(),
             ));
@@ -847,13 +870,14 @@ impl Kernels {
             .map_err(|_| ForgeError::Kernel("prepared Q4_K: rows przekracza i64".into()))?;
         let tiles = rows_u32.div_ceil(8);
         let persistent_grid = self.device.caps().sm_count.saturating_mul(6);
-        let (kernel, grid) = if persistent_grid != 0
+        let (kernel, grid) = if !exact_gfx1201
+            && persistent_grid != 0
             && tiles > persistent_grid
             && self.artifacts.has(PERSISTENT_ARTIFACT)
         {
             (self.artifacts.get(PERSISTENT_ARTIFACT)?, persistent_grid)
         } else {
-            (self.artifacts.get(PLAIN_ARTIFACT)?, tiles)
+            (self.artifacts.get(plain_artifact)?, tiles)
         };
         let cfg = LaunchConfig {
             grid: (grid, 1, 1),
@@ -862,7 +886,7 @@ impl Kernels {
         };
         let args = LaunchArgs::new()
             .buf(y)
-            .buf(w_q4k)
+            .buf_at(w_q4k, w_byte_off)?
             .buf(prepared.scratch.xq.as_ref().expect("xq prepared"))
             .buf(prepared.scratch.xd.as_ref().expect("xd prepared"))
             .buf(prepared.scratch.xsum.as_ref().expect("xsum prepared"))

@@ -68,6 +68,40 @@ impl Model {
         if cols > Kernels::DP4A_MAX_COLS {
             return Ok(false);
         }
+        if self.device.caps().vendor == Vendor::Amd
+            && self.device.caps().arch == "gfx1201"
+            && matches!(
+                self.q4k_decode_model_family(),
+                forge_kernels::Q4kDecodeModelFamily::Bielik
+            )
+            && cols == 4096
+            && projections.iter().all(|(_, weight)| {
+                matches!(
+                    weight,
+                    DevWeight::Q4K {
+                        rows: 11_264,
+                        cols: 4096,
+                        ..
+                    }
+                )
+            })
+        {
+            let mut prepared = self.kernels.prepare_q8_1(x, cols, 1, stream)?;
+            for &(output, weight) in projections {
+                let DevWeight::Q4K { buf, rows, .. } = weight else {
+                    return Ok(false);
+                };
+                self.kernels.gemv_q4_k_dp4a_prepared_f16(
+                    output,
+                    buf,
+                    0,
+                    &mut prepared,
+                    *rows,
+                    cols,
+                )?;
+            }
+            return Ok(true);
+        }
         self.kernels.gemv_q4_k_dp4a_group_f16(
             &group,
             x,

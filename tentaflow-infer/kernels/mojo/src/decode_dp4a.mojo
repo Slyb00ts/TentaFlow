@@ -410,10 +410,58 @@ def _dot_q4k_i8_global(
             s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + quarter * 2 + t], s_lo)
             s_hi = _dp4a((q >> 4) & 0x0F0F0F0F, xqi[seg * 8 + 8 + quarter * 2 + t], s_hi)
         acc += Float32(dm[0]) * sc[0] * xd[seg] * Float32(s_lo)
-        acc += Float32(dm[0]) * sc[1] * xd[seg + 2] * Float32(s_hi)
+        acc += Float32(dm[0]) * sc[1] * xd[seg + 1] * Float32(s_hi)
         if quarter == 0:
-            min_acc += Float32(dm[1]) * (mn[0] * xsm[seg] + mn[1] * xsm[seg + 2])
+            min_acc += Float32(dm[1]) * (mn[0] * xsm[seg] + mn[1] * xsm[seg + 1])
         b += 2
+    return warp.sum(acc - min_acc)
+
+
+def _dot_q4k_i8_global_gfx1201(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    lane: Int,
+) -> Float32:
+    blocks_per_row = n_cols // 256
+    row_base = row * blocks_per_row * 144
+    p = lane % 8
+    c = p // 2
+    half = p % 2
+    xqi = xq.bitcast[Int32]()
+    var acc: Float32 = 0.0
+    var min_acc: Float32 = 0.0
+    var b = lane // 8
+    while b < blocks_per_row:
+        off = row_base + b * 144
+        dm = (w + off).bitcast[Float16]().load[width=2, alignment=4]()
+        sc, mn = _q4k_scale_pair(w, off, c)
+        qv = (w + off + 16 + c * 32 + half * 16).bitcast[UInt32]().load[
+            width=4, alignment=16
+        ]()
+        seg = b * 8 + 2 * c
+        xdv = (xd + seg).load[width=2, alignment=8]()
+        xsmv = (xsm + seg).load[width=2, alignment=8]()
+        var s_lo: Int32 = 0
+        var s_hi: Int32 = 0
+        comptime for t in range(4):
+            q = Int32(qv[t])
+            s_lo = _dp4a(q & 0x0F0F0F0F, xqi[seg * 8 + half * 4 + t], s_lo)
+            s_hi = _dp4a(
+                (q >> 4) & 0x0F0F0F0F,
+                xqi[seg * 8 + 8 + half * 4 + t],
+                s_hi,
+            )
+        acc += Float32(dm[0]) * sc[0] * xdv[0] * Float32(s_lo)
+        acc += Float32(dm[0]) * sc[1] * xdv[1] * Float32(s_hi)
+        if half == 0:
+            min_acc += Float32(dm[1]) * (
+                mn[0] * xsmv[0] + mn[1] * xsmv[1]
+            )
+        b += 4
     return warp.sum(acc - min_acc)
 
 
@@ -795,6 +843,29 @@ def gemv_q4_k_dp4a_prepared_global_f16(
     if row >= n_rows:
         return
     total = _dot_q4k_i8_global(w, row, xq_i8, xd_f32, xsm_f32, n_cols, lane)
+    if lane == 0:
+        y[row] = Float16(total)
+
+
+def gemv_q4_k_dp4a_prepared_global_gfx1201_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_i8: UnsafePointer[Int8, MutAnyOrigin],
+    xd_f32: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_f32: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Prepared Q4_K GEMV using a direct global Q8 path."""
+    tid = Int(thread_idx.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = _dot_q4k_i8_global_gfx1201(
+        w, row, xq_i8, xd_f32, xsm_f32, n_cols, lane
+    )
     if lane == 0:
         y[row] = Float16(total)
 
