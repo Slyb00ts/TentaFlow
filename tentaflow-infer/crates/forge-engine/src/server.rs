@@ -2840,6 +2840,10 @@ mod tests {
             super::IdleCoalescingDecision::Wait(Duration::from_millis(1))
         );
         assert_eq!(
+            super::idle_coalescing_decision(Duration::ZERO, 1, 2, Duration::from_millis(50)),
+            super::IdleCoalescingDecision::Wait(Duration::from_millis(50))
+        );
+        assert_eq!(
             super::idle_coalescing_decision(
                 Duration::from_millis(1),
                 1,
