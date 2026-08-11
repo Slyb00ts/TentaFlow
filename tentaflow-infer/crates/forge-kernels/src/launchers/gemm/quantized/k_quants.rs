@@ -722,7 +722,7 @@ impl Kernels {
         if self.device.caps().vendor == forge_types::Vendor::Amd
             && self.device.caps().arch == "gfx1201"
             && matches!(model, Q4kDecodeModelFamily::Bielik)
-            && matches!(rows, 11_264 | 22_528)
+            && matches!(rows, 4_096 | 11_264 | 22_528)
             && cols == 4096
         {
             let mut prepared = self.prepare_q8_1(x, cols, 1, stream)?;
@@ -840,7 +840,7 @@ impl Kernels {
         const PERSISTENT_ARTIFACT: &str = "gemv_q4_k_dp4a_prepared_persist_f16";
         let exact_gfx1201 = caps.vendor == forge_types::Vendor::Amd
             && caps.arch == "gfx1201"
-            && matches!(rows, 11_264 | 22_528)
+            && matches!(rows, 4_096 | 11_264 | 22_528)
             && cols == 4096;
         let plain_artifact = if exact_gfx1201 {
             GFX1201_ARTIFACT

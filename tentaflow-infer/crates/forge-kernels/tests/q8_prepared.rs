@@ -168,29 +168,30 @@ fn prepared_global_gfx1201_matches_oracle_for_bielik_gate_up() {
     }
     let kernels = Kernels::load(device.clone()).unwrap();
     let stream = device.create_stream().unwrap();
-    let rows = 22_528usize;
     let cols = 4096usize;
-    let host_x = activations(1, cols);
-    let host_w = q4k_weights(rows, cols);
-    let expected = q4k_q8_1_oracle(&host_w, &host_x, rows, cols);
-    let x = device.alloc(host_x.len() * 2, MemKind::Device, Pool::Activations).unwrap();
-    let w = device.alloc(host_w.len(), MemKind::Device, Pool::Weights).unwrap();
-    let guard = vec![f16::from_bits(0x7bcd); 17];
-    let initial = vec![f16::from_bits(0x7bcd); rows + guard.len()];
-    let y = device.alloc(initial.len() * 2, MemKind::Device, Pool::Activations).unwrap();
-    device.write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0).unwrap();
-    device.write(&host_w, &w, 0).unwrap();
-    device.write(bytemuck::cast_slice::<f16, u8>(&initial), &y, 0).unwrap();
-    let mut prepared = kernels.prepare_q8_1(&x, cols, 1, &stream).unwrap();
-    kernels.gemv_q4_k_dp4a_prepared_f16(&y, &w, 0, &mut prepared, rows, cols).unwrap();
-    stream.synchronize().unwrap();
-    let mut bytes = vec![0u8; initial.len() * 2];
-    device.read(&y, 0, &mut bytes).unwrap();
-    let actual = f16_values(&bytes, rows);
-    for (row, (got, want)) in actual.iter().zip(&expected).enumerate() {
-        assert!((got - want).abs() <= 0.25 + want.abs() * 0.015, "row={row} actual={got} expected={want}");
+    for rows in [4_096usize, 22_528] {
+        let host_x = activations(1, cols);
+        let host_w = q4k_weights(rows, cols);
+        let expected = q4k_q8_1_oracle(&host_w, &host_x, rows, cols);
+        let x = device.alloc(host_x.len() * 2, MemKind::Device, Pool::Activations).unwrap();
+        let w = device.alloc(host_w.len(), MemKind::Device, Pool::Weights).unwrap();
+        let guard = vec![f16::from_bits(0x7bcd); 17];
+        let initial = vec![f16::from_bits(0x7bcd); rows + guard.len()];
+        let y = device.alloc(initial.len() * 2, MemKind::Device, Pool::Activations).unwrap();
+        device.write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0).unwrap();
+        device.write(&host_w, &w, 0).unwrap();
+        device.write(bytemuck::cast_slice::<f16, u8>(&initial), &y, 0).unwrap();
+        let mut prepared = kernels.prepare_q8_1(&x, cols, 1, &stream).unwrap();
+        kernels.gemv_q4_k_dp4a_prepared_f16(&y, &w, 0, &mut prepared, rows, cols).unwrap();
+        stream.synchronize().unwrap();
+        let mut bytes = vec![0u8; initial.len() * 2];
+        device.read(&y, 0, &mut bytes).unwrap();
+        let actual = f16_values(&bytes, rows);
+        for (row, (got, want)) in actual.iter().zip(&expected).enumerate() {
+            assert!((got - want).abs() <= 0.25 + want.abs() * 0.015, "row={row} actual={got} expected={want}");
+        }
+        assert_eq!(&bytes[rows * 2..], bytemuck::cast_slice::<f16, u8>(&guard));
     }
-    assert_eq!(&bytes[rows * 2..], bytemuck::cast_slice::<f16, u8>(&guard));
 }
 
 fn argmax(values: &[u8]) -> usize {
