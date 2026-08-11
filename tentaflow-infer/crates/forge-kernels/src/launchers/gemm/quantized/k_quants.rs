@@ -2,7 +2,7 @@
 use super::persist::persist_wave;
 use super::q4k_decode_profile::{
     group4_artifact, persistent_artifact, plain_artifact, q4k_decode_profile, rows_per_block,
-    uses_profiled_persistent_grid, Q4kDecodeModelFamily,
+    uses_portable32_bielik, uses_profiled_persistent_grid, Q4kDecodeModelFamily,
 };
 use super::*;
 
@@ -719,6 +719,9 @@ impl Kernels {
         stream: &Stream,
     ) -> Result<()> {
         Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a")?;
+        if uses_portable32_bielik(self.device.caps(), model, rows, cols) {
+            return self.gemv_q4_k_dp4a_amd_portable32_f16(y, w_q4k, x, rows, cols, stream);
+        }
         let profile = q4k_decode_profile(self.device.caps(), model);
         if uses_profiled_persistent_grid(profile) {
             return self.gemv_q4_k_dp4a_profiled_f16(profile, y, w_q4k, x, rows, cols, stream);
@@ -746,6 +749,44 @@ impl Kernels {
         let cfg = LaunchConfig {
             grid: (grid, 1, 1),
             block: (block, 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(y)
+            .buf(w_q4k)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(rows as i64);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
+    pub fn gemv_q4_k_dp4a_amd_portable32_f16(
+        &self,
+        y: &DevBuffer,
+        w_q4k: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let caps = self.device.caps();
+        if caps.vendor != forge_types::Vendor::Amd || caps.arch != "gfx1201" {
+            return Err(ForgeError::Unsupported(
+                "portable32 Q4_K jest eksperymentem tylko dla AMD gfx1201".into(),
+            ));
+        }
+        Self::check_dp4a_cols(cols, 256, "gemv_q4_k_dp4a_amd_portable32")?;
+        let output_bytes = checked_buffer_bytes("portable32 Q4_K output", &[rows], 2)?;
+        let weight_bytes = checked_buffer_bytes("portable32 Q4_K weights", &[rows, cols / 256], 144)?;
+        if y.len() < output_bytes || w_q4k.len() < weight_bytes || x.len() < cols * 2 {
+            return Err(ForgeError::Kernel(
+                "portable32 Q4_K: bufor wejścia, wag lub wyjścia jest za mały".into(),
+            ));
+        }
+        let k = self.artifacts.get("gemv_q4_k_dp4a_amd_portable32_f16")?;
+        let cfg = LaunchConfig {
+            grid: ((rows as u32).div_ceil(8), 1, 1),
+            block: (BLOCK, 1, 1),
             shared_mem_bytes: 0,
         };
         let args = LaunchArgs::new()

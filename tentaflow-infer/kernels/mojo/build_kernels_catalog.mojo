@@ -497,6 +497,7 @@ from src.decode_dp4a import (
 )
 from src.decode_dp4a_amd import (
     gemv_q4_k_dp4a_amd_u4_f16,
+    gemv_q4_k_dp4a_amd_portable32_f16,
     gemv_q4_k_dp4a_amd_u4_persist_f16,
     gemv_q4_k_dp4a_amd_u4_persist_x4k_f16,
     gemv_q4_k_dp4a_amd_u4_group4_f16,
@@ -3044,6 +3045,12 @@ def main() raises:
         dump_asm=Path("gemv_q4_k_dp4a_amd_u4_f16.ptx"),
     ]()
     entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_amd_u4_f16"))
+    # arch: amd:gfx1201
+    _ = ctx.compile_function[
+        gemv_q4_k_dp4a_amd_portable32_f16,
+        dump_asm=Path("gemv_q4_k_dp4a_amd_portable32_f16.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemv_q4_k_dp4a_amd_portable32_f16"))
     _ = ctx.compile_function[
         gemv_q4_k_dp4a_out_f32, dump_asm=Path("gemv_q4_k_dp4a_out_f32.ptx")
     ]()

@@ -27,6 +27,19 @@ pub enum Q4kDecodeModelFamily {
     Bielik,
 }
 
+pub(super) fn uses_portable32_bielik(
+    caps: &DeviceCaps,
+    model: Q4kDecodeModelFamily,
+    rows: usize,
+    cols: usize,
+) -> bool {
+    caps.vendor == Vendor::Amd
+        && caps.arch == "gfx1201"
+        && matches!(model, Q4kDecodeModelFamily::Bielik)
+        && cols == 5120
+        && matches!(rows, 14_336 | 28_672)
+}
+
 impl Q4kDecodeModelFamily {
     fn profile_family(self) -> ModelFamily {
         match self {
@@ -327,6 +340,34 @@ mod tests {
         let other = q4k_decode_profile(&gfx1100, Q4kDecodeModelFamily::Bielik);
         assert_eq!(persistent_grid(profile, &gfx1201, 28672, 4096, 3584), None);
         assert_eq!(persistent_grid(other, &gfx1100, 28672, 5120, 3584), None);
+    }
+
+    #[test]
+    fn portable32_bielik_uses_only_measured_device_and_shapes() {
+        assert!(uses_portable32_bielik(
+            &caps("gfx1201", Vendor::Amd),
+            Q4kDecodeModelFamily::Bielik,
+            14_336,
+            5120,
+        ));
+        assert!(!uses_portable32_bielik(
+            &caps("gfx1200", Vendor::Amd),
+            Q4kDecodeModelFamily::Bielik,
+            14_336,
+            5120,
+        ));
+        assert!(!uses_portable32_bielik(
+            &caps("gfx1201", Vendor::Amd),
+            Q4kDecodeModelFamily::Qwen35,
+            14_336,
+            5120,
+        ));
+        assert!(!uses_portable32_bielik(
+            &caps("gfx1201", Vendor::Amd),
+            Q4kDecodeModelFamily::Bielik,
+            14_336,
+            4096,
+        ));
     }
 
 }

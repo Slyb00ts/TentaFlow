@@ -9,7 +9,7 @@ from std.gpu.primitives import warp
 from std.gpu.primitives.warp import shuffle_xor
 from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
-from src.decode_dp4a import _dp4a, _q4k_scale_pair, _stage_quant_global
+from src.decode_dp4a import _dot_q4k_i8, _dp4a, _q4k_scale_pair, _stage_quant_global
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -133,6 +133,31 @@ def gemv_q4_k_dp4a_amd_u4_f16(
     if row >= n_rows:
         return
     total = _dot_q4k_i8_amd(w, row, xq, xds, n_cols, lane)
+    if lane == 0:
+        y[row] = Float16(total)
+
+
+def gemv_q4_k_dp4a_amd_portable32_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    tid = Int(thread_idx.x)
+    xq = stack_allocation[
+        X_MAX, Int8, alignment=64, address_space=AddressSpace.SHARED
+    ]()
+    xds = stack_allocation[
+        XDS_MAX, Float32, address_space=AddressSpace.SHARED
+    ]()
+    _stage_quant_global(x, xq, xds, n_cols, tid)
+    lane = tid % WARP
+    wid = tid // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = _dot_q4k_i8(w, row, xq, xds, n_cols, lane)
     if lane == 0:
         y[row] = Float16(total)
 

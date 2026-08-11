@@ -2444,3 +2444,8 @@ France"; prefill warm **~5740 tok/s** vs ~11151 MMQ (**~0.51×, ~2× WOLNIEJ** �
 - Izolowany pomiar RTX 4090 dla `n_k=16`, `n_v=32`, `d_state=128`, `d_conv=4`:
   fused T4 **0,00839 ms**, a 17 rozłożonych wywołań GPU bez kosztu kopii i repeat
   **0,02953 ms**, czyli konserwatywne przyspieszenie **3,52×**.
+## AMD portable32 Q4K decode (2026-08-11)
+
+Na AMD gfx1201 dodano wąskie routowanie Bielik Q4K dla kolumn 5120 i wierszy 14336/28672. Kernel używa mapowania subgroupowego z legalnymi odczytami 16B, a wybór jest odrzucony dla innych modeli, architektur i kształtów. Niezależny oracle Q4K/Q8_1 z guardami przeszedł dla Bielika i kształtów Qwen.
+
+HTTP GPU1, prompt 512, completion 64, identyczny SHA: C1 69,154 tok/s vs 64,895 (+6,56%), C2 114,872 vs 107,400 (+6,96%), C4 161,840 vs 96,693 (+67,38%). Protokół: `/tmp/forge-portable32-e2e/`.

@@ -9,7 +9,8 @@ use std::sync::Arc;
 use forge_hal::{gpu, PoolSizes};
 use forge_hal::{Device, Pool};
 use forge_kernels::{Kernels, Q4kDecodeModelFamily};
-use forge_types::MemKind;
+use forge_formats::affine::to_affine_triple;
+use forge_types::{MemKind, QuantKind};
 use half::f16;
 
 fn device() -> Option<Arc<dyn Device>> {
@@ -57,6 +58,106 @@ fn activations(tokens: usize, cols: usize) -> Vec<f16> {
     (0..tokens * cols)
         .map(|index| f16::from_f32(((index * 31 % 67) as f32 - 33.0) / 16.0))
         .collect()
+}
+
+fn q4k_q8_1_oracle(weights: &[u8], activation: &[f16], rows: usize, cols: usize) -> Vec<f32> {
+    let affine = to_affine_triple(weights, QuantKind::Q4K, rows, cols).unwrap();
+    let mut quantized = vec![0i8; cols];
+    let mut scales = vec![0.0f32; cols / 32];
+    let mut sums = vec![0.0f32; cols / 32];
+    for (segment, values) in activation.chunks_exact(32).enumerate() {
+        let values = values.iter().map(|value| value.to_f32()).collect::<Vec<_>>();
+        let amax = values.iter().copied().map(f32::abs).fold(0.0f32, f32::max);
+        sums[segment] = values.iter().sum();
+        if amax != 0.0 {
+            scales[segment] = amax / 127.0;
+            for (index, value) in values.iter().enumerate() {
+                quantized[segment * 32 + index] = (value * 127.0 / amax).round() as i8;
+            }
+        }
+    }
+    (0..rows)
+        .map(|row| {
+            let mut total = 0.0f32;
+            for segment in 0..cols / 32 {
+                let params = (row * (cols / 32) + segment) * 2;
+                let scale = f16::from_le_bytes([
+                    affine.scales[params],
+                    affine.scales[params + 1],
+                ])
+                .to_f32();
+                let bias = f16::from_le_bytes([
+                    affine.biases[params],
+                    affine.biases[params + 1],
+                ])
+                .to_f32();
+                for col in 0..32 {
+                    let index = row * cols + segment * 32 + col;
+                    let nibble = ((affine.packed[index / 8] >> ((index % 8) * 4)) & 0x0f) as f32;
+                    total += (nibble * scale + bias)
+                        * quantized[segment * 32 + col] as f32
+                        * scales[segment];
+                }
+            }
+            total
+        })
+        .collect()
+}
+
+fn f16_values(bytes: &[u8], rows: usize) -> Vec<f32> {
+    bytes[..rows * 2]
+        .chunks_exact(2)
+        .map(|value| f16::from_le_bytes([value[0], value[1]]).to_f32())
+        .collect()
+}
+
+#[test]
+fn portable32_q4k_zgadza_sie_z_oracle_i_chroni_canary() {
+    let Some(device) = device() else { return };
+    if device.caps().vendor != forge_types::Vendor::Amd || device.caps().arch != "gfx1201" {
+        return;
+    }
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let guard = 29usize;
+    for (rows, cols) in [(65usize, 5120usize), (14_336, 5120), (33, 6656), (17, 19_968)] {
+        let host_x = activations(1, cols);
+        let host_w = q4k_weights(rows, cols);
+        let expected = q4k_q8_1_oracle(&host_w, &host_x, rows, cols);
+        let x = device
+            .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let w = device.alloc(host_w.len(), MemKind::Device, Pool::Weights).unwrap();
+        let initial = vec![f16::from_bits(0x7bcd); rows + guard];
+        let output = device
+            .alloc(initial.len() * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+            .unwrap();
+        device.write(&host_w, &w, 0).unwrap();
+        device
+            .write(bytemuck::cast_slice::<f16, u8>(&initial), &output, 0)
+            .unwrap();
+        kernels
+            .gemv_q4_k_dp4a_amd_portable32_f16(&output, &w, &x, rows, cols, &stream)
+            .unwrap();
+        stream.synchronize().unwrap();
+        let mut bytes = vec![0u8; initial.len() * 2];
+        device.read(&output, 0, &mut bytes).unwrap();
+        for (row, (actual, expected)) in f16_values(&bytes, rows).iter().zip(&expected).enumerate() {
+            let tolerance = 0.25 + expected.abs() * 0.015;
+            assert!(
+                (actual - expected).abs() <= tolerance,
+                "portable32 Q4_K różni się od oracle, rows={rows}, cols={cols}, row={row}, gpu={actual}, cpu={expected}"
+            );
+        }
+        assert_eq!(
+            &bytes[rows * 2..],
+            bytemuck::cast_slice::<f16, u8>(&initial[rows..]),
+            "portable32 Q4_K narusza canary, rows={rows}, cols={cols}"
+        );
+    }
 }
 
 fn argmax(values: &[u8]) -> usize {
@@ -692,6 +793,159 @@ fn bench_prepared_q4k_t1_para_gate_up() {
         "q4k_gate_up grouped_us={baseline:.3} current_us={current:.3} prepared_us={prepared:.3} group_speedup={:.3}",
         current / baseline
     );
+}
+
+#[test]
+#[ignore]
+fn bench_portable32_q4k_bielik_gate_up() {
+    let Some(device) = device() else { return };
+    if device.caps().vendor != forge_types::Vendor::Amd || device.caps().arch != "gfx1201" {
+        return;
+    }
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    let cols = 5120usize;
+    let rows = 14_336usize;
+    let host_x = activations(1, cols);
+    let x = device
+        .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
+    device
+        .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+        .unwrap();
+    let mut weights = Vec::with_capacity(2);
+    let mut outputs = Vec::with_capacity(2);
+    for _ in 0..2 {
+        let host_w = q4k_weights(rows, cols);
+        let weight = device
+            .alloc(host_w.len(), MemKind::Device, Pool::Weights)
+            .unwrap();
+        device.write(&host_w, &weight, 0).unwrap();
+        weights.push(weight);
+        outputs.push(
+            device
+                .alloc(rows * 2, MemKind::Device, Pool::Activations)
+                .unwrap(),
+        );
+    }
+    let projections = [(&outputs[0], &weights[0], rows), (&outputs[1], &weights[1], rows)];
+    let group = median(
+        (0..3)
+            .map(|_| {
+                measure(device.as_ref(), &stream, 32, || {
+                    assert!(kernels
+                        .gemv_q4_k_dp4a_group_f16(
+                            &projections,
+                            &x,
+                            cols,
+                            Q4kDecodeModelFamily::Bielik,
+                            &stream,
+                        )
+                        .unwrap());
+                })
+            })
+            .collect(),
+    );
+    let current = median(
+        (0..3)
+            .map(|_| {
+                measure(device.as_ref(), &stream, 32, || {
+                    for (output, weight, projection_rows) in projections {
+                        kernels
+                            .gemv_q4_k_dp4a_f16(
+                                output,
+                                weight,
+                                &x,
+                                projection_rows,
+                                cols,
+                                Q4kDecodeModelFamily::Bielik,
+                                &stream,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect(),
+    );
+    let portable = median(
+        (0..3)
+            .map(|_| {
+                measure(device.as_ref(), &stream, 32, || {
+                    for (output, weight, projection_rows) in projections {
+                        kernels
+                            .gemv_q4_k_dp4a_amd_portable32_f16(
+                                output,
+                                weight,
+                                &x,
+                                projection_rows,
+                                cols,
+                                &stream,
+                            )
+                            .unwrap();
+                    }
+                })
+            })
+            .collect(),
+    );
+    println!(
+        "portable32_bielik_gate_up group_us={group:.3} current_us={current:.3} portable_us={portable:.3} portable_speedup={:.3}",
+        current / portable
+    );
+}
+
+#[test]
+#[ignore]
+fn bench_portable32_q4k_bielik_i_qwen() {
+    let Some(device) = device() else { return };
+    if device.caps().vendor != forge_types::Vendor::Amd || device.caps().arch != "gfx1201" {
+        return;
+    }
+    let kernels = Kernels::load(device.clone()).unwrap();
+    let stream = device.create_stream().unwrap();
+    for (label, rows, cols, model) in [
+        ("bielik_28672x5120", 28_672usize, 5120usize, Q4kDecodeModelFamily::Bielik),
+        ("qwen_4096x6656", 4096usize, 6656usize, Q4kDecodeModelFamily::Qwen35),
+    ] {
+        let host_x = activations(1, cols);
+        let host_w = q4k_weights(rows, cols);
+        let x = device
+            .alloc(host_x.len() * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        let w = device.alloc(host_w.len(), MemKind::Device, Pool::Weights).unwrap();
+        let y = device
+            .alloc(rows * 2, MemKind::Device, Pool::Activations)
+            .unwrap();
+        device
+            .write(bytemuck::cast_slice::<f16, u8>(&host_x), &x, 0)
+            .unwrap();
+        device.write(&host_w, &w, 0).unwrap();
+        let current = median(
+            (0..3)
+                .map(|_| {
+                    measure(device.as_ref(), &stream, 32, || {
+                        kernels
+                            .gemv_q4_k_dp4a_f16(&y, &w, &x, rows, cols, model, &stream)
+                            .unwrap();
+                    })
+                })
+                .collect(),
+        );
+        let portable = median(
+            (0..3)
+                .map(|_| {
+                    measure(device.as_ref(), &stream, 32, || {
+                        kernels
+                            .gemv_q4_k_dp4a_amd_portable32_f16(&y, &w, &x, rows, cols, &stream)
+                            .unwrap();
+                    })
+                })
+                .collect(),
+        );
+        println!(
+            "portable32_{label} current_us={current:.3} portable_us={portable:.3} portable_speedup={:.3}",
+            current / portable
+        );
+    }
 }
 
 #[test]

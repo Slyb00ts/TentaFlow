@@ -1329,6 +1329,10 @@
       "entry": "src_decode_dp4a_amd_gemv_q4_k_6A6A6A6A_c19dbfed1b214456",
       "file": "gemv_q4_k_dp4a_amd_persist_x4k_f16.hsaco"
     },
+    "gemv_q4_k_dp4a_amd_portable32_f16": {
+      "entry": "src_decode_dp4a_amd_gemv_q4_k_6A6A6A6A_4b89f0b0ad06dbc3",
+      "file": "gemv_q4_k_dp4a_amd_portable32_f16.hsaco"
+    },
     "gemv_q4_k_dp4a_amd_u4_f16": {
       "entry": "src_decode_dp4a_amd_gemv_q4_k_6A6A6A6A_d4cfaf72a0323f8b",
       "file": "gemv_q4_k_dp4a_amd_u4_f16.hsaco"
