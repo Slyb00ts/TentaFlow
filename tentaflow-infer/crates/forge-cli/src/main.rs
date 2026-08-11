@@ -174,6 +174,10 @@ enum Command {
         /// modeli gęstych z wagami Q8_0; prefill zostaje na jednej karcie.
         #[arg(long = "tp-cards")]
         tp_cards: Option<String>,
+        /// Pełny podział SPMD modelu na N widocznych kart. Nie łączy się z
+        /// `--tp-cards`, które rozdziela wyłącznie FFN.
+        #[arg(long = "tp", default_value_t = 1)]
+        tp: usize,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -486,6 +490,7 @@ fn main() -> Result<()> {
             prefix_cache,
             speculative,
             tp_cards,
+            tp,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -517,6 +522,7 @@ fn main() -> Result<()> {
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
                 parse_tp_cards(tp_cards.as_deref())?,
+                tp,
             )
         }
         Command::Embed {
@@ -1132,6 +1138,7 @@ fn load_for_serve(
     prefix_cache: bool,
     native_mtp: bool,
     nvfp4_gguf_layout: Nvfp4GgufLayout,
+    tp_world: usize,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
@@ -1161,31 +1168,26 @@ fn load_for_serve(
     };
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
-    let free = gpu::free_vram(0).context("query free VRAM")?;
-    let activations = activation_pool_bytes(desc.params.ssm.is_some(), max_active, free);
-    let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
-    let weights = if weights_pool_gb > 0.0 {
-        ((weights_pool_gb * (1u64 << 30) as f64) as usize)
-            .checked_add(stage)
-            .context("rozmiar puli wag i staging przekracza zakres usize")?
-            .min(weights_budget)
-            .max(1 << 30)
-    } else {
-        // 0 = automatic: hand the weights pool everything KV + activations do
-        // not reserve, leaving room for the auto fp8 prefill packs (staging for
-        // KV tiering lives inside the pool, so the budget already covers it).
-        weights_budget.max(1 << 30)
-    };
-    let dev: Arc<dyn Device> = gpu::open(
-        0,
-        PoolSizes {
+    let pools = |ordinal: usize| -> Result<PoolSizes> {
+        let free = gpu::free_vram(ordinal).context("query free VRAM")?;
+        let activations = activation_pool_bytes(desc.params.ssm.is_some(), max_active, free);
+        let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
+        let weights = if weights_pool_gb > 0.0 {
+            ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+                .checked_add(stage)
+                .context("rozmiar puli wag i staging przekracza zakres usize")?
+                .min(weights_budget)
+                .max(1 << 30)
+        } else {
+            weights_budget.max(1 << 30)
+        };
+        Ok(PoolSizes {
             weights,
             kv_cache: kv_pool,
             activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
-        },
-    )
-    .context("open GPU device")?;
+        })
+    };
     let cfg = ModelConfig {
         weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
         weight_spill_dir,
@@ -1201,7 +1203,25 @@ fn load_for_serve(
         layer_range: None,
         tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
     };
-    let loaded = load_model(dev, path, cfg)?;
+    let loaded = if tp_world > 1 {
+        let visible = gpu::enumerate().len();
+        if visible < tp_world {
+            anyhow::bail!("--tp {tp_world}: widocznych jest {visible} kart");
+        }
+        let mut devices = Vec::with_capacity(tp_world);
+        for ordinal in 0..tp_world {
+            let sizes = pools(ordinal)?;
+            devices.push(
+                gpu::open(ordinal, sizes)
+                    .with_context(|| format!("open GPU device {ordinal}"))?,
+            );
+        }
+        load_model_tp(&devices, path, cfg)?
+    } else {
+        let sizes = pools(0)?;
+        let dev: Arc<dyn Device> = gpu::open(0, sizes).context("open GPU device")?;
+        load_model(dev, path, cfg)?
+    };
     Ok((loaded, kv_pages, max_seq_len))
 }
 
@@ -1730,7 +1750,14 @@ fn cmd_serve(
     prefix_cache: bool,
     spec: SpeculativeConfig,
     tp_cards: Vec<forge_hal::gpu::DeviceId>,
+    tp_world: usize,
 ) -> Result<()> {
+    if tp_world == 0 {
+        anyhow::bail!("--tp musi być co najmniej 1");
+    }
+    if tp_world > 1 && !tp_cards.is_empty() {
+        anyhow::bail!("--tp nie łączy się z --tp-cards");
+    }
     let descriptor = read_descriptor(model_path)?;
     let max_active = resolve_max_active(max_active, &spec, descriptor.params.ssm.is_some())?;
     let t0 = Instant::now();
@@ -1748,6 +1775,7 @@ fn cmd_serve(
         prefix_cache,
         spec.is_native_mtp(),
         Nvfp4GgufLayout::RowMajor36,
+        tp_world,
     )?;
     enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
     let full_context_admission = kv_full_context_admission_capacity(

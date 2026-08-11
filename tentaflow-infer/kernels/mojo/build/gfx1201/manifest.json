@@ -1369,6 +1369,10 @@
       "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_30c98f506bf2dcc3",
       "file": "gemv_q4_k_dp4a_f16_gidx.hsaco"
     },
+    "gemv_q4_k_dp4a_f16_gidx_batch": {
+      "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_eea7191031b761f3",
+      "file": "gemv_q4_k_dp4a_f16_gidx_batch.hsaco"
+    },
     "gemv_q4_k_dp4a_group4_f16": {
       "entry": "src_decode_dp4a_gemv_q4_k_dp4a6A6A6A6A_5a3638f212025056",
       "file": "gemv_q4_k_dp4a_group4_f16.hsaco"
@@ -1709,6 +1713,10 @@
       "entry": "src_onnx_ops_lstm_f32_Pointe6A6A6A6AoA6A6A_6fd07fbec67c7fd4",
       "file": "lstm_f32.hsaco"
     },
+    "moe_combine_f16": {
+      "entry": "src_moe_moe_combine_f16_Poin6A6A6A6AoA6A6A_59500a25778a7138",
+      "file": "moe_combine_f16.hsaco"
+    },
     "moe_gate_sqrtsoftplus_f16": {
       "entry": "src_deepseek_moe_gate_sqrtsoft6A6A6A6A_dcb64654c896b5f4",
       "file": "moe_gate_sqrtsoftplus_f16.hsaco"
@@ -1728,6 +1736,10 @@
     "moe_sigmoid_f16_to_f32": {
       "entry": "src_moe_moe_sigmoid_f16_to_f326A6A6A6A_2a39729fb96b296a",
       "file": "moe_sigmoid_f16_to_f32.hsaco"
+    },
+    "moe_topk_f32": {
+      "entry": "src_moe_moe_topk_f32_Pointer6A6A6A6AoA6A6A_7decb0ed5fc7e949",
+      "file": "moe_topk_f32.hsaco"
     },
     "mtp_commit_catchup_metadata_segmented": {
       "entry": "src_mtp_mtp_commit_catchup_met6A6A6A6A_fbe7493a814eccd9",
