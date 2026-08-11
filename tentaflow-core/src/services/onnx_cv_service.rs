@@ -25,11 +25,10 @@ const DISPLAY_NAME: &str = "ONNX CV (modele dynamiczne)";
 
 /// Brings the local `onnx-cv` service row in line with `vision_models`.
 /// Returns `true` when anything changed (caller should refresh the mesh
-/// snapshot / catalog). Without the `inference-supertonic` feature the node
-/// cannot run ort sessions, so the service is kept absent regardless of
-/// registry contents.
+/// snapshot / catalog). Without the `vision-ort` feature the node cannot run
+/// dynamic ONNX vision sessions, so the service is kept absent.
 pub fn reconcile(db: &DbPool) -> Result<bool> {
-    let desired: Vec<String> = if cfg!(feature = "inference-supertonic") {
+    let desired: Vec<String> = if cfg!(feature = "vision-ort") {
         let rows = crate::db::repository::list_vision_models_all(db)?;
         let dir = crate::paths::vision_models_dir();
         rows.into_iter()

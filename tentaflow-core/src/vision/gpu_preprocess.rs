@@ -26,7 +26,7 @@
 #![cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort"
 ))]
 
 use anyhow::{bail, Result};

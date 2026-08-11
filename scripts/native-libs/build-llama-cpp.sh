@@ -189,7 +189,10 @@ build_backend() {
   fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
   backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
-  backend_enabled rocm "${enabled_backends[@]}" && cmake_args+=(-DGGML_HIP=ON)
+  if backend_enabled rocm "${enabled_backends[@]}"; then
+    cmake_args+=(-DGGML_HIP=ON)
+    [ -n "${CMAKE_HIP_ARCHITECTURES:-}" ] && cmake_args+=(-DCMAKE_HIP_ARCHITECTURES="$CMAKE_HIP_ARCHITECTURES")
+  fi
 
   if backend_enabled cuda "${enabled_backends[@]}"; then
     jobs="${LLAMA_CPP_CUDA_JOBS:-4}"

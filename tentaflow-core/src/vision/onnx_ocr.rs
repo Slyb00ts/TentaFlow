@@ -3,7 +3,7 @@
 // Opis: OcrRunner oparty o PaddleOCR PP-OCRv5 (klasyczny pipeline det -> cls ->
 //       rec). Backend inferencji wybierany cfg/feature — TAK SAMO jak
 //       `ocr_plate`/`classifier_stan`/`adr_ocr`:
-//         * `inference-supertonic` (ONNX Runtime, crate `ort`) → pula sesji ort
+//         * `vision-ort` (ONNX Runtime, crate `ort`) → pula sesji ort
 //           (TensorRT→CUDA→CPU) osobno per model (det/rec/cls). OCR biegnie na
 //           GPU; forward NIE serializuje się na jednowątkowym egzekutorze CPU. To
 //           ścieżka produkcyjna — WSZYSTKIE modele vision idą wtedy na GPU.
@@ -36,28 +36,28 @@ use image::RgbImage;
 use parking_lot::Mutex;
 use tracing::info;
 
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use tract_onnx::prelude::*;
 
 use super::resize::resize_rgb_image;
 use super::OcrRunner;
 
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
-/// Backend-specific per-model inference handle. Under `inference-supertonic` it is
+/// Backend-specific per-model inference handle. Under `vision-ort` it is
 /// an ort `SessionPool` (TensorRT→CUDA→CPU, GPU); otherwise a tract `Runnable`
 /// (pure Rust, CPU). The whole orchestration (`detect`/`maybe_rotate`/`recognize`)
 /// is backend-agnostic — only the `*_forward` helpers differ per backend.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 type OcrModel = crate::vision::ort_common::SessionPool;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 type OcrModel = Runnable;
 
 /// Rozmiar puli sesji ort dla PP-OCRv5 (wspólny dla det/rec/cls) z
 /// `[vision] ppocr_sessions`. Domyślnie 2 = kilka cropów OCR-uje się równolegle
 /// na GPU bez nadmiernego zajęcia VRAM (każda sesja to pełna kopia modelu).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn ppocr_pool_size() -> usize {
     crate::vision::ort_common::pool_size(crate::vision::settings::get().ppocr_sessions)
 }
@@ -73,7 +73,7 @@ fn ppocr_pool_size() -> usize {
 /// nie unifikuje sie z `1`. Czyscimy wiec wszystkie fakty wyjsc posrednich
 /// (kasujac symboliczne podpowiedzi z `value_info`) i pozwalamy tractowi
 /// wywnioskowac ksztalty wylacznie z konkretnego wejscia.
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn load_fixed_input(path: &Path, h: u32, w: u32) -> Result<Arc<Runnable>> {
     let mut model = tract_onnx::onnx()
         .model_for_path(path)
@@ -206,7 +206,7 @@ impl OnnxOcrEngine {
     }
 
     /// Katalog bundla (rodzic plików ONNX) — baza dla per-model engine-cache TRT.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn model_dir(&self) -> &Path {
         self.det_path.parent().unwrap_or_else(|| Path::new("."))
     }
@@ -230,7 +230,7 @@ impl OnnxOcrEngine {
     /// (batch 1, ustalony bok z `DET_LIMIT_SIDE`), wiec bez profilu TRT (`None`) —
     /// TensorRT buduje JEDEN engine dla tego kształtu leniwie na pierwszym forward
     /// (jeden engine per distinct shape). OCR zostaje w FP32 (`ocr_fp16()`).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn build_det_model(&self, _side: u32) -> Result<Arc<OcrModel>> {
         crate::vision::ort_common::ensure_ort_dylib();
         let n = ppocr_pool_size();
@@ -244,7 +244,7 @@ impl OnnxOcrEngine {
         Ok(Arc::new(pool))
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn build_det_model(&self, side: u32) -> Result<Arc<OcrModel>> {
         load_fixed_input(&self.det_path, side, side)
             .with_context(|| format!("tract: PP-OCRv5 det z {}", self.det_path.display()))
@@ -262,7 +262,7 @@ impl OnnxOcrEngine {
 
     /// Ort: pula sesji na `ppocrv5_rec.onnx`. Wejscie STALE `[1,3,48,REC_INPUT_W]`
     /// po padzie (batch 1, ustalony HxW) → bez profilu TRT (`None`). FP32.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn build_rec_model(&self) -> Result<Arc<OcrModel>> {
         crate::vision::ort_common::ensure_ort_dylib();
         let n = ppocr_pool_size();
@@ -276,7 +276,7 @@ impl OnnxOcrEngine {
         Ok(Arc::new(pool))
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn build_rec_model(&self) -> Result<Arc<OcrModel>> {
         load_fixed_input(&self.rec_path, REC_INPUT_H, REC_INPUT_W)
             .with_context(|| format!("tract: PP-OCRv5 rec z {}", self.rec_path.display()))
@@ -294,7 +294,7 @@ impl OnnxOcrEngine {
 
     /// Ort: opcjonalna pula sesji na `ppocrv5_cls.onnx`. Wejscie STALE
     /// `[1,3,48,192]` (batch 1, ustalony HxW) → bez profilu TRT (`None`). FP32.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn build_cls_model(&self) -> Result<Option<Arc<OcrModel>>> {
         let Some(path) = self.cls_path.as_ref() else {
             return Ok(None);
@@ -311,7 +311,7 @@ impl OnnxOcrEngine {
         Ok(Some(Arc::new(pool)))
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn build_cls_model(&self) -> Result<Option<Arc<OcrModel>>> {
         match self.cls_path.as_ref() {
             None => Ok(None),
@@ -436,7 +436,7 @@ impl OnnxOcrEngine {
 
     /// Forward detekcji DB → płaska mapa prawdopodobienstwa (owned f32). Ort:
     /// pojedynczy `session.run` na puli (GPU); tract: `model.run` (CPU).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn det_forward(&self, det: &DetSession, nchw: Vec<f32>, side: u32) -> Result<Vec<f32>> {
         let input = ndarray::Array4::from_shape_vec((1, 3, side as usize, side as usize), nchw)
             .map_err(|e| anyhow!("onnx-ocr: det nchw shape: {e}"))?;
@@ -464,7 +464,7 @@ impl OnnxOcrEngine {
         })
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn det_forward(&self, det: &DetSession, nchw: Vec<f32>, side: u32) -> Result<Vec<f32>> {
         let input: Tensor =
             tract_ndarray::Array4::from_shape_vec((1, 3, side as usize, side as usize), nchw)
@@ -499,7 +499,7 @@ impl OnnxOcrEngine {
 
     /// Forward klasyfikatora kata na wycinku → logity (owned f32), albo `None` gdy
     /// modelu cls nie ma w bundlu. Ort: pula sesji (GPU); tract: `model.run` (CPU).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn cls_forward(&self, crop: &RgbImage) -> Result<Option<Vec<f32>>> {
         let Some(pool) = self.cls_session()? else {
             return Ok(None);
@@ -536,7 +536,7 @@ impl OnnxOcrEngine {
         Ok(Some(logits))
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn cls_forward(&self, crop: &RgbImage) -> Result<Option<Vec<f32>>> {
         let Some(cls) = self.cls_session()? else {
             return Ok(None);
@@ -586,7 +586,7 @@ impl OnnxOcrEngine {
 
     /// Forward rozpoznania rec → `(logits, T, C)` z wyjscia (1,T,C). Ort: pula
     /// sesji (GPU); tract: `model.run` (CPU). C = liczba klas (slownik + blank na 0).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn rec_forward(&self, nchw: Vec<f32>) -> Result<(Vec<f32>, usize, usize)> {
         let pool = self.rec_session()?;
         let input = ndarray::Array4::from_shape_vec(
@@ -623,7 +623,7 @@ impl OnnxOcrEngine {
         })
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn rec_forward(&self, nchw: Vec<f32>) -> Result<(Vec<f32>, usize, usize)> {
         let rec = self.rec_session()?;
         let input: Tensor = tract_ndarray::Array4::from_shape_vec(
@@ -885,9 +885,9 @@ pub fn register_as_ocr_runner() -> Result<()> {
         }
     };
     super::set_ocr_runner(engine);
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     let backend = "ort TensorRT→CUDA→CPU";
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     let backend = "tract CPU";
     info!("[onnx-ocr] zarejestrowany jako in-process OCR runner (PP-OCRv5, {backend})");
     Ok(())

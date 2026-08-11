@@ -31,13 +31,13 @@ use crate::services::model_download::{download_with_progress, ProgressFn};
 
 /// One file in a camera-CV bundle. `remote` set → fetched from `<base>/<name>`;
 /// `embedded` set → written from the binary-embedded bytes (config sidecars).
-/// `supertonic_only` marks artifacts (the ort `.onnx` graphs) that ONLY the
-/// `inference-supertonic` build loads — a pure-Burn deploy must not require them.
+/// `ort_only` marks artifacts (the ORT `.onnx` graphs) that ONLY the
+/// `vision-ort` build loads — a pure-Burn deploy must not require them.
 struct CvFile {
     name: &'static str,
     remote: bool,
     embedded: Option<&'static str>,
-    supertonic_only: bool,
+    ort_only: bool,
 }
 
 struct CvBundle {
@@ -48,13 +48,13 @@ struct CvBundle {
 impl CvBundle {
     /// Files that apply to THIS build. On a pure-Burn build the ort-only `.onnx`
     /// artifacts are dropped, so `ensure_bundle` never demands them from the
-    /// release URL / remote manifest (they are a supertonic-only rollout dep).
+    /// release URL / remote manifest (they are an ORT-only rollout dependency).
     /// `cfg!(...)` is a plain runtime bool, so one const array serves both builds.
     fn effective_files(&self) -> Vec<&'static CvFile> {
-        let supertonic = cfg!(feature = "inference-supertonic");
+        let ort = cfg!(feature = "vision-ort");
         self.files
             .iter()
-            .filter(|f| supertonic || !f.supertonic_only)
+            .filter(|f| ort || !f.ort_only)
             .collect()
     }
 }
@@ -74,22 +74,22 @@ const BUNDLES: &[CvBundle] = &[
                 name: "rfdetr-base.bpk",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
-                // ONNX graph for the ort/TensorRT session pool. Only the supertonic
-                // build loads it — `supertonic_only` keeps it out of a pure-Burn
+                // ONNX graph for the ORT/TensorRT session pool. Only the vision-ort
+                // build loads it — `ort_only` keeps it out of a pure-Burn
                 // deploy's required set (see `CvBundle::effective_files`).
                 name: "rfdetr-base.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "rfdetr-classes.json",
                 remote: false,
                 embedded: Some(RFDETR_CLASSES),
-                supertonic_only: false,
+                ort_only: false,
             },
         ],
     },
@@ -100,7 +100,7 @@ const BUNDLES: &[CvBundle] = &[
                 name: "model_stan.bpk",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // ONNX graph + its external-weights sidecar for the ort session
@@ -108,19 +108,19 @@ const BUNDLES: &[CvBundle] = &[
                 name: "model_stan.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "model_stan.onnx.data",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "stan-classes.json",
                 remote: false,
                 embedded: Some(STAN_CLASSES),
-                supertonic_only: false,
+                ort_only: false,
             },
         ],
     },
@@ -131,20 +131,20 @@ const BUNDLES: &[CvBundle] = &[
                 name: "plate_ocr.bpk",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // ONNX graph for the ort session pool. Supertonic-only (see rfdetr).
                 name: "plate_ocr.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "plate-ocr-config.json",
                 remote: false,
                 embedded: Some(PLATE_CONFIG),
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // Nasz wytrenowany CRNN do numerów ADR (~4 MB). GŁÓWNY czytnik
@@ -153,7 +153,7 @@ const BUNDLES: &[CvBundle] = &[
                 name: "adr_ocr.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // Alfabet klas ADR OCR (`0123456789`) — mały i stabilny, więc
@@ -161,7 +161,7 @@ const BUNDLES: &[CvBundle] = &[
                 name: "adr_ocr_alphabet.txt",
                 remote: false,
                 embedded: Some(ADR_OCR_ALPHABET),
-                supertonic_only: false,
+                ort_only: false,
             },
         ],
     },
@@ -175,7 +175,7 @@ const BUNDLES: &[CvBundle] = &[
             name: "depth-anything-v2-metric.bpk",
             remote: true,
             embedded: None,
-            supertonic_only: false,
+            ort_only: false,
         }],
     },
 ];

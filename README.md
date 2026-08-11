@@ -369,7 +369,29 @@ Open the dashboard at **https://localhost:8090**.
 
 Useful `tentaflow-core` features: `inference-llamacpp`,
 `inference-whisper` (default), `inference-sherpa`, `inference-mlx*` (Apple), `inference-diarization`,
-`gpu-cuda`, `docker`.
+`gpu-cuda`, `gpu-vulkan`, `gpu-rocm`, `vision-rocm`, `docker`.
+
+Warianty głównej ścieżki vision:
+
+```bash
+# NVIDIA: dotychczasowy ORT/TensorRT/CUDA
+cargo build --release --features gpu-cuda
+
+# AMD/Intel: Burn przez WGPU/Vulkan
+cargo build --release --features gpu-vulkan
+
+# AMD: Burn przez ROCm/HIP
+cargo build --release --features gpu-rocm
+```
+
+Na kartach AMD i Intel rekomendowany jest build z Vulkan/WGPU dla głównej ścieżki
+vision (RF-DETR, Stan i OCR) oraz llama.cpp. Nie wymaga on CUDA ani `nvcc`; ROCm/HIP
+warto włączyć dla lokalnego llama.cpp lub jako natywny backend Burn na AMD. Przykład
+dla Radeon AI PRO R9700:
+`CMAKE_HIP_ARCHITECTURES=gfx1201 LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh`.
+CUDA-owy preprocessing zero-copy pozostaje osobną, jawną funkcją `gpu-cuda`/`vision-cuda`;
+Supertonic może nadal korzystać z ORT, ale nie wymusza już ORT dla wizji. NVIDIA z
+`gpu-cuda` zachowuje ścieżkę ORT/TensorRT/CUDA.
 
 ### Configuration
 

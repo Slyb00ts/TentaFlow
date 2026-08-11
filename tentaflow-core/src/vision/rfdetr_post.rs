@@ -7,7 +7,7 @@
 // modele rejestru `vision_models` (kontrakt `rfdetr`, runner `onnx_cv`) i
 // wbudowany detektor ADR (ort i Burn) liczyly wspolrzedne co do bitu tak samo.
 
-#![cfg(any(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#![cfg(any(feature = "inference-vision-gpu", feature = "vision-ort"))]
 
 use crate::services::detection_bus::Detection;
 

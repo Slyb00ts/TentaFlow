@@ -261,7 +261,8 @@ fn nv12_gpu_detect_available() -> bool {
     crate::vision::settings::get().nv12_detect
         && cfg!(all(
             feature = "inference-vision-gpu",
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))
 }
 
@@ -729,7 +730,8 @@ pub(super) fn attach_detect_branch_nv12(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gst::Element> {
     let appsink = gst::ElementFactory::make("appsink")
@@ -762,7 +764,8 @@ pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gs
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn attach_detect_branch_cuda(
     pipeline: &gst::Pipeline,
@@ -807,7 +810,8 @@ pub(super) fn attach_detect_branch_cuda(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn build_appsink_crops_cuda(
     camera_id: String,
@@ -845,7 +849,8 @@ pub(super) fn build_appsink_crops_cuda(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn attach_crops_branch_cuda(
     pipeline: &gst::Pipeline,
@@ -913,7 +918,8 @@ pub(super) fn zerocopy_enabled() -> bool {
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     {
         crate::vision::settings::get().zerocopy_detect
@@ -921,7 +927,8 @@ pub(super) fn zerocopy_enabled() -> bool {
     #[cfg(not(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     )))]
     {
         false
@@ -1689,7 +1696,8 @@ fn build_rtsp_pipeline_nvdec(
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
             feature = "inference-vision-gpu",
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         {
             if zerocopy_crops {
@@ -1723,7 +1731,8 @@ fn build_rtsp_pipeline_nvdec(
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
             feature = "inference-vision-gpu",
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         attach_detect_branch_cuda(&pipeline, tc, mailbox.clone())?;
     }

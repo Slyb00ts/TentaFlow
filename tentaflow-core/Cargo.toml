@@ -37,6 +37,9 @@ inference-mlx-kokoro = ["dep:libloading"]
 # statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
 # dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
+# ONNX Runtime dla głównej ścieżki wizji. Jest niezależny od Supertonic, żeby
+# AMD/Intel mogły używać Burn przez WGPU/Vulkan przy zachowaniu TTS przez ORT.
+vision-ort = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # RF-DETR ADR detector (Burn). Gates the whole detector/state/OCR modules + the
 # per-camera always-on analysis loop. Pulls the wgpu backend as the universal
 # floor; add `vision-cuda`/`vision-metal`/`vision-rocm` for a native backend.
@@ -45,9 +48,12 @@ inference-vision-gpu = ["vision-wgpu"]
 # feature picks the runtime (defaults to wgpu when none of cuda/metal/rocm set).
 vision-burn = ["dep:burn", "dep:burn-store", "burn/std"]
 vision-wgpu = ["vision-burn", "burn/wgpu", "burn/ndarray"]
-vision-cuda = ["vision-burn", "burn/cuda"]
+vision-cuda = ["vision-burn", "burn/cuda", "vision-ort", "vision-cuda-preprocess"]
 vision-metal = ["vision-burn", "burn/metal"]
 vision-rocm = ["vision-burn", "burn/rocm"]
+# CUDA-only preprocessing klatek NV12/RGB dla ścieżki zero-copy ORT.
+# Buildy AMD/Intel korzystają ze ścieżki hosta i nie wymagają nvcc.
+vision-cuda-preprocess = []
 inference-diarization = ["dep:tentaflow-voice"]
 rdma-probe = []
 # Udostępnia `flow_engine::node_adapter::test_support` (stub dispatcherów +
@@ -65,9 +71,9 @@ wasmi-runtime-test = ["dep:wasmi"]
 camera = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # Jedna flaga GPU per backend wlacza lokalne LLM. Konkretny backend GPU
 # wynika z natywnych bibliotek zbudowanych przez scripts/native-libs/build-all.sh.
-gpu-cuda = ["inference-llamacpp"]
-gpu-vulkan = ["inference-llamacpp"]
-gpu-rocm = ["inference-llamacpp"]
+gpu-cuda = ["inference-llamacpp", "inference-vision-gpu", "vision-cuda", "vision-cuda-preprocess"]
+gpu-vulkan = ["inference-llamacpp", "inference-vision-gpu"]
+gpu-rocm = ["inference-llamacpp", "inference-vision-gpu", "vision-rocm"]
 gpu-metal = ["inference-llamacpp"]
 # External Milvus backend (gRPC) selectable per addon alongside the embedded zvec.
 # The embedded zvec engine itself is NOT a feature — it is a mandatory dependency

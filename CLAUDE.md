@@ -38,6 +38,10 @@ if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale
 | `inference-mlx*` | Apple MLX (macOS/iOS) |
 | `inference-diarization` | speaker diarization (tentaflow-voice) |
 | `gpu-cuda` | CUDA accel for llama.cpp + whisper |
+| `gpu-vulkan` | Vulkan dla llama.cpp i przenośny backend WGPU dla vision |
+| `gpu-rocm` / `vision-rocm` | HIP/ROCm dla llama.cpp oraz opcjonalnego backendu Burn vision |
+| `vision-cuda` | CUDA backend Burn vision oraz CUDA preprocessing zero-copy |
+| `vision-ort` | ORT/TensorRT/CUDA dla głównej ścieżki vision; wybierane przez `gpu-cuda` |
 | `test-support` | exposes `flow_engine::node_adapter::test_support` (for benches) |
 
 `camera` is a default feature (GStreamer mandatory for the video pipeline).
@@ -449,6 +453,14 @@ access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write
   `LLAMA_CPP_NATIVE_VARIANT` (domyślnie `multi` = cuda+rocm+vulkan+cpu w jednym; linkowanie
   `multi` wymaga obecności WSZYSTKICH trzech runtime'ów — pod różne GPU buduj warianty
   jednobackendowe przez `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`).
+- Na Linux/Windows autodetekcja Whisper obejmuje CUDA, ROCm i Vulkan. Dla AMD można
+  wymusić architekturę układu, np. `CMAKE_HIP_ARCHITECTURES=gfx1201`, przed
+  `LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh`.
+- CUDA-owy preprocessing NV12/RGB dla ścieżki ORT zero-copy jest opt-in przez
+  `gpu-cuda` albo `vision-cuda`. Zwykły build AMD/Intel nie uruchamia `nvcc` i korzysta
+  z hostowego preprocessingu. Przenośny backend WGPU/Vulkan jest domyślną ścieżką
+  Burn dla głównego pipeline'u vision; `inference-supertonic` nie wymusza już ORT dla
+  wizji. `gpu-cuda` zachowuje ścieżkę ORT/TensorRT/CUDA dla NVIDIA.
 - `build-llama-cpp.sh` aplikuje lokalne patche z `scripts/native-libs/patches/llama-cpp/`.
   Obecny patch usuwa `SIGABRT` w auto-detekcji fused Gated Delta Net dla Qwen3.6/MTP
   na CUDA: nieznana nazwa tensora wyłącza fused GDN i loguje warning zamiast ubijać proces.

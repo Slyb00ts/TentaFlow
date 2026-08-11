@@ -25,16 +25,20 @@ pub mod settings;
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub mod gpu_preprocess;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(not(feature = "vision-cuda-preprocess"))]
+#[path = "gpu_preprocess_fallback.rs"]
+pub mod gpu_preprocess;
+#[cfg(feature = "vision-ort")]
 pub mod onnx_cv;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub mod ort_common;
 pub mod preprocessing;
 pub mod resize;
-#[cfg(any(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(any(feature = "inference-vision-gpu", feature = "vision-ort"))]
 pub mod rfdetr_post;
 
 // Vendored Burn models (build-time ONNX→Burn codegen; regenerate via
@@ -61,13 +65,13 @@ pub mod classifier_stan;
 // crops from ALL cameras into one big batched forward per model (ort/TRT path).
 #[cfg(feature = "inference-vision-gpu")]
 pub mod detector_rfdetr;
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 pub mod inference_batcher;
 // YOLOv8 vehicle detector — runs in parallel with RF-DETR (own ort pool) so each
 // ADR/plate/sticker can be associated to the vehicle it sits on (per-truck reads).
 #[cfg(feature = "inference-vision-gpu")]
 pub mod depth_anything;
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 pub mod detector_vehicle;
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_plate;

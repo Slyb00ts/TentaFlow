@@ -19,7 +19,7 @@
 // wybieranych round-robin — `Session::run` wymaga `&mut self`, więc dopiero
 // kilka sesji tego samego grafu pozwala na równoległe forwardy na GPU.
 
-#![cfg(feature = "inference-supertonic")]
+#![cfg(feature = "vision-ort")]
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};

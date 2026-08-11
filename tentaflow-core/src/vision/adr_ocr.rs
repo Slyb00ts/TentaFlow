@@ -4,7 +4,7 @@
 //       pomarańczową planszę Kemler/UN: górny wiersz (kemler) i dolny (numer UN),
 //       z wyszukiwaniem orientacji (tablice VID bywają obrócone o ~90°).
 //       Backend inferencji wybierany cfg/feature — TAK SAMO jak `ocr_plate`:
-//         * `inference-supertonic` (ONNX Runtime, crate `ort`) → pula sesji ort
+//         * `vision-ort` (ONNX Runtime, crate `ort`) → pula sesji ort
 //           (TensorRT→CUDA→CPU) na `adr_ocr.onnx`. OCR biegnie na GPU; forward NIE
 //           serializuje się na jednowątkowym egzekutorze CPU. To ścieżka produkcyjna.
 //         * inaczej → `tract-onnx` (pure Rust, CPU) na tym samym `adr_ocr.onnx`.
@@ -31,12 +31,12 @@ use anyhow::{anyhow, Context, Result};
 use parking_lot::Mutex;
 use tracing::warn;
 
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use anyhow::bail;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use tract_onnx::prelude::*;
 
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 type Runnable = RunnableModel<TypedFact, Box<dyn TypedOp>>;
 
 /// Wysokość i szerokość wejścia modelu (H×W), zgodnie z `Reader._prep`.
@@ -126,13 +126,13 @@ const ALPHABET_FILE: &str = "adr_ocr_alphabet.txt";
 /// (`forward_batch_chunked`) so an input never falls outside the pinned TRT
 /// shape range — out-of-range inputs would force a slow engine rebuild.
 const ADR_ROWS_MAX_BATCH: usize = 32;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const ADR_ROWS_OPT_BATCH: usize = 16;
 
 /// Ładuje model CRNN (tract) z USTALONYM wejściem `[1,1,32,128]` (NCHW f32). Model
 /// niesie dynamiczne kształty (Shape/Gather/Reshape wokół LSTM), więc czyścimy
 /// fakty wyjść pośrednich i pozwalamy tractowi wywnioskować kształty z wejścia.
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn load_fixed_input(path: &Path) -> Result<Arc<Runnable>> {
     let mut model = tract_onnx::onnx()
         .model_for_path(path)
@@ -161,10 +161,10 @@ fn load_fixed_input(path: &Path) -> Result<Arc<Runnable>> {
 pub struct AdrOcr {
     /// Pula sesji ONNX Runtime (TensorRT→CUDA→CPU) — ścieżka ort (GPU).
     /// Wewnętrznie współbieżna, więc `read_adr`/`read_row` biorą `&self`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pool: crate::vision::ort_common::SessionPool,
     /// Model tract (pure Rust, CPU) — ścieżka fallback bez feature ort.
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     model: Arc<Runnable>,
     /// Alfabet klas (bez blanku): klasa `v` (v≠0) mapuje na `alphabet[v-1]`.
     alphabet: Vec<char>,
@@ -199,7 +199,7 @@ impl AdrOcr {
         // profile over 1..=ADR_ROWS_MAX_BATCH — without it the TRT EP would
         // rebuild an engine on the first forward of EVERY new batch size. The
         // LSTM in the graph internally falls to the CUDA EP (still GPU).
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         {
             crate::vision::ort_common::ensure_ort_dylib();
             let n =
@@ -238,7 +238,7 @@ impl AdrOcr {
             Ok(Self { pool, alphabet })
         }
 
-        #[cfg(not(feature = "inference-supertonic"))]
+        #[cfg(not(feature = "vision-ort"))]
         {
             let model = load_fixed_input(&model_path)?;
             tracing::info!(
@@ -254,7 +254,7 @@ impl AdrOcr {
     /// zwraca `n` × `(logits, T, C)` z wyjścia `[n,T,C]`. ORT robi to JEDNYM
     /// wywołaniem sesji (model jest dynamic-batch), więc 8 orientacji ADR liczy się
     /// jednym forwardem zamiast ośmiu — to główny zysk (8.3 ms → ~1.5 ms/tablicę).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn forward_batch(&self, data: Vec<f32>, n: usize) -> Result<Vec<(Vec<f32>, usize, usize)>> {
         if n == 0 {
             return Ok(Vec::new());
@@ -301,7 +301,7 @@ impl AdrOcr {
     }
 
     /// Forward pojedynczego wejścia `[1,1,32,128]` przez tract (CPU) — fallback.
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn forward_single(&self, data: Vec<f32>) -> Result<(Vec<f32>, usize, usize)> {
         let input: Tensor =
             tract_ndarray::Array4::from_shape_vec((1, 1, IMG_H as usize, IMG_W as usize), data)
@@ -326,7 +326,7 @@ impl AdrOcr {
 
     /// Batched forward na tract: brak dynamic-batch w tej ścieżce (fixed [1,…]),
     /// więc pętla po pojedynczych forwardach. Ścieżka nieprodukcyjna (CPU).
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn forward_batch(&self, data: Vec<f32>, n: usize) -> Result<Vec<(Vec<f32>, usize, usize)>> {
         let per = (IMG_H * IMG_W) as usize;
         (0..n)

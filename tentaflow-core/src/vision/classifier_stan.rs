@@ -4,7 +4,7 @@
 //
 // Single-label condition classifier for ADR placards/labels (MobileNetV4).
 // Backend inferencji wybierany cfg/feature:
-//   * `inference-supertonic` (ONNX Runtime, crate `ort`) → pula sesji ort z
+//   * `vision-ort` (ONNX Runtime, crate `ort`) → pula sesji ort z
 //     łańcuchem EP TensorRT→CUDA→CPU, model `model_stan.onnx`. Pula jest
 //     wewnętrznie współbieżna (round-robin `Mutex<Session>`), więc forward NIE
 //     idzie już przez jednowątkowy egzekutor Burn/wgpu — cold-path enrichment
@@ -21,22 +21,22 @@
 #![cfg(feature = "inference-vision-gpu")]
 
 use anyhow::{anyhow, bail, Context, Result};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use burn::tensor::{Tensor, TensorData};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use std::sync::Arc;
 use tracing::info;
 
 use crate::paths;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use crate::vision::burn_stan::Model;
 
 /// Nazwa tensora wejściowego w grafie ONNX (`[batch,3,S,S]`).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const INPUT_NAME: &str = "input";
 
 // Classifier session-pool size comes from `[vision] stan_sessions` (default 4);
@@ -61,11 +61,11 @@ struct ClassesFile {
 pub struct StateClassifier {
     /// Pula sesji ONNX Runtime (TensorRT→CUDA→CPU) — ścieżka ort. Wewnętrznie
     /// współbieżna, więc `classify` bierze `&self` (interior mutability).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pool: crate::vision::ort_common::SessionPool,
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     model: Model<VisionBackend>,
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     device: VisionDevice,
     classes: Vec<String>,
     mean: [f32; 3],
@@ -93,7 +93,7 @@ impl StateClassifier {
 
         // Ścieżka ort+TensorRT: pula sesji na modelu dynamic-batch (`model_stan.onnx`),
         // każda z własnym engine-cache; jeden crop = forward batch=1.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         {
             let onnx_path = dir.join("model_stan.onnx");
             if !onnx_path.exists() {
@@ -148,7 +148,7 @@ impl StateClassifier {
         }
 
         // Ścieżka Burn: wagi `.bpk` na wybranym backendzie vision-*.
-        #[cfg(not(feature = "inference-supertonic"))]
+        #[cfg(not(feature = "vision-ort"))]
         {
             let weights_path = dir.join("model_stan.bpk");
             if !weights_path.exists() {
@@ -234,7 +234,7 @@ impl StateClassifier {
     ///
     /// Ścieżka ort: `&self` (pula sesji jest wewnętrznie współbieżna). Forward
     /// batch=1 na modelu dynamic-batch, wyjście `logits [1, num_classes]`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pub fn classify(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
         let s = self.img_size as usize;
         let data = self.preprocess(crop_rgb, cw, ch)?;
@@ -281,7 +281,7 @@ impl StateClassifier {
     /// wektor.
     ///
     /// Ścieżka ort: pula sesji jest wewnętrznie współbieżna, więc `&self`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pub fn classify_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Vec<String>>> {
         if crops.is_empty() {
             return Ok(Vec::new());
@@ -351,7 +351,8 @@ impl StateClassifier {
     /// per-session device wiring is deferred to the `run_cold_stages` integration).
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     pub fn classify_batch_gpu(&self, crops: &[(&[u8], u32, u32)]) -> Result<Vec<Vec<String>>> {
         if crops.is_empty() {
@@ -434,7 +435,7 @@ impl StateClassifier {
     /// Ścieżka Burn: model wkompilowany pod `[1,3,S,S]`, więc batch to pętla po
     /// pojedynczych forwardach (jak `adr_ocr::forward_batch` w wariancie tract).
     /// Zachowuje serializację wgpu (`classify` idzie przez `guarded_forward`).
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     pub fn classify_batch(&self, crops: &[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Vec<String>>> {
         crops
             .iter()
@@ -446,7 +447,7 @@ impl StateClassifier {
     /// caller MUSI serializować forwardy jednym wątkiem przez
     /// `burn_backend::run_blocking` — równoległe forwardy wgpu psują pamięć.
     /// Model wkompilowany pod `[1,3,S,S]` — jeden crop = jeden forward batch=1.
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     pub fn classify(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<Vec<String>> {
         let s = self.img_size as usize;
         let data = self.preprocess(crop_rgb, cw, ch)?;
