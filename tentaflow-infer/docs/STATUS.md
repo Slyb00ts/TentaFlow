@@ -2449,3 +2449,7 @@ France"; prefill warm **~5740 tok/s** vs ~11151 MMQ (**~0.51×, ~2× WOLNIEJ** �
 Na AMD gfx1201 dodano wąskie routowanie Bielik Q4K dla kolumn 5120 i wierszy 14336/28672. Kernel używa mapowania subgroupowego z legalnymi odczytami 16B, a wybór jest odrzucony dla innych modeli, architektur i kształtów. Niezależny oracle Q4K/Q8_1 z guardami przeszedł dla Bielika i kształtów Qwen.
 
 HTTP GPU1, prompt 512, completion 64, identyczny SHA: C1 69,154 tok/s vs 64,895 (+6,56%), C2 114,872 vs 107,400 (+6,96%), C4 161,840 vs 96,693 (+67,38%). Protokół: `/tmp/forge-portable32-e2e/`.
+
+## AMD gfx1201 Bielik global-Q8 (2026-08-11)
+
+Wąska ścieżka prepared global-Q8 obejmuje wyłącznie AMD gfx1201 oraz projekcje Bielik Q4_K `11264×4096`; offset wag jest walidowany przed uruchomieniem. Oracle z canary przeszedł, a release HIP przechodzi sprawdzenie. Sanity HTTP GPU1 (`prompt=821`, `completion=64`) zwróciło poprawną odpowiedź.
