@@ -513,12 +513,12 @@ enum IdleCoalescingDecision {
     Wait(Duration),
 }
 
-fn idle_dense_coalescing_decision(
+fn idle_coalescing_decision(
     elapsed: Duration,
     ready: usize,
     max_active: usize,
+    single_window: Duration,
 ) -> IdleCoalescingDecision {
-    const SINGLE_WINDOW: Duration = Duration::from_millis(1);
     const BURST_WINDOW: Duration = Duration::from_millis(5);
 
     if ready >= max_active {
@@ -527,7 +527,7 @@ fn idle_dense_coalescing_decision(
     let deadline = if ready >= 2 {
         BURST_WINDOW
     } else {
-        SINGLE_WINDOW
+        single_window
     };
     if elapsed >= deadline {
         IdleCoalescingDecision::Dispatch
@@ -859,13 +859,20 @@ fn worker<'t>(
                 return;
             };
             waiting.push_back(submission);
-            if dense_prefill_batch && max_active >= 4 {
+            let hybrid_cold_batch = model.is_hybrid() && model.hybrid_batch_capable();
+            if max_active >= 2 && (dense_prefill_batch || hybrid_cold_batch) {
+                let single_window = if hybrid_cold_batch {
+                    Duration::from_millis(50)
+                } else {
+                    Duration::from_millis(1)
+                };
                 let started = Instant::now();
                 loop {
-                    let IdleCoalescingDecision::Wait(timeout) = idle_dense_coalescing_decision(
+                    let IdleCoalescingDecision::Wait(timeout) = idle_coalescing_decision(
                         started.elapsed(),
                         waiting.len(),
                         max_active,
+                        single_window,
                     ) else {
                         break;
                     };
@@ -1085,6 +1092,10 @@ fn worker<'t>(
         // Gotowe decode ma pierwszeństwo przed pracą prefill, aby długi prompt
         // nie zwiększał ITL już generowanych sekwencji. Jeśli czeka prefill,
         // krok decode może pojechać w jego chunku (mixed step).
+        let hybrid_cold_staging = model.is_hybrid()
+            && model.hybrid_batch_capable()
+            && active.iter().any(|a| !a.dead && !a.pending_prompt.is_empty())
+            && active.iter().all(|a| a.dead || a.generated.is_empty());
         let mixed_prefill = if mixed_step_enabled {
             active
                 .iter()
@@ -1104,16 +1115,20 @@ fn worker<'t>(
         } else {
             None
         };
-        let mixed_done = batch_gpu_decode(
-            model,
-            &mut active,
-            batch_min,
-            native_mtp_b2,
-            mtp_ngram_batch,
-            mtp_ngram_mixed_batch,
-            mixed_prefill,
-            metrics,
-        );
+        let mixed_done = if hybrid_cold_staging {
+            false
+        } else {
+            batch_gpu_decode(
+                model,
+                &mut active,
+                batch_min,
+                native_mtp_b2,
+                mtp_ngram_batch,
+                mtp_ngram_mixed_batch,
+                mixed_prefill,
+                metrics,
+            )
+        };
         for a in active.iter_mut() {
             if a.dead || !a.pending_prompt.is_empty() || matches!(a.sampler, SeqSampler::Gpu(_)) {
                 continue;
@@ -1167,9 +1182,10 @@ fn worker<'t>(
         // decode sequence advance individually (chunked prefill / one token);
         // every GPU-sampled decode sequence runs through ONE batched forward
         // pass (`batch_gpu_decode`) — the continuous-batching throughput path.
-        let has_live_decode = active
-            .iter()
-            .any(|a| !a.dead && a.pending_prompt.is_empty());
+        let has_live_decode = !hybrid_cold_staging
+            && active
+                .iter()
+                .any(|a| !a.dead && a.pending_prompt.is_empty());
         let quantum = layer_major_scheduler_quantum(
             model.hybrid_layer_major_prefill_limit(),
             prefill_chunk,
@@ -1215,11 +1231,16 @@ fn worker<'t>(
         // per iteration (`active` keeps arrival order). A burst of new prompts
         // used to stack one chunk PER sequence between decode steps, so at
         // C=16 a decode step waited for ~16 chunks (~800 ms ITL spike) and
-        // every prompt's TTFT degenerated to the burst's tail. The batched
-        // dense path above still takes whole groups when they align.
+        // every prompt's TTFT degenerated to the burst's tail. A cold hybrid
+        // burst is the exception: staging all prompts before the first decode
+        // lets the already-supported grouped decode start with full width.
+        let cold_hybrid_burst = !mixed_done
+            && !has_live_decode
+            && model.is_hybrid()
+            && model.hybrid_batch_capable();
         let mut advanced_serial = mixed_done;
         for (index, a) in active.iter_mut().enumerate() {
-            if a.dead || advanced_serial {
+            if a.dead || (advanced_serial && !cold_hybrid_burst) {
                 continue;
             }
             if prefilled_b2.is_some_and(|pair| pair.contains(&index))
@@ -2815,27 +2836,52 @@ mod tests {
     #[test]
     fn idle_coalescing_ogranicza_b1_i_zbiera_burst_do_b16() {
         assert_eq!(
-            super::idle_dense_coalescing_decision(Duration::ZERO, 1, 16),
+            super::idle_coalescing_decision(Duration::ZERO, 1, 16, Duration::from_millis(1)),
             super::IdleCoalescingDecision::Wait(Duration::from_millis(1))
         );
         assert_eq!(
-            super::idle_dense_coalescing_decision(Duration::from_millis(1), 1, 16),
+            super::idle_coalescing_decision(
+                Duration::from_millis(1),
+                1,
+                16,
+                Duration::from_millis(1),
+            ),
             super::IdleCoalescingDecision::Dispatch
         );
         assert_eq!(
-            super::idle_dense_coalescing_decision(Duration::from_millis(1), 4, 16),
+            super::idle_coalescing_decision(
+                Duration::from_millis(1),
+                4,
+                16,
+                Duration::from_millis(1),
+            ),
             super::IdleCoalescingDecision::Wait(Duration::from_millis(4))
         );
         assert_eq!(
-            super::idle_dense_coalescing_decision(Duration::from_millis(4), 8, 16),
+            super::idle_coalescing_decision(
+                Duration::from_millis(4),
+                8,
+                16,
+                Duration::from_millis(1),
+            ),
             super::IdleCoalescingDecision::Wait(Duration::from_millis(1))
         );
         assert_eq!(
-            super::idle_dense_coalescing_decision(Duration::from_millis(5), 8, 16),
+            super::idle_coalescing_decision(
+                Duration::from_millis(5),
+                8,
+                16,
+                Duration::from_millis(1),
+            ),
             super::IdleCoalescingDecision::Dispatch
         );
         assert_eq!(
-            super::idle_dense_coalescing_decision(Duration::from_millis(2), 16, 16),
+            super::idle_coalescing_decision(
+                Duration::from_millis(2),
+                16,
+                16,
+                Duration::from_millis(1),
+            ),
             super::IdleCoalescingDecision::Dispatch
         );
     }

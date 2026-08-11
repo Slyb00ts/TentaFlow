@@ -2528,7 +2528,7 @@ impl Model {
         let bb = self.batch_bufs.as_ref().expect("provisioned");
         self.device
             .copy(&bb.out_ids, 0, &bb.pinned_out, 0, b * 4, &self.stream)?;
-        self.device.synchronize()?;
+        self.stream.synchronize()?;
         let op = bb.pinned_out.host_ptr().expect("pinned mapping") as *const i32;
         let ids = unsafe { std::slice::from_raw_parts(op, b) };
         let mut out = vec![0u32; b];
