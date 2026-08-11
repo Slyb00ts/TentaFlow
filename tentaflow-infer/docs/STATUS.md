@@ -12,6 +12,13 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Audyt CPU i batch decode Qwen na R9700 (2026-08-11).** Profil startupu
+  wskazał `fetch_embedding_host` i seryjne F32→F16 jako koszt ładowania; zmiana
+  z commitu `a769bf79` skróciła `forge run` o około 8,7%. Pomiar grouped decode
+  musi używać GPU samplera: `min_tokens` wymusza sampler CPU, więc celowo nie
+  zwiększa `hybrid_decode_batch_steps_total`. Dla p512/max64 bez `min_tokens`
+  HTTP C2 wykonał 63 kroki B2 (126 lane), a C4 63 kroki B4 (252 lane).
+
 - ✅ **HTTP na R9700 ma rozdzielony pomiar prefillu i decode (2026-08-11).**
   Vulkan: llama.cpp v290, GPU1, Vulkan1. Forge: GPU0, HIP, cache/spec off.
   Prefill to prompt tok/s z pierwszego eventu SSE (C=1); decode to agregat
