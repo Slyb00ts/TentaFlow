@@ -710,7 +710,7 @@ pub async fn chat_completions(
     if req.model != state.model_id {
         return ApiError::model_not_found(&req.model, &state.model_id).into_response();
     }
-    let spec = match req.generation_spec() {
+    let spec = match req.generation_spec_with(&state.default_sampling, &state.default_stop) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -853,7 +853,7 @@ pub async fn completions(
     if req.model != state.model_id {
         return ApiError::model_not_found(&req.model, &state.model_id).into_response();
     }
-    let spec = match req.generation_spec() {
+    let spec = match req.generation_spec_with(&state.default_sampling, &state.default_stop) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };

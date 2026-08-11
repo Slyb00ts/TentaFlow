@@ -21,6 +21,7 @@ use anyhow::Result;
 use axum::routing::{get, post};
 use axum::Router;
 use forge_engine::model::Model;
+use forge_engine::sample::SamplingParams;
 use forge_engine::server::EngineHandle;
 use forge_formats::PoolingType;
 use forge_tokenize::Tokenizer;
@@ -57,6 +58,8 @@ pub struct ServerConfig {
     /// Tool-call output syntax override: "hermes" | "llama3" | "none".
     /// `None` auto-detects from the chat template and model architecture.
     pub tool_call_parser: Option<String>,
+    pub default_sampling: SamplingParams,
+    pub default_stop: Vec<String>,
 }
 
 /// Shared per-server state handed to every handler.
@@ -74,6 +77,8 @@ pub struct ServerState {
     pub slots: Arc<tokio::sync::Semaphore>,
     pub model_id: String,
     pub api_key: Option<String>,
+    pub default_sampling: SamplingParams,
+    pub default_stop: Vec<String>,
     pub created: u64,
     /// Which tool-call syntax to parse out of this model's output.
     pub tool_parser: toolcall::ToolParserKind,
@@ -125,6 +130,8 @@ impl ServerState {
             )),
             model_id: cfg.model_id.clone(),
             api_key: cfg.api_key.clone(),
+            default_sampling: cfg.default_sampling.clone(),
+            default_stop: cfg.default_stop.clone(),
             created: std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_secs())

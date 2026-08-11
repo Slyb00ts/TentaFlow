@@ -245,6 +245,7 @@ const DEFAULT_MAX_TOKENS: usize = 1024;
 /// `min_tokens`, `logprobs`, `echo`) are layered on by each request's builder.
 #[allow(clippy::too_many_arguments)]
 fn sampling_core(
+    defaults: &SamplingParams,
     temperature: Option<f32>,
     top_p: Option<f32>,
     top_k: Option<usize>,
@@ -257,8 +258,9 @@ fn sampling_core(
     max_tokens: Option<usize>,
     max_completion_tokens: Option<usize>,
     stop: Option<StopSpec>,
+    default_stop: &[String],
 ) -> Result<(SamplingParams, usize, Vec<String>), ApiError> {
-    let mut sampling = SamplingParams::default();
+    let mut sampling = defaults.clone();
     if let Some(t) = temperature {
         if !t.is_finite() || t < 0.0 {
             return Err(ApiError::invalid_request(
@@ -319,7 +321,8 @@ fn sampling_core(
     Ok((
         sampling,
         max_tokens,
-        stop.map(StopSpec::into_vec).unwrap_or_default(),
+        stop.map(StopSpec::into_vec)
+            .unwrap_or_else(|| default_stop.to_vec()),
     ))
 }
 
@@ -390,6 +393,14 @@ const CHAT_ROLES: &[&str] = &["system", "user", "assistant", "tool"];
 
 impl ChatCompletionRequest {
     pub fn generation_spec(&self) -> Result<GenerationSpec, ApiError> {
+        self.generation_spec_with(&SamplingParams::default(), &[])
+    }
+
+    pub fn generation_spec_with(
+        &self,
+        defaults: &SamplingParams,
+        default_stop: &[String],
+    ) -> Result<GenerationSpec, ApiError> {
         if self.messages.is_empty() {
             return Err(ApiError::invalid_request("messages must not be empty"));
         }
@@ -413,6 +424,7 @@ impl ChatCompletionRequest {
             }
         }
         let (sampling, max_tokens, stop) = sampling_core(
+            defaults,
             self.temperature,
             self.top_p,
             self.top_k,
@@ -425,6 +437,7 @@ impl ChatCompletionRequest {
             self.max_tokens,
             self.max_completion_tokens,
             self.stop.clone(),
+            default_stop,
         )?;
         // `logprobs` is a bool for chat; `top_logprobs` selects the alternative
         // count and requires `logprobs = true`.
@@ -555,7 +568,16 @@ impl ChatCompletionRequest {
 
 impl CompletionRequest {
     pub fn generation_spec(&self) -> Result<GenerationSpec, ApiError> {
+        self.generation_spec_with(&SamplingParams::default(), &[])
+    }
+
+    pub fn generation_spec_with(
+        &self,
+        defaults: &SamplingParams,
+        default_stop: &[String],
+    ) -> Result<GenerationSpec, ApiError> {
         let (sampling, max_tokens, stop) = sampling_core(
+            defaults,
             self.temperature,
             self.top_p,
             self.top_k,
@@ -568,6 +590,7 @@ impl CompletionRequest {
             self.max_tokens,
             self.max_completion_tokens,
             self.stop.clone(),
+            default_stop,
         )?;
         let logprobs = match self.logprobs {
             None => None,

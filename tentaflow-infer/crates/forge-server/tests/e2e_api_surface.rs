@@ -114,6 +114,8 @@ async fn api_surface_end_to_end() {
         model_id: "qwen3-0.6b".into(),
         api_key: None,
         tool_call_parser: None,
+        default_sampling: Default::default(),
+        default_stop: vec![],
     };
     let state = ServerState::new(
         &cfg,

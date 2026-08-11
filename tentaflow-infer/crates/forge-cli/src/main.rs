@@ -1,6 +1,7 @@
 // ===== File: main.rs — `forge` CLI: serve an OpenAI API, run one-shot generation, benchmark =====
 
 mod bench;
+mod config;
 mod hf;
 
 use std::net::SocketAddr;
@@ -74,24 +75,22 @@ enum Command {
         #[arg(long)]
         api_key: Option<String>,
         /// Maksymalna liczba równocześnie dekodowanych sekwencji.
-        /// Domyślnie 1 dla MTP, w pozostałych trybach 8.
+        /// Wspólny domyślny limit wszystkich wejść to 1.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         max_active: Option<u16>,
         /// Minimum simultaneously-decoding sequences before the batched forward
-        /// path engages. Default: automatic — 2 on models with small-batch
-        /// decode kernels (NVFP4), else 12 (token-tile GEMM formats only
-        /// amortize the flat tile cost at that concurrency).
+        /// path engages. The same default is used by run and bench.
         #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
         batch_min: Option<u16>,
         /// Prompt tokens one sequence may prefill per scheduler iteration
         /// (larger = better TTFT and throughput, smaller = better decode ITL
         /// of the other active sequences during a long prefill; measured C=16
         /// p1024 sweet spot is 1024 — 628 tok/s vs 606 @512 and 499 @256).
-        #[arg(long, default_value_t = 1024)]
+        #[arg(long, default_value_t = config::DEFAULT_PREFILL_CHUNK)]
         prefill_chunk: usize,
         /// KV cache pages (32 tokens each) shared by all sequences. Raised to
         /// at least one full `--ctx` window if smaller.
-        #[arg(long, default_value_t = 512)]
+        #[arg(long, default_value_t = config::DEFAULT_KV_PAGES)]
         kv_pages: usize,
         /// Max context length per request in tokens (0 = the model's maximum).
         #[arg(long = "ctx", default_value_t = 0)]
@@ -162,12 +161,12 @@ enum Command {
         /// prefixes (system prompts, few-shot, multi-turn) so a request sharing
         /// a prefix skips re-prefilling it. Strict optimization; auto-inactive
         /// with tiering / rot KV / hybrid arch.
-        #[arg(long = "prefix-cache", default_value = "on")]
+        #[arg(long = "prefix-cache", default_value = config::DEFAULT_PREFIX_CACHE)]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3]. `on`
         /// używa proposera n-gram. MTP wymaga greedy bez kar; `max-active > 1`
         /// przechodzi startup preflight pamięci. Spekulacja wyłącza prefix cache.
-        #[arg(long = "speculative", default_value = "off")]
+        #[arg(long = "speculative", default_value = config::DEFAULT_SPECULATIVE)]
         speculative: String,
         /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
         /// przecinku, np. `--tp-cards 1`. Karta modelu jest zawsze pierwsza,
@@ -220,6 +219,15 @@ enum Command {
         chat: bool,
         #[arg(long = "no-chat", overrides_with = "chat")]
         no_chat: bool,
+        /// Maximum number of concurrently decoded sequences.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: Option<u16>,
+        /// Minimum batch size that enables the batched forward path.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: Option<u16>,
+        /// Prompt tokens processed by one scheduler iteration.
+        #[arg(long, default_value_t = config::DEFAULT_PREFILL_CHUNK)]
+        prefill_chunk: usize,
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
@@ -278,10 +286,10 @@ enum Command {
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
-        #[arg(long = "prefix-cache", default_value = "on")]
+        #[arg(long = "prefix-cache", default_value = config::DEFAULT_PREFIX_CACHE)]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        #[arg(long = "speculative", default_value = "off")]
+        #[arg(long = "speculative", default_value = config::DEFAULT_SPECULATIVE)]
         speculative: String,
         /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
         /// przecinku, np. `--tp-cards 1`. Karta modelu jest zawsze pierwsza,
@@ -325,6 +333,15 @@ enum Command {
     Bench {
         /// GGUF file or HF snapshot directory.
         model_path: PathBuf,
+        /// Maximum number of concurrently decoded sequences.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: Option<u16>,
+        /// Minimum batch size that enables the batched forward path.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: Option<u16>,
+        /// Prompt tokens processed by one scheduler iteration.
+        #[arg(long, default_value_t = config::DEFAULT_PREFILL_CHUNK)]
+        prefill_chunk: usize,
         /// Tokens to decode.
         #[arg(long, default_value_t = 128)]
         tokens: usize,
@@ -387,17 +404,16 @@ enum Command {
         /// set explicitly.
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
-        /// Radix-tree prefix caching (SPEC §5.2): on | off. Domyślnie OFF,
-        /// inaczej niż w `serve`: kolejne powtórzenia trafiałyby w cache i
-        /// przeliczały tylko rozbieżny ogon promptu, więc raportowany prefill
-        /// byłby zawyżony. Trafienie w cache kończy benchmark błędem.
-        #[arg(long = "prefix-cache", default_value = "off")]
+        /// Radix-tree prefix caching (SPEC §5.2): on | off. The shared default
+        /// is OFF so benchmark repetitions always measure the full prefill.
+        /// A cache hit still ends the benchmark with an error.
+        #[arg(long = "prefix-cache", default_value = config::DEFAULT_PREFIX_CACHE)]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        #[arg(long = "speculative", default_value = "off")]
+        #[arg(long = "speculative", default_value = config::DEFAULT_SPECULATIVE)]
         speculative: String,
         /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
-        #[arg(long = "reps", default_value_t = 5)]
+        #[arg(long = "reps", default_value_t = config::DEFAULT_REPS)]
         reps: usize,
         /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
         /// przecinku, np. `--tp-cards 1`.
@@ -527,6 +543,9 @@ fn main() -> Result<()> {
             temperature,
             chat,
             no_chat,
+            max_active,
+            batch_min,
+            prefill_chunk,
             weights_pool_gb,
             weight_host_gb,
             weight_spill_dir,
@@ -561,6 +580,9 @@ fn main() -> Result<()> {
                 temperature,
                 chat,
                 no_chat,
+                max_active,
+                batch_min,
+                prefill_chunk,
                 weights_pool_gb,
                 weight_host_gb,
                 weight_spill_dir.clone(),
@@ -588,6 +610,9 @@ fn main() -> Result<()> {
         } => cmd_onnx_run(&model_path, samples, sr, &signal),
         Command::Bench {
             model_path,
+            max_active,
+            batch_min,
+            prefill_chunk,
             tokens,
             prompt_tokens,
             prompt_token_ids,
@@ -622,6 +647,9 @@ fn main() -> Result<()> {
             )?;
             cmd_bench(
                 &model_path,
+                max_active,
+                batch_min,
+                prefill_chunk,
                 tokens,
                 prompt_tokens,
                 prompt_token_ids.as_deref(),
@@ -732,16 +760,10 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
 
 fn resolve_max_active(
     max_active: Option<u16>,
-    spec: &SpeculativeConfig,
-    hybrid_model: bool,
+    _spec: &SpeculativeConfig,
+    _hybrid_model: bool,
 ) -> Result<usize> {
-    let max_active = usize::from(max_active.unwrap_or_else(|| {
-        if hybrid_model || spec.is_native_mtp() {
-            1
-        } else {
-            8
-        }
-    }));
+    let max_active = usize::from(max_active.unwrap_or(config::DEFAULT_MAX_ACTIVE as u16));
     if max_active == 0 {
         bail!("--max-active musi być większe od zera");
     }
@@ -1781,17 +1803,10 @@ fn cmd_serve(
     // The engine caps a sequence at the configured context; the model's own
     // positional limit is already folded into max_seq_len by resolve_ctx.
     let max_context = max_seq_len;
-    let chat_template = if matches!(
-        loaded.model.weights.descriptor.arch.as_str(),
-        "muse-glimmer" | "muse_glimmer"
-    ) {
-        // The GGUF template uses Jinja type tests and mapping helpers that the
-        // portable Forge template engine deliberately does not implement.
-        // Muse's text protocol only needs the role/content envelope here.
-        "{{ bos_token }}{% for message in messages %}<|start|>{{ message['role'] }}<|message|>{{ message['content'] }}<|eot|>{% endfor %}<|start|>assistant<|message|>".to_string()
-    } else {
-        loaded.chat_template.clone()
-    };
+    let chat_template = config::chat_template(
+        &loaded.model.weights.descriptor.arch,
+        loaded.chat_template.clone(),
+    );
     let tool_parser = ToolParserKind::resolve(
         tool_call_parser.as_deref(),
         &loaded.model.weights.descriptor.arch,
@@ -1809,7 +1824,9 @@ fn cmd_serve(
         tokenizer.clone(),
         max_active,
         prefill_chunk,
-        batch_min.map(usize::from).unwrap_or(0),
+        batch_min
+            .map(usize::from)
+            .unwrap_or(config::DEFAULT_BATCH_MIN),
         spec,
     )?;
 
@@ -1856,11 +1873,19 @@ fn cmd_serve(
         None => None,
     };
 
+    let profile =
+        forge_engine::model_profile::resolve(&forge_engine::model_profile::identify(model_path));
     let cfg = ServerConfig {
         bind,
         model_id: served_id,
         api_key,
         tool_call_parser,
+        default_sampling: config::sampling_from_profile(profile),
+        default_stop: profile
+            .stop
+            .iter()
+            .map(|stop| (*stop).to_string())
+            .collect(),
     };
     let state = ServerState::new(
         &cfg,
@@ -1939,6 +1964,9 @@ fn cmd_run(
     temperature: Option<f32>,
     chat: bool,
     no_chat: bool,
+    max_active: Option<u16>,
+    batch_min: Option<u16>,
+    prefill_chunk: usize,
     weights_pool_gb: f64,
     weight_host_gb: f64,
     weight_spill_dir: Option<std::path::PathBuf>,
@@ -1958,7 +1986,8 @@ fn cmd_run(
     // modelu, a jest tylko złym ustawieniem domyślnym.
     let profile =
         forge_engine::model_profile::resolve(&forge_engine::model_profile::identify(model_path));
-    let temperature = temperature.unwrap_or(profile.temperature);
+    let mut sampling = config::sampling_from_profile(profile);
+    sampling.temperature = temperature.unwrap_or(profile.temperature);
     // `--ctx 0` znaczy „pełne okno modelu"; profil podaje wartość tam, gdzie
     // pełne okno jest niepraktyczne (Gemma 4 żąda wtedy ponad 100 GB VRAM).
     let ctx = if ctx == 0 {
@@ -1974,14 +2003,15 @@ fn cmd_run(
         profile.chat_template
     };
     eprintln!(
-        "profil modelu: {} (temp {temperature}, szablon czatu {})",
-        profile.label, chat
+        "profil modelu: {} (temp {}, szablon czatu {})",
+        profile.label, sampling.temperature, chat
     );
 
     let t0 = Instant::now();
+    let max_active = resolve_max_active(max_active, &spec, false)?;
     let mut loaded = load_auto(
         model_path,
-        1,
+        max_active,
         weights_pool_gb,
         weight_host_gb,
         weight_spill_dir,
@@ -2008,7 +2038,10 @@ fn cmd_run(
     let prompt_text = if chat {
         ChatTemplateEngine::new()
             .render(
-                &loaded.chat_template,
+                &config::chat_template(
+                    &loaded.model.weights.descriptor.arch,
+                    loaded.chat_template.clone(),
+                ),
                 &[ChatMessage::text("user", prompt)],
                 None,
                 true,
@@ -2029,9 +2062,11 @@ fn cmd_run(
     let engine = forge_engine::server::spawn_engine_batched(
         loaded.model,
         tokenizer,
-        1,
-        forge_engine::model::MAX_PREFILL_CHUNK,
-        12,
+        config::DEFAULT_MAX_ACTIVE,
+        prefill_chunk,
+        batch_min
+            .map(usize::from)
+            .unwrap_or(config::DEFAULT_BATCH_MIN),
         spec,
     )?;
 
@@ -2041,11 +2076,12 @@ fn cmd_run(
         EngineRequest {
             prompt_tokens,
             max_tokens,
-            sampling: SamplingParams {
-                temperature,
-                ..SamplingParams::default()
-            },
-            stop: vec![],
+            sampling,
+            stop: profile
+                .stop
+                .iter()
+                .map(|stop| (*stop).to_string())
+                .collect(),
             eos_ids,
             grammar: None,
             ..Default::default()
@@ -2359,6 +2395,9 @@ fn maybe_calibrate_w4a8(
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
     model_path: &Path,
+    max_active: Option<u16>,
+    batch_min: Option<u16>,
+    prefill_chunk: usize,
     tokens: usize,
     prompt_tokens: usize,
     prompt_token_ids: Option<&Path>,
@@ -2386,10 +2425,11 @@ fn cmd_bench(
     if reps == 0 {
         bail!("--reps must be at least 1");
     }
+    let max_active = resolve_max_active(max_active, &spec, false)?;
     let t0 = Instant::now();
     let mut loaded = load_auto(
         model_path,
-        1,
+        max_active,
         weights_pool_gb,
         weight_host_gb,
         weight_spill_dir,
@@ -2400,7 +2440,7 @@ fn cmd_bench(
         hot_pages,
         prefix_cache,
         spec.is_native_mtp(),
-        resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), 1)?,
+        resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), max_active)?,
         tp_world,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
@@ -2488,9 +2528,11 @@ fn cmd_bench(
     let engine = forge_engine::server::spawn_engine_batched(
         loaded.model,
         tokenizer,
-        1,
-        forge_engine::model::MAX_PREFILL_CHUNK,
-        12,
+        max_active,
+        prefill_chunk,
+        batch_min
+            .map(usize::from)
+            .unwrap_or(config::DEFAULT_BATCH_MIN),
         spec,
     )?;
     let mut target_ms = Vec::with_capacity(reps);
@@ -2830,7 +2872,7 @@ mod speculation_cli_tests {
             assert_eq!(config.kind(), SpeculationKind::HostProposer);
             assert_eq!(config.draft_tokens(), budget);
             assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
-            assert_eq!(resolve_max_active(None, &config, false).unwrap(), 8);
+            assert_eq!(resolve_max_active(None, &config, false).unwrap(), 1);
             assert!(!config.proposers().contains(&ProposerKind::Mtp));
         }
     }
@@ -2865,7 +2907,7 @@ mod speculation_cli_tests {
         let mtp = parse_speculative("mtp").unwrap();
         let off = parse_speculative("off").unwrap();
         assert_eq!(resolve_max_active(None, &mtp, true).unwrap(), 1);
-        assert_eq!(resolve_max_active(None, &off, false).unwrap(), 8);
+        assert_eq!(resolve_max_active(None, &off, false).unwrap(), 1);
         assert_eq!(resolve_max_active(None, &off, true).unwrap(), 1);
         assert_eq!(resolve_max_active(Some(1), &mtp, true).unwrap(), 1);
         assert_eq!(resolve_max_active(Some(2), &mtp, true).unwrap(), 2);
