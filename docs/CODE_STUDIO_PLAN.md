@@ -1,11 +1,35 @@
 # Code Studio — plan wdrożenia
 
-> **Rewizja 1.7** (2026-08-14). Wbudowany moduł Core (NIE addon), na wzór ML Studio i Projektów:
+> **Rewizja 1.8** (2026-08-14). Wbudowany moduł Core (NIE addon), na wzór ML Studio i Projektów:
 > środowisko pracy nad kodem — repozytoria, edytor, terminal, git — napędzane własnym,
 > wieloagentowym harnessem, którego każdy krok jest widoczny jako blok w Flow Builderze.
 > Codex i Claude Code są w nim **jednym z agentów**, a nie osobnym światem.
 >
 > Odniesienia `plik:linia` pochodzą z audytu repo z 2026-08-14.
+
+### Zmiany 1.7 → 1.8
+
+**Agent woła narzędzie albo agenta — nic więcej.** Rewizje do 1.7 wpisywały przegląd, testy, commit
+i merge w **topologię grafu**: były osobnymi blokami po pętli, więc kolejność kroków była
+zadekretowana przez flow, a nie wybierana przez agenta z kontekstu rozmowy. To nie odpowiada temu,
+jak działają istniejące harnessy (Claude Code, Codex) i odbierało agentowi głównemu jedyną wiedzę,
+której nie ma nikt inny: czy w tej rozmowie w ogóle chodziło o wypchnięcie czegokolwiek.
+
+Model docelowy: agent ma **narzędzia** (`fs_*`, `exec`, `git_*`, `ask_user`) i **agentów**
+(`agent_spawn`), a bezpieczeństwo jest **polityką w PEP**, nie kształtem grafu. `git_commit` jest
+zwykłym narzędziem, którego bramka wymaga **zaakceptowanego patch setu** — wywołanie bez niego
+otwiera przegląd i wstrzymuje run. Commit dalej powstaje z zaakceptowanych blobów (§11.5), więc
+gwarancja „commituje się dokładnie to, co człowiek zobaczył" nie zależy od tego, kto wywołał
+narzędzie.
+
+| # | Zmiana | Sekcja |
+|---|---|---|
+| 1 | `git_commit`, `git_stage`, `git_merge` przestają być systemowe i wchodzą do zestawu narzędzi agenta, z bramkami w PEP. `git_worktree` zostaje systemowe | §9.2, §9.3, §10 |
+| 2 | Nowa bramka PEP: `git_commit` bez zaakceptowanego patch setu zwraca `AskUser` z przeglądem zmian, nie `Deny` | §9.3 |
+| 3 | Merge rozbity na dwa narzędzia — `git_merge` (worktree integracyjny, wynik albo konflikt) i `git_merge_finalize` (commit z blobów + atomowy `update-ref`); saga z §11.6 zostaje bez zmian, zmienia się tylko to, kto ją inicjuje | §10, §11.6 |
+| 4 | Nowy agent `code-committer` — specjalista od gita, jedyny z `git_push` w allowliście wariantu zespołowego | §15 |
+| 5 | §16.2 zastąpione **dwoma wariantami** flow: „agent decyduje" (9 bloków, domyślny) i „wymuszony łańcuch" (bloki `spawn` za regionem). Trzeci, prawdopodobnie najczęstszy: wymuszone testy i przegląd, git zostawiony agentowi | §16.2 |
+| 6 | Blok `git_op` usunięty — nie ma czego opakowywać, skoro operacje gita są narzędziami. `patch_review` zostaje jako blok **opcjonalny**, bo domyślnie przegląd otwiera bramka PEP | §16.4 |
 
 ### Zmiany 1.6 → 1.7
 
@@ -108,13 +132,14 @@ bramka egress; `SessionAssertion`; idempotencja efektów; poprawiony CAS; `manda
 | Obszar | Decyzja |
 |---|---|
 | Mózg | Własny harness na flow engine. Codex/Claude Code jako **agenci typu CLI** |
-| Agenci | Role (planowanie / orkiestracja / kodowanie / wyszukiwanie / przegląd / testy) na istniejącej tabeli `agents`; każdy z własnym modelem, capability i skillami |
-| Orkiestracja | Hybryda: jawne `spawn`/`await_subagents` **oraz** `core.agent_spawn` |
-| Flow | Jeden flow „Code Harness", edytowalny, **acykliczny**; iteracja = nowy run w tej samej sesji |
+| Agenci | Role (orkiestracja / planowanie / kodowanie / wyszukiwanie / przegląd / testy / git) na istniejącej tabeli `agents`; każdy z własnym modelem, allowlistą narzędzi i skillami |
+| Czasowniki | Agent robi **dwie rzeczy**: woła narzędzie (§10) albo woła agenta (`core.agent_spawn`). Nie ma trzeciej kategorii |
+| Orkiestracja | Domyślnie decyduje agent; jawne `spawn`/`await_subagents` **wymuszają** krok, gdy flow ma dawać gwarancję |
+| Flow | Harness jako flow, edytowalny; iteracja to **pętla narzędziowa w regionie**, a nowy run tylko tam, gdzie run musi się zamknąć |
 | Wykonanie | **`trusted_native` domyślnie** (zaufane wykonanie lokalne, bez obietnicy izolacji od hosta); `container` jako świadomy wybór pełnej izolacji — §7.1 |
 | Koordynator | **Owner node** — pliki, procesy, zgody, CLI, broker git, adapter dostawcy, zapis zdarzeń |
 | Git | W całości w brokerze na owner node; sandbox dostaje shim RPC z tokenem związanym z aktorem i runem |
-| Commit | Wykonuje **tylko koordynator**, z blobów zaakceptowanych w review; żaden agent nie ma `git_commit` |
+| Commit | Narzędzie agenta, ale bramkowane: bez **zaakceptowanego patch setu** wywołanie otwiera przegląd, a treść zawsze pochodzi z blobów, nie z worktree |
 | Sieć sandboxa | Brak trasy domyślnej; wyjście przez bramkę egress; ruch do dostawcy przez adapter terminujący TLS |
 | Węzeł / katalog | Użytkownik wybiera **węzeł**; katalog zakłada **system** |
 | Mesh | Transport od Fazy 4; model danych i granice od Fazy 1 |
@@ -248,8 +273,9 @@ ekran `www/js/app.js:66,521`; strumienie `stream_handlers.rs:1824,2122`), `ml_li
    procesem agenta z własną mapą `git_dir`, commit z zaakceptowanych blobów, obowiązkowe pytanie
    przy `push`/`merge`, poświadczenie dostawcy wyłącznie w adapterze. To jest ta część kontraktu,
    której `trusted_native` nie traci.
-5. **Granica integralności zmian** — commitowane jest wyłącznie to, co przeszło review; commit
-   buduje koordynator z zapisanych blobów, nie z worktree (§11.5).
+5. **Granica integralności zmian** — commitowane jest wyłącznie to, co przeszło review. Nie zależy to
+   od tego, kto wywołał `git_commit`: broker buduje commit z zapisanych blobów, nie z worktree
+   (§11.5), a bramka 5a nie przepuszcza wywołania bez zaakceptowanego patch setu (§9.3).
 
 ### 2.3 Czego świadomie nie chronimy
 
@@ -954,7 +980,7 @@ Zależności: `rustix` (albo obecny `libc`, `Cargo.toml:381`) i `windows-sys`.
 | Przedmiot | capability + cel | snapshot zmian (`patch_set`) |
 | Odpowiedź | allow_once / for_run / for_session / always / deny | akceptacja per hunk/plik/całość, odrzucenie, poprawka |
 | Trwałość | `approvals`, `session_grants`, `code_workspace_allowlist` | `patch_sets/files/hunks` |
-| Blok w grafie | brak (mechanizm poprzeczny) | `patch_review` |
+| Blok w grafie | brak (mechanizm poprzeczny) | brak w wariancie domyślnym — przegląd otwiera bramka PEP na `git_commit`; blok `patch_review` jest opcjonalny |
 
 Zakresy: `allow_once`, `allow_for_run` (istniejący `run_grants`, per run —
 `agents/interaction.rs:152-159`), `allow_for_session` (`session_grants`), `always`
@@ -970,17 +996,19 @@ Zakresy: `allow_once`, `allow_for_run` (istniejący `run_grants`, per run —
 | `git_read` | ✔ | ✔ | ✔ |
 | `git_branch`, `git_checkout`, `git_stash` | ✔ | ✔ | ✖ |
 | `git_network` (fetch/pull) | ✔ | ✔ | ✖ |
-| `git_push`, `git_merge` | ✔ | ✖ | ✖ |
-| `git_commit`, `git_stage`, `git_worktree` | **system** | **system** | **system** |
+| `git_push`, `git_merge`, `git_merge_finalize` | ✔ | ✖ | ✖ |
+| `git_commit`, `git_stage` | ✔ | ✔ | ✖ |
+| `git_worktree` | **system** | **system** | **system** |
 | `net_egress` | ✔ | ✔ | ✖ |
 | `cli_delegate` (wydanie ticketu adaptera) | ✔ | ✔ | ✖ |
 | `review_decide` | ✔ | ✔ | ✖ |
 | `session_open` | ✔ | ✔ | ✖ |
 | `workspace_settings`, `member_manage`, `secret_manage` | ✔ | ✖ | ✖ |
 
-`git_commit`, `git_stage` i `git_worktree` są **systemowe**: wykonuje je wyłącznie koordynator
-(§11.5). Żaden agent modelowy ani terminal ich nie ma — inaczej commit może pominąć review, a sesja
-wyjść ze swojej izolacji.
+`git_worktree` zostaje **systemowe**: zakładanie i usuwanie worktree to operacja koordynatora,
+bo tym sesja wychodziłaby ze swojej izolacji. `git_commit` i `git_stage` są zwykłymi narzędziami
+agenta — commit nie może pominąć przeglądu nie dlatego, że agent go nie ma, tylko dlatego, że
+bramka wymaga zaakceptowanego patch setu, a treść bierze się z blobów, nie z dysku (§9.3, §11.5).
 
 ### 9.3 PEP
 
@@ -993,8 +1021,13 @@ pub fn authorize(ctx: &SessionCtx, cap: Capability, target: &Target) -> Decision
 2. rola nie pozwala → `Deny`;
 3. tryb autonomii zakazuje → `Deny`;
 4. cel poza granicą (ścieżka spoza worktree, host spoza allowlisty) → `Deny`;
-5. **`mandatory_interactive`** (`git_push`, `git_merge`, `secret_manage`) → `AskUser` **zawsze**,
-   z pominięciem 6–8; grant `always` dla nich odrzucany przy zapisie, dozwolony wyłącznie `allow_once`;
+5. **`mandatory_interactive`** (`git_push`, `git_merge`, `git_merge_finalize`, `secret_manage`) →
+   `AskUser` **zawsze**, z pominięciem 6–8; grant `always` dla nich odrzucany przy zapisie,
+   dozwolony wyłącznie `allow_once`;
+5a. **`git_commit` bez zaakceptowanego patch setu** → `AskUser` z **przeglądem zmian** (ta sama
+   mechanika i te same tabele co blok `patch_review`), z pominięciem 6–9. Nie `Deny`: agent robi
+   dokładnie to, co powinien, brakuje tylko decyzji człowieka. Po akceptacji wywołanie wznawia się
+   i commituje bloby, nie worktree. Z zaakceptowanym patch setem bramka przechodzi dalej;
 6. `code_workspace_allowlist` → `Allow`;
 7. `session_grants` → `Allow`;
 8. grant per-run → `Allow`;
@@ -1019,9 +1052,10 @@ tokenu — inaczej jest fikcją. Ta reguła obowiązuje przy każdym rozszerzeni
 | `auto_edit` | auto | auto | pyta | pyta | pyta | po review |
 | `autonomous` | auto | auto | auto (allowlista) | allowlista | **pyta zawsze** | **po review** |
 
-Commit nigdy nie jest „automatyczny": w każdym trybie wykonuje go koordynator po zaakceptowanym
-patch secie. W `autonomous` automatyczna może być **akceptacja review** (konfigurowalna per
-workspace, domyślnie wyłączona), ale sam commit dalej bierze bloby z patch setu, nie z worktree.
+Commit nigdy nie jest „automatyczny": w każdym trybie wywołanie `git_commit` przechodzi przez
+bramkę 5a, więc bez zaakceptowanego patch setu otwiera przegląd. W `autonomous` automatyczna może
+być **akceptacja review** (konfigurowalna per workspace, domyślnie wyłączona), ale sam commit dalej
+bierze bloby z patch setu, nie z worktree.
 Tryb sesji nie przekracza `autonomy_ceiling`.
 
 **Walidacja serwerowa (nie UI).** Handler zapisu workspace i otwarcia sesji odrzuca kombinacje,
@@ -1049,15 +1083,26 @@ binarny jest osiągalny poza nim:
 | `core.git_read` | `git_read` | broker | `status,diff,log,show,ls-files` |
 | `core.git_branch` | `git_branch` | broker | w obrębie gałęzi sesji |
 | `core.git_sync` | `git_network` | broker | `fetch`, `pull` |
+| `core.git_stage` | `git_stage` | broker | tylko ścieżki w worktree sesji |
+| `core.git_commit` | `git_commit` | broker | **bramka 5a**: bez zaakceptowanego patch setu otwiera przegląd; treść z blobów (§11.5) |
 | `core.git_push` | `git_push` | broker | `mandatory_interactive`; tylko gałąź sesji |
+| `core.git_merge` | `git_merge` | broker | `mandatory_interactive`; zakłada worktree integracyjny na `expected_old`, zwraca wynik albo konflikt (§11.6 kroki 1–4) |
+| `core.git_merge_finalize` | `git_merge_finalize` | broker | `mandatory_interactive` + bramka 5a dla zakresu merge; commit z blobów i atomowy `update-ref` (§11.6 kroki 5–7) |
 | `core.code_search` | `code_search` | — | limit, prefiks (od Fazy 7) |
 | `core.workspace_info` | `fs_read` | — | bez sekretów i ścieżek hosta |
 
-**Nie ma** `core.git_commit`, `core.git_stage` ani `core.git_merge` w zestawie agenta — commit i merge
-wykonuje koordynator (§11.5, §11.6) jako bloki `git_op`, po review.
-
 Reużyte: `core.ask_user`, `core.agent_spawn|wait|list|cancel`, `core.skill_view`,
 `core.project_search`, `core.project_list_sources`.
+
+**To jest cały zestaw czasowników agenta.** Agent robi dwie rzeczy: woła narzędzie z tej tabeli albo
+woła agenta przez `core.agent_spawn` (§15). Nie ma trzeciej kategorii i nie ma kroków, które
+wykonują się „obok" — testy to `core.exec`, przegląd to spawn `code-reviewer`, commit to
+`core.git_commit`. Co wolno, rozstrzyga PEP; **kiedy** i **czy w ogóle**, rozstrzyga agent na
+podstawie rozmowy, chyba że flow wymusza łańcuch (§16.2 wariant B).
+
+Ograniczenie zestawu per agent jest w `agents.tools_json` — reviewer nie dostaje `fs_write`,
+implementer nie dostaje `git_push`. To pierwsze sito, przed PEP; oba są serwerowe i niezależne
+od promptu.
 
 Wspólne: wiązanie sesji z `envelope.meta.code_session` mintowanego przez serwer (wzorzec
 `ps_generation`, `project_studio/generation.rs`); wynik obcinany do budżetu `tool_exec`
@@ -1142,9 +1187,12 @@ Wszystkie OID-y (blob, tree, commit, wartość referencji przed i po) trafiają 
 
 ### 11.6 Merge przez worktree integracyjny
 
-Merge nie dotyka gałęzi docelowej „w locie". Kluczowe jest **jak** powstaje worktree integracyjny:
+Merge nie dotyka gałęzi docelowej „w locie". Sagę inicjuje agent, wołając `core.git_merge`
+(kroki 1–4) i `core.git_merge_finalize` (kroki 5–7); wykonuje ją broker na owner node, więc podział
+na dwa narzędzia nie oddaje agentowi ani jednego z poniższych kroków. Kluczowe jest **jak** powstaje
+worktree integracyjny:
 
-1. koordynator odczytuje bieżącą wartość `refs/heads/<target>` jako `expected_old` i zakłada
+1. broker odczytuje bieżącą wartość `refs/heads/<target>` jako `expected_old` i zakłada
    worktree integracyjny **odłączony**:
    `git worktree add --detach <path> <expected_old>`.
    **Nie** `git worktree add <path> <target_branch>` — tamta forma melduje gałąź docelową
@@ -1153,11 +1201,15 @@ Merge nie dotyka gałęzi docelowej „w locie". Kluczowe jest **jak** powstaje 
 2. wynik merge'a jest zapisywany pod **prywatnym refem** `refs/code-studio/integration/<op_id>`, żeby
    przeżył restart i nie padł ofiarą GC, a run rewizji miał do czego wrócić;
 3. konflikt **nie jest błędem** — worktree przechodzi w stan `held` z zapisanymi plikami
-   konfliktowymi, a run kończy się `revision_requested` (`trigger='merge_conflict'`);
-4. na czystym wyniku merge'a uruchamiane są **testy** (profil `cow`, lease własny) i **przegląd
-   agenta**, a potem `patch_review` z zakresem merge (§16.2). Czerwone testy →
-   `trigger='merge_verify_failed'`, odrzucenie w review → `trigger='review_rejected'`; w obu
-   przypadkach worktree zostaje w stanie `held`;
+   konfliktowymi, a narzędzie zwraca to jako wynik. Agent może rozwiązywać konflikt dalej w tej samej
+   turze (worktree integracyjny jest jego katalogiem roboczym dla tej operacji) albo zakończyć run
+   jako `revision_requested` z `trigger='merge_conflict'`, jeśli potrzebuje decyzji człowieka;
+4. na czystym wyniku merge'a `core.git_merge` zwraca patch set o zakresie `merge`, a **testy**
+   (profil `cow`, lease własny) i **przegląd** są zwykłymi wywołaniami agenta na worktree
+   integracyjnym — `core.exec` albo spawn `code-tester`/`code-reviewer`. Człowiek widzi ten patch set
+   przy `core.git_merge_finalize`, przez bramkę 5a. Czerwone testy albo odrzucony przegląd zostawiają
+   worktree w stanie `held`; agent poprawia albo kończy run jako `revision_requested`
+   (`trigger='merge_verify_failed'` / `'review_rejected'`);
 5. **`finalize_merge`** — po rozwiązaniu konfliktu (w runie rewizji) commit scalenia powstaje
    z **zaakceptowanych blobów**, tą samą drogą co zwykły commit (§11.5): `hash-object -w` →
    tymczasowy indeks → `write-tree` → `commit-tree` z **dwoma rodzicami** (`expected_old`
@@ -1364,12 +1416,13 @@ patch secie, `checkout`, `pull`, `merge`; debounce, kolejka jednowątkowa per wo
 
 | Agent | Rola | Capability | Profil sandboxa |
 |---|---|---|---|
-| `code-orchestrator` | rozmowa, podział zadania, **spawnowanie wykonawców**, scalanie wyników | `agent_spawn/wait/list/cancel`, `ask_user`, odczyt, `workspace_info` | `ro`+`none` |
+| `code-orchestrator` | rozmowa i **decyzje**: co zrobić samemu, co zlecić agentowi, czy w ogóle commitować i wypychać | pełny zestaw §10 + `agent_spawn/wait/list/cancel` + `ask_user` | **`rw`+`none`** |
 | `code-planner` | plan, dekompozycja, ryzyka | wyłącznie odczyt | `ro`+`none` |
-| `code-implementer` | pisze kod | odczyt + `fs_write` + `exec` | **`rw`+`none`** — bez `git_commit` |
+| `code-implementer` | pisze kod | odczyt + `fs_write` + `exec` | **`rw`+`none`** — bez `git_push` |
 | `code-searcher` | znajduje miejsca zmian | odczyt (+ `code_search` od Fazy 7) | `ro`+`none` |
 | `code-reviewer` | przegląd zmian | odczyt + `git_read` | `ro`+`none` |
 | `code-tester` | uruchamia testy | odczyt + `exec` z allowlistą | **`cow`+`none`** (`gateway`, gdy build pobiera zależności); warstwa odrzucana po teście |
+| `code-committer` | git: wiadomość commitu, podział na commity, push | odczyt + `git_read` + `git_stage` + `git_commit` + `git_push` | `ro`+`none` — **bez `fs_write`**: składa commit z zaakceptowanych blobów, nie poprawia kodu |
 | `claude-code` / `codex` | delegacja do CLI | brak narzędzi core | `rw`/`cow` + `gateway`, ticket do adaptera |
 
 Zakres egzekucji zależy od trybu (§7.1):
@@ -1379,9 +1432,14 @@ Zakres egzekucji zależy od trybu (§7.1):
   jako katalog roboczy, więc zwykły build nie dotyka drzewa. Proces, który sam sięgnie po oryginalną
   ścieżkę, nie jest powstrzymany — to jest granica trybu, nazwana wprost, nie przeoczenie.
 
-W obu trybach implementer nie wypchnie i **nie zacommituje** gałęzi, bo `git_commit`, `git_stage`
-i `git_push` są systemowe albo `mandatory_interactive`, a broker biegnie poza jego procesem.
-Prompt nie jest zabezpieczeniem w żadnym trybie.
+Rozdział ról jest **allowlistą narzędzi w `agents.tools_json`**, nie promptem: implementer nie ma
+`git_push`, committer nie ma `fs_write`, reviewer i tester nie mają żadnego z nich. Prompt nie jest
+zabezpieczeniem w żadnym trybie, a `git_push` i tak przechodzi przez `mandatory_interactive`.
+
+**`code-committer` bez `fs_write` to celowy układ.** Commit składa się z zaakceptowanych blobów
+(§11.5), więc agent od gita nie potrzebuje dostępu do dysku — a nie mając go, nie „poprawi" po cichu
+kodu między przeglądem a commitem. Kiedy okazuje się, że trzeba coś zmienić, wraca to do agenta
+głównego jako wynik, a nie dzieje się w tle.
 
 Agent CLI ma własny `flow_id` (`trigger → workspace_context → delegate_cli → persist_turn → output`),
 więc delegacja też jest grafem; wnętrze pętli dostawcy pozostaje nieprzezroczyste i tak opisane w UI.
@@ -1398,80 +1456,86 @@ liczy się do in-degree**, więc powrót do wcześniejszego etapu to cykl; **jed
 strukturalny** `last_assistant_has_tool_calls`, a `LoopRegion` niesie tylko `max_iterations`
 i `final_pass`.
 
-Wniosek: **pętla deterministyczna nie jest dziś wyrażalna w grafie.** Iteracja ma dwie legalne postacie:
+Wniosek: **pętla deterministyczna nie jest dziś wyrażalna w grafie.** W rewizjach do 1.7 było to
+ograniczenie, bo graf miał dekretować kolejność kroków. Po przejściu na model „narzędzie albo agent"
+(§10) przestaje uwierać: stop strukturalny `last_assistant_has_tool_calls` jest **dokładnie tym**
+warunkiem, którego potrzebuje pętla narzędziowa — kręci się, dopóki agent woła narzędzia, i kończy,
+gdy agent odpowiada prozą. Tak samo działa Claude Code.
 
-- **wewnątrz runu** — pętla narzędziowa agenta (region `agent_turn` w jego flow): agent sam uruchamia
-  testy jako wywołanie narzędzia i iteruje, dopóki woła narzędzia;
-- **na poziomie sesji** — **nowy run** (`session_runs.kind='revision'`) z uwagami jako wejściem.
+Iteracja ma więc dwie postacie:
 
-Graf harnessu jest acykliczny, a iteracja widoczna jako łańcuch runów na osi czasu.
+- **wewnątrz runu** — region `code_turn`: agent czyta pliki, edytuje, uruchamia testy, spawnuje
+  reviewera, commituje — dowolnie długo i w dowolnej kolejności, dopóki woła narzędzia;
+- **na poziomie sesji** — **nowy run** (`session_runs.kind='revision'`), potrzebny już tylko tam,
+  gdzie run naprawdę musi się zamknąć: konflikt merge'a oddany człowiekowi, przekroczony budżet
+  iteracji, jawne „popraw to" po zakończonej turze.
 
-**Opcjonalne rozszerzenie rdzenia (wycenione, nie zakładane):** `stop_expr` (CEL) w `LoopRegion` —
-parsowanie z configu wejścia, ewaluacja po iteracji w alternatywie ze stopem strukturalnym,
-walidacja w R11, test regionu deterministycznego. ~1 dzień w `cache.rs` + `executor.rs` +
-`validation.rs`. Decyzja przy Fazie 5; plan działa bez tego.
+Poza regionem graf jest acykliczny, a łańcuch runów widać na osi czasu sesji.
 
-### 16.2 Graf (acykliczny)
+**`stop_expr` (CEL) w `LoopRegion` schodzi z listy.** Rewizja 1.7 trzymała go jako opcję na wypadek
+pętli deterministycznej. Żaden z dwóch wariantów §16.2 jej nie potrzebuje: wariant A kończy się
+stopem strukturalnym, wariant B — wyjściem z regionu do bloków `spawn`. Jeśli kiedyś pojawi się
+realna potrzeba, wycena z 1.7 zostaje w historii rewizji.
+
+### 16.2 Dwa warianty, wybierane per flow
+
+Harness to **flow jak każdy inny** — jego kształt jest decyzją, nie stałą. Oba warianty poniżej są
+seedowane; workspace wskazuje jeden w `sessions.flow_id`.
+
+#### Wariant A — „agent decyduje" (domyślny, 9 bloków)
 
 ```
 trigger
  → conversation_history
- → workspace_context             🆕 wiązanie sesji, stan repo z brokera, AGENTS.md/CLAUDE.md, toolchain
- → agent_context
- → condition run_kind            'user' → pytaj o zakres; 'revision' → wejdź z uwagami
- → ask_user „doprecyzuj zadanie"   ≤ 4 propozycje + własna; timeout → sentinel
- → condition intent               [praca] | [delegacja CLI] | [anuluj]
-
- ── praca ──────────────────────────────────────────────────────────────────────
- → spawn(agent=code-planner) → await_subagents(all)
- → ask_user „zatwierdź plan"       Zatwierdź | Popraw | Podziel | Anuluj (+ własna)
- → condition plan_decision_1
-      ├ Anuluj ──▶ output(anulowano)
-      ├ Popraw / Podziel ──▶ spawn(code-planner, feedback) → await
-      │                       → ask_user „zatwierdź poprawiony plan"   (Zatwierdź | Anuluj | Przekaż dalej)
-      │                       → condition plan_decision_2
-      │                             ├ Anuluj ──────▶ output(anulowano)
-      │                             ├ Przekaż dalej ▶ persist_turn → output(revision_requested)
-      │                             └ Zatwierdź ────┐
-      └ Zatwierdź ───────────────────────────────────┤
-                                                     ▼
- → spawn(agent=code-implementer) → await_subagents(all)     ⟵ JAWNY wykonawca
- → spawn(code-reviewer) + spawn(code-tester) → await_subagents(mode=all)
- → condition verify
-      ├ czerwone ─▶ persist_turn → output(revision_requested, trigger=test_failed)
-      └ zielone ──▶
- → patch_review                  🆕 snapshot sprawdzony przez agenta i testy
- → condition review_decision
-      ├ Odrzuć / Popraw ─▶ persist_turn → output(revision_requested, trigger=review_rejected)
-      └ Akceptuj ────────▶ git_op(commit)   ⟵ KOORDYNATOR, z blobów patch setu (§11.5)
- → ask_user „wypchnąć / scalić?"   Nie | Wypchnij gałąź | Scal do <target_branch>
- → condition delivery
-      ├ Nie ──────▶ persist_turn → output
-      ├ Wypchnij ─▶ git_op(push) → condition(ok?) → [błąd: ask_user(ponowić?)] → persist_turn → output
-      └ Scal ─────▶ git_op(merge_integration)        ⟵ worktree --detach na expected_old (§11.6)
-                    → condition merge_conflict?
-                        ├ konflikt ─▶ persist_turn → output(revision_requested, merge_conflict)
-                        │             [worktree integracyjny ZOSTAJE w stanie held]
-                        └ czysto ───▶ spawn(code-tester) + spawn(code-reviewer)   ⟵ NA WYNIKU MERGE'A
-                                      → await_subagents(all)
-                                      → condition verify_merge
-                                          ├ czerwone ─▶ persist_turn
-                                          │             → output(revision_requested, merge_verify_failed)
-                                          └ zielone ──▶ patch_review(scope=merge)
-                                               ├ Odrzuć ─▶ persist_turn
-                                               │           → output(revision_requested, review_rejected)
-                                               └ Akceptuj ▶ git_op(finalize_merge)  ⟵ commit z blobów
-                                                            → git_op(update_target_ref)
-                                                            → persist_turn → output(stream)
-
- ── delegacja CLI ──────────────────────────────────────────────────────────────
- → delegate_cli 🆕 → patch_review → (jak wyżej)
+ → workspace_context              🆕 wiązanie sesji, stan repo z brokera, AGENTS.md/CLAUDE.md, toolchain
+ → agent_context                  agent sesji; model bierze się Z AGENTA, nie z bloku llm
+ → ┌── region 'code_turn' ────────────────────────────────────────────────┐
+   │  compact_context → llm(tools) → tool_exec                            │
+   │                                     ↑ loop_back, dopóki są tool_calls│
+   └──────────────────────────────────────────────────────────────────────┘
+ → persist_turn
+ → output(stream)
 ```
 
-**Domknięcie ścieżki planu (P1.6):** w jednym runie dopuszczamy **najwyżej jeden** obrót poprawy planu.
-`plan_decision_2` ma trzy wyjścia i żadne nie wraca — kolejna poprawka kończy run jako
-`revision_requested`, a koordynator startuje run rewizji. Bez tego ograniczenia ścieżka wymagałaby
-krawędzi wstecznej, której graf nie przyjmie.
+Wewnątrz `tool_exec` agent ma cały zestaw z §10 i `agent_spawn` z rosterem z §15. Kolejność kroków
+nie jest zapisana nigdzie w grafie — o testach, przeglądzie, commicie i pushu decyduje agent
+z kontekstu rozmowy. „Popraw i wypchnij" kończy się pushem; „zobacz tylko, co jest nie tak" nie
+dotyka gita. Bramki PEP działają niezależnie od tej decyzji.
+
+#### Wariant B — „wymuszony łańcuch" (12 bloków)
+
+```
+… jak wyżej, aż do wyjścia z regionu …
+ → spawn(agent=code-reviewer)  → await_subagents(all)
+ → spawn(agent=code-tester)    → await_subagents(all)
+ → spawn(agent=code-committer) → await_subagents(all)
+ → persist_turn → output(stream)
+```
+
+Przegląd, testy i commit wykonają się **zawsze**, niezależnie od tego, co agent uzna za potrzebne.
+Cena jest realna i UI musi ją nazywać: łańcuch rusza **zaraz po turze agenta głównego**, więc agent
+nie ma już okazji poprawić się przed pokazaniem wyniku, a każda tura kosztuje trzy dodatkowe runy
+podrzędne — także wtedy, gdy user tylko zapytał, co robi jakaś funkcja.
+
+#### Wariant C — mieszany (prawdopodobnie najczęstszy)
+
+Wymuszone `code-reviewer` i `code-tester`, **git zostawiony agentowi**. Jakość jest gwarantowana
+mechanicznie, a decyzja „czy w ogóle commitować i wypychać" zostaje tam, gdzie jest jedyna wiedza
+potrzebna do jej podjęcia — w rozmowie. To nie jest osobny seed, tylko wariant B z usuniętym
+ostatnim spawnem; Flow Builder robi to jednym skasowaniem bloku.
+
+#### Czego w tych grafach nie ma i dlaczego
+
+| Nie ma bloku | Bo | Gdzie to jest |
+|---|---|---|
+| `ask_user „doprecyzuj zadanie"` | pytanie zadaje się wtedy, kiedy jest potrzebne, a nie na starcie każdego runu | narzędzie `core.ask_user` w `tool_exec` |
+| `patch_review` | przegląd otwiera bramka 5a przy `git_commit` | §9.3, opcjonalny blok w §16.4 |
+| `git_op(commit/push/merge)` | operacje gita są narzędziami | §10 |
+| `condition verify` po testach | wynik testów czyta agent, nie graf | `core.exec` |
+| `condition intent`, `condition plan_decision` | model rozstrzyga to lepiej niż port `true`/`false` | — |
+
+Wszystko to nadal **widać** w UI jako zdarzenia i wpisy `session_operations` — niewidoczność
+dotyczyłaby sytuacji, w której harness robi coś poza narzędziami, a takiej nie ma.
 
 ### 16.3 Pętla sesji
 
@@ -1482,8 +1546,8 @@ i uwagami. Oś czasu pokazuje łańcuch runów z powodem każdego nawrotu. Limit
 **Run rewizji po nieudanym merge'u pracuje na zachowanym worktree.** Dla triggerów
 `merge_conflict` i `merge_verify_failed` `workspace_context` wiąże run z worktree integracyjnym
 w stanie `held` (a nie z roboczym), bo to tam są pliki konfliktowe i wynik scalenia. Po rozwiązaniu
-run przechodzi `finalize_merge` (commit z zaakceptowanych blobów), a potem tę samą ścieżkę
-weryfikacji: testy → review → `update_target_ref`.
+agent woła `core.git_merge_finalize` — testy i przegląd przed nim są jego wywołaniami, a bramka 5a
+i `mandatory_interactive` pilnują, że człowiek widzi wynik scalenia przed przesunięciem referencji.
 
 Jeśli gałąź docelowa zmieniła się w międzyczasie, **próba jest unieważniana w całości** — worktree
 integracyjny jest odtwarzany na nowym `expected_old`, a merge, testy i review biegną od nowa.
@@ -1495,8 +1559,7 @@ aktualnej bazie.
 | Blok | Zadanie | Konfiguracja |
 |---|---|---|
 | `workspace_context` | Wiązanie sesji, stan repo z brokera, gałąź, zmienione pliki, `AGENTS.md`/`CLAUDE.md` jako DANE, toolchain; publikuje `harness_tools` | `include_repo_instructions`, `max_instruction_chars`, `include_git_status` |
-| `patch_review` | Domyka patch set, prezentuje diff, blokuje run (mechanika `ask_user`), zapisuje decyzje per hunk/plik, rekonstruuje plik przy częściowej akceptacji, wykrywa konflikt CAS | `scope` (`work`/`merge` — przegląd zmian sesji albo wyniku scalenia), `granularity`, `timeout_secs`, `on_timeout` |
-| `git_op` | Operacja git wykonywana przez **koordynatora** w brokerze | `op` (`commit`/`push`/`merge_integration`/`finalize_merge`/`update_target_ref`/`branch`), `message_template`, `require_clean`, `on_error` |
+| `patch_review` **(opcjonalny)** | Domyka patch set, prezentuje diff, blokuje run (mechanika `ask_user`), zapisuje decyzje per hunk/plik, rekonstruuje plik przy częściowej akceptacji, wykrywa konflikt CAS. **Ta sama implementacja** obsługuje bramkę 5a; blok jest dla flow, które chcą przeglądu w ustalonym punkcie, niezależnie od tego, czy agent sięgnie po `git_commit` | `scope` (`work`/`merge`), `granularity`, `timeout_secs`, `on_timeout` |
 | `exec_command` | Deterministyczna komenda | `argv`, `mount_access`, `network_access`, `ephemeral`, `cwd`, `timeout_secs`, `output_variable`, `fail_on_nonzero` |
 | `delegate_cli` | Delegacja do agenta CLI: rejestruje `cli_instances`, wydaje ticket adaptera, streamuje zdarzenia jako run podrzędny, zwraca podsumowanie + patch set | `engine`, `service_id`, `model`, `budget`, `timeout_secs` |
 | `code_search` | Dociągnięcie kontekstu (grep od Fazy 2, semantyka od Fazy 7) | `query_template`, `mode`, `limit`, `output_variable` |
@@ -1506,9 +1569,12 @@ tłumaczenia w pięciu lokalizacjach.
 
 ### 16.5 Walidacja przed kodowaniem
 
-Przed napisaniem adapterów powstaje **realny `flow_json`** grafu z §16.2 i przechodzi:
+Przed napisaniem adapterów powstaje **realny `flow_json`** obu wariantów z §16.2 i przechodzi:
 `FlowDefinition` → R1–R11 → `CompiledFlow::from_json` → wykonanie na atrapach adapterów. Zielony wynik
 zamyka projekt grafu; wynik może zmienić kształt. To pierwsze zadanie Fazy 5.
+
+Wariant A jest przy tym testem tezy z §16.1: region `code_turn` ma zatrzymać się na stopie
+strukturalnym po turze bez `tool_calls`, a nie wykręcić `max_iterations`.
 
 ### 16.6 Wersjonowanie
 
@@ -1632,8 +1698,8 @@ Projekt z linkiem może wskazać workspace jako źródło kodu dla przypadków F
 worktree. Runner dostaje **wskazany commit** — powtarzalność ważniejsza niż testowanie
 niezacommitowanej pracy.
 
-Cykl: agent pisze → review → commit koordynatora → projekt testuje ten commit → wynik wraca jako
-zdarzenie sesji i defekt w projekcie.
+Cykl: agent pisze → review → commit → projekt testuje ten commit → wynik wraca jako zdarzenie sesji
+i defekt w projekcie.
 
 ---
 
@@ -1780,8 +1846,12 @@ ticket wygasa z runem i nie przekracza budżetu.
   allowlistę odrzucone; adres metadata zablokowany; SNI niezgodne z `CONNECT` odrzucone;
   `local_only` faktycznie odcina sieć.
 - **PEP**: `always` na `git_push` odrzucone przy zapisie; `git_push` pyta mimo allowlisty i grantów;
-  capability systemowe niedostępne dla agenta i terminala; `allow_for_run` znika po runie,
+  `git_worktree` niedostępne dla agenta i terminala; `allow_for_run` znika po runie,
   `allow_for_session` przeżywa run, `always` przeżywa restart.
+- **Bramka 5a**: `git_commit` bez patch setu zwraca `AskUser` z diffem, nie `Deny` ani commit;
+  po akceptacji to samo wywołanie kończy się commitem z blobów; patch set zaakceptowany w innej
+  sesji nie odblokowuje wywołania; `code-committer` bez `fs_write` nie przechodzi na `fs_write`
+  przez żaden grant.
 - **Operacje**: `op_id` stabilny dla terminala, UI, shimu i bloku flow; przerwanie po efekcie a przed
   potwierdzeniem → `completed` z postcondition; przerwanie przed efektem → bezpieczne ponowienie;
   nierozstrzygalne → `unknown` bez ponowienia.
@@ -1811,8 +1881,10 @@ ticket wygasa z runem i nie przekracza budżetu.
   argv z tokenem jest zredagowane przed zapisem.
 - **Trwałość**: zabicie Core → run domknięty, oś czasu kompletna, projekcja zgodna ze zdarzeniami,
   `cli_instances` w `reaped`, sesja wznawialna.
-- **Flow**: `flow_json` przechodzi R1–R11 i `CompiledFlow::from_json`; brak cyklu; drugi obrót planu
-  kończy run; run rewizji powstaje po odrzuceniu review; limit rewizji zatrzymuje pętlę pytaniem.
+- **Flow**: `flow_json` obu wariantów przechodzi R1–R11 i `CompiledFlow::from_json`; poza regionem
+  brak cyklu; region kończy się na turze bez `tool_calls`, a nie na `max_iterations`; wariant B
+  wykonuje wszystkie trzy `spawn` także wtedy, gdy agent niczego nie zmienił; run rewizji powstaje
+  po odrzuceniu review; limit rewizji zatrzymuje pętlę pytaniem.
 - **Wstrzyknięcie promptu**: `AGENTS.md` żądający podniesienia autonomii nie zmienia trybu.
 - **Protokół**: golden test nazw i kolejności wariantów.
 - **Mesh**: zerwanie i wznowienie bez luki i duplikatu; wyczerpane okno spowalnia producenta.
