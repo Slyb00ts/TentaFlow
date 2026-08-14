@@ -567,11 +567,176 @@
 .msheet-item .sub { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
 .msheet-item .st { margin-left: auto; font-size: 10.5px; font-family: var(--cs-mono); color: var(--text-3); }
 
-/* Responsywność realnego ekranu (nie makiety) */
-@media (max-width: 1200px) {
-  .cs-body { grid-template-columns: 1fr; }
-  .cs-dock { border-top: 1px solid var(--border); max-height: 340px; }
+/* ==================== CHROME MOBILNY (w realnym ekranie) ================== */
+
+/* Górny pasek: przycisk workspace + tytuł sesji. Na desktopie ukryty. */
+.cs-mtop { display: none; }
+.cs-wsbtn {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px 6px 9px;
+  border-radius: 20px; border: 1px solid var(--border); background: var(--bg-card);
+  color: var(--text); font-family: inherit; font-size: 12.5px; font-weight: 700;
+  cursor: pointer; max-width: 62%; min-width: 0;
+}
+.cs-wsbtn .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cs-wsbtn .chev { width: 13px; height: 13px; color: var(--text-3); flex-shrink: 0; }
+.cs-wsbtn .cs-proj-badge { margin-left: 1px; }
+
+/* Dolny pasek nawigacji — przypięty; przełącza widok POWYŻEJ siebie. */
+.cs-mtabs { display: none; }
+
+/* Skrót powrotu do rozmowy z agentem głównym */
+.cs-backchat { display: none; }
+
+/* Arkusz wyboru workspace */
+.cs-sheet {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 30;
+  background: var(--bg-2); border-top: 1px solid var(--border-hover);
+  border-radius: 18px 18px 0 0; padding: 6px 10px 14px;
+  box-shadow: 0 -14px 44px rgba(0,0,0,.65);
+  transform: translateY(101%); transition: transform .3s var(--spring);
+}
+.cs-sheet.open { transform: none; }
+.cs-sheet-grab { width: 40px; height: 4px; border-radius: 3px; background: var(--bg-3); margin: 5px auto 10px; }
+.cs-sheet-item {
+  display: flex; align-items: center; gap: 10px; padding: 11px 10px; border-radius: var(--radius);
+  cursor: pointer;
+}
+.cs-sheet-item:hover { background: var(--bg-3); }
+.cs-sheet-item.active { background: var(--bg-card); box-shadow: inset 2px 0 0 var(--accent-1); }
+.cs-sheet-item .nm { font-size: 13px; font-weight: 700; color: var(--text); }
+.cs-sheet-item .sub { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.cs-sheet-item .st { margin-left: auto; font-size: 10.5px; font-family: var(--cs-mono); color: var(--text-3); }
+.cs-scrim {
+  position: absolute; inset: 0; z-index: 29; background: rgba(3,5,15,.6);
+  opacity: 0; pointer-events: none; transition: opacity .25s;
+}
+.cs-sheet.open ~ .cs-scrim, .cs-scrim.open { opacity: 1; pointer-events: auto; }
+
+/* ==================== PRZEŁĄCZANIE PANELI DOKU =========================== */
+/* Jeden mechanizm dla obu układów: atrybut data-dock na .cs-shell decyduje,
+   który panel doku jest widoczny. Na wąskim ekranie data-view decyduje
+   dodatkowo, czy widać scenę, czy dok. */
+.cs-dock-pane { display: none; }
+.cs-shell[data-dock="agenci"]   .cs-dock-pane[data-pane="agenci"],
+.cs-shell[data-dock="pliki"]    .cs-dock-pane[data-pane="pliki"],
+.cs-shell[data-dock="zmiany"]   .cs-dock-pane[data-pane="zmiany"],
+.cs-shell[data-dock="git"]      .cs-dock-pane[data-pane="git"],
+.cs-shell[data-dock="terminal"] .cs-dock-pane[data-pane="terminal"] { display: block; }
+
+/* ==================== UKŁAD WĄSKI (telefon / wąskie okno) ================ */
+
+@media (max-width: 1180px) {
+  .cs-body { grid-template-columns: 1fr 320px; }
   .cs-stage.split { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  /* Makieta schodzi z drogi — chcemy widzieć realny ekran, nie ramkę. */
+  .screen { margin: 0; padding: 0; max-width: none; }
+  .screen-header { border-radius: 0; margin-bottom: 0; padding: 9px 12px; gap: 8px; flex-wrap: wrap; }
+  .screen-header h2 { font-size: 13px; }
+  .screen-header .desc { display: none; }
+  .screen-frame { border: 0; border-radius: 0; padding: 0; box-shadow: none; }
+
+  .app { grid-template-columns: 1fr; min-height: 0; }
+  .app > .sidebar { display: none; }
+  .main { padding: 0; overflow: hidden; }
+
+  .cs-shell {
+    margin: 0; min-height: 0;
+    height: calc(100dvh - 40px);          /* minus pasek nagłówka makiety */
+    grid-template-rows: auto 1fr auto;    /* góra · treść · dolna nawigacja */
+    position: relative; overflow: hidden;
+  }
+
+  /* Poziomy pasek projektów znika — zastępuje go przycisk u góry. */
+  .cs-projects { display: none; }
+
+  .cs-mtop {
+    display: flex; align-items: center; gap: 9px; padding: 8px 11px;
+    border-bottom: 1px solid var(--border); background: var(--bg-2); min-width: 0;
+  }
+  .cs-mtop .ttl { min-width: 0; flex: 1; }
+  .cs-mtop .ttl .t1 { font-size: 12px; font-weight: 700; color: var(--text);
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cs-mtop .ttl .t2 { font-size: 10px; color: var(--text-3); font-family: var(--cs-mono); }
+
+  /* Jedna kolumna: albo scena, albo dok — nigdy jedno pod drugim. */
+  .cs-body { grid-template-columns: 1fr; grid-template-rows: 1fr; min-height: 0; }
+  .cs-stage { border-right: 0; min-height: 0; }
+  .cs-dock { min-height: 0; }
+  .cs-shell[data-view="konsola"] .cs-dock  { display: none; }
+  .cs-shell:not([data-view="konsola"]) .cs-stage { display: none; }
+  .cs-shell:not([data-view="konsola"]) .cs-dock  { display: flex; }
+  /* Zakładki doku są na desktopie u góry — na telefonie zastępuje je dolny pasek. */
+  .cs-dock-tabs { display: none; }
+  .cs-dock-body { padding: 10px 11px 12px; }
+
+  /* Nagłówek sceny: zwięzły, chipy się zawijają */
+  .cs-stage-head { padding: 8px 11px; gap: 7px; }
+  .cs-stage-head .cs-stage-title { font-size: 12.5px; }
+  .cs-stage-head .btn span { display: none; }
+  .cs-stream { padding: 12px 11px 6px; }
+  .ev-say, .ev-think { max-width: none; }
+  .ev-user { max-width: 88%; font-size: 12.5px; }
+  .cs-composer { padding: 8px 11px 10px; }
+
+  /* Dolny pasek — przypięty, przełącza widok nad sobą */
+  .cs-mtabs {
+    display: flex; border-top: 1px solid var(--border); background: var(--bg-2);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .cs-mtab {
+    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 8px 2px 7px; color: var(--text-3); font-size: 9.5px; font-weight: 700;
+    position: relative; cursor: pointer; background: none; border: 0; font-family: inherit;
+    min-height: 46px;                      /* wygodny cel dotyku */
+  }
+  .cs-mtab .icon { width: 18px; height: 18px; }
+  .cs-mtab.active { color: var(--accent-2); }
+  .cs-mtab.active::before {
+    content: ''; position: absolute; top: 0; left: 24%; right: 24%; height: 2px;
+    background: var(--gradient-accent); border-radius: 0 0 3px 3px;
+    animation: csTabIn .28s var(--spring) both;
+  }
+  @keyframes csTabIn { from { transform: scaleX(.2); opacity: 0; } to { transform: none; opacity: 1; } }
+  .cs-mtab .cnt {
+    position: absolute; top: 4px; right: 50%; margin-right: -19px;
+    min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px;
+    background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2);
+    font-size: 9.5px; display: flex; align-items: center; justify-content: center;
+  }
+  .cs-mtab .cnt.hot { background: var(--cs-ask); color: #1a1200; border-color: transparent; }
+
+  /* Skrót „wróć do agenta głównego" — pływa nad treścią, gdy jesteś gdzie indziej */
+  .cs-shell:not([data-view="konsola"]) .cs-backchat {
+    display: inline-flex; align-items: center; gap: 7px;
+    position: absolute; right: 12px; bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    z-index: 20; padding: 9px 14px 9px 11px; border-radius: 22px;
+    background: var(--gradient-accent); color: #fff; border: 0; cursor: pointer;
+    font-family: inherit; font-size: 12px; font-weight: 700;
+    box-shadow: 0 6px 20px rgba(99,102,241,.45);
+    animation: csFabIn .3s var(--spring) both;
+  }
+  .cs-backchat .icon { width: 14px; height: 14px; }
+  @keyframes csFabIn { from { transform: translateY(14px) scale(.85); opacity: 0; } to { transform: none; opacity: 1; } }
+  /* Gdy agent czeka na odpowiedź, skrót się dopomina */
+  .cs-shell[data-ask="1"]:not([data-view="konsola"]) .cs-backchat {
+    background: var(--cs-ask); color: #1a1200; box-shadow: 0 6px 20px rgba(245,158,11,.5);
+    animation: csFabIn .3s var(--spring) both, csFabNudge 2.4s ease-in-out .4s infinite;
+  }
+  @keyframes csFabNudge {
+    0%,88%,100% { transform: none; }
+    92% { transform: translateY(-4px); }
+    96% { transform: translateY(-2px); }
+  }
+}
+
+@media (max-width: 420px) {
+  .cs-mtab { font-size: 9px; }
+  .cs-stage-head .cs-chip { font-size: 9.5px; padding: 2px 6px; }
+  .ev-tool { font-size: 10.5px; gap: 7px; padding: 5px 7px; }
+  .ev-detail { margin-left: 16px; font-size: 10px; }
 }
 
 /* ============================ DROBIAZGI ================================== */
