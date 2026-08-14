@@ -395,6 +395,19 @@ fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
     let cancel = register_cancel(&run_id);
     let db = ctx.state.db.clone();
     let cipher = ctx.state.settings_cipher.clone();
+    // Sciezka in-process: KAZDY model z katalogu (embedded llama.cpp/MLX, QUIC
+    // sidecar, most coding-agenta, model na innym wezle) jest mierzalny przez
+    // executor, bez wlasnego endpointu HTTP. Tozsamosc operatora jedzie razem z
+    // nim, wiec ACL modelu obowiazuje tak samo jak przy zwyklym requescie.
+    let local = ctx.state.router.executor().map(|executor| {
+        crate::benchmark::LocalRunner::new(
+            executor,
+            Some(crate::auth::acl::UserContext::new(
+                org.user_id.clone(),
+                org.role_id.clone(),
+            )),
+        )
+    });
     let org_id = org.org_id.clone();
     let benchmark_id = benchmark_id.to_string();
     let run_id_task = run_id.clone();
@@ -467,6 +480,7 @@ fn start_run_v1(ctx: &HandlerContext, benchmark_id: &str) -> Result<MessageBody,
                     &benchmark_id,
                     &run_id_task,
                     &cipher,
+                    local,
                     cancel,
                     progress,
                 )

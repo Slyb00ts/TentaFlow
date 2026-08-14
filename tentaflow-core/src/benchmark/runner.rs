@@ -11,6 +11,7 @@ use crate::crypto::SettingsCipher;
 use crate::db::{repository, DbPool};
 
 use super::client::BenchClient;
+use super::local::LocalRunner;
 use super::scenarios::{self, VariantOutcome};
 use super::stats;
 use super::types::{
@@ -26,12 +27,16 @@ pub type ProgressFn = Arc<dyn Fn(BenchEvent) + Send + Sync>;
 /// contend for the same GPUs/network and skew every number.
 /// Cancellation: `cancel` is checked between requests; a cancelled run keeps
 /// the results persisted so far and finishes with status 'cancelled'.
+///
+/// `local` carries the in-process path (see `LocalRunner`); `None` disables
+/// in-process targets with an explicit error rather than a silent skip.
 pub async fn run_benchmark(
     db: DbPool,
     org_id: &str,
     benchmark_id: &str,
     run_id: &str,
     cipher: &SettingsCipher,
+    local: Option<LocalRunner>,
     cancel: Arc<AtomicBool>,
     progress: ProgressFn,
 ) -> Result<()> {
@@ -41,6 +46,7 @@ pub async fn run_benchmark(
         benchmark_id,
         run_id,
         cipher,
+        local,
         &cancel,
         &progress,
     )
@@ -77,6 +83,7 @@ async fn execute(
     benchmark_id: &str,
     run_id: &str,
     cipher: &SettingsCipher,
+    local: Option<LocalRunner>,
     cancel: &Arc<AtomicBool>,
     progress: &ProgressFn,
 ) -> Result<()> {
@@ -86,7 +93,7 @@ async fn execute(
         serde_json::from_str(&benchmark.config_json).context("invalid benchmark config_json")?;
     anyhow::ensure!(!targets.is_empty(), "benchmark has no targets");
 
-    let client = BenchClient::new()?;
+    let client = BenchClient::new(local)?;
     let timeout = Duration::from_secs(config.request_timeout_secs.max(1));
 
     for target_rec in &targets {
@@ -97,6 +104,13 @@ async fn execute(
         progress(BenchEvent::Log {
             line: format!("target '{}' ({}) start", target.label, target.model),
         });
+        // The executor resolves an in-process target by MODEL NAME, so when
+        // several instances serve that name the row the operator ticked is not
+        // necessarily where the tokens came from. One probe request answers it
+        // for the log before any measured sample is taken.
+        if target.api == ApiType::Local {
+            probe_route(&client, &target, &config, timeout, progress).await;
+        }
 
         if let Some(cfg) = &config.latency {
             run_scenario_variants(
@@ -165,6 +179,34 @@ async fn execute(
         }
     }
     Ok(())
+}
+
+/// Single 1-token generation whose only purpose is to record WHERE an
+/// in-process target actually landed (backend kind + serving node) and to fail
+/// loudly up front when the model cannot be reached at all — otherwise a
+/// mistyped model name only surfaces as a wall of error samples minutes later.
+/// Deliberately not run for HTTP targets: their address is the target.
+async fn probe_route(
+    client: &BenchClient,
+    target: &TargetSpec,
+    config: &BenchmarkConfig,
+    timeout: Duration,
+    progress: &ProgressFn,
+) {
+    // `u64::MAX` is out of reach of the scenarios' incrementing salt, so the
+    // probe can never seed a prefix cache that a measured prompt later reuses.
+    let prompt = super::prompt::synthetic_prompt(config.prompt_tokens.min(64), u64::MAX);
+    let (sample, route) = client.execute_routed(target, &prompt, 1, timeout).await;
+    let line = match sample.error {
+        Some(err) => format!("target '{}' in-process probe failed: {err}", target.label),
+        None => format!(
+            "target '{}' served in-process by backend={} node={}",
+            target.label,
+            route.backend.as_deref().unwrap_or("unknown"),
+            route.node.as_deref().unwrap_or("local"),
+        ),
+    };
+    progress(BenchEvent::Log { line });
 }
 
 /// Persists each variant outcome as one result row and emits progress events.
@@ -275,7 +317,7 @@ fn resolve_target(rec: &BenchmarkTargetRecord, cipher: &SettingsCipher) -> Resul
         api_key,
         model: rec.model.clone(),
     };
-    spec.validate_host()
+    spec.validate()
         .with_context(|| format!("target '{}'", rec.label))?;
     Ok(spec)
 }

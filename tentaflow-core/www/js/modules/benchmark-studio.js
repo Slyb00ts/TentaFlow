@@ -37,6 +37,7 @@ const state = {
   draft: null,
   wizardStep: 1,
   meshServices: [],
+  localNodeId: '',
   // Run live.
   runId: null,
   runBenchmarkId: null,
@@ -373,15 +374,20 @@ async function goWizard(benchmarkId) {
   state.view = 'wizard';
   state.wizardStep = 1;
 
-  // Wczytaj serwisy mesh (kategoria LLM) do kolumny targetow. Pomijamy serwisy
-  // BEZ endpointu (nie da sie ich zbenchmarkowac) — m.in. headless worker klastra
-  // TP, ktory ma te sama nazwe co head, ale nie serwuje inferencji. Bez tego user
-  // widzi dwa identyczne wiersze DeepSeek, z ktorych jeden (worker) jest martwy.
+  // Wczytaj serwisy mesh do kolumny targetow. Kryterium to POWIERZCHNIA CZATU,
+  // nie kategoria ani obecnosc endpointu: silnik wbudowany (llama.cpp/MLX), most
+  // coding-agenta i sidecar QUIC nie maja adresu HTTP, a mimo to sa mierzalne
+  // przez runtime executor. Odpada dopiero serwis bez modelu czatowego — m.in.
+  // headless worker klastra TP, ktory ma nazwe head'a, ale nie serwuje inferencji.
   try {
-    const services = await ApiBinary.list('serviceListRequest', { arrayKey: 'services' });
+    const [services, nodes] = await Promise.all([
+      ApiBinary.list('serviceListRequest', { arrayKey: 'services' }),
+      ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => []),
+    ]);
+    const localNode = (nodes || []).find((n) => n.is_local || n.isLocal);
+    state.localNodeId = String(localNode?.node_id || localNode?.nodeId || '');
     state.meshServices = (Array.isArray(services) ? services : [])
-      .filter((s) => (s.category || '').toLowerCase() === 'llm')
-      .filter((s) => (s.endpointUrl || s.endpoint_url || '').length > 0);
+      .filter((s) => serviceChatModels(s).length > 0);
   } catch { state.meshServices = []; }
 
   if (benchmarkId) {
@@ -470,20 +476,23 @@ function renderWizardTargets() {
           <tf-select id="ext-api-type" value="openai" style="max-width:280px;">
             <option value="openai">${escapeHtml(T('api_openai'))}</option>
             <option value="anthropic">${escapeHtml(T('api_anthropic'))}</option>
+            <option value="local">${escapeHtml(T('api_local'))}</option>
           </tf-select>
-          <div class="field-row" style="margin-top:10px; align-items:flex-end;">
-            <div style="flex:1;">
-              <label class="bench-subtitle">${escapeHtml(T('host_label'))}</label>
-              <tf-input id="ext-host" placeholder="${escapeAttr(T('host_ph'))}"></tf-input>
+          <div id="ext-endpoint-fields">
+            <div class="field-row" style="margin-top:10px; align-items:flex-end;">
+              <div style="flex:1;">
+                <label class="bench-subtitle">${escapeHtml(T('host_label'))}</label>
+                <tf-input id="ext-host" placeholder="${escapeAttr(T('host_ph'))}"></tf-input>
+              </div>
+              <div style="max-width:110px;">
+                <label class="bench-subtitle">${escapeHtml(T('port_label'))}</label>
+                <tf-input id="ext-port" placeholder="443"></tf-input>
+              </div>
             </div>
-            <div style="max-width:110px;">
-              <label class="bench-subtitle">${escapeHtml(T('port_label'))}</label>
-              <tf-input id="ext-port" placeholder="443"></tf-input>
+            <div style="margin-top:10px;">
+              <label class="bench-subtitle">${escapeHtml(T('api_key_optional'))}</label>
+              <tf-input id="ext-key" type="password" placeholder="sk-..."></tf-input>
             </div>
-          </div>
-          <div style="margin-top:10px;">
-            <label class="bench-subtitle">${escapeHtml(T('api_key_optional'))}</label>
-            <tf-input id="ext-key" type="password" placeholder="sk-..."></tf-input>
           </div>
           <div style="margin-top:10px;">
             <label class="bench-subtitle">${escapeHtml(T('model_name'))}</label>
@@ -506,6 +515,13 @@ function renderWizardTargets() {
   byId('bench-name')?.addEventListener('input', (e) => { d.name = e.target.value; });
   byId('wiz-cancel')?.addEventListener('click', goList);
   byId('ext-add')?.addEventListener('click', addExternalTarget);
+  // Target in-process adresuje sama nazwa modelu — host/port/klucz nie maja
+  // wtedy zadnego odbiorcy, wiec znikaja zamiast mylic formularz.
+  byId('ext-api-type')?.addEventListener('change', (e) => {
+    const local = (e.detail?.value || byId('ext-api-type')?.value) === 'local';
+    const fields = byId('ext-endpoint-fields');
+    if (fields) fields.style.display = local ? 'none' : '';
+  });
   byId('wiz-next')?.addEventListener('click', () => {
     if (!d.name.trim()) { toast(T('name_required'), 'error'); return; }
     if (!d.targets.length) { toast(T('targets_required'), 'error'); return; }
@@ -523,7 +539,7 @@ function renderWizardTargets() {
       sel.addEventListener('change', (e) => {
         const model = e.detail?.value || sel.value;
         const t = state.draft.targets.find((tt) => tt.kind === 'service' && tt.serviceRef === serviceRef);
-        if (t) { t.model = model; t.label = model || s.displayName; }
+        if (t && model) { t.model = model; t.label = model; }
       });
     }
     if (!cb) return;
@@ -537,19 +553,49 @@ function renderWizardTargets() {
   updateWizCount();
 }
 
+// Kategorie uzywane jako fallback, gdy anonsujacy node nie przyslal powierzchni
+// (peer bez manifestu tego silnika — patrz snapshot_builder).
+const CHAT_FALLBACK_CATEGORIES = ['llm', 'agents'];
+
+// Modele serwisu obslugujace czat. `serviceSurfaces` liczy anonsujacy node z
+// manifestu silnika, `capabilities` niesie katalog modeli (tak oznacza swoje
+// modele most coding-agenta).
+function serviceChatModels(s) {
+  const models = (Array.isArray(s.models) ? s.models : []).filter((m) => m.modelName);
+  const chat = models.filter((m) => {
+    const surfaces = Array.isArray(m.serviceSurfaces) ? m.serviceSurfaces : [];
+    const caps = Array.isArray(m.capabilities) ? m.capabilities : [];
+    return surfaces.includes('chat') || caps.includes('chat');
+  });
+  if (chat.length) return chat;
+  return CHAT_FALLBACK_CATEGORIES.includes((s.category || '').toLowerCase()) ? models : [];
+}
+
 // Served model names z serwisu (ServiceModelEntry.model_name → modelName po
 // decode). To jest OpenAI `model` dla `/v1/chat/completions` — dla vLLM MUSI
 // byc alias serwowany przez serwis, NIE engineId (typu `vllm`).
 function serviceModelNames(s) {
-  const models = Array.isArray(s.models) ? s.models : [];
-  return models.map((m) => m.modelName).filter(Boolean);
+  return serviceChatModels(s).map((m) => m.modelName);
 }
 
 // Domyslny serwowany model: oznaczony `isDefault`, inaczej pierwszy z listy.
 function defaultServiceModel(s) {
-  const models = Array.isArray(s.models) ? s.models : [];
-  const def = models.find((m) => m.isDefault && m.modelName);
-  return (def || models.find((m) => m.modelName))?.modelName || '';
+  const models = serviceChatModels(s);
+  const def = models.find((m) => m.isDefault);
+  return (def || models[0])?.modelName || '';
+}
+
+// Protokol pomiaru dla serwisu. Bezposredni HTTP tylko dla wlasnego, lokalnego
+// serwisu z endpointem OpenAI — wtedy mierzymy SAM silnik, bez narzutu core.
+// Reszta (embedded, QUIC, agent_rpc, cloud z kluczem w serwisie, model cudzego
+// node'a, ktorego endpoint jest adresem PETLI ZWROTNEJ tamtego hosta) idzie
+// przez runtime executor: ta sama metoda stemplowania czasu, zero HTTP z zewnatrz.
+function serviceApiType(s) {
+  const nodeId = String(s.nodeId || s.node_id || '');
+  const isLocalNode = !state.localNodeId || !nodeId || nodeId === state.localNodeId;
+  const httpDirect = (s.transport || '').toLowerCase() === 'http_direct';
+  const endpoint = s.endpointUrl || '';
+  return (isLocalNode && httpDirect && endpoint) ? 'openai' : 'local';
 }
 
 // Aktualnie wybrany model serwisu z selektora (gdy serwis serwuje >1 model).
@@ -564,10 +610,13 @@ function meshTargetRowHtml(s) {
   const checked = !!existing;
   const online = (s.status || '').toLowerCase() === 'running' || (s.status || '').toLowerCase() === 'online';
   const modelNames = serviceModelNames(s);
-  const endpoint = s.endpointUrl || '';
-  const disabled = !endpoint;
+  const apiType = serviceApiType(s);
+  // Zatrzymany serwis nie ma czego mierzyc — silnik wbudowany nie ma wtedy
+  // zaladowanego modelu, a kontener nie odpowiada.
+  const disabled = !online;
   const name = s.displayName || s.engineId || serviceRef;
-  const sub = [s.nodeId, s.deployMethod].filter(Boolean).join(' · ');
+  const sub = [s.nodeId, s.deployMethod, apiType === 'local' ? T('in_process') : T('via_http')]
+    .filter(Boolean).join(' · ');
   const selectedModel = existing?.model || defaultServiceModel(s) || modelNames[0] || '';
   const modelBlock = modelNames.length > 1
     ? `<div class="t-model-row"><label class="bench-subtitle">${escapeHtml(T('served_model'))}</label>
@@ -575,7 +624,7 @@ function meshTargetRowHtml(s) {
            ${modelNames.map((m) => `<option value="${escapeAttr(m)}" ${m === selectedModel ? 'selected' : ''}>${escapeHtml(m)}</option>`).join('')}
          </tf-select></div>`
     : (selectedModel ? `<div class="t-model">${escapeHtml(selectedModel)}</div>` : '');
-  const warn = disabled ? `<div class="t-warn">${escapeHtml(T('no_endpoint'))}</div>` : '';
+  const warn = disabled ? `<div class="t-warn">${escapeHtml(T('not_running'))}</div>` : '';
   return `
     <div class="target-option ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}" data-mesh-id="${escapeAttr(serviceRef)}">
       <tf-checkbox ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></tf-checkbox>
@@ -594,19 +643,20 @@ function toggleMeshTarget(s, checked) {
   const serviceRef = String(s.id);
   if (checked) {
     if (d.targets.some((t) => t.kind === 'service' && t.serviceRef === serviceRef)) return;
-    const endpoint = s.endpointUrl || '';
-    if (!endpoint) { toast(T('no_endpoint'), 'error'); return; }
-    const model = selectedMeshModel(s) || defaultServiceModel(s) || serviceModelNames(s)[0] || s.displayName || serviceRef;
+    const model = selectedMeshModel(s) || defaultServiceModel(s) || serviceModelNames(s)[0] || '';
+    if (!model) { toast(T('no_chat_model'), 'error'); return; }
+    const apiType = serviceApiType(s);
     d.targets.push({
       id: crypto.randomUUID(),
       kind: 'service',
       serviceRef,
-      apiType: 'openai',
-      // Backend base_url bierze pelny endpoint verbatim (host = endpointUrl).
-      host: endpoint,
+      apiType,
+      // Dla HTTP backend bierze pelny endpoint verbatim (host = endpointUrl);
+      // dla in-process adresem jest sama nazwa modelu (rozwiazuje ja katalog).
+      host: apiType === 'local' ? '' : (s.endpointUrl || ''),
       port: 0,
       model,
-      label: model || s.displayName,
+      label: model,
       hasKey: false,
       apiKey: undefined,
     });
@@ -617,11 +667,14 @@ function toggleMeshTarget(s, checked) {
 
 function extCardHtml(t) {
   const keyNote = t.hasKey ? '•••••••' : T('no_key');
+  const sub = t.apiType === 'local'
+    ? T('in_process')
+    : `${t.apiType} · ${t.host}${(t.port && !t.host.includes('://')) ? ':' + t.port : ''} · ${T('key')}: ${keyNote}`;
   return `
     <div class="ext-card" data-ext-id="${escapeAttr(t.id)}">
       <div style="flex:1;">
         <div class="t-name">${escapeHtml(t.model || t.label)}</div>
-        <div class="t-sub">${escapeHtml(t.apiType)} · ${escapeHtml(t.host)}${(t.port && !t.host.includes('://')) ? ':' + t.port : ''} · ${escapeHtml(T('key'))}: ${escapeHtml(keyNote)}</div>
+        <div class="t-sub">${escapeHtml(sub)}</div>
       </div>
       <span class="chip info">${escapeHtml(T('external'))}</span>
       <tf-button variant="ghost" size="sm" icon="trash" data-ext-remove="${escapeAttr(t.id)}"></tf-button>
@@ -630,15 +683,16 @@ function extCardHtml(t) {
 
 function addExternalTarget() {
   const apiType = byId('ext-api-type')?.value || 'openai';
-  const host = (byId('ext-host')?.value || '').trim();
+  const isLocal = apiType === 'local';
+  const host = isLocal ? '' : (byId('ext-host')?.value || '').trim();
   const portRaw = (byId('ext-port')?.value || '').trim();
-  const key = (byId('ext-key')?.value || '').trim();
+  const key = isLocal ? '' : (byId('ext-key')?.value || '').trim();
   const model = (byId('ext-model')?.value || '').trim();
-  if (!host) { toast(T('host_required'), 'error'); return; }
+  if (!isLocal && !host) { toast(T('host_required'), 'error'); return; }
   if (!model) { toast(T('model_required'), 'error'); return; }
   // Host z pelnym schematem (http://…:port) niesie port w URL; backend base_url()
   // bierze go verbatim, wiec osobne pole portu jest nadmiarowe → wymus 0.
-  const port = host.includes('://') ? 0 : (Number(portRaw) || 443);
+  const port = (isLocal || host.includes('://')) ? 0 : (Number(portRaw) || 443);
   state.draft.targets.push({
     id: crypto.randomUUID(),
     kind: 'external',
