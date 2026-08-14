@@ -1071,10 +1071,10 @@ mod tests {
 
     #[test]
     fn blackwell_rozdziela_sie_na_dwie_linie_o_roznym_isa() {
-        // GB10 to sm_121: ma MXFP4 i TMA, nie ma natywnego NVFP4 ani rdzeni
+        // GB10 to sm_121: ma oba warianty blokowanego FP4, ale nie ma rdzeni
         // FA3/FA4. Zweryfikowane skladaniem kazdej z tych instrukcji `ptxas`.
         assert!(mxf4_block_scale(121));
-        assert!(!nvf4_block_scale(121));
+        assert!(nvf4_block_scale(121));
         assert!(!wgmma_available(121));
         assert!(!tcgen05_available(121));
 
