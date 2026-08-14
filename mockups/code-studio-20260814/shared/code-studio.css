@@ -658,15 +658,8 @@ html, body { height: 100%; overflow: hidden; }
 .ev-askmark .cs-dot { flex-shrink: 0; }
 
 /* ==================== PLIKI: drzewo + podgląd ============================ */
-.cs-files { display: flex; flex-direction: column; min-height: 0; }
-.cs-file-head { display: none; }
-.cs-file-view { display: flex; flex-direction: column; min-height: 0; }
-.cs-file-view .cs-editor { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
-.cs-file-view .cs-code { max-height: 320px; }
 /* Na desktopie drzewo stoi NAD podglądem (w DOM jest niżej, bo na telefonie
    staje się szufladą pozycjonowaną absolutnie — tam kolejność nie ma znaczenia). */
-.cs-tree-panel { min-height: 0; order: -1; max-height: 300px; overflow-y: auto; margin-bottom: 10px; }
-.cs-tree-close { display: none; }
 
 /* ==================== CHROME MOBILNY (w realnym ekranie) ================== */
 
@@ -849,41 +842,8 @@ html, body { height: 100%; overflow: hidden; }
   .cs-shell[data-view="pliki"] .cs-dock-pane[data-pane="pliki"],
   .cs-shell[data-view="terminal"] .cs-dock-pane[data-pane="terminal"] { display: flex; flex: 1; min-height: 0; }
 
-  .cs-files { flex: 1; min-height: 0; position: relative; }
-  .cs-file-head {
-    display: flex; align-items: center; gap: 9px; padding: 8px 11px;
-    border-bottom: 1px solid var(--border); background: var(--bg-2); flex-shrink: 0;
-  }
-  .cs-file-head .path {
-    font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-2);
-    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
-    direction: rtl; text-align: left;      /* przy obcinaniu zostaje nazwa pliku, nie sam katalog */
-  }
-  .cs-file-head .btn { flex-shrink: 0; }
-  .cs-file-head .cs-chip { flex-shrink: 0; }
-  .cs-file-view { flex: 1; min-height: 0; }
-  .cs-file-view .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
-  .cs-file-view .cs-code { flex: 1; min-height: 0; max-height: none; font-size: 12px; }
-  .cs-tree-panel { order: 0; max-height: none; margin-bottom: 0; }
 
   /* Szuflada: wysuwa się z prawej, chowa po wybraniu pliku */
-  .cs-tree-panel {
-    position: absolute; top: 0; right: 0; bottom: 0; z-index: 15; width: 78%; max-width: 320px;
-    background: var(--bg-2); border-left: 1px solid var(--border-hover);
-    box-shadow: -14px 0 40px rgba(0,0,0,.6); padding: 8px 10px 12px;
-    overflow-y: auto; transform: translateX(101%); transition: transform .28s var(--spring);
-  }
-  .cs-files.tree-open .cs-tree-panel { transform: none; }
-  .cs-tree-close {
-    display: flex; align-items: center; gap: 6px; width: 100%; justify-content: flex-end;
-    background: none; border: 0; color: var(--text-3); font-family: inherit; font-size: 11px;
-    padding: 4px 2px 8px; cursor: pointer;
-  }
-  .cs-tree-scrim {
-    position: absolute; inset: 0; z-index: 14; background: rgba(3,5,15,.55);
-    opacity: 0; pointer-events: none; transition: opacity .25s;
-  }
-  .cs-files.tree-open .cs-tree-scrim { opacity: 1; pointer-events: auto; }
   .ft-row { padding: 8px 7px; }        /* wygodniejszy cel dotyku */
 
   .cs-term { border: 0; border-radius: 0; flex: 1; min-height: 0; overflow: auto; font-size: 11px; }
@@ -1013,14 +973,7 @@ html, body { height: 100%; overflow: hidden; }
   cursor: pointer; white-space: nowrap; position: relative; transition: color .15s, background .15s;
 }
 .cs-tab-home:hover { color: var(--text); background: var(--bg-3); }
-.cs-shell[data-stage="konsola"] .cs-tab-home { color: #fff; background: var(--bg); }
-.cs-shell[data-stage="konsola"] .cs-tab-home::after {
-  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--gradient-accent);
-}
-/* Gdy agent czeka na odpowiedź, powrót do konsoli się dopomina */
-.cs-shell[data-ask="1"]:not([data-stage="konsola"]) .cs-tab-home {
-  color: var(--cs-ask); background: rgba(245,158,11,.08);
-}
+.cs-shell.nav-open .cs-tab-home { color: var(--accent-2); background: rgba(99,102,241,.08); }
 
 /* Panele sceny — widoczny dokładnie jeden */
 .cs-spane { display: none; flex-direction: column; flex: 1; min-height: 0; }
@@ -1030,6 +983,9 @@ html, body { height: 100%; overflow: hidden; }
 .cs-shell[data-stage="terminal"] .cs-spane[data-spane="terminal"],
 .cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"],
 .cs-shell[data-stage="commit"]   .cs-spane[data-spane="commit"] { display: flex; }
+/* Bezpiecznik: brak albo nieznana wartość data-stage nie może skończyć się
+   pustym obszarem roboczym — pokazujemy wtedy pierwszy panel. */
+.cs-shell:not([data-stage]) .cs-spane[data-spane="plik"] { display: flex; }
 
 /* Pasek nad treścią w scenie (ścieżka pliku, podsumowanie diffa, akcje) */
 .cs-pane-head {
@@ -1096,4 +1052,73 @@ html, body { height: 100%; overflow: hidden; }
   .cs-pane-head { padding: 8px 11px; }
   .cs-pane-foot { padding: 9px 11px; }
   .cs-spane .cs-code, .cs-spane .diff-body, .cs-spane .cs-term { font-size: 11.5px; }
+}
+
+/* =========================================================================
+   KONSOLA JAKO STAŁY KRĘGOSŁUP
+   Rozmowa z agentem głównym nie jest miejscem, do którego się wraca — jest
+   zawsze widoczna po lewej. Obok niej obszar roboczy: kategorie i spis w
+   wąskiej kolumnie, treść w szerokiej.
+   ========================================================================= */
+
+.cs-body { grid-template-columns: minmax(330px, 32%) 1fr; }
+
+.cs-chat {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  border-right: 1px solid var(--border);
+  background:
+    radial-gradient(900px 360px at 15% -10%, rgba(99,102,241,.08), transparent 70%),
+    var(--bg);
+}
+
+.cs-work {
+  display: grid; grid-template-columns: 290px 1fr; grid-template-rows: auto 1fr;
+  min-width: 0; min-height: 0; background: var(--bg);
+}
+.cs-work > .cs-dock       { grid-column: 1; grid-row: 1 / span 2; border-right: 1px solid var(--border); }
+.cs-work > .cs-stage-tabs { grid-column: 2; grid-row: 1; }
+.cs-work > .cs-stage      { grid-column: 2; grid-row: 2; border-right: 0; min-height: 0; }
+
+/* Kategorie w wąskiej kolumnie — krótkie etykiety, żeby zmieściła się piątka */
+.cs-work .cs-dock-tab { padding: 9px 2px 8px; font-size: 9.5px; }
+.cs-work .cs-dock-tab .cnt { margin-right: -16px; }
+
+/* Konsola nie potrzebuje już powrotu do samej siebie */
+.cs-tab-home { display: none; }
+
+/* Poniżej 1350 px spis chowa się do szuflady — treść jest ważniejsza */
+@media (max-width: 1350px) {
+  .cs-work { grid-template-columns: 1fr; }
+  .cs-work > .cs-stage-tabs { grid-column: 1; }
+  .cs-work > .cs-stage { grid-column: 1; }
+  .cs-work > .cs-dock {
+    grid-column: 1; grid-row: 1 / span 2; align-self: stretch;
+    position: absolute; top: 0; bottom: 0; right: 0; z-index: 16; width: 320px;
+    border-left: 1px solid var(--border-hover); box-shadow: -14px 0 40px rgba(0,0,0,.6);
+    display: none;
+  }
+  .cs-shell.nav-open .cs-work > .cs-dock { display: flex; animation: csNavIn .28s var(--spring) both; }
+  .cs-shell.nav-open .cs-nav-scrim { display: block; }
+  .cs-nav-scrim { display: none; position: absolute; inset: 0; z-index: 15; background: rgba(3,5,15,.55); }
+  .cs-stage-tabs .cs-tab-home { display: flex; }   /* tu wraca jako „Spis" */
+}
+
+@media (max-width: 900px) {
+  /* Telefon: albo rozmowa, albo obszar roboczy — nigdy obok siebie */
+  .cs-body { grid-template-columns: 1fr; }
+  .cs-shell[data-view="konsola"] .cs-work { display: none; }
+  .cs-shell:not([data-view="konsola"]) .cs-chat { display: none; }
+  .cs-work { grid-template-columns: 1fr; }
+  .cs-shell[data-view="agenci"] .cs-work > .cs-stage,
+  .cs-shell[data-view="git"]    .cs-work > .cs-stage { display: none; }
+  .cs-shell[data-view="agenci"] .cs-work > .cs-dock,
+  .cs-shell[data-view="git"]    .cs-work > .cs-dock {
+    display: flex; position: static; width: auto; box-shadow: none; border-left: 0;
+    grid-column: 1; grid-row: 2;
+  }
+  /* Zakładki otwartych pozycji zostają — na telefonie to przełącznik plików */
+  .cs-stage-tabs { display: flex; }
+  .cs-work > .cs-stage-tabs { grid-row: 1; }
+  .cs-stab { padding: 7px 11px; font-size: 11.5px; }
+  .cs-tab-home { display: none; }
 }
