@@ -27,4 +27,5 @@ pub mod pep;
 pub mod provisioning;
 pub mod remote_policy;
 pub mod repository;
+pub mod session;
 pub mod workspace_db;
