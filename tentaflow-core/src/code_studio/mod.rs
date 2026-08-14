@@ -23,5 +23,8 @@
 pub mod git_broker;
 pub mod models;
 pub mod paths;
+pub mod pep;
+pub mod provisioning;
 pub mod remote_policy;
 pub mod repository;
+pub mod workspace_db;

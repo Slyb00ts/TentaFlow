@@ -2650,6 +2650,53 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "subject_id",
             "FK to compliance_data_subjects(subject_id), not user_accounts",
         ),
+        // Code Studio (v125). Every column below was born TEXT long after the
+        // identity flip and carries no declared user_accounts FK ON PURPOSE:
+        // the registry is synchronized across the org, so a workspace row can
+        // reach a node that has not materialized the referenced account yet —
+        // the same rationale as token_usage_daily.
+        t(
+            "code_workspaces",
+            "owner_user_id",
+            "workspace owner born TEXT in v125 (post-flip); no declared user_accounts FK \
+             because the registry syncs across nodes that may not hold the account yet",
+        ),
+        t(
+            "code_workspace_members",
+            "user_id",
+            "membership principal born TEXT in v125 (post-flip); no declared FK for the \
+             same cross-node reason as the owner column",
+        ),
+        t(
+            "code_workspace_creator_grants",
+            "user_id",
+            "grantee of the create-workspace right, born TEXT in v125 (post-flip); \
+             org-scoped and synchronized, so no declared user_accounts FK",
+        ),
+        t(
+            "code_workspace_creator_grants",
+            "granted_by",
+            "attribution of who granted the right; kept for audit even after the \
+             granting account is deleted, so it is free text rather than an FK",
+        ),
+        t(
+            "code_workspace_allowlist",
+            "created_by",
+            "attribution of the standing permission; kept for audit after the account \
+             is gone, so it is deliberately not an FK",
+        ),
+        t(
+            "code_workspace_secrets",
+            "created_by",
+            "attribution inside the NODE-LOCAL vault; the vault never syncs, and the \
+             record must survive account deletion for audit",
+        ),
+        t(
+            "code_agent_credentials",
+            "created_by",
+            "attribution inside the NODE-LOCAL vault; same rationale as \
+             code_workspace_secrets.created_by",
+        ),
     ]
 }
 
