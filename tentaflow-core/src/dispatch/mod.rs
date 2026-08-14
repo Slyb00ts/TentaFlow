@@ -46,8 +46,8 @@ pub mod resume_token;
 pub mod robots;
 pub mod role_catalog;
 pub mod run_events;
-pub mod storage_admin;
 pub mod state;
+pub mod storage_admin;
 pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
@@ -1137,9 +1137,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::SystemEventPayload::MeshPeerStatusChanged { .. } => {
                 "MeshPeerStatusChanged"
             }
-            tentaflow_protocol::SystemEventPayload::UserNotification { .. } => {
-                "UserNotification"
-            }
+            tentaflow_protocol::SystemEventPayload::UserNotification { .. } => "UserNotification",
         },
         MessageBody::MeetingLiveEventBody(_) => "MeetingLiveEvent",
         MessageBody::MeetingBody(p) => match p {
@@ -1698,9 +1696,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "StorageCreateDirResponse"
             }
             tentaflow_protocol::StorageAdminPayload::MigrateRequest(_) => "StorageMigrateRequest",
-            tentaflow_protocol::StorageAdminPayload::MigrateResponse(_) => {
-                "StorageMigrateResponse"
-            }
+            tentaflow_protocol::StorageAdminPayload::MigrateResponse(_) => "StorageMigrateResponse",
         },
         MessageBody::ProjectStudioBody(p) => {
             use tentaflow_protocol::project_studio::ProjectStudioPayload as Ps;
@@ -1975,6 +1971,36 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Ps::ArchiveStreamRequest { .. } => "ProjectStudioArchiveStreamRequest",
                 Ps::ArchiveStreamChunk { .. } => "ProjectStudioArchiveStreamChunk",
                 Ps::ArchiveStreamEnd { .. } => "ProjectStudioArchiveStreamEnd",
+            }
+        }
+        MessageBody::CodeStudioBody(p) => {
+            use tentaflow_protocol::code_studio::CodeStudioPayload as Cs;
+            match p {
+                Cs::WorkspacesListRequest { .. } => "CodeStudioWorkspacesListRequest",
+                Cs::WorkspacesListResponse { .. } => "CodeStudioWorkspacesListResponse",
+                Cs::WorkspaceCreateRequest { .. } => "CodeStudioWorkspaceCreateRequest",
+                Cs::WorkspaceCreateResponse { .. } => "CodeStudioWorkspaceCreateResponse",
+                Cs::WorkspaceGetRequest { .. } => "CodeStudioWorkspaceGetRequest",
+                Cs::WorkspaceGetResponse { .. } => "CodeStudioWorkspaceGetResponse",
+                Cs::WorkspaceRetryRequest { .. } => "CodeStudioWorkspaceRetryRequest",
+                Cs::WorkspaceRetryResponse { .. } => "CodeStudioWorkspaceRetryResponse",
+                Cs::WorkspaceArchiveRequest { .. } => "CodeStudioWorkspaceArchiveRequest",
+                Cs::WorkspaceArchiveResponse { .. } => "CodeStudioWorkspaceArchiveResponse",
+                Cs::WorkspaceMemberSetRequest { .. } => "CodeStudioWorkspaceMemberSetRequest",
+                Cs::WorkspaceMemberRemoveRequest { .. } => "CodeStudioWorkspaceMemberRemoveRequest",
+                Cs::WorkspaceMembersResponse { .. } => "CodeStudioWorkspaceMembersResponse",
+                Cs::WorkspaceCreatorGrantSetRequest { .. } => {
+                    "CodeStudioWorkspaceCreatorGrantSetRequest"
+                }
+                Cs::WorkspaceCreatorGrantResponse { .. } => {
+                    "CodeStudioWorkspaceCreatorGrantResponse"
+                }
+                Cs::SessionsListRequest { .. } => "CodeStudioSessionsListRequest",
+                Cs::SessionsListResponse { .. } => "CodeStudioSessionsListResponse",
+                Cs::SessionOpenRequest { .. } => "CodeStudioSessionOpenRequest",
+                Cs::SessionOpenResponse { .. } => "CodeStudioSessionOpenResponse",
+                Cs::SessionCloseRequest { .. } => "CodeStudioSessionCloseRequest",
+                Cs::SessionCloseResponse { .. } => "CodeStudioSessionCloseResponse",
             }
         }
     }

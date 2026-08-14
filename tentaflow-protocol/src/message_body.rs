@@ -707,6 +707,12 @@ pub struct ChatMessage {
     /// "system" / "user" / "assistant" / "tool".
     pub role: String,
     pub content: String,
+    /// Reasoning content of a reasoning model, carried through the chat path so
+    /// a replayed assistant turn keeps it. Optional and skipped when absent, so
+    /// a peer that predates the field still decodes our frames and we still
+    /// decode theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -8068,6 +8074,12 @@ pub enum MessageBody {
     // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
     // rodzinę (request+response+stream) w `ProjectStudioPayload`.
     ProjectStudioBody(crate::project_studio::ProjectStudioPayload),
+
+    // ----- Code Studio (rejestr workspace'ow, czlonkowie, sesje robocze) -----
+    // Dopisane na KONCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // zeby nie ruszac indeksow istniejacych wariantow. JEDEN wariant na cala
+    // rodzine (request+response) w `CodeStudioPayload`.
+    CodeStudioBody(crate::code_studio::CodeStudioPayload),
 }
 
 // =============================================================================
@@ -8472,10 +8484,12 @@ mod tests {
                 ChatMessage {
                     role: "system".to_string(),
                     content: "You are helpful.".to_string(),
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: "Hi".to_string(),
+                    reasoning_content: None,
                 },
             ],
             temperature: Some(0.7),

@@ -18,6 +18,7 @@
 pub mod benchmark;
 pub mod camera;
 pub mod cbor;
+pub mod code_studio;
 pub mod compliance;
 pub mod envelope;
 pub mod legal;
