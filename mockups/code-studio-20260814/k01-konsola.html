@@ -206,40 +206,11 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
 
                 <div class="cs-turn">Tura 2 · 12:06</div>
 
-                <div class="ev ev-ask pulse">
-                  <div class="ev-ask-head">
-                    <svg class="icon"><use href="#i-message"/></svg>
-                    Agent czeka na Twoją decyzję
-                    <span class="who">code-orchestrator · 1m 40s</span>
-                  </div>
-                  <div class="ev-ask-q">Jak obsłużyć wsadowe wejście (<code>input</code> jako tablica)? To zmienia kształt odpowiedzi i limity.</div>
-                  <div class="ev-ask-opts">
-                    <div class="ev-ask-opt">
-                      <span class="k">1</span>
-                      <span><span class="l">Pełna zgodność z OpenAI — tablica i string</span>
-                      <span class="d">Zwraca listę wektorów w kolejności wejścia. Najwięcej pracy, ale klient OpenAI zadziała bez zmian.</span></span>
-                    </div>
-                    <div class="ev-ask-opt">
-                      <span class="k">2</span>
-                      <span><span class="l">Tylko pojedynczy string na start</span>
-                      <span class="d">Szybciej gotowe; wsad dołożymy, gdy pojawi się realny klient.</span></span>
-                    </div>
-                    <div class="ev-ask-opt">
-                      <span class="k">3</span>
-                      <span><span class="l">Tablica z twardym limitem 64 elementów</span>
-                      <span class="d">Kompromis: zgodność bez ryzyka wysycenia GPU jednym żądaniem.</span></span>
-                    </div>
-                    <div class="ev-ask-opt">
-                      <span class="k">4</span>
-                      <span><span class="l">Zapytaj usługę o limit i ustaw dynamicznie</span>
-                      <span class="d">Limit z konfiguracji modelu embeddingów zamiast stałej w kodzie.</span></span>
-                    </div>
-                  </div>
-                  <div class="ev-ask-own"><input type="text" placeholder="…albo napisz własną odpowiedź"></div>
-                  <div class="ev-ask-foot">
-                    <svg class="icon" style="width:13px;height:13px"><use href="#i-clock"/></svg>
-                    Bez odpowiedzi agent poczeka — sesja nie wygasa, deadline jest wstrzymany.
-                  </div>
+                <!-- W strumieniu zostaje tylko kotwica — pełne pytanie przejmuje kompozytor -->
+                <div class="ev ev-askmark">
+                  <span class="cs-dot ask"></span>
+                  <span><span class="q">Pytanie:</span> jak obsłużyć wsadowe wejście?</span>
+                  <span class="go">odpowiedz niżej ↓</span>
                 </div>
 
                 <div class="ev ev-tool run">
@@ -277,15 +248,48 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
                 <span class="el">2 aktywne · 18,4k tok</span>
               </div>
 
-              <div class="cs-composer">
+              <!-- Kompozytor w trybie „agent pyta": odpowiadasz tam, gdzie piszesz -->
+              <div class="cs-composer asking">
+                <div class="cs-answer" id="answer">
+                  <div class="cs-answer-head" id="answerHead">
+                    <svg class="icon" style="width:13px;height:13px"><use href="#i-message"/></svg>
+                    Agent pyta
+                    <span class="who">orchestrator · 1m 40s</span>
+                    <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+                  </div>
+                  <div class="cs-answer-q">Jak obsłużyć wsadowe wejście (<code>input</code> jako tablica)? To zmienia kształt odpowiedzi i limity.</div>
+                  <div class="cs-answer-opts">
+                    <button class="cs-answer-opt">
+                      <span class="k">1</span>
+                      <span><span class="l">Pełna zgodność z OpenAI — tablica i string</span>
+                      <span class="d">Lista wektorów w kolejności wejścia. Najwięcej pracy, ale klient OpenAI zadziała bez zmian.</span></span>
+                    </button>
+                    <button class="cs-answer-opt">
+                      <span class="k">2</span>
+                      <span><span class="l">Tylko pojedynczy string na start</span>
+                      <span class="d">Szybciej gotowe; wsad dołożymy, gdy pojawi się realny klient.</span></span>
+                    </button>
+                    <button class="cs-answer-opt">
+                      <span class="k">3</span>
+                      <span><span class="l">Tablica z limitem 64 elementów</span>
+                      <span class="d">Zgodność bez ryzyka wysycenia GPU jednym żądaniem.</span></span>
+                    </button>
+                    <button class="cs-answer-opt">
+                      <span class="k">4</span>
+                      <span><span class="l">Limit z konfiguracji modelu</span>
+                      <span class="d">Zamiast stałej w kodzie — pytamy usługę o jej limit.</span></span>
+                    </button>
+                  </div>
+                </div>
+
                 <div class="cs-composer-box">
-                  <textarea rows="2" placeholder="Napisz do orkiestratora…  (/ komendy, @ agent, # plik)"></textarea>
+                  <textarea rows="2" placeholder="…albo napisz własną odpowiedź"></textarea>
                   <div class="cs-composer-bar">
                     <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-paperclip"/></svg></button>
                     <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-sparkles"/></svg>Tryb: normalny</button>
                     <span class="spacer"></span>
                     <span class="cs-hint-keys"><span class="kbd">↵</span> wyślij</span>
-                    <button class="btn btn-sm btn-primary"><svg class="icon"><use href="#i-zap"/></svg>Wyślij</button>
+                    <button class="btn btn-sm btn-primary" style="background:var(--cs-ask);color:#1a1200"><svg class="icon"><use href="#i-check"/></svg>Odpowiedz</button>
                   </div>
                 </div>
               </div>
@@ -370,35 +374,22 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
 
                 <!-- ---- PLIKI ---- -->
                 <div class="cs-dock-pane" data-pane="pliki">
-                  <div class="cs-dock-title">tentaflow-core</div>
-                  <div class="ft">
-                    <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>src</div>
-                    <div class="ft-ind">
-                      <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>api</div>
-                      <div class="ft-ind">
-                        <div class="ft-row active"><svg class="icon"><use href="#i-file"/></svg>embeddings.rs<span class="badge a">nowy</span></div>
-                        <div class="ft-row"><svg class="icon"><use href="#i-file"/></svg>router.rs<span class="badge">M</span></div>
-                        <div class="ft-row"><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs</div>
-                      </div>
-                      <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>routing</div>
-                      <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>flow_engine</div>
-                      <div class="ft-row"><svg class="icon"><use href="#i-file"/></svg>lib.rs</div>
-                    </div>
-                    <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>tests</div>
-                    <div class="ft-ind">
-                      <div class="ft-row"><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs<span class="badge">M</span></div>
-                    </div>
-                    <div class="ft-row"><svg class="icon"><use href="#i-file"/></svg>Cargo.toml</div>
-                    <div class="ft-row"><svg class="icon"><use href="#i-file"/></svg>CLAUDE.md</div>
-                  </div>
+                  <div class="cs-files" id="files">
 
-                  <div class="cs-dock-title">Podgląd</div>
-                  <div class="cs-editor" style="border:1px solid var(--border);border-radius:var(--radius);overflow:hidden">
-                    <div class="cs-editor-tabs">
-                      <div class="cs-etab active"><span class="dirty"></span>embeddings.rs</div>
-                      <div class="cs-etab">router.rs</div>
+                    <!-- Telefon: pasek z przyciskiem otwierającym drzewo -->
+                    <div class="cs-file-head">
+                      <button class="btn btn-sm" data-tree><svg class="icon"><use href="#i-folder"/></svg>Drzewo</button>
+                      <span class="path">src/api/embeddings.rs</span>
+                      <span class="cs-chip ok" style="font-size:9.5px">nowy</span>
                     </div>
-                    <div class="cs-code">
+
+                    <div class="cs-file-view">
+                      <div class="cs-editor">
+                        <div class="cs-editor-tabs">
+                          <div class="cs-etab active"><span class="dirty"></span>embeddings.rs</div>
+                          <div class="cs-etab">router.rs</div>
+                        </div>
+                        <div class="cs-code">
 <div class="cl"><span class="ln">1</span><span class="tk">use</span> axum::{Json, extract::State};</div>
 <div class="cl"><span class="ln">2</span><span class="tk">use</span> serde::{Deserialize, Serialize};</div>
 <div class="cl"><span class="ln">3</span></div>
@@ -408,8 +399,56 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
 <div class="cl hi"><span class="ln">7</span>    <span class="tk">pub</span> input: <span class="tt">EmbeddingsInput</span>,</div>
 <div class="cl hi"><span class="ln">8</span>}</div>
 <div class="cl"><span class="ln">9</span></div>
-<div class="cl"><span class="ln">10</span><span class="tc">// limit wsadu — do potwierdzenia przez użytkownika</span></div>
-<div class="cl"><span class="ln">11</span><span class="tk">const</span> <span class="tt">MAX_BATCH</span>: <span class="tt">usize</span> = <span class="tn">64</span>;</div>
+<div class="cl"><span class="ln">10</span><span class="tp">#[derive(Deserialize)]</span></div>
+<div class="cl"><span class="ln">11</span><span class="tp">#[serde(untagged)]</span></div>
+<div class="cl"><span class="ln">12</span><span class="tk">pub enum</span> <span class="tt">EmbeddingsInput</span> {</div>
+<div class="cl"><span class="ln">13</span>    <span class="tt">One</span>(<span class="tt">String</span>),</div>
+<div class="cl"><span class="ln">14</span>    <span class="tt">Many</span>(<span class="tt">Vec</span>&lt;<span class="tt">String</span>&gt;),</div>
+<div class="cl"><span class="ln">15</span>}</div>
+<div class="cl"><span class="ln">16</span></div>
+<div class="cl"><span class="ln">17</span><span class="tc">// limit wsadu — czeka na decyzję użytkownika</span></div>
+<div class="cl"><span class="ln">18</span><span class="tk">const</span> <span class="tt">MAX_BATCH</span>: <span class="tt">usize</span> = <span class="tn">64</span>;</div>
+<div class="cl"><span class="ln">19</span></div>
+<div class="cl"><span class="ln">20</span><span class="tk">pub async fn</span> <span class="tf">embeddings_handler</span>(</div>
+<div class="cl"><span class="ln">21</span>    <span class="tt">State</span>(state): <span class="tt">State</span>&lt;<span class="tt">AppState</span>&gt;,</div>
+<div class="cl"><span class="ln">22</span>    <span class="tt">Json</span>(req): <span class="tt">Json</span>&lt;<span class="tt">EmbeddingsRequest</span>&gt;,</div>
+<div class="cl"><span class="ln">23</span>) -&gt; <span class="tt">Result</span>&lt;<span class="tt">Json</span>&lt;<span class="tt">EmbeddingsResponse</span>&gt;, <span class="tt">ApiError</span>&gt; {</div>
+<div class="cl"><span class="ln">24</span>    <span class="tk">let</span> inputs = <span class="tk">match</span> req.input {</div>
+<div class="cl"><span class="ln">25</span>        <span class="tt">EmbeddingsInput</span>::<span class="tt">One</span>(s) =&gt; <span class="tf">vec!</span>[s],</div>
+<div class="cl"><span class="ln">26</span>        <span class="tt">EmbeddingsInput</span>::<span class="tt">Many</span>(v) =&gt; v,</div>
+<div class="cl"><span class="ln">27</span>    };</div>
+<div class="cl"><span class="ln">28</span>    <span class="tk">if</span> inputs.<span class="tf">len</span>() &gt; <span class="tt">MAX_BATCH</span> {</div>
+<div class="cl"><span class="ln">29</span>        <span class="tk">return</span> <span class="tt">Err</span>(<span class="tt">ApiError</span>::<span class="tf">bad_request</span>(<span class="ts">"input exceeds MAX_BATCH"</span>));</div>
+<div class="cl"><span class="ln">30</span>    }</div>
+                        </div>
+                      </div>
+                    </div>
+
+                    <!-- Szuflada drzewa: wysuwa się z prawej, chowa po wybraniu pliku -->
+                    <div class="cs-tree-scrim" data-tree></div>
+                    <div class="cs-tree-panel">
+                      <button class="cs-tree-close" data-tree>Zamknij <svg class="icon" style="width:13px;height:13px"><use href="#i-chevron-r"/></svg></button>
+                      <div class="cs-dock-title">tentaflow-core</div>
+                      <div class="ft">
+                        <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>src</div>
+                        <div class="ft-ind">
+                          <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>api</div>
+                          <div class="ft-ind">
+                            <div class="ft-row active" data-file><svg class="icon"><use href="#i-file"/></svg>embeddings.rs<span class="badge a">nowy</span></div>
+                            <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>router.rs<span class="badge">M</span></div>
+                            <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs</div>
+                          </div>
+                          <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>routing</div>
+                          <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>flow_engine</div>
+                          <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>lib.rs</div>
+                        </div>
+                        <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>tests</div>
+                        <div class="ft-ind">
+                          <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs<span class="badge">M</span></div>
+                        </div>
+                        <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>Cargo.toml</div>
+                        <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>CLAUDE.md</div>
+                      </div>
                     </div>
                   </div>
                 </div>
@@ -602,6 +641,38 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed
   scrim.addEventListener('click', closeSheet);
   document.querySelectorAll('.cs-sheet-item').forEach(function (el) {
     el.addEventListener('click', closeSheet);
+  });
+
+  // Szuflada drzewa plików — otwiera przycisk, zamyka wybór pliku lub tło.
+  var files = document.getElementById('files');
+  document.querySelectorAll('[data-tree]').forEach(function (el) {
+    el.addEventListener('click', function () { files.classList.toggle('tree-open'); });
+  });
+  files.querySelectorAll('[data-file]').forEach(function (row) {
+    row.addEventListener('click', function () {
+      files.querySelectorAll('.ft-row').forEach(function (r) { r.classList.remove('active'); });
+      row.classList.add('active');
+      var path = row.textContent.trim().replace(/(nowy|M)$/, '');
+      var head = files.querySelector('.cs-file-head .path');
+      if (head) head.textContent = path;
+      files.classList.remove('tree-open');
+    });
+  });
+
+  // Zwijanie pytania, gdy chcesz zobaczyć więcej rozmowy.
+  var answer = document.getElementById('answer');
+  var answerHead = document.getElementById('answerHead');
+  if (answerHead) {
+    answerHead.addEventListener('click', function () { answer.classList.toggle('collapsed'); });
+  }
+
+  // Kotwica w strumieniu prowadzi do pytania w kompozytorze.
+  document.querySelectorAll('.ev-askmark').forEach(function (el) {
+    el.addEventListener('click', function () {
+      setView('konsola');
+      answer.classList.remove('collapsed');
+      answer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
+    });
   });
 })();
 </script>

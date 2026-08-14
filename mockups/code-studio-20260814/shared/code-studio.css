@@ -567,6 +567,80 @@
 .msheet-item .sub { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
 .msheet-item .st { margin-left: auto; font-size: 10.5px; font-family: var(--cs-mono); color: var(--text-3); }
 
+/* ============ PYTANIE AGENTA WEWNĄTRZ KOMPOZYTORA ======================== */
+/* Zasada: odpowiada się TAM, gdzie się pisze. Pytanie nie jest kartą gubiącą
+   się w historii, tylko przejmuje pole wejściowe — na desktopie i na telefonie
+   tak samo. W strumieniu zostaje tylko krótki znacznik. */
+
+.cs-composer.asking {
+  border-top: 1px solid rgba(245,158,11,.45);
+  background: linear-gradient(180deg, rgba(245,158,11,.07), var(--bg-2) 60%);
+}
+.cs-answer {
+  border: 1px solid rgba(245,158,11,.4); border-radius: var(--radius-lg);
+  background: var(--bg-2); margin-bottom: 8px; overflow: hidden;
+  animation: csAskIn .38s var(--spring) both;
+}
+.cs-answer-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 11px;
+  background: rgba(245,158,11,.11); border-bottom: 1px solid rgba(245,158,11,.2);
+  font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .09em;
+  color: var(--cs-ask); cursor: pointer;
+}
+.cs-answer-head .who {
+  margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 600;
+  font-family: var(--cs-mono); color: var(--text-3); font-size: 10px;
+}
+.cs-answer-head .chev { width: 14px; height: 14px; transition: transform .2s; color: var(--cs-ask); }
+.cs-answer.collapsed .cs-answer-head .chev { transform: rotate(-90deg); }
+.cs-answer-q { padding: 11px 12px 9px; font-size: 13.5px; line-height: 1.55; color: var(--text); font-weight: 600; }
+.cs-answer.collapsed .cs-answer-q,
+.cs-answer.collapsed .cs-answer-opts { display: none; }
+.cs-answer-opts {
+  display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px;
+  max-height: 38dvh; overflow-y: auto; scrollbar-width: thin;
+}
+.cs-answer-opt {
+  display: flex; align-items: flex-start; gap: 10px; padding: 9px 11px; width: 100%;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card);
+  cursor: pointer; text-align: left; font-family: inherit;
+  transition: border-color .15s, background .15s, transform .12s;
+}
+.cs-answer-opt:hover { border-color: var(--cs-ask); background: var(--bg-card-hover); transform: translateX(2px); }
+.cs-answer-opt .k {
+  width: 20px; height: 20px; border-radius: 6px; flex-shrink: 0;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-3);
+  font-family: var(--cs-mono); font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+.cs-answer-opt:hover .k { background: var(--cs-ask); color: #1a1200; border-color: transparent; }
+.cs-answer-opt .l { font-size: 12.5px; color: var(--text); font-weight: 600; display: block; }
+.cs-answer-opt .d { font-size: 11px; color: var(--text-3); margin-top: 2px; line-height: 1.5; display: block; }
+
+/* Znacznik w strumieniu — kotwica, nie karta */
+.ev-askmark {
+  display: flex; align-items: center; gap: 9px; margin: 10px 0;
+  padding: 9px 12px; border-radius: var(--radius);
+  border: 1px solid rgba(245,158,11,.3); border-left-width: 3px;
+  background: rgba(245,158,11,.06); cursor: pointer;
+  font-size: 12px; color: var(--text-2);
+}
+.ev-askmark:hover { background: rgba(245,158,11,.1); }
+.ev-askmark .q { color: var(--text); font-weight: 600; }
+.ev-askmark .go { margin-left: auto; color: var(--cs-ask); font-weight: 700; font-size: 11px; white-space: nowrap; }
+.ev-askmark .cs-dot { flex-shrink: 0; }
+
+/* ==================== PLIKI: drzewo + podgląd ============================ */
+.cs-files { display: flex; flex-direction: column; min-height: 0; }
+.cs-file-head { display: none; }
+.cs-file-view { display: flex; flex-direction: column; min-height: 0; }
+.cs-file-view .cs-editor { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.cs-file-view .cs-code { max-height: 320px; }
+/* Na desktopie drzewo stoi NAD podglądem (w DOM jest niżej, bo na telefonie
+   staje się szufladą pozycjonowaną absolutnie — tam kolejność nie ma znaczenia). */
+.cs-tree-panel { min-height: 0; order: -1; max-height: 300px; overflow-y: auto; margin-bottom: 10px; }
+.cs-tree-close { display: none; }
+
 /* ==================== CHROME MOBILNY (w realnym ekranie) ================== */
 
 /* Górny pasek: przycisk workspace + tytuł sesji. Na desktopie ukryty. */
@@ -631,20 +705,19 @@
 }
 
 @media (max-width: 900px) {
-  /* Makieta schodzi z drogi — chcemy widzieć realny ekran, nie ramkę. */
-  .screen { margin: 0; padding: 0; max-width: none; }
-  .screen-header { border-radius: 0; margin-bottom: 0; padding: 9px 12px; gap: 8px; flex-wrap: wrap; }
-  .screen-header h2 { font-size: 13px; }
-  .screen-header .desc { display: none; }
-  .screen-frame { border: 0; border-radius: 0; padding: 0; box-shadow: none; }
+  /* Pełna wysokość przez jawny łańcuch — żadnego zgadywania calc(). Makieta
+     schodzi z drogi całkowicie: chcemy widzieć aplikację, nie ramkę. */
+  html, body { height: 100%; overflow: hidden; }
+  .screen { height: 100%; display: flex; flex-direction: column; margin: 0; padding: 0; max-width: none; }
+  .screen-header { display: none; }
+  .screen-frame { flex: 1; min-height: 0; display: flex; border: 0; border-radius: 0; box-shadow: none; }
 
-  .app { grid-template-columns: 1fr; min-height: 0; }
+  .app { flex: 1; min-height: 0; grid-template-columns: 1fr; }
   .app > .sidebar { display: none; }
-  .main { padding: 0; overflow: hidden; }
+  .main { padding: 0; min-height: 0; overflow: hidden; display: flex; }
 
   .cs-shell {
-    margin: 0; min-height: 0;
-    height: calc(100dvh - 40px);          /* minus pasek nagłówka makiety */
+    flex: 1; min-height: 0; height: auto; margin: 0;
     grid-template-rows: auto 1fr auto;    /* góra · treść · dolna nawigacja */
     position: relative; overflow: hidden;
   }
@@ -672,14 +745,68 @@
   .cs-dock-tabs { display: none; }
   .cs-dock-body { padding: 10px 11px 12px; }
 
-  /* Nagłówek sceny: zwięzły, chipy się zawijają */
-  .cs-stage-head { padding: 8px 11px; gap: 7px; }
-  .cs-stage-head .cs-stage-title { font-size: 12.5px; }
-  .cs-stage-head .btn span { display: none; }
+  /* Nagłówek sceny znika na telefonie — jego treść jest już w górnym pasku,
+     a każdy zabrany wiersz to wiersz mniej rozmowy. */
+  .cs-stage-head { display: none; }
   .cs-stream { padding: 12px 11px 6px; }
   .ev-say, .ev-think { max-width: none; }
-  .ev-user { max-width: 88%; font-size: 12.5px; }
+  .ev-say { font-size: 13.5px; }
+  .ev-user { max-width: 88%; font-size: 13px; }
   .cs-composer { padding: 8px 11px 10px; }
+  .cs-nowbar { font-size: 10.5px; padding: 6px 11px; }
+
+  /* Wywołanie narzędzia łamie się na dwie linie zamiast urywać argument
+     wielokropkiem — na wąskim ekranie sama nazwa narzędzia nic nie mówi. */
+  .ev-tool { flex-wrap: wrap; row-gap: 2px; padding: 6px 8px; }
+  .ev-tool .t-arg { flex-basis: 100%; padding-left: 29px; white-space: normal; word-break: break-word; }
+  .ev-tool .t-meta { margin-left: auto; }
+  .ev-detail { margin-left: 8px; font-size: 10.5px; }
+
+  /* Pytanie w kompozytorze może zająć więcej, ale nigdy całego ekranu */
+  .cs-answer-opts { max-height: 34dvh; }
+  .cs-answer-opt { padding: 11px; min-height: 46px; }
+
+  /* ---- Pliki: podgląd na cały ekran, drzewo jako szuflada z prawej ---- */
+  .cs-shell[data-view="pliki"] .cs-dock-body,
+  .cs-shell[data-view="terminal"] .cs-dock-body { padding: 0; display: flex; min-height: 0; }
+  .cs-shell[data-view="pliki"] .cs-dock-pane[data-pane="pliki"],
+  .cs-shell[data-view="terminal"] .cs-dock-pane[data-pane="terminal"] { display: flex; flex: 1; min-height: 0; }
+
+  .cs-files { flex: 1; min-height: 0; position: relative; }
+  .cs-file-head {
+    display: flex; align-items: center; gap: 9px; padding: 8px 11px;
+    border-bottom: 1px solid var(--border); background: var(--bg-2); flex-shrink: 0;
+  }
+  .cs-file-head .path {
+    font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-2);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
+  }
+  .cs-file-view { flex: 1; min-height: 0; }
+  .cs-file-view .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
+  .cs-file-view .cs-code { flex: 1; min-height: 0; max-height: none; font-size: 12px; }
+  .cs-tree-panel { order: 0; max-height: none; margin-bottom: 0; }
+
+  /* Szuflada: wysuwa się z prawej, chowa po wybraniu pliku */
+  .cs-tree-panel {
+    position: absolute; top: 0; right: 0; bottom: 0; z-index: 15; width: 78%; max-width: 320px;
+    background: var(--bg-2); border-left: 1px solid var(--border-hover);
+    box-shadow: -14px 0 40px rgba(0,0,0,.6); padding: 8px 10px 12px;
+    overflow-y: auto; transform: translateX(101%); transition: transform .28s var(--spring);
+  }
+  .cs-files.tree-open .cs-tree-panel { transform: none; }
+  .cs-tree-close {
+    display: flex; align-items: center; gap: 6px; width: 100%; justify-content: flex-end;
+    background: none; border: 0; color: var(--text-3); font-family: inherit; font-size: 11px;
+    padding: 4px 2px 8px; cursor: pointer;
+  }
+  .cs-tree-scrim {
+    position: absolute; inset: 0; z-index: 14; background: rgba(3,5,15,.55);
+    opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+  .cs-files.tree-open .cs-tree-scrim { opacity: 1; pointer-events: auto; }
+  .ft-row { padding: 8px 7px; }        /* wygodniejszy cel dotyku */
+
+  .cs-term { border: 0; border-radius: 0; flex: 1; min-height: 0; overflow: auto; font-size: 11px; }
 
   /* Dolny pasek — przypięty, przełącza widok nad sobą */
   .cs-mtabs {
