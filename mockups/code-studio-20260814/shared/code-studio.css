@@ -994,13 +994,42 @@ html, body { height: 100%; overflow: hidden; }
 .cs-stab .x:hover { opacity: 1; color: var(--cs-err); }
 .cs-stab .mono { font-family: var(--cs-mono); font-size: 11.5px; }
 
+/* Pasek zakładek jest spisem otwartych rzeczy AKTUALNEJ kategorii doku:
+   na subagentach widać subagentów, na plikach pliki, na terminalu sesje. */
+.cs-tabgroup { display: none; align-items: stretch; gap: 1px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.cs-tabgroup::-webkit-scrollbar { display: none; }
+.cs-shell[data-dock="agenci"]   .cs-tabgroup[data-tabs="agenci"],
+.cs-shell[data-dock="pliki"]    .cs-tabgroup[data-tabs="pliki"],
+.cs-shell[data-dock="zmiany"]   .cs-tabgroup[data-tabs="zmiany"],
+.cs-shell[data-dock="git"]      .cs-tabgroup[data-tabs="git"],
+.cs-shell[data-dock="terminal"] .cs-tabgroup[data-tabs="terminal"] { display: flex; }
+
+/* Powrót do rozmowy — przypięty do prawej krawędzi paska, jak skrót na telefonie */
+.cs-tab-home {
+  margin-left: auto; flex-shrink: 0;
+  display: flex; align-items: center; gap: 7px; padding: 8px 14px;
+  background: transparent; border: 0; border-left: 1px solid var(--border);
+  color: var(--text-3); font-family: inherit; font-size: 12px; font-weight: 700;
+  cursor: pointer; white-space: nowrap; position: relative; transition: color .15s, background .15s;
+}
+.cs-tab-home:hover { color: var(--text); background: var(--bg-3); }
+.cs-shell[data-stage="konsola"] .cs-tab-home { color: #fff; background: var(--bg); }
+.cs-shell[data-stage="konsola"] .cs-tab-home::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--gradient-accent);
+}
+/* Gdy agent czeka na odpowiedź, powrót do konsoli się dopomina */
+.cs-shell[data-ask="1"]:not([data-stage="konsola"]) .cs-tab-home {
+  color: var(--cs-ask); background: rgba(245,158,11,.08);
+}
+
 /* Panele sceny — widoczny dokładnie jeden */
 .cs-spane { display: none; flex-direction: column; flex: 1; min-height: 0; }
 .cs-shell[data-stage="konsola"]  .cs-spane[data-spane="konsola"],
 .cs-shell[data-stage="plik"]     .cs-spane[data-spane="plik"],
 .cs-shell[data-stage="zmiany"]   .cs-spane[data-spane="zmiany"],
 .cs-shell[data-stage="terminal"] .cs-spane[data-spane="terminal"],
-.cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"] { display: flex; }
+.cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"],
+.cs-shell[data-stage="commit"]   .cs-spane[data-spane="commit"] { display: flex; }
 
 /* Pasek nad treścią w scenie (ścieżka pliku, podsumowanie diffa, akcje) */
 .cs-pane-head {
