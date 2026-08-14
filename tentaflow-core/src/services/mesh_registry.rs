@@ -420,6 +420,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 0,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: Vec::new(),
             update_available: false,
             created_at: "2026-01-01 00:00:00".into(),

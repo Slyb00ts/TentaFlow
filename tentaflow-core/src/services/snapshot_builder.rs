@@ -155,6 +155,8 @@ pub fn project_service_row(
         last_deploy_id: svc.last_deploy_id,
         deployment_progress_pct: i32::try_from(svc.deployment_progress_pct).unwrap_or(100),
         progress_message: svc.progress_message,
+        usage_json: svc.usage_json,
+        usage_updated_at: svc.usage_updated_at,
         models,
         update_available,
         created_at: svc.created_at,

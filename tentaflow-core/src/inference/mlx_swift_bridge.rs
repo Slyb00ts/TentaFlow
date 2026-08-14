@@ -527,41 +527,64 @@ impl InferenceEngine for MlxSwiftEngine {
             anyhow::bail!("Swift MLX: blad generowania (kod: {})", gen_result);
         }
 
-        // Zbierz wszystkie tokeny w jeden string
+        // Zbierz wszystkie tokeny w jeden string. Liczniki i predkosci faz niesie
+        // WYLACZNIE token finalny (Swift liczy prompt/gen i oddaje realne tempo
+        // z GenerateCompletionInfo) — liczenie wywolan callbacku byloby liczeniem
+        // fragmentow tekstu, nie tokenow.
         let mut full_text = String::new();
-        let mut tokens_count: u32 = 0;
+        let mut chunk_count: u32 = 0;
         let mut first_token_time: Option<Instant> = None;
+        let mut final_token: Option<StreamToken> = None;
 
         while let Some(token) = rx.recv().await {
             if first_token_time.is_none() && !token.text.is_empty() {
                 first_token_time = Some(Instant::now());
             }
+            if !token.text.is_empty() {
+                chunk_count += 1;
+            }
             full_text.push_str(&token.text);
-            tokens_count += 1;
+            if token.is_final {
+                final_token = Some(token);
+            }
         }
 
         let total_elapsed = start.elapsed();
-        let time_to_first_token_ms =
-            first_token_time.map(|t| t.duration_since(start).as_millis() as u64);
+        let wall_ttft_ms = first_token_time.map(|t| t.duration_since(start).as_millis() as u64);
 
-        // Oblicz tokeny na sekunde (bez prefill — od pierwszego tokena)
+        // Wall-clock jest fallbackiem dla silnika, ktory nie podal pomiaru
+        // (0.0 / 0) — nigdy nie nadpisuje liczb ze silnika.
         let decode_duration = first_token_time
             .map(|t| total_elapsed - t.duration_since(start))
             .unwrap_or(total_elapsed);
-
-        let tokens_per_second = if decode_duration.as_secs_f64() > 0.0 && tokens_count > 1 {
-            (tokens_count - 1) as f64 / decode_duration.as_secs_f64()
+        let engine_completion_tps = final_token.as_ref().map(|t| t.completion_tps).unwrap_or(0.0);
+        let engine_ttft_ms = final_token.as_ref().map(|t| t.ttft_ms).unwrap_or(0);
+        let reported_completion = final_token
+            .as_ref()
+            .map(|t| t.completion_tokens)
+            .unwrap_or(0);
+        let tokens_generated = if reported_completion > 0 {
+            reported_completion
         } else {
-            0.0
+            chunk_count
         };
+        let tokens_per_second = f64::from(super::decode_tps(
+            engine_completion_tps,
+            tokens_generated,
+            decode_duration.as_secs_f32(),
+        ));
 
         Ok(GenerateResult {
             text: full_text,
-            tokens_generated: tokens_count,
+            tokens_generated,
             tokens_per_second,
-            prompt_tokens: 0, // Swift side nie raportuje tego
+            prompt_tokens: final_token.as_ref().map(|t| t.prompt_tokens).unwrap_or(0),
             stop_reason: StopReason::EndOfText,
-            time_to_first_token_ms,
+            time_to_first_token_ms: if engine_ttft_ms > 0 {
+                Some(u64::from(engine_ttft_ms))
+            } else {
+                wall_ttft_ms
+            },
             total_time_ms: Some(total_elapsed.as_millis() as u64),
         })
     }

@@ -123,6 +123,10 @@ pub struct ServiceInfo {
     /// cold start ~3 min). NULL gdy serwis Running albo nic do
     /// raportowania.
     pub progress_message: Option<String>,
+    #[serde(default)]
+    pub usage_json: Option<String>,
+    #[serde(default)]
+    pub usage_updated_at: Option<String>,
     pub models: Vec<ServiceModelEntry>,
     /// True gdy hash drzewa źródeł bundla zapisany przy deployu różni się od
     /// aktualnego hashu z manifestu — Core wykrył nowszą wersję wbudowanego

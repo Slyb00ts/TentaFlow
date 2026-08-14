@@ -191,6 +191,34 @@ pub struct StreamToken {
     pub ttft_ms: u32,
 }
 
+/// Przepustowość prefillu w t/s. Pomiar silnika wygrywa: silnik zna realne
+/// granice faz swojego slotu, a zegar konsumenta łapie dodatkowo kolejkę kanału
+/// i harmonogram tokio. `engine_tps == 0.0` znaczy „silnik nie zmierzył" — tylko
+/// wtedy liczymy z okna prefillu. Jeden kontrakt dla KAŻDEGO silnika, żeby
+/// kolumny t/s z różnych backendów dało się porównywać.
+pub fn prefill_tps(engine_tps: f32, prompt_tokens: u32, prefill_secs: f32) -> f32 {
+    if engine_tps > 0.0 {
+        engine_tps
+    } else if prefill_secs > 0.0 && prompt_tokens > 0 {
+        prompt_tokens as f32 / prefill_secs
+    } else {
+        0.0
+    }
+}
+
+/// Przepustowość dekodowania w t/s, ta sama zasada co `prefill_tps`. Okno liczy
+/// N-1 interwałów między pierwszym a ostatnim tokenem — pierwszy token nie ma
+/// poprzednika, więc wliczenie go zawyżałoby tempo.
+pub fn decode_tps(engine_tps: f32, completion_tokens: u32, decode_secs: f32) -> f32 {
+    if engine_tps > 0.0 {
+        engine_tps
+    } else if decode_secs > 0.0 && completion_tokens > 1 {
+        (completion_tokens - 1) as f32 / decode_secs
+    } else {
+        0.0
+    }
+}
+
 /// Parametry embeddingów
 #[derive(Debug, Clone)]
 pub struct EmbeddingParams {
@@ -402,5 +430,33 @@ impl InferenceManager {
             self.active_deploy_params = DeployParamsSnapshot::default();
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod throughput_tests {
+    use super::{decode_tps, prefill_tps};
+
+    #[test]
+    fn engine_measurement_wins_over_wall_clock() {
+        // Zegar konsumenta dałby tu 4x mniej — pomiar silnika nie może przegrać.
+        assert_eq!(prefill_tps(800.0, 512, 2.0), 800.0);
+        assert_eq!(decode_tps(120.0, 101, 10.0), 120.0);
+    }
+
+    #[test]
+    fn wall_clock_fills_in_when_engine_is_silent() {
+        assert_eq!(prefill_tps(0.0, 512, 2.0), 256.0);
+        // N-1 interwałów: 101 tokenów w 10 s to 10 t/s, nie 10.1.
+        assert_eq!(decode_tps(0.0, 101, 10.0), 10.0);
+    }
+
+    #[test]
+    fn unmeasurable_stays_zero_instead_of_fabricated() {
+        assert_eq!(prefill_tps(0.0, 0, 2.0), 0.0);
+        assert_eq!(prefill_tps(0.0, 512, 0.0), 0.0);
+        // Jeden token nie ma okna dekodowania.
+        assert_eq!(decode_tps(0.0, 1, 10.0), 0.0);
+        assert_eq!(decode_tps(0.0, 100, 0.0), 0.0);
     }
 }

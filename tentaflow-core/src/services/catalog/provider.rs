@@ -936,6 +936,8 @@ mod tests {
                 last_deploy_id: String::new(),
                 deployment_progress_pct: 0,
                 progress_message: None,
+                usage_json: None,
+                usage_updated_at: None,
                 models: vec![ServiceModelEntry {
                     // Same name as the seeded alias above.
                     model_name: "test-alias".into(),
@@ -1015,6 +1017,8 @@ mod tests {
                 last_deploy_id: String::new(),
                 deployment_progress_pct: 0,
                 progress_message: None,
+                usage_json: None,
+                usage_updated_at: None,
                 models: vec![ServiceModelEntry {
                     model_name: "whisper-base".into(),
                     display_name: None,
@@ -1079,6 +1083,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 0,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![ServiceModelEntry {
                 model_name: "shared".into(),
                 display_name: None,
@@ -1241,6 +1247,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 100,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![ServiceModelEntry {
                 model_name: model_name.into(),
                 display_name: None,
