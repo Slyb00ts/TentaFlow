@@ -29,7 +29,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 /// Kursor po zrzucie: pola idą po sobie w kolejności zapisu.
@@ -259,10 +261,7 @@ fn project(w: &[f32], x: &[f32], rows: usize, cols: usize) -> Vec<f32> {
 fn rms_norm(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
     let mean = x.iter().map(|v| v * v).sum::<f32>() / x.len() as f32;
     let inv = (mean + eps).sqrt().recip();
-    x.iter()
-        .zip(weight)
-        .map(|(v, w)| w * (v * inv))
-        .collect()
+    x.iter().zip(weight).map(|(v, w)| w * (v * inv)).collect()
 }
 
 /// Częstotliwości rope z interpolacją YaRN — `original_seq_len == 0` wyłącza ją.
@@ -403,8 +402,8 @@ fn neox_rope_layout_would_be_caught() {
 /// Ekspert NVFP4 rozwinięty przez PRODUKCYJNE przepakowanie do układu
 /// jednobuforowego, tak jak zobaczy go kernel.
 fn load_expert(st: &ShardedSafeTensors, base: &str) -> (Vec<f32>, usize, usize) {
-    let names = forge_formats::nvfp4::DeepseekNvFp4Names::for_weight(&format!("{base}.weight"))
-        .unwrap();
+    let names =
+        forge_formats::nvfp4::DeepseekNvFp4Names::for_weight(&format!("{base}.weight")).unwrap();
     let info = st.tensor(&names.packed).expect(&names.packed);
     let gs = st.data(&names.global_scale).unwrap();
     let global = f32::from_le_bytes([gs[0], gs[1], gs[2], gs[3]]);
@@ -557,7 +556,8 @@ fn attention_output_path_matches_the_reference_implementation() {
         // Każda grupa ma własny blok wo_a o kształcie [o_lora_rank, per_group].
         let mut lora = vec![0f32; oracle.o_groups * oracle.o_lora_rank];
         for group in 0..oracle.o_groups {
-            let block = &wo_a[group * oracle.o_lora_rank * per_group..][..oracle.o_lora_rank * per_group];
+            let block =
+                &wo_a[group * oracle.o_lora_rank * per_group..][..oracle.o_lora_rank * per_group];
             let chunk = &o[group * per_group..(group + 1) * per_group];
             let out = project(block, chunk, oracle.o_lora_rank, per_group);
             lora[group * oracle.o_lora_rank..(group + 1) * oracle.o_lora_rank]
@@ -841,7 +841,10 @@ fn sparse_indexer_matches_the_reference_implementation() {
     }
     let kv_err = relative_l2(&index_kv, &oracle.index_kv);
     eprintln!("kompresor indeksera: względne L2 = {kv_err:.3e}");
-    assert!(kv_err < 1e-3, "kompresor indeksera rozjeżdża się o {kv_err:.3e}");
+    assert!(
+        kv_err < 1e-3,
+        "kompresor indeksera rozjeżdża się o {kv_err:.3e}"
+    );
 
     // Zapytania indeksera i punktowanie pozycji.
     let softmax_scale = (d as f32).sqrt().recip();
@@ -904,7 +907,11 @@ fn sparse_attention_matches_the_reference_implementation() {
     let mut got = vec![0f32; oracle.sparse_out.len()];
     for t in 0..oracle.seqlen {
         let idxs = &oracle.topk_idxs[t * oracle.n_topk..(t + 1) * oracle.n_topk];
-        let valid: Vec<usize> = idxs.iter().filter(|i| **i >= 0).map(|i| *i as usize).collect();
+        let valid: Vec<usize> = idxs
+            .iter()
+            .filter(|i| **i >= 0)
+            .map(|i| *i as usize)
+            .collect();
         for head in 0..oracle.n_heads {
             let q = &oracle.q[(t * oracle.n_heads + head) * d..][..d];
             let scores: Vec<f32> = valid
@@ -994,9 +1001,7 @@ fn hyper_connections_match_the_reference_implementation() {
         let mean = x.iter().map(|v| v * v).sum::<f32>() / wide as f32;
         let rsqrt = (mean + eps).sqrt().recip();
         let mixes: Vec<f32> = (0..mix_hc)
-            .map(|m| {
-                (0..wide).map(|c| hc_fn[m * wide + c] * x[c]).sum::<f32>() * rsqrt
-            })
+            .map(|m| (0..wide).map(|c| hc_fn[m * wide + c] * x[c]).sum::<f32>() * rsqrt)
             .collect();
 
         let sigmoid = |v: f32| 1.0 / (1.0 + (-v).exp());
@@ -1074,7 +1079,10 @@ fn hyper_connections_match_the_reference_implementation() {
     let post_err = relative_l2(&expanded, &oracle.hc_expanded);
     eprintln!("hc_pre {pre_err:.3e}, hc_post {post_err:.3e}");
     assert!(pre_err < 1e-5, "redukcja HC rozjeżdża się o {pre_err:.3e}");
-    assert!(post_err < 1e-5, "rozprowadzenie HC rozjeżdża się o {post_err:.3e}");
+    assert!(
+        post_err < 1e-5,
+        "rozprowadzenie HC rozjeżdża się o {post_err:.3e}"
+    );
 }
 
 /// Ścieżka DEKODOWANIA kompresora: token po tokenie, ze stanem okna między
@@ -1171,7 +1179,10 @@ fn kv_compressor_decode_matches_the_reference_implementation() {
     let got = produced.expect("cztery kroki przy ratio 4 domykają jedno okno");
     let err = relative_l2(&got, &oracle.decode_compressed);
     eprintln!("kompresor (dekodowanie): względne L2 = {err:.3e}");
-    assert!(err < 1e-4, "dekodowanie kompresora rozjeżdża się o {err:.3e}");
+    assert!(
+        err < 1e-4,
+        "dekodowanie kompresora rozjeżdża się o {err:.3e}"
+    );
 }
 
 /// Głowa wyjściowa. Redukcja kopii HC jest tu PROSTSZA niż w bloku — sama
@@ -1199,7 +1210,10 @@ fn output_head_matches_the_reference_implementation() {
         let rsqrt = (mean + eps).sqrt().recip();
         let mut y = vec![0f32; dim];
         for copy in 0..hc {
-            let mix: f32 = (0..wide).map(|c| hc_fn[copy * wide + c] * x[c]).sum::<f32>() * rsqrt;
+            let mix: f32 = (0..wide)
+                .map(|c| hc_fn[copy * wide + c] * x[c])
+                .sum::<f32>()
+                * rsqrt;
             // W głowie skala jest jedna dla wszystkich kopii (w bloku są trzy
             // osobne), a przesunięcie zostaje per kopia.
             let pre = 1.0 / (1.0 + (-(mix * hc_scale[0] + hc_base[copy])).exp()) + hc_eps;
@@ -1212,7 +1226,10 @@ fn output_head_matches_the_reference_implementation() {
     }
     let reduce_err = relative_l2(&reduced, &oracle.head_reduced);
     eprintln!("głowa: redukcja HC = {reduce_err:.3e}");
-    assert!(reduce_err < 1e-5, "redukcja HC głowy rozjeżdża się o {reduce_err:.3e}");
+    assert!(
+        reduce_err < 1e-5,
+        "redukcja HC głowy rozjeżdża się o {reduce_err:.3e}"
+    );
 
     // Logity tylko dla ostatniej pozycji.
     let last = &reduced[(oracle.seqlen - 1) * dim..];
@@ -1236,10 +1253,15 @@ fn hash_routing_matches_the_reference_implementation() {
     let st = ShardedSafeTensors::load_dir(&dir).unwrap();
     let g = format!("layers.{LAYER}.ffn.gate");
     let weight = load_vector(&st, &format!("{g}.weight"));
-    let table_info = st.tensor(&format!("{g}.tid2eid")).expect("warstwa haszowana");
+    let table_info = st
+        .tensor(&format!("{g}.tid2eid"))
+        .expect("warstwa haszowana");
     let table_bytes = st.data(&format!("{g}.tid2eid")).unwrap();
     let per_token = table_info.shape[1];
-    assert_eq!(per_token, oracle.topk, "tablica ma inną liczbę ekspertów niż top-k");
+    assert_eq!(
+        per_token, oracle.topk,
+        "tablica ma inną liczbę ekspertów niż top-k"
+    );
     let route_scale = 1.5f32;
 
     for t in 0..oracle.seqlen {
@@ -1261,7 +1283,11 @@ fn hash_routing_matches_the_reference_implementation() {
                 let logit: f32 = (0..oracle.dim)
                     .map(|c| weight[e * oracle.dim + c] * x[c])
                     .sum();
-                let softplus = if logit > 20.0 { logit } else { logit.exp().ln_1p() };
+                let softplus = if logit > 20.0 {
+                    logit
+                } else {
+                    logit.exp().ln_1p()
+                };
                 softplus.sqrt()
             })
             .collect();

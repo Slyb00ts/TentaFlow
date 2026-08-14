@@ -256,7 +256,11 @@ mod tests {
     fn gelu_is_the_exact_form_not_the_tanh_approximation() {
         // Reference values from the erf definition.
         assert!((gelu(0.0) - 0.0).abs() < 1e-7);
-        assert!((gelu(1.0) - 0.841_345).abs() < 1e-4, "gelu(1) = {}", gelu(1.0));
+        assert!(
+            (gelu(1.0) - 0.841_345).abs() < 1e-4,
+            "gelu(1) = {}",
+            gelu(1.0)
+        );
         assert!((gelu(-1.0) + 0.158_655).abs() < 1e-4);
         assert!((gelu(3.0) - 2.995_95).abs() < 1e-3);
     }

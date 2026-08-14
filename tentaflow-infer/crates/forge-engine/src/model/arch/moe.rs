@@ -307,6 +307,7 @@ impl Model {
                 &layer.ffn_norm,
                 1,
                 hidden,
+                p.post_norm_eps,
                 eps,
                 stream,
             )?;
@@ -335,6 +336,7 @@ impl Model {
                 next_norm,
                 1,
                 hidden,
+                p.post_norm_eps,
                 eps,
                 stream,
             )?;
@@ -494,7 +496,10 @@ impl Model {
                 k,
             )
         };
-        let shared_scale = Self::moe_shared_scales(mb, 1).first().copied().unwrap_or(1.0);
+        let shared_scale = Self::moe_shared_scales(mb, 1)
+            .first()
+            .copied()
+            .unwrap_or(1.0);
         self.fault_in_experts(moe, layer, ids)?;
         self.moe_experts_accumulate(
             moe,
@@ -843,10 +848,9 @@ impl Model {
             .map(|stack| Self::grouped_stack_quant(stack))
             .into_iter()
             .collect::<Result<Vec<_>>>()?;
-        let stride = self.kernels.grouped_tile_stride(
-            &starts,
-            [quants[0], quants[1], quants[2]],
-        );
+        let stride = self
+            .kernels
+            .grouped_tile_stride(&starts, [quants[0], quants[1], quants[2]]);
         let (mut tile_expert, mut tile_first, mut tile_end) = (Vec::new(), Vec::new(), Vec::new());
         for e in 0..experts {
             let (from, to) = (starts[e] as usize, starts[e + 1] as usize);
@@ -873,14 +877,8 @@ impl Model {
             rows: stride,
         };
 
-        self.kernels.gather_rows_f16(
-            &mb.grouped_x,
-            x,
-            &mb.order,
-            selections,
-            hidden,
-            stream,
-        )?;
+        self.kernels
+            .gather_rows_f16(&mb.grouped_x, x, &mb.order, selections, hidden, stream)?;
         // Gate i up czytają TE SAME wiersze, więc aktywacja idzie przez swoją
         // postać raz, a nie raz na projekcję.
         let ffn_act = self.kernels.prepare_grouped_act(
@@ -972,8 +970,14 @@ impl Model {
                 self.gemm_rows(&pb.up, up, x, t, 0, up.rows(), stream)?;
             }
         }
-        self.kernels
-            .glu_mul_f16(self.ffn_act(), &pb.gate, &pb.gate, &pb.up, t * sh_inter, stream)?;
+        self.kernels.glu_mul_f16(
+            self.ffn_act(),
+            &pb.gate,
+            &pb.gate,
+            &pb.up,
+            t * sh_inter,
+            stream,
+        )?;
         self.gemm(&mb.grouped_out, &sh.down, &pb.gate, t, stream)?;
         // One expert per token, its row at its own index: the combine with
         // `top_k = 1` over the identity IS `pb.down[r] += gate[r] · shared[r]`.

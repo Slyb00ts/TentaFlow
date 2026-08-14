@@ -417,9 +417,8 @@ impl ExpertStack {
                 // amortyzuje się natychmiast; kopia jest wieczna, bo wagi są
                 // tylko do odczytu.
                 if placement.spilled[evicted].is_none() {
-                    let bytes = unsafe {
-                        std::slice::from_raw_parts(host_ptr, self.bytes_per_expert)
-                    };
+                    let bytes =
+                        unsafe { std::slice::from_raw_parts(host_ptr, self.bytes_per_expert) };
                     placement.spilled[evicted] = Some(spill.append(bytes)?);
                 }
                 placement.slot_of[evicted] = None;
@@ -467,7 +466,12 @@ pub struct ExpertBudget {
 }
 
 impl ExpertBudget {
-    pub fn new(vram_bytes: usize, host_bytes: usize, expert_bytes: usize, min_slots: usize) -> Self {
+    pub fn new(
+        vram_bytes: usize,
+        host_bytes: usize,
+        expert_bytes: usize,
+        min_slots: usize,
+    ) -> Self {
         let resident = (vram_bytes + host_bytes) as f64;
         let resident_fraction = if expert_bytes == 0 {
             1.0
@@ -702,7 +706,6 @@ impl<'a> MoeLayerView<'a> {
         [self.gate, self.up, self.down]
     }
 }
-
 
 #[cfg(test)]
 mod tests {

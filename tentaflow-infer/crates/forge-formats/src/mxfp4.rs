@@ -141,8 +141,7 @@ pub fn deepseek_expert_mxfp4_to_gguf(
         let packed_row = &packed[row * cols / 2..(row + 1) * cols / 2];
         let scale_row = &scales[row * scales_per_row..(row + 1) * scales_per_row];
         for block in 0..blocks_per_row {
-            let dst = &mut out[(row * blocks_per_row + block) * NV_BLOCK_BYTES..]
-                [..NV_BLOCK_BYTES];
+            let dst = &mut out[(row * blocks_per_row + block) * NV_BLOCK_BYTES..][..NV_BLOCK_BYTES];
             for sub in 0..4 {
                 let first = block * NV_BLOCK_VALUES + sub * NV_GROUP;
                 // Dwa sąsiednie pola NVFP4 dzielą jedną skalę MXFP4.

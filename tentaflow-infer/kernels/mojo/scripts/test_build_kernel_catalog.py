@@ -204,6 +204,92 @@ class ArchScopeTest(unittest.TestCase):
         # Rodzina mma/FP8 jest wylacznie dla NVIDII.
         self.assertGreater(counts["sm_89"], counts["gfx1100"])
 
+    def test_grouped_q6k_ma_osobne_warianty_nvidia_i_amd(self):
+        kernels, _ = build_kernel_catalog.parse_catalog()
+        scopes = {
+            artifact: scope
+            for _, _, artifact, scope in kernels
+            if artifact
+            in {
+                "gemm_q6_k_f16_grouped",
+                "gemm_q6_k_f16_grouped_bm128_bn64",
+                "gemm_q6_k_wmma_f16_grouped",
+                "gemm_q6_k_wmma_f16_grouped_bm128_bn64",
+            }
+        }
+        self.assertEqual(set(scopes), {
+            "gemm_q6_k_f16_grouped",
+            "gemm_q6_k_f16_grouped_bm128_bn64",
+            "gemm_q6_k_wmma_f16_grouped",
+            "gemm_q6_k_wmma_f16_grouped_bm128_bn64",
+        })
+        for artifact in (
+            "gemm_q6_k_f16_grouped",
+            "gemm_q6_k_f16_grouped_bm128_bn64",
+        ):
+            scope = scopes[artifact]
+            self.assertEqual(scope, ("nvidia",), artifact)
+            self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1201"), artifact)
+            self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_89"), artifact)
+        for artifact in (
+            "gemm_q6_k_wmma_f16_grouped",
+            "gemm_q6_k_wmma_f16_grouped_bm128_bn64",
+        ):
+            scope = scopes[artifact]
+            self.assertEqual(scope, ("amd:gfx11+",), artifact)
+            self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1030"), artifact)
+            self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1100"), artifact)
+            self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1201"), artifact)
+            self.assertFalse(build_kernel_catalog.scope_allows(scope, "sm_89"), artifact)
+
+    def test_grouped_q4k_i_q8_0_maja_osobne_warianty_nvidia_i_amd(self):
+        kernels, _ = build_kernel_catalog.parse_catalog()
+        scopes = {
+            artifact: scope
+            for _, _, artifact, scope in kernels
+            if artifact
+            in {
+                "gemm_q4_k_i8mma_grouped",
+                "gemm_q4_k_i8mma_grouped_bm128_bn64",
+                "gemm_q8_0_i8mma_grouped",
+                "gemm_q8_0_i8mma_grouped_bm128_bn64",
+                "gemm_q4_k_i8wmma_f16_grouped",
+                "gemm_q4_k_i8wmma_f16_grouped_bm128_bn64",
+                "gemm_q8_0_wmma_f16_grouped",
+                "gemm_q8_0_wmma_f16_grouped_bm128_bn64",
+            }
+        }
+        self.assertEqual(len(scopes), 8)
+        for artifact, scope in scopes.items():
+            if "wmma" in artifact:
+                self.assertEqual(scope, ("amd:gfx11+",), artifact)
+                self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1201"), artifact)
+                self.assertFalse(build_kernel_catalog.scope_allows(scope, "sm_89"), artifact)
+            else:
+                self.assertEqual(scope, ("nvidia",), artifact)
+                self.assertTrue(build_kernel_catalog.scope_allows(scope, "sm_89"), artifact)
+                self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1201"), artifact)
+
+    def test_rdna4_u4_decode_jest_ograniczony_do_gfx12(self):
+        kernels, _ = build_kernel_catalog.parse_catalog()
+        scopes = {
+            artifact: scope
+            for _, _, artifact, scope in kernels
+            if artifact
+            in {
+                "gemv_q4_k_dp4a_amd_u4_f16",
+                "gemv_q4_k_dp4a_amd_u4_persist_f16",
+                "gemv_q4_k_dp4a_amd_u4_persist_x4k_f16",
+                "gemv_q4_k_dp4a_amd_u4_group4_f16",
+            }
+        }
+        self.assertEqual(len(scopes), 4)
+        for artifact, scope in scopes.items():
+            self.assertEqual(scope, ("amd:gfx12",), artifact)
+            self.assertTrue(build_kernel_catalog.scope_allows(scope, "gfx1201"), artifact)
+            self.assertFalse(build_kernel_catalog.scope_allows(scope, "gfx1100"), artifact)
+            self.assertFalse(build_kernel_catalog.scope_allows(scope, "sm_89"), artifact)
+
 
 if __name__ == "__main__":
     unittest.main()

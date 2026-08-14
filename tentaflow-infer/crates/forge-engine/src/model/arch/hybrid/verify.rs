@@ -584,7 +584,9 @@ impl Model {
             1.0 / (p.head_dim as f32).sqrt(),
             stream,
         )? {
-        } else if self.device.caps().vendor == Vendor::Nvidia && t < Self::HYBRID_ATTN_TOKEN_PARALLEL {
+        } else if self.device.caps().vendor == Vendor::Nvidia
+            && t < Self::HYBRID_ATTN_TOKEN_PARALLEL
+        {
             kernels.attn_decode_batch_exact_f16_hd256(
                 &pb.attn_out,
                 &hv.qc,
@@ -804,5 +806,4 @@ impl Model {
             }
         }
     }
-
 }

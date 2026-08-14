@@ -21,6 +21,7 @@ const SLOT: usize = 0;
 fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<MetalExec> {
     Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
 }
+
 const GGUF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../.runtime/models/bielik-minitron-7b-v3-gguf/minitron-Bielik-7B-v3.0-Instruct-Q4_K_M.gguf"

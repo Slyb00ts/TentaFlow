@@ -65,4 +65,5 @@ mod tests {
         // Long enough to amortize its own ramp, so the plain form ties.
         assert_eq!(persist_wave(48, 4, 4096), None);
     }
+
 }

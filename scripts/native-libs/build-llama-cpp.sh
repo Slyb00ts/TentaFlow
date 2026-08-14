@@ -11,7 +11,7 @@ source "$SCRIPT_DIR/common.sh"
 PLATFORM="${1:-$(detect_platform)}"
 # Pinowany commit llama.cpp — wszyscy budują dokładnie tę samą wersję jako prebuilt
 # biblioteki w native-libs. Świeży master da się wymusić przez LLAMA_CPP_REF=origin/master.
-LLAMA_CPP_REF="${LLAMA_CPP_REF:-91d2fc387529940230555abd297a8b5e99737d3f}"
+LLAMA_CPP_REF="${LLAMA_CPP_REF:-689e227db485c6b33d061555e74034c93a867649}"
 BACKENDS="${LLAMA_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
@@ -189,7 +189,10 @@ build_backend() {
   fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
   backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
-  backend_enabled rocm "${enabled_backends[@]}" && cmake_args+=(-DGGML_HIP=ON)
+  if backend_enabled rocm "${enabled_backends[@]}"; then
+    cmake_args+=(-DGGML_HIP=ON)
+    [ -n "${CMAKE_HIP_ARCHITECTURES:-}" ] && cmake_args+=(-DCMAKE_HIP_ARCHITECTURES="$CMAKE_HIP_ARCHITECTURES")
+  fi
 
   if backend_enabled cuda "${enabled_backends[@]}"; then
     jobs="${LLAMA_CPP_CUDA_JOBS:-4}"

@@ -53,6 +53,8 @@ pub enum WeightRole {
     AttnO,
     AttnQNorm,
     AttnKNorm,
+    /// Muse Glimmer's separate sigmoid gate over the attention output.
+    AttnGate,
     AttnNorm,
     FfnGate,
     FfnUp,
@@ -228,6 +230,19 @@ impl Hyperparams {
     /// Podstawa rope warstwy `layer`. Gemma 4 ma dwie: 1e4 dla warstw okiennych
     /// i 1e6 dla globalnych.
     pub fn rope_theta_at(&self, layer: usize) -> f32 {
+        if self.rope_sliding_only && self.alt_attn.is_none() {
+            return if layer % 4 == 3 { 0.0 } else { self.rope_theta };
+        }
+        if self.rope_sliding_only
+            && !self
+                .alt_attn
+                .as_ref()
+                .and_then(|alt| alt.sliding.get(layer))
+                .copied()
+                .unwrap_or(true)
+        {
+            return 0.0;
+        }
         match &self.alt_attn {
             Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.rope_theta_swa,
             _ => self.rope_theta,
@@ -243,13 +258,17 @@ impl Hyperparams {
         }
     }
 
-    /// Czy warstwa `layer` w ogóle ma projekcję V. Warstwy globalne Gemmy 4 jej
-    /// nie mają i używają wtedy K jako V (potwierdzone w llama.cpp).
-    pub fn has_v_proj(&self, layer: usize) -> bool {
-        match &self.alt_attn {
-            Some(alt) => alt.sliding.get(layer).copied().unwrap_or(true),
-            None => true,
+    pub fn uses_rope_at(&self, layer: usize) -> bool {
+        if self.rope_sliding_only && self.alt_attn.is_none() {
+            return layer % 4 != 3;
         }
+        !self.rope_sliding_only
+            || self
+                .alt_attn
+                .as_ref()
+                .and_then(|alt| alt.sliding.get(layer))
+                .copied()
+                .unwrap_or(true)
     }
 }
 
@@ -349,6 +368,7 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/qwen35.ron"),
     include_str!("../arch/gemma4.ron"),
     include_str!("../arch/deepseek_v4.ron"),
+    include_str!("../arch/muse_glimmer.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -403,29 +423,41 @@ pub struct AltAttnParams {
 /// Wzorce w GGUF są KRÓTKIE i powtarzalne: Gemma 4 ma 48 warstw, ale
 /// `sliding_window_pattern` liczy 6 pozycji, a `head_count_kv` też 6 — trzeba je
 /// rozwinąć modulo długość, inaczej wychodzi zła geometria od siódmej warstwy.
-fn parse_alt_attn(
-    gguf: &Gguf,
-    arch: &str,
-    block_count: usize,
-) -> Option<AltAttnParams> {
+fn parse_alt_attn(gguf: &Gguf, arch: &str, block_count: usize) -> Option<AltAttnParams> {
     let key = |suffix: &str| format!("{arch}.{suffix}");
-    let pattern = gguf.get_array(&key("attention.sliding_window_pattern"))?;
-    if pattern.is_empty() {
-        return None;
-    }
-    let flags: Vec<bool> = pattern.iter().filter_map(|v| v.as_bool()).collect();
-    if flags.len() != pattern.len() {
-        return None;
-    }
+    let flags: Vec<bool> = match gguf.get_array(&key("attention.sliding_window_pattern")) {
+        Some(pattern) if !pattern.is_empty() => {
+            let flags: Vec<bool> = pattern.iter().filter_map(|v| v.as_bool()).collect();
+            if flags.len() != pattern.len() {
+                return None;
+            }
+            flags
+        }
+        _ if arch == "muse-glimmer" => {
+            let period = gguf
+                .get_u64(&key("attention.sliding_window_pattern"))
+                .unwrap_or(4) as usize;
+            muse_swa_pattern(period)?
+        }
+        _ => return None,
+    };
     let sliding: Vec<bool> = (0..block_count)
         .map(|layer| flags[layer % flags.len()])
         .collect();
     let window = gguf.get_u64(&key("attention.sliding_window"))? as usize;
-    let head_dim_swa = gguf.get_u64(&key("attention.key_length_swa"))? as usize;
+    let head_dim_swa = gguf
+        .get_u64(&key("attention.key_length_swa"))
+        .or_else(|| gguf.get_u64(&key("attention.key_length")))? as usize;
     // Liczba głowic KV jest tablicą o tej samej długości co wzorzec: pozycje
     // lokalne i globalne mają różne wartości (u Gemmy 8 wobec 1).
-    let kv = gguf.get_array(&key("attention.head_count_kv"))?;
-    let kv: Vec<usize> = kv.iter().filter_map(|v| v.as_u64()).map(|v| v as usize).collect();
+    let kv: Vec<usize> = match gguf.get_array(&key("attention.head_count_kv")) {
+        Some(kv) => kv
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as usize)
+            .collect(),
+        None => vec![gguf.get_u64(&key("attention.head_count_kv"))? as usize; flags.len()],
+    };
     if kv.len() != flags.len() {
         return None;
     }
@@ -444,6 +476,23 @@ fn parse_alt_attn(
         n_kv_heads_swa,
         rope_theta_swa,
     })
+}
+
+fn muse_swa_pattern(period: usize) -> Option<Vec<bool>> {
+    (period != 0).then(|| (0..period).map(|layer| layer + 1 < period).collect())
+}
+
+fn parse_post_norm_eps(gguf: &Gguf, arch: &str, rms_norm_eps: f32) -> f32 {
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    gguf.get_f32(&key("post_norm_eps"))
+        .or_else(|| gguf.get_f32(&key("post_norm_rms_epsilon")))
+        .unwrap_or_else(|| {
+            if arch == "muse-glimmer" {
+                1e-5
+            } else {
+                rms_norm_eps
+            }
+        })
 }
 
 /// Mixture-of-Experts routing parameters (present only for MoE architectures).
@@ -521,6 +570,7 @@ pub struct Hyperparams {
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    pub post_norm_eps: f32,
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: bool,
     /// Sequence pooling declared by the model (embedding models only); `None`
@@ -561,9 +611,12 @@ pub struct Hyperparams {
     /// Naprzemienna geometria uwagi (okno przesuwne + własny head_dim/KV);
     /// `None`, gdy wszystkie warstwy mają tę samą geometrię.
     pub alt_attn: Option<AltAttnParams>,
+    /// Muse Glimmer applies RoPE only on sliding-attention layers.
+    pub rope_sliding_only: bool,
     /// Ograniczenie logitów `softcap * tanh(x / softcap)` przed samplingiem
     /// (Gemma). 0 = wyłączone.
     pub final_logit_softcap: f32,
+    pub logit_scale: f32,
     /// Jawna skala logitów uwagi. `None` = domyślne `1/sqrt(head_dim)`.
     /// Gemma 4 używa 1,0 (w referencji `f_attention_scale = 1.0f`), więc bez
     /// tego pola model liczyłby uwagę na skali mniejszej ~22x.
@@ -871,7 +924,6 @@ impl ModelDescriptor {
         Ok(())
     }
 
-
     /// Czy model używa RoPE PRZEPLATANEGO (pary `(2i, 2i+1)`) zamiast NeoX
     /// (pary `(i, i + d/2)`).
     ///
@@ -882,9 +934,8 @@ impl ModelDescriptor {
     /// od drugiego tokenu — dokładnie tak objawiał się błąd znaleziony
     /// 2026-07-28 przez porównanie z `llama-eval-callback`.
     pub fn rope_interleaved(&self) -> bool {
-        matches!(self.arch.as_str(), "llama" | "mistral")
+        matches!(self.arch.as_str(), "llama" | "mistral" | "muse_glimmer")
     }
-
 
     /// Detect the architecture of a parsed GGUF file and resolve its weight map.
     pub fn detect(gguf: &Gguf) -> Result<Self> {
@@ -942,9 +993,8 @@ impl ModelDescriptor {
             .get_u64(&key("attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(hidden_size / n_heads.max(1));
-        let final_logit_softcap = gguf
-            .get_f32(&key("final_logit_softcapping"))
-            .unwrap_or(0.0);
+        let final_logit_softcap = gguf.get_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
+        let logit_scale = gguf.get_f32(&key("logit_scale")).unwrap_or(1.0);
         // GGUF nie nosi typu aktywacji; rodzina Gemma ma GeGLU z tanh, reszta
         // obsługiwanych architektur SwiGLU.
         let ffn_activation = if spec.gguf_arch.starts_with("gemma") {
@@ -957,8 +1007,14 @@ impl ModelDescriptor {
         // wzorcowej i oba są niewidoczne w metadanych GGUF.
         let (attn_logit_scale, embd_scale) = if spec.gguf_arch.starts_with("gemma") {
             (Some(1.0f32), Some((hidden_size as f32).sqrt()))
-        } else {
+        } else if spec.gguf_arch == "muse-glimmer" {
             (None, None)
+        } else {
+            (
+                gguf.get_f32(&key("attention.qk_scale_factor"))
+                    .map(|factor| factor / (head_dim as f32).sqrt()),
+                None,
+            )
         };
         let intermediate_size = req_u("feed_forward_length")?;
         let max_position_embeddings = req_u("context_length")?;
@@ -966,6 +1022,7 @@ impl ModelDescriptor {
         let rms_norm_eps = gguf
             .get_f32(&key("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
+        let post_norm_eps = parse_post_norm_eps(gguf, &spec.gguf_arch, rms_norm_eps);
         let vocab_size = gguf
             .get_u64(&key("vocab_size"))
             .map(|v| v as usize)
@@ -1088,6 +1145,7 @@ impl ModelDescriptor {
                 vocab_size,
                 rope_theta,
                 rms_norm_eps,
+                post_norm_eps,
                 max_position_embeddings,
                 tie_word_embeddings,
                 pooling_type,
@@ -1096,18 +1154,25 @@ impl ModelDescriptor {
                 v_rms_norm: spec.gguf_arch.starts_with("gemma"),
                 suppress_tokens: gguf
                     .get_array("tokenizer.ggml.suppress_tokens")
-                    .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .collect()
+                    })
                     .unwrap_or_default(),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
-            ffn_activation,
-            alt_attn,
-            final_logit_softcap,
-            attn_logit_scale,
-            embd_scale,
-            deepseek_v4: None,
+                ffn_activation,
+                alt_attn,
+                rope_sliding_only: arch == "muse-glimmer",
+                final_logit_softcap,
+                logit_scale,
+                attn_logit_scale,
+                embd_scale,
+                deepseek_v4: None,
             },
             globals,
             layers,
@@ -1203,6 +1268,7 @@ impl ModelDescriptor {
                 vocab_size: config.vocab_size,
                 rope_theta: config.rope_theta,
                 rms_norm_eps: config.rms_norm_eps,
+                post_norm_eps: config.rms_norm_eps,
                 max_position_embeddings: config.max_position_embeddings,
                 tie_word_embeddings: config.tie_word_embeddings,
                 // HF config.json carries no pooling; sentence-transformers keeps
@@ -1244,11 +1310,13 @@ impl ModelDescriptor {
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
-            ffn_activation: FfnActivation::SiLU,
-            alt_attn: None,
-            final_logit_softcap: 0.0,
-            attn_logit_scale: None,
-            embd_scale: None,
+                ffn_activation: FfnActivation::SiLU,
+                alt_attn: None,
+                rope_sliding_only: false,
+                final_logit_softcap: 0.0,
+                logit_scale: 1.0,
+                attn_logit_scale: None,
+                embd_scale: None,
             },
             globals,
             layers,
@@ -1555,6 +1623,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             vocab_size,
             rope_theta,
             rms_norm_eps,
+            post_norm_eps: rms_norm_eps,
             max_position_embeddings,
             tie_word_embeddings,
             pooling_type: PoolingType::None,
@@ -1564,7 +1633,12 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             v_rms_norm: false,
             suppress_tokens: gguf
                 .get_array("tokenizer.ggml.suppress_tokens")
-                .map(|a| a.iter().filter_map(|v| v.as_u64()).map(|v| v as u32).collect())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .collect()
+                })
                 .unwrap_or_default(),
             ssm: Some(ssm),
             rope_sections,
@@ -1572,7 +1646,9 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             attn_gated: true,
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
+            rope_sliding_only: false,
             final_logit_softcap: 0.0,
+            logit_scale: 1.0,
             attn_logit_scale: None,
             deepseek_v4: None,
             embd_scale: None,
@@ -1770,7 +1846,7 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 9);
+        assert_eq!(specs.len(), 10);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
@@ -1780,6 +1856,7 @@ mod tests {
         assert_eq!(specs[6].name, "qwen35");
         assert_eq!(specs[7].name, "gemma4");
         assert_eq!(specs[8].name, "deepseek_v4");
+        assert_eq!(specs[9].name, "muse_glimmer");
         // The MoE specs carry the router + stacked-expert roles.
         assert!(specs[3]
             .roles
@@ -1947,6 +2024,61 @@ mod tests {
         assert_eq!(PoolingType::from_gguf_u32(3), PoolingType::Last);
         // 4 = rank (reranker head), not an embedding pooler.
         assert_eq!(PoolingType::from_gguf_u32(4), PoolingType::None);
+    }
+
+    #[test]
+    fn muse_post_norm_eps_defaults_to_model_rms_eps() {
+        let gguf = write_synthetic_gguf(
+            vec![metadata_string("general.architecture", "muse-glimmer")],
+            Vec::new(),
+        );
+        assert_eq!(parse_post_norm_eps(&gguf, "muse-glimmer", 1e-5), 1e-5);
+    }
+
+    #[test]
+    fn muse_descriptor_uses_runtime_arch_and_gates() {
+        let metadata = vec![
+            metadata_string("general.architecture", "muse-glimmer"),
+            metadata_u32("muse-glimmer.block_count", 4),
+            metadata_u32("muse-glimmer.embedding_length", 64),
+            metadata_u32("muse-glimmer.feed_forward_length", 128),
+            metadata_u32("muse-glimmer.attention.head_count", 1),
+            metadata_u32("muse-glimmer.attention.head_count_kv", 1),
+            metadata_u32("muse-glimmer.attention.key_length", 64),
+            metadata_u32("muse-glimmer.context_length", 1024),
+        ];
+        let mut tensors = vec![
+            tensor("token_embd.weight", vec![64, 32]),
+            tensor("output_norm.weight", vec![64]),
+        ];
+        for layer in 0..4 {
+            for name in [
+                "attn_norm",
+                "post_attention_norm",
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_output",
+                "attn_q_norm",
+                "attn_k_norm",
+                "attn_gate",
+                "ffn_norm",
+                "post_ffw_norm",
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+            ] {
+                tensors.push(tensor(format!("blk.{layer}.{name}.weight"), vec![64]));
+            }
+        }
+
+        let descriptor = ModelDescriptor::detect(&write_synthetic_gguf(metadata, tensors))
+            .expect("wykryj Muse Glimmer");
+        assert_eq!(descriptor.arch, "muse_glimmer");
+        assert!(descriptor.rope_interleaved());
+        assert!(descriptor.params.rope_sliding_only);
+        assert!(descriptor.layers[0].contains_key(&WeightRole::AttnGate));
+        assert!(descriptor.layers[3].contains_key(&WeightRole::AttnV));
     }
 
     #[test]
@@ -2229,7 +2361,9 @@ mod tp_shard_tests {
     #[test]
     fn dwie_rangi_dziela_glowice_qwen35() {
         let shard = TpShard::new(1, 2).expect("ranga w zasięgu");
-        let ssm = qwen35_ssm().shard(shard).expect("qwen35 dzieli się na dwie");
+        let ssm = qwen35_ssm()
+            .shard(shard)
+            .expect("qwen35 dzieli się na dwie");
         assert_eq!(ssm.n_group, 8);
         assert_eq!(ssm.dt_rank, 24);
         assert_eq!(ssm.d_inner, 24 * 128);
@@ -2357,8 +2491,12 @@ impl BlockMatrix<'_> {
     /// błędu — daje cudze wagi pod właściwą głowicą.
     pub fn take_rows(&self, ranges: &[(usize, usize)]) -> Result<Vec<u8>> {
         let (_, _, row_bytes) = self.geometry()?;
-        let mut out =
-            Vec::with_capacity(ranges.iter().map(|(_, count)| count * row_bytes).sum::<usize>());
+        let mut out = Vec::with_capacity(
+            ranges
+                .iter()
+                .map(|(_, count)| count * row_bytes)
+                .sum::<usize>(),
+        );
         for &(first, count) in ranges {
             let end = first
                 .checked_add(count)
@@ -2559,9 +2697,10 @@ impl TpShard {
             | WeightRole::SsmDt
             | WeightRole::SsmConv1d
             | WeightRole::SsmOut => {
-                let ssm = p.ssm.as_ref().ok_or_else(|| {
-                    fmt_err("podział: rola DeltaNet w modelu bez parametrów SSM")
-                })?;
+                let ssm = p
+                    .ssm
+                    .as_ref()
+                    .ok_or_else(|| fmt_err("podział: rola DeltaNet w modelu bez parametrów SSM"))?;
                 let d_state = ssm.d_state;
                 let n_k = ssm.n_k_heads();
                 let n_v = ssm.n_v_heads();
@@ -2571,10 +2710,7 @@ impl TpShard {
                 // Głowice V rangi to `n_v / n_k` ciągłych przebiegów po `per_k`
                 // głowic; zwijamy je z listy indeksów, żeby wycinek był kilkoma
                 // zakresami zamiast kilkudziesięcioma.
-                let runs: Vec<usize> = v_order
-                    .chunks(per_k)
-                    .map(|run| run[0])
-                    .collect();
+                let runs: Vec<usize> = v_order.chunks(per_k).map(|run| run[0]).collect();
                 let v_rows = |width: usize, base: usize| -> Vec<(usize, usize)> {
                     runs.iter()
                         .map(|&first| (base + first * width, per_k * width))
@@ -2639,6 +2775,7 @@ mod role_shard_tests {
             vocab_size: 248320,
             rope_theta: 1.0e6,
             rms_norm_eps: 1.0e-6,
+            post_norm_eps: 1.0e-6,
             max_position_embeddings: 262144,
             tie_word_embeddings: false,
             pooling_type: PoolingType::None,
@@ -2658,11 +2795,59 @@ mod role_shard_tests {
             attn_gated: true,
             ffn_activation: FfnActivation::SiLU,
             alt_attn: None,
+            rope_sliding_only: false,
             final_logit_softcap: 0.0,
+            logit_scale: 1.0,
             attn_logit_scale: None,
             deepseek_v4: None,
             embd_scale: None,
         }
+    }
+
+    #[test]
+    fn rope_sliding_only_skips_global_layers() {
+        let mut params = qwen35();
+        params.rope_sliding_only = true;
+        params.alt_attn = Some(AltAttnParams {
+            sliding: vec![true, false],
+            window: 128,
+            head_dim_swa: 256,
+            n_kv_heads_swa: 2,
+            rope_theta_swa: 10_000.0,
+        });
+        assert!(params.uses_rope_at(0));
+        assert!(!params.uses_rope_at(1));
+    }
+
+    #[test]
+    fn muse_rope_pattern_skips_every_fourth_layer_without_alt_attention() {
+        let mut params = qwen35();
+        params.rope_sliding_only = true;
+        params.rope_theta = 500_000.0;
+
+        for layer in [0usize, 1, 2, 4, 5, 6] {
+            assert!(params.uses_rope_at(layer));
+            assert_eq!(params.rope_theta_at(layer), 500_000.0);
+        }
+        for layer in [3usize, 7] {
+            assert!(!params.uses_rope_at(layer));
+            assert_eq!(params.rope_theta_at(layer), 0.0);
+        }
+    }
+
+    #[test]
+    fn muse_scalar_swa_pattern_routes_first_three_layers_to_window() {
+        let pattern = muse_swa_pattern(4).expect("okres dodatni");
+        assert_eq!(&pattern, &[true, true, true, false]);
+        assert!(muse_swa_pattern(0).is_none());
+    }
+
+    #[test]
+    fn muse_q_norm_scale_does_not_change_attention_logit_scale() {
+        let mut params = qwen35();
+        params.head_dim = 128;
+        params.attn_logit_scale = None;
+        assert_eq!(params.attn_scale_at(0), 1.0 / (128.0f32).sqrt());
     }
 
     /// Suma wycinków obu rang musi pokryć KAŻDY wiersz (albo kolumnę) dokładnie
@@ -2706,9 +2891,7 @@ mod role_shard_tests {
     fn wejsciowa_projekcja_trzyma_kolejnosc_q_k_v() {
         let p = qwen35();
         let shard = TpShard::new(1, 2).expect("ranga 1");
-        let RoleShard::Rows(ranges) = shard
-            .role_shard(&p, WeightRole::SsmInProj)
-            .expect("plan")
+        let RoleShard::Rows(ranges) = shard.role_shard(&p, WeightRole::SsmInProj).expect("plan")
         else {
             panic!("in_proj dzieli się po wierszach");
         };

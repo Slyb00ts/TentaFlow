@@ -5,8 +5,8 @@
 // beside the tokenizer it feeds rather than inside one backend's engine, where
 // it spent long enough that the Metal path could not reach it.
 
-use forge_formats::Gguf;
 use crate::GgufVocab;
+use forge_formats::Gguf;
 use forge_types::{ForgeError, Result};
 
 /// Extract the embedded tokenizer definition from GGUF metadata.

@@ -235,5 +235,4 @@ impl Kernels {
             .scalar(n_blocks as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

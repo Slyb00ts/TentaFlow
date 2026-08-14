@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use forge_engine::model::ModelConfig;
 use forge_engine::server::spawn_engine;
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{build_router, ServerConfig, ServerState};
@@ -114,6 +114,8 @@ async fn api_surface_end_to_end() {
         model_id: "qwen3-0.6b".into(),
         api_key: None,
         tool_call_parser: None,
+        default_sampling: Default::default(),
+        default_stop: vec![],
     };
     let state = ServerState::new(
         &cfg,

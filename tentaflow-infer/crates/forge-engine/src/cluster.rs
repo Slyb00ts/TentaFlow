@@ -13,7 +13,7 @@
 // karty się widziały i umiały na siebie poczekać. Zmierzone na tej maszynie
 // (`peer_probe`): wymiana 10 KiB ze zdarzeniem to 11,21 us, przez hosta 35,2 us.
 
-use forge_hal::{Device, Event, PoolSizes, Stream, gpu};
+use forge_hal::{gpu, Device, Event, PoolSizes, Stream};
 use forge_types::{ForgeError, Result};
 use std::sync::Arc;
 
@@ -235,7 +235,16 @@ impl Cluster {
             ));
         }
         let source = self.device(from)?;
-        self.exchange_on(from, &source.stream, src, src_offset, to, dst, dst_offset, bytes)
+        self.exchange_on(
+            from,
+            &source.stream,
+            src,
+            src_offset,
+            to,
+            dst,
+            dst_offset,
+            bytes,
+        )
     }
 
     /// Jak `exchange`, ale kopia idzie WSKAZANYM strumieniem karty źródłowej.
@@ -293,9 +302,7 @@ impl Cluster {
         }
         let source = self.device(signaller)?;
         let target = self.device(waiter)?;
-        source
-            .device
-            .record_event(&source.done, signaller_stream)?;
+        source.device.record_event(&source.done, signaller_stream)?;
         target.device.wait_event(waiter_stream, &source.done)
     }
 
@@ -370,7 +377,10 @@ impl Cluster {
     pub fn refresh_free(&self, caps: &mut [crate::multi_gpu::DeviceCapability]) {
         for (index, entry) in self.devices.iter().enumerate() {
             if let Some(cap) = caps.get_mut(index) {
-                cap.free_bytes = entry.device.pool_available(forge_hal::Pool::Weights).unwrap_or(0);
+                cap.free_bytes = entry
+                    .device
+                    .pool_available(forge_hal::Pool::Weights)
+                    .unwrap_or(0);
             }
         }
     }
@@ -464,7 +474,11 @@ pub fn reduce_partials(sum: Reduction<'_>) -> Result<()> {
     };
     let mut accumulated = 0usize;
     for &index in rest {
-        let destination = if accumulated == 0 { sum.acc } else { sum.staging };
+        let destination = if accumulated == 0 {
+            sum.acc
+        } else {
+            sum.staging
+        };
         if index == sum.gather_on {
             target
                 .device
@@ -489,9 +503,11 @@ pub fn reduce_partials(sum: Reduction<'_>) -> Result<()> {
         (Some(out), 0) => target
             .kernels
             .cast_f32_f16(out, tail, sum.elems, target.stream),
-        (Some(out), _) => target
-            .kernels
-            .add_f32_out_f16(out, sum.acc, tail, sum.elems, target.stream),
+        (Some(out), _) => {
+            target
+                .kernels
+                .add_f32_out_f16(out, sum.acc, tail, sum.elems, target.stream)
+        }
         (None, 0) => target
             .device
             .copy(tail, 0, sum.acc, 0, bytes, target.stream),
@@ -567,11 +583,21 @@ pub fn all_reduce_f16(
             // Więcej kart: sumujemy do WŁASNEGO akumulatora, nigdy w miejsce
             // cząstki — cudza ranga wciąż ją czyta.
             [first, rest @ ..] => {
-                rank.kernels
-                    .add_f32(acc[index], part(index)?, part(*first)?, elems, rank.stream)?;
+                rank.kernels.add_f32(
+                    acc[index],
+                    part(index)?,
+                    part(*first)?,
+                    elems,
+                    rank.stream,
+                )?;
                 for &peer in rest {
-                    rank.kernels
-                        .add_f32(acc[index], acc[index], part(peer)?, elems, rank.stream)?;
+                    rank.kernels.add_f32(
+                        acc[index],
+                        acc[index],
+                        part(peer)?,
+                        elems,
+                        rank.stream,
+                    )?;
                 }
                 rank.kernels
                     .cast_f32_f16(out[index], acc[index], elems, rank.stream)?;

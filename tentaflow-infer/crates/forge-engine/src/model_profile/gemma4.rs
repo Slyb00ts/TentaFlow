@@ -11,5 +11,9 @@ pub fn entries() -> Vec<ProfileEntry> {
     gemma.default_ctx = Some(4096);
     gemma.stop = &["<end_of_turn>"];
 
-    vec![ProfileEntry { arch: "gemma4", name_needle: "", profile: gemma }]
+    vec![ProfileEntry {
+        arch: "gemma4",
+        name_needle: "",
+        profile: gemma,
+    }]
 }

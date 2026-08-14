@@ -4,7 +4,7 @@
 //
 // Reads alphanumeric plates from detector crops of class `tablica_rejestracyjna`.
 // Backend inferencji wybierany cfg/feature:
-//   * `inference-supertonic` (ONNX Runtime, crate `ort`) → pula sesji ort
+//   * `vision-ort` (ONNX Runtime, crate `ort`) → pula sesji ort
 //     (TensorRT→CUDA→CPU), model `plate_ocr.onnx`. Pula jest wewnętrznie
 //     współbieżna, więc forward NIE idzie przez jednowątkowy egzekutor Burn/wgpu
 //     — cold-path OCR nie serializuje się na tym wątku ani nie konkuruje z detektorem.
@@ -24,24 +24,24 @@
 #![cfg(feature = "inference-vision-gpu")]
 
 use anyhow::{anyhow, bail, Context, Result};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use burn::tensor::{Int, Tensor, TensorData};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::paths;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use crate::vision::burn_plate::Model;
 use crate::vision::ocr_prep;
 use std::borrow::Cow;
 use std::sync::Arc;
 
 /// Nazwa tensora wejściowego w grafie ONNX (`[batch,H,W,1]`, uint8 NHWC).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const INPUT_NAME: &str = "input";
 
 // Plate-OCR session-pool size comes from `[vision] plate_sessions` (default 4);
@@ -62,11 +62,11 @@ struct OcrConfig {
 pub struct PlateOcr {
     /// Pula sesji ONNX Runtime (TensorRT→CUDA→CPU) — ścieżka ort. Wewnętrznie
     /// współbieżna, więc `read`/`decode` biorą `&self` (interior mutability).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pool: crate::vision::ort_common::SessionPool,
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     model: Model<VisionBackend>,
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     device: VisionDevice,
     alphabet: Vec<char>,
     pad: char,
@@ -113,7 +113,7 @@ impl PlateOcr {
 
         // Ścieżka ort+TensorRT: pula sesji na `plate_ocr.onnx`. Wejście uint8 NHWC
         // o stałym rozmiarze modelu (H×W) i dynamicznym batchu → pin batch=1.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         {
             let onnx_path = dir.join("plate_ocr.onnx");
             if !onnx_path.exists() {
@@ -173,7 +173,7 @@ impl PlateOcr {
             })
         }
 
-        #[cfg(not(feature = "inference-supertonic"))]
+        #[cfg(not(feature = "vision-ort"))]
         {
             let weights_path = dir.join("plate_ocr.bpk");
             if !weights_path.exists() {
@@ -280,7 +280,7 @@ impl PlateOcr {
     /// 0..1) alongside the validated string, so the temporal vote can weight and
     /// gate reads instead of treating a repeated low-confidence misread as a
     /// confident plate. An unvalidated/empty read still returns `(None, score)`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pub fn read_batch(
         &self,
         crops: &[(Arc<[u8]>, u32, u32)],
@@ -384,7 +384,7 @@ impl PlateOcr {
 
     /// Ścieżka Burn: model wkompilowany pod `[1,H,W,1]`, więc batch to pętla po
     /// pojedynczych forwardach (jak `adr_ocr::forward_batch` w wariancie tract).
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     pub fn read_batch(
         &self,
         crops: &[(Arc<[u8]>, u32, u32)],
@@ -398,7 +398,7 @@ impl PlateOcr {
     /// Single-crop read plus its mean confidence — the scored twin of
     /// [`Self::read`], used by the Burn batch loop so both backends thread the
     /// same `(plate, score)` pair into the vote.
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn read_scored(&self, crop_rgb: &[u8], cw: u32, ch: u32) -> Result<(Option<String>, f32)> {
         let deskew = ocr_prep::deskew_enabled();
         let (gray, _) = self.preprocess(crop_rgb, cw, ch, deskew, false)?;
@@ -456,7 +456,7 @@ impl PlateOcr {
     /// → płaskie logity `[slots*vocab]` (row-major). Wejście to surowe 0..255 bez
     /// normalizacji — model ingeruje bajty wprost. Ścieżka ort: pojedynczy
     /// `session.run` na puli sesji; ścieżka Burn: `guarded_forward` (jeden wątek).
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     fn forward_logits(&self, gray: &[u8]) -> Result<Vec<f32>> {
         let tensor_shape = (1usize, self.img_h as usize, self.img_w as usize, 1usize);
         let input = ndarray::Array4::from_shape_vec(tensor_shape, gray.to_vec())
@@ -500,7 +500,7 @@ impl PlateOcr {
         })
     }
 
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     fn forward_logits(&self, gray: &[u8]) -> Result<Vec<f32>> {
         // Raw uint8 NHWC [1, H, W, 1] as Int — the model ingests 0..255 directly.
         let data: Vec<i32> = gray.iter().map(|&b| b as i32).collect();

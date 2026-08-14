@@ -12,6 +12,61 @@ Legenda: ✅ zrobione · 🟡 częściowe · ❌ nietknięte
 
 Ostatnia aktualizacja: 2026-07-25.
 
+- ✅ **Audyt CPU i batch decode Qwen na R9700 (2026-08-11).** Profil startupu
+  wskazał `fetch_embedding_host` i seryjne F32→F16 jako koszt ładowania; zmiana
+  z commitu `a769bf79` skróciła `forge run` o około 8,7%. Pomiar grouped decode
+  musi używać GPU samplera: `min_tokens` wymusza sampler CPU, więc celowo nie
+  zwiększa `hybrid_decode_batch_steps_total`. Dla p512/max64 bez `min_tokens`
+  HTTP C2 wykonał 63 kroki B2 (126 lane), a C4 63 kroki B4 (252 lane).
+
+- ✅ **HTTP na R9700 ma rozdzielony pomiar prefillu i decode (2026-08-11).**
+  Vulkan: llama.cpp v290, GPU1, Vulkan1. Forge: GPU0, HIP, cache/spec off.
+  Prefill to prompt tok/s z pierwszego eventu SSE (C=1); decode to agregat
+  completion tok/s dla C=1/2/4. Wszystkie żądania miały dokładne usage.
+
+  | model / prompt | Vulkan prefill | Forge prefill | Vulkan decode C1/C2/C4 | Forge decode C1/C2/C4 |
+  |---|---:|---:|---:|---:|
+  | Bielik Q4, 512 | 2659,5 | 4209,5 | 104,7 / 190,9 / 328,4 | 76,9 / 75,3 / 74,5 |
+  | Bielik Q4, 2048 | 3287,2 | 3397,6 | 97,9 / 169,5 / 267,9 | 65,3 / 64,2 / 63,7 |
+  | Qwen 3.6 27B Q4, 512 | 848,9 | 1314,1 | 30,6 / 54,6 / 88,2 | 27,7 / 27,7 / 27,7 |
+  | Qwen 3.6 27B Q4, 2048 | 970,4 | 1474,2 | 30,7 / 55,2 / 89,8 | 27,6 / 27,6 / 27,6 |
+  | Qwen 3.5 MoE Q4, 512 | 2163,0 | 3774,7 | 118,1 / 170,6 / 257,3 | 104,0 / 105,8 / 104,3 |
+  | Qwen 3.5 MoE Q4, 2048 | 3334,9 | 4899,5 | 122,2 / 185,9 / 256,1 | 102,7 / 103,1 / 101,8 |
+  | Muse Glimmer Q4, 512 | 749,5 | 1415,4 | 32,0 / 59,1 / 103,8 | 20,8 / 21,1 / timeout |
+  | Muse Glimmer Q4, 2048 | 957,8 | 1353,8 | 32,4 / 61,3 / 108,5 | 20,4 / 20,5 / timeout |
+
+  Wartości Vulkan pochodzą z tej samej macierzy HTTP co C=1/2/4; Forge
+  decode dla modeli gęstych pochodzi z tej samej macierzy, a MoE z ponownego
+  przebiegu po dobudowaniu artefaktów gfx1201 `moe_topk_f32`, `moe_combine_f16`
+  i `gemv_q4_k_dp4a_f16_gidx_batch`. Prefill Forge mierzono osobnym SSE z
+  `max_tokens=1`, aby TTFT nie mieszał się z długim decode. Muse C=4 Forge
+  przekroczył limit testu i nie jest wpisany jako wynik.
+
+  `forge serve --tp 2` przeszedł realny POST HTTP 200 na GPU0+GPU1 (`world=2`)
+  dla Bielika; P2P przechodzi z przepustowością 28,0 GB/s. Qwen 3.6 27B TP2
+  używa exact-slot dla lokalnych pul DeltaNet. HTTP C2: decode suma 72,82 tok/s,
+  TTFT suma 40,18 s i 126 lane; C4: decode suma 100,01 tok/s, TTFT 161,33 s i 252
+  lane. Wynik jednokartowy Qwen C1 wynosi 45,44 tok/s i TTFT 10,02 s.
+
+  Cache q8_1 aktywacji batch decode, mierzony na GPU1 dla Bielika Q4 tym samym
+  promptem i samplerem HTTP, dał C1/C2/C4 odpowiednio 64,03/108,87/148,17 tok/s
+  wobec 64,15/106,80/146,08 tok/s poprzedniej binarki. To jest pomiar małego
+  zysku współbieżnego, nie deklaracja uniwersalnej poprawy wszystkich modeli.
+
+- ✅ **Muse Glimmer: globalna uwaga i kanały odpowiedzi są rozdzielone (2026-08-11).**
+  Loader nie zakłada już `V = K` na podstawie geometrii warstwy: wybiera własną
+  projekcję V wyłącznie wtedy, gdy mapa wag zawiera `AttnV`. To przywraca prawidłowe
+  V w globalnych warstwach Muse, a zachowuje `V = K` dla warstw Gemmy bez tensora V.
+  GPU1 oracle dla `T=60`, `Q=32`, `KV=2`, `head_dim=128`, `page=32` przeszedł dla
+  scalar i WMMA względem niezależnej referencji CPU. Parser Muse przekazuje
+  `assistant to=self` do `reasoning_content`, pierwszy kanał użytkownika do
+  `content`, a kolejne kanały użytkownika po reasoning ignoruje, aby repetycja nie
+  trafiała do odpowiedzi API. Wspólny builtin Jinja Muse jest używany przez `serve`,
+  `run` i API; kończy się `<|start|>assistant to=user<|message|>`, więc kanał
+  odpowiedzi jest ustalony przed generacją. HTTP na GPU1, prompt 67 tokenów: przy
+  `max_tokens=512` i `2048` `content` zawiera koherentną dwuzdaniową odpowiedź po
+  polsku, a `reasoning_content` pozostaje osobno.
+
 - ✅ **Sufit dekodowania na R9700 jest ZMIERZONY i nie jest tam, gdzie zakładał
   rachunek pasma (2026-07-31).** Rachunek `16,1 GB / 552 GB/s = 34,1 tok/s`
   milcząco zakładał, że każdy bajt idzie pełnym pasmem. Nie idzie: mikrobenchmark
@@ -29,8 +84,12 @@ Ostatnia aktualizacja: 2026-07-25.
   ms**, przy niezmienionej zajętości kerneli (30,65 -> 30,35 ms), bo te fuzje nie
   przyspieszają liczenia, tylko zdejmują podatek od dyspozycji. Obie fuzje są
   bitowo zgodne (blok ma tyle wątków, ile redukcja miała wartości). Wynik przy
-  niezmienionej sumie SHA `0bf2b86b…` we wszystkich komórkach: Q4_K_M
-  **30,0 -> 31,0**, NVFP4 **30,0 -> 30,9**, MTP 58,8 -> 58,9 i 70,3 -> 70,4,
+  niezmienionej sumie SHA `0bf2b86b…` we wszystkich komórkach: wcześniejszy
+  wynik Q4_K_M **31,0 tok/s** nie jest już wynikiem referencyjnym. Niezależny
+  oracle ujawnił błąd wspólnego rdzenia Q4_K DP4A; po jego korekcie, bez
+  ekstrapolacji, Qwen3.6-27B Q4_K na HIP/R9700 osiąga przy p1024/tg1000 po
+  rozgrzewce trzy wyniki **30,9 / 30,8 / 30,7 tok/s** (mediana **30,8 tok/s**).
+  NVFP4 **30,0 -> 30,9**, MTP 58,8 -> 58,9 i 70,3 -> 70,4,
   dwie karty 39,7 -> 40,0. Zostało 128 uruchomień w zasięgu tej samej metody
   (`silu_mul`, `gated_rmsnorm`, `sigmoid_mul`), warte ~0,5 ms; **34 tok/s na
   jednej karcie dla tego checkpointu nie jest osiągalne** i przez tę ścianę
@@ -2385,3 +2444,16 @@ France"; prefill warm **~5740 tok/s** vs ~11151 MMQ (**~0.51×, ~2× WOLNIEJ** �
 - Izolowany pomiar RTX 4090 dla `n_k=16`, `n_v=32`, `d_state=128`, `d_conv=4`:
   fused T4 **0,00839 ms**, a 17 rozłożonych wywołań GPU bez kosztu kopii i repeat
   **0,02953 ms**, czyli konserwatywne przyspieszenie **3,52×**.
+## AMD portable32 Q4K decode (2026-08-11)
+
+Na AMD gfx1201 dodano wąskie routowanie Bielik Q4K dla kolumn 5120 i wierszy 14336/28672. Kernel używa mapowania subgroupowego z legalnymi odczytami 16B, a wybór jest odrzucony dla innych modeli, architektur i kształtów. Niezależny oracle Q4K/Q8_1 z guardami przeszedł dla Bielika i kształtów Qwen.
+
+HTTP GPU1, prompt 512, completion 64, identyczny SHA: C1 69,154 tok/s vs 64,895 (+6,56%), C2 114,872 vs 107,400 (+6,96%), C4 161,840 vs 96,693 (+67,38%). Protokół: `/tmp/forge-portable32-e2e/`.
+
+## AMD gfx1201 Bielik global-Q8 (2026-08-11)
+
+Wąska ścieżka prepared global-Q8 obejmuje wyłącznie AMD gfx1201 oraz projekcje Bielik Q4_K `11264×4096`; offset wag jest walidowany przed uruchomieniem. Oracle z canary przeszedł, a release HIP przechodzi sprawdzenie. Sanity HTTP GPU1 (`prompt=821`, `completion=64`) zwróciło poprawną odpowiedź.
+
+Ścieżka `4096×4096` dla Bielika (`fb1c2a16`) została sprawdzona oracle GPU1 5/5 oraz przez rocprof właściwego symbolu. HTTP GPU1: **74,77 → 87,39 tok/s** (**+16,9%**).
+
+Wariant `unroll8` (`7eb369af`) przeszedł oracle GPU1; ten sam HTTP zwiększył decode **86,67 → 87,75 tok/s**, a rocprof skrócił średni czas gorącego GEMV **53,906 → 52,114 µs**.

@@ -4,17 +4,21 @@
 # upstream source build plus one patch script we own.
 #
 # Base is vLLM's own cu130 nightly, used ONLY for its aarch64 toolchain: CUDA 13
-# and torch 2.11.0+cu130, exactly what vLLM 0.26 pins. Its own vLLM (0.19.2) is
-# too old -- it predates the DSpark speculator -- so we build 0.26 over it and
+# and torch 2.13.0+cu130, exactly what vLLM 0.27 pins. Its own vLLM (0.19.2) is
+# too old -- it predates the DSpark speculator -- so we build 0.27 over it and
 # skip recompiling torch, which is the expensive half.
 #
-# Why 0.26 and not the recipe fork: upstream absorbed the pieces the recipe used
+# Why 0.27 and not the recipe fork: upstream absorbed the pieces the recipe used
 # to carry. `v1/worker/gpu/spec_decode/dspark/` ships a DSparkSpeculator,
 # registry.py registers DSparkDraftModel, and flashinfer_b12x_moe.py is in-tree.
 # What upstream still lacks is the nvfp4_ds_mla KV dtype -- that stays ours.
 FROM vllm/vllm-openai:cu130-nightly AS build
 
-ARG VLLM_REF=v0.26.0
+ARG VLLM_REF=v0.27.0
+ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
+ARG TORCH_VERSION=2.13.0
+ARG TORCHVISION_VERSION=0.28.0
+ARG TORCHAUDIO_VERSION=2.11.0
 # GB10 is sm_121a, but the list here must say plain `12.1`: vLLM's CMake appends
 # the `a` itself for the architecture-specific kernels (CMakeLists sm120 block
 # maps 12.1 -> 12.1a). Passing `12.1a` here makes torch's parser drop the entry
@@ -26,6 +30,10 @@ ENV TORCH_CUDA_ARCH_LIST=${TORCH_CUDA_ARCH_LIST} \
     CCACHE_DIR=/ccache \
     CUDA_HOME=/usr/local/cuda \
     VLLM_TARGET_DEVICE=cuda
+
+RUN python3 -m pip install --no-cache-dir \
+    --extra-index-url ${TORCH_INDEX} \
+    torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION}
 
 # The base is a RUNTIME image: CUDA headers and the unversioned .so symlinks the
 # compiler needs are absent, so a source build dies twice -- first on
@@ -49,8 +57,8 @@ RUN --mount=type=cache,target=/var/cache/apt \
 RUN git clone --depth 1 --branch ${VLLM_REF} https://github.com/vllm-project/vllm.git /src/vllm
 
 WORKDIR /src/vllm
-# torch is already the pinned 2.11.0+cu130 from the base image; reinstalling it
-# from the requirements would pull a non-Spark wheel over a working one.
+# torch is pinned above before the vLLM source build; reinstalling it from the
+# requirements would pull a non-Spark wheel over a working one.
 RUN --mount=type=cache,target=/ccache \
     --mount=type=cache,target=/root/.cache/pip \
     sed -i '/^torch==/d;/^torchvision==/d;/^torchaudio==/d' requirements/cuda.txt && \
@@ -58,7 +66,7 @@ RUN --mount=type=cache,target=/ccache \
     python3 -m pip install --no-build-isolation -r requirements/build/cuda.txt && \
     python3 -m pip install --no-build-isolation .
 
-# The base image carries flashinfer-cubin from ITS vLLM (0.19); installing 0.26
+# The base image carries flashinfer-cubin from ITS vLLM (0.19); installing 0.27
 # pulls a newer flashinfer and the two are version-locked against each other --
 # the worker dies at init with "flashinfer-cubin (x) does not match flashinfer
 # (y)". Resolve the cubin from whatever flashinfer actually landed rather than

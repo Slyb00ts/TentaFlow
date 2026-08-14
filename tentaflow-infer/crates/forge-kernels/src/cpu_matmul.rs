@@ -366,7 +366,18 @@ impl CpuMatmul {
 
         // SAFETY: three descriptors of matching inner dimension, all pointing
         // at live buffers for the duration of the call.
-        let rc = unsafe { BNNSMatMul(false, true, 1.0, &a, &b, &c, std::ptr::null_mut(), std::ptr::null()) };
+        let rc = unsafe {
+            BNNSMatMul(
+                false,
+                true,
+                1.0,
+                &a,
+                &b,
+                &c,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+            )
+        };
         if rc != 0 {
             return Err(ForgeError::Other(format!(
                 "CPU: BNNSMatMul odmówił ({rc}) dla [{count} x {cols}] przy {tokens} tokenach"
@@ -614,7 +625,10 @@ unsafe fn fill_group_neon(dst: *mut u16, src: *const u8, lut: &[u16; 16], group:
         // SAFETY: 32 values per step are inside the group.
         unsafe {
             let d = dst.add(step * 32);
-            vst2q_u16(d, uint16x8x2_t(vld1q_u16(e.as_ptr()), vld1q_u16(o.as_ptr())));
+            vst2q_u16(
+                d,
+                uint16x8x2_t(vld1q_u16(e.as_ptr()), vld1q_u16(o.as_ptr())),
+            );
             vst2q_u16(
                 d.add(16),
                 uint16x8x2_t(vld1q_u16(e.as_ptr().add(8)), vld1q_u16(o.as_ptr().add(8))),
@@ -634,7 +648,13 @@ const QOS_USER_INITIATED: isize = 0x19;
 ///
 /// `stride` of 0 means contiguous, which is what every operand but the output
 /// window wants.
-fn descriptor(fast: usize, slow: usize, data: *mut c_void, dtype: u32, row_stride: usize) -> BnnsNdArray {
+fn descriptor(
+    fast: usize,
+    slow: usize,
+    data: *mut c_void,
+    dtype: u32,
+    row_stride: usize,
+) -> BnnsNdArray {
     let mut size = [0usize; 8];
     let mut stride = [0usize; 8];
     size[0] = fast;
@@ -748,8 +768,12 @@ mod tests {
             .map(|i| (i as u32).wrapping_mul(2_654_435_761))
             .collect();
         let groups = ROWS * COLS / GROUP;
-        let scales: Vec<u16> = (0..groups).map(|i| 0x3C00u16.wrapping_add(i as u16)).collect();
-        let biases: Vec<u16> = (0..groups).map(|i| 0xBC00u16.wrapping_add(i as u16)).collect();
+        let scales: Vec<u16> = (0..groups)
+            .map(|i| 0x3C00u16.wrapping_add(i as u16))
+            .collect();
+        let biases: Vec<u16> = (0..groups)
+            .map(|i| 0xBC00u16.wrapping_add(i as u16))
+            .collect();
         let x: Vec<u16> = (0..TOKENS * COLS)
             .map(|i| f16::from_f32((i % 7) as f32 * 0.125 - 0.5).to_bits())
             .collect();
@@ -769,7 +793,7 @@ mod tests {
             rows: ROWS as u32,
             cols: COLS as u32,
             group: GROUP as u32,
-        bits: 4,
+            bits: 4,
         };
         // SAFETY: `out` holds TOKENS * ROWS f32 and nothing else writes it here.
         unsafe {
@@ -915,9 +939,8 @@ mod tests {
     #[cfg(target_arch = "aarch64")]
     #[test]
     fn the_wide_unpack_matches_the_narrow_one_bit_for_bit() {
-        let lut: [u16; 16] = std::array::from_fn(|n| {
-            f16::from_f32(n as f32 * 0.013 - 0.11).to_bits()
-        });
+        let lut: [u16; 16] =
+            std::array::from_fn(|n| f16::from_f32(n as f32 * 0.013 - 0.11).to_bits());
         for &group in &[32usize, 64, 128] {
             let src: Vec<u8> = (0..group / 2)
                 .map(|i| (i as u8).wrapping_mul(37).wrapping_add(11))
@@ -933,7 +956,10 @@ mod tests {
                     narrow[j] = lut[nib as usize];
                 }
             }
-            assert_eq!(wide, narrow, "grupa {group}: szeroka ścieżka rozjeżdża się z wąską");
+            assert_eq!(
+                wide, narrow,
+                "grupa {group}: szeroka ścieżka rozjeżdża się z wąską"
+            );
         }
     }
 
@@ -953,7 +979,7 @@ mod tests {
             rows: 64,
             cols: 64,
             group: 64,
-        bits: 4,
+            bits: 4,
         };
         // SAFETY: odrzucenie następuje przed jakimkolwiek dostępem do `out`.
         let err = unsafe { cpu.run(&op, 32, 64) };
@@ -999,7 +1025,7 @@ mod bench {
             rows: ROWS as u32,
             cols: COLS as u32,
             group: GROUP as u32,
-        bits: 4,
+            bits: 4,
         };
         let mut cpu = CpuMatmul::new();
         // SAFETY: `out` mieści TOKENS * ROWS f32 i nikt inny go nie dotyka.

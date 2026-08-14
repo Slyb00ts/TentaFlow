@@ -483,9 +483,7 @@ impl Executor for MetalExec {
                     step: step.clone(),
                 })
             }
-            Op::HeadNorm { act, w, heads, .. } => {
-                self.op_head_norm(*act, *w, *heads, tokens)
-            }
+            Op::HeadNorm { act, w, heads, .. } => self.op_head_norm(*act, *w, *heads, tokens),
             // Refused in one place rather than stubbed. The MSL catalogue has
             // no kernel that reads its expert id on device, and writing one
             // needs the machine with the Mac; a fallback that ran the experts

@@ -15,7 +15,15 @@ fn main() {
     let out = std::env::var("OUT_DIR").expect("OUT_DIR");
     let obj = format!("{out}/forge_hip_shim.o");
     let status = std::process::Command::new(format!("{rocm}/llvm/bin/clang"))
-        .args(["-O2", "-fPIC", "-D__HIP_PLATFORM_AMD__", "-c", "hip/forge_hip_shim.c", "-o", &obj])
+        .args([
+            "-O2",
+            "-fPIC",
+            "-D__HIP_PLATFORM_AMD__",
+            "-c",
+            "hip/forge_hip_shim.c",
+            "-o",
+            &obj,
+        ])
         .arg(format!("-I{rocm}/include"))
         .status()
         .expect("uruchomienie clang z ROCm");
@@ -47,7 +55,10 @@ fn build_metal_shim() {
     let sdk = match os.as_str() {
         "macos" => None,
         "ios" => Some(
-            if std::env::var("TARGET").unwrap_or_default().ends_with("-sim") {
+            if std::env::var("TARGET")
+                .unwrap_or_default()
+                .ends_with("-sim")
+            {
                 ("iphonesimulator", "arm64-apple-ios13.0-simulator")
             } else {
                 ("iphoneos", "arm64-apple-ios13.0")
@@ -84,7 +95,10 @@ fn build_metal_shim() {
         .args(["crs", &lib, &obj])
         .status()
         .expect("uruchomienie ar");
-    assert!(status.success(), "archiwizacja shimu Metal nie powiodla sie");
+    assert!(
+        status.success(),
+        "archiwizacja shimu Metal nie powiodla sie"
+    );
     println!("cargo:rustc-link-search=native={out}");
     println!("cargo:rustc-link-lib=static=forge_metal_shim");
     println!("cargo:rustc-link-lib=framework=Metal");

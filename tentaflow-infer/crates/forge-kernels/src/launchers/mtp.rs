@@ -523,5 +523,4 @@ impl Kernels {
             .scalar(steps as i64);
         self.device.launch(kernel, &config, &args, stream)
     }
-
 }

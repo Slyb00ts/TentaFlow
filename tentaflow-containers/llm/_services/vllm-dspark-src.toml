@@ -4,10 +4,10 @@
 # Roznica wobec `vllm-dspark.toml`: tamten bierze `ghcr.io/bjk110/vllm-spark`
 # nieznanego autorstwa i nadpisuje w nim 18 plikow (~24k linii) rekurencyjnym
 # `cp -a`, przez co po cichu cofa kazda upstreamowa poprawke w tych plikach i
-# jest przypiety do jednego forka 0.21-dev. Ten buduje vLLM 0.26 z tagu i
+# jest przypiety do jednego forka 0.21-dev. Ten buduje vLLM 0.27 z tagu i
 # naklada JEDNA nasza latke — `nvfp4_ds_mla`, jedyna rzecz, ktorej upstream
 # nadal nie ma. Proposer DSpark, model draftujacy i backend B12X MoE sa juz
-# w 0.26 (`v1/worker/gpu/spec_decode/dspark/`, `DSparkDraftModel` w rejestrze,
+# w 0.27 (`v1/worker/gpu/spec_decode/dspark/`, `DSparkDraftModel` w rejestrze,
 # `flashinfer_b12x_moe.py`).
 
 [engine]
@@ -15,14 +15,14 @@ id = "vllm-dspark-src"
 backend = "vllm"
 category = "llm"
 name = "DeepSeek V4 Flash DSpark src (2-8x Spark)"
-description_pl = "DeepSeek V4 Flash 284B MoE na klaster 2-8x DGX Spark. vLLM 0.26 budowany ze zrodel dla sm_121a + latka nvfp4_ds_mla."
-description_en = "DeepSeek V4 Flash 284B MoE on a 2-8x DGX Spark cluster. vLLM 0.26 built from source for sm_121a plus the nvfp4_ds_mla patch."
+description_pl = "DeepSeek V4 Flash 284B MoE na klaster 2-8x DGX Spark. vLLM 0.27 budowany ze zrodel dla sm_121a + latka nvfp4_ds_mla."
+description_en = "DeepSeek V4 Flash 284B MoE on a 2-8x DGX Spark cluster. vLLM 0.27 built from source for sm_121a plus the nvfp4_ds_mla patch."
 homepage = "https://github.com/vllm-project/vllm"
 license = "Apache-2.0"
 icon = "vllm"
 default_port = 8000
 api = "openai-compatible"
-version = "0.26.1"
+version = "0.27.0"
 dgx_spark = true
 cluster_capable = true
 cluster_launch = "vllm-mp"
@@ -35,7 +35,7 @@ transport = "direct-http"
 
 [[model_preset]]
 id = "deepseek-v4-flash-0731-src"
-display_name = "DeepSeek V4 Flash 0731 (NVFP4, DSpark, vLLM 0.26 src, 2-8x Spark)"
+display_name = "DeepSeek V4 Flash 0731 (NVFP4, DSpark, vLLM 0.27 src, 2-8x Spark)"
 repo = "deepseek-ai/DeepSeek-V4-Flash-0731"
 quantization = "nvfp4"
 speculator_method = "dspark"

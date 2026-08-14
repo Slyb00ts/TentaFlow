@@ -4,7 +4,7 @@
 //
 // Always-on ADR (dangerous-goods placards / labels) detector for the ADR
 // camera-CV PoC. Backend inferencji wybierany cfg/feature:
-//   * `inference-supertonic` (ONNX Runtime, crate `ort`) → sesja ort + CUDA EP na
+//   * `vision-ort` (ONNX Runtime, crate `ort`) → sesja ort + CUDA EP na
 //     natywnej CUDA 13.3, model dynamic-batch `rfdetr-base.onnx` (prawdziwy
 //     batching bez paddingu). To główna, docelowa ścieżka wydajności (~200 fps).
 //   * inaczej → wendorowany `burn_rfdetr` (build-time ONNX→Burn codegen), wagi z
@@ -20,18 +20,18 @@
 #![cfg(feature = "inference-vision-gpu")]
 
 use anyhow::{anyhow, bail, Context, Result};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use burn::tensor::{Tensor, TensorData};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use burn_store::{BurnpackStore, ModuleSnapshot};
 use serde::Deserialize;
 use tracing::info;
 
 use crate::paths;
 use crate::services::detection_bus::Detection;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use crate::vision::burn_backend::{self, VisionBackend, VisionDevice};
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 use crate::vision::burn_rfdetr::Model;
 
 /// Square input resolution the exported RF-DETR graph expects. Public so the
@@ -41,7 +41,7 @@ use crate::vision::burn_rfdetr::Model;
 pub const RESOLUTION: u32 = 560;
 
 /// Nazwa tensora wejściowego w grafie ONNX (`[batch,3,560,560]`).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const INPUT_NAME: &str = "input";
 
 // Detector session-pool size comes from `[vision] detector_sessions` (default
@@ -51,7 +51,7 @@ const INPUT_NAME: &str = "input";
 
 /// Przybliżony rozmiar rezydentny JEDNEJ sesji RF-DETR na GPU (do komunikatu
 /// OOM). N sesji ≈ N×tyle VRAM — patrz fail-loud w [`RfDetrDetector::load`].
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const DETECTOR_SESSION_VRAM_GB: f32 = 2.6;
 
 /// Rozmiar batcha wkompilowany na stałe w wyeksportowany graf RF-DETR.
@@ -64,7 +64,7 @@ pub const MODEL_BATCH: usize = 8;
 const MEAN: [f32; 3] = [0.485, 0.456, 0.406];
 const STD: [f32; 3] = [0.229, 0.224, 0.225];
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 thread_local! {
     /// Reusable host input buffer for `detect_batch`. Grows to the largest
     /// batch this thread has seen and then stays resident, so the per-batch
@@ -92,11 +92,11 @@ pub struct RfDetrDetector {
     /// Pula sesji ONNX Runtime (TensorRT→CUDA→CPU) — ścieżka ort. Wewnętrznie
     /// współbieżna (round-robin `Mutex<Session>`), więc `detect_batch` bierze
     /// `&self` i wiele forwardów może biec równolegle na GPU. Budowana RAZ w `load`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pool: crate::vision::ort_common::SessionPool,
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     model: Model<VisionBackend>,
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     device: VisionDevice,
     classes: Vec<String>,
 }
@@ -118,7 +118,7 @@ impl RfDetrDetector {
 
         // Ścieżka ort+CUDA: sesja ONNX Runtime na modelu dynamic-batch, tworzona
         // RAZ przy ładowaniu i reużywana przez wszystkie forwardy.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         {
             let onnx_path = dir.join("rfdetr-base.onnx");
             if !onnx_path.exists() {
@@ -190,7 +190,7 @@ impl RfDetrDetector {
         }
 
         // Ścieżka Burn: wagi `.bpk` na wybranym backendzie vision-*.
-        #[cfg(not(feature = "inference-supertonic"))]
+        #[cfg(not(feature = "vision-ort"))]
         {
             let weights_path = dir.join("rfdetr-base.bpk");
             if !weights_path.exists() {
@@ -222,11 +222,11 @@ impl RfDetrDetector {
     /// The Burn path holds exactly one model instance. Reported over the
     /// vision-worker link as a heartbeat stat.
     pub fn pool_size(&self) -> usize {
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         {
             self.pool.len()
         }
-        #[cfg(not(feature = "inference-supertonic"))]
+        #[cfg(not(feature = "vision-ort"))]
         {
             1
         }
@@ -251,7 +251,7 @@ impl RfDetrDetector {
     /// `labels [N,queries,label_dim]` rozdzielamy per slot i postprocessujemy tą
     /// samą funkcją co ścieżka Burn — współrzędne są identyczne. Kolejność wyników
     /// == kolejność `frames`, długość wektora == `frames.len()`.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     pub fn detect_batch(
         &self,
         frames: &[(&[u8], u32, u32)],
@@ -357,7 +357,8 @@ impl RfDetrDetector {
     /// only frames sharing colorimetry. `mean`/`std`/`s` match `fill_frame`.
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     pub fn detect_batch_gpu(
         &self,
@@ -398,7 +399,8 @@ impl RfDetrDetector {
     /// kept alive by the caller (an `Arc`) for the whole blocking run.
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     pub fn detect_device_tensor(
         &self,
@@ -425,7 +427,7 @@ impl RfDetrDetector {
     /// ([`detect_batch_gpu`]) and zero-copy ([`detect_device_tensor`]) paths.
     /// `dev_ptr` is a CUDA device-0 buffer of exactly `n·3·res·res` f32 that the
     /// CALLER keeps alive for the whole (synchronous, blocking) run.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(all(feature = "vision-ort", feature = "vision-cuda-preprocess"))]
     #[cfg(any(target_os = "linux", target_os = "windows"))]
     fn forward_device_ptr(
         &self,
@@ -498,7 +500,7 @@ impl RfDetrDetector {
     /// zerowym paddingiem (sloty `chunk_len..MODEL_BATCH`), którego wyników nie
     /// postprocessujemy ani nie zwracamy. Kolejność wyników = kolejność `frames`,
     /// a długość wektora wynikowego == `frames.len()`.
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     pub fn detect_batch(
         &self,
         frames: &[(&[u8], u32, u32)],
@@ -617,7 +619,7 @@ impl RfDetrDetector {
 /// (`detect_batch`) and device-tensor (`detect_batch_gpu`) ort paths so the
 /// graph contract can never drift between them. `dets_shape`/`labels_shape`
 /// deref to `[i64]` (ort `Shape`).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn validate_detr_shapes(
     dets_shape: &[i64],
     labels_shape: &[i64],
@@ -666,7 +668,7 @@ fn validate_detr_shapes(
 /// the host-tensor and device-tensor ort paths — the decode is identical, only
 /// the model input differs, so both paths yield bit-identical detections.
 /// `pub` so `examples/detect_post_bench.rs` can time the real decode.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub fn decode_detr_batch(
     dets_owned: &[f32],
     labels_owned: &[f32],

@@ -39,6 +39,11 @@ macro_rules! block_quant_gemv_families {
                            $dgemv:ident, $dgemv_wide:ident,
                            $dresid:ident, $dresid_wide:ident;)+
         }
+        q4k {
+            $q4:ident => $q4norm:ident, $q4silu:ident,
+                         $q4gemv:ident, $q4gemv_wide:ident,
+                         $q4resid:ident, $q4resid_wide:ident;
+        }
     ) => {
         impl Model {
             pub(crate) fn gemv(
@@ -69,6 +74,21 @@ macro_rules! block_quant_gemv_families {
                             }
                         }
                     )+
+                    DevWeight::$q4 { buf, rows, cols } => {
+                        if *cols <= Kernels::DP4A_MAX_COLS {
+                            self.kernels.$q4gemv(
+                                y,
+                                buf,
+                                x,
+                                *rows,
+                                *cols,
+                                self.q4k_decode_model_family(),
+                                stream,
+                            )
+                        } else {
+                            self.kernels.$q4gemv_wide(y, buf, x, *rows, *cols, stream)
+                        }
+                    }
                     DevWeight::Fp8Row {
                         buf,
                         scales,
@@ -179,6 +199,13 @@ macro_rules! block_quant_gemv_families {
                             }
                         }
                     )+
+                    DevWeight::$q4 { buf, rows, cols } => {
+                        if *cols <= Kernels::DP4A_MAX_COLS {
+                            self.kernels.$q4resid(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                        } else {
+                            self.kernels.$q4resid_wide(&b.h, &b.h32, buf, x, *rows, *cols, stream)
+                        }
+                    }
                     DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
                         "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
                     )),
@@ -261,6 +288,18 @@ macro_rules! block_quant_gemv_families {
                             stream,
                         ),
                     )+
+                    DevWeight::$q4 { buf, rows, cols } => self.kernels.$q4norm(
+                        y,
+                        buf,
+                        &b.h,
+                        &b.h32,
+                        norm_w,
+                        *rows,
+                        *cols,
+                        ss_from_h16,
+                        eps,
+                        stream,
+                    ),
                     DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
                         "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
                     )),
@@ -345,6 +384,17 @@ macro_rules! block_quant_gemv_families {
                             stream,
                         ),
                     )+
+                    DevWeight::$q4 { buf, rows, cols } => self.kernels.$q4silu(
+                        act,
+                        buf,
+                        &b.h,
+                        &b.h32,
+                        norm_w,
+                        rows / 2,
+                        *cols,
+                        eps,
+                        stream,
+                    ),
                     DevWeight::Fp8Row { .. } => Err(ForgeError::Unsupported(
                         "wagi FP8 ze skalą wierszową nie mają tej ścieżki".into(),
                     )),
@@ -701,11 +751,13 @@ block_quant_gemv_families! {
         Q8_0 => gemv_norm_q8_0_dp4a_f16, gemv_norm_silu_q8_0_dp4a_f16,
                 gemv_q8_0_dp4a_f16, gemv_q8_0_f16,
                 gemv_residual_q8_0_dp4a_f16, gemv_residual_q8_0_f16;
-        Q4K  => gemv_norm_q4_k_dp4a_f16, gemv_norm_silu_q4_k_dp4a_f16,
-                gemv_q4_k_dp4a_f16, gemv_q4_k_f16,
-                gemv_residual_q4_k_dp4a_f16, gemv_residual_q4_k_f16;
         Q6K  => gemv_norm_q6_k_dp4a_f16, gemv_norm_silu_q6_k_dp4a_f16,
                 gemv_q6_k_dp4a_f16, gemv_q6_k_f16,
                 gemv_residual_q6_k_dp4a_f16, gemv_residual_q6_k_f16;
+    }
+    q4k {
+        Q4K => gemv_norm_q4_k_dp4a_f16, gemv_norm_silu_q4_k_dp4a_f16,
+               gemv_q4_k_dp4a_f16, gemv_q4_k_f16,
+               gemv_residual_q4_k_dp4a_f16, gemv_residual_q4_k_f16;
     }
 }

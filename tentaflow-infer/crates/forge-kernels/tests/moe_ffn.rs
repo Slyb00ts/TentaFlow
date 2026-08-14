@@ -243,7 +243,11 @@ fn expected(f: &Fixture, x: &[f32], shared: bool, gated: bool) -> Vec<f32> {
     let mut activated = vec![0.0f32; SH_INTER];
     for (i, a) in activated.iter_mut().enumerate() {
         let r = i * HIDDEN;
-        let g: f32 = sh_gate[r..r + HIDDEN].iter().zip(x).map(|(w, v)| w * v).sum();
+        let g: f32 = sh_gate[r..r + HIDDEN]
+            .iter()
+            .zip(x)
+            .map(|(w, v)| w * v)
+            .sum();
         let u: f32 = sh_up[r..r + HIDDEN].iter().zip(x).map(|(w, v)| w * v).sum();
         *a = g / (1.0 + (-g).exp()) * u;
     }
@@ -326,13 +330,31 @@ fn run_at<E: Executor + WeightStore>(
         .expect("down");
     let shared = shared.then(|| Shared {
         gate: exec
-            .put_quant(packed(f.sh_gate.clone(), GATE_QUANT, DType::U8, SH_INTER, HIDDEN))
+            .put_quant(packed(
+                f.sh_gate.clone(),
+                GATE_QUANT,
+                DType::U8,
+                SH_INTER,
+                HIDDEN,
+            ))
             .expect("gate współdzielony"),
         up: exec
-            .put_quant(packed(f.sh_up.clone(), GATE_QUANT, DType::U8, SH_INTER, HIDDEN))
+            .put_quant(packed(
+                f.sh_up.clone(),
+                GATE_QUANT,
+                DType::U8,
+                SH_INTER,
+                HIDDEN,
+            ))
             .expect("up współdzielony"),
         down: exec
-            .put_quant(packed(f.sh_down.clone(), DOWN_QUANT, DType::U8, HIDDEN, SH_INTER))
+            .put_quant(packed(
+                f.sh_down.clone(),
+                DOWN_QUANT,
+                DType::U8,
+                HIDDEN,
+                SH_INTER,
+            ))
             .expect("down współdzielony"),
         router: exec
             .put_quant(packed(
@@ -455,7 +477,9 @@ fn the_mixture_block_matches_the_formula_on_both_executors() {
     // token's row is held to the same reference row it gets alone, so a tile
     // reading a neighbour's rows shows up as one bad token rather than as an
     // average that survives a bound.
-    let tokens: Vec<u32> = (0..WIDE_TOKENS).map(|i| (i * 7 + 3) % HIDDEN as u32).collect();
+    let tokens: Vec<u32> = (0..WIDE_TOKENS)
+        .map(|i| (i * 7 + 3) % HIDDEN as u32)
+        .collect();
     let wide = run_at(&mut cuda, &f, &tokens, true);
     for (row, &t) in tokens.iter().enumerate() {
         let x = &f.table[t as usize * HIDDEN..(t as usize + 1) * HIDDEN];

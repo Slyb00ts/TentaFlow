@@ -168,7 +168,12 @@ impl PrefixCache {
     /// of pages matched. With `require_state`, the answer backs off to the
     /// deepest matched node that carries a checkpoint — pages past it describe
     /// tokens whose recurrent contribution nothing has recorded.
-    fn walk(&self, tokens: &[u32], max_shared_tokens: usize, require_state: bool) -> (NodeId, usize) {
+    fn walk(
+        &self,
+        tokens: &[u32],
+        max_shared_tokens: usize,
+        require_state: bool,
+    ) -> (NodeId, usize) {
         let ps = self.page_size;
         let max_pages = max_shared_tokens / ps;
         let mut cur = ROOT;
@@ -197,7 +202,12 @@ impl PrefixCache {
     /// Read-only longest-prefix length (in tokens, a multiple of `page_size`)
     /// this cache can serve for `tokens`, capped at `max_shared_tokens`. Used
     /// by admission to project the reduced prefill demand without pinning.
-    pub fn match_len(&self, tokens: &[u32], max_shared_tokens: usize, require_state: bool) -> usize {
+    pub fn match_len(
+        &self,
+        tokens: &[u32],
+        max_shared_tokens: usize,
+        require_state: bool,
+    ) -> usize {
         self.walk(tokens, max_shared_tokens, require_state).1 * self.page_size
     }
 
@@ -539,7 +549,10 @@ mod tests {
     fn a_second_checkpoint_for_the_same_node_comes_back() {
         let mut pc = PrefixCache::new(PS);
         let t: Vec<u32> = (0..8).collect();
-        assert!(pc.donate(ROOT, 0, 2, &t, &[10, 11], &[(8, 3)]).dup_states.is_empty());
+        assert!(pc
+            .donate(ROOT, 0, 2, &t, &[10, 11], &[(8, 3)])
+            .dup_states
+            .is_empty());
         assert_eq!(pc.cached_states(), 1);
         let again = pc.donate(ROOT, 0, 2, &t, &[10, 11], &[(8, 4)]);
         assert_eq!(again.dup_states, vec![4]);
@@ -551,7 +564,14 @@ mod tests {
         let mut pc = PrefixCache::new(PS);
         let t: Vec<u32> = (0..16).collect();
         // Checkpointy z pozycji 4 i 12; pozycja 20 nie ma swojego węzła.
-        let donation = pc.donate(ROOT, 0, 4, &t, &[10, 11, 12, 13], &[(4, 1), (12, 2), (20, 3)]);
+        let donation = pc.donate(
+            ROOT,
+            0,
+            4,
+            &t,
+            &[10, 11, 12, 13],
+            &[(4, 1), (12, 2), (20, 3)],
+        );
         assert_eq!(donation.dup_states, vec![3]);
         assert_eq!(pc.cached_states(), 2);
         // Zapytanie, które rozjeżdża się po ósmym tokenie, i tak ma z czego
@@ -568,7 +588,10 @@ mod tests {
         let t: Vec<u32> = (0..4).collect();
         // Donating from the root with nothing to insert cannot place a state:
         // the root spans no tokens, so the slot has to come back.
-        assert_eq!(pc.donate(ROOT, 0, 0, &t, &[], &[(4, 5)]).dup_states, vec![5]);
+        assert_eq!(
+            pc.donate(ROOT, 0, 0, &t, &[], &[(4, 5)]).dup_states,
+            vec![5]
+        );
         assert_eq!(pc.cached_states(), 0);
     }
 

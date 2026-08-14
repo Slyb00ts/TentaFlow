@@ -41,6 +41,10 @@ for the video pipeline). Key opt-ins:
 | `inference-mlx*` | Apple MLX (macOS/iOS) |
 | `inference-diarization` | speaker diarization (tentaflow-voice) |
 | `gpu-cuda` | CUDA accel for llama.cpp + whisper |
+| `gpu-vulkan` | Vulkan for llama.cpp + portable WGPU vision backend |
+| `gpu-rocm` / `vision-rocm` | HIP/ROCm for llama.cpp + optional Burn vision backend |
+| `vision-cuda` | Burn vision CUDA backend + zero-copy CUDA preprocessing |
+| `vision-ort` | ORT/TensorRT/CUDA for the main vision path; pulled in by `gpu-cuda` |
 | `test-support` | exposes `flow_engine::node_adapter::test_support` (for benches) |
 
 ## Configuration
@@ -168,6 +172,13 @@ native (`python-bundle`) deployment.
   `BROWSER_RENDERER_MAX_CONTEXTS`. It validates public URLs before navigation and aborts
   private/local subresource requests inside Playwright routing.
 - `test-runner` — see Project Studio below.
+
+LLM engine versions live in the container manifests: vLLM 0.27.0 on PyTorch 2.13.0 +
+torchvision 0.28.0, SGLang 0.5.17 on PyTorch 2.11.0; ROCm vLLM variants install from the
+official ROCm wheel index. DGX Spark builds vLLM 0.27.0 from source and the DeepSeek DSpark
+variant applies only the local `nvfp4_ds_mla` patch (DSpark support landed upstream). Profile
+`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.27.0 needs
+`vllm-dspark-src`, because the old overlay no longer applies to current sources.
 
 ## ML Studio training tracks
 
@@ -350,6 +361,14 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
   `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm` for single-backend builds). Local patches come from
   `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
   auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
+- Whisper autodetection on Linux/Windows covers CUDA, ROCm and Vulkan. AMD chips can be pinned,
+  e.g. `CMAKE_HIP_ARCHITECTURES=gfx1201` before
+  `LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh`.
+- CUDA NV12/RGB preprocessing for the zero-copy ORT path is opt-in via `gpu-cuda` or
+  `vision-cuda`; a plain AMD/Intel build never invokes `nvcc` and preprocesses on the host. The
+  portable WGPU/Vulkan backend is Burn's default for the main vision pipeline
+  (`inference-supertonic` no longer forces ORT for vision), while `gpu-cuda` keeps the
+  ORT/TensorRT/CUDA path on NVIDIA.
 - Android specifics: GGML builds use `GGML_OPENMP=OFF` (no `libomp.so` runtime);
   `build-rust.sh` detects the NDK, picks ABIs from the attached phone via `adb`
   (`ANDROID_ABIS=auto`, `all` for everything), fetches the GStreamer Android SDK, and copies

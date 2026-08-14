@@ -12,13 +12,19 @@
 # ustawia SGL_KERNEL_INDEX — bez kompilacji ze zrodel.
 ARG CUDA_IMAGE=nvidia/cuda:13.0.3-devel-ubuntu24.04
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
-ARG SGLANG_VERSION=0.5.15.post1
+ARG TORCH_VERSION=2.11.0
+ARG TORCHVISION_VERSION=0.26.0
+ARG TORCHAUDIO_VERSION=2.11.0
+ARG SGLANG_VERSION=0.5.17
 # Pusty = zostaw prebuilt sgl-kernel z sglang[all] (Hopper/Blackwell, cu130).
 # Ustawiony (np. https://docs.sglang.ai/whl/cu129/) = force-reinstall prebuilt
 # sgl-kernel z indeksu sglang pod CUDA 12 (Ampere/Ada, sm75+).
 ARG SGL_KERNEL_INDEX=
 FROM ${CUDA_IMAGE}
 ARG TORCH_INDEX
+ARG TORCH_VERSION
+ARG TORCHVISION_VERSION
+ARG TORCHAUDIO_VERSION
 ARG SGLANG_VERSION
 ARG SGL_KERNEL_INDEX
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -33,7 +39,7 @@ RUN pip install --no-cache-dir --upgrade pip wheel
 # torch z indeksu CUDA wybranego przez build-arg, potem sglang.
 RUN pip install --no-cache-dir \
       --index-url ${TORCH_INDEX} \
-      torch torchvision \
+      torch==${TORCH_VERSION} torchvision==${TORCHVISION_VERSION} torchaudio==${TORCHAUDIO_VERSION} \
     && pip install --no-cache-dir "sglang[all]==${SGLANG_VERSION}"
 
 # Ampere/Ada: podmien sgl-kernel na prebuilt z indeksu sglang pod CUDA 12 (pokrywa

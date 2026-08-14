@@ -22,7 +22,7 @@
 // mirror the RF-DETR device/NV12/RGB entry points so the launcher can feed the
 // same frame the RF-DETR path already has.
 
-#![cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#![cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::Deserialize;
@@ -203,7 +203,10 @@ impl VehicleDetector {
     /// ImageNet normalize) so the fused kernel yields the `/255` RGB the graph
     /// expects. Preprocesses on the GPU into a device buffer and hands its
     /// pointer to ort (zero host↔device copy of the model input).
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "vision-cuda-preprocess"
+    ))]
     pub fn detect_batch_gpu(
         &self,
         frames: &[crate::vision::gpu_preprocess::Nv12Frame<'_>],
@@ -226,7 +229,10 @@ impl VehicleDetector {
     /// `(&[u8], w, h)`, `len == w*h*3`) — the RGB analogue of `detect_batch_gpu`.
     /// The launcher uses this when the detect frame is host RGB but a GPU
     /// preprocess is still cheaper than the CPU resize. Same YOLO mean/std.
-    #[cfg(any(target_os = "linux", target_os = "windows"))]
+    #[cfg(all(
+        any(target_os = "linux", target_os = "windows"),
+        feature = "vision-cuda-preprocess"
+    ))]
     pub fn detect_device_pixels(
         &self,
         frames: &[(&[u8], u32, u32)],

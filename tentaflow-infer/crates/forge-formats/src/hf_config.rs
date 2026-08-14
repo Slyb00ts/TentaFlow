@@ -129,7 +129,10 @@ impl HfConfig {
     pub fn from_json_slice(bytes: &[u8]) -> Result<Self> {
         let raw: serde_json::Value = serde_json::from_slice(bytes)
             .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
-        let merged = match (raw.as_object(), raw.get("text_config").and_then(|t| t.as_object())) {
+        let merged = match (
+            raw.as_object(),
+            raw.get("text_config").and_then(|t| t.as_object()),
+        ) {
             (Some(top), Some(text)) => {
                 let mut out = top.clone();
                 out.remove("text_config");
@@ -140,8 +143,7 @@ impl HfConfig {
             }
             _ => raw,
         };
-        serde_json::from_value(merged)
-            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))
+        serde_json::from_value(merged).map_err(|e| ForgeError::Format(format!("config.json: {e}")))
     }
 
     pub fn num_key_value_heads(&self) -> usize {

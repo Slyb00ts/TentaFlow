@@ -77,7 +77,12 @@ fn matrix(rows: usize, cols: usize, seed: u64) -> Vec<u8> {
     f16_bytes(&(0..rows * cols).map(|_| next()).collect::<Vec<_>>())
 }
 
-fn put<E: WeightStore>(exec: &mut E, codes: Vec<u8>, rows: usize, cols: usize) -> forge_graph::WeightId {
+fn put<E: WeightStore>(
+    exec: &mut E,
+    codes: Vec<u8>,
+    rows: usize,
+    cols: usize,
+) -> forge_graph::WeightId {
     exec.put_quant(QuantWeight::Packed(PackedWeight {
         planes: Planes {
             codes,
@@ -178,7 +183,10 @@ fn a_partial_rotary_turns_only_its_own_dimensions() {
     let Some(device) = device() else { return };
 
     for (who, (before, after)) in [
-        ("wzorzec", run_rope(&mut HostExec::new(spec()).expect("wzorzec"))),
+        (
+            "wzorzec",
+            run_rope(&mut HostExec::new(spec()).expect("wzorzec")),
+        ),
         (
             "CUDA",
             run_rope(&mut CudaExec::new(device as Arc<_>, spec()).expect("wykonawca CUDA")),
@@ -199,7 +207,10 @@ fn a_partial_rotary_turns_only_its_own_dimensions() {
         for h in 0..HEADS {
             for j in ROT..HEAD_DIM {
                 let i = h * HEAD_DIM + j;
-                assert_eq!(after[i], before[i], "{who}: wymiar {j} głowicy {h} obrócony");
+                assert_eq!(
+                    after[i], before[i],
+                    "{who}: wymiar {j} głowicy {h} obrócony"
+                );
             }
         }
         // And the ones below it must have MOVED, or the test would pass for a
@@ -208,51 +219,54 @@ fn a_partial_rotary_turns_only_its_own_dimensions() {
             .flat_map(|h| (0..ROT).map(move |j| h * HEAD_DIM + j))
             .filter(|&i| (after[i] - before[i]).abs() > 1e-3)
             .count();
-        assert!(turned > HEADS * ROT / 2, "{who}: obrócono {turned} wymiarów");
+        assert!(
+            turned > HEADS * ROT / 2,
+            "{who}: obrócono {turned} wymiarów"
+        );
     }
 }
 
 fn gate_body<E: Executor + WeightStore>(exec: &mut E) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
-        let table = put(exec, matrix(HIDDEN, HIDDEN, 0x1234), HIDDEN, HIDDEN);
-        let wa = put(exec, matrix(WIDTH, HIDDEN, 0x9abc), WIDTH, HIDDEN);
-        // Scaled so the sigmoid spans a wide band while SATURATING NOWHERE.
-        // Either extreme would let a step function pass for a sigmoid, and a
-        // constant would pass for a gate that varies.
-        let wg: Vec<u8> = {
-            let mut next = noise(0xdef0);
-            f16_bytes(
-                &(0..WIDTH * HIDDEN)
-                    .map(|_| next() * 0.2)
-                    .collect::<Vec<_>>(),
-            )
-        };
-        let wg = put(exec, wg, WIDTH, HIDDEN);
-        let step = Step::single(0, 0, 1).expect("krok");
-        exec.run(&Op::Embed {
-            table,
-            tokens: vec![11],
+    let table = put(exec, matrix(HIDDEN, HIDDEN, 0x1234), HIDDEN, HIDDEN);
+    let wa = put(exec, matrix(WIDTH, HIDDEN, 0x9abc), WIDTH, HIDDEN);
+    // Scaled so the sigmoid spans a wide band while SATURATING NOWHERE.
+    // Either extreme would let a step function pass for a sigmoid, and a
+    // constant would pass for a gate that varies.
+    let wg: Vec<u8> = {
+        let mut next = noise(0xdef0);
+        f16_bytes(
+            &(0..WIDTH * HIDDEN)
+                .map(|_| next() * 0.2)
+                .collect::<Vec<_>>(),
+        )
+    };
+    let wg = put(exec, wg, WIDTH, HIDDEN);
+    let step = Step::single(0, 0, 1).expect("krok");
+    exec.run(&Op::Embed {
+        table,
+        tokens: vec![11],
+        step: step.clone(),
+    })
+    .expect("osadzenie");
+    for (out, w) in [(Act::Attn, wa), (Act::AttnGate, wg)] {
+        exec.run(&Op::MatMul {
+            out,
+            w,
+            x: Act::Hidden,
             step: step.clone(),
         })
-        .expect("osadzenie");
-        for (out, w) in [(Act::Attn, wa), (Act::AttnGate, wg)] {
-            exec.run(&Op::MatMul {
-                out,
-                w,
-                x: Act::Hidden,
-                step: step.clone(),
-            })
-            .expect("projekcja");
-        }
-        let attn = exec.read(Act::Attn, WIDTH).expect("odczyt uwagi");
-        let gate = exec.read(Act::AttnGate, WIDTH).expect("odczyt bramki");
-        exec.run(&Op::SigmoidMul {
-            act: Act::Attn,
-            gate: Act::AttnGate,
-            step,
-        })
-        .expect("bramka");
-        let out = exec.read(Act::Attn, WIDTH).expect("odczyt wyjścia");
-        (attn, gate, out)
+        .expect("projekcja");
+    }
+    let attn = exec.read(Act::Attn, WIDTH).expect("odczyt uwagi");
+    let gate = exec.read(Act::AttnGate, WIDTH).expect("odczyt bramki");
+    exec.run(&Op::SigmoidMul {
+        act: Act::Attn,
+        gate: Act::AttnGate,
+        step,
+    })
+    .expect("bramka");
+    let out = exec.read(Act::Attn, WIDTH).expect("odczyt wyjścia");
+    (attn, gate, out)
 }
 
 #[test]

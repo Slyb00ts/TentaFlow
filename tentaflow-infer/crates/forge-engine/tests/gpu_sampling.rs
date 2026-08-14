@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, Sampler, SamplingParams};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 
 const STEPS: usize = 24;
 
@@ -42,7 +42,7 @@ fn load() -> Option<Model> {
     // 64 KV pages (2048 tokens) keep the cache within the test pool.
     let cfg = ModelConfig {
         weight_host_budget: 0,
-weight_spill_dir: None,
+        weight_spill_dir: None,
         kv_pages: 64,
         ..ModelConfig::default()
     };

@@ -71,7 +71,11 @@ pub mod streaming;
 pub mod supervisor;
 pub mod transport;
 pub mod vector;
-#[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
+#[cfg(all(
+    unix,
+    feature = "camera",
+    feature = "inference-vision-gpu"
+))]
 pub mod vision_worker;
 
 pub use tts::{TTSClient, TTSConfigCompat};

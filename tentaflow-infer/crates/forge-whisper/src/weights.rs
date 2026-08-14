@@ -49,9 +49,8 @@ impl WhisperConfig {
         let flavour = WhisperFlavour::detect(config)?;
         match flavour {
             WhisperFlavour::HfTransformers => {
-                let cfg: WhisperConfig = serde_json::from_value(config.clone()).map_err(|e| {
-                    ForgeError::Format(format!("whisper config.json (HF): {e}"))
-                })?;
+                let cfg: WhisperConfig = serde_json::from_value(config.clone())
+                    .map_err(|e| ForgeError::Format(format!("whisper config.json (HF): {e}")))?;
                 Ok((cfg, flavour))
             }
             WhisperFlavour::MlxOpenAi => {
@@ -256,10 +255,9 @@ impl Loader<'_> {
             return Ok(None);
         };
         let (scales_name, biases_name) = (format!("{base}.scales"), format!("{base}.biases"));
-        let (Some(scales_t), Some(biases_t)) = (
-            self.st.tensor(&scales_name),
-            self.st.tensor(&biases_name),
-        ) else {
+        let (Some(scales_t), Some(biases_t)) =
+            (self.st.tensor(&scales_name), self.st.tensor(&biases_name))
+        else {
             return Ok(None);
         };
 
@@ -324,8 +322,13 @@ impl Loader<'_> {
 
     /// Convolution weights, normalised to [out, in, kernel]. A transposed
     /// kernel raises no error anywhere downstream — the model simply mishears.
-    fn upload_conv(&self, name: &str, out_ch: usize, in_ch: usize, kernel: usize)
-        -> Result<DevBuffer> {
+    fn upload_conv(
+        &self,
+        name: &str,
+        out_ch: usize,
+        in_ch: usize,
+        kernel: usize,
+    ) -> Result<DevBuffer> {
         let t = self
             .st
             .tensor(name)
@@ -418,7 +421,10 @@ impl WhisperWeights {
                     &format!("{p}.{}.weight", names.fc1),
                     &[config.encoder_ffn_dim, d],
                 )?,
-                fc1_b: l.upload(&format!("{p}.{}.bias", names.fc1), &[config.encoder_ffn_dim])?,
+                fc1_b: l.upload(
+                    &format!("{p}.{}.bias", names.fc1),
+                    &[config.encoder_ffn_dim],
+                )?,
                 fc2_w: l.upload(
                     &format!("{p}.{}.weight", names.fc2),
                     &[d, config.encoder_ffn_dim],
@@ -440,7 +446,10 @@ impl WhisperWeights {
                     &format!("{p}.{}.weight", names.fc1),
                     &[config.decoder_ffn_dim, d],
                 )?,
-                fc1_b: l.upload(&format!("{p}.{}.bias", names.fc1), &[config.decoder_ffn_dim])?,
+                fc1_b: l.upload(
+                    &format!("{p}.{}.bias", names.fc1),
+                    &[config.decoder_ffn_dim],
+                )?,
                 fc2_w: l.upload(
                     &format!("{p}.{}.weight", names.fc2),
                     &[d, config.decoder_ffn_dim],

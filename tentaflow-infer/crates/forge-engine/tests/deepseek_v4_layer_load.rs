@@ -20,7 +20,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 fn device() -> Arc<dyn Device> {
@@ -66,7 +68,10 @@ fn loads_layer_with_compressor_and_indexer() {
         (attn.wo_a.rows(), attn.wo_a.cols()),
         (o_groups * o_rank, n_heads * head_dim / o_groups)
     );
-    assert_eq!((attn.wo_b.rows(), attn.wo_b.cols()), (hidden, o_groups * o_rank));
+    assert_eq!(
+        (attn.wo_b.rows(), attn.wo_b.cols()),
+        (hidden, o_groups * o_rank)
+    );
 
     // Wagi FP8 muszą wyjść ze ścieżki ze skalą wierszową, a nie jako f16 —
     // inaczej model urósłby o 5,5 GiB.

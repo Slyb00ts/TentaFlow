@@ -67,7 +67,9 @@ pub fn collect(root: &Path, scope: Scope) -> Vec<SourceFile> {
             walk(&root.join("xtask"), root, &mut out, &|p| is_ext(p, "rs"));
         }
         Scope::Mojo => {
-            walk(&root.join("kernels"), root, &mut out, &|p| is_ext(p, "mojo"));
+            walk(&root.join("kernels"), root, &mut out, &|p| {
+                is_ext(p, "mojo")
+            });
         }
         Scope::Manifest => {
             walk(&root.join("kernels"), root, &mut out, &|p| {

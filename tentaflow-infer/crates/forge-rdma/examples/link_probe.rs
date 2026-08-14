@@ -116,7 +116,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         let n = ROUNDS as u64 - 64;
         let rtt = t0.elapsed().as_secs_f64() / n as f64;
-        println!("opoznienie {PING} B: {:.2} us w jedna strone", rtt * 1e6 / 2.0);
+        println!(
+            "opoznienie {PING} B: {:.2} us w jedna strone",
+            rtt * 1e6 / 2.0
+        );
 
         // Przepustowosc: kolejka duzych zapisow, sygnalizowany co 32-gi, zeby
         // kolejka ukonczen nie stala sie waskim gardlem pomiaru.

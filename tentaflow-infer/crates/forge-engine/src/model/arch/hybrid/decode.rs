@@ -35,7 +35,12 @@ impl Model {
     }
 
     /// Część 1 chunka: mikser do projekcji wyjściowej włącznie.
-    pub(crate) fn hybrid_batch_mixer(&self, layer_index: usize, t: usize, commit_prefill: bool) -> Result<()> {
+    pub(crate) fn hybrid_batch_mixer(
+        &self,
+        layer_index: usize,
+        t: usize,
+        commit_prefill: bool,
+    ) -> Result<()> {
         let layer = &self.weights.layers[layer_index];
         {
             match &layer.mixer {
@@ -218,9 +223,7 @@ impl Model {
                     LayerFfn::Dense(ffn) => ffn,
                 };
                 let gate_up = match &ffn.gate_up {
-                    GateUpWeights::Fused(weight) => {
-                        window_capable(weight) && batchable(weight)
-                    }
+                    GateUpWeights::Fused(weight) => window_capable(weight) && batchable(weight),
                     GateUpWeights::Split { gate, up } => batchable(gate) && batchable(up),
                 };
                 gate_up && batchable(&ffn.down)
@@ -320,7 +323,12 @@ impl Model {
         )
     }
 
-    pub(crate) fn hybrid_forward_token(&self, token_id: u32, want_logits: bool, src: AttnSrc) -> Result<()> {
+    pub(crate) fn hybrid_forward_token(
+        &self,
+        token_id: u32,
+        want_logits: bool,
+        src: AttnSrc,
+    ) -> Result<()> {
         self.stage_hybrid_embedding(token_id)?;
         self.hybrid_forward_staged(want_logits, src)
     }
@@ -362,7 +370,10 @@ impl Model {
         write_pinned(bytemuck::cast_slice(page_table), &host_staging.page_table)?;
         write_pinned(bytemuck::cast_slice(ids), &host_staging.ids)?;
         write_pinned(bytemuck::cast_slice(positions), &host_staging.positions)?;
-        write_pinned(bytemuck::cast_slice(visible_lens), &host_staging.visible_lens)?;
+        write_pinned(
+            bytemuck::cast_slice(visible_lens),
+            &host_staging.visible_lens,
+        )?;
         write_pinned(&(base as i32).to_le_bytes(), &host_staging.base_pos)?;
         write_pinned(&(t as i32).to_le_bytes(), &host_staging.accepted)?;
         let table = self.weights.token_embd_host.as_ref().ok_or_else(|| {
@@ -528,8 +539,14 @@ impl Model {
                             &self.stream,
                         )?;
                         for (from, to) in [(&bb.k, &self.bufs.k), (&bb.v, &self.bufs.v)] {
-                            self.device
-                                .copy(from, lane * kv_dim * 2, to, 0, kv_dim * 2, &self.stream)?;
+                            self.device.copy(
+                                from,
+                                lane * kv_dim * 2,
+                                to,
+                                0,
+                                kv_dim * 2,
+                                &self.stream,
+                            )?;
                         }
                         self.device.copy(
                             &bb.positions,
@@ -599,7 +616,14 @@ impl Model {
                     &self.weights.output_norm
                 };
                 self.kernels.rmsnorm_residual_f16(
-                    &bb.x, &bb.h, &bb.down, next_norm, n, hidden, eps, &self.stream,
+                    &bb.x,
+                    &bb.h,
+                    &bb.down,
+                    next_norm,
+                    n,
+                    hidden,
+                    eps,
+                    &self.stream,
                 )?;
                 continue;
             }
@@ -642,5 +666,4 @@ impl Model {
         let bb = self.batch_bufs.as_ref().expect("batch bufs provisioned");
         self.logits_gemm(&bb.logits, &bb.x, n, &self.stream)
     }
-
 }

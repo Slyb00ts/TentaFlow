@@ -86,9 +86,10 @@ pub fn upload_row_split_with(
     let mut offset = 0usize;
     for (index, &count) in plan.iter().enumerate() {
         let entry = cluster.device(index)?;
-        let buffer = entry
-            .device
-            .alloc(count.max(1) * row_bytes, MemKind::Device, Pool::Weights)?;
+        let buffer =
+            entry
+                .device
+                .alloc(count.max(1) * row_bytes, MemKind::Device, Pool::Weights)?;
         if count > 0 {
             entry.device.write(
                 &data[offset * row_bytes..(offset + count) * row_bytes],
@@ -826,11 +827,15 @@ pub fn ffn_forward_split(
                         .kernels
                         .gemv_q8_0_f16(y, w, input(index)?, rows, hidden, stream)
                 }
-                (QuantKind::Q4K, true) => {
-                    entry
-                        .kernels
-                        .gemv_q4_k_dp4a_f16(y, w, input(index)?, rows, hidden, stream)
-                }
+                (QuantKind::Q4K, true) => entry.kernels.gemv_q4_k_dp4a_f16(
+                    y,
+                    w,
+                    input(index)?,
+                    rows,
+                    hidden,
+                    forge_kernels::Q4kDecodeModelFamily::Dense,
+                    stream,
+                ),
                 (QuantKind::Q4K, false) => {
                     entry
                         .kernels
@@ -1104,7 +1109,11 @@ impl TpDecode {
                 continue;
             }
             let entry = self.cluster.device(index)?;
-            let mk = |bytes: usize| entry.device.alloc(bytes, MemKind::Device, Pool::Activations);
+            let mk = |bytes: usize| {
+                entry
+                    .device
+                    .alloc(bytes, MemKind::Device, Pool::Activations)
+            };
             batch.push(Some(BatchWorkspace {
                 x: if index == 0 {
                     None
@@ -1216,9 +1225,14 @@ impl TpDecode {
                     stream,
                 )?;
             }
-            entry
-                .kernels
-                .glu_mul_f16(activation, &ws.mid, &ws.gate, &ws.up, tokens * rows, stream)?;
+            entry.kernels.glu_mul_f16(
+                activation,
+                &ws.mid,
+                &ws.gate,
+                &ws.up,
+                tokens * rows,
+                stream,
+            )?;
             entry.kernels.gemm_nvfp4_gguf_out_f32_batch(
                 &ws.partial,
                 shards.down.shard(index)?,
@@ -1286,8 +1300,16 @@ impl TpDecode {
             let destination = self.ws.x[index].as_ref().ok_or_else(|| {
                 ForgeError::Scheduler(format!("karta {index} nie ma bufora wejścia"))
             })?;
-            self.cluster
-                .exchange_on(0, model_stream, x, 0, index, destination, 0, self.hidden * 2)?;
+            self.cluster.exchange_on(
+                0,
+                model_stream,
+                x,
+                0,
+                index,
+                destination,
+                0,
+                self.hidden * 2,
+            )?;
             self.cluster
                 .order(0, model_stream, index, &self.cluster.device(index)?.stream)?;
         }
@@ -1305,7 +1327,9 @@ impl TpDecode {
                     head.parts[index].as_ref().ok_or_else(|| {
                         ForgeError::Scheduler(format!("karta {index} nie ma bufora logitów"))
                     })?,
-                    self.ws.x[index].as_ref().expect("bufor wejścia sprawdzony wyżej"),
+                    self.ws.x[index]
+                        .as_ref()
+                        .expect("bufor wejścia sprawdzony wyżej"),
                 )
             };
             match head.quant {
@@ -1475,8 +1499,16 @@ impl TpDecode {
             let destination = self.ws.x[index].as_ref().ok_or_else(|| {
                 ForgeError::Scheduler(format!("karta {index} nie ma bufora wejścia"))
             })?;
-            self.cluster
-                .exchange_on(0, model_stream, x, 0, index, destination, 0, self.hidden * 2)?;
+            self.cluster.exchange_on(
+                0,
+                model_stream,
+                x,
+                0,
+                index,
+                destination,
+                0,
+                self.hidden * 2,
+            )?;
             self.cluster
                 .order(0, model_stream, index, &self.cluster.device(index)?.stream)?;
         }
@@ -1510,8 +1542,18 @@ impl TpDecode {
             // liczy je ścieżka jednokartowa.
             let dp4a = shards.cols <= forge_kernels::Kernels::DP4A_MAX_COLS;
             for (out, shard, rows, format) in [
-                (out_in, shards.in_proj.shard(index)?, rows_in, shards.in_format),
-                (out_gate, shards.gate.shard(index)?, rows_gate, shards.gate_format),
+                (
+                    out_in,
+                    shards.in_proj.shard(index)?,
+                    rows_in,
+                    shards.in_format,
+                ),
+                (
+                    out_gate,
+                    shards.gate.shard(index)?,
+                    rows_gate,
+                    shards.gate_format,
+                ),
             ] {
                 if rows == 0 {
                     continue;
@@ -1528,21 +1570,38 @@ impl TpDecode {
                         shards.cols,
                         stream,
                     )?,
-                    (QuantKind::Q8_0, true) => entry
-                        .kernels
-                        .gemv_q8_0_dp4a_f16(out, shard, input, rows, shards.cols, stream)?,
-                    (QuantKind::Q8_0, false) => entry
-                        .kernels
-                        .gemv_q8_0_f16(out, shard, input, rows, shards.cols, stream)?,
-                    (QuantKind::Q4K, true) => entry
-                        .kernels
-                        .gemv_q4_k_dp4a_f16(out, shard, input, rows, shards.cols, stream)?,
-                    (QuantKind::Q4K, false) => entry
-                        .kernels
-                        .gemv_q4_k_f16(out, shard, input, rows, shards.cols, stream)?,
-                    (QuantKind::Q6K, _) => entry
-                        .kernels
-                        .gemv_q6_k_f16(out, shard, input, rows, shards.cols, stream)?,
+                    (QuantKind::Q8_0, true) => entry.kernels.gemv_q8_0_dp4a_f16(
+                        out,
+                        shard,
+                        input,
+                        rows,
+                        shards.cols,
+                        stream,
+                    )?,
+                    (QuantKind::Q8_0, false) => {
+                        entry
+                            .kernels
+                            .gemv_q8_0_f16(out, shard, input, rows, shards.cols, stream)?
+                    }
+                    (QuantKind::Q4K, true) => entry.kernels.gemv_q4_k_dp4a_f16(
+                        out,
+                        shard,
+                        input,
+                        rows,
+                        shards.cols,
+                        forge_kernels::Q4kDecodeModelFamily::Dense,
+                        stream,
+                    )?,
+                    (QuantKind::Q4K, false) => {
+                        entry
+                            .kernels
+                            .gemv_q4_k_f16(out, shard, input, rows, shards.cols, stream)?
+                    }
+                    (QuantKind::Q6K, _) => {
+                        entry
+                            .kernels
+                            .gemv_q6_k_f16(out, shard, input, rows, shards.cols, stream)?
+                    }
                     (other, _) => {
                         return Err(ForgeError::Unsupported(format!(
                             "projekcje DeltaNet nie mają ścieżki GEMV dla {other:?}"

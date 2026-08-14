@@ -1,16 +1,16 @@
 # =============================================================================
 # Plik: reranker/python/nemotron-rerank/bundle.toml
 # Opis: NVIDIA Llama-Nemotron Rerank jako natywny bundle vLLM (PyPI, pinned
-#       0.26.0). vLLM serwuje cross-encoder w trybie score/rerank i wystawia
+#       0.27.0). vLLM serwuje cross-encoder w trybie score/rerank i wystawia
 #       OpenAI-compatible /v1/rerank + /v1/score. CUDA (cu130) i ROCm (rocm7.0).
 # =============================================================================
 
 [bundle]
 engine = "nemotron-rerank"
-description = "NVIDIA Llama-Nemotron Rerank cross-encoder via vLLM (PyPI, pinned 0.26.0)"
+description = "NVIDIA Llama-Nemotron Rerank cross-encoder via vLLM (PyPI, pinned 0.27.0)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "vllm==0.26.0"
+pypi_package = "vllm==0.27.0"
 
 [launch]
 command = "python"
@@ -45,6 +45,6 @@ extras = []
 
 [[install_variants]]
 backend = "rocm"
-extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extra_index = "https://wheels.vllm.ai/rocm/"
 extras = []
 install_hint = "VLLM_TARGET_DEVICE=rocm"

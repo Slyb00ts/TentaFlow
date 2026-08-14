@@ -18,7 +18,7 @@
 // Ten moduł NIE zawiera protokołu sieciowego. Zawiera model kosztu i decyzję,
 // którą ten protokół będzie musiał obsłużyć.
 
-use crate::multi_gpu::{DeviceCapability, MIN_USEFUL_ROWS, SplitPlan, WorkKind, plan_split};
+use crate::multi_gpu::{plan_split, DeviceCapability, SplitPlan, WorkKind, MIN_USEFUL_ROWS};
 use forge_types::{ForgeError, Result};
 
 /// Node w sensie maszyny. Karty w jednym nodzie łączy szyna, karty w różnych —
@@ -674,12 +674,11 @@ mod tests {
         let caps = [cap(336e9, 1.1e12, 16), cap(735e9, 9.7e12, 20)];
         let topology = Topology::single_node(&caps, p2p()).unwrap();
         let plan = plan_execution(&topology, profile(), WorkKind::MemoryBound).unwrap();
-        let rows = plan_stage_rows(&topology, &plan.stages[0], 4096, WorkKind::MemoryBound, 0)
-            .unwrap();
+        let rows =
+            plan_stage_rows(&topology, &plan.stages[0], 4096, WorkKind::MemoryBound, 0).unwrap();
         assert_eq!(rows.total(), 4096);
         assert!(rows.rows[1] > rows.rows[0]);
     }
-
 
     #[test]
     fn szybkie_lacze_wybiera_pelny_tensor_parallel() {
@@ -733,10 +732,12 @@ mod tests {
 
     #[test]
     fn udzial_dzielonej_mocy_maleje_wraz_z_odpornoscia_techniki() {
-        assert!(parallel_share(Technique::TensorParallel) > parallel_share(Technique::FfnTensorParallel));
+        assert!(
+            parallel_share(Technique::TensorParallel)
+                > parallel_share(Technique::FfnTensorParallel)
+        );
         assert!(parallel_share(Technique::FfnTensorParallel) > parallel_share(Technique::Pipeline));
     }
-
 
     #[test]
     fn osiem_kart_w_czterech_nodach_daje_cztery_etapy_po_dwie() {
@@ -786,8 +787,8 @@ mod tests {
         let plan = plan_execution(&topology, profile(), WorkKind::MemoryBound).unwrap();
         assert!(plan.is_pure_tensor_parallel());
         assert_eq!(plan.stages[0].workers.len(), 4);
-        let rows = plan_stage_rows(&topology, &plan.stages[0], 16384, WorkKind::MemoryBound, 0)
-            .unwrap();
+        let rows =
+            plan_stage_rows(&topology, &plan.stages[0], 16384, WorkKind::MemoryBound, 0).unwrap();
         assert_eq!(rows.total(), 16384);
         // Najmocniejsza karta musi dostać najwięcej, najsłabsza najmniej.
         assert!(rows.rows[3] > rows.rows[1]);

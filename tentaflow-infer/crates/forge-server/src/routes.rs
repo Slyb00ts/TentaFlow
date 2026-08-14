@@ -282,7 +282,7 @@ pub(crate) async fn start_generation(
                         let prompt =
                             render_chat_prompt(&st.chat_template, &vars, messages, tools.as_ref())?;
                         st.tokenizer
-                            .encode(&prompt, true)
+                            .encode_chat_template(&prompt)
                             .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?
                     }
                     GenInput::Text(s) => st
@@ -710,7 +710,7 @@ pub async fn chat_completions(
     if req.model != state.model_id {
         return ApiError::model_not_found(&req.model, &state.model_id).into_response();
     }
-    let spec = match req.generation_spec() {
+    let spec = match req.generation_spec_with(&state.default_sampling, &state.default_stop) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -718,11 +718,16 @@ pub async fn chat_completions(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    // tool_choice "none" (or no tools at all): tools are neither rendered
-    // into the template nor parsed out of the output.
+    // tool_choice "none" wyłącza wyłącznie narzędzia; parser kanałów Muse
+    // nadal rozdziela reasoning od odpowiedzi użytkownika.
     let (parser_kind, tools) = match tool_mode {
         ToolMode::Auto => (state.tool_parser, req.tools.clone()),
-        ToolMode::None => (ToolParserKind::None, None),
+        ToolMode::None => (
+            (state.tool_parser == ToolParserKind::Muse)
+                .then_some(ToolParserKind::Muse)
+                .unwrap_or(ToolParserKind::None),
+            None,
+        ),
     };
     // Constrained decoding (SPEC §8.1.2): response_format / grammar / forced
     // tool_choice compile to a grammar the sampler must obey.
@@ -738,7 +743,11 @@ pub async fn chat_completions(
     }
     let gen = match start_generation(
         &state,
-        vec![GenInput::Chat(req.messages, tools, req.chat_template_kwargs)],
+        vec![GenInput::Chat(
+            req.messages,
+            tools,
+            req.chat_template_kwargs,
+        )],
         spec,
         grammar,
     )
@@ -849,7 +858,7 @@ pub async fn completions(
     if req.model != state.model_id {
         return ApiError::model_not_found(&req.model, &state.model_id).into_response();
     }
-    let spec = match req.generation_spec() {
+    let spec = match req.generation_spec_with(&state.default_sampling, &state.default_stop) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };

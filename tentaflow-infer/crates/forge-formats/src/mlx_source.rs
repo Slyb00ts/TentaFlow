@@ -74,8 +74,7 @@ impl<'a> MlxSource<'a> {
         ) else {
             return Ok(None);
         };
-        let (Some(packed_t), Some(scales_t)) =
-            (self.st.tensor(name), self.st.tensor(&scales_name))
+        let (Some(packed_t), Some(scales_t)) = (self.st.tensor(name), self.st.tensor(&scales_name))
         else {
             return Ok(None);
         };
@@ -104,12 +103,24 @@ impl<'a> MlxSource<'a> {
         let biases = self.u16s(&biases_name)?;
         let (sc_bf, bi_bf, sc_f, bi_f);
         let (scales, biases) = if param_dtype == DType::BF16 {
-            sc_bf = scales.iter().map(|b| bf16::from_bits(*b)).collect::<Vec<_>>();
-            bi_bf = biases.iter().map(|b| bf16::from_bits(*b)).collect::<Vec<_>>();
+            sc_bf = scales
+                .iter()
+                .map(|b| bf16::from_bits(*b))
+                .collect::<Vec<_>>();
+            bi_bf = biases
+                .iter()
+                .map(|b| bf16::from_bits(*b))
+                .collect::<Vec<_>>();
             (MlxParams::Bf16(&sc_bf), MlxParams::Bf16(&bi_bf))
         } else {
-            sc_f = scales.iter().map(|b| f16::from_bits(*b)).collect::<Vec<_>>();
-            bi_f = biases.iter().map(|b| f16::from_bits(*b)).collect::<Vec<_>>();
+            sc_f = scales
+                .iter()
+                .map(|b| f16::from_bits(*b))
+                .collect::<Vec<_>>();
+            bi_f = biases
+                .iter()
+                .map(|b| f16::from_bits(*b))
+                .collect::<Vec<_>>();
             (MlxParams::F16(&sc_f), MlxParams::F16(&bi_f))
         };
         let tensor = MlxAffineTensor {
@@ -120,7 +131,12 @@ impl<'a> MlxSource<'a> {
             cols,
         };
         let blocks = repack_affine_to_q4_1(&tensor, &self.cfg)?;
-        Ok(Some((blocks, DType::F16, QuantKind::Q4_1, vec![rows, cols])))
+        Ok(Some((
+            blocks,
+            DType::F16,
+            QuantKind::Q4_1,
+            vec![rows, cols],
+        )))
     }
 }
 
@@ -203,7 +219,6 @@ impl TensorSource for MlxSource<'_> {
         Ok(None)
     }
 }
-
 
 #[cfg(test)]
 mod mlx_source_tests {
@@ -315,4 +330,3 @@ mod mlx_source_tests {
         assert_eq!(dims, st.tensor(name).unwrap().shape);
     }
 }
-

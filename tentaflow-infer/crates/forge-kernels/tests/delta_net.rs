@@ -123,10 +123,12 @@ fn fixture() -> Fixture {
         alpha: seen(&draw(V_HEADS * HIDDEN, 0x5555, 0.1)),
         beta: seen(&draw(V_HEADS * HIDDEN, 0x6666, 0.1)),
         dt_bias: seen(&draw(V_HEADS, 0x7777, 1.0)),
-        a: seen(&draw(V_HEADS, 0x8888, 1.0)
-            .iter()
-            .map(|v| -(v.abs().exp()))
-            .collect::<Vec<_>>()),
+        a: seen(
+            &draw(V_HEADS, 0x8888, 1.0)
+                .iter()
+                .map(|v| -(v.abs().exp()))
+                .collect::<Vec<_>>(),
+        ),
         norm: seen(&draw(D_STATE, 0x9999, 1.0)),
         out: seen(&draw(HIDDEN * VALUE, 0xaaaa, 0.1)),
     }
@@ -149,7 +151,13 @@ impl Carried {
 
 fn row_times(m: &[f32], rows: usize, x: &[f32]) -> Vec<f32> {
     (0..rows)
-        .map(|r| m[r * x.len()..(r + 1) * x.len()].iter().zip(x).map(|(a, b)| a * b).sum())
+        .map(|r| {
+            m[r * x.len()..(r + 1) * x.len()]
+                .iter()
+                .zip(x)
+                .map(|(a, b)| a * b)
+                .sum()
+        })
         .collect()
 }
 
@@ -277,7 +285,12 @@ fn plain<E: WeightStore>(exec: &mut E, values: &[f32]) -> WeightId {
 }
 
 /// Runs `tokens` through the layer, one step each, and returns every answer.
-fn run<E: Executor + WeightStore>(exec: &mut E, f: &Fixture, tokens: &[u32], from: u32) -> Vec<Vec<f32>> {
+fn run<E: Executor + WeightStore>(
+    exec: &mut E,
+    f: &Fixture,
+    tokens: &[u32],
+    from: u32,
+) -> Vec<Vec<f32>> {
     let table = put(exec, &f.table, HIDDEN, HIDDEN);
     let w = DeltaWeights {
         qkv: put(exec, &f.qkv, MIXED, HIDDEN),
@@ -348,7 +361,10 @@ fn the_recurrent_mixer_matches_the_formula_and_carries_its_state() {
 
     let f = fixture();
     let mut carried = Carried::new();
-    let want: Vec<Vec<f32>> = PROMPT.iter().map(|t| expected(&f, &mut carried, *t)).collect();
+    let want: Vec<Vec<f32>> = PROMPT
+        .iter()
+        .map(|t| expected(&f, &mut carried, *t))
+        .collect();
 
     let peak = want[3].iter().fold(0.0f32, |m, v| m.max(v.abs()));
     assert!(peak > 1e-4, "wzorzec dał same zera");
@@ -364,7 +380,10 @@ fn the_recurrent_mixer_matches_the_formula_and_carries_its_state() {
     );
 
     for (who, got) in [
-        ("wzorzec", run(&mut HostExec::new(spec()).expect("wzorzec"), &f, &PROMPT, 0)),
+        (
+            "wzorzec",
+            run(&mut HostExec::new(spec()).expect("wzorzec"), &f, &PROMPT, 0),
+        ),
         (
             "CUDA",
             run(

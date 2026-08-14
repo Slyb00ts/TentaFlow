@@ -40,6 +40,29 @@ def rope_neox_f16(
         j += Int(block_dim.x)
 
 
+def rope_norm_f16(
+    x_io: UnsafePointer[Float16, MutAnyOrigin],
+    positions: UnsafePointer[Int32, MutAnyOrigin],
+    n_heads: Int,
+    head_dim: Int,
+    theta_base: Float32,
+):
+    token = Int(block_idx.x)
+    head = Int(block_idx.y)
+    base = (token * n_heads + head) * head_dim
+    pos = Float32(positions[token])
+    var j = Int(thread_idx.x)
+    while j < head_dim // 2:
+        angle = pos * pow(theta_base, Float32(-2 * j) / Float32(head_dim))
+        c = cos(angle)
+        s = sin(angle)
+        a = Float32(x_io[base + 2 * j])
+        b = Float32(x_io[base + 2 * j + 1])
+        x_io[base + 2 * j] = Float16(a * c - b * s)
+        x_io[base + 2 * j + 1] = Float16(a * s + b * c)
+        j += Int(block_dim.x)
+
+
 def rope_neox_partial_f16(
     x_io: UnsafePointer[Float16, MutAnyOrigin],
     positions: UnsafePointer[Int32, MutAnyOrigin],

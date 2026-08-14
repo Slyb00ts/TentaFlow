@@ -3,22 +3,22 @@
 // safetensors (incl. NVFP4), run decode-path forward on one GPU, greedy /
 // top-k/top-p sampling on CPU, streaming generation with stop handling.
 
+pub mod cluster;
 pub mod deepseek;
 pub mod expert_spill;
 pub mod generate;
 pub mod metrics;
-pub mod cluster;
-pub mod model_profile;
-pub mod multi_gpu;
-pub mod tensor_parallel;
-pub mod topology;
 pub mod model;
+pub mod model_profile;
 pub mod moe_residency;
 pub mod mtp;
+pub mod multi_gpu;
 pub mod sample;
 pub mod server;
 pub mod speculation;
+pub mod tensor_parallel;
 pub mod tier;
+pub mod topology;
 pub mod weight_tier;
 pub mod weights;
 

@@ -1,12 +1,12 @@
 [bundle]
 engine = "sglang"
-description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.15.post1)"
+description = "SGLang serwer LLM z structured outputs (PyPI, pinned 0.5.17)"
 python_version = "3.12"
-# Pinned na najnowsza stabilna wersje sglang (2026-07, z sglang-kernel
+# Pinned na najnowsza stabilna wersje sglang (2026-08, z sglang-kernel
 # pod cu130 wspierajaca sm_103 / B300). Update wymaga regeneracji
 # requirements.lock + bumpa pakietu.
 source = "pypi"
-pypi_package = "sglang[all]==0.5.15.post1"
+pypi_package = "sglang[all]==0.5.17"
 
 [launch]
 command = "python"
@@ -47,7 +47,7 @@ backend = "cuda"
 extra_index = "https://download.pytorch.org/whl/cu130"
 # Torch 2.11 cu130 to jedyne kola dla sm_103 / B300 (cu124/torch 2.6 NIE
 # obsluguja Blackwella). Pinned, zeby uv trzymal sie wersji zgodnej z
-# SGLang 0.5.15.post1.
+# SGLang 0.5.17.
 extras = ["torch==2.11.0", "torchvision==0.26.0"]
 
 [[install_variants]]

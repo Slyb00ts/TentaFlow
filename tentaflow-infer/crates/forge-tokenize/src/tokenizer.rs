@@ -81,6 +81,15 @@ impl Tokenizer {
         Ok(encoding.get_ids().to_vec())
     }
 
+    pub fn encode_chat_template(&self, text: &str) -> Result<Vec<u32>> {
+        let raw = self.encode(text, false)?;
+        if self.bos_id.is_some_and(|bos| raw.first() == Some(&bos)) {
+            Ok(raw)
+        } else {
+            self.encode(text, true)
+        }
+    }
+
     pub fn decode(&self, ids: &[u32], skip_special_tokens: bool) -> Result<String> {
         self.inner
             .decode(ids, skip_special_tokens)

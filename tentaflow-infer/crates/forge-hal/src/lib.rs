@@ -11,16 +11,16 @@
 #[cfg(any(feature = "cuda", feature = "hip"))]
 pub(crate) mod arena;
 pub mod cpu;
-#[cfg(feature = "hip")]
-pub mod hip;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(any(feature = "cuda", feature = "hip"))]
+pub mod gpu;
+#[cfg(feature = "hip")]
+pub mod hip;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal;
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 pub mod metal_device;
-#[cfg(any(feature = "cuda", feature = "hip"))]
-pub mod gpu;
 
 use std::any::Any;
 use std::sync::Arc;
@@ -106,7 +106,10 @@ impl KernelScalar for usize {
 pub enum ArgKind {
     Scalar,
     /// Index into `retained()` plus the byte offset requested at build time.
-    Buffer { retained: usize, byte_offset: u64 },
+    Buffer {
+        retained: usize,
+        byte_offset: u64,
+    },
 }
 
 /// Typed kernel-argument builder. Each argument occupies one address-stable

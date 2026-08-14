@@ -420,9 +420,7 @@ fn cuda_lanes_match_solo_runs() {
     // ten odczyt — i to jest jedyny powód, dla którego istnieją. Liczba, a nie
     // założenie: gdyby wsad nic nie dawał, ta linia by to powiedziała.
     for lanes in [1usize, prompts.len()] {
-        let feed: Vec<Feed> = (0..lanes)
-            .map(|slot| Feed { slot, token: 991 })
-            .collect();
+        let feed: Vec<Feed> = (0..lanes).map(|slot| Feed { slot, token: 991 }).collect();
         let mut feed = feed;
         let t = std::time::Instant::now();
         for _ in 0..16 {
@@ -597,7 +595,10 @@ fn nvfp4_from_safetensors_agrees_with_the_reference() {
     let cpu_first = cpu.prefill(SLOT, &prompt).expect("prefill wzorca");
     near("nvfp4 prefill", &gpu, &cpu);
 
-    let feed = [Feed { slot: SLOT, token: gpu_first }];
+    let feed = [Feed {
+        slot: SLOT,
+        token: gpu_first,
+    }];
     gpu.decode(&feed).expect("krok CUDA");
     cpu.decode(&feed).expect("krok wzorca");
     near("nvfp4 krok", &gpu, &cpu);

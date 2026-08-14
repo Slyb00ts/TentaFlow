@@ -291,13 +291,31 @@ impl CudaExec {
                 // pojedynczy krok zapłaciłby tylko za rozruch.
                 if value_key && take > 128 {
                     self.kernels.deltanet_value_key_scan_persistent_f16(
-                        &s.o, &matrix, &s.q32, &s.k32, &s.v, &s.g, &s.beta, take, v_heads,
+                        &s.o,
+                        &matrix,
+                        &s.q32,
+                        &s.k32,
+                        &s.v,
+                        &s.g,
+                        &s.beta,
+                        take,
+                        v_heads,
                         &self.stream,
                     )?;
                 } else if value_key {
                     self.kernels.deltanet_value_key_scan_inplace_f16(
-                        &s.o, &matrix, &matrix, &s.q32, &s.k32, &s.v, &s.g, &s.beta, 1, take,
-                        v_heads, &self.stream,
+                        &s.o,
+                        &matrix,
+                        &matrix,
+                        &s.q32,
+                        &s.k32,
+                        &s.v,
+                        &s.g,
+                        &s.beta,
+                        1,
+                        take,
+                        v_heads,
+                        &self.stream,
                     )?;
                 } else {
                     self.kernels.deltanet_gated_scan_inplace_f16(

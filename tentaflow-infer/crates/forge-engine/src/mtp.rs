@@ -217,6 +217,7 @@ impl MtpWeights {
                 ffn_norm: loader.vector(name(MtpWeightRole::FfnNorm)?, hidden)?,
                 mixer: LayerMixer::Attention(Box::new(AttnWeights {
                     v_norm: None,
+                    attn_gate: None,
                     q_norm,
                     k_norm,
                     attn_qkv: QkvWeights::Split {
@@ -920,6 +921,7 @@ mod tests {
             vocab_size: 64,
             rope_theta: 10_000.0,
             rms_norm_eps: 1e-6,
+            post_norm_eps: 1e-6,
             max_position_embeddings: 1024,
             tie_word_embeddings: true,
             pooling_type: PoolingType::None,
@@ -933,7 +935,9 @@ mod tests {
             attn_gated: true,
             ffn_activation: forge_formats::FfnActivation::SiLU,
             alt_attn: None,
+            rope_sliding_only: false,
             final_logit_softcap: 0.0,
+            logit_scale: 1.0,
             attn_logit_scale: None,
             deepseek_v4: None,
             embd_scale: None,

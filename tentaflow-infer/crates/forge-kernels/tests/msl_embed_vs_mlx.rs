@@ -258,7 +258,9 @@ fn residual_add_sums_in_f32() {
         dev.write(bytes, &buf, 0).unwrap();
         buf
     };
-    let out = dev.alloc(n * 2, MemKind::Device, Pool::Activations).unwrap();
+    let out = dev
+        .alloc(n * 2, MemKind::Device, Pool::Activations)
+        .unwrap();
 
     let args = LaunchArgs::new()
         .buf(&out)

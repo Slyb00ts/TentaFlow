@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use forge_engine::model::{Model, ModelConfig};
 use forge_formats::{Gguf, HfConfig, ModelDescriptor, PoolingType};
 use forge_hal::Device;
-use forge_tokenize::{resolve_chat_template, Tokenizer};
+use forge_tokenize::{builtin_chat_template, resolve_chat_template, Tokenizer};
 
 /// Tokenizer + everything the API layer needs around it.
 pub struct TokenizerBundle {
@@ -31,6 +31,11 @@ impl TokenizerBundle {
     /// architecture when the model ships none.
     pub fn resolve_template(&self, arch: &str) -> Result<String> {
         let family = builtin_family_for_arch(arch);
+        if family == "muse_glimmer" {
+            return builtin_chat_template(family)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("brak wbudowanego szablonu Muse"));
+        }
         resolve_chat_template(None, self.chat_template.as_deref(), None, Some(family))
             .map(str::to_string)
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -60,6 +65,8 @@ pub fn builtin_family_for_arch(arch: &str) -> &'static str {
         "mistral"
     } else if arch.starts_with("gemma") {
         "gemma"
+    } else if matches!(arch, "muse-glimmer" | "muse_glimmer") {
+        "muse_glimmer"
     } else {
         "chatml"
     }
@@ -350,8 +357,14 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
     } else {
         let gguf = Gguf::open(path)?;
         let bundle = load_tokenizer_gguf(&gguf)?;
+        let identity = gguf
+            .get_str("general.basename")
+            .or_else(|| gguf.get_str("general.name"))
+            .unwrap_or_default()
+            .to_string();
         drop(gguf);
-        let model = Model::load_gguf(device, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut model = Model::load_gguf(device, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        model.set_gguf_identity(&identity);
         (model, bundle)
     };
     let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
@@ -374,8 +387,14 @@ pub fn load_model_tp(
     }
     let gguf = Gguf::open(path)?;
     let bundle = load_tokenizer_gguf(&gguf)?;
+    let identity = gguf
+        .get_str("general.basename")
+        .or_else(|| gguf.get_str("general.name"))
+        .unwrap_or_default()
+        .to_string();
     drop(gguf);
-    let model = Model::load_tp(devices, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let mut model = Model::load_tp(devices, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    model.set_gguf_identity(&identity);
     let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
     Ok(LoadedModel {
         model,

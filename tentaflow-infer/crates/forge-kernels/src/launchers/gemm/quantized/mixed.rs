@@ -76,5 +76,4 @@ impl Kernels {
             .launch(self.artifacts.get(GEMV_MIXED_GROUP4)?, &cfg, &args, stream)?;
         Ok(true)
     }
-
 }

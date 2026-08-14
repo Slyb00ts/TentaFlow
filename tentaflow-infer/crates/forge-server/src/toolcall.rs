@@ -44,6 +44,7 @@ pub trait ToolCallParser: Send {
 pub enum ToolParserKind {
     Hermes,
     Llama3Json,
+    Muse,
     None,
 }
 
@@ -64,11 +65,15 @@ impl ToolParserKind {
             return match name {
                 "hermes" => Ok(Self::Hermes),
                 "llama3" => Ok(Self::Llama3Json),
+                "muse" => Ok(Self::Muse),
                 "none" => Ok(Self::None),
                 other => Err(format!(
-                    "unknown tool_call_parser {other:?}; expected \"hermes\", \"llama3\" or \"none\""
+                    "unknown tool_call_parser {other:?}; expected \"hermes\", \"llama3\", \"muse\" or \"none\""
                 )),
             };
+        }
+        if matches!(arch, "muse-glimmer" | "muse_glimmer") {
+            return Ok(Self::Muse);
         }
         if !chat_template.contains("tools") {
             return Ok(Self::None);
@@ -92,6 +97,7 @@ impl ToolParserKind {
         match self {
             Self::Hermes => Box::new(HermesParser::default()),
             Self::Llama3Json => Box::new(Llama3JsonParser::default()),
+            Self::Muse => Box::new(PassthroughParser),
             Self::None => Box::new(PassthroughParser),
         }
     }
@@ -294,6 +300,98 @@ struct ThinkExtractor {
     inside: bool,
 }
 
+const MUSE_REASONING: &str = "assistant to=self";
+const MUSE_TEXT: &str = "assistant to=user";
+
+#[derive(Default)]
+struct MuseChannelExtractor {
+    buf: String,
+    channel: MuseChannel,
+    seen_reasoning: bool,
+}
+
+#[derive(Default)]
+enum MuseChannel {
+    #[default]
+    Text,
+    Reasoning,
+    Ignore,
+}
+
+impl MuseChannelExtractor {
+    fn push(&mut self, text: &str) -> (String, String) {
+        self.buf.push_str(text);
+        let (mut content, mut reasoning) = (String::new(), String::new());
+        loop {
+            let first = [MUSE_REASONING, MUSE_TEXT]
+                .iter()
+                .filter_map(|marker| self.buf.find(marker).map(|position| (position, *marker)))
+                .min_by_key(|(position, _)| *position);
+            let Some((position, marker)) = first else {
+                let hold = [MUSE_REASONING, MUSE_TEXT]
+                    .iter()
+                    .map(|marker| holdback_len(&self.buf, marker))
+                    .max()
+                    .unwrap_or(0);
+                let tail = self.buf.split_off(self.buf.len() - hold);
+                let before = std::mem::replace(&mut self.buf, tail);
+                match self.channel {
+                    MuseChannel::Text => content.push_str(&before),
+                    MuseChannel::Reasoning => reasoning.push_str(&before),
+                    MuseChannel::Ignore => {}
+                }
+                return (content, reasoning);
+            };
+            let before = self.buf[..position].to_string();
+            self.buf = self.buf[position + marker.len()..].to_string();
+            match self.channel {
+                MuseChannel::Text => content.push_str(&before),
+                MuseChannel::Reasoning => reasoning.push_str(&before),
+                MuseChannel::Ignore => {}
+            }
+            self.channel = if marker == MUSE_REASONING {
+                self.seen_reasoning = true;
+                MuseChannel::Reasoning
+            } else if self.seen_reasoning {
+                MuseChannel::Ignore
+            } else {
+                MuseChannel::Text
+            };
+        }
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        let rest = std::mem::take(&mut self.buf);
+        self.seen_reasoning = false;
+        match std::mem::replace(&mut self.channel, MuseChannel::Text) {
+            MuseChannel::Text => (rest, String::new()),
+            MuseChannel::Reasoning => (String::new(), rest),
+            MuseChannel::Ignore => (String::new(), String::new()),
+        }
+    }
+}
+
+enum ReasoningExtractor {
+    Think(ThinkExtractor),
+    Muse(MuseChannelExtractor),
+}
+
+impl ReasoningExtractor {
+    fn push(&mut self, text: &str) -> (String, String) {
+        match self {
+            Self::Think(extractor) => extractor.push(text),
+            Self::Muse(extractor) => extractor.push(text),
+        }
+    }
+
+    fn finish(&mut self) -> (String, String) {
+        match self {
+            Self::Think(extractor) => extractor.finish(),
+            Self::Muse(extractor) => extractor.finish(),
+        }
+    }
+}
+
 impl ThinkExtractor {
     /// Returns (content_text, reasoning_text) safe to surface now.
     fn push(&mut self, text: &str) -> (String, String) {
@@ -332,27 +430,31 @@ impl ThinkExtractor {
 /// tool-call parser. Content order is preserved; reasoning never reaches the
 /// tool parser (Hermes markers inside a think block stay reasoning).
 pub struct OutputParser {
-    think: ThinkExtractor,
+    reasoning: ReasoningExtractor,
     tool: Box<dyn ToolCallParser>,
 }
 
 impl OutputParser {
     pub fn new(kind: ToolParserKind) -> Self {
         Self {
-            think: ThinkExtractor::default(),
+            reasoning: if kind == ToolParserKind::Muse {
+                ReasoningExtractor::Muse(MuseChannelExtractor::default())
+            } else {
+                ReasoningExtractor::Think(ThinkExtractor::default())
+            },
             tool: kind.instantiate(),
         }
     }
 
     pub fn push(&mut self, text: &str) -> ParseStep {
-        let (content, reasoning) = self.think.push(text);
+        let (content, reasoning) = self.reasoning.push(text);
         let mut step = self.tool.push(&content);
         step.reasoning.push_str(&reasoning);
         step
     }
 
     pub fn finish(&mut self) -> ParseStep {
-        let (content, reasoning) = self.think.finish();
+        let (content, reasoning) = self.reasoning.finish();
         let mut step = self.tool.push(&content);
         step.merge(self.tool.finish());
         step.reasoning.push_str(&reasoning);
@@ -602,6 +704,36 @@ mod tests {
     }
 
     #[test]
+    fn muse_channels_are_chunk_safe() {
+        let mut p = OutputParser::new(ToolParserKind::Muse);
+        let step = drain(
+            &mut p,
+            &[
+                "Wstęp.assistant to=se",
+                "lfukryte rozumowanie.assistant to=us",
+                "erOdpowiedź dla użytkownika.",
+            ],
+        );
+        assert_eq!(step.reasoning, "ukryte rozumowanie.");
+        assert_eq!(step.text, "Wstęp.");
+        assert!(step.calls.is_empty());
+    }
+
+    #[test]
+    fn muse_ignores_user_channel_after_reasoning() {
+        let mut p = OutputParser::new(ToolParserKind::Muse);
+        let step = drain(
+            &mut p,
+            &[
+                "Pierwsza odpowiedź.assistant to=selfukryte",
+                " rozumowanie.assistant to=userPowtórzona odpowiedź.",
+            ],
+        );
+        assert_eq!(step.text, "Pierwsza odpowiedź.");
+        assert_eq!(step.reasoning, "ukryte rozumowanie.");
+    }
+
+    #[test]
     fn parser_resolution_rules() {
         // Explicit override is unconditional, even on a tool-less template.
         assert_eq!(
@@ -644,6 +776,10 @@ mod tests {
         assert_eq!(
             ToolParserKind::resolve(None, "gemma", "{% if tools %}{% endif %}").unwrap(),
             ToolParserKind::None
+        );
+        assert_eq!(
+            ToolParserKind::resolve(None, "muse_glimmer", "plain template").unwrap(),
+            ToolParserKind::Muse
         );
     }
 }

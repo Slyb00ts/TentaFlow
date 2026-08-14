@@ -1,18 +1,18 @@
 # =============================================================================
 # Plik: embeddings/python/nemotron-embed-vl/bundle.toml
 # Opis: NVIDIA Llama-Nemotron Embed VL jako natywny python-bundle — vLLM (PyPI
-#       pinned 0.26.0) serwowany w trybie embeddings multimodalnych
+#       pinned 0.27.0) serwowany w trybie embeddings multimodalnych
 #       (--task embed). Model liczy embeddingi z tekstu i obrazow. CUDA (cu130)
 #       oraz ROCm (rocm7.0). Eksponuje OpenAI-compatible /v1/embeddings.
 # =============================================================================
 
 [bundle]
 engine = "nemotron-embed-vl"
-description = "NVIDIA Llama-Nemotron Embed VL (multimodal) via vLLM (PyPI, pinned 0.26.0, --task embed)"
+description = "NVIDIA Llama-Nemotron Embed VL (multimodal) via vLLM (PyPI, pinned 0.27.0, --task embed)"
 python_version = "3.12"
-# Pinned na 0.26.0 dla reproducibility — git main moze rozjechac sie z deps.
+# Pinned na 0.27.0 dla reproducibility — git main moze rozjechac sie z deps.
 source = "pypi"
-pypi_package = "vllm==0.26.0"
+pypi_package = "vllm==0.27.0"
 
 [launch]
 command = "python"
@@ -50,6 +50,6 @@ extras = []
 
 [[install_variants]]
 backend = "rocm"
-extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extra_index = "https://wheels.vllm.ai/rocm/"
 extras = []
 install_hint = "VLLM_TARGET_DEVICE=rocm"

@@ -18,6 +18,7 @@ mod llama;
 mod olmoe;
 mod qwen3;
 mod qwen35;
+mod muse_glimmer;
 
 /// Czym model się przedstawia. Pochodzi z metadanych GGUF, a nie z nazwy pliku —
 /// plik bywa przemianowany, metadane nie.
@@ -106,6 +107,7 @@ fn registry() -> Vec<ProfileEntry> {
     all.extend(qwen35::entries());
     all.extend(olmoe::entries());
     all.extend(deepseek_v4::entries());
+    all.extend(muse_glimmer::entries());
     // Llama na końcu: jest najszerszy i nie może przykryć profili szczegółowych
     // dzielących z nim `gguf_arch` (Bielik, Mistral).
     all.extend(llama::entries());
@@ -152,7 +154,10 @@ pub fn identify(path: &std::path::Path) -> ModelIdentity {
         .or_else(|| gguf.get_str("general.name"))
         .unwrap_or_default();
     ModelIdentity {
-        arch: gguf.get_str("general.architecture").unwrap_or_default().to_string(),
+        arch: gguf
+            .get_str("general.architecture")
+            .unwrap_or_default()
+            .to_string(),
         name: name.to_string(),
     }
 }
@@ -201,7 +206,9 @@ mod tests {
     #[test]
     fn gemma_ogranicza_kontekst() {
         // Pełne okno Gemmy 4 każe pulom zażądać ponad 100 GB VRAM.
-        assert!(resolve(&id("gemma4", "gemma-4-12B-it")).default_ctx.is_some());
+        assert!(resolve(&id("gemma4", "gemma-4-12B-it"))
+            .default_ctx
+            .is_some());
     }
 
     #[test]
@@ -219,5 +226,16 @@ mod tests {
             );
             assert!(!p.label.is_empty());
         }
+    }
+
+    #[test]
+    fn muse_glimmer_uses_model_card_defaults() {
+        let muse = resolve(&id("muse-glimmer", "Muse Glimmer Hf"));
+        assert_eq!(muse.label, "muse_glimmer");
+        assert_eq!(muse.temperature, 1.0);
+        assert_eq!(muse.top_p, 0.95);
+        assert_eq!(muse.top_k, 64);
+        assert!(muse.chat_template);
+        assert_eq!(muse.stop, &["<|eot|>"]);
     }
 }

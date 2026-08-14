@@ -12,8 +12,8 @@ use std::sync::Arc;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::SeqSampleParams;
 use forge_engine::weights::NvFp4CtLayoutPolicy;
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use serde_json::json;
 
@@ -87,10 +87,8 @@ impl Metrics {
         let (reference_top1, reference_top2) = top2(reference);
         let (candidate_top1, candidate_top2) = top2(candidate);
         self.top1_matches += usize::from(reference_top1 == candidate_top1);
-        self.reference_margin_sum +=
-            (reference[reference_top1] - reference[reference_top2]) as f64;
-        self.candidate_margin_sum +=
-            (candidate[candidate_top1] - candidate[candidate_top2]) as f64;
+        self.reference_margin_sum += (reference[reference_top1] - reference[reference_top2]) as f64;
+        self.candidate_margin_sum += (candidate[candidate_top1] - candidate[candidate_top2]) as f64;
         self.kl_sum += kl_divergence(reference, candidate);
     }
 
@@ -130,14 +128,8 @@ fn top2(values: &[f32]) -> (usize, usize) {
 }
 
 fn kl_divergence(reference: &[f32], candidate: &[f32]) -> f64 {
-    let reference_max = reference
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max) as f64;
-    let candidate_max = candidate
-        .iter()
-        .copied()
-        .fold(f32::NEG_INFINITY, f32::max) as f64;
+    let reference_max = reference.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
+    let candidate_max = candidate.iter().copied().fold(f32::NEG_INFINITY, f32::max) as f64;
     let reference_sum = reference
         .iter()
         .map(|&value| ((value as f64) - reference_max).exp())
@@ -153,8 +145,7 @@ fn kl_divergence(reference: &[f32], candidate: &[f32]) -> f64 {
         .zip(candidate)
         .map(|(&left, &right)| {
             let log_probability = left as f64 - reference_log_z;
-            log_probability.exp()
-                * (log_probability - (right as f64 - candidate_log_z))
+            log_probability.exp() * (log_probability - (right as f64 - candidate_log_z))
         })
         .sum()
 }
@@ -181,7 +172,11 @@ fn read_prompts() -> Vec<Vec<u32>> {
         .iter()
         .map(|name| {
             let bytes = fs::read(Path::new(PROMPT_DIR).join(name)).expect("odczyt promptu");
-            assert_eq!(bytes.len(), 1024 * 4, "prompt {name} ma nieprawidłowy rozmiar");
+            assert_eq!(
+                bytes.len(),
+                1024 * 4,
+                "prompt {name} ma nieprawidłowy rozmiar"
+            );
             bytes
                 .chunks_exact(4)
                 .map(|chunk| u32::from_le_bytes(chunk.try_into().unwrap()))
@@ -193,9 +188,7 @@ fn read_prompts() -> Vec<Vec<u32>> {
 fn output_dir() -> PathBuf {
     std::env::var_os("FORGE_BM16_AUDIT_DIR")
         .map(PathBuf::from)
-        .unwrap_or_else(|| {
-            PathBuf::from("/home/critix/.cache/tentaflow-profiles/nvfp4-bm16-audit")
-        })
+        .unwrap_or_else(|| PathBuf::from("/home/critix/.cache/tentaflow-profiles/nvfp4-bm16-audit"))
 }
 
 fn load_bielik(batch: usize, layout: NvFp4CtLayoutPolicy) -> Model {
@@ -245,7 +238,11 @@ fn load_bielik(batch: usize, layout: NvFp4CtLayoutPolicy) -> Model {
     .model
 }
 
-fn prefill_serial(model: &mut Model, seq: &mut forge_engine::kv::SeqKv, prompt: &[u32]) -> Vec<f32> {
+fn prefill_serial(
+    model: &mut Model,
+    seq: &mut forge_engine::kv::SeqKv,
+    prompt: &[u32],
+) -> Vec<f32> {
     let chunks = prompt.chunks(128).collect::<Vec<_>>();
     for chunk in &chunks[..chunks.len() - 1] {
         model
@@ -354,8 +351,9 @@ fn run_candidate(prompts: &[Vec<u32>], directory: &Path, batch: usize) {
     )
     .expect("format metadanych");
     let vocab = metadata["vocab"].as_u64().expect("vocab") as usize;
-    let mut reference =
-        BufReader::new(File::open(directory.join("row-b1-logits.f32le")).expect("logity referencji"));
+    let mut reference = BufReader::new(
+        File::open(directory.join("row-b1-logits.f32le")).expect("logity referencji"),
+    );
     let mut model = load_bielik(batch, NvFp4CtLayoutPolicy::S0N64K128);
     let params = vec![greedy_params(); batch];
     let mut metrics = Metrics::default();
@@ -389,9 +387,7 @@ fn run_candidate(prompts: &[Vec<u32>], directory: &Path, batch: usize) {
             model
                 .batched_decode(&mut refs, &tokens, &params)
                 .expect("teacher-forced BM16 decode");
-            let logits = model
-                .read_batch_logits(batch)
-                .expect("pełne logity BM16");
+            let logits = model.read_batch_logits(batch).expect("pełne logity BM16");
             for lane in 0..batch {
                 read_reference_row(
                     &mut reference,
@@ -422,13 +418,7 @@ fn run_candidate(prompts: &[Vec<u32>], directory: &Path, batch: usize) {
                 if first_divergences[prompt].is_none()
                     && current[lane] != continuations[prompt][step]
                 {
-                    read_reference_row(
-                        &mut reference,
-                        prompt,
-                        step,
-                        vocab,
-                        &mut reference_row,
-                    );
+                    read_reference_row(&mut reference, prompt, step, vocab, &mut reference_row);
                     let candidate_row = &free_logits[lane * vocab..(lane + 1) * vocab];
                     let (reference_top1, reference_top2) = top2(&reference_row);
                     let (candidate_top1, candidate_top2) = top2(candidate_row);
@@ -560,7 +550,8 @@ fn nvfp4_bm32_zgadza_sie_z_bm16_i_obiema_polowkami_kafla() {
 
     for lane in 0..16 {
         assert_eq!(
-            wide[lane], wide[lane + 16],
+            wide[lane],
+            wide[lane + 16],
             "połówki kafla BM32 rozjechały się na lane {lane}"
         );
         assert_eq!(

@@ -81,9 +81,8 @@ impl ExpertSpill {
             .write(true)
             .open(&path)
             .map_err(|e| ForgeError::Device(format!("nie mogę otworzyć zrzutu {path:?}: {e}")))?;
-        std::fs::remove_file(&path).map_err(|e| {
-            ForgeError::Device(format!("nie mogę odlinkować zrzutu {path:?}: {e}"))
-        })?;
+        std::fs::remove_file(&path)
+            .map_err(|e| ForgeError::Device(format!("nie mogę odlinkować zrzutu {path:?}: {e}")))?;
         Ok(Self {
             file,
             path,

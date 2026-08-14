@@ -18,7 +18,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 /// Nazwy tensorów z indeksu safetensors, bez sufiksów skal — te są własnością
@@ -35,12 +37,7 @@ fn checkpoint_tensors(dir: &PathBuf) -> HashSet<String> {
 }
 
 /// Sufiksy towarzyszące wadze kwantyzowanej; opis modelu wskazuje samą wagę.
-const QUANT_SUFFIXES: &[&str] = &[
-    ".scale",
-    ".weight_scale",
-    ".weight_scale_2",
-    ".input_scale",
-];
+const QUANT_SUFFIXES: &[&str] = &[".scale", ".weight_scale", ".weight_scale_2", ".input_scale"];
 
 fn is_quant_sidecar(name: &str) -> bool {
     QUANT_SUFFIXES.iter().any(|suffix| name.ends_with(suffix))
@@ -66,10 +63,7 @@ fn expected_names(desc: &ModelDescriptor, n_experts: usize) -> HashMap<String, W
         for (role, template) in layer {
             if template.contains("{expert}") {
                 for expert in 0..n_experts {
-                    out.insert(
-                        template.replace("{expert}", &expert.to_string()),
-                        *role,
-                    );
+                    out.insert(template.replace("{expert}", &expert.to_string()), *role);
                 }
             } else {
                 out.insert(template.clone(), *role);
@@ -86,7 +80,11 @@ fn every_role_resolves_to_a_real_tensor() {
         return;
     };
     let desc = descriptor(&dir);
-    let moe = desc.params.moe.as_ref().expect("DeepSeek V4 jest modelem MoE");
+    let moe = desc
+        .params
+        .moe
+        .as_ref()
+        .expect("DeepSeek V4 jest modelem MoE");
     let present = checkpoint_tensors(&dir);
     let expected = expected_names(&desc, moe.n_experts);
 
@@ -109,7 +107,11 @@ fn every_checkpoint_tensor_has_a_role() {
         return;
     };
     let desc = descriptor(&dir);
-    let moe = desc.params.moe.as_ref().expect("DeepSeek V4 jest modelem MoE");
+    let moe = desc
+        .params
+        .moe
+        .as_ref()
+        .expect("DeepSeek V4 jest modelem MoE");
     let expected = expected_names(&desc, moe.n_experts);
     let present = checkpoint_tensors(&dir);
 
@@ -199,7 +201,8 @@ fn compressor_and_indexer_follow_compress_ratios() {
 
     for layer in 0..config.num_hidden_layers {
         let ratio = ratios[layer];
-        let has_compressor = present.contains(&format!("layers.{layer}.attn.compressor.wkv.weight"));
+        let has_compressor =
+            present.contains(&format!("layers.{layer}.attn.compressor.wkv.weight"));
         assert_eq!(
             has_compressor,
             ratio != 0,

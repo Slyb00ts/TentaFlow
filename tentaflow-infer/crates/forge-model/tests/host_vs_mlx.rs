@@ -61,11 +61,17 @@ fn the_host_reference_decodes_the_same_tokens_as_mlx_lm() {
 
         // Token jest jedyną liczbą, która wychodzi z modelu na zewnątrz.
         assert_eq!(
-            ours[0], theirs[0],
+            ours[0],
+            theirs[0],
             "krok {}: inny token; nasza piątka {ours:?}, MLX {theirs:?}",
             step + 1
         );
-        assert_eq!(ours[..3], theirs[..3], "krok {}: kolejność czołówki", step + 1);
+        assert_eq!(
+            ours[..3],
+            theirs[..3],
+            "krok {}: kolejność czołówki",
+            step + 1
+        );
 
         // Próg skalibrowany, nie wybrany: na TEJ SAMEJ wyroczni ścieżka
         // Metalowa daje 2,71% w pierwszym kroku i 1,21% w drugim, bo pierwszy

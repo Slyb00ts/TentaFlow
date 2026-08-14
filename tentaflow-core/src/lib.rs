@@ -37,7 +37,11 @@ pub mod sync;
 pub mod tts;
 pub mod vision;
 pub mod vision_models;
-#[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
+#[cfg(all(
+    unix,
+    feature = "camera",
+    feature = "inference-vision-gpu"
+))]
 pub mod vision_worker;
 pub mod web_research;
 

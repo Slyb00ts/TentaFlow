@@ -98,7 +98,11 @@ fn dequant_gemv_matches_mlx_on_real_weights() {
     let source = msl::qmv_affine_source(msl::Bits::Four, scale_dtype, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_name(msl::Bits::Four, scale_dtype, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(
+            msl::Bits::Four,
+            scale_dtype,
+            OutDtype::F32,
+        ))
         .unwrap();
     let stream = dev.create_stream().unwrap();
 
@@ -147,8 +151,14 @@ fn dequant_gemv_matches_mlx_on_real_weights() {
         // mantysy, a kernel liczy bez tego zaokrąglenia. Porównanie z MLX
         // mierzyłoby więc głównie stratę wyroczni. Wymagamy, żeby kernel był
         // wobec prawdy NIE GORSZY niż ścieżka MLX.
-        let mlx_err = rel_l2_f64(&c.y_mlx.iter().map(|v| *v as f64).collect::<Vec<_>>(), &c.y_true);
-        let kernel_err = rel_l2_f64(&got.iter().map(|v| *v as f64).collect::<Vec<_>>(), &c.y_true);
+        let mlx_err = rel_l2_f64(
+            &c.y_mlx.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+            &c.y_true,
+        );
+        let kernel_err = rel_l2_f64(
+            &got.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+            &c.y_true,
+        );
         let cos = cosine(&got, &c.y_mlx);
 
         assert!(
@@ -192,7 +202,11 @@ fn a_wrong_group_size_is_visible_in_the_result() {
     let source = msl::qmv_affine_source(msl::Bits::Four, ScaleDtype::Bf16, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_name(msl::Bits::Four, ScaleDtype::Bf16, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(
+            msl::Bits::Four,
+            ScaleDtype::Bf16,
+            OutDtype::F32,
+        ))
         .unwrap();
     let stream = dev.create_stream().unwrap();
 
@@ -237,7 +251,10 @@ fn a_wrong_group_size_is_visible_in_the_result() {
         .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
         .collect();
     let (rel_l2, cos) = (
-        rel_l2_f64(&got.iter().map(|v| *v as f64).collect::<Vec<_>>(), &c.y_true),
+        rel_l2_f64(
+            &got.iter().map(|v| *v as f64).collect::<Vec<_>>(),
+            &c.y_true,
+        ),
         cosine(&got, &c.y_mlx),
     );
     assert!(
@@ -285,7 +302,9 @@ fn six_bit_gemv_agrees_with_the_cpu_reference() {
     const GROUP: usize = 16;
 
     // Kody 0..63, skale i przesunięcia w f16 — jak po konwersji z Q6_K.
-    let codes: Vec<u8> = (0..ROWS * COLS).map(|i| ((i * 7 + 11) % 64) as u8).collect();
+    let codes: Vec<u8> = (0..ROWS * COLS)
+        .map(|i| ((i * 7 + 11) % 64) as u8)
+        .collect();
     let groups = ROWS * COLS / GROUP;
     let scales: Vec<half::f16> = (0..groups)
         .map(|i| half::f16::from_f32(0.002 + (i % 5) as f32 * 0.0003))
@@ -320,7 +339,11 @@ fn six_bit_gemv_agrees_with_the_cpu_reference() {
     let source = msl::qmv_affine_source(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32);
     let module = dev.load_module(source.as_bytes()).unwrap();
     let kernel = module
-        .kernel(&msl::qmv_affine_name(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(
+            msl::Bits::Six,
+            ScaleDtype::F16,
+            OutDtype::F32,
+        ))
         .unwrap();
     let stream = dev.create_stream().unwrap();
     let up = |b: &[u8]| {
@@ -328,7 +351,9 @@ fn six_bit_gemv_agrees_with_the_cpu_reference() {
         dev.write(b, &buf, 0).unwrap();
         buf
     };
-    let out = dev.alloc(ROWS * 4, MemKind::Device, Pool::Activations).unwrap();
+    let out = dev
+        .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
     dev.launch(
         &kernel,
         &LaunchConfig {

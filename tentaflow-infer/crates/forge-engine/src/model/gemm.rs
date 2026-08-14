@@ -68,8 +68,47 @@ impl Model {
         if cols > Kernels::DP4A_MAX_COLS {
             return Ok(false);
         }
-        self.kernels
-            .gemv_q4_k_dp4a_group_f16(&group, x, cols, stream)
+        if self.device.caps().vendor == Vendor::Amd
+            && self.device.caps().arch == "gfx1201"
+            && matches!(
+                self.q4k_decode_model_family(),
+                forge_kernels::Q4kDecodeModelFamily::Bielik
+            )
+            && cols == 4096
+            && projections.iter().all(|(_, weight)| {
+                matches!(
+                    weight,
+                    DevWeight::Q4K {
+                        rows: 11_264,
+                        cols: 4096,
+                        ..
+                    }
+                )
+            })
+        {
+            let mut prepared = self.kernels.prepare_q8_1(x, cols, 1, stream)?;
+            for &(output, weight) in projections {
+                let DevWeight::Q4K { buf, rows, .. } = weight else {
+                    return Ok(false);
+                };
+                self.kernels.gemv_q4_k_dp4a_prepared_f16(
+                    output,
+                    buf,
+                    0,
+                    &mut prepared,
+                    *rows,
+                    cols,
+                )?;
+            }
+            return Ok(true);
+        }
+        self.kernels.gemv_q4_k_dp4a_group_f16(
+            &group,
+            x,
+            cols,
+            self.q4k_decode_model_family(),
+            stream,
+        )
     }
 
     /// Grupa projekcji o RÓŻNYCH formatach — jedno uruchomienie.
@@ -181,6 +220,7 @@ impl Model {
         // liczą się aktywacje, a nie wybór tokena.
         if let Some(tp) = &self.tp_ffn {
             if tp.forward_logits(stream, x, y_f32)? {
+                self.postprocess_logits(y_f32, 0, self.weights.lm_head.rows(), stream)?;
                 return Ok(());
             }
         }
@@ -197,13 +237,7 @@ impl Model {
         stream: &Stream,
     ) -> Result<()> {
         self.gemv_out_f32(y_f32, y_off, x, x_off, weight, stream)?;
-        // Ograniczenie logitów (Gemma): cap * tanh(x / cap). Nakładane tutaj, bo
-        // to jedyne wyjście głowy — sampling i logprob widzą już wartości po capie.
-        let cap = self.weights.descriptor.params.final_logit_softcap;
-        if cap > 0.0 {
-            self.kernels
-                .softcap_f32(y_f32, y_off, weight.rows(), cap, stream)?;
-        }
+        self.postprocess_logits(y_f32, y_off, weight.rows(), stream)?;
         // Maska tokenów zabronionych: kopie stream-ordered z jednoelementowego
         // bufora -inf, więc mieszczą się w przechwytywanym grafie decode.
         if let Some(neg_inf) = &self.weights.neg_inf {
@@ -213,6 +247,26 @@ impl Model {
                     self.device.copy(neg_inf, 0, y_f32, slot * 4, 4, stream)?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn postprocess_logits(
+        &self,
+        y_f32: &DevBuffer,
+        y_off: usize,
+        n: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let scale = self.weights.descriptor.params.logit_scale;
+        if scale != 1.0 {
+            self.kernels.scale_f32(y_f32, y_off, n, scale, stream)?;
+        }
+        // Ograniczenie logitów (Gemma): cap * tanh(x / cap). Nakładane tutaj, bo
+        // to jedyne wyjście głowy — sampling i logprob widzą już wartości po capie.
+        let cap = self.weights.descriptor.params.final_logit_softcap;
+        if cap > 0.0 {
+            self.kernels.softcap_f32(y_f32, y_off, n, cap, stream)?;
         }
         Ok(())
     }
@@ -637,32 +691,43 @@ impl Model {
         n_tokens: usize,
         stream: &Stream,
     ) -> Result<()> {
-        match &self.weights.lm_head {
-            DevWeight::F16 { buf, rows, cols } => self
-                .kernels
-                .gemm_f16_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
-            DevWeight::Q8_0 { buf, rows, cols } if (2..=8).contains(&n_tokens) => self
-                .kernels
-                .gemm_q8_0_f16_exact_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
-            DevWeight::Q8_0 { buf, rows, cols } => self
-                .kernels
-                .gemm_q8_0_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream),
+        let rows = self.weights.lm_head.rows();
+        let batch_needs_postprocess = match &self.weights.lm_head {
+            DevWeight::F16 { buf, rows, cols } => {
+                self.kernels
+                    .gemm_f16_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream)?;
+                true
+            }
+            DevWeight::Q8_0 { buf, rows, cols } if (2..=8).contains(&n_tokens) => {
+                self.kernels.gemm_q8_0_f16_exact_out_f32_at(
+                    y_f32, buf, 0, x, *rows, *cols, n_tokens, stream,
+                )?;
+                true
+            }
+            DevWeight::Q8_0 { buf, rows, cols } => {
+                self.kernels
+                    .gemm_q8_0_out_f32_at(y_f32, buf, 0, x, *rows, *cols, n_tokens, stream)?;
+                true
+            }
             DevWeight::NvFp4Gguf {
                 buf,
                 output_scale,
                 rows,
                 cols,
                 layout: Nvfp4GgufLayout::RowMajor36,
-            } if matches!(n_tokens, 2 | 4 | 8 | 16) => self.kernels.gemm_nvfp4_gguf_out_f32_batch(
-                y_f32,
-                buf,
-                x,
-                *rows,
-                *cols,
-                n_tokens,
-                *output_scale,
-                stream,
-            ),
+            } if matches!(n_tokens, 2 | 4 | 8 | 16) => {
+                self.kernels.gemm_nvfp4_gguf_out_f32_batch(
+                    y_f32,
+                    buf,
+                    x,
+                    *rows,
+                    *cols,
+                    n_tokens,
+                    *output_scale,
+                    stream,
+                )?;
+                true
+            }
             // Q6_K ma batchowy przemiat z wyjściem f32: jeden odczyt wag na
             // cały batch. Q4_K głowy go nie ma, więc zostaje przy przemiatnięciu
             // per token (patrz niżej).
@@ -687,6 +752,9 @@ impl Model {
                     }
                     done += 8;
                 }
+                if done > 0 {
+                    self.postprocess_logits(y_f32, 0, done * *rows, stream)?;
+                }
                 for lane in done..n_tokens {
                     self.logits_weight_gemv(
                         y_f32,
@@ -697,20 +765,22 @@ impl Model {
                         stream,
                     )?;
                 }
-                Ok(())
+                false
             }
             DevWeight::Q6K { buf, rows, cols }
                 if self.kernels.gemv_q6_k_dp4a_batch_out_f32_at(
                     y_f32, 0, buf, 0, x, 0, *rows, *cols, n_tokens, stream,
                 )? =>
             {
-                Ok(())
+                true
             }
             // Pozostałe głowy K-kwantowe nie mają batchowego GEMM-a out-f32;
             // przemiat dp4a per token zostawia resztę kroku batchowego bez
             // zmian (głowa to jeden odczyt wag na token, stos warstw nadal jest
             // amortyzowany po batchu).
-            w @ (DevWeight::Q4K { rows, cols, .. } | DevWeight::Q6K { rows, cols, .. }) => {
+            w @ (DevWeight::Q4K { rows, cols, .. }
+            | DevWeight::Q5K { rows, cols, .. }
+            | DevWeight::Q6K { rows, cols, .. }) => {
                 for lane in 0..n_tokens {
                     self.logits_weight_gemv(
                         y_f32,
@@ -721,11 +791,17 @@ impl Model {
                         stream,
                     )?;
                 }
-                Ok(())
+                false
             }
-            _ => Err(ForgeError::Unsupported(
-                "batchowa głowa logitów nie obsługuje tego formatu ani szerokości".into(),
-            )),
+            _ => {
+                return Err(ForgeError::Unsupported(
+                    "batchowa głowa logitów nie obsługuje tego formatu ani szerokości".into(),
+                ));
+            }
+        };
+        if batch_needs_postprocess {
+            self.postprocess_logits(y_f32, 0, n_tokens * rows, stream)?;
         }
+        Ok(())
     }
 }

@@ -716,6 +716,8 @@ pub struct AttnWeights {
     /// Gemma normalizuje V czystą normą RMS, bez wyuczonej wagi. Trzymamy tu
     /// wektor jedynek zamiast osobnego kernela bez wagi — wynik jest ten sam.
     pub v_norm: Option<DevBuffer>,
+    /// Optional separate sigmoid gate used by Muse Glimmer.
+    pub attn_gate: Option<DevWeight>,
     pub attn_qkv: QkvWeights,
     pub attn_o: DevWeight,
 }
@@ -2984,9 +2986,29 @@ fn fetch_embedding_host(
             *value *= output_scale;
         }
     }
-    let f16s = f32s.iter().map(|&v| f16::from_f32(v)).collect();
+    let f16s = f32s_to_f16_parallel(&f32s);
     let weight = quant_host_weight(name, data, dtype, quant, rows, cols, output_scale)?;
     Ok((f16s, weight, rows, cols))
+}
+
+fn f32s_to_f16_parallel(values: &[f32]) -> Vec<f16> {
+    const MIN_PARALLEL_VALUES: usize = 1 << 20;
+    let workers = std::thread::available_parallelism().map_or(1, usize::from);
+    if values.len() < MIN_PARALLEL_VALUES || workers < 2 {
+        return values.iter().map(|&value| f16::from_f32(value)).collect();
+    }
+    let chunk_len = values.len().div_ceil(workers);
+    let mut output = vec![f16::ZERO; values.len()];
+    std::thread::scope(|scope| {
+        for (input, output) in values.chunks(chunk_len).zip(output.chunks_mut(chunk_len)) {
+            scope.spawn(move || {
+                for (source, target) in input.iter().zip(output) {
+                    *target = f16::from_f32(*source);
+                }
+            });
+        }
+    });
+    output
 }
 
 /// Upload the embedding table as f16 regardless of storage quant.
@@ -3305,10 +3327,10 @@ impl ModelWeights {
                 shard_host_weight(q, &plan(WeightRole::AttnQ)?)?,
                 shard_host_weight(k, &plan(WeightRole::AttnK)?)?,
             );
-            // Brak projekcji V oznacza wariant, w którym V = K (warstwy
-            // globalne Gemmy 4); wtedy fuzja bierze K drugi raz.
-            let v = if p.has_v_proj(idx) {
-                let v = fetch_matrix(src, name(WeightRole::AttnV)?)?;
+            // Brak tensora V oznacza wariant, w którym V = K (warstwy
+            // globalne Gemmy 4); geometria uwagi nie wystarcza do tej decyzji.
+            let v = if let Some(v_name) = layer_map.get(&WeightRole::AttnV) {
+                let v = fetch_matrix(src, v_name)?;
                 expect(&at("attn_v"), &v, kv_dim, p.hidden_size)?;
                 shard_host_weight(v, &plan(WeightRole::AttnV)?)?
             } else {
@@ -3540,6 +3562,15 @@ impl ModelWeights {
                         )?)
                     } else {
                         None
+                    },
+                    attn_gate: match layer_map.get(&WeightRole::AttnGate) {
+                        Some(n) => Some(upload_target_weight(
+                            device,
+                            fetch_matrix(src, n)?,
+                            target_tile,
+                            nvfp4_ct,
+                        )?),
+                        None => None,
                     },
                     attn_qkv,
                     attn_o: upload_target_weight(device, attn_o, target_tile, nvfp4_ct)?,
@@ -3788,10 +3819,23 @@ impl ModelWeights {
                         target_tile,
                         nvfp4_ct,
                     )?;
+                    let attn_gate = descriptor
+                        .layers[idx]
+                        .get(&WeightRole::AttnGate)
+                        .map(|_| {
+                            upload_target_weight(
+                                device,
+                                sharded(WeightRole::AttnGate)?,
+                                target_tile,
+                                nvfp4_ct,
+                            )
+                        })
+                        .transpose()?;
                     LayerMixer::Attention(Box::new(AttnWeights {
                         q_norm: Some(upload_norm(device, src, name(WeightRole::AttnQNorm)?)?),
                         k_norm: Some(upload_norm(device, src, name(WeightRole::AttnKNorm)?)?),
                         v_norm: None,
+                        attn_gate,
                         attn_qkv: QkvWeights::Split { q, k, v },
                         attn_o,
                     }))
@@ -4300,6 +4344,21 @@ impl ModelWeights {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parallel_embedding_f16_conversion_matches_serial_for_tails() {
+        for len in [0usize, 1, 31, 32, 1_048_575, 1_048_576, 1_048_577] {
+            let values: Vec<f32> = (0..len)
+                .map(|index| f32::from_bits((index as u32).wrapping_mul(0x9e37_79b9)))
+                .collect();
+            let serial: Vec<f16> = values.iter().map(|&value| f16::from_f32(value)).collect();
+            let parallel = f32s_to_f16_parallel(&values);
+            assert!(parallel
+                .iter()
+                .zip(&serial)
+                .all(|(left, right)| left.to_bits() == right.to_bits()), "length {len}");
+        }
+    }
     use forge_formats::source::{Fp8Host, NvFp4Host, TensorFetch};
 
     struct Nvfp4EmbeddingSource {

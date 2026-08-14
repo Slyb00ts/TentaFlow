@@ -85,7 +85,13 @@ pub fn make_nvfp4_gguf(rows: usize, cols: usize) -> Vec<u8> {
     }
     weights
 }
-pub fn nvfp4_gguf_dot(weights: &[u8], row: usize, cols: usize, x: &[f32], output_scale: f32) -> f32 {
+pub fn nvfp4_gguf_dot(
+    weights: &[u8],
+    row: usize,
+    cols: usize,
+    x: &[f32],
+    output_scale: f32,
+) -> f32 {
     let blocks_per_row = cols / 64;
     let row_base = row * blocks_per_row * 36;
     let mut sum = 0.0f32;

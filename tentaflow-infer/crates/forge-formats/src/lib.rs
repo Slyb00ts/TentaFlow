@@ -5,20 +5,20 @@
 // bounds-checked with checked arithmetic and parse failures surface as
 // `ForgeError::Format` — never panics.
 
+pub mod affine;
 pub mod arch;
+pub mod checkpoint;
 pub mod deltanet;
 pub mod dequant;
-pub mod affine;
-pub mod checkpoint;
 pub mod gguf;
-pub mod mlx_source;
-pub mod source;
 pub mod hf_config;
 pub mod iq_tables;
 pub mod mlx;
+pub mod mlx_source;
 pub mod mxfp4;
 pub mod nvfp4;
 pub mod safetensors;
+pub mod source;
 pub mod speculation_manifest;
 pub mod w4a8;
 

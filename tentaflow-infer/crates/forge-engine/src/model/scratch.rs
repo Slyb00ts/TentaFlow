@@ -188,5 +188,4 @@ impl Model {
         }
         device.copy(pinned, 0, dev, 0, bytes.len(), stream)
     }
-
 }

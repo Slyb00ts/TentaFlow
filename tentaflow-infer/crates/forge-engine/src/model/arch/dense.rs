@@ -17,6 +17,25 @@ fn pre_residual_norm(
 }
 
 impl Model {
+    fn normalize_muse_embedding(
+        &self,
+        embedding: &DevBuffer,
+        rows: usize,
+        hidden: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        if self.weights.descriptor.arch == "muse_glimmer" {
+            self.kernels.rmsnorm_weightless_f16(
+                embedding,
+                embedding,
+                rows,
+                hidden,
+                self.weights.descriptor.params.rms_norm_eps,
+                stream,
+            )?;
+        }
+        Ok(())
+    }
 
     /// Nieliniowość bramkowanego FFN tego modelu.
     pub(crate) fn ffn_act(&self) -> forge_formats::FfnActivation {
@@ -174,12 +193,11 @@ impl Model {
                     &self.stream,
                 )?;
                 self.device.synchronize()?;
-                let lp = self
-                    .bufs
-                    .pinned_logits
-                    .host_ptr()
-                    .expect("pinned buffer has host mapping")
-                    as *const f32;
+                let lp =
+                    self.bufs
+                        .pinned_logits
+                        .host_ptr()
+                        .expect("pinned buffer has host mapping") as *const f32;
                 last_logits = unsafe { std::slice::from_raw_parts(lp, vocab) }.to_vec();
             }
         }
@@ -399,6 +417,7 @@ impl Model {
                 hidden,
                 stream,
             )?;
+            self.normalize_muse_embedding(&pb.h, rows, hidden, stream)?;
         }
         // Rodzina Gemma mnoży embedding przez sqrt(hidden). Norma RMS jest na
         // to niewrażliwa, ale strumień rezydualny już nie — bez tego wyjście
@@ -477,22 +496,21 @@ impl Model {
             // buffers — same weight bytes, no second copy in VRAM.
             // Format wag i uklad QKV rozstrzygniete raz; dalej trzy identyczne
             // wywolania zamiast dwunastu kombinacji rozpisanych recznie.
-            let projs = self.qkv_projections(
-                layer,
-                w4a8_layer,
-                fp8_layer,
-                fp8_ffn_layer,
-                q_dim,
-                kv_dim,
-            );
+            let projs =
+                self.qkv_projections(layer, w4a8_layer, fp8_layer, fp8_ffn_layer, q_dim, kv_dim);
             let shared_act = fp8mod_fuse || fp8mod_ffn_fuse;
             self.project(&pb.q, &projs[0], &pb.x, rows, shared_act, stream)?;
             self.project(&pb.k, &projs[1], &pb.x, rows, shared_act, stream)?;
             self.project(&pb.v, &projs[2], &pb.x, rows, shared_act, stream)?;
 
+            if let Some(gate) = layer.attn().attn_gate.as_ref() {
+                self.gemm(&pb.o_out, gate, &pb.x, rows, stream)?;
+            }
+
             if l == 0 {
                 self.trace_f16("Qcur-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
                 self.trace_f16("Kcur-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
+                self.trace_f16("Vcur-0", &pb.v, (rows - 1) * kv_dim * 2, kv_dim);
             }
             trace.mark(self.device.as_ref(), "gemm_qkv");
 
@@ -568,29 +586,25 @@ impl Model {
                 }
             }
 
-            kernels.rope_neox_f16(
-                &pb.q,
-                &pb.positions,
-                t,
-                p.n_heads,
-                head_dim,
-                p.rope_theta_at(l),
-                self.rope_freqs_at(&p, l),
-                stream,
-            )?;
-            kernels.rope_neox_f16(
-                &pb.k,
-                &pb.positions,
-                t,
-                n_kv_heads,
-                head_dim,
-                p.rope_theta_at(l),
-                self.rope_freqs_at(&p, l),
-                stream,
-            )?;
+            if l == 0 {
+                self.trace_f16("Qnorm-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
+                self.trace_f16("Knorm-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
+            }
+
+            if p.uses_rope_at(l) {
+                kernels.rope_neox_f16(&pb.q, &pb.positions, t, p.n_heads, head_dim, p.rope_theta_at(l), self.rope_freqs_at(&p, l), stream)?;
+                kernels.rope_neox_f16(&pb.k, &pb.positions, t, n_kv_heads, head_dim, p.rope_theta_at(l), self.rope_freqs_at(&p, l), stream)?;
+            }
             if l == 0 {
                 self.trace_f16("Qrope-0", &pb.q, (rows - 1) * q_dim * 2, q_dim);
                 self.trace_f16("Krope-0", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
+                self.trace_f16("Qrope-all-0", &pb.q, 0, rows * q_dim);
+                self.trace_f16("Krope-all-0", &pb.k, 0, rows * kv_dim);
+                self.trace_f16("Vcur-all-0", &pb.v, 0, rows * kv_dim);
+            }
+            if l == 1 {
+                self.trace_f16("Qrope-1", &pb.q, (rows - 1) * q_dim * 2, q_dim);
+                self.trace_f16("Krope-1", &pb.k, (rows - 1) * kv_dim * 2, kv_dim);
             }
             trace.mark(self.device.as_ref(), "norm_rope");
 
@@ -861,6 +875,16 @@ impl Model {
                 )?;
             }
 
+            if layer.attn().attn_gate.is_some() {
+                self.kernels.sigmoid_mul_f16(
+                    &pb.attn_out,
+                    &pb.attn_out,
+                    &pb.o_out,
+                    rows * q_dim,
+                    stream,
+                )?;
+            }
+
             // Calibration capture 2/4: o_proj input (attention output).
             if let Some(cal) = calib.as_mut() {
                 self.device.synchronize()?;
@@ -910,6 +934,7 @@ impl Model {
                     &layer.ffn_norm,
                     rows,
                     hidden,
+                    p.post_norm_eps,
                     eps,
                     stream,
                 )?;
@@ -957,6 +982,10 @@ impl Model {
                         }
                     }
                     trace.mark(self.device.as_ref(), "gemm_gateup");
+                    if l == 1 {
+                        self.trace_f16("ffn_gate-1", &pb.gate, (rows - 1) * inter * 2, inter);
+                        self.trace_f16("ffn_up-1", &pb.up, (rows - 1) * inter * 2, inter);
+                    }
                     // SwiGLU + kwantyzacja jednym kernelem, gdy wynik i tak
                     // trafia do projekcji FP8: wtedy bufor posredni [T, inter]
                     // nie jedzie trzy razy przez HBM. Kalibracja czyta `pb.act`,
@@ -976,6 +1005,9 @@ impl Model {
                         )?;
                     }
                     trace.mark(self.device.as_ref(), "silu");
+                    if l == 1 {
+                        self.trace_f16("ffn_act-1", &pb.act, (rows - 1) * inter * 2, inter);
+                    }
                     // Calibration capture 4/4: down_proj input (SwiGLU output).
                     if let Some(cal) = calib.as_mut() {
                         self.device.synchronize()?;
@@ -1022,7 +1054,7 @@ impl Model {
                     &pb.down,
                     rows,
                     hidden,
-                    eps,
+                    p.post_norm_eps,
                     stream,
                 )?;
                 kernels.rmsnorm_residual_fp8_shared(
@@ -1046,6 +1078,7 @@ impl Model {
                     next_norm,
                     rows,
                     hidden,
+                    p.post_norm_eps,
                     eps,
                     stream,
                 )?;
@@ -1267,6 +1300,7 @@ impl Model {
             hidden,
             stream,
         )?;
+        self.normalize_muse_embedding(&b.h, 1, hidden, stream)?;
         kernels.rmsnorm_f16(
             &b.x,
             &b.h,
@@ -1311,28 +1345,30 @@ impl Model {
                             &b.qkv, k_byte_off, kn, n_kv_heads, head_dim, eps, stream,
                         )?;
                     }
-                    kernels.rope_neox_f16_at(
-                        &b.qkv,
-                        0,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        head_dim,
-                        p.rope_theta_at(l),
-                        self.rope_freqs_at(&p, l),
-                        stream,
-                    )?;
-                    kernels.rope_neox_f16_at(
-                        &b.qkv,
-                        k_byte_off,
-                        &b.pos,
-                        1,
-                        n_kv_heads,
-                        head_dim,
-                        p.rope_theta_at(l),
-                        self.rope_freqs_at(&p, l),
-                        stream,
-                    )?;
+                    if p.uses_rope_at(l) {
+                        kernels.rope_neox_f16_at(
+                            &b.qkv,
+                            0,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            head_dim,
+                            p.rope_theta_at(l),
+                            self.rope_freqs_at(&p, l),
+                            stream,
+                        )?;
+                        kernels.rope_neox_f16_at(
+                            &b.qkv,
+                            k_byte_off,
+                            &b.pos,
+                            1,
+                            n_kv_heads,
+                            head_dim,
+                            p.rope_theta_at(l),
+                            self.rope_freqs_at(&p, l),
+                            stream,
+                        )?;
+                    }
                     (&b.qkv, 0, &b.qkv, k_byte_off, &b.qkv, v_byte_off)
                 }
                 QkvWeights::FusedQk { qk, v } => {
@@ -1346,28 +1382,30 @@ impl Model {
                             &b.qkv, k_byte_off, kn, n_kv_heads, head_dim, eps, stream,
                         )?;
                     }
-                    kernels.rope_neox_f16_at(
-                        &b.qkv,
-                        0,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        head_dim,
-                        p.rope_theta_at(l),
-                        self.rope_freqs_at(&p, l),
-                        stream,
-                    )?;
-                    kernels.rope_neox_f16_at(
-                        &b.qkv,
-                        k_byte_off,
-                        &b.pos,
-                        1,
-                        n_kv_heads,
-                        head_dim,
-                        p.rope_theta_at(l),
-                        self.rope_freqs_at(&p, l),
-                        stream,
-                    )?;
+                    if p.uses_rope_at(l) {
+                        kernels.rope_neox_f16_at(
+                            &b.qkv,
+                            0,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            head_dim,
+                            p.rope_theta_at(l),
+                            self.rope_freqs_at(&p, l),
+                            stream,
+                        )?;
+                        kernels.rope_neox_f16_at(
+                            &b.qkv,
+                            k_byte_off,
+                            &b.pos,
+                            1,
+                            n_kv_heads,
+                            head_dim,
+                            p.rope_theta_at(l),
+                            self.rope_freqs_at(&p, l),
+                            stream,
+                        )?;
+                    }
                     (&b.qkv, 0, &b.qkv, k_byte_off, &b.v, 0)
                 }
                 QkvWeights::Split { q, k, v } => {
@@ -1380,26 +1418,28 @@ impl Model {
                     if let Some(kn) = &layer.attn().k_norm {
                         kernels.rmsnorm_f16(&b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream)?;
                     }
-                    kernels.rope_neox_f16(
-                        &b.q,
-                        &b.pos,
-                        1,
-                        p.n_heads,
-                        head_dim,
-                        p.rope_theta_at(l),
-                        self.rope_freqs_at(&p, l),
-                        stream,
-                    )?;
-                    kernels.rope_neox_f16(
-                        &b.k,
-                        &b.pos,
-                        1,
-                        n_kv_heads,
-                        head_dim,
-                        p.rope_theta_at(l),
-                        self.rope_freqs_at(&p, l),
-                        stream,
-                    )?;
+                    if p.uses_rope_at(l) {
+                        kernels.rope_neox_f16(
+                            &b.q,
+                            &b.pos,
+                            1,
+                            p.n_heads,
+                            head_dim,
+                            p.rope_theta_at(l),
+                            self.rope_freqs_at(&p, l),
+                            stream,
+                        )?;
+                        kernels.rope_neox_f16(
+                            &b.k,
+                            &b.pos,
+                            1,
+                            n_kv_heads,
+                            head_dim,
+                            p.rope_theta_at(l),
+                            self.rope_freqs_at(&p, l),
+                            stream,
+                        )?;
+                    }
                     if let Some(vn) = &layer.attn().v_norm {
                         kernels.rmsnorm_f16(&b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream)?;
                     }
@@ -1517,6 +1557,7 @@ impl Model {
                 &layer.ffn_norm,
                 1,
                 hidden,
+                p.post_norm_eps,
                 eps,
                 stream,
             )?;
@@ -1557,6 +1598,7 @@ impl Model {
                 next_norm,
                 1,
                 hidden,
+                p.post_norm_eps,
                 eps,
                 stream,
             )?;
@@ -1605,6 +1647,10 @@ impl Model {
         let stream = &self.stream;
         let b = &self.bufs;
         let layer = &self.weights.layers[l];
+
+        if let Some(gate) = layer.attn().attn_gate.as_ref() {
+            self.gemv(&b.o_out, gate, &b.x, stream)?;
+        }
         // Geometria bywa różna per warstwa (Gemma 4), więc szerokości i
         // offsety sekcji scalonego q|k|v muszą być liczone W PĘTLI —
         // policzone raz dla całego modelu wskazywały poza bufor warstwy.
@@ -1617,6 +1663,8 @@ impl Model {
         // decode buffer (q occupies rows 0..q_dim, so its offset is 0).
         let k_byte_off = q_dim * 2;
         let v_byte_off = (q_dim + kv_dim) * 2;
+        let apply_rope = p.uses_rope_at(l);
+        let rope_theta = if apply_rope { p.rope_theta_at(l) } else { 1.0 };
 
         // Fused layers project q|k|v with ONE GEMV into one buffer,
         // then qkv_post fuses the whole q/k-norm + RoPE + kv-append
@@ -1646,7 +1694,8 @@ impl Model {
                     head_dim,
                     self.kv.cfg.page_size,
                     eps,
-                    p.rope_theta_at(l),
+                    rope_theta,
+                    apply_rope,
                     stream,
                 )?;
                 &b.qkv
@@ -1677,7 +1726,8 @@ impl Model {
                     head_dim,
                     self.kv.cfg.page_size,
                     eps,
-                    p.rope_theta_at(l),
+                    rope_theta,
+                    apply_rope,
                     stream,
                 )?;
                 &b.qkv
@@ -1690,48 +1740,47 @@ impl Model {
                 match (aw.q_norm.as_ref(), aw.k_norm.as_ref(), aw.v_norm.as_ref()) {
                     (Some(qn), Some(kn), Some(vn)) => {
                         kernels.rmsnorm_qkv_f16(
-                            &b.q, &b.k, &b.v, qn, kn, vn, p.n_heads, n_kv_heads, head_dim,
-                            eps, stream,
+                            &b.q, &b.k, &b.v, qn, kn, vn, p.n_heads, n_kv_heads, head_dim, eps,
+                            stream,
                         )?;
                     }
                     _ => {
                         if let Some(qn) = aw.q_norm.as_ref() {
-                            kernels.rmsnorm_f16(
-                                &b.q, &b.q, qn, p.n_heads, head_dim, eps, stream,
-                            )?;
+                            kernels
+                                .rmsnorm_f16(&b.q, &b.q, qn, p.n_heads, head_dim, eps, stream)?;
                         }
                         if let Some(kn) = aw.k_norm.as_ref() {
-                            kernels.rmsnorm_f16(
-                                &b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream,
-                            )?;
+                            kernels
+                                .rmsnorm_f16(&b.k, &b.k, kn, n_kv_heads, head_dim, eps, stream)?;
                         }
                         if let Some(vn) = aw.v_norm.as_ref() {
-                            kernels.rmsnorm_f16(
-                                &b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream,
-                            )?;
+                            kernels
+                                .rmsnorm_f16(&b.v, &b.v, vn, n_kv_heads, head_dim, eps, stream)?;
                         }
                     }
                 }
-                kernels.rope_neox_f16(
-                    &b.q,
-                    &b.pos,
-                    1,
-                    p.n_heads,
-                    head_dim,
-                    p.rope_theta_at(l),
-                    self.rope_freqs_at(&p, l),
-                    stream,
-                )?;
-                kernels.rope_neox_f16(
-                    &b.k,
-                    &b.pos,
-                    1,
-                    p.n_kv_heads_at(l),
-                    head_dim,
-                    p.rope_theta_at(l),
-                    self.rope_freqs_at(&p, l),
-                    stream,
-                )?;
+                if p.uses_rope_at(l) {
+                    kernels.rope_neox_f16(
+                        &b.q,
+                        &b.pos,
+                        1,
+                        p.n_heads,
+                        head_dim,
+                        p.rope_theta_at(l),
+                        self.rope_freqs_at(&p, l),
+                        stream,
+                    )?;
+                    kernels.rope_neox_f16(
+                        &b.k,
+                        &b.pos,
+                        1,
+                        p.n_kv_heads_at(l),
+                        head_dim,
+                        p.rope_theta_at(l),
+                        self.rope_freqs_at(&p, l),
+                        stream,
+                    )?;
+                }
                 kernels.kv_append_f16(
                     &self.kv.k[self.target_kv_layer(l)],
                     &self.kv.v[self.target_kv_layer(l)],
@@ -1801,6 +1850,11 @@ impl Model {
             }
         }
 
+        if layer.attn().attn_gate.is_some() {
+            self.kernels
+                .sigmoid_mul_f16(&b.attn_out, &b.attn_out, &b.o_out, q_dim, stream)?;
+        }
+
         self.row_parallel_gemv(&b.o_out, &layer.attn().attn_o, &b.attn_out, stream)?;
         Ok(())
     }
@@ -1825,6 +1879,7 @@ impl Model {
             &layer.ffn_norm,
             1,
             hidden,
+            p.post_norm_eps,
             eps,
             stream,
         )?;
@@ -1890,6 +1945,7 @@ impl Model {
             next_norm,
             1,
             hidden,
+            p.post_norm_eps,
             eps,
             stream,
         )?;
@@ -1913,6 +1969,7 @@ impl Model {
                 hidden,
                 stream,
             )?;
+            self.normalize_muse_embedding(&b.h, 1, hidden, stream)?;
             // Skalowanie embeddingu (rodzina Gemma) — jak w prefillu.
             if let Some(factor) = p.embd_scale {
                 kernels.scale_f16(&b.h, hidden, factor, stream)?;
@@ -1985,6 +2042,7 @@ impl Model {
             hidden,
             stream,
         )?;
+        self.normalize_muse_embedding(&b.h, 1, hidden, stream)?;
 
         self.trace_f16("embd", &b.h, 0, hidden);
 
@@ -2014,7 +2072,14 @@ impl Model {
             // through a buffer and a byte offset.
             let (q_buf, q_off, k_buf, k_off, v_buf, v_off) = match &layer.attn().attn_qkv {
                 QkvWeights::Fused(w_qkv) => {
-                    self.decode_project_normed(&b.qkv, w_qkv, &layer.attn_norm, l == 0, eps, stream)?;
+                    self.decode_project_normed(
+                        &b.qkv,
+                        w_qkv,
+                        &layer.attn_norm,
+                        l == 0,
+                        eps,
+                        stream,
+                    )?;
                     if l == 0 {
                         self.trace_f16("Qcur-0", &b.qkv, 0, q_dim);
                     }
@@ -2463,7 +2528,7 @@ impl Model {
         let bb = self.batch_bufs.as_ref().expect("provisioned");
         self.device
             .copy(&bb.out_ids, 0, &bb.pinned_out, 0, b * 4, &self.stream)?;
-        self.device.synchronize()?;
+        self.stream.synchronize()?;
         let op = bb.pinned_out.host_ptr().expect("pinned mapping") as *const i32;
         let ids = unsafe { std::slice::from_raw_parts(op, b) };
         let mut out = vec![0u32; b];
@@ -2675,5 +2740,4 @@ impl Model {
         };
         Ok((out, final_id))
     }
-
 }

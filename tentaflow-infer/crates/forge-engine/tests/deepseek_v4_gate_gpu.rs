@@ -24,7 +24,9 @@ fn checkpoint_dir() -> Option<PathBuf> {
     let dir = std::env::var("FORGE_DEEPSEEK_V4_DIR")
         .unwrap_or_else(|_| "/mnt/d/models/nvidia_DeepSeek-V4-Flash-NVFP4".to_string());
     let dir = PathBuf::from(dir);
-    dir.join("model.safetensors.index.json").is_file().then_some(dir)
+    dir.join("model.safetensors.index.json")
+        .is_file()
+        .then_some(dir)
 }
 
 /// Ze zrzutu oracle'a bierzemy wejście bramki oraz oczekiwane indeksy i wagi.
@@ -51,7 +53,8 @@ fn load_oracle() -> Option<Oracle> {
         head[3] as usize,
     );
     let (gate_layer, topk) = (head[5] as usize, head[6] as usize);
-    let mut at = 72 + (seqlen * dim + seqlen * 1024 + seqlen * n_heads * head_dim + seqlen * head_dim) * 4;
+    let mut at =
+        72 + (seqlen * dim + seqlen * 1024 + seqlen * n_heads * head_dim + seqlen * head_dim) * 4;
     let gate_x: Vec<f32> = bytes[at..at + seqlen * dim * 4]
         .chunks_exact(4)
         .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
@@ -143,10 +146,18 @@ fn gate_matches_the_reference_implementation() {
     });
 
     let ids = dev
-        .alloc(oracle.seqlen * oracle.topk * 4, MemKind::Device, Pool::Activations)
+        .alloc(
+            oracle.seqlen * oracle.topk * 4,
+            MemKind::Device,
+            Pool::Activations,
+        )
         .unwrap();
     let weights = dev
-        .alloc(oracle.seqlen * oracle.topk * 4, MemKind::Device, Pool::Activations)
+        .alloc(
+            oracle.seqlen * oracle.topk * 4,
+            MemKind::Device,
+            Pool::Activations,
+        )
         .unwrap();
 
     kernels

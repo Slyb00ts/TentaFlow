@@ -1,6 +1,6 @@
 # =============================================================================
 # Plik: reranker/python/jina-rerank/bundle.toml
-# Opis: jina-reranker-v3 jako natywny bundle vLLM (PyPI, pinned 0.26.0). vLLM
+# Opis: jina-reranker-v3 jako natywny bundle vLLM (PyPI, pinned 0.27.0). vLLM
 #       serwuje reranker w trybie score i wystawia OpenAI-compatible /v1/rerank +
 #       /v1/score. CUDA (cu130) i ROCm (rocm7.0). v3 jest listwise — zweryfikuj
 #       jakosc rankingu po deployu (patrz naglowek manifestu jina-rerank.toml).
@@ -8,10 +8,10 @@
 
 [bundle]
 engine = "jina-rerank"
-description = "jina-reranker-v3 via vLLM (PyPI, pinned 0.26.0, --task score)"
+description = "jina-reranker-v3 via vLLM (PyPI, pinned 0.27.0, --task score)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "vllm==0.26.0"
+pypi_package = "vllm==0.27.0"
 
 [launch]
 command = "python"
@@ -43,6 +43,6 @@ extras = []
 
 [[install_variants]]
 backend = "rocm"
-extra_index = "https://download.pytorch.org/whl/rocm7.0"
+extra_index = "https://wheels.vllm.ai/rocm/"
 extras = []
 install_hint = "VLLM_TARGET_DEVICE=rocm"

@@ -65,6 +65,7 @@ pub struct VisionWorkerConfig {
 pub async fn run_vision_worker(cfg: VisionWorkerConfig) -> Result<()> {
     // GPU pin FIRST — before anything can resolve the process-wide vision GPU
     // set. Programmatic init (no environment): a late pin fails loudly.
+    #[cfg(feature = "vision-ort")]
     crate::vision::ort_common::init_vision_gpu_set(&[cfg.gpu]).context("pin vision GPU set")?;
 
     info!(
@@ -330,12 +331,12 @@ fn build_local_executor(
 
 /// Detector pool size across the ort/Burn handle shapes (see
 /// `vision_analysis::DetectorHandle`).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn detector_pool_size(handle: &vision_analysis::DetectorHandle) -> usize {
     handle.pool_size()
 }
 
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn detector_pool_size(handle: &vision_analysis::DetectorHandle) -> usize {
     handle
         .lock()

@@ -354,7 +354,15 @@ fn measure_gemv(
             &stream,
         ),
         QuantKind::Q8_0 => kernels.gemv_q8_0_dp4a_f16(&y, &weights, &x, ROWS, COLS, &stream),
-        QuantKind::Q4K => kernels.gemv_q4_k_dp4a_f16(&y, &weights, &x, ROWS, COLS, &stream),
+        QuantKind::Q4K => kernels.gemv_q4_k_dp4a_f16(
+            &y,
+            &weights,
+            &x,
+            ROWS,
+            COLS,
+            forge_kernels::Q4kDecodeModelFamily::Any,
+            &stream,
+        ),
         _ => unreachable!("format odrzucony wyżej"),
     };
     for _ in 0..WARMUP {

@@ -105,7 +105,11 @@ pub fn agrees(what: &str, got: &[f32], want: &[f32], bound: f64) {
     let err = spread_error(got, want);
     let ours = top_k(got, 5);
     let theirs = top_k(want, 5);
-    eprintln!("{what}: {:.3}% rozpiętości, argmax {}", err * 100.0, ours[0]);
+    eprintln!(
+        "{what}: {:.3}% rozpiętości, argmax {}",
+        err * 100.0,
+        ours[0]
+    );
 
     assert_eq!(ours[0], theirs[0], "{what}: inny token");
 

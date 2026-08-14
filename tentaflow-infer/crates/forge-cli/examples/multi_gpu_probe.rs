@@ -6,7 +6,7 @@
 // Uruchom oba, zeby zobaczyc, ze jeden staly probe nie opisuje obu przypadkow.
 //
 //   cargo run --release -p forge-cli --features hip --example multi_gpu_probe -- q4k
-use forge_engine::multi_gpu::{MIN_USEFUL_ROWS, calibrate, plan_split, WorkKind};
+use forge_engine::multi_gpu::{calibrate, plan_split, WorkKind, MIN_USEFUL_ROWS};
 use forge_hal::PoolSizes;
 use forge_kernels::Kernels;
 use forge_types::QuantKind;
@@ -30,7 +30,10 @@ fn main() {
     for ordinal in 0..2 {
         devices.push(forge_hal::gpu::open(ordinal, pools).expect("otwarcie karty"));
     }
-    let kernels: Vec<Kernels> = devices.iter().map(|d| Kernels::load(d.clone()).expect("artefakty")).collect();
+    let kernels: Vec<Kernels> = devices
+        .iter()
+        .map(|d| Kernels::load(d.clone()).expect("artefakty"))
+        .collect();
     let caps = calibrate(&devices, &kernels, quant).expect("kalibracja");
     for (index, cap) in caps.iter().enumerate() {
         println!(
@@ -51,6 +54,10 @@ fn main() {
             .iter()
             .map(|r| format!("{:.1}%", 100.0 * *r as f64 / 17408.0))
             .collect();
-        println!("{label:12}: {:?} wierszy = {}", plan.rows, shares.join(" / "));
+        println!(
+            "{label:12}: {:?} wierszy = {}",
+            plan.rows,
+            shares.join(" / ")
+        );
     }
 }

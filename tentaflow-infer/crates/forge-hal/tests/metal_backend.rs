@@ -93,8 +93,13 @@ fn launches_a_kernel_through_the_trait() {
         .buf(&input)
         .scalar(3.0f32)
         .scalar(n as u32);
-    dev.launch(&kernel, &LaunchConfig::linear(n as u32, 256), &args, &stream)
-        .unwrap();
+    dev.launch(
+        &kernel,
+        &LaunchConfig::linear(n as u32, 256),
+        &args,
+        &stream,
+    )
+    .unwrap();
     stream.synchronize().unwrap();
 
     let got = read_f32(dev.as_ref(), &output, n);
@@ -137,19 +142,27 @@ fn a_sub_buffer_addresses_a_window_of_its_parent() {
     let Some(dev) = device() else { return };
     let n = 16usize;
     let parent = dev.alloc(n * 4, MemKind::Device, Pool::Weights).unwrap();
-    write_f32(dev.as_ref(), &parent, &(0..n).map(|i| i as f32).collect::<Vec<_>>());
+    write_f32(
+        dev.as_ref(),
+        &parent,
+        &(0..n).map(|i| i as f32).collect::<Vec<_>>(),
+    );
 
     let child = dev.sub_buffer(&parent, 8 * 4, 8 * 4).unwrap();
     assert_eq!(child.len(), 32);
-    assert_eq!(read_f32(dev.as_ref(), &child, 8), vec![
-        8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0
-    ]);
+    assert_eq!(
+        read_f32(dev.as_ref(), &child, 8),
+        vec![8.0, 9.0, 10.0, 11.0, 12.0, 13.0, 14.0, 15.0]
+    );
 
     // Zapis przez dziecko musi być widoczny w rodzicu — to ta sama pamięć.
     write_f32(dev.as_ref(), &child, &[100.0]);
     assert_eq!(read_f32(dev.as_ref(), &parent, n)[8], 100.0);
 
-    assert!(dev.sub_buffer(&parent, 8 * 4, 9 * 4).is_err(), "poza zakresem");
+    assert!(
+        dev.sub_buffer(&parent, 8 * 4, 9 * 4).is_err(),
+        "poza zakresem"
+    );
 }
 
 #[test]
@@ -158,7 +171,11 @@ fn a_buffer_argument_can_start_at_an_offset() {
     let n = 8usize;
     let input = dev.alloc(n * 4, MemKind::Device, Pool::Weights).unwrap();
     let output = dev.alloc(n * 4, MemKind::Device, Pool::Weights).unwrap();
-    write_f32(dev.as_ref(), &input, &(0..n).map(|i| i as f32).collect::<Vec<_>>());
+    write_f32(
+        dev.as_ref(),
+        &input,
+        &(0..n).map(|i| i as f32).collect::<Vec<_>>(),
+    );
 
     let module = dev.load_module(SRC.as_bytes()).unwrap();
     let kernel = module.kernel("scale_add").unwrap();
@@ -221,7 +238,11 @@ fn unsupported_paths_say_so_instead_of_pretending() {
     let module = dev.load_module(SRC.as_bytes()).unwrap();
     let kernel = module.kernel("scale_add").unwrap();
     let buf = dev.alloc(64, MemKind::Device, Pool::Weights).unwrap();
-    let args = LaunchArgs::new().buf(&buf).buf(&buf).scalar(1.0f32).scalar(1u32);
+    let args = LaunchArgs::new()
+        .buf(&buf)
+        .buf(&buf)
+        .scalar(1.0f32)
+        .scalar(1u32);
 
     let two_d = LaunchConfig {
         grid: (1, 2, 1),

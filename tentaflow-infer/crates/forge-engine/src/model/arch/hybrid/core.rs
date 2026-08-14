@@ -45,15 +45,12 @@ impl Model {
                 ForgeError::Scheduler("ranga podziału nie ma puli stanów DeltaNet".into())
             })?;
             if fresh {
-                let mirrored = pool.acquire()?;
-                if mirrored != lease {
-                    return Err(ForgeError::Scheduler(format!(
-                        "ranga {} wzięła inny slot stanu DeltaNet niż ranga zerowa",
-                        index + 1
-                    )));
-                }
+                let mirrored = pool.acquire_exact_slot(lease.slot)?;
+                pool.activate(mirrored, &rank.stream)?;
+                continue;
             }
-            pool.activate(lease, &rank.stream)?;
+            let mirrored = pool.lease_for_slot(lease.slot)?;
+            pool.activate(mirrored, &rank.stream)?;
         }
         // Borrowed prefix: the pages are already attached, and this is where the
         // recurrent half of that prefix lands. It runs after `activate`, whose
@@ -153,25 +150,16 @@ impl Model {
             ForgeError::Unsupported("arena layer-major wymaga parametrów SSM".into())
         })?;
         let device_bytes = hybrid_layer_major_scratch_estimate(shape, cap)?;
-        let required = device_bytes
-            .checked_add(HYBRID_PREFILL_ACTIVATION_RESERVE)
-            .ok_or_else(|| ForgeError::Scheduler("przepełnienie budżetu layer-major".into()))?;
+        let required = hybrid_layer_major_activation_required(shape, cap)?;
         let available = self
             .device
             .pool_available(Pool::Activations)
             .ok_or_else(|| {
                 ForgeError::Unsupported("backend nie raportuje budżetu areny layer-major".into())
             })?;
-        let reclaimable = self
-            .hybrid_layer_major_bufs
-            .as_ref()
-            .map_or(0, |bufs| bufs.device_bytes);
-        let effective_available = available.checked_add(reclaimable).ok_or_else(|| {
-            ForgeError::Scheduler("przepełnienie dostępnego budżetu layer-major".into())
-        })?;
-        if required > effective_available {
+        if required > available {
             return Err(ForgeError::Unsupported(format!(
-                "arena layer-major wymaga {required} bajtów, dostępne {effective_available}"
+                "arena layer-major wymaga {required} bajtów, dostępne {available}"
             )));
         }
         drop(self.hybrid_layer_major_bufs.take());
@@ -749,7 +737,12 @@ impl Model {
         self.gemm(y, w, x, n_rows, &self.stream)
     }
 
-    pub(crate) fn hybrid_delta_mixer(&self, l: usize, d: &DeltaNetWeights, lane: usize) -> Result<()> {
+    pub(crate) fn hybrid_delta_mixer(
+        &self,
+        l: usize,
+        d: &DeltaNetWeights,
+        lane: usize,
+    ) -> Result<()> {
         let p = &self.weights.descriptor.params;
         let ssm = p.ssm.as_ref().expect("hybrid has ssm params");
         let eps = p.rms_norm_eps;
@@ -935,7 +928,10 @@ impl Model {
         self.hybrid_project(out, &d.out_proj, &hb.normed, n_rows)
     }
 
-    pub(crate) fn checkpoint_hybrid_layer_major(&self, seq: &SeqKv) -> Result<HybridLayerMajorCheckpoint> {
+    pub(crate) fn checkpoint_hybrid_layer_major(
+        &self,
+        seq: &SeqKv,
+    ) -> Result<HybridLayerMajorCheckpoint> {
         let verifier = self.hybrid_verify_bufs.as_ref().ok_or_else(|| {
             ForgeError::Scheduler("layer-major nie ma workspace verifiera do rollbacku".into())
         })?;
@@ -1132,5 +1128,4 @@ impl Model {
         }
         restore_result
     }
-
 }

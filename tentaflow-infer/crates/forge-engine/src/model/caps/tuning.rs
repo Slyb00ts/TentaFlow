@@ -1,6 +1,10 @@
 // ===== File: model/tuning.rs — progi strojenia rozstrzygane kaskadą =====
 use super::super::*;
 
+fn is_bielik_q4k_identity(arch: &str, name: &str, tensor_parallel: bool, moe: bool) -> bool {
+    arch == "llama" && name.to_ascii_lowercase().contains("bielik") && !tensor_parallel && !moe
+}
+
 /// Pokrętło, którego wartość zależy JEDNOCZEŚNIE od modelu i od karty.
 ///
 /// Nie każda stała tutaj należy. Kształt kernela (liczba warpów, szerokość
@@ -130,6 +134,42 @@ const RULES: &[Rule] = &[
 ];
 
 impl Model {
+    pub fn set_gguf_identity(&mut self, name: &str) {
+        self.q4k_decode_model =
+            if is_bielik_q4k_identity(&self.weights.descriptor.arch, name, false, false) {
+                forge_kernels::Q4kDecodeModelFamily::Bielik
+            } else {
+                forge_kernels::Q4kDecodeModelFamily::Dense
+            };
+    }
+
+    pub(crate) fn q4k_decode_model_family(&self) -> forge_kernels::Q4kDecodeModelFamily {
+        let tensor_parallel = self.tp.is_some() || self.tp_ffn.is_some();
+        let moe = self
+            .weights
+            .layers
+            .iter()
+            .any(|layer| matches!(layer.ffn, crate::weights::LayerFfn::Moe(_)));
+        if tensor_parallel || moe {
+            return forge_kernels::Q4kDecodeModelFamily::Dense;
+        }
+        if self.weights.descriptor.arch == "qwen35" {
+            return forge_kernels::Q4kDecodeModelFamily::Qwen35;
+        }
+        if matches!(
+            self.q4k_decode_model,
+            forge_kernels::Q4kDecodeModelFamily::Bielik
+        ) {
+            return forge_kernels::Q4kDecodeModelFamily::Bielik;
+        }
+        match self.model_class() {
+            ModelClass::HybridBatch => forge_kernels::Q4kDecodeModelFamily::Any,
+            ModelClass::MoeGrouped | ModelClass::SmallBatch | ModelClass::TokenTile => {
+                forge_kernels::Q4kDecodeModelFamily::Dense
+            }
+        }
+    }
+
     fn model_class(&self) -> ModelClass {
         if self.hybrid_batch_capable() {
             return ModelClass::HybridBatch;
@@ -185,7 +225,10 @@ mod tests {
             DeviceScope::Arch("sm_121a").specificity(),
             DeviceScope::Card("GB10").specificity(),
         ];
-        assert!(order.windows(2).all(|w| w[0] < w[1]), "kolejność: {order:?}");
+        assert!(
+            order.windows(2).all(|w| w[0] < w[1]),
+            "kolejność: {order:?}"
+        );
     }
 
     #[test]
@@ -202,5 +245,43 @@ mod tests {
             assert!(hit, "{class:?} nie ma progu batcha");
         }
         assert!(RULES.iter().any(|r| r.knob == Knob::MaxDecodeGroup));
+    }
+
+    #[test]
+    fn bielik_identity_accepts_only_the_exact_dense_single_gpu_route() {
+        assert!(is_bielik_q4k_identity(
+            "llama",
+            "Bielik-11B-v3.0",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn bielik_gguf_basename_selects_bielik_family() {
+        assert!(is_bielik_q4k_identity(
+            "llama",
+            "bielik-7b-Q4_K_M.gguf",
+            false,
+            false
+        ));
+    }
+
+    #[test]
+    fn bielik_identity_rejects_other_llama_and_parallel_or_moe_routes() {
+        assert!(!is_bielik_q4k_identity(
+            "llama",
+            "Mistral-11B",
+            false,
+            false
+        ));
+        assert!(!is_bielik_q4k_identity("llama", "Bielik-11B", true, false));
+        assert!(!is_bielik_q4k_identity("llama", "Bielik-11B", false, true));
+        assert!(!is_bielik_q4k_identity(
+            "qwen35",
+            "Bielik-11B",
+            false,
+            false
+        ));
     }
 }

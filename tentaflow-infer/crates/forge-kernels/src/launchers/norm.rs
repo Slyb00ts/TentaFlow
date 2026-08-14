@@ -45,6 +45,40 @@ impl Kernels {
         self.device.launch(k, &cfg, &args, stream)
     }
 
+    pub fn rmsnorm_weightless_f16(
+        &self,
+        out: &DevBuffer,
+        x: &DevBuffer,
+        rows: usize,
+        cols: usize,
+        eps: f32,
+        stream: &Stream,
+    ) -> Result<()> {
+        if rows == 0 || cols == 0 {
+            return Err(ForgeError::Kernel(
+                "rmsnorm_weightless_f16: niepoprawny kształt".into(),
+            ));
+        }
+        let bytes = checked_buffer_bytes("rmsnorm_weightless_f16", &[rows, cols], 2)?;
+        if out.len() < bytes || x.len() < bytes {
+            return Err(ForgeError::Kernel(
+                "rmsnorm_weightless_f16: zbyt mały bufor".into(),
+            ));
+        }
+        let k = self.artifacts.get("rmsnorm_weightless_f16")?;
+        let cfg = LaunchConfig {
+            grid: (rows as u32, 1, 1),
+            block: (norm_block(rows, cols), 1, 1),
+            shared_mem_bytes: 0,
+        };
+        let args = LaunchArgs::new()
+            .buf(out)
+            .buf(x)
+            .scalar(cols as i64)
+            .scalar(eps);
+        self.device.launch(k, &cfg, &args, stream)
+    }
+
     /// `rmsnorm_f16` over a section of a fused buffer, addressed by byte offset
     /// (in/out share the slice). Used by the rot decode path to normalize the
     /// q/k slices of a fused qkv buffer in place.

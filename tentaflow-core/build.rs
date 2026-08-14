@@ -357,17 +357,16 @@ fn main() {
 
 /// Compiles the fused-preprocess CUDA kernels (`cuda/crop_resize_normalize.cu`
 /// and `cuda/nv12_to_rgb_resize_normalize.cu`) into static libs in OUT_DIR via
-/// nvcc and emits the link flags for them + the CUDA runtime. Gated on the
-/// vision-gpu AND supertonic features (the only consumer is the ort device
-/// tensor path in `vision::gpu_preprocess`), so a default / non-GPU build never
-/// invokes nvcc. `--fmad=false` keeps the kernel's f64 sampling math bit-for-bit
-/// with the CPU `resize_rgb` (an FMA-contracted `(d+0.5)*scale-0.5` rounds
-/// differently and could flip a Q8 boundary weight).
+/// nvcc i emituje flagi linkera dla bibliotek oraz runtime CUDA. Jawna funkcja
+/// `vision-cuda-preprocess` włącza tę ścieżkę, więc buildy AMD/Intel nie wywołują
+/// nvcc. `--fmad=false` zachowuje zgodność obliczeń próbkowania f64 z CPU
+/// `resize_rgb` (kontrakcja FMA może zmienić zaokrąglenie na granicy Q8).
 fn compile_cuda_preprocess(out_dir: &Path) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS");
     let want = matches!(target_os.as_deref(), Ok("linux" | "windows"))
         && std::env::var_os("CARGO_FEATURE_INFERENCE_VISION_GPU").is_some()
-        && std::env::var_os("CARGO_FEATURE_INFERENCE_SUPERTONIC").is_some();
+        && std::env::var_os("CARGO_FEATURE_VISION_ORT").is_some()
+        && std::env::var_os("CARGO_FEATURE_VISION_CUDA_PREPROCESS").is_some();
     if !want {
         return;
     }

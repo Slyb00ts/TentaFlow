@@ -161,10 +161,7 @@ fn whisper_mlx_checkpoint_has_the_expected_shape() {
         components.entry(canon).or_insert([false; 3])[comp as usize] = true;
     }
 
-    let triples = components
-        .values()
-        .filter(|c| c[0] && c[1] && c[2])
-        .count();
+    let triples = components.values().filter(|c| c[0] && c[1] && c[2]).count();
     assert_eq!(triples, 233, "wagi skwantyzowane");
 
     // Pułapka nazewnicza z realnego pliku: `attn.out.bias` to wektor przesunięcia

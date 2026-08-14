@@ -22,7 +22,7 @@
 use std::sync::Arc;
 
 use forge_hal::metal_device::MetalDevice;
-use forge_hal::{Device, DevBuffer, LaunchArgs, LaunchConfig, Pool};
+use forge_hal::{DevBuffer, Device, LaunchArgs, LaunchConfig, Pool};
 use forge_kernels::msl::{self, OutDtype, ScaleDtype};
 use forge_types::MemKind;
 
@@ -155,7 +155,9 @@ fn batched_matmul_is_no_further_from_the_truth_than_mlx() {
         .dev
         .load_module(msl::qmm_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let kernel = module.kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let kernel = module
+        .kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
 
     for c in &cases {
         let packed = g.upload(&c.packed);
@@ -238,7 +240,9 @@ fn the_matrix_unit_form_is_no_further_from_the_truth_than_mlx() {
         .dev
         .load_module(msl::qmg_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let kernel = module.kernel(&msl::qmg_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let kernel = module
+        .kernel(&msl::qmg_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
 
     for c in &cases {
         assert!(
@@ -254,7 +258,11 @@ fn the_matrix_unit_form_is_no_further_from_the_truth_than_mlx() {
         let x = g.upload(&c.x);
         let y = g
             .dev
-            .alloc((tokens * c.rows) as usize * 4, MemKind::Device, Pool::Activations)
+            .alloc(
+                (tokens * c.rows) as usize * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
 
         let (gx, gy) = msl::qmg_affine_4bit_groups(c.rows, tokens);
@@ -297,7 +305,10 @@ fn the_matrix_unit_form_is_no_further_from_the_truth_than_mlx() {
                 c.name
             );
         }
-        eprintln!("{}: jednostka macierzowa zgodna na {tokens} tokenach", c.name);
+        eprintln!(
+            "{}: jednostka macierzowa zgodna na {tokens} tokenach",
+            c.name
+        );
     }
 }
 
@@ -314,12 +325,16 @@ fn the_batched_form_agrees_with_the_vector_form_bit_for_bit() {
         .dev
         .load_module(msl::qmm_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mm_kernel = mm.kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let mm_kernel = mm
+        .kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
     let mv = g
         .dev
         .load_module(msl::qmv_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mv_kernel = mv.kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let mv_kernel = mv
+        .kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
 
     let c = &cases[0];
     let packed = g.upload(&c.packed);
@@ -426,17 +441,23 @@ fn how_much_the_tile_actually_buys() {
         .dev
         .load_module(msl::qmm_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mm_kernel = mm.kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let mm_kernel = mm
+        .kernel(&msl::qmm_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
     let mv = g
         .dev
         .load_module(msl::qmv_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mv_kernel = mv.kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let mv_kernel = mv
+        .kernel(&msl::qmv_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
     let mg = g
         .dev
         .load_module(msl::qmg_affine_source(msl::Bits::Four, sd, od).as_bytes())
         .unwrap();
-    let mg_kernel = mg.kernel(&msl::qmg_affine_name(msl::Bits::Four, sd, od)).unwrap();
+    let mg_kernel = mg
+        .kernel(&msl::qmg_affine_name(msl::Bits::Four, sd, od))
+        .unwrap();
 
     // Pełny kształt warstwy, nie wycinek z fikstury. To jest cała różnica:
     // 128 wierszy Bielika to 720 KB wagi, która mieści się w cache, więc pętla
@@ -453,7 +474,11 @@ fn how_much_the_tile_actually_buys() {
         let x = g.upload(&vec![0x3Cu8; tokens as usize * row]);
         let y = g
             .dev
-            .alloc((tokens * rows) as usize * 4, MemKind::Device, Pool::Activations)
+            .alloc(
+                (tokens * rows) as usize * 4,
+                MemKind::Device,
+                Pool::Activations,
+            )
             .unwrap();
 
         let (gx, gy) = msl::qmm_affine_4bit_groups(rows, tokens);
@@ -474,11 +499,15 @@ fn how_much_the_tile_actually_buys() {
             .scalar(tokens);
 
         const REPS: u32 = 10;
-        g.dev.launch(&mm_kernel, &cfg_mm, &args_mm, &g.stream).unwrap();
+        g.dev
+            .launch(&mm_kernel, &cfg_mm, &args_mm, &g.stream)
+            .unwrap();
         g.stream.synchronize().unwrap();
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
-            g.dev.launch(&mm_kernel, &cfg_mm, &args_mm, &g.stream).unwrap();
+            g.dev
+                .launch(&mm_kernel, &cfg_mm, &args_mm, &g.stream)
+                .unwrap();
         }
         g.stream.synchronize().unwrap();
         let batched = t0.elapsed().as_secs_f64() / REPS as f64;
@@ -496,7 +525,8 @@ fn how_much_the_tile_actually_buys() {
                     .buf(&packed)
                     .buf(&scales)
                     .buf(&biases)
-                    .buf_at(&x, t as usize * row).unwrap()
+                    .buf_at(&x, t as usize * row)
+                    .unwrap()
                     .scalar(rows)
                     .scalar(cols)
                     .scalar(group);
@@ -522,11 +552,15 @@ fn how_much_the_tile_actually_buys() {
             .scalar(cols)
             .scalar(group)
             .scalar(tokens);
-        g.dev.launch(&mg_kernel, &cfg_mg, &args_mg, &g.stream).unwrap();
+        g.dev
+            .launch(&mg_kernel, &cfg_mg, &args_mg, &g.stream)
+            .unwrap();
         g.stream.synchronize().unwrap();
         let t0 = std::time::Instant::now();
         for _ in 0..REPS {
-            g.dev.launch(&mg_kernel, &cfg_mg, &args_mg, &g.stream).unwrap();
+            g.dev
+                .launch(&mg_kernel, &cfg_mg, &args_mg, &g.stream)
+                .unwrap();
         }
         g.stream.synchronize().unwrap();
         let matrix = t0.elapsed().as_secs_f64() / REPS as f64;
@@ -560,7 +594,9 @@ fn the_six_bit_prefill_forms_agree_with_the_vector_form() {
     const GROUP: usize = 16;
     const TOKENS: usize = 64;
 
-    let codes: Vec<u8> = (0..ROWS * COLS).map(|i| ((i * 13 + 5) % 64) as u8).collect();
+    let codes: Vec<u8> = (0..ROWS * COLS)
+        .map(|i| ((i * 13 + 5) % 64) as u8)
+        .collect();
     let groups = ROWS * COLS / GROUP;
     let scales: Vec<half::f16> = (0..groups)
         .map(|i| half::f16::from_f32(0.0015 + (i % 7) as f32 * 0.0002))
@@ -597,11 +633,17 @@ fn the_six_bit_prefill_forms_agree_with_the_vector_form() {
     let vec_src = msl::qmv_affine_source(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32);
     let vec_mod = dev.load_module(vec_src.as_bytes()).unwrap();
     let vec_k = vec_mod
-        .kernel(&msl::qmv_affine_name(msl::Bits::Six, ScaleDtype::F16, OutDtype::F32))
+        .kernel(&msl::qmv_affine_name(
+            msl::Bits::Six,
+            ScaleDtype::F16,
+            OutDtype::F32,
+        ))
         .unwrap();
     let mut want = vec![0f32; TOKENS * ROWS];
     for t in 0..TOKENS {
-        let row = dev.alloc(ROWS * 4, MemKind::Device, Pool::Activations).unwrap();
+        let row = dev
+            .alloc(ROWS * 4, MemKind::Device, Pool::Activations)
+            .unwrap();
         let xt = up(bytemuck::cast_slice(&x[t * COLS..(t + 1) * COLS]));
         dev.launch(
             &vec_k,
@@ -611,8 +653,15 @@ fn the_six_bit_prefill_forms_agree_with_the_vector_form() {
                 shared_mem_bytes: 0,
             },
             &LaunchArgs::new()
-                .buf(&row).buf(&bp).buf(&bs).buf(&bb).buf(&xt).buf(&bh)
-                .scalar(ROWS as u32).scalar(COLS as u32).scalar(GROUP as u32),
+                .buf(&row)
+                .buf(&bp)
+                .buf(&bs)
+                .buf(&bb)
+                .buf(&xt)
+                .buf(&bh)
+                .scalar(ROWS as u32)
+                .scalar(COLS as u32)
+                .scalar(GROUP as u32),
             &stream,
         )
         .unwrap();
@@ -653,8 +702,15 @@ fn the_six_bit_prefill_forms_agree_with_the_vector_form() {
                 shared_mem_bytes: 0,
             },
             &LaunchArgs::new()
-                .buf(&out).buf(&bp).buf(&bs).buf(&bb).buf(&bx).buf(&bh)
-                .scalar(ROWS as u32).scalar(COLS as u32).scalar(GROUP as u32)
+                .buf(&out)
+                .buf(&bp)
+                .buf(&bs)
+                .buf(&bb)
+                .buf(&bx)
+                .buf(&bh)
+                .scalar(ROWS as u32)
+                .scalar(COLS as u32)
+                .scalar(GROUP as u32)
                 .scalar(TOKENS as u32),
             &stream,
         )

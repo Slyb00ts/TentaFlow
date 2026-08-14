@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Code Studio · Mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<link rel="stylesheet" href="shared/code-studio.css">
+<style>
+  .grp { margin-bottom: 34px; }
+  .grp-title { font-size: 13px; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2);
+               font-weight: 800; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); margin-left: 6px; }
+  .index-card.soon { opacity: .5; cursor: default; }
+  .index-card.soon:hover { border-color: var(--border); transform: none; }
+  .idea { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+          padding: 16px 18px; margin-bottom: 14px; }
+  .idea h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2);
+             margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .idea p { font-size: 12.5px; color: var(--text-2); line-height: 1.7; }
+  .idea p + p { margin-top: 8px; }
+  .idea b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="index-page">
+  <h1>Code Studio · Mockupy</h1>
+  <p class="subtitle">
+    Środowisko pracy nad kodem z wieloagentowym harnessem. Punkt wyjścia to <b>aplikacja konsolowa</b>:
+    widzisz strumień tego, co agent naprawdę robi, i piszesz do niego — ale z pełnym GUI, podglądem
+    subagentów, plikami, diffem i gitem. Motyw i komponenty spójne z <span class="mono">tentaflow-core/www</span>.
+    Plan techniczny: <span class="mono">docs/CODE_STUDIO_PLAN.md</span>.
+  </p>
+
+  <div class="idea">
+    <h3>Zasada układu</h3>
+    <p><b>Pasek projektów</b> u góry — poziomy, przewijalny, z kropką statusu przy każdym workspace:
+      <span style="color:var(--cs-run)">pracuje</span> ·
+      <span style="color:var(--cs-ask)">czeka na Ciebie</span> ·
+      <span style="color:var(--cs-idle)">bezczynny</span> ·
+      <span style="color:var(--cs-err)">błąd</span>.
+      Poziomy zamiast pionowej belki, bo ten sam element działa na telefonie.</p>
+    <p><b>Scena</b> pośrodku — strumień zdarzeń: wywołania narzędzi jako gęste wiersze mono, proza agenta
+      normalną typografią, karty pytań i przeglądu zmian jako wyróżnione bloki. Pod spodem stały pasek
+      „co się dzieje teraz", żeby nigdy nie trzeba było zgadywać.</p>
+    <p><b>Dok</b> po prawej — zakładki Subagenci / Pliki / Zmiany / Git / Terminal. Domyślnie subagenci;
+      kliknięcie wchodzi w środek jednego z nich.</p>
+    <p><b>Telefon</b> — ta sama treść w jednej kolumnie z dolną nawigacją. Pytanie agenta zawsze ma
+      pierwszeństwo; diff i podgląd kodu są czytelne bez poziomego scrolla strony.</p>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Gotowe <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="k01-konsola.html">
+        <div class="id">K01</div><h3>Konsola sesji</h3>
+        <p>Widok domyślny: pasek projektów, strumień pracy agenta, karta pytania, karta zmian, dok subagentów.</p>
+      </a>
+      <a class="index-card" href="m01-mobile.html">
+        <div class="id">M01</div><h3>Telefon — cztery stany</h3>
+        <p>Konsola z pytaniem, lista subagentów z wejściem w środek, diff do akceptacji, arkusz przełączania projektów.</p>
+      </a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Zaplanowane <span class="ln"></span></div>
+    <div class="index-grid">
+      <div class="index-card soon"><div class="id">K02</div><h3>Wnętrze subagenta</h3>
+        <p>Scena rozdzielona na dwie kolumny: orkiestrator i wybrany subagent obok siebie, z powrotem jednym kliknięciem.</p></div>
+      <div class="index-card soon"><div class="id">K03</div><h3>Przegląd zmian</h3>
+        <p>Pełnoekranowy diff z akceptacją per hunk, listą plików i konfliktem CAS.</p></div>
+      <div class="index-card soon"><div class="id">K04</div><h3>Pliki i edytor</h3>
+        <p>Drzewo repo, edytor z kolorowaniem, zakładki plików, oznaczenia zmienionych przez agenta.</p></div>
+      <div class="index-card soon"><div class="id">K05</div><h3>Git</h3>
+        <p>Gałęzie, historia, staging, push i merge przez worktree integracyjny z obowiązkowym pytaniem.</p></div>
+      <div class="index-card soon"><div class="id">K06</div><h3>Terminal</h3>
+        <p>Siatka VT renderowana z serwera, z zapisem uruchomionych komend w osi czasu.</p></div>
+      <div class="index-card soon"><div class="id">W01</div><h3>Kreator workspace</h3>
+        <p>Wybór trybu (natywny domyślnie / kontener), węzła, źródła repo, poświadczeń i polityki egress.</p></div>
+      <div class="index-card soon"><div class="id">W02</div><h3>Lista workspace'ów</h3>
+        <p>Pełny przegląd wszystkich środowisk z kwotami, węzłami i stanem sesji.</p></div>
+      <div class="index-card soon"><div class="id">G01</div><h3>Rozłączenie i wznowienie</h3>
+        <p>Zachowanie sesji przy utracie węzła — wariant overlaya połączenia dla pracy zdalnej.</p></div>
+    </div>
+  </div>
+
+  <div class="idea">
+    <h3>Animacje</h3>
+    <p>Zestaw wzięty z <span class="mono">connection-overlay.css</span> i <span class="mono">update-overlay.css</span>,
+      żeby moduł nie brzmiał obco: sprężyna <span class="mono">cubic-bezier(.34,1.56,.64,1)</span> na wejściu kart,
+      pulsujące kropki statusu z rozchodzącym się cieniem, obracająca się ikona przy pracującym narzędziu.</p>
+    <p>Dołożone specyficznie dla konsoli: <b>przesuwający się połysk</b> na wierszu narzędzia w trakcie
+      wykonania, <b>sprężysty znacznik</b> po zakończeniu, <b>płynący pasek</b> po lewej krawędzi karty
+      pracującego subagenta (ten sam pomysł co przepływ po krawędzi we Flow Builderze), <b>migający kursor</b>
+      przy strumieniowanym tekście i <b>wysuwany arkusz</b> przełącznika projektów na telefonie.</p>
+  </div>
+</div>
+
+</body>
+</html>

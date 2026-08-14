@@ -61,7 +61,11 @@ fn ranga_wczytuje_swoj_fragment_kazdej_dzielonej_macierzy() {
 
     // Deskryptor rangi: cała reszta silnika ma widzieć mniejszy model.
     assert_eq!(p.n_heads % p.n_kv_heads, 0, "grupa GQA rozjechała się");
-    assert_eq!(ssm.n_v_heads() % ssm.n_k_heads(), 0, "mapowanie GQA DeltaNet");
+    assert_eq!(
+        ssm.n_v_heads() % ssm.n_k_heads(),
+        0,
+        "mapowanie GQA DeltaNet"
+    );
     assert!(p.intermediate_size.is_multiple_of(256));
 
     let key_dim = ssm.key_dim();
@@ -79,7 +83,11 @@ fn ranga_wczytuje_swoj_fragment_kazdej_dzielonej_macierzy() {
                 // inaczej mikser czytałby poza własnym fragmentem.
                 assert_eq!(d.in_proj.rows(), conv_dim, "warstwa {index} in_proj");
                 assert_eq!(d.gate_proj.rows(), value_dim, "warstwa {index} gate_proj");
-                assert_eq!(d.alpha_proj.rows(), ssm.n_v_heads(), "warstwa {index} alpha");
+                assert_eq!(
+                    d.alpha_proj.rows(),
+                    ssm.n_v_heads(),
+                    "warstwa {index} alpha"
+                );
                 assert_eq!(d.beta_proj.rows(), ssm.n_v_heads(), "warstwa {index} beta");
                 // Projekcja wyjściowa jest WIERSZOWO równoległa: dzieli się po
                 // kolumnach, więc liczba wierszy zostaje pełna, a wejściem jest
@@ -94,7 +102,11 @@ fn ranga_wczytuje_swoj_fragment_kazdej_dzielonej_macierzy() {
                 // Projekcja Q niesie na głowicę DWA bloki head_dim, bo druga
                 // połowa to bramka wyjścia.
                 let gated = if p.attn_gated { 2 } else { 1 };
-                assert_eq!(q.rows(), p.n_heads * p.head_dim * gated, "warstwa {index} q");
+                assert_eq!(
+                    q.rows(),
+                    p.n_heads * p.head_dim * gated,
+                    "warstwa {index} q"
+                );
                 assert_eq!(k.rows(), p.n_kv_heads * p.head_dim, "warstwa {index} k");
                 assert_eq!(v.rows(), p.n_kv_heads * p.head_dim, "warstwa {index} v");
                 assert_eq!(a.attn_o.rows(), p.hidden_size, "warstwa {index} attn_o");
@@ -112,6 +124,9 @@ fn ranga_wczytuje_swoj_fragment_kazdej_dzielonej_macierzy() {
         assert_eq!(ffn.down.rows(), p.hidden_size, "warstwa {index} ffn_down");
     }
 
-    assert!(delta_layers > 0 && attn_layers > 0, "hybryda ma oba rodzaje warstw");
+    assert!(
+        delta_layers > 0 && attn_layers > 0,
+        "hybryda ma oba rodzaje warstw"
+    );
     assert!(key_dim > 0 && conv_dim == 2 * key_dim + value_dim);
 }

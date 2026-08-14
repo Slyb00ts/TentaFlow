@@ -26,7 +26,11 @@ fn main() -> forge_types::Result<()> {
         let ids = tokenizer.encode(text, true)?;
         println!("  ids: {ids:?}");
         let back = tokenizer.decode(&ids, false)?;
-        let ok = if back.trim() == text.trim() { "OK " } else { "ROZNI" };
+        let ok = if back.trim() == text.trim() {
+            "OK "
+        } else {
+            "ROZNI"
+        };
         println!("{ok} [{}] -> {} tok -> [{}]", text, ids.len(), back);
     }
     Ok(())

@@ -227,7 +227,7 @@ case "$PLATFORM" in
       # jako root ("mkdir: Permission denied"). Na hostach bez SELinux Docker
       # ignoruje flage. `:z` (shared) zamiast `:Z` (private), zeby host po
       # zakonczeniu kontenera nadal mial dostep do artefaktow.
-      $DOCKER run --rm -v "$SRC_DIR:/src:z" -w /src ubuntu:22.04 bash -c '
+      $DOCKER run --rm --network=host -v "$SRC_DIR:/src:z" -w /src ubuntu:22.04 bash -c '
         set -e
         export DEBIAN_FRONTEND=noninteractive CC=gcc-11 CXX=g++-11
         apt-get update -qq && apt-get install -y -qq build-essential gcc-11 g++-11 git python3 python3-pip libssl-dev pkg-config curl ca-certificates >/dev/null 2>&1

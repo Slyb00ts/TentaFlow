@@ -1086,5 +1086,4 @@ impl Kernels {
             .scalar(rows as i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

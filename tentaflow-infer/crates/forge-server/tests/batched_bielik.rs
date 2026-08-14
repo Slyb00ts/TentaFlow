@@ -14,8 +14,8 @@ use forge_engine::model::Model;
 use forge_engine::model::ModelConfig;
 use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
 use forge_engine::server::{spawn_engine_batched, EngineEvent, EngineRequest, SpeculativeConfig};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use sha2::{Digest, Sha256};
 
@@ -155,7 +155,11 @@ fn batched_reproduces_golden() {
     .expect("load model");
     if std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn") {
         assert!(
-            loaded.model.build_fp8_ffn().expect("budowa paczek FP8").built(),
+            loaded
+                .model
+                .build_fp8_ffn()
+                .expect("budowa paczek FP8")
+                .built(),
             "Bielik test wymaga aktywnych paczek FP8"
         );
         eprintln!("Bielik test: resident FP8 Q/O/FFN/lm_head aktywne");
@@ -388,7 +392,11 @@ fn scheduler_prefill_p1024_o256_b1_b4_b8_b16() {
     )
     .expect("load model");
     if std::env::var("FORGE_GEMM").ok().as_deref() == Some("fp8mod-ffn") {
-        assert!(loaded.model.build_fp8_ffn().expect("budowa paczek FP8").built());
+        assert!(loaded
+            .model
+            .build_fp8_ffn()
+            .expect("budowa paczek FP8")
+            .built());
     }
     let seed = loaded
         .bundle

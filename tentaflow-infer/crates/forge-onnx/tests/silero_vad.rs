@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_onnx::Tensor;
 
 const DEFAULT_MODEL: &str =

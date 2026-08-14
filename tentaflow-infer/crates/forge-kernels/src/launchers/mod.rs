@@ -1376,6 +1376,20 @@ fn has_hybrid_prefill_t128_artifacts(nvidia: bool, mut has: impl FnMut(&str) -> 
         && has(triplet)
 }
 
+pub(crate) fn q4_k_wmma_prefill_artifacts_capable(
+    rows: usize,
+    n_tokens: usize,
+    mut has: impl FnMut(&str) -> bool,
+) -> bool {
+    if n_tokens <= 32 || rows <= 64 {
+        return has("gemm_q4_k_wmma_f16_bm32");
+    }
+    if n_tokens >= 512 && has("gemm_q4_k_wmma_f16_bm512_bn128") {
+        return true;
+    }
+    has("gemm_q4_k_wmma_f16_bm256_bn128") || has("gemm_q4_k_wmma_f16_bm256")
+}
+
 fn hybrid_prefill_nvfp4_artifact_chunk_limit(
     nvidia_warp32: bool,
     mut has: impl FnMut(&str) -> bool,
@@ -1486,6 +1500,7 @@ struct PrequantScratch {
     xq: Option<DevBuffer>,
     xd: Option<DevBuffer>,
     xsm: Option<DevBuffer>,
+    xsum: Option<DevBuffer>,
     /// Capacity of `xq` in BYTES: one per int8 code, or the smaller four-bit form.
     cap_codes: usize,
     /// Current f32 capacity (elements) of `xd`/`xsm`.
@@ -1652,6 +1667,7 @@ struct Q4kNativeScratch {
 /// captured (no events — all users share the model stream's ordering).
 #[derive(Default)]
 pub(crate) struct QkBatchScratch {
+    key: Option<(u64, usize, usize, usize)>,
     /// int8 q8_1 codes [16, cols].
     xq: Option<DevBuffer>,
     /// Block-major per-32 activation scale d [cols/32, 16].
@@ -1766,9 +1782,7 @@ impl Kernels {
     pub fn artifacts(&self) -> &KernelArtifacts {
         &self.artifacts
     }
-
 }
-
 
 #[cfg(test)]
 mod nvfp4_gguf_dispatch_tests {
@@ -1777,6 +1791,7 @@ mod nvfp4_gguf_dispatch_tests {
         dense_prefill_backend_capable, ensure_prepared_q8_usable, fp8_modular_bn256_capable,
         has_delta_value_key_artifacts, has_hybrid_prefill_b2_artifacts,
         has_hybrid_prefill_t128_artifacts, has_nvfp4_gguf_tile_artifacts,
+        q4_k_wmma_prefill_artifacts_capable,
         hybrid_prefill_nvfp4_artifact_chunk_limit, lock_prepared_q8_scratch,
         nvfp4_ct_s0_manual_capable, nvfp4_ct_split_pipeline_supported,
         nvfp4_gguf_dispatch as nvfp4_gguf_dispatch_impl, nvfp4_gguf_layout_dispatch,
@@ -2442,6 +2457,21 @@ mod nvfp4_gguf_dispatch_tests {
     }
 
     #[test]
+    fn q4k_prefill_wymaga_artefaktu_wmma_wybranego_dla_ksztaltu() {
+        assert!(q4_k_wmma_prefill_artifacts_capable(5120, 512, |name| {
+            name == "gemm_q4_k_wmma_f16_bm512_bn128"
+        }));
+        assert!(q4_k_wmma_prefill_artifacts_capable(5120, 512, |name| {
+            name == "gemm_q4_k_wmma_f16_bm256"
+        }));
+        assert!(!q4_k_wmma_prefill_artifacts_capable(5120, 512, |_| false));
+        assert!(q4_k_wmma_prefill_artifacts_capable(30, 512, |name| {
+            name == "gemm_q4_k_wmma_f16_bm32"
+        }));
+        assert!(!q4_k_wmma_prefill_artifacts_capable(30, 512, |_| false));
+    }
+
+    #[test]
     fn dense_prefill_wymaga_artefaktow_konkretnego_hd_formatu_i_batcha() {
         assert_eq!(
             Kernels::f16_out_f32_dispatch(32_000, 4, |_| true).0,
@@ -2782,7 +2812,9 @@ mod nvfp4_gguf_dispatch_tests {
         // sterownika CUDA — czyli na kazdym Macu — cudarc panikuje przy jej
         // leniwym ladowaniu, wiec ponizsze pomijanie nigdy nie dochodzilo do
         // skutku i caly zestaw testow byl czerwony zamiast cichy.
-        let Some(device) = test_device(64 << 20) else { return };
+        let Some(device) = test_device(64 << 20) else {
+            return;
+        };
         let kernels = Kernels::load(device.clone()).unwrap();
         let stream = device.create_stream().unwrap();
         let rows = 65usize;
@@ -2877,7 +2909,9 @@ mod nvfp4_gguf_dispatch_tests {
         // sterownika CUDA — czyli na kazdym Macu — cudarc panikuje przy jej
         // leniwym ladowaniu, wiec ponizsze pomijanie nigdy nie dochodzilo do
         // skutku i caly zestaw testow byl czerwony zamiast cichy.
-        let Some(device) = test_device(64 << 20) else { return };
+        let Some(device) = test_device(64 << 20) else {
+            return;
+        };
         let kernels = Kernels::load(device.clone()).unwrap();
         let stream = device.create_stream().unwrap();
         let rows = [65usize, 17, 9];
@@ -2999,7 +3033,9 @@ mod nvfp4_gguf_dispatch_tests {
         let _serialized = PREPARED_Q8_SCRATCH
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let Some(device) = test_device(16 << 20) else { return };
+        let Some(device) = test_device(16 << 20) else {
+            return;
+        };
         let kernels = Kernels::load(device.clone()).unwrap();
         let stream = device.create_stream().unwrap();
         let tokens = 6usize;

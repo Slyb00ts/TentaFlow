@@ -100,7 +100,8 @@ impl CudaExec {
             if bytes == 0 {
                 continue;
             }
-            self.device.copy(&stage.host, 0, dst, 0, bytes, &self.stream)?;
+            self.device
+                .copy(&stage.host, 0, dst, 0, bytes, &self.stream)?;
         }
         Ok(())
     }
@@ -112,7 +113,8 @@ impl CudaExec {
     /// that costs nothing: a step is built after its predecessor's logits have
     /// been read back, so the wait in `stage_values` never actually waits.
     pub(super) fn fence_control(&self) -> Result<()> {
-        self.device.record_event(&self.control_fence, &self.stream)?;
+        self.device
+            .record_event(&self.control_fence, &self.stream)?;
         self.fence_live.set(true);
         Ok(())
     }
@@ -132,11 +134,7 @@ impl CudaExec {
         // SAFETY: `ptr` owns the widest control buffer's bytes and `values` is
         // never wider than that; the regions cannot overlap.
         unsafe {
-            std::ptr::copy_nonoverlapping(
-                values.as_ptr() as *const u8,
-                ptr,
-                stage.bytes.get(),
-            );
+            std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, ptr, stage.bytes.get());
         }
         *held.borrow_mut() = values;
         Ok(())

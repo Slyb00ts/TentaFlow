@@ -9,7 +9,7 @@
 // `detector_rfdetr.rs`, zeby dynamiczne modele z rejestru `vision_models`
 // dzielily dokladnie te sama sciezke wydajnosci.
 
-#![cfg(feature = "inference-supertonic")]
+#![cfg(feature = "vision-ort")]
 
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, OnceLock};

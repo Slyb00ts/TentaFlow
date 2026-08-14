@@ -3,7 +3,7 @@
 // wartosci wzorcowe, wiec to jest pierwszy punkt, w ktorym mozna rozstrzygnac,
 // czy FORGE czyta te sama tablice.
 use forge_engine::model::{Model, ModelConfig};
-use forge_hal::{PoolSizes, gpu};
+use forge_hal::{gpu, PoolSizes};
 
 fn main() -> forge_types::Result<()> {
     let mut args = std::env::args().skip(1);
@@ -51,9 +51,11 @@ fn main() -> forge_types::Result<()> {
     }
     let hidden = model.weights.descriptor.params.hidden_size;
     let mut bytes = vec![0u8; hidden * 2];
-    model
-        .device
-        .read(&model.weights.token_embd_f16, token * hidden * 2, &mut bytes)?;
+    model.device.read(
+        &model.weights.token_embd_f16,
+        token * hidden * 2,
+        &mut bytes,
+    )?;
     let values: Vec<f32> = bytes
         .chunks_exact(2)
         .map(|c| half::f16::from_le_bytes([c[0], c[1]]).to_f32())
@@ -61,8 +63,14 @@ fn main() -> forge_types::Result<()> {
     let sum: f32 = values.iter().sum();
     println!(
         "token {token}: pierwsze {:?} ostatnie {:?} suma {sum:.6}",
-        values[..3].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>(),
-        values[hidden - 3..].iter().map(|v| format!("{v:.4}")).collect::<Vec<_>>(),
+        values[..3]
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>(),
+        values[hidden - 3..]
+            .iter()
+            .map(|v| format!("{v:.4}"))
+            .collect::<Vec<_>>(),
     );
     Ok(())
 }

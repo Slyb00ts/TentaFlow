@@ -183,7 +183,10 @@ impl HipDevice {
             max_threads_per_block: 0,
             max_shared_mem_per_block: 0,
         };
-        check(unsafe { forge_hip_props(ordinal, &mut raw) }, "hipGetDeviceProperties")?;
+        check(
+            unsafe { forge_hip_props(ordinal, &mut raw) },
+            "hipGetDeviceProperties",
+        )?;
         let arch = cstr_field(&raw.arch);
         // `gcnArchName` niesie sufiksy cech (np. "gfx1030:xnack-"), a artefakty
         // adresujemy samą nazwą architektury.
@@ -196,7 +199,10 @@ impl HipDevice {
             )));
         }
         if raw.cu_count <= 0 {
-            return Err(ForgeError::Device(format!("{arch} zgłasza {} CU", raw.cu_count)));
+            return Err(ForgeError::Device(format!(
+                "{arch} zgłasza {} CU",
+                raw.cu_count
+            )));
         }
         let caps = DeviceCaps {
             name: cstr_field(&raw.name),
@@ -242,7 +248,10 @@ impl HipDevice {
         } else {
             pools.kv_page_size
         };
-        let weights = HipPool::new(pools.weights, PoolArena::Bump(BumpArena::new(pools.weights)))?;
+        let weights = HipPool::new(
+            pools.weights,
+            PoolArena::Bump(BumpArena::new(pools.weights)),
+        )?;
         let kv_cache = HipPool::new(
             pools.kv_cache,
             PoolArena::Slab(SlabArena::new(pools.kv_cache, kv_page)?),
@@ -349,7 +358,6 @@ impl HipPool {
             arena: Mutex::new(arena),
         }))
     }
-
 }
 
 impl Drop for HipPool {
@@ -451,7 +459,10 @@ impl Drop for HipStream {
 
 impl StreamImpl for HipStream {
     fn synchronize(&self) -> Result<()> {
-        check(unsafe { hipStreamSynchronize(self.0) }, "hipStreamSynchronize")
+        check(
+            unsafe { hipStreamSynchronize(self.0) },
+            "hipStreamSynchronize",
+        )
     }
     fn as_any(&self) -> &dyn Any {
         self
@@ -472,7 +483,10 @@ impl Drop for HipEvent {
 
 impl EventImpl for HipEvent {
     fn synchronize(&self) -> Result<()> {
-        check(unsafe { hipEventSynchronize(self.0) }, "hipEventSynchronize")
+        check(
+            unsafe { hipEventSynchronize(self.0) },
+            "hipEventSynchronize",
+        )
     }
     fn is_complete(&self) -> Result<bool> {
         let status = unsafe { hipEventQuery(self.0) };
@@ -598,7 +612,10 @@ impl Device for HipDevice {
         }
         if matches!(kind, MemKind::PinnedHost) {
             let mut ptr: *mut c_void = std::ptr::null_mut();
-            check(unsafe { hipHostMalloc(&mut ptr, bytes, 0) }, "hipHostMalloc")?;
+            check(
+                unsafe { hipHostMalloc(&mut ptr, bytes, 0) },
+                "hipHostMalloc",
+            )?;
             return Ok(DevBuffer::from_impl(Arc::new(HipBuffer {
                 backing: Backing::Pinned { ptr },
                 ptr,
@@ -699,7 +716,10 @@ impl Device for HipDevice {
     fn record_event(&self, event: &Event, stream: &Stream) -> Result<()> {
         let event = event.downcast::<HipEvent>()?;
         let stream = stream.downcast::<HipStream>()?;
-        check(unsafe { hipEventRecord(event.0, stream.0) }, "hipEventRecord")
+        check(
+            unsafe { hipEventRecord(event.0, stream.0) },
+            "hipEventRecord",
+        )
     }
 
     fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()> {
@@ -769,9 +789,7 @@ impl Device for HipDevice {
         let target = dst.downcast::<HipBuffer>()?;
         let stream = stream.downcast::<HipStream>()?;
         if src_offset + bytes > source.len || dst_offset + bytes > target.len {
-            return Err(ForgeError::Device(
-                "kopia HIP wychodzi poza bufor".into(),
-            ));
+            return Err(ForgeError::Device("kopia HIP wychodzi poza bufor".into()));
         }
         check(
             unsafe {
@@ -930,7 +948,10 @@ impl Device for HipDevice {
     fn launch_graph(&self, graph: &ExecGraph, stream: &Stream) -> Result<()> {
         let exec = graph.downcast::<HipGraph>()?;
         let stream = stream.downcast::<HipStream>()?;
-        check(unsafe { hipGraphLaunch(exec.0, stream.0) }, "hipGraphLaunch")
+        check(
+            unsafe { hipGraphLaunch(exec.0, stream.0) },
+            "hipGraphLaunch",
+        )
     }
 
     fn reset_activations(&self) -> Result<u64> {

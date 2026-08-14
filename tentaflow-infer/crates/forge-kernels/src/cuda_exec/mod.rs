@@ -36,7 +36,6 @@ use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
 use crate::launchers::{Kernels, SAMPLE_SCRATCH_PAIRS};
 
-
 mod control;
 mod delta;
 mod formats;

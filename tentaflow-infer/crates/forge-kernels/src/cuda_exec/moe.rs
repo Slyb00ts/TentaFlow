@@ -231,9 +231,9 @@ impl CudaExec {
         }
         let table = self.expert_table(id, w, experts)?;
         if w.quant != QuantKind::MXFP4 {
-            let act = self
-                .kernels
-                .prepare_grouped_act(w.quant, x, w.cols, selections, &self.stream)?;
+            let act =
+                self.kernels
+                    .prepare_grouped_act(w.quant, x, w.cols, selections, &self.stream)?;
             return self.kernels.gemm_grouped_experts(
                 w.quant,
                 y,

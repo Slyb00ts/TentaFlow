@@ -10,8 +10,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use forge_engine::model::{Model, ModelConfig, MAX_PREFILL_CHUNK};
-use forge_hal::{PoolSizes, gpu};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 
 fn model_path() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../test-models/gguf/qwen3-0.6b-q8_0.gguf")
@@ -43,7 +43,7 @@ fn load(prefix_cache: bool) -> Option<Model> {
     let dev: Arc<dyn Device> = device;
     let cfg = ModelConfig {
         weight_host_budget: 0,
-weight_spill_dir: None,
+        weight_spill_dir: None,
         kv_pages: 512,
         prefix_cache,
         ..ModelConfig::default()

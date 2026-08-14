@@ -86,45 +86,45 @@ pub(crate) async fn get_detector() -> Option<DetectorHandle> {
 }
 
 /// Handle to the process-wide classifier/OCR singletons. On the ort path
-/// (`inference-supertonic`) the runner is internally pooled + `&self` + Send+Sync,
+/// (`vision-ort`) the runner is internally pooled + `&self` + Send+Sync,
 /// so it is shared bare as `Arc<_>` and every crop rides the concurrency-safe ort
 /// pool off the single Burn/wgpu thread. On the Burn path the runner still needs
 /// the whole-process wgpu serialization, so it stays behind `Arc<Mutex<_>>` and
 /// callers funnel forwards through `burn_backend::run_blocking`.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type DetectorHandle = std::sync::Arc<RfDetrDetector>;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 pub(crate) type DetectorHandle = std::sync::Arc<Mutex<RfDetrDetector>>;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type ClassifierHandle = std::sync::Arc<StateClassifier>;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 pub(crate) type ClassifierHandle = std::sync::Arc<Mutex<StateClassifier>>;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type OcrHandle = std::sync::Arc<PlateOcr>;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 pub(crate) type OcrHandle = std::sync::Arc<Mutex<PlateOcr>>;
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
     std::sync::Arc::new(d)
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
     std::sync::Arc::new(Mutex::new(d))
 }
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
     std::sync::Arc::new(c)
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
     std::sync::Arc::new(Mutex::new(c))
 }
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn wrap_ocr(o: PlateOcr) -> OcrHandle {
     std::sync::Arc::new(o)
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn wrap_ocr(o: PlateOcr) -> OcrHandle {
     std::sync::Arc::new(Mutex::new(o))
 }
@@ -136,16 +136,16 @@ fn wrap_ocr(o: PlateOcr) -> OcrHandle {
 /// to RF-DETR-only (no vehicle boxes, every sign keeps `vehicle_id = 0`), never
 /// a crash. Only the ort path builds a real detector; the Burn path has no
 /// YOLOv8 vehicle graph, so it is always `None`.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type VehicleHandle = std::sync::Arc<crate::vision::detector_vehicle::VehicleDetector>;
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn vehicle_detector() -> &'static OnceCell<Option<VehicleHandle>> {
     static VEHICLE: OnceCell<Option<VehicleHandle>> = OnceCell::const_new();
     &VEHICLE
 }
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) async fn get_vehicle_detector() -> Option<VehicleHandle> {
     vehicle_detector()
         .get_or_init(|| async {
@@ -319,7 +319,8 @@ fn crop_for_detection(
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     if let Some(dev) = frame_device {
         if let Some(out) = dev.crop_detection_rgb(x0, y0, cw, ch) {
@@ -918,7 +919,7 @@ struct FrameJob {
     #[cfg_attr(
         not(all(
             any(target_os = "linux", target_os = "windows"),
-            feature = "inference-supertonic"
+            feature = "vision-ort"
         )),
         allow(dead_code)
     )]
@@ -969,7 +970,7 @@ struct ForwardOutput {
 /// Górny limit współbieżnych forwardów. Odzwierciedla sufit puli sesji ort
 /// (`ort_common::MAX_SESSIONS_PER_MODEL` = 16) — więcej równoległych forwardów
 /// niż sesji nie ma sensu (i tak czekałyby na slot puli). Zdefiniowany lokalnie,
-/// bo pula ort istnieje tylko pod `inference-supertonic`, a ten limit musi
+/// bo pula ort istnieje tylko pod `vision-ort`, a ten limit musi
 /// obowiązywać na każdej ścieżce.
 const MAX_INFLIGHT: usize = 16;
 
@@ -995,7 +996,10 @@ fn resolve_inflight_limit(inflight: Option<usize>, detector_sessions: usize) -> 
 /// YUV→RGB matrix so one `detect_batch_gpu` call applies a single conversion).
 /// Without the ort GPU features NV12 frames are never produced, so every frame
 /// keys as RGB.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
 fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
     match fmt {
         super::fakefile::DetectFrameFormat::Rgb24 => None,
@@ -1004,7 +1008,10 @@ fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u3
         } => Some((kr.to_bits(), kb.to_bits(), *full_range as u32)),
     }
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(all(
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+)))]
 fn detect_batch_key(_fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
     None
 }
@@ -1012,7 +1019,7 @@ fn detect_batch_key(_fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u
 /// Sentinel batch key for the zero-copy DEVICE detect path — distinct from RGB
 /// (`None`) and any NV12 colorimetry key, so a device job never groups into an
 /// RGB/NV12 flush batch (its input is a preprocessed device tensor, not pixels).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const DEVICE_BATCH_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
 
 /// Job-level flush grouping key: the device sentinel when the job carries a
@@ -1023,7 +1030,8 @@ const DEVICE_BATCH_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
 fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     if job.detect_device.is_some() {
         return Some(DEVICE_BATCH_KEY);
@@ -1036,7 +1044,8 @@ fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
 /// dims. Owned (Arc-cloned) so the spawned forward can outlive the loop tick.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 #[derive(Clone)]
 struct Nv12DetectInput {
@@ -1052,7 +1061,8 @@ struct Nv12DetectInput {
 /// YUV→RGB coefficients for an NV12 detect frame, or `None` for RGB.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 fn nv12_color(
     fmt: &super::fakefile::DetectFrameFormat,
@@ -1076,7 +1086,8 @@ fn nv12_color(
 /// the executor's Detect op so `apply_forward_result` treats both paths alike.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 async fn run_nv12_detect_forward(
     frames: Vec<Nv12DetectInput>,
@@ -1129,7 +1140,8 @@ async fn run_nv12_detect_forward(
 /// concatenated ORT input; the batch just amortizes the loop bookkeeping.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 async fn run_device_detect_forward(
     handles: Vec<super::fakefile::DeviceDetectTensor>,
@@ -1172,7 +1184,8 @@ async fn run_device_detect_forward(
 /// vehicle detection can NEVER block or fail the primary detection.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 async fn run_nv12_vehicle_forward(
     frames: Vec<Nv12DetectInput>,
@@ -1216,7 +1229,7 @@ async fn run_nv12_vehicle_forward(
 /// zero-copy path has no YOLO-usable pixels — its `OwnedDeviceTensor` is already
 /// RF-DETR-normalized at 560 — so the launcher passes the full-res RGB `frame`
 /// here instead). Same degrade-to-empty guard as the NV12 path.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn run_rgb_vehicle_forward(frames: Vec<CvFrameLocal>) -> Vec<Vec<Detection>> {
     let n = frames.len();
     if n == 0 {
@@ -1754,15 +1767,24 @@ async fn engine_loop() {
         });
         // A homogeneous batch is device (zero-copy), NV12 (download preprocess) or
         // RGB (executor). Device jobs carry the sentinel key so they never mix.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(all(
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
+        ))]
         let batch_is_device = matches!(target_key, Some(Some(k)) if k == DEVICE_BATCH_KEY);
         #[allow(unused_variables)]
         let batch_is_nv12 = matches!(target_key, Some(Some(_))) && {
-            #[cfg(feature = "inference-supertonic")]
+            #[cfg(all(
+                feature = "vision-ort",
+                feature = "vision-cuda-preprocess"
+            ))]
             {
                 !batch_is_device
             }
-            #[cfg(not(feature = "inference-supertonic"))]
+            #[cfg(not(all(
+                feature = "vision-ort",
+                feature = "vision-cuda-preprocess"
+            )))]
             {
                 true
             }
@@ -1784,7 +1806,8 @@ async fn engine_loop() {
         // handles it identically to every other detect path.
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         if batch_is_device {
             let mut handles: Vec<super::fakefile::DeviceDetectTensor> =
@@ -1841,7 +1864,8 @@ async fn engine_loop() {
         // `resolve_ingest_path` / `nv12_detect_bench_enabled`).
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         if batch_is_nv12 {
             let color = batch
@@ -1952,7 +1976,7 @@ async fn engine_loop() {
         // Vehicle detector runs on a CLONE of the SAME detect frames (Arc-cheap),
         // concurrently with the executor detect (own ort pool). Only on the ort
         // path — the Burn path has no YOLOv8 vehicle graph.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         let vehicle_frames = frames.clone();
         let handle = forwards.spawn(async move {
             // Permit trzymany przez CAŁY forward — dropuje się z zadaniem (koniec
@@ -1966,7 +1990,7 @@ async fn engine_loop() {
             // swiezy kontekst per wywolanie (jak w vision_impl).
             let mut ctx = RuntimeContext::new(None);
             let detect_start = Instant::now();
-            #[cfg(feature = "inference-supertonic")]
+            #[cfg(feature = "vision-ort")]
             let (outcome, vehicles) = tokio::join!(
                 async {
                     executor_task
@@ -1976,7 +2000,7 @@ async fn engine_loop() {
                 },
                 run_rgb_vehicle_forward(vehicle_frames),
             );
-            #[cfg(not(feature = "inference-supertonic"))]
+            #[cfg(not(feature = "vision-ort"))]
             let (outcome, vehicles) = (
                 executor_task
                     .execute_camera_cv(request, &mut ctx)
@@ -3530,7 +3554,7 @@ fn assign_vehicle(sign_bbox: &[f32; 4], vehicles: &[VehicleBox]) -> u32 {
 fn stamp_vehicle_ids(stage_dets: &mut [(String, Vec<Detection>)], vehicles: &[VehicleBox]) {
     for (_, dets) in stage_dets.iter_mut() {
         for det in dets.iter_mut() {
-            if det.klasa == crate::vision::detector_vehicle::VEHICLE_CLASS {
+            if det.klasa == "vehicle" {
                 det.vehicle_id = det.track_id;
                 continue;
             }
@@ -3612,7 +3636,7 @@ async fn cold_stage_forward(
         // path, which retries the CRNN and then falls back to PP-OCRv5 — exactly
         // `ocr_adr_local`'s semantics, so no read is ever lost to batching.
         #[cfg(all(
-            feature = "inference-supertonic",
+            feature = "vision-ort",
             not(any(target_os = "macos", target_os = "ios"))
         ))]
         (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
@@ -4001,7 +4025,7 @@ const EXECUTOR_READ_CONFIDENCE: f32 = 1.0;
 /// per-camera batch-1. `None` (batcher unavailable / any per-crop error) →
 /// caller drops to the per-crop fallback (never loses enrichment). The blocking
 /// `submit_all` runs on the blocking pool, off the tokio worker.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec<String>>> {
     let batcher = crate::vision::inference_batcher::state_batcher().await?;
     let crops = crops.to_vec();
@@ -4027,7 +4051,7 @@ async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec
 
 /// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
 /// + `Mutex` (jak `classify_local`); `classify_batch` sam petli po cropach.
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec<String>>> {
     let classifier = get_classifier().await?;
     let crops = crops.to_vec();
@@ -4054,7 +4078,7 @@ async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec
 /// into one big `PlateOcr::read_batch` forward instead of a tiny per-camera
 /// batch-1. `None` (batcher unavailable / any per-crop error) → caller drops to
 /// the per-crop fallback. `submit_all` blocks on the blocking pool.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let batcher = crate::vision::inference_batcher::plate_batcher().await?;
     let crops = crops.to_vec();
@@ -4089,7 +4113,7 @@ async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option
 /// per-crop for the whole stage (never loses enrichment). `submit_all` blocks
 /// on the blocking pool, off the tokio worker.
 #[cfg(all(
-    feature = "inference-supertonic",
+    feature = "vision-ort",
     not(any(target_os = "macos", target_os = "ios"))
 ))]
 async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
@@ -4122,7 +4146,7 @@ async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<
 
 /// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
 /// + `Mutex` (jak `ocr_local`); `read_batch` sam petli po cropach.
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let ocr = get_ocr().await?;
     let crops = crops.to_vec();
@@ -4313,7 +4337,7 @@ mod tests {
         stage_dets.push((
             "veh".to_string(),
             vec![mk(
-                crate::vision::detector_vehicle::VEHICLE_CLASS,
+                "vehicle",
                 [0.1, 0.1, 0.6, 0.6],
                 9,
             )],

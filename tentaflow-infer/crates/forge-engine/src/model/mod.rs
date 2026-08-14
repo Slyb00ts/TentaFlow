@@ -88,6 +88,7 @@ const HYBRID_PREFILL_LADDER: [usize; 5] = [1024, 512, 256, 128, 32];
 const HYBRID_PREFILL_ACTIVATION_RESERVE: usize = 64 * 1024 * 1024;
 
 const HYBRID_LAYER_MAJOR_MAX_TOKENS: usize = 4096;
+const HYBRID_ACTIVATION_RING_ALIGN: usize = 256;
 
 /// Bufory jednego wywołania gęstego bloku FFN.
 ///
@@ -704,25 +705,84 @@ fn hybrid_layer_major_scratch_estimate(
         .conv_dim
         .checked_mul(shape.d_conv.saturating_sub(1))
         .ok_or_else(|| ForgeError::Scheduler("przepełnienie okna conv layer-major".into()))?;
+    let ring = |name, dims, element_bytes| {
+        checked_scratch_bytes(name, dims, element_bytes)?
+            .checked_add(HYBRID_ACTIVATION_RING_ALIGN - 1)
+            .map(|bytes| bytes / HYBRID_ACTIVATION_RING_ALIGN * HYBRID_ACTIVATION_RING_ALIGN)
+            .ok_or_else(|| ForgeError::Scheduler(format!("przepełnienie wyrównania {name}")))
+    };
     checked_scratch_sum(
         "arena layer-major",
         [
-            checked_scratch_bytes("hidden layer-major", &[2, tokens, shape.hidden], 2)?,
-            checked_scratch_bytes("v layer-major", &[tokens, shape.kv_dim], 2)?,
-            checked_scratch_bytes("szerokie bufory layer-major", &[2, tokens, wide], 2)?,
-            checked_scratch_bytes("z i o layer-major", &[2, tokens, shape.value_dim], 2)?,
-            checked_scratch_bytes("ffn layer-major", &[2, tokens, shape.inter], 2)?,
-            checked_scratch_bytes(
-                "surowe bramki layer-major",
-                &[2, tokens, shape.n_v_heads],
-                2,
-            )?,
-            checked_scratch_bytes("bramki f32 layer-major", &[2, tokens, shape.n_v_heads], 4)?,
-            checked_scratch_bytes("metadata layer-major", &[3, tokens], 4)?,
-            checked_scratch_bytes("okna conv layer-major", &[2, conv_elems], 2)?,
-            4,
+            ring("h layer-major", &[tokens, shape.hidden], 2)?,
+            ring("x layer-major", &[tokens, shape.hidden], 2)?,
+            ring("v layer-major", &[tokens, shape.kv_dim], 2)?,
+            ring("gatec layer-major", &[tokens, wide], 2)?,
+            ring("gated layer-major", &[tokens, wide], 2)?,
+            ring("z layer-major", &[tokens, shape.value_dim], 2)?,
+            ring("alpha layer-major", &[tokens, shape.n_v_heads], 2)?,
+            ring("beta raw layer-major", &[tokens, shape.n_v_heads], 2)?,
+            ring("g layer-major", &[tokens, shape.n_v_heads], 4)?,
+            ring("beta layer-major", &[tokens, shape.n_v_heads], 4)?,
+            ring("o layer-major", &[tokens, shape.value_dim], 2)?,
+            ring("gate layer-major", &[tokens, shape.inter], 2)?,
+            ring("up layer-major", &[tokens, shape.inter], 2)?,
+            ring("conv initial layer-major", &[conv_elems], 2)?,
+            ring("conv final layer-major", &[conv_elems], 2)?,
+            ring("ids layer-major", &[tokens], 4)?,
+            ring("positions layer-major", &[tokens], 4)?,
+            ring("visible lengths layer-major", &[tokens], 4)?,
+            ring("base position layer-major", &[1], 4)?,
         ],
     )
+}
+
+fn hybrid_layer_major_activation_required(
+    shape: HybridPrefillScratchShape,
+    tokens: usize,
+) -> Result<usize> {
+    checked_scratch_sum(
+        "arena layer-major i prefill",
+        [
+            hybrid_layer_major_scratch_estimate(shape, tokens)?,
+            hybrid_prefill_scratch_estimate(shape, tokens)?.device_bytes,
+        ],
+    )
+}
+
+fn hybrid_layer_major_activation_budget_capable(
+    shape: HybridPrefillScratchShape,
+    tokens: usize,
+    available: Option<usize>,
+) -> bool {
+    hybrid_layer_major_activation_required(shape, tokens)
+        .ok()
+        .zip(available)
+        .is_some_and(|(required, available)| required <= available)
+}
+
+fn hybrid_layer_major_prefill_limit_for_available(
+    shape: HybridPrefillScratchShape,
+    available: usize,
+    mut artifacts_capable: impl FnMut(usize) -> bool,
+) -> Option<usize> {
+    [4096, 2048, 1024, 512, 128, 32]
+        .into_iter()
+        .find(|&tokens| {
+            artifacts_capable(tokens)
+                && hybrid_layer_major_activation_budget_capable(shape, tokens, Some(available))
+        })
+}
+
+fn hybrid_layer_major_chunk_plan(tokens: usize, limit: usize) -> Vec<usize> {
+    let mut remaining = tokens;
+    let mut chunks = Vec::with_capacity(tokens.div_ceil(limit));
+    while remaining > 0 {
+        let chunk = remaining.min(limit);
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    chunks
 }
 
 fn hybrid_prefill_activation_budget_capable(
@@ -763,7 +823,6 @@ fn hybrid_prefill_step_size(remaining: usize, chunk_size: usize) -> usize {
 fn hybrid_q_full_cols(q_dim: usize, conv_dim: usize, hidden_size: usize) -> usize {
     (q_dim * 2).max(conv_dim).max(hidden_size * 2)
 }
-
 
 fn validate_mtp_routed_inputs(
     vocab: usize,
@@ -1125,6 +1184,7 @@ pub struct Model {
     pub device: Arc<dyn Device>,
     pub kernels: Kernels,
     pub weights: ModelWeights,
+    q4k_decode_model: forge_kernels::Q4kDecodeModelFamily,
     pub kv: KvCache,
     kv_reuse_poison: KvReusePoison,
     stream: Stream,
@@ -1824,11 +1884,12 @@ fn close_block(
     next_norm: &DevBuffer,
     rows: usize,
     hidden: usize,
-    eps: f32,
+    post_norm_eps: f32,
+    next_norm_eps: f32,
     stream: &Stream,
 ) -> Result<()> {
     match delta_norm {
-        Some(dn) => kernels.rmsnorm_delta_residual_f16(
+        Some(dn) if post_norm_eps == next_norm_eps => kernels.rmsnorm_delta_residual_f16(
             x_out,
             h,
             delta,
@@ -1836,12 +1897,35 @@ fn close_block(
             next_norm,
             rows,
             hidden,
-            eps,
+            next_norm_eps,
             layer_scale.unwrap_or(1.0),
             stream,
         ),
+        Some(dn) => {
+            kernels.rmsnorm_f16(delta, delta, dn, rows, hidden, post_norm_eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                x_out,
+                h,
+                delta,
+                next_norm,
+                rows,
+                hidden,
+                next_norm_eps,
+                stream,
+            )?;
+            layer_output_scale(kernels, layer_scale, h, rows * hidden, stream)
+        }
         None => {
-            kernels.rmsnorm_residual_f16(x_out, h, delta, next_norm, rows, hidden, eps, stream)?;
+            kernels.rmsnorm_residual_f16(
+                x_out,
+                h,
+                delta,
+                next_norm,
+                rows,
+                hidden,
+                next_norm_eps,
+                stream,
+            )?;
             layer_output_scale(kernels, layer_scale, h, rows * hidden, stream)
         }
     }
@@ -1892,9 +1976,9 @@ mod kv;
 mod loader;
 mod moe_bufs;
 use moe_bufs::MoeBufs;
+pub(crate) mod caps;
 mod mtp;
 mod quant_dispatch;
-pub(crate) mod caps;
 pub(crate) use caps::{batched_head_supported, native_mtp_b2_device_embedding, HYBRID_BATCH_LANES};
 mod sample;
 mod scratch;
@@ -2258,6 +2342,7 @@ impl Model {
             device,
             kernels,
             weights,
+            q4k_decode_model: forge_kernels::Q4kDecodeModelFamily::Dense,
             kv,
             kv_reuse_poison: KvReusePoison::default(),
             stream,
@@ -2749,12 +2834,13 @@ impl Model {
 #[cfg(test)]
 mod verify_rollback_tests {
     use super::{
-        cleanup_after_error, RecordedTokens, fatal_kv_synchronize,
-        finish_greedy_verification, grow_prefill_lanes_transactional,
-        hybrid_layer_major_scratch_estimate, hybrid_prefill_activation_budget_capable,
-        hybrid_prefill_chunk_config_for_model, hybrid_prefill_inner_chunk_count,
-        hybrid_prefill_nvfp4_chunk_limit, hybrid_prefill_profile_spans,
-        hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
+        cleanup_after_error, fatal_kv_synchronize, finish_greedy_verification,
+        grow_prefill_lanes_transactional, hybrid_layer_major_activation_budget_capable,
+        hybrid_layer_major_activation_required, hybrid_layer_major_chunk_plan,
+        hybrid_layer_major_prefill_limit_for_available, hybrid_layer_major_scratch_estimate,
+        hybrid_prefill_activation_budget_capable, hybrid_prefill_chunk_config_for_model,
+        hybrid_prefill_inner_chunk_count, hybrid_prefill_nvfp4_chunk_limit,
+        hybrid_prefill_profile_spans, hybrid_prefill_scratch_estimate, hybrid_prefill_step_size,
         hybrid_prefill_t128_backend_capable, hybrid_q_full_cols,
         hybrid_verify_attention_parts_bytes, hybrid_verify_dedicated_z_bytes,
         hybrid_verify_delta_scratch_instances, hybrid_verify_scratch_estimate, logical_kv_regions,
@@ -2762,11 +2848,10 @@ mod verify_rollback_tests {
         nvfp4_ct_dimensions_capable, nvfp4_ct_physical_m, nvfp4_ct_plan_physical_m,
         nvfp4_ct_projection_for_shape, parse_hybrid_prefill_chunk_config,
         resolve_hybrid_prefill_chunk_size, restore_after, restore_prefill_seq_snapshots,
-        run_dense_prefill_transaction, settle_kv_operation,
-        
-        ForgeError, HybridPrefillChunkConfig, HybridPrefillScratchShape, KvCache,
-        KvConfig, KvQuant, KvReusePoison, Model, Nvfp4CtProjection, Nvfp4GgufLayout,
-        Result, SeqKv, Vendor,
+        run_dense_prefill_transaction, settle_kv_operation, ForgeError, HybridPrefillChunkConfig,
+        HybridPrefillScratchShape, KvCache, KvConfig, KvQuant, KvReusePoison, Model,
+        Nvfp4CtProjection, Nvfp4GgufLayout, RecordedTokens, Result, SeqKv, Vendor,
+        HYBRID_ACTIVATION_RING_ALIGN, HYBRID_PREFILL_ACTIVATION_RESERVE,
     };
     use forge_hal::cpu::CpuDevice;
     use forge_hal::Device;
@@ -3595,6 +3680,94 @@ mod verify_rollback_tests {
         assert!(p4096 < p2048 * 2);
         assert!(hybrid_layer_major_scratch_estimate(shape, 0).is_err());
         assert!(hybrid_layer_major_scratch_estimate(shape, 4097).is_err());
+    }
+
+    #[test]
+    fn q4k_hybrid_layer_major_odrzuca_budzet_bez_verifiera_deltanet() {
+        let shape = HybridPrefillScratchShape {
+            hidden: 5120,
+            q_dim: 6144,
+            kv_dim: 1024,
+            inter: 17408,
+            conv_dim: 6144,
+            value_dim: 4096,
+            n_v_heads: 30,
+            d_state: 128,
+            d_conv: 4,
+            delta_layers: 8,
+            max_pages_per_seq: 128,
+        };
+        let arena = hybrid_layer_major_scratch_estimate(shape, 1024).unwrap();
+        let verifier = hybrid_verify_scratch_estimate(shape, 4)
+            .unwrap()
+            .device_bytes;
+        let mandatory = hybrid_prefill_scratch_estimate(shape, 1024)
+            .unwrap()
+            .device_bytes;
+        let legacy_required = arena + HYBRID_PREFILL_ACTIVATION_RESERVE;
+
+        assert_eq!(8 * 4 * 30 * 128 * 128 * 4, 60 * 1024 * 1024);
+        assert!(mandatory > verifier);
+        assert!(legacy_required < arena + mandatory);
+        assert!(!hybrid_layer_major_activation_budget_capable(
+            shape,
+            1024,
+            Some(legacy_required)
+        ));
+        assert!(!hybrid_layer_major_activation_budget_capable(
+            shape,
+            1024,
+            Some(arena + verifier)
+        ));
+        assert!(hybrid_layer_major_activation_budget_capable(
+            shape,
+            1024,
+            Some(arena + mandatory)
+        ));
+    }
+
+    #[test]
+    fn q4k_layer_major_p512_p2048_nie_zwalnia_kursora_pierscienia() {
+        let shape = HybridPrefillScratchShape {
+            hidden: 5120,
+            q_dim: 6144,
+            kv_dim: 1024,
+            inter: 17408,
+            conv_dim: 6144,
+            value_dim: 4096,
+            n_v_heads: 30,
+            d_state: 128,
+            d_conv: 4,
+            delta_layers: 8,
+            max_pages_per_seq: 128,
+        };
+        let cursor_after_p512 = hybrid_layer_major_scratch_estimate(shape, 512).unwrap();
+        let required_p2048 = hybrid_layer_major_activation_required(shape, 2048).unwrap();
+        let available_after_p512 = required_p2048
+            .checked_sub(cursor_after_p512)
+            .expect("p2048 wymaga więcej niż zajmuje arena p512");
+
+        assert_eq!(cursor_after_p512 % HYBRID_ACTIVATION_RING_ALIGN, 0);
+        assert!(required_p2048 <= available_after_p512 + cursor_after_p512);
+        assert!(!hybrid_layer_major_activation_budget_capable(
+            shape,
+            2048,
+            Some(available_after_p512)
+        ));
+        assert!(hybrid_layer_major_prefill_limit_for_available(
+            shape,
+            available_after_p512,
+            |_| true
+        )
+        .is_some_and(|limit| limit < 2048));
+    }
+
+    #[test]
+    fn layer_major_p1024_z_limitem_p512_nie_zada_areny_p1024() {
+        let chunks = hybrid_layer_major_chunk_plan(1024, 512);
+
+        assert_eq!(chunks, [512, 512]);
+        assert!(chunks.iter().all(|&chunk| chunk <= 512));
     }
 
     #[test]

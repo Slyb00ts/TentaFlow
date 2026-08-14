@@ -532,7 +532,11 @@ impl Kernels {
             _ => None,
         }
         .filter(|name| self.artifacts.has(name));
-        if kv_dtype == DType::F16 && window == 0 && wmma_variant.is_some() {
+        if kv_dtype == DType::F16
+            && window == 0
+            && wmma_variant.is_some()
+            && !matches!(self.attn, AttnBackend::Scalar)
+        {
             let k = self
                 .artifacts
                 .get(wmma_variant.expect("wariant sprawdzony"))?;
@@ -1174,7 +1178,11 @@ impl Kernels {
         // Blok liczy CZTERY głowice Q z jednego odczytu K/V, więc stosunek GQA
         // musi być wielokrotnością czwórki — przy 8:1 dwie grupy dzielą jeden
         // strumień i czytają go dwa razy zamiast ośmiu.
-        let heads_per_kv = if n_kv_heads == 0 { 0 } else { n_q_heads / n_kv_heads };
+        let heads_per_kv = if n_kv_heads == 0 {
+            0
+        } else {
+            n_q_heads / n_kv_heads
+        };
         if n_seqs == 0
             || n_q_heads == 0
             || n_kv_heads == 0
@@ -1241,7 +1249,9 @@ impl Kernels {
             ForgeError::Kernel("attn_decode_split_gqa4: n_seqs przekracza zakres siatki".into())
         })?;
         let grid_y = u32::try_from(n_q_heads / 4).map_err(|_| {
-            ForgeError::Kernel("attn_decode_split_gqa4: liczba grup przekracza zakres siatki".into())
+            ForgeError::Kernel(
+                "attn_decode_split_gqa4: liczba grup przekracza zakres siatki".into(),
+            )
         })?;
         let grid_z = u32::try_from(n_splits).map_err(|_| {
             ForgeError::Kernel("attn_decode_split_gqa4: n_splits przekracza zakres siatki".into())
@@ -1383,5 +1393,4 @@ impl Kernels {
             .scalar(n_splits_i64);
         self.device.launch(k, &cfg, &args, stream)
     }
-
 }

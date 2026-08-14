@@ -207,6 +207,7 @@ impl Model {
         resident: usize,
         streamed: &[(usize, &SeqKv)],
     ) -> Result<()> {
+        self.kernels.qk_batch_invalidate()?;
         let p = self.weights.descriptor.params.clone();
         let hidden = p.hidden_size;
         let inter = p.intermediate_size;
@@ -547,5 +548,4 @@ impl Model {
             }
         }
     }
-
 }

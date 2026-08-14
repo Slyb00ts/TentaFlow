@@ -5,5 +5,9 @@ pub fn entries() -> Vec<ProfileEntry> {
     let mut olmoe = ModelProfile::based_on_generic("olmoe");
     olmoe.chat_template = true;
 
-    vec![ProfileEntry { arch: "olmoe", name_needle: "", profile: olmoe }]
+    vec![ProfileEntry {
+        arch: "olmoe",
+        name_needle: "",
+        profile: olmoe,
+    }]
 }

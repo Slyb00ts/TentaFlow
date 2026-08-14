@@ -15,10 +15,10 @@ license = "Apache-2.0"
 icon = "vllm"
 default_port = 8000
 api = "openai-compatible"
-version = "0.26.0"
-# PyPI vllm 0.26.0 wheels target sm_120 max — na DGX Spark (GB10, sm_121)
+version = "0.27.0"
+# PyPI vllm 0.27.0 wheels still require a dedicated DGX Spark (GB10, sm_121)
 # crashuja w FP8 / Mamba / NVFP4 kernelach. Spark dostaje osobny silnik
-# `vllm-spark` ktory buduje vllm 0.26.0 ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
+# `vllm-spark` ktory buduje vllm ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
 dgx_spark = false
 # Multi-node tensor-parallel deploy supported — the unified deploy wizard offers
 # this engine when the deploy target is a cluster.
@@ -31,15 +31,15 @@ transport = "direct-http"
 
 # Hardware-aware build. torch cu130 ma fat wheels (sm80..sm120), wiec ten sam
 # obraz dziala na Ampere/Ada/Hopper/Blackwell — default_build_args wystarcza,
-# Core taguje obraz per arch (vllm:0.26.0-cuda-ampere itd.). Spark ma osobny
+# Core taguje obraz per arch (vllm:0.27.0-cuda-ampere itd.). Spark ma osobny
 # silnik (vllm-spark, build ze zrodel pod sm_121a).
 [deploy.docker.default_build_args]
 CUDA_IMAGE = "nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
-TORCH_VERSION = "2.11.0"
-TORCHVISION_VERSION = "0.26.0"
+TORCH_VERSION = "2.13.0"
+TORCHVISION_VERSION = "0.28.0"
 TORCHAUDIO_VERSION = "2.11.0"
-VLLM_VERSION = "0.26.0"
+VLLM_VERSION = "0.27.0"
 
 [deploy.native]
 platforms = ["linux", "windows"]

@@ -974,7 +974,7 @@ Rachunek uruchomień i przestoju przez całą tę drogę (profil, kontekst 128):
 Zajętość kerneli nie drgnęła (30,65 -> 30,35 ms) i tak miało być: te fuzje nie
 przyspieszają liczenia, tylko zdejmują podatek od liczby dyspozycji.
 
-### Wynik, wszystkie cztery komórki z tą samą sumą SHA `0bf2b86b…`
+### Wynik historyczny; zweryfikowany wynik Q4_K po korekcie rdzenia
 
 Protokół: `forge bench --prompt-tokens 1024 --tokens 128 --reps 3
 --prefix-cache off`, jedna karta (`HIP_VISIBLE_DEVICES=0`), stan przed zmierzony
@@ -982,7 +982,7 @@ tym samym poleceniem na `d5c8ffc5`.
 
 | model | tryb | przed | po | |
 |---|---|--:|--:|--:|
-| Q4_K_M | bez spekulacji | 30,0 | **31,0** | +3,3% |
+| Q4_K_M | bez spekulacji | 30,0 | nieobowiązujące* | — |
 | Q4_K_M | MTP K=3 | 58,8 | **58,9** | +0,2% |
 | NVFP4 | bez spekulacji | 30,0 | **30,9** | +3,0% |
 | NVFP4 | MTP K=3 | 70,3 | **70,4** | +0,1% |
@@ -996,6 +996,11 @@ UWAGA do wcześniejszych wpisów: notowane tu `NVFP4 decode 29,1` było
 NIEAKTUALNE — ta sama binarka na `d5c8ffc5` mierzy dziś 30,0. Porównania
 „przed/po" wolno robić wyłącznie wobec przebiegu wykonanego tego samego dnia na
 tej samej maszynie, a nie wobec liczby z dokumentu.
+
+\* Niezależny oracle wykrył błąd wspólnego rdzenia Q4_K DP4A, dlatego
+wcześniejszy wynik **31,0 tok/s** nie jest miarodajny. Po korekcie, bez
+ekstrapolacji, Qwen3.6-27B Q4_K na HIP/R9700 przy p1024/tg1000 po rozgrzewce
+osiągnął **30,9 / 30,8 / 30,7 tok/s**; mediana wynosi **30,8 tok/s**.
 
 ### Czego z tego NIE da się wycisnąć więcej
 

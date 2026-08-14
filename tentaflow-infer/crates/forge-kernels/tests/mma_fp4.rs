@@ -421,7 +421,11 @@ fn tempo_mma_wedlug_szerokosci_operandu() {
     // każdy warp, ta sama liczba dla każdej rodziny.
     const ITERS: u64 = 2048 * 8;
     let d = dev
-        .alloc((blocks * threads) as usize * 4, MemKind::Device, Pool::Weights)
+        .alloc(
+            (blocks * threads) as usize * 4,
+            MemKind::Device,
+            Pool::Weights,
+        )
         .unwrap();
     let a = dev.alloc(32 * 16, MemKind::Device, Pool::Weights).unwrap();
 
@@ -431,7 +435,10 @@ fn tempo_mma_wedlug_szerokosci_operandu() {
         forge_kernels::MmaKind::Mxf4,
         forge_kernels::MmaKind::Nvf4,
     ] {
-        if kernels.mma_rate(kind, &d, &a, blocks, threads, &stream).is_err() {
+        if kernels
+            .mma_rate(kind, &d, &a, blocks, threads, &stream)
+            .is_err()
+        {
             eprintln!("{kind:?}: brak artefaktu");
             continue;
         }
