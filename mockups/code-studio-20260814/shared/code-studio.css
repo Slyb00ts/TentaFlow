@@ -857,7 +857,10 @@ html, body { height: 100%; overflow: hidden; }
   .cs-file-head .path {
     font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-2);
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
+    direction: rtl; text-align: left;      /* przy obcinaniu zostaje nazwa pliku, nie sam katalog */
   }
+  .cs-file-head .btn { flex-shrink: 0; }
+  .cs-file-head .cs-chip { flex-shrink: 0; }
   .cs-file-view { flex: 1; min-height: 0; }
   .cs-file-view .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
   .cs-file-view .cs-code { flex: 1; min-height: 0; max-height: none; font-size: 12px; }
