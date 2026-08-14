@@ -178,7 +178,7 @@ impl PortAllocator {
 
 /// Probes whether a TCP port on 127.0.0.1 can be bound right now.
 fn is_port_free(port: u16) -> bool {
-    let addr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, port);
+    let addr = SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, port);
     TcpListener::bind(addr).is_ok()
 }
 
