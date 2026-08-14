@@ -1,0 +1,110 @@
+flowchart TD
+    classDef exist fill:#bfdbfe,stroke:#1e40af,color:#000;
+    classDef change fill:#fde68a,stroke:#b45309,color:#000;
+    classDef new fill:#bbf7d0,stroke:#15803d,color:#000;
+    classDef ask fill:#fed7aa,stroke:#c2410c,stroke-width:2px,color:#000;
+    classDef io fill:#e5e7eb,stroke:#374151,color:#000;
+    classDef store fill:#ddd6fe,stroke:#5b21b6,stroke-width:2px,color:#000;
+    classDef term fill:#fecaca,stroke:#b91c1c,color:#000;
+
+    %% ------------------------------------------------------------------ wejscie
+    TRIG["trigger — start sesji / runu"]:::io
+    CH["conversation_history (read-mode)"]:::exist
+    WC["workspace_context (NOWY)<br/>wiazanie sesji mintowane przez serwer<br/>stan repo + AGENTS.md/CLAUDE.md jako DANE"]:::new
+    AC["agent_context<br/>system prompt + skille + mailbox + harness_tools"]:::exist
+
+    TRIG --> CH --> WC --> AC --> CKIND
+
+    %% ------------------------------------------------------- rozgalezienie: rodzaj runu
+    CKIND{"condition: rodzaj runu<br/>meta.trigger"}:::exist
+    CKIND -->|"user — pierwsze zlecenie"| ASK1
+    CKIND -->|"revision — wraca z uwagami"| CC
+
+    ASK1["ask_user: doprecyzuj zakres<br/>do 4 propozycji + wlasna odpowiedz"]:::ask
+    ASK1 --> SPLAN
+
+    %% --------------------------------------------------------------- planowanie
+    SPLAN["spawn: code-planner<br/>detach, run_ids -> vars"]:::exist
+    AW1["await_subagents (mode=all)"]:::exist
+    ASK2["ask_user: zatwierdz plan"]:::ask
+    SPLAN --> AW1 --> ASK2
+
+    ASK2 -->|"Zatwierdz"| CC
+    ASK2 -->|"Popraw / Podziel (2. obrot konczy run)"| OREV
+    ASK2 -->|"Anuluj"| OCAN
+
+    %% ---------------------------------------------------------------- petla agenta
+    subgraph REGION["LOOP REGION 'code_turn' — inline, jeden envelope, stop: ostatni assistant bez tool_calls"]
+        direction TB
+        CC["compact_context (gdy ctx > prog)<br/>wejscie regionu: max_iterations, final_pass"]:::exist
+        LLM["llm(tools) — tura modelu"]:::exist
+        TE["tool_exec<br/>core.fs_* / exec / git_read / ask_user / agent_spawn"]:::change
+        CC --> LLM --> TE
+        TE -. "loop_back (cap iteracji, cancel/deadline)" .-> CC
+    end
+
+    %% ------------------------------------------------- rownolegla weryfikacja (fan-out)
+    TE --> SREV
+    TE --> STEST
+    SREV["spawn: code-reviewer<br/>profil ro — nie zapisze w worktree"]:::exist
+    STEST["spawn: code-tester<br/>profil cow — build nie dotyka drzewa"]:::exist
+    AW2["await_subagents (mode=all) — fan-in"]:::exist
+    SREV --> AW2
+    STEST --> AW2
+
+    AW2 --> CVER
+    CVER{"condition: testy zielone?"}:::exist
+    CVER -->|"nie"| OREV
+    CVER -->|"tak"| REVIEW
+
+    %% ------------------------------------------------------------ przeglad czlowieka
+    REVIEW["patch_review (NOWY)<br/>diff per hunk, CAS, rekonstrukcja pliku"]:::new
+    REVIEW -->|"Odrzuc / Popraw"| OREV
+    REVIEW -->|"Akceptuj"| GCOMMIT
+
+    %% ------------------------------------------------------------------------ git
+    GCOMMIT["git_op: commit (NOWY)<br/>z ZAAKCEPTOWANYCH blobow, nie ze stanu dysku"]:::new
+    ASK3["ask_user: wypchnac / scalic?"]:::ask
+    GCOMMIT --> ASK3
+
+    ASK3 -->|"Nie"| PT
+    ASK3 -->|"Wypchnij"| GPUSH
+    ASK3 -->|"Scal"| GMERGE
+
+    GPUSH["git_op: push — mandatory_interactive"]:::new
+    GPUSH --> PT
+
+    subgraph MERGE["Scalanie przez worktree integracyjny"]
+        direction TB
+        GMERGE["git_op: merge_integration<br/>worktree --detach na expected_old"]:::new
+        MVER{"konflikt?"}:::exist
+        MTEST["spawn tester + reviewer NA WYNIKU scalenia"]:::exist
+        MREV["patch_review (scope=merge)"]:::new
+        GFIN["git_op: finalize_merge<br/>commit scalenia z zaakceptowanych blobow"]:::new
+        GREF["git_op: update_target_ref<br/>atomowo, z expected_old"]:::new
+        GMERGE --> MVER
+        MVER -->|"nie"| MTEST --> MREV
+        MREV -->|"Akceptuj"| GFIN --> GREF
+    end
+
+    MVER -->|"tak — worktree zostaje w stanie held"| OREV
+    MREV -->|"Odrzuc"| OREV
+    GREF --> PT
+
+    %% ------------------------------------------------------------------- zakonczenia
+    PT["persist_turn — zapis delty tury"]:::exist
+    OUT["output (stream)"]:::io
+    OREV["output: revision_requested<br/>trigger = review_rejected / test_failed / merge_conflict"]:::term
+    OCAN["output: cancelled"]:::term
+    PT --> OUT
+
+    %% ------------------------- petla sesji: nawrot to NOWY RUN, nie krawedz wsteczna
+    OREV ==>|"koordynator startuje run rewizji (limit 10 na sesje)"| TRIG
+
+    %% ---------------------------------------------------------------- poza grafem
+    OPS[("session_operations<br/>pre/postcondition, OID-y git")]:::store
+    EVT[("session_events + audit_outbox<br/>zdarzenia = zrodlo prawdy")]:::store
+    TE -. "kazdy efekt: pending -> completed" .-> OPS
+    GCOMMIT -. "OID blob/tree/commit/ref" .-> OPS
+    REGION -. "trace / audit / run_log" .-> EVT
+    REVIEW -. "decyzje per hunk" .-> EVT
