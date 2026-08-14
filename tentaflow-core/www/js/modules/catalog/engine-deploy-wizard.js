@@ -87,12 +87,14 @@ let cachedModelSpec = null;
 // Poprzedni stan "at_limit" — gdy zmienia sie z false->true, dodajemy
 // klase pulse na adv-pill zeby user zauwazyl ze jest na granicy.
 let prevAtLimit = false;
+let deployInFlight = false;
 
 
 /// Publiczne API: otwiera wizard dla `engineId`. `opts` opcjonalnie zawiera
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
 export async function openDeployWizard(engineId, opts = {}) {
   currentStep = 1;
+  deployInFlight = false;
   onCloseCallback = null;
   modelSourceMode = 'preset';
   hfResults = [];
@@ -3185,6 +3187,7 @@ function updateHfGgufFiles() {
 // ---- Deploy ---------------------------------------------------------------
 
 async function startDeploy() {
+  if (deployInFlight) return;
   if (selection.isCluster) {
     await startClusterDeploy();
     return;
@@ -3207,6 +3210,7 @@ async function startDeploy() {
   }
 
   if (btn) btn.setAttribute('disabled', '');
+  deployInFlight = true;
 
   const eng = engineEntry.engine || {};
   // Build vllm_args z Advanced step (jezeli aktywny dla tego silnika).
@@ -3392,6 +3396,7 @@ async function startDeploy() {
       nodeId: selection.nodeId,
     });
   } catch (err) {
+    deployInFlight = false;
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
     if (btn) btn.removeAttribute('disabled');
   }
