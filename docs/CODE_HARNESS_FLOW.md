@@ -1,12 +1,6 @@
 # Code Harness — graf harnessu
 
-Diagram poglądowy do przeglądu **kompletności i rozgałęzień** harnessu Code Studio.
-Konwencja i kolorowanie jak w `docs/target-agent-flow.mmd`. Źródło: `docs/code-harness-flow.mmd`
-(ten sam graf; tutaj w bloku, który GitHub renderuje bez żadnych narzędzi).
-
-Legenda kolorów: szary — wejście/wyjście, niebieski — blok istniejący, żółty — istniejący do zmiany,
-zielony — nowy blok, pomarańczowy z grubą ramką — **pytanie do użytkownika**, czerwony — zakończenie
-runu, fioletowy walec — trwały zapis poza grafem.
+Diagram poglądowy. Konwencja jak w `docs/target-agent-flow.mmd`. Źródło: `docs/code-harness-flow.mmd`.
 
 ```mermaid
 flowchart TD
@@ -18,131 +12,73 @@ flowchart TD
     classDef store fill:#ddd6fe,stroke:#5b21b6,stroke-width:2px,color:#000;
     classDef term fill:#fecaca,stroke:#b91c1c,color:#000;
 
-    %% ------------------------------------------------------------------ wejscie
     TRIG["trigger — start sesji / runu"]:::io
     CH["conversation_history (read-mode)"]:::exist
     WC["workspace_context (NOWY)<br/>wiazanie sesji mintowane przez serwer<br/>stan repo + AGENTS.md/CLAUDE.md jako DANE"]:::new
-    AC["agent_context<br/>system prompt + skille + mailbox + harness_tools"]:::exist
+    AC["agent_context<br/>agent sesji + JEGO model -> meta['model']<br/>skille, mailbox, harness_tools, budzet"]:::exist
 
-    TRIG --> CH --> WC --> AC --> CKIND
+    TRIG --> CH --> WC --> AC --> CC
 
-    %% ------------------------------------------------------- rozgalezienie: rodzaj runu
-    CKIND{"condition: rodzaj runu<br/>meta.trigger"}:::exist
-    CKIND -->|"user — pierwsze zlecenie"| ASK1
-    CKIND -->|"revision — wraca z uwagami"| CC
-
-    ASK1["ask_user: doprecyzuj zakres<br/>do 4 propozycji + wlasna odpowiedz"]:::ask
-    ASK1 --> SPLAN
-
-    %% --------------------------------------------------------------- planowanie
-    SPLAN["spawn: code-planner<br/>detach, run_ids -> vars"]:::exist
-    AW1["await_subagents (mode=all)"]:::exist
-    ASK2["ask_user: zatwierdz plan"]:::ask
-    SPLAN --> AW1 --> ASK2
-
-    ASK2 -->|"Zatwierdz"| CC
-    ASK2 -->|"Popraw / Podziel (2. obrot konczy run)"| OREV
-    ASK2 -->|"Anuluj"| OCAN
-
-    %% ---------------------------------------------------------------- petla agenta
-    subgraph REGION["LOOP REGION 'code_turn' — inline, jeden envelope, stop: ostatni assistant bez tool_calls"]
+    subgraph REGION["LOOP REGION 'code_turn' — jedna petla nad jedna historia, jak w Claude Code / Codex"]
         direction TB
         CC["compact_context (gdy ctx > prog)<br/>wejscie regionu: max_iterations, final_pass"]:::exist
-        LLM["llm(tools) — tura modelu"]:::exist
-        TE["tool_exec<br/>core.fs_* / exec / git_read / ask_user / agent_spawn"]:::change
+        LLM["llm(tools) — tura modelu<br/>model PUSTY w bloku: bierze sie z agenta"]:::exist
+        TE["tool_exec — TU dzieje sie cala robota:<br/>fs_read / fs_edit · exec (cargo test, build)<br/>git_read · code_search<br/>core.ask_user + zgody -> waiting_user<br/>core.agent_spawn -> subagent w tle"]:::change
         CC --> LLM --> TE
-        TE -. "loop_back (cap iteracji, cancel/deadline)" .-> CC
+        TE -. "loop_back — czerwone testy to KOLEJNA ITERACJA,<br/>nie rozgalezienie grafu" .-> CC
     end
 
-    %% ------------------------------------------------- rownolegla weryfikacja (fan-out)
-    TE --> SREV
-    TE --> STEST
-    SREV["spawn: code-reviewer<br/>profil ro — nie zapisze w worktree"]:::exist
-    STEST["spawn: code-tester<br/>profil cow — build nie dotyka drzewa"]:::exist
-    AW2["await_subagents (mode=all) — fan-in"]:::exist
-    SREV --> AW2
-    STEST --> AW2
+    TE --> REVIEW
 
-    AW2 --> CVER
-    CVER{"condition: testy zielone?"}:::exist
-    CVER -->|"nie"| OREV
-    CVER -->|"tak"| REVIEW
+    REVIEW["patch_review (NOWY)<br/>przeglad CZLOWIEKA: diff per hunk, CAS"]:::new
+    CREV{"zaakceptowany?"}:::exist
+    REVIEW --> CREV
+    CREV -->|"nie"| OREV
+    CREV -->|"tak"| GCOMMIT
 
-    %% ------------------------------------------------------------ przeglad czlowieka
-    REVIEW["patch_review (NOWY)<br/>diff per hunk, CAS, rekonstrukcja pliku"]:::new
-    REVIEW -->|"Odrzuc / Popraw"| OREV
-    REVIEW -->|"Akceptuj"| GCOMMIT
-
-    %% ------------------------------------------------------------------------ git
-    GCOMMIT["git_op: commit (NOWY)<br/>z ZAAKCEPTOWANYCH blobow, nie ze stanu dysku"]:::new
-    ASK3["ask_user: wypchnac / scalic?"]:::ask
-    GCOMMIT --> ASK3
-
-    ASK3 -->|"Nie"| PT
-    ASK3 -->|"Wypchnij"| GPUSH
-    ASK3 -->|"Scal"| GMERGE
-
-    GPUSH["git_op: push — mandatory_interactive"]:::new
-    GPUSH --> PT
-
-    subgraph MERGE["Scalanie przez worktree integracyjny"]
-        direction TB
-        GMERGE["git_op: merge_integration<br/>worktree --detach na expected_old"]:::new
-        MVER{"konflikt?"}:::exist
-        MTEST["spawn tester + reviewer NA WYNIKU scalenia"]:::exist
-        MREV["patch_review (scope=merge)"]:::new
-        GFIN["git_op: finalize_merge<br/>commit scalenia z zaakceptowanych blobow"]:::new
-        GREF["git_op: update_target_ref<br/>atomowo, z expected_old"]:::new
-        GMERGE --> MVER
-        MVER -->|"nie"| MTEST --> MREV
-        MREV -->|"Akceptuj"| GFIN --> GREF
-    end
-
-    MVER -->|"tak — worktree zostaje w stanie held"| OREV
-    MREV -->|"Odrzuc"| OREV
-    GREF --> PT
-
-    %% ------------------------------------------------------------------- zakonczenia
+    GCOMMIT["git_op: commit (NOWY)<br/>buduje KOORDYNATOR z zaakceptowanych blobow"]:::new
+    ASK["ask_user: wypchnac / scalic?<br/>push i merge zawsze pytaja"]:::ask
     PT["persist_turn — zapis delty tury"]:::exist
-    OUT["output (stream)"]:::io
-    OREV["output: revision_requested<br/>trigger = review_rejected / test_failed / merge_conflict"]:::term
-    OCAN["output: cancelled"]:::term
-    PT --> OUT
+    OUT["output (stream) — sesja wraca do idle"]:::io
+    OREV["output: revision_requested<br/>koordynator startuje NOWY run (limit 10/sesje)"]:::term
 
-    %% ------------------------- petla sesji: nawrot to NOWY RUN, nie krawedz wsteczna
-    OREV ==>|"koordynator startuje run rewizji (limit 10 na sesje)"| TRIG
+    GCOMMIT --> ASK --> PT --> OUT
+    OREV ==>|"petla SESJI, pietro wyzej niz petla agenta"| TRIG
 
-    %% ---------------------------------------------------------------- poza grafem
     OPS[("session_operations<br/>pre/postcondition, OID-y git")]:::store
-    EVT[("session_events + audit_outbox<br/>zdarzenia = zrodlo prawdy")]:::store
+    EVT[("session_events + audit_outbox")]:::store
     TE -. "kazdy efekt: pending -> completed" .-> OPS
     GCOMMIT -. "OID blob/tree/commit/ref" .-> OPS
     REGION -. "trace / audit / run_log" .-> EVT
-    REVIEW -. "decyzje per hunk" .-> EVT
 ```
 
-## Co ten diagram ma udowodnić
+## Zasada podziału: co jest w pętli, a co poza nią
 
-**Rozgałęzienia są jawne, nie ukryte w prompcie.** Cztery miejsca rozdzielają przepływ i każde ma
-policzalne wyjścia: `condition` rodzaju runu (2), `ask_user` zatwierdzenia planu (3), `condition`
-wyniku testów (2), `patch_review` (2) i `ask_user` dostarczenia (3). Żadnej z tych decyzji nie da się
-pominąć edycją instrukcji dla modelu, bo są krawędziami grafu.
+**W pętli jest wszystko, co agent może zrobić i powtórzyć.** Czytanie i edycja plików, uruchamianie
+testów i buildów, wyszukiwanie, delegacja do subagenta, pytania do użytkownika i prośby o zgodę.
+Czerwone testy nie są rozgałęzieniem grafu — agent dostaje wynik jako rezultat narzędzia, poprawia
+kod i odpala je znowu. To kolejna iteracja tej samej pętli, dokładnie jak w Claude Code i Codeksie,
+gdzie cały harness to jeden `loop` nad jedną narastającą historią (`docs/CODEX_HARNESS_INTERNALS.md`).
 
-**Pętla jest jedna i widoczna.** Region `code_turn` obejmuje `compact_context → llm → tool_exec`
-z krawędzią `loop_back`; to jedyny cykl w całym grafie. Zatrzymuje go warunek strukturalny —
-ostatnia wypowiedź modelu bez wywołań narzędzi — a nie magiczna flaga w metadanych.
+Pętla kończy się **strukturalnie**: gdy model przestaje wołać narzędzia. Nie ma warunku „testy
+zielone?", bo to agent ma doprowadzić je do zieleni, zanim uzna robotę za skończoną.
 
-**Nawrót po odrzuceniu to nowy run, nie krawędź wsteczna.** Gruba strzałka z `revision_requested`
-do `trigger` przecina cały diagram celowo: rdzeń nie przyjmuje cyklu w zewnętrznym DAG-u, więc
-iteracja żyje na poziomie sesji i jest widoczna jako łańcuch runów z podanym powodem.
+**Poza pętlą zostaje tylko to, czego agentowi nie wolno zrobić samemu.** Przegląd zmian przez
+człowieka, commit budowany przez koordynatora z zaakceptowanych blobów, wypchnięcie albo scalenie.
+Trzy bloki — każdy dlatego, że wymaga kogoś innego niż agent, a nie dlatego, że tak wygląda porządniej.
 
-**Równoległość jest narysowana.** `tool_exec` rozwidla się na przegląd i testy, które zbiegają się
-w `await_subagents`. Profile wykonania stoją przy blokach, bo to one, a nie zaufanie do agenta,
-decydują, że reviewer nie zapisze w drzewie roboczym, a build testera go nie dotknie.
+Odrzucenie w przeglądzie nie wraca krawędzią wsteczną: kończy run jako `revision_requested`,
+a koordynator startuje kolejny z uwagami. To **pętla sesji**, piętro wyżej niż pętla agenta —
+rdzeń i tak odrzuciłby cykl w zewnętrznym DAG-u (R11 + toposort Kahna).
 
-**Scalanie jest osobnym podgrafem, bo ma własny cykl decyzyjny.** Worktree integracyjny, konflikt
-zostawiający go w stanie `held`, testy i przegląd na wyniku scalenia, `finalize_merge` z
-zaakceptowanych blobów i dopiero atomowy `update_target_ref`.
+## Skąd bierze się model
 
-**Poza grafem zostaje tylko to, co i tak jest zapisem.** Przerywane krawędzie do `session_operations`
-i `session_events` pokazują dziennik efektów i zdarzeń — nie kroki procesu, lecz jego ślad.
+Blok `llm` ma pole `model` **puste**, tak jak w zaseedowanym „Agent Run" (`seed.rs:1376`).
+Model wnosi agent: `agent_context` bierze go z `agents.model` i stempluje w `meta['model']`
+(`agent_context.rs:303-312`), a `llm` czyta stamtąd (`llm.rs:36-52`). Dzięki temu jeden blok
+w grafie obsługuje wszystkich agentów — każdy ze swoim modelem, narzędziami i skillami.
+
+Agent jest wybierany na trzy sposoby: `agent_context` wskazuje agenta sesji, blok `spawn` wskazuje
+subagenta wprost w grafie, a `core.agent_spawn` pozwala orkiestratorowi wybrać go w trakcie pracy.
+Czwarta droga, `agent_router`, dobiera agenta modelem spośród oznaczonych `routable` — tutaj nieużywana,
+bo agent sesji jest znany od startu.
