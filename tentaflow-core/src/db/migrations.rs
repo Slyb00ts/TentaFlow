@@ -647,7 +647,83 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "managed_cli_service_tags",
             MigrationStep::RustSelfManaged(managed_cli_service_tags),
         ),
+        (
+            122,
+            "service_usage_snapshot",
+            MigrationStep::Sql(SERVICE_USAGE_SNAPSHOT),
+        ),
+        (
+            123,
+            "conversation_messages_reasoning_content",
+            MigrationStep::Sql(CONVERSATION_MESSAGES_REASONING_CONTENT),
+        ),
+        (
+            124,
+            "benchmark_targets_local_api_type",
+            MigrationStep::RustSelfManaged(benchmark_targets_allow_local_api_type),
+        ),
     ]
+}
+
+const SERVICE_USAGE_SNAPSHOT: &str = r#"
+ALTER TABLE services ADD COLUMN usage_json TEXT;
+ALTER TABLE services ADD COLUMN usage_updated_at TEXT;
+"#;
+
+const CONVERSATION_MESSAGES_REASONING_CONTENT: &str = r#"
+ALTER TABLE conversation_messages ADD COLUMN reasoning_content TEXT;
+"#;
+
+/// v124 — a benchmark target may now be measured IN-PROCESS (`api_type='local'`),
+/// which is the only way to reach a backend without a dialable chat endpoint:
+/// embedded llama.cpp / MLX, a QUIC sidecar, a coding-agent bridge. SQLite cannot
+/// alter a CHECK constraint, so the table is rebuilt. `kind` keeps its two values
+/// — it records WHERE the target came from (picked from the service list vs typed
+/// by hand), while `api_type` says how we talk to it.
+fn benchmark_targets_allow_local_api_type(
+    conn: &Connection,
+    version: i64,
+    name: &str,
+) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+CREATE TABLE benchmark_targets_local_new (
+    id            TEXT PRIMARY KEY,
+    benchmark_id  TEXT NOT NULL REFERENCES benchmarks(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('service','external')),
+    service_ref   TEXT,
+    api_type      TEXT NOT NULL DEFAULT 'openai'
+                  CHECK (api_type IN ('openai','anthropic','local')),
+    host          TEXT NOT NULL,
+    port          INTEGER NOT NULL DEFAULT 0,
+    api_key_enc   TEXT,
+    model         TEXT NOT NULL,
+    label         TEXT NOT NULL
+);
+INSERT INTO benchmark_targets_local_new SELECT
+    id, benchmark_id, kind, service_ref, api_type, host, port, api_key_enc, model, label
+FROM benchmark_targets;
+DROP TABLE benchmark_targets;
+ALTER TABLE benchmark_targets_local_new RENAME TO benchmark_targets;
+CREATE INDEX idx_benchmark_targets_benchmark ON benchmark_targets(benchmark_id);
+"#,
+        )?;
+        let violations = foreign_key_check(&tx)?;
+        if !violations.is_empty() {
+            anyhow::bail!("benchmark_targets_local_api_type: {}", violations.join("; "));
+        }
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 fn managed_cli_service_tags(conn: &Connection, version: i64, name: &str) -> Result<()> {
@@ -1648,7 +1724,9 @@ fn recordings_add_search_columns(conn: &Connection) -> Result<()> {
 /// OCR/classify budget on positions they do not care about.
 fn cameras_add_zones_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "zones_json")? {
-        conn.execute_batch("ALTER TABLE cameras ADD COLUMN zones_json TEXT NOT NULL DEFAULT '[]';")?;
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN zones_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
     }
     Ok(())
 }
@@ -3870,7 +3948,13 @@ fn roles_add_robot_permissions(conn: &Connection) -> Result<()> {
 fn roles_add_project_studio_permissions(conn: &Connection) -> Result<()> {
     roles_add_permissions(
         conn,
-        &["org_admin", "org_operator", "org_viewer", "dpo", "supervisor"],
+        &[
+            "org_admin",
+            "org_operator",
+            "org_viewer",
+            "dpo",
+            "supervisor",
+        ],
         &["project_studio.read"],
     )?;
     roles_add_permissions(conn, &["org_admin"], &["project_studio.admin"])
@@ -8154,6 +8238,47 @@ mod tests {
         if let Some(json) = stored {
             assert_eq!(json, crate::db::seed::agent_run_flow_json());
         }
+    }
+
+    /// An in-process benchmark target (`api_type='local'`) must survive the
+    /// CHECK constraint on a fully migrated DB. v107 created the table admitting
+    /// only openai/anthropic, so without the v124 rebuild every save of an
+    /// embedded / coding-agent / sidecar target fails at the DB layer.
+    #[test]
+    fn migrated_db_accepts_in_process_benchmark_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let org: String = conn
+            .query_row("SELECT org_id FROM organizations LIMIT 1", [], |r| r.get(0))
+            .expect("seeded org");
+        conn.execute(
+            "INSERT INTO benchmarks (id, org_id, name, config_json) VALUES ('b1', ?1, 'b', '{}')",
+            rusqlite::params![org],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO benchmark_targets
+                 (id, benchmark_id, kind, api_type, host, port, model, label)
+             VALUES ('t1', 'b1', 'service', 'local', '', 0, 'bielik-4.5b', 'Bielik')",
+            [],
+        )
+        .expect("in-process target must pass the api_type CHECK");
+        // The two endpoint protocols keep working, and an unknown one is still rejected.
+        conn.execute(
+            "INSERT INTO benchmark_targets
+                 (id, benchmark_id, kind, api_type, host, port, model, label)
+             VALUES ('t2', 'b1', 'external', 'anthropic', 'api.anthropic.com', 443, 'm', 'A')",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO benchmark_targets
+                     (id, benchmark_id, kind, api_type, host, port, model, label)
+                 VALUES ('t3', 'b1', 'external', 'grpc', 'h', 1, 'm', 'G')",
+                [],
+            )
+            .is_err());
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by
