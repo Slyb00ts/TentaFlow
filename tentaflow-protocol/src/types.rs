@@ -33,6 +33,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 /// Pola:
 /// - `role`: Rola nadawcy ("system" | "user" | "assistant")
 /// - `content`: Treść wiadomości (tekst)
+/// - `reasoning_content`: opcjonalne rozumowanie zachowane przy replayu
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
 pub struct Message {
     /// Rola nadawcy: "system", "user", "assistant"
@@ -40,6 +41,10 @@ pub struct Message {
 
     /// Treść wiadomości (tekst)
     pub content: String,
+
+    /// Reasoning content returned by reasoning models.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 /// Message dla vision request (może zawierać tekst + obrazy).

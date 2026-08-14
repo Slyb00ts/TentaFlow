@@ -488,7 +488,7 @@ impl TentaFlowClient {
             None => {
                 let msgs: Vec<Message> = messages
                     .into_iter()
-                    .map(|(role, content)| Message { role, content })
+                    .map(|(role, content)| Message { role, content, reasoning_content: None })
                     .collect();
                 (None, msgs, None)
             }

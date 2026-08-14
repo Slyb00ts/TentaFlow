@@ -23236,13 +23236,14 @@ fn row_to_conversation_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbCo
         seq: row.get(2)?,
         role: row.get(3)?,
         content: row.get(4)?,
-        tool_calls: row.get(5)?,
-        tool_call_id: row.get(6)?,
-        name: row.get(7)?,
-        payload_ref: row.get(8)?,
-        payload_kind: row.get(9)?,
-        node_id: row.get(10)?,
-        created_at: row.get(11)?,
+        reasoning_content: row.get(5)?,
+        tool_calls: row.get(6)?,
+        tool_call_id: row.get(7)?,
+        name: row.get(8)?,
+        payload_ref: row.get(9)?,
+        payload_kind: row.get(10)?,
+        node_id: row.get(11)?,
+        created_at: row.get(12)?,
     })
 }
 
@@ -23270,14 +23271,15 @@ pub fn insert_conversation_messages(
     for m in messages {
         let affected = tx.execute(
             "INSERT OR IGNORE INTO conversation_messages
-                (session_id, seq, role, content, tool_calls, tool_call_id, name,
-                 payload_ref, payload_kind, node_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (session_id, seq, role, content, reasoning_content, tool_calls,
+                 tool_call_id, name, payload_ref, payload_kind, node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 session_id,
                 next_seq,
                 m.role,
                 m.content,
+                m.reasoning_content,
                 m.tool_calls,
                 m.tool_call_id,
                 m.name,
@@ -23304,8 +23306,8 @@ pub fn recent_conversation_messages(
     // Take the newest `limit` rows (seq DESC) then flip to chronological order
     // so the caller receives oldest-first without loading the whole session.
     let mut stmt = conn.prepare_cached(
-        "SELECT id, session_id, seq, role, content, tool_calls, tool_call_id, name,
-                payload_ref, payload_kind, node_id, created_at
+        "SELECT id, session_id, seq, role, content, reasoning_content, tool_calls,
+                tool_call_id, name, payload_ref, payload_kind, node_id, created_at
          FROM (
             SELECT * FROM conversation_messages
             WHERE session_id = ?1

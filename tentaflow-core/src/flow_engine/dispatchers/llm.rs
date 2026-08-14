@@ -93,6 +93,7 @@ impl LlmRequest {
 #[derive(Debug, Clone)]
 pub struct LlmResponse {
     pub content: String,
+    pub reasoning_content: Option<String>,
     pub usage: TokenUsage,
     pub finish_reason: super::super::envelope::FinishReason,
     /// Tool invocations requested by the model. Empty when the backend

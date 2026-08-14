@@ -115,6 +115,7 @@ mod tests {
         let assistant = ChatMessage {
             role: ChatRole::Assistant,
             content: ChatMessageContent::Text(String::new()),
+            reasoning_content: None,
             name: None,
             tool_call_id: None,
             tool_calls: Some(vec![LlmToolCall {
@@ -126,6 +127,7 @@ mod tests {
         let tool_result = ChatMessage {
             role: ChatRole::Tool,
             content: ChatMessageContent::Text("18C".into()),
+            reasoning_content: None,
             name: Some("get_weather".into()),
             tool_call_id: Some("call_1".into()),
             tool_calls: None,
@@ -138,6 +140,22 @@ mod tests {
         assert_eq!(h.len(), 2);
         assert_eq!(h[0], assistant);
         assert_eq!(h[1], tool_result);
+    }
+
+    #[tokio::test]
+    async fn reasoning_content_round_trips_through_history() {
+        let store = ConversationHistoryImpl::new(test_db());
+        let mut assistant = ChatMessage::assistant("final answer");
+        assistant.reasoning_content = Some("private reasoning".into());
+
+        store.append("s", assistant.clone()).await.unwrap();
+
+        let history = store.recent("s", 10).await.unwrap();
+        assert_eq!(history, vec![assistant]);
+        assert_eq!(
+            history[0].reasoning_content.as_deref(),
+            Some("private reasoning")
+        );
     }
 
     #[tokio::test]

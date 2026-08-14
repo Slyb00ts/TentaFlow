@@ -233,9 +233,9 @@ impl NodeAdapter for VisionNodeAdapter {
 
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Text(response.content.clone());
-        out.context
-            .messages
-            .push(ChatMessage::assistant(response.content));
+        let mut assistant = ChatMessage::assistant(response.content);
+        assistant.reasoning_content = response.reasoning_content;
+        out.context.messages.push(assistant);
         Ok(out)
     }
 }

@@ -1364,6 +1364,7 @@ pub struct DbConversationMessage {
     pub seq: i64,
     pub role: String,
     pub content: Option<String>,
+    pub reasoning_content: Option<String>,
     /// JSON-encoded `Vec<LlmToolCall>` for assistant tool calls; NULL otherwise.
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,
@@ -1382,6 +1383,7 @@ pub struct DbConversationMessage {
 pub struct NewConversationMessage<'a> {
     pub role: &'a str,
     pub content: Option<&'a str>,
+    pub reasoning_content: Option<&'a str>,
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<&'a str>,
     pub name: Option<&'a str>,

@@ -633,6 +633,7 @@ async fn dispatch_to_service(
             messages: vec![Message {
                 role: "user".to_string(),
                 content: request_json.to_string(),
+                reasoning_content: None,
             }],
             temperature: None,
             max_tokens: None,

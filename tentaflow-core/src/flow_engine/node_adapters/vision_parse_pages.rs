@@ -128,6 +128,7 @@ mod tests {
         ) -> Result<LlmResponse> {
             Ok(LlmResponse {
                 content: "# strona".into(),
+                reasoning_content: None,
                 tool_calls: Vec::new(),
                 finish_reason: crate::flow_engine::envelope::FinishReason::Stop,
                 usage: TokenUsage::default(),

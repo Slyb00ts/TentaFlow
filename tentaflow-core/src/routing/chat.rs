@@ -434,6 +434,10 @@ impl Router {
                     .choices
                     .first()
                     .and_then(|c| c.finish_reason.clone());
+                let reasoning_content = response
+                    .choices
+                    .first()
+                    .and_then(|c| c.message.reasoning_content.clone());
 
                 let metrics = response.usage.map(|usage| ModelMetrics {
                     model_name: response.model.clone(),
@@ -452,7 +456,7 @@ impl Router {
                     request_id,
                     result: ModelResult::Completion(CompletionResult {
                         text: cleaned_content,
-                        reasoning_content: None,
+                        reasoning_content,
                         model: model_name,
                         finish_reason,
                         tool_calls: None,

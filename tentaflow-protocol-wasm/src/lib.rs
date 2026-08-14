@@ -401,6 +401,7 @@ pub fn encode_chat_stream_request_simple(
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: user_message,
+            reasoning_content: None,
         }],
         temperature: None,
         max_tokens: None,

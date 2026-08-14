@@ -38,6 +38,14 @@ pub fn flow_outcome_to_chat_response(
         .find(|m| m.role == ChatRole::Assistant)
         .and_then(|m| m.tool_calls.as_ref())
         .map(|tcs| tcs.iter().map(envelope_tool_call_to_openai).collect());
+    let reasoning_content = outcome
+        .final_envelope
+        .context
+        .messages
+        .iter()
+        .rev()
+        .find(|m| m.role == ChatRole::Assistant)
+        .and_then(|m| m.reasoning_content.clone());
 
     ChatCompletionResponse {
         id: generate_response_id(),
@@ -49,7 +57,7 @@ pub fn flow_outcome_to_chat_response(
             message: Message {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(content.into_owned())),
-                reasoning_content: None,
+                reasoning_content,
                 name: None,
                 tool_calls,
                 tool_call_id: None,

@@ -276,6 +276,7 @@ impl NodeAdapter for LlmNodeAdapter {
         let mut out: FlowEnvelope = (**envelope).clone();
         out.payload = FlowValue::Text(response.content.clone());
         let mut assistant = ChatMessage::assistant(response.content);
+        assistant.reasoning_content = response.reasoning_content;
         if !response.tool_calls.is_empty() {
             // Tool calls ride on the assistant message so downstream nodes
             // (tool executor, converter) see them in conversation context.

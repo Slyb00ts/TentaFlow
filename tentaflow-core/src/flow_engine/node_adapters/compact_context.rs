@@ -653,6 +653,7 @@ mod tests {
             *self.last_user.lock().unwrap() = req.messages[1].text_or_default();
             Ok(LlmResponse {
                 content: self.summary.clone(),
+                reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
                 tool_calls: Vec::new(),
