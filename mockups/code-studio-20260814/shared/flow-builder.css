@@ -15,6 +15,14 @@
 
 .fb-shell { display: flex; flex-direction: column; flex: 1; min-height: 0; }
 
+/* Ikony sprite'a są konturowe (stroke-based). Goły <svg> bez klasy .icon
+   dostaje domyślne fill:black, więc bez tej reguły ikony w builderze są
+   czarnymi plamami — tak samo jak w tentaflow-core/www/css/flows-builder.css. */
+.fb-shell svg:not(.icon) { fill: none; stroke: currentColor; stroke-width: 2;
+  stroke-linecap: round; stroke-linejoin: round; }
+.fb-shell svg.fb-edges { stroke: none; }
+.fb-shell svg [fill="currentColor"] { fill: currentColor; stroke: none; }
+
 /* ---- Górny pasek ---- */
 .fb-topbar { display: flex; align-items: center; gap: 12px; padding: 0 16px; flex-shrink: 0;
   background: linear-gradient(180deg, var(--bg-2), var(--bg));
