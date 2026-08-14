@@ -48,6 +48,9 @@ pub enum BackendHandle {
         node_id: String,
         engine_id: String,
     },
+    /// Local Codex/Claude Code bridge. Requests are translated into managed
+    /// CLI sessions by the runtime executor instead of OpenAI-compatible HTTP.
+    AgentRpc,
 }
 
 impl BackendHandle {
@@ -58,6 +61,7 @@ impl BackendHandle {
         match self {
             BackendHandle::Http(_) => true,
             BackendHandle::Embedded { .. } => true,
+            BackendHandle::AgentRpc => true,
             BackendHandle::Quic(handle) => {
                 // `client` siedzi pod async RwLock; tu tylko fast-path. Kiedy
                 // reconnect loop jeszcze nie ustawil clienta, traktujemy jako
@@ -99,6 +103,7 @@ impl BackendHandle {
             } => {
                 format!("embedded:{engine_id}:{model_name}")
             }
+            BackendHandle::AgentRpc => "agent-rpc".to_string(),
         }
     }
 }
@@ -137,6 +142,10 @@ impl LiveHandlesCache {
         svc: &ServiceInfo,
         creds: Option<ExternalProviderCreds>,
     ) -> Result<()> {
+        if svc.transport == Transport::AgentRpc.as_db_tag() {
+            self.insert(svc.node_id.clone(), svc.id, BackendHandle::AgentRpc);
+            return Ok(());
+        }
         // Snapshot-driven inserts (mesh sync) pass `creds = None` — the
         // broadcast `ServiceInfo` carries no secrets. The owning node's deploy
         // handler resolves the decrypted external-provider creds itself;
@@ -224,7 +233,10 @@ pub struct ExternalProviderCreds {
 /// `creds` carries the decrypted key / subscription routing for external cloud
 /// providers; `None` for local engines that need no key (vllm/ollama) and for
 /// remote services reached over the mesh.
-pub fn build_handle(svc: &ServiceInfo, creds: Option<ExternalProviderCreds>) -> Result<BackendHandle> {
+pub fn build_handle(
+    svc: &ServiceInfo,
+    creds: Option<ExternalProviderCreds>,
+) -> Result<BackendHandle> {
     let transport = Transport::from_db_tag(&svc.transport)?;
     match transport {
         Transport::Embedded => {
@@ -420,6 +432,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 0,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![ServiceModelEntry {
                 model_name: model.to_string(),
                 display_name: None,
@@ -434,8 +448,8 @@ mod tests {
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-                    cluster_deployment_id: String::new(),
-}
+            cluster_deployment_id: String::new(),
+        }
     }
 
     #[test]
@@ -456,6 +470,21 @@ mod tests {
 
         let removed = cache.remove("nodeA", 42).expect("removed");
         assert!(matches!(removed, BackendHandle::Embedded { .. }));
+        assert!(cache.is_empty());
+    }
+
+    #[test]
+    fn agent_rpc_service_does_not_create_inference_handle() {
+        let cache = LiveHandlesCache::new();
+        let mut service = embedded_svc(7, "nodeA", "codex/default");
+        service.engine_id = "codex".to_string();
+        service.category = "agents".to_string();
+        service.transport = Transport::AgentRpc.as_db_tag().to_string();
+
+        cache
+            .upsert_service_info(&service, None)
+            .expect("agent RPC service should be accepted without an inference handle");
+
         assert!(cache.is_empty());
     }
 

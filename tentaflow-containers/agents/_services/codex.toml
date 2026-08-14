@@ -2,7 +2,7 @@
 id = "codex"
 category = "agents"
 resource_kind = "ai"
-provider = "coding-agents"
+provider = "external"
 name = "Codex"
 description_pl = "Oficjalny Codex CLI z trwałymi sesjami, narzędziami i dostępem do workspace."
 description_en = "Official Codex CLI with durable sessions, tools, and workspace access."
@@ -14,6 +14,9 @@ api = "custom"
 version = "0.146.0"
 requires_model = false
 gpu_supported = false
+service_surfaces = ["chat"]
+input_modalities = ["text"]
+output_modalities = ["text"]
 
 [deploy.docker]
 context_path = "agents"

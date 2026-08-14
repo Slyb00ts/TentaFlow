@@ -884,18 +884,30 @@ impl Supervisor {
     }
 
     async fn sync_coding_agent_models(&self, services: &[ServiceRow]) {
-        const INTERVAL: Duration = Duration::from_secs(300);
+        const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
+        const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
         for service in services {
             if service.transport != Transport::AgentRpc
-                || !matches!(service.status, ServiceStatus::Running | ServiceStatus::Degraded)
+                || !matches!(
+                    service.status,
+                    ServiceStatus::Running | ServiceStatus::Degraded
+                )
             {
                 continue;
             }
+            let interval = match self.model_count(service.id).await {
+                Ok(0) => DISCOVERY_RETRY_INTERVAL,
+                Ok(_) => REFRESH_INTERVAL,
+                Err(error) => {
+                    tracing::debug!(service_id = service.id, %error, "coding-agent model count failed");
+                    DISCOVERY_RETRY_INTERVAL
+                }
+            };
             {
                 let mut last = self.agent_model_sync.lock().await;
                 if last
                     .get(&service.id)
-                    .is_some_and(|instant| instant.elapsed() < INTERVAL)
+                    .is_some_and(|instant| instant.elapsed() < interval)
                 {
                     continue;
                 }
@@ -1072,6 +1084,7 @@ impl Supervisor {
             .mesh_registry
             .visible_services()
             .into_iter()
+            .filter(|svc| svc.transport != Transport::AgentRpc.as_db_tag())
             .filter(|svc| {
                 if svc.node_id == local_id {
                     return true;
@@ -2484,6 +2497,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 0,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![tentaflow_protocol::ServiceModelEntry {
                 model_name: "qwen-tiny".into(),
                 display_name: None,
@@ -2498,8 +2513,8 @@ mod tests {
             updated_at: "2026-01-01 00:00:00".into(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-                    cluster_deployment_id: String::new(),
-};
+            cluster_deployment_id: String::new(),
+        };
         registry.replace_node("peerB".into(), vec![remote_svc]);
 
         sup.reconcile_handles().await;

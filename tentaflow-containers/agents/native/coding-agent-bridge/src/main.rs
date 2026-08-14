@@ -146,13 +146,18 @@ async fn main() -> Result<()> {
         .route("/auth/status", get(auth_status))
         .route("/auth/start", post(auth_start))
         .route("/models", get(list_models))
+        .route("/usage", get(usage))
         .route("/sessions", get(list_sessions).post(create_session))
         .route("/sessions/{id}/turn", post(start_turn))
         .route("/sessions/{id}/input", post(send_input))
         .route("/sessions/{id}/events", get(list_events))
         .with_state(state);
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8765".into()).parse()?;
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port)).await?;
+    let bind_host = env::var("TENTAFLOW_BIND_HOST").unwrap_or_else(|_| "127.0.0.1".into());
+    if !matches!(bind_host.as_str(), "127.0.0.1" | "0.0.0.0") {
+        return Err(anyhow!("unsupported TENTAFLOW_BIND_HOST {bind_host:?}"));
+    }
+    let listener = tokio::net::TcpListener::bind((bind_host.as_str(), port)).await?;
     axum::serve(listener, app).await?;
     Ok(())
 }
@@ -222,19 +227,21 @@ async fn auth_status(State(state): State<AppState>) -> (StatusCode, Json<Value>)
 }
 
 async fn authentication_status(provider: Provider) -> Result<(bool, String)> {
-    let result = if provider == Provider::Codex {
-        Command::new("codex")
-            .args(["login", "status"])
-            .output()
-            .await
+    let mut command = if provider == Provider::Codex {
+        let mut command = Command::new("codex");
+        command.args(["login", "status"]);
+        command
     } else {
-        Command::new("claude")
-            .arg("auth")
-            .arg("status")
-            .output()
-            .await
+        let mut command = Command::new("claude");
+        command.args(["auth", "status"]);
+        command
     };
-    let output = result?;
+    command
+        .stdin(std::process::Stdio::null())
+        .kill_on_drop(true);
+    let output = tokio::time::timeout(std::time::Duration::from_secs(10), command.output())
+        .await
+        .context("authentication status timed out")??;
     let text = format!(
         "{}{}",
         String::from_utf8_lossy(&output.stdout),
@@ -343,6 +350,192 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             }
         }
     }
+}
+
+async fn usage(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+    require_authenticated(state.provider).await?;
+    match state.provider {
+        Provider::Codex => {
+            let events = Arc::new(SyncMutex::new(Vec::new()));
+            let runtime =
+                CodexRuntime::connect(&state.workspace_root.to_string_lossy(), events).await?;
+            let response = runtime
+                .request("account/rateLimits/read", Value::Null)
+                .await?;
+            let result = response
+                .get("result")
+                .ok_or_else(|| ApiError::internal("Codex usage response has no result"))?;
+            Ok(Json(normalize_codex_usage(result)))
+        }
+        Provider::ClaudeCode => {
+            let events = Arc::new(SyncMutex::new(Vec::new()));
+            let mut runtime = spawn_terminal(
+                state.provider,
+                None,
+                false,
+                &state.workspace_root.to_string_lossy(),
+                events.clone(),
+                false,
+                Some(&uuid::Uuid::new_v4().to_string()),
+                None,
+            )?;
+            runtime.wait_ready().await?;
+            events.lock().clear();
+            runtime.writer.lock().write_all(b"/usage\r")?;
+            runtime.writer.lock().flush()?;
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            loop {
+                let raw = events
+                    .lock()
+                    .iter()
+                    .filter_map(|event| event.data.get("text").and_then(Value::as_str))
+                    .collect::<String>();
+                if let Some(result) = parse_claude_usage(raw.as_bytes()) {
+                    runtime.writer.lock().write_all(b"\x1b")?;
+                    runtime.writer.lock().flush()?;
+                    return Ok(Json(result));
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    return Err(ApiError::internal(
+                        "Claude Code /usage did not produce session and weekly limits",
+                    ));
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    }
+}
+
+fn normalize_codex_usage(result: &Value) -> Value {
+    let snapshot = result.get("rateLimits").unwrap_or(&Value::Null);
+    let mut current_session = Value::Null;
+    let mut weekly = Value::Null;
+    for window in [snapshot.get("primary"), snapshot.get("secondary")]
+        .into_iter()
+        .flatten()
+        .filter(|value| !value.is_null())
+    {
+        let duration = window.get("windowDurationMins").and_then(Value::as_u64);
+        let normalized = normalize_usage_window(window);
+        if duration.is_some_and(|minutes| minutes >= 6 * 24 * 60) {
+            weekly = normalized;
+        } else {
+            current_session = normalized;
+        }
+    }
+    let mut model_limits = Vec::new();
+    if let Some(buckets) = result.get("rateLimitsByLimitId").and_then(Value::as_object) {
+        for (id, bucket) in buckets {
+            if id
+                == snapshot
+                    .get("limitId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+            {
+                continue;
+            }
+            for window in [bucket.get("primary"), bucket.get("secondary")]
+                .into_iter()
+                .flatten()
+                .filter(|value| !value.is_null())
+            {
+                model_limits.push(json!({
+                    "id": id,
+                    "name": bucket.get("limitName").and_then(Value::as_str).unwrap_or(id),
+                    "window": normalize_usage_window(window),
+                }));
+            }
+        }
+    }
+    json!({
+        "current_session": current_session,
+        "weekly": weekly,
+        "model_limits": model_limits,
+        "updated_at_ms": now_ms(),
+    })
+}
+
+fn normalize_usage_window(window: &Value) -> Value {
+    let used = window
+        .get("usedPercent")
+        .and_then(Value::as_u64)
+        .unwrap_or(0)
+        .min(100);
+    json!({
+        "used_percent": used,
+        "remaining_percent": 100 - used,
+        "resets_at_unix": window.get("resetsAt").and_then(Value::as_i64),
+        "resets_at_label": Value::Null,
+        "window_minutes": window.get("windowDurationMins").and_then(Value::as_u64),
+    })
+}
+
+fn parse_claude_usage(raw: &[u8]) -> Option<Value> {
+    let mut parser = vt100::Parser::new(40, 120, 0);
+    parser.process(raw);
+    let lines = parser
+        .screen()
+        .contents()
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+    let current_session = parse_claude_usage_window(&lines, "Current session")?;
+    let weekly = parse_claude_usage_window(&lines, "Current week (all models)")?;
+    let model_limits = lines
+        .iter()
+        .filter(|line| {
+            line.starts_with("Current week (") && !line.starts_with("Current week (all models)")
+        })
+        .filter_map(|line| {
+            let name = line
+                .strip_prefix("Current week (")?
+                .split(')')
+                .next()?
+                .to_string();
+            let window = parse_percent_from_line(line)?;
+            Some(json!({"id": name.to_ascii_lowercase(), "name": name, "window": window}))
+        })
+        .collect::<Vec<_>>();
+    Some(json!({
+        "current_session": current_session,
+        "weekly": weekly,
+        "model_limits": model_limits,
+        "updated_at_ms": now_ms(),
+    }))
+}
+
+fn parse_claude_usage_window(lines: &[String], label: &str) -> Option<Value> {
+    let index = lines.iter().position(|line| line.starts_with(label))?;
+    let mut window = parse_percent_from_line(&lines[index])?;
+    let reset = lines
+        .iter()
+        .skip(index + 1)
+        .take(3)
+        .find_map(|line| line.strip_prefix("Resets "));
+    if let Some(object) = window.as_object_mut() {
+        object.insert("resets_at_label".to_string(), json!(reset));
+    }
+    Some(window)
+}
+
+fn parse_percent_from_line(line: &str) -> Option<Value> {
+    let marker = line.find("% used")?;
+    let used = line[..marker]
+        .split(|ch: char| !ch.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .next_back()?
+        .parse::<u64>()
+        .ok()?
+        .min(100);
+    Some(json!({
+        "used_percent": used,
+        "remaining_percent": 100 - used,
+        "resets_at_unix": Value::Null,
+        "resets_at_label": Value::Null,
+        "window_minutes": Value::Null,
+    }))
 }
 
 async fn create_session(

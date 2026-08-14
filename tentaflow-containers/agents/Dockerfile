@@ -15,6 +15,7 @@ COPY --from=bridge-build /src/native/coding-agent-bridge/target/release/tentaflo
 RUN mkdir -p /data /workspace
 ENV TENTAFLOW_CODING_AGENT_DATA_DIR=/data
 ENV TENTAFLOW_WORKSPACE_ROOT=/workspace
+ENV TENTAFLOW_BIND_HOST=0.0.0.0
 ENV CODEX_HOME=/data/codex
 ENV CLAUDE_CONFIG_DIR=/data/claude
 ENV HOME=/data

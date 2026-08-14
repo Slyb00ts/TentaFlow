@@ -46,13 +46,15 @@ pub fn sync_models(
             service_id: service.id,
             model_name: format!("{}/{}", service.engine_id, raw_id),
             display_name: Some(format!("{} — {}", service.display_name, display_name)),
-            capabilities: "[\"agent\"]".to_string(),
+            capabilities: "[\"chat\"]".to_string(),
             context_length: None,
             quantization: None,
             is_default,
         });
     }
-    let conn = db.write().map_err(|_| "database pool is poisoned".to_string())?;
+    let conn = db
+        .write()
+        .map_err(|_| "database pool is poisoned".to_string())?;
     crate::services_repo::models::replace_discovered(&conn, service.id, &discovered)
         .map_err(|e| e.to_string())?;
     Ok(discovered.len())
@@ -105,6 +107,7 @@ pub async fn execute(
             Some(payload),
         ),
         "models.list" => (reqwest::Method::GET, "/models".to_string(), None),
+        "usage.read" => (reqwest::Method::GET, "/usage".to_string(), None),
         "sessions.list" => (reqwest::Method::GET, "/sessions".to_string(), None),
         "session.create" => (
             reqwest::Method::POST,
@@ -159,6 +162,149 @@ pub async fn execute(
     Ok(text)
 }
 
+pub async fn execute_chat(
+    service: &ServiceRow,
+    model_name: &str,
+    prompt: &str,
+) -> Result<String, String> {
+    let workspace = serde_json::from_str::<Value>(&service.config_json)
+        .ok()
+        .and_then(|config| {
+            config
+                .get("workspace_root")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let model = model_name
+        .strip_prefix(&format!("{}/", service.engine_id))
+        .unwrap_or(model_name);
+    let created = execute(
+        service,
+        "session.create",
+        &serde_json::json!({"workspace": workspace, "model": model}).to_string(),
+    )
+    .await?;
+    let session_id = serde_json::from_str::<Value>(&created)
+        .ok()
+        .and_then(|value| {
+            value
+                .pointer("/session/id")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .ok_or_else(|| "coding-agent session response has no session.id".to_string())?;
+    execute(
+        service,
+        "session.turn",
+        &serde_json::json!({"session_id": session_id, "prompt": prompt}).to_string(),
+    )
+    .await?;
+
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(600);
+    let mut after_seq = 0_u64;
+    let mut output = String::new();
+    let mut last_event = tokio::time::Instant::now();
+    let mut received_output = false;
+    loop {
+        if tokio::time::Instant::now() >= deadline {
+            return Err("coding-agent turn timed out after 600 seconds".to_string());
+        }
+        let response = execute(
+            service,
+            "session.events",
+            &serde_json::json!({"session_id": session_id, "after_seq": after_seq}).to_string(),
+        )
+        .await?;
+        let value = serde_json::from_str::<Value>(&response)
+            .map_err(|e| format!("invalid coding-agent events response: {e}"))?;
+        let events = value
+            .get("events")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let mut completed = false;
+        for event in events {
+            after_seq = after_seq.max(event.get("seq").and_then(Value::as_u64).unwrap_or(0));
+            last_event = tokio::time::Instant::now();
+            let kind = event.get("kind").and_then(Value::as_str).unwrap_or("");
+            let data = event.get("data").cloned().unwrap_or(Value::Null);
+            if kind == "terminal" {
+                if let Some(text) = data.get("text").and_then(Value::as_str) {
+                    output.push_str(text);
+                    received_output = true;
+                }
+            } else if kind == "codex" {
+                collect_agent_text(&data, &mut output);
+                received_output = !output.is_empty();
+                completed |= data.to_string().contains("turn/completed");
+            }
+        }
+        if completed
+            || (received_output
+                && last_event.elapsed()
+                    >= std::time::Duration::from_secs(if service.engine_id == "codex" {
+                        2
+                    } else {
+                        5
+                    }))
+        {
+            let text = terminal_text(&output);
+            if text.is_empty() {
+                return Err("coding-agent turn completed without text output".to_string());
+            }
+            return Ok(text);
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    }
+}
+
+fn collect_agent_text(value: &Value, output: &mut String) {
+    match value {
+        Value::Object(object) => {
+            for (key, value) in object {
+                if matches!(key.as_str(), "delta" | "text") {
+                    if let Some(text) = value.as_str() {
+                        output.push_str(text);
+                    }
+                } else {
+                    collect_agent_text(value, output);
+                }
+            }
+        }
+        Value::Array(values) => {
+            for value in values {
+                collect_agent_text(value, output);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn terminal_text(raw: &str) -> String {
+    let mut output = String::with_capacity(raw.len());
+    let mut bytes = raw.bytes().peekable();
+    while let Some(byte) = bytes.next() {
+        if byte == 0x1b {
+            if bytes.next_if_eq(&b'[').is_some() {
+                for next in bytes.by_ref() {
+                    if (0x40..=0x7e).contains(&next) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        if byte == b'\r' {
+            continue;
+        }
+        if byte == b'\n' || byte == b'\t' || byte.is_ascii_graphic() || byte == b' ' {
+            output.push(byte as char);
+        }
+    }
+    output.trim().to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -200,6 +346,7 @@ mod tests {
         };
         assert_eq!(first.len(), 2);
         assert_eq!(first[0].model_name, "claude-code/opus");
+        assert_eq!(first[0].capabilities, "[\"chat\"]");
         assert!(first[0].is_default);
         assert_eq!(first[1].model_name, "claude-code/haiku");
 
@@ -215,7 +362,10 @@ mod tests {
         };
         assert_eq!(second.len(), 1);
         assert_eq!(second[0].model_name, "claude-code/haiku");
-        assert_eq!(second[0].display_name.as_deref(), Some("Claude Code — Haiku 4.5"));
+        assert_eq!(
+            second[0].display_name.as_deref(),
+            Some("Claude Code — Haiku 4.5")
+        );
         assert!(second[0].is_default);
     }
 }

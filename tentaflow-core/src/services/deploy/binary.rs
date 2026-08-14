@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use async_trait::async_trait;
 use rusqlite::Transaction;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -18,7 +21,6 @@ use super::{
     resolve_display_name, smart_health_probe, standard_engine_env, DeployError, DeployResult,
     DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
-use crate::deploy::process_ctl;
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
@@ -35,7 +37,7 @@ pub struct BinaryDeploy {
     log_sink: Option<LogSink>,
     /// Child handle is stored on `self` (not on `PreparedDeploy`) so it stays
     /// alive across the await boundary in `deploy()`. Rollback consumes it.
-    child: std::sync::Mutex<Option<Child>>,
+    child: Arc<std::sync::Mutex<Option<Child>>>,
     /// Port z DB przy respawn — patrz `PythonBundleDeploy::preserved_port`.
     preserved_port: Option<u16>,
 }
@@ -65,7 +67,7 @@ impl BinaryDeploy {
             ports,
             hf_token,
             log_sink,
-            child: std::sync::Mutex::new(None),
+            child: Arc::new(std::sync::Mutex::new(None)),
             preserved_port,
         }
     }
@@ -126,11 +128,7 @@ impl BinaryDeploy {
             .join("coding-agents")
             .join(&self.manifest.engine.id)
             .join(&self.manifest.engine.version);
-        let bin_dir = if cfg!(windows) {
-            install_root.clone()
-        } else {
-            install_root.join("bin")
-        };
+        let bin_dir = install_root.join("node_modules").join(".bin");
         let executable_name = if cfg!(windows) {
             format!("{executable}.cmd")
         } else {
@@ -226,32 +224,76 @@ impl DeployStrategy for BinaryDeploy {
         }
 
         let root = self.binary_root()?;
-        if native.runtime == NativeRuntime::ManagedCli {
+        let managed_cli_executable = if native.runtime == NativeRuntime::ManagedCli {
+            let source_hash = self.manifest.native_source_hash.trim();
+            if source_hash.is_empty() {
+                return Err(DeployError::Manifest(format!(
+                    "engine '{}': managed-cli runtime has no native source hash",
+                    self.manifest.engine.id
+                )));
+            }
+            let immutable_root = crate::paths::cache_dir()
+                .join("coding-agents")
+                .join("bridge")
+                .join(&self.manifest.engine.id)
+                .join(source_hash);
             #[cfg(windows)]
-            let server = root.join("server.exe");
+            let immutable_server = immutable_root.join("server.exe");
             #[cfg(not(windows))]
-            let server = root.join("server");
-            if !server.exists() {
+            let immutable_server = immutable_root.join("server");
+            if immutable_server.exists() {
+                Some(immutable_server)
+            } else {
                 if let Some(s) = &self.log_sink {
                     s.info("[managed-cli] building the local bridge");
                 }
                 #[cfg(windows)]
-                let status = Command::new("powershell.exe")
+                let output = Command::new("powershell.exe")
                     .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
                     .arg(root.join("build.ps1"))
-                    .status()
+                    .output()
                     .await;
                 #[cfg(not(windows))]
-                let status = Command::new("sh").arg(root.join("build.sh")).status().await;
-                let status = status
+                let output = Command::new("sh").arg(root.join("build.sh")).output().await;
+                let output = output
                     .map_err(|e| DeployError::Spawn(format!("build coding-agent bridge: {e}")))?;
-                if !status.success() || !server.exists() {
+                #[cfg(windows)]
+                let built_server = root
+                    .join("target")
+                    .join("release")
+                    .join("tentaflow-coding-agent-bridge.exe");
+                #[cfg(not(windows))]
+                let built_server = root
+                    .join("target")
+                    .join("release")
+                    .join("tentaflow-coding-agent-bridge");
+                if !output.status.success() || !built_server.exists() {
                     return Err(DeployError::Spawn(format!(
-                        "coding-agent bridge build failed with status {status}"
+                        "coding-agent bridge build failed with status {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
                     )));
                 }
+                std::fs::create_dir_all(&immutable_root).map_err(|e| {
+                    DeployError::Spawn(format!("create coding-agent bridge cache: {e}"))
+                })?;
+                let temporary = immutable_root.join(format!(
+                    ".server-{}-{}",
+                    std::process::id(),
+                    self.manifest.engine.id
+                ));
+                std::fs::copy(&built_server, &temporary).map_err(|e| {
+                    DeployError::Spawn(format!("cache coding-agent bridge executable: {e}"))
+                })?;
+                std::fs::rename(&temporary, &immutable_server).map_err(|e| {
+                    let _ = std::fs::remove_file(&temporary);
+                    DeployError::Spawn(format!("publish coding-agent bridge executable: {e}"))
+                })?;
+                Some(immutable_server)
             }
-        }
+        } else {
+            None
+        };
         // Respawn istniejacego serwisu zachowuje port z DB.
         let port = self
             .ports
@@ -265,17 +307,20 @@ impl DeployStrategy for BinaryDeploy {
         let candidates = ["server.exe", "run.cmd", "run.ps1", "start.cmd"];
         #[cfg(not(windows))]
         let candidates = ["server", "run.sh", "start.sh", "build.sh"];
-        let exe = candidates
-            .iter()
-            .map(|n| root.join(n))
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                DeployError::Spawn(format!(
-                    "no startup script in {} (looked for {:?})",
-                    root.display(),
-                    candidates
-                ))
-            })?;
+        let exe = match managed_cli_executable {
+            Some(path) => path,
+            None => candidates
+                .iter()
+                .map(|n| root.join(n))
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    DeployError::Spawn(format!(
+                        "no startup script in {} (looked for {:?})",
+                        root.display(),
+                        candidates
+                    ))
+                })?,
+        };
 
         // Typed schema params → env (Env bindings) + request_time → config_json.
         // Computed before spawn so the launch script receives the engine's
@@ -324,6 +369,7 @@ impl DeployStrategy for BinaryDeploy {
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
         cmd.envs(env);
+        cmd.stdin(std::process::Stdio::null());
         // NO kill_on_drop: a successful deploy drops this strategy object once
         // commit() returns, and kill_on_drop would then SIGKILL the engine we
         // just launched — fatal for slow-loading engines (ds4 loads ~80 GB over
@@ -334,14 +380,17 @@ impl DeployStrategy for BinaryDeploy {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        // New process group with the engine as leader (pgid = child pid). Native
-        // engines fork worker processes (inference servers, GPU workers) that inherit
-        // this group; without it `terminate`'s group-kill `kill(-pid)` returns ESRCH
-        // and only the parent dies, orphaning workers that keep holding the port (the
-        // "zombie blocks respawn: port already in use" bug). The python-bundle path
-        // does the same via `setsid()` in pre_exec.
+        // A separate session keeps background services away from terminal job
+        // control while preserving pgid = pid for process-tree termination.
         #[cfg(unix)]
-        cmd.process_group(0);
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         if let Some(s) = &self.log_sink {
             s.info(&format!("[binary] spawn {} (PORT={})", exe.display(), port));
@@ -381,7 +430,7 @@ impl DeployStrategy for BinaryDeploy {
 
         // Stash the child for later rollback / for keep-alive across the
         // commit await.
-        let pid_for_probe = child.id();
+        let child_for_probe = Arc::clone(&self.child);
         if let Ok(mut slot) = self.child.lock() {
             *slot = Some(child);
         }
@@ -400,12 +449,16 @@ impl DeployStrategy for BinaryDeploy {
             // modele moga ladowac wiecej.
             max_wait: None,
         };
-        let outcome = smart_health_probe(probe_cfg, move || async move {
-            match pid_for_probe {
-                Some(pid) if process_ctl::is_alive(pid) => None,
-                Some(_) => Some(None),
-                // No PID at all — treat as gone.
-                None => Some(None),
+        let outcome = smart_health_probe(probe_cfg, move || {
+            let child = Arc::clone(&child_for_probe);
+            async move {
+                let mut slot = child.lock().ok()?;
+                let process = slot.as_mut()?;
+                match process.try_wait() {
+                    Ok(Some(status)) => Some(status.code()),
+                    Ok(None) => None,
+                    Err(_) => Some(None),
+                }
             }
         })
         .await;

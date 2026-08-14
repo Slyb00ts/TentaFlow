@@ -2,7 +2,7 @@
 id = "claude-code"
 category = "agents"
 resource_kind = "ai"
-provider = "coding-agents"
+provider = "external"
 name = "Claude Code"
 description_pl = "Oficjalny Claude Code CLI z natywnym logowaniem, trwałymi sesjami i dostępem do workspace."
 description_en = "Official Claude Code CLI with native login, durable sessions, and workspace access."
@@ -14,6 +14,9 @@ api = "custom"
 version = "2.1.221"
 requires_model = false
 gpu_supported = false
+service_surfaces = ["chat"]
+input_modalities = ["text"]
+output_modalities = ["text"]
 
 [deploy.docker]
 context_path = "agents"
