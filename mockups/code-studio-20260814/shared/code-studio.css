@@ -21,13 +21,31 @@
 
 /* ============================ POWŁOKA ==================================== */
 
+/* ---- Pełna wysokość okna w OBU układach ---------------------------------
+   Góra (pasek projektów / górny pasek) i dół (kompozytor, dolna nawigacja)
+   są przypięte; przewija się wyłącznie środek: strumień i ciało doku. */
+html, body { height: 100%; overflow: hidden; }
+.screen { height: 100%; display: flex; flex-direction: column; margin: 0; padding: 0; max-width: none; }
+.screen-header { flex: 0 0 auto; margin: 0; border-radius: 0; padding: 8px 16px; }
+.screen-header h2 { font-size: 15px; }
+.screen-header .desc { font-size: 11.5px; }
+.screen-frame {
+  flex: 1; min-height: 0; display: flex;
+  border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; box-shadow: none;
+}
+.app { flex: 1; min-height: 0; }
+.main { padding: 0; min-height: 0; overflow: hidden; display: flex; }
+
 .cs-shell {
   display: grid;
   grid-template-rows: auto 1fr;
-  height: 100%;
-  min-height: 780px;
-  margin: -22px -26px;            /* wychodzi poza padding .main — pełny bleed */
+  flex: 1; min-height: 0; margin: 0;
+  position: relative;             /* kotwica dla arkusza i przyciemnienia */
 }
+
+/* Chrome telefonu nie istnieje na szerokim ekranie — inaczej arkusz
+   workspace'ów pozycjonuje się względem strony i zasłania widok. */
+.cs-mtop, .cs-mtabs, .cs-backchat, .cs-sheet, .cs-scrim { display: none; }
 
 /* ---- Pasek projektów (przełączanie + status) ---------------------------- */
 .cs-projects {
@@ -94,13 +112,13 @@
 .cs-proj-add:hover { color: var(--accent-2); border-color: var(--accent-1); }
 
 /* ---- Korpus: scena + dok ------------------------------------------------ */
-.cs-body { display: grid; grid-template-columns: 1fr var(--cs-dock); min-height: 0; }
+.cs-body { display: grid; grid-template-columns: 1fr var(--cs-dock); min-height: 0; overflow: hidden; }
 .cs-body.solo { grid-template-columns: 1fr; }
 
 /* ============================ SCENA ====================================== */
 
 .cs-stage {
-  display: flex; flex-direction: column; min-width: 0;
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
   border-right: 1px solid var(--border);
   background:
     radial-gradient(1100px 400px at 12% -12%, rgba(99,102,241,.07), transparent 70%),
@@ -355,7 +373,7 @@
 
 /* ============================ DOK ======================================== */
 
-.cs-dock { display: flex; flex-direction: column; min-width: 0; background: var(--bg-2); }
+.cs-dock { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-2); }
 .cs-dock-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-2); }
 .cs-dock-tab {
   flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
@@ -591,11 +609,11 @@
   margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 600;
   font-family: var(--cs-mono); color: var(--text-3); font-size: 10px;
 }
-.cs-answer-head .chev { width: 14px; height: 14px; transition: transform .2s; color: var(--cs-ask); }
-.cs-answer.collapsed .cs-answer-head .chev { transform: rotate(-90deg); }
+/* Chevron i licznik opcji są potrzebne tylko tam, gdzie opcje się chowają
+   (telefon) — na desktopie byłyby martwą kontrolką. */
+.cs-answer-head .chev,
+.cs-answer-head .optn { display: none; }
 .cs-answer-q { padding: 11px 12px 9px; font-size: 13.5px; line-height: 1.55; color: var(--text); font-weight: 600; }
-.cs-answer.collapsed .cs-answer-q,
-.cs-answer.collapsed .cs-answer-opts { display: none; }
 .cs-answer-opts {
   display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px;
   max-height: 38dvh; overflow-y: auto; scrollbar-width: thin;
@@ -661,16 +679,19 @@
 /* Skrót powrotu do rozmowy z agentem głównym */
 .cs-backchat { display: none; }
 
-/* Arkusz wyboru workspace */
+/* Arkusz wyboru workspace — zjeżdża OD GÓRY, bo przycisk który go otwiera
+   też jest u góry. Wysuwanie od dołu zmuszało do wędrówki kciukiem przez cały
+   ekran między kliknięciem a wyborem. */
 .cs-sheet {
-  position: absolute; left: 0; right: 0; bottom: 0; z-index: 30;
-  background: var(--bg-2); border-top: 1px solid var(--border-hover);
-  border-radius: 18px 18px 0 0; padding: 6px 10px 14px;
-  box-shadow: 0 -14px 44px rgba(0,0,0,.65);
-  transform: translateY(101%); transition: transform .3s var(--spring);
+  position: absolute; left: 0; right: 0; top: 0; z-index: 30;
+  background: var(--bg-2); border-bottom: 1px solid var(--border-hover);
+  border-radius: 0 0 18px 18px; padding: 8px 10px 6px;
+  box-shadow: 0 16px 44px rgba(0,0,0,.65);
+  max-height: 80dvh; overflow-y: auto;
+  transform: translateY(-101%); transition: transform .3s var(--spring);
 }
 .cs-sheet.open { transform: none; }
-.cs-sheet-grab { width: 40px; height: 4px; border-radius: 3px; background: var(--bg-3); margin: 5px auto 10px; }
+.cs-sheet-grab { width: 40px; height: 4px; border-radius: 3px; background: var(--bg-3); margin: 10px auto 2px; }
 .cs-sheet-item {
   display: flex; align-items: center; gap: 10px; padding: 11px 10px; border-radius: var(--radius);
   cursor: pointer;
@@ -707,20 +728,12 @@
 @media (max-width: 900px) {
   /* Pełna wysokość przez jawny łańcuch — żadnego zgadywania calc(). Makieta
      schodzi z drogi całkowicie: chcemy widzieć aplikację, nie ramkę. */
-  html, body { height: 100%; overflow: hidden; }
-  .screen { height: 100%; display: flex; flex-direction: column; margin: 0; padding: 0; max-width: none; }
-  .screen-header { display: none; }
-  .screen-frame { flex: 1; min-height: 0; display: flex; border: 0; border-radius: 0; box-shadow: none; }
-
-  .app { flex: 1; min-height: 0; grid-template-columns: 1fr; }
+  .screen-header { display: none; }        /* chrome makiety znika całkowicie */
+  .screen-frame { border: 0; }
+  .app { grid-template-columns: 1fr; }
   .app > .sidebar { display: none; }
-  .main { padding: 0; min-height: 0; overflow: hidden; display: flex; }
-
-  .cs-shell {
-    flex: 1; min-height: 0; height: auto; margin: 0;
-    grid-template-rows: auto 1fr auto;    /* góra · treść · dolna nawigacja */
-    position: relative; overflow: hidden;
-  }
+  .cs-shell { grid-template-rows: auto 1fr auto; overflow: hidden; }
+  .cs-sheet, .cs-scrim { display: block; }
 
   /* Poziomy pasek projektów znika — zastępuje go przycisk u góry. */
   .cs-projects { display: none; }
@@ -762,8 +775,37 @@
   .ev-tool .t-meta { margin-left: auto; }
   .ev-detail { margin-left: 8px; font-size: 10.5px; }
 
-  /* Pytanie w kompozytorze może zająć więcej, ale nigdy całego ekranu */
-  .cs-answer-opts { max-height: 34dvh; }
+  /* Pytanie: zwinięte startowo, a opcje WYPŁYWAJĄ nad kompozytor zamiast
+     zabierać wysokość. Rozwinięte na stałe zjadały ~57% ekranu i na rozmowę
+     zostawało 29% — czyli dokładnie „nic nie widać". */
+  .cs-composer { position: relative; }
+  .cs-answer-head .chev { display: block; }
+  .cs-answer-head .optn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 5px; border-radius: 8px;
+    background: rgba(245,158,11,.2); color: var(--cs-ask);
+    font-family: var(--cs-mono); font-size: 9.5px; font-weight: 800;
+  }
+  .cs-answer-head .who { display: none; }
+  .cs-answer-q {
+    padding: 9px 11px; font-size: 13px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .cs-answer.expanded .cs-answer-q { -webkit-line-clamp: unset; }
+  .cs-answer.expanded .cs-answer-head .chev { transform: rotate(180deg); }
+
+  .cs-answer-opts {
+    display: none;
+    position: absolute; left: 10px; right: 10px; bottom: calc(100% - 6px); z-index: 12;
+    max-height: 52dvh; overflow-y: auto; padding: 8px; gap: 6px;
+    background: var(--bg-2); border: 1px solid rgba(245,158,11,.45);
+    border-radius: var(--radius-lg); box-shadow: 0 -14px 44px rgba(0,0,0,.7);
+  }
+  .cs-answer.expanded .cs-answer-opts {
+    display: flex; flex-direction: column;
+    animation: csOptsIn .26s var(--spring) both;
+  }
+  @keyframes csOptsIn { from { transform: translateY(12px); opacity: 0; } to { transform: none; opacity: 1; } }
   .cs-answer-opt { padding: 11px; min-height: 46px; }
 
   /* ---- Pliki: podgląd na cały ekran, drzewo jako szuflada z prawej ---- */

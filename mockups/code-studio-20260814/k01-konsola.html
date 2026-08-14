@@ -255,6 +255,7 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
                     <svg class="icon" style="width:13px;height:13px"><use href="#i-message"/></svg>
                     Agent pyta
                     <span class="who">orchestrator · 1m 40s</span>
+                    <span class="optn">4 opcje</span>
                     <svg class="icon chev"><use href="#i-chevron-d"/></svg>
                   </div>
                   <div class="cs-answer-q">Jak obsłużyć wsadowe wejście (<code>input</code> jako tablica)? To zmienia kształt odpowiedzi i limity.</div>
@@ -577,8 +578,7 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed
           <!-- ===== TELEFON: arkusz wyboru workspace ===== -->
           <div class="cs-scrim" id="scrim"></div>
           <div class="cs-sheet" id="sheet">
-            <div class="cs-sheet-grab"></div>
-            <div class="cs-dock-title" style="margin:0 4px 6px">Twoje workspace'y</div>
+            <div class="cs-dock-title" style="margin:2px 4px 6px">Twoje workspace'y</div>
             <div class="cs-sheet-item active">
               <span class="cs-dot run"></span>
               <span><span class="nm">tentaflow-core</span><br><span class="sub">dev-ryzen · sesja #4</span></span>
@@ -600,6 +600,7 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed
               <span class="st" style="color:var(--cs-err)">testy ✗</span>
             </div>
             <div class="cs-proj-add" style="margin-top:8px;justify-content:center">Nowy workspace</div>
+            <div class="cs-sheet-grab"></div>
           </div>
 
         </div>
@@ -663,14 +664,18 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed
   var answer = document.getElementById('answer');
   var answerHead = document.getElementById('answerHead');
   if (answerHead) {
-    answerHead.addEventListener('click', function () { answer.classList.toggle('collapsed'); });
+    answerHead.addEventListener('click', function () { answer.classList.toggle('expanded'); });
   }
+
+  document.querySelectorAll('.cs-answer-opt').forEach(function (opt) {
+    opt.addEventListener('click', function () { answer.classList.remove('expanded'); });
+  });
 
   // Kotwica w strumieniu prowadzi do pytania w kompozytorze.
   document.querySelectorAll('.ev-askmark').forEach(function (el) {
     el.addEventListener('click', function () {
       setView('konsola');
-      answer.classList.remove('collapsed');
+      answer.classList.add('expanded');
       answer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     });
   });
