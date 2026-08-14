@@ -760,9 +760,6 @@ html, body { height: 100%; overflow: hidden; }
   .cs-body { grid-template-columns: 1fr; grid-template-rows: 1fr; min-height: 0; }
   .cs-stage { border-right: 0; min-height: 0; }
   .cs-dock { min-height: 0; }
-  .cs-shell[data-view="konsola"] .cs-dock  { display: none; }
-  .cs-shell:not([data-view="konsola"]) .cs-stage { display: none; }
-  .cs-shell:not([data-view="konsola"]) .cs-dock  { display: flex; }
   /* Zakładki doku są na desktopie u góry — na telefonie zastępuje je dolny pasek. */
   .cs-dock-tabs { display: none; }
   .cs-dock-body { padding: 10px 11px 12px; }
@@ -844,10 +841,6 @@ html, body { height: 100%; overflow: hidden; }
   .pf { font-size: 11px; }
 
   /* ---- Pliki: podgląd na cały ekran, drzewo jako szuflada z prawej ---- */
-  .cs-shell[data-view="pliki"] .cs-dock-body,
-  .cs-shell[data-view="terminal"] .cs-dock-body { padding: 0; display: flex; min-height: 0; }
-  .cs-shell[data-view="pliki"] .cs-dock-pane[data-pane="pliki"],
-  .cs-shell[data-view="terminal"] .cs-dock-pane[data-pane="terminal"] { display: flex; flex: 1; min-height: 0; }
 
   .cs-files { flex: 1; min-height: 0; position: relative; }
   .cs-file-head {
@@ -1075,6 +1068,8 @@ html, body { height: 100%; overflow: hidden; }
   .cs-shell[data-view="pliki"] .cs-dock,
   .cs-shell[data-view="zmiany"] .cs-dock,
   .cs-shell[data-view="terminal"] .cs-dock { display: none; }
+  .cs-shell[data-view="agenci"] .cs-dock,
+  .cs-shell[data-view="git"] .cs-dock { display: flex; }
 
   /* …ale przy treści dok wraca jako szuflada nawigatora z PRAWEJ, wywoływana
      przyciskiem stojącym też po prawej. Jedna mechanika dla drzewa, listy
