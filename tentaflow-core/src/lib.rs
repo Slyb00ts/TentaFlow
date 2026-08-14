@@ -10,6 +10,7 @@ extern crate self as tentaflow_core;
 
 pub mod audio_models;
 pub mod benchmark;
+pub mod code_studio;
 pub mod compliance;
 pub mod config;
 pub mod crypto;
@@ -37,11 +38,7 @@ pub mod sync;
 pub mod tts;
 pub mod vision;
 pub mod vision_models;
-#[cfg(all(
-    unix,
-    feature = "camera",
-    feature = "inference-vision-gpu"
-))]
+#[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
 pub mod vision_worker;
 pub mod web_research;
 

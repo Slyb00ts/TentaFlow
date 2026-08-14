@@ -662,7 +662,160 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "benchmark_targets_local_api_type",
             MigrationStep::RustSelfManaged(benchmark_targets_allow_local_api_type),
         ),
+        (
+            125,
+            "code_studio_registry",
+            MigrationStep::Sql(CODE_STUDIO_REGISTRY),
+        ),
+        (
+            126,
+            "code_studio_permissions",
+            MigrationStep::Rust(roles_add_code_studio_permissions),
+        ),
     ]
+}
+
+// Code Studio — registry of workspaces (org scope, synchronized) plus the
+// node-local secret vault. The split is deliberate: `code_workspaces` and its
+// satellites describe WHAT exists and who may touch it, and travel through the
+// Sync Ledger; `code_workspace_secrets` and `code_agent_credentials` hold key
+// material encrypted with the per-node SettingsCipher key and must never be
+// added to `sync/core_registry.rs` — the precedent is `addon_config`, which
+// synchronizes only `is_secret=0`.
+const CODE_STUDIO_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS code_workspaces (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    exec_mode TEXT NOT NULL DEFAULT 'trusted_native'
+        CHECK(exec_mode IN ('container','trusted_native')),
+    container_image TEXT,
+    egress_enforcement TEXT NOT NULL
+        CHECK(egress_enforcement IN ('namespace','firewall','unrestricted')),
+    repo_kind TEXT NOT NULL CHECK(repo_kind IN ('empty','git')),
+    repo_url TEXT,
+    repo_auth_kind TEXT CHECK(repo_auth_kind IN ('none','token','ssh_key')),
+    secret_ref TEXT,
+    ssh_host_fingerprint TEXT,
+    default_branch TEXT,
+    target_branch TEXT,
+    autonomy_ceiling TEXT NOT NULL DEFAULT 'normal'
+        CHECK(autonomy_ceiling IN ('plan','normal','auto_edit','autonomous')),
+    egress_policy TEXT NOT NULL DEFAULT 'org_approved'
+        CHECK(egress_policy IN ('local_only','org_approved','any')),
+    index_enabled INTEGER NOT NULL DEFAULT 0,
+    quota_disk_bytes INTEGER,
+    quota_sessions INTEGER,
+    status TEXT NOT NULL
+        CHECK(status IN ('provisioning','active','error','archived','deleted')),
+    status_detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(org_id, owner_user_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_code_workspaces_org ON code_workspaces(org_id, status);
+CREATE INDEX IF NOT EXISTS idx_code_workspaces_node ON code_workspaces(node_id, status);
+
+CREATE TABLE IF NOT EXISTS code_workspace_members (
+    workspace_id TEXT NOT NULL REFERENCES code_workspaces(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','editor','viewer')),
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_code_workspace_members_user ON code_workspace_members(user_id);
+
+CREATE TABLE IF NOT EXISTS code_workspace_project_links (
+    workspace_id TEXT NOT NULL REFERENCES code_workspaces(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    linked_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_creator_grants (
+    org_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_allowlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL REFERENCES code_workspaces(id) ON DELETE CASCADE,
+    capability TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, capability, pattern)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_saga_steps (
+    workspace_id TEXT NOT NULL,
+    step TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','done','failed','compensated')),
+    detail TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, step)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_secrets (
+    secret_ref TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('git_token','ssh_key')),
+    material_enc BLOB NOT NULL,
+    fingerprint TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    rotated_at TEXT,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_code_workspace_secrets_ws
+    ON code_workspace_secrets(workspace_id);
+
+CREATE TABLE IF NOT EXISTS code_agent_credentials (
+    org_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    engine_id TEXT NOT NULL,
+    material_enc BLOB NOT NULL,
+    provider_base_url TEXT NOT NULL,
+    fingerprint TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    rotated_at TEXT,
+    last_used_at TEXT,
+    PRIMARY KEY (org_id, node_id, engine_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_assertion_jti (
+    jti TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assertion_jti_exp ON session_assertion_jti(expires_at);
+"#;
+
+/// Reading the workspace catalog is available to every role that can see the
+/// dashboard; administering someone else's workspace is not. Creating one needs
+/// a per-user grant on top (`code_workspace_creator_grants`), the same shape
+/// Project Studio uses, because a workspace consumes disk and can execute code.
+fn roles_add_code_studio_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &[
+            "org_admin",
+            "org_operator",
+            "org_viewer",
+            "dpo",
+            "supervisor",
+        ],
+        &["code_studio.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin"], &["code_studio.admin"])
 }
 
 const SERVICE_USAGE_SNAPSHOT: &str = r#"
@@ -713,7 +866,10 @@ CREATE INDEX idx_benchmark_targets_benchmark ON benchmark_targets(benchmark_id);
         )?;
         let violations = foreign_key_check(&tx)?;
         if !violations.is_empty() {
-            anyhow::bail!("benchmark_targets_local_api_type: {}", violations.join("; "));
+            anyhow::bail!(
+                "benchmark_targets_local_api_type: {}",
+                violations.join("; ")
+            );
         }
         tx.execute(
             "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
