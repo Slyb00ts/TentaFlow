@@ -962,3 +962,109 @@ html, body { height: 100%; overflow: hidden; }
   font-family: var(--cs-mono); font-size: 10px; padding: 1px 5px; border-radius: 4px;
   background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2);
 }
+
+/* =========================================================================
+   SCENA JAKO GŁÓWNE OKNO TREŚCI
+   Dok jest nawigatorem (spisy: subagenci, drzewo, lista zmian, git), a to,
+   co wybierzesz, otwiera się w scenie — 372-pikselowa kolumna to za mało na
+   czytanie kodu, diffa czy terminala.
+   ========================================================================= */
+
+.cs-stage-tabs {
+  display: flex; align-items: stretch; gap: 1px; flex-shrink: 0;
+  background: var(--bg-2); border-bottom: 1px solid var(--border);
+  overflow-x: auto; scrollbar-width: none;
+}
+.cs-stage-tabs::-webkit-scrollbar { display: none; }
+.cs-stab {
+  display: flex; align-items: center; gap: 7px; padding: 8px 13px;
+  background: transparent; border: 0; border-right: 1px solid var(--border);
+  color: var(--text-3); font-family: inherit; font-size: 12px; font-weight: 600;
+  cursor: pointer; white-space: nowrap; position: relative;
+  transition: color .15s, background .15s;
+}
+.cs-stab:hover { color: var(--text-2); background: var(--bg-3); }
+.cs-stab.active { color: #fff; background: var(--bg); }
+.cs-stab.active::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: var(--gradient-accent);
+}
+.cs-stab .icon { width: 13px; height: 13px; }
+.cs-stab .x { color: var(--text-3); opacity: .6; margin-left: 2px; }
+.cs-stab .x:hover { opacity: 1; color: var(--cs-err); }
+.cs-stab .mono { font-family: var(--cs-mono); font-size: 11.5px; }
+
+/* Panele sceny — widoczny dokładnie jeden */
+.cs-spane { display: none; flex-direction: column; flex: 1; min-height: 0; }
+.cs-shell[data-stage="konsola"]  .cs-spane[data-spane="konsola"],
+.cs-shell[data-stage="plik"]     .cs-spane[data-spane="plik"],
+.cs-shell[data-stage="zmiany"]   .cs-spane[data-spane="zmiany"],
+.cs-shell[data-stage="terminal"] .cs-spane[data-spane="terminal"],
+.cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"] { display: flex; }
+
+/* Pasek nad treścią w scenie (ścieżka pliku, podsumowanie diffa, akcje) */
+.cs-pane-head {
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  padding: 9px 14px; border-bottom: 1px solid var(--border); background: rgba(10,13,36,.6);
+}
+.cs-pane-head .path {
+  font-family: var(--cs-mono); font-size: 12px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
+  direction: rtl; text-align: left;
+}
+.cs-pane-head .spacer { flex: 1; }
+.cs-pane-body { flex: 1; min-height: 0; overflow: auto; }
+.cs-pane-foot {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg-2);
+}
+
+/* W scenie kod i terminal wypełniają okno, a nie sztuczny limit doku */
+.cs-spane .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
+.cs-spane .cs-code { flex: 1; min-height: 0; max-height: none; font-size: 12.5px; }
+.cs-spane .cs-term { flex: 1; min-height: 0; border: 0; border-radius: 0; font-size: 12px; }
+.cs-spane .diff { border: 0; border-radius: 0; }
+.cs-spane .diff-body { font-size: 12px; }
+
+/* Nawigator: wiersz spisu w doku */
+.nav-row {
+  display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 7px;
+  cursor: pointer; font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-2);
+}
+.nav-row:hover { background: var(--bg-3); color: var(--text); }
+.nav-row.active { background: rgba(99,102,241,.14); color: #fff; }
+.nav-row .n { margin-left: auto; font-size: 10.5px; flex-shrink: 0; }
+
+@media (max-width: 900px) {
+  /* Zakładki sceny znikają — steruje nimi dolny pasek */
+  .cs-stage-tabs { display: none; }
+
+  /* Widoki treściowe pokazują scenę, spisowe — dok */
+  .cs-shell[data-view="agenci"] .cs-stage,
+  .cs-shell[data-view="git"] .cs-stage { display: none; }
+  .cs-shell[data-view="konsola"] .cs-dock,
+  .cs-shell[data-view="pliki"] .cs-dock,
+  .cs-shell[data-view="zmiany"] .cs-dock,
+  .cs-shell[data-view="terminal"] .cs-dock { display: none; }
+
+  /* …ale przy treści dok wraca jako szuflada nawigatora z PRAWEJ, wywoływana
+     przyciskiem stojącym też po prawej. Jedna mechanika dla drzewa, listy
+     zmian i terminala. */
+  .cs-shell.nav-open[data-view="pliki"] .cs-dock,
+  .cs-shell.nav-open[data-view="zmiany"] .cs-dock,
+  .cs-shell.nav-open[data-view="terminal"] .cs-dock {
+    display: flex; position: absolute; top: 0; bottom: 0; right: 0; z-index: 16;
+    width: 82%; max-width: 320px;
+    border-left: 1px solid var(--border-hover); box-shadow: -14px 0 40px rgba(0,0,0,.6);
+    animation: csNavIn .28s var(--spring) both;
+  }
+  @keyframes csNavIn { from { transform: translateX(101%); } to { transform: none; } }
+  .cs-nav-scrim {
+    display: none; position: absolute; inset: 0; z-index: 15; background: rgba(3,5,15,.55);
+  }
+  .cs-shell.nav-open .cs-nav-scrim { display: block; }
+
+  .cs-pane-head { padding: 8px 11px; }
+  .cs-pane-foot { padding: 9px 11px; }
+  .cs-spane .cs-code, .cs-spane .diff-body, .cs-spane .cs-term { font-size: 11.5px; }
+}

@@ -26,6 +26,7 @@
 <symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
 <symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
 <symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
 <symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
 <symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
 <symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
@@ -142,6 +143,17 @@
 
             <!-- ============================ SCENA ============================ -->
             <div class="cs-stage">
+
+              <!-- Zakładki sceny: konsola jest przypięta, reszta to otwarte treści -->
+              <div class="cs-stage-tabs">
+                <button class="cs-stab active" data-stage="konsola"><span class="cs-dot run"></span>Konsola</button>
+                <button class="cs-stab" data-stage="subagent"><svg class="icon"><use href="#i-bot"/></svg>code-implementer</button>
+                <button class="cs-stab" data-stage="plik"><svg class="icon"><use href="#i-file"/></svg><span class="mono">embeddings.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                <button class="cs-stab" data-stage="zmiany"><svg class="icon"><use href="#i-code"/></svg>Zmiany · 3<svg class="icon x"><use href="#i-x"/></svg></button>
+                <button class="cs-stab" data-stage="terminal"><svg class="icon"><use href="#i-terminal"/></svg>Terminal<svg class="icon x"><use href="#i-x"/></svg></button>
+              </div>
+
+              <div class="cs-spane" data-spane="konsola">
 
               <div class="cs-stage-head">
                 <span class="cs-dot run"></span>
@@ -294,104 +306,22 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
                   </div>
                 </div>
               </div>
-            </div>
+              </div><!-- /spane konsola -->
 
-            <!-- ============================= DOK ============================= -->
-            <div class="cs-dock">
-              <div class="cs-dock-tabs">
-                <div class="cs-dock-tab active" data-goto="agenci"><svg class="icon"><use href="#i-bot"/></svg>Subagenci<span class="cnt">4</span></div>
-                <div class="cs-dock-tab" data-goto="pliki"><svg class="icon"><use href="#i-file"/></svg>Pliki</div>
-                <div class="cs-dock-tab" data-goto="zmiany"><svg class="icon"><use href="#i-code"/></svg>Zmiany<span class="cnt hot">3</span></div>
-                <div class="cs-dock-tab" data-goto="git"><svg class="icon"><use href="#i-git"/></svg>Git</div>
-                <div class="cs-dock-tab" data-goto="terminal"><svg class="icon"><use href="#i-terminal"/></svg>Terminal</div>
-              </div>
-
-              <div class="cs-dock-body">
-
-                <!-- ---- SUBAGENCI ---- -->
-                <div class="cs-dock-pane" data-pane="agenci">
-                  <div class="cs-dock-title">Aktywne w tej sesji</div>
-
-                  <div class="sa run focused">
-                    <div class="sa-head">
-                      <span class="sa-av"><svg class="icon"><use href="#i-edit"/></svg></span>
-                      <span><span class="sa-nm">code-implementer</span><br><span class="sa-role">qwen3.6-27b · rw</span></span>
-                      <span class="cs-dot run"></span>
-                    </div>
-                    <div class="sa-now">fs_write src/api/embeddings.rs</div>
-                    <div class="sa-bar"><i style="width:42%"></i></div>
-                    <div class="sa-foot"><span>iter 3/25</span><span class="sep"></span><span>1m 04s</span><span class="sep"></span><span>8,1k tok</span></div>
-                  </div>
-
-                  <div class="sa ok">
-                    <div class="sa-head">
-                      <span class="sa-av"><svg class="icon"><use href="#i-list"/></svg></span>
-                      <span><span class="sa-nm">code-planner</span><br><span class="sa-role">claude-code/opus · ro</span></span>
-                      <span class="cs-dot ok"></span>
-                    </div>
-                    <div class="sa-now">Plan: 4 kroki · 3 pliki · 1 test</div>
-                    <div class="sa-foot"><span>zakończony</span><span class="sep"></span><span>38s</span><span class="sep"></span><span>6,2k tok</span></div>
-                  </div>
-
-                  <div class="sa">
-                    <div class="sa-head">
-                      <span class="sa-av"><svg class="icon"><use href="#i-flask"/></svg></span>
-                      <span><span class="sa-nm">code-tester</span><br><span class="sa-role">qwen3.6-27b · cow</span></span>
-                      <span class="cs-dot idle"></span>
-                    </div>
-                    <div class="sa-now">czeka na implementera</div>
-                    <div class="sa-foot"><span>w kolejce</span><span class="sep"></span><span>cargo test</span></div>
-                  </div>
-
-                  <div class="sa">
-                    <div class="sa-head">
-                      <span class="sa-av"><svg class="icon"><use href="#i-eye"/></svg></span>
-                      <span><span class="sa-nm">code-reviewer</span><br><span class="sa-role">claude-code/opus · ro</span></span>
-                      <span class="cs-dot idle"></span>
-                    </div>
-                    <div class="sa-now">czeka na implementera</div>
-                    <div class="sa-foot"><span>w kolejce</span></div>
-                  </div>
-
-                  <div class="cs-dock-title">Wewnątrz: code-implementer</div>
-                  <div class="ev ev-tool ok">
-                    <span class="t-ico"><svg class="icon"><use href="#i-file"/></svg></span>
-                    <span class="t-name">fs_read</span><span class="t-arg">router.rs</span>
-                    <span class="t-meta"><svg class="icon t-done" style="width:12px;height:12px"><use href="#i-check"/></svg></span>
-                  </div>
-                  <div class="ev ev-tool run">
-                    <span class="t-ico"><svg class="icon"><use href="#i-refresh"/></svg></span>
-                    <span class="t-name">fs_write</span><span class="t-arg">embeddings.rs</span>
-                    <span class="t-meta"><span>12s</span></span>
-                  </div>
-
-                  <div class="cs-legend">
-                    <span><span class="cs-dot run"></span>pracuje</span>
-                    <span><span class="cs-dot ask"></span>czeka</span>
-                    <span><span class="cs-dot ok"></span>gotowe</span>
-                    <span><span class="cs-dot idle"></span>kolejka</span>
-                  </div>
+              <!-- ================= TREŚĆ: PLIK ================= -->
+              <div class="cs-spane" data-spane="plik">
+                <div class="cs-pane-head">
+                  <span class="path">src/api/embeddings.rs</span>
+                  <span class="cs-chip ok">nowy · +112</span>
+                  <button class="btn btn-sm" data-nav><svg class="icon"><use href="#i-folder"/></svg>Drzewo</button>
+                  <button class="btn btn-sm btn-ghost"><svg class="icon"><use href="#i-save"/></svg></button>
                 </div>
-
-                <!-- ---- PLIKI ---- -->
-                <div class="cs-dock-pane" data-pane="pliki">
-                  <div class="cs-files" id="files">
-
-                    <!-- Telefon: pasek z przyciskiem otwierającym drzewo -->
-                    <!-- Przycisk po PRAWEJ, bo szuflada wysuwa się z prawej -->
-                    <div class="cs-file-head">
-                      <span class="path">src/api/embeddings.rs</span>
-                      <span class="cs-chip ok" style="font-size:9.5px">nowy</span>
-                      <button class="btn btn-sm" data-tree><svg class="icon"><use href="#i-folder"/></svg>Drzewo</button>
-                    </div>
-
-                    <div class="cs-file-view">
-                      <div class="cs-editor">
-                        <div class="cs-editor-tabs">
-                          <div class="cs-etab active"><span class="dirty"></span>embeddings.rs</div>
-                          <div class="cs-etab">router.rs</div>
-                        </div>
-                        <div class="cs-code">
+                <div class="cs-editor">
+                  <div class="cs-editor-tabs">
+                    <div class="cs-etab active"><span class="dirty"></span>embeddings.rs</div>
+                    <div class="cs-etab">router.rs</div>
+                  </div>
+                  <div class="cs-code">
 <div class="cl"><span class="ln">1</span><span class="tk">use</span> axum::{Json, extract::State};</div>
 <div class="cl"><span class="ln">2</span><span class="tk">use</span> serde::{Deserialize, Serialize};</div>
 <div class="cl"><span class="ln">3</span></div>
@@ -422,47 +352,22 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
 <div class="cl"><span class="ln">28</span>    <span class="tk">if</span> inputs.<span class="tf">len</span>() &gt; <span class="tt">MAX_BATCH</span> {</div>
 <div class="cl"><span class="ln">29</span>        <span class="tk">return</span> <span class="tt">Err</span>(<span class="tt">ApiError</span>::<span class="tf">bad_request</span>(<span class="ts">"input exceeds MAX_BATCH"</span>));</div>
 <div class="cl"><span class="ln">30</span>    }</div>
-                        </div>
-                      </div>
-                    </div>
-
-                    <!-- Szuflada drzewa: wysuwa się z prawej, chowa po wybraniu pliku -->
-                    <div class="cs-tree-scrim" data-tree></div>
-                    <div class="cs-tree-panel">
-                      <button class="cs-tree-close" data-tree>Zamknij <svg class="icon" style="width:13px;height:13px"><use href="#i-chevron-r"/></svg></button>
-                      <div class="cs-dock-title">tentaflow-core</div>
-                      <div class="ft">
-                        <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>src</div>
-                        <div class="ft-ind">
-                          <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>api</div>
-                          <div class="ft-ind">
-                            <div class="ft-row active" data-file><svg class="icon"><use href="#i-file"/></svg>embeddings.rs<span class="badge a">nowy</span></div>
-                            <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>router.rs<span class="badge">M</span></div>
-                            <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs</div>
-                          </div>
-                          <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>routing</div>
-                          <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>flow_engine</div>
-                          <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>lib.rs</div>
-                        </div>
-                        <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>tests</div>
-                        <div class="ft-ind">
-                          <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs<span class="badge">M</span></div>
-                        </div>
-                        <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>Cargo.toml</div>
-                        <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>CLAUDE.md</div>
-                      </div>
-                    </div>
+<div class="cl"><span class="ln">31</span>    <span class="tk">let</span> vectors = state.embeddings.<span class="tf">embed_batch</span>(&amp;req.model, &amp;inputs).<span class="tk">await</span>?;</div>
+<div class="cl"><span class="ln">32</span>    <span class="tt">Ok</span>(<span class="tt">Json</span>(<span class="tf">to_openai_shape</span>(vectors)))</div>
+<div class="cl"><span class="ln">33</span>}</div>
                   </div>
                 </div>
+              </div>
 
-                <!-- ---- ZMIANY ---- -->
-                <div class="cs-dock-pane" data-pane="zmiany">
-                  <div class="cs-dock-title">3 pliki · +148 / −12</div>
-                  <div class="pf"><span class="st a">A</span><span class="p">src/api/embeddings.rs</span><span class="n"><span class="plus">+112</span></span></div>
-                  <div class="pf"><span class="st m">M</span><span class="p">src/api/router.rs</span><span class="n"><span class="plus">+6</span> <span class="minus">−2</span></span></div>
-                  <div class="pf"><span class="st m">M</span><span class="p">tests/openai_compat.rs</span><span class="n"><span class="plus">+30</span> <span class="minus">−10</span></span></div>
-
-                  <div class="diff" style="margin-top:10px">
+              <!-- ================= TREŚĆ: ZMIANY ================= -->
+              <div class="cs-spane" data-spane="zmiany">
+                <div class="cs-pane-head">
+                  <span class="path">src/api/embeddings.rs</span>
+                  <span class="cs-chip">1 z 3</span>
+                  <button class="btn btn-sm" data-nav><svg class="icon"><use href="#i-list"/></svg>Lista zmian</button>
+                </div>
+                <div class="cs-pane-body">
+                  <div class="diff">
                     <div class="diff-head">
                       <svg class="icon" style="width:12px;height:12px"><use href="#i-code"/></svg>
                       src/api/embeddings.rs
@@ -485,62 +390,31 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
 <div class="dl add"><span class="ln">14</span>}</div>
 <div class="dl del"><span class="ln">15</span>// TODO: batching</div>
 <div class="dl add"><span class="ln">15</span>const MAX_BATCH: usize = 64;</div>
+<div class="dl ctx"><span class="ln">16</span></div>
+<div class="dl add"><span class="ln">17</span>pub async fn embeddings_handler(</div>
+<div class="dl add"><span class="ln">18</span>    State(state): State&lt;AppState&gt;,</div>
+<div class="dl add"><span class="ln">19</span>    Json(req): Json&lt;EmbeddingsRequest&gt;,</div>
+<div class="dl add"><span class="ln">20</span>) -&gt; Result&lt;Json&lt;EmbeddingsResponse&gt;, ApiError&gt; {</div>
                     </div>
                   </div>
-
-                  <div style="display:flex;gap:8px;margin-top:12px">
-                    <button class="btn btn-sm" style="flex:1">Odrzuć</button>
-                    <button class="btn btn-sm btn-primary" style="flex:2"><svg class="icon"><use href="#i-check"/></svg>Akceptuj 3 pliki</button>
-                  </div>
-                  <div class="cs-hint-keys" style="margin-top:8px;text-align:center">
-                    commit powstanie z zaakceptowanych blobów, nie ze stanu dysku
-                  </div>
                 </div>
-
-                <!-- ---- GIT ---- -->
-                <div class="cs-dock-pane" data-pane="git">
-                  <div class="git-branch">
-                    <svg class="icon" style="color:var(--accent-2)"><use href="#i-git"/></svg>
-                    <span class="b">cs/piotr/9f2a1c4b</span>
-                    <span class="ahead">↑2 ↓0</span>
-                  </div>
-
-                  <div class="cs-dock-title">Historia gałęzi</div>
-                  <div class="git-commit head">
-                    <span class="gnode"><span class="gdot"></span><span class="gline"></span></span>
-                    <span>
-                      <span class="gmsg">feat: szkielet /v1/embeddings</span>
-                      <span class="gmeta">9f2a1c4 · przed chwilą · code-studio</span>
-                    </span>
-                  </div>
-                  <div class="git-commit">
-                    <span class="gnode"><span class="gdot"></span><span class="gline"></span></span>
-                    <span>
-                      <span class="gmsg">chore: gałąź sesji #4</span>
-                      <span class="gmeta">7b31d20 · 4 min temu</span>
-                    </span>
-                  </div>
-                  <div class="git-commit">
-                    <span class="gnode"><span class="gdot" style="border-color:var(--text-3)"></span></span>
-                    <span>
-                      <span class="gmsg">docs: record unroll8 benchmark</span>
-                      <span class="gmeta">9fba846 · main · wczoraj</span>
-                    </span>
-                  </div>
-
-                  <div style="display:flex;gap:8px;margin-top:14px">
-                    <button class="btn btn-sm" style="flex:1"><svg class="icon"><use href="#i-refresh"/></svg>Pobierz</button>
-                    <button class="btn btn-sm btn-primary" style="flex:1"><svg class="icon"><use href="#i-git"/></svg>Wypchnij</button>
-                  </div>
-                  <div class="cs-hint-keys" style="margin-top:8px;text-align:center">
-                    wypchnięcie i scalenie zawsze pytają — nie da się tego wyłączyć
-                  </div>
+                <div class="cs-pane-foot">
+                  <span class="cs-hint-keys">commit powstanie z zaakceptowanych blobów, nie ze stanu dysku</span>
+                  <span class="spacer"></span>
+                  <button class="btn btn-sm">Odrzuć plik</button>
+                  <button class="btn btn-sm btn-primary"><svg class="icon"><use href="#i-check"/></svg>Akceptuj 3 pliki</button>
                 </div>
+              </div>
 
-                <!-- ---- TERMINAL ---- -->
-                <div class="cs-dock-pane" data-pane="terminal">
-                  <div class="cs-dock-title">worktree · profil cow</div>
-                  <div class="cs-term">
+              <!-- ================= TREŚĆ: TERMINAL ================= -->
+              <div class="cs-spane" data-spane="terminal">
+                <div class="cs-pane-head">
+                  <span class="cs-chip accent"><svg class="icon"><use href="#i-terminal"/></svg>worktree · profil cow</span>
+                  <span class="spacer"></span>
+                  <button class="btn btn-sm" data-nav><svg class="icon"><use href="#i-list"/></svg>Sesje</button>
+                  <button class="btn btn-sm btn-danger"><svg class="icon"><use href="#i-stop"/></svg>Przerwij</button>
+                </div>
+                <div class="cs-term">
 <span class="pr">piotr@dev-ryzen</span>:<span class="dm">~/cs/tentaflow-core</span>$ cargo test --test openai_compat
    <span class="dm">Compiling</span> tentaflow-core v0.9.3
     <span class="dm">Finished</span> test profile in 41.2s
@@ -551,15 +425,202 @@ test embeddings_batch_input ... <span class="pr">ok</span>
 test embeddings_rejects_empty ... <span class="pr">ok</span>
 test chat_completions_stream ... <span class="pr">ok</span>
 
-test result: <span class="pr">ok</span>. 4 passed; 0 failed
+test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
 <span class="dm">— warstwa COW odrzucona, worktree nietknięty</span>
 <span class="pr">piotr@dev-ryzen</span>:<span class="dm">~/cs/tentaflow-core</span>$ <span class="cs-caret" style="vertical-align:-3px"></span>
+                </div>
+              </div>
+
+              <!-- ================= TREŚĆ: WNĘTRZE SUBAGENTA ================= -->
+              <div class="cs-spane" data-spane="subagent">
+                <div class="cs-pane-head">
+                  <span class="cs-dot run"></span>
+                  <span><strong style="font-size:12.5px">code-implementer</strong>
+                    <span class="cs-stage-sub">qwen3.6-27b · profil rw · iteracja 3/25</span></span>
+                  <span class="spacer"></span>
+                  <button class="btn btn-sm" data-stage-go="konsola"><svg class="icon"><use href="#i-arrow-left"/></svg>Agent główny</button>
+                </div>
+                <div class="cs-stream">
+                  <div class="cs-turn">Zlecenie od orkiestratora</div>
+                  <div class="ev ev-user" style="max-width:88%">Przygotuj szkielet handlera <code>/v1/embeddings</code> i zarejestruj trasę. Kształt odpowiedzi zostaw na później.</div>
+                  <div class="ev ev-think">Najpierw sprawdzam, jak zbudowany jest handler czatu, żeby trzymać ten sam wzorzec błędów.</div>
+                  <div class="ev ev-tool ok">
+                    <span class="t-ico"><svg class="icon"><use href="#i-file"/></svg></span>
+                    <span class="t-name">fs_read</span><span class="t-arg">src/api/openai_compat.rs · 60–140</span>
+                    <span class="t-meta"><svg class="icon t-done" style="width:13px;height:13px"><use href="#i-check"/></svg><span>0.1s</span></span>
+                  </div>
+                  <div class="ev ev-tool ok">
+                    <span class="t-ico"><svg class="icon"><use href="#i-edit"/></svg></span>
+                    <span class="t-name">fs_write</span><span class="t-arg">src/api/embeddings.rs</span>
+                    <span class="t-meta"><span>+112</span><svg class="icon t-done" style="width:13px;height:13px"><use href="#i-check"/></svg></span>
+                  </div>
+                  <div class="ev ev-tool run">
+                    <span class="t-ico"><svg class="icon"><use href="#i-refresh"/></svg></span>
+                    <span class="t-name">fs_edit</span><span class="t-arg">src/api/router.rs — rejestracja trasy</span>
+                    <span class="t-meta"><span>12s</span></span>
+                  </div>
+                  <div class="ev ev-say">Trasa dopisana obok pozostałych <code>/v1/*</code>. Czekam na decyzję o wsadzie, żeby dokończyć kształt odpowiedzi<span class="cs-caret"></span></div>
+                </div>
+                <div class="cs-nowbar">
+                  <svg class="icon"><use href="#i-refresh"/></svg>
+                  fs_edit · src/api/router.rs
+                  <span class="el">8,1k tok · budżet 25 iteracji</span>
+                </div>
+              </div>
+
+            </div>
+
+            <!-- ============================= DOK ============================= -->
+            <div class="cs-dock">
+              <div class="cs-dock-tabs">
+                <div class="cs-dock-tab active" data-goto="agenci"><svg class="icon"><use href="#i-bot"/></svg>Subagenci<span class="cnt">4</span></div>
+                <div class="cs-dock-tab" data-goto="pliki"><svg class="icon"><use href="#i-file"/></svg>Pliki</div>
+                <div class="cs-dock-tab" data-goto="zmiany"><svg class="icon"><use href="#i-code"/></svg>Zmiany<span class="cnt hot">3</span></div>
+                <div class="cs-dock-tab" data-goto="git"><svg class="icon"><use href="#i-git"/></svg>Git</div>
+                <div class="cs-dock-tab" data-goto="terminal"><svg class="icon"><use href="#i-terminal"/></svg>Terminal</div>
+              </div>
+
+              <div class="cs-dock-body">
+
+                <!-- ---- SPIS: SUBAGENCI ---- -->
+                <div class="cs-dock-pane" data-pane="agenci">
+                  <div class="cs-dock-title">Aktywne w tej sesji</div>
+
+                  <div class="sa run focused" data-open="subagent">
+                    <div class="sa-head">
+                      <span class="sa-av"><svg class="icon"><use href="#i-edit"/></svg></span>
+                      <span><span class="sa-nm">code-implementer</span><br><span class="sa-role">qwen3.6-27b · rw</span></span>
+                      <span class="cs-dot run"></span>
+                    </div>
+                    <div class="sa-now">fs_edit src/api/router.rs</div>
+                    <div class="sa-bar"><i style="width:42%"></i></div>
+                    <div class="sa-foot"><span>iter 3/25</span><span class="sep"></span><span>1m 04s</span><span class="sep"></span><span>8,1k tok</span></div>
+                  </div>
+
+                  <div class="sa ok" data-open="subagent">
+                    <div class="sa-head">
+                      <span class="sa-av"><svg class="icon"><use href="#i-list"/></svg></span>
+                      <span><span class="sa-nm">code-planner</span><br><span class="sa-role">claude-code/opus · ro</span></span>
+                      <span class="cs-dot ok"></span>
+                    </div>
+                    <div class="sa-now">Plan: 4 kroki · 3 pliki · 1 test</div>
+                    <div class="sa-foot"><span>zakończony</span><span class="sep"></span><span>38s</span><span class="sep"></span><span>6,2k tok</span></div>
+                  </div>
+
+                  <div class="sa" data-open="subagent">
+                    <div class="sa-head">
+                      <span class="sa-av"><svg class="icon"><use href="#i-flask"/></svg></span>
+                      <span><span class="sa-nm">code-tester</span><br><span class="sa-role">qwen3.6-27b · cow</span></span>
+                      <span class="cs-dot idle"></span>
+                    </div>
+                    <div class="sa-now">czeka na implementera</div>
+                    <div class="sa-foot"><span>w kolejce</span><span class="sep"></span><span>cargo test</span></div>
+                  </div>
+
+                  <div class="sa" data-open="subagent">
+                    <div class="sa-head">
+                      <span class="sa-av"><svg class="icon"><use href="#i-eye"/></svg></span>
+                      <span><span class="sa-nm">code-reviewer</span><br><span class="sa-role">claude-code/opus · ro</span></span>
+                      <span class="cs-dot idle"></span>
+                    </div>
+                    <div class="sa-now">czeka na implementera</div>
+                    <div class="sa-foot"><span>w kolejce</span></div>
+                  </div>
+
+                  <div class="cs-legend">
+                    <span><span class="cs-dot run"></span>pracuje</span>
+                    <span><span class="cs-dot ask"></span>czeka</span>
+                    <span><span class="cs-dot ok"></span>gotowe</span>
+                    <span><span class="cs-dot idle"></span>kolejka</span>
+                  </div>
+                </div>
+
+                <!-- ---- SPIS: DRZEWO PLIKÓW ---- -->
+                <div class="cs-dock-pane" data-pane="pliki">
+                  <div class="cs-dock-title">tentaflow-core</div>
+                  <div class="ft">
+                    <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>src</div>
+                    <div class="ft-ind">
+                      <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>api</div>
+                      <div class="ft-ind">
+                        <div class="ft-row active" data-file><svg class="icon"><use href="#i-file"/></svg>embeddings.rs<span class="badge a">nowy</span></div>
+                        <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>router.rs<span class="badge">M</span></div>
+                        <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs</div>
+                      </div>
+                      <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>routing</div>
+                      <div class="ft-row"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>flow_engine</div>
+                      <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>lib.rs</div>
+                    </div>
+                    <div class="ft-row open"><svg class="icon chev"><use href="#i-chevron-r"/></svg><svg class="icon"><use href="#i-folder"/></svg>tests</div>
+                    <div class="ft-ind">
+                      <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>openai_compat.rs<span class="badge">M</span></div>
+                    </div>
+                    <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>Cargo.toml</div>
+                    <div class="ft-row" data-file><svg class="icon"><use href="#i-file"/></svg>CLAUDE.md</div>
+                  </div>
+                </div>
+
+                <!-- ---- SPIS: ZMIANY ---- -->
+                <div class="cs-dock-pane" data-pane="zmiany">
+                  <div class="cs-dock-title">3 pliki · +148 / −12</div>
+                  <div class="nav-row active" data-open="zmiany"><span class="pf"><span class="st a">A</span></span>embeddings.rs<span class="n" style="color:var(--cs-ok)">+112</span></div>
+                  <div class="nav-row" data-open="zmiany"><span class="pf"><span class="st m">M</span></span>router.rs<span class="n"><span style="color:var(--cs-ok)">+6</span> <span style="color:var(--cs-err)">−2</span></span></div>
+                  <div class="nav-row" data-open="zmiany"><span class="pf"><span class="st m">M</span></span>openai_compat.rs<span class="n"><span style="color:var(--cs-ok)">+30</span> <span style="color:var(--cs-err)">−10</span></span></div>
+                  <div style="display:flex;gap:8px;margin-top:12px">
+                    <button class="btn btn-sm" style="flex:1">Odrzuć</button>
+                    <button class="btn btn-sm btn-primary" style="flex:2"><svg class="icon"><use href="#i-check"/></svg>Akceptuj 3</button>
+                  </div>
+                </div>
+
+                <!-- ---- SPIS: GIT ---- -->
+                <div class="cs-dock-pane" data-pane="git">
+                  <div class="git-branch">
+                    <svg class="icon" style="color:var(--accent-2)"><use href="#i-git"/></svg>
+                    <span class="b">cs/piotr/9f2a1c4b</span>
+                    <span class="ahead">↑2 ↓0</span>
+                  </div>
+                  <div class="cs-dock-title">Historia gałęzi</div>
+                  <div class="git-commit head">
+                    <span class="gnode"><span class="gdot"></span><span class="gline"></span></span>
+                    <span><span class="gmsg">feat: szkielet /v1/embeddings</span>
+                    <span class="gmeta">9f2a1c4 · przed chwilą · code-studio</span></span>
+                  </div>
+                  <div class="git-commit">
+                    <span class="gnode"><span class="gdot"></span><span class="gline"></span></span>
+                    <span><span class="gmsg">chore: gałąź sesji #4</span>
+                    <span class="gmeta">7b31d20 · 4 min temu</span></span>
+                  </div>
+                  <div class="git-commit">
+                    <span class="gnode"><span class="gdot" style="border-color:var(--text-3)"></span></span>
+                    <span><span class="gmsg">docs: record unroll8 benchmark</span>
+                    <span class="gmeta">9fba846 · main · wczoraj</span></span>
+                  </div>
+                  <div style="display:flex;gap:8px;margin-top:14px">
+                    <button class="btn btn-sm" style="flex:1"><svg class="icon"><use href="#i-refresh"/></svg>Pobierz</button>
+                    <button class="btn btn-sm btn-primary" style="flex:1"><svg class="icon"><use href="#i-git"/></svg>Wypchnij</button>
+                  </div>
+                  <div class="cs-hint-keys" style="margin-top:8px;text-align:center">
+                    wypchnięcie i scalenie zawsze pytają
+                  </div>
+                </div>
+
+                <!-- ---- SPIS: TERMINALE ---- -->
+                <div class="cs-dock-pane" data-pane="terminal">
+                  <div class="cs-dock-title">Sesje powłoki</div>
+                  <div class="nav-row active" data-open="terminal"><svg class="icon"><use href="#i-terminal"/></svg>cargo test<span class="n" style="color:var(--cs-ok)">ok</span></div>
+                  <div class="nav-row" data-open="terminal"><svg class="icon"><use href="#i-terminal"/></svg>cargo build<span class="n" style="color:var(--cs-ok)">ok</span></div>
+                  <div class="nav-row" data-open="terminal"><svg class="icon"><use href="#i-terminal"/></svg>bash<span class="n">bezczynna</span></div>
+                  <div class="cs-proj-add" style="margin-top:10px;justify-content:center">Nowa sesja</div>
+                  <div class="cs-hint-keys" style="margin-top:10px;line-height:1.6">
+                    Powłoka startuje w piaskownicy sesji, w profilu <b>cow</b> — build nie dotknie drzewa roboczego.
                   </div>
                 </div>
 
               </div>
             </div>
           </div>
+
+          <div class="cs-nav-scrim" data-nav></div>
 
           <!-- ===== TELEFON: skrót powrotu do agenta głównego ===== -->
           <button class="cs-backchat" data-goto="konsola">
@@ -612,27 +673,90 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed
 
 <script>
 (function () {
-  var shell = document.getElementById('shell');
-  var sheet = document.getElementById('sheet');
-  var scrim = document.getElementById('scrim');
+  var shell  = document.getElementById('shell');
+  var sheet  = document.getElementById('sheet');
+  var scrim  = document.getElementById('scrim');
+  var answer = document.getElementById('answer');
 
-  function setView(v) {
-    shell.dataset.view = v;
-    shell.dataset.dock = (v === 'konsola') ? 'agenci' : v;
-    document.querySelectorAll('.cs-mtab').forEach(function (t) {
-      t.classList.toggle('active', t.dataset.goto === v);
-    });
-    document.querySelectorAll('.cs-dock-tab').forEach(function (t) {
-      t.classList.toggle('active', t.dataset.goto === shell.dataset.dock);
-    });
-    var body = shell.querySelector('.cs-dock-body');
-    if (body) body.scrollTop = 0;
+  // Scena = główne okno treści. Dok = nawigator. Na wąskim ekranie widok
+  // treściowy pokazuje scenę, a spisowy dok; dolny pasek steruje jednym i drugim.
+  var VIEW = {
+    konsola:  { stage: 'konsola',  dock: 'agenci'   },
+    agenci:   { stage: 'subagent', dock: 'agenci'   },
+    pliki:    { stage: 'plik',     dock: 'pliki'    },
+    zmiany:   { stage: 'zmiany',   dock: 'zmiany'   },
+    git:      { stage: 'konsola',  dock: 'git'      },
+    terminal: { stage: 'terminal', dock: 'terminal' }
+  };
+
+  function paint() {
+    var v = shell.dataset.view, st = shell.dataset.stage, dk = shell.dataset.dock;
+    document.querySelectorAll('.cs-mtab').forEach(function (t) { t.classList.toggle('active', t.dataset.goto === v); });
+    document.querySelectorAll('.cs-dock-tab').forEach(function (t) { t.classList.toggle('active', t.dataset.goto === dk); });
+    document.querySelectorAll('.cs-stab').forEach(function (t) { t.classList.toggle('active', t.dataset.stage === st); });
   }
 
+  // Dolny pasek (telefon) — ustawia komplet stanu.
+  function setView(v) {
+    var m = VIEW[v] || VIEW.konsola;
+    shell.dataset.view = v; shell.dataset.stage = m.stage; shell.dataset.dock = m.dock;
+    shell.classList.remove('nav-open');
+    paint();
+  }
+  // Zakładka sceny — zmienia tylko treść w głównym oknie.
+  function setStage(st) {
+    shell.dataset.stage = st;
+    if (st !== 'konsola' && st !== 'subagent') shell.dataset.view = st === 'plik' ? 'pliki' : st;
+    else if (st === 'konsola') shell.dataset.view = 'konsola';
+    shell.classList.remove('nav-open');
+    paint();
+  }
+  // Zakładka doku — zmienia tylko spis.
+  function setDock(dk) { shell.dataset.dock = dk; paint(); }
+
+  document.querySelectorAll('.cs-mtab').forEach(function (el) {
+    el.addEventListener('click', function () { setView(el.dataset.goto); });
+  });
+  document.querySelectorAll('.cs-dock-tab').forEach(function (el) {
+    el.addEventListener('click', function () { setDock(el.dataset.goto); });
+  });
+  document.querySelectorAll('.cs-stab').forEach(function (el) {
+    el.addEventListener('click', function () { setStage(el.dataset.stage); });
+  });
+  document.querySelectorAll('[data-stage-go]').forEach(function (el) {
+    el.addEventListener('click', function () { setStage(el.dataset.stageGo); });
+  });
   document.querySelectorAll('[data-goto]').forEach(function (el) {
+    if (el.classList.contains('cs-mtab') || el.classList.contains('cs-dock-tab')) return;
     el.addEventListener('click', function () { setView(el.dataset.goto); });
   });
 
+  // Kliknięcie w spisie otwiera rzecz w GŁÓWNYM oknie.
+  document.querySelectorAll('[data-open]').forEach(function (el) {
+    el.addEventListener('click', function () {
+      var group = el.parentElement.querySelectorAll('[data-open]');
+      group.forEach(function (g) { g.classList.remove('active', 'focused'); });
+      el.classList.add(el.classList.contains('sa') ? 'focused' : 'active');
+      setStage(el.dataset.open);
+    });
+  });
+  document.querySelectorAll('[data-file]').forEach(function (row) {
+    row.addEventListener('click', function () {
+      document.querySelectorAll('[data-file]').forEach(function (r) { r.classList.remove('active'); });
+      row.classList.add('active');
+      var name = row.textContent.trim().replace(/(nowy|M)$/, '');
+      var head = document.querySelector('.cs-spane[data-spane="plik"] .path');
+      if (head) head.textContent = 'src/api/' + name;
+      setStage('plik');
+    });
+  });
+
+  // Nawigator jako szuflada z prawej (telefon).
+  document.querySelectorAll('[data-nav]').forEach(function (el) {
+    el.addEventListener('click', function () { shell.classList.toggle('nav-open'); });
+  });
+
+  // Arkusz workspace'ów — zjeżdża od góry, spod przycisku który go otwiera.
   function closeSheet() { sheet.classList.remove('open'); scrim.classList.remove('open'); }
   document.querySelectorAll('[data-sheet]').forEach(function (el) {
     el.addEventListener('click', function () {
@@ -641,45 +765,22 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed
     });
   });
   scrim.addEventListener('click', closeSheet);
-  document.querySelectorAll('.cs-sheet-item').forEach(function (el) {
-    el.addEventListener('click', closeSheet);
-  });
+  document.querySelectorAll('.cs-sheet-item').forEach(function (el) { el.addEventListener('click', closeSheet); });
 
-  // Szuflada drzewa plików — otwiera przycisk, zamyka wybór pliku lub tło.
-  var files = document.getElementById('files');
-  document.querySelectorAll('[data-tree]').forEach(function (el) {
-    el.addEventListener('click', function () { files.classList.toggle('tree-open'); });
-  });
-  files.querySelectorAll('[data-file]').forEach(function (row) {
-    row.addEventListener('click', function () {
-      files.querySelectorAll('.ft-row').forEach(function (r) { r.classList.remove('active'); });
-      row.classList.add('active');
-      var path = row.textContent.trim().replace(/(nowy|M)$/, '');
-      var head = files.querySelector('.cs-file-head .path');
-      if (head) head.textContent = path;
-      files.classList.remove('tree-open');
-    });
-  });
-
-  // Zwijanie pytania, gdy chcesz zobaczyć więcej rozmowy.
-  var answer = document.getElementById('answer');
+  // Pytanie: chipy są zawsze widoczne, chevron rozwija opisy.
   var answerHead = document.getElementById('answerHead');
-  if (answerHead) {
-    answerHead.addEventListener('click', function () { answer.classList.toggle('expanded'); });
-  }
-
+  if (answerHead) answerHead.addEventListener('click', function () { answer.classList.toggle('expanded'); });
   document.querySelectorAll('.cs-answer-opt').forEach(function (opt) {
     opt.addEventListener('click', function () { answer.classList.remove('expanded'); });
   });
-
-  // Kotwica w strumieniu prowadzi do pytania w kompozytorze.
   document.querySelectorAll('.ev-askmark').forEach(function (el) {
     el.addEventListener('click', function () {
       setView('konsola');
-      answer.classList.add('expanded');
       answer.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
     });
   });
+
+  paint();
 })();
 </script>
 
