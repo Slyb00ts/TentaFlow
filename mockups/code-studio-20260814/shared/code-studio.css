@@ -156,6 +156,11 @@ html, body { height: 100%; overflow: hidden; }
   display: flex; flex-direction: column; gap: 3px;
   scrollbar-width: thin;
 }
+/* KLUCZOWE: w kolumnie flex o ograniczonej wysokości dzieci mają domyślne
+   flex-shrink:1, więc przeglądarka ŚCISKA każdą wiadomość i kartę w pionie —
+   teksty się urywają, a bloki dostają własne paski przewijania. Elementy
+   rozmowy mają zajmować tyle, ile mierzy ich treść; przewija się kontener. */
+.cs-stream > * { flex-shrink: 0; }
 .cs-stream::-webkit-scrollbar { width: 7px; }
 .cs-stream::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
 
@@ -172,6 +177,10 @@ html, body { height: 100%; overflow: hidden; }
 @keyframes csEvIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
 
 /* Wiadomość użytkownika */
+.ev-user code {
+  font-family: var(--cs-mono); font-size: 12px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(255,255,255,.18); color: #fff;
+}
 .ev-user {
   align-self: flex-end; max-width: 78%; margin: 8px 0 10px;
   padding: 10px 13px; border-radius: 12px 12px 3px 12px;
@@ -245,7 +254,7 @@ html, body { height: 100%; overflow: hidden; }
   margin: 0 0 6px 30px; padding: 9px 12px; border-radius: 8px;
   background: var(--bg-input); border: 1px solid var(--border);
   font-family: var(--cs-mono); font-size: 11px; line-height: 1.65; color: var(--text-2);
-  white-space: pre-wrap; overflow-x: auto; animation: csEvIn .22s ease-out both;
+  white-space: pre-wrap; overflow-wrap: anywhere; animation: csEvIn .22s ease-out both;
 }
 .ev-detail .add { color: var(--cs-ok); }
 .ev-detail .del { color: var(--cs-err); }
@@ -743,9 +752,9 @@ html, body { height: 100%; overflow: hidden; }
     border-bottom: 1px solid var(--border); background: var(--bg-2); min-width: 0;
   }
   .cs-mtop .ttl { min-width: 0; flex: 1; }
-  .cs-mtop .ttl .t1 { font-size: 12px; font-weight: 700; color: var(--text);
+  .cs-mtop .ttl .t1 { display: block; font-size: 12px; font-weight: 700; color: var(--text);
                       overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .cs-mtop .ttl .t2 { font-size: 10px; color: var(--text-3); font-family: var(--cs-mono); }
+  .cs-mtop .ttl .t2 { display: block; font-size: 10px; color: var(--text-3); font-family: var(--cs-mono); }
 
   /* Jedna kolumna: albo scena, albo dok — nigdy jedno pod drugim. */
   .cs-body { grid-template-columns: 1fr; grid-template-rows: 1fr; min-height: 0; }
@@ -807,6 +816,13 @@ html, body { height: 100%; overflow: hidden; }
   }
   @keyframes csOptsIn { from { transform: translateY(12px); opacity: 0; } to { transform: none; opacity: 1; } }
   .cs-answer-opt { padding: 11px; min-height: 46px; }
+
+  /* Pasek kompozytora: zostaje spinacz, tryb i wysyłka — podpowiedź klawisza
+     i słowo „Tryb" to na 390 px czysta strata miejsca. */
+  .cs-composer-bar .cs-hint-keys { display: none; }
+  .cs-composer-bar .btn-ghost span { display: none; }
+  .ev-patch-files { padding: 6px 6px 2px; }
+  .pf { font-size: 11px; }
 
   /* ---- Pliki: podgląd na cały ekran, drzewo jako szuflada z prawej ---- */
   .cs-shell[data-view="pliki"] .cs-dock-body,
