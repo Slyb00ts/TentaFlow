@@ -784,9 +784,11 @@ html, body { height: 100%; overflow: hidden; }
   .ev-tool .t-meta { margin-left: auto; }
   .ev-detail { margin-left: 8px; font-size: 10.5px; }
 
-  /* Pytanie: zwinięte startowo, a opcje WYPŁYWAJĄ nad kompozytor zamiast
-     zabierać wysokość. Rozwinięte na stałe zjadały ~57% ekranu i na rozmowę
-     zostawało 29% — czyli dokładnie „nic nie widać". */
+  /* Pytanie jest ZAWSZE widoczne razem z opcjami — aktywne pytanie nie może
+     mieć stanu ukrytego. Opcje to jeden przewijalny w poziomie rząd chipów:
+     kosztuje ~48 px zamiast ~290 px, więc rozmowie zostaje ok. 60% ekranu.
+     Pływający panel nad kompozytorem został usunięty — potrafił wylądować
+     pod treścią, a i tak wymagał rozwijania. */
   .cs-composer { position: relative; }
   .cs-answer-head .chev { display: block; }
   .cs-answer-head .optn {
@@ -803,19 +805,36 @@ html, body { height: 100%; overflow: hidden; }
   .cs-answer.expanded .cs-answer-q { -webkit-line-clamp: unset; }
   .cs-answer.expanded .cs-answer-head .chev { transform: rotate(180deg); }
 
+  /* Domyślnie: chipy w jednym rzędzie, przewijane poziomo, zawsze widoczne. */
   .cs-answer-opts {
-    display: none;
-    position: absolute; left: 10px; right: 10px; bottom: calc(100% - 6px); z-index: 12;
-    max-height: 52dvh; overflow-y: auto; padding: 8px; gap: 6px;
-    background: var(--bg-2); border: 1px solid rgba(245,158,11,.45);
-    border-radius: var(--radius-lg); box-shadow: 0 -14px 44px rgba(0,0,0,.7);
+    display: flex; flex-direction: row; gap: 7px;
+    position: static; max-height: none;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+    padding: 0 10px 10px; -webkit-overflow-scrolling: touch;
   }
+  .cs-answer-opts::-webkit-scrollbar { display: none; }
+  .cs-answer-opt {
+    flex: 0 0 auto; flex-direction: row; align-items: center; gap: 8px;
+    padding: 9px 13px; min-height: 44px; white-space: nowrap;
+  }
+  .cs-answer-opt .l { font-size: 12px; }
+  .cs-answer-opt .d { display: none; }
+
+  /* Chevron rozwija OPISY — ale w układzie, a nie nad nim: karty wracają do
+     pionu, dostają limit wysokości i własne przewijanie. */
   .cs-answer.expanded .cs-answer-opts {
-    display: flex; flex-direction: column;
-    animation: csOptsIn .26s var(--spring) both;
+    flex-direction: column; overflow-x: hidden; overflow-y: auto; max-height: 32dvh;
   }
-  @keyframes csOptsIn { from { transform: translateY(12px); opacity: 0; } to { transform: none; opacity: 1; } }
-  .cs-answer-opt { padding: 11px; min-height: 46px; }
+  .cs-answer.expanded .cs-answer-opts { padding-bottom: 10px; }
+  .cs-answer.expanded .cs-answer-opt { white-space: normal; align-items: flex-start; padding: 11px; }
+  .cs-answer.expanded .cs-answer-opt .d { display: block; }
+
+  /* Cień przy prawej krawędzi mówi, że rząd chipów jedzie dalej */
+  .cs-answer { position: relative; }
+  .cs-answer:not(.expanded)::after {
+    content: ''; position: absolute; right: 0; bottom: 10px; width: 28px; height: 44px;
+    background: linear-gradient(90deg, transparent, var(--bg-2)); pointer-events: none;
+  }
 
   /* Pasek kompozytora: zostaje spinacz, tryb i wysyłka — podpowiedź klawisza
      i słowo „Tryb" to na 390 px czysta strata miejsca. */
