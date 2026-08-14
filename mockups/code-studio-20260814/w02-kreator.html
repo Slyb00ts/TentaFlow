@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>TentaFlow — Code Studio · Kreator workspace'a (W02)</title>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="shared/styles.css?v=4">
-<link rel="stylesheet" href="shared/code-studio.css?v=4">
+<link rel="stylesheet" href="shared/styles.css?v=5">
+<link rel="stylesheet" href="shared/code-studio.css?v=5">
 <style>
   .ws-page { padding: 20px 24px; overflow: hidden; flex: 1; min-height: 0; }
   .mode-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
@@ -129,13 +129,19 @@
       </main>
     </div>
     <div class="window-backdrop">
-      <div class="window wizard" style="max-width:720px">
+      <div class="window wizard">
         <div class="window-head">
           <div class="window-title"><svg class="icon"><use href="#i-plus"/></svg>Nowy workspace</div>
-          <div class="window-close"><svg class="icon"><use href="#i-x"/></svg></div>
+          <button class="window-close" title="Zamknij"><svg class="icon"><use href="#i-x"/></svg></button>
         </div>
         <div class="window-body">
-<div class="stepper"><div class="step active"><span class="n">1</span>Podstawy</div><div class="step "><span class="n">2</span>Wykonanie</div><div class="step "><span class="n">3</span>Kod</div></div>
+<div class="stepper">
+            <div class="step active"><span class="n">1</span>Podstawy</div>
+            <div class="line"></div>
+            <div class="step"><span class="n">2</span>Wykonanie</div>
+            <div class="line"></div>
+            <div class="step"><span class="n">3</span>Kod</div>
+          </div>
           <div class="field">
             <label>Nazwa workspace'a</label>
             <input class="input" value="tentaflow-core">
@@ -212,13 +218,19 @@
       </main>
     </div>
     <div class="window-backdrop">
-      <div class="window wizard" style="max-width:720px">
+      <div class="window wizard">
         <div class="window-head">
           <div class="window-title"><svg class="icon"><use href="#i-plus"/></svg>Nowy workspace</div>
-          <div class="window-close"><svg class="icon"><use href="#i-x"/></svg></div>
+          <button class="window-close" title="Zamknij"><svg class="icon"><use href="#i-x"/></svg></button>
         </div>
         <div class="window-body">
-<div class="stepper"><div class="step done"><span class="n">1</span>Podstawy</div><div class="step active"><span class="n">2</span>Wykonanie</div><div class="step "><span class="n">3</span>Kod</div></div>
+<div class="stepper">
+            <div class="step done"><span class="n"><svg class="icon icon-sm"><use href="#i-check"/></svg></span>Podstawy</div>
+            <div class="line"></div>
+            <div class="step active"><span class="n">2</span>Wykonanie</div>
+            <div class="line"></div>
+            <div class="step"><span class="n">3</span>Kod</div>
+          </div>
           <div class="field">
             <label>Tryb wykonania</label>
             <div class="mode-grid">
@@ -328,13 +340,19 @@
       </main>
     </div>
     <div class="window-backdrop">
-      <div class="window wizard" style="max-width:720px">
+      <div class="window wizard">
         <div class="window-head">
           <div class="window-title"><svg class="icon"><use href="#i-plus"/></svg>Nowy workspace</div>
-          <div class="window-close"><svg class="icon"><use href="#i-x"/></svg></div>
+          <button class="window-close" title="Zamknij"><svg class="icon"><use href="#i-x"/></svg></button>
         </div>
         <div class="window-body">
-<div class="stepper"><div class="step done"><span class="n">1</span>Podstawy</div><div class="step done"><span class="n">2</span>Wykonanie</div><div class="step active"><span class="n">3</span>Kod</div></div>
+<div class="stepper">
+            <div class="step done"><span class="n"><svg class="icon icon-sm"><use href="#i-check"/></svg></span>Podstawy</div>
+            <div class="line"></div>
+            <div class="step done"><span class="n"><svg class="icon icon-sm"><use href="#i-check"/></svg></span>Wykonanie</div>
+            <div class="line"></div>
+            <div class="step active"><span class="n">3</span>Kod</div>
+          </div>
           <div class="field">
             <label>Źródło kodu</label>
             <div class="segmented" style="margin-bottom:8px">
