@@ -148,6 +148,7 @@ impl OutDtype {
 
 pub use matmul::*;
 mod matmul;
+pub mod k_quants;
 
 /// Threads in one RMSNorm threadgroup. The reduction is per SIMD group and
 /// then across the eight of them, so the count is fixed by the kernel body and

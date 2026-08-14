@@ -29,7 +29,8 @@
 
 use std::ffi::c_void;
 
-use forge_types::{ForgeError, Result};
+use forge_formats::dequant::dequantize_to_f32;
+use forge_types::{DType, ForgeError, QuantKind, Result};
 use half::f16;
 
 /// Reusable scratch for the CPU half. One per model, not one per call: the
@@ -45,8 +46,10 @@ pub struct CpuMatmul {
 /// no copy, and the disjointness that makes it safe is in `run`'s contract.
 pub struct Operands<'a> {
     pub packed: &'a [u32],
+    pub high: Option<&'a [u32]>,
     pub scales: &'a [u16],
     pub biases: &'a [u16],
+    pub param_dtype: DType,
     pub x: &'a [u16],
     pub out: *mut u8,
     pub out_f16: bool,
@@ -63,6 +66,20 @@ pub struct Operands<'a> {
     /// of a checkpoint that decodes correctly at short prompts. A gate
     /// elsewhere and a check at the point of use are not the same thing.
     pub bits: u32,
+}
+
+/// A source that keeps a GGUF-style block layout. The CPU decodes only the
+/// rows assigned to it, so the full model never needs a second expanded copy.
+pub struct BlockOperands<'a> {
+    pub blocks: &'a [u8],
+    pub quant: QuantKind,
+    pub global: Option<f32>,
+    pub x: &'a [u16],
+    pub out: *mut u8,
+    pub out_f16: bool,
+    pub tokens: u32,
+    pub rows: u32,
+    pub cols: u32,
 }
 
 impl CpuMatmul {
@@ -88,8 +105,11 @@ impl CpuMatmul {
         let job = DequantJob {
             out: self.weights.as_mut_ptr(),
             packed: op.packed.as_ptr(),
+            high: op.high.map_or(std::ptr::null(), |high| high.as_ptr()),
             scales: op.scales.as_ptr(),
             biases: op.biases.as_ptr(),
+            bits: op.bits,
+            param_dtype: op.param_dtype,
             row0,
             count,
             cols,
@@ -108,6 +128,65 @@ impl CpuMatmul {
         }
     }
 
+    /// Decodes rows from a source block layout into the same reusable scratch
+    /// used by the affine path. Q4_K and Q6_K stay on specialized loops; the
+    /// format decoder covers the remaining self-contained block formats.
+    pub fn unpack_blocks(
+        &mut self,
+        op: &BlockOperands<'_>,
+        row0: usize,
+        count: usize,
+    ) -> Result<()> {
+        let cols = op.cols as usize;
+        let block_elems = op.quant.block_elems();
+        let block_bytes = op.quant.block_bytes();
+        if block_elems == 0 || block_bytes == 0 || !cols.is_multiple_of(block_elems) {
+            return Err(ForgeError::Unsupported(format!(
+                "CPU: {:?} nie ma samodzielnego układu blokowego dla {} kolumn",
+                op.quant, cols
+            )));
+        }
+        let bytes_per_row = cols / block_elems * block_bytes;
+        let start = row0
+            .checked_mul(bytes_per_row)
+            .ok_or_else(|| ForgeError::Format("CPU: przepełnienie offsetu bloków".into()))?;
+        let bytes = count
+            .checked_mul(bytes_per_row)
+            .ok_or_else(|| ForgeError::Format("CPU: przepełnienie rozmiaru bloków".into()))?;
+        let end = start
+            .checked_add(bytes)
+            .ok_or_else(|| ForgeError::Format("CPU: przepełnienie końca bloków".into()))?;
+        let source = op.blocks.get(start..end).ok_or_else(|| {
+            ForgeError::Format(format!(
+                "CPU: {} B bloków nie mieści wierszy [{row0}, {})",
+                op.blocks.len(),
+                row0 + count
+            ))
+        })?;
+        self.weights.resize(count * cols, f16::ZERO);
+        match op.quant {
+            QuantKind::Q4K => unpack_q4_k(source, &mut self.weights, cols),
+            QuantKind::Q6K => unpack_q6_k(source, &mut self.weights, cols),
+            _ => {
+                let decoded = dequantize_to_f32(
+                    DType::U8,
+                    op.quant,
+                    source,
+                    count * cols,
+                )?;
+                for (dst, value) in self.weights.iter_mut().zip(decoded) {
+                    *dst = f16::from_f32(value);
+                }
+            }
+        }
+        if let Some(global) = op.global {
+            for value in &mut self.weights {
+                *value = f16::from_f32(value.to_f32() * global);
+            }
+        }
+        Ok(())
+    }
+
     /// Computes rows `[row0, row0 + count)` of `out = x * wᵀ`.
     ///
     /// # Safety
@@ -124,17 +203,40 @@ impl CpuMatmul {
         unsafe { self.multiply(op, row0, count) }
     }
 
+    /// The block-layout counterpart of `run`.
+    pub unsafe fn run_blocks(
+        &mut self,
+        op: &BlockOperands<'_>,
+        row0: u32,
+        count: u32,
+    ) -> Result<()> {
+        self.check_blocks(op, row0, count)?;
+        self.unpack_blocks(op, row0 as usize, count as usize)?;
+        // SAFETY: forwarded from this function's contract.
+        unsafe { self.multiply_blocks(op, row0, count) }
+    }
+
     /// Shapes the caller has to get right before either half runs.
     pub fn check(&self, op: &Operands<'_>, row0: u32, count: u32) -> Result<()> {
         let (rows, cols, group) = (op.rows as usize, op.cols as usize, op.group as usize);
         let (row0, count) = (row0 as usize, count as usize);
-        if op.bits != 4 {
+        if !matches!(op.bits, 4 | 6) {
             return Err(ForgeError::Unsupported(format!(
-                "CPU: {} bitów na wagę, a rozpakowanie zna cztery",
+                "CPU: {} bitów na wagę, a rozpakowanie zna cztery i sześć",
                 op.bits
             )));
         }
-        if cols % group != 0 || cols % 8 != 0 {
+        if op.bits == 6 && op.high.is_none() {
+            return Err(ForgeError::Format(
+                "CPU: sześciobitowa waga nie ma płaszczyzny high".into(),
+            ));
+        }
+        if op.bits == 4 && op.high.is_some() {
+            return Err(ForgeError::Format(
+                "CPU: czterobitowa waga ma nieużywaną płaszczyznę high".into(),
+            ));
+        }
+        if cols % group != 0 || cols % 8 != 0 || (op.bits == 6 && !cols.is_multiple_of(16)) {
             return Err(ForgeError::Unsupported(format!(
                 "CPU: kolumny {cols} nie dzielą się na grupę {group} i słowa po 8"
             )));
@@ -148,6 +250,41 @@ impl CpuMatmul {
         Ok(())
     }
 
+    pub fn check_blocks(&self, op: &BlockOperands<'_>, row0: u32, count: u32) -> Result<()> {
+        let rows = op.rows as usize;
+        let (row0, count) = (row0 as usize, count as usize);
+        let block_elems = op.quant.block_elems();
+        let block_bytes = op.quant.block_bytes();
+        if block_elems == 0 || block_bytes == 0 || !op.cols.is_multiple_of(block_elems as u32) {
+            return Err(ForgeError::Unsupported(format!(
+                "CPU: {:?} nie ma samodzielnego układu blokowego dla {} kolumn",
+                op.quant, op.cols
+            )));
+        }
+        if row0.checked_add(count).is_none_or(|end| end > rows) {
+            return Err(ForgeError::Other(format!(
+                "CPU: blokowy wycinek [{row0}, {}) wykracza poza {rows} wierszy",
+                row0 + count
+            )));
+        }
+        let expected = rows
+            .checked_mul(op.cols as usize)
+            .and_then(|n| n.checked_div(block_elems))
+            .and_then(|n| n.checked_mul(block_bytes))
+            .ok_or_else(|| ForgeError::Format("CPU: przepełnienie rozmiaru wagi blokowej".into()))?;
+        if op.blocks.len() != expected {
+            return Err(ForgeError::Format(format!(
+                "CPU: {:?} ma {} B, oczekiwano {expected}",
+                op.quant,
+                op.blocks.len()
+            )));
+        }
+        if op.x.len() < op.tokens as usize * op.cols as usize {
+            return Err(ForgeError::Other("CPU: za krótki bufor aktywacji".into()));
+        }
+        Ok(())
+    }
+
     /// Multiplies the already-unpacked rows into `out`. This one DOES need the
     /// activations, so it is what the wait for the GPU has to precede.
     ///
@@ -155,11 +292,59 @@ impl CpuMatmul {
     ///
     /// As `run`, plus: `unpack` must have been called for the same slice.
     pub unsafe fn multiply(&mut self, op: &Operands<'_>, row0: u32, count: u32) -> Result<()> {
-        let (rows, cols) = (op.rows as usize, op.cols as usize);
-        let (tokens, row0, count) = (op.tokens as usize, row0 as usize, count as usize);
-        let out_ty = if op.out_f16 { BNNS_F16 } else { BNNS_F32 };
-        let elem = if op.out_f16 { 2 } else { 4 };
-        let a = descriptor(cols, tokens, op.x.as_ptr() as *mut c_void, BNNS_F16, 0);
+        // SAFETY: forwarded from `run`.
+        unsafe {
+            self.multiply_matrix(
+                op.x,
+                op.out,
+                op.out_f16,
+                op.tokens,
+                op.rows,
+                op.cols,
+                row0,
+                count,
+            )
+        }
+    }
+
+    /// Multiplies a block-layout source after its rows have been unpacked.
+    pub unsafe fn multiply_blocks(
+        &mut self,
+        op: &BlockOperands<'_>,
+        row0: u32,
+        count: u32,
+    ) -> Result<()> {
+        // SAFETY: forwarded from `run_blocks`.
+        unsafe {
+            self.multiply_matrix(
+                op.x,
+                op.out,
+                op.out_f16,
+                op.tokens,
+                op.rows,
+                op.cols,
+                row0,
+                count,
+            )
+        }
+    }
+
+    unsafe fn multiply_matrix(
+        &mut self,
+        x: &[u16],
+        out: *mut u8,
+        out_f16: bool,
+        tokens: u32,
+        rows: u32,
+        cols: u32,
+        row0: u32,
+        count: u32,
+    ) -> Result<()> {
+        let (rows, cols) = (rows as usize, cols as usize);
+        let (tokens, row0, count) = (tokens as usize, row0 as usize, count as usize);
+        let out_ty = if out_f16 { BNNS_F16 } else { BNNS_F32 };
+        let elem = if out_f16 { 2 } else { 4 };
+        let a = descriptor(cols, tokens, x.as_ptr() as *mut c_void, BNNS_F16, 0);
         let b = descriptor(
             cols,
             count,
@@ -174,7 +359,7 @@ impl CpuMatmul {
             count,
             tokens,
             // SAFETY: `row0 * elem` is inside the buffer by the check above.
-            unsafe { op.out.add(row0 * elem) } as *mut c_void,
+            unsafe { out.add(row0 * elem) } as *mut c_void,
             out_ty,
             rows,
         );
@@ -200,8 +385,11 @@ impl Default for CpuMatmul {
 struct DequantJob {
     out: *mut f16,
     packed: *const u32,
+    high: *const u32,
     scales: *const u16,
     biases: *const u16,
+    bits: u32,
+    param_dtype: DType,
     row0: usize,
     count: usize,
     cols: usize,
@@ -213,6 +401,15 @@ struct DequantJob {
 #[inline(always)]
 fn bf16(bits: u16) -> f32 {
     f32::from_bits(u32::from(bits) << 16)
+}
+
+#[inline(always)]
+fn scalar(bits: u16, dtype: DType) -> f32 {
+    match dtype {
+        DType::F16 => f16::from_bits(bits).to_f32(),
+        DType::BF16 => bf16(bits),
+        _ => unreachable!("kwantyzacyjne parametry CPU są tylko F16 albo BF16"),
+    }
 }
 
 extern "C" fn dequant_tile(ctx: *mut c_void, tile: usize) {
@@ -235,16 +432,18 @@ extern "C" fn dequant_tile(ctx: *mut c_void, tile: usize) {
         let (qrow, grow, orow) = (row * words_per_row, row * groups_per_row, local * job.cols);
         for g in 0..groups_per_row {
             // SAFETY: indices are inside the shapes checked in `check`.
-            let sc = bf16(unsafe { *job.scales.add(grow + g) });
-            let bi = bf16(unsafe { *job.biases.add(grow + g) });
+            let sc = scalar(unsafe { *job.scales.add(grow + g) }, job.param_dtype);
+            let bi = scalar(unsafe { *job.biases.add(grow + g) }, job.param_dtype);
 
             // Sixteen values ARE the whole alphabet of a 4-bit weight, and a
             // group shares one scale and one bias — so the group's values are
             // built once and then only read, instead of a multiply, an add and
             // a rounding to half per element.
-            let mut lut = [0u16; 16];
+            let mut lut = [0u16; 64];
             for (n, slot) in lut.iter_mut().enumerate() {
-                *slot = f16::from_f32(n as f32 * sc + bi).to_bits();
+                if n < (1usize << job.bits) {
+                    *slot = f16::from_f32(n as f32 * sc + bi).to_bits();
+                }
             }
 
             // SAFETY: `qrow + g * words_per_group` indexes inside `packed` and
@@ -252,8 +451,83 @@ extern "C" fn dequant_tile(ctx: *mut c_void, tile: usize) {
             let src = unsafe { job.packed.add(qrow + g * words_per_group) } as *const u8;
             let dst = unsafe { job.out.add(orow + g * job.group) } as *mut u16;
             // SAFETY: both runs are `group` elements long, as established above.
-            unsafe { fill_group(dst, src, &lut, job.group) };
+            if job.bits == 4 {
+                let lut4: &[u16; 16] = lut[..16].try_into().unwrap();
+                // SAFETY: the four-bit source uses only the low packed plane.
+                unsafe { fill_group4(dst, src, lut4, job.group) };
+            } else {
+                let high = unsafe {
+                    job.high.add(row * job.cols / 16 + g * job.group / 16)
+                };
+                // SAFETY: `check` established the six-bit layout and bounds.
+                unsafe { fill_group6(dst, src, high, &lut, job.group) };
+            }
         }
+    }
+}
+
+fn unpack_q4_k(source: &[u8], out: &mut [f16], cols: usize) {
+    let superblocks = cols / 256;
+    for (row, dst) in out.chunks_exact_mut(cols).enumerate() {
+        for sb in 0..superblocks {
+            let b = &source[(row * superblocks + sb) * 144..][..144];
+            let d = f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32();
+            let dmin = f16::from_bits(u16::from_le_bytes([b[2], b[3]])).to_f32();
+            for sub in 0..8 {
+                let (scale, min) = scale_min_k4(sub, &b[4..16]);
+                let scale = d * scale as f32;
+                let min = dmin * min as f32;
+                for j in 0..32 {
+                    let qbyte = b[16 + (sub / 2) * 32 + j];
+                    let q = if sub % 2 == 0 { qbyte & 0x0F } else { qbyte >> 4 };
+                    dst[sb * 256 + sub * 32 + j] =
+                        f16::from_f32((q as f32).mul_add(scale, -min));
+                }
+            }
+        }
+    }
+}
+
+fn unpack_q6_k(source: &[u8], out: &mut [f16], cols: usize) {
+    let superblocks = cols / 256;
+    for (row, dst) in out.chunks_exact_mut(cols).enumerate() {
+        for sb in 0..superblocks {
+            let b = &source[(row * superblocks + sb) * 210..][..210];
+            let ql = &b[..128];
+            let qh = &b[128..192];
+            let scales = &b[192..208];
+            let d = f16::from_bits(u16::from_le_bytes([b[208], b[209]])).to_f32();
+            for n in 0..2 {
+                let ql = &ql[n * 64..n * 64 + 64];
+                let qh = &qh[n * 32..n * 32 + 32];
+                let scales = &scales[n * 8..n * 8 + 8];
+                for l in 0..32 {
+                    let is = l / 16;
+                    let qs = [
+                        (ql[l] & 0x0F) | ((qh[l] & 3) << 4),
+                        (ql[l + 32] & 0x0F) | (((qh[l] >> 2) & 3) << 4),
+                        (ql[l] >> 4) | (((qh[l] >> 4) & 3) << 4),
+                        (ql[l + 32] >> 4) | (((qh[l] >> 6) & 3) << 4),
+                    ];
+                    for (q, value) in qs.into_iter().enumerate() {
+                        let col = sb * 256 + n * 128 + q * 32 + l;
+                        let scale = d * (scales[is + q * 2] as i8) as f32;
+                        dst[col] = f16::from_f32(scale * (value as i32 - 32) as f32);
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn scale_min_k4(j: usize, q: &[u8]) -> (u8, u8) {
+    if j < 4 {
+        (q[j] & 63, q[j + 4] & 63)
+    } else {
+        (
+            (q[j + 4] & 0x0F) | ((q[j - 4] >> 6) << 4),
+            (q[j + 4] >> 4) | ((q[j] >> 6) << 4),
+        )
     }
 }
 
@@ -263,7 +537,7 @@ extern "C" fn dequant_tile(ctx: *mut c_void, tile: usize) {
 ///
 /// `dst` must have room for `group` values and `src` for `group / 2` bytes.
 #[inline(always)]
-unsafe fn fill_group(dst: *mut u16, src: *const u8, lut: &[u16; 16], group: usize) {
+unsafe fn fill_group4(dst: *mut u16, src: *const u8, lut: &[u16; 16], group: usize) {
     #[cfg(target_arch = "aarch64")]
     if group % 32 == 0 {
         // SAFETY: forwarded, plus the multiple-of-32 shape this branch checks.
@@ -276,6 +550,24 @@ unsafe fn fill_group(dst: *mut u16, src: *const u8, lut: &[u16; 16], group: usiz
         let nibble = if j % 2 == 0 { byte & 0xF } else { byte >> 4 };
         // SAFETY: forwarded.
         unsafe { *dst.add(j) = lut[nibble as usize] };
+    }
+}
+
+/// Writes one six-bit affine group whose high pairs live in a second plane.
+#[inline(always)]
+unsafe fn fill_group6(
+    dst: *mut u16,
+    src: *const u8,
+    high: *const u32,
+    lut: &[u16; 64],
+    group: usize,
+) {
+    for j in 0..group {
+        let byte = unsafe { *src.add(j / 2) };
+        let low = if j % 2 == 0 { byte & 0xF } else { byte >> 4 };
+        let word = unsafe { *high.add(j / 16) };
+        let q = low | ((((word >> ((j % 16) * 2)) & 0x3) as u8) << 4);
+        unsafe { *dst.add(j) = lut[q as usize] };
     }
 }
 
@@ -466,8 +758,10 @@ mod tests {
         let mut out = vec![SENTINEL; TOKENS * ROWS];
         let op = Operands {
             packed: &packed,
+            high: None,
             scales: &scales,
             biases: &biases,
+            param_dtype: DType::BF16,
             x: &x,
             out: out.as_mut_ptr() as *mut u8,
             out_f16: false,
@@ -504,6 +798,118 @@ mod tests {
         }
     }
 
+    #[test]
+    fn block_unpack_matches_the_format_reference_for_q4_and_q6() {
+        for quant in [QuantKind::Q4K, QuantKind::Q6K] {
+            let mut data: Vec<u8> = (0..quant.block_bytes())
+                .map(|i| (i as u8).wrapping_mul(29).wrapping_add(7))
+                .collect();
+            if quant == QuantKind::Q4K {
+                data[0..2].copy_from_slice(&0x3C00u16.to_le_bytes());
+                data[2..4].copy_from_slice(&0x3800u16.to_le_bytes());
+            } else {
+                data[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+            }
+            let op = BlockOperands {
+                blocks: &data,
+                quant,
+                global: None,
+                x: &[],
+                out: std::ptr::null_mut(),
+                out_f16: false,
+                tokens: 1,
+                rows: 1,
+                cols: 256,
+            };
+            let mut cpu = CpuMatmul::new();
+            cpu.unpack_blocks(&op, 0, 1).expect("dekoder bloków");
+            let want = dequantize_to_f32(DType::U8, quant, &data, 256).expect("wzorzec");
+            for (got, expected) in cpu.weights.iter().zip(want) {
+                assert_eq!(
+                    got.to_bits(),
+                    f16::from_f32(expected).to_bits(),
+                    "niezgodność dekodera {quant:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn q4_k_block_unpack_matches_the_format_reference_for_multiple_rows() {
+        const ROWS: usize = 64;
+        const COLS: usize = 256;
+        let mut data = vec![0u8; ROWS * 144];
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte = (i as u8).wrapping_mul(17).wrapping_add(3);
+        }
+        for (i, block) in data.chunks_exact_mut(144).enumerate() {
+            block[0..2].copy_from_slice(
+                &f16::from_f32(0.01 + (i % 31) as f32 * 0.037).to_le_bytes(),
+            );
+            block[2..4]
+                .copy_from_slice(&f16::from_f32(0.02 + (i % 17) as f32 * 0.023).to_le_bytes());
+        }
+        let op = BlockOperands {
+            blocks: &data,
+            quant: QuantKind::Q4K,
+            global: None,
+            x: &[],
+            out: std::ptr::null_mut(),
+            out_f16: false,
+            tokens: 1,
+            rows: ROWS as u32,
+            cols: COLS as u32,
+        };
+        let mut cpu = CpuMatmul::new();
+        cpu.unpack_blocks(&op, 0, ROWS)
+            .expect("CPU raw Q4_K multiple rows");
+        let want = dequantize_to_f32(DType::U8, QuantKind::Q4K, &data, ROWS * COLS)
+            .expect("wzorzec");
+        for (got, expected) in cpu.weights.iter().zip(want) {
+            assert_eq!(
+                got.to_bits(),
+                f16::from_f32(expected).to_bits(),
+                "niezgodność dekodera Q4_K dla wielu wierszy"
+            );
+        }
+    }
+
+    #[test]
+    fn affine_six_bit_unpack_matches_the_format_reference() {
+        let mut data: Vec<u8> = (0..QuantKind::Q6K.block_bytes())
+            .map(|i| (i as u8).wrapping_mul(23).wrapping_add(5))
+            .collect();
+        data[208..210].copy_from_slice(&0x3C00u16.to_le_bytes());
+        let affine = forge_formats::affine::to_affine_triple(&data, QuantKind::Q6K, 1, 256)
+            .expect("Q6_K affine");
+        let op = Operands {
+            packed: &affine.packed,
+            high: Some(&affine.high),
+            scales: bytemuck::cast_slice(&affine.scales),
+            biases: bytemuck::cast_slice(&affine.biases),
+            param_dtype: affine.param_dtype,
+            x: &[],
+            out: std::ptr::null_mut(),
+            out_f16: false,
+            tokens: 1,
+            rows: 1,
+            cols: 256,
+            group: affine.group as u32,
+            bits: affine.bits,
+        };
+        let mut cpu = CpuMatmul::new();
+        cpu.check(&op, 0, 1).expect("kontrakt Q6_K");
+        cpu.unpack(&op, 0, 1);
+        let want = dequantize_to_f32(DType::U8, QuantKind::Q6K, &data, 256).expect("wzorzec");
+        for (got, expected) in cpu.weights.iter().zip(want) {
+            assert!(
+                (got.to_f32() - expected).abs() < 0.001 * expected.abs().max(1.0),
+                "niezgodność afinicznego dekodera Q6_K: {} != {expected}",
+                got.to_f32()
+            );
+        }
+    }
+
     /// Dwie implementacje tego samego muszą dawać ten sam bit — inaczej wynik
     /// zależałby od tego, na czym się akurat kompiluje.
     #[cfg(target_arch = "aarch64")]
@@ -536,8 +942,10 @@ mod tests {
         let mut cpu = CpuMatmul::new();
         let op = Operands {
             packed: &[0u32; 512],
+            high: None,
             scales: &[0u16; 64],
             biases: &[0u16; 64],
+            param_dtype: DType::BF16,
             x: &[0u16; 64],
             out: std::ptr::null_mut(),
             out_f16: false,
@@ -580,8 +988,10 @@ mod bench {
 
         let op = Operands {
             packed: &packed,
+            high: None,
             scales: &scales,
             biases: &biases,
+            param_dtype: DType::BF16,
             x: &x,
             out: out.as_mut_ptr() as *mut u8,
             out_f16: false,

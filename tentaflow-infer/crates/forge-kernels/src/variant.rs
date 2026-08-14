@@ -219,14 +219,10 @@ mod metal_forms {
     /// GPU. Every shape is allowed to answer `None`; that is the fallback and
     /// it is always correct.
     pub fn split_rows(p: &Problem) -> Option<RowSplit> {
-        // The CPU unpacker knows FOUR bits. A six-bit weight keeps half of each
-        // code in a second array that `Operands` does not even carry, so the CPU
-        // would multiply its share using the low nibbles alone — not a worse
-        // answer, a different model. Q4_K_M puts six bits on attn_v, ffn_down
-        // and the output head, and a prompt of 256 tokens or more takes this
-        // path: measured as fluent nonsense out of an otherwise working
-        // checkpoint.
-        if p.bits != 4 {
+        // The CPU unpacker has complete decoders for both affine code widths.
+        // Other widths stay on the GPU until their high-bit layout is carried
+        // through this contract; using only low nibbles would change the model.
+        if !matches!(p.bits, 4 | 6) {
             return None;
         }
         let work = 2 * u64::from(p.rows) * u64::from(p.cols) * u64::from(p.tokens);
@@ -407,29 +403,24 @@ mod metal_forms {
 
         /// Sześciobitowa waga NIGDY nie idzie w podział.
         ///
-        /// Rozpakowanie po stronie CPU zna cztery bity, a starsze dwa leżą w
-        /// tablicy, której `Operands` nie niesie. Q4_K_M ma w tym kształcie
-        /// `ffn_down`, więc bez tej bramki prompt od 256 tokenów w górę liczy
-        /// część wierszy z samych młodszych bitów i pisze bełkot — przy
-        /// SIEDMIU tokenach ten sam model pisze polszczyzną, bo tam podziału
-        /// nie ma.
+        /// Sześciobitowa waga również może dzielić prefill, bo CPU przenosi
+        /// kompletne high bits razem z niską płaszczyzną.
         #[test]
-        fn a_six_bit_weight_is_never_shared_with_the_cpu() {
+        fn a_six_bit_weight_can_be_shared_with_the_cpu() {
             let six = |tokens, rows, cols| Problem {
                 tokens,
                 rows,
                 cols,
                 bits: 6,
             };
-            assert!(split_rows(&six(256, 11264, 4096)).is_none());
-            assert!(split_rows(&six(1024, 4096, 11264)).is_none());
+            assert!(split_rows(&six(256, 11264, 4096)).is_some());
+            assert!(split_rows(&six(1024, 4096, 11264)).is_some());
             assert_eq!(
                 MATMUL_FORMS.pick(&six(1024, 4096, 11264)).unwrap().form,
-                MatmulForm::MatrixUnits,
-                "sześć bitów ma spaść na formę czysto GPU, nie niżej"
+                MatmulForm::MatrixUnitsSharedWithCpu,
+                "sześć bitów ma użyć kompletnego dekodera CPU"
             );
-            // Ta sama praca na czterech bitach dzieli się dalej — bramka jest o
-            // szerokości kodu, a nie o kształcie.
+            // Bramka dotyczy szerokości kodu, a nie konkretnego modelu.
             assert!(split_rows(&Problem::new(1024, 4096, 11264)).is_some());
         }
 

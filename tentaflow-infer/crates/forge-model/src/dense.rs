@@ -1144,15 +1144,9 @@ mod tests {
                 .map(|r| (*r, format!("{r:?}")))
                 .collect::<HashMap<_, _>>()
         };
-        let attn: Vec<WeightRole> = required_roles()
-            .iter()
-            .copied()
-            .filter(|r| {
-                !matches!(
-                    r,
-                    WeightRole::TokenEmbd | WeightRole::OutputNorm | WeightRole::LmHead
-                )
-            })
+        let attn: Vec<WeightRole> = [WeightRole::AttnNorm, WeightRole::FfnNorm]
+            .into_iter()
+            .chain(ATTN_ROLES.iter().copied())
             .collect();
         let with = |extra: &[WeightRole]| -> Vec<WeightRole> {
             attn.iter().copied().chain(extra.iter().copied()).collect()
@@ -1197,10 +1191,10 @@ mod tests {
             WeightRole::FfnGate,
             WeightRole::FfnUp,
             WeightRole::FfnDown,
-            WeightRole::SsmInProj,
+            WeightRole::FfnGateExps,
         ]))
         .expect_err("cicho pominięta rola");
-        assert!(format!("{err}").contains("SsmInProj"), "{err}");
+        assert!(format!("{err}").contains("FfnGateExps"), "{err}");
     }
 
     #[test]
@@ -1210,10 +1204,10 @@ mod tests {
             WeightRole::AttnK,
             WeightRole::AttnV,
             WeightRole::AttnO,
-            WeightRole::LmHead,
         ] {
-            assert!(required_roles().contains(&role), "{role:?}");
+            assert!(ATTN_ROLES.contains(&role), "{role:?}");
         }
+        assert!(required_roles().contains(&WeightRole::LmHead));
         for role in DENSE_FFN_ROLES.iter().chain(MOE_FFN_ROLES) {
             assert!(
                 !required_roles().contains(role),

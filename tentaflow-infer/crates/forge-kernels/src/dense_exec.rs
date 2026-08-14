@@ -24,11 +24,13 @@ use std::sync::Arc;
 use half::f16;
 
 use forge_formats::affine::{to_affine_triple, AffineTriple};
-use forge_graph::{Act, ExecSpec, Executor, Op, QuantWeight, Tile, WeightId, WeightStore};
+use forge_graph::{
+    Act, ExecSpec, Executor, Op, PackedWeight, QuantWeight, Tile, WeightId, WeightStore,
+};
 use forge_hal::{DevBuffer, Device, Event, KernelHandle, LaunchArgs, LaunchConfig, Pool, Stream};
-use forge_types::{DType, DenseShape, ForgeError, MemKind, Result};
+use forge_types::{DType, DenseShape, ForgeError, MemKind, QuantKind, Result};
 
-use crate::cpu_matmul::{CpuMatmul, Operands};
+use crate::cpu_matmul::{BlockOperands, CpuMatmul, Operands};
 use crate::msl::{self, OutDtype, ScaleDtype};
 use crate::variant::{
     self, AttentionForm, MatmulForm, Problem, RowSplit, ATTENTION_FORMS, MATMUL_FORMS,
@@ -64,9 +66,18 @@ struct Quantized {
     cols: u32,
 }
 
+struct RawQuantized {
+    blocks: DevBuffer,
+    quant: QuantKind,
+    global: Option<f32>,
+    rows: u32,
+    cols: u32,
+}
+
 /// Waga w postaci, w której wykonawca ją trzyma. Model widzi tylko `WeightId`.
 enum Weight {
     Quant(Quantized),
+    Q4K(RawQuantized),
     Plain(DevBuffer),
 }
 
@@ -82,6 +93,16 @@ impl QuantPipes {
     }
 }
 
+struct KQuantPipes {
+    by: [KernelHandle; 2],
+}
+
+impl KQuantPipes {
+    fn get(&self, f16_out: bool) -> &KernelHandle {
+        &self.by[usize::from(f16_out)]
+    }
+}
+
 struct Pipelines {
     /// Jedna rodzina, cztery warianty: dwie szerokości kodu razy dwa typy
     /// wyjścia. Trzymane w tablicy, a nie w czterech polach, bo wybór jest
@@ -89,6 +110,10 @@ struct Pipelines {
     qmv: QuantPipes,
     qmm: QuantPipes,
     qmg: QuantPipes,
+    k_qmv: KQuantPipes,
+    k_qmm: KQuantPipes,
+    k_qmg: KQuantPipes,
+    k_embed: KernelHandle,
     rmsnorm: KernelHandle,
     silu_mul: KernelHandle,
     rope: KernelHandle,
@@ -176,6 +201,25 @@ impl MetalExec {
                 msl::qmg_affine_source,
                 msl::qmg_affine_name,
                 scales_dtype,
+            )?,
+            k_qmv: k_quant_pipes(
+                &mut compile,
+                msl::k_quants::q4_k_qmv_source,
+                msl::k_quants::q4_k_qmv_name,
+            )?,
+            k_qmm: k_quant_pipes(
+                &mut compile,
+                msl::k_quants::q4_k_qmm_source,
+                msl::k_quants::q4_k_qmm_name,
+            )?,
+            k_qmg: k_quant_pipes(
+                &mut compile,
+                msl::k_quants::q4_k_qmg_source,
+                msl::k_quants::q4_k_qmg_name,
+            )?,
+            k_embed: compile(
+                &msl::k_quants::q4_k_embed_source(),
+                msl::k_quants::Q4_K_EMBED_NAME,
             )?,
             rmsnorm: compile(
                 &msl::rmsnorm_source(norm_dtype),
@@ -281,11 +325,14 @@ impl WeightStore for MetalExec {
     /// bloki jest przepisywane TU. Model tego nie robi, bo nie zna kerneli —
     /// a to samo źródło idzie na CUDA bez ani jednego przepisania.
     fn put_quant(&mut self, w: QuantWeight) -> Result<WeightId> {
-        let t = match w {
-            QuantWeight::Affine(t) => t,
-            QuantWeight::Packed(p) => to_affine_triple(&p.planes.codes, p.quant, p.rows, p.cols)?,
-        };
-        self.put_affine(t)
+        match w {
+            QuantWeight::Affine(t) => self.put_affine(t),
+            QuantWeight::Packed(p) if p.quant == forge_types::QuantKind::Q4K => self.put_q4k(p),
+            QuantWeight::Packed(p) => {
+                let t = to_affine_triple(&p.planes.codes, p.quant, p.rows, p.cols)?;
+                self.put_affine(t)
+            }
+        }
     }
 
     fn put_plain(&mut self, bytes: Vec<u8>) -> Result<WeightId> {
@@ -296,6 +343,35 @@ impl WeightStore for MetalExec {
 }
 
 impl MetalExec {
+    fn put_q4k(&mut self, p: PackedWeight) -> Result<WeightId> {
+        if p.planes.scales.is_some() || p.planes.global.is_some() {
+            return Err(ForgeError::Format(
+                "Q4_K: compactny kernel wymaga jednego bufora bloków".into(),
+            ));
+        }
+        if p.dtype != DType::U8 || !p.cols.is_multiple_of(256) {
+            return Err(ForgeError::Unsupported(format!(
+                "Q4_K: oczekiwano bloków U8 o szerokości podzielnej przez 256, jest {:?} [{}x{}]",
+                p.dtype, p.rows, p.cols
+            )));
+        }
+        let want = p.rows * p.cols / 256 * 144;
+        if p.planes.codes.len() != want {
+            return Err(ForgeError::Format(format!(
+                "Q4_K: {} B, oczekiwano {want}",
+                p.planes.codes.len()
+            )));
+        }
+        self.weights.push(Weight::Q4K(RawQuantized {
+            blocks: upload(&*self.device, &p.planes.codes)?,
+            quant: p.quant,
+            global: p.planes.global,
+            rows: p.rows as u32,
+            cols: p.cols as u32,
+        }));
+        Ok(WeightId(self.weights.len() as u32 - 1))
+    }
+
     fn put_affine(&mut self, t: AffineTriple) -> Result<WeightId> {
         // Trzy właściwości sprawdzane TU, przy użyciu, a nie zakładane przy
         // wołaniu. Każda z nich była już raz źródłem poprawnie wyglądającego,
@@ -521,35 +597,57 @@ impl MetalExec {
     fn op_embed(&self, table: WeightId, tokens: &[u32]) -> Result<()> {
         let ids: Vec<u8> = tokens.iter().flat_map(|t| t.to_le_bytes()).collect();
         self.device.write(&ids, &self.scratch.ids, 0)?;
-        let w = self.quant(table)?;
         let n = tokens.len() as u32;
-        self.launch(
-            &self.pipes.embed,
-            LaunchArgs::new()
-                .buf(self.buf(Act::Hidden))
-                .buf(&w.packed)
-                .buf(&w.scales)
-                .buf(&w.biases)
-                .buf(&self.scratch.ids)
-                .scalar(self.shape.hidden)
-                .scalar(w.group)
-                .scalar(n),
-            msl::elementwise_groups(n * self.shape.hidden),
-            msl::ELEMENTWISE_THREADS,
-        )
+        match self.weight(table)? {
+            Weight::Quant(w) => self.launch(
+                &self.pipes.embed,
+                LaunchArgs::new()
+                    .buf(self.buf(Act::Hidden))
+                    .buf(&w.packed)
+                    .buf(&w.scales)
+                    .buf(&w.biases)
+                    .buf(&self.scratch.ids)
+                    .scalar(self.shape.hidden)
+                    .scalar(w.group)
+                    .scalar(n),
+                msl::elementwise_groups(n * self.shape.hidden),
+                msl::ELEMENTWISE_THREADS,
+            ),
+            Weight::Q4K(w) => self.launch(
+                &self.pipes.k_embed,
+                LaunchArgs::new()
+                    .buf(self.buf(Act::Hidden))
+                    .buf(&w.blocks)
+                    .buf(&self.scratch.ids)
+                    .scalar(self.shape.hidden)
+                    .scalar(n),
+                msl::elementwise_groups(n * self.shape.hidden),
+                msl::ELEMENTWISE_THREADS,
+            ),
+            Weight::Plain(_) => Err(ForgeError::Other("embedding wymaga wagi kwantyzowanej".into())),
+        }
     }
 
     /// Głowa wyjściowa dla ostatniego tokenu kafla.
     fn op_logits_of_last(&self, w: WeightId, x: Act, tokens: u32) -> Result<()> {
         let last = (tokens - 1) as usize * self.shape.hidden as usize * 2;
-        let weight = self.quant(w)?;
-        self.gemv(
-            self.pipes.qmv.get(weight.bits, false),
-            self.buf(Act::Logits),
-            weight,
-            self.buf(x),
-            last,
-        )
+        match self.weight(w)? {
+            Weight::Quant(weight) => self.gemv(
+                self.pipes.qmv.get(weight.bits, false),
+                self.buf(Act::Logits),
+                weight,
+                self.buf(x),
+                last,
+            ),
+            Weight::Q4K(weight) => self.k_gemv(
+                self.pipes.k_qmv.get(false),
+                self.buf(Act::Logits),
+                weight,
+                self.buf(x),
+                last,
+            ),
+            Weight::Plain(_) => Err(ForgeError::Other("logity wymagają wagi kwantyzowanej".into())),
+        }
     }
 
     /// `out = norm(x) * waga`.
@@ -585,13 +683,23 @@ impl MetalExec {
 
     /// `out = x * wagaᵀ`. Formę wybiera rejestr, typ zapisu wynika ze slotu.
     fn op_matmul(&self, out: Act, w: WeightId, x: Act, tokens: u32) -> Result<()> {
-        self.matmul(
-            self.buf(out),
-            self.quant(w)?,
-            self.buf(x),
-            tokens,
-            Self::is_half(out),
-        )
+        match self.weight(w)? {
+            Weight::Quant(weight) => self.matmul(
+                self.buf(out),
+                weight,
+                self.buf(x),
+                tokens,
+                Self::is_half(out),
+            ),
+            Weight::Q4K(weight) => self.k_matmul(
+                self.buf(out),
+                weight,
+                self.buf(x),
+                tokens,
+                Self::is_half(out),
+            ),
+            Weight::Plain(_) => Err(ForgeError::Other("mnożenie wymaga wagi kwantyzowanej".into())),
+        }
     }
 
     fn op_rope(&self, a: Act, heads: u32, pos: u32, tokens: u32) -> Result<()> {
@@ -692,11 +800,11 @@ impl MetalExec {
         )
     }
 
-    fn quant(&self, id: WeightId) -> Result<&Quantized> {
+    fn weight(&self, id: WeightId) -> Result<&Weight> {
         match self.weights.get(id.0 as usize) {
-            Some(Weight::Quant(q)) => Ok(q),
+            Some(weight) => Ok(weight),
             _ => Err(ForgeError::Other(format!(
-                "waga {} nie jest kwantyzowana",
+                "brak wagi {}",
                 id.0
             ))),
         }
@@ -726,6 +834,141 @@ impl MetalExec {
             msl::qmv_affine_4bit_groups(w.rows),
             msl::QMV_THREADS,
         )
+    }
+
+    fn k_gemv(
+        &self,
+        kernel: &KernelHandle,
+        out: &DevBuffer,
+        w: &RawQuantized,
+        x: &DevBuffer,
+        x_offset: usize,
+    ) -> Result<()> {
+        self.launch(
+            kernel,
+            LaunchArgs::new()
+                .buf(out)
+                .buf(&w.blocks)
+                .buf_at(x, x_offset)?
+                .scalar(w.rows)
+                .scalar(w.cols),
+            msl::k_quants::q4_k_qmv_groups(w.rows),
+            msl::QMV_THREADS,
+        )
+    }
+
+    fn k_matmul(
+        &self,
+        out: &DevBuffer,
+        w: &RawQuantized,
+        x: &DevBuffer,
+        tokens: u32,
+        f16_out: bool,
+    ) -> Result<()> {
+        if tokens == 1 {
+            return self.k_gemv(self.pipes.k_qmv.get(f16_out), out, w, x, 0);
+        }
+        if tokens >= msl::QMG_BLOCK && msl::qmg_fits(w.rows, w.cols) {
+            let problem = Problem {
+                tokens,
+                rows: w.rows,
+                cols: w.cols,
+                bits: 4,
+            };
+            if self.cpu_share {
+                if let Some(split) = variant::split_rows(&problem) {
+                    return self.k_matmul_shared(out, w, x, tokens, f16_out, split);
+                }
+            }
+            let (gx, gy) = msl::k_quants::q4_k_qmg_groups(w.rows, tokens);
+            return self.launch_k_qmg(out, w, x, tokens, f16_out, w.rows, (gx, gy));
+        }
+        let (gx, gy) = msl::k_quants::q4_k_qmm_groups(w.rows, tokens);
+        self.device.launch(
+            self.pipes.k_qmm.get(f16_out),
+            &LaunchConfig {
+                grid: (gx, gy, 1),
+                block: (msl::QMM_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(out)
+                .buf(&w.blocks)
+                .buf(x)
+                .scalar(w.rows)
+                .scalar(w.cols)
+                .scalar(tokens),
+            &self.stream,
+        )
+    }
+
+    fn launch_k_qmg(
+        &self,
+        out: &DevBuffer,
+        w: &RawQuantized,
+        x: &DevBuffer,
+        tokens: u32,
+        f16_out: bool,
+        rows: u32,
+        grid: (u32, u32),
+    ) -> Result<()> {
+        self.device.launch(
+            self.pipes.k_qmg.get(f16_out),
+            &LaunchConfig {
+                grid: (grid.0, grid.1, 1),
+                block: (msl::QMG_THREADS, 1, 1),
+                shared_mem_bytes: 0,
+            },
+            &LaunchArgs::new()
+                .buf(out)
+                .buf(&w.blocks)
+                .buf(x)
+                .scalar(rows)
+                .scalar(w.cols)
+                .scalar(tokens),
+            &self.stream,
+        )
+    }
+
+    fn k_matmul_shared(
+        &self,
+        out: &DevBuffer,
+        w: &RawQuantized,
+        x: &DevBuffer,
+        tokens: u32,
+        f16_out: bool,
+        split: RowSplit,
+    ) -> Result<()> {
+        let operands = BlockOperands {
+            blocks: host_slice(&w.blocks)?,
+            quant: w.quant,
+            global: w.global,
+            x: host_slice(x)?,
+            out: out
+                .host_ptr()
+                .ok_or_else(|| ForgeError::Other("Metal: wyjście bez adresu hosta".into()))?,
+            out_f16: f16_out,
+            tokens,
+            rows: w.rows,
+            cols: w.cols,
+        };
+        let mut cpu = self.cpu.borrow_mut();
+        cpu.check_blocks(&operands, split.gpu_rows, split.cpu_rows)?;
+        cpu.unpack_blocks(&operands, split.gpu_rows as usize, split.cpu_rows as usize)?;
+
+        // The GPU produces activations in the open command buffer. The CPU
+        // can decode static weight blocks first, but it must wait before BNNS
+        // reads x and writes its disjoint output rows.
+        self.stream.synchronize()?;
+        let (gx, gy) = msl::k_quants::q4_k_qmg_groups(split.gpu_rows, tokens);
+        self.launch_k_qmg(out, w, x, tokens, f16_out, w.rows, (gx, gy))?;
+        self.device.record_event(&self.split_event, &self.stream)?;
+
+        // SAFETY: the GPU grid covers rows below split.gpu_rows and BNNS writes
+        // the remaining rows, so the two writers never overlap.
+        unsafe { cpu.multiply_blocks(&operands, split.gpu_rows, split.cpu_rows)? };
+        drop(cpu);
+        self.split_event.synchronize()
     }
 
     /// Projection for a whole batch.
@@ -791,8 +1034,10 @@ impl MetalExec {
 
         let operands = Operands {
             packed: host_slice(&w.packed)?,
+            high: w.high.as_ref().map(host_slice).transpose()?,
             scales: host_slice(&w.scales)?,
             biases: host_slice(&w.biases)?,
+            param_dtype: self.quant_params,
             x: host_slice(x)?,
             out: out
                 .host_ptr()
@@ -1003,6 +1248,19 @@ fn quant_pipes(
                 one(msl::Bits::Six, OutDtype::F32)?,
                 one(msl::Bits::Six, OutDtype::F16)?,
             ],
+        ],
+    })
+}
+
+fn k_quant_pipes(
+    compile: &mut impl FnMut(&str, &str) -> Result<KernelHandle>,
+    source: fn(OutDtype) -> String,
+    name: fn(OutDtype) -> String,
+) -> Result<KQuantPipes> {
+    Ok(KQuantPipes {
+        by: [
+            compile(&source(OutDtype::F32), &name(OutDtype::F32))?,
+            compile(&source(OutDtype::F16), &name(OutDtype::F16))?,
         ],
     })
 }

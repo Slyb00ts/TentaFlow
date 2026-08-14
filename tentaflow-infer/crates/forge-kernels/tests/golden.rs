@@ -2037,8 +2037,8 @@ fn gqa_decode_odrzuca_zbyt_male_bufory_i_overflow() {
 
     assert!(kernels
         .attn_decode_split_gqa4_f16_hd128(
-            &tiny, &tiny, 0, &tiny, 0, &tiny, 0, &tiny, &tiny, &tiny, &tiny, &tiny, 1, 4, 1, 1, 1,
-            1, 1e-5, 10_000.0, 0.125, &stream,
+            &tiny, &tiny, 0, &tiny, 0, &tiny, 0, None, None, &tiny, &tiny, &tiny, &tiny, &tiny,
+            1, 4, 1, 1, 1, 1, 1e-5, 10_000.0, 0.125, &stream,
         )
         .is_err());
     assert!(kernels
@@ -2182,7 +2182,9 @@ fn gemv_q6_k_batch_out_f32_matches_f16_variant() {
             continue;
         }
         if !kernels
-            .gemv_q6_k_dp4a_batch_out_f32_at(&y32, &wb, 0, &xb, rows, cols, n_tokens, &stream)
+            .gemv_q6_k_dp4a_batch_out_f32_at(
+                &y32, 0, &wb, 0, &xb, 0, rows, cols, n_tokens, &stream,
+            )
             .unwrap()
         {
             eprintln!("pomijam T={n_tokens}: brak kernela f32");
@@ -2950,4 +2952,3 @@ fn attn_decode_gqa6_hd256_matches_reference() {
         }
     }
 }
-

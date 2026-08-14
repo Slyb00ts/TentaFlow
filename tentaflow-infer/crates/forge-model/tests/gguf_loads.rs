@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 
 use forge_hal::metal_device::MetalDevice;
-use forge_kernels::MetalExec;
+use forge_kernels::{HostExec, MetalExec};
 use forge_model::dense::{Dense, Feed};
 
 /// Slot cache'u tych testów. Jedna sekwencja, więc zawsze ten sam.
@@ -21,8 +21,6 @@ const SLOT: usize = 0;
 fn open(device: std::sync::Arc<MetalDevice>, path: &std::path::Path) -> Dense<MetalExec> {
     Dense::load(path, |spec| MetalExec::new(device, spec)).expect("wczytanie modelu")
 }
-
-
 const GGUF: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../../../.runtime/models/bielik-minitron-7b-v3-gguf/minitron-Bielik-7B-v3.0-Instruct-Q4_K_M.gguf"
@@ -74,10 +72,126 @@ fn the_gguf_build_of_the_same_model_loads_and_generates() {
     );
 }
 
+#[test]
+#[ignore]
+fn the_metal_gguf_path_agrees_with_the_host_reference() {
+    let Some(path) = gguf() else {
+        eprintln!("pomijam: brak pliku GGUF");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut metal = open(device, Path::new(&path));
+    let mut host = Dense::load(Path::new(&path), HostExec::new).expect("wczytanie wzorca");
+    let prompt = vec![1, 4234, 8123, 302, 15];
+
+    let metal_first = metal.prefill(SLOT, &prompt).expect("Metal prefill");
+    let host_first = host.prefill(SLOT, &prompt).expect("host prefill");
+    assert_eq!(metal_first, host_first, "GGUF wybrał inny pierwszy token");
+
+    let metal_logits = metal.logits(0).expect("Metal logity");
+    let host_logits = host.logits(0).expect("host logity");
+    let max_abs = metal_logits
+        .iter()
+        .zip(&host_logits)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(max_abs < 0.25, "GGUF Metal odjechał od wzorca o {max_abs}");
+}
+
+#[test]
+#[ignore]
+fn the_gguf_cpu_share_agrees_with_gpu_only() {
+    let Some(path) = gguf() else {
+        eprintln!("pomijam: brak pliku GGUF");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut model = open(device, Path::new(&path));
+    let seed = [1, 4234, 8123, 302, 15];
+    let prompt: Vec<u32> = seed.iter().copied().cycle().take(256).collect();
+
+    model.exec_mut().set_cpu_share(false);
+    model.reset(SLOT).expect("reset GPU-only");
+    let gpu_token = model.prefill(SLOT, &prompt).expect("prefill GPU-only");
+    let gpu_logits = model.logits(0).expect("logity GPU-only");
+
+    model.exec_mut().set_cpu_share(true);
+    model.reset(SLOT).expect("reset CPU-share");
+    let shared_token = model.prefill(SLOT, &prompt).expect("prefill CPU-share");
+    let shared_logits = model.logits(0).expect("logity CPU-share");
+
+    let (worst, sum_sq, norm_sq, span) = gpu_logits.iter().zip(&shared_logits).fold(
+        (0.0f32, 0.0f64, 0.0f64, (f32::MIN, f32::MAX)),
+        |(worst, sum_sq, norm_sq, (max, min)), (&gpu, &shared)| {
+            (
+                worst.max((gpu - shared).abs()),
+                sum_sq + f64::from(gpu - shared).powi(2),
+                norm_sq + f64::from(gpu).powi(2),
+                (max.max(gpu), min.min(gpu)),
+            )
+        },
+    );
+    let span = span.0 - span.1;
+    let rel = (sum_sq / norm_sq).sqrt();
+    eprintln!(
+        "GGUF CPU-share: tokens {gpu_token}/{shared_token}, max {worst:.4}, rel L2 {rel:.2e}, span {span:.1}"
+    );
+    assert_eq!(gpu_token, shared_token, "CPU-share zmienił pierwszy token");
+    assert!(
+        worst < 0.004 * span,
+        "GGUF CPU-share różni się od GPU-only o {:.2}% rozpiętości",
+        100.0 * worst / span
+    );
+}
+
+#[test]
+#[ignore]
+fn the_gguf_cpu_share_speed_is_measured_interleaved() {
+    let Some(path) = gguf() else {
+        eprintln!("pomijam: brak pliku GGUF");
+        return;
+    };
+    let Ok(device) = MetalDevice::new() else {
+        eprintln!("pomijam: brak urządzenia Metal");
+        return;
+    };
+    let mut model = open(device, Path::new(&path));
+    let prompt: Vec<u32> = [1, 4234, 8123, 302, 15].into_iter().cycle().take(1024).collect();
+    let mut samples = [Vec::new(), Vec::new()];
+
+    for round in 0..4 {
+        let order = if round % 2 == 0 { [false, true] } else { [true, false] };
+        for cpu_share in order {
+            model.exec_mut().set_cpu_share(cpu_share);
+            model.reset(SLOT).expect("reset");
+            let start = std::time::Instant::now();
+            model.prefill(SLOT, &prompt).expect("prefill");
+            if round > 0 {
+                samples[usize::from(cpu_share)].push(start.elapsed().as_secs_f64());
+            }
+        }
+    }
+    for values in &mut samples {
+        values.sort_by(f64::total_cmp);
+    }
+    let off = samples[0][samples[0].len() / 2];
+    let on = samples[1][samples[1].len() / 2];
+    eprintln!(
+        "GGUF CPU-share speed: GPU-only {:.1} tok/s, GPU+CPU {:.1} tok/s ({:+.1}%)",
+        1024.0 / off,
+        1024.0 / on,
+        (off / on - 1.0) * 100.0
+    );
+}
+
 /// Ten sam model w dwóch formatach, na tej samej maszynie, w jednym przebiegu.
-///
-/// Przeplatane, bo maszyna dryfuje termicznie — dwa osobne uruchomienia
-/// porównywałyby temperaturę, a nie format.
+/// Kolejność jest stała, żeby oba pomiary miały identyczne warunki procesu.
 #[test]
 #[ignore]
 fn the_two_formats_of_the_same_model_side_by_side() {
@@ -90,7 +204,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
             env!("CARGO_MANIFEST_DIR"),
             "/../../../.runtime/models/models--agentGreg--Bielik-Minitron-7B-v3.0-Instruct-MLX-4bit/snapshots"
         ));
-        let Some(dir) = std::fs::read_dir(&snapshots).ok().and_then(|mut d| d.next()) else {
+        let Some(dir) = std::fs::read_dir(&snapshots)
+            .ok()
+            .and_then(|mut d| d.next())
+        else {
             eprintln!("pomijam: brak checkpointu MLX");
             return;
         };
@@ -141,6 +258,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
 
     let row = |label: &str, path: &Path| {
         let mut m = open(device.clone(), path);
+        let cpu_share = std::env::var("FORGE_CPU_SHARE")
+            .map(|value| value != "0")
+            .unwrap_or(true);
+        m.exec_mut().set_cpu_share(cpu_share);
         // Rozgrzewka, potem mediana z trzech — jak w pozostałych pomiarach.
         let mut prefills = Vec::new();
         let mut first = 0;
@@ -159,7 +280,12 @@ fn the_two_formats_of_the_same_model_side_by_side() {
         let mut tok = first;
         let mut out = vec![first];
         for _ in 0..15 {
-            tok = m.decode(&[Feed { slot: SLOT, token: tok }]).expect("krok")[0];
+            tok = m
+                .decode(&[Feed {
+                    slot: SLOT,
+                    token: tok,
+                }])
+                .expect("krok")[0];
             out.push(tok);
         }
         let decode = t.elapsed().as_secs_f64();
@@ -170,7 +296,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
             prompt.len() as f64 / prefill,
             15.0 / decode
         );
-        eprintln!("        {:?}", tokenizer.decode(&out, true).unwrap_or_default());
+        eprintln!(
+            "        {:?}",
+            tokenizer.decode(&out, true).unwrap_or_default()
+        );
         out
     };
 
@@ -186,7 +315,10 @@ fn the_two_formats_of_the_same_model_side_by_side() {
     // przechodzą każdy test na „tokeny są różne i w słowniku".
     for (label, out) in [("MLX", &mlx), ("GGUF", &gguf_out)] {
         let text = tokenizer.decode(out, true).expect("detokenizacja");
-        let letters = text.chars().filter(|c| c.is_alphabetic() || *c == ' ').count();
+        let letters = text
+            .chars()
+            .filter(|c| c.is_alphabetic() || *c == ' ')
+            .count();
         assert!(
             letters * 10 >= text.chars().count() * 6,
             "{label}: {letters} liter na {} znaków — to nie jest tekst: {text:?}",
