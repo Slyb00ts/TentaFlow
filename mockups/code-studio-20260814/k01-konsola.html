@@ -5,8 +5,8 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>TentaFlow — Code Studio · Konsola sesji (K01)</title>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="shared/styles.css?v=2">
-<link rel="stylesheet" href="shared/code-studio.css?v=2">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/code-studio.css?v=3">
 </head>
 <body>
 
@@ -88,7 +88,7 @@
       </aside>
 
       <main class="main">
-        <div class="cs-shell" id="shell" data-view="konsola" data-dock="agenci" data-stage="plik" data-ask="1">
+        <div class="cs-shell" id="shell" data-view="konsola" data-dock="agenci" data-stage="konsola" data-ask="1">
 
           <!-- ===== DESKTOP: pasek projektów ===== -->
           <div class="cs-projects">
@@ -142,8 +142,47 @@
 
           <div class="cs-body">
 
-            <!-- ===== KONSOLA: stały kręgosłup po lewej, zawsze widoczna ===== -->
-            <div class="cs-chat">
+            <!-- ============================ SCENA ============================ -->
+            <div class="cs-stage">
+
+              <!-- Zakładki sceny: konsola jest przypięta, reszta to otwarte treści -->
+              <!-- Pasek zakładek = spis otwartych rzeczy AKTUALNEJ kategorii doku -->
+              <div class="cs-stage-tabs">
+
+                <!-- Zawsze pod ręką: powrót do rozmowy z agentem głównym -->
+                <button class="cs-tab-home" data-stage-go="konsola">
+                  <svg class="icon"><use href="#i-message"/></svg>Konsola
+                </button>
+
+                <div class="cs-tabgroup" data-tabs="agenci">
+                  <button class="cs-stab active" data-stage="subagent" data-title="code-implementer" data-sub="qwen3.6-27b · profil rw · iteracja 3/25"><span class="cs-dot run"></span>code-implementer</button>
+                  <button class="cs-stab" data-stage="subagent" data-title="code-planner" data-sub="claude-code/opus · profil ro · zakończony"><span class="cs-dot ok"></span>code-planner<svg class="icon x"><use href="#i-x"/></svg></button>
+                </div>
+
+                <div class="cs-tabgroup" data-tabs="pliki">
+                  <button class="cs-stab active" data-stage="plik" data-title="src/api/embeddings.rs"><svg class="icon"><use href="#i-file"/></svg><span class="mono">embeddings.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                  <button class="cs-stab" data-stage="plik" data-title="src/api/router.rs"><svg class="icon"><use href="#i-file"/></svg><span class="mono">router.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                  <button class="cs-stab" data-stage="plik" data-title="tests/openai_compat.rs"><svg class="icon"><use href="#i-file"/></svg><span class="mono">openai_compat.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                </div>
+
+                <div class="cs-tabgroup" data-tabs="zmiany">
+                  <button class="cs-stab active" data-stage="zmiany" data-title="src/api/embeddings.rs" data-sub="1 z 3"><span class="st a" style="color:var(--cs-ok);font-weight:800">A</span><span class="mono">embeddings.rs</span></button>
+                  <button class="cs-stab" data-stage="zmiany" data-title="src/api/router.rs" data-sub="2 z 3"><span class="st m" style="color:var(--cs-ask);font-weight:800">M</span><span class="mono">router.rs</span></button>
+                  <button class="cs-stab" data-stage="zmiany" data-title="tests/openai_compat.rs" data-sub="3 z 3"><span class="st m" style="color:var(--cs-ask);font-weight:800">M</span><span class="mono">openai_compat.rs</span></button>
+                </div>
+
+                <div class="cs-tabgroup" data-tabs="git">
+                  <button class="cs-stab active" data-stage="commit" data-title="feat: szkielet /v1/embeddings" data-sub="9f2a1c4 · przed chwilą"><svg class="icon"><use href="#i-git"/></svg><span class="mono">9f2a1c4</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                  <button class="cs-stab" data-stage="commit" data-title="chore: gałąź sesji #4" data-sub="7b31d20 · 4 min temu"><svg class="icon"><use href="#i-git"/></svg><span class="mono">7b31d20</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                </div>
+
+                <div class="cs-tabgroup" data-tabs="terminal">
+                  <button class="cs-stab active" data-stage="terminal" data-title="cargo test" data-sub="worktree · profil cow"><svg class="icon"><use href="#i-terminal"/></svg><span class="mono">cargo test</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                  <button class="cs-stab" data-stage="terminal" data-title="bash" data-sub="worktree · profil cow"><svg class="icon"><use href="#i-terminal"/></svg><span class="mono">bash</span><svg class="icon x"><use href="#i-x"/></svg></button>
+                </div>
+              </div>
+
+              <div class="cs-spane" data-spane="konsola">
 
               <div class="cs-stage-head">
                 <span class="cs-dot run"></span>
@@ -296,49 +335,8 @@ router.rs:43  <span class="dim">post("/v1/audio/transcriptions", stt_handler)</s
                   </div>
                 </div>
               </div>
-              </div>
+              </div><!-- /spane konsola -->
 
-            <!-- ===== OBSZAR ROBOCZY: kategorie + spis + treść ===== -->
-            <div class="cs-work">
-              <!-- Pasek zakładek = spis otwartych rzeczy AKTUALNEJ kategorii doku -->
-              <div class="cs-stage-tabs">
-
-                <div class="cs-tabgroup" data-tabs="agenci">
-                  <button class="cs-stab active" data-stage="subagent" data-title="code-implementer" data-sub="qwen3.6-27b · profil rw · iteracja 3/25"><span class="cs-dot run"></span>code-implementer</button>
-                  <button class="cs-stab" data-stage="subagent" data-title="code-planner" data-sub="claude-code/opus · profil ro · zakończony"><span class="cs-dot ok"></span>code-planner<svg class="icon x"><use href="#i-x"/></svg></button>
-                </div>
-
-                <div class="cs-tabgroup" data-tabs="pliki">
-                  <button class="cs-stab active" data-stage="plik" data-title="src/api/embeddings.rs"><svg class="icon"><use href="#i-file"/></svg><span class="mono">embeddings.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                  <button class="cs-stab" data-stage="plik" data-title="src/api/router.rs"><svg class="icon"><use href="#i-file"/></svg><span class="mono">router.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                  <button class="cs-stab" data-stage="plik" data-title="tests/openai_compat.rs"><svg class="icon"><use href="#i-file"/></svg><span class="mono">openai_compat.rs</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                </div>
-
-                <div class="cs-tabgroup" data-tabs="zmiany">
-                  <button class="cs-stab active" data-stage="zmiany" data-title="src/api/embeddings.rs" data-sub="1 z 3"><span class="st a" style="color:var(--cs-ok);font-weight:800">A</span><span class="mono">embeddings.rs</span></button>
-                  <button class="cs-stab" data-stage="zmiany" data-title="src/api/router.rs" data-sub="2 z 3"><span class="st m" style="color:var(--cs-ask);font-weight:800">M</span><span class="mono">router.rs</span></button>
-                  <button class="cs-stab" data-stage="zmiany" data-title="tests/openai_compat.rs" data-sub="3 z 3"><span class="st m" style="color:var(--cs-ask);font-weight:800">M</span><span class="mono">openai_compat.rs</span></button>
-                </div>
-
-                <div class="cs-tabgroup" data-tabs="git">
-                  <button class="cs-stab active" data-stage="commit" data-title="feat: szkielet /v1/embeddings" data-sub="9f2a1c4 · przed chwilą"><svg class="icon"><use href="#i-git"/></svg><span class="mono">9f2a1c4</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                  <button class="cs-stab" data-stage="commit" data-title="chore: gałąź sesji #4" data-sub="7b31d20 · 4 min temu"><svg class="icon"><use href="#i-git"/></svg><span class="mono">7b31d20</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                </div>
-
-                <div class="cs-tabgroup" data-tabs="terminal">
-                  <button class="cs-stab active" data-stage="terminal" data-title="cargo test" data-sub="worktree · profil cow"><svg class="icon"><use href="#i-terminal"/></svg><span class="mono">cargo test</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                  <button class="cs-stab" data-stage="terminal" data-title="bash" data-sub="worktree · profil cow"><svg class="icon"><use href="#i-terminal"/></svg><span class="mono">bash</span><svg class="icon x"><use href="#i-x"/></svg></button>
-                </div>
-
-                <!-- Widoczny dopiero, gdy spis schował się do szuflady -->
-                <button class="cs-tab-home" data-nav>
-                  <svg class="icon"><use href="#i-list"/></svg>Spis
-                </button>
-              </div>
-
-              
-
-              <div class="cs-stage">
               <!-- ================= TREŚĆ: PLIK ================= -->
               <div class="cs-spane" data-spane="plik">
                 <div class="cs-pane-head">
@@ -497,7 +495,7 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
                   <span><strong style="font-size:12.5px" data-slot="title">code-implementer</strong>
                     <span class="cs-stage-sub" data-slot="sub">qwen3.6-27b · profil rw · iteracja 3/25</span></span>
                   <span class="spacer"></span>
-                  <button class="btn btn-sm" data-goto="konsola"><svg class="icon"><use href="#i-arrow-left"/></svg>Agent główny</button>
+                  <button class="btn btn-sm" data-stage-go="konsola"><svg class="icon"><use href="#i-arrow-left"/></svg>Agent główny</button>
                 </div>
                 <div class="cs-stream">
                   <div class="cs-turn">Zlecenie od orkiestratora</div>
@@ -527,9 +525,9 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
                 </div>
               </div>
 
-            </div><!-- /cs-stage -->
+            </div>
 
-            <!-- ===================== SPIS (NAWIGATOR) ===================== -->
+            <!-- ============================= DOK ============================= -->
             <div class="cs-dock">
               <div class="cs-dock-tabs">
                 <div class="cs-dock-tab active" data-goto="agenci"><svg class="icon"><use href="#i-bot"/></svg>Subagenci<span class="cnt">4</span></div>
@@ -678,7 +676,6 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
               </div>
             </div>
           </div>
-          </div>
 
           <div class="cs-nav-scrim" data-nav></div>
 
@@ -741,7 +738,7 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
   // Scena = główne okno treści. Dok = nawigator. Na wąskim ekranie widok
   // treściowy pokazuje scenę, a spisowy dok; dolny pasek steruje jednym i drugim.
   var VIEW = {
-    konsola:  { stage: null,       dock: 'agenci'   },   // rozmowa żyje własną kolumną
+    konsola:  { stage: 'konsola',  dock: 'agenci'   },
     agenci:   { stage: 'subagent', dock: 'agenci'   },
     pliki:    { stage: 'plik',     dock: 'pliki'    },
     zmiany:   { stage: 'zmiany',   dock: 'zmiany'   },
@@ -776,8 +773,15 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
   // Dolny pasek (telefon) — ustawia komplet stanu.
   function setView(v) {
     var m = VIEW[v] || VIEW.konsola;
-    shell.dataset.view = v; shell.dataset.dock = m.dock;
-    if (m.stage) shell.dataset.stage = m.stage;
+    shell.dataset.view = v; shell.dataset.stage = m.stage; shell.dataset.dock = m.dock;
+    shell.classList.remove('nav-open');
+    paint();
+  }
+  // Zakładka sceny — zmienia tylko treść w głównym oknie.
+  function setStage(st) {
+    shell.dataset.stage = st;
+    if (st !== 'konsola' && st !== 'subagent') shell.dataset.view = st === 'plik' ? 'pliki' : st;
+    else if (st === 'konsola') shell.dataset.view = 'konsola';
     shell.classList.remove('nav-open');
     paint();
   }
@@ -800,6 +804,9 @@ test result: <span class="pr">ok</span>. 4 passed; 0 failed; finished in 3.41s
   });
   document.querySelectorAll('.cs-stab').forEach(function (el) {
     el.addEventListener('click', function () { activateTab(el); shell.classList.remove('nav-open'); paint(); });
+  });
+  document.querySelectorAll('[data-stage-go]').forEach(function (el) {
+    el.addEventListener('click', function () { setStage(el.dataset.stageGo); });
   });
   document.querySelectorAll('[data-goto]').forEach(function (el) {
     if (el.classList.contains('cs-mtab') || el.classList.contains('cs-dock-tab')) return;
