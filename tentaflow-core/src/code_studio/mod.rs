@@ -20,6 +20,8 @@
 //
 // Plan and rationale: `docs/CODE_STUDIO_PLAN.md`.
 
+pub mod git_broker;
 pub mod models;
 pub mod paths;
+pub mod remote_policy;
 pub mod repository;
