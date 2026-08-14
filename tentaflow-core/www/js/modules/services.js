@@ -722,11 +722,14 @@ async function openCodingAgentConsole(service) {
     <tf-input data-agent-vendor label="ID istniejącej sesji" placeholder="Wymagane dla wznowienia lub fork"></tf-input>
     <div style="display:flex;gap:8px;margin:10px 0"><tf-button variant="primary" data-agent-create>Otwórz sesję</tf-button></div>
     <div data-agent-session-list></div>
+    <div data-agent-approvals style="display:flex;flex-direction:column;gap:8px;margin:10px 0"></div>
     <pre data-agent-output style="min-height:180px;max-height:360px;overflow:auto;white-space:pre-wrap"></pre>
     <tf-input data-agent-prompt label="Polecenie"></tf-input>`;
   const footer = document.createElement('div');
   footer.slot = 'footer';
-  footer.innerHTML = '<tf-button variant="primary" data-agent-turn disabled>Wyślij</tf-button>';
+  footer.innerHTML = `
+    <tf-button variant="ghost" data-agent-close disabled>Zamknij sesję</tf-button>
+    <tf-button variant="primary" data-agent-turn disabled>Wyślij</tf-button>`;
   win.append(body, footer);
   document.body.appendChild(win);
 
@@ -787,6 +790,7 @@ async function openCodingAgentConsole(service) {
       });
       sessionId = result.session.id;
       footer.querySelector('[data-agent-turn]')?.removeAttribute('disabled');
+      footer.querySelector('[data-agent-close]')?.removeAttribute('disabled');
       await refreshSessions();
       pollAgentEvents();
     } catch (error) { toast(error.message || String(error), 'error'); }
@@ -798,6 +802,50 @@ async function openCodingAgentConsole(service) {
     await agentRequest(service, 'session.turn', { session_id: sessionId, prompt });
     input.value = '';
   });
+  footer.querySelector('[data-agent-close]')?.addEventListener('click', async () => {
+    if (!sessionId) return;
+    try {
+      await agentRequest(service, 'session.close', { session_id: sessionId });
+      sessionId = null;
+      footer.querySelector('[data-agent-turn]')?.setAttribute('disabled', '');
+      footer.querySelector('[data-agent-close]')?.setAttribute('disabled', '');
+      await refreshSessions();
+      toast('Sesja CLI zamknięta', 'success');
+    } catch (error) { toast(error.message || String(error), 'error'); }
+  });
+  // Codex runs with `approvalPolicy: on-request`: the turn stops until the
+  // operator answers, so the request has to become a visible decision.
+  const renderApproval = (event) => {
+    const container = body.querySelector('[data-agent-approvals]');
+    const requestId = Number(event.data?.request_id);
+    if (!container || !Number.isFinite(requestId)) return;
+    if (container.querySelector(`[data-approval="${requestId}"]`)) return;
+    const card = document.createElement('div');
+    card.dataset.approval = String(requestId);
+    card.className = 'section-card';
+    card.innerHTML = `
+      <h3>Agent prosi o zgodę — ${escapeHtml(String(event.data?.method || 'nieznana operacja'))}</h3>
+      <pre style="max-height:160px;overflow:auto;white-space:pre-wrap">${escapeHtml(JSON.stringify(event.data?.params ?? {}, null, 2))}</pre>
+      <div style="display:flex;gap:8px;flex-wrap:wrap">
+        <tf-button variant="primary" data-decision="approved">Zezwól raz</tf-button>
+        <tf-button variant="ghost" data-decision="approved_for_session">Zezwól na sesję</tf-button>
+        <tf-button variant="ghost" data-decision="denied">Odmów</tf-button>
+        <tf-button variant="danger" data-decision="abort">Przerwij turę</tf-button>
+      </div>`;
+    card.querySelectorAll('[data-decision]').forEach((button) => {
+      button.addEventListener('click', async () => {
+        try {
+          await agentRequest(service, 'session.approval', {
+            session_id: sessionId,
+            request_id: requestId,
+            decision: button.dataset.decision,
+          });
+          card.remove();
+        } catch (error) { toast(error.message || String(error), 'error'); }
+      });
+    });
+    container.appendChild(card);
+  };
   const pollAgentEvents = async () => {
     while (!closed && sessionId) {
       try {
@@ -805,6 +853,10 @@ async function openCodingAgentConsole(service) {
         const output = body.querySelector('[data-agent-output]');
         for (const event of result.events || []) {
           afterSeq = Math.max(afterSeq, Number(event.seq || 0));
+          if (event.kind === 'approval_request') {
+            renderApproval(event);
+            continue;
+          }
           const text = event.data?.text || event.data?.delta || JSON.stringify(event.data);
           if (output) output.textContent += `${text}\n`;
         }

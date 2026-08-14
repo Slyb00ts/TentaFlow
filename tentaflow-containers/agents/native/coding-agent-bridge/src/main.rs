@@ -13,7 +13,7 @@ use anyhow::{anyhow, Context, Result};
 use axum::{
     extract::{Path as AxumPath, Query, State},
     http::StatusCode,
-    routing::{get, post},
+    routing::{delete, get, post},
     Json, Router,
 };
 use parking_lot::Mutex as SyncMutex;
@@ -67,7 +67,46 @@ struct AppState {
     provider: Provider,
     workspace_root: PathBuf,
     state_file: PathBuf,
+    probe_file: PathBuf,
+    probe: Arc<Mutex<ProbeCache>>,
+    /// Serializes every probe. Held across the whole CLI interaction, so
+    /// concurrent callers queue up and the second one finds the cache filled
+    /// instead of starting a second session.
+    probe_lock: Arc<Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+}
+
+/// Asking Claude Code what models or limits it has means driving an interactive
+/// session — there is no non-interactive listing. Two things keep that from
+/// piling up in the user's session history: answers are cached, and every probe
+/// reuses ONE session id instead of minting a fresh UUID.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+struct ProbeCache {
+    #[serde(default)]
+    probe_session_id: Option<String>,
+    #[serde(default)]
+    models: Vec<Value>,
+    #[serde(default)]
+    models_fetched_at_ms: u128,
+    /// Rate limits move, so they are never persisted and expire in a minute.
+    #[serde(default, skip)]
+    usage: Option<Value>,
+    #[serde(default, skip)]
+    usage_fetched_at_ms: u128,
+}
+
+/// A CLI gains models when the vendor ships a release, not during the day.
+const MODELS_TTL_MS: u128 = 24 * 60 * 60 * 1000;
+const USAGE_TTL_MS: u128 = 60 * 1000;
+
+impl ProbeCache {
+    fn models_are_fresh(&self, now_ms: u128) -> bool {
+        !self.models.is_empty() && now_ms.saturating_sub(self.models_fetched_at_ms) < MODELS_TTL_MS
+    }
+
+    fn usage_is_fresh(&self, now_ms: u128) -> bool {
+        self.usage.is_some() && now_ms.saturating_sub(self.usage_fetched_at_ms) < USAGE_TTL_MS
+    }
 }
 
 struct CodexRuntime {
@@ -82,7 +121,17 @@ struct TerminalRuntime {
     writer: Arc<SyncMutex<Box<dyn Write + Send>>>,
     ready: Arc<AtomicBool>,
     _master: Box<dyn MasterPty + Send>,
-    _child: Box<dyn portable_pty::Child + Send + Sync>,
+    child: Box<dyn portable_pty::Child + Send + Sync>,
+}
+
+impl Drop for TerminalRuntime {
+    fn drop(&mut self) {
+        // Dropping the PTY master does not terminate the CLI: it keeps running
+        // against a closed terminal. Without this every probe and every closed
+        // session would leave a live `claude`/`codex` process behind.
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
 }
 
 #[derive(Deserialize)]
@@ -112,6 +161,18 @@ struct EventQuery {
     after_seq: u64,
 }
 
+#[derive(Deserialize)]
+struct RefreshQuery {
+    #[serde(default)]
+    refresh: bool,
+}
+
+#[derive(Deserialize)]
+struct ApprovalRequest {
+    request_id: u64,
+    decision: String,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let provider = match env::var("TENTAFLOW_ENGINE_ID").as_deref() {
@@ -132,13 +193,18 @@ async fn main() -> Result<()> {
     }
     require_binary(provider)?;
     let state_file = data_dir.join("sessions.json");
+    let probe_file = data_dir.join("probe-cache.json");
     let sessions = load_sessions(&state_file)?;
+    let probe = load_probe_cache(&probe_file);
     let workspace_root =
         std::fs::canonicalize(env::var("TENTAFLOW_WORKSPACE_ROOT").unwrap_or_else(|_| ".".into()))?;
     let state = AppState {
         provider,
         workspace_root,
         state_file,
+        probe_file,
+        probe: Arc::new(Mutex::new(probe)),
+        probe_lock: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(sessions)),
     };
     let app = Router::new()
@@ -148,8 +214,10 @@ async fn main() -> Result<()> {
         .route("/models", get(list_models))
         .route("/usage", get(usage))
         .route("/sessions", get(list_sessions).post(create_session))
+        .route("/sessions/{id}", delete(close_session))
         .route("/sessions/{id}/turn", post(start_turn))
         .route("/sessions/{id}/input", post(send_input))
+        .route("/sessions/{id}/approval", post(send_approval))
         .route("/sessions/{id}/events", get(list_events))
         .with_state(state);
     let port: u16 = env::var("PORT").unwrap_or_else(|_| "8765".into()).parse()?;
@@ -194,6 +262,21 @@ fn load_sessions(path: &Path) -> Result<HashMap<String, Session>> {
             )
         })
         .collect())
+}
+
+fn load_probe_cache(path: &Path) -> ProbeCache {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => ProbeCache::default(),
+    }
+}
+
+async fn persist_probe_cache(state: &AppState) -> Result<()> {
+    let cache = state.probe.lock().await.clone();
+    let tmp = state.probe_file.with_extension("tmp");
+    tokio::fs::write(&tmp, serde_json::to_vec(&cache)?).await?;
+    tokio::fs::rename(tmp, &state.probe_file).await?;
+    Ok(())
 }
 
 async fn persist(state: &AppState) -> Result<()> {
@@ -300,9 +383,23 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     )
 }
 
-async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn list_models(
+    State(state): State<AppState>,
+    Query(query): Query<RefreshQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !query.refresh && state.probe.lock().await.models_are_fresh(now_ms()) {
+        let cache = state.probe.lock().await;
+        return Ok(Json(json!({"models": cache.models, "cached": true})));
+    }
     require_authenticated(state.provider).await?;
-    match state.provider {
+    let _probe = state.probe_lock.lock().await;
+    // Whoever waited on the lock may have been waiting for the probe that just
+    // filled the cache; asking the CLI again would only add a session.
+    if !query.refresh && state.probe.lock().await.models_are_fresh(now_ms()) {
+        let cache = state.probe.lock().await;
+        return Ok(Json(json!({"models": cache.models, "cached": true})));
+    }
+    let models = match state.provider {
         Provider::Codex => {
             let events = Arc::new(SyncMutex::new(Vec::new()));
             let runtime =
@@ -310,51 +407,56 @@ async fn list_models(State(state): State<AppState>) -> Result<Json<Value>, ApiEr
             let response = runtime
                 .request("model/list", json!({"includeHidden": false}))
                 .await?;
-            Ok(Json(response.get("result").cloned().unwrap_or(response)))
+            let result = response.get("result").unwrap_or(&response);
+            result
+                .get("models")
+                .or_else(|| result.get("data"))
+                .and_then(Value::as_array)
+                .cloned()
+                .ok_or_else(|| ApiError::internal("codex model/list did not return an array"))?
         }
         Provider::ClaudeCode => {
-            let events = Arc::new(SyncMutex::new(Vec::new()));
-            let mut runtime = spawn_terminal(
-                state.provider,
-                None,
-                false,
-                &state.workspace_root.to_string_lossy(),
-                events.clone(),
-                false,
-                Some(&uuid::Uuid::new_v4().to_string()),
-                None,
-            )?;
-            runtime.wait_ready().await?;
-            events.lock().clear();
-            runtime.writer.lock().write_all(b"/model\r")?;
-            runtime.writer.lock().flush()?;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            loop {
-                let raw = events
-                    .lock()
-                    .iter()
-                    .filter_map(|event| event.data.get("text").and_then(Value::as_str))
-                    .collect::<String>();
-                let models = parse_claude_models(raw.as_bytes());
-                if !models.is_empty() {
-                    runtime.writer.lock().write_all(b"\x1b")?;
-                    runtime.writer.lock().flush()?;
-                    return Ok(Json(json!({"models": models})));
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ApiError::internal(
-                        "Claude Code /model menu did not produce a model list",
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+            claude_probe(&state, "/model\r", 10, |raw| {
+                let models = parse_claude_models(raw);
+                (!models.is_empty()).then_some(models)
+            })
+            .await?
         }
+    };
+    {
+        let mut cache = state.probe.lock().await;
+        cache.models = models.clone();
+        cache.models_fetched_at_ms = now_ms();
     }
+    if let Err(error) = persist_probe_cache(&state).await {
+        eprintln!("coding-agent-bridge: probe cache write failed: {error}");
+    }
+    Ok(Json(json!({"models": models, "cached": false})))
 }
 
-async fn usage(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+async fn usage(
+    State(state): State<AppState>,
+    Query(query): Query<RefreshQuery>,
+) -> Result<Json<Value>, ApiError> {
+    if !query.refresh {
+        let cache = state.probe.lock().await;
+        if cache.usage_is_fresh(now_ms()) {
+            return Ok(Json(
+                cache.usage.clone().expect("freshness implies a value"),
+            ));
+        }
+    }
     require_authenticated(state.provider).await?;
-    match state.provider {
+    let _probe = state.probe_lock.lock().await;
+    if !query.refresh {
+        let cache = state.probe.lock().await;
+        if cache.usage_is_fresh(now_ms()) {
+            return Ok(Json(
+                cache.usage.clone().expect("freshness implies a value"),
+            ));
+        }
+    }
+    let usage = match state.provider {
         Provider::Codex => {
             let events = Arc::new(SyncMutex::new(Vec::new()));
             let runtime =
@@ -365,44 +467,93 @@ async fn usage(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
             let result = response
                 .get("result")
                 .ok_or_else(|| ApiError::internal("Codex usage response has no result"))?;
-            Ok(Json(normalize_codex_usage(result)))
+            normalize_codex_usage(result)
         }
-        Provider::ClaudeCode => {
-            let events = Arc::new(SyncMutex::new(Vec::new()));
-            let mut runtime = spawn_terminal(
-                state.provider,
-                None,
-                false,
-                &state.workspace_root.to_string_lossy(),
-                events.clone(),
-                false,
-                Some(&uuid::Uuid::new_v4().to_string()),
-                None,
-            )?;
-            runtime.wait_ready().await?;
-            events.lock().clear();
-            runtime.writer.lock().write_all(b"/usage\r")?;
-            runtime.writer.lock().flush()?;
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-            loop {
-                let raw = events
-                    .lock()
-                    .iter()
-                    .filter_map(|event| event.data.get("text").and_then(Value::as_str))
-                    .collect::<String>();
-                if let Some(result) = parse_claude_usage(raw.as_bytes()) {
-                    runtime.writer.lock().write_all(b"\x1b")?;
-                    runtime.writer.lock().flush()?;
-                    return Ok(Json(result));
-                }
-                if tokio::time::Instant::now() >= deadline {
-                    return Err(ApiError::internal(
-                        "Claude Code /usage did not produce session and weekly limits",
-                    ));
-                }
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-            }
+        Provider::ClaudeCode => claude_probe(&state, "/usage\r", 15, parse_claude_usage).await?,
+    };
+    {
+        let mut cache = state.probe.lock().await;
+        cache.usage = Some(usage.clone());
+        cache.usage_fetched_at_ms = now_ms();
+    }
+    Ok(Json(usage))
+}
+
+/// Drives a Claude Code slash command in the **reused probe session**, so
+/// repeated discovery does not add an entry to the vendor's session history for
+/// every call. A probe id the CLI no longer knows falls back to a fresh session
+/// and is remembered for next time.
+async fn claude_probe<T>(
+    state: &AppState,
+    slash_command: &str,
+    timeout_secs: u64,
+    parse: impl Fn(&[u8]) -> Option<T> + Copy,
+) -> Result<T, ApiError> {
+    let previous = state.probe.lock().await.probe_session_id.clone();
+    if let Some(id) = previous {
+        match claude_slash_command(state, Some(&id), None, slash_command, timeout_secs, parse).await
+        {
+            Ok(value) => return Ok(value),
+            Err(ApiError(_, error)) => eprintln!(
+                "coding-agent-bridge: probe session {id} unusable ({error}), starting a new one"
+            ),
         }
+    }
+    let fresh = uuid::Uuid::new_v4().to_string();
+    let value = claude_slash_command(
+        state,
+        None,
+        Some(&fresh),
+        slash_command,
+        timeout_secs,
+        parse,
+    )
+    .await?;
+    state.probe.lock().await.probe_session_id = Some(fresh);
+    Ok(value)
+}
+
+async fn claude_slash_command<T>(
+    state: &AppState,
+    resume: Option<&str>,
+    new_session_id: Option<&str>,
+    slash_command: &str,
+    timeout_secs: u64,
+    parse: impl Fn(&[u8]) -> Option<T>,
+) -> Result<T, ApiError> {
+    let events = Arc::new(SyncMutex::new(Vec::new()));
+    let mut runtime = spawn_terminal(
+        state.provider,
+        resume,
+        false,
+        &state.workspace_root.to_string_lossy(),
+        events.clone(),
+        false,
+        new_session_id,
+        None,
+    )?;
+    runtime.wait_ready().await?;
+    events.lock().clear();
+    runtime.writer.lock().write_all(slash_command.as_bytes())?;
+    runtime.writer.lock().flush()?;
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    loop {
+        let raw = events
+            .lock()
+            .iter()
+            .filter_map(|event| event.data.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        if let Some(value) = parse(raw.as_bytes()) {
+            runtime.shutdown().await;
+            return Ok(value);
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err(ApiError::internal(&format!(
+                "Claude Code {} produced no usable answer",
+                slash_command.trim_end()
+            )));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
 }
 
@@ -692,6 +843,56 @@ async fn send_input(
     Ok(Json(json!({"accepted": true})))
 }
 
+/// Answers a server→client approval request. Codex threads are started with
+/// `approvalPolicy: "on-request"`, so without this path every turn that wants
+/// to touch the filesystem or run a command waits until it times out.
+async fn send_approval(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+    Json(req): Json<ApprovalRequest>,
+) -> Result<Json<Value>, ApiError> {
+    const DECISIONS: [&str; 4] = ["approved", "approved_for_session", "denied", "abort"];
+    if !DECISIONS.contains(&req.decision.as_str()) {
+        return Err(ApiError::bad_request("unsupported approval decision"));
+    }
+    let mut sessions = state.sessions.lock().await;
+    let session = sessions
+        .get_mut(&id)
+        .ok_or_else(|| ApiError::not_found("session not found"))?;
+    match session.runtime.as_mut() {
+        Some(Runtime::Codex(runtime)) => {
+            runtime
+                .write(json!({"id": req.request_id, "result": {"decision": req.decision}}))
+                .await?;
+        }
+        _ => return Err(ApiError::bad_request("session does not use approvals")),
+    }
+    Ok(Json(json!({"accepted": true})))
+}
+
+/// Terminates the session's CLI process and forgets it. Without an explicit
+/// close, a login window or a finished session keeps its child alive for the
+/// lifetime of the bridge.
+async fn close_session(
+    State(state): State<AppState>,
+    AxumPath(id): AxumPath<String>,
+) -> Result<Json<Value>, ApiError> {
+    let session = {
+        let mut sessions = state.sessions.lock().await;
+        sessions.remove(&id)
+    };
+    let existed = session.is_some();
+    if let Some(mut session) = session {
+        if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
+            runtime.shutdown().await;
+        }
+    }
+    if existed {
+        persist(&state).await?;
+    }
+    Ok(Json(json!({"closed": existed})))
+}
+
 async fn list_events(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -720,6 +921,9 @@ impl CodexRuntime {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
+            // A dropped runtime (finished probe, closed session) must take the
+            // app-server with it; tokio kills and reaps it in the background.
+            .kill_on_drop(true)
             .spawn()?;
         let stdin = Arc::new(Mutex::new(
             child.stdin.take().context("codex stdin missing")?,
@@ -743,6 +947,20 @@ impl CodexRuntime {
                         }
                         continue;
                     }
+                    // Server→client request. It BLOCKS the vendor turn until we
+                    // answer, so it gets its own event kind carrying the id the
+                    // operator has to answer on — as a plain `codex` event the
+                    // turn would wait forever.
+                    push_event(
+                        &reader_events,
+                        "approval_request",
+                        json!({
+                            "request_id": id,
+                            "method": value.get("method").cloned().unwrap_or(Value::Null),
+                            "params": value.get("params").cloned().unwrap_or(Value::Null),
+                        }),
+                    );
+                    continue;
                 }
                 push_event(&reader_events, "codex", value);
             }
@@ -894,7 +1112,7 @@ fn spawn_terminal(
         writer,
         ready,
         _master: pty.master,
-        _child: child,
+        child,
     })
 }
 
@@ -975,6 +1193,26 @@ fn parse_claude_models(raw: &[u8]) -> Vec<Value> {
 }
 
 impl TerminalRuntime {
+    /// Asks the CLI to quit on its own and waits for it. A straight SIGKILL
+    /// (what `Drop` does) takes the process down before it writes its session
+    /// file — and an unwritten session cannot be resumed, which is exactly what
+    /// the reused probe session and every user session depend on.
+    async fn shutdown(&mut self) {
+        {
+            let mut writer = self.writer.lock();
+            let _ = writer.write_all(b"\x1b");
+            let _ = writer.write_all(b"/exit\r");
+            let _ = writer.flush();
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while tokio::time::Instant::now() < deadline {
+            if matches!(self.child.try_wait(), Ok(Some(_))) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+    }
+
     async fn wait_ready(&mut self) -> Result<()> {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(30);
         while !self.ready.load(Ordering::Acquire) {
@@ -1065,5 +1303,93 @@ impl From<std::io::Error> for ApiError {
 impl axum::response::IntoResponse for ApiError {
     fn into_response(self) -> axum::response::Response {
         (self.0, Json(json!({"error":self.1}))).into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_fresh_model_cache_keeps_the_cli_untouched() {
+        let now = 10 * MODELS_TTL_MS;
+        let cache = ProbeCache {
+            probe_session_id: Some("probe".into()),
+            models: vec![json!({"id":"opus"})],
+            models_fetched_at_ms: now - 1,
+            ..ProbeCache::default()
+        };
+        assert!(cache.models_are_fresh(now));
+
+        let stale = ProbeCache {
+            models_fetched_at_ms: now - MODELS_TTL_MS,
+            ..cache.clone()
+        };
+        assert!(!stale.models_are_fresh(now), "TTL boundary must expire");
+
+        let empty = ProbeCache {
+            models: Vec::new(),
+            ..cache
+        };
+        assert!(
+            !empty.models_are_fresh(now),
+            "an empty list is not an answer, it must be re-probed"
+        );
+    }
+
+    #[test]
+    fn usage_expires_far_sooner_than_models() {
+        let now = 10 * MODELS_TTL_MS;
+        let cache = ProbeCache {
+            usage: Some(json!({"current_session": {}})),
+            usage_fetched_at_ms: now - USAGE_TTL_MS + 1,
+            ..ProbeCache::default()
+        };
+        assert!(cache.usage_is_fresh(now));
+        assert!(
+            !ProbeCache {
+                usage_fetched_at_ms: now - USAGE_TTL_MS,
+                ..cache
+            }
+            .usage_is_fresh(now),
+            "rate limits move, they must not be served stale"
+        );
+    }
+
+    #[test]
+    fn the_persisted_cache_keeps_the_probe_session_but_not_the_limits() {
+        // Rate limits are per-moment; only the model list and the reusable probe
+        // session id are worth carrying across a restart.
+        let cache = ProbeCache {
+            probe_session_id: Some("probe-1".into()),
+            models: vec![json!({"id":"opus"})],
+            models_fetched_at_ms: 5,
+            usage: Some(json!({"x":1})),
+            usage_fetched_at_ms: 5,
+        };
+        let restored: ProbeCache =
+            serde_json::from_slice(&serde_json::to_vec(&cache).unwrap()).unwrap();
+        assert_eq!(restored.probe_session_id.as_deref(), Some("probe-1"));
+        assert_eq!(restored.models.len(), 1);
+        assert!(restored.usage.is_none());
+    }
+
+    #[test]
+    fn a_cache_written_by_an_older_build_still_loads() {
+        let cache: ProbeCache = serde_json::from_str(r#"{"models":[{"id":"o3"}]}"#).unwrap();
+        assert_eq!(cache.models.len(), 1);
+        assert_eq!(cache.probe_session_id, None);
+        assert!(!cache.models_are_fresh(MODELS_TTL_MS));
+    }
+
+    #[test]
+    fn claude_model_menu_is_parsed_from_the_rendered_screen() {
+        let screen = "  1. Opus 4.6  Most capable\n\u{276f} 2. Sonnet 4.6 \u{2714}  Balanced\n";
+        let models = parse_claude_models(screen.as_bytes());
+        assert_eq!(models.len(), 2);
+        assert_eq!(models[0]["id"], "opus");
+        assert_eq!(models[1]["id"], "sonnet");
+        assert_eq!(models[1]["selected"], true);
+        assert_eq!(models[1]["selector_index"], 2);
     }
 }

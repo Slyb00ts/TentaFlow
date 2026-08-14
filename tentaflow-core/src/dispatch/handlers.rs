@@ -10822,17 +10822,21 @@ pub async fn service_agent(
         &ctx.session,
         SessionAuth::UserSession { role: Some(role), .. } if role == "admin"
     );
-    let auth_terminal_input = payload.operation == "session.input"
-        && serde_json::from_str::<serde_json::Value>(&payload.payload_json)
-            .ok()
-            .and_then(|value| {
-                value
-                    .get("session_id")
-                    .and_then(|id| id.as_str())
-                    .map(|id| id.starts_with("auth-"))
-            })
-            .unwrap_or(false);
-    if (payload.operation == "auth.start" || auth_terminal_input) && !is_admin {
+    // Driving or tearing down a login flow is an admin act: those sessions carry
+    // the operator's device code and vendor credentials.
+    let touches_auth_flow = matches!(
+        payload.operation.as_str(),
+        "session.input" | "session.close"
+    ) && serde_json::from_str::<serde_json::Value>(&payload.payload_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(|id| id.as_str())
+                .map(|id| id.starts_with("auth-"))
+        })
+        .unwrap_or(false);
+    if (payload.operation == "auth.start" || touches_auth_flow) && !is_admin {
         return response(
             String::new(),
             Some("administrator_required_for_login".to_string()),

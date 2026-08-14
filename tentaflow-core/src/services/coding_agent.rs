@@ -83,60 +83,7 @@ pub async fn execute(
         return Err("coding-agent bridge endpoint must be loopback-only".to_string());
     }
 
-    let payload: Value = if payload_json.trim().is_empty() {
-        Value::Object(Default::default())
-    } else {
-        serde_json::from_str(payload_json).map_err(|e| format!("invalid payload JSON: {e}"))?
-    };
-    let session_id = || {
-        payload
-            .get("session_id")
-            .and_then(Value::as_str)
-            .filter(|id| {
-                !id.is_empty()
-                    && id.len() <= 128
-                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
-            })
-            .ok_or_else(|| "payload requires a valid session_id".to_string())
-    };
-    let (method, path, body) = match operation {
-        "auth.status" => (reqwest::Method::GET, "/auth/status".to_string(), None),
-        "auth.start" => (
-            reqwest::Method::POST,
-            "/auth/start".to_string(),
-            Some(payload),
-        ),
-        "models.list" => (reqwest::Method::GET, "/models".to_string(), None),
-        "usage.read" => (reqwest::Method::GET, "/usage".to_string(), None),
-        "sessions.list" => (reqwest::Method::GET, "/sessions".to_string(), None),
-        "session.create" => (
-            reqwest::Method::POST,
-            "/sessions".to_string(),
-            Some(payload),
-        ),
-        "session.turn" => (
-            reqwest::Method::POST,
-            format!("/sessions/{}/turn", session_id()?),
-            Some(payload),
-        ),
-        "session.input" => (
-            reqwest::Method::POST,
-            format!("/sessions/{}/input", session_id()?),
-            Some(payload),
-        ),
-        "session.events" => {
-            let after = payload
-                .get("after_seq")
-                .and_then(Value::as_u64)
-                .unwrap_or(0);
-            (
-                reqwest::Method::GET,
-                format!("/sessions/{}/events?after_seq={after}", session_id()?),
-                None,
-            )
-        }
-        _ => return Err(format!("unsupported coding-agent operation: {operation}")),
-    };
+    let (method, path, body) = route(operation, payload_json)?;
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(65))
         .build()
@@ -160,6 +107,93 @@ pub async fn execute(
     serde_json::from_str::<Value>(&text)
         .map_err(|e| format!("bridge returned invalid JSON: {e}"))?;
     Ok(text)
+}
+
+/// Maps a protocol operation onto the bridge's HTTP surface. Pure, so the
+/// mapping is testable without a running bridge.
+fn route(
+    operation: &str,
+    payload_json: &str,
+) -> Result<(reqwest::Method, String, Option<Value>), String> {
+    let payload: Value = if payload_json.trim().is_empty() {
+        Value::Object(Default::default())
+    } else {
+        serde_json::from_str(payload_json).map_err(|e| format!("invalid payload JSON: {e}"))?
+    };
+    // The bridge answers both of these from a cache; `refresh` is the only way
+    // to make it drive the CLI again, so it stays a deliberate, user-triggered
+    // act rather than a side effect of opening a window.
+    let refreshed = |path: &str| {
+        if payload
+            .get("refresh")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            format!("{path}?refresh=1")
+        } else {
+            path.to_string()
+        }
+    };
+    let session_id = || {
+        payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .filter(|id| {
+                !id.is_empty()
+                    && id.len() <= 128
+                    && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
+            })
+            .ok_or_else(|| "payload requires a valid session_id".to_string())
+    };
+    let routed = match operation {
+        "auth.status" => (reqwest::Method::GET, "/auth/status".to_string(), None),
+        "auth.start" => (
+            reqwest::Method::POST,
+            "/auth/start".to_string(),
+            Some(payload),
+        ),
+        "models.list" => (reqwest::Method::GET, refreshed("/models"), None),
+        "usage.read" => (reqwest::Method::GET, refreshed("/usage"), None),
+        "sessions.list" => (reqwest::Method::GET, "/sessions".to_string(), None),
+        "session.create" => (
+            reqwest::Method::POST,
+            "/sessions".to_string(),
+            Some(payload),
+        ),
+        "session.turn" => (
+            reqwest::Method::POST,
+            format!("/sessions/{}/turn", session_id()?),
+            Some(payload),
+        ),
+        "session.input" => (
+            reqwest::Method::POST,
+            format!("/sessions/{}/input", session_id()?),
+            Some(payload),
+        ),
+        "session.approval" => (
+            reqwest::Method::POST,
+            format!("/sessions/{}/approval", session_id()?),
+            Some(payload),
+        ),
+        "session.close" => (
+            reqwest::Method::DELETE,
+            format!("/sessions/{}", session_id()?),
+            None,
+        ),
+        "session.events" => {
+            let after = payload
+                .get("after_seq")
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            (
+                reqwest::Method::GET,
+                format!("/sessions/{}/events?after_seq={after}", session_id()?),
+                None,
+            )
+        }
+        _ => return Err(format!("unsupported coding-agent operation: {operation}")),
+    };
+    Ok(routed)
 }
 
 pub async fn execute_chat(
@@ -308,6 +342,73 @@ fn terminal_text(raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn path_of(operation: &str, payload: &str) -> String {
+        route(operation, payload).unwrap().1
+    }
+
+    #[test]
+    fn discovery_hits_the_bridge_cache_unless_refresh_is_requested() {
+        // Driving the CLI is what creates vendor sessions, so the expensive
+        // path must never be the default one.
+        assert_eq!(path_of("models.list", "{}"), "/models");
+        assert_eq!(path_of("usage.read", "{}"), "/usage");
+        assert_eq!(
+            path_of("models.list", r#"{"refresh":false}"#),
+            "/models",
+            "an explicit false must not force a probe"
+        );
+        assert_eq!(
+            path_of("models.list", r#"{"refresh":true}"#),
+            "/models?refresh=1"
+        );
+        assert_eq!(
+            path_of("usage.read", r#"{"refresh":true}"#),
+            "/usage?refresh=1"
+        );
+    }
+
+    #[test]
+    fn approval_and_close_are_routed_and_scoped_to_a_session() {
+        let payload = r#"{"session_id":"auth-2f1c","request_id":7,"decision":"approved"}"#;
+        let (method, path, body) = route("session.approval", payload).unwrap();
+        assert_eq!(method, reqwest::Method::POST);
+        assert_eq!(path, "/sessions/auth-2f1c/approval");
+        assert_eq!(
+            body.expect("approval carries the decision")["decision"],
+            "approved"
+        );
+
+        let (method, path, body) = route("session.close", r#"{"session_id":"abc-123"}"#).unwrap();
+        assert_eq!(method, reqwest::Method::DELETE);
+        assert_eq!(path, "/sessions/abc-123");
+        assert!(body.is_none());
+    }
+
+    #[test]
+    fn session_scoped_operations_reject_a_forged_id() {
+        // The id lands in a URL path; anything outside [A-Za-z0-9-] could reach
+        // another endpoint of the bridge.
+        for payload in [
+            r#"{"session_id":"../auth/start"}"#,
+            r#"{"session_id":""}"#,
+            r#"{}"#,
+        ] {
+            assert!(
+                route("session.close", payload).is_err(),
+                "accepted {payload}"
+            );
+            assert!(
+                route("session.approval", payload).is_err(),
+                "accepted {payload}"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_operations_are_refused() {
+        assert!(route("session.kill", r#"{"session_id":"abc"}"#).is_err());
+    }
 
     #[test]
     fn discovered_models_are_namespaced_and_reconciled() {

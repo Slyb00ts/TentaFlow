@@ -178,6 +178,16 @@ impl From<anyhow::Error> for SupervisorError {
 /// `threshold * health_check_interval`.
 const HEALTH_FAILURE_THRESHOLD: u32 = 3;
 
+/// Per-service state of coding-agent model discovery: which bridge instance was
+/// probed, whether it produced a model list, and when it was last tried.
+#[derive(Debug, Clone)]
+struct AgentModelSync {
+    /// `(runtime_pid, restart_count)` — changes when the bridge is restarted.
+    instance: (Option<i64>, i64),
+    done: bool,
+    last_attempt: Instant,
+}
+
 #[derive(Debug, Clone)]
 struct RestartState {
     attempts: u32,
@@ -250,7 +260,9 @@ pub struct Supervisor {
     /// by `(node_id, service_id)` so the supervisor can abort the right task
     /// when a row is removed from the snapshot. Sole producer.
     reconnect_tasks: Arc<Mutex<HashMap<(String, i64), JoinHandle<()>>>>,
-    agent_model_sync: Arc<Mutex<HashMap<i64, Instant>>>,
+    /// Model-discovery bookkeeping per coding-agent service. See
+    /// `sync_coding_agent_models`.
+    agent_model_sync: Arc<Mutex<HashMap<i64, AgentModelSync>>>,
     /// Optional catalog provider; when set, every successful
     /// `reconcile_handles` tick triggers a rebuild so deploy / undeploy /
     /// peer announce/disconnect propagate to `/v1/models` without an
@@ -883,9 +895,18 @@ impl Supervisor {
         .map_err(|e| SupervisorError::Database(format!("join: {}", e)))?
     }
 
+    /// Discovers models of coding-agent CLI bridges ONCE per bridge instance.
+    ///
+    /// It used to refresh every 300 s (and retry every 10 s until something was
+    /// discovered). For Claude Code that meant driving a real CLI session, and
+    /// every one of them showed up in the user's session history. The model
+    /// list of a CLI changes when the vendor ships a release, not during the
+    /// day: one sync per bridge process is enough, and the dashboard can ask
+    /// for a refresh explicitly.
     async fn sync_coding_agent_models(&self, services: &[ServiceRow]) {
-        const DISCOVERY_RETRY_INTERVAL: Duration = Duration::from_secs(10);
-        const REFRESH_INTERVAL: Duration = Duration::from_secs(300);
+        // A bridge that is up but not logged in yet cannot report models, so a
+        // failed attempt is retried — just not on every health tick.
+        const RETRY_AFTER_FAILURE: Duration = Duration::from_secs(300);
         for service in services {
             if service.transport != Transport::AgentRpc
                 || !matches!(
@@ -895,23 +916,25 @@ impl Supervisor {
             {
                 continue;
             }
-            let interval = match self.model_count(service.id).await {
-                Ok(0) => DISCOVERY_RETRY_INTERVAL,
-                Ok(_) => REFRESH_INTERVAL,
-                Err(error) => {
-                    tracing::debug!(service_id = service.id, %error, "coding-agent model count failed");
-                    DISCOVERY_RETRY_INTERVAL
-                }
-            };
+            // A restarted bridge is a new instance: pid and restart counter
+            // change, so its models are discovered again.
+            let instance = (service.runtime_pid, service.restart_count);
             {
-                let mut last = self.agent_model_sync.lock().await;
-                if last
-                    .get(&service.id)
-                    .is_some_and(|instant| instant.elapsed() < interval)
-                {
+                let mut synced = self.agent_model_sync.lock().await;
+                if synced.get(&service.id).is_some_and(|state| {
+                    state.instance == instance
+                        && (state.done || state.last_attempt.elapsed() < RETRY_AFTER_FAILURE)
+                }) {
                     continue;
                 }
-                last.insert(service.id, Instant::now());
+                synced.insert(
+                    service.id,
+                    AgentModelSync {
+                        instance,
+                        done: false,
+                        last_attempt: Instant::now(),
+                    },
+                );
             }
             let auth = match crate::services::coding_agent::execute(service, "auth.status", "{}")
                 .await
@@ -931,10 +954,17 @@ impl Supervisor {
             }
             match crate::services::coding_agent::execute(service, "models.list", "{}").await {
                 Ok(result) => {
-                    if let Err(error) =
-                        crate::services::coding_agent::sync_models(&self.db, service, &result)
-                    {
-                        tracing::warn!(service_id = service.id, %error, "coding-agent model sync failed");
+                    match crate::services::coding_agent::sync_models(&self.db, service, &result) {
+                        Ok(_) => {
+                            if let Some(state) =
+                                self.agent_model_sync.lock().await.get_mut(&service.id)
+                            {
+                                state.done = true;
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(service_id = service.id, %error, "coding-agent model sync failed");
+                        }
                     }
                 }
                 Err(error) => {

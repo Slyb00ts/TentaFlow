@@ -39,7 +39,9 @@ export async function findDeployedAgent(engineId, nodeId) {
 export async function openAgentLogin(service) {
   const status = await agentRequest(service, 'auth.status');
   if (status.authenticated) {
-    await agentRequest(service, 'models.list');
+    // Admin-triggered login is the one moment worth paying for a real CLI
+    // probe: the account may have changed, so the cached list is suspect.
+    await agentRequest(service, 'models.list', { refresh: true });
     toast(`${service.displayName || service.display_name}: konto jest już zalogowane`, 'success');
     return;
   }
@@ -67,7 +69,13 @@ export async function openAgentLogin(service) {
 
   let afterSeq = 0;
   let closed = false;
-  const close = () => { closed = true; win.remove(); };
+  // The login flow holds a live CLI process in a PTY. Closing the window without
+  // telling the bridge would leave it running until the service restarts.
+  const close = () => {
+    closed = true;
+    win.remove();
+    agentRequest(service, 'session.close', { session_id: flowId }).catch(() => {});
+  };
   win.addEventListener('close', close);
   footer.querySelector('[data-agent-send]')?.addEventListener('click', async () => {
     const input = body.querySelector('[data-agent-input]');
@@ -101,7 +109,7 @@ export async function openAgentLogin(service) {
         }
       }
       if (auth.authenticated) {
-        await agentRequest(service, 'models.list');
+        await agentRequest(service, 'models.list', { refresh: true });
         toast('Logowanie zakończone', 'success');
         close();
         return;
