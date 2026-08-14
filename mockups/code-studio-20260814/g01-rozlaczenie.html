@@ -1,0 +1,377 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Code Studio · Węzeł nieosiągalny (G01)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=4">
+<link rel="stylesheet" href="shared/code-studio.css?v=4">
+<style>
+  .go-card { width: 100%; max-width: 480px; background: var(--bg-card); border: 1px solid var(--border);
+             border-radius: var(--radius-lg); box-shadow: var(--shadow-lg); overflow: hidden;
+             animation: goIn .35s cubic-bezier(.34,1.56,.64,1); }
+  @keyframes goIn { from { opacity: 0; transform: translateY(20px) scale(.96); } to { opacity: 1; transform: none; } }
+  .go-head { display: flex; align-items: center; gap: 10px; padding: 14px 18px;
+             background: var(--bg-2); border-bottom: 1px solid var(--border); }
+  .go-head h3 { font-size: 15px; font-weight: 700; }
+  .go-body { padding: 26px 24px 18px; text-align: center; }
+  .go-ico { width: 68px; height: 68px; margin: 0 auto 18px; border-radius: 50%; display: flex;
+            align-items: center; justify-content: center; position: relative;
+            background: rgba(245,158,11,.08); border: 1px solid rgba(245,158,11,.25); color: var(--cs-ask); }
+  .go-ico::before { content: ''; position: absolute; inset: -6px; border-radius: 50%;
+                    border: 2px solid var(--cs-ask); opacity: .4; animation: goRing 2.2s ease-out infinite; }
+  @keyframes goRing { 0% { transform: scale(.92); opacity: .4; } 70%,100% { transform: scale(1.25); opacity: 0; } }
+  .go-ico svg { width: 30px; height: 30px; stroke: currentColor; fill: none; stroke-width: 2; }
+  .go-h { font-size: 16px; font-weight: 700; }
+  .go-d { font-size: 12.5px; color: var(--text-2); line-height: 1.7; margin-top: 8px; }
+  .go-retry { display: flex; align-items: center; gap: 14px; margin: 20px 0 6px;
+              padding: 12px 14px; border-radius: var(--radius); background: var(--bg-2); border: 1px solid var(--border); }
+  .go-ring { position: relative; width: 50px; height: 50px; flex-shrink: 0; }
+  .go-ring svg { transform: rotate(-90deg); }
+  .go-ring circle { fill: none; stroke-width: 4; }
+  .go-ring .track { stroke: var(--bg-3); }
+  .go-ring .fill { stroke: var(--cs-ask); stroke-linecap: round; stroke-dasharray: 125.6; stroke-dashoffset: 44; }
+  .go-ring .cd { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+                 font-family: var(--cs-mono); font-size: 13px; font-weight: 700; color: var(--cs-ask); }
+  .go-info { text-align: left; }
+  .go-info .l1 { font-size: 12.5px; color: var(--text); font-weight: 600; }
+  .go-info .l2 { font-size: 11px; color: var(--text-3); font-family: var(--cs-mono); margin-top: 2px; }
+  .go-keep { display: flex; gap: 10px; align-items: flex-start; text-align: left; padding: 12px 14px;
+             border-radius: var(--radius); background: rgba(34,197,94,.06); border: 1px solid rgba(34,197,94,.25); }
+  .go-keep .icon { color: var(--cs-ok); margin-top: 1px; flex-shrink: 0; }
+  .go-keep p { font-size: 11.5px; color: var(--text-2); line-height: 1.65; }
+  .go-keep b { color: var(--text); }
+  .go-log { margin-top: 14px; max-height: 120px; overflow-y: auto; text-align: left;
+            font-family: var(--cs-mono); font-size: 10.5px; line-height: 1.8; color: var(--text-3);
+            background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius); padding: 8px 10px; }
+  .go-log .ts { color: var(--text-3); opacity: .6; margin-right: 8px; }
+  .go-log .ok { color: var(--cs-ok); }
+  .go-log .wr { color: var(--cs-ask); }
+  .go-foot { display: flex; gap: 8px; padding: 12px 18px; background: var(--bg-2); border-top: 1px solid var(--border); }
+  .go-foot .sp { flex: 1; }
+  .dimmed { filter: saturate(.6) brightness(.7); }
+</style>
+</head>
+<body>
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+</defs></svg><section class="screen">
+  <div class="screen-header">
+    <div class="num">G01</div>
+    <h2>Węzeł nieosiągalny</h2>
+    <div class="desc">Praca zdalna: łączność z węzłem-właścicielem znika, ale sesja tam żyje dalej.</div>
+  </div>
+
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-terminal"/></svg>Code Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Dev</div><div class="role">Euvic · Platforma</div></div></div>
+        </div>
+      </aside>
+      <main class="main">
+        <div class="cs-shell dimmed" data-view="konsola" data-dock="agenci" data-stage="konsola">
+          <div class="cs-projects">
+            <div class="cs-proj active">
+              <span class="cs-dot run"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">tentaflow-core</span>
+              <span class="cs-proj-meta">dev-ryzen · pracuje 4m 12s</span></span>
+            </div>
+            <div class="cs-proj">
+              <span class="cs-dot ask"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">addon-notes</span>
+              <span class="cs-proj-meta">dev-ryzen · czeka na Ciebie</span></span>
+              <span class="cs-proj-badge">1</span>
+            </div>
+            <div class="cs-proj">
+              <span class="cs-dot idle"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">klient-b2b-portal</span>
+              <span class="cs-proj-meta">mac-studio · bezczynny</span></span>
+            </div>
+            <div class="cs-proj">
+              <span class="cs-dot err"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">forge-kernels</span>
+              <span class="cs-proj-meta">gpu-01 · testy czerwone</span></span>
+            </div>
+            <div class="cs-proj-add"><svg class="icon"><use href="#i-plus"/></svg>Nowy workspace</div>
+          </div>
+
+          <div class="cs-body">
+            <div class="cs-stage">
+              <div class="cs-stage-head">
+                <span class="cs-dot idle"></span>
+                <div><div class="cs-stage-title">Dodaj endpoint /v1/embeddings do API</div>
+                <div class="cs-stage-sub">sesja #4 · łączność utracona</div></div>
+              </div>
+              <div class="cs-stream">
+                <div class="cs-turn">Tura 2 · 12:06</div>
+                <div class="ev ev-say">Równolegle implementer przygotowuje szkielet, żeby po Twojej decyzji
+                  zostało tylko dopięcie kształtu odpowiedzi.</div>
+                <div class="ev ev-tool ok">
+                  <span class="t-ico"><svg class="icon"><use href="#i-check"/></svg></span>
+                  <span class="t-name">fs_write</span><span class="t-arg">src/api/embeddings.rs</span>
+                  <span class="t-meta"><span>+112</span></span>
+                </div>
+              </div>
+            </div>
+            <div class="cs-dock">
+              <div class="cs-dock-tabs">
+                <div class="cs-dock-tab active"><svg class="icon"><use href="#i-bot"/></svg>Subagenci</div>
+                <div class="cs-dock-tab"><svg class="icon"><use href="#i-file"/></svg>Pliki</div>
+                <div class="cs-dock-tab"><svg class="icon"><use href="#i-code"/></svg>Zmiany</div>
+              </div>
+              <div class="cs-dock-body">
+                <div class="cs-dock-pane" data-pane="agenci" style="display:block">
+                  <div class="cs-dock-title">Aktywne w tej sesji</div>
+                  <div class="sa run">
+                    <div class="sa-head">
+                      <span class="sa-av"><svg class="icon"><use href="#i-edit"/></svg></span>
+                      <span><span class="sa-nm">code-implementer</span><br><span class="sa-role">rw · iter 3/25</span></span>
+                      <span class="cs-dot run"></span>
+                    </div>
+                    <div class="sa-now">pracuje na węźle dev-ryzen</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div class="window-backdrop">
+      <div class="go-card">
+        <div class="go-head"><span class="cs-dot ask"></span><h3>Węzeł nieosiągalny</h3></div>
+        <div class="go-body">
+          <div class="go-ico"><svg viewBox="0 0 24 24"><path d="M1 1l22 22"/><path d="M16.72 11.06A10.94 10.94 0 0 1 19 12.55"/>
+            <path d="M5 12.55a10.94 10.94 0 0 1 5.17-2.39"/><path d="M10.71 5.05A16 16 0 0 1 22.58 9"/>
+            <path d="M1.42 9a15.91 15.91 0 0 1 4.7-2.88"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/>
+            <line x1="12" y1="20" x2="12.01" y2="20"/></svg></div>
+          <div class="go-h">Straciliśmy kontakt z <span class="mono">dev-ryzen</span></div>
+          <div class="go-d">Twoja przeglądarka ma połączenie z platformą, ale węzeł, na którym stoi ten
+            workspace, nie odpowiada. To nie jest utrata sesji.</div>
+
+          <div class="go-keep" style="margin-top:18px">
+            <svg class="icon"><use href="#i-check-circle"/></svg>
+            <p><b>Sesja pracuje dalej.</b> Agenci, procesy i zapis zdarzeń żyją na węźle-właścicielu,
+               nie w tej karcie. Po odzyskaniu łączności oś czasu dociągnie się od miejsca,
+               w którym urwał się strumień — nic nie przepadnie.</p>
+          </div>
+
+          <div class="go-retry">
+            <div class="go-ring">
+              <svg viewBox="0 0 50 50" width="50" height="50">
+                <circle class="track" cx="25" cy="25" r="20"/><circle class="fill" cx="25" cy="25" r="20"/>
+              </svg>
+              <div class="cd">7</div>
+            </div>
+            <div class="go-info">
+              <div class="l1">Ponawiam za 7 s</div>
+              <div class="l2">próba 3 · odstęp rośnie do 60 s</div>
+            </div>
+          </div>
+
+          <div class="go-log">
+            <div><span class="ts">12:08:14</span>strumień sesji przerwany</div>
+            <div><span class="ts">12:08:15</span>ponawiam <span class="ok">łączność mesh</span></div>
+            <div><span class="ts">12:08:19</span><span class="wr">brak odpowiedzi z dev-ryzen (2/3)</span></div>
+            <div><span class="ts">12:08:27</span>węzeł widoczny w rejestrze, brak strumienia</div>
+          </div>
+        </div>
+        <div class="go-foot">
+          <button class="btn"><svg class="icon"><use href="#i-list"/></svg>Inne workspace'y</button>
+          <span class="sp"></span>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-refresh"/></svg>Ponów teraz</button>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="screen">
+  <div class="screen-header">
+    <div class="num">G01·b</div>
+    <h2>Powrót łączności</h2>
+    <div class="desc">Oś czasu dociąga zdarzenia od kursora, zamiast zaczynać od nowa.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-terminal"/></svg>Code Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">PJ</div><div><div class="name-t">Piotr · Dev</div><div class="role">Euvic · Platforma</div></div></div>
+        </div>
+      </aside>
+      <main class="main">
+        <div class="cs-shell dimmed" data-view="konsola" data-dock="agenci" data-stage="konsola">
+          <div class="cs-projects">
+            <div class="cs-proj active">
+              <span class="cs-dot run"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">tentaflow-core</span>
+              <span class="cs-proj-meta">dev-ryzen · pracuje 4m 12s</span></span>
+            </div>
+            <div class="cs-proj">
+              <span class="cs-dot ask"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">addon-notes</span>
+              <span class="cs-proj-meta">dev-ryzen · czeka na Ciebie</span></span>
+              <span class="cs-proj-badge">1</span>
+            </div>
+            <div class="cs-proj">
+              <span class="cs-dot idle"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">klient-b2b-portal</span>
+              <span class="cs-proj-meta">mac-studio · bezczynny</span></span>
+            </div>
+            <div class="cs-proj">
+              <span class="cs-dot err"></span>
+              <span class="cs-proj-txt"><span class="cs-proj-name">forge-kernels</span>
+              <span class="cs-proj-meta">gpu-01 · testy czerwone</span></span>
+            </div>
+            <div class="cs-proj-add"><svg class="icon"><use href="#i-plus"/></svg>Nowy workspace</div>
+          </div>
+
+          <div class="cs-body">
+            <div class="cs-stage">
+              <div class="cs-stage-head">
+                <span class="cs-dot idle"></span>
+                <div><div class="cs-stage-title">Dodaj endpoint /v1/embeddings do API</div>
+                <div class="cs-stage-sub">sesja #4 · dociąganie zdarzeń</div></div>
+              </div>
+              <div class="cs-stream">
+                <div class="cs-turn">Tura 2 · 12:06</div>
+                <div class="ev ev-say">Równolegle implementer przygotowuje szkielet, żeby po Twojej decyzji
+                  zostało tylko dopięcie kształtu odpowiedzi.</div>
+                <div class="ev ev-tool ok">
+                  <span class="t-ico"><svg class="icon"><use href="#i-check"/></svg></span>
+                  <span class="t-name">fs_write</span><span class="t-arg">src/api/embeddings.rs</span>
+                  <span class="t-meta"><span>+112</span></span>
+                </div>
+              </div>
+            </div>
+            <div class="cs-dock">
+              <div class="cs-dock-tabs">
+                <div class="cs-dock-tab active"><svg class="icon"><use href="#i-bot"/></svg>Subagenci</div>
+                <div class="cs-dock-tab"><svg class="icon"><use href="#i-file"/></svg>Pliki</div>
+                <div class="cs-dock-tab"><svg class="icon"><use href="#i-code"/></svg>Zmiany</div>
+              </div>
+              <div class="cs-dock-body">
+                <div class="cs-dock-pane" data-pane="agenci" style="display:block">
+                  <div class="cs-dock-title">Aktywne w tej sesji</div>
+                  <div class="sa run">
+                    <div class="sa-head">
+                      <span class="sa-av"><svg class="icon"><use href="#i-edit"/></svg></span>
+                      <span><span class="sa-nm">code-implementer</span><br><span class="sa-role">rw · iter 3/25</span></span>
+                      <span class="cs-dot run"></span>
+                    </div>
+                    <div class="sa-now">pracuje na węźle dev-ryzen</div>
+                  </div>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </main>
+    </div>
+    <div class="window-backdrop" style="background:rgba(3,5,15,.45)">
+      <div class="go-card" style="max-width:420px">
+        <div class="go-head"><span class="cs-dot ok"></span><h3>Połączenie wróciło</h3></div>
+        <div class="go-body" style="padding:22px 24px 14px">
+          <div class="go-ico" style="background:rgba(34,197,94,.08);border-color:rgba(34,197,94,.3);color:var(--cs-ok)">
+            <svg viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></svg>
+          </div>
+          <div class="go-h">Dociągam, co się wydarzyło</div>
+          <div class="go-d">Sesja przez ten czas wykonała 14 zdarzeń. Wczytuję je od kursora
+            <span class="mono">seq 218</span>, żeby oś czasu była kompletna.</div>
+          <div class="progress" style="margin-top:18px"><i style="width:64%"></i></div>
+          <div class="cs-hint-keys" style="margin-top:8px">9 z 14 zdarzeń</div>
+        </div>
+      </div>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
