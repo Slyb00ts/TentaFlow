@@ -136,6 +136,8 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         // progress_message: brak raportu fazy startu w tescie
         progress_message: None,
         update_available: false,
+        usage_json: None,
+        usage_updated_at: None,
         models: vec![ServiceModelEntry {
             model_name: model_name.into(),
             display_name: None,
