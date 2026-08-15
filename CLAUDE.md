@@ -137,7 +137,7 @@ catalog. Rust addons get typed UI catalog v1 bindings via `scripts/gen-rust.sh` 
 Notable bundled addons: `eureka`, `company-lookup`, `contacts` (CRM source of truth), `memory`,
 `embeddings-chunker`, `notes` (SQLite source of truth + `graph_outbox` → Cozo `notes_kg` + zvec
 namespaces, hybrid RRF search), `deep-research` (thin facade over the web-research service).
-Protocol `SCHEMA_VERSION` 21 — old/new binaries reject each other on handshake; rebuild all
+Protocol `SCHEMA_VERSION` 22 — old/new binaries reject each other on handshake; rebuild all
 mesh nodes together.
 
 ### Web research

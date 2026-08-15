@@ -614,6 +614,205 @@ pub enum MeshCommandType {
         operation: String,
         payload_json: String,
     },
+    /// Code Studio (§12.1): one binary-protocol request of a workspace whose
+    /// owner node is the receiver. `payload_cbor` is the CBOR of a
+    /// `code_studio::CodeStudioPayload` request variant; it travels as opaque
+    /// bytes so `assertion.args_digest` binds the EXACT bytes that will be
+    /// executed — a re-encode on the way could change them. Appended at END.
+    CodeStudioOp {
+        assertion: SessionAssertion,
+        payload_cbor: Vec<u8>,
+    },
+    /// Code Studio (§12.1): push this node's current assertion signing keys to
+    /// a trust-paired peer after a rotation. Mirrors `MESH_MSG_HMAC_KEYS_SYNC`
+    /// — verifier-only material, public keys, never used by the receiver for
+    /// signing. Appended at END.
+    CodeStudioAssertionKeysPush {
+        keys: Vec<AssertionKeyEntry>,
+    },
+    /// Code Studio (§12.1): pull the sender's current assertion keys. Sent by a
+    /// verifier that met an unknown `kid`, so a missed push cannot wedge a
+    /// workspace. Appended at END.
+    CodeStudioAssertionKeysGet,
+    /// Code Studio (§12.1): freshness probe for an IRREVERSIBLE operation. The
+    /// owner node asks the assertion's issuer to re-resolve the actor's
+    /// authorization against ITS live database right now, so a revocation
+    /// performed on the issuer takes effect before the operation, not after
+    /// sync converges. Appended at END.
+    CodeStudioPermissionProbe {
+        user_id: String,
+        org_id: String,
+        workspace_id: String,
+        capability: String,
+    },
+    /// Code Studio (§12.2): consumer-driven stream read.
+    ///
+    /// It carries a `SessionAssertion` for the SAME reason `CodeStudioOp` does:
+    /// the mesh connection proves the NODE, and a stream carries one person's
+    /// unfinished work and their conversation with the agent (§5.3, §25.4).
+    /// Without the assertion any actor on a trusted node could read any stream
+    /// whose id it could name. `request_cbor` is the CBOR of
+    /// `CodeStudioStreamPullRequest`, carried as opaque bytes so
+    /// `assertion.args_digest` binds the EXACT parameters that will be served.
+    /// Appended at END.
+    CodeStudioStreamPull {
+        assertion: SessionAssertion,
+        request_cbor: Vec<u8>,
+    },
+    /// Code Studio (§12.2): ask the owner node to OPEN a stream for the actor
+    /// named by the assertion. `request_cbor` is the CBOR of
+    /// `CodeStudioStreamOpenRequest`, bound by `assertion.args_digest`.
+    ///
+    /// Opening is a separate command from pulling because the owner node is the
+    /// only place the session row lives (§3, §5.3): it authorizes the person
+    /// against its own database, binds the stream to
+    /// `(issuing node, subject, session)` and only then starts producing.
+    /// Appended at END.
+    CodeStudioStreamOpen {
+        assertion: SessionAssertion,
+        request_cbor: Vec<u8>,
+    },
+}
+
+// =============================================================================
+// Code Studio — session assertion and mesh streams (§12)
+// =============================================================================
+
+/// §12.1 — actor identity carried across the mesh.
+///
+/// A node signature proves the NODE, not the person acting through it, so the
+/// identity system of the node the user is connected to mints this assertion
+/// and the owner node verifies it. It transports identity only: after
+/// verification the owner node still runs its own full authorization
+/// (permission matrix, membership, role, PEP, containment).
+///
+/// `signature` covers every other field through a length-prefixed canonical
+/// encoding (see `code_studio::assertion::signing_input`) rather than the CBOR
+/// bytes — the wire form must not be able to change the signed message.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct SessionAssertion {
+    /// Signature algorithm. Only `Ed25519` is accepted; the field exists so an
+    /// unknown algorithm is a REJECTION rather than a silent reinterpretation.
+    pub alg: String,
+    /// Which of the issuer's keys signed this. Two are valid at once during a
+    /// rotation overlap window, so a rotation does not break live sessions.
+    pub kid: String,
+    /// Issuing node. Must equal the authenticated peer of the mesh connection
+    /// the assertion arrives on.
+    pub iss: String,
+    /// Acting user id (UUID string).
+    pub sub: String,
+    /// Owner node this assertion is for. Anything else is rejected.
+    pub aud: String,
+    pub org: String,
+    pub workspace: String,
+    /// Session the operation belongs to; empty for workspace-level calls that
+    /// exist before any session (list, create, settings).
+    pub session: String,
+    /// Capability slugs the issuer resolved for this actor.
+    pub caps: Vec<String>,
+    /// Issuer's revision of the actor's authorization inputs. A divergence
+    /// forces the owner node to re-resolve before it acts.
+    pub rbac_rev: String,
+    /// Unix milliseconds.
+    pub iat: u64,
+    pub nbf: u64,
+    /// Unix milliseconds; at most 120 s after `iat`, enforced at BOTH issuance
+    /// and verification.
+    pub exp: u64,
+    /// Single-use identifier, recorded in `session_assertion_jti` on the owner
+    /// node so a replay survives neither the network nor a restart.
+    pub jti: String,
+    /// Operation this assertion authorizes, for mutating calls. Empty for
+    /// read-only ones. A replay can therefore at most re-drive an operation
+    /// that `session_operations` already deduplicates by `op_id` (§13.1).
+    pub op_id: String,
+    /// Lowercase hex SHA-256 of the exact `payload_cbor` bytes carried with it.
+    pub args_digest: String,
+    pub signature: Vec<u8>,
+}
+
+/// One Ed25519 verification key of a peer's assertion key ring. Public
+/// material only.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AssertionKeyEntry {
+    pub kid: String,
+    /// 32-byte Ed25519 verifying key.
+    pub public_key: Vec<u8>,
+    /// Unix milliseconds after which this key is no longer accepted. `0` marks
+    /// the issuer's CURRENT key, which has no expiry of its own.
+    pub expires_unix_ms: u64,
+}
+
+/// §12.2 — one frame of a Code Studio stream carried over the mesh.
+///
+/// `seq` is monotonic per `(session_id, stream_id)`: it is both the dedupe key
+/// and the resume point, so a reconnect asks for "everything after N" instead
+/// of replaying from the beginning.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct CodeStudioStreamFrame {
+    pub session_id: String,
+    pub stream_id: String,
+    pub seq: u64,
+    /// `data` | `snapshot` | `artifact`. A `snapshot` frame carries a full
+    /// terminal grid at `revision` and replaces everything before it — that is
+    /// how a consumer whose gap fell out of the replay buffer resynchronizes.
+    /// An `artifact` frame carries the reference of the artifact the output
+    /// overflowed into once the inline budget was spent.
+    pub kind: String,
+    /// Producer-side revision the frame corresponds to; `0` when the stream has
+    /// no revision concept.
+    pub revision: u64,
+    pub data: Vec<u8>,
+}
+
+/// §12.2 — why a stream ended. A stream never just stops: the consumer is told
+/// which of these happened.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct CodeStudioStreamClose {
+    /// `completed` | `session_closed` | `permission_revoked` | `not_found` |
+    /// `assertion_revoked` | `trust_lost` | `gap` | `error`, plus the
+    /// producer-specific reasons a local subscription ends with
+    /// (`terminal_exited`, `index_unavailable`, …). It is ONE vocabulary: the
+    /// consumer forwards the owner's reason to the browser unchanged rather
+    /// than translating it into a guess.
+    pub reason: String,
+    pub detail: String,
+}
+
+/// §12.2 — what a consumer asks the owner node to open for it.
+///
+/// It travels as opaque CBOR under `assertion.args_digest`, so the parameters
+/// the owner node acts on are exactly the ones the actor signed for.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct CodeStudioStreamOpenRequest {
+    pub workspace_id: String,
+    /// Session the stream belongs to. Empty for the workspace-scoped index
+    /// stream, which is the only Code Studio stream without one.
+    pub session_id: String,
+    /// `timeline` | `terminal:<terminal_id>` | `index:<workspace_id>`.
+    pub stream_id: String,
+    /// PRODUCER-side resume point: the event `seq` for a timeline, the VT grid
+    /// revision for a terminal, the progress `seq` for the index. It is not the
+    /// hub sequence — that space belongs to the transport and starts at zero
+    /// for every newly opened stream.
+    pub after_revision: u64,
+    /// Send window in frames the consumer is willing to hold; `0` = the
+    /// producer's default.
+    pub window: u32,
+}
+
+/// §12.2 — one consumer read of an already opened stream.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct CodeStudioStreamPullRequest {
+    pub session_id: String,
+    pub stream_id: String,
+    /// Hub sequence this read resumes after.
+    pub after_seq: u64,
+    /// Highest hub sequence the consumer has taken delivery of — this is what
+    /// returns credit to the producer.
+    pub ack_seq: u64,
+    pub credits: u32,
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -872,6 +1071,49 @@ pub enum MeshCommandResponsePayload {
     },
     /// JSON response returned by a coding-agent bridge on the owner node.
     AgentRpcResult { result_json: String },
+    /// Code Studio: outcome of a `CodeStudioOp` executed on the owner node.
+    /// Exactly one side is populated — `payload_cbor` holds the CBOR of the
+    /// `CodeStudioPayload` response variant, `error` the protocol error with
+    /// its code intact, so the calling node reproduces the local answer
+    /// verbatim instead of flattening everything into a string. Appended at END.
+    CodeStudioOpResult {
+        payload_cbor: Vec<u8>,
+        error: Option<crate::ProtocolError>,
+    },
+    /// Code Studio: the responder's current assertion verification keys.
+    /// Appended at END.
+    CodeStudioAssertionKeysResult { keys: Vec<AssertionKeyEntry> },
+    /// Code Studio: freshness answer for one capability, re-resolved against
+    /// the responder's live database. `rbac_rev` lets the asker see WHICH
+    /// revision answered. Appended at END.
+    CodeStudioPermissionProbeResult {
+        permitted: bool,
+        rbac_rev: String,
+        /// Workspace role the responder resolved, or empty when the actor is
+        /// no longer a member.
+        workspace_role: String,
+        reason: String,
+    },
+    /// Code Studio: frames produced for one `CodeStudioStreamPull`, plus the
+    /// close record when the stream ended during this read. Appended at END.
+    CodeStudioStreamResult {
+        frames: Vec<CodeStudioStreamFrame>,
+        close: Option<CodeStudioStreamClose>,
+        /// Highest sequence the producer has generated so far — lets the
+        /// consumer tell "nothing new yet" from "your window is empty".
+        highest_seq: u64,
+    },
+    /// Code Studio: outcome of a `CodeStudioStreamOpen`. `error` carries the
+    /// owner node's refusal with its code intact — a stream the actor may not
+    /// read is refused as `NotFound` with the SAME message a session that does
+    /// not exist produces, so a member cannot probe for other people's
+    /// sessions. Appended at END.
+    CodeStudioStreamOpenResult {
+        /// Hub sequence already produced when the stream opened. `0` for a
+        /// stream that has not published anything yet.
+        highest_seq: u64,
+        error: Option<crate::ProtocolError>,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -1146,6 +1388,65 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("CameraRecordingPull")
                 .field("recording_refs", recording_refs)
                 .field("target_node_id", target_node_id)
+                .finish(),
+            // The command log prints every mesh command at info level, and a
+            // Code Studio payload can carry file contents or a git credential
+            // being stored. Only the routing identity is printed.
+            Self::CodeStudioOp {
+                assertion,
+                payload_cbor,
+            } => f
+                .debug_struct("CodeStudioOp")
+                .field("iss", &assertion.iss)
+                .field("sub", &assertion.sub)
+                .field("workspace", &assertion.workspace)
+                .field("session", &assertion.session)
+                .field("jti", &assertion.jti)
+                .field("payload_bytes", &payload_cbor.len())
+                .finish(),
+            Self::CodeStudioAssertionKeysPush { keys } => f
+                .debug_struct("CodeStudioAssertionKeysPush")
+                .field("keys", &keys.len())
+                .finish(),
+            Self::CodeStudioAssertionKeysGet => write!(f, "CodeStudioAssertionKeysGet"),
+            Self::CodeStudioPermissionProbe {
+                user_id,
+                org_id,
+                workspace_id,
+                capability,
+            } => f
+                .debug_struct("CodeStudioPermissionProbe")
+                .field("user_id", user_id)
+                .field("org_id", org_id)
+                .field("workspace_id", workspace_id)
+                .field("capability", capability)
+                .finish(),
+            // Same rule as `CodeStudioOp`: only the routing identity is
+            // printed. The request bytes name a session, and the assertion
+            // carries a signature nobody needs in a log line.
+            Self::CodeStudioStreamPull {
+                assertion,
+                request_cbor,
+            } => f
+                .debug_struct("CodeStudioStreamPull")
+                .field("iss", &assertion.iss)
+                .field("sub", &assertion.sub)
+                .field("workspace", &assertion.workspace)
+                .field("session", &assertion.session)
+                .field("jti", &assertion.jti)
+                .field("request_bytes", &request_cbor.len())
+                .finish(),
+            Self::CodeStudioStreamOpen {
+                assertion,
+                request_cbor,
+            } => f
+                .debug_struct("CodeStudioStreamOpen")
+                .field("iss", &assertion.iss)
+                .field("sub", &assertion.sub)
+                .field("workspace", &assertion.workspace)
+                .field("session", &assertion.session)
+                .field("jti", &assertion.jti)
+                .field("request_bytes", &request_cbor.len())
                 .finish(),
         }
     }
@@ -2777,6 +3078,158 @@ mod tests {
             let bytes = crate::cbor::encode(&p).expect("encode");
             crate::cbor::decode::<MeshCommandResponsePayload>(&bytes)
                 .expect("decode");
+        }
+    }
+
+    #[test]
+    fn code_studio_mesh_command_round_trip() {
+        let assertion = SessionAssertion {
+            alg: "Ed25519".into(),
+            kid: "0011223344556677".into(),
+            iss: "node-a".into(),
+            sub: "11111111-1111-4111-8111-111111111111".into(),
+            aud: "node-b".into(),
+            org: "org-1".into(),
+            workspace: "ws-1".into(),
+            session: "sess-1".into(),
+            caps: vec!["fs_read".into(), "git_push".into()],
+            rbac_rev: "deadbeef".into(),
+            iat: 1_000,
+            nbf: 1_000,
+            exp: 61_000,
+            jti: "jti-1".into(),
+            op_id: "op-1".into(),
+            args_digest: "ff".repeat(32),
+            signature: vec![7u8; 64],
+        };
+        let command = MeshCommandType::CodeStudioOp {
+            assertion: assertion.clone(),
+            payload_cbor: vec![1, 2, 3],
+        };
+        let bytes = crate::cbor::encode(&command).expect("encode");
+        match crate::cbor::decode::<MeshCommandType>(&bytes).expect("decode") {
+            MeshCommandType::CodeStudioOp {
+                assertion: decoded,
+                payload_cbor,
+            } => {
+                assert_eq!(decoded, assertion);
+                assert_eq!(payload_cbor, vec![1, 2, 3]);
+            }
+            other => panic!("expected CodeStudioOp, got {other:?}"),
+        }
+
+        // The command log prints every mesh command; the payload must not be
+        // in the printed form.
+        let printed = format!("{command:?}");
+        assert!(printed.contains("payload_bytes"));
+        assert!(!printed.contains("signature"));
+
+        // §12.2 — both stream commands carry the same assertion, so a stream is
+        // authorized per USER and not per node.
+        let open_body = crate::cbor::encode(&CodeStudioStreamOpenRequest {
+            workspace_id: "ws-1".into(),
+            session_id: "sess-1".into(),
+            stream_id: "timeline".into(),
+            after_revision: 12,
+            window: 64,
+        })
+        .expect("encode open request");
+        let open = MeshCommandType::CodeStudioStreamOpen {
+            assertion: assertion.clone(),
+            request_cbor: open_body.clone(),
+        };
+        let bytes = crate::cbor::encode(&open).expect("encode");
+        match crate::cbor::decode::<MeshCommandType>(&bytes).expect("decode") {
+            MeshCommandType::CodeStudioStreamOpen {
+                assertion: decoded,
+                request_cbor,
+            } => {
+                assert_eq!(decoded, assertion);
+                assert_eq!(
+                    crate::cbor::decode::<CodeStudioStreamOpenRequest>(&request_cbor)
+                        .expect("decode open request")
+                        .stream_id,
+                    "timeline"
+                );
+            }
+            other => panic!("expected CodeStudioStreamOpen, got {other:?}"),
+        }
+
+        let pull_body = crate::cbor::encode(&CodeStudioStreamPullRequest {
+            session_id: "sess-1".into(),
+            stream_id: "timeline".into(),
+            after_seq: 4,
+            ack_seq: 4,
+            credits: 128,
+        })
+        .expect("encode pull request");
+        let pull = MeshCommandType::CodeStudioStreamPull {
+            assertion: assertion.clone(),
+            request_cbor: pull_body,
+        };
+        let bytes = crate::cbor::encode(&pull).expect("encode");
+        assert!(matches!(
+            crate::cbor::decode::<MeshCommandType>(&bytes).expect("decode"),
+            MeshCommandType::CodeStudioStreamPull { .. }
+        ));
+        let printed = format!("{pull:?}");
+        assert!(printed.contains("request_bytes"));
+        assert!(!printed.contains("signature"));
+    }
+
+    #[test]
+    fn code_studio_mesh_response_payloads_round_trip() {
+        let payloads = vec![
+            MeshCommandResponsePayload::CodeStudioOpResult {
+                payload_cbor: vec![9, 9],
+                error: None,
+            },
+            MeshCommandResponsePayload::CodeStudioOpResult {
+                payload_cbor: Vec::new(),
+                error: Some(crate::ProtocolError::new(
+                    crate::ProtocolErrorCode::PolicyDenied,
+                    "denied",
+                )),
+            },
+            MeshCommandResponsePayload::CodeStudioAssertionKeysResult {
+                keys: vec![AssertionKeyEntry {
+                    kid: "abc".into(),
+                    public_key: vec![3u8; 32],
+                    expires_unix_ms: 0,
+                }],
+            },
+            MeshCommandResponsePayload::CodeStudioPermissionProbeResult {
+                permitted: false,
+                rbac_rev: "cafe".into(),
+                workspace_role: String::new(),
+                reason: "not a member".into(),
+            },
+            MeshCommandResponsePayload::CodeStudioStreamResult {
+                frames: vec![CodeStudioStreamFrame {
+                    session_id: "sess-1".into(),
+                    stream_id: "term-1".into(),
+                    seq: 4,
+                    kind: "data".into(),
+                    revision: 12,
+                    data: vec![0xAA],
+                }],
+                close: Some(CodeStudioStreamClose {
+                    reason: "session_closed".into(),
+                    detail: String::new(),
+                }),
+                highest_seq: 4,
+            },
+            MeshCommandResponsePayload::CodeStudioStreamOpenResult {
+                highest_seq: 0,
+                error: Some(crate::ProtocolError::new(
+                    crate::ProtocolErrorCode::NotFound,
+                    "session not found",
+                )),
+            },
+        ];
+        for p in payloads {
+            let bytes = crate::cbor::encode(&p).expect("encode");
+            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes).expect("decode");
         }
     }
 

@@ -9939,10 +9939,19 @@ fn decode_project_studio_payload(
     }
 }
 
-/// Dekoduje `CodeStudioPayload` (Code Studio: workspace'y, czlonkowie, sesje).
-/// Nie ma tu wariantow binarnych, wiec caly payload idzie generyczna sciezka
-/// serde -> JSON -> JsValue z dual-key (snake + camel), tak jak ogon
-/// `decode_project_studio_payload`.
+/// Decodes `CodeStudioPayload` (workspaces, members, sessions, filesystem, git,
+/// patch sets, timeline, operations, approvals, runs, exec, terminal, settings,
+/// index) through the same generic path as the tail of
+/// `decode_project_studio_payload`: serde's external tagging yields
+/// `{"VariantName": {fields}}`, the tag becomes "CodeStudio" + name and every
+/// field is copied under both snake_case and camelCase.
+///
+/// The family carries NO `serde_bytes` variant — file contents, diffs and the
+/// terminal grid all travel as text — so nothing needs the Uint8Array
+/// special-casing that Project Studio's attachment variants require, and every
+/// append-only variant decodes here without touching this crate. A future
+/// variant carrying raw bytes would have to be special-cased BEFORE this
+/// generic path, or it would reach JS as a per-byte number array.
 fn decode_code_studio_payload(
     obj: &js_sys::Object,
     payload: tentaflow_protocol::code_studio::CodeStudioPayload,
@@ -19664,4 +19673,478 @@ pub fn encode_code_studio_session_close_request(
         },
     ))
     .map_err(|e| JsError::new(&e))
+}
+
+// -----------------------------------------------------------------------------
+// Code Studio — session surface: filesystem, git broker, patch review, timeline,
+// operations, approvals and grants, runs, exec and terminal, settings, index.
+//
+// Every request here crosses as ONE snake_case JSON string parsed straight into
+// the enum variant through serde's external tag. That is the Project Studio F2
+// policy (`encode_project_studio_json_request`) and it is the right one for this
+// family: fields are append-only with `#[serde(default)]`, so a later field
+// needs no change on this side of the bridge, and serde — not a hand-kept
+// argument list — enforces the types.
+// -----------------------------------------------------------------------------
+
+/// Parses `fields_json` (snake_case object) into the `variant` struct variant of
+/// CodeStudioPayload through serde's external tagging and encodes the full
+/// MessageBody.
+fn encode_code_studio_json_request(variant: &str, fields_json: &str) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::code_studio::CodeStudioPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::CodeStudioBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(FileTreeRequest) — worktree listing; `path` is
+/// relative, `depth` bounds the expansion.
+#[wasm_bindgen(js_name = encodeCodeStudioFileTreeRequest)]
+pub fn encode_code_studio_file_tree_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileTreeRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileReadRequest) — whole file or a line range.
+#[wasm_bindgen(js_name = encodeCodeStudioFileReadRequest)]
+pub fn encode_code_studio_file_read_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileReadRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileWriteRequest) — `expected_blob_sha` is the
+/// compare-and-swap token; omitting it means the file must not exist yet.
+#[wasm_bindgen(js_name = encodeCodeStudioFileWriteRequest)]
+pub fn encode_code_studio_file_write_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileWriteRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileCreateRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioFileCreateRequest)]
+pub fn encode_code_studio_file_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileCreateRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileDeleteRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioFileDeleteRequest)]
+pub fn encode_code_studio_file_delete_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileDeleteRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileRenameRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioFileRenameRequest)]
+pub fn encode_code_studio_file_rename_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileRenameRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileMkdirRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioFileMkdirRequest)]
+pub fn encode_code_studio_file_mkdir_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileMkdirRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(FileGrepRequest) — `regex=false` keeps the query
+/// literal, so a search for `a.b` is not silently a pattern.
+#[wasm_bindgen(js_name = encodeCodeStudioFileGrepRequest)]
+pub fn encode_code_studio_file_grep_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("FileGrepRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitStatusRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioGitStatusRequest)]
+pub fn encode_code_studio_git_status_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitStatusRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitLogRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioGitLogRequest)]
+pub fn encode_code_studio_git_log_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitLogRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitBranchesRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioGitBranchesRequest)]
+pub fn encode_code_studio_git_branches_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitBranchesRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitDiffRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioGitDiffRequest)]
+pub fn encode_code_studio_git_diff_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitDiffRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitCommitRequest) — without `patch_set_id` the
+/// PEP opens a review instead of committing.
+#[wasm_bindgen(js_name = encodeCodeStudioGitCommitRequest)]
+pub fn encode_code_studio_git_commit_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitCommitRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitPushRequest) — mandatory-interactive, so the
+/// answer may be an approval question rather than a push.
+#[wasm_bindgen(js_name = encodeCodeStudioGitPushRequest)]
+pub fn encode_code_studio_git_push_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitPushRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitSyncRequest) — `mode` is `fetch` or `pull`.
+#[wasm_bindgen(js_name = encodeCodeStudioGitSyncRequest)]
+pub fn encode_code_studio_git_sync_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitSyncRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitMergeRequest) — starts the integration
+/// worktree; a conflict comes back as a result, not an error.
+#[wasm_bindgen(js_name = encodeCodeStudioGitMergeRequest)]
+pub fn encode_code_studio_git_merge_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitMergeRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitMergeFinalizeRequest) — commits the accepted
+/// blobs and moves the target ref under compare-and-swap.
+#[wasm_bindgen(js_name = encodeCodeStudioGitMergeFinalizeRequest)]
+pub fn encode_code_studio_git_merge_finalize_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitMergeFinalizeRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(GitMergeAbandonRequest) — drops a held
+/// integration worktree and its private ref.
+#[wasm_bindgen(js_name = encodeCodeStudioGitMergeAbandonRequest)]
+pub fn encode_code_studio_git_merge_abandon_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("GitMergeAbandonRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorktreesListRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioWorktreesListRequest)]
+pub fn encode_code_studio_worktrees_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorktreesListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(PatchSetsListRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioPatchSetsListRequest)]
+pub fn encode_code_studio_patch_sets_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("PatchSetsListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(PatchSetGetRequest) — files with their hunks.
+#[wasm_bindgen(js_name = encodeCodeStudioPatchSetGetRequest)]
+pub fn encode_code_studio_patch_set_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("PatchSetGetRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(PatchDecideRequest) — decisions per file and per
+/// hunk, including `request_revision` with a note.
+#[wasm_bindgen(js_name = encodeCodeStudioPatchDecideRequest)]
+pub fn encode_code_studio_patch_decide_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("PatchDecideRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(PatchSetAbandonRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioPatchSetAbandonRequest)]
+pub fn encode_code_studio_patch_set_abandon_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("PatchSetAbandonRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionTimelineRequest) — `after_seq` is the
+/// cursor; events are the source of truth, the status columns a projection.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionTimelineRequest)]
+pub fn encode_code_studio_session_timeline_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionTimelineRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionOperationsRequest) — the effect journal;
+/// `status="unknown"` lists what needs a human decision.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionOperationsRequest)]
+pub fn encode_code_studio_session_operations_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionOperationsRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(OperationResolveRequest) — settles an `unknown`
+/// operation as completed or failed. There is no silent retry.
+#[wasm_bindgen(js_name = encodeCodeStudioOperationResolveRequest)]
+pub fn encode_code_studio_operation_resolve_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("OperationResolveRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ApprovalsListRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioApprovalsListRequest)]
+pub fn encode_code_studio_approvals_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ApprovalsListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ApprovalDecideRequest) — `always` on a
+/// mandatory-interactive capability is refused server-side, not hidden in the UI.
+#[wasm_bindgen(js_name = encodeCodeStudioApprovalDecideRequest)]
+pub fn encode_code_studio_approval_decide_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ApprovalDecideRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionGrantsListRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioSessionGrantsListRequest)]
+pub fn encode_code_studio_session_grants_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionGrantsListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionGrantRevokeRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioSessionGrantRevokeRequest)]
+pub fn encode_code_studio_session_grant_revoke_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionGrantRevokeRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceAllowlistListRequest) — the `always`
+/// scope, workspace-wide.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceAllowlistListRequest)]
+pub fn encode_code_studio_workspace_allowlist_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceAllowlistListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceAllowlistSetRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceAllowlistSetRequest)]
+pub fn encode_code_studio_workspace_allowlist_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceAllowlistSetRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceAllowlistRemoveRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceAllowlistRemoveRequest)]
+pub fn encode_code_studio_workspace_allowlist_remove_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceAllowlistRemoveRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionRunsRequest) — the revision chain with the
+/// trigger of every turn.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionRunsRequest)]
+pub fn encode_code_studio_session_runs_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionRunsRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionMessageSendRequest) — a user turn to the
+/// session's root agent.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionMessageSendRequest)]
+pub fn encode_code_studio_session_message_send_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionMessageSendRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionCancelRequest) — without `run_id` the
+/// whole session, subagent runs included.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionCancelRequest)]
+pub fn encode_code_studio_session_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionCancelRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionAutonomySetRequest) — raising is clamped
+/// to the workspace ceiling by the server.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionAutonomySetRequest)]
+pub fn encode_code_studio_session_autonomy_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionAutonomySetRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ExecStartRequest) — `argv` is always a vector; a
+/// shell is one explicit, quoted argument.
+#[wasm_bindgen(js_name = encodeCodeStudioExecStartRequest)]
+pub fn encode_code_studio_exec_start_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ExecStartRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ExecCancelRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioExecCancelRequest)]
+pub fn encode_code_studio_exec_cancel_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ExecCancelRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ExecOutputRequest) — the transcript of a
+/// command, paged by `after_seq` over its lines.
+#[wasm_bindgen(js_name = encodeCodeStudioExecOutputRequest)]
+pub fn encode_code_studio_exec_output_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ExecOutputRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalOpenRequest) — the VT machine lives on
+/// the owner node; the browser only sends keys and renders cells.
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalOpenRequest)]
+pub fn encode_code_studio_terminal_open_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalOpenRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalInputRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalInputRequest)]
+pub fn encode_code_studio_terminal_input_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalInputRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalResizeRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalResizeRequest)]
+pub fn encode_code_studio_terminal_resize_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalResizeRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalCloseRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalCloseRequest)]
+pub fn encode_code_studio_terminal_close_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalCloseRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalSnapshotRequest) — full grid after a
+/// reload or reconnect; the live stream carries only changed rows.
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalSnapshotRequest)]
+pub fn encode_code_studio_terminal_snapshot_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalSnapshotRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceSettingsUpdateRequest) — `exec_mode` is
+/// absent because the execution mode of an existing workspace is immutable.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceSettingsUpdateRequest)]
+pub fn encode_code_studio_workspace_settings_update_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceSettingsUpdateRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceSecretSetRequest) — credential material
+/// travels once and never comes back.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceSecretSetRequest)]
+pub fn encode_code_studio_workspace_secret_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceSecretSetRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceDeleteRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceDeleteRequest)]
+pub fn encode_code_studio_workspace_delete_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceDeleteRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(IndexStatusRequest) — per-branch index state.
+#[wasm_bindgen(js_name = encodeCodeStudioIndexStatusRequest)]
+pub fn encode_code_studio_index_status_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("IndexStatusRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(IndexRebuildRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioIndexRebuildRequest)]
+pub fn encode_code_studio_index_rebuild_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("IndexRebuildRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(CodeSearchRequest) — a semantic request may be
+/// answered by grep with `degraded=true`; grep stays authoritative.
+#[wasm_bindgen(js_name = encodeCodeStudioCodeSearchRequest)]
+pub fn encode_code_studio_code_search_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("CodeSearchRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(SessionStreamRequest) — STREAM-INITIATING (no
+/// plain response): chunks = SessionStreamEvent, end = SessionStreamEnd.
+/// `after_seq` is the resume cursor; 0 replays the session from its first event.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionStreamRequest)]
+pub fn encode_code_studio_session_stream_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionStreamRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalStreamRequest) — STREAM-INITIATING:
+/// chunks = TerminalStreamSnapshot / TerminalStreamDelta, end =
+/// TerminalStreamEnd. `after_revision` is the VT revision the client holds; any
+/// value other than the live one earns a full snapshot first.
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalStreamRequest)]
+pub fn encode_code_studio_terminal_stream_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalStreamRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(IndexStreamRequest) — STREAM-INITIATING: end =
+/// IndexStreamEnd. The semantic index is phase 7, so today the stream closes
+/// with `index_unavailable` instead of reporting progress.
+#[wasm_bindgen(js_name = encodeCodeStudioIndexStreamRequest)]
+pub fn encode_code_studio_index_stream_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("IndexStreamRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(PatchBlobGetRequest) — one CAS blob by digest,
+/// so a partially accepted file can be rebuilt whole instead of from hunk
+/// windows.
+#[wasm_bindgen(js_name = encodeCodeStudioPatchBlobGetRequest)]
+pub fn encode_code_studio_patch_blob_get_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("PatchBlobGetRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(TerminalsListRequest) — shells already open in
+/// the session, so a browser reload rebuilds the dock instead of opening a
+/// second shell next to a running one.
+#[wasm_bindgen(js_name = encodeCodeStudioTerminalsListRequest)]
+pub fn encode_code_studio_terminals_list_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("TerminalsListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceMemberCandidatesRequest) — users the
+/// caller may still add. `workspace_id: null` is the creation wizard, which has
+/// no workspace whose members could be excluded yet.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceMemberCandidatesRequest)]
+pub fn encode_code_studio_workspace_member_candidates_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("WorkspaceMemberCandidatesRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ProjectLinkListRequest) — projects linked to
+/// this workspace (§20).
+#[wasm_bindgen(js_name = encodeCodeStudioProjectLinkListRequest)]
+pub fn encode_code_studio_project_link_list_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ProjectLinkListRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(ProjectLinkSetRequest) — `linked` picks the
+/// direction; the answer is the whole ProjectLinkListResponse, not a delta.
+#[wasm_bindgen(js_name = encodeCodeStudioProjectLinkSetRequest)]
+pub fn encode_code_studio_project_link_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("ProjectLinkSetRequest", &request_json)
+}
+
+/// MessageBody::CodeStudioBody(RepoTreeRequest) — structure of a PINNED commit
+/// of a linked workspace. Addressed by a commit id, never by a path on the
+/// owner node.
+#[wasm_bindgen(js_name = encodeCodeStudioRepoTreeRequest)]
+pub fn encode_code_studio_repo_tree_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("RepoTreeRequest", &request_json)
 }
