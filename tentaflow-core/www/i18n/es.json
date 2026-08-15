@@ -5017,8 +5017,8 @@
       "push_failed": "El push ha fallado."
     },
     "dock": {
-      "agents_active": "Activos en esta sesión",
-      "agents_empty": "Todavía no se ha lanzado ningún subagente.",
+      "agents_active": "Ejecuciones de esta sesión",
+      "agents_empty": "Esta sesión aún no ha ejecutado nada.",
       "konsola": "Consola",
       "agenci": "Agentes",
       "pliki": "Archivos",
@@ -5043,7 +5043,7 @@
       "no_steps": "Sin pasos.",
       "cancel": "Interrumpir",
       "elapsed": "duración",
-      "tokens": "tokens",
+      "tokens": "tok",
       "asks": "preguntas",
       "back": "Volver",
       "step_tool": "herramienta",
@@ -5091,6 +5091,19 @@
       "err_io": "error de entrada/salida: {reason}",
       "err_unknown": "la operación falló y el servidor no indicó el motivo",
       "err_quoted": "la herramienta informó: «{message}»"
+    },
+    "exec": {
+      "discarded_pill": "escrituras descartadas",
+      "discarded_note": "Las escrituras de este comando NO llegaron al árbol de trabajo: se pidió el montaje «{requested}» y el sandbox lo ejecutó sobre una copia (cow).",
+      "discarded_note_plain": "Las escrituras de este comando NO llegaron al árbol de trabajo: el sandbox lo ejecutó sobre una copia (cow).",
+      "open": "Salida",
+      "refresh": "Actualizar",
+      "more": "Cargar más",
+      "lines": "{count} {count|línea|líneas} de salida",
+      "no_output": "El comando no imprimió nada.",
+      "still_running": "El comando sigue en ejecución: su salida estará disponible cuando termine.",
+      "loading": "Cargando la salida…",
+      "unavailable": "El servidor no devolvió la salida de este comando: {reason}"
     },
     "ask": {
       "head": "El agente pregunta",

@@ -5017,8 +5017,8 @@
       "push_failed": "Der Push ist fehlgeschlagen."
     },
     "dock": {
-      "agents_active": "Aktiv in dieser Sitzung",
-      "agents_empty": "Es wurde noch kein Subagent gestartet.",
+      "agents_active": "Läufe dieser Sitzung",
+      "agents_empty": "In dieser Sitzung wurde noch kein Lauf gestartet.",
       "konsola": "Konsole",
       "agenci": "Agenten",
       "pliki": "Dateien",
@@ -5043,7 +5043,7 @@
       "no_steps": "Keine Schritte.",
       "cancel": "Abbrechen",
       "elapsed": "Dauer",
-      "tokens": "Tokens",
+      "tokens": "tok",
       "asks": "Fragen",
       "back": "Zurück",
       "step_tool": "Werkzeug",
@@ -5091,6 +5091,19 @@
       "err_io": "Ein-/Ausgabefehler: {reason}",
       "err_unknown": "die Operation ist fehlgeschlagen, der Server nannte keinen Grund",
       "err_quoted": "das Werkzeug meldet: „{message}“"
+    },
+    "exec": {
+      "discarded_pill": "Schreibvorgänge verworfen",
+      "discarded_note": "Die Schreibvorgänge dieses Befehls haben den Arbeitsbaum NICHT erreicht: angefordert war das Mount „{requested}“, die Sandbox hat ihn auf einer Kopie (cow) ausgeführt.",
+      "discarded_note_plain": "Die Schreibvorgänge dieses Befehls haben den Arbeitsbaum NICHT erreicht — die Sandbox hat ihn auf einer Kopie (cow) ausgeführt.",
+      "open": "Ausgabe",
+      "refresh": "Aktualisieren",
+      "more": "Mehr laden",
+      "lines": "{count} {count|Zeile|Zeilen} Ausgabe",
+      "no_output": "Der Befehl hat nichts ausgegeben.",
+      "still_running": "Der Befehl läuft noch — seine Ausgabe ist nach dem Ende verfügbar.",
+      "loading": "Ausgabe wird geladen…",
+      "unavailable": "Der Server hat die Ausgabe dieses Befehls nicht geliefert: {reason}"
     },
     "ask": {
       "head": "Der Agent fragt",

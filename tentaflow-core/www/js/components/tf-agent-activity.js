@@ -12,6 +12,12 @@
 //   Question / permission cards surface when a run enters waiting_user.
 //   Light DOM, i18n-agnostic (host passes a `labels` dict). tf-* primitives only.
 //
+//   A run row shows the time it really took and the tokens it really spent, so
+//   the widget must be hydratable from persisted rows (`setRunInfo`) and not
+//   only from live events: a page opened after the fact saw no event at all,
+//   and a run created by replay would otherwise date itself from the moment the
+//   client happened to look.
+//
 //   Attributes: variant (chat|chat-audio), level (bar|tree|detail — pins the
 //     surface to a level instead of forcing the host to synthesise a click on
 //     the internal expand control; when present it also tracks internal
@@ -124,6 +130,21 @@ function eventToStep(ev, labels) {
   }
 }
 
+function toMillis(value) {
+  if (value == null || value === '') return 0;
+  if (typeof value === 'number') return Number.isFinite(value) ? value : 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+// A run row states how long it took, so it has to state it the way a person
+// reads a duration: 74 seconds is "1m 14s", not "74s".
+function formatElapsed(ms) {
+  const secs = Math.max(0, Math.round(ms / 1000));
+  if (secs < 60) return `${secs}s`;
+  return `${Math.floor(secs / 60)}m ${String(secs % 60).padStart(2, '0')}s`;
+}
+
 // Public names for the three internal levels.
 const LEVEL_NAMES = ['bar', 'tree', 'detail'];
 const LEVEL_INDEX = { bar: 0, tree: 1, detail: 2 };
@@ -137,7 +158,8 @@ class TfAgentActivity extends HTMLElement {
 
   constructor() {
     super();
-    // runId → { runId, agent, status, parentRunId, tokens, startedAt, steps[],
+    // runId → { runId, agent, status, parentRunId, promptTokens,
+    //           completionTokens, model, startedAt, finishedAt, steps[],
     //           question?, permission?, currentStep }
     this._runs = new Map();
     this._labels = { ...DEFAULT_LABELS };
@@ -246,8 +268,13 @@ class TfAgentActivity extends HTMLElement {
       agent: agent || '',
       status: 'running',
       parentRunId: '',
-      tokens: 0,
+      promptTokens: 0,
+      completionTokens: 0,
+      model: '',
+      // Observation time, replaced by the row's own `started_at` as soon as one
+      // is hydrated — a run replayed from the timeline starts "now" otherwise.
       startedAt: Date.now(),
+      finishedAt: 0,
       steps: [],
       question: null,
       permission: null,
@@ -322,11 +349,36 @@ class TfAgentActivity extends HTMLElement {
 
   // Mark a run terminal (e.g. after a cancel ack) and re-render.
   setRunStatus(runId, status) {
-    const run = this._runs.get(runId);
-    if (run) {
-      run.status = status;
-      if (this._built) this._render();
+    this.setRunInfo(runId, { status });
+  }
+
+  // Hydrate a run from a persisted row: `{ agent, status, parentRunId,
+  // startedAt, finishedAt, promptTokens, completionTokens, model }`, timestamps
+  // as epoch milliseconds (a string is parsed, which only works for a form
+  // `Date.parse` reads unambiguously — the host owns naive server timestamps).
+  //
+  // A row is CREATED only when it comes with a `startedAt`: that is what tells
+  // a real run apart from a bare status update about a run this widget never
+  // saw, which must not invent a row the tree would then count.
+  setRunInfo(runId, info) {
+    if (!runId || !info) return;
+    let run = this._runs.get(runId);
+    if (!run) {
+      if (info.startedAt == null) return;
+      run = this._newRun(runId, info.agent);
+      this._runs.set(runId, run);
     }
+    if (info.agent) run.agent = String(info.agent);
+    if (info.status) run.status = String(info.status);
+    if (info.parentRunId && info.parentRunId !== runId) run.parentRunId = String(info.parentRunId);
+    if (info.model) run.model = String(info.model);
+    const started = toMillis(info.startedAt);
+    const finished = toMillis(info.finishedAt);
+    if (started) run.startedAt = started;
+    if (finished) run.finishedAt = finished;
+    if (info.promptTokens != null) run.promptTokens = Number(info.promptTokens) || 0;
+    if (info.completionTokens != null) run.completionTokens = Number(info.completionTokens) || 0;
+    if (this._built) this._render();
   }
 
   // How many runs the expanded tree lists. A host that puts a badge next to this
@@ -504,13 +556,16 @@ class TfAgentActivity extends HTMLElement {
     const render = (run, depth) => {
       const children = runs.filter((r) => r.parentRunId === run.runId);
       const tone = STATUS_TONE[run.status] || 'info';
-      const elapsed = Math.max(0, Math.round((Date.now() - run.startedAt) / 1000));
+      // A finished run is measured between its own two timestamps; only a run
+      // still going is measured against the clock.
+      const elapsed = formatElapsed((run.finishedAt || Date.now()) - run.startedAt);
+      const tokens = run.promptTokens + run.completionTokens;
       const cancellable = !TERMINAL_STATUSES.has(run.status);
       const row = `<div class="tf-aa-run" data-run="${esc(run.runId)}" style="--depth:${depth}">
-        <button class="tf-aa-run-main" data-action="open-run" data-run-id="${esc(run.runId)}">
+        <button class="tf-aa-run-main" data-action="open-run" data-run-id="${esc(run.runId)}"${run.model ? ` title="${esc(run.model)}"` : ''}>
           <tf-chip status="${tone}" dot>${esc(run.status)}</tf-chip>
           <span class="tf-aa-run-agent">${esc(run.agent || run.runId.slice(0, 8))}</span>
-          <span class="tf-aa-run-meta">${elapsed}s · ${esc(String(run.tokens))} ${esc(this._labels.tokens)}</span>
+          <span class="tf-aa-run-meta">${esc(elapsed)} · ${esc(String(tokens))} ${esc(this._labels.tokens)}</span>
         </button>
         ${cancellable ? `<tf-button variant="ghost" size="sm" data-action="cancel-run" data-run-id="${esc(run.runId)}">${esc(this._labels.cancel)}</tf-button>` : ''}
       </div>`;

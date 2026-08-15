@@ -116,6 +116,7 @@ const DOT_TONES = { run: 'accent', ask: 'warn', ok: 'ok', err: 'err', idle: 'mut
 const LETTER_TONES = { a: 'ok', m: 'warn', d: 'err', c: 'err' };
 
 const TIMELINE_PAGE = 200;
+const EXEC_PAGE = 500;
 const TIMELINE_POLL_MS = 2500;
 const SIDE_POLL_TICKS = 4; // every 4th timeline tick refreshes runs/ops/grants
 const EVENT_BUFFER = 2000;
@@ -137,6 +138,8 @@ function freshState() {
     eventsByRun: new Map(),
     subagentRuns: new Set(),
     toolCalls: new Map(), // call_id -> { name, node }
+    execs: new Map(), // exec_id -> what its timeline row knows about the command
+    exec: null, // the command whose output the exec pane is reading
     turnOrdinal: 0,
     runs: [],
     operations: [],
@@ -197,15 +200,30 @@ function flag(el, name, on) {
   else el.removeAttribute(name);
 }
 
+// SQLite writes `CURRENT_TIMESTAMP` as a zoneless `YYYY-MM-DD HH:MM:SS` in UTC,
+// and `new Date()` reads exactly that form as LOCAL time. The difference cancels
+// out between two server timestamps, so it stayed invisible in a duration — but
+// it shifts every printed clock by the viewer's offset, and it makes a run still
+// in flight (measured against `Date.now()`) look hours old. Anything already
+// carrying a zone is left to the platform parser.
+const NAIVE_TS_RE = /^(\d{4}-\d{2}-\d{2})[ T](\d{2}:\d{2}:\d{2})(\.\d+)?$/;
+
+function parseAt(value) {
+  const text = String(value || '').trim();
+  if (!text) return NaN;
+  const naive = NAIVE_TS_RE.exec(text);
+  return Date.parse(naive ? `${naive[1]}T${naive[2]}${naive[3] || ''}Z` : text);
+}
+
 function clockOf(iso) {
-  const d = new Date(iso || '');
-  if (Number.isNaN(d.getTime())) return '';
-  return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const ms = parseAt(iso);
+  if (Number.isNaN(ms)) return '';
+  return new Date(ms).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
 }
 
 function durationOf(fromIso, toIso) {
-  const a = new Date(fromIso || '').getTime();
-  const b = toIso ? new Date(toIso).getTime() : Date.now();
+  const a = parseAt(fromIso);
+  const b = toIso ? parseAt(toIso) : Date.now();
   if (Number.isNaN(a) || Number.isNaN(b) || b < a) return '';
   const secs = Math.round((b - a) / 1000);
   if (secs < 60) return `${secs}s`;
@@ -276,6 +294,56 @@ function operationFailure(error) {
   // Git and exec operations report free text no dictionary can cover. Marking it
   // as a quotation from the tool keeps it from reading like our own sentence.
   return { key: 'event.err_quoted', vars: { message: raw }, raw };
+}
+
+// An `exit 0` from a command the PEP narrowed to a copy-on-write mount is not
+// the success it looks like: the process wrote, succeeded, and the worktree
+// never saw a byte of it. The event says so with two fields — what the caller
+// ASKED for and whether the writes were dropped — and a row that carries them
+// has to say it louder than a tone change, because the reader's whole question
+// is "did this land?".
+//
+// Rows written by a server that had neither field carry neither, so their
+// absence means "nothing to claim", never "writes were discarded".
+function execVerdict(payload) {
+  const p = payload || {};
+  const exit = p.exit_code ?? p.exitCode;
+  const discarded = !!(p.writes_discarded ?? p.writesDiscarded);
+  const requested = String(p.requested_mount_access ?? p.requestedMountAccess ?? '');
+  const failed = exit != null && Number(exit) !== 0;
+  return {
+    execId: String(p.op_id ?? p.opId ?? ''),
+    discarded,
+    requested,
+    // A failure stays a failure; only a command that "succeeded" needs the
+    // amber warning to stop it from reading as done.
+    tone: exit == null ? 'run' : (failed ? 'err' : (discarded ? 'wait' : 'ok')),
+    noteKey: requested ? 'exec.discarded_note' : 'exec.discarded_note_plain',
+  };
+}
+
+// One `session_runs` row in the shape the activity widget hydrates from. The
+// widget is host-agnostic and takes epoch milliseconds, so the server's zoneless
+// UTC timestamps are resolved here, where their format is known. Token counters
+// are absent on a server that predates §17.3 accounting — an absent counter is
+// left at zero rather than guessed at.
+function runInfoOf(run) {
+  const started = parseAt(run.started_at ?? run.startedAt);
+  const finished = parseAt(run.finished_at ?? run.finishedAt);
+  const kind = String(run.kind || '');
+  return {
+    // The widget renders this as the row's name. A raw `agent_id` is a uuid on
+    // the orchestrator, which says nothing; the run chain names a run by its
+    // kind and its ordinal, and the two lists must not disagree.
+    agent: [kind ? t(`run_kind.${kind}`) : '', run.ordinal ? `#${run.ordinal}` : ''].filter(Boolean).join(' '),
+    status: run.status,
+    parentRunId: run.parent_run_id ?? run.parentRunId ?? '',
+    startedAt: Number.isNaN(started) ? 0 : started,
+    finishedAt: Number.isNaN(finished) ? 0 : finished,
+    promptTokens: run.prompt_tokens ?? run.promptTokens ?? 0,
+    completionTokens: run.completion_tokens ?? run.completionTokens ?? 0,
+    model: run.model || '',
+  };
 }
 
 function toolIcon(name) {
@@ -461,6 +529,26 @@ function buildStage() {
         <div class="cs-nowbar" data-sub-nowbar hidden></div>
       </div>
 
+      <div class="cs-spane" data-spane="exec">
+        <div class="cs-pane-head">
+          <span class="cs-dot idle" data-exec-dot></span>
+          <span>
+            <strong class="cs-pane-strong" data-exec-title>—</strong>
+            <span class="cs-stage-sub" data-exec-meta></span>
+          </span>
+          <span class="spacer"></span>
+          <tf-button size="sm" icon="refresh" data-action="exec-refresh">${escapeHtml(t('exec.refresh'))}</tf-button>
+          <tf-button size="sm" icon="chevron-left" data-stage-go="konsola">${escapeHtml(t('stage.main_agent'))}</tf-button>
+        </div>
+        <div class="cs-exec-warn" data-exec-warn hidden></div>
+        <div class="cs-term cs-exec-out" data-exec-out></div>
+        <div class="cs-pane-foot">
+          <span class="cs-stage-sub" data-exec-count></span>
+          <span class="spacer"></span>
+          <tf-button size="sm" icon="chevron-down" data-action="exec-more" hidden>${escapeHtml(t('exec.more'))}</tf-button>
+        </div>
+      </div>
+
       <div class="cs-spane" data-spane="runs">
         <div class="cs-pane-head">
           <span><strong class="cs-pane-strong">${escapeHtml(t('inspector.title'))}</strong>
@@ -514,7 +602,11 @@ function buildDock() {
       <div class="cs-dock-body">
         <div class="cs-dock-pane" id="cs-dock-pane-agenci" data-pane="agenci">
           <div class="cs-dock-title">${escapeHtml(t('dock.agents_active'))}</div>
-          <tf-agent-activity variant="chat" data-activity="dock"></tf-agent-activity>
+          <!-- Pinned to the run list: the dock is a navigator, and a session
+               whose runs have all finished still has to show what it ran and
+               what each run cost. The collapsed bar auto-hides, which is right
+               for a chat but leaves this column blank. -->
+          <tf-agent-activity variant="chat" level="tree" data-activity="dock"></tf-agent-activity>
           <div class="cs-empty" data-agents-empty>
             <p>${escapeHtml(t('dock.agents_empty'))}</p>
           </div>
@@ -569,17 +661,15 @@ function activityLabels() {
   };
 }
 
-// The dock wants the run LIST, not the collapsed bar. The component exposes no
-// level API, so we click its own expand control once it has something to show.
-function ensureDockExpanded() {
+// The widget renders its own terse "no runs" line, so exactly one of the two
+// empty states may be on screen: the dock's sentence explains what the list
+// would hold, and it replaces the widget until there is something to list.
+function paintDockEmpty() {
   const widget = state.widgets.dock;
-  if (!widget) return;
-  const root = widget.querySelector('.tf-agent-activity');
   const empty = host.querySelector('[data-agents-empty]');
-  const active = widget.hasActivity() || widget.hasWaiting();
-  if (empty) empty.hidden = active;
-  if (!root || root.hidden) return;
-  if (root.dataset.level === '0') widget.querySelector('[data-action="expand"]')?.click();
+  const listed = (widget?.runCount || 0) > 0;
+  if (widget) widget.hidden = !listed;
+  if (empty) empty.hidden = listed;
 }
 
 // ---------------------------------------------------------------------------
@@ -656,6 +746,9 @@ function setStage(stage) {
   if (stage === 'konsola') shell.dataset.view = 'konsola';
   else if (stage === 'plik') shell.dataset.view = 'pliki';
   else if (stage === 'subagent' || stage === 'runs') shell.dataset.view = 'agenci';
+  // A command transcript belongs to the terminal category — that is where its
+  // tab lives, and the phone bar has no cell of its own to light up.
+  else if (stage === 'exec') shell.dataset.view = 'terminal';
   else shell.dataset.view = stage;
   paintNav();
 }
@@ -823,6 +916,7 @@ function applyTabToPane(tab) {
   const handle = state.panes[tab.stage];
   if (handle?.update && tab.data) handle.update({ ...tab.data, workspaceId: ctx.workspaceId, sessionId: ctx.sessionId });
   if (tab.stage === 'subagent') openSubagent(tab.data?.runId || tab.id);
+  if (tab.stage === 'exec') openExec(tab.data?.execId || '');
 }
 
 function closeTab(category, id) {
@@ -945,6 +1039,14 @@ function onHostClick(e) {
     return;
   }
 
+  // The transcript is opened from the row's own affordance, so the rest of the
+  // row keeps expanding its detail as every other tool row does.
+  const execOpen = e.target.closest('.t-go');
+  if (execOpen) {
+    const execId = execOpen.closest('[data-exec]')?.dataset.exec;
+    if (execId) { openExecTab(execId); return; }
+  }
+
   const toolRow = e.target.closest('.ev-tool[data-detail]');
   if (toolRow) { toggleToolDetail(toolRow); return; }
 
@@ -965,6 +1067,8 @@ async function runAction(el) {
     case 'send': await sendComposer(); break;
     case 'cancel-session': await cancelSession(''); break;
     case 'refresh-inspector': await Promise.all([loadRuns(), loadOperations(), loadGrants()]); break;
+    case 'exec-refresh': await reloadExec(); break;
+    case 'exec-more': await loadExecPage(); break;
     case 'answer-scope': await decideApproval(el.dataset.scope); break;
     case 'answer-text': await answerQuestion(el.dataset.scope); break;
     case 'answer-confirm': await sendPaneRequest(); break;
@@ -1145,7 +1249,7 @@ function ingestEvents(list) {
     reactToEvent(ev, refresh);
   }
   if (refresh.size) void refreshSide(refresh);
-  ensureDockExpanded();
+  paintDockEmpty();
   updateCounters();
 }
 
@@ -1267,13 +1371,31 @@ function buildEventNode(ev, scope) {
         name: t('event.patch_decided'), arg: String(ev.p.decision || ''),
         meta: [clockOf(ev.at)],
       });
-    case 'exec':
-      return toolNode({
-        state: ev.p.exit_code === 0 ? 'ok' : (ev.p.exit_code == null ? 'run' : 'err'),
+    case 'exec': {
+      const verdict = execVerdict(ev.p);
+      const el = toolNode({
+        state: verdict.tone,
         icon: 'code', name: 'exec', arg: (ev.p.argv || []).join(' '),
+        pill: verdict.discarded ? t('exec.discarded_pill') : '',
+        pillTone: verdict.discarded ? 'warn' : '',
+        warn: verdict.discarded ? t(verdict.noteKey, { requested: verdict.requested }) : '',
         meta: [ev.p.exit_code == null ? '' : `exit ${ev.p.exit_code}`, clockOf(ev.at)],
         detail: ev.p.cwd ? `cwd: ${ev.p.cwd}` : '',
+        go: verdict.execId ? t('exec.open') : '',
       });
+      if (verdict.execId) {
+        el.dataset.exec = verdict.execId;
+        state.execs.set(verdict.execId, {
+          execId: verdict.execId,
+          argv: (ev.p.argv || []).map(String),
+          cwd: String(ev.p.cwd || ''),
+          exitCode: ev.p.exit_code ?? ev.p.exitCode ?? null,
+          at: ev.at,
+          verdict,
+        });
+      }
+      return el;
+    }
     case 'git_op':
       return toolNode({
         state: 'ok', icon: 'branch', name: `git ${String(ev.p.operation || '').toLowerCase()}`,
@@ -1402,23 +1524,37 @@ function messageNode(ev) {
 
 // `state` is the tone of the row, `pill` the outcome word an operation result
 // carries next to its name, `argTitle` the untruncated value behind an argument
-// the row had to shorten. Every argument passes `shortenHashes` here — one choke
-// point is what keeps a 40-character digest from reaching the stream through a
-// branch nobody remembered to guard.
-function toolNode({ state: tone, icon, name, pill, arg, argTitle, meta, detail }) {
+// the row had to shorten, `warn` a full-width sentence the row must not let a
+// reader miss, and `go` a trailing affordance that opens the row's own scene.
+// Every argument passes `shortenHashes` here — one choke point is what keeps a
+// 40-character digest from reaching the stream through a branch nobody
+// remembered to guard.
+//
+// The warning is rendered INSIDE the row rather than as a sibling, because the
+// row's expandable detail is its next sibling: a second node between them would
+// make every second click stack another copy of the detail.
+function toolNode({ state: tone, icon, name, pill, pillTone, arg, argTitle, meta, detail, warn, go }) {
   const full = String(arg || '');
   const text = shortenHashes(full);
   const title = argTitle || (text === full ? '' : full);
   const metaHtml = (meta || []).filter(Boolean)
     .map((entry) => `<span>${escapeHtml(entry)}</span>`).join('');
-  const pillHtml = pill ? `<span class="t-state">${escapeHtml(pill)}</span>` : '';
+  const pillHtml = pill
+    ? `<span class="t-state${pillTone ? ` ${escapeAttr(pillTone)}` : ''}">${escapeHtml(pill)}</span>`
+    : '';
+  const goHtml = go ? `<span class="t-go">${escapeHtml(go)}${sprite('chevron-right')}</span>` : '';
+  const warnHtml = warn
+    ? `<span class="t-warn">${sprite('alert')}${escapeHtml(warn)}</span>`
+    : '';
   const el = node(`
-    <div class="ev ev-tool ${escapeAttr(tone || 'ok')}"${detail ? ' data-detail="1"' : ''}>
+    <div class="ev ev-tool ${escapeAttr(tone || 'ok')}${warn ? ' has-warn' : ''}"${detail ? ' data-detail="1"' : ''}>
       <span class="t-ico">${sprite(icon || 'bolt')}</span>
       <span class="t-name">${escapeHtml(name || '')}</span>
       ${pillHtml}
       <span class="t-arg"${title ? ` title="${escapeAttr(title)}"` : ''}>${escapeHtml(text)}</span>
       <span class="t-meta">${metaHtml}</span>
+      ${goHtml}
+      ${warnHtml}
     </div>
   `);
   if (detail) el.dataset.detailText = detail;
@@ -1588,6 +1724,158 @@ function openSubagent(runId) {
     if (child) stream.appendChild(child);
   }
   stream.scrollTop = stream.scrollHeight;
+}
+
+// ---------------------------------------------------------------------------
+// Exec pane — what a finished command printed
+//
+// `ExecStartResponse` says only that the command was accepted; its stdout and
+// stderr are the artifact the operation was closed with, and until
+// `codeStudioExecOutputRequest` existed no client could read them at all. The
+// pane is a reader over that artifact: a cursor of line numbers, one page at a
+// time, never re-rendering what is already on screen.
+// ---------------------------------------------------------------------------
+
+function openExecTab(execId) {
+  const id = String(execId || '');
+  if (!id) return;
+  const info = state.execs.get(id) || {};
+  const command = (info.argv || []).join(' ');
+  openTab('terminal', {
+    id: `exec:${id}`,
+    stage: 'exec',
+    icon: 'code',
+    label: (info.argv || [])[0] || shortId(id),
+    title: command || shortId(id),
+    sub: info.cwd || '',
+    data: { execId: id },
+  });
+}
+
+function openExec(execId) {
+  const id = String(execId || '');
+  if (!id) return;
+  if (!state.exec || state.exec.execId !== id) {
+    state.exec = { execId: id, cursor: 0, count: 0, hasMore: false, status: '', loading: false, error: '' };
+    const out = host.querySelector('[data-exec-out]');
+    if (out) out.innerHTML = '';
+  }
+  paintExecHead();
+  void loadExecPage();
+}
+
+async function reloadExec() {
+  const view = state.exec;
+  if (!view) return;
+  const execId = view.execId;
+  state.exec = null;
+  openExec(execId);
+}
+
+function paintExecHead() {
+  const view = state.exec;
+  if (!view) return;
+  const info = state.execs.get(view.execId) || {};
+  const verdict = info.verdict || {};
+  const title = host.querySelector('[data-exec-title]');
+  const meta = host.querySelector('[data-exec-meta]');
+  const dot = host.querySelector('[data-exec-dot]');
+  const warn = host.querySelector('[data-exec-warn]');
+  if (title) title.textContent = (info.argv || []).join(' ') || shortId(view.execId);
+  if (meta) {
+    meta.textContent = [
+      info.exitCode == null ? '' : `exit ${info.exitCode}`,
+      info.cwd || '',
+      clockOf(info.at),
+    ].filter(Boolean).join(' · ');
+  }
+  if (dot) {
+    dot.className = `cs-dot ${info.exitCode == null ? 'run' : (Number(info.exitCode) === 0 ? 'ok' : 'err')}`;
+  }
+  if (warn) {
+    warn.hidden = !verdict.discarded;
+    warn.innerHTML = verdict.discarded
+      ? `${sprite('alert')}<span><strong>${escapeHtml(t('exec.discarded_pill'))}</strong> ${escapeHtml(t(verdict.noteKey, { requested: verdict.requested }))}</span>`
+      : '';
+  }
+}
+
+// The server answers with the cursor it reached. Trusting it blindly would
+// replay a page whenever it went backwards, and trusting only the line count
+// would drift the moment a page is clamped — so the cursor only ever advances,
+// and "more" is refused when a page moved nothing.
+function mergeExecPage(view, resp) {
+  const lines = Array.isArray(resp?.lines) ? resp.lines.map(String) : [];
+  const answered = Number(resp?.next_seq ?? resp?.nextSeq ?? NaN);
+  const cursor = Number.isFinite(answered) && answered > view.cursor
+    ? answered
+    : view.cursor + lines.length;
+  return {
+    lines,
+    cursor,
+    count: view.count + lines.length,
+    hasMore: !!(resp?.has_more ?? resp?.hasMore) && cursor > view.cursor,
+    status: String(resp?.status ?? view.status ?? ''),
+  };
+}
+
+async function loadExecPage() {
+  const view = state.exec;
+  if (!view || view.loading) return;
+  view.loading = true;
+  paintExecFoot();
+  try {
+    const resp = await ApiBinary.one('codeStudioExecOutputRequest', {
+      workspaceId: ctx.workspaceId, sessionId: ctx.sessionId,
+      execId: view.execId, afterSeq: view.cursor, limit: EXEC_PAGE,
+    });
+    const page = mergeExecPage(view, resp);
+    appendExecLines(page.lines);
+    view.cursor = page.cursor;
+    view.count = page.count;
+    view.hasMore = page.hasMore;
+    view.status = page.status;
+    view.error = '';
+  } catch (err) {
+    // A server that predates the request kind answers with a decode failure.
+    // The pane says so where the reader is looking instead of only in a console
+    // nobody has open.
+    view.error = String(err?.message ?? err);
+  } finally {
+    view.loading = false;
+    paintExecFoot();
+  }
+}
+
+function appendExecLines(lines) {
+  const out = host.querySelector('[data-exec-out]');
+  if (!out || !lines.length) return;
+  const stick = atBottom(out);
+  const frag = document.createDocumentFragment();
+  for (const line of lines) {
+    const row = document.createElement('div');
+    row.className = 'eo-line';
+    row.textContent = line;
+    frag.appendChild(row);
+  }
+  out.appendChild(frag);
+  if (stick) out.scrollTop = out.scrollHeight;
+}
+
+function paintExecFoot() {
+  const view = state.exec;
+  const count = host.querySelector('[data-exec-count]');
+  const more = host.querySelector('[data-action="exec-more"]');
+  const out = host.querySelector('[data-exec-out]');
+  if (!view || !count) return;
+  if (view.error) count.textContent = t('exec.unavailable', { reason: view.error });
+  else if (view.loading && !view.count) count.textContent = t('exec.loading');
+  else if (view.count) count.textContent = t('exec.lines', { count: view.count });
+  else if (view.status && view.status !== 'completed' && view.status !== 'failed') {
+    count.textContent = t('exec.still_running');
+  } else count.textContent = t('exec.no_output');
+  if (more) more.hidden = !view.hasMore || !!view.error;
+  if (out) out.classList.toggle('is-empty', !view.count);
 }
 
 // ---------------------------------------------------------------------------
@@ -1949,12 +2237,18 @@ async function loadRuns() {
     state.runs = resp.runs || [];
     for (const run of state.runs) {
       if (run.kind === 'subagent' || run.kind === 'cli') state.subagentRuns.add(run.run_id);
+      // The activity widget lived on live events alone, so a page opened after
+      // the turn had ended showed a run dated from the moment it was replayed
+      // and no consumption at all. `session_runs` is the record: its two
+      // timestamps and its token counters are what the row must state.
+      const info = runInfoOf(run);
       for (const widget of [state.widgets.dock, state.widgets.now]) {
-        if (widget) widget.setRunStatus(run.run_id, run.status);
+        if (widget) widget.setRunInfo(run.run_id, info);
       }
     }
     renderRunChain();
     paintSessionHead();
+    paintDockEmpty();
     updateCounters();
   } catch (err) {
     console.warn('[code-studio] runs load failed:', err?.message ?? err);

@@ -23,11 +23,28 @@
 // release. Mapping "something we do not recognize" onto the closest capability
 // would be guessing with the user's filesystem; the request is refused with a
 // named reason instead, and the CLI reports it as a refusal rather than hanging.
+// The same rule covers the ENGINE: a build that has no vocabulary for an engine
+// decides nothing on its behalf.
 //
 // **A path the request does not pin down is outside the worktree.** The target
 // is resolved from the request's own parameters, and anything unresolvable is
 // treated as out of bounds — the PEP's boundary check only means something if
-// the caller cannot shrug and pass `inside_worktree: true`.
+// the caller cannot shrug and pass `inside_worktree: true`. `ApprovalDialect`
+// says what "pinned down" means for each CLI, because the two ask in genuinely
+// different terms and reading one with the other's rules is how a boundary check
+// becomes decorative.
+//
+// **What the channel does NOT carry.** A CLI raises a permission request only
+// for what its OWN rules escalate to a question. `claude 2.1.233` resolves its
+// read-only tools before the channel is consulted, so those calls never reach
+// `authorize` — the engine is gated on everything it would have asked a human
+// about, which is not the same as everything it does. Two things keep that from
+// being a hole rather than a bound: the session runs with an empty, private
+// config directory, so no allow rule of anyone's widens that set behind our
+// back, and §9.5 gives reads the same automatic allowance our own harness has,
+// so the calls we never see are the ones the PEP would have allowed anyway.
+// Anything with an effect — a write, a command — is escalated by the vendor and
+// decided here.
 //
 // **No database writes.** As with the egress gateway and the adapter, every
 // decision produces `EventPayload`s the caller appends to the session timeline.
@@ -282,6 +299,36 @@ pub struct ApprovalRequest {
     pub request_id: u64,
     pub method: String,
     pub params: Value,
+}
+
+/// Whose approval vocabulary a request is written in.
+///
+/// The two CLIs do not merely spell things differently, they say different
+/// things. Codex asks `execCommandApproval` and names the `cwd` it wants to run
+/// in. Claude Code asks `Bash` and names NO directory at all, because that CLI
+/// runs every tool in the working directory its process was started in — which
+/// the bridge sets to the session worktree. Reading the second with the first's
+/// rules refuses every command Claude Code will ever make; reading the first
+/// with the second's authorizes a Codex command that pinned down nothing.
+///
+/// This is a mapping, not a second policy: whichever dialect a request is in, it
+/// ends up at the same `pep::authorize` with the same rule order.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApprovalDialect {
+    Codex,
+    ClaudeCode,
+}
+
+impl ApprovalDialect {
+    /// An engine this build has no vocabulary for gets no mapping either — its
+    /// requests are refused by name rather than guessed at.
+    pub fn for_engine(engine_id: &str) -> Option<Self> {
+        match engine_id {
+            "codex" => Some(ApprovalDialect::Codex),
+            "claude-code" => Some(ApprovalDialect::ClaudeCode),
+            _ => None,
+        }
+    }
 }
 
 /// Talks to one coding-agent bridge through the validated Core proxy. It holds
@@ -596,34 +643,30 @@ pub async fn resolve_approval(
     request: &ApprovalRequest,
 ) -> ApprovalOutcome {
     let approval_id = format!("{}:{}", ctx.run_id, request.request_id);
-    let Some(capability) = capability_for(&request.method) else {
+    let Some(dialect) = ApprovalDialect::for_engine(ctx.engine_id) else {
+        return refused_by_policy(
+            approval_id,
+            format!(
+                "engine '{}' has no approval vocabulary in this build, so its requests cannot \
+                 be mapped onto a capability",
+                ctx.engine_id
+            ),
+        );
+    };
+    let Some(capability) = capability_for(dialect, &request.method) else {
         // Default deny. A vendor release that adds an approval kind must not be
         // able to widen what a run may do just by naming it something new.
-        let reason = format!(
-            "approval kind '{}' is not one this build maps onto a capability",
-            request.method
+        return refused_by_policy(
+            approval_id,
+            format!(
+                "approval kind '{}' is not one this build maps onto a capability",
+                request.method
+            ),
         );
-        return ApprovalOutcome {
-            decision: "denied",
-            persist_grant: false,
-            capability: None,
-            events: vec![
-                EventPayload::ApprovalRequested {
-                    approval_id: approval_id.clone(),
-                    capability: "unknown".to_string(),
-                    summary: reason.clone(),
-                },
-                EventPayload::ApprovalDecided {
-                    approval_id,
-                    decision: "denied".to_string(),
-                    decided_by: "policy".to_string(),
-                },
-            ],
-        };
     };
 
     let summary = summarize(&request.method, &request.params);
-    let target = target_for(capability, &request.params, ctx.worktree);
+    let target = target_for(dialect, capability, &request.params, ctx.worktree);
     let mut events = vec![EventPayload::ApprovalRequested {
         approval_id: approval_id.clone(),
         capability: capability.slug().to_string(),
@@ -685,40 +728,113 @@ pub async fn resolve_approval(
     }
 }
 
+/// A refusal this module decided on its own, with the two timeline entries that
+/// make it readable: what was asked, and what was answered.
+fn refused_by_policy(approval_id: String, reason: String) -> ApprovalOutcome {
+    ApprovalOutcome {
+        decision: "denied",
+        persist_grant: false,
+        capability: None,
+        events: vec![
+            EventPayload::ApprovalRequested {
+                approval_id: approval_id.clone(),
+                capability: "unknown".to_string(),
+                summary: reason,
+            },
+            EventPayload::ApprovalDecided {
+                approval_id,
+                decision: "denied".to_string(),
+                decided_by: "policy".to_string(),
+            },
+        ],
+    }
+}
+
 /// Which capability a vendor approval kind corresponds to. Unknown kinds return
 /// `None` and are denied by the caller.
-pub fn capability_for(method: &str) -> Option<Capability> {
+///
+/// Claude Code asks by TOOL NAME, so the right-hand side is its tool set. Two
+/// omissions are deliberate rather than forgotten: `WebFetch` and `WebSearch`
+/// would be `net_egress`, but nothing here can tell the PEP which host they
+/// reach, and a `net_egress` decision made without a host is not a decision —
+/// they are refused. `Task` spawns a vendor subagent whose own tool calls come
+/// back through this same channel, so refusing the spawn is the only way to keep
+/// the accounting honest.
+pub fn capability_for(dialect: ApprovalDialect, method: &str) -> Option<Capability> {
     let normalized = method
         .rsplit('/')
         .next()
         .unwrap_or(method)
         .to_ascii_lowercase()
         .replace(['_', '-'], "");
-    match normalized.as_str() {
-        "applypatchapproval" | "applypatch" | "patchapproval" => Some(Capability::FsWrite),
-        "execcommandapproval" | "execcommand" | "commandapproval" => Some(Capability::Exec),
-        _ => None,
+    match dialect {
+        ApprovalDialect::Codex => match normalized.as_str() {
+            "applypatchapproval" | "applypatch" | "patchapproval" => Some(Capability::FsWrite),
+            "execcommandapproval" | "execcommand" | "commandapproval" => Some(Capability::Exec),
+            _ => None,
+        },
+        ApprovalDialect::ClaudeCode => match normalized.as_str() {
+            "read" | "glob" | "grep" => Some(Capability::FsRead),
+            "write" | "edit" | "notebookedit" => Some(Capability::FsWrite),
+            "bash" | "bashoutput" | "killshell" => Some(Capability::Exec),
+            _ => None,
+        },
     }
 }
 
 /// The boundary check. Every path the request names must sit inside the
-/// worktree; a request that names none, or names one that cannot be resolved, is
-/// outside — the safe direction when the alternative is authorizing a write the
-/// PEP never actually located.
-fn target_for(capability: Capability, params: &Value, worktree: &Path) -> Target {
-    if capability == Capability::Exec {
-        let cwd = params.get("cwd").and_then(Value::as_str);
-        return Target::Path {
-            inside_worktree: cwd.is_some_and(|cwd| is_inside(worktree, Path::new(cwd))),
-        };
-    }
-    let paths = patch_paths(params);
-    Target::Path {
-        inside_worktree: !paths.is_empty()
-            && paths
-                .iter()
-                .all(|path| is_inside(worktree, Path::new(path))),
-    }
+/// worktree; what happens when it names NONE is the one thing the two dialects
+/// answer differently, and it is a fact about the CLIs, not a preference:
+///
+///   * Codex passes the working directory as a request PARAMETER, so a request
+///     without one pinned nothing down and is out of bounds — the safe direction
+///     when the alternative is authorizing a write nobody located.
+///   * Claude Code never passes one, because its tools resolve against the
+///     PROCESS working directory, which the bridge set to the session worktree
+///     and which no request can change. A `Bash` call that names no path acts on
+///     the worktree itself, so refusing it would refuse the engine outright.
+///
+/// Neither reading lets a request widen its own boundary: the paths a request
+/// DOES name are always checked, in both dialects.
+fn target_for(
+    dialect: ApprovalDialect,
+    capability: Capability,
+    params: &Value,
+    worktree: &Path,
+) -> Target {
+    let (named, empty_means_inside) = match dialect {
+        ApprovalDialect::Codex if capability == Capability::Exec => (
+            params
+                .get("cwd")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .into_iter()
+                .collect::<Vec<_>>(),
+            false,
+        ),
+        ApprovalDialect::Codex => (patch_paths(params), false),
+        ApprovalDialect::ClaudeCode => (claude_paths(params), true),
+    };
+    let inside_worktree = if named.is_empty() {
+        empty_means_inside
+    } else {
+        named
+            .iter()
+            .all(|path| is_inside(worktree, Path::new(path)))
+    };
+    Target::Path { inside_worktree }
+}
+
+/// Paths one Claude Code tool input names. Its tool set puts them under exactly
+/// these keys — `file_path` for Read/Write/Edit, `notebook_path` for
+/// NotebookEdit, `path` for Glob/Grep — and a tool that names none acts on the
+/// process working directory.
+fn claude_paths(params: &Value) -> Vec<String> {
+    ["file_path", "notebook_path", "path"]
+        .into_iter()
+        .filter_map(|field| params.get(field).and_then(Value::as_str))
+        .map(str::to_string)
+        .collect()
 }
 
 /// Paths named by an apply-patch request, in either shape the app-server uses:
@@ -777,7 +893,15 @@ fn is_inside(worktree: &Path, candidate: &Path) -> bool {
 /// truncated: a patch body belongs in an artifact, not in a prompt.
 fn summarize(method: &str, params: &Value) -> String {
     let mut fields: BTreeMap<&str, String> = BTreeMap::new();
-    for field in ["command", "cwd", "reason", "path", "file_path"] {
+    for field in [
+        "command",
+        "cwd",
+        "reason",
+        "path",
+        "file_path",
+        "notebook_path",
+        "description",
+    ] {
         if let Some(value) = params.get(field) {
             let text = value
                 .as_str()
@@ -920,32 +1044,64 @@ mod tests {
 
     #[test]
     fn every_vendor_approval_kind_maps_to_a_capability_or_is_refused() {
+        use ApprovalDialect::{ClaudeCode, Codex};
         assert_eq!(
-            capability_for("applyPatchApproval"),
+            capability_for(Codex, "applyPatchApproval"),
             Some(Capability::FsWrite)
         );
         assert_eq!(
-            capability_for("codex/execCommandApproval"),
+            capability_for(Codex, "codex/execCommandApproval"),
             Some(Capability::Exec)
         );
         assert_eq!(
-            capability_for("exec_command_approval"),
+            capability_for(Codex, "exec_command_approval"),
             Some(Capability::Exec)
         );
         assert_eq!(
-            capability_for("networkAccessApproval"),
+            capability_for(Codex, "networkAccessApproval"),
             None,
             "a kind this build does not understand must not be mapped onto the nearest capability"
         );
+
+        // Claude Code asks by tool name.
+        assert_eq!(capability_for(ClaudeCode, "Bash"), Some(Capability::Exec));
+        assert_eq!(
+            capability_for(ClaudeCode, "Write"),
+            Some(Capability::FsWrite)
+        );
+        assert_eq!(
+            capability_for(ClaudeCode, "NotebookEdit"),
+            Some(Capability::FsWrite)
+        );
+        assert_eq!(capability_for(ClaudeCode, "Read"), Some(Capability::FsRead));
+        assert_eq!(capability_for(ClaudeCode, "Grep"), Some(Capability::FsRead));
+        for unmapped in ["WebFetch", "WebSearch", "Task", "mcp__server__tool", ""] {
+            assert_eq!(
+                capability_for(ClaudeCode, unmapped),
+                None,
+                "'{unmapped}' has no capability this build can bound, so it must be refused"
+            );
+        }
+
+        // The vocabularies are not shared: one CLI's word means nothing in the
+        // other's dialect, and must not be answered as if it did.
+        assert_eq!(capability_for(Codex, "Bash"), None);
+        assert_eq!(capability_for(ClaudeCode, "applyPatchApproval"), None);
+
+        // An engine nobody wrote a vocabulary for has no dialect at all.
+        assert_eq!(ApprovalDialect::for_engine("codex"), Some(Codex));
+        assert_eq!(ApprovalDialect::for_engine("claude-code"), Some(ClaudeCode));
+        assert_eq!(ApprovalDialect::for_engine("gemini-cli"), None);
     }
 
     #[test]
     fn a_request_that_cannot_be_located_is_out_of_bounds() {
+        use ApprovalDialect::Codex;
         let worktree = Path::new("/w/session-1");
         // Exec inside the worktree.
         let inside = serde_json::json!({"cwd": "/w/session-1/crate", "command": ["cargo","test"]});
         assert!(matches!(
-            target_for(Capability::Exec, &inside, worktree),
+            target_for(Codex, Capability::Exec, &inside, worktree),
             Target::Path {
                 inside_worktree: true
             }
@@ -953,6 +1109,7 @@ mod tests {
         // Exec with no cwd at all: unresolvable, therefore outside.
         assert!(matches!(
             target_for(
+                Codex,
                 Capability::Exec,
                 &serde_json::json!({"command": ["ls"]}),
                 worktree
@@ -964,7 +1121,7 @@ mod tests {
         // A patch that escapes the worktree lexically.
         let escaping = serde_json::json!({"changes": {"/w/session-1/../../etc/hosts": {}}});
         assert!(matches!(
-            target_for(Capability::FsWrite, &escaping, worktree),
+            target_for(Codex, Capability::FsWrite, &escaping, worktree),
             Target::Path {
                 inside_worktree: false
             }
@@ -972,18 +1129,67 @@ mod tests {
         // A patch listing relative paths resolves against the worktree.
         let relative = serde_json::json!({"changes": {"src/main.rs": {}}});
         assert!(matches!(
-            target_for(Capability::FsWrite, &relative, worktree),
+            target_for(Codex, Capability::FsWrite, &relative, worktree),
             Target::Path {
                 inside_worktree: true
             }
         ));
         // A patch that names nothing at all.
         assert!(matches!(
-            target_for(Capability::FsWrite, &serde_json::json!({}), worktree),
+            target_for(Codex, Capability::FsWrite, &serde_json::json!({}), worktree),
             Target::Path {
                 inside_worktree: false
             }
         ));
+    }
+
+    /// The Claude Code dialect names paths in the tool input and nothing else.
+    /// A tool that names none runs against the process working directory, which
+    /// IS the worktree — but a tool that names one is still bounded by it, so
+    /// the difference buys the engine nothing outside its own tree.
+    #[test]
+    fn a_claude_tool_is_bounded_by_the_paths_it_names() {
+        use ApprovalDialect::ClaudeCode;
+        let worktree = Path::new("/w/session-1");
+        let inside = |params: Value, capability: Capability| {
+            matches!(
+                target_for(ClaudeCode, capability, &params, worktree),
+                Target::Path {
+                    inside_worktree: true
+                }
+            )
+        };
+
+        // Bash names no directory in this dialect; the worktree is where it runs.
+        assert!(inside(
+            serde_json::json!({"command": "cargo test"}),
+            Capability::Exec
+        ));
+        // A Grep with no path searches the worktree.
+        assert!(inside(
+            serde_json::json!({"pattern": "todo"}),
+            Capability::FsRead
+        ));
+        // A named path is checked, absolute or relative.
+        assert!(inside(
+            serde_json::json!({"file_path": "/w/session-1/src/lib.rs"}),
+            Capability::FsWrite
+        ));
+        assert!(inside(
+            serde_json::json!({"file_path": "src/lib.rs"}),
+            Capability::FsWrite
+        ));
+        for escaping in [
+            serde_json::json!({"file_path": "/etc/passwd"}),
+            serde_json::json!({"file_path": "/w/session-1/../../etc/shadow"}),
+            serde_json::json!({"notebook_path": "/w/other/run.ipynb"}),
+            serde_json::json!({"path": "/w/session-2"}),
+        ] {
+            assert!(
+                !inside(escaping.clone(), Capability::FsWrite),
+                "{escaping} escapes the worktree and must be out of bounds"
+            );
+        }
     }
 
     #[tokio::test]
@@ -1385,5 +1591,105 @@ mod tests {
             "a write permission must not answer for a command"
         );
         assert_eq!(exec.capability, Some(Capability::Exec));
+    }
+
+    /// The same rule in the Claude Code dialect, where the two questions arrive
+    /// as `Write` and `Bash` rather than as approval kinds. It is the one that
+    /// matters most here: this engine asks about far more tools than Codex does,
+    /// so one standing grant answering for all of them would be one grant
+    /// standing in for the whole policy.
+    #[tokio::test]
+    async fn a_standing_claude_write_grant_does_not_authorize_a_command() {
+        let registry = InteractionRegistry::new();
+        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let per_capability = |capability: Capability| pep::SessionCtx {
+            allowlisted: capability == Capability::FsWrite,
+            ..ctx()
+        };
+        let context = ApprovalContext {
+            session: &per_capability,
+            session_id: "session-1",
+            run_id: "run-1",
+            parent_run_id: None,
+            engine_id: "claude-code",
+            worktree: Path::new("/w/session-1"),
+            registry: &registry,
+            manager: None,
+            progress: &progress,
+            progress_scope: "code-studio",
+            // Nobody answers, so an ASKED question ends 'denied' — which is how
+            // the test tells "allowed by the grant" from "had to ask".
+            timeout: Duration::from_millis(60),
+        };
+
+        let write = resolve_approval(
+            &context,
+            &ApprovalRequest {
+                request_id: 1,
+                method: "Write".into(),
+                params: serde_json::json!({"file_path": "/w/session-1/src/lib.rs"}),
+            },
+        )
+        .await;
+        assert_eq!(write.decision, "approved");
+        assert_eq!(write.capability, Some(Capability::FsWrite));
+
+        let bash = resolve_approval(
+            &context,
+            &ApprovalRequest {
+                request_id: 2,
+                method: "Bash".into(),
+                params: serde_json::json!({"command": "cargo test"}),
+            },
+        )
+        .await;
+        assert_eq!(
+            bash.decision, "denied",
+            "a write permission must not answer for a command"
+        );
+        assert_eq!(bash.capability, Some(Capability::Exec));
+    }
+
+    /// A request from an engine this build has no vocabulary for is refused
+    /// before any capability is guessed at, and the refusal says why.
+    #[tokio::test]
+    async fn an_engine_without_a_dialect_decides_nothing() {
+        let registry = InteractionRegistry::new();
+        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let session = pep::SessionCtx {
+            allowlisted: true,
+            ..ctx()
+        };
+        let context = ApprovalContext {
+            session: &|_| session.clone(),
+            session_id: "session-1",
+            run_id: "run-1",
+            parent_run_id: None,
+            engine_id: "gemini-cli",
+            worktree: Path::new("/w/session-1"),
+            registry: &registry,
+            manager: None,
+            progress: &progress,
+            progress_scope: "code-studio",
+            timeout: Duration::from_secs(30),
+        };
+        let outcome = resolve_approval(
+            &context,
+            &ApprovalRequest {
+                request_id: 3,
+                method: "Write".into(),
+                params: serde_json::json!({"file_path": "/w/session-1/src/lib.rs"}),
+            },
+        )
+        .await;
+        assert_eq!(outcome.decision, "denied");
+        assert!(outcome.capability.is_none());
+        assert!(
+            outcome.events.iter().any(|event| matches!(
+                event,
+                EventPayload::ApprovalRequested { summary, .. } if summary.contains("gemini-cli")
+            )),
+            "the timeline must name the engine nobody wrote a vocabulary for"
+        );
     }
 }

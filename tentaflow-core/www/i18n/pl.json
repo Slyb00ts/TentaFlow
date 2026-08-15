@@ -6511,8 +6511,8 @@
       "push_failed": "Wypchnięcie nie powiodło się."
     },
     "dock": {
-      "agents_active": "Aktywne w tej sesji",
-      "agents_empty": "Żaden subagent nie został jeszcze uruchomiony.",
+      "agents_active": "Przebiegi tej sesji",
+      "agents_empty": "W tej sesji nie uruchomiono jeszcze żadnego przebiegu.",
       "konsola": "Konsola",
       "agenci": "Agenci",
       "pliki": "Pliki",
@@ -6537,7 +6537,7 @@
       "no_steps": "Brak kroków.",
       "cancel": "Przerwij",
       "elapsed": "czas",
-      "tokens": "tokeny",
+      "tokens": "tok",
       "asks": "pytania",
       "back": "Wróć",
       "step_tool": "narzędzie",
@@ -6585,6 +6585,19 @@
       "err_io": "błąd wejścia/wyjścia: {reason}",
       "err_unknown": "operacja nie powiodła się, serwer nie podał powodu",
       "err_quoted": "narzędzie zgłosiło: „{message}”"
+    },
+    "exec": {
+      "discarded_pill": "zapisy odrzucone",
+      "discarded_note": "Zapisy tej komendy NIE trafiły do drzewa roboczego: poproszono o montowanie „{requested}”, a sandbox uruchomił ją na kopii (cow).",
+      "discarded_note_plain": "Zapisy tej komendy NIE trafiły do drzewa roboczego — sandbox uruchomił ją na kopii (cow).",
+      "open": "Wyjście",
+      "refresh": "Odśwież",
+      "more": "Wczytaj więcej",
+      "lines": "{count} {count|linia|linie|linii} wyjścia",
+      "no_output": "Komenda nic nie wypisała.",
+      "still_running": "Komenda jeszcze działa — wyjście będzie dostępne po jej zakończeniu.",
+      "loading": "Wczytywanie wyjścia…",
+      "unavailable": "Serwer nie udostępnił wyjścia tej komendy: {reason}"
     },
     "ask": {
       "head": "Agent pyta",

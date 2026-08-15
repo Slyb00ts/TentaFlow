@@ -16,6 +16,9 @@
      across the module, the colours stay the dashboard's own tokens. */
   --cs-dock: 372px;
   --cs-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  /* The prose face, needed wherever a sentence has to be readable inside a
+     block the module already switched to mono. */
+  --cs-sans: 'Manrope', -apple-system, system-ui, sans-serif;
   --cs-run: var(--accent-1);
   --cs-ask: var(--warning);
   --cs-idle: var(--text-3);
@@ -371,7 +374,38 @@
   background: rgba(239, 68, 68, .16);
   color: var(--cs-err);
 }
+/* An amber pill for a row that succeeded and still has to be doubted — the red
+   default is the outcome word of a failure. */
+.ev-tool .t-state.warn { background: rgba(245, 158, 11, .18); color: var(--cs-ask); }
 .ev-tool .t-arg { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* The way into the row's own scene, in the shape `.ev-spawn`/`.ev-askmark` use. */
+.ev-tool .t-go {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  color: var(--accent-2);
+  font-size: 10.5px;
+  white-space: nowrap;
+}
+.ev-tool .t-go .icon { width: 11px; height: 11px; }
+/* "exit 0" and "the worktree changed" are two different claims, so the second
+   one gets a full-width sentence of its own inside the row — an annotation
+   squeezed between the argument and the clock is exactly what a reader skips. */
+.ev-tool.has-warn { flex-wrap: wrap; row-gap: 4px; border-color: rgba(245, 158, 11, .32); background: rgba(245, 158, 11, .06); }
+.ev-tool .t-warn {
+  flex-basis: 100%;
+  display: flex;
+  align-items: flex-start;
+  gap: 6px;
+  padding-left: 29px;
+  color: var(--cs-ask);
+  font-family: var(--cs-sans);
+  font-size: 11.5px;
+  line-height: 1.5;
+  white-space: normal;
+}
+.ev-tool .t-warn .icon { width: 13px; height: 13px; flex-shrink: 0; margin-top: 1px; }
 .ev-tool .t-meta {
   margin-left: auto;
   color: var(--text-3);
@@ -1094,6 +1128,7 @@
 .cs-shell[data-stage="terminal"] .cs-spane[data-spane="terminal"],
 .cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"],
 .cs-shell[data-stage="runs"]     .cs-spane[data-spane="runs"],
+.cs-shell[data-stage="exec"]     .cs-spane[data-spane="exec"],
 .cs-shell[data-stage="commit"]   .cs-spane[data-spane="commit"] { display: flex; }
 
 /* Bar above the stage content (file path, diff summary, actions) */
@@ -1148,6 +1183,35 @@
   border-top: 1px solid var(--border);
   background: var(--bg-2);
 }
+
+/* ---- Command transcript (exec pane) ------------------------------------- */
+
+/* The banner is the pane's first claim, above the output: a reader who opens a
+   command that printed nothing still has to learn its writes were dropped. */
+.cs-exec-warn {
+  display: flex;
+  align-items: flex-start;
+  gap: 9px;
+  flex-shrink: 0;
+  padding: 10px 14px;
+  border-bottom: 1px solid rgba(245, 158, 11, .3);
+  background: rgba(245, 158, 11, .1);
+  color: var(--cs-ask);
+  font-size: 12px;
+  line-height: 1.5;
+}
+.cs-exec-warn .icon { width: 15px; height: 15px; flex-shrink: 0; margin-top: 1px; }
+.cs-exec-warn strong { text-transform: uppercase; letter-spacing: .04em; font-size: 10.5px; }
+.cs-exec-out {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  border: 0;
+  border-radius: 0;
+  padding: 10px 14px;
+}
+.cs-exec-out.is-empty { padding: 0; }
+.eo-line { white-space: pre-wrap; word-break: break-word; }
 
 /* In the stage, code and terminal fill the window instead of the dock's limit */
 .cs-spane .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
@@ -1437,6 +1501,11 @@
      one, the path is the item that gives way and the file name disappears
      altogether. The path takes its own row and the chips flow under it. */
   .cs-pane-head { padding: 8px 11px; flex-wrap: wrap; row-gap: 6px; }
+  /* The floating pill already owns "back to the root agent" here, and the pane
+     head is the one place a second copy of it would sit two thumbs apart. */
+  .cs-spane[data-spane="exec"] .cs-pane-head [data-stage-go] { display: none; }
+  .cs-exec-warn { padding: 9px 11px; font-size: 11.5px; }
+  .cs-exec-out { padding: 9px 11px; font-size: 10.5px; }
   .cs-pane-head .path { flex: 1 1 100%; }
   .cs-pane-foot { padding: 9px 11px; }
   /* The merge scene came to the phone with a footer built for 980 px: the hint
@@ -1468,6 +1537,9 @@
 
 /* ============================ ODDS AND ENDS ============================== */
 
+/* `display` on a class outranks the `hidden` attribute, so an empty state that
+   is switched off in script has to say so here too. */
+.cs-empty[hidden] { display: none; }
 .cs-empty {
   display: flex;
   flex-direction: column;

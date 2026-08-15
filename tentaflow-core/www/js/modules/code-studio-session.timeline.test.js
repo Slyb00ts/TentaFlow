@@ -49,13 +49,20 @@ function cutConst(name) {
 }
 
 // eslint-disable-next-line no-new-func
-const { shortHash, shortenHashes, operationFailure } = new Function(`
+const {
+  shortHash, shortenHashes, operationFailure, execVerdict, mergeExecPage, parseAt, durationOf,
+} = new Function(`
   ${cutConst('HASH_RE')}
   ${cutFn('shortHash')}
   ${cutFn('shortenHashes')}
   ${cutConst('OPERATION_ERRORS')}
   ${cutFn('operationFailure')}
-  return { shortHash, shortenHashes, operationFailure };
+  ${cutFn('execVerdict')}
+  ${cutFn('mergeExecPage')}
+  ${cutConst('NAIVE_TS_RE')}
+  ${cutFn('parseAt')}
+  ${cutFn('durationOf')}
+  return { shortHash, shortenHashes, operationFailure, execVerdict, mergeExecPage, parseAt, durationOf };
 `)();
 
 const LOCALES = ['pl', 'en', 'de', 'es', 'fr'].map((lang) => [
@@ -203,4 +210,180 @@ test('the Polish failure texts carry no untranslated English left over', () => {
     const text = lookup(dict, key);
     assert.doesNotMatch(text, /\b(expected|found|conflict|directory|exists)\b/, key);
   }
+});
+
+// ---------------------------------------------------------------------------
+// A command that succeeded against a copy
+// ---------------------------------------------------------------------------
+
+test('a command narrowed to a copy is called out, whatever its exit code says', () => {
+  const v = execVerdict({
+    op_id: 'op-1', exit_code: 0, requested_mount_access: 'rw', writes_discarded: true,
+  });
+  assert.equal(v.discarded, true);
+  assert.equal(v.requested, 'rw');
+  assert.equal(v.tone, 'wait', 'exit 0 must not read as "done" when nothing landed');
+  assert.equal(v.noteKey, 'exec.discarded_note');
+  assert.equal(v.execId, 'op-1');
+});
+
+test('a command that really wrote gets no warning at all', () => {
+  const v = execVerdict({
+    op_id: 'op-2', exit_code: 0, requested_mount_access: 'rw', writes_discarded: false,
+  });
+  assert.equal(v.discarded, false);
+  assert.equal(v.tone, 'ok');
+});
+
+test('a failure stays a failure even when its writes were dropped', () => {
+  assert.equal(execVerdict({ exit_code: 1, writes_discarded: true }).tone, 'err');
+  assert.equal(execVerdict({ exit_code: 1, writes_discarded: false }).tone, 'err');
+});
+
+test('a command still running is neither claimed to have landed nor to have failed', () => {
+  const v = execVerdict({ op_id: 'op-3', exit_code: null });
+  assert.equal(v.tone, 'run');
+  assert.equal(v.discarded, false);
+});
+
+// The server that wrote the rows on disk today has neither field. Their absence
+// is the one case that must NOT produce a warning — an old row would otherwise
+// accuse every command in the archive of losing its writes.
+test('a row from a server without the two fields makes no claim', () => {
+  const v = execVerdict({ op_id: 'op-4', argv: ['sh'], cwd: '/w', exit_code: 0 });
+  assert.equal(v.discarded, false);
+  assert.equal(v.requested, '');
+  assert.equal(v.tone, 'ok');
+});
+
+test('the request the PEP narrowed is named when the row carries it', () => {
+  assert.equal(execVerdict({ writes_discarded: true, requested_mount_access: 'rw' }).noteKey,
+    'exec.discarded_note');
+  // A tool-side effect records no request; the sentence then states only the
+  // outcome instead of interpolating an empty mount name.
+  assert.equal(execVerdict({ writes_discarded: true, requested_mount_access: '' }).noteKey,
+    'exec.discarded_note_plain');
+});
+
+test('camelCase and snake_case answers say the same thing', () => {
+  const snake = execVerdict({ op_id: 'a', exit_code: 0, requested_mount_access: 'rw', writes_discarded: true });
+  const camel = execVerdict({ opId: 'a', exitCode: 0, requestedMountAccess: 'rw', writesDiscarded: true });
+  assert.deepEqual(camel, snake);
+});
+
+test('every exec key the timeline can print exists in all five locales', () => {
+  const keys = ['exec.discarded_pill', 'exec.discarded_note', 'exec.discarded_note_plain',
+    'exec.open', 'exec.refresh', 'exec.more', 'exec.lines', 'exec.no_output',
+    'exec.still_running', 'exec.loading', 'exec.unavailable'];
+  for (const [lang, dict] of LOCALES) {
+    for (const key of keys) {
+      assert.equal(typeof lookup(dict, key), 'string', `${lang} is missing ${key}`);
+    }
+  }
+});
+
+test('the exec sentences interpolate only what the caller passes', () => {
+  const supplied = new Map([
+    ['exec.discarded_note', new Set(['requested'])],
+    ['exec.discarded_note_plain', new Set()],
+    ['exec.lines', new Set(['count'])],
+    ['exec.unavailable', new Set(['reason'])],
+  ]);
+  for (const [lang, dict] of LOCALES) {
+    for (const [key, names] of supplied) {
+      for (const [, name] of lookup(dict, key).matchAll(/\{(\w+)(?:\|[^}]*)?\}/g)) {
+        assert.ok(names.has(name), `${lang}/${key} interpolates {${name}}, which is never passed`);
+      }
+    }
+  }
+});
+
+test('the line counter carries a plural form per language, three of them in Polish', () => {
+  for (const [lang, dict] of LOCALES) {
+    const text = lookup(dict, 'exec.lines');
+    const forms = /\{count\|([^}]*)\}/.exec(text);
+    assert.ok(forms, `${lang} counts lines by concatenation instead of a plural form`);
+    const expected = lang === 'pl' ? 3 : 2;
+    assert.equal(forms[1].split('|').length, expected, `${lang} plural forms`);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Reading the transcript back
+// ---------------------------------------------------------------------------
+
+test('a page advances the cursor by the cursor the server answered with', () => {
+  const view = { cursor: 0, count: 0, status: '' };
+  const page = mergeExecPage(view, {
+    lines: ['a', 'b'], status: 'completed', next_seq: 2, has_more: true,
+  });
+  assert.deepEqual(page.lines, ['a', 'b']);
+  assert.equal(page.cursor, 2);
+  assert.equal(page.count, 2);
+  assert.equal(page.hasMore, true);
+  assert.equal(page.status, 'completed');
+});
+
+test('a second page continues where the first stopped', () => {
+  const view = { cursor: 2, count: 2, status: 'completed' };
+  const page = mergeExecPage(view, { lines: ['c'], status: 'completed', next_seq: 3, has_more: false });
+  assert.equal(page.cursor, 3);
+  assert.equal(page.count, 3);
+  assert.equal(page.hasMore, false);
+});
+
+test('a peer that omits the cursor is counted, not trusted backwards', () => {
+  assert.equal(mergeExecPage({ cursor: 5, count: 5 }, { lines: ['x', 'y'] }).cursor, 7);
+  // A cursor that went backwards would replay every line of the page.
+  assert.equal(mergeExecPage({ cursor: 5, count: 5 }, { lines: ['x'], next_seq: 1 }).cursor, 6);
+});
+
+test('"there is more" is refused when the page moved nothing', () => {
+  const page = mergeExecPage({ cursor: 4, count: 4 }, { lines: [], has_more: true, next_seq: 4 });
+  assert.equal(page.hasMore, false, 'an empty page that claims more is an endless button');
+  assert.equal(page.cursor, 4);
+  assert.equal(page.count, 4);
+});
+
+test('an answer with no lines at all is read as an empty transcript, not a crash', () => {
+  const page = mergeExecPage({ cursor: 0, count: 0, status: '' }, {});
+  assert.deepEqual(page.lines, []);
+  assert.equal(page.cursor, 0);
+  assert.equal(page.count, 0);
+  assert.equal(page.hasMore, false);
+});
+
+test('camelCase paging fields are accepted too', () => {
+  const page = mergeExecPage({ cursor: 0, count: 0 }, { lines: ['a'], nextSeq: 1, hasMore: true });
+  assert.equal(page.cursor, 1);
+  assert.equal(page.hasMore, true);
+});
+
+// ---------------------------------------------------------------------------
+// Server timestamps
+// ---------------------------------------------------------------------------
+
+// SQLite writes `CURRENT_TIMESTAMP` zoneless and in UTC. Read as local time it
+// shifts every clock on the timeline by the viewer's offset, and it dates a run
+// still in flight hours into the past.
+test('a zoneless server timestamp is read as UTC, not as local time', () => {
+  assert.equal(parseAt('2026-08-15 14:20:57'), Date.UTC(2026, 7, 15, 14, 20, 57));
+  assert.equal(parseAt('2026-08-15T14:20:57'), Date.UTC(2026, 7, 15, 14, 20, 57));
+  assert.equal(parseAt('2026-08-15 14:20:57.500'), Date.UTC(2026, 7, 15, 14, 20, 57, 500));
+});
+
+test('a timestamp that carries its own zone is left alone', () => {
+  assert.equal(parseAt('2026-08-15T14:20:57Z'), Date.UTC(2026, 7, 15, 14, 20, 57));
+  assert.equal(parseAt('2026-08-15T16:20:57+02:00'), Date.UTC(2026, 7, 15, 14, 20, 57));
+});
+
+test('nothing and nonsense are not dates', () => {
+  for (const empty of ['', null, undefined, '   ']) assert.ok(Number.isNaN(parseAt(empty)));
+  assert.ok(Number.isNaN(parseAt('yesterday')));
+});
+
+test('the real 74-second turn is reported as the minute and a bit it took', () => {
+  assert.equal(durationOf('2026-08-15 14:20:57', '2026-08-15 14:22:11'), '1m 14s');
+  assert.equal(durationOf('2026-08-15 14:20:57', '2026-08-15 14:21:20'), '23s');
+  assert.equal(durationOf('', '2026-08-15 14:21:20'), '', 'a row with no start states nothing');
 });

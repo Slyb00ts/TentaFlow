@@ -156,10 +156,124 @@ struct ClaudeRuntime {
     /// `None` once the turn stream has been closed; EOF on stdin is how this
     /// mode is asked to stop.
     stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// Permission requests the CLI is BLOCKED on, as `bridge id -> vendor
+    /// request id`. Claude Code names its control requests with opaque strings
+    /// while this bridge's approval API speaks numbers, so the translation lives
+    /// here — the same set that tells `answer_approval` an id is real and
+    /// `shutdown` what it still owes an answer to (D3).
+    approvals: Arc<SyncMutex<HashMap<u64, String>>>,
     /// Killed as a GROUP: the CLI starts helpers (MCP servers, tools) of its
     /// own, and killing the direct child alone orphans them (D2).
     handle: process::Handle,
     child: Child,
+}
+
+/// One control frame of Claude Code's `stream-json` channel.
+///
+/// `--permission-prompt-tool stdio` is what puts them there: the CLI then asks
+/// permission over the SAME newline-delimited stream it answers on, instead of
+/// calling an MCP tool. Everything else on that stream is session output.
+#[derive(Debug, Clone, PartialEq)]
+enum ClaudeControl {
+    /// "may I use this tool" — the request the session's policy engine decides.
+    Permission {
+        request_id: String,
+        tool_name: String,
+        input: Value,
+    },
+    /// A control request this bridge has no channel for. It is answered with an
+    /// error rather than ignored: an unanswered control request leaves the turn
+    /// blocked, which is defect D3 in another costume.
+    Unsupported { request_id: String, subtype: String },
+    /// The CLI withdrew a request it had made (its own timeout, an interrupt).
+    Cancelled { request_id: String },
+}
+
+/// What the model is told when the policy engine refuses a tool call. It
+/// reaches the model as the tool result, so it says who refused — a model that
+/// reads "denied" with no source retries the same call.
+const PERMISSION_DENIED_MESSAGE: &str =
+    "The workspace policy engine refused this tool call. Do not retry it; \
+     continue with what the session already allows, or explain what you need.";
+
+/// Reads one line of the CLI's stream as a control frame, or `None` when it is
+/// ordinary session output.
+fn claude_control(value: &Value) -> Option<ClaudeControl> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("control_request") => {
+            let request_id = value.get("request_id").and_then(Value::as_str)?.to_string();
+            let request = value.get("request")?;
+            let subtype = request
+                .get("subtype")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if subtype != "can_use_tool" {
+                return Some(ClaudeControl::Unsupported {
+                    request_id,
+                    subtype: subtype.to_string(),
+                });
+            }
+            Some(ClaudeControl::Permission {
+                request_id,
+                // A request that names no tool still gets forwarded: naming the
+                // capability is the caller's job, and it refuses what it cannot
+                // name. Dropping it here would block the turn instead.
+                tool_name: request
+                    .get("tool_name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                input: request
+                    .get("input")
+                    .cloned()
+                    .unwrap_or_else(|| json!({})),
+            })
+        }
+        Some("control_cancel_request") => Some(ClaudeControl::Cancelled {
+            request_id: value.get("request_id").and_then(Value::as_str)?.to_string(),
+        }),
+        _ => None,
+    }
+}
+
+/// The frame that answers one permission request.
+///
+/// Both approving decisions become a plain `allow` for THIS call. Claude Code
+/// would also accept `updatedPermissions`, which writes a standing rule into its
+/// own settings — and that is exactly what must not happen: the standing grant
+/// lives in the session's own tables, so the next call asks again and the policy
+/// engine answers from the one place that holds the rules.
+fn claude_permission_response(vendor_request_id: &str, decision: &str) -> Value {
+    let body = if matches!(decision, "approved" | "approved_for_session") {
+        json!({"behavior": "allow"})
+    } else {
+        json!({"behavior": "deny", "message": PERMISSION_DENIED_MESSAGE})
+    };
+    json!({
+        "type": "control_response",
+        "response": {"subtype": "success", "request_id": vendor_request_id, "response": body},
+    })
+}
+
+/// The frame that refuses a control request this bridge cannot answer.
+fn claude_control_error(vendor_request_id: &str, error: &str) -> Value {
+    json!({
+        "type": "control_response",
+        "response": {"subtype": "error", "request_id": vendor_request_id, "error": error},
+    })
+}
+
+/// Writes one frame to the CLI's stdin. Every line this bridge sends Claude
+/// Code — a turn, a permission answer, a refusal — goes through here, so the
+/// closed-stream case has one answer instead of three.
+async fn write_claude_frame(stdin: &Arc<Mutex<Option<ChildStdin>>>, frame: &Value) -> Result<()> {
+    let mut guard = stdin.lock().await;
+    let stdin = guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("the Claude Code input stream is closed"))?;
+    stdin.write_all(format!("{frame}\n").as_bytes()).await?;
+    stdin.flush().await?;
+    Ok(())
 }
 
 struct TerminalRuntime {
@@ -1046,9 +1160,10 @@ async fn send_input(
     Ok(Json(json!({"accepted": true})))
 }
 
-/// Answers a server→client approval request. Codex threads are started with
-/// `approvalPolicy: "on-request"`, so without this path every turn that wants
-/// to touch the filesystem or run a command waits until it times out.
+/// Answers a server→client approval request. Both engines block on one: Codex
+/// threads are started with `approvalPolicy: "on-request"`, and Claude Code runs
+/// with `--permission-prompt-tool stdio`. Without this path every turn that
+/// wants to touch the filesystem or run a command waits until it times out.
 async fn send_approval(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -1064,6 +1179,11 @@ async fn send_approval(
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     match session.runtime.as_mut() {
         Some(Runtime::Codex(runtime)) => {
+            runtime
+                .answer_approval(req.request_id, &req.decision)
+                .await?;
+        }
+        Some(Runtime::Claude(runtime)) => {
             runtime
                 .answer_approval(req.request_id, &req.decision)
                 .await?;
@@ -1316,13 +1436,14 @@ impl CodexRuntime {
 }
 
 impl ClaudeRuntime {
-    /// Starts the CLI. What it may DO is the vendor's own decision here: this
-    /// mode routes tool permissions only to a `--permission-prompt-tool`, which
-    /// is an MCP server the bridge does not run, so no approval of this engine
-    /// reaches the session's PEP the way a Codex `approval_request` does. The
-    /// turn ends either way — its `result` object says what happened — and no
-    /// flag is passed that would widen what the CLI may do without a person
-    /// deciding it.
+    /// Starts the CLI with its permission channel pointed at this bridge.
+    ///
+    /// `--permission-prompt-tool stdio` is what makes that possible without an
+    /// MCP server: the value is a sentinel, and the CLI then raises every
+    /// permission question as a `control_request` on the stream-json channel it
+    /// already reads answers from. Each one is forwarded as an
+    /// `approval_request` event, so a Claude Code tool call is decided by the
+    /// same policy engine as a Codex one and lands in the same timeline.
     async fn spawn(spawn: ClaudeSpawn<'_>) -> Result<Self> {
         let ClaudeSpawn {
             workspace,
@@ -1352,6 +1473,12 @@ impl ClaudeRuntime {
             child.stdin.take().context("claude stdin missing")?,
         )));
         let stdout = child.stdout.take().context("claude stdout missing")?;
+        let approvals = Arc::new(SyncMutex::<HashMap<u64, String>>::new(HashMap::new()));
+        let reader_approvals = approvals.clone();
+        // Lives in the reader alone: it is the only minter of these ids, and
+        // the numbers mean nothing outside the map they key.
+        let next_approval_id = AtomicU64::new(1);
+        let reader_stdin = stdin.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
             while let Ok(Some(line)) = lines.next_line().await {
@@ -1363,6 +1490,44 @@ impl ClaudeRuntime {
                     push_event(&events, "terminal", json!({ "text": line }));
                     continue;
                 };
+                match claude_control(&value) {
+                    Some(ClaudeControl::Permission {
+                        request_id,
+                        tool_name,
+                        input,
+                    }) => {
+                        let id = next_approval_id.fetch_add(1, Ordering::Relaxed);
+                        reader_approvals.lock().insert(id, request_id);
+                        push_event(
+                            &events,
+                            "approval_request",
+                            json!({"request_id": id, "method": tool_name, "params": input}),
+                        );
+                        continue;
+                    }
+                    Some(ClaudeControl::Unsupported {
+                        request_id,
+                        subtype,
+                    }) => {
+                        let refusal = format!(
+                            "this bridge answers permission requests only; it has no channel \
+                             for control request '{subtype}'"
+                        );
+                        if let Err(error) =
+                            write_claude_frame(&reader_stdin, &claude_control_error(&request_id, &refusal))
+                                .await
+                        {
+                            eprintln!("coding-agent-bridge: refusing '{subtype}' failed: {error}");
+                        }
+                        push_event(&events, "terminal", json!({ "text": refusal }));
+                        continue;
+                    }
+                    Some(ClaudeControl::Cancelled { request_id }) => {
+                        reader_approvals.lock().retain(|_, vendor| *vendor != request_id);
+                        continue;
+                    }
+                    None => {}
+                }
                 // The CLI announces the id it actually used; it is what
                 // `--resume` needs, and taking it from the vendor rather than
                 // from our own request is what makes a resume survive a CLI that
@@ -1379,9 +1544,47 @@ impl ClaudeRuntime {
         });
         Ok(Self {
             stdin,
+            approvals,
             handle,
             child,
         })
+    }
+
+    /// Answers one outstanding permission request. An id that is not
+    /// outstanding is refused rather than written: the CLI would ignore the
+    /// response, and the caller would believe a turn was unblocked when it was
+    /// not (D3).
+    async fn answer_approval(&self, request_id: u64, decision: &str) -> Result<(), ApiError> {
+        let Some(vendor_request_id) = self.approvals.lock().remove(&request_id) else {
+            return Err(ApiError::not_found(
+                "no approval request is outstanding under that id",
+            ));
+        };
+        let frame = claude_permission_response(&vendor_request_id, decision);
+        if let Err(error) = write_claude_frame(&self.stdin, &frame).await {
+            // Put it back: the turn is still blocked, so the operator must be
+            // able to answer again.
+            self.approvals.lock().insert(request_id, vendor_request_id);
+            return Err(ApiError::internal(&format!(
+                "claude permission response failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Denies whatever is still outstanding. Called when a session goes away:
+    /// an unanswered request leaves the CLI blocked, and a blocked CLI is a
+    /// process that never exits.
+    async fn settle_pending_approvals(&self) {
+        let outstanding: Vec<String> = self.approvals.lock().drain().map(|(_, id)| id).collect();
+        for vendor_request_id in outstanding {
+            let frame = claude_permission_response(&vendor_request_id, "denied");
+            if let Err(error) = write_claude_frame(&self.stdin, &frame).await {
+                eprintln!(
+                    "coding-agent-bridge: settling permission {vendor_request_id} failed: {error}"
+                );
+            }
+        }
     }
 
     /// Starts one turn by writing a single user message. The process stays
@@ -1392,24 +1595,17 @@ impl ClaudeRuntime {
             "type": "user",
             "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
         });
-        let mut guard = self.stdin.lock().await;
-        let stdin = guard
-            .as_mut()
-            .ok_or_else(|| ApiError::bad_request("this session's input stream is closed"))?;
-        let write = async {
-            stdin.write_all(format!("{message}\n").as_bytes()).await?;
-            stdin.flush().await
-        };
-        write
+        write_claude_frame(&self.stdin, &message)
             .await
             .map_err(|error| ApiError::internal(&format!("claude stdin write failed: {error}")))
     }
 
-    /// Closes the input stream, gives the CLI its chance to finish and exit, and
-    /// kills the group if it does not. The polite step is not politeness: the
-    /// session transcript `--resume` reads is written on exit, and a straight
-    /// SIGKILL loses it.
+    /// Denies what is outstanding, closes the input stream, gives the CLI its
+    /// chance to finish and exit, and kills the group if it does not. The polite
+    /// step is not politeness: the session transcript `--resume` reads is
+    /// written on exit, and a straight SIGKILL loses it.
     async fn shutdown(&mut self) -> process::ProcessState {
+        self.settle_pending_approvals().await;
         self.stdin.lock().await.take();
         match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
             Ok(Ok(_)) => {
@@ -1430,6 +1626,12 @@ impl ClaudeRuntime {
 /// they produce. `--verbose` is not optional here — without it the stream
 /// carries only the final result, and the session timeline would show a turn
 /// with no work in it.
+///
+/// `--permission-prompt-tool stdio` is the permission channel. The value is a
+/// sentinel rather than a tool name (`claude 2.1.233` routes it to the control
+/// protocol of this very stream instead of looking for an MCP tool), and it is
+/// what makes a Claude Code tool call answerable by the session's policy engine.
+/// Without it the CLI decides alone what it may do.
 fn claude_args(
     resume: Option<&str>,
     fork: bool,
@@ -1442,6 +1644,8 @@ fn claude_args(
         "--output-format=stream-json".to_string(),
         "--input-format=stream-json".to_string(),
         "--verbose".to_string(),
+        "--permission-prompt-tool".to_string(),
+        "stdio".to_string(),
     ];
     if let Some(model) = model {
         args.extend(["--model".to_string(), model.to_string()]);
@@ -1923,6 +2127,16 @@ mod tests {
         ] {
             assert!(fresh.contains(&flag.to_string()), "{flag} is missing");
         }
+        // The permission channel. Without the sentinel value the CLI answers
+        // its own permission questions and nothing this bridge forwards is
+        // decided by the session's policy engine.
+        assert_eq!(
+            fresh
+                .windows(2)
+                .find(|w| w[0] == "--permission-prompt-tool")
+                .expect("permission channel")[1],
+            "stdio"
+        );
         assert_eq!(fresh.windows(2).find(|w| w[0] == "--model").expect("model")[1], "sonnet");
         assert_eq!(
             fresh
@@ -1962,6 +2176,103 @@ mod tests {
         assert!(validated_args(&["a\0b".to_string()]).is_err());
         assert!(validated_args(&["x".repeat(4096)]).is_err());
         assert!(validated_args(&vec!["-c".to_string(); 33]).is_err());
+    }
+
+    /// The recorded shape of `claude 2.1.233`'s permission channel. A tool call
+    /// arrives as a `control_request` whose `subtype` is `can_use_tool`, and
+    /// everything the decision needs (the tool and its input) is in it.
+    #[test]
+    fn a_permission_question_is_read_off_the_control_channel() {
+        let request = json!({
+            "type": "control_request",
+            "request_id": "req_014f",
+            "request": {
+                "subtype": "can_use_tool",
+                "tool_name": "Bash",
+                "display_name": "Bash",
+                "tool_use_id": "toolu_01",
+                "description": "Run the test suite",
+                "input": {"command": "cargo test", "description": "Run the test suite"}
+            }
+        });
+        assert_eq!(
+            claude_control(&request),
+            Some(ClaudeControl::Permission {
+                request_id: "req_014f".into(),
+                tool_name: "Bash".into(),
+                input: json!({"command": "cargo test", "description": "Run the test suite"}),
+            })
+        );
+
+        // A control request of any other kind is answered with an error, never
+        // dropped: an unanswered one leaves the turn blocked forever.
+        assert_eq!(
+            claude_control(&json!({
+                "type": "control_request",
+                "request_id": "req_02",
+                "request": {"subtype": "request_user_dialog", "dialog_kind": "select"}
+            })),
+            Some(ClaudeControl::Unsupported {
+                request_id: "req_02".into(),
+                subtype: "request_user_dialog".into(),
+            })
+        );
+        assert_eq!(
+            claude_control(&json!({"type": "control_cancel_request", "request_id": "req_014f"})),
+            Some(ClaudeControl::Cancelled {
+                request_id: "req_014f".into()
+            })
+        );
+
+        // Session output is not a control frame and must reach the timeline.
+        for output in [
+            json!({"type": "assistant", "message": {"content": []}}),
+            json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+            json!({"type": "result", "subtype": "success"}),
+            // A control request without an id could never be answered; treating
+            // it as one would only lose the line.
+            json!({"type": "control_request", "request": {"subtype": "can_use_tool"}}),
+        ] {
+            assert_eq!(claude_control(&output), None, "{output} is not a control frame");
+        }
+    }
+
+    /// The answer the CLI acts on. `behavior` is the whole decision: `deny`
+    /// means the tool is never executed and the model gets the message as its
+    /// tool result.
+    #[test]
+    fn a_refusal_reaches_the_cli_as_a_deny_and_never_as_a_standing_rule() {
+        let denied = claude_permission_response("req_1", "denied");
+        assert_eq!(denied["type"], "control_response");
+        assert_eq!(denied["response"]["subtype"], "success");
+        assert_eq!(denied["response"]["request_id"], "req_1");
+        assert_eq!(denied["response"]["response"]["behavior"], "deny");
+        assert!(denied["response"]["response"]["message"]
+            .as_str()
+            .is_some_and(|message| !message.is_empty()));
+        // An abort is a refusal too; anything that is not an approval denies.
+        assert_eq!(
+            claude_permission_response("req_1", "abort")["response"]["response"]["behavior"],
+            "deny"
+        );
+
+        for approving in ["approved", "approved_for_session"] {
+            let allowed = claude_permission_response("req_2", approving);
+            assert_eq!(allowed["response"]["response"]["behavior"], "allow");
+            // The standing grant lives in the session's own tables. Writing a
+            // rule into the CLI's settings would give the vendor a second,
+            // unreadable copy of the policy.
+            assert!(
+                allowed["response"]["response"]
+                    .get("updatedPermissions")
+                    .is_none(),
+                "{approving} must not install a rule inside the CLI"
+            );
+        }
+
+        let refused = claude_control_error("req_3", "no channel");
+        assert_eq!(refused["response"]["subtype"], "error");
+        assert_eq!(refused["response"]["error"], "no channel");
     }
 
     #[test]

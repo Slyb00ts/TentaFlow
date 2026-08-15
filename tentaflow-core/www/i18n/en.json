@@ -6375,8 +6375,8 @@
       "push_failed": "The push failed."
     },
     "dock": {
-      "agents_active": "Active in this session",
-      "agents_empty": "No subagent has been started yet.",
+      "agents_active": "Runs of this session",
+      "agents_empty": "This session has not run anything yet.",
       "konsola": "Console",
       "agenci": "Agents",
       "pliki": "Files",
@@ -6401,7 +6401,7 @@
       "no_steps": "No steps.",
       "cancel": "Interrupt",
       "elapsed": "elapsed",
-      "tokens": "tokens",
+      "tokens": "tok",
       "asks": "questions",
       "back": "Back",
       "step_tool": "tool",
@@ -6449,6 +6449,19 @@
       "err_io": "input/output error: {reason}",
       "err_unknown": "the operation failed and the server named no reason",
       "err_quoted": "the tool reported: “{message}”"
+    },
+    "exec": {
+      "discarded_pill": "writes discarded",
+      "discarded_note": "This command's writes did NOT reach the worktree: it asked for a “{requested}” mount and the sandbox ran it on a copy (cow).",
+      "discarded_note_plain": "This command's writes did NOT reach the worktree — the sandbox ran it on a copy (cow).",
+      "open": "Output",
+      "refresh": "Refresh",
+      "more": "Load more",
+      "lines": "{count} {count|line|lines} of output",
+      "no_output": "The command printed nothing.",
+      "still_running": "The command is still running — its output becomes available once it ends.",
+      "loading": "Loading the output…",
+      "unavailable": "The server did not return this command's output: {reason}"
     },
     "ask": {
       "head": "The agent is asking",

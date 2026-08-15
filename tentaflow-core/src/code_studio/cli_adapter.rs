@@ -56,7 +56,12 @@
 //     `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and a session-private
 //     `CLAUDE_CONFIG_DIR`. Both are part of `EngineWiring`, because without them
 //     the process also reached api.anthropic.com, github.com and a Datadog
-//     intake, and could have used a claude.ai login of its own.
+//     intake, and could have used a claude.ai login of its own. It meets point 3
+//     through `--permission-prompt-tool stdio`, which routes its permission
+//     questions onto the bridge's own stream instead of an MCP server — with one
+//     honest bound recorded in `cli_bridge`: the CLI asks only about what its
+//     own rules escalate, so a tool it allows by default is never offered to the
+//     policy engine.
 //   * `codex 0.147.0` does NOT meet point 6. `OPENAI_BASE_URL` is ignored
 //     outright; a provider passed as `-c model_providers.*` moves the model
 //     traffic, and connections to chatgpt.com and api.github.com remain. It runs
