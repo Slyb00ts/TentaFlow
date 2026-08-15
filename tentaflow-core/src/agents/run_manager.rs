@@ -371,6 +371,10 @@ impl AgentRunManager {
     /// the task starts — the atomic path for server-minted bindings (e.g.
     /// Project Studio `ps_generation`): no post-spawn write, no race with the
     /// first tool call.
+    ///
+    /// `flow_override` replaces the harness graph this run executes. It exists
+    /// for Code Studio, where the graph is a property of the SESSION (§16) and
+    /// not of the agent definition.
     pub async fn spawn(
         &self,
         agent_id: &str,
@@ -380,6 +384,7 @@ impl AgentRunManager {
         inherited_tools: &[String],
         extra_meta: &[(&str, Value)],
         target_session_id: Option<&str>,
+        flow_override: Option<&str>,
     ) -> Result<String> {
         let agent = repository::get_agent(&self.db, agent_id)?
             .ok_or_else(|| anyhow!("agent '{agent_id}' not found"))?;
@@ -406,10 +411,13 @@ impl AgentRunManager {
             },
         )?;
 
-        let flow_id = agent
-            .flow_id
-            .as_deref()
+        // A Code Studio session pins the harness graph its runs execute (§16),
+        // and that pin belongs to the SESSION, not to the agent definition — the
+        // same agent serves every workspace. The caller therefore names the flow
+        // when it has one; everyone else keeps the agent's own harness.
+        let flow_id = flow_override
             .filter(|s| !s.is_empty())
+            .or(agent.flow_id.as_deref().filter(|s| !s.is_empty()))
             .unwrap_or(crate::flow_engine::node_adapters::AGENT_RUN_FLOW_ID)
             .to_string();
 
@@ -538,6 +546,17 @@ impl AgentRunManager {
                 Some(c) if !c.is_empty() => format!("{c}\n\n{}", task.task),
                 _ => task.task.clone(),
             };
+            // The Code Studio binding travels with the delegation: a child that
+            // reviews or tests must land in the parent's worktree, and passing
+            // it here (rather than letting the child ask for one) is what makes
+            // that impossible to redirect.
+            let extra_meta: Vec<(&str, Value)> = match &caller.code_session {
+                Some(binding) => vec![(
+                    crate::code_studio::tools::SESSION_META_KEY,
+                    binding.clone(),
+                )],
+                None => Vec::new(),
+            };
             let run_id = self
                 .spawn(
                     &child.id,
@@ -545,8 +564,14 @@ impl AgentRunManager {
                     Some(&caller.run_id),
                     &caller.principal,
                     &parent_tools,
-                    &[],
+                    &extra_meta,
                     caller.session_id.as_deref(),
+                    // A sub-agent runs ITS OWN harness, not the caller's: the
+                    // session pin (§16.6) binds the root run's graph, and a
+                    // reviewer or tester is a different agent with a different
+                    // flow. Overriding here would run every specialist through
+                    // the orchestrator's graph.
+                    None,
                 )
                 .await?;
             run_ids.push(run_id);
@@ -993,6 +1018,12 @@ pub struct CallerRun {
     /// session's next interaction via the mailbox. `None` for a background
     /// parent with no originating session.
     pub session_id: Option<String>,
+    /// Server-minted Code Studio session binding of the calling run, carried so
+    /// a delegated `code-reviewer` / `code-tester` / `code-committer` works in
+    /// the SAME worktree as its parent. It is copied, never chosen: the child
+    /// cannot name a workspace, and a caller outside Code Studio has `None`, so
+    /// spawning never grants access that the parent did not already hold.
+    pub code_session: Option<Value>,
 }
 
 impl CallerRun {
@@ -1019,11 +1050,16 @@ impl CallerRun {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let code_session = envelope
+            .meta
+            .get(crate::code_studio::tools::SESSION_META_KEY)
+            .cloned();
         Self {
             run_id,
             agent_id,
             principal,
             session_id,
+            code_session,
         }
     }
 }
@@ -1362,6 +1398,11 @@ Continue your work using it.",
                 &parent_tools,
                 &[],
                 target_session_id.as_deref(),
+                // The continuation reuses the agent's own flow. `agent_runs`
+                // records no flow id, so the run's pinned graph cannot be
+                // recovered here; this is exactly the behaviour that existed
+                // before `flow_override`, not a new gap opened by it.
+                None,
             )
             .await
         {
@@ -1681,7 +1722,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn");
 
@@ -1718,7 +1759,7 @@ mod tests {
 
         // A parent run row (created directly — the parent's own flow is elsewhere).
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
 
@@ -1727,6 +1768,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -1781,7 +1823,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn");
 
@@ -1845,7 +1887,7 @@ mod tests {
         let mut callers = Vec::new();
         for i in 0..(cap + 1) {
             let parent_run = mgr
-                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], &[], None)
+                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], &[], None, None)
                 .await
                 .expect("spawn parent");
             callers.push(CallerRun {
@@ -1853,6 +1895,7 @@ mod tests {
                 agent_id: "parent".into(),
                 principal: principal.clone(),
                 session_id: None,
+                code_session: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1909,7 +1952,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1917,6 +1960,7 @@ mod tests {
             agent_id: "parent".into(),
             principal,
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "t"}))
@@ -1940,7 +1984,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1948,6 +1992,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
 
         // First child fits max_subagents=1.
@@ -1971,7 +2016,7 @@ mod tests {
         // Simulate by giving the child spawn rights and asking it to spawn.
         seed_agent(&pool, "spawner", "midboss", "[]", 2, 1);
         let child_run = mgr
-            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], &[], None)
+            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], &[], None, None)
             .await
             .expect("spawn mid");
         let mid_caller = CallerRun {
@@ -1979,6 +2024,7 @@ mod tests {
             agent_id: "spawner".into(),
             principal,
             session_id: None,
+            code_session: None,
         };
         let grand = mgr
             .handle_agent_spawn(&mid_caller, &json!({"agent_name": "worker", "task": "g"}))
@@ -1996,7 +2042,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2004,6 +2050,7 @@ mod tests {
             agent_id: "parent".into(),
             principal,
             session_id: None,
+            code_session: None,
         };
         let out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))
@@ -2105,7 +2152,7 @@ mod tests {
 
         // First run wins the single permit and parks on the gate.
         let run_a = mgr
-            .spawn("a", "first", None, &principal, &[], &[], None)
+            .spawn("a", "first", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn a");
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2169,7 +2216,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2177,6 +2224,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2244,7 +2292,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         // Caller carries the originating session — the mailbox target.
@@ -2253,6 +2301,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: Some("sess-7".into()),
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2305,7 +2354,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2313,6 +2362,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2371,7 +2421,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2379,6 +2429,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))

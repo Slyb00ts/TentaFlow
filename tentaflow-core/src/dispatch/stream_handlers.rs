@@ -2894,6 +2894,1835 @@ inventory::submit! {
 }
 
 // =============================================================================
+// Code Studio streams (§12.2) — session timeline, terminal grid, index.
+// =============================================================================
+// Three subscriptions with one contract: the CLIENT holds the cursor and the
+// server resumes from it — `after_seq` walks the event log, `after_revision`
+// walks the VT grid. Neither stream keeps a ring buffer of the last N frames,
+// and that is deliberate: the event log IS the durable buffer (§13.3 — events
+// are the source of truth, the status columns are a projection), and the VT
+// grid tags every row with the revision at which it last changed. A ring buffer
+// next to either would be a second, weaker copy that can fall behind and then
+// has to be reconciled against the real one anyway.
+//
+// Backpressure is the credit window of the subscription channel: every frame
+// leaves through `push_chunk_async`, which AWAITS a free slot, so the producer
+// — the loop reading the log or the grid — blocks with a slow browser instead
+// of growing an unbounded queue. What does not fit into a frame is not buffered
+// either: an event body over the budget travels as the artifact reference it
+// already has (§12.2, §13.2), never as a truncated copy that would look whole.
+//
+// The terminal never carries raw VT bytes (§7.9). The parser runs here, on the
+// owner node, so a container and a remote node render identically and the
+// browser needs no terminal emulator.
+//
+// A workspace whose owner node is not this one is served the same way from the
+// browser's point of view, and completely differently underneath: the timeline
+// and the terminal are PULLED from the owner node's stream hub
+// (`code_studio::mesh_stream`) and pushed into the same subscription, frame for
+// frame, with the same variants the local loops emit. The pull carries the
+// acknowledgement that returns credit to the producer, so backpressure reaches
+// all the way from the browser to the process writing the output on the other
+// node. The gate still runs HERE, every `CS_REVALIDATE_EVERY`, on this node's
+// registry: a proxy that stopped checking would let a revoked membership keep
+// reading for as long as the socket lived.
+
+use crate::code_studio::mesh_stream;
+use crate::code_studio::terminal::{
+    Cell, Color, Cursor, GridRow, PtyHandle, TerminalRegistry, TerminalState,
+};
+use crate::mesh::iroh_manager::IrohMeshManager;
+use tentaflow_protocol::code_studio::{CodeStudioPayload, TerminalCellRow, TerminalCursorInfo};
+
+/// The session was closed or interrupted; its timeline is final. It is the hub
+/// reason too — a stream close travelling over the mesh and the end of a local
+/// subscription are the same event and must not carry two different words.
+const CS_END_SESSION_CLOSED: &str = mesh_stream::REASON_SESSION_CLOSED;
+/// Uniform denial: a non-member must not be able to tell a missing workspace
+/// from someone else's, and a session from someone else's session.
+const CS_END_NOT_FOUND: &str = "not_found";
+/// Membership, `code_studio.read` or session ownership went away mid-stream.
+/// Also travels over the mesh as a stream close reason — one definition, so the
+/// owner node and the browser cannot name the same event differently.
+pub(crate) const CS_END_PERMISSION_REVOKED: &str = mesh_stream::REASON_PERMISSION_REVOKED;
+/// The workspace belongs to another node and THIS stream has no remote path:
+/// the index stream, whose progress channel nobody publishes to the mesh hub,
+/// or a workspace that moved to another node while a local stream was open.
+/// The session timeline and the terminal do not end here — they pull from the
+/// owner node (§12.2).
+const CS_END_NOT_LOCAL: &str = "workspace_not_local";
+/// The owner node did not serve the stream: the mesh is not running on this
+/// node, the peer is not trusted, it did not answer, or it holds no such
+/// stream. All four are availability, never a verdict about the session
+/// (§3.5), so the UI may retry — reporting `session_closed` here would be a
+/// lie about somebody's unfinished work.
+const CS_END_OWNER_UNREACHABLE: &str = "owner_unreachable";
+/// A frame from the owner node spent the stream's inline budget and travels as
+/// an artifact reference (§12.2). The browser has no way to fetch and render a
+/// chunk of a timeline out of band, so the stream says so rather than dropping
+/// output that the client would never learn it was missing.
+const CS_END_STREAM_OVERFLOW: &str = "stream_overflow";
+/// No such terminal on this node. A Core restart reaps every shell (§1.2 D2),
+/// so a browser resuming after one has to open a new terminal.
+const CS_END_TERMINAL_NOT_OPEN: &str = "terminal_not_open";
+/// The shell ended; the grid stops at its last output.
+const CS_END_TERMINAL_EXITED: &str = "terminal_exited";
+/// The semantic index is switched off for this workspace, so no job will ever
+/// publish progress. An open stream that can never carry a frame is
+/// indistinguishable from a stalled indexer, which is why this is stated.
+const CS_END_INDEX_UNAVAILABLE: &str = "index_unavailable";
+/// The server could not read its own state.
+pub(crate) const CS_END_INTERNAL: &str = "internal_error";
+
+/// Events read per catch-up page. A resume from `after_seq = 0` on a long
+/// session pages through the log instead of materialising it at once.
+const CS_EVENT_PAGE: usize = 256;
+
+/// How long a REMOTE timeline waits after an empty batch. The local timeline
+/// has no interval at all — its writer announces (`events::subscribe`) — but a
+/// mesh pull cannot be woken from the other node, so an idle remote session
+/// costs one round trip at this cadence and no more.
+const CS_SESSION_POLL: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// How often the VT grid is compared against the revision already sent. The SLO
+/// for a keystroke echo is p95 < 100 ms locally (§22), so the sampling interval
+/// has to be an order of magnitude below it; one frame of a 60 Hz display is
+/// both small enough and pointless to beat, since nothing renders faster.
+const CS_TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(16);
+
+/// How often the whole access gate is re-run while a stream is open.
+const CS_REVALIDATE_EVERY: std::time::Duration = std::time::Duration::from_secs(5);
+
+/// Frame budget for one event body. Above it the frame carries the artifact
+/// reference instead (§12.2).
+const CS_MAX_EVENT_PAYLOAD_BYTES: usize = 16 * 1024;
+
+/// How often an IDLE remote terminal is polled. A mesh pull is a round trip,
+/// not a memory read, so sampling it at the local grid's 16 ms would cost some
+/// sixty requests a second per open shell that nobody is typing into. §22
+/// allows 250 ms p95 for a remote keystroke echo, and a batch that carried
+/// frames is followed immediately — this interval only bounds the wait when
+/// there was nothing to fetch.
+const CS_REMOTE_TERMINAL_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// Frames this node is willing to take in one pull from the owner node. It is
+/// the credit the producer gets back, so it must not exceed the hub's window.
+const CS_PULL_CREDITS: u32 = mesh_stream::DEFAULT_WINDOW;
+
+/// Deadline for one pull round trip. Short: the pull carries no work, it reads
+/// a buffer, so a node that needs longer than this is not answering.
+const CS_PULL_TIMEOUT_SECS: u64 = 15;
+
+/// Hub id of a session's timeline. The owner node publishes under exactly this
+/// id — the pair of ids below is the whole naming contract between the node
+/// that produces the frames and the node that shows them.
+const CS_STREAM_TIMELINE: &str = "timeline";
+
+/// Hub id of one terminal. The terminal id is part of it because a session can
+/// have several shells open at once and each is its own stream.
+fn code_studio_terminal_stream_id(terminal_id: &str) -> String {
+    format!("terminal:{terminal_id}")
+}
+
+/// Hub id of a workspace's indexing progress. The workspace is part of it
+/// because this stream has no session to be keyed by, and two workspaces
+/// watched from one node must not share a stream.
+fn code_studio_index_stream_id(workspace_id: &str) -> String {
+    format!("index:{workspace_id}")
+}
+
+/// Process-wide VT registries, one per workspace. The grid lives in memory on
+/// the owner node, so the stream and the terminal request handlers MUST read the
+/// same registry: a second instance would answer with an empty grid while the
+/// shell writes into the first.
+static CODE_STUDIO_TERMINALS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, Arc<TerminalRegistry>>>,
+> = std::sync::OnceLock::new();
+
+/// The workspace's terminal registry, created on first use. Its record root is
+/// the workspace `tmp/` directory: a record of a running shell is runtime state
+/// of this node and must not be synced.
+///
+/// This is the ONE holder for the process. Whatever opens a pseudo terminal —
+/// `dispatch::code_studio::workspace_runtime` — has to take its registry from
+/// here rather than construct its own, or the stream below would poll a grid no
+/// shell ever writes to.
+pub fn code_studio_terminal_registry(workspace_id: &str) -> anyhow::Result<Arc<TerminalRegistry>> {
+    let records_root = crate::code_studio::paths::workspace_dir(workspace_id)?.join("tmp");
+    let map = CODE_STUDIO_TERMINALS.get_or_init(|| std::sync::Mutex::new(Default::default()));
+    let mut guard = map.lock().unwrap_or_else(|e| e.into_inner());
+    Ok(Arc::clone(
+        guard
+            .entry(workspace_id.to_string())
+            .or_insert_with(|| Arc::new(TerminalRegistry::new(records_root))),
+    ))
+}
+
+/// Access gate of one Code Studio stream, kept so it can be RE-RUN. §12.2
+/// closes a stream when the membership, the permission or the session behind it
+/// goes away, and that cannot be noticed by checking once at subscribe time.
+struct CodeStudioStreamGate {
+    db: crate::db::DbPool,
+    node_id: String,
+    user_id: String,
+    org_id: String,
+    workspace_id: String,
+    /// Empty for the workspace-scoped index stream.
+    session_id: String,
+}
+
+/// Where a stream's frames are produced.
+///
+/// A workspace runs on exactly one node (§3), so either this node holds the
+/// event log, the VT grid and the runtime database, or another node does and
+/// the frames have to be pulled from it over the mesh (§12.2).
+enum CodeStudioStreamTarget {
+    Local {
+        pool: crate::db::DbPool,
+        session: crate::code_studio::session::SessionRecord,
+    },
+    Remote {
+        owner_node_id: String,
+    },
+}
+
+/// Workspace half of the gate: permission, org, membership.
+///
+/// Says nothing about WHERE the workspace runs — the callers below decide what
+/// a foreign owner node means for their stream, because one of them pulls from
+/// it and the others cannot.
+///
+/// Permissions are re-read from the database rather than taken from the
+/// connection's snapshot — a stream outlives the request that opened it, so the
+/// snapshot would keep a revoked grant alive for as long as the socket lives.
+fn code_studio_workspace_gate(
+    db: &crate::db::DbPool,
+    user_id: &str,
+    org_id: &str,
+    workspace_id: &str,
+) -> Result<crate::code_studio::models::WorkspaceRecord, &'static str> {
+    use crate::code_studio::models::WorkspaceStatus;
+
+    crate::code_studio::paths::validate_workspace_id(workspace_id).map_err(|_| CS_END_NOT_FOUND)?;
+    let org = crate::services::rbac::resolve_org_context(db, user_id, Some(org_id))
+        .map_err(|_| CS_END_PERMISSION_REVOKED)?;
+    if !org.has("code_studio.read") {
+        return Err(CS_END_PERMISSION_REVOKED);
+    }
+    let record = crate::code_studio::repository::get_workspace(db, workspace_id)
+        .map_err(|_| CS_END_INTERNAL)?
+        .ok_or(CS_END_NOT_FOUND)?;
+    if record.org_id != org_id || record.status == WorkspaceStatus::Deleted.slug() {
+        return Err(CS_END_NOT_FOUND);
+    }
+    // Membership only. The administrator overlay of §25.4 covers registry
+    // metadata and lifecycle, never the content these streams carry.
+    if crate::code_studio::repository::role_of(db, workspace_id, user_id)
+        .map_err(|_| CS_END_INTERNAL)?
+        .is_none()
+    {
+        return Err(CS_END_NOT_FOUND);
+    }
+    Ok(record)
+}
+
+/// Workspace half of the gate as the MESH path runs it.
+///
+/// Identical to what a browser attached to this node passes through — the same
+/// permission, the same org, the same membership, re-read from the database —
+/// plus the rule that this node must actually own the workspace. A workspace
+/// that runs elsewhere yields the uniform `not_found`: the caller read a stale
+/// registry row, and telling it more would let it map where workspaces live.
+pub(crate) fn code_studio_authorize_stream_read(
+    db: &crate::db::DbPool,
+    local_node_id: &str,
+    user_id: &str,
+    org_id: &str,
+    workspace_id: &str,
+) -> Result<crate::code_studio::models::WorkspaceRecord, &'static str> {
+    let record = code_studio_workspace_gate(db, user_id, org_id, workspace_id)?;
+    if record.node_id != local_node_id {
+        return Err(CS_END_NOT_FOUND);
+    }
+    Ok(record)
+}
+
+/// The full gate for a SESSION stream: the workspace half plus the one check
+/// only the owner node can make, because only it holds the row — the session
+/// belongs to this person and to nobody else (§5.3, §25.4).
+pub(crate) fn code_studio_authorize_stream(
+    db: &crate::db::DbPool,
+    local_node_id: &str,
+    user_id: &str,
+    org_id: &str,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<crate::code_studio::session::SessionRecord, &'static str> {
+    code_studio_authorize_stream_read(db, local_node_id, user_id, org_id, workspace_id)?;
+    crate::code_studio::paths::validate_session_id(session_id).map_err(|_| CS_END_NOT_FOUND)?;
+    let pool = crate::code_studio::workspace_db::open(workspace_id).map_err(|_| CS_END_INTERNAL)?;
+    let record = crate::code_studio::session::get_session(&pool, session_id)
+        .map_err(|_| CS_END_INTERNAL)?
+        .ok_or(CS_END_NOT_FOUND)?;
+    // Somebody else's session answers exactly like a session that was never
+    // opened. An administrator gets the same answer (§25.4).
+    if record.user_id != user_id {
+        return Err(CS_END_NOT_FOUND);
+    }
+    Ok(record)
+}
+
+impl CodeStudioStreamGate {
+    /// Workspace gate for a stream that only this node can serve. Returns the
+    /// CURRENT registry row, so a re-run sees a setting that changed under it.
+    async fn check_workspace(
+        &self,
+    ) -> Result<crate::code_studio::models::WorkspaceRecord, &'static str> {
+        let (db, node, user, org, workspace) = (
+            self.db.clone(),
+            self.node_id.clone(),
+            self.user_id.clone(),
+            self.org_id.clone(),
+            self.workspace_id.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let record = code_studio_workspace_gate(&db, &user, &org, &workspace)?;
+            if record.node_id != node {
+                return Err(CS_END_NOT_LOCAL);
+            }
+            Ok(record)
+        })
+        .await
+        .unwrap_or(Err(CS_END_INTERNAL))
+    }
+
+    /// Workspace gate plus the session, and where the session's frames live.
+    ///
+    /// For a local workspace it returns the runtime pool and the CURRENT
+    /// session row, so a re-run also reports whether the session has since been
+    /// closed. For a remote one it names the owner node and stops before
+    /// touching a runtime database this node does not have: opening one here
+    /// would create an empty workspace directory for somebody else's workspace.
+    async fn check_access(&self) -> Result<CodeStudioStreamTarget, &'static str> {
+        let (db, node, user, org, workspace, session) = (
+            self.db.clone(),
+            self.node_id.clone(),
+            self.user_id.clone(),
+            self.org_id.clone(),
+            self.workspace_id.clone(),
+            self.session_id.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let workspace_record = code_studio_workspace_gate(&db, &user, &org, &workspace)?;
+            if workspace_record.node_id != node {
+                // The session row lives in the owner node's runtime database
+                // (§5.3), so whether this person owns THAT session is decided
+                // by the node that holds it. That node runs the SAME gate
+                // (`code_studio_authorize_stream`) against the actor named by
+                // the assertion every stream call carries (§12.1), which is
+                // what keeps a stream private to one person rather than open to
+                // everyone on a trusted node. What the registry knows, this
+                // node has just checked: the permission, the org, the
+                // membership.
+                return Ok(CodeStudioStreamTarget::Remote {
+                    owner_node_id: workspace_record.node_id,
+                });
+            }
+            // ONE definition of the session rule, shared with the mesh path.
+            let record =
+                code_studio_authorize_stream(&db, &node, &user, &org, &workspace, &session)?;
+            let pool =
+                crate::code_studio::workspace_db::open(&workspace).map_err(|_| CS_END_INTERNAL)?;
+            Ok(CodeStudioStreamTarget::Local {
+                pool,
+                session: record,
+            })
+        })
+        .await
+        .unwrap_or(Err(CS_END_INTERNAL))
+    }
+
+    /// The node the workspace runs on, once the person has passed the workspace
+    /// gate. Used by the workspace-scoped index stream, which has no session to
+    /// resolve a target with.
+    async fn check_owner_node(&self) -> Result<String, &'static str> {
+        let (db, user, org, workspace) = (
+            self.db.clone(),
+            self.user_id.clone(),
+            self.org_id.clone(),
+            self.workspace_id.clone(),
+        );
+        tokio::task::spawn_blocking(move || {
+            code_studio_workspace_gate(&db, &user, &org, &workspace).map(|record| record.node_id)
+        })
+        .await
+        .unwrap_or(Err(CS_END_INTERNAL))
+    }
+
+    /// Re-check a REMOTE stream from this node's side: the person may still
+    /// read this workspace and it still runs where the stream is being pulled
+    /// from. The session itself is the owner node's business — it holds the row
+    /// — and is re-checked there.
+    async fn check_remote_owner(&self, owner_node_id: &str) -> Result<(), &'static str> {
+        let (db, user, org, workspace, owner) = (
+            self.db.clone(),
+            self.user_id.clone(),
+            self.org_id.clone(),
+            self.workspace_id.clone(),
+            owner_node_id.to_string(),
+        );
+        tokio::task::spawn_blocking(move || {
+            let record = code_studio_workspace_gate(&db, &user, &org, &workspace)?;
+            if record.node_id != owner {
+                // The workspace moved. Whatever it is doing now, it is not this
+                // stream on that node.
+                return Err(CS_END_NOT_LOCAL);
+            }
+            Ok(())
+        })
+        .await
+        .unwrap_or(Err(CS_END_INTERNAL))
+    }
+}
+
+/// Closes a stream with a NAMED reason. Every exit goes through one of these:
+/// a silent drop would leave the UI unable to tell "nothing more to show" from
+/// "you lost access".
+async fn code_studio_end(sub: &Arc<Subscription>, frame: CodeStudioPayload) {
+    let _ = push_end_async(sub, Some(MessageBody::CodeStudioBody(frame))).await;
+}
+
+// -----------------------------------------------------------------------------
+// Owner side: the producers that feed a mesh stream (§12.2)
+// -----------------------------------------------------------------------------
+//
+// There is ONE producer per stream and it is the same source the local
+// subscription reads: the event log for a timeline (§3 — the coordinator is the
+// only writer of `session_events`), the VT grid for a terminal (§7.9), the
+// indexer's progress channel for the index. Nothing here is a second copy of
+// the state; a producer encodes exactly the `CodeStudioPayload` frames the
+// local path pushes into a subscription, and the consumer node forwards them
+// unchanged.
+//
+// A producer also owns the stream's LIFETIME. It re-runs the whole access gate
+// every `CS_REVALIDATE_EVERY` against the database — not against anything
+// captured when the stream opened — and closes with a stated reason when the
+// membership, the role, the permission or the session ends. That is the half of
+// §12.2 a per-call check cannot cover: nobody pulls a stream they have stopped
+// being allowed to read, so a stream nobody pulls would otherwise sit there
+// producing.
+
+/// How long a closed stream keeps its buffers so the consumer can collect the
+/// close record. Dropping them immediately would turn "you lost access" into a
+/// stream that simply stopped existing, which is the one thing §12.2 forbids.
+const CS_CLOSE_LINGER: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// The streams an owner node produces, parsed from the wire id.
+enum CodeStudioOwnerStream {
+    Timeline,
+    Terminal { terminal_id: String },
+    Index,
+}
+
+/// Parse and VALIDATE a stream id against the rest of the request.
+///
+/// The id is not a free-form string: a timeline and a terminal belong to a
+/// session, the index belongs to a workspace and names it, and both ids go
+/// through the same alphabet guard the filesystem paths use. Anything else is
+/// refused before a stream exists.
+fn code_studio_owner_stream(
+    request: &tentaflow_protocol::mesh::CodeStudioStreamOpenRequest,
+) -> Option<CodeStudioOwnerStream> {
+    if request.stream_id == CS_STREAM_TIMELINE {
+        return (!request.session_id.is_empty()).then_some(CodeStudioOwnerStream::Timeline);
+    }
+    if let Some(terminal_id) = request.stream_id.strip_prefix("terminal:") {
+        if request.session_id.is_empty()
+            || crate::code_studio::paths::validate_session_id(terminal_id).is_err()
+        {
+            return None;
+        }
+        return Some(CodeStudioOwnerStream::Terminal {
+            terminal_id: terminal_id.to_string(),
+        });
+    }
+    if let Some(workspace_id) = request.stream_id.strip_prefix("index:") {
+        // The index stream has no session, so its id has to carry the
+        // workspace: without it two workspaces watched from one node would
+        // collide on a single hub key.
+        if !request.session_id.is_empty() || workspace_id != request.workspace_id {
+            return None;
+        }
+        return Some(CodeStudioOwnerStream::Index);
+    }
+    None
+}
+
+/// A terminal's full state, for a consumer whose gap fell out of the replay
+/// buffer (§12.2). The grid plus its revision is a complete answer, which is
+/// why the terminal is the one stream that resynchronizes instead of closing.
+struct CodeStudioTerminalSnapshot {
+    registry: Arc<TerminalRegistry>,
+    pty: PtyHandle,
+}
+
+impl mesh_stream::SnapshotSource for CodeStudioTerminalSnapshot {
+    fn snapshot(&self) -> Option<(u64, Vec<u8>)> {
+        let grid = self.registry.snapshot(&self.pty).ok()?;
+        let payload = CodeStudioPayload::TerminalStreamSnapshot {
+            revision: grid.revision,
+            grid_rows: grid.rows,
+            grid_cols: grid.cols,
+            cursor: code_studio_cursor(grid.cursor),
+            rows: code_studio_cell_rows(&grid.lines),
+        };
+        Some((grid.revision, crate::mesh::cbor::encode(&payload).ok()?))
+    }
+}
+
+/// Open a stream for the actor an assertion named, and start producing.
+///
+/// Called from the mesh receive path (`remote_proxy::open_owner_stream`) after
+/// the assertion verified. Everything authorization-shaped happens HERE, on the
+/// node that holds the data, exactly as it does for a browser attached to this
+/// node — the assertion transported an identity, it granted nothing.
+pub(crate) async fn code_studio_open_owner_stream(
+    state: &Arc<crate::dispatch::AppState>,
+    verified: &crate::code_studio::assertion::VerifiedAssertion,
+    consumer_node_id: &str,
+    request: &tentaflow_protocol::mesh::CodeStudioStreamOpenRequest,
+) -> Result<u64, &'static str> {
+    let kind = code_studio_owner_stream(request).ok_or(CS_END_NOT_FOUND)?;
+    let gate = CodeStudioStreamGate {
+        db: state.db.clone(),
+        node_id: state.local_node_id.to_string(),
+        user_id: verified.user_id.clone(),
+        org_id: verified.org_id.clone(),
+        workspace_id: request.workspace_id.clone(),
+        session_id: request.session_id.clone(),
+    };
+
+    let open = |snapshot: Option<Arc<dyn mesh_stream::SnapshotSource>>| {
+        mesh_stream::hub().open(mesh_stream::StreamOpen {
+            session_id: request.session_id.clone(),
+            stream_id: request.stream_id.clone(),
+            workspace_id: request.workspace_id.clone(),
+            consumer_node_id: consumer_node_id.to_string(),
+            consumer_user_id: verified.user_id.clone(),
+            window: request.window,
+            inline_budget: 0,
+            snapshot,
+        })
+    };
+
+    match kind {
+        CodeStudioOwnerStream::Timeline => {
+            let (pool, session) = match gate.check_access().await? {
+                CodeStudioStreamTarget::Local { pool, session } => (pool, session),
+                CodeStudioStreamTarget::Remote { .. } => return Err(CS_END_NOT_FOUND),
+            };
+            let handle = open(None);
+            let after = i64::try_from(request.after_revision).unwrap_or(i64::MAX);
+            tokio::spawn(code_studio_timeline_producer(
+                handle,
+                gate,
+                pool,
+                after,
+                session.status,
+            ));
+        }
+        CodeStudioOwnerStream::Terminal { terminal_id } => {
+            match gate.check_access().await? {
+                CodeStudioStreamTarget::Local { .. } => {}
+                CodeStudioStreamTarget::Remote { .. } => return Err(CS_END_NOT_FOUND),
+            }
+            let registry = code_studio_terminal_registry(&request.workspace_id)
+                .map_err(|_| CS_END_INTERNAL)?;
+            // The handle carries the session, so a member of the workspace
+            // cannot reach another session's shell by guessing a terminal id.
+            let pty = PtyHandle {
+                terminal_id,
+                session_id: request.session_id.clone(),
+            };
+            if registry.snapshot(&pty).is_err() {
+                return Err(CS_END_TERMINAL_NOT_OPEN);
+            }
+            let handle = open(Some(Arc::new(CodeStudioTerminalSnapshot {
+                registry: Arc::clone(&registry),
+                pty: pty.clone(),
+            })));
+            tokio::spawn(code_studio_terminal_producer(
+                handle,
+                gate,
+                registry,
+                pty,
+                request.after_revision,
+            ));
+        }
+        CodeStudioOwnerStream::Index => {
+            let record = gate.check_workspace().await?;
+            if !record.index_enabled {
+                return Err(CS_END_INDEX_UNAVAILABLE);
+            }
+            let handle = open(None);
+            tokio::spawn(code_studio_index_producer(
+                handle,
+                gate,
+                request.after_revision,
+            ));
+        }
+    }
+    Ok(0)
+}
+
+/// Whether a producer should still be producing: the hub holds THIS generation
+/// of the stream and nobody has closed it. A reconnect opens a new generation,
+/// and the old producer stops here rather than writing into a sequence space
+/// that is no longer being read.
+fn code_studio_stream_live(handle: &mesh_stream::StreamHandle) -> bool {
+    mesh_stream::hub().is_current(handle) && !handle.is_closed()
+}
+
+/// Every producer ends the same way: state the reason, leave the buffers long
+/// enough for the consumer to collect it, then drop them.
+async fn code_studio_finish_owner_stream(
+    handle: mesh_stream::StreamHandle,
+    reason: &str,
+    detail: &str,
+) {
+    handle.close(reason, detail);
+    code_studio_retire(handle).await;
+}
+
+/// The stream ended without this producer deciding it — a trust revocation, a
+/// session close, or a reconnect that opened a newer generation. The reason is
+/// already recorded, so all that is left is to keep the record readable for a
+/// moment and then drop the buffers. A generation that is no longer the current
+/// one owns nothing and touches nothing.
+async fn code_studio_retire(handle: mesh_stream::StreamHandle) {
+    if !mesh_stream::hub().is_current(&handle) {
+        return;
+    }
+    tokio::time::sleep(CS_CLOSE_LINGER).await;
+    mesh_stream::hub().forget(&handle);
+}
+
+/// Publish one frame, or report that the stream ended under us.
+async fn code_studio_publish(
+    handle: &mesh_stream::StreamHandle,
+    revision: u64,
+    payload: &CodeStudioPayload,
+) -> bool {
+    let Ok(bytes) = crate::mesh::cbor::encode(payload) else {
+        // A frame this node cannot encode is a bug, not output: the stream says
+        // so rather than skipping it and leaving a hole the consumer would read
+        // as "nothing happened".
+        handle.close(mesh_stream::REASON_ERROR, "a frame could not be encoded");
+        return false;
+    };
+    // `publish` AWAITS credit: a consumer that stops acknowledging slows the
+    // producer down instead of growing a buffer on the node that owns
+    // everybody's workspaces (§12.2).
+    handle
+        .publish(mesh_stream::KIND_DATA, revision, bytes)
+        .await
+        .is_ok()
+}
+
+/// Both timeline readers wait the same way, and neither polls.
+///
+/// The writer announces after it commits (`events::append`); a watermark from
+/// `events::append_in_tx`, whose caller commits later, may be ahead of what the
+/// log shows, so it is re-read once after a short grace. Every wait is bounded
+/// by the revalidation interval, which is what makes an idle session still
+/// notice that its reader lost access.
+struct CodeStudioTimelineWaiter {
+    signal: crate::code_studio::events::EventSignal,
+    settled_for: i64,
+}
+
+impl CodeStudioTimelineWaiter {
+    /// Subscribe BEFORE reading history: an event written between the two
+    /// leaves a watermark the reader still sees, so the handover has no gap.
+    fn new(session_id: &str) -> Self {
+        Self {
+            signal: crate::code_studio::events::subscribe(session_id),
+            settled_for: 0,
+        }
+    }
+
+    async fn wait(&mut self, cursor: i64) {
+        let announced = self.signal.announced();
+        if announced > cursor && self.settled_for != announced {
+            // Announced but not visible yet — one re-read, not a poll: a
+            // transaction that rolls back leaves `settled_for` equal to the
+            // watermark and the next wait goes back to sleeping.
+            self.settled_for = announced;
+            tokio::time::sleep(crate::code_studio::events::ANNOUNCE_SETTLE).await;
+            return;
+        }
+        let _ = tokio::time::timeout(CS_REVALIDATE_EVERY, self.signal.changed()).await;
+    }
+}
+
+/// One page of the timeline as wire frames, paired with the sequence each one
+/// advances the cursor to. Shared by the local subscription and the mesh
+/// producer so the two cannot drift apart.
+async fn code_studio_timeline_page(
+    pool: &crate::db::DbPool,
+    session_id: &str,
+    after: i64,
+) -> Result<Vec<(i64, CodeStudioPayload)>, ()> {
+    let (pool, session) = (pool.clone(), session_id.to_string());
+    let page = tokio::task::spawn_blocking(move || {
+        crate::code_studio::events::read_after(&pool, &session, after, CS_EVENT_PAGE)
+    })
+    .await;
+    match page {
+        Ok(Ok(page)) => Ok(page
+            .into_iter()
+            .map(|event| {
+                let frame = CodeStudioPayload::SessionStreamEvent {
+                    seq: event.seq.max(0) as u64,
+                    kind: event.kind.slug().to_string(),
+                    run_id: event.run_id.clone(),
+                    agent_id: event.agent_id.clone(),
+                    created_at: event.created_at.clone(),
+                    payload_json: code_studio_event_payload_json(&event),
+                    security_relevant: event.security_relevant,
+                };
+                (event.seq, frame)
+            })
+            .collect()),
+        _ => Err(()),
+    }
+}
+
+/// Owner-side timeline producer. Same log, same cursor rule and same frames as
+/// the local subscription — the only difference is where the frame is written.
+async fn code_studio_timeline_producer(
+    handle: mesh_stream::StreamHandle,
+    gate: CodeStudioStreamGate,
+    pool: crate::db::DbPool,
+    after_seq: i64,
+    mut status: String,
+) {
+    let mut waiter = CodeStudioTimelineWaiter::new(&gate.session_id);
+    let mut cursor = after_seq;
+    let mut last_check = std::time::Instant::now();
+    loop {
+        // The status is read BEFORE the drain, so everything the session wrote
+        // up to the moment it closed still travels.
+        let finished = matches!(status.as_str(), "closed" | "interrupted");
+        loop {
+            let Ok(page) = code_studio_timeline_page(&pool, &gate.session_id, cursor).await else {
+                code_studio_finish_owner_stream(handle, CS_END_INTERNAL, "timeline read failed")
+                    .await;
+                return;
+            };
+            let drained = page.len() < CS_EVENT_PAGE;
+            for (seq, frame) in page {
+                cursor = seq;
+                if !code_studio_publish(&handle, seq.max(0) as u64, &frame).await {
+                    code_studio_retire(handle).await;
+                    return;
+                }
+            }
+            if drained {
+                break;
+            }
+        }
+        if finished {
+            code_studio_finish_owner_stream(handle, mesh_stream::REASON_SESSION_CLOSED, &status)
+                .await;
+            return;
+        }
+
+        waiter.wait(cursor).await;
+        if !code_studio_stream_live(&handle) {
+            code_studio_retire(handle).await;
+            return;
+        }
+        if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+            last_check = std::time::Instant::now();
+            match gate.check_access().await {
+                Ok(CodeStudioStreamTarget::Local { session, .. }) => status = session.status,
+                Ok(CodeStudioStreamTarget::Remote { .. }) => {
+                    code_studio_finish_owner_stream(
+                        handle,
+                        CS_END_NOT_LOCAL,
+                        "the workspace moved to another node",
+                    )
+                    .await;
+                    return;
+                }
+                Err(reason) => {
+                    code_studio_finish_owner_stream(
+                        handle,
+                        reason,
+                        "re-checked against the database",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Owner-side terminal producer. The VT machine runs here (§7.9), so the frames
+/// that travel are finished grid rows and a revision, never raw escape bytes
+/// the other node would have to emulate a second time.
+async fn code_studio_terminal_producer(
+    handle: mesh_stream::StreamHandle,
+    gate: CodeStudioStreamGate,
+    registry: Arc<TerminalRegistry>,
+    pty: PtyHandle,
+    after_revision: u64,
+) {
+    let mut sent = after_revision;
+    match registry.snapshot(&pty) {
+        Ok(grid) => {
+            // A row is only known to be current relative to a revision this
+            // node issued, so anything other than the live one earns the whole
+            // grid first.
+            if sent != grid.revision {
+                let frame = CodeStudioPayload::TerminalStreamSnapshot {
+                    revision: grid.revision,
+                    grid_rows: grid.rows,
+                    grid_cols: grid.cols,
+                    cursor: code_studio_cursor(grid.cursor),
+                    rows: code_studio_cell_rows(&grid.lines),
+                };
+                if !code_studio_publish(&handle, grid.revision, &frame).await {
+                    code_studio_retire(handle).await;
+                    return;
+                }
+                sent = grid.revision;
+            }
+        }
+        Err(_) => {
+            code_studio_finish_owner_stream(handle, CS_END_TERMINAL_NOT_OPEN, "").await;
+            return;
+        }
+    }
+
+    let mut last_check = std::time::Instant::now();
+    loop {
+        tokio::time::sleep(CS_TERMINAL_POLL).await;
+        if !code_studio_stream_live(&handle) {
+            code_studio_retire(handle).await;
+            return;
+        }
+        let Ok(changes) = registry.changes_since(&pty, sent) else {
+            code_studio_finish_owner_stream(handle, CS_END_TERMINAL_NOT_OPEN, "").await;
+            return;
+        };
+        if changes.revision != sent {
+            let frame = CodeStudioPayload::TerminalStreamDelta {
+                revision: changes.revision,
+                grid_rows: changes.rows,
+                grid_cols: changes.cols,
+                cursor: code_studio_cursor(changes.cursor),
+                rows: code_studio_cell_rows(&changes.lines),
+            };
+            if !code_studio_publish(&handle, changes.revision, &frame).await {
+                code_studio_retire(handle).await;
+                return;
+            }
+            sent = changes.revision;
+        }
+        // Checked AFTER the delta, so the shell's last output reaches the
+        // consumer before the stream reports that it ended.
+        match registry.state(&pty) {
+            Ok(TerminalState::Running) => {}
+            Ok(_) => {
+                code_studio_finish_owner_stream(handle, CS_END_TERMINAL_EXITED, "").await;
+                return;
+            }
+            Err(_) => {
+                code_studio_finish_owner_stream(handle, CS_END_TERMINAL_NOT_OPEN, "").await;
+                return;
+            }
+        }
+        if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+            last_check = std::time::Instant::now();
+            match gate.check_access().await {
+                Ok(CodeStudioStreamTarget::Local { .. }) => {}
+                Ok(CodeStudioStreamTarget::Remote { .. }) => {
+                    code_studio_finish_owner_stream(
+                        handle,
+                        CS_END_NOT_LOCAL,
+                        "the workspace moved to another node",
+                    )
+                    .await;
+                    return;
+                }
+                Err(reason) => {
+                    code_studio_finish_owner_stream(
+                        handle,
+                        reason,
+                        "re-checked against the database",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+/// Owner-side index producer, fed by the indexer's own progress channel — the
+/// same subscription the local stream uses, so a job publishes once and both
+/// readers see it.
+async fn code_studio_index_producer(
+    handle: mesh_stream::StreamHandle,
+    gate: CodeStudioStreamGate,
+    after_seq: u64,
+) {
+    // Subscribed BEFORE the history is read: a frame published between the two
+    // would otherwise fall between the replay and the tail.
+    let mut live = crate::code_studio::index::subscribe_progress(&gate.workspace_id);
+    let mut cursor = after_seq;
+    for frame in crate::code_studio::index::progress_since(&gate.workspace_id, cursor) {
+        cursor = frame.seq;
+        if !code_studio_publish(&handle, cursor, &code_studio_index_frame(frame)).await {
+            code_studio_retire(handle).await;
+            return;
+        }
+    }
+
+    let mut last_check = std::time::Instant::now();
+    loop {
+        match tokio::time::timeout(CS_REVALIDATE_EVERY, live.recv()).await {
+            Ok(Ok(frame)) => {
+                if frame.seq > cursor {
+                    cursor = frame.seq;
+                    if !code_studio_publish(&handle, cursor, &code_studio_index_frame(frame)).await
+                    {
+                        code_studio_retire(handle).await;
+                        return;
+                    }
+                }
+            }
+            // The producer fell behind the broadcast channel. Nothing is
+            // skipped silently: the indexer's bounded history is replayed from
+            // the cursor, and each record is cumulative.
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                for frame in crate::code_studio::index::progress_since(&gate.workspace_id, cursor) {
+                    cursor = frame.seq;
+                    if !code_studio_publish(&handle, cursor, &code_studio_index_frame(frame)).await
+                    {
+                        code_studio_retire(handle).await;
+                        return;
+                    }
+                }
+            }
+            Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                code_studio_finish_owner_stream(handle, CS_END_INDEX_UNAVAILABLE, "").await;
+                return;
+            }
+            Err(_elapsed) => {}
+        }
+        if !code_studio_stream_live(&handle) {
+            code_studio_retire(handle).await;
+            return;
+        }
+        if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+            last_check = std::time::Instant::now();
+            match gate.check_workspace().await {
+                Ok(record) if record.index_enabled => {}
+                Ok(_) => {
+                    code_studio_finish_owner_stream(handle, CS_END_INDEX_UNAVAILABLE, "").await;
+                    return;
+                }
+                Err(reason) => {
+                    code_studio_finish_owner_stream(
+                        handle,
+                        reason,
+                        "re-checked against the database",
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Remote workspaces: the frames are produced on the owner node (§12.2)
+// -----------------------------------------------------------------------------
+
+/// The streams a remote workspace serves over the mesh. All three have a
+/// producer on the owner node, so all three can be pulled.
+#[derive(Clone, Copy)]
+enum CodeStudioRemoteStream {
+    Timeline,
+    Terminal,
+    Index,
+}
+
+impl CodeStudioRemoteStream {
+    /// Frames this stream may carry. The owner node is trusted to authorize,
+    /// not to decide what the browser renders: any other variant is drift
+    /// between two builds, and forwarding it would push a payload the UI has no
+    /// rule for into a live subscription.
+    fn accepts(self, frame: &CodeStudioPayload) -> bool {
+        matches!(
+            (self, frame),
+            (Self::Timeline, CodeStudioPayload::SessionStreamEvent { .. })
+                | (
+                    Self::Terminal,
+                    CodeStudioPayload::TerminalStreamSnapshot { .. }
+                        | CodeStudioPayload::TerminalStreamDelta { .. }
+                )
+                | (Self::Index, CodeStudioPayload::IndexStreamProgress { .. })
+        )
+    }
+}
+
+/// Whether a frame pulled from the owner still interests a client that already
+/// holds everything up to `after`.
+///
+/// The hub's sequence numbers and the protocol's own `seq`/`revision` are
+/// different spaces (§12.2): the hub cursor deduplicates the TRANSPORT, this
+/// deduplicates what the browser asked to resume from. A snapshot is compared
+/// for equality, not order, exactly as the local terminal path does — a
+/// snapshot at the revision the client holds is the screen it already shows.
+fn code_studio_remote_frame_is_new(frame: &CodeStudioPayload, after: u64) -> bool {
+    match frame {
+        CodeStudioPayload::SessionStreamEvent { seq, .. } => *seq > after,
+        CodeStudioPayload::TerminalStreamDelta { revision, .. } => *revision > after,
+        CodeStudioPayload::TerminalStreamSnapshot { revision, .. } => *revision != after,
+        CodeStudioPayload::IndexStreamProgress { seq, .. } => *seq > after,
+        _ => true,
+    }
+}
+
+/// What a refusal from the owner node means for the browser.
+///
+/// The mapping is deliberately coarse: `NotFound` is the ONE answer the owner
+/// gives for a session that does not exist, a session belonging to somebody
+/// else and a workspace it does not run, so nothing here can pull those apart
+/// either.
+fn code_studio_denied_reason(error: &tentaflow_protocol::ProtocolError) -> String {
+    use tentaflow_protocol::ProtocolErrorCode;
+    match error.code {
+        ProtocolErrorCode::NotFound => CS_END_NOT_FOUND,
+        ProtocolErrorCode::PolicyDenied | ProtocolErrorCode::AuthRequired => {
+            CS_END_PERMISSION_REVOKED
+        }
+        ProtocolErrorCode::Internal => CS_END_INTERNAL,
+        _ => CS_END_OWNER_UNREACHABLE,
+    }
+    .to_string()
+}
+
+/// Reason to end the local subscription with when a stream call failed.
+fn code_studio_stream_error_reason(error: &mesh_stream::StreamError) -> String {
+    match error {
+        mesh_stream::StreamError::Denied(denied) => code_studio_denied_reason(denied),
+        _ => CS_END_OWNER_UNREACHABLE.to_string(),
+    }
+}
+
+/// Turn one pulled batch into the frames the local subscription should carry
+/// and, when the stream is over, the reason to end it with.
+///
+/// The frames travel as the CBOR of the same `CodeStudioPayload` the local
+/// path emits — one encoding for the whole system, the one `remote_proxy`
+/// already uses for forwarded requests. Frames decoded before a bad one are
+/// kept: they were produced and paid for, and dropping them would lose output
+/// the client cannot ask for again.
+fn code_studio_decode_batch(
+    kind: CodeStudioRemoteStream,
+    batch: mesh_stream::ConsumedBatch,
+    after: u64,
+) -> (Vec<CodeStudioPayload>, Option<String>) {
+    let mut frames = Vec::with_capacity(batch.frames.len());
+    for frame in batch.frames {
+        if frame.kind == mesh_stream::KIND_ARTIFACT {
+            return (frames, Some(CS_END_STREAM_OVERFLOW.to_string()));
+        }
+        let payload: CodeStudioPayload = match crate::mesh::cbor::decode(&frame.data) {
+            Ok(payload) => payload,
+            Err(e) => {
+                tracing::warn!(
+                    stream = %frame.stream_id,
+                    "code studio: undecodable frame from the owner node: {e}"
+                );
+                return (frames, Some(CS_END_INTERNAL.to_string()));
+            }
+        };
+        if !kind.accepts(&payload) {
+            tracing::warn!(
+                stream = %frame.stream_id,
+                "code studio: the owner node sent a frame that does not belong to this stream"
+            );
+            return (frames, Some(CS_END_INTERNAL.to_string()));
+        }
+        if !code_studio_remote_frame_is_new(&payload, after) {
+            continue;
+        }
+        frames.push(payload);
+    }
+    // The owner's reason IS the reason. It comes from the same vocabulary
+    // (`session_closed`, `trust_lost`, `gap`, …), and rewriting it here would
+    // replace what happened with a guess.
+    (frames, batch.close.map(|close| close.reason))
+}
+
+/// Consume a stream produced on the workspace's owner node (§12.2).
+///
+/// The dashboard node has no decision logic (§3): it pulls frames, keeps
+/// checking that this person may still read this workspace, and pushes what it
+/// receives into the local subscription. The frames travel as the CBOR of the
+/// same `CodeStudioPayload` the local path emits — one encoding for the whole
+/// system, the one `remote_proxy` already uses for forwarded requests.
+///
+/// Returns the reason to end the subscription with, or `None` when the browser
+/// went away and there is nobody left to tell.
+async fn code_studio_pull_from_owner(
+    sub: &Arc<Subscription>,
+    gate: &CodeStudioStreamGate,
+    iroh: Option<Arc<IrohMeshManager>>,
+    owner_node_id: String,
+    kind: CodeStudioRemoteStream,
+    stream_id: String,
+    after: u64,
+    poll: std::time::Duration,
+) -> Option<String> {
+    let Some(iroh) = iroh else {
+        return Some(CS_END_OWNER_UNREACHABLE.to_string());
+    };
+    // A stream carries somebody's source code and terminal. It is pulled only
+    // from a peer this node has trust-paired with, never from a node that
+    // merely claims to own the workspace.
+    if !iroh.is_trusted(&owner_node_id) {
+        return Some(CS_END_OWNER_UNREACHABLE.to_string());
+    }
+
+    let mut remote = mesh_stream::RemoteStream {
+        iroh: Arc::clone(&iroh),
+        owner_node_id: owner_node_id.clone(),
+        workspace_id: gate.workspace_id.clone(),
+        session_id: gate.session_id.clone(),
+        stream_id: stream_id.clone(),
+        db: gate.db.clone(),
+        local_node_id: gate.node_id.clone(),
+        user_id: gate.user_id.clone(),
+        org_id: gate.org_id.clone(),
+        cursor: mesh_stream::StreamCursor::default(),
+    };
+    // Nothing is produced on the owner node until it has authorized the PERSON
+    // this subscription belongs to (§12.1). The resume point travels with the
+    // open, so the producer starts where the browser stopped.
+    if let Err(e) = remote
+        .open(after, CS_PULL_CREDITS, CS_PULL_TIMEOUT_SECS)
+        .await
+    {
+        tracing::debug!(
+            owner = %owner_node_id,
+            stream = %stream_id,
+            "code studio: the owner node did not open the stream: {e}"
+        );
+        return Some(code_studio_stream_error_reason(&e));
+    }
+
+    let mut last_check = std::time::Instant::now();
+    loop {
+        let batch = match remote.pull(CS_PULL_CREDITS, CS_PULL_TIMEOUT_SECS).await {
+            Ok(batch) => batch,
+            Err(e) => {
+                tracing::warn!(
+                    owner = %owner_node_id,
+                    session = %gate.session_id,
+                    stream = %stream_id,
+                    "code studio: pulling a remote stream failed: {e}"
+                );
+                return Some(code_studio_stream_error_reason(&e));
+            }
+        };
+
+        let had_frames = !batch.frames.is_empty();
+        let (frames, closed) = code_studio_decode_batch(kind, batch, after);
+        for payload in frames {
+            // The credit window, same as the local path: awaits a free slot.
+            if push_chunk_async(sub, MessageBody::CodeStudioBody(payload))
+                .await
+                .is_err()
+            {
+                return None;
+            }
+        }
+        if let Some(reason) = closed {
+            return Some(reason);
+        }
+
+        // A pull reads a buffer and returns at once, so an empty answer is the
+        // only thing worth waiting on. A batch that carried frames is followed
+        // immediately, which is what keeps the keystroke echo inside its SLO.
+        if !had_frames {
+            tokio::time::sleep(poll).await;
+        }
+        if sub.tx.is_closed() {
+            return None;
+        }
+        if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+            last_check = std::time::Instant::now();
+            // Re-read from THIS node's database, not from the connection's
+            // snapshot: a proxy that stopped checking would let a revoked
+            // membership keep reading for as long as the socket lived. The
+            // owner node re-checks its own half on every call.
+            if let Err(reason) = gate.check_remote_owner(&owner_node_id).await {
+                return Some(reason.to_string());
+            }
+            if !iroh.is_trusted(&owner_node_id) {
+                return Some(mesh_stream::REASON_TRUST_LOST.to_string());
+            }
+        }
+    }
+}
+
+/// The event body as the UI reads it. Above the frame budget the body is NOT
+/// truncated into the frame: it is already in the artifact store, redacted
+/// (§13.2, §13.4), and the frame says where.
+fn code_studio_event_payload_json(event: &crate::code_studio::events::StoredEvent) -> String {
+    match serde_json::to_string(&event.payload) {
+        Ok(body) if body.len() <= CS_MAX_EVENT_PAYLOAD_BYTES => body,
+        Ok(body) => serde_json::json!({
+            "oversized": true,
+            "bytes": body.len(),
+            "artifact_ref": event.artifact_ref,
+        })
+        .to_string(),
+        Err(e) => serde_json::json!({ "unrenderable": e.to_string() }).to_string(),
+    }
+}
+
+/// Packs one cell's colours and style into the single word `TerminalCellRow`
+/// carries per character:
+///
+/// * bits 0..7 — style flags, the exact bit layout of `terminal::attrs`
+/// * bits 8..15 — foreground colour index
+/// * bits 16..23 — background colour index
+/// * bit 24 — the foreground is set (clear means the theme's default)
+/// * bit 25 — the background is set
+///
+/// A true-colour sequence is quantised to the xterm-256 palette. Two colours
+/// plus the flags do not fit in 32 bits any other way, and one word per
+/// character is the row format the wire already fixed.
+fn code_studio_pack_attrs(cell: &Cell) -> u32 {
+    let mut word = u32::from(cell.attrs & 0x00ff);
+    if let Some(index) = code_studio_color_index(cell.fg) {
+        word |= u32::from(index) << 8;
+        word |= 1 << 24;
+    }
+    if let Some(index) = code_studio_color_index(cell.bg) {
+        word |= u32::from(index) << 16;
+        word |= 1 << 25;
+    }
+    word
+}
+
+fn code_studio_color_index(color: Color) -> Option<u8> {
+    match color {
+        Color::Default => None,
+        Color::Indexed(index) => Some(index),
+        Color::Rgb(r, g, b) => Some(code_studio_quantize_rgb(r, g, b)),
+    }
+}
+
+/// Nearest xterm-256 entry: the 6×6×6 colour cube or the 24-step grey ramp,
+/// whichever is closer. The ramp matters — a neutral grey run through the cube
+/// alone would visibly band.
+fn code_studio_quantize_rgb(r: u8, g: u8, b: u8) -> u8 {
+    const CUBE: [i32; 6] = [0, 95, 135, 175, 215, 255];
+    let nearest = |v: u8| -> usize {
+        CUBE.iter()
+            .enumerate()
+            .min_by_key(|(_, level)| (**level - i32::from(v)).abs())
+            .map(|(i, _)| i)
+            .unwrap_or(0)
+    };
+    let (ri, gi, bi) = (nearest(r), nearest(g), nearest(b));
+    let cube_cost = (CUBE[ri] - i32::from(r)).abs()
+        + (CUBE[gi] - i32::from(g)).abs()
+        + (CUBE[bi] - i32::from(b)).abs();
+
+    let average = (i32::from(r) + i32::from(g) + i32::from(b)) / 3;
+    let grey_step = ((average - 8 + 5) / 10).clamp(0, 23);
+    let grey_value = 8 + grey_step * 10;
+    let grey_cost = (grey_value - i32::from(r)).abs()
+        + (grey_value - i32::from(g)).abs()
+        + (grey_value - i32::from(b)).abs();
+
+    if grey_cost < cube_cost {
+        (232 + grey_step) as u8
+    } else {
+        (16 + 36 * ri + 6 * gi + bi) as u8
+    }
+}
+
+/// Grid rows in wire form. The trailing half of a double-width character is a
+/// placeholder in the grid, not a character: it is dropped, so `attrs` has one
+/// word per character of `text` and a renderer measures width itself.
+fn code_studio_cell_rows(lines: &[GridRow]) -> Vec<TerminalCellRow> {
+    lines
+        .iter()
+        .map(|line| {
+            let mut text = String::with_capacity(line.cells.len());
+            let mut attrs = Vec::with_capacity(line.cells.len());
+            for cell in &line.cells {
+                if cell.ch == '\0' {
+                    continue;
+                }
+                text.push(cell.ch);
+                attrs.push(code_studio_pack_attrs(cell));
+            }
+            TerminalCellRow {
+                row: u32::from(line.index),
+                text,
+                attrs,
+            }
+        })
+        .collect()
+}
+
+fn code_studio_cursor(cursor: Cursor) -> TerminalCursorInfo {
+    TerminalCursorInfo {
+        row: cursor.row,
+        col: cursor.col,
+        visible: cursor.visible,
+    }
+}
+
+/// Live session timeline. History comes from the event log by cursor and the
+/// tail keeps reading the same log, so a reconnect at `after_seq` resumes
+/// exactly where it stopped: the log is written in the same transaction as the
+/// state change it records (§13.3), which is what makes "no gap, no duplicate"
+/// a property of the storage rather than of a buffer.
+fn code_studio_session_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    let (workspace_id, session_id, after_seq) = match req {
+        MessageBody::CodeStudioBody(CodeStudioPayload::SessionStreamRequest {
+            workspace_id,
+            session_id,
+            after_seq,
+        }) => (workspace_id, session_id, after_seq),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(
+            &sub,
+            Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::SessionStreamEnd {
+                    reason: CS_END_NOT_FOUND.to_string(),
+                },
+            )),
+        );
+        return;
+    };
+
+    let gate = CodeStudioStreamGate {
+        db: ctx.state.db.clone(),
+        node_id: ctx.state.local_node_id.to_string(),
+        user_id: org.user_id.clone(),
+        org_id: org.org_id.clone(),
+        workspace_id,
+        session_id: session_id.clone(),
+    };
+    let iroh = ctx.state.quic_mesh.clone();
+
+    tokio::spawn(async move {
+        let end = |reason: &str| CodeStudioPayload::SessionStreamEnd {
+            reason: reason.to_string(),
+        };
+        let (pool, session) = match gate.check_access().await {
+            Ok(CodeStudioStreamTarget::Local { pool, session }) => (pool, session),
+            Ok(CodeStudioStreamTarget::Remote { owner_node_id }) => {
+                // §12.2 — the timeline is written where the session runs, so it
+                // is pulled from there. The browser's `after_seq` still means
+                // the event log's sequence, and it is applied to the frames.
+                if let Some(reason) = code_studio_pull_from_owner(
+                    &sub,
+                    &gate,
+                    iroh,
+                    owner_node_id,
+                    CodeStudioRemoteStream::Timeline,
+                    CS_STREAM_TIMELINE.to_string(),
+                    after_seq,
+                    CS_SESSION_POLL,
+                )
+                .await
+                {
+                    code_studio_end(&sub, end(&reason)).await;
+                }
+                return;
+            }
+            Err(reason) => {
+                code_studio_end(&sub, end(reason)).await;
+                return;
+            }
+        };
+
+        // A cursor beyond i64 cannot name a row; it resumes past the end of the
+        // log rather than wrapping into a replay.
+        let mut cursor = i64::try_from(after_seq).unwrap_or(i64::MAX);
+        let mut status = session.status;
+        let mut last_check = std::time::Instant::now();
+        // Subscribed before the history is read, so an event written during the
+        // catch-up cannot fall between the replay and the tail.
+        let mut waiter = CodeStudioTimelineWaiter::new(&session_id);
+
+        loop {
+            // The status is read BEFORE the drain, so everything the session
+            // wrote up to the moment it closed is still delivered.
+            let finished = matches!(status.as_str(), "closed" | "interrupted");
+
+            loop {
+                let Ok(page) = code_studio_timeline_page(&pool, &session_id, cursor).await else {
+                    code_studio_end(&sub, end(CS_END_INTERNAL)).await;
+                    return;
+                };
+                let drained = page.len() < CS_EVENT_PAGE;
+                for (seq, frame) in page {
+                    // Monotonic: the next read asks for `seq > cursor`, so the
+                    // same event can never be sent twice.
+                    cursor = seq;
+                    // The credit window: awaits a free slot instead of queuing.
+                    if push_chunk_async(&sub, MessageBody::CodeStudioBody(frame))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                if drained {
+                    break;
+                }
+            }
+
+            if finished {
+                code_studio_end(&sub, end(CS_END_SESSION_CLOSED)).await;
+                return;
+            }
+
+            // The writer wakes this loop (§13.3 — the log is the source of
+            // truth and its author says when it grew), so an idle session costs
+            // one query per revalidation instead of one per interval.
+            waiter.wait(cursor).await;
+            if sub.tx.is_closed() {
+                return;
+            }
+            if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+                last_check = std::time::Instant::now();
+                match gate.check_access().await {
+                    Ok(CodeStudioStreamTarget::Local { session, .. }) => status = session.status,
+                    // The workspace moved to another node mid-stream. The log
+                    // this loop is reading stopped being the live one, so the
+                    // stream ends and the client resubscribes — onto the remote
+                    // path this time.
+                    Ok(CodeStudioStreamTarget::Remote { .. }) => {
+                        code_studio_end(&sub, end(CS_END_NOT_LOCAL)).await;
+                        return;
+                    }
+                    Err(reason) => {
+                        code_studio_end(&sub, end(reason)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "CodeStudioSessionStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: code_studio_session_stream_handler,
+    }
+}
+
+/// Live terminal grid. The client sends the revision it holds; anything else
+/// than the live one earns a full snapshot first, because a row is only known
+/// to be current relative to a revision the server issued.
+fn code_studio_terminal_stream_handler(
+    req: MessageBody,
+    ctx: HandlerContext,
+    sub: Arc<Subscription>,
+) {
+    let (workspace_id, session_id, terminal_id, after_revision) = match req {
+        MessageBody::CodeStudioBody(CodeStudioPayload::TerminalStreamRequest {
+            workspace_id,
+            session_id,
+            terminal_id,
+            after_revision,
+        }) => (workspace_id, session_id, terminal_id, after_revision),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(
+            &sub,
+            Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::TerminalStreamEnd {
+                    reason: CS_END_NOT_FOUND.to_string(),
+                },
+            )),
+        );
+        return;
+    };
+
+    let gate = CodeStudioStreamGate {
+        db: ctx.state.db.clone(),
+        node_id: ctx.state.local_node_id.to_string(),
+        user_id: org.user_id.clone(),
+        org_id: org.org_id.clone(),
+        workspace_id: workspace_id.clone(),
+        session_id: session_id.clone(),
+    };
+    let iroh = ctx.state.quic_mesh.clone();
+
+    tokio::spawn(async move {
+        let end = |reason: &str| CodeStudioPayload::TerminalStreamEnd {
+            reason: reason.to_string(),
+        };
+        match gate.check_access().await {
+            Ok(CodeStudioStreamTarget::Local { .. }) => {}
+            Ok(CodeStudioStreamTarget::Remote { owner_node_id }) => {
+                // The VT grid is parsed where the shell runs (§7.9), so this
+                // node pulls finished frames instead of raw bytes it would have
+                // to emulate a second time.
+                if let Some(reason) = code_studio_pull_from_owner(
+                    &sub,
+                    &gate,
+                    iroh,
+                    owner_node_id,
+                    CodeStudioRemoteStream::Terminal,
+                    code_studio_terminal_stream_id(&terminal_id),
+                    after_revision,
+                    CS_REMOTE_TERMINAL_POLL,
+                )
+                .await
+                {
+                    code_studio_end(&sub, end(&reason)).await;
+                }
+                return;
+            }
+            Err(reason) => {
+                code_studio_end(&sub, end(reason)).await;
+                return;
+            }
+        }
+        let Ok(registry) = code_studio_terminal_registry(&workspace_id) else {
+            code_studio_end(&sub, end(CS_END_INTERNAL)).await;
+            return;
+        };
+        // The handle carries the session, so a member cannot reach another
+        // session's terminal by guessing an id.
+        let handle = PtyHandle {
+            terminal_id,
+            session_id,
+        };
+
+        let mut sent = after_revision;
+        match registry.snapshot(&handle) {
+            Ok(grid) => {
+                if sent != grid.revision {
+                    let frame = CodeStudioPayload::TerminalStreamSnapshot {
+                        revision: grid.revision,
+                        grid_rows: grid.rows,
+                        grid_cols: grid.cols,
+                        cursor: code_studio_cursor(grid.cursor),
+                        rows: code_studio_cell_rows(&grid.lines),
+                    };
+                    if push_chunk_async(&sub, MessageBody::CodeStudioBody(frame))
+                        .await
+                        .is_err()
+                    {
+                        return;
+                    }
+                    sent = grid.revision;
+                }
+            }
+            Err(_) => {
+                code_studio_end(&sub, end(CS_END_TERMINAL_NOT_OPEN)).await;
+                return;
+            }
+        }
+
+        let mut last_check = std::time::Instant::now();
+        loop {
+            tokio::time::sleep(CS_TERMINAL_POLL).await;
+            if sub.tx.is_closed() {
+                return;
+            }
+            let Ok(changes) = registry.changes_since(&handle, sent) else {
+                code_studio_end(&sub, end(CS_END_TERMINAL_NOT_OPEN)).await;
+                return;
+            };
+            if changes.revision != sent {
+                let frame = CodeStudioPayload::TerminalStreamDelta {
+                    revision: changes.revision,
+                    grid_rows: changes.rows,
+                    grid_cols: changes.cols,
+                    cursor: code_studio_cursor(changes.cursor),
+                    rows: code_studio_cell_rows(&changes.lines),
+                };
+                if push_chunk_async(&sub, MessageBody::CodeStudioBody(frame))
+                    .await
+                    .is_err()
+                {
+                    return;
+                }
+                sent = changes.revision;
+            }
+            // Checked AFTER the delta above, so the shell's last output reaches
+            // the client before the stream reports that it ended.
+            match registry.state(&handle) {
+                Ok(TerminalState::Running) => {}
+                Ok(_) => {
+                    code_studio_end(&sub, end(CS_END_TERMINAL_EXITED)).await;
+                    return;
+                }
+                Err(_) => {
+                    code_studio_end(&sub, end(CS_END_TERMINAL_NOT_OPEN)).await;
+                    return;
+                }
+            }
+            if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+                last_check = std::time::Instant::now();
+                match gate.check_access().await {
+                    Ok(CodeStudioStreamTarget::Local { .. }) => {}
+                    // The grid this loop reads belongs to a shell on a node the
+                    // workspace no longer runs on.
+                    Ok(CodeStudioStreamTarget::Remote { .. }) => {
+                        code_studio_end(&sub, end(CS_END_NOT_LOCAL)).await;
+                        return;
+                    }
+                    Err(reason) => {
+                        code_studio_end(&sub, end(reason)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "CodeStudioTerminalStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: code_studio_terminal_stream_handler,
+    }
+}
+
+/// One indexer progress record as its wire frame, field for field.
+fn code_studio_index_frame(frame: crate::code_studio::index::IndexProgress) -> CodeStudioPayload {
+    CodeStudioPayload::IndexStreamProgress {
+        seq: frame.seq,
+        job_id: frame.job_id,
+        workspace_id: frame.workspace_id,
+        branch: frame.branch,
+        phase: frame.phase,
+        files_done: frame.files_done,
+        files_total: frame.files_total,
+        chunks: frame.chunks,
+        message: frame.message,
+        terminal: frame.terminal,
+    }
+}
+
+/// Indexing progress (§14). History from `after_seq` first, then the live
+/// channel: the indexer keeps a bounded per-workspace log, so a client that
+/// reconnects with its cursor gets what it missed instead of starting over.
+///
+/// A `terminal` frame ends a JOB, not this subscription — the workspace stays
+/// indexable and the next job publishes onto the same stream, which is what the
+/// wire contract says (`IndexStreamProgress.terminal`). The subscription ends
+/// when access ends, when the index is switched off, or when the client leaves.
+fn code_studio_index_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
+    let (workspace_id, after_seq) = match req {
+        MessageBody::CodeStudioBody(CodeStudioPayload::IndexStreamRequest {
+            workspace_id,
+            after_seq,
+        }) => (workspace_id, after_seq),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
+    let Some(org) = ctx.org_context.as_ref() else {
+        let _ = push_end(
+            &sub,
+            Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::IndexStreamEnd {
+                    reason: CS_END_NOT_FOUND.to_string(),
+                },
+            )),
+        );
+        return;
+    };
+
+    let gate = CodeStudioStreamGate {
+        db: ctx.state.db.clone(),
+        node_id: ctx.state.local_node_id.to_string(),
+        user_id: org.user_id.clone(),
+        org_id: org.org_id.clone(),
+        workspace_id,
+        session_id: String::new(),
+    };
+    let iroh = ctx.state.quic_mesh.clone();
+
+    tokio::spawn(async move {
+        let end = |reason: &str| CodeStudioPayload::IndexStreamEnd {
+            reason: reason.to_string(),
+        };
+        match gate.check_workspace().await {
+            Ok(record) if record.index_enabled => {}
+            Ok(_) => {
+                code_studio_end(&sub, end(CS_END_INDEX_UNAVAILABLE)).await;
+                return;
+            }
+            // The indexer runs where the repository is (§14), so its progress
+            // is pulled from the owner node like every other stream.
+            Err(CS_END_NOT_LOCAL) => {
+                let owner = match gate.check_owner_node().await {
+                    Ok(owner) => owner,
+                    Err(reason) => {
+                        code_studio_end(&sub, end(reason)).await;
+                        return;
+                    }
+                };
+                let stream_id = code_studio_index_stream_id(&gate.workspace_id);
+                if let Some(reason) = code_studio_pull_from_owner(
+                    &sub,
+                    &gate,
+                    iroh,
+                    owner,
+                    CodeStudioRemoteStream::Index,
+                    stream_id,
+                    after_seq,
+                    CS_SESSION_POLL,
+                )
+                .await
+                {
+                    code_studio_end(&sub, end(&reason)).await;
+                }
+                return;
+            }
+            Err(reason) => {
+                code_studio_end(&sub, end(reason)).await;
+                return;
+            }
+        }
+
+        // Subscribed BEFORE the history is read: a frame published between the
+        // two would otherwise fall between the replay and the tail, and the
+        // client would never learn it existed.
+        let mut live = crate::code_studio::index::subscribe_progress(&gate.workspace_id);
+        let mut cursor = after_seq;
+        for frame in crate::code_studio::index::progress_since(&gate.workspace_id, cursor) {
+            cursor = frame.seq;
+            if push_chunk_async(
+                &sub,
+                MessageBody::CodeStudioBody(code_studio_index_frame(frame)),
+            )
+            .await
+            .is_err()
+            {
+                return;
+            }
+        }
+
+        let mut last_check = std::time::Instant::now();
+        loop {
+            // The timeout is what makes the gate below run on an idle stream:
+            // a workspace can go a whole day without an indexing job, and a
+            // membership revoked in that time must still end the subscription.
+            match tokio::time::timeout(CS_REVALIDATE_EVERY, live.recv()).await {
+                Ok(Ok(frame)) => {
+                    if frame.seq > cursor {
+                        cursor = frame.seq;
+                        if push_chunk_async(
+                            &sub,
+                            MessageBody::CodeStudioBody(code_studio_index_frame(frame)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                // The consumer fell behind the broadcast channel. Nothing is
+                // skipped silently: the indexer's bounded history is replayed
+                // from the cursor, and each progress record is cumulative, so
+                // the newest one restates whatever an older one would have said.
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                    for frame in
+                        crate::code_studio::index::progress_since(&gate.workspace_id, cursor)
+                    {
+                        cursor = frame.seq;
+                        if push_chunk_async(
+                            &sub,
+                            MessageBody::CodeStudioBody(code_studio_index_frame(frame)),
+                        )
+                        .await
+                        .is_err()
+                        {
+                            return;
+                        }
+                    }
+                }
+                Ok(Err(tokio::sync::broadcast::error::RecvError::Closed)) => {
+                    code_studio_end(&sub, end(CS_END_INDEX_UNAVAILABLE)).await;
+                    return;
+                }
+                Err(_elapsed) => {}
+            }
+            if sub.tx.is_closed() {
+                return;
+            }
+            if last_check.elapsed() >= CS_REVALIDATE_EVERY {
+                last_check = std::time::Instant::now();
+                match gate.check_workspace().await {
+                    Ok(record) if record.index_enabled => {}
+                    Ok(_) => {
+                        code_studio_end(&sub, end(CS_END_INDEX_UNAVAILABLE)).await;
+                        return;
+                    }
+                    Err(reason) => {
+                        code_studio_end(&sub, end(reason)).await;
+                        return;
+                    }
+                }
+            }
+        }
+    });
+}
+
+inventory::submit! {
+    StreamHandlerMeta {
+        variant_name: "CodeStudioIndexStreamRequest",
+        required_auth: SessionAuthKind::UserSession,
+        handler_fn: code_studio_index_stream_handler,
+    }
+}
+
+// =============================================================================
 // Testy
 // =============================================================================
 
@@ -3077,6 +4906,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             }],
             temperature: None,
             max_tokens: None,
@@ -3110,5 +4940,962 @@ mod tests {
             }
         }
         assert!(got_end, "chat_stream_handler powinien emitowac End");
+    }
+
+    // ---- Code Studio streams (§12.2) ----
+
+    fn code_studio_test_ctx() -> super::super::HandlerContext {
+        super::super::HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: super::super::state::AppState::for_test(),
+            org_context: None,
+        }
+    }
+
+    #[test]
+    fn code_studio_stream_handlers_are_registered() {
+        for variant in [
+            "CodeStudioSessionStreamRequest",
+            "CodeStudioTerminalStreamRequest",
+            "CodeStudioIndexStreamRequest",
+        ] {
+            let handler =
+                find_stream_handler(variant).unwrap_or_else(|| panic!("{variant} not registered"));
+            assert_eq!(handler.required_auth, SessionAuthKind::UserSession);
+        }
+    }
+
+    /// Without an org context there is nobody whose membership could be checked,
+    /// and the answer has to be the same uniform denial a stranger gets — with a
+    /// NAMED reason, because a silent end renders in the UI as "no events yet".
+    #[tokio::test]
+    async fn a_code_studio_stream_without_an_org_context_denies_uniformly() {
+        use super::super::subscription::SubscriptionRegistry;
+        use tentaflow_protocol::code_studio::CodeStudioPayload;
+        use tentaflow_protocol::MessageBody;
+
+        let registry = SubscriptionRegistry::new();
+
+        let (sub, mut rx) = registry.create(1, None);
+        (find_stream_handler("CodeStudioSessionStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::SessionStreamRequest {
+                workspace_id: "w1".into(),
+                session_id: "s1".into(),
+                after_seq: 0,
+            }),
+            code_studio_test_ctx(),
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::SessionStreamEnd { reason },
+            )))) => assert_eq!(reason, "not_found"),
+            other => panic!("expected a named session end, got {other:?}"),
+        }
+
+        let (sub, mut rx) = registry.create(2, None);
+        (find_stream_handler("CodeStudioTerminalStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::TerminalStreamRequest {
+                workspace_id: "w1".into(),
+                session_id: "s1".into(),
+                terminal_id: "t1".into(),
+                after_revision: 0,
+            }),
+            code_studio_test_ctx(),
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::TerminalStreamEnd { reason },
+            )))) => assert_eq!(reason, "not_found"),
+            other => panic!("expected a named terminal end, got {other:?}"),
+        }
+
+        let (sub, mut rx) = registry.create(3, None);
+        (find_stream_handler("CodeStudioIndexStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::IndexStreamRequest {
+                workspace_id: "w1".into(),
+                after_seq: 0,
+            }),
+            code_studio_test_ctx(),
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::IndexStreamEnd { reason },
+            )))) => assert_eq!(reason, "not_found"),
+            other => panic!("expected a named index end, got {other:?}"),
+        }
+    }
+
+    /// A body that is not this stream's request ends the subscription instead of
+    /// leaving the client's slot open forever.
+    #[tokio::test]
+    async fn a_code_studio_stream_refuses_a_body_that_is_not_its_request() {
+        use super::super::subscription::SubscriptionRegistry;
+        use tentaflow_protocol::MessageBody;
+
+        let registry = SubscriptionRegistry::new();
+        let (sub, mut rx) = registry.create(1, None);
+        (find_stream_handler("CodeStudioSessionStreamRequest")
+            .unwrap()
+            .handler_fn)(MessageBody::ModelListRequest, code_studio_test_ctx(), sub);
+        assert!(matches!(
+            rx.recv().await,
+            Some(SubscriptionEvent::End(None))
+        ));
+    }
+
+    /// The attribute word is the only place a cell's colour survives: bits 0..7
+    /// are the style flags, 8..15 the foreground, 16..23 the background, and
+    /// bits 24/25 say whether each colour was set at all. A cell with no colour
+    /// must not claim index 0 — that is black, not "the theme's default".
+    #[test]
+    fn a_terminal_attribute_word_packs_colour_and_style() {
+        use crate::code_studio::terminal::{attrs, Cell, Color};
+
+        assert_eq!(super::code_studio_pack_attrs(&Cell::default()), 0);
+
+        let styled = Cell {
+            ch: 'x',
+            fg: Color::Indexed(9),
+            bg: Color::Indexed(2),
+            attrs: attrs::BOLD | attrs::UNDERLINE,
+        };
+        let word = super::code_studio_pack_attrs(&styled);
+        assert_eq!(word & 0xff, u32::from(attrs::BOLD | attrs::UNDERLINE));
+        assert_eq!((word >> 8) & 0xff, 9);
+        assert_eq!((word >> 16) & 0xff, 2);
+        assert_eq!(word >> 24, 0b11);
+
+        // True colour is quantised: pure red lands on the 6×6×6 cube, a neutral
+        // grey on the 24-step ramp the cube's six levels would band.
+        assert_eq!(super::code_studio_quantize_rgb(255, 0, 0), 196);
+        assert_eq!(super::code_studio_quantize_rgb(128, 128, 128), 244);
+    }
+
+    /// The trailing half of a double-width character is a placeholder in the
+    /// grid, not a character: emitting it would put one attribute word too many
+    /// next to the text and shift every colour after it.
+    #[test]
+    fn a_double_width_placeholder_never_reaches_the_wire() {
+        use crate::code_studio::terminal::{Cell, GridRow};
+
+        let cells = vec![
+            Cell {
+                ch: '字',
+                ..Cell::default()
+            },
+            Cell {
+                ch: '\0',
+                ..Cell::default()
+            },
+            Cell {
+                ch: 'a',
+                ..Cell::default()
+            },
+        ];
+        let rows = super::code_studio_cell_rows(&[GridRow {
+            index: 3,
+            revision: 7,
+            cells,
+        }]);
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].row, 3);
+        assert_eq!(rows[0].text, "字a");
+        assert_eq!(rows[0].attrs.len(), 2);
+    }
+
+    /// §12.2: output above the frame budget goes to the artifact, not into the
+    /// frame. The body is already in the CAS, redacted, so the frame names it
+    /// instead of carrying a truncated copy that would look like the whole
+    /// thing.
+    #[test]
+    fn an_oversized_event_body_travels_as_its_artifact_reference() {
+        use crate::code_studio::events::{EventKind, EventPayload, StoredEvent};
+
+        let small = StoredEvent {
+            event_id: "e1".into(),
+            seq: 1,
+            kind: EventKind::AgentMessage,
+            run_id: None,
+            agent_id: None,
+            payload: EventPayload::AgentMessage {
+                role: "assistant".into(),
+                text: "ok".into(),
+            },
+            artifact_ref: None,
+            security_relevant: false,
+            created_at: "2026-08-14T10:00:00Z".into(),
+        };
+        assert!(super::code_studio_event_payload_json(&small).contains("\"ok\""));
+
+        let huge = StoredEvent {
+            payload: EventPayload::AgentMessage {
+                role: "assistant".into(),
+                text: "x".repeat(super::CS_MAX_EVENT_PAYLOAD_BYTES + 1),
+            },
+            artifact_ref: Some("sha256:abc".into()),
+            ..small
+        };
+        let rendered = super::code_studio_event_payload_json(&huge);
+        assert!(rendered.len() < 512, "{rendered}");
+        assert!(rendered.contains("\"oversized\":true"), "{rendered}");
+        assert!(rendered.contains("sha256:abc"), "{rendered}");
+        assert!(!rendered.contains("xxxx"), "{rendered}");
+    }
+
+    // ---- Code Studio streams across the mesh (§12.2) ----
+
+    const CS_TEST_WORKSPACE: &str = "ws-1";
+    const CS_TEST_SESSION: &str = "sess-1";
+    /// Consumer of the hub streams below. A stream is keyed by the PERSON as
+    /// well as the node, so a test that pulls has to name one.
+    const CS_TEST_USER: &str = "user-1";
+
+    /// Seeds an org, a user, a workspace owned by `owner_node` and a workspace
+    /// membership, then returns the request context the handlers see. The gate
+    /// re-reads all of it from the database, so the rows — not the context —
+    /// are what decides.
+    fn code_studio_seeded_ctx(owner_node: &str) -> super::super::HandlerContext {
+        use crate::services::org::repo as org_repo;
+        use rusqlite::params;
+
+        let state = super::super::state::AppState::for_test();
+        let user_id = uuid::Uuid::new_v4().to_string();
+        let org = org_repo::create_organization(&state.db, "Acme", "acme", None, None, None, None)
+            .expect("create org");
+        let role_id = org_repo::list_roles(&state.db)
+            .expect("roles")
+            .into_iter()
+            .find(|role| role.name == "org_admin")
+            .expect("org_admin must be seeded by the migrations")
+            .role_id;
+        org_repo::add_membership(&state.db, &org.org_id, &user_id, &role_id, &user_id)
+            .expect("org membership");
+        {
+            let conn = state.db.write().expect("db");
+            conn.execute(
+                "INSERT OR IGNORE INTO user_accounts \
+                   (id, username, password_hash, display_name, email, is_active, is_admin, \
+                    created_at, updated_at, role) \
+                 VALUES (?1, ?1, 'x', ?1, ?1, 1, 0, datetime('now'), datetime('now'), 'user')",
+                params![user_id],
+            )
+            .expect("seed user");
+            conn.execute(
+                "INSERT OR IGNORE INTO code_workspaces \
+                   (id, org_id, owner_user_id, name, slug, node_id, exec_mode, \
+                    egress_enforcement, repo_kind, autonomy_ceiling, egress_policy, \
+                    index_enabled, status, created_at, updated_at) \
+                 VALUES (?4, ?2, ?1, 'W', 'w', ?3, 'trusted_native', \
+                    'unrestricted', 'empty', 'normal', 'org_approved', 0, 'active', \
+                    datetime('now'), datetime('now'))",
+                params![user_id, org.org_id, owner_node, CS_TEST_WORKSPACE],
+            )
+            .expect("seed workspace");
+            conn.execute(
+                "INSERT OR REPLACE INTO code_workspace_members \
+                   (workspace_id, user_id, role, added_by, added_at) \
+                 VALUES (?2, ?1, 'owner', ?1, datetime('now'))",
+                params![user_id, CS_TEST_WORKSPACE],
+            )
+            .expect("seed membership");
+        }
+        let org_context =
+            crate::services::rbac::resolve_org_context(&state.db, &user_id, Some(&org.org_id))
+                .expect("org context");
+
+        super::super::HandlerContext {
+            session: tentaflow_protocol::SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: None,
+            },
+            correlation_id: 7,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            org_context: Some(org_context),
+        }
+    }
+
+    /// §12.2 landed: a workspace owned by another node is no longer a dead end.
+    /// Both live streams take the mesh pull path, and a node this one cannot
+    /// reach — here because the test process runs no mesh at all — ends the
+    /// subscription with a CONNECTIVITY reason. Never `workspace_not_local`,
+    /// which would claim the feature does not exist, and never a session
+    /// verdict, which would claim somebody's unfinished work had ended.
+    #[tokio::test]
+    async fn a_remote_workspace_stream_takes_the_pull_path_instead_of_refusing() {
+        use super::super::subscription::SubscriptionRegistry;
+        use tentaflow_protocol::code_studio::CodeStudioPayload;
+        use tentaflow_protocol::MessageBody;
+
+        let registry = SubscriptionRegistry::new();
+
+        let (sub, mut rx) = registry.create(1, None);
+        (find_stream_handler("CodeStudioSessionStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::SessionStreamRequest {
+                workspace_id: CS_TEST_WORKSPACE.into(),
+                session_id: CS_TEST_SESSION.into(),
+                after_seq: 0,
+            }),
+            code_studio_seeded_ctx("node-b"),
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::SessionStreamEnd { reason },
+            )))) => assert_eq!(reason, "owner_unreachable"),
+            other => panic!("expected the timeline to take the pull path, got {other:?}"),
+        }
+
+        let (sub, mut rx) = registry.create(2, None);
+        (find_stream_handler("CodeStudioTerminalStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::TerminalStreamRequest {
+                workspace_id: CS_TEST_WORKSPACE.into(),
+                session_id: CS_TEST_SESSION.into(),
+                terminal_id: "t1".into(),
+                after_revision: 0,
+            }),
+            code_studio_seeded_ctx("node-b"),
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::TerminalStreamEnd { reason },
+            )))) => assert_eq!(reason, "owner_unreachable"),
+            other => panic!("expected the terminal to take the pull path, got {other:?}"),
+        }
+    }
+
+    /// The index runs where the repository is, so a remote workspace's progress
+    /// is pulled like every other stream — and an owner node this process
+    /// cannot reach is CONNECTIVITY, never a claim that the feature is missing.
+    #[tokio::test]
+    async fn a_remote_index_stream_takes_the_pull_path() {
+        use super::super::subscription::SubscriptionRegistry;
+        use tentaflow_protocol::code_studio::CodeStudioPayload;
+        use tentaflow_protocol::MessageBody;
+
+        let registry = SubscriptionRegistry::new();
+        let (sub, mut rx) = registry.create(1, None);
+        (find_stream_handler("CodeStudioIndexStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::IndexStreamRequest {
+                workspace_id: CS_TEST_WORKSPACE.into(),
+                after_seq: 0,
+            }),
+            code_studio_seeded_ctx("node-b"),
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::IndexStreamEnd { reason },
+            )))) => assert_eq!(reason, "owner_unreachable"),
+            other => panic!("expected the index to take the pull path, got {other:?}"),
+        }
+    }
+
+    /// A workspace whose index is switched off says so rather than holding a
+    /// subscription open that nothing will ever write to.
+    #[tokio::test]
+    async fn an_index_stream_on_a_workspace_without_an_index_says_so() {
+        use super::super::subscription::SubscriptionRegistry;
+        use tentaflow_protocol::code_studio::CodeStudioPayload;
+        use tentaflow_protocol::MessageBody;
+
+        // The fixture seeds `index_enabled = 0`, and the local node owns it.
+        let ctx = code_studio_seeded_ctx("test-node");
+        let registry = SubscriptionRegistry::new();
+        let (sub, mut rx) = registry.create(1, None);
+        (find_stream_handler("CodeStudioIndexStreamRequest")
+            .unwrap()
+            .handler_fn)(
+            MessageBody::CodeStudioBody(CodeStudioPayload::IndexStreamRequest {
+                workspace_id: CS_TEST_WORKSPACE.into(),
+                after_seq: 0,
+            }),
+            ctx,
+            sub,
+        );
+        match rx.recv().await {
+            Some(SubscriptionEvent::End(Some(MessageBody::CodeStudioBody(
+                CodeStudioPayload::IndexStreamEnd { reason },
+            )))) => assert_eq!(reason, "index_unavailable"),
+            other => panic!("expected index_unavailable, got {other:?}"),
+        }
+    }
+
+    fn cs_event(seq: u64) -> tentaflow_protocol::code_studio::CodeStudioPayload {
+        tentaflow_protocol::code_studio::CodeStudioPayload::SessionStreamEvent {
+            seq,
+            kind: "agent_message".into(),
+            run_id: None,
+            agent_id: None,
+            created_at: "2026-08-14T10:00:00Z".into(),
+            payload_json: "{\"text\":\"ok\"}".into(),
+            security_relevant: false,
+        }
+    }
+
+    /// The two halves of §12.2 have to agree byte for byte. This drives the
+    /// REAL hub — what an owner node publishes — through the REAL cursor and
+    /// into the decoder the pull loop uses, so it covers the frame encoding,
+    /// the cursor advance, the client's own resume point and the close reason
+    /// in one pass. What it does NOT cover is the mesh round trip between them.
+    #[tokio::test]
+    async fn frames_published_on_the_owner_hub_decode_into_the_frames_the_client_gets() {
+        use crate::code_studio::mesh_stream::{
+            StreamCursor, StreamHub, StreamOpen, KIND_DATA, REASON_SESSION_CLOSED,
+        };
+        use tentaflow_protocol::code_studio::CodeStudioPayload;
+
+        let hub = StreamHub::default();
+        let handle = hub.open(StreamOpen {
+            session_id: CS_TEST_SESSION.into(),
+            stream_id: super::CS_STREAM_TIMELINE.into(),
+            workspace_id: CS_TEST_WORKSPACE.into(),
+            consumer_node_id: "node-a".into(),
+            consumer_user_id: CS_TEST_USER.into(),
+            window: 0,
+            inline_budget: 0,
+            snapshot: None,
+        });
+        for seq in 1..=3u64 {
+            handle
+                .publish(
+                    KIND_DATA,
+                    0,
+                    crate::mesh::cbor::encode(&cs_event(seq)).expect("encode"),
+                )
+                .await
+                .expect("publish");
+        }
+
+        let mut cursor = StreamCursor::default();
+        let batch = cursor.accept(
+            hub.pull_for_peer(
+                "node-a",
+                CS_TEST_USER,
+                CS_TEST_SESSION,
+                super::CS_STREAM_TIMELINE,
+                cursor.after_seq(),
+                cursor.acked_seq,
+                64,
+            )
+            .expect("pull"),
+        );
+        assert_eq!(cursor.last_seq, 3, "the cursor advances over the batch");
+
+        // The browser resumed at event 1, so it must not be handed it again.
+        let (frames, closed) =
+            super::code_studio_decode_batch(super::CodeStudioRemoteStream::Timeline, batch, 1);
+        assert!(closed.is_none(), "a live stream does not end");
+        let seqs: Vec<u64> = frames
+            .iter()
+            .map(|frame| match frame {
+                CodeStudioPayload::SessionStreamEvent { seq, .. } => *seq,
+                other => panic!("the timeline decoded into {other:?}"),
+            })
+            .collect();
+        assert_eq!(seqs, vec![2, 3]);
+        assert_eq!(frames[0], cs_event(2), "the frame survives the round trip");
+
+        // The owner ends the session; the reason travels verbatim.
+        hub.close_session(CS_TEST_SESSION, REASON_SESSION_CLOSED, "operator closed it");
+        let batch = cursor.accept(
+            hub.pull_for_peer(
+                "node-a",
+                CS_TEST_USER,
+                CS_TEST_SESSION,
+                super::CS_STREAM_TIMELINE,
+                cursor.after_seq(),
+                cursor.acked_seq,
+                64,
+            )
+            .expect("pull"),
+        );
+        let (frames, closed) =
+            super::code_studio_decode_batch(super::CodeStudioRemoteStream::Timeline, batch, 3);
+        assert!(frames.is_empty());
+        assert_eq!(
+            closed.as_deref(),
+            Some("session_closed"),
+            "the owner's reason is the reason"
+        );
+    }
+
+    /// A terminal grid crosses the same seam, and the client's `after_revision`
+    /// is applied to the DECODED frame: a snapshot at the revision it already
+    /// holds is the screen it is already showing.
+    #[test]
+    fn a_terminal_grid_crosses_the_seam_and_honours_the_clients_revision() {
+        use crate::code_studio::mesh_stream::{ConsumedBatch, KIND_DATA};
+        use tentaflow_protocol::code_studio::{
+            CodeStudioPayload, TerminalCellRow, TerminalCursorInfo,
+        };
+        use tentaflow_protocol::mesh::CodeStudioStreamFrame;
+
+        let snapshot = CodeStudioPayload::TerminalStreamSnapshot {
+            revision: 12,
+            grid_rows: 24,
+            grid_cols: 80,
+            cursor: TerminalCursorInfo {
+                row: 1,
+                col: 2,
+                visible: true,
+            },
+            rows: vec![TerminalCellRow {
+                row: 0,
+                text: "$ ls".into(),
+                attrs: vec![0, 0, 0, 0],
+            }],
+        };
+        let delta = CodeStudioPayload::TerminalStreamDelta {
+            revision: 13,
+            grid_rows: 24,
+            grid_cols: 80,
+            cursor: TerminalCursorInfo {
+                row: 2,
+                col: 0,
+                visible: true,
+            },
+            rows: Vec::new(),
+        };
+        let wire = |payload: &CodeStudioPayload| CodeStudioStreamFrame {
+            session_id: CS_TEST_SESSION.into(),
+            stream_id: super::code_studio_terminal_stream_id("t1"),
+            seq: 1,
+            kind: KIND_DATA.into(),
+            revision: 0,
+            data: crate::mesh::cbor::encode(payload).expect("encode"),
+        };
+
+        let (frames, closed) = super::code_studio_decode_batch(
+            super::CodeStudioRemoteStream::Terminal,
+            ConsumedBatch {
+                frames: vec![wire(&snapshot), wire(&delta)],
+                duplicates: 0,
+                close: None,
+            },
+            12,
+        );
+        assert!(closed.is_none());
+        assert_eq!(
+            frames,
+            vec![delta],
+            "the snapshot the client already holds is dropped, the delta is not"
+        );
+    }
+
+    /// The owner node authorizes; it does not get to decide what the browser
+    /// renders. A frame of the wrong variant, and output that overflowed into
+    /// an artifact the browser cannot fetch, both END the stream with a named
+    /// reason instead of being forwarded or silently dropped.
+    #[test]
+    fn a_frame_that_does_not_belong_to_the_stream_ends_it() {
+        use crate::code_studio::mesh_stream::{ConsumedBatch, KIND_ARTIFACT, KIND_DATA};
+        use tentaflow_protocol::mesh::CodeStudioStreamFrame;
+
+        let frame = |kind: &str, data: Vec<u8>| CodeStudioStreamFrame {
+            session_id: CS_TEST_SESSION.into(),
+            stream_id: super::CS_STREAM_TIMELINE.into(),
+            seq: 1,
+            kind: kind.into(),
+            revision: 0,
+            data,
+        };
+
+        // A terminal frame on the timeline is build drift, not content.
+        let (frames, closed) = super::code_studio_decode_batch(
+            super::CodeStudioRemoteStream::Timeline,
+            ConsumedBatch {
+                frames: vec![frame(
+                    KIND_DATA,
+                    crate::mesh::cbor::encode(
+                        &tentaflow_protocol::code_studio::CodeStudioPayload::TerminalStreamEnd {
+                            reason: "whatever".into(),
+                        },
+                    )
+                    .expect("encode"),
+                )],
+                duplicates: 0,
+                close: None,
+            },
+            0,
+        );
+        assert!(frames.is_empty());
+        assert_eq!(closed.as_deref(), Some("internal_error"));
+
+        let (frames, closed) = super::code_studio_decode_batch(
+            super::CodeStudioRemoteStream::Timeline,
+            ConsumedBatch {
+                frames: vec![
+                    frame(
+                        KIND_DATA,
+                        crate::mesh::cbor::encode(&cs_event(9)).expect("encode"),
+                    ),
+                    frame(KIND_ARTIFACT, b"sha256:abc".to_vec()),
+                ],
+                duplicates: 0,
+                close: None,
+            },
+            0,
+        );
+        assert_eq!(
+            frames,
+            vec![cs_event(9)],
+            "what was already decoded is still delivered"
+        );
+        assert_eq!(closed.as_deref(), Some("stream_overflow"));
+    }
+
+    /// The stream id is half of the contract with the owner node, and the owner
+    /// node treats it as untrusted input: a timeline and a terminal must name a
+    /// session, a terminal id goes through the filesystem alphabet guard, and
+    /// an index stream must name the workspace it was authorized for — without
+    /// that last rule two workspaces watched from one node would share a key.
+    #[test]
+    fn an_owner_stream_id_is_validated_against_the_rest_of_the_request() {
+        use tentaflow_protocol::mesh::CodeStudioStreamOpenRequest;
+
+        let request = |session: &str, stream: &str| CodeStudioStreamOpenRequest {
+            workspace_id: "ws-1".into(),
+            session_id: session.into(),
+            stream_id: stream.into(),
+            after_revision: 0,
+            window: 0,
+        };
+        let parsed = |session: &str, stream: &str| {
+            super::code_studio_owner_stream(&request(session, stream)).is_some()
+        };
+
+        assert!(parsed("sess-1", super::CS_STREAM_TIMELINE));
+        assert!(parsed("sess-1", "terminal:t1"));
+        assert!(parsed("", "index:ws-1"));
+
+        assert!(
+            !parsed("", super::CS_STREAM_TIMELINE),
+            "a timeline needs a session"
+        );
+        assert!(!parsed("", "terminal:t1"), "a terminal needs a session");
+        assert!(
+            !parsed("sess-1", "index:ws-1"),
+            "the index is workspace scoped"
+        );
+        assert!(
+            !parsed("", "index:ws-2"),
+            "an index stream may only name the workspace it was authorized for"
+        );
+        assert!(
+            !parsed("sess-1", "terminal:../etc"),
+            "the id alphabet holds"
+        );
+        assert!(
+            !parsed("sess-1", "terminal:"),
+            "an empty terminal id is not an id"
+        );
+        assert!(!parsed("sess-1", "something-else"));
+    }
+
+    /// Each shell is its own stream, so two terminals of one session cannot
+    /// collide in the hub — the ids are half of the contract with the owner
+    /// node and the only thing keeping them apart.
+    #[test]
+    fn every_terminal_of_a_session_is_its_own_stream() {
+        assert_ne!(
+            super::code_studio_terminal_stream_id("t1"),
+            super::code_studio_terminal_stream_id("t2")
+        );
+        assert_ne!(
+            super::code_studio_terminal_stream_id("t1"),
+            super::CS_STREAM_TIMELINE
+        );
+    }
+
+    /// Sessions are private to the person who opened them (§5.3), with no
+    /// administrator override (§25.4). This is the ONE gate both paths run —
+    /// the browser attached to this node and, through
+    /// `remote_proxy::open_owner_stream`, every stream command arriving over
+    /// the mesh — so the property is proved once for both.
+    mod code_studio_stream_gate {
+        use rusqlite::params;
+
+        const ORG: &str = "org-cs-streams";
+        const NODE: &str = "node-owner";
+
+        struct Fixture {
+            _data: tempfile::TempDir,
+            _registry: tempfile::TempDir,
+            _guard: std::sync::MutexGuard<'static, ()>,
+            db: crate::db::DbPool,
+            /// Unique per fixture: `workspace_db` caches pools by id for the
+            /// whole process, so two tests sharing an id would share a database
+            /// whose directory the first one already deleted.
+            workspace: String,
+            alice: String,
+            bob: String,
+        }
+
+        impl Drop for Fixture {
+            fn drop(&mut self) {
+                crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+            }
+        }
+
+        fn seed_user(db: &crate::db::DbPool, workspace: &str, role_id: &str) -> String {
+            let user_id = uuid::Uuid::new_v4().to_string();
+            let conn = db.write().expect("db");
+            conn.execute(
+                "INSERT INTO user_accounts \
+                   (id, username, password_hash, display_name, email, is_active, is_admin, \
+                    created_at, updated_at, role) \
+                 VALUES (?1, ?1, 'x', ?1, ?1, 1, 0, datetime('now'), datetime('now'), 'user')",
+                params![user_id],
+            )
+            .expect("account");
+            conn.execute(
+                "INSERT INTO org_memberships (org_id, user_id, role_id, granted_at, granted_by) \
+                 VALUES (?1, ?2, ?3, datetime('now'), ?2)",
+                params![ORG, user_id, role_id],
+            )
+            .expect("org membership");
+            conn.execute(
+                "INSERT INTO code_workspace_members \
+                   (workspace_id, user_id, role, added_by, added_at) \
+                 VALUES (?1, ?2, 'editor', ?2, datetime('now'))",
+                params![workspace, user_id],
+            )
+            .expect("workspace membership");
+            user_id
+        }
+
+        fn fixture() -> Fixture {
+            let guard = crate::code_studio::paths::test_data_dir_guard();
+            let data = tempfile::tempdir().expect("data dir");
+            crate::paths::set_category_override(
+                crate::paths::StorageCategory::Data,
+                Some(data.path().to_string_lossy().to_string()),
+            );
+            let registry = tempfile::tempdir().expect("registry dir");
+            let db = crate::db::init(&registry.path().join("tentaflow.db")).expect("init db");
+            let workspace = format!("ws-{}", uuid::Uuid::new_v4());
+            let role_id = crate::services::org::repo::list_roles(&db)
+                .expect("roles")
+                .into_iter()
+                .find(|r| r.name == "org_admin")
+                .expect("org_admin is seeded by the migrations")
+                .role_id;
+            {
+                let conn = db.write().expect("db");
+                conn.execute(
+                    "INSERT INTO organizations (org_id, name, slug, status, created_at) \
+                     VALUES (?1, 'Streams', ?1, 'active', datetime('now'))",
+                    params![ORG],
+                )
+                .expect("org");
+                conn.execute(
+                    "INSERT INTO code_workspaces \
+                       (id, org_id, owner_user_id, name, slug, node_id, exec_mode, \
+                        egress_enforcement, repo_kind, autonomy_ceiling, egress_policy, \
+                        index_enabled, status, created_at, updated_at) \
+                     VALUES (?1, ?2, 'seed', 'W', 'w', ?3, 'trusted_native', 'unrestricted', \
+                        'empty', 'normal', 'org_approved', 0, 'active', datetime('now'), \
+                        datetime('now'))",
+                    params![workspace, ORG, NODE],
+                )
+                .expect("workspace");
+            }
+            let alice = seed_user(&db, &workspace, &role_id);
+            let bob = seed_user(&db, &workspace, &role_id);
+
+            let dir = crate::code_studio::paths::workspace_dir(&workspace).expect("workspace dir");
+            std::fs::create_dir_all(&dir).expect("workspace directory");
+            let pool = crate::code_studio::workspace_db::open(&workspace).expect("workspace db");
+            {
+                let conn = pool.write().expect("workspace db");
+                for (session, user) in [("sess-alice", &alice), ("sess-bob", &bob)] {
+                    conn.execute(
+                        "INSERT INTO sessions (id, workspace_id, user_id, title, branch, \
+                          autonomy_mode, flow_id, flow_version_id, status, created_at, updated_at) \
+                         VALUES (?1, ?2, ?3, 'Session', 'cs/' || ?1, 'normal', 'flow', 'v1', \
+                          'running', datetime('now'), datetime('now'))",
+                        params![session, workspace, user],
+                    )
+                    .expect("session");
+                }
+            }
+
+            Fixture {
+                _data: data,
+                _registry: registry,
+                _guard: guard,
+                db,
+                workspace,
+                alice,
+                bob,
+            }
+        }
+
+        fn authorize(f: &Fixture, user: &str, session: &str) -> Result<(), &'static str> {
+            super::super::code_studio_authorize_stream(
+                &f.db,
+                NODE,
+                user,
+                ORG,
+                &f.workspace,
+                session,
+            )
+            .map(|_| ())
+        }
+
+        /// The hole this closes: a stream used to be bound to a NODE, so a
+        /// member of the workspace could read a colleague's session by naming
+        /// its id. The refusal is also WORD FOR WORD the one a session that
+        /// does not exist produces, so it cannot be used to discover that one
+        /// does.
+        #[test]
+        fn another_persons_session_is_refused_exactly_like_a_missing_one() {
+            let f = fixture();
+            authorize(&f, &f.alice, "sess-alice").expect("her own session");
+            authorize(&f, &f.bob, "sess-bob").expect("his own session");
+
+            let theirs = authorize(&f, &f.bob, "sess-alice").expect_err("not his session");
+            let missing = authorize(&f, &f.bob, "sess-nobody").expect_err("no such session");
+            assert_eq!(theirs, super::super::CS_END_NOT_FOUND);
+            assert_eq!(theirs, missing, "the two refusals must be identical");
+
+            // And the wire form is one message with no id in it, so the two are
+            // indistinguishable on the other node as well.
+            assert_eq!(
+                crate::code_studio::remote_proxy::STREAM_NOT_FOUND,
+                "code studio session not found"
+            );
+        }
+
+        /// `bob` is an `org_admin` holding `code_studio.admin` and a member of
+        /// the workspace. §25.4 gives the administrator metadata and lifecycle,
+        /// never the content of somebody's session.
+        #[test]
+        fn an_administrator_gets_the_same_answer_as_a_stranger() {
+            let f = fixture();
+            let org = crate::services::rbac::resolve_org_context(&f.db, &f.bob, Some(ORG))
+                .expect("org context");
+            assert!(
+                org.has("code_studio.admin"),
+                "the fixture must give bob the administrator permission"
+            );
+            assert_eq!(
+                authorize(&f, &f.bob, "sess-alice").expect_err("still not his session"),
+                super::super::CS_END_NOT_FOUND
+            );
+        }
+
+        /// Re-authorization reads the DATABASE, not a snapshot taken when the
+        /// stream opened: this is the call a producer repeats every
+        /// `CS_REVALIDATE_EVERY`, and every mesh pull repeats its workspace
+        /// half. A role taken away therefore ends the stream with a named
+        /// reason.
+        #[test]
+        fn a_revoked_role_is_seen_by_the_next_re_authorization() {
+            let f = fixture();
+            authorize(&f, &f.alice, "sess-alice").expect("permitted before");
+
+            {
+                let conn = f.db.write().expect("db");
+                conn.execute(
+                    "DELETE FROM code_workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
+                    params![f.workspace, f.alice],
+                )
+                .expect("revoke membership");
+            }
+            assert_eq!(
+                authorize(&f, &f.alice, "sess-alice").expect_err("membership is gone"),
+                super::super::CS_END_NOT_FOUND
+            );
+
+            // Losing the org role names the loss for what it is, and that word
+            // is the one the stream closes with.
+            {
+                let conn = f.db.write().expect("db");
+                conn.execute(
+                    "DELETE FROM org_memberships WHERE org_id = ?1 AND user_id = ?2",
+                    params![ORG, f.bob],
+                )
+                .expect("revoke org role");
+            }
+            assert_eq!(
+                authorize(&f, &f.bob, "sess-bob").expect_err("org role is gone"),
+                super::super::CS_END_PERMISSION_REVOKED
+            );
+        }
+
+        /// A revoked reader is not answered with an empty batch: the stream is
+        /// closed with the gate's own reason and the next pull carries it. This
+        /// is exactly the pair of steps `remote_proxy::pull_owner_stream` takes.
+        #[tokio::test]
+        async fn a_revoked_reader_gets_the_close_record_not_silence() {
+            let f = fixture();
+            let hub = crate::code_studio::mesh_stream::StreamHub::default();
+            let handle = hub.open(crate::code_studio::mesh_stream::StreamOpen {
+                session_id: "sess-alice".into(),
+                stream_id: super::super::CS_STREAM_TIMELINE.into(),
+                workspace_id: f.workspace.clone(),
+                consumer_node_id: "node-dashboard".into(),
+                consumer_user_id: f.alice.clone(),
+                window: 8,
+                inline_budget: 0,
+                snapshot: None,
+            });
+            handle
+                .publish(crate::code_studio::mesh_stream::KIND_DATA, 1, vec![1])
+                .await
+                .expect("publish");
+
+            {
+                let conn = f.db.write().expect("db");
+                conn.execute(
+                    "DELETE FROM org_memberships WHERE org_id = ?1 AND user_id = ?2",
+                    params![ORG, f.alice],
+                )
+                .expect("revoke org role");
+            }
+            let reason = authorize(&f, &f.alice, "sess-alice").expect_err("access ended");
+            hub.close_session("sess-alice", reason, "re-checked against the database");
+
+            let result = hub
+                .pull_for_peer(
+                    "node-dashboard",
+                    &f.alice,
+                    "sess-alice",
+                    super::super::CS_STREAM_TIMELINE,
+                    0,
+                    0,
+                    64,
+                )
+                .expect("the close record is still readable");
+            assert_eq!(
+                result.close.expect("closed").reason,
+                super::super::CS_END_PERMISSION_REVOKED
+            );
+        }
     }
 }

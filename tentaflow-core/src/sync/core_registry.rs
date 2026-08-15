@@ -47,6 +47,11 @@ pub enum CoreSyncResourceKind {
     ModelPricing,
     CameraCvPipeline,
     VisionModel,
+    CodeWorkspace,
+    CodeWorkspaceMember,
+    CodeWorkspaceCreatorGrant,
+    CodeWorkspaceProjectLink,
+    CodeWorkspaceAllowlist,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +486,83 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         retention: CoreSyncRetention::Durable,
         partition_suffix: "cameras",
     },
+    // Code Studio registry (plan §5.1) — the catalog of WHAT exists and who may
+    // touch it, org-scoped and replicated so a workspace created on the desktop
+    // is visible on the phone. Only its `node_id` may RUN it; every other node
+    // renders it and says whose it is (`is_local` is computed against the local
+    // node id, never assumed).
+    //
+    // The whole satellite set shares ONE partition with the workspace row (the
+    // same grouping `addon_config` keeps with its `addons` install). A satellite
+    // that still arrives before its workspace is answered with
+    // `DeferredOrdering`, so the inbox retries it instead of burning it as a
+    // conflict.
+    //
+    // NEVER add here, and the omission is a security boundary, not an oversight:
+    //   * `code_workspace_secrets` / `code_agent_credentials` (§5.2) — key
+    //     material encrypted with the PER-NODE SettingsCipher key. Replicated it
+    //     would be undecryptable at the far end anyway, so shipping it would only
+    //     widen the attack surface for no gain. Same decision as `addon_config`,
+    //     which replicates `is_secret=0` rows only.
+    //   * `session_assertion_jti` (§12.1) — a replay guard is meaningful only on
+    //     the node that verifies the assertion.
+    //   * everything in `workspace.db` (sessions, events, operations, patch sets)
+    //     — owner-node runtime; remote access is `RemoteProxy` over the mesh
+    //     (§3, §12), not replication.
+    //   * `code_workspace_saga_steps` — the provisioning run state of ONE node's
+    //     saga. No other node can resume, retry or compensate it, and the durable
+    //     outcome a remote UI needs (`status` + `status_detail`) already travels
+    //     on the workspace row. Same class as `flow_executions` / `agent_runs`.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::CodeWorkspace,
+        table_name: "code_workspaces",
+        resource_type: "core.code_workspace",
+        primary_key_column: "id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "code-studio",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::CodeWorkspaceMember,
+        table_name: "code_workspace_members",
+        resource_type: "core.code_workspace_member",
+        primary_key_column: "workspace_id,user_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "code-studio",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::CodeWorkspaceCreatorGrant,
+        table_name: "code_workspace_creator_grants",
+        resource_type: "core.code_workspace_creator_grant",
+        primary_key_column: "org_id,user_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "code-studio",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::CodeWorkspaceProjectLink,
+        table_name: "code_workspace_project_links",
+        resource_type: "core.code_workspace_project_link",
+        primary_key_column: "workspace_id,project_id",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "code-studio",
+    },
+    // Identity is the UNIQUE triple, NOT the table's `id INTEGER PRIMARY KEY
+    // AUTOINCREMENT`: two nodes hand the same rowid to different rows, so a
+    // rowid-keyed resource would make one node's `net_egress` grant overwrite
+    // another's `git_push` grant. Nothing reads or writes an allowlist row by
+    // `id` — every query in Code Studio already keys on the triple.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::CodeWorkspaceAllowlist,
+        table_name: "code_workspace_allowlist",
+        resource_type: "core.code_workspace_allowlist",
+        primary_key_column: "workspace_id,capability,pattern",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "code-studio",
+    },
 ];
 
 pub fn descriptor_for_kind(kind: CoreSyncResourceKind) -> &'static CoreSyncDescriptor {
@@ -593,6 +675,89 @@ mod tests {
             rollup.partition_id("org-default", None).unwrap().as_str(),
             "core/org/org-default/metrics"
         );
+    }
+
+    #[test]
+    fn registry_contains_code_studio_tables() {
+        for (table, resource_type, primary_key) in [
+            ("code_workspaces", "core.code_workspace", "id"),
+            (
+                "code_workspace_members",
+                "core.code_workspace_member",
+                "workspace_id,user_id",
+            ),
+            (
+                "code_workspace_creator_grants",
+                "core.code_workspace_creator_grant",
+                "org_id,user_id",
+            ),
+            (
+                "code_workspace_project_links",
+                "core.code_workspace_project_link",
+                "workspace_id,project_id",
+            ),
+            (
+                "code_workspace_allowlist",
+                "core.code_workspace_allowlist",
+                "workspace_id,capability,pattern",
+            ),
+        ] {
+            let descriptor =
+                descriptor_for_table(table).unwrap_or_else(|| panic!("missing descriptor {table}"));
+            assert_eq!(descriptor.resource_type, resource_type);
+            assert_eq!(descriptor.primary_key_column, primary_key);
+            assert_eq!(
+                descriptor.scope,
+                CoreSyncScope::Organization,
+                "{table} is org-wide (plan §5.1)"
+            );
+            assert_eq!(descriptor.retention, CoreSyncRetention::Durable);
+            // One partition for the whole set: a satellite row must be ordered
+            // after the workspace it references.
+            assert_eq!(
+                descriptor
+                    .partition_id("org-default", None)
+                    .unwrap()
+                    .as_str(),
+                "core/org/org-default/code-studio"
+            );
+        }
+    }
+
+    #[test]
+    fn code_studio_allowlist_is_not_keyed_by_its_autoincrement_id() {
+        // Two nodes assign the same rowid to different rows, so `id` can never be
+        // the replicated identity of an allowlist entry.
+        let allowlist = descriptor_for_kind(CoreSyncResourceKind::CodeWorkspaceAllowlist);
+        assert_ne!(allowlist.primary_key_column, "id");
+        assert_eq!(
+            allowlist.primary_key_column,
+            "workspace_id,capability,pattern"
+        );
+    }
+
+    #[test]
+    fn code_studio_vault_and_runtime_tables_are_not_core_synced() {
+        for table in [
+            // §5.2 — key material encrypted with the per-node SettingsCipher key.
+            "code_workspace_secrets",
+            "code_agent_credentials",
+            // Replay protection is local by definition (§12.1).
+            "session_assertion_jti",
+            // Provisioning run state of one node's saga.
+            "code_workspace_saga_steps",
+            // §5.3 — owner-node runtime (`workspace.db`), reached over the mesh.
+            "sessions",
+            "events",
+            "operations",
+            "patch_sets",
+            "approvals",
+        ] {
+            assert!(
+                !is_core_sync_table(table),
+                "{table} must stay out of core sync"
+            );
+        }
     }
 
     #[test]

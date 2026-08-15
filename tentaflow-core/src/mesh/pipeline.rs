@@ -906,6 +906,30 @@ async fn handle_peer_connected(
     peer_store.mark_routes_dirty();
 }
 
+/// Tear down everything Code Studio holds for a peer whose trust just ended.
+///
+/// Both halves have to happen at the moment of revocation, not the next time the
+/// peer touches the command path: a session stream keeps producing frames on its
+/// own, and a signed assertion the peer already holds stays verifiable for as
+/// long as its key does. Closing the streams with `trust_lost` also tells the
+/// far side WHY its output stopped, instead of leaving the UI unable to
+/// distinguish a finished session from a lost node.
+fn revoke_code_studio_peer(node_id: &str, detail: &str) {
+    let closed = crate::code_studio::mesh_stream::hub().close_for_node(
+        node_id,
+        crate::code_studio::mesh_stream::REASON_TRUST_LOST,
+        detail,
+    );
+    crate::code_studio::assertion::forget_peer_keys(node_id);
+    if closed > 0 {
+        info!(
+            peer = %node_id,
+            closed,
+            "Code Studio: closed the peer's streams after trust loss"
+        );
+    }
+}
+
 /// [SCALE] Handler PeerDisconnected wywolywany w tokio::spawn z per-peer
 /// lockiem. Debounce 150ms + emit event + auto-reconnect dla trusted.
 async fn handle_peer_disconnected(
@@ -935,6 +959,14 @@ async fn handle_peer_disconnected(
     // for verifying new tokens; drop them from the pool. They will be
     // re-acquired on the next reconnect's advertise.
     crate::services::mesh_keys::sync::forget_peer(&node_id);
+    // Same rule for the Code Studio assertion verification keys: verifier-only
+    // material that must not outlive the connection it arrived on. A reconnect
+    // re-advertises, and a peer that misses the advertisement is pulled from on
+    // the first unknown `kid`. The STREAMS are deliberately left open — a
+    // disconnect is not a loss of trust, and the consumer resumes from
+    // `after_seq` out of the replay buffer, so closing here would turn every
+    // transient drop into a dead session.
+    crate::code_studio::assertion::forget_peer_keys(&node_id);
 
     let hostname = peer_store.get_hostname(&node_id).unwrap_or_default();
     crate::dispatch::system_event_broadcast::publish_mesh_peer_status(
@@ -1909,6 +1941,10 @@ fn spawn_quic_event_handler(
                                 // Drop their advertised robots so the resolver stops
                                 // routing to a node we no longer trust.
                                 crate::mesh::robot_dispatch::global().remove_node(trusted_id);
+                                revoke_code_studio_peer(
+                                    trusted_id,
+                                    &format!("removed from mesh by {}", node_id),
+                                );
                             }
                             info!(
                                 "Odlaczony z mesh przez {} — usunieto {} kluczy",
@@ -1941,6 +1977,10 @@ fn spawn_quic_event_handler(
                             // Drop the revoked node's advertised robots so the
                             // resolver stops routing commands to an untrusted owner.
                             crate::mesh::robot_dispatch::global().remove_node(&revoked_node_id);
+                            revoke_code_studio_peer(
+                                &revoked_node_id,
+                                &format!("trust revoked, propagated by {}", node_id),
+                            );
                             info!(
                                 "Usunieto {} z mesh (propagacja od {})",
                                 revoked_node_id, node_id
@@ -3559,6 +3599,10 @@ fn spawn_trust_expiry_prune(
                     &mesh_security.db,
                     &node.node_id,
                 );
+                revoke_code_studio_peer(
+                    &node.node_id,
+                    &format!("trust expired after {} idle days", idle_days),
+                );
                 // Forget the in-memory registry entry so liveness/reconnect drop it now.
                 if let Some(registry) = peer_store.registry() {
                     if let Ok(id_bytes) = hex_to_node_id(&node.node_id) {
@@ -3921,5 +3965,57 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
             }
             Err(e) => warn!(peer = %peer_id, "SyncPull repair build failed: {}", e),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::code_studio::assertion;
+    use crate::code_studio::mesh_stream::{self, StreamOpen, KIND_DATA, REASON_TRUST_LOST};
+
+    #[tokio::test]
+    async fn revoking_trust_closes_the_peers_streams_and_forgets_its_assertion_keys() {
+        // The process-wide hub and key pool are shared by every test in this
+        // binary, so the ids below are unique to this one.
+        let node = "node-x-trust-revoke";
+        let user = "user-pipeline-trust-revoke";
+        let session = "sess-pipeline-trust-revoke";
+        let hub = mesh_stream::hub();
+        let handle = hub.open(StreamOpen {
+            session_id: session.to_string(),
+            stream_id: "s".to_string(),
+            workspace_id: format!("ws-{session}"),
+            consumer_node_id: node.to_string(),
+            consumer_user_id: user.to_string(),
+            window: 8,
+            inline_budget: 0,
+            snapshot: None,
+        });
+        handle
+            .publish(KIND_DATA, 0, vec![1])
+            .await
+            .expect("publish");
+
+        // Any valid advertisement will do — this node's own keys are the only
+        // ones a unit test can mint, and ingest only cares that `kid` matches.
+        assert!(
+            assertion::ingest_peer_keys(node, &assertion::local_advertise()) > 0,
+            "the peer must hold keys before the revocation"
+        );
+
+        super::revoke_code_studio_peer(node, "test revocation");
+
+        let result = hub
+            .pull_for_peer(node, user, session, "s", 0, 0, 64)
+            .expect("pull");
+        assert_eq!(
+            result.close.expect("the stream must be closed").reason,
+            REASON_TRUST_LOST
+        );
+        assert_eq!(
+            assertion::peer_key_count(node),
+            0,
+            "the revoked peer's assertion keys must be gone"
+        );
     }
 }

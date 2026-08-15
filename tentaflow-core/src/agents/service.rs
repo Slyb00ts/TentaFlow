@@ -70,6 +70,13 @@ impl AgentService {
         &self.db
     }
 
+    /// The node's settings key. `delegate_cli` needs it to open the Code Studio
+    /// vault row holding the provider credential (§5.2) — the key is per node,
+    /// which is what makes that credential node-local.
+    pub fn settings_cipher(&self) -> &Arc<crate::crypto::SettingsCipher> {
+        self.addon_manager.settings_cipher()
+    }
+
     // ------------------------------------------------------------------
     // Skills index
     // ------------------------------------------------------------------
@@ -276,6 +283,43 @@ impl AgentService {
     /// tool_exec block rejects out-of-surface calls before dispatch (§3.3).
     pub fn tool_allowed(&self, tools_json: &str, name: &str) -> bool {
         tool_in_allowlist(tools_json, name)
+    }
+
+    /// The allowlist of the agent the harness pinned on the run
+    /// (`envelope.meta["agent_id"]`). THE one loader: `tool_exec` and every
+    /// deterministic block that runs a core verb read the surface here, so the
+    /// graph can never out-rank the agent definition.
+    ///
+    /// No agent id, or an id that no longer resolves, yields `"[]"` — an empty
+    /// surface rejects everything, which is the right answer for a
+    /// misconfigured flow.
+    pub fn agent_tools_json(&self, agent_id: Option<&str>) -> String {
+        agent_id
+            .and_then(|id| self.get_agent(id).ok().flatten())
+            .map(|agent| agent.tools_json)
+            .unwrap_or_else(|| "[]".to_string())
+    }
+
+    /// Fail-closed gate for a GRAPH block that runs a core verb on the agent's
+    /// behalf (§10: `agents.tools_json` is the first sieve, before the PEP).
+    ///
+    /// A flow author dropping an `exec_command` block into the harness of a
+    /// read-only agent must get the agent's answer, not the graph's: the block
+    /// therefore passes exactly the sieve a model-issued call passes.
+    pub fn require_core_tool(&self, agent_id: Option<&str>, tool: CoreToolName) -> Result<()> {
+        let name = tool.public_name();
+        if self.tool_allowed(&self.agent_tools_json(agent_id), name) {
+            return Ok(());
+        }
+        let who = match agent_id {
+            Some(id) => format!("agent '{id}'"),
+            None => "this run (no agent pinned in meta.agent_id)".to_string(),
+        };
+        Err(anyhow::anyhow!(
+            "'{name}' is not in the tool allowlist of {who}: a flow block runs the verb on the \
+             agent's behalf, so it passes the same first sieve (agents.tools_json) as a call the \
+             model issues"
+        ))
     }
 
     /// Executes every call of one assistant turn for a run principal: core.*

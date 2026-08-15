@@ -6296,11 +6296,100 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            // Code Studio delegates to `code_studio::sync_capture`, the same
+            // module the live writes use. Reseed must reproduce the exact
+            // capture shape peers materialize, and one implementation is the
+            // only way to keep that true as the registry grows.
+            K::CodeWorkspace => {
+                let ids = collect_text_column(&tx, "SELECT id FROM code_workspaces")?;
+                for workspace_id in ids {
+                    crate::code_studio::sync_capture::capture_workspace(&tx, &workspace_id)?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceMember => {
+                let mut stmt =
+                    tx.prepare("SELECT workspace_id, user_id FROM code_workspace_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (workspace_id, user_id) in rows {
+                    crate::code_studio::sync_capture::capture_member(&tx, &workspace_id, &user_id)?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceCreatorGrant => {
+                let mut stmt =
+                    tx.prepare("SELECT org_id, user_id FROM code_workspace_creator_grants")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (grant_org_id, user_id) in rows {
+                    crate::code_studio::sync_capture::capture_creator_grant(
+                        &tx,
+                        &grant_org_id,
+                        &user_id,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceProjectLink => {
+                let mut stmt = tx
+                    .prepare("SELECT workspace_id, project_id FROM code_workspace_project_links")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (workspace_id, project_id) in rows {
+                    crate::code_studio::sync_capture::capture_project_link(
+                        &tx,
+                        &workspace_id,
+                        &project_id,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceAllowlist => {
+                // The AUTOINCREMENT `id` is deliberately not selected: it is
+                // node-local and plays no part in the replicated identity.
+                let mut stmt = tx.prepare(
+                    "SELECT workspace_id, capability, pattern FROM code_workspace_allowlist",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (workspace_id, capability, pattern) in rows {
+                    crate::code_studio::sync_capture::capture_allowlist_entry(
+                        &tx,
+                        &workspace_id,
+                        &capability,
+                        &pattern,
+                    )?;
+                    emitted += 1;
+                }
+            }
         }
     }
 
     tx.commit()?;
     Ok(emitted)
+}
+
+fn collect_text_column(tx: &rusqlite::Transaction<'_>, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(sql)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Snapshot of an `addons` row for mesh sync. Built from a SELECT (reseed) or
@@ -6459,7 +6548,7 @@ fn record_core_capture_tx(
     )
 }
 
-fn record_core_capture_for_org_tx(
+pub(crate) fn record_core_capture_for_org_tx(
     tx: &rusqlite::Transaction<'_>,
     kind: crate::sync::core_registry::CoreSyncResourceKind,
     org_id: &str,
@@ -25483,6 +25572,44 @@ mod api_key_access_v2_tests {
                 .unwrap();
             assert_eq!(count, 1, "missing default policy for {resource_type}");
         }
+    }
+
+    /// Registering a descriptor is only half of it — without an enabled policy
+    /// the row never leaves the outbox, so the Code Studio registry has to be
+    /// covered by the startup seeding just like Flow Builder and RBAC.
+    #[test]
+    fn default_policies_cover_code_studio_registry() {
+        let db = fresh_db();
+        ensure_default_core_sync_policies(&db).unwrap();
+        let conn = acquire(&db).unwrap();
+        for resource_type in [
+            "core.code_workspace",
+            "core.code_workspace_member",
+            "core.code_workspace_creator_grant",
+            "core.code_workspace_project_link",
+            "core.code_workspace_allowlist",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_policies \
+                     WHERE resource_type = ?1 AND mode = 'replicated_by_permission' \
+                       AND is_enabled = 1",
+                    rusqlite::params![resource_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing default policy for {resource_type}");
+        }
+        // The vault never gets a policy, because it never gets a descriptor.
+        let vault: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_policies WHERE resource_type LIKE '%secret%' \
+                   AND resource_type LIKE 'core.code%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vault, 0);
     }
 }
 

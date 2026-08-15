@@ -31,6 +31,7 @@ pub mod benchmark;
 pub mod camera_admin;
 #[cfg(feature = "camera")]
 pub mod camera_detections;
+pub mod code_studio;
 pub mod compliance_admin;
 pub mod handlers;
 pub mod legal_admin;
@@ -2001,6 +2002,132 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::SessionOpenResponse { .. } => "CodeStudioSessionOpenResponse",
                 Cs::SessionCloseRequest { .. } => "CodeStudioSessionCloseRequest",
                 Cs::SessionCloseResponse { .. } => "CodeStudioSessionCloseResponse",
+                Cs::FileTreeRequest { .. } => "CodeStudioFileTreeRequest",
+                Cs::FileTreeResponse { .. } => "CodeStudioFileTreeResponse",
+                Cs::FileReadRequest { .. } => "CodeStudioFileReadRequest",
+                Cs::FileReadResponse { .. } => "CodeStudioFileReadResponse",
+                Cs::FileWriteRequest { .. } => "CodeStudioFileWriteRequest",
+                Cs::FileWriteResponse { .. } => "CodeStudioFileWriteResponse",
+                Cs::FileCreateRequest { .. } => "CodeStudioFileCreateRequest",
+                Cs::FileDeleteRequest { .. } => "CodeStudioFileDeleteRequest",
+                Cs::FileRenameRequest { .. } => "CodeStudioFileRenameRequest",
+                Cs::FileMkdirRequest { .. } => "CodeStudioFileMkdirRequest",
+                Cs::FileMutationResponse { .. } => "CodeStudioFileMutationResponse",
+                Cs::FileGrepRequest { .. } => "CodeStudioFileGrepRequest",
+                Cs::FileGrepResponse { .. } => "CodeStudioFileGrepResponse",
+                Cs::GitStatusRequest { .. } => "CodeStudioGitStatusRequest",
+                Cs::GitStatusResponse { .. } => "CodeStudioGitStatusResponse",
+                Cs::GitLogRequest { .. } => "CodeStudioGitLogRequest",
+                Cs::GitLogResponse { .. } => "CodeStudioGitLogResponse",
+                Cs::GitBranchesRequest { .. } => "CodeStudioGitBranchesRequest",
+                Cs::GitBranchesResponse { .. } => "CodeStudioGitBranchesResponse",
+                Cs::GitDiffRequest { .. } => "CodeStudioGitDiffRequest",
+                Cs::GitDiffResponse { .. } => "CodeStudioGitDiffResponse",
+                Cs::GitCommitRequest { .. } => "CodeStudioGitCommitRequest",
+                Cs::GitCommitResponse { .. } => "CodeStudioGitCommitResponse",
+                Cs::GitPushRequest { .. } => "CodeStudioGitPushRequest",
+                Cs::GitPushResponse { .. } => "CodeStudioGitPushResponse",
+                Cs::GitSyncRequest { .. } => "CodeStudioGitSyncRequest",
+                Cs::GitSyncResponse { .. } => "CodeStudioGitSyncResponse",
+                Cs::GitMergeRequest { .. } => "CodeStudioGitMergeRequest",
+                Cs::GitMergeResponse { .. } => "CodeStudioGitMergeResponse",
+                Cs::GitMergeFinalizeRequest { .. } => "CodeStudioGitMergeFinalizeRequest",
+                Cs::GitMergeFinalizeResponse { .. } => "CodeStudioGitMergeFinalizeResponse",
+                Cs::GitMergeAbandonRequest { .. } => "CodeStudioGitMergeAbandonRequest",
+                Cs::WorktreesListRequest { .. } => "CodeStudioWorktreesListRequest",
+                Cs::WorktreesListResponse { .. } => "CodeStudioWorktreesListResponse",
+                Cs::PatchSetsListRequest { .. } => "CodeStudioPatchSetsListRequest",
+                Cs::PatchSetsListResponse { .. } => "CodeStudioPatchSetsListResponse",
+                Cs::PatchSetGetRequest { .. } => "CodeStudioPatchSetGetRequest",
+                Cs::PatchSetGetResponse { .. } => "CodeStudioPatchSetGetResponse",
+                Cs::PatchDecideRequest { .. } => "CodeStudioPatchDecideRequest",
+                Cs::PatchDecideResponse { .. } => "CodeStudioPatchDecideResponse",
+                Cs::PatchSetAbandonRequest { .. } => "CodeStudioPatchSetAbandonRequest",
+                Cs::SessionTimelineRequest { .. } => "CodeStudioSessionTimelineRequest",
+                Cs::SessionTimelineResponse { .. } => "CodeStudioSessionTimelineResponse",
+                Cs::SessionOperationsRequest { .. } => "CodeStudioSessionOperationsRequest",
+                Cs::SessionOperationsResponse { .. } => "CodeStudioSessionOperationsResponse",
+                Cs::OperationResolveRequest { .. } => "CodeStudioOperationResolveRequest",
+                Cs::OperationResolveResponse { .. } => "CodeStudioOperationResolveResponse",
+                Cs::ApprovalsListRequest { .. } => "CodeStudioApprovalsListRequest",
+                Cs::ApprovalsListResponse { .. } => "CodeStudioApprovalsListResponse",
+                Cs::ApprovalDecideRequest { .. } => "CodeStudioApprovalDecideRequest",
+                Cs::ApprovalDecideResponse { .. } => "CodeStudioApprovalDecideResponse",
+                Cs::SessionGrantsListRequest { .. } => "CodeStudioSessionGrantsListRequest",
+                Cs::SessionGrantsListResponse { .. } => "CodeStudioSessionGrantsListResponse",
+                Cs::SessionGrantRevokeRequest { .. } => "CodeStudioSessionGrantRevokeRequest",
+                Cs::WorkspaceAllowlistListRequest { .. } => {
+                    "CodeStudioWorkspaceAllowlistListRequest"
+                }
+                Cs::WorkspaceAllowlistListResponse { .. } => {
+                    "CodeStudioWorkspaceAllowlistListResponse"
+                }
+                Cs::WorkspaceAllowlistSetRequest { .. } => "CodeStudioWorkspaceAllowlistSetRequest",
+                Cs::WorkspaceAllowlistRemoveRequest { .. } => {
+                    "CodeStudioWorkspaceAllowlistRemoveRequest"
+                }
+                Cs::SessionRunsRequest { .. } => "CodeStudioSessionRunsRequest",
+                Cs::SessionRunsResponse { .. } => "CodeStudioSessionRunsResponse",
+                Cs::SessionMessageSendRequest { .. } => "CodeStudioSessionMessageSendRequest",
+                Cs::SessionMessageSendResponse { .. } => "CodeStudioSessionMessageSendResponse",
+                Cs::SessionCancelRequest { .. } => "CodeStudioSessionCancelRequest",
+                Cs::SessionCancelResponse { .. } => "CodeStudioSessionCancelResponse",
+                Cs::SessionAutonomySetRequest { .. } => "CodeStudioSessionAutonomySetRequest",
+                Cs::SessionAutonomySetResponse { .. } => "CodeStudioSessionAutonomySetResponse",
+                Cs::ExecStartRequest { .. } => "CodeStudioExecStartRequest",
+                Cs::ExecStartResponse { .. } => "CodeStudioExecStartResponse",
+                Cs::ExecCancelRequest { .. } => "CodeStudioExecCancelRequest",
+                Cs::ExecCancelResponse { .. } => "CodeStudioExecCancelResponse",
+                Cs::ExecOutputRequest { .. } => "CodeStudioExecOutputRequest",
+                Cs::ExecOutputResponse { .. } => "CodeStudioExecOutputResponse",
+                Cs::TerminalOpenRequest { .. } => "CodeStudioTerminalOpenRequest",
+                Cs::TerminalOpenResponse { .. } => "CodeStudioTerminalOpenResponse",
+                Cs::TerminalInputRequest { .. } => "CodeStudioTerminalInputRequest",
+                Cs::TerminalResizeRequest { .. } => "CodeStudioTerminalResizeRequest",
+                Cs::TerminalCloseRequest { .. } => "CodeStudioTerminalCloseRequest",
+                Cs::TerminalSnapshotRequest { .. } => "CodeStudioTerminalSnapshotRequest",
+                Cs::TerminalSnapshotResponse { .. } => "CodeStudioTerminalSnapshotResponse",
+                Cs::WorkspaceSettingsUpdateRequest { .. } => {
+                    "CodeStudioWorkspaceSettingsUpdateRequest"
+                }
+                Cs::WorkspaceSettingsUpdateResponse { .. } => {
+                    "CodeStudioWorkspaceSettingsUpdateResponse"
+                }
+                Cs::WorkspaceSecretSetRequest { .. } => "CodeStudioWorkspaceSecretSetRequest",
+                Cs::WorkspaceSecretSetResponse { .. } => "CodeStudioWorkspaceSecretSetResponse",
+                Cs::WorkspaceDeleteRequest { .. } => "CodeStudioWorkspaceDeleteRequest",
+                Cs::WorkspaceDeleteResponse { .. } => "CodeStudioWorkspaceDeleteResponse",
+                Cs::IndexStatusRequest { .. } => "CodeStudioIndexStatusRequest",
+                Cs::IndexStatusResponse { .. } => "CodeStudioIndexStatusResponse",
+                Cs::IndexRebuildRequest { .. } => "CodeStudioIndexRebuildRequest",
+                Cs::IndexRebuildResponse { .. } => "CodeStudioIndexRebuildResponse",
+                Cs::CodeSearchRequest { .. } => "CodeStudioCodeSearchRequest",
+                Cs::CodeSearchResponse { .. } => "CodeStudioCodeSearchResponse",
+                Cs::SessionStreamRequest { .. } => "CodeStudioSessionStreamRequest",
+                Cs::SessionStreamEvent { .. } => "CodeStudioSessionStreamEvent",
+                Cs::SessionStreamEnd { .. } => "CodeStudioSessionStreamEnd",
+                Cs::TerminalStreamRequest { .. } => "CodeStudioTerminalStreamRequest",
+                Cs::TerminalStreamSnapshot { .. } => "CodeStudioTerminalStreamSnapshot",
+                Cs::TerminalStreamDelta { .. } => "CodeStudioTerminalStreamDelta",
+                Cs::TerminalStreamEnd { .. } => "CodeStudioTerminalStreamEnd",
+                Cs::IndexStreamRequest { .. } => "CodeStudioIndexStreamRequest",
+                Cs::IndexStreamEnd { .. } => "CodeStudioIndexStreamEnd",
+                Cs::PatchBlobGetRequest { .. } => "CodeStudioPatchBlobGetRequest",
+                Cs::PatchBlobGetResponse { .. } => "CodeStudioPatchBlobGetResponse",
+                Cs::TerminalsListRequest { .. } => "CodeStudioTerminalsListRequest",
+                Cs::TerminalsListResponse { .. } => "CodeStudioTerminalsListResponse",
+                Cs::WorkspaceMemberCandidatesRequest { .. } => {
+                    "CodeStudioWorkspaceMemberCandidatesRequest"
+                }
+                Cs::WorkspaceMemberCandidatesResponse { .. } => {
+                    "CodeStudioWorkspaceMemberCandidatesResponse"
+                }
+                Cs::IndexStreamProgress { .. } => "CodeStudioIndexStreamProgress",
+                Cs::ProjectLinkListRequest { .. } => "CodeStudioProjectLinkListRequest",
+                Cs::ProjectLinkListResponse { .. } => "CodeStudioProjectLinkListResponse",
+                Cs::ProjectLinkSetRequest { .. } => "CodeStudioProjectLinkSetRequest",
+                Cs::RepoTreeRequest { .. } => "CodeStudioRepoTreeRequest",
+                Cs::RepoTreeResponse { .. } => "CodeStudioRepoTreeResponse",
             }
         }
     }

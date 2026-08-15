@@ -252,6 +252,44 @@ mod tests {
     }
 
     #[test]
+    fn code_studio_names_parse_and_a_typo_admits_nothing() {
+        // The allowlist is the first sieve of §10: every Code Studio verb must
+        // resolve, and a name that is not a known builtin must admit NOTHING —
+        // not the tool, and not a silent passthrough to the addon dispatcher.
+        for tool in CoreToolName::all().iter().filter(|t| t.is_code_studio()) {
+            assert_eq!(
+                AllowlistEntry::parse(tool.public_name()),
+                Some(AllowlistEntry::Core(*tool)),
+                "{}",
+                tool.public_name()
+            );
+        }
+        assert_eq!(
+            AllowlistEntry::parse("core.code_search"),
+            Some(AllowlistEntry::Core(CoreToolName::CodeSearch))
+        );
+        assert!(AllowlistEntry::parse("core.fs_chmod").is_none());
+        // A typo does not fall through to "an addon called core".
+        let json = r#"["core.fs_read","core.fs_chmod"]"#;
+        assert!(tool_in_allowlist(json, "core.fs_read"));
+        assert!(!tool_in_allowlist(json, "core.fs_chmod"));
+        assert_eq!(parse_allowlist(json).len(), 1);
+    }
+
+    #[test]
+    fn a_read_only_agent_never_surfaces_a_write_verb() {
+        // §15: the separation of duties is the allowlist, and no permission
+        // check can widen it — `is_permitted` is consulted for ADDON tools only.
+        let reviewer = r#"["core.fs_read","core.fs_grep","core.git_read"]"#;
+        let specs =
+            ToolCatalog::resolve(reviewer, &AgentPrincipal::user("u1"), &[], true, |_| true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["core.fs_read", "core.fs_grep", "core.git_read"]);
+        assert!(!names.contains(&"core.fs_write"));
+        assert!(!names.contains(&"core.git_push"));
+    }
+
+    #[test]
     fn tool_in_allowlist_matches_addon_and_core() {
         let json = r#"["memory.*","core.skill_view"]"#;
         assert!(tool_in_allowlist(json, "memory.memory_store"));

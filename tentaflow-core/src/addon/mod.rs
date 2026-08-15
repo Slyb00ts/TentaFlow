@@ -674,6 +674,13 @@ enum CallIdentity<'a> {
 }
 
 impl AddonManager {
+    /// Klucz ustawien tego wezla. Jeden wlasciciel na proces, wiec inne warstwy
+    /// (Code Studio vault w bloku `delegate_cli`) pytaja o niego tutaj zamiast
+    /// tworzyc drugi cipher z tym samym kluczem.
+    pub fn settings_cipher(&self) -> &Arc<crate::crypto::SettingsCipher> {
+        &self.settings_cipher
+    }
+
     /// Tworzy nowy AddonManager z podana baza danych
     pub fn new(db: DbPool, settings_cipher: Arc<crate::crypto::SettingsCipher>) -> Result<Self> {
         let engine = runtime::create_engine()?;

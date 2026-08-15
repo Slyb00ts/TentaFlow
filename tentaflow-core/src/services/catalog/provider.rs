@@ -505,6 +505,13 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "ocr_pages",
     // Per-platform switch: forwards the payload unchanged to the target_os port.
     "platform_switch",
+    // Code Studio (§16.4): all four act on a repository worktree and a session,
+    // never on a media payload — they add context, gate on a human decision,
+    // run a command, or delegate a turn to an external CLI.
+    "workspace_context",
+    "patch_review",
+    "exec_command",
+    "delegate_cli",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks

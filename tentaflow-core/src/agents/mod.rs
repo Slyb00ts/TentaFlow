@@ -5,16 +5,16 @@
 
 mod builtins;
 mod catalog;
-mod interaction;
+pub(crate) mod interaction;
 mod principal;
 mod retention_purge;
-mod run_manager;
+pub(crate) mod run_manager;
 mod service;
 mod subagent_reactor;
 
 use std::sync::Arc;
 
-pub use builtins::{is_core_tool, BuiltinToolError, CoreToolName};
+pub use builtins::{is_core_tool, BuiltinToolError, CoreToolName, CORE_ADDON_ID};
 pub use catalog::{tool_in_allowlist, AllowlistEntry, ToolCatalog};
 pub use interaction::{
     await_reply as await_interaction_reply, global as interaction_registry_global,

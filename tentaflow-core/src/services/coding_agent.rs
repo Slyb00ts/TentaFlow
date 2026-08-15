@@ -1,9 +1,65 @@
 // ============ File: coding_agent.rs — Validated proxy to node-owned coding-agent CLI bridges. ============
+//
+// Defect D1 of the Code Studio plan (§1.2) is a property of THIS file as much as
+// of the bridge: a model list that reaches the CLI is a model list that can cost
+// a vendor session, so the question has to stop here whenever the answer is
+// already known. `models.list` is answered from a Core-side cache with a TTL;
+// only an explicit `refresh` travels to the bridge, and only a caller who meant
+// it sets that flag.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
 use crate::services::transport::Transport;
 use crate::services_repo::services::ServiceRow;
+
+/// How long a discovered model list is served without asking the bridge again.
+/// A CLI gains models when the vendor ships a release, which also restarts the
+/// service — so this bound exists for the case where nothing restarts for days,
+/// not as the mechanism that keeps the list fresh.
+const MODELS_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+struct CachedModels {
+    /// Raw bridge response, replayed verbatim so every caller sees exactly what
+    /// the bridge said.
+    response_json: String,
+    fetched_at: Instant,
+}
+
+fn models_cache() -> &'static Mutex<HashMap<i64, CachedModels>> {
+    static CACHE: OnceLock<Mutex<HashMap<i64, CachedModels>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Serves a cached model list, if one is fresh for this service.
+fn cached_models(service_id: i64) -> Option<String> {
+    let cache = models_cache().lock().ok()?;
+    let entry = cache.get(&service_id)?;
+    (entry.fetched_at.elapsed() < MODELS_CACHE_TTL).then(|| entry.response_json.clone())
+}
+
+fn store_models(service_id: i64, response_json: &str) {
+    if let Ok(mut cache) = models_cache().lock() {
+        cache.insert(
+            service_id,
+            CachedModels {
+                response_json: response_json.to_string(),
+                fetched_at: Instant::now(),
+            },
+        );
+    }
+}
+
+/// Drops the cached list of one service. Called when the service is removed or
+/// redeployed, so a stale list cannot outlive the bridge that produced it.
+pub fn forget_models(service_id: i64) {
+    if let Ok(mut cache) = models_cache().lock() {
+        cache.remove(&service_id);
+    }
+}
 
 pub fn sync_models(
     db: &crate::db::DbPool,
@@ -84,6 +140,15 @@ pub async fn execute(
     }
 
     let (method, path, body) = route(operation, payload_json)?;
+    // A cached model list never reaches the bridge, so it can never reach the
+    // CLI. `refresh` is encoded in the routed path, which is also what makes the
+    // check impossible to bypass by spelling the payload differently.
+    let serve_models_from_cache = operation == "models.list" && !path.contains("refresh=1");
+    if serve_models_from_cache {
+        if let Some(cached) = cached_models(service.id) {
+            return Ok(cached);
+        }
+    }
     let client = reqwest::Client::builder()
         .timeout(std::time::Duration::from_secs(65))
         .build()
@@ -106,6 +171,9 @@ pub async fn execute(
     }
     serde_json::from_str::<Value>(&text)
         .map_err(|e| format!("bridge returned invalid JSON: {e}"))?;
+    if operation == "models.list" {
+        store_models(service.id, &text);
+    }
     Ok(text)
 }
 
@@ -406,8 +474,114 @@ mod tests {
     }
 
     #[test]
+    fn a_cached_model_list_is_served_without_reaching_the_bridge() {
+        // The service id is local to this test, so the process-global cache is
+        // not shared with any other test.
+        let service_id = -4_242;
+        assert!(cached_models(service_id).is_none());
+        store_models(service_id, r#"{"models":[{"id":"sonnet"}]}"#);
+        assert_eq!(
+            cached_models(service_id).as_deref(),
+            Some(r#"{"models":[{"id":"sonnet"}]}"#),
+            "a fresh list must be answered from Core, never from the CLI"
+        );
+
+        // An explicit refresh routes to a path the cache check refuses to
+        // match, which is what lets a deliberate probe through.
+        assert!(!path_of("models.list", "{}").contains("refresh=1"));
+        assert!(path_of("models.list", r#"{"refresh":true}"#).contains("refresh=1"));
+
+        forget_models(service_id);
+        assert!(
+            cached_models(service_id).is_none(),
+            "a restarted bridge must not be answered from the previous instance's list"
+        );
+    }
+
+    #[test]
     fn unknown_operations_are_refused() {
         assert!(route("session.kill", r#"{"session_id":"abc"}"#).is_err());
+    }
+
+    /// Defect D1, measured the way the plan asks for it: count what the bridge —
+    /// and therefore the CLI — is asked to do. Repeated discovery must cost the
+    /// bridge exactly one call, because every call to a Claude Code bridge is a
+    /// call that used to end in a vendor session.
+    #[tokio::test]
+    async fn repeated_discovery_reaches_the_bridge_once() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .expect("bind stub bridge");
+        let port = listener.local_addr().expect("addr").port();
+        let hits = std::sync::Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            while let Ok((mut socket, _)) = listener.accept().await {
+                let counter = counter.clone();
+                tokio::spawn(async move {
+                    let mut buffer = [0_u8; 4096];
+                    let read = socket.read(&mut buffer).await.unwrap_or(0);
+                    if String::from_utf8_lossy(&buffer[..read]).contains("/models") {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                    }
+                    let body = r#"{"models":[{"id":"sonnet","display_name":"Sonnet"}]}"#;
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = socket.write_all(response.as_bytes()).await;
+                    let _ = socket.shutdown().await;
+                });
+            }
+        });
+
+        let file = tempfile::NamedTempFile::new().unwrap();
+        let db = crate::db::init(file.path()).unwrap();
+        let service_id = {
+            let conn = db.write().unwrap();
+            conn.execute(
+                "INSERT INTO services (engine_id, category, display_name, deploy_method, \
+                    transport, status, endpoint_url) VALUES ('claude-code', 'agents', \
+                    'Claude Code', 'native_managed_cli', 'agent_rpc', 'running', ?1)",
+                rusqlite::params![format!("http://127.0.0.1:{port}")],
+            )
+            .unwrap();
+            conn.last_insert_rowid()
+        };
+        let service = {
+            let conn = db.read().unwrap();
+            crate::services_repo::services::get(&conn, service_id)
+                .unwrap()
+                .unwrap()
+        };
+        forget_models(service.id);
+
+        for _ in 0..5 {
+            execute(&service, "models.list", "{}")
+                .await
+                .expect("models.list");
+        }
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "the supervisor tick, the sessions window and the login path must share one answer"
+        );
+
+        // An explicit refresh is the deliberate exception, and it refills the
+        // cache rather than bypassing it forever.
+        execute(&service, "models.list", r#"{"refresh":true}"#)
+            .await
+            .expect("refresh");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        execute(&service, "models.list", "{}")
+            .await
+            .expect("cached again");
+        assert_eq!(hits.load(Ordering::SeqCst), 2);
+        forget_models(service.id);
     }
 
     #[test]

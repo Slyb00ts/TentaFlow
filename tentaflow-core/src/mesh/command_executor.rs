@@ -115,6 +115,16 @@ impl MeshCommandExecutor {
                 from = %from_node_id,
                 "Odrzucono komende od niezaufanego noda"
             );
+            // Trust is also what keeps a Code Studio stream open. A peer that
+            // reaches us without it must not keep a live stream on the other
+            // side of the connection, and it must not keep verification keys
+            // in our pool either (§12.2 — closing states the reason).
+            crate::code_studio::mesh_stream::hub().close_for_node(
+                from_node_id,
+                crate::code_studio::mesh_stream::REASON_TRUST_LOST,
+                "peer is no longer trusted",
+            );
+            crate::code_studio::assertion::forget_peer_keys(from_node_id);
             return CommandResponse::fail(format!("Node {} nie jest zaufany", from_node_id));
         }
 
@@ -475,6 +485,51 @@ impl MeshCommandExecutor {
                 payload_json,
             } => {
                 self.handle_agent_rpc(service_id, operation, payload_json)
+                    .await
+            }
+
+            MeshCommandType::CodeStudioOp {
+                assertion,
+                payload_cbor,
+            } => {
+                self.handle_code_studio_op(from_node_id, assertion, payload_cbor)
+                    .await
+            }
+            MeshCommandType::CodeStudioAssertionKeysPush { keys } => {
+                let accepted = crate::code_studio::assertion::ingest_peer_keys(from_node_id, &keys);
+                debug!(
+                    from = %from_node_id,
+                    accepted,
+                    "code studio: assertion keys ingested"
+                );
+                CommandResponse::ok(MeshCommandResponsePayload::Empty)
+            }
+            MeshCommandType::CodeStudioAssertionKeysGet => {
+                CommandResponse::ok(MeshCommandResponsePayload::CodeStudioAssertionKeysResult {
+                    keys: crate::code_studio::assertion::local_advertise(),
+                })
+            }
+            MeshCommandType::CodeStudioPermissionProbe {
+                user_id,
+                org_id,
+                workspace_id,
+                capability,
+            } => {
+                self.handle_code_studio_permission_probe(user_id, org_id, workspace_id, capability)
+                    .await
+            }
+            MeshCommandType::CodeStudioStreamPull {
+                assertion,
+                request_cbor,
+            } => {
+                self.handle_code_studio_stream_pull(from_node_id, assertion, request_cbor)
+                    .await
+            }
+            MeshCommandType::CodeStudioStreamOpen {
+                assertion,
+                request_cbor,
+            } => {
+                self.handle_code_studio_stream_open(from_node_id, assertion, request_cbor)
                     .await
             }
             MeshCommandType::MlTrainStart { run_id, spec_json } => {
@@ -1182,6 +1237,156 @@ impl MeshCommandExecutor {
             }
             Err(error) => CommandResponse::fail(error),
         }
+    }
+
+    /// Owner side of a forwarded Code Studio request (§12.1).
+    ///
+    /// Everything of substance lives in `code_studio::remote_proxy`: verify the
+    /// assertion, authorize FROM SCRATCH against this node's own state, probe
+    /// the issuer for permission freshness when the operation is irreversible,
+    /// and then run the ordinary local handler. There is no second
+    /// implementation of Code Studio behaviour here.
+    ///
+    /// A refusal travels as a successful mesh response carrying the typed
+    /// `ProtocolError`, the same shape `RobotControl` uses: the caller must see
+    /// the protocol code, not a transport failure that flattens it to a string.
+    async fn handle_code_studio_op(
+        &self,
+        from_node_id: &str,
+        assertion: tentaflow_protocol::mesh::SessionAssertion,
+        payload_cbor: Vec<u8>,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("code studio mesh context is not initialized");
+        };
+        let (payload_cbor, error) = crate::code_studio::remote_proxy::execute_owner_side(
+            from_node_id,
+            &assertion,
+            &payload_cbor,
+            &ctx.iroh,
+        )
+        .await;
+        if let Some(error) = &error {
+            warn!(
+                from = %from_node_id,
+                user = %assertion.sub,
+                workspace = %assertion.workspace,
+                code = ?error.code,
+                "code studio: forwarded operation refused"
+            );
+        }
+        CommandResponse::ok(MeshCommandResponsePayload::CodeStudioOpResult {
+            payload_cbor,
+            error,
+        })
+    }
+
+    /// Answer another node's permission-freshness probe (§12.1) from THIS
+    /// node's live database — the whole value of the probe is that it sees a
+    /// revocation made a moment ago, so nothing here may be cached.
+    async fn handle_code_studio_permission_probe(
+        &self,
+        user_id: String,
+        org_id: String,
+        workspace_id: String,
+        capability: String,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("code studio mesh context is not initialized");
+        };
+        let answered = tokio::task::spawn_blocking(move || {
+            crate::code_studio::remote_proxy::answer_permission_probe(
+                &ctx.db,
+                &user_id,
+                &org_id,
+                &workspace_id,
+                &capability,
+            )
+        })
+        .await;
+        match answered {
+            Ok(payload) => CommandResponse::ok(payload),
+            Err(e) => CommandResponse::fail(format!("permission probe task failed: {e}")),
+        }
+    }
+
+    /// Serve one consumer read of a Code Studio stream (§12.2).
+    ///
+    /// The assertion decides WHO is reading — trust in the peer node is not an
+    /// answer to that question (§12.1) — and the hub then only serves the
+    /// stream opened for exactly that person on exactly that node. Everything
+    /// else, including another user of the same trusted node naming a session
+    /// id, gets the answer a stream that does not exist produces.
+    async fn handle_code_studio_stream_pull(
+        &self,
+        from_node_id: &str,
+        assertion: tentaflow_protocol::mesh::SessionAssertion,
+        request_cbor: Vec<u8>,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("code studio mesh context is not initialized");
+        };
+        match crate::code_studio::remote_proxy::pull_owner_stream(
+            from_node_id,
+            &assertion,
+            &request_cbor,
+            &ctx.iroh,
+        )
+        .await
+        {
+            Ok(result) => CommandResponse::ok(MeshCommandResponsePayload::CodeStudioStreamResult {
+                frames: result.frames,
+                close: result.close,
+                highest_seq: result.highest_seq,
+            }),
+            Err(error) => {
+                warn!(
+                    from = %from_node_id,
+                    sub = %assertion.sub,
+                    code = ?error.code,
+                    "code studio: stream read refused"
+                );
+                CommandResponse::fail(error.message)
+            }
+        }
+    }
+
+    /// Open a Code Studio stream for the actor an assertion names (§12.2). The
+    /// owner node authorizes from scratch and only then starts producing, so a
+    /// stream never exists before somebody was allowed to read it.
+    async fn handle_code_studio_stream_open(
+        &self,
+        from_node_id: &str,
+        assertion: tentaflow_protocol::mesh::SessionAssertion,
+        request_cbor: Vec<u8>,
+    ) -> CommandResponse {
+        let Some(ctx) = self.service_action_ctx().await else {
+            return CommandResponse::fail("code studio mesh context is not initialized");
+        };
+        let opened = crate::code_studio::remote_proxy::open_owner_stream(
+            from_node_id,
+            &assertion,
+            &request_cbor,
+            &ctx.iroh,
+        )
+        .await;
+        let (highest_seq, error) = match opened {
+            Ok(highest_seq) => (highest_seq, None),
+            Err(error) => {
+                warn!(
+                    from = %from_node_id,
+                    sub = %assertion.sub,
+                    workspace = %assertion.workspace,
+                    code = ?error.code,
+                    "code studio: stream open refused"
+                );
+                (0, Some(error))
+            }
+        };
+        CommandResponse::ok(MeshCommandResponsePayload::CodeStudioStreamOpenResult {
+            highest_seq,
+            error,
+        })
     }
 
     /// Owner side of a forwarded vector op: run it against THIS node's local

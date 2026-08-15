@@ -4600,6 +4600,119 @@ mod tests {
         });
     }
 
+    /// A workspace created on node A must be visible on node B — the product
+    /// promise "start on the desktop, finish on the phone" is exactly this.
+    /// Node B stores the OWNER node id, which is what lets it render the
+    /// workspace while refusing to run it.
+    #[test]
+    fn core_materializer_replicates_a_code_studio_workspace_to_another_node() {
+        with_tmp_home(|| {
+            let source = make_runtime(61);
+            let receiver = make_runtime(62);
+
+            let new = crate::code_studio::models::NewWorkspace {
+                id: "ws-mesh-1".into(),
+                org_id: crate::services::org::DEFAULT_ORG_ID.into(),
+                owner_user_id: "u-owner".into(),
+                name: "TentaFlow Core".into(),
+                slug: "tentaflow-core".into(),
+                node_id: "node-a".into(),
+                exec_mode: crate::code_studio::models::ExecMode::TrustedNative,
+                container_image: None,
+                egress_enforcement: crate::code_studio::models::EgressEnforcement::Unrestricted,
+                repo_kind: "git".into(),
+                repo_url: Some("https://example.invalid/repo.git".into()),
+                repo_auth_kind: Some("token".into()),
+                // A HANDLE, not material: the vault row it points at stays on
+                // node A, so node B answers `secret_missing` instead of pretending.
+                secret_ref: Some("secret-handle-1".into()),
+                ssh_host_fingerprint: None,
+                default_branch: None,
+                target_branch: None,
+                autonomy_ceiling: crate::code_studio::models::AutonomyMode::Normal,
+                egress_policy: "org_approved".into(),
+                index_enabled: false,
+                quota_disk_bytes: Some(1_073_741_824),
+                quota_sessions: Some(3),
+            };
+            crate::code_studio::repository::create_workspace(&source.runtime.db, &new)
+                .expect("create workspace");
+
+            let mut ops = Vec::new();
+            crate::sync::core_capture::drain_pending_core_captures_with(
+                &source.runtime.db,
+                64,
+                |capture| {
+                    let record = source.runtime.record_core_capture(capture)?;
+                    ops.push(record.op_id);
+                    Ok(Some(record.op_id))
+                },
+            )
+            .expect("drain captures");
+            assert_eq!(ops.len(), 2, "workspace + owner membership");
+
+            let operations: Vec<_> = ops
+                .iter()
+                .map(|op_id| source.runtime.ledger.get_operation(*op_id).expect("op"))
+                .collect();
+
+            // The membership carries an FK to the workspace. Arriving first it
+            // must stay retryable, not become a terminal conflict.
+            let member_first = operations
+                .iter()
+                .find(|op| op.body.resource_type == "core.code_workspace_member")
+                .expect("member op");
+            let deferred = crate::sync::core_materializer::apply_core_operation(
+                &receiver.runtime.db,
+                &receiver.runtime.settings_cipher,
+                member_first,
+            )
+            .expect_err("member before workspace must not apply");
+            assert!(
+                matches!(deferred, SyncLedgerError::DeferredOrdering(_)),
+                "expected a retryable ordering gap, got {deferred:?}"
+            );
+
+            // Apply the workspace first, then the rest — which is what the inbox
+            // achieves by retrying the deferred entry on the next drain.
+            let mut ordered: Vec<_> = operations.iter().collect();
+            ordered.sort_by_key(|op| op.body.resource_type != "core.code_workspace");
+            for operation in ordered {
+                crate::sync::core_materializer::apply_core_operation(
+                    &receiver.runtime.db,
+                    &receiver.runtime.settings_cipher,
+                    operation,
+                )
+                .expect("apply code studio operation");
+            }
+
+            let landed =
+                crate::code_studio::repository::get_workspace(&receiver.runtime.db, "ws-mesh-1")
+                    .expect("get workspace")
+                    .expect("workspace must exist on the receiving node");
+            assert_eq!(landed.name, "TentaFlow Core");
+            assert_eq!(landed.node_id, "node-a");
+            assert_eq!(landed.status, "provisioning");
+            assert_eq!(landed.quota_sessions, Some(3));
+            assert_eq!(landed.secret_ref.as_deref(), Some("secret-handle-1"));
+            // `is_local` is derived from this comparison in the dispatch layer;
+            // the receiver's own node id is not node-a, so the workspace is remote.
+            assert_ne!(landed.node_id, receiver.runtime.local_node_id);
+
+            let role = crate::code_studio::repository::role_of(
+                &receiver.runtime.db,
+                "ws-mesh-1",
+                "u-owner",
+            )
+            .expect("role");
+            assert_eq!(
+                role,
+                Some(crate::code_studio::models::WorkspaceRole::Owner),
+                "a workspace without its owner membership is unreachable"
+            );
+        });
+    }
+
     /// CR-001 seed-guard: a flow locally marked `is_system=1` is seed-owned —
     /// EVERY remote write (Insert/Update/Delete) must be rejected, including
     /// an Update forging is_system=true (the seed never captures, so no such

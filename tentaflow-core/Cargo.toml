@@ -384,6 +384,9 @@ libc = "0.2.186"
 winreg = "0.56.0"
 windows-sys = { version = "0.61.2", features = [
     "Win32_Foundation",
+    # GetFinalPathNameByHandleW + the reparse-point flags the Code Studio
+    # filesystem uses to keep a session inside its worktree (code_studio/fs).
+    "Win32_Storage_FileSystem",
     "Win32_System_Performance",
     "Win32_System_SystemInformation",
     "Win32_System_Threading",
@@ -568,6 +571,13 @@ required-features = ["inference-vision-gpu", "inference-supertonic"]
 
 [[test]]
 name = "agent_run_inline_region_e2e"
+required-features = ["test-support"]
+
+# Code Studio "Code Harness" (§16.5): both graph variants through R1-R11 and
+# CompiledFlow, plus the region's structural stop driven over a stub LLM.
+# Needs `stub_ctx` from the test-support surface.
+[[test]]
+name = "code_harness_flow_e2e"
 required-features = ["test-support"]
 
 # ort-backed state classifier + plate OCR: load pool + run one forward on a real

@@ -186,26 +186,31 @@ pub fn set_project_archived(org_id: &str, project_id: &str, archived: bool) -> R
 /// chats, notifications) in one transaction. Per-project data (`project.db`,
 /// files, vectors) is removed by the caller BEFORE this step.
 pub fn delete_project_rows(project_id: &str) -> Result<()> {
-    let pool = super::db::pool()?;
-    let conn = pool.write().map_err(write_err)?;
-    let tx = conn.unchecked_transaction()?;
-    tx.execute(
-        "DELETE FROM project_members WHERE project_id = ?1",
-        params![project_id],
-    )?;
-    tx.execute(
-        "DELETE FROM project_chats WHERE project_id = ?1",
-        params![project_id],
-    )?;
-    tx.execute(
-        "DELETE FROM notifications WHERE project_id = ?1",
-        params![project_id],
-    )?;
-    tx.execute(
-        "DELETE FROM projects WHERE project_id = ?1",
-        params![project_id],
-    )?;
-    tx.commit()?;
+    {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM project_members WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM project_chats WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM notifications WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.execute(
+            "DELETE FROM projects WHERE project_id = ?1",
+            params![project_id],
+        )?;
+        tx.commit()?;
+    }
+    // The project has no members left, so the mirror reads an empty list and
+    // takes back exactly the workspace memberships it granted for it.
+    mirror_into_code_studio(project_id);
     Ok(())
 }
 
@@ -222,6 +227,27 @@ pub fn touch_project(project_id: &str) -> Result<()> {
 // =============================================================================
 // Central registry: members
 // =============================================================================
+
+/// Fires the one-way project → Code Studio permission mirror: every Code Studio
+/// workspace linked to this project re-reads the project's member list and its
+/// own grants (`code_workspace_members.added_by = 'project:<id>'`) follow it.
+///
+/// Two conditions the callers must respect. The mutation has to be COMMITTED —
+/// the mirror reads the post-change state, not the transaction. And the registry
+/// write guard has to be RELEASED: the Project Studio pool is a single
+/// connection, so the member list the mirror reads back would block on a guard
+/// still held here.
+///
+/// Infallible on purpose (`sync_project` logs its own failures). A workspace
+/// this node cannot update must never roll back a membership change that
+/// already succeeded. Repeating a pass is safe: the mirror converges on the
+/// current member list instead of applying a delta.
+fn mirror_into_code_studio(project_id: &str) {
+    let Some(core_db) = crate::db::global_pool() else {
+        return;
+    };
+    crate::code_studio::project_link::sync_project(&core_db, project_id);
+}
 
 pub fn member_role(project_id: &str, user_id: &str) -> Result<Option<String>> {
     let pool = super::db::pool()?;
@@ -291,70 +317,91 @@ pub fn add_members(
     members: &[(String, String)],
     invited_by: &str,
 ) -> Result<u32> {
-    let pool = super::db::pool()?;
-    let conn = pool.write().map_err(write_err)?;
-    let tx = conn.unchecked_transaction()?;
-    let mut added = 0u32;
-    for (user_id, role) in members {
-        let n = tx.execute(
-            "INSERT OR IGNORE INTO project_members (project_id, user_id, role, invited_by) \
-             VALUES (?1, ?2, ?3, ?4)",
-            params![project_id, user_id, role, invited_by],
-        )?;
-        added += n as u32;
+    let added = {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let tx = conn.unchecked_transaction()?;
+        let mut added = 0u32;
+        for (user_id, role) in members {
+            let n = tx.execute(
+                "INSERT OR IGNORE INTO project_members (project_id, user_id, role, invited_by) \
+                 VALUES (?1, ?2, ?3, ?4)",
+                params![project_id, user_id, role, invited_by],
+            )?;
+            added += n as u32;
+        }
+        tx.commit()?;
+        added
+    };
+    if added > 0 {
+        mirror_into_code_studio(project_id);
     }
-    tx.commit()?;
     Ok(added)
 }
 
 pub fn set_member_role(project_id: &str, user_id: &str, role: &str) -> Result<bool> {
-    let pool = super::db::pool()?;
-    let conn = pool.write().map_err(write_err)?;
-    let n = conn.execute(
-        "UPDATE project_members SET role = ?1 WHERE project_id = ?2 AND user_id = ?3",
-        params![role, project_id, user_id],
-    )?;
-    Ok(n > 0)
+    let changed = {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let n = conn.execute(
+            "UPDATE project_members SET role = ?1 WHERE project_id = ?2 AND user_id = ?3",
+            params![role, project_id, user_id],
+        )?;
+        n > 0
+    };
+    if changed {
+        mirror_into_code_studio(project_id);
+    }
+    Ok(changed)
 }
 
 pub fn remove_member(project_id: &str, user_id: &str) -> Result<bool> {
-    let pool = super::db::pool()?;
-    let conn = pool.write().map_err(write_err)?;
-    let n = conn.execute(
-        "DELETE FROM project_members WHERE project_id = ?1 AND user_id = ?2",
-        params![project_id, user_id],
-    )?;
-    Ok(n > 0)
+    let removed = {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let n = conn.execute(
+            "DELETE FROM project_members WHERE project_id = ?1 AND user_id = ?2",
+            params![project_id, user_id],
+        )?;
+        n > 0
+    };
+    if removed {
+        mirror_into_code_studio(project_id);
+    }
+    Ok(removed)
 }
 
 /// Atomic ownership transfer: the old owner is demoted to manager, the new
 /// owner promoted, and `projects.owner_user_id` updated — one transaction, so
 /// the project can never have zero or two owners.
 pub fn transfer_ownership(project_id: &str, old_owner: &str, new_owner: &str) -> Result<()> {
-    let pool = super::db::pool()?;
-    let conn = pool.write().map_err(write_err)?;
-    let tx = conn.unchecked_transaction()?;
-    let demoted = tx.execute(
-        "UPDATE project_members SET role = 'manager' \
-         WHERE project_id = ?1 AND user_id = ?2 AND role = 'owner'",
-        params![project_id, old_owner],
-    )?;
-    if demoted == 0 {
-        bail!("current owner membership not found");
+    {
+        let pool = super::db::pool()?;
+        let conn = pool.write().map_err(write_err)?;
+        let tx = conn.unchecked_transaction()?;
+        let demoted = tx.execute(
+            "UPDATE project_members SET role = 'manager' \
+             WHERE project_id = ?1 AND user_id = ?2 AND role = 'owner'",
+            params![project_id, old_owner],
+        )?;
+        if demoted == 0 {
+            bail!("current owner membership not found");
+        }
+        let promoted = tx.execute(
+            "UPDATE project_members SET role = 'owner' WHERE project_id = ?1 AND user_id = ?2",
+            params![project_id, new_owner],
+        )?;
+        if promoted == 0 {
+            bail!("new owner is not a project member");
+        }
+        tx.execute(
+            "UPDATE projects SET owner_user_id = ?1, updated_at = datetime('now') \
+             WHERE project_id = ?2",
+            params![new_owner, project_id],
+        )?;
+        tx.commit()?;
     }
-    let promoted = tx.execute(
-        "UPDATE project_members SET role = 'owner' WHERE project_id = ?1 AND user_id = ?2",
-        params![project_id, new_owner],
-    )?;
-    if promoted == 0 {
-        bail!("new owner is not a project member");
-    }
-    tx.execute(
-        "UPDATE projects SET owner_user_id = ?1, updated_at = datetime('now') \
-         WHERE project_id = ?2",
-        params![new_owner, project_id],
-    )?;
-    tx.commit()?;
+    mirror_into_code_studio(project_id);
     Ok(())
 }
 
@@ -1529,5 +1576,221 @@ mod unit_tests {
         let stored = super::super::git_source::stored_file_hashes(&pool, "s1").expect("hashes");
         assert_eq!(stored.len(), 2);
         assert!(!stored.contains_key("b.rs"));
+    }
+}
+
+#[cfg(test)]
+mod code_studio_mirror_tests {
+    use super::*;
+    use crate::code_studio::models::{
+        AutonomyMode, EgressEnforcement, ExecMode, NewWorkspace, WorkspaceRole, WorkspaceStatus,
+    };
+    use crate::code_studio::project_link;
+    use crate::code_studio::repository as code_repo;
+
+    const ORG: &str = "org-code-mirror";
+
+    /// The mirror spans two databases: Project Studio's registry holds the
+    /// members, the core one holds the workspaces, the links and the mirrored
+    /// memberships. Both are process-wide `OnceLock`s, so every test works on
+    /// freshly generated ids instead of a private database.
+    fn core_registry() -> DbPool {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let _ = super::super::db::init(&tmp.path().join("projects.db"));
+        // The registry pool outlives this call, so the directory must not be
+        // reclaimed with the handle.
+        std::mem::forget(tmp);
+        let state = crate::dispatch::state::AppState::for_test();
+        drop(state);
+        crate::db::global_pool().expect("core pool initialised by AppState::for_test")
+    }
+
+    fn workspace(db: &DbPool, id: &str) {
+        code_repo::create_workspace(
+            db,
+            &NewWorkspace {
+                id: id.to_string(),
+                org_id: ORG.into(),
+                owner_user_id: "u-ws-owner".into(),
+                name: id.to_string(),
+                slug: id.to_string(),
+                node_id: "node-1".into(),
+                exec_mode: ExecMode::TrustedNative,
+                container_image: None,
+                egress_enforcement: EgressEnforcement::Unrestricted,
+                repo_kind: "git".into(),
+                repo_url: None,
+                repo_auth_kind: None,
+                secret_ref: None,
+                ssh_host_fingerprint: None,
+                default_branch: Some("main".into()),
+                target_branch: None,
+                autonomy_ceiling: AutonomyMode::Normal,
+                egress_policy: "org_approved".into(),
+                index_enabled: false,
+                quota_disk_bytes: None,
+                quota_sessions: None,
+            },
+        )
+        .expect("create workspace");
+        code_repo::set_status(db, id, WorkspaceStatus::Active, None).expect("activate workspace");
+    }
+
+    /// Workspace role of `user_id`, but ONLY when the row carries this
+    /// project's mirror stamp — a manual grant reads as `None` here, which is
+    /// exactly what "the mirror owns this row" has to mean.
+    fn mirrored(
+        db: &DbPool,
+        workspace_id: &str,
+        project_id: &str,
+        user_id: &str,
+    ) -> Option<String> {
+        let origin = project_link::mirror_origin(project_id);
+        code_repo::list_members(db, workspace_id)
+            .expect("workspace members")
+            .into_iter()
+            .find(|member| member.user_id == user_id && member.added_by == origin)
+            .map(|member| member.role)
+    }
+
+    fn project_with_owner(project_id: &str, owner: &str) {
+        create_project(
+            project_id,
+            ORG,
+            &format!("Projekt {project_id}"),
+            "",
+            "tests",
+            "[]",
+            owner,
+            "/tmp/none",
+            &[],
+        )
+        .expect("create project");
+    }
+
+    /// Every membership mutation carries the project role into the linked
+    /// workspace: a new member is granted, a promotion is applied to the same
+    /// row, and losing project membership loses workspace access.
+    #[test]
+    fn membership_mutations_reach_a_linked_workspace() {
+        // `create_project` opens a database under the Data category, and that
+        // override is process-global: without the shared guard a Code Studio
+        // test running in parallel moves this test's paths out from under it.
+        // It passes alone and fails in a full run, which is the worst shape a
+        // test can have.
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        let core = core_registry();
+        let project_id = format!("cs-mirror-{}", uuid::Uuid::new_v4());
+        let workspace_id = format!("ws-{}", uuid::Uuid::new_v4());
+        let owner = format!("owner-{}", uuid::Uuid::new_v4());
+        let member = format!("member-{}", uuid::Uuid::new_v4());
+
+        workspace(&core, &workspace_id);
+        project_with_owner(&project_id, &owner);
+        project_link::link(&core, ORG, &workspace_id, &project_id, &owner).expect("link");
+        assert!(
+            mirrored(&core, &workspace_id, &project_id, &owner).is_none(),
+            "linking alone must not grant anything"
+        );
+
+        assert_eq!(
+            add_members(&project_id, &[(member.clone(), "viewer".to_string())], &owner)
+                .expect("add member"),
+            1
+        );
+        assert_eq!(
+            mirrored(&core, &workspace_id, &project_id, &member).as_deref(),
+            Some("viewer"),
+            "adding a project member did not reach the workspace"
+        );
+        assert_eq!(
+            mirrored(&core, &workspace_id, &project_id, &owner).as_deref(),
+            Some("editor"),
+            "the pass converges on the whole member list, not just the mutated user"
+        );
+
+        assert!(set_member_role(&project_id, &member, "editor").expect("promote"));
+        assert_eq!(
+            mirrored(&core, &workspace_id, &project_id, &member).as_deref(),
+            Some("editor"),
+            "a role change did not reach the workspace"
+        );
+
+        assert!(remove_member(&project_id, &member).expect("remove"));
+        assert!(
+            mirrored(&core, &workspace_id, &project_id, &member).is_none(),
+            "removing a project member left workspace access behind"
+        );
+        assert_eq!(
+            mirrored(&core, &workspace_id, &project_id, &owner).as_deref(),
+            Some("editor"),
+            "removing one member revoked another"
+        );
+        assert_eq!(
+            code_repo::role_of(&core, &workspace_id, "u-ws-owner").expect("workspace owner"),
+            Some(WorkspaceRole::Owner),
+            "the mirror touched the workspace owner"
+        );
+    }
+
+    /// An unlinked workspace never sees the project, a membership granted
+    /// inside Code Studio is never taken over, and deleting the project takes
+    /// back exactly what the mirror granted.
+    #[test]
+    fn the_mirror_only_touches_its_own_grants() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        let core = core_registry();
+        let project_id = format!("cs-mirror-{}", uuid::Uuid::new_v4());
+        let linked = format!("ws-{}", uuid::Uuid::new_v4());
+        let unlinked = format!("ws-{}", uuid::Uuid::new_v4());
+        let owner = format!("owner-{}", uuid::Uuid::new_v4());
+        let by_hand = format!("hand-{}", uuid::Uuid::new_v4());
+
+        workspace(&core, &linked);
+        workspace(&core, &unlinked);
+        project_with_owner(&project_id, &owner);
+        project_link::link(&core, ORG, &linked, &project_id, &owner).expect("link");
+        code_repo::upsert_member(&core, &linked, &by_hand, WorkspaceRole::Editor, "u-ws-owner")
+            .expect("manual grant");
+
+        assert_eq!(
+            add_members(
+                &project_id,
+                &[(by_hand.clone(), "viewer".to_string())],
+                &owner
+            )
+            .expect("add member"),
+            1
+        );
+        assert!(
+            mirrored(&core, &linked, &project_id, &by_hand).is_none(),
+            "the mirror took over a membership it did not create"
+        );
+        assert_eq!(
+            code_repo::role_of(&core, &linked, &by_hand).expect("manual role"),
+            Some(WorkspaceRole::Editor),
+            "the mirror downgraded a manual grant"
+        );
+        assert!(
+            code_repo::role_of(&core, &unlinked, &owner)
+                .expect("unlinked role")
+                .is_none(),
+            "a workspace without a link received a mirrored membership"
+        );
+
+        assert_eq!(
+            mirrored(&core, &linked, &project_id, &owner).as_deref(),
+            Some("editor")
+        );
+        delete_project_rows(&project_id).expect("delete project");
+        assert!(
+            mirrored(&core, &linked, &project_id, &owner).is_none(),
+            "deleting the project left its mirrored memberships behind"
+        );
+        assert_eq!(
+            code_repo::role_of(&core, &linked, &by_hand).expect("manual role"),
+            Some(WorkspaceRole::Editor),
+            "deleting the project removed a membership the mirror never granted"
+        );
     }
 }

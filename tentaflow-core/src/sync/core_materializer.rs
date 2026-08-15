@@ -48,6 +48,15 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::ModelPricing
             | CoreSyncResourceKind::CameraCvPipeline
             | CoreSyncResourceKind::VisionModel
+            // Code Studio: every one of these is revocable, and a revocation must
+            // not be resurrected by a stale grant that took the long way round.
+            // LWW makes the Delete tombstone win over the older Insert, the same
+            // reason `resource_permissions` is tracked.
+            | CoreSyncResourceKind::CodeWorkspace
+            | CoreSyncResourceKind::CodeWorkspaceMember
+            | CoreSyncResourceKind::CodeWorkspaceCreatorGrant
+            | CoreSyncResourceKind::CodeWorkspaceProjectLink
+            | CoreSyncResourceKind::CodeWorkspaceAllowlist
     )
 }
 
@@ -147,6 +156,17 @@ pub fn apply_core_operation(
         CoreSyncResourceKind::ModelPricing => apply_model_pricing(&tx, operation)?,
         CoreSyncResourceKind::CameraCvPipeline => apply_camera_cv_pipeline(&tx, operation)?,
         CoreSyncResourceKind::VisionModel => apply_vision_model(&tx, operation)?,
+        CoreSyncResourceKind::CodeWorkspace => apply_code_workspace(&tx, operation)?,
+        CoreSyncResourceKind::CodeWorkspaceMember => apply_code_workspace_member(&tx, operation)?,
+        CoreSyncResourceKind::CodeWorkspaceCreatorGrant => {
+            apply_code_workspace_creator_grant(&tx, operation)?
+        }
+        CoreSyncResourceKind::CodeWorkspaceProjectLink => {
+            apply_code_workspace_project_link(&tx, operation)?
+        }
+        CoreSyncResourceKind::CodeWorkspaceAllowlist => {
+            apply_code_workspace_allowlist(&tx, operation)?
+        }
     };
 
     if lww_tracked {
@@ -2352,6 +2372,249 @@ fn apply_vision_model(
             )
             .map_err(sql_error)
         }
+    }
+}
+
+// =============================================================================
+// Code Studio registry (plan §5.1)
+// =============================================================================
+
+/// Every satellite table carries an FK to `code_workspaces`. A satellite row
+/// landing before its workspace is a causal-ordering gap, not a conflict, so it
+/// stays retryable until the workspace op arrives.
+fn require_code_workspace(tx: &rusqlite::Transaction<'_>, workspace_id: &str) -> LedgerResult<()> {
+    let exists: bool = tx
+        .query_row(
+            "SELECT 1 FROM code_workspaces WHERE id = ?1",
+            rusqlite::params![workspace_id],
+            |_| Ok(true),
+        )
+        .optional()
+        .map_err(sql_error)?
+        .unwrap_or(false);
+    if exists {
+        Ok(())
+    } else {
+        Err(SyncLedgerError::DeferredOrdering(format!(
+            "code studio target workspace not found: {workspace_id}"
+        )))
+    }
+}
+
+/// Apply a replicated workspace row. Every local mutation is captured as a
+/// full-row Insert, so the Insert arm is the primary path and a replicated edit
+/// never depends on UPDATE-after-INSERT ordering.
+///
+/// `secret_ref` is a HANDLE into the node-local vault, never material (§5.2): on
+/// a node that does not hold the secret it resolves to nothing, which is exactly
+/// the `secret_missing` answer the plan asks for instead of a silent failure.
+fn apply_code_workspace(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let id = &operation.body.resource_id;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO code_workspaces \
+                 (id, org_id, owner_user_id, name, slug, node_id, exec_mode, container_image, \
+                  egress_enforcement, repo_kind, repo_url, repo_auth_kind, secret_ref, \
+                  ssh_host_fingerprint, default_branch, target_branch, autonomy_ceiling, \
+                  egress_policy, index_enabled, quota_disk_bytes, quota_sessions, status, \
+                  status_detail, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, \
+                         ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24, datetime('now')) \
+                 ON CONFLICT(id) DO UPDATE SET \
+                    org_id = excluded.org_id, owner_user_id = excluded.owner_user_id, \
+                    name = excluded.name, slug = excluded.slug, node_id = excluded.node_id, \
+                    exec_mode = excluded.exec_mode, container_image = excluded.container_image, \
+                    egress_enforcement = excluded.egress_enforcement, \
+                    repo_kind = excluded.repo_kind, repo_url = excluded.repo_url, \
+                    repo_auth_kind = excluded.repo_auth_kind, secret_ref = excluded.secret_ref, \
+                    ssh_host_fingerprint = excluded.ssh_host_fingerprint, \
+                    default_branch = excluded.default_branch, \
+                    target_branch = excluded.target_branch, \
+                    autonomy_ceiling = excluded.autonomy_ceiling, \
+                    egress_policy = excluded.egress_policy, \
+                    index_enabled = excluded.index_enabled, \
+                    quota_disk_bytes = excluded.quota_disk_bytes, \
+                    quota_sessions = excluded.quota_sessions, status = excluded.status, \
+                    status_detail = excluded.status_detail, updated_at = datetime('now')",
+                rusqlite::params![
+                    id,
+                    field_string(operation, "org_id")?,
+                    field_string(operation, "owner_user_id")?,
+                    field_string(operation, "name")?,
+                    field_string(operation, "slug")?,
+                    field_string(operation, "node_id")?,
+                    field_string(operation, "exec_mode")?,
+                    field_optional_string(operation, "container_image")?,
+                    field_string(operation, "egress_enforcement")?,
+                    field_string(operation, "repo_kind")?,
+                    field_optional_string(operation, "repo_url")?,
+                    field_optional_string(operation, "repo_auth_kind")?,
+                    field_optional_string(operation, "secret_ref")?,
+                    field_optional_string(operation, "ssh_host_fingerprint")?,
+                    field_optional_string(operation, "default_branch")?,
+                    field_optional_string(operation, "target_branch")?,
+                    field_string(operation, "autonomy_ceiling")?,
+                    field_string(operation, "egress_policy")?,
+                    field_bool_or(operation, "index_enabled", false)?,
+                    optional_present_i64(operation, "quota_disk_bytes")?,
+                    optional_present_i64(operation, "quota_sessions")?,
+                    field_string(operation, "status")?,
+                    field_optional_string(operation, "status_detail")?,
+                    field_string(operation, "created_at")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM code_workspaces WHERE id = ?1",
+                rusqlite::params![id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated workspace membership. Identity is (workspace_id, user_id);
+/// `added_by` travels because the project mirror recognises its own grants by it
+/// (`ps:<project_id>`) and must not revoke a hand-made membership.
+fn apply_code_workspace_member(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let workspace_id = field_string(operation, "workspace_id")?;
+    let user_id = field_string(operation, "user_id")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            require_code_workspace(tx, &workspace_id)?;
+            tx.execute(
+                "INSERT INTO code_workspace_members \
+                 (workspace_id, user_id, role, added_by, added_at) VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(workspace_id, user_id) DO UPDATE SET \
+                    role = excluded.role, added_by = excluded.added_by",
+                rusqlite::params![
+                    workspace_id,
+                    user_id,
+                    field_string(operation, "role")?,
+                    field_string(operation, "added_by")?,
+                    field_string(operation, "added_at")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM code_workspace_members WHERE workspace_id = ?1 AND user_id = ?2",
+                rusqlite::params![workspace_id, user_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated creator grant. It carries no FK, so it can land before any
+/// workspace exists — which is the point: the right to CREATE one must reach a
+/// node that holds nothing yet.
+fn apply_code_workspace_creator_grant(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let org_id = field_string(operation, "org_id")?;
+    let user_id = field_string(operation, "user_id")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO code_workspace_creator_grants \
+                 (org_id, user_id, granted_by, created_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(org_id, user_id) DO UPDATE SET granted_by = excluded.granted_by",
+                rusqlite::params![
+                    org_id,
+                    user_id,
+                    field_string(operation, "granted_by")?,
+                    field_string(operation, "created_at")?,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM code_workspace_creator_grants WHERE org_id = ?1 AND user_id = ?2",
+                rusqlite::params![org_id, user_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+fn apply_code_workspace_project_link(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let workspace_id = field_string(operation, "workspace_id")?;
+    let project_id = field_string(operation, "project_id")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            require_code_workspace(tx, &workspace_id)?;
+            tx.execute(
+                "INSERT INTO code_workspace_project_links \
+                 (workspace_id, project_id, linked_by, created_at) VALUES (?1, ?2, ?3, ?4) \
+                 ON CONFLICT(workspace_id, project_id) DO UPDATE SET \
+                    linked_by = excluded.linked_by",
+                rusqlite::params![
+                    workspace_id,
+                    project_id,
+                    field_string(operation, "linked_by")?,
+                    field_string(operation, "created_at")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM code_workspace_project_links \
+                 WHERE workspace_id = ?1 AND project_id = ?2",
+                rusqlite::params![workspace_id, project_id],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Apply a replicated standing capability grant. The local `id` is left to the
+/// receiver's AUTOINCREMENT and never travels — identity is the UNIQUE triple
+/// (workspace_id, capability, pattern), so the same grant converges to one row
+/// on every node instead of colliding with a foreign rowid.
+fn apply_code_workspace_allowlist(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let workspace_id = field_string(operation, "workspace_id")?;
+    let capability = field_string(operation, "capability")?;
+    let pattern = field_string(operation, "pattern")?;
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            require_code_workspace(tx, &workspace_id)?;
+            tx.execute(
+                "INSERT INTO code_workspace_allowlist \
+                 (workspace_id, capability, pattern, created_by, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5) \
+                 ON CONFLICT(workspace_id, capability, pattern) DO UPDATE SET \
+                    created_by = excluded.created_by",
+                rusqlite::params![
+                    workspace_id,
+                    capability,
+                    pattern,
+                    field_string(operation, "created_by")?,
+                    field_string(operation, "created_at")?,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM code_workspace_allowlist \
+                 WHERE workspace_id = ?1 AND capability = ?2 AND pattern = ?3",
+                rusqlite::params![workspace_id, capability, pattern],
+            )
+            .map_err(sql_error),
     }
 }
 
