@@ -1061,7 +1061,7 @@ tf-tabs {
 .tf-table tbody tr + tr td { border-top: 1px solid var(--tf-border); }
 .tf-table tbody tr.selected { background: var(--tf-accent-glow); }
 .tf-table tbody tr.selected td { color: var(--tf-text); }
-.tf-table td.actions {
+.tf-table td.tf-table__actions-cell {
   text-align: right;
   white-space: nowrap;
 }
@@ -1078,6 +1078,9 @@ tf-tabs {
   .tf-table tr,
   .tf-table td { display: block; width: 100%; }
   .tf-table tr {
+    /* Without this the padding is ADDED to width:100% and every card row
+       overflows its own table by 28px — enough to clip a right-aligned cell. */
+    box-sizing: border-box;
     padding: 12px 14px;
     border-bottom: 1px solid var(--tf-border);
   }
@@ -1096,7 +1099,10 @@ tf-tabs {
     min-width: 0;
     overflow-wrap: anywhere;
   }
-  .tf-table td::before {
+  /* Only a labelled cell gets the caption line. A column declared without a
+     label (a card-mode summary cell that already reads as a sentence) would
+     otherwise pay for an empty 13px box in every record. */
+  .tf-table td[data-label]::before {
     content: attr(data-label);
     font-size: 10px;
     font-weight: 700;
@@ -1104,11 +1110,20 @@ tf-tabs {
     letter-spacing: 0.06em;
     text-transform: uppercase;
   }
-  .tf-table td.actions {
-    justify-content: flex-end;
-    margin-top: 4px;
+  /* The row menu is chrome, not a field: parked in the card's top-right corner
+     it costs no vertical space, where a stacked block added ~44px per record. */
+  .tf-table tbody tr { position: relative; }
+  .tf-table td.tf-table__actions-cell {
+    position: absolute;
+    top: 8px;
+    right: 8px;
+    width: auto;
+    padding: 0;
   }
-  .tf-table td.actions::before { display: none; }
+  /* Keep the first cell clear of that corner, or a long title slides under it. */
+  .tf-table tbody tr:has(> td.tf-table__actions-cell) > td:first-child {
+    padding-right: 38px;
+  }
 
   .tf-window {
     min-width: 0;
@@ -1265,6 +1280,31 @@ td:has(> .tf-table__row-select) {
   font-size: 11px;
   color: var(--tf-text-3);
 }
+/* Machine identifiers — repository paths, refs, hashes — are scanned rather
+   than read, and a proportional face makes two similar paths look alike. */
+.tf-table__cell--mono .tf-table__cell-title,
+.tf-table__cell--mono .tf-table__cell-sub {
+  font-family: var(--tf-font-mono, ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+.tf-table__cell--mono .tf-table__cell-title { font-size: 11.5px; }
+.tf-table__cell--mono .tf-table__cell-sub { font-size: 10.5px; }
+
+/* One horizontal line inside a composed cell — a title with a trailing badge.
+   Lives here and not in a feature stylesheet because controls.css is the only
+   sheet adopted into the tf-table shadow root. */
+.tf-table__cell-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.tf-table__cell-row > .tf-table__cell-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tf-table__cell-row > .tf-chip { flex: 0 0 auto; }
 
 /* =============================================================================
    tf-chip
@@ -1388,6 +1428,25 @@ tf-chip[clickable]:focus-visible > .tf-chip {
     filter 0.24s var(--tf-spring-smooth);
   z-index: 100;
 }
+/* `compact`: a menu anchored to a table row hangs over the records the reader
+   is scanning, so it claims the least area that still reads — the 180px floor
+   is a dialog-menu default, not a law. Pointer-only: the tighter item box is
+   under the 44px touch target, so callers must not set it on a touch surface. */
+:host([compact]) .tf-menu {
+  min-width: 0;
+  padding: 4px;
+}
+tf-menu[compact] .tf-menu-item {
+  padding: 6px 10px;
+  font-size: 12.5px;
+}
+/* A thumb needs 44px, and the two places a dense table still has to honour that
+   are the row-action trigger and the items of the menu it opens. `compact` is
+   never set on a touch surface, so the two rules cannot fight. */
+@media (pointer: coarse) {
+  .tf-menu-item { min-height: 44px; box-sizing: border-box; }
+  .tf-table__actions-cell .tf-btn { min-height: 44px; min-width: 44px; }
+}
 .tf-menu[data-placement="top-start"]    { transform-origin: bottom left; }
 .tf-menu[data-placement="top-end"]      { transform-origin: bottom right; }
 .tf-menu[data-placement="bottom-end"]   { transform-origin: top right; }
@@ -1503,7 +1562,8 @@ tf-menu[open] .tf-menu-item {
   overflow: hidden;
 }
 /* Mobile — tf-window miesci sie w szerokosc ekranu (minus 16px margin),
-   wysokosc auto ale max 90vh ze scrollem w body. Wciaz centered jako dialog. */
+   wysokosc auto do wysokosci ekranu minus 16px, ze scrollem w body. Wciaz
+   centered jako dialog. */
 @media (max-width: 640px) {
   .tf-window {
     left: 8px !important;
@@ -1511,7 +1571,11 @@ tf-menu[open] .tf-menu-item {
     width: calc(100vw - 16px) !important;
     max-width: calc(100vw - 16px) !important;
     min-width: 0 !important;
-    max-height: 90dvh !important;
+    /* A phone modal whose body already scrolls gains nothing from a 10% dead
+       band: the 84px that 90dvh left unused on a 844px screen pushed the last
+       form control of a wizard step under the footer. 8px top and bottom match
+       the horizontal margins on this breakpoint. */
+    max-height: calc(100dvh - 16px) !important;
     /* Center vertically — tf-window uzywa top z JS, nadpisujemy auto + transform */
     top: 50% !important;
     transform: translateY(-50%) !important;
@@ -1569,7 +1633,8 @@ tf-menu[open] .tf-menu-item {
 .tf-window-controls {
   display: flex;
   gap: 6px;
-  margin-right: 4px;
+  margin-left: 4px;
+  flex-shrink: 0;
 }
 .tf-window-control {
   width: 13px;
@@ -1605,6 +1670,14 @@ tf-menu[open] .tf-menu-item {
   transition: opacity 0.15s;
 }
 .tf-window-controls:hover .tf-window-control svg { opacity: 1; }
+/* The hidden glyph is a traffic-light idiom, and it only reads as one when the
+   three lights stand together. A dialog renders `buttons="close"` alone, so the
+   red circle would be a lone dot that looks like an error marker — there the ×
+   is permanent. Touch devices never hover, so they never get the glyph at all. */
+.tf-window-control:only-child svg { opacity: 1; }
+@media (hover: none) {
+  .tf-window-control svg { opacity: 1; }
+}
 
 .tf-window-title {
   flex: 1;
@@ -1667,6 +1740,27 @@ tf-menu[open] .tf-menu-item {
   display: flex;
   flex-direction: column;
   gap: 14px;
+  /* Two cues that something is hidden below the footer. The thin scrollbar only
+     reserves a gutter where the platform draws classic scrollbars; a phone gives
+     it zero width and paints it only while the finger moves, so the shadow is
+     the cue that always survives — its `local` layer scrolls with the content
+     and covers the fixed `scroll` layer once the body reaches its end. */
+  scrollbar-width: thin;
+  scrollbar-color: var(--tf-border-hover) transparent;
+  background:
+    linear-gradient(to top, var(--tf-bg-card) 42%, rgba(0, 0, 0, 0)) bottom / 100% 22px no-repeat local,
+    linear-gradient(to top, rgba(255, 255, 255, 0.14), rgba(255, 255, 255, 0)) bottom / 100% 2px no-repeat scroll,
+    radial-gradient(farthest-side at 50% 100%, rgba(0, 0, 0, 0.55), rgba(0, 0, 0, 0)) bottom / 100% 16px no-repeat scroll;
+}
+
+/* Must stay AFTER the base rule: the mobile block near the top of this sheet is
+   overridden by it, so the phone override belongs here. 20px of side padding
+   costs a tenth of a 390px screen, and the 4px saved top and bottom buy a row
+   the body would otherwise have to scroll to. */
+@media (max-width: 640px) {
+  .tf-window-body {
+    padding: 14px;
+  }
 }
 
 .tf-window-footer {
@@ -1774,7 +1868,7 @@ tf-menu[open] .tf-menu-item {
 .tf-window.minimized .tf-window-controls {
   display: flex;
   gap: 4px;
-  margin-right: 2px;
+  margin-left: 2px;
 }
 .tf-window.minimized .tf-window-control {
   width: 10px;
@@ -2169,6 +2263,35 @@ tf-filter-chips {
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
+}
+
+/* `scroll`: one swipeable line. Wrapping five filters on a 390px screen costs
+   three rows before the reader sees a single record. */
+tf-filter-chips[scroll] .tf-filter-chips {
+  flex-wrap: nowrap;
+  overflow-x: auto;
+  scrollbar-width: none;
+  scroll-snap-type: x proximity;
+  /* The chips carry a focus ring and a lift on hover; without the padding the
+     overflow box clips both. */
+  padding: 3px 1px;
+  margin: -3px -1px;
+}
+tf-filter-chips[scroll] .tf-filter-chips::-webkit-scrollbar { display: none; }
+/* A chip cut flush at the frame reads as a rendering fault. The fade says the
+   row continues; it is applied only on the side that actually has more. */
+tf-filter-chips[scroll] .tf-filter-chips[data-overflow="end"] {
+  mask-image: linear-gradient(to right, #000 calc(100% - 32px), transparent);
+}
+tf-filter-chips[scroll] .tf-filter-chips[data-overflow="start"] {
+  mask-image: linear-gradient(to left, #000 calc(100% - 32px), transparent);
+}
+tf-filter-chips[scroll] .tf-filter-chips[data-overflow="both"] {
+  mask-image: linear-gradient(to right, transparent, #000 32px, #000 calc(100% - 32px), transparent);
+}
+tf-filter-chips[scroll] .tf-filter-chip {
+  flex: 0 0 auto;
+  scroll-snap-align: start;
 }
 
 .tf-filter-chip {
@@ -9099,3 +9222,977 @@ tf-relation-graph {
     scroll-behavior: auto !important;
   }
 }
+
+/* =============================================================================
+   tf-terminal — server-owned VT cell grid (Code Studio §7.9)
+   The component renders cells and sends keys; it never parses escape codes.
+   ============================================================================= */
+
+:root {
+  --tf-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+
+tf-terminal {
+  display: block;
+  min-height: 0;
+  height: 100%;
+}
+
+.tf-terminal {
+  /* Screen defaults and the 16 ANSI slots. Cells 16-255 and truecolor resolve
+     to a literal hex in JS — only these sixteen are themeable. */
+  --tf-term-bg: #05070f;
+  --tf-term-fg: #cdd6f4;
+  --tf-term-line: 1.55em;
+  --tf-term-0:  #45475a;
+  --tf-term-1:  #f38ba8;
+  --tf-term-2:  #a6e3a1;
+  --tf-term-3:  #f9e2af;
+  --tf-term-4:  #89b4fa;
+  --tf-term-5:  #cba6f7;
+  --tf-term-6:  #94e2d5;
+  --tf-term-7:  #bac2de;
+  --tf-term-8:  #585b70;
+  --tf-term-9:  #f5a3bd;
+  --tf-term-10: #b9edb5;
+  --tf-term-11: #fbeac4;
+  --tf-term-12: #a3c4fb;
+  --tf-term-13: #d7bcf9;
+  --tf-term-14: #aeeae0;
+  --tf-term-15: #ffffff;
+
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  height: 100%;
+  min-height: 0;
+  background: var(--tf-term-bg);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  overflow: hidden;
+  font-family: var(--tf-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--tf-term-fg);
+}
+
+.tf-terminal__view {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  outline: none;
+  overscroll-behavior: contain;
+}
+.tf-terminal__view:focus-visible {
+  box-shadow: inset 0 0 0 2px var(--tf-accent-1);
+}
+
+.tf-terminal__screen {
+  position: relative;
+  padding: 8px 10px;
+  width: max-content;
+  min-width: calc(var(--tf-term-cols, 80) * 1ch);
+  min-height: calc(var(--tf-term-rows, 24) * var(--tf-term-line));
+}
+
+.tf-terminal__row {
+  display: block;
+  white-space: pre;
+  min-height: var(--tf-term-line);
+  user-select: text;
+}
+
+.tf-terminal__run { white-space: pre; }
+.tf-terminal__run--bold { font-weight: 700; }
+.tf-terminal__run--dim { opacity: 0.6; }
+.tf-terminal__run--italic { font-style: italic; }
+.tf-terminal__run--underline { text-decoration-line: underline; }
+.tf-terminal__run--strike { text-decoration-line: line-through; }
+.tf-terminal__run--underline.tf-terminal__run--strike { text-decoration-line: underline line-through; }
+.tf-terminal__run--blink { animation: tf-term-cell-blink 1.2s steps(1) infinite; }
+.tf-terminal__run--hidden { visibility: hidden; }
+/* Reverse video with a defaulted colour: the swap lands on the screen colours. */
+.tf-terminal__run--fg-onbg { color: var(--tf-term-bg); }
+.tf-terminal__run--bg-onfg { background-color: var(--tf-term-fg); }
+
+.tf-terminal__fg-0  { color: var(--tf-term-0); }
+.tf-terminal__fg-1  { color: var(--tf-term-1); }
+.tf-terminal__fg-2  { color: var(--tf-term-2); }
+.tf-terminal__fg-3  { color: var(--tf-term-3); }
+.tf-terminal__fg-4  { color: var(--tf-term-4); }
+.tf-terminal__fg-5  { color: var(--tf-term-5); }
+.tf-terminal__fg-6  { color: var(--tf-term-6); }
+.tf-terminal__fg-7  { color: var(--tf-term-7); }
+.tf-terminal__fg-8  { color: var(--tf-term-8); }
+.tf-terminal__fg-9  { color: var(--tf-term-9); }
+.tf-terminal__fg-10 { color: var(--tf-term-10); }
+.tf-terminal__fg-11 { color: var(--tf-term-11); }
+.tf-terminal__fg-12 { color: var(--tf-term-12); }
+.tf-terminal__fg-13 { color: var(--tf-term-13); }
+.tf-terminal__fg-14 { color: var(--tf-term-14); }
+.tf-terminal__fg-15 { color: var(--tf-term-15); }
+
+.tf-terminal__bg-0  { background-color: var(--tf-term-0); }
+.tf-terminal__bg-1  { background-color: var(--tf-term-1); }
+.tf-terminal__bg-2  { background-color: var(--tf-term-2); }
+.tf-terminal__bg-3  { background-color: var(--tf-term-3); }
+.tf-terminal__bg-4  { background-color: var(--tf-term-4); }
+.tf-terminal__bg-5  { background-color: var(--tf-term-5); }
+.tf-terminal__bg-6  { background-color: var(--tf-term-6); }
+.tf-terminal__bg-7  { background-color: var(--tf-term-7); }
+.tf-terminal__bg-8  { background-color: var(--tf-term-8); }
+.tf-terminal__bg-9  { background-color: var(--tf-term-9); }
+.tf-terminal__bg-10 { background-color: var(--tf-term-10); }
+.tf-terminal__bg-11 { background-color: var(--tf-term-11); }
+.tf-terminal__bg-12 { background-color: var(--tf-term-12); }
+.tf-terminal__bg-13 { background-color: var(--tf-term-13); }
+.tf-terminal__bg-14 { background-color: var(--tf-term-14); }
+.tf-terminal__bg-15 { background-color: var(--tf-term-15); }
+
+.tf-terminal__cursor {
+  position: absolute;
+  top: 8px;
+  left: 10px;
+  width: 1ch;
+  height: var(--tf-term-line);
+  background: var(--tf-term-fg);
+  opacity: 0.85;
+  pointer-events: none;
+  animation: tf-term-cursor-blink 1.1s steps(1) infinite;
+}
+.tf-terminal__cursor[hidden] { display: none; }
+/* Unfocused terminals show a hollow, still cursor — the caret is not the caller. */
+.tf-terminal:not(.is-focused) .tf-terminal__cursor {
+  animation: none;
+  background: transparent;
+  box-shadow: inset 0 0 0 1px var(--tf-term-fg);
+}
+
+/* Newer output exists below the visible slice. */
+.tf-terminal.is-scrolled-back .tf-terminal__view {
+  box-shadow: inset 0 -2px 0 rgba(245, 158, 11, 0.55);
+}
+
+.tf-terminal__ruler {
+  position: absolute;
+  top: 0;
+  left: 0;
+  visibility: hidden;
+  white-space: pre;
+  pointer-events: none;
+}
+
+/* Real focus target: keeps paste, IME and screen-reader focus working on a
+   grid built from plain <div>s. Must stay laid out, so it is not display:none. */
+.tf-terminal__input {
+  position: absolute;
+  top: 0;
+  left: 0;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: 0;
+  border: 0;
+  opacity: 0;
+  resize: none;
+  overflow: hidden;
+  background: transparent;
+  color: transparent;
+  font: inherit;
+}
+
+@keyframes tf-term-cursor-blink {
+  0%, 55% { opacity: 0.85; }
+  56%, 100% { opacity: 0; }
+}
+@keyframes tf-term-cell-blink {
+  0%, 50% { opacity: 1; }
+  51%, 100% { opacity: 0.25; }
+}
+
+@media (max-width: 900px) {
+  .tf-terminal { font-size: 11px; }
+}
+
+/* =============================================================================
+   tf-diff — unified / side-by-side diff with per-hunk review (Code Studio §13.2)
+   ============================================================================= */
+
+tf-diff { display: block; }
+
+.tf-diff {
+  background: var(--tf-bg-input);
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius);
+  overflow: hidden;
+  font-family: var(--tf-mono);
+  font-size: 11.5px;
+}
+
+.tf-diff__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 7px 10px;
+  background: var(--tf-bg-3);
+  border-bottom: 1px solid var(--tf-border);
+  color: var(--tf-text-2);
+}
+.tf-diff__head[hidden] { display: none; }
+.tf-diff__path { color: var(--tf-text); font-weight: 600; }
+.tf-diff__oldpath { color: var(--tf-text-3); text-decoration: line-through; }
+.tf-diff__kind {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 10px;
+  background: var(--tf-bg-2);
+  color: var(--tf-text-3);
+}
+.tf-diff__kind--add { background: rgba(34, 197, 94, 0.16); color: var(--tf-success); }
+.tf-diff__kind--modify { background: rgba(245, 158, 11, 0.16); color: var(--tf-warning); }
+.tf-diff__kind--delete { background: rgba(239, 68, 68, 0.16); color: var(--tf-danger); }
+.tf-diff__kind--rename { background: rgba(96, 165, 250, 0.16); color: var(--tf-info); }
+.tf-diff__stat { font-weight: 700; }
+.tf-diff__stat--add { color: var(--tf-success); }
+.tf-diff__stat--del { color: var(--tf-danger); }
+.tf-diff__spacer { flex: 1 1 auto; }
+.tf-diff__count { font-size: 10.5px; color: var(--tf-text-3); }
+
+.tf-diff__hunks {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px;
+}
+
+.tf-diff__hunk {
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm);
+  overflow: hidden;
+}
+.tf-diff__hunk--accepted { border-color: rgba(34, 197, 94, 0.4); }
+.tf-diff__hunk--rejected { border-color: rgba(239, 68, 68, 0.35); opacity: 0.6; }
+.tf-diff__hunk--conflicted { border-color: var(--tf-danger); }
+
+.tf-diff__hunk-head {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 10px;
+  background: var(--tf-bg-3);
+  border-bottom: 1px solid var(--tf-border);
+  font-size: 11px;
+  color: var(--tf-text-2);
+}
+.tf-diff__hunk-title { overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.tf-diff__hunk-actions { display: flex; align-items: center; gap: 6px; }
+.tf-diff__action:focus-visible { outline: 2px solid var(--tf-accent-1); outline-offset: 1px; }
+
+.tf-diff__state {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  padding: 2px 7px;
+  border-radius: 10px;
+}
+.tf-diff__state--accepted { background: rgba(34, 197, 94, 0.16); color: var(--tf-success); }
+.tf-diff__state--rejected { background: rgba(239, 68, 68, 0.16); color: var(--tf-danger); }
+.tf-diff__state--conflicted { background: rgba(239, 68, 68, 0.24); color: var(--tf-danger); }
+
+/* A long code line scrolls sideways instead of being cut off. Chromium draws an
+   overlay scrollbar that stays invisible until it is dragged — and ignores both
+   `scrollbar-width` and `::-webkit-scrollbar` while doing so — so the edge has
+   to carry the whole signal itself: the two `local` layers ride the content and
+   mask the fixed layers, which means an edge is marked only while content is
+   still hidden behind it. The mark is a dark fade plus a bright rule right at
+   the border; an indigo wash alone disappeared into the surface. */
+.tf-diff__body {
+  line-height: 1.7;
+  overflow-x: auto;
+  scrollbar-width: thin;
+  scrollbar-color: var(--tf-border-hover) transparent;
+  background:
+    linear-gradient(to right, var(--tf-bg-input), transparent) left center / 28px 100% no-repeat local,
+    linear-gradient(to left, var(--tf-bg-input), transparent) right center / 28px 100% no-repeat local,
+    linear-gradient(to right, var(--tf-accent-1) 0 3px, transparent 3px) left center / 28px 100% no-repeat scroll,
+    linear-gradient(to left, var(--tf-accent-1) 0 3px, transparent 3px) right center / 28px 100% no-repeat scroll,
+    linear-gradient(to right, rgba(2, 4, 14, 0.92), rgba(2, 4, 14, 0)) left center / 28px 100% no-repeat scroll,
+    linear-gradient(to left, rgba(2, 4, 14, 0.92), rgba(2, 4, 14, 0)) right center / 28px 100% no-repeat scroll;
+}
+.tf-diff__body::-webkit-scrollbar { height: 8px; }
+.tf-diff__body::-webkit-scrollbar-track { background: transparent; }
+.tf-diff__body::-webkit-scrollbar-thumb { background: var(--tf-border-hover); border-radius: 4px; }
+/* `width: max-content` keeps the row background under the whole line: a row
+   clipped at the viewport edge would lose its add/del tint as soon as the body
+   is scrolled right. */
+.tf-diff__line { display: flex; padding: 0 8px; white-space: pre; width: max-content; min-width: 100%; }
+.tf-diff__line:hover { background-color: rgba(99, 102, 241, 0.08); }
+.tf-diff__ln {
+  flex: 0 0 auto;
+  min-width: 26px;
+  padding-right: 8px;
+  text-align: right;
+  color: var(--tf-text-3);
+  opacity: 0.7;
+  user-select: none;
+}
+.tf-diff__text { flex: 1 1 auto; }
+.tf-diff__line--ctx { color: var(--tf-text-2); }
+.tf-diff__line--add {
+  background: rgba(34, 197, 94, 0.09);
+  color: #b7f0c9;
+  box-shadow: inset 2px 0 0 var(--tf-success);
+  animation: tf-diff-line-in 0.3s ease-out both;
+}
+.tf-diff__line--del {
+  background: rgba(239, 68, 68, 0.09);
+  color: #ffc9c9;
+  box-shadow: inset 2px 0 0 var(--tf-danger);
+}
+@keyframes tf-diff-line-in {
+  from { opacity: 0; transform: translateX(-6px); }
+  to { opacity: 1; transform: none; }
+}
+
+tf-diff[wrap] .tf-diff__line { white-space: pre-wrap; width: auto; }
+tf-diff[wrap] .tf-diff__body { overflow-x: hidden; }
+
+.tf-diff__split {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 1px;
+  background: var(--tf-border);
+}
+.tf-diff__pane { min-width: 0; background: var(--tf-bg-input); }
+.tf-diff__pane-head {
+  padding: 5px 10px;
+  background: var(--tf-bg-2);
+  border-bottom: 1px solid var(--tf-border);
+  font-size: 10.5px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--tf-text-3);
+}
+
+.tf-diff__conflict {
+  margin: 10px 10px 0;
+  padding: 12px 14px;
+  border: 1px solid rgba(239, 68, 68, 0.45);
+  border-radius: var(--tf-radius-sm);
+  background: rgba(239, 68, 68, 0.08);
+}
+.tf-diff__conflict[hidden] { display: none; }
+.tf-diff__conflict-title { margin: 0 0 6px; font-size: 12px; color: var(--tf-danger); }
+.tf-diff__conflict-body,
+.tf-diff__conflict-msg { margin: 0; font-size: 11.5px; line-height: 1.65; color: var(--tf-text-2); }
+.tf-diff__conflict-msg { margin-top: 8px; color: var(--tf-text-3); }
+.tf-diff__sha {
+  font-family: var(--tf-mono);
+  padding: 1px 5px;
+  border-radius: 4px;
+  background: var(--tf-bg-3);
+  color: var(--tf-text);
+}
+
+.tf-diff__empty { padding: 18px; text-align: center; color: var(--tf-text-3); }
+
+@media (max-width: 900px) {
+  .tf-diff__split { grid-template-columns: 1fr; }
+}
+
+/* A phone has no room for two number columns: they claim 52 px of a 366 px body,
+   which is a sixth of the code area. Below 480 px a unified body that carries
+   BOTH sides keeps the new one alone — that column still rises monotonically,
+   while a single mixed column would run backwards wherever a deletion follows
+   context. A deleted line has no line in the result, so its cell shows a minus
+   instead of borrowing the old number. A body already narrowed to one side
+   (`gutters`) and a split pane are untouched, and so is every wider screen,
+   where two columns are the better reading. */
+@media (max-width: 480px) {
+  tf-diff:not([mode="split"]):not([gutters="old"]):not([gutters="new"]) .tf-diff__ln--old {
+    display: none;
+  }
+  tf-diff:not([mode="split"]):not([gutters="old"]):not([gutters="new"])
+    .tf-diff__line--del .tf-diff__ln--new::after {
+    content: '−';
+    color: var(--tf-danger);
+  }
+}
+
+/* =============================================================================
+   tf-tree — status badge after the label (node.badge)
+   ============================================================================= */
+
+.tf-tree__badge {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 0 5px;
+  border-radius: 8px;
+  font-size: 9.5px;
+  font-weight: 700;
+  line-height: 1.5;
+  white-space: nowrap;
+  /* Untoned badges read as "changed" — the neutral case in a file tree. */
+  background: rgba(245, 158, 11, 0.16);
+  color: var(--tf-warning);
+}
+.tf-tree__badge--a { background: rgba(34, 197, 94, 0.16); color: var(--tf-success); }
+.tf-tree__badge--m { background: rgba(245, 158, 11, 0.16); color: var(--tf-warning); }
+.tf-tree__badge--d { background: rgba(239, 68, 68, 0.16); color: var(--tf-danger); }
+.tf-tree__badge--c { background: rgba(239, 68, 68, 0.26); color: var(--tf-danger); }
+
+/* =============================================================================
+   tf-tab — unsaved-content dot (<tf-tab dirty>)
+   ============================================================================= */
+
+.tf-tab .tf-tab-dirty {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--tf-warning);
+}
+
+/* =============================================================================
+   tf-chip — monospace variant (<tf-chip mono>)
+   Identifiers must not be upper-cased or letter-spaced: a branch name has to
+   stay readable character by character and survive a copy.
+   ============================================================================= */
+
+.tf-chip.tf-chip--mono {
+  font-family: var(--tf-mono);
+  font-size: 10.5px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
+/* =============================================================================
+   tf-badge — "hot" tone: the only solid fill, for "waiting on you" counters
+   ============================================================================= */
+
+.tf-badge.hot {
+  background: var(--tf-warning);
+  color: #1a1200;
+  animation: tf-badge-pop 0.34s var(--tf-spring-snappy);
+}
+@keyframes tf-badge-pop {
+  from { transform: scale(0.4); opacity: 0; }
+  to   { transform: none; opacity: 1; }
+}
+
+/* =============================================================================
+   tf-table — <tf-column hide-below="…"> responsive column hiding
+   The cells stay in the DOM (state survives); only their box collapses. The
+   selectors carry a type so they outrank the <=720px card-view `.tf-table td`
+   rule, which would otherwise re-show the cell as a block.
+   ============================================================================= */
+
+@media (max-width: 1280px) {
+  .tf-table th.tf-table__col--hide-below-1280,
+  .tf-table td.tf-table__col--hide-below-1280 { display: none; }
+}
+@media (max-width: 1180px) {
+  .tf-table th.tf-table__col--hide-below-1180,
+  .tf-table td.tf-table__col--hide-below-1180 { display: none; }
+}
+@media (max-width: 1024px) {
+  .tf-table th.tf-table__col--hide-below-1024,
+  .tf-table td.tf-table__col--hide-below-1024 { display: none; }
+}
+@media (max-width: 900px) {
+  .tf-table th.tf-table__col--hide-below-900,
+  .tf-table td.tf-table__col--hide-below-900 { display: none; }
+}
+@media (max-width: 720px) {
+  .tf-table th.tf-table__col--hide-below-720,
+  .tf-table td.tf-table__col--hide-below-720 { display: none; }
+}
+@media (max-width: 640px) {
+  .tf-table th.tf-table__col--hide-below-640,
+  .tf-table td.tf-table__col--hide-below-640 { display: none; }
+}
+@media (max-width: 480px) {
+  .tf-table th.tf-table__col--hide-below-480,
+  .tf-table td.tf-table__col--hide-below-480 { display: none; }
+}
+
+/* =============================================================================
+   tf-tabs variant="bar" — flat navigation strip
+   One shape behind three mockup strips: the scene tab bar, the dock tabs and the
+   phone bottom navigation. They differ only by `layout`, `indicator` and
+   `safe-area`; the moving 2px rule is the SAME FLIP indicator the other variants
+   use, so there is no second highlighting mechanism.
+   ============================================================================= */
+
+tf-tabs[variant="bar"] {
+  background: var(--tf-bg-2);
+  border-bottom: 1px solid var(--tf-border);
+}
+
+.tf-tabs-navbar {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+  gap: 1px;
+  padding: 0;
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow-x: auto;
+  overflow-y: hidden;
+  scroll-behavior: smooth;
+  touch-action: pan-x;
+  scrollbar-width: none;
+  -ms-overflow-style: none;
+  white-space: nowrap;
+  max-width: 100%;
+}
+.tf-tabs-navbar::-webkit-scrollbar { display: none; }
+
+.tf-tabs-navbar .tf-tab {
+  border-radius: 0;
+  padding: 8px 13px;
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: normal;
+  border-right: 1px solid var(--tf-border);
+  color: var(--tf-text-3);
+  box-shadow: none;
+}
+.tf-tabs-navbar .tf-tab:hover {
+  color: var(--tf-text-2);
+  background: var(--tf-bg-3);
+  transform: none;
+}
+.tf-tabs-navbar .tf-tab.active {
+  color: var(--tf-text);
+  background: var(--tf-bg);
+  box-shadow: none;
+  transform: none;
+}
+
+/* The moving rule. `scale` (not `transform`) carries the entry animation so it
+   composes with the inline translateX the indicator is positioned by. */
+.tf-tab-bar-line {
+  position: absolute;
+  top: 0;
+  left: 0;
+  height: 2px;
+  background: var(--tf-gradient-accent);
+  border-radius: 0 0 3px 3px;
+  opacity: 0;
+  pointer-events: none;
+  z-index: 0;
+  transition: transform 0.22s var(--tf-spring-smooth), width 0.22s var(--tf-spring-smooth);
+}
+.tf-tab-bar-line[data-ready] { opacity: 1; }
+.tf-tab-bar-line.is-entering { animation: tf-tab-line-in 0.28s var(--tf-spring-snappy) both; }
+@keyframes tf-tab-line-in {
+  from { scale: 0.2 1; opacity: 0; }
+  to   { scale: 1 1; opacity: 1; }
+}
+tf-tabs[indicator="bottom"] .tf-tab-bar-line {
+  top: auto;
+  bottom: 0;
+  border-radius: 3px 3px 0 0;
+}
+
+/* --- layout="stacked": icon above the label, cells share the width ---------- */
+
+tf-tabs[layout="stacked"] .tf-tabs-navbar { width: 100%; }
+tf-tabs[layout="stacked"] tf-tab { flex: 1 1 0; min-width: 0; }
+tf-tabs[layout="stacked"] .tf-tab {
+  width: 100%;
+  flex-direction: column;
+  justify-content: center;
+  gap: 3px;
+  padding: 9px 4px 8px;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: normal;
+  border-right: 0;
+}
+tf-tabs[layout="stacked"] .tf-tab svg { width: 15px; height: 15px; }
+tf-tabs[layout="stacked"] .tf-tab .tf-tab-count {
+  position: absolute;
+  top: 5px;
+  right: 50%;
+  margin-right: -20px;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 9.5px;
+  border: 1px solid var(--tf-border);
+}
+
+/* --- safe-area: phone bottom navigation ------------------------------------ */
+
+tf-tabs[safe-area] {
+  border-bottom: 0;
+  border-top: 1px solid var(--tf-border);
+  padding-bottom: env(safe-area-inset-bottom, 0px);
+}
+tf-tabs[safe-area] .tf-tab { min-height: 46px; }
+/* The bottom bar is the smallest type in the product and it is read at arm's
+   length. At 9.5 px in `--tf-text-3` the labels measured 3.98:1 against the bar
+   — under the 4.5:1 floor — and short words blurred into each other ("Git" was
+   read back as "Oit"). 10.5 px in `--tf-text-2` measures 11:1 and the widest
+   label still needs 44 px of a 64 px cell, so nothing has to be dropped. */
+tf-tabs[safe-area][layout="stacked"] .tf-tab {
+  padding: 8px 2px 7px;
+  font-size: 10.5px;
+}
+tf-tabs[safe-area][layout="stacked"] .tf-tab:not(.active) { color: var(--tf-text-2); }
+tf-tabs[safe-area][layout="stacked"] .tf-tab.active { font-weight: 800; }
+tf-tabs[safe-area][layout="stacked"] .tf-tab svg { width: 18px; height: 18px; }
+tf-tabs[safe-area][layout="stacked"] .tf-tab .tf-tab-count { top: 4px; margin-right: -19px; }
+
+/* --- leading marker: dot | letter | icon (exactly one) --------------------- */
+
+.tf-tab .tf-tab-dot {
+  flex: 0 0 auto;
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--tf-text-3);
+}
+.tf-tab .tf-tab-dot--ok     { background: var(--tf-success); }
+.tf-tab .tf-tab-dot--warn,
+.tf-tab .tf-tab-dot--hot    { background: var(--tf-warning); }
+.tf-tab .tf-tab-dot--err    { background: var(--tf-danger); }
+.tf-tab .tf-tab-dot--info   { background: var(--tf-info); }
+.tf-tab .tf-tab-dot--accent { background: var(--tf-accent-1); }
+.tf-tab .tf-tab-dot--muted  { background: var(--tf-text-3); }
+
+/* Motion carries the meaning, not just the hue: a strip of coloured dots reads
+   as decoration, while a pulse reads as "this one is doing something" and a
+   faster pulse with a scale kick reads as "this one is waiting for YOU". The
+   two states a person must not miss are the two that move; done, idle and
+   error-at-rest stay still so the moving ones keep their weight.
+   `prefers-reduced-motion` drops the animation and leaves the colour. */
+@keyframes tf-tab-dot-run {
+  0%, 100% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--tf-accent-1) 55%, transparent); }
+  50%      { box-shadow: 0 0 0 5px color-mix(in srgb, var(--tf-accent-1) 0%, transparent); }
+}
+@keyframes tf-tab-dot-ask {
+  0%, 100% { transform: scale(1);
+             box-shadow: 0 0 0 0 color-mix(in srgb, var(--tf-warning) 60%, transparent); }
+  50%      { transform: scale(1.18);
+             box-shadow: 0 0 0 5px color-mix(in srgb, var(--tf-warning) 0%, transparent); }
+}
+.tf-tab .tf-tab-dot--accent { animation: tf-tab-dot-run 1.7s ease-in-out infinite; }
+.tf-tab .tf-tab-dot--warn   { animation: tf-tab-dot-ask 1.1s ease-in-out infinite; }
+
+@media (prefers-reduced-motion: reduce) {
+  .tf-tab .tf-tab-dot--accent,
+  .tf-tab .tf-tab-dot--warn { animation: none; }
+}
+
+.tf-tab .tf-tab-marker {
+  flex: 0 0 auto;
+  font-size: 11px;
+  font-weight: 800;
+  line-height: 1;
+  color: var(--tf-text-3);
+}
+.tf-tab .tf-tab-marker--ok     { color: var(--tf-success); }
+.tf-tab .tf-tab-marker--warn,
+.tf-tab .tf-tab-marker--hot    { color: var(--tf-warning); }
+.tf-tab .tf-tab-marker--err    { color: var(--tf-danger); }
+.tf-tab .tf-tab-marker--info   { color: var(--tf-info); }
+.tf-tab .tf-tab-marker--accent { color: var(--tf-accent-2); }
+.tf-tab .tf-tab-marker--muted  { color: var(--tf-text-3); }
+
+/* --- two-line label + monospace identifier --------------------------------- */
+
+.tf-tab .tf-tab-text {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+}
+.tf-tab .tf-tab-sub {
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: normal;
+  color: var(--tf-text-3);
+}
+.tf-tab .tf-tab-label--mono {
+  font-family: var(--tf-mono);
+  font-size: 11.5px;
+  letter-spacing: normal;
+}
+
+/* --- count tone ------------------------------------------------------------ */
+
+.tf-tab .tf-tab-count--hot,
+.tf-tab.active .tf-tab-count--hot {
+  background: var(--tf-warning);
+  color: #1a1200;
+  border-color: transparent;
+}
+
+/* --- closable: the × is a sibling, parked over the tab's right padding ------ */
+
+tf-tab[closable] {
+  position: relative;
+  display: inline-flex;
+  align-items: stretch;
+}
+tf-tab[closable] > .tf-tab { padding-right: 30px; }
+.tf-tab-close {
+  position: absolute;
+  right: 7px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 17px;
+  height: 17px;
+  padding: 0;
+  border: 0;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--tf-text-3);
+  opacity: 0.6;
+  font: inherit;
+  font-size: 14px;
+  line-height: 1;
+  cursor: pointer;
+  transition: opacity 0.14s, color 0.14s, background 0.14s;
+}
+.tf-tab-close:hover {
+  opacity: 1;
+  color: var(--tf-danger);
+  background: rgba(239, 68, 68, 0.14);
+}
+.tf-tab-close:focus-visible {
+  opacity: 1;
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 1px;
+}
+.tf-tab-close[disabled] { cursor: not-allowed; opacity: 0.25; }
+
+/* --- pinned first cell + "waiting for you" nudge --------------------------- */
+
+tf-tab[pinned] {
+  position: sticky;
+  left: 0;
+  z-index: 2;
+  flex: 0 0 auto;
+}
+.tf-tabs-navbar tf-tab[pinned] { background: var(--tf-bg-2); }
+tf-tab[nudge] > .tf-tab:not(.active) {
+  color: var(--tf-warning);
+  background: rgba(245, 158, 11, 0.08);
+}
+tf-tab[nudge] > .tf-tab:not(.active):hover { color: var(--tf-warning); }
+
+/* =============================================================================
+   tf-choice-card / tf-choice-group — one option of an irreversible choice
+   The unavailable card keeps its note at full contrast: greying out the reason
+   an option cannot be used is the one thing a blocked choice must not do.
+   ============================================================================= */
+
+tf-choice-group {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 12px;
+}
+tf-choice-group[columns="1"] { grid-template-columns: minmax(0, 1fr); }
+tf-choice-group[columns="3"] { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+tf-choice-group[columns="4"] { grid-template-columns: repeat(4, minmax(0, 1fr)); }
+
+tf-choice-card { display: block; min-width: 0; }
+
+.tf-choice-card {
+  position: relative;
+  height: 100%;
+  padding: 14px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-lg);
+  background: var(--tf-bg-2);
+  cursor: pointer;
+  transition: border-color 0.16s, box-shadow 0.16s, background 0.16s;
+}
+.tf-choice-card:hover:not(.is-disabled) {
+  border-color: var(--tf-border-hover);
+  background: var(--tf-bg-card);
+}
+.tf-choice-card.is-selected {
+  border-color: var(--tf-accent-1);
+  background: var(--tf-bg-card);
+  box-shadow: 0 0 0 1px var(--tf-accent-1), var(--tf-glow-accent);
+}
+.tf-choice-card.is-disabled { cursor: not-allowed; }
+.tf-choice-card.is-disabled .tf-choice-card__head,
+.tf-choice-card.is-disabled .tf-choice-card__desc,
+.tf-choice-card.is-disabled .tf-choice-card__features { opacity: 0.45; }
+.tf-choice-card:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: 2px;
+}
+
+.tf-choice-card__head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13.5px;
+  font-weight: 800;
+  color: var(--tf-text);
+}
+.tf-choice-card__icon,
+.tf-choice-card__feature-icon {
+  flex: 0 0 auto;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 2;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+}
+.tf-choice-card__icon { width: 15px; height: 15px; }
+.tf-choice-card__heading { min-width: 0; }
+.tf-choice-card__pill {
+  margin-left: auto;
+  padding: 2px 7px;
+  border-radius: 10px;
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.tf-choice-card__pill--ok      { background: rgba(34, 197, 94, 0.18);  color: var(--tf-success); }
+.tf-choice-card__pill--warn    { background: rgba(245, 158, 11, 0.18); color: var(--tf-warning); }
+.tf-choice-card__pill--err     { background: rgba(239, 68, 68, 0.18);  color: var(--tf-danger); }
+.tf-choice-card__pill--info    { background: rgba(96, 165, 250, 0.18); color: var(--tf-info); }
+.tf-choice-card__pill--accent  { background: var(--tf-accent-glow);    color: var(--tf-accent-2); }
+.tf-choice-card__pill--neutral { background: var(--tf-bg-3);           color: var(--tf-text-2); }
+
+.tf-choice-card__desc {
+  margin: 4px 0 0;
+  font-size: 11.5px;
+  line-height: 1.55;
+  color: var(--tf-text-3);
+}
+
+.tf-choice-card__features {
+  list-style: none;
+  margin: 10px 0 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.tf-choice-card__feature {
+  display: flex;
+  align-items: flex-start;
+  gap: 7px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--tf-text-2);
+}
+.tf-choice-card__feature-icon {
+  width: 12px;
+  height: 12px;
+  margin-top: 2px;
+  color: var(--tf-text-3);
+}
+.tf-choice-card__feature-text { min-width: 0; }
+.tf-choice-card__feature--ok     > .tf-choice-card__feature-icon { color: var(--tf-success); }
+.tf-choice-card__feature--warn   > .tf-choice-card__feature-icon { color: var(--tf-warning); }
+.tf-choice-card__feature--err    > .tf-choice-card__feature-icon { color: var(--tf-danger); }
+.tf-choice-card__feature--info   > .tf-choice-card__feature-icon { color: var(--tf-info); }
+.tf-choice-card__feature--accent > .tf-choice-card__feature-icon { color: var(--tf-accent-2); }
+.tf-choice-card__feature--muted  > .tf-choice-card__feature-icon { color: var(--tf-text-3); }
+.tf-choice-card__feature--ok     b { color: var(--tf-success); }
+.tf-choice-card__feature--warn   b { color: var(--tf-warning); }
+.tf-choice-card__feature--err    b { color: var(--tf-danger); }
+.tf-choice-card__feature--info   b { color: var(--tf-info); }
+.tf-choice-card__feature--accent b { color: var(--tf-accent-2); }
+.tf-choice-card__feature b { color: var(--tf-text); font-weight: 700; }
+
+.tf-choice-card__note {
+  margin: 10px 0 0;
+  padding: 8px 10px;
+  border: 1px solid var(--tf-border);
+  border-radius: var(--tf-radius-sm);
+  background: var(--tf-bg-input);
+  font-size: 11px;
+  line-height: 1.55;
+  color: var(--tf-text-3);
+}
+.tf-choice-card__note--blocking {
+  border-color: rgba(245, 158, 11, 0.35);
+  color: var(--tf-warning);
+}
+
+@media (max-width: 900px) {
+  tf-choice-group,
+  tf-choice-group[columns="3"],
+  tf-choice-group[columns="4"] { grid-template-columns: minmax(0, 1fr); }
+}
+
+/* =============================================================================
+   tf-tab focus ring
+   Keyboard navigation along a tablist is useless without one, and
+   css/addon-app.css deliberately excludes tf-tabs descendants from the addon
+   shell's ring — so the component has to carry its own. Inset offset: tabs are
+   packed edge to edge, an outward ring would be clipped by the neighbour.
+   ============================================================================= */
+
+.tf-tab:focus-visible {
+  outline: 2px solid var(--tf-accent-1);
+  outline-offset: -2px;
+  z-index: 2;
+}
+
+/* =============================================================================
+   tf-option-row — one row of a list you pick from
+   =============================================================================
+   The host is `display: contents` on purpose: the row replaces a bare <button>
+   inside a strip, a sheet or a candidate list, and adding a wrapper box would
+   change every one of those layouts. A feature stylesheet themes the control
+   through `.<feature-class> .tf-option-row`. */
+
+tf-option-row { display: contents; }
+
+.tf-option-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 0;
+  border: 0;
+  background: none;
+  color: inherit;
+  font: inherit;
+  text-align: left;
+  cursor: pointer;
+}
+.tf-option-row:disabled { cursor: not-allowed; }
+.tf-option-row__lead[hidden] { display: none; }
+.tf-option-row__lead {
+  display: inline-flex;
+  align-items: center;
+  flex-shrink: 0;
+}
+.tf-option-row__text {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  min-width: 0;
+}
+.tf-option-row__label,
+.tf-option-row__sub { display: block; min-width: 0; }
+.tf-option-row__sub[hidden] { display: none; }

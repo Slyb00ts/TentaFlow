@@ -9,6 +9,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { getNodeName, getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
+import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import '/js/components/tf-input.js';
 import '/js/components/tf-textarea.js';
 import '/js/components/tf-toggle.js';
@@ -215,29 +216,6 @@ async function loadDynamicEnumOptions(source, category) {
   return promise;
 }
 
-const TYPE_ICON = {
-  trigger: 'bolt', start: 'bolt',
-  llm: 'chip', embeddings: 'sparkle', reranker: 'sparkle',
-  stt: 'mic', tts: 'speaker',
-  rag: 'rag-db', memory: 'rag-db',
-  condition: 'branch', switch: 'branch',
-  template: 'code', transform: 'transform', router: 'transform',
-  pii_filter: 'shield', tts_clean: 'shield',
-  output: 'arrow-out', end: 'arrow-out',
-  conversation_history: 'rag-db', session_context: 'rag-db',
-  speaker_context: 'rag-db', memory_analyzer: 'sparkle',
-};
-const TYPE_VAR = {
-  trigger: '--node-trigger', start: '--node-start',
-  llm: '--node-llm', stt: '--node-stt', tts: '--node-tts',
-  rag: '--node-rag', memory: '--node-memory',
-  embeddings: '--node-embeddings', reranker: '--node-reranker',
-  condition: '--node-condition', switch: '--node-switch',
-  template: '--node-template', transform: '--node-transform',
-  pii_filter: '--node-pii_filter', tts_clean: '--node-tts_clean',
-  router: '--node-router', output: '--node-output', end: '--node-end',
-};
-
 export class FlowConfig {
   constructor(rootEl, opts = {}) {
     this.root = rootEl;
@@ -289,8 +267,8 @@ export class FlowConfig {
 
   _render() {
     const n = this.node;
-    const iconId = TYPE_ICON[n.type] || 'chip';
-    const varName = TYPE_VAR[n.type] || '--node-llm';
+    const iconId = nodeIconId(n.type, this.template?.icon, this.template?.category);
+    const varName = nodeColorVar(n.type, this.template?.category);
     const title = getNodeDisplayTitle(n, this.template);
     const subtitle = I18n.t('flows_config.subtitle', { type: n.type, id: n.id });
 

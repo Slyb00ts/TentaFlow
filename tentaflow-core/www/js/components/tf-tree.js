@@ -1,12 +1,19 @@
 // =============================================================================
 // File: tf-tree.js
 // Description: <tf-tree> — hierarchical tree with chevron expand/collapse,
-//              selectable rows, disabled nodes, DOM-node icons, lazy children
-//              and roving-tabindex keyboard navigation. Controlled component:
-//              expansion/selection state comes in via `expandedIds`/`selectedId`
-//              properties; user intent is emitted as `expand`/`collapse`/`select`
-//              events (non-bubbling, detail `{ id }`, expand adds `lazy`).
-//              Light DOM.
+//              selectable rows, disabled nodes, DOM-node icons, status badges,
+//              lazy children and roving-tabindex keyboard navigation. Controlled
+//              component: expansion/selection state comes in via
+//              `expandedIds`/`selectedId` properties; user intent is emitted as
+//              `expand`/`collapse`/`select` events (non-bubbling, detail
+//              `{ id }`, expand adds `lazy`). Light DOM.
+//
+//              Node shape: { id, label, children?, hasChildren?, disabled?,
+//                icon? (a DOM element, rendered BEFORE the label),
+//                badge? (a short status marker rendered AFTER the label and
+//                  pushed to the row's right edge — either a string, or
+//                  { text, tone } with tone a|m|d|c = added/modified/deleted/
+//                  conflict) }
 // Example: const tree = document.querySelector('tf-tree');
 //          tree.nodes = [{id:'a', label:'A', children:[{id:'a1', label:'A1'}]}];
 //          tree.expandedIds = ['a'];
@@ -14,9 +21,26 @@
 // =============================================================================
 
 const VARIANTS = new Set(['default', 'compact', 'with_icons']);
+// Status tones for `node.badge`: added / modified / deleted / conflict.
+const BADGE_TONES = new Set(['a', 'm', 'd', 'c']);
 // Defensive cap: cyclic or absurdly deep node graphs stop rendering instead of
 // recursing forever. Callers needing strict validation enforce depth themselves.
 const MAX_DEPTH = 32;
+
+// Accepts a bare string or { text|label, tone }. Anything else yields no badge.
+function normalizeBadge(badge) {
+  if (badge == null) return null;
+  if (typeof badge === 'string' || typeof badge === 'number') {
+    const text = String(badge);
+    return text ? { text, tone: '' } : null;
+  }
+  if (typeof badge !== 'object') return null;
+  const raw = badge.text != null ? badge.text : badge.label;
+  const text = raw == null ? '' : String(raw);
+  if (!text) return null;
+  const tone = typeof badge.tone === 'string' ? badge.tone.toLowerCase() : '';
+  return { text, tone: BADGE_TONES.has(tone) ? tone : '' };
+}
 
 class TfTree extends HTMLElement {
   static get observedAttributes() {
@@ -165,6 +189,17 @@ class TfTree extends HTMLElement {
     label.classList.add('tf-tree__label');
     label.textContent = node.label != null ? String(node.label) : node.id;
     row.appendChild(label);
+
+    // The badge follows the label so a file name reads first and its status
+    // marker sits at the row's right edge.
+    const badge = normalizeBadge(node.badge);
+    if (badge) {
+      const badgeEl = document.createElement('span');
+      badgeEl.classList.add('tf-tree__badge');
+      if (badge.tone) badgeEl.classList.add(`tf-tree__badge--${badge.tone}`);
+      badgeEl.textContent = badge.text;
+      row.appendChild(badgeEl);
+    }
 
     if (this._selectedId === node.id) {
       li.classList.add('tf-tree__node--selected');

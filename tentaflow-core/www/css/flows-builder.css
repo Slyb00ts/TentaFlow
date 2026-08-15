@@ -31,6 +31,20 @@
   --node-end: #94a3b8;
   /* Harness background blocks (spawn/await_subagents/subagent_status/interval). */
   --node-spawn: #0ea5e9;
+  --node-code_studio: #14b8a6;
+  --node-agent: #0284c7;
+  --node-document: #7c3aed;
+  --node-tools: #eab308;
+  /* Kolor rodziny: blok bez własnego wpisu bierze barwę swojej kategorii,
+     żeby paleta nie była ścianą jednego odcienia. */
+  --node-cat-trigger: #22c55e;
+  --node-cat-service: #6366f1;
+  --node-cat-memory: #06b6d4;
+  --node-cat-transform: #64748b;
+  --node-cat-logic: #f97316;
+  --node-cat-filter: #10b981;
+  --node-cat-output: #ef4444;
+  --node-cat-other: #94a3b8;
   /* Loop region container accent. */
   --node-loop-region: #f59e0b;
 }
@@ -90,21 +104,19 @@
 .fb-flow-name:hover { background: var(--tf-bg-input, #0b0e22); border-color: var(--tf-border, #1f2548); }
 .fb-flow-name:focus { background: var(--tf-bg-input, #0b0e22); border-color: var(--tf-accent-1, #6366f1); }
 
-.fb-status-select {
+/* The shared tf-select is a full-width form control; in the toolbar row it has
+   to shrink to its own label, so only the box metrics are overridden — colours,
+   focus ring and the chevron stay the component's. */
+.fb-status-select { display: inline-block; width: auto; flex-shrink: 0; }
+.fb-status-select .tf-select-wrap { width: auto; }
+.fb-status-select .tf-select {
   width: auto;
-  padding: 7px 32px 7px 12px;
   min-height: 32px;
+  padding: 6px 34px 6px 12px;
   font-size: 12px;
   font-weight: 600;
-  background: var(--tf-bg-input, #0b0e22) url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 24 24' fill='none' stroke='%236a7196' stroke-width='2.5'><polyline points='6 9 12 15 18 9'/></svg>") no-repeat right 10px center;
-  border: 1px solid var(--tf-border, #1f2548);
-  border-radius: var(--tf-radius, 10px);
-  color: var(--tf-text, #f5f6ff);
-  appearance: none;
-  cursor: pointer;
-  outline: none;
 }
-.fb-status-select:focus { border-color: var(--tf-accent-1, #6366f1); }
+.fb-status-select .tf-select-wrap::after { right: 12px; }
 
 .fb-topbar-spacer { flex: 1; }
 
@@ -151,6 +163,13 @@
   background: rgba(239, 68, 68, 0.1);
   border-color: rgba(239, 68, 68, 0.3);
   color: var(--tf-danger, #ef4444);
+}
+/* Zapisane, ale niekompletne: bloki z czerwoną obwódką na płótnie muszą mieć
+   odpowiednik w topbarze, inaczej „Zapisano" czyta się jako „gotowe". */
+.fb-autosave.warn {
+  background: rgba(245, 158, 11, 0.1);
+  border-color: rgba(245, 158, 11, 0.3);
+  color: var(--tf-warning, #f59e0b);
 }
 .fb-autosave svg { width: 12px; height: 12px; }
 
@@ -239,6 +258,15 @@
   transition: background 0.12s;
 }
 .fb-palette-cat-header:hover { background: var(--tf-bg-3, #131736); color: var(--tf-text-2, #c1c5e0); }
+/* Nagłówek grupy: etykieta, licznik, strzałka — licznik odpycha strzałkę na
+   prawo, więc rozkład zostaje ten sam co przed dodaniem liczby. */
+.fb-palette-cat-header > span:first-child { flex: 1; }
+.fb-palette-cat-count {
+  color: var(--tf-text-3, #6a7196);
+  opacity: 0.8;
+  margin-right: 8px;
+  letter-spacing: 0;
+}
 .fb-palette-cat-header svg { width: 14px; height: 14px; transition: transform 0.22s; }
 .fb-palette-category.collapsed .fb-palette-cat-header svg { transform: rotate(-90deg); }
 .fb-palette-category.collapsed .fb-palette-items { display: none; }
@@ -356,6 +384,20 @@
   cursor: grab;
 }
 .fb-canvas.panning { cursor: grabbing; }
+/* A graph wider than the frame has to be panned, so a block WILL sit across the
+   edge. Without a gutter the cut lands flush against the palette and the
+   inspector and reads as "the panel is covering the canvas"; the fade makes the
+   same block visibly run off the canvas's own edge instead. */
+.fb-canvas::after {
+  content: '';
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  z-index: 3;
+  background:
+    linear-gradient(90deg, var(--tf-bg, #050818), transparent 26px),
+    linear-gradient(270deg, var(--tf-bg, #050818), transparent 26px);
+}
 .fb-canvas.drop-target::before {
   content: '';
   position: absolute;
@@ -574,6 +616,8 @@
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+/* Znacznik typu jest maszynowy, tytuł jest ludzki — przy długim typie
+   (`compact_context`) to znacznik ma się skrócić, nie nazwa bloku. */
 .fb-node-type {
   font-size: 9px;
   font-weight: 700;
@@ -583,11 +627,17 @@
   padding: 2px 6px;
   background: var(--tf-bg-3, #131736);
   border-radius: 4px;
+  max-width: 35%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .fb-node-error-icon { color: var(--tf-danger, #ef4444); }
 .fb-node-error-icon svg { width: 14px; height: 14px; display: block; }
+/* The side lanes are reserved by the canvas (`--fb-lane-*`) on whichever side
+   actually draws port labels, so a label can never land on a value. */
 .fb-node-body {
-  padding: 0 14px 12px;
+  padding: 0 calc(14px + var(--fb-lane-out, 0px)) 12px calc(14px + var(--fb-lane-in, 0px));
   font-size: 11px;
   color: var(--tf-text-2, #c1c5e0);
   display: flex;
@@ -599,15 +649,18 @@
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 12px;
+  gap: 10px;
   padding: 3px 0;
   min-width: 0;
 }
+/* The field NAME is what tells you which value you are looking at, so it takes
+   whatever the (usually short) value leaves — a fixed 45 % cut `max_result_chars`
+   in half while `16000` sat in an empty half-row. */
 .fb-node-row .fb-key {
   color: var(--tf-text-3, #6a7196);
   font-weight: 500;
-  flex-shrink: 0;
-  max-width: 45%;
+  flex: 1 1 auto;
+  min-width: 0;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -616,8 +669,9 @@
   color: var(--tf-text, #f5f6ff);
   font-family: ui-monospace, 'SF Mono', monospace;
   font-size: 10.5px;
-  flex: 1;
+  flex: 0 1 auto;
   min-width: 0;
+  max-width: 55%;
   text-align: right;
   white-space: nowrap;
   overflow: hidden;
@@ -704,14 +758,19 @@
   color: var(--port-color);
 }
 
+/* The cap matches the lane the node body gives up (`PORT_LABEL_LANE`): a longer
+   port name ellipsises inside its own lane instead of growing over the values. */
 .fb-port-label {
   position: absolute;
   top: 50%;
   transform: translateY(-50%);
+  max-width: 50px;
   font-size: 10px;
   font-weight: 600;
   color: var(--tf-text-3, #6a7196);
   white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
   pointer-events: none;
   letter-spacing: 0.02em;
 }
@@ -812,14 +871,18 @@
   margin-top: 2px;
   font-family: ui-monospace, monospace;
 }
+/* Cztery zakładki nie mieszczą się w panelu o szerokości 320 px — bez zawijania
+   ostatnia ("Zaawansowane") kończyła się 54 px za krawędzią i była przycięta. */
 .fb-config-tabs {
   display: flex;
+  flex-wrap: wrap;
   gap: 4px;
   border-bottom: 1px solid var(--tf-border, #1f2548);
   padding: 0 8px;
 }
 .fb-config-tab {
   padding: 10px 12px 12px;
+  max-width: 100%;
   background: transparent;
   border: 0;
   color: var(--tf-text-3, #6a7196);
@@ -1086,9 +1149,41 @@
 }
 
 @media (max-width: 767px) {
+  /* Na telefonie pasek nie mieści się w jednym rzędzie (1064 px treści na
+     390 px ekranu), a poziome przewijanie chowało "Zapisz" poza krawędzią bez
+     żadnej wskazówki, że tam jest. Zamiast tego pasek się zawija, a wiersz
+     shella rośnie razem z nim. */
   .fb-shell {
-    grid-template-rows: 56px 1fr 52px;
+    grid-template-rows: auto 1fr 52px;
   }
+  .fb-topbar {
+    flex-wrap: wrap;
+    overflow-x: visible;
+    gap: 8px;
+    padding: 8px 12px;
+  }
+  .fb-topbar-separator { display: none; }
+  .fb-flow-name {
+    flex: 1 1 120px;
+    min-width: 0;
+    order: 2;
+  }
+  .fb-topbar > [data-role="back"] { order: 1; }
+  .fb-topbar > [data-role="save"] { order: 3; }
+  /* Rozpychacz staje się łamaczem wiersza: akcje sterujące schodzą pod nazwę. */
+  .fb-topbar-spacer {
+    flex: 0 0 100%;
+    height: 0;
+    order: 4;
+  }
+  .fb-status-select { order: 5; }
+  .fb-autosave { order: 6; }
+  .fb-zoom-controls { order: 7; }
+  .fb-topbar > [data-role="variables"] { order: 8; }
+  .fb-topbar > [data-role="test"] { order: 9; }
+  .fb-topbar > [data-role="history"] { order: 10; }
+  /* Sam znacznik wystarczy — pełne "Zapisano" zjadało cały rząd. */
+  .fb-autosave [data-role="autosave-text"] { display: none; }
   .fb-bottombar {
     padding: 0;
   }

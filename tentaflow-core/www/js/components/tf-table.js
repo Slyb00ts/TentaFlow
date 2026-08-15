@@ -1,7 +1,12 @@
 // =============================================================================
 // Plik: tf-table.js
 // Opis: Komponent <tf-table sortable selectable> z <tf-column key="..." label
-//       renderer="text|chip|num" sortable sticky>. Properties .rows (array) +
+//       renderer="text|chip|num" sortable sticky hide-below="900">.
+//       `hide-below` ukrywa kolumne ponizej podanej szerokosci viewportu
+//       (dozwolone: 480 640 720 900 1024 1180 1280 — regula zyje w controls.css,
+//       a media query nie czyta zmiennej CSS). Komorki zostaja w DOM, wiec stan
+//       tabeli (zaznaczenie, ekspansja, sort) przezywa zmiane szerokosci.
+//       Properties .rows (array) +
 //       .columns (computed z dzieci). Emituje "row-click", "row-dblclick",
 //       "sort", "select-all", "row-expand" i "page-change".
 //       Paginacja (server-side): atrybuty page-size / total / page (1-based).
@@ -24,6 +29,17 @@ class TfColumn extends HTMLElement {
   }
 }
 customElements.define('tf-column', TfColumn);
+
+// Breakpoints supported by <tf-column hide-below="…">. The rule has to live in
+// controls.css (the only sheet adopted into the shadow root) and a media query
+// cannot read a custom property, so the scale is finite by construction. A value
+// outside this set leaves the column visible rather than guessing a neighbour.
+const HIDE_BELOW_BREAKPOINTS = new Set([480, 640, 720, 900, 1024, 1180, 1280]);
+
+function hideBelowOf(el) {
+  const raw = parseInt(el.getAttribute('hide-below') || '', 10);
+  return HIDE_BELOW_BREAKPOINTS.has(raw) ? raw : 0;
+}
 
 // Szerokosc komorek sticky uzywana do skladania offsetu `left` kolejnych
 // przypietych kolumn. Bez znanego layoutu tabela nie zna realnych szerokosci,
@@ -140,7 +156,29 @@ class TfTable extends HTMLElement {
       renderer: (c.getAttribute('renderer') || 'text').toLowerCase(),
       align: (c.getAttribute('align') || '').toLowerCase(),
       sticky: c.hasAttribute('sticky'),
+      hideBelow: hideBelowOf(c),
     }));
+  }
+
+  // Hiding is a CSS concern: the cells stay in the DOM, so selection, expansion,
+  // sort and the recycled-row bookkeeping survive a viewport change untouched.
+  // Idempotent — recycled cells drop a stale breakpoint before taking the new one.
+  _applyHideBelow(cell, col) {
+    if (cell.classList.length) {
+      for (const cls of [...cell.classList]) {
+        if (cls.startsWith('tf-table__col--hide-below-')) cell.classList.remove(cls);
+      }
+    }
+    if (col.hideBelow) cell.classList.add(`tf-table__col--hide-below-${col.hideBelow}`);
+  }
+
+  // The card view (<=720px) draws the column label above each value from this
+  // attribute. A column may declare no label — a summary cell that already
+  // reads as a sentence — and then no caption line is rendered at all.
+  // Idempotent, so a recycled cell drops a stale label.
+  _applyCardLabel(cell, col) {
+    if (col.label) cell.dataset.label = col.label;
+    else delete cell.dataset.label;
   }
 
   // Indeksy kolumn (sposrod realnie renderowanych <td>, BEZ kolumny expand)
@@ -292,7 +330,7 @@ class TfTable extends HTMLElement {
   // unikac rebuildu thead przy kazdym set rows / sort. thead trzymamy
   // wylacznie dla ARIA i sortowania, nie zalezy od liczby wierszy.
   _columnsSignature(cols) {
-    const sig = cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}|${c.sticky ? 1 : 0}`).join('');
+    const sig = cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}|${c.sticky ? 1 : 0}|${c.hideBelow}`).join('');
     const selectAll = this._isMultiSelect() ? 'S' : '';
     return `${this._stickyColumns}#${this._expandable ? 'E' : ''}${selectAll}#${sig}`;
   }
@@ -332,6 +370,7 @@ class TfTable extends HTMLElement {
         th.classList.add('sortable');
         th.dataset.key = col.key;
       }
+      this._applyHideBelow(th, col);
       if (stickySet.has(i)) this._applySticky(th, i);
       tr.appendChild(th);
     });
@@ -451,8 +490,9 @@ class TfTable extends HTMLElement {
     this._appendLeadingCells(rtr, row, idx);
     cols.forEach((col, i) => {
       const td = document.createElement('td');
-      td.dataset.label = col.label;
+      this._applyCardLabel(td, col);
       if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
+      this._applyHideBelow(td, col);
       if (stickySet.has(i)) this._applySticky(td, i);
       // The select-all box lives in the first header cell, so the per-row box
       // belongs in the matching first data cell — no extra column.
@@ -489,6 +529,8 @@ class TfTable extends HTMLElement {
     const stickySet = this._stickyColumnIndices(cols);
     for (let i = 0; i < cols.length; i += 1) {
       const td = tds[i];
+      this._applyHideBelow(td, cols[i]);
+      this._applyCardLabel(td, cols[i]);
       if (stickySet.has(i)) this._applySticky(td, i);
       this._writeCell(td, cols[i], row[cols[i].key]);
     }

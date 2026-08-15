@@ -11,6 +11,14 @@
 //                         child spawns. The renderer is reused by Agents → Runs.
 //   Question / permission cards surface when a run enters waiting_user.
 //   Light DOM, i18n-agnostic (host passes a `labels` dict). tf-* primitives only.
+//
+//   Attributes: variant (chat|chat-audio), level (bar|tree|detail — pins the
+//     surface to a level instead of forcing the host to synthesise a click on
+//     the internal expand control; when present it also tracks internal
+//     navigation, when absent the widget behaves exactly as before),
+//     cards ("off" suppresses the question/permission cards for hosts that own
+//     a single answering surface elsewhere — the waiting state still shows,
+//     the amber dot and the waiting line stay).
 // Example: const w = document.createElement('tf-agent-activity');
 //          w.labels = { ... }; w.applyEvent(runEvent);
 //          w.addEventListener('agent-cancel', e => cancel(e.detail.runId));
@@ -116,7 +124,17 @@ function eventToStep(ev, labels) {
   }
 }
 
+// Public names for the three internal levels.
+const LEVEL_NAMES = ['bar', 'tree', 'detail'];
+const LEVEL_INDEX = { bar: 0, tree: 1, detail: 2 };
+
 class TfAgentActivity extends HTMLElement {
+  // `variant` stays constructor-read (property-driven, as before); only the two
+  // new attributes are observed, so no existing host changes behaviour.
+  static get observedAttributes() {
+    return ['level', 'cards'];
+  }
+
   constructor() {
     super();
     // runId → { runId, agent, status, parentRunId, tokens, startedAt, steps[],
@@ -127,11 +145,55 @@ class TfAgentActivity extends HTMLElement {
     this._detailRunId = null;
     this._variant = this.getAttribute('variant') || 'chat';
     this._built = false;
+    this._reflectingLevel = false;
+    const initial = LEVEL_INDEX[(this.getAttribute('level') || '').toLowerCase()];
+    if (initial !== undefined) this._level = initial;
   }
 
   connectedCallback() {
     if (!this._built) this._build();
     this._render();
+  }
+
+  attributeChangedCallback(name, oldVal, newVal) {
+    if (oldVal === newVal) return;
+    if (name === 'level') {
+      if (this._reflectingLevel) return;
+      const n = LEVEL_INDEX[String(newVal || '').toLowerCase()];
+      if (n === undefined) return;
+      this._level = n;
+    }
+    if (this._built) this._render();
+  }
+
+  // bar | tree | detail. Setting it drives the attribute, which drives the level.
+  get level() { return LEVEL_NAMES[this._level] || 'bar'; }
+  set level(val) {
+    const name = String(val || '').toLowerCase();
+    if (!(name in LEVEL_INDEX)) return;
+    this.setAttribute('level', name);
+    // happy-dom and some upgrade orders skip attributeChangedCallback; the
+    // assignment below is idempotent with it.
+    this._level = LEVEL_INDEX[name];
+    if (this._built) this._render();
+  }
+
+  // Internal navigation. The attribute is only written when the host already
+  // opted into it, so an uncontrolled widget keeps its previous DOM exactly.
+  _setLevel(n) {
+    this._level = n;
+    if (this.hasAttribute('level')) {
+      this._reflectingLevel = true;
+      this.setAttribute('level', LEVEL_NAMES[n]);
+      this._reflectingLevel = false;
+    }
+    this._render();
+  }
+
+  // Hosts that own a single answering surface (a composer) set cards="off" so
+  // the widget never becomes a second place to answer the same question.
+  _cardsEnabled() {
+    return (this.getAttribute('cards') || '').toLowerCase() !== 'off';
   }
 
   set labels(val) {
@@ -178,6 +240,21 @@ class TfAgentActivity extends HTMLElement {
     return (Array.isArray(events) ? events : []).map((ev) => eventToStep(ev, labels));
   }
 
+  _newRun(runId, agent) {
+    return {
+      runId,
+      agent: agent || '',
+      status: 'running',
+      parentRunId: '',
+      tokens: 0,
+      startedAt: Date.now(),
+      steps: [],
+      question: null,
+      permission: null,
+      currentStep: '',
+    };
+  }
+
   // Apply one AgentRunEvent (decoded body). Updates the run model + re-renders.
   applyEvent(ev) {
     if (!ev || !ev.kind) return;
@@ -185,37 +262,26 @@ class TfAgentActivity extends HTMLElement {
     if (!runId) return;
     let run = this._runs.get(runId);
     if (!run) {
-      run = {
-        runId,
-        agent: ev.agent || '',
-        status: 'running',
-        parentRunId: '',
-        tokens: 0,
-        startedAt: Date.now(),
-        steps: [],
-        question: null,
-        permission: null,
-        currentStep: '',
-      };
+      run = this._newRun(runId, ev.agent || '');
       this._runs.set(runId, run);
     }
 
     if (ev.kind === 'child_spawned') {
-      // The child becomes its own run row, parented to the scope's run.
+      // The child row is created above by the generic path (it is keyed by
+      // ev.run_id), so the parent link has to be written onto the EXISTING
+      // entry — the previous "create if missing" branch never fired and every
+      // spawned run stayed a root, flattening the tree.
       const childId = ev.run_id || ev.runId;
-      if (childId && !this._runs.has(childId)) {
-        this._runs.set(childId, {
-          runId: childId,
-          agent: ev.agent || '',
-          status: 'running',
-          parentRunId: ev.scope || runId,
-          tokens: 0,
-          startedAt: Date.now(),
-          steps: [],
-          question: null,
-          permission: null,
-          currentStep: '',
-        });
+      const parentId = ev.scope || '';
+      const child = childId ? this._runs.get(childId) : null;
+      // Only link to a run we already hold: the tree renders from roots down, so
+      // pointing at an unknown id would drop the child off the surface entirely.
+      // ChildSpawned is published on the parent's own scope, so in practice the
+      // parent row already exists; when it does not, the child stays a root —
+      // exactly what it was before.
+      if (child && parentId && parentId !== childId && !child.parentRunId
+        && this._runs.has(parentId)) {
+        child.parentRunId = parentId;
       }
     }
 
@@ -262,6 +328,11 @@ class TfAgentActivity extends HTMLElement {
       if (this._built) this._render();
     }
   }
+
+  // How many runs the expanded tree lists. A host that puts a badge next to this
+  // widget has to read the number off the widget itself — deriving it from a
+  // second source is how a badge ends up disagreeing with the list under it.
+  get runCount() { return this._runs.size; }
 
   // True when any run is still in-flight (drives auto-hide).
   hasActivity() {
@@ -377,6 +448,7 @@ class TfAgentActivity extends HTMLElement {
   }
 
   _renderWaitingCards() {
+    if (!this._cardsEnabled()) return '';
     const cards = [];
     for (const run of this._runs.values()) {
       if (run.question) cards.push(this._renderQuestionCard(run));
@@ -482,22 +554,18 @@ class TfAgentActivity extends HTMLElement {
     const action = actionEl.getAttribute('data-action');
     switch (action) {
       case 'expand':
-        this._level = 1;
-        this._render();
+        this._setLevel(1);
         break;
       case 'collapse':
-        this._level = 0;
-        this._render();
+        this._setLevel(0);
         break;
       case 'open-run':
         this._detailRunId = actionEl.getAttribute('data-run-id');
-        this._level = 2;
         this.dispatchEvent(new CustomEvent('agent-open-run', { detail: { runId: this._detailRunId }, bubbles: true }));
-        this._render();
+        this._setLevel(2);
         break;
       case 'to-tree':
-        this._level = 1;
-        this._render();
+        this._setLevel(1);
         break;
       case 'cancel-run':
         this.dispatchEvent(new CustomEvent('agent-cancel', { detail: { runId: actionEl.getAttribute('data-run-id') }, bubbles: true }));

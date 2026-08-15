@@ -21,6 +21,7 @@ export async function openTransport(options = {}) {
     jwtToken = null,
     preferred = TRANSPORT_WEBSOCKET,
     webTransportTimeoutMs = 3000,
+    webSocketTimeoutMs = 10_000,
   } = options;
 
   const baseUrl = window.location.origin;
@@ -42,7 +43,7 @@ export async function openTransport(options = {}) {
     }
   }
 
-  return openWebSocket(baseUrl, jwtToken);
+  return openWebSocket(baseUrl, jwtToken, webSocketTimeoutMs);
 }
 
 /**
@@ -148,7 +149,7 @@ async function readAllFromStream(stream) {
  * ALPN `bearer.<token>` in `Sec-WebSocket-Protocol` carries the JWT during the
  * upgrade request.
  */
-async function openWebSocket(baseUrl, jwtToken) {
+async function openWebSocket(baseUrl, jwtToken, timeoutMs = 10_000) {
   const wsScheme = baseUrl.startsWith('https') ? 'wss' : 'ws';
   const url = `${wsScheme}://${window.location.host}/ws/api`;
   const protocols = [];
@@ -157,9 +158,24 @@ async function openWebSocket(baseUrl, jwtToken) {
   const ws = protocols.length > 0 ? new WebSocket(url, protocols) : new WebSocket(url);
   ws.binaryType = 'arraybuffer';
 
+  // A socket that neither opens nor errors — a peer that accepted the TCP
+  // connection and then went away mid-handshake — used to leave this promise
+  // pending for the life of the page, and with it every caller waiting on the
+  // client. `onerror` is not guaranteed to fire, so the deadline is the only
+  // thing that turns a vanished server into a rejection.
   await new Promise((resolve, reject) => {
-    ws.onopen = () => resolve();
-    ws.onerror = (_e) => reject(new Error('WebSocket connection failed'));
+    const timer = setTimeout(() => {
+      try { ws.close(1000, 'connect timeout'); } catch { /* ignore */ }
+      reject(new Error(`WebSocket connect timed out after ${timeoutMs}ms`));
+    }, timeoutMs);
+    ws.onopen = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    ws.onerror = (_e) => {
+      clearTimeout(timer);
+      reject(new Error('WebSocket connection failed'));
+    };
   });
 
   const listeners = new Set();

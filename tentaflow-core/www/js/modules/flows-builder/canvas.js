@@ -8,10 +8,14 @@
 import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
+import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
 const NODE_H_APPROX = 110;
+// Próg czytelności widoku otwieranego automatycznie: przy 0.75 nazwa pola ma
+// ~8 px, poniżej z bloku zostają same wartości.
+const READABLE_MIN_ZOOM = 0.75;
 const GRID = 10;
 const MAX_HISTORY = 30;
 // Layout portów: header ma ~44px, porty zaczynają się od HEADER_OFFSET i są
@@ -19,70 +23,14 @@ const MAX_HISTORY = 30;
 const PORT_HEADER_OFFSET = 44;
 const PORT_STEP = 22;
 const DRAG_THRESHOLD = 4;
-
-// Mapa category -> ikona (sprite id) używana dla renderowania nodów na canvas
-const TYPE_ICON = {
-  trigger: 'bolt',
-  start: 'bolt',
-  llm: 'chip',
-  stt: 'mic',
-  tts: 'speaker',
-  memory: 'database',
-  embeddings: 'sparkle',
-  reranker: 'sparkle',
-  condition: 'branch',
-  switch: 'branch',
-  template: 'code',
-  transform: 'transform',
-  pii_filter: 'shield',
-  tts_clean: 'shield',
-  router: 'transform',
-  output: 'arrow-out',
-  end: 'arrow-out',
-  conversation_history: 'database',
-  session_context: 'database',
-  speaker_context: 'database',
-  memory_analyzer: 'sparkle',
-  // Harness redesign (Part 5-6): inline loop region + background blocks.
-  persist_turn: 'database',
-  spawn: 'flow',
-  await_subagents: 'clock',
-  subagent_status: 'flow',
-  interval: 'clock',
-};
-
-// Mapa node_type -> CSS var dla --node-color
-function typeVar(type) {
-  const map = {
-    trigger: '--node-trigger',
-    start: '--node-start',
-    llm: '--node-llm',
-    stt: '--node-stt',
-    tts: '--node-tts',
-    memory: '--node-memory',
-    embeddings: '--node-embeddings',
-    reranker: '--node-reranker',
-    condition: '--node-condition',
-    switch: '--node-switch',
-    template: '--node-template',
-    transform: '--node-transform',
-    pii_filter: '--node-pii_filter',
-    tts_clean: '--node-tts_clean',
-    router: '--node-router',
-    output: '--node-output',
-    end: '--node-end',
-    conversation_history: '--node-conversation_history',
-    session_context: '--node-session_context',
-    speaker_context: '--node-speaker_context',
-    memory_analyzer: '--node-memory_analyzer',
-    persist_turn: '--node-conversation_history',
-    spawn: '--node-spawn',
-    await_subagents: '--node-spawn',
-    subagent_status: '--node-spawn',
-    interval: '--node-spawn',
-  };
-  return map[type] || '--node-llm';
-}
+// Etykieta portu lezy WEWNATRZ noda, obok swojej kropki, wiec kolumna wartosci
+// musi jej oddac pas — inaczej "stream" laduje na "16000". Pas placimy tylko po
+// tej stronie, ktora faktycznie rysuje etykiety (>=2 porty).
+const PORT_LABEL_LANE = 52;
+// Margines miedzy skrajnym blokiem a krawedzia plotna — ten sam przy
+// dopasowaniu widoku i przy ograniczeniu panoramy, wiec blok nigdy nie stoi
+// przycięty przez paletę albo inspektora.
+const CONTENT_MARGIN = 40;
 
 // Kategoria -> krótka etykieta na nodzie
 const TYPE_CATEGORY = {
@@ -96,6 +44,8 @@ const TYPE_CATEGORY = {
   output: 'output', end: 'output',
   persist_turn: 'memory',
   spawn: 'agent', await_subagents: 'agent', subagent_status: 'agent', interval: 'agent',
+  workspace_context: 'code', exec_command: 'code', delegate_cli: 'code',
+  patch_review: 'logic',
 };
 
 // Generuje stabilny identyfikator regionu pętli (loop region). Region grupuje
@@ -204,6 +154,9 @@ export class FlowCanvas {
     this.onSelect = opts.onSelect || (() => {});
     this.onViewChange = opts.onViewChange || (() => {});
     this.templates = new Map(); // node_type -> template
+    // Typy dostępne w kilku presetach (np. `agent`): dla nich sama nazwa typu
+    // nie identyfikuje bloku, więc node musi zapamiętać etykietę presetu.
+    this.presetTypes = new Set();
     this._zTop = 1;
 
     this._rafPending = false;
@@ -220,7 +173,9 @@ export class FlowCanvas {
 
   setTemplates(list) {
     this.templates.clear();
+    this.presetTypes.clear();
     for (const t of list || []) {
+      if (this.templates.has(t.node_type)) this.presetTypes.add(t.node_type);
       this.templates.set(t.node_type, t);
     }
     this._normalizeNodeLabels();
@@ -363,7 +318,7 @@ export class FlowCanvas {
     // Po załadowaniu flow dopasuj widok do nodów (wyśrodkuj + zoom-to-fit),
     // żeby nie startować z pustego rogu canvasa i nie szukać nodów panem.
     // reset=false to undo/redo — wtedy zachowujemy bieżący widok użytkownika.
-    if (reset) this.fitToContent();
+    if (reset) this.fitToContent(READABLE_MIN_ZOOM);
   }
 
   getData() {
@@ -581,7 +536,7 @@ export class FlowCanvas {
     const node = {
       id: 'n_' + Date.now().toString(36) + '_' + Math.random().toString(36).slice(2, 6),
       type: tpl.node_type,
-      label: '',
+      label: this.presetTypes.has(tpl.node_type) ? String(tpl.label || '') : '',
       x: Math.round((pt.x - NODE_WIDTH / 2) / GRID) * GRID,
       y: Math.round((pt.y - NODE_H_APPROX / 2) / GRID) * GRID,
       config: defaultConfig,
@@ -625,6 +580,9 @@ export class FlowCanvas {
   _normalizeNodeLabels() {
     if (!Array.isArray(this.nodes) || this.nodes.length === 0) return;
     for (const node of this.nodes) {
+      // Preset dzieli node_type z innymi presetami, więc jego etykieta jest
+      // jedynym śladem, który z nich wybrano — nie wolno jej wyzerować.
+      if (this.presetTypes.has(node.type)) continue;
       const template = this.templates.get(node.type);
       if (isAutoNodeLabel(node.label, node.type, template?.label)) {
         node.label = '';
@@ -884,19 +842,20 @@ export class FlowCanvas {
   }
 
   _buildNodeEl(n) {
+    const tmpl = this.templates.get(n.type);
     const div = document.createElement('div');
     div.className = 'fb-node';
     div.dataset.nodeId = n.id;
     div.style.left = `${n.x}px`;
     div.style.top = `${n.y}px`;
     div.style.width = `${NODE_WIDTH}px`;
-    div.style.setProperty('--node-color', `var(${typeVar(n.type)})`);
+    div.style.setProperty('--node-color', `var(${nodeColorVar(n.type, tmpl?.category)})`);
 
-    if (this._hasError(n)) div.classList.add('error');
+    const missing = this._missingRequired(n);
+    if (missing.length) div.classList.add('error');
 
-    const iconId = TYPE_ICON[n.type] || 'chip';
+    const iconId = nodeIconId(n.type, tmpl?.icon, tmpl?.category);
     const cat = TYPE_CATEGORY[n.type] || n.type;
-    const tmpl = this.templates.get(n.type);
     const title = getNodeDisplayTitle(n, tmpl);
 
     const { inputs, outputs } = portsForNode(n, tmpl);
@@ -908,23 +867,36 @@ export class FlowCanvas {
     const portCount = Math.max(inputs.length, outputs.length, 1);
     const minHeight = PORT_HEADER_OFFSET + portCount * PORT_STEP + 14;
     div.style.minHeight = `${minHeight}px`;
+    div.style.setProperty('--fb-lane-in', inputs.length >= 2 ? `${PORT_LABEL_LANE}px` : '0px');
+    div.style.setProperty('--fb-lane-out', outputs.length >= 2 ? `${PORT_LABEL_LANE}px` : '0px');
 
     const inPortsHtml = inputs.map((p, i) => this._renderPortEl(n.id, p, i, 'in', inputs.length)).join('');
     const outPortsHtml = outputs.map((p, i) => this._renderPortEl(n.id, p, i, 'out', outputs.length)).join('');
 
+    // Ostrzeżenie bez powodu straszy i nic nie mówi, więc obwódka i trójkąt
+    // idą w parze z listą brakujących pól — w tooltipie i wprost w ciele bloku.
+    const missingNames = missing.join(', ');
     div.innerHTML = `
       <div class="fb-node-header">
         <div class="fb-node-badge"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-title">${escapeHtml(title)}</div>
-        ${this._hasError(n)
-          ? `<span class="fb-node-error-icon" title="${escapeAttr(I18n.t('flows_builder.node_error_tooltip'))}"><svg><use href="#i-alert"/></svg></span>`
+        ${missing.length
+          ? `<span class="fb-node-error-icon" title="${escapeAttr(I18n.t('flows_builder.node_error_tooltip', { fields: missingNames }))}"><svg><use href="#i-alert"/></svg></span>`
           : `<span class="fb-node-type">${escapeHtml(cat)}</span>`}
       </div>
-      <div class="fb-node-body">${this._renderNodeSummary(n)}</div>
+      <div class="fb-node-body">${this._renderMissingRows(missing)}${this._renderNodeSummary(n, missing.length === 0)}</div>
       ${inPortsHtml}
       ${outPortsHtml}
     `;
     return div;
+  }
+
+  _renderMissingRows(missing) {
+    return missing.map((field) => `
+      <div class="fb-node-row" title="${escapeAttr(I18n.t('flows_builder.node_error_field', { field }))}">
+        <span class="fb-key">${escapeHtml(field)}</span>
+        <span class="fb-val missing">${escapeHtml(I18n.t('flows_builder.node_error_required'))}</span>
+      </div>`).join('');
   }
 
   _renderPortEl(nodeId, port, idx, side, total) {
@@ -946,10 +918,12 @@ export class FlowCanvas {
     return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-kind="${escapeAttr(port.name)}" data-port-type="${escapeAttr(portType)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(tooltip)}">${labelHtml}</div>`;
   }
 
-  _renderNodeSummary(n) {
+  _renderNodeSummary(n, withPlaceholder = true) {
     const c = n.config || {};
     const keys = Object.keys(c).filter((k) => c[k] !== null && c[k] !== undefined && c[k] !== '');
-    if (keys.length === 0) return '<div class="fb-node-row"><span class="fb-key">—</span></div>';
+    if (keys.length === 0) {
+      return withPlaceholder ? '<div class="fb-node-row"><span class="fb-key">—</span></div>' : '';
+    }
     return keys.slice(0, 4).map((k) => {
       const v = c[k];
       const s = typeof v === 'object' ? JSON.stringify(v) : String(v);
@@ -958,18 +932,28 @@ export class FlowCanvas {
     }).join('');
   }
 
-  _hasError(n) {
+  /** Etykiety wymaganych pól bez wartości, w kolejności ze schematu. */
+  _missingRequired(n) {
     const tmpl = this.templates.get(n.type);
-    if (!tmpl || !tmpl.params_schema) return false;
+    if (!tmpl || !tmpl.params_schema) return [];
     let schema;
     try { schema = typeof tmpl.params_schema === 'string' ? JSON.parse(tmpl.params_schema) : tmpl.params_schema; }
-    catch (_) { return false; }
-    const required = schema.required || [];
-    for (const key of required) {
+    catch (_) { return []; }
+    const missing = [];
+    for (const key of schema.required || []) {
       const v = n.config?.[key];
-      if (v === null || v === undefined || v === '') return true;
+      if (v === null || v === undefined || v === '') {
+        missing.push(schema.properties?.[key]?.title || key);
+      }
     }
-    return false;
+    return missing;
+  }
+
+  /** Ile bloków na płótnie ma nieuzupełnione pola wymagane — czyli ile nosi
+   *  czerwoną obwódkę i wiersz „wymagane". Topbar mówi o tym wprost, bo sam
+   *  „Zapisano" przy trzech takich blokach przeczy temu, co widać na płótnie. */
+  incompleteNodeCount() {
+    return this.nodes.reduce((n, node) => n + (this._missingRequired(node).length ? 1 : 0), 0);
   }
 
   // Zwraca pozycję portu w WORLD coords (bez pan/zoom). Portu szukamy po
@@ -1105,7 +1089,49 @@ export class FlowCanvas {
   // -------------------------------------------------------------------------
   // Pan / zoom
   // -------------------------------------------------------------------------
+  /**
+   * Bounding box wszystkich wezlow w world coords, albo `null` dla pustego
+   * grafu. Uzywane i przez dopasowanie widoku, i przez ograniczenie panoramy.
+   */
+  _contentBounds() {
+    if (this.nodes.length === 0) return null;
+    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
+    for (const n of this.nodes) {
+      minX = Math.min(minX, n.x);
+      minY = Math.min(minY, n.y);
+      maxX = Math.max(maxX, n.x + NODE_WIDTH);
+      maxY = Math.max(maxY, n.y + NODE_H_APPROX);
+    }
+    return { minX, minY, maxX, maxY };
+  }
+
+  /**
+   * Widok nigdy nie stoi tak, ze skrajny blok dotyka krawedzi plotna: przy
+   * kazdej osi zostaje CONTENT_MARGIN pikseli marginesu. Graf mieszczacy sie w
+   * kadrze jest wiec ZAWSZE caly widoczny — a graf wiekszy niz kadr da sie
+   * przesuwac tylko do granicy tresci, nie w pusta przestrzen za nia.
+   */
+  _clampView() {
+    const b = this._contentBounds();
+    if (!b) return;
+    const rect = this.root.getBoundingClientRect();
+    if (rect.width === 0 || rect.height === 0) return;
+    const z = this.view.zoom;
+    const clampAxis = (value, lo, hi) => Math.min(Math.max(value, Math.min(lo, hi)), Math.max(lo, hi));
+    this.view.x = clampAxis(
+      this.view.x,
+      CONTENT_MARGIN - b.minX * z,
+      rect.width - CONTENT_MARGIN - b.maxX * z,
+    );
+    this.view.y = clampAxis(
+      this.view.y,
+      CONTENT_MARGIN - b.minY * z,
+      rect.height - CONTENT_MARGIN - b.maxY * z,
+    );
+  }
+
   _applyView() {
+    this._clampView();
     this.world.style.transform = `translate(${this.view.x}px, ${this.view.y}px) scale(${this.view.zoom})`;
     this.onViewChange(this.view);
   }
@@ -1133,23 +1159,32 @@ export class FlowCanvas {
     this._applyView();
   }
 
-  fitToContent() {
-    if (this.nodes.length === 0) { this.resetZoom(); return; }
-    let minX = Infinity, minY = Infinity, maxX = -Infinity, maxY = -Infinity;
-    for (const n of this.nodes) {
-      minX = Math.min(minX, n.x);
-      minY = Math.min(minY, n.y);
-      maxX = Math.max(maxX, n.x + NODE_WIDTH);
-      maxY = Math.max(maxY, n.y + NODE_H_APPROX);
-    }
-    const pad = 40;
+  /**
+   * `minZoom` broni czytelności: przy 15 blokach na telefonie pełne
+   * dopasowanie schodzi do ~27%, czyli tekst wielkości 3 px — z bloku zostają
+   * gołe wartości bez nazw pól. Widok otwierany automatycznie trzyma więc próg
+   * i zamiast centrować urwany środek grafu, kotwiczy się w jego lewym górnym
+   * rogu. Przycisk "dopasuj" woła tę metodę bez progu — tam użytkownik prosi
+   * wprost o całość.
+   */
+  fitToContent(minZoom = 0) {
+    const bounds = this._contentBounds();
+    if (!bounds) { this.resetZoom(); return; }
+    const { minX, minY, maxX, maxY } = bounds;
+    const pad = CONTENT_MARGIN;
     const rect = this.root.getBoundingClientRect();
     const w = maxX - minX + pad * 2;
     const h = maxY - minY + pad * 2;
-    const z = Math.min(1, Math.min(rect.width / w, rect.height / h));
+    const fit = Math.min(1, Math.min(rect.width / w, rect.height / h));
+    const z = Math.max(fit, minZoom);
     this.view.zoom = z;
-    this.view.x = (rect.width - (maxX + minX) * z) / 2;
-    this.view.y = (rect.height - (maxY + minY) * z) / 2;
+    if (z > fit) {
+      this.view.x = pad * z - minX * z;
+      this.view.y = pad * z - minY * z;
+    } else {
+      this.view.x = (rect.width - (maxX + minX) * z) / 2;
+      this.view.y = (rect.height - (maxY + minY) * z) / 2;
+    }
     this._applyView();
   }
 

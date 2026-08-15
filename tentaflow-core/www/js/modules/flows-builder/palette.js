@@ -8,46 +8,13 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeName, getNodeDescription } from '/js/modules/flows-builder/node-i18n.js';
+import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 
 const CATEGORY_ORDER = ['trigger', 'service', 'memory', 'transform', 'logic', 'filter', 'output', 'other'];
 
 function categoryLabel(cat) {
   return I18n.t(`flows_palette.categories.${cat}`);
 }
-
-// Mapa node_type -> ikona kategorii (sprite id)
-const TYPE_ICON = {
-  trigger: 'bolt', start: 'bolt',
-  llm: 'chip', embeddings: 'sparkle', reranker: 'sparkle',
-  stt: 'mic', tts: 'speaker',
-  memory: 'database',
-  conversation_history: 'database', session_context: 'database',
-  speaker_context: 'database', memory_analyzer: 'sparkle',
-  condition: 'branch', switch: 'branch',
-  template: 'code', transform: 'transform', router: 'transform',
-  pii_filter: 'shield', tts_clean: 'shield',
-  output: 'arrow-out', end: 'arrow-out',
-  persist_turn: 'database',
-  spawn: 'flow', await_subagents: 'clock', subagent_status: 'flow', interval: 'clock',
-};
-
-const TYPE_VAR = {
-  trigger: '--node-trigger', start: '--node-start',
-  llm: '--node-llm', stt: '--node-stt', tts: '--node-tts',
-  memory: '--node-memory',
-  embeddings: '--node-embeddings', reranker: '--node-reranker',
-  condition: '--node-condition', switch: '--node-switch',
-  template: '--node-template', transform: '--node-transform',
-  pii_filter: '--node-pii_filter', tts_clean: '--node-tts_clean',
-  router: '--node-router', output: '--node-output', end: '--node-end',
-  conversation_history: '--node-conversation_history',
-  session_context: '--node-session_context',
-  speaker_context: '--node-speaker_context',
-  memory_analyzer: '--node-memory_analyzer',
-  persist_turn: '--node-conversation_history',
-  spawn: '--node-spawn', await_subagents: '--node-spawn',
-  subagent_status: '--node-spawn', interval: '--node-spawn',
-};
 
 function catFor(tpl) {
   const c = (tpl.category || '').toLowerCase();
@@ -63,6 +30,10 @@ function catFor(tpl) {
   if (['output','end'].includes(t)) return 'output';
   // Harness background blocks group under "service" (closest existing category).
   if (['spawn','await_subagents','subagent_status','interval'].includes(t)) return 'service';
+  // Code Studio: `patch_review` gates the run on a human decision, so it sits
+  // with the logic blocks; the rest act on the workspace.
+  if (t === 'patch_review') return 'logic';
+  if (['workspace_context','exec_command','delegate_cli'].includes(t)) return 'service';
   return 'other';
 }
 
@@ -71,6 +42,10 @@ export class FlowPalette {
     this.root = rootEl;
     this.opts = opts;
     this.templates = [];
+    // node_type występujące w kilku wariantach (presety agentów). Dla nich
+    // nazwa z i18n jest wspólna, więc paleta musi pokazać etykietę szablonu —
+    // inaczej 17 różnych presetów to 17 wierszy "Agent".
+    this.presetTypes = new Set();
     this.filter = '';
     this.collapsedCats = new Set();
     this._ghost = null;
@@ -111,28 +86,54 @@ export class FlowPalette {
       this.listEl.innerHTML = `<div class="fb-palette-empty">${escapeHtml(I18n.t('flows_palette.load_error', { error: err.message }))}</div>`;
       return;
     }
+    const perType = new Map();
+    for (const tpl of this.templates) perType.set(tpl.node_type, (perType.get(tpl.node_type) ?? 0) + 1);
+    this.presetTypes = new Set([...perType.entries()].filter(([, n]) => n > 1).map(([t]) => t));
     if (this.opts.onTemplatesLoaded) this.opts.onTemplatesLoaded(this.templates);
     this._render();
   }
 
   getTemplates() { return this.templates; }
 
+  /** Nazwa wpisu palety — preset mówi własną etykietą, reszta tłumaczeniem typu. */
+  _nameOf(tpl) {
+    if (this.presetTypes.has(tpl.node_type) && tpl.label) return tpl.label;
+    return getNodeName(tpl.node_type, tpl.label);
+  }
+
+  _descOf(tpl) {
+    if (this.presetTypes.has(tpl.node_type) && tpl.description) return tpl.description;
+    return getNodeDescription(tpl.node_type, tpl.description);
+  }
+
   _render() {
     const groups = {};
     const total = this.templates.length;
     let shown = 0;
-    for (const tpl of this.templates) {
+    for (let i = 0; i < this.templates.length; i += 1) {
+      const tpl = this.templates[i];
       const c = catFor(tpl);
-      const label = getNodeName(tpl.node_type, tpl.label).toLowerCase();
-      const desc = getNodeDescription(tpl.node_type, tpl.description).toLowerCase();
+      const label = this._nameOf(tpl).toLowerCase();
+      const desc = this._descOf(tpl).toLowerCase();
       const type = (tpl.node_type || '').toLowerCase();
       const matches = !this.filter || label.includes(this.filter) || desc.includes(this.filter) || type.includes(this.filter);
       if (!matches) continue;
       if (!groups[c]) groups[c] = [];
-      groups[c].push(tpl);
+      groups[c].push({ tpl, index: i });
       shown += 1;
     }
-    this.countEl.textContent = String(total);
+    // Licznik odpowiada na "ile z ilu widzę", bo przy 70 blokach sam wynik
+    // filtrowania nie mówi, jak bardzo lista została zawężona. Sama liczba przy
+    // przewijanej liście czyta się jak "tyle widać", więc jednostkę niesie
+    // etykieta dostępności i tooltip.
+    this.countEl.textContent = shown === total
+      ? String(total)
+      : I18n.t('flows_palette.count_filtered', { shown, total });
+    const label = shown === total
+      ? I18n.t('flows_palette.count_title', { count: total })
+      : I18n.t('flows_palette.count_title_filtered', { shown, total });
+    this.countEl.title = label;
+    this.countEl.setAttribute('aria-label', label);
 
     if (shown === 0) {
       this.listEl.innerHTML = `
@@ -153,10 +154,11 @@ export class FlowPalette {
         <div class="fb-palette-category ${collapsed ? 'collapsed' : ''}" data-cat="${escapeAttr(cat)}">
           <div class="fb-palette-cat-header" data-role="cat-header">
             <span>${escapeHtml(categoryLabel(cat))}</span>
+            <span class="fb-palette-cat-count">${items.length}</span>
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="6 9 12 15 18 9"/></svg>
           </div>
           <div class="fb-palette-items">
-            ${items.map((t) => this._renderItem(t)).join('')}
+            ${items.map((it) => this._renderItem(it.tpl, it.index)).join('')}
           </div>
         </div>`;
     }
@@ -176,13 +178,14 @@ export class FlowPalette {
     });
   }
 
-  _renderItem(tpl) {
-    const iconId = TYPE_ICON[tpl.node_type] || 'chip';
-    const varName = TYPE_VAR[tpl.node_type] || '--node-llm';
-    const name = getNodeName(tpl.node_type, tpl.label);
-    const desc = getNodeDescription(tpl.node_type, tpl.description);
+  _renderItem(tpl, index) {
+    const cat = catFor(tpl);
+    const iconId = nodeIconId(tpl.node_type, tpl.icon, cat);
+    const varName = nodeColorVar(tpl.node_type, cat);
+    const name = this._nameOf(tpl);
+    const desc = this._descOf(tpl);
     return `
-      <div class="fb-node-item" data-node-type="${escapeAttr(tpl.node_type)}" style="--node-color: var(${varName})">
+      <div class="fb-node-item" data-index="${index}" data-node-type="${escapeAttr(tpl.node_type)}" title="${escapeAttr(desc || name)}" style="--node-color: var(${varName})">
         <div class="fb-node-icon"><svg><use href="#i-${iconId}"/></svg></div>
         <div class="fb-node-info">
           <div class="fb-node-name">${escapeHtml(name)}</div>
@@ -194,8 +197,9 @@ export class FlowPalette {
   _onPointerDown(ev, el) {
     if (ev.button !== undefined && ev.button !== 0) return;
     ev.preventDefault();
-    const nodeType = el.dataset.nodeType;
-    const tpl = this.templates.find((t) => t.node_type === nodeType);
+    // Po indeksie, nie po node_type: presety agentów dzielą jeden typ, więc
+    // wyszukiwanie po typie zawsze upuszczało pierwszy z nich.
+    const tpl = this.templates[Number(el.dataset.index)];
     if (!tpl) return;
     this._dragging = { tpl, startX: ev.clientX, startY: ev.clientY, moved: false };
     el.classList.add('dragging');
@@ -216,8 +220,8 @@ export class FlowPalette {
       d.moved = true;
       this._ghost = document.createElement('div');
       this._ghost.className = 'fb-drag-ghost';
-      this._ghost.style.setProperty('--node-color', `var(${TYPE_VAR[d.tpl.node_type] || '--node-llm'})`);
-      this._ghost.textContent = getNodeName(d.tpl.node_type, d.tpl.label);
+      this._ghost.style.setProperty('--node-color', `var(${nodeColorVar(d.tpl.node_type, catFor(d.tpl))})`);
+      this._ghost.textContent = this._nameOf(d.tpl);
       document.body.appendChild(this._ghost);
     }
     if (this._ghost) {

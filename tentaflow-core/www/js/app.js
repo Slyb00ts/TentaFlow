@@ -64,6 +64,7 @@ import RolesCatalogScreen from '/js/modules/roles_catalog.js';
 import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
 import ProjectStudioScreen from '/js/modules/project-studio.js';
+import CodeStudioScreen from '/js/modules/code-studio.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -518,6 +519,7 @@ async function renderApp() {
   Router.register('robots', RobotsScreen);
   Router.register('skills', SkillsScreen);
   Router.register('agents', AgentsScreen);
+  Router.register('code-studio', CodeStudioScreen);
   Router.register('projekty', ProjectStudioScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
@@ -602,21 +604,26 @@ async function refreshNavCounts() {
 // moze podac dowolny string w manifescie [application.icon]; jezeli nie pasuje
 // — uzywamy generycznego "apps".
 const ADDON_ICON_WHITELIST = new Set([
-  'alert', 'apps', 'arrow', 'arrow-out', 'audit', 'ban', 'bar-chart', 'bolt',
-  'brain', 'branch', 'catalog', 'chart-line', 'chat', 'check', 'chevron-down',
+  'alert', 'apps', 'arrow', 'arrow-left', 'arrow-out', 'audit', 'ban',
+  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'catalog', 'chart-line',
+  'chat', 'check', 'check-circle', 'chevron-down',
   'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
   'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',
   'dashboard', 'database', 'desktop', 'docker', 'download', 'edit',
-  'external-link', 'eye', 'file-text', 'filter', 'flow', 'folder', 'globe',
+  'external-link', 'eye', 'file', 'file-text', 'filter', 'flask', 'flow',
+  'folder', 'git', 'globe',
   'globe-grid', 'gpu', 'grid-rows', 'grip', 'home', 'home-simple', 'host',
   'iface-lan', 'iface-loop', 'iface-tb', 'iface-virt', 'iface-vpn',
-  'iface-wifi', 'image', 'info', 'key', 'line-chart', 'list', 'lock', 'logout',
+  'iface-wifi', 'image', 'info', 'key', 'layers', 'line-chart', 'list', 'lock',
+  'logout',
   'management', 'max', 'meeting', 'message', 'mic', 'min', 'model', 'models',
   'network', 'network-svg', 'os', 'paperclip', 'pause', 'pi', 'pin', 'play',
   'plus', 'prompt', 'puzzle', 'question', 'rag-db', 'ram', 'record',
-  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'search', 'send',
+  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'save', 'search',
+  'send',
   'services', 'settings', 'share', 'shield', 'sparkle', 'speaker',
-  'speaker-alt', 'star', 'stop', 'transform', 'trash', 'trend', 'unlock',
+  'speaker-alt', 'star', 'stop', 'terminal', 'transform', 'trash', 'trend',
+  'unlock',
   'user', 'users', 'volume', 'workflow-app', 'x', 'zap',
 ]);
 

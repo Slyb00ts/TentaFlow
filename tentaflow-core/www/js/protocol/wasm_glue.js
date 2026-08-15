@@ -2386,6 +2386,1319 @@ export function encodeClusterUpdateRequest(cluster_id, name, description, strate
 }
 
 /**
+ * MessageBody::CodeStudioBody(ApprovalDecideRequest) — `always` on a
+ * mandatory-interactive capability is refused server-side, not hidden in the UI.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioApprovalDecideRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioApprovalDecideRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(ApprovalsListRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioApprovalsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioApprovalsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(CodeSearchRequest) — a semantic request may be
+ * answered by grep with `degraded=true`; grep stays authoritative.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioCodeSearchRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioCodeSearchRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(ExecCancelRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioExecCancelRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioExecCancelRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(ExecOutputRequest) — the transcript of a
+ * command, paged by `after_seq` over its lines.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioExecOutputRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioExecOutputRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(ExecStartRequest) — `argv` is always a vector; a
+ * shell is one explicit, quoted argument.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioExecStartRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioExecStartRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileCreateRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileCreateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileCreateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileDeleteRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileDeleteRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileGrepRequest) — `regex=false` keeps the query
+ * literal, so a search for `a.b` is not silently a pattern.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileGrepRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileGrepRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileMkdirRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileMkdirRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileMkdirRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileReadRequest) — whole file or a line range.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileReadRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileReadRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileRenameRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileRenameRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileRenameRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileTreeRequest) — worktree listing; `path` is
+ * relative, `depth` bounds the expansion.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileTreeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileTreeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(FileWriteRequest) — `expected_blob_sha` is the
+ * compare-and-swap token; omitting it means the file must not exist yet.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioFileWriteRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioFileWriteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitBranchesRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitBranchesRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitBranchesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitCommitRequest) — without `patch_set_id` the
+ * PEP opens a review instead of committing.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitCommitRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitCommitRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitDiffRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitDiffRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitDiffRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitLogRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitLogRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitLogRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitMergeAbandonRequest) — drops a held
+ * integration worktree and its private ref.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitMergeAbandonRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitMergeAbandonRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitMergeFinalizeRequest) — commits the accepted
+ * blobs and moves the target ref under compare-and-swap.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitMergeFinalizeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitMergeFinalizeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitMergeRequest) — starts the integration
+ * worktree; a conflict comes back as a result, not an error.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitMergeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitMergeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitPushRequest) — mandatory-interactive, so the
+ * answer may be an approval question rather than a push.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitPushRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitPushRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitStatusRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitStatusRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitStatusRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(GitSyncRequest) — `mode` is `fetch` or `pull`.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioGitSyncRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioGitSyncRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(IndexRebuildRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioIndexRebuildRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioIndexRebuildRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(IndexStatusRequest) — per-branch index state.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioIndexStatusRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioIndexStatusRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(IndexStreamRequest) — STREAM-INITIATING: end =
+ * IndexStreamEnd. The semantic index is phase 7, so today the stream closes
+ * with `index_unavailable` instead of reporting progress.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioIndexStreamRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioIndexStreamRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(OperationResolveRequest) — settles an `unknown`
+ * operation as completed or failed. There is no silent retry.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioOperationResolveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioOperationResolveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(PatchBlobGetRequest) — one CAS blob by digest,
+ * so a partially accepted file can be rebuilt whole instead of from hunk
+ * windows.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioPatchBlobGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioPatchBlobGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(PatchDecideRequest) — decisions per file and per
+ * hunk, including `request_revision` with a note.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioPatchDecideRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioPatchDecideRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(PatchSetAbandonRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioPatchSetAbandonRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioPatchSetAbandonRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(PatchSetGetRequest) — files with their hunks.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioPatchSetGetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioPatchSetGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(PatchSetsListRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioPatchSetsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioPatchSetsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(ProjectLinkListRequest) — projects linked to
+ * this workspace (§20).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioProjectLinkListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioProjectLinkListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(ProjectLinkSetRequest) — `linked` picks the
+ * direction; the answer is the whole ProjectLinkListResponse, not a delta.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioProjectLinkSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioProjectLinkSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(RepoTreeRequest) — structure of a PINNED commit
+ * of a linked workspace. Addressed by a commit id, never by a path on the
+ * owner node.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioRepoTreeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioRepoTreeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionAutonomySetRequest) — raising is clamped
+ * to the workspace ceiling by the server.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionAutonomySetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionAutonomySetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionCancelRequest) — without `run_id` the
+ * whole session, subagent runs included.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionCancelRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionCancelRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionCloseRequest) — usuwa worktree, zostawia
+ * galaz.
+ * @param {string} workspace_id
+ * @param {string} session_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionCloseRequest(workspace_id, session_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionCloseRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionGrantRevokeRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionGrantRevokeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionGrantRevokeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionGrantsListRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionGrantsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionGrantsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionMessageSendRequest) — a user turn to the
+ * session's root agent.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionMessageSendRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionMessageSendRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionOpenRequest) — galaz jest wyprowadzana
+ * serwerowo, nie podawana z UI.
+ * @param {string} workspace_id
+ * @param {string} title
+ * @param {string} autonomy_mode
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionOpenRequest(workspace_id, title, autonomy_mode) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(title, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(autonomy_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionOpenRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionOperationsRequest) — the effect journal;
+ * `status="unknown"` lists what needs a human decision.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionOperationsRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionOperationsRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionRunsRequest) — the revision chain with the
+ * trigger of every turn.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionRunsRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionRunsRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionStreamRequest) — STREAM-INITIATING (no
+ * plain response): chunks = SessionStreamEvent, end = SessionStreamEnd.
+ * `after_seq` is the resume cursor; 0 replays the session from its first event.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionStreamRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionStreamRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionTimelineRequest) — `after_seq` is the
+ * cursor; events are the source of truth, the status columns a projection.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionTimelineRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionTimelineRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionsListRequest) — sesje WOLAJACEGO w tym
+ * workspace; serwer filtruje po uzytkowniku, bez obejscia dla administratora.
+ * @param {string} workspace_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionsListRequest(workspace_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalCloseRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalCloseRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalCloseRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalInputRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalInputRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalInputRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalOpenRequest) — the VT machine lives on
+ * the owner node; the browser only sends keys and renders cells.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalOpenRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalOpenRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalResizeRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalResizeRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalResizeRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalSnapshotRequest) — full grid after a
+ * reload or reconnect; the live stream carries only changed rows.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalSnapshotRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalSnapshotRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalStreamRequest) — STREAM-INITIATING:
+ * chunks = TerminalStreamSnapshot / TerminalStreamDelta, end =
+ * TerminalStreamEnd. `after_revision` is the VT revision the client holds; any
+ * value other than the live one earns a full snapshot first.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalStreamRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalStreamRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(TerminalsListRequest) — shells already open in
+ * the session, so a browser reload rebuilds the dock instead of opening a
+ * second shell next to a running one.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioTerminalsListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioTerminalsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceAllowlistListRequest) — the `always`
+ * scope, workspace-wide.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceAllowlistListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceAllowlistListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceAllowlistRemoveRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceAllowlistRemoveRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceAllowlistRemoveRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceAllowlistSetRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceAllowlistSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceAllowlistSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceArchiveRequest).
+ * @param {string} workspace_id
+ * @param {boolean} archived
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceArchiveRequest(workspace_id, archived) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceArchiveRequest(ptr0, len0, archived);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceCreateRequest). `members_json` to
+ * tablica JSON obiektow `{user_id, role}` (jak `members_json` w Project
+ * Studio); `secret_material` jedzie RAZ i nigdy nie wraca.
+ * @param {string} name
+ * @param {string} node_id
+ * @param {string} exec_mode
+ * @param {string | null | undefined} container_image
+ * @param {string} repo_kind
+ * @param {string | null | undefined} repo_url
+ * @param {string | null | undefined} repo_auth_kind
+ * @param {string | null | undefined} secret_material
+ * @param {string | null | undefined} ssh_host_fingerprint
+ * @param {string | null | undefined} default_branch
+ * @param {string} autonomy_ceiling
+ * @param {string} egress_policy
+ * @param {boolean} index_enabled
+ * @param {string} members_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceCreateRequest(name, node_id, exec_mode, container_image, repo_kind, repo_url, repo_auth_kind, secret_material, ssh_host_fingerprint, default_branch, autonomy_ceiling, egress_policy, index_enabled, members_json) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(exec_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(container_image) ? 0 : passStringToWasm0(container_image, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(repo_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(repo_url) ? 0 : passStringToWasm0(repo_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    var ptr6 = isLikeNone(repo_auth_kind) ? 0 : passStringToWasm0(repo_auth_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    var ptr7 = isLikeNone(secret_material) ? 0 : passStringToWasm0(secret_material, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len7 = WASM_VECTOR_LEN;
+    var ptr8 = isLikeNone(ssh_host_fingerprint) ? 0 : passStringToWasm0(ssh_host_fingerprint, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len8 = WASM_VECTOR_LEN;
+    var ptr9 = isLikeNone(default_branch) ? 0 : passStringToWasm0(default_branch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len9 = WASM_VECTOR_LEN;
+    const ptr10 = passStringToWasm0(autonomy_ceiling, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len10 = WASM_VECTOR_LEN;
+    const ptr11 = passStringToWasm0(egress_policy, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len11 = WASM_VECTOR_LEN;
+    const ptr12 = passStringToWasm0(members_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len12 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8, ptr9, len9, ptr10, len10, ptr11, len11, index_enabled, ptr12, len12);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v14 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v14;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceCreatorGrantSetRequest) — prawo
+ * zakladania workspace'ow, nadawane per uzytkownik.
+ * @param {string} user_id
+ * @param {boolean} granted
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceCreatorGrantSetRequest(user_id, granted) {
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceCreatorGrantSetRequest(ptr0, len0, granted);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceDeleteRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceDeleteRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceGetRequest) — szczegoly + czlonkowie +
+ * kroki provisioningu.
+ * @param {string} workspace_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceGetRequest(workspace_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceMemberCandidatesRequest) — users the
+ * caller may still add. `workspace_id: null` is the creation wizard, which has
+ * no workspace whose members could be excluded yet.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceMemberCandidatesRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceMemberCandidatesRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceMemberRemoveRequest).
+ * @param {string} workspace_id
+ * @param {string} user_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceMemberRemoveRequest(workspace_id, user_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceMemberRemoveRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceMemberSetRequest) — dodanie albo zmiana
+ * roli czlonka.
+ * @param {string} workspace_id
+ * @param {string} user_id
+ * @param {string} role
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceMemberSetRequest(workspace_id, user_id, role) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceMemberSetRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceRetryRequest) — wznowienie
+ * provisioningu; kroki `done` sa pomijane, wiec to wznowienie, nie przebudowa.
+ * @param {string} workspace_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceRetryRequest(workspace_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceRetryRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceSecretSetRequest) — credential material
+ * travels once and never comes back.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceSecretSetRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceSecretSetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceSettingsUpdateRequest) — `exec_mode` is
+ * absent because the execution mode of an existing workspace is immutable.
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceSettingsUpdateRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceSettingsUpdateRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspacesListRequest) — lista workspace'ow.
+ * @param {boolean} include_archived
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspacesListRequest(include_archived) {
+    const ret = wasm.encodeCodeStudioWorkspacesListRequest(include_archived);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorktreesListRequest).
+ * @param {string} request_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorktreesListRequest(request_json) {
+    const ptr0 = passStringToWasm0(request_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorktreesListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * @param {string | null} [status]
  * @param {string | null} [user_id]
  * @param {string | null} [addon_id]

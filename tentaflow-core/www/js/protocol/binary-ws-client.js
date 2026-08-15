@@ -324,6 +324,12 @@ export class BinaryWsClient {
     ) {
       timeoutMs = args.pop().timeoutMs;
     }
+    // A kind the codec does not know is a caller bug, and it has to read like
+    // one: spreading into `encode[kind]` raised a bare "apply was called on
+    // undefined", which named neither the request nor the layer that failed.
+    if (typeof encode[kind] !== 'function') {
+      return Promise.reject(new Error(`unknown request kind '${kind}': the codec has no encoder for it`));
+    }
     const correlationId = this.nextCorrelationId();
     const sequence = this.takeSequence();
     const frame = encode[kind](correlationId, ...args, sequence);

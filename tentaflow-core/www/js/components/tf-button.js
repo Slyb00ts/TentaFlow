@@ -53,15 +53,39 @@ class TfButton extends HTMLElement {
   constructor() {
     super();
     this._btn = null;
+    this._observer = null;
+    this._onLightMutation = this._onLightMutation.bind(this);
   }
 
   connectedCallback() {
     if (!this._btn) this._build();
     this._update();
+    // A caller that sets textContent/innerHTML on the host AFTER the upgrade
+    // throws away the <button> this component built, leaving unstyled bare
+    // text. Rebuild from whatever the caller left in the light DOM.
+    if (!this._observer && typeof MutationObserver !== 'undefined') {
+      this._observer = new MutationObserver(this._onLightMutation);
+      this._observer.observe(this, { childList: true });
+    }
+  }
+
+  disconnectedCallback() {
+    if (this._observer) {
+      this._observer.disconnect();
+      this._observer = null;
+    }
   }
 
   attributeChangedCallback() {
     if (this._btn) this._update();
+  }
+
+  // The rebuild re-appends the button, which mutates children again; that pass
+  // sees an intact button and returns, so there is no loop.
+  _onLightMutation() {
+    if (!this._btn || this.contains(this._btn)) return;
+    this._build();
+    this._update();
   }
 
   _build() {
