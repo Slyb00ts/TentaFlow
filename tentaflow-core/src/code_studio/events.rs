@@ -794,6 +794,45 @@ pub fn read_after(
     Ok(events)
 }
 
+/// The reason each finished run recorded, keyed by run id.
+///
+/// `session_runs` has no column for it, and adding one would give a projection
+/// its own copy of a fact the timeline already owns (§13.3). The run list reads
+/// it back from here instead, because a run that ends `failed` with the reason
+/// only in the database is a run nobody can diagnose without a SQL client.
+///
+/// The last `run_finished` of a run wins: a run reconciled after a restart
+/// settles a second time, and that later verdict is the current one.
+pub fn run_failure_reasons(
+    pool: &DbPool,
+    session_id: &str,
+) -> Result<BTreeMap<String, String>> {
+    let conn = pool.read().map_err(|e| anyhow!("workspace db read: {e}"))?;
+    let mut stmt = conn.prepare(
+        "SELECT payload_cbor FROM session_events \
+         WHERE session_id = ?1 AND kind = ?2 ORDER BY seq",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![session_id, EventKind::RunFinished.slug()],
+        |row| row.get::<_, Vec<u8>>(0),
+    )?;
+    let mut reasons = BTreeMap::new();
+    for row in rows {
+        let EventPayload::RunFinished { run_id, error, .. } = from_cbor(&row?)? else {
+            continue;
+        };
+        match error.filter(|text| !text.trim().is_empty()) {
+            Some(text) => {
+                reasons.insert(run_id, text);
+            }
+            None => {
+                reasons.remove(&run_id);
+            }
+        }
+    }
+    Ok(reasons)
+}
+
 /// One projection column corrected against the timeline.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProjectionCorrection {

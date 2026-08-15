@@ -546,10 +546,28 @@ pub fn put_agent_credential(
     provider_base_url: &str,
     created_by: &str,
 ) -> Result<String> {
-    if provider_base_url.trim().is_empty() {
+    let provider_base_url = provider_base_url.trim();
+    if provider_base_url.is_empty() {
         return Err(VaultError::Invalid(
             "a provider credential needs the upstream base url the adapter forwards to".into(),
         ));
+    }
+    // The adapter parses this URL when it binds. Checking it at the write means
+    // a typo is a rejected form rather than a delegation that dies after the
+    // run row, the ticket and the CLI instance have already been created.
+    match url::Url::parse(provider_base_url.trim_end_matches('/')) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => {}
+        Ok(url) => {
+            return Err(VaultError::Invalid(format!(
+                "provider_base_url must be http(s), got '{}'",
+                url.scheme()
+            )))
+        }
+        Err(error) => {
+            return Err(VaultError::Invalid(format!(
+                "provider_base_url is not a URL: {error}"
+            )))
+        }
     }
     let stored = encrypt_material(
         cipher,
@@ -641,6 +659,85 @@ pub fn get_agent_credential(
             material,
         },
     })
+}
+
+/// Everything a provider credential row says EXCEPT the material.
+///
+/// This is what an administrator screen is allowed to see: which engine, which
+/// upstream, which key (by digest) and when it was last used. There is no field
+/// here the material could be put in, which is what makes the "listing never
+/// returns a secret" rule a property of the type instead of a habit.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AgentCredentialRecord {
+    pub node_id: String,
+    pub engine_id: String,
+    pub provider_base_url: String,
+    pub fingerprint: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub rotated_at: Option<String>,
+    pub last_used_at: Option<String>,
+}
+
+const AGENT_CREDENTIAL_COLUMNS: &str = "node_id, engine_id, provider_base_url, fingerprint, \
+     created_by, created_at, rotated_at, last_used_at";
+
+fn agent_credential_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentCredentialRecord> {
+    Ok(AgentCredentialRecord {
+        node_id: row.get(0)?,
+        engine_id: row.get(1)?,
+        provider_base_url: row.get(2)?,
+        fingerprint: row.get(3)?,
+        created_by: row.get(4)?,
+        created_at: row.get(5)?,
+        rotated_at: row.get(6)?,
+        last_used_at: row.get(7)?,
+    })
+}
+
+/// Metadata of every provider credential one node holds for one organization.
+///
+/// Scoped by node because that is what the row means: material sealed with a
+/// node's `SettingsCipher` key exists for that node only, and listing another
+/// node's rows here would show credentials this Core could not open anyway.
+pub fn list_agent_credentials(
+    db: &DbPool,
+    org_id: &str,
+    node_id: &str,
+) -> Result<Vec<AgentCredentialRecord>> {
+    let conn = db.read().map_err(db_err)?;
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT {AGENT_CREDENTIAL_COLUMNS} FROM code_agent_credentials \
+             WHERE org_id = ?1 AND node_id = ?2 ORDER BY engine_id"
+        ))
+        .map_err(db_err)?;
+    let rows = stmt
+        .query_map(params![org_id, node_id], agent_credential_record)
+        .map_err(db_err)?;
+    rows.collect::<rusqlite::Result<Vec<_>>>().map_err(db_err)
+}
+
+/// The same metadata for one engine, or `None` when the node holds no key for
+/// it. Distinct from `get_agent_credential`, which decrypts: a screen that only
+/// needs to say "a key is stored" must never touch the material to find out.
+pub fn get_agent_credential_record(
+    db: &DbPool,
+    org_id: &str,
+    node_id: &str,
+    engine_id: &str,
+) -> Result<Option<AgentCredentialRecord>> {
+    let conn = db.read().map_err(db_err)?;
+    conn.query_row(
+        &format!(
+            "SELECT {AGENT_CREDENTIAL_COLUMNS} FROM code_agent_credentials \
+             WHERE org_id = ?1 AND node_id = ?2 AND engine_id = ?3"
+        ),
+        params![org_id, node_id, engine_id],
+        agent_credential_record,
+    )
+    .optional()
+    .map_err(db_err)
 }
 
 /// Removes the provider credential of one engine on this node.

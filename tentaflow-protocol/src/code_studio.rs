@@ -419,7 +419,12 @@ pub struct RunInfo {
     pub parent_run_id: Option<String>,
     pub agent_id: Option<String>,
     pub status: String,
-    /// Human-readable reason attached to the trigger, e.g. a review note.
+    /// Why this run is in the state it is: a review note for a run a person
+    /// triggered, and for a run that ended badly the failure reason the
+    /// timeline recorded. `session_runs` has no column for either, so the
+    /// server reads it back out of the `run_finished` event — without it a
+    /// failed run reads as a bare 'failed' and the reason is only in the
+    /// database.
     pub note: Option<String>,
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
@@ -571,6 +576,28 @@ pub struct RepoEntryInfo {
     pub path: String,
     pub mode: String,
     pub blob_oid: String,
+}
+
+/// Provider credential of one CLI engine on one node (§5.2, §7.5).
+///
+/// The material is deliberately absent and there is no field it could travel
+/// in: the row is node-local key material, and the only two consumers are the
+/// git broker and the provider adapter, both inside the owner node's process.
+/// `fingerprint` is a digest that identifies WHICH key is stored without being
+/// able to reconstruct it — the same thing `WorkspaceSecretSetResponse` shows.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AgentCredentialInfo {
+    /// Node whose vault holds the material. A credential is meaningless on any
+    /// other node, so the UI has to show which one it belongs to.
+    pub node_id: String,
+    pub engine_id: String,
+    /// Upstream the adapter forwards to once it has injected the material.
+    pub provider_base_url: String,
+    pub fingerprint: Option<String>,
+    pub created_by: String,
+    pub created_at: String,
+    pub rotated_at: Option<String>,
+    pub last_used_at: Option<String>,
 }
 
 /// Code Studio message family (request + response). ciborium encodes variants
@@ -1548,6 +1575,48 @@ pub enum CodeStudioPayload {
         next_seq: u64,
         has_more: bool,
     },
+
+    // ---- Provider credentials of the CLI engines (§5.2, §7.5) ----
+    /// Lists what the vault of ONE node holds. `node_id` empty means this node;
+    /// naming another node forwards the call there, because the answer is a
+    /// fact about that node's vault and nothing else can know it.
+    AgentCredentialsListRequest {
+        #[serde(default)]
+        node_id: String,
+    },
+    AgentCredentialsListResponse {
+        node_id: String,
+        credentials: Vec<AgentCredentialInfo>,
+        /// Engines this build can put behind the adapter at all. The picker is
+        /// built from it so the browser never keeps its own copy of the list.
+        engines: Vec<String>,
+    },
+    /// Stores or ROTATES the provider credential of one engine. There is no
+    /// separate rotate variant: the row is keyed by (org, node, engine), so a
+    /// second write replaces the material in place instead of leaving two.
+    AgentCredentialSetRequest {
+        #[serde(default)]
+        node_id: String,
+        engine_id: String,
+        /// Upstream the adapter forwards to. Stored with the material because
+        /// it is part of the same decision: which provider this key pays for.
+        provider_base_url: String,
+        /// The one direction material travels. Nothing sends it back.
+        credential_material: String,
+    },
+    AgentCredentialSetResponse {
+        credential: AgentCredentialInfo,
+    },
+    AgentCredentialDeleteRequest {
+        #[serde(default)]
+        node_id: String,
+        engine_id: String,
+    },
+    AgentCredentialDeleteResponse {
+        node_id: String,
+        engine_id: String,
+        removed: bool,
+    },
 }
 
 #[cfg(test)]
@@ -1654,14 +1723,14 @@ mod tests {
         let names = payload_variant_names(SOURCE);
         assert_eq!(
             names.len(),
-            133,
+            139,
             "CodeStudioPayload variant COUNT changed. Appending is fine — update the count and \
              the digest below in the same commit. Live variants:\n{}",
             names.join("\n")
         );
         assert_eq!(
             name_digest(&names),
-            0x1c00_7ee4_a875_e017,
+            0xd7e5_98a8_a391_abdd,
             "CodeStudioPayload variant NAMES or their order changed. ciborium tags variants by \
              name, so a rename silently breaks every deployed browser while the round-trip tests \
              stay green. Rename back, or update this digest deliberately. Live variants:\n{}",
@@ -1678,13 +1747,13 @@ mod tests {
         let names: Vec<String> = structs.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(
             names.len(),
-            33,
+            34,
             "wire struct COUNT changed. Live structs:\n{}",
             names.join("\n")
         );
         assert_eq!(
             name_digest(&names),
-            0xcd0f_8d7e_b127_3c54,
+            0x384d_f58e_8d99_17f6,
             "wire struct NAMES changed. Live structs:\n{}",
             names.join("\n")
         );
@@ -1724,6 +1793,7 @@ mod tests {
             ("WorkspaceUserCandidate", 3, 0xbb5e_ffdd_77e7_5762),
             ("ProjectLinkInfo", 4, 0x7dfc_6d1e_8418_2ee2),
             ("RepoEntryInfo", 3, 0x77ff_8301_d276_7ceb),
+            ("AgentCredentialInfo", 8, 0xf976_17f0_e9d7_0293),
         ];
         assert_eq!(pinned.len(), structs.len());
         for (name, count, digest) in pinned {
@@ -2645,12 +2715,57 @@ mod tests {
                 behind: 0,
                 error: None,
             },
+            CodeStudioPayload::AgentCredentialSetResponse {
+                credential: sample_agent_credential(),
+            },
+            CodeStudioPayload::AgentCredentialsListResponse {
+                node_id: "n1".into(),
+                credentials: vec![sample_agent_credential()],
+                engines: vec!["claude-code".into(), "codex".into()],
+            },
         ];
         for response in responses {
             let json = serde_json::to_string(&response).expect("json");
             assert!(!json.contains("secret_material"), "{json}");
             assert!(!json.contains("secret_ref"), "{json}");
+            assert!(!json.contains("credential_material"), "{json}");
         }
+    }
+
+    fn sample_agent_credential() -> AgentCredentialInfo {
+        AgentCredentialInfo {
+            node_id: "n1".into(),
+            engine_id: "claude-code".into(),
+            provider_base_url: "https://api.anthropic.com".into(),
+            fingerprint: Some("sha256:abc".into()),
+            created_by: "u-admin".into(),
+            created_at: "2026-08-14T10:00:00Z".into(),
+            rotated_at: None,
+            last_used_at: None,
+        }
+    }
+
+    /// The provider credential travels in exactly one direction. The request
+    /// names the material; the row that comes back names a digest, an upstream
+    /// and who wrote it — and a struct with nowhere to put a key is a stronger
+    /// guarantee than a handler that remembers not to fill one in.
+    #[test]
+    fn a_provider_credential_only_travels_towards_the_vault() {
+        let request = CodeStudioPayload::AgentCredentialSetRequest {
+            node_id: "n1".into(),
+            engine_id: "claude-code".into(),
+            provider_base_url: "https://api.anthropic.com".into(),
+            credential_material: "sk-ant-secret".into(),
+        };
+        let bytes = crate::cbor::encode(&request).expect("encode");
+        assert_eq!(
+            crate::cbor::decode::<CodeStudioPayload>(&bytes).expect("decode"),
+            request
+        );
+
+        let json = serde_json::to_string(&sample_agent_credential()).expect("json");
+        assert!(!json.contains("sk-ant-secret"), "{json}");
+        assert!(!json.contains("material"), "{json}");
     }
 
     /// A worktree row must not carry its on-disk location: that is a host path

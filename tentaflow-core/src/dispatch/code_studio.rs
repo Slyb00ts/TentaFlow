@@ -18,8 +18,9 @@ use std::time::Duration;
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::code_studio::{
-    AllowlistEntryInfo, ApprovalInfo, CodeStudioPayload, DiffHunkInfo, FileEntryInfo,
-    GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo, GrepHitInfo, OperationInfo,
+    AgentCredentialInfo, AllowlistEntryInfo, ApprovalInfo, CodeStudioPayload, DiffHunkInfo,
+    FileEntryInfo, GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo, GrepHitInfo,
+    OperationInfo,
     CodeSearchHit, IndexStateInfo, PatchFileDecision, PatchFileInfo, PatchHunkInfo, PatchSetInfo,
     ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo, RunInfo, SessionInfo, TerminalCellRow,
     TimelineEventInfo, WorkspaceInfo, WorkspaceMemberInfo, WorkspaceMemberInput,
@@ -867,6 +868,18 @@ fn route_target(payload: &CodeStudioPayload) -> Option<(&str, &str)> {
     }
 }
 
+/// The node a provider-credential call is about, for the calls that name one
+/// instead of a workspace.
+fn credential_node(payload: &CodeStudioPayload) -> Option<&str> {
+    use CodeStudioPayload as P;
+    match payload {
+        P::AgentCredentialsListRequest { node_id }
+        | P::AgentCredentialSetRequest { node_id, .. }
+        | P::AgentCredentialDeleteRequest { node_id, .. } => Some(node_id.as_str()),
+        _ => None,
+    }
+}
+
 /// Forwards a call whose workspace lives on another node, or `None` when this
 /// node owns it.
 ///
@@ -908,6 +921,21 @@ async fn route_to_owner(
         // this one's, because without it the node id off the wire would reach
         // the mesh on behalf of someone holding no Code Studio permission.
         require_read(ctx)?;
+        return remote_proxy::proxy_to_node(ctx, node_id, payload)
+            .await
+            .map(Some);
+    }
+    // A provider credential names a NODE for the same reason: the material is
+    // sealed with that node's `SettingsCipher` key (§5.2), so both the write
+    // and the listing are facts about one vault and nowhere else. The gate here
+    // is the handler's own — administering the organization's provider account
+    // is not something a read permission may forward on somebody's behalf.
+    if let Some(node_id) = credential_node(payload) {
+        let node_id = node_id.trim();
+        if node_id.is_empty() || node_id == &*ctx.state.local_node_id {
+            return Ok(None);
+        }
+        require_admin(ctx)?;
         return remote_proxy::proxy_to_node(ctx, node_id, payload)
             .await
             .map(Some);
@@ -1404,6 +1432,22 @@ pub async fn code_studio_dispatch(
             path_prefix,
             limit,
         } => repo_tree_v1(ctx, workspace_id, project_id, commit, path_prefix, *limit),
+        P::AgentCredentialsListRequest { node_id } => agent_credentials_list_v1(ctx, node_id),
+        P::AgentCredentialSetRequest {
+            node_id,
+            engine_id,
+            provider_base_url,
+            credential_material,
+        } => agent_credential_set_v1(
+            ctx,
+            node_id,
+            engine_id,
+            provider_base_url,
+            credential_material,
+        ),
+        P::AgentCredentialDeleteRequest { node_id, engine_id } => {
+            agent_credential_delete_v1(ctx, node_id, engine_id)
+        }
 
         // The `*Stream*` family is answered by `stream_handlers.rs` through a
         // subscription, not here: a request/response dispatcher has nowhere to
@@ -1474,7 +1518,10 @@ pub async fn code_studio_dispatch(
         | P::WorkspaceMemberCandidatesResponse { .. }
         | P::IndexStreamProgress { .. }
         | P::ProjectLinkListResponse { .. }
-        | P::RepoTreeResponse { .. } => Err(ProtocolError::bad_request(
+        | P::RepoTreeResponse { .. }
+        | P::AgentCredentialsListResponse { .. }
+        | P::AgentCredentialSetResponse { .. }
+        | P::AgentCredentialDeleteResponse { .. } => Err(ProtocolError::bad_request(
             "variant is not a supported code studio request",
         )),
     }
@@ -2291,6 +2338,195 @@ fn set_repo_auth(
             .filter(|f| !f.is_empty()),
     )
     .map_err(|e| db_error("set_repo_auth", e))
+}
+
+// =============================================================================
+// Provider credentials of the CLI engines (§5.2, §7.5)
+// =============================================================================
+
+/// Engines that can be put behind the provider adapter at all. `EngineWiring`
+/// is the authority — an engine with no wiring has no credential header, no
+/// base-url variable and no way to reach a provider, so storing a key for it
+/// would be storing a secret nothing can ever use.
+const CREDENTIAL_ENGINES: &[&str] = &["claude-code", "codex"];
+
+/// The node a credential call acts on: the one named, or this one.
+///
+/// A call that reaches a handler has already passed `route_to_owner`, so a
+/// foreign node id here means the mesh could not carry it. Answering it locally
+/// would write the material into THIS node's vault under someone else's node
+/// id, where nothing would ever read it — so it is refused instead.
+fn credential_node_id<'a>(
+    ctx: &'a HandlerContext,
+    node_id: &'a str,
+) -> Result<&'a str, ProtocolError> {
+    let node_id = node_id.trim();
+    if node_id.is_empty() || node_id == &*ctx.state.local_node_id {
+        return Ok(&ctx.state.local_node_id);
+    }
+    Err(ProtocolError::new(
+        ProtocolErrorCode::NotAvailable,
+        format!(
+            "the provider credential of node '{node_id}' is sealed with that node's key and can \
+             only be written there"
+        ),
+    ))
+}
+
+fn require_known_engine(engine_id: &str) -> Result<&str, ProtocolError> {
+    let engine_id = engine_id.trim();
+    if !CREDENTIAL_ENGINES.contains(&engine_id) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown CLI engine '{engine_id}'; this build reaches a provider through the adapter \
+             for {}",
+            CREDENTIAL_ENGINES.join(", ")
+        )));
+    }
+    Ok(engine_id)
+}
+
+fn credential_to_wire(record: vault::AgentCredentialRecord) -> AgentCredentialInfo {
+    AgentCredentialInfo {
+        node_id: record.node_id,
+        engine_id: record.engine_id,
+        provider_base_url: record.provider_base_url,
+        fingerprint: record.fingerprint,
+        created_by: record.created_by,
+        created_at: record.created_at,
+        rotated_at: record.rotated_at,
+        last_used_at: record.last_used_at,
+    }
+}
+
+/// Administering the organization's provider account is `code_studio.admin`.
+///
+/// It is not a workspace act: the row is keyed by (org, node, engine) and every
+/// workspace of the organization on that node delegates through it, so there is
+/// no owner to ask. `Access::Member(Owner)` — the gate on a workspace secret —
+/// has nothing to bind to here, and the closest existing org-level operation,
+/// `workspace_creator_grant_set_v1`, is on `require_admin` for the same reason.
+fn agent_credentials_list_v1(
+    ctx: &HandlerContext,
+    node_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let node_id = credential_node_id(ctx, node_id)?.to_string();
+    let credentials = vault::list_agent_credentials(&ctx.state.db, &org.org_id, &node_id)
+        .map_err(|e| vault_error("list_agent_credentials", e))?
+        .into_iter()
+        .map(credential_to_wire)
+        .collect();
+    Ok(cs(CodeStudioPayload::AgentCredentialsListResponse {
+        node_id,
+        credentials,
+        engines: CREDENTIAL_ENGINES.iter().map(|e| e.to_string()).collect(),
+    }))
+}
+
+/// Stores or rotates the provider credential of one engine.
+///
+/// Rotation is the same call: the row is keyed by (org, node, engine), so a
+/// second write replaces the material and stamps `rotated_at` rather than
+/// leaving a second key behind. Unlike a workspace secret there is no window in
+/// which the previous key must stay readable — the adapter reads the row at
+/// every start, and a run holding an adapter already has the old material in
+/// memory for as long as it lives.
+fn agent_credential_set_v1(
+    ctx: &HandlerContext,
+    node_id: &str,
+    engine_id: &str,
+    provider_base_url: &str,
+    credential_material: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let node_id = credential_node_id(ctx, node_id)?.to_string();
+    let engine_id = require_known_engine(engine_id)?;
+    let material = credential_material.trim();
+    if material.is_empty() {
+        return Err(ProtocolError::bad_request(
+            "a provider credential without material would leave the adapter unauthenticated",
+        ));
+    }
+    let existed = vault::get_agent_credential_record(
+        &ctx.state.db,
+        &org.org_id,
+        &node_id,
+        engine_id,
+    )
+    .map_err(|e| vault_error("get_agent_credential_record", e))?
+    .is_some();
+    let fingerprint = vault::put_agent_credential(
+        &ctx.state.db,
+        &ctx.state.settings_cipher,
+        &org.org_id,
+        &node_id,
+        engine_id,
+        material,
+        provider_base_url,
+        &org.user_id,
+    )
+    .map_err(|e| vault_error("put_agent_credential", e))?;
+    let record = vault::get_agent_credential_record(
+        &ctx.state.db,
+        &org.org_id,
+        &node_id,
+        engine_id,
+    )
+    .map_err(|e| vault_error("get_agent_credential_record", e))?
+    .ok_or_else(|| ProtocolError::internal("the stored credential could not be read back"))?;
+    // The digest identifies WHICH key was stored without being able to
+    // reconstruct it — the same thing the workspace-secret event records, and
+    // the only way an auditor can tell a rotation from a rewrite of the same
+    // key. The material itself appears in no field of this event.
+    audit(
+        ctx,
+        "code_studio.agent_credential_set",
+        &format!("{node_id}/{engine_id}"),
+        &serde_json::json!({
+            "node_id": node_id,
+            "engine_id": engine_id,
+            "provider_base_url": record.provider_base_url,
+            "fingerprint": fingerprint,
+            "rotated": existed,
+        }),
+    );
+    Ok(cs(CodeStudioPayload::AgentCredentialSetResponse {
+        credential: credential_to_wire(record),
+    }))
+}
+
+fn agent_credential_delete_v1(
+    ctx: &HandlerContext,
+    node_id: &str,
+    engine_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_admin(ctx)?;
+    let node_id = credential_node_id(ctx, node_id)?.to_string();
+    // Deliberately NOT `require_known_engine`: a build that drops an engine
+    // from `CREDENTIAL_ENGINES` must not strand its key material in the vault
+    // with no way to remove it. Storing a key needs the engine to exist,
+    // destroying one does not.
+    let engine_id = engine_id.trim();
+    if engine_id.is_empty() {
+        return Err(ProtocolError::bad_request("engine_id is required"));
+    }
+    let removed = vault::delete_agent_credential(&ctx.state.db, &org.org_id, &node_id, engine_id)
+        .map_err(|e| vault_error("delete_agent_credential", e))?;
+    audit(
+        ctx,
+        "code_studio.agent_credential_delete",
+        &format!("{node_id}/{engine_id}"),
+        &serde_json::json!({
+            "node_id": node_id,
+            "engine_id": engine_id,
+            "removed": removed > 0,
+        }),
+    );
+    Ok(cs(CodeStudioPayload::AgentCredentialDeleteResponse {
+        node_id,
+        engine_id: engine_id.to_string(),
+        removed: removed > 0,
+    }))
 }
 
 // =============================================================================
@@ -6530,6 +6766,12 @@ fn session_runs_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Viewer)?;
+    // Why a run ended the way it did lives in the timeline, not in the row
+    // (§13.3). Without it the console shows a bare 'failed' and the reason —
+    // 'credential_missing', an exhausted budget, a refused approval — is only
+    // reachable with a SQL client.
+    let reasons = events::run_failure_reasons(&scope.pool, &scope.session.id)
+        .map_err(|e| db_error("run_failure_reasons", e))?;
     let conn = scope
         .pool
         .read()
@@ -6543,17 +6785,16 @@ fn session_runs_v1(
         .map_err(|e| db_error("runs_list", anyhow::anyhow!("{e}")))?;
     let rows = stmt
         .query_map(rusqlite::params![scope.session.id], |row| {
+            let run_id: String = row.get(0)?;
             Ok(RunInfo {
-                run_id: row.get(0)?,
+                note: reasons.get(&run_id).cloned(),
+                run_id,
                 ordinal: row.get::<_, i64>(1)?.max(0) as u32,
                 kind: row.get(2)?,
                 trigger: row.get(3)?,
                 parent_run_id: row.get(4)?,
                 agent_id: row.get(5)?,
                 status: row.get(6)?,
-                // `session_runs` stores no note column, so the reason attached
-                // to a trigger lives in the timeline event instead (§15 gap).
-                note: None,
                 started_at: row.get(7)?,
                 finished_at: row.get(8)?,
                 // §17.3 — copied onto the row when the run settles: the flow
@@ -8110,6 +8351,18 @@ register_code_studio_variant!(
     "CodeStudioRepoTreeRequest",
     "tentaflow_ws_handler_cs_repo_tree"
 );
+register_code_studio_variant!(
+    "CodeStudioAgentCredentialsListRequest",
+    "tentaflow_ws_handler_cs_agent_credentials_list"
+);
+register_code_studio_variant!(
+    "CodeStudioAgentCredentialSetRequest",
+    "tentaflow_ws_handler_cs_agent_credential_set"
+);
+register_code_studio_variant!(
+    "CodeStudioAgentCredentialDeleteRequest",
+    "tentaflow_ws_handler_cs_agent_credential_delete"
+);
 
 #[cfg(test)]
 mod tests {
@@ -8693,6 +8946,21 @@ mod tests {
                 path_prefix: String::new(),
                 limit: 10,
             },
+            // Empty node id means "this node", so the sweep exercises the
+            // handler instead of a mesh forward no test has.
+            P::AgentCredentialsListRequest {
+                node_id: String::new(),
+            },
+            P::AgentCredentialSetRequest {
+                node_id: String::new(),
+                engine_id: "claude-code".into(),
+                provider_base_url: "https://api.anthropic.com".into(),
+                credential_material: "sk-ant-intruder".into(),
+            },
+            P::AgentCredentialDeleteRequest {
+                node_id: String::new(),
+                engine_id: "claude-code".into(),
+            },
         ]
     }
 
@@ -8777,6 +9045,9 @@ mod tests {
                 payload,
                 CodeStudioPayload::WorkspaceCreateRequest { .. }
                     | CodeStudioPayload::WorkspaceCreatorGrantSetRequest { .. }
+                    | CodeStudioPayload::AgentCredentialsListRequest { .. }
+                    | CodeStudioPayload::AgentCredentialSetRequest { .. }
+                    | CodeStudioPayload::AgentCredentialDeleteRequest { .. }
             );
             let error = code_studio_dispatch(&cs(payload), &fx.ctx)
                 .await
@@ -9109,6 +9380,228 @@ mod tests {
             fingerprint.as_deref(),
             Some(vault::fingerprint_of(SecretKind::GitToken, TOKEN).as_str())
         );
+        release();
+    }
+
+    // =========================================================================
+    // Provider credentials (§5.2, §7.5)
+    // =========================================================================
+
+    const PROVIDER_KEY: &str = "sk-ant-api03-organizationsecretvalue";
+    const PROVIDER_URL: &str = "https://api.anthropic.com";
+
+    /// Discards what the adapter reports. The delegation block journals these
+    /// onto the session timeline; a credential test has no timeline and needs
+    /// none.
+    struct DroppingSink;
+
+    impl crate::code_studio::cli_adapter::AdapterEventSink for DroppingSink {
+        fn record(&self, _event: EventPayload) {}
+    }
+
+    /// Records the organization's Phase 0B decision so the gate stops being the
+    /// first thing that refuses. Without it `start_adapter` never reaches the
+    /// vault at all, and the test would prove nothing about the credential.
+    fn record_go_no_go(ctx: &HandlerContext, engine_id: &str) {
+        use crate::code_studio::cli_adapter::{
+            BASE_URL_OVERRIDE_VERIFIED_PREFIX, GO_NO_GO_NOTE_PREFIX,
+        };
+        crate::db::repository::set_setting(
+            &ctx.state.db,
+            &format!("{BASE_URL_OVERRIDE_VERIFIED_PREFIX}{engine_id}"),
+            "true",
+        )
+        .expect("verified flag");
+        crate::db::repository::set_setting(
+            &ctx.state.db,
+            &format!("{GO_NO_GO_NOTE_PREFIX}{engine_id}"),
+            "verified against the pinned CLI in a test",
+        )
+        .expect("go/no-go note");
+    }
+
+    async fn start_adapter_for_test(
+        ctx: &HandlerContext,
+        dir: &std::path::Path,
+        engine_id: &str,
+    ) -> anyhow::Result<crate::code_studio::cli_adapter::AdapterHandle> {
+        crate::code_studio::cli_adapter::start_adapter(
+            &ctx.state.db,
+            &ctx.state.settings_cipher,
+            crate::code_studio::cli_adapter::AdapterConfig {
+                bind_addr: ([127, 0, 0, 1], 0).into(),
+                engine_id: engine_id.to_string(),
+                org_id: "org-1".to_string(),
+                node_id: ctx.state.local_node_id.to_string(),
+                ca_path: dir.join("ca.pem"),
+                cli_home_dir: dir.join("cli-home"),
+                egress_enforcement: EgressEnforcement::Unrestricted,
+                dns_names: vec!["localhost".to_string()],
+                tickets: Arc::new(crate::code_studio::cli_adapter::TicketRegistry::new()),
+                sink: Arc::new(DroppingSink),
+            },
+        )
+        .await
+    }
+
+    /// The defect this closes: `code_agent_credentials` had exactly one writer
+    /// and it lived behind `#[cfg(test)]`, so `delegate_cli` could not succeed
+    /// on any installation. The proof is the whole path — the protocol handler
+    /// writes, and the component that actually consumes the row reads.
+    #[tokio::test]
+    async fn a_stored_provider_credential_is_what_the_adapter_reads() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-admin", &[PERM_READ, PERM_ADMIN]);
+        record_go_no_go(&fx.ctx, "claude-code");
+        let dir = tempfile::tempdir().expect("adapter dir");
+
+        let Err(refusal) = start_adapter_for_test(&fx.ctx, dir.path(), "claude-code").await else {
+            panic!("an adapter must not start without a credential");
+        };
+        assert!(
+            format!("{refusal:#}").contains("credential_missing"),
+            "{refusal:#}"
+        );
+
+        agent_credential_set_v1(
+            &fx.ctx,
+            "",
+            "claude-code",
+            PROVIDER_URL,
+            PROVIDER_KEY,
+        )
+        .expect("store the provider credential");
+
+        let handle = start_adapter_for_test(&fx.ctx, dir.path(), "claude-code")
+            .await
+            .expect("the adapter starts once the node holds the credential");
+        handle.shutdown();
+        release();
+    }
+
+    /// The material travels one way. Every answer the credential handlers can
+    /// produce, plus the audit event they write, is searched for the raw bytes.
+    #[tokio::test]
+    async fn no_provider_credential_response_or_audit_entry_carries_the_material() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-admin", &[PERM_READ, PERM_ADMIN]);
+
+        let responses = vec![
+            agent_credential_set_v1(&fx.ctx, "", "claude-code", PROVIDER_URL, PROVIDER_KEY)
+                .expect("store"),
+            agent_credentials_list_v1(&fx.ctx, "").expect("list"),
+            agent_credential_delete_v1(&fx.ctx, "", "claude-code").expect("delete"),
+        ];
+        for response in &responses {
+            let json = serde_json::to_string(response).expect("json");
+            assert!(!json.contains(PROVIDER_KEY), "{json}");
+            assert!(!json.contains("credential_material"), "{json}");
+        }
+
+        for (action, details) in audit_actions(&fx.ctx, "test-node/claude-code") {
+            assert!(!details.contains(PROVIDER_KEY), "{action}: {details}");
+        }
+        let actions: Vec<String> = audit_actions(&fx.ctx, "test-node/claude-code")
+            .into_iter()
+            .map(|(action, _)| action)
+            .collect();
+        assert!(actions.contains(&"code_studio.agent_credential_set".to_string()));
+        assert!(actions.contains(&"code_studio.agent_credential_delete".to_string()));
+
+        // The listing reports the digest, which identifies the key without
+        // being able to reconstruct it.
+        agent_credential_set_v1(&fx.ctx, "", "claude-code", PROVIDER_URL, PROVIDER_KEY)
+            .expect("store again");
+        let MessageBody::CodeStudioBody(CodeStudioPayload::AgentCredentialsListResponse {
+            credentials,
+            ..
+        }) = agent_credentials_list_v1(&fx.ctx, "").expect("list")
+        else {
+            panic!("unexpected response");
+        };
+        assert_eq!(
+            credentials[0].fingerprint.as_deref(),
+            Some(vault::fingerprint_of(SecretKind::GitToken, PROVIDER_KEY).as_str())
+        );
+        release();
+    }
+
+    /// Rotation replaces the material in place. A second row would mean the
+    /// adapter picking one of two keys, and the operator having no way to
+    /// retire the first.
+    #[tokio::test]
+    async fn rotating_a_provider_credential_replaces_it_instead_of_adding_one() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-admin", &[PERM_READ, PERM_ADMIN]);
+
+        agent_credential_set_v1(&fx.ctx, "", "claude-code", PROVIDER_URL, "sk-ant-first")
+            .expect("store");
+        agent_credential_set_v1(&fx.ctx, "", "claude-code", PROVIDER_URL, "sk-ant-second")
+            .expect("rotate");
+
+        let MessageBody::CodeStudioBody(CodeStudioPayload::AgentCredentialsListResponse {
+            credentials,
+            ..
+        }) = agent_credentials_list_v1(&fx.ctx, "").expect("list")
+        else {
+            panic!("unexpected response");
+        };
+        assert_eq!(credentials.len(), 1, "rotation left a second row");
+        assert!(credentials[0].rotated_at.is_some(), "rotation was not stamped");
+        assert_eq!(
+            credentials[0].fingerprint.as_deref(),
+            Some(vault::fingerprint_of(SecretKind::GitToken, "sk-ant-second").as_str())
+        );
+
+        // And the material the adapter would inject is the new one.
+        let credential = vault::get_agent_credential(
+            &fx.ctx.state.db,
+            &fx.ctx.state.settings_cipher,
+            "org-1",
+            "test-node",
+            "claude-code",
+        )
+        .expect("read back");
+        assert_eq!(credential.material.expose(), "sk-ant-second");
+        release();
+    }
+
+    /// A credential belongs to ONE node: the material is sealed with that
+    /// node's key (§5.2). Neither the listing nor the vault may present one
+    /// node's key as another's, and a write aimed at a node this Core is not
+    /// must be refused rather than stored where nothing can open it.
+    #[tokio::test]
+    async fn a_provider_credential_belongs_to_exactly_one_node() {
+        let _guard = paths::test_data_dir_guard();
+        let fx = fixture("u-admin", &[PERM_READ, PERM_ADMIN]);
+        agent_credential_set_v1(&fx.ctx, "", "claude-code", PROVIDER_URL, PROVIDER_KEY)
+            .expect("store on this node");
+
+        let error = agent_credential_set_v1(
+            &fx.ctx,
+            "some-other-node",
+            "claude-code",
+            PROVIDER_URL,
+            PROVIDER_KEY,
+        )
+        .expect_err("a foreign node's vault is not writable from here");
+        assert_eq!(error.code, ProtocolErrorCode::NotAvailable);
+
+        assert!(
+            vault::list_agent_credentials(&fx.ctx.state.db, "org-1", "some-other-node")
+                .expect("list")
+                .is_empty(),
+            "this node's credential showed up as another node's"
+        );
+        let missing = vault::get_agent_credential(
+            &fx.ctx.state.db,
+            &fx.ctx.state.settings_cipher,
+            "org-1",
+            "some-other-node",
+            "claude-code",
+        )
+        .expect_err("another node must not resolve this node's credential");
+        assert!(matches!(missing, VaultError::CredentialMissing { .. }));
         release();
     }
 
@@ -10916,6 +11409,65 @@ mod tests {
         .await
         .expect_err("mixed decision");
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
+        release();
+    }
+
+    /// A failed run has to say WHY in the answer the console reads. The reason
+    /// is written to the timeline and to nowhere else, so a run list that does
+    /// not read it back leaves the operator with a bare 'failed' and a database
+    /// query as the only diagnosis.
+    #[tokio::test]
+    async fn a_failed_run_carries_its_reason_into_the_run_list() {
+        let _guard = paths::test_data_dir_guard();
+        let Some(live) = live("ws-run-reason", AutonomyMode::Normal, AutonomyMode::Normal) else {
+            return;
+        };
+        let scope = live.scope();
+        {
+            let conn = scope.pool.write().expect("pool");
+            conn.execute(
+                "INSERT INTO session_runs \
+                   (run_id, session_id, ordinal, kind, trigger, status, started_at, finished_at) \
+                 VALUES ('r-cli', ?1, 1, 'cli', 'cli_delegate', 'failed', datetime('now'), \
+                         datetime('now'))",
+                rusqlite::params![scope.session.id],
+            )
+            .expect("seed run");
+        }
+        events::append(
+            &scope.pool,
+            &scope.session.id,
+            events::SessionEvent::new(
+                "cli-run-finished:r-cli".to_string(),
+                EventPayload::RunFinished {
+                    run_id: "r-cli".to_string(),
+                    status: "failed".to_string(),
+                    error: Some(
+                        "credential_missing: no credential for engine 'claude-code'".to_string(),
+                    ),
+                },
+            )
+            .with_run("r-cli".to_string()),
+        )
+        .expect("journal the end of the run");
+
+        let MessageBody::CodeStudioBody(CodeStudioPayload::SessionRunsResponse { runs, .. }) =
+            session_runs_v1(&live.fx.ctx, &live.workspace_id, &live.session_id).expect("runs")
+        else {
+            panic!("unexpected response");
+        };
+        let run = runs
+            .iter()
+            .find(|run| run.run_id == "r-cli")
+            .expect("the seeded run");
+        assert_eq!(run.status, "failed");
+        assert!(
+            run.note
+                .as_deref()
+                .is_some_and(|note| note.contains("credential_missing")),
+            "the run list dropped the reason: {:?}",
+            run.note
+        );
         release();
     }
 

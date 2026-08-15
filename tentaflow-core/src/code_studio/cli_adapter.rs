@@ -273,6 +273,73 @@ impl Usage {
     }
 }
 
+/// How the model an operator configured relates to what the CLI actually puts
+/// in the request body.
+///
+/// The two vocabularies are NOT the same, and treating them as one is why a
+/// ticket configured `model = "sonnet"` refused every request the CLI made:
+/// Claude Code takes `sonnet` on `--model`, resolves it against the account's
+/// entitlements and sends `claude-sonnet-4-5-<snapshot>` on the wire. The
+/// catalog `services::coding_agent` offers is the ALIAS list, so the alias is
+/// what an operator picks and the dated id is what has to be authorized.
+///
+/// `Ok(None)` — the configured string is a wire id already, matched verbatim.
+/// `Ok(Some(family))` — it is a vendor alias for one model family; the ticket
+/// binds that family, and every other family is still refused.
+/// `Err(reason)` — it is an alias that resolves to MORE THAN ONE model, which
+/// no single-model ticket can express.
+pub fn ticket_model_binding(
+    engine_id: &str,
+    model: &str,
+) -> std::result::Result<Option<String>, String> {
+    let model = model.trim().to_ascii_lowercase();
+    if engine_id != "claude-code" {
+        // `codex` puts the configured id on the wire unchanged, and no other
+        // engine has adapter wiring at all.
+        return Ok(None);
+    }
+    match model.as_str() {
+        "opus" | "sonnet" | "haiku" => Ok(Some(model)),
+        // Phase 0B: this alias is Claude Code's "plan with Opus, execute with
+        // Sonnet" mode, so one turn addresses two models. A ticket binds one
+        // (§7.5), so the honest answer is a refusal at configuration time
+        // rather than a delegation that dies on the first request.
+        "opusplan" => Err(
+            "'opusplan' makes the CLI address two models in one turn (Opus while planning, \
+             Sonnet while executing) and a ticket binds exactly one model. Configure 'opus' or \
+             'sonnet'"
+                .to_string(),
+        ),
+        _ => Ok(None),
+    }
+}
+
+/// Whether a wire model id belongs to a Claude model family.
+///
+/// The vendor spells its ids `claude-<family>-<version…>-<snapshot>`, and older
+/// releases `claude-<version…>-<family>-<snapshot>`: exactly one family token
+/// among otherwise numeric components. Requiring every other component to be
+/// numeric is what keeps the match narrow — `sonnet` cannot reach
+/// `claude-opus-4-5-…`, and a spelling this rule does not recognize is refused
+/// loudly with `model_not_allowed` instead of being waved through.
+fn claude_id_is_family(model_lower: &str, family: &str) -> bool {
+    let Some(rest) = model_lower.strip_prefix("claude-") else {
+        return false;
+    };
+    let mut seen = false;
+    for segment in rest.split('-') {
+        if segment == family {
+            if seen {
+                return false;
+            }
+            seen = true;
+        } else if segment.is_empty() || !segment.bytes().all(|b| b.is_ascii_digit()) {
+            return false;
+        }
+    }
+    seen
+}
+
 /// Everything a ticket is bound to. A request that does not match every field
 /// is refused; there is no partial match and no default that widens the scope.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -282,11 +349,15 @@ pub struct TicketClaims {
     pub run_id: String,
     pub cli_instance_id: String,
     pub engine_id: String,
-    /// The single model this run may call. Aliases exist because a CLI resolves
-    /// `sonnet` to a dated id before it sends the request; they are supplied by
-    /// the caller from the engine catalog, never guessed here.
+    /// The single model this run may call, as the operator configured it.
     pub model: String,
+    /// Other spellings of the SAME model, supplied by the caller from our own
+    /// catalog convention (`<engine>/<id>` and the bare id).
     pub model_aliases: BTreeSet<String>,
+    /// Vendor family the configured model is an alias for, resolved once by
+    /// `ticket_model_binding`. `None` means the configured string is the wire
+    /// id and only exact spellings are accepted.
+    pub model_family: Option<String>,
     pub methods: BTreeSet<String>,
     /// Allowed path prefixes. A prefix is matched after normalization, so `..`
     /// cannot walk out of one.
@@ -557,7 +628,12 @@ impl TicketRegistry {
                     .claims
                     .model_aliases
                     .iter()
-                    .any(|alias| alias.to_ascii_lowercase() == model_lower);
+                    .any(|alias| alias.to_ascii_lowercase() == model_lower)
+                || state
+                    .claims
+                    .model_family
+                    .as_deref()
+                    .is_some_and(|family| claude_id_is_family(&model_lower, family));
             if !allowed {
                 return Err(TicketRejection::ModelNotAllowed(model.to_string()));
             }
@@ -713,6 +789,13 @@ pub fn issue_ticket(
             reason: "a ticket without a model would authorize any model".to_string(),
         });
     }
+    // Resolved HERE rather than passed in: the mapping from an operator's model
+    // name to what the CLI puts on the wire is vendor knowledge, and a caller
+    // that forgot to supply it would mint a ticket that refuses every request.
+    let model_family = match ticket_model_binding(&request.engine_id, &request.model) {
+        Ok(family) => family,
+        Err(reason) => return Ok(TicketDecision::Denied { reason }),
+    };
     if request.methods.is_empty() || request.path_prefixes.is_empty() {
         return Ok(TicketDecision::Denied {
             reason:
@@ -729,6 +812,7 @@ pub fn issue_ticket(
         engine_id: request.engine_id,
         model: request.model,
         model_aliases: request.model_aliases,
+        model_family,
         methods: request
             .methods
             .iter()
@@ -1921,6 +2005,112 @@ mod tests {
             issue_ticket(&registry, &ctx(), no_paths).expect("decide"),
             TicketDecision::Denied { .. }
         ));
+    }
+
+    /// The catalog offers `sonnet`; the CLI sends `claude-sonnet-4-5-<date>`.
+    /// A ticket that only compared the two vocabularies literally refused every
+    /// request an operator could ever have configured — so the alias binds the
+    /// FAMILY, and nothing wider.
+    #[test]
+    fn a_ticket_for_a_vendor_alias_accepts_the_dated_id_the_cli_really_sends() {
+        let registry = TicketRegistry::new();
+        // The request budget of `request()` is deliberately tiny, and this test
+        // spends a request per spelling; a budget refusal here would look like
+        // a model refusal and prove nothing.
+        let mut roomy = request();
+        roomy.budget.max_requests = 100;
+        let ticket = issued(&registry, roomy);
+        let presented = Some(ticket.presentation.as_str());
+
+        for wire_id in [
+            "claude-sonnet-4-5-20250929",
+            "claude-sonnet-4-5",
+            "claude-3-5-sonnet-20241022",
+            "CLAUDE-SONNET-4-5-20250929",
+        ] {
+            assert!(
+                registry
+                    .authorize(presented, &facts("POST", "/v1/messages", Some(wire_id)))
+                    .is_ok(),
+                "'{wire_id}' is the same model the ticket was minted for"
+            );
+        }
+
+        // Another family, a neighbouring vendor's id and a spelling that only
+        // contains the family token stay refused: the ticket still binds ONE
+        // model, it merely knows how that model is spelled on the wire.
+        for foreign in [
+            "claude-opus-4-5-20251101",
+            "claude-haiku-4-5-20251001",
+            "claude-sonnet-4-5-preview",
+            "sonnet-of-someone-else",
+            "gpt-5-codex",
+        ] {
+            assert_eq!(
+                registry
+                    .authorize(presented, &facts("POST", "/v1/messages", Some(foreign)))
+                    .unwrap_err()
+                    .slug(),
+                "model_not_allowed",
+                "'{foreign}' is not the model this ticket paid for"
+            );
+        }
+    }
+
+    /// A configured DATED id keeps exact matching: an operator who pinned one
+    /// snapshot did not ask for the family.
+    #[test]
+    fn a_ticket_for_a_dated_id_does_not_widen_to_its_family() {
+        let registry = TicketRegistry::new();
+        let mut pinned = request();
+        pinned.model = "claude-sonnet-4-5-20250929".into();
+        pinned.model_aliases.clear();
+        pinned.budget.max_requests = 100;
+        let ticket = issued(&registry, pinned);
+        let presented = Some(ticket.presentation.as_str());
+
+        assert!(registry
+            .authorize(
+                presented,
+                &facts("POST", "/v1/messages", Some("claude-sonnet-4-5-20250929"))
+            )
+            .is_ok());
+        assert_eq!(
+            registry
+                .authorize(
+                    presented,
+                    &facts("POST", "/v1/messages", Some("claude-sonnet-4-5-20260101"))
+                )
+                .unwrap_err()
+                .slug(),
+            "model_not_allowed"
+        );
+    }
+
+    /// `opusplan` addresses two models in one turn, so no single-model ticket
+    /// can express it. Refusing it at issuance is the honest answer; minting a
+    /// ticket that refuses every request is not.
+    #[test]
+    fn an_alias_that_resolves_to_two_models_cannot_bind_a_ticket() {
+        assert_eq!(ticket_model_binding("claude-code", "sonnet"), Ok(Some("sonnet".into())));
+        assert_eq!(ticket_model_binding("claude-code", "SONNET"), Ok(Some("sonnet".into())));
+        assert_eq!(
+            ticket_model_binding("claude-code", "claude-sonnet-4-5-20250929"),
+            Ok(None)
+        );
+        assert_eq!(ticket_model_binding("codex", "gpt-5-codex"), Ok(None));
+        assert!(ticket_model_binding("claude-code", "opusplan").is_err());
+
+        let registry = TicketRegistry::new();
+        let mut composite = request();
+        composite.model = "opusplan".into();
+        composite.model_aliases.clear();
+        let TicketDecision::Denied { reason } =
+            issue_ticket(&registry, &ctx(), composite).expect("decide")
+        else {
+            panic!("a two-model alias must not mint a ticket");
+        };
+        assert!(reason.contains("two models"), "{reason}");
     }
 
     #[test]

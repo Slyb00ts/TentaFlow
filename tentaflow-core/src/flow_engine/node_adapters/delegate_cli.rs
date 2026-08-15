@@ -156,6 +156,12 @@ impl DelegationConfig {
                     node.id
                 )
             })?;
+        // The same resolution `issue_ticket` performs, run at configuration
+        // time so an unbindable model is a validation error on save instead of
+        // a delegation that dies after the run row and the CLI instance exist.
+        cli_adapter::ticket_model_binding(engine, model).map_err(|reason| {
+            anyhow!("delegate_cli node '{}': {reason}", node.id)
+        })?;
         Ok(Self {
             engine: engine.to_string(),
             service_id,
@@ -188,10 +194,12 @@ impl DelegationConfig {
         }
     }
 
-    /// Spellings of the configured model a ticket accepts. Both come from OUR
-    /// catalog convention (`<engine>/<id>`), so this is not a guess about how a
-    /// vendor aliases its own names: a CLI that sends anything else is refused
-    /// by the adapter with `model_not_allowed`, loudly.
+    /// Spellings of the configured model a ticket accepts. All of them come
+    /// from OUR catalog convention (`<engine>/<id>` and the bare id), so this
+    /// is deliberately not a guess about how a vendor aliases its own names —
+    /// that half is `cli_adapter::ticket_model_binding`, which resolves an
+    /// alias like `sonnet` to the dated ids the CLI really sends. Anything
+    /// outside both is refused with `model_not_allowed`, loudly.
     fn model_aliases(&self) -> BTreeSet<String> {
         let mut aliases = BTreeSet::new();
         aliases.insert(self.model.clone());
