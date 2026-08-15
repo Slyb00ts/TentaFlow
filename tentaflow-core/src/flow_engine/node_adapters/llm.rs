@@ -195,6 +195,10 @@ impl LlmNodeAdapter {
         ctx: &ExecutionContext,
     ) -> Result<LlmRequest> {
         let model = Self::pick_model(node, envelope)?;
+        // Named here rather than at the call sites: this is the one point where
+        // both the node override and the envelope fallback have been applied,
+        // and it is shared by the blocking and the streaming path.
+        ctx.usage_sink.record_model(&model);
         let messages = Self::build_messages(node, envelope);
         let (tools, tool_choice) = Self::pick_tools(envelope);
         Ok(LlmRequest {

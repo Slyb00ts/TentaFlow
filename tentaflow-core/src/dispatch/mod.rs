@@ -2877,6 +2877,181 @@ mod tests {
         }
     }
 
+    /// Fetches an agent detail row as the JSON object the wire carries.
+    async fn agent_detail_value(agent_id: &str, ctx: &HandlerContext) -> serde_json::Value {
+        use tentaflow_protocol::{AgentsDetailRequest, AgentsPayload};
+        let detail = MessageBody::AgentsBody(AgentsPayload::DetailRequest(AgentsDetailRequest {
+            agent_id: agent_id.to_string(),
+        }));
+        let (resp, is_err) = dispatch(&detail, ctx).await;
+        assert!(!is_err, "detail failed: {:?}", resp);
+        match resp {
+            MessageBody::AgentsBody(AgentsPayload::DetailResponse(r)) => {
+                serde_json::from_str(&r.agent_json).expect("detail json")
+            }
+            other => panic!("expected DetailResponse, got {:?}", other),
+        }
+    }
+
+    /// Sends a detail row back verbatim through the upsert handler.
+    async fn agent_upsert_value(agent: &serde_json::Value, ctx: &HandlerContext) {
+        use tentaflow_protocol::{AgentsPayload, AgentsUpsertRequest};
+        let upsert = MessageBody::AgentsBody(AgentsPayload::UpsertRequest(AgentsUpsertRequest {
+            agent_json: serde_json::to_string(agent).unwrap(),
+        }));
+        let (resp, is_err) = dispatch(&upsert, ctx).await;
+        assert!(!is_err, "upsert failed: {:?}", resp);
+    }
+
+    /// The tool allowlist is the security boundary between roster agents, so
+    /// "fetch the detail row, change one field, send it back" must not touch it.
+    /// Before `AgentDetail` this test failed on the first assert: detail emitted
+    /// `tools_json`, upsert read `tools`, and the unknown field was dropped —
+    /// every allowlist silently collapsed to `[]`.
+    #[tokio::test]
+    async fn agents_detail_round_trips_through_upsert_without_losing_the_allowlist() {
+        use tentaflow_protocol::{AgentsPayload, AgentsUpsertRequest};
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+
+        let create = MessageBody::AgentsBody(AgentsPayload::UpsertRequest(AgentsUpsertRequest {
+            agent_json: serde_json::json!({
+                "name": "round-tripper",
+                "description": "Keeps its tools",
+                "system_prompt": "stay in your lane",
+                "model": "first-model",
+                "tools": ["core.fs_read", "core.fs_grep", "memory.memory_store"],
+                "skills": { "names": ["planning"], "tags": ["code"] },
+                "params": { "temperature": 0.25 },
+                "max_iterations": 33,
+                "timeout_secs": 1234,
+                "max_subagents": 2,
+                "max_spawn_depth": 2,
+                "on_child_complete": "continue",
+                "routable": false,
+                "is_enabled": true,
+            })
+            .to_string(),
+        }));
+        let (resp, is_err) = dispatch(&create, &admin).await;
+        assert!(!is_err, "create failed: {:?}", resp);
+        let agent_id = match resp {
+            MessageBody::AgentsBody(AgentsPayload::UpsertResponse(r)) => r.agent_id,
+            other => panic!("expected UpsertResponse, got {:?}", other),
+        };
+
+        let mut detail = agent_detail_value(&agent_id, &admin).await;
+        // The read shape must not leak the storage column names: a field the
+        // write side does not know is exactly how the allowlist got erased.
+        assert!(
+            detail.get("tools_json").is_none(),
+            "detail must expose `tools`, not the `tools_json` column: {detail}"
+        );
+        assert_eq!(
+            detail["tools"],
+            serde_json::json!(["core.fs_read", "core.fs_grep", "memory.memory_store"])
+        );
+
+        // The only edit an "edit one field" client makes.
+        detail["model"] = serde_json::json!("second-model");
+        agent_upsert_value(&detail, &admin).await;
+
+        let after = agent_detail_value(&agent_id, &admin).await;
+        assert_eq!(after["model"], "second-model");
+        assert_eq!(
+            after["tools"],
+            serde_json::json!(["core.fs_read", "core.fs_grep", "memory.memory_store"]),
+            "the allowlist must survive a verbatim round trip"
+        );
+        assert_eq!(after["skills"], detail["skills"]);
+        assert_eq!(after["params"], serde_json::json!({ "temperature": 0.25 }));
+        assert_eq!(after["system_prompt"], "stay in your lane");
+        assert_eq!(after["max_iterations"], 33);
+        assert_eq!(after["timeout_secs"], 1234);
+        assert_eq!(after["max_subagents"], 2);
+        assert_eq!(after["max_spawn_depth"], 2);
+        assert_eq!(after["on_child_complete"], "continue");
+        assert_eq!(after["routable"], false);
+        assert_eq!(after["id"], agent_id);
+    }
+
+    /// §15 separation of duties survives the same round trip: after re-sending
+    /// every roster agent's detail row, the seeded allowlists are byte-identical
+    /// and the reviewer/committer still cannot write.
+    #[tokio::test]
+    async fn code_studio_roster_survives_a_detail_upsert_round_trip() {
+        use crate::agents::tool_in_allowlist;
+        let state = state::AppState::for_test();
+        let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
+
+        const ROSTER: [&str; 7] = [
+            "code-orchestrator",
+            "code-planner",
+            "code-implementer",
+            "code-searcher",
+            "code-reviewer",
+            "code-tester",
+            "code-committer",
+        ];
+
+        let seeded: Vec<(String, String)> = ROSTER
+            .iter()
+            .map(|name| {
+                let agent = crate::db::repository::get_agent_by_name(&state.db, name)
+                    .expect("query")
+                    .unwrap_or_else(|| panic!("agent '{name}' not seeded"));
+                (agent.id, agent.tools_json)
+            })
+            .collect();
+        assert_eq!(
+            serde_json::from_str::<Vec<String>>(&seeded[0].1)
+                .unwrap()
+                .len(),
+            26,
+            "the orchestrator carries the full Code Studio surface"
+        );
+
+        for (agent_id, _) in &seeded {
+            let mut detail = agent_detail_value(agent_id, &admin).await;
+            detail["model"] = serde_json::json!("roster-model");
+            agent_upsert_value(&detail, &admin).await;
+        }
+
+        for (name, (agent_id, seeded_tools)) in ROSTER.iter().zip(&seeded) {
+            let agent = crate::db::repository::get_agent(&state.db, agent_id)
+                .expect("query")
+                .expect("agent still there");
+            assert_eq!(agent.model.as_deref(), Some("roster-model"));
+            assert_eq!(
+                serde_json::from_str::<Vec<String>>(&agent.tools_json).unwrap(),
+                serde_json::from_str::<Vec<String>>(seeded_tools).unwrap(),
+                "{name} lost its seeded allowlist"
+            );
+            assert!(
+                tool_in_allowlist(&agent.tools_json, "core.fs_read"),
+                "{name} must still be able to read"
+            );
+        }
+
+        let tools = |name: &str| -> String {
+            crate::db::repository::get_agent_by_name(&state.db, name)
+                .unwrap()
+                .unwrap()
+                .tools_json
+        };
+        assert!(!tool_in_allowlist(&tools("code-committer"), "core.fs_write"));
+        assert!(tool_in_allowlist(
+            &tools("code-committer"),
+            "core.git_commit"
+        ));
+        assert!(!tool_in_allowlist(&tools("code-reviewer"), "core.fs_write"));
+        assert!(!tool_in_allowlist(
+            &tools("code-implementer"),
+            "core.git_push"
+        ));
+        assert!(!tool_in_allowlist(&tools("code-tester"), "core.git_push"));
+    }
+
     #[tokio::test]
     async fn agents_upsert_denied_for_non_admin() {
         use tentaflow_protocol::{AgentsPayload, AgentsUpsertRequest};

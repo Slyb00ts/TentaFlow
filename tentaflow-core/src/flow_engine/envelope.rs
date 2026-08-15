@@ -398,6 +398,10 @@ pub struct FlowExecutionOutcome {
     pub final_envelope: FlowEnvelope,
     pub trace: Vec<TraceStep>,
     pub usage: TokenUsage,
+    /// Model the last LLM call of this run resolved to. `None` for a flow that
+    /// called no model. Tokens without the model that spent them cannot be
+    /// settled, so the two travel together.
+    pub model: Option<String>,
     /// Per-message metryki wydajnosci z ostatniego LLM chunku (TTFT, prefill/
     /// decode tok/s). `None` gdy backend ich nie zaraportowal.
     pub perf: Option<GenPerf>,

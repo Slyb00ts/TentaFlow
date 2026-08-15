@@ -8194,8 +8194,8 @@ const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, mo
 pub const AGENT_ON_CHILD_COMPLETE_VALUES: &[&str] = &["notify", "continue"];
 
 const AGENT_RUN_COLS: &str = "id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, \
-     status, prompt, result, exit_reason, iterations, total_tokens, run_log, last_heartbeat_at, \
-     started_at, finished_at, created_at";
+     status, prompt, result, exit_reason, iterations, total_tokens, prompt_tokens, \
+     completion_tokens, model, run_log, last_heartbeat_at, started_at, finished_at, created_at";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
     Ok(DbAgent {
@@ -8235,11 +8235,14 @@ fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgentRun> {
         exit_reason: row.get(9)?,
         iterations: row.get(10)?,
         total_tokens: row.get(11)?,
-        run_log: row.get(12)?,
-        last_heartbeat_at: row.get(13)?,
-        started_at: row.get(14)?,
-        finished_at: row.get(15)?,
-        created_at: row.get(16)?,
+        prompt_tokens: row.get(12)?,
+        completion_tokens: row.get(13)?,
+        model: row.get(14)?,
+        run_log: row.get(15)?,
+        last_heartbeat_at: row.get(16)?,
+        started_at: row.get(17)?,
+        finished_at: row.get(18)?,
+        created_at: row.get(19)?,
     })
 }
 
@@ -8522,8 +8525,11 @@ pub fn update_agent_run_status(
          exit_reason = COALESCE(?4, exit_reason), \
          iterations = COALESCE(?5, iterations), \
          total_tokens = COALESCE(?6, total_tokens), \
-         started_at = CASE WHEN ?7 AND started_at IS NULL THEN datetime('now') ELSE started_at END, \
-         finished_at = CASE WHEN ?8 THEN datetime('now') ELSE finished_at END, \
+         prompt_tokens = COALESCE(?7, prompt_tokens), \
+         completion_tokens = COALESCE(?8, completion_tokens), \
+         model = COALESCE(?9, model), \
+         started_at = CASE WHEN ?10 AND started_at IS NULL THEN datetime('now') ELSE started_at END, \
+         finished_at = CASE WHEN ?11 THEN datetime('now') ELSE finished_at END, \
          last_heartbeat_at = datetime('now') \
          WHERE id = ?1",
         rusqlite::params![
@@ -8533,6 +8539,9 @@ pub fn update_agent_run_status(
             update.exit_reason,
             update.iterations,
             update.total_tokens,
+            update.prompt_tokens,
+            update.completion_tokens,
+            update.model,
             update.set_started as i64,
             update.set_finished as i64,
         ],

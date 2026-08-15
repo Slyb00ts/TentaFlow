@@ -96,6 +96,14 @@ pub enum BridgeEvent {
         method: String,
         params: Value,
     },
+    /// One object from a vendor's newline-delimited JSON stream — Claude Code
+    /// run as `--print --output-format=stream-json`. It is NOT JSON-RPC: there
+    /// is no method to read, the objects are self-describing through `type`,
+    /// and the turn ends with a `result` object.
+    StreamObject {
+        seq: u64,
+        object: Value,
+    },
     Approval {
         seq: u64,
         request: ApprovalRequest,
@@ -115,6 +123,7 @@ impl BridgeEvent {
         match self {
             BridgeEvent::Text { seq, .. }
             | BridgeEvent::Notification { seq, .. }
+            | BridgeEvent::StreamObject { seq, .. }
             | BridgeEvent::Approval { seq, .. }
             | BridgeEvent::VendorSession { seq, .. }
             | BridgeEvent::Other { seq, .. } => *seq,
@@ -133,41 +142,138 @@ pub enum TurnState {
 ///
 /// The ONE place a vendor's event vocabulary is interpreted as a terminal
 /// state, for the same reason `capability_for` is the one place an approval
-/// kind becomes a capability.
+/// kind becomes a capability. Each vendor announces the end in its own shape,
+/// and both were read off Phase 0B transcripts of the pinned binaries:
 ///
-/// The method must name the TURN and end in a terminal word. Matching the tail
-/// alone would read `item/completed` — emitted per message inside a turn — as
-/// the end of the whole delegation, and the CLI would be closed while it was
-/// still working. That is the one failure this predicate must not have: an
-/// unrecognized completion merely costs the caller its timeout, whereas a
-/// premature one reports a finished turn that never finished.
+///   * `codex 0.147.0` ends EVERY turn with `turn/completed` and puts the
+///     outcome in `params.turn.status` (`completed` | `failed` | `interrupted`).
+///     Reading the method name alone reported a turn that wrote nothing as a
+///     success — the defect this function exists to not have.
+///   * `claude 2.1.233` run as `--print --output-format=stream-json` ends the
+///     turn with a `{"type":"result"}` object, where `subtype`/`is_error` carry
+///     the outcome.
 ///
-/// UNVERIFIED against a pinned CLI: §17.1 point 1 (a non-interactive mode with
-/// a structured event stream) is a Phase 0B item nobody has performed in this
-/// build, and `ensure_engine_verified` keeps the whole path shut until somebody
-/// checks against the real binary.
+/// The safe direction is asymmetric: an unrecognized ending merely costs the
+/// caller its timeout, whereas inventing one reports a finished turn that never
+/// finished. So anything that is terminal but not explicitly a success is
+/// `Failed` with the vendor's own words.
 pub fn turn_state(event: &BridgeEvent) -> Option<TurnState> {
-    let BridgeEvent::Notification { method, params, .. } = event else {
-        return None;
-    };
+    match event {
+        BridgeEvent::Notification { method, params, .. } => codex_turn_state(method, params),
+        BridgeEvent::StreamObject { object, .. } => claude_turn_state(object),
+        _ => None,
+    }
+}
+
+/// The Codex app-server's JSON-RPC notification.
+///
+/// The method must name the TURN and end in a terminal word — matching the tail
+/// alone would read `item/completed`, emitted per message inside a turn, as the
+/// end of the whole delegation. Once the method says "this turn is over", the
+/// STATUS says how it ended.
+fn codex_turn_state(method: &str, params: &Value) -> Option<TurnState> {
     let lowered = method.to_ascii_lowercase();
     let mut segments = lowered.split(['/', '.', '_', '-']).filter(|s| !s.is_empty());
     if !segments.clone().any(|segment| segment == "turn") {
         return None;
     }
     let tail = segments.next_back()?;
-    match tail {
-        "completed" | "complete" | "finished" | "done" | "end" => Some(TurnState::Completed),
-        "failed" | "error" | "aborted" | "cancelled" | "canceled" | "interrupted" => {
-            let detail = params
-                .get("message")
-                .or_else(|| params.get("error"))
-                .and_then(Value::as_str)
-                .unwrap_or(method);
-            Some(TurnState::Failed(detail.to_string()))
-        }
-        _ => None,
+    if !matches!(
+        tail,
+        "completed"
+            | "complete"
+            | "finished"
+            | "done"
+            | "end"
+            | "failed"
+            | "error"
+            | "aborted"
+            | "cancelled"
+            | "canceled"
+            | "interrupted"
+    ) {
+        return None;
     }
+    let status = params
+        .pointer("/turn/status")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty());
+    match status {
+        Some(status) if status.eq_ignore_ascii_case("completed") => Some(TurnState::Completed),
+        // Every other status the vendor may ship — `failed`, `interrupted`, or
+        // one added in a later release — ends the turn WITHOUT a success, and
+        // is reported as such rather than being mapped onto the nearest word we
+        // happen to know.
+        Some(status) => Some(TurnState::Failed(format!(
+            "the vendor ended the turn with status '{status}'{}",
+            codex_turn_error(params)
+                .map(|detail| format!(": {detail}"))
+                .unwrap_or_default()
+        ))),
+        // A build that announces the end without a status is taken at its word.
+        None => match tail {
+            "completed" | "complete" | "finished" | "done" | "end" => Some(TurnState::Completed),
+            _ => Some(TurnState::Failed(
+                codex_turn_error(params).unwrap_or_else(|| method.to_string()),
+            )),
+        },
+    }
+}
+
+/// The error a failed turn carries, in either shape the app-server uses: a
+/// string, or an object with a `message`.
+fn codex_turn_error(params: &Value) -> Option<String> {
+    let error = params
+        .pointer("/turn/error")
+        .or_else(|| params.get("error"))
+        .or_else(|| params.get("message"))?;
+    match error {
+        Value::String(text) if !text.trim().is_empty() => Some(text.clone()),
+        Value::Object(_) => error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .or_else(|| Some(error.to_string())),
+        Value::Null => None,
+        other => Some(other.to_string()),
+    }
+}
+
+/// Claude Code's `stream-json` output. The turn ends with a `result` object;
+/// everything before it (`system`, `assistant`, `user`) belongs to the turn that
+/// is still running.
+fn claude_turn_state(object: &Value) -> Option<TurnState> {
+    if object.get("type").and_then(Value::as_str) != Some("result") {
+        return None;
+    }
+    let subtype = object
+        .get("subtype")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let is_error = object
+        .get("is_error")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if subtype == "success" && !is_error {
+        return Some(TurnState::Completed);
+    }
+    // `result` carries the vendor's message on a failure; on a limit or an
+    // execution error it is the only description of what went wrong.
+    let detail = object
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty());
+    let named = if subtype.is_empty() {
+        "the vendor ended the turn with an error".to_string()
+    } else {
+        format!("the vendor ended the turn with '{subtype}'")
+    };
+    Some(TurnState::Failed(match detail {
+        Some(detail) => format!("{named}: {detail}"),
+        None => named,
+    }))
 }
 
 /// A server→client approval request, as it arrives from the bridge.
@@ -236,6 +342,7 @@ impl CliBridge {
                     "resume_vendor_session_id": request.resume_vendor_session_id,
                     "fork": false,
                     "env": env,
+                    "args": request.args,
                 }),
             )
             .await?;
@@ -307,7 +414,12 @@ impl CliBridge {
             let kind = entry.get("kind").and_then(Value::as_str).unwrap_or("");
             let data = entry.get("data").cloned().unwrap_or(Value::Null);
             events.push(match kind {
-                // A Claude Code session is a PTY, so its only channel is text.
+                // Claude Code runs as `--print --output-format=stream-json`, so
+                // its channel is a stream of self-describing JSON objects. It
+                // keeps its shape here for the same reason a Codex notification
+                // does: the turn's end is in it.
+                "claude" => BridgeEvent::StreamObject { seq, object: data },
+                // The PTY channel, which is what the login flow uses.
                 "terminal" => BridgeEvent::Text {
                     seq,
                     text: data
@@ -429,6 +541,10 @@ pub struct OpenCliInstance<'a> {
     /// Adapter wiring for the CLI process: base URL, the ticket as its API key,
     /// the session CA. Never the organization's credential.
     pub env: &'a [(String, String)],
+    /// Arguments the CLI has to be started with for an engine whose provider is
+    /// configuration rather than an environment variable (codex). Same rule as
+    /// `env`: built by `AdapterHandle::cli_args` and passed through verbatim.
+    pub args: &'a [String],
 }
 
 // =============================================================================
@@ -1075,6 +1191,142 @@ mod tests {
             }),
             None
         );
+    }
+
+    /// Phase 0B transcript, `codex 0.147.0`: a turn that produced nothing ends
+    /// with the SAME method as one that succeeded, and the outcome is in
+    /// `params.turn.status`. Reading the method alone reported a failed turn as
+    /// a completed one — the harness announced "done" about a turn in which not
+    /// a line was written.
+    #[test]
+    fn the_status_of_the_turn_decides_it_not_the_method_name() {
+        let note = |params: Value| BridgeEvent::Notification {
+            seq: 1,
+            method: "turn/completed".to_string(),
+            params,
+        };
+        assert_eq!(
+            turn_state(&note(serde_json::json!({
+                "turn": {"id": "t1", "status": "completed"}
+            }))),
+            Some(TurnState::Completed)
+        );
+        let failed = turn_state(&note(serde_json::json!({
+            "turn": {
+                "id": "t2",
+                "status": "failed",
+                "error": {"message": "stream error: unexpected status 401 Unauthorized"}
+            }
+        })));
+        assert!(
+            matches!(&failed, Some(TurnState::Failed(reason))
+                if reason.contains("failed")
+                    && reason.contains("stream error: unexpected status 401 Unauthorized")),
+            "a failed turn must be reported as failed, with the vendor's own words: {failed:?}"
+        );
+        let interrupted = turn_state(&note(serde_json::json!({
+            "turn": {"id": "t3", "status": "interrupted"}
+        })));
+        assert!(
+            matches!(&interrupted, Some(TurnState::Failed(reason)) if reason.contains("interrupted")),
+            "an interrupted turn is not a completed one, got {interrupted:?}"
+        );
+        // A status this build has never seen is not a success either.
+        assert!(matches!(
+            turn_state(&note(serde_json::json!({"turn": {"status": "throttled"}}))),
+            Some(TurnState::Failed(_))
+        ));
+    }
+
+    /// Phase 0B transcript, `claude 2.1.233` run as
+    /// `--print --output-format=stream-json`: the turn ends with a `result`
+    /// object, not with a JSON-RPC notification, and `subtype`/`is_error` carry
+    /// the outcome.
+    #[test]
+    fn the_claude_stream_ends_its_turn_with_a_result_object() {
+        let object = |value: Value| BridgeEvent::StreamObject {
+            seq: 1,
+            object: value,
+        };
+        assert_eq!(
+            turn_state(&object(serde_json::json!({
+                "type": "result",
+                "subtype": "success",
+                "stop_reason": "end_turn",
+                "terminal_reason": "completed",
+                "duration_api_ms": 4220,
+                "total_cost_usd": 0.0477,
+                "result": "Done."
+            }))),
+            Some(TurnState::Completed)
+        );
+        let failed = turn_state(&object(serde_json::json!({
+            "type": "result",
+            "subtype": "error_during_execution",
+            "is_error": true,
+            "result": "the tool call could not be completed"
+        })));
+        assert!(
+            matches!(&failed, Some(TurnState::Failed(reason))
+                if reason.contains("error_during_execution")
+                    && reason.contains("the tool call could not be completed")),
+            "a failed turn must carry the vendor's own words, got {failed:?}"
+        );
+        // A success flagged as an error is still an error: the two fields
+        // disagree, and the safe reading is the one that does not report a
+        // finished turn.
+        assert!(matches!(
+            turn_state(&object(serde_json::json!({
+                "type": "result", "subtype": "success", "is_error": true
+            }))),
+            Some(TurnState::Failed(_))
+        ));
+        // Everything inside the turn keeps the turn open.
+        for inside in [
+            serde_json::json!({"type": "system", "subtype": "init", "session_id": "s-1"}),
+            serde_json::json!({"type": "assistant", "message": {"content": []}}),
+            serde_json::json!({"type": "user", "message": {"content": []}}),
+            serde_json::json!({"type": "stream_event"}),
+        ] {
+            assert_eq!(
+                turn_state(&object(inside.clone())),
+                None,
+                "'{inside}' is not the end of the turn"
+            );
+        }
+    }
+
+    /// The one outcome that must never be invented. A vendor that announces
+    /// nothing leaves the caller with `None`, which `delegate_cli` settles as
+    /// `timed_out` — never as a completed turn.
+    #[test]
+    fn a_silent_vendor_never_produces_a_completed_turn() {
+        let silent = [
+            BridgeEvent::Text {
+                seq: 1,
+                text: "turn/completed".into(),
+            },
+            BridgeEvent::Other {
+                seq: 2,
+                kind: "terminal".into(),
+            },
+            BridgeEvent::StreamObject {
+                seq: 3,
+                object: serde_json::json!({"type": "assistant"}),
+            },
+            BridgeEvent::Notification {
+                seq: 4,
+                method: "item/completed".into(),
+                params: serde_json::json!({"turn": {"status": "completed"}}),
+            },
+        ];
+        for event in silent {
+            assert_eq!(
+                turn_state(&event),
+                None,
+                "no end-of-turn signal must stay no end of turn: {event:?}"
+            );
+        }
     }
 
     /// A standing permission is per capability. Before the approval context

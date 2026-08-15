@@ -153,14 +153,18 @@ mod tests {
             _cancel: CancellationToken,
             _progress: Arc<dyn crate::flow_engine::dispatchers::ProgressSink>,
             scope: String,
-        ) -> Result<String> {
+        ) -> Result<crate::agents::run_manager::AgentFlowOutcome> {
             let mut rx = self.rx.clone();
             while !*rx.borrow() {
                 if rx.changed().await.is_err() {
                     break;
                 }
             }
-            Ok(format!("done-{scope}"))
+            Ok(crate::agents::run_manager::AgentFlowOutcome {
+                text: format!("done-{scope}"),
+                usage: crate::flow_engine::envelope::TokenUsage::default(),
+                model: None,
+            })
         }
     }
 

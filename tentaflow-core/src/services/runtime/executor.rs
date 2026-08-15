@@ -5133,6 +5133,7 @@ mod tests {
             final_envelope: env,
             trace: vec![],
             usage: crate::flow_engine::envelope::TokenUsage::default(),
+            model: None,
             perf: None,
             finish_reason: crate::flow_engine::envelope::FinishReason::Stop,
             total_latency_ms: 0,

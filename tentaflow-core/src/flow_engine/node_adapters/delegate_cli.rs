@@ -52,6 +52,7 @@ use crate::code_studio::cli_bridge::{
     APPROVAL_TIMEOUT,
 };
 use crate::code_studio::events::{self, EventPayload, SessionEvent};
+use crate::code_studio::models::EgressEnforcement;
 use crate::code_studio::patch::PatchScope;
 use crate::code_studio::pep::{self, AskKind, Capability};
 use crate::code_studio::tools::{self, Bound, ToolCallCtx};
@@ -391,6 +392,20 @@ async fn pump(
                         pumped.state = Some(state);
                     }
                 }
+                BridgeEvent::StreamObject { object, .. } => {
+                    if let Some(text) = stream_object_text(object) {
+                        let text = redact::redact_text(&text);
+                        push_bounded(&mut pumped.transcript, &text);
+                        append_message(pool, instance, &text, ordinal);
+                    }
+                    if let Some(state) = cli_bridge::turn_state(&event) {
+                        tracing::debug!(
+                            instance = %instance.id,
+                            "delegate_cli: the vendor announced the end of the turn"
+                        );
+                        pumped.state = Some(state);
+                    }
+                }
                 BridgeEvent::Approval { request, .. } => {
                     pumped.approvals += 1;
                     let outcome = cli_bridge::resolve_approval(approvals, request).await;
@@ -464,6 +479,26 @@ fn push_bounded(transcript: &mut String, text: &str) {
 /// The human-readable half of a vendor notification, when it has one. A frame
 /// that carries no text is a control frame; putting its JSON on the timeline
 /// would be noise nobody reads.
+/// What one object of Claude Code's `stream-json` output contributes to the
+/// transcript: the text blocks of an assistant message, and nothing else. The
+/// closing `result` object repeats the last assistant text, so taking it too
+/// would put every answer in the transcript twice; its outcome is read by
+/// `cli_bridge::turn_state` and lands in the run's status instead.
+fn stream_object_text(object: &Value) -> Option<String> {
+    if object.get("type").and_then(Value::as_str) != Some("assistant") {
+        return None;
+    }
+    let blocks = object.pointer("/message/content")?.as_array()?;
+    let text = blocks
+        .iter()
+        .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|block| block.get("text").and_then(Value::as_str))
+        .filter(|text| !text.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    (!text.is_empty()).then_some(text)
+}
+
 fn notification_text(params: &Value) -> Option<String> {
     for field in ["text", "message", "delta", "content"] {
         if let Some(text) = params.get(field).and_then(Value::as_str) {
@@ -568,6 +603,19 @@ async fn mint_ticket(
 // Adapter start
 // =============================================================================
 
+/// The workspace's own statement about how its egress is enforced. A row whose
+/// value this build does not know is refused rather than assumed: guessing here
+/// would guess in the permissive direction.
+fn workspace_enforcement(bound: &Bound) -> Result<EgressEnforcement> {
+    EgressEnforcement::from_slug(&bound.workspace.egress_enforcement).ok_or_else(|| {
+        anyhow!(
+            "delegate_cli: workspace '{}' records the unknown egress enforcement '{}'",
+            bound.workspace.name,
+            bound.workspace.egress_enforcement
+        )
+    })
+}
+
 async fn start_adapter_for(
     main_db: &DbPool,
     cipher: &crate::crypto::SettingsCipher,
@@ -576,8 +624,11 @@ async fn start_adapter_for(
     sink: Arc<dyn AdapterEventSink>,
     tickets: Arc<TicketRegistry>,
 ) -> Result<AdapterHandle> {
-    let ca_path = cs_paths::session_tmp_dir(&bound.workspace.id, &bound.session.id)?
-        .join(format!("cli-{engine_id}-ca.pem"));
+    let session_tmp = cs_paths::session_tmp_dir(&bound.workspace.id, &bound.session.id)?;
+    let ca_path = session_tmp.join(format!("cli-{engine_id}-ca.pem"));
+    // Per session rather than per run: the CLI writes its resumable transcript
+    // here, so a second turn of the same session can name the first one.
+    let cli_home_dir = session_tmp.join(format!("cli-{engine_id}-home"));
     cli_adapter::start_adapter(
         main_db,
         cipher,
@@ -595,6 +646,8 @@ async fn start_adapter_for(
             // reading a row that cannot decrypt here.
             node_id: bound.workspace.node_id.clone(),
             ca_path,
+            cli_home_dir,
+            egress_enforcement: workspace_enforcement(bound)?,
             dns_names: vec!["localhost".to_string(), "127.0.0.1".to_string()],
             tickets,
             sink,
@@ -683,9 +736,15 @@ impl NodeAdapter for DelegateCliNodeAdapter {
         let bound = tools::bind(&call_ctx).await?;
 
         // Step 2 — the engine has to have passed Phase 0B before anything is
-        // started, opened or spent.
-        cli_adapter::ensure_engine_verified(&main_db, &config.engine)
-            .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?;
+        // started, opened or spent. The workspace's enforcement is part of the
+        // question: an engine that keeps traffic outside the adapter is only
+        // acceptable where a gateway sees that traffic.
+        cli_adapter::ensure_engine_verified(
+            &main_db,
+            &config.engine,
+            workspace_enforcement(&bound)?,
+        )
+        .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?;
 
         // Step 3 — §17.3: under `local_only` the sandbox has no route, so a
         // vendor CLI is not "degraded", it is absent.
@@ -951,6 +1010,9 @@ async fn run_delegation(
     );
 
     let env = adapter.sandbox_env(&ticket);
+    // For codex the provider override is not an environment variable at all; it
+    // is configuration the process has to be started with (§7.5).
+    let args = adapter.cli_args();
     let mut instance = bridge
         .open(
             &bound.pool,
@@ -963,6 +1025,7 @@ async fn run_delegation(
                 ticket_id: Some(&ticket.claims.ticket_id),
                 resume_vendor_session_id: None,
                 env: &env,
+                args: &args,
             },
         )
         .await?;
@@ -1452,6 +1515,7 @@ mod tests {
                     ticket_id: Some(&ticket.claims.ticket_id),
                     resume_vendor_session_id: None,
                     env: &[],
+                    args: &[],
                 },
             )
             .await
@@ -1609,6 +1673,7 @@ mod tests {
                     ticket_id: Some(&ticket.claims.ticket_id),
                     resume_vendor_session_id: None,
                     env: &[],
+                    args: &[],
                 },
             )
             .await
@@ -1682,6 +1747,7 @@ mod tests {
                     ticket_id: Some(&ticket.claims.ticket_id),
                     resume_vendor_session_id: None,
                     env: &[],
+                    args: &[],
                 },
             )
             .await
@@ -1796,9 +1862,17 @@ mod tests {
         assert!(wiring.ticket_path_prefixes.contains(&"/v1".to_string()));
         assert!(wiring.ticket_methods.contains("POST"));
         // Nothing in the wiring names a credential variable: the only key the
-        // CLI ever sees is the ticket, under the vendor's own API-key name.
-        assert_eq!(wiring.api_key_var, "OPENAI_API_KEY");
-        assert_eq!(wiring.base_url_var, "OPENAI_BASE_URL");
+        // CLI ever sees is the ticket, in the variable the provider entry the
+        // process is started with reads.
+        assert_eq!(wiring.api_key_var, "TF_TICKET");
+        assert_eq!(
+            wiring.base_url_var, None,
+            "codex ignores OPENAI_BASE_URL; declaring it would describe a mechanism that does \
+             not exist"
+        );
+        assert!(wiring
+            .cli_args("https://127.0.0.1:9443")
+            .contains(&"model_providers.tfadapter.base_url=https://127.0.0.1:9443/v1".to_string()));
     }
 
     /// An unfinished turn is never reported as a finished one. With no terminal
@@ -1840,6 +1914,75 @@ mod tests {
         assert!(pumped.transcript.contains("thinking"));
 
         workspace_db::close("wstimeout");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// A Claude Code delegation, end to end over the bridge protocol: the CLI's
+    /// `stream-json` objects become the transcript, and the closing `result`
+    /// object is what settles the turn. Before the CLI ran in that mode the pump
+    /// saw ANSI frames only, learned nothing, and every delegation ended at its
+    /// deadline.
+    #[tokio::test]
+    async fn a_claude_stream_gives_the_pump_both_the_text_and_the_end_of_the_turn() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let (data, pool, bridge, tickets, ticket, mut instance, _stub) = scenario(
+            "wsclaude",
+            "run-claude",
+            "cli-claude",
+            10_000,
+            vec![
+                json!({"seq": 1, "kind": "claude", "data": {
+                    "type": "system", "subtype": "init", "session_id": "vendor-77"
+                }}),
+                // The bridge reports the id the CLI announced as its own event;
+                // this is how a resume survives a CLI that chose a different id.
+                json!({"seq": 2, "kind": "vendor_session", "data": {"id": "vendor-77"}}),
+                json!({"seq": 3, "kind": "claude", "data": {
+                    "type": "assistant",
+                    "message": {"content": [{"type": "text", "text": "patched the parser"}]}
+                }}),
+                json!({"seq": 4, "kind": "claude", "data": {
+                    "type": "result",
+                    "subtype": "success",
+                    "stop_reason": "end_turn",
+                    "duration_api_ms": 4220,
+                    "total_cost_usd": 0.0477,
+                    "result": "patched the parser"
+                }}),
+            ],
+        )
+        .await;
+        let registry = crate::agents::interaction::InteractionRegistry::new();
+        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
+        let approvals = approval_context(&grants, data.path(), "run-claude", &registry, &progress);
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let pumped = pump(
+            &bridge,
+            &pool,
+            &mut instance,
+            &approvals,
+            &tickets,
+            &ticket.claims.ticket_id,
+            Instant::now() + Duration::from_secs(5),
+            &cancel,
+        )
+        .await
+        .expect("pump");
+        assert_eq!(pumped.state, Some(TurnState::Completed));
+        assert!(
+            pumped.transcript.contains("patched the parser"),
+            "the assistant's own text is the transcript: {}",
+            pumped.transcript
+        );
+        assert!(
+            !pumped.transcript.contains("\u{1b}["),
+            "the transcript must no longer carry terminal escape sequences"
+        );
+        // The vendor's own session id is what a later `--resume` needs.
+        assert_eq!(instance.vendor_session_id, "vendor-77");
+
+        workspace_db::close("wsclaude");
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 

@@ -672,7 +672,34 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "code_studio_permissions",
             MigrationStep::Rust(roles_add_code_studio_permissions),
         ),
+        (
+            127,
+            "agent_runs_token_accounting",
+            MigrationStep::Rust(agent_runs_add_token_accounting_columns),
+        ),
     ]
+}
+
+/// Completes the accounting of an agent run: the model it spent tokens on and
+/// the prompt/completion split next to the `total_tokens` column that was there
+/// from the start. A run settled with a total alone cannot be billed, compared
+/// across models, or copied into a Code Studio turn — which is why those three
+/// columns stayed empty downstream. Idempotent — guarded by column probes.
+fn agent_runs_add_token_accounting_columns(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "agent_runs", "prompt_tokens")? {
+        conn.execute_batch(
+            "ALTER TABLE agent_runs ADD COLUMN prompt_tokens INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !column_exists(conn, "agent_runs", "completion_tokens")? {
+        conn.execute_batch(
+            "ALTER TABLE agent_runs ADD COLUMN completion_tokens INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    if !column_exists(conn, "agent_runs", "model")? {
+        conn.execute_batch("ALTER TABLE agent_runs ADD COLUMN model TEXT;")?;
+    }
+    Ok(())
 }
 
 // Code Studio — registry of workspaces (org scope, synchronized) plus the

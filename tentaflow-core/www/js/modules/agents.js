@@ -303,23 +303,19 @@ function parseStringArray(json) {
   }
 }
 
-function parseSkillsSelection(json) {
-  try {
-    const obj = JSON.parse(json || '{}');
-    const names = Array.isArray(obj?.names) ? obj.names.filter((s) => typeof s === 'string') : [];
-    const tags = Array.isArray(obj?.tags) ? obj.tags.filter((s) => typeof s === 'string') : [];
-    return { names, tags };
-  } catch {
-    return { names: [], tags: [] };
-  }
+function normalizeSkillsSelection(obj) {
+  const names = Array.isArray(obj?.names) ? obj.names.filter((s) => typeof s === 'string') : [];
+  const tags = Array.isArray(obj?.tags) ? obj.tags.filter((s) => typeof s === 'string') : [];
+  return { names, tags };
 }
 
-function safeParseParams(json) {
+// The list summary still carries the raw `skills_json` column (it is a display
+// projection, not an upsert payload); the detail row carries the object.
+function parseSkillsSelection(json) {
   try {
-    const obj = JSON.parse(json || '{}');
-    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+    return normalizeSkillsSelection(JSON.parse(json || '{}'));
   } catch {
-    return {};
+    return { names: [], tags: [] };
   }
 }
 
@@ -497,7 +493,8 @@ async function fetchAgentDetail(agentId) {
 }
 
 // A full upsert payload from a detail row — enable/disable and duplicate flows
-// must round-trip every field, not just the one they change.
+// must round-trip every field, not just the one they change. The detail row is
+// already the upsert shape, so this only applies the overrides.
 function payloadFromDetail(agent, overrides = {}) {
   return {
     id: agent.id,
@@ -506,9 +503,9 @@ function payloadFromDetail(agent, overrides = {}) {
     description: agent.description || '',
     system_prompt: agent.system_prompt || null,
     model: agent.model || null,
-    tools: parseStringArray(agent.tools_json),
-    skills: parseSkillsSelection(agent.skills_json),
-    params: safeParseParams(agent.params_json),
+    tools: agent.tools ?? [],
+    skills: normalizeSkillsSelection(agent.skills),
+    params: agent.params ?? {},
     max_iterations: agent.max_iterations ?? 25,
     timeout_secs: agent.timeout_secs ?? 600,
     max_subagents: agent.max_subagents ?? 0,
@@ -730,7 +727,7 @@ function renderPlaygroundHeader() {
     <div class="agents-pg-sub">${escapeHtml(agent.description || '')}</div>
     <div class="agents-pg-chips">
       <tf-chip status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(agent.model || t('model_inherited'))}</tf-chip>
-      <tf-chip status="info">${escapeHtml(t('card_tools_count', { count: parseStringArray(agent.tools_json).length }))}</tf-chip>
+      <tf-chip status="info">${escapeHtml(t('card_tools_count', { count: (agent.tools ?? []).length }))}</tf-chip>
       ${agent.routable ? `<tf-chip>${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
     </div>
   `;
@@ -950,8 +947,8 @@ async function openWizard(agent, { forceCreate = false } = {}) {
   ]);
 
   const mode = agent && agent.id && !forceCreate ? 'edit' : 'create';
-  const selectedTools = agent ? parseStringArray(agent.tools_json) : [];
-  const skillSel = agent ? parseSkillsSelection(agent.skills_json) : { names: [], tags: [] };
+  const selectedTools = agent?.tools ?? [];
+  const skillSel = normalizeSkillsSelection(agent?.skills);
 
   const win = document.createElement('tf-window');
   win.setAttribute('title', t(mode === 'create' ? 'editor_create_title' : 'editor_edit_title'));
@@ -1000,7 +997,7 @@ async function openWizard(agent, { forceCreate = false } = {}) {
   state.wizard = {
     mode,
     agent: mode === 'edit' ? agent : null,
-    sourceParams: agent ? safeParseParams(agent.params_json) : {},
+    sourceParams: agent?.params ?? {},
     win,
     body,
     foot,

@@ -48,13 +48,24 @@
 //   * **No database writes.** Every decision produces an `EventPayload` the
 //     caller appends to the session timeline, exactly like the egress gateway.
 //
-// Phase 0B (§17.1) has NOT been performed in this build: nobody has verified
-// against pinned CLI versions that a base URL override captures ALL of a given
-// CLI's traffic (point 6) and that it has no credential-refresh channel of its
-// own (point 7). Those points are blocking, so `ensure_engine_verified` refuses
-// every engine until an administrator records the go/no-go decision. The
-// mechanism is complete; the claim that a given CLI fits it is not ours to make
-// yet.
+// Phase 0B (§17.1) has been performed against pinned binaries, inside a network
+// namespace that captured every TCP connection the CLI opened and logged its
+// SNI. What it found is why this file looks the way it does:
+//
+//   * `claude 2.1.233` meets points 6 and 7 — but only with
+//     `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1` and a session-private
+//     `CLAUDE_CONFIG_DIR`. Both are part of `EngineWiring`, because without them
+//     the process also reached api.anthropic.com, github.com and a Datadog
+//     intake, and could have used a claude.ai login of its own.
+//   * `codex 0.147.0` does NOT meet point 6. `OPENAI_BASE_URL` is ignored
+//     outright; a provider passed as `-c model_providers.*` moves the model
+//     traffic, and connections to chatgpt.com and api.github.com remain. It runs
+//     only where a gateway sees that residual traffic — see
+//     `ensure_residual_traffic_is_contained`.
+//
+// Measuring is not deciding: `ensure_engine_verified` still refuses every engine
+// until an administrator records the organization's go/no-go (a flag AND a
+// note). Nothing in this build sets that flag on its own.
 
 use std::collections::{BTreeSet, HashMap};
 use std::net::SocketAddr;
@@ -74,6 +85,7 @@ use tokio_rustls::TlsAcceptor;
 use tracing::{debug, warn};
 
 use super::events::EventPayload;
+use super::models::EgressEnforcement;
 use super::pep::{self, Capability, Decision, Target};
 use super::vault::AgentCredential;
 use crate::db::DbPool;
@@ -125,7 +137,16 @@ impl std::error::Error for GateRefusal {}
 /// implementation of "the isolation promise is either kept or the feature is
 /// absent" (§7.5): an engine nobody has verified simply does not run, rather
 /// than running with a weaker story.
-pub fn ensure_engine_verified(core_db: &DbPool, engine_id: &str) -> Result<(), GateRefusal> {
+///
+/// The organization's decision (the flag plus the note) is necessary for every
+/// engine. It is not SUFFICIENT for an engine measured to keep traffic outside
+/// the adapter: `codex` does, so its refusal also names the containment the
+/// workspace has to provide — see `ensure_residual_traffic_is_contained`.
+pub fn ensure_engine_verified(
+    core_db: &DbPool,
+    engine_id: &str,
+    egress_enforcement: EgressEnforcement,
+) -> Result<(), GateRefusal> {
     let refusal = |reason: String| GateRefusal {
         engine_id: engine_id.to_string(),
         reason,
@@ -155,7 +176,41 @@ pub fn ensure_engine_verified(core_db: &DbPool, engine_id: &str) -> Result<(), G
              verification"
         )));
     }
-    Ok(())
+    ensure_residual_traffic_is_contained(engine_id, egress_enforcement).map_err(refusal)
+}
+
+/// §17.1 point 6 for an engine that does not meet it on its own.
+///
+/// Phase 0B measured `codex 0.147.0` inside a network namespace that captured
+/// every TCP connection: `OPENAI_BASE_URL` is ignored outright, and even with
+/// the model provider redirected through `-c model_providers.*` the process
+/// still opened connections to `chatgpt.com` and `api.github.com`. The adapter
+/// therefore does NOT see all of that CLI's traffic, and no wiring on our side
+/// can make it. What is left is containment by the workspace: under `namespace`
+/// or `firewall` that residual traffic is filtered and audited by the egress
+/// gateway (§7.6), and under `unrestricted` nothing sees it at all.
+///
+/// This is deliberately a property of the WORKSPACE, not a flag an administrator
+/// can set: the refusal has to name a mechanism that exists, not a promise.
+fn ensure_residual_traffic_is_contained(
+    engine_id: &str,
+    egress_enforcement: EgressEnforcement,
+) -> Result<(), String> {
+    if engine_id != "codex" || egress_enforcement != EgressEnforcement::Unrestricted {
+        return Ok(());
+    }
+    Err(format!(
+        "Phase 0B measured that codex keeps opening connections to chatgpt.com and \
+         api.github.com even when its model provider is redirected to the adapter, so the \
+         override does not capture all of its traffic (§17.1 point 6). That residual traffic is \
+         only filtered and audited where the workspace enforces egress through the gateway, and \
+         this workspace runs 'unrestricted' — where §7.6 promises neither. Run the workspace in \
+         a container (egress_enforcement 'namespace') or on a node with the firewall rule \
+         ('firewall'), or delegate to an engine whose traffic the adapter does capture. The \
+         organization's OpenAI credential is still safe here: the CLI is started with a \
+         session-private, empty CODEX_HOME, so it can never fall back to a ChatGPT \
+         subscription credential of its own"
+    ))
 }
 
 // =============================================================================
@@ -787,13 +842,22 @@ impl SessionTrust {
 // Engine wiring
 // =============================================================================
 
-/// Which header carries the credential upstream, and which environment
-/// variables point a CLI at the adapter.
+/// Which header carries the credential upstream, and how a CLI is pointed at
+/// the adapter.
 ///
-/// UNVERIFIED against a live CLI: this is the wiring Phase 0B has to confirm
-/// (§17.1 point 6). It is written out so the verification has something concrete
-/// to test, and `ensure_engine_verified` keeps it unreachable until somebody
-/// does test it.
+/// Every field here was measured in Phase 0B against the pinned binaries
+/// (`claude 2.1.233`, `codex 0.147.0`) inside a network namespace that logged
+/// SNI for every TCP connection the process opened. Two findings shape it:
+///
+///   * claude honours `ANTHROPIC_BASE_URL` and prefers `ANTHROPIC_API_KEY` over
+///     a claude.ai login, but WITHOUT
+///     `CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC` and a private
+///     `CLAUDE_CONFIG_DIR` it also reaches api.anthropic.com, github.com and a
+///     Datadog intake. Those two variables are the mechanism behind §17.1
+///     point 6, not cosmetics.
+///   * codex ignores `OPENAI_BASE_URL` completely. Its provider is moved only by
+///     `-c model_providers.*` arguments given at startup, which is why the
+///     wiring carries ARGUMENTS as well as environment.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CredentialHeader {
     /// `Authorization: Bearer <credential>` (OpenAI-shaped APIs).
@@ -806,10 +870,23 @@ pub enum CredentialHeader {
 pub struct EngineWiring {
     pub engine_id: String,
     pub credential_header: CredentialHeader,
-    /// Environment variable that overrides the CLI's base URL.
-    pub base_url_var: String,
+    /// Environment variable that overrides the CLI's base URL, where the CLI
+    /// honours one. `None` for codex, which does not: setting `OPENAI_BASE_URL`
+    /// changed nothing and 100% of its traffic still went to the vendor, so
+    /// declaring the variable would describe a mechanism that does not exist.
+    pub base_url_var: Option<String>,
     /// Environment variable the CLI reads its API key from — it gets the ticket.
     pub api_key_var: String,
+    /// Variable pointing the CLI at a session-private configuration directory.
+    /// It is containment, not tidiness: whatever account an operator logged this
+    /// CLI into on this host lives in the default directory, and a CLI that
+    /// finds a credential of its own there uses it INSTEAD of the ticket —
+    /// which is exactly the credential-refresh channel §17.1 point 7 forbids.
+    pub config_dir_var: String,
+    /// Variables that switch off everything the CLI does besides talking to its
+    /// model. Measured, not assumed: without them claude also reached
+    /// api.anthropic.com, github.com and http-intake.logs.us5.datadoghq.com.
+    pub isolation_env: Vec<(String, String)>,
     /// Methods a ticket for this engine is minted with.
     pub ticket_methods: BTreeSet<String>,
     /// Path prefixes a ticket for this engine is minted with. Both providers
@@ -817,6 +894,13 @@ pub struct EngineWiring {
     /// rather than defaulting to "the whole host", because a ticket without a
     /// path allowlist authorizes the provider's account-management surface too.
     pub ticket_path_prefixes: Vec<String>,
+    /// Requests the adapter answers ITSELF, without a ticket and without
+    /// forwarding, as `(method, path)`. Claude Code opens a session with
+    /// `HEAD /api/hello` carrying no authentication at all: it is a "is this
+    /// base URL alive" probe, and the honest answer comes from the thing that
+    /// IS the base URL. Refusing it would log a denial per session for a
+    /// request that was never going to reach a provider.
+    pub unauthenticated_probes: Vec<(String, String)>,
 }
 
 impl EngineWiring {
@@ -830,18 +914,30 @@ impl EngineWiring {
             "claude-code" => Ok(Self {
                 engine_id: engine_id.to_string(),
                 credential_header: CredentialHeader::XApiKey,
-                base_url_var: "ANTHROPIC_BASE_URL".to_string(),
+                base_url_var: Some("ANTHROPIC_BASE_URL".to_string()),
                 api_key_var: "ANTHROPIC_API_KEY".to_string(),
+                config_dir_var: "CLAUDE_CONFIG_DIR".to_string(),
+                isolation_env: vec![(
+                    "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC".to_string(),
+                    "1".to_string(),
+                )],
                 ticket_methods: methods(),
                 ticket_path_prefixes: vec!["/v1".to_string()],
+                unauthenticated_probes: vec![("HEAD".to_string(), "/api/hello".to_string())],
             }),
             "codex" => Ok(Self {
                 engine_id: engine_id.to_string(),
                 credential_header: CredentialHeader::AuthorizationBearer,
-                base_url_var: "OPENAI_BASE_URL".to_string(),
-                api_key_var: "OPENAI_API_KEY".to_string(),
+                base_url_var: None,
+                // Named by the provider configuration below, so the CLI reads
+                // the ticket out of a variable that means nothing to the vendor
+                // — there is no chance of it being mistaken for a real key.
+                api_key_var: CODEX_TICKET_VAR.to_string(),
+                config_dir_var: "CODEX_HOME".to_string(),
+                isolation_env: Vec::new(),
                 ticket_methods: methods(),
                 ticket_path_prefixes: vec!["/v1".to_string()],
+                unauthenticated_probes: Vec::new(),
             }),
             other => Err(anyhow!(
                 "no adapter wiring for engine '{other}': an engine reaches the provider through \
@@ -849,7 +945,49 @@ impl EngineWiring {
             )),
         }
     }
+
+    /// Arguments the CLI has to be STARTED with for its model traffic to reach
+    /// the adapter, given the adapter's base URL.
+    ///
+    /// Empty for claude, whose base URL is an environment variable. For codex it
+    /// is the only thing that works: the provider is a configuration entry, and
+    /// `-c` is how a configuration entry is set for one process without writing
+    /// into `config.toml`.
+    pub fn cli_args(&self, base_url: &str) -> Vec<String> {
+        if self.engine_id != "codex" {
+            return Vec::new();
+        }
+        let provider = CODEX_PROVIDER_ID;
+        [
+            format!("model_provider={provider}"),
+            format!(
+                "model_providers.{provider}.base_url={}/v1",
+                base_url.trim_end_matches('/')
+            ),
+            format!("model_providers.{provider}.env_key={CODEX_TICKET_VAR}"),
+            format!("model_providers.{provider}.wire_api=responses"),
+        ]
+        .into_iter()
+        .flat_map(|setting| ["-c".to_string(), setting])
+        .collect()
+    }
+
+    /// Whether the adapter answers this request itself instead of matching it
+    /// against a ticket.
+    fn is_unauthenticated_probe(&self, method: &str, path: &str) -> bool {
+        self.unauthenticated_probes
+            .iter()
+            .any(|(probe_method, probe_path)| {
+                probe_method.eq_ignore_ascii_case(method) && probe_path == path
+            })
+    }
 }
+
+/// Name of the codex provider entry the CLI is started with. Ours, so it cannot
+/// collide with a provider an operator configured.
+const CODEX_PROVIDER_ID: &str = "tfadapter";
+/// Variable that provider entry reads the ticket from.
+const CODEX_TICKET_VAR: &str = "TF_TICKET";
 
 // =============================================================================
 // The adapter
@@ -975,6 +1113,13 @@ pub struct AdapterConfig {
     /// Where the session CA is written for the sandbox to read — inside the
     /// session's tmp directory (`paths::session_tmp_dir`).
     pub ca_path: PathBuf,
+    /// Configuration directory handed to the CLI, per session and per engine.
+    /// Created empty, so the CLI starts with no account of its own; it is the
+    /// session, not the host user, that the CLI is logged into.
+    pub cli_home_dir: PathBuf,
+    /// How the workspace enforces egress. Read by the Phase 0B gate for an
+    /// engine whose traffic the adapter does not fully capture.
+    pub egress_enforcement: EgressEnforcement,
     /// Names the adapter's certificate is valid for. `localhost` plus whatever
     /// hostname the sandbox will resolve.
     pub dns_names: Vec<String>,
@@ -987,6 +1132,7 @@ pub struct AdapterHandle {
     local_addr: SocketAddr,
     wiring: EngineWiring,
     ca_path: PathBuf,
+    cli_home_dir: PathBuf,
     tickets: Arc<TicketRegistry>,
     task: tokio::task::JoinHandle<()>,
 }
@@ -1007,8 +1153,21 @@ impl AdapterHandle {
         &self.wiring
     }
 
+    /// The base URL the CLI is pointed at — the adapter's own listening socket.
+    pub fn base_url(&self) -> String {
+        format!("https://{}", self.local_addr)
+    }
+
+    /// Arguments the CLI has to be started with, for an engine whose base URL
+    /// is not an environment variable.
+    pub fn cli_args(&self) -> Vec<String> {
+        self.wiring.cli_args(&self.base_url())
+    }
+
     /// Environment a sandboxed CLI needs: the adapter as its base URL, the
-    /// ticket as its API key, and the session CA as the only extra trust anchor.
+    /// ticket as its API key, a session-private configuration directory, the
+    /// isolation switches the vendor honours, and the session CA as the only
+    /// extra trust anchor.
     ///
     /// The organization's credential appears in NONE of these — that is the
     /// property §24 tests by scanning the CLI process's mounts, environment and
@@ -1016,19 +1175,23 @@ impl AdapterHandle {
     /// material would silently undo the whole design.
     pub fn sandbox_env(&self, ticket: &IssuedTicket) -> Vec<(String, String)> {
         let ca = self.ca_path.display().to_string();
-        vec![
-            (
-                self.wiring.base_url_var.clone(),
-                format!("https://{}", self.local_addr),
-            ),
-            (self.wiring.api_key_var.clone(), ticket.presentation.clone()),
-            // One anchor per runtime family, because a CLI is a Node process
-            // today and may be a Rust or Python one tomorrow. Each names the
-            // same file.
-            ("NODE_EXTRA_CA_CERTS".to_string(), ca.clone()),
-            ("SSL_CERT_FILE".to_string(), ca.clone()),
-            ("REQUESTS_CA_BUNDLE".to_string(), ca),
-        ]
+        let mut env = Vec::new();
+        if let Some(base_url_var) = &self.wiring.base_url_var {
+            env.push((base_url_var.clone(), self.base_url()));
+        }
+        env.push((self.wiring.api_key_var.clone(), ticket.presentation.clone()));
+        env.push((
+            self.wiring.config_dir_var.clone(),
+            self.cli_home_dir.display().to_string(),
+        ));
+        env.extend(self.wiring.isolation_env.iter().cloned());
+        // One anchor per runtime family, because a CLI is a Node process
+        // today and may be a Rust or Python one tomorrow. Each names the
+        // same file.
+        env.push(("NODE_EXTRA_CA_CERTS".to_string(), ca.clone()));
+        env.push(("SSL_CERT_FILE".to_string(), ca.clone()));
+        env.push(("REQUESTS_CA_BUNDLE".to_string(), ca));
+        env
     }
 
     /// Stops accepting. Called when the session's CLI work ends: the credential
@@ -1051,8 +1214,17 @@ pub async fn start_adapter(
     cipher: &crate::crypto::SettingsCipher,
     config: AdapterConfig,
 ) -> Result<AdapterHandle> {
-    ensure_engine_verified(core_db, &config.engine_id)?;
+    ensure_engine_verified(core_db, &config.engine_id, config.egress_enforcement)?;
     let wiring = EngineWiring::for_engine(&config.engine_id)?;
+    // The directory has to exist before the CLI reads it, and it has to be OURS:
+    // an engine that finds a credential of its own in there never presents the
+    // ticket (§17.1 point 7).
+    std::fs::create_dir_all(&config.cli_home_dir).with_context(|| {
+        format!(
+            "create the session's CLI configuration directory {}",
+            config.cli_home_dir.display()
+        )
+    })?;
     let credential = super::vault::get_agent_credential(
         core_db,
         cipher,
@@ -1076,6 +1248,7 @@ pub async fn start_adapter(
         local_addr,
         wiring,
         ca_path: config.ca_path,
+        cli_home_dir: config.cli_home_dir,
         tickets: config.tickets,
         task,
     })
@@ -1122,6 +1295,22 @@ async fn serve_connection(
             return Ok(());
         }
     };
+
+    // The connectivity probe is answered here, before the ticket is consulted:
+    // it carries no authentication (so every ticket rule would reject it) and it
+    // asks about the adapter, not about the provider. Nothing is forwarded, no
+    // budget is spent, and no denial is recorded — a session must not open with
+    // a refusal event for a request that was never going upstream.
+    if inner
+        .wiring
+        .is_unauthenticated_probe(&head.method, &normalized_path(&head.target))
+    {
+        let _ = tls
+            .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+            .await;
+        let _ = tls.flush().await;
+        return Ok(());
+    }
 
     let presented = head
         .header("authorization")
@@ -1950,35 +2139,83 @@ mod tests {
         assert!(is_hop_by_hop("Transfer-Encoding"));
     }
 
-    #[test]
-    fn the_sandbox_environment_carries_a_ticket_and_no_credential() {
+    #[tokio::test]
+    async fn the_sandbox_environment_carries_a_ticket_and_no_credential() {
         let registry = TicketRegistry::new();
         let ticket = issued(&registry, request());
-        let wiring = EngineWiring::for_engine("claude-code").expect("wiring");
-        // Built without binding a socket: the environment is a pure function of
-        // the wiring, the address and the ticket.
-        let env = vec![
-            (
-                wiring.base_url_var.clone(),
-                "https://127.0.0.1:9443".to_string(),
-            ),
-            (wiring.api_key_var.clone(), ticket.presentation.clone()),
-        ];
-        assert_eq!(env[0].0, "ANTHROPIC_BASE_URL");
-        assert_eq!(env[1].0, "ANTHROPIC_API_KEY");
+        let handle = AdapterHandle {
+            local_addr: "127.0.0.1:9443".parse().expect("addr"),
+            wiring: EngineWiring::for_engine("claude-code").expect("wiring"),
+            ca_path: PathBuf::from("/tmp/session/ca.pem"),
+            cli_home_dir: PathBuf::from("/tmp/session/cli-claude-code-home"),
+            tickets: Arc::new(TicketRegistry::new()),
+            task: tokio::spawn(async {}),
+        };
+        let env: HashMap<String, String> = handle.sandbox_env(&ticket).into_iter().collect();
+        assert_eq!(
+            env.get("ANTHROPIC_BASE_URL").map(String::as_str),
+            Some("https://127.0.0.1:9443")
+        );
         assert!(
-            env[1].1.starts_with("tfck_"),
+            env.get("ANTHROPIC_API_KEY")
+                .is_some_and(|value| value.starts_with("tfck_")),
             "the sandbox gets a ticket, never a provider key"
         );
+        // §17.1 points 6 and 7 are these two variables. Without them the CLI was
+        // measured reaching api.anthropic.com, github.com and a Datadog intake,
+        // and picking up whatever account this host is logged into.
+        assert_eq!(
+            env.get("CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC")
+                .map(String::as_str),
+            Some("1")
+        );
+        assert_eq!(
+            env.get("CLAUDE_CONFIG_DIR").map(String::as_str),
+            Some("/tmp/session/cli-claude-code-home")
+        );
         assert!(EngineWiring::for_engine("some-other-cli").is_err());
+    }
+
+    /// `OPENAI_BASE_URL` was measured to be ignored: with it set, 100% of the
+    /// CLI's traffic still went to the vendor. The wiring therefore does not
+    /// declare it, and the redirect is carried by the arguments the process is
+    /// started with.
+    #[test]
+    fn codex_is_redirected_by_configuration_arguments_not_by_an_environment_variable() {
+        let wiring = EngineWiring::for_engine("codex").expect("wiring");
+        assert_eq!(wiring.base_url_var, None);
+        assert_eq!(wiring.config_dir_var, "CODEX_HOME");
+        assert_eq!(wiring.api_key_var, CODEX_TICKET_VAR);
+        assert_eq!(
+            wiring.cli_args("https://127.0.0.1:9443/"),
+            vec![
+                "-c",
+                "model_provider=tfadapter",
+                "-c",
+                "model_providers.tfadapter.base_url=https://127.0.0.1:9443/v1",
+                "-c",
+                "model_providers.tfadapter.env_key=TF_TICKET",
+                "-c",
+                "model_providers.tfadapter.wire_api=responses",
+            ]
+        );
+        assert!(
+            EngineWiring::for_engine("claude-code")
+                .expect("wiring")
+                .cli_args("https://127.0.0.1:9443")
+                .is_empty(),
+            "claude's base URL is an environment variable; it needs no arguments"
+        );
     }
 
     #[test]
     fn an_unverified_engine_cannot_be_delegated_to() {
         let file = tempfile::NamedTempFile::new().expect("tempfile");
         let db = crate::db::init(file.path()).expect("db");
+        let contained = EgressEnforcement::Namespace;
 
-        let refusal = ensure_engine_verified(&db, "claude-code").expect_err("default is off");
+        let refusal =
+            ensure_engine_verified(&db, "claude-code", contained).expect_err("default is off");
         assert_eq!(refusal.engine_id, "claude-code");
         assert!(
             refusal.reason.contains("Phase 0B"),
@@ -1993,19 +2230,77 @@ mod tests {
             "true",
         )
         .expect("set flag");
-        let refusal = ensure_engine_verified(&db, "claude-code").expect_err("note is missing");
+        let refusal =
+            ensure_engine_verified(&db, "claude-code", contained).expect_err("note is missing");
         assert!(refusal.reason.contains(GO_NO_GO_NOTE_PREFIX));
 
         crate::db::repository::set_setting(
             &db,
             &format!("{GO_NO_GO_NOTE_PREFIX}claude-code"),
-            "claude-code 2.1.221 verified on 2026-08-14 by an operator",
+            "claude-code 2.1.233 verified on 2026-08-14 by an operator",
         )
         .expect("set note");
-        assert!(ensure_engine_verified(&db, "claude-code").is_ok());
+        assert!(ensure_engine_verified(&db, "claude-code", contained).is_ok());
+        // claude's traffic IS captured by the adapter, so the workspace's
+        // enforcement is not part of its gate.
+        assert!(
+            ensure_engine_verified(&db, "claude-code", EgressEnforcement::Unrestricted).is_ok()
+        );
 
         // Verification is per engine and never leaks to another one.
-        assert!(ensure_engine_verified(&db, "codex").is_err());
+        assert!(ensure_engine_verified(&db, "codex", contained).is_err());
+    }
+
+    /// The organization's decision does not make codex's residual traffic go
+    /// away. Phase 0B measured connections to chatgpt.com and api.github.com
+    /// surviving the provider redirect, so the engine only runs where the
+    /// gateway sees them — and the refusal says exactly that, rather than
+    /// "engine not available".
+    #[test]
+    fn codex_is_refused_where_nothing_watches_the_traffic_the_adapter_misses() {
+        let file = tempfile::NamedTempFile::new().expect("tempfile");
+        let db = crate::db::init(file.path()).expect("db");
+        crate::db::repository::set_setting(
+            &db,
+            &format!("{BASE_URL_OVERRIDE_VERIFIED_PREFIX}codex"),
+            "true",
+        )
+        .expect("set flag");
+        crate::db::repository::set_setting(
+            &db,
+            &format!("{GO_NO_GO_NOTE_PREFIX}codex"),
+            "codex 0.147.0, API key in the vault, decided on 2026-08-15",
+        )
+        .expect("set note");
+
+        let refusal = ensure_engine_verified(&db, "codex", EgressEnforcement::Unrestricted)
+            .expect_err("unrestricted has no mechanism for the residual traffic");
+        for named in ["chatgpt.com", "api.github.com", "unrestricted", "CODEX_HOME"] {
+            assert!(
+                refusal.reason.contains(named),
+                "the refusal must name what is missing, not merely refuse: {}",
+                refusal.reason
+            );
+        }
+        assert!(ensure_engine_verified(&db, "codex", EgressEnforcement::Namespace).is_ok());
+        assert!(ensure_engine_verified(&db, "codex", EgressEnforcement::Firewall).is_ok());
+    }
+
+    /// Claude opens a session with an UNAUTHENTICATED `HEAD /api/hello`. It is
+    /// the adapter's own liveness that is being asked about, so the adapter
+    /// answers it; matching it against the ticket would deny a request that was
+    /// never going upstream and put a refusal in every session's audit.
+    #[test]
+    fn the_connectivity_probe_is_answered_by_the_adapter_itself() {
+        let claude = EngineWiring::for_engine("claude-code").expect("wiring");
+        assert!(claude.is_unauthenticated_probe("HEAD", "/api/hello"));
+        assert!(claude.is_unauthenticated_probe("head", "/api/hello"));
+        // Nothing else is: the probe is one method on one path, not a hole.
+        assert!(!claude.is_unauthenticated_probe("GET", "/api/hello"));
+        assert!(!claude.is_unauthenticated_probe("HEAD", "/v1/messages"));
+        assert!(!EngineWiring::for_engine("codex")
+            .expect("wiring")
+            .is_unauthenticated_probe("HEAD", "/api/hello"));
     }
 
     #[test]

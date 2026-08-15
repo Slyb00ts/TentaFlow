@@ -62,6 +62,11 @@ struct Event {
 
 enum Runtime {
     Codex(CodexRuntime),
+    Claude(ClaudeRuntime),
+    /// A PTY. It is what the vendor login flow needs (a device code typed into
+    /// a real terminal) and what reading Claude Code's `/usage` still costs —
+    /// that slash command exists only inside an interactive session. No
+    /// delegated turn runs here any more.
     Terminal(TerminalRuntime),
 }
 
@@ -138,6 +143,25 @@ struct CodexRuntime {
     _child: Child,
 }
 
+/// Claude Code driven through its programmatic mode.
+///
+/// `--print --output-format=stream-json --input-format=stream-json --verbose`
+/// reads one JSON user message per line from stdin and writes one JSON object
+/// per line to stdout, closing every turn with a `result` object. The session
+/// used to be a PTY running the interactive TUI instead, which had two
+/// consequences the caller could not work around: the transcript was a stream
+/// of ANSI frames, and NOTHING in it said whether the turn was over — so a
+/// delegation ran to its timeout even when the CLI had long since answered.
+struct ClaudeRuntime {
+    /// `None` once the turn stream has been closed; EOF on stdin is how this
+    /// mode is asked to stop.
+    stdin: Arc<Mutex<Option<ChildStdin>>>,
+    /// Killed as a GROUP: the CLI starts helpers (MCP servers, tools) of its
+    /// own, and killing the direct child alone orphans them (D2).
+    handle: process::Handle,
+    child: Child,
+}
+
 struct TerminalRuntime {
     writer: Arc<SyncMutex<Box<dyn Write + Send>>>,
     ready: Arc<AtomicBool>,
@@ -167,6 +191,15 @@ struct CreateSession {
     /// which is loopback-only Core.
     #[serde(default)]
     env: std::collections::BTreeMap<String, String>,
+    /// Arguments the CLI is started with, on top of the ones the bridge needs
+    /// for its own protocol.
+    ///
+    /// The second half of the same wiring: codex ignores `OPENAI_BASE_URL`, and
+    /// the only thing that moves it onto the adapter is a provider configured
+    /// with `-c model_providers.*` at startup. As with `env`, the bridge does
+    /// not interpret any of it.
+    #[serde(default)]
+    args: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -391,11 +424,8 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
             provider: state.provider,
             workspace: &workspace,
             resume: None,
-            fork: false,
             auth: true,
             new_session_id: None,
-            model: None,
-            env: &[],
         },
         events.clone(),
         &state.processes,
@@ -469,6 +499,7 @@ async fn list_models(
     let events = Arc::new(SyncMutex::new(Vec::new()));
     let runtime = CodexRuntime::connect(
         &state.workspace_root.to_string_lossy(),
+        &[],
         &[],
         events,
         &state.processes,
@@ -588,6 +619,7 @@ async fn usage(
             let runtime = CodexRuntime::connect(
                 &state.workspace_root.to_string_lossy(),
                 &[],
+                &[],
                 events,
                 &state.processes,
             )
@@ -674,11 +706,8 @@ async fn claude_slash_command<T>(
             provider: state.provider,
             workspace: &state.workspace_root.to_string_lossy(),
             resume,
-            fork: false,
             auth: false,
             new_session_id,
-            model: None,
-            env: &[],
         },
         events.clone(),
         &state.processes,
@@ -852,6 +881,7 @@ async fn create_session(
         .map(|value| normalize_model_id(state.provider, value))
         .transpose()?;
     let env = validated_env(&req.env)?;
+    let args = validated_args(&req.args)?;
     let id = uuid::Uuid::new_v4().to_string();
     let requested_vendor_id = if req.fork || req.resume_vendor_session_id.is_none() {
         uuid::Uuid::new_v4().to_string()
@@ -869,33 +899,34 @@ async fn create_session(
                 req.fork,
                 model.as_deref(),
                 &env,
+                &args,
                 events.clone(),
                 &state.processes,
             )
             .await?,
         ),
-        Provider::ClaudeCode => {
-            let mut runtime = spawn_terminal(
-                TerminalSpawn {
-                    provider: state.provider,
-                    workspace: &workspace,
-                    resume: req.resume_vendor_session_id.as_deref(),
-                    fork: req.fork,
-                    auth: false,
-                    new_session_id: Some(&requested_vendor_id),
-                    model: model.as_deref(),
-                    env: &env,
-                },
-                events.clone(),
-                &state.processes,
-            )?;
-            runtime.wait_ready().await?;
-            Runtime::Terminal(runtime)
-        }
+        Provider::ClaudeCode => Runtime::Claude(
+            ClaudeRuntime::spawn(ClaudeSpawn {
+                workspace: &workspace,
+                resume: req.resume_vendor_session_id.as_deref(),
+                fork: req.fork,
+                new_session_id: Some(&requested_vendor_id),
+                model: model.as_deref(),
+                env: &env,
+                args: &args,
+                events: events.clone(),
+                processes: &state.processes,
+            })
+            .await?,
+        ),
     };
     let vendor_id = match &runtime {
         Runtime::Codex(runtime) => runtime.thread_id.clone(),
-        Runtime::Terminal(_) => requested_vendor_id,
+        // The id we asked for. Claude Code confirms the one it really used in
+        // its `system/init` object, which the reader forwards as a
+        // `vendor_session` event, so a CLI that chose differently still lands in
+        // the caller's record.
+        Runtime::Claude(_) | Runtime::Terminal(_) => requested_vendor_id,
     };
     let meta = SessionMeta {
         id: id.clone(),
@@ -953,39 +984,36 @@ async fn start_turn(
                     false,
                     session.meta.model.as_deref(),
                     &[],
+                    &[],
                     session.events.clone(),
                     &state.processes,
                 )
                 .await?,
             ),
-            Provider::ClaudeCode => {
-                let mut runtime = spawn_terminal(
-                    TerminalSpawn {
-                        provider: state.provider,
-                        workspace: &session.meta.workspace,
-                        resume: Some(&session.meta.vendor_session_id),
-                        fork: false,
-                        auth: false,
-                        new_session_id: None,
-                        model: session.meta.model.as_deref(),
-                        env: &[],
-                    },
-                    session.events.clone(),
-                    &state.processes,
-                )?;
-                runtime.wait_ready().await?;
-                Runtime::Terminal(runtime)
-            }
+            Provider::ClaudeCode => Runtime::Claude(
+                ClaudeRuntime::spawn(ClaudeSpawn {
+                    workspace: &session.meta.workspace,
+                    resume: Some(&session.meta.vendor_session_id),
+                    fork: false,
+                    new_session_id: None,
+                    model: session.meta.model.as_deref(),
+                    env: &[],
+                    args: &[],
+                    events: session.events.clone(),
+                    processes: &state.processes,
+                })
+                .await?,
+            ),
         });
     }
     match session.runtime.as_mut().expect("runtime initialized") {
         Runtime::Codex(runtime) => {
             runtime.request("turn/start", json!({"threadId": session.meta.vendor_session_id, "input": [{"type":"text","text":req.prompt}]})).await?;
         }
-        Runtime::Terminal(runtime) => {
-            let pasted = format!("\x1b[200~{}\x1b[201~\r", req.prompt);
-            runtime.writer.lock().write_all(pasted.as_bytes())?;
-            runtime.writer.lock().flush()?;
+        Runtime::Claude(runtime) => runtime.turn(&req.prompt).await?,
+        // A PTY session is a login, and a login has no turns.
+        Runtime::Terminal(_) => {
+            return Err(ApiError::bad_request("this session does not accept turns"))
         }
     }
     session.meta.status = "running".into();
@@ -1065,6 +1093,7 @@ async fn close_session(
     let state_after = match session.runtime.as_mut() {
         Some(Runtime::Terminal(runtime)) => runtime.shutdown().await,
         Some(Runtime::Codex(runtime)) => runtime.shutdown().await,
+        Some(Runtime::Claude(runtime)) => runtime.shutdown().await,
         // A session whose runtime was never restarted after a bridge restart
         // has nothing running; the process it once had was reaped at startup.
         None => process::ProcessState::Reaped,
@@ -1099,12 +1128,17 @@ impl CodexRuntime {
     async fn connect(
         workspace: &str,
         env: &[(String, String)],
+        args: &[String],
         events: Arc<SyncMutex<Vec<Event>>>,
         processes: &process::Registry,
     ) -> Result<Self> {
         let mut command = Command::new("codex");
         command
             .arg("app-server")
+            // The caller's provider configuration, given where the app-server
+            // reads it: `-c` overrides at startup. Passing it as environment
+            // would be passing it nowhere — `OPENAI_BASE_URL` is ignored.
+            .args(args)
             .envs(env.iter().map(|(name, value)| (name, value)))
             .current_dir(workspace)
             .stdin(std::process::Stdio::piped())
@@ -1181,16 +1215,18 @@ impl CodexRuntime {
         Ok(runtime)
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn spawn(
         workspace: &str,
         resume: Option<&str>,
         fork: bool,
         model: Option<&str>,
         env: &[(String, String)],
+        args: &[String],
         events: Arc<SyncMutex<Vec<Event>>>,
         processes: &process::Registry,
     ) -> Result<Self> {
-        let mut runtime = Self::connect(workspace, env, events.clone(), processes).await?;
+        let mut runtime = Self::connect(workspace, env, args, events.clone(), processes).await?;
         let response = if let Some(thread_id) = resume {
             let method = if fork { "thread/fork" } else { "thread/resume" };
             runtime
@@ -1279,20 +1315,189 @@ impl CodexRuntime {
     }
 }
 
-/// Everything one PTY start needs. A struct rather than eight positional
-/// arguments, because the two booleans in the middle used to be readable only
-/// by counting commas.
+impl ClaudeRuntime {
+    /// Starts the CLI. What it may DO is the vendor's own decision here: this
+    /// mode routes tool permissions only to a `--permission-prompt-tool`, which
+    /// is an MCP server the bridge does not run, so no approval of this engine
+    /// reaches the session's PEP the way a Codex `approval_request` does. The
+    /// turn ends either way — its `result` object says what happened — and no
+    /// flag is passed that would widen what the CLI may do without a person
+    /// deciding it.
+    async fn spawn(spawn: ClaudeSpawn<'_>) -> Result<Self> {
+        let ClaudeSpawn {
+            workspace,
+            resume,
+            fork,
+            new_session_id,
+            model,
+            env,
+            args,
+            events,
+            processes,
+        } = spawn;
+        let mut command = Command::new("claude");
+        command.args(claude_args(resume, fork, new_session_id, model, args)?);
+        command
+            .envs(env.iter().map(|(name, value)| (name, value)))
+            .current_dir(workspace)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .kill_on_drop(true);
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let handle = processes.track("claude-print", child.id().context("claude has no pid")?);
+        let stdin = Arc::new(Mutex::new(Some(
+            child.stdin.take().context("claude stdin missing")?,
+        )));
+        let stdout = child.stdout.take().context("claude stdout missing")?;
+        tokio::spawn(async move {
+            let mut lines = BufReader::new(stdout).lines();
+            while let Ok(Some(line)) = lines.next_line().await {
+                let Ok(value) = serde_json::from_str::<Value>(&line) else {
+                    // A line that is not JSON is not part of the protocol. It is
+                    // recorded as terminal output rather than dropped, so a
+                    // startup complaint the CLI prints on stdout is still
+                    // visible to whoever is reading the session.
+                    push_event(&events, "terminal", json!({ "text": line }));
+                    continue;
+                };
+                // The CLI announces the id it actually used; it is what
+                // `--resume` needs, and taking it from the vendor rather than
+                // from our own request is what makes a resume survive a CLI that
+                // chose differently.
+                if value.get("type").and_then(Value::as_str) == Some("system")
+                    && value.get("subtype").and_then(Value::as_str) == Some("init")
+                {
+                    if let Some(id) = value.get("session_id").and_then(Value::as_str) {
+                        push_event(&events, "vendor_session", json!({ "id": id }));
+                    }
+                }
+                push_event(&events, "claude", value);
+            }
+        });
+        Ok(Self {
+            stdin,
+            handle,
+            child,
+        })
+    }
+
+    /// Starts one turn by writing a single user message. The process stays
+    /// alive between turns, which is what `session.turn` on an open session
+    /// means (§17.2: one long-lived instance per `cli_instances` row).
+    async fn turn(&self, prompt: &str) -> Result<(), ApiError> {
+        let message = json!({
+            "type": "user",
+            "message": {"role": "user", "content": [{"type": "text", "text": prompt}]},
+        });
+        let mut guard = self.stdin.lock().await;
+        let stdin = guard
+            .as_mut()
+            .ok_or_else(|| ApiError::bad_request("this session's input stream is closed"))?;
+        let write = async {
+            stdin.write_all(format!("{message}\n").as_bytes()).await?;
+            stdin.flush().await
+        };
+        write
+            .await
+            .map_err(|error| ApiError::internal(&format!("claude stdin write failed: {error}")))
+    }
+
+    /// Closes the input stream, gives the CLI its chance to finish and exit, and
+    /// kills the group if it does not. The polite step is not politeness: the
+    /// session transcript `--resume` reads is written on exit, and a straight
+    /// SIGKILL loses it.
+    async fn shutdown(&mut self) -> process::ProcessState {
+        self.stdin.lock().await.take();
+        match tokio::time::timeout(std::time::Duration::from_secs(5), self.child.wait()).await {
+            Ok(Ok(_)) => {
+                self.handle.mark_exited();
+                process::ProcessState::Exited
+            }
+            // Either the wait failed or the CLI is still running; both are
+            // settled the same way, while the pid still names our group.
+            _ => self.handle.terminate(),
+        }
+    }
+}
+
+/// The command line one Claude Code session runs on.
+///
+/// A function of its own so the protocol flags can be asserted without starting
+/// a process: they ARE the contract with `cli_bridge`, which parses the stream
+/// they produce. `--verbose` is not optional here — without it the stream
+/// carries only the final result, and the session timeline would show a turn
+/// with no work in it.
+fn claude_args(
+    resume: Option<&str>,
+    fork: bool,
+    new_session_id: Option<&str>,
+    model: Option<&str>,
+    extra: &[String],
+) -> Result<Vec<String>> {
+    let mut args = vec![
+        "--print".to_string(),
+        "--output-format=stream-json".to_string(),
+        "--input-format=stream-json".to_string(),
+        "--verbose".to_string(),
+    ];
+    if let Some(model) = model {
+        args.extend(["--model".to_string(), model.to_string()]);
+    }
+    match (resume, fork) {
+        (Some(id), false) => args.extend(["--resume".to_string(), id.to_string()]),
+        (Some(id), true) => args.extend([
+            "--resume".to_string(),
+            id.to_string(),
+            "--fork-session".to_string(),
+            "--session-id".to_string(),
+            new_session_id
+                .context("forked Claude session id missing")?
+                .to_string(),
+        ]),
+        (None, _) => args.extend([
+            "--session-id".to_string(),
+            new_session_id
+                .context("new Claude session id missing")?
+                .to_string(),
+        ]),
+    }
+    args.extend(extra.iter().cloned());
+    Ok(args)
+}
+
+/// Everything one Claude Code start needs.
+struct ClaudeSpawn<'a> {
+    workspace: &'a str,
+    resume: Option<&'a str>,
+    fork: bool,
+    new_session_id: Option<&'a str>,
+    model: Option<&'a str>,
+    /// Caller-owned wiring for the CLI process (§7.5): the adapter as base URL,
+    /// the ticket as the API key, a session-private configuration directory.
+    env: &'a [(String, String)],
+    /// Caller-owned startup arguments (§7.5). Empty for Claude Code today, whose
+    /// provider is an environment variable; the bridge does not decide which of
+    /// the two an engine needs.
+    args: &'a [String],
+    events: Arc<SyncMutex<Vec<Event>>>,
+    processes: &'a process::Registry,
+}
+
+/// Everything one PTY start needs.
+///
+/// Only two callers are left, and both drive a real terminal on purpose: the
+/// vendor login flow (a device code typed by a person) and the `/usage` probe
+/// (a slash command that exists nowhere else). Neither carries caller wiring,
+/// so there is no `env` here — a ticket has no business in a login window.
 struct TerminalSpawn<'a> {
     provider: Provider,
     workspace: &'a str,
     resume: Option<&'a str>,
-    fork: bool,
     auth: bool,
     new_session_id: Option<&'a str>,
-    model: Option<&'a str>,
-    /// Caller-owned wiring for the CLI process (§7.5). Empty for the login and
-    /// probe paths, which talk to nothing on the caller's behalf.
-    env: &'a [(String, String)],
 }
 
 fn spawn_terminal(
@@ -1304,11 +1509,8 @@ fn spawn_terminal(
         provider,
         workspace,
         resume,
-        fork,
         auth,
         new_session_id,
-        model,
-        env,
     } = spawn;
     let pty = native_pty_system().openpty(PtySize {
         rows: 40,
@@ -1322,13 +1524,6 @@ fn spawn_terminal(
         "claude"
     });
     command.cwd(workspace);
-    for (name, value) in env {
-        command.env(name, value);
-    }
-    if let Some(model) = model {
-        command.arg("--model");
-        command.arg(model);
-    }
     if auth {
         if provider == Provider::Codex {
             command.arg("login");
@@ -1340,11 +1535,6 @@ fn spawn_terminal(
     } else if let Some(id) = resume {
         command.arg("--resume");
         command.arg(id);
-        if fork {
-            command.arg("--fork-session");
-            command.arg("--session-id");
-            command.arg(new_session_id.context("forked Claude session id missing")?);
-        }
     } else {
         command.arg("--session-id");
         command.arg(new_session_id.context("new Claude session id missing")?);
@@ -1360,7 +1550,12 @@ fn spawn_terminal(
     );
     let mut reader = pty.master.try_clone_reader()?;
     let writer = Arc::new(SyncMutex::new(pty.master.take_writer()?));
-    let ready = Arc::new(AtomicBool::new(provider == Provider::Codex || auth));
+    // A login window is driven by a person, so it is ready as soon as it exists.
+    // The one PTY anybody waits on is the `/usage` probe, and the only signal
+    // the TUI gives is what it prints — a fragile reading, kept because that
+    // slash command exists nowhere else, and confined to this one probe: no
+    // delegated turn depends on it.
+    let ready = Arc::new(AtomicBool::new(auth));
     let reader_writer = writer.clone();
     let reader_ready = ready.clone();
     std::thread::spawn(move || {
@@ -1550,6 +1745,32 @@ fn validated_env(
     Ok(env)
 }
 
+/// Bounds the arguments a session may be started with.
+///
+/// The same rule as `validated_env`: these strings go straight to `execve`, so
+/// their count and size are capped and anything that is not a plain argument is
+/// refused. An empty argument or one carrying a NUL would not mean what the
+/// caller wrote, and a shell is never involved — the CLI is spawned directly, so
+/// there is no quoting to get wrong.
+fn validated_args(raw: &[String]) -> Result<Vec<String>, ApiError> {
+    const MAX_ARGS: usize = 32;
+    const MAX_ARG: usize = 2048;
+    if raw.len() > MAX_ARGS {
+        return Err(ApiError::bad_request("too many CLI arguments"));
+    }
+    for argument in raw {
+        if argument.is_empty() || argument.len() > MAX_ARG {
+            return Err(ApiError::bad_request("invalid CLI argument length"));
+        }
+        if argument.chars().any(|c| c == '\0' || c.is_control()) {
+            return Err(ApiError::bad_request(
+                "a CLI argument contains a control character",
+            ));
+        }
+    }
+    Ok(raw.to_vec())
+}
+
 fn canonical_workspace(raw: &str, allowed_root: &Path) -> Result<String, ApiError> {
     let path = std::fs::canonicalize(raw)
         .map_err(|e| ApiError::bad_request(&format!("invalid workspace: {e}")))?;
@@ -1585,6 +1806,9 @@ fn now_ms() -> u128 {
         .as_millis()
 }
 
+/// `Debug` because the tests assert on `Result<_, ApiError>`; without it the
+/// crate's own test build does not compile.
+#[derive(Debug)]
 struct ApiError(StatusCode, String);
 impl ApiError {
     fn bad_request(s: &str) -> Self {
@@ -1682,6 +1906,62 @@ mod tests {
         assert_eq!(restored.probe_session_id.as_deref(), Some("probe-1"));
         assert_eq!(restored.models.len(), 1);
         assert!(restored.usage.is_none());
+    }
+
+    /// Claude Code runs in its programmatic mode, never in the TUI. The four
+    /// protocol flags are the contract Core's `cli_bridge` parses: without them
+    /// the session emits ANSI frames, and nothing in the stream says whether the
+    /// turn is over.
+    #[test]
+    fn a_claude_session_is_started_in_the_programmatic_mode() {
+        let fresh = claude_args(None, false, Some("s-1"), Some("sonnet"), &[]).expect("args");
+        for flag in [
+            "--print",
+            "--output-format=stream-json",
+            "--input-format=stream-json",
+            "--verbose",
+        ] {
+            assert!(fresh.contains(&flag.to_string()), "{flag} is missing");
+        }
+        assert_eq!(fresh.windows(2).find(|w| w[0] == "--model").expect("model")[1], "sonnet");
+        assert_eq!(
+            fresh
+                .windows(2)
+                .find(|w| w[0] == "--session-id")
+                .expect("session id")[1],
+            "s-1"
+        );
+
+        // Resuming names the session the vendor already knows; forking names
+        // both, and refuses without an id for the fork.
+        let resumed = claude_args(Some("s-1"), false, None, None, &[]).expect("args");
+        assert!(resumed.contains(&"--resume".to_string()));
+        assert!(!resumed.contains(&"--session-id".to_string()));
+        let forked = claude_args(Some("s-1"), true, Some("s-2"), None, &[]).expect("args");
+        assert!(forked.contains(&"--fork-session".to_string()));
+        assert!(claude_args(Some("s-1"), true, None, None, &[]).is_err());
+        assert!(claude_args(None, false, None, None, &[]).is_err());
+
+        // The caller's own arguments come last and are passed through as given.
+        let wired = claude_args(None, false, Some("s-1"), None, &["-c".into(), "x=1".into()])
+            .expect("args");
+        assert_eq!(&wired[wired.len() - 2..], &["-c".to_string(), "x=1".to_string()]);
+    }
+
+    /// Caller-supplied arguments reach `execve` directly, so they are bounded
+    /// exactly like the environment is.
+    #[test]
+    fn caller_arguments_are_bounded_before_they_reach_a_process() {
+        assert_eq!(
+            validated_args(&["-c".to_string(), "model_provider=tfadapter".to_string()])
+                .expect("plain arguments are accepted"),
+            vec!["-c".to_string(), "model_provider=tfadapter".to_string()]
+        );
+        assert!(validated_args(&[String::new()]).is_err());
+        assert!(validated_args(&["a\nb".to_string()]).is_err());
+        assert!(validated_args(&["a\0b".to_string()]).is_err());
+        assert!(validated_args(&["x".repeat(4096)]).is_err());
+        assert!(validated_args(&vec!["-c".to_string(); 33]).is_err());
     }
 
     #[test]

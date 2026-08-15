@@ -32,7 +32,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::db::models::{AgentRunStatusUpdate, DbAgentRun, NewAgentRun};
 use crate::db::{repository, DbPool};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, TokenUsage};
 use crate::flow_engine::progress_broker::ProgressBroker;
 
 use super::catalog::tool_in_allowlist;
@@ -132,14 +132,28 @@ enum WatchOutcome {
     NotInRegistry,
 }
 
+/// What one harness flow produced: the answer, and what it cost.
+///
+/// The accounting travels with the text because the run row is settled in one
+/// place — a caller that has to ask a second layer "and how many tokens was
+/// that?" ends up writing zeros, which is precisely what happened while this
+/// carried a bare `String`.
+pub struct AgentFlowOutcome {
+    pub text: String,
+    pub usage: TokenUsage,
+    /// Model the flow's last LLM call resolved to, `None` for a flow that
+    /// called none.
+    pub model: Option<String>,
+}
+
 /// Runs the agent harness flow that backs one background run. Abstracted so the
 /// manager's orchestration (semaphore, watch, cancel, heartbeat) is unit-testable
 /// without a live `FlowDispatcher`. The production impl is `FlowDispatcherRunner`.
 #[async_trait]
 pub trait BackgroundFlowRunner: Send + Sync {
     /// Runs `flow_id` with `initial` as the trigger input under `principal`,
-    /// governed by `deadline` and `cancel`. Returns the final answer text. The
-    /// `agent_run_id` already lives in `initial.meta`, so the harness flow's
+    /// governed by `deadline` and `cancel`. Returns the final answer and what it
+    /// cost. The `agent_run_id` already lives in `initial.meta`, so the harness flow's
     /// `agent_context` reuses the manager-created row instead of opening a new
     /// one. `progress` is the run-scoped sink the harness emits node/tool events
     /// to; `scope` is the run id broadcast key.
@@ -152,7 +166,7 @@ pub trait BackgroundFlowRunner: Send + Sync {
         cancel: CancellationToken,
         progress: Arc<dyn ProgressSink>,
         scope: String,
-    ) -> Result<String>;
+    ) -> Result<AgentFlowOutcome>;
 }
 
 /// Shared slot owning a run's concurrency permit. `agent_wait` takes the permit
@@ -1204,14 +1218,21 @@ async fn run_task(ctx: TaskContext) {
         )
         .await;
 
+    // The accounting is settled from whatever the flow reported, INDEPENDENT of
+    // the status: a cancelled run still burned the tokens it burned, and a row
+    // that reports the work but not its cost cannot be billed.
+    let (usage, model) = match &outcome {
+        Ok(flow) => (Some(flow.usage), flow.model.clone()),
+        Err(_) => (None, None),
+    };
     let (final_status, exit_reason, result_text) = if cancel.is_cancelled() {
         (RunStatus::Cancelled, "cancelled".to_string(), None)
     } else {
         match outcome {
-            Ok(text) => (
+            Ok(flow) => (
                 RunStatus::Completed,
                 "final_response".to_string(),
-                Some(text),
+                Some(flow.text),
             ),
             Err(e) => (RunStatus::Failed, format!("error:{e}"), None),
         }
@@ -1224,6 +1245,10 @@ async fn run_task(ctx: TaskContext) {
             status: final_status.as_str(),
             result: result_text.as_deref(),
             exit_reason: Some(&exit_reason),
+            total_tokens: usage.map(|u| u.total_tokens as i64),
+            prompt_tokens: usage.map(|u| u.prompt_tokens as i64),
+            completion_tokens: usage.map(|u| u.completion_tokens as i64),
+            model: model.as_deref(),
             set_finished: true,
             ..Default::default()
         },
@@ -1485,7 +1510,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
         cancel: CancellationToken,
         progress: Arc<dyn ProgressSink>,
         scope: String,
-    ) -> Result<String> {
+    ) -> Result<AgentFlowOutcome> {
         let dispatcher = self
             .dispatcher
             .upgrade()
@@ -1514,12 +1539,16 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
         if let Some(err) = outcome.error {
             return Err(anyhow!("agent flow failed: {err}"));
         }
-        Ok(outcome
-            .final_envelope
-            .payload
-            .as_text()
-            .unwrap_or("")
-            .to_string())
+        Ok(AgentFlowOutcome {
+            text: outcome
+                .final_envelope
+                .payload
+                .as_text()
+                .unwrap_or("")
+                .to_string(),
+            usage: outcome.usage,
+            model: outcome.model,
+        })
     }
 }
 
@@ -1658,7 +1687,7 @@ mod tests {
             cancel: CancellationToken,
             _progress: Arc<dyn ProgressSink>,
             scope: String,
-        ) -> Result<String> {
+        ) -> Result<AgentFlowOutcome> {
             if self.honor_cancel {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(anyhow!("cancelled")),
@@ -1667,7 +1696,11 @@ mod tests {
             } else {
                 self.gate.wait().await;
             }
-            Ok(format!("result-of-{scope}"))
+            Ok(AgentFlowOutcome {
+                text: format!("result-of-{scope}"),
+                usage: TokenUsage::default(),
+                model: None,
+            })
         }
     }
 
@@ -1684,8 +1717,12 @@ mod tests {
             _cancel: CancellationToken,
             _progress: Arc<dyn ProgressSink>,
             scope: String,
-        ) -> Result<String> {
-            Ok(format!("done-{scope}"))
+        ) -> Result<AgentFlowOutcome> {
+            Ok(AgentFlowOutcome {
+                text: format!("done-{scope}"),
+                usage: TokenUsage::default(),
+                model: None,
+            })
         }
     }
 

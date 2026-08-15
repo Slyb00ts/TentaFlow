@@ -13,6 +13,7 @@ use std::time::{Duration, Instant};
 
 use serde_json::Value;
 
+use crate::code_studio::cli_bridge::{turn_state, BridgeEvent, TurnState};
 use crate::services::transport::Transport;
 use crate::services_repo::services::ServiceRow;
 
@@ -336,10 +337,35 @@ pub async fn execute_chat(
                     output.push_str(text);
                     received_output = true;
                 }
-            } else if kind == "codex" {
+            } else if kind == "codex" || kind == "claude" {
                 collect_agent_text(&data, &mut output);
                 received_output = !output.is_empty();
-                completed |= data.to_string().contains("turn/completed");
+                // The end of the turn is read by the one function that knows
+                // both vendors' vocabularies, so a chat request and a Code
+                // Studio delegation cannot disagree about whether a turn
+                // finished — and a failed turn is not answered with the text it
+                // managed to produce before failing.
+                let structured = match kind {
+                    "claude" => Some(BridgeEvent::StreamObject {
+                        seq: 0,
+                        object: data.clone(),
+                    }),
+                    _ => data
+                        .get("method")
+                        .and_then(Value::as_str)
+                        .map(|method| BridgeEvent::Notification {
+                            seq: 0,
+                            method: method.to_string(),
+                            params: data.get("params").cloned().unwrap_or(Value::Null),
+                        }),
+                };
+                match structured.as_ref().and_then(turn_state) {
+                    Some(TurnState::Completed) => completed = true,
+                    Some(TurnState::Failed(reason)) => {
+                        return Err(format!("coding-agent turn failed: {reason}"))
+                    }
+                    None => {}
+                }
             }
         }
         if completed

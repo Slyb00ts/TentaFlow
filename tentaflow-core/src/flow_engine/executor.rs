@@ -23,7 +23,7 @@ use crate::flow_engine::envelope::{
     GenPerf, NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
 use crate::flow_engine::io_mapping;
-use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::types::FlowNode;
 
 const MAX_NODES_PER_EXECUTION: usize = 256;
@@ -289,6 +289,7 @@ pub async fn execute_blocking(
         final_envelope,
         trace,
         usage: aggregate_usage,
+        model: ctx.usage_sink.model(),
         perf: None,
         finish_reason,
         total_latency_ms,
@@ -371,6 +372,7 @@ pub async fn execute_direct_blocking(
         final_envelope,
         trace,
         usage: aggregate_usage,
+        model: ctx.usage_sink.model(),
         perf: None,
         finish_reason: FinishReason::Stop,
         total_latency_ms: started.elapsed().as_millis() as i64,
@@ -439,6 +441,7 @@ pub async fn execute_direct_streaming(
         cancel,
         FinalizerInputs {
             started,
+            usage_sink: ctx.usage_sink.clone(),
             producer_step_started,
             producer_node_id: node.id.clone(),
             producer_node_type: node.node_type.clone(),
@@ -1612,6 +1615,7 @@ pub async fn execute_streaming(
         cancel,
         FinalizerInputs {
             started,
+            usage_sink: ctx.usage_sink.clone(),
             producer_step_started,
             producer_node_id,
             producer_node_type,
@@ -1889,6 +1893,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
                 final_envelope: (*ctx.initial_envelope).clone(),
                 trace,
                 usage: TokenUsage::default(),
+                model: ctx.usage_sink.model(),
                 perf: last_perf,
                 finish_reason: finish,
                 total_latency_ms: started.elapsed().as_millis() as i64,
@@ -2011,6 +2016,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         final_envelope: (*final_arc).clone(),
         trace,
         usage: aggregate_usage,
+        model: ctx.usage_sink.model(),
         perf: last_perf,
         finish_reason,
         total_latency_ms: started.elapsed().as_millis() as i64,
@@ -2022,6 +2028,9 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
 
 struct FinalizerInputs {
     started: Instant,
+    /// Shared with the executing flow: the finalizer settles the outcome, so it
+    /// is the place that has to name the model the tokens were spent on.
+    usage_sink: Arc<UsageSink>,
     producer_step_started: u64,
     producer_node_id: String,
     producer_node_type: String,
@@ -2212,6 +2221,7 @@ async fn finalize_streaming_flow(
         final_envelope,
         trace: inputs.trace,
         usage: aggregate_usage,
+        model: inputs.usage_sink.model(),
         perf: last_perf,
         finish_reason,
         total_latency_ms,

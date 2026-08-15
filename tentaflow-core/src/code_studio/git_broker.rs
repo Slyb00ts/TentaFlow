@@ -1091,6 +1091,35 @@ impl Broker {
         })
     }
 
+    /// Brings a session worktree's INDEX to a commit without writing a single
+    /// byte into the working tree.
+    ///
+    /// A commit is assembled in a temporary index (§11.5), so the worktree's own
+    /// index still describes the pre-commit blobs when the reference has already
+    /// moved: `git status` then reports a file byte-identical to `HEAD` as both
+    /// staged and modified, while `git diff HEAD` is empty. The agent reads that
+    /// status on its next turn and concludes its own finished work is unfinished.
+    ///
+    /// `read-tree` WITHOUT `-u` is the whole point: the index moves to the new
+    /// head, the disk is untouched, so a file the agent changed outside the
+    /// accepted set stays an unstaged modification and remains the material of
+    /// the next patch set, exactly as §11.5 requires.
+    pub fn sync_worktree_index(&self, session_id: &str, commit: &str) -> Result<()> {
+        validate_oid(commit)?;
+        let handle = self.session(session_id)?;
+        let out = self.run(Some(&handle), &["read-tree", commit], &GitAuth::None)?;
+        ok_or_stderr(out, "git read-tree")?;
+        // `update-index --refresh` only repopulates the stat cache so later
+        // status calls stay cheap. It exits non-zero for every path that really
+        // does differ from the index — that is its answer, not a failure.
+        self.run(
+            Some(&handle),
+            &["update-index", "--refresh", "-q"],
+            &GitAuth::None,
+        )?;
+        Ok(())
+    }
+
     /// Value of a reference, or `None` when it does not exist.
     pub fn read_ref(&self, handle: &RepoHandle, ref_name: &str) -> Result<Option<String>> {
         validate_ref_name(ref_name)?;
@@ -1821,6 +1850,24 @@ impl TempIndex {
 impl Drop for TempIndex {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Refreshes a session index for a commit that is ALREADY published.
+///
+/// The failure is logged rather than raised on purpose: `update-ref` has already
+/// moved the branch and cannot be taken back, so turning a stale index into a
+/// tool error would report a landed commit as failed and send the agent into a
+/// retry whose compare-and-swap can only fail. A stale index is a wrong status,
+/// a retracted commit is a wrong history.
+pub fn sync_worktree_index_after_commit(broker: &Broker, session_id: &str, commit: &str) {
+    if let Err(error) = broker.sync_worktree_index(session_id, commit) {
+        tracing::warn!(
+            %session_id,
+            %commit,
+            error = %error,
+            "the session index still describes the pre-commit tree"
+        );
     }
 }
 
@@ -2809,6 +2856,70 @@ mod tests {
             broker.status("s-1").unwrap(),
             before,
             "the snapshot changed what the agent's own index reports"
+        );
+    }
+
+    /// A commit is built in a temporary index, so nothing moves the session's
+    /// own index unless we do it — and a stale index makes `git status` report a
+    /// file identical to `HEAD` as changed. The next turn of the agent reads
+    /// that and redoes work it already finished.
+    #[test]
+    fn a_committed_file_is_clean_afterwards_while_the_rest_of_the_tree_survives() {
+        require_git();
+        let dir = tempfile::tempdir().unwrap();
+        let broker = Broker::at(dir.path());
+        let root = broker.init_repository("main").unwrap();
+        let readme = commit_file(
+            &broker,
+            "main",
+            &root.head_commit,
+            Some(&root.head_commit),
+            "README.md",
+            "one\n",
+        );
+        let base = commit_file(
+            &broker,
+            "main",
+            &readme.commit_oid,
+            Some(&readme.commit_oid),
+            "other.txt",
+            "keep\n",
+        );
+        broker
+            .add_session_worktree("s-1", "cs/u/s1", "main")
+            .unwrap();
+        let handle = broker.session("s-1").unwrap();
+
+        // The agent edits two files; the review accepts exactly one of them.
+        std::fs::write(handle.work_tree.join("README.md"), "two\n").unwrap();
+        std::fs::write(handle.work_tree.join("other.txt"), "work in progress\n").unwrap();
+        let commit = commit_file(
+            &broker,
+            "cs/u/s1",
+            &base.commit_oid,
+            Some(&base.commit_oid),
+            "README.md",
+            "two\n",
+        );
+        broker.sync_worktree_index("s-1", &commit.commit_oid).unwrap();
+
+        let status = broker.status("s-1").unwrap();
+        assert!(
+            !status.iter().any(|entry| entry.ends_with("README.md")),
+            "the committed file is still reported as changed: {status:?}"
+        );
+        // `status` trims the porcelain block, so the leading index column of the
+        // first entry is gone; ` M` (unstaged modification) reads as `M`.
+        assert!(
+            status
+                .iter()
+                .any(|entry| entry.trim_start() == "M other.txt"),
+            "the uncommitted edit disappeared from the worktree: {status:?}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(handle.work_tree.join("other.txt")).unwrap(),
+            "work in progress\n",
+            "the index refresh overwrote a file on disk"
         );
     }
 

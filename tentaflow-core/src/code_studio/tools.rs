@@ -37,7 +37,10 @@ use super::artifacts;
 use super::events::{self, EventPayload, GitOperation, SessionEvent};
 use super::exec::{ExecEnv, ExecRequest, Executor, NullSink, Program};
 use super::fs::{self, GrepQuery, LineRange, Precondition as FsPrecondition, RelPath, SessionRoot};
-use super::git_broker::{Broker, CommitIdentity, CommitSpec, GitAuth, MergeOutcome, RepoHandle};
+use super::git_broker::{
+    sync_worktree_index_after_commit, Broker, CommitIdentity, CommitSpec, GitAuth, MergeOutcome,
+    RepoHandle,
+};
 use super::index::{CodeIndex, CodeSearchOutcome};
 use super::models::{AutonomyMode, WorkspaceRecord, WorkspaceRole};
 use super::operations::{
@@ -61,6 +64,10 @@ pub const SESSION_META_KEY: &str = "code_session";
 /// block's `max_result_chars`. Applied to the rendered JSON so an oversized
 /// grep or command output cannot blow the turn.
 pub const MAX_RESULT_CHARS: usize = 16_000;
+
+/// How much of one tool argument reaches the timeline. A `fs_write` carries a
+/// whole file and the event stream is a log, not a copy of the worktree.
+const TOOL_ARGUMENT_CHARS: usize = 256;
 
 /// Ceiling on one `core.exec` run when the model names no timeout.
 const DEFAULT_EXEC_TIMEOUT_SECS: u64 = 300;
@@ -260,6 +267,12 @@ pub async fn execute(ctx: &ToolCallCtx<'_>, tool: CoreToolName, args: &Value) ->
     let bound = bind(ctx).await?;
     let capability = capability_of(tool)
         .ok_or_else(|| anyhow!("'{}' is not a Code Studio tool", tool.public_name()))?;
+    // The call goes on the timeline BEFORE the PEP runs: a refusal is a thing
+    // the agent tried, and a result row alone carries no tool name — three
+    // anonymous "tool result" lines tell nobody what the session did. It is
+    // emitted only past the point where every exit below also emits a RESULT,
+    // so no row is left waiting for an outcome that never arrives.
+    emit_tool_call_event(&bound, ctx, tool, args);
 
     // The authorization target: what the PEP is being asked about. It is derived
     // from the arguments here, ONCE, and reused for the grant-pattern match, so
@@ -1913,6 +1926,7 @@ async fn git_commit_call(ctx: &ToolCallCtx<'_>, bound: &Bound, args: &Value) -> 
         // probe identifies the commit by tree, parent and the branch head, and
         // it can only look for an id somebody wrote down.
         operations::record_oids(&pool, &op_id_for_task, &[commit.commit_oid.clone()])?;
+        sync_worktree_index_after_commit(&broker, &session_id, &commit.commit_oid);
         patch::mark_consumed(&pool, &patch_set_id, &commit)?;
         Ok(json!({
             "commit": commit.commit_oid,
@@ -2632,6 +2646,46 @@ fn settle_operation(
         }
     }
     Ok(())
+}
+
+/// Puts the invocation itself on the session timeline (§10).
+///
+/// Arguments never travel raw: a write carries file content and a git call can
+/// carry a URL with credentials in it. `events::append` scrubs them too, but the
+/// scrub happens HERE FIRST because the cut below would otherwise split a secret
+/// in half and leave the remaining fragment unmatched by the scrubber. A
+/// non-string value is rendered as JSON, which is what the reader of the event
+/// expects for a list or an object.
+fn emit_tool_call_event(bound: &Bound, ctx: &ToolCallCtx<'_>, tool: CoreToolName, args: &Value) {
+    let arguments: BTreeMap<String, String> = args
+        .as_object()
+        .map(|obj| {
+            obj.iter()
+                .map(|(key, value)| {
+                    let rendered = match value {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    (
+                        key.clone(),
+                        truncate(&redact::redact_text(&rendered), TOOL_ARGUMENT_CHARS),
+                    )
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut event = SessionEvent::new(
+        format!("tool-call:{}", ctx.tool_call_id),
+        EventPayload::ToolCall {
+            call_id: ctx.tool_call_id.to_string(),
+            tool: tool.public_name().to_string(),
+            arguments,
+        },
+    );
+    if let Some(run_id) = ctx.run_id {
+        event = event.with_run(run_id);
+    }
+    let _ = events::append(&bound.pool, &bound.session.id, event);
 }
 
 fn emit_tool_event(bound: &Bound, ctx: &ToolCallCtx<'_>, ok: bool, summary: &str) {

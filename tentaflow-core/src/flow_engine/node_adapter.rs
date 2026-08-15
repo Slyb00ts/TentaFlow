@@ -30,6 +30,10 @@ use crate::flow_engine::blob_store::BlobStore;
 #[derive(Default)]
 pub struct UsageSink {
     inner: Mutex<Vec<(String, TokenUsage)>>,
+    /// Model the LLM adapter resolved for this run, in call order. The tokens
+    /// alone do not say what spent them, and the caller settling a run (an agent
+    /// run row, a Code Studio turn) has to record both.
+    models: Mutex<Vec<String>>,
 }
 
 impl UsageSink {
@@ -47,6 +51,24 @@ impl UsageSink {
     /// stan (executor woła to per-node po execute żeby dorzucić do TraceStep).
     pub fn snapshot(&self) -> Vec<(String, TokenUsage)> {
         self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Records the model an LLM call resolved to, at request-build time — the
+    /// only moment both the node config and the envelope fallback have been
+    /// applied, and the moment the streaming path shares with the blocking one.
+    pub fn record_model(&self, model: impl Into<String>) {
+        if let Ok(mut g) = self.models.lock() {
+            let model = model.into();
+            if g.last() != Some(&model) {
+                g.push(model);
+            }
+        }
+    }
+
+    /// The model of the LAST call. A flow may chain several, and the one that
+    /// produced the answer is the one worth naming on the run.
+    pub fn model(&self) -> Option<String> {
+        self.models.lock().ok().and_then(|g| g.last().cloned())
     }
 
     /// Suma wszystkich token usage zarejestrowanych do tej pory.

@@ -33,7 +33,9 @@ use crate::code_studio::egress;
 use crate::code_studio::events::{EventPayload, GitOperation, SessionEvent};
 use crate::code_studio::exec::{ExecEnv, ExecRequest, Executor, NullSink, Program};
 use crate::code_studio::fs::{GrepQuery, LineRange, RelPath, SessionRoot};
-use crate::code_studio::git_broker::{Broker, CommitIdentity, GitAuth, MergeOutcome, RepoHandle};
+use crate::code_studio::git_broker::{
+    sync_worktree_index_after_commit, Broker, CommitIdentity, GitAuth, MergeOutcome, RepoHandle,
+};
 use crate::code_studio::models::{
     AutonomyMode, EgressEnforcement, ExecMode, NewWorkspace, WorkspaceRecord, WorkspaceRole,
     WorkspaceStatus,
@@ -4571,6 +4573,7 @@ fn commit_accepted_blobs(
         &[outcome.commit_oid.clone(), outcome.tree_oid.clone()],
     )
     .map_err(|e| db_error("record_oids", e))?;
+    sync_worktree_index_after_commit(&broker, &scope.session.id, &outcome.commit_oid);
     patch::mark_consumed(&scope.pool, set_id, &outcome)
         .map_err(|e| db_error("mark_consumed", e))?;
     complete_op(scope, &op_id, &[outcome.commit_oid.clone()], None)?;
@@ -6470,12 +6473,17 @@ fn watch_session_run(
     let session_id = session_id.to_string();
     let run_id = run_id.to_string();
     tokio::spawn(async move {
-        let (status, error) = match manager.await_run(&run_id, RUN_WATCH_TIMEOUT).await {
+        let (status, error, accounting) = match manager.await_run(&run_id, RUN_WATCH_TIMEOUT).await
+        {
             Ok(run) => {
                 let error = run
                     .exit_reason
                     .filter(|reason| reason.starts_with("error:"));
-                (run.status, error)
+                // §17.3 — what the turn cost, taken from the run the manager
+                // settled. The harness is the only measurer of the native path,
+                // so a row that does not copy it here has no other source.
+                let accounting = (run.prompt_tokens, run.completion_tokens, run.model);
+                (run.status, error, accounting)
             }
             // The run outlived the watcher or vanished with its process. Either
             // way the row cannot be closed on evidence, so it is left as it is.
@@ -6490,10 +6498,12 @@ fn watch_session_run(
             };
             // Never overwrite a decision somebody already made: a cancelled run
             // stays cancelled even if the manager reports it finished.
+            let (prompt_tokens, completion_tokens, model) = accounting;
             if let Err(e) = conn.execute(
-                "UPDATE session_runs SET status = ?2, finished_at = datetime('now') \
+                "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
+                   prompt_tokens = ?3, completion_tokens = ?4, model = ?5 \
                  WHERE run_id = ?1 AND status NOT IN ('completed','failed','cancelled')",
-                rusqlite::params![run_id, status],
+                rusqlite::params![run_id, status, prompt_tokens, completion_tokens, model],
             ) {
                 tracing::warn!(run_id, error = %e, "code studio: cannot close a run row");
                 return;
@@ -6546,8 +6556,8 @@ fn session_runs_v1(
                 note: None,
                 started_at: row.get(7)?,
                 finished_at: row.get(8)?,
-                // Written where the tokens are spent (§17.3): the AI gateway
-                // for a harness turn, the adapter for a delegated CLI run.
+                // §17.3 — copied onto the row when the run settles: the flow
+                // measures a harness turn, the adapter a delegated CLI run.
                 prompt_tokens: row.get::<_, i64>(9)?.max(0) as u64,
                 completion_tokens: row.get::<_, i64>(10)?.max(0) as u64,
                 model: row.get(11)?,
