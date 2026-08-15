@@ -1,5 +1,7 @@
+mod process;
+
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env,
     io::{Read, Write},
     path::{Path, PathBuf},
@@ -41,6 +43,13 @@ struct SessionMeta {
     status: String,
     #[serde(default)]
     model: Option<String>,
+    /// Whether this session's CLI was started with caller-supplied wiring
+    /// (§7.5). Only the FACT is persisted: the wiring carries a ticket, which
+    /// is a bearer secret that dies with its run and has no business in a state
+    /// file. A wired session therefore cannot be lazily re-spawned after a
+    /// bridge restart — see `start_turn`.
+    #[serde(default)]
+    env_wired: bool,
     created_at_ms: u128,
 }
 
@@ -68,18 +77,22 @@ struct AppState {
     workspace_root: PathBuf,
     state_file: PathBuf,
     probe_file: PathBuf,
+    models_file: PathBuf,
     probe: Arc<Mutex<ProbeCache>>,
     /// Serializes every probe. Held across the whole CLI interaction, so
     /// concurrent callers queue up and the second one finds the cache filled
     /// instead of starting a second session.
     probe_lock: Arc<Mutex<()>>,
     sessions: Arc<Mutex<HashMap<String, Session>>>,
+    processes: Arc<process::Registry>,
 }
 
-/// Asking Claude Code what models or limits it has means driving an interactive
-/// session — there is no non-interactive listing. Two things keep that from
-/// piling up in the user's session history: answers are cached, and every probe
-/// reuses ONE session id instead of minting a fresh UUID.
+/// Asking Claude Code for its rate limits means driving an interactive session —
+/// there is no non-interactive readout. Two things keep that from piling up in
+/// the user's session history: answers are cached, and every probe reuses ONE
+/// session id instead of minting a fresh UUID. The model list does not appear
+/// here at all any more: it is configuration (see `configured_claude_models`),
+/// because a list that costs a vendor session is not a list worth having.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 struct ProbeCache {
     #[serde(default)]
@@ -113,7 +126,15 @@ struct CodexRuntime {
     thread_id: String,
     stdin: Arc<Mutex<ChildStdin>>,
     pending: Arc<SyncMutex<HashMap<u64, oneshot::Sender<Value>>>>,
+    /// Server→client requests the app-server is BLOCKED on. A turn does not
+    /// continue until each of them is answered, so the set is what tells
+    /// `send_approval` that an id is real and `close_session` what it still owes
+    /// an answer to (defect D3 of §1.2).
+    approvals: Arc<SyncMutex<HashSet<u64>>>,
     next_id: AtomicU64,
+    /// Kept so the app-server is killed as a GROUP and reaped, not merely
+    /// dropped: `codex` starts helpers of its own.
+    handle: process::Handle,
     _child: Child,
 }
 
@@ -122,16 +143,10 @@ struct TerminalRuntime {
     ready: Arc<AtomicBool>,
     _master: Box<dyn MasterPty + Send>,
     child: Box<dyn portable_pty::Child + Send + Sync>,
-}
-
-impl Drop for TerminalRuntime {
-    fn drop(&mut self) {
-        // Dropping the PTY master does not terminate the CLI: it keeps running
-        // against a closed terminal. Without this every probe and every closed
-        // session would leave a live `claude`/`codex` process behind.
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
+    /// Pid record + group kill. Dropping the PTY master does not terminate the
+    /// CLI — it keeps running against a closed terminal — and killing the direct
+    /// child leaves everything the CLI spawned attached to nothing (D2).
+    handle: process::Handle,
 }
 
 #[derive(Deserialize)]
@@ -143,6 +158,15 @@ struct CreateSession {
     resume_vendor_session_id: Option<String>,
     #[serde(default)]
     fork: bool,
+    /// Environment the CLI process is started with, on top of the bridge's own.
+    ///
+    /// This is how Core points the CLI at its provider adapter and hands it a
+    /// ticket instead of a credential (plan §7.5): the base URL override, the
+    /// ticket as the API key and the session CA all arrive here. The bridge
+    /// does not interpret any of it — it is opaque wiring owned by the caller,
+    /// which is loopback-only Core.
+    #[serde(default)]
+    env: std::collections::BTreeMap<String, String>,
 }
 
 #[derive(Deserialize)]
@@ -194,18 +218,33 @@ async fn main() -> Result<()> {
     require_binary(provider)?;
     let state_file = data_dir.join("sessions.json");
     let probe_file = data_dir.join("probe-cache.json");
+    let models_file = data_dir.join("models.json");
     let sessions = load_sessions(&state_file)?;
     let probe = load_probe_cache(&probe_file);
     let workspace_root =
         std::fs::canonicalize(env::var("TENTAFLOW_WORKSPACE_ROOT").unwrap_or_else(|_| ".".into()))?;
+    // Before anything is served: a CLI from a crashed bridge still holds the
+    // workspace and its vendor session, and a second one started next to it
+    // would fight over both (D2).
+    let processes = process::Registry::new(&data_dir)?;
+    for orphan in processes.reap_orphans() {
+        eprintln!(
+            "coding-agent-bridge: orphan {} (pid {}) from a previous life is {}",
+            orphan.kind,
+            orphan.pid,
+            orphan.state.as_str()
+        );
+    }
     let state = AppState {
         provider,
         workspace_root,
         state_file,
         probe_file,
+        models_file,
         probe: Arc::new(Mutex::new(probe)),
         probe_lock: Arc::new(Mutex::new(())),
         sessions: Arc::new(Mutex::new(sessions)),
+        processes: Arc::new(processes),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -348,14 +387,18 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
     let id = format!("auth-{}", uuid::Uuid::new_v4());
     let events = Arc::new(SyncMutex::new(Vec::new()));
     let runtime = spawn_terminal(
-        state.provider,
-        None,
-        false,
-        &workspace,
+        TerminalSpawn {
+            provider: state.provider,
+            workspace: &workspace,
+            resume: None,
+            fork: false,
+            auth: true,
+            new_session_id: None,
+            model: None,
+            env: &[],
+        },
         events.clone(),
-        true,
-        None,
-        None,
+        &state.processes,
     )?;
     let meta = SessionMeta {
         id: id.clone(),
@@ -363,6 +406,7 @@ async fn auth_start(State(state): State<AppState>) -> Result<Json<Value>, ApiErr
         workspace,
         status: "authenticating".into(),
         model: None,
+        env_wired: false,
         created_at_ms: now_ms(),
     };
     state.sessions.lock().await.insert(
@@ -383,46 +427,63 @@ async fn list_sessions(State(state): State<AppState>) -> Json<Value> {
     )
 }
 
+/// Lists the models the engine can be asked for. **This call never creates a
+/// vendor session** (defect D1 of §1.2), and the two providers reach that the
+/// same promise by different routes:
+///
+///   * Codex answers `model/list` on the app-server, which is a process, not a
+///     thread — nothing appears in the user's history. The answer is still
+///     cached, because starting an app-server per call is waste, not a session.
+///   * Claude Code has no non-interactive listing at all: `/model` is a slash
+///     command inside a running session, and driving it is exactly what used to
+///     add ~12 sessions an hour. Until Phase 0B (§17.1 point 5) proves a
+///     session-free command exists, the list is CONFIGURATION — see
+///     `configured_claude_models`. `refresh=1` re-reads that file; it does not
+///     start a CLI.
 async fn list_models(
     State(state): State<AppState>,
     Query(query): Query<RefreshQuery>,
 ) -> Result<Json<Value>, ApiError> {
+    if state.provider == Provider::ClaudeCode {
+        let (models, source) = configured_claude_models(&state.models_file)?;
+        return Ok(Json(
+            json!({"models": models, "cached": true, "source": source}),
+        ));
+    }
     if !query.refresh && state.probe.lock().await.models_are_fresh(now_ms()) {
         let cache = state.probe.lock().await;
-        return Ok(Json(json!({"models": cache.models, "cached": true})));
+        return Ok(Json(
+            json!({"models": cache.models, "cached": true, "source": "cli"}),
+        ));
     }
     require_authenticated(state.provider).await?;
     let _probe = state.probe_lock.lock().await;
     // Whoever waited on the lock may have been waiting for the probe that just
-    // filled the cache; asking the CLI again would only add a session.
+    // filled the cache; asking the CLI again would only spend another process.
     if !query.refresh && state.probe.lock().await.models_are_fresh(now_ms()) {
         let cache = state.probe.lock().await;
-        return Ok(Json(json!({"models": cache.models, "cached": true})));
+        return Ok(Json(
+            json!({"models": cache.models, "cached": true, "source": "cli"}),
+        ));
     }
-    let models = match state.provider {
-        Provider::Codex => {
-            let events = Arc::new(SyncMutex::new(Vec::new()));
-            let runtime =
-                CodexRuntime::connect(&state.workspace_root.to_string_lossy(), events).await?;
-            let response = runtime
-                .request("model/list", json!({"includeHidden": false}))
-                .await?;
-            let result = response.get("result").unwrap_or(&response);
-            result
-                .get("models")
-                .or_else(|| result.get("data"))
-                .and_then(Value::as_array)
-                .cloned()
-                .ok_or_else(|| ApiError::internal("codex model/list did not return an array"))?
-        }
-        Provider::ClaudeCode => {
-            claude_probe(&state, "/model\r", 10, |raw| {
-                let models = parse_claude_models(raw);
-                (!models.is_empty()).then_some(models)
-            })
-            .await?
-        }
-    };
+    let events = Arc::new(SyncMutex::new(Vec::new()));
+    let runtime = CodexRuntime::connect(
+        &state.workspace_root.to_string_lossy(),
+        &[],
+        events,
+        &state.processes,
+    )
+    .await?;
+    let response = runtime
+        .request("model/list", json!({"includeHidden": false}))
+        .await?;
+    let result = response.get("result").unwrap_or(&response);
+    let models = result
+        .get("models")
+        .or_else(|| result.get("data"))
+        .and_then(Value::as_array)
+        .cloned()
+        .ok_or_else(|| ApiError::internal("codex model/list did not return an array"))?;
     {
         let mut cache = state.probe.lock().await;
         cache.models = models.clone();
@@ -431,7 +492,72 @@ async fn list_models(
     if let Err(error) = persist_probe_cache(&state).await {
         eprintln!("coding-agent-bridge: probe cache write failed: {error}");
     }
-    Ok(Json(json!({"models": models, "cached": false})))
+    Ok(Json(
+        json!({"models": models, "cached": false, "source": "cli"}),
+    ))
+}
+
+/// Model aliases the pinned Claude Code release accepts on `--model`. They are
+/// aliases rather than dated ids on purpose: the alias is what the CLI resolves
+/// against the account's entitlements, so it stays correct when the vendor ships
+/// a new snapshot, and it is byte for byte what the previous screen-scraper
+/// produced — the ids already stored in `models` do not move.
+const CLAUDE_CODE_PINNED_VERSION: &str = "2.1.221";
+const CLAUDE_CODE_MODEL_ALIASES: [(&str, &str, bool); 4] = [
+    ("opus", "Opus", false),
+    ("sonnet", "Sonnet", true),
+    ("haiku", "Haiku", false),
+    ("opusplan", "Opus plan / Sonnet execute", false),
+];
+
+/// The configured Claude Code catalog: the operator's `models.json` when the
+/// deployment has one, otherwise the aliases of the pinned release.
+///
+/// This is deliberately not a probe. The honest statement is in the return
+/// value: `source` says `file` or `pinned:<version>`, so nobody reads this list
+/// as "what the CLI reported". An entitlement the account does not have fails at
+/// the turn, where the vendor's own error is the accurate answer — that is
+/// strictly better than minting a session per refresh to find out.
+fn configured_claude_models(models_file: &Path) -> Result<(Vec<Value>, String), ApiError> {
+    match std::fs::read(models_file) {
+        Ok(bytes) => {
+            let parsed: Vec<Value> = serde_json::from_slice(&bytes).map_err(|error| {
+                ApiError::internal(&format!(
+                    "{} is not a JSON array of models: {error}",
+                    models_file.display()
+                ))
+            })?;
+            if parsed.is_empty() {
+                return Err(ApiError::internal(&format!(
+                    "{} lists no models",
+                    models_file.display()
+                )));
+            }
+            for model in &parsed {
+                let id = model.get("id").and_then(Value::as_str).unwrap_or_default();
+                if id.is_empty() || id.len() > 256 || id.chars().any(char::is_control) {
+                    return Err(ApiError::internal(&format!(
+                        "{} contains a model without a usable id",
+                        models_file.display()
+                    )));
+                }
+            }
+            Ok((parsed, "file".to_string()))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok((
+            CLAUDE_CODE_MODEL_ALIASES
+                .iter()
+                .map(|(id, display_name, selected)| {
+                    json!({"id": id, "display_name": display_name, "selected": selected})
+                })
+                .collect(),
+            format!("pinned:{CLAUDE_CODE_PINNED_VERSION}"),
+        )),
+        Err(error) => Err(ApiError::internal(&format!(
+            "cannot read {}: {error}",
+            models_file.display()
+        ))),
+    }
 }
 
 async fn usage(
@@ -459,8 +585,13 @@ async fn usage(
     let usage = match state.provider {
         Provider::Codex => {
             let events = Arc::new(SyncMutex::new(Vec::new()));
-            let runtime =
-                CodexRuntime::connect(&state.workspace_root.to_string_lossy(), events).await?;
+            let runtime = CodexRuntime::connect(
+                &state.workspace_root.to_string_lossy(),
+                &[],
+                events,
+                &state.processes,
+            )
+            .await?;
             let response = runtime
                 .request("account/rateLimits/read", Value::Null)
                 .await?;
@@ -469,7 +600,23 @@ async fn usage(
                 .ok_or_else(|| ApiError::internal("Codex usage response has no result"))?;
             normalize_codex_usage(result)
         }
-        Provider::ClaudeCode => claude_probe(&state, "/usage\r", 15, parse_claude_usage).await?,
+        Provider::ClaudeCode => {
+            // `/usage` is a slash command, so reading it means being IN a
+            // session. That cost is only ever paid on an explicit request: a
+            // caller that merely wants to display limits gets the honest
+            // "unavailable" instead of a session created behind the user's back.
+            if !query.refresh {
+                return Ok(Json(json!({
+                    "available": false,
+                    "reason": "claude_code_usage_needs_a_session",
+                    "detail": "Claude Code reports rate limits only through the /usage slash \
+                               command inside a running session. Ask again with refresh=1 to \
+                               accept that one session in the vendor history.",
+                    "updated_at_ms": now_ms(),
+                })));
+            }
+            claude_probe(&state, "/usage\r", 15, parse_claude_usage).await?
+        }
     };
     {
         let mut cache = state.probe.lock().await;
@@ -479,10 +626,10 @@ async fn usage(
     Ok(Json(usage))
 }
 
-/// Drives a Claude Code slash command in the **reused probe session**, so
-/// repeated discovery does not add an entry to the vendor's session history for
-/// every call. A probe id the CLI no longer knows falls back to a fresh session
-/// and is remembered for next time.
+/// Drives a Claude Code slash command in the **reused probe session**, so a
+/// repeated explicit read does not add an entry to the vendor's session history
+/// every time. A probe id the CLI no longer knows falls back to a fresh session
+/// and is remembered for next time. The only caller is `/usage?refresh=1`.
 async fn claude_probe<T>(
     state: &AppState,
     slash_command: &str,
@@ -523,14 +670,18 @@ async fn claude_slash_command<T>(
 ) -> Result<T, ApiError> {
     let events = Arc::new(SyncMutex::new(Vec::new()));
     let mut runtime = spawn_terminal(
-        state.provider,
-        resume,
-        false,
-        &state.workspace_root.to_string_lossy(),
+        TerminalSpawn {
+            provider: state.provider,
+            workspace: &state.workspace_root.to_string_lossy(),
+            resume,
+            fork: false,
+            auth: false,
+            new_session_id,
+            model: None,
+            env: &[],
+        },
         events.clone(),
-        false,
-        new_session_id,
-        None,
+        &state.processes,
     )?;
     runtime.wait_ready().await?;
     events.lock().clear();
@@ -700,6 +851,7 @@ async fn create_session(
         .as_deref()
         .map(|value| normalize_model_id(state.provider, value))
         .transpose()?;
+    let env = validated_env(&req.env)?;
     let id = uuid::Uuid::new_v4().to_string();
     let requested_vendor_id = if req.fork || req.resume_vendor_session_id.is_none() {
         uuid::Uuid::new_v4().to_string()
@@ -716,20 +868,26 @@ async fn create_session(
                 req.resume_vendor_session_id.as_deref(),
                 req.fork,
                 model.as_deref(),
+                &env,
                 events.clone(),
+                &state.processes,
             )
             .await?,
         ),
         Provider::ClaudeCode => {
             let mut runtime = spawn_terminal(
-                state.provider,
-                req.resume_vendor_session_id.as_deref(),
-                req.fork,
-                &workspace,
+                TerminalSpawn {
+                    provider: state.provider,
+                    workspace: &workspace,
+                    resume: req.resume_vendor_session_id.as_deref(),
+                    fork: req.fork,
+                    auth: false,
+                    new_session_id: Some(&requested_vendor_id),
+                    model: model.as_deref(),
+                    env: &env,
+                },
                 events.clone(),
-                false,
-                Some(&requested_vendor_id),
-                model.as_deref(),
+                &state.processes,
             )?;
             runtime.wait_ready().await?;
             Runtime::Terminal(runtime)
@@ -745,6 +903,7 @@ async fn create_session(
         workspace,
         status: "idle".into(),
         model,
+        env_wired: !env.is_empty(),
         created_at_ms: now_ms(),
     };
     state.sessions.lock().await.insert(
@@ -776,6 +935,16 @@ async fn start_turn(
         .get_mut(&id)
         .ok_or_else(|| ApiError::not_found("session not found"))?;
     if session.runtime.is_none() {
+        // A session started with caller-supplied wiring cannot be revived here:
+        // the wiring held a ticket, the ticket was never persisted, and a CLI
+        // brought back without it would talk to the provider through whatever
+        // credential this bridge's own environment happens to carry. The caller
+        // opens a new session — and mints a new ticket — instead.
+        if session.meta.env_wired {
+            return Err(ApiError::bad_request(
+                "this session was started with caller-supplied wiring, which is not persisted;                  open a new session",
+            ));
+        }
         session.runtime = Some(match state.provider {
             Provider::Codex => Runtime::Codex(
                 CodexRuntime::spawn(
@@ -783,20 +952,26 @@ async fn start_turn(
                     Some(&session.meta.vendor_session_id),
                     false,
                     session.meta.model.as_deref(),
+                    &[],
                     session.events.clone(),
+                    &state.processes,
                 )
                 .await?,
             ),
             Provider::ClaudeCode => {
                 let mut runtime = spawn_terminal(
-                    state.provider,
-                    Some(&session.meta.vendor_session_id),
-                    false,
-                    &session.meta.workspace,
+                    TerminalSpawn {
+                        provider: state.provider,
+                        workspace: &session.meta.workspace,
+                        resume: Some(&session.meta.vendor_session_id),
+                        fork: false,
+                        auth: false,
+                        new_session_id: None,
+                        model: session.meta.model.as_deref(),
+                        env: &[],
+                    },
                     session.events.clone(),
-                    false,
-                    None,
-                    session.meta.model.as_deref(),
+                    &state.processes,
                 )?;
                 runtime.wait_ready().await?;
                 Runtime::Terminal(runtime)
@@ -862,7 +1037,7 @@ async fn send_approval(
     match session.runtime.as_mut() {
         Some(Runtime::Codex(runtime)) => {
             runtime
-                .write(json!({"id": req.request_id, "result": {"decision": req.decision}}))
+                .answer_approval(req.request_id, &req.decision)
                 .await?;
         }
         _ => return Err(ApiError::bad_request("session does not use approvals")),
@@ -873,6 +1048,9 @@ async fn send_approval(
 /// Terminates the session's CLI process and forgets it. Without an explicit
 /// close, a login window or a finished session keeps its child alive for the
 /// lifetime of the bridge.
+///
+/// The reply carries the settled process state, so the caller can record
+/// `reaped` in `cli_instances` instead of assuming it (§5.3, D2).
 async fn close_session(
     State(state): State<AppState>,
     AxumPath(id): AxumPath<String>,
@@ -881,16 +1059,20 @@ async fn close_session(
         let mut sessions = state.sessions.lock().await;
         sessions.remove(&id)
     };
-    let existed = session.is_some();
-    if let Some(mut session) = session {
-        if let Some(Runtime::Terminal(runtime)) = session.runtime.as_mut() {
-            runtime.shutdown().await;
-        }
-    }
-    if existed {
-        persist(&state).await?;
-    }
-    Ok(Json(json!({"closed": existed})))
+    let Some(mut session) = session else {
+        return Ok(Json(json!({"closed": false})));
+    };
+    let state_after = match session.runtime.as_mut() {
+        Some(Runtime::Terminal(runtime)) => runtime.shutdown().await,
+        Some(Runtime::Codex(runtime)) => runtime.shutdown().await,
+        // A session whose runtime was never restarted after a bridge restart
+        // has nothing running; the process it once had was reaped at startup.
+        None => process::ProcessState::Reaped,
+    };
+    persist(&state).await?;
+    Ok(Json(
+        json!({"closed": true, "process_state": state_after.as_str()}),
+    ))
 }
 
 async fn list_events(
@@ -914,17 +1096,32 @@ async fn list_events(
 }
 
 impl CodexRuntime {
-    async fn connect(workspace: &str, events: Arc<SyncMutex<Vec<Event>>>) -> Result<Self> {
-        let mut child = Command::new("codex")
+    async fn connect(
+        workspace: &str,
+        env: &[(String, String)],
+        events: Arc<SyncMutex<Vec<Event>>>,
+        processes: &process::Registry,
+    ) -> Result<Self> {
+        let mut command = Command::new("codex");
+        command
             .arg("app-server")
+            .envs(env.iter().map(|(name, value)| (name, value)))
             .current_dir(workspace)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit())
             // A dropped runtime (finished probe, closed session) must take the
             // app-server with it; tokio kills and reaps it in the background.
-            .kill_on_drop(true)
-            .spawn()?;
+            .kill_on_drop(true);
+        // Its own group, so the sandboxed tools the app-server starts are
+        // reachable by one signal instead of being orphaned (D2).
+        #[cfg(unix)]
+        command.process_group(0);
+        let mut child = command.spawn()?;
+        let handle = processes.track(
+            "codex-app-server",
+            child.id().context("codex app-server has no pid")?,
+        );
         let stdin = Arc::new(Mutex::new(
             child.stdin.take().context("codex stdin missing")?,
         ));
@@ -932,7 +1129,9 @@ impl CodexRuntime {
         let pending = Arc::new(SyncMutex::<HashMap<u64, oneshot::Sender<Value>>>::new(
             HashMap::new(),
         ));
+        let approvals = Arc::new(SyncMutex::<HashSet<u64>>::new(HashSet::new()));
         let reader_pending = pending.clone();
+        let reader_approvals = approvals.clone();
         let reader_events = events.clone();
         tokio::spawn(async move {
             let mut lines = BufReader::new(stdout).lines();
@@ -950,7 +1149,10 @@ impl CodexRuntime {
                     // Server→client request. It BLOCKS the vendor turn until we
                     // answer, so it gets its own event kind carrying the id the
                     // operator has to answer on — as a plain `codex` event the
-                    // turn would wait forever.
+                    // turn would wait forever. The id is remembered so an answer
+                    // can be matched to a request that is really outstanding,
+                    // and so closing the session can settle the rest (D3).
+                    reader_approvals.lock().insert(id);
                     push_event(
                         &reader_events,
                         "approval_request",
@@ -969,7 +1171,9 @@ impl CodexRuntime {
             thread_id: String::new(),
             stdin,
             pending,
+            approvals,
             next_id: AtomicU64::new(1),
+            handle,
             _child: child,
         };
         runtime.request("initialize", json!({"clientInfo":{"name":"tentaflow","title":"TentaFlow","version":"0.1.0"},"capabilities":{"experimentalApi":true}})).await?;
@@ -982,9 +1186,11 @@ impl CodexRuntime {
         resume: Option<&str>,
         fork: bool,
         model: Option<&str>,
+        env: &[(String, String)],
         events: Arc<SyncMutex<Vec<Event>>>,
+        processes: &process::Registry,
     ) -> Result<Self> {
-        let mut runtime = Self::connect(workspace, events.clone()).await?;
+        let mut runtime = Self::connect(workspace, env, events.clone(), processes).await?;
         let response = if let Some(thread_id) = resume {
             let method = if fork { "thread/fork" } else { "thread/resume" };
             runtime
@@ -1020,6 +1226,51 @@ impl CodexRuntime {
     async fn notify(&self, method: &str, params: Value) -> Result<()> {
         self.write(json!({"method":method,"params":params})).await
     }
+
+    /// Answers one outstanding server→client request. An id that is not
+    /// outstanding is refused rather than written: the app-server would ignore
+    /// the response, and the caller would believe a turn was unblocked when it
+    /// was not (D3).
+    async fn answer_approval(&self, request_id: u64, decision: &str) -> Result<(), ApiError> {
+        if !self.approvals.lock().remove(&request_id) {
+            return Err(ApiError::not_found(
+                "no approval request is outstanding under that id",
+            ));
+        }
+        if let Err(error) = self
+            .write(json!({"id": request_id, "result": {"decision": decision}}))
+            .await
+        {
+            // Put it back: the turn is still blocked, so the operator must be
+            // able to answer again.
+            self.approvals.lock().insert(request_id);
+            return Err(ApiError::internal(&format!(
+                "codex approval response failed: {error}"
+            )));
+        }
+        Ok(())
+    }
+
+    /// Denies whatever is still outstanding. Called when a session goes away:
+    /// an unanswered request leaves the CLI blocked, and a blocked CLI is a
+    /// process that never exits.
+    async fn settle_pending_approvals(&self) {
+        let outstanding: Vec<u64> = self.approvals.lock().drain().collect();
+        for request_id in outstanding {
+            if let Err(error) = self
+                .write(json!({"id": request_id, "result": {"decision": "denied"}}))
+                .await
+            {
+                eprintln!("coding-agent-bridge: settling approval {request_id} failed: {error}");
+            }
+        }
+    }
+
+    /// Denies what is outstanding, then kills and reaps the app-server group.
+    async fn shutdown(&mut self) -> process::ProcessState {
+        self.settle_pending_approvals().await;
+        self.handle.terminate()
+    }
     async fn write(&self, value: Value) -> Result<()> {
         let mut stdin = self.stdin.lock().await;
         stdin.write_all(format!("{}\n", value).as_bytes()).await?;
@@ -1028,16 +1279,37 @@ impl CodexRuntime {
     }
 }
 
-fn spawn_terminal(
+/// Everything one PTY start needs. A struct rather than eight positional
+/// arguments, because the two booleans in the middle used to be readable only
+/// by counting commas.
+struct TerminalSpawn<'a> {
     provider: Provider,
-    resume: Option<&str>,
+    workspace: &'a str,
+    resume: Option<&'a str>,
     fork: bool,
-    workspace: &str,
-    events: Arc<SyncMutex<Vec<Event>>>,
     auth: bool,
-    new_session_id: Option<&str>,
-    model: Option<&str>,
+    new_session_id: Option<&'a str>,
+    model: Option<&'a str>,
+    /// Caller-owned wiring for the CLI process (§7.5). Empty for the login and
+    /// probe paths, which talk to nothing on the caller's behalf.
+    env: &'a [(String, String)],
+}
+
+fn spawn_terminal(
+    spawn: TerminalSpawn<'_>,
+    events: Arc<SyncMutex<Vec<Event>>>,
+    processes: &process::Registry,
 ) -> Result<TerminalRuntime> {
+    let TerminalSpawn {
+        provider,
+        workspace,
+        resume,
+        fork,
+        auth,
+        new_session_id,
+        model,
+        env,
+    } = spawn;
     let pty = native_pty_system().openpty(PtySize {
         rows: 40,
         cols: 120,
@@ -1050,6 +1322,9 @@ fn spawn_terminal(
         "claude"
     });
     command.cwd(workspace);
+    for (name, value) in env {
+        command.env(name, value);
+    }
     if let Some(model) = model {
         command.arg("--model");
         command.arg(model);
@@ -1075,6 +1350,14 @@ fn spawn_terminal(
         command.arg(new_session_id.context("new Claude session id missing")?);
     }
     let child = pty.slave.spawn_command(command)?;
+    // The PTY backend makes the child a session leader, so its pid is also its
+    // process group id: one `killpg` reaches the helpers the CLI spawns.
+    let handle = processes.track(
+        if auth { "cli-login" } else { "cli-session" },
+        child
+            .process_id()
+            .context("the PTY backend returned a child without a pid")?,
+    );
     let mut reader = pty.master.try_clone_reader()?;
     let writer = Arc::new(SyncMutex::new(pty.master.take_writer()?));
     let ready = Arc::new(AtomicBool::new(provider == Provider::Codex || auth));
@@ -1113,6 +1396,7 @@ fn spawn_terminal(
         ready,
         _master: pty.master,
         child,
+        handle,
     })
 }
 
@@ -1163,41 +1447,17 @@ fn terminal_plain_text(raw: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-fn parse_claude_models(raw: &[u8]) -> Vec<Value> {
-    let mut parser = vt100::Parser::new(40, 120, 0);
-    parser.process(raw);
-    parser
-        .screen()
-        .contents()
-        .lines()
-        .filter_map(|line| {
-            let trimmed = line.trim().trim_start_matches('❯').trim();
-            let (number, label) = trimmed.split_once(". ")?;
-            let index = number.parse::<usize>().ok()?;
-            let selected = label.contains('✔');
-            let display_name = label
-                .split("  ")
-                .next()?
-                .trim_end_matches('✔')
-                .trim()
-                .to_string();
-            let model = display_name.split_whitespace().next()?.to_ascii_lowercase();
-            Some(json!({
-                "id": model,
-                "display_name": display_name,
-                "selected": selected,
-                "selector_index": index,
-            }))
-        })
-        .collect()
-}
-
 impl TerminalRuntime {
-    /// Asks the CLI to quit on its own and waits for it. A straight SIGKILL
-    /// (what `Drop` does) takes the process down before it writes its session
-    /// file — and an unwritten session cannot be resumed, which is exactly what
-    /// the reused probe session and every user session depend on.
-    async fn shutdown(&mut self) {
+    /// Asks the CLI to quit on its own, waits for it, and kills the whole group
+    /// if it does not go. Two reasons the polite step comes first: a straight
+    /// SIGKILL takes the process down before it writes its session file — and an
+    /// unwritten session cannot be resumed, which is what the reused probe
+    /// session and every user session depend on — and a CLI given the chance to
+    /// exit takes its own helpers with it.
+    ///
+    /// Returns the settled state, so a caller can record `reaped` rather than
+    /// guess (D2).
+    async fn shutdown(&mut self) -> process::ProcessState {
         {
             let mut writer = self.writer.lock();
             let _ = writer.write_all(b"\x1b");
@@ -1207,10 +1467,22 @@ impl TerminalRuntime {
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
         while tokio::time::Instant::now() < deadline {
             if matches!(self.child.try_wait(), Ok(Some(_))) {
-                return;
+                // The leader is already reaped here, so its pid must NOT be
+                // signalled again: once nothing holds the group, the number can
+                // name a different process. A CLI that exited on request took
+                // its own helpers with it; a CLI that did not is handled below,
+                // while the group id is still guaranteed to be ours.
+                let _ = self.child.wait();
+                self.handle.mark_exited();
+                return process::ProcessState::Exited;
             }
             tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
+        // Group first, `wait` second: signalling has to happen while the leader
+        // still holds its pid, and `Handle::terminate` reaps it on the way out.
+        let state = self.handle.terminate();
+        let _ = self.child.wait();
+        state
     }
 
     async fn wait_ready(&mut self) -> Result<()> {
@@ -1238,6 +1510,44 @@ fn push_event(events: &Arc<SyncMutex<Vec<Event>>>, kind: &str, data: Value) {
     if list.len() > 10_000 {
         list.drain(..1_000);
     }
+}
+
+/// Bounds the environment a session may be started with.
+///
+/// Names are restricted to the shape a shell variable actually has, and both
+/// the count and the sizes are capped: this endpoint hands strings straight to
+/// `execve`, so an unbounded map would be an unbounded process environment. The
+/// values are NEVER logged — one of them is the ticket.
+fn validated_env(
+    raw: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<(String, String)>, ApiError> {
+    const MAX_VARS: usize = 32;
+    const MAX_NAME: usize = 128;
+    const MAX_VALUE: usize = 8192;
+    if raw.len() > MAX_VARS {
+        return Err(ApiError::bad_request("too many environment variables"));
+    }
+    let mut env = Vec::with_capacity(raw.len());
+    for (name, value) in raw {
+        let named_ok = !name.is_empty()
+            && name.len() <= MAX_NAME
+            && name
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+            && !name.chars().next().is_some_and(|c| c.is_ascii_digit());
+        if !named_ok {
+            return Err(ApiError::bad_request(&format!(
+                "invalid environment variable name '{name}'"
+            )));
+        }
+        if value.len() > MAX_VALUE || value.chars().any(|c| c == '\0' || c == '\n') {
+            return Err(ApiError::bad_request(&format!(
+                "invalid value for environment variable '{name}'"
+            )));
+        }
+        env.push((name.clone(), value.clone()));
+    }
+    Ok(env)
 }
 
 fn canonical_workspace(raw: &str, allowed_root: &Path) -> Result<String, ApiError> {
@@ -1383,13 +1693,28 @@ mod tests {
     }
 
     #[test]
-    fn claude_model_menu_is_parsed_from_the_rendered_screen() {
-        let screen = "  1. Opus 4.6  Most capable\n\u{276f} 2. Sonnet 4.6 \u{2714}  Balanced\n";
-        let models = parse_claude_models(screen.as_bytes());
-        assert_eq!(models.len(), 2);
+    fn the_claude_model_list_is_configuration_and_never_a_probe() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("models.json");
+
+        // No file: the aliases of the pinned release, labelled as such so a
+        // reader cannot mistake them for something the CLI reported.
+        let (models, source) = configured_claude_models(&missing).expect("pinned catalog");
+        assert_eq!(models.len(), CLAUDE_CODE_MODEL_ALIASES.len());
         assert_eq!(models[0]["id"], "opus");
-        assert_eq!(models[1]["id"], "sonnet");
-        assert_eq!(models[1]["selected"], true);
-        assert_eq!(models[1]["selector_index"], 2);
+        assert_eq!(source, format!("pinned:{CLAUDE_CODE_PINNED_VERSION}"));
+
+        // An operator-supplied catalog wins, and says so.
+        std::fs::write(&missing, r#"[{"id":"sonnet","display_name":"Sonnet"}]"#).expect("write");
+        let (models, source) = configured_claude_models(&missing).expect("file catalog");
+        assert_eq!(models.len(), 1);
+        assert_eq!(source, "file");
+
+        // A catalog that cannot name a model is an error, not an empty list
+        // that would silently disable the engine.
+        std::fs::write(&missing, "[]").expect("write");
+        assert!(configured_claude_models(&missing).is_err());
+        std::fs::write(&missing, r#"[{"display_name":"nameless"}]"#).expect("write");
+        assert!(configured_claude_models(&missing).is_err());
     }
 }

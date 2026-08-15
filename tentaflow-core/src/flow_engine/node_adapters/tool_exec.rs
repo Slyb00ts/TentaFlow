@@ -26,6 +26,8 @@ use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, LlmToolCall, NodeInpu
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
+use crate::code_studio::tools as code_studio_tools;
+use crate::flow_engine::node_adapters::InteractionGate;
 use crate::project_studio::{
     generation as project_generation, ingest as project_ingest, knowledge as project_knowledge,
 };
@@ -194,6 +196,82 @@ impl ToolExecNodeAdapter {
         CoreToolName::from_public_name(name)
             .map(|c| c.is_case_save())
             .unwrap_or(false)
+    }
+
+    /// True for the Code Studio verbs (§10). Async: every one of them binds its
+    /// session from `envelope.meta["code_session"]`, runs the policy enforcement
+    /// point (which may park the run on a human) and journals an operation.
+    fn is_code_studio(name: &str) -> bool {
+        CoreToolName::from_public_name(name)
+            .map(|c| c.is_code_studio())
+            .unwrap_or(false)
+    }
+
+    /// Runs one Code Studio tool call. The workspace and session are NOT
+    /// parameters: they come from the server-minted binding in the envelope, so
+    /// a model cannot point a write at another person's worktree. A run without
+    /// that binding gets a tool error, exactly like a non-generation run calling
+    /// `core.project_case_save`.
+    async fn run_code_studio_call(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        envelope: &FlowEnvelope,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        let arguments: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+        };
+        let Some(tool) = CoreToolName::from_public_name(&call.name) else {
+            return error_result(call, format!("unknown core tool '{}'", call.name));
+        };
+        let Some(user_id) = principal.user_id().map(|s| s.to_string()) else {
+            return error_result(
+                call,
+                format!("tool '{}' requires a user identity", call.name),
+            );
+        };
+        let Some(binding) = code_studio_tools::binding_from_meta(&envelope.meta) else {
+            return error_result(
+                call,
+                "this run is not bound to a Code Studio session \
+                 (the workspace tools work only inside a Code Studio run)"
+                    .to_string(),
+            );
+        };
+
+        let registry = crate::agents::interaction_registry_global();
+        let extend = |waited: Duration| ctx.extend_deadline(waited);
+        let gate = InteractionGate::new(
+            &registry,
+            manager,
+            ctx.progress.as_ref(),
+            &ctx.progress_scope,
+            run_id,
+            parent_run_id,
+            &extend,
+        );
+        let call_ctx = code_studio_tools::ToolCallCtx {
+            main_db: service.db(),
+            user_id: &user_id,
+            run_id: (!run_id.is_empty()).then_some(run_id),
+            tool_call_id: &call.id,
+            binding: &binding,
+            gate: &gate,
+        };
+        match code_studio_tools::execute(&call_ctx, tool, &arguments).await {
+            Ok(output) => ToolCallResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                content: serde_json::to_string(&output).unwrap_or_default(),
+                success: true,
+            },
+            Err(e) => error_result(call, e.to_string()),
+        }
     }
 
     /// Runs one `core.project_case_save` call. The binding comes ONLY from
@@ -728,13 +806,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
         // from the agent the harness pinned in meta. No agent id = no allowlist
         // (every call is rejected as out-of-surface — a misconfigured flow).
         let agent_id = envelope.meta.get("agent_id").and_then(|v| v.as_str());
-        let tools_json = match agent_id {
-            Some(id) => service
-                .get_agent(id)?
-                .map(|a| a.tools_json)
-                .unwrap_or_else(|| "[]".to_string()),
-            None => "[]".to_string(),
-        };
+        let tools_json = service.agent_tools_json(agent_id);
 
         let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
         let started_at = Utc::now();
@@ -809,6 +881,18 @@ impl NodeAdapter for ToolExecNodeAdapter {
                 Self::run_project_knowledge_call(ctx, &principal, call).await
             } else if Self::is_case_save(&call.name) {
                 Self::run_case_save_call(ctx, &principal, envelope, call).await
+            } else if Self::is_code_studio(&call.name) {
+                Self::run_code_studio_call(
+                    &service,
+                    manager.as_deref(),
+                    ctx,
+                    &principal,
+                    &run_id,
+                    parent_run_id.as_deref(),
+                    envelope,
+                    call,
+                )
+                .await
             } else {
                 Self::run_tool_call(
                     &service,

@@ -296,6 +296,7 @@ mod tests {
             &[],
             &[],
             None,
+            None,
         )
         .await
         .expect("spawn parent")

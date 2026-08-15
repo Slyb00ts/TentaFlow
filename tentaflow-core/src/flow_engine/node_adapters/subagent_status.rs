@@ -230,6 +230,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .await
             .expect("parent");
@@ -238,6 +239,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: AgentPrincipal::user("u1"),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))

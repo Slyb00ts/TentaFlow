@@ -13,3 +13,11 @@ serde_json = "1"
 tokio = { version = "1", features = ["full"] }
 uuid = { version = "1", features = ["v4", "serde"] }
 vt100 = "0.15"
+
+# Process groups and signals. A CLI spawns helpers of its own, so "closed" has
+# to mean `killpg` + `waitpid`, not a dropped handle (defect D2 of §1.2).
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[dev-dependencies]
+tempfile = "3"

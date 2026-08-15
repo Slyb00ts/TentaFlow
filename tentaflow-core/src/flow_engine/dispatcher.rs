@@ -44,12 +44,14 @@ use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentParseNodeAdapter,
-    DocumentRouterNodeAdapter, EmbedChunksNodeAdapter, EmbeddingsNodeAdapter,
-    ExcelExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
+    ConversationHistoryNodeAdapter, DelegateCliNodeAdapter, DocumentMergeNodeAdapter,
+    DocumentParseNodeAdapter, DocumentRouterNodeAdapter, EmbedChunksNodeAdapter,
+    EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, ExecCommandNodeAdapter,
+    GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
     LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
     OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
-    PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
+    PageDetectPagesNodeAdapter, PatchReviewNodeAdapter, PdfRasterizeNodeAdapter,
+    PersistTurnNodeAdapter,
     PiiFilterNodeAdapter, PlatformSwitchNodeAdapter, PptxExtractNodeAdapter,
     ProjectKnowledgeNodeAdapter,
     RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
@@ -59,7 +61,7 @@ use crate::flow_engine::node_adapters::{
     TextExtractNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
     TtsNodeAdapter, VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter,
     VisionOcrNodeAdapter, VisionParseNodeAdapter, VisionParsePagesNodeAdapter,
-    WordExtractNodeAdapter,
+    WordExtractNodeAdapter, WorkspaceContextNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -1169,6 +1171,22 @@ fn build_registry(
         agent_service.clone(),
     )));
     r.register(Arc::new(ToolExecNodeAdapter::new(agent_service.clone())));
+    // `workspace_context` reads the running agent's allowlist to publish
+    // `harness_tools`, so it shares the same late-bound service slot.
+    r.register(Arc::new(WorkspaceContextNodeAdapter::new(
+        agent_service.clone(),
+    )));
+    // Code Studio (§16.4). `patch_review`, `exec_command` and `delegate_cli`
+    // reach the process-global interaction registry and run manager directly,
+    // like `ask_user` — and the SAME service slot: `exec_command` needs it for
+    // the agent's allowlist (§10), `delegate_cli` for the registry database and
+    // the node's settings key, which is what opens the provider credential in
+    // the node-local vault (§5.2).
+    r.register(Arc::new(PatchReviewNodeAdapter::new(
+        agent_service.clone(),
+    )));
+    r.register(Arc::new(ExecCommandNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(DelegateCliNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(AgentRouterNodeAdapter::new(agent_service.clone())));
     // `spawn` resolves an agent_id config to the agent's name through the service
     // before delegating in the background (§3.3).
@@ -1327,6 +1345,11 @@ mod tests {
             "await_subagents",
             "subagent_status",
             "interval",
+            // Code Studio (§16.4).
+            "workspace_context",
+            "patch_review",
+            "exec_command",
+            "delegate_cli",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
