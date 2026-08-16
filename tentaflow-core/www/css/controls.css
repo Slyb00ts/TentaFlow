@@ -2316,6 +2316,16 @@ tf-filter-chips[scroll] .tf-filter-chip {
     box-shadow 0.2s ease;
   user-select: none;
 }
+/* A finger is not a mouse pointer. `tf-btn-sm` and the filter chips sit at
+   ~29-30 px, which is fine to click and a miss-fest to tap, and Code Studio is
+   used from a phone. Raised only where the pointer is coarse, so desktop
+   density is untouched. */
+@media (pointer: coarse) {
+  .tf-btn.tf-btn-sm { min-height: 36px; }
+  .tf-btn.tf-btn-icon.tf-btn-sm { width: 36px; }
+  .tf-filter-chip { min-height: 36px; }
+}
+
 .tf-filter-chip svg {
   width: 12px;
   height: 12px;

@@ -209,6 +209,11 @@
 .cs-stage-chips::-webkit-scrollbar { display: none; }
 .cs-stage-head > tf-button,
 .cs-stage-head > tf-tooltip { flex-shrink: 0; }
+
+/* The way OUT of a session on a wide screen. The phone has its own exit in
+   `.cs-mtop`, which is display:none above 900px — without this button a desktop
+   operator who opened a session had no visible way back to the workspace. */
+.cs-stage-exit { margin-inline-start: -4px; }
 .cs-stage-head .spacer { flex: 1 1 0; min-width: 0; }
 
 /* Context chip (branch, mode, autonomy) */
@@ -1119,6 +1124,17 @@
    stage column and hides it on a phone, where the bottom bar drives the tabs. */
 .cs-stage-tabs { flex-shrink: 0; }
 
+/* The exit rides the stage tab strip rather than the console pane, so leaving a
+   session stays possible while a diff, a file or the terminal holds the stage. */
+.cs-stage-bar {
+  display: flex;
+  align-items: stretch;
+  min-width: 0;
+  flex-shrink: 0;
+}
+.cs-stage-bar .cs-stage-tabs { flex: 1; min-width: 0; }
+.cs-stage-bar .cs-stage-exit { align-self: center; }
+
 /* Stage panes — exactly one visible */
 .cs-spane { display: none; flex-direction: column; flex: 1; min-height: 0; }
 .cs-shell[data-stage="konsola"]  .cs-spane[data-spane="konsola"],
@@ -1254,6 +1270,10 @@
 
   /* The horizontal workspace bar disappears — a top button replaces it. */
   .cs-projects { display: none; }
+
+  /* `.cs-mtop` carries the exit on a phone, so the stage one would be a second
+     button doing the same thing in the same corner. */
+  .cs-stage-exit { display: none; }
 
   .cs-mtop {
     display: flex;

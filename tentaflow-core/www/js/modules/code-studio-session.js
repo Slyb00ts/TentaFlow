@@ -461,11 +461,16 @@ function buildStage() {
 
   const stage = node(`
     <div class="cs-stage">
-      <tf-tabs class="cs-stage-tabs" variant="bar" indicator="top" data-stage-tabs
-        value="${STAGE_HOME_ID}">
-        <tf-tab id="${STAGE_HOME_ID}" icon="message" pinned
-          label="${escapeAttr(t('stage.console'))}"></tf-tab>
-      </tf-tabs>
+      <div class="cs-stage-bar">
+        <tf-button class="cs-stage-exit" variant="ghost" size="sm" icon="chevron-left"
+          data-action="exit" title="${escapeAttr(t('session_exit'))}"
+          aria-label="${escapeAttr(t('session_exit'))}"></tf-button>
+        <tf-tabs class="cs-stage-tabs" variant="bar" indicator="top" data-stage-tabs
+          value="${STAGE_HOME_ID}">
+          <tf-tab id="${STAGE_HOME_ID}" icon="message" pinned
+            label="${escapeAttr(t('stage.console'))}"></tf-tab>
+        </tf-tabs>
+      </div>
 
       <div class="cs-spane" data-spane="konsola">
         <div class="cs-stage-head">
@@ -1270,11 +1275,15 @@ function reactToEvent(ev, refresh) {
       if (state.ask?.approvalId === ev.p.approval_id) clearAsk();
       refresh.add('approvals');
       break;
+    // A patch set exists because the agent WROTE something, so the working tree
+    // on disk is no longer what the file pane listed when it mounted.
     case 'patch_set_opened':
       refresh.add('patchsets');
+      refresh.add('files');
       break;
     case 'patch_decided':
       refresh.add('patchsets');
+      refresh.add('files');
       break;
     case 'run_started':
     case 'run_finished':
@@ -1308,6 +1317,14 @@ async function refreshSide(kinds) {
   if (kinds.has('git')) {
     state.panes.git?.update?.({ refresh: true });
     state.docks.git?.update?.({ refresh: true });
+    // A commit or a merge rewrites the tree on disk too.
+    kinds.add('files');
+  }
+  // The file pane loads its root ONCE, when the session view is built. Without
+  // this it shows the worktree as it looked before the agent touched anything,
+  // for as long as the session stays open.
+  if (kinds.has('files')) {
+    state.docks.pliki?.update?.({ refreshPath: '', refreshStatus: true });
   }
   await Promise.allSettled(jobs);
 }
@@ -1951,14 +1968,37 @@ function askFromPane(spec) {
 }
 
 function setAsk(ask) {
+  const changed = askSignature(ask) !== askSignature(state.ask);
   state.ask = ask;
   renderAsk();
+  // The answer block lives in the console pane only. An operator reading a
+  // diff, a file or the terminal when the agent raises a question would see it
+  // nowhere and the run would sit blocked on an answer nobody could give.
+  // Surfaced once per DISTINCT question, so repeated polling of the same
+  // pending one never yanks the stage away from what is being read.
+  if (ask && changed && shell && shell.dataset.stage !== 'konsola') focusAsk();
 }
 
 function clearAsk() {
   state.ask = null;
   renderAsk();
 }
+
+/// Identity of what is on screen. `loadApprovals` re-derives the ask from the
+/// server on EVERY refresh, so without this the option rows are torn down and
+/// rebuilt several times a second while the agent works — and a click that
+/// lands between the teardown and the rebuild hits a detached node and is
+/// silently lost. Answering a question must not depend on refresh timing.
+function askSignature(ask) {
+  if (!ask) return '';
+  return [
+    ask.kind, ask.approvalId, ask.capability, ask.who, ask.question, ask.detail,
+    ask.mandatory ? '1' : '0', ask.runId,
+    askOptions(ask).map((o) => `${o.key}:${o.value}:${o.off ? 'x' : 'o'}`).join(','),
+  ].join('|');
+}
+
+let renderedAskSignature = '';
 
 function renderAsk() {
   const answer = host.querySelector('[data-answer]');
@@ -1970,11 +2010,21 @@ function renderAsk() {
   // The way back to the conversation nags while the agent waits for an answer.
   paintStageStrip();
   if (!ask) {
-    answer.hidden = true;
-    answer.innerHTML = '';
+    if (renderedAskSignature !== '') {
+      answer.hidden = true;
+      answer.innerHTML = '';
+      renderedAskSignature = '';
+    }
     paintSessionHead();
     return;
   }
+  const signature = askSignature(ask);
+  if (signature === renderedAskSignature && answer.childElementCount > 0) {
+    // Same question, already on screen: leave the buttons alone.
+    paintSessionHead();
+    return;
+  }
+  renderedAskSignature = signature;
   const confirm = ask.kind === 'confirm';
   answer.hidden = false;
   answer.innerHTML = `
@@ -2290,6 +2340,8 @@ async function loadApprovals() {
     // A typed question and a pane confirmation are ours, not the server's: a
     // poll that finds no pending approval must not wipe them off the composer.
     const local = state.ask?.kind === 'question' || state.ask?.kind === 'confirm';
+    // `setAsk` brings a NEW question forward on its own, so a poll that
+    // re-reports the same pending approval changes nothing on screen.
     if (pending) setAsk(askFromApproval(pending));
     else if (!local) clearAsk();
     paintSessionHead();

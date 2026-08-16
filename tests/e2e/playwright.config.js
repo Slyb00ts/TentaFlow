@@ -18,6 +18,14 @@ module.exports = defineConfig({
     ignoreHTTPSErrors: true,
   },
   projects: [
+    // The exploration walk must never block forever on a selector that will
+    // never match: an unbounded wait would hide every defect the walk had not
+    // reached yet. Playwright's default action timeout is 0 (wait forever).
+    {
+      name: 'code-studio-explore',
+      testMatch: 'code-studio-explore.spec.js',
+      use: { actionTimeout: 10_000 },
+    },
     { name: 'code-studio-projects', testMatch: 'code-studio-projects.spec.js' },
     { name: 'code-studio-delegation', testMatch: 'code-studio-delegation.spec.js' },
     { name: 'code-studio-harness', testMatch: 'code-studio-harness.spec.js' },
