@@ -293,6 +293,130 @@ fn claude_turn_state(object: &Value) -> Option<TurnState> {
     }))
 }
 
+/// What a vendor CLI says IT spent, read out of its own event stream.
+///
+/// §17.3 asks for a delegated CLI's consumption to be measured **in the
+/// adapter** — on a socket we own — precisely so a budget does not rest on the
+/// CLI or the provider reporting honestly. This type is the other case, and it
+/// is named after the gap rather than hiding it: when the engine authenticates
+/// itself (`DelegationAuth::ProviderLogin`) no provider traffic crosses anything
+/// of ours, so the vendor's own numbers are all there are. A budget enforced
+/// from here is enforced on the word of the thing being budgeted.
+///
+/// Both sources the vendors offer are read, and the larger is used, because
+/// neither alone is enough. The per-message reports are what exist WHILE the
+/// turn runs, which is what a mid-turn ceiling needs; the terminal `result`
+/// object carries the vendor's own total, which is authoritative once it
+/// arrives. Taking the maximum keeps the number monotone without ever adding the
+/// two together — the totals overlap, and summing them would bill a turn twice.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct ProviderReportedUsage {
+    /// Running sum over the vendor's per-message reports.
+    streamed_input: u64,
+    streamed_output: u64,
+    /// Totals the vendor printed when it ended the turn.
+    final_input: u64,
+    final_output: u64,
+    /// What the vendor said the turn cost. Never computed here — there is no
+    /// price feed on the node, and `cli_adapter` refuses to invent one — only
+    /// repeated.
+    cost_usd: f64,
+    api_duration_ms: u64,
+    /// How many of the vendor's own messages carried a usage report.
+    reports: u32,
+}
+
+impl ProviderReportedUsage {
+    pub fn input_tokens(&self) -> u64 {
+        self.streamed_input.max(self.final_input)
+    }
+
+    pub fn output_tokens(&self) -> u64 {
+        self.streamed_output.max(self.final_output)
+    }
+
+    pub fn total_tokens(&self) -> u64 {
+        self.input_tokens().saturating_add(self.output_tokens())
+    }
+
+    /// `None` when the vendor reported no cost at all, so a caller can tell
+    /// "free" from "not stated".
+    pub fn cost_usd(&self) -> Option<f64> {
+        (self.cost_usd > 0.0).then_some(self.cost_usd)
+    }
+
+    pub fn api_duration_ms(&self) -> u64 {
+        self.api_duration_ms
+    }
+
+    pub fn reports(&self) -> u32 {
+        self.reports
+    }
+
+    /// Folds one bridge event into the total. Everything that is not a usage
+    /// report leaves it untouched.
+    pub fn observe(&mut self, event: &BridgeEvent) {
+        match event {
+            // Claude Code `stream-json`: `assistant` objects carry the usage of
+            // the API call that produced them, and the closing `result` object
+            // carries the turn's total plus its cost and API time.
+            BridgeEvent::StreamObject { object, .. } => {
+                match object.get("type").and_then(Value::as_str) {
+                    Some("assistant") => {
+                        if let Some((input, output)) = usage_tokens(object.pointer("/message/usage"))
+                        {
+                            self.streamed_input = self.streamed_input.saturating_add(input);
+                            self.streamed_output = self.streamed_output.saturating_add(output);
+                            self.reports += 1;
+                        }
+                    }
+                    Some("result") => {
+                        if let Some((input, output)) = usage_tokens(object.get("usage")) {
+                            self.final_input = self.final_input.max(input);
+                            self.final_output = self.final_output.max(output);
+                            self.reports += 1;
+                        }
+                        if let Some(cost) = object.get("total_cost_usd").and_then(Value::as_f64) {
+                            self.cost_usd = self.cost_usd.max(cost);
+                        }
+                        if let Some(ms) = object.get("duration_api_ms").and_then(Value::as_u64) {
+                            self.api_duration_ms = self.api_duration_ms.max(ms);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            // The Codex app-server puts a usage object on the notification that
+            // ends the turn, under either name it has used.
+            BridgeEvent::Notification { params, .. } => {
+                for candidate in [params.get("usage"), params.pointer("/turn/usage")] {
+                    if let Some((input, output)) = usage_tokens(candidate) {
+                        self.final_input = self.final_input.max(input);
+                        self.final_output = self.final_output.max(output);
+                        self.reports += 1;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The `(input, output)` pair of a vendor usage object, in whichever vocabulary
+/// it is written. Cache tokens count as input: they were part of the prompt the
+/// provider processed, and a budget that ignored them would let a long cached
+/// context run free.
+fn usage_tokens(usage: Option<&Value>) -> Option<(u64, u64)> {
+    let usage = usage?.as_object()?;
+    let read = |name: &str| usage.get(name).and_then(Value::as_u64).unwrap_or(0);
+    let input = read("input_tokens")
+        .max(read("prompt_tokens"))
+        .saturating_add(read("cache_read_input_tokens"))
+        .saturating_add(read("cache_creation_input_tokens"));
+    let output = read("output_tokens").max(read("completion_tokens"));
+    (input > 0 || output > 0).then_some((input, output))
+}
+
 /// A server→client approval request, as it arrives from the bridge.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ApprovalRequest {
@@ -422,6 +546,26 @@ impl CliBridge {
         insert_instance(pool, &instance)?;
         set_instance_status(pool, &instance.id, "ready")?;
         Ok(instance)
+    }
+
+    /// Whether the ENGINE holds a provider login of its own on this node.
+    ///
+    /// The bridge answers it by running the vendor's own status command
+    /// (`claude auth status`, `codex login status`) and reporting whether it
+    /// succeeded — so the answer is the CLI's, not a setting somebody typed.
+    /// That is the whole point: `DelegationAuth::ProviderLogin` hands the CLI no
+    /// credential at all, and the only honest way to know a run will authenticate
+    /// is to ask the thing that will do the authenticating.
+    ///
+    /// A probe that cannot be run is an error, never a `true`: the caller turns
+    /// it into a refusal, because the permissive reading would start a CLI that
+    /// then talks to a provider as nobody in particular.
+    pub async fn provider_login(&self) -> Result<bool> {
+        let response = self.call("auth.status", serde_json::json!({})).await?;
+        Ok(response
+            .get("authenticated")
+            .and_then(Value::as_bool)
+            .unwrap_or(false))
     }
 
     pub async fn turn(&self, instance: &CliInstance, prompt: &str) -> Result<()> {

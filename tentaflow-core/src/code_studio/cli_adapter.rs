@@ -219,6 +219,111 @@ fn ensure_residual_traffic_is_contained(
 }
 
 // =============================================================================
+// Which credential pays for the delegation
+// =============================================================================
+
+/// How one delegation authenticates to the provider.
+///
+/// Two mechanisms, one checkable condition, no flag — a deployment does not
+/// choose between them, its own state decides.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DelegationAuth {
+    /// §7.5 in full. The organization's credential is in this node's vault, the
+    /// adapter holds it in memory, the CLI is pointed at the adapter and gets a
+    /// ticket instead of a key, and every request it makes crosses a socket we
+    /// own — which is what makes the ticket's budget enforceable (§17.3).
+    OrgCredential,
+    /// The engine authenticates ITSELF: the operator running this node logged
+    /// the CLI into its provider, and the delegation spends that login.
+    ///
+    /// Nothing of §7.5 applies here, and pretending otherwise would break the
+    /// mode rather than harden it: a base URL override, an API key variable or a
+    /// session-private configuration directory each, on its own, TAKES THAT
+    /// LOGIN AWAY — the config directory is where the login lives. So the CLI is
+    /// started with none of them and sees exactly the account it already had.
+    ///
+    /// What is given up is measurement, and it is given up openly: no provider
+    /// traffic crosses anything of ours, so §17.3's "measured in the adapter" is
+    /// not satisfied and the budget is enforced on
+    /// `cli_bridge::ProviderReportedUsage` — the vendor's own numbers. What is
+    /// NOT given up: the Phase 0B gate, the `cli_delegate` decision, every
+    /// permission question the CLI raises, and the session worktree as the
+    /// process's boundary.
+    ProviderLogin,
+}
+
+impl DelegationAuth {
+    pub fn slug(self) -> &'static str {
+        match self {
+            DelegationAuth::OrgCredential => "org_credential",
+            DelegationAuth::ProviderLogin => "provider_login",
+        }
+    }
+
+    /// Who counts what a run of this mode spends — the honest answer, recorded
+    /// next to the numbers so nobody reads a provider's word as a measurement.
+    pub fn usage_source(self) -> &'static str {
+        match self {
+            DelegationAuth::OrgCredential => "adapter",
+            DelegationAuth::ProviderLogin => "provider_reported",
+        }
+    }
+}
+
+/// Decides which of the two an engine takes on this node.
+///
+/// The order is the decision, and both facts are read from the node rather than
+/// configured:
+///
+///   1. **Does this node's vault hold the organization's credential for the
+///      engine?** Then that is what the delegation spends, and it spends it
+///      through the adapter. An organization that provisioned a key meant the
+///      runs to use it, and the metered path is the stronger one.
+///   2. **Otherwise, is the CLI logged in on this node?** The bridge asks the
+///      vendor's own status command (`CliBridge::provider_login`). If it is, the
+///      engine authenticates itself.
+///
+/// Neither branch is a fallback for the other: they are different accounts paid
+/// for by different parties, and each is refused for its own reason. With no
+/// credential AND no login there is nothing to authenticate with, and the
+/// refusal says both halves — the old `credential_missing` alone would send an
+/// administrator looking for a vault row that is not the only answer.
+///
+/// `provider_login` is taken as a future so the probe is never run when the
+/// vault already answered: it spawns the vendor binary, and a delegation must
+/// not pay for a question it does not need.
+pub async fn resolve_delegation_auth(
+    core_db: &DbPool,
+    org_id: &str,
+    node_id: &str,
+    engine_id: &str,
+    provider_login: impl std::future::Future<Output = Result<bool>>,
+) -> Result<DelegationAuth, GateRefusal> {
+    let refusal = |reason: String| GateRefusal {
+        engine_id: engine_id.to_string(),
+        reason,
+    };
+    let stored = super::vault::get_agent_credential_record(core_db, org_id, node_id, engine_id)
+        .map_err(|error| refusal(format!("the vault could not be read: {error}")))?;
+    if stored.is_some() {
+        return Ok(DelegationAuth::OrgCredential);
+    }
+    match provider_login.await {
+        Ok(true) => Ok(DelegationAuth::ProviderLogin),
+        Ok(false) => Err(refusal(format!(
+            "credential_missing: node '{node_id}' holds no organization credential for this \
+             engine, and the CLI reports no provider login of its own. Store the organization's \
+             key for the engine (it never enters the sandbox — the adapter injects it), or log \
+             the CLI in on this node"
+        ))),
+        Err(error) => Err(refusal(format!(
+            "credential_missing: node '{node_id}' holds no organization credential for this \
+             engine, and whether the CLI is logged in could not be established: {error:#}"
+        ))),
+    }
+}
+
+// =============================================================================
 // Tickets
 // =============================================================================
 
@@ -766,6 +871,33 @@ pub enum TicketDecision {
     Denied { reason: String },
 }
 
+/// What the PEP said about `cli_delegate`, on its own.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DelegateDecision {
+    Allow,
+    Ask { summary: String },
+    Deny { reason: String },
+}
+
+/// The `cli_delegate` decision, separated from the ticket.
+///
+/// The capability is "may this run delegate a turn to a vendor CLI", not "may
+/// this run be handed a ticket", so it has to be askable without one: on a
+/// self-authenticated engine (`DelegationAuth::ProviderLogin`) there is no
+/// ticket to mint and the decision is exactly as required. `issue_ticket` calls
+/// this first, so both modes reach the PEP through one function and possessing
+/// `net_egress` entitles neither of them (§7.5).
+pub fn authorize_delegation(ctx: &pep::SessionCtx, host_allowlisted: bool) -> DelegateDecision {
+    let target = Target::Host {
+        allowlisted: host_allowlisted,
+    };
+    match pep::authorize(ctx, Capability::CliDelegate, &target) {
+        Decision::Deny { reason } => DelegateDecision::Deny { reason },
+        Decision::AskUser { summary, .. } => DelegateDecision::Ask { summary },
+        Decision::Allow(_) => DelegateDecision::Allow,
+    }
+}
+
 /// The only intended way to obtain a ticket.
 ///
 /// `cli_delegate` is checked here, through the same PEP every other operation
@@ -776,13 +908,10 @@ pub fn issue_ticket(
     ctx: &pep::SessionCtx,
     request: TicketRequest,
 ) -> Result<TicketDecision> {
-    let target = Target::Host {
-        allowlisted: request.host_allowlisted,
-    };
-    match pep::authorize(ctx, Capability::CliDelegate, &target) {
-        Decision::Deny { reason } => return Ok(TicketDecision::Denied { reason }),
-        Decision::AskUser { summary, .. } => return Ok(TicketDecision::Ask { summary }),
-        Decision::Allow(_) => {}
+    match authorize_delegation(ctx, request.host_allowlisted) {
+        DelegateDecision::Deny { reason } => return Ok(TicketDecision::Denied { reason }),
+        DelegateDecision::Ask { summary } => return Ok(TicketDecision::Ask { summary }),
+        DelegateDecision::Allow => {}
     }
     if request.model.trim().is_empty() {
         return Ok(TicketDecision::Denied {
@@ -1292,6 +1421,12 @@ impl AdapterHandle {
 }
 
 /// Starts the adapter for one engine of one session.
+///
+/// Only `DelegationAuth::OrgCredential` reaches this function — the mode is
+/// decided by `resolve_delegation_auth` before anything is started — so the
+/// missing vault row here is a genuine inconsistency (the row was deleted
+/// between the decision and the start), not the ordinary state of a node whose
+/// CLI carries its own login.
 ///
 /// The order of the three steps is the contract:
 ///   1. the Phase 0B gate (an unverified engine never gets this far),

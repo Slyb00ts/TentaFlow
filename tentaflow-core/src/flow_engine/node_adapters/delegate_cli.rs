@@ -14,13 +14,24 @@
 //      nobody verified against a pinned CLI version never starts at all;
 //   3. the egress policy (§17.3) — `local_only` has no vendor CLI, because the
 //      sandbox has no route and the promise would be empty;
-//   4. the provider adapter, which holds the organization's credential IN THIS
-//      PROCESS and hands the CLI a ticket instead (§7.5);
-//   5. the ticket, minted through `cli_adapter::issue_ticket`, which runs
-//      `cli_delegate` past the PEP — holding `net_egress` is not enough;
-//   6. the CLI instance, opened with the adapter's environment: a base URL
-//      pointing at the adapter, the ticket as the API key, the session CA as
-//      the only extra trust anchor. The credential is in none of them;
+//   4. WHAT PAYS for the turn (`cli_adapter::resolve_delegation_auth`). Two
+//      mechanisms, chosen by the node's own state and never by a flag:
+//        * `OrgCredential` — this node's vault holds the organization's key.
+//          The adapter holds it IN THIS PROCESS, the CLI is pointed at the
+//          adapter and handed a ticket instead (§7.5), and the meter sits on
+//          our own wire, which is what makes the budget enforceable (§17.3);
+//        * `ProviderLogin` — no key in the vault, and the CLI reports a login
+//          of its own on this node. Then the CLI is started with NO base URL
+//          override, NO API key and NO private config directory, because each
+//          of those would take that login away — the config directory is where
+//          it lives. Nothing of the turn's provider traffic crosses a socket of
+//          ours, so the budget is what the VENDOR reports (`Spend`), not what
+//          we measured. That gap is §17.3's, and it is named, not hidden;
+//   5. `cli_delegate` past the PEP (`authorize_delegation`) — in BOTH modes,
+//      because the capability is "may this run delegate a turn", not "may this
+//      run be handed a ticket". Holding `net_egress` is not enough;
+//   6. the CLI instance, opened with the wiring of the chosen mode and nothing
+//      else. The organization's credential is in neither of them;
 //   7. the event pump, which mirrors the vendor's stream onto the session
 //      timeline and answers its approvals through `code_studio::pep` — the
 //      same decision point, via `cli_bridge::resolve_approval`.
@@ -28,9 +39,10 @@
 // Whatever happens, step 8 runs: the ticket is revoked with the run, the
 // adapter is stopped (which is what releases the credential from memory), the
 // CLI instance is closed and reaped, and the run row is settled with a status
-// that matches what actually happened. A delegation that ran out of budget or
-// out of time ends `failed`/`timed_out` and says so — it never reports a turn
-// that did not finish as one that did.
+// that matches what actually happened, plus what the turn spent and who
+// counted it. A delegation that ran out of budget or out of time ends
+// `failed`/`timed_out` and says so — it never reports a turn that did not
+// finish as one that did.
 // =====
 
 use std::collections::BTreeSet;
@@ -44,12 +56,12 @@ use serde_json::{json, Value};
 
 use crate::agents::AgentServiceSlot;
 use crate::code_studio::cli_adapter::{
-    self, AdapterConfig, AdapterEventSink, AdapterHandle, Budget, IssuedTicket, TicketDecision,
-    TicketRegistry, TicketRequest,
+    self, AdapterConfig, AdapterEventSink, AdapterHandle, Budget, DelegateDecision, DelegationAuth,
+    IssuedTicket, TicketDecision, TicketRegistry, TicketRequest,
 };
 use crate::code_studio::cli_bridge::{
-    self, ApprovalContext, BridgeEvent, CliBridge, CliInstance, OpenCliInstance, TurnState,
-    APPROVAL_TIMEOUT,
+    self, ApprovalContext, BridgeEvent, CliBridge, CliInstance, OpenCliInstance,
+    ProviderReportedUsage, TurnState, APPROVAL_TIMEOUT,
 };
 use crate::code_studio::events::{self, EventPayload, SessionEvent};
 use crate::code_studio::models::EgressEnforcement;
@@ -296,7 +308,25 @@ fn open_run(
 
 /// Settles the run row and its timeline entry together. Called on every path,
 /// including the ones that failed before the CLI ever started.
-fn finish_run(pool: &DbPool, session_id: &str, run_id: &str, status: &str, error: Option<&str>) {
+///
+/// The token columns are settled here rather than left at zero because that is
+/// what §17.3 asks to be storable. A delegation on a self-authenticated engine
+/// writes the VENDOR's numbers into the same columns the metered path writes —
+/// `usage.source`, the timeline's `cli_delegation_authorized` event and the
+/// block's own output are what keep the two provenances apart.
+///
+/// `usage` is `None` for a delegation that died before a turn was driven at all
+/// (no adapter, no CLI, nothing spent); the columns then keep their zero rather
+/// than claim a measurement nobody made.
+fn finish_run(
+    pool: &DbPool,
+    session_id: &str,
+    run_id: &str,
+    status: &str,
+    error: Option<&str>,
+    usage: Option<&DelegationUsage>,
+    model: &str,
+) {
     let redacted = error.map(|text| redact::redact_text(text));
     let settle = || -> Result<()> {
         let mut conn = pool
@@ -304,8 +334,15 @@ fn finish_run(pool: &DbPool, session_id: &str, run_id: &str, status: &str, error
             .map_err(|e| anyhow!("workspace db write: {e}"))?;
         let tx = conn.transaction()?;
         tx.execute(
-            "UPDATE session_runs SET status = ?2, finished_at = datetime('now') WHERE run_id = ?1",
-            rusqlite::params![run_id, status],
+            "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
+                prompt_tokens = ?3, completion_tokens = ?4, model = ?5 WHERE run_id = ?1",
+            rusqlite::params![
+                run_id,
+                status,
+                usage.map(|usage| usage.input_tokens).unwrap_or(0) as i64,
+                usage.map(|usage| usage.output_tokens).unwrap_or(0) as i64,
+                model
+            ],
         )?;
         events::append_in_tx(
             &tx,
@@ -332,6 +369,106 @@ fn finish_run(pool: &DbPool, session_id: &str, run_id: &str, status: &str, error
 // The pump
 // =============================================================================
 
+/// Where a delegation's spending is watched.
+///
+/// The two variants are not two implementations of one measurement; they are
+/// different facts about WHO COUNTED, and they are kept apart so the difference
+/// survives into the run row, the block's output and the timeline.
+enum Spend<'a> {
+    /// §17.3 as written: the meter sits on the adapter's wire, so the ceiling
+    /// holds even against a CLI and a provider that both report whatever they
+    /// like, and crossing it cuts the traffic mid-response.
+    MeteredByAdapter {
+        tickets: &'a TicketRegistry,
+        ticket_id: &'a str,
+    },
+    /// §17.3's measurement GIVEN UP, deliberately and visibly. On a
+    /// self-authenticated engine no provider traffic crosses a socket of ours,
+    /// so there is nothing of ours to meter and the ceiling is enforced against
+    /// the vendor's own numbers. A vendor that under-reports therefore
+    /// under-bills, and the only other bound left on such a run is its deadline.
+    ReportedByProvider { budget_tokens: u64 },
+}
+
+impl Spend<'_> {
+    /// Why the delegation must stop now, if it must. `None` means it may go on.
+    fn exhausted(&self, reported: &ProviderReportedUsage) -> Option<String> {
+        match self {
+            Spend::MeteredByAdapter { tickets, ticket_id } => {
+                tickets.exhausted(ticket_id).map(|what| {
+                    format!(
+                        "its {what} budget is exhausted; the CLI's traffic was cut at the adapter \
+                         and nothing further was spent"
+                    )
+                })
+            }
+            Spend::ReportedByProvider { budget_tokens } => {
+                let spent = reported.total_tokens();
+                (spent >= *budget_tokens).then(|| {
+                    format!(
+                        "the provider reports {spent} tokens against a ceiling of \
+                         {budget_tokens}. The engine holds its own credential, so nothing cut its \
+                         traffic mid-request the way the metered path does — the CLI is stopped \
+                         here, at the next event"
+                    )
+                })
+            }
+        }
+    }
+}
+
+/// What one delegation spent, and who counted it.
+#[derive(Debug, Clone, PartialEq)]
+struct DelegationUsage {
+    input_tokens: u64,
+    output_tokens: u64,
+    /// Provider requests the adapter saw, or vendor messages that carried a
+    /// usage report when the adapter saw none.
+    requests: u32,
+    /// USD the PROVIDER stated for the turn, when it stated any. Never computed
+    /// here: there is no price feed on the node, and a derived number would look
+    /// measured while being a guess.
+    cost_usd: Option<f64>,
+    /// Time the PROVIDER said it spent answering. `None` on the metered path —
+    /// the adapter counts tokens, requests and bytes, and reporting a duration
+    /// it never timed would be inventing a field.
+    api_duration_ms: Option<u64>,
+    /// `DelegationAuth::usage_source` — 'adapter' or 'provider_reported'.
+    source: &'static str,
+}
+
+impl DelegationUsage {
+    /// What the adapter measured on its own wire (§17.3).
+    fn metered(usage: cli_adapter::Usage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens,
+            output_tokens: usage.output_tokens,
+            requests: usage.requests,
+            // The adapter deliberately does no cost arithmetic, and the provider
+            // states none on the inference API.
+            cost_usd: None,
+            api_duration_ms: None,
+            source: DelegationAuth::OrgCredential.usage_source(),
+        }
+    }
+
+    /// What the vendor said it spent. The same columns, a different provenance.
+    fn reported(usage: &ProviderReportedUsage) -> Self {
+        Self {
+            input_tokens: usage.input_tokens(),
+            output_tokens: usage.output_tokens(),
+            requests: usage.reports(),
+            cost_usd: usage.cost_usd(),
+            api_duration_ms: (usage.api_duration_ms() > 0).then(|| usage.api_duration_ms()),
+            source: DelegationAuth::ProviderLogin.usage_source(),
+        }
+    }
+
+    fn total_tokens(&self) -> u64 {
+        self.input_tokens.saturating_add(self.output_tokens)
+    }
+}
+
 /// What one delegated turn produced.
 #[derive(Debug)]
 struct Pumped {
@@ -339,6 +476,10 @@ struct Pumped {
     state: Option<TurnState>,
     approvals: u32,
     denied_approvals: u32,
+    /// What the vendor said it spent while the turn ran. Accumulated in both
+    /// modes — it is free, and it is the only usage figure that exists in one of
+    /// them — but it only ENFORCES a budget under `Spend::ReportedByProvider`.
+    reported: ProviderReportedUsage,
 }
 
 /// Mirrors the vendor's stream onto the session timeline until the turn ends,
@@ -353,8 +494,7 @@ async fn pump(
     pool: &DbPool,
     instance: &mut CliInstance,
     approvals: &ApprovalContext<'_>,
-    tickets: &TicketRegistry,
-    ticket_id: &str,
+    spend: &Spend<'_>,
     deadline: Instant,
     cancel: &tokio_util::sync::CancellationToken,
 ) -> Result<Pumped> {
@@ -363,22 +503,22 @@ async fn pump(
         state: None,
         approvals: 0,
         denied_approvals: 0,
+        reported: ProviderReportedUsage::default(),
     };
     let mut ordinal: u64 = 0;
     loop {
         if cancel.is_cancelled() {
             return Err(anyhow!("delegate_cli: the run was cancelled"));
         }
-        // Budget first: the adapter already stopped the traffic mid-response,
-        // so continuing to poll would only add latency to a decided outcome.
-        if let Some(what) = tickets.exhausted(ticket_id) {
-            return Err(anyhow!(
-                "delegate_cli: the delegation stopped because its {what} budget is exhausted; \
-                 the CLI's traffic was cut at the adapter and nothing further was spent"
-            ));
+        // Budget first: under the metered path the adapter already stopped the
+        // traffic mid-response, so polling on would only add latency to a
+        // decided outcome; under the reported one this check IS the stop.
+        if let Some(why) = spend.exhausted(&pumped.reported) {
+            return Err(anyhow!("delegate_cli: the delegation stopped because {why}"));
         }
         for event in bridge.poll(pool, instance).await? {
             ordinal += 1;
+            pumped.reported.observe(&event);
             match &event {
                 BridgeEvent::Text { text, .. } => {
                     let text = redact::redact_text(text);
@@ -534,70 +674,82 @@ fn append_message(pool: &DbPool, instance: &CliInstance, text: &str, ordinal: u6
 }
 
 // =============================================================================
-// Ticket issuance
+// Authorization and ticket issuance
 // =============================================================================
 
-/// Mints the run's ticket, asking the operator when the PEP says to.
+/// Runs `cli_delegate` past the PEP, asking the operator when the policy says
+/// to, and returns the session context the decision leaves behind.
 ///
-/// The PEP is consulted inside `cli_adapter::issue_ticket`; this function adds
-/// only the operator round-trip, using the same suspend/persist machinery a
-/// model-issued tool call uses. There is no second place where `cli_delegate`
-/// is decided.
-async fn mint_ticket(
+/// This is step 5 for BOTH modes. The capability is "may this run delegate a
+/// turn to a vendor CLI"; a ticket is one consequence of the answer, not the
+/// question, so a delegation that mints none is decided by the same rule and in
+/// the same place. `cli_adapter::issue_ticket` calls the same function, which is
+/// why there is no second place where `cli_delegate` is decided.
+///
+/// The host is passed as allowlisted because the provider this engine reaches is
+/// the one an administrator recorded — in the vault row, or in the login the CLI
+/// already carries — and `ensure_engine_verified` has already refused every
+/// engine that decision was never made for. `local_only`, the one policy that
+/// forbids a provider outright, was refused before this.
+async fn authorize_delegation(
     call_ctx: &ToolCallCtx<'_>,
     bound: &Bound,
-    tickets: &TicketRegistry,
-    request: TicketRequest,
-) -> Result<IssuedTicket> {
+    engine_id: &str,
+) -> Result<pep::SessionCtx> {
     // The engine is the grant's target: "always allow delegating to codex" is a
     // permission an operator can actually reason about, whereas a grant with no
     // target would cover every engine ever configured.
-    let target_label = request.engine_id.clone();
-    let session_ctx = tools::session_ctx_for(
-        call_ctx.main_db,
-        bound,
-        Capability::CliDelegate,
-        Some(&target_label),
-    )?;
-    let summary = match cli_adapter::issue_ticket(tickets, &session_ctx, request.clone())? {
-        TicketDecision::Issued(ticket) => return Ok(*ticket),
-        TicketDecision::Denied { reason } => {
-            return Err(anyhow!("delegate_cli: {reason}"));
-        }
-        TicketDecision::Ask { summary } => summary,
+    let session_ctx =
+        tools::session_ctx_for(call_ctx.main_db, bound, Capability::CliDelegate, Some(engine_id))?;
+    let summary = match cli_adapter::authorize_delegation(&session_ctx, true) {
+        DelegateDecision::Allow => return Ok(session_ctx),
+        DelegateDecision::Deny { reason } => return Err(anyhow!("delegate_cli: {reason}")),
+        DelegateDecision::Ask { summary } => summary,
     };
 
     let decision = tools::suspend_for_operator(
         call_ctx,
         bound,
         Capability::CliDelegate,
-        Some(&target_label),
+        Some(engine_id),
         &summary,
         AskKind::Permission,
     )
     .await?;
     if !decision.allows() {
         return Err(anyhow!(
-            "delegate_cli: the operator refused to delegate this turn to '{target_label}'"
+            "delegate_cli: the operator refused to delegate this turn to '{engine_id}'"
         ));
     }
     tools::persist_grant(
         call_ctx,
         bound,
         Capability::CliDelegate,
-        Some(&target_label),
+        Some(engine_id),
         decision,
     )?;
 
     // The operator answered for THIS run, so that is the grant the PEP is told
-    // about. Re-running the whole decision (rather than skipping it) keeps the
-    // role, the autonomy mode and the boundary in force — an approval buys none
-    // of those.
-    let granted = pep::SessionCtx {
+    // about. Everything else is re-decided from the same context rather than
+    // skipped, which keeps the role, the autonomy mode and the boundary in
+    // force — an approval buys none of those.
+    Ok(pep::SessionCtx {
         run_granted: true,
         ..session_ctx
-    };
-    match cli_adapter::issue_ticket(tickets, &granted, request)? {
+    })
+}
+
+/// Mints the run's ticket from a context the PEP has already answered for.
+///
+/// `issue_ticket` re-runs the decision rather than trusting this caller, so an
+/// `Ask` reaching here means the answer did not authorize what it was asked
+/// about — which is a refusal, not a second question.
+fn mint_ticket(
+    tickets: &TicketRegistry,
+    granted: &pep::SessionCtx,
+    request: TicketRequest,
+) -> Result<IssuedTicket> {
+    match cli_adapter::issue_ticket(tickets, granted, request)? {
         TicketDecision::Issued(ticket) => Ok(*ticket),
         TicketDecision::Denied { reason } => Err(anyhow!("delegate_cli: {reason}")),
         TicketDecision::Ask { summary } => Err(anyhow!(
@@ -608,8 +760,56 @@ async fn mint_ticket(
 }
 
 // =============================================================================
-// Adapter start
+// Adapter start and process wiring
 // =============================================================================
+
+/// The wiring one delegation hands the CLI process, per mode.
+enum Delegation<'a> {
+    /// §7.5: the adapter is the CLI's provider and the ticket is its key.
+    Adapter {
+        adapter: &'a AdapterHandle,
+        ticket: IssuedTicket,
+    },
+    /// The engine authenticates itself, so the CLI gets NOTHING from us.
+    ProviderLogin,
+}
+
+impl Delegation<'_> {
+    /// Environment and arguments the CLI process is started with.
+    ///
+    /// The empty pair is the whole mechanism of `ProviderLogin`, not an
+    /// omission: `ANTHROPIC_BASE_URL` would move the traffic off the account,
+    /// an API key variable would be preferred over the login, and a private
+    /// `CLAUDE_CONFIG_DIR` is the login's own directory — set it and the CLI
+    /// starts logged out. So the process inherits the bridge's environment and
+    /// sees exactly the account the operator already has on this node.
+    fn cli_wiring(&self) -> (Vec<(String, String)>, Vec<String>) {
+        match self {
+            Delegation::Adapter { adapter, ticket } => {
+                (adapter.sandbox_env(ticket), adapter.cli_args())
+            }
+            Delegation::ProviderLogin => (Vec::new(), Vec::new()),
+        }
+    }
+
+    fn ticket_id(&self) -> Option<&str> {
+        match self {
+            Delegation::Adapter { ticket, .. } => Some(ticket.claims.ticket_id.as_str()),
+            Delegation::ProviderLogin => None,
+        }
+    }
+
+    /// Which of the two spending facts applies to this run.
+    fn spend<'a>(&'a self, tickets: &'a TicketRegistry, budget_tokens: u64) -> Spend<'a> {
+        match self {
+            Delegation::Adapter { ticket, .. } => Spend::MeteredByAdapter {
+                tickets,
+                ticket_id: ticket.claims.ticket_id.as_str(),
+            },
+            Delegation::ProviderLogin => Spend::ReportedByProvider { budget_tokens },
+        }
+    }
+}
 
 /// The workspace's own statement about how its egress is enforced. A row whose
 /// value this build does not know is refused rather than assumed: guessing here
@@ -808,20 +1008,24 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     &run_id,
                     report.run_status,
                     (!completed).then_some(report.detail.as_str()),
+                    Some(&report.usage),
+                    &config.model,
                 );
                 if !completed {
                     // The usage travels with the refusal: an operator reading a
-                    // failed delegation needs to know what it already spent.
+                    // failed delegation needs to know what it already spent, and
+                    // who says so.
                     return Err(anyhow!(
                         "delegate_cli node '{}': the delegation to '{}' ended '{}': {} (spent {} \
-                         of {} tokens over {} request(s))",
+                         of {} tokens over {} request(s), counted by '{}')",
                         node.id,
                         config.engine,
                         report.run_status,
                         report.detail,
                         report.usage.total_tokens(),
                         config.budget,
-                        report.usage.requests
+                        report.usage.requests,
+                        report.usage.source
                     ));
                 }
                 let mut out: FlowEnvelope = (**envelope).clone();
@@ -840,6 +1044,8 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     &run_id,
                     "failed",
                     Some(&message),
+                    None,
+                    &config.model,
                 );
                 Err(error)
             }
@@ -893,7 +1099,8 @@ struct Report {
     run_status: &'static str,
     detail: String,
     transcript: String,
-    usage: cli_adapter::Usage,
+    usage: DelegationUsage,
+    auth: DelegationAuth,
     approvals: u32,
     denied_approvals: u32,
     vendor_session_id: String,
@@ -913,12 +1120,19 @@ impl Report {
             "patch_set_id": patch_set_id,
             "approvals": self.approvals,
             "approvals_denied": self.denied_approvals,
+            // The mode is part of the answer, not trivia: a downstream block
+            // reading `usage` has to be able to tell a number we measured from
+            // one the vendor stated (§17.3).
+            "auth_mode": self.auth.slug(),
             "usage": {
                 "requests": self.usage.requests,
                 "input_tokens": self.usage.input_tokens,
                 "output_tokens": self.usage.output_tokens,
                 "total_tokens": self.usage.total_tokens(),
                 "budget_tokens": config.budget,
+                "cost_usd": self.usage.cost_usd,
+                "api_duration_ms": self.usage.api_duration_ms,
+                "source": self.usage.source,
             },
         })
     }
@@ -938,25 +1152,77 @@ async fn delegate(
     prompt: &str,
     ctx: &ExecutionContext,
 ) -> Result<Report> {
-    let tickets = Arc::new(TicketRegistry::new());
-    let sink: Arc<dyn AdapterEventSink> = Arc::new(TimelineSink {
-        pool: bound.pool.clone(),
-        session_id: bound.session.id.clone(),
-        run_id: run_id.to_string(),
-        counter: AtomicU64::new(0),
-    });
-    let adapter = start_adapter_for(
+    // Step 4 — what pays for the turn. Read off this node: a vault row, or the
+    // engine's own login. The probe is a future, so the bridge is only asked
+    // when the vault did not already answer.
+    let auth = cli_adapter::resolve_delegation_auth(
         call_ctx.main_db,
-        cipher,
-        bound,
+        &bound.workspace.org_id,
+        // The vault is node-local and this workspace's runtime database only
+        // exists on its owner node, so the workspace's node IS this node.
+        &bound.workspace.node_id,
         &config.engine,
-        sink,
-        tickets.clone(),
+        bridge.provider_login(),
     )
-    .await?;
+    .await
+    .map_err(|refusal| anyhow!("delegate_cli: {refusal}"))?;
+
+    // Step 5 — the PEP, in both modes, before anything is started or spent.
+    let granted = authorize_delegation(call_ctx, bound, &config.engine).await?;
+    let _ = events::append(
+        &bound.pool,
+        &bound.session.id,
+        SessionEvent::new(
+            format!("cli-delegation:{run_id}"),
+            EventPayload::CliDelegationAuthorized {
+                engine_id: config.engine.clone(),
+                auth_mode: auth.slug().to_string(),
+                usage_source: auth.usage_source().to_string(),
+                budget_tokens: config.budget as u64,
+            },
+        )
+        .with_run(run_id.to_string()),
+    );
+
+    let tickets = Arc::new(TicketRegistry::new());
+    let adapter = match auth {
+        DelegationAuth::OrgCredential => {
+            let sink: Arc<dyn AdapterEventSink> = Arc::new(TimelineSink {
+                pool: bound.pool.clone(),
+                session_id: bound.session.id.clone(),
+                run_id: run_id.to_string(),
+                counter: AtomicU64::new(0),
+            });
+            Some(
+                start_adapter_for(
+                    call_ctx.main_db,
+                    cipher,
+                    bound,
+                    &config.engine,
+                    sink,
+                    tickets.clone(),
+                )
+                .await?,
+            )
+        }
+        // Nothing to start: the CLI's provider is the CLI's own, and an adapter
+        // in front of a login it does not use would be a socket nobody calls.
+        DelegationAuth::ProviderLogin => None,
+    };
 
     let result = run_delegation(
-        call_ctx, bound, bridge, config, &adapter, &tickets, run_id, worktree, prompt, ctx,
+        call_ctx.main_db,
+        bound,
+        bridge,
+        config,
+        auth,
+        adapter.as_ref(),
+        &granted,
+        &tickets,
+        run_id,
+        worktree,
+        prompt,
+        ctx,
     )
     .await;
 
@@ -964,17 +1230,21 @@ async fn delegate(
     // delegation ends (§7.5) — and stopping the adapter is what drops the
     // organization's credential out of this process.
     tickets.revoke_run(run_id);
-    adapter.shutdown();
+    if let Some(adapter) = adapter {
+        adapter.shutdown();
+    }
     result
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_delegation(
-    call_ctx: &ToolCallCtx<'_>,
+    main_db: &DbPool,
     bound: &Bound,
     bridge: &CliBridge,
     config: &DelegationConfig,
-    adapter: &AdapterHandle,
+    auth: DelegationAuth,
+    adapter: Option<&AdapterHandle>,
+    granted: &pep::SessionCtx,
     tickets: &Arc<TicketRegistry>,
     run_id: &str,
     worktree: &std::path::Path,
@@ -982,45 +1252,48 @@ async fn run_delegation(
     ctx: &ExecutionContext,
 ) -> Result<Report> {
     let instance_id = uuid::Uuid::new_v4().to_string();
-    let wiring = adapter.wiring();
-    let ticket = mint_ticket(
-        call_ctx,
-        bound,
-        tickets,
-        TicketRequest {
-            session_id: bound.session.id.clone(),
-            run_id: run_id.to_string(),
-            cli_instance_id: instance_id.clone(),
-            engine_id: config.engine.clone(),
-            model: config.model.clone(),
-            model_aliases: config.model_aliases(),
-            methods: wiring.ticket_methods.clone(),
-            path_prefixes: wiring.ticket_path_prefixes.clone(),
-            budget: config.budget(),
-            ttl: Duration::from_secs(config.timeout_secs),
-            // The provider this engine reaches is the one an administrator
-            // recorded in the vault row and signed off in the Phase 0B note;
-            // `ensure_engine_verified` has already refused every engine that
-            // decision was never made for. `local_only` was refused earlier,
-            // and it is the one policy that forbids a provider outright.
-            host_allowlisted: true,
-        },
-    )
-    .await?;
-    let _ = events::append(
-        &bound.pool,
-        &bound.session.id,
-        SessionEvent::new(
-            format!("cli-ticket:{}", ticket.claims.ticket_id),
-            ticket.event(),
-        )
-        .with_run(run_id.to_string()),
-    );
+    let delegation = match adapter {
+        Some(adapter) => {
+            let wiring = adapter.wiring();
+            let ticket = mint_ticket(
+                tickets,
+                granted,
+                TicketRequest {
+                    session_id: bound.session.id.clone(),
+                    run_id: run_id.to_string(),
+                    cli_instance_id: instance_id.clone(),
+                    engine_id: config.engine.clone(),
+                    model: config.model.clone(),
+                    model_aliases: config.model_aliases(),
+                    methods: wiring.ticket_methods.clone(),
+                    path_prefixes: wiring.ticket_path_prefixes.clone(),
+                    budget: config.budget(),
+                    ttl: Duration::from_secs(config.timeout_secs),
+                    // The provider this engine reaches is the one an
+                    // administrator recorded in the vault row and signed off in
+                    // the Phase 0B note; `ensure_engine_verified` has already
+                    // refused every engine that decision was never made for.
+                    host_allowlisted: true,
+                },
+            )?;
+            let _ = events::append(
+                &bound.pool,
+                &bound.session.id,
+                SessionEvent::new(
+                    format!("cli-ticket:{}", ticket.claims.ticket_id),
+                    ticket.event(),
+                )
+                .with_run(run_id.to_string()),
+            );
+            Delegation::Adapter { adapter, ticket }
+        }
+        None => Delegation::ProviderLogin,
+    };
 
-    let env = adapter.sandbox_env(&ticket);
     // For codex the provider override is not an environment variable at all; it
-    // is configuration the process has to be started with (§7.5).
-    let args = adapter.cli_args();
+    // is configuration the process has to be started with (§7.5). For a
+    // self-authenticated engine both halves are empty on purpose.
+    let (env, args) = delegation.cli_wiring();
     let mut instance = bridge
         .open(
             &bound.pool,
@@ -1030,7 +1303,7 @@ async fn run_delegation(
                 run_id,
                 worktree,
                 model: &config.model,
-                ticket_id: Some(&ticket.claims.ticket_id),
+                ticket_id: delegation.ticket_id(),
                 resume_vendor_session_id: None,
                 env: &env,
                 args: &args,
@@ -1039,12 +1312,11 @@ async fn run_delegation(
         .await?;
 
     let turn = drive_turn(
-        call_ctx.main_db,
+        main_db,
         bridge,
         bound,
         config,
-        tickets,
-        &ticket,
+        &delegation.spend(tickets, config.budget as u64),
         &mut instance,
         prompt,
         ctx,
@@ -1066,17 +1338,20 @@ async fn run_delegation(
     }
 
     let pumped = turn?;
-    let usage = tickets
-        .usage(&ticket.claims.ticket_id)
-        .unwrap_or_default();
+    // Whichever number exists for this mode. Under the adapter it is what we
+    // metered on our own wire; under a provider login it is what the vendor
+    // printed about itself, and `DelegationUsage::source` is what says which.
+    let usage = match delegation.ticket_id() {
+        Some(ticket_id) => DelegationUsage::metered(tickets.usage(ticket_id).unwrap_or_default()),
+        None => DelegationUsage::reported(&pumped.reported),
+    };
     let (run_status, detail) = match &pumped.state {
         Some(TurnState::Completed) => ("completed", "the vendor reported the turn complete".into()),
         Some(TurnState::Failed(reason)) => ("failed", redact::redact_text(reason)),
         None => (
             "timed_out",
             format!(
-                "the vendor announced no end of turn within {}s; the CLI was closed and its \
-                 ticket revoked",
+                "the vendor announced no end of turn within {}s; the CLI was closed",
                 config.timeout_secs
             ),
         ),
@@ -1086,6 +1361,7 @@ async fn run_delegation(
         detail,
         transcript: pumped.transcript,
         usage,
+        auth,
         approvals: pumped.approvals,
         denied_approvals: pumped.denied_approvals,
         vendor_session_id: instance.vendor_session_id.clone(),
@@ -1099,8 +1375,7 @@ async fn drive_turn(
     bridge: &CliBridge,
     bound: &Bound,
     config: &DelegationConfig,
-    tickets: &Arc<TicketRegistry>,
-    ticket: &IssuedTicket,
+    spend: &Spend<'_>,
     instance: &mut CliInstance,
     prompt: &str,
     ctx: &ExecutionContext,
@@ -1154,8 +1429,7 @@ async fn drive_turn(
         &bound.pool,
         instance,
         &approvals,
-        tickets,
-        &ticket.claims.ticket_id,
+        spend,
         deadline,
         &ctx.cancel_token,
     )
@@ -1208,6 +1482,10 @@ mod tests {
         answered: Arc<Mutex<Vec<(u64, String)>>>,
         prompts: Arc<Mutex<Vec<String>>>,
         closed: Arc<Mutex<bool>>,
+        /// What `/auth/status` reports — the bridge's answer to "is the CLI
+        /// logged in on this node". Settable, because the decision it feeds is
+        /// exactly what the two authentication modes turn on.
+        authenticated: Arc<std::sync::atomic::AtomicBool>,
     }
 
     async fn stub_bridge(script: Vec<Value>) -> StubBridge {
@@ -1216,10 +1494,17 @@ mod tests {
         let answered = Arc::new(Mutex::new(Vec::new()));
         let prompts = Arc::new(Mutex::new(Vec::new()));
         let closed = Arc::new(Mutex::new(false));
-        let (a, p, c) = (answered.clone(), prompts.clone(), closed.clone());
+        let authenticated = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let (a, p, c, auth) = (
+            answered.clone(),
+            prompts.clone(),
+            closed.clone(),
+            authenticated.clone(),
+        );
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (script, a, p, c) = (script.clone(), a.clone(), p.clone(), c.clone());
+                let (script, a, p, c, auth) =
+                    (script.clone(), a.clone(), p.clone(), c.clone(), auth.clone());
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0_u8; 4096];
@@ -1265,7 +1550,12 @@ mod tests {
                     let payload: Value =
                         serde_json::from_str(&body).unwrap_or(Value::Object(Default::default()));
 
-                    let response = if method == "POST" && target == "/sessions" {
+                    let response = if target == "/auth/status" {
+                        json!({
+                            "authenticated": auth.load(std::sync::atomic::Ordering::SeqCst),
+                            "status": "authenticated",
+                        })
+                    } else if method == "POST" && target == "/sessions" {
                         json!({"session": {"id": "bridge-1", "vendor_session_id": "vendor-1"}})
                     } else if target.ends_with("/turn") {
                         p.lock()
@@ -1311,6 +1601,7 @@ mod tests {
             answered,
             prompts,
             closed,
+            authenticated,
         }
     }
 
@@ -1531,6 +1822,14 @@ mod tests {
         (data, pool, bridge, tickets, *ticket, instance, stub)
     }
 
+    /// The metered spending fact, for tests that exercise the adapter path.
+    fn metered<'a>(tickets: &'a TicketRegistry, ticket: &'a IssuedTicket) -> Spend<'a> {
+        Spend::MeteredByAdapter {
+            tickets,
+            ticket_id: ticket.claims.ticket_id.as_str(),
+        }
+    }
+
     fn approval_context<'a>(
         engine_id: &'a str,
         grants: &'a (dyn Fn(Capability) -> pep::SessionCtx + Send + Sync),
@@ -1613,8 +1912,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             // Generous: the deadline must NOT be what ends this.
             Instant::now() + Duration::from_secs(60),
             &cancel,
@@ -1699,8 +1997,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             Instant::now() + Duration::from_secs(30),
             &cancel,
         )
@@ -1769,8 +2066,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             Instant::now() + Duration::from_secs(30),
             &cancel,
         )
@@ -1824,8 +2120,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             Instant::now() + Duration::from_secs(30),
             &cancel,
         )
@@ -1909,8 +2204,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             Instant::now() + Duration::from_millis(400),
             &cancel,
         )
@@ -1971,8 +2265,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             Instant::now() + Duration::from_secs(5),
             &cancel,
         )
@@ -2096,8 +2389,7 @@ mod tests {
             &pool,
             &mut instance,
             &approvals,
-            &tickets,
-            &ticket.claims.ticket_id,
+            &metered(&tickets, &ticket),
             Instant::now() + Duration::from_secs(30),
             &cancel,
         )
@@ -2133,6 +2425,321 @@ mod tests {
 
         workspace_db::close("wsclperm");
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// A delegation to an engine that authenticates ITSELF gets past the point
+    /// where it used to die, and gets there without a credential in the vault.
+    ///
+    /// The old order was unconditional: `delegate_cli` started the provider
+    /// adapter, the adapter read `code_agent_credentials`, and a node whose CLI
+    /// carries an operator login — which is the normal state of a workstation —
+    /// was refused `credential_missing` before a CLI was ever started. Step (2)
+    /// pins that this is still exactly what the vault says, so the test cannot
+    /// pass by the row quietly appearing; step (3) is the new decision reading
+    /// the same node and answering differently.
+    ///
+    /// The Phase 0B gate is NOT waived: it is satisfied here the only way it can
+    /// be, by an administrator's recorded decision, and the delegation is shown
+    /// to pass it. What changes is only what is required after it.
+    #[tokio::test]
+    async fn a_self_authenticated_engine_delegates_without_a_vault_credential() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let pool = workspace_fixture("wslogin", "run-login");
+        let stub = stub_bridge(Vec::new()).await;
+        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
+        let bridge = resolve_bridge(&db, service_id, "claude-code").expect("bridge");
+        let cipher = crate::crypto::SettingsCipher::new(&[7_u8; 32]);
+
+        // (1) The organization's go/no-go, recorded as §17.1 requires: the flag
+        // AND the note. Without both the delegation is refused whatever else is
+        // true, and that has not changed.
+        crate::db::repository::set_setting(
+            &db,
+            &format!("{}claude-code", cli_adapter::BASE_URL_OVERRIDE_VERIFIED_PREFIX),
+            "true",
+        )
+        .expect("flag");
+        crate::db::repository::set_setting(
+            &db,
+            &format!("{}claude-code", cli_adapter::GO_NO_GO_NOTE_PREFIX),
+            "claude 2.1.233, verified 2026-08-14 by the platform owner",
+        )
+        .expect("note");
+        cli_adapter::ensure_engine_verified(&db, "claude-code", EgressEnforcement::Unrestricted)
+            .expect("the gate passes once the decision is recorded");
+
+        // (2) The vault is empty for this engine — the exact fact that used to
+        // end the delegation.
+        let missing = crate::code_studio::vault::get_agent_credential(
+            &db,
+            &cipher,
+            "org-1",
+            "node-1",
+            "claude-code",
+        )
+        .expect_err("the vault holds nothing for this engine");
+        assert!(
+            missing.to_string().contains("credential_missing"),
+            "{missing}"
+        );
+
+        // (3) The delegation is authenticated all the same, because the CLI is.
+        let auth = cli_adapter::resolve_delegation_auth(
+            &db,
+            "org-1",
+            "node-1",
+            "claude-code",
+            bridge.provider_login(),
+        )
+        .await
+        .expect("a logged-in CLI is an authenticated delegation");
+        assert_eq!(auth, DelegationAuth::ProviderLogin);
+        assert_eq!(auth.usage_source(), "provider_reported");
+
+        // (4) And it hands the CLI nothing. Each of the three variables the
+        // adapter path sets would take the operator's login away — the config
+        // directory IS the login — so the wiring has to be empty, not merely
+        // free of the credential.
+        let delegation: Delegation<'_> = Delegation::ProviderLogin;
+        let (env, args) = delegation.cli_wiring();
+        assert!(env.is_empty(), "{env:?}");
+        assert!(args.is_empty(), "{args:?}");
+        assert_eq!(delegation.ticket_id(), None);
+
+        // (5) The CLI instance starts, over the real bridge client, with that
+        // wiring and no ticket.
+        let instance = bridge
+            .open(
+                &pool,
+                OpenCliInstance {
+                    instance_id: "cli-login",
+                    session_id: "sess-1",
+                    run_id: "run-login",
+                    worktree: data.path(),
+                    model: "sonnet",
+                    ticket_id: delegation.ticket_id(),
+                    resume_vendor_session_id: None,
+                    env: &env,
+                    args: &args,
+                },
+            )
+            .await
+            .expect("the CLI instance starts without a credential in the vault");
+        assert_eq!(
+            cli_bridge::instance_status(&pool, &instance.id)
+                .expect("status")
+                .as_deref(),
+            Some("ready")
+        );
+        let ticket_id: Option<String> = {
+            let conn = pool.read().expect("read");
+            conn.query_row(
+                "SELECT ticket_id FROM cli_instances WHERE id = 'cli-login'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("instance row")
+        };
+        assert_eq!(
+            ticket_id, None,
+            "a run on the engine's own login mints no ticket, so the column has to stay empty \
+             rather than carry a placeholder"
+        );
+
+        workspace_db::close("wslogin");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// On a self-authenticated engine the budget is the VENDOR's arithmetic, and
+    /// the block treats it as such: it reads the numbers out of the stream, it
+    /// does not add the per-message reports to the vendor's own total, and a
+    /// ceiling crossed stops the delegation.
+    ///
+    /// This is the §17.3 gap under test rather than papered over. Nothing here
+    /// measured anything — a vendor that under-reports under-bills, and what the
+    /// test can pin is that we read what it does report, honestly.
+    #[tokio::test]
+    async fn a_provider_reported_budget_is_read_from_the_stream_and_enforced() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let turn = || {
+            vec![
+                json!({"seq": 1, "kind": "claude", "data": {
+                    "type": "assistant",
+                    "message": {
+                        "content": [{"type": "text", "text": "reading the parser"}],
+                        "usage": {"input_tokens": 900, "cache_read_input_tokens": 100,
+                                  "output_tokens": 50}
+                    }
+                }}),
+                json!({"seq": 2, "kind": "claude", "data": {
+                    "type": "result",
+                    "subtype": "success",
+                    "duration_api_ms": 4220,
+                    "total_cost_usd": 0.0477,
+                    // The vendor's own total for the whole turn: the same
+                    // tokens the assistant message already reported.
+                    "usage": {"input_tokens": 1000, "output_tokens": 50},
+                    "result": "done"
+                }}),
+            ]
+        };
+
+        // --- inside the ceiling: the turn runs, and the numbers are the
+        //     vendor's total, not the sum of its two reports ---
+        let (data, pool, bridge, tickets, ticket, mut instance, _stub) =
+            scenario("wsreport", "run-report", "cli-report", 10_000, turn()).await;
+        let registry = crate::agents::interaction::InteractionRegistry::new();
+        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
+        let approvals = approval_context(
+            "claude-code",
+            &grants,
+            data.path(),
+            "run-report",
+            &registry,
+            &progress,
+        );
+        let cancel = tokio_util::sync::CancellationToken::new();
+        let pumped = pump(
+            &bridge,
+            &pool,
+            &mut instance,
+            &approvals,
+            &Spend::ReportedByProvider {
+                budget_tokens: 10_000,
+            },
+            Instant::now() + Duration::from_secs(5),
+            &cancel,
+        )
+        .await
+        .expect("pump");
+        assert_eq!(pumped.state, Some(TurnState::Completed));
+        assert_eq!(
+            pumped.reported.total_tokens(),
+            1_050,
+            "the per-message report and the turn total describe the SAME tokens; adding them \
+             would bill the turn twice"
+        );
+        let usage = DelegationUsage::reported(&pumped.reported);
+        assert_eq!(usage.input_tokens, 1_000);
+        assert_eq!(usage.output_tokens, 50);
+        assert_eq!(usage.cost_usd, Some(0.0477));
+        assert_eq!(usage.api_duration_ms, Some(4_220));
+        assert_eq!(
+            usage.source, "provider_reported",
+            "the provenance travels with the number, or a reader takes the vendor's word for a \
+             measurement"
+        );
+        // The adapter's ticket was never touched: nothing on this path went
+        // through it.
+        assert_eq!(tickets.usage(&ticket.claims.ticket_id), Some(Default::default()));
+        workspace_db::close("wsreport");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+
+        // --- over the ceiling: a turn STILL RUNNING that has already reported
+        //     more than it was allowed. That is the case the check exists for —
+        //     a turn the vendor has already ended is over, and re-labelling it
+        //     would rewrite an outcome rather than prevent one.
+        let (data, pool, bridge, _tickets, _ticket, mut instance, _stub) = scenario(
+            "wsreport2",
+            "run-report2",
+            "cli-report2",
+            10_000,
+            turn().into_iter().take(1).collect(),
+        )
+        .await;
+        let approvals = approval_context(
+            "claude-code",
+            &grants,
+            data.path(),
+            "run-report2",
+            &registry,
+            &progress,
+        );
+        let error = pump(
+            &bridge,
+            &pool,
+            &mut instance,
+            &approvals,
+            &Spend::ReportedByProvider { budget_tokens: 200 },
+            // Generous: the deadline must NOT be what ends this.
+            Instant::now() + Duration::from_secs(60),
+            &cancel,
+        )
+        .await
+        .expect_err("a crossed ceiling ends the delegation");
+        let message = format!("{error:#}");
+        assert!(
+            message.contains("the provider reports 1050 tokens against a ceiling of 200"),
+            "{message}"
+        );
+        assert!(
+            message.contains("nothing cut its traffic mid-request"),
+            "the refusal has to say that this ceiling is not the metered one: {message}"
+        );
+        workspace_db::close("wsreport2");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// The other half: an engine with neither an organization credential nor a
+    /// login of its own is still refused, and the refusal names both halves.
+    ///
+    /// "Not authenticated" must not be able to read as "authenticated by the
+    /// operator" — that is the failure mode this whole mode introduces, and the
+    /// probe answering `false` (or not answering at all) has to end the
+    /// delegation rather than start a CLI that talks to a provider as nobody.
+    #[tokio::test]
+    async fn an_engine_with_no_credential_and_no_login_is_refused_by_name() {
+        let stub = stub_bridge(Vec::new()).await;
+        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
+        let bridge = resolve_bridge(&db, service_id, "claude-code").expect("bridge");
+
+        stub.authenticated
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        let refusal = cli_adapter::resolve_delegation_auth(
+            &db,
+            "org-1",
+            "node-1",
+            "claude-code",
+            bridge.provider_login(),
+        )
+        .await
+        .expect_err("nothing authenticates this delegation");
+        let reason = refusal.to_string();
+        assert!(reason.contains("credential_missing"), "{reason}");
+        assert!(
+            reason.contains("no provider login of its own"),
+            "the refusal has to name the second half too, or an administrator only learns about \
+             the vault: {reason}"
+        );
+
+        // A bridge that cannot answer is not a login either: an unreachable
+        // probe must never be read as a yes. The reason changes, the outcome
+        // does not.
+        let dead = {
+            let listener = TcpListener::bind(("127.0.0.1", 0)).await.expect("bind");
+            listener.local_addr().expect("addr")
+        };
+        let (dead_db, dead_service) = db_with_bridge("claude-code", dead);
+        let dead_bridge = resolve_bridge(&dead_db, dead_service, "claude-code").expect("bridge");
+        let refusal = cli_adapter::resolve_delegation_auth(
+            &dead_db,
+            "org-1",
+            "node-1",
+            "claude-code",
+            dead_bridge.provider_login(),
+        )
+        .await
+        .expect_err("an unanswerable probe is a refusal, not a login");
+        assert!(
+            refusal.to_string().contains("credential_missing"),
+            "{refusal}"
+        );
     }
 
     /// The prompt reaches the CLI, and closing the instance records the state

@@ -72,6 +72,7 @@ pub enum EventKind {
     OperationReconciled,
     ProjectionCorrected,
     TestRun,
+    CliDelegationAuthorized,
 }
 
 impl EventKind {
@@ -101,6 +102,7 @@ impl EventKind {
             EventKind::OperationReconciled => "operation_reconciled",
             EventKind::ProjectionCorrected => "projection_corrected",
             EventKind::TestRun => "test_run",
+            EventKind::CliDelegationAuthorized => "cli_delegation_authorized",
         }
     }
 
@@ -130,6 +132,7 @@ impl EventKind {
             "operation_reconciled" => EventKind::OperationReconciled,
             "projection_corrected" => EventKind::ProjectionCorrected,
             "test_run" => EventKind::TestRun,
+            "cli_delegation_authorized" => EventKind::CliDelegationAuthorized,
             _ => return None,
         };
         Some(kind)
@@ -307,6 +310,26 @@ pub enum EventPayload {
         /// stays in the artifact store, well under the frame budget (§13.2).
         detail_ref: Option<String>,
     },
+    /// A delegation to a vendor CLI was authorized, and by WHAT (§7.5, §17.3).
+    ///
+    /// `TicketIssued` records the adapter path and cannot record the other one:
+    /// an engine that authenticates itself is handed no ticket, so a delegation
+    /// spending the operator's own provider login would otherwise leave no
+    /// security-relevant trace at all — an audit hole (§13.4) exactly where the
+    /// isolation story is weakest.
+    ///
+    /// `usage_source` is on the event on purpose. It is the difference between
+    /// a number we measured on our own wire and a number the vendor told us,
+    /// and a reader of the audit log must not have to know which mode was in
+    /// force to tell them apart.
+    CliDelegationAuthorized {
+        engine_id: String,
+        /// `DelegationAuth::slug`: 'org_credential' | 'provider_login'.
+        auth_mode: String,
+        /// `DelegationAuth::usage_source`: 'adapter' | 'provider_reported'.
+        usage_source: String,
+        budget_tokens: u64,
+    },
 }
 
 impl EventPayload {
@@ -336,18 +359,21 @@ impl EventPayload {
             EventPayload::OperationReconciled { .. } => EventKind::OperationReconciled,
             EventPayload::ProjectionCorrected { .. } => EventKind::ProjectionCorrected,
             EventPayload::TestRun { .. } => EventKind::TestRun,
+            EventPayload::CliDelegationAuthorized { .. } => EventKind::CliDelegationAuthorized,
         }
     }
 
     /// Which events are mirrored into the main database's audit log (§13.4):
-    /// approvals and refusals, secret access, ticket issuance, egress,
-    /// push/merge, membership, autonomy and allowlist changes.
+    /// approvals and refusals, secret access, ticket issuance, how a delegation
+    /// authenticated, egress, push/merge, membership, autonomy and allowlist
+    /// changes.
     pub fn security_relevant(&self) -> bool {
         match self {
             EventPayload::ApprovalRequested { .. }
             | EventPayload::ApprovalDecided { .. }
             | EventPayload::SecretAccess { .. }
             | EventPayload::TicketIssued { .. }
+            | EventPayload::CliDelegationAuthorized { .. }
             | EventPayload::Egress { .. }
             | EventPayload::AutonomyChanged { .. }
             | EventPayload::AllowlistChanged { .. }
@@ -1457,6 +1483,7 @@ mod tests {
             EventKind::OperationReconciled,
             EventKind::ProjectionCorrected,
             EventKind::TestRun,
+            EventKind::CliDelegationAuthorized,
         ] {
             assert_eq!(EventKind::from_slug(kind.slug()), Some(kind));
         }
