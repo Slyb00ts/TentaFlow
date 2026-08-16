@@ -20,6 +20,15 @@
 // another session or another workspace, because neither can name the key.
 // `ephemeral: true` is unchanged and still means "destroy this with the run".
 //
+// **A layer that survives is refreshed before every command.** Persistence
+// without invalidation is worse than no persistence: `fs_write` lands in the
+// worktree, so a snapshot taken at the session's first command turns every
+// later test run into a test of the code as it was before the edit, and reports
+// it green. Each acquisition therefore brings the layer back in line with the
+// worktree — changed files re-copied, removed files removed — while everything
+// the sandbox itself produced is left where it is. `Mirror` is what separates
+// the two, and `refresh_layer` is where it happens.
+//
 // Two rules shape everything below.
 //
 // **`repo/` is never part of a sandbox.** Git metadata stays with the broker
@@ -203,8 +212,9 @@ struct SharedKey {
     network: &'static str,
 }
 
-/// A workplace held for a whole session. Immutable once built: every holder
-/// reads the same paths, and the teardown works from a shared reference.
+/// A workplace held for a whole session. Every holder reads the same paths, and
+/// the teardown works from a shared reference; the one mutable part is the
+/// mirror, which records what the layer last took from the worktree.
 #[derive(Debug)]
 struct SharedSandbox {
     sandbox_id: String,
@@ -217,6 +227,9 @@ struct SharedSandbox {
     tmp_dir: PathBuf,
     home_dir: PathBuf,
     skipped_dirs: Vec<String>,
+    /// State of the worktree the layer was last brought in line with. Empty for
+    /// every profile that works in the worktree itself, which is never stale.
+    mirror: Mutex<Mirror>,
 }
 
 impl SharedSandbox {
@@ -368,10 +381,13 @@ const CONTAINER_TOOLCHAIN_OVERLAY: &str = "/toolchain/ov";
 /// A copy-on-write workplace, described so that releasing it undoes exactly
 /// what was done. `mounted` is set when the layer is a host overlayfs, which
 /// has to be unmounted before its directory tree can be removed; a reflink or
-/// full copy has nothing to unmount.
+/// full copy has nothing to unmount. `work_dir` is where the process actually
+/// works — the merged directory of an overlay, the copy otherwise — and it is
+/// what a refresh writes into.
 #[derive(Debug, Clone)]
 struct CowLayer {
     root: PathBuf,
+    work_dir: PathBuf,
     mounted: Option<PathBuf>,
 }
 
@@ -621,7 +637,14 @@ impl SandboxManager {
         let slot = Arc::clone(lock_registry().entry(key.clone()).or_default());
         let mut state = lock_slot(&slot);
         let sandbox = match state.sandbox.as_ref() {
-            Some(sandbox) => Arc::clone(sandbox),
+            Some(sandbox) => {
+                // The layer is older than this command: everything written to
+                // the worktree since it was built is missing from it. Bringing
+                // it in line HERE, and not at release, is what makes the answer
+                // depend on the tree as it is when the command starts.
+                self.refresh_layer(&worktree, sandbox)?;
+                Arc::clone(sandbox)
+            }
             None => {
                 let started = self.start(pool, session_id, profile, owner_run_id, &worktree)?;
                 let sandbox = Arc::new(SharedSandbox {
@@ -635,6 +658,7 @@ impl SandboxManager {
                     tmp_dir: started.built.tmp_dir,
                     home_dir: started.built.home_dir,
                     skipped_dirs: started.built.skipped_dirs,
+                    mirror: Mutex::new(started.built.mirror),
                 });
                 state.sandbox = Some(Arc::clone(&sandbox));
                 sandbox
@@ -997,15 +1021,33 @@ impl SandboxManager {
         _base: &Path,
         _overlay: &Path,
     ) -> std::result::Result<Built, SandboxError> {
-        let (cwd, layer, tools_read_only, skipped_dirs) = match profile.mount {
-            MountAccess::ReadWrite => (worktree.to_path_buf(), None, false, Vec::new()),
+        let (cwd, layer, tools_read_only, skipped_dirs, mirror) = match profile.mount {
+            MountAccess::ReadWrite => (
+                worktree.to_path_buf(),
+                None,
+                false,
+                Vec::new(),
+                Mirror::default(),
+            ),
             // The command runs in the worktree and the OS does not stop it from
             // writing there. What stops it is that the caller holding this lease
             // gets no write tools. Stated, not hidden (§7.2).
-            MountAccess::ReadOnly => (worktree.to_path_buf(), None, true, Vec::new()),
+            MountAccess::ReadOnly => (
+                worktree.to_path_buf(),
+                None,
+                true,
+                Vec::new(),
+                Mirror::default(),
+            ),
             MountAccess::CopyOnWrite => {
                 let built = self.build_cow_layer(tmp, worktree, false)?;
-                (built.work_dir, Some(built.layer), false, built.skipped_dirs)
+                (
+                    built.work_dir,
+                    Some(built.layer),
+                    false,
+                    built.skipped_dirs,
+                    built.mirror,
+                )
             }
         };
         Ok(Built {
@@ -1016,6 +1058,7 @@ impl SandboxManager {
             tmp_dir: tmp.join("tmp"),
             home_dir: tmp.join("home"),
             skipped_dirs,
+            mirror,
         })
     }
 
@@ -1038,13 +1081,18 @@ impl SandboxManager {
         })?;
         let network = container_network(profile.network, config)?;
 
-        let (source, layer, skipped_dirs) = match profile.mount {
+        let (source, layer, skipped_dirs, mirror) = match profile.mount {
             MountAccess::ReadOnly | MountAccess::ReadWrite => {
-                (worktree.to_path_buf(), None, Vec::new())
+                (worktree.to_path_buf(), None, Vec::new(), Mirror::default())
             }
             MountAccess::CopyOnWrite => {
                 let built = self.build_cow_layer(tmp, worktree, true)?;
-                (built.work_dir, Some(built.layer), built.skipped_dirs)
+                (
+                    built.work_dir,
+                    Some(built.layer),
+                    built.skipped_dirs,
+                    built.mirror,
+                )
             }
         };
         let bind_mode = container_bind_mode(profile.mount);
@@ -1117,6 +1165,7 @@ impl SandboxManager {
             tmp_dir: tmp.join("tmp"),
             home_dir: tmp.join("home"),
             skipped_dirs,
+            mirror,
         })
     }
 
@@ -1165,16 +1214,27 @@ impl SandboxManager {
             }
             match mount_overlay(worktree, &upper, &work, &merged) {
                 Ok(()) => {
+                    // Nothing is copied, but what the lower directory held at
+                    // this moment is still recorded: a later refresh has to be
+                    // able to tell a file the worktree changed from a file the
+                    // sandbox copied up, and only the state it started from
+                    // separates the two.
+                    let mirror = LayerPass::RecordOnly
+                        .run(worktree, &merged, &self.cow_budget, Mirror::default())
+                        .map_err(SandboxError::cow)?
+                        .mirror;
                     return Ok(BuiltLayer {
                         work_dir: merged.clone(),
                         layer: CowLayer {
                             root,
+                            work_dir: merged.clone(),
                             mounted: Some(merged),
                         },
                         // An overlay mount copies nothing, so it hides nothing:
                         // the lower directory is the whole worktree.
                         skipped_dirs: Vec::new(),
-                    })
+                        mirror,
+                    });
                 }
                 Err(reason) => format!("overlayfs: {reason}; "),
             }
@@ -1185,14 +1245,16 @@ impl SandboxManager {
         let copy = root.join("work");
         std::fs::create_dir_all(&copy)
             .map_err(|e| SandboxError::cow(format!("{overlay_reason}create copy directory: {e}")))?;
-        match copy_tree(worktree, &copy, &self.cow_budget) {
-            Ok(skipped_dirs) => Ok(BuiltLayer {
-                work_dir: copy,
+        match LayerPass::Materialise.run(worktree, &copy, &self.cow_budget, Mirror::default()) {
+            Ok(pass) => Ok(BuiltLayer {
+                work_dir: copy.clone(),
                 layer: CowLayer {
                     root,
+                    work_dir: copy,
                     mounted: None,
                 },
-                skipped_dirs,
+                skipped_dirs: pass.skipped,
+                mirror: pass.mirror,
             }),
             Err(copy_reason) => {
                 // Fail closed: nothing half-built survives and the caller gets
@@ -1202,13 +1264,64 @@ impl SandboxManager {
             }
         }
     }
+
+    /// Brings a session's shared copy-on-write layer back in line with the
+    /// worktree before the next command runs in it.
+    ///
+    /// The layer is built once and then survives the whole session, which is
+    /// the only way `target/`, `node_modules` and `.venv` are still there for
+    /// the next command. Persistence without invalidation, however, is worse
+    /// than no persistence: every `fs_write` after the first command lands in
+    /// the worktree and nowhere else, so the agent reads one tree with its file
+    /// tools and compiles another one — and a green test run means nothing,
+    /// because it ran on the code from before the edit.
+    ///
+    /// So the two kinds of content in a layer are separated instead of being
+    /// thrown away together. What came FROM the worktree is refreshed against
+    /// it (changed files re-copied, removed files removed); what the sandbox
+    /// produced itself is not in the mirror at all and is left untouched, which
+    /// is what keeps the build cache. A path under `SKIPPED_BUILD_DIRS` is
+    /// never walked in the first place, so a `target/` the build owns is never
+    /// even a candidate.
+    ///
+    /// A refresh that cannot be completed REFUSES the acquisition, for the same
+    /// reason a copy that cannot be made does: running on a tree that does not
+    /// match the worktree is the failure this whole mechanism exists to stop.
+    ///
+    /// It runs per ACQUISITION, so two commands of one session that hold the
+    /// shared layer at the same time can see it move under them — that is what
+    /// sharing one workplace means, and a run that must not have its tree
+    /// change asks for an `ephemeral` sandbox, which is built for it alone.
+    fn refresh_layer(
+        &self,
+        worktree: &Path,
+        sandbox: &SharedSandbox,
+    ) -> std::result::Result<(), SandboxError> {
+        let Some(layer) = sandbox.layer.as_ref() else {
+            // `ro` and `rw` work in the worktree itself; there is nothing
+            // between the command and the current state of the tree.
+            return Ok(());
+        };
+        let mut mirror = sandbox.mirror.lock().unwrap_or_else(|e| e.into_inner());
+        // Taken rather than borrowed: a refusal leaves the mirror empty, and an
+        // empty mirror is the safe state — the next pass re-takes the whole
+        // worktree instead of trusting a record of a pass that did not finish.
+        let previous = std::mem::take(&mut *mirror);
+        let pass = LayerPass::Refresh
+            .run(worktree, &layer.work_dir, &self.cow_budget, previous)
+            .map_err(SandboxError::cow)?;
+        *mirror = pass.mirror;
+        Ok(())
+    }
 }
 
-/// A copy-on-write layer as built, plus what building it left out.
+/// A copy-on-write layer as built, plus what building it left out and the
+/// worktree state it was built from.
 struct BuiltLayer {
     work_dir: PathBuf,
     layer: CowLayer,
     skipped_dirs: Vec<String>,
+    mirror: Mirror,
 }
 
 /// Runtime network a container profile must be started on.
@@ -1307,6 +1420,9 @@ struct Built {
     tmp_dir: PathBuf,
     home_dir: PathBuf,
     skipped_dirs: Vec<String>,
+    /// Worktree state the layer holds. Empty for a profile that has no layer,
+    /// which is exactly the profile that cannot go stale.
+    mirror: Mirror,
 }
 
 /// A freshly started workplace, before it is either handed to one lease
@@ -1460,7 +1576,7 @@ fn remove_container(runtime: ContainerRuntime, name: &str) -> Result<()> {
 /// hundred megabytes larger. Ambiguous names therefore stay in.
 ///
 /// `.git` is not on this list and is skipped for an unrelated reason (see
-/// `copy_dir`): it is a security boundary, not a size decision.
+/// `Walker::dir`): it is a security boundary, not a size decision.
 const SKIPPED_BUILD_DIRS: &[&str] = &[
     // Rust and Maven/sbt.
     "target",
@@ -1489,107 +1605,273 @@ const SKIPPED_BUILD_DIRS: &[&str] = &[
     ".terraform",
 ];
 
-/// Copies a worktree into `dst`, cheaply where the filesystem allows it.
+/// The state one worktree path was in when the layer took it.
 ///
-/// Reflink first (`FICLONE` on Btrfs/XFS, `clonefile` on APFS), full copy
-/// otherwise. Returns the reason as a string on refusal, because every caller
-/// turns it into `CowUnavailable` and nothing else; on success it returns the
-/// distinct `SKIPPED_BUILD_DIRS` names it actually walked past, so the answer to
-/// the command can say what the layer does not contain.
-///
-/// `.git` is skipped: in a worktree it is a POINTER into the reference
-/// repository, and a copy of that pointer would aim git at the real repo from
-/// inside a sandbox that is supposed to have no git metadata at all (§7.3).
-///
-/// A symbolic link that leaves the tree is a REFUSAL, not a copy — see
-/// `copy_symlink`.
-fn copy_tree(src: &Path, dst: &Path, budget: &CowBudget) -> Result<Vec<String>, String> {
-    let started = Instant::now();
-    let mut bytes = 0u64;
-    let mut files = 0u64;
-    let mut skipped: Vec<String> = Vec::new();
-    copy_dir(
-        src,
-        src,
-        dst,
-        budget,
-        started,
-        &mut bytes,
-        &mut files,
-        &mut skipped,
-    )?;
-    Ok(skipped)
+/// Size and modification time, which is what every incremental copy has used
+/// since rsync: reading every file back to compare content would cost more than
+/// the copy this exists to avoid. The residual risk is a file rewritten to the
+/// same length while keeping its timestamp, which no ordinary editor, compiler
+/// or checkout does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stamp {
+    len: u64,
+    mtime: Option<std::time::SystemTime>,
+    is_symlink: bool,
 }
 
-#[allow(clippy::too_many_arguments)]
-fn copy_dir(
-    root: &Path,
-    src: &Path,
-    dst: &Path,
-    budget: &CowBudget,
-    started: Instant,
-    bytes: &mut u64,
-    files: &mut u64,
-    skipped: &mut Vec<String>,
-) -> Result<(), String> {
-    let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
-    for entry in entries {
-        let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
-        let name = entry.file_name();
-        if name == std::ffi::OsStr::new(".git") {
-            continue;
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        Self {
+            len: meta.len(),
+            mtime: meta.modified().ok(),
+            is_symlink: meta.file_type().is_symlink(),
         }
-        if let Some(skipped_name) = name
-            .to_str()
-            .and_then(|n| SKIPPED_BUILD_DIRS.iter().find(|d| **d == n))
-        {
-            // Judged by name before the entry is stat'ed, and only a directory
-            // is skipped: a FILE called `target` is content, not a build tree.
-            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
-                let skipped_name = (*skipped_name).to_string();
-                if !skipped.contains(&skipped_name) {
-                    skipped.push(skipped_name);
-                }
+    }
+
+    /// A stamp with no readable modification time never compares equal, so a
+    /// filesystem that does not keep one degrades to copying rather than to
+    /// serving a stale file.
+    fn unchanged_from(&self, previous: &Stamp) -> bool {
+        self.mtime.is_some() && self == previous
+    }
+}
+
+/// What a layer took from the worktree, keyed by path relative to it.
+///
+/// This is the line between the two kinds of content a copy-on-write layer
+/// holds: everything in here came from the worktree and follows it, everything
+/// else was produced inside the sandbox (`target/`, a compiled binary, a
+/// downloaded wheel) and belongs to the layer. Stat alone cannot draw that line
+/// — a copy does not preserve the source timestamp — so the record is kept.
+#[derive(Debug, Default)]
+struct Mirror {
+    files: HashMap<PathBuf, Stamp>,
+}
+
+/// What one pass over the worktree is for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LayerPass {
+    /// Build the layer: every path is reproduced in it.
+    Materialise,
+    /// The lower directory of an overlay mount already IS the worktree, so the
+    /// first pass reproduces nothing and only records what it started from.
+    RecordOnly,
+    /// Bring an existing layer back in line with the worktree: copy what
+    /// changed, remove what the worktree no longer has, leave everything else.
+    Refresh,
+}
+
+/// One finished pass.
+struct LayerWalk {
+    mirror: Mirror,
+    skipped: Vec<String>,
+}
+
+impl LayerPass {
+    /// Walks the worktree once, cheaply where the filesystem allows it.
+    ///
+    /// Reflink first (`FICLONE` on Btrfs/XFS, `clonefile` on APFS), full copy
+    /// otherwise. Returns the reason as a string on refusal, because every
+    /// caller turns it into `CowUnavailable` and nothing else; on success it
+    /// returns the new mirror and the distinct `SKIPPED_BUILD_DIRS` names it
+    /// walked past, so the answer to the command can say what the layer does
+    /// not contain.
+    ///
+    /// `.git` is skipped: in a worktree it is a POINTER into the reference
+    /// repository, and a copy of that pointer would aim git at the real repo
+    /// from inside a sandbox that is supposed to have no git metadata at all
+    /// (§7.3).
+    ///
+    /// A symbolic link that leaves the tree is a REFUSAL, not a copy — see
+    /// `copy_symlink`.
+    fn run(
+        self,
+        src: &Path,
+        dst: &Path,
+        budget: &CowBudget,
+        previous: Mirror,
+    ) -> Result<LayerWalk, String> {
+        let mut walk = Walker {
+            pass: self,
+            root: src,
+            dst_root: dst,
+            budget,
+            started: Instant::now(),
+            bytes: 0,
+            files: 0,
+            skipped: Vec::new(),
+            previous,
+            current: Mirror::default(),
+        };
+        walk.dir(src, dst)?;
+        walk.drop_vanished()?;
+        Ok(LayerWalk {
+            mirror: walk.current,
+            skipped: walk.skipped,
+        })
+    }
+}
+
+struct Walker<'a> {
+    pass: LayerPass,
+    root: &'a Path,
+    dst_root: &'a Path,
+    budget: &'a CowBudget,
+    started: Instant,
+    bytes: u64,
+    files: u64,
+    skipped: Vec<String>,
+    previous: Mirror,
+    current: Mirror,
+}
+
+impl Walker<'_> {
+    fn dir(&mut self, src: &Path, dst: &Path) -> Result<(), String> {
+        let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|e| format!("read {}: {e}", src.display()))?;
+            let name = entry.file_name();
+            if name == std::ffi::OsStr::new(".git") {
                 continue;
             }
-        }
-        if started.elapsed() > budget.max_duration {
-            return Err(format!(
-                "copy exceeded its {} s budget",
-                budget.max_duration.as_secs()
-            ));
-        }
-        let from = entry.path();
-        let to = dst.join(&name);
-        let meta = entry
-            .metadata()
-            .map_err(|e| format!("stat {}: {e}", from.display()))?;
-        let file_type = meta.file_type();
-
-        if file_type.is_symlink() {
-            copy_symlink(root, &from, &to)?;
-            *files += 1;
-        } else if file_type.is_dir() {
-            std::fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
-            copy_dir(root, &from, &to, budget, started, bytes, files, skipped)?;
-        } else if file_type.is_file() {
-            *files += 1;
-            *bytes += meta.len();
-            if *files > budget.max_files {
-                return Err(format!("copy exceeded its {} file budget", budget.max_files));
+            if let Some(skipped_name) = name
+                .to_str()
+                .and_then(|n| SKIPPED_BUILD_DIRS.iter().find(|d| **d == n))
+            {
+                // Judged by name before the entry is stat'ed, and only a
+                // directory is skipped: a FILE called `target` is content, not
+                // a build tree.
+                if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                    let skipped_name = (*skipped_name).to_string();
+                    if !self.skipped.contains(&skipped_name) {
+                        self.skipped.push(skipped_name);
+                    }
+                    continue;
+                }
             }
-            if *bytes > budget.max_bytes {
+            if self.started.elapsed() > self.budget.max_duration {
                 return Err(format!(
-                    "copy exceeded its {} MiB budget",
-                    budget.max_bytes / (1024 * 1024)
+                    "copy exceeded its {} s budget",
+                    self.budget.max_duration.as_secs()
                 ));
             }
-            copy_file(&from, &to)?;
+            let from = entry.path();
+            let to = dst.join(&name);
+            let meta = entry
+                .metadata()
+                .map_err(|e| format!("stat {}: {e}", from.display()))?;
+            let file_type = meta.file_type();
+
+            if file_type.is_dir() {
+                if self.pass != LayerPass::RecordOnly {
+                    std::fs::create_dir_all(&to)
+                        .map_err(|e| format!("create {}: {e}", to.display()))?;
+                }
+                self.dir(&from, &to)?;
+            } else if file_type.is_symlink() || file_type.is_file() {
+                self.file(&from, &to, &meta)?;
+            }
+            // Sockets, fifos and devices are not copied: nothing in a source
+            // tree needs them and recreating one would be a capability, not a
+            // file.
         }
-        // Sockets, fifos and devices are not copied: nothing in a source tree
-        // needs them and recreating one would be a capability, not a file.
+        Ok(())
     }
-    Ok(())
+
+    fn file(&mut self, from: &Path, to: &Path, meta: &std::fs::Metadata) -> Result<(), String> {
+        let rel = from
+            .strip_prefix(self.root)
+            .map_err(|_| format!("{} is outside the tree being copied", from.display()))?
+            .to_path_buf();
+        let stamp = Stamp::of(meta);
+        let take = match self.pass {
+            LayerPass::Materialise => true,
+            LayerPass::RecordOnly => false,
+            // Only what moved. A file the sandbox itself rewrote while the
+            // worktree stood still keeps the sandbox's version: the worktree is
+            // the source of truth for what it contains, not for what it does
+            // not.
+            LayerPass::Refresh => !self
+                .previous
+                .files
+                .get(&rel)
+                .map(|before| stamp.unchanged_from(before))
+                .unwrap_or(false),
+        };
+        if take {
+            self.files += 1;
+            if self.files > self.budget.max_files {
+                return Err(format!(
+                    "copy exceeded its {} file budget",
+                    self.budget.max_files
+                ));
+            }
+            if !stamp.is_symlink {
+                self.bytes += meta.len();
+                if self.bytes > self.budget.max_bytes {
+                    return Err(format!(
+                        "copy exceeded its {} MiB budget",
+                        self.budget.max_bytes / (1024 * 1024)
+                    ));
+                }
+            }
+            // A refresh writes over whatever the layer holds under this path,
+            // including a path that changed kind between a file and a link. The
+            // initial pass writes into a directory it just created, so it is
+            // spared the extra stat per file.
+            if self.pass == LayerPass::Refresh {
+                remove_layer_path(to)?;
+            }
+            if stamp.is_symlink {
+                copy_symlink(self.root, from, to)?;
+            } else {
+                copy_file(from, to)?;
+            }
+        }
+        self.current.files.insert(rel, stamp);
+        Ok(())
+    }
+
+    /// Removes what the worktree no longer has.
+    ///
+    /// Only paths the mirror claims are removed, so a build output the sandbox
+    /// created is never a candidate — the difference between "this file left
+    /// the worktree" and "the sandbox made this" is the whole reason the mirror
+    /// exists. Directories are left behind: an empty one costs nothing and
+    /// removing it could take out a directory the sandbox is using.
+    fn drop_vanished(&mut self) -> Result<(), String> {
+        if self.pass != LayerPass::Refresh {
+            return Ok(());
+        }
+        for rel in self.previous.files.keys() {
+            if self.current.files.contains_key(rel) {
+                continue;
+            }
+            remove_layer_path(&self.dst_root.join(rel))?;
+        }
+        Ok(())
+    }
+}
+
+/// Removes one path from a layer. A missing path is the wanted state, not an
+/// error; the metadata is read without following links, so a link is removed as
+/// a link instead of leading the removal out of the layer.
+///
+/// A path the sandbox turned into a DIRECTORY is left alone: whatever the
+/// worktree had under that name is gone from the layer either way, and the
+/// directory is the sandbox's own.
+fn remove_layer_path(path: &Path) -> Result<(), String> {
+    match std::fs::symlink_metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(format!("stat {}: {e}", path.display())),
+        Ok(meta) if meta.is_dir() => return Ok(()),
+        Ok(_) => {}
+    }
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(format!("remove {}: {e}", path.display())),
+    }
 }
 
 /// Reproduces one symbolic link inside the copy — but only when following it
@@ -2281,6 +2563,83 @@ mod tests {
         assert_eq!(live_sandboxes(&pool), 0);
     }
 
+    /// The other half of a layer that survives the command: it has to survive
+    /// as a copy of the CURRENT worktree, not of the one that existed when the
+    /// session's first command ran.
+    ///
+    /// The failure this pins down is worse than a stale file. The agent writes
+    /// with its file tools, which go to the worktree, and runs its tests in the
+    /// sandbox, which was a snapshot: the suite passes on the code from before
+    /// the refactor, `fs_list` shows a file `exec` cannot open, and the run
+    /// reports green. So the second command must see the edit, the new file and
+    /// the deletion — while everything the first command BUILT is still there,
+    /// because a layer that refreshes by being thrown away is no layer at all.
+    #[test]
+    fn a_shared_layer_follows_the_worktree_and_still_keeps_what_the_sandbox_built() {
+        let (dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        let worktree = seed_worktree(&manager);
+
+        // Command one builds, and leaves its output in the layer.
+        let first = manager
+            .acquire(&pool, "s-1", cow(false), Some("run-1"))
+            .expect("first command");
+        let ExecTarget::Local { cwd: layer } = first.target().clone() else {
+            panic!("expected a local target");
+        };
+        std::fs::create_dir_all(layer.join("target/debug")).unwrap();
+        std::fs::write(layer.join("target/debug/app"), b"built").unwrap();
+        std::fs::write(layer.join("build.log"), b"first command").unwrap();
+        manager.release(&pool, first).expect("release after command 1");
+
+        // Between the commands the agent works on the WORKTREE, which is where
+        // every `fs_write` lands.
+        std::fs::write(worktree.join("src/main.rs"), b"fn main() { second::run() }\n").unwrap();
+        std::fs::create_dir_all(worktree.join("src/second")).unwrap();
+        std::fs::write(worktree.join("src/second/mod.rs"), b"pub fn run() {}\n").unwrap();
+        std::fs::remove_file(worktree.join("Cargo.toml")).unwrap();
+
+        let second = manager
+            .acquire(&pool, "s-1", cow(false), Some("run-2"))
+            .expect("second command");
+        let ExecTarget::Local { cwd: again } = second.target().clone() else {
+            panic!("expected a local target");
+        };
+        assert_eq!(again, layer, "the session did not get its own layer back");
+
+        assert_eq!(
+            std::fs::read(again.join("src/main.rs")).unwrap(),
+            b"fn main() { second::run() }\n",
+            "the second command runs on the code from before the edit"
+        );
+        assert_eq!(
+            std::fs::read(again.join("src/second/mod.rs")).unwrap(),
+            b"pub fn run() {}\n",
+            "a file the agent added is missing from the sandbox"
+        );
+        assert!(
+            !again.join("Cargo.toml").exists(),
+            "a file the agent deleted is still in the sandbox"
+        );
+
+        assert_eq!(
+            std::fs::read(again.join("target/debug/app")).unwrap(),
+            b"built",
+            "refreshing the layer threw away the build output"
+        );
+        assert_eq!(
+            std::fs::read(again.join("build.log")).unwrap(),
+            b"first command",
+            "refreshing the layer threw away what the command produced next to the sources"
+        );
+
+        // Following the worktree is not writing to it: the copy is still a copy.
+        assert!(!worktree.join("target").exists());
+        assert!(!worktree.join("build.log").exists());
+
+        manager.release(&pool, second).unwrap();
+        release_session_sandboxes(dir.path(), &pool, "s-1").unwrap();
+    }
+
     /// The boundary the sharing must not cross. Two sessions of one workspace
     /// are two workplaces, and so are two workspaces — the registry key covers
     /// both, which is why it carries the root AND the session id.
@@ -2694,7 +3053,10 @@ mod tests {
         let dst = dir.path().join("dst");
         std::fs::create_dir_all(&dst).unwrap();
         assert_eq!(
-            copy_tree(&src, &dst, &budget).expect("with the exclusion the copy fits"),
+            LayerPass::Materialise
+                .run(&src, &dst, &budget, Mirror::default())
+                .expect("with the exclusion the copy fits")
+                .skipped,
             vec!["target".to_string()]
         );
 
@@ -2702,22 +3064,11 @@ mod tests {
         // budget on the very same tree.
         let unfiltered = dir.path().join("unfiltered");
         std::fs::create_dir_all(&unfiltered).unwrap();
-        let mut bytes = 0u64;
-        let mut files = 0u64;
-        let mut skipped = Vec::new();
         std::fs::rename(src.join("target"), src.join("kept-target")).unwrap();
         assert!(
-            copy_dir(
-                &src,
-                &src,
-                &unfiltered,
-                &budget,
-                Instant::now(),
-                &mut bytes,
-                &mut files,
-                &mut skipped,
-            )
-            .is_err(),
+            LayerPass::Materialise
+                .run(&src, &unfiltered, &budget, Mirror::default())
+                .is_err(),
             "the build output alone must exceed the budget"
         );
     }
@@ -2737,7 +3088,11 @@ mod tests {
             max_files: 3,
             max_duration: Duration::from_secs(60),
         };
-        assert!(copy_tree(&src, &dst, &budget).is_err());
-        assert!(copy_tree(&src, &dst, &CowBudget::default()).is_ok());
+        assert!(LayerPass::Materialise
+            .run(&src, &dst, &budget, Mirror::default())
+            .is_err());
+        assert!(LayerPass::Materialise
+            .run(&src, &dst, &CowBudget::default(), Mirror::default())
+            .is_ok());
     }
 }

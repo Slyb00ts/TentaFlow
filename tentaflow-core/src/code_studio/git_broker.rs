@@ -27,6 +27,7 @@ use anyhow::{anyhow, Result};
 
 use super::paths;
 use super::remote_policy::{self, RemoteScheme, RemoteTarget};
+use crate::db::DbPool;
 
 /// Canonical location of a repository, established when the workspace or
 /// worktree is created and never re-derived from disk contents.
@@ -1041,6 +1042,24 @@ impl Broker {
         }
         validate_identity(&spec.author)?;
         validate_identity(&spec.committer)?;
+        // A single-parent commit may only be parented on the value it swaps.
+        // The accepted content was composed onto `base_commit`, so publishing
+        // it over a branch that has moved since would keep the tree of the
+        // review and drop the history in between: the compare-and-swap would
+        // still report success while every commit made after `base_commit`
+        // became unreachable. A merge is the deliberate exception — its first
+        // parent is the target tip and its second the branch being merged.
+        if spec.extra_parent.is_none() {
+            if let Some(old) = &spec.expected_old {
+                if old != &spec.base_commit {
+                    return Err(anyhow!(
+                        "the accepted change was composed onto {}, but the branch is at {old}; \
+                         it has to be reviewed again against the current head",
+                        spec.base_commit
+                    ));
+                }
+            }
+        }
 
         // 1-3. Content becomes objects and a tree. Separated out because the
         //       JOURNAL needs that tree before the commit is published: §13.1
@@ -1853,14 +1872,23 @@ impl Drop for TempIndex {
     }
 }
 
-/// Refreshes a session index for a commit that is ALREADY published.
+/// Brings a session up to date with a branch tip that has ALREADY been
+/// published — by a commit (§11.5) or by a fast-forward pull.
+///
+/// Two things move together because they answer one question, "where is this
+/// session now": the worktree index, so a later status does not report the
+/// committed content as still changed, and the `worktrees` row, which is what
+/// the UI and the journal read. Leaving the row behind was not a cosmetic
+/// staleness — the next patch set opened on the session's FIRST base, so it
+/// re-proposed the whole session from zero and its commit was parented on that
+/// same first base, which orphaned every commit in between.
 ///
 /// The failure is logged rather than raised on purpose: `update-ref` has already
 /// moved the branch and cannot be taken back, so turning a stale index into a
 /// tool error would report a landed commit as failed and send the agent into a
 /// retry whose compare-and-swap can only fail. A stale index is a wrong status,
 /// a retracted commit is a wrong history.
-pub fn sync_worktree_index_after_commit(broker: &Broker, session_id: &str, commit: &str) {
+pub fn record_session_head(pool: &DbPool, broker: &Broker, session_id: &str, commit: &str) {
     if let Err(error) = broker.sync_worktree_index(session_id, commit) {
         tracing::warn!(
             %session_id,
@@ -1869,6 +1897,27 @@ pub fn sync_worktree_index_after_commit(broker: &Broker, session_id: &str, commi
             "the session index still describes the pre-commit tree"
         );
     }
+    if let Err(error) = store_session_head(pool, session_id, commit) {
+        tracing::warn!(
+            %session_id,
+            %commit,
+            error = %error,
+            "the worktree journal still names the pre-commit head"
+        );
+    }
+}
+
+fn store_session_head(pool: &DbPool, session_id: &str, commit: &str) -> Result<()> {
+    validate_oid(commit)?;
+    let conn = pool
+        .write()
+        .map_err(|e| anyhow!("workspace db write: {e}"))?;
+    conn.execute(
+        "UPDATE worktrees SET head_commit = ?2 \
+         WHERE session_id = ?1 AND purpose = 'work' AND state <> 'removed'",
+        rusqlite::params![session_id, commit],
+    )?;
+    Ok(())
 }
 
 /// Whether the string is a git REMOTE NAME rather than a location. Anything
@@ -2780,6 +2829,13 @@ mod tests {
         );
     }
 
+    /// Two refusals guard one branch, and they catch different mistakes.
+    ///
+    /// A spec whose PARENT is not the value it swaps would publish a tree onto
+    /// a branch that has moved since the review, orphaning everything committed
+    /// in between while `update-ref` reports success — so it never reaches git.
+    /// A spec that is internally consistent but arrives after somebody else
+    /// moved the branch is stopped by the compare-and-swap itself.
     #[test]
     fn a_commit_refuses_to_overwrite_a_branch_that_moved() {
         require_git();
@@ -2794,28 +2850,41 @@ mod tests {
             "f.txt",
             "one\n",
         );
+        let spec = |base: &str, expected_old: &str| CommitSpec {
+            base_commit: base.to_string(),
+            extra_parent: None,
+            branch: "main".into(),
+            expected_old: Some(expected_old.to_string()),
+            message: "stale".into(),
+            author: identity(),
+            committer: identity(),
+            files: vec![CommitFile {
+                path: "f.txt".into(),
+                old_path: None,
+                mode: "100644".into(),
+                change: CommitChange::Write {
+                    content: b"two\n".to_vec(),
+                },
+            }],
+        };
 
-        // A stale expected_old is an error, never an overwrite.
+        // The parent is not the value being swapped: refused before git runs.
         let err = broker
             .build_commit(
                 &broker.reference(),
-                &CommitSpec {
-                    base_commit: first.commit_oid.clone(),
-                    extra_parent: None,
-                    branch: "main".into(),
-                    expected_old: Some(root.head_commit.clone()),
-                    message: "stale".into(),
-                    author: identity(),
-                    committer: identity(),
-                    files: vec![CommitFile {
-                        path: "f.txt".into(),
-                        old_path: None,
-                        mode: "100644".into(),
-                        change: CommitChange::Write {
-                            content: b"two\n".to_vec(),
-                        },
-                    }],
-                },
+                &spec(&first.commit_oid, &root.head_commit),
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("reviewed again"),
+            "a commit parented off the branch head is not a compare-and-swap: {err}"
+        );
+
+        // Consistent spec, branch already somewhere else: refused by the swap.
+        let err = broker
+            .build_commit(
+                &broker.reference(),
+                &spec(&root.head_commit, &root.head_commit),
             )
             .unwrap_err();
         assert!(err.to_string().contains("update-ref"), "got {err}");

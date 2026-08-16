@@ -36,7 +36,7 @@ use crate::code_studio::events::{EventPayload, GitOperation, SessionEvent};
 use crate::code_studio::exec::{ExecEnv, ExecRequest, Executor, NullSink, Program};
 use crate::code_studio::fs::{GrepQuery, LineRange, RelPath, SessionRoot};
 use crate::code_studio::git_broker::{
-    sync_worktree_index_after_commit, Broker, CommitIdentity, GitAuth, MergeOutcome, RepoHandle,
+    record_session_head, Broker, CommitIdentity, GitAuth, MergeOutcome, RepoHandle,
 };
 use crate::code_studio::models::{
     AutonomyMode, EgressEnforcement, ExecMode, NewWorkspace, WorkspaceRecord, WorkspaceRole,
@@ -3252,19 +3252,20 @@ impl Scope {
         SessionRoot::open_session(&self.record.id, &self.session.id).map_err(fs_error)
     }
 
-    /// Commit the session's worktree was created from. It is the base of every
-    /// patch set and of every diff the UI shows.
+    /// Tip of the session branch — the base of every patch set and of every
+    /// diff the UI shows.
+    ///
+    /// Resolved from git on every call, exactly as `tools::current_patch_set`
+    /// does, because the branch moves under a commit and under a fast-forward
+    /// pull. Reading it from a `worktrees` column that only session creation
+    /// ever wrote made every later patch set describe the session from its
+    /// first base and every later commit re-parent onto that base, which
+    /// orphaned the commits in between (§11.5 step 5).
     fn base_commit(&self) -> Result<String, ProtocolError> {
-        let conn = self
-            .pool
-            .read()
-            .map_err(|e| db_error("base_commit", anyhow::anyhow!("{e}")))?;
-        conn.query_row(
-            "SELECT base_commit FROM worktrees WHERE session_id = ?1 AND purpose = 'work'",
-            rusqlite::params![self.session.id],
-            |row| row.get::<_, String>(0),
-        )
-        .map_err(|e| db_error("base_commit", anyhow::anyhow!("{e}")))
+        let broker = self.broker()?;
+        broker
+            .head_commit(&self.worktree()?)
+            .map_err(|e| db_error("base_commit", e))
     }
 }
 
@@ -4845,7 +4846,12 @@ fn commit_accepted_blobs(
         &[outcome.commit_oid.clone(), outcome.tree_oid.clone()],
     )
     .map_err(|e| db_error("record_oids", e))?;
-    sync_worktree_index_after_commit(&broker, &scope.session.id, &outcome.commit_oid);
+    record_session_head(
+        &scope.pool,
+        &broker,
+        &scope.session.id,
+        &outcome.commit_oid,
+    );
     patch::mark_consumed(&scope.pool, set_id, &outcome)
         .map_err(|e| db_error("mark_consumed", e))?;
     complete_op(scope, &op_id, &[outcome.commit_oid.clone()], None)?;
@@ -5161,6 +5167,12 @@ fn git_sync_v1(
     };
     match fetched {
         Ok(oid) => {
+            // A fast-forward pull moves the session branch as surely as a
+            // commit does, so the session's recorded head moves with it; a
+            // fetch touches no branch and leaves it alone.
+            if mode == "pull" {
+                record_session_head(&scope.pool, &broker, &scope.session.id, &oid);
+            }
             complete_op(&scope, &op_id, &[oid.clone()], None)?;
             append_git_event(
                 &scope,
@@ -5971,24 +5983,14 @@ async fn patch_decide_v1(
     // A decision that changes what the worktree should hold is applied under
     // the SAME compare-and-swap the patch set uses: a file somebody edited
     // again is a conflict, not something to overwrite.
-    let root = scope.root()?;
-    let reference = broker.reference();
-    for rewrite in &outcome.rewrites {
-        let rel = RelPath::parse(&rewrite.path).map_err(fs_error)?;
-        let expect = match &rewrite.expect {
-            patch::Precondition::Absent => cs_fs::Precondition::Absent,
-            patch::Precondition::BlobIs(oid) => cs_fs::Precondition::BlobIs(oid.clone()),
-        };
-        match &rewrite.blob_oid {
-            Some(oid) => {
-                let content = broker
-                    .cat_file(&reference, oid)
-                    .map_err(|e| db_error("cat_file", e))?;
-                root.write(&rel, &content, expect).map_err(fs_error)?;
-            }
-            None => root.remove(&rel, false, expect).map_err(fs_error)?,
-        }
-    }
+    tools::apply_review_rewrites(
+        &broker,
+        &scope.record.id,
+        &scope.session.id,
+        &set.scope,
+        &outcome.rewrites,
+    )
+    .map_err(|e| ProtocolError::new(ProtocolErrorCode::Conflict, format!("{e:#}")))?;
 
     append_event(
         &scope,

@@ -38,7 +38,7 @@ use super::events::{self, EventPayload, GitOperation, SessionEvent};
 use super::exec::{ExecEnv, ExecRequest, Executor, NullSink, Program};
 use super::fs::{self, GrepQuery, LineRange, Precondition as FsPrecondition, RelPath, SessionRoot};
 use super::git_broker::{
-    sync_worktree_index_after_commit, Broker, CommitIdentity, CommitSpec, GitAuth, MergeOutcome,
+    record_session_head, Broker, CommitIdentity, CommitSpec, GitAuth, MergeOutcome,
     RepoHandle,
 };
 use super::index::{CodeIndex, CodeSearchOutcome};
@@ -93,7 +93,12 @@ pub struct SessionBinding {
 /// malformed = this run was not opened by a Code Studio session, so every tool
 /// in this module refuses. The model cannot forge it: meta is server-owned.
 pub fn binding_from_meta(meta: &BTreeMap<String, Value>) -> Option<SessionBinding> {
-    let value = meta.get(SESSION_META_KEY)?;
+    binding_from_value(meta.get(SESSION_META_KEY)?)
+}
+
+/// The same parse from the bare meta VALUE. The sub-agent spawn path carries
+/// the binding on its own, without the map it was read from.
+pub fn binding_from_value(value: &Value) -> Option<SessionBinding> {
     let workspace_id = value.get("workspace_id")?.as_str()?.trim();
     let session_id = value.get("session_id")?.as_str()?.trim();
     if workspace_id.is_empty() || session_id.is_empty() {
@@ -1889,6 +1894,7 @@ async fn git_sync_call(ctx: &ToolCallCtx<'_>, bound: &Bound, args: &Value) -> Re
 
     let workspace_id = bound.workspace.id.clone();
     let session_id = bound.session.id.clone();
+    let pool = bound.pool.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<Value> {
         let broker = Broker::for_workspace(&workspace_id)?;
         let handle = broker.session(&session_id)?;
@@ -1897,7 +1903,13 @@ async fn git_sync_call(ctx: &ToolCallCtx<'_>, bound: &Bound, args: &Value) -> Re
         // the repository is configured with", not "unauthenticated".
         let head = match operation.as_str() {
             "fetch" => broker.fetch_branch(&handle, &remote, &branch, &GitAuth::None)?,
-            _ => broker.pull_branch(&handle, &remote, &branch, &GitAuth::None)?,
+            // A fast-forward pull moves the session branch as surely as a
+            // commit does, so the session's recorded head moves with it.
+            _ => {
+                let head = broker.pull_branch(&handle, &remote, &branch, &GitAuth::None)?;
+                record_session_head(&pool, &broker, &session_id, &head);
+                head
+            }
         };
         Ok(json!({ "operation": operation, "remote": remote, "head": head }))
     })
@@ -2044,7 +2056,7 @@ async fn git_commit_call(ctx: &ToolCallCtx<'_>, bound: &Bound, args: &Value) -> 
         // probe identifies the commit by tree, parent and the branch head, and
         // it can only look for an id somebody wrote down.
         operations::record_oids(&pool, &op_id_for_task, &[commit.commit_oid.clone()])?;
-        sync_worktree_index_after_commit(&broker, &session_id, &commit.commit_oid);
+        record_session_head(&pool, &broker, &session_id, &commit.commit_oid);
         patch::mark_consumed(&pool, &patch_set_id, &commit)?;
         Ok(json!({
             "commit": commit.commit_oid,
@@ -2444,6 +2456,61 @@ pub fn record_work_edit(
     )
 }
 
+/// Writes what a review decided into the worktree.
+///
+/// ONE implementation for the dashboard and for the flow block, because a
+/// decision that reaches the disk from one caller and evaporates in the other
+/// is not the same review twice — it is a change the reviewer turned down that
+/// comes back in the next patch set, since the worktree is exactly what that
+/// set is measured against (§11.5 step 5).
+///
+/// Every write carries the compare-and-swap the patch set was decided under: a
+/// path the agent edited again between review and verdict is a conflict, not
+/// something to overwrite.
+///
+/// The scope decides WHICH tree is written, and it has to: a merge review
+/// describes the integration worktree (§11.6), so applying its verdicts to the
+/// session worktree would rewrite the agent's own files with content from
+/// another branch's merge.
+pub fn apply_review_rewrites(
+    broker: &Broker,
+    workspace_id: &str,
+    session_id: &str,
+    scope: &PatchScope,
+    rewrites: &[patch::Rewrite],
+) -> Result<()> {
+    if rewrites.is_empty() {
+        return Ok(());
+    }
+    let root = match scope {
+        PatchScope::Work => SessionRoot::open_session(workspace_id, session_id)
+            .map_err(|e| anyhow!("{}", fs_error_text(&e)))?,
+        PatchScope::Merge { .. } => {
+            SessionRoot::open(&broker.integration_worktree(session_id)?)
+                .map_err(|e| anyhow!("{}", fs_error_text(&e)))?
+        }
+    };
+    let reference = broker.reference();
+    for rewrite in rewrites {
+        let rel = RelPath::parse(&rewrite.path).map_err(|e| anyhow!("{}", fs_error_text(&e)))?;
+        let expect = match &rewrite.expect {
+            patch::Precondition::Absent => FsPrecondition::Absent,
+            patch::Precondition::BlobIs(oid) => FsPrecondition::BlobIs(oid.clone()),
+        };
+        match &rewrite.blob_oid {
+            Some(oid) => {
+                let content = broker.cat_file(&reference, oid)?;
+                root.write(&rel, &content, expect)
+                    .map_err(|e| anyhow!("{}", fs_error_text(&e)))?;
+            }
+            None => root
+                .remove(&rel, false, expect)
+                .map_err(|e| anyhow!("{}", fs_error_text(&e)))?,
+        }
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Review — ONE implementation, two callers
 // =============================================================================
@@ -2579,10 +2646,25 @@ pub async fn run_review(
 
     let pool_for_decide = pool.clone();
     let workspace = workspace_id.to_string();
+    let session = session_id.to_string();
+    let scope_for_decide = scope.clone();
     let patch_set_id = set.id.clone();
     let outcome = tokio::task::spawn_blocking(move || -> Result<patch::DecisionOutcome> {
         let broker = Broker::for_workspace(&workspace)?;
-        patch::decide(&pool_for_decide, &broker, &patch_set_id, &decisions)
+        let outcome = patch::decide(&pool_for_decide, &broker, &patch_set_id, &decisions)?;
+        // A timeout is the ABSENCE of a decision, so it settles the set without
+        // touching the tree: refusing to commit is the safe answer to silence,
+        // erasing the agent's work is not.
+        if !timed_out {
+            apply_review_rewrites(
+                &broker,
+                &workspace,
+                &session,
+                &scope_for_decide,
+                &outcome.rewrites,
+            )?;
+        }
+        Ok(outcome)
     })
     .await
     .map_err(|e| anyhow!("patch decision task failed: {e}"))??;

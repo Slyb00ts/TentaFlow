@@ -922,13 +922,23 @@ pub fn decide(
 
         match item.status {
             "accepted" => outcome.accepted.push(item.file.path.clone()),
-            "rejected" => outcome.rejected.push(item.file.path.clone()),
+            "rejected" => {
+                outcome.rejected.push(item.file.path.clone());
+                // A rejected whole file leaves the disk for the same reason a
+                // rejected hunk does. The worktree is what the NEXT patch set
+                // is measured against (§11.5 step 5), so a rejected change left
+                // lying there is re-proposed after every commit — the reviewer
+                // says no once and the same change comes back for as long as
+                // the session lasts.
+                outcome.rewrites.extend(undo_rewrites(&item.file));
+            }
             "conflicted" => outcome.conflicted.push(item.file.path.clone()),
             _ => {
                 outcome.accepted.push(item.file.path.clone());
-                // Only a partial acceptance implies a file change: the rejected
-                // hunks have to leave the disk. The intent is returned, not
-                // executed — this module does not own the worktree.
+                // A partial acceptance keeps the file and drops the hunks
+                // nobody took, so the tree has to end up holding the composed
+                // content. The intent is returned, not executed — this module
+                // does not own the worktree.
                 outcome.rewrites.push(Rewrite {
                     path: item.file.path.clone(),
                     blob_oid: item.accepted.clone(),
@@ -1090,6 +1100,18 @@ pub fn revert(
         }
     }
 
+    let rewrites = undo_rewrites(&file);
+    delete_file_row(pool, &file.id)?;
+    Ok(rewrites)
+}
+
+/// The worktree writes that undo one proposal: the path goes back to the
+/// content frozen when the set opened, or disappears when the base had none.
+///
+/// Shared by an explicit revert and by a rejection, because they ask the
+/// filesystem for exactly the same thing — the difference between them is who
+/// decided and what the journal records, not what the tree ends up holding.
+fn undo_rewrites(file: &PatchFile) -> Vec<Rewrite> {
     let mut rewrites = vec![Rewrite {
         path: file.path.clone(),
         blob_oid: file.patch_base_blob_sha.clone(),
@@ -1105,8 +1127,7 @@ pub fn revert(
             expect: Precondition::Absent,
         });
     }
-    delete_file_row(pool, &file.id)?;
-    Ok(rewrites)
+    rewrites
 }
 
 // ----- internals -----------------------------------------------------------

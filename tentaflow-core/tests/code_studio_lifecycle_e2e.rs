@@ -52,7 +52,9 @@ use tentaflow_core::dispatch::code_studio::code_studio_dispatch;
 use tentaflow_core::dispatch::{AppState, HandlerContext};
 use tentaflow_core::paths::{set_category_override, StorageCategory};
 use tentaflow_core::services::rbac::middleware::OrgContext;
-use tentaflow_protocol::code_studio::{CodeStudioPayload, PatchFileDecision, PatchHunkDecision};
+use tentaflow_protocol::code_studio::{
+    CodeStudioPayload, PatchFileDecision, PatchFileInfo, PatchHunkDecision,
+};
 use tentaflow_protocol::{MessageBody, ProtocolError, SessionAuth};
 
 const ORG: &str = "org-1";
@@ -236,6 +238,20 @@ impl Fixture {
 
     fn worktree(&self) -> PathBuf {
         paths::session_worktree_dir(&self.workspace_id, &self.session_id).expect("worktree path")
+    }
+
+    /// A request from the same connection carrying its own correlation id.
+    ///
+    /// The journal derives an effect's identity from the origin of the request
+    /// that caused it (§13.1), so two turns sharing one correlation id are ONE
+    /// operation as far as the journal is concerned. Every real client sends a
+    /// fresh correlation id per request, and a multi-turn test that did not
+    /// would be exercising a client that does not exist.
+    fn turn(&self, correlation_id: u64) -> HandlerContext {
+        HandlerContext {
+            correlation_id,
+            ..self.ctx.clone()
+        }
     }
 }
 
@@ -945,6 +961,293 @@ async fn the_whole_cycle_runs_from_an_empty_state_to_a_merged_target_branch() {
         },
     )
     .await;
+}
+
+// =============================================================================
+// 1b. A session that commits more than once
+// =============================================================================
+//
+// One turn is not the interesting case. A session commits, keeps working and
+// commits again, and everything the second turn does is measured against what
+// the first one published — so these two tests take the branch apart with real
+// git afterwards and ask history, not the database, whether that happened.
+
+/// Writes one file through the handlers, the way the agent's `fs_write` does.
+async fn write_file(
+    fx: &Fixture,
+    ctx: &HandlerContext,
+    path: &str,
+    content: &str,
+    expect_sha: Option<String>,
+) {
+    ok(
+        ctx,
+        CodeStudioPayload::FileWriteRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            path: path.into(),
+            content: content.into(),
+            expected_blob_sha: expect_sha,
+        },
+    )
+    .await;
+}
+
+/// Asks for a commit without an accepted review, which is what opens the review
+/// (gate 5a), and returns the set it opened with its files.
+async fn open_review(
+    fx: &Fixture,
+    ctx: &HandlerContext,
+    message: &str,
+) -> (String, Vec<PatchFileInfo>) {
+    let response = ok(
+        ctx,
+        CodeStudioPayload::GitCommitRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            message: message.into(),
+            patch_set_id: None,
+        },
+    )
+    .await;
+    let CodeStudioPayload::GitCommitResponse {
+        status,
+        patch_set_id,
+        ..
+    } = response
+    else {
+        panic!("expected GitCommitResponse");
+    };
+    assert_eq!(status, "review_required", "the commit skipped its review");
+    let patch_set_id = patch_set_id.expect("the review names the set it decides");
+
+    let response = ok(
+        ctx,
+        CodeStudioPayload::PatchSetGetRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            patch_set_id: patch_set_id.clone(),
+        },
+    )
+    .await;
+    let CodeStudioPayload::PatchSetGetResponse { files, .. } = response else {
+        panic!("expected PatchSetGetResponse");
+    };
+    (patch_set_id, files)
+}
+
+/// Decides a whole set per file and publishes it.
+async fn decide_and_commit(
+    fx: &Fixture,
+    ctx: &HandlerContext,
+    patch_set_id: &str,
+    files: &[PatchFileInfo],
+    accepted: &[&str],
+    message: &str,
+) -> String {
+    ok(
+        ctx,
+        CodeStudioPayload::PatchDecideRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            patch_set_id: patch_set_id.to_string(),
+            files: files
+                .iter()
+                .map(|file| PatchFileDecision {
+                    patch_file_id: file.patch_file_id.clone(),
+                    decision: if accepted.contains(&file.path.as_str()) {
+                        "accept".into()
+                    } else {
+                        "reject".into()
+                    },
+                    note: None,
+                    hunks: Vec::new(),
+                })
+                .collect(),
+        },
+    )
+    .await;
+
+    allow_once(fx, "git_commit").await;
+    let response = ok(
+        ctx,
+        CodeStudioPayload::GitCommitRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            message: message.into(),
+            patch_set_id: Some(patch_set_id.to_string()),
+        },
+    )
+    .await;
+    let CodeStudioPayload::GitCommitResponse {
+        status, commit_oid, ..
+    } = response
+    else {
+        panic!("expected GitCommitResponse");
+    };
+    assert_eq!(status, "committed", "the commit did not happen");
+    commit_oid.expect("a commit reports its object id")
+}
+
+/// D1. Two turns, two commits. The second one has to sit ON the first: a commit
+/// parented on the session's original base publishes a branch that has lost
+/// every commit in between, and the compare-and-swap reports success while it
+/// happens. The second turn's review must likewise describe only the second
+/// turn, because its base is the first turn's commit.
+#[tokio::test]
+async fn a_second_commit_builds_on_the_first_instead_of_re_parenting_the_session_base() {
+    let Some(fx) = fixture().await else { return };
+    let branch_ref = format!("refs/heads/{}", fx.branch);
+    let base = git_ok(&[&fx.repo_git_dir(), "rev-parse", &branch_ref]);
+
+    // ---- turn one ----------------------------------------------------------
+    let first_turn = fx.turn(11);
+    write_file(
+        &fx,
+        &first_turn,
+        REPO_FILE,
+        &edited_content(),
+        Some(cs_fs::blob_sha(seed_content().as_bytes())),
+    )
+    .await;
+    let (first_set, first_files) = open_review(&fx, &first_turn, "turn one").await;
+    assert_eq!(
+        first_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        vec![REPO_FILE.to_string()],
+        "the first review does not describe the first turn"
+    );
+    let first = decide_and_commit(
+        &fx,
+        &first_turn,
+        &first_set,
+        &first_files,
+        &[REPO_FILE],
+        "turn one",
+    )
+    .await;
+
+    // ---- turn two ----------------------------------------------------------
+    let second_turn = fx.turn(22);
+    write_file(
+        &fx,
+        &second_turn,
+        "docs/second.md",
+        "written in the second turn\n",
+        None,
+    )
+    .await;
+    let (second_set, second_files) = open_review(&fx, &second_turn, "turn two").await;
+    assert_eq!(
+        second_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        vec!["docs/second.md".to_string()],
+        "the second review re-proposes the first turn, so its base is stale"
+    );
+    let second = decide_and_commit(
+        &fx,
+        &second_turn,
+        &second_set,
+        &second_files,
+        &["docs/second.md"],
+        "turn two",
+    )
+    .await;
+
+    // ---- what the repository actually holds --------------------------------
+    assert_eq!(
+        git_ok(&[&fx.repo_git_dir(), "rev-parse", &format!("{second}^")]),
+        first,
+        "the second commit is not a child of the first"
+    );
+    for (name, commit) in [("the first", &first), ("the second", &second)] {
+        assert!(
+            git(&[
+                &fx.repo_git_dir(),
+                "merge-base",
+                "--is-ancestor",
+                commit,
+                &branch_ref,
+            ])
+            .status
+            .success(),
+            "{name} commit is not reachable from the session branch"
+        );
+    }
+    assert_eq!(
+        git_ok(&[&fx.repo_git_dir(), "rev-list", "--count", &branch_ref]),
+        git_ok(&[&fx.repo_git_dir(), "rev-list", "--count", &base])
+            .parse::<u32>()
+            .map(|n| (n + 2).to_string())
+            .expect("a commit count"),
+        "the branch does not carry both turns"
+    );
+    // Both changes are in the tree the branch points at, which is the whole
+    // point of a history: nothing published earlier was dropped on the way.
+    let head = git_ok(&[&fx.repo_git_dir(), "show", &format!("{second}:{REPO_FILE}")]);
+    assert!(
+        head.contains("line 2 CHANGED BY THE AGENT"),
+        "the second commit lost the first turn's content:\n{head}"
+    );
+    assert_eq!(
+        git_ok(&[&fx.repo_git_dir(), "show", &format!("{second}:docs/second.md")]),
+        "written in the second turn",
+    );
+}
+
+/// D1, the reviewer's half. A file turned down in one turn must not be back in
+/// the next one's review: the worktree is what the next patch set is measured
+/// against, so a rejected change left on disk is re-proposed after every commit
+/// until somebody accepts it by accident.
+#[tokio::test]
+async fn a_rejected_file_is_gone_from_the_worktree_and_from_the_next_review() {
+    let Some(fx) = fixture().await else { return };
+
+    let first_turn = fx.turn(11);
+    write_file(
+        &fx,
+        &first_turn,
+        REPO_FILE,
+        &edited_content(),
+        Some(cs_fs::blob_sha(seed_content().as_bytes())),
+    )
+    .await;
+    write_file(
+        &fx,
+        &first_turn,
+        "scratch/unwanted.txt",
+        "nobody asked for this\n",
+        None,
+    )
+    .await;
+
+    let (set, files) = open_review(&fx, &first_turn, "turn one").await;
+    assert_eq!(files.len(), 2, "the review shows {files:?}");
+    let commit = decide_and_commit(&fx, &first_turn, &set, &files, &[REPO_FILE], "turn one").await;
+
+    assert!(
+        !fx.worktree().join("scratch/unwanted.txt").exists(),
+        "the rejected file is still in the worktree, so the next set will propose it again"
+    );
+    assert!(
+        !git(&[
+            &fx.repo_git_dir(),
+            "cat-file",
+            "-e",
+            &format!("{commit}:scratch/unwanted.txt"),
+        ])
+        .status
+        .success(),
+        "the rejected file was committed"
+    );
+
+    // The next turn touches something else entirely.
+    let second_turn = fx.turn(22);
+    write_file(&fx, &second_turn, "docs/second.md", "the second turn\n", None).await;
+    let (_, next) = open_review(&fx, &second_turn, "turn two").await;
+    assert_eq!(
+        next.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        vec!["docs/second.md".to_string()],
+        "the rejected file came back in the next review"
+    );
 }
 
 // =============================================================================

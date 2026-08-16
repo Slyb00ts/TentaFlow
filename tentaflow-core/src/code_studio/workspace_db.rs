@@ -246,10 +246,13 @@ CREATE TABLE sessions (
 );
 CREATE INDEX idx_sessions_user ON sessions(user_id, status);
 
--- `head_commit` is the start point for a working worktree and the expected_old
--- of the target ref for an integration one; `state='held'` marks a merge whose
--- result is waiting for a conflict to be resolved in a later run, and such a
--- worktree must NOT be removed or the revision run has nothing to work on.
+-- `head_commit` is the branch tip a working worktree currently sits on — moved
+-- by `record_session_head` after every commit and every fast-forward pull — and
+-- the expected_old of the target ref for an integration one. `base_commit` is
+-- where the worktree started: for a session, the commit it branched from.
+-- `state='held'` marks a merge whose result is waiting for a conflict to be
+-- resolved in a later run, and such a worktree must NOT be removed or the
+-- revision run has nothing to work on.
 CREATE TABLE worktrees (
     id TEXT PRIMARY KEY,
     session_id TEXT NOT NULL REFERENCES sessions(id) ON DELETE CASCADE,

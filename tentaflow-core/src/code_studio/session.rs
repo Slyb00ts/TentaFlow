@@ -387,6 +387,211 @@ pub fn reconcile_interrupted(pool: &DbPool) -> Result<usize> {
     Ok(changed)
 }
 
+// =============================================================================
+// Session-wide run budget (§15)
+// =============================================================================
+
+/// Setting key and default for the total number of runs one session may start.
+///
+/// `max_subagents` bounds ONE parent and `max_spawn_depth` bounds ONE branch;
+/// the global `agents.max_concurrent_runs` semaphore bounds how many runs are
+/// live at the same instant across the process. None of them bounds how many
+/// runs a single session produces over its lifetime: at ten wide and three
+/// deep, one turn can reach four figures. This budget is the only thing that
+/// does, and it is read per spawn rather than cached at startup so lowering it
+/// takes effect on the next delegation instead of the next restart.
+pub const MAX_SESSION_RUNS_SETTING: &str = "code_studio.max_session_runs";
+pub const DEFAULT_MAX_SESSION_RUNS: i64 = 50;
+
+/// Reads the configured budget, falling back to the default for an absent,
+/// unparseable or non-positive value — a session with a budget of zero could
+/// not even start its first turn.
+pub fn max_session_runs(db: &DbPool) -> i64 {
+    crate::db::repository::get_setting(db, MAX_SESSION_RUNS_SETTING)
+        .ok()
+        .flatten()
+        .and_then(|v| v.parse::<i64>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or(DEFAULT_MAX_SESSION_RUNS)
+}
+
+/// One sub-agent run a delegation wants to register on a session.
+#[derive(Debug, Clone, Copy)]
+pub struct SubagentRun<'a> {
+    /// Id the run will be created under. It is minted BEFORE the run starts so
+    /// the budget can be claimed for it, which is what makes the claim atomic.
+    pub run_id: &'a str,
+    pub parent_run_id: &'a str,
+    pub agent_id: &'a str,
+}
+
+/// Claims a session run slot for every requested sub-agent and registers the
+/// rows, or refuses the whole delegation.
+///
+/// The slot is CLAIMED, not checked and then taken: ten simultaneous
+/// delegations that each counted first and inserted afterwards would all read
+/// "one left" and all write, which is how a budget of fifty becomes sixty. One
+/// conditional INSERT per run decides it, the way `insert_session_rows` claims
+/// a session quota slot, and the batch runs in one transaction so a delegation
+/// that does not fit registers none of itself.
+///
+/// A refusal stops the SPAWN, never the caller: the runs already started keep
+/// working and the calling agent gets a recoverable tool error. It also leaves
+/// a timeline entry, because an agent that quietly stops delegating is
+/// indistinguishable from an agent that decided it was done.
+pub fn claim_subagent_runs(
+    pool: &DbPool,
+    session_id: &str,
+    runs: &[SubagentRun<'_>],
+    budget: i64,
+) -> Result<()> {
+    if runs.is_empty() {
+        return Ok(());
+    }
+    let refusal = {
+        let mut conn = pool
+            .write()
+            .map_err(|e| anyhow!("workspace db write: {e}"))?;
+        let tx = conn.transaction()?;
+        let mut used: Option<i64> = None;
+        for run in runs {
+            // COUNT and MAX(ordinal) are taken over the session INSIDE the
+            // statement that inserts, so no other writer can slip between them.
+            let claimed = tx.execute(
+                "INSERT INTO session_runs \
+                   (run_id, session_id, ordinal, kind, trigger, parent_run_id, agent_id, \
+                    status, started_at) \
+                 SELECT ?1, ?2, COALESCE(MAX(ordinal), 0) + 1, 'subagent', 'agent_spawn', \
+                        ?3, ?4, 'running', datetime('now') \
+                 FROM session_runs WHERE session_id = ?2 \
+                 HAVING COUNT(*) < ?5",
+                rusqlite::params![run.run_id, session_id, run.parent_run_id, run.agent_id, budget],
+            )?;
+            if claimed == 0 {
+                used = Some(tx.query_row(
+                    "SELECT COUNT(*) FROM session_runs WHERE session_id = ?1",
+                    rusqlite::params![session_id],
+                    |row| row.get(0),
+                )?);
+                break;
+            }
+            // The registration and its timeline entry commit together: a row
+            // the timeline does not know about would be a projection with no
+            // source (§13.3).
+            super::events::append_in_tx(
+                &tx,
+                session_id,
+                super::events::SessionEvent::new(
+                    format!("run:{}:started", run.run_id),
+                    super::events::EventPayload::RunStarted {
+                        run_id: run.run_id.to_string(),
+                        kind: "subagent".to_string(),
+                        trigger: "agent_spawn".to_string(),
+                    },
+                )
+                .with_run(run.run_id)
+                .with_agent(run.agent_id),
+            )?;
+        }
+        match used {
+            // Dropping the transaction rolls back every row of the batch.
+            Some(used) => Some(used),
+            None => {
+                tx.commit()?;
+                None
+            }
+        }
+    };
+
+    let Some(used) = refusal else {
+        return Ok(());
+    };
+    let reason = format!(
+        "session run budget exhausted: this session has already started {used} of {budget} \
+         runs, so the delegation of {} further run(s) is refused; work already running \
+         continues",
+        runs.len()
+    );
+    // The count is part of the key so a parent retrying in a loop leaves one
+    // entry, while a later refusal at a different count is still recorded.
+    let event = super::events::SessionEvent::new(
+        format!("run:{}:spawn_refused:{used}", runs[0].parent_run_id),
+        super::events::EventPayload::AgentMessage {
+            role: "system".to_string(),
+            text: reason.clone(),
+        },
+    )
+    .with_run(runs[0].parent_run_id);
+    if let Err(error) = super::events::append(pool, session_id, event) {
+        warn!(session_id, "cannot journal a refused delegation: {error:#}");
+    }
+    Err(anyhow!(reason))
+}
+
+/// How a sub-agent run ended, as the run manager settled it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct SubagentRunEnd<'a> {
+    pub status: &'a str,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub model: Option<&'a str>,
+    pub error: Option<&'a str>,
+}
+
+/// Closes the session row of a settled sub-agent run and journals the end.
+///
+/// Deliberately scoped to `kind='subagent'`: the root turn's row belongs to the
+/// session coordinator's watcher, which also carries the turn's accounting, and
+/// two writers closing one row would make the first one win and the second one
+/// lose its data. A row somebody already closed is left alone.
+///
+/// A claimed slot is never given back — not even for a run that failed to
+/// launch, which is closed through here too. The budget counts what a session
+/// STARTED, so returning a slot would let a failing spawn be retried without
+/// end.
+pub fn close_subagent_run(
+    pool: &DbPool,
+    session_id: &str,
+    run_id: &str,
+    end: SubagentRunEnd<'_>,
+) -> Result<()> {
+    {
+        let conn = pool
+            .write()
+            .map_err(|e| anyhow!("workspace db write: {e}"))?;
+        let closed = conn.execute(
+            "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
+               prompt_tokens = ?3, completion_tokens = ?4, model = ?5 \
+             WHERE run_id = ?1 AND kind = 'subagent' \
+               AND status NOT IN ('completed','failed','cancelled')",
+            rusqlite::params![
+                run_id,
+                end.status,
+                end.prompt_tokens,
+                end.completion_tokens,
+                end.model
+            ],
+        )?;
+        if closed == 0 {
+            return Ok(());
+        }
+    }
+    super::events::append(
+        pool,
+        session_id,
+        super::events::SessionEvent::new(
+            format!("run:{run_id}:finished"),
+            super::events::EventPayload::RunFinished {
+                run_id: run_id.to_string(),
+                status: end.status.to_string(),
+                error: end.error.map(str::to_string),
+            },
+        )
+        .with_run(run_id),
+    )?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -719,6 +924,262 @@ mod tests {
         // Running it again touches nothing: an already-interrupted session is
         // not a live one, and a second boot must not rewrite its timestamp.
         assert_eq!(reconcile_interrupted(&fx.pool).unwrap(), 0);
+        release();
+    }
+
+    /// The root turn, written by the session coordinator. Every budget test
+    /// starts from one, because the budget counts the WHOLE session and the
+    /// first run of a session is not a sub-agent.
+    fn seed_root_run(pool: &DbPool, session_id: &str, run_id: &str) {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO session_runs \
+               (run_id, session_id, ordinal, kind, trigger, agent_id, status, started_at) \
+             VALUES (?1, ?2, 1, 'root', 'user', 'code-orchestrator', 'running', \
+                     datetime('now'))",
+            rusqlite::params![run_id, session_id],
+        )
+        .unwrap();
+    }
+
+    fn claim_one(pool: &DbPool, session_id: &str, run_id: &str, parent: &str, budget: i64) -> Result<()> {
+        claim_subagent_runs(
+            pool,
+            session_id,
+            &[SubagentRun {
+                run_id,
+                parent_run_id: parent,
+                agent_id: "code-reviewer",
+            }],
+            budget,
+        )
+    }
+
+    fn session_run_count(pool: &DbPool, session_id: &str) -> i64 {
+        let conn = pool.read().unwrap();
+        conn.query_row(
+            "SELECT COUNT(*) FROM session_runs WHERE session_id = ?1",
+            rusqlite::params![session_id],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn a_fan_out_stops_exactly_at_the_session_run_budget() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() {
+            eprintln!("skipping: git is not installed");
+            return;
+        }
+        let fx = fixture("ws-budget");
+        open_session(&fx.workspace, WorkspaceRole::Editor, &new_session("s-1")).unwrap();
+        let budget = DEFAULT_MAX_SESSION_RUNS;
+        seed_root_run(&fx.pool, "s-1", "root");
+
+        // The root turn already holds one slot, so the budget leaves room for
+        // exactly `budget - 1` delegations.
+        for index in 0..budget - 1 {
+            claim_one(&fx.pool, "s-1", &format!("child-{index}"), "root", budget)
+                .unwrap_or_else(|e| panic!("delegation {index} refused below the budget: {e}"));
+        }
+        let refused = claim_one(&fx.pool, "s-1", "one-too-many", "root", budget)
+            .expect_err("the delegation past the budget must be refused");
+        let reason = refused.to_string();
+        assert!(
+            reason.contains("session run budget exhausted") && reason.contains(&budget.to_string()),
+            "the refusal does not name its reason: {reason}"
+        );
+
+        // Nothing was killed to make room: every run claimed before the refusal
+        // is still there and still running.
+        assert_eq!(session_run_count(&fx.pool, "s-1"), budget);
+        let running: i64 = {
+            let conn = fx.pool.read().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_runs WHERE session_id='s-1' AND status='running'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(running, budget, "runs already started must survive a refusal");
+        release();
+    }
+
+    #[test]
+    fn nested_runs_count_towards_the_session_budget() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() {
+            eprintln!("skipping: git is not installed");
+            return;
+        }
+        let fx = fixture("ws-nested");
+        open_session(&fx.workspace, WorkspaceRole::Editor, &new_session("s-1")).unwrap();
+        seed_root_run(&fx.pool, "s-1", "root");
+
+        // Budget of four: root + child + grandchild + great-grandchild. The
+        // depth of a run changes nothing — what is counted is the session.
+        let budget = 4;
+        claim_one(&fx.pool, "s-1", "child", "root", budget).expect("child");
+        claim_one(&fx.pool, "s-1", "grandchild", "child", budget).expect("grandchild");
+        claim_one(&fx.pool, "s-1", "great", "grandchild", budget).expect("great-grandchild");
+        let refused = claim_one(&fx.pool, "s-1", "great-great", "great", budget)
+            .expect_err("a nested run must be counted like any other");
+        assert!(refused.to_string().contains("session run budget exhausted"));
+        assert_eq!(session_run_count(&fx.pool, "s-1"), budget);
+
+        // Another session of the same workspace has its own budget — the count
+        // is per session, not per workspace.
+        open_session(&fx.workspace, WorkspaceRole::Editor, &new_session("s-2")).unwrap();
+        seed_root_run(&fx.pool, "s-2", "root-2");
+        claim_one(&fx.pool, "s-2", "child-2", "root-2", budget).expect("other session");
+        release();
+    }
+
+    #[test]
+    fn a_refused_delegation_leaves_a_trace_on_the_timeline() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() {
+            eprintln!("skipping: git is not installed");
+            return;
+        }
+        let fx = fixture("ws-trace");
+        open_session(&fx.workspace, WorkspaceRole::Editor, &new_session("s-1")).unwrap();
+        seed_root_run(&fx.pool, "s-1", "root");
+        claim_one(&fx.pool, "s-1", "child", "root", 2).expect("child");
+        claim_one(&fx.pool, "s-1", "refused", "root", 2).expect_err("budget");
+
+        let entries = crate::code_studio::events::read_after(&fx.pool, "s-1", 0, 100).unwrap();
+        let refusal = entries
+            .iter()
+            .find(|event| {
+                matches!(&event.payload, crate::code_studio::events::EventPayload::AgentMessage { text, .. }
+                    if text.contains("session run budget exhausted"))
+            })
+            .expect("an operator must be able to see WHY the agent stopped delegating");
+        assert_eq!(refusal.run_id.as_deref(), Some("root"));
+        // And the accepted delegation is on the timeline too, so the refusal is
+        // readable in the context of what came before it.
+        assert!(entries.iter().any(|event| matches!(
+            &event.payload,
+            crate::code_studio::events::EventPayload::RunStarted { run_id, kind, .. }
+                if run_id == "child" && kind == "subagent"
+        )));
+        release();
+    }
+
+    #[test]
+    fn parallel_delegations_cannot_between_them_exceed_the_session_budget() {
+        // Ten threads delegate at once with three slots left. Counting first
+        // and inserting afterwards would let all ten see room; the claim is a
+        // single conditional INSERT, so exactly three come back with a run.
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() {
+            eprintln!("skipping: git is not installed");
+            return;
+        }
+        let fx = fixture("ws-budget-race");
+        open_session(&fx.workspace, WorkspaceRole::Editor, &new_session("s-1")).unwrap();
+        seed_root_run(&fx.pool, "s-1", "root");
+        let budget = 4; // root + three delegations
+        let racers = 10;
+
+        // The barrier outlives the scope on purpose: the spawned threads borrow
+        // it, so declaring it inside the closure makes it die while they still
+        // hold a reference.
+        let start = std::sync::Barrier::new(racers);
+        let outcomes: Vec<Result<()>> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..racers)
+                .map(|index| {
+                    let pool = fx.pool.clone();
+                    let start = &start;
+                    scope.spawn(move || {
+                        start.wait();
+                        claim_one(&pool, "s-1", &format!("child-{index}"), "root", budget)
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|handle| handle.join().expect("claim thread"))
+                .collect()
+        });
+
+        let claimed = outcomes.iter().filter(|outcome| outcome.is_ok()).count();
+        assert_eq!(
+            claimed,
+            (budget - 1) as usize,
+            "{claimed} delegations claimed against a budget of {budget}"
+        );
+        // The rows are the authority, not the count of successful returns.
+        assert_eq!(session_run_count(&fx.pool, "s-1"), budget);
+        assert!(outcomes
+            .iter()
+            .filter_map(|outcome| outcome.as_ref().err())
+            .all(|e| e.to_string().contains("session run budget exhausted")));
+        release();
+    }
+
+    #[test]
+    fn a_settled_sub_agent_closes_its_row_and_the_root_turn_is_left_alone() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        if !git_available() {
+            eprintln!("skipping: git is not installed");
+            return;
+        }
+        // Its own workspace: `ws-close` already belongs to the close test, and
+        // the fixture name is the workspace id, so sharing it means sharing the
+        // sessions table and colliding on `s-1`.
+        let fx = fixture("ws-subrun");
+        open_session(&fx.workspace, WorkspaceRole::Editor, &new_session("s-1")).unwrap();
+        seed_root_run(&fx.pool, "s-1", "root");
+        claim_one(&fx.pool, "s-1", "child", "root", 10).expect("child");
+
+        close_subagent_run(
+            &fx.pool,
+            "s-1",
+            "child",
+            SubagentRunEnd {
+                status: "completed",
+                prompt_tokens: 11,
+                completion_tokens: 7,
+                ..Default::default()
+            },
+        )
+        .expect("close");
+        // The root turn belongs to the session coordinator's watcher, which
+        // also carries its accounting; closing it from here would make one of
+        // the two writers lose its data.
+        close_subagent_run(
+            &fx.pool,
+            "s-1",
+            "root",
+            SubagentRunEnd {
+                status: "completed",
+                ..Default::default()
+            },
+        )
+        .expect("root is ignored, not an error");
+
+        let conn = fx.pool.read().unwrap();
+        let (status, prompt): (String, i64) = conn
+            .query_row(
+                "SELECT status, prompt_tokens FROM session_runs WHERE run_id='child'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!((status.as_str(), prompt), ("completed", 11));
+        let root: String = conn
+            .query_row(
+                "SELECT status FROM session_runs WHERE run_id='root'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(root, "running");
+        drop(conn);
         release();
     }
 }

@@ -389,8 +389,42 @@ impl AgentRunManager {
     /// `flow_override` replaces the harness graph this run executes. It exists
     /// for Code Studio, where the graph is a property of the SESSION (§16) and
     /// not of the agent definition.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
+        agent_id: &str,
+        prompt: &str,
+        parent_run_id: Option<&str>,
+        principal: &AgentPrincipal,
+        inherited_tools: &[String],
+        extra_meta: &[(&str, Value)],
+        target_session_id: Option<&str>,
+        flow_override: Option<&str>,
+    ) -> Result<String> {
+        self.spawn_with_run_id(
+            &uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            prompt,
+            parent_run_id,
+            principal,
+            inherited_tools,
+            extra_meta,
+            target_session_id,
+            flow_override,
+        )
+        .await
+    }
+
+    /// Same spawn, under a run id the caller minted.
+    ///
+    /// The sub-agent path needs the id BEFORE the run exists: a Code Studio
+    /// session claims its run budget by inserting the run's own row, and a
+    /// claim that could not name the run it claims for would have to count
+    /// first and insert later — the exact race the budget is there to close.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_run_id(
+        &self,
+        run_id: &str,
         agent_id: &str,
         prompt: &str,
         parent_run_id: Option<&str>,
@@ -411,7 +445,7 @@ impl AgentRunManager {
             self.assert_tools_subset(&agent.tools_json, inherited_tools)?;
         }
 
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = run_id.to_string();
         repository::create_agent_run(
             &self.db,
             &NewAgentRun {
@@ -552,7 +586,11 @@ impl AgentRunManager {
         let parent_tools: Vec<String> =
             serde_json::from_str(&parent.tools_json).unwrap_or_default();
 
-        let mut run_ids = Vec::with_capacity(tasks.len());
+        // Every child is resolved before any of them starts, because the
+        // session budget below is claimed for the whole batch at once and a
+        // claim for a task that turns out to name no agent would burn budget on
+        // a run that can never exist.
+        let mut planned = Vec::with_capacity(tasks.len());
         for task in tasks {
             let child = repository::get_agent_by_name(&self.db, &task.agent_name)?
                 .ok_or_else(|| anyhow!("agent_spawn: agent '{}' not found", task.agent_name))?;
@@ -560,21 +598,40 @@ impl AgentRunManager {
                 Some(c) if !c.is_empty() => format!("{c}\n\n{}", task.task),
                 _ => task.task.clone(),
             };
-            // The Code Studio binding travels with the delegation: a child that
-            // reviews or tests must land in the parent's worktree, and passing
-            // it here (rather than letting the child ask for one) is what makes
-            // that impossible to redirect.
-            let extra_meta: Vec<(&str, Value)> = match &caller.code_session {
-                Some(binding) => vec![(
-                    crate::code_studio::tools::SESSION_META_KEY,
-                    binding.clone(),
-                )],
-                None => Vec::new(),
-            };
-            let run_id = self
-                .spawn(
-                    &child.id,
-                    &prompt,
+            planned.push(PlannedChild {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                agent_id: child.id,
+                prompt,
+            });
+        }
+
+        // Session budget (§15): depth bounds one branch and max_subagents
+        // bounds one parent — neither bounds the tree, so a Code Studio session
+        // also carries an absolute count over ALL of its runs, nested ones
+        // included. The refusal stops this SPAWN and nothing else: the runs
+        // already working keep working and the caller sees a recoverable tool
+        // error naming the budget.
+        let session = self.claim_session_runs(caller, &planned)?;
+
+        // The Code Studio binding travels with the delegation: a child that
+        // reviews or tests must land in the parent's worktree, and passing it
+        // here (rather than letting the child ask for one) is what makes that
+        // impossible to redirect.
+        let extra_meta: Vec<(&str, Value)> = match &caller.code_session {
+            Some(binding) => vec![(
+                crate::code_studio::tools::SESSION_META_KEY,
+                binding.clone(),
+            )],
+            None => Vec::new(),
+        };
+
+        let mut run_ids = Vec::with_capacity(planned.len());
+        for child in &planned {
+            let spawned = self
+                .spawn_with_run_id(
+                    &child.run_id,
+                    &child.agent_id,
+                    &child.prompt,
                     Some(&caller.run_id),
                     &caller.principal,
                     &parent_tools,
@@ -587,11 +644,76 @@ impl AgentRunManager {
                     // the orchestrator's graph.
                     None,
                 )
-                .await?;
-            run_ids.push(run_id);
+                .await;
+            match spawned {
+                Ok(run_id) => run_ids.push(run_id),
+                Err(e) => {
+                    // The slot was claimed before the launch, so a child that
+                    // never started is closed as failed rather than left
+                    // "running" on the session's timeline for ever.
+                    if let Some((pool, session_id)) = &session {
+                        let end = crate::code_studio::session::SubagentRunEnd {
+                            status: "failed",
+                            error: Some("the run could not be started"),
+                            ..Default::default()
+                        };
+                        for pending in &planned[run_ids.len()..] {
+                            if let Err(error) = crate::code_studio::session::close_subagent_run(
+                                pool,
+                                session_id,
+                                &pending.run_id,
+                                end,
+                            ) {
+                                tracing::warn!(
+                                    run_id = %pending.run_id,
+                                    "cannot close an unstarted sub-agent run: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         Ok(json!({ "run_ids": run_ids }))
+    }
+
+    /// Claims one session run slot per planned child when the caller runs
+    /// inside a Code Studio session, returning the session's runtime pool so a
+    /// later failure can close the rows it just wrote. `None` for a caller with
+    /// no session binding — an ordinary background agent has no session to
+    /// budget.
+    fn claim_session_runs(
+        &self,
+        caller: &CallerRun,
+        planned: &[PlannedChild],
+    ) -> Result<Option<(DbPool, String)>> {
+        let Some(value) = caller.code_session.as_ref() else {
+            return Ok(None);
+        };
+        // The binding is server-minted; a malformed one means this run's meta
+        // was corrupted, and guessing "then there is no budget" is exactly the
+        // wrong way to resolve that.
+        let binding = crate::code_studio::tools::binding_from_value(value)
+            .ok_or_else(|| anyhow!("agent_spawn: the session binding of this run is malformed"))?;
+        let pool = crate::code_studio::workspace_db::open(&binding.workspace_id)?;
+        let budget = crate::code_studio::session::max_session_runs(&self.db);
+        let runs: Vec<crate::code_studio::session::SubagentRun<'_>> = planned
+            .iter()
+            .map(|child| crate::code_studio::session::SubagentRun {
+                run_id: &child.run_id,
+                parent_run_id: &caller.run_id,
+                agent_id: &child.agent_id,
+            })
+            .collect();
+        crate::code_studio::session::claim_subagent_runs(
+            &pool,
+            &binding.session_id,
+            &runs,
+            budget,
+        )?;
+        Ok(Some((pool, binding.session_id)))
     }
 
     /// `core.agent_wait` handler. Waits for the named runs to settle on their
@@ -1040,6 +1162,15 @@ pub struct CallerRun {
     pub code_session: Option<Value>,
 }
 
+/// One child of a delegation, resolved and given its run id before anything is
+/// launched. The id exists this early so a Code Studio session can claim the
+/// run's budget slot by inserting that run's own row.
+struct PlannedChild {
+    run_id: String,
+    agent_id: String,
+    prompt: String,
+}
+
 impl CallerRun {
     /// Builds the calling run's identity from a harness envelope's `meta`
     /// (`agent_run_id` + `agent_id`, set by `agent_context`) plus the run's
@@ -1137,6 +1268,11 @@ async fn run_task(ctx: TaskContext) {
         permit,
     } = ctx;
 
+    // Read once, here: the envelope moves into the runner below, and a
+    // sub-agent registered on a Code Studio session has to close its session
+    // row wherever this task ends.
+    let code_session = crate::code_studio::tools::binding_from_meta(&initial.meta);
+
     // Acquire the global permit before running the flow. While the pool is full
     // the task parks here in `queued`; a cancel before a permit is won still
     // aborts cleanly (the run is finalized cancelled below).
@@ -1163,6 +1299,14 @@ async fn run_task(ctx: TaskContext) {
                 },
             );
             let _ = status.send(RunStatus::Cancelled);
+            close_session_run(
+                code_session.as_ref(),
+                &run_id,
+                crate::code_studio::session::SubagentRunEnd {
+                    status: RunStatus::Cancelled.as_str(),
+                    ..Default::default()
+                },
+            );
             publish_child_finished(
                 &progress,
                 &run_id,
@@ -1254,6 +1398,17 @@ async fn run_task(ctx: TaskContext) {
         },
     );
     let _ = status.send(final_status);
+    close_session_run(
+        code_session.as_ref(),
+        &run_id,
+        crate::code_studio::session::SubagentRunEnd {
+            status: final_status.as_str(),
+            prompt_tokens: usage.map(|u| u.prompt_tokens as i64).unwrap_or(0),
+            completion_tokens: usage.map(|u| u.completion_tokens as i64).unwrap_or(0),
+            model: model.as_deref(),
+            error: Some(exit_reason.as_str()).filter(|r| r.starts_with("error:")),
+        },
+    );
 
     // Drop any open interactions + per-run permission grants this run earned —
     // a settled run leaves no stale waiting questions or cached grants (§3.13).
@@ -1306,6 +1461,29 @@ async fn run_task(ctx: TaskContext) {
         let _ = permit.lock().map(|mut p| p.take());
     }
     runs.remove(&run_id);
+}
+
+/// Closes the Code Studio session row of a settled run, when the run has one.
+///
+/// Best effort by design: the authoritative record of a run is its `agent_runs`
+/// row, and a workspace whose runtime database cannot be opened (moved storage,
+/// a workspace deleted under a live run) must not turn a finished run into a
+/// failing task. `close_subagent_run` ignores the ROOT turn's row, which the
+/// session coordinator's own watcher owns.
+fn close_session_run(
+    binding: Option<&crate::code_studio::tools::SessionBinding>,
+    run_id: &str,
+    end: crate::code_studio::session::SubagentRunEnd<'_>,
+) {
+    let Some(binding) = binding else {
+        return;
+    };
+    let closed = crate::code_studio::workspace_db::open(&binding.workspace_id).and_then(|pool| {
+        crate::code_studio::session::close_subagent_run(&pool, &binding.session_id, run_id, end)
+    });
+    if let Err(error) = closed {
+        tracing::warn!(run_id, "cannot close the session row of a run: {error:#}");
+    }
 }
 
 /// Publishes `ChildFinished` to the run's own scope and, when the run has a
