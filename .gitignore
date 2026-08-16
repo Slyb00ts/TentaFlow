@@ -1,11 +1,10 @@
 # =============================================================================
 # Artefakty kompilacji
 # =============================================================================
+# Every cargo output dir, however it was named: build artifacts are
+# rebuilt locally and never belong in the repository.
 target/
-target_shared/
-target-amd/
-target-addon-wasm/
-target-service-context-test/*
+target[-_]*/
 
 # Runtime data (SQLite, HMAC keys, container bundles, model cache).
 # Wczesniej trzymane w target/debug/ — `cargo clean` je wywalal. Teraz
@@ -242,10 +241,6 @@ thirparty/
 
 # Benchmark/experiment scratch
 /scratch/
-target_concurrency/
-target_prefill_finish/
-target_fixedk3/
-target_clippy_fixed/
 
 # Katalogi robocze buildu kerneli (publikacja podmienia je atomowo; gdy build
 # zostanie przerwany, zostaja na dysku i nie moga trafic do repo).
