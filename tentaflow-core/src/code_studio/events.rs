@@ -492,6 +492,21 @@ impl EventPayload {
     }
 }
 
+/// Idempotency key of "this approval was put to somebody".
+///
+/// The key is the identity of a WRITE, so the two writers of an approval's
+/// timeline entries — the dashboard handler that decides a card and the
+/// suspended call that raised it — have to spell it the same way or the same
+/// fact lands twice under two names. There is therefore one spelling, here.
+pub fn approval_requested_key(approval_id: &str) -> String {
+    format!("approval:{approval_id}:requested")
+}
+
+/// Idempotency key of "this approval was decided". Same rule as above.
+pub fn approval_decided_key(approval_id: &str) -> String {
+    format!("approval:{approval_id}:decided")
+}
+
 /// What a caller hands to `append`. `session_id` is a parameter of the call
 /// rather than a field, because it also selects the sequence space.
 #[derive(Debug, Clone)]

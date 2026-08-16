@@ -439,6 +439,12 @@ pub struct RunInfo {
     /// one yet.
     #[serde(default)]
     pub model: Option<String>,
+    /// What the PROVIDER said the turn cost, in USD. `None` whenever nobody
+    /// stated a price — which is every run we meter ourselves, because the node
+    /// has no price feed and a figure derived from tokens would read as measured
+    /// while being a guess.
+    #[serde(default)]
+    pub cost_usd: Option<f64>,
 }
 
 /// One row of the server-side VT grid. `text` holds the row's characters and
@@ -1100,6 +1106,17 @@ pub enum CodeStudioPayload {
         approval_id: String,
         status: String,
         decision: String,
+        /// True when the answer woke a call that was parked on this card.
+        ///
+        /// A card raised by a run and answered too late leaves the decision
+        /// recorded and the run already gone, which looks identical to a
+        /// successful resume from the console. The console needs to be able to
+        /// tell the operator which of the two happened, so the answer carries
+        /// it rather than leaving it to be inferred from a timeline that has
+        /// not been re-read yet. `false` is also the ordinary case for a card
+        /// the dashboard raised for its own request — nothing parks there.
+        #[serde(default)]
+        resumed: bool,
     },
     SessionGrantsListRequest {
         workspace_id: String,
@@ -1783,7 +1800,7 @@ mod tests {
             ("ApprovalInfo", 14, 0xb495_12ac_e29d_e01d),
             ("GrantInfo", 5, 0x746f_66e3_5c06_3f72),
             ("AllowlistEntryInfo", 5, 0xfa26_c8fd_98e4_01bf),
-            ("RunInfo", 13, 0x5f3e_aec5_9661_597e),
+            ("RunInfo", 14, 0xa39b_bf6c_da1e_37ea),
             ("TerminalCellRow", 3, 0x127a_c330_42a5_759e),
             ("IndexStateInfo", 6, 0x2bdd_bc96_705b_0813),
             ("CodeSearchHit", 7, 0x69cb_cf35_e72d_b0d1),
@@ -2029,6 +2046,7 @@ mod tests {
         assert_eq!(run.prompt_tokens, 0);
         assert_eq!(run.completion_tokens, 0);
         assert_eq!(run.model, None);
+        assert_eq!(run.cost_usd, None);
 
         let workspace: WorkspaceInfo = serde_json::from_str(
             r#"{"workspace_id":"w1","name":"Core","slug":"core","node_id":"n1","node_name":"dev",
@@ -2075,6 +2093,7 @@ mod tests {
                 approval_id: "a1".into(),
                 status: "decided".into(),
                 decision: decision.to_string(),
+                resumed: true,
             };
             let bytes = crate::cbor::encode(&answer).expect("encode");
             assert_eq!(

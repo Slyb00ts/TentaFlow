@@ -43,7 +43,7 @@ pub mod windows;
 #[cfg(windows)]
 use windows as platform;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -56,9 +56,29 @@ use super::sandbox::{ContainerRuntime, ExecTarget, Lease};
 
 /// Wall-clock ceiling of one command.
 pub const DEFAULT_TIMEOUT: Duration = Duration::from_secs(300);
+
 /// How much of each stream is kept for the model context and the artifact. The
 /// process keeps running past it; only the capture stops growing.
-pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 1024 * 1024;
+///
+/// Sized against the budget the capture actually has to fit into, not against
+/// what a disk could hold: a tool result reaching the model is bounded at
+/// `tools::MAX_RESULT_CHARS` (16 000), and that trim cuts from the HEAD of the
+/// widest string. Two streams of 6 KiB plus the rest of the result object stay
+/// comfortably under it, so the tail this module works to preserve survives all
+/// the way to the model instead of being cut off one layer later. A megabyte
+/// per stream — the previous value — guaranteed the opposite.
+pub const DEFAULT_MAX_OUTPUT_BYTES: usize = 6 * 1024;
+
+/// Share of the byte budget spent on the beginning of a stream.
+///
+/// The tail gets the rest, and gets the larger share, because that is where the
+/// answer is: a failing `cargo build` ends with the error that stopped it, a
+/// failing test run ends with the failure list, and a crash ends with the
+/// panic. The head is still worth keeping — it names what was being built and
+/// carries the first error of a long compile — but it is not the part a reader
+/// scrolls to.
+const HEAD_SHARE: usize = 3;
+const TOTAL_SHARE: usize = 10;
 /// Commands of one workspace running at the same time.
 pub const DEFAULT_MAX_CONCURRENT: usize = 4;
 
@@ -98,6 +118,15 @@ pub enum Program {
 /// terminal (`terminal.rs`), which owns a pseudo-terminal of its own and does
 /// not come through here. This trait is what a live view of a NON-interactive
 /// command would attach to, and the tests are its only implementors.
+///
+/// Attaching one is NOT a local change and is deliberately not done here. A
+/// live view needs three things this module cannot provide: a session-stream
+/// payload for output chunks (a new `CodeStudioPayload` variant, and that enum
+/// is append-only across every mesh node), a producer wiring it into
+/// `mesh_stream` with the backpressure and revalidation rules §12.2 sets for
+/// every other stream, and a dashboard consumer. The capture in `ExecOutcome`
+/// is what the model and the artifact read, and it is complete for both, so the
+/// missing piece is a UI feature rather than a defect in this path.
 pub trait ExecSink: Send + Sync {
     fn on_stdout(&self, chunk: &[u8]);
     fn on_stderr(&self, chunk: &[u8]);
@@ -286,8 +315,12 @@ impl ExitStatus {
 }
 
 /// One captured stream. `total_bytes` counts everything the process produced,
-/// so a caller can say "output truncated after 1 MiB of 40 MiB" instead of
-/// pretending the tail never existed.
+/// so a caller can say "output truncated after 12 KiB of 40 MiB" instead of
+/// pretending the rest never existed.
+///
+/// `text` is the beginning AND the end of the stream with a marker naming what
+/// was dropped between them (see `Capture`), so `truncated` never means "the
+/// last thing the command said is gone".
 #[derive(Debug, Clone, Default)]
 pub struct OutputCapture {
     pub text: String,
@@ -1009,42 +1042,101 @@ fn validate_exec_id(exec_id: &str) -> Result<()> {
     Ok(())
 }
 
-/// Bounded capture of one stream.
+/// Bounded capture of one stream, cut in the MIDDLE.
+///
+/// Keeping the head alone loses precisely what a caller of a build tool needs:
+/// `cargo`, `tsc`, `pytest` and every test runner put the diagnosis at the END,
+/// so a head-only capture of a failing build reports which crates started
+/// compiling and nothing about why the command failed. So the head is kept in a
+/// vector, the end in a ring buffer, and the middle is dropped with a marker
+/// counting what went. Dropping must never stall the writer, so the reader
+/// keeps draining either way.
 struct Capture {
-    limit: usize,
-    bytes: Vec<u8>,
+    head_limit: usize,
+    tail_limit: usize,
+    head: Vec<u8>,
+    tail: VecDeque<u8>,
     total: u64,
+    lines: u64,
 }
 
 impl Capture {
     fn new(limit: usize) -> Self {
+        // A one-byte budget still has to leave a byte for the tail if it can:
+        // an empty tail would put this back to a head-only capture.
+        let head_limit = (limit * HEAD_SHARE / TOTAL_SHARE).min(limit.saturating_sub(1));
         Self {
-            limit,
-            bytes: Vec::new(),
+            head_limit,
+            tail_limit: limit - head_limit,
+            head: Vec::new(),
+            tail: VecDeque::new(),
             total: 0,
+            lines: 0,
         }
     }
 
-    /// Keeps the head of the stream and counts the rest. The head is what a
-    /// model needs (a compiler prints the first error first) and dropping the
-    /// tail must never stall the writer, so the reader keeps draining.
     fn push(&mut self, chunk: &[u8]) {
         self.total += chunk.len() as u64;
-        if self.bytes.len() >= self.limit {
+        self.lines += chunk.iter().filter(|b| **b == b'\n').count() as u64;
+
+        let mut rest = chunk;
+        if self.head.len() < self.head_limit {
+            let take = (self.head_limit - self.head.len()).min(rest.len());
+            self.head.extend_from_slice(&rest[..take]);
+            rest = &rest[take..];
+        }
+        if self.tail_limit == 0 || rest.is_empty() {
             return;
         }
-        let room = self.limit - self.bytes.len();
-        let take = room.min(chunk.len());
-        self.bytes.extend_from_slice(&chunk[..take]);
+        if rest.len() >= self.tail_limit {
+            self.tail.clear();
+            self.tail.extend(&rest[rest.len() - self.tail_limit..]);
+            return;
+        }
+        self.tail.extend(rest);
+        let excess = self.tail.len().saturating_sub(self.tail_limit);
+        self.tail.drain(..excess);
     }
 
     fn finish(&self) -> OutputCapture {
+        let tail: Vec<u8> = self.tail.iter().copied().collect();
+        let kept = self.head.len() as u64 + tail.len() as u64;
+        if self.total <= kept {
+            let mut whole = self.head.clone();
+            whole.extend_from_slice(&tail);
+            return OutputCapture {
+                text: String::from_utf8_lossy(&whole).into_owned(),
+                truncated: false,
+                total_bytes: self.total,
+            };
+        }
+
+        // The tail starts wherever the ring happened to wrap, which is usually
+        // mid-line and can be mid-codepoint. Starting it at the next line
+        // boundary costs one partial line and makes what follows the marker
+        // readable.
+        let tail = match tail.iter().position(|b| *b == b'\n') {
+            Some(at) if at + 1 < tail.len() => &tail[at + 1..],
+            _ => &tail[..],
+        };
+        let cut_bytes = self.total - self.head.len() as u64 - tail.len() as u64;
+        let kept_lines = count_lines(&self.head) + count_lines(tail);
+        let cut_lines = self.lines.saturating_sub(kept_lines);
+        let text = format!(
+            "{}\n[... {cut_lines} lines / {cut_bytes} bytes cut from the middle ...]\n{}",
+            String::from_utf8_lossy(&self.head),
+            String::from_utf8_lossy(tail)
+        );
         OutputCapture {
-            text: String::from_utf8_lossy(&self.bytes).into_owned(),
-            truncated: self.total > self.bytes.len() as u64,
+            text,
+            truncated: true,
             total_bytes: self.total,
         }
     }
+}
+
+fn count_lines(bytes: &[u8]) -> u64 {
+    bytes.iter().filter(|b| **b == b'\n').count() as u64
 }
 
 fn take_capture(capture: &Arc<Mutex<Capture>>) -> OutputCapture {
@@ -1277,11 +1369,76 @@ mod tests {
             "truncation must not kill the command"
         );
         assert!(outcome.stdout.truncated);
-        assert!(outcome.stdout.text.len() <= 256);
         assert!(
             outcome.stdout.total_bytes > 256,
             "the full size must still be reported"
         );
+        assert!(
+            outcome.stdout.text.starts_with("0123456789"),
+            "the head of the stream was dropped: {:?}",
+            outcome.stdout.text
+        );
+        // The whole point of cutting in the middle: whatever the command said
+        // LAST is what a caller reads, however much came before it.
+        assert!(
+            outcome.stdout.text.ends_with("DONE\n"),
+            "the tail of the stream was dropped: {:?}",
+            outcome.stdout.text
+        );
+        assert!(outcome.stdout.text.contains("cut from the middle"));
+        // The budget bounds the program output that is kept; the marker naming
+        // what was dropped is metadata about the cut and sits on top of it.
+        assert!(outcome.stdout.text.len() <= 256 + 64);
+    }
+
+    /// The case the middle cut exists for, spelled out: a build that prints
+    /// pages of progress and ends with the error that stopped it. A head-only
+    /// capture reports the progress and loses the diagnosis.
+    #[cfg(unix)]
+    #[test]
+    fn a_failing_build_keeps_the_compiler_error_that_ended_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let executor = Executor::default();
+        let mut request = ExecRequest::new(
+            "e-11",
+            Program::Shell {
+                script: "i=0; while [ $i -lt 400 ]; do \
+                         printf '   Compiling crate-%s v0.1.0\\n' $i; i=$((i+1)); done; \
+                         printf 'error[E0308]: mismatched types\\n'; \
+                         printf ' --> src/main.rs:7:9\\n'; \
+                         printf 'error: could not compile `app` due to 1 previous error\\n'; \
+                         exit 101"
+                    .into(),
+            },
+        );
+        request.max_output_bytes = 2048;
+        let outcome = executor
+            .exec(
+                &local(dir.path()),
+                &env_at(dir.path()),
+                &request,
+                Arc::new(NullSink),
+            )
+            .expect("exec");
+
+        assert_eq!(outcome.status, ExitStatus::Code(101));
+        assert!(outcome.stdout.truncated);
+        assert!(
+            outcome.stdout.text.contains("error[E0308]: mismatched types"),
+            "the compiler error was cut away: {:?}",
+            outcome.stdout.text
+        );
+        assert!(outcome
+            .stdout
+            .text
+            .ends_with("error: could not compile `app` due to 1 previous error\n"));
+        assert!(
+            outcome.stdout.text.contains("Compiling crate-0 "),
+            "the head names what the command started doing"
+        );
+        // The marker says how much went, so nobody reads the two halves as one
+        // continuous log.
+        assert!(outcome.stdout.text.contains("lines / "));
     }
 
     // Runs a real process; the fixtures below are POSIX shell utilities.
@@ -1779,7 +1936,9 @@ mod tests {
             )
             .expect("exec");
 
-        assert_eq!(outcome.stdout.text, "abcd");
+        // A four-byte budget still splits: one byte of head, three of tail.
+        assert!(outcome.stdout.text.starts_with('a'));
+        assert!(outcome.stdout.text.ends_with("hij"));
         assert!(outcome.stdout.truncated);
         assert_eq!(
             String::from_utf8(sink.0.lock().unwrap().clone()).unwrap(),

@@ -30,6 +30,7 @@ use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::HandlerContext;
 use rusqlite::OptionalExtension;
+use crate::agents::{InteractionReply, PermissionDecision};
 use crate::code_studio::egress;
 use crate::code_studio::events::{EventPayload, GitOperation, SessionEvent};
 use crate::code_studio::exec::{ExecEnv, ExecRequest, Executor, NullSink, Program};
@@ -3758,7 +3759,7 @@ fn record_approval(
     }
     append_event(
         scope,
-        format!("approval:{approval_id}:requested"),
+        events::approval_requested_key(&approval_id),
         EventPayload::ApprovalRequested {
             approval_id: approval_id.clone(),
             capability: cap.slug().to_string(),
@@ -3767,6 +3768,41 @@ fn record_approval(
     )?;
     sync_session_waiting(scope)?;
     Ok(approval_id)
+}
+
+/// Hands the decision to the call that is parked on this card, and says whether
+/// anything was actually waiting.
+///
+/// A suspended tool call, a `delegate_cli` turn and a vendor CLI's own request
+/// all park on the interaction registry, and the `approvals` row records the id
+/// they park on — so answering the card IS the resume, and without this the
+/// dashboard's only answer channel decided a row nobody was reading.
+///
+/// Three outcomes are all normal and none of them is an error:
+///   * the id belongs to no registered interaction — the card came from the
+///     dashboard's own request path (`record_approval` mints a deterministic
+///     id, not a registry one), which re-sends the request itself;
+///   * the id was registered but the awaiter is gone — the run timed out or was
+///     cancelled while the person deliberated;
+///   * the reply lands and the run continues.
+/// The caller reports the difference instead of failing on it.
+fn resume_parked_run(interaction_id: &str, decision: &str) -> bool {
+    let reply = match decision {
+        "allow_once" => PermissionDecision::AllowOnce,
+        "allow_for_run" => PermissionDecision::AllowForRun,
+        // `session_grants` already holds the standing answer at this point, and
+        // §9.3 rule 7 is what spends it. The parked call only needs to proceed
+        // once; telling it "always" would make it write a WORKSPACE allowlist
+        // row the operator never asked for.
+        "allow_for_session" => PermissionDecision::AllowOnce,
+        "always" => PermissionDecision::Always,
+        "deny" => PermissionDecision::Deny,
+        // Unreachable: the handler validates the vocabulary before it gets
+        // here. Refusing to invent a reply keeps that true.
+        _ => return false,
+    };
+    crate::agents::interaction_registry_global()
+        .reply(interaction_id, InteractionReply::Permission(reply))
 }
 
 /// Standing workspace-level permission (§9.1 `always`), from the registry, and
@@ -6356,13 +6392,13 @@ fn approval_decide_v1(
         return Err(ProtocolError::bad_request("unknown approval decision"));
     }
 
-    let (capability, target_pattern, status) = {
+    let (capability, target_pattern, status, interaction_id, waiting_run) = {
         let conn = scope
             .pool
             .read()
             .map_err(|e| db_error("approval_decide", anyhow::anyhow!("{e}")))?;
         conn.query_row(
-            "SELECT capability, target_pattern, status FROM approvals \
+            "SELECT capability, target_pattern, status, interaction_id, run_id FROM approvals \
              WHERE id = ?1 AND session_id = ?2",
             rusqlite::params![approval_id, scope.session.id],
             |row| {
@@ -6370,6 +6406,8 @@ fn approval_decide_v1(
                     row.get::<_, String>(0)?,
                     row.get::<_, String>(1)?,
                     row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, Option<String>>(4)?,
                 ))
             },
         )
@@ -6453,33 +6491,43 @@ fn approval_decide_v1(
         _ => {}
     }
 
-    {
-        let conn = scope
-            .pool
-            .write()
-            .map_err(|e| db_error("approval_decide", anyhow::anyhow!("{e}")))?;
-        conn.execute(
-            "UPDATE approvals SET status = 'decided', decision = ?2, decided_by = ?3, \
-              decided_at = datetime('now') WHERE id = ?1 AND status = 'pending'",
-            rusqlite::params![approval_id, decision, org.user_id],
-        )
-        .map_err(|e| db_error("approval_decide", anyhow::anyhow!("{e}")))?;
-    }
-    append_event(
-        &scope,
-        format!("approval:{approval_id}:decided"),
-        EventPayload::ApprovalDecided {
-            approval_id: approval_id.to_string(),
-            decision: decision.to_string(),
-            decided_by: org.user_id.clone(),
-        },
-    )?;
+    // The row and its `approval_decided` event are written by ONE function,
+    // shared with the suspended call that raised the card: whichever of the two
+    // closes the row writes the entry, and the other writes none.
+    tools::settle_approval(
+        &scope.pool,
+        &scope.session.id,
+        approval_id,
+        decision,
+        &org.user_id,
+    )
+    .map_err(|e| db_error("settle_approval", e))?;
     sync_session_waiting(&scope)?;
+
+    // Everything the answer authorizes is now durable, so the parked run may
+    // wake up and re-read it. Waking it earlier would race a re-authorization
+    // against the grant it is supposed to find.
+    let resumed = resume_parked_run(&interaction_id, decision);
+    // A card raised BY A RUN that nothing was waiting on means the run gave up
+    // before the person answered (§9.3 timeouts). The decision is recorded
+    // either way — it still binds the next call — but the operator must not be
+    // left believing the agent has resumed, so the answer says so (`resumed`)
+    // and so does the audit trail.
+    match waiting_run.as_deref().filter(|id| !id.is_empty()) {
+        Some(run_id) if !resumed => tracing::info!(
+            approval_id,
+            run_id,
+            decision,
+            "code_studio: the approval was decided after its run stopped waiting"
+        ),
+        _ => {}
+    }
 
     Ok(cs(CodeStudioPayload::ApprovalDecideResponse {
         approval_id: approval_id.to_string(),
         status: "decided".to_string(),
         decision: decision.to_string(),
+        resumed,
     }))
 }
 
@@ -6779,7 +6827,7 @@ fn session_runs_v1(
     let mut stmt = conn
         .prepare(
             "SELECT run_id, ordinal, kind, trigger, parent_run_id, agent_id, status, \
-              started_at, finished_at, prompt_tokens, completion_tokens, model \
+              started_at, finished_at, prompt_tokens, completion_tokens, model, cost_usd \
              FROM session_runs WHERE session_id = ?1 ORDER BY ordinal",
         )
         .map_err(|e| db_error("runs_list", anyhow::anyhow!("{e}")))?;
@@ -6802,6 +6850,9 @@ fn session_runs_v1(
                 prompt_tokens: row.get::<_, i64>(9)?.max(0) as u64,
                 completion_tokens: row.get::<_, i64>(10)?.max(0) as u64,
                 model: row.get(11)?,
+                // Only ever set where a provider stated a price for the turn;
+                // NULL is "nobody quoted one", not "it was free".
+                cost_usd: row.get(12)?,
             })
         })
         .map_err(|e| db_error("runs_list", anyhow::anyhow!("{e}")))?;
@@ -9682,13 +9733,20 @@ mod tests {
         else {
             panic!("unexpected response");
         };
-        assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].capability, "net_egress");
+        // A new workspace already carries the seeded read-only `exec` programs,
+        // so this asserts about the capability the test is exercising.
+        let egress: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.capability == "net_egress")
+            .collect();
+        assert_eq!(egress.len(), 1);
+        assert_eq!(egress[0].pattern, "crates.io:443");
 
         allowlist_remove_v1(&fx.ctx, "ws-allow", "net_egress", "crates.io:443").expect("remove");
         assert!(read_allowlist(&fx.ctx.state.db, "ws-allow")
             .expect("read")
-            .is_empty());
+            .iter()
+            .all(|entry| entry.capability != "net_egress"));
         release();
     }
 
@@ -10488,6 +10546,138 @@ mod tests {
         )
         .expect_err("a stale compare-and-swap must lose");
         assert_eq!(err.code, ProtocolErrorCode::Conflict);
+        release();
+    }
+
+    /// Answering the card RESUMES the run that is parked on it.
+    ///
+    /// The console has exactly one answer channel — `codeStudioApprovalDecideRequest`
+    /// — and it used to update the row, append the event and return, never
+    /// touching the interaction the row itself names. So a suspended tool call,
+    /// a `delegate_cli` turn and a vendor CLI's request all sat until their
+    /// timeout while the operator looked at an approval they had already
+    /// answered. The row carried the `interaction_id` the whole time.
+    #[test]
+    fn deciding_an_approval_wakes_the_run_parked_on_it() {
+        let _guard = paths::test_data_dir_guard();
+        let Some(live) = live("ws-resume", AutonomyMode::AutoEdit, AutonomyMode::Normal) else {
+            return;
+        };
+        let scope = live.scope();
+
+        // A registry interaction, exactly as `suspend_for_operator` mints one:
+        // the id the run parks on IS the id written on the approval row.
+        let interaction = uuid::Uuid::new_v4().to_string();
+        let approval_id = record_approval(
+            &scope,
+            Capability::Exec,
+            "cargo",
+            &interaction,
+            "run 'cargo test'",
+        )
+        .expect("record approval");
+        let mut parked = crate::agents::interaction_registry_global().register(
+            crate::agents::PendingInteraction {
+                id: interaction.clone(),
+                run_id: "run-parked".to_string(),
+                parent_run_id: None,
+                kind: crate::agents::InteractionKind::Permission,
+                prompt: "run 'cargo test'".to_string(),
+                choices: Vec::new(),
+                addon_id: None,
+                tool_name: None,
+                permission: Some("exec".to_string()),
+                raised_at_ms: 0,
+            },
+        );
+
+        let answer = approval_decide_v1(
+            &live.fx.ctx,
+            &live.workspace_id,
+            &live.session_id,
+            &approval_id,
+            "allow_once",
+        )
+        .expect("decide");
+        let MessageBody::CodeStudioBody(CodeStudioPayload::ApprovalDecideResponse {
+            resumed,
+            ..
+        }) = answer
+        else {
+            panic!("unexpected response");
+        };
+        assert!(resumed, "the handler did not report waking anything");
+        match parked.try_recv() {
+            Ok(crate::agents::InteractionReply::Permission(
+                crate::agents::PermissionDecision::AllowOnce,
+            )) => {}
+            other => panic!(
+                "the parked run was never handed the operator's answer: {other:?}"
+            ),
+        }
+        release();
+    }
+
+    /// One decision, one `approval_decided` event.
+    ///
+    /// Two writers used to append it under two idempotency keys — the handler
+    /// as `approval:<id>:decided`, the suspended call as `approval-dec:<id>` —
+    /// so every answered card produced two entries on the timeline, one of them
+    /// attributed to the run's own user rather than to the person who decided.
+    /// Both now go through `tools::settle_approval`, and the entry follows the
+    /// row TRANSITION: whoever closes the row writes it, the other writes none.
+    #[test]
+    fn one_decision_leaves_one_decided_event() {
+        let _guard = paths::test_data_dir_guard();
+        let Some(live) = live("ws-one-event", AutonomyMode::AutoEdit, AutonomyMode::Normal)
+        else {
+            return;
+        };
+        let scope = live.scope();
+        let interaction = uuid::Uuid::new_v4().to_string();
+        let approval_id = record_approval(
+            &scope,
+            Capability::Exec,
+            "cargo",
+            &interaction,
+            "run 'cargo test'",
+        )
+        .expect("record approval");
+
+        approval_decide_v1(
+            &live.fx.ctx,
+            &live.workspace_id,
+            &live.session_id,
+            &approval_id,
+            "allow_once",
+        )
+        .expect("decide");
+
+        // What the woken call does next, verbatim: it settles the same row with
+        // the answer it received.
+        let closed = tools::settle_approval(
+            &scope.pool,
+            &scope.session.id,
+            &approval_id,
+            "allow_once",
+            "u-owner",
+        )
+        .expect("settle");
+        assert!(
+            !closed,
+            "the awaiting call must not re-close a row the operator already closed"
+        );
+
+        let decided = {
+            let conn = scope.pool.read().expect("pool");
+            conn.query_row(
+                "SELECT COUNT(*) FROM session_events WHERE session_id = ?1 AND kind = ?2",
+                rusqlite::params![scope.session.id, "approval_decided"],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(decided, 1, "one decision must leave one timeline entry");
         release();
     }
 
@@ -11764,7 +11954,10 @@ mod tests {
         allowlist_remove_v1(&fx.ctx, "ws-sync-allow", "net_egress", "crates.io*")
             .expect("remove");
         let entries = read_allowlist(&fx.ctx.state.db, "ws-sync-allow").expect("list");
-        assert!(entries.is_empty(), "the grant survived its withdrawal");
+        assert!(
+            entries.iter().all(|entry| entry.capability != "net_egress"),
+            "the grant survived its withdrawal"
+        );
         release();
     }
 

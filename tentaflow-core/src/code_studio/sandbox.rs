@@ -7,6 +7,19 @@
 // a lease and is destroyed with it, so two test runs on the same profile can
 // execute at the same time without ever seeing each other's writes.
 //
+// **A shared sandbox belongs to the SESSION, not to the command.** Building the
+// layer for one command and destroying it at the end of that command means
+// `target/`, `node_modules` and `.venv` never survive to the next one, so every
+// build in a session starts cold and no build command is usable at all. So a
+// non-ephemeral profile resolves through a registry keyed by workspace root ×
+// session × profile: the first command builds the workplace, every later
+// command of the same session gets the same one, and it is destroyed when the
+// session closes, when the process reconciles after a restart, or when it has
+// had no holder for `SHARED_IDLE_TTL`. The key is what keeps this a lifetime
+// change and not an isolation change — a layer can never be reached from
+// another session or another workspace, because neither can name the key.
+// `ephemeral: true` is unchanged and still means "destroy this with the run".
+//
 // Two rules shape everything below.
 //
 // **`repo/` is never part of a sandbox.** Git metadata stays with the broker
@@ -41,7 +54,9 @@
 //   `network = none` is not kept at all. `runtime_ref IS NULL` is what tells an
 //   auditor which of the two a row describes (§7.6).
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{anyhow, Result};
@@ -137,6 +152,14 @@ impl SandboxError {
 /// Ceiling on building a copy-on-write workplace. A repository large enough to
 /// blow through this is exactly the case where a silent full copy would stall a
 /// session for minutes, so the budget is part of the fail-closed contract.
+///
+/// The numbers are unchanged by `SKIPPED_BUILD_DIRS`, and deliberately: with
+/// the regenerable directories out of the way what the budget now measures is a
+/// SOURCE tree, where 8 GiB and 200 000 files are far above any real checkout.
+/// It stopped being a limit every large repository trips over and went back to
+/// being what it was meant to be — the detector of a pathological tree (a
+/// vendored binary dump, a dataset committed by accident) that would stall the
+/// session for minutes if it were copied.
 #[derive(Debug, Clone, Copy)]
 pub struct CowBudget {
     pub max_bytes: u64,
@@ -151,6 +174,136 @@ impl Default for CowBudget {
             max_files: 200_000,
             max_duration: Duration::from_secs(120),
         }
+    }
+}
+
+/// How long a shared sandbox survives with no holder before the next
+/// acquisition on the same workspace reclaims it.
+///
+/// It is a compromise between the two costs: a short one throws away the build
+/// cache the whole mechanism exists to keep, and a long one holds a full copy
+/// of a worktree for a session nobody came back to. Half an hour covers a
+/// person reading a diff or answering an approval between two commands; past
+/// it, rebuilding the layer is cheaper than the disk.
+const SHARED_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// Identity of a shared sandbox.
+///
+/// Both halves of the key are load-bearing and neither may be dropped: the root
+/// is what stops two workspaces of the same node from ever meeting in one
+/// layer, and the session id is what stops two sessions of ONE workspace from
+/// doing the same. The profile is in the key because a `ro` and a `cow`
+/// sandbox of one session are different workplaces, exactly as they were before
+/// the layer became session-scoped.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct SharedKey {
+    root: PathBuf,
+    session_id: String,
+    mount: &'static str,
+    network: &'static str,
+}
+
+/// A workplace held for a whole session. Immutable once built: every holder
+/// reads the same paths, and the teardown works from a shared reference.
+#[derive(Debug)]
+struct SharedSandbox {
+    sandbox_id: String,
+    target: ExecTarget,
+    layer: Option<CowLayer>,
+    workplace: PathBuf,
+    container_name: Option<String>,
+    runtime: Option<ContainerRuntime>,
+    tools_read_only: bool,
+    tmp_dir: PathBuf,
+    home_dir: PathBuf,
+    skipped_dirs: Vec<String>,
+}
+
+impl SharedSandbox {
+    fn tear_down(&self) -> Result<()> {
+        tear_down(
+            self.runtime,
+            self.container_name.as_deref(),
+            self.layer.as_ref(),
+            &self.workplace,
+        )
+    }
+}
+
+/// Registry entry of one key. `holders` counts live leases; `idle_since` starts
+/// running when the last one is released and is what the sweep measures.
+#[derive(Debug, Default)]
+struct Slot {
+    sandbox: Option<Arc<SharedSandbox>>,
+    holders: usize,
+    idle_since: Option<Instant>,
+}
+
+type SlotRef = Arc<Mutex<Slot>>;
+
+/// Shared sandboxes of this process, of every workspace and every session.
+///
+/// It has to be process-global rather than a field of `SandboxManager`: a
+/// manager is built fresh on each call (`SandboxManager::for_workspace`), so a
+/// per-manager cache would be a cache of one, and the layer would still die
+/// with the command. This is the same reasoning `Executor::for_workspace`
+/// already follows for the concurrency limit.
+fn shared_registry() -> &'static Mutex<HashMap<SharedKey, SlotRef>> {
+    static REGISTRY: OnceLock<Mutex<HashMap<SharedKey, SlotRef>>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// A poisoned registry must not take the sandboxes of every session with it —
+/// the data behind the lock is a map of handles, and a panic in one acquisition
+/// leaves it perfectly readable.
+fn lock_registry() -> MutexGuard<'static, HashMap<SharedKey, SlotRef>> {
+    shared_registry().lock().unwrap_or_else(|e| e.into_inner())
+}
+
+fn lock_slot(slot: &SlotRef) -> MutexGuard<'_, Slot> {
+    slot.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// Takes every shared sandbox of one session out of the registry.
+///
+/// Removal and teardown are separate on purpose: the caller decides what to do
+/// with the DB rows (session close closes them, restart reconciliation lets the
+/// bulk UPDATE that follows do it), and neither should happen while the
+/// registry lock is held.
+fn take_session_sandboxes(root: &Path, session_id: &str) -> Vec<Arc<SharedSandbox>> {
+    let mut taken = Vec::new();
+    let mut registry = lock_registry();
+    registry.retain(|key, slot| {
+        if key.root != root || key.session_id != session_id {
+            return true;
+        }
+        if let Some(sandbox) = lock_slot(slot).sandbox.take() {
+            taken.push(sandbox);
+        }
+        false
+    });
+    taken
+}
+
+/// Destroys the shared sandboxes of one session and closes their rows.
+///
+/// Called when a session ends — that, and not the end of a command, is what a
+/// session-scoped layer waits for. Returns how many were destroyed.
+pub fn release_session_sandboxes(root: &Path, pool: &DbPool, session_id: &str) -> Result<usize> {
+    let taken = take_session_sandboxes(root, session_id);
+    let count = taken.len();
+    let mut failure: Option<anyhow::Error> = None;
+    for sandbox in taken {
+        let outcome = sandbox.tear_down();
+        let state = if outcome.is_ok() { "stopped" } else { "failed" };
+        close_sandbox_row(pool, &sandbox.sandbox_id, state);
+        if let Err(e) = outcome {
+            failure = Some(e);
+        }
+    }
+    match failure {
+        Some(e) => Err(e),
+        None => Ok(count),
     }
 }
 
@@ -222,6 +375,26 @@ struct CowLayer {
     mounted: Option<PathBuf>,
 }
 
+/// What a lease is holding, and therefore what releasing it undoes.
+#[derive(Debug)]
+enum Holding {
+    /// The lease owns the workplace: releasing it destroys the layer and stops
+    /// the container. This is what an `ephemeral` sandbox always is.
+    Own {
+        layer: Option<CowLayer>,
+        workplace: PathBuf,
+        container_name: Option<String>,
+        runtime: Option<ContainerRuntime>,
+    },
+    /// One holder of the session's shared sandbox. Releasing it drops the
+    /// holder count and nothing else — the workplace outlives the command so
+    /// the next one finds the build tree where this one left it.
+    Shared {
+        key: SharedKey,
+        sandbox: Arc<SharedSandbox>,
+    },
+}
+
 /// A held sandbox. Dropping one without releasing it leaks the upper layer and
 /// (in container mode) a running container, so the drop path complains loudly
 /// instead of hiding it.
@@ -245,13 +418,17 @@ pub struct Lease {
     pub toolchain_overlay: PathBuf,
     pub tmp_dir: PathBuf,
     pub home_dir: PathBuf,
+    /// Directory names the copy did NOT reproduce, in the order of
+    /// `SKIPPED_BUILD_DIRS`. Empty when nothing was skipped — an overlay mount
+    /// copies nothing and therefore hides nothing.
+    ///
+    /// A command that cannot see `target/` and is not told so reports a cold
+    /// rebuild as if the tree were broken, so this travels to whoever answers
+    /// the caller instead of staying an implementation detail (§7.2).
+    pub skipped_dirs: Vec<String>,
     target: ExecTarget,
-    layer: Option<CowLayer>,
-    /// Everything this sandbox owns on the host, in one directory.
-    workplace: PathBuf,
-    container_name: Option<String>,
-    runtime: Option<ContainerRuntime>,
-    released: bool,
+    /// `None` once the lease has been released.
+    holding: Option<Holding>,
 }
 
 impl Lease {
@@ -263,18 +440,33 @@ impl Lease {
     /// tests are its only readers: it is how "the build wrote into the layer
     /// and not into the worktree" is asserted at all.
     pub fn layer_dir(&self) -> Option<&Path> {
-        self.layer.as_ref().map(|layer| layer.root.as_path())
+        match self.holding.as_ref()? {
+            Holding::Own { layer, .. } => layer.as_ref().map(|layer| layer.root.as_path()),
+            Holding::Shared { sandbox, .. } => {
+                sandbox.layer.as_ref().map(|layer| layer.root.as_path())
+            }
+        }
     }
 }
 
 impl Drop for Lease {
     fn drop(&mut self) {
-        if !self.released {
-            warn!(
+        match self.holding.as_ref() {
+            None => {}
+            Some(Holding::Own { .. }) => warn!(
                 sandbox_id = %self.sandbox_id,
                 session_id = %self.session_id,
                 "sandbox lease dropped without release: upper layer and container are leaked"
-            );
+            ),
+            // Not a leaked layer — a leaked HOLDER. The session's sandbox never
+            // reaches zero holders, so the idle sweep never reclaims it and it
+            // survives until the session closes.
+            Some(Holding::Shared { .. }) => warn!(
+                sandbox_id = %self.sandbox_id,
+                session_id = %self.session_id,
+                "shared sandbox lease dropped without release: the workplace stays busy until \
+                 the session closes"
+            ),
         }
     }
 }
@@ -287,6 +479,7 @@ pub struct SandboxManager {
     exec_mode: ExecMode,
     container: Option<ContainerConfig>,
     cow_budget: CowBudget,
+    idle_ttl: Duration,
 }
 
 impl SandboxManager {
@@ -302,6 +495,7 @@ impl SandboxManager {
             exec_mode,
             container,
             cow_budget: CowBudget::default(),
+            idle_ttl: SHARED_IDLE_TTL,
         })
     }
 
@@ -316,6 +510,7 @@ impl SandboxManager {
             exec_mode,
             container,
             cow_budget: CowBudget::default(),
+            idle_ttl: SHARED_IDLE_TTL,
         }
     }
 
@@ -325,6 +520,14 @@ impl SandboxManager {
     #[cfg(test)]
     fn with_cow_budget(mut self, budget: CowBudget) -> Self {
         self.cow_budget = budget;
+        self
+    }
+
+    /// Production always runs on `SHARED_IDLE_TTL`; this exists so the sweep can
+    /// be driven without a test that sleeps for half an hour.
+    #[cfg(test)]
+    fn with_idle_ttl(mut self, ttl: Duration) -> Self {
+        self.idle_ttl = ttl;
         self
     }
 
@@ -357,11 +560,10 @@ impl SandboxManager {
 
     /// Takes a sandbox of `profile` for `session_id`.
     ///
-    /// The database row is inserted BEFORE the workplace is built, so the unique
-    /// index on shared sandboxes — not a check-then-act race in this function —
-    /// is what arbitrates two callers asking for the same shared profile. A
-    /// failure to build removes the row again, because a sandbox that never
-    /// existed must not keep a profile occupied.
+    /// An `ephemeral` profile always builds a workplace of its own. A shared one
+    /// resolves through the session registry: the first caller builds it, every
+    /// later caller of the same session and profile gets the SAME workplace, so
+    /// `target/` and `node_modules` are still there when the next command runs.
     pub fn acquire(
         &self,
         pool: &DbPool,
@@ -384,6 +586,99 @@ impl SandboxManager {
             .toolchain_overlay(session_id)
             .map_err(SandboxError::Other)?;
 
+        if profile.ephemeral {
+            let started = self.start(pool, session_id, profile, owner_run_id, &worktree)?;
+            return Ok(Lease {
+                sandbox_id: started.sandbox_id,
+                lease_id: started.lease_id,
+                owner_run_id: owner_run_id.map(str::to_string),
+                session_id: session_id.to_string(),
+                profile,
+                tools_read_only: started.built.tools_read_only,
+                toolchain_base: self.toolchain_base(),
+                toolchain_overlay,
+                tmp_dir: started.built.tmp_dir,
+                home_dir: started.built.home_dir,
+                skipped_dirs: started.built.skipped_dirs,
+                target: started.built.target,
+                holding: Some(Holding::Own {
+                    layer: started.built.layer,
+                    workplace: started.workplace,
+                    container_name: started.built.runtime_ref,
+                    runtime: started.runtime,
+                }),
+            });
+        }
+
+        // Reclaiming abandoned layers is driven by the next acquisition rather
+        // than by a timer thread: it needs the workspace's own pool to close the
+        // rows, and that is exactly what an acquisition is holding.
+        self.sweep_idle(pool);
+
+        let key = self.shared_key(session_id, profile);
+        // The registry lock is released before the slot lock is taken, so a
+        // build of one session never blocks an acquisition of another.
+        let slot = Arc::clone(lock_registry().entry(key.clone()).or_default());
+        let mut state = lock_slot(&slot);
+        let sandbox = match state.sandbox.as_ref() {
+            Some(sandbox) => Arc::clone(sandbox),
+            None => {
+                let started = self.start(pool, session_id, profile, owner_run_id, &worktree)?;
+                let sandbox = Arc::new(SharedSandbox {
+                    sandbox_id: started.sandbox_id,
+                    target: started.built.target,
+                    layer: started.built.layer,
+                    workplace: started.workplace,
+                    container_name: started.built.runtime_ref,
+                    runtime: started.runtime,
+                    tools_read_only: started.built.tools_read_only,
+                    tmp_dir: started.built.tmp_dir,
+                    home_dir: started.built.home_dir,
+                    skipped_dirs: started.built.skipped_dirs,
+                });
+                state.sandbox = Some(Arc::clone(&sandbox));
+                sandbox
+            }
+        };
+        state.holders += 1;
+        state.idle_since = None;
+        drop(state);
+
+        Ok(Lease {
+            sandbox_id: sandbox.sandbox_id.clone(),
+            // A shared sandbox carries no lease id by definition (§5.3): the
+            // partial unique index reads `lease_id IS NULL` as "this is the one
+            // shared sandbox of the profile".
+            lease_id: None,
+            owner_run_id: owner_run_id.map(str::to_string),
+            session_id: session_id.to_string(),
+            profile,
+            tools_read_only: sandbox.tools_read_only,
+            toolchain_base: self.toolchain_base(),
+            toolchain_overlay,
+            tmp_dir: sandbox.tmp_dir.clone(),
+            home_dir: sandbox.home_dir.clone(),
+            skipped_dirs: sandbox.skipped_dirs.clone(),
+            target: sandbox.target.clone(),
+            holding: Some(Holding::Shared { key, sandbox }),
+        })
+    }
+
+    /// Builds one workplace and the row that records it.
+    ///
+    /// The database row is inserted BEFORE the workplace is built, so the unique
+    /// index on shared sandboxes — not a check-then-act race in this function —
+    /// is what arbitrates a shared profile a row of a previous process still
+    /// occupies. A failure to build removes the row again, because a sandbox
+    /// that never existed must not keep a profile occupied.
+    fn start(
+        &self,
+        pool: &DbPool,
+        session_id: &str,
+        profile: SandboxProfile,
+        owner_run_id: Option<&str>,
+        worktree: &Path,
+    ) -> std::result::Result<Started, SandboxError> {
         let sandbox_id = uuid::Uuid::new_v4().to_string();
         let lease_id = profile
             .ephemeral
@@ -394,7 +689,7 @@ impl SandboxManager {
         let workplace = self
             .workplace_dir(session_id, &sandbox_id)
             .map_err(SandboxError::Other)?;
-        let built = match self.materialise(session_id, &sandbox_id, &workplace, profile, &worktree) {
+        let built = match self.materialise(session_id, &sandbox_id, &workplace, profile, worktree) {
             Ok(built) => built,
             Err(e) => {
                 // Nothing was handed out, so nothing of it may stay on disk —
@@ -429,59 +724,140 @@ impl SandboxManager {
                         sandbox_id = %sandbox_id,
                         "sandbox could not be torn down after a failed start: {teardown:#}"
                     );
-                    self.close_row(pool, &sandbox_id, "failed");
+                    close_sandbox_row(pool, &sandbox_id, "failed");
                 }
             }
             return Err(SandboxError::Other(e));
         }
 
-        Ok(Lease {
+        Ok(Started {
             sandbox_id,
             lease_id,
-            owner_run_id: owner_run_id.map(str::to_string),
-            session_id: session_id.to_string(),
-            profile,
-            tools_read_only: built.tools_read_only,
-            toolchain_base: self.toolchain_base(),
-            toolchain_overlay,
-            tmp_dir: built.tmp_dir,
-            home_dir: built.home_dir,
-            target: built.target,
-            layer: built.layer,
+            built,
             workplace,
-            container_name: built.runtime_ref,
             runtime,
-            released: false,
         })
     }
 
-    /// Releases a lease: stops the container, destroys the upper layer and
-    /// closes the row. An ephemeral sandbox loses everything a run wrote, which
-    /// is the entire point — a second test run must not inherit the first one's
-    /// `target/` or `node_modules`.
+    fn shared_key(&self, session_id: &str, profile: SandboxProfile) -> SharedKey {
+        SharedKey {
+            root: self.root.clone(),
+            session_id: session_id.to_string(),
+            mount: mount_slug(profile.mount),
+            network: network_slug(profile.network),
+        }
+    }
+
+    /// Releases a lease.
     ///
-    /// The row is only closed as 'stopped' when the teardown actually
-    /// succeeded. A container that refused to die or a layer that could not be
-    /// removed is still there, and a row claiming otherwise would both lie to
-    /// the operator and free a profile whose workplace is still running.
+    /// An `ephemeral` one is destroyed here: it loses everything the run wrote,
+    /// which is the entire point — a second test run must not inherit the first
+    /// one's `target/`. A SHARED one only loses a holder; its workplace belongs
+    /// to the session and is destroyed by `release_session_sandboxes`, by the
+    /// restart reconciliation, or by the idle sweep.
+    ///
+    /// For the ephemeral case the row is only closed as 'stopped' when the
+    /// teardown actually succeeded. A container that refused to die or a layer
+    /// that could not be removed is still there, and a row claiming otherwise
+    /// would both lie to the operator and free a profile whose workplace is
+    /// still running.
     pub fn release(&self, pool: &DbPool, mut lease: Lease) -> Result<()> {
-        lease.released = true;
-        let workplace = lease.workplace.clone();
-        let outcome = tear_down(
-            lease.runtime,
-            lease.container_name.as_deref(),
-            lease.layer.take().as_ref(),
-            &workplace,
-        );
-        let state = if outcome.is_ok() { "stopped" } else { "failed" };
-        self.close_row(pool, &lease.sandbox_id, state);
-        outcome
+        match lease.holding.take() {
+            None => Ok(()),
+            Some(Holding::Own {
+                layer,
+                workplace,
+                container_name,
+                runtime,
+            }) => {
+                let outcome = tear_down(
+                    runtime,
+                    container_name.as_deref(),
+                    layer.as_ref(),
+                    &workplace,
+                );
+                let state = if outcome.is_ok() { "stopped" } else { "failed" };
+                close_sandbox_row(pool, &lease.sandbox_id, state);
+                outcome
+            }
+            Some(Holding::Shared { key, .. }) => {
+                let slot = lock_registry().get(&key).map(Arc::clone);
+                if let Some(slot) = slot {
+                    let mut state = lock_slot(&slot);
+                    state.holders = state.holders.saturating_sub(1);
+                    if state.holders == 0 {
+                        state.idle_since = Some(Instant::now());
+                    }
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Destroys shared sandboxes of this workspace that no longer have a holder
+    /// and have not had one for `SHARED_IDLE_TTL`.
+    ///
+    /// The registry lock is held throughout and every slot is taken with
+    /// `try_lock`, so a slot in the middle of a build (its own lock held, its
+    /// sandbox not yet set) is skipped rather than waited for — and the lock
+    /// order stays registry-then-slot everywhere, which is what keeps this free
+    /// of a deadlock against `acquire`.
+    ///
+    /// An emptied slot stays in the map on purpose: removing it could detach a
+    /// handle an acquisition already cloned, and that acquisition would then
+    /// build a second sandbox nothing has a reference to. Session teardown is
+    /// what removes keys.
+    fn sweep_idle(&self, pool: &DbPool) {
+        let mut expired: Vec<Arc<SharedSandbox>> = Vec::new();
+        {
+            let registry = lock_registry();
+            for (key, slot) in registry.iter() {
+                if key.root != self.root {
+                    continue;
+                }
+                let Ok(mut state) = slot.try_lock() else {
+                    continue;
+                };
+                if state.holders > 0 || state.sandbox.is_none() {
+                    continue;
+                }
+                let idle = matches!(state.idle_since, Some(since) if since.elapsed() >= self.idle_ttl);
+                if !idle {
+                    continue;
+                }
+                if let Some(sandbox) = state.sandbox.take() {
+                    expired.push(sandbox);
+                }
+                state.idle_since = None;
+            }
+        }
+        for sandbox in expired {
+            let outcome = sandbox.tear_down();
+            let state = if outcome.is_ok() { "stopped" } else { "failed" };
+            close_sandbox_row(pool, &sandbox.sandbox_id, state);
+            if let Err(e) = outcome {
+                warn!(
+                    sandbox_id = %sandbox.sandbox_id,
+                    "idle shared sandbox not torn down: {e:#}"
+                );
+            }
+        }
     }
 
     /// Closes sandboxes left behind by a crash. Their upper layers are gone with
     /// the temporary directory sweep, and their rows must not keep a shared
     /// profile occupied for a session that is being resumed.
     pub fn reconcile_after_restart(&self, pool: &DbPool, session_id: &str) -> Result<usize> {
+        // A shared sandbox this process still holds for the session being
+        // reconciled is torn down first — the directory sweep at the end of this
+        // function would otherwise delete the tree out from under a live
+        // overlay mount. The rows are left to the bulk UPDATE below, which is
+        // the one place restart reconciliation records the outcome.
+        for sandbox in take_session_sandboxes(&self.root, session_id) {
+            if let Err(e) = sandbox.tear_down() {
+                warn!(session_id, "shared sandbox not torn down at reconcile: {e:#}");
+            }
+        }
         let conn = pool.write().map_err(|e| anyhow!("workspace db write: {e}"))?;
         let closed = conn.execute(
             "UPDATE sandboxes SET state='stopped', stopped_at=datetime('now'), lease_id=NULL \
@@ -547,26 +923,6 @@ impl SandboxManager {
             rusqlite::params![sandbox_id, runtime_ref],
         )?;
         Ok(())
-    }
-
-    /// Closes a row in a terminal state. 'stopped' frees the shared profile
-    /// (the partial unique index ignores it); 'failed' does not, because a
-    /// workplace that could not be removed is still occupying the node.
-    fn close_row(&self, pool: &DbPool, sandbox_id: &str, state: &str) {
-        let result = pool
-            .write()
-            .map_err(|e| anyhow!("workspace db write: {e}"))
-            .and_then(|conn| {
-                conn.execute(
-                    "UPDATE sandboxes SET state=?2, stopped_at=datetime('now'), lease_id=NULL \
-                     WHERE id = ?1",
-                    rusqlite::params![sandbox_id, state],
-                )
-                .map_err(|e| anyhow!("close sandbox row: {e}"))
-            });
-        if let Err(e) = result {
-            warn!(sandbox_id, state, "sandbox row not closed: {e:#}");
-        }
     }
 
     fn delete_row(&self, pool: &DbPool, sandbox_id: &str) {
@@ -641,15 +997,15 @@ impl SandboxManager {
         _base: &Path,
         _overlay: &Path,
     ) -> std::result::Result<Built, SandboxError> {
-        let (cwd, layer, tools_read_only) = match profile.mount {
-            MountAccess::ReadWrite => (worktree.to_path_buf(), None, false),
+        let (cwd, layer, tools_read_only, skipped_dirs) = match profile.mount {
+            MountAccess::ReadWrite => (worktree.to_path_buf(), None, false, Vec::new()),
             // The command runs in the worktree and the OS does not stop it from
             // writing there. What stops it is that the caller holding this lease
             // gets no write tools. Stated, not hidden (§7.2).
-            MountAccess::ReadOnly => (worktree.to_path_buf(), None, true),
+            MountAccess::ReadOnly => (worktree.to_path_buf(), None, true, Vec::new()),
             MountAccess::CopyOnWrite => {
-                let (dir, layer) = self.build_cow_layer(tmp, worktree, false)?;
-                (dir, Some(layer), false)
+                let built = self.build_cow_layer(tmp, worktree, false)?;
+                (built.work_dir, Some(built.layer), false, built.skipped_dirs)
             }
         };
         Ok(Built {
@@ -659,6 +1015,7 @@ impl SandboxManager {
             runtime_ref: None,
             tmp_dir: tmp.join("tmp"),
             home_dir: tmp.join("home"),
+            skipped_dirs,
         })
     }
 
@@ -681,11 +1038,13 @@ impl SandboxManager {
         })?;
         let network = container_network(profile.network, config)?;
 
-        let (source, layer) = match profile.mount {
-            MountAccess::ReadOnly | MountAccess::ReadWrite => (worktree.to_path_buf(), None),
+        let (source, layer, skipped_dirs) = match profile.mount {
+            MountAccess::ReadOnly | MountAccess::ReadWrite => {
+                (worktree.to_path_buf(), None, Vec::new())
+            }
             MountAccess::CopyOnWrite => {
-                let (dir, layer) = self.build_cow_layer(tmp, worktree, true)?;
-                (dir, Some(layer))
+                let built = self.build_cow_layer(tmp, worktree, true)?;
+                (built.work_dir, Some(built.layer), built.skipped_dirs)
             }
         };
         let bind_mode = container_bind_mode(profile.mount);
@@ -757,6 +1116,7 @@ impl SandboxManager {
             runtime_ref: Some(name),
             tmp_dir: tmp.join("tmp"),
             home_dir: tmp.join("home"),
+            skipped_dirs,
         })
     }
 
@@ -793,7 +1153,7 @@ impl SandboxManager {
         tmp: &Path,
         worktree: &Path,
         allow_overlay: bool,
-    ) -> std::result::Result<(PathBuf, CowLayer), SandboxError> {
+    ) -> std::result::Result<BuiltLayer, SandboxError> {
         let root = tmp.join("cow");
         let overlay_reason = if allow_overlay {
             let merged = root.join("merged");
@@ -805,13 +1165,16 @@ impl SandboxManager {
             }
             match mount_overlay(worktree, &upper, &work, &merged) {
                 Ok(()) => {
-                    return Ok((
-                        merged.clone(),
-                        CowLayer {
+                    return Ok(BuiltLayer {
+                        work_dir: merged.clone(),
+                        layer: CowLayer {
                             root,
                             mounted: Some(merged),
                         },
-                    ))
+                        // An overlay mount copies nothing, so it hides nothing:
+                        // the lower directory is the whole worktree.
+                        skipped_dirs: Vec::new(),
+                    })
                 }
                 Err(reason) => format!("overlayfs: {reason}; "),
             }
@@ -823,13 +1186,14 @@ impl SandboxManager {
         std::fs::create_dir_all(&copy)
             .map_err(|e| SandboxError::cow(format!("{overlay_reason}create copy directory: {e}")))?;
         match copy_tree(worktree, &copy, &self.cow_budget) {
-            Ok(()) => Ok((
-                copy,
-                CowLayer {
+            Ok(skipped_dirs) => Ok(BuiltLayer {
+                work_dir: copy,
+                layer: CowLayer {
                     root,
                     mounted: None,
                 },
-            )),
+                skipped_dirs,
+            }),
             Err(copy_reason) => {
                 // Fail closed: nothing half-built survives and the caller gets
                 // a refusal, never the real worktree.
@@ -838,6 +1202,13 @@ impl SandboxManager {
             }
         }
     }
+}
+
+/// A copy-on-write layer as built, plus what building it left out.
+struct BuiltLayer {
+    work_dir: PathBuf,
+    layer: CowLayer,
+    skipped_dirs: Vec<String>,
 }
 
 /// Runtime network a container profile must be started on.
@@ -935,6 +1306,37 @@ struct Built {
     runtime_ref: Option<String>,
     tmp_dir: PathBuf,
     home_dir: PathBuf,
+    skipped_dirs: Vec<String>,
+}
+
+/// A freshly started workplace, before it is either handed to one lease
+/// (`ephemeral`) or registered as the session's shared sandbox.
+struct Started {
+    sandbox_id: String,
+    lease_id: Option<String>,
+    built: Built,
+    workplace: PathBuf,
+    runtime: Option<ContainerRuntime>,
+}
+
+/// Closes a row in a terminal state. 'stopped' frees the shared profile
+/// (the partial unique index ignores it); 'failed' does not, because a
+/// workplace that could not be removed is still occupying the node.
+fn close_sandbox_row(pool: &DbPool, sandbox_id: &str, state: &str) {
+    let result = pool
+        .write()
+        .map_err(|e| anyhow!("workspace db write: {e}"))
+        .and_then(|conn| {
+            conn.execute(
+                "UPDATE sandboxes SET state=?2, stopped_at=datetime('now'), lease_id=NULL \
+                 WHERE id = ?1",
+                rusqlite::params![sandbox_id, state],
+            )
+            .map_err(|e| anyhow!("close sandbox row: {e}"))
+        });
+    if let Err(e) = result {
+        warn!(sandbox_id, state, "sandbox row not closed: {e:#}");
+    }
 }
 
 fn destroy_layer(layer: &CowLayer) -> Result<()> {
@@ -1044,11 +1446,56 @@ fn remove_container(runtime: ContainerRuntime, name: &str) -> Result<()> {
     ))
 }
 
+/// Directory names the copy does NOT reproduce, at any depth.
+///
+/// The line is drawn at two properties that must BOTH hold: the directory is
+/// produced by a tool from the sources next to it (so a build in the layer
+/// recreates whatever it needs), and its name is not also a normal source
+/// directory name in ordinary projects. The first property is why skipping them
+/// costs nothing but a cold first build — which a per-command layer imposed on
+/// every build anyway. The second is why the list is shorter than it could be:
+/// `bin`, `obj`, `build`, `dist` and `out` are all conventionally generated AND
+/// all routinely hold committed content, and a copy that silently drops a
+/// repository's real `bin/` of scripts is worse than a copy that is a few
+/// hundred megabytes larger. Ambiguous names therefore stay in.
+///
+/// `.git` is not on this list and is skipped for an unrelated reason (see
+/// `copy_dir`): it is a security boundary, not a size decision.
+const SKIPPED_BUILD_DIRS: &[&str] = &[
+    // Rust and Maven/sbt.
+    "target",
+    // Node, and the frameworks whose caches dwarf the sources.
+    "node_modules",
+    ".next",
+    ".nuxt",
+    ".svelte-kit",
+    ".angular",
+    ".turbo",
+    ".parcel-cache",
+    ".yarn",
+    // Python.
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+    ".ruff_cache",
+    ".tox",
+    // JVM build tooling.
+    ".gradle",
+    // Generic tool caches. `.cargo` is deliberately absent: a repository-local
+    // `.cargo/config.toml` is configuration a build needs, not a cache.
+    ".cache",
+    ".terraform",
+];
+
 /// Copies a worktree into `dst`, cheaply where the filesystem allows it.
 ///
 /// Reflink first (`FICLONE` on Btrfs/XFS, `clonefile` on APFS), full copy
 /// otherwise. Returns the reason as a string on refusal, because every caller
-/// turns it into `CowUnavailable` and nothing else.
+/// turns it into `CowUnavailable` and nothing else; on success it returns the
+/// distinct `SKIPPED_BUILD_DIRS` names it actually walked past, so the answer to
+/// the command can say what the layer does not contain.
 ///
 /// `.git` is skipped: in a worktree it is a POINTER into the reference
 /// repository, and a copy of that pointer would aim git at the real repo from
@@ -1056,13 +1503,25 @@ fn remove_container(runtime: ContainerRuntime, name: &str) -> Result<()> {
 ///
 /// A symbolic link that leaves the tree is a REFUSAL, not a copy — see
 /// `copy_symlink`.
-fn copy_tree(src: &Path, dst: &Path, budget: &CowBudget) -> Result<(), String> {
+fn copy_tree(src: &Path, dst: &Path, budget: &CowBudget) -> Result<Vec<String>, String> {
     let started = Instant::now();
     let mut bytes = 0u64;
     let mut files = 0u64;
-    copy_dir(src, src, dst, budget, started, &mut bytes, &mut files)
+    let mut skipped: Vec<String> = Vec::new();
+    copy_dir(
+        src,
+        src,
+        dst,
+        budget,
+        started,
+        &mut bytes,
+        &mut files,
+        &mut skipped,
+    )?;
+    Ok(skipped)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn copy_dir(
     root: &Path,
     src: &Path,
@@ -1071,6 +1530,7 @@ fn copy_dir(
     started: Instant,
     bytes: &mut u64,
     files: &mut u64,
+    skipped: &mut Vec<String>,
 ) -> Result<(), String> {
     let entries = std::fs::read_dir(src).map_err(|e| format!("read {}: {e}", src.display()))?;
     for entry in entries {
@@ -1078,6 +1538,20 @@ fn copy_dir(
         let name = entry.file_name();
         if name == std::ffi::OsStr::new(".git") {
             continue;
+        }
+        if let Some(skipped_name) = name
+            .to_str()
+            .and_then(|n| SKIPPED_BUILD_DIRS.iter().find(|d| **d == n))
+        {
+            // Judged by name before the entry is stat'ed, and only a directory
+            // is skipped: a FILE called `target` is content, not a build tree.
+            if entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                let skipped_name = (*skipped_name).to_string();
+                if !skipped.contains(&skipped_name) {
+                    skipped.push(skipped_name);
+                }
+                continue;
+            }
         }
         if started.elapsed() > budget.max_duration {
             return Err(format!(
@@ -1097,7 +1571,7 @@ fn copy_dir(
             *files += 1;
         } else if file_type.is_dir() {
             std::fs::create_dir_all(&to).map_err(|e| format!("create {}: {e}", to.display()))?;
-            copy_dir(root, &from, &to, budget, started, bytes, files)?;
+            copy_dir(root, &from, &to, budget, started, bytes, files, skipped)?;
         } else if file_type.is_file() {
             *files += 1;
             *bytes += meta.len();
@@ -1281,19 +1755,21 @@ mod tests {
             std::fs::create_dir_all(root.join(sub)).expect("layout");
         }
         let (pool, _) = workspace_db::open_pool_at(&root).expect("workspace.db");
-        {
-            let conn = pool.write().unwrap();
-            conn.execute(
-                "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
-                  flow_id, flow_version_id, status, created_at, updated_at) \
-                 VALUES ('s-1', 'ws-1', 'u-1', 'S', 'cs/u/1', 'normal', 'f', 'v', 'idle', \
-                  datetime('now'), datetime('now'))",
-                [],
-            )
-            .expect("session");
-        }
+        add_session(&pool, "s-1");
         let manager = SandboxManager::at(&root, exec_mode, None);
         (dir, manager, pool)
+    }
+
+    fn add_session(pool: &DbPool, session_id: &str) {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
+              flow_id, flow_version_id, status, created_at, updated_at) \
+             VALUES (?1, 'ws-1', 'u-1', 'S', 'cs/u/1', 'normal', 'f', 'v', 'idle', \
+              datetime('now'), datetime('now'))",
+            rusqlite::params![session_id],
+        )
+        .expect("session");
     }
 
     /// A worktree that looks like a real one: sources, an executable script, a
@@ -1711,24 +2187,27 @@ mod tests {
 
     #[test]
     fn a_session_holds_at_most_one_shared_sandbox_per_profile() {
-        let (_dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        let (dir, manager, pool) = workspace(ExecMode::TrustedNative);
         seed_worktree(&manager);
         let profile = SandboxProfile::new(MountAccess::ReadWrite, NetworkAccess::None, false);
 
+        // "One per profile in the session" means the SECOND caller gets the
+        // first one, not a refusal: one workplace, one row, two holders.
         let held = manager.acquire(&pool, "s-1", profile, None).expect("first");
-        match manager.acquire(&pool, "s-1", profile, None) {
-            Err(SandboxError::SharedProfileBusy { mount, network, .. }) => {
-                assert_eq!((mount, network), ("rw", "none"));
-            }
-            other => panic!("a second shared sandbox was created: {other:?}"),
-        }
+        let second = manager
+            .acquire(&pool, "s-1", profile, None)
+            .expect("the shared sandbox of a profile is shared, not refused");
+        assert_eq!(held.sandbox_id, second.sandbox_id);
+        assert_eq!(held.target(), second.target());
+        assert_eq!(live_sandboxes(&pool), 1);
 
         // A different profile is a different sandbox, and an ephemeral one is
-        // never blocked by a shared one.
+        // never merged into a shared one.
         let other_profile = SandboxProfile::new(MountAccess::ReadOnly, NetworkAccess::None, false);
         let read_only = manager
             .acquire(&pool, "s-1", other_profile, None)
             .expect("a different profile");
+        assert_ne!(read_only.sandbox_id, held.sandbox_id);
         let ephemeral = manager
             .acquire(
                 &pool,
@@ -1736,15 +2215,173 @@ mod tests {
                 SandboxProfile::new(MountAccess::ReadWrite, NetworkAccess::None, true),
                 Some("run-1"),
             )
-            .expect("an ephemeral sandbox of an occupied profile");
+            .expect("an ephemeral sandbox alongside the shared one");
+        assert_ne!(ephemeral.sandbox_id, held.sandbox_id);
+        assert!(ephemeral.lease_id.is_some());
+        assert!(held.lease_id.is_none());
 
         manager.release(&pool, held).unwrap();
+        manager.release(&pool, second).unwrap();
         manager.release(&pool, read_only).unwrap();
         manager.release(&pool, ephemeral).unwrap();
 
-        // Releasing frees the profile again.
-        let again = manager.acquire(&pool, "s-1", profile, None).expect("re-acquire");
-        manager.release(&pool, again).unwrap();
+        // Releasing a shared sandbox does NOT close it: only the ephemeral one
+        // is gone, and the two shared rows are still open for the session.
+        assert_eq!(live_sandboxes(&pool), 2);
+        release_session_sandboxes(dir.path(), &pool, "s-1").expect("close the session");
+        assert_eq!(live_sandboxes(&pool), 0);
+    }
+
+    /// The defect this whole mechanism exists for: two commands of one session
+    /// used to get two workplaces, so `target/` from the first was gone by the
+    /// second and no build command could ever work. They must now share.
+    #[test]
+    fn two_commands_of_one_session_share_the_layer_and_a_build_survives_between_them() {
+        let (dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        let worktree = seed_worktree(&manager);
+        let profile = cow(false);
+
+        let first = manager
+            .acquire(&pool, "s-1", profile, Some("run-1"))
+            .expect("first command");
+        let ExecTarget::Local { cwd: first_dir } = first.target().clone() else {
+            panic!("expected a local target");
+        };
+        std::fs::create_dir_all(first_dir.join("target/debug")).unwrap();
+        std::fs::write(first_dir.join("target/debug/app"), b"built").unwrap();
+        manager.release(&pool, first).expect("release after command 1");
+
+        let second = manager
+            .acquire(&pool, "s-1", profile, Some("run-2"))
+            .expect("second command");
+        let ExecTarget::Local { cwd: second_dir } = second.target().clone() else {
+            panic!("expected a local target");
+        };
+        assert_eq!(
+            second_dir, first_dir,
+            "the second command got a fresh workplace, so every build starts cold"
+        );
+        assert_eq!(
+            std::fs::read(second_dir.join("target/debug/app")).unwrap(),
+            b"built",
+            "the build output of the first command did not survive to the second"
+        );
+        // Sharing a layer is not sharing the worktree: the copy is still a copy.
+        assert!(!worktree.join("target").exists());
+        manager.release(&pool, second).expect("release after command 2");
+
+        // And the layer dies with the session, not with the command.
+        let layer = dir.path().join("tmp/s-1/sandbox");
+        assert!(layer.is_dir());
+        assert_eq!(
+            release_session_sandboxes(dir.path(), &pool, "s-1").unwrap(),
+            1
+        );
+        assert!(!first_dir.exists(), "the layer outlived its session");
+        assert_eq!(live_sandboxes(&pool), 0);
+    }
+
+    /// The boundary the sharing must not cross. Two sessions of one workspace
+    /// are two workplaces, and so are two workspaces — the registry key covers
+    /// both, which is why it carries the root AND the session id.
+    #[test]
+    fn a_layer_of_one_session_is_never_visible_in_another() {
+        let (dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        seed_worktree(&manager);
+        add_session(&pool, "s-2");
+        std::fs::create_dir_all(dir.path().join("worktrees/s-2")).unwrap();
+        std::fs::write(dir.path().join("worktrees/s-2/Cargo.toml"), b"[package]\n").unwrap();
+
+        let first = manager
+            .acquire(&pool, "s-1", cow(false), None)
+            .expect("session 1");
+        let second = manager
+            .acquire(&pool, "s-2", cow(false), None)
+            .expect("session 2");
+        let (ExecTarget::Local { cwd: a }, ExecTarget::Local { cwd: b }) =
+            (first.target().clone(), second.target().clone())
+        else {
+            panic!("expected local targets");
+        };
+        assert_ne!(a, b, "two sessions were handed one layer");
+
+        std::fs::write(a.join("only-in-s-1"), b"1").unwrap();
+        std::fs::write(b.join("only-in-s-2"), b"2").unwrap();
+        assert!(!b.join("only-in-s-1").exists(), "session 2 saw session 1's layer");
+        assert!(!a.join("only-in-s-2").exists(), "session 1 saw session 2's layer");
+
+        manager.release(&pool, first).unwrap();
+        manager.release(&pool, second).unwrap();
+
+        // Closing one session leaves the other one's layer alone.
+        assert_eq!(
+            release_session_sandboxes(dir.path(), &pool, "s-1").unwrap(),
+            1
+        );
+        assert!(!a.exists());
+        assert!(b.join("only-in-s-2").exists(), "closing s-1 destroyed s-2's layer");
+        release_session_sandboxes(dir.path(), &pool, "s-2").unwrap();
+    }
+
+    /// Two workspaces cannot meet in one layer even when their session ids are
+    /// identical — the registry key is rooted at the workspace directory.
+    #[test]
+    fn two_workspaces_with_the_same_session_id_get_different_layers() {
+        let (_first_dir, first, first_pool) = workspace(ExecMode::TrustedNative);
+        let (_second_dir, second, second_pool) = workspace(ExecMode::TrustedNative);
+        seed_worktree(&first);
+        seed_worktree(&second);
+
+        let a = first
+            .acquire(&first_pool, "s-1", cow(false), None)
+            .expect("workspace a");
+        let b = second
+            .acquire(&second_pool, "s-1", cow(false), None)
+            .expect("workspace b");
+        assert_ne!(a.sandbox_id, b.sandbox_id);
+        let (ExecTarget::Local { cwd: a_dir }, ExecTarget::Local { cwd: b_dir }) =
+            (a.target().clone(), b.target().clone())
+        else {
+            panic!("expected local targets");
+        };
+        assert_ne!(a_dir, b_dir, "two workspaces shared one layer");
+
+        first.release(&first_pool, a).unwrap();
+        second.release(&second_pool, b).unwrap();
+        release_session_sandboxes(_first_dir.path(), &first_pool, "s-1").unwrap();
+        release_session_sandboxes(_second_dir.path(), &second_pool, "s-1").unwrap();
+    }
+
+    /// `ephemeral` keeps its old meaning exactly: destroyed with the command, so
+    /// two runs of the same profile never inherit each other's state.
+    #[test]
+    fn an_ephemeral_sandbox_is_still_destroyed_with_its_command() {
+        let (_dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        seed_worktree(&manager);
+
+        let first = manager
+            .acquire(&pool, "s-1", cow(true), Some("run-1"))
+            .expect("first run");
+        let ExecTarget::Local { cwd: first_dir } = first.target().clone() else {
+            panic!("expected a local target");
+        };
+        std::fs::write(first_dir.join("from-run-1"), b"x").unwrap();
+        manager.release(&pool, first).expect("release");
+        assert!(!first_dir.exists(), "an ephemeral layer outlived its lease");
+
+        let second = manager
+            .acquire(&pool, "s-1", cow(true), Some("run-2"))
+            .expect("second run");
+        let ExecTarget::Local { cwd: second_dir } = second.target().clone() else {
+            panic!("expected a local target");
+        };
+        assert_ne!(second_dir, first_dir);
+        assert!(
+            !second_dir.join("from-run-1").exists(),
+            "an ephemeral run inherited the previous run's layer"
+        );
+        manager.release(&pool, second).unwrap();
+        assert_eq!(live_sandboxes(&pool), 0);
     }
 
     /// `trusted_native` + `ro` enforces nothing at the OS level, and the test
@@ -1837,9 +2474,10 @@ mod tests {
         let tmp = dir.path().join("tmp/s-1/sandbox/overlay-test");
         std::fs::create_dir_all(&tmp).unwrap();
 
-        let (work, layer) = manager
+        let built = manager
             .build_cow_layer(&tmp, &worktree, true)
             .expect("a cow layer, by either mechanism");
+        let (work, layer) = (built.work_dir, built.layer);
         assert_ne!(work, worktree, "the layer was the worktree itself");
         assert_eq!(
             std::fs::read(work.join("src/main.rs")).unwrap(),
@@ -1926,6 +2564,162 @@ mod tests {
             .acquire(&pool, "s-1", profile, None)
             .expect("the profile is free again");
         manager.release(&pool, again).unwrap();
+    }
+
+    /// A session that stops working must not hold a copy of a worktree for
+    /// ever. The sweep runs on the next acquisition of the same workspace,
+    /// because that is the caller holding the pool the rows are closed through.
+    #[test]
+    fn a_shared_sandbox_with_no_holder_is_reclaimed_once_it_has_been_idle() {
+        let (dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        seed_worktree(&manager);
+        add_session(&pool, "s-2");
+        std::fs::create_dir_all(dir.path().join("worktrees/s-2")).unwrap();
+        std::fs::write(dir.path().join("worktrees/s-2/Cargo.toml"), b"[package]\n").unwrap();
+        let manager = manager.with_idle_ttl(Duration::from_millis(0));
+
+        let abandoned = manager
+            .acquire(&pool, "s-1", cow(false), None)
+            .expect("a sandbox nobody comes back to");
+        let abandoned_id = abandoned.sandbox_id.clone();
+        let ExecTarget::Local { cwd: layer } = abandoned.target().clone() else {
+            panic!("expected a local target");
+        };
+        // While it is HELD, nothing reclaims it: the sweep counts holders first.
+        manager
+            .acquire(&pool, "s-2", cow(false), None)
+            .map(|held| manager.release(&pool, held))
+            .expect("another session")
+            .unwrap();
+        assert!(layer.is_dir(), "a held sandbox was swept away");
+
+        manager.release(&pool, abandoned).unwrap();
+        // The next acquisition on this workspace finds it holderless and past
+        // its deadline.
+        let fresh = manager
+            .acquire(&pool, "s-2", cow(false), None)
+            .expect("an acquisition that runs the sweep");
+        manager.release(&pool, fresh).unwrap();
+
+        assert!(!layer.exists(), "the idle layer survived the sweep");
+        let state: String = pool
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT state FROM sandboxes WHERE id = ?1",
+                rusqlite::params![abandoned_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(state, "stopped");
+        release_session_sandboxes(dir.path(), &pool, "s-2").unwrap();
+    }
+
+    /// The copy leaves out what a build regenerates, and says which names it
+    /// left out. Without that, a checkout carrying its own `target/` blows the
+    /// budget and the sandbox is refused — which is the whole reason no build
+    /// command worked on a large repository.
+    #[test]
+    fn the_copy_skips_regenerable_build_directories_and_reports_which() {
+        let (_dir, manager, pool) = workspace(ExecMode::TrustedNative);
+        let worktree = seed_worktree(&manager);
+
+        // A worktree whose SOURCES are tiny and whose build output is not.
+        for (dir, size) in [
+            ("target/debug/deps", 6 * 1024),
+            ("node_modules/left-pad", 6 * 1024),
+            (".venv/lib", 6 * 1024),
+            ("src/__pycache__", 6 * 1024),
+        ] {
+            std::fs::create_dir_all(worktree.join(dir)).unwrap();
+            std::fs::write(worktree.join(dir).join("blob.bin"), vec![0u8; size]).unwrap();
+        }
+        // A FILE named like a build directory is content and is copied.
+        std::fs::write(worktree.join("build"), b"#!/bin/sh\n").unwrap();
+
+        // A budget the sources fit into and the build output does not: without
+        // the exclusions this acquisition is a refusal.
+        let manager = manager.with_cow_budget(CowBudget {
+            max_bytes: 16 * 1024,
+            max_files: 200_000,
+            max_duration: Duration::from_secs(120),
+        });
+        let lease = manager
+            .acquire(&pool, "s-1", cow(true), Some("run-1"))
+            .expect("the copy must fit once the build directories are out of it");
+        let ExecTarget::Local { cwd } = lease.target().clone() else {
+            panic!("expected a local target");
+        };
+
+        assert_eq!(std::fs::read(cwd.join("src/main.rs")).unwrap(), b"fn main() {}\n");
+        for missing in ["target", "node_modules", ".venv", "src/__pycache__"] {
+            assert!(
+                !cwd.join(missing).exists(),
+                "{missing} was copied into the layer"
+            );
+        }
+        assert!(cwd.join("build").is_file(), "a file was skipped by its name");
+
+        // Not silent: the caller can tell the model what the layer does not have.
+        let mut reported = lease.skipped_dirs.clone();
+        reported.sort();
+        assert_eq!(
+            reported,
+            vec![
+                ".venv".to_string(),
+                "__pycache__".to_string(),
+                "node_modules".to_string(),
+                "target".to_string()
+            ]
+        );
+        manager.release(&pool, lease).unwrap();
+    }
+
+    /// The same tree, with the exclusions taken away, is exactly what used to
+    /// be refused — so the test above is measuring the exclusions and not a
+    /// budget that was generous all along.
+    #[test]
+    fn the_same_tree_without_the_exclusions_would_not_have_fitted() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("target/debug")).unwrap();
+        std::fs::write(src.join("main.rs"), b"fn main() {}\n").unwrap();
+        std::fs::write(src.join("target/debug/blob.bin"), vec![0u8; 32 * 1024]).unwrap();
+        let budget = CowBudget {
+            max_bytes: 16 * 1024,
+            max_files: 200_000,
+            max_duration: Duration::from_secs(120),
+        };
+
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst).unwrap();
+        assert_eq!(
+            copy_tree(&src, &dst, &budget).expect("with the exclusion the copy fits"),
+            vec!["target".to_string()]
+        );
+
+        // The bytes are real: a copy that walks into `target/` runs out of
+        // budget on the very same tree.
+        let unfiltered = dir.path().join("unfiltered");
+        std::fs::create_dir_all(&unfiltered).unwrap();
+        let mut bytes = 0u64;
+        let mut files = 0u64;
+        let mut skipped = Vec::new();
+        std::fs::rename(src.join("target"), src.join("kept-target")).unwrap();
+        assert!(
+            copy_dir(
+                &src,
+                &src,
+                &unfiltered,
+                &budget,
+                Instant::now(),
+                &mut bytes,
+                &mut files,
+                &mut skipped,
+            )
+            .is_err(),
+            "the build output alone must exceed the budget"
+        );
     }
 
     #[test]

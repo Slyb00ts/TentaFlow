@@ -1311,6 +1311,35 @@ fn last_assistant_has_tool_calls(envelope: &FlowEnvelope) -> bool {
 /// wszystkich wywołań.
 const NODE_TIMEOUT_SECS: u64 = 600;
 
+/// Hard ceiling on a budget a block declares for itself. `timeout_secs` is
+/// operator input, and without an upper bound a typo parks an executor slot
+/// for years instead of failing.
+const MAX_NODE_TIMEOUT_SECS: u64 = 86_400;
+
+/// Wall-clock budget of one leaf node.
+///
+/// `NODE_TIMEOUT_SECS` is a FLOOR, not a ceiling. Blocks that own a long,
+/// bounded wait declare it in their own config — `delegate_cli` drives a whole
+/// vendor turn, `ask_user` and `patch_review` wait for a person, `exec_command`
+/// runs a build — and a node killed at 600 s while its own limit said 900
+/// reports a timeout that was never the configured one. The floor stays because
+/// it is what protects every node that declares nothing.
+///
+/// It is `max`, not "the declared value when present", because for some blocks
+/// `timeout_secs` bounds an INNER operation (the command, the question) and the
+/// block still has to settle its run, reap a child and write its rows
+/// afterwards. Taking the inner budget as the outer wall would abort exactly
+/// during that cleanup; a floor can only ever lengthen the wall.
+fn node_timeout(node: &FlowNode) -> std::time::Duration {
+    let declared = node
+        .config
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(MAX_NODE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(declared.max(NODE_TIMEOUT_SECS))
+}
+
 /// Node'y-kontenery, które ORKIESTRUJĄ wiele iteracji/podflow. Ich wewnętrzne
 /// nody-liście są już indywidualnie limitowane przez `NODE_TIMEOUT_SECS`, więc
 /// nałożenie 600 s na sam kontener błędnie ograniczyłoby CAŁĄ pętlę do 600 s
@@ -1333,23 +1362,25 @@ async fn run_node_with_io_mapping(
     inputs: &[NodeInput],
     ctx: &ExecutionContext,
 ) -> Result<FlowEnvelope> {
-    // Kontenery (loop/subflow/map/spawn) napędzają wiele wewnętrznych nodów,
-    // z których każdy ma własne 600 s — nie limitujemy ich tu, inaczej cała
-    // pętla padłaby po 600 s zamiast po wyczerpaniu `max_iterations`.
+    // Containers (loop/subflow/map/spawn) drive many inner nodes, each with its
+    // own budget — bounding the container here would kill the whole loop at one
+    // node's budget instead of at `max_iterations`.
     if is_container_node_type(node.node_type.as_str()) {
         return run_node_io_inner(adapter, node, inbound, inputs, ctx).await;
     }
 
     let node_id = node.id.clone();
+    let budget = node_timeout(node);
     match tokio::time::timeout(
-        std::time::Duration::from_secs(NODE_TIMEOUT_SECS),
+        budget,
         run_node_io_inner(adapter, node, inbound, inputs, ctx),
     )
     .await
     {
         Ok(res) => res,
         Err(_) => Err(anyhow!(
-            "node '{node_id}' timeout after {NODE_TIMEOUT_SECS}s"
+            "node '{node_id}' timeout after {}s",
+            budget.as_secs()
         )),
     }
 }
@@ -4608,5 +4639,70 @@ mod direct_execution_tests {
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
         assert_eq!(outcome.trace.len(), 1);
         assert_eq!(outcome.trace[0].node_type, "llm");
+    }
+}
+
+#[cfg(test)]
+mod node_budget_tests {
+    //! The per-node wall clock. A block that declares its own `timeout_secs`
+    //! has to actually get it: `delegate_cli` accepts up to 86400 s and its own
+    //! approval wait is 600 s on its own, so a hard-coded 600 s node budget
+    //! guaranteed the node died first and reported a limit nobody configured.
+    use super::*;
+    use serde_json::json;
+
+    fn node(config: serde_json::Value) -> FlowNode {
+        FlowNode {
+            id: "n1".into(),
+            node_type: "delegate_cli".into(),
+            config,
+            position: None,
+            label: None,
+            region: None,
+        }
+    }
+
+    #[test]
+    fn a_block_without_its_own_limit_keeps_the_global_floor() {
+        assert_eq!(
+            node_timeout(&node(json!({}))).as_secs(),
+            NODE_TIMEOUT_SECS,
+            "a node that declares nothing must stay protected by the global limit"
+        );
+        // A declared value BELOW the floor never shortens the wall: for several
+        // blocks `timeout_secs` bounds an inner operation, and the block still
+        // has to settle its run afterwards.
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": 5}))).as_secs(),
+            NODE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn a_declared_limit_longer_than_the_floor_is_the_one_that_applies() {
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": 900}))).as_secs(),
+            900,
+            "the observed defect: a node configured for 900 s died at 600 s"
+        );
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": 86_400}))).as_secs(),
+            86_400
+        );
+    }
+
+    #[test]
+    fn a_declared_limit_is_capped_and_a_nonsense_one_is_ignored() {
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": u64::MAX}))).as_secs(),
+            MAX_NODE_TIMEOUT_SECS,
+            "config is operator input; without a ceiling a typo parks the slot forever"
+        );
+        for bogus in [json!("900"), json!(-5), json!(null)] {
+            assert_eq!(
+                node_timeout(&node(json!({"timeout_secs": bogus}))).as_secs(),
+                NODE_TIMEOUT_SECS
+            );
+        }
     }
 }

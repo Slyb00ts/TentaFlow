@@ -1415,7 +1415,7 @@ impl AdapterHandle {
     /// Stops accepting. Called when the session's CLI work ends: the credential
     /// only lives in memory while an adapter does, so an adapter nobody stops is
     /// key material nobody released.
-    pub fn shutdown(self) {
+    pub fn shutdown(&self) {
         self.task.abort();
     }
 }

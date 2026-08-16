@@ -10,12 +10,23 @@
 // through:
 //
 //   PEP (`code_studio::pep::authorize`)  — role, autonomy mode, boundary
-//   InteractionRegistry (`agents::interaction`) — the human question, when the
-//                                                 PEP says one is needed
+//   `tools::suspend_for_operator`        — the human question, when the PEP
+//                                          says one is needed
 //
 // so an operator answering "may this agent run a command" answers one kind of
 // question whether the agent is our harness or a vendor CLI, and the answer
 // lands in the same timeline.
+//
+// The second half of that sentence is load-bearing and used not to hold. A
+// vendor question raised its own interaction id, announced it on the progress
+// stream and waited: the `approvals` table stayed empty while the CLI was
+// blocked, so `ApprovalsListRequest` returned nothing, the console showed
+// nothing, and the only way to answer was a reply carrying a UUID that had been
+// published on a stream. In practice that is not an answer channel at all — a
+// `claude` Edit sat for a quarter of an hour and then "lost" by starvation.
+// Suspending through `tools::suspend_for_operator` puts the row down BEFORE the
+// person is asked, which is what makes the question visible while it is open
+// and answerable with the ordinary `ApprovalDecideRequest`.
 //
 // Three rules that make the routing safe rather than merely convenient:
 //
@@ -46,33 +57,27 @@
 // Anything with an effect — a write, a command — is escalated by the vendor and
 // decided here.
 //
-// **No database writes.** As with the egress gateway and the adapter, every
-// decision produces `EventPayload`s the caller appends to the session timeline.
-// The only exception is the `cli_instances` bookkeeping at the bottom of this
-// file, which IS the runtime table for these instances (§5.3).
+// **Where this module does write.** A decision the PEP makes on its own
+// produces `EventPayload`s the caller appends to the session timeline, and
+// nothing else. The two exceptions are both runtime tables of §5.3 that belong
+// to this path: the `cli_instances` bookkeeping at the bottom of this file, and
+// the `approvals` row a suspended question opens — written by
+// `tools::suspend_for_operator` rather than here, so there is one writer of an
+// approval row for the whole product.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
 
 use anyhow::{anyhow, Context, Result};
 use rusqlite::OptionalExtension;
 use serde_json::Value;
 
 use super::events::EventPayload;
-use super::pep::{self, Capability, Decision, Target};
-use crate::agents::interaction::{self, InteractionRegistry, PermissionDecision};
-use crate::agents::run_manager::AgentRunManager;
+use super::pep::{self, AskKind, Capability, Decision, Target};
+use super::tools::{self, ApprovalDecision};
 use crate::db::DbPool;
-use crate::flow_engine::dispatchers::progress::ProgressSink;
 use crate::services::transport::Transport;
 use crate::services_repo::services::ServiceRow;
-
-/// How long an operator has to answer a CLI's approval before the turn is
-/// refused. Longer than a tool permission prompt (the CLI is blocked and the
-/// vendor's own timeout is minutes), short enough that a forgotten window does
-/// not hold a sandbox open all day.
-pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 
 // =============================================================================
 // Bridge client
@@ -700,11 +705,20 @@ impl CliBridge {
     /// Closes the CLI instance and records the process state the bridge
     /// reported. `reaped` means the bridge verified the process is gone (D2) —
     /// anything else is recorded as it came, not upgraded.
-    pub async fn close(&self, pool: &DbPool, instance: &CliInstance) -> Result<String> {
+    ///
+    /// Takes the two identifiers rather than the `CliInstance` because a
+    /// delegation abandoned mid-turn has to be able to close from a detached
+    /// task, where the live instance is long gone.
+    pub async fn close(
+        &self,
+        pool: &DbPool,
+        instance_id: &str,
+        bridge_session_id: &str,
+    ) -> Result<String> {
         let response = self
             .call(
                 "session.close",
-                serde_json::json!({"session_id": instance.bridge_session_id}),
+                serde_json::json!({"session_id": bridge_session_id}),
             )
             .await?;
         let state = response
@@ -713,7 +727,7 @@ impl CliBridge {
             .unwrap_or("ended")
             .to_string();
         let status = if state == "reaped" { "reaped" } else { "ended" };
-        set_instance_status(pool, &instance.id, status)?;
+        set_instance_status(pool, instance_id, status)?;
         Ok(state)
     }
 }
@@ -745,26 +759,31 @@ pub struct OpenCliInstance<'a> {
 /// Everything the decision depends on. Gathered by the caller, exactly like
 /// `pep::SessionCtx`, so the routing itself stays testable.
 pub struct ApprovalContext<'a> {
-    /// The PEP context for ONE capability, resolved per question.
+    /// The PEP context for ONE capability against ONE target, resolved per
+    /// question.
     ///
     /// A closure and not a single struct: `fs_write` and `exec` are answered by
     /// different rows of `code_workspace_allowlist` and `session_grants`, so a
     /// context gathered once would let a standing permission for writing files
-    /// answer a question about running a command. The caller gathers per
-    /// capability; this module still does no database work.
-    pub session: &'a (dyn Fn(Capability) -> pep::SessionCtx + Send + Sync),
-    pub session_id: &'a str,
+    /// answer a question about running a command. The TARGET travels with it
+    /// for the same reason one step down — a grant earned for `cargo` must not
+    /// answer for `curl` — and it is the same label the approval row stores, so
+    /// a permission is read back under the name it was written with.
+    pub session: &'a (dyn Fn(Capability, Option<&str>) -> pep::SessionCtx + Send + Sync),
+    /// Where the question is recorded and how it reaches a person. The vendor's
+    /// request becomes an ordinary Code Studio approval — one `approvals` row,
+    /// visible in `ApprovalsListRequest` WHILE it is open, answerable with
+    /// `ApprovalDecideRequest` — rather than a parallel channel with a card
+    /// nobody can find.
+    pub ask: tools::OperatorAsk<'a>,
+    /// Registry database, for the standing grant an `always` answer leaves.
+    pub main_db: &'a DbPool,
+    pub workspace_id: &'a str,
     pub run_id: &'a str,
-    pub parent_run_id: Option<&'a str>,
     pub engine_id: &'a str,
     /// The session's worktree. A request that cannot be shown to stay inside it
     /// is out of bounds.
     pub worktree: &'a Path,
-    pub registry: &'a InteractionRegistry,
-    pub manager: Option<&'a AgentRunManager>,
-    pub progress: &'a dyn ProgressSink,
-    pub progress_scope: &'a str,
-    pub timeout: Duration,
 }
 
 /// The answer, plus what the timeline should say about it.
@@ -773,10 +792,10 @@ pub struct ApprovalOutcome {
     /// The vendor's decision vocabulary: `approved`, `approved_for_session`,
     /// `denied`.
     pub decision: &'static str,
-    /// True when the operator asked for a STANDING grant. Writing it is the
-    /// caller's job — this module does not touch the grant tables.
-    pub persist_grant: bool,
     pub capability: Option<Capability>,
+    /// Timeline entries the CALLER still has to append. Empty when the operator
+    /// was asked: `suspend_for_operator` owns that half of the timeline, and it
+    /// writes both entries against the `approvals` row they belong to.
     pub events: Vec<EventPayload>,
 }
 
@@ -811,62 +830,102 @@ pub async fn resolve_approval(
 
     let summary = summarize(&request.method, &request.params);
     let target = target_for(dialect, capability, &request.params, ctx.worktree);
+    let label = target_label(dialect, capability, &request.params);
+
+    let session = (ctx.session)(capability, label.as_deref());
+    let decision = match pep::authorize(&session, capability, &target) {
+        // A policy answer asks nobody, so it opens no `approvals` row — the row
+        // IS the question — and the timeline entries travel back to the caller.
+        Decision::Deny { reason } => {
+            return decided_by_policy(approval_id, capability, summary, Some(reason), "denied");
+        }
+        Decision::Allow(_) => {
+            return decided_by_policy(approval_id, capability, summary, None, "approved");
+        }
+        Decision::AskUser { .. } => {
+            // The same suspension a model-issued tool call uses: the row is
+            // written before the person is asked, and the answer may arrive on
+            // the approval card or on the agent's permission channel.
+            let answered = tools::suspend_for_operator(
+                &ctx.ask,
+                capability,
+                label.as_deref(),
+                &summary,
+                AskKind::Permission,
+            )
+            .await;
+            let answer = match answered {
+                Ok(answer) => answer,
+                // A question that could not even be recorded was never put to
+                // anybody, and the CLI must not be told a person allowed it.
+                Err(error) => {
+                    tracing::warn!("cli approval could not be put to the operator: {error:#}");
+                    return decided_by_policy(
+                        approval_id,
+                        capability,
+                        summary,
+                        Some(format!("the approval could not be recorded: {error:#}")),
+                        "denied",
+                    );
+                }
+            };
+            if let Err(error) = tools::persist_grant(
+                ctx.main_db,
+                ctx.workspace_id,
+                ctx.ask.user_id,
+                capability,
+                label.as_deref(),
+                answer,
+            ) {
+                tracing::warn!("cli approval grant not stored: {error:#}");
+            }
+            match answer {
+                // A timeout is a denial, and the CLI is told so rather than
+                // being left blocked (the whole point of D3).
+                ApprovalDecision::Deny => "denied",
+                ApprovalDecision::AllowOnce => "approved",
+                ApprovalDecision::AllowForRun => "approved_for_session",
+                // The vendor has no "forever"; the standing grant lives on our
+                // side, and the CLI is told "for this session".
+                ApprovalDecision::Always => "approved_for_session",
+            }
+        }
+    };
+    ApprovalOutcome {
+        decision,
+        capability: Some(capability),
+        events: Vec::new(),
+    }
+}
+
+/// An answer the PEP gave on its own: nobody was asked, so no `approvals` row
+/// was opened, and the two timeline entries that make it readable travel back
+/// to the caller.
+fn decided_by_policy(
+    approval_id: String,
+    capability: Capability,
+    summary: String,
+    reason: Option<String>,
+    decision: &'static str,
+) -> ApprovalOutcome {
     let mut events = vec![EventPayload::ApprovalRequested {
         approval_id: approval_id.clone(),
         capability: capability.slug().to_string(),
-        summary: summary.clone(),
+        summary,
     }];
-
-    let session = (ctx.session)(capability);
-    let (decision, persist_grant, decided_by) =
-        match pep::authorize(&session, capability, &target) {
-            Decision::Deny { reason } => {
-                events.push(EventPayload::AgentMessage {
-                    role: "system".to_string(),
-                    text: reason,
-                });
-                ("denied", false, "policy")
-            }
-            Decision::Allow(_) => ("approved", false, "policy"),
-            Decision::AskUser { .. } => {
-                let (answer, _waited) = interaction::run_permission_request(
-                    ctx.registry,
-                    ctx.manager,
-                    ctx.progress,
-                    ctx.progress_scope,
-                    ctx.run_id,
-                    ctx.parent_run_id,
-                    ctx.engine_id,
-                    &request.method,
-                    capability.slug(),
-                    ctx.timeout,
-                )
-                .await;
-                match answer {
-                    // A timeout is a denial, and the CLI is told so rather than
-                    // being left blocked (the whole point of D3).
-                    PermissionDecision::Deny => ("denied", false, "user"),
-                    PermissionDecision::AllowOnce => ("approved", false, "user"),
-                    PermissionDecision::AllowForRun => ("approved_for_session", false, "user"),
-                    // The vendor has no "forever"; the standing grant lives on
-                    // our side, and the CLI is told "for this session".
-                    PermissionDecision::Always => (
-                        "approved_for_session",
-                        pep::may_store_always_grant(capability),
-                        "user",
-                    ),
-                }
-            }
-        };
-
+    if let Some(reason) = reason {
+        events.push(EventPayload::AgentMessage {
+            role: "system".to_string(),
+            text: reason,
+        });
+    }
     events.push(EventPayload::ApprovalDecided {
         approval_id,
         decision: decision.to_string(),
-        decided_by: decided_by.to_string(),
+        decided_by: "policy".to_string(),
     });
     ApprovalOutcome {
         decision,
-        persist_grant,
         capability: Some(capability),
         events,
     }
@@ -877,7 +936,6 @@ pub async fn resolve_approval(
 fn refused_by_policy(approval_id: String, reason: String) -> ApprovalOutcome {
     ApprovalOutcome {
         decision: "denied",
-        persist_grant: false,
         capability: None,
         events: vec![
             EventPayload::ApprovalRequested {
@@ -967,6 +1025,42 @@ fn target_for(
             .all(|path| is_inside(worktree, Path::new(path)))
     };
     Target::Path { inside_worktree }
+}
+
+/// What a decision about this request is STORED under (§9.1: the object of a
+/// permission is capability + target), and what standing permissions are read
+/// back with. The boundary check is `target_for`'s job; this is the narrower
+/// question of what to call the thing, and the two must not disagree.
+///
+/// The convention is the agent path's (`tools::target_label`): a command is
+/// named by its program, a file operation by the path it names. A request that
+/// pins nothing down — a multi-file patch, a `Bash` line we cannot read a
+/// program out of — has no honest narrower name, and `pep::grant_pattern` spells
+/// that `*`. Guessing one of several paths would store a permission that reads
+/// back as covering a file the operator never saw.
+fn target_label(
+    dialect: ApprovalDialect,
+    capability: Capability,
+    params: &Value,
+) -> Option<String> {
+    if capability == Capability::Exec {
+        let command = params.get("command")?;
+        let program = match command {
+            // Codex passes argv; Claude Code passes one shell line.
+            Value::Array(argv) => argv.first().and_then(Value::as_str).map(str::to_string),
+            Value::String(line) => line.split_whitespace().next().map(str::to_string),
+            _ => None,
+        }?;
+        return (!program.is_empty()).then_some(program);
+    }
+    let named = match dialect {
+        ApprovalDialect::Codex => patch_paths(params),
+        ApprovalDialect::ClaudeCode => claude_paths(params),
+    };
+    match named.as_slice() {
+        [only] if !only.is_empty() => Some(only.clone()),
+        _ => None,
+    }
 }
 
 /// Paths one Claude Code tool input names. Its tool set puts them under exactly
@@ -1173,6 +1267,8 @@ pub fn reap_orphaned_instances(pool: &DbPool) -> Result<usize> {
 mod tests {
     use super::*;
     use crate::code_studio::models::{AutonomyMode, WorkspaceRole};
+    use crate::code_studio::tools::ScriptedGate;
+    use crate::code_studio::{paths as cs_paths, workspace_db};
 
     fn ctx() -> pep::SessionCtx {
         pep::SessionCtx {
@@ -1183,6 +1279,112 @@ mod tests {
             allowlisted: false,
             session_granted: false,
             run_granted: false,
+        }
+    }
+
+    /// A workspace runtime database with one open session — the table an
+    /// approval row lands in, and the timeline it is recorded on. Real
+    /// migrations, real writes: the point of the routing change is that a
+    /// vendor question becomes a ROW, so a stub would test nothing.
+    struct Fixture {
+        _data: tempfile::TempDir,
+        workspace_id: String,
+        pool: DbPool,
+        main_db: DbPool,
+    }
+
+    impl Fixture {
+        fn open(workspace_id: &str) -> Self {
+            let data = tempfile::tempdir().expect("data dir");
+            crate::paths::set_category_override(
+                crate::paths::StorageCategory::Data,
+                Some(data.path().to_string_lossy().to_string()),
+            );
+            cs_paths::create_workspace_layout(workspace_id).expect("layout");
+            let pool = workspace_db::open(workspace_id).expect("workspace db");
+            {
+                let conn = pool.write().expect("write");
+                conn.execute(
+                    "INSERT INTO sessions (id, workspace_id, user_id, title, branch, \
+                      autonomy_mode, flow_id, flow_version_id, status, created_at, updated_at) \
+                     VALUES ('sess-1', ?1, 'u-1', 'S', 'cs/u/1', 'normal', 'f', 'v', 'running', \
+                      datetime('now'), datetime('now'))",
+                    rusqlite::params![workspace_id],
+                )
+                .expect("session row");
+            }
+            Self {
+                _data: data,
+                workspace_id: workspace_id.to_string(),
+                pool,
+                main_db: crate::db::init(Path::new(":memory:")).expect("registry db"),
+            }
+        }
+
+        fn ask<'a>(&'a self, gate: &'a dyn tools::ApprovalGate) -> tools::OperatorAsk<'a> {
+            tools::OperatorAsk {
+                pool: &self.pool,
+                session_id: "sess-1",
+                run_id: Some("run-1"),
+                user_id: "u-1",
+                gate,
+            }
+        }
+
+        fn approvals(&self) -> Vec<(String, String, String, Option<String>)> {
+            let conn = self.pool.read().expect("read");
+            let mut stmt = conn
+                .prepare(
+                    "SELECT capability, target_pattern, status, decision FROM approvals \
+                     ORDER BY requested_at",
+                )
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |row| {
+                    Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
+                })
+                .expect("query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("rows");
+            rows
+        }
+
+        fn event_kinds(&self) -> Vec<String> {
+            let conn = self.pool.read().expect("read");
+            let mut stmt = conn
+                .prepare("SELECT kind FROM session_events ORDER BY seq")
+                .expect("prepare");
+            let rows = stmt
+                .query_map([], |row| row.get(0))
+                .expect("query")
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .expect("rows");
+            rows
+        }
+    }
+
+    impl Drop for Fixture {
+        fn drop(&mut self) {
+            workspace_db::close(&self.workspace_id);
+            crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+        }
+    }
+
+    fn context<'a>(
+        fixture: &'a Fixture,
+        ask: tools::OperatorAsk<'a>,
+        session: &'a (dyn Fn(Capability, Option<&str>) -> pep::SessionCtx + Send + Sync),
+        engine_id: &'a str,
+        worktree: &'a Path,
+    ) -> ApprovalContext<'a> {
+        ApprovalContext {
+            session,
+            ask,
+            main_db: &fixture.main_db,
+            workspace_id: &fixture.workspace_id,
+            run_id: "run-1",
+            engine_id,
+            worktree,
         }
     }
 
@@ -1338,22 +1540,13 @@ mod tests {
 
     #[tokio::test]
     async fn an_unknown_approval_kind_is_denied_and_the_run_is_not_left_hanging() {
-        let registry = InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsunknown");
+        let gate = ScriptedGate::answering(ApprovalDecision::AllowOnce);
+        let ask = fixture.ask(&gate);
         let session = ctx();
-        let context = ApprovalContext {
-            session: &|_| session.clone(),
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "codex",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            timeout: Duration::from_millis(50),
-        };
+        let grants = |_: Capability, _: Option<&str>| session.clone();
+        let context = context(&fixture, ask, &grants, "codex", Path::new("/w/session-1"));
         let outcome = resolve_approval(
             &context,
             &ApprovalRequest {
@@ -1370,28 +1563,24 @@ mod tests {
             2,
             "the timeline records ask and answer"
         );
+        assert!(gate.asked().is_empty(), "nobody is asked about a kind we cannot bound");
+        assert!(
+            fixture.approvals().is_empty(),
+            "a refusal nobody was asked about opens no approval card"
+        );
     }
 
     #[tokio::test]
     async fn a_command_outside_the_worktree_is_refused_without_asking_anyone() {
-        let registry = InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsoutside");
+        // A gate that would ALLOW: whatever refuses below is the boundary, and
+        // the operator never being asked is the other half of the assertion.
+        let gate = ScriptedGate::answering(ApprovalDecision::AllowOnce);
+        let ask = fixture.ask(&gate);
         let session = ctx();
-        let context = ApprovalContext {
-            session: &|_| session.clone(),
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "codex",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            // Long enough that a question WOULD block if one were asked; the
-            // test finishing quickly is part of the assertion.
-            timeout: Duration::from_secs(30),
-        };
+        let grants = |_: Capability, _: Option<&str>| session.clone();
+        let context = context(&fixture, ask, &grants, "codex", Path::new("/w/session-1"));
         let outcome = resolve_approval(
             &context,
             &ApprovalRequest {
@@ -1403,45 +1592,64 @@ mod tests {
         .await;
         assert_eq!(outcome.decision, "denied");
         assert_eq!(outcome.capability, Some(Capability::Exec));
+        assert!(gate.asked().is_empty(), "a target out of bounds is not a question");
+        assert!(fixture.approvals().is_empty());
     }
 
+    /// The vendor's question is an ORDINARY Code Studio approval: the row is in
+    /// `approvals`, `pending`, naming the capability and the target, WHILE the
+    /// operator is being asked — not after they answered.
+    ///
+    /// Before this, `resolve_approval` wrote no row at all and appended its two
+    /// timeline entries only once the decision was in. The console's
+    /// `loadApprovals()` therefore returned nothing for the whole time the CLI
+    /// was blocked, and the only answer channel was a reply carrying a UUID
+    /// announced on a progress stream. A `claude` Edit sat for a quarter of an
+    /// hour and was refused by starvation.
     #[tokio::test]
-    async fn an_operator_answer_becomes_the_vendor_decision() {
-        let registry = std::sync::Arc::new(InteractionRegistry::new());
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let session = ctx();
-        let answering = registry.clone();
-        // Answer as soon as the question appears; the run is blocked until it
-        // does, which is exactly the hang D3 fixes.
-        let answerer = tokio::spawn(async move {
-            for _ in 0..200 {
-                let pending = answering.list_for(true, &["run-1".to_string()]);
-                if let Some(question) = pending.first() {
-                    assert_eq!(question.tool_name.as_deref(), Some("execCommandApproval"));
-                    answering.reply(
-                        &question.id,
-                        interaction::InteractionReply::Permission(PermissionDecision::AllowForRun),
-                    );
-                    return true;
-                }
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-            false
-        });
+    async fn a_vendor_question_is_a_pending_approval_row_while_it_is_open() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsvendorask");
 
-        let context = ApprovalContext {
-            session: &|_| session.clone(),
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "codex",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            timeout: Duration::from_secs(10),
+        /// A gate that reads the `approvals` table at the moment the question
+        /// is put to it — the only way to assert "visible DURING", not "after".
+        struct PeekingGate {
+            pool: DbPool,
+            seen: std::sync::Mutex<Vec<(String, String, String)>>,
+        }
+
+        #[async_trait::async_trait]
+        impl tools::ApprovalGate for PeekingGate {
+            async fn request(&self, _ask: &tools::Approval) -> ApprovalDecision {
+                let conn = self.pool.read().expect("read");
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT capability, target_pattern, status FROM approvals \
+                         WHERE session_id = 'sess-1' AND status = 'pending'",
+                    )
+                    .expect("prepare");
+                let rows = stmt
+                    .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                    .expect("query")
+                    .collect::<std::result::Result<Vec<_>, _>>()
+                    .expect("rows");
+                *self.seen.lock().expect("seen") = rows;
+                ApprovalDecision::AllowForRun
+            }
+
+            async fn present_review(&self, _prompt: &tools::ReviewPrompt) -> Option<String> {
+                None
+            }
+        }
+
+        let gate = PeekingGate {
+            pool: fixture.pool.clone(),
+            seen: std::sync::Mutex::new(Vec::new()),
         };
+        let ask = fixture.ask(&gate);
+        let session = ctx();
+        let grants = |_: Capability, _: Option<&str>| session.clone();
+        let context = context(&fixture, ask, &grants, "codex", Path::new("/w/session-1"));
         let outcome = resolve_approval(
             &context,
             &ApprovalRequest {
@@ -1451,29 +1659,43 @@ mod tests {
             },
         )
         .await;
-        assert!(answerer.await.expect("answerer"), "no question was raised");
+
+        assert_eq!(
+            *gate.seen.lock().expect("seen"),
+            vec![("exec".to_string(), "cargo".to_string(), "pending".to_string())],
+            "the operator was asked before the question existed anywhere they could see it"
+        );
+        // And the row is closed by the answer, with the target it was asked
+        // about — not with '*', which would grant every command.
+        assert_eq!(
+            fixture.approvals(),
+            vec![(
+                "exec".to_string(),
+                "cargo".to_string(),
+                "decided".to_string(),
+                Some("allow_for_run".to_string())
+            )]
+        );
         assert_eq!(outcome.decision, "approved_for_session");
-        assert!(!outcome.persist_grant);
+        // The suspension owns both timeline entries; the caller appends none.
+        assert!(outcome.events.is_empty());
+        assert_eq!(
+            fixture.event_kinds(),
+            vec!["approval_requested".to_string(), "approval_decided".to_string()],
+            "one question and one decision, each written once"
+        );
     }
 
     #[tokio::test]
     async fn an_unanswered_request_is_denied_rather_than_left_blocking() {
-        let registry = InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsunanswered");
+        // What `InteractionGate` returns when nobody answers inside the budget.
+        let gate = ScriptedGate::answering(ApprovalDecision::Deny);
+        let ask = fixture.ask(&gate);
         let session = ctx();
-        let context = ApprovalContext {
-            session: &|_| session.clone(),
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "codex",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            timeout: Duration::from_millis(80),
-        };
+        let grants = |_: Capability, _: Option<&str>| session.clone();
+        let context = context(&fixture, ask, &grants, "codex", Path::new("/w/session-1"));
         let outcome = resolve_approval(
             &context,
             &ApprovalRequest {
@@ -1487,6 +1709,7 @@ mod tests {
             outcome.decision, "denied",
             "an unanswered approval must reach the CLI as a refusal, not as silence"
         );
+        assert_eq!(gate.asked(), vec![Capability::FsWrite]);
     }
 
     #[test]
@@ -1685,27 +1908,23 @@ mod tests {
     /// the CLI to RUN COMMANDS.
     #[tokio::test]
     async fn a_standing_write_permission_does_not_authorize_a_command() {
-        let registry = InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let per_capability = |capability: Capability| pep::SessionCtx {
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsstandingcodex");
+        // Nobody answers, so an ASKED question ends 'denied' — which is how the
+        // test tells "allowed by the grant" from "had to ask".
+        let gate = ScriptedGate::answering(ApprovalDecision::Deny);
+        let ask = fixture.ask(&gate);
+        let per_capability = |capability: Capability, _: Option<&str>| pep::SessionCtx {
             allowlisted: capability == Capability::FsWrite,
             ..ctx()
         };
-        let context = ApprovalContext {
-            session: &per_capability,
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "codex",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            // Nobody answers, so an ASKED question ends 'denied' — which is how
-            // the test tells "allowed by the grant" from "had to ask".
-            timeout: Duration::from_millis(60),
-        };
+        let context = context(
+            &fixture,
+            ask,
+            &per_capability,
+            "codex",
+            Path::new("/w/session-1"),
+        );
 
         let write = resolve_approval(
             &context,
@@ -1744,27 +1963,23 @@ mod tests {
     /// standing in for the whole policy.
     #[tokio::test]
     async fn a_standing_claude_write_grant_does_not_authorize_a_command() {
-        let registry = InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let per_capability = |capability: Capability| pep::SessionCtx {
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsstandingclaude");
+        // Nobody answers, so an ASKED question ends 'denied' — which is how the
+        // test tells "allowed by the grant" from "had to ask".
+        let gate = ScriptedGate::answering(ApprovalDecision::Deny);
+        let ask = fixture.ask(&gate);
+        let per_capability = |capability: Capability, _: Option<&str>| pep::SessionCtx {
             allowlisted: capability == Capability::FsWrite,
             ..ctx()
         };
-        let context = ApprovalContext {
-            session: &per_capability,
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "claude-code",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            // Nobody answers, so an ASKED question ends 'denied' — which is how
-            // the test tells "allowed by the grant" from "had to ask".
-            timeout: Duration::from_millis(60),
-        };
+        let context = context(
+            &fixture,
+            ask,
+            &per_capability,
+            "claude-code",
+            Path::new("/w/session-1"),
+        );
 
         let write = resolve_approval(
             &context,
@@ -1798,25 +2013,16 @@ mod tests {
     /// before any capability is guessed at, and the refusal says why.
     #[tokio::test]
     async fn an_engine_without_a_dialect_decides_nothing() {
-        let registry = InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        let _guard = cs_paths::test_data_dir_guard();
+        let fixture = Fixture::open("wsnodialect");
+        let gate = ScriptedGate::answering(ApprovalDecision::AllowOnce);
+        let ask = fixture.ask(&gate);
         let session = pep::SessionCtx {
             allowlisted: true,
             ..ctx()
         };
-        let context = ApprovalContext {
-            session: &|_| session.clone(),
-            session_id: "session-1",
-            run_id: "run-1",
-            parent_run_id: None,
-            engine_id: "gemini-cli",
-            worktree: Path::new("/w/session-1"),
-            registry: &registry,
-            manager: None,
-            progress: &progress,
-            progress_scope: "code-studio",
-            timeout: Duration::from_secs(30),
-        };
+        let grants = |_: Capability, _: Option<&str>| session.clone();
+        let context = context(&fixture, ask, &grants, "gemini-cli", Path::new("/w/session-1"));
         let outcome = resolve_approval(
             &context,
             &ApprovalRequest {

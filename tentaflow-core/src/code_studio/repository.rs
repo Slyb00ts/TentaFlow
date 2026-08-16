@@ -33,6 +33,40 @@ const WORKSPACE_COLS: &str = "id, org_id, owner_user_id, name, slug, node_id, ex
      ssh_host_fingerprint, default_branch, target_branch, autonomy_ceiling, egress_policy, \
      index_enabled, quota_disk_bytes, quota_sessions, status, status_detail, created_at, updated_at";
 
+/// Programs a new workspace may run under `core.exec` without asking anyone.
+///
+/// Without a seed the table starts empty, and an empty allowlist makes the
+/// `autonomous` mode ask about `pwd` — a mode that asks about everything is a
+/// mode nobody uses. The line is drawn where Codex draws it (`is_safe_command`)
+/// and then pulled TIGHTER, because our grant grammar and its check are not the
+/// same shape: `pep::Target::Program` names argv[0] and nothing else, so a
+/// pattern cannot say "this program with these arguments". Only the programs
+/// Codex treats as safe REGARDLESS of their arguments can be expressed here at
+/// all.
+///
+/// Everything Codex admits conditionally is therefore absent, and each absence
+/// is an argument that cannot be checked:
+///   * `git` — safe for `status|log|diff|show|branch`, and a seeded `git` would
+///     equally cover `git push`. Git belongs to the broker anyway (§11.1);
+///   * `find` — `-exec`, `-delete` and `-fprintf` execute and write;
+///   * `rg` — `--pre` runs a command per match;
+///   * `base64` — `-o` writes a file;
+///   * `sed` — safe only in the exact shape `sed -n <N,M>p`.
+///
+/// `cd` is absent for a different reason: `core.exec` runs an argv through
+/// `execve`, where `cd` is a shell builtin and not a program. A command's
+/// directory is `ExecRequest::cwd_rel`, so seeding it would grant nothing.
+///
+/// Nothing here writes, and nothing here opens a socket. An operator who wants
+/// more adds it as a standing grant from the workspace's permission list
+/// (`add_allowlist_entry`), which is the same table this seeds — so widening is
+/// a recorded, revocable admin decision rather than an edit to this list.
+const DEFAULT_EXEC_ALLOWLIST: &[&str] = &[
+    "cat", "cut", "echo", "expr", "false", "grep", "head", "id", "ls", "nl", "numfmt", "paste",
+    "pwd", "rev", "seq", "stat", "tac", "tail", "tr", "true", "uname", "uniq", "wc", "which",
+    "whoami",
+];
+
 fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
         id: row.get(0)?,
@@ -111,6 +145,16 @@ pub fn create_workspace(db: &DbPool, new: &NewWorkspace) -> Result<WorkspaceReco
         params![new.id, new.owner_user_id],
     )
     .map_err(write_err)?;
+    for program in DEFAULT_EXEC_ALLOWLIST {
+        tx.execute(
+            "INSERT INTO code_workspace_allowlist \
+               (workspace_id, capability, pattern, created_by, created_at) \
+             VALUES (?1, 'exec', ?2, ?3, datetime('now'))",
+            params![new.id, program, new.owner_user_id],
+        )
+        .map_err(write_err)?;
+        sync_capture::capture_allowlist_entry(&tx, &new.id, "exec", program)?;
+    }
     // Both rows and both captures commit together: the org must never see a
     // workspace whose owner membership did not travel with it.
     sync_capture::capture_workspace(&tx, &new.id)?;
@@ -880,7 +924,8 @@ mod tests {
         let rowid: i64 = {
             let conn = db.read().expect("db");
             conn.query_row(
-                "SELECT id FROM code_workspace_allowlist WHERE workspace_id = 'ws-1'",
+                "SELECT id FROM code_workspace_allowlist \
+                 WHERE workspace_id = 'ws-1' AND capability = 'net_egress'",
                 [],
                 |row| row.get(0),
             )
@@ -907,6 +952,58 @@ mod tests {
         let (action, _) = latest_capture(&db, "core.code_workspace_allowlist", &resource_id)
             .expect("removal capture");
         assert_eq!(action, "delete");
+    }
+
+    /// A new workspace starts with the read-only programs already permitted, or
+    /// `autonomous` asks about `pwd` and is unusable. What it must NOT start
+    /// with is anything that writes, reaches the network, or whose safety
+    /// depends on arguments the grant grammar cannot see.
+    #[test]
+    fn a_new_workspace_starts_with_read_only_programs_permitted_and_nothing_else() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+
+        let seeded: Vec<(String, String)> = {
+            let conn = db.read().expect("db");
+            let mut stmt = conn
+                .prepare("SELECT capability, pattern FROM code_workspace_allowlist WHERE workspace_id = 'ws-1'")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+
+        assert!(
+            seeded.iter().all(|(cap, _)| cap == "exec"),
+            "only `exec` may be seeded: no standing grant is created for writes or the network"
+        );
+        let programs: Vec<&str> = seeded.iter().map(|(_, p)| p.as_str()).collect();
+        for expected in ["ls", "cat", "grep", "wc", "pwd"] {
+            assert!(programs.contains(&expected), "{expected} is not permitted");
+        }
+        // Every one of these is either a writer, a network client, or safe only
+        // for arguments a `Target::Program` pattern cannot constrain.
+        for refused in [
+            "git", "rg", "find", "sed", "base64", "sh", "bash", "cargo", "npm", "curl", "rm", "mv",
+            "*",
+        ] {
+            assert!(
+                !programs.contains(&refused),
+                "{refused} must not be permitted without a person deciding it"
+            );
+        }
+
+        // The seed replicates like any other standing grant, so a second node of
+        // the org sees the same permissions.
+        let resource_id = crate::sync::resource_id::composite_resource_id(&["ws-1", "exec", "ls"]);
+        let (action, fields) = latest_capture(&db, "core.code_workspace_allowlist", &resource_id)
+            .expect("the seeded grant must reach the outbox");
+        assert_eq!(action, "insert");
+        assert_eq!(text_field(&fields, "capability").as_deref(), Some("exec"));
+
+        // And it is a normal row: an operator can withdraw it.
+        assert!(remove_allowlist_entry(&db, "ws-1", "exec", "ls").unwrap());
     }
 
     #[test]

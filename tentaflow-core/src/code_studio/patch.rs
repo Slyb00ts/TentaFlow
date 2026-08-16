@@ -219,48 +219,44 @@ pub struct CommitRequest {
 
 const ZERO_OID: &str = "0000000000000000000000000000000000000000";
 
-/// Opens a patch set over the difference between `base_commit` and the current
-/// worktree.
-///
-/// The worktree is frozen into a tree object first (`snapshot_worktree`), so
-/// the review compares two immutable trees; an agent that keeps editing changes
-/// the next snapshot, never this one. Any still-open set of the SAME SCOPE is
-/// superseded — two live sets would both claim to describe the same directory —
-/// while a set of the other scope is left alone, because a merge under review
-/// and the session's own work are two different trees waiting for two different
-/// decisions. An ACCEPTED set is left alone too: it is waiting for its commit,
-/// and that commit no longer depends on the worktree at all.
-pub fn open_patch_set(
-    pool: &DbPool,
-    broker: &Broker,
-    session_id: &str,
-    run_id: Option<&str>,
-    base_commit: &str,
-    scope: &PatchScope,
-) -> Result<PatchSet> {
-    let handle = match scope {
-        PatchScope::Work => broker.session(session_id)?,
+/// The worktree a scope describes. A merge without its operation id is refused
+/// here rather than silently reviewed as the session's own work.
+fn worktree_handle(broker: &Broker, session_id: &str, scope: &PatchScope) -> Result<RepoHandle> {
+    match scope {
+        PatchScope::Work => broker.session(session_id),
         PatchScope::Merge { op_id } => {
             if op_id.is_empty() {
                 return Err(anyhow!(
                     "a merge patch set must name the merge operation it reviews"
                 ));
             }
-            broker.integration(session_id)?
+            broker.integration(session_id)
         }
-    };
-    let tree = broker.snapshot_worktree(&handle, base_commit)?;
-    let entries = broker.diff_name_status(&handle, base_commit, &tree)?;
+    }
+}
 
-    let snapshot: Vec<_> = broker.list_tree(&handle, &tree)?;
-    let base_tree: Vec<_> = broker.list_tree(&handle, base_commit)?;
+/// Everything the worktree currently differs from `base_commit` by, as
+/// undecided patch-file rows with their hunks.
+///
+/// The worktree is frozen into a tree object first (`snapshot_worktree`), so
+/// the whole scan compares two immutable trees; an agent that keeps editing
+/// changes the next snapshot, never this one.
+fn scan_worktree(
+    broker: &Broker,
+    handle: &RepoHandle,
+    base_commit: &str,
+) -> Result<Vec<PatchFile>> {
+    let tree = broker.snapshot_worktree(handle, base_commit)?;
+    let entries = broker.diff_name_status(handle, base_commit, &tree)?;
+
+    let snapshot: Vec<_> = broker.list_tree(handle, &tree)?;
+    let base_tree: Vec<_> = broker.list_tree(handle, base_commit)?;
     let find = |list: &[TreeEntry], path: &str| {
         list.iter()
             .find(|e| e.path == path)
             .map(|e| (e.mode.clone(), e.oid.clone()))
     };
 
-    let patch_set_id = uuid::Uuid::new_v4().to_string();
     let mut files: Vec<PatchFile> = Vec::new();
     for entry in &entries {
         validate_repo_path(&entry.path)?;
@@ -303,13 +299,13 @@ pub fn open_patch_set(
         let hunks = if change_kind == "delete" {
             Vec::new()
         } else {
-            let diff = broker.diff_patch(&handle, base_commit, &tree, &entry.path)?;
+            let diff = broker.diff_patch(handle, base_commit, &tree, &entry.path)?;
             split_hunks(&diff)
                 .into_iter()
                 .enumerate()
                 .map(|(idx, text)| -> Result<PatchHunk> {
                     let header = text.lines().next().unwrap_or_default().to_string();
-                    let content_ref = broker.hash_object(&handle, text.as_bytes())?;
+                    let content_ref = broker.hash_object(handle, text.as_bytes())?;
                     Ok(PatchHunk {
                         id: uuid::Uuid::new_v4().to_string(),
                         idx: idx as i64,
@@ -335,6 +331,111 @@ pub fn open_patch_set(
             hunks,
         });
     }
+    Ok(files)
+}
+
+/// Recomputes an undecided set against the worktree it describes, keeping its
+/// id and its frozen `base_commit`.
+///
+/// `record_edit` journals the effects that go THROUGH our tools. A vendor CLI
+/// driven by `delegate_cli` writes to the worktree with its own file calls, so
+/// nothing journals them and the set opened before the turn stays empty — the
+/// delegated work would reach a review with nothing in it. Rescanning is how
+/// that work becomes reviewable, and it has to keep the base: the base was
+/// frozen before the delegation started precisely so the set describes what the
+/// delegation changed rather than whatever the branch has drifted to since.
+///
+/// Only `pending` rows are recomputed. A file a person already accepted or
+/// rejected keeps that verdict and its `accepted_blob_sha` — §11.5 step 5 says
+/// a later divergence is the material of the NEXT set, not a reason to rewrite
+/// a decision — and a `conflicted` row is an unresolved review question, not an
+/// observation to refresh away. A pending row whose path no longer differs from
+/// the base is dropped: the change was undone before anyone looked at it.
+pub fn rescan_patch_set(pool: &DbPool, broker: &Broker, patch_set_id: &str) -> Result<PatchSet> {
+    let set = load_patch_set(pool, patch_set_id)?;
+    if !matches!(set.status.as_str(), "open" | "in_review" | "conflicted") {
+        return Err(anyhow!(
+            "patch set {patch_set_id} is '{}' and is not open to new material; open a new one",
+            set.status
+        ));
+    }
+    let handle = worktree_handle(broker, &set.session_id, &set.scope)?;
+    let scanned = scan_worktree(broker, &handle, &set.base_commit)?;
+
+    let decided: Vec<&PatchFile> = set.files.iter().filter(|f| f.status != "pending").collect();
+
+    let mut conn = pool
+        .write()
+        .map_err(|e| anyhow!("workspace db write: {e}"))?;
+    let tx = conn.transaction()?;
+    tx.execute(
+        "DELETE FROM patch_files WHERE patch_set_id = ?1 AND status = 'pending'",
+        rusqlite::params![patch_set_id],
+    )?;
+    for file in &scanned {
+        if decided.iter().any(|kept| kept.path == file.path) {
+            continue;
+        }
+        tx.execute(
+            "INSERT INTO patch_files (id, patch_set_id, path, change_kind, old_path, \
+              patch_base_blob_sha, current_blob_sha, mode, status) \
+             VALUES (?1, ?2, ?3, ?4, NULL, ?5, ?6, ?7, 'pending')",
+            rusqlite::params![
+                file.id,
+                patch_set_id,
+                file.path,
+                file.change_kind,
+                file.patch_base_blob_sha,
+                file.current_blob_sha,
+                file.mode,
+            ],
+        )?;
+        for hunk in &file.hunks {
+            tx.execute(
+                "INSERT INTO patch_hunks (id, patch_file_id, idx, header, content_ref, status) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, 'pending')",
+                rusqlite::params![hunk.id, file.id, hunk.idx, hunk.header, hunk.content_ref],
+            )?;
+        }
+    }
+    // A set nobody has decided anything in stays `open`; one that already
+    // carries verdicts is re-derived, because dropping and adding pending rows
+    // can be what completes or reopens it.
+    if set.status != "open" {
+        let status = set_status(&tx, patch_set_id)?;
+        tx.execute(
+            "UPDATE patch_sets SET status = ?2 WHERE id = ?1",
+            rusqlite::params![patch_set_id, status],
+        )?;
+    }
+    tx.commit()?;
+    drop(conn);
+
+    load_patch_set(pool, patch_set_id)
+}
+
+/// Opens a patch set over the difference between `base_commit` and the current
+/// worktree.
+///
+/// The worktree is frozen into a tree object first (`snapshot_worktree`), so
+/// the review compares two immutable trees; an agent that keeps editing changes
+/// the next snapshot, never this one. Any still-open set of the SAME SCOPE is
+/// superseded — two live sets would both claim to describe the same directory —
+/// while a set of the other scope is left alone, because a merge under review
+/// and the session's own work are two different trees waiting for two different
+/// decisions. An ACCEPTED set is left alone too: it is waiting for its commit,
+/// and that commit no longer depends on the worktree at all.
+pub fn open_patch_set(
+    pool: &DbPool,
+    broker: &Broker,
+    session_id: &str,
+    run_id: Option<&str>,
+    base_commit: &str,
+    scope: &PatchScope,
+) -> Result<PatchSet> {
+    let handle = worktree_handle(broker, session_id, scope)?;
+    let files = scan_worktree(broker, &handle, base_commit)?;
+    let patch_set_id = uuid::Uuid::new_v4().to_string();
 
     let mut conn = pool
         .write()
@@ -2238,6 +2339,156 @@ mod tests {
             vec![target_before, session_commit.commit_oid],
             "a merge commit must record both sides"
         );
+    }
+
+    // ----- work that never went through our tools ----------------------------
+
+    /// D5: a delegated turn writes to the worktree with the vendor's own file
+    /// calls, so `record_edit` never sees it. The set opened before the turn
+    /// therefore describes nothing, and the review it feeds is empty while
+    /// `git diff` shows the change. Rescanning on the SAME frozen base is what
+    /// turns that work into something a person can accept hunk by hunk.
+    #[test]
+    fn work_written_past_our_tools_becomes_reviewable_per_hunk_after_a_rescan() {
+        require_git();
+        let original: String = (1..=20).map(|n| format!("{n}\n")).collect();
+        let fx = fixture(&[("f.txt", &original)]);
+
+        // The set is opened BEFORE the turn, on the pre-delegation HEAD.
+        let opened = fx.open();
+        assert!(
+            opened.files.is_empty(),
+            "nothing has been written yet, so the set starts empty"
+        );
+
+        // The delegation writes. Nothing journals it — this is the vendor's own
+        // file call, not `fs_write`.
+        let edited: String = (1..=20)
+            .map(|n| match n {
+                2 => "TWO\n".to_string(),
+                19 => "NINETEEN\n".to_string(),
+                _ => format!("{n}\n"),
+            })
+            .collect();
+        fx.write("f.txt", &edited);
+        fx.write("new.txt", "fresh\n");
+
+        // Without the rescan this is what the review still sees.
+        assert!(load_patch_set(&fx.pool, &opened.id).unwrap().files.is_empty());
+
+        let refreshed = rescan_patch_set(&fx.pool, &fx.broker, &opened.id).unwrap();
+        assert_eq!(refreshed.id, opened.id, "the set keeps its identity");
+        assert_eq!(
+            refreshed.base_commit, opened.base_commit,
+            "the base was frozen before the turn and must stay frozen"
+        );
+        assert_eq!(refreshed.files.len(), 2);
+        let touched = refreshed.file("f.txt").expect("the edited file");
+        assert_eq!(touched.change_kind, "modify");
+        assert_eq!(touched.hunks.len(), 2, "two distant edits, two hunks");
+        assert_eq!(
+            refreshed.file("new.txt").expect("the new file").change_kind,
+            "add"
+        );
+
+        // And it is decidable per hunk, which is the whole point.
+        let outcome = decide(
+            &fx.pool,
+            &fx.broker,
+            &refreshed.id,
+            &Decisions {
+                decided_by: "u-1".into(),
+                files: vec![
+                    ("f.txt".into(), FileVerdict::Hunks(vec![1])),
+                    ("new.txt".into(), FileVerdict::Reject),
+                ],
+            },
+        )
+        .unwrap();
+        assert_eq!(outcome.status, "partially_accepted");
+
+        let expected: String = (1..=20)
+            .map(|n| {
+                if n == 19 {
+                    "NINETEEN\n".to_string()
+                } else {
+                    format!("{n}\n")
+                }
+            })
+            .collect();
+        let stored = load_patch_set(&fx.pool, &refreshed.id).unwrap();
+        assert_eq!(
+            stored.file("f.txt").unwrap().accepted_blob_sha,
+            Some(fx.blob(&expected))
+        );
+
+        // The commit is built from the accepted blob, so the reviewed bytes are
+        // the committed bytes.
+        let head = fx
+            .broker
+            .read_ref(&fx.broker.reference(), "refs/heads/cs/u/s1")
+            .unwrap()
+            .unwrap();
+        let committed = fx.commit(&refreshed.id, Some(&head)).unwrap();
+        assert_eq!(
+            fx.tree_blob(&committed.commit_oid, "f.txt"),
+            Some(fx.blob(&expected))
+        );
+        assert_eq!(fx.tree_blob(&committed.commit_oid, "new.txt"), None);
+    }
+
+    /// A rescan is an observation of undecided material, never a rewrite of a
+    /// verdict: §11.5 step 5 makes a later divergence the NEXT set's business.
+    /// A pending row whose change was undone before anyone looked at it goes
+    /// away instead of lingering as a phantom file.
+    #[test]
+    fn a_rescan_keeps_decisions_and_drops_a_change_that_was_undone() {
+        require_git();
+        let fx = fixture(&[("kept.txt", "base\n"), ("undone.txt", "base\n")]);
+        fx.write("kept.txt", "reviewed\n");
+        fx.write("undone.txt", "scratch\n");
+        let set = fx.open();
+        assert_eq!(set.files.len(), 2);
+
+        decide(
+            &fx.pool,
+            &fx.broker,
+            &set.id,
+            &Decisions {
+                decided_by: "u-1".into(),
+                files: vec![("kept.txt".into(), FileVerdict::Accept)],
+            },
+        )
+        .unwrap();
+
+        // The turn keeps working: it rewrites the accepted file and undoes the
+        // other one.
+        fx.write("kept.txt", "moved on\n");
+        fx.write("undone.txt", "base\n");
+
+        let refreshed = rescan_patch_set(&fx.pool, &fx.broker, &set.id).unwrap();
+        let kept = refreshed.file("kept.txt").expect("the decided file");
+        assert_eq!(kept.status, "accepted");
+        assert_eq!(
+            kept.accepted_blob_sha,
+            Some(fx.blob("reviewed\n")),
+            "a rescan must not rewrite what a person already accepted"
+        );
+        assert!(
+            refreshed.file("undone.txt").is_none(),
+            "a pending change that was undone is no longer material"
+        );
+        assert_eq!(refreshed.status, "accepted");
+
+        // A set that has been consumed is not open to new material at all.
+        let head = fx
+            .broker
+            .read_ref(&fx.broker.reference(), "refs/heads/cs/u/s1")
+            .unwrap()
+            .unwrap();
+        let committed = fx.commit(&set.id, Some(&head)).unwrap();
+        mark_consumed(&fx.pool, &set.id, &committed).unwrap();
+        assert!(rescan_patch_set(&fx.pool, &fx.broker, &set.id).is_err());
     }
 
     // ----- pure helpers ------------------------------------------------------

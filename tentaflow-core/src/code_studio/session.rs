@@ -18,6 +18,7 @@ use tracing::warn;
 
 use super::git_broker::Broker;
 use super::models::{AutonomyMode, WorkspaceRecord, WorkspaceRole};
+use super::sandbox;
 use super::workspace_db;
 use crate::db::DbPool;
 
@@ -298,6 +299,22 @@ pub fn close_session(workspace_id: &str, pool: &DbPool, session_id: &str) -> Res
             "session has {} unresolved merge worktree(s); resolve or abandon the merge first",
             held.len()
         ));
+    }
+
+    // The shared sandbox of a session lives as long as the session does (§7.2),
+    // so this is where it dies — before the worktree it was copied from goes,
+    // because an overlay mount whose lower directory has been removed cannot be
+    // taken down cleanly afterwards. A teardown failure is reported and does not
+    // abort the close: a session held open by a container that refuses to die is
+    // worse than a container an operator has to reap.
+    match sandbox::release_session_sandboxes(
+        &super::paths::workspace_dir(workspace_id)?,
+        pool,
+        session_id,
+    ) {
+        Ok(0) => {}
+        Ok(count) => tracing::debug!(session_id, count, "shared sandboxes destroyed with session"),
+        Err(error) => warn!(session_id, "shared sandbox not destroyed at close: {error:#}"),
     }
 
     let broker = Broker::for_workspace(workspace_id)?;

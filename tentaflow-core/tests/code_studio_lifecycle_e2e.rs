@@ -43,7 +43,9 @@ use tentaflow_core::code_studio::operations::{
     self, OpKind, OperationInput, OperationRequest, OperationStatus, OriginKind, Postcondition,
     Precondition, SessionProbe,
 };
+use tentaflow_core::code_studio::patch::{self, PatchScope};
 use tentaflow_core::code_studio::pep::Capability;
+use tentaflow_core::code_studio::tools;
 use tentaflow_core::code_studio::{artifacts, paths, repository, workspace_db};
 use tentaflow_core::db::DbPool;
 use tentaflow_core::dispatch::code_studio::code_studio_dispatch;
@@ -1526,5 +1528,139 @@ async fn a_turn_reaches_the_timeline_even_when_no_run_starts() {
             .iter()
             .any(|json| json.contains("no run started")),
         "a failed start left no trace at all; the timeline holds: {messages:?}"
+    );
+}
+
+// =============================================================================
+// 6. Work a delegated CLI wrote past our tools
+// =============================================================================
+
+/// `delegate_cli` opens a patch set BEFORE the vendor CLI starts, so the set's
+/// base is the pre-delegation HEAD and a review sees exactly what the turn
+/// changed. What nothing did was FILL it: the vendor writes with its own file
+/// calls, so no `fs_write` and no `record_work_edit` ever ran, and the set
+/// reached the review with no files in it while `GitDiffRequest` showed the
+/// real difference. Delegated work was outside per-hunk review entirely.
+///
+/// The vendor process is the one part of that path a build machine cannot run,
+/// so what is reproduced here is its EFFECT — bytes appearing in the session
+/// worktree with no tool call behind them. Everything after that is the real
+/// path: the recomputation the block now performs when the turn ends, the wire
+/// read the dashboard does, and the per-hunk decision.
+#[tokio::test]
+async fn work_a_delegation_wrote_straight_to_disk_reaches_the_review() {
+    let Some(fx) = fixture().await else { return };
+    let pool = fx.pool();
+    let broker = Broker::for_workspace(&fx.workspace_id).expect("workspace broker");
+
+    // What the block does before it starts the CLI: freeze the base.
+    let opened = tools::current_patch_set(&pool, &broker, &fx.session_id, &PatchScope::Work)
+        .expect("open the pre-delegation patch set");
+    assert!(
+        opened.files.is_empty(),
+        "the turn has not run yet, so there is nothing to review"
+    );
+
+    // The turn itself.
+    std::fs::write(fx.worktree().join(REPO_FILE), edited_content()).expect("the vendor's write");
+
+    // This is what a reviewer used to be shown for the whole delegation.
+    let response = ok(
+        &fx.ctx,
+        CodeStudioPayload::PatchSetGetRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            patch_set_id: opened.id.clone(),
+        },
+    )
+    .await;
+    let CodeStudioPayload::PatchSetGetResponse { files, .. } = response else {
+        panic!("expected PatchSetGetResponse");
+    };
+    assert!(
+        files.is_empty(),
+        "nothing has journalled the vendor's write yet, so the set is still empty"
+    );
+
+    // What the block now does when the turn ends — same set, same frozen base.
+    let refreshed =
+        patch::rescan_patch_set(&pool, &broker, &opened.id).expect("settle the delegation's work");
+    assert_eq!(refreshed.id, opened.id);
+    assert_eq!(
+        refreshed.base_commit, opened.base_commit,
+        "the base is frozen before the turn so the set describes the turn, not the branch"
+    );
+
+    let response = ok(
+        &fx.ctx,
+        CodeStudioPayload::PatchSetGetRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            patch_set_id: opened.id.clone(),
+        },
+    )
+    .await;
+    let CodeStudioPayload::PatchSetGetResponse { files, .. } = response else {
+        panic!("expected PatchSetGetResponse");
+    };
+    assert_eq!(files.len(), 1, "the review shows {files:?}");
+    let file = &files[0];
+    assert_eq!(file.path, REPO_FILE);
+    assert!(
+        file.hunks.len() >= 2,
+        "the delegation's change has to be reviewable per hunk, but the set has {} hunk(s)",
+        file.hunks.len()
+    );
+
+    let accepted = file
+        .hunks
+        .iter()
+        .find(|hunk| hunk.content.contains("line 2 CHANGED"))
+        .expect("the first edit has its own hunk");
+    let rejected = file
+        .hunks
+        .iter()
+        .find(|hunk| hunk.content.contains("line 23 CHANGED"))
+        .expect("the second edit has its own hunk");
+
+    let response = ok(
+        &fx.ctx,
+        CodeStudioPayload::PatchDecideRequest {
+            workspace_id: fx.workspace_id.clone(),
+            session_id: fx.session_id.clone(),
+            patch_set_id: opened.id.clone(),
+            files: vec![PatchFileDecision {
+                patch_file_id: file.patch_file_id.clone(),
+                decision: "accept".into(),
+                note: None,
+                hunks: vec![
+                    PatchHunkDecision {
+                        patch_hunk_id: accepted.patch_hunk_id.clone(),
+                        decision: "accept".into(),
+                    },
+                    PatchHunkDecision {
+                        patch_hunk_id: rejected.patch_hunk_id.clone(),
+                        decision: "reject".into(),
+                    },
+                ],
+            }],
+        },
+    )
+    .await;
+    let CodeStudioPayload::PatchDecideResponse {
+        status,
+        conflicted_paths,
+        ..
+    } = response
+    else {
+        panic!("expected PatchDecideResponse");
+    };
+    assert!(
+        conflicted_paths.is_empty(),
+        "the partial acceptance did not compose: {conflicted_paths:?}"
+    );
+    assert_eq!(
+        status, "partially_accepted",
+        "delegated work must be decidable hunk by hunk, like any other change"
     );
 }

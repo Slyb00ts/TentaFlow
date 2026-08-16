@@ -37,7 +37,7 @@ const MAX_OPEN_POOLS: usize = 16;
 const IDLE_CLOSE: Duration = Duration::from_secs(600);
 
 /// Highest runtime schema version this binary knows.
-pub const LATEST_SCHEMA_VERSION: i64 = 8;
+pub const LATEST_SCHEMA_VERSION: i64 = 9;
 
 struct Entry {
     pool: DbPool,
@@ -224,6 +224,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (6, WORKSPACE_SCHEMA_V6),
     (7, WORKSPACE_SCHEMA_V7),
     (8, WORKSPACE_SCHEMA_V8),
+    (9, WORKSPACE_SCHEMA_V9),
 ];
 
 const WORKSPACE_SCHEMA_V1: &str = r#"
@@ -596,6 +597,24 @@ CREATE TABLE workspace_reservation (
 /// working worktree.
 const WORKSPACE_SCHEMA_V8: &str = r#"
 ALTER TABLE worktrees ADD COLUMN conflict_paths TEXT;
+"#;
+
+/// What the turn cost, where the turn is settled.
+///
+/// A delegation on a self-authenticated engine is billed by the VENDOR, and the
+/// vendor states the amount per turn (`total_cost_usd`). We parsed it, put it in
+/// the block's output variable and then dropped it: the run row kept tokens and
+/// a model, so the only durable record of an organization's spend was a flow
+/// variable that lives as long as the execution.
+///
+/// Nullable REAL, and never computed here. On the metered path there is no
+/// price feed on the node, so a number derived from tokens would look measured
+/// while being a guess — NULL there means "nobody stated a cost", which is the
+/// truth, and it is also what tells the two provenances apart on the row
+/// (`usage.source` is already on the timeline event). USD because that is the
+/// currency the provider states; converting it would be inventing a rate.
+const WORKSPACE_SCHEMA_V9: &str = r#"
+ALTER TABLE session_runs ADD COLUMN cost_usd REAL;
 "#;
 
 /// Bytes this workspace may occupy, as reserved on this node. `None` means no

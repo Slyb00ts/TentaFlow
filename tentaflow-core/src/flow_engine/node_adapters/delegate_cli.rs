@@ -61,11 +61,11 @@ use crate::code_studio::cli_adapter::{
 };
 use crate::code_studio::cli_bridge::{
     self, ApprovalContext, BridgeEvent, CliBridge, CliInstance, OpenCliInstance,
-    ProviderReportedUsage, TurnState, APPROVAL_TIMEOUT,
+    ProviderReportedUsage, TurnState,
 };
 use crate::code_studio::events::{self, EventPayload, SessionEvent};
 use crate::code_studio::models::EgressEnforcement;
-use crate::code_studio::patch::PatchScope;
+use crate::code_studio::patch::{self, PatchScope, PatchSet};
 use crate::code_studio::pep::{self, AskKind, Capability};
 use crate::code_studio::tools::{self, Bound, ToolCallCtx};
 use crate::code_studio::{paths as cs_paths, redact};
@@ -264,15 +264,105 @@ impl AdapterEventSink for TimelineSink {
 }
 
 // =============================================================================
+// Releasing what a cancelled delegation would otherwise keep
+// =============================================================================
+
+/// One release action, run either on the normal path or from `Drop`.
+///
+/// A node's future is DROPPED when the executor stops waiting on it — a
+/// deadline, a cancelled flow — and a dropped future runs nothing after its
+/// current `await`. Without this, every step 8 of the header was skipped: the
+/// `cli` run row stayed `running` forever, the `cli_instances` row stayed
+/// `ready`, the bridge session stayed open, and the `claude`/`codex` process
+/// kept running, holding a worktree and a provider credential.
+///
+/// `Drop` cannot await, and that is what decides the shape here. The releases
+/// that are synchronous — revoking the run's ticket, aborting the adapter task,
+/// settling the run row in an already-open SQLite pool — happen inline. The one
+/// that needs the network, telling the bridge to close the instance (which is
+/// what reaps the vendor process), is handed to a detached task; when there is
+/// no runtime left to spawn on, the row is marked `failed` synchronously so the
+/// startup reaper is still the backstop.
+///
+/// Leaving it ALL to `reap_orphaned_instances` was the other option and was
+/// rejected: that reconciliation runs at Core START, so a process orphaned by
+/// one cancelled node would survive for the rest of this Core's lifetime. It
+/// stays as the backstop for what a crash orphans, which is what it is for.
+struct Release(Option<Box<dyn FnOnce() + Send>>);
+
+impl Release {
+    fn new(action: impl FnOnce() + Send + 'static) -> Self {
+        Self(Some(Box::new(action)))
+    }
+
+    /// Cancels the release: the normal path is about to do it itself, with the
+    /// outcome it alone knows.
+    fn disarm(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for Release {
+    fn drop(&mut self) {
+        if let Some(action) = self.0.take() {
+            action();
+        }
+    }
+}
+
+/// Closes an abandoned CLI instance without an `await` in `Drop`.
+fn close_abandoned_instance(
+    bridge: CliBridge,
+    pool: DbPool,
+    instance_id: String,
+    bridge_session_id: String,
+) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        // Core is going down with no runtime to spawn on. The row must still
+        // stop claiming a live process, and the bridge kills what it supervises
+        // at ITS own startup.
+        if let Err(error) = cli_bridge::set_instance_status(&pool, &instance_id, "failed") {
+            tracing::warn!("delegate_cli: abandoned instance status not recorded: {error:#}");
+        }
+        return;
+    };
+    handle.spawn(async move {
+        match bridge.close(&pool, &instance_id, &bridge_session_id).await {
+            Ok(state) => tracing::info!(
+                instance = %instance_id,
+                %state,
+                "delegate_cli: closed the CLI instance of a cancelled delegation"
+            ),
+            Err(error) => {
+                tracing::warn!(
+                    instance = %instance_id,
+                    "delegate_cli: the abandoned CLI instance did not close: {error:#}"
+                );
+                if let Err(error) = cli_bridge::set_instance_status(&pool, &instance_id, "failed") {
+                    tracing::warn!("delegate_cli: instance status not recorded: {error:#}");
+                }
+            }
+        }
+    });
+}
+
+// =============================================================================
 // Run bookkeeping
 // =============================================================================
 
+/// Opens the `cli` run row and hands back the guard that closes it if this
+/// delegation is abandoned.
+///
+/// The two are returned together on purpose: a caller cannot open a run row and
+/// forget the cancellation path, which is exactly how a `cli` run stayed
+/// `running` for the life of the process — and with it `sessions.status`.
 fn open_run(
     pool: &DbPool,
     session_id: &str,
     run_id: &str,
     parent_run_id: Option<&str>,
-) -> Result<()> {
+    model: &str,
+) -> Result<Release> {
     let mut conn = pool
         .write()
         .map_err(|e| anyhow!("workspace db write: {e}"))?;
@@ -303,7 +393,24 @@ fn open_run(
         .with_run(run_id.to_string()),
     )?;
     tx.commit()?;
-    Ok(())
+    drop(conn);
+    Ok(Release::new({
+        let pool = pool.clone();
+        let session_id = session_id.to_string();
+        let run_id = run_id.to_string();
+        let model = model.to_string();
+        move || {
+            finish_run(
+                &pool,
+                &session_id,
+                &run_id,
+                "cancelled",
+                Some("the flow stopped waiting for this delegation, so the turn was abandoned"),
+                None,
+                &model,
+            )
+        }
+    }))
 }
 
 /// Settles the run row and its timeline entry together. Called on every path,
@@ -314,6 +421,11 @@ fn open_run(
 /// writes the VENDOR's numbers into the same columns the metered path writes —
 /// `usage.source`, the timeline's `cli_delegation_authorized` event and the
 /// block's own output are what keep the two provenances apart.
+///
+/// `cost_usd` is the amount the PROVIDER stated for the turn, or NULL. It is
+/// never derived from tokens: there is no price feed on the node, so a computed
+/// figure would look measured while being a guess, and NULL is the honest way
+/// to say nobody quoted a price.
 ///
 /// `usage` is `None` for a delegation that died before a turn was driven at all
 /// (no adapter, no CLI, nothing spent); the columns then keep their zero rather
@@ -335,13 +447,15 @@ fn finish_run(
         let tx = conn.transaction()?;
         tx.execute(
             "UPDATE session_runs SET status = ?2, finished_at = datetime('now'), \
-                prompt_tokens = ?3, completion_tokens = ?4, model = ?5 WHERE run_id = ?1",
+                prompt_tokens = ?3, completion_tokens = ?4, model = ?5, cost_usd = ?6 \
+             WHERE run_id = ?1",
             rusqlite::params![
                 run_id,
                 status,
                 usage.map(|usage| usage.input_tokens).unwrap_or(0) as i64,
                 usage.map(|usage| usage.output_tokens).unwrap_or(0) as i64,
-                model
+                model,
+                usage.and_then(|usage| usage.cost_usd),
             ],
         )?;
         events::append_in_tx(
@@ -708,8 +822,7 @@ async fn authorize_delegation(
     };
 
     let decision = tools::suspend_for_operator(
-        call_ctx,
-        bound,
+        &call_ctx.operator_ask(bound),
         Capability::CliDelegate,
         Some(engine_id),
         &summary,
@@ -722,8 +835,9 @@ async fn authorize_delegation(
         ));
     }
     tools::persist_grant(
-        call_ctx,
-        bound,
+        call_ctx.main_db,
+        &bound.workspace.id,
+        call_ctx.user_id,
         Capability::CliDelegate,
         Some(engine_id),
         decision,
@@ -979,11 +1093,14 @@ impl NodeAdapter for DelegateCliNodeAdapter {
         )?;
 
         let run_id = uuid::Uuid::new_v4().to_string();
-        open_run(
+        // The row opened here is settled below with what actually happened; the
+        // guard closes it if this future never gets that far.
+        let settle_if_cancelled = open_run(
             &bound.pool,
             &bound.session.id,
             &run_id,
             (!parent_run_id.is_empty()).then_some(parent_run_id.as_str()),
+            &config.model,
         )?;
 
         let outcome = delegate(
@@ -998,6 +1115,17 @@ impl NodeAdapter for DelegateCliNodeAdapter {
             ctx,
         )
         .await;
+        settle_if_cancelled.disarm();
+
+        // Step 8b — the vendor writes to the worktree with its OWN file calls,
+        // so nothing went through `fs_write` and nothing was journalled into
+        // the set opened above: without this it would reach the review empty
+        // while `git diff` showed the change. Recomputing it here, on the base
+        // frozen before the turn, is what makes the delegated work reviewable
+        // per hunk. It runs before the outcome is branched on, deliberately: a
+        // turn that died halfway still left files on disk, and those are
+        // exactly the ones a person has to be able to look at.
+        let refreshed = patch::rescan_patch_set(&bound.pool, &bound.broker, &patch_set.id);
 
         match outcome {
             Ok(report) => {
@@ -1011,7 +1139,22 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     Some(&report.usage),
                     &config.model,
                 );
+                // What the turn spent belongs to the FLOW's accounting too, not
+                // only to the session run: `flow_executions` and the agent run
+                // row are settled from this sink, and a delegation that never
+                // reported into it left both reading zero for a turn that had
+                // just spent an organization's tokens.
+                ctx.usage_sink.record(
+                    node.id.clone(),
+                    crate::flow_engine::envelope::TokenUsage {
+                        prompt_tokens: report.usage.input_tokens,
+                        completion_tokens: report.usage.output_tokens,
+                        total_tokens: report.usage.total_tokens(),
+                    },
+                );
+                ctx.usage_sink.record_model(config.model.clone());
                 if !completed {
+                    warn_unreviewable(&refreshed, &patch_set.id);
                     // The usage travels with the refusal: an operator reading a
                     // failed delegation needs to know what it already spent, and
                     // who says so.
@@ -1028,6 +1171,17 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                         report.usage.source
                     ));
                 }
+                // A turn that finished and whose changes cannot be reviewed is
+                // not a turn that succeeded: reporting it as one would hand the
+                // flow a patch set id pointing at material nobody can see.
+                let patch_set = refreshed.map_err(|error| {
+                    anyhow!(
+                        "delegate_cli node '{}': the delegation to '{}' finished, but its \
+                         worktree could not be turned into a reviewable patch set: {error:#}",
+                        node.id,
+                        config.engine
+                    )
+                })?;
                 let mut out: FlowEnvelope = (**envelope).clone();
                 out.variables.insert(
                     config.output_variable.clone(),
@@ -1047,9 +1201,24 @@ impl NodeAdapter for DelegateCliNodeAdapter {
                     None,
                     &config.model,
                 );
+                warn_unreviewable(&refreshed, &patch_set.id);
                 Err(error)
             }
         }
+    }
+}
+
+/// Says so when a half-finished turn's changes could not be made reviewable.
+/// The delegation's own failure is the fact the caller is owed, so this cannot
+/// replace it — but partial work silently missing from the review is exactly
+/// the state D5 was about, and it must not be invisible.
+fn warn_unreviewable(refreshed: &Result<PatchSet>, patch_set_id: &str) {
+    if let Err(error) = refreshed {
+        tracing::warn!(
+            patch_set_id,
+            "delegate_cli: the work left on disk could not be turned into a reviewable patch \
+             set: {error:#}"
+        );
     }
 }
 
@@ -1193,7 +1362,7 @@ async fn delegate(
                 run_id: run_id.to_string(),
                 counter: AtomicU64::new(0),
             });
-            Some(
+            Some(Arc::new(
                 start_adapter_for(
                     call_ctx.main_db,
                     cipher,
@@ -1203,20 +1372,37 @@ async fn delegate(
                     tickets.clone(),
                 )
                 .await?,
-            )
+            ))
         }
         // Nothing to start: the CLI's provider is the CLI's own, and an adapter
         // in front of a login it does not use would be a socket nobody calls.
         DelegationAuth::ProviderLogin => None,
     };
 
-    let result = run_delegation(
-        call_ctx.main_db,
+    // The ticket dies with the run — a stolen one is worthless the moment the
+    // delegation ends (§7.5) — and stopping the adapter is what drops the
+    // organization's credential out of this process. Both are synchronous, so
+    // they run from the guard's `Drop` on every path, including the one where
+    // this future is abandoned mid-turn.
+    let _release = Release::new({
+        let tickets = tickets.clone();
+        let run_id = run_id.to_string();
+        let adapter = adapter.clone();
+        move || {
+            tickets.revoke_run(&run_id);
+            if let Some(adapter) = adapter {
+                adapter.shutdown();
+            }
+        }
+    });
+
+    run_delegation(
+        call_ctx,
         bound,
         bridge,
         config,
         auth,
-        adapter.as_ref(),
+        adapter.as_deref(),
         &granted,
         &tickets,
         run_id,
@@ -1224,21 +1410,12 @@ async fn delegate(
         prompt,
         ctx,
     )
-    .await;
-
-    // The ticket dies with the run — a stolen one is worthless the moment the
-    // delegation ends (§7.5) — and stopping the adapter is what drops the
-    // organization's credential out of this process.
-    tickets.revoke_run(run_id);
-    if let Some(adapter) = adapter {
-        adapter.shutdown();
-    }
-    result
+    .await
 }
 
 #[allow(clippy::too_many_arguments)]
 async fn run_delegation(
-    main_db: &DbPool,
+    call_ctx: &ToolCallCtx<'_>,
     bound: &Bound,
     bridge: &CliBridge,
     config: &DelegationConfig,
@@ -1311,8 +1488,19 @@ async fn run_delegation(
         )
         .await?;
 
+    // From here a vendor process exists. It is closed below on every outcome
+    // the turn can reach; this covers the one it cannot reach, an abandoned
+    // future, where nothing after the next `await` runs at all.
+    let close_if_cancelled = Release::new({
+        let bridge = bridge.clone();
+        let pool = bound.pool.clone();
+        let instance_id = instance.id.clone();
+        let bridge_session_id = instance.bridge_session_id.clone();
+        move || close_abandoned_instance(bridge, pool, instance_id, bridge_session_id)
+    });
+
     let turn = drive_turn(
-        main_db,
+        call_ctx,
         bridge,
         bound,
         config,
@@ -1325,7 +1513,11 @@ async fn run_delegation(
 
     // Closing is not conditional on success: an instance nobody closed is a
     // vendor process nobody reaps (D2).
-    if let Err(error) = bridge.close(&bound.pool, &instance).await {
+    close_if_cancelled.disarm();
+    if let Err(error) = bridge
+        .close(&bound.pool, &instance.id, &instance.bridge_session_id)
+        .await
+    {
         tracing::warn!(
             instance = %instance.id,
             "delegate_cli: the CLI instance did not close cleanly: {error:#}"
@@ -1371,7 +1563,7 @@ async fn run_delegation(
 
 #[allow(clippy::too_many_arguments)]
 async fn drive_turn(
-    main_db: &DbPool,
+    call_ctx: &ToolCallCtx<'_>,
     bridge: &CliBridge,
     bound: &Bound,
     config: &DelegationConfig,
@@ -1380,47 +1572,46 @@ async fn drive_turn(
     prompt: &str,
     ctx: &ExecutionContext,
 ) -> Result<Pumped> {
-    let registry = crate::agents::interaction_registry_global();
-    let manager = crate::agents::agent_run_manager_global();
     // A CLI approval is about the filesystem or about a command, so the
-    // standing permissions are read PER CAPABILITY, at the moment the question
-    // arrives — an `fs_write` allowlist entry must never answer for an `exec`.
-    // No target label: the request's own target is what
-    // `cli_bridge::resolve_approval` bounds the decision with, and the
+    // standing permissions are read PER CAPABILITY AND TARGET, at the moment
+    // the question arrives — an `fs_write` allowlist entry must never answer
+    // for an `exec`, and a grant earned for `cargo` must not answer for `curl`.
+    // The label is `cli_bridge`'s, which is also the one the approval row
+    // stores, so a permission is read under the name it was written with. The
     // `cli_delegate` grant that started this run buys nothing here.
-    let grants = |capability: Capability| -> pep::SessionCtx {
-        tools::session_ctx_for(main_db, bound, capability, None).unwrap_or_else(|error| {
-            // A permission table that cannot be read is not a permission. The
-            // fallback holds nothing, so the question reaches the operator
-            // rather than being answered from state nobody could load.
-            tracing::warn!(
-                "delegate_cli: standing grants unreadable, asking the operator instead: {error:#}"
-            );
-            pep::SessionCtx {
-                role: bound.role,
-                autonomy: bound.autonomy,
-                is_coordinator: false,
-                has_accepted_patch_set: false,
-                allowlisted: false,
-                session_granted: false,
-                run_granted: false,
-            }
-        })
+    let grants = |capability: Capability, target: Option<&str>| -> pep::SessionCtx {
+        tools::session_ctx_for(call_ctx.main_db, bound, capability, target).unwrap_or_else(
+            |error| {
+                // A permission table that cannot be read is not a permission.
+                // The fallback holds nothing, so the question reaches the
+                // operator rather than being answered from state nobody could
+                // load.
+                tracing::warn!(
+                    "delegate_cli: standing grants unreadable, asking the operator instead: \
+                     {error:#}"
+                );
+                pep::SessionCtx {
+                    role: bound.role,
+                    autonomy: bound.autonomy,
+                    is_coordinator: false,
+                    has_accepted_patch_set: false,
+                    allowlisted: false,
+                    session_granted: false,
+                    run_granted: false,
+                }
+            },
+        )
     };
     let worktree = tools::session_worktree(&bound.workspace.id, &bound.session.id)?;
     let approval_run_id = instance.run_id.clone();
     let approvals = ApprovalContext {
         session: &grants,
-        session_id: &bound.session.id,
+        ask: call_ctx.operator_ask(bound),
+        main_db: call_ctx.main_db,
+        workspace_id: &bound.workspace.id,
         run_id: &approval_run_id,
-        parent_run_id: None,
         engine_id: &config.engine,
         worktree: &worktree,
-        registry: &registry,
-        manager: manager.as_deref(),
-        progress: ctx.progress.as_ref(),
-        progress_scope: &ctx.progress_scope,
-        timeout: APPROVAL_TIMEOUT,
     };
     let deadline = Instant::now() + Duration::from_secs(config.timeout_secs);
     bridge.turn(instance, prompt).await?;
@@ -1830,28 +2021,39 @@ mod tests {
         }
     }
 
+    /// The registry database these tests never really use: nothing here answers
+    /// `always`, which is the only decision that writes a standing grant. One
+    /// shared in-memory handle keeps the helper's signature honest without
+    /// making every caller thread a database it does not care about.
+    fn test_registry_db() -> &'static DbPool {
+        static DB: std::sync::OnceLock<DbPool> = std::sync::OnceLock::new();
+        DB.get_or_init(|| {
+            crate::db::init(std::path::Path::new(":memory:")).expect("registry db")
+        })
+    }
+
     fn approval_context<'a>(
         engine_id: &'a str,
-        grants: &'a (dyn Fn(Capability) -> pep::SessionCtx + Send + Sync),
+        grants: &'a (dyn Fn(Capability, Option<&str>) -> pep::SessionCtx + Send + Sync),
         worktree: &'a std::path::Path,
         run_id: &'a str,
-        registry: &'a crate::agents::interaction::InteractionRegistry,
-        progress: &'a dyn crate::flow_engine::dispatchers::progress::ProgressSink,
+        gate: &'a tools::ScriptedGate,
+        pool: &'a DbPool,
     ) -> ApprovalContext<'a> {
         ApprovalContext {
             session: grants,
-            session_id: "sess-1",
+            ask: tools::OperatorAsk {
+                pool,
+                session_id: "sess-1",
+                run_id: Some(run_id),
+                user_id: "u-1",
+                gate,
+            },
+            main_db: test_registry_db(),
+            workspace_id: "ws-test",
             run_id,
-            parent_run_id: None,
             engine_id,
             worktree,
-            registry,
-            manager: None,
-            progress,
-            progress_scope: "code-studio",
-            // Short on purpose: no test may depend on a human, and an
-            // unanswered question is a refusal either way.
-            timeout: Duration::from_millis(80),
         }
     }
 
@@ -1901,11 +2103,11 @@ mod tests {
             .expect_err("an exhausted ticket must not authorize another request");
         assert_eq!(refusal.slug(), "budget_exhausted");
 
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
         let approvals =
-            approval_context("codex", &grants, data.path(), "run-budget", &registry, &progress);
+            approval_context("codex", &grants, data.path(), "run-budget", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let error = pump(
             &bridge,
@@ -1986,11 +2188,11 @@ mod tests {
             .await
             .expect("open");
 
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let refusing = |_: Capability| ticket_ctx(AutonomyMode::Plan);
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let refusing = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Plan);
         let approvals =
-            approval_context("codex", &refusing, data.path(), "run-appr", &registry, &progress);
+            approval_context("codex", &refusing, data.path(), "run-appr", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2058,9 +2260,9 @@ mod tests {
             )
             .await
             .expect("open");
-        let allowing = |_: Capability| ticket_ctx(AutonomyMode::Autonomous);
+        let allowing = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Autonomous);
         let approvals =
-            approval_context("codex", &allowing, data.path(), "run-appr2", &registry, &progress);
+            approval_context("codex", &allowing, data.path(), "run-appr2", &gate, &pool);
         let pumped = pump(
             &bridge,
             &pool,
@@ -2109,11 +2311,11 @@ mod tests {
         )
         .await;
 
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
         let approvals =
-            approval_context("codex", &grants, data.path(), "run-secret", &registry, &progress);
+            approval_context("codex", &grants, data.path(), "run-secret", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2193,11 +2395,11 @@ mod tests {
             vec![json!({"seq": 1, "kind": "terminal", "data": {"text": "thinking"}})],
         )
         .await;
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
         let approvals =
-            approval_context("codex", &grants, data.path(), "run-timeout", &registry, &progress);
+            approval_context("codex", &grants, data.path(), "run-timeout", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2255,10 +2457,10 @@ mod tests {
             ],
         )
         .await;
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
-        let approvals = approval_context("claude-code", &grants, data.path(), "run-claude", &registry, &progress);
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
+        let approvals = approval_context("claude-code", &grants, data.path(), "run-claude", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2286,6 +2488,202 @@ mod tests {
 
         workspace_db::close("wsclaude");
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// A delegation whose future is DROPPED releases what it holds.
+    ///
+    /// This is what a node timeout or a cancelled flow does: the executor stops
+    /// polling and the future is dropped, so nothing after the current `await`
+    /// ever runs. Step 8 of this file's header was all of it — the run row was
+    /// left `running` forever, the `cli_instances` row `ready`, the bridge
+    /// session open, and the vendor process alive with a worktree and a
+    /// provider credential. Both halves are pinned here.
+    #[tokio::test]
+    async fn an_abandoned_delegation_settles_its_run_and_closes_its_vendor_process() {
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let pool = workspace_fixture("wscancel", "run-seed");
+
+        // --- the run row ---
+        let settle = open_run(&pool, "sess-1", "run-cancel", None, "claude-sonnet-4-6")
+            .expect("open run");
+        assert_eq!(run_status(&pool, "run-cancel"), "running");
+        drop(settle);
+        assert_eq!(
+            run_status(&pool, "run-cancel"),
+            "cancelled",
+            "an abandoned delegation must not leave its run row claiming to be alive"
+        );
+
+        // --- the vendor process ---
+        // A script that never announces the end of a turn, so the delegation is
+        // still polling when the future is dropped.
+        let stub = stub_bridge(vec![json!({
+            "seq": 1, "kind": "terminal", "data": {"text": "working"}
+        })])
+        .await;
+        let (db, service_id) = db_with_bridge("claude-code", stub.addr);
+        let bridge = resolve_bridge(&db, service_id, "claude-code").expect("bridge");
+        let config = DelegationConfig::parse(&node(json!({
+            "engine": "claude-code",
+            "service_id": service_id,
+            "model": "claude-sonnet-4-6",
+            "budget": 10_000,
+            "timeout_secs": 120,
+        })))
+        .expect("config");
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let binding = tools::SessionBinding {
+            workspace_id: "wscancel".into(),
+            session_id: "sess-1".into(),
+        };
+        let call_ctx = ToolCallCtx {
+            main_db: &db,
+            user_id: "u-1",
+            run_id: None,
+            tool_call_id: "call-1",
+            binding: &binding,
+            gate: &gate,
+        };
+        let bound = bound_fixture("wscancel", pool.clone());
+        let ctx = crate::flow_engine::node_adapter::test_support::stub_ctx();
+        let tickets = Arc::new(TicketRegistry::new());
+        let granted = ticket_ctx(AutonomyMode::Normal);
+
+        let instances_before = live_instances(&pool);
+        {
+            let turn = run_delegation(
+                &call_ctx,
+                &bound,
+                &bridge,
+                &config,
+                DelegationAuth::ProviderLogin,
+                None,
+                &granted,
+                &tickets,
+                "run-seed",
+                data.path(),
+                "do the work",
+                &ctx,
+            );
+            tokio::pin!(turn);
+            // Long enough to open the instance and start polling, far short of
+            // the turn's own 120 s deadline: the future is abandoned mid-work,
+            // which is the case under test.
+            assert!(
+                tokio::time::timeout(Duration::from_millis(600), &mut turn)
+                    .await
+                    .is_err(),
+                "the stub never ends the turn, so the delegation must still be running"
+            );
+        }
+        assert!(
+            live_instances(&pool) > instances_before,
+            "the delegation never got as far as opening a CLI instance"
+        );
+
+        // `Drop` cannot await, so the close is detached — the row settles a beat
+        // later, and the point is that it settles at all rather than waiting for
+        // the next Core start.
+        let mut closed = false;
+        for _ in 0..100 {
+            if live_instances(&pool) == instances_before {
+                closed = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            closed,
+            "the abandoned CLI instance is still recorded as live, so nothing reaped the \
+             vendor process"
+        );
+        assert!(
+            *stub.closed.lock().expect("closed"),
+            "the bridge was never told to close the session, so the `claude` process is orphaned"
+        );
+
+        workspace_db::close("wscancel");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    fn run_status(pool: &DbPool, run_id: &str) -> String {
+        let conn = pool.read().expect("read");
+        conn.query_row(
+            "SELECT status FROM session_runs WHERE run_id = ?1",
+            rusqlite::params![run_id],
+            |row| row.get(0),
+        )
+        .expect("run row")
+    }
+
+    /// `cli_instances` rows still claiming to describe a running process.
+    fn live_instances(pool: &DbPool) -> i64 {
+        let conn = pool.read().expect("read");
+        conn.query_row(
+            "SELECT COUNT(*) FROM cli_instances WHERE status IN \
+             ('starting','ready','busy','idle')",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count")
+    }
+
+    /// A `Bound` over the fixture workspace. Nothing here opens a repository:
+    /// the delegation path only reads paths off it.
+    fn bound_fixture(workspace_id: &str, pool: DbPool) -> Bound {
+        Bound {
+            workspace: crate::code_studio::models::WorkspaceRecord {
+                id: workspace_id.into(),
+                org_id: "org-1".into(),
+                owner_user_id: "u-1".into(),
+                name: "Workspace".into(),
+                slug: "workspace".into(),
+                node_id: "node-1".into(),
+                exec_mode: "trusted_native".into(),
+                container_image: None,
+                egress_enforcement: "unrestricted".into(),
+                repo_kind: "git".into(),
+                repo_url: None,
+                repo_auth_kind: None,
+                secret_ref: None,
+                ssh_host_fingerprint: None,
+                default_branch: Some("main".into()),
+                target_branch: None,
+                autonomy_ceiling: "autonomous".into(),
+                egress_policy: "org_approved".into(),
+                index_enabled: false,
+                quota_disk_bytes: None,
+                quota_sessions: None,
+                status: "active".into(),
+                status_detail: None,
+                created_at: "now".into(),
+                updated_at: "now".into(),
+            },
+            session: crate::code_studio::session::SessionRecord {
+                id: "sess-1".into(),
+                workspace_id: workspace_id.into(),
+                user_id: "u-1".into(),
+                title: "S".into(),
+                branch: "cs/u/1".into(),
+                autonomy_mode: "normal".into(),
+                flow_id: "f".into(),
+                flow_version_id: "v".into(),
+                status: "running".into(),
+                created_at: "now".into(),
+                updated_at: "now".into(),
+                closed_at: None,
+            },
+            role: WorkspaceRole::Editor,
+            autonomy: AutonomyMode::Normal,
+            pool,
+            broker: crate::code_studio::git_broker::Broker::for_workspace(workspace_id)
+                .expect("broker"),
+        }
     }
 
     /// A Claude Code tool call is gated by the PEP, and the refusal is what the
@@ -2361,12 +2759,12 @@ mod tests {
             .await
             .expect("open");
 
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
         // One standing grant, for writing files and nothing else. Spelled out
         // rather than derived from `ticket_ctx`, whose blanket session grant
         // would answer every question and leave nothing for the PEP to decide.
-        let grants = |capability: Capability| pep::SessionCtx {
+        let grants = |capability: Capability, _: Option<&str>| pep::SessionCtx {
             role: WorkspaceRole::Editor,
             autonomy: AutonomyMode::Normal,
             is_coordinator: false,
@@ -2380,8 +2778,8 @@ mod tests {
             &grants,
             data.path(),
             "run-clperm",
-            &registry,
-            &progress,
+            &gate,
+            &pool,
         );
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
@@ -2593,16 +2991,16 @@ mod tests {
         //     vendor's total, not the sum of its two reports ---
         let (data, pool, bridge, tickets, ticket, mut instance, _stub) =
             scenario("wsreport", "run-report", "cli-report", 10_000, turn()).await;
-        let registry = crate::agents::interaction::InteractionRegistry::new();
-        let progress = crate::flow_engine::dispatchers::progress::NoopProgress;
-        let grants = |_: Capability| ticket_ctx(AutonomyMode::Normal);
+        // Nobody answers in a test, and an unanswered question is a refusal.
+        let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
+        let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
         let approvals = approval_context(
             "claude-code",
             &grants,
             data.path(),
             "run-report",
-            &registry,
-            &progress,
+            &gate,
+            &pool,
         );
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
@@ -2658,8 +3056,8 @@ mod tests {
             &grants,
             data.path(),
             "run-report2",
-            &registry,
-            &progress,
+            &gate,
+            &pool,
         );
         let error = pump(
             &bridge,
@@ -2766,7 +3164,10 @@ mod tests {
             vec!["add a regression test for the parser".to_string()]
         );
 
-        let state = bridge.close(&pool, &instance).await.expect("close");
+        let state = bridge
+            .close(&pool, &instance.id, &instance.bridge_session_id)
+            .await
+            .expect("close");
         assert_eq!(state, "reaped");
         assert!(*stub.closed.lock().expect("closed"));
         assert_eq!(

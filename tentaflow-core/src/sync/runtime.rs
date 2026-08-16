@@ -4649,12 +4649,26 @@ mod tests {
                 },
             )
             .expect("drain captures");
-            assert_eq!(ops.len(), 2, "workspace + owner membership");
-
             let operations: Vec<_> = ops
                 .iter()
                 .map(|op_id| source.runtime.ledger.get_operation(*op_id).expect("op"))
                 .collect();
+            // Creating a workspace captures three things, and all three have to
+            // reach the other node: the row, the owner membership, and the
+            // read-only `exec` programs it is seeded with — a node that got the
+            // workspace without them would ask about `ls`.
+            let of_type = |kind: &str| {
+                operations
+                    .iter()
+                    .filter(|op| op.body.resource_type == kind)
+                    .count()
+            };
+            assert_eq!(of_type("core.code_workspace"), 1);
+            assert_eq!(of_type("core.code_workspace_member"), 1);
+            assert!(
+                of_type("core.code_workspace_allowlist") > 0,
+                "the seeded standing grants never left the node"
+            );
 
             // The membership carries an FK to the workspace. Arriving first it
             // must stay retryable, not become a terminal conflict.

@@ -172,6 +172,47 @@ pub trait ApprovalGate: Send + Sync {
     async fn present_review(&self, prompt: &ReviewPrompt) -> Option<String>;
 }
 
+/// A gate that answers without a person.
+///
+/// Deliberately outside this file's `mod tests`: `cli_bridge` and
+/// `delegate_cli` exercise the SAME suspension from their own side, and a
+/// second stand-in written there would be a second definition of what an
+/// operator's answer looks like.
+#[cfg(test)]
+pub struct ScriptedGate {
+    answer: ApprovalDecision,
+    asked: std::sync::Mutex<Vec<Capability>>,
+}
+
+#[cfg(test)]
+impl ScriptedGate {
+    pub fn answering(answer: ApprovalDecision) -> Self {
+        Self {
+            answer,
+            asked: std::sync::Mutex::new(Vec::new()),
+        }
+    }
+
+    /// Capabilities a person was actually asked about, in order. "Was anybody
+    /// asked" is the assertion most of these tests are really making.
+    pub fn asked(&self) -> Vec<Capability> {
+        self.asked.lock().expect("asked").clone()
+    }
+}
+
+#[cfg(test)]
+#[async_trait]
+impl ApprovalGate for ScriptedGate {
+    async fn request(&self, ask: &Approval) -> ApprovalDecision {
+        self.asked.lock().expect("asked").push(ask.capability);
+        self.answer
+    }
+
+    async fn present_review(&self, _prompt: &ReviewPrompt) -> Option<String> {
+        None
+    }
+}
+
 /// Everything one tool call needs beyond its arguments.
 pub struct ToolCallCtx<'a> {
     /// Main (registry) database — workspaces, members, allowlist.
@@ -185,6 +226,37 @@ pub struct ToolCallCtx<'a> {
     /// journal entry stable across a retry of the same call.
     pub tool_call_id: &'a str,
     pub binding: &'a SessionBinding,
+    pub gate: &'a dyn ApprovalGate,
+}
+
+impl<'a> ToolCallCtx<'a> {
+    /// The suspension this call would use if the PEP asked for a human.
+    pub fn operator_ask(&'a self, bound: &'a Bound) -> OperatorAsk<'a> {
+        OperatorAsk {
+            pool: &bound.pool,
+            session_id: &bound.session.id,
+            run_id: self.run_id,
+            user_id: self.user_id,
+            gate: self.gate,
+        }
+    }
+}
+
+/// Where a suspended call's question is recorded and how it reaches a person.
+///
+/// A `Bound` carries a git broker and a whole workspace record; writing one
+/// `approvals` row needs none of that, and a vendor CLI's question — which has
+/// no tool call behind it — could not supply it anyway. Naming the five things
+/// the suspension actually depends on is what lets the CLI path and the agent
+/// path share `suspend_for_operator` instead of growing a second one.
+pub struct OperatorAsk<'a> {
+    /// Workspace runtime database: `approvals` and the session timeline.
+    pub pool: &'a DbPool,
+    pub session_id: &'a str,
+    /// Run the question belongs to, when a run raised it.
+    pub run_id: Option<&'a str>,
+    /// Principal recorded as having decided, when this side records the answer.
+    pub user_id: &'a str,
     pub gate: &'a dyn ApprovalGate,
 }
 
@@ -346,8 +418,7 @@ pub async fn execute(ctx: &ToolCallCtx<'_>, tool: CoreToolName, args: &Value) ->
         }
         Decision::AskUser { summary, kind } => {
             let decision = suspend_for_operator(
-                ctx,
-                &bound,
+                &ctx.operator_ask(&bound),
                 capability,
                 target_label.as_deref(),
                 &summary,
@@ -359,7 +430,14 @@ pub async fn execute(ctx: &ToolCallCtx<'_>, tool: CoreToolName, args: &Value) ->
                 emit_tool_event(&bound, ctx, false, &reason);
                 return Err(anyhow!("[TOOL_ERROR] {reason}"));
             }
-            persist_grant(ctx, &bound, capability, target_label.as_deref(), decision)?;
+            persist_grant(
+                ctx.main_db,
+                &bound.workspace.id,
+                ctx.user_id,
+                capability,
+                target_label.as_deref(),
+                decision,
+            )?;
             // The decision replaces steps 6-10 of §9.3, not the profile choice:
             // re-running the PEP with the grant recorded yields the profile the
             // work must execute in. `git_commit` re-enters gate 5a, which is now
@@ -683,9 +761,15 @@ pub(crate) fn session_grant_holds(
 
 /// Suspends the call: writes the `approvals` row, puts the question to the
 /// operator, records the decision back on the same row.
+///
+/// The row is written BEFORE the person is asked, and the `interaction_id` on
+/// it is the very id the gate parks on. That ordering is what makes the card
+/// answerable from anywhere: `ApprovalsListRequest` finds the question WHILE it
+/// is open, and `ApprovalDecideRequest` resolves the interaction the row names.
+/// A question asked first and recorded afterwards is a question the operator
+/// cannot see, let alone answer.
 pub async fn suspend_for_operator(
-    ctx: &ToolCallCtx<'_>,
-    bound: &Bound,
+    ask: &OperatorAsk<'_>,
     capability: Capability,
     target: Option<&str>,
     summary: &str,
@@ -696,20 +780,20 @@ pub async fn suspend_for_operator(
     let summary = redact::redact_text(summary);
 
     record_approval_request(
-        &bound.pool,
+        ask.pool,
         &approval_id,
-        &bound.session.id,
-        ctx.run_id,
+        ask.session_id,
+        ask.run_id,
         &interaction_id,
         capability,
         target,
         &summary,
     )?;
     let _ = events::append(
-        &bound.pool,
-        &bound.session.id,
+        ask.pool,
+        ask.session_id,
         SessionEvent::new(
-            format!("approval-req:{approval_id}"),
+            events::approval_requested_key(&approval_id),
             EventPayload::ApprovalRequested {
                 approval_id: approval_id.clone(),
                 capability: capability.slug().to_string(),
@@ -718,7 +802,7 @@ pub async fn suspend_for_operator(
         ),
     );
 
-    let decision = ctx
+    let decision = ask
         .gate
         .request(&Approval {
             interaction_id,
@@ -728,19 +812,17 @@ pub async fn suspend_for_operator(
         })
         .await;
 
-    record_approval_decision(&bound.pool, &approval_id, decision, ctx.user_id)?;
-    let _ = events::append(
-        &bound.pool,
-        &bound.session.id,
-        SessionEvent::new(
-            format!("approval-dec:{approval_id}"),
-            EventPayload::ApprovalDecided {
-                approval_id,
-                decision: decision.as_str().to_string(),
-                decided_by: ctx.user_id.to_string(),
-            },
-        ),
-    );
+    // The dashboard handler may have closed the row already — that is exactly
+    // how an answer given on the card reaches this awaiting call. `settle`
+    // therefore records the transition, not the observation, and only the
+    // caller that actually closed the row writes the timeline entry.
+    settle_approval(
+        ask.pool,
+        ask.session_id,
+        &approval_id,
+        decision.as_str(),
+        ask.user_id,
+    )?;
     Ok(decision)
 }
 
@@ -784,34 +866,63 @@ fn record_approval_request(
     Ok(())
 }
 
-fn record_approval_decision(
+/// Closes one open `approvals` row and writes the timeline entry that says so.
+///
+/// Every writer of a decision goes through here — the dashboard handler that
+/// answers the card, and the suspended call that wakes up holding the answer —
+/// because `approval_decided` belongs to the row TRANSITION and not to whoever
+/// noticed it. Two writers each appending their own entry is how one decision
+/// became two events on the timeline. The row and its event commit together
+/// (§13.3), and the caller that finds the row already closed writes nothing.
+///
+/// Returns true when THIS caller closed the row.
+pub fn settle_approval(
     pool: &DbPool,
+    session_id: &str,
     approval_id: &str,
-    decision: ApprovalDecision,
+    decision: &str,
     decided_by: &str,
-) -> Result<()> {
-    let conn = pool
+) -> Result<bool> {
+    let mut conn = pool
         .write()
         .map_err(|e| anyhow!("workspace db write: {e}"))?;
-    conn.execute(
+    let tx = conn.transaction()?;
+    let closed = tx.execute(
         "UPDATE approvals SET status = 'decided', decision = ?2, decided_at = ?3, \
          decided_by = ?4 WHERE id = ?1 AND status = 'pending'",
         rusqlite::params![
             approval_id,
-            decision.as_str(),
+            decision,
             chrono::Utc::now().to_rfc3339(),
             decided_by,
         ],
     )?;
-    Ok(())
+    if closed == 0 {
+        return Ok(false);
+    }
+    events::append_in_tx(
+        &tx,
+        session_id,
+        SessionEvent::new(
+            events::approval_decided_key(approval_id),
+            EventPayload::ApprovalDecided {
+                approval_id: approval_id.to_string(),
+                decision: decision.to_string(),
+                decided_by: decided_by.to_string(),
+            },
+        ),
+    )?;
+    tx.commit()?;
+    Ok(true)
 }
 
 /// Persists a standing grant when the operator chose one. `mandatory_interactive`
 /// capabilities refuse a standing grant at the point of WRITING it (§9.3 step 5),
 /// so an `always` on `git_push` cannot be stored even if the card offered it.
 pub fn persist_grant(
-    ctx: &ToolCallCtx<'_>,
-    bound: &Bound,
+    main_db: &DbPool,
+    workspace_id: &str,
+    granted_by: &str,
     capability: Capability,
     target: Option<&str>,
     decision: ApprovalDecision,
@@ -820,11 +931,11 @@ pub fn persist_grant(
     match decision {
         ApprovalDecision::Always if pep::may_store_always_grant(capability) => {
             repository::add_allowlist_entry(
-                ctx.main_db,
-                &bound.workspace.id,
+                main_db,
+                workspace_id,
                 capability.slug(),
                 pattern,
-                ctx.user_id,
+                granted_by,
             )?;
         }
         _ => {}
@@ -1473,8 +1584,14 @@ async fn exec_call(
         // the command in a registry that never saw it.
         let executor = Executor::for_workspace(&workspace_id);
         let result = executor.exec(lease.target(), &env, &request, Arc::new(NullSink));
-        // The lease is released whatever the command did: a failed build must
-        // not leak a copy-on-write layer for the rest of the session.
+        // A build directory the layer left out is not a detail: a command that
+        // cannot see `target/` recompiles from scratch, and a model told nothing
+        // reads that as a broken tree (§7.2).
+        let skipped_dirs = lease.skipped_dirs.clone();
+        // Releasing the lease drops this command's hold on the sandbox. For a
+        // SHARED profile the workplace survives, so the next command of the
+        // session finds the build tree where this one left it; only an
+        // `ephemeral` one is destroyed here.
         let release = manager.release(&pool, lease);
         let outcome = result?;
         release?;
@@ -1497,6 +1614,7 @@ async fn exec_call(
                 "mount_access": effective_mount,
                 "requested_mount_access": requested_for_answer,
                 "writes_discarded": writes_discarded,
+                "layer_skipped_dirs": skipped_dirs,
             }),
             artifact,
         })
