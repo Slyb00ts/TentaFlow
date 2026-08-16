@@ -18,7 +18,44 @@ const BINARY_CANDIDATES = [
   path.join(__dirname, '../../../target_shared/release/tentaflow'),
   path.join(__dirname, '../../../target_shared/debug/tentaflow'),
 ];
-const BINARY = BINARY_CANDIDATES.find((p) => fs.existsSync(p)) ?? BINARY_CANDIDATES[0];
+// `TENTAFLOW_E2E_BINARY` wins so a run can target a freshly built debug binary
+// without touching a release artifact someone else produced.
+const BINARY = process.env.TENTAFLOW_E2E_BINARY
+  ?? BINARY_CANDIDATES.find((p) => fs.existsSync(p))
+  ?? BINARY_CANDIDATES[0];
+
+// `www/` is compiled INTO the binary (tentaflow-core/build.rs → wwwroot_embed.rs),
+// so a binary older than the dashboard sources serves stale JS. That failure is
+// brutal to read — the served codec simply lacks the encoder a spec asks for and
+// the error names neither the file nor the reason. Warn loudly instead.
+function warnIfDashboardIsStale() {
+  try {
+    const www = path.join(__dirname, '../../../tentaflow-core/www');
+    const binMtime = fs.statSync(BINARY).mtimeMs;
+    let newest = 0;
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        // build.rs regenerates the wasm glue INTO www/, so those files are
+        // always newer than the binary that just embedded them.
+        else if (!/wasm_glue|\/generated\//.test(full)) {
+          newest = Math.max(newest, fs.statSync(full).mtimeMs);
+        }
+      }
+    };
+    walk(www);
+    if (newest > binMtime + 60_000) {
+      const age = Math.round((newest - binMtime) / 60000);
+      console.warn(
+        `[e2e] WARNING: ${BINARY} is ~${age} min older than the files in www/. ` +
+        'The dashboard is embedded in the binary, so the served front end will be stale. ' +
+        'Rebuild (cd tentaflow && cargo build) or point TENTAFLOW_E2E_BINARY at a fresh one.',
+      );
+    }
+  } catch { /* diagnostics only — never fail a run on this */ }
+}
+warnIfDashboardIsStale();
 const DEFAULT_PORT = 18099;
 const DEFAULT_DB = '/tmp/e2e-ui-test.db';
 const CONFIG_TEMPLATE = path.join(__dirname, '../config-ui-test.toml');

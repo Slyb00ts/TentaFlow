@@ -18,6 +18,8 @@ module.exports = defineConfig({
     ignoreHTTPSErrors: true,
   },
   projects: [
+    { name: 'code-studio-delegation', testMatch: 'code-studio-delegation.spec.js' },
+    { name: 'code-studio-harness', testMatch: 'code-studio-harness.spec.js' },
     { name: 'frontend-cache-version', testMatch: 'frontend-cache-version.spec.js' },
     { name: 'direct-http', testMatch: 'services-direct-http.spec.js' },
     { name: 'mesh-pairing', testMatch: 'mesh-pairing.spec.js' },
