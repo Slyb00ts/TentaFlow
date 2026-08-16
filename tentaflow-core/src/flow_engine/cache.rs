@@ -62,7 +62,22 @@ pub struct LoopRegion {
     pub max_iterations: u32,
     /// Whether one extra grace iteration runs after the budget is exhausted.
     pub final_pass: bool,
+    /// True when a `critic_gate` block sits inside the region. Such a region is
+    /// NOT a tool loop: it spins over deterministic spawn/await work, where no
+    /// assistant turn carries tool calls, so the ordinary structural stop would
+    /// fire after a single pass. The gate decides instead — it is the block an
+    /// author can see, edit and delete in the Flow Builder.
+    pub gated: bool,
 }
+
+/// Block type whose presence turns a loop region into a VERDICT-driven loop.
+/// Named here rather than in the adapter because the compiler has to recognise
+/// it before any adapter runs.
+pub const CRITIC_GATE_NODE_TYPE: &str = "critic_gate";
+
+/// Envelope meta the gate sets when the reviewer is satisfied. The region
+/// runner reads it as a structural stop.
+pub const LOOP_SHOULD_EXIT_META: &str = "loop_should_exit";
 
 /// Default iteration budget for an inline loop region when the entry node's
 /// config does not set `loop_max_iterations`.
@@ -429,6 +444,10 @@ fn build_regions(
             .and_then(|v| v.as_bool())
             .unwrap_or(false);
 
+        let gated = member_pos
+            .iter()
+            .any(|&pos| def.nodes[execution_order[pos]].node_type == CRITIC_GATE_NODE_TYPE);
+
         regions.push(LoopRegion {
             id: region_id.to_string(),
             member_pos,
@@ -437,6 +456,7 @@ fn build_regions(
             back_edge_idx,
             max_iterations,
             final_pass,
+            gated,
         });
     }
     Ok(regions)

@@ -57,7 +57,7 @@ use crate::flow_engine::node_adapters::{
     RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
     RagGraphSeedNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter,
     SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter, StoreNodeAdapter,
-    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
+    CriticGateNodeAdapter, SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
     TextExtractNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
     TtsNodeAdapter, VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter,
     VisionOcrNodeAdapter, VisionParseNodeAdapter, VisionParsePagesNodeAdapter,
@@ -1153,6 +1153,9 @@ fn build_registry(
         Arc::new(AwaitSubagentsNodeAdapter::new()),
         Arc::new(SubagentStatusNodeAdapter::new()),
         Arc::new(IntervalNodeAdapter::new()),
+        // The block that ends a review loop on a VERDICT rather than on the
+        // absence of tool calls.
+        Arc::new(CriticGateNodeAdapter::new()),
     ];
     for a in arcs {
         r.register(a);
@@ -1345,6 +1348,7 @@ mod tests {
             "await_subagents",
             "subagent_status",
             "interval",
+            "critic_gate",
             // Code Studio (§16.4).
             "workspace_context",
             "patch_review",

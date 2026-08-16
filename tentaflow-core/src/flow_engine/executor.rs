@@ -762,9 +762,25 @@ async fn run_loop_region(
             },
         );
 
-        // Structural stop: a final assistant turn WITHOUT tool calls means the
-        // agent answered and the loop is done. This replaces meta.harness_done.
-        if !last_assistant_has_tool_calls(&current) {
+        if region.gated {
+            // A gated region spins over deterministic work (delegate → wait →
+            // judge), where no assistant turn carries tool calls, so the tool
+            // -loop stop would end it after one pass. The `critic_gate` block
+            // inside decides instead, and it is visible and deletable in the
+            // Flow Builder: delete it and the region falls back to the rule
+            // below.
+            let satisfied = current
+                .meta
+                .get(crate::flow_engine::cache::LOOP_SHOULD_EXIT_META)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if satisfied {
+                break "gate_satisfied";
+            }
+        } else if !last_assistant_has_tool_calls(&current) {
+            // Structural stop: a final assistant turn WITHOUT tool calls means
+            // the agent answered and the loop is done. This replaces
+            // meta.harness_done.
             break "no_tool_calls";
         }
     };
