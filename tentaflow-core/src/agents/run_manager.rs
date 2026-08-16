@@ -590,8 +590,34 @@ impl AgentRunManager {
         // session budget below is claimed for the whole batch at once and a
         // claim for a task that turns out to name no agent would burn budget on
         // a run that can never exist.
+        // The caller's roster, if it declared one. `None` = unrestricted, which is
+        // what every agent did before the column existed; an empty list means the
+        // agent may delegate to nobody. Parsed once for the whole batch.
+        let roster: Option<Vec<String>> = repository::get_agent(&self.db, &caller.agent_id)?
+            .and_then(|a| a.allowed_agents_json)
+            .map(|raw| serde_json::from_str::<Vec<String>>(&raw))
+            .transpose()
+            .map_err(|e| anyhow!("agent_spawn: caller's allowed_agents is not a list: {e}"))?;
+
         let mut planned = Vec::with_capacity(tasks.len());
         for task in tasks {
+            // Refuse BEFORE resolving: naming an agent outside the roster must
+            // read the same whether that agent exists or not, otherwise the
+            // error message turns the roster into a directory of every agent
+            // on the node.
+            if let Some(allowed) = &roster {
+                if !allowed.iter().any(|n| n == &task.agent_name) {
+                    return Err(anyhow!(
+                        "agent_spawn: '{}' is not in this agent's delegation roster ({})",
+                        task.agent_name,
+                        if allowed.is_empty() {
+                            "it may not delegate at all".to_string()
+                        } else {
+                            allowed.join(", ")
+                        }
+                    ));
+                }
+            }
             let child = repository::get_agent_by_name(&self.db, &task.agent_name)?
                 .ok_or_else(|| anyhow!("agent_spawn: agent '{}' not found", task.agent_name))?;
             let prompt = match &task.context {

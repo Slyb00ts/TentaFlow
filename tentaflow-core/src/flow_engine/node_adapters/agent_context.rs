@@ -300,15 +300,27 @@ impl NodeAdapter for AgentContextNodeAdapter {
             serde_json::json!(max_iterations),
         );
 
-        // model: node override > agent definition; absent leaves the request /
-        // envelope model in place (the llm block falls back to meta['model']).
-        if let Some(model) = node
+        // model: node override > agent definition > platform default. The last
+        // step is what makes a fresh install work at all: the seeded agents
+        // carry `model = NULL`, and without a default the first turn fails in
+        // the llm block with a message about node config and envelope meta —
+        // neither of which the operator ever touched. An envelope that already
+        // carries a model keeps it (the llm block reads meta['model']).
+        let resolved = node
             .config
             .get("model")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
-            .or(agent.model.as_deref().filter(|s| !s.is_empty()))
-        {
+            .map(str::to_string)
+            .or_else(|| agent.model.clone().filter(|s| !s.is_empty()))
+            .or_else(|| {
+                if out.meta.contains_key("model") {
+                    None
+                } else {
+                    service.default_llm_model()
+                }
+            });
+        if let Some(model) = resolved {
             out.meta.insert("model".into(), serde_json::json!(model));
         }
 

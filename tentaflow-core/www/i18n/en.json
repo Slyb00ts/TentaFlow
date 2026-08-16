@@ -6609,7 +6609,11 @@
         "decide_failed": "The decisions could not be saved.",
         "disk_diff_failed": "The on-disk version could not be loaded.",
         "load_failed": "The patch set could not be loaded.",
-        "hunks_in_file": "{decided} of {total} {count|hunk|hunks} in this file"
+        "hunks_in_file": "{decided} of {total} {count|hunk|hunks} in this file",
+        "commit": "Commit accepted",
+        "saved_needs_commit": "Decisions saved — the commit is still pending",
+        "committed": "Changes committed",
+        "commit_default_message": "chore: commit the accepted changes"
       },
       "diff": {
         "diff": "Diff",

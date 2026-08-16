@@ -64,6 +64,22 @@ export const Router = {
     currentId = id;
     currentScreen = screen;
 
+    // Put the route in the URL so a screen can be bookmarked, shared and
+    // survive a reload. Without this the hash was decoration: `init()` always
+    // opened the dashboard and nothing listened for a change, so refreshing
+    // mid-task threw the user back to the start. `replaceState` keeps the back
+    // button meaningful — one entry per navigation, not per repaint.
+    try {
+      const next = params && Object.keys(params).length
+        ? `#/${id}?${new URLSearchParams(
+            Object.entries(params).filter(([, v]) => v != null && v !== ''),
+          )}`
+        : `#/${id}`;
+      if (window.location.hash !== next) {
+        window.history.replaceState(null, '', next);
+      }
+    } catch { /* a URL we cannot write is not worth failing navigation over */ }
+
     // Sidebar active — drill-down widoki (params != null) nie sa pozycjami
     // w sidebarze, wiec nie czyscimy podswietlenia gdy nawigujemy z parametrami.
     if (!params) {
@@ -103,7 +119,28 @@ export const Router = {
     return currentId;
   },
 
+  /// Reads `#/screen?a=b` into `{id, params}`; `null` when the hash names nothing.
+  fromHash() {
+    const raw = String(window.location.hash || '').replace(/^#\/?/, '');
+    if (!raw) return null;
+    const [id, query] = raw.split('?');
+    if (!id || !screens.has(id)) return null;
+    const params = query ? Object.fromEntries(new URLSearchParams(query)) : null;
+    return { id, params };
+  },
+
   init(defaultId) {
-    if (defaultId) this.navigate(defaultId);
+    // A hash in the address bar wins over the default: that is what makes a
+    // pasted link open the screen it names.
+    const target = this.fromHash();
+    if (target) this.navigate(target.id, target.params);
+    else if (defaultId) this.navigate(defaultId);
+
+    // Back/forward and hand-edited URLs. `replaceState` above does not fire
+    // hashchange, so this only ever reacts to the user moving.
+    window.addEventListener('hashchange', () => {
+      const next = this.fromHash();
+      if (next && next.id !== currentId) this.navigate(next.id, next.params);
+    });
   },
 };

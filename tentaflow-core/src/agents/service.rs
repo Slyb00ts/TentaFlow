@@ -63,6 +63,16 @@ impl AgentService {
         repository::get_agent_by_name(&self.db, name)
     }
 
+    /// The model to use when an agent definition names none. A fresh install
+    /// seeds every agent with `model = NULL`, so without this the first turn of
+    /// a new deployment dies in the llm block with "no model" — a message that
+    /// names the node config and the envelope, neither of which the operator
+    /// set. See `services_repo::models::default_llm_model` for what counts.
+    pub fn default_llm_model(&self) -> Option<String> {
+        let conn = self.db.read().ok()?;
+        crate::services_repo::models::default_llm_model(&conn).ok().flatten()
+    }
+
     /// Direct DB handle — the agent_context block uses it to read the skills
     /// repository (skills index) and create the `agent_runs` row. Sharing the
     /// pool keeps the service the single owner of agent-domain persistence.

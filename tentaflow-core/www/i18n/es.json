@@ -5251,7 +5251,11 @@
         "decide_failed": "No se han podido guardar las decisiones.",
         "disk_diff_failed": "No se ha podido cargar la versión del disco.",
         "load_failed": "No se ha podido cargar el conjunto de cambios.",
-        "hunks_in_file": "{decided} de {total} {count|hunk|hunks} en este archivo"
+        "hunks_in_file": "{decided} de {total} {count|hunk|hunks} en este archivo",
+        "commit": "Confirmar aceptados",
+        "saved_needs_commit": "Decisiones guardadas: falta el commit",
+        "committed": "Cambios confirmados",
+        "commit_default_message": "chore: confirmar los cambios aceptados"
       },
       "diff": {
         "diff": "Diff",

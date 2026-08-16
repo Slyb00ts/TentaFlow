@@ -6745,7 +6745,11 @@
         "decide_failed": "Nie udało się zapisać decyzji.",
         "disk_diff_failed": "Nie udało się wczytać wersji z dysku.",
         "load_failed": "Nie udało się wczytać zestawu zmian.",
-        "hunks_in_file": "{decided} z {total} {count|hunka|hunków|hunków} w tym pliku"
+        "hunks_in_file": "{decided} z {total} {count|hunka|hunków|hunków} w tym pliku",
+        "commit": "Zacommituj zaakceptowane",
+        "saved_needs_commit": "Decyzje zapisane — zostaje commit",
+        "committed": "Zmiany zacommitowane",
+        "commit_default_message": "chore: zacommituj zaakceptowane zmiany"
       },
       "diff": {
         "diff": "Diff",

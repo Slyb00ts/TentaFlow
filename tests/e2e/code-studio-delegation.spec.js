@@ -229,6 +229,42 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
       .toContain(PROGRAM);
   });
 
+  test('roster delegacji jest kontraktem, nie sugestią w prompcie', async ({ page }) => {
+    await loginAsAdmin(page, { port: PORT });
+
+    // Before the roster existed, `core.agent_spawn` resolved ANY agent by name:
+    // holding the tool meant holding the whole node's roster, bounded only by
+    // depth/width/session budget. The orchestrator now ships an explicit team.
+    const listResp = await api(page, 'agentsListRequest', {});
+    const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
+    const orch = agents.find((a) => a.name === 'code-orchestrator');
+    expect(orch, 'no orchestrator').toBeTruthy();
+
+    const detail = await api(page, 'agentsDetailRequest', { agentId: orch.id });
+    const full = JSON.parse(detail?.agentJson ?? detail?.agent_json ?? '{}');
+    console.log('[diag] roster:', JSON.stringify(full.allowed_agents));
+    expect(Array.isArray(full.allowed_agents), 'the orchestrator has no roster').toBe(true);
+    expect(full.allowed_agents).toContain('code-implementer');
+
+    // A specialist must NOT be able to delegate: it holds no agent_spawn at all,
+    // which is the first gate; the roster is the second.
+    const implementer = agents.find((a) => a.name === 'code-implementer');
+    const implDetail = await api(page, 'agentsDetailRequest', { agentId: implementer.id });
+    const impl = JSON.parse(implDetail?.agentJson ?? implDetail?.agent_json ?? '{}');
+    expect(impl.tools ?? [], 'the implementer can delegate')
+      .not.toContain('core.agent_spawn');
+
+    // The roster round-trips through upsert — otherwise editing an agent in the
+    // UI would silently drop the team.
+    await api(page, 'agentsUpsertRequest', {
+      agentJson: JSON.stringify({ ...full, allowed_agents: ['code-planner'] }),
+    });
+    const after = await api(page, 'agentsDetailRequest', { agentId: orch.id });
+    const reread = JSON.parse(after?.agentJson ?? after?.agent_json ?? '{}');
+    expect(reread.allowed_agents, 'the roster did not survive an upsert')
+      .toEqual(['code-planner']);
+  });
+
   test('kreator agentów AI zwraca propozycję agenta', async ({ page }) => {
     test.setTimeout(120_000);
     await loginAsAdmin(page, { port: PORT });

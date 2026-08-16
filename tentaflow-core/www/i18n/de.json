@@ -5251,7 +5251,11 @@
         "decide_failed": "Die Entscheidungen konnten nicht gespeichert werden.",
         "disk_diff_failed": "Die Fassung von der Festplatte konnte nicht geladen werden.",
         "load_failed": "Das Patch-Set konnte nicht geladen werden.",
-        "hunks_in_file": "{decided} von {total} {count|Hunk|Hunks} in dieser Datei"
+        "hunks_in_file": "{decided} von {total} {count|Hunk|Hunks} in dieser Datei",
+        "commit": "Akzeptierte übernehmen",
+        "saved_needs_commit": "Entscheidungen gespeichert — der Commit fehlt noch",
+        "committed": "Änderungen übernommen",
+        "commit_default_message": "chore: akzeptierte Änderungen übernehmen"
       },
       "diff": {
         "diff": "Diff",

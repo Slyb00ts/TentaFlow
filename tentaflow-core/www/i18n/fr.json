@@ -5251,7 +5251,11 @@
         "decide_failed": "Impossible d’enregistrer les décisions.",
         "disk_diff_failed": "Impossible de charger la version du disque.",
         "load_failed": "Impossible de charger le jeu de modifications.",
-        "hunks_in_file": "{decided} sur {total} {count|hunk|hunks} dans ce fichier"
+        "hunks_in_file": "{decided} sur {total} {count|hunk|hunks} dans ce fichier",
+        "commit": "Valider les acceptés",
+        "saved_needs_commit": "Décisions enregistrées — le commit reste à faire",
+        "committed": "Modifications validées",
+        "commit_default_message": "chore: valider les modifications acceptées"
       },
       "diff": {
         "diff": "Diff",

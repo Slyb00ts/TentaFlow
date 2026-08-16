@@ -440,10 +440,23 @@ async function saveDecisions(ctx, bus) {
   const conflicted = Array.isArray(body.conflicted_paths) ? body.conflicted_paths : [];
   if (conflicted.length) {
     toast(T('code_studio.panes.changes.saved_with_conflicts', { count: conflicted.length }), 'warning');
+  } else if (['accepted', 'partially_accepted'].includes(String(body.status ?? ''))) {
+    // The commit is a separate decision; saying so here is the difference
+    // between "nothing happened" and "one step left".
+    toast(T('code_studio.panes.changes.saved_needs_commit'), 'success');
   } else {
     toast(T('code_studio.panes.changes.saved'), 'success');
   }
   await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
+  return body.status ?? '';
+}
+
+/// Commits an already-accepted set through the same call the agent would make.
+async function commitAccepted(ctx, bus) {
+  const message = String(bus.commitMessage ?? '').trim()
+    || T('code_studio.panes.changes.commit_default_message');
+  await call(ctx, 'codeStudioGitCommitRequest', { message });
+  toast(T('code_studio.panes.changes.committed'), 'success');
 }
 
 // ===========================================================================
@@ -715,7 +728,16 @@ export function renderChangesPane(hostEl, ctx) {
     T('code_studio.panes.changes.request_revision'));
   const saveBtn = button({ variant: 'primary', icon: 'check', onClick: () => onSave() },
     T('code_studio.panes.changes.save_decisions'));
-  foot.append(footHint, spacer(), reviseBtn, saveBtn);
+  // Accepting a review does NOT commit: `commit_accepted_blobs` is reached from
+  // the git_commit path, so without this the operator accepts everything and
+  // nothing visibly happens (§11.5). The button carries that second decision.
+  const commitBtn = button(
+    { variant: 'primary', icon: 'git', onClick: () => onCommit() },
+    T('code_studio.panes.changes.commit'),
+  );
+  commitBtn.setAttribute('hidden', '');
+
+  foot.append(footHint, spacer(), reviseBtn, saveBtn, commitBtn);
 
   const revisionBox = el('div', { class: 'cs-revise-box', hidden: '' });
   const revisionText = el('tf-textarea', {
@@ -771,6 +793,14 @@ export function renderChangesPane(hostEl, ctx) {
   function paintProgress() {
     const file = activeFile();
     const set = tallyDecisions(bus);
+    // An accepted set still needs a commit; show the action only then, so the
+    // button never invites a commit of something nobody reviewed.
+    const decidedStatus = String(bus.patchSet?.status ?? '');
+    if (['accepted', 'partially_accepted'].includes(decidedStatus)) {
+      commitBtn.removeAttribute('hidden');
+    } else {
+      commitBtn.setAttribute('hidden', '');
+    }
     footHint.textContent = T('code_studio.panes.changes.decided_of', {
       decided: set.decided,
       total: set.total,
@@ -999,6 +1029,18 @@ export function renderChangesPane(hostEl, ctx) {
       await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
     } catch (err) {
       failed(err, 'code_studio.panes.changes.decide_failed');
+    }
+  }
+
+  async function onCommit() {
+    try {
+      await commitAccepted(ctx, bus);
+      await loadPatchSet(ctx, bus, bus.patchSet.patch_set_id);
+      paintProgress();
+    } catch (e) {
+      // An approval gate answers with Conflict, which is not a failure: the
+      // operator has to decide, and the session view renders that card.
+      toast(String(e?.message ?? e), 'warning');
     }
   }
 

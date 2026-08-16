@@ -7404,6 +7404,10 @@ struct AgentUpsertInput {
     #[serde(default = "default_max_spawn_depth")]
     max_spawn_depth: i64,
     flow_id: Option<String>,
+    /// Which agents this one may delegate to. Absent = unrestricted (what every
+    /// agent did before the roster existed); `[]` = nobody; a list = only those.
+    #[serde(default)]
+    allowed_agents: Option<Vec<String>>,
     #[serde(default = "default_true")]
     routable: bool,
     #[serde(default = "default_true")]
@@ -7482,6 +7486,8 @@ struct AgentDetail<'a> {
     routable: bool,
     is_enabled: bool,
     on_child_complete: &'a str,
+    /// `None` = unrestricted delegation; a list = only those agents.
+    allowed_agents: Option<Vec<String>>,
     created_at: &'a str,
     updated_at: &'a str,
 }
@@ -7519,6 +7525,17 @@ impl<'a> AgentDetail<'a> {
             routable: agent.routable,
             is_enabled: agent.is_enabled,
             on_child_complete: &agent.on_child_complete,
+            allowed_agents: agent
+                .allowed_agents_json
+                .as_deref()
+                .map(serde_json::from_str::<Vec<String>>)
+                .transpose()
+                .map_err(|e| {
+                    ProtocolError::internal(format!(
+                        "agent {} has invalid allowed_agents_json: {e}",
+                        agent.id
+                    ))
+                })?,
             created_at: &agent.created_at,
             updated_at: &agent.updated_at,
         })
@@ -7738,6 +7755,13 @@ pub fn agents_upsert(
         .as_ref()
         .map(|e| e.id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let allowed_agents_json = match &input.allowed_agents {
+        Some(list) => Some(
+            serde_json::to_string(list)
+                .map_err(|e| ProtocolError::bad_request(format!("allowed_agents: {e}")))?,
+        ),
+        None => None,
+    };
     let tools_json = serde_json::to_string(&input.tools)
         .map_err(|e| ProtocolError::internal(format!("agent tools encode failed: {}", e)))?;
     let skills_json = serde_json::to_string(&input.skills)
@@ -7764,6 +7788,7 @@ pub fn agents_upsert(
         is_enabled: input.is_enabled,
         on_child_complete: &input.on_child_complete,
         actor_user_id: Some(&user_id),
+            allowed_agents_json: allowed_agents_json.as_deref(),
     };
     repository::validate_agent_params(&params)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;

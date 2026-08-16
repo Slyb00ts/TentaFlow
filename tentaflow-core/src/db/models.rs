@@ -498,6 +498,9 @@ pub struct DbAgent {
     /// `notify` (default) enqueues the mailbox + emits the event; `continue`
     /// also starts a fresh parent run with the child result (Ralph-style).
     pub on_child_complete: String,
+    /// Which agents this one may delegate to (§ delegation roster).
+    /// `None` = unrestricted, `Some("[]")` = nobody, `Some(json array)` = only those.
+    pub allowed_agents_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -526,6 +529,7 @@ pub struct AgentParams<'a> {
     /// `notify` | `continue` (Harness §3.6 level 3). Validated against the set
     /// in `validate_agent_params`; the column CHECK is the fleet-wide backstop.
     pub on_child_complete: &'a str,
+    pub allowed_agents_json: Option<&'a str>,
     pub actor_user_id: Option<&'a str>,
 }
 

@@ -30,7 +30,13 @@ const BINARY = process.env.TENTAFLOW_E2E_BINARY
 // the error names neither the file nor the reason. Warn loudly instead.
 function warnIfDashboardIsStale() {
   try {
-    const www = path.join(__dirname, '../../../tentaflow-core/www');
+    const roots = [
+      path.join(__dirname, '../../../tentaflow-core/www'),
+      // Rust sources too: `cargo check` proves the tree compiles but produces no
+      // binary, so a green check next to an old artifact makes a fixed defect
+      // look unfixed — the run then reports the PREVIOUS build's behaviour.
+      path.join(__dirname, '../../../tentaflow-core/src'),
+    ];
     const binMtime = fs.statSync(BINARY).mtimeMs;
     let newest = 0;
     const walk = (dir) => {
@@ -44,7 +50,7 @@ function warnIfDashboardIsStale() {
         }
       }
     };
-    walk(www);
+    for (const root of roots) walk(root);
     if (newest > binMtime + 60_000) {
       const age = Math.round((newest - binMtime) / 60000);
       console.warn(

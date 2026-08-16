@@ -6443,6 +6443,17 @@ fn approval_decide_v1(
             "'{capability}' cannot be granted 'always'"
         )));
     }
+    // A run-scoped grant needs a run to attach to. An approval raised by an
+    // OPERATOR action (a commit from the Changes pane, a push from the git
+    // panel) belongs to no run, so storing `allow_for_run` there would write a
+    // grant that authorizes nothing — and the very next click would ask again,
+    // which reads as the gate ignoring the answer. Refuse it instead, and say
+    // which scopes do apply.
+    if decision == "allow_for_run" && waiting_run.is_none() {
+        return Err(ProtocolError::bad_request(
+            "this approval belongs to no agent run, so 'allow_for_run' would              bind to nothing — answer 'allow_once', 'allow_for_session' or              'always'",
+        ));
+    }
     // The stored answer is only as good as the target it names. A pattern the
     // matcher gives no reading to would become a grant that authorizes nothing
     // and confuses everyone who audits the table.

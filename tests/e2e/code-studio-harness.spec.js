@@ -99,6 +99,19 @@ async function registerScriptedProvider(page) {
 }
 
 async function gotoCodeStudio(page) {
+  // Deep link: the router now reads `#/screen` at boot and on hashchange, so a
+  // pasted URL opens the screen it names instead of the dashboard. Before the
+  // fix the hash was decoration and every test had to click through All apps.
+  await page.goto(`${baseUrl(PORT)}/#/code-studio`);
+  const direct = page.locator('#cs-new, #cs-empty-new, #cs-table-host').first();
+  if (await direct.count().then((n) => n > 0).catch(() => false)) {
+    await direct.waitFor({ timeout: 30_000 });
+    return;
+  }
+  return gotoCodeStudioViaTile(page);
+}
+
+async function gotoCodeStudioViaTile(page) {
   // The shell ignores the URL hash (app.js ends with `Router.init('dashboard')`
   // and router.js has no hashchange listener), and navigating too early loses
   // the race with that init. So take the path a user takes: All apps → the
@@ -185,40 +198,27 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     }, { timeout: 60_000, message: 'scripted provider never came up' }).toMatch(/running|degraded/);
   });
 
-  test('wiąże model z agentami kodu', async ({ page }) => {
+  test('świeża instalacja: agent rusza bez ręcznego przypisania modelu', async ({ page }) => {
     await loginAsAdmin(page, { port: PORT });
 
-    // A fresh install seeds the Code Studio agents with `model = NULL`, and the
-    // llm block deliberately carries no model of its own — the agent owns it.
-    // So the first session of a new install dies with
+    // Regression for the "first turn of a fresh install dies" defect: the seed
+    // leaves every code agent with model = NULL and the llm block carries none
+    // of its own, so before the fix the first session failed with
     //   "llm adapter: no model — node config 'model' nor envelope.meta['model']"
-    // An operator fixes that on the Agents screen; do exactly that here.
-    const models = await api(page, 'modelListRequest');
-    const found = (models?.models ?? []).find(
-      (m) => String(m.modelName ?? m.model_name ?? '').includes('harness-test'),
-    );
-    const modelName = found?.modelName ?? found?.model_name ?? '';
-    expect(modelName, 'the scripted model is not in the model list').toBeTruthy();
-
-    // The agent APIs carry their payload as a JSON STRING (`agents_json`,
-    // `agent_json`), not as decoded objects — agents.js:282 parses it the same way.
+    // agent_context now falls back to the platform default, so we deliberately
+    // do NOT bind a model here — the turn in the next test must work anyway.
     const listResp = await api(page, 'agentsListRequest', {});
     const agents = JSON.parse(listResp?.agentsJson ?? listResp?.agents_json ?? '[]');
     const codeAgents = agents.filter((a) => String(a.name ?? '').startsWith('code-'));
     expect(codeAgents.length, 'no seeded code-* agents').toBeGreaterThan(0);
-
-    for (const summary of codeAgents) {
-      const id = summary.id ?? summary.agentId ?? summary.agent_id;
-      const detailResp = await api(page, 'agentsDetailRequest', { agentId: id });
-      const agent = JSON.parse(detailResp?.agentJson ?? detailResp?.agent_json ?? '{}');
-      agent.model = modelName;
-      await api(page, 'agentsUpsertRequest', { agentJson: JSON.stringify(agent) });
+    for (const a of codeAgents) {
+      expect(a.model ?? '', `${a.name} unexpectedly ships with a model`).toBe('');
     }
 
-    const afterResp = await api(page, 'agentsListRequest', {});
-    const after = JSON.parse(afterResp?.agentsJson ?? afterResp?.agents_json ?? '[]');
-    const orchestrator = after.find((a) => a.name === 'code-orchestrator');
-    expect(orchestrator?.model, 'orchestrator still has no model').toBeTruthy();
+    // …and a model IS available on the node, which is what the fallback picks.
+    const models = await api(page, 'modelListRequest');
+    expect((models?.models ?? []).length, 'no model on the node to fall back to')
+      .toBeGreaterThan(0);
   });
 
   test('zakłada workspace przez kreator', async ({ page }) => {
@@ -386,7 +386,19 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
       expect(first.err, 'commit failed for a reason other than the approval gate')
         .toContain('approval_required');
       // `allow_for_run` is scoped to an agent run; this commit is operator-
-      // initiated and belongs to none, so grant it at the workspace level.
+      // initiated and belongs to none. The server now REFUSES that combination
+      // instead of storing a grant that binds to nothing — assert the refusal,
+      // then answer with a scope that actually applies.
+      const refused = await api(page, 'codeStudioApprovalsListRequest', scope())
+        .then((b) => (b?.approvals ?? []).find((a) => (a.status ?? '') === 'pending'))
+        .then((a) => api(page, 'codeStudioApprovalDecideRequest', {
+          ...scope(),
+          approvalId: a.id ?? a.approvalId ?? a.approval_id,
+          decision: 'allow_for_run',
+        }).catch((e) => String(e)));
+      expect(String(refused), 'a run-scoped grant with no run was accepted')
+        .toContain('bind to nothing');
+
       const decided = await approvePending(page, { decision: 'always' });
       expect(decided, 'the commit gate raised no approval to answer').toBeGreaterThan(0);
       await commitOnce();

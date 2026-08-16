@@ -677,7 +677,34 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "agent_runs_token_accounting",
             MigrationStep::Rust(agent_runs_add_token_accounting_columns),
         ),
+        (
+            128,
+            "agents_delegation_roster",
+            MigrationStep::Rust(agents_add_delegation_roster),
+        ),
     ]
+}
+
+/// Which agents an agent may delegate to.
+///
+/// `core.agent_spawn` resolved any name at all, so holding the tool meant
+/// holding the whole roster: the only bounds were numeric (depth, width, the
+/// session run budget). A "team" was therefore a convention in a prompt rather
+/// than a contract anything enforced.
+///
+/// Three states, each meaningful — which is why the column is nullable rather
+/// than defaulting to an empty array:
+///   * `NULL`      — no roster configured; any agent, i.e. what every existing
+///                   agent does today,
+///   * `'[]'`      — explicitly may delegate to nobody,
+///   * `'["a"]'`   — only the names listed.
+///
+/// Idempotent — guarded by a column probe.
+fn agents_add_delegation_roster(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "agents", "allowed_agents_json")? {
+        conn.execute_batch("ALTER TABLE agents ADD COLUMN allowed_agents_json TEXT")?;
+    }
+    Ok(())
 }
 
 /// Completes the accounting of an agent run: the model it spent tokens on and

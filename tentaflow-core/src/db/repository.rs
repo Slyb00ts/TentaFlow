@@ -5252,6 +5252,7 @@ pub fn reseed_core_state_from_current_rows(
                         routable: agent.routable,
                         is_enabled: agent.is_enabled,
                         on_child_complete: &agent.on_child_complete,
+                        allowed_agents_json: agent.allowed_agents_json.as_deref(),
                         actor_user_id: None,
                     };
                     record_core_capture_tx(
@@ -8188,7 +8189,8 @@ pub const AGENT_RUN_STATES: &[&str] = &[
 
 const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, model, tools_json, \
      skills_json, params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, \
-     flow_id, routable, is_enabled, on_child_complete, created_at, updated_at";
+     flow_id, routable, is_enabled, on_child_complete, allowed_agents_json, created_at, \
+     updated_at";
 
 /// Admissible `agents.on_child_complete` values (mirrors the column CHECK).
 pub const AGENT_ON_CHILD_COMPLETE_VALUES: &[&str] = &["notify", "continue"];
@@ -8216,8 +8218,9 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
         routable: row.get::<_, i64>(14)? != 0,
         is_enabled: row.get::<_, i64>(15)? != 0,
         on_child_complete: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        allowed_agents_json: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
 }
 
@@ -8403,8 +8406,8 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
         "INSERT INTO agents \
          (id, name, display_name, description, system_prompt, model, tools_json, skills_json, \
           params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, flow_id, \
-          routable, is_enabled, on_child_complete) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+          routable, is_enabled, on_child_complete, allowed_agents_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
          ON CONFLICT(id) DO UPDATE SET \
          name = excluded.name, display_name = excluded.display_name, \
          description = excluded.description, system_prompt = excluded.system_prompt, \
@@ -8414,6 +8417,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
          max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
          flow_id = excluded.flow_id, routable = excluded.routable, \
          is_enabled = excluded.is_enabled, on_child_complete = excluded.on_child_complete, \
+         allowed_agents_json = excluded.allowed_agents_json, \
          updated_at = datetime('now')",
         rusqlite::params![
             params.id,
@@ -8433,6 +8437,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
             params.routable as i64,
             params.is_enabled as i64,
             params.on_child_complete,
+            params.allowed_agents_json,
         ],
     )?;
     record_core_capture_tx(

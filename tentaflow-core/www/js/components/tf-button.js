@@ -173,8 +173,19 @@ class TfButton extends HTMLElement {
     if (this.hasAttribute('full-width')) classes.push('tf-btn-full-width');
     this._btn.className = classes.join(' ');
 
-    if (this.hasAttribute('disabled')) this._btn.setAttribute('disabled', '');
-    else this._btn.removeAttribute('disabled');
+    if (this.hasAttribute('disabled')) {
+      this._btn.setAttribute('disabled', '');
+      // The host is a custom element, not a form control, so nothing outside
+      // this component treats it as disabled: assistive tech announces it as a
+      // live button and automation happily "clicks" it while the handler above
+      // swallows the event. Both readings have to see the state.
+      this.setAttribute('aria-disabled', 'true');
+      this.style.pointerEvents = 'none';
+    } else {
+      this._btn.removeAttribute('disabled');
+      this.removeAttribute('aria-disabled');
+      this.style.pointerEvents = '';
+    }
 
     const type = this.getAttribute('type');
     if (type) this._btn.setAttribute('type', type);

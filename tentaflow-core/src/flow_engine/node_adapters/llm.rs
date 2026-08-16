@@ -49,7 +49,9 @@ impl LlmNodeAdapter {
             return Ok(m.to_string());
         }
         Err(anyhow!(
-            "llm adapter: no model — node config 'model' nor envelope.meta['model']"
+            "llm adapter: no model. The agent has none, the block has none, and \
+             the node has no model a service can serve — deploy a model or set \
+             one on the agent (Agents → the agent → Model)."
         ))
     }
 
