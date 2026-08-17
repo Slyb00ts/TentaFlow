@@ -22,7 +22,8 @@ use tentaflow_protocol::code_studio::{
     FileEntryInfo, GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo, GrepHitInfo,
     OperationInfo,
     CodeSearchHit, IndexStateInfo, PatchFileDecision, PatchFileInfo, PatchHunkInfo, PatchSetInfo,
-    ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo, RunInfo, SessionInfo, TerminalCellRow,
+    ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo, RunInfo, SessionInfo, TaskInfo,
+    TerminalCellRow,
     TimelineEventInfo, WorkspaceInfo, WorkspaceMemberInfo, WorkspaceMemberInput,
     WorkspaceNodeInfo, WorkspaceUserCandidate, WorktreeInfo,
 };
@@ -646,6 +647,11 @@ fn route_target(payload: &CodeStudioPayload) -> Option<(&str, &str)> {
             ..
         }
         | P::SessionRunsRequest {
+            workspace_id,
+            session_id,
+            ..
+        }
+        | P::SessionTasksRequest {
             workspace_id,
             session_id,
             ..
@@ -1315,6 +1321,10 @@ pub async fn code_studio_dispatch(
             workspace_id,
             session_id,
         } => session_runs_v1(ctx, workspace_id, session_id),
+        P::SessionTasksRequest {
+            workspace_id,
+            session_id,
+        } => session_tasks_v1(ctx, workspace_id, session_id),
         P::SessionMessageSendRequest {
             workspace_id,
             session_id,
@@ -1491,6 +1501,7 @@ pub async fn code_studio_dispatch(
         | P::SessionGrantsListResponse { .. }
         | P::WorkspaceAllowlistListResponse { .. }
         | P::SessionRunsResponse { .. }
+        | P::SessionTasksResponse { .. }
         | P::SessionMessageSendResponse { .. }
         | P::SessionCancelResponse { .. }
         | P::SessionAutonomySetResponse { .. }
@@ -6826,6 +6837,55 @@ fn watch_session_run(
     });
 }
 
+/// The session's plan. Read-only and viewer-level: an operator watching a
+/// session should be able to see exactly the list the build loop's gate is
+/// checking, without being able to tick items off on the agents' behalf.
+fn session_tasks_v1(
+    ctx: &HandlerContext,
+    workspace_id: &str,
+    session_id: &str,
+) -> Result<MessageBody, ProtocolError> {
+    let org = require_read(ctx)?;
+    let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Viewer)?;
+    let rows = crate::code_studio::tools::session_tasks(&scope.pool, &scope.session.id)
+        .map_err(|e| db_error("session_tasks", e))?;
+    let open = crate::code_studio::tools::open_task_count(&scope.pool, &scope.session.id)
+        .map_err(|e| db_error("open_task_count", e))?;
+
+    let tasks = rows
+        .into_iter()
+        .map(|row| TaskInfo {
+            ordinal: row.get("ordinal").and_then(|v| v.as_u64()).unwrap_or(0) as u32,
+            title: row
+                .get("title")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            detail: row
+                .get("detail")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+            status: row
+                .get("status")
+                .and_then(|v| v.as_str())
+                .unwrap_or("pending")
+                .to_string(),
+            note: row
+                .get("note")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default()
+                .to_string(),
+        })
+        .collect();
+
+    Ok(cs(CodeStudioPayload::SessionTasksResponse {
+        session_id: session_id.to_string(),
+        tasks,
+        open: open.max(0) as u32,
+    }))
+}
+
 fn session_runs_v1(
     ctx: &HandlerContext,
     workspace_id: &str,
@@ -8346,6 +8406,10 @@ register_code_studio_variant!(
     "tentaflow_ws_handler_cs_session_runs"
 );
 register_code_studio_variant!(
+    "CodeStudioSessionTasksRequest",
+    "tentaflow_ws_handler_cs_session_tasks"
+);
+register_code_studio_variant!(
     "CodeStudioSessionMessageSendRequest",
     "tentaflow_ws_handler_cs_session_message_send"
 );
@@ -8912,6 +8976,10 @@ mod tests {
                 pattern: "*".into(),
             },
             P::SessionRunsRequest {
+                workspace_id: ws(),
+                session_id: sess(),
+            },
+            P::SessionTasksRequest {
                 workspace_id: ws(),
                 session_id: sess(),
             },

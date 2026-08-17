@@ -201,6 +201,24 @@ test.describe('Code Studio — wymuszony potok', () => {
         .catch(() => null);
       expect((runs?.runs ?? []).length, 'sesja nie pokazuje przebiegow subagentow')
         .toBeGreaterThan(1);
+
+      // The plan is what the build loop's gate checks, so the operator has to be
+      // able to SEE it — otherwise a loop that keeps turning looks arbitrary.
+      const plan = await api(page, 'codeStudioSessionTasksRequest', { workspaceId, sessionId })
+        .catch((e) => ({ err: String(e) }));
+      expect(plan?.err, 'planu nie da sie odczytac przez protokol').toBeFalsy();
+      expect((plan?.tasks ?? []).length, 'planista nie zapisal ani jednego zadania')
+        .toBeGreaterThan(0);
+      expect(plan?.open, 'wykonawca nie odhaczyl planu, a petla i tak sie zamknela')
+        .toBe(0);
+
+      // …and it is on screen, not only on the wire.
+      await page.locator('tf-tab[panel="cs-dock-pane-agenci"]').first()
+        .click({ timeout: 8000 }).catch(() => {});
+      await page.waitForTimeout(1500);
+      const pane = (await page.locator('#cs-dock-pane-agenci').innerText().catch(() => '')).trim();
+      expect(pane, 'panel agentow nie pokazuje planu sesji')
+        .toMatch(new RegExp((plan?.tasks ?? [])[0]?.title?.slice(0, 20) ?? 'PLAN', 'i'));
     });
 
   test('tura, ktora tylko odpowiada, nie ciagnie za soba potoku', async ({ page }) => {

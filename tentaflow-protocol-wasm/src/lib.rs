@@ -19944,6 +19944,13 @@ pub fn encode_code_studio_session_runs_request(request_json: String) -> Result<V
     encode_code_studio_json_request("SessionRunsRequest", &request_json)
 }
 
+/// MessageBody::CodeStudioBody(SessionTasksRequest) — the session's plan: the
+/// task rows the build loop's gate checks before it lets the work finish.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionTasksRequest)]
+pub fn encode_code_studio_session_tasks_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_code_studio_json_request("SessionTasksRequest", &request_json)
+}
+
 /// MessageBody::CodeStudioBody(SessionMessageSendRequest) — a user turn to the
 /// session's root agent.
 #[wasm_bindgen(js_name = encodeCodeStudioSessionMessageSendRequest)]

@@ -407,6 +407,19 @@ pub struct AllowlistEntryInfo {
 
 /// One run of the session chain. `trigger` is why the run exists at all, which
 /// is what makes a revision chain readable instead of a flat list.
+
+/// One task of a session's plan.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TaskInfo {
+    pub ordinal: u32,
+    pub title: String,
+    pub detail: String,
+    /// `pending` | `in_progress` | `done` | `blocked`.
+    pub status: String,
+    /// Why it is blocked, or why it was reopened.
+    pub note: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct RunInfo {
     pub run_id: String,
@@ -1633,6 +1646,23 @@ pub enum CodeStudioPayload {
         node_id: String,
         engine_id: String,
         removed: bool,
+    },
+
+    /// The session's PLAN — the task rows `core.task_plan` wrote and
+    /// `core.task_update` moves. Read-only: the plan belongs to the agents that
+    /// work it, and an operator watching should see the same list the build
+    /// loop's gate is checking.
+    SessionTasksRequest {
+        workspace_id: String,
+        session_id: String,
+    },
+    SessionTasksResponse {
+        session_id: String,
+        /// Tasks in the planner's own order.
+        tasks: Vec<TaskInfo>,
+        /// How many are not `done`. The number the gate acts on, sent so the UI
+        /// never has to re-derive it and disagree.
+        open: u32,
     },
 }
 

@@ -6383,7 +6383,10 @@
       "zmiany": "Changes",
       "git": "Git",
       "terminal": "Terminal",
-      "count_title": "{name}: {count} {count|item|items} in the list"
+      "count_title": "{name}: {count} {count|item|items} in the list",
+      "plan": "Plan",
+      "plan_open": "{count} {count|open task|open tasks}",
+      "plan_done": "all done"
     },
     "legend": {
       "run": "working",

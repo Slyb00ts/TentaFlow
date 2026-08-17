@@ -5025,7 +5025,10 @@
       "zmiany": "Modifications",
       "git": "Git",
       "terminal": "Terminal",
-      "count_title": "{name} : {count} {count|élément|éléments} dans la liste"
+      "count_title": "{name} : {count} {count|élément|éléments} dans la liste",
+      "plan": "Plan",
+      "plan_open": "{count} {count|tâche ouverte|tâches ouvertes}",
+      "plan_done": "tout est fait"
     },
     "legend": {
       "run": "travaille",

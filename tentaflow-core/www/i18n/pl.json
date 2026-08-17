@@ -6519,7 +6519,10 @@
       "zmiany": "Zmiany",
       "git": "Git",
       "terminal": "Terminal",
-      "count_title": "{name}: {count} {count|pozycja|pozycje|pozycji} na liście"
+      "count_title": "{name}: {count} {count|pozycja|pozycje|pozycji} na liście",
+      "plan": "Plan",
+      "plan_open": "{count} {count|otwarte zadanie|otwarte zadania|otwartych zadań}",
+      "plan_done": "wszystko zrobione"
     },
     "legend": {
       "run": "pracuje",

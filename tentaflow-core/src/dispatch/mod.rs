@@ -2067,7 +2067,9 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                     "CodeStudioWorkspaceAllowlistRemoveRequest"
                 }
                 Cs::SessionRunsRequest { .. } => "CodeStudioSessionRunsRequest",
+                Cs::SessionTasksRequest { .. } => "CodeStudioSessionTasksRequest",
                 Cs::SessionRunsResponse { .. } => "CodeStudioSessionRunsResponse",
+                Cs::SessionTasksResponse { .. } => "CodeStudioSessionTasksResponse",
                 Cs::SessionMessageSendRequest { .. } => "CodeStudioSessionMessageSendRequest",
                 Cs::SessionMessageSendResponse { .. } => "CodeStudioSessionMessageSendResponse",
                 Cs::SessionCancelRequest { .. } => "CodeStudioSessionCancelRequest",
@@ -2998,7 +3000,7 @@ mod tests {
         let state = state::AppState::for_test();
         let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
 
-        const ROSTER: [&str; 7] = [
+        const ROSTER: [&str; 8] = [
             "code-orchestrator",
             "code-planner",
             "code-implementer",
@@ -3006,6 +3008,7 @@ mod tests {
             "code-reviewer",
             "code-tester",
             "code-committer",
+            "code-critic",
         ];
 
         let seeded: Vec<(String, String)> = ROSTER
@@ -3021,7 +3024,7 @@ mod tests {
             serde_json::from_str::<Vec<String>>(&seeded[0].1)
                 .unwrap()
                 .len(),
-            26,
+            29,
             "the orchestrator carries the full Code Studio surface"
         );
 

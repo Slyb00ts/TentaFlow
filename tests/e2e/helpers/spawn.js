@@ -65,6 +65,8 @@ warnIfDashboardIsStale();
 const DEFAULT_PORT = 18099;
 const DEFAULT_DB = '/tmp/e2e-ui-test.db';
 const CONFIG_TEMPLATE = path.join(__dirname, '../config-ui-test.toml');
+/// Storage roots of spawned instances, one directory per port.
+const HOME_ROOT = path.join(require('os').tmpdir(), 'tentaflow-e2e-home');
 
 function binaryExists() {
   return fs.existsSync(BINARY);
@@ -111,7 +113,16 @@ function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog
     renderConfig(cfg, port);
   }
   const proc = spawn(BINARY, ['-c', cfg, '--db', db], {
-    env: { ...process.env, RUST_LOG: rustLog },
+    // Every spawned instance gets its OWN storage root. The Sync Ledger (Fjall)
+    // takes an exclusive lock on its directory, so two suites sharing one home
+    // means the second one starts with "FjallError: Locked" and whichever spec
+    // needed the ledger fails for a reason that has nothing to do with it. It
+    // also keeps e2e workspaces out of the developer's real .runtime/data.
+    env: {
+      ...process.env,
+      RUST_LOG: rustLog,
+      TENTAFLOW_HOME: process.env.TENTAFLOW_HOME ?? path.join(HOME_ROOT, `port-${port}`),
+    },
   });
   // Keep an in-memory tail of backend logs so specs can attach them to
   // failure diagnostics (e.g. find_connection / PanelOpen traces).

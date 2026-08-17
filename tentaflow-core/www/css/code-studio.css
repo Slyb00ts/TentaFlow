@@ -70,6 +70,51 @@
 .cs-sheet,
 .cs-scrim { display: none; }
 
+/* ---- Plan sesji (bramka zadań) ---------------------------------------- */
+/* Widoczny nad listą przebiegów: pętla budowania nie zakończy się, dopóki
+   cokolwiek tu jest otwarte, więc operator musi widzieć tę samą listę, którą
+   sprawdza bramka. */
+.cs-plan { margin-bottom: 14px; }
+.cs-plan .cs-dock-title {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+}
+.cs-plan-open {
+  font-size: 10px;
+  font-weight: 500;
+  color: var(--text-3);
+  text-transform: none;
+  letter-spacing: 0;
+}
+.cs-plan-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+}
+.cs-plan-item {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  align-items: start;
+  gap: 7px;
+  font-size: 12px;
+  line-height: 1.35;
+  color: var(--text-2);
+}
+.cs-plan-item .cs-dot { margin-top: 4px; }
+.cs-plan-item.is-done .cs-plan-title {
+  color: var(--text-3);
+  text-decoration: line-through;
+}
+.cs-plan-note {
+  grid-column: 2;
+  font-size: 11px;
+  color: var(--text-3);
+}
+
 /* ---- Workspace bar (switching + status) --------------------------------- */
 .cs-projects {
   display: flex;

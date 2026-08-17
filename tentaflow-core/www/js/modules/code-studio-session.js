@@ -145,6 +145,8 @@ function freshState() {
     operations: [],
     grants: [],
     approvals: [],
+    tasks: [],
+    tasksOpen: 0,
     patchSets: [],
     reviewCount: 0,
     ask: null,
@@ -606,6 +608,18 @@ function buildDock() {
       </tf-tabs>
       <div class="cs-dock-body">
         <div class="cs-dock-pane" id="cs-dock-pane-agenci" data-pane="agenci">
+          <!-- The PLAN, above the runs that work it. The build loop's gate
+               refuses to finish while anything here is open, so an operator
+               watching a session has to be able to see the same list the gate
+               is checking — otherwise the loop looks like it is spinning for
+               no reason. Hidden until a plan exists. -->
+          <div class="cs-plan" data-plan hidden>
+            <div class="cs-dock-title">
+              ${escapeHtml(t('dock.plan'))}
+              <span class="cs-plan-open" data-plan-open></span>
+            </div>
+            <ol class="cs-plan-list" data-plan-list></ol>
+          </div>
           <div class="cs-dock-title">${escapeHtml(t('dock.agents_active'))}</div>
           <!-- Pinned to the run list: the dock is a navigator, and a session
                whose runs have all finished still has to show what it ran and
@@ -1311,7 +1325,7 @@ function reactToEvent(ev, refresh) {
 async function refreshSide(kinds) {
   const jobs = [];
   if (kinds.has('approvals')) jobs.push(loadApprovals());
-  if (kinds.has('runs')) jobs.push(loadRuns());
+  if (kinds.has('runs')) jobs.push(loadRuns(), loadTasks());
   if (kinds.has('operations')) jobs.push(loadOperations());
   if (kinds.has('patchsets')) jobs.push(loadPatchSets());
   if (kinds.has('git')) {
@@ -2250,7 +2264,9 @@ function setCounter(category, value, hot) {
 
 async function bootstrap() {
   await loadRuns();
-  await Promise.allSettled([loadApprovals(), loadOperations(), loadGrants(), loadPatchSets()]);
+  await Promise.allSettled([
+    loadApprovals(), loadOperations(), loadGrants(), loadPatchSets(), loadTasks(),
+  ]);
   await loadTimeline();
 }
 
@@ -2328,6 +2344,53 @@ async function loadGrants() {
   } catch (err) {
     console.warn('[code-studio] grants load failed:', err?.message ?? err);
   }
+}
+
+/// The session's plan. Read-only: the operator watches the same rows the build
+/// loop's gate checks, and ticking one off is the working agent's job.
+async function loadTasks() {
+  try {
+    const resp = await ApiBinary.one('codeStudioSessionTasksRequest', {
+      workspaceId: ctx.workspaceId, sessionId: ctx.sessionId,
+    });
+    state.tasks = resp.tasks || [];
+    state.tasksOpen = Number(resp.open ?? 0);
+    renderTasks();
+  } catch (err) {
+    console.warn('[code-studio] tasks load failed:', err?.message ?? err);
+  }
+}
+
+const TASK_DOT = {
+  done: 'ok', in_progress: 'run', blocked: 'ask', pending: 'idle',
+};
+
+function renderTasks() {
+  const box = host.querySelector('[data-plan]');
+  const list = host.querySelector('[data-plan-list]');
+  const openEl = host.querySelector('[data-plan-open]');
+  if (!box || !list) return;
+  const tasks = state.tasks || [];
+  box.hidden = tasks.length === 0;
+  if (!tasks.length) {
+    list.replaceChildren();
+    return;
+  }
+  if (openEl) {
+    openEl.textContent = state.tasksOpen > 0
+      ? t('dock.plan_open', { count: state.tasksOpen })
+      : t('dock.plan_done');
+  }
+  list.innerHTML = tasks.map((task) => {
+    const status = String(task.status || 'pending');
+    const note = String(task.note || '');
+    return `
+      <li class="cs-plan-item is-${escapeAttr(status)}">
+        <span class="cs-dot ${TASK_DOT[status] || 'idle'}"></span>
+        <span class="cs-plan-title">${escapeHtml(String(task.title || ''))}</span>
+        ${note ? `<span class="cs-plan-note">${escapeHtml(note)}</span>` : ''}
+      </li>`;
+  }).join('');
 }
 
 async function loadApprovals() {

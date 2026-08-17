@@ -510,6 +510,13 @@ mod tests {
 
     #[test]
     fn rasterize_single_page_produces_nonempty_png() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let pdf = minimal_pdf(1);
         let pages = collect_pages(&pdf, 150.0, 200).expect("rasteryzacja 1-stronicowego PDF");
         assert_eq!(pages.len(), 1);
@@ -525,6 +532,13 @@ mod tests {
 
     #[test]
     fn rasterize_respects_page_cap() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let pdf = minimal_pdf(5);
         let count =
             rasterize_pdf_streaming(&pdf, 100.0, 2, |_| Ok(())).expect("rasteryzacja z cap-em");
@@ -537,6 +551,13 @@ mod tests {
     /// jest co najwyżej jedna strona, mimo 6 stron w PDF.
     #[test]
     fn streaming_does_not_materialize_all_pages_at_once() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let pdf = minimal_pdf(6);
         let mut max_alive = 0usize;
         let mut total = 0u32;
@@ -560,6 +581,13 @@ mod tests {
     /// bez błędu — dowód, że backpressure/Closed przerywa pętlę.
     #[test]
     fn streaming_stops_early_when_sink_closes() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let pdf = minimal_pdf(10);
         let mut seen = 0u32;
         let emitted = rasterize_pdf_streaming(&pdf, 80.0, 200, |_| {
@@ -578,6 +606,13 @@ mod tests {
 
     #[test]
     fn extract_pdf_text_reads_embedded_layer() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let pdf = text_layer_pdf(3);
         let res = extract_pdf_text(&pdf, 200).expect("ekstrakcja warstwy tekstowej");
         assert_eq!(res.page_count, 3, "trzy strony");
@@ -600,6 +635,13 @@ mod tests {
 
     #[test]
     fn extract_pdf_text_respects_max_pages() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let pdf = text_layer_pdf(5);
         let res = extract_pdf_text(&pdf, 2).expect("ekstrakcja z cap-em stron");
         assert_eq!(
@@ -620,6 +662,13 @@ mod tests {
 
     #[test]
     fn anti_dos_pixel_cap_scales_down_huge_page() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         // Sztucznie ogromna strona (2000×2000 pt) przy 300 DPI dałaby
         // ~69 MPix; cap MAX_PAGE_PIXELS musi to przeskalować w dół.
         let (w, h) = target_dimensions(2000.0, 2000.0, 300.0);

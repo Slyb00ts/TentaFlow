@@ -7410,6 +7410,13 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  /** MessageBody::CodeStudioBody(SessionTasksRequest). payload: { workspaceId, sessionId } — the session's plan, the rows the build loop's gate checks. */
+  codeStudioSessionTasksRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionTasksRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
   /** MessageBody::CodeStudioBody(SessionMessageSendRequest). payload: { workspaceId, sessionId, message } — a user turn to the session's root agent. */
   codeStudioSessionMessageSendRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
