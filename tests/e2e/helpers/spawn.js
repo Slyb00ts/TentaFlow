@@ -66,7 +66,15 @@ const DEFAULT_PORT = 18099;
 const DEFAULT_DB = '/tmp/e2e-ui-test.db';
 const CONFIG_TEMPLATE = path.join(__dirname, '../config-ui-test.toml');
 /// Storage roots of spawned instances, one directory per port.
-const HOME_ROOT = path.join(require('os').tmpdir(), 'tentaflow-e2e-home');
+///
+/// On DISK, not under `/tmp`: an instance unpacks ~1.5 GB of container bundles
+/// and `/tmp` is a RAM tmpfs here, so a handful of suites would eat the
+/// machine's memory — and, as this repo already learned with native-lib caches,
+/// a full tmpfs truncates extraction instead of failing loudly. `.runtime/` is
+/// gitignored and is where the project keeps runtime data anyway. The path is
+/// stable per port, so repeated runs reuse one directory instead of leaving a
+/// fresh copy behind every time.
+const HOME_ROOT = path.join(__dirname, '../../../.runtime/e2e-home');
 
 function binaryExists() {
   return fs.existsSync(BINARY);
@@ -95,6 +103,12 @@ function renderConfig(outPath, port) {
   return outPath;
 }
 
+function homeForPort(port) {
+  const home = path.join(HOME_ROOT, `port-${port}`);
+  fs.mkdirSync(home, { recursive: true });
+  return home;
+}
+
 function registerCleanup(child) {
   const cleanup = () => {
     try { if (child && !child.killed) child.kill('SIGTERM'); } catch {}
@@ -121,7 +135,7 @@ function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog
     env: {
       ...process.env,
       RUST_LOG: rustLog,
-      TENTAFLOW_HOME: process.env.TENTAFLOW_HOME ?? path.join(HOME_ROOT, `port-${port}`),
+      TENTAFLOW_HOME: process.env.TENTAFLOW_HOME ?? homeForPort(port),
     },
   });
   // Keep an in-memory tail of backend logs so specs can attach them to
