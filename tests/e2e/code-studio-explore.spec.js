@@ -293,7 +293,6 @@ test.describe('Spacer po Code Studio', () => {
     // The point of the console is that you can SEE what the agent did. If the
     // tool calls are invisible, the operator is trusting a black box.
     const shown = (await page.locator('#cs-session-view').innerText().catch(() => '')).toLowerCase();
-    console.log(`  [konsola tresc] ${shown.replace(/\s+/g, ' ').slice(0, 400)}`);
     // The console must SHOW what the agent did — an operator who cannot see the
     // tool calls is trusting a black box.
     for (const trace of ['fs_write', 'hello.py']) {
