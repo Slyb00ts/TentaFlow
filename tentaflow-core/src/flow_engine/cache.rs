@@ -70,10 +70,18 @@ pub struct LoopRegion {
     pub gated: bool,
 }
 
-/// Block type whose presence turns a loop region into a VERDICT-driven loop.
-/// Named here rather than in the adapter because the compiler has to recognise
-/// it before any adapter runs.
+/// Block types whose presence turns a loop region into a VERDICT-driven loop.
+/// Named here rather than in the adapters because the compiler has to recognise
+/// them before any adapter runs.
 pub const CRITIC_GATE_NODE_TYPE: &str = "critic_gate";
+/// The plan gate. A region holding only this one is still verdict-driven: it
+/// spins until the plan has no open task left.
+pub const TASK_GATE_NODE_TYPE: &str = "task_gate";
+
+/// Does this block decide when a loop region ends?
+pub fn is_loop_gate(node_type: &str) -> bool {
+    node_type == CRITIC_GATE_NODE_TYPE || node_type == TASK_GATE_NODE_TYPE
+}
 
 /// Envelope meta the gate sets when the reviewer is satisfied. The region
 /// runner reads it as a structural stop.
@@ -446,7 +454,7 @@ fn build_regions(
 
         let gated = member_pos
             .iter()
-            .any(|&pos| def.nodes[execution_order[pos]].node_type == CRITIC_GATE_NODE_TYPE);
+            .any(|&pos| is_loop_gate(&def.nodes[execution_order[pos]].node_type));
 
         regions.push(LoopRegion {
             id: region_id.to_string(),

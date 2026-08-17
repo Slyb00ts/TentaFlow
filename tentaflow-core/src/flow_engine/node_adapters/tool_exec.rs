@@ -791,6 +791,16 @@ impl NodeAdapter for ToolExecNodeAdapter {
         // End detection: an assistant turn without tool calls is the final
         // response — signal the loop to stop (§1.1, §3.4).
         if calls.is_empty() {
+            // The counter must EXIST after the loop even when the turn called
+            // nothing: a graph downstream asks "did this turn do any work?", and
+            // an absent variable makes that question a hard evaluation error
+            // instead of the answer "no".
+            if !out.variables.contains_key(TOOL_CALLS_TOTAL_VAR) {
+                out.variables.insert(
+                    TOOL_CALLS_TOTAL_VAR.to_string(),
+                    FlowValue::Json(serde_json::json!(0)),
+                );
+            }
             out.meta
                 .insert("harness_done".into(), serde_json::json!(true));
             out.meta.insert(
@@ -1100,6 +1110,88 @@ mod tests {
         assert_eq!(
             out.meta.get("harness_exit_reason").and_then(|v| v.as_str()),
             Some("final_response")
+        );
+        // A turn that called nothing still has to ANSWER the question "how much
+        // did this turn do?". Leaving the variable out made a downstream
+        // `vars.tool_calls_total > 0` blow the whole flow up with "No such key"
+        // instead of taking the cheap branch.
+        assert_eq!(
+            out.variables.get(TOOL_CALLS_TOTAL_VAR),
+            Some(&FlowValue::Json(json!(0))),
+            "an idle turn must report zero, not nothing"
+        );
+    }
+
+    /// …and a turn that DID call tools reports how many, summed over the loop's
+    /// iterations rather than reset by each one.
+    #[tokio::test]
+    async fn tool_calls_are_counted_across_iterations() {
+        let pool = db();
+        let slot = service(pool.clone());
+        let ctx = stub_ctx();
+
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("agent-count"));
+        crate::db::repository::upsert_agent(
+            &pool,
+            &crate::db::models::AgentParams {
+                id: "agent-count",
+                name: "counter",
+                display_name: None,
+                description: "Liczy wywolania narzedzi w tescie.",
+                system_prompt: None,
+                model: None,
+                tools_json: r#"["core.skill_view"]"#,
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 5,
+                timeout_secs: 60,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: false,
+                is_enabled: true,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                actor_user_id: None
+            },
+        )
+        .expect("agent");
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "c1".into(),
+                name: "core.skill_view".into(),
+                arguments: r#"{"name":"nieistniejacy"}"#.into(),
+            }]));
+
+        let first = ToolExecNodeAdapter::new(slot.clone())
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .expect("first iteration");
+        assert_eq!(
+            first.variables.get(TOOL_CALLS_TOTAL_VAR),
+            Some(&FlowValue::Json(json!(1)))
+        );
+
+        // Feed the result back in, exactly as the loop region does.
+        let mut second_env = first.clone();
+        second_env
+            .context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "c2".into(),
+                name: "core.skill_view".into(),
+                arguments: r#"{"name":"nieistniejacy"}"#.into(),
+            }]));
+        let second = ToolExecNodeAdapter::new(slot)
+            .execute(&node(json!({})), &[input(second_env)], &ctx)
+            .await
+            .expect("second iteration");
+        assert_eq!(
+            second.variables.get(TOOL_CALLS_TOTAL_VAR),
+            Some(&FlowValue::Json(json!(2))),
+            "the counter must accumulate, not restart each iteration"
         );
     }
 

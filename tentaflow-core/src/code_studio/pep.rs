@@ -20,6 +20,12 @@ use super::models::{AutonomyMode, WorkspaceRole};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Capability {
     FsRead,
+    /// Writing the session's PLAN — an ordered list of tasks with their
+    /// state. Deliberately NOT `FsWrite`: the plan is session state, not
+    /// repository content, so a planner that holds no write tools must
+    /// still be able to record what it decided, and recording it must not
+    /// raise a file-write approval. Reading the plan needs only `FsRead`.
+    TaskPlan,
     /// Semantic search over the index (§14). Separate from `fs_read` because it
     /// answers from a DERIVED artifact with its own bounds (§10: a prefix and a
     /// result limit), and a permission written for reading files should not
@@ -70,6 +76,7 @@ impl Capability {
             Capability::CliDelegate => "cli_delegate",
             Capability::ReviewDecide => "review_decide",
             Capability::SecretManage => "secret_manage",
+            Capability::TaskPlan => "task_plan",
             Capability::WorkspaceSettings => "workspace_settings",
             Capability::MemberManage => "member_manage",
         }
@@ -82,7 +89,7 @@ impl Capability {
     /// Every capability, in a fixed order. Used wherever a caller has to reason
     /// about the whole set — resolving what a role holds, for instance —
     /// instead of re-listing the enum and drifting from it.
-    pub const ALL: [Capability; 21] = [
+    pub const ALL: [Capability; 22] = [
         Capability::FsRead,
         Capability::CodeSearch,
         Capability::FsWrite,
@@ -102,6 +109,7 @@ impl Capability {
         Capability::CliDelegate,
         Capability::ReviewDecide,
         Capability::SecretManage,
+        Capability::TaskPlan,
         Capability::WorkspaceSettings,
         Capability::MemberManage,
     ];

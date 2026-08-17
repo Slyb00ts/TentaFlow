@@ -55,6 +55,16 @@ fn pdfium() -> Result<&'static Pdfium, RasterizeError> {
     }
 }
 
+/// Czy pdfium da się w ogóle załadować na tej maszynie.
+///
+/// `native-libs/` nie jest commitowane (patrz CLAUDE.md — każdy buduje lokalnie),
+/// więc świeży checkout tej biblioteki nie ma. Test, który z tego powodu PADA,
+/// uczy ignorowania czerwonego; test, który się pomija z podanym powodem, nadal
+/// biegnie wszędzie tam, gdzie biblioteka jest.
+pub fn pdfium_available() -> bool {
+    pdfium().is_ok()
+}
+
 /// Lokalizuje `libpdfium.{so,dylib,dll}` w runtime. Kolejność:
 ///   1. `TENTAFLOW_PDFIUM_LIB` (jawny override pliku — używany w testach/CI).
 ///   2. Katalog binarki (`tentaflow/build.rs` kopiuje lib-dynamic obok exe).

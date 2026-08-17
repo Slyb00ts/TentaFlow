@@ -272,6 +272,10 @@ pub struct OperatorAsk<'a> {
 /// second resolution path would be a second reading of membership, autonomy and
 /// the workspace ceiling — the two would drift, and the drift would be a
 /// permission bug nobody could see in either file.
+/// Ceiling on a plan. Not a storage limit — a list longer than this is a
+/// plan nobody supervises, and the point of the rows is supervision.
+const MAX_PLAN_TASKS: usize = 60;
+
 pub struct Bound {
     pub workspace: WorkspaceRecord,
     pub session: SessionRecord,
@@ -291,7 +295,10 @@ pub fn capability_of(tool: CoreToolName) -> Option<Capability> {
         | CoreToolName::FsList
         | CoreToolName::FsGlob
         | CoreToolName::FsGrep
-        | CoreToolName::WorkspaceInfo => Capability::FsRead,
+        | CoreToolName::WorkspaceInfo
+        // Reading the plan is reading session state, not writing it.
+        | CoreToolName::TaskList => Capability::FsRead,
+        CoreToolName::TaskPlan | CoreToolName::TaskUpdate => Capability::TaskPlan,
         CoreToolName::CodeSearch => Capability::CodeSearch,
         CoreToolName::FsWrite | CoreToolName::FsEdit | CoreToolName::FsMkdir => Capability::FsWrite,
         // A move destroys the source path just as a delete does, so it is
@@ -961,6 +968,9 @@ async fn run_tool(
 ) -> Result<Value> {
     match tool {
         CoreToolName::WorkspaceInfo => workspace_info(bound),
+        CoreToolName::TaskPlan => task_plan(bound, args),
+        CoreToolName::TaskUpdate => task_update(bound, args),
+        CoreToolName::TaskList => task_list(bound),
         CoreToolName::FsRead
         | CoreToolName::FsList
         | CoreToolName::FsGlob
@@ -985,6 +995,153 @@ async fn run_tool(
             other.public_name()
         )),
     }
+}
+
+// -----------------------------------------------------------------------------
+// The plan, as rows
+// -----------------------------------------------------------------------------
+
+/// Reads the session's plan. Shared by the tool, by the gate that decides
+/// whether the build loop may finish, and by the dashboard — one query, so the
+/// three can never disagree about what "still open" means.
+pub fn session_tasks(pool: &DbPool, session_id: &str) -> Result<Vec<Value>> {
+    let conn = pool.read().map_err(|_| anyhow!("workspace db poisoned"))?;
+    let mut stmt = conn.prepare(
+        "SELECT ordinal, title, detail, status, note FROM session_tasks \
+         WHERE session_id = ?1 ORDER BY ordinal",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![session_id], |row| {
+            Ok(json!({
+                "ordinal": row.get::<_, i64>(0)?,
+                "title": row.get::<_, String>(1)?,
+                "detail": row.get::<_, String>(2)?,
+                "status": row.get::<_, String>(3)?,
+                "note": row.get::<_, String>(4)?,
+            }))
+        })?
+        .filter_map(std::result::Result::ok)
+        .collect();
+    Ok(rows)
+}
+
+/// A task counts as OPEN until it is done. `blocked` is open on purpose: work
+/// that ran into a wall is unfinished work, and letting it pass as a terminal
+/// state is exactly how a half-built change gets reported as complete.
+pub fn open_task_count(pool: &DbPool, session_id: &str) -> Result<i64> {
+    let conn = pool.read().map_err(|_| anyhow!("workspace db poisoned"))?;
+    let count = conn.query_row(
+        "SELECT COUNT(*) FROM session_tasks WHERE session_id = ?1 AND status <> 'done'",
+        rusqlite::params![session_id],
+        |row| row.get::<_, i64>(0),
+    )?;
+    Ok(count)
+}
+
+fn task_plan(bound: &Bound, args: &Value) -> Result<Value> {
+    let tasks = args
+        .get("tasks")
+        .and_then(|v| v.as_array())
+        .ok_or_else(|| anyhow!("core.task_plan: 'tasks' must be an array"))?;
+    if tasks.is_empty() {
+        return Err(anyhow!(
+            "core.task_plan: a plan with no tasks is not a plan — list what has to be done"
+        ));
+    }
+    if tasks.len() > MAX_PLAN_TASKS {
+        return Err(anyhow!(
+            "core.task_plan: {} tasks is beyond the {MAX_PLAN_TASKS} a plan may hold — \
+             group them or split the work",
+            tasks.len()
+        ));
+    }
+
+    let conn = bound
+        .pool
+        .write()
+        .map_err(|_| anyhow!("workspace db poisoned"))?;
+    let tx = conn.unchecked_transaction()?;
+    // Replacing rather than appending: this is THE plan, and a second call is a
+    // revised plan, not a longer one. Statuses of a previous revision are not
+    // carried over — a task the planner rewrote is not a task somebody finished.
+    tx.execute(
+        "DELETE FROM session_tasks WHERE session_id = ?1",
+        rusqlite::params![bound.session.id],
+    )?;
+    for (index, task) in tasks.iter().enumerate() {
+        let title = task
+            .get("title")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| anyhow!("core.task_plan: task {} has no title", index + 1))?;
+        let detail = task.get("detail").and_then(|v| v.as_str()).unwrap_or("");
+        tx.execute(
+            "INSERT INTO session_tasks (id, session_id, ordinal, title, detail) \
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                uuid::Uuid::new_v4().to_string(),
+                bound.session.id,
+                (index + 1) as i64,
+                title,
+                detail,
+            ],
+        )?;
+    }
+    tx.commit()?;
+    drop(conn);
+
+    Ok(json!({
+        "saved": tasks.len(),
+        "tasks": session_tasks(&bound.pool, &bound.session.id)?,
+    }))
+}
+
+fn task_update(bound: &Bound, args: &Value) -> Result<Value> {
+    let ordinal = args
+        .get("ordinal")
+        .and_then(serde_json::Value::as_i64)
+        .ok_or_else(|| anyhow!("core.task_update: 'ordinal' must be a number"))?;
+    let status = args
+        .get("status")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("core.task_update: 'status' is required"))?;
+    if !matches!(status, "pending" | "in_progress" | "done" | "blocked") {
+        return Err(anyhow!(
+            "core.task_update: '{status}' is not a state — use pending, in_progress, done or blocked"
+        ));
+    }
+    let note = args.get("note").and_then(|v| v.as_str()).unwrap_or("");
+
+    let changed = {
+        let conn = bound
+            .pool
+            .write()
+            .map_err(|_| anyhow!("workspace db poisoned"))?;
+        conn.execute(
+            "UPDATE session_tasks SET status = ?1, note = ?2, updated_at = datetime('now') \
+             WHERE session_id = ?3 AND ordinal = ?4",
+            rusqlite::params![status, note, bound.session.id, ordinal],
+        )?
+    };
+    if changed == 0 {
+        return Err(anyhow!(
+            "core.task_update: this session's plan has no task {ordinal} — \
+             call core.task_list to see it"
+        ));
+    }
+
+    let tasks = session_tasks(&bound.pool, &bound.session.id)?;
+    let open = open_task_count(&bound.pool, &bound.session.id)?;
+    Ok(json!({ "updated": ordinal, "open": open, "tasks": tasks }))
+}
+
+fn task_list(bound: &Bound) -> Result<Value> {
+    let tasks = session_tasks(&bound.pool, &bound.session.id)?;
+    Ok(json!({
+        "open": open_task_count(&bound.pool, &bound.session.id)?,
+        "tasks": tasks,
+    }))
 }
 
 fn workspace_info(bound: &Bound) -> Result<Value> {
@@ -3603,4 +3760,127 @@ mod tests {
         assert_eq!(bounded["exit_code"], 0);
         assert_eq!(bounded["truncated"], true);
     }
+
+    /// A `Bound` whose workspace.db really has the session row the plan hangs
+    /// off, so the foreign key on `session_tasks` is exercised rather than
+    /// bypassed.
+    fn planning_bound(slug: &str) -> Bound {
+        let dir = super::super::paths::workspace_dir(slug).expect("workspace dir");
+        std::fs::create_dir_all(&dir).expect("workspace layout");
+        let (pool, _) = workspace_db::open_pool_at(&dir).expect("workspace.db");
+        {
+            let conn = pool.write().expect("write");
+            conn.execute(
+                "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
+                 flow_id, flow_version_id, status, created_at, updated_at) \
+                 VALUES ('s-plan', ?1, 'u', 'Session', 'cs/u/1', 'autonomous', 'f', 'v', 'idle', \
+                 datetime('now'), datetime('now'))",
+                rusqlite::params![slug],
+            )
+            .expect("seed session");
+        }
+        let mut bound = test_bound(std::path::Path::new("."));
+        bound.pool = pool;
+        bound.session.id = "s-plan".into();
+        bound.workspace.id = slug.into();
+        bound
+    }
+
+    #[test]
+    fn a_plan_becomes_rows_and_a_second_plan_replaces_the_first() {
+        let _guard = super::super::paths::test_data_dir_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(dir.path().to_string_lossy().to_string()),
+        );
+        let bound = planning_bound("ws-plan-1");
+
+        let saved = task_plan(
+            &bound,
+            &json!({"tasks": [
+                {"title": "Napisac endpoint", "detail": "GET /health zwraca 200"},
+                {"title": "Dodac test", "detail": "test przechodzi w CI"}
+            ]}),
+        )
+        .expect("plan saves");
+        assert_eq!(saved.get("saved").and_then(|v| v.as_u64()), Some(2));
+        assert_eq!(open_task_count(&bound.pool, &bound.session.id).unwrap(), 2);
+
+        // A revised plan is THE plan, not an appendix to it.
+        task_plan(&bound, &json!({"tasks": [{"title": "Jedno zadanie"}]})).expect("replan");
+        let tasks = session_tasks(&bound.pool, &bound.session.id).unwrap();
+        assert_eq!(tasks.len(), 1, "a second plan must replace, not append");
+        assert_eq!(tasks[0].get("ordinal").and_then(|v| v.as_i64()), Some(1));
+
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    #[test]
+    fn only_a_done_task_stops_counting_as_open() {
+        let _guard = super::super::paths::test_data_dir_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(dir.path().to_string_lossy().to_string()),
+        );
+        let bound = planning_bound("ws-plan-2");
+        task_plan(
+            &bound,
+            &json!({"tasks": [{"title": "A"}, {"title": "B"}, {"title": "C"}]}),
+        )
+        .expect("plan");
+
+        task_update(&bound, &json!({"ordinal": 1, "status": "in_progress"})).expect("start");
+        assert_eq!(open_task_count(&bound.pool, &bound.session.id).unwrap(), 3);
+
+        task_update(&bound, &json!({"ordinal": 1, "status": "done"})).expect("finish");
+        assert_eq!(open_task_count(&bound.pool, &bound.session.id).unwrap(), 2);
+
+        // Blocked is NOT a terminal success: work that hit a wall is unfinished
+        // work, and counting it as done is how half a change gets reported whole.
+        task_update(
+            &bound,
+            &json!({"ordinal": 2, "status": "blocked", "note": "brak dostepu"}),
+        )
+        .expect("block");
+        assert_eq!(
+            open_task_count(&bound.pool, &bound.session.id).unwrap(),
+            2,
+            "a blocked task must keep the work open"
+        );
+
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    #[test]
+    fn a_plan_refuses_to_be_empty_and_a_task_refuses_to_be_invented() {
+        let _guard = super::super::paths::test_data_dir_guard();
+        let dir = tempfile::tempdir().expect("tmp");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(dir.path().to_string_lossy().to_string()),
+        );
+        let bound = planning_bound("ws-plan-3");
+
+        assert!(
+            task_plan(&bound, &json!({"tasks": []})).is_err(),
+            "an empty plan is not a plan"
+        );
+        assert!(
+            task_plan(&bound, &json!({"tasks": [{"detail": "bez tytulu"}]})).is_err(),
+            "a task without a title cannot be supervised"
+        );
+
+        task_plan(&bound, &json!({"tasks": [{"title": "A"}]})).expect("plan");
+        let err = task_update(&bound, &json!({"ordinal": 7, "status": "done"}))
+            .expect_err("a task that does not exist cannot be finished");
+        assert!(
+            err.to_string().contains("no task 7"),
+            "the refusal should name the missing task: {err}"
+        );
+
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
 }

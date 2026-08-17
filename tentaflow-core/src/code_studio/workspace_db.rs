@@ -37,7 +37,7 @@ const MAX_OPEN_POOLS: usize = 16;
 const IDLE_CLOSE: Duration = Duration::from_secs(600);
 
 /// Highest runtime schema version this binary knows.
-pub const LATEST_SCHEMA_VERSION: i64 = 9;
+pub const LATEST_SCHEMA_VERSION: i64 = 10;
 
 struct Entry {
     pool: DbPool,
@@ -215,6 +215,37 @@ fn run_migrations(conn: &Connection) -> Result<i64> {
     Ok(latest)
 }
 
+/// The plan, as ROWS rather than as prose in a message.
+///
+/// A plan written into the conversation is a suggestion: nothing can tell
+/// whether it was carried out, and "all tasks done" is a claim the model makes
+/// about itself. Rows make the same plan checkable — the gate that ends the
+/// build loop can ask the database how many tasks are still open instead of
+/// believing a sentence.
+///
+/// `ordinal` is the planner's own numbering, kept so the list reads in the order
+/// it was thought out. One task belongs to one session; a plan is per turn of
+/// work, not per workspace.
+const WORKSPACE_SCHEMA_V10: &str = r#"
+CREATE TABLE session_tasks (
+    id TEXT PRIMARY KEY,
+    session_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL,
+    title TEXT NOT NULL,
+    detail TEXT NOT NULL DEFAULT '',
+    -- 'pending' | 'in_progress' | 'done' | 'blocked'. 'blocked' is deliberately
+    -- NOT a terminal success: a plan with a blocked task is not a finished plan.
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in_progress', 'done', 'blocked')),
+    note TEXT NOT NULL DEFAULT '',
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    updated_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (session_id) REFERENCES sessions(id) ON DELETE CASCADE
+);
+CREATE INDEX idx_session_tasks_session ON session_tasks(session_id, ordinal);
+CREATE INDEX idx_session_tasks_open ON session_tasks(session_id, status);
+"#;
+
 const MIGRATIONS: &[(i64, &str)] = &[
     (1, WORKSPACE_SCHEMA_V1),
     (2, WORKSPACE_SCHEMA_V2),
@@ -225,6 +256,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (7, WORKSPACE_SCHEMA_V7),
     (8, WORKSPACE_SCHEMA_V8),
     (9, WORKSPACE_SCHEMA_V9),
+    (10, WORKSPACE_SCHEMA_V10),
 ];
 
 const WORKSPACE_SCHEMA_V1: &str = r#"

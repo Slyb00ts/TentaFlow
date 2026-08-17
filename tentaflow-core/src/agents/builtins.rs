@@ -103,6 +103,16 @@ pub enum CoreToolName {
     CodeSearch,
     /// `core.workspace_info` — the session's workspace facts, no host paths.
     WorkspaceInfo,
+    /// `core.task_plan(tasks)` — writes THE plan as rows: an ordered list of
+    /// tasks with completion criteria, replacing whatever plan the session had.
+    /// A plan in prose cannot be checked; a plan in rows can, which is what
+    /// lets the build loop refuse to finish while work is still open.
+    TaskPlan,
+    /// `core.task_update(ordinal, status, note?)` — moves ONE task of the plan
+    /// between pending / in_progress / done / blocked.
+    TaskUpdate,
+    /// `core.task_list()` — the plan and where each task stands.
+    TaskList,
 }
 
 impl CoreToolName {
@@ -138,6 +148,9 @@ impl CoreToolName {
             CoreToolName::GitMergeFinalize => "core.git_merge_finalize",
             CoreToolName::CodeSearch => "core.code_search",
             CoreToolName::WorkspaceInfo => "core.workspace_info",
+            CoreToolName::TaskPlan => "core.task_plan",
+            CoreToolName::TaskUpdate => "core.task_update",
+            CoreToolName::TaskList => "core.task_list",
         }
     }
 
@@ -233,6 +246,9 @@ impl CoreToolName {
                 | CoreToolName::GitMergeFinalize
                 | CoreToolName::CodeSearch
                 | CoreToolName::WorkspaceInfo
+                | CoreToolName::TaskPlan
+                | CoreToolName::TaskUpdate
+                | CoreToolName::TaskList
         )
     }
 
@@ -268,6 +284,9 @@ impl CoreToolName {
             CoreToolName::GitMergeFinalize,
             CoreToolName::CodeSearch,
             CoreToolName::WorkspaceInfo,
+            CoreToolName::TaskPlan,
+            CoreToolName::TaskUpdate,
+            CoreToolName::TaskList,
         ]
     }
 
@@ -1057,6 +1076,61 @@ impl CoreToolName {
                     "required": ["query"]
                 }),
             },
+            CoreToolName::TaskPlan => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Write THE plan for this session as an ordered list of tasks. \
+                              Replaces any previous plan. Each task needs a title and a \
+                              completion criterion concrete enough that someone else can \
+                              tell whether it was met. The list is what the build loop \
+                              checks before it agrees the work is finished, so a plan left \
+                              in prose is a plan nobody can verify."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tasks": {
+                            "type": "array",
+                            "description": "Tasks in the order they should be done.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string", "description": "What to do, in one line."},
+                                    "detail": {"type": "string", "description": "How to tell it is done, and which files it touches."}
+                                },
+                                "required": ["title"]
+                            }
+                        }
+                    },
+                    "required": ["tasks"]
+                }),
+            },
+            CoreToolName::TaskUpdate => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Move one task of the plan to a new state. Use 'in_progress' \
+                              when you start it, 'done' only once its completion criterion \
+                              is actually met, and 'blocked' with a note when something \
+                              stops you — a blocked task keeps the work open rather than \
+                              quietly passing as finished."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ordinal": {"type": "integer", "description": "Task number as shown by core.task_list."},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "done", "blocked"]
+                        },
+                        "note": {"type": "string", "description": "Why, when blocking or reopening."}
+                    },
+                    "required": ["ordinal", "status"]
+                }),
+            },
+            CoreToolName::TaskList => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "The plan of this session and where each task stands."
+                    .to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
             CoreToolName::WorkspaceInfo => LlmToolSpec {
                 name: self.public_name().to_string(),
                 description: "Describe the repository you are working in: name, current branch, \
@@ -1247,6 +1321,11 @@ mod tests {
             "core.git_stage",
             "core.git_sync",
             "core.workspace_info",
+            // The plan verbs: §10's verb set is what a coding agent can DO, and
+            // recording the plan it works to is part of that.
+            "core.task_plan",
+            "core.task_update",
+            "core.task_list",
         ];
         expected.sort_unstable();
         assert_eq!(actual, expected);

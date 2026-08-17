@@ -3203,34 +3203,55 @@ mod concurrent_executor_tests {
             .expect("exec")
     }
 
+    /// Wall-clock budget of everything that is NOT the sleeping: compiling the
+    /// graph, opening the db, scheduling. Measured rather than guessed, because
+    /// a fixed threshold small enough to prove concurrency on a fast machine is
+    /// a threshold that fails on a loaded one — which is exactly how the
+    /// previous version of these two tests spent its life red without ever
+    /// pointing at a real defect.
+    async fn fanout_overhead(json_zero_sleep: &str) -> Duration {
+        let start = Instant::now();
+        let _ = run_with_db(json_zero_sleep, db()).await;
+        start.elapsed()
+    }
+
     #[tokio::test]
     async fn fanout_branches_run_concurrently_and_combine_waits() {
-        // trigger → a(150ms) + b(150ms) → combine → output.
-        // Sekwencyjnie ~300ms; równolegle ~150ms. Combine widzi oba wyniki
-        // (dowód że czekał na wolniejszą gałąź = bariera).
-        let json = r#"{
+        // trigger → a + b → combine → output. Combine seeing both results is
+        // the proof that it waited for the slower branch (a barrier); the
+        // timing is the proof that the two did not queue behind each other.
+        const SLEEP_MS: u64 = 400;
+        let graph = |ms: u64| format!(r#"{{
             "nodes":[
-                {"id":"t","type":"trigger","config":{}},
-                {"id":"a","type":"sleep","config":{"sleep_ms":150}},
-                {"id":"b","type":"sleep","config":{"sleep_ms":150}},
-                {"id":"c","type":"combine","config":{}},
-                {"id":"o","type":"output","config":{}}
+                {{"id":"t","type":"trigger","config":{{}}}},
+                {{"id":"a","type":"sleep","config":{{"sleep_ms":{ms}}}}},
+                {{"id":"b","type":"sleep","config":{{"sleep_ms":{ms}}}}},
+                {{"id":"c","type":"combine","config":{{}}}},
+                {{"id":"o","type":"output","config":{{}}}}
             ],
             "edges":[
-                {"from":"t","to":"a","from_port":"text","to_port":"in"},
-                {"from":"t","to":"b","from_port":"text","to_port":"in"},
-                {"from":"a","to":"c","from_port":"full","to_port":"in"},
-                {"from":"b","to":"c","from_port":"full","to_port":"in"},
-                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+                {{"from":"t","to":"a","from_port":"text","to_port":"in"}},
+                {{"from":"t","to":"b","from_port":"text","to_port":"in"}},
+                {{"from":"a","to":"c","from_port":"full","to_port":"in"}},
+                {{"from":"b","to":"c","from_port":"full","to_port":"in"}},
+                {{"from":"c","to":"o","from_port":"full","to_port":"text"}}
             ]
-        }"#;
+        }}"#);
+
+        let overhead = fanout_overhead(&graph(0)).await;
         let db = db();
         let start = Instant::now();
-        let outcome = run_with_db(json, db).await;
+        let outcome = run_with_db(&graph(SLEEP_MS), db).await;
         let elapsed = start.elapsed();
+
+        // Concurrent ≈ one sleep, sequential ≈ two. Half-way between them is the
+        // only threshold that separates the two answers without also measuring
+        // how busy the machine is.
+        let sleeping = elapsed.saturating_sub(overhead);
         assert!(
-            elapsed < Duration::from_millis(280),
-            "branches must run concurrently, took {elapsed:?}"
+            sleeping < Duration::from_millis(SLEEP_MS + SLEEP_MS / 2),
+            "branches must run concurrently: {sleeping:?} of sleeping for two \
+             {SLEEP_MS}ms branches (overhead {overhead:?}, total {elapsed:?})"
         );
         let text = outcome.final_envelope.payload.as_text().unwrap_or("");
         assert!(text.contains("a"), "combine missing branch a: {text:?}");
@@ -3238,45 +3259,55 @@ mod concurrent_executor_tests {
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
     }
 
+
     #[tokio::test]
     async fn five_way_fanout_from_one_node_recombines() {
-        // src → 5 niezależnych gałęzi (80ms) → combine. Dowolny fan-out z
-        // dowolnego noda + zbiórka na końcu.
-        let json = r#"{
-            "nodes":[
-                {"id":"t","type":"trigger","config":{}},
-                {"id":"src","type":"sleep","config":{}},
-                {"id":"n1","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n2","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n3","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n4","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n5","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"c","type":"combine","config":{}},
-                {"id":"o","type":"output","config":{}}
-            ],
-            "edges":[
-                {"from":"t","to":"src","from_port":"text","to_port":"in"},
-                {"from":"src","to":"n1","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n2","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n3","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n4","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n5","from_port":"full","to_port":"in"},
-                {"from":"n1","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n2","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n3","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n4","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n5","to":"c","from_port":"full","to_port":"in"},
-                {"from":"c","to":"o","from_port":"full","to_port":"text"}
-            ]
-        }"#;
+        // src → five independent branches → combine. Sequentially five sleeps,
+        // concurrently one; the gap is what this measures.
+        const SLEEP_MS: u64 = 300;
+        let graph = |ms: u64| {
+            let branches: Vec<String> = (1..=5)
+                .map(|n| format!(r#"{{"id":"n{n}","type":"sleep","config":{{"sleep_ms":{ms}}}}}"#))
+                .collect();
+            let from_src: Vec<String> = (1..=5)
+                .map(|n| format!(r#"{{"from":"src","to":"n{n}","from_port":"full","to_port":"in"}}"#))
+                .collect();
+            let to_combine: Vec<String> = (1..=5)
+                .map(|n| format!(r#"{{"from":"n{n}","to":"c","from_port":"full","to_port":"in"}}"#))
+                .collect();
+            format!(
+                r#"{{
+                    "nodes":[
+                        {{"id":"t","type":"trigger","config":{{}}}},
+                        {{"id":"src","type":"sleep","config":{{}}}},
+                        {},
+                        {{"id":"c","type":"combine","config":{{}}}},
+                        {{"id":"o","type":"output","config":{{}}}}
+                    ],
+                    "edges":[
+                        {{"from":"t","to":"src","from_port":"text","to_port":"in"}},
+                        {},
+                        {},
+                        {{"from":"c","to":"o","from_port":"full","to_port":"text"}}
+                    ]
+                }}"#,
+                branches.join(",\n                        "),
+                from_src.join(",\n                        "),
+                to_combine.join(",\n                        "),
+            )
+        };
+
+        let overhead = fanout_overhead(&graph(0)).await;
         let db = db();
         let start = Instant::now();
-        let outcome = run_with_db(json, db).await;
+        let outcome = run_with_db(&graph(SLEEP_MS), db).await;
         let elapsed = start.elapsed();
-        // Sekwencyjnie 5×80=400ms; równolegle ~80ms.
+
+        let sleeping = elapsed.saturating_sub(overhead);
         assert!(
-            elapsed < Duration::from_millis(280),
-            "5 branches must run concurrently, took {elapsed:?}"
+            sleeping < Duration::from_millis(SLEEP_MS * 2),
+            "5 branches must run concurrently: {sleeping:?} of sleeping for five \
+             {SLEEP_MS}ms branches (overhead {overhead:?}, total {elapsed:?})"
         );
         let text = outcome.final_envelope.payload.as_text().unwrap_or("");
         for id in ["n1", "n2", "n3", "n4", "n5"] {

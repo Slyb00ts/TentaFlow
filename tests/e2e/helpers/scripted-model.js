@@ -166,19 +166,39 @@ function delegationScripts({ path = 'from_subagent.py', message = 'Napisane prze
 function enforcedPipelineScripts() {
   return [
     {
-      // The planner's system prompt opens with this sentence.
+      // The planner's system prompt opens with this sentence. It writes the plan
+      // as ROWS — prose would not be checkable, and the build loop's task gate
+      // reads the rows rather than the conversation.
       match: 'Jesteś planistą zmian w kodzie',
-      steps: [say('Plan:\n1. Napisać hello.py wypisujące powitanie.\n2. Uruchomić je i sprawdzić wyjście.')],
+      steps: [
+        tool('core.task_plan', {
+          tasks: [
+            { title: 'Napisać program wypisujący powitanie',
+              detail: 'plik hello.py istnieje i wypisuje tekst' },
+          ],
+        }),
+        say('Plan zapisany: jedno zadanie.'),
+      ],
     },
     {
       // Both critics share one agent, so one route serves the plan review and
       // the build review. `BEZ UWAG` is the marker the seeded gate matches.
       match: 'Jestes krytykiem',
+      // Both critics are the same agent and a review loop asks every round, so
+      // this answer has to be available more than once.
+      repeat: true,
       steps: [say('Sprawdziłem względem pierwotnych wytycznych — BEZ UWAG.')],
     },
     {
+      // The implementer works the plan and closes it. Leaving a task open is
+      // what keeps the build loop turning, so this is also the step that proves
+      // the gate can be satisfied at all.
       match: 'Piszesz kod',
-      steps: [say('Zadania z planu były już wykonane w turze orkiestratora — nic do dopisania.')],
+      steps: [
+        tool('core.task_list', {}),
+        tool('core.task_update', { ordinal: 1, status: 'done' }),
+        say('Zadanie z planu było już wykonane w turze orkiestratora — odhaczyłem je.'),
+      ],
     },
     {
       match: 'Uruchamiasz testy i buildy',
@@ -279,7 +299,8 @@ function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 
         if (idx < 0) idx = routed.findIndex((r) => !r.match);
         if (idx < 0) idx = 0;
 
-        const steps = routed[idx].steps;
+        const route = routed[idx];
+        const steps = route.steps;
         const at = cursors.get(idx) ?? 0;
         if (process.env.SCRIPTED_MODEL_DEBUG) {
           console.log(`[scripted] route idx=${idx} match=${JSON.stringify(routed[idx].match)} `
@@ -287,7 +308,11 @@ function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 
         }
         // Past the end the model just stops, so a harness bug that loops forever
         // fails as a timeout instead of hanging the CI box.
-        const step = at < steps.length ? steps[at] : say('Skrypt testowy się skończył.');
+        // A `repeat` route keeps answering with its last line: two critics share
+        // one agent, and a review loop asks the same role every round.
+        const step = at < steps.length
+          ? steps[at]
+          : (route.repeat ? steps[steps.length - 1] : say('Skrypt testowy się skończył.'));
         cursors.set(idx, at + 1);
         cursor += 1;
 

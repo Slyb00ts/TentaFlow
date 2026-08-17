@@ -5560,6 +5560,13 @@ mod tests {
     /// rasteryzacja się powiodła (gdyby pdfium padł, dostalibyśmy `Internal`).
     #[tokio::test]
     async fn execute_documents_pdf_rasterizes_then_resolves_per_page() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !crate::services::document::rasterize::pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let exec = dummy_executor();
         let mut ctx = ExecutionContext::default();
         let err = exec

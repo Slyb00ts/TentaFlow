@@ -57,7 +57,7 @@ use crate::flow_engine::node_adapters::{
     RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
     RagGraphSeedNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter,
     SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter, StoreNodeAdapter,
-    CriticGateNodeAdapter, SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
+    CriticGateNodeAdapter, SttNodeAdapter, TaskGateNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
     TextExtractNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
     TtsNodeAdapter, VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter,
     VisionOcrNodeAdapter, VisionParseNodeAdapter, VisionParsePagesNodeAdapter,
@@ -1179,6 +1179,9 @@ fn build_registry(
     r.register(Arc::new(WorkspaceContextNodeAdapter::new(
         agent_service.clone(),
     )));
+    // The plan gate reads the session's task rows, so it needs the same slot to
+    // reach the registry database that names the workspace.
+    r.register(Arc::new(TaskGateNodeAdapter::new(agent_service.clone())));
     // Code Studio (§16.4). `patch_review`, `exec_command` and `delegate_cli`
     // reach the process-global interaction registry and run manager directly,
     // like `ask_user` — and the SAME service slot: `exec_command` needs it for
@@ -1349,6 +1352,7 @@ mod tests {
             "subagent_status",
             "interval",
             "critic_gate",
+            "task_gate",
             // Code Studio (§16.4).
             "workspace_context",
             "patch_review",

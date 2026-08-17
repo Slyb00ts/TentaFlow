@@ -276,6 +276,13 @@ mod tests {
 
     #[tokio::test]
     async fn rasterizes_each_page_to_blob_ref() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !crate::services::document::rasterize::pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let ctx = stub_ctx();
         let input = pdf_input(&ctx, 2).await;
         let out = PdfRasterizeNodeAdapter::new()
@@ -314,6 +321,13 @@ mod tests {
 
     #[tokio::test]
     async fn max_pages_caps_output() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !crate::services::document::rasterize::pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let ctx = stub_ctx();
         let input = pdf_input(&ctx, 5).await;
         let out = PdfRasterizeNodeAdapter::new()
@@ -352,6 +366,13 @@ mod tests {
 
     #[tokio::test]
     async fn text_layer_pdf_takes_text_fast_path() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !crate::services::document::rasterize::pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let ctx = stub_ctx();
         let input = text_pdf_input(&ctx, 2).await;
         let adapter = PdfRasterizeNodeAdapter::new();
@@ -378,6 +399,13 @@ mod tests {
 
     #[tokio::test]
     async fn scan_like_pdf_takes_images_path() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !crate::services::document::rasterize::pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let ctx = stub_ctx();
         // `minimal_pdf` ma ~8 znaków/stronę < próg → ścieżka rasteryzacja+vision.
         let input = pdf_input(&ctx, 2).await;
