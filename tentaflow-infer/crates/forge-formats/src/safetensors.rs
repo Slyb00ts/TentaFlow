@@ -23,10 +23,19 @@ fn dtype_from_st(s: &str) -> Result<DType> {
         "BF16" => DType::BF16,
         "F8_E4M3" => DType::F8E4M3,
         "F8_E5M2" => DType::F8E5M2,
+        "F8_E8M0" => DType::F8E8M0,
         "I8" => DType::I8,
         "U8" => DType::U8,
+        "I16" => DType::I16,
+        "U16" => DType::U16,
         "I32" => DType::I32,
+        // MLX pakuje kwantyzowane wagi w U32 — bez tego wpisu checkpoint MLX
+        // nie daje się nawet otworzyć.
+        "U32" => DType::U32,
         "I64" => DType::I64,
+        "U64" => DType::U64,
+        "F64" => DType::F64,
+        "BOOL" => DType::Bool,
         other => {
             return Err(ForgeError::Unsupported(format!(
                 "safetensors: unsupported dtype '{other}'"

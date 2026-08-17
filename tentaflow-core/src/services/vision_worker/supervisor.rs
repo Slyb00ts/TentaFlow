@@ -99,7 +99,10 @@ impl VisionWorkerSupervisor {
             }
         };
 
+        #[cfg(feature = "vision-ort")]
         let gpus = crate::vision::ort_common::vision_gpu_set();
+        #[cfg(not(feature = "vision-ort"))]
+        let gpus: &[i32] = &[0];
         let socket_path = crate::paths::data_dir().join(LINK_SOCKET_NAME);
         let link_state = LinkState::new();
         let listener_task = match link::serve(&socket_path, link_state.clone()) {

@@ -1,0 +1,751 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Potwierdzenie usunięcia (G01)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* animacja okien / menu (spójna z resztą produktu) */
+  @keyframes cardIn { from { opacity: 0; transform: translateY(8px) scale(.985); } to { opacity: 1; transform: none; } }
+  .screen-frame { position: relative; }
+  .window-backdrop .window { animation: cardIn .24s cubic-bezier(.34,1.56,.64,1); }
+
+  /* okno potwierdzenia — wariant mały + akcent danger */
+  .window.confirm { width: min(540px, 94%); }
+  .window.danger .window-title .icon { color: var(--danger); }
+  .window.warn .window-title .icon { color: var(--warning); }
+
+  /* linia tożsamości usuwanego obiektu */
+  .del-target { display: flex; align-items: center; gap: 11px; padding: 11px 13px; background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); margin-bottom: 14px; }
+  .del-target .dt-ico { width: 36px; height: 36px; border-radius: var(--radius-sm); background: var(--gradient-accent);
+    color: #fff; display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .del-target .dt-ico svg { width: 18px; height: 18px; }
+  .del-target .dt-name { font-size: 13.5px; font-weight: 800; }
+  .del-target .dt-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
+
+  /* lista „co zostanie skasowane" */
+  .del-label { font-size: 11px; text-transform: uppercase; letter-spacing: .08em; color: var(--text-3);
+    font-weight: 700; margin: 4px 0 8px; }
+  .del-list { display: flex; flex-direction: column; gap: 6px; margin-bottom: 16px; }
+  .del-item { display: flex; align-items: flex-start; gap: 10px; padding: 9px 12px; background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .del-item .di-ico { width: 28px; height: 28px; border-radius: var(--radius-sm); background: rgba(239,68,68,0.1);
+    color: var(--danger); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .del-item .di-ico svg { width: 14px; height: 14px; }
+  .del-item .di-name { font-size: 12.5px; font-weight: 700; }
+  .del-item .di-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; line-height: 1.5; }
+
+  /* pole „przepisz nazwę aby potwierdzić" */
+  .confirm-input.mismatch { border-color: rgba(239,68,68,0.55); }
+  .confirm-input.mismatch:focus { box-shadow: 0 0 0 3px rgba(239,68,68,0.16); }
+  .hint.danger-hint { color: var(--danger); display: flex; align-items: center; gap: 6px; }
+  .hint.danger-hint .icon { width: 12px; height: 12px; }
+
+  /* ===== baza: nagłówek strony listy (P01) ===== */
+  .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 16px; margin-bottom: 16px; flex-wrap: wrap; }
+  .page-title { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; }
+  .page-sub { font-size: 12.5px; color: var(--text-3); margin-top: 4px; }
+  .page-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .filters-row { display: flex; align-items: center; gap: 8px; margin-bottom: 16px; flex-wrap: wrap; }
+  .filters-row .fl-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--text-3); display: inline-flex; align-items: center; gap: 6px; margin-right: 2px; }
+  .filters-row .fl-label .icon { width: 13px; height: 13px; color: var(--accent-1); }
+  .filters-row .fl-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+  .create-hint { margin-left: auto; font-size: 11.5px; color: var(--text-3); display: inline-flex; align-items: center; gap: 6px; }
+  .create-hint .icon { width: 13px; height: 13px; color: var(--success); }
+  .proj-card .pc-spark { margin-left: auto; display: flex; align-items: center; gap: 8px; }
+  .proj-card .pc-pass { font-weight: 800; color: var(--text); font-size: 12px; }
+  .proj-card .pc-stat .icon { color: var(--text-3); }
+  .proj-card.archived { opacity: 0.72; }
+
+  /* menu ⋯ w karcie / wierszu */
+  .card-more { width: 28px; height: 28px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: var(--text-3); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; }
+  .card-more:hover { background: var(--bg-3); color: var(--text); border-color: var(--border); }
+  .card-more .icon { width: 16px; height: 16px; }
+  .pc-menu-wrap { position: relative; margin-left: auto; }
+  .tf-menu { position: absolute; top: 34px; right: 0; min-width: 190px; background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); box-shadow: var(--shadow-lg); z-index: 30; padding: 5px; animation: cardIn 0.16s ease both; }
+  .tf-menu button { display: flex; align-items: center; gap: 9px; width: 100%; padding: 8px 10px; background: transparent; border: 0; color: var(--text-2); font: inherit; font-size: 12px; border-radius: var(--radius-sm); cursor: pointer; text-align: left; }
+  .tf-menu button:hover { background: var(--bg-3); color: var(--text); }
+  .tf-menu button .icon { width: 14px; height: 14px; }
+  .tf-menu .mn-sep { height: 1px; background: var(--border); margin: 5px 2px; }
+  .tf-menu button.danger { color: var(--danger); }
+  .tf-menu button.danger:hover { background: rgba(239,68,68,0.12); }
+  .add-card { border-style: dashed; align-items: center; justify-content: center; text-align: center; min-height: 176px; color: var(--text-3); }
+  .add-card:hover { border-color: var(--accent-1); color: var(--accent-2); background: var(--accent-glow); transform: translateY(-2px); }
+  .add-card .add-ico { width: 44px; height: 44px; border-radius: 50%; border: 1px solid var(--border-hover); display: flex; align-items: center; justify-content: center; margin: 0 auto 10px; }
+  .add-card .add-ico .icon { width: 20px; height: 20px; }
+  .add-card .add-name { font-size: 14px; font-weight: 800; color: var(--text); }
+  .add-card .add-sub { font-size: 11.5px; color: var(--text-3); margin-top: 4px; max-width: 220px; line-height: 1.5; }
+
+  /* ===== baza: tabela przypadków (T01) ===== */
+  .toolbar { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+  .toolbar .filters { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+  .toolbar .spacer { margin-left: auto; }
+  .table-wrap { overflow-x: auto; border-radius: var(--radius); }
+  .table-wrap .tf-table { min-width: 1000px; }
+  .row-cb { width: 15px; height: 15px; border-radius: 4px; border: 1px solid var(--border-hover); background: var(--bg-input); display: inline-block; vertical-align: middle; position: relative; }
+  .row-cb.on { background: var(--accent-1); border-color: var(--accent-1); }
+  .row-cb.on::after { content: '✓'; color: #fff; font-size: 10px; font-weight: 800; position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; }
+  .tc-title { font-weight: 700; }
+  .tc-title .tc-id { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-3); margin-right: 7px; }
+  .tag-chips { display: flex; gap: 4px; flex-wrap: wrap; }
+  .origin-ico { color: var(--text-3); display: inline-flex; }
+  .origin-ico.agent { color: var(--accent-2); }
+  .origin-ico .icon { width: 15px; height: 15px; }
+  .row-actions { display: flex; align-items: center; gap: 6px; justify-content: flex-end; position: relative; }
+  .row-actions .tf-menu { top: auto; bottom: 30px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+</defs></svg>
+
+
+<!-- =========================================================================
+     G01a — OKNO „Usuń projekt?" (wariant danger) nad listą projektów (P01)
+     Bazowy ekran: lista projektów, przyciemniona backdropem okna.
+     ========================================================================= -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">G01a</span>
+    <h2>Potwierdzenie usunięcia projektu</h2>
+    <div class="desc">Reużywalne okno danger nad listą projektów. Wypisuje wszystko, co zniknie nieodwracalnie, i wymusza przepisanie nazwy przed odblokowaniem „Usuń trwale".</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+
+        <!-- Nagłówek widoku listy (bez detail-header) -->
+        <div class="page-head">
+          <div>
+            <div class="page-title">Projekty</div>
+            <div class="page-sub">4 aktywne · 2 zarchiwizowane · należysz do wszystkich</div>
+          </div>
+          <div class="page-actions">
+            <div class="segmented">
+              <button class="active"><svg class="icon"><use href="#i-grid"/></svg>Karty</button>
+              <button><svg class="icon"><use href="#i-list"/></svg>Tabela</button>
+            </div>
+            <div class="search-box">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input placeholder="Szukaj projektu…">
+            </div>
+            <button class="btn btn-primary"><!-- otwiera: P02 -->
+              <svg class="icon"><use href="#i-plus"/></svg>Nowy projekt
+            </button>
+          </div>
+        </div>
+
+        <!-- Filtry -->
+        <div class="filters-row">
+          <span class="fl-label"><svg class="icon"><use href="#i-filter"/></svg>Filtruj</span>
+          <span class="filter-chip active">Wszystkie <span style="opacity:.7">6</span></span>
+          <span class="filter-chip">Aktywne <span style="opacity:.7">4</span></span>
+          <span class="filter-chip">Zarchiwizowane <span style="opacity:.7">2</span></span>
+          <span class="fl-sep"></span>
+          <span class="filter-chip">Moja rola: dowolna <svg class="icon"><use href="#i-chevron-d"/></svg></span>
+          <span class="create-hint"><svg class="icon"><use href="#i-check-circle"/></svg>Możesz tworzyć projekty</span>
+        </div>
+
+        <!-- Siatka projektów -->
+        <div class="proj-grid">
+
+          <!-- Karta 1: menu ⋯ OTWARTE — stąd uruchomiono G01 -->
+          <div class="proj-card"><!-- otwiera: P03 -->
+            <div class="pc-top">
+              <div class="pc-ico"><svg><use href="#i-folder"/></svg></div>
+              <div style="flex:1; min-width:0;">
+                <div class="pc-name">Portal Klienta B2B</div>
+                <div class="pc-desc">Testy, dokumentacja i baza wiedzy dla portalu zamówień B2B.</div>
+              </div>
+              <span class="status-pill ok">aktywny</span>
+            </div>
+            <div class="pc-stats">
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-clipboard"/></svg><b>128</b>&nbsp;przypadków</div>
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-bug"/></svg><b>7</b>&nbsp;usterek</div>
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-doc"/></svg><b>9</b>&nbsp;dok.</div>
+              <div class="pc-stat pc-spark">
+                <svg class="sparkline" viewBox="0 0 90 24" preserveAspectRatio="none"><polyline points="0,16 15,14 30,15 45,11 60,10 75,7 90,6" stroke="#22c55e"/></svg>
+                <span class="pc-pass">92%</span>
+              </div>
+            </div>
+            <div class="pc-foot">
+              <span class="chip accent">Twoja rola: <b style="margin-left:4px">Właściciel</b></span>
+              <span class="chip">Testy + Dokumentacja</span>
+              <div class="pc-menu-wrap">
+                <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+                <div class="tf-menu" role="menu">
+                  <button><!-- otwiera: P03 --><svg class="icon"><use href="#i-external"/></svg>Otwórz</button>
+                  <button><!-- otwiera: X04 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj dane</button>
+                  <button><svg class="icon"><use href="#i-download"/></svg>Eksportuj</button>
+                  <button><svg class="icon"><use href="#i-history"/></svg>Archiwizuj</button>
+                  <div class="mn-sep"></div>
+                  <button class="danger"><!-- otwiera: G01a --><svg class="icon"><use href="#i-trash"/></svg>Usuń</button>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <!-- Karta 2 -->
+          <div class="proj-card"><!-- otwiera: P03 -->
+            <div class="pc-top">
+              <div class="pc-ico"><svg><use href="#i-calendar"/></svg></div>
+              <div style="flex:1; min-width:0;">
+                <div class="pc-name">System Rezerwacji</div>
+                <div class="pc-desc">Rezerwacje sal i zasobów, integracja z kalendarzem firmowym.</div>
+              </div>
+              <span class="status-pill ok">aktywny</span>
+            </div>
+            <div class="pc-stats">
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-clipboard"/></svg><b>74</b>&nbsp;przypadki</div>
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-bug"/></svg><b>3</b>&nbsp;usterki</div>
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-doc"/></svg><b>5</b>&nbsp;dok.</div>
+              <div class="pc-stat pc-spark">
+                <svg class="sparkline" viewBox="0 0 90 24" preserveAspectRatio="none"><polyline points="0,15 15,13 30,14 45,12 60,10 75,9 90,8" stroke="#22c55e"/></svg>
+                <span class="pc-pass">88%</span>
+              </div>
+            </div>
+            <div class="pc-foot">
+              <span class="chip accent">Twoja rola: <b style="margin-left:4px">Właściciel</b></span>
+              <span class="chip">Testy + Dokumentacja</span>
+              <div class="pc-menu-wrap">
+                <button class="card-more" title="Otwórz · Edytuj · Eksportuj · Archiwizuj · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Karta 3 -->
+          <div class="proj-card"><!-- otwiera: P03 -->
+            <div class="pc-top">
+              <div class="pc-ico"><svg><use href="#i-cpu"/></svg></div>
+              <div style="flex:1; min-width:0;">
+                <div class="pc-name">Aplikacja Mobilna Kurier</div>
+                <div class="pc-desc">Testy UI i API aplikacji dla kurierów (Android / iOS).</div>
+              </div>
+              <span class="status-pill ok">aktywny</span>
+            </div>
+            <div class="pc-stats">
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-clipboard"/></svg><b>96</b>&nbsp;przypadków</div>
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-bug"/></svg><b>11</b>&nbsp;usterek</div>
+              <div class="pc-stat"><svg class="icon icon-sm"><use href="#i-doc"/></svg><b>4</b>&nbsp;dok.</div>
+              <div class="pc-stat pc-spark">
+                <svg class="sparkline" viewBox="0 0 90 24" preserveAspectRatio="none"><polyline points="0,10 15,12 30,11 45,14 60,13 75,15 90,14" stroke="#f59e0b"/></svg>
+                <span class="pc-pass" style="color:var(--warning)">81%</span>
+              </div>
+            </div>
+            <div class="pc-foot">
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Tester</b></span>
+              <span class="chip">Testy + Dokumentacja</span>
+              <div class="pc-menu-wrap">
+                <button class="card-more" title="Otwórz · Edytuj · Eksportuj · Archiwizuj · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+              </div>
+            </div>
+          </div>
+
+          <!-- Karta „+ Nowy projekt" -->
+          <div class="proj-card add-card"><!-- otwiera: P02 -->
+            <div>
+              <div class="add-ico"><svg class="icon"><use href="#i-plus"/></svg></div>
+              <div class="add-name">Nowy projekt</div>
+              <div class="add-sub">Utwórz projekt testowy lub dokumentacyjny z gotowego szablonu.</div>
+            </div>
+          </div>
+
+        </div>
+
+      </main>
+    </div>
+
+    <!-- ===== OKNO: Usuń projekt? (danger, małe) ===== -->
+    <div class="window-backdrop">
+      <div class="window confirm danger">
+        <div class="window-head">
+          <div class="window-title"><svg class="icon"><use href="#i-alert"/></svg>Usuń projekt?</div>
+          <button class="window-close" title="Zamknij"><svg class="icon"><use href="#i-x"/></svg></button>
+        </div>
+
+        <div class="window-body">
+
+          <div class="del-target">
+            <div class="dt-ico"><svg><use href="#i-folder"/></svg></div>
+            <div>
+              <div class="dt-name">Portal Klienta B2B</div>
+              <div class="dt-sub">utworzono 12.05.2026 · 6 członków · Twoja rola: Właściciel</div>
+            </div>
+          </div>
+
+          <div class="banner err" style="margin-bottom:16px;">
+            <svg class="icon"><use href="#i-alert"/></svg>
+            <div class="b-text">Operacja jest <b>nieodwracalna</b>. Usuwasz cały projekt wraz z danymi wszystkich modułów — nie da się tego cofnąć ani odzyskać z kosza.</div>
+          </div>
+
+          <div class="del-label">Zostanie trwale skasowane</div>
+          <div class="del-list">
+            <div class="del-item">
+              <div class="di-ico"><svg><use href="#i-book"/></svg></div>
+              <div>
+                <div class="di-name">Baza wiedzy</div>
+                <div class="di-sub">4 źródła · 342 chunki · indeksy wektorowe i metadane</div>
+              </div>
+            </div>
+            <div class="del-item">
+              <div class="di-ico"><svg><use href="#i-git"/></svg></div>
+              <div>
+                <div class="di-name">Workspace projektu</div>
+                <div class="di-sub">klon repo portal-b2b, pliki robocze i wygenerowany kod</div>
+              </div>
+            </div>
+            <div class="del-item">
+              <div class="di-ico"><svg><use href="#i-clipboard"/></svg></div>
+              <div>
+                <div class="di-name">Przypadki, przebiegi i wyniki</div>
+                <div class="di-sub">128 przypadków · 244 przebiegi · artefakty, zrzuty i logi</div>
+              </div>
+            </div>
+            <div class="del-item">
+              <div class="di-ico"><svg><use href="#i-doc"/></svg></div>
+              <div>
+                <div class="di-name">Dokumenty i zadania</div>
+                <div class="di-sub">9 dokumentów · 12 zadań i usterek · historia wersji</div>
+              </div>
+            </div>
+            <div class="del-item">
+              <div class="di-ico"><svg><use href="#i-users"/></svg></div>
+              <div>
+                <div class="di-name">Członkostwa i uprawnienia</div>
+                <div class="di-sub">6 osób straci dostęp; powiązanie z projektem ML zostanie zerwane</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="field" style="margin-bottom:0;">
+            <label>Aby potwierdzić, przepisz nazwę projektu</label>
+            <input class="input mono confirm-input mismatch" value="Portal Klienta" placeholder="Portal Klienta B2B">
+            <div class="hint danger-hint"><svg class="icon"><use href="#i-x-circle"/></svg>Wpisz dokładnie: <b style="margin-left:4px">Portal Klienta B2B</b></div>
+          </div>
+
+        </div>
+
+        <div class="window-foot">
+          <button class="btn btn-ghost">Anuluj</button>
+          <button class="btn btn-danger" disabled title="Najpierw przepisz dokładnie nazwę projektu">
+            <svg class="icon"><use href="#i-trash"/></svg>Usuń trwale
+          </button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+
+<!-- =========================================================================
+     G01b — OKNO „Usuń przypadek testowy?" nad listą przypadków (T01)
+     Wariant: przypadek MA powiązane wyniki → zostanie oznaczony jako deprecated
+     zamiast trwałego usunięcia (zachowanie śladu audytowego).
+     ========================================================================= -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">G01b</span>
+    <h2>Usunięcie przypadku z wynikami → deprecated</h2>
+    <div class="desc">Ten sam wzorzec okna dla przypadku testowego, który ma historię przebiegów. Zamiast trwałego usunięcia domyślnie proponuje oznaczenie jako „deprecated", żeby nie utracić wyników.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Testy</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Przypadki testowe: manualne, UI, API, jednostkowe, wydajnościowe i bezpieczeństwa</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-users"/></svg>6 członków</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Właściciel</b></span>
+              <span class="chip info"><svg class="icon"><use href="#i-clipboard"/></svg>128 przypadków</span>
+              <span class="chip info"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Testy + Dokumentacja</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab active"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-square"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <div style="overflow-x:auto; margin-bottom:16px;">
+          <div class="segmented">
+            <button class="active">Przypadki</button>
+            <button>Zestawy</button>
+            <button>Przebiegi</button>
+            <button>Generowania</button>
+            <button>Środowiska</button>
+            <button>Harmonogramy</button>
+            <button>Raporty</button>
+          </div>
+        </div>
+
+        <div class="toolbar">
+          <div class="search-box">
+            <svg class="icon"><use href="#i-search"/></svg>
+            <input placeholder="Szukaj przypadku…">
+          </div>
+          <div class="filters">
+            <span class="filter-chip active">Wszystkie</span>
+            <span class="filter-chip">Manualne</span>
+            <span class="filter-chip">UI</span>
+            <span class="filter-chip">API</span>
+            <span class="filter-chip"><svg class="icon"><use href="#i-filter"/></svg>Status</span>
+          </div>
+          <div class="spacer"></div>
+          <button class="btn"><svg class="icon"><use href="#i-upload"/></svg>Import CSV</button>
+          <button class="btn"><!-- otwiera: T04 -->
+            <svg class="icon"><use href="#i-sparkles"/></svg>Generuj testy
+          </button>
+          <button class="btn btn-primary"><!-- otwiera: T02 -->
+            <svg class="icon"><use href="#i-plus"/></svg>Nowy przypadek
+          </button>
+        </div>
+
+        <div class="table-wrap">
+          <table class="tf-table">
+            <thead>
+              <tr>
+                <th style="width:32px"><span class="row-cb"></span></th>
+                <th>Przypadek</th>
+                <th>Typ</th>
+                <th>Priorytet</th>
+                <th>Tagi</th>
+                <th>Status</th>
+                <th>Źródło</th>
+                <th>Ostatni wynik</th>
+                <th style="text-align:right">Akcje</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr>
+                <td><span class="row-cb"></span></td>
+                <td class="tc-title"><span class="tc-id">TC-011</span>Logowanie — poprawne dane</td>
+                <td><span class="chip info">api</span></td>
+                <td><span class="prio P2">P2</span></td>
+                <td><div class="tag-chips"><span class="chip">auth</span><span class="chip">smoke</span></div></td>
+                <td><span class="status-pill ok">approved</span></td>
+                <td><span class="origin-ico" title="utworzone ręcznie"><svg class="icon"><use href="#i-eye"/></svg></span></td>
+                <td><span class="chip success">passed</span></td>
+                <td>
+                  <div class="row-actions">
+                    <button class="btn btn-sm btn-ghost" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+                    <button class="btn btn-sm btn-ghost" title="Edytuj · Duplikuj · Zmień status · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td><span class="row-cb"></span></td>
+                <td class="tc-title"><span class="tc-id">TC-012</span>Rejestracja B2B — walidacja NIP</td>
+                <td><span class="chip accent">ui</span></td>
+                <td><span class="prio P1">P1</span></td>
+                <td><div class="tag-chips"><span class="chip">rejestracja</span></div></td>
+                <td><span class="status-pill ok">approved</span></td>
+                <td><span class="origin-ico agent" title="wygenerowane przez agenta"><svg class="icon"><use href="#i-sparkles"/></svg></span></td>
+                <td><span class="chip success">passed</span></td>
+                <td>
+                  <div class="row-actions">
+                    <button class="btn btn-sm btn-ghost" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+                    <button class="btn btn-sm btn-ghost" title="Edytuj · Duplikuj · Zmień status · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td><span class="row-cb"></span></td>
+                <td class="tc-title"><span class="tc-id">TC-013</span>Koszyk — przeliczenie rabatu</td>
+                <td><span class="chip">manual</span></td>
+                <td><span class="prio P1">P1</span></td>
+                <td><div class="tag-chips"><span class="chip">koszyk</span><span class="chip">rabaty</span></div></td>
+                <td><span class="status-pill warn">review</span></td>
+                <td><span class="origin-ico" title="utworzone ręcznie"><svg class="icon"><use href="#i-eye"/></svg></span></td>
+                <td><span class="chip danger">failed</span></td>
+                <td>
+                  <div class="row-actions">
+                    <button class="btn btn-sm btn-ghost" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+                    <button class="btn btn-sm btn-ghost" title="Edytuj · Duplikuj · Zmień status · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </td>
+              </tr>
+              <!-- Wiersz z OTWARTYM menu ⋯ — stąd uruchomiono G01b -->
+              <tr style="background:var(--bg-card)">
+                <td><span class="row-cb on"></span></td>
+                <td class="tc-title"><span class="tc-id">TC-014</span>Checkout — płatność kartą</td>
+                <td><span class="chip accent">ui</span></td>
+                <td><span class="prio P1">P1</span></td>
+                <td><div class="tag-chips"><span class="chip">checkout</span><span class="chip">płatności</span></div></td>
+                <td><span class="status-pill ok">approved</span></td>
+                <td><span class="origin-ico" title="utworzone ręcznie"><svg class="icon"><use href="#i-eye"/></svg></span></td>
+                <td><span class="chip success">passed</span></td>
+                <td>
+                  <div class="row-actions">
+                    <button class="btn btn-sm btn-ghost" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+                    <button class="btn btn-sm btn-ghost" title="Więcej akcji"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <div class="tf-menu" role="menu">
+                      <button><!-- otwiera: T02 --><svg class="icon"><use href="#i-edit"/></svg>Edytuj</button>
+                      <button><svg class="icon"><use href="#i-copy"/></svg>Duplikuj</button>
+                      <button><svg class="icon"><use href="#i-tag"/></svg>Zmień status</button>
+                      <div class="mn-sep"></div>
+                      <button class="danger"><!-- otwiera: G01b --><svg class="icon"><use href="#i-trash"/></svg>Usuń</button>
+                    </div>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td><span class="row-cb"></span></td>
+                <td class="tc-title"><span class="tc-id">TC-015</span>Wylogowanie i wygaśnięcie sesji</td>
+                <td><span class="chip info">api</span></td>
+                <td><span class="prio P3">P3</span></td>
+                <td><div class="tag-chips"><span class="chip">auth</span></div></td>
+                <td><span class="status-pill ok">approved</span></td>
+                <td><span class="origin-ico agent" title="wygenerowane przez agenta"><svg class="icon"><use href="#i-sparkles"/></svg></span></td>
+                <td><span class="chip success">passed</span></td>
+                <td>
+                  <div class="row-actions">
+                    <button class="btn btn-sm btn-ghost" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+                    <button class="btn btn-sm btn-ghost" title="Edytuj · Duplikuj · Zmień status · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </td>
+              </tr>
+              <tr>
+                <td><span class="row-cb"></span></td>
+                <td class="tc-title"><span class="tc-id">TC-016</span>Eksport zamówień do CSV</td>
+                <td><span class="chip">manual</span></td>
+                <td><span class="prio P2">P2</span></td>
+                <td><div class="tag-chips"><span class="chip">eksport</span></div></td>
+                <td><span class="status-pill idle">draft</span></td>
+                <td><span class="origin-ico" title="utworzone ręcznie"><svg class="icon"><use href="#i-eye"/></svg></span></td>
+                <td class="text-3">—</td>
+                <td>
+                  <div class="row-actions">
+                    <button class="btn btn-sm btn-ghost" title="Edytuj"><svg class="icon"><use href="#i-edit"/></svg></button>
+                    <button class="btn btn-sm btn-ghost" title="Edytuj · Duplikuj · Zmień status · Usuń"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </td>
+              </tr>
+            </tbody>
+          </table>
+        </div>
+
+      </main>
+    </div>
+
+    <!-- ===== OKNO: Usuń przypadek testowy? (ma wyniki → deprecated) ===== -->
+    <div class="window-backdrop">
+      <div class="window confirm warn">
+        <div class="window-head">
+          <div class="window-title"><svg class="icon"><use href="#i-alert"/></svg>Usuń przypadek testowy?</div>
+          <button class="window-close" title="Zamknij"><svg class="icon"><use href="#i-x"/></svg></button>
+        </div>
+
+        <div class="window-body">
+
+          <div class="del-target">
+            <div class="dt-ico" style="background:var(--bg-3);color:var(--accent-2)"><svg><use href="#i-clipboard"/></svg></div>
+            <div>
+              <div class="dt-name">TC-014 · Checkout — płatność kartą</div>
+              <div class="dt-sub">ui (Playwright) · P1 · zatwierdzony · w 2 zestawach</div>
+            </div>
+          </div>
+
+          <div class="banner warn" style="margin-bottom:16px;">
+            <svg class="icon"><use href="#i-alert"/></svg>
+            <div class="b-text">Ten przypadek ma <b>powiązaną historię wyników</b>. Aby zachować ślad audytowy, zostanie <b>oznaczony jako „deprecated"</b> zamiast trwale usunięty.</div>
+          </div>
+
+          <div class="del-label">Powiązane dane, które musiałyby zniknąć przy trwałym usunięciu</div>
+          <div class="del-list">
+            <div class="del-item">
+              <div class="di-ico" style="background:rgba(96,165,250,0.12);color:var(--info)"><svg><use href="#i-play"/></svg></div>
+              <div>
+                <div class="di-name">8 przebiegów · 34 wykonania</div>
+                <div class="di-sub">werdykty, czasy, konfiguracje testerów i środowisk</div>
+              </div>
+            </div>
+            <div class="del-item">
+              <div class="di-ico" style="background:rgba(239,68,68,0.12);color:var(--danger)"><svg><use href="#i-bug"/></svg></div>
+              <div>
+                <div class="di-name">3 powiązane usterki</div>
+                <div class="di-sub">m.in. #DEF-042 „Koszyk nie przelicza rabatu" (krytyczna)</div>
+              </div>
+            </div>
+            <div class="del-item">
+              <div class="di-ico" style="background:rgba(167,139,250,0.12);color:var(--accent-2)"><svg><use href="#i-layers"/></svg></div>
+              <div>
+                <div class="di-name">Artefakty: zrzuty, logi, trace</div>
+                <div class="di-sub">dowody wykonania cytowane w raportach jakości</div>
+              </div>
+            </div>
+          </div>
+
+          <div class="del-label">Wybierz działanie</div>
+
+          <div class="target-option checked" style="align-items:flex-start;">
+            <span class="cb"></span>
+            <div>
+              <div class="t-name">Oznacz jako „deprecated" <span class="chip accent" style="margin-left:6px">zalecane</span></div>
+              <div class="t-sub">Zostaje w historii przebiegów, ale jest ukryty przy nowych przebiegach i generowaniu. W każdej chwili możesz go przywrócić.</div>
+            </div>
+          </div>
+
+          <div class="hint" style="margin-top:10px; display:flex; align-items:flex-start; gap:6px;">
+            <svg class="icon" style="width:12px;height:12px;color:var(--text-3);flex-shrink:0;margin-top:2px;"><use href="#i-history"/></svg>
+            <span>Trwałe usunięcie jest możliwe tylko dla przypadków bez historii przebiegów. Deprecated przypadki znajdziesz w filtrze statusu „deprecated" na liście przypadków.</span>
+          </div>
+
+        </div>
+
+        <div class="window-foot">
+          <button class="btn btn-ghost">Anuluj</button>
+          <button class="btn btn-primary"><svg class="icon"><use href="#i-tag"/></svg>Oznacz jako deprecated</button>
+        </div>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+</body>
+</html>

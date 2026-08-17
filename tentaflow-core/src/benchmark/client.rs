@@ -1,37 +1,44 @@
-// ===== File: benchmark/client.rs — streaming API clients (OpenAI-compatible + Anthropic) with client-side TTFT/decode timing =====
+// ===== File: benchmark/client.rs — streaming benchmark clients (OpenAI-compatible + Anthropic over HTTP, plus the in-process path) with client-side TTFT/decode timing =====
 
 use std::time::{Duration, Instant};
 
 use futures::StreamExt;
 use serde_json::{json, Value};
 
+use super::local::{LocalRunner, RouteNote};
 use super::types::{ApiType, RequestSample, TargetSpec};
 
-/// Shared HTTP client for all benchmark requests. Cloning is cheap (reqwest
-/// clients share their connection pool), which the concurrency scenarios rely on.
+/// Dispatcher for all benchmark requests. Cloning is cheap (reqwest clients
+/// share their connection pool, the local runner is one `Arc`), which the
+/// concurrency scenarios rely on.
 #[derive(Clone)]
 pub struct BenchClient {
     http: reqwest::Client,
+    /// In-process path. `None` only when the runtime executor is not wired
+    /// (tests, a Router built without init) — an in-process target then fails
+    /// with a clear error instead of silently degrading to HTTP.
+    local: Option<LocalRunner>,
 }
 
 /// Raw observation of one streamed response. Timestamps are taken at chunk
 /// ARRIVAL inside the drain loop (same principle as ExternalPerfStream): the
 /// benchmark client is the consumer and reads eagerly, so the decode window
-/// reflects the server's generation pace, not consumption pace.
-struct StreamObservation {
-    first_token_at: Option<Instant>,
-    last_token_at: Option<Instant>,
+/// reflects the server's generation pace, not consumption pace. Shared by the
+/// HTTP and in-process paths so both produce numbers on the same scale.
+pub(super) struct StreamObservation {
+    pub(super) first_token_at: Option<Instant>,
+    pub(super) last_token_at: Option<Instant>,
     /// End of the response stream (bytes exhausted / `[DONE]` / `message_stop`),
     /// stamped after draining. total_ms measures to here, not to the last content
     /// chunk, so trailing usage-only frames and stream teardown are included.
-    stream_end_at: Option<Instant>,
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    usage_seen: bool,
+    pub(super) stream_end_at: Option<Instant>,
+    pub(super) prompt_tokens: u32,
+    pub(super) completion_tokens: u32,
+    pub(super) usage_seen: bool,
 }
 
 impl StreamObservation {
-    fn empty() -> Self {
+    pub(super) fn empty() -> Self {
         Self {
             first_token_at: None,
             last_token_at: None,
@@ -44,11 +51,11 @@ impl StreamObservation {
 }
 
 impl BenchClient {
-    pub fn new() -> anyhow::Result<Self> {
+    pub fn new(local: Option<LocalRunner>) -> anyhow::Result<Self> {
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(10))
             .build()?;
-        Ok(Self { http })
+        Ok(Self { http, local })
     }
 
     /// Executes one streamed request and turns the observation into a sample.
@@ -63,21 +70,51 @@ impl BenchClient {
         max_tokens: u32,
         timeout: Duration,
     ) -> RequestSample {
+        self.execute_routed(target, prompt, max_tokens, timeout)
+            .await
+            .0
+    }
+
+    /// Same as `execute`, but also reports which backend served an in-process
+    /// request. HTTP targets have a fixed address, so their route is empty.
+    pub async fn execute_routed(
+        &self,
+        target: &TargetSpec,
+        prompt: &str,
+        max_tokens: u32,
+        timeout: Duration,
+    ) -> (RequestSample, RouteNote) {
         let start = Instant::now();
         let fut = async {
             match target.api {
-                ApiType::OpenAi => self.stream_openai(target, prompt, max_tokens).await,
-                ApiType::Anthropic => self.stream_anthropic(target, prompt, max_tokens).await,
+                ApiType::OpenAi => self
+                    .stream_openai(target, prompt, max_tokens)
+                    .await
+                    .map(|obs| (obs, RouteNote::default())),
+                ApiType::Anthropic => self
+                    .stream_anthropic(target, prompt, max_tokens)
+                    .await
+                    .map(|obs| (obs, RouteNote::default())),
+                ApiType::Local => match &self.local {
+                    Some(runner) => runner.stream(&target.model, prompt, max_tokens).await,
+                    None => anyhow::bail!(
+                        "in-process target requires the model runtime executor, which is not wired"
+                    ),
+                },
             }
         };
         match tokio::time::timeout(timeout, fut).await {
-            Ok(Ok(obs)) => build_sample(start, &obs),
-            Ok(Err(e)) => {
-                RequestSample::failed(start.elapsed().as_secs_f64() * 1000.0, e.to_string())
-            }
-            Err(_) => RequestSample::failed(
-                start.elapsed().as_secs_f64() * 1000.0,
-                format!("request timeout after {}s", timeout.as_secs()),
+            Ok(Ok((obs, route))) => (build_sample(start, &obs), route),
+            Ok(Err(e)) => (
+                RequestSample::failed(start.elapsed().as_secs_f64() * 1000.0, e.to_string()),
+                RouteNote::default(),
+            ),
+            Err(_) => (
+                RequestSample::failed(
+                    start.elapsed().as_secs_f64() * 1000.0,
+                    format!("request timeout after {}s", timeout.as_secs()),
+                ),
+                RouteNote::default(),
             ),
         }
     }

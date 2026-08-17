@@ -305,6 +305,7 @@ fn row_to_flow(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlow> {
         flow_json: row.get(6)?,
         status: row.get(7)?,
         published_model_name: row.get(8)?,
+        is_system: row.get(11)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
     })
@@ -3465,11 +3466,22 @@ pub fn update_cluster_member_rdma(
     rdma_devices: &str,
     rdma_ip: &str,
     rdma_socket_ifname: &str,
+    rdma_gid_index: Option<u32>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    // COALESCE: nod, ktory nie umial ustalic indeksu GID, nie kasuje wartosci
+    // zapisanej wczesniej.
     conn.execute(
-        "UPDATE cluster_members SET rdma_devices = ?3, rdma_ip = ?4, rdma_socket_ifname = ?5 WHERE cluster_id = ?1 AND node_id = ?2",
-        rusqlite::params![cluster_id, node_id, rdma_devices, rdma_ip, rdma_socket_ifname],
+        "UPDATE cluster_members SET rdma_devices = ?3, rdma_ip = ?4, rdma_socket_ifname = ?5, \
+         rdma_gid_index = COALESCE(?6, rdma_gid_index) WHERE cluster_id = ?1 AND node_id = ?2",
+        rusqlite::params![
+            cluster_id,
+            node_id,
+            rdma_devices,
+            rdma_ip,
+            rdma_socket_ifname,
+            rdma_gid_index
+        ],
     )?;
     Ok(())
 }
@@ -3566,8 +3578,22 @@ pub fn add_cluster_member(
     interface_type: &str,
 ) -> Result<()> {
     let conn = acquire(pool)?;
+    // UPSERT, nie INSERT OR REPLACE: REPLACE kasuje wiersz i wstawia nowy, wiec
+    // gubil kolumny spoza tej listy — konfiguracje RDMA (`rdma_*`) i `joined_at`.
+    // Ponowne dodanie noda po cichu rozbrajalo klaster do deployu.
+    //
+    // NULLIF/COALESCE: puste pole znaczy "nie podano", nie "wyczysc". Dodanie
+    // noda bez jawnego wyboru karty nie moze skasowac przypisania z testu
+    // polaczen ani recznego wyboru admina.
     conn.execute(
-        "INSERT OR REPLACE INTO cluster_members (cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        "INSERT INTO cluster_members (cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+         ON CONFLICT(cluster_id, node_id) DO UPDATE SET \
+           role = excluded.role, \
+           interface_name = COALESCE(NULLIF(excluded.interface_name, ''), cluster_members.interface_name), \
+           interface_ip = COALESCE(NULLIF(excluded.interface_ip, ''), cluster_members.interface_ip), \
+           interface_speed_mbps = COALESCE(NULLIF(excluded.interface_speed_mbps, 0), cluster_members.interface_speed_mbps), \
+           interface_type = COALESCE(NULLIF(excluded.interface_type, ''), cluster_members.interface_type)",
         rusqlite::params![cluster_id, node_id, role, interface_name, interface_ip, interface_speed_mbps, interface_type],
     )?;
     Ok(())
@@ -3625,9 +3651,8 @@ pub fn remove_cluster_member(pool: &DbPool, cluster_id: &str, node_id: &str) -> 
     Ok(())
 }
 
-/// Lista klastrow z agregatami liczby czlonkow (LEFT JOIN cluster_members).
-/// `members_online` przyjmuje `members_count` jako proxy — peer_store dolicza
-/// online/offline po stronie handlera (peer_store nie jest w DB).
+/// Lista klastrow z agregatem liczby czlonkow. Liczba online nie jest w DB —
+/// wylicza ja handler z peer_store.
 pub fn list_clusters_with_counts(
     pool: &DbPool,
 ) -> Result<Vec<crate::db::models::DbClusterWithCounts>> {
@@ -3646,7 +3671,6 @@ pub fn list_clusters_with_counts(
             Ok(crate::db::models::DbClusterWithCounts {
                 cluster,
                 members_count,
-                members_online: members_count,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -3901,6 +3925,35 @@ pub fn active_cluster_deployment(
     Ok(res)
 }
 
+/// Wszystkie deploymenty klastra o podanych statusach, niezaleznie od klastra.
+/// Uzywane przy starcie procesu (rekoncyliacja osieroconych) i przez petle
+/// zdrowia — te sciezki nie znaja `cluster_id` z gory.
+pub fn cluster_deployments_by_status(
+    pool: &DbPool,
+    statuses: &[&str],
+) -> Result<Vec<DbClusterDeployment>> {
+    if statuses.is_empty() {
+        return Ok(Vec::new());
+    }
+    let conn = acquire(pool)?;
+    let placeholders = statuses
+        .iter()
+        .enumerate()
+        .map(|(i, _)| format!("?{}", i + 1))
+        .collect::<Vec<_>>()
+        .join(",");
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {} FROM cluster_deployments WHERE status IN ({}) ORDER BY created_at",
+        CLUSTER_DEPLOYMENT_COLS, placeholders
+    ))?;
+    let params: Vec<&dyn rusqlite::ToSql> =
+        statuses.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+    let rows = stmt
+        .query_map(params.as_slice(), row_to_cluster_deployment)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
 /// All `failed` distributed deployments of a cluster — cleared (best-effort
 /// teardown + delete) before a fresh deploy so a stale failed record never blocks
 /// a redeploy.
@@ -4031,7 +4084,7 @@ pub fn replace_routing_config_from_sync(
 
 // --- Flows ---
 
-const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at";
+const FLOW_COLS: &str = "id, name, description, version, is_default, service_type, flow_json, status, published_model_name, created_at, updated_at, is_system";
 
 pub fn list_flows(pool: &DbPool, offset: i64, limit: i64) -> Result<Vec<DbFlow>> {
     let conn = acquire(pool)?;
@@ -4079,7 +4132,7 @@ pub fn get_flow_for_model(pool: &DbPool, model_name: &str) -> Result<Option<DbFl
     // tylko jawny `*` jest wildcardem; reszta wzorca jest literalna. ESCAPE '\'
     // mówi LIKE, że `\` poprzedza znak literalny.
     let mut stmt = conn.prepare_cached(
-        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at \
+        "SELECT f.id, f.name, f.description, f.version, f.is_default, f.service_type, f.flow_json, f.status, f.published_model_name, f.created_at, f.updated_at, f.is_system \
          FROM flows f INNER JOIN flow_model_bindings b ON f.id = b.flow_id \
          WHERE ?1 LIKE REPLACE(REPLACE(REPLACE(REPLACE(b.model_pattern, '\\', '\\\\'), '%', '\\%'), '_', '\\_'), '*', '%') ESCAPE '\\' \
          AND f.status = 'active' ORDER BY b.priority DESC LIMIT 1",
@@ -4210,6 +4263,15 @@ fn flow_changed_fields(
     fields.insert(
         "published_model_name".to_string(),
         field_optional_string(params.published_model_name),
+    );
+    // FlowParams deliberately has no is_system and user handlers reject edits
+    // of system flows, so every capture minted here is explicitly non-system.
+    // The column still travels: apply_flow's seed-guard uses it to distinguish
+    // a user edit (is_system=false → rejected on a local system row) from a
+    // seed refresh (is_system=true → accepted).
+    fields.insert(
+        "is_system".to_string(),
+        crate::sync::ledger::FieldValue::Bool(false),
     );
     fields
 }
@@ -17622,14 +17684,24 @@ mod alias_resolve_tests {
         assert_eq!(tts.target_model, "tts-1");
         assert!(tts.is_active);
 
-        let summary = resolve_model_alias(&db, "teams-summary", None).unwrap();
-        assert!(summary.is_some(), "Alias teams-summary powinien istniec");
-        let summary = summary.unwrap();
+        // An unbound alias (empty target) registers PARKED: the row exists so the
+        // admin can bind a model later, but the router must never resolve it.
+        assert!(
+            resolve_model_alias(&db, "teams-summary", None)
+                .unwrap()
+                .is_none(),
+            "Zaparkowany alias teams-summary nie powinien byc rozwiazywany"
+        );
+        let summary = list_model_aliases(&db)
+            .unwrap()
+            .into_iter()
+            .find(|a| a.alias == "teams-summary")
+            .expect("Alias teams-summary powinien byc zarejestrowany (zaparkowany)");
         assert_eq!(
             summary.target_model, "",
             "teams-summary ma pusty target — admin uzupelnia recznie"
         );
-        assert!(summary.is_active);
+        assert!(!summary.is_active, "pusty target => alias zaparkowany");
 
         // Act 2 — dezaktywacja (symulacja zatrzymania addonu)
         set_model_alias_active(&db, "teams-stt", false)
@@ -21625,6 +21697,40 @@ pub fn camera_analysis_fps(pool: &DbPool, camera_id: &str) -> Result<u32> {
     Ok(fps.map(|v| v.clamp(0, 30) as u32).unwrap_or(10))
 }
 
+/// Detection zones drawn on one camera, as stored JSON: an array of polygons,
+/// each polygon an array of `[x, y]` points in NORMALIZED frame coordinates
+/// (0.0-1.0). `[]` (or a missing camera row) means "no zones" — the caller then
+/// treats the whole frame as live. Process-wide lookup like
+/// [`camera_analysis_fps`]: the analysis loop is keyed by `camera_id`.
+#[cfg(feature = "camera")]
+pub fn camera_zones_json(pool: &DbPool, camera_id: &str) -> Result<String> {
+    let conn = acquire(pool)?;
+    let raw: Option<String> = conn
+        .query_row(
+            "SELECT zones_json FROM cameras WHERE camera_id = ?1 AND removed_at IS NULL",
+            rusqlite::params![camera_id],
+            |r| r.get(0),
+        )
+        .optional()?;
+    Ok(raw.unwrap_or_else(|| "[]".to_string()))
+}
+
+/// Replaces the detection zones of one camera. `zones_json` must already be a
+/// JSON array of polygons in normalized coordinates — validation lives at the
+/// API boundary so a malformed blob never reaches the analysis loop.
+#[cfg(feature = "camera")]
+pub fn set_camera_zones_json(pool: &DbPool, camera_id: &str, zones_json: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    // `updated_at` is a unix-epoch INTEGER; `datetime('now')` writes a TEXT string
+    // into it, corrupting the column type so the camera-ingest hydrate query
+    // (which reads it as i64) fails at the next startup and no camera loads.
+    Ok(conn.execute(
+        "UPDATE cameras SET zones_json = ?2, updated_at = strftime('%s','now') \
+         WHERE camera_id = ?1 AND removed_at IS NULL",
+        rusqlite::params![camera_id, zones_json],
+    )?)
+}
+
 /// Identity columns the per-vehicle event recorder stamps onto its catalog
 /// rows: `(owner_addon_id, org_id, retention_class)` of the active LOCAL
 /// camera, or `None` when no such camera exists on this node. Process-wide
@@ -22836,14 +22942,17 @@ pub fn get_recording_for_addon(
     Ok(row)
 }
 
-/// Optional server-side filters for [`list_recordings_for_addon`]. Every field
-/// is `None` = "no filter"; they compose with AND. Dates are unix SECONDS
+/// Optional server-side filters for [`list_recordings`]. Every field is
+/// `None` = "no filter"; they compose with AND. Dates are unix SECONDS
 /// (matching `recordings.created_at`); `plate`/`adr` are case-insensitive
 /// substring (`LIKE %x%`) matches against the indexed `plate_text`/`adr_text`
-/// columns written by the event recorder.
+/// columns written by the event recorder. `owner_addon_id` scopes to a single
+/// owning addon (`Some`, reproducing the per-addon browser listing) or lists the
+/// whole node (`None`, org-bounded only); the org boundary is always enforced.
 #[cfg(feature = "camera")]
 #[derive(Debug, Default, Clone)]
 pub struct RecordingListFilters<'a> {
+    pub owner_addon_id: Option<&'a str>,
     pub kind: Option<&'a str>,
     pub camera_id: Option<&'a str>,
     pub created_from: Option<i64>,
@@ -22867,15 +22976,16 @@ fn like_contains(needle: &str) -> String {
     format!("%{escaped}%")
 }
 
-/// Lists active recordings owned by `addon_id`, newest first, applying the
-/// optional [`RecordingListFilters`]. `kind` filters to one recording kind
-/// (`"segment"` / `"snapshot"`); `None` returns both. `limit` caps the row count
-/// so a dashboard list never pulls an unbounded catalog into memory. The org
-/// scope mirrors `get_recording_for_addon` so cross-tenant rows cannot leak.
+/// Lists active recordings, newest first, applying the optional
+/// [`RecordingListFilters`]. `owner_addon_id = Some` scopes to one owning addon
+/// (the per-addon browser listing); `None` lists the whole node. `kind` filters to
+/// one recording kind (`"segment"` / `"snapshot"`); `None` returns both. `limit`
+/// caps the row count so a dashboard list never pulls an unbounded catalog into
+/// memory. The org scope is ALWAYS enforced (mirrors `get_recording_for_addon`) so
+/// cross-tenant rows cannot leak.
 #[cfg(feature = "camera")]
-pub fn list_recordings_for_addon(
+pub fn list_recordings(
     pool: &DbPool,
-    addon_id: &str,
     org_id: Option<&str>,
     filters: &RecordingListFilters<'_>,
     limit: u32,
@@ -22884,14 +22994,15 @@ pub fn list_recordings_for_addon(
     let resolved_org = org_id.unwrap_or(crate::services::org::DEFAULT_ORG_ID);
     // Bind params positionally; the optional filters are appended in a fixed
     // order so the placeholder indices stay stable regardless of which are set.
-    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![
-        Box::new(addon_id.to_string()),
-        Box::new(resolved_org.to_string()),
-    ];
+    let mut params: Vec<Box<dyn rusqlite::ToSql>> = vec![Box::new(resolved_org.to_string())];
     let mut sql = format!(
         "SELECT {RECORDING_SELECT_COLS} FROM recordings \
-         WHERE owner_addon_id = ?1 AND org_id = ?2 AND purged_at IS NULL"
+         WHERE org_id = ?1 AND purged_at IS NULL"
     );
+    if let Some(addon_id) = filters.owner_addon_id {
+        params.push(Box::new(addon_id.to_string()));
+        sql.push_str(&format!(" AND owner_addon_id = ?{}", params.len()));
+    }
     if let Some(k) = filters.kind {
         params.push(Box::new(k.to_string()));
         sql.push_str(&format!(" AND kind = ?{}", params.len()));
@@ -23125,13 +23236,14 @@ fn row_to_conversation_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbCo
         seq: row.get(2)?,
         role: row.get(3)?,
         content: row.get(4)?,
-        tool_calls: row.get(5)?,
-        tool_call_id: row.get(6)?,
-        name: row.get(7)?,
-        payload_ref: row.get(8)?,
-        payload_kind: row.get(9)?,
-        node_id: row.get(10)?,
-        created_at: row.get(11)?,
+        reasoning_content: row.get(5)?,
+        tool_calls: row.get(6)?,
+        tool_call_id: row.get(7)?,
+        name: row.get(8)?,
+        payload_ref: row.get(9)?,
+        payload_kind: row.get(10)?,
+        node_id: row.get(11)?,
+        created_at: row.get(12)?,
     })
 }
 
@@ -23159,14 +23271,15 @@ pub fn insert_conversation_messages(
     for m in messages {
         let affected = tx.execute(
             "INSERT OR IGNORE INTO conversation_messages
-                (session_id, seq, role, content, tool_calls, tool_call_id, name,
-                 payload_ref, payload_kind, node_id)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                (session_id, seq, role, content, reasoning_content, tool_calls,
+                 tool_call_id, name, payload_ref, payload_kind, node_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             rusqlite::params![
                 session_id,
                 next_seq,
                 m.role,
                 m.content,
+                m.reasoning_content,
                 m.tool_calls,
                 m.tool_call_id,
                 m.name,
@@ -23193,8 +23306,8 @@ pub fn recent_conversation_messages(
     // Take the newest `limit` rows (seq DESC) then flip to chronological order
     // so the caller receives oldest-first without loading the whole session.
     let mut stmt = conn.prepare_cached(
-        "SELECT id, session_id, seq, role, content, tool_calls, tool_call_id, name,
-                payload_ref, payload_kind, node_id, created_at
+        "SELECT id, session_id, seq, role, content, reasoning_content, tool_calls,
+                tool_call_id, name, payload_ref, payload_kind, node_id, created_at
          FROM (
             SELECT * FROM conversation_messages
             WHERE session_id = ?1
@@ -23210,6 +23323,35 @@ pub fn recent_conversation_messages(
         )?
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
+}
+
+/// Appends ONE project-chat (ps-chat) message to a session and returns its row
+/// id — the wire `message_id` of `ChatHistoryResponse`/`ChatStreamEnd`.
+/// Separate from `insert_conversation_messages` because ps-chat needs the id
+/// back and persists `citations_json` (assistant replies), which the generic
+/// turn-batch writer has no business carrying.
+pub fn append_project_chat_message(
+    pool: &DbPool,
+    session_id: &str,
+    role: &str,
+    content: &str,
+    citations_json: Option<&str>,
+) -> Result<i64> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    let next_seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), -1) + 1 FROM conversation_messages WHERE session_id = ?1",
+        rusqlite::params![session_id],
+        |r| r.get(0),
+    )?;
+    tx.execute(
+        "INSERT INTO conversation_messages (session_id, seq, role, content, citations_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5)",
+        rusqlite::params![session_id, next_seq, role, content, citations_json],
+    )?;
+    let id = tx.last_insert_rowid();
+    tx.commit()?;
+    Ok(id)
 }
 
 #[cfg(test)]
@@ -25736,22 +25878,26 @@ mod token_metrics_tests {
 
     #[test]
     fn histogram_bucket_index_maps_edges() {
+        // Bucket i covers (edges[i-1], edges[i]]: a value EQUAL to an edge falls
+        // in the lower bucket. This mirrors `percentile_from_histogram`, which
+        // interpolates inside bucket i using edges[i] as its upper bound.
         // TTFT edges [0,50,100,200,400,800,1600,3200,6400,∞] → 10 buckets 0..=9.
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 0), 0);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 1), 1);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 50), 1);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 51), 2);
-        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 9);
+        assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 6400), 8);
         assert_eq!(histogram_bucket_index(&TTFT_MS_EDGES, 999_999), 9);
         // decode_tps edges [0,10,...,320,∞] → 8 buckets 0..=7.
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 0.0), 0);
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5.0), 1);
-        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 7);
+        assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 320.0), 6);
         assert_eq!(histogram_bucket_index(&DECODE_TPS_EDGES, 5000.0), 7);
         // e2e edges → 10 buckets 0..=9.
         assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 0), 0);
-        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 3);
-        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 9);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 250), 2);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 16000), 8);
+        assert_eq!(histogram_bucket_index(&E2E_MS_EDGES, 999_999), 9);
     }
 
     #[test]

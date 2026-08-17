@@ -2,7 +2,7 @@
 // Plik: mtp_bench.rs
 // Opis: Porównuje sekwencyjny greedy decode z natywnym MTP K=2/3 bez
 //       ponownego ładowania wag między próbami.
-// Przykład: cargo run -p forge-engine --release --example mtp_bench -- model.gguf 3 128 512
+// Przykład: cargo run -p forge-engine --release --example mtp_bench -- model.gguf 3 128 512 prose
 // =============================================================================
 
 use std::path::PathBuf;
@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::Tokenizer;
 
 struct Trial {
@@ -33,7 +33,10 @@ fn greedy_sampler() -> GpuSampler {
     })
 }
 
-fn prepare(model: &mut Model, prompt: &[u32]) -> Result<(forge_engine::kv::SeqKv, u32), Box<dyn std::error::Error>> {
+fn prepare(
+    model: &mut Model,
+    prompt: &[u32],
+) -> Result<(forge_engine::kv::SeqKv, u32), Box<dyn std::error::Error>> {
     let mut seq = model.new_seq();
     model.prefill_chunk(&mut seq, prompt)?;
     let first = model.sample_last_logits(&mut greedy_sampler())?;
@@ -131,14 +134,22 @@ fn adaptive_mtp_trial(
     while tokens.len() < target {
         tokens.push(fed);
         let preferred = if cycles < 4 {
-            if cycles.is_multiple_of(2) { 3 } else { 2 }
+            if cycles.is_multiple_of(2) {
+                3
+            } else {
+                2
+            }
         } else if k3_rate.unwrap_or(0.0) >= k2_rate.unwrap_or(0.0) {
             3
         } else {
             2
         };
         let budget = if cycles >= 4 && cycles.is_multiple_of(16) {
-            if preferred == 3 { 2 } else { 3 }
+            if preferred == 3 {
+                2
+            } else {
+                3
+            }
         } else {
             preferred
         };
@@ -148,7 +159,11 @@ fn adaptive_mtp_trial(
             .map_err(|error| format!("adaptacyjny cykl MTP {cycles}, fed={fed}: {error}"))?;
         let cycle_rate = (accepted + 1) as f64 / cycle_started.elapsed().as_secs_f64();
         if cycles > 0 {
-            let rate = if budget == 2 { &mut k2_rate } else { &mut k3_rate };
+            let rate = if budget == 2 {
+                &mut k2_rate
+            } else {
+                &mut k3_rate
+            };
             *rate = Some(rate.map_or(cycle_rate, |previous| previous * 0.75 + cycle_rate * 0.25));
         }
         for &token in &draft[..accepted] {
@@ -194,6 +209,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let budget = if adaptive { 3 } else { mode.parse()? };
     let target = args.next().map(|v| v.parse()).transpose()?.unwrap_or(32);
     let prompt_tokens: usize = args.next().map(|v| v.parse()).transpose()?.unwrap_or(128);
+    let prompt_kind = args.next().unwrap_or_else(|| "repeat".into());
     let max_seq_len = prompt_tokens
         .checked_add(target)
         .and_then(|length| length.checked_add(budget + 8))
@@ -201,12 +217,12 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let activations = 1usize << 30;
     let kv_cache = 64usize << 20;
     let reserve = 512usize << 20;
-    let free = CudaDevice::free_vram(0)?;
+    let free = gpu::free_vram(0)?;
     eprintln!("VRAM free={} MiB, max_seq_len={max_seq_len}", free >> 20);
     let weights = free
         .checked_sub(activations + kv_cache + reserve)
         .ok_or("za mało wolnego VRAM na benchmark MTP")?;
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights,
@@ -217,10 +233,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     eprintln!("pule CUDA gotowe");
     let gguf = forge_formats::Gguf::open(&path)?;
-    let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+    let vocab = forge_tokenize::gguf_vocab(&gguf)?;
     drop(gguf);
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
-    let unit = tokenizer.encode(" abc", false)?;
+    let prompt_text = match prompt_kind.as_str() {
+        "repeat" => " abc",
+        "prose" => {
+            "Kraków przez stulecia był ważnym ośrodkiem nauki, kultury i handlu. Jego historia łączy średniowieczną architekturę z codziennym życiem współczesnego miasta. "
+        }
+        _ => return Err("rodzaj promptu musi być równy repeat albo prose".into()),
+    };
+    let unit = tokenizer.encode(prompt_text, false)?;
     if unit.is_empty() {
         return Err("tokenizer zwrócił pusty wzorzec promptu".into());
     }
@@ -234,6 +257,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         device,
         &path,
         ModelConfig {
+            weight_host_budget: 0,
+            weight_spill_dir: None,
             kv_page_size: 32,
             kv_pages: max_seq_len.div_ceil(32) + 2,
             max_seq_len,
@@ -292,11 +317,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .iter()
                 .map(|trial| trial.drafted_by_position[position])
                 .sum::<usize>();
-            if drafted == 0 { 0.0 } else { accepted as f64 * 100.0 / drafted as f64 }
+            if drafted == 0 {
+                0.0
+            } else {
+                accepted as f64 * 100.0 / drafted as f64
+            }
         })
         .collect();
     println!(
-        "prompt={prompt_tokens}; serial tok/s={serial_tps:?}; mtp mode={mode} tok/s={mtp_tps:?}; acceptance={:.1}%; acceptance_by_position={accepted_by_position:?}; cycle_p50={:.3} ms",
+        "prompt={prompt_tokens}; kind={prompt_kind}; serial tok/s={serial_tps:?}; mtp mode={mode} tok/s={mtp_tps:?}; acceptance={:.1}%; acceptance_by_position={accepted_by_position:?}; cycle_p50={:.3} ms",
         accepted as f64 * 100.0 / drafted as f64,
         percentile_ms(&mut cycle_ms),
     );

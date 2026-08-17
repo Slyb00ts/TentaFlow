@@ -1284,7 +1284,7 @@ fn connections_of<'a>(view: &'a GraphView, selected: &str) -> Vec<(&'a GEdge, &'
         let is_note = |n: &GNode| n.node_type == "note";
         is_note(a.1)
             .cmp(&is_note(b.1))
-            .then(b.0.weight.partial_cmp(&a.0.weight).unwrap_or(std::cmp::Ordering::Equal))
+            .then(b.0.weight.total_cmp(&a.0.weight))
             .then(a.1.label.cmp(&b.1.label))
     });
     out

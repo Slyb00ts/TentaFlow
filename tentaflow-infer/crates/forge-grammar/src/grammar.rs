@@ -185,8 +185,7 @@ impl Grammar {
     fn char_class_end(&self, rule: usize, idx: usize) -> usize {
         let elems = &self.rules[rule];
         let mut i = idx + 1; // skip the initial Char/CharNot
-        while i < elems.len()
-            && matches!(elems[i].ty, ElemType::CharRangeUpper | ElemType::CharAlt)
+        while i < elems.len() && matches!(elems[i].ty, ElemType::CharRangeUpper | ElemType::CharAlt)
         {
             i += 1;
         }

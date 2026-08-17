@@ -12,7 +12,8 @@
 // exponential backoff (capped) and ±20% jitter — internal rtspsrc retry is
 // disabled so we control the policy at one layer only.
 
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use gstreamer as gst;
@@ -169,6 +170,16 @@ pub struct RtspPipelineHandles {
     /// ([`attach_rgb_branch_cuda`]) rather than start from host NV12
     /// ([`attach_rgb_branch`]).
     pub decode_tee_is_cuda: bool,
+    /// Set by the dynamic decoder build when the hardware branch could NOT be
+    /// constructed (no NVDEC element for this codec, or a link/state-change
+    /// failure). This is the only DEFINITIVE evidence that the current ingest
+    /// path cannot work here: the build runs on the streaming thread after the
+    /// pipeline is already PLAYING, so the failure never reaches the bus as an
+    /// error and the session would otherwise perceive it only as "no frames".
+    /// The session polls this to demote a rung immediately — and, conversely,
+    /// treats a warmup timeout WITHOUT this flag as a slow camera rather than as
+    /// proof that the decode chain is broken.
+    pub branch_build_error: Arc<Mutex<Option<String>>>,
 }
 
 /// Którą ścieżką dekodowania budujemy pipeline dla bieżącej próby. `Cpu` to
@@ -205,7 +216,40 @@ impl IngestPath {
             IngestPath::Cpu => "CPU decode",
         }
     }
+
+    /// Slot in [`PATH_EVER_DELIVERED`].
+    fn index(self) -> usize {
+        match self {
+            IngestPath::GpuResidentNvidia => 0,
+            IngestPath::NvdecNv12 => 1,
+            IngestPath::NvdecCpuConvert => 2,
+            IngestPath::Cpu => 3,
+        }
+    }
+
+    /// Record that this path produced a frame — unlocks it as an upgrade target.
+    fn mark_delivered(self) {
+        PATH_EVER_DELIVERED[self.index()].store(true, Ordering::Relaxed);
+    }
+
+    /// Has this path ever delivered a frame in this process?
+    fn ever_delivered(self) -> bool {
+        PATH_EVER_DELIVERED[self.index()].load(Ordering::Relaxed)
+    }
 }
+
+/// Per-path record of "this ingest path has delivered at least one frame in THIS
+/// process", indexed by [`IngestPath::index`]. Process-wide on purpose: whether
+/// NVDEC can decode at all is a property of the build and the machine, not of one
+/// camera or one session, so the first camera to prove a path works clears it for
+/// everyone — and a path nothing has ever proven is never worth tearing down a
+/// healthy stream for.
+static PATH_EVER_DELIVERED: [AtomicBool; 4] = [
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+    AtomicBool::new(false),
+];
 
 /// Whether the GPU-resident NV12 detect path is usable: the ort GPU detect
 /// features must be compiled (`detect_batch_gpu` exists to consume the raw NV12
@@ -217,7 +261,8 @@ fn nv12_gpu_detect_available() -> bool {
     crate::vision::settings::get().nv12_detect
         && cfg!(all(
             feature = "inference-vision-gpu",
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))
 }
 
@@ -231,6 +276,30 @@ fn degrade_ingest_path(p: IngestPath) -> IngestPath {
         IngestPath::NvdecNv12 => IngestPath::NvdecCpuConvert,
         _ => IngestPath::Cpu,
     }
+}
+
+/// True when a pre-first-frame pipeline failure came from the RTSP SOURCE
+/// (network / transport / auth) rather than from caps negotiation of the
+/// GPU (CUDA / NVDEC) branch.
+///
+/// The degrade ladders below fire on "died before the first frame", which is the
+/// right signal for a broken hardware chain — but a flaky camera fails the same
+/// way, and degrading on that permanently walks a perfectly healthy GPU pipeline
+/// down to CPU colour-convert and finally CPU decode (4K H.264 on cores), where
+/// it stays until the process restarts. Real negotiation faults still surface as
+/// `not-negotiated` / caps errors and MUST keep degrading, so this matches only
+/// the unambiguous source-side failures.
+fn is_transport_failure(reason: &str) -> bool {
+    let r = reason.to_ascii_lowercase();
+    r.contains("gstrtspsrc.c")
+        || r.contains("could not setup transport")
+        || r.contains("could not get/set settings from/on resource")
+        || r.contains("could not read from resource")
+        || r.contains("could not open resource")
+        || r.contains("could not receive message")
+        || r.contains("could not connect")
+        || r.contains("could not resolve")
+        || r.contains("unauthorized")
 }
 
 /// Rozstrzyga, czy NA STARCIE próbować dekodowania sprzętowego dla tej kamery.
@@ -310,11 +379,13 @@ fn build_rtspsrc(url: &str, timeout_secs: u32) -> Result<gst::Element> {
 
     // `protocols` is GstRTSPLowerTrans (GFlags) — can't be set as raw u32.
     // We pass through stringified flags which gst-rs parses via GFlags::from_str:
-    //   - rtsp://  -> `[vision] rtsp_protocols`, default "tcp" (interleaved).
-    //     Across routed networks UDP media dies SILENTLY (conntrack/NAT idle
-    //     timeouts) while the RTSP control TCP stays healthy — the session then
-    //     sat "ONLINE" with a black tile. Interleaved TCP cannot die silently;
-    //     the mid-session stall watchdog remains as defense in depth.
+    //   - rtsp://  -> `[vision] rtsp_protocols`, default "udp+udp-mcast+tcp"
+    //     (patrz `default_rtsp_protocols` w `config/mod.rs` — tam jest źródło
+    //     prawdy i pomiar, dla którego UDP zostało domyślne: interleaved TCP
+    //     zderzył się z backpressure startu naszego łańcucha tee i sesja nigdy
+    //     nie wchodziła online). UDP z kolei potrafi umrzeć CICHO na trasowanych
+    //     sieciach (timeouty conntrack/NAT) przy zdrowym kanale kontrolnym TCP —
+    //     pilnuje tego watchdog stallu w trakcie sesji.
     //   - rtsps:// -> "tcp+tls" (TLS over TCP; udp-over-tls is rare)
     // Without `tls` in the mask, rtspsrc would silently fail on rtsps:// URLs.
     let is_tls = url.starts_with("rtsps://");
@@ -659,7 +730,8 @@ pub(super) fn attach_detect_branch_nv12(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gst::Element> {
     let appsink = gst::ElementFactory::make("appsink")
@@ -692,7 +764,8 @@ pub(super) fn build_appsink_detect_cuda(mailbox: Arc<FrameMailbox>) -> Result<gs
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn attach_detect_branch_cuda(
     pipeline: &gst::Pipeline,
@@ -737,7 +810,8 @@ pub(super) fn attach_detect_branch_cuda(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn build_appsink_crops_cuda(
     camera_id: String,
@@ -775,7 +849,8 @@ pub(super) fn build_appsink_crops_cuda(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(super) fn attach_crops_branch_cuda(
     pipeline: &gst::Pipeline,
@@ -843,7 +918,8 @@ pub(super) fn zerocopy_enabled() -> bool {
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     {
         crate::vision::settings::get().zerocopy_detect
@@ -851,7 +927,8 @@ pub(super) fn zerocopy_enabled() -> bool {
     #[cfg(not(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     )))]
     {
         false
@@ -1203,6 +1280,9 @@ fn build_rtsp_pipeline_cpu(
         tee,
         decode_tee: None,
         decode_tee_is_cuda: false,
+        // No dynamically-built hardware branch on this path — nothing can fail
+        // after PLAYING, so the session never has a definitive demote signal here.
+        branch_build_error: Arc::new(Mutex::new(None)),
     })
 }
 
@@ -1350,6 +1430,8 @@ fn build_rtsp_pipeline_gpu_resident(
         .static_pad("src")
         .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a src pad missing".into()))?;
     let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let branch_build_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let branch_build_error_cb = branch_build_error.clone();
     let build_decoder = move |caps: &gst::Caps| {
         if built.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1368,14 +1450,17 @@ fn build_rtsp_pipeline_gpu_resident(
             .and_then(|s| s.get::<String>("encoding-name").ok())
             .unwrap_or_default();
         if let Err(e) = link_nvdec_branch(&pipeline, &queue_a, &cudaconvert, &encoding) {
-            // Nie panikujemy: brak NVDEC dla tego kodeka (np. MJPEG) oznacza,
-            // że branch A nie ruszy, pipeline nie da klatek, a sesja zejdzie
-            // na ścieżkę CPU. Logujemy, żeby było jasne dlaczego.
+            // Brak NVDEC dla tego kodeka (np. MJPEG) albo nieudany link: gałąź A
+            // nie ruszy i pipeline nie da ani jednej klatki. Publikujemy powód,
+            // żeby sesja zeszła o szczebel NATYCHMIAST zamiast czekać na koniec
+            // okna warmupu — ten błąd leci na wątku streamingu, więc nigdy nie
+            // trafi na bus.
             tracing::warn!(
                 encoding = %encoding,
                 error = %e,
-                "rtsp: nie udało się zbudować gałęzi NVDEC — fallback CPU nastąpi przez sesję"
+                "rtsp: nie udało się zbudować gałęzi NVDEC — sesja zejdzie o szczebel niżej"
             );
+            *branch_build_error_cb.lock().unwrap() = Some(format!("NVDEC branch build: {e}"));
         }
     };
     let build_decoder = std::sync::Arc::new(build_decoder);
@@ -1405,6 +1490,7 @@ fn build_rtsp_pipeline_gpu_resident(
         tee,
         decode_tee: None,
         decode_tee_is_cuda: false,
+        branch_build_error,
     })
 }
 
@@ -1610,7 +1696,8 @@ fn build_rtsp_pipeline_nvdec(
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
             feature = "inference-vision-gpu",
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         {
             if zerocopy_crops {
@@ -1644,7 +1731,8 @@ fn build_rtsp_pipeline_nvdec(
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
             feature = "inference-vision-gpu",
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         attach_detect_branch_cuda(&pipeline, tc, mailbox.clone())?;
     }
@@ -1726,6 +1814,8 @@ fn build_rtsp_pipeline_nvdec(
         .static_pad("src")
         .ok_or_else(|| CameraIngestError::PipelineBuild("queue_a src pad missing".into()))?;
     let built = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let branch_build_error: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let branch_build_error_cb = branch_build_error.clone();
     let build_decoder = move |caps: &gst::Caps| {
         if built.swap(true, std::sync::atomic::Ordering::SeqCst) {
             return;
@@ -1744,14 +1834,17 @@ fn build_rtsp_pipeline_nvdec(
             .and_then(|s| s.get::<String>("encoding-name").ok())
             .unwrap_or_default();
         if let Err(e) = link_nvdec_branch(&pipeline, &queue_a, &downstream, &encoding) {
-            // Nie panikujemy: brak NVDEC dla tego kodeka (np. MJPEG) oznacza,
-            // że branch A nie ruszy, pipeline nie da klatek, a sesja zejdzie na
-            // ścieżkę CPU. Logujemy, żeby było jasne dlaczego.
+            // Brak NVDEC dla tego kodeka (np. MJPEG) albo nieudany link: gałąź A
+            // nie ruszy i pipeline nie da ani jednej klatki. Publikujemy powód,
+            // żeby sesja zeszła o szczebel NATYCHMIAST zamiast czekać na koniec
+            // okna warmupu — ten błąd leci na wątku streamingu, więc nigdy nie
+            // trafi na bus.
             tracing::warn!(
                 encoding = %encoding,
                 error = %e,
-                "rtsp: nie udało się zbudować gałęzi NVDEC — fallback CPU nastąpi przez sesję"
+                "rtsp: nie udało się zbudować gałęzi NVDEC — sesja zejdzie o szczebel niżej"
             );
+            *branch_build_error_cb.lock().unwrap() = Some(format!("NVDEC branch build: {e}"));
         }
     };
     let build_decoder = std::sync::Arc::new(build_decoder);
@@ -1790,6 +1883,7 @@ fn build_rtsp_pipeline_nvdec(
         tee,
         decode_tee,
         decode_tee_is_cuda,
+        branch_build_error,
     })
 }
 
@@ -1820,7 +1914,15 @@ fn link_nvdec_branch(
     let depay = gst::ElementFactory::make(depay_name)
         .build()
         .map_err(|e| format!("{depay_name}: {e}"))?;
+    // Re-inject SPS/PPS before every IDR (`config-interval=-1`). A live Axis RTP
+    // stream sends codec parameters only periodically, and NVDEC is strict: it
+    // will not initialise its GPU decode session — and delivers ZERO frames while
+    // sitting in Playing — until it sees SPS/PPS. avdec_h264 (the CPU path)
+    // tolerates their absence, which is why software decode worked and hardware
+    // silently produced nothing. Branch B (mp4mux) already sets this on the same
+    // stream and records fine; the decode branch simply never did.
     let parse = gst::ElementFactory::make(parse_name)
+        .property_from_str("config-interval", "-1")
         .build()
         .map_err(|e| format!("{parse_name}: {e}"))?;
     let dec = gst::ElementFactory::make(dec_name)
@@ -1850,8 +1952,76 @@ fn link_nvdec_branch(
     pipeline
         .add_many([&depay, &parse, &dec])
         .map_err(|e| format!("add_many nvdec: {e}"))?;
-    gst::Element::link_many([queue_a, &depay, &parse, &dec, downstream])
-        .map_err(|e| format!("link nvdec branch: {e}"))?;
+    // Feed the decoder Annex-B byte-stream, not AVC. The pad probes proved
+    // depay+parse emit valid buffers (SPS/PPS present in codec_data) while
+    // nvh264dec outputs nothing on the live Axis: it was being handed
+    // `stream-format=avc`, where parameter sets live only in codec_data. Forcing
+    // `byte-stream` makes h264parse put SPS/PPS inline — and only then does the
+    // `config-interval=-1` above take effect (it is a no-op in AVC mode) — which is
+    // the format hardware decoders reliably initialise on for a mid-stream RTSP
+    // join. Everything up to `parse` links normally; `parse → dec` carries the caps.
+    let byte_stream_caps = gst::Caps::builder(if encoding.eq_ignore_ascii_case("H264") {
+        "video/x-h264"
+    } else {
+        "video/x-h265"
+    })
+    .field("stream-format", "byte-stream")
+    .field("alignment", "au")
+    .build();
+    // Leaky queue directly on the decoder's output. PROVEN off-app on the live
+    // camera: nvh264dec decodes the Axis feed at 28 fps into a fakesink but only
+    // ~1.6 fps through the real tail (cudadownload → tee → queue → appsink),
+    // because the 4K NV12 host download (24.9 MB/frame) cannot sustain real-time
+    // and backpressures the decoder into a pool-exhaustion stall — which then
+    // propagates through the shared rtp_tee and stalls the whole ingest until the
+    // warmup timeout demotes it to CPU. The existing leaky queue sits AFTER
+    // cudadownload, so nothing decoupled the decoder from the download. This queue
+    // drops decoded frames when the download falls behind, keeping nvh264dec free-
+    // running; the analysis path already consumes latest-only, so dropping is fine.
+    let decode_out = build_raw_leaky_queue("queue_nvdec_out")
+        .map_err(|e| format!("nvdec leaky queue: {e}"))?;
+    pipeline
+        .add(&decode_out)
+        .map_err(|e| format!("add nvdec leaky queue: {e}"))?;
+    gst::Element::link_many([queue_a, &depay, &parse])
+        .map_err(|e| format!("link nvdec front: {e}"))?;
+    parse
+        .link_filtered(&dec, &byte_stream_caps)
+        .map_err(|e| format!("link parse->dec byte-stream: {e}"))?;
+    gst::Element::link_many([&dec, &decode_out, downstream])
+        .map_err(|e| format!("link dec->leaky->downstream: {e}"))?;
+    decode_out
+        .sync_state_with_parent()
+        .map_err(|e| format!("sync nvdec leaky queue: {e}"))?;
+
+    // Diagnostic pad probes on each stage's src pad: log the FIRST buffer and its
+    // caps at depay, parse and decoder. NVDEC decodes this Axis stream fine from a
+    // file (1015 frames) yet delivers nothing live, so we need to see exactly
+    // where frames stop — if depay/parse emit but the decoder does not, the
+    // decoder is eating access units; if parse never emits, the fault is upstream.
+    // Probes fire once (AtomicBool) and remove themselves, so there is no per-frame
+    // cost past the first buffer.
+    for (label, el) in [("depay", &depay), ("parse", &parse), ("nvdec", &dec)] {
+        if let Some(pad) = el.static_pad("src") {
+            let once = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stage = label.to_string();
+            pad.add_probe(gst::PadProbeType::BUFFER, move |probe_pad, _info| {
+                if !once.swap(true, std::sync::atomic::Ordering::SeqCst) {
+                    let caps = probe_pad
+                        .current_caps()
+                        .map(|c| c.to_string())
+                        .unwrap_or_else(|| "<none>".into());
+                    tracing::info!(
+                        stage = %stage,
+                        caps = %caps,
+                        "rtsp: NVDEC branch first buffer at stage"
+                    );
+                    return gst::PadProbeReturn::Remove;
+                }
+                gst::PadProbeReturn::Ok
+            });
+        }
+    }
 
     for el in [&depay, &parse, &dec] {
         el.sync_state_with_parent()
@@ -2010,21 +2180,6 @@ fn install_base_pts_probe(pad: gst::Pad, publisher: &Arc<Mp4StreamPublisher>) {
     });
 }
 
-/// Pad-probe na src-padzie h264parse (bufory wchodzace do mp4mux): PIERWSZY
-/// bufor z ustawionym PTS ustala `mux_base_pts_ns` w publisherze i probe sam
-/// sie odpina. To ta sama oś czasu (media-timeline) co PTS appsink Branch A,
-/// bo Branch A i B dziela `tee` przed dekodem/muxem — klient odejmuje te baze
-/// od PTS detekcji, kotwiczac overlay na wlasciwej klatce MSE. WYLACZNIE dla
-/// gałęzi passthrough (bez transkodu) — za x264enc PTS jest juz przesuniety.
-pub(super) fn install_mux_base_pts_probe(
-    parse: &gst::Element,
-    publisher: &Arc<Mp4StreamPublisher>,
-) {
-    if let Some(parse_src) = parse.static_pad("src") {
-        install_base_pts_probe(parse_src, publisher);
-    }
-}
-
 /// Pad-probe na src-padzie pierwszej kolejki gałęzi B ZA tee (przed
 /// depay/dekodem/transkodem): PIERWSZY bufor z ustawionym PTS ustala
 /// `mux_base_pts_ns` i probe sam sie odpina. Dla gałęzi TRANSKODUJACYCH
@@ -2043,167 +2198,6 @@ pub(super) fn install_branch_input_base_pts_probe(
     }
 }
 
-/// Build and link Branch B (RTP → rtph264depay → h264parse → mp4mux → appsink)
-/// onto the running pipeline. Returns the branch state for later teardown,
-/// or `None` if the RTP caps say the stream is not H.264 (HEVC, MJPEG, …).
-///
-/// The mp4mux output goes through an appsink whose callback forwards each
-/// buffer to the supplied publisher via a `Weak` ref — that keeps the
-/// pipeline from accidentally pinning the hub-side `Arc` alive past the
-/// last subscriber.
-fn attach_mp4_branch(
-    pipeline: &gst::Pipeline,
-    tee: &gst::Element,
-    publisher: &Arc<Mp4StreamPublisher>,
-) -> std::result::Result<Mp4BranchState, String> {
-    // Codec gate: branch B muxer is hardwired for H.264 ES. We probe the RTP
-    // caps via the static sink pad on `tee` — by the time the first
-    // subscriber subscribes the pipeline is already PLAYING and caps have
-    // been negotiated. A missing caps probe means rtspsrc has not produced
-    // a pad yet; we treat that as transient and refuse politely.
-    let tee_sink = tee
-        .static_pad("sink")
-        .ok_or_else(|| "tee has no sink pad".to_string())?;
-    let caps = tee_sink
-        .current_caps()
-        .ok_or_else(|| "tee caps not yet negotiated".to_string())?;
-    let s = caps
-        .structure(0)
-        .ok_or_else(|| "empty caps on tee sink".to_string())?;
-    let encoding_name: String = s
-        .get::<String>("encoding-name")
-        .map_err(|e| format!("rtp caps missing encoding-name: {e}"))?;
-    if !encoding_name.eq_ignore_ascii_case("H264") {
-        return Err(format!(
-            "mp4 streaming requires H.264 (rtp encoding={})",
-            encoding_name
-        ));
-    }
-
-    // Kolejka gałęzi B — NIE-leaky: bufory to surowe pakiety RTP, a mux fMP4
-    // wymaga kompletnego elementary stream (drop pakietu = uszkodzone AU =
-    // artefakty w MSE). Gdy klient nie nadąża, przepełnienie obsługuje
-    // broadcast/subscriber_lagged wyżej (po stronie publishera), nie gstreamer.
-    let queue_b = gst::ElementFactory::make("queue")
-        .property("name", "queue_branch_b")
-        .property("max-size-buffers", 120u32)
-        .build()
-        .map_err(|e| format!("queue_b build: {e}"))?;
-    let depay = gst::ElementFactory::make("rtph264depay")
-        .build()
-        .map_err(|e| format!("rtph264depay build: {e}"))?;
-    let parse = gst::ElementFactory::make("h264parse")
-        // mp4mux needs AVC sample format (length-prefixed NALUs) — the
-        // default byte-stream out of rtph264depay would otherwise force
-        // mp4mux to refuse with `not-negotiated`.
-        .property_from_str("config-interval", "-1")
-        .build()
-        .map_err(|e| format!("h264parse build: {e}"))?;
-    // `streamable=true` writes ftyp+moov on the first fragment (init segment
-    // for MSE) and produces moof+mdat fragments thereafter, without an
-    // ending mfra/mvex finalize — exactly what a live MSE consumer needs.
-    // `fragment-duration` is in milliseconds; 200 ms strikes a balance
-    // between latency and overhead.
-    let mux = gst::ElementFactory::make("mp4mux")
-        .property("fragment-duration", 200u32)
-        .property("streamable", true)
-        .build()
-        .map_err(|e| format!("mp4mux build: {e}"))?;
-    let sink = gst::ElementFactory::make("appsink")
-        .property("name", "sink_mp4")
-        .property("emit-signals", false)
-        // Mux fragments must be drained promptly to keep latency bounded —
-        // sync=false lets the appsink consume as fast as the muxer emits.
-        .property("sync", false)
-        .property("max-buffers", 8u32)
-        .property("drop", false)
-        .build()
-        .map_err(|e| format!("appsink_b build: {e}"))?;
-
-    pipeline
-        .add_many([&queue_b, &depay, &parse, &mux, &sink])
-        .map_err(|e| format!("add_many branch B: {e}"))?;
-
-    let queue_b_sink = queue_b
-        .static_pad("sink")
-        .ok_or_else(|| "queue_b sink pad missing".to_string())?;
-    gst::Element::link_many([&queue_b, &depay, &parse, &mux, &sink])
-        .map_err(|e| format!("link branch B: {e}"))?;
-
-    wire_mp4_appsink(&sink, publisher)?;
-
-    // Rebuild pipeline'u (reconnect) resetuje oś PTS mediów wraz z nowym
-    // init-segmentem. Ten sam publisher moze przezyc reconnect, wiec kasujemy
-    // stara baze — inaczej `set_base_pts_ns` (ustawia tylko gdy pusto) zostawilby
-    // baze z poprzedniej osi i overlay rozjechalby sie po reconnectcie. Po
-    // skasowaniu pierwszy bufor tej Branch B ustali baze spojna z init-segmentem.
-    publisher.reset_base_pts_ns();
-
-    install_mux_base_pts_probe(&parse, publisher);
-
-    // Bring every new element up to the pipeline's current state so the
-    // mux branch starts producing without needing a full pipeline restart.
-    for el in [&queue_b, &depay, &parse, &mux, &sink] {
-        el.sync_state_with_parent()
-            .map_err(|e| format!("sync_state branch B element: {e}"))?;
-    }
-
-    // Pad tee linkujemy DOPIERO po aktywacji całej gałęzi. Push tee w okno
-    // między linkiem a aktywacją queue_b zwraca FLUSHING, a tee trwale
-    // oznacza taki pad jako usunięty i nigdy więcej do niego nie pcha —
-    // gałąź wygląda na wpiętą, ale mux nie dostaje ani bajta i init segment
-    // nigdy nie powstaje.
-    // Gałąź jest już AKTYWNA w pipeline — przy błędzie tego kroku trzeba ją
-    // rozebrać (Null + remove), inaczej kolejny attach wywali się na kolizji
-    // stałych nazw elementów, a osierocone elementy dalej mieliłyby dane.
-    let Some(tee_src_pad) = tee.request_pad_simple("src_%u") else {
-        for el in [&queue_b, &depay, &parse, &mux, &sink] {
-            let _ = el.set_state(gst::State::Null);
-        }
-        let _ = pipeline.remove_many([&queue_b, &depay, &parse, &mux, &sink]);
-        return Err("tee src_%u request for branch B failed".to_string());
-    };
-    if let Err(e) = tee_src_pad.link(&queue_b_sink) {
-        detach_mp4_branch(
-            pipeline,
-            tee,
-            Mp4BranchState {
-                tee_src_pad,
-                elements: vec![queue_b, depay, parse, mux, sink],
-            },
-        );
-        return Err(format!("tee → queue_b: {e:?}"));
-    }
-
-    // Wymuś natychmiastową klatkę kluczową w GÓRĘ pipeline'u. Nowy widz podpina
-    // się do już działającego strumienia — bez tego `mp4mux`/`h264parse` czeka
-    // na najbliższy naturalny keyframe (IDR) kamery zanim wyemituje init
-    // segment (ftyp+moov+IDR), co daje ~2 s czarnego ekranu w podglądzie MSE.
-    // Zdarzenie force-key-unit puszczone upstream na `tee` propaguje się do
-    // źródła RTP (rtspsrc) — dla RTSP tłumaczone na RTCP PLI/żądanie IDR;
-    // wiele kamer (w tym UniFi) oraz nasz symulator MediaMTX reagują od razu,
-    // skracając czas do pierwszej klatki. `all_headers=true` wymusza dołączenie
-    // SPS/PPS przy nowym keyframie, dzięki czemu init segment jest kompletny.
-    let force_key_unit = gst_video::UpstreamForceKeyUnitEvent::builder()
-        .all_headers(true)
-        .build();
-    if !tee.send_event(force_key_unit) {
-        // Nie każde źródło honoruje force-key-unit — to best-effort. Jeśli tee
-        // nie połknęło zdarzenia, spróbuj na całym pipeline (trafi do sink pada
-        // propagującego upstream). Brak reakcji nie jest błędem: strumień i tak
-        // ruszy przy najbliższym naturalnym IDR.
-        let fallback = gst_video::UpstreamForceKeyUnitEvent::builder()
-            .all_headers(true)
-            .build();
-        let _ = pipeline.send_event(fallback);
-    }
-
-    Ok(Mp4BranchState {
-        tee_src_pad,
-        elements: vec![queue_b, depay, parse, mux, sink],
-    })
-}
-
 /// Dowiesza wariant PODGLĄDU gałęzi B: zamiast passthroughu pełnego strumienia
 /// źródła (1080p, ~4-8 Mbit/s) transkodujemy do 720p/~1,5 Mbit/s —
 ///
@@ -2220,11 +2214,48 @@ fn attach_mp4_branch(
 /// bo x264enc przesuwa timestampy za sobą o stały offset.
 /// Dekoder jest osobny od Branch A (własny avdec za tee), więc podgląd nie
 /// zakłóca ścieżki detekcji. Ta sama bramka kodeka co passthrough: H.264.
+/// Jedna próba wpięcia gałęzi B (fMP4) dla `publisher`. Wariant wybiera ścieżkę:
+/// MJPEG transkoduje JPEG→H.264, podgląd schodzi do 720p/1,5 Mbit/s (kafelki),
+/// a pojedynczy kafelek do 1080p/4 Mbit/s — przeglądarka nie dekoduje 4K w czasie
+/// rzeczywistym (≈5 fps i rozjechana oś czasu nakładki detekcji).
+fn try_attach_branch_b(
+    pipeline: &gst::Pipeline,
+    tee: &gst::Element,
+    publisher: &Arc<Mp4StreamPublisher>,
+    is_mjpeg: bool,
+    target_fps: u32,
+) -> std::result::Result<Mp4BranchState, String> {
+    let preview = publisher.is_preview();
+    if is_mjpeg {
+        super::mjpeg::attach_mp4_branch_mjpeg(pipeline, tee, publisher, preview, target_fps)
+    } else if preview {
+        attach_mp4_branch_preview(pipeline, tee, publisher, target_fps, 1280, 1500)
+    } else {
+        attach_mp4_branch_preview(pipeline, tee, publisher, target_fps, 1920, 4000)
+    }
+}
+
+/// Czy odmowa wpięcia gałęzi B jest PRZEJŚCIOWA. `tee` negocjuje caps dopiero gdy
+/// popłynie pierwszy bufor, a subskrypcja z dashboardu trafia zwykle wcześniej:
+/// pipeline jest świeżo zbudowany, RTSP jeszcze się zestawia. Zabicie takiej
+/// subskrypcji czyni podgląd niemożliwym przez cały warmup (a przy flapującym
+/// transporcie — w praktyce zawsze), więc taki publisher czeka na wpięcie zamiast
+/// dostać `mark_unsupported`. Pozostałe odmowy (obcy kodek, błąd budowy muxa) są
+/// trwałe i muszą kończyć subskrypcję natychmiast.
+fn attach_refusal_is_transient(reason: &str) -> bool {
+    reason.contains("caps not yet negotiated")
+}
+
 fn attach_mp4_branch_preview(
     pipeline: &gst::Pipeline,
     tee: &gst::Element,
     publisher: &Arc<Mp4StreamPublisher>,
     source_fps: u32,
+    // Transcode target: the single tile uses 1080p, the grid tiles 720p. Full 4K
+    // passthrough overwhelmed the browser's real-time decoder (≈5 fps, jumpy
+    // playback), which also broke the detection overlay's media-time sync.
+    target_width: i32,
+    bitrate: u32,
 ) -> std::result::Result<Mp4BranchState, String> {
     // Bramka kodeka jak w `attach_mp4_branch`: depay jest przykręcony do
     // H.264, inne kodeki (HEVC, MJPEG) odrzucamy zanim ruszy budowa gałęzi.
@@ -2247,11 +2278,29 @@ fn attach_mp4_branch_preview(
         ));
     }
 
+    // Nazwy elementów MUSZĄ różnić się między wariantami: pełna jakość i podgląd
+    // to dwie NIEZALEŻNE gałęzie na tym samym tee, a `gst_bin_add` odrzuca element
+    // o nazwie już obecnej w binie. Wspólna nazwa dla obu wariantów sprawiała, że
+    // wpięcie drugiej gałęzi padało na `add_many` — kafelek pojedynczy nie działał,
+    // gdy działał kafelek siatki (i odwrotnie). Sufiks jak w wariancie MJPEG.
+    let name_suffix = if publisher.is_preview() {
+        "_preview"
+    } else {
+        ""
+    };
+    // Etykieta wariantu do komunikatów błędu: dotąd każdy mówił „preview", także
+    // dla gałęzi pełnej jakości, przez co log twierdził `preview=false
+    // reason="... branch B preview ..."` i mylił przy diagnozie.
+    let wariant = if publisher.is_preview() {
+        "preview"
+    } else {
+        "full"
+    };
     // Kolejka przed dekoderem — NIE-leaky: bufory to surowe pakiety RTP, drop
     // psułby access-unity aż do najbliższego IDR. Gubienie przy spiętrzeniu
     // dopiero ZA dekoderem (queue_dec niżej), na pełnych klatkach.
     let queue_b = gst::ElementFactory::make("queue")
-        .property("name", "queue_branch_b_preview")
+        .property("name", format!("queue_branch_b{name_suffix}"))
         .property("max-size-buffers", 120u32)
         .build()
         .map_err(|e| format!("queue_b preview build: {e}"))?;
@@ -2264,16 +2313,18 @@ fn attach_mp4_branch_preview(
     let dec = gst::ElementFactory::make("avdec_h264")
         .build()
         .map_err(|e| format!("avdec_h264 build: {e}"))?;
-    let queue_dec = build_raw_leaky_queue("queue_decoded_b_preview").map_err(|e| e.to_string())?;
+    let queue_dec =
+        build_raw_leaky_queue(&format!("queue_decoded_b{name_suffix}")).map_err(|e| e.to_string())?;
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| format!("videoconvert build: {e}"))?;
     let scale = gst::ElementFactory::make("videoscale")
         .build()
         .map_err(|e| format!("videoscale build: {e}"))?;
+    // 16:9 source (4K 3840×2160), so height follows width to preserve aspect.
     let scale_caps = gst::Caps::builder("video/x-raw")
-        .field("width", 1280i32)
-        .field("height", 720i32)
+        .field("width", target_width)
+        .field("height", target_width * 9 / 16)
         .build();
     let scale_filter = gst::ElementFactory::make("capsfilter")
         .property("caps", &scale_caps)
@@ -2284,7 +2335,7 @@ fn attach_mp4_branch_preview(
     // źródła) — MSE potrzebuje regularnych punktów wejścia. Te same parametry
     // co transkoder MJPEG, tylko niższy bitrate pod kafelki Live view przez WAN.
     let enc = gst::ElementFactory::make("x264enc")
-        .property("bitrate", 1500u32)
+        .property("bitrate", bitrate)
         .property("key-int-max", transcoder_key_int_max(source_fps))
         .build()
         .map_err(|e| format!("x264enc build: {e}"))?;
@@ -2303,7 +2354,7 @@ fn attach_mp4_branch_preview(
         .build()
         .map_err(|e| format!("mp4mux build: {e}"))?;
     let sink = gst::ElementFactory::make("appsink")
-        .property("name", "sink_mp4_preview")
+        .property("name", format!("sink_mp4{name_suffix}"))
         .property("emit-signals", false)
         .property("sync", false)
         .property("max-buffers", 8u32)
@@ -2327,29 +2378,50 @@ fn attach_mp4_branch_preview(
     ];
     pipeline
         .add_many(elements)
-        .map_err(|e| format!("add_many branch B preview: {e}"))?;
+        .map_err(|e| format!("add_many branch B {wariant}: {e}"))?;
 
-    let queue_b_sink = queue_b
-        .static_pad("sink")
-        .ok_or_else(|| "queue_b preview sink pad missing".to_string())?;
-    gst::Element::link_many(elements).map_err(|e| format!("link branch B preview: {e}"))?;
+    // Od tego miejsca elementy SĄ w pipeline, więc KAŻDA ścieżka błędu musi je
+    // usunąć. Trzy z nich mają nazwy stałe w obrębie wariantu
+    // (`queue_branch_b{,_preview}`, `queue_decoded_b{,_preview}`,
+    // `sink_mp4{,_preview}`), a `gst_bin_add` odrzuca
+    // element o nazwie już obecnej w binie — osierocona gałąź blokuje więc
+    // KAŻDĄ kolejną próbę wpięcia na `add_many`, trwale, aż do przebudowy
+    // pipeline'u. Dlatego kroki fallible siedzą w jednym domknięciu i mają
+    // JEDNO wspólne sprzątanie, którego nie da się pominąć przy kolejnej edycji.
+    let wired = (|| -> std::result::Result<gst::Pad, String> {
+        let queue_b_sink = queue_b
+            .static_pad("sink")
+            .ok_or_else(|| format!("queue_b {wariant} sink pad missing"))?;
+        gst::Element::link_many(elements).map_err(|e| format!("link branch B {wariant}: {e}"))?;
 
-    wire_mp4_appsink(&sink, publisher)?;
+        wire_mp4_appsink(&sink, publisher)?;
 
-    // Ta sama semantyka resetu bazy PTS co w gałęzi passthrough (rebuild =
-    // nowa oś), ale probe stoi na WEJŚCIU gałęzi (src pad queue_b za tee,
-    // przed depay/dekodem): x264enc przesuwa timestampy o stały offset, więc
-    // baza zdjęta za enkoderem leżałaby w innej osi niż PTS detekcji i klient
-    // w trybie PTS nie rysowałby boxów. PTS pierwszej klatki wchodzącej do
-    // gałęzi to oś detekcji (Branch A), spójna z media-time pierwszej próbki
-    // fragmentu z dokładnością do opóźnienia enkodera (1-2 klatki).
-    publisher.reset_base_pts_ns();
-    install_branch_input_base_pts_probe(&queue_b, publisher);
+        // Ta sama semantyka resetu bazy PTS co w gałęzi passthrough (rebuild =
+        // nowa oś), ale probe stoi na WEJŚCIU gałęzi (src pad queue_b za tee,
+        // przed depay/dekodem): x264enc przesuwa timestampy o stały offset, więc
+        // baza zdjęta za enkoderem leżałaby w innej osi niż PTS detekcji i klient
+        // w trybie PTS nie rysowałby boxów. PTS pierwszej klatki wchodzącej do
+        // gałęzi to oś detekcji (Branch A), spójna z media-time pierwszej próbki
+        // fragmentu z dokładnością do opóźnienia enkodera (1-2 klatki).
+        publisher.reset_base_pts_ns();
+        install_branch_input_base_pts_probe(&queue_b, publisher);
 
-    for el in elements {
-        el.sync_state_with_parent()
-            .map_err(|e| format!("sync_state branch B preview element: {e}"))?;
-    }
+        for el in elements {
+            el.sync_state_with_parent()
+                .map_err(|e| format!("sync_state branch B {wariant} element: {e}"))?;
+        }
+        Ok(queue_b_sink)
+    })();
+    let queue_b_sink = match wired {
+        Ok(pad) => pad,
+        Err(reason) => {
+            for el in elements {
+                let _ = el.set_state(gst::State::Null);
+            }
+            let _ = pipeline.remove_many(elements);
+            return Err(reason);
+        }
+    };
 
     // Pad tee linkujemy DOPIERO po aktywacji całej gałęzi. Push tee w okno
     // między linkiem a aktywacją queue_b zwraca FLUSHING, a tee trwale
@@ -2364,7 +2436,7 @@ fn attach_mp4_branch_preview(
             let _ = el.set_state(gst::State::Null);
         }
         let _ = pipeline.remove_many(elements);
-        return Err("tee src_%u request for branch B preview failed".to_string());
+        return Err(format!("tee src_%u request for branch B {wariant} failed"));
     };
     if let Err(e) = tee_src_pad.link(&queue_b_sink) {
         detach_mp4_branch(
@@ -2375,7 +2447,7 @@ fn attach_mp4_branch_preview(
                 elements: elements.iter().map(|el| (*el).clone()).collect(),
             },
         );
-        return Err(format!("tee → queue_b preview: {e:?}"));
+        return Err(format!("tee → queue_b {wariant}: {e:?}"));
     }
 
     // Jak w gałęzi passthrough: nowy widz wpina się w działający strumień, a
@@ -2689,6 +2761,17 @@ pub async fn run_rtsp_session(
     // Without this the UI sees `status_message = None` 99% of the time
     // because health ticks publish every second but failures publish once.
     let mut last_error: Option<String> = None;
+    // FPS is a property of the CAMERA, not of one pipeline incarnation. Declared
+    // outside `'outer` so a reconnect does not empty the window: rebuilding it per
+    // attempt made the reported rate collapse to 0 and crawl back up over the next
+    // 30 s after every reconnect, which is what the dashboard showed as "jumping
+    // FPS" even while frames flowed steadily.
+    let mut fps_window: std::collections::VecDeque<f32> =
+        std::collections::VecDeque::with_capacity(30);
+    // Periodic pipeline metrics (path / fps / stage timings). Throttled to keep
+    // one line per camera per interval out of the hot health tick.
+    const METRICS_EVERY: Duration = Duration::from_secs(30);
+    let mut last_metrics_at = tokio::time::Instant::now();
 
     publish(
         &health_tx,
@@ -2824,6 +2907,9 @@ pub async fn run_rtsp_session(
         // Whether `decode_tee` is the CUDA-memory tee (zero-copy crops): the
         // on-demand RGB attach then inserts its own `cudadownload`.
         let decode_tee_is_cuda = handles.decode_tee_is_cuda;
+        // Polled each tick: a hardware branch that failed to build reports here
+        // instead of on the bus.
+        let branch_build_error = handles.branch_build_error.clone();
         let mut rgb_branch: Option<Mp4BranchState> = None;
         // Branch B mux state — `Some` whenever a consumer is subscribed.
         // Dwa niezależne sloty na tym samym tee: pełna jakość (passthrough,
@@ -2836,6 +2922,24 @@ pub async fn run_rtsp_session(
         // nowym pipeline daje nowy init segment i nową bazę PTS.
         let mut branch_b_full: Option<Mp4BranchState> = None;
         let mut branch_b_preview: Option<Mp4BranchState> = None;
+        // Publisher, którego wpięcie odroczono do wynegocjowania caps na `tee`
+        // (patrz `attach_refusal_is_transient`). `Weak`, bo porzucony przez hub
+        // publisher nie może się tu trzymać w nieskończoność — nieudane
+        // `upgrade()` JEST sygnałem, że subskrybent już odszedł.
+        // Para: publisher czekający na wpięcie + moment zaparkowania (do wykrycia
+        // czekania, które trwa podejrzanie długo).
+        let mut pending_attach_full: Option<(std::sync::Weak<Mp4StreamPublisher>, tokio::time::Instant)> =
+            None;
+        let mut pending_attach_preview: Option<(
+            std::sync::Weak<Mp4StreamPublisher>,
+            tokio::time::Instant,
+        )> = None;
+        // Po tylu sekundach czekania na caps mówimy o tym GŁOŚNO. `tee` dostaje
+        // caps od pierwszego bufora RTP, więc długie czekanie nie znaczy „zaraz
+        // będzie" tylko „kamera nie dostarcza ani jednego pakietu" — bez tego
+        // ostrzeżenia log pokazywał jedynie ciszę i ponawiane subskrypcje.
+        const PENDING_ATTACH_STALL: Duration = Duration::from_secs(15);
+        let mut pending_stall_logged = [false, false];
         // Słabe referencje do publisherów aktualnie wpiętych gałęzi B. Służą do:
         // (a) zamknięcia strumieni przy rozbiórce pipeline'u, (b) ignorowania
         // przeterminowanych `DetachMp4Branch` od STARYCH publisherów (komenda
@@ -2944,8 +3048,6 @@ pub async fn run_rtsp_session(
         // instant stall -> reconnect storm (tens of thousands per night).
         let base_total = counters.snapshot().0;
         let mut last_total: u64 = base_total;
-        let mut fps_window: std::collections::VecDeque<f32> =
-            std::collections::VecDeque::with_capacity(30);
         let started_at = tokio::time::Instant::now();
         // `[vision] warmup_extra_secs` (default 20): grace past the connect
         // timeout for FIRST frames before the path degrades a rung — a camera
@@ -2960,6 +3062,14 @@ pub async fn run_rtsp_session(
         // restart (e.g. credentials rotation). On restart we want to skip
         // the reconnect backoff and try the new config immediately.
         let mut restart_requested = false;
+        // A warmup timeout DOES walk the ingest path down a rung. Treating it as
+        // "just a slow camera" and retrying the same rung was tried and left the
+        // production camera with no frames at all: the NVDEC branch attaches and
+        // negotiates, then delivers nothing from this Axis, so without the demote
+        // there is no path to a working stream.
+        // The dynamic hardware branch could not be built. This IS evidence the
+        // path cannot work here, so it degrades immediately.
+        let mut branch_build_failed = false;
         // Inner loop owns the running pipeline. Terminate it by `break` →
         // outer reconnects; or `return` for a final stop.
         let inner_reason: Option<String> = loop {
@@ -2981,6 +3091,7 @@ pub async fn run_rtsp_session(
                             close_mp4_stream_on_teardown(&cam_id, &branch_b_preview_publisher);
                             publish(&health_tx, &cam_id, CameraStatus::Offline, None, &counters, None);
                             streaming_bus().close_camera(&cam_id, "stopped").await;
+                            super::stage_metrics::forget(&cam_id);
                             return;
                         }
                         Some(SessionCommand::UpdateConfig(_)) => {
@@ -3055,30 +3166,48 @@ pub async fn run_rtsp_session(
                                 );
                                 publisher.mark_unsupported();
                             } else {
-                                // MJPEG transkoduje JPEG → H.264 (x264enc);
-                                // RTSP w pełnej jakości przepakowuje H.264 z RTP
-                                // bez rekompresji, a w podglądzie transkoduje do
-                                // 720p/1,5 Mbit/s (kafelki Live view przez WAN).
-                                let attach_result = if is_mjpeg {
-                                    super::mjpeg::attach_mp4_branch_mjpeg(pipeline, &tee, &publisher, preview, config.target_fps)
-                                } else if preview {
-                                    attach_mp4_branch_preview(pipeline, &tee, &publisher, config.target_fps)
-                                } else {
-                                    attach_mp4_branch(pipeline, &tee, &publisher)
-                                };
-                                match attach_result {
+                                match try_attach_branch_b(pipeline, &tee, &publisher, is_mjpeg, config.target_fps) {
                                     Ok(state) => {
                                         tracing::info!(
                                             camera_id = %cam_id,
                                             preview,
                                             "rtsp: branch B attached (fMP4 mux)"
                                         );
+                                        // Restart budżetu na init segment — liczy się
+                                        // od wpięcia, nie od subskrypcji.
+                                        publisher.mark_branch_attached();
                                         *slot = Some(state);
                                         let weak = Some(std::sync::Arc::downgrade(&publisher));
                                         if preview {
                                             branch_b_preview_publisher = weak;
                                         } else {
                                             branch_b_full_publisher = weak;
+                                        }
+                                    }
+                                    Err(reason) if attach_refusal_is_transient(&reason) => {
+                                        // Caps jeszcze nie ma — parkujemy publishera i
+                                        // wpinamy go na najbliższym ticku (1 s), gdy
+                                        // popłynie pierwszy bufor. Nowe żądanie zastępuje
+                                        // stare: hub tworzy świeżego publishera przy każdym
+                                        // resubscribe, a stary już nikogo nie karmi.
+                                        tracing::info!(
+                                            camera_id = %cam_id,
+                                            preview,
+                                            reason = %reason,
+                                            "rtsp: branch B attach odroczone — czekam na caps"
+                                        );
+                                        let pending = if preview {
+                                            &mut pending_attach_preview
+                                        } else {
+                                            &mut pending_attach_full
+                                        };
+                                        if let Some((stale, _)) = pending.replace((
+                                            std::sync::Arc::downgrade(&publisher),
+                                            tokio::time::Instant::now(),
+                                        )) {
+                                            if let Some(stale) = stale.upgrade() {
+                                                stale.mark_unsupported();
+                                            }
                                         }
                                     }
                                     Err(reason) => {
@@ -3145,11 +3274,110 @@ pub async fn run_rtsp_session(
                                 terminate = Some(redact_url_in_text(&raw));
                                 break;
                             }
+                            // Hardware decoders report a silent no-frames failure as
+                            // a non-fatal Warning, not an Error, so it never surfaced.
+                            // Log it (with the emitting element) so a stuck nvh264dec
+                            // says WHY instead of just timing out the warmup window.
+                            MessageView::Warning(w) => {
+                                let src = w
+                                    .src()
+                                    .map(|s| s.name().to_string())
+                                    .unwrap_or_default();
+                                let raw = format!(
+                                    "{} ({})",
+                                    w.error(),
+                                    w.debug().unwrap_or_default()
+                                );
+                                tracing::warn!(
+                                    camera_id = %cam_id,
+                                    element = %src,
+                                    "rtsp: element warning: {}",
+                                    redact_url_in_text(&raw)
+                                );
+                            }
                             _ => {}
                         }
                     }
                     if let Some(reason) = terminate {
                         break Some(reason);
+                    }
+
+                    // Odroczone wpięcia gałęzi B: caps na `tee` pojawiają się po
+                    // pierwszym buforze, więc subskrypcja złożona w trakcie warmupu
+                    // dowiązuje się dopiero tutaj. Bez tego kroku podgląd był
+                    // nieosiągalny dla każdej subskrypcji, która trafiła w świeżo
+                    // zbudowany pipeline — a przy flapującym transporcie RTSP to
+                    // znaczyło: dla każdej.
+                    for preview in [false, true] {
+                        let (pending, slot) = if preview {
+                            (&mut pending_attach_preview, &mut branch_b_preview)
+                        } else {
+                            (&mut pending_attach_full, &mut branch_b_full)
+                        };
+                        let Some((weak, parked_at)) = pending.as_ref() else { continue };
+                        let waiting = parked_at.elapsed();
+                        let Some(publisher) = weak.upgrade() else {
+                            // Subskrybent odszedł (hub porzucił źródło) — nie ma
+                            // czego wpinać.
+                            *pending = None;
+                            continue;
+                        };
+                        if slot.is_some() {
+                            // Inny publisher zdążył zająć ten wariant.
+                            publisher.mark_unsupported();
+                            *pending = None;
+                            continue;
+                        }
+                        match try_attach_branch_b(pipeline, &tee, &publisher, is_mjpeg, config.target_fps) {
+                            Ok(state) => {
+                                tracing::info!(
+                                    camera_id = %cam_id,
+                                    preview,
+                                    waited_ms = waiting.as_millis() as u64,
+                                    "rtsp: branch B attached (odroczone wpięcie)"
+                                );
+                                // Tu reset budżetu jest KRYTYCZNY: odroczenie mogło
+                                // trwać sekundy, a bez niego publisher umierał tuż
+                                // po wpięciu.
+                                publisher.mark_branch_attached();
+                                pending_stall_logged[usize::from(preview)] = false;
+                                *slot = Some(state);
+                                *pending = None;
+                                let weak = Some(std::sync::Arc::downgrade(&publisher));
+                                if preview {
+                                    branch_b_preview_publisher = weak;
+                                } else {
+                                    branch_b_full_publisher = weak;
+                                }
+                            }
+                            // Caps wciąż nie ma — czekamy dalej (kolejny tick). Gdy
+                            // czekanie się przeciąga, mówimy o tym RAZ: `tee` bierze
+                            // caps z pierwszego bufora RTP, więc to nie jest „zaraz
+                            // będzie", tylko „kamera nie dostarcza ani pakietu".
+                            Err(reason) if attach_refusal_is_transient(&reason) => {
+                                let logged = &mut pending_stall_logged[usize::from(preview)];
+                                if !*logged && waiting >= PENDING_ATTACH_STALL {
+                                    *logged = true;
+                                    tracing::warn!(
+                                        camera_id = %cam_id,
+                                        preview,
+                                        waiting_s = waiting.as_secs(),
+                                        reason = %reason,
+                                        "rtsp: gałąź B czeka na caps — brak danych z kamery na tee"
+                                    );
+                                }
+                            }
+                            Err(reason) => {
+                                tracing::warn!(
+                                    camera_id = %cam_id,
+                                    preview,
+                                    reason = %reason,
+                                    "rtsp: branch B attach refused (po odroczeniu)"
+                                );
+                                publisher.mark_unsupported();
+                                *pending = None;
+                            }
+                        }
                     }
 
                     // On-demand RGB branch (Stage 3, NV12 crops path only): attach
@@ -3195,10 +3423,21 @@ pub async fn run_rtsp_session(
                         Some(fps_window.iter().sum::<f32>() / fps_window.len() as f32)
                     };
 
+                    // A hardware branch that failed to BUILD is definitive: it can
+                    // never deliver a frame, and because the failure happens on the
+                    // streaming thread it never reaches the bus. Demote at once
+                    // rather than burning the whole warmup window on a dead branch.
+                    let build_error = branch_build_error.lock().unwrap().clone();
+                    if let Some(e) = build_error {
+                        branch_build_failed = true;
+                        break Some(e);
+                    }
+
                     if !online {
                         if total > base_total {
                             online = true;
                             online_at = Some(tokio::time::Instant::now());
+                            ingest_path.mark_delivered();
                             // Successful connect — clear backoff state so the
                             // next disconnect starts the schedule fresh.
                             attempt = 0;
@@ -3207,6 +3446,7 @@ pub async fn run_rtsp_session(
                             tracing::info!(
                                 camera_id = %cam_id,
                                 total,
+                                path = ingest_path.label(),
                                 "rtsp: camera ONLINE — first frames flowing"
                             );
                         } else if tokio::time::Instant::now() >= warmup_deadline {
@@ -3214,14 +3454,18 @@ pub async fn run_rtsp_session(
                         }
                     } else if !path_upgrade_attempted
                         && ingest_path != preferred_path
+                        && preferred_path.ever_delivered()
                         && online_at.is_some_and(|t| t.elapsed() >= PATH_UPGRADE_AFTER)
                     {
                         // Self-heal a degraded path: stable ONLINE on a lower rung →
-                        // one reconnect at the preferred path this session. The
-                        // camera is warm now, so the preferred-path warmup gets
-                        // frames immediately; if it still fails, the normal degrade
-                        // cascade brings the stream back and no further upgrade is
-                        // attempted until the next session.
+                        // one reconnect at the preferred path this session.
+                        //
+                        // Gated on `preferred_path.ever_delivered()`: tearing down a
+                        // HEALTHY stream costs a ~70 s outage, so it is only worth
+                        // paying when the target path is known to work in this
+                        // process. Retrying a path that has never produced a single
+                        // frame just bought an outage and landed back on the same
+                        // rung, once every PATH_UPGRADE_AFTER, forever.
                         path_upgrade_attempted = true;
                         ingest_path = preferred_path;
                         tracing::info!(
@@ -3253,6 +3497,31 @@ pub async fn run_rtsp_session(
                                 break Some("stream stalled — no frames for 10 s".into());
                             }
                         }
+                    }
+
+                    // Periodic pipeline metrics. Until this line existed the only
+                    // way to tell which decode path a camera actually ended up on
+                    // was to correlate startup warnings, and detect/enrich timings
+                    // were measured but never printed at all.
+                    if last_metrics_at.elapsed() >= METRICS_EVERY {
+                        last_metrics_at = tokio::time::Instant::now();
+                        let (detect_ms, enrich_ms, analysed) =
+                            super::stage_metrics::drain_mean(&cam_id)
+                                .map(|(d, e, n)| (d as i64, e as i64, n as i64))
+                                .unwrap_or((-1, -1, 0));
+                        tracing::info!(
+                            camera_id = %cam_id,
+                            path = ingest_path.label(),
+                            online,
+                            fps_actual = avg.unwrap_or(0.0),
+                            frames_total = total,
+                            frames_dropped = dropped,
+                            // -1 = no frame went through analysis in this window.
+                            detect_ms,
+                            enrich_ms,
+                            analysed,
+                            "rtsp: ingest metrics"
+                        );
                     }
 
                     let status = if online {
@@ -3305,7 +3574,7 @@ pub async fn run_rtsp_session(
         // tej samej wadliwej gałęzi). Detekcja dalej działa (CPU resize).
         // Gdy klatki już poszły (`online`), to awaria sieciowa — zostawiamy
         // GPU-resize włączone.
-        if gpu_resize && !online {
+        if gpu_resize && !online && !is_transport_failure(&reason) {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
@@ -3317,17 +3586,25 @@ pub async fn run_rtsp_session(
             continue 'outer;
         }
 
-        // Fallback GPU (GPU-resident lub NVDEC) → niższa ścieżka. Pipeline
-        // sprzętowy padł na busie, ZANIM wszedł Online (brak ani jednej klatki)
-        // — typowy objaw nieudanej negocjacji łańcucha CUDA/NVDEC albo kodeka
-        // bez NVDEC (np. MJPEG, gdy gałąź NVDEC się nie wpięła). Schodzimy o
-        // jeden szczebel (NvdecNv12 → NvdecCpuConvert → Cpu) bez backoffu i bez
-        // liczenia do limitu prób. Gdy ścieżka sprzętowa zdążyła dać klatki
-        // (`online`), traktujemy awarię jako sieciową i zostajemy.
+        // Fallback GPU (GPU-resident lub NVDEC) → niższa ścieżka. Schodzimy TYLKO
+        // gdy mamy DOWÓD, że łańcuch sprzętowy nie działa: błąd na busie (nieudana
+        // negocjacja caps) albo nieudana budowa gałęzi (`branch_build_failed`).
+        //
+        // Samo wygaśnięcie okna warmupu dowodem NIE jest — kamera wracająca po
+        // stresie sesji RTSP wygląda identycznie. Traktowanie timeoutu jak awarii
+        // negocjacji zrzucało zdrową ścieżkę NVDEC na dekod programowy przy
+        // PIERWSZYM wolnym starcie i już nigdy nie wracała: stąd 0 udanych prób
+        // NVDEC przy 41 podejściach mimo w pełni sprawnego dekodera. Po timeoucie
+        // wracamy tą SAMĄ ścieżką (z backoffem), a nie o szczebel niżej.
+        // A failed branch BUILD is conclusive on its own — no need to also rule out
+        // a transport fault, the branch was never going to carry frames.
+        let hw_chain_broken =
+            branch_build_failed || !is_transport_failure(&reason);
         if matches!(
             ingest_path,
             IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert
         ) && !online
+            && hw_chain_broken
         {
             let next = degrade_ingest_path(ingest_path);
             tracing::warn!(
@@ -3351,7 +3628,7 @@ pub async fn run_rtsp_session(
         // do limitu prób), żeby kamera zadziałała zamiast wpaść w pętlę
         // reconnectów. Jeśli HW zdążyło dać klatki (`online`), traktujemy
         // awarię jako sieciową i zostajemy na HW.
-        if use_hw_decode && !online {
+        if use_hw_decode && !online && !is_transport_failure(&reason) {
             tracing::warn!(
                 camera_id = %cam_id,
                 reason = %reason,
@@ -3569,6 +3846,26 @@ pub fn spawn_rtsp_session(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Odroczenie wpięcia gałęzi B stoi na ROZPOZNANIU treści odmowy, więc ten
+    /// test wiąże klasyfikator z komunikatem, który realnie produkuje ścieżka
+    /// attach. Zmiana tego napisu bez zmiany klasyfikatora cicho przywróciłaby
+    /// stary błąd: podgląd nieosiągalny przez cały warmup kamery.
+    #[test]
+    fn caps_refusal_is_transient_permanent_ones_are_not() {
+        assert!(attach_refusal_is_transient("tee caps not yet negotiated"));
+        for permanent in [
+            "tee has no sink pad",
+            "unsupported codec: H265",
+            "mux build failed: element factory mp4mux missing",
+            "",
+        ] {
+            assert!(
+                !attach_refusal_is_transient(permanent),
+                "{permanent:?} musi kończyć subskrypcję, nie czekać na caps"
+            );
+        }
+    }
 
     #[test]
     fn test_validate_rtsp_url_accepts_rtsp() {
@@ -3821,6 +4118,55 @@ mod tests {
         assert!(IngestPath::GpuResidentNvidia.label().contains("GPU"));
         assert!(IngestPath::NvdecNv12.label().contains("NV12"));
         assert!(IngestPath::NvdecCpuConvert.label().contains("NVDEC"));
+    }
+
+    #[test]
+    fn path_index_is_unique_per_variant() {
+        // `PATH_EVER_DELIVERED` is indexed by `index()`; a collision would let one
+        // path's success unlock a different, unproven path as an upgrade target.
+        let idx = [
+            IngestPath::GpuResidentNvidia.index(),
+            IngestPath::NvdecNv12.index(),
+            IngestPath::NvdecCpuConvert.index(),
+            IngestPath::Cpu.index(),
+        ];
+        let mut deduped = idx.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        assert_eq!(deduped.len(), idx.len(), "indeksy muszą być unikalne");
+        assert!(
+            idx.iter().all(|i| *i < PATH_EVER_DELIVERED.len()),
+            "indeks poza tablicą"
+        );
+    }
+
+    #[test]
+    fn path_upgrade_requires_a_proven_path() {
+        // The whole point of the gate: a path nobody has ever gotten a frame out of
+        // is not worth a ~70 s outage. Uses GpuResidentNvidia because the runtime
+        // here lacks `cudaconvert`, so nothing else in the process marks it.
+        let untested = IngestPath::GpuResidentNvidia;
+        assert!(
+            !untested.ever_delivered(),
+            "ścieżka bez ani jednej klatki nie może być celem upgrade'u"
+        );
+        untested.mark_delivered();
+        assert!(
+            untested.ever_delivered(),
+            "po pierwszej klatce ścieżka staje się celem upgrade'u"
+        );
+    }
+
+    #[test]
+    fn warmup_timeout_is_not_a_transport_failure() {
+        // The warmup timeout must be distinguishable from both a transport fault
+        // and a negotiation fault: it is now gated by its own flag precisely
+        // because `is_transport_failure` does NOT match it, which is what made the
+        // degrade ladder treat a slow camera as a broken NVDEC chain.
+        assert!(!is_transport_failure("no frames within warmup window"));
+        assert!(is_transport_failure(
+            "gstrtspsrc.c(7003): could not connect"
+        ));
     }
 
     #[test]

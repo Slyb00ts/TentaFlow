@@ -93,9 +93,12 @@ impl GrammarMatcher {
         if bytes.is_empty() {
             return;
         }
-        if let Some((stacks, partial)) =
-            feed_bytes(&self.program.grammar, self.stacks.clone(), self.partial.clone(), bytes)
-        {
+        if let Some((stacks, partial)) = feed_bytes(
+            &self.program.grammar,
+            self.stacks.clone(),
+            self.partial.clone(),
+            bytes,
+        ) {
             self.stacks = stacks;
             self.partial = partial;
         }
@@ -150,9 +153,13 @@ impl GrammarMatcher {
             if !first_ok[first as usize] {
                 continue;
             }
-            *slot =
-                feed_bytes(&self.program.grammar, self.stacks.clone(), self.partial.clone(), bytes)
-                    .is_some();
+            *slot = feed_bytes(
+                &self.program.grammar,
+                self.stacks.clone(),
+                self.partial.clone(),
+                bytes,
+            )
+            .is_some();
         }
         mask
     }

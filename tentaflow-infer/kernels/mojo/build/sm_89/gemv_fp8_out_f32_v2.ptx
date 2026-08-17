@@ -53,18 +53,10 @@
 $L__BB0_3:
 	add.s64 	%rd23, %rd5, %rd26;
 	ld.global.v4.b16 	{%rs1, %rs2, %rs3, %rs4}, [%rd23];
-	// begin inline asm
 	cvt.rn.f16x2.e4m3x2 %r4, %rs1;
-	// end inline asm
-	// begin inline asm
 	cvt.rn.f16x2.e4m3x2 %r5, %rs2;
-	// end inline asm
-	// begin inline asm
 	cvt.rn.f16x2.e4m3x2 %r6, %rs3;
-	// end inline asm
-	// begin inline asm
 	cvt.rn.f16x2.e4m3x2 %r7, %rs4;
-	// end inline asm
 	mov.b32 	{%rs5, %rs6}, %r4;
 	cvt.f32.f16 	%r8, %rs6;
 	mov.b32 	{%rs7, %rs8}, %r5;

@@ -130,31 +130,48 @@ fn mp_node_rank(spec: &DistributedDeploySpec) -> Result<u32, String> {
 }
 
 /// Stale argumenty `vllm serve` dla silnika w trybie vllm-mp. `vllm-dspark` =
-/// zweryfikowany profil DeepSeek V4 Flash DSpark (garble-fix 2026-07-03:
-/// probabilistyczny draft, 3 tokeny spekulacyjne, capture-size == max-num-seqs).
+/// zweryfikowany profil DeepSeek V4 Flash DSpark.
+///
+/// `num_speculative_tokens` MUSI rownac sie `dspark_block_size` z config.json
+/// checkpointu, wiec przychodzi z PRESETU, nie z tej funkcji: preview ma 5, a
+/// 0731 deklaruje 7. Blok krotszy niz zadeklarowany daje BLEDNE wyjscie, wiec
+/// wczesniejsze zaszyte 3 leczylo objaw garblingu jego wlasna przyczyna —
+/// wlasciwym lekarstwem jest probabilistyczny draft przy PELNYM bloku.
 /// `--max-num-seqs`/`--max-cudagraph-capture-size` mozna nadpisac przez
 /// `vllm_args` (argparse: ostatnie wystapienie wygrywa).
-fn vllm_mp_engine_args(engine_id: &str) -> Vec<String> {
-    if engine_id != "vllm-dspark" {
+fn vllm_mp_engine_args(engine_id: &str, spec_num_tokens: Option<u32>) -> Vec<String> {
+    // `vllm-dspark` (prebuilt fork) i `vllm-dspark-src` (vLLM 0.26 ze zrodel)
+    // serwuja ten sam checkpoint tym samym dialektem — profil jest wspolny.
+    if !matches!(engine_id, "vllm-dspark" | "vllm-dspark-src") {
         return Vec::new();
     }
+    let k = spec_num_tokens.unwrap_or(5).max(1);
+    let speculative_config = format!(
+        r#"{{"method":"dspark","num_speculative_tokens":{k},"draft_sample_method":"probabilistic"}}"#
+    );
     [
         "--trust-remote-code",
         "--kv-cache-dtype",
         "nvfp4_ds_mla",
         "--block-size",
         "256",
+        // Przy 12 pula KV wychodzila -25 GiB ("No available memory for the cache
+        // blocks") — capture CUDA-graph rosnie z glebokoscia draftu, a na Sparku
+        // idzie z tej samej pamieci unified co wagi.
         "--max-num-seqs",
-        "12",
+        "6",
         "--max-num-batched-tokens",
         "8192",
+        // Capture MUSI byc wielokrotnoscia `num_speculative_tokens + 1` (= 6 przy
+        // k=5), inaczej po zaokragleniu nie zostaje zaden prawidlowy rozmiar.
+        // 36 = max_num_seqs * (k+1); sama szostka jest za mala.
         "--max-cudagraph-capture-size",
-        "12",
+        "36",
         "--enable-prefix-caching",
         "--async-scheduling",
         "--enable-chunked-prefill",
         "--speculative-config",
-        r#"{"method":"dspark","num_speculative_tokens":3,"draft_sample_method":"probabilistic"}"#,
+        speculative_config.as_str(),
         "--tokenizer-mode",
         "deepseek_v4",
         "--tool-call-parser",
@@ -214,9 +231,15 @@ fn build_mp_serve_command(
     if headless {
         serve.push_str(" --headless");
     }
-    for tok in vllm_mp_engine_args(&spec.engine_id) {
+    for tok in vllm_mp_engine_args(&spec.engine_id, spec.speculative_num_tokens) {
         serve.push(' ');
         serve.push_str(&sh_quote(&tok));
+    }
+    // Sampling presetu PRZED `vllm_args` usera, zeby jawne ustawienie w formularzu
+    // nadal wygrywalo (argparse: ostatnie wystapienie).
+    if let Some(gen_cfg) = spec.generation_config_json.as_deref() {
+        serve.push_str(" --override-generation-config ");
+        serve.push_str(&sh_quote(gen_cfg));
     }
     for tok in user_vllm_arg_tokens(spec)? {
         serve.push(' ');
@@ -1342,6 +1365,8 @@ mod tests {
             rdma_devices: "roceP2p1s0f0,rocep1s0f0".into(),
             socket_ifname: "enP2p1s0f0np0".into(),
             gid_index: 3,
+            speculative_num_tokens: None,
+            generation_config_json: None,
             config_json: String::new(),
         }
     }

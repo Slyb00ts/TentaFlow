@@ -96,7 +96,7 @@ impl LocalCameraCvHandler {
 /// Dispatch do `vision::onnx_cv`: pobiera wiersz rejestru po nazwie modelu
 /// (nazwy są globalnie unikalne — PK tabeli) i wykonuje operację zgodną z
 /// zarejestrowanym kontraktem.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn onnx_cv_local(model_name: &str, op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
     let pool =
         crate::db::global_pool().ok_or_else(|| "onnx-cv: baza danych niedostępna".to_string())?;
@@ -108,9 +108,9 @@ async fn onnx_cv_local(model_name: &str, op: CameraCvOpLocal) -> Result<CameraCv
     crate::vision::onnx_cv::execute(row, op).await
 }
 
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 async fn onnx_cv_local(_model_name: &str, _op: CameraCvOpLocal) -> Result<CameraCvResult, String> {
-    Err("onnx-cv wymaga feature 'inference-supertonic' (ONNX Runtime)".into())
+    Err("onnx-cv wymaga feature 'vision-ort' (ONNX Runtime)".into())
 }
 
 /// Detekcja RF-DETR na batchu klatek (ort) — pulowany singleton
@@ -118,7 +118,7 @@ async fn onnx_cv_local(_model_name: &str, _op: CameraCvOpLocal) -> Result<Camera
 /// zwykły `spawn_blocking` z puli sesji ort (round-robin), a NIE przez
 /// jednowątkowy egzekutor Burn/wgpu ani globalny lock — wiele batchowanych
 /// forwardów detektora może biec równolegle na GPU.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 async fn detect_local(
     frames: Vec<CvFrameLocal>,
     threshold: Option<f32>,
@@ -160,7 +160,7 @@ async fn detect_local(
 /// forwardy wgpu = korupcja stanu).
 #[cfg(all(
     feature = "inference-vision-gpu",
-    not(feature = "inference-supertonic")
+    not(feature = "vision-ort")
 ))]
 async fn detect_local(
     frames: Vec<CvFrameLocal>,
@@ -203,7 +203,7 @@ async fn detect_local(
 /// zwykły `spawn_blocking` z puli ort, a NIE przez jednowątkowy egzekutor
 /// Burn/wgpu — cold-path nie serializuje się na tym wątku ani nie konkuruje z
 /// detektorem.
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
     let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
         .await
@@ -223,7 +223,7 @@ async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
 /// pamięć przy równoległych forwardach).
 #[cfg(all(
     feature = "inference-vision-gpu",
-    not(feature = "inference-supertonic")
+    not(feature = "vision-ort")
 ))]
 async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
     let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
@@ -244,7 +244,7 @@ async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
 /// (`&self`), forward przez `spawn_blocking` z puli ort (poza wątkiem Burn/wgpu).
 /// Tryb `Adr` idzie przez ogólny OCR PP-OCRv5 (`read_lines` → `adr::snap_adr_from_lines`);
 /// `Plate`/`Generic` przez model tablic (`read`).
-#[cfg(all(feature = "inference-vision-gpu", feature = "inference-supertonic"))]
+#[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult, String> {
     if matches!(mode, CvOcrMode::Adr) {
         return ocr_adr_local(crop).await;
@@ -266,7 +266,7 @@ async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult
 /// wyżej idzie przez ogólny PP-OCRv5, poza wątkiem Burn.
 #[cfg(all(
     feature = "inference-vision-gpu",
-    not(feature = "inference-supertonic")
+    not(feature = "vision-ort")
 ))]
 async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult, String> {
     if matches!(mode, CvOcrMode::Adr) {

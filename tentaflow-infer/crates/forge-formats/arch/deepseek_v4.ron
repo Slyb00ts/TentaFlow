@@ -1,0 +1,75 @@
+// ===== File: deepseek_v4.ron — DeepSeek V4 Flash tensor-role map =====
+//
+// Model wyłącznie safetensors (brak wariantu GGUF), więc role nie mają nazw
+// GGUF. Nazwy HF nie mają prefiksu `model.` — korzeń to `layers.N.`, `embed`,
+// `norm`, `head`.
+//
+// Struktura odbiega od wszystkiego, co FORGE obsługiwał do tej pory:
+//
+//   * uwaga latentna z projekcjami LoRA — Q przez wq_a -> q_norm -> wq_b,
+//     wyjście przez grupowane wo_a -> wo_b; KV to POJEDYNCZA głowica (wkv),
+//   * strumień KV ma obok okna przesuwnego drugi, skompresowany strumień
+//     budowany przez `compressor` (uczony pooling bramkowany); warstwy 0, 1 i
+//     ostatnia mają `compress_ratios` = 0 i kompresora nie mają,
+//   * warstwy o stopniu kompresji 4 mają dodatkowo `indexer` — własny kompresor
+//     z rotacją Hadamarda, który wybiera top-k pozycji do rzadkiej uwagi,
+//   * eksperci są zapisani POJEDYNCZO (`ffn.experts.{expert}.w1`), nie jako
+//     jeden sklejony tensor; w1/w3 to bramka i wejście SwiGLU, w2 to wyjście,
+//   * `hc_*` to modulacja warunkowana haszem, wpinana przy uwadze, FFN i głowie.
+//
+// Role opcjonalne to te, których część warstw nie ma: kompresor, indekser oraz
+// bias i tablica routingu.
+(
+    name: "deepseek_v4",
+    gguf_arch: "",
+    hf_architectures: ["DeepseekV4ForCausalLM"],
+    hf_model_types: ["deepseek_v4"],
+    roles: [
+        (role: TokenEmbd, hf: "embed.weight", per_layer: false, required: true),
+        (role: OutputNorm, hf: "norm.weight", per_layer: false, required: true),
+        (role: LmHead, hf: "head.weight", per_layer: false, required: true),
+        (role: HcHeadBase, hf: "hc_head_base", per_layer: false, required: true),
+        (role: HcHeadFn, hf: "hc_head_fn", per_layer: false, required: true),
+        (role: HcHeadScale, hf: "hc_head_scale", per_layer: false, required: true),
+
+        (role: AttnNorm, hf: "layers.{layer}.attn_norm.weight", per_layer: true, required: true),
+        (role: AttnQA, hf: "layers.{layer}.attn.wq_a.weight", per_layer: true, required: true),
+        (role: AttnQNorm, hf: "layers.{layer}.attn.q_norm.weight", per_layer: true, required: true),
+        (role: AttnQB, hf: "layers.{layer}.attn.wq_b.weight", per_layer: true, required: true),
+        (role: AttnKV, hf: "layers.{layer}.attn.wkv.weight", per_layer: true, required: true),
+        (role: AttnKvNorm, hf: "layers.{layer}.attn.kv_norm.weight", per_layer: true, required: true),
+        (role: AttnOA, hf: "layers.{layer}.attn.wo_a.weight", per_layer: true, required: true),
+        (role: AttnOB, hf: "layers.{layer}.attn.wo_b.weight", per_layer: true, required: true),
+        (role: AttnSink, hf: "layers.{layer}.attn.attn_sink", per_layer: true, required: true),
+
+        (role: CompressorApe, hf: "layers.{layer}.attn.compressor.ape", per_layer: true, required: false),
+        (role: CompressorNorm, hf: "layers.{layer}.attn.compressor.norm.weight", per_layer: true, required: false),
+        (role: CompressorWGate, hf: "layers.{layer}.attn.compressor.wgate.weight", per_layer: true, required: false),
+        (role: CompressorWkv, hf: "layers.{layer}.attn.compressor.wkv.weight", per_layer: true, required: false),
+
+        (role: IndexerCompressorApe, hf: "layers.{layer}.attn.indexer.compressor.ape", per_layer: true, required: false),
+        (role: IndexerCompressorNorm, hf: "layers.{layer}.attn.indexer.compressor.norm.weight", per_layer: true, required: false),
+        (role: IndexerCompressorWGate, hf: "layers.{layer}.attn.indexer.compressor.wgate.weight", per_layer: true, required: false),
+        (role: IndexerCompressorWkv, hf: "layers.{layer}.attn.indexer.compressor.wkv.weight", per_layer: true, required: false),
+        (role: IndexerWeightsProj, hf: "layers.{layer}.attn.indexer.weights_proj.weight", per_layer: true, required: false),
+        (role: IndexerWqB, hf: "layers.{layer}.attn.indexer.wq_b.weight", per_layer: true, required: false),
+
+        (role: FfnNorm, hf: "layers.{layer}.ffn_norm.weight", per_layer: true, required: true),
+        (role: FfnGateInp, hf: "layers.{layer}.ffn.gate.weight", per_layer: true, required: true),
+        (role: FfnGateBias, hf: "layers.{layer}.ffn.gate.bias", per_layer: true, required: false),
+        (role: FfnGateTid2Eid, hf: "layers.{layer}.ffn.gate.tid2eid", per_layer: true, required: false),
+        (role: FfnGateExps, hf: "layers.{layer}.ffn.experts.{expert}.w1.weight", per_layer: true, per_expert: true, required: true),
+        (role: FfnUpExps, hf: "layers.{layer}.ffn.experts.{expert}.w3.weight", per_layer: true, per_expert: true, required: true),
+        (role: FfnDownExps, hf: "layers.{layer}.ffn.experts.{expert}.w2.weight", per_layer: true, per_expert: true, required: true),
+        (role: FfnGateShExp, hf: "layers.{layer}.ffn.shared_experts.w1.weight", per_layer: true, required: true),
+        (role: FfnUpShExp, hf: "layers.{layer}.ffn.shared_experts.w3.weight", per_layer: true, required: true),
+        (role: FfnDownShExp, hf: "layers.{layer}.ffn.shared_experts.w2.weight", per_layer: true, required: true),
+
+        (role: HcAttnBase, hf: "layers.{layer}.hc_attn_base", per_layer: true, required: true),
+        (role: HcAttnFn, hf: "layers.{layer}.hc_attn_fn", per_layer: true, required: true),
+        (role: HcAttnScale, hf: "layers.{layer}.hc_attn_scale", per_layer: true, required: true),
+        (role: HcFfnBase, hf: "layers.{layer}.hc_ffn_base", per_layer: true, required: true),
+        (role: HcFfnFn, hf: "layers.{layer}.hc_ffn_fn", per_layer: true, required: true),
+        (role: HcFfnScale, hf: "layers.{layer}.hc_ffn_scale", per_layer: true, required: true),
+    ],
+)

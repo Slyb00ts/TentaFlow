@@ -6,6 +6,11 @@ edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 
+[features]
+# Backend AMD. Bez tego testy tego crate buduja sie z samym CUDA i na
+# maszynie z Radeonem nie widza zadnego urzadzenia.
+hip = ["forge-hal/hip", "forge-kernels/hip"]
+
 [dependencies]
 forge-types = { workspace = true }
 forge-hal = { workspace = true }

@@ -1,6 +1,8 @@
 # CLAUDE.md
 
-Guidance for Claude Code (claude.ai/code) working in this repo.
+Guidance for Claude Code (claude.ai/code) working in this repo. This file holds **invariants,
+traps and rules** — not change history. Measurements, plans and phase reports live in `docs/`
+and `tentaflow-infer/docs/`.
 
 ## Build & Run
 
@@ -22,14 +24,15 @@ rustup target add wasm32-wasip1                               # WASM addons
 
 Run: `./tentaflow/target/release/tentaflow --config <your.toml>` (config is user-provided).
 
-macOS 26+ (Xcode 26) split the Metal compiler into a separate component. Without it,
-`xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns gibberish (wrong
-GPU logits) with no build error. `setup.sh` installs it; `tentaflow/build.rs` fails loudly
-if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale metallib
-(`rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode`). MLXBridge builds via
+**macOS trap.** macOS 26+ (Xcode 26) split the Metal compiler into a separate component.
+Without it `xcodebuild` builds a broken `mlx.metallib` and EVERY MLX model returns gibberish
+(wrong GPU logits) with no build error. `setup.sh` installs it; `tentaflow/build.rs` fails
+loudly if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale
+metallib (`rm -rf tentaflow-desktop/macos/swift/MLXBridge/build-xcode`). MLXBridge builds via
 `xcodebuild -skipMacroValidation` (SwiftPM CLI can't compile Metal shaders).
 
-`tentaflow-core` features — default = `inference-whisper` + `camera`. Key opt-ins:
+`tentaflow-core` features — default = `inference-whisper` + `camera` (GStreamer is mandatory
+for the video pipeline). Key opt-ins:
 
 | Flag | Purpose |
 |------|---------|
@@ -38,9 +41,11 @@ if missing. Fix: `xcodebuild -downloadComponent MetalToolchain` + drop the stale
 | `inference-mlx*` | Apple MLX (macOS/iOS) |
 | `inference-diarization` | speaker diarization (tentaflow-voice) |
 | `gpu-cuda` | CUDA accel for llama.cpp + whisper |
+| `gpu-vulkan` | Vulkan for llama.cpp + portable WGPU vision backend |
+| `gpu-rocm` / `vision-rocm` | HIP/ROCm for llama.cpp + optional Burn vision backend |
+| `vision-cuda` | Burn vision CUDA backend + zero-copy CUDA preprocessing |
+| `vision-ort` | ORT/TensorRT/CUDA for the main vision path; pulled in by `gpu-cuda` |
 | `test-support` | exposes `flow_engine::node_adapter::test_support` (for benches) |
-
-`camera` is a default feature (GStreamer mandatory for the video pipeline).
 
 ## Configuration
 
@@ -67,10 +72,9 @@ WebTransport `/wt/api` + WebSocket `/ws/api` fallback, binary `MessageBody` (CBO
 - `GET /models/manifest/<bundle>` / `GET /models/file/<bundle>/<name>` — vision model-bundle
   sharing between instances. Auth: signed URL OR `Authorization: Bearer <api-key>` with an
   explicit `('model_bundle', <bundle_ref>)` allow scope (default-DENY, general keys only) —
-  works between UNPAIRED instances. API-key manifests return token-less file urls; the client
-  repeats the Bearer header. Pull side: deploy wizard "Custom" tab → config `vision_bundle_url`
-  + `vision_bundle_api_key` (encrypted like `api_key`), fallback settings
-  `vision_bundle_base_url` + `vision_bundle_api_key`.
+  works between UNPAIRED instances.
+- `GET /project-studio/exports/<ref>` — Project Studio archive, signed-URL scope
+  `ProjectStudioExport`.
 
 Security (both tiers): HMAC SHA-256 (constant-time via `subtle`), audit log per outcome,
 per-IP + global rate limit (429 + `Retry-After`), path-traversal containment, security
@@ -86,29 +90,27 @@ payload (Text/Json/Audio/Image/Video/Embedding/Other) + named artifacts. Entry p
 `execute_blocking` (full DAG) and `execute_streaming` (LLM streaming). Node adapters under
 `node_adapters/`: trigger, llm, stt, tts (blocking + streaming, one node), tts_clean,
 sentence_buffer, combine, condition, pii_filter, memory, embeddings, conversation_history,
-output, plus
-dynamic `addon.*` blocks. User-defined flows are validated (R1–R8) on save in
-`dispatch/handlers.rs`. `FlowDispatcher` resolves a flow per `{model}:{service_type}:{modality}`
-or falls back to a synthetic flow (`synthetic.rs`).
+project_knowledge, output, plus dynamic `addon.*` blocks. User-defined flows are validated
+(R1–R8) on save in `dispatch/handlers.rs`. `FlowDispatcher` resolves a flow per
+`{model}:{service_type}:{modality}` or falls back to a synthetic flow (`synthetic.rs`).
+
+Embedded streaming + tools does not work — a streaming LLM node runs WITHOUT tools.
 
 ## Sync (decentralized data)
 
-Target design in `docs/SYNC_LEDGER_PLAN.md`. SQLite = current addon/platform state;
-embedded **Fjall** = Sync Ledger (operation log, outbox/inbox, ACK, cursors, hash-chain,
-snapshots, compaction). The old CRDT mechanism is removed. The only active sync path is
-`sync/ledger` + `sync/runtime`. Wire is binary CBOR over UFP/2 `channel=0x06 SyncLedger`
-(not JSON). Platform tables synced per `sync/core_registry.rs`; runtime tables
+Design: `docs/SYNC_LEDGER_PLAN.md`. SQLite = current addon/platform state; embedded **Fjall**
+= Sync Ledger (operation log, outbox/inbox, ACK, cursors, hash-chain, snapshots, compaction).
+The only active sync path is `sync/ledger` + `sync/runtime`; wire is binary CBOR over UFP/2
+`channel=0x06 SyncLedger`. Platform tables synced per `sync/core_registry.rs`; runtime tables
 (`flow_executions`, `audit_log`) are not. External secrets sync only via the allowlist
-(`hf_token`, `ngc_api_key`), re-encrypted per node. Permission Engine + Sync Policy gate
-which nodes receive which resources. Startup runs `ensure_default_core_sync_policies` +
-`ensure_trusted_nodes_in_sync_identity`: global core resources get a default
-`replicated_by_permission` policy and active `trusted_nodes` are materialized into
-`sync_nodes`, so Flow Builder, shared settings, identity and RBAC reach the outbox without
-hand-seeding policies.
+(`hf_token`, `ngc_api_key`), re-encrypted per node. Permission Engine + Sync Policy gate which
+nodes receive which resources. Startup runs `ensure_default_core_sync_policies` +
+`ensure_trusted_nodes_in_sync_identity` so Flow Builder, shared settings, identity and RBAC
+reach the outbox without hand-seeding policies.
 
 ## Mesh
 
-First-contact pairing over iroh ALPN `tentaflow-pairing/v2` (len-prefixed CBOR); handler
+First-contact pairing over iroh ALPN `tentaflow-pairing/v2` (len-prefixed CBOR); the handler
 verifies `sender_node_id == iroh remote_id` and the Ed25519 key. Trust state lives in
 `peer_persisted` / `peer_hints`. HMAC issuer keys mirror to trust-paired peers
 (`MESH_MSG_HMAC_KEYS_SYNC`), in-memory only (revoke leaves no stale verifier). Cross-node
@@ -116,339 +118,454 @@ frame pickup proxies frame bytes over the mesh stream.
 
 ## Addons
 
-`tentaflow-core/build.rs` embeds bundled addons from `tentaflow-core/addons/`
-(addon.wasm + manifest.toml + `migrations/*.sql`). `bundle_hash` includes migrations, so a
-schema change forces reconciliation. Host fn `http.request` is **fail-closed**: it needs an
-admin-approved `[[network_rule]]` (addon Network tab) — manifest declarations are NOT
-auto-approved, even with `required=true`.
+`tentaflow-core/build.rs` embeds bundled addons from `tentaflow-core/addons/` (addon.wasm +
+manifest.toml + `migrations/*.sql`). `bundle_hash` includes migrations, so a schema change
+forces reconciliation (a rebuilt bundled addon stays down until the new hash is approved).
 
-Notable bundled addons: `eureka` (MF Eureka index → own SQLite), `company-lookup` (VAT
-registry lookup, stateless), `contacts` (CRM source-of-truth: companies/persons/relations;
-Flow blocks + app panels), `memory`, `embeddings-chunker`, `notes` (Rust, UI catalog v1:
-per user/group/org notes with ACL-guarded auto-graph — SQLite source of truth +
-`graph_outbox` → Cozo `notes_kg` + zvec namespaces, hybrid RRF search with streamed LLM
-answer, share modal on `directory.read` host fns, STT dictation, flow blocks + LLM tools).
-The legacy built-in notes screen/protocol was removed (protocol `SCHEMA_VERSION` 21 —
-old/new binaries reject each other on handshake; rebuild all mesh nodes together).
+Host fn `http.request` is **fail-closed**: it needs an admin-approved `[[network_rule]]`
+(addon Network tab) — manifest declarations are NOT auto-approved, even with `required=true`.
+`[[network_rule]].host` supports exact hosts, `*.domain` wildcards and `*`. Wildcards keep the
+declared port and stay behind the host SSRF guard (public destinations only); exact-host rules
+may target ANY address including private/LAN/loopback — that is the intended way to reach a
+LAN service. Exact beats wildcard. `http.request` never follows redirects (the addon receives
+the raw 3xx).
 
-Host fns `directory_users/groups/roles/org_v1` (scope `directory.read`) expose the org
-identity catalog to addons. Rust addons get typed UI catalog v1 bindings via
-`scripts/gen-rust.sh` → `addon-sdk/sdk/src/ui_v1/` (re-exports of `tentaflow-sdk-spec`
-components; same codegen pipeline as C#/Python). `RelationGraph` (0x0703) has a canvas
-renderer (`tf-relation-graph`); audio-capture uploads are bound host-side to the uploader
-(`source=audio_capture` docs deny cross-user `document_get/delete/list`).
+Host fns `directory_users/groups/roles/org_v1` (scope `directory.read`) expose the org identity
+catalog. Rust addons get typed UI catalog v1 bindings via `scripts/gen-rust.sh` →
+`addon-sdk/sdk/src/ui_v1/` (same codegen pipeline as C#/Python).
 
-`[[network_rule]].host` supports exact hosts, `*.domain` subdomain wildcards and `*` for
-public-web addons. Wildcards still require explicit admin approval, keep the declared port,
-and remain behind the host HTTP SSRF guard (public destinations only). Exact-host rules are
-the allowlist: once approved they may target ANY address, including private/LAN/loopback —
-admin explicitly approving `192.168.x.x:port` in the Network tab is the intended way to reach
-local services (e.g. a LAN MCP server). When a destination matches both, exact beats wildcard.
-`http.request` never follows redirects (addon receives the raw 3xx).
+Notable bundled addons: `eureka`, `company-lookup`, `contacts` (CRM source of truth), `memory`,
+`embeddings-chunker`, `notes` (SQLite source of truth + `graph_outbox` → Cozo `notes_kg` + zvec
+namespaces, hybrid RRF search), `deep-research` (thin facade over the web-research service).
+Protocol `SCHEMA_VERSION` 21 — old/new binaries reject each other on handshake; rebuild all
+mesh nodes together.
 
-`tentaflow-core/src/web_research/` is the central public-web research service for addons:
-configurable search providers (`searxng`, `duckduckgo`, `brave`, `tavily`), public URL reading with DNS
-pinning/redirect revalidation/body limits, generic HTML/text extraction and batch
-`read_search_results`. Addons call it through SDK `web_*` wrappers and need `web.research`.
-When a search request omits `provider`, the host function resolves a running local
-`searxng` service from `services.endpoint_url` and marks it as an internal Core provider.
-If no local service exists, Core selects a visible remote `searxng` service from the mesh
-registry and sends a trusted `MeshCommandType::WebResearch` command to that owning node;
-the remote node executes the request against its own local endpoint and returns the serialized
-`WebResearchResponse`. This keeps phones and other mobile nodes from needing direct HTTP
-access to another node's loopback SearXNG port. If no SearXNG exists anywhere, Core falls
-back to the public DuckDuckGo HTML provider. Page URLs returned by search are still read through
-the public URL SSRF guard.
+### Web research
 
-Page reading is not a simple tag-stripper: `reader.rs` fetches only public readable content types
-with redirect revalidation and body limits, then `extract.rs` runs `readability` (default features
-disabled, no independent HTTP client) against the already fetched HTML. If Readability cannot
-produce useful text, Core falls back to local semantic block scoring (`article`/`main`/content
-classes, link-density penalty, boilerplate cleanup). Responses include extraction method,
-character count, word count and `quality_score` so flows/LLMs can rank or reject weak pages.
-Addon calls use Browser Renderer for `mode="auto"` when a local or visible remote
-`browser-renderer` service exists; `mode="browser"` requires it and `mode="static"` keeps the
-pure HTTP/readability path. `read_search_results` now treats `search_limit` as the candidate pool
-and keeps reading until it gets `read_limit` successful pages or runs out of search results.
-Bundled addon `deep-research` is only the LLM tool / Flow Builder facade over that SDK.
+`tentaflow-core/src/web_research/` is the central public-web service for addons (scope
+`web.research`, SDK `web_*` wrappers): search providers (`searxng`, `duckduckgo`, `brave`,
+`tavily`), public URL reading with DNS pinning / redirect revalidation / body limits, and batch
+`read_search_results` (`search_limit` = candidate pool, keep reading until `read_limit` pages
+succeed).
+
+Provider resolution when the request omits `provider`: local running `searxng` service →
+otherwise a visible remote `searxng` in the mesh registry via `MeshCommandType::WebResearch`
+(so mobile nodes need no direct HTTP to another node's loopback) → otherwise public DuckDuckGo
+HTML. Page URLs from search always go through the public-URL SSRF guard.
+
+Reading is not a tag-stripper: `reader.rs` fetches only public readable content types, then
+`extract.rs` runs `readability` (no independent HTTP client), falling back to local semantic
+block scoring. Responses carry extraction method, char/word counts and `quality_score`.
+`mode="auto"` uses Browser Renderer when one is reachable, `mode="browser"` requires it,
+`mode="static"` forces the HTTP/readability path.
 
 ## Service Containers
 
-`tentaflow-containers/tools/_services/searxng.toml` registers SearXNG as an infra service
-for public-web search. It has a Docker deployment based on the official
-`searxng/searxng` image and a native `python-bundle` deployment from the upstream git repo.
-Both variants enable JSON search output for `web_research`; iOS does not run this service
-natively because SearXNG is a Python web application, not an embedded Rust engine.
+`tentaflow-containers/tools/_services/*.toml` register infra services with a Docker and a
+native (`python-bundle`) deployment.
 
-`tentaflow-containers/tools/_services/browser-renderer.toml` registers the Playwright
-Chromium renderer used for JS-heavy page reading. Docker runs from
-`tools/docker/browser-renderer/` on the official Playwright Python image; native deploy uses
-`tools/python/browser-renderer/` as a `python-bundle`. The service exposes `/render`,
-`/contexts`, and `/health`, keeps one persistent headless browser context per `user_id`,
-evicts idle contexts by `BROWSER_RENDERER_CONTEXT_TTL_SECONDS`, and caps active contexts with
-`BROWSER_RENDERER_MAX_CONTEXTS`. Each profile has isolated cookies/localStorage/sessionStorage.
-The renderer validates public URLs before navigation and aborts private/local subresource
-requests inside Playwright routing, so Core can use it without exposing local node networks to
-web pages.
+- `searxng.toml` — public-web search; both variants enable JSON output for `web_research`.
+  Not available natively on iOS (it is a Python web app, not an embedded Rust engine).
+- `browser-renderer.toml` — Playwright Chromium for JS-heavy pages; exposes `/render`,
+  `/contexts`, `/health`, one persistent context per `user_id` (isolated cookies/storage),
+  idle eviction by `BROWSER_RENDERER_CONTEXT_TTL_SECONDS`, cap
+  `BROWSER_RENDERER_MAX_CONTEXTS`. It validates public URLs before navigation and aborts
+  private/local subresource requests inside Playwright routing.
+- `test-runner` — see Project Studio below.
+
+LLM engine versions live in the container manifests: vLLM 0.27.0 on PyTorch 2.13.0 +
+torchvision 0.28.0, SGLang 0.5.17 on PyTorch 2.11.0; ROCm vLLM variants install from the
+official ROCm wheel index. DGX Spark builds vLLM 0.27.0 from source and the DeepSeek DSpark
+variant applies only the local `nvfp4_ds_mla` patch (DSpark support landed upstream). Profile
+`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.27.0 needs
+`vllm-dspark-src`, because the old overlay no longer applies to current sources.
+
+## ML Studio training tracks
+
+`tentaflow-core/src/ml_studio/` drives three vision tracks off ONE COCO dataset, each with its
+own Python training service under `tentaflow-containers/training/`:
+
+| Track | Core driver | Service | Artifact |
+|-------|-------------|---------|----------|
+| detection (17 ADR classes) | `train_recognition.rs` | `rfdetr-training` :8202 | RF-DETR checkpoint |
+| attribute classifier (`stan`) | `train_classifier.rs` | `classifier-training` :8203 | ONNX timm |
+| OCR reader (`kod`) | `train_ocr.rs` | `ocr-training` :8204 | `adr_ocr.onnx` + alphabet |
+
+**The `approved` gate is mandatory for every track.** Only images with `approved: true` enter
+training; unreviewed auto-label predictions (`predicted: true`) must never train the model on
+its own output. Detection filters in `pool_splits` (Core), the other tracks in `_collect_*` of
+the service. A dataset where NO image has an `approved` field never passed our editor (external
+COCO) and is used whole.
+
+OCR trains on plate ROWS: an `ocr` attribute value `<kemler>/<UN>` (e.g. `99/3257`) labels the
+top and bottom row, cut with the same 6% gap as runtime (`SPLIT_MARGIN` in `vision/adr_ocr.rs`).
+Real rows are mixed with synthetics generated from the deployment's `adr-list.json`
+(`synthetic_per_epoch`, `real_repeat`). On success Core immediately calls `/export` — the
+artifact is ONNX + alphabet, not a torch checkpoint, and the service rejects an export that
+diverges numerically from the model. `scripts/train-adr-ocr/` is only an eval harness.
+
+Cancellation: `MlStudioTrainCancelRequest` (one variant for all tracks) → flag in `live_view`
++ service `POST /cancel/{job_id}`, and mesh command `MlTrainCancel` for remote training.
+RF-DETR and LLM cancel by killing the child process (`RFDETR.train()` is one blocking call);
+classifier and OCR cancel cooperatively per batch. A run orphaned by a Core restart is closed
+by `reconcile_orphan_local_run` — the `register_local_run` marker distinguishes "we supervise
+this" from "nobody watches this", with no time heuristics.
 
 ## Admin Scheduler
 
 `tentaflow-core/src/scheduler/`, state in SQLite (`scheduled_jobs`, `scheduled_runs`). Runs
-addon tools via `AddonManager::call_tool`; the dashboard talks to it over the binary
-protocol (`SchedulerBody`), not REST. Modes: `once` (RFC3339), `interval` (`30m`/`1h`/`1d`),
-daily `cron` (`minute hour * * *`). UI in `www/js/modules/scheduler.js` (admin-only).
+addon tools via `AddonManager::call_tool`; the dashboard talks to it over the binary protocol
+(`SchedulerBody`), not REST. Modes: `once` (RFC3339), `interval` (`30m`/`1h`/`1d`), daily
+`cron` (`minute hour * * *`). UI in `www/js/modules/scheduler.js` (admin-only).
 
 ## Dashboard Settings
 
 `Settings → Dostępy zewnętrzne`: external secrets (`hf_token`, `ngc_api_key`, container
 registries) saved via the binary protocol with `is_secret`; listing returns `<redacted>` for
-non-empty secrets. The vLLM recommender uses the stored `hf_token` to fetch `config.json`
-from gated repos without persisting the token in the deployment config.
+non-empty secrets. The vLLM recommender uses the stored `hf_token` to fetch `config.json` from
+gated repos without persisting the token in the deployment config.
+
+## Projekty (Project Studio)
+
+`tentaflow-core/src/project_studio/` — native core module (NOT a WASM addon). Registry
+(projects, members, creator grants, chats, notifications, `project_schedule_hints`) in
+`<data>/projects.db`; per-project content in `<data>/projects/<id>/{project.db, files/<sha256>,
+vectors/}` behind a bounded pool cache (`project_db.rs`: LRU max 16 open pools + idle sweeper,
+migrations on every open, strict `validate_project_id` path guard, `checkpoint_all` at
+shutdown). UI `www/js/modules/project-studio.js`, apps-home tile `projekty` WITHOUT
+`requiresPowerUser`.
+
+**Wire contract.** One `MessageBody::ProjectStudioBody(ProjectStudioPayload)`, currently 248
+variants — strictly append-only (ciborium tags by variant NAME: never rename or reorder; golden
+test `project_studio_wire_golden`). That is close to the 256-variant budget of the frame format,
+so new features belong in a NEW sub-enum. Struct FIELDS are append-only the same way — add with
+`#[serde(default)]` so peers that omit them still decode.
+
+**Permissions.** Migration 119: `project_studio.read` (all roles) + `project_studio.admin`
+(org_admin). Creating a project needs a per-user grant (`project_creator_grants`); in-project
+roles owner/manager/editor/tester/viewer. Non-members get uniform NotFound (no existence leak);
+an archived project is read-only (`require_active`). Chats are private per user — every chat
+query is hard-filtered by `user_id`, with no admin bypass.
+
+**Knowledge.** Native ingest (`ingest.rs` — office/text/code via `services/document/extract`,
+PDF text layer via pdfium; scans/images are `skipped` until the vision pipeline is callable),
+`split_into_chunks`, embeddings through the `rag-embeddings` alias, vectors under scope
+`addon_id="ps-<project_id>"` namespace `passages` created AT the project directory
+(`NamespaceManager::get_or_create_at`). Deliberately does NOT use the flow `store` node. Jobs:
+cancel registry + `log_bus` progress + panic guard + semaphore of 2 concurrent ingests. Upload:
+4 MiB chunks, 64 MiB per file.
+
+**Chat.** System flow `ps-chat` (fixed UUID, `is_system=1`): trigger → project_knowledge →
+conversation_history → llm streaming. Passages are pushed into `context.system_prompts` as
+fenced DATA with `<<<PASSAGE>>>` delimiters (prompt-injection guard); citations persist in
+`conversation_messages.citations_json`. `flows.is_system` (migration 118): system flows are
+non-editable/non-deletable via the protocol, and sync NEVER trusts the wire `is_system` flag
+(coerced to 0) — the local seed is the source of truth.
+
+**Agent generation** (`generation.rs`) does NOT parse a "return JSON" answer — the agent writes
+through a DURABLE SINK, builtin `core.project_case_save`. The target project/generation is not a
+tool parameter but a server-minted binding in `envelope.meta["ps_generation"]`, injected via
+`AgentRunManager::spawn` extra_meta, so the model can never redirect output elsewhere. Each case
+is validated at save; a rejection is a `[TOOL_ERROR]` scoped to THAT case and the model repairs
+it. Terminal watcher via `await_run` (30 min budget) + lazy reconciliation after restart.
+
+**Manual testing.** Cases are versioned (`test_case_versions`, append-only) under optimistic
+locking — ONE conditional `UPDATE … WHERE current_version = expected`, so a stale editor loses
+instead of overwriting. A run SNAPSHOTS the case into `test_run_items`/`test_run_steps`, so a
+later edit never rewrites history; a pool item is claimed by a single atomic
+`UPDATE … RETURNING`.
+
+**Automated testing.** Service `test-runner`
+(`tentaflow-containers/tools/{_services,docker,python}/test-runner`, FastAPI, port 8093,
+pytest/Playwright/Locust/httpx in killable subprocesses). The per-run host allowlist is enforced
+INSIDE PYTHON — `executor/sandbox_net.py` wraps `socket.getaddrinfo` plus connect/sendto before
+untrusted code is imported; the container itself runs `network_mode=bridge`. Core hardens it
+with `SandboxLimits::test_runner` → bollard `HostConfig` (read-only rootfs, two tmpfs,
+4 GiB / 2 CPU / 512 PID, `cap_drop: ALL`, `no-new-privileges`), applied only when
+`engine.id == "test-runner"`. A PER-RUN sandbox is DEFERRED, hence: a unit case carrying
+`build_profile_ref` becomes item 'blocked' (it would silently degrade to pytest in an empty tree
+and report green), and a runner reporting `isolated: false` is refused unless an admin flips
+`project_studio_allow_unisolated_runner`.
+
+**Environments** (`environments.rs`) invert the `web_research` SSRF rule: a PUBLIC target is
+auto-approved, a private/LAN/loopback one queues for an admin. The class is computed over EVERY
+resolved address of EVERY allowlist host (one LAN entry makes the environment private; an
+unresolvable name counts as private) and is RE-CHECKED at submit (`recheck_private`) — DNS may
+move to 127.0.0.1 long after approval. The secret is SettingsCipher-encrypted, decrypted at
+exactly one place (the submission body, never logged) and scrubbed from stored artifacts.
+Sources: git clone via the system binary (a `repo_url` reaching a private address is a HARD
+refusal — code sources have no approval queue), ZIP (`enclosed_name`, symlink refusal,
+entry/byte budgets enforced while writing) and OpenAPI parsed by our own generic `paths` walk
+(NOT `openapiv3`, which rejects a whole document over one non-conformant field).
+
+**Schedules** ('once' RFC3339 / 'interval' / daily cron in an IANA zone via chrono-tz, DST
+resolved explicitly) fire from a 30 s loop that never opens a project speculatively: the
+registry `project_schedule_hints` (`next_run_at` per project, NULL = nothing pending) lets ONE
+query pick due projects, otherwise every tick would thrash the 16-pool LRU. A due schedule is
+claimed BEFORE firing by a conditional `UPDATE … WHERE next_run_at IS <stale value>`, and the
+tick also runs `auto_runs::reconcile_running`. Gate outcomes are not interchangeable: 'blocked'
+(missing/unapproved environment — an admin decision) and 'skipped' (previous run open, archived,
+nothing executable, no runner) never advance the failure breaker; 5 consecutive 'error' outcomes
+set `auto_disabled` (resume is manual only).
+
+**ML Studio link** (`ml_link.rs`): ONE-WAY project→ML permission mirror (5 project roles →
+editor/viewer). It acts as the ML project OWNER and records what IT granted in a project setting
+(`ml_link_granted:<link_id>`), so it never revokes someone else's membership. The Power-User
+wire gate is not waived; the 10 READ handlers in `dispatch/ml_studio.rs` are
+`#[policy(UserSession)]` because each carries its own membership check (every MUTATING ML
+handler stays `PowerUser`).
+
+**Export/import** (`archive.rs`): the db snapshot is `VACUUM INTO` after a TRUNCATE checkpoint
+(a plain file copy would archive a file missing its own `-wal` commits); the snapshot blanks
+both `secret_enc` columns, resets every environment to 'pending' and DISABLES every schedule.
+The manifest carries per-file sha256, verified after extraction; import enforces
+`enclosed_name`, refuses symlinks, whitelists entry prefixes and caps entries/bytes. Vectors are
+moved verbatim ONLY when the `rag-embeddings` alias resolves to the SAME target model and the
+metric/dim/field fingerprint matches — otherwise the import re-indexes from archived blobs.
+
+**UI conventions** pinned by `mockups/projekty-20260723/`: one toolbar row (searchbox + selects,
+primary action right-aligned via `.ps-toolbar-spacer`), a `.ps-table-footer` summary under every
+list, two-line table cells (`tf-table__cell-title` + `tf-table__cell-sub` with the short id), and
+KPI rows built from full `tf-stat-card`s in `.ps-kpi-grid`.
 
 ## Compliance Core
 
-`tentaflow-core/src/compliance/` — shared core layer for GDPR/RODO, AI audit, retention,
-ROPA, DSAR, consents, DPIA, breach register. Migration `compliance_core_foundation` creates
-the canonical tables and seeds per-org defaults; UI-visible text uses `*_translations` fields
-validated by `json_valid` (seed must include at least `pl` + `en`). `compliance_ai_events`
-holds one AI call/session and links to the `audit_log` chain via `audit_log_id` (prompts,
-responses, sources, tool calls stay in dedicated compliance AI tables). `AiGateway` is the
-central entry for blocking + streaming chat and addon `llm_generate`: it starts the event,
-records prompt/response/tool calls and the final `audit_log` entry. AI-audit retention is
-resolved via `compliance_retention_policies` and cannot be shorter than 183 days. Admin
-protocol uses `MessageBody::ComplianceAdminBody` + `tentaflow-protocol/src/compliance.rs`
-(CBOR carries category/retention/AI-event summaries, never prompt/response bodies). Admin
-access needs `compliance.read`; `org_admin` and `dpo` also get `compliance.write`.
+`tentaflow-core/src/compliance/` — shared core layer for GDPR/RODO, AI audit, retention, ROPA,
+DSAR, consents, DPIA, breach register. Migration `compliance_core_foundation` creates the
+canonical tables and seeds per-org defaults; UI-visible text uses `*_translations` fields
+validated by `json_valid` (seed must include at least `pl` + `en`). `compliance_ai_events` holds
+one AI call/session and links to the `audit_log` chain via `audit_log_id` (prompts, responses,
+sources, tool calls stay in dedicated compliance AI tables). `AiGateway` is the central entry
+for blocking + streaming chat and addon `llm_generate`. AI-audit retention resolves via
+`compliance_retention_policies` and cannot be shorter than 183 days. Admin protocol:
+`MessageBody::ComplianceAdminBody` + `tentaflow-protocol/src/compliance.rs` (CBOR carries
+summaries, never prompt/response bodies). Access needs `compliance.read`; `org_admin` and `dpo`
+also get `compliance.write`.
 
-## Native Libraries
+## Native libraries
 
-- `scripts/native-libs/build-all.sh` (Linux/macOS) i `scripts/native-libs/build-all.ps1`
-  (Windows) wykrywają platformę i budują natywne zależności do `native-libs/<platform>/`.
-- Android ma osobny cross-build producer: `scripts/native-libs/build-all-android.sh`.
-  Buduje `zvec`, `llama.cpp` i izolowane `whisper.cpp` przez Android NDK do
-  `native-libs/android-arm64`, `native-libs/android-armv7` i `native-libs/android-x86_64`.
-  Domyślny wariant llama/whisper to `multi` CPU, zgodny z `LLAMA_CPP_NATIVE_VARIANT`
-  i `WHISPER_CPP_NATIVE_VARIANT` w sys-crate'ach. Androidowe buildy GGML mają
-  `GGML_OPENMP=OFF`, żeby nie wymagać dodatkowego runtime `libomp.so`. Skrypt kopiuje też `libc++_shared.so`;
-  `tentaflow-mobile/android/scripts/build-rust.sh` kopiuje `libwhisper_tf.so` i
-  `libc++_shared.so` do `app/src/main/jniLibs/<abi>/`.
-- `tentaflow-mobile/android/scripts/build-rust.sh` jest samowystarczalnym wejściem dla
-  Androida: wykrywa NDK w standardowych lokalizacjach, wybiera ABI z podłączonego
-  telefonu przez `adb` (`ANDROID_ABIS=auto`, domyślnie), pobiera GStreamer Android SDK
-  do `TENTAFLOW_NATIVE_CACHE` gdy go brakuje, i wywołuje `build-all-android.sh` dla
-  brakujących native-libs. `ANDROID_ABIS=all` buduje wszystkie ABI.
-- `tentaflow-mobile/android/gradlew` jest repo-local bootstrapem Gradle: pobiera Gradle
-  8.2.1 i, gdy system ma zbyt nową Javę, Temurin JDK 17 do `TENTAFLOW_NATIVE_CACHE`.
-  `scripts/setup.sh` wywołuje ten bootstrap, więc Android APK nie wymaga ręcznej
-  instalacji systemowego Gradle/JDK.
-- `tentaflow-mobile/core/build.rs` dopina na Androidzie statyczne archiwa GStreamer SDK
-  (`ffi`, `pcre2-8`, `gmodule-2.0`, `iconv`, `intl`), żeby `libtentaflow_mobile.so`
-  nie zostawiał niezwiązanych symboli typu `ffi_type_void` przy `dlopen` na telefonie.
-- Źródła pobierane przez skrypty trafiają poza repo do `TENTAFLOW_NATIVE_CACHE`
-  (domyślnie `${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs` — trwały cache na
-  dysku, NIE `/tmp`: tmpfs w RAM urywa rozpakowanie na małym RAM-ie → CMake „Parse
-  error ... bad character"), więc repo przechowuje **tylko skrypty**.
-  Cała zawartość `native-libs/<platform>/` (nagłówki, biblioteki, `manifest.toml`)
-  jest generowana lokalnie i NIE jest commitowana — `.gitignore` ignoruje `native-libs/*`
-  poza `README.md`. Każdy buduje u siebie: `./scripts/native-libs/build-all.sh`.
-- Układ platformy: `include/`, `lib-static/`, `lib-dynamic/`, `manifest.toml`.
-  Biblioteki statyczne są preferowane, a dynamiczne są kopiowane przez `tentaflow/build.rs`
-  obok budowanej binarki z `native-libs/<platform>/lib-dynamic`.
-- Aktualizacja źródeł: uruchom `build-all.sh --update` albo `build-all.ps1 -Update`.
-- `build-llama-cpp.sh` domyślnie buduje **pinowany commit** `LLAMA_CPP_REF=6b80c74f`
-  (świeży master z 2026-06-06 — Qwen3.6 MTP/NextN wymaga nowego `llama.cpp`), żeby
-  wszyscy mieli identyczną wersję jako prebuilt w `native-libs`. Świeży master:
-  `LLAMA_CPP_REF=origin/master`. Stare vendored źródła: `LLAMA_CPP_REF=vendored`
-  (drzewo `vendor/crates/*/llama.cpp/` NIE jest w repo — patrz `.gitignore`).
-- Biblioteki NIE są w repo (porzucony Git LFS — przekraczał limity i blokował push).
-  Każdy buduje je lokalnie przez `build-all.sh`; pliki zostają na dysku, ale są
-  gitignorowane. Wariant llama.cpp wybiera
-  `LLAMA_CPP_NATIVE_VARIANT` (domyślnie `multi` = cuda+rocm+vulkan+cpu w jednym; linkowanie
-  `multi` wymaga obecności WSZYSTKICH trzech runtime'ów — pod różne GPU buduj warianty
-  jednobackendowe przez `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`).
-- `build-llama-cpp.sh` aplikuje lokalne patche z `scripts/native-libs/patches/llama-cpp/`.
-  Obecny patch usuwa `SIGABRT` w auto-detekcji fused Gated Delta Net dla Qwen3.6/MTP
-  na CUDA: nieznana nazwa tensora wyłącza fused GDN i loguje warning zamiast ubijać proces.
-- `tentaflow-wrappers/` centralizuje własne wrappery dla `llama.cpp`, `whisper.cpp`
-  i kolejnych silników. Ten crate definiuje kontrakt konfiguracji oraz mapowanie
-  artefaktów z `native-libs`, żeby stopniowo odchodzić od high-level bindingów
-  blokujących nowe funkcje upstreamu, m.in. `mtp` i `ngram-simple` w `llama.cpp`.
-- `tentaflow-wrappers/examples/llama_smoke.rs` służy do szybkiego testu GGUF:
-  `--metadata-only` czyta metadane bez ładowania wag i wykrywa MTP po
-  `*.nextn_predict_layers`; bez tej flagi ładuje model PRZEZ SILNIK (`LlamaEngine`,
-  jedyna ścieżka generacji) i sprawdza streaming pojedynczego requestu. MTP bez
-  głowy nextn degraduje do `Off` już z nagłówka GGUF (`mtp_layers==0`).
-- `tentaflow-wrappers/src/llama_engine.rs` to silnik continuous batching nad
-  llama.cpp (jeden model, jeden ctx, wiele slotów sekwencji, anty-hang per-slot).
-  `SpeculativeMode` ma trzy tryby: `Off`, `NgramSimple` (drafter ngram bez modelu
-  draftującego) i `Mtp { n_max }` (self-speculative przez głowę MTP/NextN W TYM
-  SAMYM modelu — zero duplikacji wag). Dla MTP scheduler tworzy drugi kontekst
-  `ctx_dft` na tym samym modelu (`ctx_type=LLAMA_CONTEXT_TYPE_MTP`, `n_rs_seq=0`)
-  i wpina go do shimu `common_speculative`. Pętla MTP: `llama_decode(ctx_tgt)` →
-  `common_speculative_process` (mirror nextn embd target→draft) → sample + verify
-  jak ngram. Kluczowe rollbacki KV ctx_dft: do `base_pos` po `draft()` (kasuje
-  autoregresyjne pre-advancement draftera) oraz do nowej wolnej pozycji po
-  akceptacji (lustrza rollback ctx_tgt) — bez nich M-RoPE ctx_dft odrzuca batch.
-  Oba konteksty i uchwyt speculative żyją wyłącznie w wątku schedulera. Pomiar:
-  MTP daje realne przyspieszenie tylko gdy GPU nie jest wysycone (pojedynczy /
-  rzadki strumień ~1.8x na Qwen3.6-27B Q4_K_S, RTX 4090); przy 4 równoległych
-  sekwencjach narzut draftu przewyższa zysk.
-- `tentaflow-wrappers/examples/llama_engine_smoke.rs` testuje silnik:
-  `--speculative off|ngram|mtp`, realny licznik tokenów (pole
-  `StreamToken.generated_tokens` na tokenie finalnym), per-request tok/s oraz
-  dowód anty-hangu przy `--slow-consumer` (porównanie 1. fali requestów).
-  Scenariusze regresji anty-hang (CR-001): `--drop-mid` (konsument porzuca
-  Receiver w połowie → slot zwolniony, `LlamaEngine::inflight()` wraca do 0),
-  `--silent-consumer` (konsument żywy ale niemy → po `stream_stall_timeout`,
-  w teście 3s, slot zwolniony z Error, inne sloty działają), `--queue-overflow`
-  (12 req na 4 sloty → wszystkie kolejkują i kończą, inflight=0, brak wycieku).
-- `inference/llamacpp.rs` (`LlamaCppEngine`) wpina `LlamaEngine` jako backend
-  `InferenceEngine` w core. Silnik trzymany jest w `RwLock<Option<Arc<LlamaEngine>>>`;
-  `generate`/`generate_stream` biorą KRÓTKI read-lock, klonują `Arc` i zwalniają lock
-  PRZED `submit` — żaden lock nie jest trzymany podczas generacji (anty-hang). Most
-  stream→tokio nie tworzy wątku-per-request: `LlamaEngine::submit_with_sink` przyjmuje
-  `Box<dyn EngineSink>`, a scheduler woła `sink.try_send` wprost ze swojego wątku.
-  Core dostarcza `StreamSink`/`CollectSink` owijające `tokio::mpsc::Sender`
-  (`try_send` → `SinkStatus::{Delivered|Full|Closed}`), więc setki równoległych
-  requestów dzielą jeden wątek-scheduler bez globalnego locka i bez kanału std mpsc
-  per slot. `tentaflow-wrappers` pozostaje BEZ zależności od tokio (sink jest
-  generyczny). Anty-hang per-slot zachowany: `Full` odkłada token do `pending`
-  slotu, terminalny token też idzie przez `pending` (deferred finish — `release_slot`
-  zwalnia slot dopiero po opróżnieniu ogona, zero blokującego `send`). CR-001:
-  `EngineConfig.stream_stall_timeout` (z deploy `stream_stall_timeout_secs`,
-  domyślnie 60s) wymusza deadline POSTĘPU dostarczania — slot z niepustym `pending`,
-  który od progu nie zmniejszył `pending` (konsument „żywy ale niemy", nigdy nie
-  czyta i nie rozłącza się), jest siłą zwalniany z `FinishReason::Error`, więc po
-  wyczerpaniu `queue_capacity` silnik nie odmawia w nieskończoność (cichy hang
-  admission). CR-003: rdzeniowy `StreamToken` niesie `finish_reason: Option<StopReason>`
-  + `error: Option<String>` na finale; `StreamSink` przekłada `FinishReason::Error`
-  silnika na `error` (+`warn!`), a `stream_tokens_to_chunks` mapuje realny
-  finish_reason (`length`/`stop`/`error`) zamiast twardego "stop". CR-004:
-  `generate` liczy `tokens_per_second` od pierwszego tokena (TTFT) i raportuje
-  realne `prompt_tokens` (pole `StreamToken.prompt_tokens` z silnika, nie 0).
-  Deploy params → `EngineConfig`: `n_seq_max` z `n_parallel`/`max_concurrency`
-  (domyślnie 8), `ctx_per_seq`=ctx_size, `n_batch`=batch_size, reszta z load-configu;
-  speculative z `speculative_method`/`num_speculative_tokens`/`size_ngram`/`size_mgram`
-  → `SpeculativeMode` (silnik sam ustawia `n_rs_seq` i odrzuca MTP bez głowy nextn).
-- Embeddingi: silnik jest generation-only, więc `LlamaCppEngine::embeddings` używa
-  ODRĘBNEJ, leniwie tworzonej ścieżki `LlamaRuntime` (kontekst `embeddings=true`)
-  obok silnika generacji — zero regresji. Pełna unifikacja (embeddingi w silniku)
-  jest świadomie odłożona. `LlamaRuntime` jest TYLKO ścieżką embeddingów: w Fazie 4
-  usunięto z niego martwą generację (`generate`/`generate_streaming`/`generate_inner`
-  + ręczny speculative `draft_tokens`/`verify_draft`/`rollback_memory`/
-  `ngram_simple_draft` oraz martwe typy `LlamaGenerateConfig`/`LlamaGenerateOutput`/
-  `LlamaStopReason`). Zostają `load`/`metadata`/`embeddings`/`tokenize`/`context`
-  oraz współdzielone z silnikiem `build_sampler_chain`/`is_eog_with_model`/
-  `token_to_piece_with_model`/`check_stop_sequence`. `SpeculativeConfig` zostaje
-  (parsuje deploy params w `inference/llamacpp.rs`). Integracyjny test core
-  `tentaflow-core/tests/llamacpp_engine_e2e.rs` (`#[ignore]`, env
-  `TENTAFLOW_LLAMA_TEST_MODEL`) ładuje GGUF i sprawdza generate/stream + unload.
-- `tentaflow-wrappers/examples/whisper_smoke.rs` ładuje model whisper.cpp przez
-  nasz wrapper i wykonuje krótką transkrypcję ciszy, żeby sprawdzić runtime bez
-  uruchamiania całego API.
-- `inference-whisper` jest ZAWSZE wbudowany na nie-Apple (Linux/Windows w
-  `tentaflow/Cargo.toml`, Android w `tentaflow-mobile/core/Cargo.toml`) — engine
-  STT `whisper` musi byc dostepny w runtime na tych platformach, to nie jest
-  feature opt-in. Apple (macOS/iOS) NIE linkuje whisper.cpp — STT idzie przez
-  MLX-whisper / natywny Swift. Wpiete per-target przez osobny blok
-  `[target.'cfg(...)'.dependencies]`, zeby Apple bylo z niego wykluczone.
-- Whisper.cpp i llama.cpp ZAWSZE wspolistnieja w binarce (kazdy `gpu-*` feature
-  pociaga `inference-llamacpp`), a oba projekty wnosza WLASNY, ROZNYCH WERSJI
-  ggml (llama master vs whisper `v1.8.3`) z identycznymi nazwami symboli `ggml_*`.
-  Zeby to nie konczylo sie `SIGABRT` (mieszanie dwoch implementacji ggml), whisper
-  jest linkowany jako IZOLOWANY dylib: `build-whisper-cpp.sh` linkuje whisper +
-  jego ggml w jeden `libwhisper_tf.so` z version-scriptem `{ global: whisper_*;
-  local: *; }` (ggml_* UKRYTE), `whisper-rs-sys/build.rs` linkuje ten dylib
-  dynamicznie (a NIE statyczne ggml), a `tentaflow/build.rs` kopiuje go plasko
-  obok binarki (`$ORIGIN`). Dzieki temu llama.cpp zostaje statycznie ze swoim
-  ggml i nie ma kolizji — bez dawnego hacka `--allow-multiple-definition`.
-  Izolacja jest zaimplementowana dla Linux i macOS w `build-whisper-cpp.sh`;
-  na Windows izolowany DLL (eksport whisper_* przez `.def`) buduje `build-all.ps1`.
-- **INWARIANT izolacji symboli (OBOWIĄZKOWY dla każdej vendorowanej biblioteki natywnej).**
-  Każda samowystarczalna biblioteka natywna (whisper, zvec, …) MUSI eksportować WYŁĄCZNIE
-  własne publiczne API (`whisper_*`, `zvec_*`) i CHOWAĆ całą zbundlowaną resztę
-  (protobuf, abseil, RocksDB, Arrow, ggml). Inaczej dwie kopie tej samej biblioteki C++
-  (np. protobuf w zvec ORAZ w warstwie ONNX binarki) interpozycjonują się przez dynamiczny
-  linker na Linuxie i psują stertę przy static-init (`corrupted size vs prev_size`, crash
-  przed `main`; macOS chroni two-level namespace, ale i tak izolujemy). Mechanizm:
-  Linux `-Wl,--version-script` z `{ global: <name>_*; local: *; }`; macOS
-  `-Wl,-exported_symbols_list` z `_<name>_*`; Windows `.def`. zvec: `scripts/build-zvec.sh`.
-  PUŁAPKA: deploy uruchamia binarkę z `LD_LIBRARY_PATH=target/<profile>`, który ma
-  pierwszeństwo nad rpath do vendora — `tentaflow/build.rs` MUSI kopiować świeży vendored
-  `.so/.dylib` do `target/<profile>` (pełna kopia, nie hardlink), inaczej stara kopia
-  shadow'uje nowy vendored. Weryfikacja: `nm -D --defined-only <so> | grep -ic protobuf` = 0.
-- Deploy `llama.cpp` z HuggingFace GGUF musi wskazywać pojedynczy plik `.gguf`
-  (`config_json.model_file`) albo preset z `quantization`; downloader nie powinien
-  pobierać wszystkich kwantyzacji z repozytorium.
+Build: `scripts/native-libs/build-all.sh` (Linux/macOS), `build-all.ps1` (Windows),
+`build-all-android.sh` (NDK cross-build → `native-libs/android-{arm64,armv7,x86_64}`). Update
+sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`, `lib-dynamic/`,
+`manifest.toml`; static is preferred, dynamic libs are copied next to the binary by
+`tentaflow/build.rs`.
+
+- **Nothing under `native-libs/<platform>/` is committed** (Git LFS was abandoned — it exceeded
+  limits and blocked push). Everyone builds locally; `.gitignore` keeps only `README.md`.
+- Downloaded sources go OUTSIDE the repo to `TENTAFLOW_NATIVE_CACHE` (default
+  `${XDG_CACHE_HOME:-$HOME/.cache}/tentaflow-native-libs`) — **not `/tmp`**: a RAM tmpfs
+  truncates extraction on small-RAM machines → CMake "Parse error … bad character".
+- llama.cpp: pinned `LLAMA_CPP_REF=6b80c74f` so everyone shares one prebuilt (`origin/master`
+  for fresh, `vendored` for the old tree). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
+  `multi` = cuda+rocm+vulkan+cpu, which requires ALL three runtimes present at link time — use
+  `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm` for single-backend builds). Local patches come from
+  `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
+  auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
+- Whisper autodetection on Linux/Windows covers CUDA, ROCm and Vulkan. AMD chips can be pinned,
+  e.g. `CMAKE_HIP_ARCHITECTURES=gfx1201` before
+  `LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh`.
+- CUDA NV12/RGB preprocessing for the zero-copy ORT path is opt-in via `gpu-cuda` or
+  `vision-cuda`; a plain AMD/Intel build never invokes `nvcc` and preprocesses on the host. The
+  portable WGPU/Vulkan backend is Burn's default for the main vision pipeline
+  (`inference-supertonic` no longer forces ORT for vision), while `gpu-cuda` keeps the
+  ORT/TensorRT/CUDA path on NVIDIA.
+- Android specifics: GGML builds use `GGML_OPENMP=OFF` (no `libomp.so` runtime);
+  `build-rust.sh` detects the NDK, picks ABIs from the attached phone via `adb`
+  (`ANDROID_ABIS=auto`, `all` for everything), fetches the GStreamer Android SDK, and copies
+  `libwhisper_tf.so` + `libc++_shared.so` into `app/src/main/jniLibs/<abi>/`.
+  `tentaflow-mobile/android/gradlew` bootstraps Gradle 8.2.1 (+ Temurin JDK 17 when the system
+  Java is too new). `tentaflow-mobile/core/build.rs` links the static GStreamer archives
+  (`ffi`, `pcre2-8`, `gmodule-2.0`, `iconv`, `intl`) so `libtentaflow_mobile.so` has no
+  unresolved `ffi_type_void` at `dlopen`.
+
+### INVARIANT: symbol isolation (MANDATORY for every vendored native library)
+
+Every self-contained native library (whisper, zvec, …) MUST export ONLY its own public API
+(`whisper_*`, `zvec_*`) and HIDE everything bundled (protobuf, abseil, RocksDB, Arrow, ggml).
+Otherwise two copies of the same C++ library (e.g. protobuf in zvec AND in the binary's ONNX
+layer) interpose through the Linux dynamic linker and corrupt the heap during static init
+(`corrupted size vs prev_size`, crash before `main`; macOS's two-level namespace protects it,
+but we isolate anyway).
+
+Mechanism: Linux `-Wl,--version-script` with `{ global: <name>_*; local: *; }`; macOS
+`-Wl,-exported_symbols_list` with `_<name>_*`; Windows `.def`. See `scripts/build-zvec.sh` and
+`build-whisper-cpp.sh`.
+
+TRAP: deploy runs the binary with `LD_LIBRARY_PATH=target/<profile>`, which outranks the rpath
+to the vendor dir — `tentaflow/build.rs` MUST copy the fresh vendored `.so/.dylib` into
+`target/<profile>` (full copy, not a hardlink), or the stale copy shadows the new one.
+Verify: `nm -D --defined-only <so> | grep -ic protobuf` = 0.
+
+whisper is the reference case: whisper.cpp and llama.cpp always coexist in the binary (every
+`gpu-*` feature pulls `inference-llamacpp`) and each vendors its own ggml version under
+identical `ggml_*` symbol names. whisper + its ggml are linked into one isolated
+`libwhisper_tf.so` (ggml_* hidden), `whisper-rs-sys/build.rs` links that dylib dynamically, and
+`tentaflow/build.rs` copies it flat next to the binary (`$ORIGIN`).
+
+### Inference wrappers
+
+`tentaflow-wrappers/` holds our own wrappers for llama.cpp / whisper.cpp, defining the config
+contract and the `native-libs` artifact mapping, so we can use upstream features (`mtp`,
+`ngram-simple`) that high-level bindings block. The crate has NO tokio dependency.
+
+- `llama_engine.rs` — continuous-batching engine (one model, one ctx, many sequence slots,
+  per-slot anti-hang). `SpeculativeMode`: `Off`, `NgramSimple`, `Mtp { n_max }` (self-speculative
+  through the model's own MTP/NextN head — no duplicated weights; the scheduler creates a second
+  `ctx_dft` on the same model and drives `common_speculative`). Both contexts live only in the
+  scheduler thread. KV rollbacks of `ctx_dft` are load-bearing: to `base_pos` after `draft()` and
+  to the new free position after acceptance — without them M-RoPE rejects the batch. MTP only
+  pays off when the GPU is not saturated (a single or rare stream); with several parallel
+  sequences the draft overhead outweighs the gain.
+- Anti-hang contract: `submit_with_sink` takes a `Box<dyn EngineSink>` and the scheduler calls
+  `sink.try_send` from its own thread (no thread per request). A `Full` token is deferred to the
+  slot's `pending`, including the terminal token, and `release_slot` only frees the slot after
+  the tail drains — no blocking `send`. `EngineConfig.stream_stall_timeout` (deploy
+  `stream_stall_timeout_secs`, default 60 s) is a DELIVERY-PROGRESS deadline: a slot whose
+  `pending` never shrinks (consumer alive but mute) is force-released with `FinishReason::Error`,
+  so exhausting `queue_capacity` cannot silently wedge admission.
+- `inference/llamacpp.rs` (`LlamaCppEngine`) plugs the engine into core. The engine lives in
+  `RwLock<Option<Arc<LlamaEngine>>>`; `generate`/`generate_stream` take a SHORT read lock, clone
+  the `Arc` and release it BEFORE `submit` — no lock is ever held during generation. Core
+  supplies `StreamSink`/`CollectSink` over `tokio::mpsc`. `StreamToken` carries real
+  `finish_reason` + `error` + `prompt_tokens`, and `generate` measures `tokens_per_second` from
+  the first token (TTFT). Deploy params → `EngineConfig`: `n_seq_max` from
+  `n_parallel`/`max_concurrency` (default 8), `ctx_per_seq` = ctx_size, `n_batch` = batch_size,
+  speculative from `speculative_method`/`num_speculative_tokens`/`size_ngram`/`size_mgram`.
+- The engine is generation-only, so `LlamaCppEngine::embeddings` uses a separate, lazily created
+  `LlamaRuntime` (context with `embeddings=true`). `LlamaRuntime` is ONLY the embeddings path —
+  it keeps `load`/`metadata`/`embeddings`/`tokenize`/`context` plus helpers shared with the
+  engine. Full unification is deliberately deferred.
+- Smoke tests: `examples/llama_smoke.rs` (`--metadata-only` reads GGUF metadata and detects MTP
+  via `*.nextn_predict_layers`; without it, loads through `LlamaEngine`),
+  `examples/llama_engine_smoke.rs` (`--speculative off|ngram|mtp`, per-request tok/s, anti-hang
+  regressions `--slow-consumer` / `--drop-mid` / `--silent-consumer` / `--queue-overflow`),
+  `examples/whisper_smoke.rs`. Core integration test:
+  `tentaflow-core/tests/llamacpp_engine_e2e.rs` (`#[ignore]`, env `TENTAFLOW_LLAMA_TEST_MODEL`).
+- `inference-whisper` is ALWAYS built on non-Apple platforms (Linux/Windows in
+  `tentaflow/Cargo.toml`, Android in `tentaflow-mobile/core/Cargo.toml`) — the `whisper` STT
+  engine must exist at runtime there, it is not opt-in. Apple (macOS/iOS) does NOT link
+  whisper.cpp (STT goes through MLX-whisper / native Swift); wired per-target via a separate
+  `[target.'cfg(...)'.dependencies]` block.
+- A llama.cpp deploy from a HuggingFace GGUF repo must name a single `.gguf`
+  (`config_json.model_file`) or a preset with `quantization` — the downloader must not pull
+  every quantization in the repo.
 
 ## tentaflow-infer (FORGE)
 
-Independent inference-engine project (own Cargo workspace, NOT part of the
-main binary): Rust systems layer + **Mojo GPU kernels** (AOT → PTX + manifest,
-zero Mojo runtime in the server; ADR-0001). Spec: `tentaflow-infer/docs/SPEC.md`,
-plan: `docs/PLAN.md`, Mojo 1.0b API quirks: `kernels/mojo/MOJO_NOTES.md`.
-Crates: forge-types/hal (CUDA via cudarc, VRAM arenas, CUDA graphs) /
-formats (GGUF+safetensors+NVFP4, CPU golden dequant) / tokenize / kernels
-(PTX registry + typed launchers, golden GPU tests) / engine (paged KV,
-forward pass, scheduler queue) / server+cli (OpenAI API). Kernel toolchain:
-`cd tentaflow-infer/kernels/mojo && pixi run mojo build_kernels.mojo`
-(pixi env, gitignored; artifacts in `build/<arch>/` are committed).
-E2E proven: Bielik-PL-Minitron-7B-NVFP4 (software FP4 dequant) generates
-coherent Polish on the RTX 4090.
+Independent inference-engine project (own Cargo workspace, NOT part of the main binary): Rust
+systems layer + **Mojo GPU kernels** (AOT → PTX + manifest, zero Mojo runtime in the server;
+ADR-0001). Crates: forge-types/hal (CUDA via cudarc, VRAM arenas, CUDA graphs) / formats
+(GGUF + safetensors + NVFP4, CPU golden dequant) / tokenize / kernels (PTX registry + typed
+launchers, golden GPU tests) / state (paged KV + radix tree, shared by both paths) / engine
+(forward pass, scheduler) / server+cli (OpenAI API).
 
-### Ścieżka NVFP4/FP8
+Docs: `tentaflow-infer/docs/SPEC.md`, `docs/PLAN.md`, `docs/STATUS.md`, target architecture
+`docs/ARCHITEKTURA_DOCELOWA.md`, Mojo 1.0b API quirks `kernels/mojo/MOJO_NOTES.md`,
+benchmarks `docs/BENCH_*.md` (`BENCH_NVFP4_VLLM.md`, `BENCH_QWEN35_MTP_NVFP4.md`).
 
-- `FORGE_GEMM=fp8mod-ffn` włącza hybrydowy prefill: kernele Mojo przepakowują
-  projekcje Q/O/gate/up/down NVFP4 oraz pojedynczy `lm_head` F16 do FP8 na GPU.
-  Źródłowe NVFP4 pozostaje rezydentne dla decode; K/V nie są konwertowane.
-- Wyspecjalizowane kernele małych batchy NVFP4 obsługują B4/B8/B16 i BM32.
-  Decode GQA 4:1 dla `head_dim=128`, KV F16 i bez Q/K norm współdzieli K/V między
-  czterema głowicami Q oraz używa dwugłowicowego `combine2`.
-- Konwersję wolno rozpocząć dopiero po sprawdzeniu możliwości urządzenia,
-  obsługiwanych kształtów, kompletu artefaktów i dostępnego VRAM. Niespełnienie
-  warunków pozostawia całą warstwę na istniejącej ścieżce NVFP4.
-- Zweryfikowany wynik RTX 4090, pp4096/jeden strumień: FORGE 10 302,7 tok/s
-  prefill i 143,100 tok/s decode; vLLM 0.25.1 odpowiednio 9 732,9 i 146,372.
-  Prefill wygrywa o 5,85%, decode pozostaje 2,24% wolniejszy. Protokół i
-  ograniczenia są w `tentaflow-infer/docs/BENCH_NVFP4_VLLM.md`.
-- HAL FORGE nadal obsługuje tylko CUDA. AMD/ROCm, Metal i natywne instrukcje FP4
-  Blackwell nie są zaimplementowane; fallback możliwości nie oznacza obsługi
-  tych backendów. Użyty checkpoint compressed-tensors NVFP4 nie jest bezpośrednio
-  obsługiwany przez badaną wersję `llama.cpp`.
+Kernel toolchain: `cd tentaflow-infer/kernels/mojo && pixi run mojo build_kernels.mojo` (pixi
+env is gitignored; artifacts in `build/<arch>/` ARE committed). The builder compiles the kernel
+catalog in isolated Mojo units, splits a unit after a compiler offload error, stages PTX/cubins/
+manifest on the same filesystem and publishes the whole arch directory with an atomic
+`RENAME_EXCHANGE` — a late failure leaves the previous set untouched. PTX artifacts need
+`sm_80+`.
 
-### Dekodowanie spekulatywne
+**Direction.** A second layout (`docs/ARCHITEKTURA_DOCELOWA.md`) treats a model as a SEQUENCE OF
+OPERATIONS (`forge-graph`): `forge-model` emits `Op` and knows neither HAL nor kernels, and three
+executors compute the same contract — Metal, a host f32 oracle (runs without an accelerator) and
+`CudaExec`. Weight form and KV paging belong to the EXECUTOR, not the model. This is the only
+target path; `forge-engine` is to be rewritten onto it and disappear (order and measurement bar
+in §8 of that doc). Until the measurement matches, `forge-engine` stays in production.
 
-- `forge-engine::speculation` ma wspólny kontrakt `Proposer`, typowane
-  `DraftTree`/`DraftNode`, `SpeculationCoordinator`, kompozycję kaskadową i
-  statystyki akceptacji per proposer. Węzły przenoszą źródło,
-  `proposal_logprob` i `conditional_confidence`, dzięki czemu ten sam kontrakt
-  obsłuży później greedy oraz lossless stochastic acceptance.
-- Wykonawczo działają dwie rozłączne ścieżki: hostowy `NgramProposer` oraz natywne
-  MTP/NextN modelu dla gęstego hybrydowego GGUF `qwen35`. Natywne MTP wydziela
-  bloki `nextn_predict_layers` z trunku, ładuje ich NVFP4/Q8_0/F32 bez drugiej
-  kopii targetu i wykonuje proposer, weryfikację całego draftu oraz checkpointy
-  DeltaNet/KV na GPU przez kernele Mojo. Serwer obsługuje `--speculative mtp`,
-  `mtp:2` i `mtp:3`; budżet 3 jest adaptacyjnie przełączany między K=2 i K=3.
-  Przy wyłączonej spekulacji loader pomija opcjonalne wagi i stan NextN.
-- Natywne MTP jest obecnie greedy-exact, wymaga `max_active=1` z powodu stanu SSM
-  należącego do modelu i zostało wykonawczo sprawdzone wyłącznie na CUDA/RTX 4090
-  z `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`. Źródła Mojo zachowują podział
-  umożliwiający przyszły codegen AMDGPU/Metal, ale backendy AMD i Metal nie są
-  jeszcze podłączone ani przetestowane. `draft-model`, `eagle`, `dflash` i
-  `dspark` nadal zwracają `Unsupported`; weryfikacja drzewa, sampling, PARD i
-  suffix nie są jeszcze zaimplementowane.
-- Retained checkpointy stanu DeltaNet usuwają ponowny skan 48 warstw podczas
-  zatwierdzania zaakceptowanego prefiksu. Końcowy pomiar RTX 4090: około 59,8
-  tok/s dla raw128 oraz 57,7 tok/s dla raw512 w trybie MTP K=3. Referencja
-  llama.cpp na tym samym modelu osiąga odpowiednio
-  110,2 i 100,5 tok/s; luka wydajności pozostaje otwarta. Szczegóły:
-  `tentaflow-infer/docs/BENCH_QWEN35_MTP_NVFP4.md`.
-- `forge-formats` udostępnia zamknięty parser `forge-speculation.json` dla
-  neuralnych proposerów. Manifest opisuje target, fingerprinty, tensory, cechy,
-  dtype/kwantyzację, sampling, kalibrację oraz osobne licencje kodu i wag.
-  `SpeculationManifest::load` ogranicza artefakty do katalogu manifestu i
-  weryfikuje SHA-256 każdego pliku; porównanie fingerprintu z aktywnym targetem
-  nastąpi przy integracji neuralnego runtime.
+**Scope limits (do not overstate).** The HAL supports CUDA only. AMD/ROCm, Metal and native
+Blackwell FP4 instructions are NOT implemented — a capability fallback is not backend support.
+Mojo sources keep a split that allows future AMDGPU/Metal codegen, but neither backend is wired
+or tested. Everything below was verified only on CUDA / RTX 4090.
+
+### NVFP4 / FP8 path
+
+- For a catalog checkpoint, an unset `FORGE_GEMM` auto-attempts hybrid FP8 prefill: Mojo kernels
+  repack NVFP4 Q/O/gate/up/down and the single F16 `lm_head` to FP8 on GPU. `fp8mod-ffn` forces
+  the attempt; any other explicit value disables auto. Source NVFP4 stays resident for decode;
+  K/V are never converted.
+- Conversion may only start after checking device capability, supported shapes, artifact
+  completeness and free VRAM. Any unmet condition leaves the whole layer on the existing path.
+- `FORGE_NVFP4_CT_LAYOUT=auto` (default) picks S0 only after those checks pass, else row-major.
+  Small-batch BM16 is likewise automatic; `FORGE_NVFP4_CT_BM16=0` disables it explicitly.
+- `serve`, `run`, `embed` and `ppl` always use `RowMajor36`. `TileN128K64` is an explicit
+  `bench`-only comparison mode via `FORGE_BENCH_NVFP4_TILE=1` and requires
+  `SpeculationKind::Off` with one active sequence.
+
+### Speculative decoding
+
+- `forge-engine::speculation` defines the shared `Proposer` contract, typed `DraftTree`/
+  `DraftNode`, `SpeculationCoordinator`, cascade composition and per-proposer acceptance stats.
+  Nodes carry source, `proposal_logprob` and `conditional_confidence`, so the same contract will
+  later cover greedy and lossless stochastic acceptance.
+- Working today: host `NgramProposer`, native MTP/NextN, and their priority router for the dense
+  hybrid `qwen35` GGUF. Native MTP splits `nextn_predict_layers` out of the trunk and loads their
+  NVFP4/Q8_0/F32 without a second copy of the target; proposer, full-draft verification and
+  DeltaNet/KV checkpoints run on GPU through Mojo kernels. Server flags: `--speculative mtp`,
+  `mtp:2`, `mtp:3`, `mtp+ngram:2|3` (a complete n-gram draft bypasses the MTP proposer; MTP state
+  catches up on the accepted prefix). `mtp` and `mtp:3` hold K=3; K=2 is a fallback only on
+  insufficient context or KV pool.
+- NOT implemented: `draft-model`, `eagle`, `dflash`, `dspark` return `Unsupported`; tree
+  verification, sampling beyond greedy-exact, PARD and suffix are absent.
+- Native MTP is greedy-exact. Default `max_active=1`; an explicit `max_active > 1` goes through
+  an atomic startup preflight. The scheduler pairs two pure-MTP requests with the same K into
+  native B2 (`FORGE_NATIVE_MTP_B2` accepts only `0`/`1`, default on); different K, `mtp+ngram`,
+  tiering, an incomplete pair or an unmet kernel contract fall back to serial B1. Target DeltaNet
+  and draft MTP keep isolated per-sequence state under a shared lease; a restore/rollback error
+  poisons and quarantines both leases.
+- Admission reserves a logical future-KV-page budget per active sequence, enforces
+  `max_pages_per_seq` and runs an atomic whole-batch growth preflight. A bounded queue window
+  (`2 * max_active`, clamped 2–16) skips requests temporarily blocked on KV, with aging against
+  starvation. Pinned borrowed-prefix pages are accounted conservatively, which can delay
+  admission despite physical KV sharing.
+- `forge-formats` parses `forge-speculation.json` for neural proposers (target, fingerprints,
+  tensors, features, dtype/quantization, sampling, calibration, separate code/weight licenses).
+  `SpeculationManifest::load` confines artifacts to the manifest directory and verifies each
+  file's SHA-256; fingerprint comparison against the live target lands with the neural runtime.
+
+### Hybrid prefill and MTP catch-up
+
+- The hybrid target prefills in matrix chunks on GPU; dynamic DeltaNet kernels handle full
+  chunks and commit recurrent state per chunk, with no sequential trip through the CPU.
+- Layer-major runs full GEMM projections once per layer in a lazy arena up to P4096 and is the
+  DEFAULT for compatible models (`FORGE_HYBRID_LAYER_MAJOR_PREFILL=0` disables it
+  diagnostically). It sizes the arena to the current activation budget: a lone prefill uses all
+  capacity, an active decode caps the scheduler quantum at T1024 and interleaves segments.
+- Layer-major prefill is a TRANSACTION covering target + MTP catch-up: before mutating it
+  checkpoints all DeltaNet states/windows and the partial KV tail via D2D copies into existing
+  verifier buffers, and any error restores state, KV, page map, tokens and sequence lengths. The
+  MTP checkpoint stays live through profile-end registration and the final GPU sync; the commit
+  is validated first but applied as the last error-free change.
+- Native MTP with a shared target embedding catches up the whole accepted prefix in ONE GPU
+  batch; models without a compatible shared embedding keep the sequential variant.
+- Hybrid models with native MTP reserve 1152 MiB of activation pool to hold prefill buffers,
+  verifier buffers, DeltaNet states and batched catch-up at once.
+- Kernel selection is capability-gated, and every gate has a bit-exact fallback: persistent
+  DeltaNet scan only on NVIDIA / warp32 / `d_state=128` / T>128 with the artifact present
+  (`chunked` forces the fallback); `FORGE_HYBRID_LAYER_MAJOR_ATTN` defaults to Mojo FA HD256
+  (`exact`/`prefill` force older variants); Flash Attention HD256 defaults to the bit-exact K16
+  variant, with the inexact K32 only via `FORGE_HYBRID_FA_KEY_TILE=32`;
+  `FORGE_HYBRID_LAYER_MAJOR_DELTA_PREPARE=tiled` opts into tiled DeltaNet prepare. A missing
+  artifact always degrades to the previous kernel rather than failing.
+- Target KV keeps a compact `global_layer -> kv_layer` map and allocates slabs only for
+  `Attention` layers, so a hybrid model pays KV only for its attention layers; the separate MTP
+  cache keeps a single-layer identity map.
+- DeltaNet D128 state uses the `ValueKey` layout, chosen once at pool creation — same byte size
+  as `KeyValue`, and an incomplete artifact set or unsupported warp geometry selects the portable
+  `KeyValue` before allocation.
+- `FORGE_MTP_DRAFT_HEAD=nvfp4` (optional) repacks the shared Q8_0 head into a separate NVFP4 GGUF
+  copy used ONLY for MTP proposals; the target verifier keeps the original Q8_0.
+- Known limit: the full builder blocks FP8 paths needing PTX 8.4 while Mojo emits PTX 8.1.
+
+### GPU histogram sampling
+
+Active repetition / frequency / presence penalties are applied by a single histogram kernel,
+followed by the existing parallel argmax or top-k selection. The default greedy path without
+penalties launches no extra kernel and does no extra allocation or sync.
 
 ## Conventions
 
@@ -485,7 +602,17 @@ specific rule for a specific task.
    every primitive — zero raw `<button>`/`<input>`/`<select>`, hand-rolled modals, tab strips.
    Missing a feature → **extend the component**, don't fork. A pattern repeated in 2+ feature
    modules → add a new `tf-*` component. (There IS a `tf-file-input` — use it instead of raw
-   `<input type="file">`.)
+   `<input type="file">`.) Component styling lives in `css/controls.css` — it is the ONLY
+   sheet adopted into shadow roots, so markup injected into a `tf-table` cell can never use a
+   feature stylesheet's classes. `tf-table selectable="multi"` renders a checkbox in the first
+   cell of every row and emits `row-select`; a plain row click stays `row-click` (open), and
+   `tf-segmented` options take an `icon` attribute. Filter/action bars use the shared
+   `.tf-toolbar` class (+ `.tf-toolbar-spacer` to push actions right): `tf-select`/`tf-input`
+   default to `width:100%`, so a bar without it stacks every control on its own row.
+8. **Plural forms go through i18n, never string concatenation.** `{count|forma1|forma2|forma3}`
+   in a translation picks the right form (Polish needs all three, other languages two), so
+   "1 przypadków" cannot happen. Every `project_studio` key exists in all five locales — the
+   parity check is a plain key-count comparison across `www/i18n/*.json`.
 
 ## gstack & skill routing
 

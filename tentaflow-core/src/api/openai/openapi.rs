@@ -608,14 +608,19 @@ fn build_anthropic_paths() -> Value {
         "/v1/messages": {
             "post": {
                 "tags": ["Anthropic (Messages API)"],
-                "summary": "Anthropic Messages (tekst i vision)",
+                "summary": "Anthropic Messages (tekst, vision, tool calling)",
                 "description": "Zgodne z Anthropic Messages API. Auth naglowkiem `x-api-key` \
                     (+ `anthropic-version`). `messages[].content` to string albo lista blokow: \
-                    `{type:\"text\",text}` oraz `{type:\"image\",source:{type:\"base64\",media_type,data}}`. \
+                    `{type:\"text\",text}`, `{type:\"image\",source:{type:\"base64\",media_type,data}}`, \
+                    `{type:\"tool_use\",id,name,input}` oraz `{type:\"tool_result\",tool_use_id,content}`. \
                     `system` jest top-level (string albo lista blokow text). `max_tokens` jest wymagane. \
-                    Gdy `stream:true`, odpowiedz to strumien SSE z sekwencja zdarzen Anthropic: \
-                    `message_start` -> `content_block_start` -> `content_block_delta`* -> \
-                    `content_block_stop` -> `message_delta` -> `message_stop`.",
+                    `tools[].input_schema` mapuje sie na OpenAI `function.parameters`, a `tool_choice` \
+                    `auto`/`any`/`none`/`tool` na `auto`/`required`/`none`/nazwana funkcje. \
+                    Gdy model wywola narzedzie, odpowiedz zawiera bloki `tool_use` i \
+                    `stop_reason: \"tool_use\"`. Gdy `stream:true`, odpowiedz to strumien SSE: \
+                    `message_start` -> (`content_block_start` -> `content_block_delta`* -> \
+                    `content_block_stop`)* -> `message_delta` -> `message_stop`; bloki tekstowe \
+                    niosa `text_delta`, bloki `tool_use` — `input_json_delta`.",
                 "operationId": "createAnthropicMessage",
                 "security": [ { "apiKeyAuth": [] } ],
                 "parameters": [
@@ -669,8 +674,8 @@ fn build_anthropic_paths() -> Value {
                 "tags": ["Anthropic (Messages API)"],
                 "summary": "Anthropic count_tokens",
                 "description": "Zwraca estymacje liczby tokenow wejsciowych dla podanych \
-                    `messages` (+ opcjonalnego `system`). Bloki text sa liczone, bloki image \
-                    pomijane.",
+                    `messages` (+ opcjonalnego `system` i `tools`). Bloki text, `tool_use` i \
+                    `tool_result` sa liczone, bloki image pomijane.",
                 "operationId": "countAnthropicTokens",
                 "security": [ { "apiKeyAuth": [] } ],
                 "requestBody": {
@@ -986,8 +991,47 @@ fn build_anthropic_schemas() -> Value {
                         "media_type": { "type": "string", "example": "image/png" },
                         "data": { "type": "string", "description": "Obraz zakodowany base64." }
                     }, "required": ["type", "media_type", "data"] }
-                }, "required": ["type", "source"] }
+                }, "required": ["type", "source"] },
+                { "type": "object", "description": "Wywolanie narzedzia w turze asystenta.", "properties": {
+                    "type": { "type": "string", "enum": ["tool_use"] },
+                    "id": { "type": "string", "example": "toolu_0123" },
+                    "name": { "type": "string" },
+                    "input": { "type": "object" }
+                }, "required": ["type", "id", "name"] },
+                { "type": "object", "description": "Wynik narzedzia w turze uzytkownika.", "properties": {
+                    "type": { "type": "string", "enum": ["tool_result"] },
+                    "tool_use_id": { "type": "string" },
+                    "content": { "oneOf": [
+                        { "type": "string" },
+                        { "type": "array", "items": { "$ref": "#/components/schemas/AnthropicContentBlock" } }
+                    ] }
+                }, "required": ["type", "tool_use_id"] },
+                { "type": "object", "description": "Blok rozumowania odsylany w historii — pomijany przy tlumaczeniu.", "properties": {
+                    "type": { "type": "string", "enum": ["thinking", "redacted_thinking"] },
+                    "thinking": { "type": "string" }
+                }, "required": ["type"] }
             ]
+        },
+        "AnthropicTool": {
+            "type": "object",
+            "description": "Deklaracja narzedzia. `input_schema` odpowiada OpenAI \
+                `function.parameters`. Narzedzia serwerowe Anthropic (bez `input_schema`) \
+                sa pomijane — nie maja odpowiednika w OpenAI function calling.",
+            "properties": {
+                "name": { "type": "string" },
+                "description": { "type": "string" },
+                "input_schema": { "type": "object", "description": "JSON Schema argumentow." }
+            },
+            "required": ["name"]
+        },
+        "AnthropicToolChoice": {
+            "type": "object",
+            "description": "`any` odpowiada OpenAI `required`; `tool` wymaga pola `name`.",
+            "properties": {
+                "type": { "type": "string", "enum": ["auto", "any", "tool", "none"] },
+                "name": { "type": "string" }
+            },
+            "required": ["type"]
         },
         "AnthropicMessage": {
             "type": "object",
@@ -1014,6 +1058,8 @@ fn build_anthropic_schemas() -> Value {
                 "top_p": { "type": "number" },
                 "top_k": { "type": "integer", "description": "Brak odpowiednika w sciezce chatu — pomijane." },
                 "stop_sequences": { "type": "array", "items": { "type": "string" } },
+                "tools": { "type": "array", "items": { "$ref": "#/components/schemas/AnthropicTool" } },
+                "tool_choice": { "$ref": "#/components/schemas/AnthropicToolChoice" },
                 "stream": { "type": "boolean" }
             },
             "required": ["model", "max_tokens", "messages"]
@@ -1024,12 +1070,21 @@ fn build_anthropic_schemas() -> Value {
                 "id": { "type": "string", "example": "msg_0123456789abcdef" },
                 "type": { "type": "string", "example": "message" },
                 "role": { "type": "string", "example": "assistant" },
-                "content": { "type": "array", "items": { "type": "object", "properties": {
-                    "type": { "type": "string", "enum": ["text"] },
-                    "text": { "type": "string" }
-                } } },
+                "content": { "type": "array", "items": { "oneOf": [
+                    { "type": "object", "properties": {
+                        "type": { "type": "string", "enum": ["text"] },
+                        "text": { "type": "string" }
+                    }, "required": ["type", "text"] },
+                    { "type": "object", "properties": {
+                        "type": { "type": "string", "enum": ["tool_use"] },
+                        "id": { "type": "string" },
+                        "name": { "type": "string" },
+                        "input": { "type": "object" }
+                    }, "required": ["type", "id", "name", "input"] }
+                ] } },
                 "model": { "type": "string" },
-                "stop_reason": { "type": ["string", "null"] },
+                "stop_reason": { "type": ["string", "null"],
+                    "description": "`end_turn`, `max_tokens`, `stop_sequence` albo `tool_use`." },
                 "stop_sequence": { "type": ["string", "null"] },
                 "usage": { "type": "object", "properties": {
                     "input_tokens": { "type": "integer" },
@@ -1046,7 +1101,8 @@ fn build_anthropic_schemas() -> Value {
                 "system": { "oneOf": [
                     { "type": "string" },
                     { "type": "array", "items": { "type": "object", "properties": { "type": { "type": "string", "enum": ["text"] }, "text": { "type": "string" } } } }
-                ] }
+                ] },
+                "tools": { "type": "array", "items": { "$ref": "#/components/schemas/AnthropicTool" } }
             },
             "required": ["model", "messages"]
         },

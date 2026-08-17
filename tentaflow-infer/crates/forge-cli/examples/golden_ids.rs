@@ -11,7 +11,7 @@ use std::sync::Arc;
 use anyhow::{bail, Result};
 use forge_engine::model::ModelConfig;
 use forge_engine::sample::{GpuSampler, SamplingParams};
-use forge_hal::cuda::CudaDevice;
+use forge_hal::gpu;
 use forge_hal::Device;
 use forge_server::source::load_model;
 
@@ -35,7 +35,7 @@ fn main() -> Result<()> {
     let max_tokens: usize = args[3].parse()?;
     let prefill_chunk: usize = args.get(4).map_or(Ok(256), |s| s.parse())?;
 
-    let device = CudaDevice::with_default_pools(0)?;
+    let device = gpu::open_default_pools(0)?;
     let dev: Arc<dyn Device> = device;
     let mut loaded = load_model(dev, &model_path, ModelConfig::default())?;
     let tokenizer = Arc::new(loaded.bundle.tokenizer);

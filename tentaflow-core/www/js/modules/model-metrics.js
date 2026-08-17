@@ -292,14 +292,14 @@ async function loadFilterSubjects() {
 
 function filterbarHtml({ node = true, model = true } = {}) {
   return `
-    <div class="mm-filters">
+    <div class="mm-filters tf-toolbar">
       <span class="mm-fl">${escapeHtml(T('period'))}</span>
       <tf-segmented id="mm-period" value="${escapeAttr(filters.period)}" size="sm">
         <option value="hourly">${escapeHtml(T('period_hourly'))}</option>
         <option value="daily">${escapeHtml(T('period_daily'))}</option>
         <option value="monthly">${escapeHtml(T('period_monthly'))}</option>
       </tf-segmented>
-      <span id="mm-period-key-host">${periodKeyHtml()}</span>
+      <span id="mm-period-key-host" class="tf-toolbar">${periodKeyHtml()}</span>
       ${node ? `
         <span class="mm-fl">${escapeHtml(T('node'))}</span>
         <tf-select id="mm-node" value="${escapeAttr(filters.filterNode)}">
@@ -604,7 +604,7 @@ async function renderUsers() {
     <section class="card">${filterbarHtml()}</section>
     <div id="mm-users-banner"></div>
     <section class="card">
-      <div class="mm-filters">
+      <div class="mm-filters tf-toolbar">
         <tf-segmented id="mm-users-subtab" value="${escapeAttr(usersSubTab)}" size="sm">
           <option value="user">${escapeHtml(T('subtab_users'))}</option>
           <option value="group">${escapeHtml(T('subtab_groups'))}</option>
@@ -871,7 +871,7 @@ async function renderBilling() {
   panel.innerHTML = `
     <section class="card">${filterbarHtml({ node: false, model: false })}</section>
     <section class="card">
-      <div class="mm-filters">
+      <div class="mm-filters tf-toolbar">
         <tf-segmented id="mm-billing-by" value="${escapeAttr(billingBy)}" size="sm">
           <option value="user">${escapeHtml(T('billing_by_user'))}</option>
           <option value="group">${escapeHtml(T('billing_by_group'))}</option>

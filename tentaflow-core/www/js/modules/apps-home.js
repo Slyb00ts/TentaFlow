@@ -14,6 +14,7 @@ import { byId, escapeHtml } from '/js/utils.js';
 // is filtered out before it ever reaches the DOM, mirroring the backend policy.
 const TILES = [
   { id: 'chat',         route: 'chat',         icon: 'chat' },
+  { id: 'projekty',     route: 'projekty',     icon: 'folder' },
   { id: 'ml-studio',    route: 'ml-studio',    icon: 'brain',        requiresPowerUser: true },
   { id: 'images',       route: 'images',       icon: 'image',        soon: true },
   { id: 'meeting',      route: 'meeting',      icon: 'meeting',      soon: true },

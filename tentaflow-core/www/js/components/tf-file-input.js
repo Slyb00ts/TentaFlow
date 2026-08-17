@@ -65,7 +65,11 @@ class TfFileInput extends HTMLElement {
     input.type = 'file';
     input.className = 'tf-file-input-native';
     input.style.display = 'none';
-    input.addEventListener('change', () => {
+    input.addEventListener('change', (e) => {
+      // Native change bubbles up to this host too; without stopping it, listeners
+      // on <tf-file-input> receive a second detail-less `change` right after our
+      // CustomEvent and would treat it as an empty selection.
+      e.stopPropagation();
       this._showFiles(input.files);
       this.dispatchEvent(new CustomEvent('change', {
         bubbles: true,

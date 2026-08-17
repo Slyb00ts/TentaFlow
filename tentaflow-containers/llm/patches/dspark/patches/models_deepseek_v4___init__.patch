@@ -1,0 +1,18 @@
+--- a/vllm/models/deepseek_v4/__init__.py
++++ b/vllm/models/deepseek_v4/__init__.py
+@@ -17,6 +17,7 @@
+ # default that mypy sees; the ROCm branch overrides it at runtime and is
+ # kept type-compatible via ``# type: ignore[assignment]``.
+ if TYPE_CHECKING or not current_platform.is_rocm():
++    from .nvidia.dspark import DeepSeekV4DSpark
+     from .nvidia.model import DeepseekV4ForCausalLM
+     from .nvidia.mtp import DeepSeekV4MTP
+ else:
+@@ -24,6 +25,7 @@
+     from .amd.mtp import DeepSeekV4MTP  # type: ignore[assignment]
+ 
+ __all__ = [
++    "DeepSeekV4DSpark",
+     "DeepSeekV4MTP",
+     "DeepseekV4FP8Config",
+     "DeepseekV4ForCausalLM",

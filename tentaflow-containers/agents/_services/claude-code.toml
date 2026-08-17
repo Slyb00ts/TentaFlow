@@ -1,0 +1,33 @@
+[engine]
+id = "claude-code"
+category = "agents"
+resource_kind = "ai"
+provider = "external"
+name = "Claude Code"
+description_pl = "Oficjalny Claude Code CLI z natywnym logowaniem, trwałymi sesjami i dostępem do workspace."
+description_en = "Official Claude Code CLI with native login, durable sessions, and workspace access."
+homepage = "https://docs.anthropic.com/en/docs/claude-code"
+license = "Proprietary"
+icon = "claude"
+default_port = 8765
+api = "custom"
+version = "2.1.221"
+requires_model = false
+gpu_supported = false
+service_surfaces = ["chat"]
+input_modalities = ["text"]
+output_modalities = ["text"]
+
+[deploy.docker]
+context_path = "agents"
+platforms = ["linux", "macos"]
+transport = "direct-http"
+
+[deploy.docker.default_build_args]
+CLI_PACKAGE = "@anthropic-ai/claude-code"
+CLI_VERSION = "2.1.221"
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "managed-cli"
+binary_path = "agents/native/coding-agent-bridge"

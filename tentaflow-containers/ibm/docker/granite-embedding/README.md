@@ -21,13 +21,13 @@ kontenera przy deployu (dostęp do repozytoriów gated).
 ## Ważna uwaga: wsparcie vLLM zależy od architektury modelu
 
 Tryb `--task embed` w vLLM obsługuje embeddingi tylko dla architektur, które
-dany build vLLM zna. Ten obraz pinuje **vLLM 0.25.1**:
+dany build vLLM zna. Ten obraz pinuje **vLLM 0.27.0**:
 
 - Warianty Granite oparte o **RoBERTa / XLM-RoBERTa** (np.
   `granite-embedding-30m-english`, `granite-embedding-278m-multilingual`) są
   obsługiwane przez vLLM `--task embed`.
 - Nowsze warianty „r2" (`granite-embedding-english-r2`) bazują na
-  **ModernBERT** i mogą wymagać **nowszej wersji vLLM niż 0.25.1**. Jeśli
+  **ModernBERT** i mogą wymagać **nowszej wersji vLLM niż 0.27.0**. Jeśli
   serwowanie wariantu r2 zwróci błąd nieobsługiwanej architektury, należy
   zaktualizować pinowaną wersję vLLM w `Dockerfile`.
 

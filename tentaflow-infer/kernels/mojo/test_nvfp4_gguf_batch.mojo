@@ -11,6 +11,8 @@ from src.nvfp4_gguf_batch import (
     gemm_nvfp4_gguf_f16_b2,
     gemm_nvfp4_gguf_f16_b3,
     gemm_nvfp4_gguf_f16_b4,
+    gemm_nvfp4_gguf_f16_b3_nvidia,
+    gemm_nvfp4_gguf_f16_b4_nvidia,
 )
 
 
@@ -43,6 +45,8 @@ def _golden(ctx: DeviceContext) raises:
     var y2 = ctx.enqueue_create_buffer[DType.float16](2 * ROWS)
     var y3 = ctx.enqueue_create_buffer[DType.float16](3 * ROWS)
     var y4 = ctx.enqueue_create_buffer[DType.float16](4 * ROWS)
+    var y3_nvidia = ctx.enqueue_create_buffer[DType.float16](3 * ROWS)
+    var y4_nvidia = ctx.enqueue_create_buffer[DType.float16](4 * ROWS)
     with weights.map_to_host() as values:
         for i in range(len(values)):
             values[i] = UInt8((i * 29 + 11) & 0xFF)
@@ -68,9 +72,19 @@ def _golden(ctx: DeviceContext) raises:
         y4.unsafe_ptr(), weights.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWS,
         4, Float32(OUTPUT_SCALE), grid_dim=ROWS, block_dim=WARP_SIZE,
     )
+    ctx.enqueue_function[gemm_nvfp4_gguf_f16_b3_nvidia](
+        y3_nvidia.unsafe_ptr(), weights.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWS,
+        3, Float32(OUTPUT_SCALE), grid_dim=(ROWS + 1) // 2,
+        block_dim=2 * WARP_SIZE,
+    )
+    ctx.enqueue_function[gemm_nvfp4_gguf_f16_b4_nvidia](
+        y4_nvidia.unsafe_ptr(), weights.unsafe_ptr(), x.unsafe_ptr(), COLS, ROWS,
+        4, Float32(OUTPUT_SCALE), grid_dim=(ROWS + 1) // 2,
+        block_dim=2 * WARP_SIZE,
+    )
     ctx.synchronize()
 
-    with weights.map_to_host() as w, x.map_to_host() as xv, y2.map_to_host() as result2, y3.map_to_host() as result3, y4.map_to_host() as result4:
+    with weights.map_to_host() as w, x.map_to_host() as xv, y2.map_to_host() as result2, y3.map_to_host() as result3, y4.map_to_host() as result4, y3_nvidia.map_to_host() as result3_nvidia, y4_nvidia.map_to_host() as result4_nvidia:
         for token in range(TOKENS):
             for row in range(ROWS):
                 var expected: Float32 = 0.0
@@ -95,6 +109,10 @@ def _golden(ctx: DeviceContext) raises:
                     raise Error("niezgodny wynik F16 B3 GGUF NVFP4")
                 if abs(Float32(result4[token * ROWS + row]) - expected) > tolerance:
                     raise Error("niezgodny wynik F16 B4 GGUF NVFP4")
+                if token < 3 and result3_nvidia[token * ROWS + row].to_bits() != result3[token * ROWS + row].to_bits():
+                    raise Error("szybki NVIDIA B3 nie jest bit-exact")
+                if result4_nvidia[token * ROWS + row].to_bits() != result4[token * ROWS + row].to_bits():
+                    raise Error("szybki NVIDIA B4 nie jest bit-exact")
     print("golden F16 NVFP4 T=2/3/4 0x7f/output_scale: PASS")
 
 

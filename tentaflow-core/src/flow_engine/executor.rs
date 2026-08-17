@@ -1150,6 +1150,7 @@ async fn stream_llm_member(
     let mut stream = producer.produce_stream(node, inputs, ctx).await?;
 
     let mut content = String::new();
+    let mut reasoning_content = String::new();
     let mut tool_calls = ToolCallAccumulator::new();
     let mut finish_reason: Option<FinishReason> = None;
 
@@ -1176,6 +1177,9 @@ async fn stream_llm_member(
 
         if !content.is_empty() || !chunk.text_delta.is_empty() {
             content.push_str(&chunk.text_delta);
+        }
+        if let Some(reasoning) = &chunk.reasoning_delta {
+            reasoning_content.push_str(reasoning);
         }
         tool_calls.absorb(&chunk.tool_calls);
         if let Some(u) = chunk.usage.as_ref() {
@@ -1222,6 +1226,7 @@ async fn stream_llm_member(
         .unwrap_or_else(|| (*ctx.initial_envelope).clone());
     out.payload = FlowValue::Text(content.clone());
     let mut assistant = ChatMessage::assistant(content);
+    assistant.reasoning_content = (!reasoning_content.is_empty()).then_some(reasoning_content);
     let calls = tool_calls.finish();
     if !calls.is_empty() {
         assistant.tool_calls = Some(calls);
@@ -2141,10 +2146,9 @@ async fn finalize_streaming_flow(
         // pochłonięty wewnątrz bridge. Brak text_buf do append'u.
     } else {
         final_envelope.payload = FlowValue::Text(text_buf.clone());
-        final_envelope
-            .context
-            .messages
-            .push(ChatMessage::assistant(text_buf));
+        let mut assistant = ChatMessage::assistant(text_buf);
+        assistant.reasoning_content = (!reasoning_buf.is_empty()).then_some(reasoning_buf);
+        final_envelope.context.messages.push(assistant);
     }
 
     let producer_duration_ms = producer_attempt_started.elapsed().as_millis() as u64;
@@ -4406,6 +4410,7 @@ mod direct_execution_tests {
         async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
             Ok(LlmResponse {
                 content: self.content.clone(),
+                reasoning_content: None,
                 usage: self.usage.clone(),
                 finish_reason: FinishReason::Stop,
                 tool_calls: Vec::new(),

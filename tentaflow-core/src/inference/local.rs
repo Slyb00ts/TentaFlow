@@ -430,8 +430,8 @@ impl LocalInferenceHandler {
                 first_token_at = Some(Instant::now());
             }
             // Usage jedzie na tokenie finalnym z realnymi licznikami silnika; tym
-            // chunkiem token accounting (AiGateway) zlicza zużycie. Silniki nie
-            // raportujące liczb (np. MLX) dają 0 → pomijamy, by nie wpisywać zer.
+            // chunkiem token accounting (AiGateway) zlicza zużycie. Silnik, który
+            // liczb nie podał, daje 0 → pomijamy, by nie wpisywać zer.
             let usage =
                 if token.is_final && (token.prompt_tokens > 0 || token.completion_tokens > 0) {
                     Some(Usage {
@@ -465,20 +465,10 @@ impl LocalInferenceHandler {
                     .map(|t| now.duration_since(t).as_secs_f32())
                     .unwrap_or(0.0);
                 let prefill_secs = (ttft_ms as f32) / 1000.0;
-                let prefill_tps = if engine_prefill_tps > 0.0 {
-                    engine_prefill_tps
-                } else if prefill_secs > 0.0 {
-                    u.prompt_tokens as f32 / prefill_secs
-                } else {
-                    0.0
-                };
-                let decode_tps = if engine_completion_tps > 0.0 {
-                    engine_completion_tps
-                } else if decode_secs > 0.0 && u.completion_tokens > 1 {
-                    (u.completion_tokens - 1) as f32 / decode_secs
-                } else {
-                    0.0
-                };
+                let prefill_tps =
+                    super::prefill_tps(engine_prefill_tps, u.prompt_tokens, prefill_secs);
+                let decode_tps =
+                    super::decode_tps(engine_completion_tps, u.completion_tokens, decode_secs);
                 // total_ms: pełny czas od startu strumienia do tego (ostatniego
                 // przed usage) tokena. `now` zmierzony powyżej domyka okno.
                 let total_ms = now.duration_since(start).as_millis() as u32;

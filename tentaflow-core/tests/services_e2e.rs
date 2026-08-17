@@ -66,6 +66,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             // dgx_spark: brak ograniczen Spark dla testowego silnika
             dgx_spark: None,
             cluster_capable: None,
+            preset_only: None,
             cluster_launch: None,
             default_port: 0,
             api: ApiKind::OpenaiCompatible,
@@ -101,6 +102,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             speculator_repo: None,
             speculator_method: None,
             speculator_num_tokens: None,
+            sampling: None,
             vllm: None,
             quant_variants: vec![],
         }],

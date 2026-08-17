@@ -57,6 +57,7 @@ pub fn role_from_str(s: &str) -> ChatRole {
 pub struct EncodedMessage {
     role: &'static str,
     content: Option<String>,
+    reasoning_content: Option<String>,
     tool_calls: Option<String>,
     tool_call_id: Option<String>,
     name: Option<String>,
@@ -96,6 +97,7 @@ impl EncodedMessage {
         Ok(Self {
             role: role_to_str(msg.role),
             content,
+            reasoning_content: msg.reasoning_content.clone(),
             tool_calls,
             tool_call_id: msg.tool_call_id.clone(),
             name: msg.name.clone(),
@@ -109,6 +111,7 @@ impl EncodedMessage {
         NewConversationMessage {
             role: self.role,
             content: self.content.as_deref(),
+            reasoning_content: self.reasoning_content.as_deref(),
             tool_calls: self.tool_calls.clone(),
             tool_call_id: self.tool_call_id.as_deref(),
             name: self.name.as_deref(),
@@ -142,6 +145,7 @@ pub fn row_to_message(row: &DbConversationMessage) -> Result<ChatMessage> {
     Ok(ChatMessage {
         role: role_from_str(&row.role),
         content,
+        reasoning_content: row.reasoning_content.clone(),
         name: row.name.clone(),
         tool_call_id: row.tool_call_id.clone(),
         tool_calls,

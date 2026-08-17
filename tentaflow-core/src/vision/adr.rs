@@ -58,6 +58,16 @@ fn wczytaj_liste_adr() -> Vec<(String, String, String)> {
     }
 }
 
+/// Pary `(kemler, UN)` z listy ADR. Trening czytnika OCR generuje z nich wiersze
+/// syntetyczne, żeby model widział REALNE kombinacje z katalogu wdrożenia, a nie
+/// tylko losowe cyfry. Pusta lista = brak albo niepoprawny `adr-list.json`.
+pub fn pary_kemler_un() -> Vec<(String, String)> {
+    wczytaj_liste_adr()
+        .into_iter()
+        .map(|(kemler, un, _)| (kemler, un))
+        .collect()
+}
+
 /// Z listy linii OCR (posortowanych góra→dół) wyłuskuje numer UN (dolna 3-4
 /// cyfrowa grupa) i snapuje do `adr-list.json`. Górny wiersz (kemler) bierzemy
 /// z trafionego wpisu listy — OCR górnego rzędu bywa mylony, więc mu nie ufamy.

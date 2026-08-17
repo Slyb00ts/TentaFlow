@@ -1,0 +1,1101 @@
+/* =============================================================================
+   Code Studio — warstwa modułu nad shared/styles.css
+   Język wizualny: „konsola z duszą" — gęsty strumień zdarzeń jak w aplikacji
+   terminalowej, ale z pełną typografią, statusami i animacjami żywego procesu.
+   Animacje wzorowane na connection-overlay.css / update-overlay.css
+   (spring cubic-bezier(.34,1.56,.64,1), dotPulse, ringPulse) + flows-builder
+   (przepływ po krawędzi).
+   ============================================================================= */
+
+:root {
+  --cs-rail: 52px;
+  --cs-dock: 372px;
+  --cs-mono: 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+  --cs-run: #6366f1;      /* pracuje */
+  --cs-ask: #f59e0b;      /* czeka na Ciebie */
+  --cs-idle: #6a7196;     /* bezczynny */
+  --cs-ok: #22c55e;
+  --cs-err: #ef4444;
+  --spring: cubic-bezier(.34, 1.56, .64, 1);
+}
+
+/* ============================ POWŁOKA ==================================== */
+
+/* ---- Pełna wysokość okna w OBU układach ---------------------------------
+   Góra (pasek projektów / górny pasek) i dół (kompozytor, dolna nawigacja)
+   są przypięte; przewija się wyłącznie środek: strumień i ciało doku. */
+html, body { height: 100%; overflow: hidden; }
+.screen { height: 100%; display: flex; flex-direction: column; margin: 0; padding: 0; max-width: none; }
+.screen-header { flex: 0 0 auto; margin: 0; border-radius: 0; padding: 8px 16px; }
+.screen-header h2 { font-size: 15px; }
+.screen-header .desc { font-size: 11.5px; }
+.screen-frame {
+  flex: 1; min-height: 0; display: flex;
+  border-radius: 0; border-left: 0; border-right: 0; border-bottom: 0; box-shadow: none;
+}
+.app { flex: 1; min-height: 0; }
+.main { padding: 0; min-height: 0; overflow: hidden; display: flex; }
+
+.cs-shell {
+  display: grid;
+  grid-template-rows: auto 1fr;
+  flex: 1; min-height: 0; margin: 0;
+  position: relative;             /* kotwica dla arkusza i przyciemnienia */
+}
+
+/* Chrome telefonu nie istnieje na szerokim ekranie — inaczej arkusz
+   workspace'ów pozycjonuje się względem strony i zasłania widok. */
+.cs-mtop, .cs-mtabs, .cs-backchat, .cs-sheet, .cs-scrim { display: none; }
+
+/* ---- Pasek projektów (przełączanie + status) ---------------------------- */
+.cs-projects {
+  display: flex; align-items: stretch; gap: 6px;
+  padding: 8px 10px; background: var(--bg-2);
+  border-bottom: 1px solid var(--border);
+  overflow-x: auto; scrollbar-width: thin;
+}
+.cs-projects::-webkit-scrollbar { height: 4px; }
+.cs-projects::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+.cs-proj {
+  display: flex; align-items: center; gap: 9px;
+  padding: 7px 12px 7px 11px; border-radius: var(--radius);
+  border: 1px solid transparent; background: transparent;
+  cursor: pointer; white-space: nowrap; flex-shrink: 0;
+  transition: background .16s, border-color .16s, transform .16s;
+}
+.cs-proj:hover { background: var(--bg-card); border-color: var(--border); }
+.cs-proj.active {
+  background: var(--bg-card); border-color: var(--border-hover);
+  box-shadow: inset 0 -2px 0 0 var(--accent-1);
+}
+.cs-proj-name { font-size: 12.5px; font-weight: 700; color: var(--text); }
+.cs-proj.active .cs-proj-name { color: #fff; }
+.cs-proj-meta { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.cs-proj-txt { display: flex; flex-direction: column; gap: 1px; align-items: flex-start; }
+
+/* Kropka statusu — jeden słownik dla całego modułu */
+.cs-dot { width: 8px; height: 8px; border-radius: 50%; flex-shrink: 0; position: relative; }
+.cs-dot.run  { background: var(--cs-run);  animation: csDotRun 1.7s ease-in-out infinite; }
+.cs-dot.ask  { background: var(--cs-ask);  animation: csDotAsk 1.1s ease-in-out infinite; }
+.cs-dot.idle { background: var(--cs-idle); }
+.cs-dot.ok   { background: var(--cs-ok); }
+.cs-dot.err  { background: var(--cs-err);  animation: csDotErr 1.4s ease-in-out infinite; }
+@keyframes csDotRun {
+  0%   { box-shadow: 0 0 0 0 rgba(99,102,241,.55); }
+  60%  { box-shadow: 0 0 0 7px rgba(99,102,241,0); }
+  100% { box-shadow: 0 0 0 0 rgba(99,102,241,0); }
+}
+@keyframes csDotAsk {
+  0%,100% { box-shadow: 0 0 0 0 rgba(245,158,11,.65); transform: scale(1); }
+  50%     { box-shadow: 0 0 0 6px rgba(245,158,11,0); transform: scale(1.18); }
+}
+@keyframes csDotErr {
+  0%,100% { box-shadow: 0 0 0 0 rgba(239,68,68,.6); }
+  55%     { box-shadow: 0 0 0 7px rgba(239,68,68,0); }
+}
+
+/* Licznik nieprzeczytanych / pytań na kafelku projektu */
+.cs-proj-badge {
+  min-width: 17px; height: 17px; padding: 0 5px; border-radius: 9px;
+  background: var(--cs-ask); color: #1a1200; font-size: 10.5px; font-weight: 800;
+  display: inline-flex; align-items: center; justify-content: center;
+  animation: csBadgePop .34s var(--spring);
+}
+@keyframes csBadgePop { from { transform: scale(.4); opacity: 0; } to { transform: none; opacity: 1; } }
+
+.cs-proj-add {
+  display: flex; align-items: center; gap: 6px; padding: 7px 11px;
+  border: 1px dashed var(--border); border-radius: var(--radius);
+  color: var(--text-3); font-size: 12px; cursor: pointer; flex-shrink: 0;
+}
+.cs-proj-add:hover { color: var(--accent-2); border-color: var(--accent-1); }
+
+/* ---- Korpus: scena + dok ------------------------------------------------ */
+.cs-body { display: grid; grid-template-columns: 1fr var(--cs-dock); min-height: 0; overflow: hidden; }
+.cs-body.solo { grid-template-columns: 1fr; }
+
+/* ============================ SCENA ====================================== */
+
+.cs-stage {
+  display: flex; flex-direction: column; min-width: 0; min-height: 0;
+  border-right: 1px solid var(--border);
+  background:
+    radial-gradient(1100px 400px at 12% -12%, rgba(99,102,241,.07), transparent 70%),
+    var(--bg);
+}
+.cs-stage.split { display: grid; grid-template-columns: 1fr 1fr; }
+.cs-stage.split > .cs-lane + .cs-lane { border-left: 1px solid var(--border); }
+.cs-lane { display: flex; flex-direction: column; min-width: 0; min-height: 0; }
+
+.cs-stage-head {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 11px 16px; border-bottom: 1px solid var(--border);
+  background: rgba(10,13,36,.72); backdrop-filter: blur(8px);
+}
+.cs-stage-title { font-size: 13.5px; font-weight: 800; color: var(--text); }
+.cs-stage-sub { font-size: 11px; color: var(--text-3); font-family: var(--cs-mono); }
+.cs-stage-head .spacer { flex: 1; }
+
+/* Chip kontekstu (gałąź, tryb, autonomia) */
+.cs-chip {
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 3px 8px; border-radius: 20px; font-size: 10.5px; font-weight: 700;
+  background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border);
+  font-family: var(--cs-mono); white-space: nowrap;
+}
+.cs-chip .icon { width: 11px; height: 11px; }
+.cs-chip.accent { color: var(--accent-2); border-color: rgba(167,139,250,.35); background: rgba(167,139,250,.1); }
+.cs-chip.warn   { color: var(--cs-ask); border-color: rgba(245,158,11,.35); background: rgba(245,158,11,.1); }
+.cs-chip.ok     { color: var(--cs-ok); border-color: rgba(34,197,94,.3); background: rgba(34,197,94,.1); }
+.cs-chip.danger { color: var(--cs-err); border-color: rgba(239,68,68,.32); background: rgba(239,68,68,.1); }
+
+/* ---- Strumień zdarzeń -------------------------------------------------- */
+.cs-stream {
+  flex: 1; overflow-y: auto; padding: 16px 16px 8px;
+  display: flex; flex-direction: column; gap: 3px;
+  scrollbar-width: thin;
+}
+/* KLUCZOWE: w kolumnie flex o ograniczonej wysokości dzieci mają domyślne
+   flex-shrink:1, więc przeglądarka ŚCISKA każdą wiadomość i kartę w pionie —
+   teksty się urywają, a bloki dostają własne paski przewijania. Elementy
+   rozmowy mają zajmować tyle, ile mierzy ich treść; przewija się kontener. */
+.cs-stream > * { flex-shrink: 0; }
+.cs-stream::-webkit-scrollbar { width: 7px; }
+.cs-stream::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+/* Znacznik tury — cienka linia z etykietą */
+.cs-turn {
+  display: flex; align-items: center; gap: 10px; margin: 14px 0 8px;
+  font-size: 10px; text-transform: uppercase; letter-spacing: .12em;
+  color: var(--text-3); font-weight: 800;
+}
+.cs-turn::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* Wiersz zdarzenia — bazowy */
+.ev { animation: csEvIn .3s ease-out both; border-radius: 8px; }
+@keyframes csEvIn { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+/* Wiadomość użytkownika */
+.ev-user code {
+  font-family: var(--cs-mono); font-size: 12px; padding: 1px 5px; border-radius: 4px;
+  background: rgba(255,255,255,.18); color: #fff;
+}
+.ev-user {
+  align-self: flex-end; max-width: 78%; margin: 8px 0 10px;
+  padding: 10px 13px; border-radius: 12px 12px 3px 12px;
+  background: var(--gradient-accent); color: #fff;
+  font-size: 13px; line-height: 1.6; box-shadow: var(--shadow-sm);
+}
+
+/* Proza agenta */
+.ev-say {
+  padding: 4px 2px 10px; font-size: 13.5px; line-height: 1.7; color: var(--text);
+  max-width: 74ch;
+}
+.ev-say strong { color: #fff; }
+.ev-say code {
+  font-family: var(--cs-mono); font-size: 12px; padding: 1px 5px;
+  background: var(--bg-3); border: 1px solid var(--border); border-radius: 4px; color: var(--accent-2);
+}
+.cs-caret {
+  display: inline-block; width: 7px; height: 15px; vertical-align: -2px;
+  background: var(--accent-2); margin-left: 2px; animation: csCaret 1s steps(2) infinite;
+}
+@keyframes csCaret { 50% { opacity: 0; } }
+
+/* Rozumowanie — przygaszone, zwijalne */
+.ev-think {
+  padding: 3px 2px 7px; font-size: 12px; line-height: 1.6; color: var(--text-3);
+  font-style: italic; max-width: 74ch; border-left: 2px solid var(--border);
+  padding-left: 10px; margin: 2px 0 8px;
+}
+
+/* Wywołanie narzędzia — serce konsoli */
+.ev-tool {
+  display: flex; align-items: center; gap: 9px;
+  padding: 6px 10px; margin: 1px 0; position: relative; overflow: hidden;
+  border: 1px solid transparent; font-family: var(--cs-mono); font-size: 11.5px;
+  cursor: pointer; transition: background .15s, border-color .15s;
+}
+.ev-tool:hover { background: var(--bg-2); border-color: var(--border); }
+.ev-tool .t-ico {
+  width: 20px; height: 20px; border-radius: 5px; display: flex;
+  align-items: center; justify-content: center; flex-shrink: 0;
+  background: var(--bg-3); color: var(--text-2); border: 1px solid var(--border);
+}
+.ev-tool .t-ico .icon { width: 12px; height: 12px; }
+.ev-tool .t-name { color: var(--accent-2); font-weight: 700; }
+.ev-tool .t-arg  { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-tool .t-meta { margin-left: auto; color: var(--text-3); font-size: 10.5px; display: flex; align-items: center; gap: 8px; flex-shrink: 0; }
+
+.ev-tool.ok   .t-ico { color: var(--cs-ok); border-color: rgba(34,197,94,.28); background: rgba(34,197,94,.08); }
+.ev-tool.err  .t-ico { color: var(--cs-err); border-color: rgba(239,68,68,.3); background: rgba(239,68,68,.08); }
+.ev-tool.wait .t-ico { color: var(--cs-ask); border-color: rgba(245,158,11,.3); background: rgba(245,158,11,.08); }
+
+/* Narzędzie w trakcie — przesuwający się połysk + obracająca się ikona */
+.ev-tool.run { border-color: rgba(99,102,241,.3); background: rgba(99,102,241,.05); }
+.ev-tool.run .t-ico { color: var(--accent-1); border-color: rgba(99,102,241,.4); background: rgba(99,102,241,.12); }
+.ev-tool.run .t-ico .icon { animation: csSpin 1.1s linear infinite; }
+.ev-tool.run::after {
+  content: ''; position: absolute; inset: 0; pointer-events: none;
+  background: linear-gradient(90deg, transparent, rgba(99,102,241,.13), transparent);
+  transform: translateX(-100%); animation: csSweep 1.6s ease-in-out infinite;
+}
+@keyframes csSpin { to { transform: rotate(360deg); } }
+@keyframes csSweep { to { transform: translateX(100%); } }
+
+/* Znacznik zakończenia — sprężysty pop */
+.t-done { color: var(--cs-ok); animation: csPop .32s var(--spring) both; }
+@keyframes csPop { from { transform: scale(.3); opacity: 0; } to { transform: none; opacity: 1; } }
+
+/* Rozwinięcie narzędzia (wynik) */
+.ev-detail {
+  margin: 0 0 6px 30px; padding: 9px 12px; border-radius: 8px;
+  background: var(--bg-input); border: 1px solid var(--border);
+  font-family: var(--cs-mono); font-size: 11px; line-height: 1.65; color: var(--text-2);
+  white-space: pre-wrap; overflow-wrap: anywhere; animation: csEvIn .22s ease-out both;
+}
+.ev-detail .add { color: var(--cs-ok); }
+.ev-detail .del { color: var(--cs-err); }
+.ev-detail .dim { color: var(--text-3); }
+
+/* ---- Karta pytania do użytkownika (ask_user) --------------------------- */
+.ev-ask {
+  margin: 12px 0; border-radius: var(--radius-lg); overflow: hidden;
+  border: 1px solid rgba(245,158,11,.35); background: rgba(245,158,11,.05);
+  animation: csAskIn .4s var(--spring) both;
+  box-shadow: 0 0 0 0 rgba(245,158,11,.4);
+}
+@keyframes csAskIn { from { opacity: 0; transform: translateY(14px) scale(.97); } to { opacity: 1; transform: none; } }
+.ev-ask.pulse { animation: csAskIn .4s var(--spring) both, csAskGlow 2.6s ease-out 0.4s infinite; }
+@keyframes csAskGlow {
+  0%   { box-shadow: 0 0 0 0 rgba(245,158,11,.35); }
+  55%  { box-shadow: 0 0 0 10px rgba(245,158,11,0); }
+  100% { box-shadow: 0 0 0 0 rgba(245,158,11,0); }
+}
+.ev-ask-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  background: rgba(245,158,11,.1); border-bottom: 1px solid rgba(245,158,11,.2);
+  font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em;
+  color: var(--cs-ask);
+}
+.ev-ask-head .icon { width: 14px; height: 14px; }
+.ev-ask-head .who { margin-left: auto; text-transform: none; letter-spacing: 0; font-family: var(--cs-mono); font-weight: 600; color: var(--text-3); font-size: 10.5px; }
+.ev-ask-q { padding: 14px 14px 10px; font-size: 14px; line-height: 1.6; color: var(--text); font-weight: 600; }
+.ev-ask-opts { display: flex; flex-direction: column; gap: 7px; padding: 0 14px 12px; }
+.ev-ask-opt {
+  display: flex; align-items: flex-start; gap: 10px; padding: 10px 12px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-2);
+  cursor: pointer; transition: border-color .15s, background .15s, transform .12s;
+}
+.ev-ask-opt:hover { border-color: var(--accent-1); background: var(--bg-card); transform: translateX(2px); }
+.ev-ask-opt .k {
+  width: 19px; height: 19px; border-radius: 5px; flex-shrink: 0;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-3);
+  font-family: var(--cs-mono); font-size: 10.5px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+.ev-ask-opt:hover .k { color: #fff; border-color: var(--accent-1); background: var(--accent-1); }
+.ev-ask-opt .l { font-size: 12.5px; color: var(--text); font-weight: 600; }
+.ev-ask-opt .d { font-size: 11.5px; color: var(--text-3); margin-top: 2px; line-height: 1.5; }
+.ev-ask-own { padding: 0 14px 14px; }
+.ev-ask-own input {
+  width: 100%; padding: 9px 12px; border-radius: var(--radius);
+  background: var(--bg-input); border: 1px solid var(--border); color: var(--text);
+  font-family: inherit; font-size: 12.5px;
+}
+.ev-ask-own input:focus { outline: none; border-color: var(--accent-1); box-shadow: 0 0 0 3px var(--accent-glow); }
+.ev-ask-foot {
+  display: flex; align-items: center; gap: 8px; padding: 0 14px 13px;
+  font-size: 11px; color: var(--text-3);
+}
+
+/* ---- Karta subagenta w strumieniu -------------------------------------- */
+.ev-spawn {
+  display: flex; align-items: center; gap: 11px; margin: 8px 0;
+  padding: 10px 12px; border-radius: var(--radius);
+  border: 1px solid var(--border); background: var(--bg-2);
+  cursor: pointer; transition: border-color .16s, background .16s;
+}
+.ev-spawn:hover { border-color: var(--border-hover); background: var(--bg-card); }
+.ev-spawn .av {
+  width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--accent-2);
+}
+.ev-spawn .nm { font-size: 12.5px; font-weight: 700; color: var(--text); }
+.ev-spawn .ds { font-size: 11px; color: var(--text-3); margin-top: 1px; }
+.ev-spawn .go { margin-left: auto; color: var(--text-3); display: flex; align-items: center; gap: 6px; font-size: 11px; }
+
+/* ---- Karta przeglądu zmian --------------------------------------------- */
+.ev-patch {
+  margin: 12px 0; border-radius: var(--radius-lg); overflow: hidden;
+  border: 1px solid rgba(99,102,241,.32); background: rgba(99,102,241,.04);
+  animation: csAskIn .38s var(--spring) both;
+}
+.ev-patch-head {
+  display: flex; align-items: center; gap: 8px; padding: 10px 14px;
+  background: rgba(99,102,241,.1); border-bottom: 1px solid rgba(99,102,241,.2);
+  font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2);
+}
+.ev-patch-head .sum { margin-left: auto; font-family: var(--cs-mono); text-transform: none; letter-spacing: 0; font-weight: 600; }
+.ev-patch-files { padding: 8px 10px; display: flex; flex-direction: column; gap: 2px; }
+.pf {
+  display: flex; align-items: center; gap: 9px; padding: 6px 9px; border-radius: 7px;
+  font-family: var(--cs-mono); font-size: 11.5px; cursor: pointer;
+}
+.pf:hover { background: var(--bg-2); }
+.pf .st { width: 14px; text-align: center; font-weight: 800; }
+.pf .st.a { color: var(--cs-ok); }
+.pf .st.m { color: var(--cs-ask); }
+.pf .st.d { color: var(--cs-err); }
+.pf .p { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pf .n { margin-left: auto; color: var(--text-3); font-size: 10.5px; flex-shrink: 0; }
+.pf .n .plus { color: var(--cs-ok); }
+.pf .n .minus { color: var(--cs-err); }
+.ev-patch-foot { display: flex; gap: 8px; padding: 4px 14px 13px; align-items: center; }
+
+/* ---- Kompozytor -------------------------------------------------------- */
+.cs-composer { border-top: 1px solid var(--border); background: var(--bg-2); padding: 10px 14px 12px; }
+.cs-composer-box {
+  border: 1px solid var(--border); border-radius: var(--radius-lg);
+  background: var(--bg-input); transition: border-color .16s, box-shadow .16s;
+}
+.cs-composer-box:focus-within { border-color: var(--accent-1); box-shadow: 0 0 0 3px var(--accent-glow); }
+.cs-composer textarea {
+  width: 100%; border: 0; background: transparent; color: var(--text); resize: none;
+  padding: 11px 13px 4px; font-family: inherit; font-size: 13px; line-height: 1.6; outline: none;
+}
+.cs-composer-bar { display: flex; align-items: center; gap: 7px; padding: 4px 9px 8px; }
+.cs-composer-bar .spacer { flex: 1; }
+.cs-hint-keys { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+
+/* Pasek statusu pod kompozytorem — „co się teraz dzieje" */
+.cs-nowbar {
+  display: flex; align-items: center; gap: 8px; padding: 7px 14px;
+  border-top: 1px solid var(--border); background: rgba(99,102,241,.06);
+  font-size: 11.5px; color: var(--text-2); font-family: var(--cs-mono);
+}
+.cs-nowbar .icon { width: 13px; height: 13px; color: var(--accent-1); animation: csSpin 1.4s linear infinite; }
+.cs-nowbar .el { margin-left: auto; color: var(--text-3); }
+
+/* ============================ DOK ======================================== */
+
+.cs-dock { display: flex; flex-direction: column; min-width: 0; min-height: 0; background: var(--bg-2); }
+.cs-dock-tabs { display: flex; border-bottom: 1px solid var(--border); background: var(--bg-2); }
+.cs-dock-tab {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 9px 4px 8px; cursor: pointer; border-bottom: 2px solid transparent;
+  color: var(--text-3); font-size: 10px; font-weight: 700; transition: color .15s, border-color .15s;
+  position: relative;
+}
+.cs-dock-tab .icon { width: 15px; height: 15px; }
+.cs-dock-tab:hover { color: var(--text-2); }
+.cs-dock-tab.active { color: var(--accent-2); border-bottom-color: var(--accent-1); background: rgba(99,102,241,.06); }
+.cs-dock-tab .cnt {
+  position: absolute; top: 5px; right: 50%; margin-right: -20px;
+  min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2);
+  font-size: 9.5px; display: flex; align-items: center; justify-content: center;
+}
+.cs-dock-tab .cnt.hot { background: var(--cs-ask); color: #1a1200; border-color: transparent; }
+.cs-dock-body { flex: 1; overflow-y: auto; padding: 10px; scrollbar-width: thin; }
+.cs-dock-body::-webkit-scrollbar { width: 7px; }
+.cs-dock-body::-webkit-scrollbar-thumb { background: var(--border); border-radius: 4px; }
+
+.cs-dock-title {
+  font-size: 10px; text-transform: uppercase; letter-spacing: .11em; font-weight: 800;
+  color: var(--text-3); margin: 4px 2px 8px; display: flex; align-items: center; gap: 7px;
+}
+.cs-dock-title::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+/* ---- Karta subagenta w doku -------------------------------------------- */
+.sa {
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card);
+  padding: 10px 11px; margin-bottom: 8px; cursor: pointer; position: relative; overflow: hidden;
+  transition: border-color .16s, transform .16s, box-shadow .16s;
+}
+.sa:hover { border-color: var(--border-hover); transform: translateY(-1px); box-shadow: var(--shadow-sm); }
+.sa.focused { border-color: var(--accent-1); box-shadow: 0 0 0 1px var(--accent-1), var(--glow-indigo); }
+/* Lewy pasek postępu — „płynie" gdy agent pracuje (jak krawędź we flow builderze) */
+.sa.run::before {
+  content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px;
+  background: linear-gradient(180deg, transparent, var(--accent-1), transparent);
+  background-size: 100% 200%; animation: csFlow 1.5s linear infinite;
+}
+@keyframes csFlow { from { background-position: 0 200%; } to { background-position: 0 -200%; } }
+.sa.ok::before  { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--cs-ok); }
+.sa.ask::before { content: ''; position: absolute; left: 0; top: 0; bottom: 0; width: 2px; background: var(--cs-ask); }
+
+.sa-head { display: flex; align-items: center; gap: 8px; }
+.sa-av {
+  width: 26px; height: 26px; border-radius: 7px; flex-shrink: 0;
+  display: flex; align-items: center; justify-content: center;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--accent-2);
+}
+.sa-av .icon { width: 13px; height: 13px; }
+.sa-nm { font-size: 12.5px; font-weight: 700; color: var(--text); }
+.sa-role { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.sa-head .cs-dot { margin-left: auto; }
+.sa-now {
+  margin-top: 8px; padding: 6px 8px; border-radius: 6px; background: var(--bg-input);
+  border: 1px solid var(--border); font-family: var(--cs-mono); font-size: 10.5px;
+  color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.sa-foot { display: flex; align-items: center; gap: 10px; margin-top: 8px; font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.sa-foot .sep { width: 3px; height: 3px; border-radius: 50%; background: var(--text-3); }
+/* Mini pasek iteracji */
+.sa-bar { height: 3px; border-radius: 2px; background: var(--bg-3); overflow: hidden; margin-top: 8px; }
+.sa-bar i { display: block; height: 100%; background: var(--gradient-accent); border-radius: 2px; transition: width .4s ease; }
+
+/* ---- Drzewo plików ----------------------------------------------------- */
+.ft { font-family: var(--cs-mono); font-size: 11.5px; user-select: none; }
+.ft-row {
+  display: flex; align-items: center; gap: 6px; padding: 4px 7px; border-radius: 6px;
+  color: var(--text-2); cursor: pointer; white-space: nowrap;
+}
+.ft-row:hover { background: var(--bg-3); color: var(--text); }
+.ft-row.active { background: rgba(99,102,241,.14); color: #fff; }
+.ft-row .icon { width: 13px; height: 13px; flex-shrink: 0; color: var(--text-3); }
+.ft-row.active .icon { color: var(--accent-2); }
+.ft-row .chev { width: 11px; height: 11px; transition: transform .16s; }
+.ft-row.open .chev { transform: rotate(90deg); }
+.ft-row .badge {
+  margin-left: auto; font-size: 9.5px; padding: 0 5px; border-radius: 8px;
+  background: rgba(245,158,11,.16); color: var(--cs-ask); font-weight: 700;
+}
+.ft-row .badge.a { background: rgba(34,197,94,.16); color: var(--cs-ok); }
+.ft-ind { padding-left: 14px; border-left: 1px solid var(--border); margin-left: 12px; }
+
+/* ---- Git --------------------------------------------------------------- */
+.git-branch {
+  display: flex; align-items: center; gap: 8px; padding: 9px 11px; border-radius: var(--radius);
+  background: var(--bg-card); border: 1px solid var(--border); margin-bottom: 10px;
+}
+.git-branch .b { font-family: var(--cs-mono); font-size: 12px; color: var(--accent-2); font-weight: 700; }
+.git-branch .ahead { margin-left: auto; font-family: var(--cs-mono); font-size: 10.5px; color: var(--text-3); }
+.git-commit {
+  display: flex; gap: 9px; padding: 8px 4px; border-bottom: 1px solid var(--border);
+}
+.git-commit:last-child { border-bottom: 0; }
+.git-commit .gnode { display: flex; flex-direction: column; align-items: center; padding-top: 3px; }
+.git-commit .gdot { width: 8px; height: 8px; border-radius: 50%; border: 2px solid var(--accent-1); background: var(--bg-2); }
+.git-commit .gline { flex: 1; width: 1px; background: var(--border); margin-top: 2px; }
+.git-commit .gmsg { font-size: 12px; color: var(--text); line-height: 1.45; }
+.git-commit .gmeta { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); margin-top: 3px; }
+.git-commit.head .gdot { background: var(--accent-1); box-shadow: 0 0 0 3px var(--accent-glow); }
+
+/* ---- Diff -------------------------------------------------------------- */
+.diff { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; background: var(--bg-input); }
+.diff-head {
+  display: flex; align-items: center; gap: 8px; padding: 7px 10px;
+  background: var(--bg-3); border-bottom: 1px solid var(--border);
+  font-family: var(--cs-mono); font-size: 11px; color: var(--text-2);
+}
+.diff-head .n { margin-left: auto; font-size: 10px; }
+.diff-body { font-family: var(--cs-mono); font-size: 11px; line-height: 1.7; overflow-x: auto; }
+.dl { display: flex; padding: 0 8px; white-space: pre; }
+.dl .ln { width: 34px; flex-shrink: 0; color: var(--text-3); text-align: right; padding-right: 10px; opacity: .7; }
+.dl.add { background: rgba(34,197,94,.09); color: #b7f0c9; box-shadow: inset 2px 0 0 var(--cs-ok); animation: csDiffIn .3s ease-out both; }
+.dl.del { background: rgba(239,68,68,.09); color: #ffc9c9; box-shadow: inset 2px 0 0 var(--cs-err); }
+.dl.ctx { color: var(--text-2); }
+@keyframes csDiffIn { from { opacity: 0; transform: translateX(-6px); } to { opacity: 1; transform: none; } }
+
+/* ---- Edytor kodu ------------------------------------------------------- */
+.cs-editor { display: flex; flex-direction: column; min-height: 0; flex: 1; }
+.cs-editor-tabs { display: flex; gap: 1px; background: var(--bg-2); border-bottom: 1px solid var(--border); overflow-x: auto; }
+.cs-etab {
+  display: flex; align-items: center; gap: 7px; padding: 8px 13px;
+  font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-3);
+  border-right: 1px solid var(--border); cursor: pointer; white-space: nowrap;
+}
+.cs-etab:hover { color: var(--text-2); background: var(--bg-3); }
+.cs-etab.active { color: var(--text); background: var(--bg); border-bottom: 1px solid var(--bg); margin-bottom: -1px; }
+.cs-etab .dirty { width: 6px; height: 6px; border-radius: 50%; background: var(--cs-ask); }
+.cs-code { flex: 1; overflow: auto; background: var(--bg); font-family: var(--cs-mono); font-size: 12px; line-height: 1.65; padding: 10px 0; }
+.cl { display: flex; padding: 0 12px; white-space: pre; }
+.cl:hover { background: rgba(255,255,255,.02); }
+.cl .ln { width: 36px; flex-shrink: 0; color: var(--text-3); text-align: right; padding-right: 14px; opacity: .55; user-select: none; }
+.cl.hi { background: rgba(99,102,241,.09); box-shadow: inset 2px 0 0 var(--accent-1); }
+/* Kolorowanie składni */
+.tk { color: #c792ea; } .tf { color: #82aaff; } .ts { color: #c3e88d; }
+.tc { color: #5c6584; font-style: italic; } .tn { color: #f78c6c; } .tt { color: #ffcb6b; }
+.tp { color: #89ddff; }
+
+/* ---- Terminal ---------------------------------------------------------- */
+.cs-term {
+  background: #05070f; border: 1px solid var(--border); border-radius: var(--radius);
+  padding: 10px 12px; font-family: var(--cs-mono); font-size: 11px; line-height: 1.7;
+  color: #cdd6f4; overflow-x: auto;
+}
+.cs-term .pr { color: var(--cs-ok); }
+.cs-term .wr { color: var(--cs-ask); }
+.cs-term .er { color: var(--cs-err); }
+.cs-term .dm { color: var(--text-3); }
+
+/* ============================ MOBILE ===================================== */
+
+.cs-mob { display: none; }
+.phone {
+  width: 390px; border-radius: 28px; border: 1px solid var(--border-hover);
+  background: var(--bg); overflow: hidden; box-shadow: var(--shadow-lg);
+  display: flex; flex-direction: column; height: 780px; position: relative;
+}
+.phone-notch { height: 26px; background: var(--bg-2); display: flex; align-items: center; justify-content: center; }
+.phone-notch i { width: 96px; height: 6px; border-radius: 4px; background: var(--bg-3); display: block; }
+.phone-grid { display: flex; gap: 22px; flex-wrap: wrap; justify-content: center; }
+.phone-cap { text-align: center; font-size: 12px; color: var(--text-2); margin-top: 10px; font-weight: 700; }
+.phone-cap span { display: block; font-size: 11px; color: var(--text-3); font-weight: 500; margin-top: 2px; }
+
+.mtop {
+  display: flex; align-items: center; gap: 9px; padding: 10px 13px;
+  border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.mtop .nm { font-size: 13px; font-weight: 800; color: var(--text); }
+.mtop .sub { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.mtop .sp { flex: 1; }
+.mbody { flex: 1; overflow-y: auto; padding: 12px; }
+.mtabs {
+  display: flex; border-top: 1px solid var(--border); background: var(--bg-2);
+  padding-bottom: 6px;
+}
+.mtab {
+  flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+  padding: 9px 2px 5px; color: var(--text-3); font-size: 9.5px; font-weight: 700; position: relative;
+}
+.mtab .icon { width: 18px; height: 18px; }
+.mtab.active { color: var(--accent-2); }
+.mtab.active::before {
+  content: ''; position: absolute; top: 0; left: 22%; right: 22%; height: 2px;
+  background: var(--gradient-accent); border-radius: 0 0 3px 3px;
+}
+.mtab .cnt {
+  position: absolute; top: 5px; right: 50%; margin-right: -18px;
+  min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px;
+  background: var(--cs-ask); color: #1a1200; font-size: 9.5px; font-weight: 800;
+  display: flex; align-items: center; justify-content: center;
+}
+
+/* Arkusz przełączania projektów (mobile) */
+.msheet {
+  position: absolute; left: 0; right: 0; bottom: 0; z-index: 5;
+  background: var(--bg-2); border-top: 1px solid var(--border-hover);
+  border-radius: 18px 18px 0 0; padding: 8px 10px 14px;
+  box-shadow: 0 -12px 40px rgba(0,0,0,.6); animation: csSheetIn .32s var(--spring) both;
+}
+@keyframes csSheetIn { from { transform: translateY(100%); } to { transform: none; } }
+.msheet-grab { width: 40px; height: 4px; border-radius: 3px; background: var(--bg-3); margin: 4px auto 12px; }
+.msheet-item {
+  display: flex; align-items: center; gap: 10px; padding: 11px 10px; border-radius: var(--radius);
+}
+.msheet-item.active { background: var(--bg-card); }
+.msheet-item .nm { font-size: 13px; font-weight: 700; color: var(--text); }
+.msheet-item .sub { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.msheet-item .st { margin-left: auto; font-size: 10.5px; font-family: var(--cs-mono); color: var(--text-3); }
+
+/* ============ PYTANIE AGENTA WEWNĄTRZ KOMPOZYTORA ======================== */
+/* Zasada: odpowiada się TAM, gdzie się pisze. Pytanie nie jest kartą gubiącą
+   się w historii, tylko przejmuje pole wejściowe — na desktopie i na telefonie
+   tak samo. W strumieniu zostaje tylko krótki znacznik. */
+
+.cs-composer.asking {
+  border-top: 1px solid rgba(245,158,11,.45);
+  background: linear-gradient(180deg, rgba(245,158,11,.07), var(--bg-2) 60%);
+}
+.cs-answer {
+  border: 1px solid rgba(245,158,11,.4); border-radius: var(--radius-lg);
+  background: var(--bg-2); margin-bottom: 8px; overflow: hidden;
+  animation: csAskIn .38s var(--spring) both;
+}
+.cs-answer-head {
+  display: flex; align-items: center; gap: 8px; padding: 8px 11px;
+  background: rgba(245,158,11,.11); border-bottom: 1px solid rgba(245,158,11,.2);
+  font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: .09em;
+  color: var(--cs-ask); cursor: pointer;
+}
+.cs-answer-head .who {
+  margin-left: auto; text-transform: none; letter-spacing: 0; font-weight: 600;
+  font-family: var(--cs-mono); color: var(--text-3); font-size: 10px;
+}
+/* Chevron i licznik opcji są potrzebne tylko tam, gdzie opcje się chowają
+   (telefon) — na desktopie byłyby martwą kontrolką. */
+.cs-answer-head .chev,
+.cs-answer-head .optn { display: none; }
+.cs-answer-q { padding: 11px 12px 9px; font-size: 13.5px; line-height: 1.55; color: var(--text); font-weight: 600; }
+.cs-answer-opts {
+  display: flex; flex-direction: column; gap: 6px; padding: 0 10px 10px;
+  max-height: 38dvh; overflow-y: auto; scrollbar-width: thin;
+}
+.cs-answer-opt {
+  display: flex; align-items: flex-start; gap: 10px; padding: 9px 11px; width: 100%;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--bg-card);
+  cursor: pointer; text-align: left; font-family: inherit;
+  transition: border-color .15s, background .15s, transform .12s;
+}
+.cs-answer-opt:hover { border-color: var(--cs-ask); background: var(--bg-card-hover); transform: translateX(2px); }
+.cs-answer-opt .k {
+  width: 20px; height: 20px; border-radius: 6px; flex-shrink: 0;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-3);
+  font-family: var(--cs-mono); font-size: 11px; font-weight: 700;
+  display: flex; align-items: center; justify-content: center;
+}
+.cs-answer-opt:hover .k { background: var(--cs-ask); color: #1a1200; border-color: transparent; }
+.cs-answer-opt .l { font-size: 12.5px; color: var(--text); font-weight: 600; display: block; }
+.cs-answer-opt .d { font-size: 11px; color: var(--text-3); margin-top: 2px; line-height: 1.5; display: block; }
+
+/* Znacznik w strumieniu — kotwica, nie karta */
+.ev-askmark {
+  display: flex; align-items: center; gap: 9px; margin: 10px 0;
+  padding: 9px 12px; border-radius: var(--radius);
+  border: 1px solid rgba(245,158,11,.3); border-left-width: 3px;
+  background: rgba(245,158,11,.06); cursor: pointer;
+  font-size: 12px; color: var(--text-2);
+}
+.ev-askmark:hover { background: rgba(245,158,11,.1); }
+.ev-askmark .q { color: var(--text); font-weight: 600; }
+.ev-askmark .go { margin-left: auto; color: var(--cs-ask); font-weight: 700; font-size: 11px; white-space: nowrap; }
+.ev-askmark .cs-dot { flex-shrink: 0; }
+
+/* ==================== PLIKI: drzewo + podgląd ============================ */
+.cs-files { display: flex; flex-direction: column; min-height: 0; }
+.cs-file-head { display: none; }
+.cs-file-view { display: flex; flex-direction: column; min-height: 0; }
+.cs-file-view .cs-editor { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; }
+.cs-file-view .cs-code { max-height: 320px; }
+/* Na desktopie drzewo stoi NAD podglądem (w DOM jest niżej, bo na telefonie
+   staje się szufladą pozycjonowaną absolutnie — tam kolejność nie ma znaczenia). */
+.cs-tree-panel { min-height: 0; order: -1; max-height: 300px; overflow-y: auto; margin-bottom: 10px; }
+.cs-tree-close { display: none; }
+
+/* ==================== CHROME MOBILNY (w realnym ekranie) ================== */
+
+/* Górny pasek: przycisk workspace + tytuł sesji. Na desktopie ukryty. */
+.cs-mtop { display: none; }
+.cs-wsbtn {
+  display: flex; align-items: center; gap: 8px; padding: 6px 10px 6px 9px;
+  border-radius: 20px; border: 1px solid var(--border); background: var(--bg-card);
+  color: var(--text); font-family: inherit; font-size: 12.5px; font-weight: 700;
+  cursor: pointer; max-width: 62%; min-width: 0;
+}
+.cs-wsbtn .nm { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cs-wsbtn .chev { width: 13px; height: 13px; color: var(--text-3); flex-shrink: 0; }
+.cs-wsbtn .cs-proj-badge { margin-left: 1px; }
+
+/* Dolny pasek nawigacji — przypięty; przełącza widok POWYŻEJ siebie. */
+.cs-mtabs { display: none; }
+
+/* Skrót powrotu do rozmowy z agentem głównym */
+.cs-backchat { display: none; }
+
+/* Arkusz wyboru workspace — zjeżdża OD GÓRY, bo przycisk który go otwiera
+   też jest u góry. Wysuwanie od dołu zmuszało do wędrówki kciukiem przez cały
+   ekran między kliknięciem a wyborem. */
+.cs-sheet {
+  position: absolute; left: 0; right: 0; top: 0; z-index: 30;
+  background: var(--bg-2); border-bottom: 1px solid var(--border-hover);
+  border-radius: 0 0 18px 18px; padding: 8px 10px 6px;
+  box-shadow: 0 16px 44px rgba(0,0,0,.65);
+  max-height: 80dvh; overflow-y: auto;
+  transform: translateY(-101%); transition: transform .3s var(--spring);
+}
+.cs-sheet.open { transform: none; }
+.cs-sheet-grab { width: 40px; height: 4px; border-radius: 3px; background: var(--bg-3); margin: 10px auto 2px; }
+.cs-sheet-item {
+  display: flex; align-items: center; gap: 10px; padding: 11px 10px; border-radius: var(--radius);
+  cursor: pointer;
+}
+.cs-sheet-item:hover { background: var(--bg-3); }
+.cs-sheet-item.active { background: var(--bg-card); box-shadow: inset 2px 0 0 var(--accent-1); }
+.cs-sheet-item .nm { font-size: 13px; font-weight: 700; color: var(--text); }
+.cs-sheet-item .sub { font-size: 10.5px; color: var(--text-3); font-family: var(--cs-mono); }
+.cs-sheet-item .st { margin-left: auto; font-size: 10.5px; font-family: var(--cs-mono); color: var(--text-3); }
+.cs-scrim {
+  position: absolute; inset: 0; z-index: 29; background: rgba(3,5,15,.6);
+  opacity: 0; pointer-events: none; transition: opacity .25s;
+}
+.cs-sheet.open ~ .cs-scrim, .cs-scrim.open { opacity: 1; pointer-events: auto; }
+
+/* ==================== PRZEŁĄCZANIE PANELI DOKU =========================== */
+/* Jeden mechanizm dla obu układów: atrybut data-dock na .cs-shell decyduje,
+   który panel doku jest widoczny. Na wąskim ekranie data-view decyduje
+   dodatkowo, czy widać scenę, czy dok. */
+.cs-dock-pane { display: none; }
+.cs-shell[data-dock="agenci"]   .cs-dock-pane[data-pane="agenci"],
+.cs-shell[data-dock="pliki"]    .cs-dock-pane[data-pane="pliki"],
+.cs-shell[data-dock="zmiany"]   .cs-dock-pane[data-pane="zmiany"],
+.cs-shell[data-dock="git"]      .cs-dock-pane[data-pane="git"],
+.cs-shell[data-dock="terminal"] .cs-dock-pane[data-pane="terminal"] { display: block; }
+
+/* ==================== UKŁAD WĄSKI (telefon / wąskie okno) ================ */
+
+@media (max-width: 1180px) {
+  .cs-body { grid-template-columns: 1fr 320px; }
+  .cs-stage.split { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 900px) {
+  /* Pełna wysokość przez jawny łańcuch — żadnego zgadywania calc(). Makieta
+     schodzi z drogi całkowicie: chcemy widzieć aplikację, nie ramkę. */
+  .screen-header { display: none; }        /* chrome makiety znika całkowicie */
+  .screen-frame { border: 0; }
+  .app { grid-template-columns: 1fr; }
+  .app > .sidebar { display: none; }
+  .cs-shell { grid-template-rows: auto 1fr auto; overflow: hidden; }
+  .cs-sheet, .cs-scrim { display: block; }
+
+  /* Poziomy pasek projektów znika — zastępuje go przycisk u góry. */
+  .cs-projects { display: none; }
+
+  .cs-mtop {
+    display: flex; align-items: center; gap: 9px; padding: 8px 11px;
+    border-bottom: 1px solid var(--border); background: var(--bg-2); min-width: 0;
+  }
+  .cs-mtop .ttl { min-width: 0; flex: 1; }
+  .cs-mtop .ttl .t1 { display: block; font-size: 12px; font-weight: 700; color: var(--text);
+                      overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .cs-mtop .ttl .t2 { display: block; font-size: 10px; color: var(--text-3); font-family: var(--cs-mono); }
+
+  /* Jedna kolumna: albo scena, albo dok — nigdy jedno pod drugim. */
+  .cs-body { grid-template-columns: 1fr; grid-template-rows: 1fr; min-height: 0; }
+  .cs-stage { border-right: 0; min-height: 0; }
+  .cs-dock { min-height: 0; }
+  /* Zakładki doku są na desktopie u góry — na telefonie zastępuje je dolny pasek. */
+  .cs-dock-tabs { display: none; }
+  .cs-dock-body { padding: 10px 11px 12px; }
+
+  /* Nagłówek sceny znika na telefonie — jego treść jest już w górnym pasku,
+     a każdy zabrany wiersz to wiersz mniej rozmowy. */
+  .cs-stage-head { display: none; }
+  .cs-stream { padding: 12px 11px 6px; }
+  .ev-say, .ev-think { max-width: none; }
+  .ev-say { font-size: 13.5px; }
+  .ev-user { max-width: 88%; font-size: 13px; }
+  .cs-composer { padding: 8px 11px 10px; }
+  .cs-nowbar { font-size: 10.5px; padding: 6px 11px; }
+
+  /* Wywołanie narzędzia łamie się na dwie linie zamiast urywać argument
+     wielokropkiem — na wąskim ekranie sama nazwa narzędzia nic nie mówi. */
+  .ev-tool { flex-wrap: wrap; row-gap: 2px; padding: 6px 8px; }
+  .ev-tool .t-arg { flex-basis: 100%; padding-left: 29px; white-space: normal; word-break: break-word; }
+  .ev-tool .t-meta { margin-left: auto; }
+  .ev-detail { margin-left: 8px; font-size: 10.5px; }
+
+  /* Pytanie jest ZAWSZE widoczne razem z opcjami — aktywne pytanie nie może
+     mieć stanu ukrytego. Opcje to jeden przewijalny w poziomie rząd chipów:
+     kosztuje ~48 px zamiast ~290 px, więc rozmowie zostaje ok. 60% ekranu.
+     Pływający panel nad kompozytorem został usunięty — potrafił wylądować
+     pod treścią, a i tak wymagał rozwijania. */
+  .cs-composer { position: relative; }
+  .cs-answer-head .chev { display: block; }
+  .cs-answer-head .optn {
+    display: inline-flex; align-items: center; justify-content: center;
+    min-width: 16px; height: 16px; padding: 0 5px; border-radius: 8px;
+    background: rgba(245,158,11,.2); color: var(--cs-ask);
+    font-family: var(--cs-mono); font-size: 9.5px; font-weight: 800;
+  }
+  .cs-answer-head .who { display: none; }
+  .cs-answer-q {
+    padding: 9px 11px; font-size: 13px;
+    display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; overflow: hidden;
+  }
+  .cs-answer.expanded .cs-answer-q { -webkit-line-clamp: unset; }
+  .cs-answer.expanded .cs-answer-head .chev { transform: rotate(180deg); }
+
+  /* Domyślnie: chipy w jednym rzędzie, przewijane poziomo, zawsze widoczne. */
+  .cs-answer-opts {
+    display: flex; flex-direction: row; gap: 7px;
+    position: static; max-height: none;
+    overflow-x: auto; overflow-y: hidden; scrollbar-width: none;
+    padding: 0 10px 10px; -webkit-overflow-scrolling: touch;
+  }
+  .cs-answer-opts::-webkit-scrollbar { display: none; }
+  .cs-answer-opt {
+    flex: 0 0 auto; flex-direction: row; align-items: center; gap: 8px;
+    padding: 9px 13px; min-height: 44px; white-space: nowrap;
+  }
+  .cs-answer-opt .l { font-size: 12px; }
+  .cs-answer-opt .d { display: none; }
+
+  /* Chevron rozwija OPISY — ale w układzie, a nie nad nim: karty wracają do
+     pionu, dostają limit wysokości i własne przewijanie. */
+  .cs-answer.expanded .cs-answer-opts {
+    flex-direction: column; overflow-x: hidden; overflow-y: auto; max-height: 32dvh;
+  }
+  .cs-answer.expanded .cs-answer-opts { padding-bottom: 10px; }
+  .cs-answer.expanded .cs-answer-opt { white-space: normal; align-items: flex-start; padding: 11px; }
+  .cs-answer.expanded .cs-answer-opt .d { display: block; }
+
+  /* Cień przy prawej krawędzi mówi, że rząd chipów jedzie dalej */
+  .cs-answer { position: relative; }
+  .cs-answer:not(.expanded)::after {
+    content: ''; position: absolute; right: 0; bottom: 10px; width: 28px; height: 44px;
+    background: linear-gradient(90deg, transparent, var(--bg-2)); pointer-events: none;
+  }
+
+  /* Pasek kompozytora: zostaje spinacz, tryb i wysyłka — podpowiedź klawisza
+     i słowo „Tryb" to na 390 px czysta strata miejsca. */
+  .cs-composer-bar .cs-hint-keys { display: none; }
+  .cs-composer-bar .btn-ghost span { display: none; }
+  .ev-patch-files { padding: 6px 6px 2px; }
+  .pf { font-size: 11px; }
+
+  /* ---- Pliki: podgląd na cały ekran, drzewo jako szuflada z prawej ---- */
+
+  .cs-files { flex: 1; min-height: 0; position: relative; }
+  .cs-file-head {
+    display: flex; align-items: center; gap: 9px; padding: 8px 11px;
+    border-bottom: 1px solid var(--border); background: var(--bg-2); flex-shrink: 0;
+  }
+  .cs-file-head .path {
+    font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-2);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
+    direction: rtl; text-align: left;      /* przy obcinaniu zostaje nazwa pliku, nie sam katalog */
+  }
+  .cs-file-head .btn { flex-shrink: 0; }
+  .cs-file-head .cs-chip { flex-shrink: 0; }
+  .cs-file-view { flex: 1; min-height: 0; }
+  .cs-file-view .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
+  .cs-file-view .cs-code { flex: 1; min-height: 0; max-height: none; font-size: 12px; }
+  .cs-tree-panel { order: 0; max-height: none; margin-bottom: 0; }
+
+  /* Szuflada: wysuwa się z prawej, chowa po wybraniu pliku */
+  .cs-tree-panel {
+    position: absolute; top: 0; right: 0; bottom: 0; z-index: 15; width: 78%; max-width: 320px;
+    background: var(--bg-2); border-left: 1px solid var(--border-hover);
+    box-shadow: -14px 0 40px rgba(0,0,0,.6); padding: 8px 10px 12px;
+    overflow-y: auto; transform: translateX(101%); transition: transform .28s var(--spring);
+  }
+  .cs-files.tree-open .cs-tree-panel { transform: none; }
+  .cs-tree-close {
+    display: flex; align-items: center; gap: 6px; width: 100%; justify-content: flex-end;
+    background: none; border: 0; color: var(--text-3); font-family: inherit; font-size: 11px;
+    padding: 4px 2px 8px; cursor: pointer;
+  }
+  .cs-tree-scrim {
+    position: absolute; inset: 0; z-index: 14; background: rgba(3,5,15,.55);
+    opacity: 0; pointer-events: none; transition: opacity .25s;
+  }
+  .cs-files.tree-open .cs-tree-scrim { opacity: 1; pointer-events: auto; }
+  .ft-row { padding: 8px 7px; }        /* wygodniejszy cel dotyku */
+
+  .cs-term { border: 0; border-radius: 0; flex: 1; min-height: 0; overflow: auto; font-size: 11px; }
+
+  /* Dolny pasek — przypięty, przełącza widok nad sobą */
+  .cs-mtabs {
+    display: flex; border-top: 1px solid var(--border); background: var(--bg-2);
+    padding-bottom: env(safe-area-inset-bottom, 0px);
+  }
+  .cs-mtab {
+    flex: 1; display: flex; flex-direction: column; align-items: center; gap: 3px;
+    padding: 8px 2px 7px; color: var(--text-3); font-size: 9.5px; font-weight: 700;
+    position: relative; cursor: pointer; background: none; border: 0; font-family: inherit;
+    min-height: 46px;                      /* wygodny cel dotyku */
+  }
+  .cs-mtab .icon { width: 18px; height: 18px; }
+  .cs-mtab.active { color: var(--accent-2); }
+  .cs-mtab.active::before {
+    content: ''; position: absolute; top: 0; left: 24%; right: 24%; height: 2px;
+    background: var(--gradient-accent); border-radius: 0 0 3px 3px;
+    animation: csTabIn .28s var(--spring) both;
+  }
+  @keyframes csTabIn { from { transform: scaleX(.2); opacity: 0; } to { transform: none; opacity: 1; } }
+  .cs-mtab .cnt {
+    position: absolute; top: 4px; right: 50%; margin-right: -19px;
+    min-width: 15px; height: 15px; padding: 0 4px; border-radius: 8px;
+    background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2);
+    font-size: 9.5px; display: flex; align-items: center; justify-content: center;
+  }
+  .cs-mtab .cnt.hot { background: var(--cs-ask); color: #1a1200; border-color: transparent; }
+
+  /* Skrót „wróć do agenta głównego" — pływa nad treścią, gdy jesteś gdzie indziej */
+  .cs-shell:not([data-view="konsola"]) .cs-backchat {
+    display: inline-flex; align-items: center; gap: 7px;
+    position: absolute; right: 12px; bottom: calc(56px + env(safe-area-inset-bottom, 0px));
+    z-index: 20; padding: 9px 14px 9px 11px; border-radius: 22px;
+    background: var(--gradient-accent); color: #fff; border: 0; cursor: pointer;
+    font-family: inherit; font-size: 12px; font-weight: 700;
+    box-shadow: 0 6px 20px rgba(99,102,241,.45);
+    animation: csFabIn .3s var(--spring) both;
+  }
+  .cs-backchat .icon { width: 14px; height: 14px; }
+  @keyframes csFabIn { from { transform: translateY(14px) scale(.85); opacity: 0; } to { transform: none; opacity: 1; } }
+  /* Gdy agent czeka na odpowiedź, skrót się dopomina */
+  .cs-shell[data-ask="1"]:not([data-view="konsola"]) .cs-backchat {
+    background: var(--cs-ask); color: #1a1200; box-shadow: 0 6px 20px rgba(245,158,11,.5);
+    animation: csFabIn .3s var(--spring) both, csFabNudge 2.4s ease-in-out .4s infinite;
+  }
+  @keyframes csFabNudge {
+    0%,88%,100% { transform: none; }
+    92% { transform: translateY(-4px); }
+    96% { transform: translateY(-2px); }
+  }
+}
+
+@media (max-width: 420px) {
+  .cs-mtab { font-size: 9px; }
+  .cs-stage-head .cs-chip { font-size: 9.5px; padding: 2px 6px; }
+  .ev-tool { font-size: 10.5px; gap: 7px; padding: 5px 7px; }
+  .ev-detail { margin-left: 16px; font-size: 10px; }
+}
+
+/* ============================ DROBIAZGI ================================== */
+
+.cs-empty {
+  display: flex; flex-direction: column; align-items: center; justify-content: center;
+  gap: 10px; padding: 40px 20px; text-align: center; color: var(--text-3);
+}
+.cs-empty .icon { width: 30px; height: 30px; opacity: .5; }
+.cs-empty p { font-size: 12px; max-width: 240px; line-height: 1.6; }
+
+.cs-legend { display: flex; gap: 14px; flex-wrap: wrap; padding: 10px 14px; font-size: 11px; color: var(--text-3); }
+.cs-legend span { display: inline-flex; align-items: center; gap: 6px; }
+
+.kbd {
+  font-family: var(--cs-mono); font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  background: var(--bg-3); border: 1px solid var(--border); color: var(--text-2);
+}
+
+/* =========================================================================
+   SCENA JAKO GŁÓWNE OKNO TREŚCI
+   Dok jest nawigatorem (spisy: subagenci, drzewo, lista zmian, git), a to,
+   co wybierzesz, otwiera się w scenie — 372-pikselowa kolumna to za mało na
+   czytanie kodu, diffa czy terminala.
+   ========================================================================= */
+
+.cs-stage-tabs {
+  display: flex; align-items: stretch; gap: 1px; flex-shrink: 0;
+  background: var(--bg-2); border-bottom: 1px solid var(--border);
+  overflow-x: auto; scrollbar-width: none;
+}
+.cs-stage-tabs::-webkit-scrollbar { display: none; }
+.cs-stab {
+  display: flex; align-items: center; gap: 7px; padding: 8px 13px;
+  background: transparent; border: 0; border-right: 1px solid var(--border);
+  color: var(--text-3); font-family: inherit; font-size: 12px; font-weight: 600;
+  cursor: pointer; white-space: nowrap; position: relative;
+  transition: color .15s, background .15s;
+}
+.cs-stab:hover { color: var(--text-2); background: var(--bg-3); }
+.cs-stab.active { color: #fff; background: var(--bg); }
+.cs-stab.active::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: var(--gradient-accent);
+}
+.cs-stab .icon { width: 13px; height: 13px; }
+.cs-stab .x { color: var(--text-3); opacity: .6; margin-left: 2px; }
+.cs-stab .x:hover { opacity: 1; color: var(--cs-err); }
+.cs-stab .mono { font-family: var(--cs-mono); font-size: 11.5px; }
+
+/* Pasek zakładek jest spisem otwartych rzeczy AKTUALNEJ kategorii doku:
+   na subagentach widać subagentów, na plikach pliki, na terminalu sesje. */
+.cs-tabgroup { display: none; align-items: stretch; gap: 1px; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.cs-tabgroup::-webkit-scrollbar { display: none; }
+.cs-shell[data-dock="agenci"]   .cs-tabgroup[data-tabs="agenci"],
+.cs-shell[data-dock="pliki"]    .cs-tabgroup[data-tabs="pliki"],
+.cs-shell[data-dock="zmiany"]   .cs-tabgroup[data-tabs="zmiany"],
+.cs-shell[data-dock="git"]      .cs-tabgroup[data-tabs="git"],
+.cs-shell[data-dock="terminal"] .cs-tabgroup[data-tabs="terminal"] { display: flex; }
+
+/* Powrót do rozmowy — przypięty do prawej krawędzi paska, jak skrót na telefonie */
+.cs-tab-home {
+  flex-shrink: 0;
+  display: flex; align-items: center; gap: 7px; padding: 8px 14px;
+  background: transparent; border: 0; border-right: 1px solid var(--border);
+  color: var(--text-3); font-family: inherit; font-size: 12px; font-weight: 700;
+  cursor: pointer; white-space: nowrap; position: relative; transition: color .15s, background .15s;
+}
+.cs-tab-home:hover { color: var(--text); background: var(--bg-3); }
+.cs-shell[data-stage="konsola"] .cs-tab-home { color: #fff; background: var(--bg); }
+.cs-shell[data-stage="konsola"] .cs-tab-home::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px; background: var(--gradient-accent);
+}
+/* Gdy agent czeka na odpowiedź, powrót do konsoli się dopomina */
+.cs-shell[data-ask="1"]:not([data-stage="konsola"]) .cs-tab-home {
+  color: var(--cs-ask); background: rgba(245,158,11,.08);
+}
+
+/* Panele sceny — widoczny dokładnie jeden */
+.cs-spane { display: none; flex-direction: column; flex: 1; min-height: 0; }
+.cs-shell[data-stage="konsola"]  .cs-spane[data-spane="konsola"],
+.cs-shell[data-stage="plik"]     .cs-spane[data-spane="plik"],
+.cs-shell[data-stage="zmiany"]   .cs-spane[data-spane="zmiany"],
+.cs-shell[data-stage="terminal"] .cs-spane[data-spane="terminal"],
+.cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"],
+.cs-shell[data-stage="commit"]   .cs-spane[data-spane="commit"] { display: flex; }
+
+/* Pasek nad treścią w scenie (ścieżka pliku, podsumowanie diffa, akcje) */
+.cs-pane-head {
+  display: flex; align-items: center; gap: 10px; flex-shrink: 0;
+  padding: 9px 14px; border-bottom: 1px solid var(--border); background: rgba(10,13,36,.6);
+}
+.cs-pane-head .path {
+  font-family: var(--cs-mono); font-size: 12px; color: var(--text-2);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
+  direction: rtl; text-align: left;
+}
+.cs-pane-head .spacer { flex: 1; }
+.cs-pane-body { flex: 1; min-height: 0; overflow: auto; }
+.cs-pane-foot {
+  display: flex; align-items: center; gap: 8px; flex-shrink: 0;
+  padding: 10px 14px; border-top: 1px solid var(--border); background: var(--bg-2);
+}
+
+/* W scenie kod i terminal wypełniają okno, a nie sztuczny limit doku */
+.cs-spane .cs-editor { flex: 1; min-height: 0; border: 0; border-radius: 0; }
+.cs-spane .cs-code { flex: 1; min-height: 0; max-height: none; font-size: 12.5px; }
+.cs-spane .cs-term { flex: 1; min-height: 0; border: 0; border-radius: 0; font-size: 12px; }
+.cs-spane .diff { border: 0; border-radius: 0; }
+.cs-spane .diff-body { font-size: 12px; }
+
+/* Nawigator: wiersz spisu w doku */
+.nav-row {
+  display: flex; align-items: center; gap: 9px; padding: 8px 9px; border-radius: 7px;
+  cursor: pointer; font-family: var(--cs-mono); font-size: 11.5px; color: var(--text-2);
+}
+.nav-row:hover { background: var(--bg-3); color: var(--text); }
+.nav-row.active { background: rgba(99,102,241,.14); color: #fff; }
+.nav-row .n { margin-left: auto; font-size: 10.5px; flex-shrink: 0; }
+
+@media (max-width: 900px) {
+  /* Zakładki sceny znikają — steruje nimi dolny pasek */
+  .cs-stage-tabs { display: none; }
+
+  /* Widoki treściowe pokazują scenę, spisowe — dok */
+  .cs-shell[data-view="agenci"] .cs-stage,
+  .cs-shell[data-view="git"] .cs-stage { display: none; }
+  .cs-shell[data-view="konsola"] .cs-dock,
+  .cs-shell[data-view="pliki"] .cs-dock,
+  .cs-shell[data-view="zmiany"] .cs-dock,
+  .cs-shell[data-view="terminal"] .cs-dock { display: none; }
+  .cs-shell[data-view="agenci"] .cs-dock,
+  .cs-shell[data-view="git"] .cs-dock { display: flex; }
+
+  /* …ale przy treści dok wraca jako szuflada nawigatora z PRAWEJ, wywoływana
+     przyciskiem stojącym też po prawej. Jedna mechanika dla drzewa, listy
+     zmian i terminala. */
+  .cs-shell.nav-open[data-view="pliki"] .cs-dock,
+  .cs-shell.nav-open[data-view="zmiany"] .cs-dock,
+  .cs-shell.nav-open[data-view="terminal"] .cs-dock {
+    display: flex; position: absolute; top: 0; bottom: 0; right: 0; z-index: 16;
+    width: 82%; max-width: 320px;
+    border-left: 1px solid var(--border-hover); box-shadow: -14px 0 40px rgba(0,0,0,.6);
+    animation: csNavIn .28s var(--spring) both;
+  }
+  @keyframes csNavIn { from { transform: translateX(101%); } to { transform: none; } }
+  .cs-nav-scrim {
+    display: none; position: absolute; inset: 0; z-index: 15; background: rgba(3,5,15,.55);
+  }
+  .cs-shell.nav-open .cs-nav-scrim { display: block; }
+
+  .cs-pane-head { padding: 8px 11px; }
+  .cs-pane-foot { padding: 9px 11px; }
+  .cs-spane .cs-code, .cs-spane .diff-body, .cs-spane .cs-term { font-size: 11.5px; }
+}
+
+/* ---- Okno kreatora ------------------------------------------------------
+   Reguła żyła dotąd tylko w projekty.css, którego ten zestaw nie ładuje —
+   bez niej klasa .wizard nic nie robiła i szerokość trzeba było wpisywać inline. */
+.window.wizard { width: min(880px, 94%); }
+.screen-frame .window { max-height: none; }
+@media (max-width: 900px) { .window, .window.wizard { width: 96%; } }

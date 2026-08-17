@@ -6,19 +6,12 @@
 # kernel on a dequantized cache" while restoring the bandwidth win.
 
 from std.memory import bitcast
-from std.sys import inlined_assembly
+from src.arch_dot import f8e4m3x2_to_f16x2
 
 comptime WARP_SIZE = 32
 
 
-def _e4m3x2_to_f16x2(lo: UInt8, hi: UInt8) -> SIMD[DType.float16, 2]:
-    pair = inlined_assembly[
-        "cvt.rn.f16x2.e4m3x2 $0, $1;",
-        UInt32,
-        constraints="=r,h",
-        has_side_effect=False,
-    ](UInt16(UInt32(lo) | (UInt32(hi) << 8)))
-    return bitcast[DType.float16, 2](pair)
+comptime _e4m3x2_to_f16x2 = f8e4m3x2_to_f16x2
 
 
 def kv_frag_f32[kv_dtype: DType, epl: Int](
@@ -54,15 +47,14 @@ def kv_row8_f16[kv_dtype: DType](
 
     comptime if kv_dtype == DType.float8_e4m3fn:
         raw = ptr.bitcast[UInt16]().load[width=4, alignment=8]()
-        var pairs = SIMD[DType.uint32, 4](0)
+        var out = SIMD[DType.float16, 8](0)
 
         comptime for j in range(4):
-            pairs[j] = inlined_assembly[
-                "cvt.rn.f16x2.e4m3x2 $0, $1;",
-                UInt32,
-                constraints="=r,h",
-                has_side_effect=False,
-            ](raw[j])
-        return bitcast[DType.float16, 8](pairs)
+            pair = f8e4m3x2_to_f16x2(
+                UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8)
+            )
+            out[2 * j] = pair[0]
+            out[2 * j + 1] = pair[1]
+        return out
     else:
         return ptr.load[width=8, alignment=16]().cast[DType.float16]()

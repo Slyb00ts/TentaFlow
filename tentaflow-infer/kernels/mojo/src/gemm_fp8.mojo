@@ -15,9 +15,10 @@
 # (the shim ptxas_fp8_shim.sh does the same for `mojo run` JIT). Ada fp8 tensor
 # cores are hardware-valid at 8.4; this only lifts an emitter version cap.
 
+from std.math import exp
 from std.gpu import block_dim, block_idx, thread_idx
 from std.gpu.sync import barrier
-from std.gpu.memory import AddressSpace
+from std.gpu.memory import AddressSpace, external_memory
 from std.memory import bitcast, stack_allocation
 from std.gpu.compute.mma import ld_matrix
 from std.sys import _RegisterPackType
@@ -281,3 +282,79 @@ def gemm_fp8_impl[BM: Int, BN: Int, NW: Int](
 comptime gemm_fp8_f16 = gemm_fp8_impl[128, 64, 8]
 comptime gemm_fp8_f16_bm64 = gemm_fp8_impl[64, 64, 8]
 comptime gemm_fp8_f16_big = gemm_fp8_impl[128, 128, 16]
+
+
+def silu_mul_quant_fp8(
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xs: UnsafePointer[Float32, MutAnyOrigin],
+    gate: UnsafePointer[Float16, MutAnyOrigin],
+    up: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    """SwiGLU + kwantyzacja per token w JEDNYM przejsciu przez HBM.
+
+    Rozdzielnie kosztowalo trzy przejscia po buforze posrednim [T, n_cols]:
+    `silu_mul` czytal gate i up i zapisywal wynik, a `quantize_act_fp8` czytal
+    ten wynik dwa razy — raz na absmax, raz na kodowanie. Tutaj `silu(gate)*up`
+    liczymy RAZ do pamieci wspoldzielonej i uzywamy do obu przebiegow, wiec z
+    HBM idzie tylko odczyt gate i up oraz zapis kodow.
+
+    Blok na token, redukcja absmax po K. Wymaga n_cols * 2 B pamieci
+    wspoldzielonej (dla 11264 kolumn to 22 KiB, mieszczace sie w limicie).
+    """
+    tok = Int(block_idx.x)
+    if tok >= n_tokens:
+        return
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    base = tok * n_cols
+
+    var stage = external_memory[
+        Float16, address_space = AddressSpace.SHARED, alignment=16
+    ]()
+
+    var local: Float32 = 0.0
+    var c = tid
+    while c < n_cols:
+        g = Float32(gate[base + c])
+        v = (g / (1.0 + exp(-g))) * Float32(up[base + c])
+        stage[c] = Float16(v)
+        a = abs(v)
+        if a > local:
+            local = a
+        c += nthreads
+
+    red = stack_allocation[
+        1024, Float32, address_space = AddressSpace.SHARED
+    ]()
+    red[tid] = local
+    barrier()
+    var stride = nthreads // 2
+    while stride > 0:
+        if tid < stride:
+            if red[tid + stride] > red[tid]:
+                red[tid] = red[tid + stride]
+        barrier()
+        stride //= 2
+
+    var amax = red[0]
+    barrier()
+    if amax == 0.0:
+        if tid == 0:
+            xs[tok] = 0.0
+        var z = tid
+        while z < n_cols:
+            xq[base + z] = 0
+            z += nthreads
+        return
+
+    var scale = amax / E4M3_MAX
+    var inv = E4M3_MAX / amax
+    if tid == 0:
+        xs[tok] = scale
+    var q = tid
+    while q < n_cols:
+        e = Scalar[DType.float8_e4m3fn](Float32(stage[q]) * inv)
+        xq[base + q] = bitcast[DType.int8, 1](e)
+        q += nthreads

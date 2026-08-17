@@ -357,17 +357,16 @@ fn main() {
 
 /// Compiles the fused-preprocess CUDA kernels (`cuda/crop_resize_normalize.cu`
 /// and `cuda/nv12_to_rgb_resize_normalize.cu`) into static libs in OUT_DIR via
-/// nvcc and emits the link flags for them + the CUDA runtime. Gated on the
-/// vision-gpu AND supertonic features (the only consumer is the ort device
-/// tensor path in `vision::gpu_preprocess`), so a default / non-GPU build never
-/// invokes nvcc. `--fmad=false` keeps the kernel's f64 sampling math bit-for-bit
-/// with the CPU `resize_rgb` (an FMA-contracted `(d+0.5)*scale-0.5` rounds
-/// differently and could flip a Q8 boundary weight).
+/// nvcc i emituje flagi linkera dla bibliotek oraz runtime CUDA. Jawna funkcja
+/// `vision-cuda-preprocess` włącza tę ścieżkę, więc buildy AMD/Intel nie wywołują
+/// nvcc. `--fmad=false` zachowuje zgodność obliczeń próbkowania f64 z CPU
+/// `resize_rgb` (kontrakcja FMA może zmienić zaokrąglenie na granicy Q8).
 fn compile_cuda_preprocess(out_dir: &Path) {
     let target_os = std::env::var("CARGO_CFG_TARGET_OS");
     let want = matches!(target_os.as_deref(), Ok("linux" | "windows"))
         && std::env::var_os("CARGO_FEATURE_INFERENCE_VISION_GPU").is_some()
-        && std::env::var_os("CARGO_FEATURE_INFERENCE_SUPERTONIC").is_some();
+        && std::env::var_os("CARGO_FEATURE_VISION_ORT").is_some()
+        && std::env::var_os("CARGO_FEATURE_VISION_CUDA_PREPROCESS").is_some();
     if !want {
         return;
     }
@@ -1397,6 +1396,10 @@ mod services_manifest_build {
         /// Mirror of runtime `Engine.cluster_launch` ("ray" default / "vllm-mp").
         #[serde(default)]
         pub cluster_launch: Option<String>,
+        /// Mirror of runtime `Engine.preset_only` — katalog chowa karte takiego
+        /// silnika i pokazuje wylacznie jego kafelki modeli.
+        #[serde(default)]
+        pub preset_only: Option<bool>,
         pub default_port: u16,
         pub api: ApiKind,
         pub version: String,
@@ -1524,6 +1527,7 @@ mod services_manifest_build {
         Embedded,
         Binary,
         PythonBundle,
+        ManagedCli,
     }
 
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1582,6 +1586,11 @@ mod services_manifest_build {
         pub speculator_method: Option<String>,
         #[serde(default)]
         pub speculator_num_tokens: Option<u32>,
+        /// Mirror `ModelPreset::sampling` — bez tego pola serde po cichu gubi
+        /// blok `[model_preset.sampling]`, a runtime czyta manifesty wlasnie
+        /// z JSON-a generowanego tutaj.
+        #[serde(default)]
+        pub sampling: Option<SamplingDefaults>,
         /// Plik checkpointu image-gen (ComfyUI) pobierany z `repo` przy deployu.
         /// Mirror `ModelPreset::checkpoint_file` z `services/manifest/types.rs`.
         #[serde(default)]
@@ -1599,6 +1608,19 @@ mod services_manifest_build {
         pub repo: String,
         #[serde(default)]
         pub display_name: Option<String>,
+    }
+
+    /// Mirror `manifest::types::SamplingDefaults`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct SamplingDefaults {
+        #[serde(default)]
+        pub temperature: Option<f64>,
+        #[serde(default)]
+        pub top_p: Option<f64>,
+        #[serde(default)]
+        pub top_k: Option<i64>,
+        #[serde(default)]
+        pub min_p: Option<f64>,
     }
 
     // Single source of truth for the three wire-string allow-lists is
@@ -1686,6 +1708,18 @@ mod services_manifest_build {
                         errors.push(format!(
                             "engine '{}': deploy.native.runtime = python-bundle wymaga \
                              pola bundle_path (i nie moze miec feature_flag/binary_path)",
+                            eid
+                        ));
+                    }
+                }
+                NativeRuntime::ManagedCli => {
+                    if n.binary_path.is_none()
+                        || n.feature_flag.is_some()
+                        || n.bundle_path.is_some()
+                    {
+                        errors.push(format!(
+                            "engine '{}': deploy.native.runtime = managed-cli wymaga pola \
+                             binary_path (i nie moze miec feature_flag/bundle_path)",
                             eid
                         ));
                     }

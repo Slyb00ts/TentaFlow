@@ -1492,7 +1492,10 @@ fn start_job(
         return;
     }
 
+    let vocab = unsafe { sys::llama_model_get_vocab(model) };
+    let n_vocab = unsafe { sys::llama_vocab_n_tokens(vocab) };
     let sampler = match build_sampler_chain(
+        n_vocab,
         request.sampling.repeat_penalty,
         request.sampling.top_k,
         request.sampling.top_p,

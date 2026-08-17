@@ -16,7 +16,7 @@ use cudarc::driver::safe::{CudaContext, CudaEvent, CudaStream};
 use cudarc::driver::{result, sys, DriverError};
 use forge_types::{DeviceCaps, ForgeError, MemKind, Result, Vendor};
 
-use crate::arena::{BumpArena, RingArena, SlabArena, ALLOC_ALIGN};
+use crate::arena::{BumpArena, RingArena, SlabArena};
 use crate::{
     BufferImpl, DevBuffer, Device, Event, EventImpl, ExecGraph, GraphImpl, KernelHandle,
     KernelImpl, LaunchArgs, LaunchConfig, Module, ModuleImpl, Pool, Stream, StreamImpl,
@@ -25,46 +25,9 @@ use crate::{
 fn cu_err(context: &str, err: DriverError) -> ForgeError {
     ForgeError::Device(format!("{context}: {err}"))
 }
-
-/// Explicit byte budgets for the three VRAM pools. Constructing a
-/// `CudaDevice` claims exactly these amounts up front.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct PoolSizes {
-    pub weights: usize,
-    pub kv_cache: usize,
-    /// Slab granularity of the KV pool; KV allocations round up to pages.
-    pub kv_page_size: usize,
-    pub activations: usize,
-}
-
-impl PoolSizes {
-    /// Default KV page: 256 KiB holds a 16-token page of a 7B-class layer's
-    /// K+V in fp16 with headroom, while keeping free-list churn negligible.
-    pub const DEFAULT_KV_PAGE: usize = 256 * 1024;
-
-    /// Opt-in sizing from currently free VRAM: claims 90% of `free_bytes`,
-    /// split 60/30/10 between weights, KV cache and activations.
-    pub fn auto_from_free(free_bytes: usize) -> Self {
-        let budget = free_bytes / 10 * 9;
-        let weights = align_down(budget / 10 * 6);
-        let kv_cache = align_down(budget / 10 * 3);
-        let activations = align_down(budget - weights - kv_cache);
-        Self {
-            weights,
-            kv_cache,
-            kv_page_size: Self::DEFAULT_KV_PAGE,
-            activations,
-        }
-    }
-
-    fn total(&self) -> usize {
-        self.weights + self.kv_cache + self.activations
-    }
-}
-
-fn align_down(bytes: usize) -> usize {
-    bytes / ALLOC_ALIGN * ALLOC_ALIGN
-}
+// `PoolSizes` żyje w lib.rs, żeby dzielili je oba backendy GPU; re-eksport
+// utrzymuje istniejące ścieżki `forge_hal::cuda::PoolSizes`.
+pub use crate::PoolSizes;
 
 // --- Pools ----------------------------------------------------------------------
 
@@ -97,8 +60,7 @@ impl CudaPool {
         let base = if capacity == 0 {
             0
         } else {
-            unsafe { result::malloc_sync(capacity) }
-                .map_err(|e| cu_err("cuMemAlloc pool", e))?
+            unsafe { result::malloc_sync(capacity) }.map_err(|e| cu_err("cuMemAlloc pool", e))?
         };
         Ok(Arc::new(Self {
             ctx: ctx.clone(),
@@ -135,6 +97,15 @@ enum Backing {
         ctx: Arc<CudaContext>,
         dptr: sys::CUdeviceptr,
     },
+    /// Okno wewnątrz innej alokacji; zatrzymuje ją, ale niczego nie zwalnia.
+    Borrowed {
+        ctx: Arc<CudaContext>,
+        /// Trzymany wyłącznie po to, żeby rodzic przeżył pod-bufor.
+        #[allow(dead_code)]
+        parent: Arc<dyn BufferImpl>,
+        dptr: u64,
+        hptr: Option<*mut u8>,
+    },
 }
 
 struct CudaBuffer {
@@ -149,6 +120,7 @@ impl CudaBuffer {
             Backing::Pooled { pool, .. } => &pool.ctx,
             Backing::Pinned { ctx, .. } => ctx,
             Backing::Managed { ctx, .. } => ctx,
+            Backing::Borrowed { ctx, .. } => ctx,
         }
     }
 }
@@ -174,6 +146,7 @@ impl BufferImpl for CudaBuffer {
             // the device-visible address on every 64-bit CUDA platform.
             Backing::Pinned { ptr, .. } => *ptr as u64,
             Backing::Managed { dptr, .. } => *dptr,
+            Backing::Borrowed { dptr, .. } => *dptr,
         }
     }
 
@@ -182,6 +155,7 @@ impl BufferImpl for CudaBuffer {
             Backing::Pooled { .. } => None,
             Backing::Pinned { ptr, .. } => Some(*ptr as *mut u8),
             Backing::Managed { dptr, .. } => Some(*dptr as *mut u8),
+            Backing::Borrowed { hptr, .. } => *hptr,
         }
     }
 
@@ -217,6 +191,7 @@ impl Drop for CudaBuffer {
                 let _ = ctx.bind_to_thread();
                 let _ = unsafe { result::memory_free(*dptr) };
             }
+            Backing::Borrowed { .. } => {}
         }
     }
 }
@@ -301,7 +276,7 @@ struct CudaModuleImpl {
 }
 
 impl ModuleImpl for CudaModuleImpl {
-    fn kernel(&self, name: &str) -> Result<KernelHandle> {
+    fn kernel(self: Arc<Self>, name: &str) -> Result<KernelHandle> {
         self.raw
             .ctx
             .bind_to_thread()
@@ -337,6 +312,21 @@ unsafe impl Sync for CudaKernelImpl {}
 impl KernelImpl for CudaKernelImpl {
     fn name(&self) -> &str {
         &self.name
+    }
+
+    fn max_block_threads(&self) -> Option<u32> {
+        let mut value: i32 = 0;
+        let status = unsafe {
+            sys::cuFuncGetAttribute(
+                &mut value,
+                sys::CUfunction_attribute_enum::CU_FUNC_ATTRIBUTE_MAX_THREADS_PER_BLOCK,
+                self.func,
+            )
+        };
+        if status != sys::CUresult::CUDA_SUCCESS {
+            return None;
+        }
+        u32::try_from(value).ok().filter(|threads| *threads > 0)
     }
 
     fn as_any(&self) -> &dyn Any {
@@ -401,17 +391,20 @@ impl CudaDevice {
     pub fn new(ordinal: usize, pools: PoolSizes) -> Result<Arc<Self>> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx
-            .mem_get_info()
-            .map_err(|e| cu_err("cuMemGetInfo", e))?;
-        if pools.total() > free {
+        let (free, _total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let requested = pools.total()?;
+        if requested > free {
             return Err(ForgeError::OutOfMemory {
-                requested: pools.total(),
+                requested,
                 available: free,
             });
         }
         let caps = detect_caps(&ctx)?;
-        let weights = CudaPool::new(&ctx, pools.weights, PoolArena::Bump(BumpArena::new(pools.weights)))?;
+        let weights = CudaPool::new(
+            &ctx,
+            pools.weights,
+            PoolArena::Bump(BumpArena::new(pools.weights)),
+        )?;
         let kv_cache = CudaPool::new(
             &ctx,
             pools.kv_cache,
@@ -437,9 +430,7 @@ impl CudaDevice {
     pub fn with_default_pools(ordinal: usize) -> Result<Arc<Self>> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx
-            .mem_get_info()
-            .map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let (free, _total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
         Self::new(ordinal, PoolSizes::auto_from_free(free))
     }
 
@@ -450,15 +441,26 @@ impl CudaDevice {
             .map_err(|e| cu_err("cuMemGetInfo", e))
     }
 
-    /// Free VRAM in bytes without retaining a device — for sizing pools before
-    /// the arenas (which grab their whole budget up front) are created.
+    /// Memory an arena may claim, without retaining a device — for sizing pools
+    /// before the arenas (which grab their whole budget up front) are created.
+    ///
+    /// On an integrated device the GPU's memory IS the host's, so the free
+    /// figure counts memory the kernel still needs; asking for all of it fails
+    /// the allocation outright. GB10 measured: 127,6 GB total, ~124 GB free,
+    /// and a 122 GB pool is refused where 100 GB is granted — hence the eighth
+    /// left to the host, which no discrete card gives up.
     pub fn free_vram(ordinal: usize) -> Result<usize> {
         let ctx = CudaContext::new(ordinal)
             .map_err(|e| cu_err(&format!("CudaContext::new({ordinal})"), e))?;
-        let (free, _total) = ctx
-            .mem_get_info()
-            .map_err(|e| cu_err("cuMemGetInfo", e))?;
-        Ok(free)
+        let (free, total) = ctx.mem_get_info().map_err(|e| cu_err("cuMemGetInfo", e))?;
+        let integrated = ctx
+            .attribute(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_INTEGRATED)
+            .map_err(|e| cu_err("cuDeviceGetAttribute", e))?
+            != 0;
+        Ok(match integrated {
+            true => free.saturating_sub(total / 8),
+            false => free,
+        })
     }
 
     fn pool(&self, pool: Pool) -> &Arc<CudaPool> {
@@ -490,6 +492,53 @@ impl CudaDevice {
     }
 }
 
+// Blackwell splits into two lines that do NOT share the tensor-core ISA, and
+// the compute capability alone does not say which one a device is on: sm_100
+// and sm_103 are the datacenter parts, sm_120 and sm_121 the consumer ones.
+// Established by assembling each instruction with `ptxas` and reading the SASS
+// back with `nvdisasm`; see docs/PLAN_ARCHITEKTURA.md.
+//
+// Probe against the ARCHITECTURE-SPECIFIC target (`sm_121a`, not `sm_121`).
+// These are arch-specific instructions: the plain target refuses lines the `a`
+// target assembles, so a probe against it reports "unsupported" for a part that
+// supports the instruction — which is exactly how the NVFP4 entry below came to
+// claim the opposite of the truth for two Blackwell lines.
+
+/// Block-scaled FP4 MMA with UE8M0 scales — MXFP4. Present on both Blackwell
+/// lines; accepted by `ptxas` on sm_121a.
+fn mxf4_block_scale(sm: i32) -> bool {
+    sm >= 100
+}
+
+/// Block-scaled FP4 MMA with E4M3 scales — NVFP4 computed natively. Present on
+/// both Blackwell lines, exactly like the UE8M0 variant above.
+///
+/// This said "datacenter only" and was WRONG. `ptxas` from CUDA 13.0 assembles
+/// `mma.sync.aligned.m16n8k64.row.col.kind::mxf4nvf4.block_scale.scale_vec::4X
+/// .f32.e2m1.e2m1.f32.ue4m3` for sm_121a and sm_120a, and `nvdisasm` shows it
+/// reaching SASS as `OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X`. The negative control
+/// holds: the same assembler refuses `tcgen05.alloc` on sm_121a by name, so it
+/// does reject what the part cannot do.
+///
+/// What produced the wrong conclusion is that these are ARCHITECTURE-SPECIFIC
+/// instructions: `sm_121` refuses the same line that `sm_121a` accepts. A probe
+/// against the plain target reports "unsupported" for a part that supports it.
+fn nvf4_block_scale(sm: i32) -> bool {
+    sm >= 100
+}
+
+/// Warp-group MMA, the core of FlashAttention-3. Hopper-only architecture-
+/// specific instruction; rejected on sm_121a.
+fn wgmma_available(sm: i32) -> bool {
+    sm == 90
+}
+
+/// Fifth-generation tensor-core instruction plus tensor memory, the core of
+/// FlashAttention-4. Datacenter Blackwell only; rejected on sm_121a.
+fn tcgen05_available(sm: i32) -> bool {
+    (100..120).contains(&sm)
+}
+
 fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
     let name = ctx.name().map_err(|e| cu_err("cuDeviceGetName", e))?;
     let (major, minor) = ctx
@@ -500,14 +549,13 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
         ctx.attribute(a)
             .map_err(|e| cu_err("cuDeviceGetAttribute", e))
     };
-    let max_shared_mem_per_block = attr(
-        sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN,
-    )? as usize;
+    let max_shared_mem_per_block =
+        attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_SHARED_MEMORY_PER_BLOCK_OPTIN)?
+            as usize;
     let max_threads_per_block =
         attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MAX_THREADS_PER_BLOCK)? as u32;
     let warp_size = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_WARP_SIZE)? as u32;
-    let sm_count =
-        attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
+    let sm_count = attr(sys::CUdevice_attribute::CU_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT)? as u32;
     let supports_p2p = detect_p2p(ctx)?;
     Ok(DeviceCaps {
         name,
@@ -518,11 +566,14 @@ fn detect_caps(ctx: &Arc<CudaContext>) -> Result<DeviceCaps> {
         max_threads_per_block,
         warp_size,
         sm_count,
-        // FP8 matmul is native from Ada (sm_89); FP4 tensor cores from
-        // Blackwell (sm_100). Below those, NVFP4/FP8 take the software
-        // fused-dequant path.
+        // FP8 matmul is native from Ada (sm_89). Below it, FP8 takes the
+        // software fused-dequant path.
         fp8_native: sm >= 89,
-        fp4_native: sm >= 100,
+        fp4_block_scale_ue8m0: mxf4_block_scale(sm),
+        fp4_block_scale_e4m3: nvf4_block_scale(sm),
+        wgmma: wgmma_available(sm),
+        tcgen05: tcgen05_available(sm),
+        tma: sm >= 90,
         bf16_native: sm >= 80,
         supports_p2p,
         supports_graph_capture: true,
@@ -536,11 +587,9 @@ fn detect_p2p(ctx: &Arc<CudaContext>) -> Result<bool> {
             continue;
         }
         let mut accessible: i32 = 0;
-        unsafe {
-            sys::cuDeviceCanAccessPeer(&mut accessible, ctx.cu_device(), peer as i32)
-        }
-        .result()
-        .map_err(|e| cu_err("cuDeviceCanAccessPeer", e))?;
+        unsafe { sys::cuDeviceCanAccessPeer(&mut accessible, ctx.cu_device(), peer as i32) }
+            .result()
+            .map_err(|e| cu_err("cuDeviceCanAccessPeer", e))?;
         if accessible != 0 {
             return Ok(true);
         }
@@ -562,6 +611,21 @@ fn bounds_check(buf: &DevBuffer, offset: usize, bytes: usize) -> Result<()> {
     }
 }
 
+/// Zachowuje typowany `OutOfMemory` z areny i dokłada nazwę puli do logu.
+/// Zawijanie wyczerpania puli w `Device(String)` gubiło wariant, na którym
+/// opierają się admission i tiering — rozpoznawały wtedy zwykły błąd urządzenia.
+fn pool_alloc_error(pool: Pool, error: ForgeError) -> ForgeError {
+    if let ForgeError::OutOfMemory {
+        requested,
+        available,
+    } = &error
+    {
+        tracing::debug!(?pool, requested, available, "pula wyczerpana");
+        return error;
+    }
+    ForgeError::Device(format!("pula {pool:?}: {error}"))
+}
+
 impl Device for CudaDevice {
     fn caps(&self) -> &DeviceCaps {
         &self.caps
@@ -571,20 +635,27 @@ impl Device for CudaDevice {
         self.bind()?;
         let backing = match kind {
             MemKind::Device => {
-                let pool = self.pool(pool).clone();
+                let pool_kind = pool;
+                let pool = self.pool(pool_kind).clone();
                 let (offset, reserved, generation) = {
                     let mut arena = pool.arena.lock().expect("pool arena poisoned");
                     match &mut *arena {
                         PoolArena::Bump(bump) => {
-                            let offset = bump.alloc(bytes)?;
+                            let offset = bump
+                                .alloc(bytes)
+                                .map_err(|error| pool_alloc_error(pool_kind, error))?;
                             (offset, 0, None)
                         }
                         PoolArena::Slab(slab) => {
-                            let (offset, reserved) = slab.alloc(bytes)?;
+                            let (offset, reserved) = slab
+                                .alloc(bytes)
+                                .map_err(|error| pool_alloc_error(pool_kind, error))?;
                             (offset, reserved, None)
                         }
                         PoolArena::Ring(ring) => {
-                            let (offset, generation) = ring.alloc(bytes)?;
+                            let (offset, generation) = ring
+                                .alloc(bytes)
+                                .map_err(|error| pool_alloc_error(pool_kind, error))?;
                             (offset, 0, Some(generation))
                         }
                     }
@@ -625,11 +696,31 @@ impl Device for CudaDevice {
         })))
     }
 
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer> {
+        let base = parent.downcast::<CudaBuffer>()?;
+        crate::check_sub_range(base.bytes, offset, len)?;
+        let ctx = base.ctx().clone();
+        let kind = base.kind;
+        let dptr = base.device_ptr() + offset as u64;
+        let hptr = base.host_ptr().map(|p| unsafe { p.add(offset) });
+        Ok(DevBuffer::from_impl(Arc::new(CudaBuffer {
+            bytes: len,
+            kind,
+            backing: Backing::Borrowed {
+                ctx,
+                parent: parent.impl_arc(),
+                dptr,
+                hptr,
+            },
+        })))
+    }
+
     fn pool_available(&self, pool: Pool) -> Option<usize> {
         let arena = self.pool(pool).arena.lock().expect("pool arena poisoned");
         match &*arena {
             PoolArena::Bump(bump) => Some(bump.available()),
-            _ => None,
+            PoolArena::Ring(ring) => Some(ring.available()),
+            PoolArena::Slab(slab) => Some(slab.available()),
         }
     }
 
@@ -648,6 +739,14 @@ impl Device for CudaDevice {
         let event = self
             .ctx
             .new_event(None)
+            .map_err(|e| cu_err("cuEventCreate", e))?;
+        Ok(Event::from_impl(Arc::new(CudaEventImpl { event })))
+    }
+
+    fn create_timing_event(&self) -> Result<Event> {
+        let event = self
+            .ctx
+            .new_event(Some(sys::CUevent_flags::CU_EVENT_DEFAULT))
             .map_err(|e| cu_err("cuEventCreate", e))?;
         Ok(Event::from_impl(Arc::new(CudaEventImpl { event })))
     }
@@ -672,6 +771,18 @@ impl Device for CudaDevice {
             .stream
             .wait(&event.event)
             .map_err(|e| cu_err("cuStreamWaitEvent", e))
+    }
+
+    fn elapsed_event_ms(&self, start: &Event, end: &Event) -> Result<Option<f32>> {
+        let start = start.downcast::<CudaEventImpl>()?;
+        let end = end.downcast::<CudaEventImpl>()?;
+        self.check_same_device(start.event.context(), "Event")?;
+        self.check_same_device(end.event.context(), "Event")?;
+        start
+            .event
+            .elapsed_ms(&end.event)
+            .map(Some)
+            .map_err(|e| cu_err("cuEventElapsedTime", e))
     }
 
     fn copy(
@@ -799,9 +910,7 @@ impl Device for CudaDevice {
                     cfg.shared_mem_bytes as i32,
                 )
             }
-            .map_err(|e| {
-                cu_err(&format!("cuFuncSetAttribute({})", kernel_impl.name), e)
-            })?;
+            .map_err(|e| cu_err(&format!("cuFuncSetAttribute({})", kernel_impl.name), e))?;
         }
         unsafe {
             result::launch_kernel(
@@ -884,8 +993,7 @@ impl Device for CudaDevice {
         // device launch. Raw sys call because cudarc's enum wrapper cannot
         // express an empty flag set.
         let mut exec = std::ptr::null_mut();
-        let instantiate =
-            unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0) }.result();
+        let instantiate = unsafe { sys::cuGraphInstantiateWithFlags(&mut exec, graph, 0) }.result();
         if let Err(e) = instantiate {
             let _ = unsafe { result::graph::destroy(graph) };
             return Err(cu_err("cuGraphInstantiateWithFlags", e));
@@ -939,5 +1047,48 @@ impl Device for CudaDevice {
             PoolArena::Ring(ring) => ring.reset(),
             _ => unreachable!("activations pool is always a ring"),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        mxf4_block_scale, nvf4_block_scale, tcgen05_available, wgmma_available, PoolSizes,
+    };
+
+    #[test]
+    fn suma_pul_cuda_odrzuca_przepelnienie() {
+        let pools = PoolSizes {
+            weights: usize::MAX,
+            kv_cache: 1,
+            activations: 0,
+            kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
+        };
+
+        assert!(pools.total().is_err());
+    }
+
+    #[test]
+    fn blackwell_rozdziela_sie_na_dwie_linie_o_roznym_isa() {
+        // GB10 to sm_121: ma oba warianty blokowanego FP4, ale nie ma rdzeni
+        // FA3/FA4. Zweryfikowane skladaniem kazdej z tych instrukcji `ptxas`.
+        assert!(mxf4_block_scale(121));
+        assert!(nvf4_block_scale(121));
+        assert!(!wgmma_available(121));
+        assert!(!tcgen05_available(121));
+
+        // Blackwell serwerowy ma odwrotny zestaw: natywne NVFP4 i tcgen05.
+        assert!(nvf4_block_scale(100));
+        assert!(tcgen05_available(103));
+        assert!(!wgmma_available(100));
+
+        // Hopper ma wgmma i nie ma zadnego FP4.
+        assert!(wgmma_available(90));
+        assert!(!mxf4_block_scale(90));
+        assert!(!nvf4_block_scale(90));
+
+        // Ada nie ma nic z tego; FP8 owszem, ale to osobne pole.
+        assert!(!mxf4_block_scale(89));
+        assert!(!wgmma_available(89));
     }
 }

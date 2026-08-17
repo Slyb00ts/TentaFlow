@@ -5,14 +5,16 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::cuda::PoolSizes;
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
 use half::f16;
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+/// Test musi biec na realnym urzadzeniu dowolnego backendu — wczesniejsze
+/// wiazanie z CUDA cicho pomijalo caly plik na AMD.
+fn device() -> Option<Arc<dyn Device>> {
+    match forge_hal::gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,
@@ -23,7 +25,7 @@ fn device() -> Option<Arc<CudaDevice>> {
     ) {
         Ok(d) => Some(d),
         Err(e) => {
-            eprintln!("skipping CUDA MoE tests: {e}");
+            eprintln!("brak urzadzenia GPU dla testow MoE: {e}");
             None
         }
     }
@@ -32,9 +34,53 @@ fn device() -> Option<Arc<CudaDevice>> {
 fn upload_f16(dev: &dyn Device, vals: &[f32]) -> DevBuffer {
     let host: Vec<f16> = vals.iter().map(|&v| f16::from_f32(v)).collect();
     let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
-    let buf = dev.alloc(bytes.len(), MemKind::Device, Pool::Weights).unwrap();
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
     dev.write(bytes, &buf, 0).unwrap();
     buf
+}
+
+fn upload_f32(dev: &dyn Device, vals: &[f32]) -> DevBuffer {
+    let bytes = unsafe { std::slice::from_raw_parts(vals.as_ptr() as *const u8, vals.len() * 4) };
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(bytes, &buf, 0).unwrap();
+    buf
+}
+
+fn cpu_topk(logits: &[f32], top_k: usize, norm_topk: bool) -> (Vec<i32>, Vec<f32>) {
+    let max = logits.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+    let denom: f32 = logits.iter().map(|&value| (value - max).exp()).sum();
+    let mut probabilities: Vec<f32> = logits
+        .iter()
+        .map(|&value| (value - max).exp() / denom)
+        .collect();
+    let mut ids = Vec::with_capacity(top_k);
+    let mut weights = Vec::with_capacity(top_k);
+    for _ in 0..top_k {
+        let (index, weight) = probabilities
+            .iter()
+            .enumerate()
+            .max_by(|(left_index, left), (right_index, right)| {
+                left.partial_cmp(right)
+                    .unwrap()
+                    .then_with(|| right_index.cmp(left_index))
+            })
+            .map(|(index, &weight)| (index, weight))
+            .unwrap();
+        ids.push(index as i32);
+        weights.push(weight);
+        probabilities[index] = f32::NEG_INFINITY;
+    }
+    if norm_topk {
+        let sum: f32 = weights.iter().sum();
+        for weight in &mut weights {
+            *weight /= sum;
+        }
+    }
+    (ids, weights)
 }
 
 /// CPU reference: f16-round inputs, f32 dot, softmax over all experts, top-k
@@ -102,13 +148,29 @@ fn run_case(n_tokens: usize, hidden: usize, n_expert: usize, top_k: usize, norm_
     let ids_dev = dev
         .alloc(n_tokens * top_k * 4, MemKind::Device, Pool::Activations)
         .unwrap();
+    // Kernel routera zlicza wybory ekspertow; licznik musi istniec, choc test
+    // sprawdza tylko wybor i wagi.
+    let counts_dev = dev
+        .alloc(n_expert * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(&vec![0u8; n_expert * 4], &counts_dev, 0).unwrap();
     let wt_dev = dev
         .alloc(n_tokens * top_k * 4, MemKind::Device, Pool::Activations)
         .unwrap();
 
     kernels
         .moe_router_f16(
-            &ids_dev, &wt_dev, &x_dev, &w_dev, n_tokens, hidden, n_expert, top_k, norm_topk, &stream,
+            &ids_dev,
+            &wt_dev,
+            &x_dev,
+            &w_dev,
+            &counts_dev,
+            n_tokens,
+            hidden,
+            n_expert,
+            top_k,
+            norm_topk,
+            &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();
@@ -164,4 +226,70 @@ fn router_qwen3moe_shape_renorm() {
 #[test]
 fn router_single_token() {
     run_case(1, 1024, 32, 4, true);
+}
+
+#[test]
+fn topk_qwen3moe_logits_matches_cpu() {
+    let Some(dev) = device() else { return };
+    let kernels = Kernels::load(dev.clone()).unwrap();
+    let stream = dev.create_stream().unwrap();
+    let n_tokens = 3;
+    let n_expert = 256;
+    let top_k = 8;
+    let logits: Vec<f32> = (0..n_tokens * n_expert)
+        .map(|index| ((index * 37 % 509) as f32 - 254.0) * 0.03125)
+        .collect();
+    let logits_dev = upload_f32(dev.as_ref(), &logits);
+    let ids_dev = dev
+        .alloc(n_tokens * top_k * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let weights_dev = dev
+        .alloc(n_tokens * top_k * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    let counts_dev = dev
+        .alloc(n_expert * 4, MemKind::Device, Pool::Activations)
+        .unwrap();
+    dev.write(&vec![0u8; n_expert * 4], &counts_dev, 0).unwrap();
+
+    kernels
+        .moe_topk_f32(
+            &ids_dev,
+            &weights_dev,
+            &logits_dev,
+            &counts_dev,
+            n_tokens,
+            n_expert,
+            top_k,
+            true,
+            &stream,
+        )
+        .unwrap();
+    dev.synchronize().unwrap();
+
+    let mut ids_bytes = vec![0u8; n_tokens * top_k * 4];
+    dev.read(&ids_dev, 0, &mut ids_bytes).unwrap();
+    let ids: Vec<i32> = ids_bytes
+        .chunks_exact(4)
+        .map(|bytes| i32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    let mut weights_bytes = vec![0u8; n_tokens * top_k * 4];
+    dev.read(&weights_dev, 0, &mut weights_bytes).unwrap();
+    let weights: Vec<f32> = weights_bytes
+        .chunks_exact(4)
+        .map(|bytes| f32::from_le_bytes(bytes.try_into().unwrap()))
+        .collect();
+    for token in 0..n_tokens {
+        let (expected_ids, expected_weights) = cpu_topk(
+            &logits[token * n_expert..(token + 1) * n_expert],
+            top_k,
+            true,
+        );
+        assert_eq!(&ids[token * top_k..(token + 1) * top_k], expected_ids);
+        for (actual, expected) in weights[token * top_k..(token + 1) * top_k]
+            .iter()
+            .zip(expected_weights)
+        {
+            assert!((actual - expected).abs() < 1e-5, "{actual} != {expected}");
+        }
+    }
 }

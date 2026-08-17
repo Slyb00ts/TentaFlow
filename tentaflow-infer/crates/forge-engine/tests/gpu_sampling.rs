@@ -8,8 +8,8 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, Sampler, SamplingParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 
 const STEPS: usize = 24;
 
@@ -23,7 +23,7 @@ fn load() -> Option<Model> {
         eprintln!("skipping: test model missing at {}", path.display());
         return None;
     }
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 2 << 30,
@@ -41,6 +41,8 @@ fn load() -> Option<Model> {
     let dev: Arc<dyn Device> = device;
     // 64 KV pages (2048 tokens) keep the cache within the test pool.
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+        weight_spill_dir: None,
         kv_pages: 64,
         ..ModelConfig::default()
     };
@@ -49,7 +51,9 @@ fn load() -> Option<Model> {
 
 fn prompt() -> Vec<u32> {
     // Fixed token ids; the model only needs a plausible in-vocab prefix.
-    vec![151644, 872, 198, 105043, 100165, 11319, 151645, 198, 151644, 77091, 198]
+    vec![
+        151644, 872, 198, 105043, 100165, 11319, 151645, 198, 151644, 77091, 198,
+    ]
 }
 
 /// Greedy ids via the CPU path: full logits download + host argmax through
@@ -79,7 +83,9 @@ fn gpu_ids(model: &mut Model, params: SamplingParams) -> Vec<u32> {
     let mut sampler = GpuSampler::new(params);
     let mut seq = model.new_seq();
     let mut ids: Vec<u32> = Vec::new();
-    model.prefill_chunk(&mut seq, &prompt()).unwrap();
+    model
+        .prefill_chunk_device_logits(&mut seq, &prompt())
+        .unwrap();
     let mut next = model.sample_last_logits(&mut sampler).unwrap();
     ids.push(next);
     while ids.len() < STEPS {
@@ -89,6 +95,133 @@ fn gpu_ids(model: &mut Model, params: SamplingParams) -> Vec<u32> {
     }
     model.release_seq(&mut seq);
     ids
+}
+
+#[test]
+fn device_prefill_logits_match_host_prefill() {
+    let Some(mut model) = load() else { return };
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let mut cpu_sampler = Sampler::new(params.clone());
+    let mut gpu_sampler = GpuSampler::new(params);
+    let mut host_seq = model.new_seq();
+    let mut device_seq = model.new_seq();
+
+    let host_logits = model.prefill_chunk(&mut host_seq, &prompt()).unwrap();
+    let expected = cpu_sampler.sample(&host_logits, &[]).unwrap();
+    model
+        .prefill_chunk_device_logits(&mut device_seq, &prompt())
+        .unwrap();
+    let actual = model.sample_last_logits(&mut gpu_sampler).unwrap();
+
+    model.release_seq(&mut host_seq);
+    model.release_seq(&mut device_seq);
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn device_prefill_profile_is_ready_after_sampling() {
+    let Some(mut model) = load() else { return };
+    let prompt = prompt();
+    let mut sampler = GpuSampler::new(SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    });
+    model.prepare_prefill_profiles(prompt.len(), 1).unwrap();
+    let mut seq = model.new_seq();
+
+    model
+        .prefill_chunk_device_logits(&mut seq, &prompt)
+        .unwrap();
+    model.sample_last_logits(&mut sampler).unwrap();
+    let profile = model
+        .take_prefill_profile()
+        .unwrap()
+        .expect("profil prefill powinien istnieć");
+
+    model.release_seq(&mut seq);
+    assert!(profile.target_gpu_ms.is_some_and(|ms| ms > 0.0));
+}
+
+#[test]
+fn device_prefill_multichunk_matches_host_with_interleaved_sequences() {
+    let Some(mut model) = load() else { return };
+    let tokens = prompt();
+    let chunks = [&tokens[..5], &tokens[5..]];
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let mut expected = [0u32; 2];
+    for lane in &mut expected {
+        let mut seq = model.new_seq();
+        model.prefill_chunk(&mut seq, chunks[0]).unwrap();
+        let logits = model.prefill_chunk(&mut seq, chunks[1]).unwrap();
+        *lane = Sampler::new(params.clone()).sample(&logits, &[]).unwrap();
+        model.release_seq(&mut seq);
+    }
+
+    let mut seqs = [model.new_seq(), model.new_seq()];
+    model
+        .prefill_chunk_device_sync(&mut seqs[0], chunks[0])
+        .unwrap();
+    model
+        .prefill_chunk_device_sync(&mut seqs[1], chunks[0])
+        .unwrap();
+    let mut actual = [0u32; 2];
+    for lane in 0..2 {
+        let mut sampler = GpuSampler::new(params.clone());
+        model
+            .prefill_chunk_device_logits(&mut seqs[lane], chunks[1])
+            .unwrap();
+        actual[lane] = model.sample_last_logits(&mut sampler).unwrap();
+    }
+
+    for seq in &mut seqs {
+        model.release_seq(seq);
+    }
+    assert_eq!(actual, expected);
+}
+
+#[test]
+fn dense_equal_prefill_b4_b8_b16_matches_serial() {
+    let Some(mut model) = load() else { return };
+    let mut tokens = Vec::with_capacity(64);
+    while tokens.len() < 64 {
+        tokens.extend(prompt());
+    }
+    tokens.truncate(64);
+    let params = SamplingParams {
+        temperature: 0.0,
+        ..SamplingParams::default()
+    };
+    let mut reference_seq = model.new_seq();
+    let logits = model.prefill_chunk(&mut reference_seq, &tokens).unwrap();
+    let expected = Sampler::new(params.clone()).sample(&logits, &[]).unwrap();
+    model.release_seq(&mut reference_seq);
+
+    for batch in [4usize, 8, 16] {
+        assert!(model.dense_prefill_batch_capable(batch, tokens.len()));
+        let mut seqs = (0..batch).map(|_| model.new_seq()).collect::<Vec<_>>();
+        let mut seq_refs = seqs.iter_mut().collect::<Vec<_>>();
+        let token_lanes = (0..batch).map(|_| tokens.as_slice()).collect::<Vec<_>>();
+        model
+            .prefill_batch_device_logits(&mut seq_refs, &token_lanes)
+            .unwrap();
+        let mut samplers = (0..batch)
+            .map(|_| GpuSampler::new(params.clone()))
+            .collect::<Vec<_>>();
+        let mut sampler_refs = samplers.iter_mut().collect::<Vec<_>>();
+        let actual = model
+            .sample_prefill_batch_logits(&mut sampler_refs)
+            .unwrap();
+        assert_eq!(actual, vec![expected; batch], "B={batch}");
+        for seq in &mut seqs {
+            model.release_seq(seq);
+        }
+    }
 }
 
 #[test]

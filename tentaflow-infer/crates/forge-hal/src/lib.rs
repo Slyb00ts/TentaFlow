@@ -8,16 +8,26 @@
 
 // Offset arenas are consumed by GPU backends only; the CPU backend allocates
 // per-buffer from the host allocator.
-#[cfg(feature = "cuda")]
+#[cfg(any(feature = "cuda", feature = "hip"))]
 pub(crate) mod arena;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
+#[cfg(any(feature = "cuda", feature = "hip"))]
+pub mod gpu;
+#[cfg(feature = "hip")]
+pub mod hip;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal;
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+pub mod metal_device;
 
 use std::any::Any;
 use std::sync::Arc;
 
 use forge_types::{DeviceCaps, ForgeError, MemKind, Result};
+
+pub const DEVICE_ALLOC_ALIGN: usize = 256;
 
 /// Logical VRAM sub-pool an allocation is served from (spec §3.2). Only
 /// meaningful for `MemKind::Device`; host-side kinds ignore it.
@@ -87,12 +97,28 @@ impl KernelScalar for usize {
     }
 }
 
+/// What one argument slot holds. Recorded alongside the slot value because a
+/// raw address is enough for an API that takes pointers and not enough for one
+/// that binds buffers by index: Metal needs to know WHICH arguments are
+/// buffers, and recovering that by comparing slot values against buffer
+/// addresses would be a guess.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArgKind {
+    Scalar,
+    /// Index into `retained()` plus the byte offset requested at build time.
+    Buffer {
+        retained: usize,
+        byte_offset: u64,
+    },
+}
+
 /// Typed kernel-argument builder. Each argument occupies one address-stable
 /// 8-byte slot; buffers contribute their raw device address and are retained
 /// (Arc clone) so the asynchronous launch cannot outlive the allocation.
 #[derive(Default)]
 pub struct LaunchArgs {
     slots: Vec<u64>,
+    kinds: Vec<ArgKind>,
     retained: Vec<DevBuffer>,
 }
 
@@ -104,6 +130,10 @@ impl LaunchArgs {
     /// Pass the buffer's base device address as a pointer argument.
     pub fn buf(mut self, buffer: &DevBuffer) -> Self {
         self.slots.push(buffer.device_ptr());
+        self.kinds.push(ArgKind::Buffer {
+            retained: self.retained.len(),
+            byte_offset: 0,
+        });
         self.retained.push(buffer.clone());
         self
     }
@@ -118,6 +148,10 @@ impl LaunchArgs {
             )));
         }
         self.slots.push(buffer.device_ptr() + byte_offset as u64);
+        self.kinds.push(ArgKind::Buffer {
+            retained: self.retained.len(),
+            byte_offset: byte_offset as u64,
+        });
         self.retained.push(buffer.clone());
         Ok(self)
     }
@@ -125,6 +159,7 @@ impl LaunchArgs {
     /// Pass a scalar by value.
     pub fn scalar<T: KernelScalar>(mut self, value: T) -> Self {
         self.slots.push(value.to_slot());
+        self.kinds.push(ArgKind::Scalar);
         self
     }
 
@@ -147,6 +182,12 @@ impl LaunchArgs {
     /// retain these so replays cannot dereference freed memory.
     pub fn retained(&self) -> &[DevBuffer] {
         &self.retained
+    }
+
+    /// Per-slot kind, parallel to `slots()`. Backends that bind arguments by
+    /// index rather than by address read this instead of guessing.
+    pub fn kinds(&self) -> &[ArgKind] {
+        &self.kinds
     }
 }
 
@@ -181,12 +222,25 @@ pub trait EventImpl: Send + Sync {
 }
 
 pub trait ModuleImpl: Send + Sync {
-    fn kernel(&self, name: &str) -> Result<KernelHandle>;
+    /// Odbiornikiem jest `Arc<Self>`, żeby uchwyt kernela mógł ZATRZYMAĆ moduł.
+    /// Bez tego backend, który odładowuje moduł w `Drop` (HIP), zwalnia kod
+    /// zaraz po pobraniu uchwytu — rejestr kerneli trzyma bowiem tylko uchwyty.
+    fn kernel(self: Arc<Self>, name: &str) -> Result<KernelHandle>;
     fn as_any(&self) -> &dyn Any;
 }
 
 pub trait KernelImpl: Send + Sync {
     fn name(&self) -> &str;
+    /// Największy blok, z jakim TA funkcja się uruchomi.
+    ///
+    /// To nie jest limit karty: liczba rejestrów na wątek jest własnością
+    /// skompilowanego kernela, więc kafel strojony na kartę o większym budżecie
+    /// rejestrów potrafi przekroczyć limit gdzie indziej — i wtedy launch
+    /// zwraca błąd zamiast policzyć cokolwiek. `None`, gdy backend nie umie
+    /// odpowiedzieć; wołający ma wtedy zachować dotychczasowy wybór.
+    fn max_block_threads(&self) -> Option<u32> {
+        None
+    }
     fn as_any(&self) -> &dyn Any;
 }
 
@@ -262,6 +316,13 @@ handle!(
     GraphImpl
 );
 
+impl KernelHandle {
+    /// Największy blok, z jakim ta funkcja się uruchomi; `None` bez odpowiedzi.
+    pub fn max_block_threads(&self) -> Option<u32> {
+        self.0.max_block_threads()
+    }
+}
+
 impl DevBuffer {
     pub fn len(&self) -> usize {
         self.0.len()
@@ -283,6 +344,11 @@ impl DevBuffer {
     /// for device-only memory.
     pub fn host_ptr(&self) -> Option<*mut u8> {
         self.0.host_ptr()
+    }
+
+    /// Uchwyt na implementację, żeby backend mógł zatrzymać rodzica pod-bufora.
+    pub(crate) fn impl_arc(&self) -> Arc<dyn BufferImpl> {
+        Arc::clone(&self.0)
     }
 }
 
@@ -308,7 +374,7 @@ impl Event {
 impl Module {
     /// Resolve a kernel entry point by its exported (extern "C") name.
     pub fn kernel(&self, name: &str) -> Result<KernelHandle> {
-        self.0.kernel(name)
+        Arc::clone(&self.0).kernel(name)
     }
 }
 
@@ -326,6 +392,60 @@ impl KernelHandle {
 /// Asynchrony contract: `copy` and `launch` are stream-ordered and return
 /// before completion; `write`/`read` are synchronous staging helpers and must
 /// not be called while a stream on this device is capturing a graph.
+
+/// Explicit byte budgets for the three VRAM pools. Constructing a
+/// `CudaDevice` claims exactly these amounts up front.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PoolSizes {
+    pub weights: usize,
+    pub kv_cache: usize,
+    /// Slab granularity of the KV pool; KV allocations round up to pages.
+    pub kv_page_size: usize,
+    pub activations: usize,
+}
+
+impl PoolSizes {
+    /// Default KV page: 256 KiB holds a 16-token page of a 7B-class layer's
+    /// K+V in fp16 with headroom, while keeping free-list churn negligible.
+    pub const DEFAULT_KV_PAGE: usize = 256 * 1024;
+
+    /// Opt-in sizing from currently free VRAM: claims 90% of `free_bytes`,
+    /// split 60/30/10 between weights, KV cache and activations.
+    pub fn auto_from_free(free_bytes: usize) -> Self {
+        let budget = free_bytes / 10 * 9;
+        let weights = align_down(budget / 10 * 6);
+        let kv_cache = align_down(budget / 10 * 3);
+        let activations = align_down(budget - weights - kv_cache);
+        Self {
+            weights,
+            kv_cache,
+            kv_page_size: Self::DEFAULT_KV_PAGE,
+            activations,
+        }
+    }
+
+    fn total(&self) -> Result<usize> {
+        self.weights
+            .checked_add(self.kv_cache)
+            .and_then(|value| value.checked_add(self.activations))
+            .ok_or_else(|| ForgeError::Device("suma rozmiarów pul CUDA przekracza usize".into()))
+    }
+}
+
+fn align_down(bytes: usize) -> usize {
+    bytes / crate::arena::ALLOC_ALIGN * crate::arena::ALLOC_ALIGN
+}
+
+/// Wspólna kontrola zakresu pod-bufora dla wszystkich backendów.
+pub(crate) fn check_sub_range(parent_len: usize, offset: usize, len: usize) -> Result<()> {
+    if offset.checked_add(len).is_none_or(|end| end > parent_len) {
+        return Err(ForgeError::Device(format!(
+            "pod-bufor [{offset}, +{len}) wykracza poza rodzica o {parent_len} bajtach"
+        )));
+    }
+    Ok(())
+}
+
 pub trait Device: Send + Sync {
     fn caps(&self) -> &DeviceCaps;
 
@@ -333,6 +453,16 @@ pub trait Device: Send + Sync {
     /// `MemKind::Device`; host kinds allocate directly from the driver/OS.
     /// Freeing is RAII via `DevBuffer` drop.
     fn alloc(&self, bytes: usize, kind: MemKind, pool: Pool) -> Result<DevBuffer>;
+
+    /// Uchwyt na `len` bajtów wewnątrz `parent`, licząc od `offset`. Pamięć
+    /// pozostaje własnością rodzica — pod-bufor tylko go zatrzymuje, więc
+    /// zwolnienie następuje dopiero po zniknięciu ostatniego uchwytu.
+    ///
+    /// Istnieje dla rezydencji ekspertów MoE: pojedynczy ekspert musi być
+    /// osobnym uchwytem (własny wskaźnik urządzenia, własne miejsce w tablicy
+    /// wskaźników), ale alokowanie każdego z osobna oznaczałoby dziesiątki
+    /// tysięcy alokacji, a przy pamięci przypiętej — tyleż blokad stron.
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer>;
 
     /// Liczba wolnych bajtów w puli urządzenia, gdy backend potrafi ją raportować.
     fn pool_available(&self, _pool: Pool) -> Option<usize> {
@@ -343,11 +473,21 @@ pub trait Device: Send + Sync {
 
     fn create_event(&self) -> Result<Event>;
 
+    /// Zdarzenie z licznikiem czasu, używane tylko przez profilowanie.
+    fn create_timing_event(&self) -> Result<Event> {
+        self.create_event()
+    }
+
     /// Record `event` at the current tail of `stream`.
     fn record_event(&self, event: &Event, stream: &Stream) -> Result<()>;
 
     /// Make future work on `stream` wait until `event` completes.
     fn wait_event(&self, stream: &Stream, event: &Event) -> Result<()>;
+
+    /// Czas GPU między zdarzeniami. `None` oznacza backend bez liczników czasu.
+    fn elapsed_event_ms(&self, _start: &Event, _end: &Event) -> Result<Option<f32>> {
+        Ok(None)
+    }
 
     /// Stream-ordered copy between buffers; direction (H2D/D2H/D2D/H2H) is
     /// derived from the buffers' `MemKind`s. Host-side endpoints must be
@@ -362,6 +502,21 @@ pub trait Device: Send + Sync {
         bytes: usize,
         stream: &Stream,
     ) -> Result<()>;
+
+    /// Otwiera bezpośredni dostęp do pamięci drugiej karty (P2P). Bez tego
+    /// kopia między urządzeniami idzie przez hosta i traci rząd wielkości.
+    /// Zwraca `Unsupported`, gdy backend albo para kart tego nie potrafi.
+    fn enable_peer_access(&self, _peer_ordinal: usize) -> Result<()> {
+        Err(ForgeError::Unsupported(
+            "ten backend nie obsługuje dostępu P2P".into(),
+        ))
+    }
+
+    /// Numer urządzenia w obrębie backendu — potrzebny, żeby wskazać partnera
+    /// przy otwieraniu P2P.
+    fn ordinal(&self) -> usize {
+        0
+    }
 
     /// Synchronous host→buffer staging write (init/load path, not hot path).
     fn write(&self, src: &[u8], dst: &DevBuffer, dst_offset: usize) -> Result<()>;

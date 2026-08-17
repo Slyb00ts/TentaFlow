@@ -135,7 +135,8 @@ impl DeviceCropsFrame {
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 impl DeviceCropsFrame {
     /// Maps the device NV12 surface and returns its device plane pointers/strides.
@@ -523,7 +524,7 @@ pub fn set_nv12_bench_mode(detect: bool, full: bool) {
 pub fn nv12_detect_bench_enabled() -> bool {
     cfg!(all(
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort"
     )) && (NV12_DETECT_BENCH.load(std::sync::atomic::Ordering::Relaxed)
         || nv12_full_bench_enabled())
 }
@@ -534,7 +535,7 @@ pub fn nv12_detect_bench_enabled() -> bool {
 pub fn nv12_full_bench_enabled() -> bool {
     cfg!(all(
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort"
     )) && NV12_FULL_BENCH.load(std::sync::atomic::Ordering::Relaxed)
 }
 
@@ -798,7 +799,8 @@ pub(crate) fn install_detect_frame_callback_nv12(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(crate) fn install_detect_frame_callback_cuda(
     appsink: &gst_app::AppSink,
@@ -913,7 +915,8 @@ pub(crate) fn install_detect_frame_callback_cuda(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 fn download_nv12_detect(
     mailbox: &Arc<FrameMailbox>,
@@ -958,7 +961,8 @@ fn download_nv12_detect(
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 fn warn_zerocopy_fallback(logged: &std::sync::atomic::AtomicBool, reason: &str) {
     if !logged.swap(true, std::sync::atomic::Ordering::Relaxed) {
@@ -976,7 +980,8 @@ fn warn_zerocopy_fallback(logged: &std::sync::atomic::AtomicBool, reason: &str) 
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 fn verify_zerocopy(
     map: &super::gst_cuda_ffi::CudaNv12Map<'_>,
@@ -1136,7 +1141,8 @@ pub fn zerocopy_crops_enabled() -> bool {
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     {
         crate::vision::settings::get().zerocopy_crops
@@ -1144,7 +1150,8 @@ pub fn zerocopy_crops_enabled() -> bool {
     #[cfg(not(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     )))]
     {
         false
@@ -1171,7 +1178,8 @@ pub fn zerocopy_crops_enabled() -> bool {
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
     feature = "inference-vision-gpu",
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 pub(crate) fn install_frame_callback_crops_cuda(
     appsink: &gst_app::AppSink,

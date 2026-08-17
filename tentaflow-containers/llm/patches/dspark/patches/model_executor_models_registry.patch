@@ -1,0 +1,10 @@
+--- a/vllm/model_executor/models/registry.py
++++ b/vllm/model_executor/models/registry.py
+@@ -597,6 +597,7 @@
+     "EagleLlama4ForCausalLM": ("llama4_eagle", "EagleLlama4ForCausalLM"),
+     "EagleMiniCPMForCausalLM": ("minicpm_eagle", "EagleMiniCPMForCausalLM"),
+     "DFlashDraftModel": ("qwen3_dflash", "DFlashQwen3ForCausalLM"),
++    "DeepSeekV4DSparkModel": ("vllm.models.deepseek_v4", "DeepSeekV4DSpark"),
+     "PEagleDraftModel": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+     "PeagleLlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),
+     "Eagle3LlamaForCausalLM": ("llama_eagle3", "Eagle3LlamaForCausalLM"),

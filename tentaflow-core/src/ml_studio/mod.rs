@@ -11,15 +11,18 @@ pub mod coco_annotate;
 pub mod db;
 pub mod distill;
 pub mod export_llm;
+pub mod import_recordings;
 pub mod infer;
 pub mod live_view;
 pub mod mesh_artifact;
 pub mod models;
 pub mod profile;
+pub mod project_archive;
 pub mod repository;
 pub mod train_autogluon;
 pub mod train_classifier;
 pub mod train_llm;
+pub mod train_ocr;
 pub mod train_recognition;
 pub mod train_tabular;
 

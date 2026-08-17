@@ -1,5 +1,7 @@
 // ===== File: main.rs — `forge` CLI: serve an OpenAI API, run one-shot generation, benchmark =====
 
+mod bench;
+mod config;
 mod hf;
 
 use std::net::SocketAddr;
@@ -10,16 +12,21 @@ use std::time::Instant;
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use forge_engine::kv::KvQuant;
-use forge_engine::model::{ModelConfig, MAX_SPEC_DRAFT};
-use forge_engine::tier::{KvTierConfig, KvTierMode};
+use forge_engine::model::Fp8PackOutcome;
+use forge_engine::model::{ModelConfig, Nvfp4GgufLayout, MAX_SPEC_DRAFT};
 use forge_engine::sample::SamplingParams;
-use forge_engine::server::{EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig};
+use forge_engine::server::{
+    BenchmarkTimings, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
+};
 use forge_engine::speculation::{ProposerKind, SpeculationKind};
+use forge_engine::tier::{KvTierConfig, KvTierMode};
+use forge_engine::weights::NvFp4CtLayoutPolicy;
 use forge_formats::PoolingType;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{
-    kv_pool_bytes, load_model, read_descriptor, resolve_normalize, resolve_pooling, LoadedModel,
+    kv_pool_bytes, load_model, load_model_tp, read_descriptor, resolve_normalize, resolve_pooling,
+    LoadedModel,
 };
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{EmbedModel, ServerConfig, ServerState, SharedEmbed};
@@ -52,6 +59,9 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Report what each visible device can actually do — the facts kernel
+    /// selection is allowed to depend on.
+    Caps,
     /// Serve an OpenAI-compatible HTTP API for one model.
     Serve {
         /// GGUF file or HF snapshot directory.
@@ -65,26 +75,40 @@ enum Command {
         #[arg(long)]
         api_key: Option<String>,
         /// Maksymalna liczba równocześnie dekodowanych sekwencji.
-        /// Domyślnie 1 dla MTP, w pozostałych trybach 8.
+        /// Wspólny domyślny limit wszystkich wejść to 1.
         #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
         max_active: Option<u16>,
         /// Minimum simultaneously-decoding sequences before the batched forward
-        /// path engages (below it the tuned fused single-seq path is faster).
-        #[arg(long, default_value_t = 12, value_parser = clap::value_parser!(u16).range(2..))]
-        batch_min: u16,
-        /// Prompt tokens one sequence may prefill per scheduler iteration.
-        #[arg(long, default_value_t = 16)]
+        /// path engages. The same default is used by run and bench.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: Option<u16>,
+        /// Prompt tokens one sequence may prefill per scheduler iteration
+        /// (larger = better TTFT and throughput, smaller = better decode ITL
+        /// of the other active sequences during a long prefill; measured C=16
+        /// p1024 sweet spot is 1024 — 628 tok/s vs 606 @512 and 499 @256).
+        #[arg(long, default_value_t = config::DEFAULT_PREFILL_CHUNK)]
         prefill_chunk: usize,
         /// KV cache pages (32 tokens each) shared by all sequences. Raised to
         /// at least one full `--ctx` window if smaller.
-        #[arg(long, default_value_t = 512)]
+        #[arg(long, default_value_t = config::DEFAULT_KV_PAGES)]
         kv_pages: usize,
         /// Max context length per request in tokens (0 = the model's maximum).
         #[arg(long = "ctx", default_value_t = 0)]
         ctx: usize,
-        /// Weights pool size in GiB.
-        #[arg(long, default_value_t = 16.0)]
+        /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM,
+        /// which also leaves room for the auto fp8 prefill packs).
+        #[arg(long, default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
         /// Tool-call output parser: hermes | llama3 | none (default: auto-detect).
         #[arg(long)]
         tool_call_parser: Option<String>,
@@ -137,13 +161,23 @@ enum Command {
         /// prefixes (system prompts, few-shot, multi-turn) so a request sharing
         /// a prefix skips re-prefilling it. Strict optimization; auto-inactive
         /// with tiering / rot KV / hybrid arch.
-        #[arg(long = "prefix-cache", default_value = "on")]
+        #[arg(long = "prefix-cache", default_value = config::DEFAULT_PREFIX_CACHE)]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3]. `on`
-        /// używa proposera n-gram. MTP wymaga greedy bez kar oraz
-        /// `--max-active 1`. Spekulacja wymusza `--prefix-cache off`.
-        #[arg(long = "speculative", default_value = "off")]
+        /// używa proposera n-gram. MTP wymaga greedy bez kar; `max-active > 1`
+        /// przechodzi startup preflight pamięci. Spekulacja wyłącza prefix cache.
+        #[arg(long = "speculative", default_value = config::DEFAULT_SPECULATIVE)]
         speculative: String,
+        /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
+        /// przecinku, np. `--tp-cards 1`. Karta modelu jest zawsze pierwsza,
+        /// wymienia się tylko te, które mają ją wesprzeć. Obejmuje dekodowanie
+        /// modeli gęstych z wagami Q8_0; prefill zostaje na jednej karcie.
+        #[arg(long = "tp-cards")]
+        tp_cards: Option<String>,
+        /// Pełny podział SPMD modelu na N widocznych kart. Nie łączy się z
+        /// `--tp-cards`, które rozdziela wyłącznie FFN.
+        #[arg(long = "tp", default_value_t = 1)]
+        tp: usize,
     },
     /// Print an embedding vector for one text (dims + L2 norm + first values).
     Embed {
@@ -160,6 +194,16 @@ enum Command {
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
     },
     /// One-shot generation streamed to stdout.
     Run {
@@ -169,14 +213,38 @@ enum Command {
         /// Max tokens to generate.
         #[arg(short = 'n', long = "max-tokens", default_value_t = 256)]
         max_tokens: usize,
-        #[arg(long = "temp", default_value_t = 0.7)]
-        temperature: f32,
-        /// Wrap the prompt in the model's chat template as a user message.
-        #[arg(long)]
+        /// Temperatura samplingu. Bez tej flagi bierze się z profilu modelu
+        /// (`forge-engine/src/model_profile/`).
+        #[arg(long = "temp")]
+        temperature: Option<f32>,
+        /// Owija prompt w szablon czatu modelu. Bez tej flagi decyduje profil
+        /// modelu; `--no-chat` wymusza surowy prompt.
+        #[arg(long, overrides_with = "no_chat")]
         chat: bool,
+        #[arg(long = "no-chat", overrides_with = "chat")]
+        no_chat: bool,
+        /// Maximum number of concurrently decoded sequences.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: Option<u16>,
+        /// Minimum batch size that enables the batched forward path.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: Option<u16>,
+        /// Prompt tokens processed by one scheduler iteration.
+        #[arg(long, default_value_t = config::DEFAULT_PREFILL_CHUNK)]
+        prefill_chunk: usize,
         /// VRAM weights-pool size in GiB (0 = automatic split of free VRAM).
         #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
         weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -222,12 +290,23 @@ enum Command {
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
         /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
-        #[arg(long = "prefix-cache", default_value = "on")]
+        #[arg(long = "prefix-cache", default_value = config::DEFAULT_PREFIX_CACHE)]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        /// Włączenie wymusza `--prefix-cache off`.
-        #[arg(long = "speculative", default_value = "off")]
+        #[arg(long = "speculative", default_value = config::DEFAULT_SPECULATIVE)]
         speculative: String,
+        /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
+        /// przecinku, np. `--tp-cards 1`. Karta modelu jest zawsze pierwsza,
+        /// wymienia się tylko te, które mają ją wesprzeć. Obejmuje dekodowanie
+        /// modeli gęstych z wagami Q8_0; prefill zostaje na jednej karcie.
+        #[arg(long = "tp-cards")]
+        tp_cards: Option<String>,
+        /// Podział SPMD na N kart: model jest dzielony RAZ, przy ładowaniu, a
+        /// każda karta wykonuje tę samą pętlę warstw na swoim fragmencie każdej
+        /// macierzy. Obejmuje modele hybrydowe; dzielnik musi dzielić liczbę
+        /// głowic KV. 1 (domyślnie) = jedna karta.
+        #[arg(long = "tp", default_value_t = 1)]
+        tp: usize,
     },
     /// Transcribe a WAV file with a Whisper model.
     Transcribe {
@@ -258,12 +337,37 @@ enum Command {
     Bench {
         /// GGUF file or HF snapshot directory.
         model_path: PathBuf,
+        /// Maximum number of concurrently decoded sequences.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(1..))]
+        max_active: Option<u16>,
+        /// Minimum batch size that enables the batched forward path.
+        #[arg(long, value_parser = clap::value_parser!(u16).range(2..))]
+        batch_min: Option<u16>,
+        /// Prompt tokens processed by one scheduler iteration.
+        #[arg(long, default_value_t = config::DEFAULT_PREFILL_CHUNK)]
+        prefill_chunk: usize,
         /// Tokens to decode.
         #[arg(long, default_value_t = 128)]
         tokens: usize,
         /// Prompt length in tokens.
         #[arg(long, default_value_t = 512)]
         prompt_tokens: usize,
+        /// Dokładne tokeny promptu jako kolejne little-endian `u32`.
+        #[arg(long = "prompt-token-ids")]
+        prompt_token_ids: Option<PathBuf>,
+        /// Rozmiar puli wag w GiB; 0 dobiera pulę z aktualnie wolnego VRAM.
+        #[arg(long = "weights-pool-gb", default_value_t = 0.0)]
+        weights_pool_gb: f64,
+        /// Wagi, które nie mieszczą się w VRAM, trafiają do pamięci przypiętej
+        /// hosta — GPU czyta je wprost przez PCIe (~28 GB/s zamiast ~500 GB/s).
+        /// Budżet w GiB; 0 wyłącza, więc brak miejsca w VRAM jest błędem.
+        #[arg(long = "weight-host-gb", default_value_t = 0.0)]
+        weight_host_gb: f64,
+        /// Katalog na plik zrzutu wag ekspertów MoE. Eksperci, którzy nie
+        /// zmieszczą się w VRAM ani w budżecie hosta, lądują tam i są
+        /// stronicowani na żądanie. Bez tej opcji brak pamięci jest błędem.
+        #[arg(long = "weight-spill-dir")]
+        weight_spill_dir: Option<std::path::PathBuf>,
         /// KV cache mode: f16 | fp8 | rot4 | rot3 (fp8 halves KV bytes; rot4/rot3
         /// are rotational low-bit — rot4 recommended, rot3 lossier).
         #[arg(long = "kv-cache", default_value = "f16")]
@@ -304,18 +408,31 @@ enum Command {
         /// set explicitly.
         #[arg(long = "kvflash", default_value_t = false)]
         kvflash: bool,
-        /// Radix-tree prefix caching (SPEC §5.2): on | off (see `forge serve`).
-        #[arg(long = "prefix-cache", default_value = "on")]
+        /// Radix-tree prefix caching (SPEC §5.2): on | off. The shared default
+        /// is OFF so benchmark repetitions always measure the full prefill.
+        /// A cache hit still ends the benchmark with an error.
+        #[arg(long = "prefix-cache", default_value = config::DEFAULT_PREFIX_CACHE)]
         prefix_cache: String,
         /// Dekodowanie spekulatywne: off | on | ngram[:k] | mtp[:2|3].
-        /// Włączenie wymusza `--prefix-cache off`.
-        #[arg(long = "speculative", default_value = "off")]
+        #[arg(long = "speculative", default_value = config::DEFAULT_SPECULATIVE)]
         speculative: String,
-        /// Warm best-of-N: submit the same request N times reusing the loaded
-        /// model and report the fastest prefill + decode. The 4090's cold first
-        /// GEMM launch throttles ~2×, so rep 1 is always discarded when N > 1.
-        #[arg(long = "reps", default_value_t = 1)]
+        /// Liczba mierzonych prób po jednym osobnym przebiegu rozgrzewającym.
+        #[arg(long = "reps", default_value_t = config::DEFAULT_REPS)]
         reps: usize,
+        /// Podział FFN na dodatkowe karty (tensor parallel): numery kart po
+        /// przecinku, np. `--tp-cards 1`.
+        #[arg(long = "tp-cards")]
+        tp_cards: Option<String>,
+        /// Narzucony podział wymiaru pośredniego, np. `8704,8704`. Bez tego
+        /// podział idzie ze zmierzonej mocy kart, co dla kart tej samej
+        /// architektury bywa obarczone błędem samego pomiaru.
+        #[arg(long = "tp-split")]
+        tp_split: Option<String>,
+        /// Podział SPMD na N kart, jak w `forge run --tp`. Dzięki temu rozbicie
+        /// na prefill, TTFT i dekodowanie da się zmierzyć także dla podziału, a
+        /// nie tylko dla jednej karty.
+        #[arg(long = "tp", default_value_t = 1)]
+        tp: usize,
     },
     /// Measure next-token perplexity on a fixed held-out passage (W4A8 quality
     /// gate). Runs whatever GEMM `FORGE_GEMM` selects (W4A8 is calibrated first).
@@ -344,6 +461,7 @@ fn main() -> Result<()> {
             token,
             dir,
         } => cmd_pull(repo, file, revision, token, dir),
+        Command::Caps => cmd_caps(),
         Command::Serve {
             model_path,
             bind,
@@ -354,6 +472,8 @@ fn main() -> Result<()> {
             prefill_chunk,
             kv_pages,
             weights_pool_gb,
+            weight_host_gb,
+            weight_spill_dir,
             tool_call_parser,
             whisper_model,
             embed_model,
@@ -369,6 +489,8 @@ fn main() -> Result<()> {
             kvflash,
             prefix_cache,
             speculative,
+            tp_cards,
+            tp,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -388,6 +510,8 @@ fn main() -> Result<()> {
                 prefill_chunk,
                 kv_pages,
                 weights_pool_gb,
+                weight_host_gb,
+                weight_spill_dir.clone(),
                 tool_call_parser,
                 whisper_model.as_deref(),
                 embed_model.as_deref(),
@@ -397,6 +521,8 @@ fn main() -> Result<()> {
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
+                parse_tp_cards(tp_cards.as_deref())?,
+                tp,
             )
         }
         Command::Embed {
@@ -405,12 +531,16 @@ fn main() -> Result<()> {
             pooling,
             dimensions,
             weights_pool_gb,
+            weight_host_gb,
+            weight_spill_dir,
         } => cmd_embed(
             &model_path,
             &text,
             pooling.as_deref(),
             dimensions,
             weights_pool_gb,
+            weight_host_gb,
+            weight_spill_dir,
         ),
         Command::Run {
             model_path,
@@ -418,7 +548,13 @@ fn main() -> Result<()> {
             max_tokens,
             temperature,
             chat,
+            no_chat,
+            max_active,
+            batch_min,
+            prefill_chunk,
             weights_pool_gb,
+            weight_host_gb,
+            weight_spill_dir,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -432,6 +568,8 @@ fn main() -> Result<()> {
             kvflash,
             prefix_cache,
             speculative,
+            tp_cards,
+            tp,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -447,7 +585,13 @@ fn main() -> Result<()> {
                 max_tokens,
                 temperature,
                 chat,
+                no_chat,
+                max_active,
+                batch_min,
+                prefill_chunk,
                 weights_pool_gb,
+                weight_host_gb,
+                weight_spill_dir.clone(),
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -455,6 +599,8 @@ fn main() -> Result<()> {
                 hot_pages,
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
+                parse_tp_cards(tp_cards.as_deref())?,
+                tp,
             )
         }
         Command::Transcribe {
@@ -470,8 +616,15 @@ fn main() -> Result<()> {
         } => cmd_onnx_run(&model_path, samples, sr, &signal),
         Command::Bench {
             model_path,
+            max_active,
+            batch_min,
+            prefill_chunk,
             tokens,
             prompt_tokens,
+            prompt_token_ids,
+            weights_pool_gb,
+            weight_host_gb,
+            weight_spill_dir,
             kv_cache,
             kv_residual_window,
             kv_activate_at,
@@ -486,6 +639,9 @@ fn main() -> Result<()> {
             prefix_cache,
             speculative,
             reps,
+            tp_cards,
+            tp_split,
+            tp,
         } => {
             let (hot_pages, tier) = resolve_kvflash(
                 kvflash,
@@ -497,8 +653,15 @@ fn main() -> Result<()> {
             )?;
             cmd_bench(
                 &model_path,
+                max_active,
+                batch_min,
+                prefill_chunk,
                 tokens,
                 prompt_tokens,
+                prompt_token_ids.as_deref(),
+                weights_pool_gb,
+                weight_host_gb,
+                weight_spill_dir.clone(),
                 parse_kv_quant(&kv_cache, kv_residual_window, kv_activate_at)?,
                 tier,
                 ctx,
@@ -507,6 +670,9 @@ fn main() -> Result<()> {
                 parse_prefix_cache(&prefix_cache)?,
                 parse_speculative(&speculative)?,
                 reps,
+                parse_tp_cards(tp_cards.as_deref())?,
+                parse_tp_split(tp_split.as_deref())?,
+                tp,
             )
         }
         Command::Ppl { model_path, ctx } => cmd_ppl(&model_path, ctx),
@@ -537,13 +703,21 @@ fn parse_kv_quant(s: &str, residual_window: usize, activate_at: usize) -> Result
     match s {
         "f16" => Ok(KvQuant::F16),
         "fp8" => Ok(KvQuant::Fp8),
-        "rot4" => Ok(KvQuant::Rot { bits: 4, residual_window, activate_at }),
-        "rot3" => Ok(KvQuant::Rot { bits: 3, residual_window, activate_at }),
+        "rot4" => Ok(KvQuant::Rot {
+            bits: 4,
+            residual_window,
+            activate_at,
+        }),
+        "rot3" => Ok(KvQuant::Rot {
+            bits: 3,
+            residual_window,
+            activate_at,
+        }),
         other => bail!("unsupported --kv-cache '{other}' (expected f16 | fp8 | rot4 | rot3)"),
     }
 }
 
-/// Parsuje `--speculative`: `off` | `on` | `ngram[:k]` | `mtp[:2|3]`.
+/// Parsuje `--speculative`: `off` | `on` | `ngram[:k]` | `mtp[:2|3]` | `mtp+ngram:2|3`.
 fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     // The verify forward runs the ungraphed prefill path, so a long draft
     // (amortizing its per-op launch overhead over many accepted tokens) is what
@@ -563,7 +737,14 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
             }
             (name, budget)
         }
-        None => (s, if s == "mtp" { 3 } else { DEFAULT_DRAFT }),
+        None => (
+            s,
+            if matches!(s, "mtp" | "mtp+ngram") {
+                3
+            } else {
+                DEFAULT_DRAFT
+            },
+        ),
     };
     match name {
         "on" if explicit_budget => {
@@ -571,6 +752,11 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
         }
         "on" | "ngram" => SpeculativeConfig::ngram(budget).map_err(Into::into),
         "mtp" => SpeculativeConfig::chain(vec![ProposerKind::Mtp], budget).map_err(Into::into),
+        "mtp+ngram" => SpeculativeConfig::chain(
+            vec![ProposerKind::Mtp, ProposerKind::Ngram],
+            budget,
+        )
+        .map_err(Into::into),
         "draft-model" | "eagle" | "dflash" | "dspark" => bail!(
             "--speculative proposer '{name}' requires an implemented neural loader and forge-speculation.json"
         ),
@@ -578,18 +764,160 @@ fn parse_speculative(s: &str) -> Result<SpeculativeConfig> {
     }
 }
 
-fn resolve_max_active(max_active: Option<u16>, spec: &SpeculativeConfig) -> Result<usize> {
-    let max_active = usize::from(max_active.unwrap_or_else(|| {
-        if spec.kind() == SpeculationKind::NativeMtp {
-            1
-        } else {
-            8
-        }
-    }));
-    if spec.kind() == SpeculationKind::NativeMtp && max_active != 1 {
-        bail!("--speculative mtp wymaga --max-active 1");
+fn resolve_max_active(
+    max_active: Option<u16>,
+    _spec: &SpeculativeConfig,
+    _hybrid_model: bool,
+) -> Result<usize> {
+    let max_active = usize::from(max_active.unwrap_or(config::DEFAULT_MAX_ACTIVE as u16));
+    if max_active == 0 {
+        bail!("--max-active musi być większe od zera");
     }
     Ok(max_active)
+}
+
+fn resolve_bench_nvfp4_gguf_layout_from_env(
+    speculation: SpeculationKind,
+    max_active: usize,
+) -> Result<Nvfp4GgufLayout> {
+    let value = match std::env::var("FORGE_BENCH_NVFP4_TILE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => "0".into(),
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("FORGE_BENCH_NVFP4_TILE musi być poprawnym UTF-8 i mieć wartość 0 albo 1")
+        }
+    };
+    resolve_bench_nvfp4_gguf_layout(speculation, max_active, &value)
+}
+
+fn resolve_bench_nvfp4_gguf_layout(
+    speculation: SpeculationKind,
+    max_active: usize,
+    value: &str,
+) -> Result<Nvfp4GgufLayout> {
+    match value {
+        "0" => Ok(Nvfp4GgufLayout::RowMajor36),
+        "1" if speculation != SpeculationKind::Off => {
+            bail!("FORGE_BENCH_NVFP4_TILE=1 wymaga --speculative off")
+        }
+        "1" if max_active != 1 => {
+            bail!("FORGE_BENCH_NVFP4_TILE=1 wymaga dokładnie jednej aktywnej sekwencji")
+        }
+        "1" => Ok(Nvfp4GgufLayout::TileN128K64),
+        _ => bail!("FORGE_BENCH_NVFP4_TILE musi mieć wartość 0 albo 1"),
+    }
+}
+
+/// Włącza podział FFN, gdy operator wskazał dodatkowe karty.
+///
+/// Pula wag kart pomocniczych jest tej samej wielkości co pula karty modelu:
+/// fragment jest mniejszy od całych wag, więc to margines, nie wymaganie.
+fn enable_tp_ffn(
+    model: &mut forge_engine::model::Model,
+    model_path: &Path,
+    cards: &[forge_hal::gpu::DeviceId],
+    weights_pool_gb: f64,
+) -> Result<()> {
+    enable_tp_ffn_with(model, model_path, cards, weights_pool_gb, None)
+}
+
+fn enable_tp_ffn_with(
+    model: &mut forge_engine::model::Model,
+    model_path: &Path,
+    cards: &[forge_hal::gpu::DeviceId],
+    weights_pool_gb: f64,
+    forced: Option<&[usize]>,
+) -> Result<()> {
+    if cards.is_empty() {
+        return Ok(());
+    }
+    // Karta wspierająca trzyma WYŁĄCZNIE fragmenty FFN i garść buforów roboczych
+    // — żadnego KV, bo uwaga zostaje na karcie modelu. Domyślna pula z
+    // `--weights-pool-gb 0` to jeden gibibajt, czyli mniej niż połowa FFN
+    // dwudziestosiedmiomiliardowego modelu, więc bez tego podział kończy się
+    // brakiem pamięci przy pierwszej warstwie.
+    let weights = if weights_pool_gb > 0.0 {
+        (weights_pool_gb * (1u64 << 30) as f64) as usize
+    } else {
+        let mut free = usize::MAX;
+        for card in cards {
+            free = free.min(
+                forge_hal::gpu::free_vram(card.ordinal)
+                    .with_context(|| format!("odczyt wolnego VRAM karty {}", card.ordinal))?,
+            );
+        }
+        free / 10 * 8
+    };
+    eprintln!("pula wag kart wspierających: {} MiB", weights >> 20);
+    let pools = forge_hal::PoolSizes {
+        weights,
+        kv_cache: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
+        activations: 256 << 20,
+        kv_page_size: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
+    };
+    model.enable_tp_ffn(model_path, cards, pools, None, forced)?;
+    let tp = model.tp_ffn().expect("podział właśnie włączony");
+    eprintln!(
+        "podział FFN na {} kart (P2P {}, pula wag kart wspierających {} MiB): {:?} wierszy pośrednich warstwy 0",
+        tp.cards(),
+        tp.peer_access(),
+        weights >> 20,
+        tp.split_of(0)
+    );
+    if let Some(split) = tp.lm_head_split() {
+        eprintln!("głowa logitów podzielona po wierszach słownika: {split:?}");
+    }
+    if let Some((in_split, gate_split)) = tp.delta_proj_split() {
+        eprintln!(
+            "projekcje DeltaNet podzielone w {} warstwach: in {in_split:?}, gate {gate_split:?}",
+            tp.delta_proj_layers()
+        );
+    }
+    Ok(())
+}
+
+/// Narzucony podział wymiaru pośredniego, np. `8704,8704`.
+fn parse_tp_split(spec: Option<&str>) -> Result<Option<Vec<usize>>> {
+    let Some(spec) = spec else { return Ok(None) };
+    let mut out = Vec::new();
+    for part in spec.split(',').map(str::trim).filter(|p| !p.is_empty()) {
+        out.push(
+            part.parse::<usize>()
+                .map_err(|_| anyhow::anyhow!("--tp-split: `{part}` nie jest liczbą kolumn"))?,
+        );
+    }
+    if out.len() < 2 {
+        return Err(anyhow::anyhow!(
+            "--tp-split wymaga udziału dla każdej karty"
+        ));
+    }
+    Ok(Some(out))
+}
+
+/// Numery kart do podziału FFN, np. `1` albo `1,2`. `None` znaczy jedną kartę.
+fn parse_tp_cards(spec: Option<&str>) -> Result<Vec<forge_hal::gpu::DeviceId>> {
+    let Some(spec) = spec else {
+        return Ok(Vec::new());
+    };
+    let visible = forge_hal::gpu::enumerate();
+    let mut out = Vec::new();
+    for part in spec.split(',') {
+        let index: usize = part
+            .trim()
+            .parse()
+            .map_err(|_| anyhow::anyhow!("--tp-cards: `{part}` nie jest numerem karty"))?;
+        let id = *visible.get(index).ok_or_else(|| {
+            anyhow::anyhow!(
+                "--tp-cards: nie ma karty {index}, widocznych jest {}",
+                visible.len()
+            )
+        })?;
+        if out.contains(&id) {
+            return Err(anyhow::anyhow!("--tp-cards: karta {index} podana dwa razy"));
+        }
+        out.push(id);
+    }
+    Ok(out)
 }
 
 fn parse_prefix_cache(s: &str) -> Result<bool> {
@@ -681,9 +1009,14 @@ fn tier_stage_bytes(
     kv_page_size: usize,
     ctx_pages: usize,
     quant: KvQuant,
-) -> usize {
-    2 * ctx_pages * desc.params.n_kv_heads * kv_page_size * desc.params.head_dim
-        * quant.slab_dtype().size()
+) -> Result<usize> {
+    2usize
+        .checked_mul(ctx_pages)
+        .and_then(|value| value.checked_mul(desc.params.kv_cache_heads()))
+        .and_then(|value| value.checked_mul(kv_page_size))
+        .and_then(|value| value.checked_mul(desc.params.kv_cache_head_dim()))
+        .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
+        .context("rozmiar bufora staging KV przekracza zakres usize")
 }
 
 fn default_model_id(path: &Path) -> String {
@@ -693,20 +1026,119 @@ fn default_model_id(path: &Path) -> String {
         .unwrap_or_else(|| "model".into())
 }
 
-/// Load a model for the fixed-pool `serve` layout: weights sized by flag,
-/// KV pool sized for exactly `kv_pages` pages of this model (floored at
-/// 1 GiB), 1 GiB activations.
+#[derive(Debug, Eq, PartialEq)]
+struct KvPoolLayout {
+    pages: usize,
+    bytes: usize,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn resolve_kv_pool_layout(
+    desc: &forge_formats::ModelDescriptor,
+    page_size: usize,
+    ctx_pages: usize,
+    requested_pages: usize,
+    hot_pages: usize,
+    tier: &KvTierConfig,
+    quant: KvQuant,
+    native_mtp: bool,
+) -> Result<KvPoolLayout> {
+    if hot_pages > 0 && !tier.enabled() {
+        bail!("--kv-hot-pages wymaga --kv-tier ram|nvme");
+    }
+    let pages = if hot_pages > 0 {
+        hot_pages
+    } else if tier.enabled() {
+        if requested_pages == 0 {
+            ctx_pages
+        } else {
+            requested_pages.min(ctx_pages)
+        }
+    } else if requested_pages == 0 {
+        ctx_pages
+    } else {
+        requested_pages.max(ctx_pages)
+    };
+    if tier.enabled() {
+        let floor = forge_engine::tier::min_resident_pages(page_size);
+        if pages < floor {
+            bail!(
+                "efektywna pula KV ma {pages} stron, poniżej minimum rezydencji {floor}; zwiększ --kv-pages lub --kv-hot-pages"
+            );
+        }
+    }
+    Ok(KvPoolLayout {
+        pages,
+        bytes: kv_pool_bytes(desc, page_size, pages, quant, native_mtp)?,
+    })
+}
+
+fn kv_full_context_admission_capacity(
+    pages: usize,
+    ctx_pages: usize,
+    page_size: usize,
+    tier_enabled: bool,
+    max_active: usize,
+) -> usize {
+    let pages_per_request = if tier_enabled {
+        ctx_pages.min(forge_engine::tier::min_resident_pages(page_size))
+    } else {
+        ctx_pages
+    };
+    if pages_per_request == 0 {
+        return 0;
+    }
+    max_active.min(pages / pages_per_request)
+}
+
+fn pool_reserve_bytes(kv_bytes: usize, activation_bytes: usize) -> Result<usize> {
+    kv_bytes
+        .checked_add(activation_bytes)
+        .and_then(|value| value.checked_add(512 << 20))
+        .context("suma pul KV, aktywacji i rezerwy przekracza zakres usize")
+}
+
+/// Baza plus część rosnąca z liczbą linii: verifier i prefill trzymają bufory na
+/// sekwencję, a stała nie zależała od niczego — przy 32 liniach brakowało pamięci.
+/// Pierścień nie zwalnia, więc podłoga rośnie do 1/32 wolnej pamięci karty.
+fn activation_pool_bytes(hybrid: bool, max_active: usize, free_vram: usize) -> usize {
+    (if hybrid { 9usize << 27 } else { 1usize << 30 }).max(free_vram / 32)
+        + max_active.saturating_sub(8) * (16usize << 20)
+}
+
+fn resolve_nvfp4_ct_layout(value: &str) -> Result<NvFp4CtLayoutPolicy> {
+    match value {
+        "row" => Ok(NvFp4CtLayoutPolicy::RowMajorE4M3),
+        "s0" => Ok(NvFp4CtLayoutPolicy::S0N64K128),
+        "auto" => Ok(NvFp4CtLayoutPolicy::Auto),
+        _ => bail!("FORGE_NVFP4_CT_LAYOUT wymaga row, s0 albo auto"),
+    }
+}
+
+fn resolve_nvfp4_ct_layout_from_env() -> Result<NvFp4CtLayoutPolicy> {
+    resolve_nvfp4_ct_layout(
+        std::env::var("FORGE_NVFP4_CT_LAYOUT")
+            .as_deref()
+            .unwrap_or("auto"),
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn load_for_serve(
     path: &Path,
+    max_active: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
     hot_pages: usize,
     prefix_cache: bool,
     native_mtp: bool,
+    nvfp4_gguf_layout: Nvfp4GgufLayout,
+    tp_world: usize,
 ) -> Result<(LoadedModel, usize, usize)> {
     let kv_page_size = ModelConfig::default().kv_page_size;
     let desc = read_descriptor(path)?;
@@ -717,39 +1149,48 @@ fn load_for_serve(
     // stays constant as the context grows.
     let (max_seq_len, ctx_pages) =
         resolve_ctx(desc.params.max_position_embeddings, ctx, kv_page_size);
-    let kv_pages = if hot_pages > 0 {
-        hot_pages
-    } else if kv_tier.enabled() {
-        kv_pages.min(ctx_pages)
-    } else {
-        kv_pages.max(ctx_pages)
-    };
-    let kv_pool = kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30);
+    let layout = resolve_kv_pool_layout(
+        &desc,
+        kv_page_size,
+        ctx_pages,
+        kv_pages,
+        hot_pages,
+        &kv_tier,
+        kv_quant,
+        native_mtp,
+    )?;
+    let kv_pages = layout.pages;
+    let kv_pool = layout.bytes;
     let stage = if kv_tier.enabled() {
-        tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)
+        tier_stage_bytes(&desc, kv_page_size, ctx_pages, kv_quant)?
     } else {
         0
     };
-    let activations = 1usize << 30;
     // Clamp the requested weights pool so weights + KV + activations always fit
     // free VRAM — a large --ctx grows KV and must not OOM the pool arenas.
-    let free = CudaDevice::free_vram(0).context("query free VRAM")?;
-    let weights_budget = free.saturating_sub(kv_pool + activations + (512 << 20));
-    let weights = ((weights_pool_gb * (1u64 << 30) as f64) as usize + stage)
-        .min(weights_budget)
-        .max(1 << 30);
-    let device = CudaDevice::new(
-        0,
-        PoolSizes {
+    let pools = |ordinal: usize| -> Result<PoolSizes> {
+        let free = gpu::free_vram(ordinal).context("query free VRAM")?;
+        let activations = activation_pool_bytes(desc.params.ssm.is_some(), max_active, free);
+        let weights_budget = free.saturating_sub(pool_reserve_bytes(kv_pool, activations)?);
+        let weights = if weights_pool_gb > 0.0 {
+            ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+                .checked_add(stage)
+                .context("rozmiar puli wag i staging przekracza zakres usize")?
+                .min(weights_budget)
+                .max(1 << 30)
+        } else {
+            weights_budget.max(1 << 30)
+        };
+        Ok(PoolSizes {
             weights,
             kv_cache: kv_pool,
-            activations: 1 << 30,
+            activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
-        },
-    )
-    .context("create CUDA device")?;
-    let dev: Arc<dyn Device> = device;
+        })
+    };
     let cfg = ModelConfig {
+        weight_host_budget: (weight_host_gb * (1u64 << 30) as f64) as usize,
+        weight_spill_dir,
         kv_page_size,
         kv_pages,
         kv_quant,
@@ -757,8 +1198,30 @@ fn load_for_serve(
         max_seq_len,
         prefix_cache,
         native_mtp,
+        nvfp4_gguf_layout,
+        nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
+        layer_range: None,
+        tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
     };
-    let loaded = load_model(dev, path, cfg)?;
+    let loaded = if tp_world > 1 {
+        let visible = gpu::enumerate().len();
+        if visible < tp_world {
+            anyhow::bail!("--tp {tp_world}: widocznych jest {visible} kart");
+        }
+        let mut devices = Vec::with_capacity(tp_world);
+        for ordinal in 0..tp_world {
+            let sizes = pools(ordinal)?;
+            devices.push(
+                gpu::open(ordinal, sizes)
+                    .with_context(|| format!("open GPU device {ordinal}"))?,
+            );
+        }
+        load_model_tp(&devices, path, cfg)?
+    } else {
+        let sizes = pools(0)?;
+        let dev: Arc<dyn Device> = gpu::open(0, sizes).context("open GPU device")?;
+        load_model(dev, path, cfg)?
+    };
     Ok((loaded, kv_pages, max_seq_len))
 }
 
@@ -767,7 +1230,16 @@ fn load_for_serve(
 /// `requested == 0` defaults to the model's own maximum; a non-zero request is
 /// honored as-is (down to a single page, up to the model's positional limit).
 /// Whether the resulting KV pool fits VRAM is decided later by pool sizing.
-fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usize) -> (usize, usize) {
+/// Dolna granica automatycznego zmniejszania kontekstu. Ponizej tej wartosci
+/// model przestaje byc uzyteczny, wiec zamiast ciac dalej zostawiamy resztę
+/// wag na sciezce offloadu.
+const MIN_AUTO_CTX_TOKENS: usize = 8192;
+
+fn resolve_ctx(
+    max_position_embeddings: usize,
+    requested: usize,
+    page_size: usize,
+) -> (usize, usize) {
     let model_max = max_position_embeddings.max(page_size);
     let target = if requested == 0 {
         model_max
@@ -778,9 +1250,107 @@ fn resolve_ctx(max_position_embeddings: usize, requested: usize, page_size: usiz
 }
 
 #[allow(clippy::too_many_arguments)]
+
+/// Ile bajtów wag niesie checkpoint. Dla GGUF to rozmiar pliku (nagłówek jest
+/// pomijalny), dla katalogu safetensors suma plików tensorów.
+fn checkpoint_weight_bytes(path: &Path) -> Result<usize> {
+    if path.is_dir() {
+        let mut total = 0u64;
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            if entry.path().extension().is_some_and(|e| e == "safetensors") {
+                total += entry.metadata()?.len();
+            }
+        }
+        return Ok(total as usize);
+    }
+    Ok(std::fs::metadata(path)?.len() as usize)
+}
+
+/// Pamięć hosta, którą wolno zająć pod wagi. `MemAvailable` z `/proc/meminfo`
+/// jest jedyną wiarygodną miarą „ile da się wziąć bez wpychania systemu w swap";
+/// bierzemy z niej połowę, żeby zostawić miejsce na resztę procesu.
+fn host_offload_headroom() -> usize {
+    let Ok(text) = std::fs::read_to_string("/proc/meminfo") else {
+        return 0;
+    };
+    for line in text.lines() {
+        if let Some(rest) = line.strip_prefix("MemAvailable:") {
+            let kib: usize = rest
+                .split_whitespace()
+                .next()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(0);
+            return (kib / 2) * 1024;
+        }
+    }
+    0
+}
+
+/// Dobiera budżet RAM i katalog zrzutu, gdy wagi nie mieszczą się w VRAM.
+/// Jawne `--weight-host-gb` / `--weight-spill-dir` mają pierwszeństwo i nie są
+/// ruszane — automat działa tylko tam, gdzie użytkownik nic nie podał.
+fn resolve_offload(
+    path: &Path,
+    vram_weights_pool: usize,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
+) -> Result<(usize, Option<std::path::PathBuf>)> {
+    let explicit_host = (weight_host_gb * (1u64 << 30) as f64) as usize;
+    if explicit_host > 0 && weight_spill_dir.is_some() {
+        return Ok((explicit_host, weight_spill_dir));
+    }
+    let needed = checkpoint_weight_bytes(path).unwrap_or(0);
+    if needed == 0 || needed <= vram_weights_pool {
+        return Ok((explicit_host, weight_spill_dir));
+    }
+    // Zapas 15%: pula wag trzyma nie tylko same tensory, więc realny niedobór
+    // jest większy niż różnica rozmiarów.
+    let missing = (needed - vram_weights_pool) * 115 / 100;
+    let host = if explicit_host > 0 {
+        explicit_host
+    } else {
+        missing.min(host_offload_headroom())
+    };
+    // Zrzut na dysk wystawiamy ZAWSZE, gdy model nie mieści się w VRAM. Katalog
+    // sam z siebie nic nie kosztuje, a jest jedyną deską ratunku, gdy RAM też
+    // się skończy w trakcie ładowania.
+    let spill = match weight_spill_dir {
+        Some(dir) => Some(dir),
+        None => Some(default_spill_dir()?),
+    };
+    eprintln!(
+        "wagi {} MiB nie mieszczą się w puli VRAM {} MiB — RAM {} MiB{}",
+        needed >> 20,
+        vram_weights_pool >> 20,
+        host >> 20,
+        match spill.as_ref() {
+            Some(dir) => format!(", zrzut na NVMe: {}", dir.display()),
+            None => String::new(),
+        }
+    );
+    Ok((host, spill))
+}
+
+/// Katalog zrzutu wag na dysku. Trafia do cache użytkownika, nie do `/tmp` —
+/// `/tmp` bywa tmpfs w RAM, więc zrzut „na dysk" zjadłby tę samą pamięć.
+fn default_spill_dir() -> Result<std::path::PathBuf> {
+    let base = std::env::var_os("XDG_CACHE_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|h| std::path::PathBuf::from(h).join(".cache")))
+        .context("nie da się ustalić katalogu cache na zrzut wag")?;
+    let dir = base.join("forge").join("weight-spill");
+    std::fs::create_dir_all(&dir)
+        .with_context(|| format!("utworzenie katalogu zrzutu {}", dir.display()))?;
+    Ok(dir)
+}
+
 fn load_auto(
     path: &Path,
+    max_active: usize,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -788,58 +1358,106 @@ fn load_auto(
     hot_pages: usize,
     prefix_cache: bool,
     native_mtp: bool,
+    nvfp4_gguf_layout: Nvfp4GgufLayout,
+    tp_world: usize,
 ) -> Result<LoadedModel> {
     // Read hyperparameters before loading weights so the KV cache is sized for
     // the requested context up front (its slabs are allocated during load).
     let desc = read_descriptor(path)?;
     let page_size = ModelConfig::default().kv_page_size;
-    let (max_seq_len, ctx_pages) =
-        resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
+    let (max_seq_len, ctx_pages) = resolve_ctx(desc.params.max_position_embeddings, ctx, page_size);
     // KVFlash (`hot_pages > 0`) fixes the VRAM pool to a constant page count
     // regardless of --ctx; else 0 = a pool covering the whole context (today's
     // behavior) and an explicit --kv-pages caps the hot VRAM working set.
-    let kv_pages = if hot_pages > 0 {
-        hot_pages
-    } else if kv_pages_flag > 0 {
-        kv_pages_flag.min(ctx_pages)
-    } else {
-        ctx_pages
-    };
+    let mut layout = resolve_kv_pool_layout(
+        &desc,
+        page_size,
+        ctx_pages,
+        kv_pages_flag,
+        hot_pages,
+        &kv_tier,
+        kv_quant,
+        native_mtp,
+    )?;
+    let activations =
+        activation_pool_bytes(desc.params.ssm.is_some(), max_active, gpu::free_vram(0)?);
+    // Automatycznie dobrany kontekst NIE MOZE zaglodzic wag. Kazdy token czyta
+    // cale wagi, a strony KV zapelniaja sie dopiero wraz z dlugoscia sekwencji,
+    // wiec oddanie rezydentnych wag za wiekszy kontekst jest zawsze zla
+    // zamiana: Qwen3.6-27B na karcie 20 GiB schodzil tak do 1,6 GiB w VRAM i
+    // czytal 89% wag przez PCIe. Kontekst podany recznie zostaje nietkniety —
+    // to wybor uzytkownika.
+    let mut max_seq_len = max_seq_len;
+    let mut ctx_pages = ctx_pages;
+    if ctx == 0 && weights_pool_gb == 0.0 && hot_pages == 0 && kv_pages_flag == 0 {
+        let needed = checkpoint_weight_bytes(path).unwrap_or(0);
+        let free = gpu::free_vram(0).context("query free VRAM")?;
+        let floor_pages = MIN_AUTO_CTX_TOKENS.div_ceil(page_size);
+        let full_seq_len = max_seq_len;
+        while ctx_pages > floor_pages
+            && free.saturating_sub(pool_reserve_bytes(layout.bytes, activations)?) < needed
+        {
+            ctx_pages = (ctx_pages / 2).max(floor_pages);
+            max_seq_len = ctx_pages * page_size;
+            layout = resolve_kv_pool_layout(
+                &desc,
+                page_size,
+                ctx_pages,
+                kv_pages_flag,
+                hot_pages,
+                &kv_tier,
+                kv_quant,
+                native_mtp,
+            )?;
+        }
+        if max_seq_len < full_seq_len {
+            eprintln!(
+                "kontekst zmniejszony z {full_seq_len} do {max_seq_len} tokenow, zeby wagi \
+                 ({} MiB) zostaly w VRAM — podaj --ctx, zeby wymusic wiekszy",
+                needed >> 20
+            );
+        }
+    }
+    let kv_pages = layout.pages;
     let stage = if kv_tier.enabled() {
-        tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)
+        tier_stage_bytes(&desc, page_size, ctx_pages, kv_quant)?
     } else {
         0
     };
 
-    // Activations pool holds decode scratch + persistent decode buffers. The
-    // engine's paged KV slabs and (hybrid) SSM state allocate from the WEIGHTS
-    // pool, not the HAL kv_cache pool — that pool is unused by the LLM engine,
-    // so it is kept minimal (otherwise a full 1 GiB kv_cache arena is claimed
-    // but never used, needlessly starving the weights pool).
-    let activations = 1usize << 30;
-    let hal_kv = 4usize << 20;
-    let weights = if weights_pool_gb > 0.0 {
-        (weights_pool_gb * (1u64 << 30) as f64) as usize + stage
-    } else {
-        let free = CudaDevice::free_vram(0).context("query free VRAM")?;
-        free.saturating_sub(activations + hal_kv + (512 << 20))
-            .max(1 << 30)
-    };
-    let device = CudaDevice::new(
-        0,
-        PoolSizes {
+    // `KvCache` alokuje wszystkie slaby targetu i opcjonalnego MTP w dedykowanej
+    // puli; rozmiar uwzględnia wyrównanie każdego bufora do granulacji slabów.
+    let hal_kv = layout.bytes;
+    // Podział na rangi: każda karta dostaje pule liczone z WŁASNEJ wolnej
+    // pamięci, bo trzyma swój fragment wag i swój fragment KV. Karty otwierają
+    // się tutaj, a dostęp P2P nad nimi dopiero po zbudowaniu modeli — inaczej
+    // każda karta płaciłaby drugim kompletem pul.
+    let pools = |ordinal: usize| -> Result<PoolSizes> {
+        let weights = if weights_pool_gb > 0.0 {
+            ((weights_pool_gb * (1u64 << 30) as f64) as usize)
+                .checked_add(stage)
+                .context("rozmiar puli wag i staging przekracza zakres usize")?
+        } else {
+            let free = gpu::free_vram(ordinal).context("query free VRAM")?;
+            free.saturating_sub(pool_reserve_bytes(hal_kv, activations)?)
+                .max(1 << 30)
+        };
+        Ok(PoolSizes {
             weights,
             kv_cache: hal_kv,
             activations,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
-        },
-    )
-    .context("create CUDA device")?;
-    let dev: Arc<dyn Device> = device;
-    load_model(
-        dev,
-        path,
-        ModelConfig {
+        })
+    };
+    let config = |weights: usize| -> Result<ModelConfig> {
+        // Wagi, które nie mieszczą się w puli VRAM, mają zjechać do RAM, a potem
+        // na NVMe — automatycznie. Bez tego model większy od karty kończy się
+        // błędem pamięci, mimo że w maszynie jest i RAM, i dysk.
+        let (weight_host_budget, weight_spill_dir) =
+            resolve_offload(path, weights, weight_host_gb, weight_spill_dir.clone())?;
+        Ok(ModelConfig {
+            weight_host_budget,
+            weight_spill_dir,
             kv_quant,
             kv_tier,
             kv_page_size: page_size,
@@ -847,11 +1465,37 @@ fn load_auto(
             max_seq_len,
             prefix_cache,
             native_mtp,
-        },
-    )
+            nvfp4_gguf_layout,
+            nvfp4_ct_layout: resolve_nvfp4_ct_layout_from_env()?,
+            layer_range: None,
+            tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+        })
+    };
+    if tp_world > 1 {
+        let visible = gpu::enumerate().len();
+        if visible < tp_world {
+            anyhow::bail!("--tp {tp_world}: widocznych jest {visible} kart");
+        }
+        let mut devices = Vec::with_capacity(tp_world);
+        let mut first_weights = 0usize;
+        for ordinal in 0..tp_world {
+            let sizes = pools(ordinal)?;
+            if ordinal == 0 {
+                first_weights = sizes.weights;
+            }
+            devices.push(
+                gpu::open(ordinal, sizes).with_context(|| format!("open GPU device {ordinal}"))?,
+            );
+        }
+        return load_model_tp(&devices, path, config(first_weights)?);
+    }
+    let sizes = pools(0)?;
+    let weights = sizes.weights;
+    let dev: Arc<dyn Device> = gpu::open(0, sizes).context("open GPU device")?;
+    load_model(dev, path, config(weights)?)
 }
 
-/// Load a Whisper model on its own CudaDevice with pools sized from the
+/// Load a Whisper model on its own GPU device with pools sized from the
 /// snapshot: safetensors bytes bound the f16 upload (most tensors are f32,
 /// halved on upload) and 1 GiB covers the persistent activation scratch.
 /// A separate device instance keeps Whisper's weights-pool allocations away
@@ -867,7 +1511,7 @@ fn load_whisper(dir: &Path) -> Result<forge_server::SharedWhisper> {
     if tensor_bytes == 0 {
         bail!("no .safetensors files in {}", dir.display());
     }
-    let device = CudaDevice::new(
+    let dev: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights: tensor_bytes as usize + (1 << 30),
@@ -876,8 +1520,7 @@ fn load_whisper(dir: &Path) -> Result<forge_server::SharedWhisper> {
             kv_page_size: 256 << 10,
         },
     )
-    .context("create CUDA device for whisper")?;
-    let dev: Arc<dyn Device> = device;
+    .context("open GPU device for whisper")?;
     let model = forge_whisper::WhisperModel::load(dev, dir)
         .with_context(|| format!("load whisper model from {}", dir.display()))?;
     Ok(Arc::new(tokio::sync::Mutex::new(model)))
@@ -892,14 +1535,13 @@ fn parse_pooling(s: &str) -> Result<PoolingType> {
     }
 }
 
-/// Load an embedding model on its own CudaDevice (like Whisper), resolving its
+/// Load an embedding model on its own GPU device (like Whisper), resolving its
 /// pooling and normalization from metadata. A `None` pooling degrades to mean.
 /// Pools auto-size from free VRAM (the model loads after the chat engine has
 /// already taken its own device pool).
 fn load_embed(path: &Path, model_id: String) -> Result<SharedEmbed> {
-    let device = CudaDevice::with_default_pools(0)
-        .context("create CUDA device for embedding model")?;
-    let dev: Arc<dyn Device> = device;
+    let dev: Arc<dyn Device> =
+        gpu::open_default_pools(0).context("open GPU device for embedding model")?;
     let loaded = load_model(dev, path, ModelConfig::default())
         .with_context(|| format!("load embedding model from {}", path.display()))?;
     let params = &loaded.model.weights.descriptor.params;
@@ -930,11 +1572,16 @@ fn cmd_embed(
     pooling_override: Option<&str>,
     dimensions: Option<usize>,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
 ) -> Result<()> {
     let t0 = Instant::now();
     let loaded = load_auto(
         model_path,
+        1,
         weights_pool_gb,
+        weight_host_gb,
+        weight_spill_dir,
         KvQuant::F16,
         KvTierConfig::default(),
         8192,
@@ -942,6 +1589,8 @@ fn cmd_embed(
         0,
         false,
         false,
+        Nvfp4GgufLayout::RowMajor36,
+        1,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
 
@@ -1019,7 +1668,9 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
     }
 
     let inputs = &model.graph.input;
-    let is_vad = ["input", "state", "sr"].iter().all(|n| inputs.iter().any(|i| i == n));
+    let is_vad = ["input", "state", "sr"]
+        .iter()
+        .all(|n| inputs.iter().any(|i| i == n));
     if !is_vad {
         println!(
             "\nparsed {} nodes; no Silero VAD input signature (input/state/sr) — \
@@ -1037,7 +1688,7 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
         })
         .collect();
 
-    let device = CudaDevice::new(
+    let dev: Arc<dyn Device> = gpu::open(
         0,
         PoolSizes {
             weights: 64 << 20,
@@ -1046,12 +1697,14 @@ fn cmd_onnx_run(model_path: &Path, samples: usize, sr: i64, signal: &str) -> Res
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
     )
-    .context("create CUDA device")?;
-    let dev: Arc<dyn Device> = device;
+    .context("open GPU device")?;
     let session = forge_onnx::load_session(dev, model_path)?;
 
     let mut named = std::collections::HashMap::new();
-    named.insert("input".to_string(), forge_onnx::Tensor::from_f32(vec![1, samples], frame));
+    named.insert(
+        "input".to_string(),
+        forge_onnx::Tensor::from_f32(vec![1, samples], frame),
+    );
     named.insert(
         "state".to_string(),
         forge_onnx::Tensor::from_f32(vec![2, 1, 128], vec![0.0; 256]),
@@ -1081,10 +1734,12 @@ fn cmd_serve(
     model_id: Option<String>,
     api_key: Option<String>,
     max_active: Option<u16>,
-    batch_min: u16,
+    batch_min: Option<u16>,
     prefill_chunk: usize,
     kv_pages: usize,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     tool_call_parser: Option<String>,
     whisper_model: Option<&Path>,
     embed_model: Option<&Path>,
@@ -1094,35 +1749,78 @@ fn cmd_serve(
     hot_pages: usize,
     prefix_cache: bool,
     spec: SpeculativeConfig,
+    tp_cards: Vec<forge_hal::gpu::DeviceId>,
+    tp_world: usize,
 ) -> Result<()> {
-    let max_active = resolve_max_active(max_active, &spec)?;
-    // Speculation appends + rolls back draft KV on the plain paged cache; the
-    // radix prefix cache donates/borrows pages and is mutually exclusive with
-    // it, so enabling speculation forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.is_enabled();
-    if spec.is_enabled() {
-        tracing::info!("speculative decoding enabled; prefix cache disabled");
+    if tp_world == 0 {
+        anyhow::bail!("--tp musi być co najmniej 1");
     }
+    if tp_world > 1 && !tp_cards.is_empty() {
+        anyhow::bail!("--tp nie łączy się z --tp-cards");
+    }
+    let descriptor = read_descriptor(model_path)?;
+    let max_active = resolve_max_active(max_active, &spec, descriptor.params.ssm.is_some())?;
     let t0 = Instant::now();
     let (mut loaded, kv_pages, max_seq_len) = load_for_serve(
         model_path,
+        max_active,
         kv_pages,
         weights_pool_gb,
+        weight_host_gb,
+        weight_spill_dir,
         kv_quant,
         kv_tier,
         ctx,
         hot_pages,
         prefix_cache,
-        spec.kind() == SpeculationKind::NativeMtp,
+        spec.is_native_mtp(),
+        Nvfp4GgufLayout::RowMajor36,
+        tp_world,
     )?;
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
+    let full_context_admission = kv_full_context_admission_capacity(
+        kv_pages,
+        max_seq_len.div_ceil(ModelConfig::default().kv_page_size),
+        ModelConfig::default().kv_page_size,
+        loaded.model.tier_enabled(),
+        max_active,
+    );
+    // Koszt jednej strony KV pozwala przeliczyć deficyt puli wag na liczbę
+    // stron, które operator musi zwolnić, gdy paczki FP8 się nie mieszczą.
+    let native_mtp = matches!(
+        spec.kind(),
+        SpeculationKind::NativeMtp | SpeculationKind::NativeMtpNgram
+    );
+    let kv_descriptor = loaded.model.weights.descriptor.clone();
+    let kv_bytes_for = |pages: usize| {
+        kv_pool_bytes(
+            &kv_descriptor,
+            ModelConfig::default().kv_page_size,
+            pages,
+            kv_quant,
+            native_mtp,
+        )
+        .ok()
+    };
+    let kv_probe = KvPoolProbe {
+        pages: kv_pages,
+        bytes_for: &kv_bytes_for,
+    };
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        true,
+        Some(&kv_probe),
+    )?;
     tracing::info!(
-        "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}",
+        "loaded {} ({}) in {:.1}s: {} layers, kv_pages={}, full_context_admission={}",
         model_path.display(),
         loaded.model.weights.descriptor.arch,
         t0.elapsed().as_secs_f32(),
         loaded.model.weights.descriptor.params.block_count,
         kv_pages,
+        full_context_admission,
     );
 
     let template_vars = loaded.bundle.template_vars();
@@ -1133,10 +1831,14 @@ fn cmd_serve(
     // The engine caps a sequence at the configured context; the model's own
     // positional limit is already folded into max_seq_len by resolve_ctx.
     let max_context = max_seq_len;
+    let chat_template = config::chat_template(
+        &loaded.model.weights.descriptor.arch,
+        loaded.chat_template.clone(),
+    )?;
     let tool_parser = ToolParserKind::resolve(
         tool_call_parser.as_deref(),
         &loaded.model.weights.descriptor.arch,
-        &loaded.chat_template,
+        &chat_template,
     )
     .map_err(|e| anyhow::anyhow!(e))?;
     tracing::info!("tool-call parser: {tool_parser:?}");
@@ -1150,7 +1852,9 @@ fn cmd_serve(
         tokenizer.clone(),
         max_active,
         prefill_chunk,
-        batch_min as usize,
+        batch_min
+            .map(usize::from)
+            .unwrap_or(config::DEFAULT_BATCH_MIN),
         spec,
     )?;
 
@@ -1197,11 +1901,19 @@ fn cmd_serve(
         None => None,
     };
 
+    let profile =
+        forge_engine::model_profile::resolve(&forge_engine::model_profile::identify(model_path));
     let cfg = ServerConfig {
         bind,
         model_id: served_id,
         api_key,
         tool_call_parser,
+        default_sampling: config::sampling_from_profile(profile),
+        default_stop: profile
+            .stop
+            .iter()
+            .map(|stop| (*stop).to_string())
+            .collect(),
     };
     let state = ServerState::new(
         &cfg,
@@ -1209,7 +1921,7 @@ fn cmd_serve(
         tokenizer,
         template_vars,
         eos_ids,
-        loaded.chat_template,
+        chat_template,
         max_context,
         max_active,
         tool_parser,
@@ -1223,38 +1935,49 @@ fn cmd_serve(
         .block_on(forge_server::serve(state, cfg.bind))
 }
 
-/// Drive one engine request to completion, invoking `on_text` per emitted
-/// piece. Returns (generated_tokens, prompt_tokens, first_token_at, done_at).
-/// Token counts come from the engine's `Done` usage, not from counting text
-/// pieces. `first_token_at` is the first VISIBLE text event: the engine only
-/// emits `Token` for non-empty decoded pieces, so UTF-8/stop-holdback in the
-/// stream decoder can shift it a decode step or two past the true first
-/// sampled token.
+/// Wynik jednego przebiegu żądania. Liczniki pochodzą z `Done` silnika, nie z
+/// liczenia kawałków tekstu, a `first_token_at` jest pierwszym WIDOCZNYM
+/// zdarzeniem, więc holdback dekodera może je przesunąć o krok czy dwa.
+/// `cache_read_tokens` jest widoczny celowo: bez niego benchmark raportuje
+/// przepustowość prefillu za prompt, którego nigdy nie przeliczył.
+struct DrainOutcome {
+    generated: usize,
+    prompt_tokens: usize,
+    cache_read_tokens: usize,
+    first_token_at: Instant,
+    done_at: Instant,
+    benchmark: Option<BenchmarkTimings>,
+}
+
 fn drain_request(
     engine: &EngineHandle,
     req: EngineRequest,
-    mut on_text: impl FnMut(&str),
-) -> Result<(usize, usize, Instant, Instant)> {
+    mut on_token: impl FnMut(u32, &str),
+) -> Result<DrainOutcome> {
     let rx = engine.submit(req).map_err(|e| anyhow::anyhow!("{e}"))?;
     let mut first_token_at = None;
     loop {
         match rx.recv().context("engine stream ended unexpectedly")? {
-            EngineEvent::Token { text, .. } => {
+            EngineEvent::Token { id, text, .. } => {
                 first_token_at.get_or_insert_with(Instant::now);
-                on_text(&text);
+                on_token(id, &text);
             }
             EngineEvent::Done {
                 tokens,
                 prompt_tokens,
+                cache_read_tokens,
+                benchmark,
                 ..
             } => {
                 let done_at = Instant::now();
-                return Ok((
-                    tokens,
+                return Ok(DrainOutcome {
+                    generated: tokens,
                     prompt_tokens,
-                    first_token_at.unwrap_or(done_at),
+                    cache_read_tokens,
+                    first_token_at: first_token_at.unwrap_or(done_at),
                     done_at,
-                ));
+                    benchmark,
+                });
             }
             EngineEvent::Error(msg) => bail!("engine error: {msg}"),
         }
@@ -1266,9 +1989,15 @@ fn cmd_run(
     model_path: &Path,
     prompt: &str,
     max_tokens: usize,
-    temperature: f32,
+    temperature: Option<f32>,
     chat: bool,
+    no_chat: bool,
+    max_active: Option<u16>,
+    batch_min: Option<u16>,
+    prefill_chunk: usize,
     weights_pool_gb: f64,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1276,29 +2005,71 @@ fn cmd_run(
     hot_pages: usize,
     prefix_cache: bool,
     spec: SpeculativeConfig,
+    tp_cards: Vec<forge_hal::gpu::DeviceId>,
+    tp_world: usize,
 ) -> Result<()> {
+    // Ustawienia domyślne bierze profil modelu; flagi CLI je nadpisują. Bez tego
+    // `forge run <model> "<prompt>"` losowałby przy temperaturze 0,7 i podawał
+    // surowy prompt modelowi instrukcyjnemu — jedno i drugie wygląda jak awaria
+    // modelu, a jest tylko złym ustawieniem domyślnym.
+    let profile =
+        forge_engine::model_profile::resolve(&forge_engine::model_profile::identify(model_path));
+    let mut sampling = config::sampling_from_profile(profile);
+    sampling.temperature = temperature.unwrap_or(profile.temperature);
+    // `--ctx 0` znaczy „pełne okno modelu"; profil podaje wartość tam, gdzie
+    // pełne okno jest niepraktyczne (Gemma 4 żąda wtedy ponad 100 GB VRAM).
+    let ctx = if ctx == 0 {
+        profile.default_ctx.unwrap_or(0)
+    } else {
+        ctx
+    };
+    let chat = if chat {
+        true
+    } else if no_chat {
+        false
+    } else {
+        profile.chat_template
+    };
+    eprintln!(
+        "profil modelu: {} (temp {}, szablon czatu {})",
+        profile.label, sampling.temperature, chat
+    );
+
     let t0 = Instant::now();
-    // Speculation is mutually exclusive with the radix prefix cache (both manage
-    // paged KV ownership); enabling it forces prefix caching off.
-    let prefix_cache = prefix_cache && !spec.is_enabled();
+    let max_active = resolve_max_active(max_active, &spec, false)?;
     let mut loaded = load_auto(
         model_path,
+        max_active,
         weights_pool_gb,
+        weight_host_gb,
+        weight_spill_dir,
         kv_quant,
         kv_tier,
         ctx,
         kv_pages,
         hot_pages,
         prefix_cache,
-        spec.kind() == SpeculationKind::NativeMtp,
+        spec.is_native_mtp(),
+        Nvfp4GgufLayout::RowMajor36,
+        tp_world,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    enable_tp_ffn(&mut loaded.model, model_path, &tp_cards, weights_pool_gb)?;
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        true,
+        None,
+    )?;
 
     let prompt_text = if chat {
         ChatTemplateEngine::new()
             .render(
-                &loaded.chat_template,
+                &config::chat_template(
+                    &loaded.model.weights.descriptor.arch,
+                    loaded.chat_template.clone(),
+                )?,
                 &[ChatMessage::text("user", prompt)],
                 None,
                 true,
@@ -1312,39 +2083,65 @@ fn cmd_run(
 
     let eos_ids = loaded.bundle.eos_ids.clone();
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
-    let prompt_tokens = tokenizer
-        .encode(&prompt_text, true)
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let engine = forge_engine::server::spawn_engine_batched(loaded.model, tokenizer, 1, 16, 12, spec)?;
+    let prompt_tokens = (if chat {
+        tokenizer.encode_chat_template(&prompt_text)
+    } else {
+        tokenizer.encode(&prompt_text, true)
+    })
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Single sequence: full-size prefill chunks, no other decode ITL to protect.
+    let engine = forge_engine::server::spawn_engine_batched(
+        loaded.model,
+        tokenizer,
+        config::DEFAULT_MAX_ACTIVE,
+        prefill_chunk,
+        batch_min
+            .map(usize::from)
+            .unwrap_or(config::DEFAULT_BATCH_MIN),
+        spec,
+    )?;
 
     let submit_at = Instant::now();
-    let (generated, prompt_len, _first, done_at) = drain_request(
+    let outcome = drain_request(
         &engine,
         EngineRequest {
             prompt_tokens,
             max_tokens,
-            sampling: SamplingParams {
-                temperature,
-                ..SamplingParams::default()
-            },
-            stop: vec![],
+            sampling,
+            stop: profile
+                .stop
+                .iter()
+                .map(|stop| (*stop).to_string())
+                .collect(),
             eos_ids,
             grammar: None,
             ..Default::default()
         },
-        |piece| {
+        |_, piece| {
             use std::io::Write;
             print!("{piece}");
             std::io::stdout().flush().ok();
         },
     )?;
     println!();
-    let dt = done_at.duration_since(submit_at).as_secs_f32();
+    let dt = outcome.done_at.duration_since(submit_at).as_secs_f32();
     eprintln!(
-        "{prompt_len} prompt + {generated} generated in {dt:.2}s ({:.1} tok/s overall)",
-        (prompt_len + generated) as f32 / dt
+        "{} prompt + {} generated in {dt:.2}s ({:.1} tok/s overall)",
+        outcome.prompt_tokens,
+        outcome.generated,
+        (outcome.prompt_tokens + outcome.generated) as f32 / dt
     );
+    shutdown_engine(engine)?;
     Ok(())
+}
+
+/// Zatrzymuje wątek roboczy silnika przed wyjściem z procesu.
+///
+/// Wątek trzyma model i zasoby urządzenia. Bez dołączenia go proces wychodzi w
+/// chwili, gdy on jeszcze je zwalnia, a sterownik GPU jest już w trakcie własnej
+/// rozbiórki — na ROCm kończy się to uszkodzeniem sterty hosta.
+fn shutdown_engine(engine: EngineHandle) -> Result<()> {
+    engine.shutdown().map_err(|e| anyhow::anyhow!(e))
 }
 
 /// Held-out passage for the perplexity gate — deliberately DISTINCT from the
@@ -1366,13 +2163,87 @@ second, enabling the training and deployment of large neural networks that \
 translate languages, recognize images, and generate fluent text across dozens \
 of domains and writing styles with remarkable and often surprising competence.";
 
+/// Print the capability report of every visible device.
+///
+/// Kernel selection is meant to follow facts about the hardware rather than
+/// proxies for them, and this is where those facts become readable. It exists
+/// because the alternative was assembling a probe instruction with `ptxas` by
+/// hand every time the question came up.
+fn cmd_caps() -> Result<()> {
+    let devices = forge_hal::gpu::enumerate();
+    if devices.is_empty() {
+        println!("nie znaleziono zadnego urzadzenia GPU");
+        return Ok(());
+    }
+    for id in devices {
+        // Najmniejsze pule, jakie backend przyjmie: pytamy o zdolnosci, nie
+        // uruchamiamy modelu, wiec zajmowanie VRAM byloby czysta szkoda.
+        let device = forge_hal::gpu::open_id(
+            id,
+            forge_hal::PoolSizes {
+                weights: 0,
+                kv_cache: 0,
+                activations: 0,
+                kv_page_size: forge_hal::PoolSizes::DEFAULT_KV_PAGE,
+            },
+        )?;
+        let c = device.caps();
+        println!("{} ({:?}, {})", c.name, c.vendor, c.arch);
+        println!("  pamiec                {} MiB", c.total_memory >> 20);
+        println!(
+            "  SM / warp / watki     {} / {} / {}",
+            c.sm_count, c.warp_size, c.max_threads_per_block
+        );
+        println!(
+            "  pamiec wspoldzielona  {} KiB na blok",
+            c.max_shared_mem_per_block >> 10
+        );
+        println!("  bf16                  {}", tak_nie(c.bf16_native));
+        println!("  fp8 (e4m3/e5m2)       {}", tak_nie(c.fp8_native));
+        println!(
+            "  fp4 blokowe ue8m0     {}   (MXFP4)",
+            tak_nie(c.fp4_block_scale_ue8m0)
+        );
+        println!(
+            "  fp4 blokowe e4m3      {}   (NVFP4 natywnie)",
+            tak_nie(c.fp4_block_scale_e4m3)
+        );
+        println!(
+            "  wgmma                 {}   (rdzen FlashAttention-3)",
+            tak_nie(c.wgmma)
+        );
+        println!(
+            "  tcgen05 + TMEM        {}   (rdzen FlashAttention-4)",
+            tak_nie(c.tcgen05)
+        );
+        println!("  TMA                   {}", tak_nie(c.tma));
+        println!(
+            "  grafy / P2P           {} / {}",
+            tak_nie(c.supports_graph_capture),
+            tak_nie(c.supports_p2p)
+        );
+    }
+    Ok(())
+}
+
+fn tak_nie(value: bool) -> &'static str {
+    if value {
+        "jest "
+    } else {
+        "brak "
+    }
+}
+
 /// Compute mean next-token perplexity of the held-out passage under the active
 /// GEMM backend (W4A8 when `FORGE_GEMM=w4a8`, else the committed Q4_K path).
 fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
     let t0 = Instant::now();
     let mut loaded = load_auto(
         model_path,
+        1,
         0.0,
+        0.0,
+        None,
         KvQuant::F16,
         KvTierConfig::default(),
         ctx,
@@ -1380,9 +2251,17 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
         0,
         false,
         false,
+        Nvfp4GgufLayout::RowMajor36,
+        1,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        false,
+        None,
+    )?;
 
     let tokens = loaded
         .bundle
@@ -1401,30 +2280,116 @@ fn cmd_ppl(model_path: &Path, ctx: usize) -> Result<()> {
 /// Build the W4A8 SmoothQuant packs when `FORGE_GEMM=w4a8` is selected. A
 /// one-time calibration over the embedded passage; GGUF sources only (the dense
 /// W4A8 gate model). No-op for any other GEMM backend.
+///
+/// Pozwala przeliczyć deficyt puli wag na liczbę stron KV, których zwolnienie
+/// REALNIE go pokryje. Slab każdej warstwy jest zaokrąglany do granulacji
+/// alokatora osobno, więc pula maleje skokami i średnia na stronę zaniża wynik.
+struct KvPoolProbe<'a> {
+    pages: usize,
+    bytes_for: &'a dyn Fn(usize) -> Option<usize>,
+}
+
+impl KvPoolProbe<'_> {
+    fn pages_to_free(&self, deficit: usize) -> Option<usize> {
+        let current = (self.bytes_for)(self.pages)?;
+        (1..self.pages).find(|freed| {
+            (self.bytes_for)(self.pages - freed)
+                .is_some_and(|smaller| current.saturating_sub(smaller) >= deficit)
+        })
+    }
+}
+
+/// Zgłasza operatorowi, że szybki prefill FP8 wypadł WYŁĄCZNIE przez budżet
+/// puli wag — wcześniej ten przypadek był nieodróżnialny od braku wsparcia
+/// sprzętowego i cicho zostawiał serwer na wolniejszym prefillu NVFP4.
+fn report_fp8_pool_shortfall(
+    label: &str,
+    required: usize,
+    available: usize,
+    kv_probe: Option<&KvPoolProbe<'_>>,
+) {
+    let gib = |bytes: usize| bytes as f64 / (1u64 << 30) as f64;
+    let deficit = required.saturating_sub(available);
+    let remedy = match kv_probe.and_then(|probe| probe.pages_to_free(deficit)) {
+        Some(pages) => format!(
+            "zmniejsz --kv-pages o co najmniej {pages} (albo --ctx), lub podnieś --weights-pool-gb"
+        ),
+        None => "zmniejsz --kv-pages albo --ctx, lub podnieś --weights-pool-gb".to_string(),
+    };
+    tracing::warn!(
+        required_bytes = required,
+        available_bytes = available,
+        deficit_bytes = deficit,
+        "paczki FP8 nie mieszczą się w puli wag"
+    );
+    eprintln!(
+        "{label}: paczki FP8 wymagają {:.2} GiB, pula wag ma {:.2} GiB (brakuje {:.2} GiB) \
+         — prefill zostaje na wolniejszej ścieżce; {remedy}",
+        gib(required),
+        gib(available),
+        gib(deficit)
+    );
+}
+
+/// `auto_gguf_fp8` (serve, run, bench — everything except `ppl`, which is a
+/// quality gate documented to run exactly the GEMM `FORGE_GEMM` names): with
+/// FORGE_GEMM unset, a dense GGUF model on
+/// an fp8-native device whose projection shapes all have committed Modular fp8
+/// instances gets the fp8mod prefill automatically (near-lossless, ~2× the
+/// native int8 prefill); `FORGE_GEMM=mojo` keeps the native path explicitly.
 fn maybe_calibrate_w4a8(
     model: &mut forge_engine::model::Model,
     path: &Path,
     tokenizer: &forge_tokenize::Tokenizer,
+    auto_gguf_fp8: bool,
+    kv_probe: Option<&KvPoolProbe<'_>>,
 ) -> Result<()> {
     let gemm = std::env::var("FORGE_GEMM").ok();
-    if gemm.as_deref() == Some("fp8mod-ffn") {
+    let auto_fp8_ffn = gemm.is_none() && path.is_dir();
+    if gemm.as_deref() == Some("fp8mod-ffn") || auto_fp8_ffn {
         if !path.is_dir() {
             bail!("FORGE_GEMM=fp8mod-ffn wymaga katalogu checkpointu NVFP4");
         }
         let t0 = Instant::now();
-        if model.build_fp8_ffn()? {
-            eprintln!(
-                "paczki FP8 Q/O/FFN/lm_head zbudowane na GPU w {:.3}s (K/V i warstwy decode pozostają NVFP4)",
+        match model.build_fp8_ffn()? {
+            Fp8PackOutcome::Built => eprintln!(
+                "paczki FP8 Q/O/K/V/FFN/lm_head zbudowane na GPU w {:.3}s (dekodowanie zostaje na NVFP4)",
                 t0.elapsed().as_secs_f32()
-            );
-        } else {
-            eprintln!("fp8mod-ffn niedostępny dla urządzenia, kształtów lub puli VRAM; pozostaje NVFP4");
+            ),
+            Fp8PackOutcome::Unsupported => {
+                eprintln!("fp8mod-ffn niedostępny dla urządzenia lub kształtów; pozostaje NVFP4")
+            }
+            Fp8PackOutcome::PoolShortfall {
+                required,
+                available,
+            } => report_fp8_pool_shortfall("fp8mod-ffn", required, available, kv_probe),
+        }
+        return Ok(());
+    }
+    if gemm.is_none() && auto_gguf_fp8 && path.extension().and_then(|e| e.to_str()) == Some("gguf")
+    {
+        let t0 = Instant::now();
+        match model.build_fp8_modular_auto(path)? {
+            Fp8PackOutcome::Built => eprintln!(
+                "auto fp8mod: paczki e4m3 zbudowane w {:.1}s (prefill Modular fp8, decode zostaje na natywnym GGUF)",
+                t0.elapsed().as_secs_f32()
+            ),
+            Fp8PackOutcome::Unsupported => {
+                eprintln!("auto fp8mod niedostępny dla urządzenia lub kształtów; prefill zostaje natywny")
+            }
+            Fp8PackOutcome::PoolShortfall {
+                required,
+                available,
+            } => report_fp8_pool_shortfall("auto fp8mod", required, available, kv_probe),
         }
         return Ok(());
     }
     if matches!(gemm.as_deref(), Some("fp8") | Some("fp8mod")) {
         if path.extension().and_then(|e| e.to_str()) != Some("gguf") {
-            bail!("FORGE_GEMM={} currently supports GGUF models only", gemm.unwrap());
+            bail!(
+                "FORGE_GEMM={} currently supports GGUF models only",
+                gemm.unwrap()
+            );
         }
         let t0 = Instant::now();
         model.build_fp8(path)?;
@@ -1461,8 +2426,15 @@ fn maybe_calibrate_w4a8(
 #[allow(clippy::too_many_arguments)]
 fn cmd_bench(
     model_path: &Path,
+    max_active: Option<u16>,
+    batch_min: Option<u16>,
+    prefill_chunk: usize,
     tokens: usize,
     prompt_tokens: usize,
+    prompt_token_ids: Option<&Path>,
+    weights_pool_gb: f64,
+    weight_host_gb: f64,
+    weight_spill_dir: Option<std::path::PathBuf>,
     kv_quant: KvQuant,
     kv_tier: KvTierConfig,
     ctx: usize,
@@ -1471,69 +2443,141 @@ fn cmd_bench(
     prefix_cache: bool,
     spec: SpeculativeConfig,
     reps: usize,
+    tp_cards: Vec<forge_hal::gpu::DeviceId>,
+    tp_split: Option<Vec<usize>>,
+    tp_world: usize,
 ) -> Result<()> {
     if tokens < 2 {
         bail!("--tokens must be at least 2 to measure decode throughput");
     }
-    if prompt_tokens == 0 {
+    if prompt_tokens == 0 && prompt_token_ids.is_none() {
         bail!("--prompt-tokens must be at least 1");
     }
     if reps == 0 {
         bail!("--reps must be at least 1");
     }
+    let max_active = resolve_max_active(max_active, &spec, false)?;
     let t0 = Instant::now();
-    let prefix_cache = prefix_cache && !spec.is_enabled();
     let mut loaded = load_auto(
         model_path,
-        0.0,
+        max_active,
+        weights_pool_gb,
+        weight_host_gb,
+        weight_spill_dir,
         kv_quant,
         kv_tier,
         ctx,
         kv_pages,
         hot_pages,
         prefix_cache,
-        spec.kind() == SpeculationKind::NativeMtp,
+        spec.is_native_mtp(),
+        resolve_bench_nvfp4_gguf_layout_from_env(spec.kind(), max_active)?,
+        tp_world,
     )?;
     eprintln!("model loaded in {:.1}s", t0.elapsed().as_secs_f32());
-    maybe_calibrate_w4a8(&mut loaded.model, model_path, &loaded.bundle.tokenizer)?;
+    enable_tp_ffn_with(
+        &mut loaded.model,
+        model_path,
+        &tp_cards,
+        weights_pool_gb,
+        tp_split.as_deref(),
+    )?;
+    maybe_calibrate_w4a8(
+        &mut loaded.model,
+        model_path,
+        &loaded.bundle.tokenizer,
+        true,
+        None,
+    )?;
 
     let tokenizer = Arc::new(loaded.bundle.tokenizer);
-    // Cycle a natural-language seed to the exact requested prompt length so
-    // prefill cost is measured on realistic token ids.
-    let seed_ids = tokenizer
-        .encode(
-            "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
-            false,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?;
-    let prompt_ids: Vec<u32> = seed_ids
-        .iter()
-        .cycle()
-        .take(prompt_tokens)
-        .copied()
-        .collect();
+    let (prompt_ids, prompt_sha256, prompt_source) = if let Some(path) = prompt_token_ids {
+        let input = bench::TokenInput::read_u32le(path)?;
+        (input.ids, input.sha256, path.display().to_string())
+    } else {
+        let seed_ids = tokenizer
+            .encode(
+                "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
+                false,
+            )
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        let ids: Vec<u32> = seed_ids
+            .iter()
+            .cycle()
+            .take(prompt_tokens)
+            .copied()
+            .collect();
+        let sha = bench::sha256_ids(&ids);
+        (ids, sha, "tokenizer-seed".into())
+    };
+    if prompt_ids.is_empty() {
+        bail!("benchmark prompt must contain at least one token");
+    }
+    let model_sha256 = model_path
+        .is_file()
+        .then(|| bench::sha256_file(model_path))
+        .transpose()?;
+    let (nvfp4_gguf_layout, nvfp4_repacked_weights) = loaded.model.nvfp4_gguf_layout_summary();
+    let bos_id = tokenizer.bos_id();
+    eprintln!(
+        "{}",
+        serde_json::json!({
+            "benchmark_input": {
+                "format": "u32le",
+                "source": prompt_source,
+                "sha256": prompt_sha256,
+                "token_count": prompt_ids.len(),
+                "first_token_id": prompt_ids.first(),
+                "tokenizer_bos_id": bos_id,
+                "starts_with_bos": bos_id.is_some_and(|id| prompt_ids.first() == Some(&id)),
+            },
+            "model": {
+                "path": model_path.display().to_string(),
+                "sha256": model_sha256,
+            },
+            "config": {
+                "ctx": ctx,
+                "kv_pages": kv_pages,
+                "hot_pages": hot_pages,
+                "weights_pool_gb": weights_pool_gb,
+                "kv_cache": format!("{kv_quant:?}"),
+                "prefix_cache": prefix_cache,
+                "speculation": format!("{:?}", spec.kind()),
+                "nvfp4_gguf_layout": format!("{nvfp4_gguf_layout:?}"),
+                "nvfp4_repacked_weights": nvfp4_repacked_weights,
+                "warmup_runs": 1,
+                "measured_runs": reps,
+            }
+        })
+    );
+
+    loaded
+        .model
+        .prepare_prefill_profiles(prompt_ids.len(), reps + 1)?;
 
     // Single-sequence bench: full-size prefill chunks, no ITL to protect.
     let engine = forge_engine::server::spawn_engine_batched(
         loaded.model,
         tokenizer,
-        1,
-        forge_engine::model::MAX_PREFILL_CHUNK,
-        12,
+        max_active,
+        prefill_chunk,
+        batch_min
+            .map(usize::from)
+            .unwrap_or(config::DEFAULT_BATCH_MIN),
         spec,
     )?;
-    // Warm best-of-N: re-submit the identical request `reps` times reusing the
-    // loaded engine. With prefix caching off each rep re-runs the full prefill,
-    // so the cold first GEMM launch (throttled ~2× on the 4090) lands in rep 1
-    // and is discarded when reps > 1. Best (fastest) prefill and decode win.
-    let mut best_prefill_s = f64::INFINITY;
-    let mut best_decode_s = f64::INFINITY;
+    let mut target_ms = Vec::with_capacity(reps);
+    let mut catchup_ms = Vec::with_capacity(reps);
+    let mut ttft_ms = Vec::with_capacity(reps);
+    let mut decode_s = Vec::with_capacity(reps);
     let mut last_prompt_len = 0usize;
     let mut last_generated = 0usize;
-    for rep in 0..reps {
+    let mut generated_sha256 = None;
+    for rep in 0..=reps {
         let submit_at = Instant::now();
+        let mut generated_ids = Vec::with_capacity(tokens);
         // No EOS ids: the benchmark must decode exactly `tokens` tokens.
-        let (generated, prompt_len, first_at, done_at) = drain_request(
+        let outcome = drain_request(
             &engine,
             EngineRequest {
                 prompt_tokens: prompt_ids.clone(),
@@ -1547,49 +2591,291 @@ fn cmd_bench(
                 grammar: None,
                 ..Default::default()
             },
-            |_| {},
+            |id, _| generated_ids.push(id),
         )?;
-        let prefill_s = first_at.duration_since(submit_at).as_secs_f64();
-        let decode_s = done_at.duration_since(first_at).as_secs_f64();
+        let DrainOutcome {
+            generated,
+            prompt_tokens: prompt_len,
+            cache_read_tokens,
+            first_token_at: first_at,
+            done_at,
+            benchmark: profile,
+        } = outcome;
+        // Prefill mierzy się po PEŁNYM promptcie. Trafienie w cache prefiksów
+        // przelicza tylko rozbieżny ogon, a czas nadal dzielilibyśmy przez całą
+        // długość promptu — stąd zawyżone tok/s (zmierzone 44 537 zamiast 14 775
+        // na Mistralu-7B Q4_K_M). Dlatego to błąd, nie ostrzeżenie.
+        if cache_read_tokens != 0 {
+            bail!(
+                "cache prefiksów obsłużył {cache_read_tokens} z {prompt_len} tokenów promptu w powtórzeniu {rep}; przepustowość prefillu byłaby zawyżona — uruchom benchmark z --prefix-cache off"
+            );
+        }
+        let run_sha256 = bench::sha256_ids(&generated_ids);
+        if let Some(expected) = &generated_sha256 {
+            if expected != &run_sha256 {
+                bail!("greedy token IDs differ between benchmark repetitions");
+            }
+        } else {
+            generated_sha256 = Some(run_sha256.clone());
+        }
+        let visible_ttft_s = first_at.duration_since(submit_at).as_secs_f64();
+        let decode_elapsed_s = done_at.duration_since(first_at).as_secs_f64();
         last_prompt_len = prompt_len;
         last_generated = generated;
-        let prefill_tps = prompt_len as f64 / prefill_s.max(1e-9);
-        let decode_tps = (generated.saturating_sub(1)) as f64 / decode_s.max(1e-9);
+        let profile = profile.context("worker nie zwrócił profilu prefill")?;
+        let target = profile
+            .target_gpu_ms
+            .context("backend nie udostępnia czasu GPU target prefill")?;
+        let catchup = profile
+            .mtp_catchup_gpu_ms
+            .context("backend nie udostępnia czasu GPU MTP catch-up")?;
+        let prefill_tps = prompt_len as f64 / (target / 1000.0).max(1e-9);
+        let decode_tps = (generated.saturating_sub(1)) as f64 / decode_elapsed_s.max(1e-9);
         eprintln!(
-            "rep {}/{reps}: prefill {prefill_s:.3}s ({prefill_tps:.1} tok/s) | decode {decode_s:.3}s ({decode_tps:.1} tok/s)",
-            rep + 1
+            "{} {}/{}: target {:.3} ms ({prefill_tps:.1} tok/s) | MTP catch-up {:.3} ms | TTFT {:.3} ms | visible TTFT {:.3} ms | decode {:.1} tok/s",
+            if rep == 0 { "warmup" } else { "rep" },
+            if rep == 0 { 1 } else { rep },
+            if rep == 0 { 1 } else { reps },
+            target,
+            catchup,
+            profile.ttft_ms,
+            visible_ttft_s * 1000.0,
+            decode_tps,
         );
-        // Discard rep 1 (cold) from the best-of when averaging over multiple reps.
-        if reps > 1 && rep == 0 {
+        eprintln!("generated token SHA256: {run_sha256}");
+        if rep == 0 {
             continue;
         }
-        best_prefill_s = best_prefill_s.min(prefill_s);
-        best_decode_s = best_decode_s.min(decode_s);
+        target_ms.push(target);
+        catchup_ms.push(catchup);
+        ttft_ms.push(profile.ttft_ms);
+        decode_s.push(decode_elapsed_s);
     }
-
-    // Honest measurement note: "prefill" is submit → first visible token,
-    // which includes at least one decode step (and possibly a couple more if
-    // the decoder held back partial UTF-8); "decode" covers the remaining
-    // generated tokens as counted by the engine's usage numbers. Prefill runs
-    // through the batched chunked path (one chunk per scheduler iteration).
-    let prefill_tps = last_prompt_len as f64 / best_prefill_s.max(1e-9);
-    let decode_tps = (last_generated.saturating_sub(1)) as f64 / best_decode_s.max(1e-9);
-
-    println!("| phase   | tokens | seconds | tok/s   |");
-    println!("|---------|--------|---------|---------|");
-    println!("| prefill | {last_prompt_len:>6} | {best_prefill_s:>7.3} | {prefill_tps:>7.1} |");
+    let target = bench::Distribution::from_samples(&target_ms)?;
+    let catchup = bench::Distribution::from_samples(&catchup_ms)?;
+    let ttft = bench::Distribution::from_samples(&ttft_ms)?;
+    let decode = bench::Distribution::from_samples(&decode_s)?;
+    println!("| phase | tokens | p10 ms | median ms | p90 ms | median tok/s |");
+    println!("|---|---:|---:|---:|---:|---:|");
     println!(
-        "| decode  | {:>6} | {best_decode_s:>7.3} | {decode_tps:>7.1} |",
-        last_generated.saturating_sub(1)
+        "| target prefill | {last_prompt_len} | {:.3} | {:.3} | {:.3} | {:.1} |",
+        target.p10,
+        target.median,
+        target.p90,
+        last_prompt_len as f64 / (target.median / 1000.0).max(1e-9)
     );
-    eprintln!("note: prefill is timed to the first visible token, so it includes >=1 decode step");
+    println!(
+        "| MTP catch-up | {last_prompt_len} | {:.3} | {:.3} | {:.3} | - |",
+        catchup.p10, catchup.median, catchup.p90
+    );
+    println!(
+        "| TTFT | 1 | {:.3} | {:.3} | {:.3} | - |",
+        ttft.p10, ttft.median, ttft.p90
+    );
+    println!(
+        "| decode | {} | {:.3} | {:.3} | {:.3} | {:.1} |",
+        last_generated.saturating_sub(1),
+        decode.p10 * 1000.0,
+        decode.median * 1000.0,
+        decode.p90 * 1000.0,
+        last_generated.saturating_sub(1) as f64 / decode.median.max(1e-9)
+    );
+    shutdown_engine(engine)?;
     Ok(())
 }
 
 #[cfg(test)]
 mod speculation_cli_tests {
-    use super::{parse_speculative, resolve_max_active};
+    use super::{
+        activation_pool_bytes, kv_full_context_admission_capacity, parse_speculative,
+        resolve_bench_nvfp4_gguf_layout, resolve_kv_pool_layout, resolve_max_active,
+        resolve_nvfp4_ct_layout,
+    };
+    use forge_engine::kv::KvQuant;
+    use forge_engine::model::Nvfp4GgufLayout;
     use forge_engine::speculation::{ProposerKind, SpeculationKind};
+    use forge_engine::tier::{KvTierConfig, KvTierMode};
+    use forge_engine::weights::NvFp4CtLayoutPolicy;
+    use forge_formats::{HfConfig, LayerKind, ModelDescriptor};
+    fn qwen_hybrid_descriptor() -> ModelDescriptor {
+        let config: HfConfig = serde_json::from_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 4096,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "intermediate_size": 12288,
+                "vocab_size": 248320,
+                "max_position_embeddings": 262144
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.layer_kinds = [
+            vec![LayerKind::DeltaNet; 48],
+            vec![LayerKind::Attention; 16],
+        ]
+        .concat();
+        descriptor
+    }
+
+    fn ram_tier() -> KvTierConfig {
+        KvTierConfig {
+            mode: KvTierMode::Ram,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn layout_serve_dla_4096_tokenow_nie_ma_progu_jeden_gib() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout = resolve_kv_pool_layout(
+            &descriptor,
+            32,
+            128,
+            128,
+            0,
+            &KvTierConfig::default(),
+            KvQuant::F16,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(layout.bytes, 320 << 20);
+    }
+
+    #[test]
+    fn layout_serve_zachowuje_domyslne_512_stron() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout = resolve_kv_pool_layout(
+            &descriptor,
+            32,
+            128,
+            512,
+            0,
+            &KvTierConfig::default(),
+            KvQuant::F16,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(layout.pages, 512);
+    }
+
+    #[test]
+    fn layout_tier_zero_oznacza_pelny_kontekst() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout =
+            resolve_kv_pool_layout(&descriptor, 32, 128, 0, 0, &ram_tier(), KvQuant::F16, false)
+                .unwrap();
+
+        assert_eq!(layout.pages, 128);
+    }
+
+    #[test]
+    fn layout_tier_odrzuca_pule_ponizej_minimum_rezydencji() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let result =
+            resolve_kv_pool_layout(&descriptor, 32, 128, 1, 0, &ram_tier(), KvQuant::F16, false);
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn layout_hot_ma_pierwszenstwo_nad_liczba_stron() {
+        let descriptor = qwen_hybrid_descriptor();
+
+        let layout = resolve_kv_pool_layout(
+            &descriptor,
+            32,
+            128,
+            512,
+            64,
+            &ram_tier(),
+            KvQuant::F16,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(layout.pages, 64);
+    }
+
+    #[test]
+    fn admission_pelnego_kontekstu_respektuje_max_active_i_pule() {
+        let capacity = kv_full_context_admission_capacity(512, 128, 32, false, 8);
+
+        assert_eq!(capacity, 4);
+    }
+
+    #[test]
+    fn tile_nvfp4_benchmark_domyslnie_pozostaje_wylaczony() {
+        assert_eq!(
+            resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 1, "0").unwrap(),
+            Nvfp4GgufLayout::RowMajor36
+        );
+    }
+
+    #[test]
+    fn parser_layoutu_nvfp4_ct_obsluguje_wszystkie_tryby() {
+        assert_eq!(
+            resolve_nvfp4_ct_layout("row").unwrap(),
+            NvFp4CtLayoutPolicy::RowMajorE4M3
+        );
+        assert_eq!(
+            resolve_nvfp4_ct_layout("s0").unwrap(),
+            NvFp4CtLayoutPolicy::S0N64K128
+        );
+        assert_eq!(
+            resolve_nvfp4_ct_layout("auto").unwrap(),
+            NvFp4CtLayoutPolicy::Auto
+        );
+        assert!(resolve_nvfp4_ct_layout("1").is_err());
+    }
+
+    #[test]
+    fn tile_nvfp4_benchmark_wymaga_jawnego_opt_in() {
+        assert_eq!(
+            resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 1, "1").unwrap(),
+            Nvfp4GgufLayout::TileN128K64
+        );
+    }
+
+    #[test]
+    fn tile_nvfp4_benchmark_odrzuca_spekulacje_i_batch() {
+        for kind in [
+            SpeculationKind::HostProposer,
+            SpeculationKind::NativeMtp,
+            SpeculationKind::NativeMtpNgram,
+        ] {
+            assert_eq!(
+                resolve_bench_nvfp4_gguf_layout(kind, 1, "0").unwrap(),
+                Nvfp4GgufLayout::RowMajor36
+            );
+            assert!(resolve_bench_nvfp4_gguf_layout(kind, 1, "1").is_err());
+        }
+        assert_eq!(
+            resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 2, "0").unwrap(),
+            Nvfp4GgufLayout::RowMajor36
+        );
+        assert!(resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 2, "1").is_err());
+        assert!(resolve_bench_nvfp4_gguf_layout(SpeculationKind::Off, 1, "auto").is_err());
+    }
+
+    #[test]
+    fn admission_tier_uzywa_minimum_stron_rezydentnych() {
+        let floor = forge_engine::tier::min_resident_pages(32);
+
+        let capacity = kv_full_context_admission_capacity(floor * 3, 128, 32, true, 8);
+
+        assert_eq!(capacity, 3);
+    }
 
     #[test]
     fn parser_rejects_unsupported_budget_and_neural_proposer() {
@@ -1609,6 +2895,19 @@ mod speculation_cli_tests {
     }
 
     #[test]
+    fn parser_accepts_hybrid_ngram_budgets() {
+        for budget in [2, 3] {
+            let config = parse_speculative(&format!("ngram:{budget}"))
+                .expect("budżet hybrydowego n-gram powinien być poprawny");
+            assert_eq!(config.kind(), SpeculationKind::HostProposer);
+            assert_eq!(config.draft_tokens(), budget);
+            assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
+            assert_eq!(resolve_max_active(None, &config, false).unwrap(), 1);
+            assert!(!config.proposers().contains(&ProposerKind::Mtp));
+        }
+    }
+
+    #[test]
     fn parser_accepts_native_mtp_budgets() {
         for (input, expected_budget) in [("mtp", 3), ("mtp:2", 2), ("mtp:3", 3)] {
             let config = parse_speculative(input).expect("MTP powinno być obsługiwane");
@@ -1619,12 +2918,40 @@ mod speculation_cli_tests {
     }
 
     #[test]
+    fn parser_accepts_mtp_ngram_router() {
+        for (input, expected_budget) in [("mtp+ngram", 3), ("mtp+ngram:2", 2), ("mtp+ngram:3", 3)] {
+            let config = parse_speculative(input).expect("router powinien być obsługiwany");
+            assert_eq!(
+                config.proposers(),
+                &[ProposerKind::Mtp, ProposerKind::Ngram]
+            );
+            assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
+            assert_eq!(config.draft_tokens(), expected_budget);
+            assert_eq!(resolve_max_active(None, &config, true).unwrap(), 1);
+            assert_eq!(resolve_max_active(Some(2), &config, true).unwrap(), 2);
+        }
+    }
+
+    #[test]
     fn mtp_domyslnie_ogranicza_serwer_do_jednej_sekwencji() {
         let mtp = parse_speculative("mtp").unwrap();
         let off = parse_speculative("off").unwrap();
-        assert_eq!(resolve_max_active(None, &mtp).unwrap(), 1);
-        assert_eq!(resolve_max_active(None, &off).unwrap(), 8);
-        assert_eq!(resolve_max_active(Some(1), &mtp).unwrap(), 1);
-        assert!(resolve_max_active(Some(2), &mtp).is_err());
+        assert_eq!(resolve_max_active(None, &mtp, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(None, &off, false).unwrap(), 1);
+        assert_eq!(resolve_max_active(None, &off, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(Some(1), &mtp, true).unwrap(), 1);
+        assert_eq!(resolve_max_active(Some(2), &mtp, true).unwrap(), 2);
+        assert!(resolve_max_active(Some(0), &mtp, true).is_err());
+    }
+
+    #[test]
+    fn pula_aktywacji_rosnie_z_liczba_linii() {
+        assert_eq!(activation_pool_bytes(true, 8, 24 << 30), 1152 << 20);
+        assert_eq!(activation_pool_bytes(false, 8, 24 << 30), 1 << 30);
+        assert_eq!(
+            activation_pool_bytes(true, 32, 24 << 30),
+            (1152 << 20) + 24 * (16 << 20)
+        );
+        assert_eq!(activation_pool_bytes(true, 8, 128 << 30), 4 << 30);
     }
 }

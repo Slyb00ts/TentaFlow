@@ -5,7 +5,11 @@ edition = "2021"
 description = "TentaFlow Core — wspolna biblioteka dla Router, Desktop i Mobile"
 
 [features]
-default = ["camera"]
+# Vision (camera CV) is NOT optional: the analysis engine, its pipeline and the
+# vision worker ship in every build. Keeping it behind an opt-in feature meant
+# `cargo test`/`cargo check` silently skipped the whole module, so regressions in
+# it went unnoticed until runtime.
+default = ["camera", "inference-vision-gpu", "inference-supertonic"]
 docker = ["dep:bollard"]
 inference-llamacpp = ["dep:tentaflow-wrappers", "tentaflow-wrappers/llama"]
 inference-whisper = ["dep:tentaflow-wrappers", "tentaflow-wrappers/whisper"]
@@ -33,6 +37,9 @@ inference-mlx-kokoro = ["dep:libloading"]
 # statycznie), wiec NIE koliduje z sherpa-rs (ktore tez linkuje onnxruntime
 # dynamicznie) — oba moga byc wlaczone naraz bez kolizji symboli linkera.
 inference-supertonic = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
+# ONNX Runtime dla głównej ścieżki wizji. Jest niezależny od Supertonic, żeby
+# AMD/Intel mogły używać Burn przez WGPU/Vulkan przy zachowaniu TTS przez ORT.
+vision-ort = ["dep:ort", "dep:ndarray", "dep:rand_distr", "dep:unicode-normalization", "dep:crossbeam-channel"]
 # RF-DETR ADR detector (Burn). Gates the whole detector/state/OCR modules + the
 # per-camera always-on analysis loop. Pulls the wgpu backend as the universal
 # floor; add `vision-cuda`/`vision-metal`/`vision-rocm` for a native backend.
@@ -41,9 +48,12 @@ inference-vision-gpu = ["vision-wgpu"]
 # feature picks the runtime (defaults to wgpu when none of cuda/metal/rocm set).
 vision-burn = ["dep:burn", "dep:burn-store", "burn/std"]
 vision-wgpu = ["vision-burn", "burn/wgpu", "burn/ndarray"]
-vision-cuda = ["vision-burn", "burn/cuda"]
+vision-cuda = ["vision-burn", "burn/cuda", "vision-ort", "vision-cuda-preprocess"]
 vision-metal = ["vision-burn", "burn/metal"]
 vision-rocm = ["vision-burn", "burn/rocm"]
+# CUDA-only preprocessing klatek NV12/RGB dla ścieżki zero-copy ORT.
+# Buildy AMD/Intel korzystają ze ścieżki hosta i nie wymagają nvcc.
+vision-cuda-preprocess = []
 inference-diarization = ["dep:tentaflow-voice"]
 rdma-probe = []
 # Udostępnia `flow_engine::node_adapter::test_support` (stub dispatcherów +
@@ -61,9 +71,9 @@ wasmi-runtime-test = ["dep:wasmi"]
 camera = ["dep:gstreamer", "dep:gstreamer-app", "dep:gstreamer-video"]
 # Jedna flaga GPU per backend wlacza lokalne LLM. Konkretny backend GPU
 # wynika z natywnych bibliotek zbudowanych przez scripts/native-libs/build-all.sh.
-gpu-cuda = ["inference-llamacpp"]
-gpu-vulkan = ["inference-llamacpp"]
-gpu-rocm = ["inference-llamacpp"]
+gpu-cuda = ["inference-llamacpp", "inference-vision-gpu", "vision-cuda", "vision-cuda-preprocess"]
+gpu-vulkan = ["inference-llamacpp", "inference-vision-gpu"]
+gpu-rocm = ["inference-llamacpp", "inference-vision-gpu", "vision-rocm"]
 gpu-metal = ["inference-llamacpp"]
 # External Milvus backend (gRPC) selectable per addon alongside the embedded zvec.
 # The embedded zvec engine itself is NOT a feature — it is a mandatory dependency
@@ -163,7 +173,7 @@ toml = "1.1.2+spec-1.1.0"
 ciborium = "0.2"
 
 # Database
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
 fjall = "3.1.5"
 # Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
 # zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
@@ -243,6 +253,10 @@ rustc-hash = "2.1.2"
 # Utils
 uuid = { version = "1.23.3", features = ["v4", "v5", "v7"] }
 chrono = { version = "0.4.45", features = ["serde"] }
+# IANA timezone database for chrono. Project Studio run schedules evaluate a
+# daily cron expression in the user's zone, so DST transitions must resolve
+# against real tz rules instead of a fixed UTC offset.
+chrono-tz = "0.10.4"
 rand = "0.10.1"
 rand_core = "0.10"
 getrandom = "0.4.3"
@@ -334,6 +348,11 @@ which = "8.0.4"
 # python-build-standalone dystrybuuje archiwa .tar.zst (domyslnie) — zstd dekoder
 zstd = "0.13.3"
 zip = "8.6.0"
+# Parser YAML dla opisow API (OpenAPI/Swagger) w zrodlach wiedzy `api_spec`.
+# `serde_yaml` jest archiwalny; `serde_yaml_ng` to utrzymywany fork o tym samym
+# API. Deserializujemy prosto do `serde_json::Value`, wiec JSON i YAML dziela
+# jedna sciezke ekstrakcji endpointow (patrz project_studio/api_spec.rs).
+serde_yaml_ng = "0.10.0"
 # Parser XML dla ekstrakcji DOCX (word/document.xml) i PPTX (ppt/slides/slideN.xml)
 # w node-adapterach flow-ingestu RAG. default-features=false wyłącza `encoding`,
 # co odsłania `unescape_value`/`config_mut` (API używane przez ekstraktor; zgodne
@@ -426,7 +445,7 @@ hex = "0.4"
 walkdir = "2"
 
 [dev-dependencies]
-rusqlite = { version = "0.39.0", features = ["bundled"] }
+rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
 wasmtime = "46.0.0"
 tempfile = "3"
 criterion = { version = "0.8.2", features = ["html_reports"] }

@@ -23,6 +23,8 @@ pub struct HfConfig {
     /// Absent means hidden_size / num_attention_heads.
     #[serde(default)]
     pub head_dim: Option<usize>,
+    /// Modele czysto-MoE (DeepSeek V4) nie deklarują gęstego FFN.
+    #[serde(default)]
     pub intermediate_size: usize,
     pub vocab_size: usize,
     #[serde(default = "default_rope_theta")]
@@ -37,6 +39,65 @@ pub struct HfConfig {
     pub torch_dtype: Option<String>,
     #[serde(default)]
     pub quantization_config: Option<serde_json::Value>,
+
+    // --- Mixture-of-Experts (nazewnictwo DeepSeek) ---
+    #[serde(default)]
+    pub n_routed_experts: Option<usize>,
+    #[serde(default)]
+    pub num_experts_per_tok: Option<usize>,
+    #[serde(default)]
+    pub moe_intermediate_size: Option<usize>,
+    #[serde(default)]
+    pub n_shared_experts: Option<usize>,
+    #[serde(default)]
+    pub norm_topk_prob: bool,
+
+    // --- DeepSeek V4: uwaga latentna, kompresja KV, indekser, hash-conditioning ---
+    /// Ranga projekcji LoRA dla Q.
+    #[serde(default)]
+    pub q_lora_rank: Option<usize>,
+    /// Ranga projekcji LoRA dla wyjścia uwagi.
+    #[serde(default)]
+    pub o_lora_rank: Option<usize>,
+    /// Na ile grup dzielone jest wyjście uwagi przed projekcją LoRA.
+    #[serde(default)]
+    pub o_groups: Option<usize>,
+    /// Ile wymiarów głowicy obejmuje rope (reszta zostaje bez pozycji).
+    #[serde(default)]
+    pub qk_rope_head_dim: Option<usize>,
+    /// Stopień kompresji KV per warstwa; 0 oznacza warstwę bez kompresora.
+    #[serde(default)]
+    pub compress_ratios: Vec<usize>,
+    /// Baza rope dla skompresowanego strumienia KV.
+    #[serde(default)]
+    pub compress_rope_theta: Option<f32>,
+    /// Szerokość okna przesuwnego uwagi.
+    #[serde(default)]
+    pub sliding_window: Option<usize>,
+    #[serde(default)]
+    pub index_n_heads: Option<usize>,
+    #[serde(default)]
+    pub index_head_dim: Option<usize>,
+    #[serde(default)]
+    pub index_topk: Option<usize>,
+    /// Ile warstw ma routing z tablicą token->ekspert zamiast wyuczonej bramki.
+    #[serde(default)]
+    pub num_hash_layers: usize,
+    #[serde(default)]
+    pub num_nextn_predict_layers: usize,
+    #[serde(default)]
+    pub scoring_func: Option<String>,
+    #[serde(default)]
+    pub routed_scaling_factor: Option<f32>,
+    #[serde(default)]
+    pub swiglu_limit: Option<f32>,
+    /// Ile kopii stanu utrzymuje strumień rezydualny (hyper-connections).
+    #[serde(default)]
+    pub hc_mult: Option<usize>,
+    #[serde(default)]
+    pub hc_sinkhorn_iters: Option<usize>,
+    #[serde(default)]
+    pub hc_eps: Option<f32>,
 }
 
 fn default_rope_theta() -> f32 {
@@ -48,9 +109,41 @@ fn default_rms_norm_eps() -> f32 {
 }
 
 impl HfConfig {
+    /// Wczytuje `config.json`, akceptujac takze uklad multimodalny.
+    ///
+    /// Modele z wiezami wizyjnymi (Gemma 4, Llama 4) trzymaja parametry czesci
+    /// tekstowej w zagniezdzonym `text_config`, a na wierzchu zostawiaja tylko
+    /// rzeczy wspolne — `architectures`, `quantization_config`, konfiguracje
+    /// pozostalych wiez. Bierzemy wtedy wierzch jako baze i nakladamy na nia
+    /// `text_config`, zeby pola wspolne nie przepadly, a tekstowe wygraly.
     pub fn load(path: impl AsRef<Path>) -> Result<Self> {
         let bytes = std::fs::read(path.as_ref())?;
-        serde_json::from_slice(&bytes).map_err(|e| ForgeError::Format(format!("config.json: {e}")))
+        Self::from_json_slice(&bytes)
+    }
+
+    /// Ten sam scalajacy odczyt co `load`, dla wywolan majacych juz tresc.
+    pub fn from_json_str(raw: &str) -> Result<Self> {
+        Self::from_json_slice(raw.as_bytes())
+    }
+
+    pub fn from_json_slice(bytes: &[u8]) -> Result<Self> {
+        let raw: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|e| ForgeError::Format(format!("config.json: {e}")))?;
+        let merged = match (
+            raw.as_object(),
+            raw.get("text_config").and_then(|t| t.as_object()),
+        ) {
+            (Some(top), Some(text)) => {
+                let mut out = top.clone();
+                out.remove("text_config");
+                for (key, value) in text {
+                    out.insert(key.clone(), value.clone());
+                }
+                serde_json::Value::Object(out)
+            }
+            _ => raw,
+        };
+        serde_json::from_value(merged).map_err(|e| ForgeError::Format(format!("config.json: {e}")))
     }
 
     pub fn num_key_value_heads(&self) -> usize {

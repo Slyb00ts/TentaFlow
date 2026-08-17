@@ -93,6 +93,28 @@ pub struct Detection {
 ///   "items": [ { "klasa": "...", "bbox": [..], "score": .., "stan": [..], "tekst": null } ]
 /// }
 /// ```
+/// One frame's directional motion verdict inside the active detection zone(s),
+/// computed on the luma plane by `camera_ingest::motion`. Lives here (always
+/// compiled) rather than in the camera-only module so it can ride the always-
+/// compiled `DetectionsMessage`. The vehicle detector misses tankers that fill
+/// the frame, so the event recorder triggers on this motion signal (robust to
+/// lighting/flicker because it is directional, not brightness-based) OR on an
+/// in-zone detection — never on the unreliable vehicle box alone.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct MotionSignal {
+    /// Coherent directional motion is present in the zone this frame.
+    pub moving: bool,
+    /// Net horizontal direction, -1.0..=1.0 (positive = rightward). 0.0 when idle.
+    pub dir_x: f32,
+    /// Motion strength, 0.0..=1.0 (normalised median coherent displacement).
+    pub magnitude: f32,
+    /// Normalised full-frame x (0.0..=1.0) of the moving mass — "entered left" vs
+    /// "exited right".
+    pub centroid_x: f32,
+    /// Fraction of evaluated blocks agreeing on the dominant direction, 0.0..=1.0.
+    pub coherence: f32,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct DetectionsMessage {
     /// Staly dyskryminator typu wiadomosci — zawsze "detections".
@@ -117,6 +139,10 @@ pub struct DetectionsMessage {
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub enriched: bool,
     pub items: Vec<Detection>,
+    /// Directional zone motion for this frame. Internal to the recorder pipeline —
+    /// the browser overlay does not need it, so it is skipped on the JSON wire.
+    #[serde(skip)]
+    pub motion: MotionSignal,
 }
 
 impl DetectionsMessage {
@@ -127,6 +153,7 @@ impl DetectionsMessage {
         proc_ms: u32,
         enriched: bool,
         items: Vec<Detection>,
+        motion: MotionSignal,
     ) -> Self {
         Self {
             msg_type: "detections",
@@ -136,6 +163,7 @@ impl DetectionsMessage {
             proc_ms,
             enriched,
             items,
+            motion,
         }
     }
 }
@@ -195,6 +223,7 @@ pub fn publish_detections(
     proc_ms: u32,
     enriched: bool,
     items: Vec<Detection>,
+    motion: MotionSignal,
 ) {
     // Per-vehicle event recording rides the same bus: the hook lazily spawns a
     // recorder task for this camera (cheap set-probe once one exists). Fired
@@ -209,6 +238,7 @@ pub fn publish_detections(
         proc_ms,
         enriched,
         items,
+        motion,
     );
     // `send` zwraca Err tylko gdy nie ma zadnych odbiorcow — ignorujemy.
     let _ = detection_bus().sender(camera_id).send(msg);
@@ -309,7 +339,7 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            publish_detections(&camera_id, ts_ms, None, 0, false, items);
+            publish_detections(&camera_id, ts_ms, None, 0, false, items, MotionSignal::default());
         }
     })
 }
@@ -358,6 +388,7 @@ mod tests {
                     vy: 0.,
                 },
             ],
+            MotionSignal::default(),
         );
 
         let v: serde_json::Value = serde_json::to_value(&msg).expect("serializacja JSON");
@@ -419,6 +450,7 @@ mod tests {
                 vx: 0.,
                 vy: 0.,
             }],
+            MotionSignal::default(),
         );
         let msg = rx.recv().await.expect("wiadomosc detekcji");
         assert_eq!(msg.camera_id, cam);
@@ -448,6 +480,7 @@ mod tests {
                 vx: 0.,
                 vy: 0.,
             }],
+            MotionSignal::default(),
         );
     }
 

@@ -1,0 +1,116 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Code Studio · Mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=11">
+<link rel="stylesheet" href="shared/code-studio.css?v=11">
+<style>
+  .grp { margin-bottom: 34px; }
+  .grp-title { font-size: 13px; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2);
+               font-weight: 800; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); margin-left: 6px; }
+  .index-card.soon { opacity: .5; cursor: default; }
+  .index-card.soon:hover { border-color: var(--border); transform: none; }
+  .idea { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+          padding: 16px 18px; margin-bottom: 14px; }
+  .idea h3 { font-size: 12px; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2);
+             margin-bottom: 8px; display: flex; align-items: center; gap: 8px; }
+  .idea p { font-size: 12.5px; color: var(--text-2); line-height: 1.7; }
+  .idea p + p { margin-top: 8px; }
+  .idea b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<div class="index-page">
+  <h1>Code Studio · Mockupy</h1>
+  <p class="subtitle">
+    Środowisko pracy nad kodem z wieloagentowym harnessem. Punkt wyjścia to <b>aplikacja konsolowa</b>:
+    widzisz strumień tego, co agent naprawdę robi, i piszesz do niego — ale z pełnym GUI, podglądem
+    subagentów, plikami, diffem i gitem. Motyw i komponenty spójne z <span class="mono">tentaflow-core/www</span>.
+    Plan techniczny: <span class="mono">docs/CODE_STUDIO_PLAN.md</span>.
+    Graf harnessu: <span class="mono">docs/CODE_HARNESS_FLOW.md</span> — w konwencji
+    <span class="mono">docs/target-agent-flow.mmd</span>, bo to dokument projektowy, a nie ekran.
+  </p>
+
+  <div class="idea">
+    <h3>Zasada układu</h3>
+    <p><b>Pasek projektów</b> u góry — poziomy, przewijalny, z kropką statusu przy każdym workspace:
+      <span style="color:var(--cs-run)">pracuje</span> ·
+      <span style="color:var(--cs-ask)">czeka na Ciebie</span> ·
+      <span style="color:var(--cs-idle)">bezczynny</span> ·
+      <span style="color:var(--cs-err)">błąd</span>.
+      Poziomy zamiast pionowej belki, bo ten sam element działa na telefonie.</p>
+    <p><b>Scena</b> pośrodku — strumień zdarzeń: wywołania narzędzi jako gęste wiersze mono, proza agenta
+      normalną typografią, karty pytań i przeglądu zmian jako wyróżnione bloki. Pod spodem stały pasek
+      „co się dzieje teraz", żeby nigdy nie trzeba było zgadywać.</p>
+    <p><b>Dok</b> po prawej jest nawigatorem — same spisy: subagenci, drzewo plików, lista zmian,
+      historia gita, sesje powłoki. Kliknięcie otwiera rzecz <b>w scenie</b>, bo 372&nbsp;px to za mało
+      na kod czy diff. Pasek zakładek nad sceną pokazuje otwarte pozycje aktualnej kategorii, a przycisk
+      „Konsola" stoi na jego początku.</p>
+    <p><b>Telefon</b> — ta sama treść w jednej kolumnie z dolną nawigacją. Pytanie agenta zawsze ma
+      pierwszeństwo; diff i podgląd kodu są czytelne bez poziomego scrolla strony.</p>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Ekrany <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="k01-konsola.html">
+        <div class="id">K01</div><h3>Konsola sesji — responsywna</h3>
+        <p><b>Źródło prawdy dla układu.</b> Jeden plik dla desktopu i telefonu: zwęź okno poniżej
+           900&nbsp;px albo otwórz na telefonie. Przełączanie widoków, arkusz workspace'ów i szuflada
+           nawigatora działają.</p>
+      </a>
+      <a class="index-card" href="w01-lista.html">
+        <div class="id">W01</div><h3>Lista workspace'ów</h3>
+        <p>Węzeł, repozytorium, tryb wykonania, sesje i kwota dysku. Drugi ekran: wariant pusty
+           bez grantu tworzenia.</p>
+      </a>
+      <a class="index-card" href="w02-kreator.html">
+        <div class="id">W02 · okno</div><h3>Kreator workspace'a</h3>
+        <p>Trzy kroki. W kroku 2 wybór trybu: <b>native</b> preselekcjonowany z ostrzeżeniem
+           o dostępie do hosta, kontener z listą tego, co zyskuje.</p>
+      </a>
+      <a class="index-card" href="k02-zmiany.html">
+        <div class="id">K02</div><h3>Przegląd zmian</h3>
+        <p>Akceptacja per hunk, stan konfliktu CAS i rekonstrukcja pliku z przyjętych fragmentów.</p>
+      </a>
+      <a class="index-card" href="k03-git.html">
+        <div class="id">K03</div><h3>Git — scalanie</h3>
+        <p>Worktree integracyjny, testy i przegląd na wyniku scalenia, atomowy <span class="mono">update-ref</span>.
+           Drugi ekran: konflikt i worktree w stanie <span class="mono">held</span>.</p>
+      </a>
+      <a class="index-card" href="f01-flow-builder.html">
+        <div class="id">F01</div><h3>Flow Builder — Code Harness</h3>
+        <p>Pełny harness jako flow w prawdziwym builderze: paleta, kanwa z siatką, region pętli,
+           rozgałęzienia na portach <span class="mono">true</span>/<span class="mono">false</span>,
+           minimapa i panel konfiguracji wejścia regionu.</p>
+      </a>
+      <a class="index-card" href="g01-rozlaczenie.html">
+        <div class="id">G01</div><h3>Węzeł nieosiągalny</h3>
+        <p>Praca zdalna: łączność ginie, sesja żyje dalej na węźle-właścicielu, oś czasu dociąga
+           zdarzenia od kursora.</p>
+      </a>
+      <a class="index-card" href="m01-mobile.html">
+        <div class="id">M01</div><h3>Telefon — poglądowo</h3>
+        <p>Cztery stany obok siebie w ramkach telefonu, do oglądania na dużym ekranie. Wersja żywa to K01.</p>
+      </a>
+    </div>
+  </div>
+
+  <div class="idea">
+    <h3>Animacje</h3>
+    <p>Zestaw wzięty z <span class="mono">connection-overlay.css</span> i <span class="mono">update-overlay.css</span>,
+      żeby moduł nie brzmiał obco: sprężyna <span class="mono">cubic-bezier(.34,1.56,.64,1)</span> na wejściu kart,
+      pulsujące kropki statusu z rozchodzącym się cieniem, obracająca się ikona przy pracującym narzędziu.</p>
+    <p>Dołożone specyficznie dla konsoli: <b>przesuwający się połysk</b> na wierszu narzędzia w trakcie
+      wykonania, <b>sprężysty znacznik</b> po zakończeniu, <b>płynący pasek</b> po lewej krawędzi karty
+      pracującego subagenta (ten sam pomysł co przepływ po krawędzi we Flow Builderze), <b>migający kursor</b>
+      przy strumieniowanym tekście i <b>wysuwany arkusz</b> przełącznika projektów na telefonie.</p>
+  </div>
+</div>
+
+</body>
+</html>

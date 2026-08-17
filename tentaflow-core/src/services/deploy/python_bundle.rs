@@ -576,10 +576,16 @@ impl PythonBundleDeploy {
     async fn kill_running(&self) {
         let state = self.running.lock().ok().and_then(|mut slot| slot.take());
         let Some(state) = state else { return };
-        let _ = crate::deploy::process_ctl::terminate(state.pid);
-        // Give the engine a moment to flush before any caller wipes the
-        // venv. We don't wait on the Child handle (we forgot it earlier);
-        // a fixed grace is enough for clean shutdown logs.
+        // Grupa, nie sam lider: vLLM zostawia `EngineCore`/`WorkerProc`, ktore
+        // po smierci rodzica trzymaja VRAM jeszcze sekundy (albo w nieskonczonosc,
+        // gdy zawisna na NCCL). Osierocone workery obnizaly wolna pamiec na
+        // kartach i KOLEJNY deploy padal na „Free memory ... less than desired".
+        let pid = state.pid;
+        let _ = tokio::task::spawn_blocking(move || {
+            crate::deploy::process_ctl::terminate_group(pid)
+        })
+        .await;
+        // Krotka pauza przed ewentualnym czyszczeniem venva przez callera.
         tokio::time::sleep(Duration::from_millis(500)).await;
     }
 }
@@ -715,6 +721,7 @@ mod tests {
                 default_port: 0,
                 dgx_spark: None,
                 cluster_capable: None,
+                preset_only: None,
                 cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),

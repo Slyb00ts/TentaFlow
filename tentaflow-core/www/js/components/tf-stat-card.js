@@ -11,7 +11,9 @@ const ACCENT_CLASSES = new Set(['success', 'danger', 'warning', 'info']);
 const DELTA_TYPES = new Set(['up', 'down', 'warn', 'neutral']);
 const SIZE_CLASSES = new Set(['sm', 'md', 'lg']);
 
-const DELTA_ARROWS = { up: '↑', down: '↓', warn: '⚠', neutral: '—' };
+// A neutral delta is plain context ("3 suites"), so it gets no glyph — the dash
+// only added noise in front of every such line.
+const DELTA_ARROWS = { up: '↑', down: '↓', warn: '⚠', neutral: '' };
 
 function escapeHtml(value) {
   return String(value)

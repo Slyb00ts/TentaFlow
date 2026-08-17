@@ -101,6 +101,11 @@ async function loadAll() {
       // Skleic ClusterInfo + members[] z osobnych pol odpowiedzi w jeden obiekt
       // pasujacy do reszty kodu (resolveMembers oczekuje cluster.members).
       clusterData = { ...detailBody.cluster, members: detailBody.members || [] };
+      // Zrodlem prawdy o wdrozeniu jest serwer, nie stan tej karty przegladarki:
+      // deployment przezywa odswiezenie GUI i restart core'a, a jego brak
+      // oznacza, ze naprawde nic nie dziala.
+      activeDeployment = detailBody.deployment || null;
+      if (activeDeployment) deployResult = null;
     } else {
       clusterData = null;
     }
@@ -185,6 +190,7 @@ function renderDetail() {
     `;
     bindBack(content);
     bindBodyClicks(content);
+    bindNicPicker(content);
   }
 
   const nameEl = byId('cd-name');
@@ -229,6 +235,16 @@ function bindBack(root) {
       const { Router } = await import('/js/router.js');
       Router.navigate('clusters');
     }
+  });
+}
+
+function bindNicPicker(root) {
+  root.addEventListener('change', async (e) => {
+    const sel = e.target.closest('.cd-nic-select');
+    if (!sel) return;
+    const nodeId = sel.dataset.nodeId;
+    const value = e.detail?.value ?? sel.value;
+    if (nodeId && value) await setMemberInterface(nodeId, value);
   });
 }
 
@@ -348,8 +364,83 @@ function renderNodeMini(member) {
         ${renderMiniBar('VRAM', vramPct)}
       </div>
       ${linkLabel ? `<div class="cdn-link"><span class="link-chip ${linkClass}">${asg ? '✓ ' : ''}${escapeHtml(linkLabel)}${asgDetail ? ` · ${escapeHtml(asgDetail)}` : ''}</span></div>` : ''}
+      ${renderRdmaSummary(member)}
+      ${renderNicPicker(member)}
     </div>
   `;
+}
+
+/// Co realnie pojedzie do NCCL przy distributed deployu. Bez tego jedynym
+/// sposobem sprawdzenia konfiguracji RDMA byloby zagladanie do bazy.
+function renderRdmaSummary(member) {
+  if (!member.rdma_devices) return '';
+  const gid = member.rdma_gid_index;
+  return `
+    <div class="cdn-rdma">
+      <code>${escapeHtml(member.rdma_devices)}</code>
+      <span>${escapeHtml(member.rdma_ip || '—')}</span>
+      <span>GID ${gid == null ? '—' : escapeHtml(String(gid))}</span>
+    </div>
+  `;
+}
+
+/// Interfejsy noda nadajace sie na interconnect klastra: link UP i z adresem
+/// IPv4. Karty RDMA na gorze — to one daja RoCE, reszta to fallback ethernet.
+function interconnectCandidates(nodeId) {
+  const node = nodesById.get(nodeId);
+  const ifaces = (node && (node.networkInterfaces || node.network_interfaces)) || [];
+  return ifaces
+    .filter(i => (i.linkUp ?? i.link_up) && (i.ipv4Address || i.ipv4_address))
+    .map(i => ({
+      name: i.name,
+      ip: i.ipv4Address || i.ipv4_address,
+      speed: i.speedMbps || i.speed_mbps || 0,
+      rdma: !!(i.rdmaAvailable ?? i.rdma_available),
+    }))
+    .sort((a, b) => (b.rdma - a.rdma) || (b.speed - a.speed) || a.name.localeCompare(b.name));
+}
+
+/// Reczny wybor karty interconnectu. Test polaczen wybiera ja automatycznie, ale
+/// admin musi moc go nadpisac — bez tego jedyna droga do zmiany karty byloby
+/// przestawianie adresow w systemie.
+function renderNicPicker(member) {
+  const cands = interconnectCandidates(member.node_id);
+  if (cands.length === 0) return '';
+  const current = member.interface_name || (findAssignment(member.node_id) || {}).interface_name || '';
+  const opts = cands.map(c => {
+    const label = `${c.name} · ${c.ip}${c.speed ? ` · ${Math.round(c.speed / 1000)}G` : ''}${c.rdma ? ' · RDMA' : ''}`;
+    return `<option value="${escapeAttr(c.name)}"${c.name === current ? ' selected' : ''}>${escapeHtml(label)}</option>`;
+  }).join('');
+  return `
+    <div class="cdn-nic">
+      <label>${escapeHtml(I18n.t('cluster_detail.interconnect_nic'))}</label>
+      <tf-select class="cd-nic-select" data-node-id="${escapeAttr(member.node_id)}"
+        value="${escapeAttr(current)}">${opts}</tf-select>
+    </div>
+  `;
+}
+
+/// Zapisuje wybrana karte jako interconnect czlonka. Adres/predkosc/typ biore z
+/// danych noda, zeby zapis byl spojny z tym, co pokazuje lista.
+async function setMemberInterface(nodeId, ifaceName) {
+  const cand = interconnectCandidates(nodeId).find(c => c.name === ifaceName);
+  if (!cand) return;
+  try {
+    const res = await ApiBinary.action('clusterAddMemberRequest', {
+      clusterId: currentClusterId,
+      nodeId,
+      interfaceName: cand.name,
+      interfaceIp: cand.ip,
+      interfaceSpeedMbps: cand.speed,
+      interfaceType: cand.rdma ? 'rdma' : 'ethernet',
+    });
+    if (res && res.ok === false) throw new Error(res.error || 'failed');
+    toast(I18n.t('cluster_detail.nic_saved'), 'success');
+    await loadAll();
+    renderDetail();
+  } catch (err) {
+    toast(`${I18n.t('cluster_detail.nic_save_failed')}: ${err.message || err}`, 'error');
+  }
 }
 
 function renderMiniBar(label, pct) {
@@ -809,19 +900,22 @@ function renderDeploySection(members) {
 
 function renderActiveDeployment(dep) {
   const memberRows = (dep.members || []).map(m => renderDeployMemberRow(m)).join('');
-  const endpoint = dep.endpointUrl
-    ? `<div class="cluster-deploy-endpoint"><span class="k">${escapeHtml(I18n.t('cluster_detail.deploy_endpoint'))}</span><code>${escapeHtml(dep.endpointUrl)}</code></div>`
-    : '';
+  const running = dep.status === 'running';
+  const row = (label, value) => (value
+    ? `<div class="cluster-deploy-endpoint"><span class="k">${escapeHtml(label)}</span><code>${escapeHtml(String(value))}</code></div>`
+    : '');
   return `
     <div class="cluster-deploy-active">
       <div class="cluster-deploy-active-head">
-        <tf-chip status="${dep.ok ? 'online' : 'warning'}" dot>${escapeHtml(dep.ok ? I18n.t('cluster_detail.deploy_active') : I18n.t('cluster_detail.deploy_degraded'))}</tf-chip>
+        <tf-chip status="${running ? 'online' : 'warning'}" dot>${escapeHtml(running ? I18n.t('cluster_detail.deploy_active') : I18n.t('cluster_detail.deploying'))}</tf-chip>
         <span class="cluster-deploy-id"><code>${escapeHtml(dep.deploymentClusterId || '')}</code></span>
         <tf-button variant="danger" size="sm" icon="stop" id="btn-deploy-stop">${escapeHtml(I18n.t('cluster_detail.deploy_stop'))}</tf-button>
       </div>
-      ${endpoint}
+      ${row(I18n.t('cluster_detail.deploy_model'), dep.servedModelName || dep.model)}
+      ${row(I18n.t('cluster_detail.deploy_engine'), dep.engineId)}
+      ${row(I18n.t('cluster_detail.deploy_tp_size'), dep.tpSize)}
+      ${row(I18n.t('cluster_detail.deploy_endpoint'), dep.endpointUrl)}
       <table class="cluster-rdma-table"><tbody>${memberRows}</tbody></table>
-      ${dep.message ? `<div class="cluster-deploy-message">${escapeHtml(dep.message)}</div>` : ''}
     </div>
   `;
 }
@@ -840,13 +934,10 @@ function renderDeployResult(res) {
 }
 
 function renderDeployMemberRow(m) {
-  const detail = m.error
-    ? `<tf-chip status="error">${escapeHtml(m.error)}</tf-chip>`
-    : `<tf-chip status="success">${escapeHtml(I18n.t('cluster_detail.deploy_member_ok'))}</tf-chip>${m.deployId ? ` <code>${escapeHtml(m.deployId)}</code>` : ''}`;
   return `<tr>
     <th>${escapeHtml(m.hostname || m.nodeId)}</th>
     <td><tf-chip status="neutral">${escapeHtml(m.role)}</tf-chip></td>
-    <td>${detail}</td>
+    <td><tf-chip status="success">${escapeHtml(I18n.t('cluster_detail.deploy_member_ok'))}</tf-chip>${m.containerName ? ` <code>${escapeHtml(m.containerName)}</code>` : ''}</td>
   </tr>`;
 }
 
@@ -866,6 +957,12 @@ async function openDeployModal() {
   // clean it up explicitly here.
   const clusterId = currentClusterId;
   const label = clusterData.name || clusterId;
+  // Nazwy GPU czlonkow decyduja o bramce Sparka w katalogu. Bez nich klaster
+  // ze Sparkow dostawal takze silniki jawnie z Sparkiem niezgodne.
+  const gpuNames = members.flatMap((m) => {
+    const live = m.live || nodesById.get(m.node_id) || {};
+    return (Array.isArray(live.gpus) ? live.gpus : []).map((g) => g.name || '');
+  }).filter(Boolean);
   ClusterDetailScreen.cleanup();
   const { Router } = await import('/js/router.js');
   Router.navigate('catalog', {
@@ -874,7 +971,8 @@ async function openDeployModal() {
       id: clusterId,
       label,
       os: null,
-      gpuNames: [],
+      gpuNames,
+      isDgxSpark: gpuNames.length > 0 && gpuNames.every((n) => /GB10/i.test(n)),
     },
   });
 }
@@ -1018,6 +1116,9 @@ function resolveMembers(cluster) {
       rdma_ip: m.rdmaIp || m.rdma_ip || '',
       rdma_devices: m.rdmaDevices || m.rdma_devices || '',
       rdma_socket_ifname: m.rdmaSocketIfname || m.rdma_socket_ifname || '',
+      interface_name: m.interfaceName || m.interface_name || '',
+      interface_ip: m.interfaceIp || m.interface_ip || '',
+      rdma_gid_index: m.rdmaGidIndex ?? m.rdma_gid_index ?? null,
       live,
     };
   });
@@ -1035,7 +1136,8 @@ function clusterStatus(members) {
 // swiezy stan polaczenia z mesh node list (nodesById -> member.live).
 function memberOnline(m) {
   if (!m) return false;
-  if (String(m.status || '').toLowerCase() === 'online') return true;
+  // Statusy pochodza wprost z peer_store ("connected"/"reachable"/...).
+  if (['connected', 'reachable'].includes(String(m.status || '').toLowerCase())) return true;
   return isOnline(m.live);
 }
 

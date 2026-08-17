@@ -1,0 +1,22 @@
+# ===== File: Cargo.toml — forge-model: a dense decoder as an order of operations =====
+[package]
+name = "forge-model"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+# Kernele Metal dla TESTÓW. Sam model ich nie potrzebuje — nie zna wykonawcy,
+# więc buduje się wszędzie i tak samo.
+metal = ["forge-hal/metal", "forge-kernels/metal"]
+
+[dependencies]
+forge-types.workspace = true
+forge-formats.workspace = true
+forge-graph.workspace = true
+
+[dev-dependencies]
+forge-hal.workspace = true
+forge-kernels.workspace = true
+forge-tokenize.workspace = true
+serde_json.workspace = true

@@ -15,10 +15,10 @@ license = "Apache-2.0"
 icon = "vllm"
 default_port = 8000
 api = "openai-compatible"
-version = "0.25.1"
-# PyPI vllm 0.25.1 wheels target sm_120 max — na DGX Spark (GB10, sm_121)
+version = "0.27.0"
+# PyPI vllm 0.27.0 wheels still require a dedicated DGX Spark (GB10, sm_121)
 # crashuja w FP8 / Mamba / NVFP4 kernelach. Spark dostaje osobny silnik
-# `vllm-spark` ktory buduje vllm 0.25.1 ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
+# `vllm-spark` ktory buduje vllm ze zrodel z TORCH_CUDA_ARCH_LIST=12.1a.
 dgx_spark = false
 # Multi-node tensor-parallel deploy supported — the unified deploy wizard offers
 # this engine when the deploy target is a cluster.
@@ -31,15 +31,15 @@ transport = "direct-http"
 
 # Hardware-aware build. torch cu130 ma fat wheels (sm80..sm120), wiec ten sam
 # obraz dziala na Ampere/Ada/Hopper/Blackwell — default_build_args wystarcza,
-# Core taguje obraz per arch (vllm:0.25.1-cuda-ampere itd.). Spark ma osobny
+# Core taguje obraz per arch (vllm:0.27.0-cuda-ampere itd.). Spark ma osobny
 # silnik (vllm-spark, build ze zrodel pod sm_121a).
 [deploy.docker.default_build_args]
 CUDA_IMAGE = "nvidia/cuda:13.0.3-cudnn-devel-ubuntu24.04"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
-TORCH_VERSION = "2.11.0"
-TORCHVISION_VERSION = "0.26.0"
+TORCH_VERSION = "2.13.0"
+TORCHVISION_VERSION = "0.28.0"
 TORCHAUDIO_VERSION = "2.11.0"
-VLLM_VERSION = "0.25.1"
+VLLM_VERSION = "0.27.0"
 
 [deploy.native]
 platforms = ["linux", "windows"]
@@ -124,27 +124,6 @@ display_name = "Nemotron Nano 12B v2 VL (captioning)"
 repo = "nvidia/NVIDIA-Nemotron-Nano-12B-v2-VL-FP8"
 quantization = "fp8"
 
-# DeepSeek V4 (Flash 284B/13B-act, Pro 1.6T/49B-act) — MoE + DSA long-context (1M).
-# Warianty -DSpark maja glowe draftujaca WBUDOWANA w checkpoint (self-speculative,
-# ~1.2-1.4x vs stock MTP, lossless), wiec speculator BEZ osobnego repo. Turnkey
-# max-perf: Core auto-dokłada fp8 kv-cache (model_type deepseek_v4), --block-size 256
-# i --enable-expert-parallel (MoE na multi-GPU). --data-parallel-size zalezy od
-# liczby kart → recepta vLLM / extra-args. Datacenter Blackwell/Hopper LUB cluster
-# 4-8x DGX Spark przez RDMA 200Gbit (Flash sie mie sci; Pro 1.6T nie na 8 Sparkach).
-[[model_preset]]
-id = "deepseek-v4-flash-dspark"
-display_name = "DeepSeek V4 Flash (DSpark, MoE, 1M ctx)"
-repo = "deepseek-ai/DeepSeek-V4-Flash-DSpark"
-quantization = "fp8"
-speculator_method = "dspark"
-speculator_num_tokens = 4
-featured = true
-
-[[model_preset]]
-id = "deepseek-v4-pro-dspark"
-display_name = "DeepSeek V4 Pro (DSpark, 1.6T MoE, 1M ctx)"
-repo = "deepseek-ai/DeepSeek-V4-Pro-DSpark"
-quantization = "fp8"
-speculator_method = "dspark"
-speculator_num_tokens = 4
-featured = true
+# DeepSeek V4 nie ma tu presetow: Flash wymaga obrazu z kernelami sm_121
+# (`vllm-dspark.toml`), a Pro 1.6T/49B-act nie miesci sie ani na Sparkach, ani w
+# zadnej konfiguracji, ktora ten manifest opisuje.

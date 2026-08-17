@@ -149,19 +149,15 @@ fn parse_response_format(rf: &serde_json::Value) -> Result<Option<ConstraintKind
             Ok(Some(ConstraintKind::JsonSchema(schema.clone())))
         }
         "regex" => {
-            let re = obj
-                .get("regex")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| ApiError::invalid_request("response_format regex requires `regex`"))?;
+            let re = obj.get("regex").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::invalid_request("response_format regex requires `regex`")
+            })?;
             Ok(Some(ConstraintKind::Regex(re.to_string())))
         }
         "grammar" => {
-            let g = obj
-                .get("grammar")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| {
-                    ApiError::invalid_request("response_format grammar requires `grammar`")
-                })?;
+            let g = obj.get("grammar").and_then(|v| v.as_str()).ok_or_else(|| {
+                ApiError::invalid_request("response_format grammar requires `grammar`")
+            })?;
             Ok(Some(ConstraintKind::Gbnf(g.to_string())))
         }
         other => Err(ApiError::invalid_request(format!(

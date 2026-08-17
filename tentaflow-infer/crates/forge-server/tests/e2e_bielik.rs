@@ -7,8 +7,8 @@ use std::sync::Arc;
 
 use forge_engine::model::ModelConfig;
 use forge_engine::server::spawn_engine;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_server::{build_router, ServerConfig, ServerState};
 
@@ -28,11 +28,18 @@ async fn chat_completions_end_to_end() {
         let kv_page_size = 32;
         let kv_pages = 160;
         let desc = read_descriptor(model_dir).expect("read model descriptor");
-        let device = CudaDevice::new(
+        let device = gpu::open(
             0,
             PoolSizes {
                 weights: 8 << 30,
-                kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16),
+                kv_cache: kv_pool_bytes(
+                    &desc,
+                    kv_page_size,
+                    kv_pages,
+                    forge_engine::kv::KvQuant::F16,
+                    false,
+                )
+                .unwrap(),
                 activations: 1 << 30,
                 kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
             },
@@ -43,12 +50,19 @@ async fn chat_completions_end_to_end() {
             dev,
             model_dir,
             ModelConfig {
+                weight_spill_dir: None,
+                weight_host_budget: 0,
                 kv_page_size,
                 kv_pages,
                 max_seq_len: 4096,
                 kv_quant: forge_engine::kv::KvQuant::F16,
                 kv_tier: Default::default(),
                 prefix_cache: false,
+                layer_range: None,
+                tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+                native_mtp: false,
+                nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+                nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,
             },
         )
         .expect("load model");
@@ -74,6 +88,8 @@ async fn chat_completions_end_to_end() {
         model_id: "bielik-7b-nvfp4".into(),
         api_key: None,
         tool_call_parser: None,
+        default_sampling: Default::default(),
+        default_stop: vec![],
     };
     let state = ServerState::new(
         &cfg,

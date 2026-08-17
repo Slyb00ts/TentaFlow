@@ -21,8 +21,13 @@ const HOST_ALIGN: usize = 64;
 
 struct CpuBuffer {
     ptr: *mut u8,
-    layout: Layout,
+    len: usize,
     kind: MemKind,
+    /// `Some` dla własnej alokacji (zwalnianej przy Drop), `None` dla okna
+    /// wewnątrz innego bufora — wtedy pamięć trzyma `parent`.
+    layout: Option<Layout>,
+    #[allow(dead_code)]
+    parent: Option<Arc<dyn BufferImpl>>,
 }
 
 // The raw pointer is uniquely owned by this struct and freed on drop; access
@@ -32,7 +37,7 @@ unsafe impl Sync for CpuBuffer {}
 
 impl BufferImpl for CpuBuffer {
     fn len(&self) -> usize {
-        self.layout.size()
+        self.len
     }
 
     fn kind(&self) -> MemKind {
@@ -54,7 +59,9 @@ impl BufferImpl for CpuBuffer {
 
 impl Drop for CpuBuffer {
     fn drop(&mut self) {
-        unsafe { dealloc(self.ptr, self.layout) };
+        if let Some(layout) = self.layout {
+            unsafe { dealloc(self.ptr, layout) };
+        }
     }
 }
 
@@ -106,7 +113,13 @@ impl CpuDevice {
                 warp_size: 1,
                 sm_count: 0,
                 fp8_native: false,
-                fp4_native: false,
+                // Blokowo skalowane FP4, wgmma, tcgen05 i TMA to instrukcje NVIDII;
+                // ten backend nie ma zadnego z tych rdzeni.
+                fp4_block_scale_ue8m0: false,
+                fp4_block_scale_e4m3: false,
+                wgmma: false,
+                tcgen05: false,
+                tma: false,
                 bf16_native: false,
                 supports_p2p: false,
                 supports_graph_capture: false,
@@ -172,8 +185,22 @@ impl Device for CpuDevice {
         }
         Ok(DevBuffer::from_impl(Arc::new(CpuBuffer {
             ptr,
-            layout,
+            len: bytes.max(1),
             kind,
+            layout: Some(layout),
+            parent: None,
+        })))
+    }
+
+    fn sub_buffer(&self, parent: &DevBuffer, offset: usize, len: usize) -> Result<DevBuffer> {
+        let base = parent.downcast::<CpuBuffer>()?;
+        crate::check_sub_range(base.len, offset, len)?;
+        Ok(DevBuffer::from_impl(Arc::new(CpuBuffer {
+            ptr: unsafe { base.ptr.add(offset) },
+            len,
+            kind: base.kind,
+            layout: None,
+            parent: Some(parent.impl_arc()),
         })))
     }
 

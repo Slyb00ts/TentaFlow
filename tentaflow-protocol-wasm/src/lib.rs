@@ -16,17 +16,16 @@
 //   ws.send(frame);
 // =============================================================================
 
+use std::collections::HashMap;
+use std::sync::OnceLock;
 use tentaflow_protocol::{
-    SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
-    envelope::{Envelope, EnvelopeFlags, Routing, message_kind},
+    envelope::{message_kind, Envelope, EnvelopeFlags, Routing},
     message_body::{
-        AddonAdminOnlySetRequest, AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest,
-        AddonDocumentPayload, AddonDocumentUploadChunkRequest,
-        AddonInstallRequest, AddonInstanceDuplicateRequest, AddonInstanceInstallRequest,
-        AddonInstancePayload, AddonInstanceUpdateRequest, AddonInstanceVersionsRequest,
-        AddonLogsRequest, AddonNetworkRulesGetRequest, AddonStoragePayload,
-        AddonStorageStatsRequest, AddonVectorConfig, AddonVectorGetConfigRequest,
-        AddonVectorPayload, AddonVectorServiceRef, AddonVectorSetConfigRequest,
+        AddonAccessDecisionRequest, AddonAccessListRequest, AddonAdminOnlySetRequest,
+        AddonConfigGetRequest, AddonConfigSetRequest, AddonDetailRequest, AddonDocumentPayload,
+        AddonDocumentUploadChunkRequest, AddonInstallRequest, AddonInstanceDuplicateRequest,
+        AddonInstanceInstallRequest, AddonInstancePayload, AddonInstanceUpdateRequest,
+        AddonInstanceVersionsRequest, AddonLogsRequest, AddonNetworkRulesGetRequest,
         AddonNetworkRulesSetRequest, AddonOAuthAuthorizeStartRequest,
         AddonOAuthConfigClearSecretRequest, AddonOAuthConfigListRequest,
         AddonOAuthConfigSetRequest, AddonOAuthLinkedAccountsRequest, AddonOAuthReauthorizeRequest,
@@ -34,33 +33,30 @@ use tentaflow_protocol::{
         AddonPermissionCheckRequest, AddonPermissionDefaultSetRequest,
         AddonPermissionMatrixRequest, AddonPermissionSetRequest, AddonReloadRequest,
         AddonResourcesGetRequest, AddonResourcesSetRequest, AddonShowInCatalogSetRequest,
-        AddonToggleRequest, AddonToolsRequest, AddonUninstallRequest, AddonVisibilityListRequest,
-        AddonVisibilitySetRequest, AddonAccessDecisionRequest, AddonAccessListRequest,
-        AliasConsumerGrantRequest, AliasConsumerListRequest, AliasConsumerRevokeRequest,
-        AliasVisibilitySetRequest, ModelConsumerGrantRequest, ModelConsumerListRequest,
-        ModelConsumerRevokeRequest, ModelVisibilitySetRequest,
-        ApiKeyCreateRequest, AuthLoginRequest,
-        BaselineAdoptPhaseTag, BaselineAdoptStartRequest, ChatMessage,
+        AddonStoragePayload, AddonStorageStatsRequest, AddonToggleRequest, AddonToolsRequest,
+        AddonUninstallRequest, AddonVectorConfig, AddonVectorGetConfigRequest, AddonVectorPayload,
+        AddonVectorServiceRef, AddonVectorSetConfigRequest, AddonVisibilityListRequest,
+        AddonVisibilitySetRequest, AliasConsumerGrantRequest, AliasConsumerListRequest,
+        AliasConsumerRevokeRequest, AliasVisibilitySetRequest, ApiKeyCreateRequest,
+        AuthLoginRequest, BaselineAdoptPhaseTag, BaselineAdoptStartRequest, ChatMessage,
         ChatStreamRequest, ClusterAddMemberRequest, ClusterCreateRequest, ClusterDeleteRequest,
-        ClusterDeployRequest, ClusterDeployStopRequest,
-        ClusterDetailRequest, ClusterProbeStreamRequest, ClusterRemoveMemberRequest,
-        ClusterUpdateRequest, DeployVllmRecommendRequest, SuggestServicePortRequest,
-        FlowCreateRequest, FlowUpdateRequest,
-        FlowVersionGetRequest, FlowVersionListRequest, FlowVersionRestoreRequest,
-        MePreferencesGetRequest, MePreferencesUpdateRequest, MeshConnectRequest,
-        MeshNodeCommandRequest, MeshNodeNetworkConfigRequest, MeshPairInitRequest,
-        MeshPairingConfirmRequest, MeshPairingRejectRequest, MeshPairingStartRequest,
-        MeshTrustRetrustRequest, MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest,
-        ModelAliasDeleteRequest, ModelAliasUpdateRequest, ModelInstallRequest,
-        MyOAuthAccountsListRequest,
-        ProtocolError, ProtocolErrorCode, ServiceManifestDeployRequest, SettingEntry,
-        SettingsUpdateRequest, SsoProviderCreateRequest, SsoProviderDeleteRequest,
-        TranslateRequest, TtsRule,
+        ClusterDeployRequest, ClusterDeployStopRequest, ClusterDetailRequest,
+        ClusterProbeStreamRequest, ClusterRemoveMemberRequest, ClusterUpdateRequest,
+        DeployVllmRecommendRequest, FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
+        FlowVersionListRequest, FlowVersionRestoreRequest, MePreferencesGetRequest,
+        MePreferencesUpdateRequest, MeshConnectRequest, MeshNodeCommandRequest,
+        MeshNodeNetworkConfigRequest, MeshPairInitRequest, MeshPairingConfirmRequest,
+        MeshPairingRejectRequest, MeshPairingStartRequest, MeshTrustRetrustRequest,
+        MeshTrustRevokeRequest, MessageBody, ModelAliasCreateRequest, ModelAliasDeleteRequest,
+        ModelAliasUpdateRequest, ModelConsumerGrantRequest, ModelConsumerListRequest,
+        ModelConsumerRevokeRequest, ModelInstallRequest, ModelVisibilitySetRequest,
+        MyOAuthAccountsListRequest, ProtocolError, ProtocolErrorCode, ServiceManifestDeployRequest,
+        SettingEntry, SettingsUpdateRequest, SsoProviderCreateRequest, SsoProviderDeleteRequest,
+        SuggestServicePortRequest, TranslateRequest, TtsRule,
     },
+    SCHEMA_VERSION as PROTOCOL_SCHEMA_VERSION,
 };
 use wasm_bindgen::prelude::*;
-use std::collections::HashMap;
-use std::sync::OnceLock;
 
 mod identity;
 pub use identity::*;
@@ -288,10 +284,12 @@ pub fn encode_api_key_create_request(
     let scope_resources = scope_types
         .into_iter()
         .zip(scope_ids)
-        .map(|(resource_type, resource_id)| tentaflow_protocol::ResourceRef {
-            resource_type,
-            resource_id,
-        })
+        .map(
+            |(resource_type, resource_id)| tentaflow_protocol::ResourceRef {
+                resource_type,
+                resource_id,
+            },
+        )
         .collect();
     encode_body_inner(&MessageBody::ApiKeyCreateRequestBody(ApiKeyCreateRequest {
         name,
@@ -305,7 +303,8 @@ pub fn encode_api_key_create_request(
 /// MessageBody::ApiKeyScopeListRequest { key_uid }.
 #[wasm_bindgen(js_name = encodeApiKeyScopeListRequest)]
 pub fn encode_api_key_scope_list_request(key_uid: String) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ApiKeyScopeListRequest { key_uid }).map_err(|e| JsError::new(&e))
+    encode_body_inner(&MessageBody::ApiKeyScopeListRequest { key_uid })
+        .map_err(|e| JsError::new(&e))
 }
 
 /// MessageBody::ApiKeyScopeSetRequest { key_uid, resource_type, resource_id, access_level }.
@@ -401,6 +400,7 @@ pub fn encode_chat_stream_request_simple(
         messages: vec![ChatMessage {
             role: "user".to_string(),
             content: user_message,
+            reasoning_content: None,
         }],
         temperature: None,
         max_tokens: None,
@@ -546,6 +546,8 @@ pub fn encode_cluster_add_member_request(
     node_id: String,
     interface_type: Option<String>,
     interface_speed_mbps: Option<u32>,
+    interface_name: Option<String>,
+    interface_ip: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ClusterAddMemberRequestBody(
         ClusterAddMemberRequest {
@@ -553,6 +555,8 @@ pub fn encode_cluster_add_member_request(
             node_id,
             interface_type,
             interface_speed_mbps,
+            interface_name,
+            interface_ip,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -630,25 +634,27 @@ pub fn encode_cluster_deploy_request(
     audio_per_min: Option<f64>,
     image_each: Option<f64>,
 ) -> Result<Vec<u8>, JsError> {
-    encode_body_inner(&MessageBody::ClusterDeployRequestBody(ClusterDeployRequest {
-        cluster_id,
-        engine_id,
-        model_repo,
-        model_preset_id,
-        served_model_name,
-        gpu_memory_utilization,
-        max_model_len,
-        port,
-        gpus_per_node,
-        config_json,
-        build_timeout_secs,
-        gcs_timeout_secs,
-        ready_timeout_secs,
-        prompt_per_1k,
-        completion_per_1k,
-        audio_per_min,
-        image_each,
-    }))
+    encode_body_inner(&MessageBody::ClusterDeployRequestBody(
+        ClusterDeployRequest {
+            cluster_id,
+            engine_id,
+            model_repo,
+            model_preset_id,
+            served_model_name,
+            gpu_memory_utilization,
+            max_model_len,
+            port,
+            gpus_per_node,
+            config_json,
+            build_timeout_secs,
+            gcs_timeout_secs,
+            ready_timeout_secs,
+            prompt_per_1k,
+            completion_per_1k,
+            audio_per_min,
+            image_each,
+        },
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -1202,12 +1208,14 @@ pub fn encode_addon_instance_install_request(
             pairs.push((key, value));
         }
     }
-    encode_addon_instance(AddonInstancePayload::ReqInstall(AddonInstanceInstallRequest {
-        package_id,
-        version,
-        display_name,
-        config: pairs,
-    }))
+    encode_addon_instance(AddonInstancePayload::ReqInstall(
+        AddonInstanceInstallRequest {
+            package_id,
+            version,
+            display_name,
+            config: pairs,
+        },
+    ))
 }
 
 /// MessageBody::AddonInstanceBody(ReqDuplicate) — duplikacja instancji.
@@ -1238,10 +1246,12 @@ pub fn encode_addon_instance_update_request(
     addon_id: String,
     target_version: String,
 ) -> Result<Vec<u8>, JsError> {
-    encode_addon_instance(AddonInstancePayload::ReqUpdate(AddonInstanceUpdateRequest {
-        addon_id,
-        target_version,
-    }))
+    encode_addon_instance(AddonInstancePayload::ReqUpdate(
+        AddonInstanceUpdateRequest {
+            addon_id,
+            target_version,
+        },
+    ))
 }
 
 /// MessageBody::AddonStorageBody(StatsRequest) — statystyki storage addona.
@@ -2210,9 +2220,7 @@ pub fn encode_ml_studio_project_resources_request(project_id: String) -> Result<
 }
 
 #[wasm_bindgen(js_name = encodeMlStudioTrainingRunsListRequest)]
-pub fn encode_ml_studio_training_runs_list_request(
-    project_id: String,
-) -> Result<Vec<u8>, JsError> {
+pub fn encode_ml_studio_training_runs_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::TrainingRunsListRequest(
             tentaflow_protocol::MlStudioTrainingRunsListRequest { project_id },
@@ -2566,6 +2574,51 @@ pub fn encode_ml_studio_classifier_train_start_request(
     .map_err(|e| JsError::new(&e))
 }
 
+#[wasm_bindgen(js_name = encodeMlStudioOcrTrainStartRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_ml_studio_ocr_train_start_request(
+    project_id: String,
+    dataset_id: String,
+    attribute: String,
+    source_class: String,
+    epochs: i32,
+    batch_size: i32,
+    learning_rate: f32,
+    synthetic_per_epoch: i32,
+    real_repeat: i32,
+    target_node_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::OcrTrainStartRequest(
+            tentaflow_protocol::MlStudioOcrTrainStartRequest {
+                project_id,
+                dataset_id,
+                attribute,
+                source_class,
+                hyperparams: tentaflow_protocol::MlStudioOcrHyperparams {
+                    epochs,
+                    batch_size,
+                    learning_rate,
+                    synthetic_per_epoch,
+                    real_repeat,
+                },
+                target_node_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioTrainCancelRequest)]
+pub fn encode_ml_studio_train_cancel_request(run_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::TrainCancelRequest(
+            tentaflow_protocol::MlStudioTrainCancelRequest { run_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioGenericTrainStatusRequest)]
 pub fn encode_ml_studio_generic_train_status_request(run_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
@@ -2611,7 +2664,10 @@ pub fn encode_ml_studio_recog_image_request(
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogImageRequest(
-            tentaflow_protocol::MlStudioRecogImageRequest { dataset_id, image_id },
+            tentaflow_protocol::MlStudioRecogImageRequest {
+                dataset_id,
+                image_id,
+            },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -2664,9 +2720,7 @@ pub fn encode_ml_studio_schema_save_request(
 }
 
 #[wasm_bindgen(js_name = encodeMlStudioLookupDictsListRequest)]
-pub fn encode_ml_studio_lookup_dicts_list_request(
-    project_id: String,
-) -> Result<Vec<u8>, JsError> {
+pub fn encode_ml_studio_lookup_dicts_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::LookupDictsListRequest(
             tentaflow_protocol::MlStudioLookupDictsListRequest { project_id },
@@ -2808,10 +2862,7 @@ pub fn encode_storage_browse_request(path: String) -> Result<Vec<u8>, JsError> {
 }
 
 #[wasm_bindgen(js_name = encodeStorageCreateDirRequest)]
-pub fn encode_storage_create_dir_request(
-    parent: String,
-    name: String,
-) -> Result<Vec<u8>, JsError> {
+pub fn encode_storage_create_dir_request(parent: String, name: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::StorageAdminBody(
         tentaflow_protocol::StorageAdminPayload::CreateDirRequest(
             tentaflow_protocol::StorageCreateDirRequest { parent, name },
@@ -2946,6 +2997,225 @@ pub fn encode_ml_studio_recog_autolabel_status_request(job_id: String) -> Result
     encode_body_inner(&MessageBody::MlStudioBody(
         tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusRequest(
             tentaflow_protocol::MlStudioRecogAutolabelStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectExportStartRequest)]
+pub fn encode_ml_studio_project_export_start_request(
+    project_id: String,
+    include_models: bool,
+    include_history: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectExportStartRequest(
+            tentaflow_protocol::MlStudioProjectExportStartRequest {
+                project_id,
+                include_models,
+                include_history,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectExportStatusRequest)]
+pub fn encode_ml_studio_project_export_status_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectExportStatusRequest(
+            tentaflow_protocol::MlStudioProjectExportStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportUploadChunkRequest)]
+pub fn encode_ml_studio_project_import_upload_chunk_request(
+    upload_id: String,
+    seq: u32,
+    total_chunks: u32,
+    filename: String,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkRequest(
+            tentaflow_protocol::MlStudioProjectImportUploadChunkRequest {
+                upload_id,
+                seq,
+                total_chunks,
+                filename,
+                bytes,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportUploadStatusRequest)]
+pub fn encode_ml_studio_project_import_upload_status_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusRequest(
+            tentaflow_protocol::MlStudioProjectImportUploadStatusRequest { upload_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportPreviewRequest)]
+pub fn encode_ml_studio_project_import_preview_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportPreviewRequest(
+            tentaflow_protocol::MlStudioProjectImportPreviewRequest { upload_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportApplyRequest)]
+pub fn encode_ml_studio_project_import_apply_request(
+    upload_id: String,
+    mode: String,
+    name_override: Option<String>,
+    target_project_id: Option<String>,
+    target_dataset_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportApplyRequest(
+            tentaflow_protocol::MlStudioProjectImportApplyRequest {
+                upload_id,
+                mode,
+                name_override,
+                target_project_id,
+                target_dataset_id,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportStatusRequest)]
+pub fn encode_ml_studio_project_import_status_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportStatusRequest(
+            tentaflow_protocol::MlStudioProjectImportStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioProjectImportCancelRequest)]
+pub fn encode_ml_studio_project_import_cancel_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::ProjectImportCancelRequest(
+            tentaflow_protocol::MlStudioProjectImportCancelRequest { upload_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecordingsListRequest)]
+pub fn encode_ml_studio_recordings_list_request(
+    camera_id: Option<String>,
+    date_from_ms: Option<f64>,
+    date_to_ms: Option<f64>,
+    limit: u32,
+    source_node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecordingsListRequest(
+            tentaflow_protocol::MlStudioRecordingsListRequest {
+                camera_id: camera_id.filter(|s| !s.is_empty()),
+                date_from_ms: date_from_ms.map(|v| v as i64),
+                date_to_ms: date_to_ms.map(|v| v as i64),
+                limit,
+                source_node_id: source_node_id.filter(|s| !s.is_empty()),
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogImportRecordingsRequest)]
+pub fn encode_ml_studio_recog_import_recordings_request(
+    project_id: String,
+    dataset_id: String,
+    recording_refs: Vec<String>,
+    fps: u32,
+    autolabel: bool,
+    collision: String,
+    source_node_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(
+            tentaflow_protocol::MlStudioRecogImportRecordingsRequest {
+                project_id,
+                dataset_id,
+                recording_refs,
+                fps,
+                autolabel,
+                collision,
+                source_node_id: source_node_id.filter(|s| !s.is_empty()),
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRecogImportRecordingsStatusRequest)]
+pub fn encode_ml_studio_recog_import_recordings_status_request(
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusRequest(
+            tentaflow_protocol::MlStudioRecogImportRecordingsStatusRequest { job_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRemoteImportPreviewRequest)]
+pub fn encode_ml_studio_remote_import_preview_request(
+    url: String,
+    api_key: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(
+            tentaflow_protocol::MlStudioRemoteImportPreviewRequest { url, api_key },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRemoteImportStartRequest)]
+pub fn encode_ml_studio_remote_import_start_request(
+    url: String,
+    api_key: String,
+    name_override: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(
+            tentaflow_protocol::MlStudioRemoteImportStartRequest {
+                url,
+                api_key,
+                name_override,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeMlStudioRemoteImportStatusRequest)]
+pub fn encode_ml_studio_remote_import_status_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::MlStudioBody(
+        tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(
+            tentaflow_protocol::MlStudioRemoteImportStatusRequest { job_id },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -3141,11 +3411,13 @@ pub fn encode_agent_runs_list_request(
     parent_run_id: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::AgentsBody(
-        tentaflow_protocol::AgentsPayload::RunsListRequest(tentaflow_protocol::AgentRunsListRequest {
-            agent_id,
-            status,
-            parent_run_id,
-        }),
+        tentaflow_protocol::AgentsPayload::RunsListRequest(
+            tentaflow_protocol::AgentRunsListRequest {
+                agent_id,
+                status,
+                parent_run_id,
+            },
+        ),
     ))
     .map_err(|e| JsError::new(&e))
 }
@@ -3233,6 +3505,29 @@ pub fn encode_agent_run_events_subscribe_request(
     encode_body_inner(&MessageBody::AgentsBody(
         tentaflow_protocol::AgentsPayload::RunEventsSubscribeRequest(
             tentaflow_protocol::AgentRunEventsSubscribeRequest { scope },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentRunStartRequest)]
+pub fn encode_agent_run_start_request(
+    agent_id: String,
+    prompt: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunStartRequest(
+            tentaflow_protocol::AgentRunStartRequest { agent_id, prompt },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeAgentBuilderAssistRequest)]
+pub fn encode_agent_builder_assist_request(messages_json: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::BuilderAssistRequest(
+            tentaflow_protocol::AgentBuilderAssistRequest { messages_json },
         ),
     ))
     .map_err(|e| JsError::new(&e))
@@ -3655,9 +3950,9 @@ pub fn encode_service_model_selection_request(payload_json: String) -> Result<Ve
     use tentaflow_protocol::{ServiceModelSelectionRequest, ServicePayload};
     let payload: ServiceModelSelectionRequest = serde_json::from_str(&payload_json)
         .map_err(|e| JsError::new(&format!("ServiceModelSelectionRequest JSON: {e}")))?;
-    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqModelSelection(
-        payload,
-    )))
+    encode_body_inner(&MessageBody::ServiceBody(
+        ServicePayload::ReqModelSelection(payload),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -3685,6 +3980,17 @@ pub fn encode_service_oauth_poll_request(payload_json: String) -> Result<Vec<u8>
         payload,
     )))
     .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ServiceBody(ServicePayload::ReqAgent) — execute a validated
+/// operation against a node-owned Codex or Claude Code bridge.
+#[wasm_bindgen(js_name = encodeServiceAgentRequest)]
+pub fn encode_service_agent_request(payload_json: String) -> Result<Vec<u8>, JsError> {
+    use tentaflow_protocol::{ServiceAgentRequest, ServicePayload};
+    let payload: ServiceAgentRequest = serde_json::from_str(&payload_json)
+        .map_err(|e| JsError::new(&format!("ServiceAgentRequest JSON: {e}")))?;
+    encode_body_inner(&MessageBody::ServiceBody(ServicePayload::ReqAgent(payload)))
+        .map_err(|e| JsError::new(&e))
 }
 
 // --- Prompts --------------------------------------------------------------
@@ -4320,19 +4626,29 @@ fn access_transition_to_js(t: &tentaflow_protocol::AccessTransition) -> JsValue 
 /// Buduje jeden wiersz summary (JS object) z `ModelMetricsRowWire`. Wspoldzielony
 /// przez `rows` i `grandTotal`, zeby oba mialy identyczny ksztalt (klucze
 /// camelCase + snake_case, percentyle number|null).
-fn model_metrics_summary_row_to_js(
-    r: &tentaflow_protocol::ModelMetricsRowWire,
-) -> js_sys::Object {
+fn model_metrics_summary_row_to_js(r: &tentaflow_protocol::ModelMetricsRowWire) -> js_sys::Object {
     let item = js_sys::Object::new();
     set(&item, "key", r.key.clone().into());
     set(&item, "promptTokens", (r.prompt_tokens as f64).into());
     set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
-    set(&item, "completionTokens", (r.completion_tokens as f64).into());
-    set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+    set(
+        &item,
+        "completionTokens",
+        (r.completion_tokens as f64).into(),
+    );
+    set(
+        &item,
+        "completion_tokens",
+        (r.completion_tokens as f64).into(),
+    );
     set(&item, "totalTokens", (r.total_tokens as f64).into());
     set(&item, "total_tokens", (r.total_tokens as f64).into());
     set(&item, "embeddingTokens", (r.embedding_tokens as f64).into());
-    set(&item, "embedding_tokens", (r.embedding_tokens as f64).into());
+    set(
+        &item,
+        "embedding_tokens",
+        (r.embedding_tokens as f64).into(),
+    );
     set(&item, "audioMs", (r.audio_ms as f64).into());
     set(&item, "audio_ms", (r.audio_ms as f64).into());
     set(&item, "images", (r.images as f64).into());
@@ -4391,7 +4707,11 @@ fn decode_model_metrics_payload(
             }
             set(obj, "rows", arr.into());
             match grand_total {
-                Some(r) => set(obj, "grandTotal", model_metrics_summary_row_to_js(&r).into()),
+                Some(r) => set(
+                    obj,
+                    "grandTotal",
+                    model_metrics_summary_row_to_js(&r).into(),
+                ),
                 None => set(obj, "grandTotal", JsValue::NULL),
             }
         }
@@ -4409,8 +4729,16 @@ fn decode_model_metrics_payload(
                 set(&item, "model_id", r.model_id.into());
                 set(&item, "promptTokens", (r.prompt_tokens as f64).into());
                 set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
-                set(&item, "completionTokens", (r.completion_tokens as f64).into());
-                set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+                set(
+                    &item,
+                    "completionTokens",
+                    (r.completion_tokens as f64).into(),
+                );
+                set(
+                    &item,
+                    "completion_tokens",
+                    (r.completion_tokens as f64).into(),
+                );
                 set(&item, "totalTokens", (r.total_tokens as f64).into());
                 set(&item, "total_tokens", (r.total_tokens as f64).into());
                 set(&item, "requestCount", (r.request_count as f64).into());
@@ -4545,7 +4873,11 @@ fn benchmark_result_row_to_js(r: &tentaflow_protocol::ResultRowWire) -> JsValue 
     set(&item, "prefillTpsMean", opt_f64_to_js(r.prefill_tps_mean));
     set(&item, "prefill_tps_mean", opt_f64_to_js(r.prefill_tps_mean));
     set(&item, "prefillTpsSigma", opt_f64_to_js(r.prefill_tps_sigma));
-    set(&item, "prefill_tps_sigma", opt_f64_to_js(r.prefill_tps_sigma));
+    set(
+        &item,
+        "prefill_tps_sigma",
+        opt_f64_to_js(r.prefill_tps_sigma),
+    );
     set(&item, "decodeTpsMean", opt_f64_to_js(r.decode_tps_mean));
     set(&item, "decode_tps_mean", opt_f64_to_js(r.decode_tps_mean));
     set(&item, "decodeTpsSigma", opt_f64_to_js(r.decode_tps_sigma));
@@ -4825,7 +5157,11 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                     "clusterDeploymentId",
                     s.cluster_deployment_id.clone().into(),
                 );
-                set(&item, "cluster_deployment_id", s.cluster_deployment_id.into());
+                set(
+                    &item,
+                    "cluster_deployment_id",
+                    s.cluster_deployment_id.into(),
+                );
 
                 let models = js_sys::Array::new();
                 for m in s.models {
@@ -5068,6 +5404,20 @@ fn decode_service_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Ser
                 set(obj, "accountLabel", a.clone().into());
                 set(obj, "account_label", a.into());
             }
+            if let Some(e) = r.error {
+                set(obj, "error", e.into());
+            }
+        }
+        SP::ReqAgent(r) => {
+            set(obj, "variant", "ServiceAgentRequest".into());
+            set(obj, "serviceId", r.service_id.into());
+            set(obj, "operation", r.operation.into());
+        }
+        SP::ResAgent(r) => {
+            set(obj, "variant", "ServiceAgentResponse".into());
+            set(obj, "success", r.success.into());
+            set(obj, "resultJson", r.result_json.clone().into());
+            set(obj, "result_json", r.result_json.into());
             if let Some(e) = r.error {
                 set(obj, "error", e.into());
             }
@@ -6342,8 +6692,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     // jako BigInt i psuł arytmetykę/wykresy w dashboardzie.
                     set(&item, "promptTokens", (r.prompt_tokens as f64).into());
                     set(&item, "prompt_tokens", (r.prompt_tokens as f64).into());
-                    set(&item, "completionTokens", (r.completion_tokens as f64).into());
-                    set(&item, "completion_tokens", (r.completion_tokens as f64).into());
+                    set(
+                        &item,
+                        "completionTokens",
+                        (r.completion_tokens as f64).into(),
+                    );
+                    set(
+                        &item,
+                        "completion_tokens",
+                        (r.completion_tokens as f64).into(),
+                    );
                     set(&item, "totalTokens", (r.total_tokens as f64).into());
                     set(&item, "total_tokens", (r.total_tokens as f64).into());
                     set(&item, "requestCount", (r.request_count as f64).into());
@@ -6352,7 +6710,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "audio_ms", (r.audio_ms as f64).into());
                     set(&item, "images", (r.images as f64).into());
                     set(&item, "embeddingTokens", (r.embedding_tokens as f64).into());
-                    set(&item, "embedding_tokens", (r.embedding_tokens as f64).into());
+                    set(
+                        &item,
+                        "embedding_tokens",
+                        (r.embedding_tokens as f64).into(),
+                    );
                     arr.push(&item);
                 }
                 set(&obj, "rows", arr.into());
@@ -6373,7 +6735,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set_optional_string(&item, "model_id", q.model_id);
                     set(&item, "period", q.period.into());
                     set(&item, "maxTotalTokens", (q.max_total_tokens as f64).into());
-                    set(&item, "max_total_tokens", (q.max_total_tokens as f64).into());
+                    set(
+                        &item,
+                        "max_total_tokens",
+                        (q.max_total_tokens as f64).into(),
+                    );
                     set(&item, "isActive", q.is_active.into());
                     set(&item, "is_active", q.is_active.into());
                     arr.push(&item);
@@ -6408,7 +6774,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "base_used", (l.base_used as f64).into());
                     set(&item, "grantedTokens", (l.granted_tokens as f64).into());
                     set(&item, "granted_tokens", (l.granted_tokens as f64).into());
-                    set(&item, "coordinatorNodeId", l.coordinator_node_id.clone().into());
+                    set(
+                        &item,
+                        "coordinatorNodeId",
+                        l.coordinator_node_id.clone().into(),
+                    );
                     set(&item, "coordinator_node_id", l.coordinator_node_id.into());
                     set(&item, "expiresAt", l.expires_at.clone().into());
                     set(&item, "expires_at", l.expires_at.into());
@@ -6609,8 +6979,16 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "variant", "SkillsCuratorApplyRequest".into());
                 set(&obj, "snapshotId", req.snapshot_id.clone().into());
                 set(&obj, "snapshot_id", req.snapshot_id.into());
-                set(&obj, "approvedActionsJson", req.approved_actions_json.clone().into());
-                set(&obj, "approved_actions_json", req.approved_actions_json.into());
+                set(
+                    &obj,
+                    "approvedActionsJson",
+                    req.approved_actions_json.clone().into(),
+                );
+                set(
+                    &obj,
+                    "approved_actions_json",
+                    req.approved_actions_json.into(),
+                );
             }
             tentaflow_protocol::SkillsPayload::CuratorApplyResponse(resp) => {
                 set(&obj, "variant", "SkillsCuratorApplyResponse".into());
@@ -6785,6 +7163,27 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "permission", ev.permission.into());
                 set(&obj, "outcome", ev.outcome.into());
             }
+            tentaflow_protocol::AgentsPayload::RunStartRequest(req) => {
+                set(&obj, "variant", "AgentRunStartRequest".into());
+                set(&obj, "agentId", req.agent_id.clone().into());
+                set(&obj, "agent_id", req.agent_id.into());
+                set(&obj, "prompt", req.prompt.into());
+            }
+            tentaflow_protocol::AgentsPayload::RunStartResponse(resp) => {
+                set(&obj, "variant", "AgentRunStartResponse".into());
+                set(&obj, "runId", resp.run_id.clone().into());
+                set(&obj, "run_id", resp.run_id.into());
+            }
+            tentaflow_protocol::AgentsPayload::BuilderAssistRequest(req) => {
+                set(&obj, "variant", "AgentBuilderAssistRequest".into());
+                set(&obj, "messagesJson", req.messages_json.clone().into());
+                set(&obj, "messages_json", req.messages_json.into());
+            }
+            tentaflow_protocol::AgentsPayload::BuilderAssistResponse(resp) => {
+                set(&obj, "variant", "AgentBuilderAssistResponse".into());
+                set(&obj, "resultJson", resp.result_json.clone().into());
+                set(&obj, "result_json", resp.result_json.into());
+            }
         },
         MessageBody::SyncConflictBody(payload) => match payload {
             tentaflow_protocol::SyncConflictPayload::ListRequest(req) => {
@@ -6898,11 +7297,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     "snapshot_blob_bytes",
                     resp.snapshot_blob_bytes.clone().into(),
                 );
-                set(
-                    &obj,
-                    "finalBlobBytes",
-                    resp.final_blob_bytes.clone().into(),
-                );
+                set(&obj, "finalBlobBytes", resp.final_blob_bytes.clone().into());
                 set(
                     &obj,
                     "final_blob_bytes",
@@ -7379,6 +7774,9 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 arr.push(&cluster_member_to_js(m).into());
             }
             set(&obj, "members", arr.into());
+            if let Some(dep) = resp.deployment {
+                set(&obj, "deployment", cluster_deployment_to_js(dep).into());
+            }
         }
         MessageBody::ClusterCreateRequestBody(req) => {
             set(&obj, "variant", "ClusterCreateRequest".into());
@@ -7540,7 +7938,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ClusterDeployResponseBody(resp) => {
             set(&obj, "variant", "ClusterDeployResponse".into());
             set(&obj, "ok", resp.ok.into());
-            set(&obj, "deploymentClusterId", resp.deployment_cluster_id.into());
+            set(
+                &obj,
+                "deploymentClusterId",
+                resp.deployment_cluster_id.into(),
+            );
             set(&obj, "headNodeId", resp.head_node_id.into());
             if let Some(url) = resp.endpoint_url {
                 set(&obj, "endpointUrl", url.into());
@@ -7568,7 +7970,11 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::ClusterDeployStopRequestBody(req) => {
             set(&obj, "variant", "ClusterDeployStopRequest".into());
             set(&obj, "clusterId", req.cluster_id.into());
-            set(&obj, "deploymentClusterId", req.deployment_cluster_id.into());
+            set(
+                &obj,
+                "deploymentClusterId",
+                req.deployment_cluster_id.into(),
+            );
         }
         MessageBody::ClusterDeployStopResponseBody(resp) => {
             set(&obj, "variant", "ClusterDeployStopResponse".into());
@@ -8005,11 +8411,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "oauth_providers", providers.into());
             set(&obj, "license", resp.license.into());
             set(&obj, "fileSizeBytes", resp.file_size_bytes.clone().into());
-            set(
-                &obj,
-                "file_size_bytes",
-                resp.file_size_bytes.clone().into(),
-            );
+            set(&obj, "file_size_bytes", resp.file_size_bytes.clone().into());
             set(&obj, "runtime", resp.runtime.into());
             match resp.icon {
                 Some(ref v) => set(&obj, "icon", v.clone().into()),
@@ -8427,6 +8829,28 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&obj, "status", status.into());
                 set(&obj, "message", message.into());
             }
+            tentaflow_protocol::SystemEventPayload::UserNotification {
+                user_id,
+                notification_id,
+                project_id,
+                kind,
+                title,
+                body,
+                link_json,
+            } => {
+                set(&obj, "variant", "UserNotification".into());
+                set(&obj, "userId", user_id.clone().into());
+                set(&obj, "user_id", user_id.into());
+                set(&obj, "notificationId", notification_id.clone().into());
+                set(&obj, "notification_id", notification_id.into());
+                set(&obj, "projectId", project_id.clone().into());
+                set(&obj, "project_id", project_id.into());
+                set(&obj, "kind", kind.into());
+                set(&obj, "title", title.into());
+                set(&obj, "body", body.into());
+                set(&obj, "linkJson", link_json.clone().into());
+                set(&obj, "link_json", link_json.into());
+            }
         },
         MessageBody::AddonPermissionChangedEventBody(evt) => {
             set(&obj, "variant", "AddonPermissionChangedEvent".into());
@@ -8621,11 +9045,7 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 "httpRequestsPerMin",
                 r.http_requests_per_min.clone().into(),
             );
-            set(
-                &obj,
-                "llmTokensPerMin",
-                r.llm_tokens_per_min.clone().into(),
-            );
+            set(&obj, "llmTokensPerMin", r.llm_tokens_per_min.clone().into());
         }
         MessageBody::AddonResourcesSetResponseBody(r) => {
             set(&obj, "variant", "AddonResourcesSetResponse".into());
@@ -9340,6 +9760,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
+        MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
+        MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
     }
     Ok(obj.into())
 }
@@ -9381,9 +9803,21 @@ fn decode_storage_admin_payload(
             set(obj, "categories", arr.into());
             set(obj, "root", resp.root.into());
             set(obj, "diskTotalBytes", (resp.disk_total_bytes as f64).into());
-            set(obj, "disk_total_bytes", (resp.disk_total_bytes as f64).into());
-            set(obj, "diskAvailableBytes", (resp.disk_available_bytes as f64).into());
-            set(obj, "disk_available_bytes", (resp.disk_available_bytes as f64).into());
+            set(
+                obj,
+                "disk_total_bytes",
+                (resp.disk_total_bytes as f64).into(),
+            );
+            set(
+                obj,
+                "diskAvailableBytes",
+                (resp.disk_available_bytes as f64).into(),
+            );
+            set(
+                obj,
+                "disk_available_bytes",
+                (resp.disk_available_bytes as f64).into(),
+            );
         }
         P::BrowseResponse(resp) => {
             set(obj, "variant", "StorageBrowseResponse".into());
@@ -9427,6 +9861,167 @@ fn decode_storage_admin_payload(
         P::CreateDirRequest(_) => set(obj, "variant", "StorageCreateDirRequest".into()),
         P::MigrateRequest(_) => set(obj, "variant", "StorageMigrateRequest".into()),
     }
+}
+
+/// Decodes `ProjectStudioPayload` generically: serde's external tagging yields
+/// `{"VariantName": {fields}}` (or a bare string for unit variants), so the
+/// variant tag becomes "ProjectStudio" + name and every field is copied with
+/// both snake_case and camelCase keys. Future append-only variants decode
+/// without touching this crate. `bytes` of the upload request would arrive as
+/// a number array, but request variants never legitimately decode in the
+/// response path. AttachmentGetResponse and RunArtifactGetResponse are
+/// special-cased BEFORE the generic path: their serde_bytes payloads (up to
+/// 8 MiB / 32 MiB) must reach JS as a Uint8Array, not a per-byte number
+/// array built through serde_json.
+fn decode_project_studio_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::project_studio::ProjectStudioPayload,
+) {
+    if let tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentGetResponse {
+        bytes,
+        mime,
+        truncated,
+    } = payload
+    {
+        set(obj, "variant", "ProjectStudioAttachmentGetResponse".into());
+        set(
+            obj,
+            "bytes",
+            js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        );
+        set(obj, "mime", mime.into());
+        set(obj, "truncated", truncated.into());
+        return;
+    }
+    if let tentaflow_protocol::project_studio::ProjectStudioPayload::RunArtifactGetResponse {
+        bytes,
+        mime,
+        truncated,
+    } = payload
+    {
+        set(obj, "variant", "ProjectStudioRunArtifactGetResponse".into());
+        set(
+            obj,
+            "bytes",
+            js_sys::Uint8Array::from(bytes.as_slice()).into(),
+        );
+        set(obj, "mime", mime.into());
+        set(obj, "truncated", truncated.into());
+        return;
+    }
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "ProjectStudioDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("ProjectStudio{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("ProjectStudio{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "ProjectStudioDecodeError".into()),
+    }
+}
+
+/// Dekoduje `CodeStudioPayload` (Code Studio: workspace'y, czlonkowie, sesje).
+/// Nie ma tu wariantow binarnych, wiec caly payload idzie generyczna sciezka
+/// serde -> JSON -> JsValue z dual-key (snake + camel), tak jak ogon
+/// `decode_project_studio_payload`.
+fn decode_code_studio_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::code_studio::CodeStudioPayload,
+) {
+    let value = match serde_json::to_value(&payload) {
+        Ok(v) => v,
+        Err(_) => {
+            set(obj, "variant", "CodeStudioDecodeError".into());
+            return;
+        }
+    };
+    match value {
+        serde_json::Value::String(name) => {
+            set(obj, "variant", format!("CodeStudio{name}").into());
+        }
+        serde_json::Value::Object(map) => {
+            if let Some((name, fields)) = map.into_iter().next() {
+                set(obj, "variant", format!("CodeStudio{name}").into());
+                if let serde_json::Value::Object(fields) = fields {
+                    for (key, val) in &fields {
+                        let js_val = json_value_to_js_dual(val);
+                        let camel = snake_key_to_camel(key);
+                        if &camel != key {
+                            set(obj, &camel, js_val.clone());
+                        }
+                        set(obj, key, js_val);
+                    }
+                }
+            }
+        }
+        _ => set(obj, "variant", "CodeStudioDecodeError".into()),
+    }
+}
+
+/// Recursive serde_json::Value → JsValue conversion; object keys are emitted
+/// under both snake_case and camelCase (same dual-key convention as the
+/// hand-written decoders above).
+fn json_value_to_js_dual(value: &serde_json::Value) -> JsValue {
+    match value {
+        serde_json::Value::Null => JsValue::NULL,
+        serde_json::Value::Bool(b) => (*b).into(),
+        serde_json::Value::Number(n) => n.as_f64().unwrap_or(0.0).into(),
+        serde_json::Value::String(s) => s.clone().into(),
+        serde_json::Value::Array(items) => {
+            let arr = js_sys::Array::new();
+            for item in items {
+                arr.push(&json_value_to_js_dual(item));
+            }
+            arr.into()
+        }
+        serde_json::Value::Object(map) => {
+            let obj = js_sys::Object::new();
+            for (key, val) in map {
+                let js_val = json_value_to_js_dual(val);
+                let camel = snake_key_to_camel(key);
+                if &camel != key {
+                    set(&obj, &camel, js_val.clone());
+                }
+                set(&obj, key, js_val);
+            }
+            obj.into()
+        }
+    }
+}
+
+fn snake_key_to_camel(key: &str) -> String {
+    let mut out = String::with_capacity(key.len());
+    let mut upper_next = false;
+    for c in key.chars() {
+        if c == '_' {
+            upper_next = true;
+        } else if upper_next {
+            out.extend(c.to_uppercase());
+            upper_next = false;
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 
 fn robot_entry_to_js(r: &tentaflow_protocol::RobotEntry) -> js_sys::Object {
@@ -9860,7 +10455,11 @@ fn lidar_frame_to_js(bytes: &[u8]) -> JsValue {
         }
         v
     };
-    set(&obj, "points", js_sys::Float32Array::from(&floats[..]).into());
+    set(
+        &obj,
+        "points",
+        js_sys::Float32Array::from(&floats[..]).into(),
+    );
     obj.into()
 }
 
@@ -10209,7 +10808,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "role", req.role.into());
         }
         tentaflow_protocol::MlStudioPayload::ProjectMemberRoleSetResponse(resp) => {
-            set(obj, "variant", "MlStudioProjectMemberRoleSetResponse".into());
+            set(
+                obj,
+                "variant",
+                "MlStudioProjectMemberRoleSetResponse".into(),
+            );
             set(obj, "member", ml_studio_member_to_js(&resp.member).into());
         }
         tentaflow_protocol::MlStudioPayload::DatasetUploadRequest(req) => {
@@ -10221,7 +10824,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
         }
         tentaflow_protocol::MlStudioPayload::DatasetUploadResponse(resp) => {
             set(obj, "variant", "MlStudioDatasetUploadResponse".into());
-            set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
+            set(
+                obj,
+                "dataset",
+                ml_studio_dataset_summary_to_js(&resp.dataset).into(),
+            );
         }
         tentaflow_protocol::MlStudioPayload::DatasetUploadChunkRequest(req) => {
             set(obj, "variant", "MlStudioDatasetUploadChunkRequest".into());
@@ -10267,8 +10874,16 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
         }
         tentaflow_protocol::MlStudioPayload::DatasetProfileResponse(resp) => {
             set(obj, "variant", "MlStudioDatasetProfileResponse".into());
-            set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
-            set(obj, "profile", ml_studio_table_profile_to_js(&resp.profile).into());
+            set(
+                obj,
+                "dataset",
+                ml_studio_dataset_summary_to_js(&resp.dataset).into(),
+            );
+            set(
+                obj,
+                "profile",
+                ml_studio_table_profile_to_js(&resp.profile).into(),
+            );
         }
         tentaflow_protocol::MlStudioPayload::TabularTrainRequest(req) => {
             set(obj, "variant", "MlStudioTabularTrainRequest".into());
@@ -10448,12 +11063,20 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "status", resp.status.into());
         }
         tentaflow_protocol::MlStudioPayload::DistillGenerateStatusRequest(req) => {
-            set(obj, "variant", "MlStudioDistillGenerateStatusRequest".into());
+            set(
+                obj,
+                "variant",
+                "MlStudioDistillGenerateStatusRequest".into(),
+            );
             set(obj, "datasetId", req.dataset_id.clone().into());
             set(obj, "dataset_id", req.dataset_id.into());
         }
         tentaflow_protocol::MlStudioPayload::DistillGenerateStatusResponse(resp) => {
-            set(obj, "variant", "MlStudioDistillGenerateStatusResponse".into());
+            set(
+                obj,
+                "variant",
+                "MlStudioDistillGenerateStatusResponse".into(),
+            );
             set(obj, "status", resp.status.into());
             set(obj, "total", (resp.total as f64).into());
             set(obj, "done", (resp.done as f64).into());
@@ -10468,7 +11091,10 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 set(
                     &o,
                     "rejected",
-                    pair.rejected.clone().map(JsValue::from).unwrap_or(JsValue::NULL),
+                    pair.rejected
+                        .clone()
+                        .map(JsValue::from)
+                        .unwrap_or(JsValue::NULL),
                 );
                 arr.push(&JsValue::from(o));
             }
@@ -10536,8 +11162,16 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
             }
-            set(obj, "lossCurve", ml_studio_loss_curve_to_js(&resp.loss_curve).into());
-            set(obj, "loss_curve", ml_studio_loss_curve_to_js(&resp.loss_curve).into());
+            set(
+                obj,
+                "lossCurve",
+                ml_studio_loss_curve_to_js(&resp.loss_curve).into(),
+            );
+            set(
+                obj,
+                "loss_curve",
+                ml_studio_loss_curve_to_js(&resp.loss_curve).into(),
+            );
             match resp.sync_phase {
                 Some(p) => {
                     set(obj, "syncPhase", p.clone().into());
@@ -10551,7 +11185,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "syncBytesSent", (resp.sync_bytes_sent as f64).into());
             set(obj, "sync_bytes_sent", (resp.sync_bytes_sent as f64).into());
             set(obj, "syncBytesTotal", (resp.sync_bytes_total as f64).into());
-            set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
+            set(
+                obj,
+                "sync_bytes_total",
+                (resp.sync_bytes_total as f64).into(),
+            );
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
         }
@@ -10670,7 +11308,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 Some(e) => set(obj, "error", e.into()),
                 None => set(obj, "error", JsValue::NULL),
             }
-            set(obj, "curve", ml_studio_recog_curve_to_js(&resp.curve).into());
+            set(
+                obj,
+                "curve",
+                ml_studio_recog_curve_to_js(&resp.curve).into(),
+            );
             match resp.sync_phase {
                 Some(p) => {
                     set(obj, "syncPhase", p.clone().into());
@@ -10684,7 +11326,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "syncBytesSent", (resp.sync_bytes_sent as f64).into());
             set(obj, "sync_bytes_sent", (resp.sync_bytes_sent as f64).into());
             set(obj, "syncBytesTotal", (resp.sync_bytes_total as f64).into());
-            set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
+            set(
+                obj,
+                "sync_bytes_total",
+                (resp.sync_bytes_total as f64).into(),
+            );
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
             set(obj, "etaS", (resp.eta_s as f64).into());
@@ -10707,10 +11353,42 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "variant_name", req.variant.into());
         }
         tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(resp) => {
-            set(obj, "variant", "MlStudioClassifierTrainStartResponse".into());
+            set(
+                obj,
+                "variant",
+                "MlStudioClassifierTrainStartResponse".into(),
+            );
             set(obj, "runId", resp.run_id.clone().into());
             set(obj, "run_id", resp.run_id.into());
             set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::OcrTrainStartRequest(req) => {
+            set(obj, "variant", "MlStudioOcrTrainStartRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            set(obj, "attribute", req.attribute.into());
+            set(obj, "sourceClass", req.source_class.clone().into());
+            set(obj, "source_class", req.source_class.into());
+        }
+        tentaflow_protocol::MlStudioPayload::OcrTrainStartResponse(resp) => {
+            set(obj, "variant", "MlStudioOcrTrainStartResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+        }
+        tentaflow_protocol::MlStudioPayload::TrainCancelRequest(req) => {
+            set(obj, "variant", "MlStudioTrainCancelRequest".into());
+            set(obj, "runId", req.run_id.clone().into());
+            set(obj, "run_id", req.run_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::TrainCancelResponse(resp) => {
+            set(obj, "variant", "MlStudioTrainCancelResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            set(obj, "status", resp.status.into());
+            set(obj, "cancelled", resp.cancelled.into());
         }
         tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(req) => {
             set(obj, "variant", "MlStudioGenericTrainStatusRequest".into());
@@ -10725,7 +11403,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "epoch", (resp.epoch as f64).into());
             set(obj, "totalEpochs", (resp.total_epochs as f64).into());
             set(obj, "total_epochs", (resp.total_epochs as f64).into());
-            set(obj, "curve", ml_studio_generic_curve_to_js(&resp.curve).into());
+            set(
+                obj,
+                "curve",
+                ml_studio_generic_curve_to_js(&resp.curve).into(),
+            );
             set(obj, "error", resp.error.into());
             match resp.sync_phase {
                 Some(p) => {
@@ -10740,7 +11422,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "syncBytesSent", (resp.sync_bytes_sent as f64).into());
             set(obj, "sync_bytes_sent", (resp.sync_bytes_sent as f64).into());
             set(obj, "syncBytesTotal", (resp.sync_bytes_total as f64).into());
-            set(obj, "sync_bytes_total", (resp.sync_bytes_total as f64).into());
+            set(
+                obj,
+                "sync_bytes_total",
+                (resp.sync_bytes_total as f64).into(),
+            );
             set(obj, "syncRateBps", (resp.sync_rate_bps as f64).into());
             set(obj, "sync_rate_bps", (resp.sync_rate_bps as f64).into());
             set(obj, "etaS", (resp.eta_s as f64).into());
@@ -10759,8 +11445,16 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "path", req.path.into());
         }
         tentaflow_protocol::MlStudioPayload::RecogDatasetRegisterResponse(resp) => {
-            set(obj, "variant", "MlStudioRecogDatasetRegisterResponse".into());
-            set(obj, "dataset", ml_studio_dataset_summary_to_js(&resp.dataset).into());
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogDatasetRegisterResponse".into(),
+            );
+            set(
+                obj,
+                "dataset",
+                ml_studio_dataset_summary_to_js(&resp.dataset).into(),
+            );
         }
         tentaflow_protocol::MlStudioPayload::RecogStageMediaRequest(req) => {
             set(obj, "variant", "MlStudioRecogStageMediaRequest".into());
@@ -10825,8 +11519,16 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "files_total", (resp.files_total as f64).into());
             set(obj, "filesDone", (resp.files_done as f64).into());
             set(obj, "files_done", (resp.files_done as f64).into());
-            set(obj, "framesExtracted", (resp.frames_extracted as f64).into());
-            set(obj, "frames_extracted", (resp.frames_extracted as f64).into());
+            set(
+                obj,
+                "framesExtracted",
+                (resp.frames_extracted as f64).into(),
+            );
+            set(
+                obj,
+                "frames_extracted",
+                (resp.frames_extracted as f64).into(),
+            );
             if let Some(ds) = &resp.dataset {
                 set(obj, "dataset", ml_studio_dataset_summary_to_js(ds).into());
             }
@@ -10862,7 +11564,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "job_id", req.job_id.into());
         }
         tentaflow_protocol::MlStudioPayload::RecogAutolabelStatusResponse(resp) => {
-            set(obj, "variant", "MlStudioRecogAutolabelStatusResponse".into());
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogAutolabelStatusResponse".into(),
+            );
             set(obj, "status", resp.status.into());
             set(obj, "imagesTotal", (resp.images_total as f64).into());
             set(obj, "images_total", (resp.images_total as f64).into());
@@ -10937,7 +11643,11 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
             set(obj, "approve", req.approve.into());
         }
         tentaflow_protocol::MlStudioPayload::RecogSaveAnnotationsResponse(resp) => {
-            set(obj, "variant", "MlStudioRecogSaveAnnotationsResponse".into());
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogSaveAnnotationsResponse".into(),
+            );
             set(obj, "ok", resp.ok.into());
             match resp.error {
                 Some(e) => set(obj, "error", e.into()),
@@ -11075,6 +11785,483 @@ fn decode_ml_studio_payload(obj: &js_sys::Object, payload: tentaflow_protocol::M
                 None => set(obj, "error", JsValue::NULL),
             }
         }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStartRequest(req) => {
+            set(obj, "variant", "MlStudioProjectExportStartRequest".into());
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "includeModels", req.include_models.into());
+            set(obj, "include_models", req.include_models.into());
+            set(obj, "includeHistory", req.include_history.into());
+            set(obj, "include_history", req.include_history.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStartResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectExportStartResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStatusRequest(req) => {
+            set(obj, "variant", "MlStudioProjectExportStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectExportStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectExportStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "filesTotal", (resp.files_total as f64).into());
+            set(obj, "files_total", (resp.files_total as f64).into());
+            set(obj, "filesDone", (resp.files_done as f64).into());
+            set(obj, "files_done", (resp.files_done as f64).into());
+            set(obj, "bytesTotal", (resp.bytes_total as f64).into());
+            set(obj, "bytes_total", (resp.bytes_total as f64).into());
+            set(obj, "bytesDone", (resp.bytes_done as f64).into());
+            set(obj, "bytes_done", (resp.bytes_done as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            let export_ref = match resp.export_ref {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "exportRef", export_ref.clone());
+            set(obj, "export_ref", export_ref);
+            let signed_url = match resp.signed_url {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "signedUrl", signed_url.clone());
+            set(obj, "signed_url", signed_url);
+            let archive_bytes = match resp.archive_bytes {
+                Some(v) => JsValue::from_f64(v as f64),
+                None => JsValue::NULL,
+            };
+            set(obj, "archiveBytes", archive_bytes.clone());
+            set(obj, "archive_bytes", archive_bytes);
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkRequest(req) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioProjectImportUploadChunkRequest".into(),
+            );
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+            set(obj, "seq", req.seq.into());
+            set(obj, "totalChunks", req.total_chunks.into());
+            set(obj, "total_chunks", req.total_chunks.into());
+            set(obj, "filename", req.filename.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkResponse(resp) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioProjectImportUploadChunkResponse".into(),
+            );
+            set(obj, "uploadId", resp.upload_id.clone().into());
+            set(obj, "upload_id", resp.upload_id.into());
+            set(obj, "receivedChunks", resp.received_chunks.into());
+            set(obj, "received_chunks", resp.received_chunks.into());
+            set(obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(obj, "received_bytes", (resp.received_bytes as f64).into());
+            set(obj, "complete", resp.complete.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusRequest(req) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioProjectImportUploadStatusRequest".into(),
+            );
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusResponse(resp) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioProjectImportUploadStatusResponse".into(),
+            );
+            set(obj, "uploadId", resp.upload_id.clone().into());
+            set(obj, "upload_id", resp.upload_id.into());
+            set(obj, "receivedChunks", resp.received_chunks.into());
+            set(obj, "received_chunks", resp.received_chunks.into());
+            set(obj, "receivedBytes", (resp.received_bytes as f64).into());
+            set(obj, "received_bytes", (resp.received_bytes as f64).into());
+            set(obj, "totalChunks", resp.total_chunks.into());
+            set(obj, "total_chunks", resp.total_chunks.into());
+            set(obj, "complete", resp.complete.into());
+            set(obj, "exists", resp.exists.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportPreviewRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportPreviewRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportPreviewResponse(resp) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioProjectImportPreviewResponse".into(),
+            );
+            set(obj, "projectName", resp.project_name.clone().into());
+            set(obj, "project_name", resp.project_name.into());
+            set(obj, "projectType", resp.project_type.clone().into());
+            set(obj, "project_type", resp.project_type.into());
+            let datasets = js_sys::Array::new();
+            for d in &resp.datasets {
+                let entry = js_sys::Object::new();
+                set(&entry, "datasetId", d.dataset_id.clone().into());
+                set(&entry, "dataset_id", d.dataset_id.clone().into());
+                set(&entry, "name", d.name.clone().into());
+                set(&entry, "imageCount", (d.image_count as f64).into());
+                set(&entry, "image_count", (d.image_count as f64).into());
+                set(
+                    &entry,
+                    "annotationCount",
+                    (d.annotation_count as f64).into(),
+                );
+                set(
+                    &entry,
+                    "annotation_count",
+                    (d.annotation_count as f64).into(),
+                );
+                datasets.push(&entry);
+            }
+            set(obj, "datasets", datasets.into());
+            let classes = js_sys::Array::new();
+            for c in &resp.classes {
+                classes.push(&JsValue::from_str(c));
+            }
+            set(obj, "classes", classes.into());
+            set(obj, "hasModels", resp.has_models.into());
+            set(obj, "has_models", resp.has_models.into());
+            set(obj, "hasHistory", resp.has_history.into());
+            set(obj, "has_history", resp.has_history.into());
+            set(
+                obj,
+                "totalUncompressedBytes",
+                (resp.total_uncompressed_bytes as f64).into(),
+            );
+            set(
+                obj,
+                "total_uncompressed_bytes",
+                (resp.total_uncompressed_bytes as f64).into(),
+            );
+            let missing = js_sys::Array::new();
+            for m in &resp.missing_artifacts {
+                let entry = js_sys::Object::new();
+                set(&entry, "path", m.path.clone().into());
+                set(&entry, "reason", m.reason.clone().into());
+                missing.push(&entry);
+            }
+            set(obj, "missingArtifacts", missing.clone().into());
+            set(obj, "missing_artifacts", missing.into());
+            set(obj, "archiveVersion", resp.archive_version.into());
+            set(obj, "archive_version", resp.archive_version.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportApplyRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportApplyRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+            set(obj, "mode", req.mode.into());
+            let name_override = match req.name_override {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "nameOverride", name_override.clone());
+            set(obj, "name_override", name_override);
+            let target_project_id = match req.target_project_id {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "targetProjectId", target_project_id.clone());
+            set(obj, "target_project_id", target_project_id);
+            let target_dataset_id = match req.target_dataset_id {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "targetDatasetId", target_dataset_id.clone());
+            set(obj, "target_dataset_id", target_dataset_id);
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportApplyResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportApplyResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportStatusRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "filesTotal", (resp.files_total as f64).into());
+            set(obj, "files_total", (resp.files_total as f64).into());
+            set(obj, "filesDone", (resp.files_done as f64).into());
+            set(obj, "files_done", (resp.files_done as f64).into());
+            set(obj, "bytesTotal", (resp.bytes_total as f64).into());
+            set(obj, "bytes_total", (resp.bytes_total as f64).into());
+            set(obj, "bytesDone", (resp.bytes_done as f64).into());
+            set(obj, "bytes_done", (resp.bytes_done as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportCancelRequest(req) => {
+            set(obj, "variant", "MlStudioProjectImportCancelRequest".into());
+            set(obj, "uploadId", req.upload_id.clone().into());
+            set(obj, "upload_id", req.upload_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::ProjectImportCancelResponse(resp) => {
+            set(obj, "variant", "MlStudioProjectImportCancelResponse".into());
+            set(obj, "cancelled", resp.cancelled.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecordingsListRequest(req) => {
+            set(obj, "variant", "MlStudioRecordingsListRequest".into());
+            let camera_id = match req.camera_id {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "cameraId", camera_id.clone());
+            set(obj, "camera_id", camera_id);
+            let date_from_ms = match req.date_from_ms {
+                Some(v) => JsValue::from_f64(v as f64),
+                None => JsValue::NULL,
+            };
+            set(obj, "dateFromMs", date_from_ms.clone());
+            set(obj, "date_from_ms", date_from_ms);
+            let date_to_ms = match req.date_to_ms {
+                Some(v) => JsValue::from_f64(v as f64),
+                None => JsValue::NULL,
+            };
+            set(obj, "dateToMs", date_to_ms.clone());
+            set(obj, "date_to_ms", date_to_ms);
+            set(obj, "limit", req.limit.into());
+            let source_node_id = match &req.source_node_id {
+                Some(v) => v.clone().into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "sourceNodeId", source_node_id.clone());
+            set(obj, "source_node_id", source_node_id);
+        }
+        tentaflow_protocol::MlStudioPayload::RecordingsListResponse(resp) => {
+            set(obj, "variant", "MlStudioRecordingsListResponse".into());
+            let items = js_sys::Array::new();
+            for it in &resp.items {
+                let entry = js_sys::Object::new();
+                set(&entry, "recordingRef", it.recording_ref.clone().into());
+                set(&entry, "recording_ref", it.recording_ref.clone().into());
+                set(&entry, "kind", it.kind.clone().into());
+                set(&entry, "cameraId", it.camera_id.clone().into());
+                set(&entry, "camera_id", it.camera_id.clone().into());
+                set(&entry, "createdAt", (it.created_at as f64).into());
+                set(&entry, "created_at", (it.created_at as f64).into());
+                let duration_ms = match it.duration_ms {
+                    Some(v) => JsValue::from_f64(v as f64),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "durationMs", duration_ms.clone());
+                set(&entry, "duration_ms", duration_ms);
+                set(&entry, "fileSizeBytes", (it.file_size_bytes as f64).into());
+                set(
+                    &entry,
+                    "file_size_bytes",
+                    (it.file_size_bytes as f64).into(),
+                );
+                let plate_text = match &it.plate_text {
+                    Some(v) => v.clone().into(),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "plateText", plate_text.clone());
+                set(&entry, "plate_text", plate_text);
+                let adr_text = match &it.adr_text {
+                    Some(v) => v.clone().into(),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "adrText", adr_text.clone());
+                set(&entry, "adr_text", adr_text);
+                items.push(&entry);
+            }
+            set(obj, "items", items.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(req) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogImportRecordingsRequest".into(),
+            );
+            set(obj, "projectId", req.project_id.clone().into());
+            set(obj, "project_id", req.project_id.into());
+            set(obj, "datasetId", req.dataset_id.clone().into());
+            set(obj, "dataset_id", req.dataset_id.into());
+            let refs = js_sys::Array::new();
+            for r in &req.recording_refs {
+                refs.push(&JsValue::from_str(r));
+            }
+            set(obj, "recordingRefs", refs.clone().into());
+            set(obj, "recording_refs", refs.into());
+            set(obj, "fps", req.fps.into());
+            set(obj, "autolabel", req.autolabel.into());
+            set(obj, "collision", req.collision.into());
+            let source_node_id = match &req.source_node_id {
+                Some(v) => v.clone().into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "sourceNodeId", source_node_id.clone());
+            set(obj, "source_node_id", source_node_id);
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsResponse(resp) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogImportRecordingsResponse".into(),
+            );
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusRequest(req) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogImportRecordingsStatusRequest".into(),
+            );
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusResponse(resp) => {
+            set(
+                obj,
+                "variant",
+                "MlStudioRecogImportRecordingsStatusResponse".into(),
+            );
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "recordingsTotal", resp.recordings_total.into());
+            set(obj, "recordings_total", resp.recordings_total.into());
+            set(obj, "recordingsDone", resp.recordings_done.into());
+            set(obj, "recordings_done", resp.recordings_done.into());
+            set(
+                obj,
+                "framesExtracted",
+                (resp.frames_extracted as f64).into(),
+            );
+            set(
+                obj,
+                "frames_extracted",
+                (resp.frames_extracted as f64).into(),
+            );
+            set(obj, "framesLabeled", (resp.frames_labeled as f64).into());
+            set(obj, "frames_labeled", (resp.frames_labeled as f64).into());
+            set(obj, "imagesAdded", (resp.images_added as f64).into());
+            set(obj, "images_added", (resp.images_added as f64).into());
+            set(obj, "detections", (resp.detections as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+            let outcomes = js_sys::Array::new();
+            for o in &resp.outcomes {
+                let entry = js_sys::Object::new();
+                set(&entry, "recordingRef", o.recording_ref.clone().into());
+                set(&entry, "recording_ref", o.recording_ref.clone().into());
+                set(&entry, "frames", (o.frames as f64).into());
+                set(&entry, "detections", (o.detections as f64).into());
+                set(&entry, "skippedFrames", (o.skipped_frames as f64).into());
+                set(&entry, "skipped_frames", (o.skipped_frames as f64).into());
+                let skipped = match &o.skipped {
+                    Some(v) => v.clone().into(),
+                    None => JsValue::NULL,
+                };
+                set(&entry, "skipped", skipped);
+                outcomes.push(&entry);
+            }
+            set(obj, "outcomes", outcomes.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(req) => {
+            set(obj, "variant", "MlStudioRemoteImportPreviewRequest".into());
+            set(obj, "url", req.url.into());
+            set(obj, "apiKey", req.api_key.clone().into());
+            set(obj, "api_key", req.api_key.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportPreviewResponse(resp) => {
+            set(obj, "variant", "MlStudioRemoteImportPreviewResponse".into());
+            set(obj, "projectName", resp.project_name.clone().into());
+            set(obj, "project_name", resp.project_name.into());
+            set(obj, "projectType", resp.project_type.clone().into());
+            set(obj, "project_type", resp.project_type.into());
+            let datasets = js_sys::Array::new();
+            for d in &resp.datasets {
+                let entry = js_sys::Object::new();
+                set(&entry, "datasetId", d.dataset_id.clone().into());
+                set(&entry, "dataset_id", d.dataset_id.clone().into());
+                set(&entry, "name", d.name.clone().into());
+                set(&entry, "imageCount", (d.image_count as f64).into());
+                set(&entry, "image_count", (d.image_count as f64).into());
+                set(
+                    &entry,
+                    "annotationCount",
+                    (d.annotation_count as f64).into(),
+                );
+                set(
+                    &entry,
+                    "annotation_count",
+                    (d.annotation_count as f64).into(),
+                );
+                datasets.push(&entry);
+            }
+            set(obj, "datasets", datasets.into());
+            let classes = js_sys::Array::new();
+            for c in &resp.classes {
+                classes.push(&JsValue::from_str(c));
+            }
+            set(obj, "classes", classes.into());
+            set(obj, "archiveBytes", (resp.archive_bytes as f64).into());
+            set(obj, "archive_bytes", (resp.archive_bytes as f64).into());
+            set(obj, "archiveVersion", resp.archive_version.into());
+            set(obj, "archive_version", resp.archive_version.into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(req) => {
+            set(obj, "variant", "MlStudioRemoteImportStartRequest".into());
+            set(obj, "url", req.url.into());
+            set(obj, "apiKey", req.api_key.clone().into());
+            set(obj, "api_key", req.api_key.into());
+            let name_override = match req.name_override {
+                Some(v) => v.into(),
+                None => JsValue::NULL,
+            };
+            set(obj, "nameOverride", name_override.clone());
+            set(obj, "name_override", name_override);
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStartResponse(resp) => {
+            set(obj, "variant", "MlStudioRemoteImportStartResponse".into());
+            set(obj, "jobId", resp.job_id.clone().into());
+            set(obj, "job_id", resp.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(req) => {
+            set(obj, "variant", "MlStudioRemoteImportStatusRequest".into());
+            set(obj, "jobId", req.job_id.clone().into());
+            set(obj, "job_id", req.job_id.into());
+        }
+        tentaflow_protocol::MlStudioPayload::RemoteImportStatusResponse(resp) => {
+            set(obj, "variant", "MlStudioRemoteImportStatusResponse".into());
+            set(obj, "status", resp.status.into());
+            set(obj, "phase", resp.phase.into());
+            set(obj, "bytesTotal", (resp.bytes_total as f64).into());
+            set(obj, "bytes_total", (resp.bytes_total as f64).into());
+            set(obj, "bytesDone", (resp.bytes_done as f64).into());
+            set(obj, "bytes_done", (resp.bytes_done as f64).into());
+            match resp.error {
+                Some(e) => set(obj, "error", e.into()),
+                None => set(obj, "error", JsValue::NULL),
+            }
+        }
     }
 }
 
@@ -11112,9 +12299,7 @@ fn ml_studio_generic_curve_to_js(
 }
 
 /// Mapuje krzywą straty (lista punktów per krok) na tablicę JS dla wykresu f02.
-fn ml_studio_loss_curve_to_js(
-    points: &[tentaflow_protocol::MlStudioLossPoint],
-) -> js_sys::Array {
+fn ml_studio_loss_curve_to_js(points: &[tentaflow_protocol::MlStudioLossPoint]) -> js_sys::Array {
     let arr = js_sys::Array::new();
     for p in points {
         let item = js_sys::Object::new();
@@ -11234,11 +12419,7 @@ fn compliance_admin_payload_to_js(
                     set(&item, "categoryId", category_id.clone().into());
                     set(&item, "category_id", category_id.into());
                 }
-                set(
-                    &item,
-                    "retentionDays",
-                    policy.retention_days.clone().into(),
-                );
+                set(&item, "retentionDays", policy.retention_days.clone().into());
                 set(
                     &item,
                     "retention_days",
@@ -12629,7 +13810,45 @@ fn cluster_member_to_js(m: tentaflow_protocol::ClusterMember) -> js_sys::Object 
     if let Some(s) = m.rdma_socket_ifname {
         set(&item, "rdmaSocketIfname", s.into());
     }
+    if let Some(n) = m.interface_name {
+        set(&item, "interfaceName", n.into());
+    }
+    if let Some(ip) = m.interface_ip {
+        set(&item, "interfaceIp", ip.into());
+    }
+    if let Some(g) = m.rdma_gid_index {
+        set(&item, "rdmaGidIndex", g.into());
+    }
     item
+}
+
+fn cluster_deployment_to_js(d: tentaflow_protocol::ClusterDeploymentInfo) -> js_sys::Object {
+    let obj = js_sys::Object::new();
+    set(&obj, "deploymentClusterId", d.deployment_cluster_id.into());
+    set(&obj, "engineId", d.engine_id.into());
+    set(&obj, "model", d.model.into());
+    set(&obj, "servedModelName", d.served_model_name.into());
+    set(&obj, "tpSize", d.tp_size.into());
+    set(&obj, "headNodeId", d.head_node_id.into());
+    set(&obj, "port", d.port.into());
+    if let Some(u) = d.endpoint_url {
+        set(&obj, "endpointUrl", u.into());
+    }
+    set(&obj, "status", d.status.into());
+    set(&obj, "createdAt", d.created_at.into());
+    let arr = js_sys::Array::new();
+    for m in d.members {
+        let item = js_sys::Object::new();
+        set(&item, "nodeId", m.node_id.into());
+        if let Some(h) = m.hostname {
+            set(&item, "hostname", h.into());
+        }
+        set(&item, "role", m.role.into());
+        set(&item, "containerName", m.container_name.into());
+        arr.push(&item.into());
+    }
+    set(&obj, "members", arr.into());
+    obj
 }
 
 fn cluster_info_to_js(c: tentaflow_protocol::ClusterInfo) -> js_sys::Object {
@@ -12889,11 +14108,7 @@ fn my_oauth_entry_to_js(e: tentaflow_protocol::message_body::MyOAuthEntry) -> js
         "connected_at_epoch",
         e.connected_at_epoch.clone().into(),
     );
-    set(
-        &obj,
-        "lastUsedAtEpoch",
-        e.last_used_at_epoch.clone().into(),
-    );
+    set(&obj, "lastUsedAtEpoch", e.last_used_at_epoch.clone().into());
     set(
         &obj,
         "last_used_at_epoch",
@@ -14527,9 +15742,7 @@ pub fn encode_camera_frame_url_request(
 /// gates on `camera.read` + org isolation, and replies with a long-lived
 /// stream of `CameraDetectionsFrame` chunks until cancel/disconnect.
 #[wasm_bindgen(js_name = encodeCameraDetectionsSubscribeRequest)]
-pub fn encode_camera_detections_subscribe_request(
-    camera_id: String,
-) -> Result<Vec<u8>, JsError> {
+pub fn encode_camera_detections_subscribe_request(camera_id: String) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::CameraAdminBody(
         tentaflow_protocol::CameraAdminPayload::DetectionsSubscribeRequest(
             tentaflow_protocol::CameraDetectionsSubscribeRequest { camera_id },
@@ -14635,7 +15848,10 @@ pub fn encode_compliance_ai_events_list_request(
 /// wybiera wariant podglądu 720p/~1,5 Mbit/s dla strumieni `camera:` (kafelki
 /// Live view); `false` = pełna jakość źródła.
 #[wasm_bindgen(js_name = encodeStreamSubscribeRequest)]
-pub fn encode_stream_subscribe_request(stream_id: String, preview: bool) -> Result<Vec<u8>, JsError> {
+pub fn encode_stream_subscribe_request(
+    stream_id: String,
+    preview: bool,
+) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::StreamBody(
         tentaflow_protocol::StreamPayload::SubscribeRequest(
             tentaflow_protocol::StreamSubscribeRequest { stream_id, preview },
@@ -14923,8 +16139,8 @@ pub fn encode_ui_panel_open(
     viewport_width: u32,
     viewport_height: u32,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_sdk_spec::UiPayload;
     use tentaflow_sdk_spec::protocol::ui::panel::{PanelOpen, PanelOpenContext, Viewport};
+    use tentaflow_sdk_spec::UiPayload;
 
     let payload = UiPayload::PanelOpen(PanelOpen {
         addon_id,
@@ -14955,8 +16171,8 @@ pub fn encode_ui_panel_close(
     panel_id: String,
     panel_epoch: u64,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_sdk_spec::UiPayload;
     use tentaflow_sdk_spec::protocol::ui::panel::{CloseReason, PanelClose};
+    use tentaflow_sdk_spec::UiPayload;
 
     let payload = UiPayload::PanelClose(PanelClose {
         addon_id,
@@ -14977,8 +16193,8 @@ pub fn encode_ui_action(
     action_id: String,
     params_json: String,
 ) -> Result<Vec<u8>, JsError> {
-    use tentaflow_sdk_spec::UiPayload;
     use tentaflow_sdk_spec::protocol::ui::action::Action;
+    use tentaflow_sdk_spec::UiPayload;
 
     let payload = UiPayload::Action(Action {
         addon_id,
@@ -15162,7 +16378,11 @@ pub fn decode_ui_payload(cbor_bytes: &[u8]) -> Result<JsValue, JsError> {
                     "default_state",
                     slot_default_to_js(&slot.default_state).map_err(|e| JsError::new(&e))?,
                 );
-                set(&s_obj, "cache_policy", cache_policy_to_js(&slot.cache_policy)?);
+                set(
+                    &s_obj,
+                    "cache_policy",
+                    cache_policy_to_js(&slot.cache_policy)?,
+                );
                 set(
                     &s_obj,
                     "visibility",
@@ -16303,7 +17523,16 @@ pub fn encode_robot_control_request(
     encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::ControlRequest(
         RobotControlRequest {
             robot_id,
-            action: RobotActionWire { kind, vx, vy, vyaw, p1, p2, p3, p4 },
+            action: RobotActionWire {
+                kind,
+                vx,
+                vy,
+                vyaw,
+                p1,
+                p2,
+                p3,
+                p4,
+            },
         },
     )))
     .map_err(|e| JsError::new(&e))
@@ -16337,9 +17566,15 @@ pub fn encode_robot_geo_anchor_set_request(
     heading: Option<f64>,
 ) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{RobotGeoAnchorSetRequest, RobotsPayload};
-    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::GeoAnchorSetRequest(
-        RobotGeoAnchorSetRequest { robot_id, lat, lon, alt, heading },
-    )))
+    encode_body_inner(&MessageBody::RobotsBody(
+        RobotsPayload::GeoAnchorSetRequest(RobotGeoAnchorSetRequest {
+            robot_id,
+            lat,
+            lon,
+            alt,
+            heading,
+        }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
@@ -16348,9 +17583,2085 @@ pub fn encode_robot_geo_anchor_set_request(
 #[wasm_bindgen(js_name = encodeRobotGeoAnchorGetRequest)]
 pub fn encode_robot_geo_anchor_get_request(robot_id: String) -> Result<Vec<u8>, JsError> {
     use tentaflow_protocol::{RobotGeoAnchorGetRequest, RobotsPayload};
-    encode_body_inner(&MessageBody::RobotsBody(RobotsPayload::GeoAnchorGetRequest(
-        RobotGeoAnchorGetRequest { robot_id },
-    )))
+    encode_body_inner(&MessageBody::RobotsBody(
+        RobotsPayload::GeoAnchorGetRequest(RobotGeoAnchorGetRequest { robot_id }),
+    ))
     .map_err(|e| JsError::new(&e))
 }
 
+// ----- Project Studio ("Projekty") -----
+// One encoder per ProjectStudioPayload request variant. Requests carrying
+// arrays/maps of structs take a JSON string parsed via serde (same pattern as
+// encode_benchmark_save_request); simple fields are explicit parameters.
+// i64 fields (ActivityList.before_id) cross the JS boundary as Option<String>
+// and are parsed here — JS numbers cannot represent the full i64 range.
+
+/// MessageBody::ProjectStudioBody(ProjectsListRequest) — project registry.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectsListRequest)]
+pub fn encode_project_studio_projects_list_request(
+    include_archived: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectsListRequest {
+            include_archived,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectCreateRequest). `modules_json` is a
+/// JSON array of module names; `members_json` is a JSON array of
+/// MemberInputWire objects ({user_id, role}).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectCreateRequest)]
+pub fn encode_project_studio_project_create_request(
+    name: String,
+    description: String,
+    template: String,
+    modules_json: String,
+    members_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let modules: Vec<String> = serde_json::from_str(&modules_json)
+        .map_err(|e| JsError::new(&format!("invalid modules_json: {e}")))?;
+    let members: Vec<tentaflow_protocol::project_studio::MemberInputWire> =
+        serde_json::from_str(&members_json)
+            .map_err(|e| JsError::new(&format!("invalid members_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectCreateRequest {
+            name,
+            description,
+            template,
+            modules,
+            members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectGetRequest)]
+pub fn encode_project_studio_project_get_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectGetRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectUpdateRequest) — name/description.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectUpdateRequest)]
+pub fn encode_project_studio_project_update_request(
+    project_id: String,
+    name: String,
+    description: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectUpdateRequest {
+            project_id,
+            name,
+            description,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectArchiveRequest) — archive/unarchive.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectArchiveRequest)]
+pub fn encode_project_studio_project_archive_request(
+    project_id: String,
+    archived: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectArchiveRequest {
+            project_id,
+            archived,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectDeleteRequest)]
+pub fn encode_project_studio_project_delete_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectDeleteRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MembersListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMembersListRequest)]
+pub fn encode_project_studio_members_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MembersListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MemberCandidatesRequest). `project_id: None`
+/// = creation wizard (grant holders), `Some` = the "Invite" modal (manager+).
+#[wasm_bindgen(js_name = encodeProjectStudioMemberCandidatesRequest)]
+pub fn encode_project_studio_member_candidates_request(
+    project_id: Option<String>,
+    query: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MemberCandidatesRequest {
+            project_id,
+            query,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MembersAddRequest). `members_json` is a JSON
+/// array of MemberInputWire objects ({user_id, role}).
+#[wasm_bindgen(js_name = encodeProjectStudioMembersAddRequest)]
+pub fn encode_project_studio_members_add_request(
+    project_id: String,
+    members_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let members: Vec<tentaflow_protocol::project_studio::MemberInputWire> =
+        serde_json::from_str(&members_json)
+            .map_err(|e| JsError::new(&format!("invalid members_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MembersAddRequest {
+            project_id,
+            members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MemberRoleSetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMemberRoleSetRequest)]
+pub fn encode_project_studio_member_role_set_request(
+    project_id: String,
+    user_id: String,
+    role: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MemberRoleSetRequest {
+            project_id,
+            user_id,
+            role,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MemberRemoveRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMemberRemoveRequest)]
+pub fn encode_project_studio_member_remove_request(
+    project_id: String,
+    user_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MemberRemoveRequest {
+            project_id,
+            user_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(OwnershipTransferRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioOwnershipTransferRequest)]
+pub fn encode_project_studio_ownership_transfer_request(
+    project_id: String,
+    new_owner_user_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::OwnershipTransferRequest {
+            project_id,
+            new_owner_user_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CreatorGrantsListRequest) — admin only.
+#[wasm_bindgen(js_name = encodeProjectStudioCreatorGrantsListRequest)]
+pub fn encode_project_studio_creator_grants_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CreatorGrantsListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CreatorGrantSetRequest) — admin only.
+#[wasm_bindgen(js_name = encodeProjectStudioCreatorGrantSetRequest)]
+pub fn encode_project_studio_creator_grant_set_request(
+    user_id: String,
+    granted: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CreatorGrantSetRequest {
+            user_id,
+            granted,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourcesListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourcesListRequest)]
+pub fn encode_project_studio_sources_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourcesListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceUploadChunkRequest) — one raw chunk of
+/// an uploaded file (`bytes` is a Uint8Array on the JS side).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceUploadChunkRequest)]
+pub fn encode_project_studio_source_upload_chunk_request(
+    project_id: String,
+    upload_id: String,
+    filename: String,
+    mime: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceUploadChunkRequest {
+            project_id,
+            upload_id,
+            filename,
+            mime,
+            seq,
+            total_chunks,
+            bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceCreateRequest). `config_json` passes
+/// through as-is (server validates per kind); `file_refs_json` is a JSON array
+/// of sha256 refs returned by the upload.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceCreateRequest)]
+pub fn encode_project_studio_source_create_request(
+    project_id: String,
+    kind: String,
+    name: String,
+    config_json: String,
+    file_refs_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let file_refs: Vec<String> = serde_json::from_str(&file_refs_json)
+        .map_err(|e| JsError::new(&format!("invalid file_refs_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceCreateRequest {
+            project_id,
+            kind,
+            name,
+            config_json,
+            file_refs,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceUpdateRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceUpdateRequest)]
+pub fn encode_project_studio_source_update_request(
+    project_id: String,
+    source_id: String,
+    name: String,
+    config_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceUpdateRequest {
+            project_id,
+            source_id,
+            name,
+            config_json,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceDeleteRequest)]
+pub fn encode_project_studio_source_delete_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceDeleteRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceReingestRequest). `file_id: Some` =
+/// re-ingest a single file, `None` = the whole source.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceReingestRequest)]
+pub fn encode_project_studio_source_reingest_request(
+    project_id: String,
+    source_id: String,
+    file_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceReingestRequest {
+            project_id,
+            source_id,
+            file_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(IngestCancelRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioIngestCancelRequest)]
+pub fn encode_project_studio_ingest_cancel_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::IngestCancelRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(IngestStatusRequest) — polling is the source
+/// of truth for job state; the stream is only a live view.
+#[wasm_bindgen(js_name = encodeProjectStudioIngestStatusRequest)]
+pub fn encode_project_studio_ingest_status_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::IngestStatusRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceFilesListRequest) — paged file list.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceFilesListRequest)]
+pub fn encode_project_studio_source_files_list_request(
+    project_id: String,
+    source_id: String,
+    offset: u32,
+    limit: u32,
+    filter: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceFilesListRequest {
+            project_id,
+            source_id,
+            offset,
+            limit,
+            filter,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceFileDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceFileDeleteRequest)]
+pub fn encode_project_studio_source_file_delete_request(
+    project_id: String,
+    file_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceFileDeleteRequest {
+            project_id,
+            file_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceFilePreviewRequest) — text-only
+/// preview; the server clamps `max_bytes`.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceFilePreviewRequest)]
+pub fn encode_project_studio_source_file_preview_request(
+    project_id: String,
+    file_id: String,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceFilePreviewRequest {
+            project_id,
+            file_id,
+            max_bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(KbSearchRequest). `source_ids_json` is a
+/// JSON array of source ids ([] = search all sources).
+#[wasm_bindgen(js_name = encodeProjectStudioKbSearchRequest)]
+pub fn encode_project_studio_kb_search_request(
+    project_id: String,
+    query: String,
+    source_ids_json: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    let source_ids: Vec<String> = serde_json::from_str(&source_ids_json)
+        .map_err(|e| JsError::new(&format!("invalid source_ids_json: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::KbSearchRequest {
+            project_id,
+            query,
+            source_ids,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(OverviewRequest) — KPIs + recent activity.
+#[wasm_bindgen(js_name = encodeProjectStudioOverviewRequest)]
+pub fn encode_project_studio_overview_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::OverviewRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ActivityListRequest). `before_id` crosses
+/// the JS boundary as a decimal string (i64 does not fit in a JS number) and
+/// is parsed here.
+#[wasm_bindgen(js_name = encodeProjectStudioActivityListRequest)]
+pub fn encode_project_studio_activity_list_request(
+    project_id: String,
+    before_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    let before_id = match before_id {
+        Some(s) => Some(
+            s.parse::<i64>()
+                .map_err(|e| JsError::new(&format!("invalid before_id: {e}")))?,
+        ),
+        None => None,
+    };
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ActivityListRequest {
+            project_id,
+            before_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatsListRequest) — caller's own chats only.
+#[wasm_bindgen(js_name = encodeProjectStudioChatsListRequest)]
+pub fn encode_project_studio_chats_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatsListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatCreateRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioChatCreateRequest)]
+pub fn encode_project_studio_chat_create_request(
+    project_id: String,
+    title: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatCreateRequest {
+            project_id,
+            title,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatRenameRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioChatRenameRequest)]
+pub fn encode_project_studio_chat_rename_request(
+    project_id: String,
+    chat_id: String,
+    title: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatRenameRequest {
+            project_id,
+            chat_id,
+            title,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioChatDeleteRequest)]
+pub fn encode_project_studio_chat_delete_request(
+    project_id: String,
+    chat_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatDeleteRequest {
+            project_id,
+            chat_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatHistoryRequest) — paged, newest first;
+/// `before_message_id: None` = latest page.
+#[wasm_bindgen(js_name = encodeProjectStudioChatHistoryRequest)]
+pub fn encode_project_studio_chat_history_request(
+    project_id: String,
+    chat_id: String,
+    before_message_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatHistoryRequest {
+            project_id,
+            chat_id,
+            before_message_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SettingsGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSettingsGetRequest)]
+pub fn encode_project_studio_settings_get_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SettingsGetRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save; `None`
+/// fields are left untouched. `agents_json` is a JSON array of
+/// ProjectAgentBinding objects; `modules_json` is a JSON array of module names
+/// that REPLACES the enabled set (absent, empty or `null` = leave untouched).
+#[wasm_bindgen(js_name = encodeProjectStudioSettingsSaveRequest)]
+pub fn encode_project_studio_settings_save_request(
+    project_id: String,
+    name: Option<String>,
+    description: Option<String>,
+    agents_json: Option<String>,
+    modules_json: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    let modules: Option<Vec<String>> = match modules_json
+        .as_deref()
+        .map(str::trim)
+        .filter(|raw| !raw.is_empty() && *raw != "null")
+    {
+        Some(raw) => Some(
+            serde_json::from_str(raw)
+                .map_err(|e| JsError::new(&format!("invalid modules_json: {e}")))?,
+        ),
+        None => None,
+    };
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SettingsSaveRequest {
+            project_id,
+            name,
+            description,
+            agents_json,
+            modules,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TagSaveRequest). `tag_id: None` = create,
+/// `Some` = rename.
+#[wasm_bindgen(js_name = encodeProjectStudioTagSaveRequest)]
+pub fn encode_project_studio_tag_save_request(
+    project_id: String,
+    tag_id: Option<String>,
+    name: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TagSaveRequest {
+            project_id,
+            tag_id,
+            name,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TagDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTagDeleteRequest)]
+pub fn encode_project_studio_tag_delete_request(
+    project_id: String,
+    tag_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TagDeleteRequest {
+            project_id,
+            tag_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(IngestStreamRequest) — subscribe to live
+/// ingest logs/progress (chunks = IngestStreamChunk, end = IngestStreamEnd).
+#[wasm_bindgen(js_name = encodeProjectStudioIngestStreamRequest)]
+pub fn encode_project_studio_ingest_stream_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::IngestStreamRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ChatStreamRequest) — send one user message
+/// and stream the assistant reply (chunks = ChatStreamChunk, end =
+/// ChatStreamEnd).
+#[wasm_bindgen(js_name = encodeProjectStudioChatStreamRequest)]
+pub fn encode_project_studio_chat_stream_request(
+    project_id: String,
+    chat_id: String,
+    message: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ChatStreamRequest {
+            project_id,
+            chat_id,
+            message,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ----- Project Studio F2: tests, runs, tasks, generation, notifications -----
+// Multi-field mutating requests (CaseSave, RunCreate, TaskSave, ...) take ONE
+// snake_case JSON string deserialized straight into the enum variant via its
+// external tag — serde enforces field types and applies #[serde(default)], so
+// the wasm signature never drifts from the protocol. Simple requests keep
+// explicit parameters like the F1 section above.
+
+/// Parses `fields_json` (snake_case object) into the `variant` struct variant
+/// of ProjectStudioPayload through serde's external tagging and encodes the
+/// full MessageBody.
+fn encode_project_studio_json_request(
+    variant: &str,
+    fields_json: &str,
+) -> Result<Vec<u8>, JsError> {
+    let fields: serde_json::Value = serde_json::from_str(fields_json)
+        .map_err(|e| JsError::new(&format!("invalid {variant} json: {e}")))?;
+    let payload: tentaflow_protocol::project_studio::ProjectStudioPayload =
+        serde_json::from_value(serde_json::json!({ variant: fields }))
+            .map_err(|e| JsError::new(&format!("invalid {variant} fields: {e}")))?;
+    encode_body_inner(&MessageBody::ProjectStudioBody(payload)).map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CasesListRequest) — filtered + paged manual
+/// test cases; empty filter strings mean "all".
+#[wasm_bindgen(js_name = encodeProjectStudioCasesListRequest)]
+pub fn encode_project_studio_cases_list_request(
+    project_id: String,
+    kind: String,
+    status: String,
+    priority: String,
+    tag_id: String,
+    origin: String,
+    search: String,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CasesListRequest {
+            project_id,
+            kind,
+            status,
+            priority,
+            tag_id,
+            origin,
+            search,
+            offset,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseGetRequest)]
+pub fn encode_project_studio_case_get_request(
+    project_id: String,
+    case_id: String,
+    include_versions: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseGetRequest {
+            project_id,
+            case_id,
+            include_versions,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseSaveRequest). `request_json` is the full
+/// snake_case field set (case_id null = create, expected_version drives
+/// optimistic locking).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseSaveRequest)]
+pub fn encode_project_studio_case_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("CaseSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(CaseStatusSetRequest) — every downgrade
+/// requires `reason`.
+#[wasm_bindgen(js_name = encodeProjectStudioCaseStatusSetRequest)]
+pub fn encode_project_studio_case_status_set_request(
+    project_id: String,
+    case_id: String,
+    status: String,
+    reason: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseStatusSetRequest {
+            project_id,
+            case_id,
+            status,
+            reason,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CasesBulkStatusRequest). `request_json`
+/// carries {project_id, case_ids, status, reason}.
+#[wasm_bindgen(js_name = encodeProjectStudioCasesBulkStatusRequest)]
+pub fn encode_project_studio_cases_bulk_status_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("CasesBulkStatusRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(CaseDuplicateRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseDuplicateRequest)]
+pub fn encode_project_studio_case_duplicate_request(
+    project_id: String,
+    case_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseDuplicateRequest {
+            project_id,
+            case_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseDeleteRequest)]
+pub fn encode_project_studio_case_delete_request(
+    project_id: String,
+    case_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseDeleteRequest {
+            project_id,
+            case_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseVersionGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseVersionGetRequest)]
+pub fn encode_project_studio_case_version_get_request(
+    project_id: String,
+    case_id: String,
+    version: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseVersionGetRequest {
+            project_id,
+            case_id,
+            version,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CaseRestoreVersionRequest) — restore creates
+/// a NEW version (append-only history).
+#[wasm_bindgen(js_name = encodeProjectStudioCaseRestoreVersionRequest)]
+pub fn encode_project_studio_case_restore_version_request(
+    project_id: String,
+    case_id: String,
+    version: u32,
+    expected_version: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CaseRestoreVersionRequest {
+            project_id,
+            case_id,
+            version,
+            expected_version,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CasesImportCsvRequest). `request_json`
+/// carries {project_id, csv_text, dry_run}.
+#[wasm_bindgen(js_name = encodeProjectStudioCasesImportCsvRequest)]
+pub fn encode_project_studio_cases_import_csv_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("CasesImportCsvRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(AttachmentGetRequest) — download by content
+/// hash; the server clamps `max_bytes` to 8 MiB.
+#[wasm_bindgen(js_name = encodeProjectStudioAttachmentGetRequest)]
+pub fn encode_project_studio_attachment_get_request(
+    project_id: String,
+    sha256: String,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::AttachmentGetRequest {
+            project_id,
+            sha256,
+            max_bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SuitesListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSuitesListRequest)]
+pub fn encode_project_studio_suites_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SuitesListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SuiteGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSuiteGetRequest)]
+pub fn encode_project_studio_suite_get_request(
+    project_id: String,
+    suite_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SuiteGetRequest {
+            project_id,
+            suite_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SuiteSaveRequest). `request_json` carries
+/// {project_id, suite_id?, name, description, case_ids} — case order defines
+/// member positions.
+#[wasm_bindgen(js_name = encodeProjectStudioSuiteSaveRequest)]
+pub fn encode_project_studio_suite_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("SuiteSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(SuiteDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSuiteDeleteRequest)]
+pub fn encode_project_studio_suite_delete_request(
+    project_id: String,
+    suite_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SuiteDeleteRequest {
+            project_id,
+            suite_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunsListRequest) — filtered + paged runs.
+#[wasm_bindgen(js_name = encodeProjectStudioRunsListRequest)]
+pub fn encode_project_studio_runs_list_request(
+    project_id: String,
+    status: String,
+    run_type: String,
+    offset: u32,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunsListRequest {
+            project_id,
+            status,
+            run_type,
+            offset,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunCreateRequest). `request_json` carries
+/// the full field set; exactly ONE of suite_id / case_ids / from_failed_run_id
+/// selects the case source (server-enforced).
+#[wasm_bindgen(js_name = encodeProjectStudioRunCreateRequest)]
+pub fn encode_project_studio_run_create_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunCreateRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunGetRequest)]
+pub fn encode_project_studio_run_get_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunGetRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunCloseRequest) — `cancelled` = abort
+/// instead of complete.
+#[wasm_bindgen(js_name = encodeProjectStudioRunCloseRequest)]
+pub fn encode_project_studio_run_close_request(
+    project_id: String,
+    run_id: String,
+    cancelled: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunCloseRequest {
+            project_id,
+            run_id,
+            cancelled,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunDeleteRequest)]
+pub fn encode_project_studio_run_delete_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunDeleteRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunItemClaimRequest). `item_id: None` claims
+/// the nearest pool item atomically server-side.
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemClaimRequest)]
+pub fn encode_project_studio_run_item_claim_request(
+    project_id: String,
+    run_id: String,
+    item_id: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunItemClaimRequest {
+            project_id,
+            run_id,
+            item_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunItemReleaseRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemReleaseRequest)]
+pub fn encode_project_studio_run_item_release_request(
+    project_id: String,
+    item_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunItemReleaseRequest {
+            project_id,
+            item_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunItemGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemGetRequest)]
+pub fn encode_project_studio_run_item_get_request(
+    project_id: String,
+    item_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunItemGetRequest {
+            project_id,
+            item_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunStepSetRequest). `request_json` carries
+/// {project_id, item_id, step_index, status, note, attachments_json}.
+#[wasm_bindgen(js_name = encodeProjectStudioRunStepSetRequest)]
+pub fn encode_project_studio_run_step_set_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunStepSetRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunItemFinishRequest). `request_json`
+/// carries the full field set; empty status = server derives the verdict.
+#[wasm_bindgen(js_name = encodeProjectStudioRunItemFinishRequest)]
+pub fn encode_project_studio_run_item_finish_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunItemFinishRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MyTestWorkRequest) — cross-project, no
+/// project_id (aggregates the caller's open run items).
+#[wasm_bindgen(js_name = encodeProjectStudioMyTestWorkRequest)]
+pub fn encode_project_studio_my_test_work_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MyTestWorkRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TasksListRequest) — filtered + paged tasks
+/// and defects.
+#[wasm_bindgen(js_name = encodeProjectStudioTasksListRequest)]
+pub fn encode_project_studio_tasks_list_request(
+    project_id: String,
+    task_type: String,
+    status: String,
+    assigned_to: String,
+    search: String,
+    offset: u32,
+    limit: u32,
+    severity: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TasksListRequest {
+            project_id,
+            task_type,
+            status,
+            assigned_to,
+            search,
+            offset,
+            limit,
+            severity: severity.unwrap_or_default(),
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskGetRequest)]
+pub fn encode_project_studio_task_get_request(
+    project_id: String,
+    task_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskGetRequest {
+            project_id,
+            task_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskSaveRequest). `request_json` is the full
+/// snake_case field set (task_id null = create; defects require severity).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskSaveRequest)]
+pub fn encode_project_studio_task_save_request(request_json: String) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TaskSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(TaskDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskDeleteRequest)]
+pub fn encode_project_studio_task_delete_request(
+    project_id: String,
+    task_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskDeleteRequest {
+            project_id,
+            task_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskCommentAddRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskCommentAddRequest)]
+pub fn encode_project_studio_task_comment_add_request(
+    project_id: String,
+    task_id: String,
+    body_md: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentAddRequest {
+            project_id,
+            task_id,
+            body_md,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskCommentEditRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskCommentEditRequest)]
+pub fn encode_project_studio_task_comment_edit_request(
+    project_id: String,
+    comment_id: String,
+    body_md: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentEditRequest {
+            project_id,
+            comment_id,
+            body_md,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskCommentDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioTaskCommentDeleteRequest)]
+pub fn encode_project_studio_task_comment_delete_request(
+    project_id: String,
+    comment_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskCommentDeleteRequest {
+            project_id,
+            comment_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationStartRequest). `request_json`
+/// carries {project_id, kind, source_ids, requested_count, instructions,
+/// agent_id?} — agent_id null = the project's 'generator_manual' binding.
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationStartRequest)]
+pub fn encode_project_studio_generation_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("GenerationStartRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(GenerationsListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationsListRequest)]
+pub fn encode_project_studio_generations_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationsListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationGetRequest) — polling is the
+/// source of truth for generation progress.
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationGetRequest)]
+pub fn encode_project_studio_generation_get_request(
+    project_id: String,
+    gen_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationGetRequest {
+            project_id,
+            gen_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationCancelRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationCancelRequest)]
+pub fn encode_project_studio_generation_cancel_request(
+    project_id: String,
+    gen_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationCancelRequest {
+            project_id,
+            gen_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(GenerationReviewRequest). `request_json`
+/// carries {project_id, gen_id, accept_case_ids, reject_case_ids}.
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationReviewRequest)]
+pub fn encode_project_studio_generation_review_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("GenerationReviewRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(GenerationDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioGenerationDeleteRequest)]
+pub fn encode_project_studio_generation_delete_request(
+    project_id: String,
+    gen_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::GenerationDeleteRequest {
+            project_id,
+            gen_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(NotificationsListRequest) — always
+/// caller-scoped, no project_id.
+#[wasm_bindgen(js_name = encodeProjectStudioNotificationsListRequest)]
+pub fn encode_project_studio_notifications_list_request(
+    only_unread: bool,
+    before_id: Option<String>,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::NotificationsListRequest {
+            only_unread,
+            before_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(NotificationsMarkReadRequest).
+/// `request_json` carries {notification_ids} — empty = mark ALL as read.
+#[wasm_bindgen(js_name = encodeProjectStudioNotificationsMarkReadRequest)]
+pub fn encode_project_studio_notifications_mark_read_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("NotificationsMarkReadRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ReportQueryRequest). `request_json` carries
+/// {project_id, report, from_date, to_date, suite_id} — one generic variant,
+/// rows_json schema is per report.
+#[wasm_bindgen(js_name = encodeProjectStudioReportQueryRequest)]
+pub fn encode_project_studio_report_query_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ReportQueryRequest", &request_json)
+}
+
+// ----- Project Studio F3: test environments, build profiles, runners,
+// automated runs, try-run, git/zip/api_spec sources, artifacts, code assist -----
+// Same convention as F2: multi-field mutating requests (EnvironmentSave,
+// BuildProfileSave, RunStartAuto, TryRunStart) take ONE snake_case JSON string
+// parsed by serde; simple requests keep explicit parameters.
+
+/// MessageBody::ProjectStudioBody(EnvironmentsListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioEnvironmentsListRequest)]
+pub fn encode_project_studio_environments_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvironmentsListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(EnvironmentSaveRequest). `request_json` is
+/// the full snake_case field set (environment_id null = create; secret null =
+/// keep stored, "" = clear, value = replace).
+#[wasm_bindgen(js_name = encodeProjectStudioEnvironmentSaveRequest)]
+pub fn encode_project_studio_environment_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("EnvironmentSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(EnvironmentDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioEnvironmentDeleteRequest)]
+pub fn encode_project_studio_environment_delete_request(
+    project_id: String,
+    environment_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvironmentDeleteRequest {
+            project_id,
+            environment_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(EnvApprovalsListRequest) — admin only,
+/// cross-project pending environment approvals.
+#[wasm_bindgen(js_name = encodeProjectStudioEnvApprovalsListRequest)]
+pub fn encode_project_studio_env_approvals_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvApprovalsListRequest,
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(EnvApprovalDecideRequest) — admin only,
+/// rejection requires a non-empty `reason`.
+#[wasm_bindgen(js_name = encodeProjectStudioEnvApprovalDecideRequest)]
+pub fn encode_project_studio_env_approval_decide_request(
+    project_id: String,
+    environment_id: String,
+    approve: bool,
+    reason: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::EnvApprovalDecideRequest {
+            project_id,
+            environment_id,
+            approve,
+            reason,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(BuildProfileGetRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioBuildProfileGetRequest)]
+pub fn encode_project_studio_build_profile_get_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::BuildProfileGetRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(BuildProfileSaveRequest). `request_json` is
+/// the full snake_case field set — upserts the single profile of a source.
+#[wasm_bindgen(js_name = encodeProjectStudioBuildProfileSaveRequest)]
+pub fn encode_project_studio_build_profile_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("BuildProfileSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunnersListRequest) — test-runner discovery.
+#[wasm_bindgen(js_name = encodeProjectStudioRunnersListRequest)]
+pub fn encode_project_studio_runners_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunnersListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunStartAutoRequest). `request_json` carries
+/// the XOR case selectors (suite_id / case_ids / from_run_id), environment_id,
+/// optional runner_service_id and perf_profile_json.
+#[wasm_bindgen(js_name = encodeProjectStudioRunStartAutoRequest)]
+pub fn encode_project_studio_run_start_auto_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("RunStartAutoRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(RunAutoGetRequest) — polling snapshot, the
+/// source of truth for automated-run progress.
+#[wasm_bindgen(js_name = encodeProjectStudioRunAutoGetRequest)]
+pub fn encode_project_studio_run_auto_get_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunAutoGetRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunAutoCancelRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioRunAutoCancelRequest)]
+pub fn encode_project_studio_run_auto_cancel_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunAutoCancelRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TryRunStartRequest) — STREAM-INITIATING (no
+/// plain response): chunks = TryRunStreamChunk, end = TryRunStreamEnd on the
+/// same subscription. `request_json` carries the client-minted try_id plus
+/// case/environment/override fields.
+#[wasm_bindgen(js_name = encodeProjectStudioTryRunStartRequest)]
+pub fn encode_project_studio_try_run_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("TryRunStartRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(TryRunCancelRequest) — addresses the
+/// ephemeral execution by the client-minted try_id.
+#[wasm_bindgen(js_name = encodeProjectStudioTryRunCancelRequest)]
+pub fn encode_project_studio_try_run_cancel_request(
+    project_id: String,
+    try_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TryRunCancelRequest {
+            project_id,
+            try_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceRefreshRequest) — git sources only:
+/// fetch + delta re-index of changed files.
+#[wasm_bindgen(js_name = encodeProjectStudioSourceRefreshRequest)]
+pub fn encode_project_studio_source_refresh_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceRefreshRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ApiSpecEndpointsRequest) — parsed endpoint
+/// list of an api_spec source.
+#[wasm_bindgen(js_name = encodeProjectStudioApiSpecEndpointsRequest)]
+pub fn encode_project_studio_api_spec_endpoints_request(
+    project_id: String,
+    source_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ApiSpecEndpointsRequest {
+            project_id,
+            source_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(SourceSecretSetRequest) — sets/clears the
+/// access token of a git source; `token` None clears (input-only, reads never
+/// return it).
+#[wasm_bindgen(js_name = encodeProjectStudioSourceSecretSetRequest)]
+pub fn encode_project_studio_source_secret_set_request(
+    project_id: String,
+    source_id: String,
+    token: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SourceSecretSetRequest {
+            project_id,
+            source_id,
+            token,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunArtifactGetRequest) — artifact download
+/// by id; the server clamps `max_bytes` to 32 MiB, response.bytes arrives as
+/// a Uint8Array.
+#[wasm_bindgen(js_name = encodeProjectStudioRunArtifactGetRequest)]
+pub fn encode_project_studio_run_artifact_get_request(
+    project_id: String,
+    artifact_id: String,
+    max_bytes: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunArtifactGetRequest {
+            project_id,
+            artifact_id,
+            max_bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(RunAutoStreamRequest) — subscribe to the
+/// live view of an automated run (chunks = RunAutoStreamChunk, end =
+/// RunAutoStreamEnd).
+#[wasm_bindgen(js_name = encodeProjectStudioRunAutoStreamRequest)]
+pub fn encode_project_studio_run_auto_stream_request(
+    project_id: String,
+    run_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::RunAutoStreamRequest {
+            project_id,
+            run_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(CodeAssistRequest) — STREAM-INITIATING:
+/// tokens stream via CodeAssistStreamChunk, the final proposal arrives whole
+/// in CodeAssistStreamEnd.
+#[wasm_bindgen(js_name = encodeProjectStudioCodeAssistRequest)]
+pub fn encode_project_studio_code_assist_request(
+    project_id: String,
+    case_id: String,
+    kind: String,
+    selection: String,
+    instruction: String,
+    full_content: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::CodeAssistRequest {
+            project_id,
+            case_id,
+            kind,
+            selection,
+            instruction,
+            full_content,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// ----- Project Studio F4: run schedules, ML Studio links, kanban status,
+// project export/import -----
+// Same convention as F2/F3: multi-field mutating requests (ScheduleSave,
+// MlProjectCreateFromProject, MlLinkAttach, MlLinkUpdate, ProjectExportStart,
+// ProjectImportApply) take ONE snake_case JSON string parsed by serde; simple
+// requests keep explicit parameters. Every F4 response decodes through the
+// generic ProjectStudio path — none of them carries raw bytes (the export
+// archive is fetched over a signed URL, not the binary protocol).
+
+/// MessageBody::ProjectStudioBody(SchedulesListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioSchedulesListRequest)]
+pub fn encode_project_studio_schedules_list_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::SchedulesListRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleSaveRequest). `request_json` is the
+/// COMPLETE definition (schedule_id null = create); every omitted field is a
+/// real clear, so list-row toggles must use ScheduleSetEnabledRequest instead.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleSaveRequest)]
+pub fn encode_project_studio_schedule_save_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ScheduleSaveRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleDeleteRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleDeleteRequest)]
+pub fn encode_project_studio_schedule_delete_request(
+    project_id: String,
+    schedule_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleDeleteRequest {
+            project_id,
+            schedule_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleSetEnabledRequest) — enable/disable
+/// toggle that leaves the rest of the definition untouched.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleSetEnabledRequest)]
+pub fn encode_project_studio_schedule_set_enabled_request(
+    project_id: String,
+    schedule_id: String,
+    enabled: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleSetEnabledRequest {
+            project_id,
+            schedule_id,
+            enabled,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleRunNowRequest) — fires through the
+/// same gate chain as the loop and never moves `next_run_at`.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleRunNowRequest)]
+pub fn encode_project_studio_schedule_run_now_request(
+    project_id: String,
+    schedule_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleRunNowRequest {
+            project_id,
+            schedule_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ScheduleRunsListRequest) — trigger history
+/// of one schedule.
+#[wasm_bindgen(js_name = encodeProjectStudioScheduleRunsListRequest)]
+pub fn encode_project_studio_schedule_runs_list_request(
+    project_id: String,
+    schedule_id: String,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ScheduleRunsListRequest {
+            project_id,
+            schedule_id,
+            limit,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlLinksListRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinksListRequest)]
+pub fn encode_project_studio_ml_links_list_request(project_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlLinksListRequest { project_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlProjectCreateFromProjectRequest).
+/// `request_json` carries the role_map array, so it goes through serde like
+/// the other multi-field mutations.
+#[wasm_bindgen(js_name = encodeProjectStudioMlProjectCreateFromProjectRequest)]
+pub fn encode_project_studio_ml_project_create_from_project_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MlProjectCreateFromProjectRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MlProjectCandidatesRequest) — ML projects the
+/// caller OWNS and that are not linked yet.
+#[wasm_bindgen(js_name = encodeProjectStudioMlProjectCandidatesRequest)]
+pub fn encode_project_studio_ml_project_candidates_request(
+    project_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlProjectCandidatesRequest {
+            project_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkAttachRequest). `request_json` carries
+/// the role_map array.
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkAttachRequest)]
+pub fn encode_project_studio_ml_link_attach_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MlLinkAttachRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkUpdateRequest). `request_json` carries
+/// the role_map array.
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkUpdateRequest)]
+pub fn encode_project_studio_ml_link_update_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("MlLinkUpdateRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkDetachRequest) — `revoke_members` also
+/// removes the ML memberships this link granted; the ML project survives.
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkDetachRequest)]
+pub fn encode_project_studio_ml_link_detach_request(
+    project_id: String,
+    link_id: String,
+    revoke_members: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlLinkDetachRequest {
+            project_id,
+            link_id,
+            revoke_members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(MlLinkSyncNowRequest).
+#[wasm_bindgen(js_name = encodeProjectStudioMlLinkSyncNowRequest)]
+pub fn encode_project_studio_ml_link_sync_now_request(
+    project_id: String,
+    link_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::MlLinkSyncNowRequest {
+            project_id,
+            link_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(TaskStatusSetRequest) — status-only kanban
+/// move; TaskSaveRequest would clear description_md and attachments.
+#[wasm_bindgen(js_name = encodeProjectStudioTaskStatusSetRequest)]
+pub fn encode_project_studio_task_status_set_request(
+    project_id: String,
+    task_id: String,
+    status: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::TaskStatusSetRequest {
+            project_id,
+            task_id,
+            status,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectExportStartRequest). `request_json`
+/// carries the include_* switches; `include_user_names` copies display names
+/// into the archive (personal data — audited).
+#[wasm_bindgen(js_name = encodeProjectStudioProjectExportStartRequest)]
+pub fn encode_project_studio_project_export_start_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectExportStartRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ProjectExportStatusRequest) — polling this is
+/// the source of truth; ArchiveStream is only a live view.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectExportStatusRequest)]
+pub fn encode_project_studio_project_export_status_request(
+    project_id: String,
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectExportStatusRequest {
+            project_id,
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportUploadChunkRequest) — one raw
+/// chunk of an uploaded archive (`bytes` is a Uint8Array on the JS side);
+/// `upload_id` is client-minted and there is no project_id yet.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportUploadChunkRequest)]
+pub fn encode_project_studio_project_import_upload_chunk_request(
+    upload_id: String,
+    filename: String,
+    seq: u32,
+    total_chunks: u32,
+    bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectImportUploadChunkRequest {
+            upload_id,
+            filename,
+            seq,
+            total_chunks,
+            bytes,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportPreviewRequest) — reads ONLY the
+/// archive manifest; nothing is unpacked before the user confirms.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportPreviewRequest)]
+pub fn encode_project_studio_project_import_preview_request(
+    upload_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectImportPreviewRequest {
+            upload_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportApplyRequest). `request_json`
+/// carries the upload_id plus the name override and import switches.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportApplyRequest)]
+pub fn encode_project_studio_project_import_apply_request(
+    request_json: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_project_studio_json_request("ProjectImportApplyRequest", &request_json)
+}
+
+/// MessageBody::ProjectStudioBody(ProjectImportStatusRequest) — addressed by
+/// job_id alone: the project row does not exist until the import succeeds.
+#[wasm_bindgen(js_name = encodeProjectStudioProjectImportStatusRequest)]
+pub fn encode_project_studio_project_import_status_request(
+    job_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ProjectImportStatusRequest {
+            job_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ProjectStudioBody(ArchiveStreamRequest) — STREAM-INITIATING (no
+/// plain response): chunks = ArchiveStreamChunk, end = ArchiveStreamEnd. Live
+/// progress of an export or import job, job owner only.
+#[wasm_bindgen(js_name = encodeProjectStudioArchiveStreamRequest)]
+pub fn encode_project_studio_archive_stream_request(job_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ProjectStudioBody(
+        tentaflow_protocol::project_studio::ProjectStudioPayload::ArchiveStreamRequest { job_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// =============================================================================
+// Code Studio — workspace'y, czlonkowie, sesje robocze.
+//
+// Kazdy wariant ma wlasny, typowany enkoder: argumenty przechodza przez granice
+// JS -> WASM jako konkretne typy, a rama idzie na drut jako CBOR
+// (`MessageBody::CodeStudioBody`). Jedyne pole podawane jako JSON to lista
+// czlonkow w kreatorze — dokladnie tak samo jak `members_json` w Project Studio,
+// bo wasm-bindgen nie przenosi `Vec<struct>` bez recznego mostu.
+// =============================================================================
+
+/// MessageBody::CodeStudioBody(WorkspacesListRequest) — lista workspace'ow.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspacesListRequest)]
+pub fn encode_code_studio_workspaces_list_request(
+    include_archived: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspacesListRequest {
+            include_archived,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceCreateRequest). `members_json` to
+/// tablica JSON obiektow `{user_id, role}` (jak `members_json` w Project
+/// Studio); `secret_material` jedzie RAZ i nigdy nie wraca.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceCreateRequest)]
+#[allow(clippy::too_many_arguments)]
+pub fn encode_code_studio_workspace_create_request(
+    name: String,
+    node_id: String,
+    exec_mode: String,
+    container_image: Option<String>,
+    repo_kind: String,
+    repo_url: Option<String>,
+    repo_auth_kind: Option<String>,
+    secret_material: Option<String>,
+    ssh_host_fingerprint: Option<String>,
+    default_branch: Option<String>,
+    autonomy_ceiling: String,
+    egress_policy: String,
+    index_enabled: bool,
+    members_json: String,
+) -> Result<Vec<u8>, JsError> {
+    let members: Vec<tentaflow_protocol::code_studio::WorkspaceMemberInput> =
+        if members_json.trim().is_empty() {
+            Vec::new()
+        } else {
+            serde_json::from_str(&members_json)
+                .map_err(|e| JsError::new(&format!("invalid members_json: {e}")))?
+        };
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceCreateRequest {
+            name,
+            node_id,
+            exec_mode,
+            container_image,
+            repo_kind,
+            repo_url,
+            repo_auth_kind,
+            secret_material,
+            ssh_host_fingerprint,
+            default_branch,
+            autonomy_ceiling,
+            egress_policy,
+            index_enabled,
+            members,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceGetRequest) — szczegoly + czlonkowie +
+/// kroki provisioningu.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceGetRequest)]
+pub fn encode_code_studio_workspace_get_request(workspace_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceGetRequest { workspace_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceRetryRequest) — wznowienie
+/// provisioningu; kroki `done` sa pomijane, wiec to wznowienie, nie przebudowa.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceRetryRequest)]
+pub fn encode_code_studio_workspace_retry_request(
+    workspace_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceRetryRequest { workspace_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceArchiveRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceArchiveRequest)]
+pub fn encode_code_studio_workspace_archive_request(
+    workspace_id: String,
+    archived: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceArchiveRequest {
+            workspace_id,
+            archived,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceMemberSetRequest) — dodanie albo zmiana
+/// roli czlonka.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceMemberSetRequest)]
+pub fn encode_code_studio_workspace_member_set_request(
+    workspace_id: String,
+    user_id: String,
+    role: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceMemberSetRequest {
+            workspace_id,
+            user_id,
+            role,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceMemberRemoveRequest).
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceMemberRemoveRequest)]
+pub fn encode_code_studio_workspace_member_remove_request(
+    workspace_id: String,
+    user_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceMemberRemoveRequest {
+            workspace_id,
+            user_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(WorkspaceCreatorGrantSetRequest) — prawo
+/// zakladania workspace'ow, nadawane per uzytkownik.
+#[wasm_bindgen(js_name = encodeCodeStudioWorkspaceCreatorGrantSetRequest)]
+pub fn encode_code_studio_workspace_creator_grant_set_request(
+    user_id: String,
+    granted: bool,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::WorkspaceCreatorGrantSetRequest {
+            user_id,
+            granted,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(SessionsListRequest) — sesje WOLAJACEGO w tym
+/// workspace; serwer filtruje po uzytkowniku, bez obejscia dla administratora.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionsListRequest)]
+pub fn encode_code_studio_sessions_list_request(workspace_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::SessionsListRequest { workspace_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(SessionOpenRequest) — galaz jest wyprowadzana
+/// serwerowo, nie podawana z UI.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionOpenRequest)]
+pub fn encode_code_studio_session_open_request(
+    workspace_id: String,
+    title: String,
+    autonomy_mode: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::SessionOpenRequest {
+            workspace_id,
+            title,
+            autonomy_mode,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::CodeStudioBody(SessionCloseRequest) — usuwa worktree, zostawia
+/// galaz.
+#[wasm_bindgen(js_name = encodeCodeStudioSessionCloseRequest)]
+pub fn encode_code_studio_session_close_request(
+    workspace_id: String,
+    session_id: String,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::CodeStudioBody(
+        tentaflow_protocol::code_studio::CodeStudioPayload::SessionCloseRequest {
+            workspace_id,
+            session_id,
+        },
+    ))
+    .map_err(|e| JsError::new(&e))
+}

@@ -45,9 +45,13 @@ pub enum QuantKind {
     /// four FP8-E4M3 per-16 scales + 32 packed e2m1 bytes inline.
     NVFP4Gguf,
     /// GPTQ INT4 with group scales/zeros; group size is model metadata.
-    Gptq4 { group: u16 },
+    Gptq4 {
+        group: u16,
+    },
     /// AWQ INT4 with group scales/zeros; group size is model metadata.
-    Awq4 { group: u16 },
+    Awq4 {
+        group: u16,
+    },
     /// Per-tensor/per-channel FP8 (compressed-tensors "fp8" scheme); scales in
     /// sibling tensors.
     Fp8Dynamic,

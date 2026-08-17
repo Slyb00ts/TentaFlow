@@ -10,6 +10,7 @@ extern crate self as tentaflow_core;
 
 pub mod audio_models;
 pub mod benchmark;
+pub mod code_studio;
 pub mod compliance;
 pub mod config;
 pub mod crypto;
@@ -24,6 +25,7 @@ pub mod mesh;
 pub mod metrics;
 pub mod ml_studio;
 pub mod net;
+pub mod project_studio;
 pub mod prompt_registry;
 pub mod routing;
 pub mod scheduler;

@@ -405,9 +405,12 @@ pub fn api_key_list_request(
 /// one of the supported ACL kinds and `resource_id` must be non-empty, so neither
 /// creation seeding nor scope set/clear can persist a garbage or empty-id rule.
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
-    if !matches!(resource_type, "model" | "flow" | "alias" | "model_bundle") {
+    if !matches!(
+        resource_type,
+        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export"
+    ) {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow', 'alias' or 'model_bundle'",
+            "resource_type must be 'model', 'flow', 'alias', 'model_bundle' or 'ml_studio_export'",
         ));
     }
     if resource_id.is_empty() {
@@ -420,6 +423,13 @@ fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(),
     {
         return Err(ProtocolError::bad_request(
             "resource_id is not a shareable model bundle",
+        ));
+    }
+    // ml_studio_export scopes gate the per-project export archive download — the
+    // resource_id is an ML Studio project id, which is a v4 UUID.
+    if resource_type == "ml_studio_export" && uuid::Uuid::parse_str(resource_id).is_err() {
+        return Err(ProtocolError::bad_request(
+            "resource_id is not a valid ML Studio project id",
         ));
     }
     Ok(())
@@ -1106,6 +1116,7 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             enabled: f.status == "active",
             is_default: f.is_default,
             published_model_name: f.published_model_name,
+            is_system: f.is_system,
         })
         .collect();
     Ok(MessageBody::FlowListResponse { flows: summaries })
@@ -1131,6 +1142,7 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         graph_json: flow.flow_json,
         enabled: flow.status == "active",
         status: flow.status,
+        is_system: flow.is_system,
     }))
 }
 
@@ -1198,11 +1210,14 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     };
 
     // Existence check przed delete (delete_flow nie raisuje na missing).
-    let exists = repository::get_flow(&ctx.state.db, flow_id)
-        .map_err(db_err)?
-        .is_some();
-    if !exists {
-        return Ok(MessageBody::FlowDeleteResponse { deleted: false });
+    let existing = match repository::get_flow(&ctx.state.db, flow_id).map_err(db_err)? {
+        Some(f) => f,
+        None => return Ok(MessageBody::FlowDeleteResponse { deleted: false }),
+    };
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be deleted — it is managed by the platform",
+        ));
     }
     repository::delete_flow(&ctx.state.db, flow_id).map_err(db_err)?;
     // A deleted flow that was published as a model must drop out of the
@@ -1278,6 +1293,12 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     let existing = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    // Guards edit AND status flips — status rides on the same update payload.
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be modified — it is managed by the platform",
+        ));
+    }
 
     // Partial update — pola nie przeslane zachowuja wartosci z `existing`.
     let new_name = payload
@@ -1607,6 +1628,11 @@ pub fn flow_version_restore(
     let existing = repository::get_flow(&ctx.state.db, flow_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be modified — it is managed by the platform",
+        ));
+    }
     let version = repository::get_flow_version(&ctx.state.db, flow_id, version_id)
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow version not found"))?;
@@ -1722,6 +1748,17 @@ fn build_cluster_members(
                 } else {
                     Some(m.rdma_socket_ifname.clone())
                 },
+                interface_name: if m.interface_name.is_empty() {
+                    None
+                } else {
+                    Some(m.interface_name.clone())
+                },
+                interface_ip: if m.interface_ip.is_empty() {
+                    None
+                } else {
+                    Some(m.interface_ip.clone())
+                },
+                rdma_gid_index: u32::try_from(m.rdma_gid_index).ok(),
             }
         })
         .collect()
@@ -1760,7 +1797,9 @@ fn db_cluster_to_info(
     }
 }
 
-/// Liczy ilu czlonkow klastra ma status "online" w peer_store.
+/// Liczy ilu czlonkow klastra jest osiagalnych wg peer_store. Peer_store nadaje
+/// statusy "connected"/"reachable"/"discovered"/"disconnected"/"offline" — nody
+/// zdolne przyjac komende mesh to dwa pierwsze.
 fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
     let members = match repository::list_cluster_members(&ctx.state.db, cluster_id) {
         Ok(m) => m,
@@ -1773,7 +1812,7 @@ fn count_online_members(ctx: &HandlerContext, cluster_id: &str) -> (u32, u32) {
             ctx.state
                 .mesh_peer_store
                 .get(&m.node_id)
-                .map(|p| p.status == "online")
+                .map(|p| matches!(p.status.as_str(), "connected" | "reachable"))
                 .unwrap_or(false)
         })
         .count() as u32;
@@ -1825,12 +1864,64 @@ pub fn cluster_detail(
     let members = build_cluster_members(ctx, &payload.cluster_id);
     let info = db_cluster_to_info(&cluster, total, online, members.clone());
 
+    let deployment = build_cluster_deployment(ctx, &payload.cluster_id, &members);
+
     Ok(MessageBody::ClusterDetailResponseBody(
         tentaflow_protocol::ClusterDetailResponse {
             cluster: info,
             members,
+            deployment,
         },
     ))
+}
+
+/// The live distributed deployment of a cluster, resolved from the database so
+/// it survives a dashboard refresh and a core restart. Hostnames come from the
+/// cluster members already assembled for the response — the deployment tables
+/// only carry node ids, and an id is not what an operator recognises.
+fn build_cluster_deployment(
+    ctx: &HandlerContext,
+    cluster_id: &str,
+    members: &[tentaflow_protocol::ClusterMember],
+) -> Option<tentaflow_protocol::ClusterDeploymentInfo> {
+    let dep = repository::active_cluster_deployment(&ctx.state.db, cluster_id)
+        .ok()
+        .flatten()?;
+
+    let hostname_of = |node_id: &str| {
+        members
+            .iter()
+            .find(|m| m.node_id == node_id)
+            .map(|m| m.hostname.clone())
+    };
+
+    let dep_members = repository::list_cluster_deployment_members(
+        &ctx.state.db,
+        &dep.deployment_cluster_id,
+    )
+    .unwrap_or_default()
+    .into_iter()
+    .map(|m| tentaflow_protocol::ClusterDeploymentMemberInfo {
+        hostname: hostname_of(&m.node_id),
+        node_id: m.node_id,
+        role: m.role,
+        container_name: m.container_name,
+    })
+    .collect();
+
+    Some(tentaflow_protocol::ClusterDeploymentInfo {
+        deployment_cluster_id: dep.deployment_cluster_id,
+        engine_id: dep.engine_id,
+        model: dep.model,
+        served_model_name: dep.served_model_name,
+        tp_size: dep.tp_size.max(0) as u32,
+        head_node_id: dep.head_node_id,
+        port: dep.port.max(0) as u32,
+        endpoint_url: dep.endpoint_url,
+        status: dep.status,
+        created_at: dep.created_at,
+        members: dep_members,
+    })
 }
 
 #[handler(variant = "ClusterCreateRequest", since = (1, 0))]
@@ -2042,8 +2133,8 @@ pub fn cluster_add_member(
         &payload.cluster_id,
         &payload.node_id,
         "worker",
-        "",
-        "",
+        payload.interface_name.as_deref().unwrap_or(""),
+        payload.interface_ip.as_deref().unwrap_or(""),
         payload.interface_speed_mbps.map(|v| v as i64).unwrap_or(0),
         payload.interface_type.as_deref().unwrap_or(""),
     )
@@ -4725,6 +4816,7 @@ fn resolve_deploy_method(
                 NativeRuntime::Embedded => DeployMethod::NativeEmbedded,
                 NativeRuntime::Binary => DeployMethod::NativeBinary,
                 NativeRuntime::PythonBundle => DeployMethod::NativePythonBundle,
+                NativeRuntime::ManagedCli => DeployMethod::NativeManagedCli,
             })
         }
         other => Err(format!(
@@ -4940,6 +5032,7 @@ pub async fn deploy_vllm_recommend(
             requested_max_num_seqs: payload.max_num_seqs,
             requested_tensor_parallel: payload.tensor_parallel,
             requested_pipeline_parallel: payload.pipeline_parallel,
+            max_num_batched_tokens: payload.max_num_batched_tokens,
             lock_max_model_len: lock_ctx,
             lock_max_num_seqs: lock_seqs,
             lock_tensor_parallel: lock_tp,
@@ -4954,15 +5047,11 @@ pub async fn deploy_vllm_recommend(
         error: fit_error,
     } = fit;
 
-    // auto_fit nie propaguje typu V cache ani batcha tokenow — ustawiamy je na
-    // applied PRZED estymacja i builderem argow, zeby estymata KV (osobne K/V)
-    // i wygenerowana komenda uzywaly tych samych wartosci co wybor uzytkownika.
-    // Domyslny batch = max_model_len (min. 8192) napedza szczyt aktywacji w
-    // modelu puli KV vLLM.
+    // auto_fit nie propaguje typu V cache — ustawiamy go na applied PRZED
+    // estymacja i builderem argow. Batcha NIE ruszamy: auto_fit dobral ctx wlasnie
+    // pod niego, wiec podmiana tutaj kazalaby estymacie ocenic wybor na innym
+    // szczycie aktywacji niz ten, dla ktorego zostal policzony.
     applied_input.kv_cache_dtype_v = payload.kv_cache_dtype_v.clone();
-    applied_input.max_num_batched_tokens = payload
-        .max_num_batched_tokens
-        .unwrap_or_else(|| applied_input.max_model_len.max(8192));
 
     // Over-budget NIE jest twardym bledem requestu — auto_fit zwraca uzywalny
     // `applied` (minimalny ctx/seqs), wiec liczymy estymacje i oddajemy
@@ -5812,16 +5901,14 @@ pub async fn engine_recommend(
                 requested_max_num_seqs: None,
                 requested_tensor_parallel: None,
                 requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
                 lock_max_model_len: false,
                 lock_max_num_seqs: false,
                 lock_tensor_parallel: false,
                 weights_bytes_override: weights_override,
             };
             let outcome = auto_fit_config(&spec, &req_fit);
-            let mut cfg = outcome.applied;
-            // Spojnie z deploy_vllm_recommend: applied nie niesie batcha tokenow,
-            // ustawiamy default (max_model_len, min 8192) dla szczytu aktywacji.
-            cfg.max_num_batched_tokens = cfg.max_model_len.max(8192);
+            let cfg = outcome.applied;
             if let Some(err) = outcome.error {
                 warnings.push(err);
             }
@@ -7405,6 +7492,45 @@ struct ToolsCatalog {
     core: Vec<CatalogTool>,
 }
 
+/// Builds the pickable tool catalog: addon tools grouped by `addon_id`, then
+/// the `core.*` builtins. Shared by the ToolsCatalog handler and the
+/// agent-builder assistant so both see the exact same tool universe.
+fn build_tools_catalog(ctx: &HandlerContext) -> ToolsCatalog {
+    use std::collections::BTreeMap;
+    let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
+    if let Some(manager) = &ctx.state.addon_manager {
+        for tool in manager.list_tools() {
+            grouped
+                .entry(tool.addon_id.clone())
+                .or_default()
+                .push(CatalogTool {
+                    name: format!("{}.{}", tool.addon_id, tool.tool_name),
+                    description: tool.description,
+                    parameters: tool.parameters_schema,
+                });
+        }
+    }
+    let addons = grouped
+        .into_iter()
+        .map(|(addon_id, mut tools)| {
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+            CatalogAddonGroup { addon_id, tools }
+        })
+        .collect();
+    let core = crate::agents::CoreToolName::all()
+        .iter()
+        .map(|t| {
+            let spec = t.spec();
+            CatalogTool {
+                name: spec.name,
+                description: spec.description,
+                parameters: spec.parameters,
+            }
+        })
+        .collect();
+    ToolsCatalog { addons, core }
+}
+
 /// True when the acting session is an admin. Non-admins only ever see their own
 /// runs (Harness §3.3 ACL) — enforced here, never in the UI.
 fn session_is_admin(ctx: &HandlerContext) -> bool {
@@ -7837,52 +7963,303 @@ pub fn tools_catalog(
     _req: &MessageBody,
     ctx: &HandlerContext,
 ) -> Result<MessageBody, ProtocolError> {
-    // Admin-only: the only consumer is the admin-gated agent editor, and the
-    // catalog discloses every addon's full tool surface (names, descriptions,
-    // JSON schemas) regardless of the caller's own "llm" grants. Matching the
-    // handler policy to its sole consumer keeps the disclosure admin-scoped.
-    // Addon tools grouped by addon, then the core builtins — the pickable
-    // surface the editor renders as a checkbox tree (plus its own addon.*
-    // wildcard rows). The catalog is the universe; the agent's allowlist is the
-    // selection, intersected with live permissions at execution time (§3.3).
-    use std::collections::BTreeMap;
-    let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
-    if let Some(manager) = &ctx.state.addon_manager {
-        for tool in manager.list_tools() {
-            grouped
-                .entry(tool.addon_id.clone())
-                .or_default()
-                .push(CatalogTool {
-                    name: format!("{}.{}", tool.addon_id, tool.tool_name),
-                    description: tool.description,
-                    parameters: tool.parameters_schema,
-                });
-        }
-    }
-    let addons = grouped
-        .into_iter()
-        .map(|(addon_id, mut tools)| {
-            tools.sort_by(|a, b| a.name.cmp(&b.name));
-            CatalogAddonGroup { addon_id, tools }
-        })
-        .collect();
-    let core = crate::agents::CoreToolName::all()
-        .iter()
-        .map(|t| {
-            let spec = t.spec();
-            CatalogTool {
-                name: spec.name,
-                description: spec.description,
-                parameters: spec.parameters,
-            }
-        })
-        .collect();
-    let catalog = ToolsCatalog { addons, core };
+    // Admin-only: the consumers are the admin-gated agent editor and the
+    // builder assistant, and the catalog discloses every addon's full tool
+    // surface (names, descriptions, JSON schemas) regardless of the caller's
+    // own "llm" grants. Matching the handler policy to its consumers keeps the
+    // disclosure admin-scoped. The catalog is the universe; the agent's
+    // allowlist is the selection, intersected with live permissions at
+    // execution time (§3.3).
+    let catalog = build_tools_catalog(ctx);
     let tools_json = serde_json::to_string(&catalog)
         .map_err(|e| ProtocolError::internal(format!("tools catalog encode failed: {}", e)))?;
     Ok(MessageBody::AgentsBody(
         tentaflow_protocol::AgentsPayload::ToolsCatalogResponse(
             tentaflow_protocol::ToolsCatalogResponse { tools_json },
+        ),
+    ))
+}
+
+#[handler(variant = "AgentRunStartRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub async fn agent_run_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::RunStartRequest(p)) => p,
+        _ => return Err(ProtocolError::bad_request("expected AgentRunStartRequest")),
+    };
+    let user_id = user_id_to_uuid(&require_user_id(ctx)?);
+    if payload.prompt.trim().is_empty() {
+        return Err(ProtocolError::bad_request("prompt must not be empty"));
+    }
+    if payload.prompt.chars().count() > 8000 {
+        return Err(ProtocolError::bad_request(
+            "prompt exceeds 8000 characters",
+        ));
+    }
+    let agent = repository::get_agent(&ctx.state.db, &payload.agent_id)
+        .map_err(db_err)?
+        .ok_or_else(|| {
+            ProtocolError::not_found(format!("agent not found: {}", payload.agent_id))
+        })?;
+    if !agent.is_enabled {
+        return Err(ProtocolError::bad_request(format!(
+            "agent is disabled: {}",
+            payload.agent_id
+        )));
+    }
+
+    // Attended principal: the run acts as the starting session user (playground
+    // "try it" — the user tests their own agent, so addon tools resolve under
+    // their grants); the org snapshot stamps compliance attribution on the row.
+    let principal = crate::agents::AgentPrincipal::new(
+        Some(user_id.clone()),
+        ctx.org_context.as_ref().map(|o| o.org_id.clone()),
+    );
+    let manager = crate::agents::agent_run_manager_global()
+        .ok_or_else(|| ProtocolError::internal("agent run manager not initialized"))?;
+    let run_id = manager
+        .spawn(&agent.id, &payload.prompt, None, &principal, &[], &[], None)
+        .await
+        .map_err(|e| ProtocolError::internal(format!("agent run spawn failed: {e}")))?;
+
+    audit(
+        ctx,
+        Some(&user_id),
+        "agent.run_start",
+        Some(&format!("agent:{}", payload.agent_id)),
+        Some(&run_id),
+    );
+
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::RunStartResponse(
+            tentaflow_protocol::AgentRunStartResponse { run_id },
+        ),
+    ))
+}
+
+/// Wire shape of one transcript turn in `AgentBuilderAssistRequest.messages_json`.
+#[derive(serde::Deserialize)]
+struct BuilderTurn {
+    role: String,
+    content: String,
+}
+
+/// System prompt of the agent-builder assistant. Polish text because the
+/// assistant replies directly to the (Polish) dashboard user; the live tool
+/// catalog is appended at request time.
+const AGENT_BUILDER_SYSTEM_PROMPT: &str = r#"Jesteś asystentem tworzenia agentów w platformie TentaFlow. Prowadzisz krótką rozmowę z użytkownikiem, aby zaprojektować agenta. Dopytuj o: co agent dostaje na wejściu, co ma zrobić oraz jak ma wyglądać jego odpowiedź. Zadawaj pojedyncze, konkretne pytania. Gdy masz wystarczająco informacji, zwróć finalną propozycję agenta.
+
+ZAWSZE odpowiadaj wyłącznie czystym JSON, bez markdownu i bez tekstu poza JSON, w formacie:
+{"reply":"<twoja odpowiedź lub pytanie po polsku>","proposal":null}
+a gdy propozycja jest gotowa:
+{"reply":"<krótkie podsumowanie po polsku>","proposal":{"name":"nazwa-kebab-case","display_name":"...","description":"...","system_prompt":"...","tools":["<nazwy narzędzi z katalogu, np. deep-research.search_web, core.skill_view, albo wildcard całego addonu, np. deep-research.*>"],"max_iterations":25}}
+
+W polu "tools" używaj wyłącznie nazw z poniższego katalogu (lub wildcardu <addon_id>.*)."#;
+
+/// Extracts the first balanced `{...}` block from LLM output — models wrap
+/// JSON in prose or code fences despite instructions. String-aware so braces
+/// inside quoted values do not unbalance the scan.
+fn extract_first_json_object(text: &str) -> Option<&str> {
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+    for (i, &b) in text.as_bytes().iter().enumerate().skip(start) {
+        if in_string {
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            continue;
+        }
+        match b {
+            b'"' => in_string = true,
+            b'{' => depth += 1,
+            b'}' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some(&text[start..=i]);
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+#[handler(variant = "AgentBuilderAssistRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub async fn agent_builder_assist(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    use crate::api::openai::types::{ChatCompletionRequest, ContentPart, Message, MessageContent};
+    use std::collections::HashSet;
+
+    let payload = match req {
+        MessageBody::AgentsBody(tentaflow_protocol::AgentsPayload::BuilderAssistRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected AgentBuilderAssistRequest",
+            ));
+        }
+    };
+    let turns: Vec<BuilderTurn> = serde_json::from_str(&payload.messages_json)
+        .map_err(|e| ProtocolError::bad_request(format!("invalid messages json: {e}")))?;
+    if turns.is_empty() || turns.len() > 20 {
+        return Err(ProtocolError::bad_request(
+            "messages must contain between 1 and 20 turns",
+        ));
+    }
+    for turn in &turns {
+        if turn.role != "user" && turn.role != "assistant" {
+            return Err(ProtocolError::bad_request(
+                "message role must be 'user' or 'assistant'",
+            ));
+        }
+        if turn.content.chars().count() > 4000 {
+            return Err(ProtocolError::bad_request(
+                "message content exceeds 4000 characters",
+            ));
+        }
+    }
+
+    // The LLM picks tools by name: one flat "name — description" line per tool
+    // keeps the prompt small, while the sets validate the picks afterwards.
+    let catalog = build_tools_catalog(ctx);
+    let mut tool_lines: Vec<String> = Vec::new();
+    let mut valid_names: HashSet<&str> = HashSet::new();
+    let mut valid_addon_ids: HashSet<&str> = HashSet::new();
+    for group in &catalog.addons {
+        valid_addon_ids.insert(group.addon_id.as_str());
+        for tool in &group.tools {
+            valid_names.insert(tool.name.as_str());
+            tool_lines.push(format!("- {} — {}", tool.name, tool.description));
+        }
+    }
+    for tool in &catalog.core {
+        valid_names.insert(tool.name.as_str());
+        tool_lines.push(format!("- {} — {}", tool.name, tool.description));
+    }
+    let system_prompt = format!(
+        "{AGENT_BUILDER_SYSTEM_PROMPT}\n\nDostępne narzędzia:\n{}",
+        tool_lines.join("\n")
+    );
+
+    let mut messages = Vec::with_capacity(turns.len() + 1);
+    messages.push(Message {
+        role: "system".to_string(),
+        content: Some(MessageContent::Text(system_prompt)),
+        reasoning_content: None,
+        name: None,
+        tool_calls: None,
+        tool_call_id: None,
+    });
+    for turn in turns {
+        messages.push(Message {
+            role: turn.role,
+            content: Some(MessageContent::Text(turn.content)),
+            reasoning_content: None,
+            name: None,
+            tool_calls: None,
+            tool_call_id: None,
+        });
+    }
+
+    let request = ChatCompletionRequest {
+        model: crate::skills::resolve_model(&ctx.state.db),
+        messages,
+        temperature: Some(0.2),
+        max_tokens: Some(2048),
+        top_p: None,
+        frequency_penalty: None,
+        presence_penalty: None,
+        stop: None,
+        stream: false,
+        stream_options: None,
+        user: Some("agent-builder".to_string()),
+        response_format: None,
+        tools: None,
+        tool_choice: None,
+        n: None,
+        memory_options: None,
+        audio_input: None,
+    };
+    let result = ctx
+        .state
+        .router
+        .route_chat_completion(request, None, None)
+        .await
+        .map_err(|e| ProtocolError::internal(format!("builder assist LLM call failed: {e}")))?;
+    let raw = result
+        .response
+        .choices
+        .first()
+        .and_then(|c| c.message.content.as_ref())
+        .map(|content| match content {
+            MessageContent::Text(t) => t.clone(),
+            MessageContent::Parts(parts) => parts
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(""),
+        })
+        .unwrap_or_default();
+
+    // A malformed LLM reply is never a hard error: the raw text becomes the
+    // reply so the dashboard conversation can continue.
+    let parsed = extract_first_json_object(&raw)
+        .and_then(|block| serde_json::from_str::<serde_json::Value>(block).ok())
+        .filter(|v| v.is_object());
+    let result_value = match parsed {
+        Some(mut value) => {
+            if value.get("reply").and_then(|r| r.as_str()).is_none() {
+                value["reply"] = serde_json::Value::String(raw.clone());
+            }
+            if !value
+                .get("proposal")
+                .map(|p| p.is_object() || p.is_null())
+                .unwrap_or(false)
+            {
+                value["proposal"] = serde_json::Value::Null;
+            }
+            // Drop hallucinated tool names: only catalog tools or a whole-addon
+            // wildcard of an installed addon survive into the proposal.
+            if let Some(tools) = value
+                .get_mut("proposal")
+                .and_then(|p| p.get_mut("tools"))
+                .and_then(|t| t.as_array_mut())
+            {
+                tools.retain(|t| {
+                    t.as_str().is_some_and(|name| {
+                        valid_names.contains(name)
+                            || name
+                                .strip_suffix(".*")
+                                .is_some_and(|addon| valid_addon_ids.contains(addon))
+                    })
+                });
+            }
+            value
+        }
+        None => serde_json::json!({ "reply": raw, "proposal": null }),
+    };
+    let result_json = serde_json::to_string(&result_value)
+        .map_err(|e| ProtocolError::internal(format!("builder assist encode failed: {e}")))?;
+
+    Ok(MessageBody::AgentsBody(
+        tentaflow_protocol::AgentsPayload::BuilderAssistResponse(
+            tentaflow_protocol::AgentBuilderAssistResponse { result_json },
         ),
     ))
 }
@@ -10413,6 +10790,103 @@ pub async fn service_oauth_poll(
     let (status, account_label, error) =
         crate::services::backend::codex_oauth::poll(&payload.flow_id);
     poll_resp(status, account_label, error)
+}
+
+#[handler(variant = "ServiceAgentRequest", since = (1, 0))]
+#[policy(UserSession)]
+#[observed]
+pub async fn service_agent(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::ServiceBody(tentaflow_protocol::ServicePayload::ReqAgent(p)) => p.clone(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected ServicePayload::ReqAgent",
+            ))
+        }
+    };
+    let response = |result_json: String, error: Option<String>| {
+        Ok(MessageBody::ServiceBody(
+            tentaflow_protocol::ServicePayload::ResAgent(
+                tentaflow_protocol::ServiceAgentResponse {
+                    success: error.is_none(),
+                    result_json,
+                    error,
+                },
+            ),
+        ))
+    };
+    let is_admin = matches!(
+        &ctx.session,
+        SessionAuth::UserSession { role: Some(role), .. } if role == "admin"
+    );
+    // Driving or tearing down a login flow is an admin act: those sessions carry
+    // the operator's device code and vendor credentials.
+    let touches_auth_flow = matches!(
+        payload.operation.as_str(),
+        "session.input" | "session.close"
+    ) && serde_json::from_str::<serde_json::Value>(&payload.payload_json)
+        .ok()
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(|id| id.as_str())
+                .map(|id| id.starts_with("auth-"))
+        })
+        .unwrap_or(false);
+    if (payload.operation == "auth.start" || touches_auth_flow) && !is_admin {
+        return response(
+            String::new(),
+            Some("administrator_required_for_login".to_string()),
+        );
+    }
+    if let Some(target) = forward_target_node(ctx, &payload.node_id) {
+        let command = tentaflow_protocol::mesh::MeshCommandType::AgentRpc {
+            service_id: payload.service_id,
+            operation: payload.operation,
+            payload_json: payload.payload_json,
+        };
+        return match forward_command(ctx, target, command).await {
+            Ok(result) if result.ok => match result.payload {
+                tentaflow_protocol::mesh::MeshCommandResponsePayload::AgentRpcResult {
+                    result_json,
+                } => response(result_json, None),
+                _ => response(String::new(), Some("unexpected mesh response".to_string())),
+            },
+            Ok(result) => response(
+                String::new(),
+                result
+                    .error
+                    .or(Some("remote coding-agent request failed".to_string())),
+            ),
+            Err(error) => response(String::new(), Some(error)),
+        };
+    }
+    reject_ambiguous_local_service_action(ctx, &payload.node_id, payload.service_id)?;
+    let service = fetch_service_row(ctx, payload.service_id)?;
+    match crate::services::coding_agent::execute(
+        &service,
+        &payload.operation,
+        &payload.payload_json,
+    )
+    .await
+    {
+        Ok(result_json) => {
+            if payload.operation == "models.list" {
+                if let Err(error) = crate::services::coding_agent::sync_models(
+                    &ctx.state.db,
+                    &service,
+                    &result_json,
+                ) {
+                    return response(String::new(), Some(error));
+                }
+            }
+            response(result_json, None)
+        }
+        Err(error) => response(String::new(), Some(error)),
+    }
 }
 
 #[handler(variant = "ServiceVramHintRequest", since = (1, 0))]

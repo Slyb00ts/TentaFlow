@@ -46,6 +46,32 @@ impl CascadeComposer {
         ctx_tokens: &[u32],
         budget: usize,
     ) -> Result<(Vec<u32>, Vec<DraftSegment>)> {
+        if self.slots.len() == 1 {
+            let slot = &mut self.slots[0];
+            if slot.stats.is_sleeping() {
+                return Ok((Vec::new(), Vec::new()));
+            }
+            let kind = slot.proposer.kind();
+            let proposal = slot
+                .proposer
+                .propose(&SeqContext::new(ctx_tokens), budget)?;
+            if proposal.nodes().iter().any(|node| node.source != kind) {
+                return Err(ForgeError::Scheduler(format!(
+                    "speculative proposer '{}' returned a node with a different source",
+                    kind.as_str()
+                )));
+            }
+            let mut tokens = proposal.linear_tokens()?;
+            tokens.truncate(budget);
+            let segments = (!tokens.is_empty())
+                .then_some(DraftSegment {
+                    proposer_idx: 0,
+                    len: tokens.len(),
+                })
+                .into_iter()
+                .collect();
+            return Ok((tokens, segments));
+        }
         let mut extended = ctx_tokens.to_vec();
         let base = extended.len();
         let mut segments = Vec::new();

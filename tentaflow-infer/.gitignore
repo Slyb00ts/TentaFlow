@@ -8,3 +8,9 @@ test-models/
 # Throwaway experiment/benchmark working dirs (Modular clones, PTX probes, engine builds)
 scratch/
 kernels/mojo/scratch/
+target-amd/
+
+# Srodowisko Pythona wyroczni MLX (~400 MB). Trzyma sie poza repo dzis tylko
+# dlatego, ze venv sam wklada do siebie .gitignore z gwiazdka — to wlasnosc
+# Pythona, nie nasza decyzja, wiec zapisana wprost.
+tools/mlx-oracle/.venv/

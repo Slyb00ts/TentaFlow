@@ -159,7 +159,6 @@ pub struct DbCluster {
 pub struct DbClusterWithCounts {
     pub cluster: DbCluster,
     pub members_count: i64,
-    pub members_online: i64,
 }
 
 /// Czlonek klastra (node przypisany do klastra)
@@ -232,6 +231,10 @@ pub struct DbFlow {
     /// catalog (`/v1/models`, mesh `catalog.list`, GUI). Uniqueness is
     /// enforced in domain logic against aliases and service model names.
     pub published_model_name: Option<String>,
+    /// Platform-seeded flow — user handlers reject edit/delete/status changes.
+    /// Only platform seeding may set this; `FlowParams` deliberately has no
+    /// counterpart so the user create/update paths can never flip it.
+    pub is_system: bool,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -1361,6 +1364,7 @@ pub struct DbConversationMessage {
     pub seq: i64,
     pub role: String,
     pub content: Option<String>,
+    pub reasoning_content: Option<String>,
     /// JSON-encoded `Vec<LlmToolCall>` for assistant tool calls; NULL otherwise.
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<String>,
@@ -1379,6 +1383,7 @@ pub struct DbConversationMessage {
 pub struct NewConversationMessage<'a> {
     pub role: &'a str,
     pub content: Option<&'a str>,
+    pub reasoning_content: Option<&'a str>,
     pub tool_calls: Option<String>,
     pub tool_call_id: Option<&'a str>,
     pub name: Option<&'a str>,

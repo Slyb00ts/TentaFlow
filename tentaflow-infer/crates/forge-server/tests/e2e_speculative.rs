@@ -24,12 +24,12 @@ use std::time::{Duration, Instant};
 
 use forge_engine::kv::KvQuant;
 use forge_engine::model::ModelConfig;
+use forge_engine::sample::SamplingParams;
 use forge_engine::server::{
     spawn_engine_batched, EngineEvent, EngineHandle, EngineRequest, SpeculativeConfig,
 };
-use forge_engine::sample::SamplingParams;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_tokenize::Tokenizer;
 
@@ -52,11 +52,11 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
     let kv_page_size = 32;
     let kv_pages = 512;
     let desc = read_descriptor(&path).expect("read descriptor");
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 3 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, KvQuant::F16),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, KvQuant::F16, false).unwrap(),
             activations: 1 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -72,6 +72,8 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
         dev,
         &path,
         ModelConfig {
+            weight_spill_dir: None,
+            weight_host_budget: 0,
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,
@@ -80,6 +82,11 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
             // Speculation and the radix prefix cache both manage paged KV
             // ownership; the eligible speculative path requires prefix off.
             prefix_cache: false,
+            layer_range: None,
+            tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+            native_mtp: false,
+            nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+            nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,
         },
     )
     .expect("load model");
@@ -99,7 +106,10 @@ fn load_engine(spec: SpeculativeConfig) -> Option<Engine> {
 /// tokens, wall-clock). Greedy + deterministic, so text + token count together
 /// pin the exact token sequence.
 fn run(engine: &Engine, prompt: &str, max_tokens: usize) -> (String, u64, Duration) {
-    let prompt_tokens = engine.tokenizer.encode(prompt, true).expect("encode prompt");
+    let prompt_tokens = engine
+        .tokenizer
+        .encode(prompt, true)
+        .expect("encode prompt");
     let req = EngineRequest {
         prompt_tokens,
         max_tokens,
@@ -153,9 +163,8 @@ fn speculative_is_exact_and_faster_on_repetitive() {
     let (norm_text_off, norm_tok_off, norm_dt_off) = run(&off, NORMAL, NORMAL_MAX_TOKENS);
     drop(off); // worker thread ends when the last handle drops
 
-    let Some(on) = load_engine(
-        SpeculativeConfig::ngram(16).expect("budżet powinien być poprawny"),
-    ) else {
+    let Some(on) = load_engine(SpeculativeConfig::ngram(16).expect("budżet powinien być poprawny"))
+    else {
         return;
     };
     run(&on, REPETITIVE, 16);

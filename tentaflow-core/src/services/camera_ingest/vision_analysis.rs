@@ -86,45 +86,45 @@ pub(crate) async fn get_detector() -> Option<DetectorHandle> {
 }
 
 /// Handle to the process-wide classifier/OCR singletons. On the ort path
-/// (`inference-supertonic`) the runner is internally pooled + `&self` + Send+Sync,
+/// (`vision-ort`) the runner is internally pooled + `&self` + Send+Sync,
 /// so it is shared bare as `Arc<_>` and every crop rides the concurrency-safe ort
 /// pool off the single Burn/wgpu thread. On the Burn path the runner still needs
 /// the whole-process wgpu serialization, so it stays behind `Arc<Mutex<_>>` and
 /// callers funnel forwards through `burn_backend::run_blocking`.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type DetectorHandle = std::sync::Arc<RfDetrDetector>;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 pub(crate) type DetectorHandle = std::sync::Arc<Mutex<RfDetrDetector>>;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type ClassifierHandle = std::sync::Arc<StateClassifier>;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 pub(crate) type ClassifierHandle = std::sync::Arc<Mutex<StateClassifier>>;
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type OcrHandle = std::sync::Arc<PlateOcr>;
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 pub(crate) type OcrHandle = std::sync::Arc<Mutex<PlateOcr>>;
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
     std::sync::Arc::new(d)
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn wrap_detector(d: RfDetrDetector) -> DetectorHandle {
     std::sync::Arc::new(Mutex::new(d))
 }
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
     std::sync::Arc::new(c)
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn wrap_classifier(c: StateClassifier) -> ClassifierHandle {
     std::sync::Arc::new(Mutex::new(c))
 }
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn wrap_ocr(o: PlateOcr) -> OcrHandle {
     std::sync::Arc::new(o)
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 fn wrap_ocr(o: PlateOcr) -> OcrHandle {
     std::sync::Arc::new(Mutex::new(o))
 }
@@ -136,16 +136,16 @@ fn wrap_ocr(o: PlateOcr) -> OcrHandle {
 /// to RF-DETR-only (no vehicle boxes, every sign keeps `vehicle_id = 0`), never
 /// a crash. Only the ort path builds a real detector; the Burn path has no
 /// YOLOv8 vehicle graph, so it is always `None`.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) type VehicleHandle = std::sync::Arc<crate::vision::detector_vehicle::VehicleDetector>;
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 fn vehicle_detector() -> &'static OnceCell<Option<VehicleHandle>> {
     static VEHICLE: OnceCell<Option<VehicleHandle>> = OnceCell::const_new();
     &VEHICLE
 }
 
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 pub(crate) async fn get_vehicle_detector() -> Option<VehicleHandle> {
     vehicle_detector()
         .get_or_init(|| async {
@@ -319,7 +319,8 @@ fn crop_for_detection(
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
         feature = "inference-vision-gpu",
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     if let Some(dev) = frame_device {
         if let Some(out) = dev.crop_detection_rgb(x0, y0, cw, ch) {
@@ -520,6 +521,17 @@ const EXECUTOR_STALL_ERROR_AFTER: Duration = Duration::from_secs(30);
 /// Minimum spacing between repeated stall `error!` lines while still waiting.
 const EXECUTOR_STALL_ERROR_EVERY: Duration = Duration::from_secs(300);
 
+/// A detection forward that hangs (blocked on a lock/resource, GPU idle) leaves
+/// its job in `jobs`, and the per-camera ordering gate then blocks EVERY new
+/// frame of that camera until it clears — observed as a 2–4 min analysis outage
+/// (emitted+coalesced frozen, overlay blank). Nothing aborts a stuck
+/// `spawn_blocking`, so the loop force-evicts any job older than this, freeing the
+/// gate; a fresh forward spawns on a free inflight permit and analysis resumes in
+/// seconds. The evicted forward, when it finally returns, hits a missing job in
+/// `stage_completed` and is dropped. Chosen well above a normal forward (~20 ms)
+/// so healthy frames are never evicted.
+const FORWARD_STALL_TIMEOUT: Duration = Duration::from_secs(4);
+
 /// One registered camera's scheduling state inside the shared engine.
 struct CamSlot {
     /// Camera-level `cameras.analysis_fps` — the fallback cadence for frame
@@ -537,6 +549,12 @@ struct CamSlot {
     /// Last config warning already logged — resolve/parse failures repeat
     /// every recheck, so we warn once per DISTINCT message, not per tick.
     last_cfg_err: Option<String>,
+    /// Detection zones (`cameras.zones_json`), parsed into normalized polygons.
+    /// EMPTY = no zones = whole frame live. Shared with each frame job by
+    /// `Arc` clone so the hot path never re-parses or copies point data.
+    zones: Arc<Vec<Vec<(f32, f32)>>>,
+    /// Raw zones JSON of the parsed value — cheap change detection on recheck.
+    zones_raw: String,
 }
 
 /// Active-camera registry driven by the single engine task. Cameras join via
@@ -571,6 +589,8 @@ pub fn ensure_analysis(camera_id: &str) {
                     stage_due: HashMap::new(),
                     next_cfg_check: now,
                     last_cfg_err: None,
+                    zones: Arc::new(Vec::new()),
+                    zones_raw: String::new(),
                 },
             );
             info!("[vision_analysis] camera {camera_id} registered");
@@ -659,7 +679,9 @@ fn start_engine_once() {
 /// The pipeline result distinguishes "resolved to nothing" (`Ok(None)` — no
 /// pipeline exists at all, camera stops analyzing) from a resolve FAILURE
 /// (`Err` — DB error, keep the last good pipeline).
-async fn resolve_camera_config(camera_id: &str) -> (u32, Result<Option<(String, String)>, String>) {
+async fn resolve_camera_config(
+    camera_id: &str,
+) -> (u32, Result<Option<(String, String)>, String>, String) {
     let id = camera_id.to_string();
     tokio::task::spawn_blocking(move || match crate::db::global_pool() {
         Some(pool) => {
@@ -667,24 +689,102 @@ async fn resolve_camera_config(camera_id: &str) -> (u32, Result<Option<(String, 
                 .unwrap_or(DEFAULT_ANALYSIS_FPS);
             let pipeline = crate::db::repository::resolve_camera_cv_pipeline(&pool, &id)
                 .map_err(|e| e.to_string());
-            (fps, pipeline)
+            // Zones are advisory: a read failure must never stop analysis, it
+            // just means "no zones this tick" (whole frame stays live).
+            let zones = crate::db::repository::camera_zones_json(&pool, &id)
+                .unwrap_or_else(|_| "[]".to_string());
+            (fps, pipeline, zones)
         }
-        None => (DEFAULT_ANALYSIS_FPS, Err("no global DB pool".to_string())),
+        None => (
+            DEFAULT_ANALYSIS_FPS,
+            Err("no global DB pool".to_string()),
+            "[]".to_string(),
+        ),
     })
     .await
     .unwrap_or((
         DEFAULT_ANALYSIS_FPS,
         Err("camera config task panicked".to_string()),
+        "[]".to_string(),
     ))
 }
 
 /// Applies a freshly resolved camera config to the registry slot. Invalid or
 /// unresolvable pipelines never crash: a failure keeps the last good pipeline
 /// (warned once per distinct message), `Ok(None)` clears it (no analysis).
+/// Parses `cameras.zones_json` into normalized polygons. Shape:
+/// `[[[x,y],[x,y],...], ...]` with every coordinate in `0.0..=1.0`. Anything
+/// malformed is skipped rather than failing the camera — a bad zone must never
+/// take analysis down, it just does not constrain it. Polygons with fewer than
+/// three points cannot bound an area and are dropped.
+fn parse_zone_polygons(raw: &str) -> Vec<Vec<(f32, f32)>> {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return Vec::new();
+    };
+    let Some(list) = value.as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for poly in list {
+        let Some(points) = poly.as_array() else {
+            continue;
+        };
+        let mut pts: Vec<(f32, f32)> = Vec::with_capacity(points.len());
+        for p in points {
+            let Some(pair) = p.as_array() else { continue };
+            if pair.len() < 2 {
+                continue;
+            }
+            let (Some(x), Some(y)) = (pair[0].as_f64(), pair[1].as_f64()) else {
+                continue;
+            };
+            pts.push((x as f32, y as f32));
+        }
+        if pts.len() >= 3 {
+            out.push(pts);
+        }
+    }
+    out
+}
+
+/// Ray-casting point-in-polygon on normalized coordinates. Points exactly on an
+/// edge may land either way — irrelevant for a hand-drawn operator zone.
+fn point_in_polygon(x: f32, y: f32, poly: &[(f32, f32)]) -> bool {
+    let mut inside = false;
+    let n = poly.len();
+    let mut j = n - 1;
+    for i in 0..n {
+        let (xi, yi) = poly[i];
+        let (xj, yj) = poly[j];
+        if (yi > y) != (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi {
+            inside = !inside;
+        }
+        j = i;
+    }
+    inside
+}
+
+/// Keeps only detections whose box CENTRE falls inside at least one zone. With
+/// no zones every detection passes, so cameras without drawn zones behave
+/// exactly as before. Applied to the raw detector output — an out-of-zone box
+/// never reaches tracking, enrichment (OCR/classify), the overlay or the event
+/// recorder, so a zone also buys back the per-frame budget it excludes.
+fn retain_in_zones(dets: &mut Vec<Detection>, zones: &[Vec<(f32, f32)>]) {
+    if zones.is_empty() {
+        return;
+    }
+    dets.retain(|d| {
+        let cx = d.bbox[0] + d.bbox[2] * 0.5;
+        let cy = d.bbox[1] + d.bbox[3] * 0.5;
+        zones.iter().any(|p| point_in_polygon(cx, cy, p))
+    });
+}
+
 fn apply_camera_config(
     camera_id: &str,
     fps: u32,
     resolved: Result<Option<(String, String)>, String>,
+    zones_raw: String,
     now: std::time::Instant,
 ) {
     let mut reg = cameras().lock().unwrap();
@@ -692,6 +792,17 @@ fn apply_camera_config(
         return;
     };
     slot.fps = fps;
+    // Reparse zones only when the stored JSON actually changed — the recheck
+    // runs on every camera every few seconds.
+    if slot.zones_raw != zones_raw {
+        let parsed = parse_zone_polygons(&zones_raw);
+        info!(
+            "[vision_analysis] camera {camera_id}: {} detection zone(s) active",
+            parsed.len()
+        );
+        slot.zones = Arc::new(parsed);
+        slot.zones_raw = zones_raw;
+    }
     slot.next_cfg_check = now + CFG_RECHECK;
     let warn_changed = |slot: &mut CamSlot, msg: String| {
         if slot.last_cfg_err.as_deref() != Some(msg.as_str()) {
@@ -771,6 +882,10 @@ struct PendingItem {
 /// wiadomość overlay per przeanalizowana klatka.
 struct FrameJob {
     camera_id: String,
+    /// Detection zones of this camera at the moment the frame was queued.
+    /// EMPTY = whole frame live. Snapshotted per job so the hot path never
+    /// touches the camera registry lock.
+    zones: Arc<Vec<Vec<(f32, f32)>>>,
     frame: Arc<[u8]>,
     /// Zero-copy CROPS path ONLY: a DEVICE reference to the full-res NV12 frame.
     /// When `Some`, `frame` is EMPTY and enrichment cuts each detection's crop
@@ -804,7 +919,7 @@ struct FrameJob {
     #[cfg_attr(
         not(all(
             any(target_os = "linux", target_os = "windows"),
-            feature = "inference-supertonic"
+            feature = "vision-ort"
         )),
         allow(dead_code)
     )]
@@ -826,6 +941,13 @@ struct FrameJob {
     /// path do asocjacji znak→pojazd. Puste, gdy model pojazdow niedostepny
     /// (degradacja do RF-DETR-only).
     vehicles: Vec<Detection>,
+    /// Kiedy job trafił do `jobs` (in-flight). Bramka kolejności blokuje kolejne
+    /// klatki kamery, dopóki jej job tu wisi; gdy forward inferencji zawiśnie na
+    /// locku/zasobie, job nigdy się nie domyka i analiza kamery STOI na minuty.
+    /// Pętla po [`FORWARD_STALL_TIMEOUT`] siłą usuwa taki job — bramka się zwalnia
+    /// i analiza rusza w sekundę (zawieszony forward, gdy w końcu skończy, trafia
+    /// na brak joba w `stage_completed` i jest pomijany).
+    submitted_at: std::time::Instant,
 }
 
 /// Wynik jednego współbieżnego forwardu batcha zwrócony ze spawnowanego zadania
@@ -848,7 +970,7 @@ struct ForwardOutput {
 /// Górny limit współbieżnych forwardów. Odzwierciedla sufit puli sesji ort
 /// (`ort_common::MAX_SESSIONS_PER_MODEL` = 16) — więcej równoległych forwardów
 /// niż sesji nie ma sensu (i tak czekałyby na slot puli). Zdefiniowany lokalnie,
-/// bo pula ort istnieje tylko pod `inference-supertonic`, a ten limit musi
+/// bo pula ort istnieje tylko pod `vision-ort`, a ten limit musi
 /// obowiązywać na każdej ścieżce.
 const MAX_INFLIGHT: usize = 16;
 
@@ -874,7 +996,10 @@ fn resolve_inflight_limit(inflight: Option<usize>, detector_sessions: usize) -> 
 /// YUV→RGB matrix so one `detect_batch_gpu` call applies a single conversion).
 /// Without the ort GPU features NV12 frames are never produced, so every frame
 /// keys as RGB.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(all(
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+))]
 fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
     match fmt {
         super::fakefile::DetectFrameFormat::Rgb24 => None,
@@ -883,7 +1008,10 @@ fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u3
         } => Some((kr.to_bits(), kb.to_bits(), *full_range as u32)),
     }
 }
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(all(
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
+)))]
 fn detect_batch_key(_fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
     None
 }
@@ -891,7 +1019,7 @@ fn detect_batch_key(_fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u
 /// Sentinel batch key for the zero-copy DEVICE detect path — distinct from RGB
 /// (`None`) and any NV12 colorimetry key, so a device job never groups into an
 /// RGB/NV12 flush batch (its input is a preprocessed device tensor, not pixels).
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 const DEVICE_BATCH_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
 
 /// Job-level flush grouping key: the device sentinel when the job carries a
@@ -902,7 +1030,8 @@ const DEVICE_BATCH_KEY: (u32, u32, u32) = (u32::MAX, u32::MAX, u32::MAX);
 fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
     #[cfg(all(
         any(target_os = "linux", target_os = "windows"),
-        feature = "inference-supertonic"
+        feature = "vision-ort",
+        feature = "vision-cuda-preprocess"
     ))]
     if job.detect_device.is_some() {
         return Some(DEVICE_BATCH_KEY);
@@ -915,7 +1044,8 @@ fn job_batch_key(job: &FrameJob) -> Option<(u32, u32, u32)> {
 /// dims. Owned (Arc-cloned) so the spawned forward can outlive the loop tick.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 #[derive(Clone)]
 struct Nv12DetectInput {
@@ -931,7 +1061,8 @@ struct Nv12DetectInput {
 /// YUV→RGB coefficients for an NV12 detect frame, or `None` for RGB.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 fn nv12_color(
     fmt: &super::fakefile::DetectFrameFormat,
@@ -955,7 +1086,8 @@ fn nv12_color(
 /// the executor's Detect op so `apply_forward_result` treats both paths alike.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 async fn run_nv12_detect_forward(
     frames: Vec<Nv12DetectInput>,
@@ -1008,7 +1140,8 @@ async fn run_nv12_detect_forward(
 /// concatenated ORT input; the batch just amortizes the loop bookkeeping.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 async fn run_device_detect_forward(
     handles: Vec<super::fakefile::DeviceDetectTensor>,
@@ -1051,7 +1184,8 @@ async fn run_device_detect_forward(
 /// vehicle detection can NEVER block or fail the primary detection.
 #[cfg(all(
     any(target_os = "linux", target_os = "windows"),
-    feature = "inference-supertonic"
+    feature = "vision-ort",
+    feature = "vision-cuda-preprocess"
 ))]
 async fn run_nv12_vehicle_forward(
     frames: Vec<Nv12DetectInput>,
@@ -1095,7 +1229,7 @@ async fn run_nv12_vehicle_forward(
 /// zero-copy path has no YOLO-usable pixels — its `OwnedDeviceTensor` is already
 /// RF-DETR-normalized at 560 — so the launcher passes the full-res RGB `frame`
 /// here instead). Same degrade-to-empty guard as the NV12 path.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn run_rgb_vehicle_forward(frames: Vec<CvFrameLocal>) -> Vec<Vec<Detection>> {
     let n = frames.len();
     if n == 0 {
@@ -1300,6 +1434,36 @@ async fn engine_loop() {
     loop {
         let now = std::time::Instant::now();
 
+        // Anti-stall: force-evict any job whose forward has been in flight past
+        // FORWARD_STALL_TIMEOUT. A hung forward otherwise keeps the job in `jobs`,
+        // and the ordering gate below (`jobs.values().any(camera_id == id)`) then
+        // blocks every new frame of that camera indefinitely — the multi-minute
+        // "analysis stopped, overlay blank" outage. Evicting frees the gate; the
+        // next iteration spawns a fresh forward on a free inflight permit.
+        {
+            let stale: Vec<(u64, String, Vec<String>, u64)> = jobs
+                .iter()
+                .filter(|(_, j)| now.duration_since(j.submitted_at) >= FORWARD_STALL_TIMEOUT)
+                .map(|(id, j)| {
+                    (
+                        *id,
+                        j.camera_id.clone(),
+                        j.open_stages.clone(),
+                        now.duration_since(j.submitted_at).as_millis() as u64,
+                    )
+                })
+                .collect();
+            for (job_id, cam, open, age_ms) in stale {
+                tracing::error!(
+                    camera_id = %cam,
+                    age_ms,
+                    open_stages = ?open,
+                    "[vision_analysis] forward stalled — evicting job to unblock the camera (a detection forward hung on a lock/resource; ordering gate was blocking every new frame)"
+                );
+                jobs.remove(&job_id);
+            }
+        }
+
         // Graceful shutdown (drain): dokończ WSZYSTKIE trwające forwardy —
         // awaitem, nie abortem — aplikując ich wyniki (finalne publikacje), po
         // czym wyjdź. Abort anulowałby tylko async-task; biegnący `spawn_blocking`
@@ -1331,7 +1495,12 @@ async fn engine_loop() {
         // Collect due (camera, frame-stage) pairs + which cameras need a config
         // re-read (no DB under the lock). Also track the soonest upcoming
         // deadline so an idle wait sleeps exactly until the next stage is due.
-        let mut due: Vec<(String, Arc<CvPipeline>, Vec<String>)> = Vec::new();
+        let mut due: Vec<(
+            String,
+            Arc<CvPipeline>,
+            Vec<String>,
+            Arc<Vec<Vec<(f32, f32)>>>,
+        )> = Vec::new();
         let mut recheck: Vec<String> = Vec::new();
         let mut earliest_next: Option<std::time::Instant> = None;
         {
@@ -1361,7 +1530,7 @@ async fn engine_loop() {
                     }
                 }
                 if !due_stages.is_empty() {
-                    due.push((id.clone(), pipeline.clone(), due_stages));
+                    due.push((id.clone(), pipeline.clone(), due_stages, slot.zones.clone()));
                 }
             }
         }
@@ -1370,8 +1539,8 @@ async fn engine_loop() {
         // BEFORE the executor gate, so pipelines keep refreshing while the
         // engine waits — the moment the slot arrives, analysis starts instantly.
         for id in &recheck {
-            let (fps, resolved) = resolve_camera_config(id).await;
-            apply_camera_config(id, fps, resolved, now);
+            let (fps, resolved, zones_raw) = resolve_camera_config(id).await;
+            apply_camera_config(id, fps, resolved, zones_raw, now);
         }
 
         // Etapy rozwiązują modele TYLKO przez executor — pusty slot (bootstrap,
@@ -1412,7 +1581,7 @@ async fn engine_loop() {
         // na wlasciwej klatce. Jedna kamera pobiera JEDNĄ klatkę per tick —
         // wszystkie jej due-etapy analizują TĘ SAMĄ klatkę (wspólny FrameJob),
         // więc ich wyniki scala jedna publikacja.
-        for (id, pipeline, due_stages) in &due {
+        for (id, pipeline, due_stages, zones) in &due {
             // Ordering gate: jedna klatka w locie per KAMERA (przez wszystkie
             // etapy). Szybszy etap nie może otworzyć joba dla captured_ms T+1,
             // dopóki wieloetapowy job T jest otwarty — inaczej starszy merge
@@ -1473,6 +1642,7 @@ async fn engine_loop() {
                 job_id,
                 FrameJob {
                     camera_id: id.clone(),
+                    zones: zones.clone(),
                     frame: crops,
                     frame_device: crops_device,
                     w,
@@ -1491,6 +1661,7 @@ async fn engine_loop() {
                     detect_ms_total: 0,
                     failed_stages: 0,
                     vehicles: Vec::new(),
+                    submitted_at: now,
                 },
             );
         }
@@ -1499,7 +1670,7 @@ async fn engine_loop() {
         // camera-level analysis_fps when the stage does not set one).
         {
             let mut reg = cameras().lock().unwrap();
-            for (id, pipeline, due_stages) in &due {
+            for (id, pipeline, due_stages, _zones) in &due {
                 if let Some(slot) = reg.get_mut(id) {
                     for sid in due_stages {
                         let Some(stage) = pipeline.stages.iter().find(|s| &s.stage_id == sid)
@@ -1596,15 +1767,24 @@ async fn engine_loop() {
         });
         // A homogeneous batch is device (zero-copy), NV12 (download preprocess) or
         // RGB (executor). Device jobs carry the sentinel key so they never mix.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(all(
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
+        ))]
         let batch_is_device = matches!(target_key, Some(Some(k)) if k == DEVICE_BATCH_KEY);
         #[allow(unused_variables)]
         let batch_is_nv12 = matches!(target_key, Some(Some(_))) && {
-            #[cfg(feature = "inference-supertonic")]
+            #[cfg(all(
+                feature = "vision-ort",
+                feature = "vision-cuda-preprocess"
+            ))]
             {
                 !batch_is_device
             }
-            #[cfg(not(feature = "inference-supertonic"))]
+            #[cfg(not(all(
+                feature = "vision-ort",
+                feature = "vision-cuda-preprocess"
+            )))]
             {
                 true
             }
@@ -1626,7 +1806,8 @@ async fn engine_loop() {
         // handles it identically to every other detect path.
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         if batch_is_device {
             let mut handles: Vec<super::fakefile::DeviceDetectTensor> =
@@ -1683,7 +1864,8 @@ async fn engine_loop() {
         // `resolve_ingest_path` / `nv12_detect_bench_enabled`).
         #[cfg(all(
             any(target_os = "linux", target_os = "windows"),
-            feature = "inference-supertonic"
+            feature = "vision-ort",
+            feature = "vision-cuda-preprocess"
         ))]
         if batch_is_nv12 {
             let color = batch
@@ -1794,7 +1976,7 @@ async fn engine_loop() {
         // Vehicle detector runs on a CLONE of the SAME detect frames (Arc-cheap),
         // concurrently with the executor detect (own ort pool). Only on the ort
         // path — the Burn path has no YOLOv8 vehicle graph.
-        #[cfg(feature = "inference-supertonic")]
+        #[cfg(feature = "vision-ort")]
         let vehicle_frames = frames.clone();
         let handle = forwards.spawn(async move {
             // Permit trzymany przez CAŁY forward — dropuje się z zadaniem (koniec
@@ -1808,7 +1990,7 @@ async fn engine_loop() {
             // swiezy kontekst per wywolanie (jak w vision_impl).
             let mut ctx = RuntimeContext::new(None);
             let detect_start = Instant::now();
-            #[cfg(feature = "inference-supertonic")]
+            #[cfg(feature = "vision-ort")]
             let (outcome, vehicles) = tokio::join!(
                 async {
                     executor_task
@@ -1818,7 +2000,7 @@ async fn engine_loop() {
                 },
                 run_rgb_vehicle_forward(vehicle_frames),
             );
-            #[cfg(not(feature = "inference-supertonic"))]
+            #[cfg(not(feature = "vision-ort"))]
             let (outcome, vehicles) = (
                 executor_task
                     .execute_camera_cv(request, &mut ctx)
@@ -1861,6 +2043,9 @@ fn stage_completed(
     // track_id (== its vehicle_id for association). Attached to the job; the last
     // detect stage of a multi-stage frame wins (all share the frame).
     if let Some(mut veh) = vehicles {
+        // Zones gate the WHOLE frame: a vehicle outside every drawn zone is not
+        // detected at all — no track, no overlay box, no event, no reads.
+        retain_in_zones(&mut veh, &job.zones);
         if !veh.is_empty() {
             tracker::update(
                 &tracker::key(&job.camera_id, "vehicles"),
@@ -1872,6 +2057,9 @@ fn stage_completed(
     }
     match outcome {
         Some((mut dets, detect_ms)) => {
+            // Same gate for signs/plates: out-of-zone detections never reach the
+            // tracker, enrichment (OCR/classify), the overlay or the recorder.
+            retain_in_zones(&mut dets, &job.zones);
             // Tracker IOU per (kamera, etap detekcji): nadaje stabilne `track_id`
             // + prędkość (vx,vy) KAŻDEJ detekcji przed publikacją, tak by FAZA 1
             // i FAZA 2 niosly juz spojne identyfikatory sledzenia.
@@ -1962,6 +2150,71 @@ fn synthesize_forced_detections(pipeline: &CvPipeline, captured_ms: u64) -> Vec<
         .collect()
 }
 
+/// Per-camera motion estimator state (previous luma for directional flow). Held
+/// process-wide because `finalize_job` is stateless per call. The map lock is held
+/// only to fetch/insert the `Arc`; the estimate itself runs on the per-camera mutex.
+fn motion_estimators() -> &'static Mutex<HashMap<String, Arc<Mutex<super::motion::MotionEstimator>>>>
+{
+    static M: OnceLock<Mutex<HashMap<String, Arc<Mutex<super::motion::MotionEstimator>>>>> =
+        OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Directional zone motion for this frame, converted to the always-compiled wire
+/// type. Non-moving default when no host luma is available (device zero-copy path)
+/// or the frame is malformed. NV12 uses the Y plane directly; RGB24 is converted to
+/// luma once (BT.601 integer approximation).
+fn compute_zone_motion(
+    camera_id: &str,
+    frame: &[u8],
+    format: &super::fakefile::DetectFrameFormat,
+    w: u32,
+    h: u32,
+    zones: &[Vec<(f32, f32)>],
+) -> detection_bus::MotionSignal {
+    use super::fakefile::DetectFrameFormat;
+    if frame.is_empty() || w == 0 || h == 0 {
+        return detection_bus::MotionSignal::default();
+    }
+    let (luma, y_stride, y_offset): (std::borrow::Cow<[u8]>, u32, u32) = match *format {
+        DetectFrameFormat::Nv12 {
+            y_stride, y_offset, ..
+        } => (std::borrow::Cow::Borrowed(frame), y_stride, y_offset),
+        DetectFrameFormat::Rgb24 => {
+            let n = w as usize * h as usize;
+            if frame.len() < n * 3 {
+                return detection_bus::MotionSignal::default();
+            }
+            let mut y = vec![0u8; n];
+            for (i, px) in y.iter_mut().enumerate() {
+                let p = i * 3;
+                *px = ((77 * frame[p] as u32
+                    + 150 * frame[p + 1] as u32
+                    + 29 * frame[p + 2] as u32)
+                    >> 8) as u8;
+            }
+            (std::borrow::Cow::Owned(y), w, 0)
+        }
+    };
+    let est = {
+        let mut map = motion_estimators().lock().unwrap();
+        map.entry(camera_id.to_string())
+            .or_insert_with(|| Arc::new(Mutex::new(super::motion::MotionEstimator::new())))
+            .clone()
+    };
+    let sig = est
+        .lock()
+        .unwrap()
+        .estimate(&luma, w, h, y_stride, y_offset, zones);
+    detection_bus::MotionSignal {
+        moving: sig.moving,
+        dir_x: sig.dir_x,
+        magnitude: sig.magnitude,
+        centroid_x: sig.centroid_x,
+        coherence: sig.coherence,
+    }
+}
+
 /// Finalizacja klatki po domknięciu wszystkich jej etapów `frame`: scala wyniki
 /// etapów w JEDNĄ publikację overlay (FAZA 1, kolejność etapów pipeline'u) i —
 /// dla niepustych zestawów — oddaje ramkę do cold path (FAZA 2, wzbogacenie).
@@ -1999,6 +2252,16 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
     // rysuje ramki cieżarowek), NIE do `merged` uzytego do sygnatury/eventu.
     let mut overlay = merged.clone();
     overlay.extend(job.vehicles.iter().cloned());
+    // Directional zone motion for this frame — the event recorder's trigger. Runs
+    // on the host luma; the device zero-copy path yields a non-moving default.
+    let motion = compute_zone_motion(
+        &job.camera_id,
+        &job.frame,
+        &job.frame_format,
+        job.w,
+        job.h,
+        &job.zones,
+    );
     detection_bus::publish_detections(
         &job.camera_id,
         job.captured_ms,
@@ -2009,6 +2272,7 @@ fn finalize_job(mut job: FrameJob, cold: &mpsc::Sender<DetectionEvent>) {
         // these (they would flood the unassigned `vehicle_id = 0` bucket).
         false,
         overlay,
+        motion,
     );
     // Pusty zestaw nie wymaga wzbogacenia: FAZA 1 juz wyczyscila overlay. Sam
     // pojazd bez znaku/tablicy NIE tworzy eventu (trigger to detekcje RF-DETR).
@@ -2434,6 +2698,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
             .await;
             let enrich_ms = enrich_start.elapsed().as_millis() as u32;
             let proc_ms = detect_ms + enrich_ms;
+            // Feed the ingest session's periodic metrics line — these timings are
+            // otherwise measured and thrown away.
+            super::stage_metrics::record(&camera_id, detect_ms, enrich_ms);
             // Enriched signs now carry `vehicle_id`. Publish them WITH the vehicle
             // boxes (self-assigned vehicle_id) so the event recorder groups per
             // truck and the overlay keeps drawing vehicle rectangles.
@@ -2454,6 +2721,9 @@ async fn cold_consumer(mut rx: mpsc::Receiver<DetectionEvent>) {
                 // this is the ONLY publish the event recorder buckets per vehicle.
                 true,
                 merged.clone(),
+                // Motion is estimated once per frame on the hot FAZA 1 publish; the
+                // cold FAZA 2 republish of the same frame carries no fresh signal.
+                detection_bus::MotionSignal::default(),
             );
             if !merged.is_empty() {
                 if let (Some(flow_id), Some(disp)) = (
@@ -2674,6 +2944,7 @@ fn publish_flow_detections(
         // no vehicle association), so it feeds the overlay only — never bucketing.
         false,
         enriched.unwrap_or(original),
+        detection_bus::MotionSignal::default(),
     );
 }
 
@@ -3283,12 +3554,126 @@ fn assign_vehicle(sign_bbox: &[f32; 4], vehicles: &[VehicleBox]) -> u32 {
 fn stamp_vehicle_ids(stage_dets: &mut [(String, Vec<Detection>)], vehicles: &[VehicleBox]) {
     for (_, dets) in stage_dets.iter_mut() {
         for det in dets.iter_mut() {
-            if det.klasa == crate::vision::detector_vehicle::VEHICLE_CLASS {
+            if det.klasa == "vehicle" {
                 det.vehicle_id = det.track_id;
                 continue;
             }
             det.vehicle_id = assign_vehicle(&det.bbox, vehicles);
         }
+    }
+}
+
+/// A cold stage resolved to its parent detections and pre-cut crops, ready for a
+/// batched forward. Built in one sequential pass so the forward (phase 2) borrows
+/// nothing from `stage_dets` (`items` owns index + crop) and independent stages
+/// overlap; results are applied back in pipeline order (phase 3).
+struct ColdStagePlan {
+    /// Detect-stage id whose `stage_dets` entry holds the parent detections.
+    parent: String,
+    stage_id: String,
+    op: CvOp,
+    ocr_mode: CvOcrMode,
+    model: String,
+    output: Option<CvStageOutput>,
+    /// Local batchable engine alias when the model resolves to one, else `None`
+    /// (mesh/remote/onnx-cv → per-crop executor fallback).
+    engine: Option<String>,
+    /// `(detection index in parent dets, crop, crop_w, crop_h, class)` per crop.
+    items: Vec<(usize, Arc<[u8]>, u32, u32, String)>,
+}
+
+/// Runs ONE cold stage's batched forward over its pre-cut crops and returns a
+/// `CachedEnrich` per crop (order == `items`). Touches no shared detection state,
+/// so several stages' forwards overlap via `join_all`; the caller applies the
+/// results sequentially in pipeline order. Batchowana sciezka lokalna dla znanych
+/// silnikow; kazdy inny przypadek (w tym zwrot None / niezgodna dlugosc batcha)
+/// schodzi na per-crop fallback, wiec porazka batcha nigdy cicho nie gubi
+/// wzbogacenia.
+async fn cold_stage_forward(
+    executor: &Arc<ModelRuntimeExecutor>,
+    model: &str,
+    op: CvOp,
+    ocr_mode: &CvOcrMode,
+    engine: Option<&str>,
+    items: &[(usize, Arc<[u8]>, u32, u32, String)],
+    crops: &[(Arc<[u8]>, u32, u32)],
+) -> Vec<CachedEnrich> {
+    match (op, engine) {
+        (CvOp::Classify, Some("nalepka-stan")) => match classify_batch_local(crops).await {
+            Some(labels) if labels.len() == crops.len() => labels
+                .into_iter()
+                .map(|stan| CachedEnrich {
+                    stan,
+                    tekst: None,
+                    tekst_conf: None,
+                    tekst_votes: Vec::new(),
+                    at: Instant::now(),
+                })
+                .collect(),
+            _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+        },
+        (CvOp::Ocr, Some("plate-ocr"))
+            if matches!(ocr_mode, CvOcrMode::Plate | CvOcrMode::Generic) =>
+        {
+            match read_batch_local(crops).await {
+                Some(reads) if reads.len() == crops.len() => reads
+                    .into_iter()
+                    .map(|(tekst, conf)| CachedEnrich {
+                        stan: Vec::new(),
+                        tekst_conf: tekst.as_ref().map(|_| conf),
+                        tekst,
+                        tekst_votes: Vec::new(),
+                        at: Instant::now(),
+                    })
+                    .collect(),
+                _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+            }
+        }
+        // ADR placards: submit every crop to the cross-camera ADR batcher — the
+        // rows of ALL placards (from all cameras) run as ONE forward instead of one
+        // tiny 2-row forward per placard. A crop the CRNN could not read (or whose
+        // UN failed the `snap_adr` catalog snap) keeps today's per-crop executor
+        // path, which retries the CRNN and then falls back to PP-OCRv5 — exactly
+        // `ocr_adr_local`'s semantics, so no read is ever lost to batching.
+        #[cfg(all(
+            feature = "vision-ort",
+            not(any(target_os = "macos", target_os = "ios"))
+        ))]
+        (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
+            match adr_batch_local(crops).await {
+                Some(reads) if reads.len() == crops.len() => {
+                    let mut outputs: Vec<CachedEnrich> = reads
+                        .into_iter()
+                        .map(|(tekst, conf)| CachedEnrich {
+                            stan: Vec::new(),
+                            tekst_conf: tekst.as_ref().map(|_| conf),
+                            tekst,
+                            tekst_votes: Vec::new(),
+                            at: Instant::now(),
+                        })
+                        .collect();
+                    let missed: Vec<usize> = outputs
+                        .iter()
+                        .enumerate()
+                        .filter(|(_, o)| o.tekst.is_none())
+                        .map(|(i, _)| i)
+                        .collect();
+                    if !missed.is_empty() {
+                        let missed_items: Vec<_> =
+                            missed.iter().map(|&i| items[i].clone()).collect();
+                        let fallback =
+                            cold_stage_per_crop(executor, model, op, ocr_mode.clone(), &missed_items)
+                                .await;
+                        for (&i, value) in missed.iter().zip(fallback) {
+                            outputs[i] = value;
+                        }
+                    }
+                    outputs
+                }
+                _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
+            }
+        }
+        _ => cold_stage_per_crop(executor, model, op, ocr_mode.clone(), items).await,
     }
 }
 
@@ -3331,6 +3716,15 @@ async fn run_cold_stages(
             det.tekst = None;
         }
     }
+    // PHASE 1 (sequential, cheap): resolve each enabled cold stage to its parent
+    // detections and cut every matching crop. Reads `stage_dets` immutably. The
+    // produced `items` own their (index + crop) data, so the forwards in phase 2
+    // borrow nothing from `stage_dets` and can overlap. The pipeline validator's
+    // depth-2 invariant (`cv_pipeline::validate`: a crop stage may only hang off a
+    // detect/frame stage, never another crop stage) guarantees no cold stage reads
+    // another cold stage's output — the crops select on `bbox`/`klasa`/`track_id`,
+    // which cold stages never write — so the stages are provably independent.
+    let mut plans: Vec<ColdStagePlan> = Vec::new();
     for stage in cv_pipeline::cold_stages(pipeline) {
         let CvStageInput::Stage {
             stage_id: parent,
@@ -3364,7 +3758,7 @@ async fn run_cold_stages(
             "plate" => CvOcrMode::Plate,
             _ => CvOcrMode::Generic,
         };
-        let Some((_, dets)) = stage_dets.iter_mut().find(|(sid, _)| sid == parent) else {
+        let Some((_, dets)) = stage_dets.iter().find(|(sid, _)| sid == parent) else {
             continue;
         };
         // Zbierz WSZYSTKIE pasujace klasami detekcje tego etapu w JEDNA liste
@@ -3404,130 +3798,75 @@ async fn run_cold_stages(
             let mut ctx = RuntimeContext::new(None);
             executor.local_camera_cv_engine(&stage.model, &mut ctx)
         };
-        let crops: Vec<(Arc<[u8]>, u32, u32)> = items
+        plans.push(ColdStagePlan {
+            parent: parent.clone(),
+            stage_id: stage.stage_id.clone(),
+            op,
+            ocr_mode,
+            model: stage.model.clone(),
+            output: stage.output,
+            engine,
+            items,
+        });
+    }
+
+    // PHASE 2 (concurrent, expensive): overlap the independent stage forwards.
+    // OCR now dominates the cold path (enrich_ms≈70-86 vs detect_ms≈18-32) and the
+    // plate-OCR / ADR-OCR / classify stages operate on disjoint crops with no data
+    // dependency, so their batched forwards run at max(stage) latency instead of
+    // sum(stages). Each forward carries owned `items`/`crops` and touches no shared
+    // detection state; the process-wide batchers are built for concurrent submit.
+    let forwards = plans.iter().map(|plan| {
+        let executor = executor.clone();
+        let crops: Vec<(Arc<[u8]>, u32, u32)> = plan
+            .items
             .iter()
             .map(|(_, crop, cw, ch, _)| (crop.clone(), *cw, *ch))
             .collect();
+        async move {
+            cold_stage_forward(
+                &executor,
+                &plan.model,
+                plan.op,
+                &plan.ocr_mode,
+                plan.engine.as_deref(),
+                &plan.items,
+                &crops,
+            )
+            .await
+        }
+    });
+    let all_outputs: Vec<Vec<CachedEnrich>> = futures::future::join_all(forwards).await;
 
-        // Wynik per crop (kolejnosc == kolejnosc `items`). Batchowana sciezka
-        // lokalna dla znanych silnikow; kazdy inny przypadek (w tym zwrot None /
-        // niezgodna dlugosc batcha) schodzi na per-crop fallback, wiec porazka
-        // batcha nigdy cicho nie gubi wzbogacenia.
-        let outputs: Vec<CachedEnrich> = match (op, engine.as_deref()) {
-            (CvOp::Classify, Some("nalepka-stan")) => match classify_batch_local(&crops).await {
-                Some(labels) if labels.len() == crops.len() => labels
-                    .into_iter()
-                    .map(|stan| CachedEnrich {
-                        stan,
-                        tekst: None,
-                        tekst_conf: None,
-                        tekst_votes: Vec::new(),
-                        at: Instant::now(),
-                    })
-                    .collect(),
-                _ => {
-                    cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await
-                }
-            },
-            (CvOp::Ocr, Some("plate-ocr"))
-                if matches!(ocr_mode, CvOcrMode::Plate | CvOcrMode::Generic) =>
-            {
-                match read_batch_local(&crops).await {
-                    Some(reads) if reads.len() == crops.len() => reads
-                        .into_iter()
-                        .map(|(tekst, conf)| CachedEnrich {
-                            stan: Vec::new(),
-                            tekst_conf: tekst.as_ref().map(|_| conf),
-                            tekst,
-                            tekst_votes: Vec::new(),
-                            at: Instant::now(),
-                        })
-                        .collect(),
-                    _ => {
-                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
-                            .await
-                    }
-                }
-            }
-            // ADR placards: submit every crop to the cross-camera ADR batcher —
-            // the rows of ALL placards (from all cameras) run as ONE forward
-            // instead of one tiny 2-row forward per placard. A crop the CRNN
-            // could not read (or whose UN failed the `snap_adr` catalog snap)
-            // keeps today's per-crop executor path, which retries the CRNN and
-            // then falls back to PP-OCRv5 — exactly `ocr_adr_local`'s
-            // semantics, so no read is ever lost to batching.
-            #[cfg(all(
-                feature = "inference-supertonic",
-                not(any(target_os = "macos", target_os = "ios"))
-            ))]
-            (CvOp::Ocr, Some("plate-ocr")) if matches!(ocr_mode, CvOcrMode::Adr) => {
-                match adr_batch_local(&crops).await {
-                    Some(reads) if reads.len() == crops.len() => {
-                        let mut outputs: Vec<CachedEnrich> = reads
-                            .into_iter()
-                            .map(|(tekst, conf)| CachedEnrich {
-                                stan: Vec::new(),
-                                tekst_conf: tekst.as_ref().map(|_| conf),
-                                tekst,
-                                tekst_votes: Vec::new(),
-                                at: Instant::now(),
-                            })
-                            .collect();
-                        let missed: Vec<usize> = outputs
-                            .iter()
-                            .enumerate()
-                            .filter(|(_, o)| o.tekst.is_none())
-                            .map(|(i, _)| i)
-                            .collect();
-                        if !missed.is_empty() {
-                            let missed_items: Vec<_> =
-                                missed.iter().map(|&i| items[i].clone()).collect();
-                            let fallback = cold_stage_per_crop(
-                                &executor,
-                                &stage.model,
-                                op,
-                                ocr_mode.clone(),
-                                &missed_items,
-                            )
-                            .await;
-                            for (&i, value) in missed.iter().zip(fallback) {
-                                outputs[i] = value;
-                            }
-                        }
-                        outputs
-                    }
-                    _ => {
-                        cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items)
-                            .await
-                    }
-                }
-            }
-            _ => cold_stage_per_crop(&executor, &stage.model, op, ocr_mode.clone(), &items).await,
+    // PHASE 3 (sequential, cheap): apply each stage's results IN PIPELINE ORDER so
+    // OCR vote histograms, thumbnail throttles and `stan` extends stay byte-for-byte
+    // identical to the pre-concurrency sequential path. Naloz wyniki na wlasciwe
+    // detekcje po indeksie z `items` (bez pomieszania cropow). OCR: glosowanie
+    // temporalne per track stabilizuje chwiejny znak (surowy odczyt wciela sie do
+    // histogramu, `det.tekst` = zwyciezca); track bez id (track_id=0) emituje
+    // surowy odczyt wprost. Classify: `stan` przypisany od zera, bez cache-put.
+    for (plan, outputs) in plans.iter().zip(all_outputs) {
+        let Some((_, dets)) = stage_dets.iter_mut().find(|(sid, _)| sid == &plan.parent) else {
+            continue;
         };
-
-        // Naloz wyniki na wlasciwe detekcje po indeksie z `items` (bez pomieszania
-        // cropow). OCR: glosowanie temporalne per track stabilizuje chwiejny znak
-        // (surowy odczyt wciela sie do histogramu, `det.tekst` = zwyciezca); track
-        // bez id (track_id=0) emituje surowy odczyt wprost. Classify: `stan`
-        // przypisany od zera, bez cache-put (kazda klatka czyta na nowo).
-        let (min_conf, min_agreement) = ocr_gate_thresholds(&ocr_mode);
+        let (min_conf, min_agreement) = ocr_gate_thresholds(&plan.ocr_mode);
         // Key thumbnail throttling by the READ MODE (plate vs adr) so a plate and
         // an ADR read on the same track_id keep independent best-confidence
         // baselines and each produces its own scene thumbnail.
-        let thumb_mode_key = match ocr_mode {
+        let thumb_mode_key = match &plan.ocr_mode {
             CvOcrMode::Adr => "adr",
             CvOcrMode::Plate | CvOcrMode::Generic => "plate",
         };
         // Lazily built full-scene RGB frame (whole camera image), produced at most
         // once per stage and only when a capture actually fires — the NV12
         // download/convert on the zero-copy path is not free.
-        for ((idx, _, _, _, _), value) in items.iter().zip(outputs) {
+        for ((idx, _, _, _, _), value) in plan.items.iter().zip(outputs) {
             let det = &mut dets[*idx];
-            if op == CvOp::Ocr && det.track_id > 0 {
+            if plan.op == CvOp::Ocr && det.track_id > 0 {
                 let read = value.tekst.map(|t| (t, value.tekst_conf.unwrap_or(0.0)));
                 let (tekst, conf) = enrich_cache_vote_ocr(
                     camera_id,
-                    &stage.stage_id,
+                    &plan.stage_id,
                     det.track_id,
                     read,
                     min_conf,
@@ -3552,7 +3891,7 @@ async fn run_cold_stages(
                 det.tekst = tekst;
                 det.tekst_conf = conf;
             } else {
-                apply_stage_output(det, stage.output, &value);
+                apply_stage_output(det, plan.output, &value);
             }
         }
     }
@@ -3686,7 +4025,7 @@ const EXECUTOR_READ_CONFIDENCE: f32 = 1.0;
 /// per-camera batch-1. `None` (batcher unavailable / any per-crop error) →
 /// caller drops to the per-crop fallback (never loses enrichment). The blocking
 /// `submit_all` runs on the blocking pool, off the tokio worker.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec<String>>> {
     let batcher = crate::vision::inference_batcher::state_batcher().await?;
     let crops = crops.to_vec();
@@ -3712,7 +4051,7 @@ async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec
 
 /// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
 /// + `Mutex` (jak `classify_local`); `classify_batch` sam petli po cropach.
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec<String>>> {
     let classifier = get_classifier().await?;
     let crops = crops.to_vec();
@@ -3739,7 +4078,7 @@ async fn classify_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<Vec
 /// into one big `PlateOcr::read_batch` forward instead of a tiny per-camera
 /// batch-1. `None` (batcher unavailable / any per-crop error) → caller drops to
 /// the per-crop fallback. `submit_all` blocks on the blocking pool.
-#[cfg(feature = "inference-supertonic")]
+#[cfg(feature = "vision-ort")]
 async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let batcher = crate::vision::inference_batcher::plate_batcher().await?;
     let crops = crops.to_vec();
@@ -3774,7 +4113,7 @@ async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option
 /// per-crop for the whole stage (never loses enrichment). `submit_all` blocks
 /// on the blocking pool, off the tokio worker.
 #[cfg(all(
-    feature = "inference-supertonic",
+    feature = "vision-ort",
     not(any(target_os = "macos", target_os = "ios"))
 ))]
 async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
@@ -3807,7 +4146,7 @@ async fn adr_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<
 
 /// Ścieżka Burn: forward serializowany na jednym watku wgpu przez `run_blocking`
 /// + `Mutex` (jak `ocr_local`); `read_batch` sam petli po cropach.
-#[cfg(not(feature = "inference-supertonic"))]
+#[cfg(not(feature = "vision-ort"))]
 async fn read_batch_local(crops: &[(Arc<[u8]>, u32, u32)]) -> Option<Vec<(Option<String>, f32)>> {
     let ocr = get_ocr().await?;
     let crops = crops.to_vec();
@@ -3998,7 +4337,7 @@ mod tests {
         stage_dets.push((
             "veh".to_string(),
             vec![mk(
-                crate::vision::detector_vehicle::VEHICLE_CLASS,
+                "vehicle",
                 [0.1, 0.1, 0.6, 0.6],
                 9,
             )],
@@ -4184,15 +4523,22 @@ mod tests {
         assert!((winner.weight / total - 1.0).abs() < 1e-6, "agreement ~1.0");
     }
 
-    /// (d) A high-COUNT but low-confidence misread must LOSE to a lower-count but
-    /// high-confidence correct read: 4×"M88901"@0.30 vs 2×"WPL5HJ2"@0.95 —
-    /// weight 1.2 vs 1.9, so the correct plate wins and is reported.
+    /// (d) The winner is decided by RAW READ COUNT, never by confidence weight.
+    ///
+    /// This deliberately reverses the original confidence-weighted rule. The
+    /// plate-OCR softmax is near-uniform in production (~0.05) and its per-frame
+    /// noise does not correlate with correctness, so weighting handed the plate
+    /// to a 21-read blur over a 2018-read correct plate on real traffic. Raw
+    /// majority is the robust signal: 4×"M88901" beats 2×"WPL5HJ2" here, and on
+    /// real data the true plate is the one that accumulates the reads.
     #[test]
-    fn ocr_vote_high_conf_beats_high_count_misread() {
+    fn ocr_vote_winner_is_raw_count_not_confidence() {
         let mut votes: Vec<TekstVote> = Vec::new();
         let mut prev: Option<String> = None;
+        // Both variants clear the confidence floor, so this isolates the WINNER
+        // rule from the readability gate: only the read COUNT may decide.
         for _ in 0..4 {
-            prev = ocr_vote(&mut votes, "M88901", 0.30, MC, MA, prev.as_deref()).text;
+            prev = ocr_vote(&mut votes, "M88901", 0.60, MC, MA, prev.as_deref()).text;
         }
         for _ in 0..2 {
             prev = ocr_vote(&mut votes, "WPL5HJ2", 0.95, MC, MA, prev.as_deref()).text;
@@ -4200,8 +4546,8 @@ mod tests {
         let final_outcome = gate_votes(&votes, MC, MA, None);
         assert_eq!(
             final_outcome.text.as_deref(),
-            Some("WPL5HJ2"),
-            "high-confidence correct read must beat a high-count low-confidence misread"
+            Some("M88901"),
+            "most-read variant wins even though the other read scored higher"
         );
     }
 
@@ -4233,9 +4579,50 @@ mod tests {
         }
     }
 
+    /// Zones are a FULL attention gate: with zones drawn, a detection whose box
+    /// centre sits outside every polygon is dropped before tracking/enrichment;
+    /// with no zones nothing is filtered (existing cameras behave as before).
+    #[test]
+    fn zones_gate_detections_by_box_centre() {
+        let det = |x: f32, y: f32| Detection {
+            klasa: "tablica_adr".into(),
+            bbox: [x, y, 0.05, 0.05],
+            score: 0.9,
+            stan: Vec::new(),
+            tekst: None,
+            tekst_conf: None,
+            tekst_thumb_ref: None,
+            track_id: 0,
+            vehicle_id: 0,
+            vx: 0.,
+            vy: 0.,
+        };
+        // Square covering the LEFT half of the frame.
+        let zones = parse_zone_polygons("[[[0.0,0.0],[0.5,0.0],[0.5,1.0],[0.0,1.0]]]");
+        assert_eq!(zones.len(), 1, "one polygon parsed");
+
+        let mut dets = vec![det(0.10, 0.10), det(0.80, 0.10)];
+        retain_in_zones(&mut dets, &zones);
+        assert_eq!(dets.len(), 1, "only the in-zone detection survives");
+        assert!(dets[0].bbox[0] < 0.5);
+
+        // No zones → pass-through (backward compatible).
+        let mut all = vec![det(0.10, 0.10), det(0.80, 0.10)];
+        retain_in_zones(&mut all, &[]);
+        assert_eq!(all.len(), 2, "no zones means no filtering");
+
+        // Malformed / degenerate polygons are ignored, never partially applied.
+        assert!(parse_zone_polygons("nonsense").is_empty());
+        assert!(
+            parse_zone_polygons("[[[0.1,0.1],[0.2,0.2]]]").is_empty(),
+            "2 points is not an area"
+        );
+    }
+
     fn make_job(cam: &str, captured: u64, pipeline: &Arc<CvPipeline>, stage: &str) -> FrameJob {
         FrameJob {
             camera_id: cam.to_string(),
+            zones: Arc::new(Vec::new()),
             frame: Arc::from(vec![0u8; 12]),
             frame_device: None,
             w: 2,
@@ -4254,6 +4641,7 @@ mod tests {
             detect_ms_total: 0,
             failed_stages: 0,
             vehicles: Vec::new(),
+            submitted_at: std::time::Instant::now(),
         }
     }
 

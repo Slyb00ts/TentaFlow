@@ -12,8 +12,8 @@ use std::time::Instant;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{Sampler, SamplingParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::{StreamDecoder, Tokenizer};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -26,15 +26,26 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let page_size = 32usize;
     let kv_pages = (target / page_size) + 8;
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+        weight_spill_dir: None,
         kv_page_size: page_size,
         kv_pages,
         max_seq_len: target + 64,
-        kv_quant: if kv_fp8 { forge_engine::kv::KvQuant::Fp8 } else { forge_engine::kv::KvQuant::F16 },
+        kv_quant: if kv_fp8 {
+            forge_engine::kv::KvQuant::Fp8
+        } else {
+            forge_engine::kv::KvQuant::F16
+        },
         kv_tier: Default::default(),
         prefix_cache: false,
+        layer_range: None,
+        tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+        native_mtp: false,
+        nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+        nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::RowMajorE4M3,
     };
 
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 12 << 30,
@@ -51,7 +62,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (m, t)
     } else {
         let gguf = forge_formats::Gguf::open(&path)?;
-        let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+        let vocab = forge_tokenize::gguf_vocab(&gguf)?;
         drop(gguf);
         let t = Tokenizer::from_gguf_vocab(&vocab)?;
         let m = Model::load_gguf(dev, &path, cfg)?;
@@ -136,7 +147,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         logits = model.step(&mut seq, next)?;
     }
 
-    eprintln!("reached depth {} (kv_fp8={kv_fp8}) (coherent if samples above are real words)", seq.len);
+    eprintln!(
+        "reached depth {} (kv_fp8={kv_fp8}) (coherent if samples above are real words)",
+        seq.len
+    );
     model.release_seq(&mut seq);
     Ok(())
 }

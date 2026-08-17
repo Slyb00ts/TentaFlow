@@ -5,7 +5,7 @@
 # score matrix is ever materialized. head_dim is a compile-time parameter —
 # specializations are registered in build_kernels.mojo per supported size.
 
-from std.gpu import block_dim, block_idx, thread_idx
+from std.gpu import WARP_SIZE, block_dim, block_idx, thread_idx
 from std.gpu.sync import barrier
 from std.gpu.primitives import warp
 from std.gpu.memory import AddressSpace
@@ -14,9 +14,12 @@ from std.math import exp, rsqrt, cos, sin, pow
 from src.reduce import block_reduce_sum
 from src.kv_fp8 import kv_frag_f32
 
-comptime WARP_SIZE = 32
 comptime MAX_WARPS = 8
 comptime NEG_INF: Float32 = -1e30
+comptime HD256 = 256
+comptime HD256_ELEMENTS_PER_LANE = 8
+comptime HD256_SPLITS = 8
+comptime HD256_PARTIAL_STRIDE = 260
 
 
 def attn_decode_f16[head_dim: Int](
@@ -31,8 +34,14 @@ def attn_decode_f16[head_dim: Int](
     page_size: Int,
     max_pages: Int,
     scale: Float32,
+    window: Int,
 ):
     """out[seq, qh] = softmax(q[seq, qh] · K^T * scale) · V.
+
+    `window` > 0 włącza okno przesuwne. W decode zapytanie siedzi na ostatniej
+    pozycji, więc okno sprowadza się do PRZESUNIĘCIA STARTU skanu — pozycje
+    starsze niż `ctx_len - window` są pomijane, a nie maskowane, więc kernel
+    robi wtedy mniej pracy, nie więcej.
 
     Layouts:
       q/out:            [n_seqs, n_q_heads, head_dim]
@@ -62,7 +71,10 @@ def attn_decode_f16[head_dim: Int](
     var l: Float32 = 0.0
     var acc = SIMD[DType.float32, epl](0.0)
 
-    var pos = wid
+    var first = 0
+    if window > 0 and ctx_len > window:
+        first = ctx_len - window
+    var pos = first + wid
     while pos < ctx_len:
         page = Int(page_table[seq * max_pages + pos // page_size])
         kv_base = ((page * n_kv_heads + kvh) * page_size + (pos % page_size)) * head_dim
@@ -125,10 +137,499 @@ def attn_decode_f16[head_dim: Int](
 
 comptime attn_decode_f16_hd64 = attn_decode_f16[64]
 comptime attn_decode_f16_hd128 = attn_decode_f16[128]
-# qwen35moe full-attention layers use head_dim 256 (n_embd_head_k). RoPE, QK
-# norm and the paged append run as separate launches for this arch, so the
-# plain (non-fused) decode/prefill specializations are the ones wired in.
 comptime attn_decode_f16_hd256 = attn_decode_f16[256]
+# head_dim 512 — warstwy globalne Gemmy 4 (16 głowic Q na jedną głowicę KV).
+comptime attn_decode_f16_hd512 = attn_decode_f16[512]
+
+
+def attn_decode_split8_f16[head_dim: Int](
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    """Dekodowanie z podzialem kontekstu na HD256_SPLITS partycji.
+
+    Wariant generyczny ma siatke (sekwencje, glowice), czyli przy JEDNEJ
+    sekwencji 16 grup roboczych na 80 CU — profiler pokazal 50 GB/s na
+    odczytach KV, gdy GEMV wag wyciaga 397 GB/s. Podzial kontekstu mnozy
+    liczbe grup przez HD256_SPLITS i dopiero to wysyca pamiec.
+
+    `window` > 0 ogranicza widoczne pozycje do `[ctx - window, ctx)` (warstwy
+    okienne Gemmy 4). 0 oznacza pelny kontekst.
+    """
+    comptime epl = head_dim // WARP_SIZE
+    seq = Int(block_idx.x)
+    query_head = Int(block_idx.y)
+    partition = Int(block_idx.z)
+    kv_head = query_head // (n_q_heads // n_kv_heads)
+    lane = Int(thread_idx.x) % WARP_SIZE
+    warp_id = Int(thread_idx.x) // WARP_SIZE
+    warps = Int(block_dim.x) // WARP_SIZE
+    context = Int(seq_lens[seq])
+    var first = 0
+    if window > 0 and context > window:
+        first = context - window
+    query_base = (seq * n_q_heads + query_head) * head_dim
+    lane_element = lane * epl
+    query = (q + query_base + lane_element).load[
+        width=epl, alignment=16
+    ]().cast[DType.float32]()
+
+    var maximum: Float32 = NEG_INF
+    var denominator: Float32 = 0.0
+    var output = SIMD[DType.float32, epl](0.0)
+    var position = first + partition + warp_id * HD256_SPLITS
+    while position < context:
+        page = Int(page_table[seq * max_pages + position // page_size])
+        cache_base = (
+            (page * n_kv_heads + kv_head) * page_size + position % page_size
+        ) * head_dim + lane_element
+        key = (k_cache + cache_base).load[
+            width=epl, alignment=16
+        ]().cast[DType.float32]()
+        value = (v_cache + cache_base).load[
+            width=epl, alignment=16
+        ]().cast[DType.float32]()
+        score = warp.sum((query * key).reduce_add()) * scale
+        next_maximum = max(maximum, score)
+        correction = exp(maximum - next_maximum)
+        probability = exp(score - next_maximum)
+        denominator = denominator * correction + probability
+        output = output * correction + value * probability
+        maximum = next_maximum
+        position += warps * HD256_SPLITS
+
+    shared_maximum = stack_allocation[
+        MAX_WARPS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    shared_denominator = stack_allocation[
+        MAX_WARPS, Float32, address_space=AddressSpace.SHARED
+    ]()
+    shared_output = stack_allocation[
+        MAX_WARPS * head_dim, Float32, address_space=AddressSpace.SHARED
+    ]()
+    if lane == 0:
+        shared_maximum[warp_id] = maximum
+        shared_denominator[warp_id] = denominator
+    (shared_output + warp_id * head_dim + lane_element).store[
+        width=epl, alignment=16
+    ](output)
+    barrier()
+
+    if warp_id == 0:
+        var block_maximum: Float32 = NEG_INF
+        for index in range(warps):
+            block_maximum = max(block_maximum, shared_maximum[index])
+        var block_denominator: Float32 = 0.0
+        var block_output = SIMD[DType.float32, epl](0.0)
+        for index in range(warps):
+            factor = exp(shared_maximum[index] - block_maximum)
+            block_denominator += shared_denominator[index] * factor
+            partial = (shared_output + index * head_dim + lane_element).load[
+                width=epl, alignment=16
+            ]()
+            block_output += partial * factor
+        partial_base = (
+            (seq * n_q_heads + query_head) * HD256_SPLITS + partition
+        ) * (head_dim + 4)
+        (partial_ptr + partial_base + lane_element).store[
+            width=epl, alignment=16
+        ](block_output)
+        if lane == 0:
+            partial_ptr[partial_base + head_dim] = block_maximum
+            partial_ptr[partial_base + head_dim + 1] = block_denominator
+
+
+def attn_decode_split8_combine_f16[head_dim: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    comptime epl = head_dim // WARP_SIZE
+    comptime stride = head_dim + 4
+    seq = Int(block_idx.x)
+    query_head = Int(block_idx.y)
+    lane = Int(thread_idx.x)
+    lane_element = lane * epl
+    query_base = (seq * n_q_heads + query_head) * head_dim
+    head_base = (seq * n_q_heads + query_head) * HD256_SPLITS * stride
+    var maximum: Float32 = NEG_INF
+    for partition in range(HD256_SPLITS):
+        maximum = max(
+            maximum,
+            partial_ptr[head_base + partition * stride + head_dim],
+        )
+    var denominator: Float32 = 0.0
+    var output = SIMD[DType.float32, epl](0.0)
+    for partition in range(HD256_SPLITS):
+        partial_base = head_base + partition * stride
+        factor = exp(partial_ptr[partial_base + head_dim] - maximum)
+        denominator += partial_ptr[partial_base + head_dim + 1] * factor
+        partial = (partial_ptr + partial_base + lane_element).load[
+            width=epl, alignment=16
+        ]()
+        output += partial * factor
+    (out_ptr + query_base + lane_element).store[
+        width=epl, alignment=16
+    ]((output / denominator).cast[DType.float16]())
+
+
+# Specjalizacje dekodowania z podzialem kontekstu, po jednej na obslugiwane
+# `head_dim`. Osobne definicje (zamiast aliasow `comptime`) trzymaja nazwe
+# kernela blisko jego geometrii w zrzutach i manifescie.
+
+
+def hd64_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[64](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd64_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[64](out_ptr, partial_ptr, n_q_heads)
+
+def hd128_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[128](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd128_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[128](out_ptr, partial_ptr, n_q_heads)
+
+def hd256_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[256](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd256_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[256](out_ptr, partial_ptr, n_q_heads)
+
+def hd512_attn_split8(
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+    window: Int,
+):
+    attn_decode_split8_f16[512](
+        partial_ptr, q, k_cache, v_cache, page_table, seq_lens,
+        n_q_heads, n_kv_heads, page_size, max_pages, scale, window,
+    )
+
+
+def hd512_attn_split8_combine(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    partial_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    n_q_heads: Int,
+):
+    attn_decode_split8_combine_f16[512](out_ptr, partial_ptr, n_q_heads)
+
+
+def attn_decode_batch_exact_f16[head_dim: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    seq_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+):
+    """Dokładny batch krótkich zapytań korzystających ze wspólnej tablicy stron."""
+    comptime epl = head_dim // WARP_SIZE
+
+    token = Int(block_idx.x)
+    qh = Int(block_idx.y)
+    kvh = qh // (n_q_heads // n_kv_heads)
+    lane = Int(thread_idx.x) % WARP_SIZE
+    wid = Int(thread_idx.x) // WARP_SIZE
+    n_warps = Int(block_dim.x) // WARP_SIZE
+    ctx_len = Int(seq_lens[token])
+    q_base = (token * n_q_heads + qh) * head_dim
+    var q_frag = SIMD[DType.float32, epl](0.0)
+
+    comptime for e in range(epl):
+        q_frag[e] = Float32(q[q_base + e * WARP_SIZE + lane])
+
+    var m: Float32 = NEG_INF
+    var l: Float32 = 0.0
+    var acc = SIMD[DType.float32, epl](0.0)
+    var pos = wid
+    while pos < ctx_len:
+        page = Int(page_table[pos // page_size])
+        kv_base = ((page * n_kv_heads + kvh) * page_size + (pos % page_size)) * head_dim
+        var dot: Float32 = 0.0
+
+        comptime for e in range(epl):
+            dot += q_frag[e] * Float32(k_cache[kv_base + e * WARP_SIZE + lane])
+        score = warp.sum(dot) * scale
+        var m_new = m
+        if score > m_new:
+            m_new = score
+        factor = exp(m - m_new)
+        p = exp(score - m_new)
+        l = l * factor + p
+
+        comptime for e in range(epl):
+            acc[e] = acc[e] * factor + p * Float32(v_cache[kv_base + e * WARP_SIZE + lane])
+        m = m_new
+        pos += n_warps
+
+    shared_m = stack_allocation[MAX_WARPS, Float32, address_space = AddressSpace.SHARED]()
+    shared_l = stack_allocation[MAX_WARPS, Float32, address_space = AddressSpace.SHARED]()
+    shared_acc = stack_allocation[
+        MAX_WARPS * head_dim, Float32, address_space = AddressSpace.SHARED
+    ]()
+
+    if lane == 0:
+        shared_m[wid] = m
+        shared_l[wid] = l
+
+    comptime for e in range(epl):
+        shared_acc[wid * head_dim + e * WARP_SIZE + lane] = acc[e]
+    barrier()
+
+    if wid == 0:
+        var m_star: Float32 = NEG_INF
+        for w in range(n_warps):
+            if shared_m[w] > m_star:
+                m_star = shared_m[w]
+        var l_star: Float32 = 0.0
+        var out_frag = SIMD[DType.float32, epl](0.0)
+        for w in range(n_warps):
+            f = exp(shared_m[w] - m_star)
+            l_star += shared_l[w] * f
+
+            comptime for e in range(epl):
+                out_frag[e] += shared_acc[w * head_dim + e * WARP_SIZE + lane] * f
+        inv_l = 1.0 / l_star
+
+        comptime for e in range(epl):
+            out_ptr[q_base + e * WARP_SIZE + lane] = Float16(out_frag[e] * inv_l)
+
+
+comptime attn_decode_batch_exact_f16_hd256 = attn_decode_batch_exact_f16[256]
+
+
+def attn_verify_segmented_f16[head_dim: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    visible_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+):
+    """Przenośna atencja dla segmentów sequence-major `[B,T]`."""
+    token = Int(block_idx.x)
+    qh = Int(block_idx.y)
+    kvh = qh // (n_q_heads // n_kv_heads)
+    element = Int(thread_idx.x)
+    lane = token // n_tokens
+    ctx_len = Int(visible_lens[token])
+    q_base = (token * n_q_heads + qh) * head_dim
+    shared = stack_allocation[head_dim, Float32, address_space=AddressSpace.SHARED]()
+    var maximum: Float32 = NEG_INF
+    var denominator: Float32 = 0.0
+    var output: Float32 = 0.0
+
+    for pos in range(ctx_len):
+        page = Int(page_tables[lane * max_pages + pos // page_size])
+        kv_base = ((page * n_kv_heads + kvh) * page_size + pos % page_size) * head_dim
+        shared[element] = Float32(q[q_base + element]) * Float32(k_cache[kv_base + element])
+        barrier()
+        var stride = head_dim // 2
+        while stride > 0:
+            if element < stride:
+                shared[element] += shared[element + stride]
+            barrier()
+            stride //= 2
+        score = shared[0] * scale
+        next_maximum = max(maximum, score)
+        correction = exp(maximum - next_maximum) if maximum > NEG_INF else Float32(0.0)
+        probability = exp(score - next_maximum)
+        denominator = denominator * correction + probability
+        output = output * correction + probability * Float32(v_cache[kv_base + element])
+        maximum = next_maximum
+        barrier()
+
+    out_ptr[q_base + element] = Float16(output / denominator)
+
+
+def attn_verify_segmented_f16_warp32[head_dim: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    visible_lens: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    max_pages: Int,
+    scale: Float32,
+):
+    """Dokładna atencja NVIDIA dla osobnych tablic stron."""
+    comptime elements_per_lane = head_dim // WARP_SIZE
+    token = Int(block_idx.x)
+    qh = Int(block_idx.y)
+    kvh = qh // (n_q_heads // n_kv_heads)
+    sequence = token // n_tokens
+    lane_id = Int(thread_idx.x) % WARP_SIZE
+    warp_id = Int(thread_idx.x) // WARP_SIZE
+    n_warps = Int(block_dim.x) // WARP_SIZE
+    ctx_len = Int(visible_lens[token])
+    q_base = (token * n_q_heads + qh) * head_dim
+    var q_frag = SIMD[DType.float32, elements_per_lane](0.0)
+    comptime for element in range(elements_per_lane):
+        q_frag[element] = Float32(q[q_base + element * WARP_SIZE + lane_id])
+
+    var maximum: Float32 = NEG_INF
+    var denominator: Float32 = 0.0
+    var output = SIMD[DType.float32, elements_per_lane](0.0)
+    var position = warp_id
+
+    while position < ctx_len:
+        page = Int(page_tables[sequence * max_pages + position // page_size])
+        kv_base = (
+            (page * n_kv_heads + kvh) * page_size + position % page_size
+        ) * head_dim
+        var partial: Float32 = 0.0
+        comptime for element in range(elements_per_lane):
+            offset = element * WARP_SIZE + lane_id
+            partial += q_frag[element] * Float32(k_cache[kv_base + offset])
+        score = warp.sum(partial) * scale
+        next_maximum = max(maximum, score)
+        correction = exp(maximum - next_maximum)
+        probability = exp(score - next_maximum)
+        denominator = denominator * correction + probability
+        comptime for element in range(elements_per_lane):
+            offset = element * WARP_SIZE + lane_id
+            output[element] = output[element] * correction + probability * Float32(
+                v_cache[kv_base + offset]
+            )
+        maximum = next_maximum
+        position += n_warps
+
+    shared_maximum = stack_allocation[MAX_WARPS, Float32, address_space=AddressSpace.SHARED]()
+    shared_denominator = stack_allocation[MAX_WARPS, Float32, address_space=AddressSpace.SHARED]()
+    shared_output = stack_allocation[
+        MAX_WARPS * head_dim, Float32, address_space=AddressSpace.SHARED
+    ]()
+
+    if lane_id == 0:
+        shared_maximum[warp_id] = maximum
+        shared_denominator[warp_id] = denominator
+    comptime for element in range(elements_per_lane):
+        shared_output[warp_id * head_dim + element * WARP_SIZE + lane_id] = output[element]
+    barrier()
+
+    if warp_id == 0:
+        var merged_maximum: Float32 = NEG_INF
+        for source_warp in range(n_warps):
+            if shared_maximum[source_warp] > merged_maximum:
+                merged_maximum = shared_maximum[source_warp]
+        var merged_denominator: Float32 = 0.0
+        var merged_output = SIMD[DType.float32, elements_per_lane](0.0)
+        for source_warp in range(n_warps):
+            correction = exp(shared_maximum[source_warp] - merged_maximum)
+            merged_denominator += shared_denominator[source_warp] * correction
+            comptime for element in range(elements_per_lane):
+                merged_output[element] += shared_output[
+                    source_warp * head_dim + element * WARP_SIZE + lane_id
+                ] * correction
+        inverse_denominator = 1.0 / merged_denominator
+        comptime for element in range(elements_per_lane):
+            out_ptr[q_base + element * WARP_SIZE + lane_id] = Float16(
+                merged_output[element] * inverse_denominator
+            )
+
+
+comptime attn_verify_segmented_f16_hd128 = attn_verify_segmented_f16[128]
+comptime attn_verify_segmented_f16_hd256 = attn_verify_segmented_f16[256]
+comptime attn_verify_segmented_f16_hd128_warp32 = attn_verify_segmented_f16_warp32[128]
+comptime attn_verify_segmented_f16_hd256_warp32 = attn_verify_segmented_f16_warp32[256]
 
 
 def attn_decode_split[head_dim: Int, kv_dtype: DType](
@@ -194,7 +695,30 @@ def attn_decode_split[head_dim: Int, kv_dtype: DType](
     wid = tid // WARP_SIZE
     n_warps = Int(block_dim.x) // WARP_SIZE
     ctx_len = Int(seq_lens[seq])
-    chunk = (ctx_len + n_splits - 1) // n_splits
+    # Short contexts collapse to fewer effective splits (>= 256 tokens per
+    # split): the prologue (q/k norm reductions, RoPE, paged append) repeats
+    # per split block, so at ctx ~200 a fixed 8-way split pays 8x prologue
+    # for ~25-token attention chunks. Surplus split blocks publish a neutral
+    # partial (m = -inf, l = 0 — zero weight in the combine) and exit before
+    # the prologue; the surviving blocks each still perform the full benign
+    # duplicate append. At ctx >= 256 * n_splits the chunking (and rounding)
+    # is bit-identical to the fixed split.
+    var eff_splits = (ctx_len + 255) // 256
+    if eff_splits > n_splits:
+        eff_splits = n_splits
+    if eff_splits < 1:
+        eff_splits = 1
+    if split >= eff_splits:
+        parts_base = ((seq * n_q_heads + qh) * n_splits + split) * (head_dim + 2)
+        var pi = tid
+        while pi < head_dim:
+            parts[parts_base + pi] = 0.0
+            pi += Int(block_dim.x)
+        if tid == 0:
+            parts[parts_base + head_dim] = NEG_INF
+            parts[parts_base + head_dim + 1] = 0.0
+        return
+    chunk = (ctx_len + eff_splits - 1) // eff_splits
     start = split * chunk
     var end = start + chunk
     if end > ctx_len:
@@ -398,6 +922,8 @@ def attn_decode_split[head_dim: Int, kv_dtype: DType](
 
 comptime attn_decode_split_f16_hd64 = attn_decode_split[64, DType.float16]
 comptime attn_decode_split_f16_hd128 = attn_decode_split[128, DType.float16]
+# head_dim 512 — warstwy globalne Gemmy 4 na ścieżce decode w batchu mieszanym.
+comptime attn_decode_split_f16_hd512 = attn_decode_split[512, DType.float16]
 comptime attn_decode_split_fp8_hd64 = attn_decode_split[64, DType.float8_e4m3fn]
 comptime attn_decode_split_fp8_hd128 = attn_decode_split[128, DType.float8_e4m3fn]
 
@@ -446,3 +972,4 @@ def attn_decode_combine_f16[head_dim: Int](
 
 comptime attn_decode_combine_f16_hd64 = attn_decode_combine_f16[64]
 comptime attn_decode_combine_f16_hd128 = attn_decode_combine_f16[128]
+comptime attn_decode_combine_f16_hd512 = attn_decode_combine_f16[512]

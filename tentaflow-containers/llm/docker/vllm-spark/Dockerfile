@@ -1,13 +1,13 @@
 # =============================================================================
 # Plik: Dockerfile (vllm-spark)
-# Opis: vLLM 0.25.1 budowane ze zrodel pod NVIDIA DGX Spark (GB10 Grace
+# Opis: vLLM 0.27.0 budowane ze zrodel pod NVIDIA DGX Spark (GB10 Grace
 #       Blackwell, aarch64, sm_121a). PyPI wheels vllm/torch celuja w sm_120
 #       i crashuja na sm_121 — tu odpalamy lokalny build z
 #       TORCH_CUDA_ARCH_LIST=12.1a w devel-image (nvcc + toolchain).
 #       Build CUDA kerneli trwa 20-30 min — to jednorazowy koszt obrazu.
 # =============================================================================
 
-# --- vLLM 0.25.1 build from source (direct-http, no sidecar) ---
+# --- vLLM 0.27.0 build from source (direct-http, no sidecar) ---
 # Devel variant — potrzebujemy nvcc + cuda headers do kompilacji kerneli.
 # Runtime variant nie ma toolchainu, vanilla `pip install -e .` by sie wywalil
 # na "nvcc not found".
@@ -26,11 +26,11 @@ RUN python3 -m venv /opt/vllm-venv
 ENV PATH="/opt/vllm-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel setuptools
 
-# PyTorch 2.11 + cu130 z aarch64 nightly wheels (sm_121 baseline). Stable
-# PyPI torch-2.11.0 nie ma sm_121 bytecode dla Grace Blackwell.
+# PyTorch 2.13 + cu130 z aarch64 wheels (sm_121 baseline). Stable
+# PyPI torch-2.13.0 nie ma wariantu CUDA dla Grace Blackwell.
 RUN pip install --no-cache-dir \
-      --extra-index-url https://download.pytorch.org/whl/nightly/cu130 \
-      torch==2.11.0 torchvision==0.26.0 torchaudio==2.11.0 \
+      --extra-index-url https://download.pytorch.org/whl/cu130 \
+      torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
       ninja cmake
 
 # Build env wymuszony PRZED `pip install -e .` zeby nvcc emitowal sm_121a
@@ -45,17 +45,17 @@ ENV TORCH_CUDA_ARCH_LIST="12.1a" \
     TRITON_PTXAS_PATH="/usr/local/cuda/bin/ptxas" \
     MAX_JOBS="8"
 
-# Klon vllm @ v0.25.1 i build editable. Trzymamy `--depth 1` zeby skrocic
+# Klon vllm @ v0.27.0 i build editable. Trzymamy `--depth 1` zeby skrocic
 # clone — caly history nie jest potrzebny do builda.
 WORKDIR /src
-RUN git clone --depth 1 --branch v0.25.1 https://github.com/vllm-project/vllm.git \
+RUN git clone --depth 1 --branch v0.27.0 https://github.com/vllm-project/vllm.git \
     && cd vllm \
     && pip install --no-cache-dir -e . \
     && pip cache purge
 
 # Ray w TYM SAMYM venv co vllm — wymagany do multi-node tensor-parallel
 # (head+worker, --distributed-executor-backend ray). 2.55.1 ma kola aarch64 i
-# jest kompatybilny z vllm 0.23 / torch 2.11 (D3 distributed deploy).
+# jest kompatybilny z vllm 0.27 / torch 2.13 (D3 distributed deploy).
 RUN pip install --no-cache-dir ray==2.55.1
 
 # llm-compressor — self-quantyzacja zrodel HF do NVFP4 (presety Bielik). hf CLI

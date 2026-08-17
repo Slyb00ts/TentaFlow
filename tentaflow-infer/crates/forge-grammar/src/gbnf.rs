@@ -24,7 +24,11 @@ struct Parser {
 
 impl Parser {
     fn err(&self, msg: impl Into<String>) -> ForgeError {
-        ForgeError::Grammar(format!("GBNF parse error at char {}: {}", self.pos, msg.into()))
+        ForgeError::Grammar(format!(
+            "GBNF parse error at char {}: {}",
+            self.pos,
+            msg.into()
+        ))
     }
 
     fn peek(&self) -> Option<char> {
@@ -383,7 +387,9 @@ impl Parser {
     fn parse_hex(&mut self, n: usize) -> Result<u32> {
         let mut v = 0u32;
         for _ in 0..n {
-            let c = self.bump().ok_or_else(|| self.err("truncated hex escape"))?;
+            let c = self
+                .bump()
+                .ok_or_else(|| self.err("truncated hex escape"))?;
             let d = c
                 .to_digit(16)
                 .ok_or_else(|| self.err("invalid hex digit"))?;

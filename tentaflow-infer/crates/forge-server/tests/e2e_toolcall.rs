@@ -10,8 +10,8 @@ use std::time::Duration;
 
 use forge_engine::model::ModelConfig;
 use forge_engine::server::spawn_engine;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{build_router, ServerConfig, ServerState};
@@ -65,11 +65,18 @@ async fn qwen3_tool_calls_end_to_end() {
             let kv_page_size = 32;
             let kv_pages = 256;
             let desc = read_descriptor(&load_dir).expect("read model descriptor");
-            let device = CudaDevice::new(
+            let device = gpu::open(
                 0,
                 PoolSizes {
                     weights: 3 << 30,
-                    kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, forge_engine::kv::KvQuant::F16),
+                    kv_cache: kv_pool_bytes(
+                        &desc,
+                        kv_page_size,
+                        kv_pages,
+                        forge_engine::kv::KvQuant::F16,
+                        false,
+                    )
+                    .unwrap(),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -80,12 +87,19 @@ async fn qwen3_tool_calls_end_to_end() {
                 dev,
                 &load_dir,
                 ModelConfig {
+                    weight_spill_dir: None,
+                    weight_host_budget: 0,
                     kv_page_size,
                     kv_pages,
                     max_seq_len: 4096,
                     kv_quant: forge_engine::kv::KvQuant::F16,
                     kv_tier: Default::default(),
                     prefix_cache: false,
+                    layer_range: None,
+                    tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+                    native_mtp: false,
+                    nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+                    nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,
                 },
             )
             .expect("load model");
@@ -119,6 +133,8 @@ async fn qwen3_tool_calls_end_to_end() {
         model_id: "qwen3-0.6b".into(),
         api_key: None,
         tool_call_parser: None,
+        default_sampling: Default::default(),
+        default_stop: vec![],
     };
     let state = ServerState::new(
         &cfg,
@@ -180,7 +196,10 @@ async fn qwen3_tool_calls_end_to_end() {
     let body: serde_json::Value = resp.json().await.unwrap();
     let forced = &body["choices"][0]["message"]["tool_calls"];
     let forced = forced.as_array().expect("forced tool_calls array");
-    assert!(!forced.is_empty(), "required must yield a tool call: {body}");
+    assert!(
+        !forced.is_empty(),
+        "required must yield a tool call: {body}"
+    );
     assert_eq!(forced[0]["function"]["name"], "get_weather");
     let forced_args = forced[0]["function"]["arguments"].as_str().unwrap();
     let _: serde_json::Value =
@@ -241,7 +260,10 @@ async fn qwen3_tool_calls_end_to_end() {
     }
     // Qwen3 thinks by default; reasoning must be extracted, never in content.
     if let Some(content) = message["content"].as_str() {
-        assert!(!content.contains("<think>"), "think block leaked: {content}");
+        assert!(
+            !content.contains("<think>"),
+            "think block leaked: {content}"
+        );
     }
 
     // Streaming: same request; tool calls arrive as incremental deltas.
@@ -299,7 +321,10 @@ async fn qwen3_tool_calls_end_to_end() {
         assert_eq!(finish_reason.as_deref(), Some("tool_calls"));
         assert_eq!(calls[0]["index"], 0);
         assert_eq!(calls[0]["function"]["name"], "get_weather");
-        assert!(calls[0]["function"]["arguments"].as_str().unwrap().contains("Krak"));
+        assert!(calls[0]["function"]["arguments"]
+            .as_str()
+            .unwrap()
+            .contains("Krak"));
     } else {
         assert!(
             !content.trim().is_empty() || !reasoning.trim().is_empty(),

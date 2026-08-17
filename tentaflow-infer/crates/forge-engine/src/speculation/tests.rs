@@ -5,8 +5,8 @@ use super::ngram::NgramProposer;
 use super::state::SpeculativeState;
 use super::stats::ProposerStats;
 use super::{
-    verify_greedy, DraftNode, DraftTree, Proposer, ProposerKind, SeqContext, SpeculationKind,
-    SpeculationCoordinator, SpeculativeConfig,
+    verify_greedy, DraftNode, DraftTree, Proposer, ProposerKind, SeqContext,
+    SpeculationCoordinator, SpeculationKind, SpeculativeConfig,
 };
 
 /// Deterministic stand-in for a draft-model/MTP proposer: always proposes a
@@ -355,6 +355,45 @@ fn speculative_state_rejects_overwriting_pending_draft() {
 }
 
 #[test]
+fn para_pending_ngram_anuluje_obie_lane_i_pozwala_na_reuse() {
+    let make_state = || {
+        SpeculativeState::new(CascadeComposer::new(vec![Box::new(FixedProposer {
+            tokens: vec![7, 8, 9],
+        })]))
+    };
+    let mut first = make_state();
+    let mut second = make_state();
+    let first_draft = first.draft(3).expect("lane0 powinna utworzyć draft");
+    let second_draft = second.draft(3).expect("lane1 powinna utworzyć draft");
+    first
+        .validate_commit(&first_draft, 0)
+        .expect("pending lane0 powinien być poprawny");
+    second
+        .validate_commit(&second_draft, 0)
+        .expect("pending lane1 powinien być poprawny");
+    first.cancel_draft();
+    second.cancel_draft();
+    assert_eq!(
+        first.draft(3).expect("lane0 powinna pozwolić na reuse"),
+        first_draft
+    );
+    assert_eq!(
+        second.draft(3).expect("lane1 powinna pozwolić na reuse"),
+        second_draft
+    );
+    first
+        .validate_commit(&first_draft, 1)
+        .expect("lane0 powinna przyjąć retained=2");
+    second
+        .validate_commit(&second_draft, 3)
+        .expect("lane1 powinna przyjąć retained=4");
+    first.commit_validated(&first_draft, 1);
+    second.commit_validated(&second_draft, 3);
+    assert_eq!(first.history(), &[7]);
+    assert_eq!(second.history(), &[7, 8, 9]);
+}
+
+#[test]
 fn linear_verifier_rejects_branching_proposal() {
     let proposal = DraftTree::new(vec![
         DraftNode {
@@ -449,8 +488,17 @@ fn coordinator_recognizes_model_owned_native_mtp() {
     }
     assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 1).is_err());
     assert!(SpeculativeConfig::chain(vec![ProposerKind::Mtp], 4).is_err());
+    for budget in [2, 3] {
+        let config = SpeculativeConfig::chain(vec![ProposerKind::Mtp, ProposerKind::Ngram], budget)
+            .expect("router MTP+n-gram powinien obsługiwać budżet 2 lub 3");
+        assert_eq!(config.kind(), SpeculationKind::NativeMtpNgram);
+        let coordinator = SpeculationCoordinator::new(config).expect("router powinien działać");
+        assert!(coordinator
+            .new_state(&[1, 2, 3, 1, 2, 3])
+            .expect("router powinien utworzyć stan n-gram")
+            .is_some());
+    }
     for chain in [
-        vec![ProposerKind::Mtp, ProposerKind::Ngram],
         vec![ProposerKind::Mtp, ProposerKind::DraftModel],
         vec![ProposerKind::DraftModel, ProposerKind::Mtp],
     ] {

@@ -62,6 +62,13 @@ from src.gemv2 import (
     _gemv_iq1_m_row_acc,
     IQ1S_DELTA,
 )
+from src.nvfp4_ct_layout import (
+    NVFP4_CT_SCALE_BYTES,
+    NVFP4_CT_TILE_BYTES,
+    NVFP4_CT_TILE_COLS,
+    NVFP4_CT_TILE_ROWS,
+    nvfp4_ct_decode_s0,
+)
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -524,6 +531,124 @@ def _dot2_nvfp4(
     return SIMD[DType.float32, 2](warp.sum(acc_g), warp.sum(acc_u))
 
 
+def _dot_nvfp4_ct_s0(
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    xs: UnsafePointer[
+        Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    lut: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+    inv_global_scale: Float32,
+) -> Float32:
+    groups = n_cols // 16
+    stages = n_cols // NVFP4_CT_TILE_COLS
+    row_tile = row // NVFP4_CT_TILE_ROWS
+    tile_row = row % NVFP4_CT_TILE_ROWS
+    var acc: Float32 = 0.0
+    var g = lane
+    while g < groups:
+        tile_col = g // 8
+        group_in_tile = g % 8
+        tile_base = (row_tile * stages + tile_col) * NVFP4_CT_TILE_BYTES
+        encoded_scale = weights[tile_base + tile_row * 8 + group_in_tile]
+        scale = Float32(nvfp4_ct_decode_s0(encoded_scale)) * (
+            inv_global_scale / 128.0
+        )
+        qv = (
+            weights
+            + tile_base
+            + NVFP4_CT_SCALE_BYTES
+            + tile_row * 64
+            + group_in_tile * 8
+        ).load[width=8, alignment=8]()
+        xv = (xs + g * 16).load[width=16, alignment=32]().cast[DType.float32]()
+        x_even, x_odd = xv.deinterleave()
+        var lov = SIMD[DType.float32, 8]()
+        var hiv = SIMD[DType.float32, 8]()
+        comptime for j in range(8):
+            lov[j] = lut[Int(qv[j] & 0x0F)]
+            hiv[j] = lut[Int(qv[j] >> 4)]
+        acc += scale * (
+            (lov * x_even).reduce_add() + (hiv * x_odd).reduce_add()
+        )
+        g += WARP
+    return warp.sum(acc)
+
+
+def _dot2_nvfp4_ct_s0(
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    row_g: Int,
+    row_u: Int,
+    xs: UnsafePointer[
+        Float16, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    lut: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+    inv_global_scale: Float32,
+) -> SIMD[DType.float32, 2]:
+    return SIMD[DType.float32, 2](
+        _dot_nvfp4_ct_s0(
+            weights, row_g, xs, lut, n_cols, lane, inv_global_scale
+        ),
+        _dot_nvfp4_ct_s0(
+            weights, row_u, xs, lut, n_cols, lane, inv_global_scale
+        ),
+    )
+
+
+def _dot_nvfp4_ct_s0_global(
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    row: Int,
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    lut: UnsafePointer[
+        Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    n_cols: Int,
+    lane: Int,
+    inv_global_scale: Float32,
+) -> Float32:
+    groups = n_cols // 16
+    stages = n_cols // NVFP4_CT_TILE_COLS
+    row_tile = row // NVFP4_CT_TILE_ROWS
+    tile_row = row % NVFP4_CT_TILE_ROWS
+    var acc: Float32 = 0.0
+    var g = lane
+    while g < groups:
+        tile_col = g // 8
+        group_in_tile = g % 8
+        tile_base = (row_tile * stages + tile_col) * NVFP4_CT_TILE_BYTES
+        encoded_scale = weights[tile_base + tile_row * 8 + group_in_tile]
+        scale = Float32(nvfp4_ct_decode_s0(encoded_scale)) * (
+            inv_global_scale / 128.0
+        )
+        qv = (
+            weights
+            + tile_base
+            + NVFP4_CT_SCALE_BYTES
+            + tile_row * 64
+            + group_in_tile * 8
+        ).load[width=8, alignment=8]()
+        xv = (x + g * 16).load[width=16, alignment=32]().cast[DType.float32]()
+        x_even, x_odd = xv.deinterleave()
+        var lov = SIMD[DType.float32, 8]()
+        var hiv = SIMD[DType.float32, 8]()
+        comptime for j in range(8):
+            lov[j] = lut[Int(qv[j] & 0x0F)]
+            hiv[j] = lut[Int(qv[j] >> 4)]
+        acc += scale * (
+            (lov * x_even).reduce_add() + (hiv * x_odd).reduce_add()
+        )
+        g += WARP
+    return warp.sum(acc)
+
+
 def _init_nvfp4_lut(
     lut: UnsafePointer[
         Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
@@ -603,6 +728,39 @@ def gemv_norm_nvfp4_f16(
         row = (Int(block_idx.x) * rows_per_warp + i) * rows_per_block + wid
         if row < n_rows:
             total = _dot_nvfp4(packed, scales, row, xs, lut, n_cols, lane, inv_global_scale)
+            if lane == 0:
+                y[row] = Float16(total)
+
+
+def gemv_norm_nvfp4_ct_s0_f16(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    h: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    inv_global_scale: Float32,
+    ss_from_h16: Int,
+    eps: Float32,
+    rows_per_warp: Int,
+):
+    xs = stack_allocation[
+        MAX_HIDDEN, Float16, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    _init_nvfp4_lut(lut)
+    _norm_x_to_shared(xs, h, h32, norm_w, n_cols, ss_from_h16, eps)
+    barrier()
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    rows_per_block = Int(block_dim.x) // WARP
+    for i in range(rows_per_warp):
+        row = (Int(block_idx.x) * rows_per_warp + i) * rows_per_block + wid
+        if row < n_rows:
+            total = _dot_nvfp4_ct_s0(
+                weights, row, xs, lut, n_cols, lane, inv_global_scale
+            )
             if lane == 0:
                 y[row] = Float16(total)
 
@@ -764,6 +922,42 @@ def gemv_norm_silu_nvfp4_f16(
             if lane == 0:
                 g = Float32(Float16(gu[0]))
                 act[row] = Float16(g / (1.0 + exp(-g)) * Float32(Float16(gu[1])))
+
+
+def gemv_norm_silu_nvfp4_ct_s0_f16(
+    act: UnsafePointer[Float16, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    h: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    norm_w: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    inter: Int,
+    inv_global_scale: Float32,
+    eps: Float32,
+    rows_per_warp: Int,
+):
+    xs = stack_allocation[
+        MAX_HIDDEN, Float16, alignment=64, address_space = AddressSpace.SHARED
+    ]()
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    _init_nvfp4_lut(lut)
+    _norm_x_to_shared(xs, h, h32, norm_w, n_cols, 0, eps)
+    barrier()
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    rows_per_block = Int(block_dim.x) // WARP
+    for i in range(rows_per_warp):
+        row = (Int(block_idx.x) * rows_per_warp + i) * rows_per_block + wid
+        if row < inter:
+            gu = _dot2_nvfp4_ct_s0(
+                weights, row, inter + row, xs, lut, n_cols, lane,
+                inv_global_scale,
+            )
+            if lane == 0:
+                g = Float32(Float16(gu[0]))
+                act[row] = Float16(
+                    g / (1.0 + exp(-g)) * Float32(Float16(gu[1]))
+                )
 
 
 
@@ -935,6 +1129,38 @@ def gemv_residual_nvfp4_f16(
         acc += s * ((lov * x_even).reduce_add() + (hiv * x_odd).reduce_add())
         g += WARP
     total = warp.sum(acc)
+    if lane == 0:
+        v = Float32(h_io[row]) + Float32(Float16(total))
+        h_io[row] = Float16(v)
+        h32[row] = v
+
+
+def gemv_residual_nvfp4_ct_s0_f16(
+    h_io: UnsafePointer[Float16, MutAnyOrigin],
+    h32: UnsafePointer[Float32, MutAnyOrigin],
+    weights: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    inv_global_scale: Float32,
+):
+    lut = stack_allocation[16, Float32, address_space = AddressSpace.SHARED]()
+    _init_nvfp4_lut(lut)
+    barrier()
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+    total = _dot_nvfp4_ct_s0_global(
+        weights,
+        row,
+        x,
+        lut,
+        n_cols,
+        lane,
+        inv_global_scale,
+    )
     if lane == 0:
         v = Float32(h_io[row]) + Float32(Float16(total))
         h_io[row] = Float16(v)

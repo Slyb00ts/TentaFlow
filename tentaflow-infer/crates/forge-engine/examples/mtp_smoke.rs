@@ -9,8 +9,8 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::Tokenizer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -24,11 +24,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let activations = 1usize << 30;
     let kv_cache = 4usize << 20;
     let reserve = 512usize << 20;
-    let free = CudaDevice::free_vram(0)?;
+    let free = gpu::free_vram(0)?;
     let weights = free
         .checked_sub(activations + kv_cache + reserve)
         .ok_or("za mało wolnego VRAM na pule MTP")?;
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights,
@@ -48,13 +48,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         embedding.quant,
         embedding.size_bytes >> 20
     );
-    let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+    let vocab = forge_tokenize::gguf_vocab(&gguf)?;
     drop(gguf);
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
     let mut model = Model::load_gguf(
         dev,
         &path,
         ModelConfig {
+            weight_host_budget: 0,
+            weight_spill_dir: None,
             kv_page_size: 32,
             kv_pages: 4,
             max_seq_len: 128,
@@ -90,7 +92,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
     let started = std::time::Instant::now();
-    let draft = model.mtp_propose_k(target_before, k)?;
+    let draft = model.mtp_propose_k(&mut seq, target_before, k)?;
     let mut sampler = GpuSampler::new(SamplingParams {
         temperature: 0.0,
         ..SamplingParams::default()

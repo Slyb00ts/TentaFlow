@@ -622,7 +622,325 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "recordings_search_columns",
             MigrationStep::Rust(recordings_add_search_columns),
         ),
+        (
+            117,
+            "cameras_detection_zones",
+            MigrationStep::Rust(cameras_add_zones_column),
+        ),
+        (
+            118,
+            "flows_is_system",
+            MigrationStep::Rust(flows_add_is_system_column),
+        ),
+        (
+            119,
+            "project_studio_permissions",
+            MigrationStep::Rust(roles_add_project_studio_permissions),
+        ),
+        (
+            120,
+            "conversation_messages_citations",
+            MigrationStep::Rust(conversation_messages_add_citations_column),
+        ),
+        (
+            121,
+            "managed_cli_service_tags",
+            MigrationStep::RustSelfManaged(managed_cli_service_tags),
+        ),
+        (
+            122,
+            "service_usage_snapshot",
+            MigrationStep::Sql(SERVICE_USAGE_SNAPSHOT),
+        ),
+        (
+            123,
+            "conversation_messages_reasoning_content",
+            MigrationStep::Sql(CONVERSATION_MESSAGES_REASONING_CONTENT),
+        ),
+        (
+            124,
+            "benchmark_targets_local_api_type",
+            MigrationStep::RustSelfManaged(benchmark_targets_allow_local_api_type),
+        ),
+        (
+            125,
+            "code_studio_registry",
+            MigrationStep::Sql(CODE_STUDIO_REGISTRY),
+        ),
+        (
+            126,
+            "code_studio_permissions",
+            MigrationStep::Rust(roles_add_code_studio_permissions),
+        ),
     ]
+}
+
+// Code Studio — registry of workspaces (org scope, synchronized) plus the
+// node-local secret vault. The split is deliberate: `code_workspaces` and its
+// satellites describe WHAT exists and who may touch it, and travel through the
+// Sync Ledger; `code_workspace_secrets` and `code_agent_credentials` hold key
+// material encrypted with the per-node SettingsCipher key and must never be
+// added to `sync/core_registry.rs` — the precedent is `addon_config`, which
+// synchronizes only `is_secret=0`.
+const CODE_STUDIO_REGISTRY: &str = r#"
+CREATE TABLE IF NOT EXISTS code_workspaces (
+    id TEXT PRIMARY KEY,
+    org_id TEXT NOT NULL,
+    owner_user_id TEXT NOT NULL,
+    name TEXT NOT NULL,
+    slug TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    exec_mode TEXT NOT NULL DEFAULT 'trusted_native'
+        CHECK(exec_mode IN ('container','trusted_native')),
+    container_image TEXT,
+    egress_enforcement TEXT NOT NULL
+        CHECK(egress_enforcement IN ('namespace','firewall','unrestricted')),
+    repo_kind TEXT NOT NULL CHECK(repo_kind IN ('empty','git')),
+    repo_url TEXT,
+    repo_auth_kind TEXT CHECK(repo_auth_kind IN ('none','token','ssh_key')),
+    secret_ref TEXT,
+    ssh_host_fingerprint TEXT,
+    default_branch TEXT,
+    target_branch TEXT,
+    autonomy_ceiling TEXT NOT NULL DEFAULT 'normal'
+        CHECK(autonomy_ceiling IN ('plan','normal','auto_edit','autonomous')),
+    egress_policy TEXT NOT NULL DEFAULT 'org_approved'
+        CHECK(egress_policy IN ('local_only','org_approved','any')),
+    index_enabled INTEGER NOT NULL DEFAULT 0,
+    quota_disk_bytes INTEGER,
+    quota_sessions INTEGER,
+    status TEXT NOT NULL
+        CHECK(status IN ('provisioning','active','error','archived','deleted')),
+    status_detail TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL,
+    UNIQUE(org_id, owner_user_id, slug)
+);
+CREATE INDEX IF NOT EXISTS idx_code_workspaces_org ON code_workspaces(org_id, status);
+CREATE INDEX IF NOT EXISTS idx_code_workspaces_node ON code_workspaces(node_id, status);
+
+CREATE TABLE IF NOT EXISTS code_workspace_members (
+    workspace_id TEXT NOT NULL REFERENCES code_workspaces(id) ON DELETE CASCADE,
+    user_id TEXT NOT NULL,
+    role TEXT NOT NULL CHECK(role IN ('owner','editor','viewer')),
+    added_by TEXT NOT NULL,
+    added_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, user_id)
+);
+CREATE INDEX IF NOT EXISTS idx_code_workspace_members_user ON code_workspace_members(user_id);
+
+CREATE TABLE IF NOT EXISTS code_workspace_project_links (
+    workspace_id TEXT NOT NULL REFERENCES code_workspaces(id) ON DELETE CASCADE,
+    project_id TEXT NOT NULL,
+    linked_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, project_id)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_creator_grants (
+    org_id TEXT NOT NULL,
+    user_id TEXT NOT NULL,
+    granted_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    PRIMARY KEY (org_id, user_id)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_allowlist (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    workspace_id TEXT NOT NULL REFERENCES code_workspaces(id) ON DELETE CASCADE,
+    capability TEXT NOT NULL,
+    pattern TEXT NOT NULL,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    UNIQUE(workspace_id, capability, pattern)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_saga_steps (
+    workspace_id TEXT NOT NULL,
+    step TEXT NOT NULL,
+    status TEXT NOT NULL CHECK(status IN ('pending','done','failed','compensated')),
+    detail TEXT,
+    updated_at TEXT NOT NULL,
+    PRIMARY KEY (workspace_id, step)
+);
+
+CREATE TABLE IF NOT EXISTS code_workspace_secrets (
+    secret_ref TEXT PRIMARY KEY,
+    workspace_id TEXT NOT NULL,
+    kind TEXT NOT NULL CHECK(kind IN ('git_token','ssh_key')),
+    material_enc BLOB NOT NULL,
+    fingerprint TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    rotated_at TEXT,
+    last_used_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_code_workspace_secrets_ws
+    ON code_workspace_secrets(workspace_id);
+
+CREATE TABLE IF NOT EXISTS code_agent_credentials (
+    org_id TEXT NOT NULL,
+    node_id TEXT NOT NULL,
+    engine_id TEXT NOT NULL,
+    material_enc BLOB NOT NULL,
+    provider_base_url TEXT NOT NULL,
+    fingerprint TEXT,
+    created_by TEXT NOT NULL,
+    created_at TEXT NOT NULL,
+    rotated_at TEXT,
+    last_used_at TEXT,
+    PRIMARY KEY (org_id, node_id, engine_id)
+);
+
+CREATE TABLE IF NOT EXISTS session_assertion_jti (
+    jti TEXT PRIMARY KEY,
+    expires_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_assertion_jti_exp ON session_assertion_jti(expires_at);
+"#;
+
+/// Reading the workspace catalog is available to every role that can see the
+/// dashboard; administering someone else's workspace is not. Creating one needs
+/// a per-user grant on top (`code_workspace_creator_grants`), the same shape
+/// Project Studio uses, because a workspace consumes disk and can execute code.
+fn roles_add_code_studio_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &[
+            "org_admin",
+            "org_operator",
+            "org_viewer",
+            "dpo",
+            "supervisor",
+        ],
+        &["code_studio.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin"], &["code_studio.admin"])
+}
+
+const SERVICE_USAGE_SNAPSHOT: &str = r#"
+ALTER TABLE services ADD COLUMN usage_json TEXT;
+ALTER TABLE services ADD COLUMN usage_updated_at TEXT;
+"#;
+
+const CONVERSATION_MESSAGES_REASONING_CONTENT: &str = r#"
+ALTER TABLE conversation_messages ADD COLUMN reasoning_content TEXT;
+"#;
+
+/// v124 — a benchmark target may now be measured IN-PROCESS (`api_type='local'`),
+/// which is the only way to reach a backend without a dialable chat endpoint:
+/// embedded llama.cpp / MLX, a QUIC sidecar, a coding-agent bridge. SQLite cannot
+/// alter a CHECK constraint, so the table is rebuilt. `kind` keeps its two values
+/// — it records WHERE the target came from (picked from the service list vs typed
+/// by hand), while `api_type` says how we talk to it.
+fn benchmark_targets_allow_local_api_type(
+    conn: &Connection,
+    version: i64,
+    name: &str,
+) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+            r#"
+CREATE TABLE benchmark_targets_local_new (
+    id            TEXT PRIMARY KEY,
+    benchmark_id  TEXT NOT NULL REFERENCES benchmarks(id) ON DELETE CASCADE,
+    kind          TEXT NOT NULL CHECK (kind IN ('service','external')),
+    service_ref   TEXT,
+    api_type      TEXT NOT NULL DEFAULT 'openai'
+                  CHECK (api_type IN ('openai','anthropic','local')),
+    host          TEXT NOT NULL,
+    port          INTEGER NOT NULL DEFAULT 0,
+    api_key_enc   TEXT,
+    model         TEXT NOT NULL,
+    label         TEXT NOT NULL
+);
+INSERT INTO benchmark_targets_local_new SELECT
+    id, benchmark_id, kind, service_ref, api_type, host, port, api_key_enc, model, label
+FROM benchmark_targets;
+DROP TABLE benchmark_targets;
+ALTER TABLE benchmark_targets_local_new RENAME TO benchmark_targets;
+CREATE INDEX idx_benchmark_targets_benchmark ON benchmark_targets(benchmark_id);
+"#,
+        )?;
+        let violations = foreign_key_check(&tx)?;
+        if !violations.is_empty() {
+            anyhow::bail!(
+                "benchmark_targets_local_api_type: {}",
+                violations.join("; ")
+            );
+        }
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
+}
+
+fn managed_cli_service_tags(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+        tx.execute_batch(
+        r#"
+CREATE TABLE services_coding_agent_new (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    engine_id TEXT NOT NULL,
+    category TEXT NOT NULL,
+    display_name TEXT NOT NULL,
+    deploy_method TEXT NOT NULL CHECK(deploy_method IN ('docker','native_embedded','native_binary','native_python_bundle','native_managed_cli','external')),
+    transport TEXT NOT NULL CHECK(transport IN ('embedded','http_direct','sidecar_quic','external_http','agent_rpc')),
+    status TEXT NOT NULL CHECK(status IN ('deploying','starting','running','degraded','failed','stopped','interrupted')) DEFAULT 'starting',
+    pinned INTEGER NOT NULL DEFAULT 0,
+    paused INTEGER NOT NULL DEFAULT 0,
+    runtime_pid INTEGER,
+    runtime_port INTEGER,
+    sidecar_quic_port INTEGER,
+    endpoint_url TEXT,
+    config_json TEXT NOT NULL DEFAULT '{}',
+    active_deploy_id TEXT NOT NULL DEFAULT '',
+    last_deploy_id TEXT NOT NULL DEFAULT '',
+    deployment_progress_pct INTEGER NOT NULL DEFAULT 0,
+    deployed_source_hash TEXT NOT NULL DEFAULT '',
+    health_last_ok TIMESTAMP,
+    health_last_err TEXT,
+    progress_message TEXT,
+    restart_count INTEGER NOT NULL DEFAULT 0,
+    created_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP NOT NULL DEFAULT CURRENT_TIMESTAMP
+);
+INSERT INTO services_coding_agent_new SELECT
+    id, engine_id, category, display_name, deploy_method, transport, status,
+    pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url,
+    config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, deployed_source_hash,
+    health_last_ok, health_last_err, progress_message, restart_count, created_at, updated_at
+FROM services;
+DROP TABLE services;
+ALTER TABLE services_coding_agent_new RENAME TO services;
+CREATE INDEX idx_services_status ON services(status);
+CREATE INDEX idx_services_engine ON services(engine_id);
+CREATE INDEX idx_services_category ON services(category);
+CREATE INDEX idx_services_active_deploy ON services(active_deploy_id);
+"#,
+        )?;
+        let violations = foreign_key_check(&tx)?;
+        if !violations.is_empty() {
+            anyhow::bail!("managed_cli_service_tags: {}", violations.join("; "));
+        }
+        tx.execute(
+            "INSERT INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 // v112 — the built-in Notes screen was removed in favor of the notes addon
@@ -1552,11 +1870,50 @@ fn recordings_add_search_columns(conn: &Connection) -> Result<()> {
     Ok(())
 }
 
+/// Detection zones drawn on a camera: JSON array of polygons, each polygon a
+/// JSON array of `[x, y]` points in NORMALIZED frame coordinates (0.0-1.0), so
+/// a zone survives any resolution change. Empty array = no zones = the whole
+/// frame stays live (backward compatible for every existing camera).
+///
+/// The vision engine drops every detection whose box centre falls outside ALL
+/// zones BEFORE enrichment — an operator watching a wide scene then spends no
+/// OCR/classify budget on positions they do not care about.
+fn cameras_add_zones_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "cameras", "zones_json")? {
+        conn.execute_batch(
+            "ALTER TABLE cameras ADD COLUMN zones_json TEXT NOT NULL DEFAULT '[]';",
+        )?;
+    }
+    Ok(())
+}
+
 fn cameras_add_analysis_fps_column(conn: &Connection) -> Result<()> {
     if !column_exists(conn, "cameras", "analysis_fps")? {
         conn.execute_batch(
             "ALTER TABLE cameras ADD COLUMN analysis_fps INTEGER NOT NULL DEFAULT 10;",
         )?;
+    }
+    Ok(())
+}
+
+/// Adds `is_system` to `flows`. Marks platform-seeded flows that user-facing
+/// handlers must refuse to edit, delete or change status on — the flag is only
+/// ever set by platform seeding, never through the user create/update paths.
+fn flows_add_is_system_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "flows", "is_system")? {
+        conn.execute_batch("ALTER TABLE flows ADD COLUMN is_system INTEGER NOT NULL DEFAULT 0;")?;
+    }
+    Ok(())
+}
+
+/// Adds `citations_json` to `conversation_messages`. Project-chat (ps-chat)
+/// assistant replies persist their RAG citations next to the content, so
+/// `ChatHistoryResponse` can rebuild the sources panel after a reload. NULL /
+/// empty = message without citations (every non-ps-chat writer leaves it NULL).
+/// Idempotent — guarded by a column probe.
+fn conversation_messages_add_citations_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "conversation_messages", "citations_json")? {
+        conn.execute_batch("ALTER TABLE conversation_messages ADD COLUMN citations_json TEXT;")?;
     }
     Ok(())
 }
@@ -2292,6 +2649,53 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "compliance_dsar_requests",
             "subject_id",
             "FK to compliance_data_subjects(subject_id), not user_accounts",
+        ),
+        // Code Studio (v125). Every column below was born TEXT long after the
+        // identity flip and carries no declared user_accounts FK ON PURPOSE:
+        // the registry is synchronized across the org, so a workspace row can
+        // reach a node that has not materialized the referenced account yet —
+        // the same rationale as token_usage_daily.
+        t(
+            "code_workspaces",
+            "owner_user_id",
+            "workspace owner born TEXT in v125 (post-flip); no declared user_accounts FK \
+             because the registry syncs across nodes that may not hold the account yet",
+        ),
+        t(
+            "code_workspace_members",
+            "user_id",
+            "membership principal born TEXT in v125 (post-flip); no declared FK for the \
+             same cross-node reason as the owner column",
+        ),
+        t(
+            "code_workspace_creator_grants",
+            "user_id",
+            "grantee of the create-workspace right, born TEXT in v125 (post-flip); \
+             org-scoped and synchronized, so no declared user_accounts FK",
+        ),
+        t(
+            "code_workspace_creator_grants",
+            "granted_by",
+            "attribution of who granted the right; kept for audit even after the \
+             granting account is deleted, so it is free text rather than an FK",
+        ),
+        t(
+            "code_workspace_allowlist",
+            "created_by",
+            "attribution of the standing permission; kept for audit after the account \
+             is gone, so it is deliberately not an FK",
+        ),
+        t(
+            "code_workspace_secrets",
+            "created_by",
+            "attribution inside the NODE-LOCAL vault; the vault never syncs, and the \
+             record must survive account deletion for audit",
+        ),
+        t(
+            "code_agent_credentials",
+            "created_by",
+            "attribution inside the NODE-LOCAL vault; same rationale as \
+             code_workspace_secrets.created_by",
         ),
     ]
 }
@@ -3737,6 +4141,26 @@ fn roles_add_robot_permissions(conn: &Connection) -> Result<()> {
         &["org_admin", "org_operator"],
         &["robot.command", "robot.estop", "robot.telemetry"],
     )
+}
+
+// v119 — Project Studio ("Projekty"). Every org role may enter the module
+// (`project_studio.read` — per-project access is then gated by project
+// membership roles), while `project_studio.admin` (creator grants, viewing
+// projects outside membership, orphaned-project takeover) stays with
+// org_admin. Idempotent via `roles_add_permissions`.
+fn roles_add_project_studio_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &[
+            "org_admin",
+            "org_operator",
+            "org_viewer",
+            "dpo",
+            "supervisor",
+        ],
+        &["project_studio.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin"], &["project_studio.admin"])
 }
 
 // F2 P6.a — ONVIF metadata (Media2 + PullPoint events). The `cameras` table
@@ -8017,6 +8441,47 @@ mod tests {
         if let Some(json) = stored {
             assert_eq!(json, crate::db::seed::agent_run_flow_json());
         }
+    }
+
+    /// An in-process benchmark target (`api_type='local'`) must survive the
+    /// CHECK constraint on a fully migrated DB. v107 created the table admitting
+    /// only openai/anthropic, so without the v124 rebuild every save of an
+    /// embedded / coding-agent / sidecar target fails at the DB layer.
+    #[test]
+    fn migrated_db_accepts_in_process_benchmark_target() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        let org: String = conn
+            .query_row("SELECT org_id FROM organizations LIMIT 1", [], |r| r.get(0))
+            .expect("seeded org");
+        conn.execute(
+            "INSERT INTO benchmarks (id, org_id, name, config_json) VALUES ('b1', ?1, 'b', '{}')",
+            rusqlite::params![org],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO benchmark_targets
+                 (id, benchmark_id, kind, api_type, host, port, model, label)
+             VALUES ('t1', 'b1', 'service', 'local', '', 0, 'bielik-4.5b', 'Bielik')",
+            [],
+        )
+        .expect("in-process target must pass the api_type CHECK");
+        // The two endpoint protocols keep working, and an unknown one is still rejected.
+        conn.execute(
+            "INSERT INTO benchmark_targets
+                 (id, benchmark_id, kind, api_type, host, port, model, label)
+             VALUES ('t2', 'b1', 'external', 'anthropic', 'api.anthropic.com', 443, 'm', 'A')",
+            [],
+        )
+        .unwrap();
+        assert!(conn
+            .execute(
+                "INSERT INTO benchmark_targets
+                     (id, benchmark_id, kind, api_type, host, port, model, label)
+                 VALUES ('t3', 'b1', 'external', 'grpc', 'h', 1, 'm', 'G')",
+                [],
+            )
+            .is_err());
     }
 
     /// Builds a DB at exactly the pre-flip schema state (INTEGER identity ids) by

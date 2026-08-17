@@ -52,6 +52,7 @@ pub fn spawn_ft_training(
     num_gpus: Option<u32>,
 ) {
     tokio::spawn(async move {
+        crate::ml_studio::live_view::register_local_run(&run_id);
         if let Err(err) = run_training(
             &run_id,
             &project_id,
@@ -73,6 +74,8 @@ pub fn spawn_ft_training(
             tracing::warn!(run_id = %run_id, error = %err, "LLM fine-tuning failed");
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
+        crate::ml_studio::live_view::clear_local_job(&run_id);
+        crate::ml_studio::live_view::forget_local_run(&run_id);
     });
 }
 
@@ -147,6 +150,13 @@ async fn run_training(
         if tokio::time::Instant::now() >= deadline {
             anyhow::bail!("LLM training timed out after {}s", JOB_TIMEOUT.as_secs());
         }
+        // Anulowanie zgłoszone przez użytkownika: serwis dostał już `POST /cancel`
+        // od handlera, więc pętla nadzoru nie ma czego pilnować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            repository::update_training_run_status(run_id, "cancelled")?;
+            crate::ml_studio::live_view::clear_cancel(run_id);
+            return Ok(());
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
 
         let url = status_url.clone();
@@ -163,6 +173,11 @@ async fn run_training(
 
         match st.status.as_str() {
             "running" => continue,
+            "cancelled" => {
+                repository::update_training_run_status(run_id, "cancelled")?;
+                crate::ml_studio::live_view::clear_cancel(run_id);
+                return Ok(());
+            }
             "succeeded" => {
                 let metrics_json = json!({
                     "train_loss": st.train_loss,
@@ -560,11 +575,32 @@ async fn run_local_worker(
         let st = tokio::task::spawn_blocking(move || get_status(&u)).await??;
         match st.status.as_str() {
             "running" => continue,
+            // Rank>0 tylko dożywa końca DDP — anulowanie rangi 0 kończy i jego.
+            "cancelled" => return Ok(()),
             "succeeded" => return Ok(()),
             "failed" => anyhow::bail!(st.error.unwrap_or_else(|| "worker failed".into())),
             other => anyhow::bail!("unknown worker status '{}'", other),
         }
     }
+}
+
+/// B-side (odbiorca `MlTrainCancel` dla joba LLM): woła `/cancel` lokalnego serwisu
+/// ml-training dla joba zmapowanego z `run_id`.
+pub async fn mesh_train_cancel_llm(run_id: &str) -> anyhow::Result<()> {
+    let (base, job_id) = mesh_jobs_llm()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs_llm lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany job LLM mesh: {}", run_id))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::ml_studio::live_view::cancel_service_job_blocking(&base, &job_id)
+    })
+    .await?;
+    if !ok {
+        anyhow::bail!("serwis ml-training odrzucił żądanie anulowania");
+    }
+    Ok(())
 }
 
 /// B-side (odbiorca `MlTrainStatus` dla joba LLM): surowy JSON statusu z serwisu.

@@ -7,7 +7,7 @@
 use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, Read, Seek, SeekFrom};
-use std::path::{Component, Path, PathBuf};
+use std::path::{Component, Path};
 
 use forge_types::{ForgeError, Result};
 use serde::Deserialize;
@@ -594,6 +594,7 @@ fn validate_open_file_location(
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
+        use std::path::PathBuf;
 
         let descriptor = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
         let opened = std::fs::canonicalize(descriptor).map_err(|error| {

@@ -70,7 +70,9 @@ fn fmt_f64(v: f64) -> String {
 
 /// Escape a label value per the exposition format (backslash, quote, newline).
 fn escape_label(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n")
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// Build the full exposition body from the engine metrics and HTTP counts.
@@ -145,6 +147,72 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
         "Speculative draft tokens accepted across verify forwards.",
         load(&engine.spec_accepted_total),
     );
+    counter(
+        &mut out,
+        "forge_engine_native_mtp_b2_steps_total",
+        "Native MTP steps executed by the paired B2 fast path.",
+        load(&engine.native_mtp_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_steps_total",
+        "Wspólne kroki targetowego prefill B2 T32.",
+        load(&engine.hybrid_prefill_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_tokens_total",
+        "Tokeny promptu wykonane przez targetowy prefill B2 T32.",
+        load(&engine.hybrid_prefill_b2_tokens_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_fallbacks_total",
+        "Pary prefill skierowane do wykonania serialnego.",
+        load(&engine.hybrid_prefill_b2_fallbacks_total),
+    );
+    gauge(
+        &mut out,
+        "forge_engine_hybrid_prefill_b2_scratch_bytes",
+        "Logiczny rozmiar zaalokowanego dedykowanego scratchu prefill B2.",
+        load(&engine.hybrid_prefill_b2_scratch_bytes),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_decode_batch_steps_total",
+        "Decode steps executed by the shared hybrid batched forward.",
+        load(&engine.hybrid_decode_batch_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_hybrid_decode_batch_lanes_total",
+        "Lanes served by those steps; lanes/steps is the realised group width.",
+        load(&engine.hybrid_decode_batch_lanes_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_mtp_ngram_b2_steps_total",
+        "MTP+n-gram verifies executed by the paired N/N B2 fast path.",
+        load(&engine.mtp_ngram_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_mtp_routed_nn_b2_steps_total",
+        "Routed MTP B2 verifies for N/N source pairs.",
+        load(&engine.mtp_routed_nn_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_mtp_routed_nm_b2_steps_total",
+        "Routed MTP B2 verifies for N/M or M/N source pairs.",
+        load(&engine.mtp_routed_nm_b2_steps_total),
+    );
+    counter(
+        &mut out,
+        "forge_engine_mtp_routed_mm_b2_steps_total",
+        "Routed MTP B2 verifies for M/M source pairs.",
+        load(&engine.mtp_routed_mm_b2_steps_total),
+    );
 
     // ---- Gauges ----
     gauge(
@@ -202,4 +270,49 @@ pub fn render(engine: &EngineMetrics, http: &HttpMetrics, model_id: &str) -> Str
     );
 
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::{render, HttpMetrics};
+    use forge_engine::metrics::EngineMetrics;
+
+    #[test]
+    fn prometheus_eksponuje_liczniki_prefill_i_mtp_ngram_b2() {
+        let engine = EngineMetrics::new();
+        engine
+            .hybrid_prefill_b2_steps_total
+            .store(5, Ordering::Relaxed);
+        engine
+            .hybrid_prefill_b2_tokens_total
+            .store(320, Ordering::Relaxed);
+        engine
+            .hybrid_prefill_b2_fallbacks_total
+            .store(4, Ordering::Relaxed);
+        engine
+            .hybrid_prefill_b2_scratch_bytes
+            .store(450_692_688, Ordering::Relaxed);
+        engine.mtp_ngram_b2_steps_total.store(7, Ordering::Relaxed);
+        engine
+            .mtp_routed_nn_b2_steps_total
+            .store(3, Ordering::Relaxed);
+        engine
+            .mtp_routed_nm_b2_steps_total
+            .store(2, Ordering::Relaxed);
+        engine
+            .mtp_routed_mm_b2_steps_total
+            .store(1, Ordering::Relaxed);
+        let output = render(&engine, &HttpMetrics::default(), "test");
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_steps_total 5"));
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_tokens_total 320"));
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_fallbacks_total 4"));
+        assert!(output.contains("forge_engine_hybrid_prefill_b2_scratch_bytes 450692688"));
+        assert!(output.contains("# TYPE forge_engine_mtp_ngram_b2_steps_total counter"));
+        assert!(output.contains("forge_engine_mtp_ngram_b2_steps_total 7"));
+        assert!(output.contains("forge_engine_mtp_routed_nn_b2_steps_total 3"));
+        assert!(output.contains("forge_engine_mtp_routed_nm_b2_steps_total 2"));
+        assert!(output.contains("forge_engine_mtp_routed_mm_b2_steps_total 1"));
+    }
 }

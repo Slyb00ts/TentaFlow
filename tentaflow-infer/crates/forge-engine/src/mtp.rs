@@ -1,16 +1,17 @@
 // =============================================================================
 // Plik: mtp.rs
-// Opis: Typowane wagi MTP oraz niezależny stan KV i hidden dla draftu NextN.
+// Opis: Typowane wagi MTP i stan draftu NextN korzystający ze wspólnej puli KV.
 // Przykład: MtpWeights::load(descriptor, params, loader, embedding, output)
 // =============================================================================
 
 use std::sync::Arc;
 
 use forge_formats::{Hyperparams, MtpDescriptor, MtpWeightRole};
-use forge_hal::{DevBuffer, Device, Pool, Stream};
+use forge_hal::{DevBuffer, Device, Event, Pool, Stream};
+use forge_kernels::{Kernels, Nvfp4GgufLayout};
 use forge_types::{ForgeError, MemKind, Result};
 
-use crate::kv::{KvCache, KvConfig, SeqKv};
+use crate::kv::{KvCache, SeqKv};
 use crate::weights::{
     AttnWeights, DenseFfn, DevWeight, GateUpWeights, LayerFfn, LayerMixer, LayerWeights, QkvWeights,
 };
@@ -18,6 +19,13 @@ use crate::weights::{
 /// Adapter źródła tensorów używany przez loader MTP niezależnie od GGUF i safetensors.
 pub trait MtpTensorLoader {
     fn matrix(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight>;
+    /// Ładuje macierz i GWARANTUJE Q8_0 na urządzeniu, przekwantowując z
+    /// formatu pliku, jeżeli trzeba. Używane wyłącznie dla `eh_proj`: cała
+    /// ścieżka MTP (`mtp_prepare_f16`, `mtp_project_joined_q8_f16`) czyta ją
+    /// jednym kernelem Q8_0, a checkpointy Q4_K trzymają tę jedną macierz w
+    /// Q4_K. Przekwantowanie kosztuje tu 26 MiB VRAM na całą głowę i jest
+    /// tańsze niż drugi komplet kerneli o innej arytmetyce.
+    fn matrix_q8(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight>;
     fn vector(&mut self, name: &str, len: usize) -> Result<DevBuffer>;
 }
 
@@ -45,11 +53,14 @@ impl MtpEmbedding {
 
 pub struct MtpWeights {
     pub descriptor: MtpDescriptor,
+    pub shares_target_embedding: bool,
     /// Jeden staged wiersz embeddingu używany jako wejście kernela MTP.
     pub token_embedding: DevBuffer,
     pub embedding: MtpEmbedding,
     /// Waga współdzieląca alokacje LM headu targetu.
     pub output: DevWeight,
+    /// Opcjonalna, stratna kopia headu używana wyłącznie do propozycji draftu.
+    pub draft_output: Option<DevWeight>,
     pub layers: Vec<MtpLayerWeights>,
 }
 
@@ -72,7 +83,11 @@ impl MtpWeights {
                 MtpEmbedding::HostF16
                     | MtpEmbedding::Device(DevWeight::F16 { .. })
                     | MtpEmbedding::Device(DevWeight::Q8_0 { .. })
-                    | MtpEmbedding::Device(DevWeight::NvFp4Gguf { .. })
+                    | MtpEmbedding::Device(DevWeight::Q4K { .. })
+                    | MtpEmbedding::Device(DevWeight::NvFp4Gguf {
+                        layout: Nvfp4GgufLayout::RowMajor36,
+                        ..
+                    })
             )
             && !matches!(
                 &self.output,
@@ -117,12 +132,12 @@ impl MtpWeights {
         let first_layer = descriptor.layers.first().ok_or_else(|| {
             ForgeError::Format("MTP: deskryptor nie zawiera mapy pierwszej warstwy".into())
         })?;
+        let shares_target_embedding = !first_layer.contains_key(&MtpWeightRole::Embedding)
+            && descriptor.share_target_embedding;
         let embedding = match first_layer.get(&MtpWeightRole::Embedding) {
-            Some(name) => MtpEmbedding::Device(loader.matrix(
-                name,
-                params.vocab_size,
-                params.hidden_size,
-            )?),
+            Some(name) => {
+                MtpEmbedding::Device(loader.matrix(name, params.vocab_size, params.hidden_size)?)
+            }
             None if descriptor.share_target_embedding => embedding,
             None => {
                 return Err(ForgeError::Format(
@@ -167,6 +182,17 @@ impl MtpWeights {
         let inter = params.intermediate_size;
         let mut layers = Vec::with_capacity(descriptor.block_count);
         for (index, names) in descriptor.layers.iter().enumerate() {
+            // The speculation head repeats the trunk's block, so a mixture trunk
+            // gives it a mixture block — and this loader builds a dense one. It
+            // is refused HERE, where the native MTP runtime is assembled, rather
+            // than at the descriptor: a checkpoint whose head this runtime
+            // cannot compute is still a checkpoint whose trunk it can.
+            if names.contains_key(&MtpWeightRole::FfnGateExps) {
+                return Err(ForgeError::Unsupported(format!(
+                    "MTP: warstwa {index} niesie ekspertów, a natywny runtime MTP \
+                     liczy tylko blok gęsty"
+                )));
+            }
             let name = |role| {
                 names.get(&role).map(String::as_str).ok_or_else(|| {
                     ForgeError::Format(format!("MTP: warstwa {index} nie ma roli {role:?}"))
@@ -181,9 +207,17 @@ impl MtpWeights {
                 .map(|tensor| loader.vector(tensor, params.head_dim))
                 .transpose()?;
             let block = LayerWeights {
+                hc_attn: None,
+                hc_ffn: None,
+                // Głowa MTP nie ma norm sandwich ani skali warstwy.
+                post_attn_norm: None,
+                post_ffw_norm: None,
+                layer_output_scale: None,
                 attn_norm: loader.vector(name(MtpWeightRole::AttnNorm)?, hidden)?,
                 ffn_norm: loader.vector(name(MtpWeightRole::FfnNorm)?, hidden)?,
                 mixer: LayerMixer::Attention(Box::new(AttnWeights {
+                    v_norm: None,
+                    attn_gate: None,
                     q_norm,
                     k_norm,
                     attn_qkv: QkvWeights::Split {
@@ -202,7 +236,7 @@ impl MtpWeights {
                 }),
             };
             layers.push(MtpLayerWeights {
-                eh_proj: loader.matrix(name(MtpWeightRole::EhProj)?, hidden, 2 * hidden)?,
+                eh_proj: loader.matrix_q8(name(MtpWeightRole::EhProj)?, hidden, 2 * hidden)?,
                 enorm: loader.vector(name(MtpWeightRole::ENorm)?, hidden)?,
                 hnorm: loader.vector(name(MtpWeightRole::HNorm)?, hidden)?,
                 shared_head_norm: loader.vector(name(MtpWeightRole::SharedHeadNorm)?, hidden)?,
@@ -212,9 +246,11 @@ impl MtpWeights {
 
         Ok(Self {
             descriptor: descriptor.clone(),
+            shares_target_embedding,
             token_embedding: target_embedding.clone(),
             embedding,
             output,
+            draft_output: None,
             layers,
         })
     }
@@ -222,6 +258,17 @@ impl MtpWeights {
 
 fn share_weight(weight: &DevWeight) -> DevWeight {
     match weight {
+        DevWeight::Fp8Row {
+            buf,
+            scales,
+            rows,
+            cols,
+        } => DevWeight::Fp8Row {
+            buf: buf.clone(),
+            scales: scales.clone(),
+            rows: *rows,
+            cols: *cols,
+        },
         DevWeight::F16 { buf, rows, cols } => DevWeight::F16 {
             buf: buf.clone(),
             rows: *rows,
@@ -328,14 +375,22 @@ fn share_weight(weight: &DevWeight) -> DevWeight {
             cols: *cols,
         },
         DevWeight::NvFp4 {
-            packed,
-            scales,
+            storage,
             inv_global_scale,
             rows,
             cols,
         } => DevWeight::NvFp4 {
-            packed: packed.clone(),
-            scales: scales.clone(),
+            storage: match storage {
+                crate::weights::NvFp4CtStorage::RowMajorE4M3 { packed, scales } => {
+                    crate::weights::NvFp4CtStorage::RowMajorE4M3 {
+                        packed: packed.clone(),
+                        scales: scales.clone(),
+                    }
+                }
+                crate::weights::NvFp4CtStorage::S0N64K128 { data } => {
+                    crate::weights::NvFp4CtStorage::S0N64K128 { data: data.clone() }
+                }
+            },
             inv_global_scale: *inv_global_scale,
             rows: *rows,
             cols: *cols,
@@ -345,19 +400,20 @@ fn share_weight(weight: &DevWeight) -> DevWeight {
             output_scale,
             rows,
             cols,
+            layout,
         } => DevWeight::NvFp4Gguf {
             buf: buf.clone(),
             output_scale: *output_scale,
             rows: *rows,
             cols: *cols,
+            layout: *layout,
         },
     }
 }
 
-/// Właściciel odrębnego KV MTP i hidden przenoszonego między krokami draftu.
+/// Stan jednej sekwencji MTP korzystającej ze współdzielonego cache stron.
 pub struct MtpDraftState {
     device: Arc<dyn Device>,
-    pub kv: KvCache,
     pub seq: SeqKv,
     pub recurrent_hidden: DevBuffer,
     pub catchup_hidden: DevBuffer,
@@ -368,25 +424,45 @@ pub struct MtpDraftState {
     pub position: DevBuffer,
     pub token_ids: DevBuffer,
     pub pinned_token_ids: DevBuffer,
+    pub pinned_scalar: DevBuffer,
+    pub pinned_scalar_ready: Event,
+    pub pinned_scalar_recorded: bool,
+    zero_hidden: DevBuffer,
+    empty_page_table: DevBuffer,
+    zero_scalar: DevBuffer,
     checkpoint_hidden: DevBuffer,
+    checkpoint_page_table: DevBuffer,
+    checkpoint_seq_len: DevBuffer,
+    checkpoint_position: DevBuffer,
     step_hidden: DevBuffer,
-    pinned_metadata: DevBuffer,
-    pinned_page_table: DevBuffer,
     checkpoint_len: Option<usize>,
     host_embedding_gathers: u64,
+    #[cfg(test)]
+    fail_rollback_once: bool,
+    #[cfg(test)]
+    fail_checkpoint_once: bool,
+}
+
+fn new_page_mapping(position: usize, page_size: usize, pages: &[i32]) -> Option<(usize, i32)> {
+    position.is_multiple_of(page_size).then(|| {
+        (
+            pages.len() - 1,
+            *pages.last().expect("grow dodał stronę na granicy"),
+        )
+    })
 }
 
 impl MtpDraftState {
     pub fn new(
         device: Arc<dyn Device>,
-        kv_config: KvConfig,
+        kv: &KvCache,
         hidden_size: usize,
         vocab_size: usize,
     ) -> Result<Self> {
-        if kv_config.n_layers != 1 {
+        if kv.cfg.n_layers != 1 {
             return Err(ForgeError::Format(format!(
                 "MTP wymaga dokładnie jednej warstwy KV, otrzymano {}",
-                kv_config.n_layers
+                kv.cfg.n_layers
             )));
         }
         let hidden_bytes = hidden_size
@@ -405,42 +481,91 @@ impl MtpDraftState {
                 "MTP: vocab_size musi być dodatni".into(),
             ));
         }
-        let max_pages_per_seq = kv_config.max_pages_per_seq;
-        let kv = KvCache::new(device.as_ref(), kv_config)?;
+        let max_pages_per_seq = kv.cfg.max_pages_per_seq;
         let seq = kv.new_seq();
         let recurrent_hidden = device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?;
+        let page_table = device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Activations)?;
+        let seq_len = device.alloc(4, MemKind::Device, Pool::Activations)?;
+        let position = device.alloc(4, MemKind::Device, Pool::Activations)?;
         device.write(&vec![0u8; hidden_bytes], &recurrent_hidden, 0)?;
+        device.write(&vec![0xff; max_pages_per_seq * 4], &page_table, 0)?;
+        device.write(&[0u8; 4], &seq_len, 0)?;
+        device.write(&[0u8; 4], &position, 0)?;
+        let zero_hidden = device.alloc(hidden_bytes, MemKind::PinnedHost, Pool::Activations)?;
+        let empty_page_table = device.alloc(
+            max_pages_per_seq * 4,
+            MemKind::PinnedHost,
+            Pool::Activations,
+        )?;
+        let zero_scalar = device.alloc(4, MemKind::PinnedHost, Pool::Activations)?;
+        unsafe {
+            std::ptr::write_bytes(
+                zero_hidden
+                    .host_ptr()
+                    .expect("pinned zero hidden ma mapowanie"),
+                0,
+                hidden_bytes,
+            );
+            std::ptr::write_bytes(
+                empty_page_table
+                    .host_ptr()
+                    .expect("pinned pusta tabela stron ma mapowanie"),
+                0xff,
+                max_pages_per_seq * 4,
+            );
+            std::ptr::write_bytes(
+                zero_scalar
+                    .host_ptr()
+                    .expect("pinned zero scalar ma mapowanie"),
+                0,
+                4,
+            );
+        }
         Ok(Self {
             recurrent_hidden,
             catchup_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             prepared_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
             logits: device.alloc(logits_bytes, MemKind::Device, Pool::Activations)?,
-            page_table: device.alloc(max_pages_per_seq * 4, MemKind::Device, Pool::Activations)?,
-            seq_len: device.alloc(4, MemKind::Device, Pool::Activations)?,
-            position: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            page_table,
+            seq_len,
+            position,
             token_ids: device.alloc(5 * 4, MemKind::Device, Pool::Activations)?,
             pinned_token_ids: device.alloc(5 * 4, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_scalar: device.alloc(4, MemKind::PinnedHost, Pool::Activations)?,
+            pinned_scalar_ready: device.create_event()?,
+            pinned_scalar_recorded: false,
+            zero_hidden,
+            empty_page_table,
+            zero_scalar,
             checkpoint_hidden: device.alloc(hidden_bytes, MemKind::Device, Pool::Activations)?,
-            step_hidden: device.alloc(4 * hidden_bytes, MemKind::Device, Pool::Activations)?,
-            pinned_metadata: device.alloc(8, MemKind::PinnedHost, Pool::Activations)?,
-            pinned_page_table: device.alloc(
+            checkpoint_page_table: device.alloc(
                 max_pages_per_seq * 4,
-                MemKind::PinnedHost,
+                MemKind::Device,
                 Pool::Activations,
             )?,
+            checkpoint_seq_len: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            checkpoint_position: device.alloc(4, MemKind::Device, Pool::Activations)?,
+            step_hidden: device.alloc(4 * hidden_bytes, MemKind::Device, Pool::Activations)?,
             device,
-            kv,
             seq,
             checkpoint_len: None,
             host_embedding_gathers: 0,
+            #[cfg(test)]
+            fail_rollback_once: false,
+            #[cfg(test)]
+            fail_checkpoint_once: false,
         })
     }
 
-    pub fn grow(&mut self) -> Result<()> {
-        self.kv.grow(&mut self.seq)
+    pub fn grow(&mut self, kv: &mut KvCache) -> Result<()> {
+        kv.grow(&mut self.seq)
     }
 
     pub fn checkpoint(&mut self, stream: &Stream) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_checkpoint_once) {
+            return Err(ForgeError::Device("MTP: wymuszony błąd checkpointu".into()));
+        }
         if self.checkpoint_len.is_some() {
             return Err(ForgeError::Scheduler(
                 "MTP: poprzedni checkpoint nie został rozstrzygnięty".into(),
@@ -454,49 +579,130 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
+        self.device.copy(
+            &self.page_table,
+            0,
+            &self.checkpoint_page_table,
+            0,
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device
+            .copy(&self.seq_len, 0, &self.checkpoint_seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.position, 0, &self.checkpoint_position, 0, 4, stream)?;
         self.checkpoint_len = Some(self.seq.len);
         Ok(())
     }
 
-    pub fn stage_step(&mut self, stream: &Stream) -> Result<usize> {
-        let position = self.seq.len;
-        self.grow()?;
-        let metadata = self
-            .pinned_metadata
-            .host_ptr()
-            .expect("pinned metadata ma mapowanie hosta");
-        unsafe {
-            let values = [position as i32, self.seq.len as i32];
-            std::ptr::copy_nonoverlapping(values.as_ptr() as *const u8, metadata, 8);
+    /// Zeruje pusty runtime w ramach aktywnej transakcji bez kasowania checkpointu.
+    pub fn reset_pending(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
+        if self.checkpoint_len != Some(0) || self.seq.len != 0 || !self.seq.pages.is_empty() {
+            return Err(ForgeError::Scheduler(
+                "MTP: transakcyjny reset wymaga pustego checkpointu".into(),
+            ));
         }
-        let page_table = self
-            .pinned_page_table
-            .host_ptr()
-            .expect("pinned page table ma mapowanie hosta");
-        unsafe {
-            std::ptr::write_bytes(page_table, 0xff, self.pinned_page_table.len());
-            std::ptr::copy_nonoverlapping(
-                self.seq.pages.as_ptr() as *const u8,
-                page_table,
-                self.seq.pages.len() * 4,
-            );
-        }
-        self.device
-            .copy(&self.pinned_metadata, 0, &self.position, 0, 4, stream)?;
-        self.device
-            .copy(&self.pinned_metadata, 4, &self.seq_len, 0, 4, stream)?;
         self.device.copy(
-            &self.pinned_page_table,
+            &self.zero_hidden,
+            0,
+            &self.recurrent_hidden,
+            0,
+            self.recurrent_hidden.len(),
+            stream,
+        )?;
+        self.device.copy(
+            &self.empty_page_table,
             0,
             &self.page_table,
             0,
-            self.pinned_page_table.len(),
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.position, 0, 4, stream)?;
+        kv.release(&mut self.seq);
+        Ok(())
+    }
+
+    /// Czyści cały stan sekwencji MTP na tym samym streamie co wcześniejszy compute.
+    pub fn reset(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
+        self.device.copy(
+            &self.zero_hidden,
+            0,
+            &self.recurrent_hidden,
+            0,
+            self.recurrent_hidden.len(),
+            stream,
+        )?;
+        self.device.copy(
+            &self.empty_page_table,
+            0,
+            &self.page_table,
+            0,
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.zero_scalar, 0, &self.position, 0, 4, stream)?;
+        kv.release(&mut self.seq);
+        self.checkpoint_len = None;
+        Ok(())
+    }
+
+    pub fn stage_step(
+        &mut self,
+        kv: &mut KvCache,
+        kernels: &Kernels,
+        stream: &Stream,
+    ) -> Result<usize> {
+        let position = self.seq.len;
+        self.grow(kv)?;
+        let mapping = new_page_mapping(position, kv.cfg.page_size, &self.seq.pages);
+        kernels.mtp_stage_step(
+            &self.position,
+            &self.seq_len,
+            &self.page_table,
+            position,
+            self.seq.len,
+            mapping.map(|value| value.0),
+            mapping.map(|value| value.1),
             stream,
         )?;
         Ok(position)
     }
 
-    pub fn rollback(&mut self, stream: &Stream) -> Result<()> {
+    /// Rezerwuje ciąg pozycji MTP i aktualizuje jego tabelę stron jednym zapisem.
+    pub fn stage_batch(
+        &mut self,
+        kv: &mut KvCache,
+        n_tokens: usize,
+    ) -> Result<(usize, Vec<i32>, i32, i32)> {
+        if n_tokens == 0 {
+            return Err(ForgeError::Scheduler("MTP: pusty batch catch-up".into()));
+        }
+        let base = self.seq.len;
+        for _ in 0..n_tokens {
+            self.grow(kv)?;
+        }
+        let mut page_table = vec![-1i32; kv.cfg.max_pages_per_seq];
+        page_table[..self.seq.pages.len()].copy_from_slice(&self.seq.pages);
+        Ok((
+            base,
+            page_table,
+            self.seq.len as i32,
+            (self.seq.len - 1) as i32,
+        ))
+    }
+
+    pub fn rollback(&mut self, kv: &mut KvCache, stream: &Stream) -> Result<()> {
+        #[cfg(test)]
+        if std::mem::take(&mut self.fail_rollback_once) {
+            return Err(ForgeError::Device("MTP: wymuszony błąd rollbacku".into()));
+        }
         let len = self.checkpoint_len.ok_or_else(|| {
             ForgeError::Scheduler("MTP: rollback bez aktywnego checkpointu".into())
         })?;
@@ -508,7 +714,19 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
-        self.kv.rollback(&mut self.seq, len);
+        self.device.copy(
+            &self.checkpoint_page_table,
+            0,
+            &self.page_table,
+            0,
+            self.page_table.len(),
+            stream,
+        )?;
+        self.device
+            .copy(&self.checkpoint_seq_len, 0, &self.seq_len, 0, 4, stream)?;
+        self.device
+            .copy(&self.checkpoint_position, 0, &self.position, 0, 4, stream)?;
+        kv.rollback(&mut self.seq, len);
         self.checkpoint_len = None;
         Ok(())
     }
@@ -529,15 +747,19 @@ impl MtpDraftState {
         )
     }
 
-    pub fn commit_prefix(&mut self, retained: usize, stream: &Stream) -> Result<()> {
-        let base = self.checkpoint_len.ok_or_else(|| {
-            ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into())
-        })?;
+    pub fn commit_prefix(
+        &mut self,
+        kv: &mut KvCache,
+        retained: usize,
+        stream: &Stream,
+    ) -> Result<()> {
+        let base = self
+            .checkpoint_len
+            .ok_or_else(|| ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into()))?;
         if retained == 0 || retained > 4 || base + retained > self.seq.len {
             return Err(ForgeError::Scheduler(format!(
                 "MTP: niepoprawna długość zatwierdzenia {retained} dla zakresu {}..{}",
-                base,
-                self.seq.len
+                base, self.seq.len
             )));
         }
         self.device.copy(
@@ -548,13 +770,65 @@ impl MtpDraftState {
             self.recurrent_hidden.len(),
             stream,
         )?;
-        self.kv.rollback(&mut self.seq, base + retained);
+        kv.rollback(&mut self.seq, base + retained);
         self.checkpoint_len = None;
         Ok(())
     }
 
+    pub(crate) fn validate_commit_prefix_metadata(&self, retained: usize) -> Result<usize> {
+        let base = self
+            .checkpoint_len
+            .ok_or_else(|| ForgeError::Scheduler("MTP: commit bez aktywnego checkpointu".into()))?;
+        if retained == 0 || retained > 4 || base + retained > self.seq.len {
+            return Err(ForgeError::Scheduler(format!(
+                "MTP: niepoprawna długość zatwierdzenia {retained} dla zakresu {}..{}",
+                base, self.seq.len
+            )));
+        }
+        Ok(base + retained)
+    }
+
+    pub(crate) fn apply_commit_prefix_metadata(&mut self, kv: &mut KvCache, target: usize) {
+        kv.rollback(&mut self.seq, target);
+        self.checkpoint_len = None;
+    }
+
+    /// Zatwierdza sekwencyjny catch-up wykonany od aktywnego checkpointu.
+    pub fn commit_catchup(&mut self, retained: usize) -> Result<()> {
+        self.validate_commit_catchup(retained)?;
+        self.apply_commit_catchup();
+        Ok(())
+    }
+
+    pub(crate) fn validate_commit_catchup(&self, retained: usize) -> Result<()> {
+        let base = self.checkpoint_len.ok_or_else(|| {
+            ForgeError::Scheduler("MTP: commit catch-up bez aktywnego checkpointu".into())
+        })?;
+        if retained == 0 || base + retained != self.seq.len {
+            return Err(ForgeError::Scheduler(format!(
+                "MTP: niepoprawna długość catch-up {retained} dla zakresu {base}..{}",
+                self.seq.len
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn apply_commit_catchup(&mut self) {
+        self.checkpoint_len = None;
+    }
+
     pub fn checkpoint_len(&self) -> Option<usize> {
         self.checkpoint_len
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_rollback_failure(&mut self) {
+        self.fail_rollback_once = true;
+    }
+
+    #[cfg(test)]
+    pub(crate) fn inject_checkpoint_failure(&mut self) {
+        self.fail_checkpoint_once = true;
     }
 
     pub fn record_host_embedding_gather(&mut self) {
@@ -565,8 +839,8 @@ impl MtpDraftState {
         self.host_embedding_gathers
     }
 
-    pub fn release(&mut self) {
-        self.kv.release(&mut self.seq);
+    pub fn release(&mut self, kv: &mut KvCache) {
+        kv.release(&mut self.seq);
         self.checkpoint_len = None;
     }
 }
@@ -576,8 +850,20 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::kv::KvConfig;
     use forge_formats::{MoeParams, PoolingType};
     use forge_hal::cpu::CpuDevice;
+
+    #[test]
+    fn mapowanie_stron_powstaje_tylko_na_granicy() {
+        assert_eq!(new_page_mapping(0, 2, &[7]), Some((0, 7)));
+        assert_eq!(new_page_mapping(1, 2, &[7]), None);
+        assert_eq!(new_page_mapping(2, 2, &[7, 11]), Some((1, 11)));
+        assert_eq!(new_page_mapping(3, 2, &[7, 11]), None);
+        assert_eq!(new_page_mapping(0, 4, &[5]), Some((0, 5)));
+        assert_eq!(new_page_mapping(3, 4, &[5]), None);
+        assert_eq!(new_page_mapping(4, 4, &[5, 9]), Some((1, 9)));
+    }
 
     struct SyntheticLoader {
         device: Arc<dyn Device>,
@@ -607,6 +893,17 @@ mod tests {
             })
         }
 
+        fn matrix_q8(&mut self, name: &str, rows: usize, cols: usize) -> Result<DevWeight> {
+            self.loaded.push((name.to_string(), rows, cols));
+            Ok(DevWeight::Q8_0 {
+                buf: self
+                    .device
+                    .alloc(rows * (cols / 32) * 34, MemKind::Device, Pool::Weights)?,
+                rows,
+                cols,
+            })
+        }
+
         fn vector(&mut self, name: &str, len: usize) -> Result<DevBuffer> {
             self.loaded.push((name.to_string(), 1, len));
             self.device.alloc(len * 2, MemKind::Device, Pool::Weights)
@@ -624,15 +921,26 @@ mod tests {
             vocab_size: 64,
             rope_theta: 10_000.0,
             rms_norm_eps: 1e-6,
+            post_norm_eps: 1e-6,
             max_position_embeddings: 1024,
             tie_word_embeddings: true,
             pooling_type: PoolingType::None,
             moe: None::<MoeParams>,
             qk_norm_over_hidden: false,
+            v_rms_norm: false,
+            suppress_tokens: Vec::new(),
             ssm: None,
             rope_sections: None,
             full_attention_interval: 0,
             attn_gated: true,
+            ffn_activation: forge_formats::FfnActivation::SiLU,
+            alt_attn: None,
+            rope_sliding_only: false,
+            final_logit_softcap: 0.0,
+            logit_scale: 1.0,
+            attn_logit_scale: None,
+            deepseek_v4: None,
+            embd_scale: None,
         }
     }
 
@@ -704,6 +1012,7 @@ mod tests {
         )
         .expect("załaduj syntetyczne MTP");
         assert_eq!(weights.layers.len(), 1);
+        assert!(weights.shares_target_embedding);
         assert!(weights.runtime_supported());
         assert_eq!(weights.token_embedding.device_ptr(), embedding.device_ptr());
         let DevWeight::F16 { buf, .. } = &weights.output else {
@@ -758,6 +1067,7 @@ mod tests {
             &output,
         )
         .expect("załaduj dedykowane MTP IO");
+        assert!(!weights.shares_target_embedding);
         let MtpEmbedding::Device(DevWeight::F16 {
             buf: embedding_buf, ..
         }) = &weights.embedding
@@ -833,31 +1143,110 @@ mod tests {
             max_pages_per_seq: 4,
             quant: crate::kv::KvQuant::F16,
         };
-        let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
         for _ in 0..3 {
-            state.grow().unwrap();
+            state.grow(&mut kv).unwrap();
         }
         device
             .write(&[1, 2, 3, 4, 5, 6, 7, 8], &state.recurrent_hidden, 0)
             .unwrap();
         state.checkpoint(&stream).unwrap();
         for _ in 0..3 {
-            state.grow().unwrap();
+            state.grow(&mut kv).unwrap();
         }
         device.write(&[9; 8], &state.recurrent_hidden, 0).unwrap();
         assert_eq!(state.seq.len, 6);
-        assert_eq!(state.kv.free_page_count(), 1);
+        assert_eq!(kv.free_page_count(), 1);
 
-        state.rollback(&stream).unwrap();
+        state.rollback(&mut kv, &stream).unwrap();
         assert_eq!(state.seq.len, 3);
         assert_eq!(state.seq.pages.len(), 2);
-        assert_eq!(state.kv.free_page_count(), 2);
+        assert_eq!(kv.free_page_count(), 2);
         assert_eq!(state.checkpoint_len(), None);
         let mut hidden = [0u8; 8];
         device
             .read(&state.recurrent_hidden, 0, &mut hidden)
             .unwrap();
         assert_eq!(hidden, [1, 2, 3, 4, 5, 6, 7, 8]);
+    }
+
+    #[test]
+    fn reset_oddaje_strony_i_czysci_caly_stan_sekwencji() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 2,
+            n_pages: 4,
+            max_pages_per_seq: 4,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+        for _ in 0..3 {
+            state.grow(&mut kv).unwrap();
+        }
+        state.checkpoint(&stream).unwrap();
+        device.write(&[7u8; 8], &state.recurrent_hidden, 0).unwrap();
+        device.write(&[3u8; 4], &state.seq_len, 0).unwrap();
+        device.write(&[2u8; 4], &state.position, 0).unwrap();
+        assert_eq!(kv.free_page_count(), 2);
+
+        state.reset(&mut kv, &stream).unwrap();
+        stream.synchronize().unwrap();
+
+        assert_eq!(state.seq.len, 0);
+        assert!(state.seq.pages.is_empty());
+        assert_eq!(state.checkpoint_len(), None);
+        assert_eq!(kv.free_page_count(), 4);
+        let mut hidden = [0xffu8; 8];
+        let mut page_table = [0u8; 16];
+        let mut seq_len = [0xffu8; 4];
+        let mut position = [0xffu8; 4];
+        device
+            .read(&state.recurrent_hidden, 0, &mut hidden)
+            .unwrap();
+        device.read(&state.page_table, 0, &mut page_table).unwrap();
+        device.read(&state.seq_len, 0, &mut seq_len).unwrap();
+        device.read(&state.position, 0, &mut position).unwrap();
+        assert_eq!(hidden, [0u8; 8]);
+        assert_eq!(page_table, [0xffu8; 16]);
+        assert_eq!(seq_len, [0u8; 4]);
+        assert_eq!(position, [0u8; 4]);
+    }
+
+    #[test]
+    fn blad_reset_nie_oddaje_stron_przed_zakolejkowaniem_zerowania() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 2,
+            n_pages: 4,
+            max_pages_per_seq: 4,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+        for _ in 0..3 {
+            state.grow(&mut kv).unwrap();
+        }
+        state.checkpoint(&stream).unwrap();
+        let pages = state.seq.pages.clone();
+        state.empty_page_table = device
+            .alloc(1, MemKind::PinnedHost, Pool::Activations)
+            .unwrap();
+
+        assert!(state.reset(&mut kv, &stream).is_err());
+        assert_eq!(state.seq.len, 3);
+        assert_eq!(state.seq.pages, pages);
+        assert_eq!(state.checkpoint_len(), Some(3));
+        assert_eq!(kv.free_page_count(), 2);
     }
 
     #[test]
@@ -875,17 +1264,18 @@ mod tests {
                     max_pages_per_seq: 4,
                     quant: crate::kv::KvQuant::F16,
                 };
-                let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
+                let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+                let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
                 state.checkpoint(&stream).unwrap();
                 for step in 0..=budget {
-                    state.grow().unwrap();
+                    state.grow(&mut kv).unwrap();
                     device
                         .write(&[step as u8 + 1; 8], &state.recurrent_hidden, 0)
                         .unwrap();
                     state.save_step_hidden(step, &stream).unwrap();
                 }
 
-                state.commit_prefix(accepted + 1, &stream).unwrap();
+                state.commit_prefix(&mut kv, accepted + 1, &stream).unwrap();
                 assert_eq!(state.seq.len, accepted + 1);
                 assert_eq!(state.checkpoint_len(), None);
                 let mut hidden = [0u8; 8];
@@ -894,11 +1284,68 @@ mod tests {
                     .unwrap();
                 assert_eq!(hidden, [accepted as u8 + 1; 8]);
 
-                state.release();
+                state.release(&mut kv);
                 assert_eq!(state.seq.len, 0);
-                assert_eq!(state.kv.free_page_count(), 4);
+                assert_eq!(kv.free_page_count(), 4);
             }
         }
+    }
+
+    #[test]
+    fn commit_catchup_zachowuje_caly_dogoniony_prefiks() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 2,
+            n_pages: 4,
+            max_pages_per_seq: 4,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device, &kv, 4, 8).unwrap();
+        state.grow(&mut kv).unwrap();
+        state.checkpoint(&stream).unwrap();
+        state.grow(&mut kv).unwrap();
+        state.grow(&mut kv).unwrap();
+
+        assert!(state.commit_catchup(1).is_err());
+        assert_eq!(state.checkpoint_len(), Some(1));
+        state.commit_catchup(2).unwrap();
+        assert_eq!(state.seq.len, 3);
+        assert_eq!(state.checkpoint_len(), None);
+    }
+
+    #[test]
+    fn stage_batch_obsluguje_kolejne_ogona_i_granice_stron() {
+        let device: Arc<dyn Device> = CpuDevice::new();
+        let stream = device.create_stream().unwrap();
+        let config = KvConfig {
+            n_layers: 1,
+            n_kv_heads: 1,
+            head_dim: 32,
+            page_size: 4,
+            n_pages: 8,
+            max_pages_per_seq: 8,
+            quant: crate::kv::KvQuant::F16,
+        };
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+
+        state.checkpoint(&stream).unwrap();
+        let (base, _, seq_len, position) = state.stage_batch(&mut kv, 3).unwrap();
+        assert_eq!((base, seq_len, position), (0, 3, 2));
+        state.commit_catchup(3).unwrap();
+        state.checkpoint(&stream).unwrap();
+        let (base, page_table, seq_len, position) = state.stage_batch(&mut kv, 2).unwrap();
+        assert_eq!((base, seq_len, position), (3, 5, 4));
+        state.commit_catchup(2).unwrap();
+
+        assert_eq!(&page_table[..state.seq.pages.len()], &state.seq.pages);
+        assert_eq!(state.seq.pages.len(), 2);
+        assert!(state.stage_batch(&mut kv, 0).is_err());
     }
 
     #[test]
@@ -914,17 +1361,16 @@ mod tests {
             max_pages_per_seq: 4,
             quant: crate::kv::KvQuant::F16,
         };
-        let mut state = MtpDraftState::new(device.clone(), config, 4, 8).unwrap();
-        state.grow().unwrap();
+        let mut kv = KvCache::new(device.as_ref(), config).unwrap();
+        let mut state = MtpDraftState::new(device.clone(), &kv, 4, 8).unwrap();
+        state.grow(&mut kv).unwrap();
         state.checkpoint(&stream).unwrap();
-        state.grow().unwrap();
+        state.grow(&mut kv).unwrap();
         let len = state.seq.len;
         let pages = state.seq.pages.clone();
-        state.checkpoint_hidden = device
-            .alloc(1, MemKind::Device, Pool::Activations)
-            .unwrap();
+        state.checkpoint_hidden = device.alloc(1, MemKind::Device, Pool::Activations).unwrap();
 
-        assert!(state.rollback(&stream).is_err());
+        assert!(state.rollback(&mut kv, &stream).is_err());
         assert_eq!(state.seq.len, len);
         assert_eq!(state.seq.pages, pages);
         assert_eq!(state.checkpoint_len(), Some(1));

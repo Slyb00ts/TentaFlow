@@ -324,6 +324,7 @@ fn message_to_chat_message(m: &Message) -> Option<ChatMessage> {
     Some(ChatMessage {
         role,
         content,
+        reasoning_content: m.reasoning_content.clone(),
         name: m.name.clone(),
         tool_call_id: m.tool_call_id.clone(),
         // Inbound history replay: an external tool loop resends the assistant
@@ -366,6 +367,7 @@ pub(crate) fn openai_messages_to_protocol(
             tentaflow_protocol::Message {
                 role: m.role.clone(),
                 content,
+                reasoning_content: m.reasoning_content.clone(),
             }
         })
         .collect()
@@ -475,5 +477,29 @@ mod data_url_tests {
         let url = "data:image/jpeg,raw_bytes_here";
         let err = decode_data_url(url).unwrap_err();
         assert!(err.to_string().to_lowercase().contains("base64"));
+    }
+}
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::*;
+
+    #[test]
+    fn openai_reasoning_content_survives_mesh_message_conversion() {
+        let messages = vec![crate::api::openai::types::Message {
+            role: "assistant".to_string(),
+            content: Some(MessageContent::Text("answer".to_string())),
+            reasoning_content: Some("reasoning".to_string()),
+            ..Default::default()
+        }];
+
+        let protocol_messages = openai_messages_to_protocol(&messages);
+
+        assert_eq!(protocol_messages.len(), 1);
+        assert_eq!(protocol_messages[0].content, "answer");
+        assert_eq!(
+            protocol_messages[0].reasoning_content.as_deref(),
+            Some("reasoning")
+        );
     }
 }

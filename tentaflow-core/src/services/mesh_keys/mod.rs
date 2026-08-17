@@ -56,6 +56,7 @@ pub enum KeyScope {
     RecordingUrl,
     LegalUrl,
     ModelBundleUrl,
+    MlStudioExportUrl,
 }
 
 impl KeyScope {
@@ -68,6 +69,7 @@ impl KeyScope {
             Self::RecordingUrl => UrlScope::Recording.key_name(),
             Self::LegalUrl => UrlScope::LegalUrl.key_name(),
             Self::ModelBundleUrl => UrlScope::ModelBundle.key_name(),
+            Self::MlStudioExportUrl => UrlScope::MlStudioExport.key_name(),
         }
     }
 
@@ -82,17 +84,20 @@ impl KeyScope {
             Some(Self::LegalUrl)
         } else if s == UrlScope::ModelBundle.key_name() {
             Some(Self::ModelBundleUrl)
+        } else if s == UrlScope::MlStudioExport.key_name() {
+            Some(Self::MlStudioExportUrl)
         } else {
             None
         }
     }
 
-    pub const ALL: [KeyScope; 5] = [
+    pub const ALL: [KeyScope; 6] = [
         KeyScope::PickupToken,
         KeyScope::FrameUrl,
         KeyScope::RecordingUrl,
         KeyScope::LegalUrl,
         KeyScope::ModelBundleUrl,
+        KeyScope::MlStudioExportUrl,
     ];
 }
 
@@ -129,6 +134,7 @@ struct PerPeerKeys {
     recording_url: Option<PeerKeyState>,
     legal_url: Option<PeerKeyState>,
     model_bundle_url: Option<PeerKeyState>,
+    ml_studio_export_url: Option<PeerKeyState>,
 }
 
 impl PerPeerKeys {
@@ -139,6 +145,7 @@ impl PerPeerKeys {
             KeyScope::RecordingUrl => &mut self.recording_url,
             KeyScope::LegalUrl => &mut self.legal_url,
             KeyScope::ModelBundleUrl => &mut self.model_bundle_url,
+            KeyScope::MlStudioExportUrl => &mut self.ml_studio_export_url,
         }
     }
 
@@ -149,6 +156,7 @@ impl PerPeerKeys {
             KeyScope::RecordingUrl => &self.recording_url,
             KeyScope::LegalUrl => &self.legal_url,
             KeyScope::ModelBundleUrl => &self.model_bundle_url,
+            KeyScope::MlStudioExportUrl => &self.ml_studio_export_url,
         }
     }
 }

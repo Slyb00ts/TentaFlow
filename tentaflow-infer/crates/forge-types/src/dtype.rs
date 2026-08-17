@@ -10,6 +10,9 @@ pub enum DType {
     BF16,
     F8E4M3,
     F8E5M2,
+    /// Skala blokowa FP8 bez mantysy (sam wykładnik) — DeepSeek V4 trzyma w
+    /// niej skale wag FP8.
+    F8E8M0,
     F64,
     I64,
     I32,
@@ -29,7 +32,9 @@ impl DType {
         match self {
             DType::F32 | DType::I32 | DType::U32 => 4,
             DType::F16 | DType::BF16 | DType::I16 | DType::U16 => 2,
-            DType::F8E4M3 | DType::F8E5M2 | DType::I8 | DType::U8 | DType::Bool => 1,
+            DType::F8E4M3 | DType::F8E5M2 | DType::F8E8M0 | DType::I8 | DType::U8 | DType::Bool => {
+                1
+            }
             DType::F64 | DType::I64 | DType::U64 => 8,
         }
     }
@@ -37,7 +42,7 @@ impl DType {
     pub const fn is_float(self) -> bool {
         matches!(
             self,
-            DType::F32 | DType::F16 | DType::BF16 | DType::F8E4M3 | DType::F8E5M2
+            DType::F32 | DType::F16 | DType::BF16 | DType::F8E4M3 | DType::F8E5M2 | DType::F8E8M0
         )
     }
 }
@@ -50,6 +55,7 @@ impl std::fmt::Display for DType {
             DType::BF16 => "bf16",
             DType::F8E4M3 => "f8e4m3",
             DType::F8E5M2 => "f8e5m2",
+            DType::F8E8M0 => "f8e8m0",
             DType::F64 => "f64",
             DType::I64 => "i64",
             DType::I32 => "i32",

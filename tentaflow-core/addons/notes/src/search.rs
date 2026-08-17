@@ -139,7 +139,7 @@ pub fn rrf_fuse(rankings: &[Vec<String>], k: f64) -> Vec<(String, f64)> {
             }
         }
     }
-    scores.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scores.sort_by(|a, b| b.1.total_cmp(&a.1));
     scores
 }
 
@@ -470,7 +470,7 @@ fn text_search(
             (m, s)
         })
         .collect();
-    scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     let max = scored.first().map(|(_, s)| *s).unwrap_or(1.0);
     let hits: Vec<SearchHit> = scored
         .into_iter()
@@ -530,7 +530,7 @@ fn graph_text_search(
         .filter(|m| meta.contains_key(&m.id))
         .map(|m| (m.id.clone(), text_match_score(&m.title, &m.content, terms).max(1.0)))
         .collect();
-    text_scored.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    text_scored.sort_by(|a, b| b.1.total_cmp(&a.1));
     let text_max = text_scored.first().map(|(_, s)| *s).unwrap_or(1.0);
 
     let graph_ranked: Vec<String> = graph_candidates
@@ -643,7 +643,7 @@ fn graph_walk(ctx: &UserCtx, terms: &[String]) -> Result<Vec<GraphCandidate>, St
             score: graph_hit_score(2, 1, weight),
         });
     }
-    out.sort_by(|a, b| b.score.partial_cmp(&a.score).unwrap_or(std::cmp::Ordering::Equal));
+    out.sort_by(|a, b| b.score.total_cmp(&a.score));
     Ok(out)
 }
 

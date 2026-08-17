@@ -159,7 +159,7 @@ impl RouterClient {
     ) -> Result<ChatCompletionResult> {
         let msgs: Vec<Message> = messages
             .into_iter()
-            .map(|(role, content)| Message { role, content })
+            .map(|(role, content)| Message { role, content, reasoning_content: None })
             .collect();
 
         let mut meta: Vec<(String, String)> = Vec::new();
@@ -273,7 +273,7 @@ impl RouterClient {
     {
         let msgs: Vec<Message> = messages
             .into_iter()
-            .map(|(role, content)| Message { role, content })
+            .map(|(role, content)| Message { role, content, reasoning_content: None })
             .collect();
 
         let mut meta: Vec<(String, String)> = Vec::new();

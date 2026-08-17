@@ -145,7 +145,7 @@ fn llm_response_to_chat_response(response: &LlmResponse, model: &str) -> ChatCom
             message: Message {
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(response.content.clone())),
-                reasoning_content: None,
+                reasoning_content: response.reasoning_content.clone(),
                 name: None,
                 tool_calls,
                 tool_call_id: None,
@@ -238,6 +238,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
                 .join(""),
             None => String::new(),
         };
+        let reasoning_content = choice.message.reasoning_content.clone();
 
         let usage = response
             .usage
@@ -252,6 +253,7 @@ impl LlmDispatcher for LlmDispatcherImpl {
 
         let llm_response = LlmResponse {
             content,
+            reasoning_content,
             usage,
             finish_reason,
             tool_calls,
@@ -585,7 +587,7 @@ async fn chat_msg_to_openai(m: &ChatMessage, blobs: &dyn BlobStore) -> Result<Me
     Ok(Message {
         role: chat_role_to_str(m.role).to_string(),
         content,
-        reasoning_content: None,
+        reasoning_content: m.reasoning_content.clone(),
         name: m.name.clone(),
         tool_calls: m
             .tool_calls
@@ -749,6 +751,7 @@ mod tests {
 
         let response = LlmResponse {
             content: "Noted — blue.".into(),
+            reasoning_content: None,
             usage: TokenUsage {
                 prompt_tokens: 6,
                 completion_tokens: 3,
@@ -900,12 +903,14 @@ mod tests {
         use crate::flow_engine::blob_store::InMemoryBlobStore;
         let blobs = InMemoryBlobStore::new();
         let mut m = ChatMessage::assistant("");
+        m.reasoning_content = Some("reasoning".into());
         m.tool_calls = Some(vec![LlmToolCall {
             id: "call_0_aa".into(),
             name: "t".into(),
             arguments: "{\"a\":1}".into(),
         }]);
         let api = chat_msg_to_openai(&m, &blobs).await.unwrap();
+        assert_eq!(api.reasoning_content.as_deref(), Some("reasoning"));
         let tcs = api.tool_calls.expect("tool_calls should round trip");
         assert_eq!(tcs.len(), 1);
         assert_eq!(tcs[0].id, "call_0_aa");

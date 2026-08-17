@@ -15,8 +15,8 @@ use std::time::Instant;
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams};
 use forge_engine::tier::{KvTierConfig, KvTierMode};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::{StreamDecoder, Tokenizer};
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -63,6 +63,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let ctx_pages = ctx.div_ceil(page_size);
     let kv_pages = if kv_pages == 0 { ctx_pages } else { kv_pages };
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+        weight_spill_dir: None,
         kv_page_size: page_size,
         kv_pages,
         max_seq_len: ctx,
@@ -74,12 +76,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             watermark: 0.10,
         },
         prefix_cache: false,
+        layer_range: None,
+        tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+        native_mtp: false,
+        nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+        nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::RowMajorE4M3,
     };
     // The engine's paged KV slabs + (hybrid) SSM state allocate from the
     // WEIGHTS pool, not the HAL kv_cache pool, so keep the latter tiny (a full
     // multi-GiB kv_cache arena would needlessly starve the weights pool on a
     // 20 GB model). Size weights from --weights-gb for large models.
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: (weights_gb * (1u64 << 30) as f64) as usize,
@@ -97,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (m, t)
     } else {
         let gguf = forge_formats::Gguf::open(&path)?;
-        let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+        let vocab = forge_tokenize::gguf_vocab(&gguf)?;
         drop(gguf);
         let t = Tokenizer::from_gguf_vocab(&vocab)?;
         let m = Model::load_gguf(dev, &path, cfg)?;
@@ -144,8 +151,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
         (None, false) => {
             let mut ids = tokenizer.encode("", true)?;
-            let filler_ids =
-                tokenizer.encode("Jednym z najważniejszych miast w historii Polski jest Kraków. ", false)?;
+            let filler_ids = tokenizer.encode(
+                "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
+                false,
+            )?;
             while ids.len() + filler_ids.len() <= prompt_tokens.max(filler_ids.len() + 1) {
                 ids.extend_from_slice(&filler_ids);
             }

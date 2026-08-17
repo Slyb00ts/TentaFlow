@@ -1,0 +1,134 @@
+gemm_q8_0_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q8_0_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_f16_bm32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_f16_out_f32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_f16_out_f32_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_f16_out_f32_bm32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q8_0_out_f32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q8_0_out_f32_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q8_0_i8mma	[53383:53384:20260725,160209.840982:ERROR http_transport_libcurl.cc:483] HTTP status 413
+gemm_q8_0_i8mma_bm64	[53495:53496:20260725,160214.547823:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/270464ee-e4a6-4e0a-9c58-70f9da297a68: No such file or directory (2)
+gemm_q8_0_i8mma_big	[53548:53549:20260725,160217.399789:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/72bc99a9-2760-4d0a-96ab-bac97c55f8f0: No such file or directory (2)
+gemm_q8_0_i8mma_triplet_bm64	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
+gemm_q4_k_i8mma	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
+gemm_q4_k_i8mma_bm64	[53871:53872:20260725,160234.284367:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/d5b77f15-a721-4ac2-a412-9ae41002bdd7: No such file or directory (2)
+gemm_q4_k_i8mma_big	[53972:53973:20260725,160246.639035:ERROR http_transport_libcurl.cc:483] HTTP status 413
+gemm_q6_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q6_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q5_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q5_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q3_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q3_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q2_k_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q2_k_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4_0_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4_0_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4_1_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4_1_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q5_0_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q5_0_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q5_1_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q5_1_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq4_nl_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq4_nl_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq4_xs_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq4_xs_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_mxfp4_gguf_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_mxfp4_gguf_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq2_xs_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq2_xs_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq2_s_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq2_s_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq3_s_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq3_s_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq2_xxs_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq2_xxs_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq3_xxs_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq3_xxs_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq1_s_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq1_s_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq1_m_f16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_iq1_m_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_f16	[57208:57209:20260725,160447.624750:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/29d62564-f0d5-46c8-ab4d-f714a7c51db9: No such file or directory (2)
+gemm_fp8_f16_bm64	[57319:57320:20260725,160453.501453:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/9d322363-bab4-4d50-954c-251f49794f8c: No such file or directory (2)
+gemm_fp8_f16_big	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
+gemm_fp8_mod_4096_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_1024_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_14336_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_4096_14336	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_11264_4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_4096_11264	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_4096_4096_bn256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_fp8_mod_11264_4096_bn256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_4096_m128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_4096_m256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_4096_m512	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_4096_m1024	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_4096_m2048	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_4096_m4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_1024_4096_m128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_1024_4096_m256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_1024_4096_m512	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_1024_4096_m1024	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_1024_4096_m2048	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_1024_4096_m4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_14336_4096_m128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_14336_4096_m256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_14336_4096_m512	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_14336_4096_m1024	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_14336_4096_m2048	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_14336_4096_m4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_14336_m128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_14336_m256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_14336_m512	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_14336_m1024	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_14336_m2048	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q4k_i8_native_4096_14336_m4096	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q8_0_i8mma_triplet_single_bm64	[60172:60173:20260725,160747.522623:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/c024444d-3304-49be-bf9c-03441f4005c9: No such file or directory (2)
+gemm_q8_0_i8mma_triplet_single_big	LLVM ERROR: Cannot select: intrinsic %llvm.nvvm.ldmatrix.sync.aligned.m8n8.x2.b16
+gemm_nvfp4_ct_bm16_qkv_m4	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_qkv_m8	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_qkv_m16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_o_m4	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_o_m8	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_o_m16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_gateup_m4	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_gateup_m8	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_gateup_m16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_down_m4	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_down_m8	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm16_down_m16	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_qkv_m24	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_qkv_m32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_o_m24	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_o_m32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_gateup_m24	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_gateup_m32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_down_m24	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_bm32_down_m32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_s0_f16_bm64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_ct_s0_f16_bm128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_gguf_mma_f16_bm32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_gguf_mma_f16_bm128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_gguf_mma_f16_bm128_bn32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_gguf_mma_f16_bm128_prefetch	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_gguf_mma_f16_bm128_bn64_sync1	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_gguf_mma_f16_bm128_bn128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_tile128_mma_f16_bm128_bn64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_nvfp4_tile128_mma_f16_bm128_bn128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_segmented_f16_hd128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_f16_hd64	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_f16_hd128	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_f16_hd256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_device_pos_f16_hd256	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_device_pos_f16_hd256_bk32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_f16_hd256_bk32	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_f16_hd256_vtrans	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+attn_prefill_fa_mojo_device_pos_f16_hd256_vtrans	/home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/bin/mojo: error: failed to run the pass manager
+gemm_q8_0_i8mma_triplet_single_big_poststage	[70539:70540:20260725,161059.678909:ERROR directory_reader_posix.cc:42] opendir /home/critix/repos/rust/TentaFlow/tentaflow-infer/kernels/mojo/.pixi/envs/default/share/max/crashdb/attachments/860c2702-27a6-41ff-8201-6d50a1b7df0a: No such file or directory (2)

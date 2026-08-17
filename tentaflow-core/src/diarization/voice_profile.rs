@@ -341,7 +341,7 @@ pub fn estimate_snr_db(samples: &[f32]) -> f32 {
             (sum_sq / frame_size as f32).sqrt()
         })
         .collect();
-    rms_frames.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+    rms_frames.sort_by(|a, b| a.total_cmp(b));
     let p10_idx = n_frames / 10;
     let p90_idx = (n_frames * 9) / 10;
     let noise = rms_frames[p10_idx].max(1e-6);
@@ -583,7 +583,7 @@ pub fn match_to_profiles(pool: &DbPool, embedding: &[f32]) -> Result<Option<Matc
                 cosine_similarity(embedding, &emb)
             })
             .collect();
-        sims.sort_by(|a, b| b.partial_cmp(a).unwrap_or(std::cmp::Ordering::Equal));
+        sims.sort_by(|a, b| b.total_cmp(a));
 
         let max_sim = sims[0];
         let k = 5.min(sims.len());

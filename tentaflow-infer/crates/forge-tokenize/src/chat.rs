@@ -167,7 +167,8 @@ impl ChatTemplateEngine {
         env.set_unknown_method_callback(unknown_method_callback);
         env.add_function("raise_exception", raise_exception);
         env.add_function("strftime_now", strftime_now);
-        env.add_template("chat", template_src)
+        let normalized_template = normalize_template_source(template_src);
+        env.add_template("chat", &normalized_template)
             .map_err(|e| ForgeError::Tokenizer(format!("chat template parse error: {e:#}")))?;
 
         let mut ctx = std::collections::BTreeMap::new();
@@ -209,6 +210,13 @@ impl ChatTemplateEngine {
         }
         Ok(rendered)
     }
+}
+
+fn normalize_template_source(source: &str) -> String {
+    source.replace(
+        "namespace(name=tcid if tcid else '')",
+        "namespace(name=(tcid or ''))",
+    )
 }
 
 /// HF `continue_final_message` semantics: render normally, then cut the output
@@ -471,6 +479,7 @@ pub fn builtin_chat_template(family: &str) -> Option<&'static str> {
         "mistral" => Some(MISTRAL_TEMPLATE),
         "gemma" => Some(GEMMA_TEMPLATE),
         "qwen" => Some(QWEN_TEMPLATE),
+        "muse_glimmer" => Some(MUSE_GLIMMER_TEMPLATE),
         _ => None,
     }
 }
@@ -551,3 +560,5 @@ const QWEN_TEMPLATE: &str = r#"{%- if tools %}
 {%- if add_generation_prompt %}
     {{- '<|im_start|>assistant\n' }}
 {%- endif %}"#;
+
+const MUSE_GLIMMER_TEMPLATE: &str = r#"{%- if messages and messages[0]['role'] == 'system' -%}{{ '<|start|>system<|message|>' + messages[0]['content'] + '<|eot|>' }}{%- else -%}{{ '<|start|>system<|message|>You are a helpful AI assistant.\nKnowledge cutoff: 2026-01-04.\n\nReasoning strength: high.\n\n# Valid recipients: "self", "user".<|eot|>' }}{%- endif -%}{%- for message in messages -%}{%- if message['role'] == 'user' -%}{{ '<|start|>user<|message|>' + message['content'] + '<|eot|>' }}{%- elif message['role'] == 'assistant' -%}{{ '<|start|>assistant to=user<|message|>' + message['content'] + '<|eot|>' }}{%- endif -%}{%- endfor -%}{%- if add_generation_prompt -%}{{ '<|start|>assistant to=user<|message|>' }}{%- endif -%}"#;

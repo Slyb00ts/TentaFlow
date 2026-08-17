@@ -40,6 +40,7 @@ pub fn spawn_classifier_training(
     hyperparams: tentaflow_protocol::MlStudioClassifierHyperparams,
 ) {
     tokio::spawn(async move {
+        crate::ml_studio::live_view::register_local_run(&run_id);
         if let Err(err) = run_training(
             &run_id,
             &project_id,
@@ -57,8 +58,9 @@ pub fn spawn_classifier_training(
             let _ = repository::set_training_run_error(&run_id, &err.to_string());
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
-        // Sprzątamy wpis live-view niezależnie od wyniku (job już nie żyje).
+        // Sprzątamy wpisy live-view niezależnie od wyniku (job już nie żyje).
         crate::ml_studio::live_view::clear_local_job(&run_id);
+        crate::ml_studio::live_view::forget_local_run(&run_id);
     });
 }
 
@@ -160,6 +162,13 @@ async fn run_training_against_dir(
                 JOB_TIMEOUT.as_secs()
             );
         }
+        // Anulowanie zgłoszone przez użytkownika: serwis dostał już `POST /cancel`
+        // od handlera, więc pętla nadzoru nie ma czego pilnować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            repository::update_training_run_status(run_id, "cancelled")?;
+            crate::ml_studio::live_view::clear_cancel(run_id);
+            return Ok(());
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
 
         let url = status_url.clone();
@@ -178,6 +187,11 @@ async fn run_training_against_dir(
 
         match st.status.as_str() {
             "running" => continue,
+            "cancelled" => {
+                repository::update_training_run_status(run_id, "cancelled")?;
+                crate::ml_studio::live_view::clear_cancel(run_id);
+                return Ok(());
+            }
             "succeeded" => {
                 let metrics_json = json!({
                     "task": "classifier",
@@ -186,8 +200,10 @@ async fn run_training_against_dir(
                     "values": values,
                     "val_acc": st.val_acc,
                     "val_macro_f1": st.val_macro_f1,
-                    "onnx_path": st.onnx_path,
-                    "checkpoint_path": st.checkpoint_path,
+                    // Eksport ONNX robi dopiero publikacja (`locate_or_export_onnx`
+                    // woła `/export` z tym checkpointem), więc tu zapisujemy sam
+                    // checkpoint — jedyny artefakt, który istnieje po treningu.
+                    "checkpoint_path": st.artifact_path,
                 })
                 .to_string();
                 let model_name = format!("classifier-{}-{}", attribute, variant);
@@ -342,6 +358,25 @@ pub async fn mesh_train_start_classifier(run_id: &str, spec_json: &str) -> anyho
     Ok(())
 }
 
+/// B-side (odbiorca `MlTrainCancel`): woła `/cancel` lokalnego serwisu klasyfikatora
+/// dla joba zmapowanego z `run_id`.
+pub async fn mesh_train_cancel_classifier(run_id: &str) -> anyhow::Result<()> {
+    let (base, job_id) = mesh_jobs()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany run_id na tym nodzie: {}", run_id))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::ml_studio::live_view::cancel_service_job_blocking(&base, &job_id)
+    })
+    .await?;
+    if !ok {
+        anyhow::bail!("serwis klasyfikatora odrzucił żądanie anulowania");
+    }
+    Ok(())
+}
+
 /// B-side (odbiorca `MlTrainStatus`): odpytuje lokalny serwis o status joba
 /// klasyfikatora zmapowanego z `run_id` i zwraca surowy JSON statusu do inicjatora.
 pub async fn mesh_train_status_classifier(run_id: &str) -> anyhow::Result<String> {
@@ -390,14 +425,27 @@ pub async fn run_export(
     });
     let value: serde_json::Value =
         tokio::task::spawn_blocking(move || -> anyhow::Result<serde_json::Value> {
+            // `http_status_as_error(false)`: bez tego ureq zamienia 4xx/5xx na błąd
+            // BEZ treści odpowiedzi, a operator w GUI widział goły „http status: 500",
+            // podczas gdy serwis dokładnie opisał przyczynę w body. Czytamy status
+            // sami i przy błędzie dołączamy tę treść.
             let http: ureq::Agent = ureq::Agent::config_builder()
                 .timeout_global(Some(EXPORT_TIMEOUT))
+                .http_status_as_error(false)
                 .build()
                 .into();
             let mut resp = http
                 .post(&url)
                 .send_json(&body)
                 .map_err(|e| anyhow::anyhow!("POST {} failed: {}", url, e))?;
+            let status = resp.status();
+            if !status.is_success() {
+                let detail = resp
+                    .body_mut()
+                    .read_to_string()
+                    .unwrap_or_else(|e| format!("<nie udało się odczytać treści: {e}>"));
+                anyhow::bail!("serwis odrzucił eksport ({}): {}", status, detail.trim());
+            }
             resp.body_mut()
                 .read_json()
                 .map_err(|e| anyhow::anyhow!("decode /export response: {}", e))
@@ -441,10 +489,13 @@ struct StatusResponse {
     val_macro_f1: Option<f64>,
     #[serde(default)]
     error: Option<String>,
+    /// Serwis raportuje ścieżkę checkpointu POD TĄ nazwą (`JobState.artifact_path`
+    /// w `server.py`) — czytanie `checkpoint_path`/`onnx_path`, których nigdy nie
+    /// wysyła, zapisywało w metrykach modelu `null` i publikacja do rejestru
+    /// wizji odbijała się o „model bez checkpoint_path". Tor detekcji mapuje to
+    /// pole tak samo.
     #[serde(default)]
-    onnx_path: Option<String>,
-    #[serde(default)]
-    checkpoint_path: Option<String>,
+    artifact_path: Option<String>,
 }
 
 fn http_agent() -> ureq::Agent {

@@ -1,0 +1,12 @@
+{
+ "decoder_start_token_id": 42,
+ "eos_token_id": 41,
+ "is_multilingual": true,
+ "suppress_tokens": [
+  1,
+  2
+ ],
+ "begin_suppress_tokens": [
+  3
+ ]
+}

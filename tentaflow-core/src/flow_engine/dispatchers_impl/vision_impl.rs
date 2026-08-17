@@ -144,11 +144,11 @@ async fn ocr_direct(req: VisionOcrRequest) -> Result<Option<String>> {
     } = req;
     // ort: pulowany `&self` runner (spawn_blocking, poza wątkiem Burn/wgpu);
     // Burn: `Arc<Mutex<_>>` — zablokuj przed forwardem.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     let out = tokio::task::spawn_blocking(move || runner.read(&rgb, width, height))
         .await
         .map_err(|e| anyhow::anyhow!("vision ocr task: {e}"))??;
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     let out = tokio::task::spawn_blocking(move || runner.lock().unwrap().read(&rgb, width, height))
         .await
         .map_err(|e| anyhow::anyhow!("vision ocr task: {e}"))??;
@@ -177,11 +177,11 @@ async fn classify_direct(req: VisionClassifyRequest) -> Result<Vec<String>> {
     } = req;
     // ort: pulowany `&self` runner (spawn_blocking, poza wątkiem Burn/wgpu);
     // Burn: `Arc<Mutex<_>>` — zablokuj przed forwardem.
-    #[cfg(feature = "inference-supertonic")]
+    #[cfg(feature = "vision-ort")]
     let out = tokio::task::spawn_blocking(move || runner.classify(&rgb, width, height))
         .await
         .map_err(|e| anyhow::anyhow!("vision classify task: {e}"))??;
-    #[cfg(not(feature = "inference-supertonic"))]
+    #[cfg(not(feature = "vision-ort"))]
     let out =
         tokio::task::spawn_blocking(move || runner.lock().unwrap().classify(&rgb, width, height))
             .await

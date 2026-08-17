@@ -362,7 +362,11 @@ function renderProviderTab(provider) {
           if (p && p.featured) featured.push({ engine: e, preset: p });
         }
       }
-      const cardCount = engines.length + featured.length;
+      // Runtime'y `preset_only` nie dostaja wlasnego kafelka — ich presety i tak
+      // sa osobnymi kafelkami, a karta silnika nazwana modelem czytala sie jak
+      // duplikat tego presetu.
+      const engineCards = engines.filter((e) => !Manifest.isPresetOnly(e));
+      const cardCount = engineCards.length + featured.length;
       rendered += cardCount;
       groupCount += cardCount;
 
@@ -374,14 +378,14 @@ function renderProviderTab(provider) {
         <h3 class="catalog-section-title">${escapeHtml(label)} <span class="section-count">${count}</span></h3>
         <div class="catalog-grid">${cardsHtml}</div>
       `;
-      const enginesHtml = engines.map((e) => renderEngineCard(e, targetOs, target)).join('');
+      const enginesHtml = engineCards.map((e) => renderEngineCard(e, targetOs, target)).join('');
       const featuredHtml = featured.map((f) => renderFeaturedCard(f.engine, f.preset, targetOs, target)).join('');
 
       if (cat === 'llm') {
         // Rozdzial: same silniki (backendy vLLM/llama.cpp/MLX) -> "Silniki";
         // prekonfigurowane presety modeli (Bielik, DeepSeek, Gemma-4) -> "Modele
         // jezykowe". Presety i tak sa osobnymi kafelkami, wiec to naturalny podzial.
-        if (engines.length) groupHtml += section(I18n.t('category.engines'), engines.length, enginesHtml);
+        if (engineCards.length) groupHtml += section(I18n.t('category.engines'), engineCards.length, enginesHtml);
         if (featured.length) groupHtml += section(categoryLabel, featured.length, featuredHtml);
       } else {
         groupHtml += section(categoryLabel, cardCount, enginesHtml + featuredHtml);

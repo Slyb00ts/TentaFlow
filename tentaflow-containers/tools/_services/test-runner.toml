@@ -1,0 +1,50 @@
+[engine]
+id = "test-runner"
+category = "tools"
+name = "Test Runner"
+description_pl = "Wykonawca testów pisanych przez agentów: pytest, Playwright, Locust, httpx."
+description_en = "Executor for agent-authored tests: pytest, Playwright, Locust, httpx."
+homepage = "https://docs.pytest.org/"
+license = "Apache-2.0"
+resource_kind = "infra"
+default_port = 8093
+api = "custom"
+version = "1.0.0"
+requires_model = false
+gpu_supported = false
+
+[deploy.docker]
+context_path = "tools/docker/test-runner"
+platforms = ["linux"]
+transport = "direct-http"
+gpus = "none"
+download_size_mb = 2200
+
+[deploy.native]
+platforms = ["linux", "macos", "windows"]
+runtime = "python-bundle"
+bundle_path = "tools/python/test-runner"
+
+[[parameter]]
+key = "max_parallel"
+label_pl = "Maksymalna liczba równoległych itemów"
+label_en = "Max parallel test items"
+kind = "int"
+default = 4
+range = { min = 1.0, max = 32.0, step = 1.0 }
+bindings = [
+  { when = "docker", type = "env", name = "TEST_RUNNER_MAX_PARALLEL" },
+  { when = "native_python_bundle", type = "env", name = "TEST_RUNNER_MAX_PARALLEL" }
+]
+
+[[parameter]]
+key = "item_timeout_secs"
+label_pl = "Limit czasu pojedynczego itemu (s)"
+label_en = "Per-item timeout (s)"
+kind = "int"
+default = 300
+range = { min = 5.0, max = 7200.0, step = 5.0 }
+bindings = [
+  { when = "docker", type = "env", name = "TEST_RUNNER_ITEM_TIMEOUT" },
+  { when = "native_python_bundle", type = "env", name = "TEST_RUNNER_ITEM_TIMEOUT" }
+]

@@ -105,7 +105,12 @@ class MLXSwiftEngine: @unchecked Sendable {
         topP: Float,
         maxContextTokens: Int,
         memoryBudgetMB: Int,
-        tokenCallback: @escaping (String, Bool) -> Void
+        // (text, isFinal, promptTokens, completionTokens, prefillTps, decodeTps).
+        // Liczniki i predkosci faz sa niezerowe tylko na finalnym wywolaniu
+        // (isFinal=true) i pochodza z realnych pomiarow MLX
+        // (GenerateCompletionInfo), nie z wall-clock TTFT. Kontrakt musi byc
+        // identyczny z macOS MLXBridge — Rust ma jeden typ callbacku dla obu.
+        tokenCallback: @escaping (String, Bool, Int, Int, Double, Double) -> Void
     ) -> Int32 {
         guard let container = modelContainer else {
             print("[MLXSwift] Brak zaladowanego modelu")
@@ -129,7 +134,7 @@ class MLXSwiftEngine: @unchecked Sendable {
 
         Task {
             do {
-                let _ = try await container.perform { context in
+                let counts = try await container.perform { context in
                     // Prompt juz jest sformatowany przez Rust (ChatML).
                     let tokenIds = context.tokenizer.encode(text: prompt)
                     if maxContextTokens > 0 && tokenIds.count > maxContextTokens {
@@ -144,6 +149,9 @@ class MLXSwiftEngine: @unchecked Sendable {
                     // Flaga OOM w scope `perform` (jak `lastOutput`).
                     var lastOutput = ""
                     var memExceeded = false
+                    // Licznik wygenerowanych tokenow — mutowany w token-closure,
+                    // zwracany na koncu (MLX nie oddaje go w GenerateCompletionInfo).
+                    var genCount = 0
                     let info = try MLXLMCommon.generate(
                         input: input,
                         parameters: parameters,
@@ -159,9 +167,10 @@ class MLXSwiftEngine: @unchecked Sendable {
                         let fullText = context.tokenizer.decode(tokenIds: tokens)
                         if fullText.count > lastOutput.count {
                             let newPart = String(fullText.dropFirst(lastOutput.count))
-                            tokenCallback(newPart, false)
+                            tokenCallback(newPart, false, 0, 0, 0, 0)
                         }
                         lastOutput = fullText
+                        genCount = tokens.count
 
                         for stop in stopStrings {
                             if fullText.contains(stop) {
@@ -174,15 +183,17 @@ class MLXSwiftEngine: @unchecked Sendable {
                         return tokens.count >= maxTokens ? .stop : .more
                     }
                     if memExceeded { throw MLXContextBudgetExceeded() }
-                    return info
+                    // Realne predkosci faz z MLX: promptTokensPerSecond = prefill,
+                    // tokensPerSecond = decode. Dokladniejsze niz wall-clock.
+                    return (promptCount, genCount, info.promptTokensPerSecond, info.tokensPerSecond)
                 }
 
-                tokenCallback("", true)
+                tokenCallback("", true, counts.0, counts.1, counts.2, counts.3)
                 resultCode = 0
                 print("[MLXSwift] Generowanie zakonczone (kod \(resultCode))")
             } catch {
                 print("[MLXSwift] Blad generowania: \(error)")
-                tokenCallback("", true)
+                tokenCallback("", true, 0, 0, 0, 0)
                 if error is MLXContextBudgetExceeded || budgetBytes > 0 {
                     resultCode = -10
                 } else {
@@ -247,7 +258,7 @@ private func swiftGenerate(
     topP: Float,
     maxContextTokens: Int32,
     memoryBudgetMB: Int32,
-    tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UnsafeMutableRawPointer?) -> Void)?,
+    tokenCallback: (@convention(c) (UnsafePointer<CChar>?, Bool, UInt32, UInt32, Float, Float, UnsafeMutableRawPointer?) -> Void)?,
     callbackContext: UnsafeMutableRawPointer?,
     context: UnsafeMutableRawPointer?
 ) -> Int32 {
@@ -264,10 +275,10 @@ private func swiftGenerate(
         topP: topP,
         maxContextTokens: Int(maxContextTokens),
         memoryBudgetMB: Int(memoryBudgetMB)
-    ) { text, isFinal in
+    ) { text, isFinal, promptTokens, completionTokens, prefillTps, decodeTps in
         // Wywolaj Rust token callback
         text.withCString { cstr in
-            tokenCb(cstr, isFinal, callbackContext)
+            tokenCb(cstr, isFinal, UInt32(promptTokens), UInt32(completionTokens), Float(prefillTps), Float(decodeTps), callbackContext)
         }
     }
 }

@@ -36,7 +36,11 @@ impl Gpu {
     pub fn new(device: Arc<dyn Device>) -> Result<Self> {
         let kernels = Kernels::load(device.clone())?;
         let stream = device.create_stream()?;
-        Ok(Self { device, kernels, stream })
+        Ok(Self {
+            device,
+            kernels,
+            stream,
+        })
     }
 
     /// Retire the activations ring between forward passes so per-op scratch
@@ -124,7 +128,8 @@ impl Gpu {
         let ab = self.upload(a)?;
         let bb = self.upload(b)?;
         let out = self.alloc(a.len())?;
-        self.kernels.add_f32(&out, &ab, &bb, a.len(), &self.stream)?;
+        self.kernels
+            .add_f32(&out, &ab, &bb, a.len(), &self.stream)?;
         self.download(&out, a.len())
     }
 

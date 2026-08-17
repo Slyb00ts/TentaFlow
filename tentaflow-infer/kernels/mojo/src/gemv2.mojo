@@ -10,7 +10,7 @@ from std.gpu.primitives import warp
 from std.gpu.sync import barrier
 from std.gpu.memory import AddressSpace
 from std.memory import bitcast, stack_allocation
-from src.kv_fp8 import _e4m3x2_to_f16x2
+from src.arch_dot import f8e4m3_to_f32, f8e4m3x2_to_f16x2
 
 comptime WARP = 32
 comptime ROWS_PER_BLOCK = 8
@@ -26,8 +26,13 @@ def gemv_q8_0_f16_v2(
     """Q8_0 GEMV, one warp per row. Grid.x = ceil(n_rows / 8), block = 256.
 
     The 34-byte block layout is only 2-byte aligned, so the 32 int8 values are
-    fetched as sixteen u16 lanes and reinterpreted — same trade llama.cpp
-    makes; throughput comes from utilization, not load width.
+    fetched as sixteen u16 lanes and reinterpreted — same trade llama.cpp makes.
+
+    Sprowadzenie wagi do pamieci wspoldzielonej kawalkami wyrownanymi do
+    szesnastu bajtow — to, co dalo MXFP4 trzykrotnosc — jest tu GORSZE: 45,7
+    zamiast 47,1 tok/s generacji. Blok siedemnastobajtowy daje linii adres
+    NIEPARZYSTY, blok trzydziestoczterobajtowy dwubajtowo wyrownany, a to
+    wystarcza scalaczowi; koszt kafla i barier przewyzsza wtedy zysk.
     """
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
@@ -98,11 +103,34 @@ def _e2m1x8(codes: SIMD[DType.uint8, 8]) -> SIMD[DType.float32, 8]:
     return mag4.cast[DType.float32]() * 0.25 * sign
 
 
-def _f8e4m3s(b: UInt8) -> Float32:
-    # e4m3 -> f16 is exact; the sm_89 hardware cvt is a single instruction vs
-    # the ~15-op generic float8 emulation. NaN codes 0x7F/0xFF widen to NaN
-    # (real NVFP4 block scales are never NaN).
-    return Float32(_e4m3x2_to_f16x2(b, 0)[0])
+@always_inline
+def _e2m1x8_f16(codes: SIMD[DType.uint8, 8]) -> SIMD[DType.float16, 8]:
+    """Osiem kodow e2m1 wprost na wzorzec bitowy f16, bez konwersji int->float.
+
+    e2m1 to znak, dwubitowy wykladnik z biasem 1 i jednobitowa mantysa, wiec f16
+    (bias 15) powstaje przesunieciem pol: `exp16 = E + 14`, `mant16 = M << 9`.
+    DWA wyjatki: zero (maskujemy calosc) oraz jedyna wartosc subnormalna 0.5
+    (E=0, M=1), ktora w f16 jest normalna `0x3800`, czyli MA ZEROWA mantyse —
+    dlatego bit mantysy przepuszczamy tylko dla E > 0.
+
+    Wersja arytmetyczna (`_e2m1x8`) liczy magnitude maskami na int32 i konczy
+    konwersja na float — okolo dwa razy wiecej operacji wektorowych na wartosc.
+    W GEMV NVFP4 to wlasnie dekwantyzacja, a nie pamiec, byla scianka.
+    """
+    m = (codes & 0x07).cast[DType.uint16]()
+    exponent = m >> 1
+    # `(exponent + 3) >> 2` to arytmetyczny wskaznik „E > 0" (0 dla E=0, 1 dalej).
+    mantissa = (m & 1) & ((exponent + 3) >> 2)
+    bits = ((exponent + 14) << 10) | (mantissa << 9)
+    # Porownania SIMD zapadaja sie w tym toolchainie do skalarnego Bool, wiec
+    # maska „m != 0" musi byc arytmetyczna: (m + 7) >> 3 daje 0 dla zera i 1 dla
+    # kazdego innego kodu, a odjecie od zera rozciaga to na pelne 0xFFFF.
+    nonzero = SIMD[DType.uint16, 8](0) - ((m + 7) >> 3)
+    sign = ((codes >> 3) & 1).cast[DType.uint16]() << 15
+    return bitcast[DType.float16, 8]((bits & nonzero) | sign)
+
+
+comptime _f8e4m3s = f8e4m3_to_f32
 
 
 def gemv_nvfp4_f16_v2(
@@ -412,26 +440,26 @@ def gemv_q6_k_f16_v2(
 
 def gemv_q6_k_f16_gidx(
     y: UnsafePointer[Float16, MutAnyOrigin],
-    w: UnsafePointer[UInt8, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
     x: UnsafePointer[Float16, MutAnyOrigin],
     n_cols: Int,
     n_rows: Int,
     ids: UnsafePointer[Int32, MutAnyOrigin],
     sel: Int,
-    rows_per_expert: Int,
 ):
     """Routed-MoE Q6_K expert GEMV: identical math to gemv_q6_k_f16_v2 but the
-    expert row window is read ON DEVICE from `ids[sel]` (no host readback). The
-    global weight row is `ids[sel] * rows_per_expert + local_row`; `y[local_row]`
-    is written, so the result is bit-identical to launching gemv_q6_k_f16_v2 at
-    the same expert's byte offset."""
+    expert is chosen ON DEVICE from `ids[sel]` (no host readback).
+
+    `wtab[e]` is expert `e`'s own weight base pointer, so experts need not be
+    contiguous and each may sit in VRAM or pinned host memory independently.
+    Bit-identical to gemv_q6_k_f16_v2 launched against that expert's block."""
     lane = Int(thread_idx.x) % WARP
     wid = Int(thread_idx.x) // WARP
     lrow = Int(block_idx.x) * ROWS_PER_BLOCK + wid
     if lrow >= n_rows:
         return
-    grow = Int(ids[sel]) * rows_per_expert + lrow
-    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, grow, lane))
+    w = wtab[Int(ids[sel])]
+    total = warp.sum(_gemv_q6_k_row_acc(w, x, n_cols, lrow, lane))
     if lane == 0:
         y[lrow] = Float16(total)
 
@@ -537,7 +565,7 @@ def gemv_fp8_out_f32_v2(
         var pairs = SIMD[DType.uint32, 4](0)
         comptime for j in range(4):
             pairs[j] = bitcast[DType.uint32, 1](
-                _e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
+                f8e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
             )[0]
         wv = bitcast[DType.float16, 8](pairs).cast[DType.float32]()
         xv = (x + i).load[width=8, alignment=16]().cast[DType.float32]()
@@ -547,6 +575,47 @@ def gemv_fp8_out_f32_v2(
     total = warp.sum(acc) * scales[row]
     if lane == 0:
         y[row] = total
+
+
+def gemv_fp8_row_f16_v2(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    scales: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Ta sama matematyka co gemv_fp8_out_f32_v2, ale wynik zapisywany w f16.
+
+    Istnieje dla wag DeepSeeka V4, gdzie projekcje FP8 karmią kolejne warstwy
+    aktywacji trzymane w f16 — wariant f32 wymuszałby dodatkowe przejście po
+    całym wyjściu tylko po to, żeby je zawęzić.
+    """
+    lane = Int(thread_idx.x) % WARP
+    wid = Int(thread_idx.x) // WARP
+    row = Int(block_idx.x) * ROWS_PER_BLOCK + wid
+    if row >= n_rows:
+        return
+
+    base = row * n_cols
+    var acc: Float32 = 0.0
+    var i = lane * 8
+    stride = WARP * 8
+    while i + 8 <= n_cols:
+        raw = (w + base + i).bitcast[UInt16]().load[width=4, alignment=8]()
+        var pairs = SIMD[DType.uint32, 4](0)
+        comptime for j in range(4):
+            pairs[j] = bitcast[DType.uint32, 1](
+                f8e4m3x2_to_f16x2(UInt8(raw[j] & 0xFF), UInt8(raw[j] >> 8))
+            )[0]
+        wv = bitcast[DType.float16, 8](pairs).cast[DType.float32]()
+        xv = (x + i).load[width=8, alignment=16]().cast[DType.float32]()
+        acc += (wv * xv).reduce_add()
+        i += stride
+
+    total = warp.sum(acc) * scales[row]
+    if lane == 0:
+        y[row] = Float16(total)
 
 
 def _gemv_q5_k_row_acc(
@@ -1205,6 +1274,28 @@ comptime MXFP4_VALS = SIMD[DType.float32, 16](
 )
 
 
+def mxfp4_vals[W: Int](nib: SIMD[DType.uint8, W]) -> SIMD[DType.float32, W]:
+    """`MXFP4_VALS` złożone z bitów zamiast odczytane z tablicy.
+
+    Indeksowanie tablicy wartością Z REJESTRU wypycha ją do pamięci lokalnej, i
+    to osobną kopią na każdą pozycję wektora — szesnaście kodów razy osiem
+    pozycji to pół kilobajta zapisów na jeden odczyt wagi. Wykładnik e2m1 jest
+    funkcją liniową kodu, więc ta sama liczba powstaje z kilku operacji na
+    rejestrach i nie dotyka pamięci ani razu. Wynik jest bitowo tą samą
+    czwórką bajtów co odczyt z tablicy.
+    """
+    c = nib.cast[DType.uint32]()
+    lo = c & 7
+    # Kolejne pary kodów 1,2|3,4|6,8|12 dzielą wykładnik, stąd `lo >> 1`.
+    var bits = ((lo >> 1) + 0x7F) << 23
+    # Bit mantysy niosą kody 3, 5 i 7 — te trzy pozycje daje maska 0xA8.
+    bits |= ((SIMD[DType.uint32, W](0xA8) >> lo) & 1) << 22
+    bits |= (c & 8) << 28
+    # Kod zerowy jest dodatni w obu połówkach tablicy, więc znika z nim znak.
+    nonzero = (lo + 7) >> 3
+    return bitcast[DType.float32, W](bits & (SIMD[DType.uint32, W](0) - nonzero))
+
+
 def _init_lut16(
     lut: UnsafePointer[
         Float32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
@@ -1363,6 +1454,252 @@ def gemv_mxfp4_f16_v2(
     total = warp.sum(_gemv_mxfp4_row_acc(w, x, lut, n_cols, row, lane))
     if lane == 0:
         y[row] = Float16(total)
+
+
+@always_inline
+def _e2m1x16_f16(codes: SIMD[DType.uint8, 16]) -> SIMD[DType.float16, 16]:
+    """`_e2m1x8_f16` na szesnastu kodach naraz — patrz tam po wyprowadzenie."""
+    m = (codes & 0x07).cast[DType.uint16]()
+    exponent = m >> 1
+    mantissa = (m & 1) & ((exponent + 3) >> 2)
+    bits = ((exponent + 14) << 10) | (mantissa << 9)
+    nonzero = SIMD[DType.uint16, 16](0) - ((m + 7) >> 3)
+    sign = ((codes >> 3) & 1).cast[DType.uint16]() << 15
+    return bitcast[DType.float16, 16]((bits & nonzero) | sign)
+
+
+comptime MXFP4_UNIT = 1
+"""Blokow MXFP4 na jedna iteracje linii.
+
+CZTERY — jak jednostka Q6_K, ktora na tym samym ksztalcie wyciaga 255 GB/s —
+zmierzono i jest GORSZE: 36,4 zamiast 44,9 GB/s na gate/up i 12,3 zamiast 41,1
+na down. Szeroka jednostka zostawia bezczynne linie (64 bloki wiersza dzielone
+na cztery to 16 jednostek na 32 linie, a 16 blokow `down` to raptem cztery), a
+ten kernel traci na tym wiecej, niz zyskuje na amortyzacji dekodowania."""
+
+
+@always_inline
+def _mxfp4_row_acc_fast(
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    row: Int,
+    lane: Int,
+) -> Float32:
+    """`dot(W[row], x)` z blokow MXFP4, jednostka pracy to 128 wartosci.
+
+    Wariant z tablica w LDS robil TRZYDZIESCI DWA skalarne odczyty wspoldzielone
+    na blok szesnastu bajtow wagi, a jednostka pracy linii miala 32 wartosci —
+    czyli okolo 29 instrukcji na wartosc wobec 7 w Q6_K, ktory na tym samym
+    ksztalcie i przez ten sam launcher wyciaga 255 GB/s. Roznica byla dokladnie
+    ta: SZEROKOSC JEDNOSTKI. Tu linia bierze cztery bloki naraz i liczy je
+    wektorami szesnastu wartosci, wiec dekodowanie i redukcja amortyzuja sie na
+    128 wartosciach zamiast na 32.
+
+    Skala: `_e8m0_half(e)` razy tablica MXFP4 (dwukrotnosc e2m1) to `2^(e-127)`
+    razy e2m1 — bitowo ta sama liczba, jeden mnoznik mniej.
+    """
+    blocks_per_row = n_cols // 32
+    row_base = row * blocks_per_row * 17
+    units = blocks_per_row // MXFP4_UNIT
+    var acc: Float32 = 0.0
+    var u = lane
+    while u < units:
+        base = row_base + u * (MXFP4_UNIT * 17)
+        col = u * (MXFP4_UNIT * 32)
+        comptime for k in range(MXFP4_UNIT):
+            off = base + k * 17
+            codes = (w + off + 1).load[width=16, alignment=1]()
+            x0 = (x + col + k * 32).load[width=16, alignment=32]()
+            x1 = (x + col + k * 32 + 16).load[width=16, alignment=32]()
+            acc += _e8m0_pow2(w[off]) * (
+                (_e2m1x16_f16(codes & 0x0F) * x0)
+                .cast[DType.float32]()
+                .reduce_add()
+                + (_e2m1x16_f16(codes >> 4) * x1)
+                .cast[DType.float32]()
+                .reduce_add()
+            )
+        u += WARP
+
+    # Ogon: wiersz krotszy niz `WARP * MXFP4_UNIT` blokow zostawilby czesc
+    # kolumn nieprzeliczonych, wiec reszta idzie blok po bloku.
+    var b = units * MXFP4_UNIT + lane
+    while b < blocks_per_row:
+        off = row_base + b * 17
+        codes = (w + off + 1).load[width=16, alignment=1]()
+        col = b * 32
+        x0 = (x + col).load[width=16, alignment=32]()
+        x1 = (x + col + 16).load[width=16, alignment=32]()
+        acc += _e8m0_pow2(w[off]) * (
+            (_e2m1x16_f16(codes & 0x0F) * x0).cast[DType.float32]().reduce_add()
+            + (_e2m1x16_f16(codes >> 4) * x1)
+            .cast[DType.float32]()
+            .reduce_add()
+        )
+        b += WARP
+    return acc
+
+
+@always_inline
+def _e8m0_pow2(e: UInt8) -> Float32:
+    """`2^(e-127)`, czyli dwukrotnosc `_e8m0_half` — patrz `_mxfp4_row_acc_fast`."""
+    var bits: UInt32
+    if e < 1:
+        bits = UInt32(0x00400000) << UInt32(e)
+    else:
+        bits = UInt32(e) << 23
+    return UnsafePointer(to=bits).bitcast[Float32]()[0]
+
+
+comptime MXFP4_PASS_BLOCKS = 32
+"""Blokow MXFP4 na jedno przejscie: po jednym na linie fali."""
+
+comptime MXFP4_PASS_BYTES = MXFP4_PASS_BLOCKS * 17
+
+comptime MXFP4_PASS_CHUNKS = MXFP4_PASS_BYTES // 16 + 1
+"""Szesnastobajtowych kawalkow na przejscie; jeden zapasowy, bo okno wiersza
+zaczyna sie w dowolnym miejscu, a czytamy od WYROWNANEGO dolu."""
+
+comptime MXFP4_STAGE_ROW = MXFP4_PASS_CHUNKS * 16
+
+
+@always_inline
+def _mxfp4_half_acc(
+    swu: UnsafePointer[
+        UInt32, MutUntrackedOrigin, address_space = AddressSpace.SHARED
+    ],
+    q: Int,
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    col: Int,
+) -> Float32:
+    """Osiem bajtow kodow spod DOWOLNEGO adresu w LDS — wklad ich szesnastu wartosci.
+
+    Bajt `j` bloku MXFP4 trzyma kolumne `j` w mlodszym polbajcie i `j+16` w
+    starszym, wiec te osiem bajtow to kolumny `col..col+8` i `col+16..col+24`.
+
+    Adres jest dowolny, bo blok ma siedemnascie bajtow. Odczyt niewyrownany
+    wprost z LDS schodzil do przestrzeni generycznej (`ld.v4.b32` bez
+    kwalifikatora) — i wolno, i dla takiego adresu niezdefiniowane — wiec osiem
+    bajtow sklada sie z TRZECH WYROWNANYCH SLOW przesunieciem lejkowym.
+    """
+    words = swu + (q >> 2)
+    sh = UInt64((q & 3) << 3)
+    var v = SIMD[DType.uint32, 2](0)
+    comptime for j in range(2):
+        pair = UInt64(words[j]) | (UInt64(words[j + 1]) << 32)
+        v[j] = UInt32((pair >> sh) & 0xFFFFFFFF)
+    codes = bitcast[DType.uint8, 8](v)
+    xa = (x + col).load[width=8, alignment=16]()
+    xb = (x + col + 16).load[width=8, alignment=16]()
+    return (_e2m1x8_f16(codes & 0x0F) * xa).cast[DType.float32]().reduce_add() + (
+        _e2m1x8_f16(codes >> 4) * xb
+    ).cast[DType.float32]().reduce_add()
+
+
+def gemv_mxfp4_f16_gidx(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    sel: Int,
+):
+    """Routed-MoE MXFP4 expert GEMV: ekspert wybierany NA URZADZENIU z `ids[sel]`.
+
+    Wage czyta sie do pamieci wspoldzielonej KAWALKAMI WYROWNANYMI DO SZESNASTU
+    BAJTOW, a dopiero stamtad dekoduje. Powod jest zmierzony i jest jedynym
+    powodem: blok MXFP4 ma SIEDEMNASCIE bajtow, wiec czytany wprost daje linii
+    adres `17b+1`, ktorego scalacz dostepow nie sklada. Ta sama liczba tych
+    samych bajtow, ta sama siatka, roznica wylacznie w wyrownaniu — 45,5 wobec
+    482,7 GB/s (`examples/moe_gemv_bench`). Dekodowanie kosztuje przy tym tyle,
+    co nic: sonda czytajaca bajty i nic z nimi nierobiaca miala 98,0 us wobec
+    101,4 us pelnego kernela.
+
+    `wtab[e]` jest wlasnym wskaznikiem wagi eksperta `e`, wiec eksperci nie musza
+    lezec ciagiem i kazdy moze siedziec w VRAM albo w pamieci hosta niezaleznie.
+    """
+    # Cztery bajty zapasu: ostatni blok kafla czyta piec slow, czyli o trzy
+    # bajty dalej niz siega jego siedemnascie.
+    sw = stack_allocation[
+        ROWS_PER_BLOCK * MXFP4_STAGE_ROW + 16,
+        UInt8,
+        alignment=16,
+        address_space = AddressSpace.SHARED,
+    ]()
+    swu = sw.bitcast[UInt32]()
+    tid = Int(thread_idx.x)
+    nthreads = Int(block_dim.x)
+    lane = tid % WARP
+    wid = tid // WARP
+    w = wtab[Int(ids[sel])]
+    blocks_per_row = n_cols // 32
+    stride = blocks_per_row * 17
+    # Wiersz `down` ma szesnascie blokow na trzydziesci dwie linie fali, wiec
+    # przy jednym bloku na linie polowa fali nie ma czego liczyc — a ten kernel
+    # jest zwiazany DEKODOWANIEM, nie pasmem: dwukrotne ograniczenie sciaganych
+    # bajtow nie zmienilo mu tempa (73,4 wobec 75,3 GB/s). Gdy wiersz jest
+    # krotszy niz fala, blok idzie na DWIE linie po osiem bajtow kodow.
+    var split = 1
+    if blocks_per_row * 2 <= WARP:
+        split = 2
+    row0 = Int(block_idx.x) * ROWS_PER_BLOCK
+    # Ostatni legalny wyrownany kawalek stosu tego eksperta: okno ostatniego
+    # przejscia siega do szesnastu bajtow za wiersz, a czytanie za koniec
+    # alokacji jest bledem, nie niedokladnoscia.
+    last_chunk = (n_rows * stride // 16) * 16 - 16
+
+    var lrow = row0 + wid
+    if lrow > n_rows - 1:
+        lrow = n_rows - 1
+    var acc: Float32 = 0.0
+
+    var first = 0
+    while first < blocks_per_row:
+        var i = tid
+        while i < ROWS_PER_BLOCK * MXFP4_PASS_CHUNKS:
+            r = i // MXFP4_PASS_CHUNKS
+            c = i % MXFP4_PASS_CHUNKS
+            var src_row = row0 + r
+            if src_row > n_rows - 1:
+                src_row = n_rows - 1
+            win = src_row * stride + first * 17
+            var at = (win // 16) * 16 + c * 16
+            if at > last_chunk:
+                at = last_chunk
+            (sw + r * MXFP4_STAGE_ROW + c * 16).store[alignment=16](
+                (w + at).load[width=16, alignment=16]()
+            )
+            i += nthreads
+        barrier()
+
+        win = lrow * stride + first * 17
+        skew = win - (win // 16) * 16
+        if split == 1:
+            b = first + lane
+            if b < blocks_per_row:
+                base = wid * MXFP4_STAGE_ROW + skew + lane * 17
+                col = b * 32
+                acc += _e8m0_pow2(sw[base]) * (
+                    _mxfp4_half_acc(swu, base + 1, x, col)
+                    + _mxfp4_half_acc(swu, base + 9, x, col + 8)
+                )
+        else:
+            b = first + (lane >> 1)
+            if b < blocks_per_row:
+                half = (lane & 1) * 8
+                base = wid * MXFP4_STAGE_ROW + skew + (lane >> 1) * 17
+                col = b * 32 + half
+                acc += _e8m0_pow2(sw[base]) * _mxfp4_half_acc(
+                    swu, base + 1 + half, x, col
+                )
+        barrier()
+        first += MXFP4_PASS_BLOCKS
+
+    total = warp.sum(acc)
+    if lane == 0 and row0 + wid < n_rows:
+        y[row0 + wid] = Float16(total)
 
 
 def gemv_mxfp4_out_f32_v2(
@@ -2136,3 +2473,68 @@ def gemv_iq1_m_out_f32_v2(
     total = warp.sum(_gemv_iq1_m_row_acc(w, grid, x, n_cols, row, lane))
     if lane == 0:
         y[row] = total
+
+
+def gemv_q6_k_f16_gidx_batch(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Every selection of a routed step, in ONE launch.
+
+    `block_idx.y` IS the selection: it picks the expert out of `ids`, the input
+    row that feeds it, and the slice of `y` the answer goes to.
+
+    `share` is how many consecutive selections read the SAME input row. It is
+    `top_k` for the projections that take the token's hidden state, because a
+    token's experts all read it, and 1 for the one that takes the feed-forward
+    half, because there each selection already has a row of its own. Getting it
+    wrong feeds every expert of a token the first expert's intermediate values,
+    which is arithmetic that still produces text. A decode step used to launch one of these per selection per
+    projection — forty kernels a layer for eight experts — and each covered too
+    few blocks to fill the card, so they ran one after another over an idle GPU.
+
+    Calls the single-selection body rather than repeating it, so the arithmetic
+    is the same arithmetic by construction and not by review.
+    """
+    sel = Int(block_idx.y)
+    gemv_q6_k_f16_gidx(
+        y + sel * n_rows,
+        wtab,
+        x + (sel // share) * n_cols,
+        n_cols,
+        n_rows,
+        ids + sel,
+        0,
+    )
+
+
+def gemv_mxfp4_f16_gidx_batch(
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    share: Int,
+):
+    """Every selection of a routed step in one launch — the MXFP4 half.
+
+    See `gemv_q6_k_f16_gidx_batch`; a mixture needs every one of its stacks
+    batched, because one projection left per selection sets the launch count for
+    the whole layer.
+    """
+    sel = Int(block_idx.y)
+    gemv_mxfp4_f16_gidx(
+        y + sel * n_rows,
+        wtab,
+        x + (sel // share) * n_cols,
+        n_cols,
+        n_rows,
+        ids + sel,
+        0,
+    )

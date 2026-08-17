@@ -23,7 +23,7 @@ use tentaflow_protocol::{
     MeshPairingStartResponse, MeshTrustRetrustRequest, MeshTrustRetrustResponse,
     MeshTrustRevokeRequest, MeshTrustRevokeResponse, MessageBody, ProtocolError, ProtocolErrorCode,
 };
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use tentaflow_protocol::mesh::{MeshCommandResponsePayload, MeshCommandType};
 
@@ -867,6 +867,7 @@ pub async fn cluster_rdma_configure(
                 &confirmed_devices.join(","),
                 &plan.primary_ip,
                 &plan.socket_ifname,
+                plan.gid_index,
             ) {
                 warn!("update_cluster_member_rdma nieudany: {}", e);
             }
@@ -920,18 +921,42 @@ pub async fn cluster_rdma_configure(
 /// transferu to zawsze head; gdy head == local, koordynator pcha bezposrednio,
 /// inaczej zleca headowi `PushModelToPeer`. Token HF rozwiazywany LOKALNIE na
 /// nodzie pobierajacym (nigdy nie leci przez mesh).
+/// Node, ktory POBIERA model dla calego klastra i rozsyla go reszcie. Wybor jest
+/// deterministyczny — czlonek o NAJNIZSZYM adresie IP interconnectu — zeby przy
+/// powtorzonym deployu zawsze siadal na ten sam wezel (a wiec i ten sam cache),
+/// niezaleznie od tego, z ktorego noda admin kliknal deploy. Porownujemy
+/// numerycznie po oktetach: leksykograficznie `10.10.10.9` wypadloby PO
+/// `10.10.10.10`. Adres RDMA ma pierwszenstwo (to nim leci transfer); gdy go
+/// jeszcze nie ma, uzywamy adresu interconnectu z testu polaczen.
+fn model_seed_node(members: &[crate::db::models::DbClusterMember]) -> Option<String> {
+    members
+        .iter()
+        .filter_map(|m| {
+            let raw = if m.rdma_ip.is_empty() {
+                m.interface_ip.as_str()
+            } else {
+                m.rdma_ip.as_str()
+            };
+            raw.parse::<std::net::Ipv4Addr>()
+                .ok()
+                .map(|ip| (ip.octets(), m.node_id.clone()))
+        })
+        .min()
+        .map(|(_, node_id)| node_id)
+}
+
 async fn ensure_cluster_model(
     ctx: &HandlerContext,
     qm: &Arc<IrohMeshManager>,
     local_id: &str,
     deployment_cluster_id: &str,
-    head_node_id: &str,
+    seed_node_id: &str,
     members: &[crate::db::models::DbClusterMember],
     model_repo: &str,
     engine_id: &str,
 ) -> Result<(), String> {
-    // 1. Head MUSI miec model w cache — pobierz jesli brak.
-    if head_node_id == local_id {
+    // 1. Seed MUSI miec model w cache — pobierz jesli brak.
+    if seed_node_id == local_id {
         let hf_token = crate::db::repository::get_setting_secure(
             &ctx.state.db,
             "hf_token",
@@ -948,34 +973,34 @@ async fn ensure_cluster_model(
             deployment_cluster_id,
         )
         .await
-        .map_err(|e| format!("head: pobranie modelu: {e}"))?;
+        .map_err(|e| format!("seed: pobranie modelu: {e}"))?;
     } else {
         let cmd = MeshCommandType::EnsureModelLocal {
             deployment_cluster_id: deployment_cluster_id.to_string(),
             model_repo: model_repo.to_string(),
             engine_id: engine_id.to_string(),
         };
-        match qm.send_command_and_wait(head_node_id, cmd, 7200).await {
+        match qm.send_command_and_wait(seed_node_id, cmd, 7200).await {
             Ok(resp) if resp.ok => {
                 if let MeshCommandResponsePayload::EnsureModelResult { error: Some(e), .. } =
                     resp.payload
                 {
-                    return Err(format!("head: pobranie modelu: {e}"));
+                    return Err(format!("seed: pobranie modelu: {e}"));
                 }
             }
             Ok(resp) => {
                 return Err(format!(
-                    "head: pobranie modelu: {}",
+                    "seed: pobranie modelu: {}",
                     resp.error.unwrap_or_default()
                 ))
             }
-            Err(e) => return Err(format!("head: EnsureModelLocal mesh: {e}")),
+            Err(e) => return Err(format!("seed: EnsureModelLocal mesh: {e}")),
         }
     }
 
-    // 2. Kazdy worker: brak modelu → transfer z head-a.
+    // 2. Kazdy worker: brak modelu → transfer z seed-a.
     for m in members {
-        if m.node_id == head_node_id {
+        if m.node_id == seed_node_id {
             continue;
         }
         let present = if m.node_id == local_id {
@@ -998,9 +1023,9 @@ async fn ensure_cluster_model(
             continue;
         }
         info!(node = %m.node_id, model = %model_repo, "P0: transfer modelu na worker");
-        if head_node_id == local_id {
+        if seed_node_id == local_id {
             let snap = crate::services::deploy::distributed::model_snapshot_dir(model_repo)
-                .ok_or_else(|| "model zniknal z cache head-a przed transferem".to_string())?;
+                .ok_or_else(|| "model zniknal z cache seed-a przed transferem".to_string())?;
             let hash = snap
                 .file_name()
                 .and_then(|n| n.to_str())
@@ -1025,7 +1050,7 @@ async fn ensure_cluster_model(
                 target_node_id: m.node_id.clone(),
             };
             match qm
-                .send_command_and_wait(head_node_id, cmd, MODEL_TRANSFER_CMD_TIMEOUT_SECS)
+                .send_command_and_wait(seed_node_id, cmd, MODEL_TRANSFER_CMD_TIMEOUT_SECS)
                 .await
             {
                 Ok(resp) if resp.ok => {
@@ -1229,6 +1254,8 @@ fn build_member_spec(
     max_model_len: u32,
     ray_head_ip: &str,
     ray_port: u16,
+    speculative_num_tokens: Option<u32>,
+    generation_config_json: Option<String>,
     user_config_json: &str,
 ) -> tentaflow_protocol::mesh::DistributedDeploySpec {
     // Wstrzykujemy `_target_node_id` do user-config JSON (do routingu mesh).
@@ -1268,6 +1295,8 @@ fn build_member_spec(
         // Per-member persisted RoCEv2 GID index (D1 column, default 3) — not a
         // hardcode in the deploy path (P2-2).
         gid_index: member.rdma_gid_index.max(0) as u32,
+        speculative_num_tokens,
+        generation_config_json,
         config_json: serde_json::to_string(&cfg).unwrap_or_else(|_| "{}".to_string()),
     }
 }
@@ -1359,6 +1388,19 @@ pub async fn cluster_deploy(
         .clone()
         .filter(|s| !s.trim().is_empty())
         .unwrap_or_else(|| model.clone());
+
+    // Liczba tokenow draftu jest wlasnoscia CHECKPOINTU, nie silnika: dla DSpark
+    // musi rownac sie `dspark_block_size` z jego config.json (preview = 5,
+    // 0731 = 7), bo krotszy blok daje bledne wyjscie. Bierzemy ja z presetu.
+    let preset = model_preset_id
+        .as_deref()
+        .and_then(|pid| manifest.model_presets.iter().find(|p| p.id == pid));
+    let speculative_num_tokens = preset.and_then(|p| p.speculator_num_tokens);
+    // Sampling zalecany przez autora checkpointu — bez niego silnik startuje z
+    // wlasnym domyslem, ktory dla czesci modeli jest wyraznie za niski.
+    let generation_config_json = preset
+        .and_then(|p| p.sampling.as_ref())
+        .and_then(|s| s.to_generation_config_json());
 
     // P1-4: reject a second deploy only when a LIVE deployment (deploying/running)
     // exists — a node has one GPU set, so two TP deployments would collide on GPU
@@ -1505,6 +1547,8 @@ pub async fn cluster_deploy(
                 max_len,
                 &ray_head_ip,
                 ray_port,
+                speculative_num_tokens,
+                generation_config_json.clone(),
                 &user_cfg,
             ),
         ));
@@ -1796,6 +1840,15 @@ async fn cdeploy_fail(
         MessageBody::ClusterDeployResponseBody(r) => r.message.unwrap_or(reason),
         _ => reason,
     };
+    // Log_bus zyje tylko dopoki ktos oglada strumien w UI. Bez wpisu w logu
+    // serwera nieudany deploy nie zostawial zadnego sladu — po zamknieciu
+    // przegladarki powod porazki byl nie do odtworzenia.
+    error!(
+        deployment_cluster_id = %deployment_cluster_id,
+        head_node_id = %head_node_id,
+        "distributed deploy FAILED: {}",
+        msg
+    );
     crate::deploy::log_bus::fail(
         &ctx.state.db,
         deployment_cluster_id,
@@ -1876,7 +1929,7 @@ async fn cluster_serve_log_poller(
     while !stop.load(Ordering::Relaxed) {
         tokio::time::sleep(std::time::Duration::from_secs(3)).await;
         if let Some(tail) =
-            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40).await
+            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300).await
         {
             let lines: Vec<&str> = tail.lines().collect();
             let start = match &anchor {
@@ -1944,11 +1997,16 @@ async fn run_cluster_deploy_phases(
         "P0: pobieranie modelu",
     );
     info!(deployment_cluster_id=%deployment_cluster_id, "cluster deploy P0: ensure model on head + transfer to workers");
+    // Model pobiera czlonek o najnizszym IP i rozsyla go reszcie — NIE head.
+    // Head jest wybierany pod endpoint (lokalny nod), wiec wiazanie z nim
+    // pobierania oznaczaloby, ze te same wagi laduja raz tu, raz tam, zaleznie
+    // od tego, z ktorej maszyny kliknieto deploy.
+    let seed_node_id = model_seed_node(&members).unwrap_or_else(|| head_node_id.clone());
     let p0_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
     {
         let worker_nodes: Vec<String> = members
             .iter()
-            .filter(|m| m.node_id != head_node_id)
+            .filter(|m| m.node_id != seed_node_id)
             .map(|m| m.node_id.clone())
             .collect();
         tokio::spawn(cluster_p0_progress_poller(
@@ -1960,12 +2018,17 @@ async fn run_cluster_deploy_phases(
             p0_stop.clone(),
         ));
     }
+    info!(
+        deployment_cluster_id = %deployment_cluster_id,
+        seed_node_id = %seed_node_id,
+        "cluster deploy P0: seed = najnizsze IP, pobiera i rozsyla model"
+    );
     let p0_res = ensure_cluster_model(
         ctx,
         &qm,
         &local_id,
         &deployment_cluster_id,
-        &head_node_id,
+        &seed_node_id,
         &members,
         &model,
         &engine_id,
@@ -2342,7 +2405,7 @@ async fn run_cluster_deploy_phases(
     {
         serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
         let reason = if head_node_id == local_id {
-            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 40)
+            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300)
                 .await
             {
                 Some(tail) => format!(

@@ -102,6 +102,12 @@ fn default_sustained_concurrency() -> u32 {
 pub enum ApiType {
     OpenAi,
     Anthropic,
+    /// In-process: the request goes through `ModelRuntimeExecutor::stream_chat`
+    /// instead of a socket. This is the only way to measure a backend that has
+    /// no dialable chat endpoint — embedded llama.cpp / MLX, a QUIC sidecar, a
+    /// coding-agent bridge — and it also reaches models owned by another mesh
+    /// node through the normal forward path.
+    Local,
 }
 
 impl ApiType {
@@ -109,6 +115,7 @@ impl ApiType {
         match self {
             ApiType::OpenAi => "openai",
             ApiType::Anthropic => "anthropic",
+            ApiType::Local => "local",
         }
     }
 
@@ -116,6 +123,7 @@ impl ApiType {
         match s {
             "openai" => Some(ApiType::OpenAi),
             "anthropic" => Some(ApiType::Anthropic),
+            "local" => Some(ApiType::Local),
             _ => None,
         }
     }
@@ -128,7 +136,8 @@ pub struct TargetSpec {
     pub label: String,
     pub api: ApiType,
     /// Either a full URL (`http(s)://host[:port]`) or a bare hostname
-    /// combined with `port` (443 implies https).
+    /// combined with `port` (443 implies https). Empty for `ApiType::Local`,
+    /// which dispatches in-process and never opens a socket of its own.
     pub host: String,
     pub port: u16,
     pub api_key: Option<String>,
@@ -147,8 +156,11 @@ impl TargetSpec {
         }
     }
 
-    /// Rejects only cloud-metadata / link-local destinations. Private, loopback
-    /// and LAN targets are intentionally allowed: benchmarking a local inference
+    /// Pre-flight check for one target. An in-process target carries no
+    /// endpoint at all — the model name IS the address, resolved through the
+    /// catalog — so only that is required. For HTTP targets we reject
+    /// cloud-metadata / link-local destinations. Private, loopback and LAN
+    /// targets are intentionally allowed: benchmarking a local inference
     /// service hits loopback/LAN by design, exactly like an addon exact-host
     /// network rule. The admin-permission gate for who may run a benchmark lives
     /// in the Chunk 2 handler; here we only stop a target from being pointed at
@@ -156,7 +168,16 @@ impl TargetSpec {
     /// Only literal IPs are checked — DNS names are not an SSRF vector here
     /// because the destination is admin-configured, not attacker-supplied per
     /// request.
-    pub fn validate_host(&self) -> anyhow::Result<()> {
+    pub fn validate(&self) -> anyhow::Result<()> {
+        if self.model.trim().is_empty() {
+            anyhow::bail!("target has no model name");
+        }
+        if self.api == ApiType::Local {
+            return Ok(());
+        }
+        if self.host.trim().is_empty() {
+            anyhow::bail!("target has no host");
+        }
         let host = self.host_only();
         if let Ok(ip) = host.parse::<IpAddr>() {
             let blocked = match ip {
@@ -178,7 +199,7 @@ impl TargetSpec {
     }
 
     /// Bare host of the target: strips an optional scheme, path and `:port` /
-    /// `[ipv6]:port` wrapper so `validate_host` can parse a literal IP.
+    /// `[ipv6]:port` wrapper so `validate` can parse a literal IP.
     fn host_only(&self) -> String {
         let without_scheme = self
             .host
@@ -344,4 +365,55 @@ pub struct BenchmarkListItem {
     pub target_count: u32,
     pub models: Vec<String>,
     pub last_run: Option<BenchmarkRunRecord>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn spec(api: ApiType, host: &str, model: &str) -> TargetSpec {
+        TargetSpec {
+            id: "t1".into(),
+            label: "target".into(),
+            api,
+            host: host.into(),
+            port: 8080,
+            api_key: None,
+            model: model.into(),
+        }
+    }
+
+    #[test]
+    fn api_type_round_trips_through_storage() {
+        for api in [ApiType::OpenAi, ApiType::Anthropic, ApiType::Local] {
+            assert_eq!(ApiType::parse(api.as_str()), Some(api));
+        }
+        assert_eq!(ApiType::parse("grpc"), None);
+    }
+
+    #[test]
+    fn local_target_needs_a_model_but_no_host() {
+        spec(ApiType::Local, "", "qwen3.5-0.8b")
+            .validate()
+            .expect("model name is the whole address of an in-process target");
+        assert!(spec(ApiType::Local, "", "").validate().is_err());
+    }
+
+    #[test]
+    fn http_target_needs_a_host() {
+        assert!(spec(ApiType::OpenAi, "", "gpt-5.1").validate().is_err());
+        spec(ApiType::OpenAi, "10.0.4.21", "gpt-5.1")
+            .validate()
+            .expect("LAN destinations are allowed on purpose");
+    }
+
+    #[test]
+    fn cloud_metadata_destination_stays_blocked() {
+        assert!(spec(ApiType::OpenAi, "169.254.169.254", "m")
+            .validate()
+            .is_err());
+        assert!(spec(ApiType::OpenAi, "http://[fd00:ec2::254]:80", "m")
+            .validate()
+            .is_err());
+    }
 }

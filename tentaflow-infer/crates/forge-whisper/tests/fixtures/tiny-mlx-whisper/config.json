@@ -1,0 +1,17 @@
+{
+ "n_mels": 16,
+ "n_audio_ctx": 8,
+ "n_audio_state": 64,
+ "n_audio_head": 4,
+ "n_audio_layer": 2,
+ "n_vocab": 51,
+ "n_text_ctx": 6,
+ "n_text_state": 64,
+ "n_text_head": 4,
+ "n_text_layer": 2,
+ "quantization": {
+  "group_size": 64,
+  "bits": 4
+ },
+ "model_type": "whisper"
+}

@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::{GpuSampler, SamplingParams, SeqSampleParams};
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 
 const STEPS: usize = 24;
 
@@ -25,7 +25,7 @@ fn load() -> Option<Model> {
         eprintln!("skipping: test model missing at {}", path.display());
         return None;
     }
-    let device = match CudaDevice::new(
+    let device = match gpu::open(
         0,
         PoolSizes {
             weights: 2 << 30,
@@ -42,6 +42,8 @@ fn load() -> Option<Model> {
     };
     let dev: Arc<dyn Device> = device;
     let cfg = ModelConfig {
+        weight_host_budget: 0,
+        weight_spill_dir: None,
         kv_pages: 256,
         ..ModelConfig::default()
     };
@@ -65,7 +67,10 @@ fn greedy_seq_params() -> SeqSampleParams {
         seed: 0,
         step: 0,
         penalty: 1.0,
+        frequency_penalty: 0.0,
+        presence_penalty: 0.0,
         penalty_ids: Vec::new(),
+        penalty_counts: Vec::new(),
     }
 }
 
@@ -183,12 +188,97 @@ fn throughput_scaling() {
     }
 }
 
+/// Statystyki różnicy dwóch wektorów logitów tego samego kroku.
+fn logits_delta(left: &[f32], right: &[f32]) -> (f64, f64, f64, f64) {
+    let mut diff2 = 0.0f64;
+    let mut norm2 = 0.0f64;
+    let mut max_abs = 0.0f64;
+    for (a, b) in left.iter().zip(right) {
+        let d = (*a as f64) - (*b as f64);
+        diff2 += d * d;
+        norm2 += (*a as f64) * (*a as f64);
+        max_abs = max_abs.max(d.abs());
+    }
+    let margin = |values: &[f32]| {
+        let mut best = f32::NEG_INFINITY;
+        let mut second = f32::NEG_INFINITY;
+        for v in values {
+            if *v > best {
+                second = best;
+                best = *v;
+            } else if *v > second {
+                second = *v;
+            }
+        }
+        (best - second) as f64
+    };
+    (
+        (diff2 / norm2.max(1e-30)).sqrt(),
+        max_abs,
+        margin(left),
+        margin(right),
+    )
+}
+
+/// Przeplata krok po kroku ścieżkę jednosekwencyjną i batchowaną B=1 na tym
+/// samym promptcie i zwraca diagnostykę pierwszej rozbieżności tokenu: numer
+/// kroku, relatywne L2 i max|delta| logitów oraz margines top-2 każdej ścieżki.
+/// Ścieżki mają osobne sekwencje i osobne bufory logitów, więc przeplot jest
+/// bezpieczny. `None` = strumienie są identyczne przez `steps` kroków.
+fn diff_single_vs_batched(model: &mut Model, prompt: &[u32], steps: usize) -> Option<String> {
+    let mut sampler = GpuSampler::new(greedy());
+    let mut seq_single = model.new_seq();
+    model.prefill_chunk(&mut seq_single, prompt).unwrap();
+    let mut token_single = model.sample_last_logits(&mut sampler).unwrap();
+
+    let mut seq_batched = model.new_seq();
+    let mut batched_sampler = GpuSampler::new(greedy());
+    model.prefill_chunk(&mut seq_batched, prompt).unwrap();
+    let mut token_batched = model.sample_last_logits(&mut batched_sampler).unwrap();
+
+    let mut report = None;
+    let mut trend: Vec<String> = Vec::new();
+    for step in 1..steps {
+        sampler.note_token(token_single);
+        token_single = model
+            .step_and_sample(&mut seq_single, token_single, &mut sampler)
+            .unwrap();
+        let single_logits = model.read_single_logits().unwrap();
+
+        let params = vec![greedy_seq_params()];
+        let mut refs: Vec<&mut _> = vec![&mut seq_batched];
+        token_batched = model
+            .batched_decode(&mut refs, &[token_batched], &params)
+            .unwrap()[0];
+        let batched_logits = model.read_batch_logits(1).unwrap();
+
+        let (rel_l2, max_abs, margin_single, margin_batched) =
+            logits_delta(&single_logits, &batched_logits);
+        trend.push(format!("{step}:{rel_l2:.2e}"));
+        if token_single != token_batched && report.is_none() {
+            report = Some(format!(
+                "krok {step} (długość sekwencji {}): token single {token_single} vs batched \
+                 {token_batched}; logity rel_l2 {rel_l2:.3e}, max|delta| {max_abs:.3e}, \
+                 margines top-2 single {margin_single:.4}, batched {margin_batched:.4}",
+                prompt.len() + step + 1
+            ));
+        }
+    }
+    model.release_seq(&mut seq_single);
+    model.release_seq(&mut seq_batched);
+    report.map(|first| format!("{first}\nrel_l2 per krok: {}", trend.join(" ")))
+}
+
 fn prompt_a() -> Vec<u32> {
-    vec![151644, 872, 198, 105043, 100165, 11319, 151645, 198, 151644, 77091, 198]
+    vec![
+        151644, 872, 198, 105043, 100165, 11319, 151645, 198, 151644, 77091, 198,
+    ]
 }
 
 fn prompt_b() -> Vec<u32> {
-    vec![151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198]
+    vec![
+        151644, 872, 198, 3838, 374, 220, 17, 10, 17, 30, 151645, 198, 151644, 77091, 198,
+    ]
 }
 
 #[test]
@@ -198,11 +288,19 @@ fn batched_matches_single_seq() {
     // (a) B=1 batched must match the legacy fused single-seq greedy stream.
     let single_a = single_seq_greedy(&mut model, &prompt_a(), STEPS);
     let b1 = batched_greedy(&mut model, &[prompt_a()], STEPS);
-    assert_eq!(single_a, b1[0], "B=1 batched diverged from single-seq greedy");
+    if single_a != b1[0] {
+        let detail = diff_single_vs_batched(&mut model, &prompt_a(), STEPS)
+            .unwrap_or_else(|| "przeplot nie odtworzył rozbieżności".to_string());
+        panic!("B=1 batched diverged from single-seq greedy\n{detail}");
+    }
 
     // (b) N identical prompts must all produce identical streams, equal to the
     // single-sequence result (per-seq isolation + correct paged attention).
-    let same = batched_greedy(&mut model, &[prompt_a(), prompt_a(), prompt_a(), prompt_a()], STEPS);
+    let same = batched_greedy(
+        &mut model,
+        &[prompt_a(), prompt_a(), prompt_a(), prompt_a()],
+        STEPS,
+    );
     for (j, s) in same.iter().enumerate() {
         assert_eq!(*s, single_a, "identical-prompt lane {j} diverged");
     }
@@ -210,7 +308,11 @@ fn batched_matches_single_seq() {
     // (c) Distinct prompts in one batch must each match their own single-seq
     // greedy generation.
     let single_b = single_seq_greedy(&mut model, &prompt_b(), STEPS);
-    let mixed = batched_greedy(&mut model, &[prompt_a(), prompt_b(), prompt_a(), prompt_b()], STEPS);
+    let mixed = batched_greedy(
+        &mut model,
+        &[prompt_a(), prompt_b(), prompt_a(), prompt_b()],
+        STEPS,
+    );
     assert_eq!(mixed[0], single_a, "mixed lane 0 (prompt A) diverged");
     assert_eq!(mixed[1], single_b, "mixed lane 1 (prompt B) diverged");
     assert_eq!(mixed[2], single_a, "mixed lane 2 (prompt A) diverged");

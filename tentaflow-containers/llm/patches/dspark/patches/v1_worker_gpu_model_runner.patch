@@ -1,0 +1,606 @@
+--- a/vllm/v1/worker/gpu_model_runner.py
++++ b/vllm/v1/worker/gpu_model_runner.py
+@@ -4,6 +4,7 @@
+ import functools
+ import gc
+ import itertools
++import os
+ import threading
+ import time
+ from collections import defaultdict
+@@ -175,6 +176,8 @@
+ from vllm.v1.spec_decode.custom_class_proposer import create_custom_proposer
+ from vllm.v1.spec_decode.dflash import DFlashProposer
+ from vllm.v1.spec_decode.draft_model import DraftModelProposer
++from vllm.v1.spec_decode.dspark import DSparkPosition0Diagnostics
++from vllm.v1.spec_decode.dspark_proposer import DSparkProposer
+ from vllm.v1.spec_decode.eagle import EagleProposer
+ from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
+ from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
+@@ -358,6 +361,10 @@
+     return pooler_output
+ 
+ 
++def _format_optional_float(value: float | None) -> str:
++    return "nan" if value is None else f"{value:.3f}"
++
++
+ class AsyncGPUPoolingModelRunnerOutput(AsyncModelRunnerOutput):
+     def __init__(
+         self,
+@@ -431,6 +438,21 @@
+         self.scheduler_config = vllm_config.scheduler_config
+         self.speculative_config = vllm_config.speculative_config
+         self.observability_config = vllm_config.observability_config
++        self._dspark_iter_timing = os.getenv("VLLM_DSPARK_ITER_TIMING", "0").lower() in {
++            "1",
++            "true",
++            "yes",
++            "on",
++        }
++        try:
++            self._dspark_iter_timing_log_every = max(
++                1, int(os.getenv("VLLM_DSPARK_ITER_TIMING_LOG_EVERY", "20"))
++            )
++        except ValueError:
++            self._dspark_iter_timing_log_every = 20
++        self._dspark_iter_timing_count = 0
++        self._dspark_iter_timing_totals_ms: defaultdict[str, float] = defaultdict(float)
++        self._dspark_iter_timing_started = 0.0
+ 
+         model_config = self.model_config
+         cache_config = self.cache_config
+@@ -439,6 +461,11 @@
+         self.device = device
+         self.pin_memory = is_pin_memory_available()
+         self.dtype = self.model_config.dtype
++        if self._dspark_iter_timing:
++            logger.info(
++                "DSpark iteration timing enabled. CUDA is synchronized around "
++                "measured stages; use for diagnostics only."
++            )
+ 
+         self.kv_cache_dtype = kv_cache_dtype_str_to_dtype(
+             cache_config.cache_dtype, self.model_config
+@@ -543,6 +570,7 @@
+                 | SuffixDecodingProposer
+                 | EagleProposer
+                 | DFlashProposer
++                | DSparkProposer
+                 | DraftModelProposer
+                 | MedusaProposer
+                 | ExtractHiddenStatesProposer
+@@ -584,6 +612,8 @@
+             elif self.speculative_config.use_dflash():
+                 self.drafter = DFlashProposer(self.vllm_config, self.device, self)
+                 self.use_aux_hidden_state_outputs = True
++            elif self.speculative_config.use_dspark():
++                self.drafter = DSparkProposer(self.vllm_config, self.device, self)
+             elif self.speculative_config.method == "suffix":
+                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+             elif self.speculative_config.use_eagle():
+@@ -822,8 +852,28 @@
+ 
+         # Cached outputs.
+         self._draft_token_ids: list[list[int]] | torch.Tensor | None = None
++        self._draft_token_lengths_cpu: list[int] | None = None
++        self._draft_token_length_req_ids: list[str] | None = None
+         self._draft_probs: torch.Tensor | None = None
+         self._draft_prob_req_ids: list[str] | None = None
++        self._draft_confidence: torch.Tensor | None = None
++        self._draft_confidence_req_ids: list[str] | None = None
++        self._dspark_position0_diagnostics = (
++            DSparkPosition0Diagnostics()
++            if (
++                self.speculative_config is not None
++                and self.speculative_config.use_dspark()
++                and envs.VLLM_DSPARK_POSITION0_DIAGNOSTICS
++            )
++            else None
++        )
++        self._dspark_position0_log_next = 1
++        if self._dspark_position0_diagnostics is not None:
++            logger.info(
++                "DSpark position-0 quality diagnostics enabled. This copies "
++                "one scalar agreement and optional confidence per request to "
++                "CPU on speculative decode steps."
++            )
+         # N-gram GPU path: async D2H buffer/event for per-request valid draft counts.
+         self._num_valid_draft_tokens: torch.Tensor | None = None
+         self._num_valid_draft_tokens_cpu: torch.Tensor | None = None
+@@ -3500,6 +3550,10 @@
+             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
+             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
+ 
++        self._maybe_observe_dspark_position0_quality(
++            spec_decode_metadata,
++            logits,
++        )
+         draft_probs = self._get_spec_decode_draft_probs(spec_decode_metadata)
+         sampler_output = self.rejection_sampler(
+             spec_decode_metadata,
+@@ -3509,6 +3563,93 @@
+         )
+         return sampler_output
+ 
++    def _get_dspark_position0_confidence(
++        self,
++        req_ids: list[str],
++    ) -> torch.Tensor | None:
++        if self._draft_confidence is None or self._draft_confidence_req_ids is None:
++            return None
++
++        row_by_req_id = {
++            req_id: idx for idx, req_id in enumerate(self._draft_confidence_req_ids)
++        }
++        confidence_rows: list[torch.Tensor] = []
++        for req_id in req_ids:
++            row_idx = row_by_req_id.get(req_id)
++            if row_idx is None:
++                return None
++            confidence_rows.append(self._draft_confidence[row_idx, 0])
++        if not confidence_rows:
++            return None
++        return torch.stack(confidence_rows).float()
++
++    def _maybe_observe_dspark_position0_quality(
++        self,
++        spec_decode_metadata: SpecDecodeMetadata,
++        logits: torch.Tensor | None,
++    ) -> None:
++        diagnostics = self._dspark_position0_diagnostics
++        if diagnostics is None or logits is None:
++            return
++
++        first_offsets: list[int] = []
++        active_req_ids: list[str] = []
++        offset = 0
++        for req_id, num_draft in zip(
++            self.input_batch.req_ids,
++            spec_decode_metadata.num_draft_tokens,
++        ):
++            if num_draft > 0:
++                first_offsets.append(offset)
++                active_req_ids.append(req_id)
++            offset += num_draft
++        if not first_offsets:
++            return
++
++        first_offsets_tensor = torch.tensor(
++            first_offsets,
++            dtype=torch.long,
++            device=spec_decode_metadata.draft_token_ids.device,
++        )
++        first_target_indices = spec_decode_metadata.target_logits_indices.index_select(
++            0,
++            first_offsets_tensor,
++        ).long()
++        first_draft_ids = spec_decode_metadata.draft_token_ids.index_select(
++            0,
++            first_offsets_tensor,
++        ).long()
++        target_argmax = logits.index_select(
++            0,
++            first_target_indices,
++        ).argmax(dim=-1)
++        matches = target_argmax.eq(first_draft_ids)
++        confidence = self._get_dspark_position0_confidence(active_req_ids)
++
++        confidences = (
++            None if confidence is None else confidence.detach().cpu().tolist()
++        )
++        diagnostics.observe(
++            matches.detach().cpu().tolist(),
++            confidences,
++        )
++        snapshot = diagnostics.snapshot()
++        if snapshot.num_tokens < self._dspark_position0_log_next:
++            return
++        logger.info(
++            "DSpark position-0 diagnostics: samples=%d, "
++            "target_argmax_match_rate=%.3f, avg_confidence=%s, "
++            "avg_confidence_matched=%s, avg_confidence_missed=%s, "
++            "confidence_logits_normalized=%d",
++            snapshot.num_tokens,
++            snapshot.match_rate,
++            _format_optional_float(snapshot.avg_confidence),
++            _format_optional_float(snapshot.avg_confidence_when_matched),
++            _format_optional_float(snapshot.avg_confidence_when_missed),
++            snapshot.num_confidence_logits_normalized,
++        )
++        self._dspark_position0_log_next = snapshot.num_tokens + 64
++
+     def _bookkeeping_sync(
+         self,
+         scheduler_output: "SchedulerOutput",
+@@ -3951,6 +4092,52 @@
+         num_reqs = self.input_batch.num_reqs
+         return bool(self.discard_request_mask.np[:num_reqs].all())
+ 
++    def _dspark_timing_start(self) -> float:
++        if not self._dspark_iter_timing:
++            return 0.0
++        if self.device.type == "cuda":
++            torch.cuda.synchronize()
++        return time.perf_counter()
++
++    def _dspark_timing_record(self, name: str, started: float) -> None:
++        if not self._dspark_iter_timing or started == 0.0:
++            return
++        if self.device.type == "cuda":
++            torch.cuda.synchronize()
++        self._dspark_iter_timing_totals_ms[name] += (
++            time.perf_counter() - started
++        ) * 1000.0
++
++    def _dspark_timing_finish_iteration(self) -> None:
++        if not self._dspark_iter_timing:
++            return
++        self._dspark_timing_record("iter_total", self._dspark_iter_timing_started)
++        self._dspark_iter_timing_started = 0.0
++        self._dspark_iter_timing_count += 1
++        if self._dspark_iter_timing_count % self._dspark_iter_timing_log_every != 0:
++            return
++
++        names = (
++            "execute_preprocess",
++            "target_forward",
++            "target_postprocess_logits",
++            "sample_reject",
++            "state_update",
++            "draft_propose",
++            "bookkeeping",
++            "finalize_output",
++            "iter_total",
++        )
++        parts = []
++        for name in names:
++            total_ms = self._dspark_iter_timing_totals_ms.get(name, 0.0)
++            parts.append(f"{name}={total_ms / self._dspark_iter_timing_count:.3f}ms")
++        logger.info(
++            "DSpark iteration timing avg over %d iterations: %s",
++            self._dspark_iter_timing_count,
++            ", ".join(parts),
++        )
++
+     @torch.inference_mode()
+     def execute_model(
+         self,
+@@ -3966,6 +4153,8 @@
+         if self.routed_experts_initialized:
+             self.routed_experts_capturer.clear_buffer()
+ 
++        self._dspark_iter_timing_started = self._dspark_timing_start()
++
+         # If ngram_gpu is used, we need to copy the scheduler_output to avoid
+         # the modification has influence on the scheduler_output in engine core process.
+         # The replace is much faster than deepcopy.
+@@ -3989,6 +4178,7 @@
+             get_kv_transfer_group().handle_preemptions(kv_connector_metadata)
+ 
+         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
++        stage_started = self._dspark_timing_start()
+         with (
+             record_function_or_nullcontext("gpu_model_runner: preprocess"),
+             self.synchronize_input_prep(),
+@@ -4189,6 +4379,7 @@
+             ) = self._preprocess(
+                 scheduler_output, num_tokens_padded, intermediate_tensors
+             )
++        self._dspark_timing_record("execute_preprocess", stage_started)
+ 
+         # Set cudagraph mode to none if calc_kv_scales is true.
+         # KV scales calculation involves dynamic operations that are incompatible
+@@ -4210,6 +4401,7 @@
+         # When spec decode is enabled, defer connector finalization
+         # (wait_for_save + clear metadata) until after draft model runs.
+         defer_kv_connector_finalize = self.speculative_config is not None
++        stage_started = self._dspark_timing_start()
+         with (
+             set_forward_context(
+                 attn_metadata,
+@@ -4235,7 +4427,9 @@
+                 inputs_embeds=inputs_embeds,
+                 **model_kwargs,
+             )
++        self._dspark_timing_record("target_forward", stage_started)
+ 
++        stage_started = self._dspark_timing_start()
+         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
+             if self.use_aux_hidden_state_outputs:
+                 # True when EAGLE 3 is used.
+@@ -4294,6 +4488,7 @@
+                 )
+                 assert broadcasted is not None
+                 logits = broadcasted["logits"]
++        self._dspark_timing_record("target_postprocess_logits", stage_started)
+ 
+         self.execute_model_state = ExecuteModelState(
+             scheduler_output,
+@@ -4360,9 +4555,12 @@
+                 scheduler_output, grammar_output, self.input_batch, logits
+             )
+ 
++        stage_started = self._dspark_timing_start()
+         with record_function_or_nullcontext("gpu_model_runner: sample"):
+             sampler_output = self._sample(logits, spec_decode_metadata)
++        self._dspark_timing_record("sample_reject", stage_started)
+ 
++        stage_started = self._dspark_timing_start()
+         self._update_states_after_model_execute(
+             sampler_output.sampled_token_ids, scheduler_output
+         )
+@@ -4375,16 +4573,22 @@
+                 self._pp_broadcast_prev_sampled_token_ids(
+                     sampler_output.sampled_token_ids
+                 )
++        self._dspark_timing_record("state_update", stage_started)
+ 
+         self._draft_token_ids = None
++        self._draft_token_lengths_cpu = None
++        self._draft_token_length_req_ids = None
+         self._draft_probs = None
+         self._draft_prob_req_ids = None
++        self._draft_confidence = None
++        self._draft_confidence_req_ids = None
+         self._draft_token_req_ids = None
+         self.valid_sampled_token_count_gpu = None
+         self.input_batch.prev_sampled_token_ids = None
+ 
+         def propose_draft_token_ids(sampled_token_ids):
+             assert spec_decode_common_attn_metadata is not None
++            stage_started = self._dspark_timing_start()
+             with record_function_or_nullcontext("gpu_model_runner: draft"):
+                 self._draft_token_ids = self.propose_draft_token_ids(
+                     scheduler_output,
+@@ -4398,6 +4602,7 @@
+                     slot_mappings,
+                 )
+                 self._copy_draft_token_ids_to_cpu(scheduler_output)
++            self._dspark_timing_record("draft_propose", stage_started)
+ 
+         spec_config = self.speculative_config
+         propose_drafts_after_bookkeeping = False
+@@ -4411,6 +4616,7 @@
+                 spec_config.use_eagle()
+                 or spec_config.uses_draft_model()
+                 or spec_config.uses_extract_hidden_states()
++                or spec_config.use_dspark()
+             ) and not spec_config.disable_padded_drafter_batch
+             if use_gpu_toks:
+                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
+@@ -4419,6 +4625,7 @@
+                     self.drafter,
+                     EagleProposer
+                     | DFlashProposer
++                    | DSparkProposer
+                     | DraftModelProposer
+                     | ExtractHiddenStatesProposer
+                     | Gemma4Proposer,
+@@ -4475,8 +4682,11 @@
+                 ).expand(len(self.input_batch.req_ids), self.num_spec_tokens)
+                 self._draft_probs = None
+                 self._draft_prob_req_ids = None
++                self._draft_confidence = None
++                self._draft_confidence_req_ids = None
+                 self._copy_draft_token_ids_to_cpu(scheduler_output, zeros_only=True)
+ 
++        stage_started = self._dspark_timing_start()
+         with record_function_or_nullcontext("gpu_model_runner: bookkeep"):
+             (
+                 num_nans_in_logits,
+@@ -4493,12 +4703,14 @@
+                 hidden_states,
+                 scheduler_output.total_num_scheduled_tokens,
+             )
++        self._dspark_timing_record("bookkeeping", stage_started)
+ 
+         if propose_drafts_after_bookkeeping:
+             # ngram and other speculative decoding methods use the sampled
+             # tokens on the CPU, so they are run after bookkeeping.
+             propose_draft_token_ids(valid_sampled_token_ids)
+ 
++        stage_started = self._dspark_timing_start()
+         # Finalize KV connector (wait_for_save + clear metadata) after
+         # draft model runs. Deferred from target model forward to allow
+         # draft model to also save its KV cache.
+@@ -4511,6 +4723,20 @@
+         # self.kv_connector_output may be modified during drafting
+         kv_connector_output = self.kv_connector_output
+         self.kv_connector_output = None
++        draft_token_lengths = None
++        if (
++            self.use_async_scheduling
++            and self._draft_token_lengths_cpu is not None
++            and self._draft_token_length_req_ids is not None
++        ):
++            draft_token_lengths = {
++                req_id: int(length)
++                for req_id, length in zip(
++                    self._draft_token_length_req_ids,
++                    self._draft_token_lengths_cpu,
++                    strict=True,
++                )
++            }
+ 
+         with record_function_or_nullcontext("gpu_model_runner: ModelRunnerOutput"):
+             output = ModelRunnerOutput(
+@@ -4526,7 +4752,9 @@
+                 num_nans_in_logits=num_nans_in_logits,
+                 cudagraph_stats=cudagraph_stats,
+                 routed_experts=None,
++                draft_token_lengths=draft_token_lengths,
+             )
++        self._dspark_timing_record("finalize_output", stage_started)
+ 
+         if not self.use_async_scheduling:
+             if self.routed_experts_initialized:
+@@ -4538,6 +4766,7 @@
+                     routing_data=self.routed_experts_cpu[:total].numpy(),
+                     slot_mapping=self.routed_experts_slot_mapping_cpu[:total].numpy(),
+                 )
++            self._dspark_timing_finish_iteration()
+             return output
+ 
+         with record_function_or_nullcontext(
+@@ -4585,6 +4814,7 @@
+                 async_output.async_copy_ready_event,
+             )
+ 
++        self._dspark_timing_finish_iteration()
+         return async_output
+ 
+     def _pp_broadcast_prev_sampled_token_ids(
+@@ -4682,7 +4912,17 @@
+         assert self.draft_token_ids_event is not None
+         assert self.draft_token_ids_cpu is not None
+         self.draft_token_ids_event.synchronize()
+-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
++        draft_token_ids = self.draft_token_ids_cpu[: len(req_ids)].tolist()
++        if self._draft_token_lengths_cpu is not None:
++            draft_token_ids = [
++                row[: max(0, min(len(row), int(length)))]
++                for row, length in zip(
++                    draft_token_ids,
++                    self._draft_token_lengths_cpu,
++                    strict=True,
++                )
++            ]
++        return draft_token_ids, req_ids
+ 
+     def _copy_valid_sampled_token_count(
+         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor
+@@ -4764,6 +5004,8 @@
+         assert spec_config is not None
+         self._draft_probs = None
+         self._draft_prob_req_ids = None
++        self._draft_confidence = None
++        self._draft_confidence_req_ids = None
+         if spec_config.method == "ngram":
+             from vllm.v1.spec_decode.ngram_proposer import NgramProposer
+ 
+@@ -4885,11 +5127,16 @@
+         elif (
+             spec_config.use_eagle()
+             or spec_config.use_dflash()
++            or spec_config.use_dspark()
+             or spec_config.uses_draft_model()
+         ):
+             assert isinstance(
+                 self.drafter,
+-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
++                EagleProposer
++                | DFlashProposer
++                | DSparkProposer
++                | DraftModelProposer
++                | Gemma4Proposer,
+             )
+ 
+             if spec_config.disable_padded_drafter_batch:
+@@ -4931,9 +5178,12 @@
+             # (e.g. DeepSeek V4 MTP needs the pre-hc_head residual). Safe to
+             # rebind here: hidden_states was already consumed for sampling
+             # above and is not used again in this branch.
+-            alt = getattr(
+-                self.get_model(), "get_mtp_target_hidden_states", lambda: None
+-            )()
++            target_hidden_getter_name = (
++                "get_dspark_target_hidden_states"
++                if spec_config.use_dspark()
++                else "get_mtp_target_hidden_states"
++            )
++            alt = getattr(self.get_model(), target_hidden_getter_name, lambda: None)()
+             if alt is not None:
+                 hidden_states = alt
+ 
+@@ -4997,6 +5247,15 @@
+             else:
+                 mm_embed_inputs = None
+ 
++            # DSpark keys its persistent draft KV by a stable per-request slot,
++            # so it needs the request ids in the same order used to build
++            # next_token_ids (the running input_batch order). Other proposers
++            # do not accept this argument.
++            dspark_propose_kwargs = (
++                {"req_ids": self.input_batch.req_ids}
++                if spec_config.use_dspark()
++                else {}
++            )
+             draft_token_ids = self.drafter.propose(
+                 target_token_ids=target_token_ids,
+                 target_positions=target_positions,
+@@ -5008,12 +5267,29 @@
+                 mm_embed_inputs=mm_embed_inputs,
+                 num_rejected_tokens_gpu=num_rejected_tokens_gpu,
+                 slot_mappings=slot_mappings,
++                **dspark_propose_kwargs,
+             )
+             if hasattr(self.drafter, "take_last_draft_probs"):
+                 draft_probs = self.drafter.take_last_draft_probs()
+                 if draft_probs is not None:
+                     self._draft_probs = draft_probs
+                     self._draft_prob_req_ids = self.input_batch.req_ids.copy()
++            if hasattr(self.drafter, "take_last_confidence"):
++                confidence = self.drafter.take_last_confidence()
++                if confidence is not None:
++                    self._draft_confidence = confidence
++                    self._draft_confidence_req_ids = (
++                        self.input_batch.req_ids.copy()
++                    )
++            if spec_config.use_dspark() and hasattr(
++                self.drafter, "take_last_draft_lengths"
++            ):
++                self._draft_token_lengths_cpu = self.drafter.take_last_draft_lengths()
++                self._draft_token_length_req_ids = (
++                    self.input_batch.req_ids.copy()
++                    if self._draft_token_lengths_cpu is not None
++                    else None
++                )
+ 
+         return draft_token_ids
+ 
+@@ -5849,11 +6125,13 @@
+                 self.speculative_config.use_eagle()
+                 or self.speculative_config.uses_draft_model()
+                 or self.speculative_config.uses_extract_hidden_states()
++                or self.speculative_config.use_dspark()
+             ):
+                 assert isinstance(
+                     self.drafter,
+                     EagleProposer
+                     | DFlashProposer
++                    | DSparkProposer
+                     | DraftModelProposer
+                     | ExtractHiddenStatesProposer
+                     | Gemma4Proposer,
+@@ -6690,10 +6968,15 @@
+         if self.speculative_config and (
+             self.speculative_config.use_eagle()
+             or self.speculative_config.uses_draft_model()
++            or self.speculative_config.use_dspark()
+         ):
+             assert isinstance(
+                 self.drafter,
+-                EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,
++                EagleProposer
++                | DFlashProposer
++                | DSparkProposer
++                | DraftModelProposer
++                | Gemma4Proposer,
+             )
+             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
+ 
+@@ -6743,11 +7026,13 @@
+         if self.speculative_config and (
+             self.speculative_config.use_eagle()
+             or self.speculative_config.uses_extract_hidden_states()
++            or self.speculative_config.use_dspark()
+         ):
+             assert isinstance(
+                 self.drafter,
+                 EagleProposer
+                 | DFlashProposer
++                | DSparkProposer
+                 | ExtractHiddenStatesProposer
+                 | Gemma4Proposer,
+             )

@@ -32,6 +32,60 @@ pub fn terminate(pid: u32) -> Result<bool> {
     Ok(true)
 }
 
+/// Zatrzymuje CALA GRUPE procesow silnika, nie tylko jego lidera.
+///
+/// `terminate` pilnuje wylacznie PID-a rodzica: gdy ten zginie po SIGTERM w
+/// 100 ms, funkcja wraca `Ok` i NIKT juz nie eskaluje do potomkow. Dla vLLM to
+/// za malo — `EngineCore`/`WorkerProc` schodza wlasnym cyklem SIGTERM→grace→
+/// SIGKILL trwajacym kilka sekund (w produkcyjnym logu 12:52:42 → 12:52:46), a
+/// gdy zawisna na NCCL, nie schodza wcale. Zostawaly wtedy OSIEROCONE, trzymajac
+/// VRAM: kolejny deploy widzial mniej wolnej pamieci i padal na
+/// „Free memory ... less than desired", zostawiajac kolejne sieroty. Petla
+/// sama sie napedzala.
+///
+/// Tu po zabiciu lidera sprawdzamy `kill(-pgid, 0)` — dopoki zwraca 0, ktos z
+/// grupy zyje — i po `GROUP_GRACE` wysylamy grupowy SIGKILL. `setsid()` przed
+/// exec (patrz `python_venv`) czyni proces liderem grupy, wiec `pgid == pid`.
+#[cfg(unix)]
+pub fn terminate_group(pid: u32) -> Result<bool> {
+    const GROUP_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
+    let killed = terminate(pid)?;
+    let deadline = std::time::Instant::now() + GROUP_GRACE;
+    while group_alive(pid) {
+        if std::time::Instant::now() >= deadline {
+            unsafe {
+                libc::kill(-(pid as libc::pid_t), libc::SIGKILL);
+            }
+            // Krotkie dobicie: po SIGKILL jadro sprząta natychmiast, ale dajemy
+            // szanse na reap, zeby caller nie kasowal venva spod zywych deskryptorow.
+            std::thread::sleep(std::time::Duration::from_millis(200));
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    Ok(killed)
+}
+
+#[cfg(not(unix))]
+pub fn terminate_group(pid: u32) -> Result<bool> {
+    // Windows: `TerminateProcess` w `terminate` nie ma odpowiednika grupy
+    // procesow POSIX; job objects byłyby osobnym mechanizmem.
+    terminate(pid)
+}
+
+/// Czy w grupie procesow `pgid` zyje jeszcze ktokolwiek. `ESRCH` = pusta grupa.
+#[cfg(unix)]
+fn group_alive(pgid: u32) -> bool {
+    unsafe {
+        if libc::kill(-(pgid as libc::pid_t), 0) == 0 {
+            return true;
+        }
+    }
+    // EPERM tez znaczy „ktos tam jest", tylko nie nasz.
+    last_errno() == libc::EPERM
+}
+
 /// Sprawdza czy PID wciaz istnieje w systemie (bez zabijania).
 pub fn is_alive(pid: u32) -> bool {
     is_alive_impl(pid)

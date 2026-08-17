@@ -1,0 +1,12 @@
+# ===== File: Cargo.toml — forge-state: paged KV cache and the radix prefix tree =====
+[package]
+name = "forge-state"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+forge-hal.workspace = true
+
+[dev-dependencies]

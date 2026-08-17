@@ -3,6 +3,7 @@
 # =============================================================================
 target/
 target_shared/
+target-amd/
 target-addon-wasm/
 target-service-context-test/*
 
@@ -10,6 +11,7 @@ target-service-context-test/*
 # Wczesniej trzymane w target/debug/ — `cargo clean` je wywalal. Teraz
 # osobny katalog `.runtime/` poza target/.
 /.runtime/
+/.runtime-B/
 obj/
 bin/
 *.o
@@ -90,6 +92,9 @@ config.toml
 # settings (jobs, profile defaults, linker, sccache) zadzialaly dla
 # wszystkich. Nadpisuje regule `config.toml` powyzej.
 !.cargo/config.toml
+# To samo dla workspace tentaflow-infer: alias `cargo xtask` jest czescia
+# kontraktu bramek jakosci i musi byc dostepny dla kazdego i w CI.
+!tentaflow-infer/.cargo/config.toml
 .env
 .env.*
 !.env.example
@@ -237,3 +242,23 @@ thirparty/
 
 # Benchmark/experiment scratch
 /scratch/
+target_concurrency/
+target_prefill_finish/
+target_fixedk3/
+target_clippy_fixed/
+
+# Katalogi robocze buildu kerneli (publikacja podmienia je atomowo; gdy build
+# zostanie przerwany, zostaja na dysku i nie moga trafic do repo).
+tentaflow-infer/kernels/mojo/build/.kernel-build-*/
+
+# Scratch Playwright (skrypty QA, zrzuty ekranu, profile przegladarki) — nigdy do repo.
+# Trafialy tu tez klucze API wklejane do testow, wiec ta reguła jest zabezpieczeniem, nie porzadkami.
+.pw-tmp/
+
+# =============================================================================
+# Fikstury testowe
+# =============================================================================
+# SA zrodlem, nie artefaktem builda: testy golden wciagaja je przez
+# include_bytes!, wiec bez nich nie kompiluja sie u nikogo innego. Wpis MUSI
+# stac po regulach *.bin i *.safetensors, bo w .gitignore wygrywa pozniejszy.
+!tentaflow-infer/crates/*/tests/fixtures/**

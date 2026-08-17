@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 use std::sync::OnceLock;
 
-use forge_types::{ForgeError, Result};
+use forge_types::{ForgeError, QuantKind, Result};
 use serde::Deserialize;
 
 use crate::gguf::Gguf;
@@ -53,6 +53,8 @@ pub enum WeightRole {
     AttnO,
     AttnQNorm,
     AttnKNorm,
+    /// Muse Glimmer's separate sigmoid gate over the attention output.
+    AttnGate,
     AttnNorm,
     FfnGate,
     FfnUp,
@@ -60,6 +62,15 @@ pub enum WeightRole {
     FfnNorm,
     OutputNorm,
     LmHead,
+    /// Dzielniki częstotliwości rope (`rope_freqs`) używane przez warstwy
+    /// globalne Gemmy 4 — rope proporcjonalne. Tensor f32 o długości head_dim/2.
+    RopeFreqs,
+    /// Norma PO bloku uwagi, przed rezydualem (rodzina Gemma — „sandwich norm”).
+    PostAttnNorm,
+    /// Norma PO bloku FFN, przed rezydualem (rodzina Gemma).
+    PostFfwNorm,
+    /// Skalar mnożący wyjście warstwy (`layer_output_scale`, Gemma 4).
+    LayerOutputScale,
     /// MoE router (`ffn_gate_inp`): logits over experts, [n_expert, hidden].
     FfnGateInp,
     /// MoE stacked expert projections ([n_expert, inter, hidden] resp.
@@ -95,6 +106,170 @@ pub enum WeightRole {
     SsmNorm,
     /// DeltaNet output projection (`ssm_out`, [value_dim, hidden]).
     SsmOut,
+
+    // --- DeepSeek V4: uwaga latentna z projekcjami LoRA ---
+    /// Zejście LoRA dla Q: [hidden, q_lora_rank].
+    AttnQA,
+    /// Wyjście LoRA dla Q: [q_lora_rank, n_heads*head_dim].
+    AttnQB,
+    /// Wspólna projekcja KV jednej głowicy: [hidden, head_dim].
+    AttnKV,
+    /// Norma RMS na skompresowanym KV.
+    AttnKvNorm,
+    /// Zejście LoRA wyjścia uwagi, grupowane: [n_heads*head_dim/o_groups,
+    /// o_groups*o_lora_rank].
+    AttnOA,
+    /// Wyjście LoRA uwagi: [o_groups*o_lora_rank, hidden].
+    AttnOB,
+    /// Logit „kotwicy" uwagi, jeden na głowicę (attention sink).
+    AttnSink,
+
+    // --- DeepSeek V4: kompresor strumienia KV ---
+    /// Kodowanie pozycji wewnątrz okna kompresji.
+    CompressorApe,
+    CompressorNorm,
+    /// Projekcja bramki wyznaczającej wagi poolingu.
+    CompressorWGate,
+    /// Projekcja kompresowanego KV.
+    CompressorWkv,
+
+    // --- DeepSeek V4: indekser rzadkiej uwagi (własny kompresor) ---
+    IndexerCompressorApe,
+    IndexerCompressorNorm,
+    IndexerCompressorWGate,
+    IndexerCompressorWkv,
+    /// Waga na głowicę przy sumowaniu wyników indeksera.
+    IndexerWeightsProj,
+    /// Wyjście LoRA dla zapytań indeksera.
+    IndexerWqB,
+
+    // --- DeepSeek V4: routing ---
+    /// Bias dodawany do logitów routera przed wyborem top-k.
+    FfnGateBias,
+    /// Tablica token -> ekspert dla warstw z routingiem haszowanym.
+    FfnGateTid2Eid,
+
+    // --- DeepSeek V4: modulacja warunkowana haszem ---
+    HcAttnBase,
+    HcAttnFn,
+    HcAttnScale,
+    HcFfnBase,
+    HcFfnFn,
+    HcFfnScale,
+    HcHeadBase,
+    HcHeadFn,
+    HcHeadScale,
+}
+
+impl Hyperparams {
+    /// `head_dim` warstwy `layer`. Architektury z naprzemienną geometrią
+    /// (Gemma 4) mają inny wymiar głowicy w warstwach z oknem niż w globalnych;
+    /// pola skalarne opisują warstwy globalne, więc to jedyny poprawny sposób
+    /// pytania o wymiar konkretnej warstwy.
+    pub fn head_dim_at(&self, layer: usize) -> usize {
+        match &self.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.head_dim_swa,
+            _ => self.head_dim,
+        }
+    }
+
+    /// Liczba głowic KV warstwy `layer` — jak wyżej.
+    pub fn n_kv_heads_at(&self, layer: usize) -> usize {
+        match &self.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.n_kv_heads_swa,
+            _ => self.n_kv_heads,
+        }
+    }
+
+    /// Skala logitów uwagi dla warstwy `layer`.
+    pub fn attn_scale_at(&self, layer: usize) -> f32 {
+        match self.attn_logit_scale {
+            Some(scale) => scale,
+            None => 1.0 / (self.head_dim_at(layer) as f32).sqrt(),
+        }
+    }
+
+    /// Największy `head_dim` w modelu — do wymiarowania buforów aktywacji,
+    /// które muszą pomieścić każdą warstwę.
+    pub fn max_head_dim(&self) -> usize {
+        match &self.alt_attn {
+            Some(alt) => self.head_dim.max(alt.head_dim_swa),
+            None => self.head_dim,
+        }
+    }
+
+    /// Największa szerokość projekcji Q w modelu.
+    pub fn max_q_dim(&self) -> usize {
+        self.n_heads * self.max_head_dim()
+    }
+
+    /// Największa szerokość projekcji K (lub V) w modelu. Liczona per warstwa,
+    /// bo największa liczba głowic i największy `head_dim` mogą być w RÓŻNYCH
+    /// warstwach — iloczyn maksimów zawyżyłby bufor.
+    pub fn max_kv_dim(&self) -> usize {
+        let global = self.n_kv_heads * self.head_dim;
+        match &self.alt_attn {
+            Some(alt) => global.max(alt.n_kv_heads_swa * alt.head_dim_swa),
+            None => global,
+        }
+    }
+
+    /// Geometria, na którą rozmiarowany jest cache KV: musi pomieścić
+    /// NAJSZERSZĄ warstwę modelu. Przy naprzemiennej uwadze (Gemma 4) warstwy
+    /// różnią się liczbą głowic KV i szerokością głowicy, a każda adresuje swój
+    /// slab własnymi wymiarami — mieści się wtedy w tym zakresie. Dla modeli
+    /// jednorodnych zwraca dokładnie `n_kv_heads` i `head_dim`.
+    pub fn kv_cache_head_dim(&self) -> usize {
+        self.max_head_dim()
+    }
+
+    pub fn kv_cache_heads(&self) -> usize {
+        self.max_kv_dim().div_ceil(self.max_head_dim())
+    }
+
+    /// Podstawa rope warstwy `layer`. Gemma 4 ma dwie: 1e4 dla warstw okiennych
+    /// i 1e6 dla globalnych.
+    pub fn rope_theta_at(&self, layer: usize) -> f32 {
+        if self.rope_sliding_only && self.alt_attn.is_none() {
+            return if layer % 4 == 3 { 0.0 } else { self.rope_theta };
+        }
+        if self.rope_sliding_only
+            && !self
+                .alt_attn
+                .as_ref()
+                .and_then(|alt| alt.sliding.get(layer))
+                .copied()
+                .unwrap_or(true)
+        {
+            return 0.0;
+        }
+        match &self.alt_attn {
+            Some(alt) if alt.sliding.get(layer).copied().unwrap_or(false) => alt.rope_theta_swa,
+            _ => self.rope_theta,
+        }
+    }
+
+    /// Czy warstwa `layer` używa rope proporcjonalnego (tensor `rope_freqs`).
+    /// Dotyczy wyłącznie warstw globalnych architektur z naprzemienną uwagą.
+    pub fn rope_proportional_at(&self, layer: usize) -> bool {
+        match &self.alt_attn {
+            Some(alt) => !alt.sliding.get(layer).copied().unwrap_or(false),
+            None => false,
+        }
+    }
+
+    pub fn uses_rope_at(&self, layer: usize) -> bool {
+        if self.rope_sliding_only && self.alt_attn.is_none() {
+            return layer % 4 != 3;
+        }
+        !self.rope_sliding_only
+            || self
+                .alt_attn
+                .as_ref()
+                .and_then(|alt| alt.sliding.get(layer))
+                .copied()
+                .unwrap_or(true)
+    }
 }
 
 /// Per-layer computation kind in a hybrid (attention + linear-attention) stack.
@@ -155,10 +330,17 @@ impl SsmParams {
 pub struct RoleSpec {
     pub role: WeightRole,
     /// GGUF tensor-name template; `{layer}` expands to the layer index.
-    pub gguf: String,
+    /// `None` dla ról, które istnieją wyłącznie w checkpointach HF.
+    #[serde(default)]
+    pub gguf: Option<String>,
     /// HF safetensors tensor-name template.
     pub hf: String,
     pub per_layer: bool,
+    /// Rola rozwijana na każdego eksperta: nazwa zachowuje `{expert}`, a
+    /// konkretny indeks podstawia loader. Bez tego 43 warstwy po 256 ekspertów
+    /// oznaczałyby 132 tysiące nazw w opisie modelu.
+    #[serde(default)]
+    pub per_expert: bool,
     /// Required roles must resolve to existing tensors on GGUF detect;
     /// optional ones (lm_head with tied embeddings, arch-specific norms) may
     /// be absent.
@@ -184,6 +366,9 @@ const ARCH_SOURCES: &[&str] = &[
     include_str!("../arch/qwen3moe.ron"),
     include_str!("../arch/qwen35moe.ron"),
     include_str!("../arch/qwen35.ron"),
+    include_str!("../arch/gemma4.ron"),
+    include_str!("../arch/deepseek_v4.ron"),
+    include_str!("../arch/muse_glimmer.ron"),
 ];
 
 /// Embedded specs are compile-time assets of this crate, so a parse failure
@@ -193,9 +378,121 @@ pub fn registry() -> &'static [ArchSpec] {
     REGISTRY.get_or_init(|| {
         ARCH_SOURCES
             .iter()
-            .map(|src| ron::from_str(src).expect("embedded arch spec must parse"))
+            .map(|src| {
+                // IMPLICIT_SOME pozwala pisać `gguf: "nazwa"` zamiast
+                // `gguf: Some("nazwa")` w każdej z kilkudziesięciu ról.
+                ron::Options::default()
+                    .with_default_extension(ron::extensions::Extensions::IMPLICIT_SOME)
+                    .from_str(src)
+                    .expect("embedded arch spec must parse")
+            })
             .collect()
     })
+}
+
+/// Nieliniowość bramki FFN. SwiGLU (`silu`) jest domyślne; rodzina Gemma używa
+/// GeGLU z przybliżeniem tanh, a różnica jest widoczna w logitach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FfnActivation {
+    #[default]
+    SiLU,
+    GeLUTanh,
+}
+
+/// Naprzemienna geometria uwagi: część warstw ma okno przesuwne i WŁASNY
+/// `head_dim` oraz liczbę głowic KV, część jest globalna. Gemma 4 powtarza
+/// wzorzec [lokalna x5, globalna x1], przy czym warstwy lokalne mają
+/// head_dim 256 i 8 głowic KV, a globalne head_dim 512 i jedną głowicę.
+///
+/// Wartości spoza wzorca (`head_dim`, `n_kv_heads` w `Hyperparams`) opisują
+/// warstwy GLOBALNE, żeby modele bez tego pola czytały się bez zmian.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AltAttnParams {
+    /// `true` = warstwa z oknem przesuwnym; długość równa liczbie warstw.
+    pub sliding: Vec<bool>,
+    /// Rozmiar okna w tokenach.
+    pub window: usize,
+    pub head_dim_swa: usize,
+    pub n_kv_heads_swa: usize,
+    pub rope_theta_swa: f32,
+}
+
+/// Czyta naprzemienną geometrię uwagi z metadanych GGUF; `None`, gdy model jej
+/// nie deklaruje (wtedy wszystkie warstwy mają jedną geometrię).
+///
+/// Wzorce w GGUF są KRÓTKIE i powtarzalne: Gemma 4 ma 48 warstw, ale
+/// `sliding_window_pattern` liczy 6 pozycji, a `head_count_kv` też 6 — trzeba je
+/// rozwinąć modulo długość, inaczej wychodzi zła geometria od siódmej warstwy.
+fn parse_alt_attn(gguf: &Gguf, arch: &str, block_count: usize) -> Option<AltAttnParams> {
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    let flags: Vec<bool> = match gguf.get_array(&key("attention.sliding_window_pattern")) {
+        Some(pattern) if !pattern.is_empty() => {
+            let flags: Vec<bool> = pattern.iter().filter_map(|v| v.as_bool()).collect();
+            if flags.len() != pattern.len() {
+                return None;
+            }
+            flags
+        }
+        _ if arch == "muse-glimmer" => {
+            let period = gguf
+                .get_u64(&key("attention.sliding_window_pattern"))
+                .unwrap_or(4) as usize;
+            muse_swa_pattern(period)?
+        }
+        _ => return None,
+    };
+    let sliding: Vec<bool> = (0..block_count)
+        .map(|layer| flags[layer % flags.len()])
+        .collect();
+    let window = gguf.get_u64(&key("attention.sliding_window"))? as usize;
+    let head_dim_swa = gguf
+        .get_u64(&key("attention.key_length_swa"))
+        .or_else(|| gguf.get_u64(&key("attention.key_length")))? as usize;
+    // Liczba głowic KV jest tablicą o tej samej długości co wzorzec: pozycje
+    // lokalne i globalne mają różne wartości (u Gemmy 8 wobec 1).
+    let kv: Vec<usize> = match gguf.get_array(&key("attention.head_count_kv")) {
+        Some(kv) => kv
+            .iter()
+            .filter_map(|v| v.as_u64())
+            .map(|v| v as usize)
+            .collect(),
+        None => vec![gguf.get_u64(&key("attention.head_count_kv"))? as usize; flags.len()],
+    };
+    if kv.len() != flags.len() {
+        return None;
+    }
+    let n_kv_heads_swa = flags
+        .iter()
+        .zip(&kv)
+        .find(|(local, _)| **local)
+        .map(|(_, heads)| *heads)?;
+    let rope_theta_swa = gguf
+        .get_f32(&key("rope.freq_base_swa"))
+        .unwrap_or_else(|| gguf.get_f32(&key("rope.freq_base")).unwrap_or(10000.0));
+    Some(AltAttnParams {
+        sliding,
+        window,
+        head_dim_swa,
+        n_kv_heads_swa,
+        rope_theta_swa,
+    })
+}
+
+fn muse_swa_pattern(period: usize) -> Option<Vec<bool>> {
+    (period != 0).then(|| (0..period).map(|layer| layer + 1 < period).collect())
+}
+
+fn parse_post_norm_eps(gguf: &Gguf, arch: &str, rms_norm_eps: f32) -> f32 {
+    let key = |suffix: &str| format!("{arch}.{suffix}");
+    gguf.get_f32(&key("post_norm_eps"))
+        .or_else(|| gguf.get_f32(&key("post_norm_rms_epsilon")))
+        .unwrap_or_else(|| {
+            if arch == "muse-glimmer" {
+                1e-5
+            } else {
+                rms_norm_eps
+            }
+        })
 }
 
 /// Mixture-of-Experts routing parameters (present only for MoE architectures).
@@ -214,6 +511,53 @@ pub struct MoeParams {
     pub shared_intermediate_size: usize,
 }
 
+/// Parametry swoiste dla DeepSeeka V4: uwaga latentna z projekcjami LoRA,
+/// dwustrumieniowy KV z kompresorem, indekser rzadkiej uwagi i modulacja
+/// warunkowana haszem. Wszystkie są bez odpowiednika w pozostałych
+/// architekturach, więc siedzą w osobnym bloku zamiast rozlewać się po
+/// `Hyperparams`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeepseekV4Params {
+    /// Ranga zejścia LoRA dla Q.
+    pub q_lora_rank: usize,
+    /// Ranga LoRA wyjścia uwagi (na grupę).
+    pub o_lora_rank: usize,
+    /// Na ile grup dzielone jest wyjście uwagi przed projekcją.
+    pub o_groups: usize,
+    /// Ile wymiarów głowicy obejmuje rope; reszta zostaje bez pozycji.
+    pub rope_head_dim: usize,
+    /// Szerokość okna przesuwnego uwagi.
+    pub window_size: usize,
+    /// Stopień kompresji KV per warstwa; 0 = warstwa bez kompresora.
+    pub compress_ratios: Vec<usize>,
+    /// Baza rope skompresowanego strumienia KV.
+    pub compress_rope_theta: f32,
+    pub index_n_heads: usize,
+    pub index_head_dim: usize,
+    pub index_topk: usize,
+    /// Ile warstw routuje przez tablicę token->ekspert zamiast wyuczonej bramki.
+    pub n_hash_layers: usize,
+    /// Funkcja punktująca bramki routera (`sqrtsoftplus` w tym checkpoincie).
+    pub scoring_func: String,
+    /// Mnożnik wag routingu po wyborze top-k.
+    pub routed_scaling_factor: f32,
+    /// Górne ograniczenie bramki SwiGLU (0 = brak).
+    pub swiglu_limit: f32,
+}
+
+impl DeepseekV4Params {
+    /// Czy warstwa ma kompresor strumienia KV.
+    pub fn has_compressor(&self, layer: usize) -> bool {
+        self.compress_ratios.get(layer).is_some_and(|r| *r != 0)
+    }
+
+    /// Indekser istnieje tylko przy najgęstszej kompresji (ratio 4); warstwy o
+    /// ratio 128 czytają skompresowany strumień w całości.
+    pub fn has_indexer(&self, layer: usize) -> bool {
+        self.compress_ratios.get(layer) == Some(&4)
+    }
+}
+
 /// Unified model hyperparameters sourced from GGUF metadata or HF config.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Hyperparams {
@@ -226,6 +570,7 @@ pub struct Hyperparams {
     pub vocab_size: usize,
     pub rope_theta: f32,
     pub rms_norm_eps: f32,
+    pub post_norm_eps: f32,
     pub max_position_embeddings: usize,
     pub tie_word_embeddings: bool,
     /// Sequence pooling declared by the model (embedding models only); `None`
@@ -238,6 +583,14 @@ pub struct Hyperparams {
     /// per token rather than per-head over `head_dim`. OLMoE normalizes the full
     /// query/key vector; Qwen3 normalizes each head. `false` when no QK-norm.
     pub qk_norm_over_hidden: bool,
+    /// Tokeny, których logity model MUSI maskować do -inf. Checkpointy Gemmy 4
+    /// przypisują wysokie logity tokenom `<image|>`/`<audio|>`, więc bez maski
+    /// greedy wybiera je i generacja się rozjeżdża (referencja llama.cpp wstawia
+    /// tę maskę jako wejście grafu).
+    pub suppress_tokens: Vec<u32>,
+    /// V przechodzi CZYSTĄ normalizację RMS (bez wagi) przed zapisem do cache —
+    /// rodzina Gemma. Realizowane wektorem jedynek, żeby nie mnożyć kerneli.
+    pub v_rms_norm: bool,
     /// Gated-DeltaNet / SSM parameters for hybrid architectures (`qwen35moe`);
     /// `None` for pure-attention models.
     pub ssm: Option<SsmParams>,
@@ -253,6 +606,26 @@ pub struct Hyperparams {
     /// (qwen35moe): `wq` has width `head_dim * n_heads * 2` and the second half
     /// gates the attention output. `false` for ungated attention.
     pub attn_gated: bool,
+    /// Nieliniowość bramki FFN (SwiGLU domyślnie, GeGLU w rodzinie Gemma).
+    pub ffn_activation: FfnActivation,
+    /// Naprzemienna geometria uwagi (okno przesuwne + własny head_dim/KV);
+    /// `None`, gdy wszystkie warstwy mają tę samą geometrię.
+    pub alt_attn: Option<AltAttnParams>,
+    /// Muse Glimmer applies RoPE only on sliding-attention layers.
+    pub rope_sliding_only: bool,
+    /// Ograniczenie logitów `softcap * tanh(x / softcap)` przed samplingiem
+    /// (Gemma). 0 = wyłączone.
+    pub final_logit_softcap: f32,
+    pub logit_scale: f32,
+    /// Jawna skala logitów uwagi. `None` = domyślne `1/sqrt(head_dim)`.
+    /// Gemma 4 używa 1,0 (w referencji `f_attention_scale = 1.0f`), więc bez
+    /// tego pola model liczyłby uwagę na skali mniejszej ~22x.
+    pub attn_logit_scale: Option<f32>,
+    /// `Some` tylko dla DeepSeeka V4.
+    pub deepseek_v4: Option<DeepseekV4Params>,
+    /// Mnożnik embeddingu wejściowego. `None` = brak. Rodzina Gemma mnoży przez
+    /// `sqrt(hidden_size)` (tylko dla wejścia tokenowego).
+    pub embd_scale: Option<f32>,
 }
 
 /// Rola tensora należącego do jednej warstwy NextN.
@@ -405,7 +778,13 @@ fn build_dense_mtp(
                         spec.name
                     ))
                 })?;
-            required_mtp_tensor(gguf, &mut weights, mtp_role, expand(&template.gguf, block))?;
+            let gguf_template = template.gguf.as_deref().ok_or_else(|| {
+                fmt_err(format!(
+                    "{} spec role {weight_role:?} has no GGUF name",
+                    spec.name
+                ))
+            })?;
+            required_mtp_tensor(gguf, &mut weights, mtp_role, expand(gguf_template, block))?;
         }
         for (role, suffix) in [
             (MtpWeightRole::EhProj, "eh_proj.weight"),
@@ -510,7 +889,54 @@ fn build_moe_mtp(
     }))
 }
 
+/// Sprawdza, czy zakres etapu pipeline'u mieści się w modelu. Wydzielone z
+/// `restrict_layers`, żeby dało się to przetestować bez budowania całego
+/// deskryptora — sama arytmetyka granic jest tu jedyną rzeczą, która może się
+/// pomylić.
+pub fn check_pipeline_range(total: usize, first: usize, count: usize) -> Result<()> {
+    if count == 0 {
+        return Err(fmt_err("etap pipeline'u bez warstw"));
+    }
+    if first + count > total {
+        return Err(fmt_err(format!(
+            "zakres warstw {first}..{} wychodzi poza model o {total} warstwach",
+            first + count
+        )));
+    }
+    Ok(())
+}
+
 impl ModelDescriptor {
+    /// Ogranicza model do zakresu warstw `[first, first + count)`.
+    ///
+    /// Podstawa pipeline parallel: każdy etap ładuje WYŁĄCZNIE swoje warstwy,
+    /// więc model większy od jednej karty mieści się na kilku. Etap, który nie
+    /// zawiera warstwy zerowej, nie potrzebuje embeddingu, a etap bez ostatniej
+    /// — normy końcowej i głowy; o tym decyduje już wołający, bo tylko on wie,
+    /// czy jest pierwszy albo ostatni.
+    pub fn restrict_layers(&mut self, first: usize, count: usize) -> Result<()> {
+        check_pipeline_range(self.layers.len(), first, count)?;
+        self.layers = self.layers.drain(first..first + count).collect();
+        if !self.layer_kinds.is_empty() {
+            self.layer_kinds = self.layer_kinds.drain(first..first + count).collect();
+        }
+        self.params.block_count = count;
+        Ok(())
+    }
+
+    /// Czy model używa RoPE PRZEPLATANEGO (pary `(2i, 2i+1)`) zamiast NeoX
+    /// (pary `(i, i + d/2)`).
+    ///
+    /// Rodzina Llama zapisuje w GGUF wagi w układzie, dla którego llama.cpp
+    /// stosuje rotację przeplataną; Qwen, Gemma i DeepSeek używają NeoX.
+    /// Pomylenie tych dwóch definicji nie psuje pozycji zerowej (kąt = 0), więc
+    /// model odpowiada poprawnie na prompt jednotokenowy i rozjeżdża się dopiero
+    /// od drugiego tokenu — dokładnie tak objawiał się błąd znaleziony
+    /// 2026-07-28 przez porównanie z `llama-eval-callback`.
+    pub fn rope_interleaved(&self) -> bool {
+        matches!(self.arch.as_str(), "llama" | "mistral" | "muse_glimmer")
+    }
+
     /// Detect the architecture of a parsed GGUF file and resolve its weight map.
     pub fn detect(gguf: &Gguf) -> Result<Self> {
         let arch = gguf
@@ -541,20 +967,62 @@ impl ModelDescriptor {
         let mtp = build_dense_mtp(gguf, spec, block_count, nextn)?;
         let hidden_size = req_u("embedding_length")?;
         let n_heads = req_u("attention.head_count")?;
-        let n_kv_heads = gguf
-            .get_u64(&key("attention.head_count_kv"))
-            .map(|v| v as usize)
-            .unwrap_or(n_heads);
+        let alt_attn = parse_alt_attn(gguf, &spec.gguf_arch, block_count);
+        // Przy naprzemiennej geometrii `head_count_kv` jest TABLICĄ; skalary
+        // `Hyperparams` opisują wtedy warstwy globalne (patrz `AltAttnParams`).
+        let n_kv_heads = match (&alt_attn, gguf.get_array(&key("attention.head_count_kv"))) {
+            (Some(alt), Some(values)) => {
+                let heads: Vec<usize> = values
+                    .iter()
+                    .filter_map(|v| v.as_u64())
+                    .map(|v| v as usize)
+                    .collect();
+                alt.sliding
+                    .iter()
+                    .zip(heads.iter().cycle())
+                    .find(|(local, _)| !**local)
+                    .map(|(_, h)| *h)
+                    .unwrap_or(n_heads)
+            }
+            _ => gguf
+                .get_u64(&key("attention.head_count_kv"))
+                .map(|v| v as usize)
+                .unwrap_or(n_heads),
+        };
         let head_dim = gguf
             .get_u64(&key("attention.key_length"))
             .map(|v| v as usize)
             .unwrap_or(hidden_size / n_heads.max(1));
+        let final_logit_softcap = gguf.get_f32(&key("final_logit_softcapping")).unwrap_or(0.0);
+        let logit_scale = gguf.get_f32(&key("logit_scale")).unwrap_or(1.0);
+        // GGUF nie nosi typu aktywacji; rodzina Gemma ma GeGLU z tanh, reszta
+        // obsługiwanych architektur SwiGLU.
+        let ffn_activation = if spec.gguf_arch.starts_with("gemma") {
+            FfnActivation::GeLUTanh
+        } else {
+            FfnActivation::SiLU
+        };
+        // Rodzina Gemma: uwaga bez dzielenia przez sqrt(head_dim) i embedding
+        // przemnożony przez sqrt(hidden). Oba potwierdzone w implementacji
+        // wzorcowej i oba są niewidoczne w metadanych GGUF.
+        let (attn_logit_scale, embd_scale) = if spec.gguf_arch.starts_with("gemma") {
+            (Some(1.0f32), Some((hidden_size as f32).sqrt()))
+        } else if spec.gguf_arch == "muse-glimmer" {
+            (None, None)
+        } else {
+            (
+                gguf.get_f32(&key("attention.qk_scale_factor"))
+                    .map(|factor| factor / (head_dim as f32).sqrt()),
+                None,
+            )
+        };
         let intermediate_size = req_u("feed_forward_length")?;
         let max_position_embeddings = req_u("context_length")?;
         let rope_theta = gguf.get_f32(&key("rope.freq_base")).unwrap_or(10_000.0);
         let rms_norm_eps = gguf
             .get_f32(&key("attention.layer_norm_rms_epsilon"))
             .unwrap_or(1e-5);
+        let post_norm_eps = parse_post_norm_eps(gguf, &spec.gguf_arch, rms_norm_eps);
         let vocab_size = gguf
             .get_u64(&key("vocab_size"))
             .map(|v| v as usize)
@@ -571,9 +1039,13 @@ impl ModelDescriptor {
         let mut globals = HashMap::new();
         let mut layers: Vec<HashMap<WeightRole, String>> = vec![HashMap::new(); block_count];
         for role in &spec.roles {
+            // Rola bez nazwy GGUF istnieje wyłącznie w checkpointach HF.
+            let Some(template) = role.gguf.as_deref() else {
+                continue;
+            };
             if role.per_layer {
                 for (layer, map) in layers.iter_mut().enumerate() {
-                    let name = expand(&role.gguf, layer);
+                    let name = expand(template, layer);
                     if gguf.tensor(&name).is_some() {
                         map.insert(role.role, name);
                     } else if role.required {
@@ -583,12 +1055,12 @@ impl ModelDescriptor {
                         )));
                     }
                 }
-            } else if gguf.tensor(&role.gguf).is_some() {
-                globals.insert(role.role, role.gguf.clone());
+            } else if gguf.tensor(template).is_some() {
+                globals.insert(role.role, template.to_string());
             } else if role.required {
                 return Err(fmt_err(format!(
-                    "gguf: arch '{}' requires tensor '{}' which is missing",
-                    spec.name, role.gguf
+                    "gguf: arch '{}' requires tensor '{template}' which is missing",
+                    spec.name
                 )));
             }
         }
@@ -636,13 +1108,21 @@ impl ModelDescriptor {
         // QK-norm granularity: OLMoE normalizes the whole q/k projection, so its
         // attn_q_norm vector spans n_heads*head_dim; Qwen3 normalizes per head,
         // so its vector spans head_dim. Read the resolved tensor's element count.
+        // Porównanie musi używać head_dim WARSTWY 0 — przy naprzemiennej
+        // geometrii (Gemma 4) warstwy okienne mają węższe głowice niż globalne,
+        // a pomyłka tutaj normalizuje całą projekcję wagą długości jednej
+        // głowicy i czyta poza bufor.
+        let head_dim_layer0 = match &alt_attn {
+            Some(alt) if alt.sliding.first().copied().unwrap_or(false) => alt.head_dim_swa,
+            _ => head_dim,
+        };
         let qk_norm_over_hidden = layers
             .first()
             .and_then(|m| m.get(&WeightRole::AttnQNorm))
             .and_then(|n| gguf.tensor(n))
             .map(|t| {
                 let numel: usize = t.dims.iter().map(|&d| d as usize).product();
-                numel != head_dim
+                numel != head_dim_layer0
             })
             .unwrap_or(false);
 
@@ -665,15 +1145,34 @@ impl ModelDescriptor {
                 vocab_size,
                 rope_theta,
                 rms_norm_eps,
+                post_norm_eps,
                 max_position_embeddings,
                 tie_word_embeddings,
                 pooling_type,
                 moe,
                 qk_norm_over_hidden,
+                v_rms_norm: spec.gguf_arch.starts_with("gemma"),
+                suppress_tokens: gguf
+                    .get_array("tokenizer.ggml.suppress_tokens")
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_u64())
+                            .map(|v| v as u32)
+                            .collect()
+                    })
+                    .unwrap_or_default(),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
+                ffn_activation,
+                alt_attn,
+                rope_sliding_only: arch == "muse-glimmer",
+                final_logit_softcap,
+                logit_scale,
+                attn_logit_scale,
+                embd_scale,
+                deepseek_v4: None,
             },
             globals,
             layers,
@@ -683,6 +1182,42 @@ impl ModelDescriptor {
     }
 
     /// Build a descriptor from an HF config.json (safetensors-side naming).
+    /// Usuwa role opcjonalne, których tensorów nie ma w checkpoincie.
+    ///
+    /// Ścieżka GGUF sprawdza obecność przy budowie opisu, bo ma tabelę
+    /// tensorów pod ręką; ścieżka HF widzi tylko `config.json`, więc deklaruje
+    /// wszystkie role każdej warstwy. Dla architektur, w których część warstw
+    /// nie ma kompresora, indeksera czy tablicy routingu, opis obiecywałby
+    /// wtedy tensory, po które loader sięgnąłby na darmo.
+    pub fn prune_absent_optional(&mut self, exists: impl Fn(&str) -> bool) {
+        let Some(spec) = registry().iter().find(|s| s.name == self.arch) else {
+            return;
+        };
+        let optional: HashMap<WeightRole, bool> = spec
+            .roles
+            .iter()
+            .map(|role| (role.role, role.per_expert))
+            .filter(|(role, _)| {
+                spec.roles
+                    .iter()
+                    .any(|entry| entry.role == *role && !entry.required)
+            })
+            .collect();
+        for layer in &mut self.layers {
+            layer.retain(|role, template| match optional.get(role) {
+                // Rola per ekspert jest szablonem — obecność sprawdzamy na
+                // eksperice zero, bo albo warstwa ma komplet, albo żadnego.
+                Some(true) => exists(&template.replace("{expert}", "0")),
+                Some(false) => exists(template),
+                None => true,
+            });
+        }
+        self.globals.retain(|role, name| match optional.get(role) {
+            Some(_) => exists(name),
+            None => true,
+        });
+    }
+
     pub fn from_hf(config: &HfConfig) -> Result<Self> {
         let spec = registry()
             .iter()
@@ -709,6 +1244,9 @@ impl ModelDescriptor {
         for role in &spec.roles {
             if role.per_layer {
                 for (layer, map) in layers.iter_mut().enumerate() {
+                    // Rola per ekspert zostaje szablonem z `{expert}`: loader
+                    // podstawia indeks sam, bo inaczej opis modelu trzymałby
+                    // sto tysięcy nazw.
                     map.insert(role.role, expand(&role.hf, layer));
                 }
             } else if role.role == WeightRole::LmHead && config.tie_word_embeddings {
@@ -730,19 +1268,55 @@ impl ModelDescriptor {
                 vocab_size: config.vocab_size,
                 rope_theta: config.rope_theta,
                 rms_norm_eps: config.rms_norm_eps,
+                post_norm_eps: config.rms_norm_eps,
                 max_position_embeddings: config.max_position_embeddings,
                 tie_word_embeddings: config.tie_word_embeddings,
                 // HF config.json carries no pooling; sentence-transformers keeps
                 // it in a `1_Pooling/config.json` sidecar the loader overrides.
                 pooling_type: PoolingType::None,
-                // Safetensors MoE loading is not wired yet; the GGUF path is the
-                // supported entry for Mixture-of-Experts models.
-                moe: None,
+                deepseek_v4: (spec.name == "deepseek_v4").then(|| DeepseekV4Params {
+                    q_lora_rank: config.q_lora_rank.unwrap_or(0),
+                    o_lora_rank: config.o_lora_rank.unwrap_or(0),
+                    o_groups: config.o_groups.unwrap_or(1),
+                    rope_head_dim: config.qk_rope_head_dim.unwrap_or(0),
+                    window_size: config.sliding_window.unwrap_or(0),
+                    compress_ratios: config.compress_ratios.clone(),
+                    compress_rope_theta: config.compress_rope_theta.unwrap_or(config.rope_theta),
+                    index_n_heads: config.index_n_heads.unwrap_or(0),
+                    index_head_dim: config.index_head_dim.unwrap_or(0),
+                    index_topk: config.index_topk.unwrap_or(0),
+                    n_hash_layers: config.num_hash_layers,
+                    scoring_func: config
+                        .scoring_func
+                        .clone()
+                        .unwrap_or_else(|| "softmax".to_string()),
+                    routed_scaling_factor: config.routed_scaling_factor.unwrap_or(1.0),
+                    swiglu_limit: config.swiglu_limit.unwrap_or(0.0),
+                }),
+                moe: config.n_routed_experts.map(|n_experts| MoeParams {
+                    n_experts,
+                    n_experts_used: config.num_experts_per_tok.unwrap_or(1),
+                    moe_intermediate_size: config.moe_intermediate_size.unwrap_or(0),
+                    norm_topk_prob: config.norm_topk_prob,
+                    shared_intermediate_size: config
+                        .n_shared_experts
+                        .map(|shared| shared * config.moe_intermediate_size.unwrap_or(0))
+                        .unwrap_or(0),
+                }),
                 qk_norm_over_hidden: false,
+                v_rms_norm: false,
+                suppress_tokens: Vec::new(),
                 ssm: None,
                 rope_sections: None,
                 full_attention_interval: 0,
                 attn_gated: false,
+                ffn_activation: FfnActivation::SiLU,
+                alt_attn: None,
+                rope_sliding_only: false,
+                final_logit_softcap: 0.0,
+                logit_scale: 1.0,
+                attn_logit_scale: None,
+                embd_scale: None,
             },
             globals,
             layers,
@@ -837,11 +1411,11 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
     } else {
         None
     };
-    if moe.is_some() && nextn > 0 {
-        return Err(fmt_err(
-            "qwen35moe: natywny runtime MTP nie obsługuje jeszcze bloku MoE",
-        ));
-    }
+    // A descriptor DESCRIBES the file; whether a given runtime can compute the
+    // speculation head is that runtime's answer, given where it builds it. This
+    // check used to stand here and refused the whole checkpoint — including its
+    // forty trunk layers, which have nothing to do with MTP — so a MoE hybrid
+    // could not be opened by anything, and `build_moe_mtp` below was unreachable.
     let mtp = if moe.is_some() {
         build_moe_mtp(gguf, block_count, nextn)?
     } else {
@@ -861,7 +1435,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             .roles
             .iter()
             .find(|r| r.role == role)
-            .map(|r| r.gguf.clone())
+            .and_then(|r| r.gguf.clone())
             .ok_or_else(|| fmt_err(format!("qwen35moe spec missing global role {role:?}")))?;
         if gguf.tensor(&name).is_none() {
             return Err(fmt_err(format!(
@@ -874,7 +1448,7 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
     // Untied LM head: present as output.weight, else tie to the embedding.
     let tie_word_embeddings = gguf.tensor("output.weight").is_none();
     if !tie_word_embeddings {
-        globals.insert(WeightRole::LmHead, "output.weight".into());
+        globals.insert(WeightRole::LmHead, "output.weight".to_string());
     }
 
     // Common per-layer roles shared by both attention and DeltaNet layers.
@@ -1049,16 +1623,35 @@ fn build_qwen35_hybrid(gguf: &Gguf, spec: &ArchSpec) -> Result<ModelDescriptor> 
             vocab_size,
             rope_theta,
             rms_norm_eps,
+            post_norm_eps: rms_norm_eps,
             max_position_embeddings,
             tie_word_embeddings,
             pooling_type: PoolingType::None,
             moe,
             // qwen35moe attention normalizes each head over head_dim.
             qk_norm_over_hidden: false,
+            v_rms_norm: false,
+            suppress_tokens: gguf
+                .get_array("tokenizer.ggml.suppress_tokens")
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_u64())
+                        .map(|v| v as u32)
+                        .collect()
+                })
+                .unwrap_or_default(),
             ssm: Some(ssm),
             rope_sections,
             full_attention_interval,
             attn_gated: true,
+            ffn_activation: FfnActivation::SiLU,
+            alt_attn: None,
+            rope_sliding_only: false,
+            final_logit_softcap: 0.0,
+            logit_scale: 1.0,
+            attn_logit_scale: None,
+            deepseek_v4: None,
+            embd_scale: None,
         },
         globals,
         layers,
@@ -1244,10 +1837,7 @@ mod tests {
             }
             if dedicated_mtp_io {
                 tensors.push(tensor("blk.2.nextn.embed_tokens.weight", vec![64, 32]));
-                tensors.push(tensor(
-                    "blk.2.nextn.shared_head_head.weight",
-                    vec![64, 32],
-                ));
+                tensors.push(tensor("blk.2.nextn.shared_head_head.weight", vec![64, 32]));
             }
         }
         write_synthetic_gguf(metadata, tensors)
@@ -1256,7 +1846,7 @@ mod tests {
     #[test]
     fn all_embedded_specs_parse() {
         let specs = registry();
-        assert_eq!(specs.len(), 7);
+        assert_eq!(specs.len(), 10);
         assert_eq!(specs[0].name, "qwen3");
         assert_eq!(specs[1].name, "llama");
         assert_eq!(specs[2].name, "mistral");
@@ -1264,6 +1854,9 @@ mod tests {
         assert_eq!(specs[4].name, "qwen3moe");
         assert_eq!(specs[5].name, "qwen35moe");
         assert_eq!(specs[6].name, "qwen35");
+        assert_eq!(specs[7].name, "gemma4");
+        assert_eq!(specs[8].name, "deepseek_v4");
+        assert_eq!(specs[9].name, "muse_glimmer");
         // The MoE specs carry the router + stacked-expert roles.
         assert!(specs[3]
             .roles
@@ -1434,6 +2027,61 @@ mod tests {
     }
 
     #[test]
+    fn muse_post_norm_eps_defaults_to_model_rms_eps() {
+        let gguf = write_synthetic_gguf(
+            vec![metadata_string("general.architecture", "muse-glimmer")],
+            Vec::new(),
+        );
+        assert_eq!(parse_post_norm_eps(&gguf, "muse-glimmer", 1e-5), 1e-5);
+    }
+
+    #[test]
+    fn muse_descriptor_uses_runtime_arch_and_gates() {
+        let metadata = vec![
+            metadata_string("general.architecture", "muse-glimmer"),
+            metadata_u32("muse-glimmer.block_count", 4),
+            metadata_u32("muse-glimmer.embedding_length", 64),
+            metadata_u32("muse-glimmer.feed_forward_length", 128),
+            metadata_u32("muse-glimmer.attention.head_count", 1),
+            metadata_u32("muse-glimmer.attention.head_count_kv", 1),
+            metadata_u32("muse-glimmer.attention.key_length", 64),
+            metadata_u32("muse-glimmer.context_length", 1024),
+        ];
+        let mut tensors = vec![
+            tensor("token_embd.weight", vec![64, 32]),
+            tensor("output_norm.weight", vec![64]),
+        ];
+        for layer in 0..4 {
+            for name in [
+                "attn_norm",
+                "post_attention_norm",
+                "attn_q",
+                "attn_k",
+                "attn_v",
+                "attn_output",
+                "attn_q_norm",
+                "attn_k_norm",
+                "attn_gate",
+                "ffn_norm",
+                "post_ffw_norm",
+                "ffn_gate",
+                "ffn_up",
+                "ffn_down",
+            ] {
+                tensors.push(tensor(format!("blk.{layer}.{name}.weight"), vec![64]));
+            }
+        }
+
+        let descriptor = ModelDescriptor::detect(&write_synthetic_gguf(metadata, tensors))
+            .expect("wykryj Muse Glimmer");
+        assert_eq!(descriptor.arch, "muse_glimmer");
+        assert!(descriptor.rope_interleaved());
+        assert!(descriptor.params.rope_sliding_only);
+        assert!(descriptor.layers[0].contains_key(&WeightRole::AttnGate));
+        assert!(descriptor.layers[3].contains_key(&WeightRole::AttnV));
+    }
+
+    #[test]
     fn from_hf_has_no_pooling() {
         let cfg: HfConfig = serde_json::from_str(
             r#"{"architectures":["Qwen3ForCausalLM"],"hidden_size":1024,
@@ -1514,5 +2162,765 @@ mod tests {
             ModelDescriptor::from_hf(&cfg),
             Err(ForgeError::Unsupported(_))
         ));
+    }
+}
+
+#[cfg(test)]
+mod pipeline_tests {
+    use super::check_pipeline_range;
+
+    #[test]
+    fn zakres_ze_srodka_jest_poprawny() {
+        assert!(check_pipeline_range(40, 20, 20).is_ok());
+        assert!(check_pipeline_range(65, 0, 33).is_ok());
+    }
+
+    #[test]
+    fn zakres_poza_model_jest_bledem() {
+        assert!(check_pipeline_range(40, 30, 20).is_err());
+        assert!(check_pipeline_range(40, 40, 1).is_err());
+    }
+
+    #[test]
+    fn etap_bez_warstw_jest_bledem() {
+        assert!(check_pipeline_range(40, 0, 0).is_err());
+    }
+
+    #[test]
+    fn caly_model_jako_jeden_etap_przechodzi() {
+        assert!(check_pipeline_range(40, 0, 40).is_ok());
+    }
+}
+
+// ===== Kontrakt podziału tensor-parallel =====
+//
+// Ranga to osobny model na własnej karcie, zbudowany z deskryptora o
+// PODZIELONYCH liczbach głowic. Dzięki temu prefill, dekodowanie, weryfikacja
+// MTP i batch przechodzą przez ten sam kod na mniejszym kształcie, zamiast
+// wymagać osobnego wpięcia każda z osobna.
+//
+// Ten moduł nie dzieli wag — opisuje WYŁĄCZNIE, co komu przypada, i odmawia,
+// gdy kształt się nie dzieli. Wszystko, co dzieli wagi, ma się o niego pytać.
+
+/// Przydział rangi w podziale tensor-parallel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct TpShard {
+    pub rank: usize,
+    pub world: usize,
+}
+
+impl TpShard {
+    pub fn new(rank: usize, world: usize) -> Result<Self> {
+        if world == 0 || rank >= world {
+            return Err(fmt_err(format!(
+                "tensor parallel: ranga {rank} poza światem {world}"
+            )));
+        }
+        Ok(Self { rank, world })
+    }
+
+    /// Podział pojedynczego wymiaru; `align` to najmniejsza niepodzielna
+    /// jednostka (blok kwantyzacji albo `head_dim`).
+    fn split(&self, what: &str, total: usize, align: usize) -> Result<usize> {
+        if align == 0 || !total.is_multiple_of(align) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {what} = {total} nie jest wielokrotnością {align}"
+            )));
+        }
+        let units = total / align;
+        if !units.is_multiple_of(self.world) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {what} = {total} daje {units} jednostek po {align}, \
+                 czego nie da się podzielić na {} rang",
+                self.world
+            )));
+        }
+        Ok(total / self.world)
+    }
+}
+
+impl Hyperparams {
+    /// Hiperparametry JEDNEJ rangi. Odmawia zamiast dobierać po cichu — podział,
+    /// który nie wychodzi, ma się zatrzymać przy starcie, a nie policzyć co
+    /// innego.
+    pub fn shard(&self, shard: TpShard) -> Result<Self> {
+        if shard.world == 1 {
+            return Ok(self.clone());
+        }
+        if self.moe.is_some() {
+            return Err(fmt_err(
+                "tensor parallel: MoE dzieli się po ekspertach, nie po głowicach",
+            ));
+        }
+        if self.alt_attn.is_some() {
+            return Err(fmt_err(
+                "tensor parallel: naprzemienna geometria uwagi nie ma opisanego podziału",
+            ));
+        }
+        let mut out = self.clone();
+        // GQA jest tu NAJCIAŚNIEJSZE: głowic KV jest zwykle kilka, więc to one
+        // wyznaczają dopuszczalną liczbę rang, a nie liczba głowic Q.
+        out.n_kv_heads = shard.split("n_kv_heads", self.n_kv_heads, 1)?;
+        out.n_heads = shard.split("n_heads", self.n_heads, 1)?;
+        if !out.n_heads.is_multiple_of(out.n_kv_heads) {
+            return Err(fmt_err(format!(
+                "tensor parallel: po podziale zostaje {} głowic Q na {} KV — grupa GQA \
+                 musi zostać cała na jednej randze",
+                out.n_heads, out.n_kv_heads
+            )));
+        }
+        // Wymiar pośredni dzieli się po WIERSZACH `gate`/`up` i po KOLUMNACH
+        // `down`, więc musi zostać wielokrotnością największego bloku kwantyzacji
+        // K-kwantów; inaczej kolumnowy wycinek `down` trafiałby w środek bloku.
+        out.intermediate_size = shard.split("intermediate_size", self.intermediate_size, 256)?;
+        if let Some(ssm) = &self.ssm {
+            out.ssm = Some(ssm.shard(shard)?);
+        }
+        Ok(out)
+    }
+}
+
+impl SsmParams {
+    /// Parametry DeltaNet jednej rangi.
+    ///
+    /// PUŁAPKA, na której rozbiła się poprzednia próba: GGUF przypisuje głowicę
+    /// V do głowicy K przez MODULO (`deltanet_repeat_qk_f16` liczy
+    /// `source = index % key_dim`), więc CIĄGŁY zakres głowic V nie pokrywa się z
+    /// żadnym zakresem głowic K. Ranga, która dostała V 24-47 i K 8-15, sięga
+    /// głowicą V 39 po głowicę K 7 — której nie ma. Nie ma z tego błędu ani
+    /// asercji, tylko tekst-śmieć.
+    ///
+    /// Dlatego podział idzie po KLASACH RESZTY: ranga bierze głowice K
+    /// `[r*n_k/W, (r+1)*n_k/W)` oraz te głowice V, których reszta z dzielenia
+    /// przez `n_k` wpada w ten zakres. Odpowiada to `n_v / n_k` ciągłym
+    /// przebiegom — patrz `TpShard::v_head_runs`.
+    pub fn shard(&self, shard: TpShard) -> Result<Self> {
+        if shard.world == 1 {
+            return Ok(self.clone());
+        }
+        if !self.dt_rank.is_multiple_of(self.n_group) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {} głowic V nie jest wielokrotnością {} głowic K, \
+                 więc mapowanie GQA DeltaNet nie ma podziału",
+                self.dt_rank, self.n_group
+            )));
+        }
+        let mut out = self.clone();
+        out.n_group = shard.split("ssm.group_count", self.n_group, 1)?;
+        out.dt_rank = shard.split("ssm.time_step_rank", self.dt_rank, 1)?;
+        out.d_inner = out.dt_rank * self.d_state;
+        Ok(out)
+    }
+}
+
+impl TpShard {
+    /// Globalne indeksy głowic K tej rangi (ciągły zakres).
+    pub fn k_head_range(&self, n_k_heads: usize) -> Result<(usize, usize)> {
+        let per = self.split("ssm.group_count", n_k_heads, 1)?;
+        Ok((self.rank * per, per))
+    }
+
+    /// Globalne indeksy głowic V tej rangi, W KOLEJNOŚCI LOKALNEJ.
+    ///
+    /// Kolejność jest istotna, a nie kosmetyczna: scalony wstęp kroku DeltaNet
+    /// numeruje głowice V jako `h_local + run * n_k_local`, więc loader musi
+    /// ułożyć wiersze dokładnie w tej kolejności. Inaczej ranga liczyłaby swoje
+    /// głowice poprawnie, ale przypisała im cudze wagi.
+    pub fn v_head_order(&self, n_k_heads: usize, n_v_heads: usize) -> Result<Vec<usize>> {
+        if n_k_heads == 0 || !n_v_heads.is_multiple_of(n_k_heads) {
+            return Err(fmt_err(format!(
+                "tensor parallel: {n_v_heads} głowic V nie jest wielokrotnością {n_k_heads} głowic K"
+            )));
+        }
+        let (first_k, per_k) = self.k_head_range(n_k_heads)?;
+        let runs = n_v_heads / n_k_heads;
+        let mut order = Vec::with_capacity(runs * per_k);
+        for run in 0..runs {
+            for h in 0..per_k {
+                order.push(run * n_k_heads + first_k + h);
+            }
+        }
+        Ok(order)
+    }
+}
+
+#[cfg(test)]
+mod tp_shard_tests {
+    use super::*;
+
+    fn qwen35_ssm() -> SsmParams {
+        SsmParams {
+            d_conv: 4,
+            d_inner: 6144,
+            d_state: 128,
+            dt_rank: 48,
+            n_group: 16,
+        }
+    }
+
+    #[test]
+    fn dwie_rangi_dziela_glowice_qwen35() {
+        let shard = TpShard::new(1, 2).expect("ranga w zasięgu");
+        let ssm = qwen35_ssm()
+            .shard(shard)
+            .expect("qwen35 dzieli się na dwie");
+        assert_eq!(ssm.n_group, 8);
+        assert_eq!(ssm.dt_rank, 24);
+        assert_eq!(ssm.d_inner, 24 * 128);
+    }
+
+    #[test]
+    fn glowice_v_ida_klasami_reszty_a_nie_ciagiem() {
+        let rank0 = TpShard::new(0, 2).expect("ranga 0");
+        let rank1 = TpShard::new(1, 2).expect("ranga 1");
+        let v0 = rank0.v_head_order(16, 48).expect("podział V");
+        let v1 = rank1.v_head_order(16, 48).expect("podział V");
+        // Ciągły podział dałby 0-23 i 24-47, i głowica V 39 sięgałaby po
+        // głowicę K 7, której ranga 1 nie ma.
+        assert_eq!(&v0[..8], &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(&v0[8..16], &[16, 17, 18, 19, 20, 21, 22, 23]);
+        assert_eq!(&v0[16..], &[32, 33, 34, 35, 36, 37, 38, 39]);
+        assert_eq!(&v1[..8], &[8, 9, 10, 11, 12, 13, 14, 15]);
+        assert_eq!(v0.len() + v1.len(), 48);
+        // Każda głowica V trafia dokładnie raz i na tę rangę, która ma jej K.
+        let mut all: Vec<usize> = v0.iter().chain(v1.iter()).copied().collect();
+        all.sort_unstable();
+        assert_eq!(all, (0..48).collect::<Vec<_>>());
+        for (rank, heads) in [(0usize, &v0), (1usize, &v1)] {
+            let (first_k, per_k) = TpShard::new(rank, 2)
+                .expect("ranga")
+                .k_head_range(16)
+                .expect("zakres K");
+            for &v in heads {
+                let k = v % 16;
+                assert!(
+                    k >= first_k && k < first_k + per_k,
+                    "głowica V {v} sięga po K {k} spoza rangi {rank}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn niepodzielne_ksztalty_sa_odrzucane() {
+        let shard = TpShard::new(0, 3).expect("ranga 0 z trzech");
+        // 16 głowic K nie dzieli się na trzy rangi.
+        assert!(qwen35_ssm().shard(shard).is_err());
+        let mut ssm = qwen35_ssm();
+        // 48 głowic V przy 5 głowicach K nie ma mapowania GQA.
+        ssm.n_group = 5;
+        assert!(ssm.shard(TpShard::new(0, 2).expect("ranga")).is_err());
+    }
+
+    #[test]
+    fn ranga_poza_swiatem_jest_bledem() {
+        assert!(TpShard::new(2, 2).is_err());
+        assert!(TpShard::new(0, 0).is_err());
+    }
+}
+
+/// Geometria bloku kwantyzacji: ile wartości i ile bajtów zajmuje jeden blok.
+///
+/// Podział tensor-parallel tnie macierze bez dekwantyzacji, więc musi znać
+/// dokładnie tę jedną rzecz. Lista jest świadomie WĄSKA — to formaty, w których
+/// leżą checkpointy objęte podziałem. Każdy inny ma tu paść głośno, a nie zostać
+/// pocięty regułą, której nikt nie sprawdził na danych.
+pub fn block_geometry(quant: QuantKind) -> Result<(usize, usize)> {
+    Ok(match quant {
+        QuantKind::None => (1, 2),
+        QuantKind::Q8_0 => (32, 34),
+        QuantKind::Q4K => (256, 144),
+        QuantKind::Q6K => (256, 210),
+        QuantKind::NVFP4Gguf => (64, 36),
+        other => {
+            return Err(fmt_err(format!(
+                "podział tensor-parallel nie zna geometrii bloku {other:?}"
+            )));
+        }
+    })
+}
+
+/// Macierz `[rows, cols]` w formacie blokowym, krojona na rangi bez
+/// dekwantyzacji.
+///
+/// Dwa kierunki cięcia wynikają wprost z tego, który wymiar jest dzielony:
+///
+/// - macierz **kolumnowo równoległa** (dzielone WYJŚCIE) tnie WIERSZE, a wynik
+///   zostaje lokalny. Wiersze leżą ciągle w każdym formacie blokowym, więc
+///   wycinek to sklejenie zakresów bajtów;
+/// - macierz **wierszowo równoległa** (dzielone WEJŚCIE) tnie KOLUMNY, czyli
+///   wycinek WEWNĄTRZ każdego wiersza. Dlatego granica musi paść na blok:
+///   inaczej wycinek zaczynałby się w środku bloku, a jego skala opisywałaby
+///   wagi, których na tej randze nie ma.
+pub struct BlockMatrix<'a> {
+    pub data: &'a [u8],
+    pub rows: usize,
+    pub cols: usize,
+    pub quant: QuantKind,
+}
+
+impl BlockMatrix<'_> {
+    fn geometry(&self) -> Result<(usize, usize, usize)> {
+        let (values, block_bytes) = block_geometry(self.quant)?;
+        if !self.cols.is_multiple_of(values) {
+            return Err(fmt_err(format!(
+                "podział: {} kolumn nie jest wielokrotnością bloku {values}",
+                self.cols
+            )));
+        }
+        let row_bytes = (self.cols / values) * block_bytes;
+        let expected = self.rows * row_bytes;
+        if self.data.len() != expected {
+            return Err(fmt_err(format!(
+                "podział: [{}, {}] w {:?} ma zajmować {expected} B, a tensor ma {} B",
+                self.rows,
+                self.cols,
+                self.quant,
+                self.data.len()
+            )));
+        }
+        Ok((values, block_bytes, row_bytes))
+    }
+
+    /// Wycinek WIERSZY: skleja podane zakresy W PODANEJ KOLEJNOŚCI.
+    ///
+    /// Kolejność jest częścią kontraktu, a nie kosmetyką. Głowice V DeltaNet idą
+    /// klasami reszty (`TpShard::v_head_order`), więc ranga dostaje kilka
+    /// rozłącznych przebiegów, które muszą trafić do wag dokładnie w tej
+    /// kolejności, w jakiej numeruje je kernel. Odwrotna kolejność nie daje
+    /// błędu — daje cudze wagi pod właściwą głowicą.
+    pub fn take_rows(&self, ranges: &[(usize, usize)]) -> Result<Vec<u8>> {
+        let (_, _, row_bytes) = self.geometry()?;
+        let mut out = Vec::with_capacity(
+            ranges
+                .iter()
+                .map(|(_, count)| count * row_bytes)
+                .sum::<usize>(),
+        );
+        for &(first, count) in ranges {
+            let end = first
+                .checked_add(count)
+                .ok_or_else(|| fmt_err("podział wierszy: przepełnienie zakresu"))?;
+            if end > self.rows {
+                return Err(fmt_err(format!(
+                    "podział wierszy: zakres [{first}, {end}) wykracza poza {} wierszy",
+                    self.rows
+                )));
+            }
+            out.extend_from_slice(&self.data[first * row_bytes..end * row_bytes]);
+        }
+        Ok(out)
+    }
+
+    /// Wycinek KOLUMN, ten sam w każdym wierszu, sklejony w PODANEJ KOLEJNOŚCI.
+    ///
+    /// Zakresów jest kilka z tego samego powodu co przy wierszach: `ssm_out`
+    /// czyta wymiar głowic V, a te idą klasami reszty, więc ranga bierze
+    /// `n_v / n_k` rozłącznych przebiegów kolumn. Granice muszą paść na blok.
+    pub fn take_cols(&self, ranges: &[(usize, usize)]) -> Result<Vec<u8>> {
+        let (values, block_bytes, row_bytes) = self.geometry()?;
+        let mut spans = Vec::with_capacity(ranges.len());
+        let mut take_bytes = 0usize;
+        for &(first, count) in ranges {
+            if !first.is_multiple_of(values) || !count.is_multiple_of(values) {
+                return Err(fmt_err(format!(
+                    "podział kolumn: granica [{first}, {}) nie pada na blok {values} wartości",
+                    first + count
+                )));
+            }
+            let end = first
+                .checked_add(count)
+                .ok_or_else(|| fmt_err("podział kolumn: przepełnienie zakresu"))?;
+            if end > self.cols {
+                return Err(fmt_err(format!(
+                    "podział kolumn: zakres [{first}, {end}) wykracza poza {} kolumn",
+                    self.cols
+                )));
+            }
+            let from = (first / values) * block_bytes;
+            let bytes = (count / values) * block_bytes;
+            spans.push((from, bytes));
+            take_bytes += bytes;
+        }
+        let mut out = Vec::with_capacity(self.rows * take_bytes);
+        for row in 0..self.rows {
+            for &(from, bytes) in &spans {
+                let base = row * row_bytes + from;
+                out.extend_from_slice(&self.data[base..base + bytes]);
+            }
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod block_matrix_tests {
+    use super::*;
+
+    /// Q4_K: 144 B na 256 wartości. Bajt `i` wiersza `r` niesie numer wiersza,
+    /// więc każdy wycinek da się sprawdzić po zawartości, a nie po długości.
+    fn matrix(rows: usize, cols: usize) -> Vec<u8> {
+        let row_bytes = (cols / 256) * 144;
+        let mut data = vec![0u8; rows * row_bytes];
+        for r in 0..rows {
+            for b in 0..row_bytes {
+                data[r * row_bytes + b] = (r % 251) as u8;
+            }
+        }
+        data
+    }
+
+    #[test]
+    fn wycinek_wierszy_zachowuje_kolejnosc_zakresow() {
+        let data = matrix(48, 256);
+        let m = BlockMatrix {
+            data: &data,
+            rows: 48,
+            cols: 256,
+            quant: QuantKind::Q4K,
+        };
+        // Kolejność głowic V rangi 1 przy n_k = 16, n_v = 48.
+        let order = TpShard::new(1, 2)
+            .expect("ranga")
+            .v_head_order(16, 48)
+            .expect("podział V");
+        let ranges: Vec<(usize, usize)> = order.iter().map(|&h| (h, 1)).collect();
+        let out = m.take_rows(&ranges).expect("wycinek");
+        assert_eq!(out.len() / 144, order.len());
+        for (slot, &head) in order.iter().enumerate() {
+            assert_eq!(out[slot * 144], (head % 251) as u8, "slot {slot}");
+        }
+    }
+
+    #[test]
+    fn wycinek_kolumn_bierze_ten_sam_zakres_w_kazdym_wierszu() {
+        let data = matrix(4, 1024);
+        let m = BlockMatrix {
+            data: &data,
+            rows: 4,
+            cols: 1024,
+            quant: QuantKind::Q4K,
+        };
+        let out = m.take_cols(&[(512, 512)]).expect("wycinek");
+        assert_eq!(out.len(), 4 * 2 * 144);
+        for r in 0..4 {
+            assert_eq!(out[r * 2 * 144], (r % 251) as u8);
+        }
+    }
+
+    #[test]
+    fn granica_w_srodku_bloku_jest_bledem() {
+        let data = matrix(2, 512);
+        let m = BlockMatrix {
+            data: &data,
+            rows: 2,
+            cols: 512,
+            quant: QuantKind::Q4K,
+        };
+        assert!(m.take_cols(&[(128, 256)]).is_err());
+        assert!(m.take_cols(&[(0, 300)]).is_err());
+        assert!(m.take_rows(&[(1, 2)]).is_err());
+    }
+
+    #[test]
+    fn niezgodna_dlugosc_tensora_jest_bledem() {
+        let data = vec![0u8; 100];
+        let m = BlockMatrix {
+            data: &data,
+            rows: 2,
+            cols: 512,
+            quant: QuantKind::Q4K,
+        };
+        assert!(m.take_rows(&[(0, 1)]).is_err());
+    }
+}
+
+/// Jak pociąć tensor danej roli dla jednej rangi.
+///
+/// `Rows` obsługuje macierze kolumnowo równoległe (dzielone WYJŚCIE, wynik
+/// zostaje lokalny), `Cols` wierszowo równoległe (dzielone WEJŚCIE, wynik to
+/// suma cząstkowa kończąca się redukcją). Oba niosą LISTĘ zakresów, bo głowice V
+/// DeltaNet idą klasami reszty i dają kilka rozłącznych przebiegów.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RoleShard {
+    Replicated,
+    Rows(Vec<(usize, usize)>),
+    Cols(Vec<(usize, usize)>),
+}
+
+impl TpShard {
+    /// Plan cięcia tensora danej roli dla architektury hybrydowej `qwen35`.
+    ///
+    /// Liczony z PEŁNYCH hiperparametrów, bo opisuje wycinek pełnej macierzy.
+    /// Rola nieznana temu podziałowi jest BŁĘDEM, a nie cichą replikacją —
+    /// tensor, o którym nikt nie pomyślał, replikowany po cichu daje model,
+    /// który liczy poprawnie i czyta dwa razy więcej, więc nikt tego nie zauważy
+    /// poza brakiem przyspieszenia.
+    pub fn role_shard(&self, p: &Hyperparams, role: WeightRole) -> Result<RoleShard> {
+        if self.world == 1 {
+            return Ok(RoleShard::Replicated);
+        }
+        let head_dim = p.head_dim;
+        let q_per = self.split("n_heads", p.n_heads, 1)?;
+        let kv_per = self.split("n_kv_heads", p.n_kv_heads, 1)?;
+        let inter_per = self.split("intermediate_size", p.intermediate_size, 256)?;
+        let one = |first: usize, count: usize| vec![(first, count)];
+        Ok(match role {
+            // Uwaga. Projekcja Q niesie na głowicę DWA bloki `head_dim`, bo
+            // druga połowa to bramka wyjścia (`attn_gated`) — wycinek musi objąć
+            // obie, inaczej ranga dostałaby bramkę cudzej głowicy.
+            WeightRole::AttnQ => {
+                let per = q_per * head_dim * if p.attn_gated { 2 } else { 1 };
+                RoleShard::Rows(one(self.rank * per, per))
+            }
+            WeightRole::AttnK | WeightRole::AttnV => {
+                let per = kv_per * head_dim;
+                RoleShard::Rows(one(self.rank * per, per))
+            }
+            WeightRole::AttnO => {
+                let per = q_per * head_dim;
+                RoleShard::Cols(one(self.rank * per, per))
+            }
+            // FFN: `gate`/`up` kolumnowo, `down` wierszowo — granice pokrywają
+            // się co do wiersza, więc kolumny `down` to dokładnie ten kawałek
+            // wymiaru pośredniego, który ta ranga policzyła.
+            WeightRole::FfnGate | WeightRole::FfnUp => {
+                RoleShard::Rows(one(self.rank * inter_per, inter_per))
+            }
+            WeightRole::FfnDown => RoleShard::Cols(one(self.rank * inter_per, inter_per)),
+            // DeltaNet.
+            WeightRole::SsmInProj
+            | WeightRole::SsmGate
+            | WeightRole::SsmAlpha
+            | WeightRole::SsmBeta
+            | WeightRole::SsmA
+            | WeightRole::SsmDt
+            | WeightRole::SsmConv1d
+            | WeightRole::SsmOut => {
+                let ssm = p
+                    .ssm
+                    .as_ref()
+                    .ok_or_else(|| fmt_err("podział: rola DeltaNet w modelu bez parametrów SSM"))?;
+                let d_state = ssm.d_state;
+                let n_k = ssm.n_k_heads();
+                let n_v = ssm.n_v_heads();
+                let key_dim = ssm.key_dim();
+                let (first_k, per_k) = self.k_head_range(n_k)?;
+                let v_order = self.v_head_order(n_k, n_v)?;
+                // Głowice V rangi to `n_v / n_k` ciągłych przebiegów po `per_k`
+                // głowic; zwijamy je z listy indeksów, żeby wycinek był kilkoma
+                // zakresami zamiast kilkudziesięcioma.
+                let runs: Vec<usize> = v_order.chunks(per_k).map(|run| run[0]).collect();
+                let v_rows = |width: usize, base: usize| -> Vec<(usize, usize)> {
+                    runs.iter()
+                        .map(|&first| (base + first * width, per_k * width))
+                        .collect()
+                };
+                match role {
+                    // Wejściowa projekcja niesie q, k i v jedno za drugim, więc
+                    // ranga bierze TRZY grupy zakresów w tej właśnie kolejności —
+                    // taki układ ma jej lokalny `conv_dim`.
+                    WeightRole::SsmInProj | WeightRole::SsmConv1d => {
+                        let mut ranges = vec![
+                            (first_k * d_state, per_k * d_state),
+                            (key_dim + first_k * d_state, per_k * d_state),
+                        ];
+                        ranges.extend(v_rows(d_state, 2 * key_dim));
+                        RoleShard::Rows(ranges)
+                    }
+                    WeightRole::SsmGate => RoleShard::Rows(v_rows(d_state, 0)),
+                    WeightRole::SsmAlpha
+                    | WeightRole::SsmBeta
+                    | WeightRole::SsmA
+                    | WeightRole::SsmDt => RoleShard::Rows(v_rows(1, 0)),
+                    // Projekcja wyjściowa czyta wymiar głowic V, więc dzieli się
+                    // po KOLUMNACH tymi samymi przebiegami. Kończy się redukcją.
+                    WeightRole::SsmOut => RoleShard::Cols(v_rows(d_state, 0)),
+                    _ => unreachable!("rola DeltaNet obsłużona wyżej"),
+                }
+            }
+            // Replikowane: wektory norm i tablica embeddingu. Dekodowanie pobiera
+            // z niej JEDEN wiersz, więc dzielenie nic nie daje.
+            WeightRole::AttnNorm
+            | WeightRole::AttnQNorm
+            | WeightRole::AttnKNorm
+            | WeightRole::FfnNorm
+            | WeightRole::PostAttnNorm
+            | WeightRole::PostFfwNorm
+            | WeightRole::SsmNorm
+            | WeightRole::OutputNorm
+            | WeightRole::TokenEmbd
+            | WeightRole::RopeFreqs => RoleShard::Replicated,
+            other => {
+                return Err(fmt_err(format!(
+                    "podział tensor-parallel nie ma planu dla roli {other:?}"
+                )));
+            }
+        })
+    }
+}
+
+#[cfg(test)]
+mod role_shard_tests {
+    use super::*;
+
+    fn qwen35() -> Hyperparams {
+        Hyperparams {
+            block_count: 64,
+            hidden_size: 5120,
+            n_heads: 24,
+            n_kv_heads: 4,
+            head_dim: 256,
+            intermediate_size: 17408,
+            vocab_size: 248320,
+            rope_theta: 1.0e6,
+            rms_norm_eps: 1.0e-6,
+            post_norm_eps: 1.0e-6,
+            max_position_embeddings: 262144,
+            tie_word_embeddings: false,
+            pooling_type: PoolingType::None,
+            moe: None,
+            qk_norm_over_hidden: false,
+            v_rms_norm: false,
+            suppress_tokens: Vec::new(),
+            ssm: Some(SsmParams {
+                d_conv: 4,
+                d_inner: 6144,
+                d_state: 128,
+                dt_rank: 48,
+                n_group: 16,
+            }),
+            rope_sections: None,
+            full_attention_interval: 4,
+            attn_gated: true,
+            ffn_activation: FfnActivation::SiLU,
+            alt_attn: None,
+            rope_sliding_only: false,
+            final_logit_softcap: 0.0,
+            logit_scale: 1.0,
+            attn_logit_scale: None,
+            deepseek_v4: None,
+            embd_scale: None,
+        }
+    }
+
+    #[test]
+    fn rope_sliding_only_skips_global_layers() {
+        let mut params = qwen35();
+        params.rope_sliding_only = true;
+        params.alt_attn = Some(AltAttnParams {
+            sliding: vec![true, false],
+            window: 128,
+            head_dim_swa: 256,
+            n_kv_heads_swa: 2,
+            rope_theta_swa: 10_000.0,
+        });
+        assert!(params.uses_rope_at(0));
+        assert!(!params.uses_rope_at(1));
+    }
+
+    #[test]
+    fn muse_rope_pattern_skips_every_fourth_layer_without_alt_attention() {
+        let mut params = qwen35();
+        params.rope_sliding_only = true;
+        params.rope_theta = 500_000.0;
+
+        for layer in [0usize, 1, 2, 4, 5, 6] {
+            assert!(params.uses_rope_at(layer));
+            assert_eq!(params.rope_theta_at(layer), 500_000.0);
+        }
+        for layer in [3usize, 7] {
+            assert!(!params.uses_rope_at(layer));
+            assert_eq!(params.rope_theta_at(layer), 0.0);
+        }
+    }
+
+    #[test]
+    fn muse_scalar_swa_pattern_routes_first_three_layers_to_window() {
+        let pattern = muse_swa_pattern(4).expect("okres dodatni");
+        assert_eq!(&pattern, &[true, true, true, false]);
+        assert!(muse_swa_pattern(0).is_none());
+    }
+
+    #[test]
+    fn muse_q_norm_scale_does_not_change_attention_logit_scale() {
+        let mut params = qwen35();
+        params.head_dim = 128;
+        params.attn_logit_scale = None;
+        assert_eq!(params.attn_scale_at(0), 1.0 / (128.0f32).sqrt());
+    }
+
+    /// Suma wycinków obu rang musi pokryć KAŻDY wiersz (albo kolumnę) dokładnie
+    /// raz. To jest bramka, która łapie i lukę, i nakładkę.
+    fn assert_partition(p: &Hyperparams, role: WeightRole, total: usize) {
+        let mut seen = vec![0usize; total];
+        for rank in 0..2 {
+            let shard = TpShard::new(rank, 2).expect("ranga");
+            let ranges = match shard.role_shard(p, role).expect("plan") {
+                RoleShard::Rows(r) | RoleShard::Cols(r) => r,
+                RoleShard::Replicated => panic!("{role:?} miała być dzielona"),
+            };
+            for (first, count) in ranges {
+                for i in first..first + count {
+                    seen[i] += 1;
+                }
+            }
+        }
+        for (i, hits) in seen.iter().enumerate() {
+            assert_eq!(*hits, 1, "{role:?}: element {i} pokryty {hits} razy");
+        }
+    }
+
+    #[test]
+    fn podzialy_pokrywaja_kazdy_element_dokladnie_raz() {
+        let p = qwen35();
+        let ssm = p.ssm.clone().expect("ssm");
+        assert_partition(&p, WeightRole::AttnQ, 24 * 256 * 2);
+        assert_partition(&p, WeightRole::AttnK, 4 * 256);
+        assert_partition(&p, WeightRole::AttnO, 24 * 256);
+        assert_partition(&p, WeightRole::FfnGate, 17408);
+        assert_partition(&p, WeightRole::FfnDown, 17408);
+        assert_partition(&p, WeightRole::SsmInProj, ssm.conv_dim());
+        assert_partition(&p, WeightRole::SsmConv1d, ssm.conv_dim());
+        assert_partition(&p, WeightRole::SsmGate, ssm.value_dim());
+        assert_partition(&p, WeightRole::SsmOut, ssm.value_dim());
+        assert_partition(&p, WeightRole::SsmAlpha, 48);
+    }
+
+    #[test]
+    fn wejsciowa_projekcja_trzyma_kolejnosc_q_k_v() {
+        let p = qwen35();
+        let shard = TpShard::new(1, 2).expect("ranga 1");
+        let RoleShard::Rows(ranges) = shard.role_shard(&p, WeightRole::SsmInProj).expect("plan")
+        else {
+            panic!("in_proj dzieli się po wierszach");
+        };
+        // q, k, potem trzy przebiegi v — dokładnie ten układ ma lokalny conv_dim.
+        assert_eq!(ranges.len(), 5);
+        assert_eq!(ranges[0], (8 * 128, 8 * 128));
+        assert_eq!(ranges[1], (2048 + 8 * 128, 8 * 128));
+        assert_eq!(ranges[2], (4096 + 8 * 128, 8 * 128));
+        assert_eq!(ranges[3], (4096 + 24 * 128, 8 * 128));
+        assert_eq!(ranges[4], (4096 + 40 * 128, 8 * 128));
+        let width: usize = ranges.iter().map(|(_, c)| c).sum();
+        let local = p.shard(shard).expect("hiperparametry rangi");
+        assert_eq!(width, local.ssm.expect("ssm rangi").conv_dim());
+    }
+
+    #[test]
+    fn bramkowana_projekcja_q_bierze_obie_polowki_glowicy() {
+        let p = qwen35();
+        let shard = TpShard::new(1, 2).expect("ranga 1");
+        let RoleShard::Rows(ranges) = shard.role_shard(&p, WeightRole::AttnQ).expect("plan") else {
+            panic!("q dzieli się po wierszach");
+        };
+        assert_eq!(ranges, vec![(12 * 256 * 2, 12 * 256 * 2)]);
+    }
+
+    #[test]
+    fn nieznana_rola_jest_bledem_a_nie_cicha_replikacja() {
+        let p = qwen35();
+        let shard = TpShard::new(0, 2).expect("ranga");
+        assert!(shard.role_shard(&p, WeightRole::FfnGateInp).is_err());
     }
 }

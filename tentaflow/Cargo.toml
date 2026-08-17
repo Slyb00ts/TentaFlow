@@ -12,6 +12,7 @@ gpu-cuda = ["tentaflow-core/gpu-cuda"]
 vision-cuda = ["tentaflow-core/vision-cuda"]
 gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-rocm = ["tentaflow-core/gpu-rocm"]
+vision-rocm = ["tentaflow-core/vision-rocm"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
 
 [dependencies]

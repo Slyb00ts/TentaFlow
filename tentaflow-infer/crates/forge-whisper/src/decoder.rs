@@ -124,9 +124,25 @@ impl WhisperModel {
                 stream,
             )?;
 
-            k.gemv_f16_bias(&s.dec_ffn, &layer.fc1_w, &s.dec_x, &layer.fc1_b, ffn, d, stream)?;
+            k.gemv_f16_bias(
+                &s.dec_ffn,
+                &layer.fc1_w,
+                &s.dec_x,
+                &layer.fc1_b,
+                ffn,
+                d,
+                stream,
+            )?;
             k.gelu_f16(&s.dec_ffn, &s.dec_ffn, ffn, stream)?;
-            k.gemv_f16_bias(&s.dec_o, &layer.fc2_w, &s.dec_ffn, &layer.fc2_b, d, ffn, stream)?;
+            k.gemv_f16_bias(
+                &s.dec_o,
+                &layer.fc2_w,
+                &s.dec_ffn,
+                &layer.fc2_b,
+                d,
+                ffn,
+                stream,
+            )?;
 
             let ln = if l + 1 < n_layers {
                 &self.weights.dec_layers[l + 1].self_attn_ln
@@ -134,7 +150,15 @@ impl WhisperModel {
                 &self.weights.dec_ln
             };
             k.layernorm_residual_f16(
-                &s.dec_x, &s.dec_h, &s.dec_o, &ln.w, &ln.b, 1, d, crate::LN_EPS, stream,
+                &s.dec_x,
+                &s.dec_h,
+                &s.dec_o,
+                &ln.w,
+                &ln.b,
+                1,
+                d,
+                crate::LN_EPS,
+                stream,
             )?;
         }
 

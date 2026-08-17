@@ -3,7 +3,11 @@
 // Opis: Komponent <tf-table sortable selectable> z <tf-column key="..." label
 //       renderer="text|chip|num" sortable sticky>. Properties .rows (array) +
 //       .columns (computed z dzieci). Emituje "row-click", "row-dblclick",
-//       "sort", "select-all" i "row-expand".
+//       "sort", "select-all", "row-expand" i "page-change".
+//       Paginacja (server-side): atrybuty page-size / total / page (1-based).
+//       Gdy total > page-size, pod tabela renderuje sie pasek stronicowania;
+//       klik prev/next emituje "page-change" {page, pageSize} — host laduje
+//       nowa strone i aktualizuje atrybuty `page` + .rows.
 //       Mobile (<=720px): td otrzymuja data-label dla widoku kart.
 // Przyklad:
 //   const t = document.createElement('tf-table');
@@ -28,7 +32,7 @@ const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
-    return ['sortable', 'selectable', 'variant', 'density'];
+    return ['sortable', 'selectable', 'variant', 'density', 'page-size', 'total', 'page'];
   }
 
   constructor() {
@@ -169,6 +173,13 @@ class TfTable extends HTMLElement {
     wrap.className = 'tf-table-wrap';
     const table = document.createElement('table');
     table.className = 'tf-table';
+    // Handlery byly zbindowane w konstruktorze, ale nigdy nie podlaczone:
+    // sortowanie naglowka, row-click/row-dblclick, rozwijanie wierszy i akcje
+    // wiersza nie reagowaly w ZADNEJ tabeli dashboardu. "change" dodatkowo nie
+    // jest composed, wiec nasluch musi siedziec tutaj, w shadow root.
+    table.addEventListener('click', this._onClick);
+    table.addEventListener('dblclick', this._onDblClick);
+    table.addEventListener('change', this._onChange);
     const thead = document.createElement('thead');
     const tbody = document.createElement('tbody');
     table.appendChild(thead);
@@ -176,14 +187,105 @@ class TfTable extends HTMLElement {
     wrap.appendChild(table);
     this._shadow.appendChild(wrap);
 
-    table.addEventListener('click', this._onClick);
-    table.addEventListener('dblclick', this._onDblClick);
-    table.addEventListener('change', this._onChange);
+    // Pager lives in the shadow root, so controls.css cannot be extended for
+    // it from the outside — a small scoped stylesheet keeps it self-contained.
+    const pagerStyle = document.createElement('style');
+    pagerStyle.textContent = `
+      .tf-table__pager {
+        display: flex;
+        align-items: center;
+        justify-content: flex-end;
+        gap: 8px;
+        padding: 8px 4px 2px;
+        font-size: 11.5px;
+        color: var(--text-3, #8a8f98);
+      }
+      .tf-table__pager[hidden] { display: none; }
+      .tf-table__page-btn {
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+        width: 24px;
+        height: 24px;
+        border: 1px solid var(--border, #333);
+        border-radius: var(--radius-sm, 6px);
+        background: transparent;
+        color: var(--text-2, #b8bcc4);
+        cursor: pointer;
+        font: inherit;
+        line-height: 1;
+      }
+      .tf-table__page-btn:hover:not(:disabled) {
+        border-color: var(--border-hover, #555);
+        color: var(--text, #e6e8ec);
+      }
+      .tf-table__page-btn:disabled { opacity: 0.4; cursor: default; }
+    `;
+    this._shadow.appendChild(pagerStyle);
+
+    const pager = document.createElement('div');
+    pager.className = 'tf-table__pager';
+    pager.hidden = true;
+    const range = document.createElement('span');
+    range.className = 'tf-table__page-range';
+    const prev = document.createElement('button');
+    prev.type = 'button';
+    prev.className = 'tf-table__page-btn';
+    prev.dataset.page = 'prev';
+    prev.setAttribute('aria-label', 'Poprzednia strona');
+    prev.textContent = '‹';
+    const next = document.createElement('button');
+    next.type = 'button';
+    next.className = 'tf-table__page-btn';
+    next.dataset.page = 'next';
+    next.setAttribute('aria-label', 'Nastepna strona');
+    next.textContent = '›';
+    pager.append(range, prev, next);
+    pager.addEventListener('click', (e) => {
+      const btn = e.target.closest('.tf-table__page-btn');
+      if (!btn || btn.disabled) return;
+      const { page, pages } = this._pageState();
+      const target = btn.dataset.page === 'prev' ? page - 1 : page + 1;
+      if (target < 1 || target > pages) return;
+      this.dispatchEvent(new CustomEvent('page-change', {
+        bubbles: true,
+        detail: { page: target, pageSize: this._pageState().pageSize },
+      }));
+    });
+    this._shadow.appendChild(pager);
 
     this._wrap = wrap;
     this._table = table;
     this._thead = thead;
     this._tbody = tbody;
+    this._pager = pager;
+    this._pagerRange = range;
+    this._pagerPrev = prev;
+    this._pagerNext = next;
+  }
+
+  // Reads pagination attributes: page-size (>0 enables the pager), total row
+  // count and the current 1-based page. Rows are provided by the host for the
+  // CURRENT page only — the table never slices `.rows` itself.
+  _pageState() {
+    const pageSize = Math.max(0, parseInt(this.getAttribute('page-size') || '0', 10) || 0);
+    const total = Math.max(0, parseInt(this.getAttribute('total') || '0', 10) || 0);
+    const pages = pageSize > 0 ? Math.max(1, Math.ceil(total / pageSize)) : 1;
+    const page = Math.min(pages, Math.max(1, parseInt(this.getAttribute('page') || '1', 10) || 1));
+    return { pageSize, total, page, pages };
+  }
+
+  _renderPager() {
+    if (!this._pager) return;
+    const { pageSize, total, page, pages } = this._pageState();
+    const active = pageSize > 0 && total > pageSize;
+    this._pager.hidden = !active;
+    if (!active) return;
+    const from = (page - 1) * pageSize + 1;
+    const to = Math.min(page * pageSize, total);
+    this._pagerRange.textContent = `${from}–${to} / ${total}`;
+    this._pagerPrev.disabled = page <= 1;
+    this._pagerNext.disabled = page >= pages;
   }
 
   // Sygnatura kolumn — sluzy do detekcji "kolumny sie nie zmienily" zeby
@@ -344,6 +446,7 @@ class TfTable extends HTMLElement {
   _buildRow(cols, row, idx) {
     const rtr = document.createElement('tr');
     rtr.dataset.idx = String(idx);
+    if (row && row._selected) rtr.classList.add('selected');
     const stickySet = this._stickyColumnIndices(cols);
     this._appendLeadingCells(rtr, row, idx);
     cols.forEach((col, i) => {
@@ -351,7 +454,16 @@ class TfTable extends HTMLElement {
       td.dataset.label = col.label;
       if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
       if (stickySet.has(i)) this._applySticky(td, i);
-      this._writeCell(td, col, row[col.key]);
+      // The select-all box lives in the first header cell, so the per-row box
+      // belongs in the matching first data cell — no extra column.
+      if (i === 0 && this._isMultiSelect()) {
+        const cb = document.createElement('tf-checkbox');
+        cb.className = 'tf-table__row-select';
+        cb.setAttribute('aria-label', 'Zaznacz wiersz');
+        if (row && row._selected) cb.setAttribute('checked', '');
+        td.appendChild(cb);
+      }
+      this._writeCell(td, col, row[col.key], i === 0 && this._isMultiSelect());
       rtr.appendChild(td);
     });
     if (this._rowActions) {
@@ -394,7 +506,13 @@ class TfTable extends HTMLElement {
     else td.replaceChildren();
   }
 
-  _writeCell(td, col, value) {
+  _writeCell(td, col, value, keepExisting = false) {
+    if (keepExisting) {
+      const holder = document.createElement('span');
+      this._writeCell(holder, col, value);
+      td.appendChild(holder);
+      return;
+    }
     if (col.renderer === 'chip') {
       const chip = typeof value === 'object' && value
         ? value
@@ -457,6 +575,7 @@ class TfTable extends HTMLElement {
 
     const rows = this._sortedRows();
     this._renderTbody(cols, rows);
+    this._renderPager();
   }
 
   // Mirror the `variant`/`density` attributes onto the real shadow <table> as
@@ -521,9 +640,9 @@ class TfTable extends HTMLElement {
     // Wiersz ekspansji nie jest wierszem danych — ignoruj.
     if (!tr || tr.classList.contains('tf-table__expansion-row')) return;
     const idx = parseInt(tr.dataset.idx, 10);
-    if (this.hasAttribute('selectable')) {
-      tr.classList.toggle('selected');
-    }
+    // Selection is checkbox-driven; a row click stays a plain open action so a
+    // table can both select rows and drill into them.
+    if (e.target.closest('.tf-table__row-select')) return;
     const row = this._sortedRows()[idx];
     this.dispatchEvent(new CustomEvent('row-click', {
       bubbles: true,
@@ -547,10 +666,29 @@ class TfTable extends HTMLElement {
   }
 
   // Select-all checkbox (tf-checkbox emituje natywny "change" z .checked).
+  // tf-checkbox trzyma swój <input> w LIGHT DOM, wiec e.target to ten input, a
+  // klasa marker siedzi na hoscie — bez wejscia w przodkow warunek nigdy nie
+  // przechodzi i "select-all" nie jest emitowane (akcje zbiorcze byly martwe).
   _onChange(e) {
     const target = e.target;
-    if (!target || !target.classList || !target.classList.contains('tf-table__select-all')) return;
-    const checked = !!target.checked;
+    if (!target || !target.closest) return;
+    const rowBox = target.closest('.tf-table__row-select');
+    if (rowBox) {
+      const tr = rowBox.closest('tbody tr');
+      const idx = tr ? parseInt(tr.dataset.idx, 10) : NaN;
+      if (!Number.isInteger(idx)) return;
+      const checked = typeof target.checked === 'boolean' ? target.checked : !!rowBox.checked;
+      tr.classList.toggle('selected', checked);
+      this.dispatchEvent(new CustomEvent('row-select', {
+        bubbles: true,
+        detail: { row: this._sortedRows()[idx], index: idx, selected: checked },
+      }));
+      return;
+    }
+    const box = target.closest('.tf-table__select-all');
+    if (!box) return;
+    // Host odzwierciedla stan atrybutem; input niesie go wprost.
+    const checked = typeof target.checked === 'boolean' ? target.checked : !!box.checked;
     this.dispatchEvent(new CustomEvent('select-all', {
       bubbles: true,
       detail: { selected: checked },

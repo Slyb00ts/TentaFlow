@@ -9,15 +9,22 @@
 from std.gpu import block_dim, block_idx, thread_idx, global_idx
 from std.gpu.sync import barrier
 from std.gpu.primitives import warp
+from std.gpu.primitives.warp import shuffle_xor
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
+from std.atomic import Atomic
+
+from src.reduce import block_reduce_max, block_reduce_sum
 
 # One block per token stages that token's hidden vector in shared f32; caps the
 # supported hidden size and expert count (every current MoE model fits).
 comptime MOE_MAX_HIDDEN = 8192
 comptime MOE_MAX_EXPERTS = 256
 comptime NEG_BIG: Float32 = -3.0e38
+comptime WARP = 32
+comptime MOE_TOPK_SLOTS = MOE_MAX_EXPERTS // WARP
+"""Ekspertow na linie fali: limit kernela podzielony przez szerokosc fali."""
 
 
 def moe_router_f16(
@@ -25,6 +32,7 @@ def moe_router_f16(
     weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
     x_ptr: UnsafePointer[Float16, MutAnyOrigin],
     w_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    counts_ptr: UnsafePointer[Int32, MutAnyOrigin],
     hidden: Int,
     n_expert: Int,
     top_k: Int,
@@ -35,6 +43,11 @@ def moe_router_f16(
     grid=(n_tokens,1,1), block=256. Writes ids[token, k] (Int32) and the
     softmax routing weights[token, k] (Float32). `norm_topk` renormalizes the
     selected weights to sum 1.
+
+    `counts_ptr[e]` accumulates how often expert `e` was selected. That tally is
+    what drives weight residency: the hot experts belong in VRAM and the cold
+    ones in host memory, and nothing else on the device knows the routing. The
+    add is atomic because a prefill launches one block per token.
     """
     token = Int(block_idx.x)
     tid = Int(thread_idx.x)
@@ -103,6 +116,7 @@ def moe_router_f16(
                     best_i = n
                 n += 1
             ids_ptr[token * top_k + kk] = Int32(best_i)
+            _ = Atomic.fetch_add(counts_ptr + best_i, Int32(1))
             weights_ptr[token * top_k + kk] = best_v
             wsum += best_v
             logits[best_i] = NEG_BIG
@@ -164,10 +178,170 @@ def moe_scale_add_gidx_f16(
 def moe_sigmoid_f16_to_f32(
     out_ptr: UnsafePointer[Float32, MutAnyOrigin],
     in_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
 ):
-    """out[0] = sigmoid(in[0]); the shared-expert gate logit (f16, produced by
-    its gate GEMV) becomes a device-resident f32 scale so moe_scale_add_gidx can
-    fold the shared expert without a per-layer host round-trip. Single thread."""
-    if Int(global_idx.x) == 0:
-        logit = Float32(in_ptr[0])
-        out_ptr[0] = 1.0 / (1.0 + exp(-logit))
+    """out[i] = sigmoid(in[i]) over n shared-expert gate logits.
+
+    The logits (f16, produced by the gate projection) become device-resident
+    f32 scales, so folding the shared expert costs no host round-trip. `n` is
+    the step's token count: one logit per token, and the whole step at once
+    when its projections ran as one matrix."""
+    i = Int(global_idx.x)
+    if i < n:
+        logit = Float32(in_ptr[i])
+        out_ptr[i] = 1.0 / (1.0 + exp(-logit))
+
+
+def moe_combine_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    src_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    slots_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    cols: Int,
+    top_k: Int,
+    init: Int,
+):
+    """out[t] = sum_j weights[t*top_k+j] * src[slots[t*top_k+j]] over cols f16.
+
+    The inverse of the gather that groups a step's selections by expert: once
+    every expert has multiplied its own block of rows, each token's answer is
+    scattered across `top_k` rows of `src` and this brings them back together.
+
+    One block per token, and the sum walks `j` in the order the router chose,
+    which is the order the per-token route accumulated in. It differs from that
+    route in ONE respect and deliberately: the running sum stays f32 across all
+    `top_k` and is rounded to f16 once, where folding expert by expert rounded
+    after each. That is a step TOWARD the f32 reference, not away from it.
+
+    `init` overwrites instead of accumulating. The shared expert folds on top
+    of the routed sum through this same kernel with `top_k = 1` and identity
+    slots: its per-token sigmoid gate IS a routing weight, and giving it a
+    second kernel would mean two places to keep the rounding equal.
+    """
+    t = Int(block_idx.x)
+    base = t * top_k
+    i = Int(thread_idx.x)
+    while i < cols:
+        acc = Float32(0)
+        for j in range(top_k):
+            row = Int(slots_ptr[base + j])
+            acc += weights_ptr[base + j] * Float32(src_ptr[row * cols + i])
+        if init != 0:
+            out_ptr[t * cols + i] = Float16(acc)
+        else:
+            out_ptr[t * cols + i] = Float16(Float32(out_ptr[t * cols + i]) + acc)
+        i += Int(block_dim.x)
+
+
+def moe_topk_f32(
+    ids_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    weights_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    logits_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    counts_ptr: UnsafePointer[Int32, MutAnyOrigin],
+    n_expert: Int,
+    top_k: Int,
+    norm_topk: Int,
+):
+    """Softmax i wybor top-k z GOTOWYCH logitow routera. grid=(tokeny), block=32.
+
+    `moe_router_f16` liczyl iloczyny ekspertow i wybor w jednym bloku na token.
+    Przy generacji token jest JEDEN, wiec cala projekcja routera — dla 256
+    ekspertow i 2048 kanalow milion bajtow wagi — szla przez jeden
+    multiprocesor. Iloczyny sa zwyklym GEMV, wiec liczy je GEMV; tutaj zostaje
+    wylacznie to, co naprawde jest jednym blokiem na token.
+
+    Caly wybor miesci sie w JEDNEJ FALI, i to jest tu jedyna decyzja. Osiem rund
+    po dwiescie piecdziesiat szesc ekspertow na jednym watku to kilka tysiecy
+    iteracji szeregowych — zmierzone 45,7 us na warstwe. Drzewiasta redukcja
+    przez blok 256 watkow zrobila z tego 14,3 us, ale zostawila SZESCDZIESIAT
+    CZTERY bariery na token, ktore przy jednym bloku na calej karcie nie maja
+    czym sie ukryc. Fala trzyma po osiem ekspertow na linie w rejestrach i
+    redukuje przetasowaniem, wiec barier nie ma ani jednej.
+
+    Remisy rozstrzyga NIZSZY INDEKS, tak samo jak wzorzec: to jest czesc
+    porownania, a nie szczegol implementacji.
+    """
+    token = Int(block_idx.x)
+    lane = Int(thread_idx.x)
+    base = token * n_expert
+
+    var v = SIMD[DType.float32, MOE_TOPK_SLOTS](NEG_BIG)
+    comptime for s in range(MOE_TOPK_SLOTS):
+        idx = lane + s * WARP
+        if idx < n_expert:
+            v[s] = logits_ptr[base + idx]
+
+    var local_max = NEG_BIG
+    comptime for s in range(MOE_TOPK_SLOTS):
+        if v[s] > local_max:
+            local_max = v[s]
+    mx = warp.max(local_max)
+
+    comptime for s in range(MOE_TOPK_SLOTS):
+        if lane + s * WARP < n_expert:
+            v[s] = exp(v[s] - mx)
+        else:
+            v[s] = 0.0
+
+    # Mianownik sumuje sie DOKLADNIE w tej kolejnosci, co redukcja przez blok
+    # 256 watkow, ktora tu byla. To nie jest ostroznosc: ten model sklada wejscie
+    # przez czterdziesci osiem warstw rekurencyjnych i wybiera ekspertow
+    # progiem, wiec jeden ulp mianownika przewraca wybor na bliskim remisie, a
+    # ten wybor jest skokiem. Zmierzone: suma szeregowa po slotach dala 1,428%
+    # rozpietosci logitow zamiast 0,967%, a zrownowazone drzewo po slotach
+    # PRZEWROCILO piatke czolowa i wywalilo bramke wzorca.
+    #
+    # Tamta redukcja liczyla najpierw motyla fali nad kazda trzydziestodwojka
+    # ekspertow, a potem motyla nad osmioma czesciami. Slot `s` tej fali trzyma
+    # dokladnie ekspertow `32s..32s+32`, wiec `warp.sum` na slocie odtwarza
+    # pierwszy poziom, a jawne pary drugi.
+    var p = SIMD[DType.float32, MOE_TOPK_SLOTS](0.0)
+    comptime for s in range(MOE_TOPK_SLOTS):
+        p[s] = warp.sum(v[s])
+    inv_denom = 1.0 / (
+        ((p[0] + p[1]) + (p[2] + p[3])) + ((p[4] + p[5]) + (p[6] + p[7]))
+    )
+    comptime for s in range(MOE_TOPK_SLOTS):
+        if lane + s * WARP < n_expert:
+            v[s] = v[s] * inv_denom
+        else:
+            v[s] = NEG_BIG
+
+    var wsum: Float32 = 0.0
+    var kk = 0
+    while kk < top_k:
+        # Kolejnosc slotow linii rosnie po indeksie eksperta, a `>` przepuszcza
+        # tylko ostro wieksza wartosc, wiec remis w linii bierze nizszy indeks
+        # sam z siebie; miedzy liniami trzeba go rozstrzygnac jawnie.
+        var bv = NEG_BIG
+        var bi: Int32 = 0
+        comptime for s in range(MOE_TOPK_SLOTS):
+            if v[s] > bv:
+                bv = v[s]
+                bi = Int32(lane + s * WARP)
+        comptime for d in range(5):
+            span = 1 << d
+            ov = shuffle_xor(bv, UInt32(span))
+            oi = shuffle_xor(bi, UInt32(span))
+            if ov > bv or (ov == bv and oi < bi):
+                bv = ov
+                bi = oi
+
+        if lane == 0:
+            ids_ptr[token * top_k + kk] = bi
+            weights_ptr[token * top_k + kk] = bv
+            _ = Atomic.fetch_add(counts_ptr + Int(bi), Int32(1))
+        wsum += bv
+        comptime for s in range(MOE_TOPK_SLOTS):
+            if lane + s * WARP == Int(bi):
+                v[s] = NEG_BIG
+        kk += 1
+
+    if lane == 0 and norm_topk != 0 and wsum > 0.0:
+        inv = 1.0 / wsum
+        kk = 0
+        while kk < top_k:
+            weights_ptr[token * top_k + kk] = (
+                weights_ptr[token * top_k + kk] * inv
+            )
+            kk += 1

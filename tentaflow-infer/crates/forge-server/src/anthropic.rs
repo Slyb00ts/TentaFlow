@@ -204,8 +204,8 @@ pub async fn messages(
         Err(e) => return e.into_response(),
     };
 
-    let gen = match start_generation(&state, vec![GenInput::Chat(messages, None)], spec, None).await
-    {
+    let input = vec![GenInput::Chat(messages, None, None)];
+    let gen = match start_generation(&state, input, spec, None).await {
         Ok(g) => g,
         Err(e) => return e.into_response(),
     };
@@ -322,9 +322,7 @@ async fn stream_message(
                 EngineEvent::Token { text, .. } => {
                     output_tokens += 1;
                     let step = parser.push(&text);
-                    if !step.text.is_empty()
-                        && emit_text_delta(&tx, &step.text).await.is_err()
-                    {
+                    if !step.text.is_empty() && emit_text_delta(&tx, &step.text).await.is_err() {
                         return;
                     }
                 }
@@ -333,9 +331,7 @@ async fn stream_message(
                     stop = reason;
                     // Flush any parser-held tail before closing the block.
                     let step = parser.finish();
-                    if !step.text.is_empty()
-                        && emit_text_delta(&tx, &step.text).await.is_err()
-                    {
+                    if !step.text.is_empty() && emit_text_delta(&tx, &step.text).await.is_err() {
                         return;
                     }
                     break;

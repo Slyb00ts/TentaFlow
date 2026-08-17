@@ -445,6 +445,10 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "table_structure",
     "graphic_elements",
     "ocr",
+    // VLM page parsing (page image → structured markdown).
+    "document_parse",
+    // Project Studio knowledge search (text query → text with citations).
+    "project_knowledge",
 ];
 
 /// Node types that intentionally do not contribute modalities — they do
@@ -499,6 +503,8 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     "vision_parse_pages",
     "page_detect_pages",
     "ocr_pages",
+    // Per-platform switch: forwards the payload unchanged to the target_os port.
+    "platform_switch",
 ];
 
 /// Best-effort capability inference from a stored flow graph. Walks
@@ -556,7 +562,9 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
             // table_structure / ocr emitują tekst; page_detect / graphic_elements
             // zwracają JSON regionów (brak medialnego outputu — deklarujemy tylko
             // ograniczenie wejścia Image).
-            "vision_parse" | "table_structure" | "ocr" => {
+            // document_parse: VLM page-image → structured markdown, same
+            // shape as the other page-parsing nodes.
+            "vision_parse" | "table_structure" | "ocr" | "document_parse" => {
                 inputs.insert(InputModality::Image);
                 has_text_output = true;
             }
@@ -576,7 +584,8 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
                 inputs.insert(InputModality::Text);
                 outputs.insert(OutputModality::Embedding);
             }
-            "llm" | "chat" | "memory" | "conversation_history" => {
+            // project_knowledge: text query in, text passages out.
+            "llm" | "chat" | "memory" | "conversation_history" | "project_knowledge" => {
                 // Default chat-like output shape.
                 has_text_output = true;
             }
@@ -927,6 +936,8 @@ mod tests {
                 last_deploy_id: String::new(),
                 deployment_progress_pct: 0,
                 progress_message: None,
+                usage_json: None,
+                usage_updated_at: None,
                 models: vec![ServiceModelEntry {
                     // Same name as the seeded alias above.
                     model_name: "test-alias".into(),
@@ -1006,6 +1017,8 @@ mod tests {
                 last_deploy_id: String::new(),
                 deployment_progress_pct: 0,
                 progress_message: None,
+                usage_json: None,
+                usage_updated_at: None,
                 models: vec![ServiceModelEntry {
                     model_name: "whisper-base".into(),
                     display_name: None,
@@ -1070,6 +1083,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 0,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![ServiceModelEntry {
                 model_name: "shared".into(),
                 display_name: None,
@@ -1232,6 +1247,8 @@ mod tests {
             last_deploy_id: String::new(),
             deployment_progress_pct: 100,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![ServiceModelEntry {
                 model_name: model_name.into(),
                 display_name: None,

@@ -5,25 +5,39 @@
 // bounds-checked with checked arithmetic and parse failures surface as
 // `ForgeError::Format` — never panics.
 
+pub mod affine;
 pub mod arch;
+pub mod checkpoint;
 pub mod deltanet;
 pub mod dequant;
 pub mod gguf;
 pub mod hf_config;
 pub mod iq_tables;
+pub mod mlx;
+pub mod mlx_source;
+pub mod mxfp4;
 pub mod nvfp4;
 pub mod safetensors;
+pub mod source;
 pub mod speculation_manifest;
 pub mod w4a8;
 
 pub use arch::{
-    ArchSpec, Hyperparams, LayerKind, ModelDescriptor, MoeParams, MtpDescriptor, MtpWeightRole,
-    PoolingType, SsmParams, WeightRole,
+    AltAttnParams, ArchSpec, BlockMatrix, FfnActivation, Hyperparams, LayerKind, ModelDescriptor,
+    MoeParams, MtpDescriptor, MtpWeightRole, PoolingType, RoleShard, SsmParams, TpShard,
+    WeightRole,
 };
 pub use dequant::dequantize_to_f32;
 pub use gguf::{Gguf, GgufTensor, MetaValue};
 pub use hf_config::HfConfig;
-pub use nvfp4::{NvFp4Scheme, NvFp4TensorNames};
+pub use mlx::{
+    dequantize_affine, map_checkpoint, repack_affine_to_q4_1, split_component, MlxAffineTensor,
+    MlxComponent, MlxLayout, MlxMode, MlxParams, MlxQuantConfig, Q4_1_BLOCK_BYTES,
+    Q4_1_BLOCK_ELEMS,
+};
+pub use nvfp4::{
+    nvfp4_ct_s0_from_e4m3, nvfp4_ct_s0_to_f32, NvFp4Scheme, NvFp4TensorNames, NVFP4_CT_S0_NAN,
+};
 pub use safetensors::{SafeTensors, ShardedSafeTensors, StTensor};
 pub use speculation_manifest::{
     ArtifactRole, ArtifactSpec, CompositionMode, ConfidenceCalibration, ConfidenceMethod,

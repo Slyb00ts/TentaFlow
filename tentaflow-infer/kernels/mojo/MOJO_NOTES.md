@@ -75,6 +75,44 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
   (ISETP/BSSY per load) starve the tensor pipe; clamp out-of-range
   tokens/rows instead of branching and zero-fill only the W k-tail.
 
+## Matrix units on RDNA3 / gfx1100 (verified on RX 7900 XT)
+
+- **WMMA is reachable straight from Mojo** — no HIP, no `inlined_assembly`:
+  `llvm_intrinsic["llvm.amdgcn.wmma.i32.16x16x16.iu8.v8i32.v4i32", ...]`
+  (`i1 signA, <4 x i32> a, i1 signB, <4 x i32> b, <8 x i32> c, i1 clamp`) and
+  `llvm.amdgcn.wmma.f32.16x16x16.f16.v8f32.v16f16`. Wrapped in `src/arch_wmma.mojo`.
+- **Wave32 fragment layout** (probed exhaustively over all 256 output positions,
+  `bench-amd/bench_wmma_gfx11.mojo` guards it):
+  - A: lane L carries the WHOLE row `m = L % 16`, 16 bytes of k. Lanes 16-31
+    duplicate rows 0-15 (the instruction needs 2x redundancy in wave32).
+  - B: lane L carries the whole column `n = L % 16`, 16 bytes of k.
+  - C/D: element `(m, n)` lives in lane `16*(m % 2) + n` at index `m // 2`.
+  Because a lane wants 16 CONSECUTIVE bytes of its own row, A and B can be read
+  straight from global memory when the source is row-major — no LDS staging.
+- **Measured ceilings, 7900 XT vs 6900 XT** — RDNA3 demoted the packed-dot
+  instructions in favour of WMMA, so the newer card is SLOWER on the old path:
+
+  | primitive | 6900 XT (gfx1030) | 7900 XT (gfx1100) |
+  |---|--:|--:|
+  | `v_dot4_i32_i8` int8 | **97 TOPS** | **43 TOPS** |
+  | `v_dot2_f32_f16` f16 | 48 TFLOPS | 31 TFLOPS |
+  | WMMA int8 16x16x16 | brak jednostki | **98 TOPS** |
+  | WMMA f16 16x16x16 | brak jednostki | **102 TFLOPS** |
+  | DRAM read | 221 GB/s | 674 GB/s |
+
+- **TRAP — `v_dot4_i32_i8` silently computes UNSIGNED on gfx11.** The assembler
+  accepts the RDNA2 mnemonic, executes it as `v_dot4_i32_iu8` with `neg_lo`
+  cleared, and returns garbage for any negative byte: measured on the card,
+  `(-1,-2,-3,-4)·(4,3,2,1)` gave **2540 instead of -20**. Nothing warns. The
+  signed form is `v_dot4_i32_iu8 ... neg_lo:[1,1]` (see `src/arch_dot.mojo`);
+  `__builtin_amdgcn_sdot4` is NOT available on gfx11 (`needs target feature
+  dot1-insts`). Every int8 microbenchmark must include a NEGATIVE case — a
+  throughput-only benchmark passed happily while the instruction was wrong.
+- **`v_dot2_f32_f16` is 1 ULP inexact on gfx11** where RDNA2 is exact
+  (`(-2,0.5)·(8,-16)` → -24.0000019 instead of -24). `v_fma_mix_f32` gives the
+  exact result but costs two instructions. Reproduced in plain HIP, so it is the
+  hardware, not Mojo.
+
 ## Tensor-core flash-attention prefill IS competitive in Mojo (unlike int8-GEMM)
 - **The FA counter-example to the int8-GEMM codegen wall.** `attn_prefill_fa_mma`
   (`src/prefill.mojo`, `FORGE_ATTN=fa_mojo`) is a straight Mojo port of the CUDA
@@ -355,6 +393,44 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
     below 2 CTAs/SM, the documented 512-prefill occupancy tripwire). **Do not retry
     deep K-unroll for perf** — Mojo emits it faithfully, it just doesn't pay.
 
+## FP8 prefill GEMM on GB10: a hand-written multistage kernel LOSES to Modular
+- **Measured 2026-08-03, sm_121a. Do not retry the "more warps" lever.** The
+  shipped prefill GEMM is Modular's `multistage_gemm_kernel` at block 128x256x64
+  with a 64x64 warp tile: 8 warps, 224 regs, 98.3 KB smem, 1 CTA/SM = 16.67 %
+  occupancy, and it plateaus at ~150 TFLOPS against a **251 TFLOPS** e4m3 mma
+  ceiling (`bench_fp8_ceiling.mojo`, independent accumulators). The obvious
+  hypothesis — shrink the warp tile to 32x64 so the accumulator drops 128 -> 64
+  regs and 16 warps fit — was implemented in full (cp.async multistage, 3 stages,
+  ldmatrix fragments, fused scale epilogue, LDY column slices) and **it is
+  slower, not faster**:
+
+  | shape | warp tile | warps | ours | Modular |
+  |---|---|--:|--:|--:|
+  | q/o (4096,4096) | 64x64 | 8 | 306.0 us | **258.0 us** |
+  | q/o (4096,4096) | 32x64 | 16 | 327.5 us | **244.7 us** |
+  | down (4096,11264) | 64x64 | 8 | 997.0 us | **865.6 us** |
+  | down (4096,11264) | 32x64 | 16 | 1026.8 us | **878.6 us** |
+
+  Output was **bit-identical** to Modular's on every case, so this is a pure
+  perf result, not a correctness artifact.
+- **Why more warps loses, quantitatively.** Per k-step the block issues
+  `BM*BN/(16*WN)` A-ldmatrix and `BM*BN/(8*WM)` B-ldmatrix instructions, so A
+  traffic scales as 1/WN and B traffic as 1/WM. Halving WM from 64 to 32 leaves
+  A alone and **doubles** the shared-memory reads of B. The kernel is smem-
+  bandwidth bound before it is occupancy bound, which is exactly why Modular
+  rejects any warp tile other than 64x64. Registers were never the binding
+  constraint. (The opposite result on the int8 MMQ path — 16 warps x 32 acc
+  beating 8 warps x 64 — does NOT carry over: that kernel spends its smem
+  budget on unpacking, not on ldmatrix.)
+- **32x32 (32 warps, 1024 threads) does not launch at all** —
+  `CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`; 1024 threads x 64 acc regs is the whole
+  65536-register file before operands.
+- Even at the IDENTICAL 64x64 tiling our kernel trails by 15-19 %, i.e. the gap
+  is implementation quality (smem swizzle vs our padding, paired B ldmatrix.x4,
+  pipeline scheduling), the same ptxas-scheduling advantage `CODEGEN_PROOF.md`
+  documents for int8. Closing it is a multi-day rewrite against a known wall.
+  **Both files were reverted; the committed Modular path is retained.**
+
 ## FP8 (e4m3) — verified on sm_89
 - `DType.float8_e4m3fn` works end-to-end: buffers, kernel pointers, and
   `Scalar[DType.float8_e4m3fn](f32)` casts (RN, satfinite ±448, denormals and
@@ -384,3 +460,224 @@ Published tutorials mostly show pre-1.0 syntax — trust these notes over old do
 ## Files / OS
 - `import std.os as os` → `os.makedirs(String(path), exist_ok=True)`, `os.remove(...)`.
 - `from std.pathlib import Path` → `p.read_text()`, `p.write_text(s)`, `/` join.
+
+## Natywne NVFP4 `mma` na sm_121a — uklad operandow skal
+
+Sprzet liczy NVFP4 wprost, bez rekwantyzacji do MXFP4:
+
+```
+mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3
+  {d0..d3}, {a0..a3}, {b0,b1}, {c0..c3}, {sa}, {bid_a, tid_a}, {sb}, {bid_b, tid_b};
+```
+
+Typ skali nazywa sie **`ue4m3`**, nie `e4m3` — ta druga nazwa jest odrzucana
+przez `ptxas` i wlasnie ona kazala nam wczesniej sadzic, ze natywne NVFP4 jest
+niedostepne. `kind::mxf4nvf4` oraz jawne `scale_vec::4X` sa obowiazkowe.
+
+Kodowanie: e2m1 1.0 = `0x2` (bajt dwoch jedynek = `0x22`), ue4m3 1.0 = `0x38`,
+ue4m3 2.0 = `0x40`, ue8m0 1.0 = `0x7F`.
+
+Operand skali to rejestr `.b32` W KAZDYM watku, ale licza sie tylko niektore.
+Zmapowane empirycznie przez `probe_nvfp4_mma_layout.mojo` (A i B same jedynki,
+jedna skala podniesiona do 2.0, obserwacja ktore wyjscie drgnelo):
+
+| co | gdzie |
+|---|---|
+| skala wiersza `r` macierzy A (r = 0..7) | pas `4r`, przy `tid_a` parzystym |
+| skala wiersza `r+8` macierzy A | pas `4r+1` |
+| skala kolumny `n` macierzy B (n = 0..7) | pas `4n` |
+| blok K `j` (k = 16j..16j+15) | bajt `j` rejestru, po obu stronach |
+
+`tid` NIEPARZYSTY przesuwa pare pasow w kwadzie: licza wtedy `4r+2` i `4r+3`
+(odwzorowane tak samo). `bid` przy `scale_vec::4X` **nie ma znaczenia** — caly
+rejestr jest zuzywany; sprawdzone dla wszystkich czterech wartosci.
+
+Kontrola poprawnosci: A i B same jedynki, wszystkie skale 1.0, `m16n8k64` daje
+64.0 w kazdym elemencie wyjscia (4 bloki po 16). Podniesienie jednej skali A do
+2.0 daje 80.0 w calym wierszu — po 16 na blok.
+
+### Uklad fragmentow danych
+
+Watek `t` ma grupe `g = t/4` i pozycje `q = t%4`; kazdy rejestr `.b32` niesie
+osiem wartosci czterobitowych, mlodsza polbajtowka to mniejsze `k`:
+
+| rejestr | co niesie |
+|---|---|
+| `a0` | wiersz `g`, `k = 8q .. 8q+7` |
+| `a1` | wiersz `g+8`, `k = 8q .. 8q+7` |
+| `a2` | wiersz `g`, `k = 32 + 8q .. 32+8q+7` |
+| `a3` | wiersz `g+8`, `k = 32 + 8q .. 32+8q+7` |
+| `b0` | kolumna `g`, `k = 8q .. 8q+7` |
+| `b1` | kolumna `g`, `k = 32 + 8q .. 32+8q+7` |
+
+Akumulator jak w kazdym `m16n8`: element `i` watku `t` to
+`wiersz = t/4 + 8*(i/2)`, `kolumna = 2*(t%4) + i%2`.
+
+`probe_nvfp4_mma_golden.mojo` liczy pelny kafel `16x8x64` z losowymi wartosciami
+i skalami, i porownuje z referencja CPU **dokladnie** — wartosci sa dobrane tak,
+zeby kazdy iloczyn i kazda suma byly w f32 scisle reprezentowalne, wiec test
+wykrywa zly uklad, a nie zaokraglenie. Przechodzi na wszystkich 128 elementach.
+
+To komplet potrzebny do napisania GEMM-u: wartosci, skale i akumulator.
+
+### Warstwa kafelkowania nad tym rdzeniem (GB10, sm_121a, 2026-08-04)
+
+`bench_nvfp4_native_gemm.mojo` trzyma dwa jadra liczace BITOWO to samo: naiwne
+(jeden warp na kafel 16x64, prosto z pamieci globalnej) i kafelkowe. Kolejnosc
+sumowania po K jest w obu identyczna, wiec kazdy krok optymalizacji sprawdza sie
+testem na ROWNOSC CO DO BITU wzgledem CPU, nie na tolerancje.
+
+Sufity tej maszyny (`bench_fp8_ceiling.mojo`): **497 TFLOPS** dla samej
+instrukcji `mxf4nvf4/ue4m3` (mierzone osobno od `mxf4/ue8m0` — wychodzi tyle
+samo) i **222 GB/s** odczytu strumieniowego. 48 SM, 24 MiB L2, LPDDR5X 256 bit.
+
+Co dalo wynik, w kolejnosci wagi:
+
+| krok | q/o | gate/up | down |
+|---|--:|--:|--:|
+| naiwny | 1104 us | 3413 us | 3233 us |
+| + kafel BM x BN, `cp.async`, smem | 251 | 1699 | 583 |
+| + przenumerowanie siatki pod L2 | 236 | 635 | 497 |
+| + wyjscie f16 zamiast f32 | 213 | 558 | 505 |
+| + `ldmatrix` na fragmenty | **197** | **500** | **484** |
+
+- **Przenumerowanie siatki to najwiekszy pojedynczy skok** (gate/up 2,7x).
+  Siatka jest 1-D i liczona grupami po GM kafli M, wiec bloki lecace obok siebie
+  maja wspolne `n0` i dziela plat B w L2. Przy naturalnej kolejnosci (n
+  najszybsze) fala bloków przemiata cale B dla jednego m i czyta je z DRAM-u od
+  nowa dla kazdego kolejnego.
+- **Dtype wyjscia to nie kosmetyka.** Przy M=1024 wagi NVFP4 to 0,5625 B na
+  element, a wyjscie f32 az 4 B: dla gate/up wyjscie (46 MB) wazylo WIECEJ niz
+  wagi (26 MB). Stad `OUT` jest parametrem jadra — sprawdzenie idzie na f32
+  (mocniejsze porownanie), a mierzona sciezka pisze f16.
+- **`LDA = 8*KC + 4`** u32 rozklada 32 pasy fragmentu na 32 rozne banki; bez tego
+  odczyt A zderza sie wielodroznie. Ten sam odstep jest bezkonfliktowy dla
+  `ldmatrix` (osiem wierszy po 16 B na plytke).
+- **Fragment `mma` k64 to dokladnie to, co oddaje `ldmatrix`**: `ld_matrix[8]`
+  (x4) na ukladzie wierszowym daje `a0..a3` bez zadnego przepakowania, a
+  `ld_matrix[4]` (x2) daje `b0,b1`. Adresy podaje sie w innym rozbiciu pasa
+  (osiem wierszy na plytke) niz to, w ktorym instrukcja oddaje dane. Warte 2-4%.
+- Statyczne `stack_allocation` ma sufit 48 KiB, wiec potok glebszy niz 2 etapy
+  wymaga `external_memory` + `shared_mem_bytes` (opt-in na tej maszynie: 99 KiB).
+
+Czego NIE robic (zmierzone, bez zysku):
+
+- **Potok glebszy niz 3 etapy szkodzi.** 4 etapy przy 128x256x64 to 78 KiB smem,
+  1 CTA/SM i **-35%** (q/o 197 -> 268 us). 2 i 3 etapy sa w granicach szumu.
+- **Parowanie B w `ldmatrix.x4`** (jeden `.x4` na dwa podkafle N zamiast dwoch
+  `.x2`) — polowa ladowan B, zmiana **w granicach szumu** (197,0 vs 196,7 us;
+  ksztalt L2-rezydentny 150,5 vs 151,1). Wycofane: zlozonosc bez zysku.
+  To ten sam wniosek, co w sekcji int8/FP8 wyzej — liczba instrukcji w zrodle
+  nie jest tu dzwignia.
+- **Nie ma jednego najlepszego kafla.** q/o i gate/up wola 128x128x128 na 4
+  warpach, down wola 128x256x64 na 8 warpach. Roznica ~8%.
+
+### Podwojne buforowanie fragmentow w rejestrach i JEDNA bariera na etap
+
+**Wczesniejszy wniosek w tym pliku — ze reszta luki to sciana codegenu Mojo — byl
+BLEDNY i zostal wycofany.** Powstal z porownania do wlasnego zlego kodu. Lektura
+`src/modular_i8/multistage_i8.mojo` (wendorowana kopia jadra Modulara) pokazala
+trzy konkretne bledy w naszej petli:
+
+1. **Opoznienie `ldmatrix` stalo odsloniete.** Nasza petla to bylo
+   `bariera -> ldmatrix -> mma -> bariera`, czyli 12 ladowan i dopiero potem 32
+   `mma`, z pelna zaleznoscia miedzy nimi. Przy 1 CTA na SM nie ma innych warpow,
+   ktore by to zaslonily. Modular trzyma fragmenty w DWOCH kompletach rejestrow
+   (`a_reg_tiles[next]`, `num_reg_tiles = 2 * k_group_size`) i wystawia
+   `ldmatrix` kroku k+1 PRZED `mma` kroku k.
+2. **Dwie bariery na etap zamiast jednej.** Wystawialismy `cp.async` PRZED bariera
+   etapu, wiec zapis scigal sie z odczytami poprzedniego etapu i trzeba bylo
+   bariery zamykajacej. Modular wystawia prefetch W SRODKU petli po k, juz za
+   bariera — wtedy bufor `(s-1) % NS` jest z definicji wolny i wystarczy JEDNA.
+3. Przy okazji: `wait_group` liczy sie inaczej w tej strukturze — `NS-2`, nie
+   `NS-1`, i przy `NS=2` nie ma juz zadnego nakladania, wiec **NS=3 jest teraz
+   ustawieniem domyslnym**, a nie NS=2.
+
+PULAPKA, ktora to wprowadzilo (zlapana testem na rownosc co do bitu): skale nie
+moga byc czytane z pamieci wspoldzielonej dopiero przy `mma`. Bariera etapu
+ogradza tylko to, co przed nia, a `cp.async` nadpisujacy bufor `(s-1) % NS`
+rusza zaraz po niej — odczyt skal za bariera scigal sie z tym zapisem
+(512 blednych elementow na 65536). Skale czyta sie na POCZATKU kroku K, przed
+awansem potoku. Trzymanie ich w drugim komplecie rejestrow tez dziala, ale
+kosztuje `2*(MT+NT)` rejestrow i wpycha jadro w spille przy 255.
+
+Wynik (128x256x64, 8 warpow, potok 3 etapy, wyjscie f16):
+
+| | q/o | gate/up | down | 2048^3 w L2 |
+|---|--:|--:|--:|--:|
+| przed | 196,6 us | 500,7 us | 484,2 us | 118,8 us |
+| po | **183,6** | **506,7** | **462,9** | **108,6** |
+
+`ptxas`: 230-254 rejestrow, zero spilli. Ksztalt L2-rezydentny poprawil sie o 9%,
+czyli poprawa jest w samej petli, nie w ruchu pamieci.
+
+### Permutacja kawalkow zamiast wypelnienia
+
+Wypelnienie `LDA = 8*KC + 4` bylo bezkonfliktowe dla ODCZYTU `ldmatrix`, ale nie
+dla ZAPISU `cp.async`, i zadne wypelnienie tego nie naprawia: przy KC=1 wiersz
+ma 32 B, wiec osiem wierszy to 256 B — dwa razy wiecej niz 128-bajtowy zasieg
+bankow. Rozwiazaniem jest permutacja gniazd (`_swz`), nie odstep.
+
+Wbrew temu, co bylo tu napisane wczesniej, **nie wymaga to KC=4**. Wiersz ma
+NCH = 2*KC kawalkow po 16 B, wiec 128-bajtowy blok mieszci BRB = 8/NCH kolejnych
+WIERSZY, a gniazdo przesuwa sie o numer bloku:
+
+    slot(r, ch) = ((r % BRB) * NCH + ch + (r // BRB) % NCH) % 8
+    offset_u32  = (r // BRB) * 32 + 4 * slot
+
+Sprawdzone wyczerpujaco dla KC=1,2,4 po OBU stronach (osiem wierszy `ldmatrix`
+i osiem pasow `cp.async` trafiaja w 32 rozne banki).
+
+PULAPKA: sam wzor to za malo. `% 8` w petli sprawia, ze adres przestaje byc
+"wskaznik + stala", ptxas rozbija go na osobne rejestry i jadro wchodzi w spille
+przy 255 — wynik byl wtedy o 10% GORSZY niz z wypelnieniem. Trzeba wyliczyc
+JEDEN wskaznik na krok K i na pas przed petla (`a_ptr[c]`, `b_ptr[c]`); wtedy w
+petli zostaje sam skok o blok i spille znikaja.
+
+Zysk: 1-2% czasu i **jedna trzecia mniej pamieci wspoldzielonej** (8 zamiast 12
+u32 na wiersz), dzieki czemu potok 3 etapow miesci sie w 40 KiB zamiast 59.
+
+### Stan i co zmierzono o reszcie luki
+
+128x256x64, 8 warpow, potok 3 etapy, wyjscie f16, GB10:
+
+| | q/o | gate/up | down |
+|---|--:|--:|--:|
+| czas | 182,4 us | 489,2 us | 453,9 us |
+| TFLOPS | 188 | 193 | 208 |
+| roofline ksztaltu | 50% | 47% | 42% |
+| sufit instrukcji (497) | 38% | 39% | 42% |
+
+Trzy pomiary, ktore ZAMYKAJA hipotezy, zamiast je mnozyc:
+
+- **Liczba akumulatorow nie jest wina.** `bench_fp8_ceiling` z ILP=16 i ILP=32
+  (czyli 128 rejestrow akumulatora, tyle co nasz podkafel 64x64) trzyma
+  494-499 TFLOPS. Sufit nie spada przy naszym obciazeniu rejestrow.
+- **Skale kosztuja 14% na ksztaltach dlugich po K i ZERO w petli.** Podmiana
+  odczytu skal na stala (wynik bledny, sam pomiar): `down` 454 -> 390 us, ale
+  ksztalt L2-rezydentny bez zmian (109,2 vs 108,7). Czyli placi sie za RUCH skal
+  z DRAM, nie za ich odczyt z pamieci wspoldzielonej — a to jest wpisane w
+  format (1/16 bajta na element, +12,5% ruchu).
+- **SASS jest zdrowy**: 64 OMMA na cialo petli, akumulatory niezalezne, flagi
+  `.reuse`, zero kopii akumulatora przy `mma`, zero spilli (248 rejestrow).
+
+Czego NIE robic:
+
+- **16 warpow nie startuje.** 512 watkow x ~135 rejestrow > 65536
+  (`CUDA_ERROR_LAUNCH_OUT_OF_RESOURCES`), tak samo jak udokumentowane wyzej dla
+  FP8. Podkafel 64x64 na 8 warpach zostaje.
+- **Potok glebszy niz 4 etapy szkodzi** (NS=6: -38%), mimo ze po permutacji
+  miesci sie w pamieci.
+- Parowanie B w `ldmatrix.x4` — w granicach szumu (patrz wyzej).
+
+Dla porownania: wlasne jadro FP8 Modulara na tej samej maszynie plateauje na
+~150 TFLOPS przy suficie 251, czyli 60%. My mamy 208 TFLOPS przy suficie 497,
+czyli 42%. W liczbach bezwzglednych NVFP4 daje wiec 1,39x wzgledem FP8, a nie
+2x, ktore obiecuje sama instrukcja — i to ta roznica miedzy 42% a 60% jest tym,
+co zostalo do wziecia.
+
+Nastepna konkretna dzwignia (zmierzona, niezrobiona): skale ida osobnym
+`cp.async` po **4 bajty na wiersz na etap** — to jedna trzecia wszystkich kopii
+przy jednej dziewiatej bajtow. Skale kolejnych blokow K sa w pamieci ciagle,
+wiec da sie brac cztery etapy naraz jednym 16-bajtowym `cp.async`, kosztem
+osobnego, glebszego pierscienia na skale.

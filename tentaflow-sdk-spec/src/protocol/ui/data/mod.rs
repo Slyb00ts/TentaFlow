@@ -28,7 +28,7 @@ pub use labels::{Badge, Chip, Tag};
 pub use lists::{BulletList, Timeline};
 pub use markdown::{DataDefinitionList, JsonViewer, Markdown};
 pub use progress::{Diff, ProgressBar, RatingDisplay};
-pub use specialised::{CalendarMonth, Image, LiveRegionComponent, VisuallyHidden};
+pub use specialised::{CalendarMonth, Image, LiveRegionComponent, VisuallyHidden, ZoneEditor};
 pub use stat::{KeyValue, Stat, StatCard};
 pub use tables::{EmptyCell, List, Table, Tree};
 pub use text::{CodeBlock, Heading, MonoBlock, Paragraph, RichText, Text};
@@ -865,6 +865,22 @@ mod tests {
         };
         let c = cm.clone().into_component("cm").unwrap();
         assert_eq!(CalendarMonth::try_from_component(&c).unwrap(), cm);
+    }
+
+    /// The zone editor carries what the operator drew straight to the DB shape,
+    /// so its encode/decode must be lossless — a silent field drop here would
+    /// mean saved zones that filter nothing (or filter everything).
+    #[test]
+    fn zone_editor_roundtrip() {
+        let ze = ZoneEditor {
+            image_ref: lit("snap_ref"),
+            zones_json: lit("[[[0.36,0.8],[0.52,0.02],[0.99,0.02],[0.99,0.8]]]"),
+        };
+        rt(
+            ze,
+            |m| m.into_component("ze").unwrap(),
+            ZoneEditor::try_from_component,
+        );
     }
 
     #[test]

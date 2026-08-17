@@ -90,3 +90,38 @@ TinyLlama F16 22/22); outputs are bit-identical to the unfused path.
 
 Before/after measured on the same tree (same GEMV kernels), fusion isolated
 via stash. Prefill moves within noise (11.2k→11.5k / 259→264 tok/s).
+
+## Aktualizacja 2026-07-22: hybrydowy prefill B2 T32
+
+Model `protoLabsAI/ThinkingCap-Qwen3.6-27B-MTP-GGUF`, wariant NVFP4, RTX 4090.
+Każda próba obejmuje dwa requesty, pełne porównanie ID i sampling GPU. Pomiar
+Auto pozostawia `FORGE_HYBRID_PREFILL_BATCH` bez wartości, a OFF używa `0`;
+osobny smoke potwierdza równoważne pełne ID i aktywację B2 dla wartości `1`.
+Zakres wykonawczy jest obecnie ograniczony do NVIDIA warp32 oraz dokładnie
+`B=2`, `T=32`. To historyczne A/B mierzyło C1 z wewnętrznym T32. Po zmianie
+Auto C1 na T128 dla zweryfikowanego qwen35 NVFP4 poniższy wiersz OFF nie jest
+wynikiem aktualnego domyślnego C1; odtworzenie wymaga
+`FORGE_HYBRID_PREFILL_CHUNK=32`.
+
+| Prompt | Tryb | Prefill tok/s, mediana | TTFT, mediana | E2E, mediana |
+|---|---|---:|---:|---:|
+| raw128 | Auto | **309,7** | **826,69 ms** | **1119,60 ms** |
+| raw128 | OFF | 248,6 | 1029,87 ms | 1322,60 ms |
+| raw512 | ON | **320,2** | **3198,02 ms** | **3505,75 ms** |
+| raw512 | OFF | 251,4 | około 4073 ms | około 4380 ms |
+
+Pięć wyników raw512 ON to 320,5; 320,2; 319,9; 320,0; 320,2 tok/s. Każda
+próba wykonała dokładnie 16 kroków B2 i obsłużyła 1024 tokeny wejściowe. Pięć
+wyników raw128 Auto to 309,6; 309,7; 309,7; 309,8; 309,3 tok/s; OFF to 248,5;
+248,5; 248,7; 248,6; 248,6 tok/s.
+
+Stały scratch wynosi 450 692 688 B (429,81 MiB). Profil dwóch requestów po
+osiem tokenów zawiera 18 150 launchy, osiem synchronizacji i osiem transferów
+D2H po 8 B, bez kopiowania logitów słownika. Catch-up MTP zachowuje atomową
+transakcję pary, lecz nadal wykonuje dwa seryjne przebiegi macierzowe lane po
+lane. Jest to główny pozostały koszt tej części ścieżki.
+
+Źródła kerneli są zapisane w Mojo z myślą o portowaniu, ale pomiary i testy
+wykonawcze dotyczą wyłącznie NVIDIA warp32. AMD i Metal nie są obecnie
+zweryfikowanymi backendami tej optymalizacji. Surowe logi i raporty `nsys`
+pozostają lokalnie w `/tmp`; nie są częścią repozytorium.

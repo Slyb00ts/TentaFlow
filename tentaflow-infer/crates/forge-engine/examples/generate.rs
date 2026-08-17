@@ -8,8 +8,8 @@ use std::sync::Arc;
 use forge_engine::generate::{generate, GenerateRequest, StreamEvent};
 use forge_engine::model::{Model, ModelConfig};
 use forge_engine::sample::SamplingParams;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_tokenize::Tokenizer;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_else(|| "The capital of France is".into());
     let max_tokens: usize = args.next().map(|s| s.parse().unwrap()).unwrap_or(48);
 
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 14 << 30,
@@ -38,7 +38,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         (model, tokenizer)
     } else {
         let gguf = forge_formats::Gguf::open(&path)?;
-        let vocab = forge_engine::gguf_vocab::gguf_vocab(&gguf)?;
+        let vocab = forge_tokenize::gguf_vocab(&gguf)?;
         drop(gguf);
         let tokenizer = Tokenizer::from_gguf_vocab(&vocab)?;
         let model = Model::load_gguf(dev, &path, ModelConfig::default())?;

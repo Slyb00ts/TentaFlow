@@ -4600,6 +4600,128 @@ mod tests {
         });
     }
 
+    /// CR-001 seed-guard: a flow locally marked `is_system=1` is seed-owned —
+    /// EVERY remote write (Insert/Update/Delete) must be rejected, including
+    /// an Update forging is_system=true (the seed never captures, so no such
+    /// op is legitimate). The wire is_system flag is coerced to 0 on Insert:
+    /// a new flow claiming is_system=true lands as a regular, deletable flow.
+    #[test]
+    fn core_materializer_guards_local_system_flow() {
+        with_tmp_home(|| {
+            let source = make_runtime(25);
+            let receiver = make_runtime(26);
+            const SYS_ID: &str = "sys-flow-1";
+            {
+                let conn = receiver.runtime.db.write().expect("db lock");
+                conn.execute(
+                    "INSERT INTO flows (id, name, flow_json, status, is_system) \
+                     VALUES (?1, 'System Flow', '{\"nodes\":[]}', 'active', 1)",
+                    rusqlite::params![SYS_ID],
+                )
+                .expect("seed system flow");
+            }
+            let hlc_at = |offset: i64| HybridLogicalTimestamp {
+                wall_time_ms: now_ms() + offset,
+                logical: 0,
+                node_id: "test-node".to_string(),
+            };
+            let record_and_apply = |resource_id: &str,
+                                    action: SqlWriteAction,
+                                    fields: BTreeMap<String, FieldValue>,
+                                    offset: i64| {
+                let capture = crate::sync::core_capture::CoreWriteCapture::new(
+                    crate::sync::core_registry::CoreSyncResourceKind::Flow,
+                    "org-default",
+                    resource_id,
+                    action,
+                    fields,
+                    None,
+                    hlc_at(offset),
+                    test_epoch(),
+                );
+                let result = source
+                    .runtime
+                    .record_core_capture(capture)
+                    .expect("record core capture");
+                let operation = source
+                    .runtime
+                    .ledger
+                    .get_operation(result.op_id)
+                    .expect("operation");
+                crate::sync::core_materializer::apply_core_operation(
+                    &receiver.runtime.db,
+                    &receiver.runtime.settings_cipher,
+                    &operation,
+                )
+                .expect("apply core operation")
+            };
+            let local_flow = || {
+                repository::get_flow(&receiver.runtime.db, SYS_ID)
+                    .expect("get flow")
+                    .expect("flow exists")
+            };
+
+            // User-style Update (is_system=false on the wire) → rejected.
+            let mut user_update = BTreeMap::new();
+            user_update.insert(
+                "flow_json".to_string(),
+                FieldValue::String(r#"{"nodes":[{"id":"hacked"}]}"#.to_string()),
+            );
+            user_update.insert("is_system".to_string(), FieldValue::Bool(false));
+            let rows = record_and_apply(SYS_ID, SqlWriteAction::Update, user_update, 1);
+            assert_eq!(rows, 0, "user update of a system flow must be rejected");
+            assert_eq!(local_flow().flow_json, r#"{"nodes":[]}"#);
+
+            // Delete → rejected, the row stays.
+            let mut del_fields = BTreeMap::new();
+            del_fields.insert("id".to_string(), FieldValue::String(SYS_ID.to_string()));
+            let rows = record_and_apply(SYS_ID, SqlWriteAction::Delete, del_fields, 2);
+            assert_eq!(rows, 0, "delete of a system flow must be rejected");
+            assert!(local_flow().is_system);
+
+            // Forged "seed refresh" (Update carrying is_system=true) → also
+            // rejected: the local seed is the only writer of system flows.
+            let mut forged = BTreeMap::new();
+            forged.insert(
+                "flow_json".to_string(),
+                FieldValue::String(r#"{"nodes":[{"id":"forged"}]}"#.to_string()),
+            );
+            forged.insert("is_system".to_string(), FieldValue::Bool(true));
+            let rows = record_and_apply(SYS_ID, SqlWriteAction::Update, forged, 3);
+            assert_eq!(rows, 0, "forged seed refresh must be rejected");
+            let guarded = local_flow();
+            assert_eq!(guarded.flow_json, r#"{"nodes":[]}"#);
+            assert!(guarded.is_system);
+
+            // Insert of a NEW id claiming is_system=true → applied, but the
+            // wire flag is coerced to 0: the row is a regular, deletable flow.
+            const NEW_ID: &str = "user-flow-1";
+            let mut forged_insert = BTreeMap::new();
+            forged_insert.insert(
+                "name".to_string(),
+                FieldValue::String("Forged System".to_string()),
+            );
+            forged_insert.insert(
+                "flow_json".to_string(),
+                FieldValue::String(r#"{"nodes":[]}"#.to_string()),
+            );
+            forged_insert.insert("is_system".to_string(), FieldValue::Bool(true));
+            let rows = record_and_apply(NEW_ID, SqlWriteAction::Insert, forged_insert, 4);
+            assert_eq!(rows, 1, "insert of a new flow must apply");
+            let inserted = repository::get_flow(&receiver.runtime.db, NEW_ID)
+                .expect("get flow")
+                .expect("flow exists");
+            assert!(!inserted.is_system, "wire is_system must be coerced to 0");
+            let mut del_new = BTreeMap::new();
+            del_new.insert("id".to_string(), FieldValue::String(NEW_ID.to_string()));
+            let rows = record_and_apply(NEW_ID, SqlWriteAction::Delete, del_new, 5);
+            assert_eq!(rows, 1, "the coerced flow must stay deletable");
+            assert!(repository::get_flow(&receiver.runtime.db, NEW_ID)
+                .expect("get flow")
+                .is_none());
+        });
+    }
+
     #[test]
     fn shared_setting_secret_capture_materializes_with_receiver_cipher() {
         with_tmp_home(|| {

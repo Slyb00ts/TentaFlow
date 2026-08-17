@@ -54,8 +54,9 @@ fn mel_filterbank(n_mels: usize) -> Vec<Vec<f32>> {
     let hz_pts: Vec<f32> = (0..n_mels + 2)
         .map(|i| mel_to_hz(mel_min + (mel_max - mel_min) * i as f32 / (n_mels + 1) as f32))
         .collect();
-    let fft_freqs: Vec<f32> =
-        (0..N_FREQS).map(|f| f as f32 * SAMPLE_RATE as f32 / N_FFT as f32).collect();
+    let fft_freqs: Vec<f32> = (0..N_FREQS)
+        .map(|f| f as f32 * SAMPLE_RATE as f32 / N_FFT as f32)
+        .collect();
 
     let mut bank = vec![vec![0.0f32; N_FREQS]; n_mels];
     for (m, row) in bank.iter_mut().enumerate() {
@@ -188,7 +189,11 @@ mod tests {
         // Column energy at frame 50 (inside the tone) must exceed frame 2000
         // (silence) for the band containing 1 kHz.
         let m_1khz = (0..80)
-            .max_by(|&x, &y| a[x * N_FRAMES + 50].partial_cmp(&a[y * N_FRAMES + 50]).unwrap())
+            .max_by(|&x, &y| {
+                a[x * N_FRAMES + 50]
+                    .partial_cmp(&a[y * N_FRAMES + 50])
+                    .unwrap()
+            })
             .unwrap();
         assert!(a[m_1khz * N_FRAMES + 50] > a[m_1khz * N_FRAMES + 2000]);
     }

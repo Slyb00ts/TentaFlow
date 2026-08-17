@@ -75,6 +75,8 @@ import './tf-pie-chart.js';
 import './tf-tag-input.js';
 import './tf-mention-input.js';
 import './tf-relation-graph.js';
+import './tf-code-editor.js';
+import './tf-kanban.js';
 
 export { TfButton } from './tf-button.js';
 export { TfInput } from './tf-input.js';
@@ -145,3 +147,5 @@ export { TfPieChart } from './tf-pie-chart.js';
 export { TfTagInput } from './tf-tag-input.js';
 export { TfMentionInput } from './tf-mention-input.js';
 export { TfRelationGraph } from './tf-relation-graph.js';
+export { TfCodeEditor } from './tf-code-editor.js';
+export { TfKanban } from './tf-kanban.js';

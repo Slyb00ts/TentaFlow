@@ -10,7 +10,7 @@ use std::collections::BTreeMap;
 /// Alignment applied to every sub-allocation. 256 B satisfies all CUDA
 /// texture/vector-load requirements and keeps kernels free to use the widest
 /// load instructions.
-pub(crate) const ALLOC_ALIGN: usize = 256;
+pub(crate) use crate::DEVICE_ALLOC_ALIGN as ALLOC_ALIGN;
 
 // Checked: near-usize::MAX requests must surface as OOM, not wrap around and
 // alias live allocations in release builds.
@@ -85,11 +85,10 @@ impl SlabArena {
     /// First-fit allocation of `bytes` rounded up to whole pages. Returns the
     /// byte offset and the rounded size actually reserved.
     pub(crate) fn alloc(&mut self, bytes: usize) -> Result<(usize, usize)> {
-        let size =
-            align_up(bytes.max(1), self.page_size).ok_or(ForgeError::OutOfMemory {
-                requested: bytes,
-                available: self.free.values().copied().max().unwrap_or(0),
-            })?;
+        let size = align_up(bytes.max(1), self.page_size).ok_or(ForgeError::OutOfMemory {
+            requested: bytes,
+            available: self.free.values().copied().max().unwrap_or(0),
+        })?;
         let candidate = self
             .free
             .iter()
@@ -109,11 +108,18 @@ impl SlabArena {
         Ok((offset, size))
     }
 
+    /// Bytes still free, across all ranges.
+    ///
+    /// A sum and not the largest range: the caller sizing a KV budget asks how
+    /// many equal slabs fit, and every one of them is a separate allocation.
+    /// The largest range would answer a question nobody asks.
+    pub(crate) fn available(&self) -> usize {
+        self.free.values().sum()
+    }
+
     /// Return a previously allocated range, coalescing with neighbours.
     pub(crate) fn free(&mut self, offset: usize, size: usize) {
-        debug_assert!(
-            offset.is_multiple_of(self.page_size) && size.is_multiple_of(self.page_size)
-        );
+        debug_assert!(offset.is_multiple_of(self.page_size) && size.is_multiple_of(self.page_size));
         debug_assert!(offset + size <= self.capacity);
         let mut start = offset;
         let mut len = size;
@@ -178,6 +184,10 @@ impl RingArena {
         }
     }
 
+    pub(crate) fn available(&self) -> usize {
+        self.capacity - self.cursor
+    }
+
     pub(crate) fn reset(&mut self) -> Result<u64> {
         if self.live > 0 {
             return Err(ForgeError::Device(format!(
@@ -204,10 +214,7 @@ mod tests {
         assert_eq!(a.available(), 256);
         assert_eq!(a.alloc(256).unwrap(), 768);
         assert_eq!(a.available(), 0);
-        assert!(matches!(
-            a.alloc(512),
-            Err(ForgeError::OutOfMemory { .. })
-        ));
+        assert!(matches!(a.alloc(512), Err(ForgeError::OutOfMemory { .. })));
     }
 
     #[test]
@@ -249,10 +256,7 @@ mod tests {
         s.free(a, sa);
         s.free(c, sc);
         // 2 free pages exist but not contiguously.
-        assert!(matches!(
-            s.alloc(2048),
-            Err(ForgeError::OutOfMemory { .. })
-        ));
+        assert!(matches!(s.alloc(2048), Err(ForgeError::OutOfMemory { .. })));
     }
 
     #[test]
@@ -280,17 +284,26 @@ mod tests {
         for bytes in [usize::MAX, usize::MAX - 1, usize::MAX - ALLOC_ALIGN + 1] {
             let mut b = BumpArena::new(1024);
             b.alloc(512).unwrap();
-            assert!(matches!(b.alloc(bytes), Err(ForgeError::OutOfMemory { .. })));
+            assert!(matches!(
+                b.alloc(bytes),
+                Err(ForgeError::OutOfMemory { .. })
+            ));
             // The failed alloc must not have moved the cursor.
             assert_eq!(b.alloc(256).unwrap(), 512);
 
             let mut s = SlabArena::new(4096, 1024).unwrap();
-            assert!(matches!(s.alloc(bytes), Err(ForgeError::OutOfMemory { .. })));
+            assert!(matches!(
+                s.alloc(bytes),
+                Err(ForgeError::OutOfMemory { .. })
+            ));
             assert_eq!(s.alloc(1024).unwrap().0, 0);
 
             let mut r = RingArena::new(1024);
             r.alloc(512).unwrap();
-            assert!(matches!(r.alloc(bytes), Err(ForgeError::OutOfMemory { .. })));
+            assert!(matches!(
+                r.alloc(bytes),
+                Err(ForgeError::OutOfMemory { .. })
+            ));
             assert_eq!(r.alloc(256).unwrap().0, 512);
         }
     }
@@ -299,10 +312,7 @@ mod tests {
     fn ring_oom_within_generation() {
         let mut r = RingArena::new(512);
         let (_o, g) = r.alloc(512).unwrap();
-        assert!(matches!(
-            r.alloc(1),
-            Err(ForgeError::OutOfMemory { .. })
-        ));
+        assert!(matches!(r.alloc(1), Err(ForgeError::OutOfMemory { .. })));
         r.on_drop(g);
     }
 }

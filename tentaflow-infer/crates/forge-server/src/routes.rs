@@ -13,8 +13,8 @@ use axum::response::{IntoResponse, Response};
 use axum::Json;
 use forge_engine::generate::FinishReason;
 use forge_engine::server::{EngineEvent, EngineRequest};
-use forge_types::ForgeError;
 use forge_tokenize::{ChatMessage, ChatTemplateEngine};
+use forge_types::ForgeError;
 use tokio_stream::wrappers::ReceiverStream;
 
 use std::collections::BTreeMap;
@@ -24,13 +24,13 @@ use crate::api::{
     ChatLogprobs, ChatResponseMessage, CompletionChoice, CompletionLogprobs, CompletionRequest,
     CompletionResponse, EmbItem, EmbeddingData, EmbeddingUsage, EmbeddingVec, EmbeddingsRequest,
     EmbeddingsResponse, EncodingFormat, FunctionCallOut, GenerationSpec, ModelEntry, ModelList,
-    TopLogprobEntry, ToolCallOut, ToolMode, Usage,
+    ToolCallOut, ToolMode, TopLogprobEntry, Usage,
 };
-use forge_engine::sample::TokenLogprob;
-use forge_tokenize::Tokenizer;
 use crate::error::ApiError;
 use crate::toolcall::{OutputParser, ParseStep, ToolParserKind};
 use crate::ServerState;
+use forge_engine::sample::TokenLogprob;
+use forge_tokenize::Tokenizer;
 
 fn now_unix() -> u64 {
     SystemTime::now()
@@ -79,11 +79,7 @@ pub async fn healthz() -> Json<serde_json::Value> {
 /// API-key gate like /healthz. Renders the engine's live counters/gauges/
 /// histograms plus the per-route HTTP request counts.
 pub async fn metrics_endpoint(State(state): State<Arc<ServerState>>) -> Response {
-    let body = crate::metrics::render(
-        state.engine.metrics(),
-        &state.http_metrics,
-        &state.model_id,
-    );
+    let body = crate::metrics::render(state.engine.metrics(), &state.http_metrics, &state.model_id);
     (
         [(
             header::CONTENT_TYPE,
@@ -209,7 +205,12 @@ fn render_chat_prompt(
 }
 
 pub(crate) enum GenInput {
-    Chat(Vec<ChatMessage>, Option<serde_json::Value>),
+    /// Wiadomości, narzędzia i zmienne szablonu — komplet tego, co czyta jinja.
+    Chat(
+        Vec<ChatMessage>,
+        Option<serde_json::Value>,
+        Option<serde_json::Map<String, serde_json::Value>>,
+    ),
     Text(String),
     /// Pre-tokenized prompt (completions `prompt` given as token ids).
     Tokens(Vec<u32>),
@@ -270,15 +271,18 @@ pub(crate) async fn start_generation(
             let mut per_input = Vec::with_capacity(inputs.len());
             for input in &inputs {
                 let prompt_tokens = match input {
-                    GenInput::Chat(messages, tools) => {
-                        let prompt = render_chat_prompt(
-                            &st.chat_template,
-                            &st.template_vars,
-                            messages,
-                            tools.as_ref(),
-                        )?;
+                    GenInput::Chat(messages, tools, kwargs) => {
+                        let mut vars = st.template_vars.clone();
+                        // Żądanie dokłada swoje zmienne i wygrywa z domyślnymi:
+                        // `bos_token`/`eos_token` opisują model, a te opisują tę
+                        // jedną rozmowę.
+                        if let Some(kwargs) = kwargs {
+                            vars.extend(kwargs.clone());
+                        }
+                        let prompt =
+                            render_chat_prompt(&st.chat_template, &vars, messages, tools.as_ref())?;
                         st.tokenizer
-                            .encode(&prompt, true)
+                            .encode_chat_template(&prompt)
                             .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?
                     }
                     GenInput::Text(s) => st
@@ -307,6 +311,7 @@ pub(crate) async fn start_generation(
                             logit_bias: spec.logit_bias.clone(),
                             min_tokens: spec.min_tokens,
                             logprobs: spec.logprobs,
+                            emit_empty_tokens: false,
                         })
                         .map_err(|e| ApiError::internal(e.to_string()))?;
                     streams.push(rx);
@@ -371,6 +376,7 @@ pub(crate) async fn collect_events(
                 tokens,
                 prompt_tokens,
                 cache_read_tokens,
+                ..
             } => {
                 return Ok(Collected {
                     text,
@@ -641,6 +647,7 @@ async fn stream_response(
                     tokens,
                     prompt_tokens,
                     cache_read_tokens,
+                    ..
                 } => {
                     let engine_reason = finish_reason_str(reason);
                     let mut choices = Vec::new();
@@ -703,7 +710,7 @@ pub async fn chat_completions(
     if req.model != state.model_id {
         return ApiError::model_not_found(&req.model, &state.model_id).into_response();
     }
-    let spec = match req.generation_spec() {
+    let spec = match req.generation_spec_with(&state.default_sampling, &state.default_stop) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -711,11 +718,16 @@ pub async fn chat_completions(
         Ok(m) => m,
         Err(e) => return e.into_response(),
     };
-    // tool_choice "none" (or no tools at all): tools are neither rendered
-    // into the template nor parsed out of the output.
+    // tool_choice "none" wyłącza wyłącznie narzędzia; parser kanałów Muse
+    // nadal rozdziela reasoning od odpowiedzi użytkownika.
     let (parser_kind, tools) = match tool_mode {
         ToolMode::Auto => (state.tool_parser, req.tools.clone()),
-        ToolMode::None => (ToolParserKind::None, None),
+        ToolMode::None => (
+            (state.tool_parser == ToolParserKind::Muse)
+                .then_some(ToolParserKind::Muse)
+                .unwrap_or(ToolParserKind::None),
+            None,
+        ),
     };
     // Constrained decoding (SPEC §8.1.2): response_format / grammar / forced
     // tool_choice compile to a grammar the sampler must obey.
@@ -727,12 +739,15 @@ pub async fn chat_completions(
     // Streaming a multi-completion response is not supported (the OpenAI stream
     // shape interleaves choices ambiguously); ask for a non-streaming request.
     if req.stream && spec.n > 1 {
-        return ApiError::invalid_request("streaming is not supported with n > 1")
-            .into_response();
+        return ApiError::invalid_request("streaming is not supported with n > 1").into_response();
     }
     let gen = match start_generation(
         &state,
-        vec![GenInput::Chat(req.messages, tools)],
+        vec![GenInput::Chat(
+            req.messages,
+            tools,
+            req.chat_template_kwargs,
+        )],
         spec,
         grammar,
     )
@@ -843,7 +858,7 @@ pub async fn completions(
     if req.model != state.model_id {
         return ApiError::model_not_found(&req.model, &state.model_id).into_response();
     }
-    let spec = match req.generation_spec() {
+    let spec = match req.generation_spec_with(&state.default_sampling, &state.default_stop) {
         Ok(s) => s,
         Err(e) => return e.into_response(),
     };
@@ -993,8 +1008,7 @@ pub async fn audio_transcriptions(
     // ≤64 MiB upload while transcriptions run one at a time, so excess load
     // is rejected up front instead of buffered.
     let Ok(_permit) = state.stt_slots.try_acquire() else {
-        return ApiError::overloaded("too many concurrent transcription requests")
-            .into_response();
+        return ApiError::overloaded("too many concurrent transcription requests").into_response();
     };
 
     let mut file: Option<Vec<u8>> = None;
@@ -1086,57 +1100,58 @@ pub async fn embeddings(
     };
 
     let model_id = embed.model_id.clone();
-    let joined = tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
-        // Tokenize (or accept caller ids) and bound each input before any GPU
-        // work, so an over-length item fails fast without partial compute.
-        let mut token_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
-        let mut prompt_tokens = 0usize;
-        for item in items {
-            let ids = match item {
-                EmbItem::Text(s) => embed
-                    .tokenizer
-                    .encode(&s, true)
-                    .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?,
-                EmbItem::Tokens(ids) => ids,
-            };
-            if ids.is_empty() {
-                return Err(ApiError::invalid_request(
-                    "an `input` item produced zero tokens",
-                ));
+    let joined =
+        tokio::task::spawn_blocking(move || -> Result<(Vec<Vec<f32>>, usize), ApiError> {
+            // Tokenize (or accept caller ids) and bound each input before any GPU
+            // work, so an over-length item fails fast without partial compute.
+            let mut token_sets: Vec<Vec<u32>> = Vec::with_capacity(items.len());
+            let mut prompt_tokens = 0usize;
+            for item in items {
+                let ids = match item {
+                    EmbItem::Text(s) => embed
+                        .tokenizer
+                        .encode(&s, true)
+                        .map_err(|e| ApiError::internal(format!("tokenization failed: {e}")))?,
+                    EmbItem::Tokens(ids) => ids,
+                };
+                if ids.is_empty() {
+                    return Err(ApiError::invalid_request(
+                        "an `input` item produced zero tokens",
+                    ));
+                }
+                if ids.len() > embed.max_context {
+                    return Err(ApiError::context_length_exceeded(format!(
+                        "input has {} tokens, over the embedding model limit of {}",
+                        ids.len(),
+                        embed.max_context
+                    )));
+                }
+                prompt_tokens += ids.len();
+                token_sets.push(ids);
             }
-            if ids.len() > embed.max_context {
-                return Err(ApiError::context_length_exceeded(format!(
-                    "input has {} tokens, over the embedding model limit of {}",
-                    ids.len(),
-                    embed.max_context
-                )));
-            }
-            prompt_tokens += ids.len();
-            token_sets.push(ids);
-        }
 
-        let mut model = embed.model.blocking_lock();
-        let mut vecs = Vec::with_capacity(token_sets.len());
-        for ids in &token_sets {
-            let mut v = model
-                .embed(ids, embed.pooling, embed.normalize)
-                .map_err(|e| ApiError::internal(format!("embedding failed: {e}")))?;
-            // Matryoshka: keep the leading `dimensions` components; the
-            // prefixes of these models are trained to stay meaningful, and a
-            // normalized model needs a renormalize after truncation.
-            if let Some(d) = dimensions {
-                if d < v.len() {
-                    v.truncate(d);
-                    if embed.normalize {
-                        forge_engine::model::l2_normalize(&mut v);
+            let mut model = embed.model.blocking_lock();
+            let mut vecs = Vec::with_capacity(token_sets.len());
+            for ids in &token_sets {
+                let mut v = model
+                    .embed(ids, embed.pooling, embed.normalize)
+                    .map_err(|e| ApiError::internal(format!("embedding failed: {e}")))?;
+                // Matryoshka: keep the leading `dimensions` components; the
+                // prefixes of these models are trained to stay meaningful, and a
+                // normalized model needs a renormalize after truncation.
+                if let Some(d) = dimensions {
+                    if d < v.len() {
+                        v.truncate(d);
+                        if embed.normalize {
+                            forge_engine::model::l2_normalize(&mut v);
+                        }
                     }
                 }
+                vecs.push(v);
             }
-            vecs.push(v);
-        }
-        Ok((vecs, prompt_tokens))
-    })
-    .await;
+            Ok((vecs, prompt_tokens))
+        })
+        .await;
 
     match joined {
         Ok(Ok((vecs, prompt_tokens))) => {
@@ -1201,13 +1216,8 @@ mod tests {
             "function": {"name": "get_weather", "parameters": {"type": "object"}}
         }]);
 
-        let out = render_chat_prompt(
-            template,
-            &serde_json::Map::new(),
-            &messages,
-            Some(&tools),
-        )
-        .unwrap();
+        let out =
+            render_chat_prompt(template, &serde_json::Map::new(), &messages, Some(&tools)).unwrap();
         assert!(out.contains("<tool_call>"), "assistant call missing: {out}");
         assert!(out.contains("get_weather"));
         assert!(out.contains("<tool_response>\n12°C, słonecznie"));

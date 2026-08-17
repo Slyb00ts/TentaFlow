@@ -5,18 +5,20 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_whisper::{audio, WhisperModel};
 
 fn repo_path(rel: &str) -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../..").join(rel)
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../..")
+        .join(rel)
 }
 
 #[test]
 #[ignore = "needs a CUDA GPU and test-models/whisper-base"]
 fn transcribes_jfk() {
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 768 << 20,

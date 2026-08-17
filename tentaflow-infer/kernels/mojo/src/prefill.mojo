@@ -7,7 +7,13 @@ from std.gpu.primitives.warp import shuffle_xor
 from std.gpu.memory import AddressSpace
 from std.memory import stack_allocation
 from std.math import exp
+
+# Prog warunkowego przeskalowania softmaxu. exp(8) ~ 2981, czyli daleko od
+# zakresu f32, a im wyzszy prog tym rzadsze przeskalowania — FA4 raportuje
+# okolo dziesieciokrotnie mniej tych operacji.
+comptime SOFTMAX_RESCALE_T: Float32 = 8.0
 from std.gpu.compute.mma import mma, ld_matrix
+from src.arch_dot import dot2_f16
 from src.kv_fp8 import kv_row8_f16
 
 comptime WARP_SIZE = 32
@@ -51,12 +57,93 @@ comptime kv_append_batch_f16 = kv_append_batch[DType.float16]
 comptime kv_append_batch_fp8 = kv_append_batch[DType.float8_e4m3fn]
 
 
+def kv_append_batch_device_pos_f16(
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    base_pos: UnsafePointer[Int32, MutAnyOrigin],
+    n_kv_heads: Int,
+    page_size: Int,
+    head_dim: Int,
+):
+    """Wariant F16 odczytujący bazową pozycję z bufora urządzenia."""
+    kv_append_batch[DType.float16](
+        k_cache, v_cache, k_in, v_in, page_table, Int(base_pos[0]),
+        n_kv_heads, page_size, head_dim,
+    )
+
+
+def kv_append_batch_segmented_f16(
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    max_pages: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    head_dim: Int,
+):
+    """Zapisuje spłaszczone `[B,T]` do osobnych tablic stron każdego lane."""
+    token = Int(block_idx.x)
+    kvh = Int(block_idx.y)
+    lane = token // n_tokens
+    local_token = token % n_tokens
+    pos = Int(base_positions[lane]) + local_token
+    page = Int(page_tables[lane * max_pages + pos // page_size])
+    slot = pos % page_size
+    dst = ((page * n_kv_heads + kvh) * page_size + slot) * head_dim
+    src = (token * n_kv_heads + kvh) * head_dim
+    var element = Int(thread_idx.x)
+    while element < head_dim:
+        k_cache[dst + element] = k_in[src + element]
+        v_cache[dst + element] = v_in[src + element]
+        element += Int(block_dim.x)
+
+
+def kv_append_batch_segmented_masked_f16(
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    k_in: UnsafePointer[Float16, MutAnyOrigin],
+    v_in: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    decisions: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    max_pages: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    head_dim: Int,
+):
+    """Zapisuje tylko prefiks `[B,T]` zatwierdzony osobno dla każdego lane."""
+    token = Int(block_idx.x)
+    kvh = Int(block_idx.y)
+    lane = token // n_tokens
+    local_token = token % n_tokens
+    base_position = Int(base_positions[lane])
+    if base_position < 0 or local_token >= Int(decisions[2 * lane]):
+        return
+    pos = base_position + local_token
+    page = Int(page_tables[lane * max_pages + pos // page_size])
+    slot = pos % page_size
+    dst = ((page * n_kv_heads + kvh) * page_size + slot) * head_dim
+    src = (token * n_kv_heads + kvh) * head_dim
+    var element = Int(thread_idx.x)
+    while element < head_dim:
+        k_cache[dst + element] = k_in[src + element]
+        v_cache[dst + element] = v_in[src + element]
+        element += Int(block_dim.x)
+
+
 comptime QT = 16  # query tokens per block
-comptime PT = WARP_SIZE  # cached positions per smem tile (one lane per position)
 comptime QPW = QT // MAX_WARPS  # queries owned by one warp
 
 
-def attn_prefill[head_dim: Int, kv_dtype: DType](
+def attn_prefill[head_dim: Int, kv_dtype: DType, PT: Int](
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     q: UnsafePointer[Float16, MutAnyOrigin],
     k_cache: UnsafePointer[Scalar[kv_dtype], MutAnyOrigin],
@@ -68,8 +155,12 @@ def attn_prefill[head_dim: Int, kv_dtype: DType](
     page_size: Int,
     scale: Float32,
     n_tokens: Int,
+    window: Int,
 ):
     """Causal attention for a prefill chunk over the paged cache.
+
+    `window` > 0 włącza okno przesuwne: zapytanie na pozycji `aq` widzi tylko
+    pozycje z przedziału `[aq - window + 1, aq]`. 0 wyłącza okno.
 
     q/out: [T, n_q_heads, head_dim]; query token tok attends positions
     0..base_pos+tok (its K/V must already be in the cache).
@@ -171,25 +262,58 @@ def attn_prefill[head_dim: Int, kv_dtype: DType](
                 h = 0
             if h > n_valid:
                 h = n_valid
-            if h > 0:
-                # Lane `lane` scores position pos0+lane against query i.
-                var dotv = SIMD[DType.float32, 8](0.0)
+            # Dolna granica okna dla tego zapytania. UWAGA: przy oknie kafel
+            # może mieć h > 0, a mimo to być CAŁY poza oknem. Taki kafel trzeba
+            # pominąć, bo inaczej wszystkie lane'y mają score = NEG_INF, maksimum
+            # nie rośnie ponad startowe NEG_INF i `exp(score - m)` daje 1.0
+            # zamiast 0 — czyli softmax dostaje masę z pozycji, których nie ma.
+            var lo = 0
+            if window > 0:
+                aq = base_pos + tq
+                if aq + 1 > window:
+                    lo = aq + 1 - window
+            if pos0 + h <= lo:
+                h = 0
 
-                comptime for c in range(row_chunks):
-                    kv8 = (
-                        ks
-                        + lane * head_dim
-                        + ((c ^ (lane % row_chunks)) * 8)
-                    ).load[width=8, alignment=16]().cast[DType.float32]()
-                    qv8 = (
-                        qs + (wid * QPW + i) * head_dim + c * 8
-                    ).load[width=8, alignment=16]().cast[DType.float32]()
-                    dotv += qv8 * kv8
-                var score = dotv.reduce_add() * scale
-                if lane >= h:
-                    score = NEG_INF
+            if h > 0:
+                # Lane `lane` scores position pos0+lane against query i. Przy
+                # PT < WARP_SIZE kafel ma mniej wierszy niż fala ma lane'ów, więc
+                # odczyt musi być pod warunkiem — inaczej nadmiarowe lane'y
+                # czytają LDS poza `ks` (maskowanie samego score jest za późno).
+                var score = NEG_INF
+                if lane < h and pos0 + lane >= lo:
+                    # Iloczyn Q·K przez `v_dot2_f32_f16`: dwa MAC-i f16 na
+                    # instrukcje zamiast mnozenia i dodawania w f32 po rozszerzeniu
+                    # (dwukrotnie mniej operacji wektorowych na te sama matematyke).
+                    # Cztery lancuchy akumulacji na chunk daja ILP, ktorego pojedyncza
+                    # suma nie ma.
+                    var dotv = SIMD[DType.float32, 4](0.0)
+
+                    comptime for c in range(row_chunks):
+                        kv8 = (
+                            ks
+                            + lane * head_dim
+                            + ((c ^ (lane % row_chunks)) * 8)
+                        ).load[width=8, alignment=16]()
+                        qv8 = (
+                            qs + (wid * QPW + i) * head_dim + c * 8
+                        ).load[width=8, alignment=16]()
+                        comptime for j in range(4):
+                            dotv[j] = dot2_f16(
+                                qv8.slice[2, offset = j * 2](),
+                                kv8.slice[2, offset = j * 2](),
+                                dotv[j],
+                            )
+                    score = dotv.reduce_add() * scale
                 mtile = warp.max(score)
-                if mtile > m[i]:
+                # Warunkowe przeskalowanie (FlashAttention-4). Maksimum biezacego
+                # kafla przesuwa `m` DOPIERO gdy urosnie o wiecej niz prog —
+                # inaczej zostawiamy stare `m` i pomijamy przeskalowanie `l` i
+                # `acc`. Niezmiennik: po tym warunku zawsze `score <= m[i] + T`,
+                # wiec `p = exp(score - m[i]) <= exp(T)` i akumulacja f32 zostaje
+                # w bezpiecznym zakresie. Znormalizowanie przez `l` na koncu i tak
+                # skraca wspolny czynnik, wiec wynik jest ten sam.
+                if mtile > m[i] + SOFTMAX_RESCALE_T:
                     rescale = exp(m[i] - mtile)
                     l[i] *= rescale
                     acc[i] = acc[i] * rescale
@@ -218,11 +342,201 @@ def attn_prefill[head_dim: Int, kv_dtype: DType](
             )
 
 
-comptime attn_prefill_f16_hd64 = attn_prefill[64, DType.float16]
-comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16]
-comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16]
-comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn]
-comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn]
+def attn_prefill_segmented_f16[head_dim: Int, PT: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    max_pages: Int,
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    scale: Float32,
+):
+    """Kafelkowa causal attention dla równych segmentów sequence-major `[B,T]`."""
+    comptime epl = head_dim // WARP_SIZE
+    comptime row_chunks = head_dim // 8
+    comptime tile_chunks = PT * row_chunks
+    comptime block_threads = MAX_WARPS * WARP_SIZE
+    comptime chunks_per_thread = tile_chunks // block_threads
+    comptime q_chunks = QT * row_chunks
+
+    tiles_per_sequence = (n_tokens + QT - 1) // QT
+    sequence = Int(block_idx.x) // tiles_per_sequence
+    tile = Int(block_idx.x) % tiles_per_sequence
+    token_offset = sequence * n_tokens
+    tok0 = tile * QT
+    base_pos = Int(base_positions[sequence])
+    page_table = page_tables + sequence * max_pages
+    qh = Int(block_idx.y)
+    kvh = qh // (n_q_heads // n_kv_heads)
+    tid = Int(thread_idx.x)
+    lane = tid % WARP_SIZE
+    wid = tid // WARP_SIZE
+
+    qs = stack_allocation[
+        QT * head_dim, Float16, address_space = AddressSpace.SHARED
+    ]()
+    ks = stack_allocation[
+        PT * head_dim, Float16, address_space = AddressSpace.SHARED
+    ]()
+    vs = stack_allocation[
+        PT * head_dim, Float16, address_space = AddressSpace.SHARED
+    ]()
+
+    comptime for it in range((q_chunks + block_threads - 1) // block_threads):
+        c = tid + it * block_threads
+        if c < q_chunks:
+            row = c // row_chunks
+            off = (c % row_chunks) * 8
+            var tq = tok0 + row
+            if tq > n_tokens - 1:
+                tq = n_tokens - 1
+            global_token = token_offset + tq
+            (qs + row * head_dim + off).store[width=8, alignment=16](
+                (q + (global_token * n_q_heads + qh) * head_dim + off).load[
+                    width=8, alignment=16
+                ]()
+            )
+
+    var m = InlineArray[Float32, QPW](fill=NEG_INF)
+    var l = InlineArray[Float32, QPW](fill=0.0)
+    var acc = InlineArray[SIMD[DType.float32, epl], QPW](
+        fill=SIMD[DType.float32, epl](0.0)
+    )
+
+    var tok_hi = tok0 + QT
+    if tok_hi > n_tokens:
+        tok_hi = n_tokens
+    max_abs = base_pos + tok_hi - 1
+
+    var pos0 = 0
+    while pos0 <= max_abs:
+        var n_valid = max_abs + 1 - pos0
+        if n_valid > PT:
+            n_valid = PT
+        barrier()
+
+        comptime for it in range(chunks_per_thread):
+            c = tid + it * block_threads
+            row = c // row_chunks
+            off = c % row_chunks
+            if row < n_valid:
+                pos = pos0 + row
+                page = Int(page_table[pos // page_size])
+                kv_base = (
+                    (page * n_kv_heads + kvh) * page_size + pos % page_size
+                ) * head_dim + off * 8
+                (ks + row * head_dim + ((off ^ (row % row_chunks)) * 8)).store[
+                    width=8, alignment=16
+                ]((k_cache + kv_base).load[width=8, alignment=16]())
+                (vs + row * head_dim + off * 8).store[width=8, alignment=16](
+                    (v_cache + kv_base).load[width=8, alignment=16]()
+                )
+        barrier()
+
+        comptime for i in range(QPW):
+            tq = tok0 + wid * QPW + i
+            var h = base_pos + tq - pos0 + 1
+            if tq >= n_tokens:
+                h = 0
+            if h > n_valid:
+                h = n_valid
+            if h > 0:
+                # Iloczyn Q·K przez `v_dot2_f32_f16` zamiast mnozen f32: dwa
+                # MAC-i f16 na takt na linie, czyli polowa instrukcji na te sama
+                # matematyke. Akumulacja zostaje w f32, wiec wynik nie traci
+                # precyzji wzgledem poprzedniej wersji — zmienia sie tylko
+                # kolejnosc dodawania (osiem czastkowych sum zamiast jednej
+                # redukcji SIMD na koncu).
+                var dot = Float32(0.0)
+                comptime for c in range(row_chunks):
+                    kv8 = (
+                        ks
+                        + lane * head_dim
+                        + ((c ^ (lane % row_chunks)) * 8)
+                    ).load[width=8, alignment=16]()
+                    qv8 = (
+                        qs + (wid * QPW + i) * head_dim + c * 8
+                    ).load[width=8, alignment=16]()
+                    comptime for j in range(4):
+                        dot = dot2_f16(
+                            qv8.slice[2, offset = j * 2](),
+                            kv8.slice[2, offset = j * 2](),
+                            dot,
+                        )
+                var score = dot * scale
+                if lane >= h:
+                    score = NEG_INF
+                mtile = warp.max(score)
+                if mtile > m[i]:
+                    rescale = exp(m[i] - mtile)
+                    l[i] *= rescale
+                    acc[i] = acc[i] * rescale
+                    m[i] = mtile
+                probability = exp(score - m[i])
+                l[i] += warp.sum(probability)
+
+                var key = 0
+                while key < h:
+                    weight = warp.shuffle_idx(probability, UInt32(key))
+                    value = (vs + key * head_dim + lane * epl).load[
+                        width=epl, alignment=epl * 2
+                    ]().cast[DType.float32]()
+                    acc[i] += value * weight
+                    key += 1
+
+        pos0 += PT
+
+    comptime for i in range(QPW):
+        tq = tok0 + wid * QPW + i
+        if tq < n_tokens:
+            global_token = token_offset + tq
+            q_base = (global_token * n_q_heads + qh) * head_dim
+            inverse = 1.0 / l[i]
+            (out_ptr + q_base + lane * epl).store[width=epl](
+                (acc[i] * inverse).cast[DType.float16]()
+            )
+
+
+comptime attn_prefill_f16_hd64 = attn_prefill[64, DType.float16, WARP_SIZE]
+comptime attn_prefill_f16_hd128 = attn_prefill[128, DType.float16, WARP_SIZE]
+comptime attn_prefill_f16_hd256 = attn_prefill[256, DType.float16, WARP_SIZE]
+# head_dim 512 (warstwy globalne Gemmy 4): kafle K i V przy PT=32 zajęłyby same
+# 64 KiB LDS, czyli caly limit. Polowa kafla pozycji mieści się w 48 KiB i
+# zostawia zapas na kafel zapytań.
+comptime attn_prefill_f16_hd512 = attn_prefill[512, DType.float16, WARP_SIZE // 2]
+comptime attn_prefill_segmented_f16_hd128 = attn_prefill_segmented_f16[
+    128, WARP_SIZE
+]
+comptime attn_prefill_segmented_f16_hd256 = attn_prefill_segmented_f16[
+    256, WARP_SIZE
+]
+comptime attn_prefill_fp8_hd64 = attn_prefill[64, DType.float8_e4m3fn, WARP_SIZE]
+comptime attn_prefill_fp8_hd128 = attn_prefill[128, DType.float8_e4m3fn, WARP_SIZE]
+
+
+def attn_prefill_device_pos_f16_hd256(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_table: UnsafePointer[Int32, MutAnyOrigin],
+    base_pos: UnsafePointer[Int32, MutAnyOrigin],
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    scale: Float32,
+    n_tokens: Int,
+):
+    """Wariant HD256 odczytujący bazową pozycję z bufora urządzenia."""
+    attn_prefill[256, DType.float16, WARP_SIZE](
+        out_ptr, q, k_cache, v_cache, page_table, Int(base_pos[0]),
+        n_q_heads, n_kv_heads, page_size, scale, n_tokens, 0,
+    )
 
 
 comptime BQ = 64  # query rows per block (4 warps x 16)
@@ -483,5 +797,39 @@ def attn_prefill_fa_mma[head_dim: Int](
             out_ptr[o + 1] = Float16(av[3] * inv_b)
 
 
+def attn_prefill_fa_segmented_f16[head_dim: Int](
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    q: UnsafePointer[Float16, MutAnyOrigin],
+    k_cache: UnsafePointer[Float16, MutAnyOrigin],
+    v_cache: UnsafePointer[Float16, MutAnyOrigin],
+    page_tables: UnsafePointer[Int32, MutAnyOrigin],
+    base_positions: UnsafePointer[Int32, MutAnyOrigin],
+    n_tokens: Int,
+    max_pages: Int,
+    n_q_heads: Int,
+    n_kv_heads: Int,
+    page_size: Int,
+    scale: Float32,
+):
+    """Uruchamia niezmieniony kernel FA MMA na lane wybranym przez grid.z."""
+    sequence = Int(block_idx.z)
+    token_offset = sequence * n_tokens
+    activation_offset = token_offset * n_q_heads * head_dim
+    attn_prefill_fa_mma[head_dim](
+        out_ptr + activation_offset,
+        q + activation_offset,
+        k_cache,
+        v_cache,
+        page_tables + sequence * max_pages,
+        Int(base_positions[sequence]),
+        n_q_heads,
+        n_kv_heads,
+        page_size,
+        scale,
+        n_tokens,
+    )
+
+
 comptime attn_prefill_fa_f16_hd64 = attn_prefill_fa_mma[64]
 comptime attn_prefill_fa_f16_hd128 = attn_prefill_fa_mma[128]
+comptime attn_prefill_fa_segmented_f16_hd128 = attn_prefill_fa_segmented_f16[128]

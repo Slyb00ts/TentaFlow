@@ -9,6 +9,8 @@ from std.gpu.host import DeviceContext
 from std.pathlib import Path
 from src.gemm_fp8_modular import (
     gemm_fp8_mod_11264_4096,
+    gemm_fp8_mod_11264_4096_bn256,
+    gemm_fp8_mod_4096_4096_bn256,
     gemm_fp8_mod_4096_11264,
 )
 from src.nvfp4 import pack_f16_fp8, pack_nvfp4_fp8
@@ -21,7 +23,7 @@ def _entry_from_ptx(ptx_path: Path) raises -> String:
     if i < 0:
         raise Error("brak wpisu PTX")
     j = text.find("(", i)
-    return String(text[byte = i + marker.byte_length():j])
+    return String(text[byte = i + marker.byte_length() : j])
 
 
 def _finalize(out_dir: Path, name: StringSlice) raises -> String:
@@ -34,8 +36,13 @@ def _finalize(out_dir: Path, name: StringSlice) raises -> String:
     entry = _entry_from_ptx(final)
     print("  skompilowano", name, "->", entry)
     return (
-        String('    "') + String(name) + String('": {"file": "')
-        + String(name) + String('.ptx", "entry": "') + entry + String('"}')
+        String('    "')
+        + String(name)
+        + String('": {"file": "')
+        + String(name)
+        + String('.ptx", "entry": "')
+        + entry
+        + String('"}')
     )
 
 
@@ -55,6 +62,16 @@ def main() raises:
     ]()
     entries.append(_finalize(out_dir, "gemm_fp8_mod_4096_11264"))
     _ = ctx.compile_function[
+        gemm_fp8_mod_4096_4096_bn256,
+        dump_asm=Path("gemm_fp8_mod_4096_4096_bn256.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_fp8_mod_4096_4096_bn256"))
+    _ = ctx.compile_function[
+        gemm_fp8_mod_11264_4096_bn256,
+        dump_asm=Path("gemm_fp8_mod_11264_4096_bn256.ptx"),
+    ]()
+    entries.append(_finalize(out_dir, "gemm_fp8_mod_11264_4096_bn256"))
+    _ = ctx.compile_function[
         pack_nvfp4_fp8,
         dump_asm=Path("pack_nvfp4_fp8.ptx"),
     ]()
@@ -64,5 +81,8 @@ def main() raises:
         dump_asm=Path("pack_f16_fp8.ptx"),
     ]()
     entries.append(_finalize(out_dir, "pack_f16_fp8"))
-    fragment = entries[0] + ",\n" + entries[1] + ",\n" + entries[2] + ",\n" + entries[3] + "\n"
+    fragment = entries[0]
+    for index in range(1, len(entries)):
+        fragment += ",\n" + entries[index]
+    fragment += "\n"
     (out_dir / "manifest_nvfp4_fp8_ffn.json.fragment").write_text(fragment)

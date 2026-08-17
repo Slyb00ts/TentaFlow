@@ -31,13 +31,13 @@ use crate::services::model_download::{download_with_progress, ProgressFn};
 
 /// One file in a camera-CV bundle. `remote` set → fetched from `<base>/<name>`;
 /// `embedded` set → written from the binary-embedded bytes (config sidecars).
-/// `supertonic_only` marks artifacts (the ort `.onnx` graphs) that ONLY the
-/// `inference-supertonic` build loads — a pure-Burn deploy must not require them.
+/// `ort_only` marks artifacts (the ORT `.onnx` graphs) that ONLY the
+/// `vision-ort` build loads — a pure-Burn deploy must not require them.
 struct CvFile {
     name: &'static str,
     remote: bool,
     embedded: Option<&'static str>,
-    supertonic_only: bool,
+    ort_only: bool,
 }
 
 struct CvBundle {
@@ -48,13 +48,13 @@ struct CvBundle {
 impl CvBundle {
     /// Files that apply to THIS build. On a pure-Burn build the ort-only `.onnx`
     /// artifacts are dropped, so `ensure_bundle` never demands them from the
-    /// release URL / remote manifest (they are a supertonic-only rollout dep).
+    /// release URL / remote manifest (they are an ORT-only rollout dependency).
     /// `cfg!(...)` is a plain runtime bool, so one const array serves both builds.
     fn effective_files(&self) -> Vec<&'static CvFile> {
-        let supertonic = cfg!(feature = "inference-supertonic");
+        let ort = cfg!(feature = "vision-ort");
         self.files
             .iter()
-            .filter(|f| supertonic || !f.supertonic_only)
+            .filter(|f| ort || !f.ort_only)
             .collect()
     }
 }
@@ -74,22 +74,22 @@ const BUNDLES: &[CvBundle] = &[
                 name: "rfdetr-base.bpk",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
-                // ONNX graph for the ort/TensorRT session pool. Only the supertonic
-                // build loads it — `supertonic_only` keeps it out of a pure-Burn
+                // ONNX graph for the ORT/TensorRT session pool. Only the vision-ort
+                // build loads it — `ort_only` keeps it out of a pure-Burn
                 // deploy's required set (see `CvBundle::effective_files`).
                 name: "rfdetr-base.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "rfdetr-classes.json",
                 remote: false,
                 embedded: Some(RFDETR_CLASSES),
-                supertonic_only: false,
+                ort_only: false,
             },
         ],
     },
@@ -100,7 +100,7 @@ const BUNDLES: &[CvBundle] = &[
                 name: "model_stan.bpk",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // ONNX graph + its external-weights sidecar for the ort session
@@ -108,19 +108,19 @@ const BUNDLES: &[CvBundle] = &[
                 name: "model_stan.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "model_stan.onnx.data",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "stan-classes.json",
                 remote: false,
                 embedded: Some(STAN_CLASSES),
-                supertonic_only: false,
+                ort_only: false,
             },
         ],
     },
@@ -131,20 +131,20 @@ const BUNDLES: &[CvBundle] = &[
                 name: "plate_ocr.bpk",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // ONNX graph for the ort session pool. Supertonic-only (see rfdetr).
                 name: "plate_ocr.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: true,
+                ort_only: true,
             },
             CvFile {
                 name: "plate-ocr-config.json",
                 remote: false,
                 embedded: Some(PLATE_CONFIG),
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // Nasz wytrenowany CRNN do numerów ADR (~4 MB). GŁÓWNY czytnik
@@ -153,7 +153,7 @@ const BUNDLES: &[CvBundle] = &[
                 name: "adr_ocr.onnx",
                 remote: true,
                 embedded: None,
-                supertonic_only: false,
+                ort_only: false,
             },
             CvFile {
                 // Alfabet klas ADR OCR (`0123456789`) — mały i stabilny, więc
@@ -161,7 +161,7 @@ const BUNDLES: &[CvBundle] = &[
                 name: "adr_ocr_alphabet.txt",
                 remote: false,
                 embedded: Some(ADR_OCR_ALPHABET),
-                supertonic_only: false,
+                ort_only: false,
             },
         ],
     },
@@ -175,7 +175,7 @@ const BUNDLES: &[CvBundle] = &[
             name: "depth-anything-v2-metric.bpk",
             remote: true,
             embedded: None,
-            supertonic_only: false,
+            ort_only: false,
         }],
     },
 ];
@@ -401,21 +401,33 @@ const TOTAL_IMPORT_LIMIT: u64 = 2 * 1024 * 1024 * 1024;
 /// Setting key: when truthy, model-bundle pulls may reach loopback/private/
 /// link-local hosts. Absent/false → deny (the safe default).
 const ALLOW_PRIVATE_HOSTS_SETTING: &str = "vision_bundle_allow_private_hosts";
+const ALLOW_INVALID_TLS_SETTING: &str = "vision_bundle_allow_invalid_tls";
 
-/// Whether the admin opted into pulling from private/LAN hosts. Deploy-time
-/// only, read from the global settings row.
-fn allow_private_bundle_hosts() -> bool {
+/// Read a boolean global setting (accepts `1`/`true`/`yes`), default false.
+fn bundle_bool_setting(key: &str) -> bool {
     crate::db::global_pool()
-        .and_then(|pool| {
-            crate::db::repository::get_setting(&pool, ALLOW_PRIVATE_HOSTS_SETTING)
-                .ok()
-                .flatten()
-        })
+        .and_then(|pool| crate::db::repository::get_setting(&pool, key).ok().flatten())
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "yes"
         })
         .unwrap_or(false)
+}
+
+/// Whether the admin opted into pulling from private/LAN hosts. Deploy-time
+/// only, read from the global settings row.
+fn allow_private_bundle_hosts() -> bool {
+    bundle_bool_setting(ALLOW_PRIVATE_HOSTS_SETTING)
+}
+
+/// Whether the admin opted into accepting self-signed / otherwise-invalid TLS
+/// certificates when pulling a bundle or shared project. Cross-instance and
+/// intra-fleet nodes commonly serve self-signed certs; this opt-in (default
+/// false → full validation) mirrors the `curl -k` intra-fleet trust the deploy
+/// runbook assumes. It weakens transport authentication (MITM), so it is
+/// deliberately off unless an admin sets it for a trusted fleet.
+fn allow_invalid_bundle_tls() -> bool {
+    bundle_bool_setting(ALLOW_INVALID_TLS_SETTING)
 }
 
 /// Resolve `base`'s host to socket addresses and reject non-public IPs unless
@@ -510,7 +522,7 @@ fn per_file_ceiling(declared_size: u64, cumulative: u64) -> std::result::Result<
 /// Read a manifest response body with a hard cap. Content-Length MUST be
 /// present and within the cap, and the body is streamed with a running counter
 /// so a lying (or absent-then-huge) body is aborted before it is buffered.
-async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
+pub(crate) async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8>> {
     match response.content_length() {
         Some(len) if len <= MANIFEST_BODY_LIMIT => {}
         Some(_) => {
@@ -549,7 +561,7 @@ async fn read_capped_manifest_body(response: reqwest::Response) -> Result<Vec<u8
 /// Drop `?<query>` fragments from an error message so signed-URL tokens never
 /// land in deploy logs. Everything from a `?` to the next whitespace/quote is
 /// replaced with `?<redacted>`.
-fn redact_query_strings(msg: &str) -> String {
+pub(crate) fn redact_query_strings(msg: &str) -> String {
     let mut out = String::with_capacity(msg.len());
     let mut skipping = false;
     for c in msg.chars() {
@@ -599,7 +611,7 @@ async fn download_from_bundle_manifest(
     // let a compromised serving node bounce the pull (with its Bearer key) to
     // an arbitrary (possibly internal) destination. Matches the addon
     // `http.request` posture.
-    let client = bundle_http_client(&base)?;
+    let client = bundle_http_client(&base, Some(std::time::Duration::from_secs(600)))?;
 
     if let Some(s) = log_sink {
         s.phase("downloading-vision", "Fetching model bundle manifest");
@@ -853,17 +865,31 @@ async fn download_signed_file(
 /// compromised serving node must not be able to bounce the pull (with its
 /// Bearer key) to an arbitrary destination. Pinning the resolved address closes
 /// the DNS-rebind window between the SSRF check and connect.
-fn bundle_http_client(base: &reqwest::Url) -> Result<reqwest::Client> {
+/// `total_timeout` bounds the WHOLE request incl. body — right for small manifests
+/// and model files, but WRONG for multi-GB archives: a slow-but-steady 10 GB pull
+/// legitimately outlasts any fixed cap and would be killed mid-stream. Such callers
+/// pass `None` and enforce a no-progress (stall) timeout on the body instead, so a
+/// download only fails when the peer sends NOTHING for a while, never for being slow.
+pub(crate) fn bundle_http_client(
+    base: &reqwest::Url,
+    total_timeout: Option<std::time::Duration>,
+) -> Result<reqwest::Client> {
     let host = base
         .host_str()
         .ok_or_else(|| anyhow!("bundle URL has no host"))?;
     let addrs = vet_bundle_host(base)?;
-    reqwest::Client::builder()
+    let mut builder = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
-        .timeout(std::time::Duration::from_secs(600))
         .connect_timeout(std::time::Duration::from_secs(30))
         .user_agent(concat!("tentaflow/", env!("CARGO_PKG_VERSION")))
-        .resolve_to_addrs(host, &addrs)
+        .resolve_to_addrs(host, &addrs);
+    if let Some(t) = total_timeout {
+        builder = builder.timeout(t);
+    }
+    if allow_invalid_bundle_tls() {
+        builder = builder.danger_accept_invalid_certs(true);
+    }
+    builder
         .build()
         .map_err(|e| anyhow!("build HTTP client: {}", e))
 }
@@ -888,7 +914,7 @@ pub async fn fetch_custom_manifest_json(
         return Err(anyhow!("URL manifestu musi używać https"));
     }
     let bearer = api_key.trim();
-    let client = bundle_http_client(&base)?;
+    let client = bundle_http_client(&base, Some(std::time::Duration::from_secs(600)))?;
     let mut request = client.get(base.clone());
     if !bearer.is_empty() {
         request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {}", bearer));
@@ -1001,7 +1027,7 @@ pub async fn import_custom_model(
 
     let bearer = api_key.trim();
     let bearer_opt = (!bearer.is_empty()).then_some(bearer);
-    let client = bundle_http_client(&base)?;
+    let client = bundle_http_client(&base, Some(std::time::Duration::from_secs(600)))?;
     let dir = vision_models_dir();
     std::fs::create_dir_all(&dir).map_err(|e| anyhow!("create {}: {}", dir.display(), e))?;
 

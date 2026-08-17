@@ -38,14 +38,16 @@ pub mod meeting_live_broadcast;
 pub mod mesh_write_handlers;
 pub mod metrics;
 pub mod ml_studio;
+pub mod ml_studio_remote_import;
 pub mod model_metrics;
+pub mod project_studio;
 pub mod recorder;
 pub mod resume_token;
 pub mod robots;
 pub mod role_catalog;
 pub mod run_events;
-pub mod storage_admin;
 pub mod state;
+pub mod storage_admin;
 pub mod stream;
 pub mod stream_handlers;
 pub mod subscription;
@@ -769,6 +771,18 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ClassifierTrainStartResponse(_) => {
                 "MlStudioClassifierTrainStartResponse"
             }
+            tentaflow_protocol::MlStudioPayload::OcrTrainStartRequest(_) => {
+                "MlStudioOcrTrainStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::OcrTrainStartResponse(_) => {
+                "MlStudioOcrTrainStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainCancelRequest(_) => {
+                "MlStudioTrainCancelRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::TrainCancelResponse(_) => {
+                "MlStudioTrainCancelResponse"
+            }
             tentaflow_protocol::MlStudioPayload::GenericTrainStatusRequest(_) => {
                 "MlStudioGenericTrainStatusRequest"
             }
@@ -869,6 +883,90 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::MlStudioPayload::ServiceModelsListResponse(_) => {
                 "MlStudioServiceModelsListResponse"
             }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStartRequest(_) => {
+                "MlStudioProjectExportStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStartResponse(_) => {
+                "MlStudioProjectExportStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStatusRequest(_) => {
+                "MlStudioProjectExportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectExportStatusResponse(_) => {
+                "MlStudioProjectExportStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkRequest(_) => {
+                "MlStudioProjectImportUploadChunkRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadChunkResponse(_) => {
+                "MlStudioProjectImportUploadChunkResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusRequest(_) => {
+                "MlStudioProjectImportUploadStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportUploadStatusResponse(_) => {
+                "MlStudioProjectImportUploadStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportPreviewRequest(_) => {
+                "MlStudioProjectImportPreviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportPreviewResponse(_) => {
+                "MlStudioProjectImportPreviewResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportApplyRequest(_) => {
+                "MlStudioProjectImportApplyRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportApplyResponse(_) => {
+                "MlStudioProjectImportApplyResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportStatusRequest(_) => {
+                "MlStudioProjectImportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportStatusResponse(_) => {
+                "MlStudioProjectImportStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportCancelRequest(_) => {
+                "MlStudioProjectImportCancelRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::ProjectImportCancelResponse(_) => {
+                "MlStudioProjectImportCancelResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecordingsListRequest(_) => {
+                "MlStudioRecordingsListRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecordingsListResponse(_) => {
+                "MlStudioRecordingsListResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsRequest(_) => {
+                "MlStudioRecogImportRecordingsRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsResponse(_) => {
+                "MlStudioRecogImportRecordingsResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusRequest(_) => {
+                "MlStudioRecogImportRecordingsStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RecogImportRecordingsStatusResponse(_) => {
+                "MlStudioRecogImportRecordingsStatusResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportPreviewRequest(_) => {
+                "MlStudioRemoteImportPreviewRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportPreviewResponse(_) => {
+                "MlStudioRemoteImportPreviewResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStartRequest(_) => {
+                "MlStudioRemoteImportStartRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStartResponse(_) => {
+                "MlStudioRemoteImportStartResponse"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStatusRequest(_) => {
+                "MlStudioRemoteImportStatusRequest"
+            }
+            tentaflow_protocol::MlStudioPayload::RemoteImportStatusResponse(_) => {
+                "MlStudioRemoteImportStatusResponse"
+            }
         },
         MessageBody::RobotsBody(p) => match p {
             tentaflow_protocol::RobotsPayload::ListRequest(_) => "RobotsListRequest",
@@ -944,6 +1042,14 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "AgentRunEventsSubscribeRequest"
             }
             tentaflow_protocol::AgentsPayload::RunEvent(_) => "AgentRunEvent",
+            tentaflow_protocol::AgentsPayload::RunStartRequest(_) => "AgentRunStartRequest",
+            tentaflow_protocol::AgentsPayload::RunStartResponse(_) => "AgentRunStartResponse",
+            tentaflow_protocol::AgentsPayload::BuilderAssistRequest(_) => {
+                "AgentBuilderAssistRequest"
+            }
+            tentaflow_protocol::AgentsPayload::BuilderAssistResponse(_) => {
+                "AgentBuilderAssistResponse"
+            }
         },
         MessageBody::SyncConflictBody(p) => match p {
             tentaflow_protocol::SyncConflictPayload::ListRequest(_) => "SyncConflictsListRequest",
@@ -1021,6 +1127,8 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::ServicePayload::ResOauthStart(_) => "ServiceOauthStartResponse",
             tentaflow_protocol::ServicePayload::ReqOauthPoll(_) => "ServiceOauthPollRequest",
             tentaflow_protocol::ServicePayload::ResOauthPoll(_) => "ServiceOauthPollResponse",
+            tentaflow_protocol::ServicePayload::ReqAgent(_) => "ServiceAgentRequest",
+            tentaflow_protocol::ServicePayload::ResAgent(_) => "ServiceAgentResponse",
         },
         MessageBody::SystemEventBody(p) => match p {
             tentaflow_protocol::SystemEventPayload::ServiceStatusChanged { .. } => {
@@ -1029,6 +1137,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::SystemEventPayload::MeshPeerStatusChanged { .. } => {
                 "MeshPeerStatusChanged"
             }
+            tentaflow_protocol::SystemEventPayload::UserNotification { .. } => "UserNotification",
         },
         MessageBody::MeetingLiveEventBody(_) => "MeetingLiveEvent",
         MessageBody::MeetingBody(p) => match p {
@@ -1587,10 +1696,313 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 "StorageCreateDirResponse"
             }
             tentaflow_protocol::StorageAdminPayload::MigrateRequest(_) => "StorageMigrateRequest",
-            tentaflow_protocol::StorageAdminPayload::MigrateResponse(_) => {
-                "StorageMigrateResponse"
-            }
+            tentaflow_protocol::StorageAdminPayload::MigrateResponse(_) => "StorageMigrateResponse",
         },
+        MessageBody::ProjectStudioBody(p) => {
+            use tentaflow_protocol::project_studio::ProjectStudioPayload as Ps;
+            match p {
+                Ps::ProjectsListRequest { .. } => "ProjectStudioProjectsListRequest",
+                Ps::ProjectsListResponse { .. } => "ProjectStudioProjectsListResponse",
+                Ps::ProjectCreateRequest { .. } => "ProjectStudioProjectCreateRequest",
+                Ps::ProjectCreateResponse { .. } => "ProjectStudioProjectCreateResponse",
+                Ps::ProjectGetRequest { .. } => "ProjectStudioProjectGetRequest",
+                Ps::ProjectGetResponse { .. } => "ProjectStudioProjectGetResponse",
+                Ps::ProjectUpdateRequest { .. } => "ProjectStudioProjectUpdateRequest",
+                Ps::ProjectUpdateResult { .. } => "ProjectStudioProjectUpdateResult",
+                Ps::ProjectArchiveRequest { .. } => "ProjectStudioProjectArchiveRequest",
+                Ps::ProjectArchiveResult { .. } => "ProjectStudioProjectArchiveResult",
+                Ps::ProjectDeleteRequest { .. } => "ProjectStudioProjectDeleteRequest",
+                Ps::ProjectDeleteResult { .. } => "ProjectStudioProjectDeleteResult",
+                Ps::MembersListRequest { .. } => "ProjectStudioMembersListRequest",
+                Ps::MembersListResponse { .. } => "ProjectStudioMembersListResponse",
+                Ps::MemberCandidatesRequest { .. } => "ProjectStudioMemberCandidatesRequest",
+                Ps::MemberCandidatesResponse { .. } => "ProjectStudioMemberCandidatesResponse",
+                Ps::MembersAddRequest { .. } => "ProjectStudioMembersAddRequest",
+                Ps::MembersAddResponse { .. } => "ProjectStudioMembersAddResponse",
+                Ps::MemberRoleSetRequest { .. } => "ProjectStudioMemberRoleSetRequest",
+                Ps::MemberRoleSetResult { .. } => "ProjectStudioMemberRoleSetResult",
+                Ps::MemberRemoveRequest { .. } => "ProjectStudioMemberRemoveRequest",
+                Ps::MemberRemoveResult { .. } => "ProjectStudioMemberRemoveResult",
+                Ps::OwnershipTransferRequest { .. } => "ProjectStudioOwnershipTransferRequest",
+                Ps::OwnershipTransferResult { .. } => "ProjectStudioOwnershipTransferResult",
+                Ps::CreatorGrantsListRequest => "ProjectStudioCreatorGrantsListRequest",
+                Ps::CreatorGrantsListResponse { .. } => "ProjectStudioCreatorGrantsListResponse",
+                Ps::CreatorGrantSetRequest { .. } => "ProjectStudioCreatorGrantSetRequest",
+                Ps::CreatorGrantSetResult { .. } => "ProjectStudioCreatorGrantSetResult",
+                Ps::SourcesListRequest { .. } => "ProjectStudioSourcesListRequest",
+                Ps::SourcesListResponse { .. } => "ProjectStudioSourcesListResponse",
+                Ps::SourceUploadChunkRequest { .. } => "ProjectStudioSourceUploadChunkRequest",
+                Ps::SourceUploadChunkResponse { .. } => "ProjectStudioSourceUploadChunkResponse",
+                Ps::SourceCreateRequest { .. } => "ProjectStudioSourceCreateRequest",
+                Ps::SourceCreateResponse { .. } => "ProjectStudioSourceCreateResponse",
+                Ps::SourceUpdateRequest { .. } => "ProjectStudioSourceUpdateRequest",
+                Ps::SourceUpdateResponse { .. } => "ProjectStudioSourceUpdateResponse",
+                Ps::SourceDeleteRequest { .. } => "ProjectStudioSourceDeleteRequest",
+                Ps::SourceDeleteResult { .. } => "ProjectStudioSourceDeleteResult",
+                Ps::SourceReingestRequest { .. } => "ProjectStudioSourceReingestRequest",
+                Ps::SourceReingestResponse { .. } => "ProjectStudioSourceReingestResponse",
+                Ps::IngestCancelRequest { .. } => "ProjectStudioIngestCancelRequest",
+                Ps::IngestCancelResult { .. } => "ProjectStudioIngestCancelResult",
+                Ps::IngestStatusRequest { .. } => "ProjectStudioIngestStatusRequest",
+                Ps::IngestStatusResponse { .. } => "ProjectStudioIngestStatusResponse",
+                Ps::SourceFilesListRequest { .. } => "ProjectStudioSourceFilesListRequest",
+                Ps::SourceFilesListResponse { .. } => "ProjectStudioSourceFilesListResponse",
+                Ps::SourceFileDeleteRequest { .. } => "ProjectStudioSourceFileDeleteRequest",
+                Ps::SourceFileDeleteResult { .. } => "ProjectStudioSourceFileDeleteResult",
+                Ps::SourceFilePreviewRequest { .. } => "ProjectStudioSourceFilePreviewRequest",
+                Ps::SourceFilePreviewResponse { .. } => "ProjectStudioSourceFilePreviewResponse",
+                Ps::KbSearchRequest { .. } => "ProjectStudioKbSearchRequest",
+                Ps::KbSearchResponse { .. } => "ProjectStudioKbSearchResponse",
+                Ps::OverviewRequest { .. } => "ProjectStudioOverviewRequest",
+                Ps::OverviewResponse { .. } => "ProjectStudioOverviewResponse",
+                Ps::ActivityListRequest { .. } => "ProjectStudioActivityListRequest",
+                Ps::ActivityListResponse { .. } => "ProjectStudioActivityListResponse",
+                Ps::ChatsListRequest { .. } => "ProjectStudioChatsListRequest",
+                Ps::ChatsListResponse { .. } => "ProjectStudioChatsListResponse",
+                Ps::ChatCreateRequest { .. } => "ProjectStudioChatCreateRequest",
+                Ps::ChatCreateResponse { .. } => "ProjectStudioChatCreateResponse",
+                Ps::ChatRenameRequest { .. } => "ProjectStudioChatRenameRequest",
+                Ps::ChatRenameResult { .. } => "ProjectStudioChatRenameResult",
+                Ps::ChatDeleteRequest { .. } => "ProjectStudioChatDeleteRequest",
+                Ps::ChatDeleteResult { .. } => "ProjectStudioChatDeleteResult",
+                Ps::ChatHistoryRequest { .. } => "ProjectStudioChatHistoryRequest",
+                Ps::ChatHistoryResponse { .. } => "ProjectStudioChatHistoryResponse",
+                Ps::SettingsGetRequest { .. } => "ProjectStudioSettingsGetRequest",
+                Ps::SettingsGetResponse { .. } => "ProjectStudioSettingsGetResponse",
+                Ps::SettingsSaveRequest { .. } => "ProjectStudioSettingsSaveRequest",
+                Ps::SettingsSaveResult { .. } => "ProjectStudioSettingsSaveResult",
+                Ps::TagSaveRequest { .. } => "ProjectStudioTagSaveRequest",
+                Ps::TagSaveResponse { .. } => "ProjectStudioTagSaveResponse",
+                Ps::TagDeleteRequest { .. } => "ProjectStudioTagDeleteRequest",
+                Ps::TagDeleteResult { .. } => "ProjectStudioTagDeleteResult",
+                Ps::IngestStreamRequest { .. } => "ProjectStudioIngestStreamRequest",
+                Ps::IngestStreamChunk { .. } => "ProjectStudioIngestStreamChunk",
+                Ps::IngestStreamEnd { .. } => "ProjectStudioIngestStreamEnd",
+                Ps::ChatStreamRequest { .. } => "ProjectStudioChatStreamRequest",
+                Ps::ChatStreamChunk { .. } => "ProjectStudioChatStreamChunk",
+                Ps::ChatStreamEnd { .. } => "ProjectStudioChatStreamEnd",
+                Ps::CasesListRequest { .. } => "ProjectStudioCasesListRequest",
+                Ps::CasesListResponse { .. } => "ProjectStudioCasesListResponse",
+                Ps::CaseGetRequest { .. } => "ProjectStudioCaseGetRequest",
+                Ps::CaseGetResponse { .. } => "ProjectStudioCaseGetResponse",
+                Ps::CaseSaveRequest { .. } => "ProjectStudioCaseSaveRequest",
+                Ps::CaseSaveResponse { .. } => "ProjectStudioCaseSaveResponse",
+                Ps::CaseStatusSetRequest { .. } => "ProjectStudioCaseStatusSetRequest",
+                Ps::CaseStatusSetResult { .. } => "ProjectStudioCaseStatusSetResult",
+                Ps::CasesBulkStatusRequest { .. } => "ProjectStudioCasesBulkStatusRequest",
+                Ps::CasesBulkStatusResponse { .. } => "ProjectStudioCasesBulkStatusResponse",
+                Ps::CaseDuplicateRequest { .. } => "ProjectStudioCaseDuplicateRequest",
+                Ps::CaseDuplicateResponse { .. } => "ProjectStudioCaseDuplicateResponse",
+                Ps::CaseDeleteRequest { .. } => "ProjectStudioCaseDeleteRequest",
+                Ps::CaseDeleteResult { .. } => "ProjectStudioCaseDeleteResult",
+                Ps::CaseVersionGetRequest { .. } => "ProjectStudioCaseVersionGetRequest",
+                Ps::CaseVersionGetResponse { .. } => "ProjectStudioCaseVersionGetResponse",
+                Ps::CaseRestoreVersionRequest { .. } => "ProjectStudioCaseRestoreVersionRequest",
+                Ps::CaseRestoreVersionResponse { .. } => "ProjectStudioCaseRestoreVersionResponse",
+                Ps::CasesImportCsvRequest { .. } => "ProjectStudioCasesImportCsvRequest",
+                Ps::CasesImportCsvResponse { .. } => "ProjectStudioCasesImportCsvResponse",
+                Ps::AttachmentGetRequest { .. } => "ProjectStudioAttachmentGetRequest",
+                Ps::AttachmentGetResponse { .. } => "ProjectStudioAttachmentGetResponse",
+                Ps::SuitesListRequest { .. } => "ProjectStudioSuitesListRequest",
+                Ps::SuitesListResponse { .. } => "ProjectStudioSuitesListResponse",
+                Ps::SuiteGetRequest { .. } => "ProjectStudioSuiteGetRequest",
+                Ps::SuiteGetResponse { .. } => "ProjectStudioSuiteGetResponse",
+                Ps::SuiteSaveRequest { .. } => "ProjectStudioSuiteSaveRequest",
+                Ps::SuiteSaveResponse { .. } => "ProjectStudioSuiteSaveResponse",
+                Ps::SuiteDeleteRequest { .. } => "ProjectStudioSuiteDeleteRequest",
+                Ps::SuiteDeleteResult { .. } => "ProjectStudioSuiteDeleteResult",
+                Ps::RunsListRequest { .. } => "ProjectStudioRunsListRequest",
+                Ps::RunsListResponse { .. } => "ProjectStudioRunsListResponse",
+                Ps::RunCreateRequest { .. } => "ProjectStudioRunCreateRequest",
+                Ps::RunCreateResponse { .. } => "ProjectStudioRunCreateResponse",
+                Ps::RunGetRequest { .. } => "ProjectStudioRunGetRequest",
+                Ps::RunGetResponse { .. } => "ProjectStudioRunGetResponse",
+                Ps::RunCloseRequest { .. } => "ProjectStudioRunCloseRequest",
+                Ps::RunCloseResult { .. } => "ProjectStudioRunCloseResult",
+                Ps::RunDeleteRequest { .. } => "ProjectStudioRunDeleteRequest",
+                Ps::RunDeleteResult { .. } => "ProjectStudioRunDeleteResult",
+                Ps::RunItemClaimRequest { .. } => "ProjectStudioRunItemClaimRequest",
+                Ps::RunItemClaimResponse { .. } => "ProjectStudioRunItemClaimResponse",
+                Ps::RunItemReleaseRequest { .. } => "ProjectStudioRunItemReleaseRequest",
+                Ps::RunItemReleaseResult { .. } => "ProjectStudioRunItemReleaseResult",
+                Ps::RunItemGetRequest { .. } => "ProjectStudioRunItemGetRequest",
+                Ps::RunItemGetResponse { .. } => "ProjectStudioRunItemGetResponse",
+                Ps::RunStepSetRequest { .. } => "ProjectStudioRunStepSetRequest",
+                Ps::RunStepSetResult { .. } => "ProjectStudioRunStepSetResult",
+                Ps::RunItemFinishRequest { .. } => "ProjectStudioRunItemFinishRequest",
+                Ps::RunItemFinishResponse { .. } => "ProjectStudioRunItemFinishResponse",
+                Ps::MyTestWorkRequest => "ProjectStudioMyTestWorkRequest",
+                Ps::MyTestWorkResponse { .. } => "ProjectStudioMyTestWorkResponse",
+                Ps::TasksListRequest { .. } => "ProjectStudioTasksListRequest",
+                Ps::TasksListResponse { .. } => "ProjectStudioTasksListResponse",
+                Ps::TaskGetRequest { .. } => "ProjectStudioTaskGetRequest",
+                Ps::TaskGetResponse { .. } => "ProjectStudioTaskGetResponse",
+                Ps::TaskSaveRequest { .. } => "ProjectStudioTaskSaveRequest",
+                Ps::TaskSaveResponse { .. } => "ProjectStudioTaskSaveResponse",
+                Ps::TaskDeleteRequest { .. } => "ProjectStudioTaskDeleteRequest",
+                Ps::TaskDeleteResult { .. } => "ProjectStudioTaskDeleteResult",
+                Ps::TaskCommentAddRequest { .. } => "ProjectStudioTaskCommentAddRequest",
+                Ps::TaskCommentAddResponse { .. } => "ProjectStudioTaskCommentAddResponse",
+                Ps::TaskCommentEditRequest { .. } => "ProjectStudioTaskCommentEditRequest",
+                Ps::TaskCommentEditResult { .. } => "ProjectStudioTaskCommentEditResult",
+                Ps::TaskCommentDeleteRequest { .. } => "ProjectStudioTaskCommentDeleteRequest",
+                Ps::TaskCommentDeleteResult { .. } => "ProjectStudioTaskCommentDeleteResult",
+                Ps::GenerationStartRequest { .. } => "ProjectStudioGenerationStartRequest",
+                Ps::GenerationStartResponse { .. } => "ProjectStudioGenerationStartResponse",
+                Ps::GenerationsListRequest { .. } => "ProjectStudioGenerationsListRequest",
+                Ps::GenerationsListResponse { .. } => "ProjectStudioGenerationsListResponse",
+                Ps::GenerationGetRequest { .. } => "ProjectStudioGenerationGetRequest",
+                Ps::GenerationGetResponse { .. } => "ProjectStudioGenerationGetResponse",
+                Ps::GenerationCancelRequest { .. } => "ProjectStudioGenerationCancelRequest",
+                Ps::GenerationCancelResult { .. } => "ProjectStudioGenerationCancelResult",
+                Ps::GenerationReviewRequest { .. } => "ProjectStudioGenerationReviewRequest",
+                Ps::GenerationReviewResponse { .. } => "ProjectStudioGenerationReviewResponse",
+                Ps::GenerationDeleteRequest { .. } => "ProjectStudioGenerationDeleteRequest",
+                Ps::GenerationDeleteResult { .. } => "ProjectStudioGenerationDeleteResult",
+                Ps::NotificationsListRequest { .. } => "ProjectStudioNotificationsListRequest",
+                Ps::NotificationsListResponse { .. } => "ProjectStudioNotificationsListResponse",
+                Ps::NotificationsMarkReadRequest { .. } => {
+                    "ProjectStudioNotificationsMarkReadRequest"
+                }
+                Ps::NotificationsMarkReadResult { .. } => {
+                    "ProjectStudioNotificationsMarkReadResult"
+                }
+                Ps::ReportQueryRequest { .. } => "ProjectStudioReportQueryRequest",
+                Ps::ReportQueryResponse { .. } => "ProjectStudioReportQueryResponse",
+                Ps::EnvironmentsListRequest { .. } => "ProjectStudioEnvironmentsListRequest",
+                Ps::EnvironmentsListResponse { .. } => "ProjectStudioEnvironmentsListResponse",
+                Ps::EnvironmentSaveRequest { .. } => "ProjectStudioEnvironmentSaveRequest",
+                Ps::EnvironmentSaveResponse { .. } => "ProjectStudioEnvironmentSaveResponse",
+                Ps::EnvironmentDeleteRequest { .. } => "ProjectStudioEnvironmentDeleteRequest",
+                Ps::EnvironmentDeleteResult { .. } => "ProjectStudioEnvironmentDeleteResult",
+                Ps::EnvApprovalsListRequest => "ProjectStudioEnvApprovalsListRequest",
+                Ps::EnvApprovalsListResponse { .. } => "ProjectStudioEnvApprovalsListResponse",
+                Ps::EnvApprovalDecideRequest { .. } => "ProjectStudioEnvApprovalDecideRequest",
+                Ps::EnvApprovalDecideResult { .. } => "ProjectStudioEnvApprovalDecideResult",
+                Ps::BuildProfileGetRequest { .. } => "ProjectStudioBuildProfileGetRequest",
+                Ps::BuildProfileGetResponse { .. } => "ProjectStudioBuildProfileGetResponse",
+                Ps::BuildProfileSaveRequest { .. } => "ProjectStudioBuildProfileSaveRequest",
+                Ps::BuildProfileSaveResponse { .. } => "ProjectStudioBuildProfileSaveResponse",
+                Ps::RunnersListRequest { .. } => "ProjectStudioRunnersListRequest",
+                Ps::RunnersListResponse { .. } => "ProjectStudioRunnersListResponse",
+                Ps::RunStartAutoRequest { .. } => "ProjectStudioRunStartAutoRequest",
+                Ps::RunStartAutoResponse { .. } => "ProjectStudioRunStartAutoResponse",
+                Ps::RunAutoGetRequest { .. } => "ProjectStudioRunAutoGetRequest",
+                Ps::RunAutoGetResponse { .. } => "ProjectStudioRunAutoGetResponse",
+                Ps::RunAutoCancelRequest { .. } => "ProjectStudioRunAutoCancelRequest",
+                Ps::RunAutoCancelResult { .. } => "ProjectStudioRunAutoCancelResult",
+                Ps::TryRunStartRequest { .. } => "ProjectStudioTryRunStartRequest",
+                Ps::TryRunCancelRequest { .. } => "ProjectStudioTryRunCancelRequest",
+                Ps::TryRunCancelResult { .. } => "ProjectStudioTryRunCancelResult",
+                Ps::SourceRefreshRequest { .. } => "ProjectStudioSourceRefreshRequest",
+                Ps::SourceRefreshResponse { .. } => "ProjectStudioSourceRefreshResponse",
+                Ps::ApiSpecEndpointsRequest { .. } => "ProjectStudioApiSpecEndpointsRequest",
+                Ps::ApiSpecEndpointsResponse { .. } => "ProjectStudioApiSpecEndpointsResponse",
+                Ps::SourceSecretSetRequest { .. } => "ProjectStudioSourceSecretSetRequest",
+                Ps::SourceSecretSetResult { .. } => "ProjectStudioSourceSecretSetResult",
+                Ps::RunArtifactGetRequest { .. } => "ProjectStudioRunArtifactGetRequest",
+                Ps::RunArtifactGetResponse { .. } => "ProjectStudioRunArtifactGetResponse",
+                Ps::RunAutoStreamRequest { .. } => "ProjectStudioRunAutoStreamRequest",
+                Ps::RunAutoStreamChunk { .. } => "ProjectStudioRunAutoStreamChunk",
+                Ps::RunAutoStreamEnd { .. } => "ProjectStudioRunAutoStreamEnd",
+                Ps::TryRunStreamChunk { .. } => "ProjectStudioTryRunStreamChunk",
+                Ps::TryRunStreamEnd { .. } => "ProjectStudioTryRunStreamEnd",
+                Ps::CodeAssistRequest { .. } => "ProjectStudioCodeAssistRequest",
+                Ps::CodeAssistStreamChunk { .. } => "ProjectStudioCodeAssistStreamChunk",
+                Ps::CodeAssistStreamEnd { .. } => "ProjectStudioCodeAssistStreamEnd",
+                Ps::SchedulesListRequest { .. } => "ProjectStudioSchedulesListRequest",
+                Ps::SchedulesListResponse { .. } => "ProjectStudioSchedulesListResponse",
+                Ps::ScheduleSaveRequest { .. } => "ProjectStudioScheduleSaveRequest",
+                Ps::ScheduleSaveResponse { .. } => "ProjectStudioScheduleSaveResponse",
+                Ps::ScheduleDeleteRequest { .. } => "ProjectStudioScheduleDeleteRequest",
+                Ps::ScheduleDeleteResult { .. } => "ProjectStudioScheduleDeleteResult",
+                Ps::ScheduleSetEnabledRequest { .. } => "ProjectStudioScheduleSetEnabledRequest",
+                Ps::ScheduleSetEnabledResult { .. } => "ProjectStudioScheduleSetEnabledResult",
+                Ps::ScheduleRunNowRequest { .. } => "ProjectStudioScheduleRunNowRequest",
+                Ps::ScheduleRunNowResponse { .. } => "ProjectStudioScheduleRunNowResponse",
+                Ps::ScheduleRunsListRequest { .. } => "ProjectStudioScheduleRunsListRequest",
+                Ps::ScheduleRunsListResponse { .. } => "ProjectStudioScheduleRunsListResponse",
+                Ps::MlLinksListRequest { .. } => "ProjectStudioMlLinksListRequest",
+                Ps::MlLinksListResponse { .. } => "ProjectStudioMlLinksListResponse",
+                Ps::MlProjectCreateFromProjectRequest { .. } => {
+                    "ProjectStudioMlProjectCreateFromProjectRequest"
+                }
+                Ps::MlProjectCreateFromProjectResponse { .. } => {
+                    "ProjectStudioMlProjectCreateFromProjectResponse"
+                }
+                Ps::MlProjectCandidatesRequest { .. } => "ProjectStudioMlProjectCandidatesRequest",
+                Ps::MlProjectCandidatesResponse { .. } => {
+                    "ProjectStudioMlProjectCandidatesResponse"
+                }
+                Ps::MlLinkAttachRequest { .. } => "ProjectStudioMlLinkAttachRequest",
+                Ps::MlLinkAttachResponse { .. } => "ProjectStudioMlLinkAttachResponse",
+                Ps::MlLinkUpdateRequest { .. } => "ProjectStudioMlLinkUpdateRequest",
+                Ps::MlLinkUpdateResult { .. } => "ProjectStudioMlLinkUpdateResult",
+                Ps::MlLinkDetachRequest { .. } => "ProjectStudioMlLinkDetachRequest",
+                Ps::MlLinkDetachResult { .. } => "ProjectStudioMlLinkDetachResult",
+                Ps::MlLinkSyncNowRequest { .. } => "ProjectStudioMlLinkSyncNowRequest",
+                Ps::MlLinkSyncNowResponse { .. } => "ProjectStudioMlLinkSyncNowResponse",
+                Ps::TaskStatusSetRequest { .. } => "ProjectStudioTaskStatusSetRequest",
+                Ps::TaskStatusSetResult { .. } => "ProjectStudioTaskStatusSetResult",
+                Ps::ProjectExportStartRequest { .. } => "ProjectStudioProjectExportStartRequest",
+                Ps::ProjectExportStartResponse { .. } => "ProjectStudioProjectExportStartResponse",
+                Ps::ProjectExportStatusRequest { .. } => "ProjectStudioProjectExportStatusRequest",
+                Ps::ProjectExportStatusResponse { .. } => {
+                    "ProjectStudioProjectExportStatusResponse"
+                }
+                Ps::ProjectImportUploadChunkRequest { .. } => {
+                    "ProjectStudioProjectImportUploadChunkRequest"
+                }
+                Ps::ProjectImportUploadChunkResponse { .. } => {
+                    "ProjectStudioProjectImportUploadChunkResponse"
+                }
+                Ps::ProjectImportPreviewRequest { .. } => {
+                    "ProjectStudioProjectImportPreviewRequest"
+                }
+                Ps::ProjectImportPreviewResponse { .. } => {
+                    "ProjectStudioProjectImportPreviewResponse"
+                }
+                Ps::ProjectImportApplyRequest { .. } => "ProjectStudioProjectImportApplyRequest",
+                Ps::ProjectImportApplyResponse { .. } => "ProjectStudioProjectImportApplyResponse",
+                Ps::ProjectImportStatusRequest { .. } => "ProjectStudioProjectImportStatusRequest",
+                Ps::ProjectImportStatusResponse { .. } => {
+                    "ProjectStudioProjectImportStatusResponse"
+                }
+                Ps::ArchiveStreamRequest { .. } => "ProjectStudioArchiveStreamRequest",
+                Ps::ArchiveStreamChunk { .. } => "ProjectStudioArchiveStreamChunk",
+                Ps::ArchiveStreamEnd { .. } => "ProjectStudioArchiveStreamEnd",
+            }
+        }
+        MessageBody::CodeStudioBody(p) => {
+            use tentaflow_protocol::code_studio::CodeStudioPayload as Cs;
+            match p {
+                Cs::WorkspacesListRequest { .. } => "CodeStudioWorkspacesListRequest",
+                Cs::WorkspacesListResponse { .. } => "CodeStudioWorkspacesListResponse",
+                Cs::WorkspaceCreateRequest { .. } => "CodeStudioWorkspaceCreateRequest",
+                Cs::WorkspaceCreateResponse { .. } => "CodeStudioWorkspaceCreateResponse",
+                Cs::WorkspaceGetRequest { .. } => "CodeStudioWorkspaceGetRequest",
+                Cs::WorkspaceGetResponse { .. } => "CodeStudioWorkspaceGetResponse",
+                Cs::WorkspaceRetryRequest { .. } => "CodeStudioWorkspaceRetryRequest",
+                Cs::WorkspaceRetryResponse { .. } => "CodeStudioWorkspaceRetryResponse",
+                Cs::WorkspaceArchiveRequest { .. } => "CodeStudioWorkspaceArchiveRequest",
+                Cs::WorkspaceArchiveResponse { .. } => "CodeStudioWorkspaceArchiveResponse",
+                Cs::WorkspaceMemberSetRequest { .. } => "CodeStudioWorkspaceMemberSetRequest",
+                Cs::WorkspaceMemberRemoveRequest { .. } => "CodeStudioWorkspaceMemberRemoveRequest",
+                Cs::WorkspaceMembersResponse { .. } => "CodeStudioWorkspaceMembersResponse",
+                Cs::WorkspaceCreatorGrantSetRequest { .. } => {
+                    "CodeStudioWorkspaceCreatorGrantSetRequest"
+                }
+                Cs::WorkspaceCreatorGrantResponse { .. } => {
+                    "CodeStudioWorkspaceCreatorGrantResponse"
+                }
+                Cs::SessionsListRequest { .. } => "CodeStudioSessionsListRequest",
+                Cs::SessionsListResponse { .. } => "CodeStudioSessionsListResponse",
+                Cs::SessionOpenRequest { .. } => "CodeStudioSessionOpenRequest",
+                Cs::SessionOpenResponse { .. } => "CodeStudioSessionOpenResponse",
+                Cs::SessionCloseRequest { .. } => "CodeStudioSessionCloseRequest",
+                Cs::SessionCloseResponse { .. } => "CodeStudioSessionCloseResponse",
+            }
+        }
     }
 }
 

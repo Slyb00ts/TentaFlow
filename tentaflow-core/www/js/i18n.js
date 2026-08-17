@@ -84,11 +84,31 @@ function lookup(dict, path) {
   return typeof result === 'string' ? result : null;
 }
 
+// Plural forms: `{count|przypadek|przypadki|przypadków}` picks the form for the
+// current language. Polish needs three forms (1 / 2-4 / rest), the other
+// supported languages only one/other, so a two-form list works everywhere.
+function pluralForm(value, forms) {
+  const n = Math.abs(Number(value));
+  if (!Number.isFinite(n)) return forms[forms.length - 1];
+  if (currentLang === 'pl' && forms.length >= 3) {
+    if (n === 1) return forms[0];
+    const mod10 = n % 10;
+    const mod100 = n % 100;
+    if (mod10 >= 2 && mod10 <= 4 && !(mod100 >= 12 && mod100 <= 14)) return forms[1];
+    return forms[2];
+  }
+  return n === 1 ? forms[0] : forms[1] ?? forms[0];
+}
+
 function interpolate(template, vars) {
   if (!vars) return template;
-  return template.replace(/\{(\w+)\}/g, (match, key) => {
-    return key in vars ? String(vars[key]) : match;
-  });
+  return template
+    .replace(/\{(\w+)\|([^}]*)\}/g, (match, key, forms) => (
+      key in vars ? pluralForm(vars[key], forms.split('|')) : match
+    ))
+    .replace(/\{(\w+)\}/g, (match, key) => {
+      return key in vars ? String(vars[key]) : match;
+    });
 }
 
 function applyDataI18n(root = document) {

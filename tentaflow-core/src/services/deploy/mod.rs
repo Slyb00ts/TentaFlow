@@ -6,6 +6,7 @@
 //                deployments. If it fails, ROLLBACK is invoked to undo prepare.
 
 pub mod binary;
+pub mod cluster_health;
 pub mod distributed;
 pub mod docker;
 pub mod embedded;
@@ -516,6 +517,13 @@ pub async fn deploy(
             hf_token.clone(),
             sink.clone(),
         )),
+        DeployMethod::NativeManagedCli => Box::new(binary::BinaryDeploy::new(
+            manifest.clone(),
+            user_config.clone(),
+            ports.clone(),
+            hf_token.clone(),
+            sink.clone(),
+        )),
         DeployMethod::NativePythonBundle => Box::new(python_bundle::PythonBundleDeploy::new(
             manifest.clone(),
             user_config.clone(),
@@ -696,6 +704,14 @@ pub async fn respawn(
             None,
             preserved_port,
         )),
+        DeployMethod::NativeManagedCli => Box::new(binary::BinaryDeploy::new_with_port(
+            manifest,
+            user_config,
+            ports.clone(),
+            hf_token.clone(),
+            None,
+            preserved_port,
+        )),
         DeployMethod::NativePythonBundle => {
             Box::new(python_bundle::PythonBundleDeploy::new_with_port(
                 manifest,
@@ -842,10 +858,17 @@ pub async fn stop(
     }
 
     // Process shutdown: only the process-owning transports actually have a PID.
-    if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+    if matches!(
+        svc.deploy_method,
+        DM::NativeBinary | DM::NativePythonBundle | DM::NativeManagedCli
+    ) {
         if let Some(pid) = svc.runtime_pid {
-            // SIGTERM with short grace then SIGKILL — handled inside terminate.
-            let _ = crate::deploy::process_ctl::terminate(pid as u32);
+            // SIGTERM → grace → SIGKILL, i to dla CALEJ GRUPY, nie tylko lidera:
+            // `terminate` przestaje pilnowac, gdy zginie rodzic, a workery vLLM
+            // (`EngineCore`) schodza wolniej i zostawaly osierocone, trzymajac
+            // VRAM. Nastepny deploy widzial wtedy mniej wolnej pamieci i padal.
+            // Sweep po porcie ponizej ich NIE lapie — worker nie slucha na porcie.
+            let _ = crate::deploy::process_ctl::terminate_group(pid as u32);
         }
         // Belt-and-suspenders: `terminate(runtime_pid)` misses the real port-holder
         // when the tracked PID is stale/None (crash + un-recorded respawn) or when a
@@ -913,7 +936,10 @@ pub async fn stop_checked(
     // deploy wpadłby w duplikat runtime'u / OOM. Reużywamy detektora żywotności
     // supervisora (`process_ctl::is_alive`, który wykrywa też zombie przez
     // /proc/<pid>/status), żeby potwierdzić śmierć po stopie.
-    if matches!(svc.deploy_method, DM::NativeBinary | DM::NativePythonBundle) {
+    if matches!(
+        svc.deploy_method,
+        DM::NativeBinary | DM::NativePythonBundle | DM::NativeManagedCli
+    ) {
         if let Some(pid) = svc.runtime_pid {
             let pid = pid as u32;
             if crate::deploy::process_ctl::is_alive(pid) {
@@ -1174,9 +1200,9 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         .by_id(&prepared.engine_id)
         .map(|m| match prepared.deploy_method {
             DeployMethod::Docker => m.docker_source_hash.clone(),
-            DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => {
-                m.native_source_hash.clone()
-            }
+            DeployMethod::NativeBinary
+            | DeployMethod::NativePythonBundle
+            | DeployMethod::NativeManagedCli => m.native_source_hash.clone(),
             _ => String::new(),
         })
         .unwrap_or_default();
@@ -1309,6 +1335,7 @@ fn placeholder_transport(method: DeployMethod) -> Transport {
         DeployMethod::External => Transport::ExternalHttp,
         DeployMethod::Docker => Transport::SidecarQuic,
         DeployMethod::NativeBinary | DeployMethod::NativePythonBundle => Transport::HttpDirect,
+        DeployMethod::NativeManagedCli => Transport::AgentRpc,
     }
 }
 
@@ -2012,6 +2039,7 @@ mod apply_parameters_deploy_tests {
             default_port: 8000,
             dgx_spark: None,
             cluster_capable: None,
+            preset_only: None,
             cluster_launch: None,
             api: ApiKind::OpenaiCompatible,
             version: "0.1.0".into(),
@@ -2297,6 +2325,7 @@ mod hf_token_gate_tests {
             default_port: 8000,
             dgx_spark: None,
             cluster_capable: None,
+            preset_only: None,
             cluster_launch: None,
             api,
             version: "0.1.0".into(),
@@ -2951,6 +2980,7 @@ mod tests {
                 default_port: 8000,
                 dgx_spark: None,
                 cluster_capable: None,
+                preset_only: None,
                 cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0.0.1".into(),
@@ -2982,6 +3012,7 @@ mod tests {
                 speculator_repo: None,
                 speculator_method: None,
                 speculator_num_tokens: None,
+                sampling: None,
                 vllm: None,
                 checkpoint_file: None,
                 quant_variants: Vec::new(),

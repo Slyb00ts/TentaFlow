@@ -1,0 +1,52 @@
+# Manifest serwisu vLLM-DSpark-src — DeepSeek V4 Flash na klaster 2-8x DGX Spark,
+# ale zbudowany z UPSTREAMOWYCH zrodel zamiast cudzego prebuilt obrazu.
+#
+# Roznica wobec `vllm-dspark.toml`: tamten bierze `ghcr.io/bjk110/vllm-spark`
+# nieznanego autorstwa i nadpisuje w nim 18 plikow (~24k linii) rekurencyjnym
+# `cp -a`, przez co po cichu cofa kazda upstreamowa poprawke w tych plikach i
+# jest przypiety do jednego forka 0.21-dev. Ten buduje vLLM 0.27 z tagu i
+# naklada JEDNA nasza latke — `nvfp4_ds_mla`, jedyna rzecz, ktorej upstream
+# nadal nie ma. Proposer DSpark, model draftujacy i backend B12X MoE sa juz
+# w 0.27 (`v1/worker/gpu/spec_decode/dspark/`, `DSparkDraftModel` w rejestrze,
+# `flashinfer_b12x_moe.py`).
+
+[engine]
+id = "vllm-dspark-src"
+backend = "vllm"
+category = "llm"
+name = "DeepSeek V4 Flash DSpark src (2-8x Spark)"
+description_pl = "DeepSeek V4 Flash 284B MoE na klaster 2-8x DGX Spark. vLLM 0.27 budowany ze zrodel dla sm_121a + latka nvfp4_ds_mla."
+description_en = "DeepSeek V4 Flash 284B MoE on a 2-8x DGX Spark cluster. vLLM 0.27 built from source for sm_121a plus the nvfp4_ds_mla patch."
+homepage = "https://github.com/vllm-project/vllm"
+license = "Apache-2.0"
+icon = "vllm"
+default_port = 8000
+api = "openai-compatible"
+version = "0.27.0"
+dgx_spark = true
+cluster_capable = true
+cluster_launch = "vllm-mp"
+preset_only = true
+
+[deploy.docker]
+context_path = "llm/docker/vllm-dspark-src"
+platforms = ["linux"]
+transport = "direct-http"
+
+[[model_preset]]
+id = "deepseek-v4-flash-0731-src"
+display_name = "DeepSeek V4 Flash 0731 (NVFP4, DSpark, vLLM 0.27 src, 2-8x Spark)"
+repo = "deepseek-ai/DeepSeek-V4-Flash-0731"
+quantization = "nvfp4"
+speculator_method = "dspark"
+# k MUSI rownac sie `dspark_block_size` checkpointu (= 5). Karta modelu podaje 7,
+# a vLLM odrzuca to wprost: "7 must be divisible by n_predict=5".
+speculator_num_tokens = 5
+recommended = true
+featured = true
+
+# Wartosci z karty modelu 0731. `temperature = 1.0` jest nietypowa — bez jawnego
+# ustawienia serwer wystartowalby z wlasnym domyslem i model odpowiadalby gorzej.
+[model_preset.sampling]
+temperature = 1.0
+top_p = 0.95

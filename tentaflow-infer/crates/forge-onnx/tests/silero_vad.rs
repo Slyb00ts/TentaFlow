@@ -12,8 +12,8 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_onnx::Tensor;
 
 const DEFAULT_MODEL: &str =
@@ -38,7 +38,7 @@ fn model_path() -> Option<String> {
 
 fn device() -> Option<Arc<dyn Device>> {
     // Small pools: Silero is 2.3 MB and its activations are a handful of KB.
-    let dev = CudaDevice::new(
+    let dev = gpu::open(
         0,
         PoolSizes {
             weights: 64 << 20,
@@ -77,7 +77,15 @@ fn op_histogram_lists_silero_ops() {
     let hist = forge_onnx::op_histogram(&model);
     // The parser must recover the real op set, including the ops inside the
     // sample-rate / state-init If subgraphs (Conv, LSTM, …).
-    for op in ["Conv", "LSTM", "Sigmoid", "Relu", "ReduceMean", "If", "Slice"] {
+    for op in [
+        "Conv",
+        "LSTM",
+        "Sigmoid",
+        "Relu",
+        "ReduceMean",
+        "If",
+        "Slice",
+    ] {
         assert!(hist.contains_key(op), "missing op {op} in {hist:?}");
     }
     eprintln!("silero_vad op histogram: {hist:?}");

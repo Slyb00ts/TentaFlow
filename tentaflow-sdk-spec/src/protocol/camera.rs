@@ -96,6 +96,28 @@ pub struct CameraIdInput {
     pub camera_id: String,
 }
 
+/// Detection zones of a camera — normalized polygons serialized as JSON,
+/// mirroring the `cameras.zones_json` column. An empty list means "analyse the
+/// whole frame".
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraZonesOut {
+    #[n(0)]
+    pub camera_id: String,
+    #[n(1)]
+    pub zones_json: String,
+}
+
+/// Input for `camera_zones_set_v1` — replaces the whole polygon set.
+#[derive(Debug, Clone, PartialEq, Encode, Decode)]
+#[cbor(map)]
+pub struct CameraZonesSetInput {
+    #[n(0)]
+    pub camera_id: String,
+    #[n(1)]
+    pub zones_json: String,
+}
+
 /// Input for `camera_update_v1`. Every field except `camera_id` is optional —
 /// only present fields are patched.
 #[derive(Debug, Clone, PartialEq, Encode, Decode)]

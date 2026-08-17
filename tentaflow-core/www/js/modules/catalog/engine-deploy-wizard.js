@@ -87,12 +87,14 @@ let cachedModelSpec = null;
 // Poprzedni stan "at_limit" — gdy zmienia sie z false->true, dodajemy
 // klase pulse na adv-pill zeby user zauwazyl ze jest na granicy.
 let prevAtLimit = false;
+let deployInFlight = false;
 
 
 /// Publiczne API: otwiera wizard dla `engineId`. `opts` opcjonalnie zawiera
 /// `nodeId` (preselekcja z MeshDetail) i `hostOs` (z katalogu).
 export async function openDeployWizard(engineId, opts = {}) {
   currentStep = 1;
+  deployInFlight = false;
   onCloseCallback = null;
   modelSourceMode = 'preset';
   hfResults = [];
@@ -121,6 +123,8 @@ export async function openDeployWizard(engineId, opts = {}) {
     clusterId: opts.clusterId || null,
     clusterMembers: [],
     gpusPerNode: 1,
+    // null = wylicz z rozmiaru wag (`defaultReadyTimeoutSecs`).
+    readyTimeoutSecs: null,
     servedModelName: '',
     pricing: { promptPer1k: null, completionPer1k: null, audioPerMin: null, imageEach: null },
     // External cloud provider credentials (deploy.external.requires_api_key).
@@ -2208,6 +2212,23 @@ function clusterTpSize() {
   return members * g;
 }
 
+/// Budzet fazy P6 (zaladowanie wag -> /v1/models 200). Przekroczenie NIE jest
+/// bledem modelu — Core rozbiera wtedy caly klaster, wiec wartosc musi byc do
+/// ustawienia. Default skaluje sie z rozmiarem wag: pierwszy start czyta je z
+/// dysku na kazdym czlonku, po czym dochodzi CUDA-graph capture i autotune.
+function defaultReadyTimeoutSecs() {
+  const rec = advancedRecommendation && !advancedRecommendation.error ? advancedRecommendation : null;
+  const weightsGb = rec?.vram_estimate?.model_weights_gb || 0;
+  // ~15 GB/min laczne czytanie wag + 15 min stalego narzutu startu.
+  const scaled = Math.ceil((weightsGb / 15) * 60) + 900;
+  return Math.min(14400, Math.max(1800, scaled));
+}
+
+function clusterReadyTimeoutSecs() {
+  const v = Number(selection.readyTimeoutSecs);
+  return Number.isFinite(v) && v >= 300 ? Math.round(v) : defaultReadyTimeoutSecs();
+}
+
 function renderStepClusterConfig() {
   const members = selection.clusterMembers.length || 0;
   // gpusPerNode is bounded by the representative node's physical GPU count.
@@ -2256,6 +2277,21 @@ function renderStepClusterConfig() {
     </div>
 
     <div class="form-group">
+      <tf-input type="number" id="edw-cluster-ready-timeout" min="300" step="60"
+        label="${escapeAttr(tCluster('ready_timeout'))}"
+        value="${escapeAttr(String(clusterReadyTimeoutSecs()))}"></tf-input>
+      <div class="form-hint">${escapeHtml(tCluster('ready_timeout_hint'))}</div>
+    </div>
+
+    <div class="form-group">
+      <tf-input type="text" id="edw-cluster-vllm-args"
+        label="${escapeAttr(tCluster('vllm_args'))}"
+        placeholder="--max-num-seqs 6 --max-cudagraph-capture-size 36"
+        value="${escapeAttr(selection.clusterVllmArgs || '')}"></tf-input>
+      <div class="form-hint">${escapeHtml(tCluster('vllm_args_hint'))}</div>
+    </div>
+
+    <div class="form-group">
       <label>${escapeHtml(tCluster('pricing_title'))}</label>
       <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(tCluster('pricing_hint'))}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
@@ -2301,6 +2337,21 @@ function bindStepClusterConfigInputs() {
     portInput.addEventListener('input', (e) => {
       const v = parseInt(e.detail?.value ?? portInput.value, 10);
       selection.port = Number.isFinite(v) ? v : 8100;
+    });
+  }
+
+  const readyInput = document.getElementById('edw-cluster-ready-timeout');
+  if (readyInput) {
+    readyInput.addEventListener('input', (e) => {
+      const v = parseInt(e.detail?.value ?? readyInput.value, 10);
+      selection.readyTimeoutSecs = Number.isFinite(v) ? v : null;
+    });
+  }
+
+  const argsInput = document.getElementById('edw-cluster-vllm-args');
+  if (argsInput) {
+    argsInput.addEventListener('input', (e) => {
+      selection.clusterVllmArgs = String(e.detail?.value ?? argsInput.value ?? '');
     });
   }
 
@@ -3136,6 +3187,7 @@ function updateHfGgufFiles() {
 // ---- Deploy ---------------------------------------------------------------
 
 async function startDeploy() {
+  if (deployInFlight) return;
   if (selection.isCluster) {
     await startClusterDeploy();
     return;
@@ -3158,6 +3210,7 @@ async function startDeploy() {
   }
 
   if (btn) btn.setAttribute('disabled', '');
+  deployInFlight = true;
 
   const eng = engineEntry.engine || {};
   // Build vllm_args z Advanced step (jezeli aktywny dla tego silnika).
@@ -3340,8 +3393,10 @@ async function startDeploy() {
       deployId: id,
       engineId: eng.id,
       deployMethod: selection.deployMethod,
+      nodeId: selection.nodeId,
     });
   } catch (err) {
+    deployInFlight = false;
     toast(I18n.t('wizard.deployFailed').replace('{error}', err.message || err), 'error');
     if (btn) btn.removeAttribute('disabled');
   }
@@ -3376,15 +3431,19 @@ async function startClusterDeploy() {
   const gpuMem = adv.gpu_memory_utilization ?? 0.5;
 
   if (btn) btn.setAttribute('disabled', '');
-  // P6 (model load -> /v1/models 200) budget. A 100-300GB TP=2 model's first
-  // boot includes weight load on every member + CUDA-graph capture + FlashInfer
-  // autotune — 10 min is too tight and a timeout tears the whole cluster down.
-  const readyTimeoutSecs = 1800;
+  const readyTimeoutSecs = clusterReadyTimeoutSecs();
+  // `config_json` niesie `vllm_args` — backend dokleja je PO argumentach silnika,
+  // wiec argparse pozwala nimi nadpisac kazdy zaszyty domysl bez przebudowy.
+  // Protokol mial to pole od poczatku, ale sciezka klastrowa go nie wysylala,
+  // przez co jedyna droga do zmiany np. `--max-num-seqs` byl rebuild.
+  const clusterArgs = String(selection.clusterVllmArgs || '').trim();
+  const configJson = clusterArgs ? JSON.stringify({ vllm_args: clusterArgs }) : null;
   try {
     const resp = await ApiBinary.action(
       'clusterDeployRequest',
       {
         clusterId: selection.clusterId,
+        configJson,
         engineId: eng.id,
         modelRepo,
         modelPresetId: selection.modelPresetId || null,

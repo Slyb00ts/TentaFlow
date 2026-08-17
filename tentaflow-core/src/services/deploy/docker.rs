@@ -881,6 +881,7 @@ mod backend {
         labels: &HashMap<String, String>,
         gpu: GpuSelection,
         distributed: Option<DistributedDockerOpts>,
+        sandbox: Option<crate::deploy::docker::SandboxLimits>,
     ) -> DeployResult<String> {
         let mut port_bindings: HashMap<String, Option<Vec<PortBinding>>> = HashMap::new();
         let mut exposed: Vec<String> = Vec::new();
@@ -966,6 +967,11 @@ mod backend {
                 hard: Some(-1),
             }]);
             host_config.shm_size = Some(opts.shm_size_bytes);
+        }
+        // Untrusted-code engines (the Project Studio test runner) get hard
+        // resource + capability limits on top of the normal config.
+        if let Some(limits) = &sandbox {
+            crate::deploy::docker::apply_sandbox_limits(&mut host_config, limits);
         }
         // Distributed: BYPASS the base entrypoint — run the ray+vllm command
         // directly as `bash -c <cmd>`. `cmd`/`engine_args` are ignored (the full
@@ -1274,10 +1280,14 @@ impl DeployStrategy for DockerDeploy {
             .map(|d| d.role == "worker")
             .unwrap_or(false);
 
-        let transport = match &distributed {
-            Some(_) if is_worker => Transport::Embedded,
-            Some(_) => Transport::HttpDirect,
-            None => self.pick_transport(),
+        let transport = if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
+            Transport::AgentRpc
+        } else {
+            match &distributed {
+                Some(_) if is_worker => Transport::Embedded,
+                Some(_) => Transport::HttpDirect,
+                None => self.pick_transport(),
+            }
         };
         let internal_port = self.manifest.engine.default_port;
         let mut allocated = Vec::new();
@@ -1328,6 +1338,10 @@ impl DeployStrategy for DockerDeploy {
             env.insert(k, v);
         }
         env.insert("PORT".into(), internal_port.to_string());
+        env.insert(
+            "TENTAFLOW_ENGINE_ID".into(),
+            self.manifest.engine.id.clone(),
+        );
         // Distributed: VLLM_PORT is the torch.distributed TCPStore master port and
         // MUST differ from the serve API port — the manifest default (8000) is never
         // allocated, so without this every member's vLLM would land on 8000 and
@@ -1534,6 +1548,36 @@ impl DeployStrategy for DockerDeploy {
                 false,
             ),
         ];
+        if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
+            let workspace = self
+                .user_config
+                .get("workspace_root")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir().map_err(|e| {
+                    DeployError::Manifest(format!("resolve coding-agent workspace: {e}"))
+                })?);
+            let workspace = std::fs::canonicalize(&workspace).map_err(|e| {
+                DeployError::Manifest(format!(
+                    "invalid coding-agent workspace {}: {e}",
+                    workspace.display()
+                ))
+            })?;
+            if !workspace.is_dir() {
+                return Err(DeployError::Manifest(
+                    "coding-agent workspace_root is not a directory".to_string(),
+                ));
+            }
+            let state = crate::paths::keys_dir()
+                .join("coding-agents")
+                .join(&self.manifest.engine.id);
+            std::fs::create_dir_all(&state).map_err(|e| {
+                DeployError::Manifest(format!("create coding-agent state directory: {e}"))
+            })?;
+            binds.push((workspace, "/workspace".to_string(), false));
+            binds.push((state, "/data".to_string(), false));
+        }
 
         // ComfyUI nie pobiera wag sam: bez checkpointu w `models/checkpoints`
         // kazda generacja konczy sie `ckpt_name not in []`. Sciagamy plik
@@ -1737,6 +1781,11 @@ impl DeployStrategy for DockerDeploy {
             }
             None => None,
         };
+        // The test runner executes agent-authored scripts: the container is the
+        // security boundary, so it runs with a read-only rootfs, dropped
+        // capabilities and hard memory/CPU/PID caps.
+        let sandbox = (self.manifest.engine.id == crate::project_studio::auto_runs::RUNNER_ENGINE_ID)
+            .then(crate::deploy::docker::SandboxLimits::test_runner);
         let id = backend::run(
             &docker,
             &image_tag,
@@ -1748,6 +1797,7 @@ impl DeployStrategy for DockerDeploy {
             &labels,
             gpu,
             distributed_opts,
+            sandbox,
         )
         .await?;
 
@@ -2055,6 +2105,7 @@ mod tests {
                 default_port: 8000,
                 dgx_spark: None,
                 cluster_capable: None,
+                preset_only: None,
                 cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),

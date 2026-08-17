@@ -42,6 +42,7 @@ use tentaflow_sdk_spec::protocol::ui::{
         Avatar as AvatarComp, Badge as BadgeComp, Chip as ChipComp, Heading as HeadingComp,
         Heatmap as HeatmapComp, KeyValue as KvComp, ProgressBar as ProgressBarComp,
         Sparkline as SparklineComp, StatCard as StatCardComp, Text as TextComp,
+        ZoneEditor as ZoneEditorComp,
     },
     feedback::overlays::Modal as ModalComp,
     feedback::{Alert as AlertComp, GateScreen as GateScreenComp, Spinner as SpinnerComp},
@@ -180,6 +181,20 @@ extern "C" {
         out_len_ptr: i32,
     ) -> i32;
     fn recording_get_url_v1(
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
+    ) -> i32;
+    fn camera_zones_get_v1(
+        input_ptr: i32,
+        input_len: i32,
+        out_ptr: i32,
+        out_cap: i32,
+        out_len_ptr: i32,
+    ) -> i32;
+    fn camera_zones_set_v1(
         input_ptr: i32,
         input_len: i32,
         out_ptr: i32,
@@ -377,6 +392,25 @@ fn host_camera_analysis_flows() -> Result<Vec<(String, String)>, AbiError> {
 fn host_list_accessible_cameras() -> Result<Vec<tentaflow_sdk_spec::CameraInfoOut>, AbiError> {
     let out: tentaflow_sdk_spec::CameraListOut = call_cbor_out(camera_list_accessible_v1)?;
     Ok(out.camera)
+}
+
+/// Detection zones held by CORE (`cameras.zones_json`) — the polygons the vision
+/// engine actually filters on. Normalized 0.0-1.0, JSON `[[[x,y],...],...]`.
+fn host_camera_zones_get(camera_id: &str) -> Result<String, AbiError> {
+    let input = tentaflow_sdk_spec::CameraIdInput {
+        camera_id: camera_id.into(),
+    };
+    let out: tentaflow_sdk_spec::CameraZonesOut = call_cbor_in_out(&input, camera_zones_get_v1)?;
+    Ok(out.zones_json)
+}
+
+fn host_camera_zones_set(camera_id: &str, zones_json: &str) -> Result<String, AbiError> {
+    let input = tentaflow_sdk_spec::CameraZonesSetInput {
+        camera_id: camera_id.into(),
+        zones_json: zones_json.into(),
+    };
+    let out: tentaflow_sdk_spec::CameraZonesOut = call_cbor_in_out(&input, camera_zones_set_v1)?;
+    Ok(out.zones_json)
 }
 
 /// Reads one camera's authoritative info from core (carries `analysis_flow_id`,
@@ -2282,6 +2316,10 @@ struct ZonesState {
     rule_name: String,
     rule_expr: String,
     rule_action: String,
+    /// Still frame the polygons are drawn on, cached as a `data:` URI. Grabbing a
+    /// snapshot is a host round-trip, so it happens on camera select / explicit
+    /// refresh — never on every render of the tab.
+    frame_data_uri: String,
 }
 
 impl ZonesState {
@@ -2297,6 +2335,7 @@ impl ZonesState {
             rule_name: String::new(),
             rule_expr: String::new(),
             rule_action: String::new(),
+            frame_data_uri: String::new(),
         }
     }
 
@@ -3950,16 +3989,43 @@ fn handle_action(action: &str, params: &JsonValue) -> JsonValue {
                 .unwrap_or("")
                 .trim()
                 .to_string();
+            let frame = if id.is_empty() {
+                String::new()
+            } else {
+                zone_frame_url(&id)
+            };
             with_state(|s| {
                 s.clear_messages();
                 s.zones.selected_camera_id = if id.is_empty() { None } else { Some(id) };
                 s.zones.zone_form_visible = false;
                 s.zones.rule_form_visible = false;
                 s.zones.zone_pending_remove = None;
+                s.zones.frame_data_uri = frame;
             });
             render_panel("zones");
             json!({"ok":true})
         }
+        "zone-frame-refresh" => {
+            let camera = with_state(|s| s.zones.selected_camera_id.clone());
+            match camera {
+                Some(id) => {
+                    let frame = zone_frame_url(&id);
+                    let found = !frame.is_empty();
+                    with_state(|s| {
+                        s.clear_messages();
+                        s.zones.frame_data_uri = frame;
+                        if !found {
+                            s.error_message =
+                                Some("Brak zapisanej klatki z tej kamery — nagraj zdarzenie, aby uzyskać tło edytora.".into());
+                        }
+                    });
+                    render_panel("zones");
+                    json!({"ok": found})
+                }
+                None => json!({"ok":false}),
+            }
+        }
+        "zone-editor-commit" => handle_zone_editor_commit(params),
         "zone-add-start" => {
             with_state(|s| {
                 s.clear_messages();
@@ -7365,6 +7431,25 @@ fn format_size_mb(bytes: i64) -> String {
 /// empty string when there is no thumb (the `img` cell renderer then shows a
 /// muted placeholder). A URL-issue failure also degrades to the placeholder
 /// rather than surfacing an error in the list.
+/// Background still for the zone editor: the newest event thumbnail from that
+/// camera. Every recording is guaranteed a thumbnail, so this is a real frame in
+/// the camera's real framing — no snapshot round-trip and no image bytes crossing
+/// the wasm boundary (which would burn the addon's fuel budget).
+fn zone_frame_url(camera_id: &str) -> String {
+    let search = RecordingSearch {
+        camera_id: Some(camera_id.to_string()),
+        date_from: None,
+        date_to: None,
+        plate: None,
+        adr: None,
+    };
+    host_recording_list(&search, 1)
+        .ok()
+        .and_then(|items| items.into_iter().next())
+        .map(|item| recording_thumb_url(&item.plate_thumb_ref))
+        .unwrap_or_default()
+}
+
 fn recording_thumb_url(thumb_ref: &Option<String>) -> String {
     match thumb_ref.as_deref() {
         Some(r) if !r.trim().is_empty() => host_recording_get_url(r, RECORDING_URL_TTL_SECS)
@@ -12645,14 +12730,43 @@ fn build_zones_content() -> Component {
         let lin = zones.iter().filter(|z| z.kind == "line").count();
         alloc::format!("{} include · {} exclude · {} linie", inc, exc, lin)
     };
+    let core_zones = host_camera_zones_get(&camera.id).unwrap_or_else(|_| "[]".into());
+    let core_zone_count = serde_json::from_str::<JsonValue>(&core_zones)
+        .ok()
+        .and_then(|v| v.as_array().map(|a| a.len()))
+        .unwrap_or(0);
+    let mut editor = ZoneEditorComp {
+        image_ref: bound("zone_frame"),
+        zones_json: bound("zone_polygons"),
+    }
+    .into_component(next_id())
+    .expect("ZoneEditor");
+    editor.handlers = Some(HandlerMap(vec![(
+        tentaflow_sdk_spec::EventKind::Commit,
+        Handler::Backend {
+            action_id: "zone-editor-commit".into(),
+            params: CborMap::default(),
+            optimistic: None,
+            on_failure: FailurePolicy::Toast,
+        },
+    )]));
+    let detection_hint = if core_zone_count == 0 {
+        "Brak stref detekcji — analizowany jest CAŁY kadr. Narysuj wielokąt, aby ograniczyć detekcję.".to_string()
+    } else {
+        alloc::format!(
+            "{} stref(y) detekcji — pojazdy poza nimi są pomijane przez silnik analityki.",
+            core_zone_count
+        )
+    };
     let camera_card = card(
         Some(&alloc::format!("{} · widok kamery", camera.name)),
         vec![
-            empty_state("Kadr kamery", Some(&zone_summary), Some("cameras")),
-            text_styled(
-                "Strefy zapisane są jako współrzędne wielokąta (0–100% kadru) i renderowane przez silnik analityki na żywym podglądzie (zakładka Live view).",
-                "caption",
-            ),
+            stack_h(vec![
+                text_styled(&zone_summary, "caption"),
+                button_with_icon("Odśwież kadr", "zone-frame-refresh", "ghost", "refresh"),
+            ]),
+            editor,
+            text_styled(&detection_hint, "caption"),
         ],
     );
 
@@ -13046,6 +13160,13 @@ fn zones_overlay() -> Vec<StateEntry> {
             "zone_camera_select",
             Value::Text(z.selected_camera_id.clone().unwrap_or_default()),
         )];
+        entries.push(key("zone_frame", Value::Text(z.frame_data_uri.clone())));
+        let polygons = z
+            .selected_camera_id
+            .as_deref()
+            .and_then(|id| host_camera_zones_get(id).ok())
+            .unwrap_or_else(|| "[]".into());
+        entries.push(key("zone_polygons", Value::Text(polygons)));
         if z.zone_form_visible {
             entries.push(key("zone_name", Value::Text(z.form_name.clone())));
             entries.push(key("zone_kind", Value::Text(z.form_kind.clone())));
@@ -13088,6 +13209,64 @@ fn handle_zone_field_change(params: &JsonValue) -> JsonValue {
 /// Creates a zone for the selected camera. Validates the polygon JSON (array of
 /// `[x, y]` numeric pairs; line needs ≥2, include/exclude need ≥3), persists it
 /// and writes a `zone_change` audit entry.
+/// Persists the polygons drawn in the ZoneEditor straight into core
+/// (`cameras.zones_json`) — the single set the vision engine gates detections on.
+/// The host re-validates the JSON, so a malformed payload cannot silently switch
+/// the camera back to whole-frame analysis.
+fn handle_zone_editor_commit(params: &JsonValue) -> JsonValue {
+    let camera_id = match with_state(|s| s.zones.selected_camera_id.clone()) {
+        Some(c) => c,
+        None => {
+            with_state(|s| s.error_message = Some("Najpierw wybierz kamerę.".into()));
+            render_panel("zones");
+            return json!({"ok":false});
+        }
+    };
+    let zones_json = params
+        .get("zones_json")
+        .and_then(|x| x.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    if zones_json.is_empty() {
+        with_state(|s| s.error_message = Some("Edytor nie przekazał stref.".into()));
+        render_panel("zones");
+        return json!({"ok":false,"error":"empty payload"});
+    }
+    match host_camera_zones_set(&camera_id, &zones_json) {
+        Ok(saved) => {
+            let count = serde_json::from_str::<JsonValue>(&saved)
+                .ok()
+                .and_then(|v| v.as_array().map(|a| a.len()))
+                .unwrap_or(0);
+            let _ = db::insert_audit(
+                ZONE_ACTOR,
+                "zone_change",
+                &camera_id,
+                "null",
+                &alloc::format!("{{\"detection_zones\":{}}}", saved),
+            );
+            with_state(|s| {
+                s.clear_messages();
+                s.success_message = Some(if count == 0 {
+                    "Strefy wyczyszczone — analizowany jest cały kadr.".into()
+                } else {
+                    alloc::format!("Zapisano {} stref(y) detekcji.", count)
+                });
+            });
+            render_panel("zones");
+            json!({"ok":true})
+        }
+        Err(e) => {
+            with_state(|s| {
+                s.error_message = Some(alloc::format!("Nie zapisano stref: {}", abi_message(e)))
+            });
+            render_panel("zones");
+            json!({"ok":false})
+        }
+    }
+}
+
 fn handle_zone_add_submit() -> JsonValue {
     let (camera_id, name, kind, polygon) = with_state(|s| {
         (

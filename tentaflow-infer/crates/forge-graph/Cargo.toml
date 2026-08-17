@@ -1,0 +1,10 @@
+# ===== File: Cargo.toml — forge-graph: co model każe zrobić, bez wiedzy czym =====
+[package]
+name = "forge-graph"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+forge-types.workspace = true
+forge-formats.workspace = true

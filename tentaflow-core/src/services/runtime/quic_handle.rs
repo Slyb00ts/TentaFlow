@@ -835,6 +835,8 @@ mod snapshot_helpers_tests {
                 last_deploy_id: String::new(),
                 deployment_progress_pct: 0,
                 progress_message: None,
+                usage_json: None,
+                usage_updated_at: None,
                 models: vec![tentaflow_protocol::ServiceModelEntry {
                     model_name: "qwen-tiny".into(),
                     display_name: None,
@@ -906,6 +908,8 @@ mod snapshot_helpers_tests {
                 last_deploy_id: String::new(),
                 deployment_progress_pct: 0,
                 progress_message: None,
+                usage_json: None,
+                usage_updated_at: None,
                 models: vec![tentaflow_protocol::ServiceModelEntry {
                     model_name: "qwen-tiny".into(),
                     display_name: None,

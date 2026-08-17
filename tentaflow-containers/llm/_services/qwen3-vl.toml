@@ -34,10 +34,10 @@ transport = "direct-http"
 CUDA_IMAGE = "nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04"
 TORCH_INDEX = "https://download.pytorch.org/whl/cu130"
 VLLM_INDEX = "https://wheels.vllm.ai/nightly/cu130"
-TORCH_VERSION = "2.11.0"
-TORCHVISION_VERSION = "0.26.0"
+TORCH_VERSION = "2.13.0"
+TORCHVISION_VERSION = "0.28.0"
 TORCHAUDIO_VERSION = "2.11.0"
-VLLM_VERSION = "0.25.1"
+VLLM_VERSION = "0.27.0"
 
 [deploy.native]
 platforms = ["linux", "windows"]

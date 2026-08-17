@@ -433,9 +433,292 @@ function renderLiveRegion(component, ctx) {
 // Registration
 // =============================================================================
 
+
+// -----------------------------------------------------------------------------
+// 0x0F01 — ZoneEditor (TentaFlow extension, outside catalog v1)
+// -----------------------------------------------------------------------------
+
+const ZONE_EDITOR_TAG = 0x0f01;
+const ZONE_EDITOR_FIELD_KEYS = new Set([0, 1]);
+
+/// Parses the persisted zone shape: `[[[x,y],...], ...]` normalized 0..1.
+/// Anything malformed yields an empty set — the editor then starts blank
+/// instead of throwing and taking the whole panel down.
+function parseZones(raw) {
+  if (typeof raw !== 'string' || raw.trim() === '') return [];
+  let v;
+  try { v = JSON.parse(raw); } catch { return []; }
+  if (!Array.isArray(v)) return [];
+  const out = [];
+  for (const poly of v) {
+    if (!Array.isArray(poly)) continue;
+    const pts = [];
+    for (const p of poly) {
+      if (!Array.isArray(p) || p.length < 2) continue;
+      const x = Number(p[0]); const y = Number(p[1]);
+      if (Number.isFinite(x) && Number.isFinite(y)) pts.push([x, y]);
+    }
+    if (pts.length >= 3) out.push(pts);
+  }
+  return out;
+}
+
+/// Polygon zone editor over a still camera frame. Click places a vertex,
+/// "Zamknij" closes the polygon, "Zapisz" emits `commit` carrying the full set
+/// as the same JSON string the vision engine filters on. Coordinates are stored
+/// NORMALIZED so a zone keeps its meaning across resolutions.
+function renderZoneEditor(component, ctx) {
+  assertOnlyKnownFields(component.fields, ZONE_EDITOR_FIELD_KEYS, 'ZoneEditor');
+  const imageBind = ctx.readField(component.fields, 0);
+  if (imageBind == null) throw new TypeError('ZoneEditor.image_ref is required (BindRef)');
+  assertBindRef(imageBind, 'ZoneEditor.image_ref');
+  const zonesBind = ctx.readField(component.fields, 1);
+  if (zonesBind == null) throw new TypeError('ZoneEditor.zones_json is required (BindRef)');
+  assertBindRef(zonesBind, 'ZoneEditor.zones_json');
+
+  // The drawing box owns its geometry instead of inheriting it from the image:
+  // with no background frame yet (a camera that has not recorded anything) an
+  // image-sized wrapper collapses to zero height and the operator cannot draw at
+  // all. Aspect ratio snaps to the real frame once one loads.
+  // Outer column holds the frame box AND the toolbar. The toolbar must live
+  // OUTSIDE the frame box: inside it, a static-flow bar is painted underneath
+  // the absolutely-positioned image and canvas, leaving the operator with
+  // buttons that are invisible and unclickable.
+  const wrapper = document.createElement('div');
+  wrapper.classList.add('tf-zone-editor');
+  Object.assign(wrapper.style, { display: 'block', width: '100%' });
+
+  const frameBox = document.createElement('div');
+  frameBox.classList.add('tf-zone-editor__frame');
+  Object.assign(frameBox.style, {
+    position: 'relative', display: 'block', width: '100%',
+    aspectRatio: '16 / 9', background: '#111', overflow: 'hidden',
+  });
+
+  const img = document.createElement('img');
+  img.classList.add('tf-zone-editor__img');
+  img.alt = 'Podgląd kamery';
+  // `fill` (not `contain`) keeps normalized zone coordinates aligned with the
+  // box: the box IS the frame, so no letterboxing offset can creep in.
+  Object.assign(img.style, {
+    position: 'absolute', left: '0', top: '0',
+    width: '100%', height: '100%', objectFit: 'fill',
+  });
+
+  const canvas = document.createElement('canvas');
+  canvas.classList.add('tf-zone-editor__canvas');
+  Object.assign(canvas.style, {
+    position: 'absolute', left: '0', top: '0',
+    width: '100%', height: '100%', cursor: 'crosshair',
+  });
+
+  let zones = parseZones(resolveBindRef(zonesBind, ctx.store));
+  let current = [];
+
+  const draw = () => {
+    const w = canvas.clientWidth || 0;
+    const h = canvas.clientHeight || 0;
+    if (!w || !h) return;
+    canvas.width = w; canvas.height = h;
+    const g = canvas.getContext('2d');
+    if (!g) return;
+    g.clearRect(0, 0, w, h);
+    const paint = (pts, close, stroke, fill) => {
+      if (!pts.length) return;
+      g.beginPath();
+      g.moveTo(pts[0][0] * w, pts[0][1] * h);
+      for (let i = 1; i < pts.length; i++) g.lineTo(pts[i][0] * w, pts[i][1] * h);
+      if (close) g.closePath();
+      if (fill) { g.fillStyle = fill; g.fill(); }
+      g.strokeStyle = stroke; g.lineWidth = 2; g.stroke();
+      g.fillStyle = stroke;
+      for (const [px, py] of pts) {
+        g.beginPath(); g.arc(px * w, py * h, 4, 0, Math.PI * 2); g.fill();
+      }
+    };
+    for (const z of zones) paint(z, true, '#22cc66', 'rgba(34,204,102,0.25)');
+    paint(current, false, '#ffcc00', null);
+  };
+
+  const applyImage = () => {
+    const src = resolveBindRef(imageBind, ctx.store);
+    if (typeof src !== 'string' || /^javascript:/i.test(src.trim())) {
+      img.removeAttribute('src');
+      return;
+    }
+    img.src = src;
+  };
+  const applyZones = () => {
+    zones = parseZones(resolveBindRef(zonesBind, ctx.store));
+    current = [];
+    draw();
+  };
+  applyImage();
+  ctx.registerCleanup(subscribeBindRef(imageBind, ctx.store, applyImage));
+  ctx.registerCleanup(subscribeBindRef(zonesBind, ctx.store, applyZones));
+
+  const onLoad = () => {
+    if (img.naturalWidth && img.naturalHeight) {
+      frameBox.style.aspectRatio = `${img.naturalWidth} / ${img.naturalHeight}`;
+    }
+    draw();
+  };
+  img.addEventListener('load', onLoad);
+  ctx.registerCleanup(() => img.removeEventListener('load', onLoad));
+
+  // Pointer geometry helpers. Coordinates are normalized 0..1 against the frame
+  // box, which IS the camera frame — see the layout note above.
+  const HIT_PX = 10;
+  const norm = (e) => {
+    const r = canvas.getBoundingClientRect();
+    if (!r.width || !r.height) return null;
+    return {
+      x: Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)),
+      y: Math.min(1, Math.max(0, (e.clientY - r.top) / r.height)),
+      w: r.width, h: r.height,
+    };
+  };
+  const round = (v) => Number(v.toFixed(4));
+  /// Nearest vertex within HIT_PX. `zone: -1` addresses the polygon in progress.
+  const hitVertex = (p) => {
+    let best = null;
+    let bestDist = HIT_PX;
+    const scan = (pts, zone) => {
+      for (let i = 0; i < pts.length; i++) {
+        const dx = (pts[i][0] - p.x) * p.w;
+        const dy = (pts[i][1] - p.y) * p.h;
+        const d = Math.hypot(dx, dy);
+        if (d <= bestDist) { bestDist = d; best = { zone, index: i }; }
+      }
+    };
+    for (let z = 0; z < zones.length; z++) scan(zones[z], z);
+    scan(current, -1);
+    return best;
+  };
+  const ptsOf = (zone) => (zone === -1 ? current : zones[zone]);
+
+  let drag = null;
+  let movedWhileDown = false;
+
+  const onPointerDown = (e) => {
+    const p = norm(e);
+    if (!p) return;
+    const hit = hitVertex(p);
+    movedWhileDown = false;
+    if (hit) {
+      // Grabbing an existing vertex edits it — including vertices of zones that
+      // were already saved, so a stored polygon stays adjustable.
+      drag = hit;
+      canvas.setPointerCapture?.(e.pointerId);
+      return;
+    }
+    drag = null;
+  };
+
+  const onPointerMove = (e) => {
+    if (!drag) return;
+    const p = norm(e);
+    if (!p) return;
+    movedWhileDown = true;
+    const pts = ptsOf(drag.zone);
+    if (!pts || !pts[drag.index]) return;
+    pts[drag.index] = [round(p.x), round(p.y)];
+    draw();
+  };
+
+  const onPointerUp = (e) => {
+    const wasDragging = drag !== null;
+    drag = null;
+    canvas.releasePointerCapture?.(e.pointerId);
+    if (wasDragging && movedWhileDown) return;   // a drag never places a point
+    const p = norm(e);
+    if (!p) return;
+    if (wasDragging) return;                     // tapped an existing vertex
+    // Clicking the first vertex closes the ring — the gesture operators expect,
+    // without hunting for the toolbar button.
+    if (current.length >= 3) {
+      const dx = (current[0][0] - p.x) * p.w;
+      const dy = (current[0][1] - p.y) * p.h;
+      if (Math.hypot(dx, dy) <= HIT_PX) {
+        zones.push(current); current = []; draw(); return;
+      }
+    }
+    current.push([round(p.x), round(p.y)]);
+    draw();
+  };
+
+  /// Double-click removes a vertex; a ring may not drop below a triangle, so the
+  /// last three are kept and the whole zone must be deleted instead.
+  const onDoubleClick = (e) => {
+    const p = norm(e);
+    if (!p) return;
+    const hit = hitVertex(p);
+    if (!hit) return;
+    const pts = ptsOf(hit.zone);
+    if (!pts) return;
+    const floor = hit.zone === -1 ? 1 : 4;
+    if (pts.length < floor) return;
+    pts.splice(hit.index, 1);
+    draw();
+  };
+
+  canvas.addEventListener('pointerdown', onPointerDown);
+  canvas.addEventListener('pointermove', onPointerMove);
+  canvas.addEventListener('pointerup', onPointerUp);
+  canvas.addEventListener('dblclick', onDoubleClick);
+  ctx.registerCleanup(() => {
+    canvas.removeEventListener('pointerdown', onPointerDown);
+    canvas.removeEventListener('pointermove', onPointerMove);
+    canvas.removeEventListener('pointerup', onPointerUp);
+    canvas.removeEventListener('dblclick', onDoubleClick);
+  });
+
+  const bar = document.createElement('div');
+  bar.classList.add('tf-zone-editor__bar');
+  bar.style.marginTop = '8px';
+  bar.style.display = 'flex';
+  bar.style.gap = '8px';
+  bar.style.flexWrap = 'wrap';
+  const mkBtn = (label, fn) => {
+    const b = document.createElement('button');
+    b.type = 'button';
+    b.textContent = label;
+    b.addEventListener('click', fn);
+    ctx.registerCleanup(() => b.removeEventListener('click', fn));
+    bar.appendChild(b);
+    return b;
+  };
+  // A polygon needs three vertices to bound an area; closing with fewer is a
+  // no-op rather than saving a degenerate zone the engine would discard.
+  mkBtn('Zamknij wielokąt', () => {
+    if (current.length >= 3) { zones.push(current); current = []; draw(); }
+  });
+  mkBtn('Cofnij punkt', () => {
+    if (current.length) current.pop();
+    else if (zones.length) current = zones.pop();
+    draw();
+  });
+  mkBtn('Wyczyść wszystko', () => { zones = []; current = []; draw(); });
+  mkBtn('Zapisz strefy', () => {
+    if (current.length >= 3) { zones.push(current); current = []; }
+    draw();
+    wrapper.dispatchEvent(new (globalThis.CustomEvent || globalThis.Event)('commit', {
+      bubbles: false,
+      detail: { zones_json: JSON.stringify(zones) },
+    }));
+  });
+
+  frameBox.appendChild(img);
+  frameBox.appendChild(canvas);
+  wrapper.appendChild(frameBox);
+  wrapper.appendChild(bar);
+  return wrapper;
+}
+
 export function registerDataSpecialisedRenderers() {
   if (!lookupComponentRenderer(CALENDAR_MONTH_TAG)) registerComponentRenderer(CALENDAR_MONTH_TAG, renderCalendarMonth);
   if (!lookupComponentRenderer(IMAGE_TAG)) registerComponentRenderer(IMAGE_TAG, renderImage);
   if (!lookupComponentRenderer(VISUALLY_HIDDEN_TAG)) registerComponentRenderer(VISUALLY_HIDDEN_TAG, renderVisuallyHidden);
+  if (!lookupComponentRenderer(ZONE_EDITOR_TAG)) registerComponentRenderer(ZONE_EDITOR_TAG, renderZoneEditor);
   if (!lookupComponentRenderer(LIVE_REGION_TAG)) registerComponentRenderer(LIVE_REGION_TAG, renderLiveRegion);
 }

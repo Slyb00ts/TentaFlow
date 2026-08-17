@@ -3,7 +3,7 @@
 //
 
 .version 8.1
-.target sm_89
+.target sm_80
 .address_size 64
 
 	// .globl	src_attention_gqa_attn_decode_6A6A6A6A_04ebcfec9b7af78a
@@ -223,25 +223,17 @@ $L__BB0_17:
 	and.pred 	%p19, %p17, %p18;
 	mov.b32 	%r305, 0f7FC00000;
 	@%p19 bra 	$L__BB0_19;
-	// begin inline asm
 	lg2.approx.ftz.f32 %r51, %r303;
-	// end inline asm
 	mul.f32 	%r53, %r51, 0f3F317218;
 	mul.f32 	%r54, %r3, %r53;
 	mul.f32 	%r52, %r54, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r305, %r52;
-	// end inline asm
 $L__BB0_19:
 	ld.global.b32 	%r62, [%rd24];
 	cvt.rn.f32.s32 	%r63, %r62;
 	mul.f32 	%r61, %r305, %r63;
-	// begin inline asm
 	cos.approx.ftz.f32 %r59, %r61;
-	// end inline asm
-	// begin inline asm
 	sin.approx.ftz.f32 %r60, %r61;
-	// end inline asm
 	add.s32 	%r64, %r35, %r296;
 	add.s32 	%r306, %r64, 128;
 	mov.b64 	%rd162, -4;
@@ -507,15 +499,11 @@ $L__BB0_35:
 	selp.f32 	%r311, %r127, %r307, %p35;
 	sub.f32 	%r128, %r307, %r311;
 	mul.f32 	%r89, %r128, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r88, %r89;
-	// end inline asm
 	neg.f32 	%r129, %r311;
 	fma.rn.f32 	%r130, %r24, %r126, %r129;
 	mul.f32 	%r91, %r130, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r90, %r91;
-	// end inline asm
 	fma.rn.f32 	%r315, %r315, %r88, %r90;
 	mul.f32 	%r131, %r90, %r105;
 	fma.rn.f32 	%r319, %r319, %r88, %r131;
@@ -545,15 +533,11 @@ $L__BB0_35:
 	selp.f32 	%r312, %r150, %r308, %p36;
 	sub.f32 	%r151, %r308, %r312;
 	mul.f32 	%r93, %r151, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r92, %r93;
-	// end inline asm
 	neg.f32 	%r152, %r312;
 	fma.rn.f32 	%r153, %r24, %r149, %r152;
 	mul.f32 	%r95, %r153, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r94, %r95;
-	// end inline asm
 	fma.rn.f32 	%r316, %r316, %r92, %r94;
 	mul.f32 	%r154, %r94, %r105;
 	fma.rn.f32 	%r323, %r323, %r92, %r154;
@@ -583,15 +567,11 @@ $L__BB0_35:
 	selp.f32 	%r313, %r173, %r309, %p37;
 	sub.f32 	%r174, %r309, %r313;
 	mul.f32 	%r97, %r174, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r96, %r97;
-	// end inline asm
 	neg.f32 	%r175, %r313;
 	fma.rn.f32 	%r176, %r24, %r172, %r175;
 	mul.f32 	%r99, %r176, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r98, %r99;
-	// end inline asm
 	fma.rn.f32 	%r317, %r317, %r96, %r98;
 	mul.f32 	%r177, %r98, %r105;
 	fma.rn.f32 	%r327, %r327, %r96, %r177;
@@ -621,15 +601,11 @@ $L__BB0_35:
 	selp.f32 	%r314, %r196, %r310, %p38;
 	sub.f32 	%r197, %r310, %r314;
 	mul.f32 	%r101, %r197, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r100, %r101;
-	// end inline asm
 	neg.f32 	%r198, %r314;
 	fma.rn.f32 	%r199, %r24, %r195, %r198;
 	mul.f32 	%r103, %r199, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r102, %r103;
-	// end inline asm
 	fma.rn.f32 	%r318, %r318, %r100, %r102;
 	mul.f32 	%r200, %r102, %r105;
 	fma.rn.f32 	%r331, %r331, %r100, %r200;
@@ -748,9 +724,7 @@ $L__BB0_50:
 	ld.shared.b32 	%r213, [%r339];
 	sub.f32 	%r214, %r213, %r336;
 	mul.f32 	%r212, %r214, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r211, %r212;
-	// end inline asm
 	ld.shared.b32 	%r215, [%r338];
 	fma.rn.f32 	%r340, %r211, %r215, %r340;
 	or.b32 	%r216, %r337, %r34;
@@ -824,9 +798,7 @@ $L__BB0_58:
 	ld.shared.b32 	%r235, [%r348];
 	sub.f32 	%r236, %r235, %r346;
 	mul.f32 	%r234, %r236, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r233, %r234;
-	// end inline asm
 	ld.shared.b32 	%r237, [%r349];
 	fma.rn.f32 	%r350, %r233, %r237, %r350;
 	or.b32 	%r238, %r347, %r34;
@@ -900,9 +872,7 @@ $L__BB0_66:
 	ld.shared.b32 	%r257, [%r358];
 	sub.f32 	%r258, %r257, %r356;
 	mul.f32 	%r256, %r258, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r255, %r256;
-	// end inline asm
 	ld.shared.b32 	%r259, [%r359];
 	fma.rn.f32 	%r360, %r255, %r259, %r360;
 	or.b32 	%r260, %r357, %r34;
@@ -975,9 +945,7 @@ $L__BB0_74:
 	ld.shared.b32 	%r279, [%r368];
 	sub.f32 	%r280, %r279, %r366;
 	mul.f32 	%r278, %r280, 0f3FB8AA3B;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r277, %r278;
-	// end inline asm
 	ld.shared.b32 	%r281, [%r369];
 	fma.rn.f32 	%r370, %r277, %r281, %r370;
 	or.b32 	%r282, %r367, %r34;

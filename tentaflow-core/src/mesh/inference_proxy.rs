@@ -225,12 +225,16 @@ pub async fn dispatch_reverse_request(
                                 .join(""),
                         })
                         .unwrap_or_default();
+                    let reasoning_content = chat_response
+                        .choices
+                        .first()
+                        .and_then(|c| c.message.reasoning_content.clone());
 
                     ModelResponse {
                         request_id,
                         result: ModelResult::Completion(CompletionResult {
                             text,
-                            reasoning_content: None,
+                            reasoning_content,
                             model: chat_response.model,
                             finish_reason: chat_response
                                 .choices
@@ -415,6 +419,7 @@ fn build_chat_request(
         .map(|m| Message {
             role: m.role.clone(),
             content: Some(MessageContent::Text(m.content.clone())),
+            reasoning_content: m.reasoning_content.clone(),
             ..Default::default()
         })
         .collect();
@@ -1054,10 +1059,12 @@ mod tests {
                 Message {
                     role: "system".to_string(),
                     content: "Jestes asystentem.".to_string(),
+                    reasoning_content: None,
                 },
                 Message {
                     role: "user".to_string(),
                     content: "Czesc!".to_string(),
+                    reasoning_content: None,
                 },
             ],
             temperature: Some(0.7),
@@ -1323,6 +1330,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "Podsumuj spotkanie".to_string(),
+                reasoning_content: None,
             }],
             temperature: None,
             max_tokens: None,
@@ -1356,6 +1364,7 @@ mod tests {
             messages: vec![Message {
                 role: "user".to_string(),
                 content: "Tresc wiadomosci".to_string(),
+                reasoning_content: None,
             }],
             temperature: None,
             max_tokens: None,

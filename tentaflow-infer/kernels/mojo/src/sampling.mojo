@@ -81,6 +81,204 @@ def penalize_f32(
         logits[t] = l * penalty
 
 
+def _penalized_logit(
+    logit: Float32,
+    count: Int,
+    repetition_penalty: Float32,
+    frequency_penalty: Float32,
+    presence_penalty: Float32,
+) -> Float32:
+    var value = logit
+    if repetition_penalty != 1.0:
+        if value > 0.0:
+            value /= repetition_penalty
+        else:
+            value *= repetition_penalty
+    return value - presence_penalty - frequency_penalty * Float32(count)
+
+
+def penalize_histogram_f32(
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    counts: UnsafePointer[Int32, MutAnyOrigin],
+    n_ids: Int,
+    vocab: Int,
+    repetition_penalty: Float32,
+    frequency_penalty: Float32,
+    presence_penalty: Float32,
+):
+    """Nakłada kary z histogramu unikalnych identyfikatorów tokenów."""
+    item = Int(global_idx.x)
+    if item >= n_ids:
+        return
+    token = Int(ids[item])
+    if token < 0 or token >= vocab:
+        return
+    logits[token] = _penalized_logit(
+        logits[token],
+        Int(counts[item]),
+        repetition_penalty,
+        frequency_penalty,
+        presence_penalty,
+    )
+
+
+def penalized_argmax_f32(
+    out_id: UnsafePointer[Int32, MutAnyOrigin],
+    out_lp: UnsafePointer[Float32, MutAnyOrigin],
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    counts: UnsafePointer[Int32, MutAnyOrigin],
+    n_ids: Int,
+    vocab: Int,
+    repetition_penalty: Float32,
+    frequency_penalty: Float32,
+    presence_penalty: Float32,
+):
+    """Nakłada kary z histogramu i wybiera greedy w jednym launchu."""
+    tid = Int(thread_idx.x)
+    bd = Int(block_dim.x)
+    var item = tid
+    while item < n_ids:
+        history_token = Int(ids[item])
+        if history_token >= 0 and history_token < vocab:
+            logits[history_token] = _penalized_logit(
+                logits[history_token],
+                Int(counts[item]),
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+            )
+        item += bd
+    barrier()
+
+    var best_value = NEG_INF
+    var best_id = 0x7FFFFFFF
+    var scan_token = tid
+    while scan_token < vocab:
+        current_value = logits[scan_token]
+        if current_value != current_value or current_value < NEG_INF:
+            current_value = NEG_INF
+        if best_id == 0x7FFFFFFF or current_value > best_value or (current_value == best_value and scan_token < best_id):
+            best_value = current_value
+            best_id = scan_token
+        scan_token += bd
+    (_, winner) = _block_argmax(best_value, best_id)
+    if tid == 0:
+        out_id[0] = Int32(winner)
+        out_lp[0] = 0.0
+
+
+def penalized_topk_f32(
+    out_id: UnsafePointer[Int32, MutAnyOrigin],
+    out_lp: UnsafePointer[Float32, MutAnyOrigin],
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    ids: UnsafePointer[Int32, MutAnyOrigin],
+    counts: UnsafePointer[Int32, MutAnyOrigin],
+    n_ids: Int,
+    vocab: Int,
+    repetition_penalty: Float32,
+    frequency_penalty: Float32,
+    presence_penalty: Float32,
+    k: Int,
+    inv_t: Float32,
+    top_p: Float32,
+    min_p: Float32,
+    seed: UInt64,
+    step: UInt64,
+):
+    """Nakłada kary i wykonuje losowanie top-k w jednym launchu."""
+    topv = stack_allocation[MAX_TOPK, Float32, address_space = AddressSpace.SHARED]()
+    topi = stack_allocation[MAX_TOPK, Int32, address_space = AddressSpace.SHARED]()
+    tid = Int(thread_idx.x)
+    bd = Int(block_dim.x)
+    var item = tid
+    while item < n_ids:
+        history_token = Int(ids[item])
+        if history_token >= 0 and history_token < vocab:
+            logits[history_token] = _penalized_logit(
+                logits[history_token],
+                Int(counts[item]),
+                repetition_penalty,
+                frequency_penalty,
+                presence_penalty,
+            )
+        item += bd
+    barrier()
+
+    for rank in range(k):
+        var best_value = NEG_INF
+        var best_id = 0x7FFFFFFF
+        var scan_token = tid
+        while scan_token < vocab:
+            var selected = False
+            for previous in range(rank):
+                if scan_token == Int(topi[previous]):
+                    selected = True
+            if not selected:
+                current_value = logits[scan_token]
+                if current_value != current_value or current_value < NEG_INF:
+                    current_value = NEG_INF
+                if best_id == 0x7FFFFFFF or current_value > best_value or (current_value == best_value and scan_token < best_id):
+                    best_value = current_value
+                    best_id = scan_token
+            scan_token += bd
+        (winner_value, winner_id) = _block_argmax(best_value, best_id)
+        if tid == 0:
+            topv[rank] = winner_value
+            topi[rank] = Int32(winner_id)
+        barrier()
+
+    if tid != 0:
+        return
+    if topv[0] == NEG_INF:
+        out_id[0] = topi[0]
+        out_lp[0] = 0.0
+        return
+    maximum = topv[0] * inv_t
+    var total: Float32 = 0.0
+    for rank in range(k):
+        probability = exp(topv[rank] * inv_t - maximum)
+        topv[rank] = probability
+        total += probability
+    for rank in range(k):
+        topv[rank] /= total
+
+    var candidates = k
+    if min_p > 0.0:
+        floor = min_p * topv[0]
+        var keep = 0
+        while keep < k and topv[keep] >= floor:
+            keep += 1
+        if keep == 0:
+            out_id[0] = topi[0]
+            out_lp[0] = log(topv[0])
+            return
+        candidates = keep
+    if top_p < 1.0:
+        var cumulative: Float32 = 0.0
+        var cut = candidates
+        for rank in range(candidates):
+            cumulative += topv[rank]
+            if cumulative >= top_p:
+                cut = rank + 1
+                break
+        candidates = cut
+
+    var surviving_total: Float32 = 0.0
+    for rank in range(candidates):
+        surviving_total += topv[rank]
+    var draw = _rand_u01(seed, step) * surviving_total
+    var chosen = candidates - 1
+    for rank in range(candidates):
+        draw -= topv[rank]
+        if draw <= 0.0:
+            chosen = rank
+            break
+    out_id[0] = topi[chosen]
+    out_lp[0] = log(topv[chosen])
+
+
 def argmax_partial_f32(
     logits: UnsafePointer[Float32, MutAnyOrigin],
     part_vals: UnsafePointer[Float32, MutAnyOrigin],
@@ -97,7 +295,9 @@ def argmax_partial_f32(
     end = min(base + chunk, n)
     while i < end:
         v = logits[i]
-        if v > bv or (v == bv and i < bi):
+        if v != v or v < NEG_INF:
+            v = NEG_INF
+        if bi == 0x7FFFFFFF or v > bv or (v == bv and i < bi):
             bv = v
             bi = i
         i += Int(block_dim.x)
@@ -122,7 +322,7 @@ def argmax_final_f32(
     while i < n_parts:
         v = part_vals[i]
         t = Int(part_idx[i])
-        if v > bv or (v == bv and t < bi):
+        if bi == 0x7FFFFFFF or v > bv or (v == bv and t < bi):
             bv = v
             bi = t
         i += Int(block_dim.x)
@@ -145,6 +345,7 @@ def topk_partial_f32(
     k rounds of block-argmax with -inf masking. Output pairs land descending
     at part[block * k .. block * k + k]. Grid.x = ceil(n / chunk)."""
     sm = stack_allocation[SAMPLE_CHUNK, Float32, address_space = AddressSpace.SHARED]()
+    selected = stack_allocation[SAMPLE_CHUNK, UInt8, address_space = AddressSpace.SHARED]()
     blk = Int(block_idx.x)
     base = blk * chunk
     tid = Int(thread_idx.x)
@@ -154,9 +355,13 @@ def topk_partial_f32(
     while s < chunk:
         gi = base + s
         if gi < n:
-            sm[s] = logits[gi]
+            value = logits[gi]
+            if value != value or value < NEG_INF:
+                value = NEG_INF
+            sm[s] = value
         else:
             sm[s] = NEG_INF
+        selected[s] = 0
         s += bd
     barrier()
 
@@ -166,7 +371,7 @@ def topk_partial_f32(
         s = tid
         while s < chunk:
             v = sm[s]
-            if v > bv or (v == bv and s < bs):
+            if selected[s] == 0 and (bs == 0x7FFFFFFF or v > bv or (v == bv and s < bs)):
                 bv = v
                 bs = s
             s += bd
@@ -174,7 +379,7 @@ def topk_partial_f32(
         if tid == 0:
             part_vals[blk * k + r] = mv
             part_idx[blk * k + r] = Int32(base + ms)
-            sm[ms] = NEG_INF
+            selected[ms] = 1
         barrier()
 
 
@@ -198,6 +403,7 @@ def topk_final_f32(
     within the top-k softmax."""
     sv = stack_allocation[MAX_PARTS, Float32, address_space = AddressSpace.SHARED]()
     si = stack_allocation[MAX_PARTS, Int32, address_space = AddressSpace.SHARED]()
+    selected = stack_allocation[MAX_PARTS, UInt8, address_space = AddressSpace.SHARED]()
     topv = stack_allocation[MAX_TOPK, Float32, address_space = AddressSpace.SHARED]()
     topi = stack_allocation[MAX_TOPK, Int32, address_space = AddressSpace.SHARED]()
     tid = Int(thread_idx.x)
@@ -207,6 +413,7 @@ def topk_final_f32(
     while s < n_parts:
         sv[s] = part_vals[s]
         si[s] = part_idx[s]
+        selected[s] = 0
         s += bd
     barrier()
 
@@ -219,7 +426,7 @@ def topk_final_f32(
         s = tid
         while s < n_parts:
             v = sv[s]
-            if v > bv or (v == bv and s < bs):
+            if selected[s] == 0 and (bs == 0x7FFFFFFF or v > bv or (v == bv and s < bs)):
                 bv = v
                 bs = s
             s += bd
@@ -227,10 +434,15 @@ def topk_final_f32(
         if tid == 0:
             topv[r] = mv
             topi[r] = si[ms]
-            sv[ms] = NEG_INF
+            selected[ms] = 1
         barrier()
 
     if tid != 0:
+        return
+
+    if topv[0] == NEG_INF:
+        out_id[0] = topi[0]
+        out_lp[0] = 0.0
         return
 
     # Candidates are sorted descending, so probabilities after the softmax
@@ -286,27 +498,28 @@ def penalize_batched_f32(
     logits: UnsafePointer[Float32, MutAnyOrigin],
     vocab: Int,
     ids: UnsafePointer[Int32, MutAnyOrigin],
+    counts: UnsafePointer[Int32, MutAnyOrigin],
     offsets: UnsafePointer[Int32, MutAnyOrigin],
     penalties: UnsafePointer[Float32, MutAnyOrigin],
+    frequency_penalties: UnsafePointer[Float32, MutAnyOrigin],
+    presence_penalties: UnsafePointer[Float32, MutAnyOrigin],
 ):
-    """Batched in-place repetition penalty. One block per sequence; the
-    sequence's distinct token ids live in ids[offsets[seq] .. offsets[seq+1]]
-    and each row of `logits` ([n_seqs, vocab]) is penalized with penalties[seq].
-    Same per-id rule as penalize_f32 (positive divide, non-positive multiply)."""
+    """Nakłada kary z histogramów na każdy wiersz batcha."""
     seq = Int(block_idx.x)
     base = seq * vocab
     start = Int(offsets[seq])
     end = Int(offsets[seq + 1])
     pen = penalties[seq]
+    frequency = frequency_penalties[seq]
+    presence = presence_penalties[seq]
     bd = Int(block_dim.x)
     var i = start + Int(thread_idx.x)
     while i < end:
         t = Int(ids[i])
-        l = logits[base + t]
-        if l > 0.0:
-            logits[base + t] = l / pen
-        else:
-            logits[base + t] = l * pen
+        if t >= 0 and t < vocab:
+            logits[base + t] = _penalized_logit(
+                logits[base + t], Int(counts[i]), pen, frequency, presence
+            )
         i += bd
 
 
@@ -328,7 +541,9 @@ def argmax_batched_f32(
     var i = tid
     while i < vocab:
         v = logits[base + i]
-        if v > bv or (v == bv and i < bi):
+        if v != v or v < NEG_INF:
+            v = NEG_INF
+        if bi == 0x7FFFFFFF or v > bv or (v == bv and i < bi):
             bv = v
             bi = i
         i += bd
@@ -337,9 +552,70 @@ def argmax_batched_f32(
         out_ids[seq] = Int32(mi)
 
 
-def topk_batched_f32(
-    out_ids: UnsafePointer[Int32, MutAnyOrigin],
+def topk_batched_partial_f32(
+    part_vals: UnsafePointer[Float32, MutAnyOrigin],
+    part_idx: UnsafePointer[Int32, MutAnyOrigin],
     logits: UnsafePointer[Float32, MutAnyOrigin],
+    vocab: Int,
+    chunk: Int,
+    k_arr: UnsafePointer[Int32, MutAnyOrigin],
+):
+    """Pass 1 of the batched categorical draw: grid (chunks, n_seqs); block
+    (cx, seq) stages its vocab slice in shared memory and extracts a local
+    top-k by k rounds of block-argmax with selected-flag masking — the same
+    dataflow as the single-row `topk_partial_f32`, indexed per sequence.
+    Output pairs land at part[seq * MAX_PARTS + cx * k .. + k], descending."""
+    sm = stack_allocation[SAMPLE_CHUNK, Float32, address_space = AddressSpace.SHARED]()
+    selected = stack_allocation[SAMPLE_CHUNK, UInt8, address_space = AddressSpace.SHARED]()
+    blk = Int(block_idx.x)
+    seq = Int(block_idx.y)
+    tid = Int(thread_idx.x)
+    bd = Int(block_dim.x)
+    var k = Int(k_arr[seq])
+    if k > MAX_TOPK:
+        k = MAX_TOPK
+    if k > vocab:
+        k = vocab
+    base = seq * vocab + blk * chunk
+
+    var s = tid
+    while s < chunk:
+        gi = blk * chunk + s
+        if gi < vocab:
+            value = logits[base - blk * chunk + gi]
+            if value != value or value < NEG_INF:
+                value = NEG_INF
+            sm[s] = value
+        else:
+            sm[s] = NEG_INF
+        selected[s] = 0
+        s += bd
+    barrier()
+
+    out = seq * MAX_PARTS + blk * k
+    for r in range(k):
+        var bv = NEG_INF
+        var bs = 0x7FFFFFFF
+        s = tid
+        while s < chunk:
+            v = sm[s]
+            if selected[s] == 0 and (bs == 0x7FFFFFFF or v > bv or (v == bv and s < bs)):
+                bv = v
+                bs = s
+            s += bd
+        (mv, ms) = _block_argmax(bv, bs)
+        if tid == 0:
+            part_vals[out + r] = mv
+            part_idx[out + r] = Int32(blk * chunk + ms)
+            selected[ms] = 1
+        barrier()
+
+
+def topk_batched_final_f32(
+    out_ids: UnsafePointer[Int32, MutAnyOrigin],
+    part_vals: UnsafePointer[Float32, MutAnyOrigin],
+    part_idx: UnsafePointer[Int32, MutAnyOrigin],
+    n_blocks: Int,
     vocab: Int,
     k_arr: UnsafePointer[Int32, MutAnyOrigin],
     inv_t_arr: UnsafePointer[Float32, MutAnyOrigin],
@@ -348,48 +624,62 @@ def topk_batched_f32(
     seed_arr: UnsafePointer[UInt64, MutAnyOrigin],
     step_arr: UnsafePointer[UInt64, MutAnyOrigin],
 ):
-    """Batched categorical draw over `logits` ([n_seqs, vocab]) with per-seq
-    params. One block per sequence extracts its top-k by k rounds of
-    full-row block-argmax with in-place NEG_INF masking (the logits buffer is
-    regenerated every step), then thread 0 replays the exact softmax /
-    min-p / top-p / counter-hash pipeline of topk_final_f32. Value ties
-    resolve to the lowest token id, so the survivors and their order match the
-    single-row two-pass path bit-for-bit. Grid.x = n_seqs, block SAMPLE_BLOCK."""
+    """Pass 2: one block per sequence merges its per-chunk partial lists into
+    the global top-k (same merge as `topk_final_f32`), then thread 0 replays
+    the exact softmax / min-p / top-p / counter-hash pipeline over the
+    survivors with this sequence's parameters."""
+    sv = stack_allocation[MAX_PARTS, Float32, address_space = AddressSpace.SHARED]()
+    si = stack_allocation[MAX_PARTS, Int32, address_space = AddressSpace.SHARED]()
+    selected = stack_allocation[MAX_PARTS, UInt8, address_space = AddressSpace.SHARED]()
     topv = stack_allocation[MAX_TOPK, Float32, address_space = AddressSpace.SHARED]()
     topi = stack_allocation[MAX_TOPK, Int32, address_space = AddressSpace.SHARED]()
     seq = Int(block_idx.x)
-    base = seq * vocab
     tid = Int(thread_idx.x)
     bd = Int(block_dim.x)
-    k = Int(k_arr[seq])
+    var k = Int(k_arr[seq])
     if k > MAX_TOPK:
         k = MAX_TOPK
     if k > vocab:
         k = vocab
+    n_parts = n_blocks * k
+    base = seq * MAX_PARTS
+
+    var s = tid
+    while s < n_parts:
+        sv[s] = part_vals[base + s]
+        si[s] = part_idx[base + s]
+        selected[s] = 0
+        s += bd
+    barrier()
 
     for r in range(k):
         var bv = NEG_INF
-        var bi = 0x7FFFFFFF
-        var i = tid
-        while i < vocab:
-            v = logits[base + i]
-            if v > bv or (v == bv and i < bi):
+        var bs = 0x7FFFFFFF
+        s = tid
+        while s < n_parts:
+            v = sv[s]
+            if selected[s] == 0 and (bs == 0x7FFFFFFF or v > bv or (v == bv and s < bs)):
                 bv = v
-                bi = i
-            i += bd
-        (mv, mi) = _block_argmax(bv, bi)
+                bs = s
+            s += bd
+        (mv, ms) = _block_argmax(bv, bs)
         if tid == 0:
             topv[r] = mv
-            topi[r] = Int32(mi)
-            logits[base + mi] = NEG_INF
+            topi[r] = si[ms]
+            selected[ms] = 1
         barrier()
 
     if tid != 0:
         return
 
+    if topv[0] == NEG_INF:
+        out_ids[seq] = topi[0]
+        return
+
     inv_t = inv_t_arr[seq]
     top_p = top_p_arr[seq]
     min_p = min_p_arr[seq]
+
     m = topv[0] * inv_t
     var total: Float32 = 0.0
     for j in range(k):

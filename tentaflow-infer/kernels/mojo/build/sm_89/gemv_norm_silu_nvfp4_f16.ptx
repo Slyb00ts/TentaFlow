@@ -278,9 +278,7 @@ $L__BB0_20:
 	ld.global.b8 	%rs8, [%rd59];
 	shl.b16 	%rs9, %rs8, 8;
 	or.b16 	%rs6, %rs9, %rs7;
-	// begin inline asm
 	cvt.rn.f16x2.e4m3x2 %r60, %rs6;
-	// end inline asm
 	mov.b32 	{%rs10, %rs11}, %r60;
 	cvt.f32.f16 	%r61, %rs10;
 	mul.f32 	%r62, %r15, %r61;
@@ -539,9 +537,7 @@ $L__BB0_22:
 	mul.f32 	%r266, %r268, 0fBFB8AA3B;
 	cvt.rn.f16.f32 	%rs77, %r269;
 	cvt.f32.f16 	%r270, %rs77;
-	// begin inline asm
 	ex2.approx.ftz.f32 %r265, %r266;
-	// end inline asm
 	add.f32 	%r271, %r265, 0f3F800000;
 	div.rn.f32 	%r272, %r268, %r271;
 	mul.f32 	%r273, %r272, %r270;

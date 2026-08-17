@@ -1,0 +1,209 @@
+--- a/vllm/models/deepseek_v4/nvidia/sm120.py
++++ b/vllm/models/deepseek_v4/nvidia/sm120.py
+@@ -16,11 +16,13 @@
+ only for its reusable LSE buffer; split-K decode scratch is supplied per call.
+ """
+ 
++import os
+ from typing import TYPE_CHECKING, ClassVar, cast
+ 
+ import torch
+ 
+ from vllm.forward_context import get_forward_context
++from vllm.logger import init_logger
+ from vllm.models.deepseek_v4.common.ops import (
+     compute_global_topk_indices_and_lens,
+ )
+@@ -36,6 +38,8 @@
+     from vllm.models.deepseek_v4.attention import DeepseekV4MLAAttention
+     from vllm.v1.attention.backends.mla.sparse_swa import DeepseekSparseSWAMetadata
+ 
++logger = init_logger(__name__)
++
+ 
+ _DECODE_MAX_TOKENS = 64
+ _DECODE_SPLIT_TILE = 64
+@@ -64,6 +68,29 @@
+     )
+ 
+ 
++def _env_enabled(name: str, default: str = "0") -> bool:
++    value = os.getenv(name, default).strip().lower()
++    return value not in ("0", "false", "no", "off", "")
++
++
++def _use_b12x_compressed_mla() -> bool:
++    return _env_enabled("VLLM_DSV4_B12X_COMPRESSED_MLA")
++
++
++def _extra_topk_capacity(layer: "DeepseekV4MLAAttention") -> int:
++    if layer.compress_ratio <= 1:
++        return 0
++    if layer.compress_ratio == 4:
++        assert layer.topk_indices_buffer is not None
++        return int(layer.topk_indices_buffer.shape[-1])
++    if layer.compress_ratio == 128:
++        return _c128a_max_compressed(layer.max_model_len, layer.compress_ratio)
++    raise ValueError(
++        f"Unsupported compress_ratio={layer.compress_ratio}; "
++        "expected 1, 4, or 128."
++    )
++
++
+ def _get_decode_scratch(
+     num_tokens: int,
+     num_heads: int,
+@@ -79,6 +106,69 @@
+     return mid_out, mid_lse
+ 
+ 
++def _b12x_index_matrix(indices: torch.Tensor | None) -> torch.Tensor | None:
++    if indices is None:
++        return None
++    if indices.ndim == 3:
++        assert indices.shape[1] == 1
++        return indices.squeeze(1)
++    return indices
++
++
++def _get_b12x_decode_workspace(
++    layer: "DeepseekV4MLAAttention",
++    *,
++    extra_topk: int,
++):
++    from b12x.attention.workspace import B12XAttentionWorkspace
++
++    total_topk = int(layer.window_size) + int(extra_topk)
++    max_rows = _max_decode_workspace_tokens(layer.max_num_batched_tokens)
++    max_chunks = _decode_num_splits(layer.window_size, extra_topk)
++
++    workspace = getattr(layer, "_b12x_compressed_mla_workspace", None)
++    if (
++        workspace is None
++        or int(workspace.topk) < total_topk
++        or int(workspace.max_total_q) < max_rows
++        or int(workspace.max_chunks_per_row) < max_chunks
++        or int(workspace.num_q_heads) != int(layer.padded_heads)
++    ):
++        device = layer.attn_sink.device
++        if device.type != "cuda":
++            device = torch.device(f"cuda:{torch.cuda.current_device()}")
++        workspace = B12XAttentionWorkspace(
++            mode="decode",
++            device=device,
++            dtype=torch.bfloat16,
++            kv_dtype=torch.uint8,
++            num_q_heads=int(layer.padded_heads),
++            head_dim=512,
++            v_head_dim=512,
++            topk=total_topk,
++            max_total_q=max_rows,
++            max_batch=max_rows,
++            max_page_table_width=total_topk,
++            max_paged_q_rows=max_rows,
++            page_size=int(layer.swa_cache_layer.block_size),
++            padded_heads=int(layer.padded_heads),
++            max_chunks_per_row=max_chunks,
++        )
++        workspace.kv_chunk_size_ptr = torch.empty(
++            (1,), dtype=torch.int32, device=device
++        )
++        workspace.num_chunks_ptr = torch.empty((1,), dtype=torch.int32, device=device)
++        layer._b12x_compressed_mla_workspace = workspace
++        logger.info_once(
++            "DeepSeek V4 SM120 b12x compressed MLA decode enabled "
++            "(topk=%d, max_rows=%d, max_chunks=%d).",
++            total_topk,
++            max_rows,
++            max_chunks,
++        )
++    return workspace
++
++
+ class DeepseekV4SM120SparseBackend(DeepseekV4FlashMLASparseBackend):
+     """SM120 variant. Geometry is identical to the FlashMLA parent (same KV
+     layout, head size, block size); the only thing that changes is the impl
+@@ -184,21 +274,7 @@
+ 
+     @classmethod
+     def _reserve_decode_workspace(cls, layer: "DeepseekV4MLAAttention") -> None:
+-        if layer.compress_ratio <= 1:
+-            extra_topk = 0
+-        elif layer.compress_ratio == 4:
+-            assert layer.topk_indices_buffer is not None
+-            extra_topk = layer.topk_indices_buffer.shape[-1]
+-        elif layer.compress_ratio == 128:
+-            extra_topk = _c128a_max_compressed(
+-                layer.max_model_len,
+-                layer.compress_ratio,
+-            )
+-        else:
+-            raise ValueError(
+-                f"Unsupported compress_ratio={layer.compress_ratio}; "
+-                "expected 1, 4, or 128."
+-            )
++        extra_topk = _extra_topk_capacity(layer)
+         _get_decode_scratch(
+             _max_decode_workspace_tokens(layer.max_num_batched_tokens),
+             layer.padded_heads,
+@@ -206,6 +282,8 @@
+             layer.window_size,
+             extra_topk,
+         )
++        if _use_b12x_compressed_mla():
++            _get_b12x_decode_workspace(layer, extra_topk=extra_topk)
+ 
+     @classmethod
+     def _forward_decode(
+@@ -237,6 +315,7 @@
+                     attn_metadata.block_table[:num_decodes],
+                     block_size,
+                     is_valid,
++                    kv_cache.shape[0],
+                 )
+                 topk_indices = global_indices.view(num_decode_tokens, 1, -1)
+             else:
+@@ -260,6 +339,35 @@
+         # Treat queries in the same seq as independent queries (attended
+         # purely by the generated indices). q arrives pre-padded to
+         # layer.padded_heads by the outer wrapper.
++        if _use_b12x_compressed_mla():
++            from b12x.attention.mla.compressed_api import (
++                compressed_mla_decode_forward,
++            )
++
++            workspace = _get_b12x_decode_workspace(layer, extra_topk=extra_topk)
++            workspace.tmp_output = mid_out
++            workspace.tmp_lse = mid_lse
++            workspace.output_buffer = output
++            result = compressed_mla_decode_forward(
++                q_all=q,
++                swa_k_cache=layer.swa_cache_layer.kv_cache,
++                swa_indices=_b12x_index_matrix(swa_indices),
++                swa_topk_lengths=swa_lens,
++                workspace=workspace,
++                sm_scale=layer.scale,
++                swa_page_size=swa_metadata.block_size,
++                indexed_k_cache=kv_cache,
++                indexed_indices=_b12x_index_matrix(topk_indices),
++                indexed_topk_lengths=topk_lens,
++                indexed_page_size=block_size if kv_cache is not None else None,
++                attn_sink=layer.attn_sink,
++                expected_num_q_heads=q.shape[1],
++                backend="sm120_unified",
++            )
++            if result.data_ptr() != output.data_ptr():
++                output.copy_(result)
++            return
++
+         q = q.unsqueeze(1)
+         swa_cache = layer.swa_cache_layer.kv_cache.unsqueeze(-2)
+         if kv_cache is not None:
+@@ -340,6 +448,7 @@
+                 attn_metadata.block_table,
+                 block_size,
+                 swa_metadata.is_valid_token[prefill_token_slice],
++                compressed_k_cache.shape[0],
+             )
+ 
+         assert swa_metadata.prefill_swa_indices is not None

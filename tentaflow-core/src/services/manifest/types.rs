@@ -60,6 +60,14 @@ pub struct Engine {
     /// across a cluster. The unified deploy wizard offers it as a cluster target.
     #[serde(default)]
     pub cluster_capable: Option<bool>,
+    /// `Some(true)` for a runtime that exists ONLY to back its own model presets
+    /// (e.g. `vllm-dspark` — a patched image pinned to one checkpoint). The
+    /// catalog then hides its engine card and shows only the model tiles;
+    /// deploying a preset still resolves this engine normally. Without it such a
+    /// runtime shows up under "Engines" named after a model and reads as a
+    /// duplicate of its own preset.
+    #[serde(default)]
+    pub preset_only: Option<bool>,
     /// Multi-node launch mode for cluster deploy. `None`/"ray" = Ray GCS on the
     /// head + `vllm serve --distributed-executor-backend ray` exec'd on the head
     /// once every worker joined. "vllm-mp" = vLLM native multi-node
@@ -541,6 +549,8 @@ pub enum NativeRuntime {
     Binary,
     /// Python bundle managed by TentaFlow.
     PythonBundle,
+    /// Vendor CLI managed as a long-lived service bridge (Codex / Claude Code).
+    ManagedCli,
 }
 
 impl NativeRuntime {
@@ -549,6 +559,7 @@ impl NativeRuntime {
             NativeRuntime::Embedded => "embedded",
             NativeRuntime::Binary => "binary",
             NativeRuntime::PythonBundle => "python-bundle",
+            NativeRuntime::ManagedCli => "managed-cli",
         }
     }
 }
@@ -631,6 +642,13 @@ pub struct ModelPreset {
     /// when absent.
     #[serde(default)]
     pub speculator_num_tokens: Option<u32>,
+    /// Domyslny sampling zalecany przez autora checkpointu. Modele potrafia
+    /// wymagac nietypowych wartosci (DeepSeek V4 chce `temperature = 1.0`, nie
+    /// ~0.7), a bez tego serwer startuje z wlasnym domyslem i model odpowiada
+    /// gorzej, niz powinien. Serwowane jako `--override-generation-config`, wiec
+    /// obowiazuje kazdego klienta, ktory nie poda swoich wartosci.
+    #[serde(default)]
+    pub sampling: Option<SamplingDefaults>,
     /// vLLM-specific provisioning for this preset — self-quantization to NVFP4
     /// before serving. Ignored by non-vLLM engines.
     #[serde(default)]
@@ -648,6 +666,44 @@ pub struct ModelPreset {
     /// podmienia `payload.model` na repo wybranego wariantu (+ przelicza wagi).
     #[serde(default, rename = "quant_variant")]
     pub quant_variants: Vec<QuantVariant>,
+}
+
+/// Domyslny sampling presetu (`[model_preset.sampling]`). Kazde pole opcjonalne —
+/// wysylamy do silnika tylko te, ktore manifest faktycznie deklaruje.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SamplingDefaults {
+    #[serde(default)]
+    pub temperature: Option<f64>,
+    #[serde(default)]
+    pub top_p: Option<f64>,
+    #[serde(default)]
+    pub top_k: Option<i64>,
+    #[serde(default)]
+    pub min_p: Option<f64>,
+}
+
+impl SamplingDefaults {
+    /// JSON dla `--override-generation-config`. `None` gdy blok nie niesie
+    /// zadnej wartosci — pusty obiekt tylko zasmiecalby komende.
+    pub fn to_generation_config_json(&self) -> Option<String> {
+        let mut m = serde_json::Map::new();
+        if let Some(v) = self.temperature {
+            m.insert("temperature".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.top_p {
+            m.insert("top_p".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.top_k {
+            m.insert("top_k".into(), serde_json::json!(v));
+        }
+        if let Some(v) = self.min_p {
+            m.insert("min_p".into(), serde_json::json!(v));
+        }
+        if m.is_empty() {
+            return None;
+        }
+        serde_json::to_string(&serde_json::Value::Object(m)).ok()
+    }
 }
 
 /// Jeden wariant kwantyzacji presetu — kwantyzacja + repo HF pod nia.

@@ -8,7 +8,32 @@
 # emitter-side version cap, it does not change kernel semantics.
 set -euo pipefail
 
-REAL_PTXAS="${FORGE_REAL_PTXAS:-/opt/cuda/bin/ptxas}"
+# Lokalizacja ptxas różni się między dystrybucjami (Arch: /opt/cuda,
+# Ubuntu/DGX: /usr/local/cuda), więc szukamy, zamiast zakładać. Brak wykrycia
+# kończy się czytelnym komunikatem, a nie „No such file or directory" z wnętrza
+# kompilatora Mojo.
+if [[ -z "${FORGE_REAL_PTXAS:-}" ]]; then
+    for candidate in \
+        "$(command -v ptxas 2>/dev/null || true)" \
+        "${CUDA_HOME:-}/bin/ptxas" \
+        /usr/local/cuda/bin/ptxas \
+        /opt/cuda/bin/ptxas
+    do
+        if [[ -n "$candidate" && -x "$candidate" ]]; then
+            FORGE_REAL_PTXAS="$candidate"
+            break
+        fi
+    done
+fi
+if [[ -z "${FORGE_REAL_PTXAS:-}" ]]; then
+    echo "ptxas nie znaleziony; ustaw FORGE_REAL_PTXAS albo CUDA_HOME" >&2
+    exit 1
+fi
+REAL_PTXAS="$FORGE_REAL_PTXAS"
+if [[ -n "${FORGE_PTXAS_AUDIT_LOG:-}" ]]; then
+    printf '%q ' "$@" >> "$FORGE_PTXAS_AUDIT_LOG"
+    printf '\n' >> "$FORGE_PTXAS_AUDIT_LOG"
+fi
 
 # Find the .ptx input argument (ptxas is invoked as: ptxas [opts] input.ptx -o out ...).
 patched=()

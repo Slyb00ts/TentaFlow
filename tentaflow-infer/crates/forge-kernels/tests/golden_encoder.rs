@@ -6,7 +6,7 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{gpu, PoolSizes};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
@@ -14,8 +14,8 @@ use half::f16;
 
 const EPS: f32 = 1e-5;
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+fn device() -> Option<Arc<dyn Device>> {
+    match gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,
@@ -96,7 +96,11 @@ fn layernorm_matches_reference() {
 
     let (rows, cols) = (5usize, 512usize);
     let x = quantize(&(0..rows * cols).map(fill).collect::<Vec<_>>());
-    let w = quantize(&(0..cols).map(|i| 0.8 + (i % 7) as f32 * 0.05).collect::<Vec<_>>());
+    let w = quantize(
+        &(0..cols)
+            .map(|i| 0.8 + (i % 7) as f32 * 0.05)
+            .collect::<Vec<_>>(),
+    );
     let b = quantize(&(0..cols).map(|i| fill(i) * 0.2).collect::<Vec<_>>());
 
     let xb = upload_f16(dev.as_ref(), &x);
@@ -121,8 +125,16 @@ fn layernorm_residual_matches_reference() {
 
     let (rows, cols) = (3usize, 512usize);
     let res = quantize(&(0..rows * cols).map(fill).collect::<Vec<_>>());
-    let x = quantize(&(0..rows * cols).map(|i| fill(i + 11) * 0.5).collect::<Vec<_>>());
-    let w = quantize(&(0..cols).map(|i| 1.0 + (i % 3) as f32 * 0.1).collect::<Vec<_>>());
+    let x = quantize(
+        &(0..rows * cols)
+            .map(|i| fill(i + 11) * 0.5)
+            .collect::<Vec<_>>(),
+    );
+    let w = quantize(
+        &(0..cols)
+            .map(|i| 1.0 + (i % 3) as f32 * 0.1)
+            .collect::<Vec<_>>(),
+    );
     let b = quantize(&(0..cols).map(|i| fill(i) * 0.1).collect::<Vec<_>>());
 
     let rb = upload_f16(dev.as_ref(), &res);
@@ -136,12 +148,7 @@ fn layernorm_residual_matches_reference() {
     dev.synchronize().unwrap();
 
     // residual is updated in place (f16-rounded), then normalized.
-    let sum = quantize(
-        &res.iter()
-            .zip(&x)
-            .map(|(r, v)| r + v)
-            .collect::<Vec<_>>(),
-    );
+    let sum = quantize(&res.iter().zip(&x).map(|(r, v)| r + v).collect::<Vec<_>>());
     let want = layernorm_ref(&sum, &w, &b, rows, cols);
     let got = download_f16(dev.as_ref(), &yb, rows * cols);
     assert!(max_abs_err(&got, &want) < 0.01);
@@ -206,7 +213,11 @@ fn conv1d_k3_matches_reference() {
 
     let (in_ch, out_ch, in_t) = (8usize, 6usize, 40usize);
     let x = quantize(&(0..in_ch * in_t).map(fill).collect::<Vec<_>>());
-    let w = quantize(&(0..out_ch * in_ch * 3).map(|i| fill(i + 5) * 0.3).collect::<Vec<_>>());
+    let w = quantize(
+        &(0..out_ch * in_ch * 3)
+            .map(|i| fill(i + 5) * 0.3)
+            .collect::<Vec<_>>(),
+    );
     let b = quantize(&(0..out_ch).map(|i| fill(i) * 0.2).collect::<Vec<_>>());
 
     let xb = upload_f16(dev.as_ref(), &x);
@@ -268,7 +279,17 @@ fn gemv_bias_and_offset_variants_match_reference() {
     let xbig = upload_f16(dev.as_ref(), &x_big);
     let ybig = upload_f16(dev.as_ref(), &vec![0.0; rows * 3]);
     kernels
-        .gemv_f16_bias_at(&ybig, rows * 2, &wb, &xbig, cols * 2 * 2, &bb, rows, cols, &stream)
+        .gemv_f16_bias_at(
+            &ybig,
+            rows * 2,
+            &wb,
+            &xbig,
+            cols * 2 * 2,
+            &bb,
+            rows,
+            cols,
+            &stream,
+        )
         .unwrap();
     dev.synchronize().unwrap();
     let got = download_f16(dev.as_ref(), &ybig, rows * 3);
@@ -278,7 +299,16 @@ fn gemv_bias_and_offset_variants_match_reference() {
     let want_nobias: Vec<f32> = want.iter().zip(&b).map(|(v, bi)| v - bi).collect();
     let ybig2 = upload_f16(dev.as_ref(), &vec![0.0; rows * 3]);
     kernels
-        .gemv_f16_at(&ybig2, rows * 2, &wb, &xbig, cols * 2 * 2, rows, cols, &stream)
+        .gemv_f16_at(
+            &ybig2,
+            rows * 2,
+            &wb,
+            &xbig,
+            cols * 2 * 2,
+            rows,
+            cols,
+            &stream,
+        )
         .unwrap();
     dev.synchronize().unwrap();
     let got2 = download_f16(dev.as_ref(), &ybig2, rows * 3);
@@ -300,7 +330,11 @@ fn attn_full_ref(
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; n_q * heads * head_dim];
     for t in 0..n_q {
-        let limit = if causal { (q_offset + t + 1).min(n_kv) } else { n_kv };
+        let limit = if causal {
+            (q_offset + t + 1).min(n_kv)
+        } else {
+            n_kv
+        };
         for h in 0..heads {
             let qv = &q[(t * heads + h) * head_dim..(t * heads + h + 1) * head_dim];
             let mut scores = vec![0.0f32; limit];
@@ -332,17 +366,27 @@ fn attn_full_matches_reference() {
     let (heads, head_dim, n_kv) = (4usize, 64usize, 37usize);
     let scale = 1.0 / (head_dim as f32).sqrt();
     let k = quantize(&(0..n_kv * heads * head_dim).map(fill).collect::<Vec<_>>());
-    let v = quantize(&(0..n_kv * heads * head_dim).map(|i| fill(i + 7)).collect::<Vec<_>>());
+    let v = quantize(
+        &(0..n_kv * heads * head_dim)
+            .map(|i| fill(i + 7))
+            .collect::<Vec<_>>(),
+    );
     let kb = upload_f16(dev.as_ref(), &k);
     let vb = upload_f16(dev.as_ref(), &v);
 
     // Bidirectional, multiple query rows (encoder case).
     let n_q = n_kv;
-    let q = quantize(&(0..n_q * heads * head_dim).map(|i| fill(i + 3)).collect::<Vec<_>>());
+    let q = quantize(
+        &(0..n_q * heads * head_dim)
+            .map(|i| fill(i + 3))
+            .collect::<Vec<_>>(),
+    );
     let qb = upload_f16(dev.as_ref(), &q);
     let ob = upload_f16(dev.as_ref(), &vec![0.0; n_q * heads * head_dim]);
     kernels
-        .attn_full_f16(&ob, &qb, &kb, &vb, n_q, heads, heads, head_dim, n_kv, false, 0, scale, &stream)
+        .attn_full_f16(
+            &ob, &qb, &kb, &vb, n_q, heads, heads, head_dim, n_kv, false, 0, scale, &stream,
+        )
         .unwrap();
     dev.synchronize().unwrap();
     let got = download_f16(dev.as_ref(), &ob, n_q * heads * head_dim);
@@ -351,19 +395,45 @@ fn attn_full_matches_reference() {
 
     // Single-query causal with q_offset (decode case): only the first
     // q_offset+1 keys are admitted.
-    let q1 = quantize(&(0..heads * head_dim).map(|i| fill(i + 9)).collect::<Vec<_>>());
+    let q1 = quantize(
+        &(0..heads * head_dim)
+            .map(|i| fill(i + 9))
+            .collect::<Vec<_>>(),
+    );
     let q1b = upload_f16(dev.as_ref(), &q1);
     let o1b = upload_f16(dev.as_ref(), &vec![0.0; heads * head_dim]);
     let q_offset = 20usize;
     kernels
         .attn_full_f16(
-            &o1b, &q1b, &kb, &vb, 1, heads, heads, head_dim, q_offset + 1, true, q_offset, scale,
+            &o1b,
+            &q1b,
+            &kb,
+            &vb,
+            1,
+            heads,
+            heads,
+            head_dim,
+            q_offset + 1,
+            true,
+            q_offset,
+            scale,
             &stream,
         )
         .unwrap();
     dev.synchronize().unwrap();
     let got1 = download_f16(dev.as_ref(), &o1b, heads * head_dim);
-    let want1 = attn_full_ref(&q1, &k, &v, 1, heads, head_dim, q_offset + 1, true, q_offset, scale);
+    let want1 = attn_full_ref(
+        &q1,
+        &k,
+        &v,
+        1,
+        heads,
+        head_dim,
+        q_offset + 1,
+        true,
+        q_offset,
+        scale,
+    );
     assert!(max_abs_err(&got1, &want1) < 0.02, "causal decode");
 }
 
@@ -377,7 +447,9 @@ fn gather_rows_matches_reference() {
     let table = quantize(&(0..n_rows * cols).map(fill).collect::<Vec<_>>());
     let tb = upload_f16(dev.as_ref(), &table);
     let ids: Vec<i32> = vec![7, 0, 3];
-    let idb = dev.alloc(ids.len() * 4, MemKind::Device, Pool::Weights).unwrap();
+    let idb = dev
+        .alloc(ids.len() * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
     dev.write(bytemuck::cast_slice(&ids), &idb, 0).unwrap();
     let ob = upload_f16(dev.as_ref(), &vec![0.0; ids.len() * cols]);
     kernels

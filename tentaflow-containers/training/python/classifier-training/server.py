@@ -93,18 +93,24 @@ def _gpu_mem_mb() -> float:
 @dataclass
 class JobState:
     job_id: str
-    status: str = "running"  # running | succeeded | failed
+    status: str = "running"  # running | succeeded | failed | cancelled
     epoch: int = 0
     total_epochs: int = 0
     train_loss: Optional[float] = None
     val_acc: Optional[float] = None
     val_macro_f1: Optional[float] = None
+    # F1 per klasa z ostatniej walidacji (`{nazwa: f1}`) — macro samo nie mówi,
+    # która klasa ciągnie wynik w dół.
+    val_f1_per_class: Optional[dict[str, float]] = None
     error: Optional[str] = None
     artifact_path: Optional[str] = None
     # Etap joba do podglądu na żywo (przygotowanie → budowa cropów → trening → ewaluacja → eksport).
     stage: str = "przygotowanie"
     # Znacznik startu joba (monotoniczny) do liczenia elapsed_s/eta_s.
     start_time: float = field(default_factory=time.monotonic)
+    # Żądanie anulowania złożone przez Core (`POST /cancel/{job_id}`). Pętla treningu
+    # i budowa cropów sprawdzają je kooperacyjnie i kończą job jako `cancelled`.
+    cancel_requested: bool = False
 
     def snapshot(self) -> dict[str, Any]:
         elapsed = time.monotonic() - self.start_time
@@ -118,6 +124,7 @@ class JobState:
             "train_loss": self.train_loss,
             "val_acc": self.val_acc,
             "val_macro_f1": self.val_macro_f1,
+            "val_f1_per_class": self.val_f1_per_class,
             "error": self.error,
             "artifact_path": self.artifact_path,
             "gpu_mem_mb": _gpu_mem_mb(),
@@ -274,8 +281,36 @@ def _iter_coco_splits(dataset_dir: str):
             yield sub, j
 
 
+class _Cancelled(Exception):
+    """Trening przerwany na żądanie Core (`POST /cancel/{job_id}`)."""
+
+
+def _cancel_requested(job_id: str) -> bool:
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        return bool(st and st.cancel_requested)
+
+
+def _review_gate_active(dataset_dir: str) -> bool:
+    """Czy dataset przeszedł przez nasz edytor, czyli czy bramka `approved` ma sens.
+    Aktywna, gdy JAKIKOLWIEK obraz w JAKIMKOLWIEK splicie niesie pole `approved`."""
+    for _images_dir, coco_json in _iter_coco_splits(dataset_dir):
+        if os.path.getsize(coco_json) > _MAX_COCO_BYTES:
+            continue
+        with open(coco_json, encoding="utf-8") as f:
+            coco = json.load(f)
+        for im in coco.get("images", []):
+            if "approved" in im:
+                return True
+    return False
+
+
 def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
-    """Wczytuje wszystkie splity COCO z dataset_dir, filtruje adnotacje po kategorii
+    """Wczytuje wszystkie splity COCO z dataset_dir, bierze tylko obrazy ZATWIERDZONE
+    przez człowieka (`approved: true` — nieobejrzane predykcje auto-labela nie mogą
+    uczyć modelu na jego własnych wyjściach; dataset, w którym żaden obraz nie ma tego
+    pola, nie przeszedł przez nasz edytor i idzie w całości), filtruje adnotacje po
+    kategorii
     (source_class lub dowolna) i atrybucie (attributes[attribute] ∈ values), wycina
     bbox z PEŁNEJ rozdzielczości obrazu (PIL) i zapisuje do ImageFolder w cache jako
     train/<indeks-wartości>/<n>.jpg oraz valid/<indeks-wartości>/<n>.jpg (split
@@ -298,8 +333,13 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
     skipped_no_attr = 0
     skipped_bad_value = 0
     skipped_wrong_class = 0
+    skipped_unapproved = 0
     total_annotations = 0
     total_candidates = 0
+    images_seen = 0
+    images_approved = 0
+
+    review_gate = _review_gate_active(req.dataset_dir)
 
     for images_dir, coco_json in _iter_coco_splits(req.dataset_dir):
         size = os.path.getsize(coco_json)
@@ -310,7 +350,16 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
         with open(coco_json, encoding="utf-8") as f:
             coco = json.load(f)
         cat_name = {c["id"]: c["name"] for c in coco.get("categories", [])}
-        img_meta = {im["id"]: im for im in coco.get("images", [])}
+        split_images = coco.get("images", [])
+        images_seen += len(split_images)
+        # Bramka zatwierdzenia: adnotacje z obrazów nieobejrzanych przez człowieka
+        # w ogóle nie wchodzą do puli cropów.
+        img_meta = {
+            im["id"]: im
+            for im in split_images
+            if not review_gate or im.get("approved") is True
+        }
+        images_approved += len(img_meta)
         annotations = coco.get("annotations", [])
         total_annotations += len(annotations)
         if total_annotations > _MAX_ANNOTATIONS:
@@ -325,6 +374,10 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
                     flush=True,
                 )
                 break
+            im = img_meta.get(ann.get("image_id"))
+            if im is None:
+                skipped_unapproved += 1
+                continue
             cid = ann.get("category_id")
             cname = cat_name.get(cid, "")
             if source_class and cname != source_class:
@@ -337,9 +390,6 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
             value = attrs.get(req.attribute)
             if value not in value_index:
                 skipped_bad_value += 1
-                continue
-            im = img_meta.get(ann.get("image_id"))
-            if im is None:
                 continue
             bbox = ann.get("bbox")
             if not bbox or len(bbox) != 4:
@@ -380,6 +430,8 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
         os.makedirs(va_dir, exist_ok=True)
         n_tr = n_va = 0
         for i, (path, bbox) in enumerate(items):
+            if i % 200 == 0 and _cancel_requested(job_id):
+                raise _Cancelled
             x, y, w, h = bbox
             try:
                 with Image.open(path) as img:
@@ -414,6 +466,12 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
     with open(os.path.join(data_root, "classes.json"), "w", encoding="utf-8") as f:
         json.dump({"classes": req.values}, f, ensure_ascii=False)
 
+    if total_candidates == 0 and review_gate and images_approved == 0:
+        raise ValueError(
+            f"brak zatwierdzonych obrazów (0 z {images_seen}) — zatwierdź adnotacje "
+            'przyciskiem „Zapisz i zatwierdź" w edytorze'
+        )
+
     return {
         "data_root": data_root,
         "counts_raw": counts_raw,
@@ -421,6 +479,10 @@ def _collect_crops(req: TrainRequest, job_id: str) -> dict[str, Any]:
         "skipped_no_attr": skipped_no_attr,
         "skipped_bad_value": skipped_bad_value,
         "skipped_wrong_class": skipped_wrong_class,
+        "skipped_unapproved": skipped_unapproved,
+        "review_gate": review_gate,
+        "images_seen": images_seen,
+        "images_approved": images_approved,
     }
 
 
@@ -445,8 +507,11 @@ def _build_transforms(image_size: int):  # noqa: ANN201
     return train_tf, val_tf
 
 
-def _macro_f1(confusion: list[list[int]], num_classes: int) -> tuple[float, float]:
-    """Liczy accuracy i macro-F1 z macierzy pomyłek [true][pred]."""
+def _macro_f1(confusion: list[list[int]], num_classes: int) -> tuple[float, float, list[float]]:
+    """Liczy accuracy, macro-F1 i F1 PER KLASA z macierzy pomyłek [true][pred].
+    Per-klasowe F1 wychodzi na zewnątrz, bo samo macro nie mówi, KTÓRA klasa
+    zawodzi — a przy silnie niezbalansowanym zbiorze to jedyna informacja, która
+    kieruje następnym krokiem (dosypać zdjęć konkretnego stanu)."""
     total = sum(sum(r) for r in confusion)
     correct = sum(confusion[i][i] for i in range(num_classes))
     acc = correct / total if total else 0.0
@@ -460,7 +525,7 @@ def _macro_f1(confusion: list[list[int]], num_classes: int) -> tuple[float, floa
         f1 = 2 * prec * rec / (prec + rec) if (prec + rec) else 0.0
         f1s.append(f1)
     macro_f1 = sum(f1s) / num_classes if num_classes else 0.0
-    return acc, macro_f1
+    return acc, macro_f1, f1s
 
 
 def _train_worker(req: TrainRequest, job_id: str) -> None:
@@ -522,15 +587,28 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         criterion = nn.CrossEntropyLoss(weight=weights)
         params = [p for p in model.parameters() if p.requires_grad]
         optimizer = torch.optim.AdamW(params, lr=hp.learning_rate, weight_decay=1e-4)
+        # Wygaszanie LR cosinusem przez cały przebieg. Bez niego (stałe LR) model
+        # dobijał do minimum i przez resztę epok wokół niego skakał: na produkcji
+        # macro-F1 oscylowało w paśmie ~0.72-0.90 do samego końca, więc wartość z
+        # OSTATNIEJ epoki była loterią, a nie wynikiem. Malejące LR pozwala się w
+        # tym minimum ustatkować. `T_max` = liczba epok, krok raz na epokę.
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=hp.epochs)
 
         pin = device.type == "cuda"
+        # Wycinki leżą na dysku jako JPEG, więc każdy batch wymaga dekodowania na
+        # CPU. Przy sztywnych 4 workerach większy `batch_size` NIE przyspieszał —
+        # wąskim gardłem stawał się dekoder, a karta czekała. Skalujemy do liczby
+        # rdzeni (z zapasem jednego na resztę procesu), a `persistent_workers`
+        # oszczędza respawn puli na każdej epoce (przy 60+ epokach to realny czas).
+        workers = min(8, max(0, (os.cpu_count() or 2) - 1))
         train_loader = DataLoader(
-            train_ds, batch_size=hp.batch_size, shuffle=True, num_workers=4,
+            train_ds, batch_size=hp.batch_size, shuffle=True, num_workers=workers,
             pin_memory=pin, drop_last=False,
+            persistent_workers=workers > 0, prefetch_factor=4 if workers > 0 else None,
         )
         val_loader = DataLoader(
-            valid_ds, batch_size=hp.batch_size, shuffle=False, num_workers=4,
-            pin_memory=pin,
+            valid_ds, batch_size=hp.batch_size, shuffle=False, num_workers=workers,
+            pin_memory=pin, persistent_workers=workers > 0,
         )
         remap = remap.to(device)
 
@@ -540,11 +618,15 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
         best_f1 = -1.0
         best_ckpt = os.path.join(output_dir, "checkpoint_best.pth")
         for epoch in range(1, hp.epochs + 1):
+            if _cancel_requested(job_id):
+                raise _Cancelled
             _update(job_id, stage="trening")
             model.train()
             running = 0.0
             seen = 0
             for imgs, folder_targets in train_loader:
+                if _cancel_requested(job_id):
+                    raise _Cancelled
                 imgs = imgs.to(device, non_blocking=True)
                 targets = remap[folder_targets.to(device)]
                 optimizer.zero_grad()
@@ -568,7 +650,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
                         preds = model(imgs).argmax(dim=1)
                         for t, p in zip(targets.tolist(), preds.tolist()):
                             confusion[t][p] += 1
-            val_acc, val_macro_f1 = _macro_f1(confusion, num_classes)
+            val_acc, val_macro_f1, per_class_f1 = _macro_f1(confusion, num_classes)
 
             with open(metrics_csv, "a", newline="", encoding="utf-8") as f:
                 csv.writer(f).writerow([
@@ -577,7 +659,10 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             _update(
                 job_id, epoch=epoch, train_loss=train_loss,
                 val_acc=val_acc, val_macro_f1=val_macro_f1,
+                val_f1_per_class=dict(zip(req.values, per_class_f1)),
             )
+
+            scheduler.step()
 
             if val_macro_f1 >= best_f1:
                 best_f1 = val_macro_f1
@@ -594,6 +679,7 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
                             "epoch": epoch,
                             "val_macro_f1": val_macro_f1,
                             "val_acc": val_acc,
+                            "val_f1_per_class": dict(zip(req.values, per_class_f1)),
                         },
                         f,
                         ensure_ascii=False,
@@ -606,6 +692,8 @@ def _train_worker(req: TrainRequest, job_id: str) -> None:
             job_id, status="succeeded",
             artifact_path=best_ckpt if os.path.exists(best_ckpt) else output_dir,
         )
+    except _Cancelled:
+        _update(job_id, status="cancelled", stage="anulowany")
     except Exception as exc:  # noqa: BLE001
         _update(
             job_id, status="failed",
@@ -693,6 +781,21 @@ def status(job_id: str) -> dict[str, Any]:
     return st.snapshot()
 
 
+@app.post("/cancel/{job_id}")
+def cancel(job_id: str) -> dict[str, Any]:
+    """Podnosi flagę anulowania; pętla treningu kończy job jako `cancelled` przy
+    najbliższym batchu. Job już zakończony wraca z aktualnym statusem i
+    `cancelled: false` — anulowanie nie jest błędem wołającego."""
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        if st is None:
+            raise HTTPException(404, "job not found")
+        if st.status != "running":
+            return {"job_id": job_id, "status": st.status, "cancelled": False}
+        st.cancel_requested = True
+        return {"job_id": job_id, "status": st.status, "cancelled": True}
+
+
 @app.post("/export")
 def export(req: ExportRequest) -> dict[str, Any]:
     """Eksportuje checkpoint do ONNX (opset 17, dynamic batch). Klasy w kolejności
@@ -725,11 +828,17 @@ def export(req: ExportRequest) -> dict[str, Any]:
         model.eval()
         dummy = torch.randn(1, 3, image_size, image_size)
         onnx_path = os.path.join(out_dir, "model.onnx")
+        # `dynamo=False` JEST WYMAGANE: od torch 2.9 domyślny jest eksporter
+        # torch.export, który zapisuje wagi OBOK grafu (`model.onnx` 0,25 MB +
+        # `model.onnx.data` 94 MB). Publikacja kopiuje wyłącznie plik `.onnx`, więc
+        # do rejestru trafiałby graf BEZ WAG — model ładowałby się (albo i nie) i
+        # zwracał bzdury. Eksporter TorchScript daje jeden samowystarczalny plik.
         torch.onnx.export(
             model, dummy, onnx_path,
             input_names=["input"], output_names=["logits"],
             opset_version=17,
             dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
+            dynamo=False,
         )
         with open(os.path.join(out_dir, "classes.json"), "w", encoding="utf-8") as f:
             json.dump({"classes": req.values, "image_size": image_size}, f, ensure_ascii=False)

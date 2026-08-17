@@ -306,8 +306,22 @@ pub async fn handle_ws_connection<S>(
     {
         let tx_sys = control_tx.clone();
         let mut sys_rx = crate::dispatch::system_event_broadcast::subscribe();
+        let sys_user_id = user_id.clone();
         tokio::spawn(async move {
             while let Ok(event) = sys_rx.recv().await {
+                // UserNotification is private per user: the broadcast channel
+                // reaches every open dashboard, so forward it only to
+                // connections authenticated as the target user. All other
+                // SystemEvent variants stay broadcast.
+                if let tentaflow_protocol::SystemEventPayload::UserNotification {
+                    user_id: target_user_id,
+                    ..
+                } = &event
+                {
+                    if sys_user_id.as_deref() != Some(target_user_id.as_str()) {
+                        continue;
+                    }
+                }
                 if send_body(
                     &tx_sys,
                     0,

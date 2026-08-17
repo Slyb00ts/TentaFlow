@@ -1,0 +1,248 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Przegląd projektu (P03)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">P03</span>
+    <h2>Przegląd projektu</h2>
+    <div class="desc">Pulpit projektu: kluczowe wskaźniki, trend jakości testów, ostatnia aktywność zespołu i agentów oraz szybkie akcje. Zakładki u góry odpowiadają wyłącznie włączonym modułom projektu.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Portal Klienta B2B</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Testy, dokumentacja i baza wiedzy dla portalu zamówień B2B · utworzono 12.05.2026</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-users"/></svg>6 członków</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Menedżer</b></span>
+              <span class="chip info"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Testy + Dokumentacja</span>
+              <span class="chip info"><svg class="icon"><use href="#i-book"/></svg>4 źródła wiedzy</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab active"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-square"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- KPI -->
+        <div class="kpi-grid">
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-clipboard"/></svg>Przypadki testowe</div>
+            <div class="value">128 <span class="small">/ 96 zatwierdz.</span></div>
+            <div class="delta up">+14 w tym tygodniu</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-check-square"/></svg>Pass-rate (ost. przebieg)</div>
+            <div class="value">92,4<span class="small">%</span></div>
+            <div class="delta up">+3,1 pkt vs poprzedni</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-bug"/></svg>Otwarte usterki</div>
+            <div class="value">7 <span class="small">· 2 krytyczne</span></div>
+            <div class="delta down">+2 z ost. przebiegu</div>
+          </div>
+          <div class="kpi">
+            <div class="label"><svg class="icon"><use href="#i-book"/></svg>Baza wiedzy</div>
+            <div class="value">3 <span class="small">/ 4 gotowe</span></div>
+            <div class="delta warn">1 źródło w indeksacji</div>
+          </div>
+        </div>
+
+        <div class="grid-2" style="margin-bottom:16px;">
+          <!-- Trend pass-rate -->
+          <div class="section-card" style="margin-bottom:0;">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-target"/></svg>Trend pass-rate (30 dni)</div>
+              <div class="chart-legend">
+                <span class="lg"><span class="sw" style="background:var(--success)"></span>automatyczne</span>
+                <span class="lg"><span class="sw" style="background:var(--accent-2)"></span>manualne</span>
+              </div>
+            </div>
+            <svg class="chart-svg" viewBox="0 0 480 150" preserveAspectRatio="none" style="height:150px;">
+              <line class="gridline" x1="0" y1="30" x2="480" y2="30"/>
+              <line class="gridline" x1="0" y1="70" x2="480" y2="70"/>
+              <line class="gridline" x1="0" y1="110" x2="480" y2="110"/>
+              <polyline points="0,80 60,72 120,66 180,74 240,58 300,50 360,44 420,40 480,34" fill="none" stroke="#22c55e" stroke-width="2.5"/>
+              <polyline points="0,100 60,96 120,92 180,90 240,86 300,80 360,78 420,72 480,70" fill="none" stroke="#a78bfa" stroke-width="2.5" stroke-dasharray="4 3"/>
+            </svg>
+          </div>
+          <!-- Ostatnie przebiegi -->
+          <div class="section-card" style="margin-bottom:0;">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-activity"/></svg>Ostatnie 8 przebiegów</div>
+              <span class="text-3 text-xs">passed / failed / blocked</span>
+            </div>
+            <svg class="chart-svg" viewBox="0 0 480 150" style="height:150px;">
+              <g>
+                <rect x="14" y="40" width="34" height="90" rx="2" fill="#22c55e"/><rect x="14" y="130" width="34" height="8" rx="2" fill="#ef4444"/>
+                <rect x="72" y="52" width="34" height="78" rx="2" fill="#22c55e"/><rect x="72" y="130" width="34" height="10" rx="2" fill="#ef4444"/>
+                <rect x="130" y="34" width="34" height="96" rx="2" fill="#22c55e"/><rect x="130" y="130" width="34" height="6" rx="2" fill="#ef4444"/>
+                <rect x="188" y="60" width="34" height="70" rx="2" fill="#22c55e"/><rect x="188" y="130" width="34" height="14" rx="2" fill="#ef4444"/>
+                <rect x="246" y="44" width="34" height="86" rx="2" fill="#22c55e"/><rect x="246" y="130" width="34" height="8" rx="2" fill="#f59e0b"/>
+                <rect x="304" y="38" width="34" height="92" rx="2" fill="#22c55e"/><rect x="304" y="130" width="34" height="6" rx="2" fill="#ef4444"/>
+                <rect x="362" y="30" width="34" height="100" rx="2" fill="#22c55e"/><rect x="362" y="130" width="34" height="4" rx="2" fill="#ef4444"/>
+                <rect x="420" y="28" width="34" height="102" rx="2" fill="#22c55e"/><rect x="420" y="130" width="34" height="5" rx="2" fill="#ef4444"/>
+              </g>
+            </svg>
+          </div>
+        </div>
+
+        <div class="grid-2">
+          <!-- Aktywność -->
+          <div class="section-card" style="margin-bottom:0;">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-clock"/></svg>Aktywność</div>
+              <button class="btn btn-sm btn-ghost">Pokaż więcej</button>
+            </div>
+            <div class="activity-feed">
+              <div class="activity-item">
+                <div class="av agent"><svg class="icon icon-sm"><use href="#i-sparkles"/></svg></div>
+                <div class="ac-body"><div class="ac-text"><b>Generator scenariuszy</b> utworzył 14 przypadków manualnych ze źródła „Specyfikacja API v2.pdf" — czekają na przegląd.</div><div class="ac-time">12 minut temu</div></div>
+              </div>
+              <div class="activity-item">
+                <div class="av">MN</div>
+                <div class="ac-body"><div class="ac-text"><b>Marek Nowak</b> zgłosił usterkę <b>#DEF-042</b> „Koszyk nie przelicza rabatu" (krytyczna).</div><div class="ac-time">48 minut temu</div></div>
+              </div>
+              <div class="activity-item">
+                <div class="av">AK</div>
+                <div class="ac-body"><div class="ac-text"><b>Anna Kowalska</b> uruchomiła przebieg manualny „Regresja checkout" dla 3 testerów.</div><div class="ac-time">2 godziny temu</div></div>
+              </div>
+              <div class="activity-item">
+                <div class="av agent"><svg class="icon icon-sm"><use href="#i-check-square"/></svg></div>
+                <div class="ac-body"><div class="ac-text">Przebieg automatyczny <b>#231</b> zakończony: 58/60 passed, 2 failed.</div><div class="ac-time">wczoraj, 22:04</div></div>
+              </div>
+            </div>
+          </div>
+          <!-- Szybkie akcje -->
+          <div class="section-card" style="margin-bottom:0;">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-play"/></svg>Szybkie akcje</div>
+            </div>
+            <div class="quick-actions">
+              <div class="quick-action"><!-- otwiera: W02 -->
+                <div class="qa-ico"><svg class="icon"><use href="#i-book"/></svg></div>
+                <div><div class="qa-name">Dodaj źródło</div><div class="qa-sub">dokument, repo, API</div></div>
+              </div>
+              <div class="quick-action"><!-- otwiera: T04 -->
+                <div class="qa-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div>
+                <div><div class="qa-name">Generuj testy</div><div class="qa-sub">agentem z wiedzy</div></div>
+              </div>
+              <div class="quick-action"><!-- otwiera: T08 -->
+                <div class="qa-ico"><svg class="icon"><use href="#i-play"/></svg></div>
+                <div><div class="qa-name">Nowy przebieg</div><div class="qa-sub">manualny lub auto</div></div>
+              </div>
+              <div class="quick-action"><!-- otwiera: D02 -->
+                <div class="qa-ico"><svg class="icon"><use href="#i-doc"/></svg></div>
+                <div><div class="qa-name">Nowy dokument</div><div class="qa-sub">z pomocą agenta</div></div>
+              </div>
+              <div class="quick-action"><!-- otwiera: C01 -->
+                <div class="qa-ico"><svg class="icon"><use href="#i-message"/></svg></div>
+                <div><div class="qa-name">Zapytaj projekt</div><div class="qa-sub">chat z kontekstem</div></div>
+              </div>
+              <div class="quick-action"><!-- otwiera: T01 -->
+                <div class="qa-ico"><svg class="icon"><use href="#i-clipboard"/></svg></div>
+                <div><div class="qa-name">Przypadki</div><div class="qa-sub">przeglądaj i edytuj</div></div>
+              </div>
+            </div>
+            <div class="assistant-box mt-md">
+              <div class="ab-head"><svg class="icon"><use href="#i-sparkles"/></svg>Generuj z wiedzy</div>
+              <div class="text-sm text-2">Masz nowe źródła w bazie wiedzy — wygeneruj z nich testy agentem. <a href="#">Otwórz generowanie testów →</a></div>
+            </div>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

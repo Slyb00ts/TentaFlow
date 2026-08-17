@@ -12,8 +12,8 @@ use std::time::Duration;
 
 use forge_engine::model::ModelConfig;
 use forge_engine::server::spawn_engine;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_server::toolcall::ToolParserKind;
 use forge_server::{build_router, ServerConfig, ServerState};
@@ -48,7 +48,7 @@ async fn generation_api_end_to_end() {
             let kv_page_size = 32;
             let kv_pages = 512;
             let desc = read_descriptor(&load_path).expect("read descriptor");
-            let device = CudaDevice::new(
+            let device = gpu::open(
                 0,
                 PoolSizes {
                     weights: 3 << 30,
@@ -57,7 +57,9 @@ async fn generation_api_end_to_end() {
                         kv_page_size,
                         kv_pages,
                         forge_engine::kv::KvQuant::F16,
-                    ),
+                        false,
+                    )
+                    .unwrap(),
                     activations: 1 << 30,
                     kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
                 },
@@ -68,12 +70,19 @@ async fn generation_api_end_to_end() {
                 dev,
                 &load_path,
                 ModelConfig {
+                    weight_spill_dir: None,
+                    weight_host_budget: 0,
                     kv_page_size,
                     kv_pages,
                     max_seq_len: 4096,
                     kv_quant: forge_engine::kv::KvQuant::F16,
                     kv_tier: Default::default(),
                     prefix_cache: true,
+                    layer_range: None,
+                    tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+                    native_mtp: false,
+                    nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+                    nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,
                 },
             )
             .expect("load model");
@@ -105,6 +114,8 @@ async fn generation_api_end_to_end() {
         model_id: "qwen3-0.6b".into(),
         api_key: None,
         tool_call_parser: None,
+        default_sampling: Default::default(),
+        default_stop: vec![],
     };
     let state = ServerState::new(
         &cfg,
@@ -269,14 +280,19 @@ async fn generation_api_end_to_end() {
             prev = v;
             sum_exp += v.exp();
         }
-        assert!(sum_exp <= 1.0 + 1e-3, "top-N prob mass exceeds 1: {sum_exp}");
+        assert!(
+            sum_exp <= 1.0 + 1e-3,
+            "top-N prob mass exceeds 1: {sum_exp}"
+        );
         // Greedy: the sampled token is the top-1 alternative.
         assert_eq!(
             entry["token"].as_str().unwrap(),
             top[0]["token"].as_str().unwrap(),
             "at temp 0 the sampled token must be the top-1 logprob token"
         );
-        assert!((entry["logprob"].as_f64().unwrap() - top[0]["logprob"].as_f64().unwrap()).abs() < 1e-6);
+        assert!(
+            (entry["logprob"].as_f64().unwrap() - top[0]["logprob"].as_f64().unwrap()).abs() < 1e-6
+        );
     }
     println!("[logprobs] {} well-formed entries", content.len());
 
@@ -318,7 +334,10 @@ async fn generation_api_end_to_end() {
         .iter()
         .map(|c| c["text"].as_str().unwrap_or("").to_string())
         .collect();
-    assert_eq!(texts, texts2, "seeded n-way generation must be deterministic");
+    assert_eq!(
+        texts, texts2,
+        "seeded n-way generation must be deterministic"
+    );
     println!("[n=3] deterministic across runs");
 
     // Streaming with n>1 is rejected.

@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use forge_hal::cuda::{CudaDevice, PoolSizes};
+use forge_hal::{gpu, PoolSizes};
 use forge_hal::{DevBuffer, Device, Pool};
 use forge_kernels::Kernels;
 use forge_types::MemKind;
@@ -18,8 +18,8 @@ const PAGE: usize = 32;
 const NPAGES: usize = 8;
 const CTX: usize = 200; // tokens (fits NPAGES*PAGE = 256)
 
-fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(
+fn device() -> Option<Arc<dyn Device>> {
+    match gpu::open(
         0,
         PoolSizes {
             weights: 256 << 20,
@@ -39,14 +39,19 @@ fn device() -> Option<Arc<CudaDevice>> {
 fn upload_f16(dev: &dyn Device, vals: &[f32]) -> DevBuffer {
     let host: Vec<f16> = vals.iter().map(|&v| f16::from_f32(v)).collect();
     let bytes = unsafe { std::slice::from_raw_parts(host.as_ptr() as *const u8, host.len() * 2) };
-    let buf = dev.alloc(bytes.len(), MemKind::Device, Pool::Weights).unwrap();
+    let buf = dev
+        .alloc(bytes.len(), MemKind::Device, Pool::Weights)
+        .unwrap();
     dev.write(bytes, &buf, 0).unwrap();
     buf
 }
 
 // Deterministic pseudo-random with heavy outliers (the regime rotation fixes).
 fn synth(seed: u64, i: usize, outlier: bool) -> f32 {
-    let mut s = seed.wrapping_add(i as u64).wrapping_mul(6364136223846793005).wrapping_add(1);
+    let mut s = seed
+        .wrapping_add(i as u64)
+        .wrapping_mul(6364136223846793005)
+        .wrapping_add(1);
     s ^= s >> 33;
     let u = (s >> 11) as f64 / (1u64 << 53) as f64;
     let v = (u - 0.5) * 4.0;
@@ -76,16 +81,28 @@ fn run_bits(kernels: &Kernels, dev: &dyn Device, bits: u8) -> f64 {
     let out = dev.alloc(HD * 2, MemKind::Device, Pool::Weights).unwrap();
 
     let page_table: Vec<i32> = (0..NPAGES as i32).collect();
-    let pt = dev.alloc(NPAGES * 4, MemKind::Device, Pool::Weights).unwrap();
-    dev.write(bytemuck::cast_slice(&page_table), &pt, 0).unwrap();
+    let pt = dev
+        .alloc(NPAGES * 4, MemKind::Device, Pool::Weights)
+        .unwrap();
+    dev.write(bytemuck::cast_slice(&page_table), &pt, 0)
+        .unwrap();
     let seq_lens = dev.alloc(4, MemKind::Device, Pool::Weights).unwrap();
-    dev.write(bytemuck::cast_slice(&[CTX as i32]), &seq_lens, 0).unwrap();
+    dev.write(bytemuck::cast_slice(&[CTX as i32]), &seq_lens, 0)
+        .unwrap();
 
     let pb = HD * bits as usize / 8;
-    let k_packed = dev.alloc(slots * pb, MemKind::Device, Pool::Weights).unwrap();
-    let v_packed = dev.alloc(slots * pb, MemKind::Device, Pool::Weights).unwrap();
-    let k_scale = dev.alloc(slots * 2, MemKind::Device, Pool::Weights).unwrap();
-    let v_scale = dev.alloc(slots * 2, MemKind::Device, Pool::Weights).unwrap();
+    let k_packed = dev
+        .alloc(slots * pb, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let v_packed = dev
+        .alloc(slots * pb, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let k_scale = dev
+        .alloc(slots * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
+    let v_scale = dev
+        .alloc(slots * 2, MemKind::Device, Pool::Weights)
+        .unwrap();
 
     kernels
         .kv_pack_rot_from_cache(
@@ -121,7 +138,10 @@ fn run_bits(kernels: &Kernels, dev: &dyn Device, bits: u8) -> f64 {
         .collect();
 
     // f64 reference softmax attention over the same (f16-rounded) K/V.
-    let qf: Vec<f64> = q.iter().map(|&x| f16::from_f32(x).to_f32() as f64).collect();
+    let qf: Vec<f64> = q
+        .iter()
+        .map(|&x| f16::from_f32(x).to_f32() as f64)
+        .collect();
     let mut scores = vec![0f64; CTX];
     let mut m = f64::MIN;
     for (t, sc) in scores.iter_mut().enumerate() {

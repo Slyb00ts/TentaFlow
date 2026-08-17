@@ -11,8 +11,8 @@ use std::path::Path;
 use std::sync::Arc;
 
 use forge_engine::model::ModelConfig;
-use forge_hal::cuda::{CudaDevice, PoolSizes};
 use forge_hal::Device;
+use forge_hal::{gpu, PoolSizes};
 use forge_server::source::{kv_pool_bytes, load_model, read_descriptor};
 use forge_types::DType;
 
@@ -50,7 +50,10 @@ struct Fp8CacheStats {
     values: usize,
 }
 
-fn fp8_cache_stats(model: &forge_engine::model::Model, seq: &forge_engine::kv::SeqKv) -> Fp8CacheStats {
+fn fp8_cache_stats(
+    model: &forge_engine::model::Model,
+    seq: &forge_engine::kv::SeqKv,
+) -> Fp8CacheStats {
     let mut stats = Fp8CacheStats::default();
     let cfg = &model.kv.cfg;
     let page_elems = cfg.n_kv_heads * cfg.page_size * cfg.head_dim;
@@ -100,11 +103,13 @@ fn run_pass_ids(
         forge_engine::kv::KvQuant::F16
     };
     let desc = read_descriptor(path).expect("read model descriptor");
-    let device = CudaDevice::new(
+    let device = gpu::open(
         0,
         PoolSizes {
             weights: 8 << 30,
-            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant).max(1 << 30),
+            kv_cache: kv_pool_bytes(&desc, kv_page_size, kv_pages, kv_quant, false)
+                .unwrap()
+                .max(1 << 30),
             activations: 1 << 30,
             kv_page_size: PoolSizes::DEFAULT_KV_PAGE,
         },
@@ -115,12 +120,19 @@ fn run_pass_ids(
         dev,
         path,
         ModelConfig {
+            weight_spill_dir: None,
+            weight_host_budget: 0,
             kv_page_size,
             kv_pages,
             max_seq_len: 4096,
             kv_quant,
             kv_tier: Default::default(),
             prefix_cache: false,
+            layer_range: None,
+            tp_shard: forge_formats::TpShard { rank: 0, world: 1 },
+            native_mtp: false,
+            nvfp4_gguf_layout: forge_engine::model::Nvfp4GgufLayout::RowMajor36,
+            nvfp4_ct_layout: forge_engine::weights::NvFp4CtLayoutPolicy::Auto,
         },
     )
     .expect("load model");
@@ -155,11 +167,18 @@ fn encode_prompt(path: &Path, prompt: &str) -> Vec<u32> {
         let gguf = forge_formats::Gguf::open(path).expect("open gguf");
         forge_server::source::load_tokenizer_gguf(&gguf).expect("load tokenizer")
     };
-    bundle.tokenizer.encode(prompt, true).expect("encode prompt")
+    bundle
+        .tokenizer
+        .encode(prompt, true)
+        .expect("encode prompt")
 }
 
 /// `run_pass_ids` over an encoded text prompt.
-fn run_pass(path: &Path, prompt: &str, kv_dtype: DType) -> (Vec<u32>, Vec<Vec<f32>>, Fp8CacheStats) {
+fn run_pass(
+    path: &Path,
+    prompt: &str,
+    kv_dtype: DType,
+) -> (Vec<u32>, Vec<Vec<f32>>, Fp8CacheStats) {
     let prompt_ids = encode_prompt(path, prompt);
     run_pass_ids(path, &prompt_ids, kv_dtype, 256)
 }
@@ -169,8 +188,14 @@ fn run_pass(path: &Path, prompt: &str, kv_dtype: DType) -> (Vec<u32>, Vec<Vec<f3
 fn fp8_kv_matches_f16_greedy() {
     let models: [(&str, &str); 3] = [
         (BIELIK_DIR, "Stolicą Polski jest"),
-        ("../../test-models/gguf/qwen3-0.6b-q8_0.gguf", "The capital of France is"),
-        ("../../test-models/gguf/mistral-7b-q4_k_m.gguf", "The capital of France is"),
+        (
+            "../../test-models/gguf/qwen3-0.6b-q8_0.gguf",
+            "The capital of France is",
+        ),
+        (
+            "../../test-models/gguf/mistral-7b-q4_k_m.gguf",
+            "The capital of France is",
+        ),
     ];
     let mut ran = 0;
     for (path, prompt) in models {
@@ -197,10 +222,25 @@ fn fp8_kv_matches_f16_greedy() {
             "  fp8 cache range: max |k/v| = {} over {} values, saturated codes = {}, NaN codes = {}",
             stats.max_abs, stats.values, stats.saturated, stats.nan_codes
         );
-        assert_eq!(ids16, ids8, "fp8 KV changed the greedy path for {}", path.display());
+        assert_eq!(
+            ids16,
+            ids8,
+            "fp8 KV changed the greedy path for {}",
+            path.display()
+        );
         // Scale-free e4m3 assumption: post-norm K/V must not saturate.
-        assert_eq!(stats.saturated, 0, "e4m3 saturation in the KV cache of {}", path.display());
-        assert_eq!(stats.nan_codes, 0, "NaN codes in the KV cache of {}", path.display());
+        assert_eq!(
+            stats.saturated,
+            0,
+            "e4m3 saturation in the KV cache of {}",
+            path.display()
+        );
+        assert_eq!(
+            stats.nan_codes,
+            0,
+            "NaN codes in the KV cache of {}",
+            path.display()
+        );
         ran += 1;
     }
     assert!(ran > 0, "no test models available");
@@ -214,8 +254,14 @@ fn fp8_kv_range_at_long_context() {
     // fills 4096 tokens of context and asserts the cache still has zero
     // saturated codes, on both a QK-norm model and a plain one.
     let models: [(&str, &str); 2] = [
-        ("../../test-models/gguf/qwen3-0.6b-q8_0.gguf", "One of the most important cities in the history of Poland is Krakow. "),
-        (BIELIK_DIR, "Jednym z najważniejszych miast w historii Polski jest Kraków. "),
+        (
+            "../../test-models/gguf/qwen3-0.6b-q8_0.gguf",
+            "One of the most important cities in the history of Poland is Krakow. ",
+        ),
+        (
+            BIELIK_DIR,
+            "Jednym z najważniejszych miast w historii Polski jest Kraków. ",
+        ),
     ];
     let mut ran = 0;
     for (path, seed) in models {
@@ -225,7 +271,12 @@ fn fp8_kv_range_at_long_context() {
             continue;
         }
         let seed_ids = encode_prompt(path, seed);
-        let prompt_ids: Vec<u32> = seed_ids.iter().cycle().take(4096 - STEPS).copied().collect();
+        let prompt_ids: Vec<u32> = seed_ids
+            .iter()
+            .cycle()
+            .take(4096 - STEPS)
+            .copied()
+            .collect();
         let (_, _, stats) = run_pass_ids(path, &prompt_ids, DType::F8E4M3, 4096 / 32);
         println!(
             "{}: fp8 cache range at ~4096 ctx: max |k/v| = {} over {} values, saturated = {}, NaN = {}",
@@ -235,8 +286,18 @@ fn fp8_kv_range_at_long_context() {
             stats.saturated,
             stats.nan_codes
         );
-        assert_eq!(stats.saturated, 0, "e4m3 saturation at long context for {}", path.display());
-        assert_eq!(stats.nan_codes, 0, "NaN codes at long context for {}", path.display());
+        assert_eq!(
+            stats.saturated,
+            0,
+            "e4m3 saturation at long context for {}",
+            path.display()
+        );
+        assert_eq!(
+            stats.nan_codes,
+            0,
+            "NaN codes at long context for {}",
+            path.display()
+        );
         ran += 1;
     }
     assert!(ran > 0, "no test models available");

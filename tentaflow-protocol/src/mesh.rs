@@ -583,6 +583,37 @@ pub enum MeshCommandType {
         model_repo: String,
         target_node_id: String,
     },
+    /// Cross-node camera recordings listing. Node A asks paired node B for its
+    /// recordings list. B resolves its own org context, applies the filters
+    /// (serialized JSON — keeps this crate free of the recordings filter types)
+    /// and returns `CameraRecordingsListResult { recordings_json }`. Appended
+    /// at END (ciborium index rule).
+    CameraRecordingsList {
+        filters_json: String,
+    },
+    /// Cross-node camera recordings pull. Node A asks paired node B to stream the
+    /// selected recording files back to `target_node_id` over ALPN_ARTIFACT. B
+    /// validates each recording path (canonicalize + containment under its own
+    /// recordings dir, reject symlinks), caps count + per-file size, streams each
+    /// file with an artifact name key `recording|<ref>|<ext>` and returns
+    /// `CameraRecordingPullResult { pulled_refs }`. The files themselves travel
+    /// over ALPN_ARTIFACT, not in the CBOR response. Appended at END.
+    CameraRecordingPull {
+        recording_refs: Vec<String>,
+        target_node_id: String,
+    },
+    /// ML Studio: anuluj zdalny trening o `run_id` (odbiorca woła `POST /cancel`
+    /// swojego lokalnego serwisu treningowego). Odpowiedź: Empty (ok/error).
+    /// Appended at END (ciborium index rule).
+    MlTrainCancel {
+        run_id: String,
+    },
+    /// Forward a validated coding-agent bridge operation to its owner node.
+    AgentRpc {
+        service_id: i64,
+        operation: String,
+        payload_json: String,
+    },
 }
 
 /// Per-node spec distributed-deployu policzony przez koordynatora z
@@ -635,6 +666,16 @@ pub struct DistributedDeploySpec {
     /// per-czlonek (D1); nie hardkodowany. Domyslnie 3 (zweryfikowana wartosc
     /// RoCEv2 IPv4 na ConnectX-7 DGX Spark).
     pub gid_index: u32,
+    /// `num_speculative_tokens` z presetu modelu. Wartosc jest wlasnoscia
+    /// KONKRETNEGO checkpointu (dla DSpark musi rownac sie jego
+    /// `dspark_block_size`, inaczej wyjscie jest bledne), wiec nie wolno jej
+    /// zaszywac per silnik. `None` = zostaw domyslna silnika.
+    #[serde(default)]
+    pub speculative_num_tokens: Option<u32>,
+    /// Domyslny sampling presetu jako JSON do `--override-generation-config`.
+    /// `None` = manifest nie deklaruje, silnik zostaje przy swoim.
+    #[serde(default)]
+    pub generation_config_json: Option<String>,
     /// Dodatkowy config usera (vllm_args, gpu_select_mode, gpu_ids) jako JSON.
     pub config_json: String,
 }
@@ -670,6 +711,12 @@ pub struct RoceInterfaceInfo {
     /// ConnectX), a gdy go brak — rodzic sciezki PCI. Pusty gdy nieznany.
     #[serde(default)]
     pub group_key: String,
+    /// Indeks GID RoCE v2 / IPv4 tej karty, odczytany NA nodzie z
+    /// `/sys/class/infiniband/<dev>/ports/1/gid_attrs`. Trafia do
+    /// `NCCL_IB_GID_INDEX` — zalezy od sprzetu, wiec nie wolno go zakladac.
+    /// `None` gdy nie da sie ustalic (starszy peer albo brak wpisu RoCE v2).
+    #[serde(default)]
+    pub gid_index: Option<u32>,
 }
 
 // =============================================================================
@@ -812,6 +859,19 @@ pub enum MeshCommandResponsePayload {
     ModelPresentResult {
         present: bool,
     },
+    /// Serialized recordings list JSON (`Vec<RemoteRecordingItem>`) produced by
+    /// the receiver for `CameraRecordingsList`. Appended at END.
+    CameraRecordingsListResult {
+        recordings_json: String,
+    },
+    /// Recording refs the receiver successfully streamed over ALPN_ARTIFACT for
+    /// `CameraRecordingPull`. Confirms which files travelled; the bytes are not
+    /// in this CBOR. Appended at END.
+    CameraRecordingPullResult {
+        pulled_refs: Vec<String>,
+    },
+    /// JSON response returned by a coding-agent bridge on the owner node.
+    AgentRpcResult { result_json: String },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -967,6 +1027,15 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlTrainStatus")
                 .field("run_id", run_id)
                 .finish(),
+            Self::MlTrainCancel { run_id } => f
+                .debug_struct("MlTrainCancel")
+                .field("run_id", run_id)
+                .finish(),
+            Self::AgentRpc { service_id, operation, .. } => f
+                .debug_struct("AgentRpc")
+                .field("service_id", service_id)
+                .field("operation", operation)
+                .finish(),
             Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f
                 .debug_struct("MlDatasetChunk")
                 .field("hash", &&dataset_hash[..dataset_hash.len().min(12)])
@@ -1064,6 +1133,18 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("PushModelToPeer")
                 .field("deployment_cluster_id", deployment_cluster_id)
                 .field("model_repo", model_repo)
+                .field("target_node_id", target_node_id)
+                .finish(),
+            Self::CameraRecordingsList { filters_json } => f
+                .debug_struct("CameraRecordingsList")
+                .field("filters_json", filters_json)
+                .finish(),
+            Self::CameraRecordingPull {
+                recording_refs,
+                target_node_id,
+            } => f
+                .debug_struct("CameraRecordingPull")
+                .field("recording_refs", recording_refs)
                 .field("target_node_id", target_node_id)
                 .finish(),
         }
@@ -2148,7 +2229,12 @@ mod tests {
             counter: 5,
             origin_node: "node_b".to_string(),
         };
-        assert!(same_counter_b > same_counter_a);
+        // At an equal counter the LOWER origin_node is the winner, so it must be
+        // the maximum: that is the same node `decide_roles` elects as donor, and
+        // the two decisions have to agree without further negotiation.
+        assert!(same_counter_a > same_counter_b);
+        assert!(same_counter_a.wins_over(&same_counter_b));
+        assert!(!same_counter_b.wins_over(&same_counter_a));
     }
 
     #[test]

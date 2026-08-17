@@ -22,7 +22,9 @@ struct Scope {
 
 impl Scope {
     fn new() -> Self {
-        Self { frames: vec![HashMap::new()] }
+        Self {
+            frames: vec![HashMap::new()],
+        }
     }
     fn push(&mut self) {
         self.frames.push(HashMap::new());
@@ -41,7 +43,9 @@ impl Scope {
                 return Ok(t);
             }
         }
-        Err(ForgeError::Format(format!("onnx: value '{name}' not produced")))
+        Err(ForgeError::Format(format!(
+            "onnx: value '{name}' not produced"
+        )))
     }
     /// Optional input: an empty name means "absent".
     fn get_opt(&self, name: &str) -> Result<Option<Tensor>> {
@@ -122,10 +126,14 @@ impl Session {
 
     fn op_if(&self, node: &NodeProto, scope: &mut Scope) -> Result<()> {
         let cond = scope.get(&node.input[0])?.to_bool_vec()?;
-        let take_then = *cond.first().ok_or_else(|| {
-            ForgeError::Format("If: condition tensor is empty".into())
-        })?;
-        let branch_name = if take_then { "then_branch" } else { "else_branch" };
+        let take_then = *cond
+            .first()
+            .ok_or_else(|| ForgeError::Format("If: condition tensor is empty".into()))?;
+        let branch_name = if take_then {
+            "then_branch"
+        } else {
+            "else_branch"
+        };
         let branch = attr_graph(node, branch_name)?;
         scope.push();
         let res = (|| {
@@ -159,13 +167,32 @@ impl Session {
             "Size" => one(Tensor::scalar_i64(req(0)?.numel() as i64)),
             "Cast" => one(op_cast(node, req(0)?)?),
             "Gather" => one(op_gather(node, req(0)?, req(1)?)?),
-            "Slice" => one(op_slice(req(0)?, req(1)?, req(2)?, ins.get(3).and_then(|o| o.as_ref()), ins.get(4).and_then(|o| o.as_ref()))?),
+            "Slice" => one(op_slice(
+                req(0)?,
+                req(1)?,
+                req(2)?,
+                ins.get(3).and_then(|o| o.as_ref()),
+                ins.get(4).and_then(|o| o.as_ref()),
+            )?),
             "Concat" => one(op_concat(node, ins)?),
-            "Unsqueeze" => one(op_unsqueeze(node, req(0)?, ins.get(1).and_then(|o| o.as_ref()))?),
-            "Squeeze" => one(op_squeeze(node, req(0)?, ins.get(1).and_then(|o| o.as_ref()))?),
+            "Unsqueeze" => one(op_unsqueeze(
+                node,
+                req(0)?,
+                ins.get(1).and_then(|o| o.as_ref()),
+            )?),
+            "Squeeze" => one(op_squeeze(
+                node,
+                req(0)?,
+                ins.get(1).and_then(|o| o.as_ref()),
+            )?),
             "Reshape" => one(op_reshape(req(0)?, req(1)?)?),
             "Transpose" => one(op_transpose(node, req(0)?)?),
-            "Pad" => one(op_pad(node, req(0)?, req(1)?, ins.get(2).and_then(|o| o.as_ref()))?),
+            "Pad" => one(op_pad(
+                node,
+                req(0)?,
+                req(1)?,
+                ins.get(2).and_then(|o| o.as_ref()),
+            )?),
             "Equal" => one(op_equal(req(0)?, req(1)?)?),
             "Not" => one(op_not(req(0)?)?),
             "Relu" => one(self.gpu_unary(req(0)?, |x| self.gpu.relu(x))?),
@@ -173,18 +200,20 @@ impl Session {
             "Sqrt" => one(self.gpu_unary(req(0)?, |x| self.gpu.sqrt(x))?),
             "Add" => one(self.op_add(req(0)?, req(1)?)?),
             "Pow" => one(self.op_pow(req(0)?, req(1)?)?),
-            "Conv" => one(self.op_conv(node, req(0)?, req(1)?, ins.get(2).and_then(|o| o.as_ref()))?),
-            "ReduceMean" => one(self.op_reduce_mean(node, req(0)?, ins.get(1).and_then(|o| o.as_ref()))?),
+            "Conv" => {
+                one(self.op_conv(node, req(0)?, req(1)?, ins.get(2).and_then(|o| o.as_ref()))?)
+            }
+            "ReduceMean" => {
+                one(self.op_reduce_mean(node, req(0)?, ins.get(1).and_then(|o| o.as_ref()))?)
+            }
             "LSTM" => self.op_lstm(node, ins),
-            other => Err(ForgeError::Unsupported(format!("onnx op '{other}' not implemented"))),
+            other => Err(ForgeError::Unsupported(format!(
+                "onnx op '{other}' not implemented"
+            ))),
         }
     }
 
-    fn gpu_unary(
-        &self,
-        x: &Tensor,
-        f: impl Fn(&[f32]) -> Result<Vec<f32>>,
-    ) -> Result<Tensor> {
+    fn gpu_unary(&self, x: &Tensor, f: impl Fn(&[f32]) -> Result<Vec<f32>>) -> Result<Tensor> {
         let v = x.to_f32_vec()?;
         Ok(Tensor::from_f32(x.shape.clone(), f(&v)?))
     }
@@ -198,7 +227,9 @@ impl Session {
 
     fn op_pow(&self, base: &Tensor, exp: &Tensor) -> Result<Tensor> {
         let e = exp.to_f32_vec()?;
-        let e0 = *e.first().ok_or_else(|| ForgeError::Format("Pow: empty exponent".into()))?;
+        let e0 = *e
+            .first()
+            .ok_or_else(|| ForgeError::Format("Pow: empty exponent".into()))?;
         if e.iter().any(|&v| v != e0) {
             return Err(ForgeError::Unsupported("Pow: non-uniform exponent".into()));
         }
@@ -223,7 +254,10 @@ impl Session {
         if attr_int(node, "group").unwrap_or(1) != 1 {
             return Err(ForgeError::Unsupported("Conv: only group=1".into()));
         }
-        if attr_ints(node, "dilations").map(|d| d.iter().any(|&x| x != 1)).unwrap_or(false) {
+        if attr_ints(node, "dilations")
+            .map(|d| d.iter().any(|&x| x != 1))
+            .unwrap_or(false)
+        {
             return Err(ForgeError::Unsupported("Conv: only dilation=1".into()));
         }
         let in_ch = x.shape[1];
@@ -251,9 +285,18 @@ impl Session {
             Some(b) => Some(b.to_f32_vec()?),
             None => None,
         };
-        let out = self
-            .gpu
-            .conv1d(&xv, &wv, bv.as_deref(), in_ch, in_t, out_ch, out_t, ksize, stride, pad)?;
+        let out = self.gpu.conv1d(
+            &xv,
+            &wv,
+            bv.as_deref(),
+            in_ch,
+            in_t,
+            out_ch,
+            out_t,
+            ksize,
+            stride,
+            pad,
+        )?;
         Ok(Tensor::from_f32(vec![1, out_ch, out_t], out))
     }
 
@@ -297,9 +340,15 @@ impl Session {
         let hidden = attr_int(node, "hidden_size")
             .ok_or_else(|| ForgeError::Format("LSTM: missing hidden_size".into()))?
             as usize;
-        let x = ins[0].as_ref().ok_or_else(|| ForgeError::Format("LSTM: X missing".into()))?;
-        let w = ins[1].as_ref().ok_or_else(|| ForgeError::Format("LSTM: W missing".into()))?;
-        let r = ins[2].as_ref().ok_or_else(|| ForgeError::Format("LSTM: R missing".into()))?;
+        let x = ins[0]
+            .as_ref()
+            .ok_or_else(|| ForgeError::Format("LSTM: X missing".into()))?;
+        let w = ins[1]
+            .as_ref()
+            .ok_or_else(|| ForgeError::Format("LSTM: W missing".into()))?;
+        let r = ins[2]
+            .as_ref()
+            .ok_or_else(|| ForgeError::Format("LSTM: R missing".into()))?;
         // X [seq, batch, input]; single direction, batch 1.
         if x.shape.len() != 3 || x.shape[1] != 1 {
             return Err(ForgeError::Unsupported(format!(
@@ -316,7 +365,7 @@ impl Session {
         }
         let wv = w.to_f32_vec()?; // [4h*input]
         let rv = r.to_f32_vec()?; // [4h*hidden]
-        // B [num_dir, 8h] optional; default zeros.
+                                  // B [num_dir, 8h] optional; default zeros.
         let bv = match ins.get(3).and_then(|o| o.as_ref()) {
             Some(b) => b.to_f32_vec()?,
             None => vec![0.0; 8 * hidden],
@@ -330,8 +379,17 @@ impl Session {
             Some(t) => t.to_f32_vec()?,
             None => vec![0.0; hidden],
         };
-        let (y, yh, yc) =
-            self.gpu.lstm(&x.to_f32_vec()?, &wv, &rv, &bv, &h0, &c0, seq, input_size, hidden)?;
+        let (y, yh, yc) = self.gpu.lstm(
+            &x.to_f32_vec()?,
+            &wv,
+            &rv,
+            &bv,
+            &h0,
+            &c0,
+            seq,
+            input_size,
+            hidden,
+        )?;
         // Y [seq, num_dir, batch, hidden]; Y_h/Y_c [num_dir, batch, hidden].
         Ok(vec![
             Tensor::from_f32(vec![seq, 1, 1, hidden], y),
@@ -344,7 +402,10 @@ impl Session {
 // --- Attribute accessors -----------------------------------------------------
 
 fn attr<'a>(node: &'a NodeProto, name: &str) -> Option<&'a AttrValue> {
-    node.attribute.iter().find(|a| a.name == name).map(|a| &a.value)
+    node.attribute
+        .iter()
+        .find(|a| a.name == name)
+        .map(|a| &a.value)
 }
 
 fn attr_int(node: &NodeProto, name: &str) -> Option<i64> {
@@ -399,7 +460,11 @@ fn op_constant(node: &NodeProto) -> Result<Tensor> {
 }
 
 fn op_constant_of_shape(node: &NodeProto, shape_t: &Tensor) -> Result<Tensor> {
-    let shape: Vec<usize> = shape_t.to_i64_vec()?.into_iter().map(|d| d.max(0) as usize).collect();
+    let shape: Vec<usize> = shape_t
+        .to_i64_vec()?
+        .into_iter()
+        .map(|d| d.max(0) as usize)
+        .collect();
     let numel: usize = shape.iter().product();
     // `value` is a 1-element tensor giving dtype + fill; default float 0.
     let fill = match attr(node, "value") {
@@ -425,17 +490,27 @@ fn op_cast(node: &NodeProto, x: &Tensor) -> Result<Tensor> {
     Ok(match dt {
         DType::F32 => Tensor::from_f32(x.shape.clone(), x.to_f32_vec()?),
         DType::F64 => {
-            let v: Vec<u8> = x.to_f32_vec()?.iter().flat_map(|&f| (f as f64).to_le_bytes()).collect();
+            let v: Vec<u8> = x
+                .to_f32_vec()?
+                .iter()
+                .flat_map(|&f| (f as f64).to_le_bytes())
+                .collect();
             Tensor::new(DType::F64, x.shape.clone(), v)
         }
         DType::I64 => Tensor::from_i64(x.shape.clone(), x.to_i64_vec()?),
         DType::I32 => {
-            let v: Vec<u8> = x.to_i64_vec()?.iter().flat_map(|&i| (i as i32).to_le_bytes()).collect();
+            let v: Vec<u8> = x
+                .to_i64_vec()?
+                .iter()
+                .flat_map(|&i| (i as i32).to_le_bytes())
+                .collect();
             Tensor::new(DType::I32, x.shape.clone(), v)
         }
         DType::Bool => Tensor::from_bool(x.shape.clone(), x.to_bool_vec()?),
         other => {
-            return Err(ForgeError::Unsupported(format!("Cast: to dtype {other} unsupported")))
+            return Err(ForgeError::Unsupported(format!(
+                "Cast: to dtype {other} unsupported"
+            )))
         }
     })
 }
@@ -509,8 +584,7 @@ fn op_slice(
         None => vec![1; starts.len()],
     };
     // Per-axis effective (start, step, count); default = full range, step 1.
-    let mut sel: Vec<(i64, i64, usize)> =
-        data.shape.iter().map(|&d| (0, 1, d)).collect();
+    let mut sel: Vec<(i64, i64, usize)> = data.shape.iter().map(|&d| (0, 1, d)).collect();
     for i in 0..axes.len() {
         let mut ax = axes[i];
         if ax < 0 {
@@ -560,8 +634,7 @@ fn op_slice(
             let src_coord = (s + coord as i64 * st) as usize;
             src += src_coord * dstride[d];
         }
-        out[lin * esz..lin * esz + esz]
-            .copy_from_slice(&data.data[src * esz..src * esz + esz]);
+        out[lin * esz..lin * esz + esz].copy_from_slice(&data.data[src * esz..src * esz + esz]);
     }
     Ok(Tensor::new(data.dtype, out_shape, out))
 }
@@ -602,7 +675,10 @@ fn resolve_axes(node: &NodeProto, axes_in: Option<&Tensor>, rank: i64) -> Result
         Some(t) => t.to_i64_vec()?,
         None => attr_ints(node, "axes").cloned().unwrap_or_default(),
     };
-    Ok(raw.into_iter().map(|a| if a < 0 { a + rank } else { a }).collect())
+    Ok(raw
+        .into_iter()
+        .map(|a| if a < 0 { a + rank } else { a })
+        .collect())
 }
 
 fn op_unsqueeze(node: &NodeProto, x: &Tensor, axes_in: Option<&Tensor>) -> Result<Tensor> {
@@ -662,7 +738,12 @@ fn op_reshape(x: &Tensor, shape_t: &Tensor) -> Result<Tensor> {
         }
     }
     if let Some(i) = neg {
-        let known: usize = shape.iter().enumerate().filter(|(j, _)| *j != i).map(|(_, &d)| d).product();
+        let known: usize = shape
+            .iter()
+            .enumerate()
+            .filter(|(j, _)| *j != i)
+            .map(|(_, &d)| d)
+            .product();
         shape[i] = numel.checked_div(known).unwrap_or(0);
     }
     if shape.iter().product::<usize>() != numel {
@@ -697,8 +778,7 @@ fn op_transpose(node: &NodeProto, x: &Tensor) -> Result<Tensor> {
             rem %= out_stride[d];
             src += coord * in_stride[perm[d]];
         }
-        out[lin * esz..lin * esz + esz]
-            .copy_from_slice(&x.data[src * esz..src * esz + esz]);
+        out[lin * esz..lin * esz + esz].copy_from_slice(&x.data[src * esz..src * esz + esz]);
     }
     Ok(Tensor::new(x.dtype, out_shape, out))
 }
@@ -776,7 +856,10 @@ fn op_equal(a: &Tensor, b: &Tensor) -> Result<Tensor> {
 }
 
 fn op_not(x: &Tensor) -> Result<Tensor> {
-    Ok(Tensor::from_bool(x.shape.clone(), x.to_bool_vec()?.into_iter().map(|b| !b).collect()))
+    Ok(Tensor::from_bool(
+        x.shape.clone(),
+        x.to_bool_vec()?.into_iter().map(|b| !b).collect(),
+    ))
 }
 
 // --- Broadcasting ------------------------------------------------------------
@@ -785,8 +868,16 @@ fn broadcast_shape(a: &[usize], b: &[usize]) -> Result<Vec<usize>> {
     let rank = a.len().max(b.len());
     let mut out = vec![0usize; rank];
     for i in 0..rank {
-        let da = if i < rank - a.len() { 1 } else { a[i - (rank - a.len())] };
-        let db = if i < rank - b.len() { 1 } else { b[i - (rank - b.len())] };
+        let da = if i < rank - a.len() {
+            1
+        } else {
+            a[i - (rank - a.len())]
+        };
+        let db = if i < rank - b.len() {
+            1
+        } else {
+            b[i - (rank - b.len())]
+        };
         out[i] = if da == db {
             da
         } else if da == 1 {
@@ -853,7 +944,10 @@ mod tests {
         let data = Tensor::from_f32(vec![2, 3], vec![0.0, 1.0, 2.0, 3.0, 4.0, 5.0]);
         let node = NodeProto {
             op_type: "Gather".into(),
-            attribute: vec![AttributeProto { name: "axis".into(), value: AttrValue::Int(0) }],
+            attribute: vec![AttributeProto {
+                name: "axis".into(),
+                value: AttrValue::Int(0),
+            }],
             ..Default::default()
         };
         let out = op_gather(&node, &data, &Tensor::scalar_i64(1)).unwrap();
@@ -889,7 +983,10 @@ mod tests {
         };
         let out = op_transpose(&node, &x).unwrap();
         assert_eq!(out.shape, vec![3, 2]);
-        assert_eq!(out.to_f32_vec().unwrap(), vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+        assert_eq!(
+            out.to_f32_vec().unwrap(),
+            vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
     }
 
     #[test]
@@ -905,7 +1002,10 @@ mod tests {
         let b = Tensor::from_i64(vec![2, 2], vec![3, 4, 5, 6]);
         let node = NodeProto {
             op_type: "Concat".into(),
-            attribute: vec![AttributeProto { name: "axis".into(), value: AttrValue::Int(0) }],
+            attribute: vec![AttributeProto {
+                name: "axis".into(),
+                value: AttrValue::Int(0),
+            }],
             ..Default::default()
         };
         let out = op_concat(&node, &[Some(a), Some(b)]).unwrap();

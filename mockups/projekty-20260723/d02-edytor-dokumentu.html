@@ -1,0 +1,622 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Edytor dokumentu + AI diff (D02)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* cardIn (nie ma go w shared) — dla menu ⋯ i paneli live */
+  @keyframes cardIn { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+
+  /* Edytowalny tytuł dokumentu */
+  .title-edit { background: var(--bg-input); border: 1px solid var(--border); color: var(--text); font-size: 18px; font-weight: 800; padding: 5px 11px; border-radius: var(--radius-sm); min-width: 380px; font-family: inherit; }
+  .title-edit:focus { outline: none; border-color: var(--accent-1); box-shadow: 0 0 0 3px var(--accent-glow); }
+  .edit-badge { display: inline-flex; align-items: center; gap: 5px; font-size: 10.5px; color: var(--text-3); }
+  .edit-badge .icon { width: 12px; height: 12px; }
+
+  /* Menu ⋯ (pokazane otwarte, aby zaprezentować akcje) */
+  .row-menu { position: relative; }
+  .tf-menu { position: absolute; top: 40px; right: 0; width: 216px; background: var(--bg-2); border: 1px solid var(--border-hover); border-radius: var(--radius); box-shadow: var(--shadow-lg); z-index: 30; padding: 5px; animation: cardIn .16s ease; }
+  .tf-menu .mi { display: flex; align-items: center; gap: 9px; padding: 8px 10px; border-radius: var(--radius-sm); font-size: 12.5px; color: var(--text-2); cursor: pointer; }
+  .tf-menu .mi:hover { background: var(--bg-3); color: var(--text); }
+  .tf-menu .mi.danger { color: var(--danger); }
+  .tf-menu .mi.danger:hover { background: rgba(239,68,68,0.1); }
+  .tf-menu .mi .icon { width: 15px; height: 15px; }
+  .tf-menu .mi-sep { height: 1px; background: var(--border); margin: 5px 2px; }
+
+  /* Chipy kontekstu / powiązań (Dodaj + usuń per element) */
+  .ctx-grid { display: grid; grid-template-columns: repeat(2, 1fr); gap: 14px; }
+  .ctx-block { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+  .ck { font-size: 10.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 700; width: 100%; }
+  .ctx-chip { display: inline-flex; align-items: center; gap: 6px; padding: 4px 9px; border-radius: 12px; background: var(--bg-3); border: 1px solid var(--border); font-size: 11.5px; color: var(--text-2); }
+  .ctx-chip .icon { width: 12px; height: 12px; }
+  .ctx-chip .rm { display: inline-flex; cursor: pointer; color: var(--text-3); }
+  .ctx-chip .rm:hover { color: var(--danger); }
+  .ctx-chip .rm .icon { width: 11px; height: 11px; }
+  .chip-add { display: inline-flex; align-items: center; gap: 5px; padding: 4px 9px; border-radius: 12px; background: transparent; border: 1px dashed var(--border-hover); font-size: 11.5px; color: var(--text-2); cursor: pointer; }
+  .chip-add:hover { border-color: var(--accent-1); color: var(--accent-2); }
+  .chip-add .icon { width: 12px; height: 12px; }
+
+  /* Split-view: edytor markdown | podgląd */
+  .doc-split { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; align-items: stretch; }
+  .doc-pane { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; display: flex; flex-direction: column; min-height: 580px; }
+  .doc-pane-head { display: flex; align-items: center; gap: 8px; padding: 8px 12px; border-bottom: 1px solid var(--border); background: var(--bg-3); }
+  .doc-pane-head .pane-t { font-size: 11px; text-transform: uppercase; letter-spacing: .06em; color: var(--text-3); font-weight: 700; display: flex; align-items: center; gap: 6px; }
+  .doc-pane-head .pane-t .icon { width: 13px; height: 13px; color: var(--accent-2); }
+
+  /* Pasek narzędzi markdown */
+  .md-toolbar { display: flex; align-items: center; gap: 2px; flex-wrap: wrap; }
+  .md-btn { min-width: 28px; height: 28px; padding: 0 6px; border-radius: var(--radius-sm); border: 1px solid transparent; background: transparent; color: var(--text-2); display: inline-flex; align-items: center; justify-content: center; cursor: pointer; font-size: 12px; font-weight: 800; font-family: inherit; }
+  .md-btn:hover { background: var(--bg-card); color: var(--text); border-color: var(--border); }
+  .md-btn .icon { width: 14px; height: 14px; }
+  .md-btn.ital { font-style: italic; font-weight: 600; }
+  .md-sep { width: 1px; height: 18px; background: var(--border); margin: 0 4px; }
+
+  .md-area { flex: 1; border: 0; background: #04061a; color: var(--text-2); font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 12.5px; line-height: 1.75; padding: 14px 16px; resize: none; outline: none; width: 100%; tab-size: 2; }
+
+  /* Podgląd wyrenderowanego markdown */
+  .doc-preview-body { flex: 1; padding: 18px 22px; overflow-y: auto; }
+  .doc-preview-body h1 { font-size: 20px; font-weight: 800; margin-bottom: 10px; }
+  .doc-preview-body h2 { font-size: 15px; font-weight: 700; margin: 18px 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--border); }
+  .doc-preview-body p { font-size: 12.5px; color: var(--text-2); line-height: 1.75; margin-bottom: 10px; }
+  .doc-preview-body ul { margin: 0 0 12px 18px; }
+  .doc-preview-body li { font-size: 12.5px; color: var(--text-2); line-height: 1.7; margin-bottom: 5px; }
+  .doc-preview-body code { font-family: ui-monospace, 'JetBrains Mono', monospace; font-size: 11.5px; background: var(--bg-3); padding: 1px 5px; border-radius: 4px; color: var(--accent-2); }
+  .doc-preview-body pre { background: #04061a; border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 12px 14px; overflow-x: auto; margin-bottom: 12px; }
+  .doc-preview-body pre code { background: none; padding: 0; color: var(--text-2); font-size: 11.5px; }
+  .doc-preview-body blockquote { border-left: 3px solid var(--accent-1); background: var(--accent-glow); padding: 8px 14px; border-radius: 0 var(--radius-sm) var(--radius-sm) 0; margin-bottom: 12px; font-size: 12.5px; color: var(--text-2); }
+  .doc-preview-body table { width: 100%; border-collapse: collapse; margin-bottom: 12px; font-size: 12px; }
+  .doc-preview-body th, .doc-preview-body td { border: 1px solid var(--border); padding: 7px 10px; text-align: left; }
+  .doc-preview-body th { background: var(--bg-3); color: var(--text-3); font-size: 10.5px; text-transform: uppercase; letter-spacing: .05em; }
+  .doc-preview-body td { color: var(--text-2); }
+
+  /* Blok wskazujący nowość/usunięcie w podglądzie „po" (D02b) */
+  .ins-block { background: rgba(34,197,94,0.1); border-left: 3px solid var(--success); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 4px 12px 4px; margin: 0 -6px 10px; }
+  .ins-block .ins-tag { font-size: 9.5px; text-transform: uppercase; letter-spacing: .06em; color: var(--success); font-weight: 800; }
+  .del-mark { background: rgba(239,68,68,0.08); border-left: 3px solid var(--danger); border-radius: 0 var(--radius-sm) var(--radius-sm) 0; padding: 6px 12px; margin-bottom: 10px; font-size: 12px; color: var(--text-3); text-decoration: line-through; opacity: .75; }
+
+  /* Diff-line — numeracja + kontekst (rozszerzenie ponad .add/.del z projekty.css) */
+  .diff-line .ln { display: inline-block; width: 26px; color: var(--text-3); text-align: right; margin-right: 10px; opacity: .8; }
+  .diff-line.ctx { color: var(--text-2); }
+
+  /* Karta pojedynczej zmiany z akcjami Zastosuj/Odrzuć */
+  .change-card { border: 1px solid var(--border); border-radius: var(--radius); overflow: hidden; margin-bottom: 12px; background: var(--bg); }
+  .change-card .cc-head { display: flex; align-items: center; gap: 10px; padding: 9px 12px; background: var(--bg-2); border-bottom: 1px solid var(--border); }
+  .change-card .cc-title { font-size: 12.5px; font-weight: 700; }
+  .change-card .cc-loc { font-size: 10.5px; color: var(--text-3); font-family: ui-monospace, monospace; }
+  .change-card .cc-actions { margin-left: auto; display: flex; gap: 6px; }
+  .change-card .cc-diff { padding: 8px 0; overflow-x: auto; }
+  .change-card.applied .cc-head { background: rgba(34,197,94,0.08); }
+
+  /* Wskaźnik pisania agenta (żywe kropki) */
+  .typing-dots { display: inline-flex; gap: 3px; align-items: center; }
+  .typing-dots span { width: 5px; height: 5px; border-radius: 50%; background: var(--accent-2); animation: blink 1.2s infinite; }
+  .typing-dots span:nth-child(2) { animation-delay: .2s; }
+  .typing-dots span:nth-child(3) { animation-delay: .4s; }
+
+  /* Pasek akcji na dole recenzji diffa */
+  .review-bar { display: flex; align-items: center; gap: 10px; padding: 14px 18px; background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); }
+  .review-bar .rb-info { font-size: 12px; color: var(--text-2); }
+  .review-bar .rb-info b { color: var(--text); }
+
+  @media (max-width: 1100px) {
+    .doc-split { grid-template-columns: 1fr; }
+    .ctx-grid { grid-template-columns: 1fr; }
+  }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+</defs></svg>
+
+<!-- ============================================================= -->
+<!-- D02a — Edytor dokumentu (split-view markdown / podgląd)       -->
+<!-- ============================================================= -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">D02a</span>
+    <h2>Edytor dokumentu</h2>
+    <div class="desc">Własny edytor markdown z podglądem na żywo. Piszesz po lewej, po prawej widzisz gotowy dokument. Jedno kliknięcie „Popraw z agentem" uruchamia asystenta, który proponuje zmiany do zatwierdzenia.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Dokumentacja</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Instrukcja wdrożenia · Edytor</span>
+        </div>
+
+        <!-- Nagłówek edytora: edytowalny tytuł + status + akcje -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-doc"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">
+              <input class="title-edit" value="Instrukcja wdrożenia — Środowisko Staging" aria-label="Tytuł dokumentu">
+              <span class="status-pill warn">w przeglądzie</span>
+            </div>
+            <div class="d-sub">Folder <b class="text-2">Instrukcje/</b> · wersja <b class="text-2">v4</b> · autor: Anna Kowalska · zapisano 3 min temu</div>
+            <div class="d-badges">
+              <span class="chip"><svg class="icon"><use href="#i-tag"/></svg>wdrożenie</span>
+              <span class="chip"><svg class="icon"><use href="#i-tag"/></svg>staging</span>
+              <span class="chip info">markdown</span>
+              <span class="edit-badge"><svg class="icon"><use href="#i-edit"/></svg>tytuł można edytować w miejscu</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg>Zapisz wersję</button>
+            <button class="btn"><svg class="icon"><use href="#i-check-circle"/></svg>Wyślij do przeglądu</button>
+            <button class="btn"><!-- otwiera: D02b --><svg class="icon"><use href="#i-sparkles"/></svg>Popraw z agentem</button>
+            <div class="row-menu">
+              <button class="btn" title="Więcej akcji"><svg class="icon"><use href="#i-more"/></svg></button>
+              <!-- menu pokazane otwarte, aby zaprezentować pozostałe akcje dokumentu -->
+              <div class="tf-menu">
+                <div class="mi"><svg class="icon"><use href="#i-history"/></svg>Historia wersji</div>
+                <div class="mi"><svg class="icon"><use href="#i-copy"/></svg>Duplikuj dokument</div>
+                <div class="mi-sep"></div>
+                <div class="mi"><svg class="icon"><use href="#i-clock"/></svg>Archiwizuj</div>
+                <div class="mi danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń dokument</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Powiązania: chipy z Dodaj oraz usuwaniem per element -->
+        <div class="section-card">
+          <div class="section-card-head" style="margin-bottom:12px;">
+            <div class="title"><svg class="icon"><use href="#i-link"/></svg>Powiązania i kontekst dokumentu</div>
+            <span class="hint">Agent „Popraw z agentem" korzysta z tych źródeł jako kontekstu</span>
+          </div>
+          <div class="ctx-grid">
+            <div class="ctx-block">
+              <span class="ck">Źródła wiedzy</span>
+              <span class="ctx-chip"><svg class="icon"><use href="#i-book"/></svg>Wymagania bezpieczeństwa.docx <span class="rm" title="Odłącz źródło"><svg class="icon"><use href="#i-x"/></svg></span></span>
+              <span class="ctx-chip"><svg class="icon"><use href="#i-doc"/></svg>openapi.yaml <span class="rm" title="Odłącz źródło"><svg class="icon"><use href="#i-x"/></svg></span></span>
+              <button class="chip-add" title="Dodaj powiązane źródło"><svg class="icon"><use href="#i-plus"/></svg>Dodaj źródło</button>
+            </div>
+            <div class="ctx-block">
+              <span class="ck">Powiązane</span>
+              <span class="ctx-chip"><svg class="icon"><use href="#i-play"/></svg>Przebieg #241 <span class="rm" title="Usuń powiązanie"><svg class="icon"><use href="#i-x"/></svg></span></span>
+              <button class="chip-add" title="Dodaj powiązanie"><svg class="icon"><use href="#i-plus"/></svg>Dodaj</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Split-view: markdown | podgląd -->
+        <div class="doc-split">
+          <!-- LEWA: edytor markdown -->
+          <div class="doc-pane">
+            <div class="doc-pane-head">
+              <span class="pane-t"><svg class="icon"><use href="#i-code"/></svg>Markdown</span>
+              <div class="md-toolbar ml-auto">
+                <button class="md-btn" title="Pogrubienie">B</button>
+                <button class="md-btn ital" title="Kursywa">I</button>
+                <span class="md-sep"></span>
+                <button class="md-btn" title="Nagłówek 1">H1</button>
+                <button class="md-btn" title="Nagłówek 2">H2</button>
+                <span class="md-sep"></span>
+                <button class="md-btn" title="Lista punktowana"><svg class="icon"><use href="#i-list"/></svg></button>
+                <button class="md-btn" title="Odnośnik"><svg class="icon"><use href="#i-link"/></svg></button>
+                <button class="md-btn" title="Kod"><svg class="icon"><use href="#i-code"/></svg></button>
+                <button class="md-btn" title="Tabela"><svg class="icon"><use href="#i-grid"/></svg></button>
+                <button class="md-btn" title="Załącz plik"><svg class="icon"><use href="#i-paperclip"/></svg></button>
+              </div>
+            </div>
+            <textarea class="md-area" spellcheck="false" aria-label="Treść dokumentu (markdown)"># Instrukcja wdrożenia — Środowisko Staging
+
+Dokument opisuje krok po kroku uruchomienie **Portalu Klienta B2B**
+na środowisku `staging.portal-b2b.euvic.pl`.
+
+> Wymagane uprawnienia: rola **Menedżer** lub **Właściciel** projektu.
+
+## 1. Wymagania wstępne
+
+- Docker 26+ oraz `docker compose`
+- Dostęp do rejestru obrazów `registry.euvic.pl`
+- Sekret `DB_PASSWORD` dodany w Ustawienia → Dostępy zewnętrzne
+
+## 2. Zmienne środowiskowe
+
+| Zmienna        | Przykład                       | Opis                    |
+|----------------|--------------------------------|-------------------------|
+| `BASE_URL`     | https://staging.portal-b2b...  | Adres publiczny portalu |
+| `DB_HOST`      | db-staging.internal            | Host bazy PostgreSQL    |
+| `PAYMENTS_KEY` | (sekret)                       | Klucz bramki płatności  |
+
+## 3. Uruchomienie
+
+```bash
+git checkout release/1.8
+docker compose -f compose.staging.yml up -d
+```
+
+Po starcie sprawdź `GET /health` — powinno zwrócić `200 OK`.
+</textarea>
+          </div>
+
+          <!-- PRAWA: podgląd wyrenderowany -->
+          <div class="doc-pane">
+            <div class="doc-pane-head">
+              <span class="pane-t"><svg class="icon"><use href="#i-eye"/></svg>Podgląd</span>
+              <span class="chip accent ml-auto" style="border-radius:12px;">renderowanie na żywo</span>
+            </div>
+            <div class="doc-preview-body">
+              <h1>Instrukcja wdrożenia — Środowisko Staging</h1>
+              <p>Dokument opisuje krok po kroku uruchomienie <b>Portalu Klienta B2B</b> na środowisku <code>staging.portal-b2b.euvic.pl</code>.</p>
+              <blockquote>Wymagane uprawnienia: rola <b>Menedżer</b> lub <b>Właściciel</b> projektu.</blockquote>
+              <h2>1. Wymagania wstępne</h2>
+              <ul>
+                <li>Docker 26+ oraz <code>docker compose</code></li>
+                <li>Dostęp do rejestru obrazów <code>registry.euvic.pl</code></li>
+                <li>Sekret <code>DB_PASSWORD</code> dodany w Ustawienia → Dostępy zewnętrzne</li>
+              </ul>
+              <h2>2. Zmienne środowiskowe</h2>
+              <table>
+                <thead><tr><th>Zmienna</th><th>Przykład</th><th>Opis</th></tr></thead>
+                <tbody>
+                  <tr><td><code>BASE_URL</code></td><td>https://staging.portal-b2b…</td><td>Adres publiczny portalu</td></tr>
+                  <tr><td><code>DB_HOST</code></td><td>db-staging.internal</td><td>Host bazy PostgreSQL</td></tr>
+                  <tr><td><code>PAYMENTS_KEY</code></td><td>(sekret)</td><td>Klucz bramki płatności</td></tr>
+                </tbody>
+              </table>
+              <h2>3. Uruchomienie</h2>
+              <pre><code>git checkout release/1.8
+docker compose -f compose.staging.yml up -d</code></pre>
+              <p>Po starcie sprawdź <code>GET /health</code> — powinno zwrócić <code>200 OK</code>.</p>
+            </div>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+<!-- ============================================================= -->
+<!-- D02b — „Popraw z agentem": recenzja różnic (stara/nowa)      -->
+<!-- ============================================================= -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">D02b</span>
+    <h2>Popraw z agentem — recenzja zmian</h2>
+    <div class="desc">Agent „Dokumentalista" proponuje poprawki na podstawie Twojej instrukcji. Widzisz stare i nowe obok siebie, a każdą zmianę zatwierdzasz lub odrzucasz osobno. Nic nie trafia do dokumentu bez Twojej zgody.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Dokumentacja</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Instrukcja wdrożenia</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Popraw z agentem</span>
+        </div>
+
+        <!-- Nagłówek trybu recenzji -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-sparkles"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Instrukcja wdrożenia — Środowisko Staging <span class="status-pill info">tryb poprawek</span></div>
+            <div class="d-sub">Propozycja agenta <b class="text-2">Dokumentalista</b> · model: qwen3-27b (alias projektu) · porównanie <b class="text-2">v4 → v5 (propozycja)</b></div>
+            <div class="d-badges">
+              <span class="chip success"><svg class="icon"><use href="#i-plus"/></svg>2 dodane bloki</span>
+              <span class="chip warning"><svg class="icon"><use href="#i-edit"/></svg>1 zmiana tabeli</span>
+              <span class="chip"><svg class="icon"><use href="#i-clock"/></svg>wygenerowano w 6,2 s</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn"><svg class="icon"><use href="#i-arrow-left"/></svg>Wróć do edytora</button>
+          </div>
+        </div>
+
+        <!-- Baner: bezpieczeństwo zmian -->
+        <div class="banner info">
+          <svg class="icon"><use href="#i-shield"/></svg>
+          <div class="b-text"><b>Nic nie zostało jeszcze zapisane.</b> Propozycje agenta zastosują się dopiero po kliknięciu „Zastosuj". Możesz przyjąć wszystkie, wybrane albo tylko pojedyncze zmiany.</div>
+        </div>
+
+        <!-- Instrukcja do agenta + live -->
+        <div class="section-card">
+          <div class="section-card-head" style="margin-bottom:12px;">
+            <div class="title"><svg class="icon"><use href="#i-message"/></svg>Instrukcja dla agenta</div>
+            <span class="hint">Opisz zwykłym językiem, co poprawić — agent zaproponuje zmiany</span>
+          </div>
+          <div class="field" style="margin-bottom:10px;">
+            <textarea class="textarea" aria-label="Instrukcja dla agenta">Dodaj sekcję o wycofaniu zmian (rollback) i uzupełnij tabelę zmiennych środowiskowych o serwer SMTP używany do powiadomień.</textarea>
+          </div>
+          <div class="ai-chips" style="margin-top:0;">
+            <span class="ai-chip"><svg class="icon"><use href="#i-wand"/></svg>Skróć tekst</span>
+            <span class="ai-chip"><svg class="icon"><use href="#i-edit"/></svg>Popraw styl</span>
+            <span class="ai-chip"><svg class="icon"><use href="#i-list"/></svg>Dodaj przykłady</span>
+            <span class="ai-chip"><svg class="icon"><use href="#i-check-circle"/></svg>Uzupełnij luki</span>
+            <span class="ai-chip"><svg class="icon"><use href="#i-globe"/></svg>Ujednolić terminologię</span>
+          </div>
+          <div class="flex align-center gap-md" style="margin-top:12px; justify-content:flex-end;">
+            <button class="btn btn-primary"><!-- otwiera: D02b (ponowna generacja) --><svg class="icon"><use href="#i-sparkles"/></svg>Wyślij do agenta</button>
+          </div>
+
+          <!-- Przebieg agenta na żywo -->
+          <div class="agent-run mt-md">
+            <div class="ar-head">
+              <div class="ar-badge done"><svg class="icon icon-sm"><use href="#i-check"/></svg></div>
+              <div>
+                <div class="ar-label">Dokumentalista <span class="text-3 text-xs" style="font-weight:500;">· iteracja 3 z 3 (pętla krytyka)</span></div>
+                <div class="ar-detail">model: qwen3-27b (alias projektu) · kontekst: dokument v4 + 2 źródła wiedzy</div>
+              </div>
+              <span class="status-pill ok ml-auto">zakończono</span>
+            </div>
+            <div class="ar-iter">
+              <div class="ar-badge done"><svg class="icon icon-sm"><use href="#i-check"/></svg></div>
+              <div><div class="ar-label">agent_context</div><div class="ar-detail">wczytano dokument (v4) + „Wymagania bezpieczeństwa.docx"</div></div>
+            </div>
+            <div class="ar-iter">
+              <div class="ar-badge done"><svg class="icon icon-sm"><use href="#i-check"/></svg></div>
+              <div><div class="ar-label">llm(draft)</div><div class="ar-detail">propozycja: +sekcja rollback, +wiersz SMTP_HOST</div></div>
+            </div>
+            <div class="ar-iter">
+              <div class="ar-badge done"><svg class="icon icon-sm"><use href="#i-check"/></svg></div>
+              <div><div class="ar-label">krytyk → llm(refine)</div><div class="ar-detail">spójność kroków wdrożenia i format tabeli — zgodne</div></div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Porównanie obok siebie: obecna vs propozycja -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-layers"/></svg>Porównanie wersji — obok siebie</div>
+            <span class="hint">Zielone bloki po prawej to treść dodana przez agenta</span>
+          </div>
+          <div class="doc-split">
+            <!-- OBECNA -->
+            <div class="doc-pane">
+              <div class="doc-pane-head">
+                <span class="pane-t"><svg class="icon"><use href="#i-file"/></svg>Wersja obecna</span>
+                <span class="chip ml-auto" style="border-radius:12px;">v4</span>
+              </div>
+              <div class="doc-preview-body">
+                <h2>2. Zmienne środowiskowe</h2>
+                <table>
+                  <thead><tr><th>Zmienna</th><th>Opis</th></tr></thead>
+                  <tbody>
+                    <tr><td><code>BASE_URL</code></td><td>Adres publiczny portalu</td></tr>
+                    <tr><td><code>DB_HOST</code></td><td>Host bazy PostgreSQL</td></tr>
+                    <tr><td><code>PAYMENTS_KEY</code></td><td>Klucz bramki płatności</td></tr>
+                  </tbody>
+                </table>
+                <h2>3. Uruchomienie</h2>
+                <pre><code>git checkout release/1.8
+docker compose -f compose.staging.yml up -d</code></pre>
+                <p>Po starcie sprawdź <code>GET /health</code> — powinno zwrócić <code>200 OK</code>.</p>
+                <div class="del-mark">(brak sekcji o wycofaniu zmian)</div>
+              </div>
+            </div>
+            <!-- PROPOZYCJA -->
+            <div class="doc-pane">
+              <div class="doc-pane-head">
+                <span class="pane-t"><svg class="icon"><use href="#i-sparkles"/></svg>Propozycja agenta</span>
+                <span class="chip accent ml-auto" style="border-radius:12px;">v5 · propozycja</span>
+              </div>
+              <div class="doc-preview-body">
+                <h2>2. Zmienne środowiskowe</h2>
+                <table>
+                  <thead><tr><th>Zmienna</th><th>Opis</th></tr></thead>
+                  <tbody>
+                    <tr><td><code>BASE_URL</code></td><td>Adres publiczny portalu</td></tr>
+                    <tr><td><code>DB_HOST</code></td><td>Host bazy PostgreSQL</td></tr>
+                    <tr><td><code>PAYMENTS_KEY</code></td><td>Klucz bramki płatności</td></tr>
+                    <tr style="background:rgba(34,197,94,0.1)"><td><code>SMTP_HOST</code></td><td>Serwer poczty — powiadomienia e-mail</td></tr>
+                  </tbody>
+                </table>
+                <h2>3. Uruchomienie</h2>
+                <pre><code>git checkout release/1.8
+docker compose -f compose.staging.yml up -d</code></pre>
+                <p>Po starcie sprawdź <code>GET /health</code> — powinno zwrócić <code>200 OK</code>.</p>
+                <div class="ins-block">
+                  <div class="ins-tag">+ dodane przez agenta</div>
+                  <h2 style="margin-top:6px;">4. Wycofanie zmian (rollback)</h2>
+                  <p>Jeśli po wdrożeniu <code>GET /health</code> zwraca błąd, wróć do poprzedniego wydania:</p>
+                  <pre><code>docker compose -f compose.staging.yml down
+git checkout release/1.7
+docker compose -f compose.staging.yml up -d</code></pre>
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Szczegóły zmian: unified diff z akcjami Zastosuj/Odrzuć per zmiana -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-code"/></svg>Szczegóły zmian (2)</div>
+          </div>
+
+          <!-- Zmiana 1 -->
+          <div class="change-card">
+            <div class="cc-head">
+              <span class="chip warning" style="border-radius:12px;"><svg class="icon"><use href="#i-edit"/></svg>zmiana</span>
+              <div>
+                <div class="cc-title">Dodano zmienną SMTP_HOST do tabeli</div>
+                <div class="cc-loc">Sekcja „2. Zmienne środowiskowe" · linie 20–24</div>
+              </div>
+              <div class="cc-actions">
+                <button class="btn btn-sm btn-danger"><svg class="icon"><use href="#i-x"/></svg>Odrzuć</button>
+                <button class="btn btn-sm btn-primary"><svg class="icon"><use href="#i-check"/></svg>Zastosuj</button>
+              </div>
+            </div>
+            <div class="cc-diff">
+              <div class="diff-line ctx"><span class="ln">21</span>| `DB_HOST`      | Host bazy PostgreSQL    |</div>
+              <div class="diff-line ctx"><span class="ln">22</span>| `PAYMENTS_KEY` | Klucz bramki płatności  |</div>
+              <div class="diff-line add"><span class="ln">+</span>| `SMTP_HOST`    | Serwer poczty — powiadomienia e-mail |</div>
+            </div>
+          </div>
+
+          <!-- Zmiana 2 (już zaakceptowana — przykład stanu applied) -->
+          <div class="change-card applied">
+            <div class="cc-head">
+              <span class="chip success" style="border-radius:12px;"><svg class="icon"><use href="#i-check"/></svg>zastosowana</span>
+              <div>
+                <div class="cc-title">Dodano sekcję „4. Wycofanie zmian (rollback)"</div>
+                <div class="cc-loc">Nowa sekcja po „3. Uruchomienie" · +8 linii</div>
+              </div>
+              <div class="cc-actions">
+                <button class="btn btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Cofnij</button>
+              </div>
+            </div>
+            <div class="cc-diff">
+              <div class="diff-line ctx"><span class="ln">32</span>Po starcie sprawdź `GET /health` — powinno zwrócić `200 OK`.</div>
+              <div class="diff-line add"><span class="ln">+</span>## 4. Wycofanie zmian (rollback)</div>
+              <div class="diff-line add"><span class="ln">+</span></div>
+              <div class="diff-line add"><span class="ln">+</span>Jeśli `GET /health` zwraca błąd, wróć do poprzedniego wydania:</div>
+              <div class="diff-line add"><span class="ln">+</span>```bash</div>
+              <div class="diff-line add"><span class="ln">+</span>docker compose -f compose.staging.yml down</div>
+              <div class="diff-line add"><span class="ln">+</span>git checkout release/1.7</div>
+              <div class="diff-line add"><span class="ln">+</span>```</div>
+            </div>
+          </div>
+        </div>
+
+        <!-- Pasek akcji recenzji -->
+        <div class="review-bar">
+          <div class="rb-info"><b>1 z 2</b> zmian zastosowanych · powstanie wersja <b>v5</b></div>
+          <div class="flex gap-sm ml-auto">
+            <button class="btn btn-danger"><svg class="icon"><use href="#i-x-circle"/></svg>Odrzuć wszystko</button>
+            <button class="btn"><svg class="icon"><use href="#i-check"/></svg>Zastosuj wszystko</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg>Zapisz jako v5</button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

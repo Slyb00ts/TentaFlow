@@ -99,9 +99,9 @@ pub struct ServiceInfo {
     /// llm / stt / tts / embeddings / image-gen / agents / ...
     pub category: String,
     pub display_name: String,
-    /// docker / native_embedded / native_binary / native_python_bundle / external.
+    /// docker / native_embedded / native_binary / native_python_bundle / native_managed_cli / external.
     pub deploy_method: String,
-    /// embedded / http_direct / sidecar_quic / external_http.
+    /// embedded / http_direct / sidecar_quic / external_http / agent_rpc.
     pub transport: String,
     /// deploying / starting / running / degraded / failed / stopped / interrupted.
     pub status: String,
@@ -123,6 +123,10 @@ pub struct ServiceInfo {
     /// cold start ~3 min). NULL gdy serwis Running albo nic do
     /// raportowania.
     pub progress_message: Option<String>,
+    #[serde(default)]
+    pub usage_json: Option<String>,
+    #[serde(default)]
+    pub usage_updated_at: Option<String>,
     pub models: Vec<ServiceModelEntry>,
     /// True gdy hash drzewa źródeł bundla zapisany przy deployu różni się od
     /// aktualnego hashu z manifestu — Core wykrył nowszą wersję wbudowanego
@@ -465,6 +469,24 @@ pub struct ServiceOauthPollResponse {
     pub error: Option<String>,
 }
 
+/// Request routed to a deployed Codex or Claude Code CLI bridge.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAgentRequest {
+    pub service_id: i64,
+    pub node_id: Option<String>,
+    /// Stable bridge operation name, for example `auth.status` or `session.turn`.
+    pub operation: String,
+    /// Operation-specific JSON. The owner validates it before contacting the bridge.
+    pub payload_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ServiceAgentResponse {
+    pub success: bool,
+    pub result_json: String,
+    pub error: Option<String>,
+}
+
 /// Inner enum bundling every services-screen RPC pair into a single MessageBody
 /// slot — `MessageBody::ServiceBody`. Pattern mirrors `DeploymentPayload`.
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -493,6 +515,8 @@ pub enum ServicePayload {
     ResOauthStart(ServiceOauthStartResponse),
     ReqOauthPoll(ServiceOauthPollRequest),
     ResOauthPoll(ServiceOauthPollResponse),
+    ReqAgent(ServiceAgentRequest),
+    ResAgent(ServiceAgentResponse),
 }
 
 // =============================================================================
@@ -683,6 +707,12 @@ pub struct ChatMessage {
     /// "system" / "user" / "assistant" / "tool".
     pub role: String,
     pub content: String,
+    /// Reasoning content of a reasoning model, carried through the chat path so
+    /// a replayed assistant turn keeps it. Optional and skipped when absent, so
+    /// a peer that predates the field still decodes our frames and we still
+    /// decode theirs.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -906,6 +936,10 @@ pub struct FlowSummary {
     /// access-key wizard must grant — the flow's own UUID is not callable.
     #[serde(default)]
     pub published_model_name: Option<String>,
+    /// `flows.is_system` — platform-seeded flow; the server rejects user
+    /// edit/delete/status changes, so the UI can hide those actions.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -918,6 +952,10 @@ pub struct FlowDetail {
     pub enabled: bool,
     /// Raw flow status column: "active" | "draft" | "decoded" itp.
     pub status: String,
+    /// `flows.is_system` — platform-seeded flow; the server rejects user
+    /// edit/delete/status changes, so the UI can hide those actions.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -2224,6 +2262,62 @@ pub struct MlStudioGenericTrainStatusResponse {
     pub stage: String,
 }
 
+/// Anulowanie TRWAJĄCEGO treningu ML Studio — jeden wariant dla wszystkich torów
+/// (detekcja, klasyfikator, OCR, LLM), bo run zna swój tor po `config_json`.
+/// Handler woła `/cancel` serwisu treningowego (lokalnie albo przez mesh na węźle
+/// treningowym) i podnosi flagę anulowania, którą widzą pętle nadzoru Core.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainCancelRequest {
+    pub run_id: String,
+}
+
+/// `cancelled = false` znaczy „nie było co anulować" (run już się zakończył);
+/// `status` to stan runu po żądaniu.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioTrainCancelResponse {
+    pub run_id: String,
+    pub status: String,
+    pub cancelled: bool,
+}
+
+/// Hiperparametry treningu czytnika OCR (CRNN + CTC) na wierszach tablic.
+/// `synthetic_per_epoch` to liczba próbek syntetycznych generowanych na epokę
+/// (0 = trening wyłącznie na realnych wierszach), `real_repeat` ile razy realne
+/// wiersze są powtarzane w epoce — realnych etykiet jest z natury mało, więc bez
+/// powtórzeń syntetyk by je zdominował.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioOcrHyperparams {
+    pub epochs: i32,
+    pub batch_size: i32,
+    pub learning_rate: f32,
+    pub synthetic_per_epoch: i32,
+    pub real_repeat: i32,
+}
+
+/// Start treningu CZYTNIKA OCR na wierszach wycinków (np. atrybut "kod" klasy
+/// `tablica_adr` o wartościach w formacie `<kemler>/<UN>`). Wycinki, podział na
+/// wiersze i etykiety buduje SERWIS `ocr-training`; Core przekazuje dataset +
+/// specyfikację atrybutu. Biegnie ASYNCHRONICZNIE (zob. `train_ocr.rs`); UI pyta
+/// o postęp przez `MlStudioGenericTrainStatusRequest`.
+#[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioOcrTrainStartRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub attribute: String,
+    pub source_class: String,
+    pub hyperparams: MlStudioOcrHyperparams,
+    /// Węzeł docelowy treningu: "" = trening lokalny; inny node_id → trening na
+    /// zdalnym węźle (Node B) przez komendę mesh, status proxowany z powrotem.
+    #[serde(default)]
+    pub target_node_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioOcrTrainStartResponse {
+    pub run_id: String,
+    pub status: String,
+}
+
 /// Żądanie eksportu wytrenowanego modelu FT do GGUF. Eksport (merge adaptera +
 /// konwersja) trwa, więc biegnie ASYNCHRONICZNIE w tle Core (zob.
 /// `export_llm.rs`); odpowiedź wraca natychmiast, a UI odpytuje przez
@@ -2456,6 +2550,310 @@ pub struct MlStudioDistillGenerateStatusResponse {
     pub samples: Vec<MlStudioDistillQaPair>,
 }
 
+// ---------------------------------------------------------------------------
+// Project export/import — pakowanie całego projektu ML Studio (datasety, klasy,
+// opcjonalnie modele i historia) do archiwum i odtwarzanie po stronie klienta.
+// ---------------------------------------------------------------------------
+
+/// Podsumowanie datasetu wykryte w podglądzie importowanego archiwum.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioImportDatasetInfo {
+    pub dataset_id: String,
+    pub name: String,
+    pub image_count: u64,
+    pub annotation_count: u64,
+}
+
+/// Artefakt zadeklarowany w manifeście archiwum, którego brakuje w paczce.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioImportMissingArtifact {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Pojedyncze nagranie dostępne do zaimportowania jako źródło klatek datasetu.
+/// `created_at` to unix w MILISEKUNDACH.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingItem {
+    pub recording_ref: String,
+    pub kind: String,
+    pub camera_id: String,
+    pub created_at: i64,
+    #[serde(default)]
+    pub duration_ms: Option<i64>,
+    pub file_size_bytes: i64,
+    #[serde(default)]
+    pub plate_text: Option<String>,
+    #[serde(default)]
+    pub adr_text: Option<String>,
+    /// Signed `/frames/<ref>` URL of a representative full frame (the scene at
+    /// the best OCR read of the event), used as a clip preview. `None` when the
+    /// recording carries no thumb ref or lives on a remote node.
+    #[serde(default)]
+    pub thumb_url: Option<String>,
+}
+
+/// Start pakowania projektu. Job w tle buduje archiwum; postęp przez
+/// `MlStudioProjectExportStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStartRequest {
+    pub project_id: String,
+    pub include_models: bool,
+    pub include_history: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStartResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectExportStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub files_total: u64,
+    pub files_done: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    #[serde(default)]
+    pub export_ref: Option<String>,
+    #[serde(default)]
+    pub signed_url: Option<String>,
+    #[serde(default)]
+    pub archive_bytes: Option<u64>,
+}
+
+/// Jeden fragment przesyłanego archiwum projektu. Duże paczki przekraczają limit
+/// pojedynczej ramki WS, więc klient dzieli plik na części `seq` (0..total_chunks).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadChunkRequest {
+    pub upload_id: String,
+    pub seq: u32,
+    pub total_chunks: u32,
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadChunkResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadStatusRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportUploadStatusResponse {
+    pub upload_id: String,
+    pub received_chunks: u32,
+    pub received_bytes: u64,
+    pub total_chunks: u32,
+    pub complete: bool,
+    pub exists: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportPreviewRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportPreviewResponse {
+    pub project_name: String,
+    pub project_type: String,
+    pub datasets: Vec<MlStudioImportDatasetInfo>,
+    pub classes: Vec<String>,
+    pub has_models: bool,
+    pub has_history: bool,
+    pub total_uncompressed_bytes: u64,
+    pub missing_artifacts: Vec<MlStudioImportMissingArtifact>,
+    pub archive_version: u32,
+}
+
+/// Zatwierdzenie importu. `mode`: "new_project" | "merge".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportApplyRequest {
+    pub upload_id: String,
+    pub mode: String,
+    #[serde(default)]
+    pub name_override: Option<String>,
+    #[serde(default)]
+    pub target_project_id: Option<String>,
+    #[serde(default)]
+    pub target_dataset_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportApplyResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub files_total: u64,
+    pub files_done: u64,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportCancelRequest {
+    pub upload_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioProjectImportCancelResponse {
+    pub cancelled: bool,
+}
+
+/// Lista nagrań filtrowana po kamerze i zakresie czasu (unix w milisekundach).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingsListRequest {
+    #[serde(default)]
+    pub camera_id: Option<String>,
+    #[serde(default)]
+    pub date_from_ms: Option<i64>,
+    #[serde(default)]
+    pub date_to_ms: Option<i64>,
+    pub limit: u32,
+    /// Hex node_id of a PAIRED node to list recordings from. `None`/absent =
+    /// local node (unchanged behaviour).
+    #[serde(default)]
+    pub source_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingsListResponse {
+    pub items: Vec<MlStudioRecordingItem>,
+}
+
+/// Import nagrań do datasetu rozpoznawania: ekstrakcja klatek `fps`, opcjonalny
+/// autolabel. `collision`: "suffix" | "skip".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsRequest {
+    pub project_id: String,
+    pub dataset_id: String,
+    pub recording_refs: Vec<String>,
+    pub fps: u32,
+    pub autolabel: bool,
+    pub collision: String,
+    /// Hex node_id of a PAIRED node to pull recordings from. `None`/absent =
+    /// local node (unchanged behaviour).
+    #[serde(default)]
+    pub source_node_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsResponse {
+    pub job_id: String,
+}
+
+/// Wynik importu pojedynczego nagrania. `skipped` = Some(powód) gdy pominięto.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecordingOutcome {
+    pub recording_ref: String,
+    pub frames: u64,
+    pub detections: u64,
+    pub skipped_frames: u64,
+    #[serde(default)]
+    pub skipped: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsStatusRequest {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRecogImportRecordingsStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub recordings_total: u32,
+    pub recordings_done: u32,
+    pub frames_extracted: u64,
+    pub frames_labeled: u64,
+    pub images_added: u64,
+    pub detections: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+    pub outcomes: Vec<MlStudioRecordingOutcome>,
+}
+
+/// Podgląd projektu udostępnionego przez ZDALNĄ, niesparowaną instancję. `url` to
+/// link „share" (albo bezpośredni `/ml-studio/share/<id>/manifest`, albo baza),
+/// `api_key` to klucz Bearer. Handler pobiera TYLKO manifest (tani podgląd, bez
+/// pobierania archiwum) przez utwardzony klient HTTPS.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportPreviewRequest {
+    pub url: String,
+    pub api_key: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportPreviewResponse {
+    pub project_name: String,
+    pub project_type: String,
+    pub datasets: Vec<MlStudioImportDatasetInfo>,
+    pub classes: Vec<String>,
+    pub archive_bytes: u64,
+    pub archive_version: u32,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
+/// Start zdalnego importu: pobranie archiwum ZIP z instancji źródłowej i import
+/// jako NOWY projekt lokalny. Job w tle; postęp przez `RemoteImportStatusRequest`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStartRequest {
+    pub url: String,
+    pub api_key: String,
+    #[serde(default)]
+    pub name_override: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStartResponse {
+    pub job_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStatusRequest {
+    pub job_id: String,
+}
+
+/// Postęp zdalnego importu. `phase` obejmuje etap „downloading" przed fazami
+/// importu archiwum („extracting" | „registering").
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MlStudioRemoteImportStatusResponse {
+    pub status: String,
+    pub phase: String,
+    pub bytes_total: u64,
+    pub bytes_done: u64,
+    #[serde(default)]
+    pub error: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
 pub enum MlStudioPayload {
     ProjectsListRequest(MlStudioProjectsListRequest),
@@ -2568,6 +2966,38 @@ pub enum MlStudioPayload {
     VisionModelsListResponse(MlStudioVisionModelsListResponse),
     VisionModelDeleteRequest(MlStudioVisionModelDeleteRequest),
     VisionModelDeleteResponse(MlStudioVisionModelDeleteResponse),
+    ProjectExportStartRequest(MlStudioProjectExportStartRequest),
+    ProjectExportStartResponse(MlStudioProjectExportStartResponse),
+    ProjectExportStatusRequest(MlStudioProjectExportStatusRequest),
+    ProjectExportStatusResponse(MlStudioProjectExportStatusResponse),
+    ProjectImportUploadChunkRequest(MlStudioProjectImportUploadChunkRequest),
+    ProjectImportUploadChunkResponse(MlStudioProjectImportUploadChunkResponse),
+    ProjectImportUploadStatusRequest(MlStudioProjectImportUploadStatusRequest),
+    ProjectImportUploadStatusResponse(MlStudioProjectImportUploadStatusResponse),
+    ProjectImportPreviewRequest(MlStudioProjectImportPreviewRequest),
+    ProjectImportPreviewResponse(MlStudioProjectImportPreviewResponse),
+    ProjectImportApplyRequest(MlStudioProjectImportApplyRequest),
+    ProjectImportApplyResponse(MlStudioProjectImportApplyResponse),
+    ProjectImportStatusRequest(MlStudioProjectImportStatusRequest),
+    ProjectImportStatusResponse(MlStudioProjectImportStatusResponse),
+    ProjectImportCancelRequest(MlStudioProjectImportCancelRequest),
+    ProjectImportCancelResponse(MlStudioProjectImportCancelResponse),
+    RecordingsListRequest(MlStudioRecordingsListRequest),
+    RecordingsListResponse(MlStudioRecordingsListResponse),
+    RecogImportRecordingsRequest(MlStudioRecogImportRecordingsRequest),
+    RecogImportRecordingsResponse(MlStudioRecogImportRecordingsResponse),
+    RecogImportRecordingsStatusRequest(MlStudioRecogImportRecordingsStatusRequest),
+    RecogImportRecordingsStatusResponse(MlStudioRecogImportRecordingsStatusResponse),
+    RemoteImportPreviewRequest(MlStudioRemoteImportPreviewRequest),
+    RemoteImportPreviewResponse(MlStudioRemoteImportPreviewResponse),
+    RemoteImportStartRequest(MlStudioRemoteImportStartRequest),
+    RemoteImportStartResponse(MlStudioRemoteImportStartResponse),
+    RemoteImportStatusRequest(MlStudioRemoteImportStatusRequest),
+    RemoteImportStatusResponse(MlStudioRemoteImportStatusResponse),
+    TrainCancelRequest(MlStudioTrainCancelRequest),
+    TrainCancelResponse(MlStudioTrainCancelResponse),
+    OcrTrainStartRequest(MlStudioOcrTrainStartRequest),
+    OcrTrainStartResponse(MlStudioOcrTrainStartResponse),
 }
 
 // ----- Robots screen (UserSession) -----
@@ -3262,6 +3692,36 @@ pub struct AgentRunEvent {
     pub outcome: String,
 }
 
+// ----- Run start + builder assist -----
+//
+// RunStart spawns one attended background run for the calling admin session
+// (the dashboard "run now" button). BuilderAssist is a short LLM-backed
+// conversation that drafts an agent definition; the transcript and the result
+// travel as pre-serialized JSON (`*_json`), matching the rest of this domain.
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunStartRequest {
+    pub agent_id: String,
+    pub prompt: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentRunStartResponse {
+    pub run_id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentBuilderAssistRequest {
+    /// JSON array of `{"role":"user"|"assistant","content":"..."}` turns.
+    pub messages_json: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct AgentBuilderAssistResponse {
+    /// JSON object `{"reply":String,"proposal":null|{...}}`.
+    pub result_json: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum AgentsPayload {
     ListRequest(AgentsListRequest),
@@ -3286,6 +3746,12 @@ pub enum AgentsPayload {
     RunCancelResponse(AgentRunCancelResponse),
     RunEventsSubscribeRequest(AgentRunEventsSubscribeRequest),
     RunEvent(AgentRunEvent),
+    // Append-only past this point: ciborium encodes variants by index, so
+    // inserting or reordering above breaks older peers on the wire.
+    RunStartRequest(AgentRunStartRequest),
+    RunStartResponse(AgentRunStartResponse),
+    BuilderAssistRequest(AgentBuilderAssistRequest),
+    BuilderAssistResponse(AgentBuilderAssistResponse),
 }
 
 // =============================================================================
@@ -4137,6 +4603,17 @@ pub struct ClusterMember {
     /// `NCCL_SOCKET_IFNAME`/`GLOO_SOCKET_IFNAME` bootstrap interface).
     #[serde(default)]
     pub rdma_socket_ifname: Option<String>,
+    /// Netdev chosen as the cluster interconnect for this member, and its IPv4.
+    /// Without them the UI cannot show WHICH card is currently in use, so a NIC
+    /// picker would have nothing to preselect.
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    #[serde(default)]
+    pub interface_ip: Option<String>,
+    /// RoCE v2 GID index handed to `NCCL_IB_GID_INDEX`, read from the member's
+    /// own GID table by the RDMA auto-config.
+    #[serde(default)]
+    pub rdma_gid_index: Option<u32>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -4153,6 +4630,41 @@ pub struct ClusterDetailRequest {
 pub struct ClusterDetailResponse {
     pub cluster: ClusterInfo,
     pub members: Vec<ClusterMember>,
+    /// Live distributed deployment of this cluster, if any. Without it the
+    /// dashboard only knew about a deployment it had started itself in the
+    /// current page session, so a refresh made a running cluster look idle and
+    /// offered "deploy" again. `default` keeps peers that predate the field
+    /// decodable.
+    #[serde(default)]
+    pub deployment: Option<ClusterDeploymentInfo>,
+}
+
+/// A distributed deployment as the dashboard needs to render it: identity,
+/// endpoint and per-member placement.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeploymentInfo {
+    pub deployment_cluster_id: String,
+    pub engine_id: String,
+    pub model: String,
+    pub served_model_name: String,
+    pub tp_size: u32,
+    pub head_node_id: String,
+    pub port: u32,
+    pub endpoint_url: Option<String>,
+    /// "deploying" | "running" | "failed" | "stopped".
+    pub status: String,
+    pub created_at: String,
+    pub members: Vec<ClusterDeploymentMemberInfo>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct ClusterDeploymentMemberInfo {
+    pub node_id: String,
+    pub hostname: Option<String>,
+    /// "head" | "worker".
+    pub role: String,
+    /// Empty for a deployment that runs no container (native bundle).
+    pub container_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -4206,6 +4718,14 @@ pub struct ClusterAddMemberRequest {
     pub node_id: String,
     pub interface_type: Option<String>,
     pub interface_speed_mbps: Option<u32>,
+    /// Netdev interconnectu wskazany RECZNIE przez admina (np. `enp1s0f0np0`).
+    /// `None` = zostaw wybor automatowi z testu polaczen. Dla istniejacego
+    /// czlonka to zmiana karty — handler robi UPSERT, nie duplikat.
+    #[serde(default)]
+    pub interface_name: Option<String>,
+    /// Adres IPv4 tej karty, uzywany jako adres interconnectu klastra.
+    #[serde(default)]
+    pub interface_ip: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -6220,6 +6740,21 @@ pub enum SystemEventPayload {
         status: String,
         message: String,
     },
+    /// Personal notification push (Project Studio). Variant appended at the
+    /// END — SystemEventPayload is append-only on the wire like every other
+    /// enum. Unlike the broadcast variants above, this one is PRIVATE:
+    /// ws_binary forwards it only to connections authenticated as `user_id`.
+    /// The badge/list source of truth stays NotificationsListRequest; this
+    /// event only triggers a toast + badge refresh.
+    UserNotification {
+        user_id: String,
+        notification_id: String,
+        project_id: String,
+        kind: String,
+        title: String,
+        body: String,
+        link_json: String,
+    },
 }
 
 /// Zbiorczy payload deployment (req + res + stream chunks). Jeden wariant
@@ -7533,6 +8068,18 @@ pub enum MessageBody {
     // JEDEN wariant na całą rodzinę (overview + browse + mkdir + migrate) w
     // `StorageAdminPayload`.
     StorageAdminBody(crate::storage::StorageAdminPayload),
+
+    // ----- Project Studio (rejestr projektów, wiedza, ingest, chat, ustawienia) -----
+    // Dopisane na KOŃCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // żeby nie ruszać indeksów istniejących wariantów. JEDEN wariant na całą
+    // rodzinę (request+response+stream) w `ProjectStudioPayload`.
+    ProjectStudioBody(crate::project_studio::ProjectStudioPayload),
+
+    // ----- Code Studio (rejestr workspace'ow, czlonkowie, sesje robocze) -----
+    // Dopisane na KONCU enuma (ciborium koduje warianty po indeksie liczbowym),
+    // zeby nie ruszac indeksow istniejacych wariantow. JEDEN wariant na cala
+    // rodzine (request+response) w `CodeStudioPayload`.
+    CodeStudioBody(crate::code_studio::CodeStudioPayload),
 }
 
 // =============================================================================
@@ -7610,6 +8157,20 @@ mod tests {
                 },
             },
         ));
+        assert_eq!(round_trip(body.clone()), body);
+    }
+
+    #[test]
+    fn system_event_user_notification_round_trip() {
+        let body = MessageBody::SystemEventBody(SystemEventPayload::UserNotification {
+            user_id: "u1".to_string(),
+            notification_id: "n1".to_string(),
+            project_id: "p1".to_string(),
+            kind: "run_item_assigned".to_string(),
+            title: "t".to_string(),
+            body: "b".to_string(),
+            link_json: "{}".to_string(),
+        });
         assert_eq!(round_trip(body.clone()), body);
     }
 
@@ -7923,10 +8484,12 @@ mod tests {
                 ChatMessage {
                     role: "system".to_string(),
                     content: "You are helpful.".to_string(),
+                    reasoning_content: None,
                 },
                 ChatMessage {
                     role: "user".to_string(),
                     content: "Hi".to_string(),
+                    reasoning_content: None,
                 },
             ],
             temperature: Some(0.7),

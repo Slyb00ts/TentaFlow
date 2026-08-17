@@ -16,6 +16,7 @@ pub enum Transport {
     HttpDirect,
     SidecarQuic,
     ExternalHttp,
+    AgentRpc,
 }
 
 impl Transport {
@@ -26,6 +27,7 @@ impl Transport {
             Transport::HttpDirect => "http_direct",
             Transport::SidecarQuic => "sidecar_quic",
             Transport::ExternalHttp => "external_http",
+            Transport::AgentRpc => "agent_rpc",
         }
     }
 
@@ -35,6 +37,7 @@ impl Transport {
             "http_direct" => Transport::HttpDirect,
             "sidecar_quic" => Transport::SidecarQuic,
             "external_http" => Transport::ExternalHttp,
+            "agent_rpc" => Transport::AgentRpc,
             other => return Err(anyhow!("unknown transport tag: {}", other)),
         })
     }
@@ -44,7 +47,7 @@ impl Transport {
     pub fn endpoint_url(self, host: &str, port: u16) -> Option<String> {
         match self {
             Transport::Embedded => None,
-            Transport::HttpDirect | Transport::ExternalHttp => {
+            Transport::HttpDirect | Transport::ExternalHttp | Transport::AgentRpc => {
                 Some(format!("http://{}:{}", host, port))
             }
             Transport::SidecarQuic => Some(format!("quic://{}:{}", host, port)),
@@ -63,6 +66,7 @@ mod tests {
             Transport::HttpDirect,
             Transport::SidecarQuic,
             Transport::ExternalHttp,
+            Transport::AgentRpc,
         ] {
             let tag = t.as_db_tag();
             let parsed = Transport::from_db_tag(tag).unwrap();

@@ -16,7 +16,7 @@
 // / UPDATE / DELETE and on every file-path resolution.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use dashmap::DashMap;
@@ -633,6 +633,63 @@ impl NamespaceManager {
         fields: &[FieldSpec],
         sparse: bool,
     ) -> Result<Arc<dyn VectorBackend>> {
+        self.get_or_create_inner(
+            org_id, addon_id, namespace, dim, metric, fields, sparse, None,
+        )
+    }
+
+    /// Like [`Self::get_or_create`], but a namespace created by this call lands
+    /// at `custom_dir/<namespace>.usearch` instead of the addon vectors tree.
+    /// Used for collections that belong to a non-addon owner (e.g. the Projects
+    /// module: `data/projects/<project_id>/vectors/`). Validations and the
+    /// per-(org, addon) quotas are identical to `get_or_create`.
+    ///
+    /// If the namespace already EXISTS (DB row present), `custom_dir` is
+    /// ignored and the persisted `file_path` wins — the row is the single
+    /// source of truth for where the data lives (`load_row` opens by it), so
+    /// honoring a different directory on reopen would fork the collection and
+    /// make the existing vectors look lost. Same-arguments reopen therefore
+    /// behaves exactly like `get_or_create`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn get_or_create_at(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        dim: u32,
+        metric: Metric,
+        fields: &[FieldSpec],
+        sparse: bool,
+        custom_dir: &Path,
+    ) -> Result<Arc<dyn VectorBackend>> {
+        self.get_or_create_inner(
+            org_id,
+            addon_id,
+            namespace,
+            dim,
+            metric,
+            fields,
+            sparse,
+            Some(custom_dir),
+        )
+    }
+
+    /// Shared core of [`Self::get_or_create`] / [`Self::get_or_create_at`].
+    /// `create_dir` only decides where a NOT-yet-existing namespace is created;
+    /// every other code path (cache hit, existing row, quota, backend build)
+    /// is common.
+    #[allow(clippy::too_many_arguments)]
+    fn get_or_create_inner(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        namespace: &str,
+        dim: u32,
+        metric: Metric,
+        fields: &[FieldSpec],
+        sparse: bool,
+        create_dir: Option<&Path>,
+    ) -> Result<Arc<dyn VectorBackend>> {
         validate_org_id(org_id)?;
         validate_addon_id(addon_id)?;
         validate_namespace_name(namespace)?;
@@ -699,7 +756,10 @@ impl NamespaceManager {
                 }
                 None => {
                     self.check_namespace_quota(org_id, addon_id)?;
-                    let path = self.file_path_for(org_id, addon_id, namespace)?;
+                    let path = match create_dir {
+                        Some(dir) => dir.join(format!("{namespace}.usearch")),
+                        None => self.file_path_for(org_id, addon_id, namespace)?,
+                    };
                     self.insert_row(
                         org_id, addon_id, namespace, dim, metric, &path, fields, sparse,
                     )?;
@@ -1263,6 +1323,109 @@ mod tests {
             .get_or_create(ORG_A, "addon_a", "faces", 4, Metric::Cosine, &[], false)
             .unwrap();
         assert!(Arc::ptr_eq(&a, &b));
+    }
+
+    #[test]
+    fn test_get_or_create_at_custom_dir_create_reopen_search() {
+        let root = TempDir::new().unwrap();
+        let custom = TempDir::new().unwrap();
+        let pool = in_memory_db_with_v27();
+        // Nested, not-yet-existing dir: the backend must create it on open.
+        let custom_dir = custom.path().join("projects").join("p1").join("vectors");
+
+        {
+            let mgr = NamespaceManager::with_root(pool.clone(), root.path().to_path_buf());
+            let be = mgr
+                .get_or_create_at(
+                    ORG_A,
+                    "ps-proj1",
+                    "docs",
+                    3,
+                    Metric::Cosine,
+                    &[],
+                    false,
+                    &custom_dir,
+                )
+                .unwrap();
+            be.upsert(1, &[1.0, 0.0, 0.0], &[], None).unwrap();
+            be.upsert(2, &[0.0, 1.0, 0.0], &[], None).unwrap();
+            be.save().unwrap();
+
+            // The persisted file_path must live under custom_dir, NOT the
+            // manager root — that is the whole point of the variant.
+            let conn = pool.read().unwrap();
+            let p: String = conn
+                .query_row(
+                    "SELECT file_path FROM addon_vector_namespaces \
+                     WHERE addon_id='ps-proj1' AND namespace='docs' AND org_id='org-a'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let stored = PathBuf::from(&p);
+            assert!(stored.starts_with(&custom_dir), "stored path: {p}");
+            assert!(stored.exists());
+        }
+
+        // Fresh manager (empty backend cache): reopen resolves through the
+        // persisted file_path, so the custom-dir data survives a restart.
+        let mgr2 = NamespaceManager::with_root(pool, root.path().to_path_buf());
+        let be = mgr2.get(ORG_A, "ps-proj1", "docs").unwrap();
+        assert_eq!(be.count(), 2);
+        let hits = be.search(&[1.0, 0.0, 0.0], 1, None, &[]).unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].ref_id, 1);
+
+        // Reopening via get_or_create_at with a DIFFERENT dir keeps the
+        // persisted path (same handle, no fork).
+        let other = TempDir::new().unwrap();
+        let be2 = mgr2
+            .get_or_create_at(
+                ORG_A,
+                "ps-proj1",
+                "docs",
+                3,
+                Metric::Cosine,
+                &[],
+                false,
+                other.path(),
+            )
+            .unwrap();
+        assert!(Arc::ptr_eq(&be, &be2));
+        assert_eq!(be2.count(), 2);
+    }
+
+    #[test]
+    fn test_get_or_create_at_enforces_namespace_quota() {
+        let (_dir, mgr) = mgr();
+        let custom = TempDir::new().unwrap();
+        for i in 0..MAX_NAMESPACES_PER_ADDON {
+            mgr.get_or_create_at(
+                ORG_A,
+                "ps-proj1",
+                &format!("ns{i}"),
+                4,
+                Metric::Cosine,
+                &[],
+                false,
+                custom.path(),
+            )
+            .unwrap();
+        }
+        let res = mgr.get_or_create_at(
+            ORG_A,
+            "ps-proj1",
+            "overflow",
+            4,
+            Metric::Cosine,
+            &[],
+            false,
+            custom.path(),
+        );
+        assert!(matches!(
+            res,
+            Err(VectorError::NamespaceQuotaExceeded { .. })
+        ));
     }
 
     #[test]

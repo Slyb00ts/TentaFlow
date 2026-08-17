@@ -39,6 +39,15 @@ class TfAlert extends HTMLElement {
     const actionsContent = this.querySelector('[slot="actions"]');
     if (actionsContent) actionsContent.removeAttribute('slot');
     this._actionsEl = actionsContent;
+    // Fallback for the common `<tf-alert>text</tf-alert>` form: capture loose child
+    // text (NOT element children like the actions container) before the clear
+    // below drops it. Without this the message is silently lost and the alert
+    // renders as an empty coloured box — `message` attribute still wins when set.
+    this._childText = Array.from(this.childNodes)
+      .filter((n) => n.nodeType === Node.TEXT_NODE)
+      .map((n) => n.textContent)
+      .join('')
+      .trim();
     this.innerHTML = '';
     const el = document.createElement('div');
     el.className = 'tf-alert';
@@ -51,34 +60,61 @@ class TfAlert extends HTMLElement {
       ? this.getAttribute('tone')
       : 'info';
     const title = this.getAttribute('title') || '';
-    const message = this.getAttribute('message') || '';
+    const message = this.getAttribute('message') || this._childText || '';
     const dismissable = this.hasAttribute('dismissable');
 
     this._root.className = `tf-alert ${tone}`;
+    this._root.textContent = '';
 
-    const iconPath = TONE_ICONS[tone];
-    const iconHtml = `<svg class="tf-alert-icon" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="${iconPath}"/></svg>`;
+    // Icon path comes from the trusted TONE_ICONS map keyed by a validated
+    // tone, so no caller data reaches the SVG markup. Build via the SVG
+    // namespace instead of innerHTML.
+    const svgNs = 'http://www.w3.org/2000/svg';
+    const icon = document.createElementNS(svgNs, 'svg');
+    icon.setAttribute('class', 'tf-alert-icon');
+    icon.setAttribute('width', '18');
+    icon.setAttribute('height', '18');
+    icon.setAttribute('viewBox', '0 0 24 24');
+    icon.setAttribute('fill', 'none');
+    icon.setAttribute('stroke', 'currentColor');
+    icon.setAttribute('stroke-width', '2');
+    icon.setAttribute('stroke-linecap', 'round');
+    icon.setAttribute('stroke-linejoin', 'round');
+    icon.setAttribute('aria-hidden', 'true');
+    const iconPathEl = document.createElementNS(svgNs, 'path');
+    iconPathEl.setAttribute('d', TONE_ICONS[tone]);
+    icon.appendChild(iconPathEl);
+    this._root.appendChild(icon);
 
-    const titleHtml = title ? `<div class="tf-alert-title">${title}</div>` : '';
-    const msgHtml = message ? `<div class="tf-alert-message">${message}</div>` : '';
-
-    const closeHtml = dismissable
-      ? `<button class="tf-alert-close" aria-label="Dismiss">&times;</button>`
-      : '';
-
-    this._root.innerHTML =
-      `${iconHtml}<div class="tf-alert-content">${titleHtml}${msgHtml}</div>${closeHtml}`;
-
-    if (this._actionsEl) {
-      this._root.querySelector('.tf-alert-content').appendChild(this._actionsEl);
+    // Title and message are attacker-reachable (foreign-node manifests, addon
+    // state). Assign as textContent so any HTML in them is rendered inert.
+    const content = document.createElement('div');
+    content.className = 'tf-alert-content';
+    if (title) {
+      const titleEl = document.createElement('div');
+      titleEl.className = 'tf-alert-title';
+      titleEl.textContent = title;
+      content.appendChild(titleEl);
     }
+    if (message) {
+      const msgEl = document.createElement('div');
+      msgEl.className = 'tf-alert-message';
+      msgEl.textContent = message;
+      content.appendChild(msgEl);
+    }
+    if (this._actionsEl) content.appendChild(this._actionsEl);
+    this._root.appendChild(content);
 
     if (dismissable) {
-      const btn = this._root.querySelector('.tf-alert-close');
+      const btn = document.createElement('button');
+      btn.className = 'tf-alert-close';
+      btn.setAttribute('aria-label', 'Dismiss');
+      btn.appendChild(document.createTextNode('×'));
       btn.addEventListener('click', () => {
         this.dispatchEvent(new CustomEvent('dismiss', { bubbles: true }));
         this.remove();
       }, { once: true });
+      this._root.appendChild(btn);
     }
   }
 }

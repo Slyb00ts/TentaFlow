@@ -1,7 +1,8 @@
-// ===== File: source.rs — model/tokenizer/chat-template resolution shared by server and CLI =====
-// One place decides, for a GGUF file or an HF snapshot directory, which
-// tokenizer to build, which special-token ids apply, which EOS ids terminate
-// generation, and which chat template source renders conversations.
+// =============================================================================
+// Plik: source.rs
+// Opis: Rozwiązuje model, tokenizer, tokeny specjalne i szablon rozmowy.
+// Przykład: load_model(device, path, config)
+// =============================================================================
 
 use std::path::Path;
 use std::sync::Arc;
@@ -10,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use forge_engine::model::{Model, ModelConfig};
 use forge_formats::{Gguf, HfConfig, ModelDescriptor, PoolingType};
 use forge_hal::Device;
-use forge_tokenize::{resolve_chat_template, Tokenizer};
+use forge_tokenize::{builtin_chat_template, resolve_chat_template, Tokenizer};
 
 /// Tokenizer + everything the API layer needs around it.
 pub struct TokenizerBundle {
@@ -30,6 +31,11 @@ impl TokenizerBundle {
     /// architecture when the model ships none.
     pub fn resolve_template(&self, arch: &str) -> Result<String> {
         let family = builtin_family_for_arch(arch);
+        if family == "muse_glimmer" {
+            return builtin_chat_template(family)
+                .map(str::to_string)
+                .ok_or_else(|| anyhow::anyhow!("brak wbudowanego szablonu Muse"));
+        }
         resolve_chat_template(None, self.chat_template.as_deref(), None, Some(family))
             .map(str::to_string)
             .map_err(|e| anyhow::anyhow!("{e}"))
@@ -59,6 +65,8 @@ pub fn builtin_family_for_arch(arch: &str) -> &'static str {
         "mistral"
     } else if arch.starts_with("gemma") {
         "gemma"
+    } else if matches!(arch, "muse-glimmer" | "muse_glimmer") {
+        "muse_glimmer"
     } else {
         "chatml"
     }
@@ -184,7 +192,7 @@ pub fn load_tokenizer_dir(dir: &Path) -> Result<TokenizerBundle> {
 
 /// Build the tokenizer bundle from GGUF-embedded metadata.
 pub fn load_tokenizer_gguf(gguf: &Gguf) -> Result<TokenizerBundle> {
-    let vocab = forge_engine::gguf_vocab::gguf_vocab(gguf).map_err(|e| anyhow::anyhow!("{e}"))?;
+    let vocab = forge_tokenize::gguf_vocab(gguf).map_err(|e| anyhow::anyhow!("{e}"))?;
     let tokenizer = Tokenizer::from_gguf_vocab(&vocab).map_err(|e| anyhow::anyhow!("{e}"))?;
     let piece = |id: Option<u32>| id.and_then(|i| tokenizer.token_to_piece(i));
     let bos_token = piece(vocab.bos_id);
@@ -214,34 +222,71 @@ pub fn read_descriptor(path: &Path) -> Result<ModelDescriptor> {
     }
 }
 
-/// Bytes the KV cache of this model needs for `kv_pages` pages of
-/// `kv_page_size` tokens in storage mode `quant`, plus per-buffer
-/// pool-granularity rounding headroom. F16/Fp8 reserve the full paged slab.
-/// Rot reserves the full-history packed low-bit region + f16 scales plus a
-/// small residual ring (`residual_window` tokens at f16) — NOT a full f16 slab,
-/// so its KV footprint is ~3.9× (rot4) / ~5× (rot3) below f16.
+/// Oblicza rozmiar puli KV z uwzględnieniem wyrównania każdego bufora.
+/// Tryb Rot rezerwuje historię niskobitową, skale F16 oraz residual ring.
+/// Model z włączonym natywnym MTP otrzymuje dodatkowo jedną parę pełnych slabów F16.
 pub fn kv_pool_bytes(
     desc: &ModelDescriptor,
     kv_page_size: usize,
     kv_pages: usize,
     quant: forge_engine::kv::KvQuant,
-) -> usize {
+    native_mtp: bool,
+) -> Result<usize> {
     let p = &desc.params;
-    let slots = p.n_kv_heads * kv_page_size * kv_pages;
+    let overflow = || anyhow::anyhow!("rozmiar puli KV przekracza zakres usize");
+    let slots = p
+        .kv_cache_heads()
+        .checked_mul(kv_page_size)
+        .and_then(|value| value.checked_mul(kv_pages))
+        .ok_or_else(overflow)?;
     let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
-    let round = |b: usize| b.div_ceil(granularity) * granularity;
-    let per_layer_pair = if let Some(pb) = quant.packed_bytes(p.head_dim) {
-        // Rot: residual ring (f16) + packed low-bit codes (u8) + f16 scales,
-        // K and V per layer. No full-context f16 slab.
-        let ring_slots = quant.ring_slots().unwrap_or(1);
-        let ring = ring_slots * p.n_kv_heads * p.head_dim * quant.slab_dtype().size();
-        2 * round(ring) + 2 * round(slots * pb) + 2 * round(slots * 2)
-    } else {
-        // K and V f16/fp8 slab per layer.
-        let slab = slots * p.head_dim * quant.slab_dtype().size();
-        2 * round(slab)
+    let round = |b: usize| -> Result<usize> {
+        let pages = b / granularity + usize::from(!b.is_multiple_of(granularity));
+        pages.checked_mul(granularity).ok_or_else(overflow)
     };
-    p.block_count * per_layer_pair + 64 * (1 << 20)
+    let per_layer_pair = if let Some(pb) = quant.packed_bytes(p.kv_cache_head_dim())? {
+        // Rot przechowuje residual ring F16, kody niskobitowe i skale F16.
+        let ring_slots = quant.ring_slots().unwrap_or(1);
+        let ring = ring_slots
+            .checked_mul(p.kv_cache_heads())
+            .and_then(|value| value.checked_mul(p.kv_cache_head_dim()))
+            .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
+            .ok_or_else(overflow)?;
+        let packed = slots.checked_mul(pb).ok_or_else(overflow)?;
+        let scales = slots.checked_mul(2).ok_or_else(overflow)?;
+        let ring_pair = 2usize.checked_mul(round(ring)?).ok_or_else(overflow)?;
+        let packed_pair = 2usize.checked_mul(round(packed)?).ok_or_else(overflow)?;
+        let scale_pair = 2usize.checked_mul(round(scales)?).ok_or_else(overflow)?;
+        ring_pair
+            .checked_add(packed_pair)
+            .and_then(|value| value.checked_add(scale_pair))
+            .ok_or_else(overflow)?
+    } else {
+        let slab = slots
+            .checked_mul(p.kv_cache_head_dim())
+            .and_then(|value| value.checked_mul(quant.slab_dtype().size()))
+            .ok_or_else(overflow)?;
+        2usize.checked_mul(round(slab)?).ok_or_else(overflow)?
+    };
+    let mtp_pair = if native_mtp && desc.mtp.is_some() {
+        let slab = slots
+            .checked_mul(p.head_dim)
+            .and_then(|value| value.checked_mul(forge_types::DType::F16.size()))
+            .ok_or_else(overflow)?;
+        2usize.checked_mul(round(slab)?).ok_or_else(overflow)?
+    } else {
+        0
+    };
+    let target_layers = desc
+        .layer_kinds
+        .iter()
+        .filter(|kind| matches!(kind, forge_formats::LayerKind::Attention))
+        .count();
+    target_layers
+        .checked_mul(per_layer_pair)
+        .and_then(|value| value.checked_add(mtp_pair))
+        .and_then(|value| value.checked_add(64 * (1 << 20)))
+        .ok_or_else(overflow)
 }
 
 /// Resolve the sequence pooling for an embedding model path. GGUF carries
@@ -312,10 +357,44 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
     } else {
         let gguf = Gguf::open(path)?;
         let bundle = load_tokenizer_gguf(&gguf)?;
+        let identity = gguf
+            .get_str("general.basename")
+            .or_else(|| gguf.get_str("general.name"))
+            .unwrap_or_default()
+            .to_string();
         drop(gguf);
-        let model = Model::load_gguf(device, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let mut model = Model::load_gguf(device, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+        model.set_gguf_identity(&identity);
         (model, bundle)
     };
+    let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
+    Ok(LoadedModel {
+        model,
+        bundle,
+        chat_template,
+    })
+}
+
+/// Jak `load_model`, ale model jest rozłożony na `devices` jako podział
+/// tensor-parallel. Tokenizer i szablon są jedne — dotyczą modelu, nie rangi.
+pub fn load_model_tp(
+    devices: &[Arc<dyn Device>],
+    path: &Path,
+    cfg: ModelConfig,
+) -> Result<LoadedModel> {
+    if path.is_dir() {
+        anyhow::bail!("podział na rangi czyta na razie wyłącznie pojedynczy plik GGUF");
+    }
+    let gguf = Gguf::open(path)?;
+    let bundle = load_tokenizer_gguf(&gguf)?;
+    let identity = gguf
+        .get_str("general.basename")
+        .or_else(|| gguf.get_str("general.name"))
+        .unwrap_or_default()
+        .to_string();
+    drop(gguf);
+    let mut model = Model::load_tp(devices, path, cfg).map_err(|e| anyhow::anyhow!("{e}"))?;
+    model.set_gguf_identity(&identity);
     let chat_template = bundle.resolve_template(&model.weights.descriptor.arch)?;
     Ok(LoadedModel {
         model,
@@ -327,7 +406,187 @@ pub fn load_model(device: Arc<dyn Device>, path: &Path, cfg: ModelConfig) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forge_formats::{LayerKind, MtpDescriptor};
     use forge_tokenize::{ChatMessage, ChatTemplateEngine};
+
+    fn qwen_hybrid_descriptor(native_mtp: bool) -> ModelDescriptor {
+        let config: HfConfig = HfConfig::from_json_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 4096,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 16,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "intermediate_size": 12288,
+                "vocab_size": 248320,
+                "max_position_embeddings": 262144
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.layer_kinds = [
+            vec![LayerKind::DeltaNet; 48],
+            vec![LayerKind::Attention; 16],
+        ]
+        .concat();
+        if native_mtp {
+            descriptor.mtp = Some(MtpDescriptor {
+                first_block: descriptor.params.block_count,
+                block_count: 1,
+                layers: vec![Default::default()],
+                share_target_embedding: true,
+                share_target_output: true,
+            });
+        }
+        descriptor
+    }
+
+    #[test]
+    fn pula_kv_qwen_4096_bez_mtp_ma_320_mib() {
+        let descriptor = qwen_hybrid_descriptor(false);
+
+        let bytes =
+            kv_pool_bytes(&descriptor, 32, 128, forge_engine::kv::KvQuant::F16, false).unwrap();
+
+        assert_eq!(bytes, 320 << 20);
+    }
+
+    #[test]
+    fn pula_kv_qwen_4096_z_mtp_ma_336_mib() {
+        let descriptor = qwen_hybrid_descriptor(true);
+
+        let bytes =
+            kv_pool_bytes(&descriptor, 32, 128, forge_engine::kv::KvQuant::F16, true).unwrap();
+
+        assert_eq!(bytes, 336 << 20);
+    }
+
+    #[test]
+    fn pula_kv_qwen_dla_czterech_kontekstow_ma_1088_mib() {
+        let descriptor = qwen_hybrid_descriptor(false);
+
+        let bytes =
+            kv_pool_bytes(&descriptor, 32, 512, forge_engine::kv::KvQuant::F16, false).unwrap();
+
+        assert_eq!(bytes, 1088 << 20);
+    }
+
+    #[test]
+    fn pula_kv_qwen_dla_64_goracych_stron_ma_192_mib() {
+        let descriptor = qwen_hybrid_descriptor(false);
+
+        let bytes =
+            kv_pool_bytes(&descriptor, 32, 64, forge_engine::kv::KvQuant::F16, false).unwrap();
+
+        assert_eq!(bytes, 192 << 20);
+    }
+
+    #[test]
+    fn pula_kv_odrzuca_przepelnienie_liczby_stron() {
+        let descriptor = qwen_hybrid_descriptor(true);
+
+        let result = kv_pool_bytes(
+            &descriptor,
+            usize::MAX,
+            usize::MAX,
+            forge_engine::kv::KvQuant::F16,
+            true,
+        );
+
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pula_kv_rezerwuje_slab_mtp_tylko_gdy_runtime_jest_wlaczony() {
+        let config: HfConfig = HfConfig::from_json_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 128,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 2,
+                "num_key_value_heads": 2,
+                "head_dim": 64,
+                "intermediate_size": 256,
+                "vocab_size": 1024,
+                "max_position_embeddings": 1024
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.mtp = Some(MtpDescriptor {
+            first_block: descriptor.params.block_count,
+            block_count: 1,
+            layers: vec![Default::default()],
+            share_target_embedding: true,
+            share_target_output: true,
+        });
+        let page_size = 32;
+        let pages = 8;
+        let without_mtp = kv_pool_bytes(
+            &descriptor,
+            page_size,
+            pages,
+            forge_engine::kv::KvQuant::F16,
+            false,
+        )
+        .unwrap();
+        let with_mtp = kv_pool_bytes(
+            &descriptor,
+            page_size,
+            pages,
+            forge_engine::kv::KvQuant::F16,
+            true,
+        )
+        .unwrap();
+        let slots = descriptor.params.n_kv_heads * page_size * pages;
+        let slab = slots * descriptor.params.head_dim * forge_types::DType::F16.size();
+        let granularity = forge_hal::cuda::PoolSizes::DEFAULT_KV_PAGE;
+        let expected_mtp_pair = 2 * slab.div_ceil(granularity) * granularity;
+
+        assert_eq!(with_mtp - without_mtp, expected_mtp_pair);
+    }
+
+    #[test]
+    fn hybrydowa_pula_kv_obejmuje_tylko_warstwy_attention() {
+        let config: HfConfig = HfConfig::from_json_str(
+            r#"{
+                "architectures": ["LlamaForCausalLM"],
+                "model_type": "llama",
+                "hidden_size": 1024,
+                "num_hidden_layers": 64,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 4,
+                "head_dim": 256,
+                "intermediate_size": 2048,
+                "vocab_size": 1024,
+                "max_position_embeddings": 1024
+            }"#,
+        )
+        .unwrap();
+        let mut descriptor = ModelDescriptor::from_hf(&config).unwrap();
+        descriptor.layer_kinds = [
+            vec![LayerKind::DeltaNet; 48],
+            vec![LayerKind::Attention; 16],
+        ]
+        .concat();
+        let page_size = 32;
+        let pages = 4;
+
+        let bytes = kv_pool_bytes(
+            &descriptor,
+            page_size,
+            pages,
+            forge_engine::kv::KvQuant::F16,
+            false,
+        )
+        .unwrap()
+            - 64 * (1 << 20);
+
+        assert_eq!(bytes / (page_size * pages), 64 * 1024);
+    }
 
     #[test]
     fn family_mapping() {

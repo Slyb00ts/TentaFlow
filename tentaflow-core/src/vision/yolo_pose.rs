@@ -159,12 +159,9 @@ fn nms_pose(detections: Vec<PoseDetection>, iou_threshold: f32) -> Vec<PoseDetec
         return detections;
     }
     let mut idx: Vec<usize> = (0..detections.len()).collect();
-    idx.sort_by(|a, b| {
-        detections[*b]
-            .score
-            .partial_cmp(&detections[*a].score)
-            .unwrap_or(std::cmp::Ordering::Equal)
-    });
+    // total_cmp, not partial_cmp: a NaN score makes a partial comparator
+    // inconsistent and the sort panics ("does not implement a total order").
+    idx.sort_by(|a, b| detections[*b].score.total_cmp(&detections[*a].score));
 
     let mut keep = Vec::with_capacity(detections.len());
     let mut suppressed = vec![false; detections.len()];

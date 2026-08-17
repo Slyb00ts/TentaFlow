@@ -18,6 +18,29 @@ def silu_mul_f16(
         out_ptr[i] = Float16(s * Float32(up[i]))
 
 
+def gelu_mul_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    gate: UnsafePointer[Float16, MutAnyOrigin],
+    up: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+):
+    """out = gelu(gate) * up nad n kolejnymi elementami (GeGLU, rodzina Gemma).
+
+    Wariant tanh (`gelu_pytorch_tanh`), bo to on jest w referencji Gemmy — nie
+    dokladny erf. Rozjazd miedzy nimi jest rzedu 1e-3 i widoczny w logitach.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        g = Float32(gate[i])
+        inner = 0.7978845608028654 * (g + 0.044715 * g * g * g)
+        # tanh liczone jako 1 - 2/(exp(2x)+1): przy dużych bramkach (|g| ~ 30,
+        # realne w FFN) exp(2x) przelewa się do inf, a ta postać nasyca się wtedy
+        # do +-1. Wariant (e-1)/(e+1) dawał inf/inf = NaN, co ścieżka int8
+        # kwantyzacji aktywacji zamieniała w ciche śmieci.
+        tanh_inner = 1.0 - 2.0 / (exp(2.0 * inner) + 1.0)
+        out_ptr[i] = Float16(0.5 * g * (1.0 + tanh_inner) * Float32(up[i]))
+
+
 def sigmoid_mul_f16(
     out_ptr: UnsafePointer[Float16, MutAnyOrigin],
     a: UnsafePointer[Float16, MutAnyOrigin],
@@ -50,3 +73,114 @@ def deinterleave_gate_f16(
         base = h * 2 * head_dim + d
         qc[i] = q_full[base]
         gatec[i] = q_full[base + head_dim]
+
+
+def scale_f16(
+    buf: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+    factor: Float32,
+):
+    """buf *= factor w miejscu, nad n elementami f16.
+
+    Potrzebne rodzinie Gemma, która mnoży embedding wejściowy przez
+    `sqrt(hidden)`. Sama norma RMS tego nie widzi (jest niezmiennicza na skalę),
+    ale strumień rezydualny już tak — dlatego to nie jest operacja pusta.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        buf[i] = Float16(Float32(buf[i]) * factor)
+
+
+def scale_f32(
+    buf: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+    factor: Float32,
+):
+    i = Int(global_idx.x)
+    if i < n:
+        buf[i] *= factor
+
+
+def softcap_f32(
+    logits: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+    cap: Float32,
+):
+    """logits = cap * tanh(logits / cap) w miejscu.
+
+    Ograniczenie logitów rodziny Gemma, stosowane po `output_norm`, a przed
+    samplingiem.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        x = Float32(logits[i]) / cap
+        e = exp(2.0 * x)
+        logits[i] = cap * ((e - 1.0) / (e + 1.0))
+
+
+def cast_f16_f32(
+    out_ptr: UnsafePointer[Float32, MutAnyOrigin],
+    src: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+):
+    """out = f32(src) over n elements."""
+    i = Int(global_idx.x)
+    if i < n:
+        out_ptr[i] = Float32(src[i])
+
+
+def cast_f32_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    src: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """out = f16(src) nad n elementami.
+
+    Tensor parallel sumuje wyniki cząstkowe projekcji `down` w f32, bo dodawanie
+    w f16 gubiłoby bity przy każdej karcie. Strumień rezydualny silnika jest
+    natomiast f16 — ten kernel jest jedynym miejscem, gdzie te dwie
+    reprezentacje się spotykają.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        out_ptr[i] = Float16(src[i])
+
+
+def residual_add_f16(
+    h_io: UnsafePointer[Float16, MutAnyOrigin],
+    delta: UnsafePointer[Float16, MutAnyOrigin],
+    n: Int,
+):
+    """h += delta over n elements, summed in f32 and rounded once.
+
+    The catalogue had every FUSED form of this — `rmsnorm_residual_f16`,
+    `gemv_residual_*` — because the engine hand-fuses the residual add into
+    whichever kernel touches the stream next. A vocabulary of separate
+    operations needs the unfused one, and this is it.
+
+    The sum widens to f32 before rounding so that a later fusion pass, which
+    replaces this plus the following norm with `rmsnorm_residual_f16`, produces
+    the SAME residual stream bit for bit rather than a differently rounded one.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        h_io[i] = Float16(Float32(h_io[i]) + Float32(delta[i]))
+
+
+def add_f32_out_f16(
+    out_ptr: UnsafePointer[Float16, MutAnyOrigin],
+    a: UnsafePointer[Float32, MutAnyOrigin],
+    b: UnsafePointer[Float32, MutAnyOrigin],
+    n: Int,
+):
+    """out = f16(a + b) nad n elementami.
+
+    Ogon podziału kolumnowego na dwie karty: suma cząstkowa karty zbierającej
+    plus przysłana suma drugiej karty, od razu zawężona do f16 strumienia
+    rezydualnego. Osobne dodawanie i osobne zawężenie to były dwa uruchomienia na
+    warstwę, czyli 130 na token — przy zmierzonym narzucie rzędu 4,5 us na
+    uruchomienie to więcej niż cała wymiana aktywacji między kartami.
+    """
+    i = Int(global_idx.x)
+    if i < n:
+        out_ptr[i] = Float16(a[i] + b[i])

@@ -510,6 +510,10 @@ pub struct FlowRow {
     pub flow_json: String,
     pub status: String,
     pub published_model_name: Option<String>,
+    /// `#[serde(default)]`: snapshots from a pre-is_system donor decode as
+    /// non-system rows instead of failing the whole baseline import.
+    #[serde(default)]
+    pub is_system: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -730,7 +734,7 @@ fn capture_baseline_snapshot_tx(
     let mut stmt = tx
         .prepare(
             "SELECT id, name, description, is_default, service_type, flow_json, status, \
-                    published_model_name FROM flows",
+                    published_model_name, is_system FROM flows",
         )
         .map_err(map_err)?;
     let flows = stmt
@@ -744,6 +748,7 @@ fn capture_baseline_snapshot_tx(
                 flow_json: r.get(5)?,
                 status: r.get(6)?,
                 published_model_name: r.get(7)?,
+                is_system: r.get(8)?,
             })
         })
         .map_err(map_err)?
@@ -1845,13 +1850,14 @@ fn upsert_donor_rows(
         tx.execute(
             "INSERT INTO flows \
                 (id, name, description, is_default, service_type, flow_json, status, \
-                 published_model_name) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
+                 published_model_name, is_system) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9) \
              ON CONFLICT(id) DO UPDATE SET \
                 name = excluded.name, description = excluded.description, \
                 is_default = excluded.is_default, service_type = excluded.service_type, \
                 flow_json = excluded.flow_json, status = excluded.status, \
-                published_model_name = excluded.published_model_name",
+                published_model_name = excluded.published_model_name, \
+                is_system = excluded.is_system",
             params![
                 f.id,
                 f.name,
@@ -1860,7 +1866,8 @@ fn upsert_donor_rows(
                 f.service_type,
                 f.flow_json,
                 f.status,
-                f.published_model_name
+                f.published_model_name,
+                f.is_system
             ],
         )
         .map_err(map_err)?;

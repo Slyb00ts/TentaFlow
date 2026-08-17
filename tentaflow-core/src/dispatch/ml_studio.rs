@@ -3,6 +3,14 @@
 // Projects slice: list/create/detail plus the fixed project-type catalogue.
 // Identity (owner/org) comes from the request `HandlerContext` (UserSession +
 // org context); ML Studio data lives in its own `ml_studio.db`.
+//
+// Wire policy split: a project role mapped into ML Studio by a Project Studio
+// link is worthless if the wire gate still demands Power User — a tester
+// mirrored as an ML viewer would hold a membership they could never use. READ
+// handlers therefore run at `UserSession` and carry their own membership check
+// (`require_project_member`, or a repository call that joins `project_members`);
+// every MUTATING handler stays at `PowerUser`. Each read handler documents the
+// check it relies on.
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
@@ -15,6 +23,8 @@ use tentaflow_protocol::{
 
 use super::HandlerContext;
 use crate::ml_studio::build_recog_dataset;
+use crate::ml_studio::import_recordings;
+use crate::ml_studio::project_archive;
 use crate::ml_studio::models::{
     Dataset, ModelSummary, ProjectMember, ProjectRole, ProjectSummary, ProjectType, ResourceGrant,
     TrainingRunSummary,
@@ -118,7 +128,9 @@ fn action_err(e: anyhow::Error) -> ProtocolError {
 }
 
 #[handler(variant = "MlStudioProjectsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only and scoped to the caller's own memberships (`list_projects`
+/// joins `project_members`).
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_projects_list(
     req: &MessageBody,
@@ -175,7 +187,9 @@ pub fn ml_studio_project_create(
 }
 
 #[handler(variant = "MlStudioProjectDetailRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; `get_project` joins `project_members`, so a non-member gets
+/// NotFound.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_detail(
     req: &MessageBody,
@@ -201,7 +215,10 @@ pub fn ml_studio_project_detail(
 }
 
 #[handler(variant = "MlStudioProjectTypesListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only static catalog with no project data. It has to be reachable
+/// below Power User because the Project Studio "create ML project" window is a
+/// project-manager action and needs the type list to render at all.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_types_list(
     req: &MessageBody,
@@ -273,7 +290,8 @@ fn require_project_member(user_id: &str, project_id: &str) -> Result<(), Protoco
 }
 
 #[handler(variant = "MlStudioProjectMembersListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; the `get_project` lookup above enforces membership.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_project_members_list(
     req: &MessageBody,
@@ -1406,7 +1424,8 @@ pub fn ml_studio_recog_build_status(
 }
 
 #[handler(variant = "MlStudioDatasetsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; `list_datasets` enforces membership in the repository.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_datasets_list(
     req: &MessageBody,
@@ -1939,7 +1958,8 @@ fn to_model(m: ModelSummary) -> tentaflow_protocol::MlStudioModelSummary {
 }
 
 #[handler(variant = "MlStudioTrainingRunsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; guarded by `require_project_member`.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_training_runs_list(
     req: &MessageBody,
@@ -2116,7 +2136,8 @@ fn reconcile_local_inference_status(
 }
 
 #[handler(variant = "MlStudioModelsListRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Read-only; guarded by `require_project_member`.
+#[policy(UserSession)]
 #[observed]
 pub fn ml_studio_models_list(
     req: &MessageBody,
@@ -2502,7 +2523,14 @@ pub async fn ml_studio_distill_generate_status(
 }
 
 #[handler(variant = "MlStudioFtTrainStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Guarded by `require_project_member` on the run's project. Not read-only: the
+/// poll is also the reconcile point of the training run, so it mirrors the
+/// TRAINER's state into the row (mesh sync phase, a remote node that stopped
+/// answering, metrics of a remote run). Every written value is derived from the
+/// trainer, never from the request — the payload only names a run — so a viewer
+/// polling it cannot steer the outcome, and running the reconcile only on the
+/// run owner's poll would freeze the status of every other member's view.
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_ft_train_status(
     req: &MessageBody,
@@ -2945,7 +2973,14 @@ pub async fn ml_studio_recog_train_start(
 }
 
 #[handler(variant = "MlStudioRecogTrainStatusRequest", since = (1, 0))]
-#[policy(PowerUser)]
+/// Guarded by `require_project_member` on the run's project. Not read-only: the
+/// poll is also the reconcile point of the training run, so it mirrors the
+/// TRAINER's state into the row (mesh sync phase, a remote node that stopped
+/// answering, metrics of a remote run). Every written value is derived from the
+/// trainer, never from the request — the payload only names a run — so a viewer
+/// polling it cannot steer the outcome, and running the reconcile only on the
+/// run owner's poll would freeze the status of every other member's view.
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_recog_train_status(
     req: &MessageBody,
@@ -3040,6 +3075,7 @@ pub async fn ml_studio_recog_train_status(
     let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
         .ok()
         .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    reconcile_orphan_local_run(&mut run, run_node.as_deref(), &local_node);
     if let Some(node) = run_node.filter(|n| *n != local_node) {
         if run.status == "running" {
             if let Some(iroh) = ctx.state.quic_mesh.clone() {
@@ -3176,17 +3212,6 @@ pub async fn ml_studio_classifier_train_start(
     }
     // Treść atrybutu i wartości trafia po stronie serwisu do metadanych/ścieżek —
     // whitelist znaków, bez pustych i `.`/`..`/separatorów ścieżek (path traversal).
-    let is_valid_ml_name = |s: &str| -> bool {
-        let t = s.trim();
-        if t.is_empty() || t == "." || t == ".." {
-            return false;
-        }
-        let n = s.chars().count();
-        n >= 1
-            && n <= 64
-            && s.chars()
-                .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
-    };
     if !is_valid_ml_name(&payload.attribute) {
         return Err(ProtocolError::bad_request(
             "attribute zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
@@ -3333,8 +3358,306 @@ pub async fn ml_studio_classifier_train_start(
     ))
 }
 
-#[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
+/// Domyka run OSIEROCONY przez restart Core. Pętla nadzoru treningu żyje w
+/// procesie, który ją wystartował — po restarcie nikt nie domknie wiersza, a UI
+/// pokazywałoby wieczne „trening trwa" i nie dałoby się nawet anulować (job
+/// serwisu jest nieznany). Warunek jest jednoznaczny, bez heurystyk czasowych:
+/// run lokalny, w stanie `running`, bez markera nadzoru w TYM procesie i bez
+/// transferu datasetu przez mesh w toku. Zwraca `true`, gdy run został domknięty.
+fn reconcile_orphan_local_run(
+    run: &mut repository::TrainingRunRow,
+    run_node: Option<&str>,
+    local_node: &str,
+) -> bool {
+    if run.status != "running" {
+        return false;
+    }
+    if run_node.is_some_and(|n| n != local_node) {
+        return false;
+    }
+    if crate::ml_studio::live_view::is_local_run_live(&run.run_id) {
+        return false;
+    }
+    if crate::ml_studio::train_recognition::recog_sync_progress(&run.run_id).is_some() {
+        return false;
+    }
+    let _ = repository::set_training_run_error(
+        &run.run_id,
+        "trening przerwany przez restart TentaFlow — uruchom go ponownie",
+    );
+    let _ = repository::update_training_run_status(&run.run_id, "failed");
+    run.status = "failed".to_string();
+    true
+}
+
+/// Nazwa atrybutu / klasy / wartości bezpieczna do przekazania serwisowi
+/// treningowemu: trafia u niego do metadanych i ŚCIEŻEK, więc whitelist znaków,
+/// bez pustych i bez `.`/`..`/separatorów ścieżek (path traversal).
+fn is_valid_ml_name(s: &str) -> bool {
+    let t = s.trim();
+    if t.is_empty() || t == "." || t == ".." {
+        return false;
+    }
+    let n = s.chars().count();
+    n >= 1
+        && n <= 64
+        && s.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-' | ' '))
+}
+
+#[handler(variant = "MlStudioOcrTrainStartRequest", since = (1, 0))]
 #[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_ocr_train_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::OcrTrainStartRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioOcrTrainStartRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    repository::get_project(&org.user_id, &payload.project_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "project not found"))?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    // Atrybut i klasa źródłowa trafiają po stronie serwisu do metadanych/ścieżek —
+    // whitelist znaków, bez pustych i `.`/`..`/separatorów ścieżek.
+    if !is_valid_ml_name(&payload.attribute) {
+        return Err(ProtocolError::bad_request(
+            "attribute zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+        ));
+    }
+    if !payload.source_class.is_empty() && !is_valid_ml_name(&payload.source_class) {
+        return Err(ProtocolError::bad_request(
+            "source_class zawiera niedozwolone znaki (dozwolone: [A-Za-z0-9_.- ], 1-64 znaki)",
+        ));
+    }
+    let hp = &payload.hyperparams;
+    if hp.epochs < 1 || hp.batch_size < 1 || hp.learning_rate <= 0.0 {
+        return Err(ProtocolError::bad_request(
+            "epochs i batch_size muszą być >= 1, a learning_rate > 0",
+        ));
+    }
+    if hp.synthetic_per_epoch < 0 || hp.real_repeat < 1 {
+        return Err(ProtocolError::bad_request(
+            "synthetic_per_epoch nie może być ujemne, a real_repeat musi być >= 1",
+        ));
+    }
+    // Syntetyk bez katalogu ADR uczyłby się wyłącznie losowych cyfr — to cicha
+    // utrata jakości, więc odmawiamy zamiast startować gorszy trening.
+    if hp.synthetic_per_epoch > 0 && crate::ml_studio::train_ocr::adr_pairs_json().is_empty() {
+        return Err(ProtocolError::bad_request(
+            "brak katalogu ADR (adr-list.json w katalogu modeli wizji) — dodaj go albo ustaw liczbę próbek syntetycznych na 0",
+        ));
+    }
+
+    // Mesh-distributed: węzeł docelowy. Pusty/local → trening lokalny.
+    let local_node = ctx.state.local_node_id.to_string();
+    let target_node = {
+        let t = payload.target_node_id.trim();
+        if t.is_empty() || t == local_node {
+            None
+        } else {
+            Some(t.to_string())
+        }
+    };
+
+    let hyperparams_json = serde_json::json!({
+        "epochs": hp.epochs,
+        "batch_size": hp.batch_size,
+        "learning_rate": hp.learning_rate,
+        "synthetic_per_epoch": hp.synthetic_per_epoch,
+        "real_repeat": hp.real_repeat,
+    });
+    let config_json = serde_json::json!({
+        "kind": "ocr",
+        "attribute": payload.attribute,
+        "source_class": payload.source_class,
+        "dataset_id": payload.dataset_id,
+        "node_id": target_node.clone().unwrap_or_else(|| local_node.clone()),
+        "hyperparams": hyperparams_json,
+    })
+    .to_string();
+
+    let run_id =
+        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+
+    let target_was_remote = target_node.is_some();
+    match target_node {
+        None => {
+            crate::ml_studio::train_ocr::spawn_ocr_training(
+                run_id.clone(),
+                payload.project_id.clone(),
+                org.user_id.clone(),
+                payload.dataset_id.clone(),
+                payload.attribute.clone(),
+                payload.source_class.clone(),
+                payload.hyperparams.clone(),
+            );
+        }
+        Some(target) => {
+            // Trening ZDALNY (Node B): dataset COCO → mesh (content-addr po hashu),
+            // po zmaterializowaniu start treningu OCR na B (kind="ocr").
+            let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+                .map_err(db_err)?
+                .ok_or_else(|| {
+                    ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found")
+                })?;
+            if dataset.kind != "coco_path" {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(
+                    "trening zdalny wymaga datasetu COCO przez ścieżkę (coco_path) widoczną na węźle B",
+                ));
+            }
+            let raw =
+                repository::get_dataset_raw(&org.user_id, &payload.dataset_id).map_err(db_err)?;
+            let dataset_dir = String::from_utf8_lossy(&raw).trim().to_string();
+            let dataset_hash = crate::ml_studio::train_recognition::coco_content_hash(
+                std::path::Path::new(&dataset_dir),
+            )
+            .map_err(|e| ProtocolError::bad_request(format!("hash datasetu: {}", e)))?;
+            let spec_json = serde_json::json!({
+                "kind": "ocr",
+                "dataset_dir": format!("mesh:{}", dataset_hash),
+                "dataset_hash": dataset_hash,
+                "attribute": payload.attribute,
+                "source_class": payload.source_class,
+                "output_dir": format!("ocr/{}/{}", payload.project_id, run_id),
+                "hyperparams": hyperparams_json,
+            })
+            .to_string();
+
+            let iroh = ctx.state.quic_mesh.clone().ok_or_else(|| {
+                ProtocolError::internal("mesh transport not available on this node")
+            })?;
+            let security = ctx.state.mesh_security.as_ref().ok_or_else(|| {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                ProtocolError::internal(
+                    "mesh security niedostępny — nie można zweryfikować zaufania peera",
+                )
+            })?;
+            if !security.is_trusted(&target) {
+                let _ = repository::update_training_run_status(&run_id, "failed");
+                return Err(ProtocolError::bad_request(format!(
+                    "peer {} is not trusted",
+                    target
+                )));
+            }
+
+            let _ = repository::update_training_run_status(&run_id, "syncing");
+            crate::ml_studio::train_recognition::spawn_mesh_dataset_push_and_train(
+                iroh,
+                target,
+                run_id.clone(),
+                dataset_dir,
+                dataset_hash,
+                spec_json,
+            );
+        }
+    }
+
+    let start_status = if target_was_remote {
+        "syncing"
+    } else {
+        "running"
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::OcrTrainStartResponse(
+            tentaflow_protocol::MlStudioOcrTrainStartResponse {
+                run_id,
+                status: start_status.to_string(),
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioTrainCancelRequest", since = (1, 0))]
+/// Anuluje TRWAJĄCY run treningowy — wspólne wejście dla wszystkich torów.
+/// Kolejność jest istotna: najpierw flaga w Core (widzą ją pętle nadzoru i pętla
+/// transferu datasetu przez mesh), potem `/cancel` na serwisie treningowym. Gdy
+/// trening biegnie na węźle B, żądanie idzie tam komendą mesh — flaga na A i tak
+/// domknie run po stronie inicjatora, więc nieosiągalny węzeł B nie zostawia
+/// runu na wieki w stanie `running`.
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_train_cancel(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::TrainCancelRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioTrainCancelRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let run = repository::get_training_run(&payload.run_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "run not found"))?;
+    require_project_editor(&org.user_id, &run.project_id)?;
+
+    // Run już domknięty — nie ma czego anulować (i nie jest to błąd wołającego).
+    if !matches!(run.status.as_str(), "running" | "syncing") {
+        return Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::TrainCancelResponse(tentaflow_protocol::MlStudioTrainCancelResponse {
+                run_id: payload.run_id.clone(),
+                status: run.status,
+                cancelled: false,
+            }),
+        ));
+    }
+
+    crate::ml_studio::live_view::request_cancel(&payload.run_id);
+
+    let local_node = ctx.state.local_node_id.to_string();
+    let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
+        .ok()
+        .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    match run_node.filter(|n| *n != local_node) {
+        Some(node) => {
+            if let Some(iroh) = ctx.state.quic_mesh.clone() {
+                let cmd = tentaflow_protocol::mesh::MeshCommandType::MlTrainCancel {
+                    run_id: payload.run_id.clone(),
+                };
+                if let Err(e) = iroh.send_command_and_wait(&node, cmd, 30).await {
+                    // Węzeł B nieosiągalny: flaga na A domknie run przy najbliższym
+                    // obiegu, więc logujemy i idziemy dalej zamiast zwracać błąd.
+                    tracing::warn!(run_id = %payload.run_id, node = %node, error = %e,
+                        "mesh train cancel nie dotarł do węzła treningowego");
+                }
+            }
+        }
+        None => {
+            crate::ml_studio::live_view::cancel_local_job(&payload.run_id).await;
+        }
+    }
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::TrainCancelResponse(tentaflow_protocol::MlStudioTrainCancelResponse {
+            run_id: payload.run_id.clone(),
+            status: "cancelling".to_string(),
+            cancelled: true,
+        }),
+    ))
+}
+
+#[handler(variant = "MlStudioGenericTrainStatusRequest", since = (1, 0))]
+/// Guarded by `require_project_member` on the run's project. Not read-only: the
+/// poll is also the reconcile point of the training run, so it mirrors the
+/// TRAINER's state into the row (mesh sync phase, a remote node that stopped
+/// answering, metrics of a remote run). Every written value is derived from the
+/// trainer, never from the request — the payload only names a run — so a viewer
+/// polling it cannot steer the outcome, and running the reconcile only on the
+/// run owner's poll would freeze the status of every other member's view.
+#[policy(UserSession)]
 #[observed]
 pub async fn ml_studio_generic_train_status(
     req: &MessageBody,
@@ -3420,6 +3743,7 @@ pub async fn ml_studio_generic_train_status(
     let run_node = serde_json::from_str::<serde_json::Value>(&run.config_json)
         .ok()
         .and_then(|c| c.get("node_id")?.as_str().map(String::from));
+    reconcile_orphan_local_run(&mut run, run_node.as_deref(), &local_node);
     if let Some(node) = run_node.filter(|n| *n != local_node) {
         if run.status == "running" {
             if let Some(iroh) = ctx.state.quic_mesh.clone() {
@@ -5057,6 +5381,56 @@ fn stage_into_vision_dir(
     Ok((sha256, temp))
 }
 
+/// Wstawia wytrenowany czytnik OCR do katalogu modeli wizji pod nazwami, których
+/// szuka runtime (`adr_ocr.onnx` + `adr_ocr_alphabet.txt`). Oba pliki są najpierw
+/// stage'owane, a promowane dopiero gdy OBA się skopiowały — inaczej awaria w
+/// połowie zostawiłaby model nowy, a alfabet stary (CTC dekodowałby wtedy cyframi
+/// z innego zestawu, czyli po cichu bzdury).
+#[cfg(not(any(target_os = "macos", target_os = "ios")))]
+async fn publish_ocr_reader(metrics: &serde_json::Value) -> Result<(), String> {
+    const MODEL_FILE: &str = "adr_ocr.onnx";
+    const ALPHABET_FILE: &str = "adr_ocr_alphabet.txt";
+
+    let pick = |key: &str| -> Result<std::path::PathBuf, String> {
+        let raw = metrics
+            .get(key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| format!("model bez `{key}` — eksport nie zapisał artefaktu"))?;
+        contained_artifact_file(std::path::Path::new(raw))
+    };
+    let onnx = pick("onnx_path")?;
+    let alphabet = pick("alphabet_path")?;
+
+    let staged = tokio::task::spawn_blocking(
+        move || -> anyhow::Result<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+            let mut out = Vec::new();
+            for (src, name) in [(onnx, MODEL_FILE), (alphabet, ALPHABET_FILE)] {
+                let (_sha, temp) = stage_into_vision_dir(&src, name)?;
+                out.push((temp, crate::paths::vision_models_dir().join(name)));
+            }
+            Ok(out)
+        },
+    )
+    .await
+    .map_err(|e| format!("kopiowanie artefaktów OCR: {e}"))?
+    .map_err(|e| format!("kopiowanie artefaktów OCR: {e:#}"))?;
+
+    for (temp, final_path) in &staged {
+        if let Err(e) = std::fs::rename(temp, final_path) {
+            // Sprzątamy wszystkie stage'e — częściowa promocja jest gorsza niż brak.
+            for (t, _) in &staged {
+                let _ = std::fs::remove_file(t);
+            }
+            return Err(format!(
+                "promocja {} nieudana: {e}",
+                final_path.file_name().unwrap_or_default().to_string_lossy()
+            ));
+        }
+    }
+    Ok(())
+}
+
 #[handler(variant = "MlStudioVisionModelPublishRequest", since = (1, 0))]
 #[policy(PowerUser)]
 #[observed]
@@ -5086,13 +5460,6 @@ pub async fn ml_studio_vision_model_publish(
         ))
     };
 
-    // The registry name becomes the on-disk file name — validate it with the
-    // repository rule BEFORE any export/filesystem work so `../x` never
-    // reaches a `Path::join`.
-    if let Err(e) = crate::db::repository::validate_vision_model_name(&payload.model_name) {
-        return respond(false, Some(e));
-    }
-
     let metrics: serde_json::Value = serde_json::from_str(&model.metrics_json)
         .map_err(|e| ProtocolError::internal(format!("stored metrics corrupt: {}", e)))?;
 
@@ -5112,6 +5479,48 @@ pub async fn ml_studio_vision_model_publish(
                 "artefakty modelu żyją na węźle '{node}' — uruchom publikację na tym węźle"
             )),
         );
+    }
+
+    // Czytnik OCR NIE idzie przez rejestr vision: runtime (`vision::adr_ocr`)
+    // ładuje go po STAŁYCH nazwach plików z katalogu modeli wizji, nie po nazwie
+    // w rejestrze ani aliasie. Publikacja to więc podmiana tych dwóch plików —
+    // model bez alfabetu jest bezużyteczny, więc lecą razem.
+    if model.framework == "ocr-crnn" {
+        // Apple nie ma tego czytnika: `vision::adr_ocr` jest tam wycięty
+        // (`cfg(not(macos|ios))`), bo OCR pokrywa `apple_ocr`. Podmiana plików nie
+        // miałaby czego uruchomić, więc odmawiamy wprost zamiast zapisywać model,
+        // którego nic nie wczyta.
+        #[cfg(any(target_os = "macos", target_os = "ios"))]
+        {
+            return respond(
+                false,
+                Some(
+                    "czytnik ADR nie jest dostępny na macOS/iOS (OCR idzie przez apple_ocr) \
+                     — opublikuj go na węźle z tą ścieżką wizji"
+                        .to_string(),
+                ),
+            );
+        }
+        #[cfg(not(any(target_os = "macos", target_os = "ios")))]
+        {
+            return match publish_ocr_reader(&metrics).await {
+                Ok(()) => {
+                    // Proces trzyma silnik w cache; bez zrzucenia go operator
+                    // widziałby sukces i stare odczyty aż do restartu.
+                    crate::vision::adr_ocr::invalidate();
+                    respond(true, None)
+                }
+                Err(e) => respond(false, Some(e)),
+            };
+        }
+    }
+
+    // Nazwa w rejestrze staje się nazwą pliku na dysku — waliduj regułą repozytorium
+    // ZANIM ruszy eksport czy zapis, żeby `../x` nigdy nie doszło do `Path::join`.
+    // Sprawdzane dopiero tutaj, bo tor OCR wyżej rejestru w ogóle nie używa (ładuje
+    // się po stałych nazwach plików) i nie ma po co wymagać od niego nazwy.
+    if let Err(e) = crate::db::repository::validate_vision_model_name(&payload.model_name) {
+        return respond(false, Some(e));
     }
 
     let (expected_op, contract) = match model.framework.as_str() {
@@ -5369,4 +5778,996 @@ fn set_export_status_running(metrics: &serde_json::Value) -> String {
         obj.remove(key);
     }
     root.to_string()
+}
+
+// =============================================================================
+// Project export / import + recordings import — dispatch glue over the core
+// modules `project_archive` (export/import as a self-contained ZIP) and
+// `import_recordings` (TentaVision frames → recognition dataset).
+// =============================================================================
+
+/// Signed-URL lifetime for a finished export archive. Matches the export
+/// retention window so a link never outlives the file it points at.
+const EXPORT_URL_TTL_SECS: u64 = 7 * 24 * 3600;
+/// Export archives are deleted after this age (== the max signed-URL TTL).
+const EXPORT_RETENTION: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
+
+// Upload staging caps for a streamed-to-disk project import archive. Distinct
+// from `UPLOAD_ACCUM`/`STAGE_ACCUM`: no chunk bytes are ever held in RAM.
+const MAX_ARCHIVE_UPLOAD_BYTES: u64 = 32 * 1024 * 1024 * 1024;
+const MAX_ARCHIVE_UPLOAD_CHUNKS: u32 = 200_000;
+const ARCHIVE_UPLOAD_TTL: std::time::Duration = std::time::Duration::from_secs(6 * 3600);
+const ARCHIVE_CONSUMED_TTL: std::time::Duration = std::time::Duration::from_secs(24 * 3600);
+const MAX_ARCHIVE_UPLOADS_PER_USER: usize = 2;
+
+/// One in-flight (or recently consumed) import upload. Holds NO payload bytes —
+/// each chunk is appended straight to `path` on disk. `next_seq` is the strict
+/// sequential cursor; `last_chunk_len` guards the idempotent re-send of the
+/// previous chunk; `consumed` is set once `apply` handed the file to an import
+/// job so the file survives until the consumed TTL and can no longer be reused.
+struct ArchiveUpload {
+    owner_user_id: String,
+    display_filename: String,
+    path: std::path::PathBuf,
+    total_chunks: u32,
+    next_seq: u32,
+    received_bytes: u64,
+    last_chunk_len: usize,
+    consumed: bool,
+    last_touch: std::time::Instant,
+}
+
+static ARCHIVE_UPLOADS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, ArchiveUpload>>,
+> = std::sync::OnceLock::new();
+
+fn archive_uploads() -> &'static std::sync::Mutex<std::collections::HashMap<String, ArchiveUpload>> {
+    ARCHIVE_UPLOADS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+// job_id → export_ref, so the status handler can build the download path and
+// mint the signed URL for a finished export (the core progress map carries only
+// project/owner identity, not the archive ref).
+static EXPORT_REFS: std::sync::OnceLock<
+    std::sync::Mutex<std::collections::HashMap<String, String>>,
+> = std::sync::OnceLock::new();
+
+fn export_refs() -> &'static std::sync::Mutex<std::collections::HashMap<String, String>> {
+    EXPORT_REFS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// Reduces a client-supplied filename to a safe display string: ASCII
+/// alphanumerics plus `.-_ `, capped at 200 chars. Never used as an on-disk
+/// name — the staged file is always a server-generated `mlsimp_<uuid>`.
+fn sanitize_display_filename(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' '))
+        .take(200)
+        .collect();
+    let trimmed = cleaned.trim().to_string();
+    if trimmed.is_empty() {
+        "archive.zip".to_string()
+    } else {
+        trimmed
+    }
+}
+
+/// Appends one chunk to the on-disk staging file. Called under the uploads
+/// mutex so the file offset stays consistent with the `next_seq` invariant.
+fn append_archive_chunk(path: &std::path::Path, bytes: &[u8]) -> Result<(), ProtocolError> {
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .append(true)
+        .open(path)
+        .map_err(|e| ProtocolError::internal(format!("open staging file: {e}")))?;
+    f.write_all(bytes)
+        .map_err(|e| ProtocolError::internal(format!("append chunk: {e}")))?;
+    Ok(())
+}
+
+/// Evicts stale uploads (deleting their temp files) and sweeps the staging dir
+/// for files orphaned by a restart (the map is in-memory only). Run on every
+/// chunk, under the uploads mutex.
+fn reap_archive_uploads(map: &mut std::collections::HashMap<String, ArchiveUpload>) {
+    let now = std::time::Instant::now();
+    let stale: Vec<String> = map
+        .iter()
+        .filter(|(_, e)| {
+            let ttl = if e.consumed {
+                ARCHIVE_CONSUMED_TTL
+            } else {
+                ARCHIVE_UPLOAD_TTL
+            };
+            now.duration_since(e.last_touch) >= ttl
+        })
+        .map(|(id, _)| id.clone())
+        .collect();
+    for id in stale {
+        if let Some(e) = map.remove(&id) {
+            let _ = std::fs::remove_file(&e.path);
+        }
+    }
+
+    // A restart loses the map but not the files: delete any `mlsimp_*` in the
+    // staging dir that no live entry references.
+    let referenced: std::collections::HashSet<std::path::PathBuf> =
+        map.values().map(|e| e.path.clone()).collect();
+    if let Ok(rd) = std::fs::read_dir(crate::paths::ml_studio_import_staging_dir()) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let is_ours = p
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with("mlsimp_"))
+                .unwrap_or(false);
+            if is_ours && !referenced.contains(&p) {
+                let _ = std::fs::remove_file(&p);
+            }
+        }
+    }
+}
+
+/// Deletes export archives older than the retention window. Run on export start
+/// so finished-but-abandoned archives never accumulate on the cache disk.
+fn reap_export_archives() {
+    let now = std::time::SystemTime::now();
+    if let Ok(rd) = std::fs::read_dir(crate::paths::ml_studio_exports_dir()) {
+        for entry in rd.flatten() {
+            let p = entry.path();
+            if p.extension().and_then(|e| e.to_str()) != Some("zip") {
+                continue;
+            }
+            if let Ok(age) = entry
+                .metadata()
+                .and_then(|m| m.modified())
+                .and_then(|modified| now.duration_since(modified).map_err(std::io::Error::other))
+            {
+                if age >= EXPORT_RETENTION {
+                    let _ = std::fs::remove_file(&p);
+                }
+            }
+        }
+    }
+}
+
+#[handler(variant = "MlStudioProjectExportStartRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_export_start(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectExportStartRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectExportStartRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    require_project_owner(&org.user_id, &payload.project_id)?;
+    reap_export_archives();
+
+    let export_ref = format!("mlsexp_{}", uuid::Uuid::new_v4());
+    let dest = crate::api::ml_studio_export::export_archive_path(&export_ref);
+    let opts = project_archive::ExportOptions {
+        include_models: payload.include_models,
+        include_history: payload.include_history,
+    };
+    let job_id = project_archive::spawn_export(
+        payload.project_id.clone(),
+        org.user_id.clone(),
+        opts,
+        dest,
+    )
+    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    export_refs()
+        .lock()
+        .unwrap()
+        .insert(job_id.clone(), export_ref);
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectExportStartResponse(
+            tentaflow_protocol::MlStudioProjectExportStartResponse { job_id },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectExportStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_export_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectExportStatusRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectExportStatusRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    // Authorize on the job's stored owner — never the bare job id.
+    let progress = project_archive::job_progress(&payload.job_id)
+        .filter(|p| p.owner_user_id == org.user_id)
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "export job not found"))?;
+
+    let mut export_ref: Option<String> = None;
+    let mut signed_url: Option<String> = None;
+    let mut archive_bytes: Option<u64> = None;
+    if progress.status == "succeeded" {
+        if let Some(ref_id) = export_refs().lock().unwrap().get(&payload.job_id).cloned() {
+            let path = crate::api::ml_studio_export::export_archive_path(&ref_id);
+            if path.is_file() {
+                let issuer = crate::services::ml_studio_export_url_issuer();
+                match issuer.issue(ref_id.clone(), EXPORT_URL_TTL_SECS) {
+                    Ok(signed) => {
+                        signed_url = Some(format!(
+                            "/ml-studio/exports/{}?{}",
+                            ref_id,
+                            signed.query_string()
+                        ));
+                    }
+                    Err(e) => {
+                        tracing::warn!("ml studio export mint signed url failed: {e}");
+                    }
+                }
+                archive_bytes = Some(progress.bytes_done);
+                export_ref = Some(ref_id);
+            }
+        }
+    }
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectExportStatusResponse(
+            tentaflow_protocol::MlStudioProjectExportStatusResponse {
+                status: progress.status,
+                phase: progress.phase,
+                files_total: progress.files_total,
+                files_done: progress.files_done,
+                bytes_total: progress.bytes_total,
+                bytes_done: progress.bytes_done,
+                error: progress.error,
+                export_ref,
+                signed_url,
+                archive_bytes,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectImportUploadChunkRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_import_upload_chunk(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectImportUploadChunkRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectImportUploadChunkRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+
+    if payload.upload_id.trim().is_empty() || payload.upload_id.len() > 128 {
+        return Err(ProtocolError::bad_request("invalid upload_id"));
+    }
+    if payload.total_chunks == 0 || payload.total_chunks > MAX_ARCHIVE_UPLOAD_CHUNKS {
+        return Err(ProtocolError::bad_request("invalid total_chunks"));
+    }
+    if payload.seq >= payload.total_chunks {
+        return Err(ProtocolError::bad_request("chunk seq out of range"));
+    }
+
+    let (received_chunks, received_bytes, complete) = {
+        let mut map = archive_uploads().lock().unwrap();
+        reap_archive_uploads(&mut map);
+
+        let chunk_len = payload.bytes.len();
+        match map.get_mut(&payload.upload_id) {
+            Some(entry) => {
+                // A foreign-owned id must look exactly like an unknown one.
+                if entry.owner_user_id != org.user_id {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        "upload not found",
+                    ));
+                }
+                if entry.consumed {
+                    return Err(ProtocolError::bad_request("upload already consumed"));
+                }
+                if entry.total_chunks != payload.total_chunks {
+                    return Err(ProtocolError::bad_request("total_chunks mismatch for upload_id"));
+                }
+                if payload.seq == entry.next_seq {
+                    if entry.received_bytes + chunk_len as u64 > MAX_ARCHIVE_UPLOAD_BYTES {
+                        return Err(ProtocolError::bad_request("upload exceeds size limit"));
+                    }
+                    append_archive_chunk(&entry.path, &payload.bytes)?;
+                    entry.next_seq += 1;
+                    entry.received_bytes += chunk_len as u64;
+                    entry.last_chunk_len = chunk_len;
+                    entry.last_touch = std::time::Instant::now();
+                } else if entry.next_seq > 0 && payload.seq == entry.next_seq - 1 {
+                    // Idempotent re-send of the previous chunk: length-checked, never
+                    // appended a second time.
+                    if chunk_len != entry.last_chunk_len {
+                        return Err(ProtocolError::bad_request("resend length mismatch"));
+                    }
+                    entry.last_touch = std::time::Instant::now();
+                } else {
+                    return Err(ProtocolError::bad_request("out-of-order chunk (hole)"));
+                }
+                (
+                    entry.next_seq,
+                    entry.received_bytes,
+                    entry.next_seq == entry.total_chunks,
+                )
+            }
+            None => {
+                // A new transfer must start at seq 0.
+                if payload.seq != 0 {
+                    return Err(ProtocolError::new(
+                        ProtocolErrorCode::NotFound,
+                        "upload not found",
+                    ));
+                }
+                let non_consumed = map
+                    .values()
+                    .filter(|e| e.owner_user_id == org.user_id && !e.consumed)
+                    .count();
+                if non_consumed >= MAX_ARCHIVE_UPLOADS_PER_USER {
+                    return Err(ProtocolError::bad_request(
+                        "too many concurrent import uploads — finish or cancel one first",
+                    ));
+                }
+                if chunk_len as u64 > MAX_ARCHIVE_UPLOAD_BYTES {
+                    return Err(ProtocolError::bad_request("upload exceeds size limit"));
+                }
+                let staging = crate::paths::ml_studio_import_staging_dir();
+                std::fs::create_dir_all(&staging)
+                    .map_err(|e| ProtocolError::internal(format!("staging dir: {e}")))?;
+                let path = staging.join(format!("mlsimp_{}", uuid::Uuid::new_v4()));
+                std::fs::File::create(&path)
+                    .map_err(|e| ProtocolError::internal(format!("create staging file: {e}")))?;
+                append_archive_chunk(&path, &payload.bytes)?;
+                let entry = ArchiveUpload {
+                    owner_user_id: org.user_id.clone(),
+                    display_filename: sanitize_display_filename(&payload.filename),
+                    path,
+                    total_chunks: payload.total_chunks,
+                    next_seq: 1,
+                    received_bytes: chunk_len as u64,
+                    last_chunk_len: chunk_len,
+                    consumed: false,
+                    last_touch: std::time::Instant::now(),
+                };
+                let out = (
+                    entry.next_seq,
+                    entry.received_bytes,
+                    entry.next_seq == entry.total_chunks,
+                );
+                map.insert(payload.upload_id.clone(), entry);
+                out
+            }
+        }
+    };
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectImportUploadChunkResponse(
+            tentaflow_protocol::MlStudioProjectImportUploadChunkResponse {
+                upload_id: payload.upload_id.clone(),
+                received_chunks,
+                received_bytes,
+                complete,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectImportUploadStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_import_upload_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectImportUploadStatusRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectImportUploadStatusRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let map = archive_uploads().lock().unwrap();
+    // Unknown OR foreign-owned → the same zeroed `exists: false`, so one user's
+    // transfer is never revealed to another.
+    let resp = match map.get(&payload.upload_id) {
+        Some(e) if e.owner_user_id == org.user_id => {
+            tentaflow_protocol::MlStudioProjectImportUploadStatusResponse {
+                upload_id: payload.upload_id.clone(),
+                received_chunks: e.next_seq,
+                received_bytes: e.received_bytes,
+                total_chunks: e.total_chunks,
+                complete: e.next_seq == e.total_chunks,
+                exists: true,
+            }
+        }
+        _ => tentaflow_protocol::MlStudioProjectImportUploadStatusResponse {
+            upload_id: payload.upload_id.clone(),
+            received_chunks: 0,
+            received_bytes: 0,
+            total_chunks: 0,
+            complete: false,
+            exists: false,
+        },
+    };
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectImportUploadStatusResponse(resp),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectImportPreviewRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_import_preview(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectImportPreviewRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectImportPreviewRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let path = {
+        let map = archive_uploads().lock().unwrap();
+        match map.get(&payload.upload_id) {
+            Some(e) if e.owner_user_id == org.user_id => e.path.clone(),
+            _ => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::NotFound,
+                    "upload not found",
+                ))
+            }
+        }
+    };
+
+    let preview = project_archive::preview(&path)
+        .map_err(|e| ProtocolError::bad_request(format!("nie można odczytać archiwum: {e:#}")))?;
+
+    let datasets = preview
+        .datasets
+        .into_iter()
+        .map(|d| tentaflow_protocol::MlStudioImportDatasetInfo {
+            dataset_id: d.dataset_id,
+            name: d.name,
+            image_count: d.image_count,
+            annotation_count: d.annotation_count,
+        })
+        .collect();
+    let missing_artifacts = preview
+        .missing_artifacts
+        .into_iter()
+        .map(|m| tentaflow_protocol::MlStudioImportMissingArtifact {
+            reason: format!("brak artefaktu ({}/{})", m.kind, m.run_id),
+            path: m.expected_path,
+        })
+        .collect();
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectImportPreviewResponse(
+            tentaflow_protocol::MlStudioProjectImportPreviewResponse {
+                project_name: preview.project_name,
+                project_type: preview.project_type,
+                datasets,
+                classes: preview.classes,
+                has_models: preview.has_models,
+                has_history: preview.has_history,
+                total_uncompressed_bytes: preview.total_uncompressed_bytes,
+                missing_artifacts,
+                archive_version: preview.version,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectImportApplyRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_import_apply(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectImportApplyRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectImportApplyRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let (path, display_filename) = {
+        let map = archive_uploads().lock().unwrap();
+        match map.get(&payload.upload_id) {
+            Some(e) if e.owner_user_id == org.user_id => {
+                if e.consumed {
+                    return Err(ProtocolError::bad_request("upload already consumed"));
+                }
+                (e.path.clone(), e.display_filename.clone())
+            }
+            _ => {
+                return Err(ProtocolError::new(
+                    ProtocolErrorCode::NotFound,
+                    "upload not found",
+                ))
+            }
+        }
+    };
+
+    let mode = match payload.mode.as_str() {
+        "new_project" => project_archive::ImportMode::NewProject {
+            name_override: payload
+                .name_override
+                .clone()
+                .filter(|s| !s.trim().is_empty()),
+        },
+        "merge" => {
+            let project_id = payload
+                .target_project_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| ProtocolError::bad_request("merge mode requires target_project_id"))?;
+            let dataset_id = payload
+                .target_dataset_id
+                .clone()
+                .filter(|s| !s.trim().is_empty())
+                .ok_or_else(|| ProtocolError::bad_request("merge mode requires target_dataset_id"))?;
+            require_project_editor(&org.user_id, &project_id)?;
+            project_archive::ImportMode::MergeInto {
+                project_id,
+                dataset_id,
+            }
+        }
+        other => {
+            return Err(ProtocolError::bad_request(format!(
+                "unknown import mode: {other} (expected new_project|merge)"
+            )))
+        }
+    };
+
+    // The org is the caller's session org — NEVER the one recorded in the archive.
+    let job_id = project_archive::spawn_import(path, mode, org.user_id.clone(), org.org_id.clone())
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    tracing::info!(
+        upload_id = %payload.upload_id,
+        file = %display_filename,
+        job_id = %job_id,
+        "ml studio project import started"
+    );
+
+    // Mark consumed so the file survives for the running import, can no longer be
+    // reused or cancelled, and is reaped after the consumed TTL.
+    if let Some(e) = archive_uploads().lock().unwrap().get_mut(&payload.upload_id) {
+        e.consumed = true;
+        e.last_touch = std::time::Instant::now();
+    }
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectImportApplyResponse(
+            tentaflow_protocol::MlStudioProjectImportApplyResponse { job_id },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectImportStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_import_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectImportStatusRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectImportStatusRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let progress = project_archive::job_progress(&payload.job_id)
+        .filter(|p| p.owner_user_id == org.user_id)
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "import job not found"))?;
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::ProjectImportStatusResponse(
+            tentaflow_protocol::MlStudioProjectImportStatusResponse {
+                status: progress.status,
+                phase: progress.phase,
+                files_total: progress.files_total,
+                files_done: progress.files_done,
+                bytes_total: progress.bytes_total,
+                bytes_done: progress.bytes_done,
+                error: progress.error,
+            },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioProjectImportCancelRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_project_import_cancel(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::ProjectImportCancelRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioProjectImportCancelRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let mut map = archive_uploads().lock().unwrap();
+    match map.get(&payload.upload_id) {
+        Some(e) if e.owner_user_id == org.user_id => {
+            if e.consumed {
+                return Err(ProtocolError::bad_request(
+                    "upload already consumed — cannot cancel",
+                ));
+            }
+            let path = e.path.clone();
+            map.remove(&payload.upload_id);
+            let _ = std::fs::remove_file(&path);
+            Ok(MessageBody::MlStudioBody(
+                MlStudioPayload::ProjectImportCancelResponse(
+                    tentaflow_protocol::MlStudioProjectImportCancelResponse { cancelled: true },
+                ),
+            ))
+        }
+        _ => Err(ProtocolError::new(
+            ProtocolErrorCode::NotFound,
+            "upload not found",
+        )),
+    }
+}
+
+/// TTL for the signed clip-preview `/frames/` URLs. Long enough that the import
+/// modal can stay open and lazy-load thumbnails as the user scrolls.
+#[cfg(feature = "camera")]
+const RECORDING_THUMB_TTL_SECS: u64 = 3600;
+
+#[handler(variant = "MlStudioRecordingsListRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub async fn ml_studio_recordings_list(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecordingsListRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecordingsListRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+
+    // Remote source: list a PAIRED node's recordings over the mesh. Both sides
+    // carry unix MILLISECONDS, so no conversion is needed, and the remote item maps
+    // onto the SAME `MlStudioRecordingItem`. A value equal to the local node id
+    // falls through to the local path below.
+    if let Some(node) = payload
+        .source_node_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if crate::sync::runtime::local_node_id().as_deref() != Some(node) {
+            let filters = crate::mesh::recordings_pull::RemoteRecordingFilters {
+                camera_id: payload
+                    .camera_id
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+                date_from_ms: payload.date_from_ms,
+                date_to_ms: payload.date_to_ms,
+                limit: payload.limit.clamp(1, 1000),
+            };
+            let items = crate::mesh::recordings_pull::list_remote(node, filters)
+                .await
+                .map_err(|e| {
+                    ProtocolError::internal(format!(
+                        "nie udało się pobrać listy nagrań z węzła {node}: {e:#}"
+                    ))
+                })?
+                .into_iter()
+                // Clips only, mirroring the local path; a remote node serves its
+                // own `/frames/` surface so no cross-node preview URL is minted.
+                .filter(|r| r.kind == "segment")
+                .map(|r| tentaflow_protocol::MlStudioRecordingItem {
+                    recording_ref: r.recording_ref,
+                    kind: r.kind,
+                    camera_id: r.camera_id,
+                    created_at: r.created_at_ms,
+                    duration_ms: r.duration_ms,
+                    file_size_bytes: r.file_size_bytes,
+                    plate_text: r.plate_text,
+                    adr_text: r.adr_text,
+                    thumb_url: None,
+                })
+                .collect();
+            return Ok(MessageBody::MlStudioBody(
+                MlStudioPayload::RecordingsListResponse(
+                    tentaflow_protocol::MlStudioRecordingsListResponse { items },
+                ),
+            ));
+        }
+    }
+
+    #[cfg(feature = "camera")]
+    {
+        let pool = crate::db::global_pool()
+            .ok_or_else(|| ProtocolError::internal("recordings database unavailable"))?;
+        let limit = payload.limit.clamp(1, 1000);
+        let camera_id = payload.camera_id.as_deref().filter(|s| !s.trim().is_empty());
+        // Wire timestamps are unix MILLISECONDS; the recordings table is SECONDS.
+        let created_from = payload.date_from_ms.map(|ms| ms / 1000);
+        let created_to = payload.date_to_ms.map(|ms| ms / 1000);
+        // Frame import only makes sense for video clips; snapshots (single OCR
+        // frames) are excluded so they don't crowd out clips under the row limit.
+        let filters = crate::db::repository::RecordingListFilters {
+            owner_addon_id: None,
+            kind: Some("segment"),
+            camera_id,
+            created_from,
+            created_to,
+            plate: None,
+            adr: None,
+        };
+        // Recordings are node-global (no project scope); the org boundary stays.
+        let rows =
+            crate::db::repository::list_recordings(&pool, Some(&org.org_id), &filters, limit)
+                .map_err(db_err)?;
+        let items = rows
+            .into_iter()
+            .map(|r| {
+                // Representative preview: the full downscaled scene captured at the
+                // best plate/ADR read of the event, served through the signed
+                // `/frames/<ref>` surface. Falls back to the ADR thumb.
+                let thumb_url = r
+                    .plate_thumb_ref
+                    .as_deref()
+                    .or(r.adr_thumb_ref.as_deref())
+                    .and_then(|thumb_ref| {
+                        crate::services::frame_url_issuer()
+                            .issue(thumb_ref.to_string(), RECORDING_THUMB_TTL_SECS)
+                            .ok()
+                            .map(|url| format!("/frames/{}?{}", thumb_ref, url.query_string()))
+                    });
+                tentaflow_protocol::MlStudioRecordingItem {
+                    recording_ref: r.recording_ref,
+                    kind: r.kind,
+                    camera_id: r.camera_id,
+                    created_at: r.created_at.saturating_mul(1000),
+                    duration_ms: r.duration_ms,
+                    file_size_bytes: r.file_size_bytes,
+                    plate_text: r.plate_text,
+                    adr_text: r.adr_text,
+                    thumb_url,
+                }
+            })
+            .collect();
+        Ok(MessageBody::MlStudioBody(
+            MlStudioPayload::RecordingsListResponse(
+                tentaflow_protocol::MlStudioRecordingsListResponse { items },
+            ),
+        ))
+    }
+    #[cfg(not(feature = "camera"))]
+    {
+        let _ = (payload, org);
+        Err(ProtocolError::new(
+            ProtocolErrorCode::NotImplemented,
+            "recordings require the camera module",
+        ))
+    }
+}
+
+#[handler(variant = "MlStudioRecogImportRecordingsRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_import_recordings(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogImportRecordingsRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogImportRecordingsRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    require_project_editor(&org.user_id, &payload.project_id)?;
+
+    // Resolve `dataset_dir` server-side from the dataset row (never the caller):
+    // it must be a recognition dataset whose `raw_data` is its COCO path.
+    let dataset = repository::get_dataset(&org.user_id, &payload.dataset_id)
+        .map_err(db_err)?
+        .filter(|d| d.project_id == payload.project_id)
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "dataset not found"))?;
+    if dataset.kind != "coco_path" {
+        return Err(ProtocolError::bad_request(
+            "dataset is not a recognition (coco_path) dataset",
+        ));
+    }
+    let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id)
+        .map_err(|e| ProtocolError::bad_request(format!("dataset path unavailable: {e:#}")))?;
+    let dataset_dir =
+        std::path::PathBuf::from(String::from_utf8_lossy(&raw).trim().to_string());
+
+    // `collision`/`fps` are validated on the wire: a bad policy string fails here,
+    // an out-of-range fps fails inside `spawn_import_recordings::validate_spec`.
+    let collision = payload
+        .collision
+        .parse::<import_recordings::CollisionPolicy>()
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    let spec = import_recordings::ImportRecordingsSpec {
+        dataset_id: payload.dataset_id.clone(),
+        project_id: payload.project_id.clone(),
+        owner_user_id: org.user_id.clone(),
+        dataset_dir,
+        recording_refs: payload.recording_refs.clone(),
+        fps: payload.fps,
+        autolabel: payload.autolabel,
+        collision,
+        source_node_id: payload
+            .source_node_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+    };
+    let job_id = import_recordings::spawn_import_recordings(spec)
+        .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogImportRecordingsResponse(
+            tentaflow_protocol::MlStudioRecogImportRecordingsResponse { job_id },
+        ),
+    ))
+}
+
+#[handler(variant = "MlStudioRecogImportRecordingsStatusRequest", since = (1, 0))]
+#[policy(PowerUser)]
+#[observed]
+pub fn ml_studio_recog_import_recordings_status(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let payload = match req {
+        MessageBody::MlStudioBody(MlStudioPayload::RecogImportRecordingsStatusRequest(p)) => p,
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected MlStudioRecogImportRecordingsStatusRequest",
+            ))
+        }
+    };
+    let org = require_org(ctx)?;
+    let progress = import_recordings::import_progress(&payload.job_id)
+        .filter(|p| p.owner_user_id == org.user_id)
+        .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "import job not found"))?;
+
+    let outcomes = progress
+        .outcomes
+        .into_iter()
+        .map(|o| tentaflow_protocol::MlStudioRecordingOutcome {
+            recording_ref: o.recording_ref,
+            frames: o.frames,
+            detections: o.detections,
+            skipped_frames: o.skipped_frames,
+            skipped: o.skipped,
+        })
+        .collect();
+
+    Ok(MessageBody::MlStudioBody(
+        MlStudioPayload::RecogImportRecordingsStatusResponse(
+            tentaflow_protocol::MlStudioRecogImportRecordingsStatusResponse {
+                status: progress.status,
+                phase: progress.phase,
+                recordings_total: progress.recordings_total as u32,
+                recordings_done: progress.recordings_done as u32,
+                frames_extracted: progress.frames_extracted,
+                frames_labeled: progress.frames_labeled,
+                images_added: progress.images_added,
+                detections: progress.detections,
+                error: progress.error,
+                outcomes,
+            },
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod policy_tests {
+    /// Regression guard for the F4 downgrade (project role → ML Studio role).
+    ///
+    /// Mapping a project tester onto an ML viewer is pointless if the wire gate
+    /// still demands Power User: the membership exists but every call bounces.
+    /// The READ handlers therefore run at UserSession — each one enforces its own
+    /// membership check — while every MUTATING handler stays at PowerUser, so a
+    /// mirrored viewer can look at a project and still cannot start a training
+    /// run or upload a dataset.
+    #[test]
+    fn ml_read_handlers_run_below_power_user_and_mutations_do_not() {
+        use crate::dispatch::SessionAuthKind;
+
+        for variant in [
+            "MlStudioProjectsListRequest",
+            "MlStudioProjectDetailRequest",
+            "MlStudioProjectTypesListRequest",
+            "MlStudioProjectMembersListRequest",
+            "MlStudioDatasetsListRequest",
+            "MlStudioTrainingRunsListRequest",
+            "MlStudioModelsListRequest",
+            "MlStudioFtTrainStatusRequest",
+            "MlStudioRecogTrainStatusRequest",
+            "MlStudioGenericTrainStatusRequest",
+        ] {
+            let handler = crate::dispatch::find(variant).expect("handler registered");
+            assert_eq!(
+                handler.required_auth,
+                SessionAuthKind::UserSession,
+                "{variant} must be reachable for a mapped non-power-user member"
+            );
+        }
+
+        for variant in [
+            "MlStudioProjectCreateRequest",
+            "MlStudioProjectInviteRequest",
+            "MlStudioProjectMemberRemoveRequest",
+            "MlStudioProjectMemberRoleSetRequest",
+            "MlStudioDatasetUploadRequest",
+            "MlStudioDatasetUploadChunkRequest",
+            "MlStudioDatasetRowsSaveRequest",
+            "MlStudioFtTrainStartRequest",
+            "MlStudioRecogTrainStartRequest",
+            "MlStudioClassifierTrainStartRequest",
+            "MlStudioOcrTrainStartRequest",
+            "MlStudioTrainCancelRequest",
+            "MlStudioTabularTrainRequest",
+            "MlStudioRecogSaveAnnotationsRequest",
+            "MlStudioVisionModelDeleteRequest",
+            "MlStudioProjectExportStartRequest",
+            "MlStudioProjectImportApplyRequest",
+        ] {
+            let handler = crate::dispatch::find(variant).expect("handler registered");
+            assert_eq!(
+                handler.required_auth,
+                SessionAuthKind::PowerUser,
+                "{variant} mutates ML Studio and must stay behind the Power User gate"
+            );
+        }
+    }
 }

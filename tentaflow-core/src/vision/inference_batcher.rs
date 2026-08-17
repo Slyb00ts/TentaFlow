@@ -15,7 +15,7 @@
 // channel — never by position across cameras. On a batch error every waiter in
 // the batch gets the error; no submitter is ever dropped or left hanging.
 //
-// Scoped to the ort/TensorRT path (`inference-supertonic`): the session pools
+// Scoped to the ort/TensorRT path (`vision-ort`): the session pools
 // are `&self` + Send+Sync and take a batch dim (TRT profile 1..=16), so the
 // worker can call `classify_batch`/`read_batch` straight off its own thread. The
 // Burn/wgpu path must serialize forwards on the single wgpu thread and is left on
@@ -242,7 +242,10 @@ pub(crate) async fn state_batcher() -> Option<&'static InferenceBatcher<Vec<Stri
         let run_batch: Arc<
             dyn Fn(&[(Arc<[u8]>, u32, u32)]) -> Result<Vec<Vec<String>>> + Send + Sync,
         > = Arc::new(move |crops| {
-            #[cfg(any(target_os = "linux", target_os = "windows"))]
+            #[cfg(all(
+                any(target_os = "linux", target_os = "windows"),
+                feature = "vision-cuda-preprocess"
+            ))]
             {
                 let refs: Vec<(&[u8], u32, u32)> =
                     crops.iter().map(|(c, w, h)| (c.as_ref(), *w, *h)).collect();
@@ -251,7 +254,10 @@ pub(crate) async fn state_batcher() -> Option<&'static InferenceBatcher<Vec<Stri
                     classifier.classify_batch(crops)
                 });
             }
-            #[cfg(not(any(target_os = "linux", target_os = "windows")))]
+            #[cfg(not(all(
+                any(target_os = "linux", target_os = "windows"),
+                feature = "vision-cuda-preprocess"
+            )))]
             classifier.classify_batch(crops)
         });
         Some(InferenceBatcher::new(MAX_BATCH, batch_window(), run_batch))

@@ -1,0 +1,468 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Wiedza: Pliki (W04)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* Drobiazgi ekranowe — brak w shared CSS */
+  @keyframes cardIn { from { opacity: 0; transform: translateY(-6px) scale(.98); } to { opacity: 1; transform: none; } }
+
+  .files-layout { display: grid; grid-template-columns: 300px 1fr; gap: 16px; align-items: start; }
+  @media (max-width: 1100px) { .files-layout { grid-template-columns: 1fr; } }
+
+  /* Pasek nad podglądem: ścieżka + status ingestu + akcje */
+  .file-head {
+    background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius);
+    padding: 12px 14px; margin-bottom: 12px; display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  }
+  .file-head .fh-path { font-family: ui-monospace,'JetBrains Mono',monospace; font-size: 12px; color: var(--text-2); }
+  .file-head .fh-path b { color: var(--text); }
+  .file-head .fh-meta { display: flex; gap: 12px; font-size: 11px; color: var(--text-3); flex-wrap: wrap; }
+  .file-head .fh-meta span { display: inline-flex; align-items: center; gap: 5px; }
+  .file-head .fh-actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
+
+  /* Drzewo — status per plik + menu ⋯ */
+  .file-tree .ft-item { position: relative; }
+  .file-tree .ft-item .ft-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .ft-dot { width: 7px; height: 7px; border-radius: 50%; flex-shrink: 0; }
+  .ft-dot.ready { background: var(--success); box-shadow: 0 0 6px rgba(34,197,94,0.7); }
+  .ft-dot.err { background: var(--danger); box-shadow: 0 0 6px rgba(239,68,68,0.7); }
+  .file-tree .ft-item.excluded { opacity: .48; }
+  .file-tree .ft-more {
+    width: 22px; height: 22px; border-radius: 5px; border: 0; background: transparent; color: var(--text-3);
+    display: inline-flex; align-items: center; justify-content: center; cursor: pointer; flex-shrink: 0;
+  }
+  .file-tree .ft-more:hover { background: var(--bg-card); color: var(--text); }
+  .file-tree .ft-more .icon { width: 14px; height: 14px; }
+
+  .ft-tag { font-size: 9px; font-weight: 800; text-transform: uppercase; letter-spacing: .05em;
+    padding: 1px 5px; border-radius: 4px; background: var(--bg-3); color: var(--text-3); flex-shrink: 0; }
+
+  /* Dropdown per-wiersz (prosty absolutny) */
+  .file-menu {
+    position: absolute; top: 26px; right: 4px; width: 196px; background: var(--bg-2);
+    border: 1px solid var(--border-hover); border-radius: var(--radius-sm); box-shadow: var(--shadow-lg);
+    z-index: 20; padding: 4px; animation: cardIn .18s ease;
+  }
+  .file-menu .fm-item { display: flex; align-items: center; gap: 9px; padding: 7px 10px; font-size: 12px;
+    color: var(--text-2); border-radius: var(--radius-sm); cursor: pointer; }
+  .file-menu .fm-item:hover { background: var(--bg-3); color: var(--text); }
+  .file-menu .fm-item.danger { color: var(--danger); }
+  .file-menu .fm-item.danger:hover { background: rgba(239,68,68,0.12); }
+  .file-menu .fm-item .icon { width: 13px; height: 13px; }
+  .file-menu .fm-sep { height: 1px; background: var(--border); margin: 4px 6px; }
+
+  .tree-legend { display: flex; gap: 14px; flex-wrap: wrap; margin-top: 12px; padding-top: 12px;
+    border-top: 1px solid var(--border); font-size: 10.5px; color: var(--text-3); }
+  .tree-legend span { display: inline-flex; align-items: center; gap: 6px; }
+
+  .ingest-note { font-size: 11.5px; color: var(--text-2); line-height: 1.6; }
+  .ingest-note b { color: var(--text); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">W04</span>
+    <h2>Wiedza: Pliki (drzewo + kod)</h2>
+    <div class="desc">Przeglądaj zaindeksowane repozytorium wiedzy: drzewo plików po lewej, kolorowany podgląd po prawej. Widzisz dokładnie, co trafia do bazy wiedzy, i sterujesz indeksacją per plik.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Wiedza</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Testy, dokumentacja i baza wiedzy dla portalu zamówień B2B · utworzono 12.05.2026</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-users"/></svg>6 członków</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Menedżer</b></span>
+              <span class="chip"><svg class="icon"><use href="#i-layers"/></svg>Profil: Testy + Dokumentacja</span>
+              <span class="chip info"><svg class="icon"><use href="#i-book"/></svg>4 źródła wiedzy</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+            <button class="btn"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+          </div>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab active"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-circle"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- Pod-nawigacja Wiedzy + narzędzia -->
+        <div class="subnav-row">
+          <div class="segmented">
+            <button><svg class="icon"><use href="#i-book"/></svg>Źródła</button><!-- otwiera: W01 -->
+            <button><svg class="icon"><use href="#i-search"/></svg>Przeszukaj</button><!-- otwiera: W03 -->
+            <button class="active"><svg class="icon"><use href="#i-file"/></svg>Pliki</button>
+          </div>
+          <div class="flex align-center gap-md" style="margin-left:auto;">
+            <label class="text-xs text-3" for="src-select" style="font-weight:600;">Źródło:</label>
+            <select class="select" id="src-select" style="width:230px;">
+              <option>portal-b2b (repozytorium git)</option>
+              <option>Archiwum: legacy-cart.zip</option>
+            </select>
+            <div class="search-box" style="min-width:210px;">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input type="text" placeholder="Filtruj pliki po nazwie…">
+            </div>
+          </div>
+        </div>
+
+        <!-- Layout 2-kolumnowy: drzewo + podgląd kodu -->
+        <div class="files-layout">
+
+          <!-- LEWA: drzewo plików repo -->
+          <div class="section-card" style="margin-bottom:0;">
+            <div class="section-card-head">
+              <div class="title"><svg class="icon"><use href="#i-git"/></svg>portal-b2b</div>
+              <div class="flex gap-sm align-center">
+                <span class="chip"><svg class="icon"><use href="#i-git"/></svg>main</span>
+                <button class="btn btn-sm" title="Fetch + delta ostatnich zmian"><svg class="icon"><use href="#i-refresh"/></svg>Odśwież</button>
+              </div>
+            </div>
+            <div class="flex" style="margin-bottom:12px;">
+              <button class="btn btn-primary btn-sm" style="width:100%; justify-content:center;"><!-- otwiera: W02 -->
+                <svg class="icon"><use href="#i-plus"/></svg>Dodaj źródło
+              </button>
+            </div>
+
+            <div class="file-tree">
+              <!-- src/ (rozwinięty) -->
+              <div class="ft-item dir">
+                <svg class="icon"><use href="#i-chevron-d"/></svg>
+                <svg class="icon"><use href="#i-folder"/></svg>
+                <span class="ft-name">src</span>
+              </div>
+              <div class="ft-indent">
+                <!-- src/api/ (rozwinięty) -->
+                <div class="ft-item dir">
+                  <svg class="icon"><use href="#i-chevron-d"/></svg>
+                  <svg class="icon"><use href="#i-folder"/></svg>
+                  <span class="ft-name">api</span>
+                </div>
+                <div class="ft-indent">
+                  <div class="ft-item active">
+                    <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                    <svg class="icon"><use href="#i-code"/></svg>
+                    <span class="ft-name">client.ts</span>
+                    <span class="ft-dot ready" title="Zaindeksowany"></span>
+                    <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+                    <!-- Menu per-wiersz (pokazane otwarte dla demonstracji CRUD) -->
+                    <div class="file-menu">
+                      <div class="fm-item"><svg class="icon"><use href="#i-eye"/></svg>Podgląd</div>
+                      <div class="fm-item"><svg class="icon"><use href="#i-copy"/></svg>Kopiuj ścieżkę</div>
+                      <div class="fm-item"><svg class="icon"><use href="#i-refresh"/></svg>Indeksuj ponownie</div>
+                      <div class="fm-sep"></div>
+                      <div class="fm-item"><svg class="icon"><use href="#i-x-circle"/></svg>Wyklucz z indeksu</div>
+                      <div class="fm-item danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń z indeksu</div>
+                    </div>
+                  </div>
+                  <div class="ft-item">
+                    <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                    <svg class="icon"><use href="#i-code"/></svg>
+                    <span class="ft-name">auth.ts</span>
+                    <span class="ft-dot ready" title="Zaindeksowany"></span>
+                    <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                  <div class="ft-item">
+                    <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                    <svg class="icon"><use href="#i-code"/></svg>
+                    <span class="ft-name">errors.ts</span>
+                    <span class="ft-dot ready" title="Zaindeksowany"></span>
+                    <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </div>
+                <!-- src/components/ (zwinięty) -->
+                <div class="ft-item dir">
+                  <svg class="icon"><use href="#i-chevron-r"/></svg>
+                  <svg class="icon"><use href="#i-folder"/></svg>
+                  <span class="ft-name">components</span>
+                  <span class="ft-tag">8</span>
+                </div>
+                <!-- src/legacy/ (rozwinięty, plik wykluczony) -->
+                <div class="ft-item dir">
+                  <svg class="icon"><use href="#i-chevron-d"/></svg>
+                  <svg class="icon"><use href="#i-folder"/></svg>
+                  <span class="ft-name">legacy</span>
+                </div>
+                <div class="ft-indent">
+                  <div class="ft-item excluded">
+                    <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                    <svg class="icon"><use href="#i-code"/></svg>
+                    <span class="ft-name">old-cart.js</span>
+                    <span class="ft-tag">wykluczony</span>
+                    <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+                  </div>
+                </div>
+              </div>
+
+              <!-- docs/ (rozwinięty) -->
+              <div class="ft-item dir">
+                <svg class="icon"><use href="#i-chevron-d"/></svg>
+                <svg class="icon"><use href="#i-folder"/></svg>
+                <span class="ft-name">docs</span>
+              </div>
+              <div class="ft-indent">
+                <div class="ft-item">
+                  <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                  <svg class="icon"><use href="#i-doc"/></svg>
+                  <span class="ft-name">openapi.yaml</span>
+                  <span class="ft-dot ready" title="Zaindeksowany"></span>
+                  <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+                </div>
+                <div class="ft-item">
+                  <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                  <svg class="icon"><use href="#i-doc"/></svg>
+                  <span class="ft-name">architektura.md</span>
+                  <span class="ft-status"><span class="spin-sm" title="Indeksacja w toku"></span></span>
+                  <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+                </div>
+              </div>
+
+              <!-- tests/ (zwinięty) -->
+              <div class="ft-item dir">
+                <svg class="icon"><use href="#i-chevron-r"/></svg>
+                <svg class="icon"><use href="#i-folder"/></svg>
+                <span class="ft-name">tests</span>
+                <span class="ft-tag">12</span>
+              </div>
+
+              <!-- pliki root -->
+              <div class="ft-item">
+                <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                <svg class="icon"><use href="#i-book"/></svg>
+                <span class="ft-name">README.md</span>
+                <span class="ft-dot ready" title="Zaindeksowany"></span>
+                <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+              </div>
+              <div class="ft-item">
+                <svg class="icon" style="visibility:hidden"><use href="#i-file"/></svg>
+                <svg class="icon"><use href="#i-file"/></svg>
+                <span class="ft-name">package-lock.json</span>
+                <span class="ft-dot err" title="Błąd: przekroczono limit rozmiaru"></span>
+                <button class="ft-more" title="Akcje pliku"><svg class="icon"><use href="#i-more"/></svg></button>
+              </div>
+            </div>
+
+            <div class="tree-legend">
+              <span><span class="ft-dot ready"></span>zaindeksowany</span>
+              <span><span class="spin-sm"></span>indeksacja</span>
+              <span><span class="ft-dot err"></span>błąd</span>
+              <span><span class="ft-tag" style="opacity:.6">wykluczony</span>pominięty</span>
+            </div>
+          </div>
+
+          <!-- PRAWA: podgląd wybranego pliku -->
+          <div>
+            <!-- Pasek nad podglądem: ścieżka + status ingestu + akcje -->
+            <div class="file-head">
+              <div>
+                <div class="fh-path">portal-b2b / src / api / <b>client.ts</b></div>
+                <div class="fh-meta mt-sm">
+                  <span><svg class="icon icon-sm"><use href="#i-layers"/></svg>2 chunki</span>
+                  <span><svg class="icon icon-sm"><use href="#i-file"/></svg>1,4 KB · TypeScript</span>
+                  <span><svg class="icon icon-sm"><use href="#i-clock"/></svg>zindeksowano 22.07.2026, 09:14</span>
+                </div>
+              </div>
+              <div class="fh-actions">
+                <span class="status-pill ok">gotowe</span>
+                <button class="btn btn-sm btn-primary"><!-- nawiguje: C01 --><svg class="icon"><use href="#i-message"/></svg>Zapytaj w chacie o ten plik</button>
+                <button class="btn btn-sm"><svg class="icon"><use href="#i-x-circle"/></svg>Wyklucz z indeksu</button>
+                <button class="btn btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Indeksuj ponownie</button>
+                <button class="btn btn-sm"><svg class="icon"><use href="#i-copy"/></svg>Kopiuj</button>
+              </div>
+            </div>
+
+            <!-- Edytor kodu (read-only) -->
+            <div class="code-editor">
+              <div class="ce-tabs">
+                <div class="ce-tab active"><svg class="icon"><use href="#i-code"/></svg>client.ts</div>
+                <div class="ce-tab"><svg class="icon"><use href="#i-code"/></svg>auth.ts</div>
+                <div class="ce-toolbar">
+                  <span class="chip"><svg class="icon"><use href="#i-eye"/></svg>tylko do odczytu</span>
+                  <button class="btn btn-sm btn-ghost" title="Pobierz plik"><svg class="icon"><use href="#i-download"/></svg></button>
+                </div>
+              </div>
+              <div class="ce-body">
+                <div class="ce-gutter">1<br>2<br>3<br>4<br>5<br>6<br>7<br>8<br>9<br>10<br>11<br>12<br>13<br>14<br>15<br>16<br>17<br>18<br>19<br>20<br>21<br>22<br>23<br>24<br>25<br>26<br>27<br>28<br>29<br>30<br>31<br>32<br>33<br>34<br>35</div>
+<div class="ce-code"><span class="com">// =============================================================================</span>
+<span class="com">// Plik: client.ts — klient HTTP portalu B2B</span>
+<span class="com">// Opis: obsługa tokenu, ponawianie 401 i typowane odpowiedzi API.</span>
+<span class="com">// =============================================================================</span>
+<span class="kw">import</span> { getAuthToken, refreshToken } <span class="kw">from</span> <span class="str">"./auth"</span>;
+<span class="kw">import</span> { ApiError } <span class="kw">from</span> <span class="str">"./errors"</span>;
+
+<span class="kw">const</span> BASE_URL = process.env.API_BASE_URL ?? <span class="str">"https://api.portal-b2b.pl/v2"</span>;
+<span class="kw">const</span> MAX_RETRIES = <span class="num">3</span>;
+
+<span class="kw">export</span> <span class="kw">interface</span> <span class="fn">RequestOptions</span> {
+  method?: <span class="str">"GET"</span> | <span class="str">"POST"</span> | <span class="str">"PUT"</span> | <span class="str">"DELETE"</span>;
+  body?: <span class="kw">unknown</span>;
+  retries?: <span class="kw">number</span>;
+}
+
+<span class="hl"><span class="kw">export</span> <span class="kw">async</span> <span class="kw">function</span> <span class="fn">request</span>&lt;T&gt;(path: <span class="kw">string</span>, opts: <span class="fn">RequestOptions</span> = {}): <span class="fn">Promise</span>&lt;T&gt; {</span>
+  <span class="kw">const</span> token = <span class="kw">await</span> <span class="fn">getAuthToken</span>();
+  <span class="kw">const</span> res = <span class="kw">await</span> <span class="fn">fetch</span>(<span class="str">`${BASE_URL}${path}`</span>, {
+    method: opts.method ?? <span class="str">"GET"</span>,
+    headers: {
+      <span class="str">"Content-Type"</span>: <span class="str">"application/json"</span>,
+      Authorization: <span class="str">`Bearer ${token}`</span>,
+    },
+    body: opts.body ? <span class="fn">JSON</span>.stringify(opts.body) : <span class="kw">undefined</span>,
+  });
+
+  <span class="kw">if</span> (res.status === <span class="num">401</span> &amp;&amp; (opts.retries ?? <span class="num">0</span>) &lt; MAX_RETRIES) {
+    <span class="kw">await</span> <span class="fn">refreshToken</span>();
+    <span class="kw">return</span> <span class="fn">request</span>&lt;T&gt;(path, { ...opts, retries: (opts.retries ?? <span class="num">0</span>) + <span class="num">1</span> });
+  }
+
+  <span class="kw">if</span> (!res.ok) <span class="kw">throw</span> <span class="kw">new</span> <span class="fn">ApiError</span>(res.status, <span class="kw">await</span> res.text());
+  <span class="kw">return</span> res.json() <span class="kw">as</span> <span class="fn">Promise</span>&lt;T&gt;;
+}</div>
+              </div>
+            </div>
+
+            <!-- Info: jak działa indeksacja plików -->
+            <div class="section-card" style="margin-top:16px; margin-bottom:0;">
+              <div class="section-card-head" style="margin-bottom:10px;">
+                <div class="title"><svg class="icon"><use href="#i-book"/></svg>Jak to trafia do wiedzy?</div>
+              </div>
+              <div class="ingest-note">
+                Pliki repozytorium są dzielone na <b>chunki</b> i zapisywane w bazie wiedzy projektu. Agenci i chat
+                korzystają z nich jako kontekstu. Wybierz plik w drzewie, aby go podejrzeć. Akcją <b>„Wyklucz z indeksu"</b>
+                pominiesz plik przy kolejnej indeksacji (np. wygenerowany kod), a <b>„Indeksuj ponownie"</b> przetworzy go jeszcze raz.
+                Zmiany w repozytorium pobierzesz przyciskiem <b>Odśwież</b> (fetch + delta) — reindeksowane są tylko zmienione pliki.
+              </div>
+            </div>
+          </div>
+
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

@@ -155,14 +155,20 @@ fn utf8_multibyte_class() {
 
 /// A tiny vocab: byte tokens 0..=255 map to their own single byte, plus a few
 /// multi-byte word tokens, plus an EOS id.
-fn toy_vocab() -> (Vec<Option<Vec<u8>>>, u32, std::collections::HashMap<String, u32>) {
+fn toy_vocab() -> (
+    Vec<Option<Vec<u8>>>,
+    u32,
+    std::collections::HashMap<String, u32>,
+) {
     let mut table: Vec<Option<Vec<u8>>> = Vec::new();
     let mut names = std::collections::HashMap::new();
     // 0..256 single-byte tokens.
     for b in 0u16..256 {
         table.push(Some(vec![b as u8]));
     }
-    let add = |s: &str, table: &mut Vec<Option<Vec<u8>>>, names: &mut std::collections::HashMap<String, u32>| {
+    let add = |s: &str,
+               table: &mut Vec<Option<Vec<u8>>>,
+               names: &mut std::collections::HashMap<String, u32>| {
         let id = table.len() as u32;
         table.push(Some(s.as_bytes().to_vec()));
         names.insert(s.to_string(), id);
@@ -209,7 +215,10 @@ fn token_mask_advances_and_completes() {
     let mut logits = vec![0.0f32; n];
     m.apply_mask(&mut logits);
     let true_id = names["true"];
-    assert!(logits[true_id as usize].is_finite(), "`true` token must be allowed");
+    assert!(
+        logits[true_id as usize].is_finite(),
+        "`true` token must be allowed"
+    );
     m.accept_token(true_id);
     assert!(m.is_complete());
     // Now only EOS is allowed.
@@ -239,12 +248,24 @@ fn token_mask_rejects_overlong_lead_fragment() {
     let m = prog.matcher();
     let mut logits = vec![0.0f32; vocab.len()];
     m.apply_mask(&mut logits);
-    assert!(logits[obj_open as usize].is_finite(), "`{{` must be allowed");
+    assert!(
+        logits[obj_open as usize].is_finite(),
+        "`{{` must be allowed"
+    );
     assert!(logits[0x7B].is_finite(), "single-byte `{{` allowed");
     // 3-byte and 4-byte lead bytes are NOT valid starts here.
-    assert!(logits[0xE0] == f32::NEG_INFINITY, "0xE0 lead must be rejected");
-    assert!(logits[0xF0] == f32::NEG_INFINITY, "0xF0 lead must be rejected");
-    assert!(logits[0xC3] == f32::NEG_INFINITY, "0xC3 lead must be rejected");
+    assert!(
+        logits[0xE0] == f32::NEG_INFINITY,
+        "0xE0 lead must be rejected"
+    );
+    assert!(
+        logits[0xF0] == f32::NEG_INFINITY,
+        "0xF0 lead must be rejected"
+    );
+    assert!(
+        logits[0xC3] == f32::NEG_INFINITY,
+        "0xC3 lead must be rejected"
+    );
 }
 
 #[test]

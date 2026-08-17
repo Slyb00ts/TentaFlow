@@ -29,7 +29,7 @@ from std.gpu.compute.mma import mma, ld_matrix
 from std.sys import _RegisterPackType
 from std.sys._assembly import inlined_assembly
 from src.gemv2 import _e2m1x8, _f8e4m3s, _q4k_scale_min, _q3k_scales8
-from src.gemv2 import _iq4xs_scale, _e8m0_half, IQ4NL_VALS, MXFP4_VALS
+from src.gemv2 import _iq4xs_scale, _e8m0_half, IQ4NL_VALS, mxfp4_vals
 from src.gemv2 import _signs8
 from src.gemv2 import IQ1S_DELTA
 
@@ -479,12 +479,37 @@ def gemm_q6_k_impl[BM: Int, NW: Int](
     n_rows: Int,
     n_tokens: Int,
 ):
+    gemm_q6_k_tile_impl[BM, NW](
+        y,
+        w,
+        x,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(block_idx.y) * BM,
+    )
+
+
+def gemm_q6_k_tile_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    row0: Int,
+    t0: Int,
+):
     """Q6_K tensor-core GEMM. Grid (ceil(rows/64), ceil(T/BM)), block NW*32,
     n_cols % 256 == 0 (whole 210-byte superblocks per row). Each 32-col stage
     covers one int8-scaled quadrant slice: ql nibbles + qh 2-bit highs are
     combined to (q - 32) f16 in registers (prefetched a stage ahead) and
     staged to smem like Q4_K. The 210-byte block is only 2-byte aligned, so
-    raw bytes load as u16 lanes."""
+    raw bytes load as u16 lanes.
+
+    `row0` and `t0` place the tile, so the same body serves the ungrouped grid
+    and the grouped launch that puts every expert in one grid."""
     comptime XTILE = BM * LDK
     comptime NT = NW * WARP
     comptime x_rpp = NT // 4
@@ -494,8 +519,6 @@ def gemm_q6_k_impl[BM: Int, NW: Int](
     tid = Int(thread_idx.x)
     lane = tid % WARP
     wid = tid // WARP
-    row0 = Int(block_idx.x) * BN
-    t0 = Int(block_idx.y) * BM
 
     xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
@@ -1499,10 +1522,35 @@ def gemm_mxfp4_gguf_impl[BM: Int, NW: Int](
     n_rows: Int,
     n_tokens: Int,
 ):
+    gemm_mxfp4_gguf_tile_impl[BM, NW](
+        y,
+        w,
+        x,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(block_idx.y) * BM,
+    )
+
+
+def gemm_mxfp4_gguf_tile_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+    row0: Int,
+    t0: Int,
+):
     """GGML MXFP4 tensor-core GEMM (17-byte blocks: E8M0 scale + 16 e2m1
     pair bytes). Grid (ceil(rows/64), ceil(T/BM)), block NW*32, n_cols % 32
     == 0. The odd block size leaves only byte alignment for the quant
-    bytes."""
+    bytes.
+
+    `row0` and `t0` place the tile, so the same body serves the ungrouped grid
+    and the grouped launch that puts every expert in one grid."""
     comptime XTILE = BM * LDK
     comptime NT = NW * WARP
     comptime x_rpp = NT // 4
@@ -1512,8 +1560,6 @@ def gemm_mxfp4_gguf_impl[BM: Int, NW: Int](
     tid = Int(thread_idx.x)
     lane = tid % WARP
     wid = tid // WARP
-    row0 = Int(block_idx.x) * BN
-    t0 = Int(block_idx.y) * BM
 
     xs = stack_allocation[2 * XTILE, Float16, address_space = AddressSpace.SHARED]()
     ws = stack_allocation[2 * WTILE, Float16, address_space = AddressSpace.SHARED]()
@@ -1590,10 +1636,7 @@ def gemm_mxfp4_gguf_impl[BM: Int, NW: Int](
                 nib = qv[wp] >> 4
             else:
                 nib = qv[wp] & 0x0F
-            var vals = SIMD[DType.float32, 8]()
-            comptime for j in range(8):
-                vals[j] = MXFP4_VALS[Int(nib[j])]
-            wv = (vals * dl[wp]).cast[DType.float16]()
+            wv = (mxfp4_vals[8](nib) * dl[wp]).cast[DType.float16]()
             (wdst + (s % 2) * WTILE + wp * (NT // 4) * LDW).store[
                 width=8, alignment=16
             ](wv)
@@ -2836,8 +2879,8 @@ def gemm_q8_0_out_f32_impl[BM: Int, NW: Int](
 # summed (block scales differ, so accumulation is f32 outside the tensor op).
 # 256-thread block = 8 warps; one block owns a BM-token x 64-row output tile.
 # Warps split as M_WARPS x N_WARPS; each warp owns MT_PER_WARP token m-tiles and
-# NT_PER_WARP 8-row n-tiles. Staging = activation q8_1 quant + weight-code
-# unpack + per-block scales into shared, software-pipelined a stage ahead.
+# NT_PER_WARP 8-row n-tiles. Staging = pre-quantized activation codes + weight-
+# code unpack + per-block scales into shared, read into registers a stage ahead.
 def _mma_s8(
     a0: UInt32,
     a1: UInt32,
@@ -2856,6 +2899,30 @@ def _mma_s8(
         constraints="=r,=r,=r,=r,r,r,r,r,r,r,r,r,r,r",
         has_side_effect=False,
     ](a0, a1, a2, a3, b0, b1, c[0], c[1], c[2], c[3])
+    return SIMD[DType.int32, 4](r[0], r[1], r[2], r[3])
+
+
+def _mma_s8_k16(
+    a0: UInt32,
+    a1: UInt32,
+    b0: UInt32,
+    c: SIMD[DType.int32, 4],
+) -> SIMD[DType.int32, 4]:
+    """Half-k twin of `_mma_s8`, for a format whose scale changes every 16 columns.
+
+    The two share their operands exactly: registers {a0,a1} of the k=32 A
+    fragment are the k=16 fragment of columns 0..15 and {a2,a3} the fragment of
+    columns 16..31, with b0/b1 splitting the same way. So a Q6_K tile stages and
+    reads shared memory like a Q4_K one and only pays a second mma issue."""
+    var r = inlined_assembly[
+        (
+            "mma.sync.aligned.m16n8k16.row.col.s32.s8.s8.s32 {$0, $1, $2,"
+            " $3}, {$4, $5}, {$6}, {$7, $8, $9, $10};"
+        ),
+        _RegisterPackType[Int32, Int32, Int32, Int32],
+        constraints="=r,=r,=r,=r,r,r,r,r,r,r,r",
+        has_side_effect=False,
+    ](a0, a1, b0, c[0], c[1], c[2], c[3])
     return SIMD[DType.int32, 4](r[0], r[1], r[2], r[3])
 
 
@@ -2899,7 +2966,45 @@ def quantize_act_q8_1(
         xsm[sidx] = d * Float32(sumq)
 
 
-def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
+def quantize_act_q8_1_xsum(
+    xq: UnsafePointer[Int8, MutAnyOrigin],
+    xd: UnsafePointer[Float32, MutAnyOrigin],
+    xsm: UnsafePointer[Float32, MutAnyOrigin],
+    xsum: UnsafePointer[Float32, MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    """Q8_1 pre-pass retaining both d*sum(q) and the exact f32 input sum."""
+    nb = n_cols // 32
+    idx = Int(block_idx.x) * Int(block_dim.x) + Int(thread_idx.x)
+    if idx >= n_tokens * nb:
+        return
+    tok = idx // nb
+    blk = idx % nb
+    off = tok * n_cols + blk * 32
+    sidx = blk * n_tokens + tok
+    xf = (x + off).load[width=32, alignment=64]().cast[DType.float32]()
+    exact_sum = xf.reduce_add()
+    amax = abs(xf).reduce_max()
+    xsum[sidx] = exact_sum
+    if amax == 0.0:
+        (xq + off).store[alignment=32](SIMD[DType.int8, 32](0))
+        xd[sidx] = 0.0
+        xsm[sidx] = 0.0
+    else:
+        d = amax * (1.0 / 127.0)
+        q = round(xf * (127.0 / amax)).cast[DType.int8]()
+        (xq + off).store[alignment=32](q)
+        xd[sidx] = d
+        var sumq: Int32 = 0
+        comptime for e in range(32):
+            sumq += Int32(q[e])
+        xsm[sidx] = d * Float32(sumq)
+
+
+@always_inline
+def gemm_i8mma_tile_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     y: UnsafePointer[Float16, MutAnyOrigin],
     w: UnsafePointer[UInt8, MutAnyOrigin],
     xq_g: UnsafePointer[Int8, MutAnyOrigin],
@@ -2908,7 +3013,16 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     n_cols: Int,
     n_rows: Int,
     n_tokens: Int,
+    row0: Int,
+    t0: Int,
+    t_end: Int,
 ):
+    # `n_tokens` is the STRIDE of the per-block activation scales, which are
+    # laid out block-major (`xd_g[stage * n_tokens + token]`) — it is not only a
+    # bound. `t_end` is the bound: the last token this tile may stage or write.
+    # The two differ for a grouped launch, where a tile owns one expert's slice
+    # of a much longer activation; passing that slice's end as the stride reads
+    # another expert's scales, which is arithmetic that still produces numbers.
     # NW-warp block (NW*32 threads). One block owns a BM-token x BN-row output
     # tile. Warps split M_WARPS x N_WARPS; each warp owns MT_PER_WARP=2 token
     # m-tiles (32 tokens) and NT_PER_WARP row n-tiles, so A fragments are reused
@@ -2922,37 +3036,59 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     comptime N_WARPS = NW // M_WARPS
     comptime NT_PER_WARP = (BN // 8) // N_WARPS
     comptime NTHREADS = NW * 32
+    comptime BLK_BYTES = 34 if FMT == 0 else (210 if FMT == 2 else 144)
+    comptime BPR_DIV = 32 if FMT == 0 else 256
+    # Sub-blocks of 32 columns staged, and computed, between two barriers.
+    #
+    # The barrier is what this width buys. At one sub-block per stage the tile
+    # crossed a barrier every 32 columns and the profiler charged 3,65 stalled
+    # instructions per issue to waiting at it, against a matrix unit running at
+    # 6% of peak — the tile was not short of bandwidth or of arithmetic, it was
+    # short of work between synchronizations. A Q4_K SUPERBLOCK is the natural
+    # width: its 144 bytes are contiguous, its eight sub-blocks share one header,
+    # and four staging threads take a quarter of it each. Half a superblock per
+    # stage keeps the whole tile inside 48 KiB WITHOUT the second buffer, which
+    # is the trade: two barriers per stage instead of one, a quarter as many
+    # stages. A Q8_0 block is 34 bytes and carries its own scale, so there is no
+    # superblock to widen to — it stays at one.
+    comptime KS = 1 if FMT == 0 else 4
+    comptime TILE_K = 32 * KS
     # W staging: 4 threads per row -> NTHREADS/4 rows per pass.
     comptime W_ROWS_PER_PASS = NTHREADS // 4
     comptime W_PASSES = BN // W_ROWS_PER_PASS
-    comptime BLK_BYTES = 34 if FMT == 0 else 144
-    comptime BPR_DIV = 32 if FMT == 0 else 256
+    comptime W_CODES = 8 if FMT == 0 else (16 if FMT == 2 else 32)
+    comptime W_WORDS = W_CODES // 4
+    comptime W_QOFF = 2 if FMT == 0 else 16
+    # X staging unit = one token's 32 columns; the block covers BM*KS of them.
+    comptime X_UNITS = BM * KS
+    comptime X_PASSES = (X_UNITS + NTHREADS - 1) // NTHREADS
 
     tid = Int(thread_idx.x)
-    row0 = Int(block_idx.x) * BN
-    t0 = Int(block_idx.y) * BM
-
     xq = stack_allocation[
-        2 * BM * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
+        BM * TILE_K, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
     wq = stack_allocation[
-        2 * BN * 32, Int8, alignment=64, address_space = AddressSpace.SHARED
+        BN * TILE_K, Int8, alignment=64, address_space = AddressSpace.SHARED
     ]()
-    xd = stack_allocation[2 * BM, Float32, address_space = AddressSpace.SHARED]()
-    xsm = stack_allocation[
-        2 * BM, Float32, address_space = AddressSpace.SHARED
+    # Scales in PAIRS — (d, d*sum) per token, (d*scale, dmin*min) per row —
+    # because the tile reads them together and the shared pipe counts
+    # INSTRUCTIONS. Kept apart, twelve of the sixteen shared reads per stage
+    # were scale bookkeeping against four of actual matrix data, and the
+    # profiler charged 6,04 stalled instructions per issue to the queue in
+    # front of that pipe. Paired, one load fetches what two used to.
+    xds = stack_allocation[
+        2 * KS * BM, Float32, alignment=16, address_space = AddressSpace.SHARED
     ]()
-    wdsc = stack_allocation[
-        2 * BN, Float32, address_space = AddressSpace.SHARED
-    ]()
-    wdmn = stack_allocation[
-        2 * BN, Float32, address_space = AddressSpace.SHARED
+    wdm = stack_allocation[
+        2 * KS * BN, Float32, alignment=16, address_space = AddressSpace.SHARED
     ]()
 
-    # X staging: one token per thread (tid < BM); NTHREADS >= BM.
-    var xtok_c = t0 + tid
-    if xtok_c > n_tokens - 1:
-        xtok_c = n_tokens - 1
+    var xtok_c = InlineArray[Int, X_PASSES](fill=0)
+    comptime for p in range(X_PASSES):
+        var tok = t0 + (p * NTHREADS + tid) % BM
+        if tok > t_end - 1:
+            tok = t_end - 1
+        xtok_c[p] = tok
 
     # W staging: 4 threads per row, 8 codes each; W_PASSES row-passes cover BN.
     row_l = tid // 4
@@ -2966,7 +3102,7 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
             wrow_c = n_rows - 1
         wrow_base[p] = wrow_c * blocks_per_row * BLK_BYTES
 
-    n_stages = n_cols // 32
+    n_stages = n_cols // TILE_K
 
     # Warp / lane identity for the mma fragments.
     wid = tid // 32
@@ -2987,166 +3123,269 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
     # Stage-ahead prefetch registers (raw global reads). X now arrives already
     # q8_1-quantized (quantize_act_q8_1 pre-pass), so staging is a pure int8
     # copy — no per-block requant in the hot kernel.
-    var xcodes = SIMD[DType.int8, 32](0)
-    var xdv = Float32(0)
-    var xsv_g = Float32(0)
-    var wcodes = InlineArray[SIMD[DType.uint8, 8], W_PASSES](
-        fill=SIMD[DType.uint8, 8](0)
+    var xcodes = InlineArray[SIMD[DType.int8, 32], X_PASSES](
+        fill=SIMD[DType.int8, 32](0)
+    )
+    var xdv = InlineArray[Float32, X_PASSES](fill=0)
+    var xsv_g = InlineArray[Float32, X_PASSES](fill=0)
+    # Held as words, not bytes: a 32-byte vector of bytes lands in local memory,
+    # the same value as eight words stays in registers.
+    var wcodes = InlineArray[SIMD[DType.uint32, W_WORDS], W_PASSES](
+        fill=SIMD[DType.uint32, W_WORDS](0)
     )
     var wsc = InlineArray[Float16, W_PASSES](fill=Float16(0))
+    # Q6_K splits its codes over two planes (ql nibbles) plus a two-bit plane in
+    # qh, and carries eight signed scales per half superblock.
+    var wqh = InlineArray[SIMD[DType.uint32, 4], W_PASSES](
+        fill=SIMD[DType.uint32, 4](0)
+    )
+    var wsix = InlineArray[SIMD[DType.uint8, 8], W_PASSES](
+        fill=SIMD[DType.uint8, 8](0)
+    )
     var whdr = InlineArray[SIMD[DType.uint8, 16], W_PASSES](
         fill=SIMD[DType.uint8, 16](0)
     )
 
-    comptime W_QOFF = 2 if FMT == 0 else 16
-
-    if tid < BM:
-        xcodes = (xq_g + xtok_c * n_cols).load[width=32, alignment=32]()
-        xdv = xd_g[xtok_c]
-        comptime if FMT == 1:
-            xsv_g = xsm_g[xtok_c]
-    comptime for p in range(W_PASSES):
-        comptime if FMT == 0:
-            wcodes[p] = (w + wrow_base[p] + W_QOFF + part * 8).load[
-                width=8, alignment=2
-            ]()
-            if part == 0:
-                wsc[p] = (w + wrow_base[p]).bitcast[Float16]()[0]
-        else:
-            wcodes[p] = (w + wrow_base[p] + W_QOFF + part * 8).load[
-                width=8, alignment=8
-            ]()
-            if part == 0:
-                whdr[p] = (w + wrow_base[p]).load[width=16, alignment=16]()
-
-    # Software pipeline (mirrors the f16 kernel): each iteration computes stage
-    # s from buffer s%2 while stage s+1 is quantized/unpacked into the OTHER
-    # buffer (via `sw`) and stage s+2's raw global reads prefetch into registers
-    # (via `gl`), so the activation-quant + weight-unpack work hides in the
-    # tensor pipe's shadow. One barrier per stage.
-    @parameter
-    @always_inline
-    def sw(sidx: Int, buf: Int):
-        if tid < BM:
-            (xq + buf * BM * 32 + tid * 32).store[alignment=32](xcodes)
-            xd[buf * BM + tid] = xdv
-            comptime if FMT == 1:
-                xsm[buf * BM + tid] = xsv_g
-
-        comptime for p in range(W_PASSES):
-            rl = p * W_ROWS_PER_PASS + row_l
-            var codes8: SIMD[DType.int8, 8]
-            comptime if FMT == 0:
-                codes8 = wcodes[p].cast[DType.int8]()
-                if part == 0:
-                    wdsc[buf * BN + rl] = Float32(wsc[p])
-            else:
-                half = (sidx % 8) % 2
-                codes8 = ((wcodes[p] >> UInt8(4 * half)) & 0x0F).cast[
-                    DType.int8
-                ]()
-                if part == 0:
-                    dm = bitcast[DType.float16, 8](whdr[p])
-                    sc, mn = _q4k_scale_min(whdr[p], sidx % 8)
-                    wdsc[buf * BN + rl] = Float32(dm[0]) * sc
-                    wdmn[buf * BN + rl] = Float32(dm[1]) * mn
-            (wq + buf * BN * 32 + rl * 32 + part * 8).store[alignment=8](codes8)
-
+    # Global -> registers for stage `sidx`. Issued one whole stage before the
+    # `sw` that drains it, so its latency runs under a barrier and a stage of
+    # matrix work rather than in front of them.
     @parameter
     @always_inline
     def gl(sidx: Int):
-        if tid < BM:
-            xcodes = (xq_g + xtok_c * n_cols + sidx * 32).load[
-                width=32, alignment=32
-            ]()
-            xdv = xd_g[sidx * n_tokens + xtok_c]
-            comptime if FMT == 1:
-                xsv_g = xsm_g[sidx * n_tokens + xtok_c]
+        comptime for p in range(X_PASSES):
+            u = p * NTHREADS + tid
+            if u < X_UNITS:
+                sb = u // BM
+                xcodes[p] = (
+                    xq_g + xtok_c[p] * n_cols + sidx * TILE_K + sb * 32
+                ).load[width=32, alignment=32]()
+                xdv[p] = xd_g[(sidx * KS + sb) * n_tokens + xtok_c[p]]
+                comptime if FMT == 1:
+                    xsv_g[p] = xsm_g[(sidx * KS + sb) * n_tokens + xtok_c[p]]
         comptime for p in range(W_PASSES):
-            comptime if FMT == 0:
-                wcodes[p] = (w + wrow_base[p] + sidx * 34 + 2 + part * 8).load[
+            comptime if FMT == 2:
+                # One stage is one half superblock, so every staging thread reads
+                # its own sixteen ql bytes and the sixteen qh bytes that carry
+                # their top two bits. A 210-byte block is only 2-aligned, hence
+                # the uint16 loads.
+                nhalf = sidx % 2
+                nsb6 = sidx // 2
+                base6 = wrow_base[p] + nsb6 * 210
+                wcodes[p] = bitcast[DType.uint32, W_WORDS](
+                    (w + base6 + nhalf * 64 + 16 * part)
+                    .bitcast[UInt16]()
+                    .load[width=8, alignment=2]()
+                )
+                wqh[p] = bitcast[DType.uint32, 4](
+                    (w + base6 + 128 + nhalf * 32 + 16 * (part % 2))
+                    .bitcast[UInt16]()
+                    .load[width=8, alignment=2]()
+                )
+                wsix[p] = (w + base6 + 192 + nhalf * 8).load[
                     width=8, alignment=2
                 ]()
+                wsc[p] = (w + base6 + 208).bitcast[Float16]().load[
+                    width=1, alignment=2
+                ]()[0]
+            elif FMT == 0:
+                wcodes[p] = bitcast[DType.uint32, W_WORDS](
+                    (
+                        w + wrow_base[p] + sidx * 34 + W_QOFF + part * W_CODES
+                    ).load[width=W_CODES, alignment=2]()
+                )
                 if part == 0:
                     wsc[p] = (w + wrow_base[p] + sidx * 34).bitcast[Float16]()[0]
             else:
-                nsb = sidx // 8
-                nsub = sidx % 8
-                nchunk = nsub // 2
-                wcodes[p] = (
-                    w + wrow_base[p] + nsb * 144 + 16 + nchunk * 32 + part * 8
-                ).load[width=8, alignment=8]()
-                if part == 0:
+                # One read per superblock per thread, and the four threads of a
+                # row cover its 144 bytes end to end: [header|chunk0..3]. Taking
+                # a chunk at a time instead cut the row into five short runs 1152
+                # bytes apart, each paying for an L2 line it used a quarter of.
+                # All four read the header — same 16 bytes, so the coalescer
+                # broadcasts them, and each thread then owns the scales of the
+                # two sub-blocks its own chunk carries.
+                if sidx % 2 == 0:
+                    nsb = sidx // 2
+                    wcodes[p] = bitcast[DType.uint32, W_WORDS](
+                        (
+                            w
+                            + wrow_base[p]
+                            + nsb * 144
+                            + W_QOFF
+                            + part * W_CODES
+                        ).load[width=W_CODES, alignment=16]()
+                    )
                     whdr[p] = (w + wrow_base[p] + nsb * 144).load[
                         width=16, alignment=16
                     ]()
 
-    # Prologue: stage 0 -> buf 0, prefetch stage 1's global reads.
-    sw(0, 0)
-    if n_stages > 1:
-        gl(1)
-    barrier()
+    # Registers -> shared for stage `sidx`.
+    @parameter
+    @always_inline
+    def sw(sidx: Int):
+        comptime for p in range(X_PASSES):
+            u = p * NTHREADS + tid
+            if u < X_UNITS:
+                sb = u // BM
+                tk = u % BM
+                (xq + sb * BM * 32 + tk * 32).store[alignment=32](xcodes[p])
+                (xds + (sb * BM + tk) * 2).store[alignment=8](
+                    SIMD[DType.float32, 2](xdv[p], xsv_g[p])
+                )
+
+        comptime for p in range(W_PASSES):
+            rl = p * W_ROWS_PER_PASS + row_l
+            comptime if FMT == 2:
+                # `part` owns sub-blocks mlo and mlo+2 over sixteen columns each:
+                # the low nibble of its ql bytes plus one two-bit field of qh,
+                # then the high nibble plus the field two positions up. Codes go
+                # to shared already biased by -32, so the mma needs no fixup.
+                mlo = part // 2
+                col0 = 16 * (part % 2)
+                ql8 = bitcast[DType.uint8, 16](wcodes[p])
+                qh8 = bitcast[DType.uint8, 16](wqh[p])
+                var clo = SIMD[DType.int8, 16](0)
+                var chi = SIMD[DType.int8, 16](0)
+                comptime for i in range(16):
+                    hb = Int(qh8[i])
+                    qb6 = Int(ql8[i])
+                    lo = (qb6 & 0x0F) | (((hb >> (2 * mlo)) & 3) << 4)
+                    hi = (qb6 >> 4) | (((hb >> (2 * mlo + 4)) & 3) << 4)
+                    clo[i] = Int8(lo - 32)
+                    chi[i] = Int8(hi - 32)
+                (wq + mlo * BN * 32 + rl * 32 + col0).store[alignment=16](clo)
+                (wq + (mlo + 2) * BN * 32 + rl * 32 + col0).store[alignment=16](
+                    chi
+                )
+                if part % 2 == 0:
+                    dsix = Float32(wsc[p])
+                    sc8 = bitcast[DType.int8, 8](wsix[p])
+                    (wdm + (mlo * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            dsix * Float32(Int(sc8[2 * mlo])),
+                            dsix * Float32(Int(sc8[2 * mlo + 1])),
+                        )
+                    )
+                    (wdm + ((mlo + 2) * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            dsix * Float32(Int(sc8[2 * mlo + 4])),
+                            dsix * Float32(Int(sc8[2 * mlo + 5])),
+                        )
+                    )
+            elif FMT == 0:
+                if part == 0:
+                    (wdm + rl * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](Float32(wsc[p]), 0.0)
+                    )
+                (wq + rl * 32 + part * 8).store[alignment=8](
+                    bitcast[DType.int8, W_CODES](wcodes[p])
+                )
+            else:
+                # Chunk `part` carries sub-blocks 2*part (low nibbles) and
+                # 2*part+1 (high), so half the staging threads serve each half
+                # of the superblock and a stage is written by two of the four.
+                if part // 2 == sidx % 2:
+                    kk = (part % 2) * 2
+                    dm = bitcast[DType.float16, 8](whdr[p])
+                    (wq + kk * BN * 32 + rl * 32).store[alignment=32](
+                        bitcast[DType.int8, W_CODES](wcodes[p] & 0x0F0F0F0F)
+                    )
+                    (wq + (kk + 1) * BN * 32 + rl * 32).store[alignment=32](
+                        bitcast[DType.int8, W_CODES](
+                            (wcodes[p] >> 4) & 0x0F0F0F0F
+                        )
+                    )
+                    sc0, mn0 = _q4k_scale_min(whdr[p], part * 2)
+                    sc1, mn1 = _q4k_scale_min(whdr[p], part * 2 + 1)
+                    (wdm + (kk * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            Float32(dm[0]) * sc0, Float32(dm[1]) * mn0
+                        )
+                    )
+                    (wdm + ((kk + 1) * BN + rl) * 2).store[alignment=8](
+                        SIMD[DType.float32, 2](
+                            Float32(dm[0]) * sc1, Float32(dm[1]) * mn1
+                        )
+                    )
+
+    gl(0)
 
     var s = 0
     while s < n_stages:
-        buf = s % 2
-
-        # Stage s+1 into the other buffer (overlaps this stage's compute), then
-        # prefetch stage s+2's global reads into registers.
-        if s + 1 < n_stages:
-            sw(s + 1, (s + 1) % 2)
-        if s + 2 < n_stages:
-            gl(s + 2)
-
-        # int8 tensor-core MAC over this 32-column block. Fragments load via
-        # ld_matrix (b16 view: 32 int8/row = 16 b16), one warp-wide instruction
-        # each instead of per-thread scalar loads — the f16 kernel's lever.
-        # MT_PER_WARP A fragments are reused across all NT_PER_WARP n-tiles.
-        Af = (xq + buf * BM * 32 + mt0 * 32).bitcast[Float16]()
-        var ai = InlineArray[SIMD[DType.uint32, 4], MT_PER_WARP](
-            fill=SIMD[DType.uint32, 4](0)
-        )
-        # Per-block activation scales per m-tile (broadcast a,a,b,b over the
-        # fragment's 4 outputs). The scale epilogue is vectorized to SIMD[f32,4].
-        var dxv = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP](
-            fill=SIMD[DType.float32, 4](0)
-        )
-        var xsv = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP](
-            fill=SIMD[DType.float32, 4](0)
-        )
-        comptime for mi in range(MT_PER_WARP):
-            a_base = Af + (mi * 16 + (sub % 2) * 8 + lr) * 16 + (sub // 2) * 8
-            ai[mi] = bitcast[DType.uint32, 4](ld_matrix[8](a_base))
-            dx_a = xd[buf * BM + mt0 + mi * 16 + g]
-            dx_b = xd[buf * BM + mt0 + mi * 16 + g + 8]
-            dxv[mi] = SIMD[DType.float32, 4](dx_a, dx_a, dx_b, dx_b)
-            comptime if FMT == 1:
-                xs_a = xsm[buf * BM + mt0 + mi * 16 + g]
-                xs_b = xsm[buf * BM + mt0 + mi * 16 + g + 8]
-                xsv[mi] = SIMD[DType.float32, 4](xs_a, xs_a, xs_b, xs_b)
-
-        comptime for nti in range(NT_PER_WARP):
-            nb = (nbase + nti) * 8
-            Bf = (wq + buf * BN * 32 + nb * 32).bitcast[Float16]()
-            b_base = Bf + lr * 16 + (sub % 2) * 8
-            bi = bitcast[DType.uint32, 2](ld_matrix[4](b_base))
-            dw2 = (wdsc + buf * BN + nb + 2 * tt).load[width=2]()
-            dwv = SIMD[DType.float32, 4](dw2[0], dw2[1], dw2[0], dw2[1])
-            var mnv = SIMD[DType.float32, 4](0)
-            comptime if FMT == 1:
-                mn2 = (wdmn + buf * BN + nb + 2 * tt).load[width=2]()
-                mnv = SIMD[DType.float32, 4](mn2[0], mn2[1], mn2[0], mn2[1])
-            comptime for mi in range(MT_PER_WARP):
-                mres = _mma_s8(
-                    ai[mi][0], ai[mi][1], ai[mi][2], ai[mi][3],
-                    bi[0], bi[1], SIMD[DType.int32, 4](0),
-                )
-                acc[mi * NT_PER_WARP + nti] += (
-                    dxv[mi] * dwv * mres.cast[DType.float32]()
-                )
-                comptime if FMT == 1:
-                    acc[mi * NT_PER_WARP + nti] -= mnv * xsv[mi]
+        # One buffer, so the tile may not be overwritten until every warp has
+        # finished reading the previous stage out of it.
         barrier()
+        sw(s)
+        if s + 1 < n_stages:
+            gl(s + 1)
+        barrier()
+
+        # int8 tensor-core MAC over this stage's KS 32-column blocks. Fragments
+        # load via ld_matrix (b16 view: 32 int8/row = 16 b16), one warp-wide
+        # instruction each instead of per-thread scalar loads — the f16 kernel's
+        # lever. MT_PER_WARP A fragments are reused across all NT_PER_WARP
+        # n-tiles, and the whole stage runs between two barriers.
+        comptime for kk in range(KS):
+            Af = (xq + kk * BM * 32 + mt0 * 32).bitcast[Float16]()
+            var ai = InlineArray[SIMD[DType.uint32, 4], MT_PER_WARP](
+                fill=SIMD[DType.uint32, 4](0)
+            )
+            # Per-block activation scales per m-tile (broadcast a,a,b,b over the
+            # fragment's 4 outputs). The scale epilogue is a SIMD[f32,4].
+            var dxv = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP](
+                fill=SIMD[DType.float32, 4](0)
+            )
+            var xsv = InlineArray[SIMD[DType.float32, 4], MT_PER_WARP](
+                fill=SIMD[DType.float32, 4](0)
+            )
+            comptime for mi in range(MT_PER_WARP):
+                a_base = Af + (mi * 16 + (sub % 2) * 8 + lr) * 16 + (sub // 2) * 8
+                ai[mi] = bitcast[DType.uint32, 4](ld_matrix[8](a_base))
+                pa = (xds + (kk * BM + mt0 + mi * 16 + g) * 2).load[width=2]()
+                pb = (
+                    xds + (kk * BM + mt0 + mi * 16 + g + 8) * 2
+                ).load[width=2]()
+                dxv[mi] = SIMD[DType.float32, 4](pa[0], pa[0], pb[0], pb[0])
+                comptime if FMT == 1:
+                    xsv[mi] = SIMD[DType.float32, 4](pa[1], pa[1], pb[1], pb[1])
+
+            comptime for nti in range(NT_PER_WARP):
+                nb = (nbase + nti) * 8
+                Bf = (wq + kk * BN * 32 + nb * 32).bitcast[Float16]()
+                b_base = Bf + lr * 16 + (sub % 2) * 8
+                bi = bitcast[DType.uint32, 2](ld_matrix[4](b_base))
+                q4 = (wdm + (kk * BN + nb + 2 * tt) * 2).load[
+                    width=4, alignment=16
+                ]()
+                dwv = SIMD[DType.float32, 4](q4[0], q4[2], q4[0], q4[2])
+                var mnv = SIMD[DType.float32, 4](0)
+                comptime if FMT != 0:
+                    mnv = SIMD[DType.float32, 4](q4[1], q4[3], q4[1], q4[3])
+                comptime for mi in range(MT_PER_WARP):
+                    comptime if FMT == 2:
+                        # Two scales per 32 columns, so two half-k products on
+                        # the same fragments; `dwv`/`mnv` carry the pair.
+                        rlo = _mma_s8_k16(
+                            ai[mi][0], ai[mi][1], bi[0],
+                            SIMD[DType.int32, 4](0),
+                        )
+                        rhi = _mma_s8_k16(
+                            ai[mi][2], ai[mi][3], bi[1],
+                            SIMD[DType.int32, 4](0),
+                        )
+                        acc[mi * NT_PER_WARP + nti] += dxv[mi] * (
+                            dwv * rlo.cast[DType.float32]()
+                            + mnv * rhi.cast[DType.float32]()
+                        )
+                    else:
+                        mres = _mma_s8(
+                            ai[mi][0], ai[mi][1], ai[mi][2], ai[mi][3],
+                            bi[0], bi[1], SIMD[DType.int32, 4](0),
+                        )
+                        acc[mi * NT_PER_WARP + nti] += (
+                            dxv[mi] * dwv * mres.cast[DType.float32]()
+                        )
+                        comptime if FMT == 1:
+                            acc[mi * NT_PER_WARP + nti] -= mnv * xsv[mi]
         s += 1
 
     comptime for mi in range(MT_PER_WARP):
@@ -3157,24 +3396,237 @@ def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
             r_a = row0 + nb + 2 * tt
             r_b = row0 + nb + 2 * tt + 1
             d4 = acc[mi * NT_PER_WARP + nti]
-            if tok_a < n_tokens:
+            if tok_a < t_end:
                 if r_a < n_rows:
                     y[tok_a * n_rows + r_a] = Float16(d4[0])
                 if r_b < n_rows:
                     y[tok_a * n_rows + r_b] = Float16(d4[1])
-            if tok_b < n_tokens:
+            if tok_b < t_end:
                 if r_a < n_rows:
                     y[tok_b * n_rows + r_a] = Float16(d4[2])
                 if r_b < n_rows:
                     y[tok_b * n_rows + r_b] = Float16(d4[3])
 
 
+def gemm_i8mma_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    w: UnsafePointer[UInt8, MutAnyOrigin],
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    gemm_i8mma_tile_impl[BM, BN, NW, FMT](
+        y,
+        w,
+        xq_g,
+        xd_g,
+        xsm_g,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(block_idx.y) * BM,
+        n_tokens,
+    )
+
+
+def gemm_q8_0_i8mma_triplet_bm64(
+    y0: UnsafePointer[Float16, MutAnyOrigin],
+    w0: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows0: Int,
+    y1: UnsafePointer[Float16, MutAnyOrigin],
+    w1: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows1: Int,
+    y2: UnsafePointer[Float16, MutAnyOrigin],
+    w2: UnsafePointer[UInt8, MutAnyOrigin],
+    n_rows2: Int,
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    n_cols: Int,
+    n_tokens: Int,
+):
+    comptime BM = 64
+    comptime BN = 64
+    tile = Int(block_idx.x)
+    blocks0 = (n_rows0 + BN - 1) // BN
+    blocks1 = (n_rows1 + BN - 1) // BN
+    t0 = Int(block_idx.y) * BM
+    if tile < blocks0:
+        gemm_i8mma_tile_impl[BM, BN, 8, 0](
+            y0,
+            w0,
+            xq_g,
+            xd_g,
+            xsm_g,
+            n_cols,
+            n_rows0,
+            n_tokens,
+            tile * BN,
+            t0,
+            n_tokens,
+        )
+    elif tile < blocks0 + blocks1:
+        gemm_i8mma_tile_impl[BM, BN, 8, 0](
+            y1,
+            w1,
+            xq_g,
+            xd_g,
+            xsm_g,
+            n_cols,
+            n_rows1,
+            n_tokens,
+            (tile - blocks0) * BN,
+            t0,
+            n_tokens,
+        )
+    else:
+        gemm_i8mma_tile_impl[BM, BN, 8, 0](
+            y2,
+            w2,
+            xq_g,
+            xd_g,
+            xsm_g,
+            n_cols,
+            n_rows2,
+            n_tokens,
+            (tile - blocks0 - blocks1) * BN,
+            t0,
+            n_tokens,
+        )
+
+
+def gemm_i8mma_grouped_impl[BM: Int, BN: Int, NW: Int, FMT: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    xq_g: UnsafePointer[Int8, MutAnyOrigin],
+    xd_g: UnsafePointer[Float32, MutAnyOrigin],
+    xsm_g: UnsafePointer[Float32, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+    n_tokens: Int,
+):
+    """Every expert of a routed step, in ONE launch.
+
+    A mixture prefill used to launch one GEMM per expert per projection, and
+    each of those covered a dozen blocks — a card with dozens of multiprocessors
+    sat mostly idle while they ran one after another. Here `block_idx.y` indexes
+    a TILE, the tile says which expert it belongs to and which rows of the
+    grouped activation it owns, and the grid spans every expert at once.
+
+    Same tile as the ungrouped kernel, so the arithmetic is unchanged: what a
+    tile does is decided by (row0, t0) and the token bound, and grouping only
+    chooses those three per block instead of per launch. `tile_end` is the end
+    of that expert's block rather than the tile's, so the staging clamp lands
+    inside the expert it belongs to and never on a neighbour's rows.
+    """
+    tile = Int(block_idx.y)
+    gemm_i8mma_tile_impl[BM, BN, NW, FMT](
+        y,
+        wtab[Int(tile_expert[tile])],
+        xq_g,
+        xd_g,
+        xsm_g,
+        n_cols,
+        n_rows,
+        n_tokens,
+        Int(block_idx.x) * BN,
+        Int(tile_first[tile]),
+        Int(tile_end[tile]),
+    )
+
+
+def gemm_q6_k_grouped_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Every expert of a routed step in one launch — the Q6_K half of it.
+
+    Same construction as `gemm_i8mma_grouped_impl`; a mixture whose stacks are
+    Q4_K for gate and up and Q6_K for down needs both, and one of them grouped
+    leaves the other launching per expert.
+    """
+    tile = Int(block_idx.y)
+    gemm_q6_k_tile_impl[BM, NW](
+        y,
+        wtab[Int(tile_expert[tile])],
+        x,
+        n_cols,
+        n_rows,
+        Int(tile_end[tile]),
+        Int(block_idx.x) * BN,
+        Int(tile_first[tile]),
+    )
+
+
+def gemm_mxfp4_gguf_grouped_impl[BM: Int, NW: Int](
+    y: UnsafePointer[Float16, MutAnyOrigin],
+    wtab: UnsafePointer[UnsafePointer[UInt8, MutAnyOrigin], MutAnyOrigin],
+    x: UnsafePointer[Float16, MutAnyOrigin],
+    tile_expert: UnsafePointer[Int32, MutAnyOrigin],
+    tile_first: UnsafePointer[Int32, MutAnyOrigin],
+    tile_end: UnsafePointer[Int32, MutAnyOrigin],
+    n_cols: Int,
+    n_rows: Int,
+):
+    """Every expert of a routed step in one launch — the MXFP4 half of it.
+
+    Same construction as `gemm_i8mma_grouped_impl`. A hybrid whose expert stacks
+    are MXFP4 needs this one; without it the wide route refuses the very
+    checkpoint that brought the family in.
+    """
+    tile = Int(block_idx.y)
+    gemm_mxfp4_gguf_tile_impl[BM, NW](
+        y,
+        wtab[Int(tile_expert[tile])],
+        x,
+        n_cols,
+        n_rows,
+        Int(tile_end[tile]),
+        Int(block_idx.x) * BN,
+        Int(tile_first[tile]),
+    )
+
+
+comptime gemm_mxfp4_gguf_f16_grouped = gemm_mxfp4_gguf_grouped_impl[64, 4]
+
+comptime gemm_q6_k_f16_grouped = gemm_q6_k_grouped_impl[64, 4]
+
+comptime gemm_q8_0_i8mma_grouped = gemm_i8mma_grouped_impl[64, 64, 8, 0]
+comptime gemm_q4_k_i8mma_grouped = gemm_i8mma_grouped_impl[64, 64, 8, 1]
+
+# A decode step gives a tile three or four rows, a prefill chunk gives it a
+# hundred — and at that width the tile stops being short of rows and starts
+# being short of arithmetic per unpacked byte. A weight sub-block is staged
+# once and multiplied by every token in the tile, so twice the tokens halves
+# what the unpacking costs per row: measured 1,75x per row on the mixture's
+# projections, which is why the wide tile wins even when it pads more.
+comptime gemm_q8_0_i8mma_grouped_bm128_bn64 = gemm_i8mma_grouped_impl[128, 64, 8, 0]
+comptime gemm_q4_k_i8mma_grouped_bm128_bn64 = gemm_i8mma_grouped_impl[128, 64, 8, 1]
+comptime gemm_q6_k_f16_grouped_bm128_bn64 = gemm_q6_k_grouped_impl[128, 8]
+
 comptime gemm_q8_0_i8mma = gemm_i8mma_impl[128, 64, 8, 0]
 comptime gemm_q8_0_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 0]
 comptime gemm_q8_0_i8mma_big = gemm_i8mma_impl[128, 128, 16, 0]
+comptime gemm_q8_0_i8mma_bn128 = gemm_i8mma_impl[128, 128, 8, 0]
 comptime gemm_q4_k_i8mma = gemm_i8mma_impl[128, 64, 8, 1]
 comptime gemm_q4_k_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 1]
 comptime gemm_q4_k_i8mma_big = gemm_i8mma_impl[128, 128, 16, 1]
+comptime gemm_q4_k_i8mma_bn128 = gemm_i8mma_impl[128, 128, 8, 1]
+comptime gemm_q6_k_i8mma = gemm_i8mma_impl[128, 64, 8, 2]
+comptime gemm_q6_k_i8mma_bm64 = gemm_i8mma_impl[64, 64, 8, 2]
 
 
 comptime gemm_f16_out_f32 = gemm_f16_out_f32_impl[128, 8]

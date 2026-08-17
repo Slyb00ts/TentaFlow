@@ -98,6 +98,8 @@ pub struct ChatMessage {
     pub role: ChatRole,
     pub content: ChatMessageContent,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_content: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tool_call_id: Option<String>,
@@ -149,6 +151,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::System,
             content: ChatMessageContent::Text(content.into()),
+            reasoning_content: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -159,6 +162,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: ChatMessageContent::Text(content.into()),
+            reasoning_content: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -169,6 +173,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::Assistant,
             content: ChatMessageContent::Text(content.into()),
+            reasoning_content: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,
@@ -180,6 +185,7 @@ impl ChatMessage {
         Self {
             role: ChatRole::User,
             content: ChatMessageContent::Parts(parts),
+            reasoning_content: None,
             name: None,
             tool_call_id: None,
             tool_calls: None,

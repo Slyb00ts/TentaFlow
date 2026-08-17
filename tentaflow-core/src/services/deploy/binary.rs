@@ -8,6 +8,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
+
 use async_trait::async_trait;
 use rusqlite::Transaction;
 use tokio::io::{AsyncBufReadExt, BufReader};
@@ -18,7 +21,6 @@ use super::{
     resolve_display_name, smart_health_probe, standard_engine_env, DeployError, DeployResult,
     DeployStrategy, LogSink, PreparedDeploy, RuntimeHandle, SmartProbeConfig, SmartProbeOutcome,
 };
-use crate::deploy::process_ctl;
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
@@ -35,7 +37,7 @@ pub struct BinaryDeploy {
     log_sink: Option<LogSink>,
     /// Child handle is stored on `self` (not on `PreparedDeploy`) so it stays
     /// alive across the await boundary in `deploy()`. Rollback consumes it.
-    child: std::sync::Mutex<Option<Child>>,
+    child: Arc<std::sync::Mutex<Option<Child>>>,
     /// Port z DB przy respawn — patrz `PythonBundleDeploy::preserved_port`.
     preserved_port: Option<u16>,
 }
@@ -65,7 +67,7 @@ impl BinaryDeploy {
             ports,
             hf_token,
             log_sink,
-            child: std::sync::Mutex::new(None),
+            child: Arc::new(std::sync::Mutex::new(None)),
             preserved_port,
         }
     }
@@ -77,7 +79,10 @@ impl BinaryDeploy {
                 self.manifest.engine.id
             ))
         })?;
-        if native.runtime != NativeRuntime::Binary {
+        if !matches!(
+            native.runtime,
+            NativeRuntime::Binary | NativeRuntime::ManagedCli
+        ) {
             return Err(DeployError::Manifest(format!(
                 "engine '{}' is not a binary runtime ({:?})",
                 self.manifest.engine.id, native.runtime
@@ -101,6 +106,105 @@ impl BinaryDeploy {
         }
         Ok(path)
     }
+
+    async fn prepare_managed_cli_env(
+        &self,
+        native: &crate::services::manifest::NativeDeploy,
+        env: &mut std::collections::HashMap<String, String>,
+    ) -> DeployResult<()> {
+        if native.runtime != NativeRuntime::ManagedCli {
+            return Ok(());
+        }
+        let (package, executable) = match self.manifest.engine.id.as_str() {
+            "codex" => ("@openai/codex", "codex"),
+            "claude-code" => ("@anthropic-ai/claude-code", "claude"),
+            other => {
+                return Err(DeployError::Manifest(format!(
+                    "managed-cli engine '{other}' has no installer mapping"
+                )))
+            }
+        };
+        let install_root = crate::paths::cache_dir()
+            .join("coding-agents")
+            .join(&self.manifest.engine.id)
+            .join(&self.manifest.engine.version);
+        let bin_dir = install_root.join("node_modules").join(".bin");
+        let executable_name = if cfg!(windows) {
+            format!("{executable}.cmd")
+        } else {
+            executable.to_string()
+        };
+        if !bin_dir.join(executable_name).exists() {
+            std::fs::create_dir_all(&install_root).map_err(|e| {
+                DeployError::Spawn(format!("create managed-cli install directory: {e}"))
+            })?;
+            if let Some(s) = &self.log_sink {
+                s.info(&format!(
+                    "[managed-cli] installing {}@{}",
+                    package, self.manifest.engine.version
+                ));
+            }
+            let output = Command::new(if cfg!(windows) { "npm.cmd" } else { "npm" })
+                .arg("install")
+                .arg("--prefix")
+                .arg(&install_root)
+                .arg("--no-audit")
+                .arg("--no-fund")
+                .arg(format!("{}@{}", package, self.manifest.engine.version))
+                .output()
+                .await
+                .map_err(|e| DeployError::Spawn(format!("start npm installer: {e}")))?;
+            if !output.status.success() {
+                return Err(DeployError::Spawn(format!(
+                    "npm install {}@{} failed: {}",
+                    package,
+                    self.manifest.engine.version,
+                    String::from_utf8_lossy(&output.stderr).trim()
+                )));
+            }
+        }
+        let inherited_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![bin_dir];
+        paths.extend(std::env::split_paths(&inherited_path));
+        let joined = std::env::join_paths(paths)
+            .map_err(|e| DeployError::Spawn(format!("build managed-cli PATH: {e}")))?;
+        env.insert("PATH".to_string(), joined.to_string_lossy().into_owned());
+        let state_dir = crate::paths::category_dir(crate::paths::StorageCategory::Keys)
+            .join("coding-agents")
+            .join(&self.manifest.engine.id);
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| DeployError::Spawn(format!("create managed-cli state directory: {e}")))?;
+        env.insert(
+            "TENTAFLOW_CODING_AGENT_DATA_DIR".to_string(),
+            state_dir.to_string_lossy().into_owned(),
+        );
+        let workspace_root =
+            self.user_config
+                .get("workspace_root")
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.trim().is_empty())
+                .map(PathBuf::from)
+                .unwrap_or(std::env::current_dir().map_err(|e| {
+                    DeployError::Spawn(format!("resolve coding-agent workspace: {e}"))
+                })?);
+        let workspace_root = std::fs::canonicalize(&workspace_root).map_err(|e| {
+            DeployError::Spawn(format!(
+                "invalid coding-agent workspace {}: {e}",
+                workspace_root.display()
+            ))
+        })?;
+        env.insert(
+            "TENTAFLOW_WORKSPACE_ROOT".to_string(),
+            workspace_root.to_string_lossy().into_owned(),
+        );
+        if self.manifest.engine.id == "codex" {
+            env.insert(
+                "CODEX_HOME".to_string(),
+                state_dir.to_string_lossy().into_owned(),
+            );
+        }
+        Ok(())
+    }
 }
 
 #[async_trait]
@@ -120,6 +224,76 @@ impl DeployStrategy for BinaryDeploy {
         }
 
         let root = self.binary_root()?;
+        let managed_cli_executable = if native.runtime == NativeRuntime::ManagedCli {
+            let source_hash = self.manifest.native_source_hash.trim();
+            if source_hash.is_empty() {
+                return Err(DeployError::Manifest(format!(
+                    "engine '{}': managed-cli runtime has no native source hash",
+                    self.manifest.engine.id
+                )));
+            }
+            let immutable_root = crate::paths::cache_dir()
+                .join("coding-agents")
+                .join("bridge")
+                .join(&self.manifest.engine.id)
+                .join(source_hash);
+            #[cfg(windows)]
+            let immutable_server = immutable_root.join("server.exe");
+            #[cfg(not(windows))]
+            let immutable_server = immutable_root.join("server");
+            if immutable_server.exists() {
+                Some(immutable_server)
+            } else {
+                if let Some(s) = &self.log_sink {
+                    s.info("[managed-cli] building the local bridge");
+                }
+                #[cfg(windows)]
+                let output = Command::new("powershell.exe")
+                    .args(["-NoProfile", "-ExecutionPolicy", "Bypass", "-File"])
+                    .arg(root.join("build.ps1"))
+                    .output()
+                    .await;
+                #[cfg(not(windows))]
+                let output = Command::new("sh").arg(root.join("build.sh")).output().await;
+                let output = output
+                    .map_err(|e| DeployError::Spawn(format!("build coding-agent bridge: {e}")))?;
+                #[cfg(windows)]
+                let built_server = root
+                    .join("target")
+                    .join("release")
+                    .join("tentaflow-coding-agent-bridge.exe");
+                #[cfg(not(windows))]
+                let built_server = root
+                    .join("target")
+                    .join("release")
+                    .join("tentaflow-coding-agent-bridge");
+                if !output.status.success() || !built_server.exists() {
+                    return Err(DeployError::Spawn(format!(
+                        "coding-agent bridge build failed with status {}: {}",
+                        output.status,
+                        String::from_utf8_lossy(&output.stderr).trim()
+                    )));
+                }
+                std::fs::create_dir_all(&immutable_root).map_err(|e| {
+                    DeployError::Spawn(format!("create coding-agent bridge cache: {e}"))
+                })?;
+                let temporary = immutable_root.join(format!(
+                    ".server-{}-{}",
+                    std::process::id(),
+                    self.manifest.engine.id
+                ));
+                std::fs::copy(&built_server, &temporary).map_err(|e| {
+                    DeployError::Spawn(format!("cache coding-agent bridge executable: {e}"))
+                })?;
+                std::fs::rename(&temporary, &immutable_server).map_err(|e| {
+                    let _ = std::fs::remove_file(&temporary);
+                    DeployError::Spawn(format!("publish coding-agent bridge executable: {e}"))
+                })?;
+                Some(immutable_server)
+            }
+        } else {
+            None
+        };
         // Respawn istniejacego serwisu zachowuje port z DB.
         let port = self
             .ports
@@ -129,18 +303,24 @@ impl DeployStrategy for BinaryDeploy {
 
         // Pick the executable: prefer `<root>/server`, then `<root>/run.sh`,
         // then `<root>/start.sh`, then `<root>/build.sh` (used by tests).
+        #[cfg(windows)]
+        let candidates = ["server.exe", "run.cmd", "run.ps1", "start.cmd"];
+        #[cfg(not(windows))]
         let candidates = ["server", "run.sh", "start.sh", "build.sh"];
-        let exe = candidates
-            .iter()
-            .map(|n| root.join(n))
-            .find(|p| p.exists())
-            .ok_or_else(|| {
-                DeployError::Spawn(format!(
-                    "no startup script in {} (looked for {:?})",
-                    root.display(),
-                    candidates
-                ))
-            })?;
+        let exe = match managed_cli_executable {
+            Some(path) => path,
+            None => candidates
+                .iter()
+                .map(|n| root.join(n))
+                .find(|p| p.exists())
+                .ok_or_else(|| {
+                    DeployError::Spawn(format!(
+                        "no startup script in {} (looked for {:?})",
+                        root.display(),
+                        candidates
+                    ))
+                })?,
+        };
 
         // Typed schema params → env (Env bindings) + request_time → config_json.
         // Computed before spawn so the launch script receives the engine's
@@ -161,6 +341,10 @@ impl DeployStrategy for BinaryDeploy {
             env.entry(k).or_insert(v);
         }
         env.insert("PORT".to_string(), port.to_string());
+        env.insert(
+            "TENTAFLOW_ENGINE_ID".to_string(),
+            self.manifest.engine.id.clone(),
+        );
         if let Some(model) = super::resolve_model_repo(&self.manifest, &self.user_config) {
             env.insert("MODEL".to_string(), model);
         }
@@ -180,10 +364,12 @@ impl DeployStrategy for BinaryDeploy {
         }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
+        self.prepare_managed_cli_env(native, &mut env).await?;
 
         let mut cmd = Command::new(&exe);
         cmd.current_dir(&root);
         cmd.envs(env);
+        cmd.stdin(std::process::Stdio::null());
         // NO kill_on_drop: a successful deploy drops this strategy object once
         // commit() returns, and kill_on_drop would then SIGKILL the engine we
         // just launched — fatal for slow-loading engines (ds4 loads ~80 GB over
@@ -194,14 +380,17 @@ impl DeployStrategy for BinaryDeploy {
         cmd.stdout(std::process::Stdio::piped());
         cmd.stderr(std::process::Stdio::piped());
 
-        // New process group with the engine as leader (pgid = child pid). Native
-        // engines fork worker processes (inference servers, GPU workers) that inherit
-        // this group; without it `terminate`'s group-kill `kill(-pid)` returns ESRCH
-        // and only the parent dies, orphaning workers that keep holding the port (the
-        // "zombie blocks respawn: port already in use" bug). The python-bundle path
-        // does the same via `setsid()` in pre_exec.
+        // A separate session keeps background services away from terminal job
+        // control while preserving pgid = pid for process-tree termination.
         #[cfg(unix)]
-        cmd.process_group(0);
+        unsafe {
+            cmd.as_std_mut().pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
 
         if let Some(s) = &self.log_sink {
             s.info(&format!("[binary] spawn {} (PORT={})", exe.display(), port));
@@ -241,7 +430,7 @@ impl DeployStrategy for BinaryDeploy {
 
         // Stash the child for later rollback / for keep-alive across the
         // commit await.
-        let pid_for_probe = child.id();
+        let child_for_probe = Arc::clone(&self.child);
         if let Ok(mut slot) = self.child.lock() {
             *slot = Some(child);
         }
@@ -260,12 +449,16 @@ impl DeployStrategy for BinaryDeploy {
             // modele moga ladowac wiecej.
             max_wait: None,
         };
-        let outcome = smart_health_probe(probe_cfg, move || async move {
-            match pid_for_probe {
-                Some(pid) if process_ctl::is_alive(pid) => None,
-                Some(_) => Some(None),
-                // No PID at all — treat as gone.
-                None => Some(None),
+        let outcome = smart_health_probe(probe_cfg, move || {
+            let child = Arc::clone(&child_for_probe);
+            async move {
+                let mut slot = child.lock().ok()?;
+                let process = slot.as_mut()?;
+                match process.try_wait() {
+                    Ok(Some(status)) => Some(status.code()),
+                    Ok(None) => None,
+                    Err(_) => Some(None),
+                }
             }
         })
         .await;
@@ -306,12 +499,21 @@ impl DeployStrategy for BinaryDeploy {
         let config_json = super::merge_config_json(&self.user_config, &request_time)
             .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
 
+        let managed_cli = native.runtime == NativeRuntime::ManagedCli;
         Ok(PreparedDeploy {
             engine_id: self.manifest.engine.id.clone(),
             category: category_tag(&self.manifest).to_string(),
             display_name: resolve_display_name(&self.manifest),
-            deploy_method: DeployMethod::NativeBinary,
-            transport: Transport::HttpDirect,
+            deploy_method: if managed_cli {
+                DeployMethod::NativeManagedCli
+            } else {
+                DeployMethod::NativeBinary
+            },
+            transport: if managed_cli {
+                Transport::AgentRpc
+            } else {
+                Transport::HttpDirect
+            },
             runtime,
             models,
             config_json,
@@ -386,6 +588,7 @@ mod tests {
                 default_port: 0,
                 dgx_spark: None,
                 cluster_capable: None,
+                preset_only: None,
                 cluster_launch: None,
                 api: ApiKind::OpenaiCompatible,
                 version: "0".into(),

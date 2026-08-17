@@ -695,6 +695,9 @@ tf-tabs {
   border-radius: 999px;
 }
 .tf-segmented .tf-seg-opt {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   background: transparent;
   border: 0;
   padding: 6px 12px;
@@ -1212,7 +1215,56 @@ th.tf-table__sticky-col { box-shadow: 1px 0 0 0 var(--tf-border); }
   background: var(--tf-bg-subtle);
 }
 .tf-table__expanded-region { padding: var(--tf-space-sm) var(--tf-space-md); }
+/* =============================================================================
+   .tf-toolbar — one-row filter/action bar shared by feature screens.
+   tf-select/tf-input default to width:100%, so without this every control
+   claims its own row ("everything stacked") — the bar pins them to content
+   width and lets only the searchbox grow.
+   ============================================================================= */
+.tf-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--tf-space-sm);
+}
+.tf-toolbar > tf-select,
+.tf-toolbar > tf-input,
+.tf-toolbar > tf-combobox,
+.tf-toolbar > tf-datepicker {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 160px;
+  /* auto width follows the longest option, and one long model name would push
+     the rest of the bar onto a second row. */
+  max-width: 230px;
+}
+.tf-toolbar > tf-searchbox {
+  flex: 1 1 220px;
+  min-width: 0;
+  max-width: 340px;
+}
+.tf-toolbar > tf-button,
+.tf-toolbar > tf-segmented,
+.tf-toolbar > tf-toggle {
+  flex: 0 0 auto;
+}
+.tf-toolbar-spacer { flex: 1 1 auto; }
+
 .tf-table__select-all { margin-right: var(--tf-space-xs); vertical-align: middle; }
+/* Per-row checkbox shares the first data cell with its content. */
+td:has(> .tf-table__row-select) {
+  display: flex;
+  align-items: center;
+  gap: var(--tf-space-xs);
+}
+.tf-table__row-select { flex: 0 0 auto; }
+/* Two-line cell: primary label plus a muted identifier/description below. */
+.tf-table__cell-title { color: var(--tf-text); }
+.tf-table__cell-sub {
+  margin-top: 2px;
+  font-size: 11px;
+  color: var(--tf-text-3);
+}
 
 /* =============================================================================
    tf-chip
@@ -2347,13 +2399,37 @@ tf-contrib-tag {
    tf-stat-card
    ============================================================================= */
 
-tf-stat-card { display: block; }
+/* =============================================================================
+   .icon inside shadow roots
+   -----------------------------------------------------------------------------
+   The base rule lives in style.css, which only reaches the light DOM. Components
+   adopt controls.css into their shadow root, so an .icon rendered inside a table
+   cell or any other shadow-rendered markup had NO size and expanded to the SVG
+   default (300x150) — single table rows grew to ~180px tall.
+   ============================================================================= */
+.icon {
+  width: 16px;
+  height: 16px;
+  stroke: currentColor;
+  stroke-width: 1.75;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  fill: none;
+  flex-shrink: 0;
+}
+
+/* A grid or flex row stretches the HOST, but the frame lives on the inner
+   .tf-stat-card — without height:100% each card shrinks to its own content and
+   a row of cards ends up ragged whenever only some of them carry a delta line. */
+tf-stat-card { display: block; height: 100%; }
 
 .tf-stat-card {
   background: var(--tf-bg-card);
   border: 1px solid var(--tf-border);
   border-radius: var(--tf-radius);
   padding: 18px 20px;
+  height: 100%;
+  box-sizing: border-box;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -2404,6 +2480,10 @@ tf-stat-card { display: block; }
 .tf-stat-card-delta {
   font-size: 12px;
   font-weight: 600;
+  /* Pinned to the bottom so the values stay on one baseline across a row even
+     when only some cards have a delta. */
+  margin-top: auto;
+  padding-top: 2px;
 }
 .tf-stat-card-delta.up      { color: var(--tf-success); }
 .tf-stat-card-delta.down    { color: var(--tf-danger); }
@@ -2537,6 +2617,7 @@ tf-alert { display: block; }
   font-size: 12px;
   color: var(--tf-text-2);
   line-height: 1.5;
+  white-space: pre-line;
 }
 
 .tf-alert-close {
@@ -2663,6 +2744,8 @@ tf-badge { display: inline-flex; vertical-align: middle; }
 .tf-badge.success { background: rgba(34, 197, 94, 0.18); color: var(--tf-success); }
 .tf-badge.warning { background: rgba(245, 158, 11, 0.18); color: var(--tf-warning); }
 .tf-badge.info    { background: rgba(96, 165, 250, 0.18); color: var(--tf-info); }
+/* Stan wygaszony: ani sukces, ani błąd (np. trening anulowany przez operatora). */
+.tf-badge.neutral { background: var(--tf-bg-3); color: var(--tf-text-2); }
 
 /* Status-dot badge variants (BadgeVariant::Dot / ::Pulse). The dot follows the
    badge tone (`color` carries the tone), so a Success badge shows a green dot
@@ -7681,6 +7764,7 @@ tf-relation-graph {
 .tf-modal--size-md  { width: min(560px, 90vw); }
 .tf-modal--size-lg  { width: min(720px, 90vw); }
 .tf-modal--size-xl  { width: min(960px, 90vw); }
+.tf-modal--size-xxl { width: min(92vw, max(960px, 80vw)); }
 .tf-modal--size-fullscreen {
   width: 100vw;
   height: 100vh;

@@ -22,7 +22,19 @@ const TEST_POOLS: PoolSizes = PoolSizes {
 };
 
 fn device() -> Option<Arc<CudaDevice>> {
-    match CudaDevice::new(0, TEST_POOLS) {
+    // `catch_unwind`, not just the `Err` arm: on a host with no CUDA driver
+    // library at all — any Mac, for one — cudarc panics while lazily loading
+    // it, so the graceful skip below never got a chance and the whole suite
+    // went red instead of quiet.
+    let created = std::panic::catch_unwind(|| CudaDevice::new(0, TEST_POOLS));
+    let created = match created {
+        Ok(result) => result,
+        Err(_) => {
+            eprintln!("skipping CUDA test: brak sterownika CUDA na tej maszynie");
+            return None;
+        }
+    };
+    match created {
         Ok(dev) => Some(dev),
         Err(e) => {
             eprintln!("skipping CUDA test: no usable CUDA device ({e})");
@@ -58,7 +70,11 @@ fn caps_report() {
     let sm: u32 = caps.arch.trim_start_matches("sm_").parse().unwrap();
     assert_eq!(caps.bf16_native, sm >= 80);
     assert_eq!(caps.fp8_native, sm >= 89);
-    assert_eq!(caps.fp4_native, sm >= 100);
+    // FP4 nie jest jedna zdolnoscia: blokowe skale UE8M0 (MXFP4) ma cala rodzina
+    // Blackwella, a skale E4M3 (natywne NVFP4) wylacznie linia serwerowa.
+    assert_eq!(caps.fp4_block_scale_ue8m0, sm >= 100);
+    assert_eq!(caps.fp4_block_scale_e4m3, (100..120).contains(&sm));
+    assert_eq!(caps.tma, sm >= 90);
 }
 
 #[test]
@@ -67,8 +83,12 @@ fn h2d_d2h_roundtrip_async() {
     let stream = dev.create_stream().unwrap();
     let n = 4096usize;
 
-    let staging_in = dev.alloc(n, MemKind::PinnedHost, Pool::Activations).unwrap();
-    let staging_out = dev.alloc(n, MemKind::PinnedHost, Pool::Activations).unwrap();
+    let staging_in = dev
+        .alloc(n, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
+    let staging_out = dev
+        .alloc(n, MemKind::PinnedHost, Pool::Activations)
+        .unwrap();
     let device_a = dev.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
     let device_b = dev.alloc(n, MemKind::Device, Pool::KvCache).unwrap();
 
@@ -137,8 +157,13 @@ fn event_ordering_across_streams() {
     // Correct ordering yields 5.0; a race could observe 4.0 (add-then-scale).
     let event = dev.create_event().unwrap();
     let cfg = LaunchConfig::linear(n, 128);
-    dev.launch(&scale2, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &producer)
-        .unwrap();
+    dev.launch(
+        &scale2,
+        &cfg,
+        &LaunchArgs::new().buf(&x).scalar(n),
+        &producer,
+    )
+    .unwrap();
     dev.record_event(&event, &producer).unwrap();
     dev.wait_event(&consumer, &event).unwrap();
     dev.launch(&add3, &cfg, &LaunchArgs::new().buf(&x).scalar(n), &consumer)
@@ -148,7 +173,10 @@ fn event_ordering_across_streams() {
     assert!(event.is_complete().unwrap());
     event.synchronize().unwrap();
     let result = read_f32(&dev, &x, n as usize);
-    assert!(result.iter().all(|&v| v == 5.0), "ordering violated: {result:?}");
+    assert!(
+        result.iter().all(|&v| v == 5.0),
+        "ordering violated: {result:?}"
+    );
 }
 
 #[test]
@@ -208,7 +236,10 @@ fn pool_exhaustion_reports_oom() {
     let err = dev
         .alloc(TEST_POOLS.kv_cache + 1, MemKind::Device, Pool::KvCache)
         .unwrap_err();
-    assert!(matches!(err, ForgeError::OutOfMemory { .. }));
+    assert!(
+        matches!(err, ForgeError::OutOfMemory { .. }),
+        "wyczerpanie puli musi zgłaszać OutOfMemory, otrzymano {err:?}"
+    );
 }
 
 #[test]
@@ -277,7 +308,9 @@ fn graph_survives_handle_drop_during_replay() {
     stream.synchronize().unwrap();
 
     let expected = 2.0f32.powi(64);
-    assert!(read_f32(&dev, &x, n as usize).iter().all(|&v| v == expected));
+    assert!(read_f32(&dev, &x, n as usize)
+        .iter()
+        .all(|&v| v == expected));
     // Device-level synchronize prunes the pending-launch retention list.
     dev.synchronize().unwrap();
 }
@@ -333,7 +366,7 @@ fn bounds_check_rejects_offset_overflow() {
 #[test]
 fn cross_device_handles_rejected() {
     let Some(dev) = device() else { return };
-    let Ok(other) = CudaDevice::new(1, TEST_POOLS) else {
+    let Ok(Ok(other)) = std::panic::catch_unwind(|| CudaDevice::new(1, TEST_POOLS)) else {
         eprintln!("skipping cross-device test: no second CUDA device");
         return;
     };

@@ -1,0 +1,89 @@
+--- a/vllm/models/deepseek_v4/common/ops/cache_utils.py
++++ b/vllm/models/deepseek_v4/common/ops/cache_utils.py
+@@ -259,8 +259,16 @@
+         token_fp8_ptr = token_data_ptr
+         token_bf16_ptr = token_data_ptr + fp8_dim
+ 
+-        # Output pointer for this token (flattened)
+-        output_row_ptr = out_ptr + batch_idx * out_stride0 + (offset + i) * out_stride1
++        # Output pointer for this token (flattened).
++        # int64: batch_idx * out_stride0 can exceed 2^31 when the gather buffer
++        # is sized for very long sequences (out_stride0 = max_num_tokens * 512;
++        # wraps at >= ~819K tokens with batch_idx >= 4) — same overflow class
++        # as the guarded physical_block_idx multiply above.
++        output_row_ptr = (
++            out_ptr
++            + batch_idx.to(tl.int64) * out_stride0
++            + (offset + i) * out_stride1
++        )
+ 
+         # ========== Dequantize FP8 portion using UE8M0 ==========
+         for qblock_idx in tl.static_range(n_quant_blocks):
+@@ -386,6 +394,7 @@
+     block_table: torch.Tensor,
+     block_size: int,
+     is_valid_token: torch.Tensor,
++    num_blocks: int | None = None,
+ ) -> tuple[torch.Tensor, torch.Tensor]:
+     """Map local topk indices to global KV cache slots and count valid entries.
+ 
+@@ -393,10 +402,16 @@
+     1. Block-table lookup (local index → global slot id)
+     2. Valid-entry counting (topk_lens per token)
+     3. Masking padding tokens to length 0
++
++    ``num_blocks`` is the block count of the KV cache these slots index into;
++    slots resolving to a block outside it reference nonexistent KV (stale
++    block-table entries) and are dropped rather than gathered out of bounds.
++    When ``None`` the bound is disabled (no-op sentinel).
+     """
+     num_tokens = topk_indices.shape[0]
+     global_topk_indices = torch.empty_like(topk_indices)
+     topk_lens = torch.empty(num_tokens, dtype=torch.int32, device=topk_indices.device)
++    num_blocks_bound = (1 << 31) - 1 if num_blocks is None else num_blocks
+     _compute_global_topk_indices_and_lens_kernel[(num_tokens,)](
+         global_topk_indices,
+         global_topk_indices.stride(0),
+@@ -409,6 +424,7 @@
+         block_table.stride(0),
+         block_size,
+         is_valid_token,
++        num_blocks_bound,
+         TRITON_BLOCK_SIZE=1024,
+     )
+     return global_topk_indices, topk_lens
+@@ -427,6 +443,7 @@
+     block_table_stride,
+     block_size,
+     is_valid_token_ptr,
++    num_blocks,
+     TRITON_BLOCK_SIZE: tl.constexpr,
+ ):
+     token_idx = tl.program_id(0)
+@@ -443,13 +460,25 @@
+             mask=mask,
+             other=-1,
+         )
+-        is_valid = local_idx >= 0
++        # Padding tokens (is_valid_token == 0) keep uninitialized entries in the
++        # persistent topk_indices buffer; those stale indices must not drive the
++        # block-table gather or it reads out of bounds. Gate the gather on token
++        # validity as well as the per-slot sentinel.
++        is_valid = (local_idx >= 0) & (is_valid_token != 0)
+ 
+         block_indices = local_idx // block_size
++        # A stale local_idx can exceed the request's block-table row; don't read
++        # past it.
++        is_valid = is_valid & (block_indices < block_table_stride)
+         block_numbers = tl.load(
+             block_table_ptr + req_idx * block_table_stride + block_indices,
+             mask=mask & is_valid,
++            other=-1,
+         )
++        # A block number outside the KV cache is a stale/unallocated block-table
++        # entry pointing at nonexistent KV. Dropping it (vs. gathering out of
++        # bounds) is correct: there is nothing valid to attend at that slot.
++        is_valid = is_valid & (block_numbers >= 0) & (block_numbers < num_blocks)
+         block_offsets = local_idx % block_size
+ 
+         slot_ids = block_numbers * block_size + block_offsets

@@ -43,6 +43,7 @@ def qkv_post_f16(
     has_k_norm: Int,
     eps: Float32,
     theta_base: Float32,
+    apply_rope: Int,
 ):
     """Fused rmsnorm(q/k) + rope(q/k) + kv_append for the single-token step.
 
@@ -68,7 +69,7 @@ def qkv_post_f16(
             val = raw * inv * Float32(q_norm_w[tid])
         staged[tid] = Float16(val)
         barrier()
-        if tid < half:
+        if apply_rope == 1 and tid < half:
             freq = pow(theta_base, Float32(-2 * tid) / Float32(head_dim))
             angle = Float32(positions[0]) * freq
             c = cos(angle)
@@ -77,6 +78,8 @@ def qkv_post_f16(
             b = Float32(staged[half + tid])
             q_io[base + tid] = Float16(a * c - b * s)
             q_io[base + half + tid] = Float16(a * s + b * c)
+        elif apply_rope == 0:
+            q_io[base + tid] = staged[tid]
     else:
         kvh = blk - n_heads
         base = kvh * head_dim
@@ -93,7 +96,7 @@ def qkv_post_f16(
         page = Int(page_table[pos // page_size])
         slot = pos % page_size
         dst = ((page * n_kv_heads + kvh) * page_size + slot) * head_dim
-        if tid < half:
+        if apply_rope == 1 and tid < half:
             freq = pow(theta_base, Float32(-2 * tid) / Float32(head_dim))
             angle = Float32(positions[0]) * freq
             c = cos(angle)
@@ -102,4 +105,6 @@ def qkv_post_f16(
             b = Float32(staged[half + tid])
             k_cache[dst + tid] = Float16(a * c - b * s)
             k_cache[dst + half + tid] = Float16(a * s + b * c)
+        elif apply_rope == 0:
+            k_cache[dst + tid] = staged[tid]
         v_cache[dst + tid] = v_in[base + tid]

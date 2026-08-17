@@ -283,3 +283,55 @@ impl LiveRegionComponent {
         })
     }
 }
+
+// -----------------------------------------------------------------------------
+// 0x0F01 — ZoneEditor (TentaFlow extension; OUTSIDE catalog v1)
+// -----------------------------------------------------------------------------
+
+/// Polygon zone editor drawn over a still camera frame. The operator clicks to
+/// place vertices, closes a polygon, and the renderer emits the full set on the
+/// `"commit"` handler.
+///
+/// Zones travel as a JSON STRING (`[[[x,y],...], ...]`, normalized 0.0-1.0)
+/// rather than nested arrays: it is the exact shape already persisted in
+/// `cameras.zones_json`, so no lossy conversion sits between what the operator
+/// draws and what the vision engine filters on.
+///
+/// This tag lives outside the frozen v1 catalog on purpose — it is a product
+/// component, not part of the addon-UI contract other SDKs generate bindings for.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ZoneEditor {
+    /// Background still frame (signed snapshot URL) the zones are drawn on.
+    pub image_ref: BindRef,
+    /// Existing zones as the normalized JSON string described above.
+    pub zones_json: BindRef,
+}
+
+impl ZoneEditor {
+    pub const TAG: u16 = 0x0F01;
+
+    pub fn into_component(self, id: impl Into<String>) -> Result<Component, IntoComponentError> {
+        let mut e: Vec<(u8, Value)> = Vec::with_capacity(2);
+        e.push((0, encode_to_value(&self.image_ref)?));
+        e.push((1, encode_to_value(&self.zones_json)?));
+        Ok(component(Self::TAG, id, e))
+    }
+
+    pub fn try_from_component(c: &Component) -> Result<Self, minicbor::decode::Error> {
+        ensure_tag(c.tag, Self::TAG, "ZoneEditor")?;
+        ensure_no_duplicate_keys("ZoneEditor", &c.fields.0)?;
+        let mut image_ref = None;
+        let mut zones_json = None;
+        for (k, v) in &c.fields.0 {
+            match k {
+                0 => image_ref = Some(decode_from_value(v)?),
+                1 => zones_json = Some(decode_from_value(v)?),
+                other => return Err(unknown_field("ZoneEditor", *other)),
+            }
+        }
+        Ok(Self {
+            image_ref: image_ref.ok_or_else(|| missing_field("ZoneEditor", "image_ref"))?,
+            zones_json: zones_json.ok_or_else(|| missing_field("ZoneEditor", "zones_json"))?,
+        })
+    }
+}

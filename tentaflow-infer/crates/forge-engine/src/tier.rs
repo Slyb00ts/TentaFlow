@@ -198,8 +198,8 @@ impl TierManager {
             let (dir, default_dir) = match &cfg.dir {
                 Some(d) => (d.clone(), None),
                 None => {
-                    let d = std::env::temp_dir()
-                        .join(format!("forge-kv-tier-{}", std::process::id()));
+                    let d =
+                        std::env::temp_dir().join(format!("forge-kv-tier-{}", std::process::id()));
                     (d.clone(), Some(d))
                 }
             };
@@ -359,8 +359,13 @@ impl TierManager {
             }
         }
         stream.synchronize()?;
-        ema(&self.d2h_bps, bytes as f64 / t0.elapsed().as_secs_f64(), DEFAULT_D2H_BPS);
-        self.spilled_bytes.set(self.spilled_bytes.get() + bytes as u64);
+        ema(
+            &self.d2h_bps,
+            bytes as f64 / t0.elapsed().as_secs_f64(),
+            DEFAULT_D2H_BPS,
+        );
+        self.spilled_bytes
+            .set(self.spilled_bytes.get() + bytes as u64);
         for i in 0..n {
             kv.push_free(seq.pages[first + i]);
             seq.pages[first + i] = -1;
@@ -417,10 +422,7 @@ impl TierManager {
             };
             let host = buf.host_ptr().expect("pinned buffer has host mapping");
             let slice = unsafe { std::slice::from_raw_parts(host, chunk.bytes) };
-            let (offset, reused) = match self
-                .free_extents
-                .get_mut(&chunk.bytes)
-                .and_then(Vec::pop)
+            let (offset, reused) = match self.free_extents.get_mut(&chunk.bytes).and_then(Vec::pop)
             {
                 Some(off) => (off, true),
                 None => {
@@ -479,7 +481,11 @@ impl TierManager {
 
     /// Feed a measured prefill rate into the recompute estimate.
     pub fn note_prefill(&self, tokens: usize, secs: f64) {
-        ema(&self.prefill_tps, tokens as f64 / secs.max(1e-9), DEFAULT_PREFILL_TPS);
+        ema(
+            &self.prefill_tps,
+            tokens as f64 / secs.max(1e-9),
+            DEFAULT_PREFILL_TPS,
+        );
     }
 
     /// Restore every spilled chunk of `seq` into freshly allocated VRAM pages.
@@ -562,8 +568,13 @@ impl TierManager {
             p.set(false);
         }
         drop(retained);
-        ema(&self.h2d_bps, total as f64 / t0.elapsed().as_secs_f64(), DEFAULT_H2D_BPS);
-        self.restored_bytes.set(self.restored_bytes.get() + total as u64);
+        ema(
+            &self.h2d_bps,
+            total as f64 / t0.elapsed().as_secs_f64(),
+            DEFAULT_H2D_BPS,
+        );
+        self.restored_bytes
+            .set(self.restored_bytes.get() + total as u64);
         tracing::info!(
             "kv tier restore: seq {} {:.1} MiB in {:.1} ms ({:.1} GB/s)",
             seq.id,
@@ -602,7 +613,10 @@ impl TierManager {
             )?);
             self.scratch_pending[slot].set(false);
         }
-        Ok(self.scratch[slot].as_ref().expect("allocated above").clone())
+        Ok(self.scratch[slot]
+            .as_ref()
+            .expect("allocated above")
+            .clone())
     }
 
     /// Host-wait until the slot's previously enqueued copies out of its
@@ -633,7 +647,9 @@ impl TierManager {
         // Chunks pack managed layers by their compact position; a global layer
         // index maps to that position (attention-only for the hybrid path).
         let ci = *self.layer_slot.get(&l).ok_or_else(|| {
-            ForgeError::Scheduler(format!("kv tier stage_layer: layer {l} is not tier-managed"))
+            ForgeError::Scheduler(format!(
+                "kv tier stage_layer: layer {l} is not tier-managed"
+            ))
         })?;
         let mut any_cold = false;
         let mut cursor = 0usize;
@@ -669,9 +685,8 @@ impl TierManager {
                         ForgeError::Scheduler("kv tier scratch missing (prepare_streaming)".into())
                     })?;
                     let host = scratch.host_ptr().expect("pinned mapping");
-                    let dst = unsafe {
-                        std::slice::from_raw_parts_mut(host.add(cursor), layer_span)
-                    };
+                    let dst =
+                        unsafe { std::slice::from_raw_parts_mut(host.add(cursor), layer_span) };
                     let tr = Instant::now();
                     read_exact_at(
                         self.file.as_ref().expect("nvme file"),
@@ -719,7 +734,8 @@ impl TierManager {
                     .copy(buf, phys * rb, stage, logical * rb, rb, stream)?;
             }
         }
-        self.streamed_bytes.set(self.streamed_bytes.get() + bytes as u64);
+        self.streamed_bytes
+            .set(self.streamed_bytes.get() + bytes as u64);
         Ok(())
     }
 

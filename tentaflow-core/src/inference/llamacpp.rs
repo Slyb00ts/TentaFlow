@@ -364,6 +364,8 @@ impl InferenceEngine for LlamaCppEngine {
         let mut stop = StopReason::EndOfText;
         let mut ttft: Option<Instant> = None;
         let mut hard_error: Option<String> = None;
+        let mut engine_completion_tps = 0.0_f32;
+        let mut engine_ttft_ms = 0_u32;
 
         while let Some(token) = rx.recv().await {
             if !token.text.is_empty() {
@@ -376,6 +378,8 @@ impl InferenceEngine for LlamaCppEngine {
                 generated_tokens = token.generated_tokens;
                 // CR-004: realna liczba tokenów promptu z silnika (slot zna prompt.len()).
                 prompt_tokens = token.prompt_tokens;
+                engine_completion_tps = token.completion_tps;
+                engine_ttft_ms = token.ttft_ms;
                 if let Some(FinishReason::Error(msg)) = &token.finish_reason {
                     hard_error = Some(msg.clone());
                 }
@@ -389,7 +393,14 @@ impl InferenceEngine for LlamaCppEngine {
         }
 
         let elapsed = start.elapsed();
-        let ttft_ms = ttft.map(|t| t.duration_since(start).as_millis() as u64);
+        // Pomiar silnika (granice faz slotu) bije zegar ścienny konsumenta, który
+        // łapie kolejkę kanału; wall-clock zostaje fallbackiem dla silnika bez
+        // pomiaru (0). Ta sama zasada co w `stream_tokens_to_chunks`.
+        let ttft_ms = if engine_ttft_ms > 0 {
+            Some(u64::from(engine_ttft_ms))
+        } else {
+            ttft.map(|t| t.duration_since(start).as_millis() as u64)
+        };
         // CR-004: tok/s liczymy od PIERWSZEGO tokena (TTFT), nie od startu — czas
         // prefillu/TTFT nie zaniża tempa dekodowania. Bez pierwszego tokena (0 lub 1
         // wygenerowany) tempo nie ma sensu → 0.0.
@@ -399,11 +410,11 @@ impl InferenceEngine for LlamaCppEngine {
                 .as_secs_f64(),
             None => 0.0,
         };
-        let tokens_per_second = if decode_secs > 0.0 && generated_tokens > 1 {
-            (generated_tokens.saturating_sub(1)) as f64 / decode_secs
-        } else {
-            0.0
-        };
+        let tokens_per_second = f64::from(super::decode_tps(
+            engine_completion_tps,
+            generated_tokens,
+            decode_secs as f32,
+        ));
 
         Ok(GenerateResult {
             text,

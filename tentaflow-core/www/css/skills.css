@@ -19,6 +19,31 @@
   max-width: 340px;
 }
 
+/* tf-select/tf-input default to width:100%, which would push every filter onto
+   its own toolbar row — pin them to their content width instead. */
+.skills-toolbar tf-select,
+.skills-toolbar tf-input {
+  flex: 0 0 auto;
+  width: auto;
+  min-width: 170px;
+}
+
+/* The hub source field takes a full owner/repo/path or a URL — give it room
+   to breathe instead of clipping the placeholder. */
+.skills-toolbar tf-input {
+  flex: 1 1 260px;
+  min-width: 240px;
+  max-width: 420px;
+}
+
+.skills-toolbar tf-button {
+  flex: 0 0 auto;
+}
+
+.skills-toolbar-spacer {
+  flex: 1 1 auto;
+}
+
 .skills-filter {
   min-width: 170px;
 }
@@ -94,9 +119,12 @@
   flex: 1;
 }
 
-.skills-content .tf-textarea {
-  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-  font-size: 12.5px;
+tf-code-editor.skills-content {
+  display: block;
+  height: 340px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm, 8px);
+  overflow: hidden;
 }
 
 .skills-files {

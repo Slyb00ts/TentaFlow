@@ -59,6 +59,7 @@ pub fn spawn_recog_training(
     hyperparams: tentaflow_protocol::MlStudioRecogHyperparams,
 ) {
     tokio::spawn(async move {
+        crate::ml_studio::live_view::register_local_run(&run_id);
         if let Err(err) = run_training(
             &run_id,
             &project_id,
@@ -72,8 +73,9 @@ pub fn spawn_recog_training(
             tracing::warn!(run_id = %run_id, error = %err, "RF-DETR training failed");
             let _ = repository::update_training_run_status(&run_id, "failed");
         }
-        // Sprzątamy wpis live-view niezależnie od wyniku (job już nie żyje).
+        // Sprzątamy wpisy live-view niezależnie od wyniku (job już nie żyje).
         crate::ml_studio::live_view::clear_local_job(&run_id);
+        crate::ml_studio::live_view::forget_local_run(&run_id);
     });
 }
 
@@ -206,6 +208,13 @@ async fn run_training_against_dir(
                 JOB_TIMEOUT.as_secs()
             );
         }
+        // Anulowanie zgłoszone przez użytkownika: serwis dostał już `POST /cancel`
+        // od handlera, więc pętla nadzoru nie ma czego pilnować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            repository::update_training_run_status(run_id, "cancelled")?;
+            crate::ml_studio::live_view::clear_cancel(run_id);
+            return Ok(());
+        }
         tokio::time::sleep(POLL_INTERVAL).await;
 
         let url = status_url.clone();
@@ -221,6 +230,11 @@ async fn run_training_against_dir(
 
         match st.status.as_str() {
             "running" => continue,
+            "cancelled" => {
+                repository::update_training_run_status(run_id, "cancelled")?;
+                crate::ml_studio::live_view::clear_cancel(run_id);
+                return Ok(());
+            }
             "succeeded" => {
                 let metrics_json = json!({
                     "train_loss": st.train_loss,
@@ -262,42 +276,41 @@ const VALID_HOLDOUT_STRIDE: usize = 7;
 /// Minimalna liczba obrazów w train/ wymagana do sensownego treningu.
 const MIN_TRAIN_IMAGES: usize = 4;
 
-/// Przygotowuje katalog treningowy z gwarantowanym splitem valid/.
+/// Przygotowuje katalog treningowy z gwarantowanym splitem valid/, zawężony do
+/// obrazów ZATWIERDZONYCH przez człowieka.
 ///
-/// Gdy `coco_path` ma już `valid/_annotations.coco.json` → zwraca go bez zmian.
-/// Gdy ma TYLKO `train/` → tworzy efemeryczną kopię pod cache (train/ + valid/),
-/// deterministycznie wstrzymując co `VALID_HOLDOUT_STRIDE`-ty obraz do valid/.
-/// Oryginalny `coco_path` pozostaje NIETKNIĘTY (read-only).
+/// Bramka zatwierdzenia: obrazy z `approved: true` to jedyny materiał treningowy —
+/// predykcje auto-labela, których nikt nie obejrzał, nie mogą uczyć modelu na jego
+/// własnych wyjściach. Datasety zbudowane w ML Studio zawsze niosą to pole (start
+/// `false`, edytor podnosi je przez „Zapisz i zatwierdź").
+///
+/// Dataset, w którym ŻADEN obraz nie ma pola `approved`, nie przeszedł przez nasz
+/// edytor (zewnętrzny COCO, np. Roboflow) — nie ma czego bramkować, więc idzie
+/// w całości i, gdy ma własny `valid/`, bez żadnych zmian.
+///
+/// Pozostałe przypadki dostają efemeryczną kopię pod cache: zatwierdzone obrazy
+/// ze WSZYSTKICH splitów wracają do jednej puli i są dzielone deterministycznie
+/// (co `VALID_HOLDOUT_STRIDE`-ty → valid/, poprzedni → test/). Oryginalny
+/// `coco_path` pozostaje NIETKNIĘTY (read-only).
 fn prepare_dataset_with_valid(coco_path: &Path, run_id: &str) -> anyhow::Result<PreparedDataset> {
+    let pooled = pool_splits(coco_path)?;
     let valid_annot = coco_path.join("valid").join("_annotations.coco.json");
-    if valid_annot.is_file() {
+    if !pooled.has_review_flag && valid_annot.is_file() {
         return Ok(PreparedDataset::Original(coco_path.to_path_buf()));
     }
 
-    let train_dir = coco_path.join("train");
-    let train_annot = train_dir.join("_annotations.coco.json");
-    if !train_annot.is_file() {
-        anyhow::bail!(
-            "dataset COCO bez splitu valid/ ani train/ ({})",
-            coco_path.display()
-        );
-    }
-
-    let coco: serde_json::Value = serde_json::from_slice(&std::fs::read(&train_annot)?)
-        .map_err(|e| anyhow::anyhow!("train/_annotations.coco.json niepoprawny: {}", e))?;
-    let categories = coco.get("categories").cloned().unwrap_or(json!([]));
-    let images = coco
-        .get("images")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
-    let annotations = coco
-        .get("annotations")
-        .and_then(|v| v.as_array())
-        .cloned()
-        .unwrap_or_default();
+    let categories = pooled.categories;
+    let images = pooled.images;
+    let annotations = pooled.annotations;
 
     if images.len() < MIN_TRAIN_IMAGES {
+        if pooled.has_review_flag {
+            anyhow::bail!(
+                "za mało zatwierdzonych obrazów do treningu ({} z {}) — zatwierdź adnotacje przyciskiem „Zapisz i zatwierdź\" w edytorze",
+                images.len(),
+                pooled.images_seen
+            );
+        }
         anyhow::bail!("zbiór za mały do treningu — dodaj więcej obrazów");
     }
 
@@ -395,11 +408,170 @@ fn prepare_dataset_with_valid(coco_path: &Path, run_id: &str) -> anyhow::Result<
 
     // Kopiujemy (preferując hardlink) pliki obrazów do odpowiednich splitów.
     // Serwis czyta obrazy po file_name z katalogu danego splitu.
-    copy_split_images(&train_dir, &dest_train, &train_images)?;
-    copy_split_images(&train_dir, &dest_valid, &valid_images)?;
-    copy_split_images(&train_dir, &dest_test, &test_images)?;
+    copy_split_images(&pooled.sources, &dest_train, &train_images)?;
+    copy_split_images(&pooled.sources, &dest_valid, &valid_images)?;
+    copy_split_images(&pooled.sources, &dest_test, &test_images)?;
 
     Ok(PreparedDataset::Ephemeral(dest))
+}
+
+/// Splity COCO przeszukiwane przy budowie puli treningowej, w stałej kolejności.
+const COCO_SPLITS: [&str; 3] = ["train", "valid", "test"];
+
+/// Pula obrazów zatwierdzonych, zebrana ze wszystkich splitów datasetu. `id`
+/// obrazów są przenumerowane (dwa splity mogą używać tych samych id), a
+/// `file_name` sprowadzone do unikalnej nazwy w płaskim katalogu docelowym —
+/// `sources` mapuje przenumerowane id na plik źródłowy do skopiowania.
+struct PooledDataset {
+    categories: serde_json::Value,
+    images: Vec<serde_json::Value>,
+    annotations: Vec<serde_json::Value>,
+    sources: std::collections::HashMap<i64, std::path::PathBuf>,
+    /// Czy w datasecie WYSTĘPUJE pole `approved` (czyli czy przeszedł przez nasz
+    /// edytor i bramka zatwierdzenia ma sens).
+    has_review_flag: bool,
+    /// Liczba obrazów przed bramką — do komunikatu „X z Y zatwierdzonych".
+    images_seen: usize,
+}
+
+/// Zbiera zatwierdzone obrazy (i ich adnotacje) ze wszystkich splitów `coco_path`.
+/// Gdy żaden obraz nie ma pola `approved`, bramka jest nieaktywna i pula obejmuje
+/// wszystkie obrazy (zewnętrzny dataset, nigdy nie recenzowany w naszym edytorze).
+fn pool_splits(coco_path: &Path) -> anyhow::Result<PooledDataset> {
+    let mut loaded: Vec<(std::path::PathBuf, serde_json::Value)> = Vec::new();
+    for split in COCO_SPLITS {
+        let dir = coco_path.join(split);
+        let annot = dir.join("_annotations.coco.json");
+        if !annot.is_file() {
+            continue;
+        }
+        let doc: serde_json::Value = serde_json::from_slice(&std::fs::read(&annot)?)
+            .map_err(|e| anyhow::anyhow!("{}/_annotations.coco.json niepoprawny: {}", split, e))?;
+        loaded.push((dir, doc));
+    }
+    if loaded.is_empty() {
+        anyhow::bail!(
+            "dataset COCO bez splitu train/, valid/ ani test/ ({})",
+            coco_path.display()
+        );
+    }
+
+    let has_review_flag = loaded.iter().any(|(_, doc)| {
+        doc.get("images")
+            .and_then(|v| v.as_array())
+            .is_some_and(|imgs| imgs.iter().any(|im| im.get("approved").is_some()))
+    });
+
+    let mut categories = json!([]);
+    let mut images: Vec<serde_json::Value> = Vec::new();
+    let mut annotations: Vec<serde_json::Value> = Vec::new();
+    let mut sources: std::collections::HashMap<i64, std::path::PathBuf> =
+        std::collections::HashMap::new();
+    let mut used_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut images_seen = 0usize;
+    let mut next_image_id: i64 = 1;
+    let mut next_annot_id: i64 = 1;
+
+    for (dir, doc) in &loaded {
+        if categories.as_array().is_none_or(|c| c.is_empty()) {
+            if let Some(cats) = doc.get("categories") {
+                categories = cats.clone();
+            }
+        }
+        let split_images = doc
+            .get("images")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let split_annots = doc
+            .get("annotations")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        images_seen += split_images.len();
+
+        // Stare id → nowe id, dla obrazów które przeszły bramkę.
+        let mut id_map: std::collections::HashMap<i64, i64> = std::collections::HashMap::new();
+        for img in &split_images {
+            if has_review_flag
+                && !img
+                    .get("approved")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false)
+            {
+                continue;
+            }
+            let Some(old_id) = img.get("id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let file_name = coco_image_file_name(img);
+            let Some(base) = Path::new(&file_name).file_name().map(|b| b.to_owned()) else {
+                continue;
+            };
+            let src = dir.join(&base);
+            if !src.is_file() {
+                anyhow::bail!("obraz datasetu nie istnieje: {}", src.display());
+            }
+            let dest_name = unique_file_name(&base.to_string_lossy(), &mut used_names);
+            let new_id = next_image_id;
+            next_image_id += 1;
+            id_map.insert(old_id, new_id);
+            sources.insert(new_id, src);
+
+            let mut record = img.clone();
+            record["id"] = json!(new_id);
+            record["file_name"] = json!(dest_name);
+            images.push(record);
+        }
+
+        for ann in &split_annots {
+            let Some(old_img_id) = ann.get("image_id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let Some(&new_img_id) = id_map.get(&old_img_id) else {
+                continue;
+            };
+            let mut record = ann.clone();
+            record["id"] = json!(next_annot_id);
+            record["image_id"] = json!(new_img_id);
+            next_annot_id += 1;
+            annotations.push(record);
+        }
+    }
+
+    Ok(PooledDataset {
+        categories,
+        images,
+        annotations,
+        sources,
+        has_review_flag,
+        images_seen,
+    })
+}
+
+/// Nadaje nazwie pliku unikalność w płaskim katalogu docelowym: przy kolizji
+/// wstawia `_2`, `_3`, … przed rozszerzeniem. Dwa splity mogą nieść ten sam
+/// `file_name`, a wszystkie obrazy jednego splitu leżą w jednym katalogu.
+fn unique_file_name(name: &str, used: &mut std::collections::HashSet<String>) -> String {
+    if used.insert(name.to_string()) {
+        return name.to_string();
+    }
+    let path = Path::new(name);
+    let stem = path
+        .file_stem()
+        .map(|s| s.to_string_lossy().to_string())
+        .unwrap_or_else(|| name.to_string());
+    let ext = path
+        .extension()
+        .map(|e| format!(".{}", e.to_string_lossy()))
+        .unwrap_or_default();
+    for n in 2.. {
+        let candidate = format!("{}_{}{}", stem, n, ext);
+        if used.insert(candidate.clone()) {
+            return candidate;
+        }
+    }
+    unreachable!("nazwa pliku zawsze uzyskuje unikalny sufiks")
 }
 
 /// file_name obrazu z rekordu COCO (pusty string gdy brak — stabilne sortowanie).
@@ -430,10 +602,12 @@ fn write_split_coco(
     Ok(())
 }
 
-/// Kopiuje pliki obrazów wymienione w `images` z `src_dir` do `dst_dir`. Preferuje
-/// hardlink (zero dodatkowego miejsca); gdy się nie uda (inny FS) — kopiuje bajty.
+/// Kopiuje pliki obrazów wymienione w `images` do `dst_dir`, biorąc ścieżkę
+/// źródłową z mapy `sources` (obrazy puli mogą pochodzić z różnych splitów).
+/// Preferuje hardlink (zero dodatkowego miejsca); gdy się nie uda (inny FS) —
+/// kopiuje bajty.
 fn copy_split_images(
-    src_dir: &Path,
+    sources: &std::collections::HashMap<i64, std::path::PathBuf>,
     dst_dir: &Path,
     images: &[&serde_json::Value],
 ) -> anyhow::Result<()> {
@@ -441,17 +615,19 @@ fn copy_split_images(
         let Some(name) = img.get("file_name").and_then(|v| v.as_str()) else {
             continue;
         };
+        let Some(id) = img.get("id").and_then(|v| v.as_i64()) else {
+            continue;
+        };
+        let src = sources
+            .get(&id)
+            .ok_or_else(|| anyhow::anyhow!("brak pliku źródłowego dla obrazu {}", name))?;
         // Tylko nazwa pliku — odcięcie ewentualnych komponentów ścieżki (zip slip).
         let Some(base) = Path::new(name).file_name() else {
             continue;
         };
-        let src = src_dir.join(base);
-        if !src.is_file() {
-            anyhow::bail!("obraz datasetu nie istnieje: {}", src.display());
-        }
         let dst = dst_dir.join(base);
-        if std::fs::hard_link(&src, &dst).is_err() {
-            std::fs::copy(&src, &dst)?;
+        if std::fs::hard_link(src, &dst).is_err() {
+            std::fs::copy(src, &dst)?;
         }
     }
     Ok(())
@@ -727,18 +903,31 @@ pub fn spawn_mesh_dataset_push_and_train(
             Err(e) => Err(anyhow::anyhow!("zip join: {}", e)),
         };
         if let Err(err) = result {
-            tracing::warn!(run_id = %run_id, error = %err, "mesh dataset push/train failed");
-            set_recog_sync(
-                &run_id,
-                DatasetSyncProgress {
-                    phase: "error".into(),
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                },
-            );
-            let _ = repository::update_training_run_status(&run_id, "failed");
+            finish_failed_mesh_push(&run_id, &err, "mesh dataset push/train failed");
         }
     });
+}
+
+/// Domyka run, którego transfer datasetu przez mesh się nie udał. Anulowanie
+/// przez użytkownika kończy run jako `cancelled` (nie `failed`) i nie zostawia
+/// paska błędu w UI — to nie awaria, tylko decyzja operatora.
+fn finish_failed_mesh_push(run_id: &str, err: &anyhow::Error, log_msg: &str) {
+    if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+        clear_recog_sync(run_id);
+        let _ = repository::update_training_run_status(run_id, "cancelled");
+        crate::ml_studio::live_view::clear_cancel(run_id);
+        return;
+    }
+    tracing::warn!(run_id = %run_id, error = %err, "{}", log_msg);
+    set_recog_sync(
+        run_id,
+        DatasetSyncProgress {
+            phase: "error".into(),
+            error: Some(err.to_string()),
+            ..Default::default()
+        },
+    );
+    let _ = repository::update_training_run_status(run_id, "failed");
 }
 
 /// Wariant generyczny: transfer GOTOWEGO zip-a (np. spakowany blob JSONL dla LLM)
@@ -762,16 +951,7 @@ pub fn spawn_mesh_push_and_train(
         )
         .await
         {
-            tracing::warn!(run_id = %run_id, error = %err, "mesh blob push/train failed");
-            set_recog_sync(
-                &run_id,
-                DatasetSyncProgress {
-                    phase: "error".into(),
-                    error: Some(err.to_string()),
-                    ..Default::default()
-                },
-            );
-            let _ = repository::update_training_run_status(&run_id, "failed");
+            finish_failed_mesh_push(&run_id, &err, "mesh blob push/train failed");
         }
     });
 }
@@ -805,6 +985,11 @@ async fn mesh_push_and_train(
     let mut rate_bps: u64 = 0;
     let mut seq: u32 = 0;
     while seq < total_chunks {
+        // Anulowanie w trakcie transferu: przerywamy wysyłkę zamiast dowozić kilka
+        // GB datasetu na węzeł, na którym trening już nie ma wystartować.
+        if crate::ml_studio::live_view::is_cancel_requested(run_id) {
+            anyhow::bail!("anulowane przez użytkownika");
+        }
         if last_advance.elapsed() > SYNC_STALL_TIMEOUT {
             anyhow::bail!(
                 "transfer datasetu utknął — brak postępu przez {}s",
@@ -1104,6 +1289,26 @@ pub async fn mesh_train_start(run_id: &str, spec_json: &str) -> anyhow::Result<(
         .lock()
         .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
         .insert(run_id.to_string(), (base, job_id));
+    Ok(())
+}
+
+/// B-side (odbiorca `MlTrainCancel`): woła `/cancel` lokalnego serwisu dla joba
+/// zmapowanego z `run_id`. Postęp anulowania inicjator zobaczy przez zwykły status
+/// (serwis przechodzi w `cancelled`).
+pub async fn mesh_train_cancel(run_id: &str) -> anyhow::Result<()> {
+    let (base, job_id) = mesh_jobs()
+        .lock()
+        .map_err(|_| anyhow::anyhow!("mesh_jobs lock poisoned"))?
+        .get(run_id)
+        .cloned()
+        .ok_or_else(|| anyhow::anyhow!("nieznany run_id na tym nodzie: {}", run_id))?;
+    let ok = tokio::task::spawn_blocking(move || {
+        crate::ml_studio::live_view::cancel_service_job_blocking(&base, &job_id)
+    })
+    .await?;
+    if !ok {
+        anyhow::bail!("serwis treningowy odrzucił żądanie anulowania");
+    }
     Ok(())
 }
 

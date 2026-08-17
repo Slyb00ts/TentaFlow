@@ -11,6 +11,60 @@ use std::path::Path;
 
 use super::bundle;
 
+/// Hard limits of a container executing UNTRUSTED code (the Project Studio
+/// test runner). Bollard's default `HostConfig` constrains nothing — a
+/// container running agent-authored tests would get the whole host RAM, full
+/// capabilities and a writable rootfs.
+///
+/// ARCHITECTURE NOTE: the target design (F3 variant A) has Core create an
+/// EPHEMERAL container per run and also enforce `network_mode = "none"` for
+/// unit tests. This version applies the limits to the long-lived test-runner
+/// service, because per-run container orchestration needs its own lifecycle
+/// (build/mount/cleanup) outside the scope of this change. Network allowlist
+/// enforcement already runs on the Python side (`executor/sandbox_net.py` plus
+/// Playwright routing), so the network boundary does not disappear — only the
+/// place where it is enforced.
+#[derive(Debug, Clone)]
+pub struct SandboxLimits {
+    /// `"none"` = no network, `"bridge"` = network with the runner-side allowlist.
+    pub network_mode: String,
+    pub memory_bytes: i64,
+    /// CPU limit in nano-cores (1 core = 1_000_000_000).
+    pub nano_cpus: i64,
+    pub pids_limit: i64,
+    /// Read-only rootfs plus a `noexec` tmpfs on `/tmp`.
+    pub readonly_rootfs: bool,
+    pub tmpfs_bytes: u64,
+    /// Writable tmpfs for the service work directory, or `None` when the image
+    /// only needs `/tmp`. A read-only rootfs makes a container whose process
+    /// creates its work tree (the test runner rmtree+mkdir's
+    /// `TEST_RUNNER_WORK_DIR` on startup) fail before it can serve `/health`.
+    pub work_tmpfs: Option<(String, u64)>,
+}
+
+impl SandboxLimits {
+    /// Test-runner profile: 4 GiB RAM, 2 cores, 512 processes, read-only
+    /// rootfs, no extra capabilities and writes confined to two tmpfs mounts —
+    /// `/tmp` (1 GiB, noexec) and the run work tree `/var/lib/tentaflow`
+    /// (2 GiB), which holds the generated scripts, pytest reports, Playwright
+    /// traces and screenshots of every concurrent run.
+    ///
+    /// The memory cap covers BOTH tmpfs mounts: tmpfs pages are charged to the
+    /// container's memory cgroup, so a 2 GiB cap next to 3 GiB of tmpfs would
+    /// OOM-kill the runner as soon as a run produced large artifacts.
+    pub fn test_runner() -> Self {
+        Self {
+            network_mode: "bridge".to_string(),
+            memory_bytes: 4 * 1024 * 1024 * 1024,
+            nano_cpus: 2_000_000_000,
+            pids_limit: 512,
+            readonly_rootfs: true,
+            tmpfs_bytes: 1024 * 1024 * 1024,
+            work_tmpfs: Some(("/var/lib/tentaflow".to_string(), 2 * 1024 * 1024 * 1024)),
+        }
+    }
+}
+
 /// Konfiguracja deployu jednego kontenera.
 #[derive(Debug, Clone)]
 pub struct DeployRequest {
@@ -32,6 +86,9 @@ pub struct DeployRequest {
     pub env: HashMap<String, String>,
     /// Czy uzyc GPU (--gpus all)
     pub gpu: bool,
+    /// Twarde limity dla kontenerow wykonujacych niezaufany kod. `None` =
+    /// zaufany silnik (LLM, TTS...) bez dodatkowych ograniczen.
+    pub sandbox: Option<SandboxLimits>,
 }
 
 /// Buduje obraz Docker z embedowanego kontekstu i uruchamia kontener.
@@ -112,6 +169,47 @@ async fn build_image(docker: &Docker, context: &Path, container: &str, tag: &str
     Ok(())
 }
 
+/// Applies `SandboxLimits` to a `HostConfig`. Additive: fields the sandbox does
+/// not touch (ports, binds, GPU) stay as they are.
+#[cfg(feature = "docker")]
+pub fn apply_sandbox_limits(
+    host_config: &mut bollard::models::HostConfig,
+    limits: &SandboxLimits,
+) {
+    host_config.network_mode = Some(limits.network_mode.clone());
+    host_config.memory = Some(limits.memory_bytes);
+    host_config.nano_cpus = Some(limits.nano_cpus);
+    host_config.pids_limit = Some(limits.pids_limit);
+    // Drop ALL capabilities: a test process needs none of them.
+    host_config.cap_drop = Some(vec!["ALL".to_string()]);
+    // Blocks escalation through setuid binaries inside the image.
+    host_config.security_opt = Some(vec!["no-new-privileges".to_string()]);
+    host_config.readonly_rootfs = Some(limits.readonly_rootfs);
+    if limits.readonly_rootfs {
+        // A read-only rootfs needs a writable /tmp — `noexec` prevents running
+        // a downloaded binary from there, `nosuid` blocks setuid.
+        let mut tmpfs = HashMap::new();
+        tmpfs.insert(
+            "/tmp".to_string(),
+            format!("rw,noexec,nosuid,nodev,size={}", limits.tmpfs_bytes),
+        );
+        if let Some((path, size)) = &limits.work_tmpfs {
+            // The work tree is created by the container's own (non-root) user,
+            // so the mount needs world-writable permissions; `mode=1777` also
+            // keeps one run from deleting another user's files (sticky bit).
+            // Deliberately WITHOUT `noexec`: build/test toolchains materialise
+            // executables (venv shims, node_modules/.bin) inside the run
+            // directory. Containment stays with cap_drop + no-new-privileges +
+            // the read-only rootfs.
+            tmpfs.insert(
+                path.clone(),
+                format!("rw,nosuid,nodev,mode=1777,size={size}"),
+            );
+        }
+        host_config.tmpfs = Some(tmpfs);
+    }
+}
+
 async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Result<String> {
     use bollard::models::{ContainerCreateBody as Config, DeviceRequest, HostConfig, PortBinding};
     use bollard::query_parameters::{CreateContainerOptions, StartContainerOptions};
@@ -157,12 +255,15 @@ async fn run_container(docker: &Docker, req: &DeployRequest, image: &str) -> Res
         None
     };
 
-    let host_config = HostConfig {
+    let mut host_config = HostConfig {
         port_bindings: Some(port_bindings),
         binds: if binds.is_empty() { None } else { Some(binds) },
         device_requests,
         ..Default::default()
     };
+    if let Some(limits) = &req.sandbox {
+        apply_sandbox_limits(&mut host_config, limits);
+    }
 
     let exposed_ports_vec: Vec<String> = exposed.into_keys().collect();
     let config = Config {

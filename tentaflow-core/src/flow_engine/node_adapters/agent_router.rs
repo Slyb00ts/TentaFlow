@@ -398,6 +398,7 @@ mod tests {
         async fn execute_chat(&self, _req: Req) -> Result<LlmResponse> {
             Ok(LlmResponse {
                 content: self.answer.clone(),
+                reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
                 tool_calls: Vec::new(),
@@ -705,6 +706,7 @@ mod tests {
                 *self.captured.lock().unwrap() = req.messages[0].text_or_default();
                 Ok(LlmResponse {
                     content: r#"{"agent_id":"id-a","reason":"ok"}"#.into(),
+                    reasoning_content: None,
                     usage: TokenUsage::default(),
                     finish_reason: FinishReason::Stop,
                     tool_calls: Vec::new(),

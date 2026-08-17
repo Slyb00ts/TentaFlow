@@ -216,6 +216,47 @@ pub fn replace_selection(
     Ok(())
 }
 
+/// Reconcile models discovered from a managed runtime with the registry rows
+/// owned by that service. Metadata and the default marker are authoritative;
+/// rows no longer advertised by the runtime are removed.
+pub fn replace_discovered(
+    conn: &Connection,
+    service_id: i64,
+    discovered: &[NewModel],
+) -> Result<()> {
+    use std::collections::HashSet;
+
+    let names: HashSet<&str> = discovered.iter().map(|model| model.model_name.as_str()).collect();
+    for row in list_for_service(conn, service_id)? {
+        if !names.contains(row.model_name.as_str()) {
+            conn.execute("DELETE FROM model_registry WHERE id = ?1", params![row.id])
+                .context("delete stale discovered model")?;
+        }
+    }
+    for model in discovered {
+        conn.execute(
+            "INSERT INTO model_registry (service_id, model_name, display_name, capabilities, \
+                context_length, quantization, is_default) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+             ON CONFLICT(service_id, model_name) DO UPDATE SET \
+                display_name = excluded.display_name, capabilities = excluded.capabilities, \
+                context_length = excluded.context_length, quantization = excluded.quantization, \
+                is_default = excluded.is_default",
+            params![
+                service_id,
+                model.model_name,
+                model.display_name,
+                model.capabilities,
+                model.context_length,
+                model.quantization,
+                model.is_default as i64,
+            ],
+        )
+        .context("upsert discovered model")?;
+    }
+    Ok(())
+}
+
 /// Aggregate row joining `model_registry` with the parent `services`.
 /// Used by the dashboard `GET /api/models` to surface which engine each
 /// model is served by + the runtime transport / status.

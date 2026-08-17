@@ -75,6 +75,7 @@ pub fn format_results_as_messages(results: &[ToolCallResult]) -> Vec<ChatMessage
         .map(|result| ChatMessage {
             role: ChatRole::Tool,
             content: ChatMessageContent::Text(result.content.clone()),
+            reasoning_content: None,
             name: Some(result.name.clone()),
             tool_call_id: Some(result.tool_call_id.clone()),
             tool_calls: None,

@@ -8,9 +8,17 @@ license.workspace = true
 [features]
 default = ["cuda"]
 cuda = ["dep:cudarc"]
+# Backend HIP/ROCm. Wymaga ROCm w czasie budowy (ROCM_PATH, domyślnie /opt/rocm).
+hip = []
+# Backend Metal (macOS). Shim Objective-C budowany przez build.rs.
+metal = []
 
 [dependencies]
 forge-types.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 cudarc = { workspace = true, optional = true }
+
+[dev-dependencies]
+serde_json.workspace = true
+forge-types.workspace = true

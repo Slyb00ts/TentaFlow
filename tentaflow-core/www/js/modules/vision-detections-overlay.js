@@ -653,14 +653,21 @@ class DetectionsOverlay {
         if (!(id > 0)) continue;
         const tekst = it?.tekst != null ? String(it.tekst) : '';
         if (tekst.length === 0) continue;
-        const score = Number.isFinite(it?.score) ? it.score : 0;
-        if (score < OCR_MIN_SCORE) continue;
+        // `score` to pewnosc DETEKTORA ramki, nie odczytu. Pewnosc OCR jedzie na
+        // drucie jako `tekst_conf` — bez tego odlegla/skosna tablica odpadala
+        // mimo poprawnego odczytu i pasek pokazywal "Rejestracja: —".
+        const conf = Number.isFinite(it?.tekst_conf)
+          ? it.tekst_conf
+          : (Number.isFinite(it?.score) ? it.score : 0);
+        if (conf < OCR_MIN_SCORE) continue;
         let wpis = this.ocrGlosy.get(id);
         if (!wpis) { wpis = { glosy: new Map(), at: now }; this.ocrGlosy.set(id, wpis); }
         let g = wpis.glosy.get(tekst);
         if (!g) { g = { count: 0, maxScore: 0 }; wpis.glosy.set(tekst, g); }
         g.count += 1;
-        if (score > g.maxScore) g.maxScore = score;
+        // Tie-break trzyma TĘ SAMĄ miarę, po której wpuszczamy głos: pewność
+        // ODCZYTU (`conf`), nie pewność ramki detektora.
+        if (conf > g.maxScore) g.maxScore = conf;
         wpis.at = now;
       }
     }
@@ -698,7 +705,9 @@ class DetectionsOverlay {
     if (det?.klasa !== 'tablica_rejestracyjna') return det;
     const id = det?.track_id ?? det?.trackId ?? 0;
     const zwyciezca = id > 0 ? this.zwyciezcaOcr(id) : null;
-    return { ...det, tekst: zwyciezca };
+    // Brak zwyciezcy glosowania nie znaczy "brak tablicy" — serwer mogl przyslac
+    // ustabilizowany odczyt, ktorego nie wolno skasowac na null.
+    return { ...det, tekst: zwyciezca ?? (det?.tekst ?? null) };
   }
 
   // Uzupelnia metadane detekcji o ostatni znany stan/OCR z cache, GDY biezaca
@@ -765,6 +774,7 @@ class DetectionsOverlay {
     this.ocrGlosy.clear();
     this.klasaSeq.clear();
     this.lastMessageAt = 0;
+    this.paskStan = null;
   }
 
   // =============================================================================
@@ -1100,8 +1110,6 @@ class DetectionsOverlay {
     // Lista {det, bbox, alpha} juz zinterpolowana/wybrana pod biezacy media-time.
     const lista = this.computeRenderList();
 
-    if (!lista.length) return;
-
     const area = this.videoContentRect();
     const dpr = window.devicePixelRatio || 1;
     // Ramka: grubsza dla czytelnosci na obrazie (skalowana z DPR).
@@ -1198,9 +1206,21 @@ class DetectionsOverlay {
       (a, b) => this.klasaSeq.get(a).seq - this.klasaSeq.get(b).seq,
     );
     // Pakuj OD LEWEJ do slotow 0,1,2 (bez dziur); brakujace sloty z PRAWEJ = "—".
-    const sloty = ['—', '—', '—'];
+    let sloty = ['—', '—', '—'];
     for (let s = 0; s < 3 && s < obecne.length; s++) {
       sloty[s] = uniq.get(obecne[s]).label;
+    }
+
+    // Krotka pamiec paska. Lista renderowania pustoszeje na ulamek sekundy przy
+    // kazdej luce w analizie albo dryfie playheada — bez tego odczyty mrugaja do
+    // "—", mimo ze serwer je zna. Pamietamy TYLKO odczyty, nie ramki.
+    const terazPasek = performance.now();
+    if (rej != null || adr != null || obecne.length > 0) {
+      this.paskStan = { rej, adr, sloty, at: terazPasek };
+    } else if (this.paskStan && terazPasek - this.paskStan.at < TRACK_META_TTL_MS) {
+      rej = this.paskStan.rej;
+      adr = this.paskStan.adr;
+      sloty = this.paskStan.sloty;
     }
 
     // Wartosc ADR: numer + opis rozdzielone z tekstu przyslanego przez serwer

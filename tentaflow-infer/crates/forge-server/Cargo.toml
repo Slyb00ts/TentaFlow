@@ -5,6 +5,11 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Backend AMD. Bez tego testy tego crate buduja sie z samym CUDA i na
+# maszynie z Radeonem nie widza zadnego urzadzenia.
+hip = ["forge-hal/hip", "forge-engine/hip"]
+
 [dependencies]
 forge-types.workspace = true
 forge-hal.workspace = true
@@ -25,3 +30,5 @@ tracing.workspace = true
 tempfile.workspace = true
 reqwest.workspace = true
 futures.workspace = true
+sha2 = "0.10"
+bytemuck.workspace = true

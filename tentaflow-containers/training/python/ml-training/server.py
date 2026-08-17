@@ -71,6 +71,9 @@ _JOBS_LOCK = threading.Lock()
 # kończą się OOM. Slot jest zwalniany przez serwer gdy proces workera kończy się.
 _TRAIN_SLOT = threading.Semaphore(1)
 
+# Ile czekamy na czyste wyjście torchruna po SIGTERM, zanim wyślemy SIGKILL.
+_CANCEL_GRACE_S = 30
+
 # Trening biegnie jako PODPROCES `torchrun` (multi-GPU/multi-node DDP), nie wątek.
 # Serwer śledzi proces + plik statusu pisany przez ranka 0; status czytamy z pliku.
 # _PROCS: job_id -> {"proc", "status_path", "log_path", "released"}.
@@ -190,7 +193,7 @@ def _compute_dtype():  # noqa: ANN201
 @dataclass
 class JobState:
     job_id: str
-    status: str = "running"  # running | succeeded | failed
+    status: str = "running"  # running | succeeded | failed | cancelled
     step: int = 0
     total_steps: int = 0
     train_loss: Optional[float] = None
@@ -198,6 +201,9 @@ class JobState:
     error: Optional[str] = None
     output_dir: str = ""
     artifact_path: Optional[str] = None
+    # Żądanie anulowania (`POST /cancel/{job_id}`) — reaper wie, że rc procesu
+    # torchrun opisuje ubicie, nie awarię.
+    cancel_requested: bool = False
 
     def snapshot(self) -> dict[str, Any]:
         return {
@@ -1027,7 +1033,11 @@ def _reap_train(job_id: str) -> None:
         if st is not None:
             if snap:
                 _apply_snapshot(st, snap)
-            if st.status == "running":
+            if st.cancel_requested:
+                # Proces ubity na żądanie — jego rc/log nie opisuje awarii.
+                st.status = "cancelled"
+                st.error = None
+            elif st.status == "running":
                 # Proces padł nie zostawiając terminalnego statusu → błąd z logu.
                 st.status = "failed"
                 st.error = f"worker torchrun zakończył się rc={rc}\n{_tail(info['log_path'])}"
@@ -1125,8 +1135,10 @@ def status(job_id: str) -> dict[str, Any]:
         info = _PROCS.get(job_id)
         if st is None:
             raise HTTPException(404, f"unknown job: {job_id}")
-        # Status pisze ranga 0 do pliku — wczytaj najświeższy snapshot.
-        if info:
+        # Status pisze ranga 0 do pliku — wczytaj najświeższy snapshot. Po statusie
+        # terminalnym (ustawia go reaper) plik nie ma już nic do powiedzenia i nie
+        # może cofnąć joba do `running`.
+        if info and st.status == "running":
             try:
                 snap = json.loads(_tail(info["status_path"], 100_000) or "{}")
                 if snap:
@@ -1137,6 +1149,31 @@ def status(job_id: str) -> dict[str, Any]:
         if info:
             out["world_size"] = info.get("world_size", 1)
         return out
+
+
+@app.post("/cancel/{job_id}")
+def cancel(job_id: str) -> dict[str, Any]:
+    """Ubija proces torchrun treningu. To jedyny pewny sposób zwolnienia GPU —
+    trening biegnie w osobnym procesie (ew. wielu rangach), więc kooperacyjna flaga
+    w serwerze nic by nie dała. `SIGTERM`, a po `_CANCEL_GRACE_S` `SIGKILL`; reaper
+    zamyka job jako `cancelled`. Job już zakończony wraca z `cancelled: false`."""
+    with _JOBS_LOCK:
+        st = _JOBS.get(job_id)
+        info = _PROCS.get(job_id)
+        if st is None:
+            raise HTTPException(404, f"unknown job: {job_id}")
+        if st.status != "running":
+            return {"job_id": job_id, "status": st.status, "cancelled": False}
+        st.cancel_requested = True
+        proc = info.get("proc") if info else None
+
+    if proc is not None and proc.poll() is None:
+        proc.terminate()
+        try:
+            proc.wait(timeout=_CANCEL_GRACE_S)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+    return {"job_id": job_id, "status": "running", "cancelled": True}
 
 
 @app.get("/models/{job_id}/path")

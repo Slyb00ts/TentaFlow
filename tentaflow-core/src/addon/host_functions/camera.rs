@@ -36,7 +36,8 @@ use tentaflow_sdk_spec::{
     CameraGrantInfo, CameraGrantInput, CameraGrantListInput, CameraGrantListOut, CameraGrantOut,
     CameraHealthOut, CameraIdInput, CameraInfoOut, CameraListOut, CameraRemoveOut,
     CameraRevokeInput, CameraSnapshotOut, CameraTestConnectionInput, CameraTestConnectionOut,
-    CameraUpdateInput, DiscoveredCameraOut, LocalCameraDeviceOut, LocalCameraDevicesOut,
+    CameraUpdateInput, CameraZonesOut, CameraZonesSetInput, DiscoveredCameraOut,
+    LocalCameraDeviceOut, LocalCameraDevicesOut,
 };
 
 use super::abi_helpers::{enforce_payload_size, PayloadKind};
@@ -48,12 +49,12 @@ use super::{
 use crate::addon::errors::AbiError;
 use crate::audit::RiskClass;
 use crate::db::repository::{
-    can_read_camera, delete_camera_cv_pipeline, get_camera_cv_pipeline, get_camera_for_addon,
-    get_camera_in_org, grant_camera, insert_camera, list_accessible_cameras,
+    camera_zones_json, can_read_camera, delete_camera_cv_pipeline, get_camera_cv_pipeline,
+    get_camera_for_addon, get_camera_in_org, grant_camera, insert_camera, list_accessible_cameras,
     list_addon_available_aliases, list_camera_cv_pipelines, list_camera_grants,
     list_cameras_for_addon, revoke_camera_grant, save_camera_cv_pipeline,
-    set_camera_credentials_encrypted, set_camera_onvif_resolved, soft_delete_camera, update_camera,
-    CameraPatch, CameraRow, CvPipelineWriteError,
+    set_camera_credentials_encrypted, set_camera_onvif_resolved, set_camera_zones_json,
+    soft_delete_camera, update_camera, CameraPatch, CameraRow, CvPipelineWriteError,
 };
 use crate::services::camera_ingest::{
     credentials::credentials_cipher, list_local_devices, start_supervisor, CameraConfig,
@@ -2585,6 +2586,282 @@ pub fn camera_get_v1(
         &memory,
         &mut caller,
         &info,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+// =============================================================================
+// Host functions: camera_zones_get_v1 / camera_zones_set_v1
+// =============================================================================
+
+/// Reject anything the analysis engine could not parse back into polygons.
+/// Storing malformed JSON would silently disable zone gating for the camera,
+/// so the host validates the shape instead of trusting the addon.
+fn zones_json_valid(raw: &str) -> bool {
+    let parsed: Vec<Vec<(f32, f32)>> = match serde_json::from_str(raw) {
+        Ok(v) => v,
+        Err(_) => return false,
+    };
+    parsed.iter().all(|poly| {
+        poly.len() >= 3
+            && poly
+                .iter()
+                .all(|(x, y)| (0.0..=1.0).contains(x) && (0.0..=1.0).contains(y))
+    })
+}
+
+pub fn camera_zones_get_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_READ, None) {
+        audit(
+            caller.data(),
+            "camera.zones.get",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraIdInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.zones.get",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if !camera_id_valid(&input.camera_id) {
+        audit(
+            caller.data(),
+            "camera.zones.get",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("camera_id_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    let addon_id = caller.data().addon_id.clone();
+    let db = caller.data().db.clone();
+    let org = caller.data().org_id.clone();
+    match can_read_camera(&db, &addon_id, &input.camera_id, org.as_deref()) {
+        Ok(true) => {}
+        Ok(false) => {
+            audit(
+                caller.data(),
+                "camera.zones.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "denied",
+                Some("not_found_or_not_authorized"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.zones.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    }
+    let zones_json = match camera_zones_json(&db, &input.camera_id) {
+        Ok(v) => v,
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.zones.get",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    };
+    audit(
+        caller.data(),
+        "camera.zones.get",
+        Some(&input.camera_id),
+        RiskClass::B,
+        "ok",
+        None,
+    );
+    let out = CameraZonesOut {
+        camera_id: input.camera_id,
+        zones_json,
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
+        out_ptr,
+        out_cap,
+        out_len_ptr,
+        PayloadKind::ServiceCall,
+    )
+}
+
+pub fn camera_zones_set_v1(
+    mut caller: WasmCaller<'_, AddonState>,
+    input_ptr: i32,
+    input_len: i32,
+    out_ptr: i32,
+    out_cap: i32,
+    out_len_ptr: i32,
+) -> i32 {
+    let memory = match get_memory(&mut caller) {
+        Some(m) => m,
+        None => return AbiError::Operation.as_i32(),
+    };
+    if !check_permission(caller.data(), PERM_CAMERAS_WRITE, None) {
+        audit(
+            caller.data(),
+            "camera.zones.set",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("missing_permission"),
+        );
+        return AbiError::Permission.as_i32();
+    }
+    let input: CameraZonesSetInput = match read_input_cbor(
+        &memory,
+        &caller,
+        input_ptr,
+        input_len,
+        PayloadKind::ServiceCall,
+    ) {
+        Ok(v) => v,
+        Err(e) => {
+            audit(
+                caller.data(),
+                "camera.zones.set",
+                None,
+                RiskClass::B,
+                "error",
+                Some(if e == AbiError::PayloadTooLarge {
+                    "payload_too_large"
+                } else {
+                    "invalid_payload"
+                }),
+            );
+            return e.as_i32();
+        }
+    };
+    if !camera_id_valid(&input.camera_id) {
+        audit(
+            caller.data(),
+            "camera.zones.set",
+            None,
+            RiskClass::B,
+            "denied",
+            Some("camera_id_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    if !zones_json_valid(&input.zones_json) {
+        audit(
+            caller.data(),
+            "camera.zones.set",
+            Some(&input.camera_id),
+            RiskClass::B,
+            "denied",
+            Some("zones_json_invalid"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    let addon_id = caller.data().addon_id.clone();
+    let db = caller.data().db.clone();
+    let org = caller.data().org_id.clone();
+    // Writing zones changes what the analysis engine sees, so require ownership
+    // rather than the read grant that `camera_zones_get_v1` accepts.
+    match get_camera_for_addon(&db, &addon_id, &input.camera_id, org.as_deref()) {
+        Ok(Some(_)) => {}
+        Ok(None) => {
+            audit(
+                caller.data(),
+                "camera.zones.set",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "denied",
+                Some("not_found_or_not_authorized"),
+            );
+            return AbiError::NotFound.as_i32();
+        }
+        Err(_) => {
+            audit(
+                caller.data(),
+                "camera.zones.set",
+                Some(&input.camera_id),
+                RiskClass::B,
+                "error",
+                Some("db_error"),
+            );
+            return AbiError::Operation.as_i32();
+        }
+    }
+    if set_camera_zones_json(&db, &input.camera_id, &input.zones_json).is_err() {
+        audit(
+            caller.data(),
+            "camera.zones.set",
+            Some(&input.camera_id),
+            RiskClass::B,
+            "error",
+            Some("db_error"),
+        );
+        return AbiError::Operation.as_i32();
+    }
+    audit(
+        caller.data(),
+        "camera.zones.set",
+        Some(&input.camera_id),
+        RiskClass::B,
+        "ok",
+        None,
+    );
+    let out = CameraZonesOut {
+        camera_id: input.camera_id,
+        zones_json: input.zones_json,
+    };
+    write_cbor_capped(
+        &memory,
+        &mut caller,
+        &out,
         out_ptr,
         out_cap,
         out_len_ptr,

@@ -107,11 +107,20 @@ export function isClusterCapable(service) {
   return service?.engine?.cluster_capable === true;
 }
 
+/// Runtime istniejacy wylacznie pod wlasne presety modeli — katalog chowa jego
+/// kafelek z sekcji silnikow, kafelki modeli zostaja.
+export function isPresetOnly(service) {
+  return service?.engine?.preset_only === true;
+}
+
 export function isEngineCompatible(service, hostOs, host) {
   if (!service) return false;
   // Cluster target ma os=null (heterogeniczne wezly) — nie filtrujemy po OS,
   // pokazujemy wylacznie silniki cluster-capable (multi-node tensor-parallel).
-  if (host?.kind === 'cluster') return isClusterCapable(service);
+  // Bramka Sparka obowiazuje TAK SAMO jak dla pojedynczego noda: klaster ze
+  // Sparkow nie moze proponowac silnika oznaczonego `dgx_spark = false`
+  // (kola PyPI maja sm_120 max i wywalaja sie na sm_121).
+  if (host?.kind === 'cluster') return isClusterCapable(service) && dgxSparkOk(service, host);
   if (!hostOs) return false;
   const os = String(hostOs).toLowerCase();
   const sec = deploySections(service);

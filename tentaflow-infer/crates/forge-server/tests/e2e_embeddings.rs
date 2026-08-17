@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use forge_engine::model::{Model, ModelConfig};
 use forge_formats::{Gguf, PoolingType};
-use forge_hal::cuda::CudaDevice;
+use forge_hal::gpu;
 use forge_hal::Device;
 use forge_server::source::{
     load_tokenizer_gguf, read_descriptor, resolve_normalize, resolve_pooling,
@@ -44,7 +44,7 @@ fn embedding_sanity_cosine_ordering() {
     // These qwen3 embedding models are decoder-causal with last-token pooling,
     // so pooling operates on the final token's hidden state after it has
     // attended to the whole (causal) sequence — no bidirectional attention.
-    let dev: Arc<dyn Device> = CudaDevice::with_default_pools(0).expect("cuda device");
+    let dev: Arc<dyn Device> = gpu::open_default_pools(0).expect("cuda device");
 
     let _desc = read_descriptor(&path).expect("descriptor");
     let gguf = Gguf::open(&path).expect("open gguf");
@@ -74,7 +74,10 @@ fn embedding_sanity_cosine_ordering() {
         );
         if normalize {
             let l2 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
-            assert!((l2 - 1.0).abs() < 1e-3, "L2 norm {l2} not ~1.0 for '{text}'");
+            assert!(
+                (l2 - 1.0).abs() < 1e-3,
+                "L2 norm {l2} not ~1.0 for '{text}'"
+            );
         }
         v
     };

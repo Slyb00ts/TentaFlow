@@ -8,7 +8,7 @@ pub mod shape;
 pub use dtype::DType;
 pub use error::{ForgeError, Result};
 pub use quant::QuantKind;
-pub use shape::Shape;
+pub use shape::{DenseShape, Shape};
 
 use serde::{Deserialize, Serialize};
 
@@ -28,12 +28,43 @@ pub struct DeviceCaps {
     pub sm_count: u32,
     /// Native FP8 (E4M3/E5M2) matrix pipeline available.
     pub fp8_native: bool,
-    /// Native FP4 tensor cores (NVIDIA Blackwell+). Absent => NVFP4 uses the
-    /// software fused-dequant path.
-    pub fp4_native: bool,
+    /// Block-scaled FP4 MMA with UE8M0 (power-of-two) scales — the MXFP4
+    /// instruction. Doubles K per instruction against FP8.
+    pub fp4_block_scale_ue8m0: bool,
+    /// Block-scaled FP4 MMA with E4M3 scales — NVFP4 computed natively, with
+    /// no repack and no second copy of the weights.
+    pub fp4_block_scale_e4m3: bool,
+    /// `wgmma` warp-group MMA — the core of FlashAttention-3.
+    pub wgmma: bool,
+    /// `tcgen05` plus tensor memory — the core of FlashAttention-4.
+    pub tcgen05: bool,
+    /// Tensor Memory Accelerator (`cp.async.bulk.tensor`).
+    pub tma: bool,
     pub bf16_native: bool,
     pub supports_p2p: bool,
     pub supports_graph_capture: bool,
+}
+
+/// Czy urządzenie ma jednostkę macierzową i falę 32 — warunek wariantów
+/// pisanych pod ten kształt.
+///
+/// Świadomie NIE pyta o producenta. Warunek `vendor == Nvidia` stał kiedyś w
+/// bramce chunków prefillu i kazał każdemu modelowi qwen35 na Radeonie liczyć
+/// go porcjami po 16 tokenów, czyli czytać komplet wag 64 razy na prompt o
+/// długości 1024. Sufit wynika z rozmiaru bloku i szerokości fali, nie z
+/// nazwy producenta.
+pub fn matrix_warp32(vendor: Vendor, warp_size: u32) -> bool {
+    matches!(vendor, Vendor::Nvidia | Vendor::Amd) && warp_size == 32
+}
+
+/// Czy wolno użyć wariantu zbudowanego WYŁĄCZNIE pod NVIDIĘ.
+///
+/// To węższe pytanie od [`matrix_warp32`] i takie ma pozostać dopóki
+/// odpowiednika dla AMD nie ma w zestawie artefaktów albo nikt go nie zmierzył.
+/// Każde użycie jest kandydatem na tę samą usterkę co powyżej — sprawdzenie
+/// wymaga jednak Radeona, więc nie zgaduje się go z fotela.
+pub fn nvidia_warp32(vendor: Vendor, warp_size: u32) -> bool {
+    vendor == Vendor::Nvidia && warp_size == 32
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]

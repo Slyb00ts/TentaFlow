@@ -1,0 +1,701 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Projekty · Ustawienia projektu (X04)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=3">
+<link rel="stylesheet" href="shared/projekty.css?v=3">
+<style>
+  /* X04 — drobiazgi ekranowe (reszta z shared / projekty.css) */
+
+  /* pod-nawigacja sekcji ustawień (segmented, przewijalna) */
+  .subnav-wrap { overflow-x: auto; margin-bottom: 16px; }
+  .subnav { margin-bottom: 0; }
+
+  /* przycisk „Ustawienia" w nagłówku — bieżąca lokalizacja */
+  .btn.current { border-color: var(--accent-1); color: var(--text); background: var(--accent-glow); }
+
+  /* nagłówek karty z akcjami po prawej */
+  .section-card-head .head-actions { display: flex; align-items: center; gap: 8px; margin-left: auto; }
+
+  /* kontrolki w komórce setting-row (select agenta + model przypisanego agenta) */
+  .fn-controls { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+  .fn-controls .select { width: auto; flex: 1 1 200px; min-width: 190px; }
+  .fn-controls .fn-model { font-size: 12px; color: var(--text-3); white-space: nowrap; }
+
+  /* stan modułu (toggle + etykieta) */
+  .mod-state { display: flex; align-items: center; gap: 10px; }
+  .mod-state .st-txt { font-size: 12px; color: var(--text-2); }
+  .toggle.locked { opacity: 0.55; cursor: not-allowed; }
+
+  /* lista tagów */
+  .tag-add { display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center;
+    padding: 10px 12px; border: 1px dashed var(--border-hover); border-radius: var(--radius-sm);
+    background: var(--bg-input); margin-bottom: 12px; }
+  .tag-list { display: flex; flex-direction: column; gap: 8px; }
+  .tag-row { display: grid; grid-template-columns: 1fr auto auto; gap: 12px; align-items: center;
+    padding: 10px 12px; background: var(--bg-card); border: 1px solid var(--border); border-radius: var(--radius-sm); }
+  .tag-row .tr-name { display: flex; align-items: center; gap: 8px; }
+  .tag-row .tr-count { font-size: 11px; color: var(--text-3); white-space: nowrap; }
+  .tag-row .tr-actions { display: flex; gap: 6px; }
+
+  /* pola retencji z jednostką */
+  .suffix-input { display: flex; align-items: center; gap: 8px; }
+  .suffix-input .input { width: 110px; }
+  .suffix-input .unit { font-size: 12px; color: var(--text-3); }
+
+  /* strefa niebezpieczna */
+  .danger-zone { border-left: 3px solid var(--danger); }
+  .danger-zone .dz-title { color: var(--danger); }
+  .danger-row { display: flex; align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+  .danger-row:last-child { border-bottom: 0; }
+  .danger-row .dr-body { flex: 1; }
+  .danger-row .dr-title { font-size: 12.5px; font-weight: 700; }
+  .danger-row .dr-desc { font-size: 11px; color: var(--text-3); margin-top: 3px; line-height: 1.5; }
+
+  /* wiersz eksportu */
+  .export-row { display: flex; align-items: center; gap: 14px; padding: 14px 0; border-bottom: 1px solid var(--border); }
+  .export-row:last-child { border-bottom: 0; }
+  .export-row .ex-ico { width: 36px; height: 36px; border-radius: var(--radius-sm); background: var(--bg-3);
+    color: var(--accent-2); display: flex; align-items: center; justify-content: center; flex-shrink: 0; }
+  .export-row .ex-body { flex: 1; }
+  .export-row .ex-title { font-size: 12.5px; font-weight: 700; }
+  .export-row .ex-desc { font-size: 11px; color: var(--text-3); margin-top: 3px; line-height: 1.5; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-grid" viewBox="0 0 24 24"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-check-circle" viewBox="0 0 24 24"><path d="M22 11.08V12a10 10 0 1 1-5.93-9.14"/><polyline points="22 4 12 14.01 9 11.01"/></symbol>
+<symbol id="i-x-circle" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-bug" viewBox="0 0 24 24"><rect x="8" y="6" width="8" height="14" rx="4"/><path d="M19 7l-3 2M5 7l3 2M12 6V3M4 13H2M22 13h-2M5 19l3-1M19 19l-3-1"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-doc" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-link" viewBox="0 0 24 24"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-stop" viewBox="0 0 24 24"><rect x="5" y="5" width="14" height="14" rx="2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-upload" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-calendar" viewBox="0 0 24 24"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/></symbol>
+<symbol id="i-bell" viewBox="0 0 24 24"><path d="M18 8a6 6 0 0 0-12 0c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/></symbol>
+<symbol id="i-tag" viewBox="0 0 24 24"><path d="M20.59 13.41 13.42 20.6a2 2 0 0 1-2.83 0L2 12V2h10l8.59 8.59a2 2 0 0 1 0 2.82z"/><line x1="7" y1="7" x2="7.01" y2="7"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-gauge" viewBox="0 0 24 24"><path d="M12 14 8 10"/><path d="M3.34 19a10 10 0 1 1 17.32 0"/></symbol>
+<symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
+<symbol id="i-chart" viewBox="0 0 24 24"><line x1="12" y1="20" x2="12" y2="10"/><line x1="18" y1="20" x2="18" y2="4"/><line x1="6" y1="20" x2="6" y2="16"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-user-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-chevron-r" viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-arrow-left" viewBox="0 0 24 24"><line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-server" viewBox="0 0 24 24"><rect x="2" y="3" width="20" height="7" rx="2"/><rect x="2" y="14" width="20" height="7" rx="2"/><line x1="6" y1="6.5" x2="6.01" y2="6.5"/><line x1="6" y1="17.5" x2="6.01" y2="17.5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-clipboard" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"/><rect x="8" y="2" width="8" height="4" rx="1"/><path d="m9 14 2 2 4-4"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-paperclip" viewBox="0 0 24 24"><path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48"/></symbol>
+<symbol id="i-history" viewBox="0 0 24 24"><path d="M3 3v5h5"/><path d="M3.05 13A9 9 0 1 0 6 5.3L3 8"/><polyline points="12 7 12 12 15 15"/></symbol>
+<symbol id="i-check-square" viewBox="0 0 24 24"><polyline points="9 11 12 14 22 4"/><path d="M21 12v7a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11"/></symbol>
+</defs></svg>
+
+
+<!-- =========================================================================
+     X04 — Ustawienia projektu (pełnostronicowy widok konfiguracji)
+     ========================================================================= -->
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">X04</span>
+    <h2>Ustawienia projektu</h2>
+    <div class="desc">Konfiguracja projektu w jednym miejscu: podstawy, włączone moduły, przypisania agentów do funkcji, tagi, retencja danych i eksport. Sekcje po lewej przełączają fragmenty tej samej strony.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb">Projekty</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb">Portal Klienta B2B</span>
+          <span class="sep"><svg viewBox="0 0 24 24"><polyline points="9 18 15 12 9 6" fill="none"/></svg></span>
+          <span class="crumb current">Ustawienia</span>
+        </div>
+
+        <!-- Nagłówek projektu -->
+        <div class="detail-header">
+          <div class="big-ico"><svg><use href="#i-folder"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Portal Klienta B2B <span class="status-pill ok">aktywny</span></div>
+            <div class="d-sub">Ustawienia projektu · utworzono 12.05.2026 · ostatnia zmiana konfiguracji 22.07.2026</div>
+            <div class="d-badges">
+              <span class="chip accent"><svg class="icon"><use href="#i-users"/></svg>6 członków</span>
+              <span class="chip">Twoja rola: <b style="margin-left:4px">Menedżer</b></span>
+              <span class="chip info"><svg class="icon"><use href="#i-book"/></svg>4 źródła wiedzy</span>
+              <span class="chip info"><svg class="icon"><use href="#i-layers"/></svg>Moduły: Testy + Dokumentacja</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="icon-btn" title="Powiadomienia"><svg class="icon"><use href="#i-bell"/></svg><span class="badge-dot">3</span></button>
+            <button class="btn"><svg class="icon"><use href="#i-users"/></svg>Członkowie</button>
+            <button class="btn current" aria-current="page"><svg class="icon"><use href="#i-settings"/></svg>Ustawienia</button>
+            <button class="btn btn-ghost">Odrzuć zmiany</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg>Zapisz zmiany</button>
+          </div>
+        </div>
+
+        <!-- Zakładki modułów -->
+        <div class="tabs-bar">
+          <button class="tab"><svg class="icon"><use href="#i-activity"/></svg>Przegląd</button>
+          <button class="tab"><svg class="icon"><use href="#i-book"/></svg>Wiedza <span class="count">4</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-clipboard"/></svg>Testy <span class="count">128</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-doc"/></svg>Dokumentacja <span class="count">9</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-message"/></svg>Chat</button>
+          <button class="tab"><svg class="icon"><use href="#i-check-square"/></svg>Zadania <span class="count">12</span></button>
+          <button class="tab"><svg class="icon"><use href="#i-link"/></svg>Połączenia <span class="count">1</span></button>
+        </div>
+
+        <!-- Pod-nawigacja sekcji ustawień -->
+        <div class="subnav-wrap">
+          <div class="segmented subnav">
+            <button class="active"><svg class="icon"><use href="#i-settings"/></svg>Podstawy</button>
+            <button><svg class="icon"><use href="#i-layers"/></svg>Moduły</button>
+            <button><svg class="icon"><use href="#i-bot"/></svg>Agenci projektu</button>
+            <button><svg class="icon"><use href="#i-tag"/></svg>Tagi</button>
+            <button><svg class="icon"><use href="#i-clock"/></svg>Retencja</button>
+            <button><svg class="icon"><use href="#i-download"/></svg>Eksport</button>
+          </div>
+        </div>
+
+        <!-- ============================== PODSTAWY ============================== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-settings"/></svg>Podstawy</div>
+            <div class="head-actions">
+              <span class="hint">Zmiany zapisujesz przyciskiem „Zapisz zmiany" u góry</span>
+            </div>
+          </div>
+
+          <div class="field">
+            <label>Nazwa projektu</label>
+            <input class="input" value="Portal Klienta B2B">
+            <div class="hint">Nazwa widoczna na liście projektów i w raportach. Musi być unikalna w organizacji.</div>
+          </div>
+
+          <div class="field">
+            <label>Opis</label>
+            <textarea class="textarea">Testy, dokumentacja i baza wiedzy dla portalu zamówień B2B. Obejmuje ścieżki logowania, katalog produktów, koszyk, płatności kartą i panel zamówień.</textarea>
+            <div class="hint">Krótki opis pomaga zespołowi i agentom rozumieć zakres projektu.</div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Archiwizacja</div>
+              <div class="sr-desc">Zarchiwizowany projekt jest tylko do odczytu — nie można uruchamiać przebiegów ani edytować przypadków. Można go przywrócić w każdej chwili.</div>
+            </div>
+            <div class="mod-state">
+              <span class="toggle" role="switch" aria-checked="false"></span>
+              <span class="st-txt">Aktywny (nie zarchiwizowany)</span>
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-history"/></svg>Archiwizuj projekt</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Strefa niebezpieczna -->
+        <div class="section-card danger-zone">
+          <div class="section-card-head">
+            <div class="title dz-title"><svg class="icon" style="color:var(--danger)"><use href="#i-alert"/></svg>Strefa niebezpieczna</div>
+          </div>
+
+          <div class="danger-row">
+            <div class="dr-body">
+              <div class="dr-title">Przekaż własność projektu</div>
+              <div class="dr-desc">Zmiana właściciela projektu na innego członka. W projekcie może być tylko jeden właściciel.</div>
+            </div>
+            <button class="btn" disabled title="Dostępne tylko dla właściciela projektu — Twoja rola: Menedżer"><svg class="icon"><use href="#i-user-plus"/></svg>Przekaż własność</button>
+          </div>
+
+          <div class="danger-row">
+            <div class="dr-body">
+              <div class="dr-title">Usuń projekt</div>
+              <div class="dr-desc">Trwałe usunięcie projektu wraz z bazą wiedzy, workspace'em, przypadkami, przebiegami i artefaktami. Operacja nieodwracalna.</div>
+            </div>
+            <button class="btn btn-danger"><!-- otwiera: G01 --><svg class="icon"><use href="#i-trash"/></svg>Usuń projekt</button>
+          </div>
+        </div>
+
+        <!-- ============================== MODUŁY ============================== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-layers"/></svg>Moduły projektu</div>
+            <div class="head-actions">
+              <span class="hint">Wyłączony moduł znika z zakładek u góry projektu</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Szablon projektu</div>
+              <div class="sr-desc">Szablon wybrany przy tworzeniu projektu włączył poniższe moduły. Zakładki u góry pokazują wyłącznie moduły włączone.</div>
+            </div>
+            <div class="mod-state">
+              <span class="chip info"><svg class="icon"><use href="#i-layers"/></svg>Testy + Dokumentacja</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Wiedza</div>
+              <div class="sr-desc">Baza wiedzy: źródła (dokumenty, repo git, API), indeksacja i przeszukiwanie. Fundament dla generowania testów i dokumentów.</div>
+            </div>
+            <div class="mod-state">
+              <span class="toggle on locked" role="switch" aria-checked="true" title="Moduł wymagany — nie można wyłączyć"></span>
+              <span class="chip accent">wymagany</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Testy</div>
+              <div class="sr-desc">Przypadki, zestawy, przebiegi, środowiska, harmonogramy i raporty testowe.</div>
+            </div>
+            <div class="mod-state">
+              <span class="toggle on" role="switch" aria-checked="true"></span>
+              <span class="st-txt">Włączony</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Dokumentacja</div>
+              <div class="sr-desc">Dokumenty projektowe z edytorem markdown, wersjonowaniem i generowaniem z wiedzy.</div>
+            </div>
+            <div class="mod-state">
+              <span class="toggle on" role="switch" aria-checked="true"></span>
+              <span class="st-txt">Włączony</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Chat</div>
+              <div class="sr-desc">Rozmowa z projektem — odpowiedzi z cytowaniami ze źródeł wiedzy.</div>
+            </div>
+            <div class="mod-state">
+              <span class="toggle on" role="switch" aria-checked="true"></span>
+              <span class="st-txt">Włączony</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Zadania</div>
+              <div class="sr-desc">Zadania i usterki (lista + tablica kanban) powiązane z przypadkami i przebiegami.</div>
+            </div>
+            <div class="mod-state">
+              <span class="toggle on" role="switch" aria-checked="true"></span>
+              <span class="st-txt">Włączony</span>
+            </div>
+          </div>
+
+        </div>
+
+        <!-- ============================== AGENCI PROJEKTU ============================== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-bot"/></svg>Agenci projektu</div>
+            <div class="head-actions">
+              <a href="#" class="btn btn-sm btn-ghost"><!-- nawiguje do listy agentów --><svg class="icon"><use href="#i-external"/></svg>Zarządzaj agentami</a>
+            </div>
+          </div>
+          <div class="section-sub">Przypisz agenta do każdej funkcji projektu — model wynika z wybranego agenta (zmienisz go w ustawieniach agenta). Puste przypisanie = funkcja korzysta z domyślnego agenta organizacji.</div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Chat projektu</div>
+              <div class="sr-desc">Odpowiada na pytania o projekt z cytowaniami ze źródeł.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — chat projektu">
+                <option selected>Nadzorca procesu</option>
+                <option>Generator scenariuszy</option>
+                <option>Krytyk wymagań</option>
+                <option>Dokumentalista</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: qwen2.5-7b</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Generator testów manualnych</div>
+              <div class="sr-desc">Tworzy przypadki manualne (kroki + oczekiwane rezultaty) z wiedzy.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — generator manualnych">
+                <option selected>Generator scenariuszy</option>
+                <option>Generator Playwright</option>
+                <option>Krytyk wymagań</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: qwen2.5-7b</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Generator testów UI</div>
+              <div class="sr-desc">Kod testów interfejsu (Playwright) na podstawie scenariuszy i środowiska.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — generator UI">
+                <option selected>Generator Playwright</option>
+                <option>Generator scenariuszy</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: claude-sonnet</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Generator testów API</div>
+              <div class="sr-desc">Kod testów endpointów (pytest/HTTP) na bazie specyfikacji OpenAPI.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — generator API">
+                <option selected>Generator Playwright</option>
+                <option>Generator scenariuszy</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: qwen2.5-7b</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Generator testów jednostkowych</div>
+              <div class="sr-desc">Testy jednostkowe z kodu źródłowego repozytorium.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — generator unit">
+                <option selected>Generator scenariuszy</option>
+                <option>Generator Playwright</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: gemma-4-31b</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Generator testów wydajnościowych</div>
+              <div class="sr-desc">Scenariusze obciążeniowe (RPS, profile) dla przebiegów wydajnościowych.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — generator perf">
+                <option selected>Generator scenariuszy</option>
+                <option>Agent bezpieczeństwa</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: qwen2.5-7b</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Agent bezpieczeństwa</div>
+              <div class="sr-desc">Proponuje testy bezpieczeństwa (OWASP, autoryzacja, walidacja danych).</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — bezpieczeństwo">
+                <option selected>Agent bezpieczeństwa</option>
+                <option>Generator scenariuszy</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: claude-sonnet</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Dokumentalista</div>
+              <div class="sr-desc">Generuje i poprawia dokumenty projektowe na podstawie wiedzy i wyników.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — dokumentalista">
+                <option selected>Dokumentalista</option>
+                <option>Generator scenariuszy</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: qwen2.5-7b</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Krytyk</div>
+              <div class="sr-desc">Ocenia i poprawia wygenerowane przypadki/dokumenty w pętli krytyka.</div>
+            </div>
+            <div class="fn-controls">
+              <select class="select" aria-label="Agent — krytyk">
+                <option selected>Krytyk wymagań</option>
+                <option>Nadzorca procesu</option>
+                <option>— domyślny agent —</option>
+              </select>
+              <span class="fn-model">model: claude-sonnet</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============================== TAGI ============================== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-tag"/></svg>Tagi</div>
+            <div class="head-actions">
+              <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-plus"/></svg>Nowy tag</button>
+            </div>
+          </div>
+          <div class="section-sub">Tagi porządkują przypadki testowe. Zmiana nazwy tagu aktualizuje wszystkie powiązane przypadki, usunięcie odłącza go od nich (przypadki zostają).</div>
+
+          <!-- Dodawanie taga inline (bez okna) -->
+          <div class="tag-add">
+            <input class="input" placeholder="Nazwa nowego tagu, np. onboarding…">
+            <button class="btn"><svg class="icon"><use href="#i-check"/></svg>Dodaj tag</button>
+          </div>
+
+          <div class="tag-list">
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip"><svg class="icon"><use href="#i-tag"/></svg>checkout</span></div>
+              <div class="tr-count">24 przypadki</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip"><svg class="icon"><use href="#i-tag"/></svg>płatności</span></div>
+              <div class="tr-count">18 przypadków</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip"><svg class="icon"><use href="#i-tag"/></svg>regresja</span></div>
+              <div class="tr-count">31 przypadków</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip danger"><svg class="icon"><use href="#i-tag"/></svg>bezpieczeństwo</span></div>
+              <div class="tr-count">12 przypadków</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip info"><svg class="icon"><use href="#i-tag"/></svg>api</span></div>
+              <div class="tr-count">27 przypadków</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip warning"><svg class="icon"><use href="#i-tag"/></svg>krytyczne</span></div>
+              <div class="tr-count">7 przypadków</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+            <div class="tag-row">
+              <div class="tr-name"><span class="chip"><svg class="icon"><use href="#i-tag"/></svg>smoke</span></div>
+              <div class="tr-count">9 przypadków</div>
+              <div class="tr-actions">
+                <button class="btn btn-sm btn-ghost" title="Zmień nazwę"><svg class="icon"><use href="#i-edit"/></svg></button>
+                <button class="btn btn-sm btn-ghost" title="Usuń tag"><svg class="icon"><use href="#i-trash"/></svg></button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <!-- ============================== RETENCJA ============================== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-clock"/></svg>Retencja danych</div>
+            <div class="head-actions">
+              <span class="hint">Starsze dane są automatycznie usuwane po upływie okresu</span>
+            </div>
+          </div>
+          <div class="section-sub">Ustaw, jak długo projekt przechowuje dane historyczne. Skrócenie okresu skasuje dane starsze niż nowy limit przy najbliższym sprzątaniu.</div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Artefakty przebiegów</div>
+              <div class="sr-desc">Logi, ślady (trace) i pliki wynikowe przebiegów testowych.</div>
+            </div>
+            <div class="suffix-input">
+              <input class="input" type="number" value="90" min="7">
+              <span class="unit">dni</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Dziennik aktywności (activity_log)</div>
+              <div class="sr-desc">Historia działań członków i agentów w projekcie.</div>
+            </div>
+            <div class="suffix-input">
+              <input class="input" type="number" value="183" min="183">
+              <span class="unit">dni</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Zrzuty ekranu i nagrania</div>
+              <div class="sr-desc">Załączniki wizualne z wykonania testów manualnych i automatycznych.</div>
+            </div>
+            <div class="suffix-input">
+              <input class="input" type="number" value="30" min="7">
+              <span class="unit">dni</span>
+            </div>
+          </div>
+
+          <div class="setting-row">
+            <div>
+              <div class="sr-label">Wersje przypadków i dokumentów</div>
+              <div class="sr-desc">Ile ostatnich wersji zachowywać w historii (starsze są łączone/usuwane).</div>
+            </div>
+            <div class="suffix-input">
+              <input class="input" type="number" value="20" min="5">
+              <span class="unit">wersji</span>
+            </div>
+          </div>
+
+          <div class="banner info" style="margin-bottom:0;margin-top:14px;">
+            <svg class="icon"><use href="#i-shield"/></svg>
+            <div class="b-text">Dziennik aktywności podlega polityce audytu organizacji — okres nie może być krótszy niż <b>183 dni</b>.</div>
+          </div>
+        </div>
+
+        <!-- ============================== EKSPORT ============================== -->
+        <div class="section-card">
+          <div class="section-card-head">
+            <div class="title"><svg class="icon"><use href="#i-download"/></svg>Eksport</div>
+            <div class="head-actions">
+              <button class="btn btn-sm"><svg class="icon"><use href="#i-download"/></svg>Pełny eksport (ZIP)</button>
+            </div>
+          </div>
+          <div class="section-sub">Pobierz dane projektu do przeniesienia, archiwizacji lub audytu. Eksporty są dostępne przy przebiegach i dokumentach, których dotyczą.</div>
+
+          <div class="export-row">
+            <div class="ex-ico"><svg class="icon"><use href="#i-clipboard"/></svg></div>
+            <div class="ex-body">
+              <div class="ex-title">Przypadki testowe → CSV</div>
+              <div class="ex-desc">128 przypadków z metadanymi, tagami i statusami. Format zgodny z importem CSV.</div>
+            </div>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksportuj CSV</button>
+          </div>
+
+          <div class="export-row">
+            <div class="ex-ico"><svg class="icon"><use href="#i-chart"/></svg></div>
+            <div class="ex-body">
+              <div class="ex-title">Raporty przebiegów → PDF</div>
+              <div class="ex-desc">Zestawienie wyników i wykresów z wybranego zakresu dat.</div>
+            </div>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksportuj PDF</button>
+          </div>
+
+          <div class="export-row">
+            <div class="ex-ico"><svg class="icon"><use href="#i-doc"/></svg></div>
+            <div class="ex-body">
+              <div class="ex-title">Dokumentacja → Markdown / PDF</div>
+              <div class="ex-desc">9 dokumentów projektowych wraz z bieżącymi wersjami.</div>
+            </div>
+            <button class="btn"><svg class="icon"><use href="#i-download"/></svg>Eksportuj</button>
+          </div>
+
+          <div class="export-row">
+            <div class="ex-ico"><svg class="icon"><use href="#i-layers"/></svg></div>
+            <div class="ex-body">
+              <div class="ex-title">Pełny eksport projektu → ZIP</div>
+              <div class="ex-desc">Wiedza, przypadki, przebiegi, dokumenty, artefakty i konfiguracja w jednym archiwum.</div>
+            </div>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-download"/></svg>Eksportuj ZIP</button>
+          </div>
+        </div>
+
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>

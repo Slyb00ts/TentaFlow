@@ -12,6 +12,7 @@ pub enum DeployMethod {
     NativeEmbedded,
     NativeBinary,
     NativePythonBundle,
+    NativeManagedCli,
     External,
 }
 
@@ -22,6 +23,7 @@ impl DeployMethod {
             DeployMethod::NativeEmbedded => "native_embedded",
             DeployMethod::NativeBinary => "native_binary",
             DeployMethod::NativePythonBundle => "native_python_bundle",
+            DeployMethod::NativeManagedCli => "native_managed_cli",
             DeployMethod::External => "external",
         }
     }
@@ -33,6 +35,7 @@ pub fn parse_deploy_method(tag: &str) -> Result<DeployMethod> {
         "native_embedded" => DeployMethod::NativeEmbedded,
         "native_binary" => DeployMethod::NativeBinary,
         "native_python_bundle" => DeployMethod::NativePythonBundle,
+        "native_managed_cli" => DeployMethod::NativeManagedCli,
         "external" => DeployMethod::External,
         other => return Err(anyhow!("unknown deploy_method tag: {}", other)),
     })
@@ -155,6 +158,8 @@ pub struct ServiceRow {
     pub health_last_ok: Option<String>,
     pub health_last_err: Option<String>,
     pub progress_message: Option<String>,
+    pub usage_json: Option<String>,
+    pub usage_updated_at: Option<String>,
     pub restart_count: i64,
     pub created_at: String,
     pub updated_at: String,
@@ -199,6 +204,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
         health_last_ok: row.get("health_last_ok")?,
         health_last_err: row.get("health_last_err")?,
         progress_message: row.get("progress_message").ok().flatten(),
+        usage_json: row.get("usage_json").ok().flatten(),
+        usage_updated_at: row.get("usage_updated_at").ok().flatten(),
         restart_count: row.get("restart_count")?,
         created_at: row.get("created_at")?,
         updated_at: row.get("updated_at")?,
@@ -208,7 +215,8 @@ fn map_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<ServiceRow> {
 const SELECT_COLUMNS: &str = "id, engine_id, category, display_name, deploy_method, transport, \
     status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
     config_json, active_deploy_id, last_deploy_id, deployment_progress_pct, deployed_source_hash, \
-    health_last_ok, health_last_err, progress_message, restart_count, created_at, updated_at";
+    health_last_ok, health_last_err, progress_message, usage_json, usage_updated_at, \
+    restart_count, created_at, updated_at";
 
 const INSERT_SQL: &str = "INSERT INTO services (engine_id, category, display_name, deploy_method, \
     transport, status, pinned, paused, runtime_pid, runtime_port, sidecar_quic_port, endpoint_url, \
@@ -543,6 +551,21 @@ pub fn update_progress_message(conn: &Connection, id: i64, msg: Option<&str>) ->
     if n == 0 {
         return Err(anyhow!(
             "update_progress_message: service id={} not found",
+            id
+        ));
+    }
+    Ok(())
+}
+
+pub fn update_usage_snapshot(conn: &Connection, id: i64, usage_json: &str) -> Result<()> {
+    let changed = conn.execute(
+        "UPDATE services SET usage_json = ?2, usage_updated_at = CURRENT_TIMESTAMP \
+         WHERE id = ?1",
+        params![id, usage_json],
+    )?;
+    if changed == 0 {
+        return Err(anyhow!(
+            "update_usage_snapshot: service id={} not found",
             id
         ));
     }
