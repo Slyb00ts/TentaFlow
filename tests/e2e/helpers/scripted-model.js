@@ -154,6 +154,39 @@ function delegationScripts({ path = 'from_subagent.py', message = 'Napisane prze
   ];
 }
 
+
+// Routes for the ENFORCED pipeline (harness variant C). After the orchestrator's
+// turn the graph delegates to a planner, a critic, an implementer, a tester and
+// a critic again — five agents hitting this same endpoint. Without a route each
+// they would share one cursor and read each other's lines.
+//
+// The critics approve immediately, so each review loop turns once: the loop
+// mechanics are proven by the gate's own unit tests, and an e2e that argued for
+// ten rounds would only prove that waiting works.
+function enforcedPipelineScripts() {
+  return [
+    {
+      // The planner's system prompt opens with this sentence.
+      match: 'Jesteś planistą zmian w kodzie',
+      steps: [say('Plan:\n1. Napisać hello.py wypisujące powitanie.\n2. Uruchomić je i sprawdzić wyjście.')],
+    },
+    {
+      // Both critics share one agent, so one route serves the plan review and
+      // the build review. `BEZ UWAG` is the marker the seeded gate matches.
+      match: 'Jestes krytykiem',
+      steps: [say('Sprawdziłem względem pierwotnych wytycznych — BEZ UWAG.')],
+    },
+    {
+      match: 'Piszesz kod',
+      steps: [say('Zadania z planu były już wykonane w turze orkiestratora — nic do dopisania.')],
+    },
+    {
+      match: 'Uruchamiasz testy i buildy',
+      steps: [say('Uruchomiłem hello.py — wypisuje oczekiwany tekst. Nic nie jest czerwone.')],
+    },
+  ];
+}
+
 // ---------------------------------------------------------------------------
 // Server
 // ---------------------------------------------------------------------------
@@ -306,4 +339,6 @@ function startScriptedModel({ script, scripts, modelId = 'harness-test', port = 
   };
 }
 
-module.exports = { startScriptedModel, helloWorldScript, delegationScripts, tool, say };
+module.exports = {
+  startScriptedModel, helloWorldScript, delegationScripts, enforcedPipelineScripts, tool, say,
+};

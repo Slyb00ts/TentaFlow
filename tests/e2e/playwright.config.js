@@ -26,6 +26,7 @@ module.exports = defineConfig({
       testMatch: 'code-studio-explore.spec.js',
       use: { actionTimeout: 10_000 },
     },
+    { name: 'code-studio-pipeline', testMatch: 'code-studio-pipeline.spec.js' },
     { name: 'code-studio-projects', testMatch: 'code-studio-projects.spec.js' },
     { name: 'code-studio-delegation', testMatch: 'code-studio-delegation.spec.js' },
     { name: 'code-studio-harness', testMatch: 'code-studio-harness.spec.js' },

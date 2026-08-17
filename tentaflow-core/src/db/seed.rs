@@ -8,6 +8,7 @@ use rusqlite::Connection;
 use tracing::{debug, info, warn};
 
 use crate::crypto;
+use crate::flow_engine::node_adapters::tool_exec::TOOL_CALLS_TOTAL_VAR;
 
 /// Staly UUID domyslnego admina. id w user_accounts musi byc UUID, bo login
 /// pakuje je do 16-bajtowej formy wire (literal '1' bylby odrzucony jako
@@ -1815,8 +1816,31 @@ pub fn code_harness_critic_flow_json() -> String {
         verdict_var: "plan_verdict",
         max_rounds: 10,
     };
+    nodes.push(serde_json::json!({"id": "p1", "type": "persist_turn",
+        "position": grid_position(index), "config": {}}));
+    index += 1;
+    nodes.push(serde_json::json!({"id": "o1", "type": "output",
+        "position": grid_position(index), "config": {"mode": "stream"}}));
+    index += 1;
+
+    // Not every turn deserves a five-agent pipeline. A turn where the agent only
+    // answered a question called no tools at all, and running planner, critic,
+    // implementer, tester and critic over it would cost five sub-runs to review
+    // nothing. The condition is a visible block: widen it, narrow it, or delete
+    // it and wire `x1` straight into the planner to get the pipeline on every
+    // turn.
+    nodes.push(serde_json::json!({"id": "d1", "type": "condition",
+        "position": grid_position(index),
+        "config": {
+            "expression": format!("vars.{TOOL_CALLS_TOTAL_VAR} > 0"),
+        }}));
+    index += 1;
+
     let (plan_entry, plan_gate) = review_loop_nodes(&plan, &mut index, &mut nodes, &mut edges);
-    edges.push(serde_json::json!({"from_node": "x1", "to_node": plan_entry, "from_port": "full"}));
+    edges.push(serde_json::json!({"from_node": "p1", "to_node": "d1"}));
+    edges.push(
+        serde_json::json!({"from_node": "d1", "to_node": plan_entry, "from_port": "true"}),
+    );
 
     let build = ReviewLoop {
         region: "build_review",
@@ -1840,18 +1864,18 @@ pub fn code_harness_critic_flow_json() -> String {
     let (build_entry, build_gate) = review_loop_nodes(&build, &mut index, &mut nodes, &mut edges);
     edges.push(serde_json::json!({"from_node": plan_gate, "to_node": build_entry}));
 
-    nodes.push(serde_json::json!({"id": "p1", "type": "persist_turn",
-        "position": grid_position(index), "config": {}}));
-    index += 1;
-    nodes.push(serde_json::json!({"id": "o1", "type": "output",
-        "position": grid_position(index), "config": {"mode": "stream"}}));
-
-    edges.push(serde_json::json!({"from_node": build_gate, "to_node": "p1"}));
+    // The turn is persisted and shown BEFORE the pipeline runs: the operator
+    // reads the orchestrator's answer straight away and watches the planner,
+    // implementer, tester and critic work behind it in the Agents pane, instead
+    // of staring at nothing until five sub-runs finish.
+    edges.push(serde_json::json!({"from_node": "x1", "to_node": "p1", "from_port": "full"}));
     edges.push(
         serde_json::json!({"from_node": "x1", "to_node": "o1", "from_port": "stream",
             "to_port": "text"}),
     );
     edges.push(serde_json::json!({"from_node": "p1", "to_node": "o1", "to_port": "text"}));
+    // What the pipeline concluded reaches the same output.
+    edges.push(serde_json::json!({"from_node": build_gate, "to_node": "o1", "to_port": "text"}));
 
     serde_json::json!({"nodes": nodes, "edges": edges}).to_string()
 }

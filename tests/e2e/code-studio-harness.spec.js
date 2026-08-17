@@ -24,7 +24,9 @@ const {
   baseUrl,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
-const { startScriptedModel, helloWorldScript } = require('./helpers/scripted-model');
+const {
+  startScriptedModel, helloWorldScript, enforcedPipelineScripts,
+} = require('./helpers/scripted-model');
 
 const PORT = 18111;
 const DB = '/tmp/e2e-code-studio.db';
@@ -48,7 +50,13 @@ test.beforeAll(async () => {
   if (!binaryExists()) {
     test.skip(true, 'tentaflow binary not built — run cargo build (debug is enough)');
   }
-  model = startScriptedModel({ script: helloWorldScript({ path: PROGRAM, message: PRINTED }) });
+  model = startScriptedModel({
+    scripts: [
+      { match: 'Jesteś agentem programistycznym',
+        steps: helloWorldScript({ path: PROGRAM, message: PRINTED }) },
+      ...enforcedPipelineScripts(),
+    ],
+  });
   proc = startBinary({ port: PORT, db: DB, rustLog: process.env.RUST_LOG ?? 'warn' });
   await waitForServer(PORT);
 });

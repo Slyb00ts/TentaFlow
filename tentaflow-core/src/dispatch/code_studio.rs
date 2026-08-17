@@ -61,7 +61,7 @@ use crate::code_studio::{
     artifacts, events, fs as cs_fs, index, operations, patch, paths, project_link, provisioning,
     redact, remote_proxy, repository, sandbox, session, tools, workspace_db,
 };
-use crate::db::seed::CODE_HARNESS_FLOW_ID;
+use crate::db::seed::CODE_HARNESS_CRITIC_FLOW_ID;
 use crate::db::DbPool;
 use crate::services::rbac::OrgContext;
 
@@ -2926,11 +2926,17 @@ async fn session_open_v1(
 /// without the flow refuses to open a session rather than pinning something
 /// that is not the harness.
 ///
+/// The pin is the ENFORCED pipeline (§16.2 C): planning argues with a critic
+/// before anything is built, an implementer never works without a tester behind
+/// it, and a critic judges the result against the original request — each as an
+/// ordinary block on the canvas, so an operator who wants the plain tool loop
+/// edits the graph rather than asking for a setting.
+///
 /// The id comes from the seed rather than a copy here: the seeded graph and the
 /// session pin are two halves of one contract (§16), and a second literal is a
 /// second thing to forget.
 fn resolve_harness_flow(db: &DbPool) -> Result<(String, String), ProtocolError> {
-    let flow = crate::db::repository::get_flow(db, CODE_HARNESS_FLOW_ID)
+    let flow = crate::db::repository::get_flow(db, CODE_HARNESS_CRITIC_FLOW_ID)
         .map_err(|e| db_error("get_flow", e))?
         .ok_or_else(|| {
             ProtocolError::new(

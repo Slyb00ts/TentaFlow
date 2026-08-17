@@ -22,7 +22,7 @@ use crate::agents::{
 };
 use crate::db::repository;
 use crate::flow_engine::dispatchers::ProgressEvent;
-use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, LlmToolCall, NodeInput};
+use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, FlowValue, LlmToolCall, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
@@ -37,6 +37,10 @@ const NODE_TYPE: &str = "tool_exec";
 const DEFAULT_MAX_RESULT_CHARS: usize = 16_000;
 const DEFAULT_MAX_TOOL_CALLS: usize = 16;
 const TRUNCATION_MARKER: &str = "\n…[truncated]…\n";
+/// Flow variable holding how many tool calls the turn dispatched, summed over
+/// the loop's iterations. A downstream graph reads it to tell a turn that did
+/// work from a turn that only answered.
+pub const TOOL_CALLS_TOTAL_VAR: &str = "tool_calls_total";
 
 /// Budget for a `core.project_search` result JSON — headroom under the default
 /// 16k middle-out truncation, so the model always receives intact JSON (a
@@ -801,6 +805,25 @@ impl NodeAdapter for ToolExecNodeAdapter {
         if calls.len() > max_tool_calls {
             calls.truncate(max_tool_calls);
         }
+
+        // How much the turn DID, accumulated across the loop's iterations. A
+        // graph downstream of the tool loop has no other way to tell "the agent
+        // answered a question" from "the agent changed the repository", and the
+        // difference decides whether an expensive review pipeline is worth
+        // running at all. Counted before dispatch, because a call that failed
+        // is still work the turn attempted.
+        let executed_before = out
+            .variables
+            .get(TOOL_CALLS_TOTAL_VAR)
+            .and_then(|v| match v {
+                FlowValue::Json(json) => json.as_i64(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        out.variables.insert(
+            TOOL_CALLS_TOTAL_VAR.to_string(),
+            FlowValue::Json(serde_json::json!(executed_before + calls.len() as i64)),
+        );
 
         // The effective tool surface is the agent's allowlist (§3.3); reload it
         // from the agent the harness pinned in meta. No agent id = no allowlist
