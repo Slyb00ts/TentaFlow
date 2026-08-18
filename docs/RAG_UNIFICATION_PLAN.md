@@ -226,9 +226,19 @@ zamiast czytać `engine_flow_model:<id>` z KV instancji.
 chunków i identyczną liczbę wektorów **oraz** niepuste `source_name`/`file_path`/`location` w
 cytatach `ps-chat`.
 
-### Etap 4 — jedna kolejka zadań ingestu
-Usługa core: kolejka + postęp + cancel + limit współbieżności. Projekty i `ingest_drain` stają się
-jej klientami.
+### Etap 4 — wspólne anulowanie i wspólny limit współbieżności **[WYKONANE, węziej niż planowano]**
+Zrobione: `services::cancel_registry` (trzy kopie mapy flag → jeden typ; kopia w Projektach sama
+nazywała się „lustrem `dispatch/benchmark.rs`") oraz `services::ingest_gate` — limit w
+`execute_ingest`, czyli w jedynym punkcie, przez który przechodzą obaj konsumenci. Limit liczy
+DOKUMENTY, nie zadania, bo to one ograniczają pamięć; semafor na poziomie zadania i tak przepuszczał
+jeden dokument z każdego zadania.
+
+**Świadomie NIE zrobione: wspólna trwała kolejka.** Addon ma durable `ingest_jobs` w swoim SQLite,
+drenowane przez Scheduler; Projekty mają zadania w procesie, ginące przy restarcie. To nie jest
+duplikacja jednego mechanizmu, tylko **dwa różne modele trwałości**. Sprowadzenie ich do jednego
+oznacza migrację danych addona i zmianę jego modelu synchronizacji — osobne zadanie, nie etap tego
+planu. Po tej zmianie identyczne są mechanizmy *wykonania* (limit, anulowanie), a różna zostaje
+*trwałość zlecenia*.
 
 ### Etap 5 — jeden retrieval **[nowa blokada]**
 `retrieval_round` i `query` jako flowy systemowe; `project_knowledge` zostaje wyłącznie bramką
