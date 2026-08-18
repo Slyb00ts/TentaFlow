@@ -398,6 +398,7 @@ mod tests {
     impl LlmDispatcher for MockLlm {
         async fn execute_chat(&self, _req: Req) -> Result<LlmResponse> {
             Ok(LlmResponse {
+                audio: None,
                 content: self.answer.clone(),
                 reasoning_content: None,
                 usage: TokenUsage::default(),
@@ -706,6 +707,7 @@ mod tests {
             async fn execute_chat(&self, req: Req) -> Result<LlmResponse> {
                 *self.captured.lock().unwrap() = req.messages[0].text_or_default();
                 Ok(LlmResponse {
+                    audio: None,
                     content: r#"{"agent_id":"id-a","reason":"ok"}"#.into(),
                     reasoning_content: None,
                     usage: TokenUsage::default(),

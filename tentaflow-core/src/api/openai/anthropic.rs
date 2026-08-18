@@ -314,6 +314,8 @@ fn to_openai_request(
         .and_then(|_| to_openai_tool_choice(req.tool_choice.as_ref()));
 
     Ok(ChatCompletionRequest {
+        modalities: None,
+        audio: None,
         model: req.model,
         messages,
         temperature: req.temperature,
@@ -474,7 +476,9 @@ fn anthropic_message_to_openai(
 
     let has_text = parts.iter().any(|p| match p {
         ContentPart::Text { text } => !text.is_empty(),
-        ContentPart::ImageUrl { .. } => true,
+        // Media count as content: a turn carrying only a picture or a
+        // recording is not an empty turn.
+        ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => true,
     });
     if has_text || !tool_calls.is_empty() || reasoning_content.is_some() {
         out.push(Message {
@@ -498,7 +502,7 @@ fn flatten_parts(parts: Vec<ContentPart>) -> MessageContent {
             .iter()
             .filter_map(|p| match p {
                 ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ImageUrl { .. } => None,
+                ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n");
@@ -531,7 +535,7 @@ fn extract_text(content: Option<&MessageContent>) -> String {
             .iter()
             .filter_map(|p| match p {
                 ContentPart::Text { text } => Some(text.as_str()),
-                ContentPart::ImageUrl { .. } => None,
+                ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
             })
             .collect::<Vec<_>>()
             .join(""),

@@ -82,6 +82,8 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         // swoje sane defaults; wstrzykiwanie ENG system prompt do polskich
         // 4-bit modeli (Bielik) degradowalo kontekst → bełkot z corpusu.
         let request = ChatCompletionRequest {
+            modalities: None,
+            audio: None,
             model: stream_req.model_id.clone(),
             messages,
             temperature: stream_req.temperature,

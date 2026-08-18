@@ -11,7 +11,8 @@ use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::{LlmRequest, LlmToolSpec};
 use crate::flow_engine::envelope::{
-    ChatMessage, ChatRole, EnvelopeDelta, FlowEnvelope, FlowValue, NodeInput,
+    audio_format_from_mime, ChatMessage, ChatRole, EnvelopeDelta, FinishReason, FlowEnvelope,
+    FlowValue, LlmToolCall, MessagePart, NodeInput,
 };
 use crate::flow_engine::node_adapter::{
     ExecutionContext, LlmAdapter, NodeAdapter, PortSpec, StreamProducerAdapter,
@@ -155,40 +156,264 @@ impl LlmNodeAdapter {
             .map(|s| s.to_string())
     }
 
-    /// Zbieranie messages z envelope.context. Plan v4.2:
-    /// 1. system_prompts → osobne System messages (nie sklejać).
-    /// 2. inline `system_prompt` z node config → osobny System message
-    ///    dopisany ZA system_prompts (envelope-driven idą pierwsze).
-    /// 3. context.messages w kolejności.
-    /// 4. Jeśli payload jest Text i ostatnia message ma inny content,
+    /// Zbieranie messages z envelope.context:
+    /// 1. system_prompts + inline `system_prompt` z node config → JEDNA
+    ///    wiadomość System, sekcje rozdzielone pustą linią (envelope-driven
+    ///    idą pierwsze, inline na końcu).
+    /// 2. context.messages w kolejności.
+    /// 3. Jeśli payload jest Text i ostatnia message ma inny content,
     ///    doklejamy User(payload.text). Empty payload nie produkuje żadnego
     ///    dodatkowego user'a.
+    ///
+    /// Sklejanie, a nie osobne wiadomości (jak zakładał plan v4.2): ścisłe
+    /// szablony czatu — Qwen3, Mistral, Gemma — dopuszczają DOKŁADNIE jedną
+    /// wiadomość systemową na pozycji zerowej i przerywają renderowanie
+    /// wyjątkiem „System message must be at the beginning" przy drugiej.
+    /// `agent_context` sam produkuje ich kilka (prompt agenta, indeks skilli,
+    /// nota anty-injection, wyniki delegacji), więc rozdzielone wiadomości
+    /// czyniły harness niekompatybilnym z większością lokalnych modeli.
+    /// Ogranicznik pozostaje pustą linią, więc fence'y anty-injection
+    /// (`<<<PASSAGE>>>`) działają jak wcześniej.
     fn build_messages(node: &FlowNode, envelope: &FlowEnvelope) -> Vec<ChatMessage> {
         let mut out: Vec<ChatMessage> = Vec::new();
 
-        for sp in &envelope.context.system_prompts {
-            out.push(ChatMessage::system(sp.clone()));
+        let mut sections: Vec<&str> = envelope
+            .context
+            .system_prompts
+            .iter()
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
+            .collect();
+        let inline = Self::inline_system_prompt(node);
+        if let Some(inline) = inline.as_deref() {
+            if !inline.trim().is_empty() {
+                sections.push(inline);
+            }
         }
-        if let Some(inline) = Self::inline_system_prompt(node) {
-            out.push(ChatMessage::system(inline));
+        if !sections.is_empty() {
+            out.push(ChatMessage::system(sections.join("\n\n")));
         }
         out.extend(envelope.context.messages.iter().cloned());
 
-        if let FlowValue::Text(t) = &envelope.payload {
-            if !t.is_empty() {
-                // Etap 3b: porównanie tylko gdy ostatnia message to czysty
-                // Text. Parts (multimodal) zawsze potraktowane jako "różne"
-                // — payload.Text będzie dodany jako kolejny user message.
-                let last_matches = out
-                    .last()
-                    .map(|m| m.role == ChatRole::User && m.text() == Some(t.as_str()))
-                    .unwrap_or(false);
-                if !last_matches {
-                    out.push(ChatMessage::user(t.clone()));
+        if let Some(user) = Self::payload_user_message(envelope, &out) {
+            out.push(user);
+        }
+        out
+    }
+
+    /// The User message that `build_messages` derives from `envelope.payload`,
+    /// or `None` when the payload adds nothing (empty, non-Text, or already the
+    /// last message).
+    ///
+    /// Extracted so `execute` can PERSIST it into the conversation. The user's
+    /// prompt arrives in `envelope.payload`, and `execute` overwrites that
+    /// payload with the model's answer — so without persisting it the prompt
+    /// survives exactly ONE iteration of the harness loop. From the second
+    /// iteration on the model reasons over tool results with no idea what it
+    /// was asked to do, and a strict chat template (Qwen3) refuses to render a
+    /// conversation containing no user turn at all
+    /// (`No user query found in messages.`).
+    ///
+    /// `prior` is the message list the payload would be appended to, so the
+    /// "already the last message" check matches whatever the caller is building.
+    /// Folds every arriving edge into ONE envelope for the turn.
+    ///
+    /// With typed ports per modality a multimodal turn legitimately arrives as
+    /// several edges — the prompt down `in`, the picture down `image` — and one
+    /// of them has to carry the conversation while the others contribute their
+    /// media. The text branch wins the base (it holds history, system prompts
+    /// and meta accumulated by `agent_context`), and a media payload is folded
+    /// into it; when no text edge arrived the media envelope IS the base.
+    ///
+    /// Media is carried in `meta` rather than in the payload of the base, so a
+    /// single turn can hold both a prompt and a picture — `payload` has room
+    /// for exactly one value, which is why simply picking `inputs.first()` used
+    /// to make the second edge disappear.
+    fn merge_inputs(inputs: &[NodeInput]) -> Result<FlowEnvelope> {
+        let base_idx = inputs
+            .iter()
+            .position(|i| matches!(i.envelope.payload, FlowValue::Text(_)))
+            .unwrap_or(0);
+        let base = inputs
+            .get(base_idx)
+            .ok_or_else(|| anyhow!("llm adapter: missing input edge"))?;
+        let mut out: FlowEnvelope = (*base.envelope).clone();
+
+        for (idx, other) in inputs.iter().enumerate() {
+            if idx == base_idx {
+                continue;
+            }
+            match &other.envelope.payload {
+                FlowValue::Image { blob_ref, mime, dims } => {
+                    out.meta.insert(
+                        "llm_image".into(),
+                        serde_json::json!({
+                            "blob": blob_ref,
+                            "mime": mime,
+                            "dims": dims,
+                        }),
+                    );
+                }
+                FlowValue::Audio { blob_ref, mime, sample_rate } => {
+                    out.meta.insert(
+                        "llm_audio".into(),
+                        serde_json::json!({
+                            "blob": blob_ref,
+                            "mime": mime,
+                            "sample_rate": sample_rate,
+                        }),
+                    );
+                }
+                // A second text edge cannot happen (one `in` port) and anything
+                // else has no place in a chat turn; dropping it loudly beats
+                // pretending it was sent.
+                other_kind => {
+                    tracing::warn!(
+                        from = %other.from_node_id,
+                        port = %other.from_port,
+                        "llm adapter: input of unsupported kind ignored: {other_kind:?}"
+                    );
                 }
             }
         }
-        out
+        Ok(out)
+    }
+
+    /// Drops tool calls whose `arguments` are not parseable JSON and says why,
+    /// returning the surviving calls plus a note for the model (`None` when
+    /// nothing was dropped).
+    ///
+    /// A generation cut by the token budget ends mid-string, so the backend
+    /// hands back a REAL tool call carrying half a JSON object — that is
+    /// correct behaviour, not a broken model. The damage starts if we keep it:
+    /// the call goes into the conversation, and the next turn replays the whole
+    /// history to a server whose template parses `arguments` back into an
+    /// object (`supports_object_arguments`). It fails on the unterminated
+    /// string and answers 500 — for every following request, because the
+    /// poisoned message never leaves the history. One truncated turn kills the
+    /// session.
+    ///
+    /// So the call is dropped at the boundary and the model is told, which is
+    /// what it needs to retry with a shorter argument. Silently dropping it
+    /// would leave the model waiting for a result that never comes.
+    pub(crate) fn sanitize_tool_calls(
+        calls: Vec<LlmToolCall>,
+        finish: FinishReason,
+    ) -> (Vec<LlmToolCall>, Option<String>) {
+        let mut kept = Vec::with_capacity(calls.len());
+        let mut dropped: Vec<String> = Vec::new();
+        for call in calls {
+            if serde_json::from_str::<serde_json::Value>(&call.arguments).is_ok() {
+                kept.push(call);
+            } else {
+                dropped.push(call.name.clone());
+            }
+        }
+        if dropped.is_empty() {
+            return (kept, None);
+        }
+        let truncated = finish == FinishReason::Length;
+        let names = dropped.join(", ");
+        let note = if truncated {
+            format!(
+                "[System] Odpowiedź została ucięta na limicie tokenów w środku wywołania: \
+                 {names}. Argumenty są niekompletne, więc wywołanie zostało odrzucone. \
+                 Powtórz je z krótszą treścią — na przykład zapisz plik w częściach."
+            )
+        } else {
+            format!(
+                "[System] Wywołanie {names} miało argumenty, których nie da się sparsować \
+                 jako JSON, więc zostało odrzucone. Powtórz je z poprawnym JSON-em."
+            )
+        };
+        (kept, Some(note))
+    }
+
+    pub(crate) fn payload_user_message(
+        envelope: &FlowEnvelope,
+        prior: &[ChatMessage],
+    ) -> Option<ChatMessage> {
+        // An Image payload becomes a multimodal user turn instead of vanishing.
+        // Before this, a graph that fed a picture into `llm` dropped it in
+        // silence: `build_messages` only ever looked at `FlowValue::Text`, so
+        // the model was asked about an image it never received and answered
+        // from thin air. The caption rides along when the flow put one in
+        // `meta.image_prompt`; without it the picture stands alone and the
+        // instruction comes from the system prompt or the history.
+        // The picture is either THIS turn's payload (a graph whose only input is
+        // an image) or one folded in from a second edge by `merge_inputs`.
+        let image: Option<crate::flow_engine::blob_store::BlobRef> = match &envelope.payload {
+            FlowValue::Image { blob_ref, .. } => Some(blob_ref.clone()),
+            _ => envelope
+                .meta
+                .get("llm_image")
+                .and_then(|v| v.get("blob"))
+                .and_then(|b| serde_json::from_value(b.clone()).ok()),
+        };
+        let audio: Option<(crate::flow_engine::blob_store::BlobRef, String)> =
+            match &envelope.payload {
+                FlowValue::Audio { blob_ref, mime, .. } => {
+                    Some((blob_ref.clone(), audio_format_from_mime(mime)))
+                }
+                _ => envelope.meta.get("llm_audio").and_then(|v| {
+                    let blob: crate::flow_engine::blob_store::BlobRef =
+                        serde_json::from_value(v.get("blob")?.clone()).ok()?;
+                    let mime = v.get("mime").and_then(|m| m.as_str()).unwrap_or("audio/wav");
+                    Some((blob, audio_format_from_mime(mime)))
+                }),
+            };
+
+        if image.is_some() || audio.is_some() {
+            let mut parts = Vec::with_capacity(3);
+            // The prompt for a picture is the turn's text when there is one —
+            // that is the whole point of wiring both edges — and falls back to
+            // an explicit caption in meta.
+            let caption = match &envelope.payload {
+                FlowValue::Text(t) if !t.trim().is_empty() => Some(t.clone()),
+                _ => envelope
+                    .meta
+                    .get("image_prompt")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.trim().is_empty())
+                    .map(str::to_string),
+            };
+            if let Some(caption) = caption {
+                parts.push(MessagePart::Text { text: caption });
+            }
+            if let Some(blob_ref) = image {
+                parts.push(MessagePart::Image {
+                    blob_ref,
+                    detail: envelope
+                        .meta
+                        .get("image_detail")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("auto")
+                        .to_string(),
+                });
+            }
+            if let Some((blob_ref, format)) = audio {
+                parts.push(MessagePart::Audio { blob_ref, format });
+            }
+            return Some(ChatMessage::user_multimodal(parts));
+        }
+        let FlowValue::Text(t) = &envelope.payload else {
+            return None;
+        };
+        if t.is_empty() {
+            return None;
+        }
+        // Comparison only when the last message is plain Text. Parts
+        // (multimodal) always count as "different" — payload.Text is then
+        // appended as another user message.
+        let last_matches = prior
+            .last()
+            .map(|m| m.role == ChatRole::User && m.text() == Some(t.as_str()))
+            .unwrap_or(false);
+        if last_matches {
+            None
+        } else {
+            Some(ChatMessage::user(t.clone()))
+        }
     }
 
     fn build_llm_request(
@@ -212,6 +437,25 @@ impl LlmNodeAdapter {
             frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
             presence_penalty: Self::pick_optional_f32(node, envelope, "presence_penalty"),
             stop: Self::pick_stop(node),
+            // Audio out is per-block config, not a model guess: the operator
+            // decides that THIS step should speak. A model without the
+            // capability is rejected by the resolver, not silently muted.
+            audio_out: node
+                .config
+                .get("audio_output")
+                .and_then(|v| v.as_object())
+                .map(|o| crate::flow_engine::dispatchers::AudioOut {
+                    voice: o
+                        .get("voice")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("alloy")
+                        .to_string(),
+                    format: o
+                        .get("format")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("wav")
+                        .to_string(),
+                }),
             tools,
             tool_choice,
             deadline: ctx.deadline,
@@ -238,8 +482,22 @@ impl NodeAdapter for LlmNodeAdapter {
     fn node_type(&self) -> &str {
         NODE_TYPE
     }
+    /// Typed ports for every modality a chat model can be fed, mirroring how
+    /// `output` carries six of them: a port is a promise about the DATA, not
+    /// about the model, so the block advertises what it can carry and the
+    /// resolver rejects a model that cannot take it (`required_input_modalities`).
+    ///
+    /// Declaring only `in: Text` made an image impossible to WIRE: the edge
+    /// failed R6 before anyone could ask whether the model has vision. The
+    /// Flow Builder greys out the ports the selected model does not accept,
+    /// reading `input_modalities` off the catalog entry — so what changes with
+    /// the model is the port's availability, not its type.
     fn input_ports(&self) -> Vec<PortSpec> {
-        vec![PortSpec::new("in", FlowDataType::Text)]
+        vec![
+            PortSpec::new("in", FlowDataType::Text),
+            PortSpec::new("image", FlowDataType::Image),
+            PortSpec::new("audio", FlowDataType::Audio),
+        ]
     }
     fn output_ports(&self) -> Vec<PortSpec> {
         // Adapter umie wyprodukować obie formy outputu — streaming
@@ -252,7 +510,29 @@ impl NodeAdapter for LlmNodeAdapter {
         vec![
             PortSpec::new("stream", FlowDataType::Text),
             PortSpec::new("full", FlowDataType::Text),
+            // An omni model SPEAKS AND WRITES in one turn, so `audio` is not an
+            // alternative to the text ports — it lights up alongside them. The
+            // recording rides in `artifacts["audio"]` because an envelope has
+            // one payload and that payload is the answer's text; a consumer
+            // reads the artifact. `active_output_ports` keeps the port dark on
+            // turns that produced no sound, so a text-only model never drags a
+            // dead branch behind it.
+            PortSpec::new("audio", FlowDataType::Audio),
         ]
+    }
+
+    /// Only light `audio` when this turn actually produced sound.
+    fn active_output_ports(
+        &self,
+        _node: &FlowNode,
+        result: &FlowEnvelope,
+    ) -> Option<std::collections::HashSet<String>> {
+        let mut ports: std::collections::HashSet<String> =
+            ["stream", "full"].iter().map(|s| s.to_string()).collect();
+        if result.artifacts.contains_key("audio") {
+            ports.insert("audio".to_string());
+        }
+        Some(ports)
     }
 
     async fn execute(
@@ -261,10 +541,8 @@ impl NodeAdapter for LlmNodeAdapter {
         inputs: &[NodeInput],
         ctx: &ExecutionContext,
     ) -> Result<FlowEnvelope> {
-        let input = inputs
-            .first()
-            .ok_or_else(|| anyhow!("llm adapter: missing input edge"))?;
-        let envelope = &input.envelope;
+        let merged = Self::merge_inputs(inputs)?;
+        let envelope: &FlowEnvelope = &merged;
 
         let request = Self::build_llm_request(node, envelope, ctx)?;
         let response = ctx
@@ -279,16 +557,61 @@ impl NodeAdapter for LlmNodeAdapter {
         // assistant message. Provenance trzymamy tylko dla artifacts
         // bag (envelope.artifacts) — payload jest głównym slotem flow,
         // jego pochodzenie wynika z trace (executor produkuje TraceStep).
-        let mut out: FlowEnvelope = (**envelope).clone();
+        let mut out: FlowEnvelope = envelope.clone();
+        // Persist the prompt BEFORE overwriting the payload with the answer:
+        // it lives only in `payload`, so a harness loop would otherwise drop
+        // the user's request after the first iteration (see
+        // `payload_user_message`).
+        if let Some(user) = Self::payload_user_message(envelope, &envelope.context.messages) {
+            out.context.messages.push(user);
+        }
         out.payload = FlowValue::Text(response.content.clone());
+        // Speech from an omni turn: the bytes go to the blob store and the
+        // artifact bag, because `payload` already holds the answer's text and a
+        // turn that both speaks and writes needs somewhere for the second half.
+        // The `audio` output port lights up off this artifact
+        // (`active_output_ports`).
+        if let Some(audio) = &response.audio {
+            match ctx.blobs.put(audio.bytes.clone(), &audio.mime).await {
+                Ok(blob_ref) => {
+                    out.artifacts.insert(
+                        "audio".to_string(),
+                        FlowValue::Audio {
+                            blob_ref,
+                            mime: audio.mime.clone(),
+                            sample_rate: None,
+                        },
+                    );
+                    if let Some(transcript) = &audio.transcript {
+                        out.meta.insert(
+                            "audio_transcript".into(),
+                            serde_json::Value::String(transcript.clone()),
+                        );
+                    }
+                }
+                // Losing the recording must not lose the answer: the text half
+                // of the turn is already valid and useful on its own.
+                Err(e) => tracing::warn!(node = %node.id, "storing model audio failed: {e}"),
+            }
+        }
         let mut assistant = ChatMessage::assistant(response.content);
         assistant.reasoning_content = response.reasoning_content;
-        if !response.tool_calls.is_empty() {
+        // A truncated generation yields half a JSON object; keeping it poisons
+        // every later turn (`sanitize_tool_calls`).
+        let (calls, note) =
+            Self::sanitize_tool_calls(response.tool_calls, response.finish_reason);
+        if !calls.is_empty() {
             // Tool calls ride on the assistant message so downstream nodes
             // (tool executor, converter) see them in conversation context.
-            assistant.tool_calls = Some(response.tool_calls);
+            assistant.tool_calls = Some(calls);
         }
         out.context.messages.push(assistant);
+        if let Some(note) = note {
+            tracing::warn!(node = %node.id, "{note}");
+            // As a user turn, so the loop keeps a valid alternation and the
+            // model reads it as an instruction rather than as its own words.
+            out.context.messages.push(ChatMessage::user(note));
+        }
         Ok(out)
     }
 }
@@ -316,6 +639,7 @@ impl LlmAdapter for LlmNodeAdapter {
         Self::build_llm_request(node, envelope, ctx).unwrap_or_else(|_| {
             let (tools, tool_choice) = Self::pick_tools(envelope);
             LlmRequest {
+                audio_out: None,
                 model: String::new(),
                 messages: Self::build_messages(node, envelope),
                 temperature: Self::pick_optional_f32(node, envelope, "temperature"),
@@ -392,8 +716,12 @@ mod tests {
         }
     }
 
+    /// Sekcje systemowe lądują w JEDNEJ wiadomości System na pozycji zerowej.
+    /// Ścisłe szablony (Qwen3/Mistral/Gemma) przerywają na drugiej wiadomości
+    /// systemowej, a `agent_context` produkuje ich kilka — rozdzielone
+    /// wiadomości wywracały każdą turę na lokalnym modelu.
     #[test]
-    fn build_messages_stitches_system_prompts_then_messages() {
+    fn build_messages_merges_system_prompts_into_one() {
         let mut env = FlowEnvelope::empty();
         env.context = ConversationContext {
             messages: vec![ChatMessage::user("ping")],
@@ -401,14 +729,145 @@ mod tests {
         };
         let n = node(json!({"system_prompt": "inline"}));
         let msgs = LlmNodeAdapter::build_messages(&n, &env);
-        assert_eq!(msgs.len(), 4);
+        assert_eq!(msgs.len(), 2, "system sections must collapse into one message");
         assert_eq!(msgs[0].role, ChatRole::System);
-        assert_eq!(msgs[0].text(), Some("sp1"));
-        assert_eq!(msgs[1].role, ChatRole::System);
-        assert_eq!(msgs[1].text(), Some("sp2"));
-        assert_eq!(msgs[2].role, ChatRole::System);
-        assert_eq!(msgs[2].text(), Some("inline"));
-        assert_eq!(msgs[3].role, ChatRole::User);
+        assert_eq!(msgs[0].text(), Some("sp1\n\nsp2\n\ninline"));
+        assert_eq!(msgs[1].role, ChatRole::User);
+        assert!(
+            msgs.iter().skip(1).all(|m| m.role != ChatRole::System),
+            "no system message may follow a non-system one"
+        );
+    }
+
+    /// Regresja złapana na żywym modelu: prompt użytkownika żyje wyłącznie
+    /// w `payload`, który `execute` nadpisuje odpowiedzią. Bez utrwalenia go
+    /// w rozmowie druga iteracja pętli harnessu widziała już tylko
+    /// [system, assistant(tool_calls), tool] — model rozumował nad wynikami
+    /// narzędzi, nie wiedząc, o co go poproszono, a ścisłe szablony odmawiały
+    /// renderowania („No user query found in messages.").
+    #[test]
+    fn payload_user_message_survives_a_loop_iteration() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("napisz hello.py".into());
+
+        // Iteracja 1: prompt trafia do żądania…
+        let msgs = LlmNodeAdapter::build_messages(&node(json!({})), &env);
+        assert_eq!(msgs.last().map(|m| m.role), Some(ChatRole::User));
+
+        // …i musi zostać utrwalony w rozmowie, zanim payload zostanie nadpisany.
+        let user = LlmNodeAdapter::payload_user_message(&env, &env.context.messages)
+            .expect("prompt must be persistable");
+        assert_eq!(user.text(), Some("napisz hello.py"));
+
+        // Iteracja 2: payload to już odpowiedź modelu, ale prompt został.
+        let mut next = env.clone();
+        next.context.messages.push(user);
+        next.context.messages.push(ChatMessage::assistant("wołam narzędzie"));
+        next.payload = FlowValue::Text("wołam narzędzie".into());
+        let msgs2 = LlmNodeAdapter::build_messages(&node(json!({})), &next);
+        assert!(
+            msgs2.iter().any(|m| m.role == ChatRole::User && m.text() == Some("napisz hello.py")),
+            "the user's request must still be in the conversation on iteration 2"
+        );
+    }
+
+    /// Regresja zmierzona na rig24: wiadomość `assistant` z niedokończonym
+    /// JSON-em w `arguments` wywraca llama.cpp błędem 500 („invalid string:
+    /// missing closing quote") przy RENDEROWANIU historii — zanim model cokolwiek
+    /// wygeneruje. Zapisana raz, zatruwa sesję na stałe, bo wraca w każdym
+    /// kolejnym żądaniu.
+    #[test]
+    fn a_truncated_tool_call_is_dropped_and_explained() {
+        let calls = vec![
+            LlmToolCall {
+                id: "ok".into(),
+                name: "core.fs_read".into(),
+                arguments: r#"{"path":"a.rs"}"#.into(),
+            },
+            LlmToolCall {
+                id: "cut".into(),
+                name: "core.fs_write".into(),
+                arguments: r#"{"path":"a.py","content":"niedokonczony"#.into(),
+            },
+        ];
+        let (kept, note) = LlmNodeAdapter::sanitize_tool_calls(calls, FinishReason::Length);
+        assert_eq!(kept.len(), 1, "only the parseable call survives");
+        assert_eq!(kept[0].id, "ok");
+        let note = note.expect("the model must be told why its call vanished");
+        assert!(note.contains("core.fs_write"), "the note names the dropped call");
+        assert!(note.contains("ucięta"), "a length cut is explained as a cut");
+    }
+
+    /// Obraz w payloadzie musi stać się multimodalną turą, a nie zniknąć.
+    /// Wcześniej `build_messages` patrzył wyłącznie na `FlowValue::Text`, więc
+    /// graf podający zdjęcie do bloku `llm` gubił je bez śladu i model
+    /// odpowiadał o obrazie, którego nigdy nie dostał.
+    #[test]
+    fn an_image_payload_becomes_a_multimodal_turn() {
+        use crate::flow_engine::blob_store::BlobRef;
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Image {
+            blob_ref: BlobRef {
+                id: "b1".into(),
+                size_bytes: 1024,
+                mime: "image/png".into(),
+                sha256: "abc".into(),
+            },
+            mime: "image/png".into(),
+            dims: Some((800, 600)),
+        };
+        env.meta.insert("image_prompt".into(), serde_json::json!("Co tu widać?"));
+
+        let msg = LlmNodeAdapter::payload_user_message(&env, &[])
+            .expect("an image must reach the model");
+        assert_eq!(msg.role, ChatRole::User);
+        match &msg.content {
+            crate::flow_engine::envelope::ChatMessageContent::Parts(parts) => {
+                assert_eq!(parts.len(), 2, "caption + image");
+                assert!(matches!(parts[0], MessagePart::Text { .. }));
+                assert!(matches!(parts[1], MessagePart::Image { .. }));
+            }
+            other => panic!("expected multimodal parts, got {other:?}"),
+        }
+
+        // …i trafia do żądania, nie tylko do rozmowy.
+        let msgs = LlmNodeAdapter::build_messages(&node(json!({})), &env);
+        assert!(
+            msgs.iter().any(|m| matches!(
+                &m.content,
+                crate::flow_engine::envelope::ChatMessageContent::Parts(p)
+                    if p.iter().any(|x| matches!(x, MessagePart::Image { .. }))
+            )),
+            "the request must carry the image"
+        );
+    }
+
+    /// Poprawne wywołania przechodzą nietknięte i bez noty — inaczej każda tura
+    /// dokładałaby modelowi szum.
+    #[test]
+    fn valid_tool_calls_pass_through_untouched() {
+        let calls = vec![LlmToolCall {
+            id: "a".into(),
+            name: "core.exec".into(),
+            arguments: r#"{"argv":["ls"]}"#.into(),
+        }];
+        let (kept, note) = LlmNodeAdapter::sanitize_tool_calls(calls, FinishReason::ToolCalls);
+        assert_eq!(kept.len(), 1);
+        assert!(note.is_none());
+    }
+
+    /// Brak jakiejkolwiek sekcji systemowej nie może wyprodukować pustej
+    /// wiadomości System — część backendów odrzuca pustą treść.
+    #[test]
+    fn build_messages_emits_no_system_when_there_is_nothing_to_say() {
+        let mut env = FlowEnvelope::empty();
+        env.context = ConversationContext {
+            messages: vec![ChatMessage::user("ping")],
+            system_prompts: vec!["   ".into()],
+        };
+        let msgs = LlmNodeAdapter::build_messages(&node(json!({})), &env);
+        assert_eq!(msgs.len(), 1);
+        assert_eq!(msgs[0].role, ChatRole::User);
     }
 
     #[test]

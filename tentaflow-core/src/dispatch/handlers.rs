@@ -8264,6 +8264,7 @@ pub async fn agent_builder_assist(
 
     let mut messages = Vec::with_capacity(turns.len() + 1);
     messages.push(Message {
+        audio: None,
         role: "system".to_string(),
         content: Some(MessageContent::Text(system_prompt)),
         reasoning_content: None,
@@ -8273,6 +8274,7 @@ pub async fn agent_builder_assist(
     });
     for turn in turns {
         messages.push(Message {
+            audio: None,
             role: turn.role,
             content: Some(MessageContent::Text(turn.content)),
             reasoning_content: None,
@@ -8283,6 +8285,8 @@ pub async fn agent_builder_assist(
     }
 
     let request = ChatCompletionRequest {
+        modalities: None,
+        audio: None,
         model: crate::skills::resolve_model(&ctx.state.db),
         messages,
         temperature: Some(0.2),

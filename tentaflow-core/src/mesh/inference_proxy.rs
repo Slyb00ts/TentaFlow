@@ -442,6 +442,8 @@ fn build_chat_request(
     }
 
     Ok(ChatCompletionRequest {
+        modalities: None,
+        audio: None,
         model: payload.model.clone(),
         messages,
         temperature: payload.temperature,

@@ -401,6 +401,8 @@ impl Router {
             .collect();
 
         let request = crate::api::openai::types::ChatCompletionRequest {
+            modalities: None,
+            audio: None,
             model: payload.model.clone(),
             messages: openai_messages,
             temperature: payload.temperature,

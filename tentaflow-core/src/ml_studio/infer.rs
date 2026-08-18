@@ -20,8 +20,11 @@ pub async fn run_local_chat(
     max_tokens: u32,
 ) -> anyhow::Result<String> {
     let request = ChatCompletionRequest {
+        modalities: None,
+        audio: None,
         model: model_name.to_string(),
         messages: vec![Message {
+            audio: None,
             role: "user".to_string(),
             content: Some(MessageContent::Text(message.to_string())),
             reasoning_content: None,

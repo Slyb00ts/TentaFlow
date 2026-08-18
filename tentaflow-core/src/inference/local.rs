@@ -325,6 +325,7 @@ impl LocalInferenceHandler {
             choices: vec![Choice {
                 index: 0,
                 message: Message {
+                    audio: None,
                     role: "assistant".to_string(),
                     content: Some(MessageContent::Text(result.text.clone())),
                     reasoning_content: None,

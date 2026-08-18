@@ -1243,14 +1243,36 @@ async fn stream_llm_member(
         .first()
         .map(|i| (*i.envelope).clone())
         .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+    // Same contract as the blocking adapter: the prompt lives only in the
+    // payload, which the next line overwrites with the answer. Without
+    // persisting it the harness loop loses the user's request after the first
+    // iteration (`LlmNodeAdapter::payload_user_message`).
+    if let Some(user) = crate::flow_engine::node_adapters::llm::LlmNodeAdapter::payload_user_message(
+        &out,
+        &out.context.messages,
+    ) {
+        out.context.messages.push(user);
+    }
     out.payload = FlowValue::Text(content.clone());
     let mut assistant = ChatMessage::assistant(content);
     assistant.reasoning_content = (!reasoning_content.is_empty()).then_some(reasoning_content);
-    let calls = tool_calls.finish();
+    // Streaming reassembles arguments from deltas, so a stream cut by the token
+    // budget ends mid-string exactly like the blocking path — and poisons the
+    // history the same way (`LlmNodeAdapter::sanitize_tool_calls`).
+    let (calls, note) = crate::flow_engine::node_adapters::llm::LlmNodeAdapter::sanitize_tool_calls(
+        tool_calls.finish(),
+        // A stream that ended without saying why is treated as complete; only
+        // an explicit `length` marks the cut that truncates arguments.
+        finish_reason.unwrap_or(FinishReason::Stop),
+    );
     if !calls.is_empty() {
         assistant.tool_calls = Some(calls);
     }
     out.context.messages.push(assistant);
+    if let Some(note) = note {
+        tracing::warn!("{note}");
+        out.context.messages.push(ChatMessage::user(note));
+    }
     Ok(out)
 }
 
@@ -2201,6 +2223,17 @@ async fn finalize_streaming_flow(
         // przez chain (tts_stream_bridge konsumował) lub został
         // pochłonięty wewnątrz bridge. Brak text_buf do append'u.
     } else {
+        // A turn that records an assistant must also record the user that
+        // prompted it: the prompt lives only in the payload, overwritten on the
+        // next line (`LlmNodeAdapter::payload_user_message`).
+        if let Some(user) =
+            crate::flow_engine::node_adapters::llm::LlmNodeAdapter::payload_user_message(
+                &final_envelope,
+                &final_envelope.context.messages,
+            )
+        {
+            final_envelope.context.messages.push(user);
+        }
         final_envelope.payload = FlowValue::Text(text_buf.clone());
         let mut assistant = ChatMessage::assistant(text_buf);
         assistant.reasoning_content = (!reasoning_buf.is_empty()).then_some(reasoning_buf);
@@ -4497,6 +4530,7 @@ mod direct_execution_tests {
     impl LlmDispatcher for FakeBlockingLlm {
         async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
             Ok(LlmResponse {
+                audio: None,
                 content: self.content.clone(),
                 reasoning_content: None,
                 usage: self.usage.clone(),

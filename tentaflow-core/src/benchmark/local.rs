@@ -58,6 +58,8 @@ impl LocalRunner {
         max_tokens: u32,
     ) -> anyhow::Result<(StreamObservation, RouteNote)> {
         let request = ChatCompletionRequest {
+            modalities: None,
+            audio: None,
             model: model.to_string(),
             messages: vec![Message {
                 role: "user".to_string(),

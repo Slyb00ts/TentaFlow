@@ -5,6 +5,7 @@
 // =============================================================================
 
 import { escapeHtml, escapeAttr } from '/js/utils.js';
+import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeName, getNodeDescription } from '/js/modules/flows-builder/node-i18n.js';
@@ -78,6 +79,11 @@ export class FlowPalette {
         this._render();
       }, 120);
     });
+
+    // Alongside the palette: which model can take what. Fire-and-forget — a
+    // canvas that renders before the catalog lands simply dims nothing, and the
+    // next render (any edit) picks it up.
+    ModelModalities.load();
 
     try {
       this.templates = await ApiBinary.list('flowNodeTemplatesListRequest', { arrayKey: 'templates' });

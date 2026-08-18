@@ -1402,6 +1402,8 @@ impl BackendClient {
 
         // Utworz ChatCompletionRequest
         let request = ChatCompletionRequest {
+            modalities: None,
+            audio: None,
             model: model.clone(),
             messages: chat_messages,
             max_tokens,

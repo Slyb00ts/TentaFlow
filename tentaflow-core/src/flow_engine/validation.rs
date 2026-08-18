@@ -507,6 +507,14 @@ pub fn validate(
         if node.node_type == "text_extract" {
             continue;
         }
+        // `llm` ma typowane porty per modalnosc (`in`/`image`/`audio`), a jedna
+        // tura multimodalna to LEGALNIE kilka krawedzi naraz: prompt tekstowy z
+        // jednej galezi i zdjecie z drugiej skladaja sie na jedna wiadomosc
+        // uzytkownika. Bez zwolnienia z R4 obrazu nie da sie podpiac inaczej niz
+        // zamiast tekstu — czyli model dostawalby zdjecie bez pytania.
+        if node.node_type == "llm" {
+            continue;
+        }
         // `output` ma 6 typed input portow (text/audio/image/video/embedding
         // /other) — kazdy branch flow moze emitowac inny typ jednoczesnie
         // (np. text z LLM + audio z TTS w streamingu). Wymaga zwolnienia z

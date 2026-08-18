@@ -725,6 +725,17 @@
    nie zmienialy wygladu. */
 .fb-port-type-text     { --port-color: #38bdf8; border-color: var(--port-color); }
 .fb-port-type-audio    { --port-color: #f472b6; border-color: var(--port-color); }
+
+/* Port, ktorego WYBRANY MODEL nie obsluguje. Typ portu sie nie zmienia — to
+   wylacznie podpowiedz, ze to polaczenie nie zadziala z tym modelem. Port
+   zostaje klikalny: kto wie lepiej (model spoza katalogu, swiezy deploy),
+   moze go uzyc, a bieg i tak powie prawde. */
+.fb-port-unsupported {
+  opacity: 0.32;
+  border-style: dashed;
+  filter: grayscale(0.7);
+}
+.fb-port-unsupported:hover { opacity: 0.6; }
 .fb-port-type-image    { --port-color: #34d399; border-color: var(--port-color); }
 .fb-port-type-video    { --port-color: #f59e0b; border-color: var(--port-color); }
 .fb-port-type-embedding{ --port-color: #a78bfa; border-color: var(--port-color); }

@@ -55,6 +55,7 @@ pub fn flow_outcome_to_chat_response(
         choices: vec![Choice {
             index: 0,
             message: Message {
+                audio: None,
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(content.into_owned())),
                 reasoning_content,

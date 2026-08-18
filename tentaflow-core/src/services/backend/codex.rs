@@ -234,7 +234,7 @@ fn message_text(m: &Message) -> String {
             .iter()
             .filter_map(|p| match p {
                 ContentPart::Text { text } => Some(text.clone()),
-                ContentPart::ImageUrl { .. } => None,
+                ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
             })
             .collect::<Vec<_>>()
             .join("\n"),

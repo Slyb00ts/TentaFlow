@@ -9,6 +9,7 @@ import { escapeHtml, escapeAttr } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle, isAutoNodeLabel } from '/js/modules/flows-builder/node-i18n.js';
 import { nodeIconId, nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
+import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
 import '/js/components/tf-menu.js';
 
 const NODE_WIDTH = 280;
@@ -64,6 +65,37 @@ function genRegionId() {
 // Kazdy port ma `type` (string `text`/`audio`/`image`/`video`/`embedding`/
 // `other`/`json`/`any`) — uzywany do kolorowania i walidacji polaczenia
 // po stronie GUI (lustrzana R8: `any` na ktorejkolwiek stronie = wildcard).
+/// Flags ports the node's CHOSEN MODEL cannot serve. The port keeps its type
+/// and its identity — only `unsupported` is added, and the canvas dims it.
+///
+/// Only a model-driven node has anything to check: for everything else the
+/// question is meaningless, so the flag is never set and nothing dims.
+/// An unknown model (not in the catalog, e.g. typed by hand or newer than the
+/// snapshot) leaves every port enabled — refusing to wire something we simply
+/// have no record of would be worse than letting the run report it.
+function markUnsupported(node, ports, side) {
+  if (!node || (node.type !== 'llm' && node.type !== 'vision_llm')) return;
+  const model = node.config?.model;
+  if (!model || !ModelModalities.known(model)) return;
+  const modalityOf = (p) => {
+    const t = (p.type || '').toLowerCase();
+    if (t === 'image' || t === 'audio') return t;
+    // `stream`/`full`/`in` are the text channel whatever they are called.
+    return 'text';
+  };
+  for (const p of ports) {
+    const modality = modalityOf(p);
+    const ok = side === 'in'
+      ? ModelModalities.accepts(model, modality)
+      : ModelModalities.emits(model, modality);
+    if (ok === false) {
+      p.unsupported = true;
+      p.unsupportedReason = I18n.t('flows_builder.port_unsupported', { model, modality })
+        || `${model}: brak obsługi ${modality}`;
+    }
+  }
+}
+
 function portsForNode(node, template) {
   const isTrigger = node.type === 'trigger' || node.type === 'start';
   const isOutput = node.type === 'output' || node.type === 'end';
@@ -103,6 +135,7 @@ function portsForNode(node, template) {
   }
 
   const inputs = tplIn || (isTrigger ? [] : [{ name: 'in', type: 'any' }]);
+  markUnsupported(node, inputs, 'in');
 
   let outputs;
   if (tplOut) {
@@ -126,6 +159,7 @@ function portsForNode(node, template) {
     outputs = [{ name: 'full', type: 'any' }];
   }
 
+  markUnsupported(node, outputs, 'out');
   return { inputs, outputs };
 }
 
@@ -910,11 +944,16 @@ export class FlowCanvas {
     const portType = (port.type || 'any').toLowerCase();
     // Tooltip pokazuje nazwe portu + typ danych zeby uzytkownik widzial
     // dlaczego port ma kolor X (np. "audio • Audio").
-    const tooltip = `${portLabel} • ${portType}`;
+    // The tooltip must say WHY a port is dim, otherwise it reads as broken.
+    const tooltip = port.unsupported === true
+      ? `${portLabel} • ${portType} — ${port.unsupportedReason}`
+      : `${portLabel} • ${portType}`;
     const labelHtml = showLabel
       ? `<span class="fb-port-label">${escapeHtml(port.name)}</span>`
       : '';
-    const cls = `fb-port fb-port-${side === 'in' ? 'in' : 'out'} fb-port-type-${portType}`;
+    const unsupported = port.unsupported === true;
+    const cls = `fb-port fb-port-${side === 'in' ? 'in' : 'out'} fb-port-type-${portType}`
+      + (unsupported ? ' fb-port-unsupported' : '');
     return `<div class="${cls}" data-node-id="${escapeAttr(nodeId)}" data-port="${escapeAttr(port.name)}" data-port-kind="${escapeAttr(port.name)}" data-port-type="${escapeAttr(portType)}" data-port-idx="${idx}" style="top:${top}px;" title="${escapeAttr(tooltip)}">${labelHtml}</div>`;
   }
 

@@ -165,14 +165,21 @@ impl NodeAdapter for VisionNodeAdapter {
         let detail = Self::pick_detail(node);
         let model = Self::pick_model(node, envelope)?;
 
-        // Compose messages: system_prompts → System; istniejące context.messages
-        // PRZED (history); na końcu user multimodal z prompt + image.
-        let mut messages: Vec<ChatMessage> = envelope
+        // Compose messages: system_prompts → JEDNA System (ścisłe szablony
+        // czatu dopuszczają dokładnie jedną i przerywają na drugiej — patrz
+        // `llm.rs::build_messages`); istniejące context.messages PRZED
+        // (history); na końcu user multimodal z prompt + image.
+        let sections: Vec<&str> = envelope
             .context
             .system_prompts
             .iter()
-            .map(|sp| ChatMessage::system(sp.clone()))
+            .map(String::as_str)
+            .filter(|s| !s.trim().is_empty())
             .collect();
+        let mut messages: Vec<ChatMessage> = Vec::new();
+        if !sections.is_empty() {
+            messages.push(ChatMessage::system(sections.join("\n\n")));
+        }
         messages.extend(envelope.context.messages.iter().cloned());
         messages.push(ChatMessage::user_multimodal(vec![
             MessagePart::Text { text: prompt },
@@ -180,6 +187,7 @@ impl NodeAdapter for VisionNodeAdapter {
         ]));
 
         let req = LlmRequest {
+            audio_out: None,
             model,
             messages,
             temperature: Self::pick_optional_f32(node, envelope, "temperature"),

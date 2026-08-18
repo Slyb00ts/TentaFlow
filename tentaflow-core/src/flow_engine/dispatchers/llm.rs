@@ -39,6 +39,10 @@ pub struct LlmRequest {
     /// Tools offered for this request. Empty = no tool calling — the
     /// outgoing request carries no `tools` field at all.
     pub tools: Vec<LlmToolSpec>,
+    /// Audio na WYJSCIU: glos i kontener. `None` = tylko tekst, i wtedy
+    /// zadanie nie niesie ani `modalities`, ani `audio` — backend bez wsparcia
+    /// omni odrzuca te pola, wiec nie wysylamy ich "na wszelki wypadek".
+    pub audio_out: Option<AudioOut>,
     /// OpenAI-style tool_choice ("auto" / "none" / "required"). `None`
     /// leaves the backend default.
     pub tool_choice: Option<String>,
@@ -67,6 +71,7 @@ pub struct LlmRequest {
 impl LlmRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
+            audio_out: None,
             model: model.into(),
             messages: Vec::new(),
             temperature: None,
@@ -99,6 +104,25 @@ pub struct LlmResponse {
     /// Tool invocations requested by the model. Empty when the backend
     /// answered with plain content only.
     pub tool_calls: Vec<LlmToolCall>,
+    /// Natywne audio modelu omni. Wspolistnieje z `content` — model mowi i
+    /// pisze w jednej turze, wiec to nie jest alternatywa dla tekstu.
+    pub audio: Option<LlmAudioOut>,
+}
+
+/// Zadanie audio wyjsciowego.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AudioOut {
+    pub voice: String,
+    pub format: String,
+}
+
+/// Audio zwrocone przez model: surowe bajty (juz zdekodowane z base64) plus
+/// transkrypcja, gdy backend ja podal.
+#[derive(Debug, Clone)]
+pub struct LlmAudioOut {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+    pub transcript: Option<String>,
 }
 
 #[async_trait]

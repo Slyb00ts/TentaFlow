@@ -788,6 +788,8 @@ mod tests {
 
     fn chat_request(messages: Vec<Message>, tools: Option<Vec<Tool>>) -> ChatCompletionRequest {
         ChatCompletionRequest {
+            modalities: None,
+            audio: None,
             model: "m".to_string(),
             messages,
             temperature: None,

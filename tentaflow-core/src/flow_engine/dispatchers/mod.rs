@@ -28,7 +28,7 @@ pub use clock::Clock;
 pub use conversation::ConversationHistoryStore;
 pub use documents::DocumentsDispatcher;
 pub use embeddings::{EmbeddingsDispatcher, EmbeddingsRequest, EmbeddingsResponse};
-pub use llm::{LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
+pub use llm::{AudioOut, LlmAudioOut, LlmDispatcher, LlmRequest, LlmResponse, LlmToolSpec};
 pub use memory::{
     MemoryHit, MemoryQuery, MemoryRecall, MemoryRecord, MemoryStore, MemoryStoreReceipt,
 };

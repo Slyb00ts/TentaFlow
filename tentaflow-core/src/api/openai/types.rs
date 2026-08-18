@@ -137,6 +137,15 @@ pub struct ChatCompletionRequest {
     /// Zwraca transkrybowany tekst oraz info o mowcy w response.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub audio_input: Option<Vec<u8>>,
+
+    /// Zadane modalnosci ODPOWIEDZI, np. `["text","audio"]`. Model omni mowi i
+    /// pisze w jednej turze, wiec to lista, nie wybor.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub modalities: Option<Vec<String>>,
+
+    /// Glos i kontener audio wyjsciowego. Wymagane razem z `modalities`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub audio: Option<AudioConfig>,
 }
 
 /// Pojedyncza wiadomosc w konwersacji
@@ -158,6 +167,12 @@ pub struct Message {
     /// Nazwa uzytkownika/bota (opcjonalne)
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub name: Option<String>,
+
+    /// Natywne audio wyjsciowe modelu omni (GPT-4o-audio, Qwen-Omni). Model
+    /// zwraca RAZEM tekst i dzwiek, wiec to pole wspolistnieje z `content` —
+    /// nie zastepuje go.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub audio: Option<OutputAudio>,
 
     /// Tool calls (dla function calling)
     #[serde(skip_serializing_if = "Option::is_none", default)]
@@ -186,6 +201,37 @@ pub enum ContentPart {
     Text { text: String },
     /// URL do obrazu (dla vision)
     ImageUrl { image_url: ImageUrl },
+    /// Audio wejsciowe (dla modeli omni/audio) — base64 + kod formatu.
+    InputAudio { input_audio: InputAudio },
+}
+
+/// Audio wejsciowe w tresci wiadomosci. OpenAI oczekuje surowego base64 bez
+/// prefiksu `data:` i krotkiego kodu kontenera ("wav"/"mp3"), nie typu MIME.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InputAudio {
+    pub data: String,
+    pub format: String,
+}
+
+/// Audio zwrocone przez model. `transcript` to zapis tego, co model POWIEDZIAL —
+/// bywa bogatszy niz `content`, wiec zachowujemy oba zamiast wybierac.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutputAudio {
+    #[serde(default)]
+    pub id: Option<String>,
+    /// base64 audio w formacie zadanym w `AudioConfig.format`.
+    #[serde(default)]
+    pub data: String,
+    #[serde(default)]
+    pub transcript: Option<String>,
+}
+
+/// Zadanie audio na wyjsciu. OpenAI wymaga OBU: `modalities` musi zawierac
+/// "audio", a `audio` opisac glos i kontener — sam `modalities` nie wystarcza.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AudioConfig {
+    pub voice: String,
+    pub format: String,
 }
 
 /// URL obrazu dla vision requests
