@@ -42,7 +42,7 @@ przez mesh, indeks semantyczny, terminal.
 
 ## 3. Gdzie mamy realne luki
 
-### 3.1 Narzędzia wołane sekwencyjnie
+### 3.1 Narzędzia wołane sekwencyjnie **[NAPRAWIONE]**
 `tool_exec.rs` robi `for call in &calls` — jedno po drugim. To upraszcza (kolejność jest z
 definicji zachowana, więc nie potrzeba maszynerii zatwierdzania w kolejności modelu), ale
 **niezależne odczyty nie mogą jechać równolegle**. U nich: pula z limitem `maxParallelToolCalls`,
@@ -51,11 +51,23 @@ zatwierdzanie po ciągłych slotach, przeklasyfikowanie trybu tuż przed startem
 Nasza równoległość istnieje piętro wyżej — `agent_spawn` i sub-agenci. To inna jednostka
 zrównoleglenia i nie zastępuje tamtej przy trzech `read_file` w jednej turze.
 
-### 3.2 Brak budżetu czasu per narzędzie
+**Zrobione.** Niezależne wywołania jadą równolegle w puli `max_parallel_tool_calls` (domyślnie 4),
+a wyniki wracają w kolejności modelu, więc audyt i wiadomości `role=tool` wyglądają identycznie jak
+przy wykonaniu sekwencyjnym. To, co wolno równolegle, jest **allowlistą**: same odczyty; każde
+narzędzie mutujące, interaktywne i **każde narzędzie addonu** zostaje wyłączne.
+
+### 3.2 Brak budżetu czasu per narzędzie **[NAPRAWIONE]**
 Mamy sufit na `core.exec` (model podaje `timeout_secs`, my go ograniczamy), timeout `ask_user` i
 dodany niedawno idle-timeout. **Nie mamy** odpowiednika `ToolDefinition.timeoutMs` egzekwowanego
 przez jeden wrapper. Zawieszone narzędzie addonowe nie ma budżetu — to jest ta sama klasa problemu,
 którą rozwiązaliśmy punktowo dla `core.exec`.
+
+**Zrobione.** `tool_timeout_secs` (domyślnie 120 s) egzekwowany w JEDNYM miejscu — we wrapperze
+wokół rozdzielacza, więc nowego narzędzia nie da się dodać z pominięciem limitu. Przekroczenie daje
+**ustrukturyzowany wynik błędu**, nie awarię flow. Zwolnione są cztery narzędzia, które same trzymają
+deadline (`ask_user`, `agent_wait`, `agent_spawn`, `exec`) — nałożenie drugiego tylko by go skróciło.
+Granica mechanizmu: anulowanie działa przez drop future'a, więc zadanie `spawn_blocking`, które już
+ruszyło, dobiegnie końca w tle i porzucony zostanie tylko jego wynik.
 
 ### 3.3 Brak ponowienia wewnątrz kroku
 Ich krok jest pętlą: błąd żądania idzie przez waterfall `agent/request-error`, a `retry` **nie
@@ -79,10 +91,10 @@ wtyczkowości i najdroższa różnica do nadrobienia.
 
 ## 5. Kolejność nadrabiania (wg stosunku wartości do kosztu)
 
-1. **Budżet czasu per narzędzie** — najtańsze, usuwa całą klasę zawieszeń.
-2. **Ponowienie wewnątrz kroku** — przestaje zjadać budżet pętli na błędach transportu.
-3. **Lepkie `max-tokens`** — drobne, ale bez tego wynik tury potrafi kłamać.
-4. **Model zdarzeń z `code_studio/events.rs` na poziom flow** — odblokowuje TTFT i czas narzędzia.
-5. **Równoległe wywołania narzędzi** — dopiero gdy 1–4 są zrobione, bo wymaga zatwierdzania w
-   kolejności modelu, żeby log pozostał deterministyczny.
+1. ~~Budżet czasu per narzędzie~~ — **zrobione**.
+2. ~~Równoległe wywołania narzędzi~~ — **zrobione** (wcześniej, niż zakładała ta kolejność, bo
+   zatwierdzanie w kolejności modelu wyszło za darmo: `join_all` zachowuje kolejność wejścia).
+3. **Ponowienie wewnątrz kroku** — przestaje zjadać budżet pętli na błędach transportu.
+4. **Lepkie `max-tokens`** — drobne, ale bez tego wynik tury potrafi kłamać.
+5. **Model zdarzeń z `code_studio/events.rs` na poziom flow** — odblokowuje TTFT i czas narzędzia.
 6. **Rejestr składania promptu** — największa zmiana, osobny projekt.
