@@ -11,6 +11,7 @@ pub mod distributed;
 pub mod docker;
 pub mod embedded;
 pub mod external;
+pub mod gpu_topology;
 pub mod python_bundle;
 
 use std::collections::HashMap;

@@ -1738,35 +1738,21 @@ impl MeshCommandExecutor {
             );
             cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
         }
-        if let Some(util) = gpu_memory_utilization {
-            if let Some(num) = serde_json::Number::from_f64(util as f64) {
-                cfg_obj.insert(
-                    "gpu_memory_utilization".into(),
-                    serde_json::Value::Number(num),
-                );
-            }
-        }
-        if let Some(v) = max_model_len {
-            cfg_obj.insert("max_model_len".into(), serde_json::Value::Number(v.into()));
-        }
-        if let Some(v) = max_num_seqs {
-            cfg_obj.insert("max_num_seqs".into(), serde_json::Value::Number(v.into()));
-        }
-        if let Some(v) = max_num_batched_tokens {
-            cfg_obj.insert(
-                "max_num_batched_tokens".into(),
-                serde_json::Value::Number(v.into()),
-            );
-        }
-        if let Some(dt) = kv_cache_dtype {
-            cfg_obj.insert("kv_cache_dtype".into(), serde_json::Value::String(dt));
-        }
-        if let Some(b) = chunked_prefill {
-            cfg_obj.insert("chunked_prefill".into(), serde_json::Value::Bool(b));
-        }
-        if let Some(args) = vllm_args_override {
-            cfg_obj.insert("vllm_args".into(), serde_json::Value::String(args));
-        }
+        // Same merge as the local handler: scalar keys + flags rewritten inside
+        // `vllm_args`, otherwise the edit never reaches a vLLM/sglang engine.
+        crate::deploy::launch_dialect::apply_service_tuning(
+            &svc.engine_id,
+            cfg_obj,
+            &crate::deploy::launch_dialect::ServiceTuningPatch {
+                gpu_memory_utilization,
+                max_model_len,
+                max_num_seqs,
+                max_num_batched_tokens,
+                kv_cache_dtype,
+                chunked_prefill,
+                vllm_args_override,
+            },
+        );
         let new_config_json = match serde_json::to_string(&cfg) {
             Ok(s) => s,
             Err(e) => return CommandResponse::fail(format!("serialize config: {}", e)),

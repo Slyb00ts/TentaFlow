@@ -15,6 +15,8 @@ import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
 import { deployIcon, render as renderIcon } from '/js/modules/catalog/catalog-icons.js';
 import { isCameraCvEngineId } from '/js/modules/catalog/camera-cv-bundles.js';
+import { computeGpuGroups, gpuPairChipHtml, gpuTopologyLegendHtml, selectionLinkHintHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
+import '/js/components/tf-progress-bar.js';
 
 let currentStep = 1;
 let engineEntry = null;
@@ -182,6 +184,9 @@ export async function openDeployWizard(engineId, opts = {}) {
       // ladowaniu (wymagane przez Gemma 4, DeepSeek V4 i inne z custom kodem).
       // Default ON dla wygody; user moze zdjac dla nieufnego repo.
       trust_remote_code: true,
+      // vLLM-family free-text flags appended LAST to vllm_args, so they win
+      // over recipe/slider values in the backend's last-wins dedup.
+      extra_args: '',
       // MLX-only: budzet pamieci (MB) dla Apple unified memory. Backend liczy
       // realny `pool_tokens` (engine='mlx') z tego budzetu + wybranych kv-bits.
       // Default 16 GB — 8 GB jest mniejsze niz wagi modelu 7B+, wiec wizard
@@ -1123,6 +1128,26 @@ async function fetchVllmRecommendation(overrides = {}) {
   }
 }
 
+// Human label of the weight storage format for the summary readouts. A
+// quantized checkpoint (AWQ / compressed-tensors / fp8 / nvfp4) still reports
+// the config `dtype` (bf16) — the calculator's detected `quantization` label is
+// what the weights are actually stored in, so it wins when present.
+const QUANT_LABELS = {
+  awq: 'int4 (awq)',
+  gptq: 'int4 (gptq)',
+  compressed_tensors_4bit: 'int4 (compressed-tensors)',
+  w8a16: 'int8 (compressed-tensors)',
+  bnb_4bit: 'int4 (bitsandbytes)',
+  bnb_8bit: 'int8 (bitsandbytes)',
+  modelopt_fp8: 'fp8 (modelopt)',
+};
+function weightDtypeLabel(ms) {
+  if (!ms) return '?';
+  const q = String(ms.quantization || '').toLowerCase();
+  if (!q) return ms.dtype || '?';
+  return QUANT_LABELS[q] || q.replace(/_/g, '-');
+}
+
 // Mapuje wybor kv-bits ('none'|'8'|'4') na etykiete wire `kv_cache_dtype`
 // (none|kv8|kv4) ktora backend (estimate_mlx_vram) rozpoznaje.
 function mlxKvDtypeLabel() {
@@ -1303,7 +1328,7 @@ function renderStepAdvanced() {
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_model'))}</div>
           <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
-          ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(rec.model_spec.dtype || '?')} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
+          ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(weightDtypeLabel(rec.model_spec))} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
         </div>
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_gpu'))}</div>
@@ -1362,16 +1387,51 @@ function renderStepAdvanced() {
     ${summaryCard}
     ${vramCard}
     ${modeCard}
+    ${isVllmFamilyEngine() ? renderExtraArgsCard(adv) : ''}
     ${renderSpeculativeCard(adv)}
+  `;
+}
+
+// Free-text vLLM/SGLang flags. Both modes (auto/manual) — the text is
+// tokenized and appended after every generated flag, so it wins on the backend.
+function renderExtraArgsCard(adv) {
+  return `
+    <div class="adv-section">
+      <div class="adv-sec-title">
+        <svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        ${escapeHtml(tAdv('extra_args_label'))}
+      </div>
+      <div class="adv-form-row">
+        <tf-textarea id="edw-adv-extra-args" rows="2" placeholder="--enable-prefix-caching --seed 42"
+          value="${escapeAttr(adv.extra_args || '')}"></tf-textarea>
+        <div class="adv-hint">${escapeHtml(tAdv('extra_args_hint'))}</div>
+      </div>
+    </div>
   `;
 }
 
 // Speculative Decoding panel — emit `--speculative-config '{...}'` w VLLM_ARGS.
 // Pre-fillsuje sie z `model_preset.speculator_*`, ale toggle jest user-opt-in.
+// Speculative methods that draft from the target itself — no drafter repo.
+const SPEC_METHODS_WITHOUT_MODEL = ['mtp', 'ngram'];
+
+function specMethodNeedsModel(method) {
+  return !SPEC_METHODS_WITHOUT_MODEL.includes(String(method || '').toLowerCase());
+}
+
+function nativeMtpAvailable() {
+  return advancedRecommendation?.native_mtp_available === true;
+}
+
 function renderSpeculativeCard(adv) {
   const sp = adv?.speculative || {};
   const tk = (k, params) => I18n.t(`catalog.deploy_wizard.advanced.${k}`, params);
   const enabled = sp.enabled === true;
+  const method = sp.method || 'dflash';
+  const needsModel = specMethodNeedsModel(method);
+  const nativeMtpChip = nativeMtpAvailable()
+    ? `<div class="adv-form-row"><tf-chip status="info" icon="zap">${escapeHtml(tk('spec_native_mtp'))}</tf-chip></div>`
+    : '';
   const tooltipPl = 'Speculative decoding (vLLM --speculative-config). Mały model-drafter predyktuje N tokenów do przodu, target verifuje równolegle. Zysk do 2× szybszy decode bez utraty jakości. Wymaga sparowanego speculatora (np. RedHatAI/...-speculator.dflash).';
   return `
     <div class="adv-section">
@@ -1384,15 +1444,16 @@ function renderSpeculativeCard(adv) {
         <label><tf-toggle id="edw-adv-spec-enabled" ${enabled ? 'checked' : ''}></tf-toggle> <span>Włącz speculative decoding</span></label>
         <div class="adv-hint">Drafter musi być kompatybilny z modelem (np. ten sam tokenizer / wytrenowany pod target). Brak parowania — startup vLLM zakończy się błędem.</div>
       </div>
+      ${nativeMtpChip}
       <div class="adv-row-2" style="${enabled ? '' : 'display:none;'}" id="edw-adv-spec-fields">
-        <div class="adv-form-row">
+        <div class="adv-form-row" id="edw-adv-spec-model-row" style="${needsModel ? '' : 'display:none;'}">
           <label><span>Speculator (HF repo)</span></label>
           <tf-input id="edw-adv-spec-model" placeholder="RedHatAI/gemma-4-31B-it-speculator.dflash" value="${escapeAttr(sp.model || '')}"></tf-input>
           <div class="adv-hint">Repo z drafterem (sufix .dflash / .pflash / itd.).</div>
         </div>
         <div class="adv-form-row">
           <label><span>Method</span></label>
-          <tf-select id="edw-adv-spec-method" value="${escapeAttr(sp.method || 'dflash')}">
+          <tf-select id="edw-adv-spec-method" value="${escapeAttr(method)}">
             <option value="dflash">dflash</option>
             <option value="pflash">pflash</option>
             <option value="eagle">eagle</option>
@@ -1403,6 +1464,7 @@ function renderSpeculativeCard(adv) {
             <option value="ngram">ngram</option>
           </tf-select>
           <div class="adv-hint">Wartość przekazywana do vLLM 1:1.</div>
+          <div class="adv-hint" id="edw-adv-spec-nomodel-hint" style="${needsModel ? 'display:none;' : ''}">${escapeHtml(tk('spec_no_model_hint'))}</div>
         </div>
       </div>
       <div class="adv-row-2" style="${enabled ? '' : 'display:none;'}" id="edw-adv-spec-tokens-row">
@@ -1494,7 +1556,7 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
       </div>
       ${noFitBanner}
       <div class="adv-kpi-grid" id="edw-adv-kpi">
-        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
+        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(weightDtypeLabel(rec.model_spec))}</div></div>
         <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_kv_total') : tAdv('kpi_kv_pool'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv(isLcpp ? 'kpi_kv_total_sub' : 'kpi_kv_pool_sub', {
           tokens: poolTokens.toLocaleString(),
           // llama.cpp: whole slots only (-c = ctx × slots); vLLM: fractional pool capacity.
@@ -1674,6 +1736,12 @@ function renderAdvancedManualControls(adv, rec) {
       : tAdv('ctx_chip_set', { label: p.label });
     return `<button type="button" class="${cls.join(' ')}" data-ctx="${p.value}" title="${escapeAttr(title)}" ${exceeds ? 'disabled' : ''}>${escapeHtml(p.label)}</button>`;
   }).join('');
+  // "Max that fits in VRAM" — the backend's max_supported_model_len rounded
+  // down to a 1024 boundary so the slider lands on a clean value.
+  const vramFitCtx = Math.floor(vramMaxCtx / 1024) * 1024;
+  const vramFitChip = vramFitCtx >= 1024
+    ? `<tf-button size="sm" variant="ghost" icon="zap" id="edw-adv-ctx-vram-max" data-ctx="${vramFitCtx}" title="${escapeAttr(tAdv('ctx_chip_vram_max_title', { ctx: vramFitCtx.toLocaleString() }))}">${escapeHtml(tAdv('ctx_chip_vram_max'))}</tf-button>`
+    : '';
 
   // Hinty auto-adjust — porownujemy applied z recommended zeby pokazac
   // delty. Backend powinien zwracac obie wartosci, ale dzialamy defensive
@@ -1795,7 +1863,7 @@ function renderAdvancedManualControls(adv, rec) {
         <span class="v" id="edw-adv-ctx-val">${ctx.toLocaleString()}</span>
       </label>
       <input type="range" class="adv-range" id="edw-adv-ctx" min="512" max="${maxCtx}" step="512" value="${ctx}">
-      <div class="adv-ctx-presets">${chips}</div>
+      <div class="adv-ctx-presets">${chips}${vramFitChip}</div>
       <div class="adv-hint">${escapeHtml(ctxHint)}</div>
       ${ctxAdjust}
     </div>
@@ -2034,23 +2102,33 @@ function bindAdvancedHandlers() {
     null);
 
   // Chipy presetów kontekstu — klik ustawia suwak i wyzwala recompute.
+  const applyCtxPreset = (v, chip) => {
+    selection.advanced.max_model_len = v;
+    selection.advanced.lockedParam = 'max_model_len';
+    const slider = document.getElementById('edw-adv-ctx');
+    if (slider) slider.value = String(v);
+    const valSpan = document.getElementById('edw-adv-ctx-val');
+    if (valSpan) valSpan.textContent = v.toLocaleString();
+    document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((c) => c.classList.remove('active'));
+    if (chip) chip.classList.add('active');
+    markKvTileEstimating();
+    debounceRecompute(buildOverrides());
+  };
   document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((chip) => {
     chip.addEventListener('click', () => {
       if (chip.classList.contains('exceeds')) return;
       const v = parseInt(chip.dataset.ctx, 10);
       if (!Number.isFinite(v)) return;
-      selection.advanced.max_model_len = v;
-      selection.advanced.lockedParam = 'max_model_len';
-      const slider = document.getElementById('edw-adv-ctx');
-      if (slider) slider.value = String(v);
-      const valSpan = document.getElementById('edw-adv-ctx-val');
-      if (valSpan) valSpan.textContent = v.toLocaleString();
-      document.querySelectorAll('.adv-ctx-chip[data-ctx]').forEach((c) => c.classList.remove('active'));
-      chip.classList.add('active');
-      markKvTileEstimating();
-      debounceRecompute(buildOverrides());
+      applyCtxPreset(v, chip);
     });
   });
+  const vramMaxBtn = document.getElementById('edw-adv-ctx-vram-max');
+  if (vramMaxBtn) {
+    vramMaxBtn.addEventListener('click', () => {
+      const v = parseInt(vramMaxBtn.dataset.ctx, 10);
+      if (Number.isFinite(v) && v > 0) applyCtxPreset(v, null);
+    });
+  }
 
   // tf-input dla TP/PP (emituje "change" z detail.value).
   ['edw-adv-tp', 'edw-adv-pp'].forEach((id) => {
@@ -2128,17 +2206,41 @@ function bindAdvancedHandlers() {
     });
   }
 
+  const extraArgsTa = document.getElementById('edw-adv-extra-args');
+  if (extraArgsTa) {
+    const onExtra = (e) => {
+      selection.advanced.extra_args = String(e.detail?.value ?? extraArgsTa.value ?? '');
+    };
+    extraArgsTa.addEventListener('input', onExtra);
+    extraArgsTa.addEventListener('change', onExtra);
+  }
+
   // Speculative Decoding — toggle, model repo, method, num_tokens.
   // Recompute VRAM nie jest wywolywane bo backend recommender (auto_fit_config)
   // nie modeluje pamieci speculatora. To swiadomy trade-off — drafter to
   // mniejszy model (~10-30% targetu), zwykle miesci sie w headroomie po
   // auto-fit. Jezeli vllm padnie OOM przy starcie, user zmniejszy
   // max-model-len recznie.
+  const syncSpecModelRow = () => {
+    const needsModel = specMethodNeedsModel(selection.advanced.speculative.method);
+    const modelRow = document.getElementById('edw-adv-spec-model-row');
+    if (modelRow) modelRow.style.display = needsModel ? '' : 'none';
+    const noModelHint = document.getElementById('edw-adv-spec-nomodel-hint');
+    if (noModelHint) noModelHint.style.display = needsModel ? 'none' : '';
+  };
   const specToggle = document.getElementById('edw-adv-spec-enabled');
   if (specToggle) {
     specToggle.addEventListener('change', (e) => {
       const v = e.detail?.checked ?? specToggle.checked;
       selection.advanced.speculative.enabled = !!v;
+      // A model with a built-in MTP head needs no drafter repo, so enabling
+      // speculation defaults to `mtp` unless a preset already paired a drafter.
+      if (v && nativeMtpAvailable() && !selection.advanced.speculative.model) {
+        selection.advanced.speculative.method = 'mtp';
+        const methodSel = document.getElementById('edw-adv-spec-method');
+        if (methodSel) methodSel.value = 'mtp';
+        syncSpecModelRow();
+      }
       const fields = document.getElementById('edw-adv-spec-fields');
       const tokensRow = document.getElementById('edw-adv-spec-tokens-row');
       const display = v ? '' : 'none';
@@ -2159,6 +2261,7 @@ function bindAdvancedHandlers() {
   if (specMethod) {
     specMethod.addEventListener('change', (e) => {
       selection.advanced.speculative.method = e.detail?.value ?? specMethod.value ?? 'dflash';
+      syncSpecModelRow();
     });
   }
   const specNum = document.getElementById('edw-adv-spec-num');
@@ -2457,8 +2560,7 @@ function renderStepRuntime() {
 // silnikow LLM (komenda dostepna); cloud/external nie maja lokalnej komendy.
 function renderLaunchCommandPanel() {
   if (selection.deployMethod !== 'docker' && selection.deployMethod !== 'native') return '';
-  const rec = advancedRecommendation;
-  const autoCmd = (rec && !rec.error && rec.launch_command) ? rec.launch_command : '';
+  const autoCmd = previewLaunchCommand();
   const mode = selection.launchCommandMode || 'auto';
   if (!autoCmd && mode !== 'custom') return '';
   const value = mode === 'custom' ? (selection.launchCommandText || autoCmd) : autoCmd;
@@ -2630,6 +2732,22 @@ function fmtMb(mb) {
   return `${Math.round(n)} MB`;
 }
 
+function fmtGb(mb) {
+  const gb = (Number(mb) || 0) / 1024;
+  return gb >= 10 ? String(Math.round(gb)) : gb.toFixed(1);
+}
+
+function nodeGpuLinks(nodeId) {
+  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  return Array.isArray(node?.gpu_links) ? node.gpu_links : [];
+}
+
+function vramTone(pct) {
+  if (pct <= 50) return 'success';
+  if (pct <= 80) return 'warning';
+  return 'danger';
+}
+
 function vendorStatus(vendor) {
   const v = String(vendor || '').toLowerCase();
   if (v.includes('nvidia')) return 'accent';
@@ -2644,7 +2762,13 @@ function gpuSummaryText(gpus) {
   const ids = new Set(selection.gpuIds);
   const chosen = gpus.filter((_, idx) => ids.has(String(idx)));
   const totalVram = chosen.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
-  return I18n.t('wizard.gpu_summary_specific', { n: chosen.length, total_vram: fmtMb(totalVram) });
+  let text = I18n.t('wizard.gpu_summary_specific', { n: chosen.length, total_vram: fmtMb(totalVram) });
+  const known = chosen.filter((g) => g.vram_used_mb != null && g.vram_total_mb);
+  if (known.length > 0) {
+    const free = known.reduce((s, g) => s + Math.max(0, g.vram_total_mb - g.vram_used_mb), 0);
+    text += ` · ${I18n.t('wizard.gpu_summary_free', { free_vram: fmtMb(free) })}`;
+  }
+  return text;
 }
 
 function renderStepGpu() {
@@ -2659,14 +2783,30 @@ function renderStepGpu() {
   const icoSpec = `<svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>`;
   const icoCpu = `<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>`;
 
+  const gpuLinks = nodeGpuLinks(selection.nodeId);
+  const topology = computeGpuGroups(gpus.length, gpuLinks);
+
   const rows = gpus.map((g, idx) => {
+    const pcie = (g.pcie_link_gen != null && g.pcie_link_width != null)
+      ? `PCIe Gen${g.pcie_link_gen} x${g.pcie_link_width}`
+      : '';
     const meta = [
-      `${fmtMb(g.vram_total_mb)} VRAM`,
-      g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
+      g.pci_bus_id ? shortPciBusId(g.pci_bus_id) : '',
+      pcie,
       g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '',
-      g.driver_version ? `driver ${escapeHtml(String(g.driver_version))}` : '',
+      g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
     ].filter(Boolean);
     const metaHtml = meta.map((m, i) => i < meta.length - 1 ? `<span>${escapeHtml(m)}</span><span class="sep">·</span>` : `<span>${escapeHtml(m)}</span>`).join(' ');
+    const total = Number(g.vram_total_mb) || 0;
+    let vramHtml;
+    if (total > 0 && g.vram_used_mb != null) {
+      const used = Math.min(total, Math.max(0, Number(g.vram_used_mb) || 0));
+      const pct = Math.round((used / total) * 100);
+      const text = I18n.t('wizard.gpu_vram_line', { used: fmtGb(used), total: fmtGb(total), free: fmtGb(total - used) });
+      vramHtml = `<tf-progress-bar size="sm" value="${pct}" tone="${vramTone(pct)}"></tf-progress-bar><span class="gpu-vram-text">${escapeHtml(text)}</span>`;
+    } else {
+      vramHtml = `<span class="gpu-vram-text">${escapeHtml(`${fmtMb(total)} VRAM`)}</span>`;
+    }
     const selected = selectedSet.has(String(idx));
     const vendor = String(g.vendor || '').toLowerCase();
     let brandClass = 'other';
@@ -2678,9 +2818,13 @@ function renderStepGpu() {
       <div class="gpu-row${selected ? ' selected' : ''}" data-gpu-idx="${idx}" role="checkbox" aria-checked="${selected}" tabindex="0">
         <div class="gpu-check"></div>
         <div class="gpu-info">
-          <div class="gpu-name"><span class="gpu-idx">GPU ${idx} ·</span> ${escapeHtml(String(g.name || ''))}</div>
-          <div class="gpu-meta">${metaHtml}</div>
+          <div class="gpu-line">
+            <div class="gpu-name"><span class="gpu-idx">GPU ${idx} ·</span> ${escapeHtml(String(g.name || ''))}</div>
+            <div class="gpu-meta">${metaHtml}</div>
+          </div>
+          <div class="gpu-vram">${vramHtml}</div>
         </div>
+        ${gpuPairChipHtml(idx, topology)}
         <span class="gpu-brand ${brandClass}">${escapeHtml(String(brandLabel))}</span>
       </div>
     `;
@@ -2714,6 +2858,8 @@ function renderStepGpu() {
     <div class="gpu-list" ${listHidden}>
       <div class="gpu-list-hint">${escapeHtml(I18n.t('wizard.gpu_list_hint', { n: gpus.length }))}</div>
       ${rows}
+      ${topology.hasLinks ? gpuTopologyLegendHtml() : ''}
+      <div class="gpu-topo-hint-slot">${selectionLinkHintHtml(gpuLinks, selection.gpuIds)}</div>
     </div>
 
     <div class="gpu-summary">${iconSummary}<span>${escapeHtml(gpuSummaryText(gpus))}</span></div>
@@ -2747,6 +2893,8 @@ function bindStepGpuInputs() {
     row.setAttribute('aria-checked', set.has(idx) ? 'true' : 'false');
     const box = document.querySelector('.gpu-summary span:last-child');
     if (box) box.textContent = gpuSummaryText(nodeGpus(selection.nodeId));
+    const hintSlot = document.querySelector('.gpu-list .gpu-topo-hint-slot');
+    if (hintSlot) hintSlot.innerHTML = selectionLinkHintHtml(nodeGpuLinks(selection.nodeId), selection.gpuIds);
   };
   document.querySelectorAll('.gpu-list .gpu-row[data-gpu-idx]').forEach((row) => {
     row.addEventListener('click', () => toggleGpu(row));
@@ -2976,8 +3124,7 @@ function bindStepRuntimeInputs() {
     const mode = e.detail?.value === 'custom' ? 'custom' : 'auto';
     selection.launchCommandMode = mode;
     const ta = document.getElementById('edw-launch-cmd');
-    const autoCmd = (advancedRecommendation && !advancedRecommendation.error
-      && advancedRecommendation.launch_command) || '';
+    const autoCmd = previewLaunchCommand();
     if (mode === 'custom') {
       if (!selection.launchCommandText) selection.launchCommandText = autoCmd;
       if (ta) { ta.removeAttribute('disabled'); ta.value = selection.launchCommandText; }
@@ -3184,6 +3331,142 @@ function updateHfGgufFiles() {
   bindGgufFileClicks();
 }
 
+// ---- CLI args helpers ------------------------------------------------------
+
+// Shell-like split honouring single/double quotes, so a value such as
+// `--speculative-config '{"method":"mtp"}'` stays one token (quotes stripped).
+function tokenizeCliArgs(str) {
+  const out = [];
+  let cur = '';
+  let inTok = false;
+  let quote = null;
+  for (let i = 0; i < str.length; i += 1) {
+    const ch = str[i];
+    if (quote) {
+      if (ch === quote) quote = null;
+      else if (ch === '\\' && quote === '"' && i + 1 < str.length) { cur += str[i + 1]; i += 1; }
+      else cur += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      inTok = true;
+    } else if (/\s/.test(ch)) {
+      if (inTok) { out.push(cur); cur = ''; inTok = false; }
+    } else if (ch === '\\' && i + 1 < str.length) {
+      cur += str[i + 1]; i += 1; inTok = true;
+    } else {
+      cur += ch;
+      inTok = true;
+    }
+  }
+  if (inTok) out.push(cur);
+  return out;
+}
+
+// Single-quote a token when it needs it; JSON never contains `'`, and the
+// backend splits with shlex (native) / xargs (docker), both of which honour it.
+function quoteCliArg(tok) {
+  if (tok !== '' && !/[\s'"\\$`|&;<>(){}*?]/.test(tok)) return tok;
+  return `'${tok.replace(/'/g, "'\\''")}'`;
+}
+
+// Apply `overrides` (`{ flag, value }` for valued flags, `{ flag, present }`
+// for boolean flags) to a tokenized argv: an existing occurrence — either
+// `--flag value` or `--flag=value` — is rewritten in place, otherwise the flag
+// is appended. `value: null` / `present: false` remove the flag; `value:
+// undefined` leaves whatever the base argv carries untouched (an "unset" user
+// choice must not strip a recipe-provided flag).
+function mergeCliArgs(baseArgv, overrides) {
+  const argv = baseArgv.slice();
+  for (const ov of overrides) {
+    const isBool = ov.present !== undefined;
+    if (!isBool && ov.value === undefined) continue;
+    const keep = isBool ? ov.present : ov.value !== null;
+    const repl = keep ? (isBool ? [ov.flag] : [ov.flag, String(ov.value)]) : [];
+    let replaced = false;
+    for (let i = 0; i < argv.length;) {
+      const t = argv[i];
+      if (t !== ov.flag && !t.startsWith(`${ov.flag}=`)) { i += 1; continue; }
+      const span = (isBool || t.includes('=')) ? 1 : 2;
+      // First occurrence is rewritten in place; later duplicates are dropped.
+      const ins = replaced ? [] : repl;
+      argv.splice(i, span, ...ins);
+      replaced = true;
+      i += ins.length;
+    }
+    if (!replaced && keep) argv.push(...repl);
+  }
+  return argv;
+}
+
+// Final `vllm_args` for a single-node deploy, shared by the payload and the
+// launch-command preview. Auto mode forwards the calculator's recipe flags;
+// manual mode starts from the same string and overrides only the user knobs, so
+// recipe-only flags (tool parsers, reasoning parser, mm encoder mode) survive.
+function buildVllmArgs() {
+  const rec = advancedRecommendation;
+  if (shouldSkipAdvancedStep() || !rec || rec.error) return null;
+  const a = selection.advanced;
+  const recArgs = (rec.recommended_vllm_args || '').trim();
+  // llama.cpp: the backend already returned llama-server flags after the
+  // round-trip with the manual overrides — use them verbatim in both modes.
+  if (isLlamaCppEngine()) return recArgs || null;
+
+  let argv = tokenizeCliArgs(recArgs);
+  if (a.mode === 'auto') {
+    // The calculator's `--gpu-memory-utilization` would be taken as "user
+    // explicit" by the backend and defeat its free-VRAM clamp; in auto mode the
+    // user never chose it, so it is stripped and sent as a separate hint.
+    argv = mergeCliArgs(argv, [
+      { flag: '--gpu-memory-utilization', value: null },
+      { flag: '--trust-remote-code', present: a.trust_remote_code !== false },
+    ]);
+  } else {
+    const r = rec.recommended || {};
+    const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
+    const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
+    const kv = a.kv_cache_dtype || r.kv_cache_dtype || 'auto';
+    argv = mergeCliArgs(argv, [
+      { flag: '--gpu-memory-utilization', value: String(a.gpu_memory_utilization ?? r.gpu_memory_utilization ?? 0.9) },
+      { flag: '--max-model-len', value: String(a.max_model_len ?? r.max_model_len ?? 8192) },
+      { flag: '--max-num-seqs', value: String(a.max_num_seqs ?? r.max_num_seqs ?? 16) },
+      { flag: '--max-num-batched-tokens', value: String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)) },
+      { flag: '--tensor-parallel-size', value: tp > 1 ? String(tp) : null },
+      { flag: '--pipeline-parallel-size', value: pp > 1 ? String(pp) : null },
+      // vLLM accepts only the fp8 family here; 'auto' / empty quantization are
+      // "unset" choices, so the recipe's own flag (if any) is left as is.
+      { flag: '--kv-cache-dtype', value: kv !== 'auto' ? kv : undefined },
+      { flag: '--quantization', value: a.quantization ? String(a.quantization) : undefined },
+      { flag: '--trust-remote-code', present: a.trust_remote_code !== false },
+    ]);
+  }
+
+  if (isVllmFamilyEngine()) {
+    const sp = a.speculative;
+    if (sp && sp.enabled && (!specMethodNeedsModel(sp.method) || sp.model)) {
+      const cfg = { method: sp.method || 'dflash', num_speculative_tokens: sp.num_tokens || 8 };
+      if (specMethodNeedsModel(sp.method)) cfg.model = sp.model;
+      argv = mergeCliArgs(argv, [{ flag: '--speculative-config', value: JSON.stringify(cfg) }]);
+    }
+    // User free-text goes last: the backend dedups last-wins.
+    argv = argv.concat(tokenizeCliArgs(a.extra_args || ''));
+  }
+  return argv.length ? argv.map(quoteCliArg).join(' ') : null;
+}
+
+// Launch-command preview for auto mode: the backend builds `launch_command` as
+// `<base> <recommended_vllm_args>`, so swap that tail for the merged args the
+// deploy will actually send.
+function previewLaunchCommand() {
+  const rec = advancedRecommendation;
+  if (!rec || rec.error || !rec.launch_command) return '';
+  const cmd = String(rec.launch_command);
+  const recArgs = (rec.recommended_vllm_args || '').trim();
+  const merged = buildVllmArgs();
+  if (!recArgs || !cmd.endsWith(recArgs)) return cmd;
+  const base = cmd.slice(0, cmd.length - recArgs.length).trimEnd();
+  return merged ? `${base} ${merged}` : base;
+}
+
 // ---- Deploy ---------------------------------------------------------------
 
 async function startDeploy() {
@@ -3213,74 +3496,7 @@ async function startDeploy() {
   deployInFlight = true;
 
   const eng = engineEntry.engine || {};
-  // Build vllm_args z Advanced step (jezeli aktywny dla tego silnika).
-  // Auto-tuned -> uzywa recommended_vllm_args z kalkulatora.
-  // Manual -> sklada CLI string z user-set wartosci suwakow.
-  let vllmArgs = null;
-  if (!shouldSkipAdvancedStep() && advancedRecommendation && !advancedRecommendation.error) {
-    // llama.cpp: backend zwraca w `recommended_vllm_args` POPRAWNE argi
-    // llama-server (-c/-np/-ngl/-ub/--split-mode/--cache-type-k/v/-fa), juz po
-    // round-tripie z manualnymi override'ami (ctx/seqs/K/V poszly w requeście,
-    // backend przeliczyl). Reczne sklejanie flag vLLM dla llama (DRUG-10) dalo
-    // niepoprawna komende — uzywamy tego co policzyl backend, w OBU trybach.
-    if (isLlamaCppEngine()) {
-      vllmArgs = (advancedRecommendation.recommended_vllm_args || '').trim() || null;
-    } else if (selection.advanced.mode === 'auto') {
-      // recommended_vllm_args z kalkulatora zawiera m.in. `--gpu-memory-utilization`
-      // ktore backend traktuje jako "user explicit" i nadpisuje auto-clamp z
-      // free VRAM. W trybie auto user nie wybral tej wartosci — wycinamy ja
-      // ze stringa, zeby backend mogl ja policzyc z aktualnego stanu karty.
-      let raw = advancedRecommendation.recommended_vllm_args || '';
-      // `--trust-remote-code` przychodzi domyslnie z kalkulatora (default ON).
-      // Gdy user zdjal toggle, wycinamy je tutaj.
-      if (selection.advanced.trust_remote_code === false) {
-        raw = raw.replace(/--trust-remote-code\b/g, '');
-      }
-      vllmArgs = raw.replace(/--gpu-memory-utilization(?:=|\s+)[^\s]+/g, '').replace(/\s+/g, ' ').trim() || null;
-    } else {
-      const a = selection.advanced;
-      const r = advancedRecommendation.recommended || {};
-      const parts = [
-        '--dtype', 'auto',
-        '--gpu-memory-utilization', String(a.gpu_memory_utilization ?? r.gpu_memory_utilization ?? 0.9),
-        '--max-model-len', String(a.max_model_len ?? r.max_model_len ?? 8192),
-        '--max-num-seqs', String(a.max_num_seqs ?? r.max_num_seqs ?? 16),
-        '--max-num-batched-tokens', String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)),
-        '--enable-chunked-prefill',
-      ];
-      // Default ON; user moze zdjac toggle dla nieufnego repo.
-      if (a.trust_remote_code !== false) parts.push('--trust-remote-code');
-      const tp = a.tensor_parallel ?? r.tensor_parallel ?? 1;
-      const pp = a.pipeline_parallel ?? r.pipeline_parallel ?? 1;
-      if (tp > 1) parts.push('--tensor-parallel-size', String(tp));
-      if (pp > 1) parts.push('--pipeline-parallel-size', String(pp));
-      // KV dtype tylko z rodziny fp8 (auto/fp8*) — vLLM odrzuca fp16/bfloat16.
-      const kv = a.kv_cache_dtype || r.kv_cache_dtype || 'auto';
-      if (kv !== 'auto') parts.push('--kv-cache-dtype', kv);
-      vllmArgs = parts.join(' ');
-    }
-  }
-
-  // Speculative Decoding — append `--speculative-config '{...}'` do VLLM_ARGS.
-  // Tokenizacja po stronie backendu honoruje single-quotes wokol JSON w OBU
-  // torach: native przez `shlex::split` (python_venv::build_engine_args), docker
-  // przez `xargs` w entrypoint.sh (surowy `$VLLM_ARGS` w bashu zostawialby
-  // literalne apostrofy). Single-quotes nie potrzebuja escapingu wewnetrznych
-  // ", a JSON nie zawiera ' wiec single-quote jest bezpieczny.
-  const sp = selection.advanced?.speculative;
-  if (!shouldSkipAdvancedStep() && sp && sp.enabled && sp.model) {
-    const cfg = {
-      model: sp.model,
-      num_speculative_tokens: sp.num_tokens || 8,
-      method: sp.method || 'dflash',
-    };
-    const cfgJson = JSON.stringify(cfg);
-    // Sanity: gdyby JSON jakims cudem zawieral apostrof — zabezpieczamy
-    // przez escape (jednak parser JSON go nie wyemituje, ale trzymajmy to
-    // odporne na rozszerzenia metody / przyszle pola).
-    const safeJson = cfgJson.replace(/'/g, "'\\''");
-    vllmArgs = `${vllmArgs ? vllmArgs + ' ' : ''}--speculative-config '${safeJson}'`.trim();
-  }
+  const vllmArgs = buildVllmArgs();
 
   // Suwak gpu_memory_utilization w panelu Advanced jest wspolny dla obu trybow
   // (auto/manual) — w auto mode `vllmArgs` bierzemy z `recommended_vllm_args`

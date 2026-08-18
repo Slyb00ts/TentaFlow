@@ -1,17 +1,17 @@
 # =============================================================================
 # Plik: reranker/python/nemotron-rerank-vl/bundle.toml
 # Opis: NVIDIA Llama-Nemotron Rerank VL jako natywny bundle vLLM (PyPI, pinned
-#       0.27.0). Multimodalny cross-encoder (Eagle VLM: Llama 3.2 1B + SigLIP2)
+#       0.27.1). Multimodalny cross-encoder (Eagle VLM: Llama 3.2 1B + SigLIP2)
 #       serwowany w trybie score/rerank; wystawia /v1/rerank + /v1/score dla
 #       tekstu i obrazow. CUDA (cu130) i ROCm (rocm7.0).
 # =============================================================================
 
 [bundle]
 engine = "nemotron-rerank-vl"
-description = "NVIDIA Llama-Nemotron Rerank VL multimodal cross-encoder via vLLM (PyPI, pinned 0.27.0)"
+description = "NVIDIA Llama-Nemotron Rerank VL multimodal cross-encoder via vLLM (PyPI, pinned 0.27.1)"
 python_version = "3.12"
 source = "pypi"
-pypi_package = "vllm==0.27.0"
+pypi_package = "vllm==0.27.1"
 
 [launch]
 command = "python"

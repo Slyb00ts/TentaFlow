@@ -55,6 +55,9 @@ pub struct MeshPeerInfo {
     pub cpu_usage_percent: f32,
     pub ram_used_mb: u64,
     pub gpu_info: Vec<PeerGpuInfo>,
+    /// Inter-GPU topology from the peer's NodeInfo (empty until received).
+    #[serde(default)]
+    pub gpu_links: Vec<PeerGpuLink>,
     pub containers: Vec<PeerContainerInfo>,
     pub networks: Vec<PeerNetworkInfo>,
     pub platform: String,
@@ -112,6 +115,28 @@ pub struct PeerGpuInfo {
     /// Producent GPU — wykrywany po nazwie/PCI. Domyslnie `Other` dopoki
     /// detekcja nie jest podlaczona (PR2 doda klasyfikacje).
     pub vendor: GpuVendor,
+    /// PCI bus id as nvidia-smi prints it ("00000000:82:00.0"); NVIDIA only.
+    #[serde(default)]
+    pub pci_bus_id: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub fan_speed_percent: Option<u8>,
+    /// Current PCIe link generation / lane width (NVIDIA only).
+    #[serde(default)]
+    pub pcie_link_gen: Option<u8>,
+    #[serde(default)]
+    pub pcie_link_width: Option<u8>,
+}
+
+/// One inter-GPU link of a peer (`nvidia-smi topo -m`), `a < b` are GPU
+/// indices in `gpu_info` order; `link` is the label from `gpu_topology::Link::as_str`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerGpuLink {
+    pub a: u32,
+    pub b: u32,
+    pub link: String,
+    pub p2p_ok: Option<bool>,
 }
 
 /// Informacje o nodzie — wymieniane przez QUIC po polaczeniu
@@ -123,6 +148,9 @@ pub struct NodeInfo {
     pub cpu_count: u32,
     pub ram_total_mb: u64,
     pub gpu_info: Vec<PeerGpuInfo>,
+    /// Static inter-GPU topology; travels with NodeInfo, not the heartbeat.
+    #[serde(default)]
+    pub gpu_links: Vec<PeerGpuLink>,
 }
 
 /// Informacje o kontenerze Docker peera
@@ -870,6 +898,7 @@ impl MeshPeerStore {
             entry.cpu_count = info.cpu_count;
             entry.ram_total_mb = info.ram_total_mb;
             entry.gpu_info = info.gpu_info.clone();
+            entry.gpu_links = info.gpu_links.clone();
             (entry.hostname.clone(), entry.port, entry.ram_total_mb)
         };
         Self::remove_stale_by_hostname_port(&self.peers, node_id, &hostname, port);
@@ -1289,6 +1318,7 @@ impl MeshPeerStore {
             cpu_usage_percent: 0.0,
             ram_used_mb: 0,
             gpu_info: vec![],
+            gpu_links: vec![],
             containers: vec![],
             networks: vec![],
             platform: String::new(),
@@ -1322,6 +1352,11 @@ mod tests {
             power_draw_w: Some(310.0),
             power_limit_w: Some(450.0),
             vendor: GpuVendor::Nvidia,
+            pci_bus_id: Some("00000000:82:00.0".to_string()),
+            uuid: Some("GPU-1234".to_string()),
+            fan_speed_percent: Some(35),
+            pcie_link_gen: Some(4),
+            pcie_link_width: Some(16),
         };
 
         let bytes = crate::mesh::cbor::encode(&gpu).expect("encode");
@@ -1335,6 +1370,11 @@ mod tests {
         assert_eq!(decoded.power_draw_w, gpu.power_draw_w);
         assert_eq!(decoded.power_limit_w, gpu.power_limit_w);
         assert_eq!(decoded.vendor, GpuVendor::Nvidia);
+        assert_eq!(decoded.pci_bus_id, gpu.pci_bus_id);
+        assert_eq!(decoded.uuid, gpu.uuid);
+        assert_eq!(decoded.fan_speed_percent, Some(35));
+        assert_eq!(decoded.pcie_link_gen, Some(4));
+        assert_eq!(decoded.pcie_link_width, Some(16));
     }
 
     #[test]

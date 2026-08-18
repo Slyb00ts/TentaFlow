@@ -542,6 +542,7 @@ fn upsert_local_peer(
         cpu_usage_percent: 0.0,
         ram_used_mb: 0,
         gpu_info: local_node_info.gpu_info.clone(),
+        gpu_links: local_node_info.gpu_links.clone(),
         containers: vec![],
         networks: vec![],
         platform: node_info_collector::detect_platform(),

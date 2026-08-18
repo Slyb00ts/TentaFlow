@@ -372,6 +372,7 @@ pub use message_body::{
     MeshNodeContainer,
     MeshNodeDetailRequest,
     MeshNodeDetailResponse,
+    MeshGpuLink,
     MeshNodeGpuInfo,
     MeshNodeInfo,
     MeshNodeListResponse,

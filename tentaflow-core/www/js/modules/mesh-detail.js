@@ -25,6 +25,7 @@ import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
 import { ProfilingActiveBanner } from '/js/modules/profiling-active-banner.js';
 import { profilingCollectorsStatus } from '/js/protocol/profiling.js';
 import { ProfileRecPill } from '/js/modules/profile-rec-pill.js';
+import { computeGpuGroups, gpuPairChipHtml, gpuTopologyMatrixHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
 
 let currentNodeId = null;
 let nodeData = null;
@@ -607,6 +608,9 @@ function renderGpus(n) {
     ? `VRAM: <strong style="color:var(--text);">${formatMb(usedTotal)} / ${formatMb(totalTotal)}</strong>`
     : '';
 
+  const gpuLinks = Array.isArray(n.gpu_links) ? n.gpu_links : [];
+  const topology = computeGpuGroups(gpus.length, gpuLinks);
+
   const cards = gpus.map((g, idx) => {
     const usage = g.usage_percent ?? 0;
     const usagePct = Math.min(100, Math.max(0, Math.round(usage)));
@@ -617,8 +621,15 @@ function renderGpus(n) {
     const temp = g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '—';
     const fan = g.fan_speed_percent != null ? `${Math.round(g.fan_speed_percent)}%` : '—';
     const profileBtn = gpuProfileButtonHtml(n, g, idx);
-    const vendor = [g.driver_version ? `driver ${g.driver_version}` : null, g.cuda_version ? `CUDA ${g.cuda_version}` : null]
-      .filter(Boolean).join(' · ');
+    const pcie = (g.pcie_link_gen != null && g.pcie_link_width != null) ? `PCIe Gen${g.pcie_link_gen} x${g.pcie_link_width}` : null;
+    const pcieLine = [
+      g.pci_bus_id ? shortPciBusId(g.pci_bus_id) : null,
+      pcie,
+    ].filter(Boolean).join(' · ');
+    const vendor = [
+      g.driver_version ? `driver ${g.driver_version}` : null,
+      g.cuda_version ? `CUDA ${g.cuda_version}` : null,
+    ].filter(Boolean).join(' · ');
 
     return `
       <div class="nd-gpu" data-key="gpu-${idx}">
@@ -626,6 +637,8 @@ function renderGpus(n) {
           <div class="gc-title-wrap">
             <span class="gc-idx">${idx}</span>
             <span class="gc-name">${escapeHtml(g.name || '—')}</span>
+            ${gpuPairChipHtml(idx, topology)}
+            ${pcieLine ? `<div class="gc-pcie">${escapeHtml(pcieLine)}</div>` : ''}
             ${vendor ? `<div class="gc-vendor">${escapeHtml(vendor)}</div>` : ''}
           </div>
           <div class="gc-actions">${profileBtn}</div>
@@ -652,6 +665,7 @@ function renderGpus(n) {
   // Auto-dense gdy >= 6 GPU (typowe rigi 8x). Mniejsze karty bez 'driver/CUDA'
   // line, ciasniejsze odstepy.
   const dense = gpus.length >= 6;
+  const matrix = gpuTopologyMatrixHtml(gpus.length, gpuLinks);
   return `
     <div class="nd-section">
       <h3>
@@ -661,6 +675,7 @@ function renderGpus(n) {
         ${summary ? `<span class="h-actions">${summary}</span>` : ''}
       </h3>
       <div class="nd-gpu-grid${dense ? ' dense' : ''}">${cards}</div>
+      ${matrix ? `<h4 class="gpu-topo-title">${escapeHtml(I18n.t('gpu_topology.title'))}</h4>${matrix}` : ''}
     </div>
   `;
 }

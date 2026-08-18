@@ -3163,7 +3163,27 @@ fn all_gpus_to_proto(gpus: &[StoreGpu]) -> Vec<tentaflow_protocol::MeshNodeGpuIn
                 utilization_percent: Some(g.usage_percent),
                 driver_version: None,
                 cuda_version: None,
+                pci_bus_id: g.pci_bus_id.clone(),
+                uuid: g.uuid.clone(),
+                power_limit_w: g.power_limit_w,
+                fan_speed_percent: g.fan_speed_percent,
+                pcie_link_gen: g.pcie_link_gen,
+                pcie_link_width: g.pcie_link_width,
             }
+        })
+        .collect()
+}
+
+fn gpu_links_to_proto(
+    links: &[crate::mesh::peer_store::PeerGpuLink],
+) -> Vec<tentaflow_protocol::MeshGpuLink> {
+    links
+        .iter()
+        .map(|l| tentaflow_protocol::MeshGpuLink {
+            a: l.a,
+            b: l.b,
+            link: l.link.clone(),
+            p2p_ok: l.p2p_ok,
         })
         .collect()
 }
@@ -3279,6 +3299,15 @@ async fn store_peer_to_proto(
         p.profiling_collectors_available.clone()
     };
 
+    // The local peer_store row is seeded from NodeInfo at startup, but the
+    // host probe is the source of truth here; remote rows carry what the peer
+    // sent in its NodeInfo.
+    let gpu_links = if is_local {
+        gpu_links_to_proto(&crate::mesh::node_info_collector::local_gpu_links())
+    } else {
+        gpu_links_to_proto(&p.gpu_links)
+    };
+
     tentaflow_protocol::MeshNodeInfo {
         node_id: p.node_id.clone(),
         hostname: p.hostname.clone(),
@@ -3304,6 +3333,7 @@ async fn store_peer_to_proto(
         nsys_available,
         nsys_version,
         profiling_collectors_available,
+        gpu_links,
     }
 }
 
@@ -3440,6 +3470,7 @@ pub async fn mesh_node_list(
                 nsys_available: false,
                 nsys_version: String::new(),
                 profiling_collectors_available: Vec::new(),
+                gpu_links: Vec::new(),
             });
         }
         emitted.insert(node_id_hex);
@@ -5089,10 +5120,48 @@ pub async fn deploy_vllm_recommend(
                 // (Blackwell FP4 MoE / Hopper FP8 MoE). Embedded snapshot first so
                 // offline/HF-only deploys are instant; live fetch only fills models
                 // missing from the snapshot (added upstream after the last vendor).
-                use crate::deploy::vllm_recipes;
-                let entry = match vllm_recipes::resolve_embedded(&payload.model) {
-                    Some(e) => Some(e),
-                    None => vllm_recipes::fetch_live(&client, &payload.model).await,
+                // Cascade: exact embedded → live exact → embedded with packaging
+                // suffixes stripped → architecture-family defaults, so quantized
+                // community repacks (NVFP4/FP8/AWQ) still get parser flags.
+                use crate::deploy::vllm_recipes::{self, RecipeMatch};
+                let embedded = vllm_recipes::resolve_embedded(&payload.model);
+                let entry = match embedded {
+                    Some((e, RecipeMatch::Exact)) => {
+                        tracing::debug!(model = %payload.model, "vllm recipe: exact embedded match");
+                        Some(e)
+                    }
+                    other => match vllm_recipes::fetch_live(&client, &payload.model).await {
+                        Some(e) => {
+                            tracing::debug!(model = %payload.model, "vllm recipe: live exact match");
+                            Some(e)
+                        }
+                        None => match other {
+                            Some((e, level)) => {
+                                tracing::debug!(
+                                    model = %payload.model,
+                                    recipe = %e.hf_id,
+                                    ?level,
+                                    "vllm recipe: normalized repo match"
+                                );
+                                Some(e)
+                            }
+                            None => {
+                                let arch = vllm_recipes::resolve_for_architecture(
+                                    &spec.architectures,
+                                    &spec.model_type,
+                                    spec.has_vision,
+                                );
+                                if let Some(e) = &arch {
+                                    tracing::debug!(
+                                        model = %payload.model,
+                                        recipe = %e.hf_id,
+                                        "vllm recipe: architecture-family defaults"
+                                    );
+                                }
+                                arch
+                            }
+                        },
+                    },
                 };
                 if let Some(entry) = entry {
                     let family = payload
@@ -5307,6 +5376,7 @@ pub async fn deploy_vllm_recommend(
             recommended_env,
             recipe_applied,
             launch_command,
+            native_mtp_available: spec.mtp_num_hidden_layers > 0,
         },
     ))
 }
@@ -10336,38 +10406,21 @@ pub async fn service_update(
         );
         cfg_obj.insert("model_repo".into(), serde_json::Value::Null);
     }
-    if let Some(util) = payload.gpu_memory_utilization {
-        if let Some(num) = serde_json::Number::from_f64(util as f64) {
-            cfg_obj.insert(
-                "gpu_memory_utilization".into(),
-                serde_json::Value::Number(num),
-            );
-        }
-    }
-    if let Some(v) = payload.max_model_len {
-        cfg_obj.insert("max_model_len".into(), serde_json::Value::Number(v.into()));
-    }
-    if let Some(v) = payload.max_num_seqs {
-        cfg_obj.insert("max_num_seqs".into(), serde_json::Value::Number(v.into()));
-    }
-    if let Some(v) = payload.max_num_batched_tokens {
-        cfg_obj.insert(
-            "max_num_batched_tokens".into(),
-            serde_json::Value::Number(v.into()),
-        );
-    }
-    if let Some(dt) = payload.kv_cache_dtype.as_ref() {
-        cfg_obj.insert(
-            "kv_cache_dtype".into(),
-            serde_json::Value::String(dt.clone()),
-        );
-    }
-    if let Some(b) = payload.chunked_prefill {
-        cfg_obj.insert("chunked_prefill".into(), serde_json::Value::Bool(b));
-    }
-    if let Some(args) = payload.vllm_args_override.as_ref() {
-        cfg_obj.insert("vllm_args".into(), serde_json::Value::String(args.clone()));
-    }
+    // Scalar keys + the matching flags inside `vllm_args` (the runtime builds
+    // argv from that string, so scalar-only edits would be inert for vLLM/sglang).
+    crate::deploy::launch_dialect::apply_service_tuning(
+        &svc.engine_id,
+        cfg_obj,
+        &crate::deploy::launch_dialect::ServiceTuningPatch {
+            gpu_memory_utilization: payload.gpu_memory_utilization,
+            max_model_len: payload.max_model_len,
+            max_num_seqs: payload.max_num_seqs,
+            max_num_batched_tokens: payload.max_num_batched_tokens,
+            kv_cache_dtype: payload.kv_cache_dtype.clone(),
+            chunked_prefill: payload.chunked_prefill,
+            vllm_args_override: payload.vllm_args_override.clone(),
+        },
+    );
 
     let new_config_json = serde_json::to_string(&cfg)
         .map_err(|e| ProtocolError::internal(format!("serialize config: {e}")))?;

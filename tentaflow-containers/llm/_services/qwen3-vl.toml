@@ -37,7 +37,7 @@ VLLM_INDEX = "https://wheels.vllm.ai/nightly/cu130"
 TORCH_VERSION = "2.13.0"
 TORCHVISION_VERSION = "0.28.0"
 TORCHAUDIO_VERSION = "2.11.0"
-VLLM_VERSION = "0.27.0"
+VLLM_VERSION = "0.27.1"
 
 [deploy.native]
 platforms = ["linux", "windows"]

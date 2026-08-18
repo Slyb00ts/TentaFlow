@@ -1754,6 +1754,28 @@ impl DeployStrategy for DockerDeploy {
                 )),
             }
         }
+        // `--gpus N` hands the container the first N host indices, so the NCCL
+        // decision sees the same set the engine will span.
+        let nccl_scope = match &gpu {
+            GpuSelection::None => None,
+            GpuSelection::Count(c) if *c < 0 => Some(super::gpu_topology::GpuScope::All),
+            GpuSelection::Count(c) => Some(super::gpu_topology::GpuScope::Indices(
+                (0..*c as u32).collect(),
+            )),
+            GpuSelection::Devices(ids) => Some(super::gpu_topology::GpuScope::Indices(
+                super::gpu_topology::parse_gpu_indices(ids.iter().map(String::as_str)),
+            )),
+        };
+        if let Some(scope) = nccl_scope {
+            super::gpu_topology::apply_nccl_p2p_level_env(
+                &self.manifest.engine.id,
+                &self.user_config,
+                scope,
+                super::gpu_topology::host_topology(),
+                &mut env,
+                self.log_sink.as_ref(),
+            );
+        }
 
         // Recipe shm-size: 16 GiB (default 64 MB → NCCL "No space left on device").
         // The ray+vllm command (set as `launch_command_override` by the distributed

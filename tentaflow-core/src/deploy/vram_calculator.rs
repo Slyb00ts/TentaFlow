@@ -68,6 +68,17 @@ pub struct ModelSpec {
     /// Per-token V cache elements summed over SWA layers (window-capped cache).
     #[serde(default)]
     pub kv_v_elems_swa: u64,
+    /// Constant per-sequence recurrent state (bytes) summed over linear-attention /
+    /// SSM layers of a hybrid model. Those layers hold no per-token KV; the state
+    /// is allocated once per active sequence (vLLM: from the KV pool, llama.cpp /
+    /// MLX: per slot).
+    #[serde(default)]
+    pub recurrent_state_bytes_per_seq: u64,
+    /// Built-in MTP / NextN draft layers (`mtp_num_hidden_layers` /
+    /// `num_nextn_predict_layers`). > 0 = native speculative decoding needs no
+    /// separate draft repo.
+    #[serde(default)]
+    pub mtp_num_hidden_layers: u64,
 }
 
 impl ModelSpec {
@@ -173,6 +184,12 @@ impl ModelSpec {
         };
         (k_g as f64 * bytes_k + v_g as f64 * bytes_v) * ctx_tokens as f64
             + (k_swa as f64 * bytes_k + v_swa as f64 * bytes_v) * swa_tokens as f64
+    }
+
+    /// Recurrent (linear-attention / SSM) state bytes for `seqs` concurrently
+    /// active sequences. Zero for pure-attention models.
+    pub fn recurrent_state_bytes(&self, seqs: u64) -> f64 {
+        self.recurrent_state_bytes_per_seq as f64 * seqs.max(1) as f64
     }
 
     /// Wymiar posredni eksperta MoE. Czesc configow trzyma rozmiar per-ekspert
@@ -666,17 +683,29 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
         0.0
     };
     let kv_per_token_per_gpu = kv_per_token_total / (kv_tp_shards * pp);
+    // Hybrid (linear-attention / SSM) layers hold a constant state per active
+    // sequence. vLLM's hybrid KV manager draws it from the same pool as the
+    // paged KV, so it is a per-sequence cost, not a fixed × max_num_seqs one:
+    // admission needs state + one full context, concurrency divides the pool by
+    // (state + ctx × per-token KV). Linear heads shard across the whole TP.
+    let recurrent_seq_per_gpu = model.recurrent_state_bytes(1) / parallel;
 
     let usable_per_gpu = input.gpu_memory_gb_each * input.gpu_memory_utilization;
     let kv_pool_per_gpu = (usable_per_gpu - required_fixed_per_gpu).max(0.0);
     let kv_pool_per_gpu_bytes = kv_pool_per_gpu * 1024.0 * 1024.0 * 1024.0;
     let pool_tokens = if kv_per_token_per_gpu > 0.0 {
-        (kv_pool_per_gpu_bytes / kv_per_token_per_gpu).floor() as u64
+        ((kv_pool_per_gpu_bytes - recurrent_seq_per_gpu).max(0.0) / kv_per_token_per_gpu).floor()
+            as u64
     } else {
         0
     };
     let concurrent_full_len_seqs = if input.max_model_len > 0 {
-        pool_tokens as f64 / input.max_model_len as f64
+        let per_seq = kv_per_token_per_gpu * input.max_model_len as f64 + recurrent_seq_per_gpu;
+        if per_seq > 0.0 {
+            kv_pool_per_gpu_bytes / per_seq
+        } else {
+            0.0
+        }
     } else {
         0.0
     };
@@ -817,7 +846,9 @@ pub fn estimate_llamacpp_vram(model: &ModelSpec, input: &VramEstimateInput) -> V
         input.v_label(),
         input.max_model_len,
     );
-    let kv_cache_gb = bytes_to_gib(kv_one_seq_bytes * seqs as f64);
+    // Recurrent state of hybrid models is allocated per slot up front.
+    let kv_cache_gb =
+        bytes_to_gib(kv_one_seq_bytes * seqs as f64 + model.recurrent_state_bytes(seqs));
 
     let compute_buffer_gb = llamacpp_compute_buffer_gb(model, seqs);
 
@@ -953,7 +984,8 @@ pub fn estimate_mlx_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramEs
         input.v_label(),
         input.max_model_len,
     );
-    let kv_cache_gb = bytes_to_gib(kv_one_seq_bytes * seqs as f64);
+    let kv_cache_gb =
+        bytes_to_gib(kv_one_seq_bytes * seqs as f64 + model.recurrent_state_bytes(seqs));
 
     // Graf MLX: residual + bufor MLP na tokeny batcha; brak osobnego CUDA-graph
     // const, ale 0.5 GB na bufory frameworka/Metal heap.
@@ -1459,11 +1491,17 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
             }
         }
     };
+    // Hybrid models add a constant recurrent state per sequence (see
+    // `estimate_vllm_vram`): vLLM needs it for the one admitted sequence,
+    // llama.cpp/MLX allocate it per slot.
+    let recurrent_seq_per_gpu = model.recurrent_state_bytes(1) / parallel;
     let kv_demand_bytes = |ctx: u64, seqs: u64| -> f64 {
         match engine {
-            DeployEngine::Vllm => kv_one_seq_bytes(ctx) / (kv_tp_shards * chosen_pp_f),
+            DeployEngine::Vllm => {
+                kv_one_seq_bytes(ctx) / (kv_tp_shards * chosen_pp_f) + recurrent_seq_per_gpu
+            }
             DeployEngine::LlamaCpp | DeployEngine::Mlx => {
-                kv_one_seq_bytes(ctx) * seqs.max(1) as f64
+                (kv_one_seq_bytes(ctx) + model.recurrent_state_bytes(1)) * seqs.max(1) as f64
             }
         }
     };
@@ -1543,12 +1581,11 @@ pub fn auto_fit_config(model: &ModelSpec, req: &AutoFitRequest) -> AutoFitOutcom
         if ctx == 0 {
             return 1;
         }
-        let per_token = kv_one_seq_bytes(ctx) / ctx as f64 / (kv_tp_shards * chosen_pp_f);
-        if per_token <= 0.0 {
+        let per_seq = kv_one_seq_bytes(ctx) / (kv_tp_shards * chosen_pp_f) + recurrent_seq_per_gpu;
+        if per_seq <= 0.0 {
             return 1;
         }
-        let pool_tokens = (kv_budget_bytes_for(1) / per_token).floor() as u64;
-        (pool_tokens / ctx).clamp(1, 256)
+        ((kv_budget_bytes_for(1) / per_seq).floor() as u64).clamp(1, 256)
     };
     // llama.cpp/MLX concurrency scale-up: largest slot count keeping ctx fitting.
     let scale_up_seqs = |ctx: u64, start: u64| -> u64 {
@@ -1883,11 +1920,14 @@ pub fn parse_hf_config_with_override(
 
     let num_hidden_layers = pick_u64_either("num_hidden_layers");
 
-    // Sliding-window attention layout. `use_sliding_window: false` (Qwen2-style)
-    // disables a declared window. Layer layout comes from `layer_types`
-    // ("sliding_attention"/"full_attention") or an integer
-    // `sliding_window_pattern` (gemma3: 6 -> every 6th layer is global). A window
-    // with no layer info is resolved per architecture below.
+    // Per-layer attention layout. `use_sliding_window: false` (Qwen2-style)
+    // disables a declared window. Layer kinds come from `layer_types`
+    // ("full_attention" / "sliding_attention" / "linear_attention" / mamba-style
+    // names), from `full_attention_interval` (Qwen3-Next: every n-th layer is
+    // attention, the rest linear) or from an integer `sliding_window_pattern`
+    // (gemma3: 6 -> every 6th layer is global). A window with no layer info is
+    // resolved per architecture below. Linear/SSM layers hold NO per-token KV,
+    // only a constant per-sequence recurrent state.
     let use_sliding_window = text_cfg
         .get("use_sliding_window")
         .and_then(|v| v.as_bool())
@@ -1898,48 +1938,95 @@ pub fn parse_hf_config_with_override(
     } else {
         0
     };
-    let layer_types: Option<Vec<bool>> = text_cfg
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum LayerKind {
+        Global,
+        Swa,
+        Recurrent,
+    }
+    let layer_types: Option<Vec<LayerKind>> = text_cfg
         .get("layer_types")
         .or_else(|| cfg.get("layer_types"))
         .and_then(|v| v.as_array())
         .map(|arr| {
             arr.iter()
-                .map(|v| v.as_str() == Some("sliding_attention"))
+                .map(|v| match v.as_str().unwrap_or("") {
+                    "sliding_attention" if sliding_window > 0 => LayerKind::Swa,
+                    "linear_attention" | "mamba" | "mamba2" | "ssm" | "recurrent"
+                    | "gated_deltanet" => LayerKind::Recurrent,
+                    _ => LayerKind::Global,
+                })
                 .collect()
         });
+    let full_attention_interval = pick_u64_either("full_attention_interval");
     let swa_pattern = pick_u64_either("sliding_window_pattern");
     let model_type = pick_str(cfg, "model_type");
     let mut kv_k_elems_global: u64 = 0;
     let mut kv_v_elems_global: u64 = 0;
     let mut kv_k_elems_swa: u64 = 0;
     let mut kv_v_elems_swa: u64 = 0;
-    if sliding_window > 0 && num_hidden_layers > 0 {
-        // HF configs have uniform per-layer kv heads and head dim.
-        let per_layer = kv_heads_final * head_dim;
-        for i in 0..num_hidden_layers {
-            let is_swa = match (&layer_types, swa_pattern) {
-                (Some(t), _) => t.get(i as usize).copied().unwrap_or(true),
-                (None, n) if n > 0 => (i + 1) % n != 0,
-                // No layer layout declared: gemma2 configs omit it but the
-                // architecture alternates SWA/global (even layers sliding);
-                // mistral/mixtral are genuinely uniform SWA. For unknown
-                // architectures treat every layer as global — overcounting KV
-                // only loses headroom, undercounting recommends OOM deploys.
-                _ => match model_type.as_str() {
-                    "gemma2" => i % 2 == 0,
-                    "mistral" | "mixtral" => true,
-                    _ => false,
-                },
-            };
-            if is_swa {
+    let mut recurrent_layers: u64 = 0;
+    // HF configs have uniform per-layer kv heads and head dim.
+    let per_layer = kv_heads_final * head_dim;
+    for i in 0..num_hidden_layers {
+        let kind = match (&layer_types, full_attention_interval, swa_pattern) {
+            (Some(t), _, _) => t.get(i as usize).copied().unwrap_or(LayerKind::Global),
+            (None, n, _) if n > 0 => {
+                if (i + 1) % n == 0 {
+                    LayerKind::Global
+                } else {
+                    LayerKind::Recurrent
+                }
+            }
+            (None, _, n) if sliding_window > 0 && n > 0 => {
+                if (i + 1) % n != 0 {
+                    LayerKind::Swa
+                } else {
+                    LayerKind::Global
+                }
+            }
+            // No layer layout declared: gemma2 configs omit it but the
+            // architecture alternates SWA/global (even layers sliding);
+            // mistral/mixtral are genuinely uniform SWA. For unknown
+            // architectures treat every layer as global — overcounting KV
+            // only loses headroom, undercounting recommends OOM deploys.
+            _ if sliding_window > 0 => match model_type.as_str() {
+                "gemma2" if i % 2 == 0 => LayerKind::Swa,
+                "mistral" | "mixtral" => LayerKind::Swa,
+                _ => LayerKind::Global,
+            },
+            _ => LayerKind::Global,
+        };
+        match kind {
+            LayerKind::Swa => {
                 kv_k_elems_swa += per_layer;
                 kv_v_elems_swa += per_layer;
-            } else {
+            }
+            LayerKind::Global => {
                 kv_k_elems_global += per_layer;
                 kv_v_elems_global += per_layer;
             }
+            LayerKind::Recurrent => recurrent_layers += 1,
         }
     }
+    // Gated DeltaNet state per linear layer (Qwen3-Next / Qwen3.5+ field names):
+    // fp32 recurrent state [value_heads, key_dim, value_dim] + bf16 conv state
+    // over the projected q/k/v width. Configs without these fields (or without
+    // recurrent layers) contribute nothing.
+    let recurrent_state_bytes_per_seq = if recurrent_layers > 0 {
+        let v_heads = pick_u64_either("linear_num_value_heads");
+        let k_heads = pick_u64_either("linear_num_key_heads");
+        let k_dim = pick_u64_either("linear_key_head_dim");
+        let v_dim = pick_u64_either("linear_value_head_dim");
+        let conv_k = pick_u64_either("linear_conv_kernel_dim");
+        let ssm_state = v_heads * k_dim * v_dim * 4;
+        let conv_state = conv_k * (2 * k_heads * k_dim + v_heads * v_dim) * 2;
+        recurrent_layers * (ssm_state + conv_state)
+    } else {
+        0
+    };
+    let mtp_num_hidden_layers =
+        pick_u64_aliases(&["mtp_num_hidden_layers", "num_nextn_predict_layers"]);
 
     let num_experts = pick_u64_aliases(&["num_experts", "num_local_experts", "n_routed_experts"]);
     let num_experts_per_tok = pick_u64_aliases(&[
@@ -1987,6 +2074,8 @@ pub fn parse_hf_config_with_override(
         kv_v_elems_global,
         kv_k_elems_swa,
         kv_v_elems_swa,
+        recurrent_state_bytes_per_seq,
+        mtp_num_hidden_layers,
     };
     if spec.num_experts > 0 {
         spec.num_active_parameters = spec.active_params();
@@ -2682,6 +2771,8 @@ pub fn parse_gguf_header(buf: &[u8], gguf_file: &str) -> Result<ModelSpec> {
         kv_v_elems_global,
         kv_k_elems_swa,
         kv_v_elems_swa,
+        recurrent_state_bytes_per_seq: 0,
+        mtp_num_hidden_layers: 0,
     })
 }
 
@@ -5137,6 +5228,147 @@ mod tests {
         assert_eq!(spec.kv_v_elems_global, 2 * 4 * 256);
         assert_eq!(spec.kv_k_elems_swa, 10 * 4 * 256);
         assert_eq!(spec.kv_v_elems_swa, 10 * 4 * 256);
+    }
+
+    /// Real Qwen/Qwen3.5-27B config.json shape (fetched from HF): 64 layers,
+    /// `layer_types` 48 linear_attention + 16 full_attention, GQA 4 kv heads,
+    /// head_dim 256, GDN state fields, one built-in MTP layer, vision tower.
+    fn qwen35_27b_config(layer_types: bool, all_full: bool) -> serde_json::Value {
+        let types: Vec<&str> = (0..64)
+            .map(|i| {
+                if all_full || (i + 1) % 4 == 0 {
+                    "full_attention"
+                } else {
+                    "linear_attention"
+                }
+            })
+            .collect();
+        let mut text = serde_json::json!({
+            "model_type": "qwen3_5_text",
+            "dtype": "bfloat16",
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 24,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "max_position_embeddings": 262144,
+            "full_attention_interval": 4,
+            "linear_conv_kernel_dim": 4,
+            "linear_key_head_dim": 128,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_value_head_dim": 128,
+            "mtp_num_hidden_layers": 1
+        });
+        if layer_types {
+            text["layer_types"] = serde_json::json!(types);
+        }
+        serde_json::json!({
+            "architectures": ["Qwen3_5ForConditionalGeneration"],
+            "model_type": "qwen3_5",
+            "text_config": text,
+            "vision_config": {"depth": 27, "hidden_size": 1152},
+            "tie_word_embeddings": false
+        })
+    }
+
+    #[test]
+    fn parse_hf_config_hybrid_linear_attention_layers_hold_no_kv() {
+        let spec = parse_hf_config(&qwen35_27b_config(true, false), "Qwen/Qwen3.5-27B").unwrap();
+        assert_eq!(spec.num_hidden_layers, 64);
+        assert_eq!(spec.sliding_window, 0);
+        // Only the 16 full-attention layers carry per-token KV.
+        assert_eq!(spec.kv_k_elems_global, 16 * 4 * 256);
+        assert_eq!(spec.kv_v_elems_global, 16 * 4 * 256);
+        assert_eq!(spec.kv_k_elems_swa, 0);
+        // GDN state per linear layer: 48*128*128*4 + 4*(2*16*128 + 48*128)*2.
+        let per_layer = 48 * 128 * 128 * 4 + 4 * (2 * 16 * 128 + 48 * 128) * 2;
+        assert_eq!(spec.recurrent_state_bytes_per_seq, 48 * per_layer);
+        assert_eq!(spec.mtp_num_hidden_layers, 1);
+        assert!(spec.has_vision);
+
+        // Qwen3-Next style: no layer_types, `full_attention_interval` decides.
+        let spec2 = parse_hf_config(&qwen35_27b_config(false, false), "Qwen/Qwen3.5-27B").unwrap();
+        assert_eq!(spec2.kv_k_elems_global, 16 * 4 * 256);
+        assert_eq!(
+            spec2.recurrent_state_bytes_per_seq,
+            spec.recurrent_state_bytes_per_seq
+        );
+
+        // Same dims with every layer full attention: 4× the KV, no state.
+        let full = parse_hf_config(&qwen35_27b_config(true, true), "acme/dense-27b").unwrap();
+        assert_eq!(full.kv_k_elems_global, 64 * 4 * 256);
+        assert_eq!(full.recurrent_state_bytes_per_seq, 0);
+    }
+
+    #[test]
+    fn hybrid_model_gets_about_four_times_the_context_of_dense() {
+        let hybrid = parse_hf_config(&qwen35_27b_config(true, false), "Qwen/Qwen3.5-27B").unwrap();
+        let dense = parse_hf_config(&qwen35_27b_config(true, true), "acme/dense-27b").unwrap();
+        // One 80 GB GPU, bf16 weights (~47 GB) — the KV pool decides max ctx.
+        let input = VramEstimateInput {
+            gpu_count: 1,
+            gpu_memory_gb_each: 80.0,
+            kv_cache_dtype: "auto".into(),
+            max_num_seqs: 64,
+            max_model_len: 32768,
+            ..Default::default()
+        };
+        // Same pool, 16 instead of 64 KV layers: ~4× the tokens. The recurrent
+        // state reserved for the admitted sequence (~150 MB) only shaves a bit.
+        let pool_hybrid = estimate_vram(&hybrid, &input).pool_tokens;
+        let pool_dense = estimate_vram(&dense, &input).pool_tokens;
+        let ratio = pool_hybrid as f64 / pool_dense as f64;
+        assert!(
+            (3.8..=4.0).contains(&ratio),
+            "hybrid pool {pool_hybrid} vs dense {pool_dense} (ratio {ratio:.2})"
+        );
+        let ctx_hybrid = max_context_for_budget(&hybrid, &input);
+        let ctx_dense = max_context_for_budget(&dense, &input);
+        assert!(
+            ctx_hybrid > ctx_dense,
+            "hybrid {ctx_hybrid} <= dense {ctx_dense}"
+        );
+        assert!(
+            ctx_hybrid >= 2 * ctx_dense,
+            "hybrid {ctx_hybrid} vs dense {ctx_dense}"
+        );
+
+        // Concurrency accounts for the per-sequence recurrent state.
+        let est = estimate_vram(&hybrid, &input);
+        assert!(est.concurrent_full_len_seqs > 0.0);
+        assert!(est.concurrent_full_len_seqs < pool_hybrid as f64 / 32768.0);
+
+        // auto_fit ends up on a usable hybrid config too.
+        let fit = auto_fit_config(
+            &hybrid,
+            &AutoFitRequest {
+                engine: DeployEngine::Vllm,
+                gpu_count: 1,
+                gpu_memory_gb_each: 80.0,
+                kv_cache_dtype: "auto".into(),
+                kv_cache_dtype_v: None,
+                gpu_memory_utilization: 0.9,
+                requested_max_model_len: None,
+                requested_max_num_seqs: None,
+                requested_tensor_parallel: None,
+                requested_pipeline_parallel: None,
+                max_num_batched_tokens: None,
+                lock_max_model_len: false,
+                lock_max_num_seqs: false,
+                lock_tensor_parallel: false,
+                weights_bytes_override: None,
+            },
+        );
+        assert!(fit.error.is_none(), "{:?}", fit.error);
+        assert!(
+            fit.applied.max_model_len >= 65536,
+            "{}",
+            fit.applied.max_model_len
+        );
+        assert!(estimate_vram(&hybrid, &fit.applied).fits_per_gpu);
     }
 
     #[test]

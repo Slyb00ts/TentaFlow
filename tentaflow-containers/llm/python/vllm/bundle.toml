@@ -1,18 +1,18 @@
 # =============================================================================
 # Plik: python-bundles/vllm/bundle.toml
-# Opis: vLLM jako PyPI pinned (0.27.0). Dla macOS Apple
+# Opis: vLLM jako PyPI pinned (0.27.1). Dla macOS Apple
 #       Silicon uzywamy osobnego silnika `vllm-metal` (bundle
 #       ../vllm-metal/bundle.toml) — plugin MLX, inny flow instalacji.
 # =============================================================================
 
 [bundle]
 engine = "vllm"
-description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.27.0)"
+description = "vLLM OpenAI-compatible LLM server (PyPI, pinned 0.27.1)"
 python_version = "3.12"
-# Pinned na 0.27.0. Switch z git HEAD na PyPI dla
+# Pinned na 0.27.1. Switch z git HEAD na PyPI dla
 # reproducibility — git main moze rozjechac sie z innymi deps.
 source = "pypi"
-pypi_package = "vllm==0.27.0"
+pypi_package = "vllm==0.27.1"
 
 [launch]
 command = "python"

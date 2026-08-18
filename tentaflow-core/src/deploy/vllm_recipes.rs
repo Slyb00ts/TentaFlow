@@ -3,8 +3,15 @@
 // Mirrors the expert launch flags + env vars that https://recipes.vllm.ai serves
 // per model. The rendered JSON is vendored into `vllm-recipes/recipes.json.gz`
 // (refresh via `scripts/update-vllm-recipes.sh`) and embedded here, so offline /
-// HF-only deploys get the same recipe. When the network reaches recipes.vllm.ai,
+// HF-only deploys get the same recipe. `vllm-recipes/supplement.json` carries
+// hand-curated entries for models the upstream index does not have yet; a
+// snapshot refresh never drops them. When the network reaches recipes.vllm.ai,
 // `fetch_live` overrides the embedded entry with a fresh copy for that one model.
+//
+// Resolution is a cascade (`resolve_embedded`): exact repo id → repo id with
+// quantization/packaging suffixes stripped (same org, then any org) → per
+// architecture family defaults (`resolve_for_architecture`), so a community
+// NVFP4/FP8/AWQ repack still gets the tool-call and reasoning parsers.
 
 use std::collections::HashMap;
 use std::sync::OnceLock;
@@ -12,7 +19,49 @@ use std::sync::OnceLock;
 use serde::Deserialize;
 
 const EMBEDDED_GZ: &[u8] = include_bytes!("../../vllm-recipes/recipes.json.gz");
+const SUPPLEMENT_JSON: &str = include_str!("../../vllm-recipes/supplement.json");
 const RECIPES_BASE_URL: &str = "https://recipes.vllm.ai";
+
+/// Repo-name tokens that describe weight packing, not the model. Stripping them
+/// maps `Inferact/Qwen3.8-27B-NVFP4` onto the `qwen3.8-27b` recipe.
+const PACKAGING_TOKENS: &[&str] = &[
+    "fp8",
+    "nvfp4",
+    "fp4",
+    "mxfp4",
+    "awq",
+    "gptq",
+    "int4",
+    "int8",
+    "w4a16",
+    "w8a8",
+    "w8a16",
+    "bnb",
+    "4bit",
+    "8bit",
+    "bf16",
+    "fp16",
+    "unsloth",
+    "dynamic",
+    "compressed",
+    "tensors",
+    "autoround",
+    "marlin",
+    "exl2",
+    "gguf",
+];
+
+/// Orgs whose recipe wins when several orgs publish the same base name.
+const CANONICAL_ORGS: &[&str] = &[
+    "qwen/",
+    "meta-llama/",
+    "google/",
+    "deepseek-ai/",
+    "mistralai/",
+    "zai-org/",
+    "moonshotai/",
+    "nvidia/",
+];
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub struct HwOverride {
@@ -54,9 +103,17 @@ fn embedded() -> &'static HashMap<String, RecipeEntry> {
         if GzDecoder::new(EMBEDDED_GZ).read_to_string(&mut s).is_err() {
             return HashMap::new();
         }
-        serde_json::from_str::<Snapshot>(&s)
+        let mut recipes = serde_json::from_str::<Snapshot>(&s)
             .map(|x| x.recipes)
-            .unwrap_or_default()
+            .unwrap_or_default();
+        // Curated entries only fill gaps: a refreshed upstream snapshot that
+        // gained the model keeps its own (more current) recipe.
+        if let Ok(extra) = serde_json::from_str::<Snapshot>(SUPPLEMENT_JSON) {
+            for (k, v) in extra.recipes {
+                recipes.entry(k.to_lowercase()).or_insert(v);
+            }
+        }
+        recipes
     })
 }
 
@@ -96,10 +153,186 @@ pub fn gpu_family(gpu_name: &str) -> Option<&'static str> {
     None
 }
 
-/// Resolve the embedded recipe for a HF repo id (case-insensitive). Variant
-/// model ids resolve to their parent recipe with the variant env folded in.
-pub fn resolve_embedded(model_repo: &str) -> Option<RecipeEntry> {
-    embedded().get(&model_repo.trim().to_lowercase()).cloned()
+/// Which cascade level produced a recipe (debug logging + the GUI badge).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RecipeMatch {
+    /// Exact lowercase repo id.
+    Exact,
+    /// Packaging suffixes stripped, same org.
+    NormalizedSameOrg,
+    /// Packaging suffixes stripped, recipe from another (preferably canonical) org.
+    NormalizedAnyOrg,
+    /// Architecture-family defaults (no repo-specific recipe at all).
+    Architecture,
+}
+
+/// Lowercase repo name with quantization/packaging tokens removed. Tokens are
+/// separated by `-`/`_`; separators of the surviving tokens are preserved so
+/// `internvl3_5-8b` keeps its underscore. Returns the name part only (no org).
+pub fn normalize_repo_base(model_repo: &str) -> String {
+    let lower = model_repo.trim().to_lowercase();
+    let name = lower.rsplit('/').next().unwrap_or(&lower);
+    let mut out = String::with_capacity(name.len());
+    let mut token = String::new();
+    // Separator that preceded the token currently being collected.
+    let mut sep: Option<char> = None;
+    let flush = |out: &mut String, token: &mut String, sep: Option<char>| {
+        if !token.is_empty() && !PACKAGING_TOKENS.contains(&token.as_str()) {
+            if let (Some(c), false) = (sep, out.is_empty()) {
+                out.push(c);
+            }
+            out.push_str(token);
+        }
+        token.clear();
+    };
+    for ch in name.chars() {
+        if ch == '-' || ch == '_' {
+            flush(&mut out, &mut token, sep);
+            sep = Some(ch);
+        } else {
+            token.push(ch);
+        }
+    }
+    flush(&mut out, &mut token, sep);
+    out
+}
+
+/// Resolve the embedded recipe for a HF repo id (case-insensitive) through the
+/// cascade: exact id → normalized id in the same org → normalized id in any org
+/// (canonical orgs first). Variant model ids resolve to their parent recipe
+/// with the variant env folded in. Architecture defaults are a separate step
+/// (`resolve_for_architecture`) because they need the parsed config.
+pub fn resolve_embedded(model_repo: &str) -> Option<(RecipeEntry, RecipeMatch)> {
+    let table = embedded();
+    let id = model_repo.trim().to_lowercase();
+    if let Some(e) = table.get(&id) {
+        return Some((e.clone(), RecipeMatch::Exact));
+    }
+    let base = normalize_repo_base(&id);
+    if base.is_empty() {
+        return None;
+    }
+    let (org, name) = match id.rsplit_once('/') {
+        Some((o, n)) => (Some(o), n),
+        None => (None, id.as_str()),
+    };
+    // With nothing stripped the same-org lookup would just repeat the exact miss.
+    if base != name {
+        if let Some(o) = org {
+            if let Some(e) = table.get(&format!("{o}/{base}")) {
+                return Some((e.clone(), RecipeMatch::NormalizedSameOrg));
+            }
+        }
+    }
+    let mut candidates: Vec<&String> = table
+        .keys()
+        .filter(|k| *k != &id)
+        .filter(|k| k.rsplit('/').next() == Some(base.as_str()))
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    candidates.sort();
+    let pick = CANONICAL_ORGS
+        .iter()
+        .find_map(|org| candidates.iter().find(|k| k.starts_with(org)))
+        .or_else(|| candidates.first())?;
+    table
+        .get(*pick)
+        .map(|e| (e.clone(), RecipeMatch::NormalizedAnyOrg))
+}
+
+/// Architecture-family defaults for repos with no recipe at all: the parser
+/// flags every model of the family needs, nothing hardware- or size-specific.
+/// Parser names follow what recipes.vllm.ai publishes for the family: Qwen3.5+
+/// use the XML tool format (`qwen3_coder`), older Qwen3/Qwen3-Next/Qwen3-VL
+/// speak hermes JSON. Multimodal Qwen3.5+ also get the data-parallel vision
+/// encoder like the upstream 27B recipe. Gemma stays out on purpose — the
+/// gemma-4 flags are applied by the caller for the whole family.
+pub fn resolve_for_architecture(
+    architectures: &[String],
+    model_type: &str,
+    has_vision: bool,
+) -> Option<RecipeEntry> {
+    let arch = architectures.first().map(String::as_str).unwrap_or("");
+    let arch_lc = arch.to_lowercase();
+    let mt = model_type.to_lowercase();
+    let s = |v: &str| v.to_string();
+    let parsers = |tool: &str, reasoning: Option<&str>| -> Vec<String> {
+        let mut v = vec![
+            s("--enable-auto-tool-choice"),
+            s("--tool-call-parser"),
+            s(tool),
+        ];
+        if let Some(r) = reasoning {
+            v.push(s("--reasoning-parser"));
+            v.push(s(r));
+        }
+        v
+    };
+    let qwen35_plus = arch_lc.starts_with("qwen3_5")
+        || arch_lc.starts_with("qwen3_6")
+        || arch_lc.starts_with("qwen3_7")
+        || arch_lc.starts_with("qwen3_8")
+        || mt.starts_with("qwen3_5")
+        || mt.starts_with("qwen3_6")
+        || mt.starts_with("qwen3_7")
+        || mt.starts_with("qwen3_8");
+    let mut argv: Vec<String> = if qwen35_plus {
+        let mut v = vec![s("--trust-remote-code")];
+        v.extend(parsers("qwen3_coder", Some("qwen3")));
+        if has_vision || arch_lc.contains("forconditionalgeneration") {
+            v.push(s("--mm-encoder-tp-mode"));
+            v.push(s("data"));
+        }
+        v
+    } else if arch_lc.starts_with("qwen3vl") || mt.starts_with("qwen3_vl") {
+        let mut v = parsers("hermes", Some("qwen3"));
+        v.push(s("--mm-encoder-tp-mode"));
+        v.push(s("data"));
+        v
+    } else if arch_lc.starts_with("qwen3") || mt.starts_with("qwen3") {
+        parsers("hermes", Some("qwen3"))
+    } else if arch_lc.starts_with("glm4") || mt.starts_with("glm4") {
+        let mut v = vec![s("--trust-remote-code")];
+        v.extend(parsers("glm45", Some("glm45")));
+        v
+    } else if arch_lc.starts_with("glm") || mt.starts_with("glm") {
+        let mut v = vec![s("--trust-remote-code")];
+        v.extend(parsers("glm47", Some("glm45")));
+        v
+    } else if arch_lc.starts_with("deepseekv4") || mt == "deepseek_v4" {
+        let mut v = vec![
+            s("--trust-remote-code"),
+            s("--tokenizer-mode"),
+            s("deepseek_v4"),
+        ];
+        v.extend(parsers("deepseek_v4", Some("deepseek_v4")));
+        v
+    } else if arch_lc.starts_with("deepseekv3") || mt == "deepseek_v3" {
+        let mut v = vec![s("--trust-remote-code")];
+        v.extend(parsers("deepseek_v31", Some("deepseek_v3")));
+        v
+    } else if arch_lc.starts_with("llama4") || mt == "llama4" {
+        parsers("llama4_pythonic", None)
+    } else if arch_lc.starts_with("llama") || mt == "llama" {
+        parsers("llama3_json", None)
+    } else if arch_lc.starts_with("mistral") || arch_lc.starts_with("mixtral") || mt == "mistral" {
+        parsers("mistral", None)
+    } else if arch_lc.starts_with("gptoss") || mt == "gpt_oss" {
+        parsers("openai", None)
+    } else {
+        return None;
+    };
+    argv.dedup();
+    Some(RecipeEntry {
+        hf_id: format!(
+            "architecture:{}",
+            if arch.is_empty() { model_type } else { arch }
+        ),
+        base_argv: argv,
+        ..RecipeEntry::default()
+    })
 }
 
 /// Fetch a fresh recipe straight from recipes.vllm.ai for a single model. Two
@@ -340,6 +573,120 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn normalize_repo_base_strips_packaging_suffixes() {
+        assert_eq!(
+            normalize_repo_base("Inferact/Qwen3.8-27B-NVFP4"),
+            "qwen3.8-27b"
+        );
+        assert_eq!(
+            normalize_repo_base("unsloth/Qwen3.8-27B-FP8-Dynamic"),
+            "qwen3.8-27b"
+        );
+        assert_eq!(
+            normalize_repo_base("Qwen/Qwen3.5-27B-AWQ-Int4"),
+            "qwen3.5-27b"
+        );
+        assert_eq!(
+            normalize_repo_base("RedHatAI/gemma-4-31b-it-FP8-dynamic"),
+            "gemma-4-31b-it"
+        );
+        // Separators of surviving tokens are kept verbatim.
+        assert_eq!(
+            normalize_repo_base("OpenGVLab/InternVL3_5-8B"),
+            "internvl3_5-8b"
+        );
+        assert_eq!(
+            normalize_repo_base("meta-llama/Llama-3.3-70B-Instruct"),
+            "llama-3.3-70b-instruct"
+        );
+    }
+
+    #[test]
+    fn resolve_embedded_cascades_over_normalized_ids() {
+        let (e, level) = resolve_embedded("Qwen/Qwen3.6-27B").expect("exact");
+        assert_eq!(level, RecipeMatch::Exact);
+        assert_eq!(e.hf_id, "Qwen/Qwen3.6-27B");
+
+        // Same org, packaging suffix stripped.
+        let (e, level) = resolve_embedded("Qwen/Qwen3.5-27B-AWQ-Int4").expect("same org");
+        assert_eq!(level, RecipeMatch::NormalizedSameOrg);
+        assert_eq!(e.hf_id, "Qwen/Qwen3.5-27B");
+
+        // Community repack → canonical org wins.
+        let (e, level) = resolve_embedded("Inferact/Qwen3.8-27B-NVFP4").expect("any org");
+        assert_eq!(level, RecipeMatch::NormalizedAnyOrg);
+        assert_eq!(e.hf_id, "Qwen/Qwen3.8-27B");
+        assert!(e.base_argv.iter().any(|a| a == "qwen3_coder"));
+        let (e, level) = resolve_embedded("unsloth/Qwen3.8-27B-FP8-Dynamic").expect("any org");
+        assert_eq!(level, RecipeMatch::NormalizedAnyOrg);
+        assert_eq!(e.hf_id, "Qwen/Qwen3.8-27B");
+
+        // Supplement entries are exact hits and mirror the 3.6 recipe.
+        let (fp8, level) = resolve_embedded("Qwen/Qwen3.8-27B-FP8").expect("supplement");
+        assert_eq!(level, RecipeMatch::Exact);
+        assert!(fp8.base_argv.iter().any(|a| a == "--reasoning-parser"));
+
+        assert!(resolve_embedded("acme/totally-unknown-7b-fp8").is_none());
+    }
+
+    #[test]
+    fn architecture_fallback_covers_known_families() {
+        let q =
+            resolve_for_architecture(&["Qwen3_5ForConditionalGeneration".into()], "qwen3_5", true)
+                .expect("qwen3.5");
+        let argv = q.base_argv.join(" ");
+        assert!(argv.contains("--tool-call-parser qwen3_coder"));
+        assert!(argv.contains("--reasoning-parser qwen3"));
+        assert!(argv.contains("--mm-encoder-tp-mode data"));
+        assert!(argv.contains("--enable-auto-tool-choice"));
+
+        let dense =
+            resolve_for_architecture(&["Qwen3ForCausalLM".into()], "qwen3", false).expect("qwen3");
+        assert!(dense
+            .base_argv
+            .join(" ")
+            .contains("--tool-call-parser hermes"));
+        assert!(!dense.base_argv.join(" ").contains("--mm-encoder-tp-mode"));
+
+        let glm = resolve_for_architecture(&["Glm4MoeForCausalLM".into()], "glm4_moe", false)
+            .expect("glm4");
+        assert!(glm.base_argv.join(" ").contains("--tool-call-parser glm45"));
+
+        let ds = resolve_for_architecture(&["DeepseekV3ForCausalLM".into()], "deepseek_v3", false)
+            .expect("deepseek");
+        assert!(ds
+            .base_argv
+            .join(" ")
+            .contains("--tool-call-parser deepseek_v31"));
+        assert!(ds
+            .base_argv
+            .join(" ")
+            .contains("--reasoning-parser deepseek_v3"));
+
+        let llama =
+            resolve_for_architecture(&["LlamaForCausalLM".into()], "llama", false).expect("llama");
+        assert!(llama
+            .base_argv
+            .join(" ")
+            .contains("--tool-call-parser llama3_json"));
+
+        let mistral = resolve_for_architecture(&["MistralForCausalLM".into()], "mistral", false)
+            .expect("mistral");
+        assert!(mistral
+            .base_argv
+            .join(" ")
+            .contains("--tool-call-parser mistral"));
+
+        assert!(resolve_for_architecture(
+            &["Gemma4ForConditionalGeneration".into()],
+            "gemma4",
+            true
+        )
+        .is_none());
+        assert!(resolve_for_architecture(&[], "", false).is_none());
     }
 
     #[test]

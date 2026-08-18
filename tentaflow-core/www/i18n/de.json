@@ -1,4 +1,16 @@
 {
+  "gpu_topology": {
+    "title": "GPU-Topologie",
+    "pair": "Paar {letter} · {link}",
+    "no_pair": "ohne Paar",
+    "no_pair_tip": "mit dem Rest über NODE/SYS verbunden",
+    "legend": "PHB/PIX/PXB/NVLink-Paare = schnelle P2P-Verbindung (beste Wahl für TP), NODE/SYS = über die CPU.",
+    "selection_hint": "{fast} {fast|schnelles Paar|schnelle Paare}, {slow} {slow|Verbindung|Verbindungen} über die CPU",
+    "no_p2p": "kein P2P",
+    "cell_tip": "GPU{a} ↔ GPU{b}: {link}, P2P: {p2p}",
+    "p2p_yes": "ja",
+    "p2p_no": "nein"
+  },
   "project_studio": {
     "title": "Projekte",
     "refresh": "Aktualisieren",
@@ -2477,6 +2489,12 @@
         "ctx_label": "Kontextlänge (max_model_len)",
         "ctx_hint_max": "Max aus Modell-Konfiguration: {model}",
         "ctx_hint_max_with_vram": "Max aus Modell-Konfiguration: {model} · aus VRAM: {vram}.",
+        "ctx_chip_vram_max": "Max. passend in VRAM",
+        "ctx_chip_vram_max_title": "Kontext auf {ctx} setzen — das Größte, das in den VRAM passt",
+        "extra_args_label": "Zusätzliche vLLM-Argumente",
+        "extra_args_hint": "Freie CLI-Flags, die ans Ende von VLLM_ARGS angehängt werden — sie überschreiben Werte aus Rechner und Rezept. Anführungszeichen werden beachtet.",
+        "spec_native_mtp": "Modell hat einen eingebauten MTP-Kopf",
+        "spec_no_model_hint": "Diese Methode entwirft aus dem Modell selbst — kein Speculator-Repo nötig.",
         "ctx_chip_set": "Auf {label} setzen",
         "ctx_chip_exceeds": "Überschreitet Modell-Max ({max})",
         "tp_label": "Tensor Parallel",
@@ -4260,6 +4278,8 @@
     "gpu_empty_on_node": "Dieser Knoten meldet keine GPUs.",
     "gpu_select_at_least_one": "Mindestens eine GPU auswählen oder einen anderen Modus wählen.",
     "gpu_summary_specific": "{n} GPU(s) ausgewählt · {total_vram} VRAM gesamt",
+    "gpu_summary_free": "{free_vram} frei",
+    "gpu_vram_line": "{used} / {total} GB · {free} GB frei",
     "gpu_summary_all": "Alle GPUs des Knotens werden verwendet",
     "gpu_summary_none": "GPU wird nicht verwendet",
     "gpu_mode_all_title": "Alle verwenden",
