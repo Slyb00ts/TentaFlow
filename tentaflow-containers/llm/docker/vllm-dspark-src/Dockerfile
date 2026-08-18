@@ -14,7 +14,7 @@
 # What upstream still lacks is the nvfp4_ds_mla KV dtype -- that stays ours.
 FROM vllm/vllm-openai:cu130-nightly AS build
 
-ARG VLLM_REF=v0.27.0
+ARG VLLM_REF=v0.27.1
 ARG TORCH_INDEX=https://download.pytorch.org/whl/cu130
 ARG TORCH_VERSION=2.13.0
 ARG TORCHVISION_VERSION=0.28.0

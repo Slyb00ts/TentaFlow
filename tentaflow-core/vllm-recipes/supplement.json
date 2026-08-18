@@ -1,0 +1,47 @@
+{
+  "recipes": {
+    "qwen/qwen3.8-27b": {
+      "hf_id": "Qwen/Qwen3.8-27B",
+      "base_argv": [
+        "--trust-remote-code",
+        "--tensor-parallel-size",
+        "1",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "qwen3_coder",
+        "--reasoning-parser",
+        "qwen3",
+        "--mm-encoder-tp-mode",
+        "data"
+      ],
+      "base_env": {},
+      "hardware_overrides": {},
+      "variants": {
+        "default": { "extra_env": {}, "model_id": null, "precision": "bf16" },
+        "fp8": { "extra_env": {}, "model_id": "Qwen/Qwen3.8-27B-FP8", "precision": "fp8" }
+      }
+    },
+    "qwen/qwen3.8-27b-fp8": {
+      "hf_id": "Qwen/Qwen3.8-27B-FP8",
+      "base_argv": [
+        "--trust-remote-code",
+        "--max-num-seqs",
+        "512",
+        "--tensor-parallel-size",
+        "1",
+        "--enable-auto-tool-choice",
+        "--tool-call-parser",
+        "qwen3_coder",
+        "--reasoning-parser",
+        "qwen3",
+        "--mm-encoder-tp-mode",
+        "data"
+      ],
+      "base_env": {},
+      "hardware_overrides": {},
+      "variants": {
+        "default": { "extra_env": {}, "model_id": null, "precision": "fp8" }
+      }
+    }
+  }
+}

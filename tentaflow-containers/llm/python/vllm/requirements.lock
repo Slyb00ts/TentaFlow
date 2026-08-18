@@ -12,7 +12,7 @@
 #   * variant `cuda` + extra_index cu130 -> torch-2.13.0+cu130-cp3X-manylinux_2_28_<arch>.whl
 #   * variant `rocm` + extra_index rocm  -> torch-2.13.0+rocmX.Y-...
 #   * variant `cpu`  (brak extra_index)  -> torch-2.13.0-...-manylinux_2_28_<arch> (CPU)
-# vLLM 0.27.0 wymaga PyTorch 2.13 jako baseline; cu130 wheels istnieja dla
+# vLLM 0.27.1 wymaga PyTorch 2.13 jako baseline; cu130 wheels istnieja dla
 # x86_64 i aarch64 (potrzebne dla DGX Spark / Grace Blackwell).
 torch==2.13.0
 torchvision==0.28.0
@@ -20,7 +20,7 @@ torchaudio==2.11.0
 
 # Ray — wymagany do multi-node tensor-parallel (head+worker,
 # --distributed-executor-backend ray). 2.55.1 ma kola aarch64 + x86_64,
-# kompatybilny z vLLM 0.27.0 / torch 2.13. Native host ma juz systemowy
+# kompatybilny z vLLM 0.27.1 / torch 2.13. Native host ma juz systemowy
 # rdma-core, wiec w bundlu wystarczy sam Ray (NCCL uzyje systemowego
 # libibverbs do RoCE).
 ray==2.55.1
@@ -29,7 +29,7 @@ ray==2.55.1
 # Sidecar python_venv pobiera je wprost z requirements-cuda.txt HEAD;
 # ten plik tylko aktualizuje kilka najciezszych wheels do wstepnego cache.
 
-# Runtime tooling - bez pinow, vLLM 0.27.0 sam zaciagnie kompatybilne fastapi/uvicorn.
+# Runtime tooling - bez pinow, vLLM 0.27.1 sam zaciagnie kompatybilne fastapi/uvicorn.
 # vLLM wymaga model-hosting-container-standards >= 0.1.13, ktore zalezy
 # od starlette >= 0.49 - to koliduje z fastapi == 0.115.5 ktore pinuje
 # starlette < 0.42.

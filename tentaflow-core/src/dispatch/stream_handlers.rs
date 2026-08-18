@@ -3077,6 +3077,7 @@ mod tests {
             messages: vec![ChatMessage {
                 role: "user".into(),
                 content: "hi".into(),
+                reasoning_content: None,
             }],
             temperature: None,
             max_tokens: None,

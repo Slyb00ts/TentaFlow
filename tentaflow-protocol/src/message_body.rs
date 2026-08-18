@@ -5466,6 +5466,11 @@ pub struct DeployVllmRecommendResponse {
     /// w config_json. Pusta dla silnikow bez strojonych argumentow. Wire-additive.
     #[serde(default)]
     pub launch_command: String,
+    /// The checkpoint ships its own MTP / NextN draft head (config
+    /// `mtp_num_hidden_layers` / `num_nextn_predict_layers` > 0), so the wizard
+    /// can offer `--speculative-config {"method":"mtp"}` without a draft repo.
+    #[serde(default)]
+    pub native_mtp_available: bool,
 }
 
 // =============================================================================

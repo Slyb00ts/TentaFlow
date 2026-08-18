@@ -851,8 +851,8 @@ function renderEngineArgsSection(cfg, tk) {
             <option value="">${escapeHtml(tk('kv_dtype_default'))}</option>
             <option value="auto"${cfg.kv_cache_dtype === 'auto' ? ' selected' : ''}>auto</option>
             <option value="fp8"${cfg.kv_cache_dtype === 'fp8' ? ' selected' : ''}>fp8</option>
-            <option value="fp16"${cfg.kv_cache_dtype === 'fp16' ? ' selected' : ''}>fp16</option>
-            <option value="bf16"${cfg.kv_cache_dtype === 'bf16' ? ' selected' : ''}>bf16</option>
+            <option value="fp8_e4m3"${cfg.kv_cache_dtype === 'fp8_e4m3' ? ' selected' : ''}>fp8_e4m3</option>
+            <option value="fp8_e5m2"${cfg.kv_cache_dtype === 'fp8_e5m2' ? ' selected' : ''}>fp8_e5m2</option>
           </select>
         </div>
       </div>

@@ -274,6 +274,16 @@ impl DeployStrategy for PythonBundleDeploy {
         }
         super::apply_engine_env(&self.user_config, &mut env);
         super::apply_gpu_selection_env(&self.user_config, &mut env);
+        if let Some(scope) = super::gpu_topology::wizard_gpu_scope(&self.user_config) {
+            super::gpu_topology::apply_nccl_p2p_level_env(
+                &engine_id,
+                &self.user_config,
+                scope,
+                super::gpu_topology::host_topology(),
+                &mut env,
+                self.log_sink.as_ref(),
+            );
+        }
 
         // Strukturalne argi CLI budowane przez Rust (speculative, gpu-memory).
         // Plyna do silnika jako osobne elementy argv przez
