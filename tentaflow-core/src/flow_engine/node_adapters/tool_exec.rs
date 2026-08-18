@@ -20,14 +20,14 @@ use crate::agents::{
     is_core_tool, AgentPrincipal, AgentRunManager, AgentService, AgentServiceSlot, CallerRun,
     CoreToolName, PermissionDecision, DEFAULT_INTERACTION_TIMEOUT_SECS,
 };
+use crate::code_studio::tools as code_studio_tools;
 use crate::db::repository;
+use crate::flow_engine::dispatchers::EmbeddingsRequest;
 use crate::flow_engine::dispatchers::ProgressEvent;
 use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, FlowValue, LlmToolCall, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
-use crate::flow_engine::types::{FlowDataType, FlowNode};
-use crate::flow_engine::dispatchers::EmbeddingsRequest;
-use crate::code_studio::tools as code_studio_tools;
 use crate::flow_engine::node_adapters::InteractionGate;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::project_studio::{
     generation as project_generation, ingest as project_ingest, knowledge as project_knowledge,
 };
@@ -49,6 +49,10 @@ const PROJECT_SEARCH_RESULT_BUDGET: usize = 15_000;
 
 /// Human-wait budget for a permission grant card (§3.13 B). A grant has no
 /// model-supplied timeout (unlike ask_user), so it uses the shared default.
+/// Ile niezaleznych wywolan wolno miec w locie naraz. Odczyty sa tanie, ale
+/// kazde trzyma bufor wyniku, wiec pula ma sufit.
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 4;
+
 const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
 
 /// Shapes a failed tool call into a recoverable `[TOOL_ERROR]`-style result the
@@ -739,6 +743,117 @@ impl ToolExecNodeAdapter {
             );
         }
     }
+
+    /// Czy wywolanie tego narzedzia wolno puscic obok innych.
+    ///
+    /// Lista jest ALLOWLISTA, nie denylista, i to jest celowe: narzedzie nieznane
+    /// tej funkcji — w tym KAZDE narzedzie addonu — laduje w trybie wylacznym.
+    /// Pomylka w te strone kosztuje czas; w druga kosztowalaby splatane zapisy
+    /// albo dwa rownolegle pytania do czlowieka.
+    fn is_parallel_safe(name: &str) -> bool {
+        matches!(
+            CoreToolName::from_public_name(name),
+            Some(
+                CoreToolName::FsRead
+                    | CoreToolName::FsList
+                    | CoreToolName::FsGlob
+                    | CoreToolName::FsGrep
+                    | CoreToolName::GitRead
+                    | CoreToolName::CodeSearch
+                    | CoreToolName::WorkspaceInfo
+                    | CoreToolName::AgentList
+                    | CoreToolName::ProjectSearch
+                    | CoreToolName::ProjectListSources
+            )
+        )
+    }
+
+    /// Wykonuje JEDNO wywolanie narzedzia. Wydzielone z petli, zeby ta sama
+    /// sciezka obslugiwala wykonanie pojedyncze i rownolegla grupe.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_one(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        caller: &CallerRun,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        envelope: &FlowEnvelope,
+        tools_json: &str,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            ProgressEvent::ToolCallStarted {
+                name: call.name.clone(),
+            },
+        );
+
+        let result = if !service.tool_allowed(&tools_json, &call.name) {
+            error_result(call, format!("tool '{}' not in agent allowlist", call.name))
+        } else if CoreToolName::from_public_name(&call.name)
+            .map(|c| c.is_ask_user())
+            .unwrap_or(false)
+        {
+            Self::run_ask_user_call(
+                manager.as_deref(),
+                ctx,
+                &run_id,
+                parent_run_id.as_deref(),
+                call,
+            )
+            .await
+        } else if Self::is_subagent_control(&call.name) {
+            match (&manager, run_id.is_empty()) {
+                (Some(mgr), false) => Self::run_manager_call(mgr, &caller, call).await,
+                (Some(_), true) => error_result(
+                    call,
+                    "sub-agent control requires a managed run context".to_string(),
+                ),
+                (None, _) => error_result(
+                    call,
+                    "sub-agent control is not available on this node".to_string(),
+                ),
+            }
+        } else if Self::is_project_knowledge(&call.name) {
+            Self::run_project_knowledge_call(ctx, &principal, call).await
+        } else if Self::is_case_save(&call.name) {
+            Self::run_case_save_call(ctx, &principal, envelope, call).await
+        } else if Self::is_code_studio(&call.name) {
+            Self::run_code_studio_call(
+                &service,
+                manager.as_deref(),
+                ctx,
+                &principal,
+                &run_id,
+                parent_run_id.as_deref(),
+                envelope,
+                call,
+            )
+            .await
+        } else {
+            Self::run_tool_call(
+                &service,
+                manager.as_deref(),
+                ctx,
+                &principal,
+                &run_id,
+                parent_run_id.as_deref(),
+                call,
+            )
+            .await
+        };
+
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            ProgressEvent::ToolCallFinished {
+                name: call.name.clone(),
+                status: if result.success { "ok" } else { "error" }.to_string(),
+            },
+        );
+        result
+    }
 }
 
 #[async_trait]
@@ -876,77 +991,68 @@ impl NodeAdapter for ToolExecNodeAdapter {
                 .and_then(|r| r.parent_run_id)
         };
 
-        for call in &calls {
-            ctx.progress.emit(
-                &ctx.progress_scope,
-                ProgressEvent::ToolCallStarted {
-                    name: call.name.clone(),
-                },
-            );
-
-            let result = if !service.tool_allowed(&tools_json, &call.name) {
-                error_result(call, format!("tool '{}' not in agent allowlist", call.name))
-            } else if CoreToolName::from_public_name(&call.name)
-                .map(|c| c.is_ask_user())
-                .unwrap_or(false)
-            {
-                Self::run_ask_user_call(
-                    manager.as_deref(),
-                    ctx,
-                    &run_id,
-                    parent_run_id.as_deref(),
-                    call,
-                )
-                .await
-            } else if Self::is_subagent_control(&call.name) {
-                match (&manager, run_id.is_empty()) {
-                    (Some(mgr), false) => Self::run_manager_call(mgr, &caller, call).await,
-                    (Some(_), true) => error_result(
-                        call,
-                        "sub-agent control requires a managed run context".to_string(),
-                    ),
-                    (None, _) => error_result(
-                        call,
-                        "sub-agent control is not available on this node".to_string(),
-                    ),
-                }
-            } else if Self::is_project_knowledge(&call.name) {
-                Self::run_project_knowledge_call(ctx, &principal, call).await
-            } else if Self::is_case_save(&call.name) {
-                Self::run_case_save_call(ctx, &principal, envelope, call).await
-            } else if Self::is_code_studio(&call.name) {
-                Self::run_code_studio_call(
-                    &service,
-                    manager.as_deref(),
-                    ctx,
-                    &principal,
-                    &run_id,
-                    parent_run_id.as_deref(),
-                    envelope,
-                    call,
-                )
-                .await
+        // Wywolania niezalezne jada ROWNOLEGLE, reszta pojedynczo. Podzial nie
+        // jest optymalizacja "na wszelki wypadek": narzedzia mutujace maja
+        // preconditiony CAS i skutki uboczne, dla ktorych kolejnosc modelu JEST
+        // znaczeniem, a `ask_user` i sterowanie sub-agentami musza widziec stan
+        // ustalony. Rownolegle puszczamy wylacznie odczyty.
+        //
+        // Wyniki i tak wracaja w kolejnosci modelu — `join_all` zachowuje
+        // kolejnosc wejscia — wiec audyt i wiadomosci role=tool ustawiaja sie
+        // dokladnie tak, jak przy wykonaniu sekwencyjnym.
+        let max_parallel = Self::config_usize(
+            node,
+            "max_parallel_tool_calls",
+            DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+        )
+        .max(1);
+        let mut idx = 0usize;
+        while idx < calls.len() {
+            let group_len = if Self::is_parallel_safe(&calls[idx].name) {
+                calls[idx..]
+                    .iter()
+                    .take(max_parallel)
+                    .take_while(|c| Self::is_parallel_safe(&c.name))
+                    .count()
             } else {
-                Self::run_tool_call(
-                    &service,
-                    manager.as_deref(),
-                    ctx,
-                    &principal,
-                    &run_id,
-                    parent_run_id.as_deref(),
-                    call,
-                )
-                .await
+                1
             };
+            let group = &calls[idx..idx + group_len];
 
-            ctx.progress.emit(
-                &ctx.progress_scope,
-                ProgressEvent::ToolCallFinished {
-                    name: call.name.clone(),
-                    status: if result.success { "ok" } else { "error" }.to_string(),
-                },
-            );
-            results.push(result);
+            if group_len == 1 {
+                results.push(
+                    Self::dispatch_one(
+                        &service,
+                        manager.as_deref(),
+                        ctx,
+                        &principal,
+                        &caller,
+                        &run_id,
+                        parent_run_id.as_deref(),
+                        envelope,
+                        &tools_json,
+                        &group[0],
+                    )
+                    .await,
+                );
+            } else {
+                let futures_iter = group.iter().map(|call| {
+                    Self::dispatch_one(
+                        &service,
+                        manager.as_deref(),
+                        ctx,
+                        &principal,
+                        &caller,
+                        &run_id,
+                        parent_run_id.as_deref(),
+                        envelope,
+                        &tools_json,
+                        call,
+                    )
+                });
+                results.extend(futures::future::join_all(futures_iter).await);
+            }
+            idx += group_len;
         }
 
         // Audit + run log against the run's AI event before truncation (the
@@ -1153,7 +1259,7 @@ mod tests {
                 is_enabled: true,
                 on_child_complete: "notify",
                 allowed_agents_json: None,
-                actor_user_id: None
+                actor_user_id: None,
             },
         )
         .expect("agent");
@@ -1453,6 +1559,67 @@ mod tests {
             assert!(t.contains("not in agent allowlist"), "got: {t}");
         } else {
             panic!("tool content must be text");
+        }
+    }
+
+    /// Rownolegle wolno puszczac WYLACZNIE odczyty. Kazde narzedzie mutujace,
+    /// interaktywne albo sterujace sub-agentami musi zostac wylaczne — inaczej
+    /// dwa zapisy z preconditionem CAS scigalyby sie o ten sam plik, a dwa
+    /// `ask_user` zadalyby czlowiekowi dwoch pytan naraz.
+    #[test]
+    fn only_reads_are_parallel_safe() {
+        for name in [
+            "core.fs_read",
+            "core.fs_list",
+            "core.fs_glob",
+            "core.fs_grep",
+            "core.git_read",
+            "core.code_search",
+            "core.workspace_info",
+            "core.agent_list",
+            "core.project_search",
+            "core.project_list_sources",
+        ] {
+            assert!(
+                ToolExecNodeAdapter::is_parallel_safe(name),
+                "{name} to odczyt i powinien isc rownolegle"
+            );
+        }
+        for name in [
+            "core.fs_write",
+            "core.fs_edit",
+            "core.fs_move",
+            "core.fs_delete",
+            "core.fs_mkdir",
+            "core.exec",
+            "core.git_commit",
+            "core.git_push",
+            "core.git_stage",
+            "core.git_merge",
+            "core.ask_user",
+            "core.agent_spawn",
+            "core.agent_wait",
+            "core.agent_cancel",
+            "core.task_plan",
+            "core.project_case_save",
+        ] {
+            assert!(
+                !ToolExecNodeAdapter::is_parallel_safe(name),
+                "{name} zmienia stan albo wymaga kolejnosci — musi byc wylaczne"
+            );
+        }
+    }
+
+    /// Narzedzie spoza rdzenia (kazdy addon) nie jest znane allowliscie, wiec
+    /// laduje w trybie wylacznym. To jest ta strona pomylki, ktora kosztuje czas,
+    /// a nie poprawnosc.
+    #[test]
+    fn unknown_and_addon_tools_default_to_exclusive() {
+        for name in ["notes.search", "rag.ask", "totally_unknown", ""] {
+            assert!(
+                !ToolExecNodeAdapter::is_parallel_safe(name),
+                "{name} nie jest znane — domyslnie wylaczne"
+            );
         }
     }
 }
