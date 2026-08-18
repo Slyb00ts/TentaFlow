@@ -179,7 +179,7 @@ wywołaniami.
 1.0 „test, który dziś musi failować" prawdopodobnie przejdzie — `store.rs` ma już
 `reingest_removes_orphan_chunks`.
 
-### Etap 2 — flowy platformowe: `ingest`, `query`, `retrieval-round` **[rozszerzony wg §0]**
+### Etap 2 — flowy platformowe: `ingest`, `query`, `retrieval-round` **[WYKONANE: 2a, 2b, 2c]**
 Idzie **po 0c** (flow platformowy nie może zależeć od aliasów addonowych). W 1.0/2.0 etap dotyczył
 samego ingestu; wg §0 obejmuje wszystkie trzy flowy naraz — i tak muszą jechać razem, bo `query`
 woła `retrieval-round`.
@@ -204,13 +204,13 @@ zamiast czytać `engine_flow_model:<id>` z KV instancji.
   `engine_flow_model` (nazwa pierwszego flow) zostaje w bazie i trzeba je wyczyścić razem z
   `engine_flow_model:<id>`.
 
-### Etap 3 — Projekty na wspólnym flow **[rozcięty na 3a–3c]**
+### Etap 3 — Projekty na wspólnym flow **[3a, 3b WYKONANE; 3c: zostaje natywnie]**
 - **3a.** Rozszerzenie schematu pól noda `store` o `source_id/path/location` (§4.3). Bez tego reszta
   etapu wyzeruje cytaty.
 - **3b.** Przełączenie ścieżki proza/office/PDF na `execute_ingest`.
-- **3c.** Decyzja o kodzie i URL-ach: albo nody we flow, albo świadome zostawienie natywnej ścieżki
-  dla `chunk_code` i `WorkPayload::Url` (§2). **Rekomendacja:** zostawić natywne w V1 — chunkowanie
-  kodu z `location` jako zakresem linii to inna semantyka niż chunking prozy.
+- **3c. ROZSTRZYGNIĘTE — zostają natywne.** `chunk_code` (zakres linii jako `location`) i
+  `WorkPayload::Url` (trigger flow-ingestu przyjmuje wyłącznie blob binarny) nie mają odpowiednika
+  we flow, a chunkowanie kodu to inna semantyka niż chunking prozy. Wszystko inne idzie flow.
 
 **[nowe] Koszty do zaakceptowania lub zaadresowania:**
 - `execute_ingest` bierze `document_bytes: Vec<u8>` w całości do RAM, robi `blobs.put` i `delete` po
