@@ -279,3 +279,34 @@ dotknie strony retrievalowej.
 - **[nowe]** Dziedziczenie `flow_depth` w `ingest_invoke.rs:168`: tworzy świeży `ExecutionContext` z
   pustym `flow_stack`, mimo że `ExecutionContext::new_with_flow_depth` istnieje — guard rekursji
   (`MAX_FLOW_DEPTH=3`) się resetuje. Etap 3 dokłada drugiego callera do tej ścieżki. Osobne zadanie.
+
+---
+
+## 8. Zadanie NASTĘPNE (po zakończeniu unifikacji RAG i Projektów)
+
+Zapisane na wniosek właściciela — **do zrobienia po Etapach 0–5**, nie w ich trakcie.
+
+**Agent musi mieć sterowanie głębokością rozumowania i temperaturą.**
+
+1. **Ile ma myśleć.** Po wybraniu modelu dla agenta trzeba móc ustawić poziom rozumowania.
+   Poziomy NIE są stałą listą: bywa `low`/`medium`/`high`, czasem dochodzi `xhigh` albo `max`, a
+   część modeli nie ma tego wcale. Zestaw musi **wynikać z modelu**, tak jak porty LLM w Flow
+   Builderze wynikają z modalności — wzorzec jest już zbudowany
+   (`www/js/modules/flows-builder/model-modalities.js`: katalog jest źródłem prawdy, a model
+   nieznany katalogowi nie jest traktowany jak niezdolny, tylko zostawiony bez ograniczenia).
+2. **Temperatura per agent.** Raz chcemy działanie bardziej twórcze, raz zachowawcze. Dziś agent
+   nie ma tego pola.
+
+Stan zastany (sprawdzony, nie zakładany):
+- `AgentParams` ma slot `params_json`, ale we wszystkich miejscach zapisu jest to `"{}"` — pole
+  jest zarezerwowane i nieużywane. To naturalne miejsce na oba ustawienia, bez migracji kolumn.
+- W core **nie ma dziś pojęcia `reasoning_effort`** w żadnej postaci. Katalog modeli niesie
+  modalności, ale nie poziomy rozumowania — więc dojdzie do tego nowe pole katalogowe i jego
+  wypełnienie per backend (llama.cpp wystawia `--reasoning`/`--reasoning-format`
+  i `--chat-template-kwargs`; dla API zewnętrznych poziomy są własnością dostawcy).
+- `LlmRequest` ma już `temperature`, więc strona wykonawcza dla punktu 2 istnieje — brakuje
+  wyłącznie ustawienia na agencie i przekazania go do żądania.
+
+Do rozstrzygnięcia przy podejmowaniu zadania: co robić, gdy agent ma ustawiony poziom, a model
+zostanie przepięty na taki, który go nie wspiera (zignorować, zdegradować do najbliższego, czy
+zablokować zapis).
