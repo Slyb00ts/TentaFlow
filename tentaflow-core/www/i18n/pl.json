@@ -2970,7 +2970,8 @@
     "loop_region_exit": "wyjście",
     "node_error_field": "Pole wymagane do uruchomienia flow: {field}",
     "node_error_required": "wymagane",
-    "autosave_incomplete": "Zapisano · {count} {count|blok wymaga|bloki wymagają|bloków wymaga} konfiguracji"
+    "autosave_incomplete": "Zapisano · {count} {count|blok wymaga|bloki wymagają|bloków wymaga} konfiguracji",
+    "port_unsupported": "{model}: brak obsługi wejścia/wyjścia typu {modality}"
   },
   "flows_vars": {
     "title": "Zmienne flow",
