@@ -1126,6 +1126,26 @@ async function fetchVllmRecommendation(overrides = {}) {
   }
 }
 
+// Human label of the weight storage format for the summary readouts. A
+// quantized checkpoint (AWQ / compressed-tensors / fp8 / nvfp4) still reports
+// the config `dtype` (bf16) — the calculator's detected `quantization` label is
+// what the weights are actually stored in, so it wins when present.
+const QUANT_LABELS = {
+  awq: 'int4 (awq)',
+  gptq: 'int4 (gptq)',
+  compressed_tensors_4bit: 'int4 (compressed-tensors)',
+  w8a16: 'int8 (compressed-tensors)',
+  bnb_4bit: 'int4 (bitsandbytes)',
+  bnb_8bit: 'int8 (bitsandbytes)',
+  modelopt_fp8: 'fp8 (modelopt)',
+};
+function weightDtypeLabel(ms) {
+  if (!ms) return '?';
+  const q = String(ms.quantization || '').toLowerCase();
+  if (!q) return ms.dtype || '?';
+  return QUANT_LABELS[q] || q.replace(/_/g, '-');
+}
+
 // Mapuje wybor kv-bits ('none'|'8'|'4') na etykiete wire `kv_cache_dtype`
 // (none|kv8|kv4) ktora backend (estimate_mlx_vram) rozpoznaje.
 function mlxKvDtypeLabel() {
@@ -1306,7 +1326,7 @@ function renderStepAdvanced() {
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_model'))}</div>
           <div class="adv-cell-value"><code>${escapeHtml(model)}</code></div>
-          ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(rec.model_spec.dtype || '?')} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
+          ${rec && rec.model_spec ? `<div class="adv-cell-sub">${(rec.model_spec.estimated_params_billions || 0).toFixed(1)}B params · ${escapeHtml(weightDtypeLabel(rec.model_spec))} · max ctx ${(rec.model_spec.max_position_embeddings || 0).toLocaleString()}</div>` : ''}
         </div>
         <div class="adv-summary-cell">
           <div class="adv-cell-label">${escapeHtml(tk('summary_gpu'))}</div>
@@ -1534,7 +1554,7 @@ function renderVramCard(rec, totalVramGb, gpuCount) {
       </div>
       ${noFitBanner}
       <div class="adv-kpi-grid" id="edw-adv-kpi">
-        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(rec.model_spec?.dtype || '?')}</div></div>
+        <div class="adv-kpi"><div class="k-label">${escapeHtml(tAdv('kpi_weights'))}</div><div class="k-value">${weightsGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(weightDtypeLabel(rec.model_spec))}</div></div>
         <div class="adv-kpi ${kvCls}"><div class="k-label">${escapeHtml(isLcpp ? tAdv('kpi_kv_total') : tAdv('kpi_kv_pool'))}</div><div class="k-value">${kvGb.toFixed(1)} GB</div><div class="k-sub">${escapeHtml(tAdv(isLcpp ? 'kpi_kv_total_sub' : 'kpi_kv_pool_sub', {
           tokens: poolTokens.toLocaleString(),
           // llama.cpp: whole slots only (-c = ctx × slots); vLLM: fractional pool capacity.
@@ -3304,11 +3324,14 @@ function quoteCliArg(tok) {
 // Apply `overrides` (`{ flag, value }` for valued flags, `{ flag, present }`
 // for boolean flags) to a tokenized argv: an existing occurrence — either
 // `--flag value` or `--flag=value` — is rewritten in place, otherwise the flag
-// is appended. `value: null` / `present: false` remove the flag.
+// is appended. `value: null` / `present: false` remove the flag; `value:
+// undefined` leaves whatever the base argv carries untouched (an "unset" user
+// choice must not strip a recipe-provided flag).
 function mergeCliArgs(baseArgv, overrides) {
   const argv = baseArgv.slice();
   for (const ov of overrides) {
     const isBool = ov.present !== undefined;
+    if (!isBool && ov.value === undefined) continue;
     const keep = isBool ? ov.present : ov.value !== null;
     const repl = keep ? (isBool ? [ov.flag] : [ov.flag, String(ov.value)]) : [];
     let replaced = false;
@@ -3361,9 +3384,10 @@ function buildVllmArgs() {
       { flag: '--max-num-batched-tokens', value: String(a.max_num_batched_tokens || Math.max(a.max_model_len ?? 8192, 8192)) },
       { flag: '--tensor-parallel-size', value: tp > 1 ? String(tp) : null },
       { flag: '--pipeline-parallel-size', value: pp > 1 ? String(pp) : null },
-      // vLLM accepts only the fp8 family here; 'auto' means "no flag".
-      { flag: '--kv-cache-dtype', value: kv !== 'auto' ? kv : null },
-      { flag: '--quantization', value: a.quantization ? String(a.quantization) : null },
+      // vLLM accepts only the fp8 family here; 'auto' / empty quantization are
+      // "unset" choices, so the recipe's own flag (if any) is left as is.
+      { flag: '--kv-cache-dtype', value: kv !== 'auto' ? kv : undefined },
+      { flag: '--quantization', value: a.quantization ? String(a.quantization) : undefined },
       { flag: '--trust-remote-code', present: a.trust_remote_code !== false },
     ]);
   }
@@ -3371,7 +3395,7 @@ function buildVllmArgs() {
   if (isVllmFamilyEngine()) {
     const sp = a.speculative;
     if (sp && sp.enabled && (!specMethodNeedsModel(sp.method) || sp.model)) {
-      const cfg = { num_speculative_tokens: sp.num_tokens || 8, method: sp.method || 'dflash' };
+      const cfg = { method: sp.method || 'dflash', num_speculative_tokens: sp.num_tokens || 8 };
       if (specMethodNeedsModel(sp.method)) cfg.model = sp.model;
       argv = mergeCliArgs(argv, [{ flag: '--speculative-config', value: JSON.stringify(cfg) }]);
     }
