@@ -4067,6 +4067,31 @@ pub struct MeshNodeGpuInfo {
     pub utilization_percent: Option<f32>,
     pub driver_version: Option<String>,
     pub cuda_version: Option<String>,
+    /// PCI bus id as nvidia-smi prints it, e.g. "00000000:82:00.0" (32-bit domain).
+    #[serde(default)]
+    pub pci_bus_id: Option<String>,
+    #[serde(default)]
+    pub uuid: Option<String>,
+    #[serde(default)]
+    pub power_limit_w: Option<f32>,
+    #[serde(default)]
+    pub fan_speed_percent: Option<u8>,
+    /// Current (not max) PCIe link generation / lane width.
+    #[serde(default)]
+    pub pcie_link_gen: Option<u8>,
+    #[serde(default)]
+    pub pcie_link_width: Option<u8>,
+}
+
+/// One inter-GPU link from `nvidia-smi topo -m`; `a`/`b` are the node's GPU
+/// indices (same order as `MeshNodeInfo.gpus`), always `a < b`. `link` is
+/// "NVL" | "PIX" | "PXB" | "PHB" | "NODE" | "SYS" | "UNKNOWN".
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct MeshGpuLink {
+    pub a: u32,
+    pub b: u32,
+    pub link: String,
+    pub p2p_ok: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -4172,6 +4197,9 @@ pub struct MeshNodeInfo {
     /// `linux.proc.cpu_util`, `nvidia.nsys.gpu`) ktore peer moze uruchomic.
     /// Pusta lista = peer nie obsluguje multi-source profiling V2.
     pub profiling_collectors_available: Vec<String>,
+    /// Inter-GPU PCIe/NVLink topology of the node; empty when unknown.
+    #[serde(default)]
+    pub gpu_links: Vec<MeshGpuLink>,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]

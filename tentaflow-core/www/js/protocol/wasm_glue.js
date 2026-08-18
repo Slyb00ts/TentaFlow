@@ -2386,6 +2386,257 @@ export function encodeClusterUpdateRequest(cluster_id, name, description, strate
 }
 
 /**
+ * MessageBody::CodeStudioBody(SessionCloseRequest) — usuwa worktree, zostawia
+ * galaz.
+ * @param {string} workspace_id
+ * @param {string} session_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionCloseRequest(workspace_id, session_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionCloseRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionOpenRequest) — galaz jest wyprowadzana
+ * serwerowo, nie podawana z UI.
+ * @param {string} workspace_id
+ * @param {string} title
+ * @param {string} autonomy_mode
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionOpenRequest(workspace_id, title, autonomy_mode) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(title, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(autonomy_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionOpenRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::CodeStudioBody(SessionsListRequest) — sesje WOLAJACEGO w tym
+ * workspace; serwer filtruje po uzytkowniku, bez obejscia dla administratora.
+ * @param {string} workspace_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioSessionsListRequest(workspace_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioSessionsListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceArchiveRequest).
+ * @param {string} workspace_id
+ * @param {boolean} archived
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceArchiveRequest(workspace_id, archived) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceArchiveRequest(ptr0, len0, archived);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceCreateRequest). `members_json` to
+ * tablica JSON obiektow `{user_id, role}` (jak `members_json` w Project
+ * Studio); `secret_material` jedzie RAZ i nigdy nie wraca.
+ * @param {string} name
+ * @param {string} node_id
+ * @param {string} exec_mode
+ * @param {string | null | undefined} container_image
+ * @param {string} repo_kind
+ * @param {string | null | undefined} repo_url
+ * @param {string | null | undefined} repo_auth_kind
+ * @param {string | null | undefined} secret_material
+ * @param {string | null | undefined} ssh_host_fingerprint
+ * @param {string | null | undefined} default_branch
+ * @param {string} autonomy_ceiling
+ * @param {string} egress_policy
+ * @param {boolean} index_enabled
+ * @param {string} members_json
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceCreateRequest(name, node_id, exec_mode, container_image, repo_kind, repo_url, repo_auth_kind, secret_material, ssh_host_fingerprint, default_branch, autonomy_ceiling, egress_policy, index_enabled, members_json) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(exec_mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(container_image) ? 0 : passStringToWasm0(container_image, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ptr4 = passStringToWasm0(repo_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len4 = WASM_VECTOR_LEN;
+    var ptr5 = isLikeNone(repo_url) ? 0 : passStringToWasm0(repo_url, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len5 = WASM_VECTOR_LEN;
+    var ptr6 = isLikeNone(repo_auth_kind) ? 0 : passStringToWasm0(repo_auth_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len6 = WASM_VECTOR_LEN;
+    var ptr7 = isLikeNone(secret_material) ? 0 : passStringToWasm0(secret_material, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len7 = WASM_VECTOR_LEN;
+    var ptr8 = isLikeNone(ssh_host_fingerprint) ? 0 : passStringToWasm0(ssh_host_fingerprint, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len8 = WASM_VECTOR_LEN;
+    var ptr9 = isLikeNone(default_branch) ? 0 : passStringToWasm0(default_branch, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len9 = WASM_VECTOR_LEN;
+    const ptr10 = passStringToWasm0(autonomy_ceiling, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len10 = WASM_VECTOR_LEN;
+    const ptr11 = passStringToWasm0(egress_policy, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len11 = WASM_VECTOR_LEN;
+    const ptr12 = passStringToWasm0(members_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len12 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceCreateRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8, ptr9, len9, ptr10, len10, ptr11, len11, index_enabled, ptr12, len12);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v14 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v14;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceCreatorGrantSetRequest) — prawo
+ * zakladania workspace'ow, nadawane per uzytkownik.
+ * @param {string} user_id
+ * @param {boolean} granted
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceCreatorGrantSetRequest(user_id, granted) {
+    const ptr0 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceCreatorGrantSetRequest(ptr0, len0, granted);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceGetRequest) — szczegoly + czlonkowie +
+ * kroki provisioningu.
+ * @param {string} workspace_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceGetRequest(workspace_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceGetRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceMemberRemoveRequest).
+ * @param {string} workspace_id
+ * @param {string} user_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceMemberRemoveRequest(workspace_id, user_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceMemberRemoveRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceMemberSetRequest) — dodanie albo zmiana
+ * roli czlonka.
+ * @param {string} workspace_id
+ * @param {string} user_id
+ * @param {string} role
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceMemberSetRequest(workspace_id, user_id, role) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(user_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(role, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceMemberSetRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspaceRetryRequest) — wznowienie
+ * provisioningu; kroki `done` sa pomijane, wiec to wznowienie, nie przebudowa.
+ * @param {string} workspace_id
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspaceRetryRequest(workspace_id) {
+    const ptr0 = passStringToWasm0(workspace_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeCodeStudioWorkspaceRetryRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * MessageBody::CodeStudioBody(WorkspacesListRequest) — lista workspace'ow.
+ * @param {boolean} include_archived
+ * @returns {Uint8Array}
+ */
+export function encodeCodeStudioWorkspacesListRequest(include_archived) {
+    const ret = wasm.encodeCodeStudioWorkspacesListRequest(include_archived);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * @param {string | null} [status]
  * @param {string | null} [user_id]
  * @param {string | null} [addon_id]

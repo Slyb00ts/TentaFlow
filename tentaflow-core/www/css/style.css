@@ -3946,6 +3946,63 @@ textarea {
   display: flex; align-items: center; gap: 8px;
 }
 .gpu-summary svg { width: 14px; height: 14px; stroke: currentColor; fill: none; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+.gpu-info .gpu-line { display: flex; align-items: baseline; justify-content: space-between; gap: 10px; flex-wrap: wrap; }
+.gpu-info .gpu-line .gpu-meta { margin-top: 0; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+.gpu-vram { display: flex; align-items: center; gap: 10px; margin-top: 6px; }
+.gpu-vram tf-progress-bar { flex: 1; min-width: 80px; max-width: 220px; }
+.gpu-vram .gpu-vram-text { font-size: 11px; color: var(--text-2); white-space: nowrap; font-family: 'JetBrains Mono', ui-monospace, monospace; }
+
+/* GPU topology (pair chips, legend, selection hint, NxN matrix) — shared by
+   the deploy wizard and the mesh node detail. Six group colors cycle by index. */
+:root {
+  --gpu-group-0: #22c55e;
+  --gpu-group-1: #60a5fa;
+  --gpu-group-2: #f59e0b;
+  --gpu-group-3: #a78bfa;
+  --gpu-group-4: #06b6d4;
+  --gpu-group-5: #f472b6;
+}
+.gpu-pair-chip .tf-chip { text-transform: none; letter-spacing: normal; white-space: nowrap; }
+.gpu-pair-chip[data-gpu-group] .tf-chip {
+  background: color-mix(in srgb, var(--gpu-group-color) 16%, transparent);
+  color: var(--gpu-group-color);
+  border: 1px solid color-mix(in srgb, var(--gpu-group-color) 35%, transparent);
+}
+.gpu-pair-chip[data-gpu-group="0"] { --gpu-group-color: var(--gpu-group-0); }
+.gpu-pair-chip[data-gpu-group="1"] { --gpu-group-color: var(--gpu-group-1); }
+.gpu-pair-chip[data-gpu-group="2"] { --gpu-group-color: var(--gpu-group-2); }
+.gpu-pair-chip[data-gpu-group="3"] { --gpu-group-color: var(--gpu-group-3); }
+.gpu-pair-chip[data-gpu-group="4"] { --gpu-group-color: var(--gpu-group-4); }
+.gpu-pair-chip[data-gpu-group="5"] { --gpu-group-color: var(--gpu-group-5); }
+.gpu-topo-legend { font-size: 11px; color: var(--text-3); margin-top: 6px; line-height: 1.5; }
+.gpu-topo-hint { font-size: 12px; color: var(--text-2); margin-top: 4px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.gpu-topo-hint-slot:empty { display: none; }
+.gpu-topo-title { font-size: 12px; font-weight: 700; color: var(--text-2); margin: 14px 0 8px; text-transform: uppercase; letter-spacing: 0.06em; }
+.gpu-topo-matrix {
+  display: grid;
+  grid-template-columns: auto repeat(var(--gpu-topo-n), minmax(44px, 1fr));
+  gap: 3px; max-width: 640px; overflow-x: auto;
+}
+.gpu-topo-matrix .gpu-topo-head {
+  font-size: 10px; font-weight: 700; color: var(--text-3);
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  display: flex; align-items: center; justify-content: center; padding: 2px 6px;
+}
+.gpu-topo-matrix tf-tooltip, .gpu-topo-matrix .tf-tooltip-wrap { display: block; }
+.gpu-topo-cell {
+  font-size: 10px; font-weight: 700; text-align: center; padding: 6px 4px;
+  border-radius: 4px; font-family: 'JetBrains Mono', ui-monospace, monospace;
+  background: var(--bg-3); color: var(--text-3); border: 1px solid transparent;
+}
+.gpu-topo-cell.self { opacity: 0.4; }
+.gpu-topo-cell.link-nvl { background: rgba(34, 197, 94, 0.32); color: #4ade80; }
+.gpu-topo-cell.link-pix { background: rgba(34, 197, 94, 0.24); color: #4ade80; }
+.gpu-topo-cell.link-pxb { background: rgba(34, 197, 94, 0.17); color: #22c55e; }
+.gpu-topo-cell.link-phb { background: rgba(34, 197, 94, 0.11); color: #22c55e; }
+.gpu-topo-cell.link-node { background: rgba(245, 158, 11, 0.16); color: #f59e0b; }
+.gpu-topo-cell.link-sys { background: rgba(239, 68, 68, 0.16); color: #ef4444; }
+.gpu-topo-cell.no-p2p { border-color: rgba(239, 68, 68, 0.6); border-style: dashed; }
+.nd-gpu .gc-title-wrap .gpu-pair-chip { margin-left: 6px; vertical-align: middle; }
 
 /* =============================================================================
    Meeting Bot — per-meeting container app
@@ -5372,7 +5429,8 @@ tf-screen {
   margin-right: 8px; vertical-align: middle;
 }
 .nd-gpu .gc-name { font-size: 13px; font-weight: 700; color: var(--text); display: inline; vertical-align: middle; }
-.nd-gpu .gc-vendor { font-size: 11px; color: var(--text-3); margin-top: 4px; font-family: 'JetBrains Mono', 'SF Mono', monospace; }
+.nd-gpu .gc-pcie { font-size: 11px; color: var(--text-3); margin-top: 4px; font-family: 'JetBrains Mono', 'SF Mono', monospace; white-space: nowrap; }
+.nd-gpu .gc-vendor { font-size: 11px; color: var(--text-3); margin-top: 2px; font-family: 'JetBrains Mono', 'SF Mono', monospace; }
 .nd-gpu .gc-actions { display: flex; gap: 4px; flex-shrink: 0; }
 .nd-gpu .gc-meters { display: flex; flex-direction: column; gap: 12px; }
 .nd-gpu .gc-foot {

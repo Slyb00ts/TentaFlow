@@ -235,6 +235,11 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
                         power_draw_w: None,
                         power_limit_w: None,
                         vendor,
+                        pci_bus_id: None,
+                        uuid: None,
+                        fan_speed_percent: None,
+                        pcie_link_gen: None,
+                        pcie_link_width: None,
                     }
                 })
                 .collect()
@@ -410,7 +415,25 @@ pub fn collect_node_info(node_id: &str) -> NodeInfo {
         cpu_count,
         ram_total_mb,
         gpu_info,
+        gpu_links: local_gpu_links(),
     }
+}
+
+/// Inter-GPU topology of this host as mesh wire rows (`a < b`), from the
+/// process-cached `nvidia-smi topo` probe. Empty without NVIDIA GPUs.
+pub fn local_gpu_links() -> Vec<crate::mesh::peer_store::PeerGpuLink> {
+    crate::services::deploy::gpu_topology::host_topology()
+        .map(|t| {
+            t.pairs()
+                .map(|(a, b, link, p2p_ok)| crate::mesh::peer_store::PeerGpuLink {
+                    a,
+                    b,
+                    link: link.as_str().to_string(),
+                    p2p_ok,
+                })
+                .collect()
+        })
+        .unwrap_or_default()
 }
 
 /// Biezace metryki systemu — CPU usage, RAM used, GPU usage
@@ -596,6 +619,11 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
                         power_draw_w: e.power_draw,
                         power_limit_w: e.power_limit,
                         vendor: crate::mesh::peer_store::GpuVendor::Nvidia,
+                        pci_bus_id: e.pci_bus_id,
+                        uuid: e.uuid,
+                        fan_speed_percent: e.fan_speed,
+                        pcie_link_gen: e.pcie_gen,
+                        pcie_link_width: e.pcie_width,
                     }
                 })
                 .collect();
@@ -650,11 +678,17 @@ pub(super) struct NvidiaEntry {
     pub temp: u32,
     pub power_draw: Option<f32>,
     pub power_limit: Option<f32>,
+    /// As printed by nvidia-smi ("00000000:82:00.0"), no normalisation.
+    pub pci_bus_id: Option<String>,
+    pub uuid: Option<String>,
+    pub fan_speed: Option<u8>,
+    pub pcie_gen: Option<u8>,
+    pub pcie_width: Option<u8>,
 }
 
 /// Parser czystego stdoutu z `nvidia-smi --query-gpu=...,--format=csv,noheader,nounits`.
-/// Wydzielony zeby byl testowalny bez spawnowania procesu. Tolerujacy: wiersze 5/6/7 pol,
-/// wartosci `[N/A]` (typowe dla unified-memory GB10) traktowane jak 0.
+/// Wydzielony zeby byl testowalny bez spawnowania procesu. Tolerujacy: wiersze 5..13 pol,
+/// wartosci `[N/A]` (typowe dla unified-memory GB10) traktowane jak 0/None.
 pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
     stdout
         .lines()
@@ -672,6 +706,17 @@ pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
                 temp: parts[4].parse().unwrap_or(0),
                 power_draw: parts.get(5).and_then(|s| s.parse().ok()),
                 power_limit: parts.get(6).and_then(|s| s.parse().ok()),
+                pci_bus_id: parts
+                    .get(7)
+                    .filter(|s| !s.is_empty() && !s.starts_with('['))
+                    .map(|s| s.to_string()),
+                uuid: parts
+                    .get(8)
+                    .filter(|s| !s.is_empty() && !s.starts_with('['))
+                    .map(|s| s.to_string()),
+                fan_speed: parts.get(9).and_then(|s| s.parse().ok()),
+                pcie_gen: parts.get(10).and_then(|s| s.parse().ok()),
+                pcie_width: parts.get(11).and_then(|s| s.parse().ok()),
             })
         })
         .collect()
@@ -683,7 +728,7 @@ pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
 pub(super) fn query_nvidia_smi() -> Vec<NvidiaEntry> {
     let output = match std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,power.limit",
+            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,power.limit,pci.bus_id,uuid,fan.speed,pcie.link.gen.current,pcie.link.width.current",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -722,6 +767,11 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
             gpu.temperature_c = nv.temp;
             gpu.power_draw_w = nv.power_draw;
             gpu.power_limit_w = nv.power_limit;
+            gpu.pci_bus_id = nv.pci_bus_id.clone();
+            gpu.uuid = nv.uuid.clone();
+            gpu.fan_speed_percent = nv.fan_speed;
+            gpu.pcie_link_gen = nv.pcie_gen;
+            gpu.pcie_link_width = nv.pcie_width;
 
             // Unified memory GPU (np. DGX Spark GB10) — nvidia-smi zwraca [N/A] dla VRAM.
             // Wtedy VRAM = RAM systemowy (wspoldzielona pamiec CPU/GPU).
@@ -1759,6 +1809,26 @@ mod nvidia_smi_tests {
         assert_eq!(e.temp, 62);
         assert_eq!(e.power_draw, Some(250.5));
         assert_eq!(e.power_limit, Some(450.0));
+    }
+
+    #[test]
+    fn parses_identity_and_pcie_fields() {
+        let out = "NVIDIA GeForce RTX 3090, 24576, 1024, 35, 62, 250.5, 350.0, 00000000:82:00.0, GPU-abc-123, 30, 4, 16\n\
+NVIDIA GB10, [N/A], [N/A], 12, 55, [N/A], [N/A], [N/A], GPU-def, [N/A], [N/A], [N/A]\n";
+        let entries = parse_nvidia_smi_output(out);
+        assert_eq!(entries.len(), 2);
+        let e = &entries[0];
+        assert_eq!(e.pci_bus_id.as_deref(), Some("00000000:82:00.0"));
+        assert_eq!(e.uuid.as_deref(), Some("GPU-abc-123"));
+        assert_eq!(e.fan_speed, Some(30));
+        assert_eq!(e.pcie_gen, Some(4));
+        assert_eq!(e.pcie_width, Some(16));
+        let e = &entries[1];
+        assert_eq!(e.pci_bus_id, None);
+        assert_eq!(e.uuid.as_deref(), Some("GPU-def"));
+        assert_eq!(e.fan_speed, None);
+        assert_eq!(e.pcie_gen, None);
+        assert_eq!(e.pcie_width, None);
     }
 
     #[test]

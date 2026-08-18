@@ -3163,7 +3163,27 @@ fn all_gpus_to_proto(gpus: &[StoreGpu]) -> Vec<tentaflow_protocol::MeshNodeGpuIn
                 utilization_percent: Some(g.usage_percent),
                 driver_version: None,
                 cuda_version: None,
+                pci_bus_id: g.pci_bus_id.clone(),
+                uuid: g.uuid.clone(),
+                power_limit_w: g.power_limit_w,
+                fan_speed_percent: g.fan_speed_percent,
+                pcie_link_gen: g.pcie_link_gen,
+                pcie_link_width: g.pcie_link_width,
             }
+        })
+        .collect()
+}
+
+fn gpu_links_to_proto(
+    links: &[crate::mesh::peer_store::PeerGpuLink],
+) -> Vec<tentaflow_protocol::MeshGpuLink> {
+    links
+        .iter()
+        .map(|l| tentaflow_protocol::MeshGpuLink {
+            a: l.a,
+            b: l.b,
+            link: l.link.clone(),
+            p2p_ok: l.p2p_ok,
         })
         .collect()
 }
@@ -3279,6 +3299,15 @@ async fn store_peer_to_proto(
         p.profiling_collectors_available.clone()
     };
 
+    // The local peer_store row is seeded from NodeInfo at startup, but the
+    // host probe is the source of truth here; remote rows carry what the peer
+    // sent in its NodeInfo.
+    let gpu_links = if is_local {
+        gpu_links_to_proto(&crate::mesh::node_info_collector::local_gpu_links())
+    } else {
+        gpu_links_to_proto(&p.gpu_links)
+    };
+
     tentaflow_protocol::MeshNodeInfo {
         node_id: p.node_id.clone(),
         hostname: p.hostname.clone(),
@@ -3304,6 +3333,7 @@ async fn store_peer_to_proto(
         nsys_available,
         nsys_version,
         profiling_collectors_available,
+        gpu_links,
     }
 }
 
@@ -3440,6 +3470,7 @@ pub async fn mesh_node_list(
                 nsys_available: false,
                 nsys_version: String::new(),
                 profiling_collectors_available: Vec::new(),
+                gpu_links: Vec::new(),
             });
         }
         emitted.insert(node_id_hex);

@@ -13706,10 +13706,47 @@ fn mesh_node_info_to_js(n: tentaflow_protocol::MeshNodeInfo) -> js_sys::Object {
             set(&item, "cudaVersion", v.clone().into());
             set(&item, "cuda_version", v.clone().into());
         }
+        if let Some(ref v) = g.pci_bus_id {
+            set(&item, "pciBusId", v.clone().into());
+            set(&item, "pci_bus_id", v.clone().into());
+        }
+        if let Some(ref v) = g.uuid {
+            set(&item, "uuid", v.clone().into());
+        }
+        if let Some(v) = g.power_limit_w {
+            set(&item, "powerLimitW", v.into());
+            set(&item, "power_limit_w", v.into());
+        }
+        if let Some(v) = g.fan_speed_percent {
+            set(&item, "fanSpeedPercent", (v as f64).into());
+            set(&item, "fan_speed_percent", (v as f64).into());
+        }
+        if let Some(v) = g.pcie_link_gen {
+            set(&item, "pcieLinkGen", (v as f64).into());
+            set(&item, "pcie_link_gen", (v as f64).into());
+        }
+        if let Some(v) = g.pcie_link_width {
+            set(&item, "pcieLinkWidth", (v as f64).into());
+            set(&item, "pcie_link_width", (v as f64).into());
+        }
         gpu_arr.push(&item.into());
     }
     set(&obj, "gpus", gpu_arr.clone().into());
     set(&obj, "gpu_count", (gpu_arr.length() as u32).into());
+    let links_arr = js_sys::Array::new();
+    for l in &n.gpu_links {
+        let item = js_sys::Object::new();
+        set(&item, "a", (l.a as f64).into());
+        set(&item, "b", (l.b as f64).into());
+        set(&item, "link", l.link.clone().into());
+        if let Some(v) = l.p2p_ok {
+            set(&item, "p2pOk", v.into());
+            set(&item, "p2p_ok", v.into());
+        }
+        links_arr.push(&item.into());
+    }
+    set(&obj, "gpuLinks", links_arr.clone().into());
+    set(&obj, "gpu_links", links_arr.into());
     let models = js_sys::Array::new();
     for m in n.models {
         let item = js_sys::Object::new();

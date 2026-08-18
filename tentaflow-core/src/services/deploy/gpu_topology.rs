@@ -8,17 +8,22 @@ use std::sync::OnceLock;
 
 use super::LogSink;
 
-/// Interconnect class of one GPU pair, collapsed from the `nvidia-smi topo -m`
-/// cell to what the NCCL_P2P_LEVEL decision needs.
+/// Interconnect class of one GPU pair, the exact `nvidia-smi topo -m` cell
+/// (`NV#` collapsed to NVLink). The NCCL decision reduces it via `is_remote`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Link {
     /// `NV#` — NVLink; NCCL already picks the right transport, never override.
     NvLink,
-    /// `PIX` / `PXB` / `PHB` — same host bridge; NCCL's default P2P level covers it.
-    Local,
-    /// `NODE` / `SYS` — crosses a NUMA node or the QPI/UPI link; NCCL disables P2P
-    /// by default here even though the driver can route it.
-    Remote,
+    /// `PIX` — same PCIe switch.
+    Pix,
+    /// `PXB` — multiple PCIe bridges, no host bridge crossing.
+    Pxb,
+    /// `PHB` — same host bridge; NCCL's default P2P level still covers it.
+    Phb,
+    /// `NODE` — crosses PCIe host bridges within one NUMA node.
+    Node,
+    /// `SYS` — crosses the QPI/UPI link between NUMA nodes.
+    Sys,
     Unknown,
 }
 
@@ -29,11 +34,33 @@ impl Link {
             Link::NvLink
         } else {
             match c {
-                "PIX" | "PXB" | "PHB" => Link::Local,
-                "NODE" | "SYS" => Link::Remote,
+                "PIX" => Link::Pix,
+                "PXB" => Link::Pxb,
+                "PHB" => Link::Phb,
+                "NODE" => Link::Node,
+                "SYS" => Link::Sys,
                 _ => Link::Unknown,
             }
         }
+    }
+
+    /// Wire label shared with the mesh protocol (`MeshGpuLink.link`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Link::NvLink => "NVL",
+            Link::Pix => "PIX",
+            Link::Pxb => "PXB",
+            Link::Phb => "PHB",
+            Link::Node => "NODE",
+            Link::Sys => "SYS",
+            Link::Unknown => "UNKNOWN",
+        }
+    }
+
+    /// `NODE` / `SYS`: NCCL disables P2P by default here even though the driver
+    /// can route it — the only classes where `NCCL_P2P_LEVEL=SYS` helps.
+    fn is_remote(self) -> bool {
+        matches!(self, Link::Node | Link::Sys)
     }
 }
 
@@ -79,6 +106,21 @@ impl GpuTopology {
 
     fn p2p_ok(&self, a: u32, b: u32) -> bool {
         self.p2p_ok.get(&pair_key(a, b)).copied().unwrap_or(false)
+    }
+
+    /// Every known pair `(a, b, link, p2p_ok)` with `a < b`, ordered by index.
+    /// `p2p_ok` is `None` when the P2P matrix had no cell for the pair.
+    pub fn pairs(&self) -> impl Iterator<Item = (u32, u32, Link, Option<bool>)> + '_ {
+        let mut keys: Vec<(u32, u32)> = self.links.keys().copied().collect();
+        keys.sort_unstable();
+        keys.into_iter().map(move |(a, b)| {
+            (
+                a,
+                b,
+                self.link(a, b),
+                self.p2p_ok.get(&(a, b)).copied(),
+            )
+        })
     }
 }
 
@@ -199,14 +241,14 @@ pub fn nccl_p2p_level_for(topo: &GpuTopology, gpu_ids: &[u32]) -> Decision {
         for &b in &ids[i + 1..] {
             match topo.link(a, b) {
                 Link::NvLink => return Decision::Keep("NVLink present"),
-                Link::Remote => {
+                Link::Unknown => return Decision::Keep("unknown link class"),
+                link if link.is_remote() => {
                     if !topo.p2p_ok(a, b) {
                         return Decision::Keep("P2P unavailable on a NODE/SYS pair");
                     }
                     candidate.get_or_insert((a, b));
                 }
-                Link::Local => {}
-                Link::Unknown => return Decision::Keep("unknown link class"),
+                _ => {}
             }
         }
     }
@@ -291,10 +333,10 @@ pub fn apply_nccl_p2p_level_env(
         Decision::Set { pair, link } => {
             env.insert(NCCL_P2P_LEVEL.to_string(), "SYS".to_string());
             format!(
-                "[gpu] NCCL_P2P_LEVEL=SYS: GPU{} <-> GPU{} linked via {:?} with P2P available (gpus=[{}])",
+                "[gpu] NCCL_P2P_LEVEL=SYS: GPU{} <-> GPU{} linked via {} with P2P available (gpus=[{}])",
                 pair.0,
                 pair.1,
-                link,
+                link.as_str(),
                 join_ids(&ids)
             )
         }
@@ -402,11 +444,38 @@ Legend:\n";
     fn parses_real_nvidia_smi_output() {
         let t = GpuTopology::from_nvidia_smi(HAZAI_TOPO, HAZAI_P2P);
         assert_eq!(t.gpu_indices(), &[0, 1, 2]);
-        assert_eq!(t.link(0, 1), Link::Local);
-        assert_eq!(t.link(1, 0), Link::Local);
-        assert_eq!(t.link(0, 2), Link::Remote);
+        assert_eq!(t.link(0, 1), Link::Phb);
+        assert_eq!(t.link(1, 0), Link::Phb);
+        assert_eq!(t.link(0, 2), Link::Node);
         assert!(t.p2p_ok(0, 2));
         assert!(t.p2p_ok(2, 1));
+        let pairs: Vec<_> = t.pairs().collect();
+        assert_eq!(
+            pairs,
+            vec![
+                (0, 1, Link::Phb, Some(true)),
+                (0, 2, Link::Node, Some(true)),
+                (1, 2, Link::Node, Some(true)),
+            ]
+        );
+    }
+
+    #[test]
+    fn link_labels_and_pairs_without_p2p_matrix() {
+        for (cell, label) in [
+            ("NV1", "NVL"),
+            ("NV18", "NVL"),
+            ("PIX", "PIX"),
+            ("PXB", "PXB"),
+            ("PHB", "PHB"),
+            ("NODE", "NODE"),
+            ("SYS", "SYS"),
+            ("??", "UNKNOWN"),
+        ] {
+            assert_eq!(Link::parse(cell).as_str(), label, "{cell}");
+        }
+        let t = topo(&[(1, 0, "PIX")], &[]);
+        assert_eq!(t.pairs().collect::<Vec<_>>(), vec![(0, 1, Link::Pix, None)]);
     }
 
     #[test]
@@ -438,7 +507,7 @@ Legend:\n";
             nccl_p2p_level_for(&t, &[0, 1, 2]),
             Decision::Set {
                 pair: (0, 2),
-                link: Link::Remote
+                link: Link::Node
             }
         );
         assert_eq!(
@@ -477,7 +546,7 @@ Legend:\n";
             Decision::Keep("P2P unavailable on a NODE/SYS pair")
         );
         let missing = topo(&[(0, 1, "SYS")], &[]);
-        assert_eq!(missing.link(0, 1), Link::Remote);
+        assert_eq!(missing.link(0, 1), Link::Sys);
         assert!(nccl_p2p_level_for(&missing, &[0, 1]).env_value().is_none());
     }
 

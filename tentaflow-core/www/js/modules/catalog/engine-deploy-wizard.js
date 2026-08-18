@@ -15,6 +15,8 @@ import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
 import { deployIcon, render as renderIcon } from '/js/modules/catalog/catalog-icons.js';
 import { isCameraCvEngineId } from '/js/modules/catalog/camera-cv-bundles.js';
+import { computeGpuGroups, gpuPairChipHtml, gpuTopologyLegendHtml, selectionLinkHintHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
+import '/js/components/tf-progress-bar.js';
 
 let currentStep = 1;
 let engineEntry = null;
@@ -2730,6 +2732,22 @@ function fmtMb(mb) {
   return `${Math.round(n)} MB`;
 }
 
+function fmtGb(mb) {
+  const gb = (Number(mb) || 0) / 1024;
+  return gb >= 10 ? String(Math.round(gb)) : gb.toFixed(1);
+}
+
+function nodeGpuLinks(nodeId) {
+  const node = nodes.find((n) => n && (n.node_id || n.id) === nodeId);
+  return Array.isArray(node?.gpu_links) ? node.gpu_links : [];
+}
+
+function vramTone(pct) {
+  if (pct <= 50) return 'success';
+  if (pct <= 80) return 'warning';
+  return 'danger';
+}
+
 function vendorStatus(vendor) {
   const v = String(vendor || '').toLowerCase();
   if (v.includes('nvidia')) return 'accent';
@@ -2744,7 +2762,13 @@ function gpuSummaryText(gpus) {
   const ids = new Set(selection.gpuIds);
   const chosen = gpus.filter((_, idx) => ids.has(String(idx)));
   const totalVram = chosen.reduce((s, g) => s + (g.vram_total_mb || 0), 0);
-  return I18n.t('wizard.gpu_summary_specific', { n: chosen.length, total_vram: fmtMb(totalVram) });
+  let text = I18n.t('wizard.gpu_summary_specific', { n: chosen.length, total_vram: fmtMb(totalVram) });
+  const known = chosen.filter((g) => g.vram_used_mb != null && g.vram_total_mb);
+  if (known.length > 0) {
+    const free = known.reduce((s, g) => s + Math.max(0, g.vram_total_mb - g.vram_used_mb), 0);
+    text += ` · ${I18n.t('wizard.gpu_summary_free', { free_vram: fmtMb(free) })}`;
+  }
+  return text;
 }
 
 function renderStepGpu() {
@@ -2759,14 +2783,30 @@ function renderStepGpu() {
   const icoSpec = `<svg viewBox="0 0 24 24"><path d="M12 2l3.09 6.26L22 9.27l-5 4.87 1.18 6.88L12 17.77l-6.18 3.25L7 14.14 2 9.27l6.91-1.01z"/></svg>`;
   const icoCpu = `<svg viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></svg>`;
 
+  const gpuLinks = nodeGpuLinks(selection.nodeId);
+  const topology = computeGpuGroups(gpus.length, gpuLinks);
+
   const rows = gpus.map((g, idx) => {
+    const pcie = (g.pcie_link_gen != null && g.pcie_link_width != null)
+      ? `PCIe Gen${g.pcie_link_gen} x${g.pcie_link_width}`
+      : '';
     const meta = [
-      `${fmtMb(g.vram_total_mb)} VRAM`,
-      g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
+      g.pci_bus_id ? shortPciBusId(g.pci_bus_id) : '',
+      pcie,
       g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '',
-      g.driver_version ? `driver ${escapeHtml(String(g.driver_version))}` : '',
+      g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
     ].filter(Boolean);
     const metaHtml = meta.map((m, i) => i < meta.length - 1 ? `<span>${escapeHtml(m)}</span><span class="sep">·</span>` : `<span>${escapeHtml(m)}</span>`).join(' ');
+    const total = Number(g.vram_total_mb) || 0;
+    let vramHtml;
+    if (total > 0 && g.vram_used_mb != null) {
+      const used = Math.min(total, Math.max(0, Number(g.vram_used_mb) || 0));
+      const pct = Math.round((used / total) * 100);
+      const text = I18n.t('wizard.gpu_vram_line', { used: fmtGb(used), total: fmtGb(total), free: fmtGb(total - used) });
+      vramHtml = `<tf-progress-bar size="sm" value="${pct}" tone="${vramTone(pct)}"></tf-progress-bar><span class="gpu-vram-text">${escapeHtml(text)}</span>`;
+    } else {
+      vramHtml = `<span class="gpu-vram-text">${escapeHtml(`${fmtMb(total)} VRAM`)}</span>`;
+    }
     const selected = selectedSet.has(String(idx));
     const vendor = String(g.vendor || '').toLowerCase();
     let brandClass = 'other';
@@ -2778,9 +2818,13 @@ function renderStepGpu() {
       <div class="gpu-row${selected ? ' selected' : ''}" data-gpu-idx="${idx}" role="checkbox" aria-checked="${selected}" tabindex="0">
         <div class="gpu-check"></div>
         <div class="gpu-info">
-          <div class="gpu-name"><span class="gpu-idx">GPU ${idx} ·</span> ${escapeHtml(String(g.name || ''))}</div>
-          <div class="gpu-meta">${metaHtml}</div>
+          <div class="gpu-line">
+            <div class="gpu-name"><span class="gpu-idx">GPU ${idx} ·</span> ${escapeHtml(String(g.name || ''))}</div>
+            <div class="gpu-meta">${metaHtml}</div>
+          </div>
+          <div class="gpu-vram">${vramHtml}</div>
         </div>
+        ${gpuPairChipHtml(idx, topology)}
         <span class="gpu-brand ${brandClass}">${escapeHtml(String(brandLabel))}</span>
       </div>
     `;
@@ -2814,6 +2858,8 @@ function renderStepGpu() {
     <div class="gpu-list" ${listHidden}>
       <div class="gpu-list-hint">${escapeHtml(I18n.t('wizard.gpu_list_hint', { n: gpus.length }))}</div>
       ${rows}
+      ${topology.hasLinks ? gpuTopologyLegendHtml() : ''}
+      <div class="gpu-topo-hint-slot">${selectionLinkHintHtml(gpuLinks, selection.gpuIds)}</div>
     </div>
 
     <div class="gpu-summary">${iconSummary}<span>${escapeHtml(gpuSummaryText(gpus))}</span></div>
@@ -2847,6 +2893,8 @@ function bindStepGpuInputs() {
     row.setAttribute('aria-checked', set.has(idx) ? 'true' : 'false');
     const box = document.querySelector('.gpu-summary span:last-child');
     if (box) box.textContent = gpuSummaryText(nodeGpus(selection.nodeId));
+    const hintSlot = document.querySelector('.gpu-list .gpu-topo-hint-slot');
+    if (hintSlot) hintSlot.innerHTML = selectionLinkHintHtml(nodeGpuLinks(selection.nodeId), selection.gpuIds);
   };
   document.querySelectorAll('.gpu-list .gpu-row[data-gpu-idx]').forEach((row) => {
     row.addEventListener('click', () => toggleGpu(row));

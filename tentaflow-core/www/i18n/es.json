@@ -1,4 +1,16 @@
 {
+  "gpu_topology": {
+    "title": "Topología de GPU",
+    "pair": "Par {letter} · {link}",
+    "no_pair": "sin par",
+    "no_pair_tip": "conectada al resto por NODE/SYS",
+    "legend": "Pares PHB/PIX/PXB/NVLink = enlace P2P rápido (mejor opción para TP), NODE/SYS = a través de la CPU.",
+    "selection_hint": "{fast} {fast|par rápido|pares rápidos}, {slow} {slow|enlace|enlaces} a través de la CPU",
+    "no_p2p": "sin P2P",
+    "cell_tip": "GPU{a} ↔ GPU{b}: {link}, P2P: {p2p}",
+    "p2p_yes": "sí",
+    "p2p_no": "no"
+  },
   "project_studio": {
     "title": "Proyectos",
     "refresh": "Actualizar",
@@ -4179,6 +4191,8 @@
     "gpu_empty_on_node": "Este nodo no reporta ninguna GPU.",
     "gpu_select_at_least_one": "Selecciona al menos una GPU o elige otro modo.",
     "gpu_summary_specific": "Seleccionadas {n} GPU(s) · {total_vram} VRAM total",
+    "gpu_summary_free": "{free_vram} libres",
+    "gpu_vram_line": "{used} / {total} GB · {free} GB libres",
     "gpu_summary_all": "Se usarán todas las GPUs del nodo",
     "gpu_summary_none": "No se usará GPU",
     "gpu_mode_all_title": "Usar todas",
