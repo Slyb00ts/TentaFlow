@@ -3339,7 +3339,7 @@ pub fn set_model_alias_active_audited(
 /// transaction. Used by the addon install path to keep the gated-alias
 /// deactivate inside the same tx as the create/reactivate above.
 pub fn set_model_alias_active_audited_within_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     alias: &str,
     is_active: bool,
     changed_by_addon_id: Option<&str>,

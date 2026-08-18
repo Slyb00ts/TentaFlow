@@ -4,7 +4,7 @@
 // =============================================================================
 
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use tracing::{debug, info, warn};
 
 use crate::crypto;
@@ -132,6 +132,7 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_default_flows(&tx)?;
     seed_camera_analysis_flow(&tx)?;
     seed_camera_cv_aliases(&tx)?;
+    seed_platform_rag_aliases(&tx)?;
     seed_camera_cv_pipeline(&tx)?;
     seed_harness_flows(&tx)?;
     seed_code_harness_flows(&tx)?;
@@ -1245,6 +1246,106 @@ fn seed_camera_analysis_flow(conn: &Connection) -> Result<()> {
     )?;
     if inserted > 0 {
         info!("seed: utworzono domyslny flow analizy kamery '{}'", NAME);
+    }
+    Ok(())
+}
+
+/// Aliasy platformowe RAG. Do tej pory deklarowal je manifest addona `rag`, przez
+/// co addon byl ich WLASCICIELEM — a `deactivate_aliases_owned_by_addon` wylacza
+/// aliasy addona nie tylko przy deinstalacji, ale takze gdy zniknie jego ostatnia
+/// instancja. Zwykle zatrzymanie addona RAG gasilo wiec baze wiedzy Projektow i
+/// indeks Code Studio, ktore uzywaja `rag-embeddings` bezposrednio, z pominieciem
+/// addona. Teraz aliasy naleza do platformy: seed NIE tworzy wiersza w
+/// `model_alias_owners`, wiec zaden addon ich nie przejmie ani nie zdeaktywuje.
+///
+/// Widocznosc `public` jest WYMAGANA, nie kosmetyczna: addon konsumuje te aliasy
+/// przez `[[uses_alias]] required = true`, a `compute_uses_alias_status_within_tx`
+/// mapuje `private` na `denied` — czyli prywatny alias bez addonowego wlasciciela
+/// zablokowalby instalacje addona RAG.
+///
+/// Cel jest pusty, wiec alias startuje zaparkowany i admin podpina model recznie
+/// (Services -> Aliasy) — dokladnie jak dotad robil to `suggested_default = ""`.
+const PLATFORM_RAG_ALIASES: &[(&str, &str)] = &[
+    ("rag-embeddings", r#"["embed"]"#),
+    ("rag-llm", r#"["chat"]"#),
+    ("rag-reranker", r#"["rerank"]"#),
+    ("rag-parse", r#"["parse"]"#),
+    ("rag-page-elements", r#"["documents"]"#),
+    ("rag-table-structure", r#"["documents"]"#),
+    ("rag-graphic-elements", r#"["documents"]"#),
+    ("rag-ocr", r#"["documents"]"#),
+];
+
+/// Seeduje aliasy z [`PLATFORM_RAG_ALIASES`] i przenosi na platforme te, ktore
+/// istniejace instalacje maja jeszcze zapisane jako addonowe. Idempotentne.
+fn seed_platform_rag_aliases(conn: &Connection) -> Result<()> {
+    for (alias, methods) in PLATFORM_RAG_ALIASES {
+        // INSERT OR IGNORE: nie dotyka modelu podpietego przez admina.
+        conn.execute(
+            "INSERT OR IGNORE INTO model_aliases (alias, target_model, is_active, strategy, methods) \
+             VALUES (?1, '', 0, 'first_available', ?2)",
+            rusqlite::params![alias, methods],
+        )?;
+        let Some(alias_id): Option<i64> = conn
+            .query_row(
+                "SELECT id FROM model_aliases WHERE alias = ?1",
+                rusqlite::params![alias],
+                |r| r.get(0),
+            )
+            .optional()?
+        else {
+            continue;
+        };
+
+        // Bezwarunkowo `public` — to warunek poprawnosci (patrz doc powyzej), a nie
+        // preferencja, ktora admin moglby chciec zmienic.
+        conn.execute(
+            "INSERT INTO model_alias_visibility (alias_id, visibility, updated_at, updated_by_user_id) \
+             VALUES (?1, 'public', strftime('%s','now'), NULL) \
+             ON CONFLICT(alias_id) DO UPDATE SET \
+                 visibility = 'public', updated_at = excluded.updated_at",
+            rusqlite::params![alias_id],
+        )?;
+
+        // Migracja istniejacych instalacji: bez przepisania wiersza wlasciciela
+        // stary addon nadal deaktywowalby alias przy zatrzymaniu.
+        let dropped = conn.execute(
+            "UPDATE model_alias_owners SET owner_type = 'manual', owner_id = NULL \
+             WHERE alias_id = ?1 AND owner_type = 'addon'",
+            rusqlite::params![alias_id],
+        )?;
+        conn.execute(
+            "INSERT OR IGNORE INTO model_alias_owners (alias_id, owner_type, owner_id, created_at) \
+             VALUES (?1, 'manual', NULL, datetime('now'))",
+            rusqlite::params![alias_id],
+        )?;
+        if dropped > 0 {
+            info!("seed: alias '{}' przeniesiony z addona na platforme", alias);
+            // Alias zwiazany przez admina, ktory zostal zgaszony przez zatrzymanie
+            // addona, nie mial juz kogo reaktywowac — po zdjeciu wlasciciela nikt by
+            // go nie wlaczyl. Przywracamy tylko wiersze z realnym celem.
+            let target: String = conn.query_row(
+                "SELECT target_model FROM model_aliases WHERE id = ?1",
+                rusqlite::params![alias_id],
+                |r| r.get(0),
+            )?;
+            let is_active: i64 = conn.query_row(
+                "SELECT is_active FROM model_aliases WHERE id = ?1",
+                rusqlite::params![alias_id],
+                |r| r.get(0),
+            )?;
+            if !target.trim().is_empty() && is_active == 0 {
+                // Reaktywacja przechodzi przez helper, bo musi powtorzyc kontrole
+                // lancucha aliasow. Blad nie moze wywalic startu — alias zostaje
+                // zaparkowany, admin widzi go w Services.
+                match crate::db::repository::set_model_alias_active_audited_within_tx(
+                    conn, alias, true, None,
+                ) {
+                    Ok(()) => info!("seed: reaktywowano zwiazany alias '{}'", alias),
+                    Err(e) => warn!("seed: nie reaktywowano aliasu '{}': {}", alias, e),
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -2421,6 +2522,97 @@ fn generate_jwt_secret() -> String {
 #[cfg(test)]
 mod tests {
     use std::path::Path;
+
+    /// Aliasy RAG naleza do platformy, nie do addona: istnieja po samym seedzie
+    /// (bez instalacji addona), sa `public` i NIE maja wiersza wlasciciela.
+    /// Wlasciciel-addon oznaczalby, ze `deactivate_aliases_owned_by_addon` gasi je
+    /// przy zatrzymaniu addona — a `rag-embeddings` uzywaja bezposrednio Projekty
+    /// i Code Studio.
+    #[test]
+    fn platform_rag_aliases_are_seeded_public_and_unowned() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        for (alias, _) in super::PLATFORM_RAG_ALIASES {
+            let (id, target, visibility): (i64, String, String) = conn
+                .query_row(
+                    "SELECT a.id, a.target_model, v.visibility FROM model_aliases a \
+                     JOIN model_alias_visibility v ON v.alias_id = a.id WHERE a.alias = ?1",
+                    rusqlite::params![alias],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                )
+                .unwrap_or_else(|e| panic!("alias '{alias}' nie zaseedowany: {e}"));
+            assert!(
+                target.trim().is_empty(),
+                "alias '{alias}' ma startowac niezwiazany (admin podpina model)"
+            );
+            // `private` odrzucaloby konsumenta z [[uses_alias]] required=true
+            // (compute_uses_alias_status_within_tx -> "denied") i blokowalo install.
+            assert_eq!(visibility, "public", "alias '{alias}' musi byc public");
+            let owner_type: String = conn
+                .query_row(
+                    "SELECT owner_type FROM model_alias_owners WHERE alias_id = ?1",
+                    rusqlite::params![id],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("alias '{alias}' bez wiersza wlasciciela: {e}"));
+            // 'manual' chroni podwojnie: nie lapie sie w aliases_owned_by_addon
+            // (brak deaktywacji) i wywala guard przy probie przejecia przez addon.
+            assert_eq!(owner_type, "manual", "alias '{alias}' musi byc platformowy");
+        }
+    }
+
+    /// Migracja istniejacej instalacji: alias przejety kiedys przez addon (wlasciciel
+    /// + `private` + zgaszony przy stopie mimo podpietego modelu) wraca pod platforme
+    /// i ODZYSKUJE aktywnosc — inaczej po zdjeciu wlasciciela nie mialby juz kogo
+    /// wlaczyc i binding admina zostalby martwy na zawsze.
+    #[test]
+    fn legacy_addon_owned_alias_is_reclaimed_and_reactivated() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        {
+            let conn = pool.write().unwrap();
+            conn.execute(
+                "UPDATE model_aliases SET target_model = 'some-embed-model', is_active = 0 \
+                 WHERE alias = 'rag-embeddings'",
+                [],
+            )
+            .unwrap();
+            let id: i64 = conn
+                .query_row(
+                    "SELECT id FROM model_aliases WHERE alias = 'rag-embeddings'",
+                    [],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            conn.execute(
+                "UPDATE model_alias_visibility SET visibility = 'private' WHERE alias_id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            // Stan sprzed zmiany: wiersz wlasciciela wskazuje addona.
+            conn.execute(
+                "UPDATE model_alias_owners SET owner_type = 'addon', owner_id = 'rag' \
+                 WHERE alias_id = ?1",
+                rusqlite::params![id],
+            )
+            .unwrap();
+            super::seed_platform_rag_aliases(&conn).expect("re-seed");
+        }
+        let conn = pool.read().unwrap();
+        let (target, is_active, visibility, owner_type): (String, i64, String, String) = conn
+            .query_row(
+                "SELECT a.target_model, a.is_active, v.visibility, \
+                        (SELECT o.owner_type FROM model_alias_owners o WHERE o.alias_id = a.id) \
+                 FROM model_aliases a JOIN model_alias_visibility v ON v.alias_id = a.id \
+                 WHERE a.alias = 'rag-embeddings'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(target, "some-embed-model", "binding admina musi przetrwac");
+        assert_eq!(owner_type, "manual", "wlasnosc musi wrocic do platformy");
+        assert_eq!(visibility, "public");
+        assert_eq!(is_active, 1, "zwiazany alias musi wrocic do aktywnosci");
+    }
 
     /// Domyslny flow analizy kamery jest zaseedowany (active, camera_analysis) i
     /// jego graf realnie sie kompiluje (walidacja R1-R8 + topo sort) z rejestrem

@@ -102,69 +102,18 @@ display_name = "Zapis stanu instancji"
 description = "Zapis instancyjnego stanu KV (rezerwa pod cache zapytan RAG)."
 risk = "low"
 
-# --- Aliasy modeli wystawiane przez addon ---
-# suggested_default jest pusty dla wszystkich aliasow RAG: swieza instalacja
-# tworzy je ODPIETE (is_active=0), a admin podpina konkretny model recznie
-# (Services -> Aliasy). materialize_addon_aliases jest idempotentne i nie
-# nadpisuje recznych bindowan, wiec reinstall nie cofa wyboru admina.
-
-[[alias]]
-id = "rag-embeddings"
-display_name = "RAG — embeddingi"
-methods = ["embed"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-llm"
-display_name = "RAG — LLM"
-methods = ["chat"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-reranker"
-display_name = "RAG — reranker"
-methods = ["rerank"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-parse"
-display_name = "RAG — parsowanie dokumentow"
-methods = ["parse"]
-suggested_default = ""
-visibility = "private"
-
-# Detektory struktury strony (PARTIA 0 typed-surface Documents) — pod przyszle
-# nody page_detect_pages / table_structure / ocr_pages w flow-ingescie. Wzor rag-parse.
-[[alias]]
-id = "rag-page-elements"
-display_name = "RAG — elementy strony"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-table-structure"
-display_name = "RAG — struktura tabel"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-graphic-elements"
-display_name = "RAG — elementy graficzne"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-ocr"
-display_name = "RAG — OCR"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
+# --- Aliasy modeli: WLASNOSC PLATFORMY, nie addona ---
+# Aliasy `rag-*` seeduje rdzen (`db/seed.rs::seed_platform_rag_aliases`) i to on jest
+# ich wlascicielem. Addon deklaruje je WYLACZNIE ponizej jako `[[uses_alias]]`.
+#
+# Dlaczego nie `[[alias]]`: wlasciciel-addon podlega
+# `deactivate_aliases_owned_by_addon`, ktore gasi aliasy takze przy zniknieciu
+# ostatniej instancji addona. `rag-embeddings` uzywaja bezposrednio Projekty i
+# Code Studio, wiec zatrzymanie tego addona wylaczalo im baze wiedzy. Alias bez
+# addonowego wlasciciela nie ma tego cyklu zycia.
+#
+# Aliasy platformowe sa `public` — addon wymaga ponizej `required = true`, a
+# `compute_uses_alias_status_within_tx` odrzuca `private` jako `denied`.
 
 # --- Aliasy konsumowane przez addon ---
 # rag-llm i rag-reranker sa dla query slice (Etap 1) — swiadomie required=false.
