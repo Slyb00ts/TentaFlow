@@ -3208,10 +3208,17 @@ const ENGINE_FLOW_STATE_KEY_PREFIX: &str = "engine_flow_model:";
 /// nazwie jest najpierw usuwany (kasuje też wiązanie przez ON DELETE CASCADE +
 /// jawnie), a potem tworzony od nowa ze świeżego JSON.
 fn register_engine_flows(db: &DbPool, manifest: &AddonManifest, addon_dir: &Path) -> Result<()> {
+    let addon_id = &manifest.addon_id;
+
+    // Najpierw sprzataj flowy USUNIETE z manifestu. Upgrade dotad tylko DODAWAL,
+    // wiec `[[engine_flow]]` skasowany w nowej wersji zostawal na zawsze — z zywym
+    // wiazaniem modelu, ktore nadal rozwiazywalo sie na nieaktualny graf.
+    prune_stale_engine_flows(db, manifest);
+
     if manifest.engine_flows.is_empty() {
+        crate::flow_engine::dispatcher::global_flow_dispatcher().map(|d| d.invalidate_cache());
         return Ok(());
     }
-    let addon_id = &manifest.addon_id;
 
     // Rejestr adapterów z globalnego dispatchera (w produkcji ustawiony przed
     // obsługą instalacji). Brak dispatchera (bardzo wczesny start / część
@@ -3353,6 +3360,60 @@ fn register_engine_flows(db: &DbPool, manifest: &AddonManifest, addon_dir: &Path
 /// tego samego pakietu (inny `addon_id` => inna nazwa). `manifest` instancji
 /// niesie listę `[[engine_flow]]`; gdy go nie ma (np. uszkodzony wpis), funkcja
 /// jest no-opem.
+/// Kasuje flowy addona, ktorych NIE MA juz w jego manifescie: wiersz flow,
+/// wiazanie modelu i klucz KV z published-name. Best-effort — blad sprzatania nie
+/// moze wywrocic instalacji, wiec kazdy krok tylko ostrzega.
+fn prune_stale_engine_flows(db: &DbPool, manifest: &AddonManifest) {
+    let addon_id = &manifest.addon_id;
+    let desired: std::collections::HashSet<String> = manifest
+        .engine_flows
+        .iter()
+        .map(|spec| engine_flow_published_name(addon_id, &spec.id))
+        .collect();
+    let existing = match crate::db::repository::list_engine_flow_published_names(db, addon_id) {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!("engine_flow prune: lista flow addona '{addon_id}': {e}");
+            return;
+        }
+    };
+    let store = crate::addon::state_store::AddonStateStore::global();
+    for published_name in existing {
+        if desired.contains(&published_name) {
+            continue;
+        }
+        match crate::db::repository::get_flow_id_by_published_model_name(db, &published_name) {
+            Ok(Some(flow_id)) => {
+                if let Err(e) = crate::db::repository::delete_flow_model_binding_for_pattern(
+                    db,
+                    &published_name,
+                ) {
+                    tracing::warn!("engine_flow prune: wiązanie '{published_name}': {e}");
+                }
+                if let Err(e) = crate::db::repository::delete_flow(db, &flow_id) {
+                    tracing::warn!("engine_flow prune: flow '{flow_id}': {e}");
+                }
+                tracing::info!("engine_flow prune: usunieto '{published_name}' (poza manifestem)");
+            }
+            Ok(None) => {}
+            Err(e) => tracing::warn!("engine_flow prune: lookup '{published_name}': {e}"),
+        }
+        // KV trzyma published-name pod `engine_flow_model:<local_id>`; local_id to
+        // czesc po dwukropku.
+        if let Some(local) = published_name.split_once(':').map(|(_, l)| l) {
+            store.delete(addon_id, &format!("{ENGINE_FLOW_STATE_KEY_PREFIX}{local}"));
+        }
+        // Legacy skrot wskazujacy PIERWSZY flow — jesli wskazywal usuwany, znika.
+        if store
+            .get(addon_id, ENGINE_FLOW_STATE_KEY)
+            .and_then(|b| String::from_utf8(b).ok())
+            .is_some_and(|v| v == published_name)
+        {
+            store.delete(addon_id, ENGINE_FLOW_STATE_KEY);
+        }
+    }
+}
+
 fn unregister_engine_flows(db: &DbPool, manifest: &AddonManifest) {
     let addon_id = &manifest.addon_id;
     for spec in &manifest.engine_flows {
@@ -3865,8 +3926,12 @@ service_type = "chat"
 
     /// Realny manifest addona RAG parsuje się z nową sekcją `[[engine_flow]]`
     /// (po `rewrite_manifest_for_instance`, bo pakietowe `[addon].id` to "rag").
+    /// Addon RAG nie jest wlascicielem flow ani aliasow — obie rzeczy naleza do
+    /// platformy (`seed_platform_rag_flows` / `seed_platform_rag_aliases`), zeby
+    /// zatrzymanie addona nie gasilo bazy wiedzy Projektow ani Code Studio, i zeby
+    /// istnial jeden flow ingestu zamiast dwoch implementacji.
     #[test]
-    fn rag_manifest_parses_with_engine_flow() {
+    fn rag_manifest_owns_no_flows_and_no_aliases() {
         let path = concat!(env!("CARGO_MANIFEST_DIR"), "/addons/rag/manifest.toml");
         let toml = std::fs::read_to_string(path).expect("manifest.toml istnieje");
         let rewritten = rewrite_manifest_for_instance(
@@ -3877,18 +3942,18 @@ service_type = "chat"
         )
         .expect("rewrite instancji");
         let m = parse_manifest_toml(&rewritten).expect("parse manifestu instancji RAG");
-        // Manifest RAG ma DWA engine-flow: `query` (chat) + `retrieval-round`
-        // (ciało pętli multi-hop). Inwariant: `query` MUSI być pierwszy, bo
-        // register_engine_flows zapisuje nazwę PIERWSZEGO do engine_flow_model.
-        assert_eq!(m.engine_flows.len(), 2);
-        assert_eq!(m.engine_flows[0].id, "query");
-        assert_eq!(m.engine_flows[0].service_type, "chat");
-        let flow_ids: Vec<&str> = m.engine_flows.iter().map(|f| f.id.as_str()).collect();
-        assert!(flow_ids.contains(&"query"), "engine_flows: {flow_ids:?}");
         assert!(
-            flow_ids.contains(&"retrieval-round"),
-            "engine_flows: {flow_ids:?}"
+            m.engine_flows.is_empty(),
+            "flowy RAG jada z platformy; [[engine_flow]] przywrocilby drugi komplet"
         );
+        assert!(
+            m.aliases.is_empty(),
+            "aliasy rag-* sa platformowe; [[alias]] oddalby je z powrotem addonowi \
+             i przywrocil deaktywacje przy jego zatrzymaniu"
+        );
+        // Konsument nadal deklaruje, czego uzywa — to zostaje.
+        let used: Vec<&str> = m.uses_aliases.iter().map(|u| u.id.as_str()).collect();
+        assert!(used.contains(&"rag-embeddings"), "uses_alias: {used:?}");
         // Przestrzeń 'passages' niesie pola text + collection_id (retrieval grounding).
         let passages = m
             .vector_namespaces
@@ -3901,22 +3966,6 @@ service_type = "chat"
             field_names.contains(&"collection_id"),
             "fields: {field_names:?}"
         );
-    }
-
-    /// Dołączony `query.flow.json` addona RAG przechodzi `validation::validate`
-    /// (R1–R10) na pełnym rejestrze adapterów — flow jest realnie wykonywalny.
-    #[test]
-    fn rag_query_flow_json_passes_validation() {
-        let path = concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/addons/rag/flows/query.flow.json"
-        );
-        let json = std::fs::read_to_string(path).expect("query.flow.json istnieje");
-        let def: crate::flow_engine::types::FlowDefinition =
-            serde_json::from_str(&json).expect("parsuje się do FlowDefinition");
-        let registry = crate::flow_engine::dispatcher::build_registry_for_test();
-        crate::flow_engine::validation::validate(&def, &registry)
-            .expect("query-flow musi przejść walidację R1–R10");
     }
 
     /// register_engine_flows tworzy flow z unikalną published-name + wiązanie
@@ -4000,8 +4049,54 @@ service_type = "chat"
         );
     }
 
+    /// Flow USUNIETY z manifestu znika razem z wiazaniem. Bez tego upgrade tylko
+    /// dodawal: skasowany `[[engine_flow]]` zostawal na zawsze, a jego wiazanie
+    /// nadal rozwiazywalo nazwe modelu na nieaktualny graf.
+    #[test]
+    fn engine_flow_dropped_from_manifest_is_pruned() {
+        let db = fresh_db();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("flows")).unwrap();
+        std::fs::write(
+            dir.path().join("flows/query.flow.json"),
+            minimal_engine_flow_json("query"),
+        )
+        .unwrap();
+        let head = "[addon]\nid = \"rag-bbbb\"\nname = \"RAG\"\nversion = \"0.1.0\"\n\
+                    wasm_file = \"addon.wasm\"\n";
+        let with_flow = format!(
+            "{head}[[engine_flow]]\nid = \"query\"\npath = \"flows/query.flow.json\"\n\
+             service_type = \"chat\"\n"
+        );
+        let name = "rag-bbbb:query";
+
+        let m1 = parse_manifest_toml(&with_flow).unwrap();
+        register_engine_flows(&db, &m1, dir.path()).unwrap();
+        assert!(
+            crate::db::repository::get_flow_for_model(&db, name)
+                .unwrap()
+                .is_some(),
+            "flow musi istniec po rejestracji"
+        );
+
+        // Nowa wersja manifestu juz go nie deklaruje.
+        let m2 = parse_manifest_toml(head).unwrap();
+        register_engine_flows(&db, &m2, dir.path()).unwrap();
+        assert!(
+            crate::db::repository::get_flow_for_model(&db, name)
+                .unwrap()
+                .is_none(),
+            "flow poza manifestem musi zniknac razem z wiazaniem"
+        );
+        let bindings = crate::db::repository::list_flow_model_bindings(&db).unwrap();
+        assert!(
+            !bindings.iter().any(|b| b.model_pattern == name),
+            "osierocone wiazanie zostalo"
+        );
+    }
+
     /// Bug 3 — rejestracja atomowa: po (re)rejestracji model jest ZAWSZE
-    /// rozwiązywalny (flow + wiązanie razem). Re-rejestracja podmienia komplet
+    /// rozwiązywalny (flow + wiązanie razem), a re-rejestracja aktualizuje komplet
     /// w jednej transakcji — brak okna „model niedostępny".
     #[test]
     fn engine_flow_registration_is_atomic_model_always_resolvable() {
@@ -4025,12 +4120,14 @@ service_type = "chat"
             .expect("model rozwiązywalny po 1. rejestracji")
             .id;
 
-        // Re-rejestracja: model dalej rozwiązywalny, ale to NOWY flow_id (podmiana).
+        // Re-rejestracja aktualizuje flow W MIEJSCU. Id MUSI zostać: `flow_executions`
+        // ma FK bez CASCADE, więc podmiana id zerwałaby historię wykonań
+        // (`register_engine_flow_atomic`, gałąź 1a).
         register_engine_flows(&db, &m, dir.path()).unwrap();
         let resolved2 = crate::db::repository::get_flow_for_model(&db, name)
             .unwrap()
             .expect("model rozwiązywalny po re-rejestracji");
-        assert_ne!(resolved2.id, id1, "re-rejestracja podmienia flow_id");
+        assert_eq!(resolved2.id, id1, "re-rejestracja zachowuje flow_id");
 
         // Dokładnie jedno wiązanie na ten wzorzec (brak duplikatów po podmianie).
         let bindings = crate::db::repository::list_flow_model_bindings(&db).unwrap();

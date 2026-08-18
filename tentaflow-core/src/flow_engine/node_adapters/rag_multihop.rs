@@ -823,41 +823,49 @@ mod tests {
 
     #[test]
     fn outer_query_flow_validates() {
-        let json = include_str!("../../../addons/rag/flows/query.flow.json");
+        let json = include_str!("../../../flows/rag/query.flow.json");
         validate_flow_json(json).expect("outer query.flow.json musi przejść R1-R10");
     }
 
     #[test]
     fn body_retrieval_round_flow_validates() {
-        let json = include_str!("../../../addons/rag/flows/retrieval_round.flow.json");
+        let json = include_str!("../../../flows/rag/retrieval_round.flow.json");
         validate_flow_json(json).expect("body retrieval_round.flow.json musi przejść R1-R10");
     }
 
     #[test]
     fn ingest_flow_validates() {
-        let json = include_str!("../../../addons/rag/flows/ingest.flow.json");
+        let json = include_str!("../../../flows/rag/ingest.flow.json");
         validate_flow_json(json).expect("ingest.flow.json musi przejść R1-R10");
     }
 
-    /// Outer flow naprawdę używa loop block z `body_flow_engine_id=retrieval_round`
-    /// i `max_iterations` <= twardego capu (anti-DoS). Asercja na realnej
-    /// konfiguracji, nie na opisie.
+    /// Outer flow naprawdę używa loop block wskazującego ciało przez STAŁE
+    /// `body_flow_id` i `max_iterations` <= twardego capu (anti-DoS). Asercja na
+    /// realnej konfiguracji, nie na opisie.
+    ///
+    /// `body_flow_engine_id` byłby tu błędem: składa nazwę `{addon}:{local}` i
+    /// wymaga `ctx.addon_id`, więc dla wołającego spoza addona (projekt) nigdy by
+    /// się nie rozwiązał.
     #[test]
     fn outer_flow_loop_config_is_capped_multihop() {
-        let json = include_str!("../../../addons/rag/flows/query.flow.json");
+        let json = include_str!("../../../flows/rag/query.flow.json");
         let def: crate::flow_engine::types::FlowDefinition = serde_json::from_str(json).unwrap();
         let loop_node = def
             .nodes
             .iter()
             .find(|n| n.node_type == "loop")
             .expect("outer flow ma węzeł loop");
+        assert!(
+            loop_node.config.get("body_flow_engine_id").is_none(),
+            "body_flow_engine_id wymaga tożsamości addona — flow platformowy jej nie ma"
+        );
         assert_eq!(
             loop_node
                 .config
-                .get("body_flow_engine_id")
+                .get("body_flow_id")
                 .and_then(|v| v.as_str()),
-            Some("retrieval-round"),
-            "loop wskazuje na body retrieval-round przez engine-flow id"
+            Some(crate::db::seed::RAG_RETRIEVAL_ROUND_FLOW_ID),
+            "loop wskazuje na zaseedowane ciało retrieval-round"
         );
         let max_iter = loop_node
             .config

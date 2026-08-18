@@ -7105,6 +7105,22 @@ pub fn create_flow_model_binding(
 /// `ON DELETE CASCADE`, więc skasowanie flow który już się wykonał (istnieją
 /// wiersze historii) naruszałoby FK przy upgrade używanej instancji. Zachowanie
 /// `id` utrzymuje historię wykonań spójną i pozwala bezpiecznie re-rejestrować
+/// Published-name'y wszystkich flow addona `addon_id` (prefiks `<addon_id>:`).
+/// Filtr po prefiksie liczony w Rust, nie przez `LIKE` — `_` jest w `LIKE`
+/// wieloznacznikiem, wiec id addona z podkresleniem dopasowywaloby cudze wiersze.
+pub fn list_engine_flow_published_names(pool: &DbPool, addon_id: &str) -> Result<Vec<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn
+        .prepare("SELECT published_model_name FROM flows WHERE published_model_name IS NOT NULL")?;
+    let prefix = format!("{addon_id}:");
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(std::result::Result::ok)
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    Ok(names)
+}
+
 /// nową treść `flow_json` (np. poprawiony retrieval-round).
 pub fn register_engine_flow_atomic(
     pool: &DbPool,

@@ -1264,6 +1264,8 @@ fn seed_camera_analysis_flow(conn: &Connection) -> Result<()> {
 ///
 /// Nazwa publikowana ma prefiks `core:`, wiec nie koliduje z `rag:*`, ktore addon
 /// rejestruje do czasu przejscia na te nazwy.
+pub(crate) const RAG_RETRIEVAL_ROUND_FLOW_ID: &str = "00000000-0000-4000-8000-000000000052";
+
 const PLATFORM_RAG_FLOWS: &[(&str, &str, &str, &str, &str)] = &[
     (
         "00000000-0000-4000-8000-000000000050",
@@ -1280,7 +1282,7 @@ const PLATFORM_RAG_FLOWS: &[(&str, &str, &str, &str, &str)] = &[
         include_str!("../../flows/rag/query.flow.json"),
     ),
     (
-        "00000000-0000-4000-8000-000000000052",
+        RAG_RETRIEVAL_ROUND_FLOW_ID,
         "core:rag-retrieval-round",
         "chat",
         "RAG — jeden hop retrievalu",
