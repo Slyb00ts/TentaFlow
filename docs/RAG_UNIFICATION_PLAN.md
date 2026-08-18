@@ -240,9 +240,26 @@ oznacza migrację danych addona i zmianę jego modelu synchronizacji — osobne 
 planu. Po tej zmianie identyczne są mechanizmy *wykonania* (limit, anulowanie), a różna zostaje
 *trwałość zlecenia*.
 
-### Etap 5 — jeden retrieval **[nowa blokada]**
+### Etap 5 — jeden retrieval **[CZĘŚCIOWO WYKONANE; przejście `ps-chat` zablokowane]**
 `retrieval_round` i `query` jako flowy systemowe; `project_knowledge` zostaje wyłącznie bramką
 (członkostwo + scope + delegacja), join nazw źródeł zostaje po stronie PS.
+
+**Zrobione:** `search_namespace` w `services/vector/doc_vectors.rs` — jeden prymityw otwarcia
+przestrzeni i k-NN, używany przez `knowledge::search` i węzeł `vector`. Rozjazd, który był powodem
+dwóch kopii, jest teraz jawnym parametrem: nieistniejąca przestrzeń to pusty wynik dla Projektów
+(projekt bez zaingestowanej wiedzy) i błąd dla węzła flow (graf pytający o przestrzeń, której nikt
+nie założył).
+
+**NIE zrobione — przejście `ps-chat` na platformowy `query` (pętla multi-hop z rerankiem i sędzią).**
+Trzy regresje, sprawdzone w definicjach flow, nie założone:
+1. węzeł `output` flow platformowego ma `emit_citations`, **nie streamuje**, a `ps-chat` jest
+   jawnie streamingowy;
+2. węzeł `answer` ma zaszyte `model: rag-llm`, więc wiązanie modelu czatu projektu byłoby
+   ignorowane;
+3. węzeł `reranker` wywala flow przy niezwiązanym `rag-reranker`, a ten alias i `rag-llm` startują
+   niezwiązane z założenia.
+
+Każda jest naprawialna, żadna po cichu — to osobna zmiana z tymi trzema warunkami wstępnymi.
 
 **Blokada zdjęta w Etapie 2** (§0.3): przejście `query` na `body_flow_id` ze stałym UUID rozwiązuje
 to samo dla Projektów — `loop_block.rs:134` nie jest już na ścieżce, bo `ps-<id>:retrieval-round`
