@@ -1648,28 +1648,78 @@ install_rocm() {
             fi
             ;;
         fedora)
-            # Nazwy pakietow ROCm na Fedorze sie zmieniaja miedzy wydaniami, wiec
-            # NIE hardcodujemy ich. Instalujemy to, co dostarcza konkretne
-            # biblioteki wymagane przy linkowaniu wariantu 'multi' llama.cpp
-            # (libamdhip64/librocblas/libhipblas) — przez `dnf whatprovides`.
-            # Dziala niezaleznie od dokladnej nazwy pakietu (Fedora pakuje ROCm
-            # w swoich repo od F36+).
-            log_info "Szukam pakietow ROCm dostarczajacych libamdhip64/librocblas/libhipblas..."
+            # Fedora ships ROCm in its own repos (F36+). Install the known set by
+            # NAME in one transaction — llama.cpp/whisper HIP builds need the HIP
+            # runtime + hipcc, hipBLAS/rocBLAS/hipBLASLt, device-libs and comgr —
+            # then verify the three link-time libraries and fill any gap through
+            # a fixed list of alternative package names (names drift between releases).
+            local rocm_pkgs=(
+                rocm-hip-devel
+                hipblas-devel
+                rocblas-devel
+                hipcc
+                rocm-device-libs
+                rocm-comgr-devel
+                rocminfo
+                rocm-cmake
+                hipblaslt-devel
+                rocm-runtime-devel
+            )
+            # dnf5 (F41+) has --skip-unavailable; dnf4 only knows --skip-broken.
+            local dnf_skip_flag="--skip-unavailable"
+            if ! dnf --version 2>/dev/null | head -1 | grep -q '^dnf5'; then
+                dnf_skip_flag="--skip-broken"
+            fi
+            local rocm_err
+            rocm_err="$(mktemp)"
+            local rocm_ok=true
+            log_info "Instalacja: ${rocm_pkgs[*]}"
+            log_info "(moze potrwac — dnf pobiera metadane repozytoriow)"
+            if ! run_privileged dnf install -y "$dnf_skip_flag" "${rocm_pkgs[@]}" </dev/null 2> >(tee "$rocm_err" >&2); then
+                rocm_ok=false
+                log_error "dnf install pakietow ROCm nie powiodl sie:"
+                tail -n 5 "$rocm_err" | while IFS= read -r line; do log_error "  $line"; done
+            fi
+
+            # Verify the libraries the 'multi' llama.cpp variant links against.
+            # No `repoquery --whatprovides "*/lib.so"` here: a file-path query makes
+            # dnf5 download the huge filelists metadata, which looks like a hang.
+            # For a missing lib we try a fixed list of alternative package names.
             local rocm_libs=(libamdhip64.so librocblas.so libhipblas.so)
-            local got=()
-            local lib pkg
+            local rocm_extra=()
+            local lib pkg alt_pkgs found
             for lib in "${rocm_libs[@]}"; do
-                pkg="$(dnf -y -q repoquery --whatprovides "*/$lib" </dev/null 2>/dev/null | head -1)"
-                if [ -n "$pkg" ]; then
-                    if run_privileged dnf install -y "$pkg"; then
-                        got+=("$pkg")
+                if ldconfig -p 2>/dev/null | grep -q "$lib" \
+                    || ls /usr/lib64/"$lib"* /opt/rocm/lib/"$lib"* &>/dev/null; then
+                    continue
+                fi
+                case "$lib" in
+                    libamdhip64.so) alt_pkgs=(rocm-hip-devel hip-devel hip-runtime-amd rocm-hip-runtime) ;;
+                    librocblas.so)  alt_pkgs=(rocblas-devel rocblas) ;;
+                    libhipblas.so)  alt_pkgs=(hipblas-devel hipblas) ;;
+                esac
+                found=false
+                for pkg in "${alt_pkgs[@]}"; do
+                    log_info "Brak $lib — probuje pakiet $pkg"
+                    if run_privileged dnf install -y "$pkg" </dev/null 2> >(tee "$rocm_err" >&2); then
+                        rocm_extra+=("$pkg")
+                        found=true
+                        break
                     fi
+                    tail -n 5 "$rocm_err" | while IFS= read -r line; do log_error "  $line"; done
+                done
+                if [ "$found" = false ]; then
+                    log_error "Nie udalo sie zainstalowac pakietu dostarczajacego $lib (probowano: ${alt_pkgs[*]})"
+                    rocm_ok=false
                 fi
             done
-            if [ ${#got[@]} -gt 0 ]; then
-                INSTALLED+=("rocm: ${got[*]}")
+            rm -f "$rocm_err"
+
+            if [ "$rocm_ok" = true ]; then
+                INSTALLED+=("rocm: ${rocm_pkgs[*]} ${rocm_extra[*]}")
             else
-                log_warn "ROCm nie znaleziony w repo Fedory. Dodaj repo AMD (repo.radeon.com)"
+                log_warn "ROCm nie zainstalowal sie w calosci — sprawdz bledy dnf powyzej"
+                log_warn "(brak repo, GPG, konflikty). Dodaj repo AMD (repo.radeon.com)"
                 log_warn "lub odpal z --no-rocm jesli ta maszyna nie ma karty AMD."
             fi
 
