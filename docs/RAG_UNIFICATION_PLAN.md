@@ -310,3 +310,35 @@ Stan zastany (sprawdzony, nie zakładany):
 Do rozstrzygnięcia przy podejmowaniu zadania: co robić, gdy agent ma ustawiony poziom, a model
 zostanie przepięty na taki, który go nie wspiera (zignorować, zdegradować do najbliższego, czy
 zablokować zapis).
+
+---
+
+## 9. Zadanie po §8: obserwowalność wzorowana na DeepSeek Harness
+
+Pełna analiza: [`ANALIZA_DEEPSEEK_HARNESS.md`](ANALIZA_DEEPSEEK_HARNESS.md). Tu tylko to, co z niej
+wchodzi do kolejki — **po** unifikacji RAG i po §8.
+
+Sedno: u nich **nie ma instrumentacji czasu**. Jest jeden append-only log zdarzeń z ciągłym `seq`
+i czasem, a `toolMs`, `ttftMs`, `decodeMs`, `llmMs` to **foldy po parach zdarzeń**. Z tego samego
+logu wynikają za darmo wznowienie, fork, wyszukiwanie i replay.
+
+Kolejność wg stosunku wartości do kosztu:
+
+1. **Log zdarzeń przebiegu z ciągłym `seq` i czasem** jako źródło prawdy. Dziś `flow_executions` +
+   `TraceStep` to „wiersz na przebieg" — nie da się z tego policzyć ani TTFT, ani czasu jednego
+   narzędzia. `flow_executions` zostaje jako indeks.
+2. **Metryki jako zapytania po logu, zero liczników w `node_adapters/*`.**
+3. **Rejestr składania promptu** zamiast promptu wklejonego w config węzła `llm` w seedzie — z
+   jawną kolejnością narzędzi i głośnym błędem przy złej konfiguracji, nie cichym przy generacji.
+4. **`timeout_ms` w deklaracji narzędzia + jeden wrapper egzekwujący.** Idle-timeout w
+   `code_studio/exec` rozwiązał ten sam problem punktowo.
+5. **Odrzucanie niezamkniętych wywołań narzędzi przy zamknięciu tury** w liczeniu czasu — inaczej
+   pierwsza awaria zatruwa statystyki na stałe.
+6. **Cykl życia notatek decyzyjnych** (`proposed`/`implemented`/`rejected`/`archived` × klasa,
+   zakodowane w ścieżce). Mamy `docs/*.md` bez statusu i klasyfikacji.
+7. **`Model Experience` / wpływ na cache KV w opisie każdego bloku flow** — u nas miejscem na to
+   jest opis węzła w palecie.
+
+Świadomie NIE kopiujemy: telemetrii bez reguł redakcji (ich kontrakt to at-most-once, a reguły
+należą do wdrożenia — Compliance Core wymaga więcej) ani Code Mode jako alternatywy dla function
+callingu; to osobna decyzja produktowa.
