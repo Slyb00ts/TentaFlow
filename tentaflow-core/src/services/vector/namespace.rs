@@ -166,6 +166,33 @@ fn namespace_file_path(org_id: &str, addon_id: &str, namespace: &str) -> Result<
         .join(format!("{namespace}.usearch")))
 }
 
+/// Waliduje katalog przekazany przez wolajacego pod utworzenie przestrzeni
+/// (`get_or_create_at` / `*_with_quota`). Musi byc bezwzgledny i wolny od `..` —
+/// sciezka sklada sie potem z nazwa pliku i laduje w `addon_vector_namespaces`
+/// jako trwale zrodlo prawdy o lokalizacji danych, wiec traversal zapisalby
+/// indeks poza obszarem danych na stale.
+///
+/// Wartosc jest emitowana przez serwer (rejestr projektow), nie przez wolajacego
+/// addona — to zabezpieczenie w glab, nie jedyna bariera.
+fn validate_custom_dir(dir: &Path) -> Result<()> {
+    if !dir.is_absolute() {
+        return Err(VectorError::Db(format!(
+            "vector namespace dir must be absolute: {}",
+            dir.display()
+        )));
+    }
+    if dir
+        .components()
+        .any(|c| matches!(c, std::path::Component::ParentDir))
+    {
+        return Err(VectorError::Db(format!(
+            "vector namespace dir must not contain '..': {}",
+            dir.display()
+        )));
+    }
+    Ok(())
+}
+
 /// Reserved per-addon config keys (set by an admin via the vector backend picker,
 /// keyed by addon_id == instance). Config is one structured JSON value; secrets
 /// (Milvus auth) stay as separate `is_secret` rows so redaction/export keep working.
@@ -757,7 +784,10 @@ impl NamespaceManager {
                 None => {
                     self.check_namespace_quota(org_id, addon_id)?;
                     let path = match create_dir {
-                        Some(dir) => dir.join(format!("{namespace}.usearch")),
+                        Some(dir) => {
+                            validate_custom_dir(dir)?;
+                            dir.join(format!("{namespace}.usearch"))
+                        }
                         None => self.file_path_for(org_id, addon_id, namespace)?,
                     };
                     self.insert_row(
@@ -821,6 +851,12 @@ impl NamespaceManager {
     /// succeed.
     ///
     /// Returns the new count for the namespace.
+    ///
+    /// `create_dir` dziala jak w [`Self::get_or_create_at`]: wskazuje katalog dla
+    /// przestrzeni, ktora jeszcze NIE istnieje (wlasciciel spoza drzewa addonow,
+    /// np. projekt). Dla istniejacego wiersza jest ignorowany — zrodlem prawdy o
+    /// lokalizacji zostaje zapisany `file_path`.
+    #[allow(clippy::too_many_arguments)]
     pub fn upsert_with_quota(
         &self,
         org_id: &str,
@@ -834,8 +870,9 @@ impl NamespaceManager {
         field_values: &[Field],
         sparse_flag: bool,
         sparse_value: Option<&SparseVector>,
+        create_dir: Option<&Path>,
     ) -> Result<u64> {
-        let backend = self.get_or_create(
+        let backend = self.get_or_create_inner(
             org_id,
             addon_id,
             namespace,
@@ -843,6 +880,7 @@ impl NamespaceManager {
             metric,
             field_specs,
             sparse_flag,
+            create_dir,
         )?;
         let is_replace = backend.has_ref(ref_id);
 
@@ -914,10 +952,11 @@ impl NamespaceManager {
         field_specs: &[FieldSpec],
         sparse_flag: bool,
         items: &[UpsertItem<'_>],
+        create_dir: Option<&Path>,
     ) -> Result<u64> {
         if items.is_empty() {
             return Ok(self
-                .get_or_create(
+                .get_or_create_inner(
                     org_id,
                     addon_id,
                     namespace,
@@ -925,11 +964,12 @@ impl NamespaceManager {
                     metric,
                     field_specs,
                     sparse_flag,
+                    create_dir,
                 )?
                 .count());
         }
 
-        let backend = self.get_or_create(
+        let backend = self.get_or_create_inner(
             org_id,
             addon_id,
             namespace,
@@ -937,6 +977,7 @@ impl NamespaceManager {
             metric,
             field_specs,
             sparse_flag,
+            create_dir,
         )?;
 
         // Count genuinely new ref_ids (replaces consume no quota). A duplicate
@@ -1567,6 +1608,7 @@ mod tests {
                 &[],
                 false,
                 None,
+                None,
             )
             .unwrap();
         assert_eq!(c1, 1);
@@ -1582,6 +1624,7 @@ mod tests {
                 &[],
                 &[],
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1626,6 +1669,7 @@ mod tests {
                 &[],
                 false,
                 &items,
+                None,
             )
             .unwrap();
         assert_eq!(c1, 3);
@@ -1641,6 +1685,7 @@ mod tests {
                 &[],
                 false,
                 &items,
+                None,
             )
             .unwrap();
         assert_eq!(c2, 3);
@@ -1671,6 +1716,7 @@ mod tests {
                 &[],
                 false,
                 &mixed,
+                None,
             )
             .unwrap();
         assert_eq!(c3, 4);
@@ -1709,6 +1755,7 @@ mod tests {
                 &values_inbox,
                 false,
                 None,
+                None,
             )
             .unwrap();
             mgr.upsert_with_quota(
@@ -1722,6 +1769,7 @@ mod tests {
                 &specs,
                 &values_web,
                 false,
+                None,
                 None,
             )
             .unwrap();
@@ -1792,6 +1840,7 @@ mod tests {
                 value: FieldValue::Str("inbox".to_string()),
             }],
             false,
+            None,
             None,
         )
         .unwrap();
@@ -1940,6 +1989,7 @@ mod tests {
             &[],
             false,
             None,
+            None,
         )
         .unwrap();
         {
@@ -1964,8 +2014,99 @@ mod tests {
                 &[],
                 false,
                 None,
+                None,
             )
             .unwrap_err();
         assert!(matches!(err, VectorError::VectorQuotaExceeded { .. }));
+    }
+
+    /// `create_dir` w scieżce quota-upsert tworzy przestrzen U SIEBIE, a nie w
+    /// drzewie addonow — to jest cala mechanika, ktora pozwala jednemu flow
+    /// obsluzyc wlasciciela spoza tego drzewa (projekt).
+    #[test]
+    fn upsert_with_quota_creates_namespace_in_custom_dir() {
+        let (_dir, mgr) = mgr();
+        let home = TempDir::new().unwrap();
+        mgr.upsert_with_quota(
+            ORG_A,
+            "ps-proj1",
+            "passages",
+            1,
+            &[0.1, 0.2, 0.3],
+            3,
+            Metric::Cosine,
+            &[],
+            &[],
+            false,
+            None,
+            Some(home.path()),
+        )
+        .expect("upsert with custom dir");
+        assert!(
+            home.path().join("passages.usearch").exists(),
+            "indeks musi powstac we wskazanym katalogu"
+        );
+    }
+
+    /// Wiersz przestrzeni jest zrodlem prawdy o lokalizacji: gdy juz istnieje,
+    /// pozniejszy `create_dir` jest ignorowany. Inaczej dalo by sie rozszczepic
+    /// kolekcje na dwa pliki i "zgubic" zapisane wektory.
+    #[test]
+    fn existing_namespace_ignores_later_custom_dir() {
+        let (_dir, mgr) = mgr();
+        let first = TempDir::new().unwrap();
+        let second = TempDir::new().unwrap();
+        for (i, dir) in [(1u64, first.path()), (2u64, second.path())] {
+            mgr.upsert_with_quota(
+                ORG_A,
+                "ps-proj1",
+                "passages",
+                i,
+                &[0.1, 0.2, 0.3],
+                3,
+                Metric::Cosine,
+                &[],
+                &[],
+                false,
+                None,
+                Some(dir),
+            )
+            .expect("upsert");
+        }
+        assert!(first.path().join("passages.usearch").exists());
+        assert!(
+            !second.path().join("passages.usearch").exists(),
+            "drugi katalog nie moze przejac istniejacej przestrzeni"
+        );
+    }
+
+    /// Sciezka wzgledna i traversal sa odrzucane: `file_path` laduje w rejestrze
+    /// na trwale, wiec `..` zapisalby indeks poza obszarem danych na stale.
+    #[test]
+    fn custom_dir_rejects_relative_and_traversal() {
+        let (_dir, mgr) = mgr();
+        for bad in [
+            std::path::PathBuf::from("relative/dir"),
+            std::path::PathBuf::from("/data/projects/../../etc"),
+        ] {
+            let err = match mgr.get_or_create_at(
+                ORG_A,
+                "ps-proj1",
+                "passages",
+                3,
+                Metric::Cosine,
+                &[],
+                false,
+                &bad,
+            ) {
+                Ok(_) => panic!("zly katalog musi byc odrzucony: {}", bad.display()),
+                Err(e) => e,
+            };
+            assert!(
+                format!("{err}").contains("must be absolute")
+                    || format!("{err}").contains("must not contain"),
+                "nieoczekiwany blad: {err}"
+            );
+        }
     }
 }

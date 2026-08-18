@@ -355,6 +355,7 @@ impl NodeAdapter for StoreNodeAdapter {
             &field_specs,
             false,
             &items,
+            ctx.vector_home.as_deref(),
         ) {
             // Cleanup-on-failure: batch jest transakcyjny po stronie quoty i
             // robi jeden insert, ale gdyby częściowo zapisał (błąd backendu po

@@ -755,6 +755,7 @@ fn store_chunks_blocking(
         &specs,
         false,
         &items,
+        None,
     ) {
         // No partial ingest: best-effort delete of every ref of this file.
         if let Ok(backend) = mgr.get(org_id, &scope, VECTOR_NAMESPACE) {

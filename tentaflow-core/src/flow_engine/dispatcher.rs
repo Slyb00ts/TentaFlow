@@ -129,6 +129,10 @@ pub struct FlowRequestMeta {
     /// RAG E1.0 — organizacja-właściciel (`CallerContext.org_id`). `None` =>
     /// domyślny tenant rozwiązywany przy użyciu. Kopiowane do `ExecutionContext.org_id`.
     pub org_id: Option<String>,
+    /// Katalog dla NOWEJ przestrzeni wektorowej tego wywolania — patrz
+    /// `ExecutionContext::vector_home`. Osobne pole, nie klucz w `options`/meta:
+    /// caller-addon nie moze sterowac miejscem zapisu indeksu.
+    pub vector_home: Option<std::path::PathBuf>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
     /// §3.11 C — per-request progress fan-out. The caller (a handler holding
@@ -154,6 +158,7 @@ impl FlowRequestMeta {
             user_id: None,
             user_role: None,
             addon_id: None,
+            vector_home: None,
             org_id: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
@@ -252,6 +257,7 @@ impl ContextFactory {
             user_role: meta.user_role.clone(),
             addon_id: meta.addon_id.clone(),
             org_id: meta.org_id.clone(),
+            vector_home: meta.vector_home.clone(),
             deadline: meta.deadline,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: meta.cancel_token.clone(),

@@ -375,6 +375,7 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
         &[],
         false,
         None,
+        None,
     )
     .unwrap();
     {
@@ -401,6 +402,7 @@ fn upsert_with_quota_concurrent_at_cap_blocks_all_new_inserts() {
                 &[],
                 &[],
                 false,
+                None,
                 None,
             )
         }));

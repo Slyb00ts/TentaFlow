@@ -171,6 +171,19 @@ pub struct ExecutionContext {
     /// `with_root(tempdir)`.
     pub vectors: Arc<crate::services::vector::NamespaceManager>,
 
+    /// Katalog, w ktorym ma powstac przestrzen wektorowa tego wykonania, gdy
+    /// jeszcze nie istnieje. `None` => domyslne drzewo addonow. Ustawia go
+    /// wlasciciel spoza tego drzewa (Projekty: `<data>/projects/<id>/vectors`),
+    /// zeby generyczny `store`/`vector` zapisal dane u siebie zamiast w
+    /// katalogu addona.
+    ///
+    /// Trzymane TU, nie w `envelope.meta` — z tego samego powodu co
+    /// `subflow_depth` powyzej: meta jest zapisywalne przez kazdy node, w tym
+    /// blok addonu WASM, a to jest sciezka tworzenia pliku na dysku. Dla
+    /// istniejacej przestrzeni pole nie ma znaczenia (wygrywa zapisany
+    /// `file_path`), wiec nie da sie nim przekierowac juz zapisanych danych.
+    pub vector_home: Option<std::path::PathBuf>,
+
     /// RAG E1.1 — rejestr kolekcji grafowych `(org, addon_instance, collection)`.
     /// `GraphSearchNodeAdapter` uderza w niego z `ctx.addon_id`/`ctx.org_id`,
     /// dokładnie jak `vectors`. Współdzielony proces-szeroki manager
@@ -810,6 +823,7 @@ pub mod test_support {
             user_id: None,
             user_role: None,
             addon_id: None,
+            vector_home: None,
             org_id: None,
             deadline: None,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),

@@ -1730,6 +1730,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             // Ścieżka agenta (nie-addon) — bez tożsamości instancji addona.
             addon_id: None,
             org_id: None,
+            vector_home: None,
             deadline,
             cancel_token: cancel,
             progress_sink: Some(progress),

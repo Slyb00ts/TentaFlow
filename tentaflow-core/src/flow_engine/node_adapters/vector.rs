@@ -392,6 +392,7 @@ impl VectorNodeAdapter {
                     &p.values,
                     sparse_ns,
                     p.sparse.as_ref(),
+                    ctx.vector_home.as_deref(),
                 )
                 .map_err(|e| anyhow!("vector adapter: upsert: {e}"))?;
             written += 1;

@@ -156,6 +156,9 @@ pub fn ingest_invoke_v1(
         document_bytes,
         mime: input.mime,
         options,
+        // Addon zawsze pisze do wlasnego drzewa — hosta nie da sie stad
+        // przekierowac na cudzy katalog.
+        vector_home: None,
         flow_depth: 0,
     };
 

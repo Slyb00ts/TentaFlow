@@ -1343,6 +1343,7 @@ impl CodeIndex {
             &specs,
             false,
             &items,
+            None,
         ) {
             // No partial file in the index: roll back every ref of this file so
             // the ledger and the store cannot disagree.
