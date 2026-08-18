@@ -1417,8 +1417,17 @@ mod tests {
         s.config_json = r#"{"vllm_args":"--swap-space 8 --foo $(touch /pwned)"}"#.into();
         let cmd = build_serve_command(&s).unwrap();
         assert!(cmd.contains("'--swap-space'"));
-        assert!(cmd.contains("'$(touch /pwned)'")); // quoted → inert
+        // `shlex::split` tnie po bialych znakach, wiec `$(touch /pwned)` to DWA
+        // tokeny — i kazdy z nich osobno ląduje w apostrofach. Wlasciwosc, ktora
+        // ma znaczenie, to nie ksztalt tokenu, tylko brak niecytowanego `$(`,
+        // ktorym powloka mogłaby wykonac podstawienie.
+        assert!(cmd.contains("'$(touch'"), "cmd: {cmd}");
+        assert!(cmd.contains("'/pwned)'"), "cmd: {cmd}");
         assert!(!cmd.contains("&& touch"));
+        assert!(
+            !cmd.replace("'$(touch'", "").contains("$("),
+            "zadne `$(` nie moze zostac poza apostrofami: {cmd}"
+        );
     }
 
     #[test]

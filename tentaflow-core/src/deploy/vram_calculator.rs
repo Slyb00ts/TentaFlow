@@ -652,10 +652,10 @@ pub fn estimate_vllm_vram(model: &ModelSpec, input: &VramEstimateInput) -> VramE
     let nccl = if tp > 1.0 { 0.3 * tp } else { 0.0 };
     let activations_per_gpu = activation_peak + cuda_graph_const + nccl;
     let activations_gb = activations_per_gpu * parallel; // cluster-wide (informational)
-    // Overhead MUSI wejsc do stalego footprintu, nie tylko do sumy. Pula KV to z
-    // definicji reszta budzetu, wiec dodanie overheadu dopiero do `total_gb`
-    // sprawialo, ze suma zawsze przekraczala budzet o te 0.5 GB — `fits_total`
-    // nie mogl byc prawdziwy dla ZADNEGO modelu wypelniajacego pule.
+                                                         // Overhead MUSI wejsc do stalego footprintu, nie tylko do sumy. Pula KV to z
+                                                         // definicji reszta budzetu, wiec dodanie overheadu dopiero do `total_gb`
+                                                         // sprawialo, ze suma zawsze przekraczala budzet o te 0.5 GB — `fits_total`
+                                                         // nie mogl byc prawdziwy dla ZADNEGO modelu wypelniajacego pule.
     let overhead_gb = VLLM_CUDA_OVERHEAD_GB * parallel;
 
     let required_fixed_per_gpu = weights_per_gpu + activations_per_gpu + VLLM_CUDA_OVERHEAD_GB;
@@ -4636,10 +4636,10 @@ mod tests {
 
     #[test]
     fn fits_total_respects_util() {
-        // DRUG-1: fits_total musi mnozyc budzet przez util. Config tuz powyzej
-        // count*each*util ma fits_total=false, mimo ze count*each (bez util) by go
-        // pomiescil. Maly model na 2×24GB: total ~weights+akt+pula+overhead ≈
-        // 2*each*util gdy pula wypelnia budzet, wiec total > 2*each*0.9 jest false.
+        // DRUG-1: `fits_total` musi mnozyc budzet przez util, a nie porownywac z
+        // surowym VRAM. Sprawdzamy oba konce: pula wypelniona DOKLADNIE do budzetu
+        // miesci sie, a przy util tak niskim, ze staly footprint nie wchodzi w
+        // dostepna czesc VRAM — nie miesci sie, mimo zapasu w surowym VRAM.
         let m = qwen_05b();
         let input = VramEstimateInput {
             engine: DeployEngine::Vllm,
@@ -4657,14 +4657,17 @@ mod tests {
             weights_bytes_override: None,
         };
         let est = estimate_vllm_vram(&m, &input);
-        // total wypelnia pule do util*VRAM, wiec lezy tuz powyzej count*each*util
-        // (przez overhead 0.5) → fits_total musi byc false (z util), choc total
-        // < count*each (bez util).
         let raw_total = input.gpu_memory_gb_each * input.gpu_count as f64;
         let util_total = raw_total * input.gpu_memory_utilization;
+
+        // Pula KV to z definicji RESZTA budzetu z util, wiec suma dobija dokladnie
+        // do util*VRAM i nie przekracza go. Overhead CUDA siedzi w stalym
+        // footprincie, nie doklejany do sumy — inaczej kazdy model wypelniajacy
+        // pule wychodzilby 0.5 GB nad budzet i `fits_total` nie moglby byc
+        // prawdziwy dla ZADNEJ konfiguracji (patrz komentarz przy `overhead_gb`).
         assert!(
-            est.total_gb > util_total,
-            "total {} powinno przekroczyc budzet z util {}",
+            est.total_gb <= util_total + 1e-6,
+            "total {} nie moze przekroczyc budzetu z util {}",
             est.total_gb,
             util_total
         );
@@ -4675,8 +4678,21 @@ mod tests {
             raw_total
         );
         assert!(
-            !est.fits_total,
-            "fits_total z util musi byc false gdy total > count*each*util: {est:?}"
+            est.fits_total,
+            "konfiguracja wypelniajaca pule dokladnie do budzetu MIESCI sie: {est:?}"
+        );
+
+        // A util jest nadal respektowany: przy niskim util staly footprint nie
+        // wchodzi w dostepna czesc VRAM, wiec `fits_total` musi byc false — mimo ze
+        // model swobodnie zmiescilby sie w SUROWYM VRAM.
+        let tight = VramEstimateInput {
+            gpu_memory_utilization: 0.05,
+            ..input.clone()
+        };
+        let est_tight = estimate_vllm_vram(&m, &tight);
+        assert!(
+            !est_tight.fits_total,
+            "przy util 0.2 staly footprint nie miesci sie w budzecie: {est_tight:?}"
         );
     }
 
