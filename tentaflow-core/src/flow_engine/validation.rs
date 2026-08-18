@@ -368,6 +368,10 @@ pub fn validate(
 
     // R1, R3, R4, R6
     let mut incoming_count: HashMap<&str, usize> = HashMap::new();
+    // Krawedzie liczone TAKZE per port: wezel z typowanymi wejsciami (llm) moze
+    // przyjac kilka krawedzi, ale dwie na TEN SAM port to nadal blad — drugi
+    // producent zostalby po cichu zignorowany przy skladaniu wejsc.
+    let mut incoming_per_port: HashMap<(&str, &str), usize> = HashMap::new();
     for edge in &def.edges {
         let from_node = nodes_by_id.get(edge.from.as_str()).ok_or_else(|| {
             FlowValidationError::UnknownNode {
@@ -477,6 +481,9 @@ pub fn validate(
             }
         } else {
             *incoming_count.entry(to_node.id.as_str()).or_insert(0) += 1;
+            *incoming_per_port
+                .entry((to_node.id.as_str(), edge.to_port.as_str()))
+                .or_insert(0) += 1;
         }
     }
 
@@ -512,7 +519,23 @@ pub fn validate(
         // jednej galezi i zdjecie z drugiej skladaja sie na jedna wiadomosc
         // uzytkownika. Bez zwolnienia z R4 obrazu nie da sie podpiac inaczej niz
         // zamiast tekstu — czyli model dostawalby zdjecie bez pytania.
+        //
+        // Zwolnienie jest jednak WYLACZNIE od liczby krawedzi na wezel, nie na
+        // port: dwa zrodla wpiete w ten sam port to nadal blad, bo `merge_inputs`
+        // wybralby jedno z nich na baze, a drugie przepadloby bez sladu.
         if node.node_type == "llm" {
+            if let Some((port, actual)) = incoming_per_port
+                .iter()
+                .filter(|((n, _), _)| *n == node.id.as_str())
+                .find(|(_, c)| **c > 1)
+                .map(|((_, p), c)| ((*p).to_string(), *c))
+            {
+                tracing::debug!(node = %node.id, port = %port, actual, "llm port has multiple producers");
+                return Err(FlowValidationError::MultipleInputs {
+                    node_id: node.id.clone(),
+                    actual,
+                });
+            }
             continue;
         }
         // `output` ma 6 typed input portow (text/audio/image/video/embedding
@@ -1149,6 +1172,29 @@ mod tests {
         );
         let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(err, FlowValidationError::MultipleInputs { .. }));
+    }
+
+    /// Multimodalna tura to LEGALNIE kilka krawedzi do `llm` — ale kazda na INNY
+    /// port. Tekst z jednej galezi i obraz z drugiej skladaja sie na jedna
+    /// wiadomosc uzytkownika; dwa zrodla na tym samym porcie to nadal blad, bo
+    /// jedno z nich przepadloby przy skladaniu wejsc.
+    #[test]
+    fn accepts_llm_fan_in_on_distinct_ports() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l","from_port":"text","to_port":"in"},
+                    {"from":"t","to":"l","from_port":"image","to_port":"image"},
+                    {"from":"l","to":"o","to_port":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &registry()).expect("tekst + obraz na roznych portach jest poprawny");
     }
 
     #[test]

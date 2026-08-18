@@ -715,6 +715,7 @@ async fn run_loop_region(
 ) -> Result<FlowEnvelope> {
     let mut current = seed;
     let mut iterations: u32 = 0;
+    let mut truncated = false;
     // Runtime budget override: agent_context stamps `meta.loop_max_iterations`
     // from the agent's per-definition `max_iterations`, so a single seeded
     // region serves agents with different budgets. It overrides the compile-time
@@ -754,6 +755,15 @@ async fn run_loop_region(
         );
         current = execute_subdag(compiled, adapters, ctx, region, current).await?;
         iterations += 1;
+        // Lepkosc uciecia: znacznik jedzie w envelope, wiec przezywa kolejne
+        // iteracje sam z siebie — ale trzymamy go OBOK, zeby zadna zmiana w ciele
+        // petli nie mogla go po cichu zgubic. Wynik tury nie moze twierdzic, ze
+        // wszystko sie udalo, jesli ktorykolwiek krok zostal uciety w polowie.
+        truncated |= current
+            .meta
+            .get(crate::flow_engine::cache::LLM_TRUNCATED_META)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         ctx.progress.emit(
             &ctx.progress_scope,
             crate::flow_engine::dispatchers::ProgressEvent::IterationFinished {
@@ -835,6 +845,15 @@ async fn run_loop_region(
         "loop_exit_reason".into(),
         serde_json::Value::String(exit_reason.to_string()),
     );
+    // Przepisujemy znacznik z NASZEJ lepkiej flagi, a nie zostawiamy go temu, co
+    // przyniosla ostatnia iteracja: grace-pass `final_pass` wola model jeszcze raz
+    // i jego envelope moze juz nie niesc uciecia z iteracji wczesniejszej.
+    if truncated {
+        current.meta.insert(
+            crate::flow_engine::cache::LLM_TRUNCATED_META.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     if exit_reason == "cancelled" {
         if matches!(current.payload, FlowValue::Empty) {
             current.payload = FlowValue::Text(String::new());
@@ -3254,7 +3273,9 @@ mod concurrent_executor_tests {
         // the proof that it waited for the slower branch (a barrier); the
         // timing is the proof that the two did not queue behind each other.
         const SLEEP_MS: u64 = 400;
-        let graph = |ms: u64| format!(r#"{{
+        let graph = |ms: u64| {
+            format!(
+                r#"{{
             "nodes":[
                 {{"id":"t","type":"trigger","config":{{}}}},
                 {{"id":"a","type":"sleep","config":{{"sleep_ms":{ms}}}}},
@@ -3269,7 +3290,9 @@ mod concurrent_executor_tests {
                 {{"from":"b","to":"c","from_port":"full","to_port":"in"}},
                 {{"from":"c","to":"o","from_port":"full","to_port":"text"}}
             ]
-        }}"#);
+        }}"#
+            )
+        };
 
         let overhead = fanout_overhead(&graph(0)).await;
         let db = db();
@@ -3292,7 +3315,6 @@ mod concurrent_executor_tests {
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
     }
 
-
     #[tokio::test]
     async fn five_way_fanout_from_one_node_recombines() {
         // src → five independent branches → combine. Sequentially five sleeps,
@@ -3303,7 +3325,9 @@ mod concurrent_executor_tests {
                 .map(|n| format!(r#"{{"id":"n{n}","type":"sleep","config":{{"sleep_ms":{ms}}}}}"#))
                 .collect();
             let from_src: Vec<String> = (1..=5)
-                .map(|n| format!(r#"{{"from":"src","to":"n{n}","from_port":"full","to_port":"in"}}"#))
+                .map(|n| {
+                    format!(r#"{{"from":"src","to":"n{n}","from_port":"full","to_port":"in"}}"#)
+                })
                 .collect();
             let to_combine: Vec<String> = (1..=5)
                 .map(|n| format!(r#"{{"from":"n{n}","to":"c","from_port":"full","to_port":"in"}}"#))

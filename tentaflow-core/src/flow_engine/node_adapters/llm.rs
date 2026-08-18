@@ -257,7 +257,11 @@ impl LlmNodeAdapter {
                 continue;
             }
             match &other.envelope.payload {
-                FlowValue::Image { blob_ref, mime, dims } => {
+                FlowValue::Image {
+                    blob_ref,
+                    mime,
+                    dims,
+                } => {
                     out.meta.insert(
                         "llm_image".into(),
                         serde_json::json!({
@@ -267,7 +271,11 @@ impl LlmNodeAdapter {
                         }),
                     );
                 }
-                FlowValue::Audio { blob_ref, mime, sample_rate } => {
+                FlowValue::Audio {
+                    blob_ref,
+                    mime,
+                    sample_rate,
+                } => {
                     out.meta.insert(
                         "llm_audio".into(),
                         serde_json::json!({
@@ -371,7 +379,10 @@ impl LlmNodeAdapter {
                 _ => envelope.meta.get("llm_audio").and_then(|v| {
                     let blob: crate::flow_engine::blob_store::BlobRef =
                         serde_json::from_value(v.get("blob")?.clone()).ok()?;
-                    let mime = v.get("mime").and_then(|m| m.as_str()).unwrap_or("audio/wav");
+                    let mime = v
+                        .get("mime")
+                        .and_then(|m| m.as_str())
+                        .unwrap_or("audio/wav");
                     Some((blob, audio_format_from_mime(mime)))
                 }),
             };
@@ -485,6 +496,121 @@ impl LlmNodeAdapter {
     }
 }
 
+/// Ile razy wolno powtorzyc JEDNO zadanie do modelu.
+///
+/// Ponowienie dzieje sie WEWNATRZ kroku, wiec nie zjada budzetu petli harnessu:
+/// zerwane polaczenie nie moze kosztowac iteracji, ktora agent mial na prace.
+const LLM_MAX_ATTEMPTS: u32 = 3;
+
+/// Odstep przed pierwsza powtorka; kolejne podwajaja.
+const LLM_RETRY_BACKOFF_MS: u64 = 250;
+
+/// Czy ten blad ma sens powtarzac.
+///
+/// Klasyfikacja jest HEURYSTYKA po tekscie, bo `execute_chat` zwraca `anyhow`, a
+/// nie typowany blad — i lepiej to powiedziec wprost, niz udawac precyzje.
+/// Kierunek pomylki dobrany swiadomie: przy nieznanym bledzie NIE powtarzamy.
+/// Powtorzenie deterministycznej odmowy (zly model, za dlugi kontekst, brak
+/// uprawnien) to trzy razy ta sama porazka i trzy razy ten sam rachunek.
+fn is_retryable_llm_error(err: &anyhow::Error) -> bool {
+    let text = format!("{err:#}").to_lowercase();
+    // Deterministyczne odmowy — powtorka nic nie zmieni.
+    const PERMANENT: &[&str] = &[
+        "context length",
+        "context_length",
+        "too many tokens",
+        "invalid",
+        "unsupported",
+        "not found",
+        "unauthorized",
+        "forbidden",
+        "400",
+        "401",
+        "403",
+        "404",
+        "422",
+    ];
+    if PERMANENT.iter().any(|m| text.contains(m)) {
+        return false;
+    }
+    const TRANSIENT: &[&str] = &[
+        "timeout",
+        "timed out",
+        "connection",
+        "connect",
+        "reset",
+        "broken pipe",
+        "eof",
+        "unavailable",
+        "overloaded",
+        "temporarily",
+        "429",
+        "500",
+        "502",
+        "503",
+        "504",
+    ];
+    TRANSIENT.iter().any(|m| text.contains(m))
+}
+
+impl LlmNodeAdapter {
+    /// Wykonuje zadanie z ograniczona liczba powtorek bledow przejsciowych.
+    ///
+    /// Sciezka BLOKUJACA. Strumieniowa swiadomie nie ma powtorek: po wyslaniu
+    /// pierwszego tokenu w dol nie da sie ich cofnac, wiec powtorka duplikowalaby
+    /// odpowiedz u odbiorcy. To osobny problem i osobna zmiana.
+    async fn execute_chat_with_retry(
+        node: &FlowNode,
+        ctx: &ExecutionContext,
+        request: crate::flow_engine::dispatchers::LlmRequest,
+    ) -> Result<crate::flow_engine::dispatchers::LlmResponse> {
+        let max_attempts = node
+            .config
+            .get("max_request_attempts")
+            .and_then(|v| v.as_u64())
+            .map(|v| v.max(1) as u32)
+            .unwrap_or(LLM_MAX_ATTEMPTS);
+        let mut attempt = 1;
+        loop {
+            // Zadanie skladane jest raz i klonowane: powtorka ma isc DOKLADNIE
+            // ta sama trescia, inaczej nie jest powtorka tylko nowym pytaniem.
+            let result = ctx.llm.execute_chat(request.clone()).await;
+            let err = match result {
+                Ok(response) => return Ok(response),
+                Err(e) => e,
+            };
+            let last = attempt >= max_attempts;
+            if last || !is_retryable_llm_error(&err) || ctx.cancel_token.is_cancelled() {
+                return Err(anyhow!("llm adapter: dispatcher failed: {err}"));
+            }
+            let backoff =
+                std::time::Duration::from_millis(LLM_RETRY_BACKOFF_MS << (attempt - 1) as u32);
+            // Deadline biegnie dalej podczas czekania, wiec powtorka, ktora i tak
+            // by sie w nim nie zmiescila, jest bezcelowa.
+            if ctx
+                .effective_deadline()
+                .is_some_and(|d| std::time::Instant::now() + backoff >= d)
+            {
+                return Err(anyhow!("llm adapter: dispatcher failed: {err}"));
+            }
+            tracing::warn!(
+                node = %node.id,
+                attempt,
+                max_attempts,
+                error = %err,
+                "llm request failed, retrying inside the step"
+            );
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = ctx.cancel_token.cancelled() => {
+                    return Err(anyhow!("llm adapter: cancelled while retrying: {err}"));
+                }
+            }
+            attempt += 1;
+        }
+    }
+}
+
 impl Default for LlmNodeAdapter {
     fn default() -> Self {
         Self::new()
@@ -559,19 +685,27 @@ impl NodeAdapter for LlmNodeAdapter {
         let envelope: &FlowEnvelope = &merged;
 
         let request = Self::build_llm_request(node, envelope, ctx)?;
-        let response = ctx
-            .llm
-            .execute_chat(request)
-            .await
-            .map_err(|e| anyhow!("llm adapter: dispatcher failed: {e}"))?;
+        let response = Self::execute_chat_with_retry(node, ctx, request).await?;
 
         ctx.usage_sink.record(&node.id, response.usage);
+
+        // Uderzenie w sufit tokenow jest LEPKIE: raz ustawione, nie kasujemy go
+        // nigdzie. Odpowiedz ucieta w polowie to fakt o calej turze, a nie o
+        // jednym wywolaniu — pozniejsza iteracja, ktora zmiescila sie w limicie,
+        // nie moze go zamaskowac. Dlatego zapisujemy WYLACZNIE `true`.
+        let truncated_now = response.finish_reason == FinishReason::Length;
 
         // Output envelope: klon input + nadpisany payload + dopisana
         // assistant message. Provenance trzymamy tylko dla artifacts
         // bag (envelope.artifacts) — payload jest głównym slotem flow,
         // jego pochodzenie wynika z trace (executor produkuje TraceStep).
         let mut out: FlowEnvelope = envelope.clone();
+        if truncated_now {
+            out.meta.insert(
+                crate::flow_engine::cache::LLM_TRUNCATED_META.to_string(),
+                serde_json::Value::Bool(true),
+            );
+        }
         // Persist the prompt BEFORE overwriting the payload with the answer:
         // it lives only in `payload`, so a harness loop would otherwise drop
         // the user's request after the first iteration (see
@@ -612,8 +746,7 @@ impl NodeAdapter for LlmNodeAdapter {
         assistant.reasoning_content = response.reasoning_content;
         // A truncated generation yields half a JSON object; keeping it poisons
         // every later turn (`sanitize_tool_calls`).
-        let (calls, note) =
-            Self::sanitize_tool_calls(response.tool_calls, response.finish_reason);
+        let (calls, note) = Self::sanitize_tool_calls(response.tool_calls, response.finish_reason);
         if !calls.is_empty() {
             // Tool calls ride on the assistant message so downstream nodes
             // (tool executor, converter) see them in conversation context.
@@ -744,7 +877,11 @@ mod tests {
         };
         let n = node(json!({"system_prompt": "inline"}));
         let msgs = LlmNodeAdapter::build_messages(&n, &env);
-        assert_eq!(msgs.len(), 2, "system sections must collapse into one message");
+        assert_eq!(
+            msgs.len(),
+            2,
+            "system sections must collapse into one message"
+        );
         assert_eq!(msgs[0].role, ChatRole::System);
         assert_eq!(msgs[0].text(), Some("sp1\n\nsp2\n\ninline"));
         assert_eq!(msgs[1].role, ChatRole::User);
@@ -777,11 +914,15 @@ mod tests {
         // Iteracja 2: payload to już odpowiedź modelu, ale prompt został.
         let mut next = env.clone();
         next.context.messages.push(user);
-        next.context.messages.push(ChatMessage::assistant("wołam narzędzie"));
+        next.context
+            .messages
+            .push(ChatMessage::assistant("wołam narzędzie"));
         next.payload = FlowValue::Text("wołam narzędzie".into());
         let msgs2 = LlmNodeAdapter::build_messages(&node(json!({})), &next);
         assert!(
-            msgs2.iter().any(|m| m.role == ChatRole::User && m.text() == Some("napisz hello.py")),
+            msgs2
+                .iter()
+                .any(|m| m.role == ChatRole::User && m.text() == Some("napisz hello.py")),
             "the user's request must still be in the conversation on iteration 2"
         );
     }
@@ -809,8 +950,14 @@ mod tests {
         assert_eq!(kept.len(), 1, "only the parseable call survives");
         assert_eq!(kept[0].id, "ok");
         let note = note.expect("the model must be told why its call vanished");
-        assert!(note.contains("core.fs_write"), "the note names the dropped call");
-        assert!(note.contains("ucięta"), "a length cut is explained as a cut");
+        assert!(
+            note.contains("core.fs_write"),
+            "the note names the dropped call"
+        );
+        assert!(
+            note.contains("ucięta"),
+            "a length cut is explained as a cut"
+        );
     }
 
     /// Obraz w payloadzie musi stać się multimodalną turą, a nie zniknąć.
@@ -831,10 +978,11 @@ mod tests {
             mime: "image/png".into(),
             dims: Some((800, 600)),
         };
-        env.meta.insert("image_prompt".into(), serde_json::json!("Co tu widać?"));
+        env.meta
+            .insert("image_prompt".into(), serde_json::json!("Co tu widać?"));
 
-        let msg = LlmNodeAdapter::payload_user_message(&env, &[])
-            .expect("an image must reach the model");
+        let msg =
+            LlmNodeAdapter::payload_user_message(&env, &[]).expect("an image must reach the model");
         assert_eq!(msg.role, ChatRole::User);
         match &msg.content {
             crate::flow_engine::envelope::ChatMessageContent::Parts(parts) => {
@@ -1014,5 +1162,44 @@ mod tests {
             LlmNodeAdapter::pick_optional_string(&node(json!({})), &env, "reasoning_effort"),
             None
         );
+    }
+
+    /// Klasyfikacja bledow do powtorki. Kierunek pomylki jest tu decyzja: blad
+    /// nieznany NIE jest powtarzany, bo powtorzenie deterministycznej odmowy to
+    /// trzy razy ta sama porazka i trzy razy ten sam rachunek.
+    #[test]
+    fn only_transient_llm_errors_are_retried() {
+        for msg in [
+            "connection reset by peer",
+            "request timed out",
+            "upstream returned 503",
+            "server is overloaded, try again",
+            "unexpected EOF while reading body",
+        ] {
+            assert!(
+                super::is_retryable_llm_error(&anyhow!("{msg}")),
+                "'{msg}' jest przejsciowy i powinien byc powtorzony"
+            );
+        }
+        for msg in [
+            "context length exceeded",
+            "model not found",
+            "invalid request: bad tool schema",
+            "401 unauthorized",
+            "unsupported modality",
+        ] {
+            assert!(
+                !super::is_retryable_llm_error(&anyhow!("{msg}")),
+                "'{msg}' jest deterministyczny — powtorka nic nie da"
+            );
+        }
+    }
+
+    /// Blad zupelnie nieznany traktujemy jak trwaly.
+    #[test]
+    fn unknown_llm_errors_are_not_retried() {
+        assert!(!super::is_retryable_llm_error(&anyhow!(
+            "something nobody classified"
+        )));
     }
 }

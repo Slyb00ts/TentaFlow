@@ -83,6 +83,14 @@ pub fn is_loop_gate(node_type: &str) -> bool {
     node_type == CRITIC_GATE_NODE_TYPE || node_type == TASK_GATE_NODE_TYPE
 }
 
+/// Klucz `envelope.meta`: model uderzyl w sufit tokenow w TEJ turze.
+///
+/// Lepki z zalozenia — ustawiany wylacznie na `true` i nigdy nie kasowany, wiec
+/// iteracja, ktora zmiescila sie w limicie, nie zamaskuje wczesniejszego uciecia.
+/// Bez tego wynik tury potrafi sklamac: agent przerwany w polowie zapisu pliku
+/// konczy jako "gotowe".
+pub const LLM_TRUNCATED_META: &str = "llm_truncated";
+
 /// Envelope meta the gate sets when the reviewer is satisfied. The region
 /// runner reads it as a structural stop.
 pub const LOOP_SHOULD_EXIT_META: &str = "loop_should_exit";
