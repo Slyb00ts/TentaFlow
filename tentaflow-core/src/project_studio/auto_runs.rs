@@ -13,7 +13,7 @@
 // `ml_studio::train_autogluon`). The submission body is NEVER logged: it
 // carries the decrypted environment secret.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};

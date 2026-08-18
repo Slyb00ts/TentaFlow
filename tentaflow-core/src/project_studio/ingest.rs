@@ -21,7 +21,6 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
 use super::repository;

@@ -10,8 +10,9 @@
 // that is the reason this module exists; the retrieval quality of both consumers
 // depends on cleanup actually being complete.
 
-use super::backend::VectorBackend;
-use super::error::Result;
+use super::backend::{SearchHit, VectorBackend};
+use super::error::{Result, VectorError};
+use super::NamespaceManager;
 use tentaflow_sdk_spec::{FieldValue, Filter};
 
 /// Cap on the cleanup query. One document never has more chunks than this, so a
@@ -41,6 +42,32 @@ pub fn ref_id_for(doc_id: &str, chunk_index: u64) -> u64 {
     } else {
         hash
     }
+}
+
+/// k-NN nad przestrzenia `(org, scope, namespace)` — jedno miejsce, ktore wie, jak
+/// otworzyc przestrzen i zapytac ja o sasiadow.
+///
+/// Rozjazd, ktory dotad byl powodem dwoch kopii, jest teraz JAWNYM parametrem:
+/// `missing_is_empty` decyduje, czy nieistniejaca przestrzen to pusty wynik
+/// (projekt bez zaingestowanej wiedzy — normalny stan), czy blad (wezel flow,
+/// ktory zapytal o przestrzen, ktorej nikt nie zalozyl — realna pomylka w grafie).
+pub fn search_namespace(
+    vectors: &NamespaceManager,
+    org_id: &str,
+    scope: &str,
+    namespace: &str,
+    query: &[f32],
+    top_k: usize,
+    filter: Option<&Filter>,
+    output_fields: &[String],
+    missing_is_empty: bool,
+) -> Result<Vec<SearchHit>> {
+    let backend = match vectors.get(org_id, scope, namespace) {
+        Ok(b) => b,
+        Err(VectorError::NamespaceNotFound { .. }) if missing_is_empty => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
+    backend.search(query, top_k, filter, output_fields)
 }
 
 /// Removes every vector of `doc_id` from `backend`.
