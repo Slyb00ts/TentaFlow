@@ -69,13 +69,24 @@ deadline (`ask_user`, `agent_wait`, `agent_spawn`, `exec`) — nałożenie drugi
 Granica mechanizmu: anulowanie działa przez drop future'a, więc zadanie `spawn_blocking`, które już
 ruszyło, dobiegnie końca w tle i porzucony zostanie tylko jego wynik.
 
-### 3.3 Brak ponowienia wewnątrz kroku
+### 3.3 Brak ponowienia wewnątrz kroku **[NAPRAWIONE]**
 Ich krok jest pętlą: błąd żądania idzie przez waterfall `agent/request-error`, a `retry` **nie
-zużywa kroku**. U nas błąd LLM przewraca iterację i zjada budżet pętli.
+zużywa kroku**. U nas było gorzej, niż napisałem: błąd LLM propagował się z iteracji i **zabijał
+cały przebieg**, nie tylko zjadał budżet.
 
-### 3.4 `max-tokens` nie jest lepkie
+**Zrobione.** Do `max_request_attempts` (domyślnie 3) prób z narastającym odstępem, wewnątrz kroku.
+Klasyfikacja błędów jest heurystyką po tekście, bo `execute_chat` zwraca `anyhow` — i tak to
+zapisałem, zamiast udawać precyzję. Kierunek pomyłki dobrany świadomie: **błąd nierozpoznany nie
+jest powtarzany**. Ponowienia zatrzymuje anulowanie i deadline. Ścieżka strumieniowa świadomie
+**nie** ma powtórek — po wysłaniu pierwszego tokenu w dół nie da się go cofnąć.
+
+### 3.4 `max-tokens` nie jest lepkie **[NAPRAWIONE]**
 `llm.rs` liczy `truncated` per wywołanie, ale pętla nie niesie tego jako wyniku tury. U nich raz
 uderzony sufit **nie może** zostać zdegradowany przez późniejszy zakończony normalnie krok.
+
+**Zrobione.** Znacznik `llm_truncated` zapisywany wyłącznie jako `true` i nigdy nie kasowany, a
+pętla trzyma go we własnej fladze i stempluje wynik — więc grace-pass `final_pass`, który woła model
+jeszcze raz, nie zamaskuje ucięcia z wcześniejszej iteracji.
 
 ### 3.5 Prompt składany raz, nie co krok
 Nasz prompt systemowy siedzi w configu węzła `llm`. U nich składany jest **raz na krok** z wkładów
@@ -94,7 +105,11 @@ wtyczkowości i najdroższa różnica do nadrobienia.
 1. ~~Budżet czasu per narzędzie~~ — **zrobione**.
 2. ~~Równoległe wywołania narzędzi~~ — **zrobione** (wcześniej, niż zakładała ta kolejność, bo
    zatwierdzanie w kolejności modelu wyszło za darmo: `join_all` zachowuje kolejność wejścia).
-3. **Ponowienie wewnątrz kroku** — przestaje zjadać budżet pętli na błędach transportu.
-4. **Lepkie `max-tokens`** — drobne, ale bez tego wynik tury potrafi kłamać.
+3. ~~Ponowienie wewnątrz kroku~~ — **zrobione**.
+4. ~~Lepkie `max-tokens`~~ — **zrobione**.
 5. **Model zdarzeń z `code_studio/events.rs` na poziom flow** — odblokowuje TTFT i czas narzędzia.
 6. **Rejestr składania promptu** — największa zmiana, osobny projekt.
+
+Poza listą, znalezione przy okazji: **zwolnienie `llm` z R4 było za szerokie** i przepuszczało dwie
+krawędzie na ten sam port, gdzie `merge_inputs` po cichu wybrałby jedną. Naprawione — zwolnienie
+działa per port, nie per węzeł.
