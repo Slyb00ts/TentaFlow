@@ -4,7 +4,9 @@
 //       Eksportuje klientow QUIC/HTTP do komunikacji z silnikami AI.
 // =============================================================================
 
+pub mod cancel_registry;
 pub mod gpu_snapshot;
+pub mod ingest_gate;
 pub mod manifest;
 pub mod model_download;
 pub mod model_residency;

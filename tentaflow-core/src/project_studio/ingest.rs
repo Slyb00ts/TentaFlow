@@ -57,48 +57,27 @@ pub fn vector_scope(project_id: &str) -> String {
 // Global ingest concurrency gate
 // =============================================================================
 
-/// At most this many ingest jobs process files at once. Extraction + embedding
-/// batches of several jobs in parallel can hold hundreds of MiB of chunk text
-/// and vectors in memory — the cap turns a burst of SourceCreate requests into
-/// a queue instead of an OOM.
-const MAX_CONCURRENT_INGEST_JOBS: usize = 2;
-
-fn ingest_semaphore() -> &'static tokio::sync::Semaphore {
-    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_INGEST_JOBS))
-}
-
 // =============================================================================
 // Cancel registry (module-local mirror of dispatch/benchmark.rs)
 // =============================================================================
 
-fn cancel_registry() -> &'static RwLock<HashMap<String, Arc<AtomicBool>>> {
-    static REG: OnceLock<RwLock<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashMap::new()))
-}
+/// Anulowanie biezacych zadan tego procesu. Wspolny typ z
+/// `services::cancel_registry` — kazda z trzech kopii tej mapy miala wlasna
+/// implementacje, a ta w Project Studio wprost nazywala sie lustrem benchmarku.
+static INGEST_CANCEL: crate::services::cancel_registry::CancelRegistry =
+    crate::services::cancel_registry::CancelRegistry::new();
 
 fn register_cancel(job_id: &str) -> Arc<AtomicBool> {
-    let token = Arc::new(AtomicBool::new(false));
-    cancel_registry()
-        .write()
-        .insert(job_id.to_string(), token.clone());
-    token
+    INGEST_CANCEL.register(job_id)
 }
 
 fn unregister_cancel(job_id: &str) {
-    cancel_registry().write().remove(job_id);
+    INGEST_CANCEL.unregister(job_id)
 }
 
-/// Flags a running job for cancellation. Returns `false` when the job is not
-/// (or no longer) registered.
+/// Flags a live run for cancellation. `false` = this process does not own it.
 pub fn signal_cancel(job_id: &str) -> bool {
-    match cancel_registry().read().get(job_id) {
-        Some(token) => {
-            token.store(true, Ordering::Relaxed);
-            true
-        }
-        None => false,
-    }
+    INGEST_CANCEL.signal(job_id)
 }
 
 // =============================================================================
@@ -445,7 +424,7 @@ pub fn recover_orphaned_jobs(pool: &DbPool) {
         return;
     };
     for job_id in jobs {
-        if cancel_registry().read().contains_key(&job_id) {
+        if INGEST_CANCEL.is_registered(&job_id) {
             continue;
         }
         tracing::warn!(job_id, "marking orphaned ingest job as failed");
@@ -1126,63 +1105,42 @@ pub fn start_job(task: IngestTask) {
         let project_pool = task.project_pool.clone();
         let job_id_task = task.job_id.clone();
 
-        // Global concurrency gate: the job row already says 'running' (the
-        // status CHECK list is closed and polling clients treat 'running' as
-        // in-progress either way), so a queued job simply waits here before
-        // touching any file. The wait polls the cancel token so a queued job
-        // can still be cancelled — it then finishes terminally without ever
-        // processing, which the delete paths rely on.
-        let mut queued_notice_sent = false;
-        let permit = loop {
-            if cancel.load(Ordering::Relaxed) {
-                break None;
+        // Wspolbieznosc ogranicza teraz JEDNA bramka w `execute_ingest`
+        // (`services::ingest_gate`), przez ktora przechodzi tez addon RAG — a
+        // liczy ona DOKUMENTY, czyli to, co realnie ogranicza pamiec. Wlasny
+        // semafor na poziomie zadania byl drugim, niezaleznym limitem tego samego
+        // zasobu i przepuszczal jeden dokument z kazdego zadania i tak.
+        //
+        // Zadanie anulowane, zanim tknelo jakikolwiek plik, konczy sie terminalnie
+        // bez przetwarzania — na tym opieraja sie sciezki kasowania — bo `run_job`
+        // sprawdza flage przed kazdym plikiem.
+        if cancel.load(Ordering::Relaxed) {
+            let _ = repository::finish_ingest_job(&project_pool, &job_id_task, "cancelled", "");
+        } else {
+            if crate::services::ingest_gate::would_wait() {
+                emit_line(
+                    &tx,
+                    &job_id_task,
+                    "log",
+                    "queue",
+                    "waiting for a free ingest slot".to_string(),
+                    0,
+                );
             }
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                ingest_semaphore().acquire(),
-            )
-            .await
-            {
-                Ok(Ok(permit)) => break Some(permit),
-                // The semaphore is static and never closed; treat a closed
-                // error like cancellation instead of panicking.
-                Ok(Err(_)) => break None,
-                Err(_) => {
-                    if !queued_notice_sent {
-                        queued_notice_sent = true;
-                        emit_line(
-                            &tx,
-                            &job_id_task,
-                            "log",
-                            "queue",
-                            "waiting for a free ingest slot".to_string(),
-                            0,
-                        );
-                    }
+            let run = {
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move { run_job(task, tx, cancel).await })
+            };
+            if let Err(join_err) = run.await {
+                if join_err.is_panic() {
+                    let _ = repository::finish_ingest_job(
+                        &project_pool,
+                        &job_id_task,
+                        "failed",
+                        "ingest task panicked",
+                    );
                 }
-            }
-        };
-
-        match permit {
-            Some(_permit) => {
-                let run = {
-                    let tx = tx.clone();
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move { run_job(task, tx, cancel).await })
-                };
-                if let Err(join_err) = run.await {
-                    if join_err.is_panic() {
-                        let _ = repository::finish_ingest_job(
-                            &project_pool,
-                            &job_id_task,
-                            "failed",
-                            "ingest task panicked",
-                        );
-                    }
-                }
-            }
-            None => {
-                let _ = repository::finish_ingest_job(&project_pool, &job_id_task, "cancelled", "");
             }
         }
 

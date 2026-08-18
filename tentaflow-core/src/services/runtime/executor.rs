@@ -2310,6 +2310,11 @@ impl ModelRuntimeExecutor {
         // (jak parse/embeddings przez catalog), tylko po nazwie `<model>:ingest`.
         // `enter_flow` potrzebuje stabilnego identyfikatora w stosie — używamy
         // nazwy modelu, by self-referencyjny ingest narastał `subflow_depth`.
+        // Bramka wspolbieznosci PRZED wejsciem w guard rekursji: przepustka
+        // trzymana jest przez caly przebieg flow i zwalnia sie przy drop, takze
+        // przy panice.
+        let _permit = crate::services::ingest_gate::acquire().await;
+
         let flow_key = format!("{}:ingest", request.model);
         ctx.enter_flow(&flow_key)
             .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
