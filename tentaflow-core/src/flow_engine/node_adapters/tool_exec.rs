@@ -49,6 +49,12 @@ const PROJECT_SEARCH_RESULT_BUDGET: usize = 15_000;
 
 /// Human-wait budget for a permission grant card (§3.13 B). A grant has no
 /// model-supplied timeout (unlike ask_user), so it uses the shared default.
+/// Sufit na JEDNO wywolanie narzedzia, gdy narzedzie nie trzyma wlasnego
+/// deadline'u (patrz `tool_budget`). Bez tego zawieszone narzedzie addonu
+/// zatrzymuje cala ture, a model nie dostaje nawet informacji, ze cos poszlo nie
+/// tak.
+const DEFAULT_TOOL_TIMEOUT_SECS: usize = 120;
+
 /// Ile niezaleznych wywolan wolno miec w locie naraz. Odczyty sa tanie, ale
 /// kazde trzyma bufor wyniku, wiec pula ma sufit.
 const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 4;
@@ -781,6 +787,7 @@ impl ToolExecNodeAdapter {
         parent_run_id: Option<&str>,
         envelope: &FlowEnvelope,
         tools_json: &str,
+        default_budget: Duration,
         call: &LlmToolCall,
     ) -> ToolCallResult {
         ctx.progress.emit(
@@ -790,7 +797,83 @@ impl ToolExecNodeAdapter {
             },
         );
 
-        let result = if !service.tool_allowed(&tools_json, &call.name) {
+        let inner = Self::dispatch_inner(
+            service,
+            manager,
+            ctx,
+            principal,
+            caller,
+            run_id,
+            parent_run_id,
+            envelope,
+            tools_json,
+            call,
+        );
+        let result = match Self::tool_budget(&call.name, default_budget) {
+            None => inner.await,
+            Some(budget) => match tokio::time::timeout(budget, inner).await {
+                Ok(result) => result,
+                // Blad ustrukturyzowany, a nie awaria flow: model widzi, ze
+                // narzedzie nie zdazylo, i moze sprobowac inaczej. Przerwanie
+                // dziala przez DROP futures — zadanie `spawn_blocking`, ktore juz
+                // ruszylo, dobiegnie konca w tle, tylko jego wynik zostanie
+                // porzucony. To granica tego mechanizmu i powod, dla ktorego
+                // `core.exec` ma wlasny, twardszy limit w sandboxie.
+                Err(_) => error_result(
+                    call,
+                    format!(
+                        "tool '{}' exceeded its {} s budget",
+                        call.name,
+                        budget.as_secs()
+                    ),
+                ),
+            },
+        };
+
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            ProgressEvent::ToolCallFinished {
+                name: call.name.clone(),
+                status: if result.success { "ok" } else { "error" }.to_string(),
+            },
+        );
+        result
+    }
+
+    /// Ile czasu ma to narzedzie. `None` = narzedzie SAMO trzyma swoj deadline i
+    /// nadlozenie drugiego tylko by go skrocilo:
+    ///
+    ///  * `ask_user` czeka na czlowieka i ma wlasny `timeout_secs`,
+    ///  * `agent_wait` czeka na dzieci, ktore moga pracowac dowolnie dlugo,
+    ///  * `exec` ma limit wybierany przez model z sufitem ORAZ idle-timeout
+    ///    liczony od aktywnosci — kompilacja godzine milczaca przez minute jest
+    ///    poprawna, a budzet scienny by ja zabil.
+    fn tool_budget(name: &str, default_budget: Duration) -> Option<Duration> {
+        match CoreToolName::from_public_name(name) {
+            Some(CoreToolName::AskUser)
+            | Some(CoreToolName::AgentWait)
+            | Some(CoreToolName::AgentSpawn)
+            | Some(CoreToolName::Exec) => None,
+            _ => Some(default_budget),
+        }
+    }
+
+    /// Rozdzielacz wywolan. Bez pomiaru czasu i bez zdarzen postepu — te trzyma
+    /// `dispatch_one`, zeby przekroczony budzet tez zamykal pare start/koniec.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_inner(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        caller: &CallerRun,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        envelope: &FlowEnvelope,
+        tools_json: &str,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        if !service.tool_allowed(&tools_json, &call.name) {
             error_result(call, format!("tool '{}' not in agent allowlist", call.name))
         } else if CoreToolName::from_public_name(&call.name)
             .map(|c| c.is_ask_user())
@@ -843,16 +926,7 @@ impl ToolExecNodeAdapter {
                 call,
             )
             .await
-        };
-
-        ctx.progress.emit(
-            &ctx.progress_scope,
-            ProgressEvent::ToolCallFinished {
-                name: call.name.clone(),
-                status: if result.success { "ok" } else { "error" }.to_string(),
-            },
-        );
-        result
+        }
     }
 }
 
@@ -1006,6 +1080,9 @@ impl NodeAdapter for ToolExecNodeAdapter {
             DEFAULT_MAX_PARALLEL_TOOL_CALLS,
         )
         .max(1);
+        let tool_budget = Duration::from_secs(
+            Self::config_usize(node, "tool_timeout_secs", DEFAULT_TOOL_TIMEOUT_SECS).max(1) as u64,
+        );
         let mut idx = 0usize;
         while idx < calls.len() {
             let group_len = if Self::is_parallel_safe(&calls[idx].name) {
@@ -1031,6 +1108,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
                         parent_run_id.as_deref(),
                         envelope,
                         &tools_json,
+                        tool_budget,
                         &group[0],
                     )
                     .await,
@@ -1047,6 +1125,7 @@ impl NodeAdapter for ToolExecNodeAdapter {
                         parent_run_id.as_deref(),
                         envelope,
                         &tools_json,
+                        tool_budget,
                         call,
                     )
                 });
@@ -1619,6 +1698,48 @@ mod tests {
             assert!(
                 !ToolExecNodeAdapter::is_parallel_safe(name),
                 "{name} nie jest znane — domyslnie wylaczne"
+            );
+        }
+    }
+
+    /// Narzedzia, ktore SAME trzymaja swoj deadline, nie moga dostac drugiego —
+    /// nalozony budzet scienny tylko by go skrocil i zabil poprawna prace:
+    /// `ask_user` czeka na czlowieka, `agent_wait`/`agent_spawn` na dzieci, a
+    /// `exec` ma limit z sufitem ORAZ idle-timeout liczony od aktywnosci
+    /// (kompilacja milczaca przez minute jest poprawna).
+    #[test]
+    fn tools_owning_their_deadline_get_no_second_one() {
+        let default = Duration::from_secs(120);
+        for name in [
+            "core.ask_user",
+            "core.agent_wait",
+            "core.agent_spawn",
+            "core.exec",
+        ] {
+            assert_eq!(
+                ToolExecNodeAdapter::tool_budget(name, default),
+                None,
+                "{name} trzyma wlasny deadline"
+            );
+        }
+    }
+
+    /// Wszystko inne — w tym KAZDE narzedzie addonu — dostaje budzet. To jest cel:
+    /// zawieszone narzedzie nie moze zatrzymac tury bez sladu.
+    #[test]
+    fn everything_else_gets_a_budget() {
+        let default = Duration::from_secs(90);
+        for name in [
+            "core.fs_read",
+            "core.git_commit",
+            "core.code_search",
+            "notes.search",
+            "totally_unknown",
+        ] {
+            assert_eq!(
+                ToolExecNodeAdapter::tool_budget(name, default),
+                Some(default),
+                "{name} powinien dostac budzet"
             );
         }
     }
