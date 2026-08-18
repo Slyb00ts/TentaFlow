@@ -309,7 +309,7 @@ dotknie strony retrievalowej.
 
 ---
 
-## 8. Zadanie NASTĘPNE (po zakończeniu unifikacji RAG i Projektów)
+## 8. Sterowanie rozumowaniem i temperaturą w agentach **[WYKONANE]**
 
 Zapisane na wniosek właściciela — **do zrobienia po Etapach 0–5**, nie w ich trakcie.
 
@@ -334,9 +334,15 @@ Stan zastany (sprawdzony, nie zakładany):
 - `LlmRequest` ma już `temperature`, więc strona wykonawcza dla punktu 2 istnieje — brakuje
   wyłącznie ustawienia na agencie i przekazania go do żądania.
 
-Do rozstrzygnięcia przy podejmowaniu zadania: co robić, gdy agent ma ustawiony poziom, a model
-zostanie przepięty na taki, który go nie wspiera (zignorować, zdegradować do najbliższego, czy
-zablokować zapis).
+**Rozstrzygnięte przy wykonaniu — model przepięty na taki, który nie wspiera poziomu.** Nie
+walidujemy przy zapisie ani przy rozwiązywaniu agenta. Poziom jest odrzucany dopiero tam, gdzie
+składane jest żądanie, czyli w jedynym miejscu znającym zdolności celu. Powód: walidacja przy
+zapisie znaczyłaby, że przepięcie modelu **cicho zmienia zapisaną konfigurację agenta**, a
+użytkownik po powrocie do poprzedniego modelu nie odzyskałby swojego ustawienia.
+
+W formularzu: model bez poziomów **chowa pole** zamiast pokazywać pusty select; model nieznany
+katalogowi zachowuje zapisany wybór (brak wpisu to niewiedza, nie brak możliwości — reguła z
+modalności); pusta wartość znaczy „zostaw ustawienie modelu", a nie „poziom zerowy".
 
 ---
 
