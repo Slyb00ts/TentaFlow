@@ -15,14 +15,9 @@ use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::services::org::DEFAULT_ORG_ID;
 use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
-use tentaflow_sdk_spec::{FieldType, FieldValue, Filter};
+use tentaflow_sdk_spec::{FieldType, FieldValue};
 
 const NODE_TYPE: &str = "store";
-
-/// Górny limit zapytania o istniejące wektory dokumentu przy cleanupie. Jeden
-/// dokument nie powinien mieć więcej chunków niż to (a gdy ma — kolejne i tak
-/// zostaną nadpisane deterministycznym ref_id, więc nie ma orphanów).
-const CLEANUP_SEARCH_K: usize = 100_000;
 
 /// Pojedynczy chunk przygotowany do zapisu: deterministyczny ref_id (z doc_id +
 /// chunk_index) + wektor + tekst.
@@ -114,27 +109,6 @@ impl StoreNodeAdapter {
             .map(|s| s.to_string())
     }
 
-    /// Deterministyczny ref_id z (doc_id, chunk_index): hash FNV-1a 64-bit doc_id
-    /// zmieszany z indeksem. Deterministyczny ⇒ re-ingest tego samego chunka
-    /// nadpisuje stary wektor (upsert = replace), a nie tworzy duplikatu. ref_id=0
-    /// jest zarezerwowany (backend zvec go odrzuca), więc wymuszamy >0.
-    fn ref_id_for(doc_id: &str, chunk_index: u64) -> u64 {
-        // FNV-1a 64-bit.
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for b in doc_id.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        // Wmieszaj indeks chunka, by chunki tego samego dokumentu miały różne id.
-        hash ^= chunk_index.wrapping_add(1);
-        hash = hash.wrapping_mul(0x100000001b3);
-        if hash == 0 {
-            1
-        } else {
-            hash
-        }
-    }
-
     /// Parsuje wejściowe chunki+embeddingi z payloadu Json. Akceptujemy
     /// `{chunks:[{index,text,embedding|vector:[f32]}]}` — upstream embed dokłada
     /// wektor do każdego chunka. WALIDACJA-PRZED-ZAPISEM: wszystkie chunki
@@ -200,7 +174,7 @@ impl StoreNodeAdapter {
                 Some(_) => {}
             }
             prepared.push(PreparedChunk {
-                ref_id: Self::ref_id_for(doc_id, chunk_index),
+                ref_id: crate::services::vector::doc_vectors::ref_id_for(doc_id, chunk_index),
                 chunk_index,
                 vector,
                 text,
@@ -288,17 +262,12 @@ impl NodeAdapter for StoreNodeAdapter {
         // Namespace może jeszcze nie istnieć (pierwszy ingest) — NamespaceNotFound
         // traktujemy jako „nic do sprzątania", nie błąd.
         match ctx.vectors.get(&org, addon, &namespace) {
-            Ok(backend) => {
-                let filter = Filter::Eq("doc_id".to_string(), FieldValue::Str(doc_id.clone()));
-                let existing = backend
-                    .search(&prepared[0].vector, CLEANUP_SEARCH_K, Some(&filter), &[])
-                    .map_err(|e| anyhow!("store: cleanup search dokumentu: {e}"))?;
-                for hit in existing {
-                    backend
-                        .delete(hit.ref_id)
-                        .map_err(|e| anyhow!("store: cleanup delete ref {}: {e}", hit.ref_id))?;
-                }
-            }
+            Ok(backend) => crate::services::vector::doc_vectors::delete_doc_vectors(
+                &*backend,
+                &doc_id,
+                Some(&prepared[0].vector),
+            )
+            .map_err(|e| anyhow!("store: cleanup-then-reingest: {e}"))?,
             Err(crate::services::vector::error::VectorError::NamespaceNotFound { .. }) => {
                 // Pierwszy ingest do tej przestrzeni — nic do sprzątania.
             }
@@ -418,7 +387,6 @@ impl NodeAdapter for StoreNodeAdapter {
 impl StoreNodeAdapter {
     /// Kasuje listę ref_id z przestrzeni (cleanup-on-failure). Zwraca `Some(msg)`
     /// gdy KTÓRYKOLWIEK delete padł — caller doklei to do błędu ingestu.
-    /// Best-effort: próbujemy skasować wszystkie, raportujemy pierwszy błąd.
     fn rollback(
         ctx: &ExecutionContext,
         org: &str,
@@ -433,13 +401,7 @@ impl StoreNodeAdapter {
             Ok(b) => b,
             Err(e) => return Some(format!("backend niedostępny do rollbacku: {e}")),
         };
-        let mut first_err: Option<String> = None;
-        for r in refs {
-            if let Err(e) = backend.delete(*r) {
-                first_err.get_or_insert(format!("ref {r}: {e}"));
-            }
-        }
-        first_err
+        crate::services::vector::doc_vectors::rollback_refs(&*backend, refs)
     }
 }
 
@@ -449,6 +411,7 @@ mod tests {
     use crate::flow_engine::node_adapter::test_support::{stub_ctx, stub_vectors};
     use serde_json::json;
     use std::sync::Arc;
+    use tentaflow_sdk_spec::Filter;
 
     fn node(config: serde_json::Value) -> FlowNode {
         FlowNode {

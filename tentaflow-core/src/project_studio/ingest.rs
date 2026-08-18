@@ -37,7 +37,7 @@ use crate::services::document::rasterize::extract_pdf_text;
 use crate::services::document::{MAX_PDF_PAGES, MIN_TEXT_LAYER_CHARS_PER_PAGE};
 use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
 use crate::services::vector::error::VectorError;
-use tentaflow_sdk_spec::{FieldType, FieldValue, Filter};
+use tentaflow_sdk_spec::{FieldType, FieldValue};
 
 /// Embeddings model alias resolved by the platform (same alias the RAG addon
 /// uses, so one embedding space serves both).
@@ -49,15 +49,6 @@ pub const VECTOR_NAMESPACE: &str = "passages";
 /// Chunks per embeddings request — bounds request size and lets cancel react
 /// between batches on large files.
 const EMBED_BATCH: usize = 16;
-
-/// Mirrors `flow_engine::node_adapters::store` — one document never has more
-/// chunks than this, so a filtered search with this `k` returns them all for
-/// cleanup.
-const CLEANUP_SEARCH_K: usize = 100_000;
-
-/// Upper bound on repeated cleanup search+delete passes (see
-/// `delete_doc_vectors`); a well-behaved index empties in one or two passes.
-const CLEANUP_MAX_PASSES: usize = 8;
 
 /// Skip reason for scanned PDFs and images: the vision-parse pipeline needs a
 /// flow/addon execution context that a native core job does not have yet.
@@ -515,24 +506,6 @@ pub async fn embed_texts(router: &Router, texts: Vec<String>) -> Result<Vec<Vec<
 // Vector store plumbing
 // =============================================================================
 
-/// Deterministic ref id from (doc_id, chunk_index) — FNV-1a 64-bit, identical
-/// to `flow_engine::node_adapters::store::ref_id_for` so a re-ingest replaces
-/// the old vector instead of duplicating it. ref_id 0 is reserved by zvec.
-fn ref_id_for(doc_id: &str, chunk_index: u64) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in doc_id.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash ^= chunk_index.wrapping_add(1);
-    hash = hash.wrapping_mul(0x100000001b3);
-    if hash == 0 {
-        1
-    } else {
-        hash
-    }
-}
-
 /// Metadata schema of the `passages` namespace. The same names feed `KbHit`
 /// mapping in the dispatcher.
 pub fn passage_field_specs() -> Vec<FieldSpec> {
@@ -586,43 +559,8 @@ pub fn delete_file_vectors(
         Err(VectorError::NamespaceNotFound { .. }) => return Ok(()),
         Err(e) => return Err(anyhow!("vector namespace open: {e}")),
     };
-    delete_doc_vectors(&*backend, file_id, None)
-}
-
-/// Removes every vector whose `doc_id` matches. The backend exposes no
-/// delete-by-filter or full-scan API, so cleanup relies on filtered ANN
-/// searches: a single pass may under-report (HNSW recall is approximate,
-/// especially with a zero-vector probe), therefore search+delete repeats
-/// until a pass returns no hits — deleting found refs improves reachability
-/// of the remainder — bounded by `CLEANUP_MAX_PASSES` as a safety valve.
-fn delete_doc_vectors(
-    backend: &dyn crate::services::vector::backend::VectorBackend,
-    doc_id: &str,
-    probe: Option<&[f32]>,
-) -> Result<()> {
-    let filter = Filter::Eq("doc_id".to_string(), FieldValue::Str(doc_id.to_string()));
-    let zero;
-    let probe: &[f32] = match probe {
-        Some(p) => p,
-        None => {
-            zero = vec![0.0f32; backend.dim() as usize];
-            zero.as_slice()
-        }
-    };
-    for _ in 0..CLEANUP_MAX_PASSES {
-        let existing = backend
-            .search(probe, CLEANUP_SEARCH_K, Some(&filter), &[])
-            .map_err(|e| anyhow!("vector cleanup search: {e}"))?;
-        if existing.is_empty() {
-            return Ok(());
-        }
-        for hit in existing {
-            backend
-                .delete(hit.ref_id)
-                .map_err(|e| anyhow!("vector cleanup delete ref {}: {e}", hit.ref_id))?;
-        }
-    }
-    Ok(())
+    crate::services::vector::doc_vectors::delete_doc_vectors(&*backend, file_id, None)
+        .map_err(|e| anyhow!("vector cleanup: {e}"))
 }
 
 /// Drops every namespace of the project scope `ps-<project_id>` (registry row
@@ -684,7 +622,11 @@ fn store_chunks_blocking(
     // zero vector degenerates under cosine, a fresh vector of the same doc
     // lands near the old ones and maximises cleanup recall (store.rs pattern).
     match mgr.get(org_id, &scope, VECTOR_NAMESPACE) {
-        Ok(backend) => delete_doc_vectors(&*backend, file_id, Some(vectors[0].as_slice()))?,
+        Ok(backend) => crate::services::vector::doc_vectors::delete_doc_vectors(
+            &*backend,
+            file_id,
+            Some(vectors[0].as_slice()),
+        )?,
         Err(VectorError::NamespaceNotFound { .. }) => {}
         Err(e) => return Err(anyhow!("vector namespace open: {e}")),
     }
@@ -739,7 +681,7 @@ fn store_chunks_blocking(
         .zip(vectors.iter())
         .zip(fields_per_chunk.iter())
         .map(|((chunk, vector), fields)| UpsertItem {
-            ref_id: ref_id_for(file_id, chunk.index),
+            ref_id: crate::services::vector::doc_vectors::ref_id_for(file_id, chunk.index),
             vector,
             fields: fields.as_slice(),
             sparse: None,
@@ -1539,11 +1481,20 @@ mod tests {
     fn ref_id_matches_store_adapter_deterministics() {
         // Same doc + index → same id; different index/doc → different id;
         // never zero (reserved by zvec).
-        let a = ref_id_for("doc-1", 0);
-        assert_eq!(a, ref_id_for("doc-1", 0));
-        assert_ne!(a, ref_id_for("doc-1", 1));
-        assert_ne!(a, ref_id_for("doc-2", 0));
-        assert_ne!(ref_id_for("", 0), 0);
+        let a = crate::services::vector::doc_vectors::ref_id_for("doc-1", 0);
+        assert_eq!(
+            a,
+            crate::services::vector::doc_vectors::ref_id_for("doc-1", 0)
+        );
+        assert_ne!(
+            a,
+            crate::services::vector::doc_vectors::ref_id_for("doc-1", 1)
+        );
+        assert_ne!(
+            a,
+            crate::services::vector::doc_vectors::ref_id_for("doc-2", 0)
+        );
+        assert_ne!(crate::services::vector::doc_vectors::ref_id_for("", 0), 0);
     }
 
     #[test]
