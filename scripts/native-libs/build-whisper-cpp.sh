@@ -13,33 +13,10 @@ WHISPER_CPP_REF="${WHISPER_CPP_REF:-v1.8.3}"
 BACKENDS="${WHISPER_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
+# Resolved here (parent shell) so the PATH/CUDACXX/HIPCXX exports reach cmake.
+resolve_gpu_toolchains
 
 SRC="$(repo_checkout whisper.cpp https://github.com/ggml-org/whisper.cpp.git "$WHISPER_CPP_REF")"
-
-detect_backends() {
-  case "$PLATFORM" in
-    linux-*|windows-*)
-      local detected=()
-      command -v nvcc >/dev/null 2>&1 && detected+=("cuda")
-      if command -v hipcc >/dev/null 2>&1 || command -v amdclang++ >/dev/null 2>&1; then
-        detected+=("rocm")
-      fi
-      if command -v glslc >/dev/null 2>&1 || command -v vulkaninfo >/dev/null 2>&1 || [ -n "${VULKAN_SDK:-}" ]; then
-        detected+=("vulkan")
-      fi
-      printf '%s\n' "${detected[@]}"
-      ;;
-    macos-*)
-      printf '%s\n' "metal"
-      ;;
-    android-*)
-      true
-      ;;
-    *)
-      true
-      ;;
-  esac
-}
 
 android_abi_for_platform() {
   case "$1" in
@@ -72,9 +49,12 @@ android_cxx_for_platform() {
 if [ "$BACKENDS" = "auto" ]; then
   BACKEND_LIST=("multi")
   MULTI_BACKENDS=()
+  # Command substitution (not process substitution) so a hard error inside
+  # detect_backends aborts the script under set -e.
+  detected_backends="$(detect_backends)"
   while IFS= read -r backend; do
     [ -n "$backend" ] && MULTI_BACKENDS+=("$backend")
-  done < <(detect_backends)
+  done <<< "$detected_backends"
 else
   IFS=',' read -r -a BACKEND_LIST <<< "$BACKENDS"
   MULTI_BACKENDS=()
@@ -118,6 +98,14 @@ build_isolated_dylib() {
   done
   if [ "${#archives[@]}" -eq 0 ]; then
     echo "[whisper.cpp] brak archiwow .a w $static_dir" >&2
+    exit 1
+  fi
+  # ggml-hip is ggml-cuda compiled for HIP: same object names, same symbols,
+  # one ggml_backend_cuda_reg() registration — the two can never share one link.
+  if [ -f "$static_dir/libggml-cuda.a" ] && [ -f "$static_dir/libggml-hip.a" ]; then
+    echo "[whisper.cpp] $static_dir contains both libggml-cuda.a and libggml-hip.a;" >&2
+    echo "  the CUDA and HIP ggml backends define the same symbols and cannot be linked into one object." >&2
+    echo "  Build them as separate variants (WHISPER_CPP_BACKENDS=cuda or rocm)." >&2
     exit 1
   fi
   # Liby systemowe/frameworki dobieramy po OBECNOSCI archiwum backendu, nie po
@@ -200,7 +188,11 @@ build_backend() {
   local jobs
   local enabled_backends=()
   reset_dir "$build"
-  mkdir -p "$static_dir" "$dynamic_dir"
+  # Wipe the variant's outputs before copying: build_isolated_dylib globs
+  # lib*.a, so a stale archive from a previous build (e.g. libggml-cuda.a next
+  # to a fresh libggml-hip.a) would be linked in and clash on ggml symbols.
+  reset_dir "$static_dir"
+  reset_dir "$dynamic_dir"
 
   local cmake_args=(
     -S "$SRC"

@@ -43,6 +43,134 @@ platform_cpu_count() {
   nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4
 }
 
+# Resolves a compiler binary: PATH first, then the given fallback locations.
+# Prints the absolute path on success.
+find_toolchain_compiler() {
+  local name="$1"
+  shift
+  local found candidate
+  if found="$(command -v "$name" 2>/dev/null)"; then
+    printf '%s\n' "$found"
+    return 0
+  fi
+  for candidate in "$@"; do
+    [ -n "$candidate" ] && [ -x "$candidate" ] || continue
+    printf '%s\n' "$candidate"
+    return 0
+  done
+  return 1
+}
+
+# Prepends the compiler's directory to PATH when it was found outside PATH, so
+# cmake's CUDA/HIP language detection sees the same compiler.
+expose_compiler_on_path() {
+  local compiler="$1"
+  command -v "$(basename "$compiler")" >/dev/null 2>&1 && return 0
+  export PATH="$(dirname "$compiler"):$PATH"
+}
+
+# Locates nvcc/hipcc (PATH or the usual toolkit prefixes) and exports what
+# cmake needs to pick them up (PATH, CUDACXX, HIPCXX). Idempotent: the result
+# is cached in exported NATIVE_NVCC / NATIVE_HIPCC, so it can be called from
+# the parent shell (where the exports must land) and again from subshells.
+resolve_gpu_toolchains() {
+  [ "${NATIVE_TOOLCHAINS_RESOLVED:-0}" = "1" ] && return 0
+  export NATIVE_TOOLCHAINS_RESOLVED=1
+  export NATIVE_NVCC="" NATIVE_HIPCC=""
+
+  local nvcc hipcc
+  if nvcc="$(find_toolchain_compiler nvcc \
+      "${CUDA_HOME:+$CUDA_HOME/bin/nvcc}" \
+      "${CUDA_PATH:+$CUDA_PATH/bin/nvcc}" \
+      /usr/local/cuda/bin/nvcc \
+      /opt/cuda/bin/nvcc)"; then
+    expose_compiler_on_path "$nvcc"
+    export NATIVE_NVCC="$nvcc"
+    export CUDACXX="${CUDACXX:-$nvcc}"
+  fi
+  if hipcc="$(find_toolchain_compiler hipcc \
+      "${HIP_PATH:+$HIP_PATH/bin/hipcc}" \
+      "${ROCM_PATH:+$ROCM_PATH/bin/hipcc}" \
+      /opt/rocm/bin/hipcc)"; then
+    expose_compiler_on_path "$hipcc"
+    export NATIVE_HIPCC="$hipcc"
+    export HIPCXX="${HIPCXX:-$hipcc}"
+  fi
+}
+
+nvidia_gpu_visible() {
+  [ "$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')" -ge 1 ] 2>/dev/null
+}
+
+amd_gpu_visible() {
+  rocm-smi --showid >/dev/null 2>&1 && return 0
+  [ -e /sys/class/kfd/kfd ] && return 0
+  lspci 2>/dev/null | grep -iE 'VGA|3D' | grep -qi amd
+}
+
+# Prints the auto-detected GPU backends for $PLATFORM, one per line, and a
+# one-line summary (with compiler paths) on stderr so a silent miss is visible.
+# On Linux a visible NVIDIA GPU without a detected CUDA toolkit is a hard error:
+# the toolkit is almost certainly installed but not found.
+detect_backends() {
+  case "$PLATFORM" in
+    linux-*|windows-*)
+      resolve_gpu_toolchains
+      local detected=() summary=()
+      local hipcc="$NATIVE_HIPCC"
+      if [ -z "$hipcc" ] && command -v amdclang++ >/dev/null 2>&1; then
+        hipcc="$(command -v amdclang++)"
+      fi
+      if [ -n "$NATIVE_NVCC" ] && [ -n "$hipcc" ]; then
+        # ggml-hip is ggml-cuda built for HIP (same symbols, one
+        # ggml_backend_cuda_reg), so a static ggml can hold only one of them:
+        # pick by the GPU that is actually visible on this machine.
+        local pick reason
+        if nvidia_gpu_visible; then
+          pick="cuda"; reason="NVIDIA GPU visible"
+        elif amd_gpu_visible; then
+          pick="rocm"; reason="AMD GPU visible"
+        else
+          pick="cuda"; reason="no GPU visible, default"
+        fi
+        echo "[native-libs] cuda and rocm toolchains both present; static ggml can hold only one — choosing $pick ($reason). Override with LLAMA_CPP_BACKENDS/WHISPER_CPP_BACKENDS." >&2
+        if [ "$pick" = "cuda" ]; then hipcc=""; else NATIVE_NVCC=""; fi
+      fi
+      if [ -n "$NATIVE_NVCC" ]; then
+        detected+=("cuda")
+        summary+=("cuda($NATIVE_NVCC)")
+      fi
+      if [ -n "$hipcc" ]; then
+        detected+=("rocm")
+        summary+=("rocm($hipcc)")
+      fi
+      if command -v glslc >/dev/null 2>&1 || command -v vulkaninfo >/dev/null 2>&1 || [ -n "${VULKAN_SDK:-}" ]; then
+        detected+=("vulkan")
+        summary+=("vulkan")
+      fi
+      echo "[native-libs] backends: ${summary[*]:-none}" >&2
+      case "$PLATFORM" in
+        linux-*)
+          if [ -z "$NATIVE_NVCC" ] && [ -z "$hipcc" ] && nvidia_gpu_visible; then
+            echo "[native-libs] ERROR: an NVIDIA GPU is visible (nvidia-smi -L) but no CUDA toolkit was found" >&2
+            echo "  (looked for nvcc on PATH, \$CUDA_HOME/bin, \$CUDA_PATH/bin, /usr/local/cuda/bin, /opt/cuda/bin)." >&2
+            echo "  Install the toolkit or export CUDA_HOME; to build without CUDA on purpose set" >&2
+            echo "  LLAMA_CPP_BACKENDS / WHISPER_CPP_BACKENDS explicitly instead of 'auto'." >&2
+            exit 1
+          fi
+          ;;
+      esac
+      printf '%s\n' "${detected[@]}"
+      ;;
+    macos-*|ios-*)
+      printf '%s\n' "metal"
+      ;;
+    *)
+      true
+      ;;
+  esac
+}
+
 require_cmd() {
   local missing=0
   for cmd in "$@"; do
