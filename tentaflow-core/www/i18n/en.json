@@ -1750,7 +1750,12 @@
     "tpl_agent_researcher_role": "Researcher — gathers sources from the web and knowledge",
     "tpl_agent_summarizer_name": "Summariser",
     "tpl_agent_summarizer_role": "Summariser — condenses findings into a note",
-    "tpl_agent_summarizer_prompt": "You are a summariser. You condense the provided material into one concise note: key findings, conclusions and open questions, always with source references."
+    "tpl_agent_summarizer_prompt": "You are a summariser. You condense the provided material into one concise note: key findings, conclusions and open questions, always with source references.",
+    "label_reasoning_effort": "Reasoning effort",
+    "hint_reasoning_effort": "Levels come from the selected model. Empty = leave the model's own setting.",
+    "reasoning_effort_default": "Model default",
+    "label_temperature": "Temperature",
+    "hint_temperature": "Higher = more creative, lower = more conservative. Empty = the model's own setting."
   },
   "skills": {
     "title": "Skills",

@@ -5245,6 +5245,10 @@ pub struct CatalogEntryWire {
     pub service_surfaces: Vec<String>,
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
+    /// Poziomy rozumowania wspierane przez model. `#[serde(default)]`, bo wezel
+    /// ze starsza binarka wysle wpis bez tego pola — dekoder musi to znosic.
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
     pub diagnostic: Option<CatalogDiagnosticWire>,
     /// `tentaflow-service` | `tentaflow-flow` | `tentaflow-alias`.
     pub owned_by: String,

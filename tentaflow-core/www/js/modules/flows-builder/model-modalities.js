@@ -17,6 +17,7 @@
 // Example:
 //   await ModelModalities.load();
 //   ModelModalities.accepts('qwen3-vl', 'image');   // -> true | false | null
+//   ModelModalities.reasoningLevels('gpt-5');       // -> ['low','high'] | [] | null
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -37,6 +38,8 @@ function build(entries) {
     map.set(id, {
       input: new Set((e.inputModalities ?? e.input_modalities ?? []).map(normalise)),
       output: new Set((e.outputModalities ?? e.output_modalities ?? []).map(normalise)),
+      // Kolejność z katalogu jest znacząca (low → high), więc lista, nie zbiór.
+      reasoning: (e.reasoningLevels ?? e.reasoning_levels ?? []).map(normalise),
     });
   }
   return map;
@@ -78,6 +81,16 @@ export const ModelModalities = {
     if (!e) return null;
     if (e.output.size === 0) return normalise(modality) === 'text';
     return e.output.has(normalise(modality));
+  },
+
+  /// Poziomy rozumowania modelu w kolejności podanej przez katalog. Pusta lista =
+  /// model NIE wspiera sterowania rozumowaniem, więc formularz nie ma czego
+  /// pokazać. `null` = model nieznany katalogowi — tak jak przy modalnościach nie
+  /// wyciągamy z tego wniosku, że czegoś nie potrafi.
+  reasoningLevels(modelId) {
+    const e = index?.get(normalise(modelId));
+    if (!e) return null;
+    return e.reasoning.slice();
   },
 
   known(modelId) {

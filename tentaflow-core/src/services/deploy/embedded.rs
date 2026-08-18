@@ -1066,6 +1066,7 @@ mod tests {
     fn manifest(id: &str, runtime: NativeRuntime, platforms: Vec<TargetOs>) -> ServiceManifest {
         ServiceManifest {
             engine: Engine {
+                reasoning_levels: None,
                 id: id.into(),
                 backend: None,
                 category: Category::Llm,
@@ -1102,6 +1103,7 @@ mod tests {
                 external: None,
             },
             model_presets: vec![ModelPreset {
+                reasoning_levels: None,
                 id: "p1".into(),
                 display_name: "Preset 1".into(),
                 repo: "x".into(),

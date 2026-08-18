@@ -300,6 +300,11 @@ impl NodeAdapter for AgentContextNodeAdapter {
             serde_json::json!(max_iterations),
         );
 
+        // `params_json` jest walidowany przy zapisie agenta jako obiekt JSON; wiersz
+        // z uszkodzona trescia nie moze wywrocic tury, wiec degradujemy do pustego.
+        let agent_params: serde_json::Map<String, serde_json::Value> =
+            serde_json::from_str(&agent.params_json).unwrap_or_default();
+
         // model: node override > agent definition > platform default. The last
         // step is what makes a fresh install work at all: the seeded agents
         // carry `model = NULL`, and without a default the first turn fails in
@@ -322,6 +327,23 @@ impl NodeAdapter for AgentContextNodeAdapter {
             });
         if let Some(model) = resolved {
             out.meta.insert("model".into(), serde_json::json!(model));
+        }
+
+        // Parametry generowania agenta (`agents.params_json`): jak dlugo ma myslec
+        // i jak tworczo ma odpowiadac. Ta sama kolejnosc co przy modelu — node
+        // override > definicja agenta — i ten sam nosnik, `envelope.meta`, bo blok
+        // llm czyta oba klucze z fallbackiem `node.config -> meta`.
+        //
+        // Wartosci NIE sa tu walidowane wzgledem modelu. Poziom rozumowania, ktorego
+        // model nie wspiera, jest odrzucany dopiero przy skladaniu zadania (jedno
+        // miejsce znajace zdolnosci celu), a nie tutaj — inaczej przepiecie agenta na
+        // inny model cicho zmienialoby zapisana konfiguracje.
+        for key in ["temperature", "reasoning_effort"] {
+            let from_node = node.config.get(key).filter(|v| !v.is_null()).cloned();
+            let from_agent = agent_params.get(key).filter(|v| !v.is_null()).cloned();
+            if let Some(value) = from_node.or(from_agent) {
+                out.meta.insert(key.to_string(), value);
+            }
         }
 
         // Create the agent_runs row unless the harness already opened one (a run

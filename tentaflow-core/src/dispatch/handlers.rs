@@ -3885,6 +3885,7 @@ fn catalog_snapshot_to_wire(
         });
 
         out.push(CatalogEntryWire {
+            reasoning_levels: entry.reasoning_levels.clone(),
             id: entry.id.clone(),
             kind,
             service_surfaces: entry
@@ -8377,6 +8378,7 @@ pub async fn agent_builder_assist(
     }
 
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: crate::skills::resolve_model(&ctx.state.db),
@@ -11183,6 +11185,7 @@ mod catalog_list_tests {
 
     fn service_entry(id: &str, surface: ServiceSurface) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::ServiceModel {
                 instances: vec![ModelInstance {
@@ -11206,6 +11209,7 @@ mod catalog_list_tests {
 
     fn alias_entry(id: &str, target: &str, fallbacks: Vec<&str>) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::Alias {
                 target: target.to_string(),
@@ -11221,6 +11225,7 @@ mod catalog_list_tests {
 
     fn flow_entry(id: &str, flow_id: &str) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::Flow {
                 flow_id: flow_id.to_string(),

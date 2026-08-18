@@ -454,6 +454,7 @@ mod tests {
         output: Vec<OutputModality>,
     ) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::ServiceModel {
                 instances: vec![ModelInstance {
@@ -477,6 +478,7 @@ mod tests {
 
     fn alias(id: &str, target: &str, fallbacks: &[&str], strategy: Strategy) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::Alias {
                 target: target.to_string(),
@@ -522,6 +524,7 @@ mod tests {
         surfaces: Vec<ServiceSurface>,
     ) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::ServiceModel {
                 instances: vec![ModelInstance {

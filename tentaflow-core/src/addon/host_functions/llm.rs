@@ -477,6 +477,7 @@ pub fn llm_generate(
 
     // Zbuduj ChatCompletionRequest
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: model_name.unwrap_or_else(|| "default".to_string()),
@@ -972,6 +973,7 @@ pub fn llm_generate_stream_start(
         .map(|v| v as f32);
 
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: model_name.clone().unwrap_or_else(|| "default".to_string()),

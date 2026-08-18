@@ -66,6 +66,19 @@ impl LlmNodeAdapter {
             .map(|f| f as f32)
     }
 
+    /// Lustro `pick_optional_f32` dla wartosci tekstowych. Pusty napis traktujemy
+    /// jak brak — inaczej wyczyszczone pole w formularzu wysylaloby `""` jako
+    /// poziom rozumowania.
+    fn pick_optional_string(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<String> {
+        node.config
+            .get(key)
+            .and_then(|v| v.as_str())
+            .or_else(|| envelope.meta.get(key).and_then(|v| v.as_str()))
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+    }
+
     fn pick_optional_u32(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<u32> {
         node.config
             .get(key)
@@ -432,6 +445,7 @@ impl LlmNodeAdapter {
             model,
             messages,
             temperature: Self::pick_optional_f32(node, envelope, "temperature"),
+            reasoning_effort: Self::pick_optional_string(node, envelope, "reasoning_effort"),
             max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
             top_p: Self::pick_optional_f32(node, envelope, "top_p"),
             frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
@@ -643,6 +657,7 @@ impl LlmAdapter for LlmNodeAdapter {
                 model: String::new(),
                 messages: Self::build_messages(node, envelope),
                 temperature: Self::pick_optional_f32(node, envelope, "temperature"),
+                reasoning_effort: Self::pick_optional_string(node, envelope, "reasoning_effort"),
                 max_tokens: Self::pick_optional_u32(node, envelope, "max_tokens"),
                 top_p: Self::pick_optional_f32(node, envelope, "top_p"),
                 frequency_penalty: Self::pick_optional_f32(node, envelope, "frequency_penalty"),
@@ -958,5 +973,46 @@ mod tests {
         assert_eq!(req.temperature, Some(0.7));
         assert_eq!(req.max_tokens, Some(128));
         assert_eq!(req.stop, vec!["\n".to_string()]);
+    }
+
+    /// Poziom rozumowania i temperatura docieraja z `envelope.meta` (tam wpisuje je
+    /// `agent_context` z definicji agenta), a `node.config` je przesłania — ta sama
+    /// kolejnosc co przy modelu.
+    #[test]
+    fn reasoning_effort_comes_from_config_then_meta() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), serde_json::json!("m"));
+        env.meta
+            .insert("reasoning_effort".into(), serde_json::json!("high"));
+        env.meta
+            .insert("temperature".into(), serde_json::json!(0.2));
+
+        let from_meta =
+            LlmNodeAdapter::pick_optional_string(&node(json!({})), &env, "reasoning_effort");
+        assert_eq!(from_meta.as_deref(), Some("high"));
+        assert_eq!(
+            LlmNodeAdapter::pick_optional_f32(&node(json!({})), &env, "temperature"),
+            Some(0.2)
+        );
+
+        let overridden = LlmNodeAdapter::pick_optional_string(
+            &node(json!({"reasoning_effort": "low"})),
+            &env,
+            "reasoning_effort",
+        );
+        assert_eq!(overridden.as_deref(), Some("low"), "config przesłania meta");
+    }
+
+    /// Wyczyszczone pole w formularzu zapisuje pusty napis — nie moze wyjsc na wire
+    /// jako poziom rozumowania, bo backend odrzucilby ""; ma zniknac jak brak.
+    #[test]
+    fn blank_reasoning_effort_is_treated_as_unset() {
+        let mut env = FlowEnvelope::empty();
+        env.meta
+            .insert("reasoning_effort".into(), serde_json::json!("   "));
+        assert_eq!(
+            LlmNodeAdapter::pick_optional_string(&node(json!({})), &env, "reasoning_effort"),
+            None
+        );
     }
 }

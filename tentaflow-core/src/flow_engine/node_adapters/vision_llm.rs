@@ -188,6 +188,7 @@ impl NodeAdapter for VisionNodeAdapter {
 
         let req = LlmRequest {
             audio_out: None,
+            reasoning_effort: None,
             model,
             messages,
             temperature: Self::pick_optional_f32(node, envelope, "temperature"),

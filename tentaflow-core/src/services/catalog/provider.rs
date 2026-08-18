@@ -157,6 +157,7 @@ struct EntryCapabilities {
     surfaces: Vec<ServiceSurface>,
     input: Vec<InputModality>,
     output: Vec<OutputModality>,
+    reasoning_levels: Vec<String>,
 }
 
 fn build_capabilities_index(entries: &[CatalogEntry]) -> HashMap<String, EntryCapabilities> {
@@ -168,6 +169,7 @@ fn build_capabilities_index(entries: &[CatalogEntry]) -> HashMap<String, EntryCa
                 surfaces: entry.service_surfaces.clone(),
                 input: entry.input_modalities.clone(),
                 output: entry.output_modalities.clone(),
+                reasoning_levels: entry.reasoning_levels.clone(),
             },
         );
     }
@@ -204,6 +206,9 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
     // routing won't reject a request that one of them can satisfy.
     let mut inputs_by_name: HashMap<String, HashSet<InputModality>> = HashMap::new();
     let mut outputs_by_name: HashMap<String, HashSet<OutputModality>> = HashMap::new();
+    // Poziomy rozumowania sa wlasnoscia modelu, wiec zbieramy je tak samo jak
+    // modalnosci — po nazwie modelu, przez wszystkie instancje w siatce.
+    let mut reasoning_by_name: HashMap<String, HashSet<String>> = HashMap::new();
 
     for svc in registry.visible_services() {
         let is_local = svc.node_id == local_node_id;
@@ -217,6 +222,7 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             let mut svc_surfaces: HashSet<ServiceSurface> = HashSet::new();
             let mut svc_inputs: HashSet<InputModality> = HashSet::new();
             let mut svc_outputs: HashSet<OutputModality> = HashSet::new();
+            let mut svc_reasoning: HashSet<String> = HashSet::new();
             // Surfaces anonsowane przez właściciela (policzone z JEGO manifestu)
             // są autorytatywne — działają nawet gdy TEN node nie ma manifestu
             // silnika, a `category` (np. `vision`) nie mapuje się na ServiceSurface.
@@ -251,6 +257,9 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
                         svc_outputs.insert(v);
                     }
                 }
+                for level in m.engine.effective_reasoning_levels(preset) {
+                    svc_reasoning.insert(level);
+                }
             } else {
                 // Manifest nieznany na tym nodzie (np. serwis z mesh od noda
                 // z innym zestawem silnikow) — surfaces i modalnosci spadaja
@@ -284,6 +293,10 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
                 .entry(model.model_name.clone())
                 .or_default()
                 .extend(svc_inputs.iter().copied());
+            reasoning_by_name
+                .entry(model.model_name.clone())
+                .or_default()
+                .extend(svc_reasoning.iter().cloned());
             outputs_by_name
                 .entry(model.model_name.clone())
                 .or_default()
@@ -340,12 +353,22 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             .collect();
         outputs.sort_by_key(|v| *v as u8);
 
+        let model_name_for_reasoning = model_name.clone();
         out.push(CatalogEntry {
             id: model_name,
             kind: CatalogEntryKind::ServiceModel { instances },
             service_surfaces: surfaces,
             input_modalities: inputs,
             output_modalities: outputs,
+            reasoning_levels: {
+                let mut v: Vec<String> = reasoning_by_name
+                    .remove(&model_name_for_reasoning)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .collect();
+                v.sort();
+                v
+            },
             diagnostic: None,
         });
     }
@@ -392,6 +415,9 @@ fn build_flow_entries(pool: &DbPool, taken_ids: &HashSet<String>) -> Result<Vec<
         let (input_modalities, output_modalities) = infer_flow_modalities(&flow.flow_json);
 
         entries.push(CatalogEntry {
+            // Flow nie jest modelem i nie ma wlasnych poziomow rozumowania —
+            // decyduje o nich model wewnatrz jego wezlow llm.
+            reasoning_levels: Vec::new(),
             id: published_name.clone(),
             kind: CatalogEntryKind::Flow {
                 flow_id: flow.id,
@@ -474,6 +500,10 @@ pub(crate) const MODALITY_PASSTHROUGH_NODE_TYPES: &[&str] = &[
     // Harness control / sub-agent orchestration nodes (no media modality of
     // their own — they steer the graph or run other flows / agents).
     "agent",
+    // Bramki potoku Code Harness: decyduja, CZY tura leci dalej, i przepuszczaja
+    // envelope bez zmiany nosnika.
+    "critic_gate",
+    "task_gate",
     "agent_context",
     "agent_router",
     "ask_user",
@@ -697,6 +727,9 @@ fn build_alias_entries(
             service_surfaces: primary_caps.surfaces,
             input_modalities: primary_caps.input,
             output_modalities: primary_caps.output,
+            // Alias dziedziczy poziomy po celu — to ten sam model, tylko pod inna
+            // nazwa; wlasnych zdolnosci nie ma.
+            reasoning_levels: primary_caps.reasoning_levels,
             diagnostic,
         });
     }
@@ -860,6 +893,7 @@ mod tests {
     fn advertised_entries_strip_blocking_diagnostics() {
         let entries = vec![
             CatalogEntry {
+                reasoning_levels: Vec::new(),
                 id: "good".into(),
                 kind: CatalogEntryKind::ServiceModel { instances: vec![] },
                 service_surfaces: vec![],
@@ -868,6 +902,7 @@ mod tests {
                 diagnostic: None,
             },
             CatalogEntry {
+                reasoning_levels: Vec::new(),
                 id: "shadowed".into(),
                 kind: CatalogEntryKind::ServiceModel { instances: vec![] },
                 service_surfaces: vec![],
@@ -878,6 +913,7 @@ mod tests {
                 }),
             },
             CatalogEntry {
+                reasoning_levels: Vec::new(),
                 id: "info".into(),
                 kind: CatalogEntryKind::Alias {
                     target: "good".into(),

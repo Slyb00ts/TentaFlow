@@ -43,6 +43,11 @@ pub struct LlmRequest {
     /// zadanie nie niesie ani `modalities`, ani `audio` — backend bez wsparcia
     /// omni odrzuca te pola, wiec nie wysylamy ich "na wszelki wypadek".
     pub audio_out: Option<AudioOut>,
+    /// Jak dlugo model ma "myslec" (`low` | `medium` | `high` | `xhigh` | `max`).
+    /// Zestaw poziomow zalezy od MODELU, nie od nas — tu jedzie surowa wartosc,
+    /// a jej dopuszczalnosc rozstrzyga sie przy skladaniu zadania do konkretnego
+    /// backendu. `None` = nie ruszamy ustawienia modelu.
+    pub reasoning_effort: Option<String>,
     /// OpenAI-style tool_choice ("auto" / "none" / "required"). `None`
     /// leaves the backend default.
     pub tool_choice: Option<String>,
@@ -72,6 +77,7 @@ impl LlmRequest {
     pub fn new(model: impl Into<String>) -> Self {
         Self {
             audio_out: None,
+            reasoning_effort: None,
             model: model.into(),
             messages: Vec::new(),
             temperature: None,

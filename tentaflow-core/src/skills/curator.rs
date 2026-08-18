@@ -756,6 +756,7 @@ pub fn rollback_snapshot(
 /// choice's text content.
 pub async fn router_complete(router: &Router, model: &str, prompt: String) -> Result<String> {
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: model.to_string(),

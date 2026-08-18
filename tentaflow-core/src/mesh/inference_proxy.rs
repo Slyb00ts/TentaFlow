@@ -442,6 +442,7 @@ fn build_chat_request(
     }
 
     Ok(ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: payload.model.clone(),

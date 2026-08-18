@@ -530,6 +530,7 @@ async fn build_chat_request(
         None => (None, None),
     };
     Ok(ChatCompletionRequest {
+        reasoning_effort: req.reasoning_effort.clone(),
         modalities,
         audio,
         model: req.model.clone(),

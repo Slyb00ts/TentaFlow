@@ -76,6 +76,13 @@ pub struct ChatCompletionRequest {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub temperature: Option<f32>,
 
+    /// Jak dlugo model ma rozumowac (`low` | `medium` | `high` | `xhigh` | `max`).
+    /// Zestaw poziomow nalezy do MODELU — pole jest przekazywane bez tlumaczenia,
+    /// a backend, ktory go nie zna, po prostu go nie dostaje: `skip_serializing_if`
+    /// pilnuje, zeby zadanie bez ustawionego poziomu nie niosло tego klucza wcale.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
+
     /// Max tokens w odpowiedzi
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<u32>,

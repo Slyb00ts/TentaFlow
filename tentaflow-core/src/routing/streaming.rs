@@ -1090,6 +1090,7 @@ mod compliance_stream_tests {
         let db = db();
         let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
+            reasoning_effort: None,
             modalities: None,
             audio: None,
             model: "bielik".to_string(),

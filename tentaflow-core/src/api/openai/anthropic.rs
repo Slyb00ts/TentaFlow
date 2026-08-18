@@ -314,6 +314,7 @@ fn to_openai_request(
         .and_then(|_| to_openai_tool_choice(req.tool_choice.as_ref()));
 
     Ok(ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: req.model,

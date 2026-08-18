@@ -715,6 +715,7 @@ mod tests {
         };
         let manifest = ServiceManifest {
             engine: Engine {
+                reasoning_levels: None,
                 id: "no-bundle".into(),
                 backend: None,
                 category: Category::Llm,

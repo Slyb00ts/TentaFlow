@@ -1745,7 +1745,12 @@
     "tpl_agent_researcher_role": "Investigador — reúne fuentes de la web y del conocimiento",
     "tpl_agent_summarizer_name": "Sintetizador",
     "tpl_agent_summarizer_role": "Sintetizador — condensa las conclusiones en una nota",
-    "tpl_agent_summarizer_prompt": "Eres un sintetizador. Condensas el material proporcionado en una nota concisa: hallazgos clave, conclusiones y preguntas abiertas, siempre con referencias a las fuentes."
+    "tpl_agent_summarizer_prompt": "Eres un sintetizador. Condensas el material proporcionado en una nota concisa: hallazgos clave, conclusiones y preguntas abiertas, siempre con referencias a las fuentes.",
+    "label_reasoning_effort": "Nivel de razonamiento",
+    "hint_reasoning_effort": "Los niveles provienen del modelo elegido. Vacío = mantener el ajuste del modelo.",
+    "reasoning_effort_default": "Predeterminado del modelo",
+    "label_temperature": "Temperatura",
+    "hint_temperature": "Más alto = más creativo, más bajo = más conservador. Vacío = ajuste del modelo."
   },
   "skills": {
     "title": "Habilidades",

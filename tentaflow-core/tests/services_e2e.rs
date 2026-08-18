@@ -51,6 +51,7 @@ fn test_cipher() -> tentaflow_core::crypto::SettingsCipher {
 fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
     ServiceManifest {
         engine: Engine {
+            reasoning_levels: None,
             id: id.into(),
             category: Category::Llm,
             name: id.into(),
@@ -88,6 +89,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             external: None,
         },
         model_presets: vec![ModelPreset {
+            reasoning_levels: None,
             id: "preset-a".into(),
             display_name: "Preset A".into(),
             repo: "org/model".into(),

@@ -191,6 +191,7 @@ text, with no explanations, quotes, preface or meta-commentary.",
     let model_id = pick_llm_model(ctx);
 
     let completion_req = ChatCompletionRequest {
+        reasoning_effort: None,
         modalities: None,
         audio: None,
         model: model_id.clone(),

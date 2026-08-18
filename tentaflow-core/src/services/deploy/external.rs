@@ -188,6 +188,7 @@ mod tests {
     fn manifest_with_external(id: &str, endpoint: &str, health: &str) -> ServiceManifest {
         ServiceManifest {
             engine: Engine {
+                reasoning_levels: None,
                 id: id.into(),
                 backend: None,
                 category: Category::Llm,
@@ -224,6 +225,7 @@ mod tests {
                 }),
             },
             model_presets: vec![ModelPreset {
+                reasoning_levels: None,
                 id: "preset-x".into(),
                 display_name: "Preset X".into(),
                 repo: "x".into(),

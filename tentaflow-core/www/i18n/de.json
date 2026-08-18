@@ -1745,7 +1745,12 @@
     "tpl_agent_researcher_role": "Researcher — sammelt Quellen aus Web und Wissen",
     "tpl_agent_summarizer_name": "Zusammenfasser",
     "tpl_agent_summarizer_role": "Zusammenfasser — verdichtet Erkenntnisse zu einer Notiz",
-    "tpl_agent_summarizer_prompt": "Du bist ein Zusammenfasser. Du verdichtest das bereitgestellte Material zu einer knappen Notiz: zentrale Erkenntnisse, Schlussfolgerungen und offene Fragen, stets mit Quellenverweisen."
+    "tpl_agent_summarizer_prompt": "Du bist ein Zusammenfasser. Du verdichtest das bereitgestellte Material zu einer knappen Notiz: zentrale Erkenntnisse, Schlussfolgerungen und offene Fragen, stets mit Quellenverweisen.",
+    "label_reasoning_effort": "Denktiefe",
+    "hint_reasoning_effort": "Die Stufen stammen vom gewählten Modell. Leer = Einstellung des Modells beibehalten.",
+    "reasoning_effort_default": "Modellstandard",
+    "label_temperature": "Temperatur",
+    "hint_temperature": "Höher = kreativer, niedriger = konservativer. Leer = Einstellung des Modells."
   },
   "skills": {
     "title": "Skills",

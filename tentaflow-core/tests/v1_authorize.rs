@@ -23,6 +23,7 @@ fn open_pool() -> (tempfile::TempDir, DbPool) {
 
 fn service_model(id: &str) -> CatalogEntry {
     CatalogEntry {
+        reasoning_levels: Vec::new(),
         id: id.to_string(),
         kind: CatalogEntryKind::ServiceModel { instances: vec![] },
         service_surfaces: vec![],
@@ -34,6 +35,7 @@ fn service_model(id: &str) -> CatalogEntry {
 
 fn flow_entry(id: &str) -> CatalogEntry {
     CatalogEntry {
+        reasoning_levels: Vec::new(),
         id: id.to_string(),
         kind: CatalogEntryKind::Flow {
             flow_id: id.to_string(),
@@ -48,6 +50,7 @@ fn flow_entry(id: &str) -> CatalogEntry {
 
 fn alias_entry(id: &str, target: &str, fallbacks: &[&str]) -> CatalogEntry {
     CatalogEntry {
+        reasoning_levels: Vec::new(),
         id: id.to_string(),
         kind: CatalogEntryKind::Alias {
             target: target.to_string(),

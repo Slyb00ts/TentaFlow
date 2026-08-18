@@ -2237,6 +2237,7 @@ impl ModelRuntimeExecutor {
              Zwróć WYŁĄCZNIE treść dokumentu, bez komentarza.";
 
         let chat_request = ChatCompletionRequest {
+            reasoning_effort: None,
             modalities: None,
             audio: None,
             model: request.model.clone(),

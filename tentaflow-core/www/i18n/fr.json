@@ -1745,7 +1745,12 @@
     "tpl_agent_researcher_role": "Chercheur — rassemble des sources du web et des connaissances",
     "tpl_agent_summarizer_name": "Synthétiseur",
     "tpl_agent_summarizer_role": "Synthétiseur — condense les conclusions en une note",
-    "tpl_agent_summarizer_prompt": "Tu es un synthétiseur. Tu condenses les documents fournis en une note concise : conclusions clés, enseignements et questions ouvertes, toujours avec des références aux sources."
+    "tpl_agent_summarizer_prompt": "Tu es un synthétiseur. Tu condenses les documents fournis en une note concise : conclusions clés, enseignements et questions ouvertes, toujours avec des références aux sources.",
+    "label_reasoning_effort": "Effort de raisonnement",
+    "hint_reasoning_effort": "Les niveaux proviennent du modèle choisi. Vide = conserver le réglage du modèle.",
+    "reasoning_effort_default": "Valeur par défaut du modèle",
+    "label_temperature": "Température",
+    "hint_temperature": "Plus haut = plus créatif, plus bas = plus prudent. Vide = réglage du modèle."
   },
   "skills": {
     "title": "Compétences",

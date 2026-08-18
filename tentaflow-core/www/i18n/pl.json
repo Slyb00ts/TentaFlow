@@ -1750,7 +1750,12 @@
     "tpl_agent_researcher_role": "Researcher — zbiera źródła z sieci i wiedzy",
     "tpl_agent_summarizer_name": "Streszczacz",
     "tpl_agent_summarizer_role": "Streszczacz — kondensuje ustalenia do notatki",
-    "tpl_agent_summarizer_prompt": "Jesteś streszczaczem. Kondensujesz dostarczone materiały do jednej zwięzłej notatki: najważniejsze ustalenia, wnioski i otwarte pytania, zawsze z odnośnikami do źródeł."
+    "tpl_agent_summarizer_prompt": "Jesteś streszczaczem. Kondensujesz dostarczone materiały do jednej zwięzłej notatki: najważniejsze ustalenia, wnioski i otwarte pytania, zawsze z odnośnikami do źródeł.",
+    "label_reasoning_effort": "Głębokość rozumowania",
+    "hint_reasoning_effort": "Poziomy pochodzą z wybranego modelu. Puste = zostaw ustawienie modelu.",
+    "reasoning_effort_default": "Domyślna modelu",
+    "label_temperature": "Temperatura",
+    "hint_temperature": "Wyżej = bardziej twórczo, niżej = bardziej zachowawczo. Puste = ustawienie modelu."
   },
   "skills": {
     "title": "Skills",
