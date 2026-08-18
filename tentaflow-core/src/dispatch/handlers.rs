@@ -5211,6 +5211,28 @@ pub async fn deploy_vllm_recommend(
         warnings.push(w.clone());
     }
 
+    // A vLLM deploy that cannot call tools is the quietest failure this product
+    // has: the server accepts the `tools` field, answers with prose, logs
+    // nothing, and every agent on that model looks like a model too weak to use
+    // its tools. The recipe carries the parser for 181 of 283 models; anything
+    // outside the snapshot (a private fine-tune, a repo newer than the refresh)
+    // gets none. Say so where the operator is already looking, at deploy time,
+    // rather than leaving it to be discovered from an agent that never acts.
+    if matches!(engine, DeployEngine::Vllm) {
+        let argv: Vec<String> = recommended_vllm_args
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        if let Some(reason) = crate::deploy::vllm_recipes::tool_calling_gap(&argv) {
+            warnings.push(format!(
+                "Ten model nie będzie wywoływał narzędzi: {reason}. \
+                 Agenci dostaną odpowiedzi tekstowe zamiast wywołań. \
+                 Dodaj `--tool-call-parser <parser> --enable-auto-tool-choice` w argumentach \
+                 (dla rodziny Qwen zwykle `hermes`, dla wariantów coder `qwen3_coder`)."
+            ));
+        }
+    }
+
     let model_spec = tentaflow_protocol::DeployVllmModelSpecSummary {
         model_type: spec.model_type.clone(),
         architectures: spec.architectures.clone(),

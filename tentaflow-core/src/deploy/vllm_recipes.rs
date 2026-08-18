@@ -182,6 +182,44 @@ fn strip_serve_prefix(argv: Vec<String>) -> Vec<String> {
 /// Curated recipe CLI args + env for a model on a GPU family. Drops repo-relative
 /// `--chat-template` paths (absent from our deploy tree), and forces TP/PP to the
 /// values Core computed from the actual GPUs (recipe values are node-specific).
+/// In vLLM a tool-call parser without `--enable-auto-tool-choice` is inert: the
+/// server keeps the OpenAI `tools` field but never routes a generation through
+/// the parser, so it answers with prose and NEVER emits `tool_calls`. Nothing
+/// logs a complaint — an agent simply looks like a model that will not use its
+/// tools.
+///
+/// The pairing is mechanical, so it is repaired rather than reported: a recipe
+/// that names a parser meant tool calling. The upstream snapshot is regenerated
+/// by `scripts/update-vllm-recipes.sh`, so patching the data would be undone on
+/// the next refresh; normalising on load survives it.
+fn normalise_tool_flags(argv: &mut Vec<String>) {
+    let has_parser = argv.iter().any(|a| a == "--tool-call-parser");
+    let has_auto = argv.iter().any(|a| a == "--enable-auto-tool-choice");
+    if has_parser && !has_auto {
+        argv.push("--enable-auto-tool-choice".to_string());
+    }
+}
+
+/// Why the assembled argv will not serve tool calls, or `None` when it will.
+///
+/// A deploy that silently cannot call tools is the worst failure mode we have:
+/// every agent on that model degrades to a chatbot and the logs stay clean.
+/// This is what the deploy path warns on (`handlers.rs`), and it is deliberately
+/// a diagnosis rather than a repair — the right parser depends on the model
+/// family (`hermes`, `qwen3_coder`, `qwen3_xml`, `deepseek_v3`…) and guessing it
+/// wrong is worse than saying nothing works.
+pub fn tool_calling_gap(argv: &[String]) -> Option<&'static str> {
+    if !argv.iter().any(|a| a == "--tool-call-parser") {
+        return Some(
+            "no --tool-call-parser: vLLM will accept the `tools` field and never return a tool call",
+        );
+    }
+    if !argv.iter().any(|a| a == "--enable-auto-tool-choice") {
+        return Some("--tool-call-parser without --enable-auto-tool-choice: the parser is inert");
+    }
+    None
+}
+
 pub fn build_args(
     entry: &RecipeEntry,
     family: Option<&str>,
@@ -238,6 +276,8 @@ pub fn build_args(
         argv.push("--pipeline-parallel-size".to_string());
         argv.push(pipeline_parallel.to_string());
     }
+    // After the merge, so a hardware override that adds the parser is seen too.
+    normalise_tool_flags(&mut argv);
     (argv, env)
 }
 
@@ -249,6 +289,57 @@ mod tests {
     fn embedded_snapshot_loads() {
         let m = embedded();
         assert!(!m.is_empty(), "embedded recipe snapshot should decode");
+    }
+
+    /// A parser without auto-tool-choice is inert in vLLM, so the pair is
+    /// repaired on the way out of `build_args` — the upstream snapshot ships at
+    /// least one recipe like that (`xiaomimimo/mimo-v2-flash`) and regenerating
+    /// it would bring the gap back.
+    #[test]
+    fn a_parser_without_auto_tool_choice_is_repaired() {
+        let entry = RecipeEntry {
+            hf_id: "x/y".into(),
+            base_argv: vec!["--tool-call-parser".into(), "hermes".into()],
+            base_env: HashMap::new(),
+            hardware_overrides: HashMap::new(),
+            variant_env: HashMap::new(),
+        };
+        let (argv, _) = build_args(&entry, None, 1, 1);
+        assert!(argv.iter().any(|a| a == "--enable-auto-tool-choice"));
+        assert_eq!(tool_calling_gap(&argv), None);
+    }
+
+    /// The repair must not invent a parser: which one is right depends on the
+    /// model family, and a wrong parser fails as silently as none.
+    #[test]
+    fn a_recipe_without_a_parser_is_reported_not_guessed() {
+        let entry = RecipeEntry {
+            hf_id: "x/y".into(),
+            base_argv: vec!["--max-model-len".into(), "auto".into()],
+            base_env: HashMap::new(),
+            hardware_overrides: HashMap::new(),
+            variant_env: HashMap::new(),
+        };
+        let (argv, _) = build_args(&entry, None, 1, 1);
+        assert!(!argv.iter().any(|a| a == "--tool-call-parser"));
+        assert!(tool_calling_gap(&argv).is_some(), "the gap must be reported");
+    }
+
+    /// Tool flags live in `base_argv`, never in a hardware override, so tool
+    /// calling cannot depend on which GPU the model lands on. A recipe that
+    /// broke this would serve tools on an H100 and silently not on a 4090.
+    #[test]
+    fn tool_flags_never_depend_on_the_gpu() {
+        for (id, entry) in embedded() {
+            let base_has = entry.base_argv.iter().any(|a| a == "--tool-call-parser");
+            for (family, over) in &entry.hardware_overrides {
+                let only_here = over.extra_args.iter().any(|a| a == "--tool-call-parser");
+                assert!(
+                    !(only_here && !base_has),
+                    "{id}: --tool-call-parser only under hardware override '{family}'",
+                );
+            }
+        }
     }
 
     #[test]
