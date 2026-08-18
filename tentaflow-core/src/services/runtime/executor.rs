@@ -166,6 +166,10 @@ pub struct IngestRequest {
     /// `options` sa przepisywane wprost do `envelope.meta`, ktore addon moze
     /// nadpisac, a to jest sciezka tworzenia pliku indeksu na dysku.
     pub vector_home: Option<std::path::PathBuf>,
+    /// Anulowanie przeprowadzone od wolajacego. `execute_ingest` buduje wlasne
+    /// `FlowRequestMeta`, wiec bez tego pola flow dostawalby SWIEZY token i przebieg
+    /// bylby nieanulowalny — job zatrzymany przez uzytkownika dalej mielilby model.
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub flow_depth: u8,
 }
 
@@ -4031,6 +4035,9 @@ pub(crate) async fn ingest_request_to_initial_envelope(
     let mut meta =
         crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
     meta.vector_home = request.vector_home.clone();
+    if let Some(token) = &request.cancel_token {
+        meta.cancel_token = token.clone();
+    }
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);

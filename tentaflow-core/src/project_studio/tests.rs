@@ -936,7 +936,6 @@ pub fn suite_names(pool: &DbPool, suite_ids: &[String]) -> Result<std::collectio
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use std::sync::Arc;
 
     fn pool() -> DbPool {
         let tmp = tempfile::tempdir().expect("tempdir");

@@ -30,11 +30,8 @@ use crate::db::DbPool;
 use crate::deploy::log_bus::{self, BusMessage, LogLine};
 use crate::routing::router::Router;
 use crate::services::document::extract::{
-    classify_source, docx_to_markdown, pptx_to_markdown, split_into_chunks, xlsx_to_markdown,
-    SourceKind, CHUNK_OVERLAP_CHARS, CHUNK_SIZE_CHARS,
+    classify_source, split_into_chunks, SourceKind, CHUNK_OVERLAP_CHARS, CHUNK_SIZE_CHARS,
 };
-use crate::services::document::rasterize::extract_pdf_text;
-use crate::services::document::{MAX_PDF_PAGES, MIN_TEXT_LAYER_CHARS_PER_PAGE};
 use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
 use crate::services::vector::error::VectorError;
 use tentaflow_sdk_spec::{FieldType, FieldValue};
@@ -49,10 +46,6 @@ pub const VECTOR_NAMESPACE: &str = "passages";
 /// Chunks per embeddings request — bounds request size and lets cancel react
 /// between batches on large files.
 const EMBED_BATCH: usize = 16;
-
-/// Skip reason for scanned PDFs and images: the vision-parse pipeline needs a
-/// flow/addon execution context that a native core job does not have yet.
-const VISION_REQUIRED_MSG: &str = "PDF/scan parsing requires the vision pipeline (planned)";
 
 /// Vector scope for a project — a pseudo addon id, so the per-tenant quota and
 /// registry rows in `addon_vector_namespaces` apply unchanged.
@@ -1070,44 +1063,16 @@ fn extract_file(dir_path: &Path, work: &FileWork) -> Result<ExtractOutcome> {
             }
             Ok(ExtractOutcome::Chunks(prose_chunks(&page.text)))
         }
+        // Tu trafiaja juz TYLKO pliki kodu — `process_file` kieruje kazdy inny blob
+        // do wspolnego flow-ingestu. Proza, office, PDF, skany i obrazy sa jego
+        // sprawa; ta sciezka zostaje wylacznie dla chunkowania po liniach z
+        // zakresem linii jako `location`, ktorego wezel `chunk` nie odtwarza.
         WorkPayload::Blob => {
             let blob_path = dir_path.join("files").join(&work.sha256);
             let bytes =
                 std::fs::read(&blob_path).map_err(|e| anyhow!("blob {} read: {e}", work.sha256))?;
-            if let Some(_ext) = code_ext(&work.path) {
-                let content = String::from_utf8_lossy(&bytes);
-                return Ok(ExtractOutcome::Chunks(chunk_code(&work.path, &content)));
-            }
-            match classify_source(&work.mime, &bytes) {
-                SourceKind::Text => {
-                    let content = String::from_utf8_lossy(&bytes);
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&content)))
-                }
-                SourceKind::Xlsx => {
-                    let md = xlsx_to_markdown(&bytes).map_err(|e| anyhow!(e))?;
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&md)))
-                }
-                SourceKind::Docx => {
-                    let md = docx_to_markdown(&bytes).map_err(|e| anyhow!(e))?;
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&md)))
-                }
-                SourceKind::Pptx => {
-                    let md = pptx_to_markdown(&bytes).map_err(|e| anyhow!(e))?;
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&md)))
-                }
-                SourceKind::Pdf => {
-                    let text = extract_pdf_text(&bytes, MAX_PDF_PAGES as usize)
-                        .map_err(|e| anyhow!("pdf text layer: {e}"))?;
-                    let pages = text.page_count.max(1);
-                    if text.total_chars / pages < MIN_TEXT_LAYER_CHARS_PER_PAGE {
-                        // Scan / image-only PDF — needs render + vision-parse.
-                        return Ok(ExtractOutcome::Skip(VISION_REQUIRED_MSG.into()));
-                    }
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&text.markdown)))
-                }
-                SourceKind::Image => Ok(ExtractOutcome::Skip(VISION_REQUIRED_MSG.into())),
-                SourceKind::Unknown => Ok(ExtractOutcome::Skip("unsupported file type".into())),
-            }
+            let content = String::from_utf8_lossy(&bytes);
+            Ok(ExtractOutcome::Chunks(chunk_code(&work.path, &content)))
         }
     }
 }
@@ -1392,6 +1357,95 @@ enum FileResult {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Published-name platformowego flow-ingestu (seed rdzenia). Ten sam flow obsluguje
+/// addon RAG — rozne sa tylko scope zapisu i katalog przestrzeni wektorowej.
+const INGEST_FLOW_MODEL: &str = "core:rag-ingest";
+
+/// Ingestuje JEDEN plik przez wspolny flow zamiast wlasnej sciezki
+/// extract -> chunk -> embed -> store.
+///
+/// Tozsamosc pisania jedzie w `ExecutionContext` (scope `ps-<project_id>`), a nie w
+/// opcjach: `options` sa przepisywane wprost do `envelope.meta`, ktore moze nadpisac
+/// kazdy wezel. `doc_id`/`source_id`/`path` ida przez meta swiadomie — to metadane
+/// wektora, ktore wezel `store` ma zapisac, a nie decyzje o tym, GDZIE pisze.
+///
+/// Anulowanie: `execute_ingest` nie widzi naszej flagi, wiec pilnujemy jej obok i
+/// przewracamy token. Bez tego zatrzymany job dalej mielilby model do konca pliku.
+async fn ingest_file_via_flow(
+    router: &Arc<Router>,
+    org_id: &str,
+    project_id: &str,
+    dir_path: &Path,
+    source_id: &str,
+    work: &FileWork,
+    bytes: Vec<u8>,
+    cancel: &Arc<AtomicBool>,
+) -> FileResult {
+    let Some(executor) = router.executor() else {
+        return FileResult::Error("model runtime executor not available".to_string());
+    };
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "doc_id".to_string(),
+        serde_json::Value::String(work.file_id.clone()),
+    );
+    options.insert(
+        "source_id".to_string(),
+        serde_json::Value::String(source_id.to_string()),
+    );
+    options.insert(
+        "path".to_string(),
+        serde_json::Value::String(work.path.clone()),
+    );
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let request = crate::services::runtime::executor::IngestRequest {
+        model: INGEST_FLOW_MODEL.to_string(),
+        document_bytes: bytes,
+        mime: work.mime.clone(),
+        options,
+        vector_home: Some(dir_path.join("vectors")),
+        cancel_token: Some(token.clone()),
+        flow_depth: 0,
+    };
+
+    let mut rctx = crate::services::runtime::context::ExecutionContext::new(None);
+    rctx.addon_id = Some(vector_scope(project_id));
+    rctx.org_id = Some(org_id.to_string());
+
+    let fut = executor.execute_ingest(request, &mut rctx);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            result = &mut fut => {
+                return match result {
+                    Ok(response) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            FileResult::Cancelled
+                        } else if response.chunks == 0 {
+                            FileResult::Skipped("no text content".to_string())
+                        } else {
+                            FileResult::Ready(response.chunks)
+                        }
+                    }
+                    Err(e) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            FileResult::Cancelled
+                        } else {
+                            FileResult::Error(e.to_string())
+                        }
+                    }
+                };
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    token.cancel();
+                }
+            }
+        }
+    }
+}
+
 async fn process_file(
     core_db: &DbPool,
     router: &Arc<Router>,
@@ -1402,6 +1456,25 @@ async fn process_file(
     work: &FileWork,
     cancel: &Arc<AtomicBool>,
 ) -> FileResult {
+    // Pliki binarne, ktore umie wspolny flow (proza / office / PDF / skan /
+    // obraz), ida przez NIEGO — jedna implementacja parsowania, chunkingu,
+    // embeddingu i zapisu, wspolna z addonem RAG. Natywnie zostaja tylko dwa
+    // przypadki bez odpowiednika we flow: kod (chunkowany po liniach, z zakresem
+    // linii jako `location`) i zrodla URL (trigger flow-ingestu przyjmuje wylacznie
+    // blob binarny).
+    if matches!(work.payload, WorkPayload::Blob) && code_ext(&work.path).is_none() {
+        let blob_path = dir_path.join("files").join(&work.sha256);
+        let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&blob_path)).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return FileResult::Error(format!("blob read: {e}")),
+            Err(_) => return FileResult::Error("blob read task panicked".to_string()),
+        };
+        return ingest_file_via_flow(
+            router, org_id, project_id, dir_path, source_id, work, bytes, cancel,
+        )
+        .await;
+    }
+
     // Extraction is CPU/IO heavy (pdfium, zip, blocking HTTP) — off the
     // async worker.
     let extracted = {
