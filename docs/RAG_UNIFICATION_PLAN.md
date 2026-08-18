@@ -142,7 +142,7 @@ W 1.0 twierdziłem, że brakuje **jednej** rzeczy (`vector_home`). Brakuje trzec
 
 ## 5. Etapy
 
-### Etap 0 — fundament scope'u **[rozcięty na 0a–0d]**
+### Etap 0 — fundament scope'u **[WYKONANE: 0a, 0b, 0c, 0d]**
 - **0a.** `custom_dir` przez `upsert_with_quota` + `upsert_batch_with_quota`; walidacja containment
   w `get_or_create_at`.
 - **0b.** `vector_home` w `ExecutionContext`, `FlowRequestMeta`, `IngestRequest` (osobne pole).
@@ -170,7 +170,7 @@ W 1.0 twierdziłem, że brakuje **jednej** rzeczy (`vector_home`). Brakuje trzec
 **Weryfikacja:** istniejący namespace addonowy otwiera się z niezmienionej ścieżki; nowy projektowy
 powstaje pod `<data>/projects/<id>/vectors/`; zatrzymanie addona RAG nie psuje ingestu w Projektach.
 
-### Etap 1 — jedna implementacja prymitywów wektorowych
+### Etap 1 — jedna implementacja prymitywów wektorowych **[WYKONANE]**
 Moduł `services/vector/doc_vectors.rs`: `ref_id_for`, `delete_doc_vectors` (wariant
 wieloprzebiegowy), wspólne ciało zapisu z rollbackiem. `store.rs` i `ingest.rs` stają się cienkimi
 wywołaniami.
