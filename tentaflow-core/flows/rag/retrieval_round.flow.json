@@ -1,0 +1,158 @@
+{
+  "id": "retrieval_round",
+  "name": "RAG — retrieval round (multi-hop body)",
+  "description": "Cialo pojedynczego hopu petli multi-hop RAG (E2.2 + GraphRAG E3.2), wykonywane przez loop block z query.flow.json. Jeden hop: rag_query_seed (payload = biezace pod-pytanie z meta.rag_current_query, init = oryginalne pytanie) -> rag_graph_seed (identyfikacja encji zapytania -> seedy PPR w meta.graph_seeds; payload bez zmian) -> embeddings -> vector(search 'passages', FILTR po collection_id z meta jak E2.0) -> reranker(rag-reranker, top_n=5; query z meta.rag_query_text) -> rag_accumulate (DEDUP po (doc_id,chunk_index), akumulacja do meta.rag_accumulated, cap 20; payload = kontekst dla sedziego) -> rag_graph_facts (PPR po seedach z meta -> top encje -> neighbors -> FAKTY grafowe; FUZJA z pasazami wektorowymi w kontekscie; best-effort: brak grafu/encji -> pass-through) -> llm(rag-llm SEDZIA: zwraca JSON {enough, next_query?}) -> rag_judge (parsuje werdykt: enough -> meta.harness_done=true; inaczej meta.rag_current_query = next_query) -> output. Meta (rag_accumulated, rag_current_query, graph_seeds, rag_graph_facts, harness_done) PRZETRWA do nastepnej iteracji bo loop podaje output-envelope hopu N jako input hopu N+1.",
+  "nodes": [
+    {
+      "id": "trigger",
+      "type": "trigger",
+      "config": {},
+      "position": { "x": 0, "y": 0 }
+    },
+    {
+      "id": "seed",
+      "type": "rag_query_seed",
+      "config": {},
+      "position": { "x": 200, "y": 0 }
+    },
+    {
+      "id": "graph_seed",
+      "type": "rag_graph_seed",
+      "config": {},
+      "position": { "x": 300, "y": 0 }
+    },
+    {
+      "id": "embed_query",
+      "type": "embeddings",
+      "config": {
+        "model": "rag-embeddings"
+      },
+      "position": { "x": 400, "y": 0 }
+    },
+    {
+      "id": "retrieve",
+      "type": "vector",
+      "config": {
+        "op": "search",
+        "namespace": "passages",
+        "metric": "cosine",
+        "output_fields": ["text", "doc_id", "chunk_index", "collection_id"]
+      },
+      "position": { "x": 600, "y": 0 }
+    },
+    {
+      "id": "rerank",
+      "type": "reranker",
+      "config": {
+        "model": "rag-reranker",
+        "top_n": 5
+      },
+      "position": { "x": 800, "y": 0 }
+    },
+    {
+      "id": "accumulate",
+      "type": "rag_accumulate",
+      "config": {},
+      "position": { "x": 1000, "y": 0 }
+    },
+    {
+      "id": "graph_facts",
+      "type": "rag_graph_facts",
+      "config": {},
+      "position": { "x": 1100, "y": 0 }
+    },
+    {
+      "id": "judge",
+      "type": "llm",
+      "config": {
+        "model": "rag-llm",
+        "system_prompt": "Jestes SEDZIA retrievalu RAG. Dostajesz oryginalne pytanie uzytkownika i zakumulowane pasaze (kontekst). Oce, czy kontekst WYSTARCZA do pelnej, popartej zrodlami odpowiedzi na pytanie. Odpowiedz WYLACZNIE jednym obiektem JSON, bez zadnego innego tekstu: {\"enough\": true} gdy kontekst starczy, albo {\"enough\": false, \"next_query\": \"<konkretne pod-pytanie do nastepnego wyszukiwania>\"} gdy brakuje informacji. next_query ma byc samodzielnym zapytaniem wyszukiwarki (nie meta-komentarzem). Nie odpowiadaj na samo pytanie — tylko ocen wystarczalnosc kontekstu."
+      },
+      "position": { "x": 1200, "y": 0 }
+    },
+    {
+      "id": "verdict",
+      "type": "rag_judge",
+      "config": {},
+      "position": { "x": 1400, "y": 0 }
+    },
+    {
+      "id": "out",
+      "type": "output",
+      "config": {},
+      "position": { "x": 1600, "y": 0 }
+    }
+  ],
+  "edges": [
+    {
+      "from_node": "trigger",
+      "to_node": "seed",
+      "from_port": "text",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "seed",
+      "to_node": "graph_seed",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "graph_seed",
+      "to_node": "embed_query",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "embed_query",
+      "to_node": "retrieve",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "embedding"
+    },
+    {
+      "from_node": "retrieve",
+      "to_node": "rerank",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "rerank",
+      "to_node": "accumulate",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "json"
+    },
+    {
+      "from_node": "accumulate",
+      "to_node": "graph_facts",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "graph_facts",
+      "to_node": "judge",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "judge",
+      "to_node": "verdict",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "verdict",
+      "to_node": "out",
+      "from_port": "full",
+      "to_port": "text",
+      "data_type": "text"
+    }
+  ]
+}

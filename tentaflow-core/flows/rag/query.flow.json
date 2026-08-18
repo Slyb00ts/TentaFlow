@@ -1,0 +1,91 @@
+{
+  "id": "query",
+  "name": "RAG — query (multi-hop)",
+  "description": "Flow zapytania RAG z PETLA multi-hop (E2.2). trigger -> loop(body=retrieval_round przez body_flow_engine_id, until=meta.harness_done==true, max_iterations=4) -> rag_finalize (odbudowa payloadu = oryginalne pytanie + WSZYSTKIE zakumulowane pasaze z meta.rag_accumulated; przepiecie ich na rag_citations) -> llm(rag-llm: finalna odpowiedz WYLACZNIE z kontekstu, z cytatami) -> output (emit_citations: {answer, citations} z zakumulowanych pasazy, dedup, top wg score). Petla: kazdy hop retrievalu (embed -> vector(collection-scoped z meta jak E2.0) -> rerank -> akumulacja+dedup -> sedzia LLM {enough,next_query}) akumuluje pasaze do meta.rag_accumulated (przetrwa iteracje, bo loop podaje output-envelope hopu N jako input N+1). Proste pytanie = 1 iteracja (sedzia od razu enough). collection_id/top_k jada z meta (addon przeprowadza je przez options llm_generate). Anti-DoS: max_iterations=4 (twardy cap loop block), cap akumulacji = 20 pasazy (rag_accumulate).",
+  "nodes": [
+    {
+      "id": "trigger",
+      "type": "trigger",
+      "config": {},
+      "position": {
+        "x": 0,
+        "y": 0
+      }
+    },
+    {
+      "id": "hops",
+      "type": "loop",
+      "config": {
+        "until": "has(meta.harness_done) && meta.harness_done == true",
+        "max_iterations": 4,
+        "body_flow_id": "00000000-0000-4000-8000-000000000052"
+      },
+      "position": {
+        "x": 240,
+        "y": 0
+      }
+    },
+    {
+      "id": "finalize",
+      "type": "rag_finalize",
+      "config": {},
+      "position": {
+        "x": 480,
+        "y": 0
+      }
+    },
+    {
+      "id": "answer",
+      "type": "llm",
+      "config": {
+        "model": "rag-llm",
+        "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (zakumulowane pasaze ponizej, numerowane [i] z doc/chunk). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo (numer pasaza / doc). Nie zmyslaj faktow spoza kontekstu."
+      },
+      "position": {
+        "x": 720,
+        "y": 0
+      }
+    },
+    {
+      "id": "out",
+      "type": "output",
+      "config": {
+        "emit_citations": true
+      },
+      "position": {
+        "x": 960,
+        "y": 0
+      }
+    }
+  ],
+  "edges": [
+    {
+      "from_node": "trigger",
+      "to_node": "hops",
+      "from_port": "text",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "hops",
+      "to_node": "finalize",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "any"
+    },
+    {
+      "from_node": "finalize",
+      "to_node": "answer",
+      "from_port": "full",
+      "to_port": "in",
+      "data_type": "text"
+    },
+    {
+      "from_node": "answer",
+      "to_node": "out",
+      "from_port": "full",
+      "to_port": "text",
+      "data_type": "text"
+    }
+  ]
+}

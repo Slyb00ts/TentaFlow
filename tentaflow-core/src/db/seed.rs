@@ -133,6 +133,7 @@ pub fn seed_defaults(conn: &Connection) -> Result<()> {
     seed_camera_analysis_flow(&tx)?;
     seed_camera_cv_aliases(&tx)?;
     seed_platform_rag_aliases(&tx)?;
+    seed_platform_rag_flows(&tx)?;
     seed_camera_cv_pipeline(&tx)?;
     seed_harness_flows(&tx)?;
     seed_code_harness_flows(&tx)?;
@@ -1246,6 +1247,97 @@ fn seed_camera_analysis_flow(conn: &Connection) -> Result<()> {
     )?;
     if inserted > 0 {
         info!("seed: utworzono domyslny flow analizy kamery '{}'", NAME);
+    }
+    Ok(())
+}
+
+/// Flowy RAG naleza do platformy, tak jak aliasy `rag-*` (patrz
+/// [`PLATFORM_RAG_ALIASES`]). Do tej pory wozil je addon jako `[[engine_flow]]`,
+/// co znaczylo, ze bez zainstalowanego addona nie istnial zaden flow ingestu ani
+/// zapytania — a Projekty potrzebuja dokladnie tych samych, zeby nie utrzymywac
+/// drugiej implementacji parsowania, chunkingu i zapisu wektorow.
+///
+/// Id sa STALE, bo `query` odwoluje sie do ciala petli przez `body_flow_id`:
+/// wariant `body_flow_engine_id` sklada nazwe `{addon}:{local}` i wymaga
+/// `ctx.addon_id` (`loop_block.rs`), wiec dla wolajacego spoza addona — czyli dla
+/// projektu — nigdy by sie nie rozwiazal.
+///
+/// Nazwa publikowana ma prefiks `core:`, wiec nie koliduje z `rag:*`, ktore addon
+/// rejestruje do czasu przejscia na te nazwy.
+const PLATFORM_RAG_FLOWS: &[(&str, &str, &str, &str, &str)] = &[
+    (
+        "00000000-0000-4000-8000-000000000050",
+        "core:rag-ingest",
+        "ingest",
+        "RAG — ingest dokumentu",
+        include_str!("../../flows/rag/ingest.flow.json"),
+    ),
+    (
+        "00000000-0000-4000-8000-000000000051",
+        "core:rag-query",
+        "chat",
+        "RAG — zapytanie multi-hop",
+        include_str!("../../flows/rag/query.flow.json"),
+    ),
+    (
+        "00000000-0000-4000-8000-000000000052",
+        "core:rag-retrieval-round",
+        "chat",
+        "RAG — jeden hop retrievalu",
+        include_str!("../../flows/rag/retrieval_round.flow.json"),
+    ),
+];
+
+/// Seeduje [`PLATFORM_RAG_FLOWS`] jako flowy systemowe wraz z wiazaniem modelu na
+/// nazwie publikowanej. Wzorzec `seed_ps_chat_flow`: `is_system = 1` blokuje
+/// edycje z protokolu i pozwala odswiezac tresc przy kazdym starcie, wiec nowa
+/// binarka dowozi nowa wersje grafu bez migracji.
+fn seed_platform_rag_flows(conn: &Connection) -> Result<()> {
+    for (id, published, service_type, name, flow_json) in PLATFORM_RAG_FLOWS {
+        // Reclaim jak przy ps-chat: wiersz na tym id nalezy do seeda, wiec wiersz
+        // pozbawiony is_system omijalby guard WHERE ponizej na zawsze.
+        let stray: i64 = conn.query_row(
+            "SELECT COUNT(*) FROM flows WHERE id = ?1 AND is_system = 0",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )?;
+        if stray > 0 {
+            warn!("reclaiming platform RAG flow (row {id} lost is_system)");
+            conn.execute(
+                "UPDATE flows SET is_system = 1 WHERE id = ?1",
+                rusqlite::params![id],
+            )?;
+        }
+        conn.execute(
+            "INSERT INTO flows (id, name, description, service_type, flow_json, status,                                 is_default, is_system, published_model_name)              VALUES (?1, ?2, ?3, ?4, ?5, 'active', 0, 1, ?6)              ON CONFLICT(id) DO UPDATE SET                  name = excluded.name,                  description = excluded.description,                  service_type = excluded.service_type,                  flow_json = excluded.flow_json,                  status = 'active',                  is_default = 0,                  is_system = 1,                  published_model_name = excluded.published_model_name,                  updated_at = datetime('now')              WHERE is_system = 1",
+            rusqlite::params![id, name, name, service_type, flow_json, published],
+        )?;
+
+        // Wiazanie na nazwie publikowanej — bez niego `resolve_flow` nie znajdzie
+        // flow po nazwie modelu. Identyfikowane przez `model_pattern`, jak w
+        // `register_engine_flow_atomic`, wiec re-seed podmienia flow_id zamiast
+        // mnozyc wiersze.
+        let existing: Option<String> = conn
+            .query_row(
+                "SELECT id FROM flow_model_bindings WHERE model_pattern = ?1 LIMIT 1",
+                rusqlite::params![published],
+                |r| r.get(0),
+            )
+            .optional()?;
+        match existing {
+            Some(binding_id) => {
+                conn.execute(
+                    "UPDATE flow_model_bindings SET flow_id = ?2, priority = 100 WHERE id = ?1",
+                    rusqlite::params![binding_id, id],
+                )?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO flow_model_bindings (id, flow_id, model_pattern, priority)                      VALUES (?1, ?2, ?3, 100)",
+                    rusqlite::params![uuid::Uuid::new_v4().to_string(), id, published],
+                )?;
+            }
+        }
     }
     Ok(())
 }
@@ -2523,6 +2615,75 @@ fn generate_jwt_secret() -> String {
 mod tests {
     use std::path::Path;
 
+    /// Flowy RAG sa dostepne od startu, bez addona: wiersz systemowy + wiazanie
+    /// na nazwie publikowanej. Bez wiazania `resolve_flow` nie znajdzie flow po
+    /// nazwie modelu, wiec sam wiersz nic by nie dal.
+    #[test]
+    fn platform_rag_flows_are_seeded_with_bindings() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        for (id, published, service_type, _, _) in super::PLATFORM_RAG_FLOWS {
+            let (st, status, is_system, name): (String, String, i64, String) = conn
+                .query_row(
+                    "SELECT service_type, status, is_system, published_model_name \
+                     FROM flows WHERE id = ?1",
+                    rusqlite::params![id],
+                    |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+                )
+                .unwrap_or_else(|e| panic!("flow '{published}' nie zaseedowany: {e}"));
+            assert_eq!(&st, service_type);
+            assert_eq!(status, "active");
+            assert_eq!(is_system, 1, "flow platformowy musi byc systemowy");
+            assert_eq!(&name, published);
+            let bound: String = conn
+                .query_row(
+                    "SELECT flow_id FROM flow_model_bindings WHERE model_pattern = ?1",
+                    rusqlite::params![published],
+                    |r| r.get(0),
+                )
+                .unwrap_or_else(|e| panic!("brak wiazania dla '{published}': {e}"));
+            assert_eq!(&bound, id);
+        }
+    }
+
+    /// Petla `query` musi wskazywac cialo przez STALE id, nie przez
+    /// `body_flow_engine_id` — ten sklada `{addon}:{local}` i wymaga tozsamosci
+    /// addona, wiec dla wolajacego spoza addona (projekt) nigdy by sie nie
+    /// rozwiazal. Test pilnuje, ze id wskazuje realnie zaseedowany wiersz.
+    #[test]
+    fn query_loop_points_at_the_seeded_retrieval_round() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        let flow_json: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE published_model_name = 'core:rag-query'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("query flow");
+        let v: serde_json::Value = serde_json::from_str(&flow_json).unwrap();
+        let loop_cfg = v["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["type"] == "loop")
+            .expect("loop node")["config"]
+            .clone();
+        assert!(
+            loop_cfg.get("body_flow_engine_id").is_none(),
+            "body_flow_engine_id nie rozwiaze sie dla wolajacego bez addon_id"
+        );
+        let body_id = loop_cfg["body_flow_id"].as_str().expect("body_flow_id");
+        let exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flows WHERE id = ?1",
+                rusqlite::params![body_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(exists, 1, "body_flow_id musi wskazywac zaseedowany flow");
+    }
+
     /// Aliasy RAG naleza do platformy, nie do addona: istnieja po samym seedzie
     /// (bez instalacji addona), sa `public` i NIE maja wiersza wlasciciela.
     /// Wlasciciel-addon oznaczalby, ze `deactivate_aliases_owned_by_addon` gasi je
@@ -2734,9 +2895,9 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            total, 7,
-            "oczekiwane 7 flow (Default Chat + Camera Analysis + Agent Run + Project Chat \
-             + Code Harness A/B/C), jest {}",
+            total, 10,
+            "oczekiwane 10 flow (Default Chat + Camera Analysis + Agent Run + Project Chat \
+             + Code Harness A/B/C + RAG ingest/query/retrieval-round), jest {}",
             total
         );
 
@@ -2780,6 +2941,9 @@ mod tests {
                 "Code Harness — zespół QA".to_string(),
                 "Default Chat".to_string(),
                 "Project Chat".to_string(),
+                "RAG — ingest dokumentu".to_string(),
+                "RAG — jeden hop retrievalu".to_string(),
+                "RAG — zapytanie multi-hop".to_string(),
             ]
         );
 
@@ -2895,7 +3059,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 7, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 10, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(
@@ -2932,7 +3096,7 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 7, "rename nie moze tworzyc drugiego flow");
+        assert_eq!(total, 10, "rename nie moze tworzyc drugiego flow");
         let name: String = conn
             .query_row(
                 "SELECT name FROM flows WHERE id = ?1",
