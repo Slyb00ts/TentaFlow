@@ -659,9 +659,7 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local {
-                service_id,
-                handle,
-                ..
+                service_id, handle, ..
             } => match handle {
                 BackendHandle::Embedded { .. } => {
                     let rx = self
@@ -1218,9 +1216,7 @@ impl ModelRuntimeExecutor {
         };
         let mut response = match target {
             ResolvedExecutionTarget::Local {
-                service_id,
-                handle,
-                ..
+                service_id, handle, ..
             } => match handle {
                 BackendHandle::Embedded { .. } => self
                     .local_inference

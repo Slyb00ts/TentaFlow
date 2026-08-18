@@ -1764,6 +1764,31 @@ fn code_harness_prefix_nodes() -> Vec<serde_json::Value> {
     ]
 }
 
+/// The end-of-turn review, shared by both harness variants.
+///
+/// Wired unconditionally, yet it only stops a turn that CHANGED something: the
+/// review opens the work patch set by scanning the worktree, and a clean tree
+/// yields no files, so the block reports `empty` and the turn walks straight
+/// past it (and, since `open_patch_set` keeps an empty set transient, leaves no
+/// row behind).
+///
+/// It exists because nothing else guarantees a review. The tools mirror an edit
+/// into an ALREADY-open set and otherwise rely on "the next review will snapshot
+/// it" — but the only other openers are `core.git_commit` and `delegate_cli`.
+/// An agent told to "write it and run it" has no reason to ask for a commit, so
+/// without this node its work reached the disk with nothing to accept, which
+/// contradicts the integrity boundary: what gets committed is what passed review.
+fn code_harness_review_node(slot: usize) -> serde_json::Value {
+    serde_json::json!({"id": "r1", "type": "patch_review", "position": grid_position(slot),
+    "config": {
+        "scope": "work",
+        "granularity": "hunk",
+        "timeout_secs": 1800,
+        "on_timeout": "reject",
+        "output_variable": "patch_review"
+    }})
+}
+
 /// Edges of the shared prefix, up to and including the region's back edge.
 fn code_harness_prefix_edges() -> Vec<serde_json::Value> {
     vec![
@@ -1785,13 +1810,15 @@ fn code_harness_prefix_edges() -> Vec<serde_json::Value> {
 /// give it a context, a loop and a place to put the answer.
 pub fn code_harness_flow_json() -> String {
     let mut nodes = code_harness_prefix_nodes();
+    nodes.push(code_harness_review_node(7));
     nodes.push(serde_json::json!({"id": "p1", "type": "persist_turn",
-        "position": grid_position(7), "config": {}}));
+        "position": grid_position(8), "config": {}}));
     nodes.push(serde_json::json!({"id": "o1", "type": "output",
-        "position": grid_position(8), "config": {"mode": "stream"}}));
+        "position": grid_position(9), "config": {"mode": "stream"}}));
 
     let mut edges = code_harness_prefix_edges();
-    edges.push(serde_json::json!({"from_node": "x1", "to_node": "p1", "from_port": "full"}));
+    edges.push(serde_json::json!({"from_node": "x1", "to_node": "r1", "from_port": "full"}));
+    edges.push(serde_json::json!({"from_node": "r1", "to_node": "p1"}));
     edges.push(
         serde_json::json!({"from_node": "x1", "to_node": "o1", "from_port": "stream",
             "to_port": "text"}),
@@ -1864,6 +1891,11 @@ pub fn code_harness_team_flow_json() -> String {
         );
         index += 1;
     }
+    // The human review sits between the machines that INSPECT the change and
+    // the one that COMMITS it: the committer is told to act "if an accepted
+    // review exists", and nothing else in this chain produces one.
+    nodes.push(code_harness_review_node(index));
+    index += 1;
     nodes.push(serde_json::json!({"id": "p1", "type": "persist_turn",
         "position": grid_position(index), "config": {}}));
     index += 1;
@@ -1875,7 +1907,8 @@ pub fn code_harness_team_flow_json() -> String {
     edges.push(serde_json::json!({"from_node": "s1", "to_node": "a1"}));
     edges.push(serde_json::json!({"from_node": "a1", "to_node": "s2"}));
     edges.push(serde_json::json!({"from_node": "s2", "to_node": "a2"}));
-    edges.push(serde_json::json!({"from_node": "a2", "to_node": "s3"}));
+    edges.push(serde_json::json!({"from_node": "a2", "to_node": "r1"}));
+    edges.push(serde_json::json!({"from_node": "r1", "to_node": "s3"}));
     edges.push(serde_json::json!({"from_node": "s3", "to_node": "a3"}));
     edges.push(serde_json::json!({"from_node": "a3", "to_node": "p1"}));
     edges.push(
@@ -1947,35 +1980,61 @@ fn review_loop_nodes(
             "position": grid_position(*index), "region": loop_spec.region,
             "config": config}));
         *index += 1;
-        nodes.push(serde_json::json!({"id": await_id, "type": "await_subagents",
+        nodes.push(
+            serde_json::json!({"id": await_id, "type": "await_subagents",
             "position": grid_position(*index), "region": loop_spec.region,
             "config": {
                 "run_ids_var": format!("{out_var}_run_ids"),
                 "mode": "all",
                 "timeout_secs": 3600,
                 "output_variable": out_var,
-            }}));
+            }}),
+        );
         *index += 1;
         chain.push(spawn_id);
         chain.push(await_id);
     };
 
     let (w_prefix, w_agent, w_task) = loop_spec.worker;
-    delegate(w_prefix, w_agent, w_task, format!("{w_prefix}_result"), true, nodes, index);
+    delegate(
+        w_prefix,
+        w_agent,
+        w_task,
+        format!("{w_prefix}_result"),
+        true,
+        nodes,
+        index,
+    );
     if let Some((s_prefix, s_agent, s_task)) = loop_spec.second {
-        delegate(s_prefix, s_agent, s_task, format!("{s_prefix}_result"), false, nodes, index);
+        delegate(
+            s_prefix,
+            s_agent,
+            s_task,
+            format!("{s_prefix}_result"),
+            false,
+            nodes,
+            index,
+        );
     }
     let (c_prefix, c_task) = loop_spec.critic;
-    delegate(c_prefix, "code-critic", c_task, loop_spec.verdict_var.to_string(), false, nodes, index);
+    delegate(
+        c_prefix,
+        "code-critic",
+        c_task,
+        loop_spec.verdict_var.to_string(),
+        false,
+        nodes,
+        index,
+    );
 
     let gate_id = format!("{}g", loop_spec.region);
     nodes.push(serde_json::json!({"id": gate_id, "type": "critic_gate",
-        "position": grid_position(*index), "region": loop_spec.region,
-        "config": {
-            "verdict_var": loop_spec.verdict_var,
-            "approved_marker": CRITIC_APPROVED_MARKER,
-            "output_variable": format!("{}_decision", loop_spec.region),
-        }}));
+    "position": grid_position(*index), "region": loop_spec.region,
+    "config": {
+        "verdict_var": loop_spec.verdict_var,
+        "approved_marker": CRITIC_APPROVED_MARKER,
+        "output_variable": format!("{}_decision", loop_spec.region),
+    }}));
     *index += 1;
     chain.push(gate_id.clone());
 
@@ -2052,17 +2111,15 @@ pub fn code_harness_critic_flow_json() -> String {
     // it and wire `x1` straight into the planner to get the pipeline on every
     // turn.
     nodes.push(serde_json::json!({"id": "d1", "type": "condition",
-        "position": grid_position(index),
-        "config": {
-            "expression": format!("vars.{TOOL_CALLS_TOTAL_VAR} > 0"),
-        }}));
+    "position": grid_position(index),
+    "config": {
+        "expression": format!("vars.{TOOL_CALLS_TOTAL_VAR} > 0"),
+    }}));
     index += 1;
 
     let (plan_entry, plan_gate) = review_loop_nodes(&plan, &mut index, &mut nodes, &mut edges);
     edges.push(serde_json::json!({"from_node": "p1", "to_node": "d1"}));
-    edges.push(
-        serde_json::json!({"from_node": "d1", "to_node": plan_entry, "from_port": "true"}),
-    );
+    edges.push(serde_json::json!({"from_node": "d1", "to_node": plan_entry, "from_port": "true"}));
 
     let build = ReviewLoop {
         region: "build_review",
@@ -2087,6 +2144,17 @@ pub fn code_harness_critic_flow_json() -> String {
     let (build_entry, build_gate) = review_loop_nodes(&build, &mut index, &mut nodes, &mut edges);
     edges.push(serde_json::json!({"from_node": plan_gate, "to_node": build_entry}));
 
+    // The human review closes the pipeline: the machines have planned, built,
+    // tested and criticised, and what they produced is now a diff somebody has
+    // to accept. Without it the work reaches the worktree with nothing to
+    // approve — the tools only mirror an edit into an ALREADY-open patch set,
+    // and the only other openers are `core.git_commit` and `delegate_cli`.
+    // A turn that changed nothing never gets here: `d1` gates the whole
+    // pipeline on the turn having called tools, and a clean tree would in any
+    // case make the block report `empty` and step aside.
+    nodes.push(code_harness_review_node(index));
+    edges.push(serde_json::json!({"from_node": build_gate, "to_node": "r1"}));
+
     // The turn is persisted and shown BEFORE the pipeline runs: the operator
     // reads the orchestrator's answer straight away and watches the planner,
     // implementer, tester and critic work behind it in the Agents pane, instead
@@ -2097,8 +2165,9 @@ pub fn code_harness_critic_flow_json() -> String {
             "to_port": "text"}),
     );
     edges.push(serde_json::json!({"from_node": "p1", "to_node": "o1", "to_port": "text"}));
-    // What the pipeline concluded reaches the same output.
-    edges.push(serde_json::json!({"from_node": build_gate, "to_node": "o1", "to_port": "text"}));
+    // What the pipeline concluded reaches the same output — through the review,
+    // so the operator sees the verdict and the diff as one step.
+    edges.push(serde_json::json!({"from_node": "r1", "to_node": "o1", "to_port": "text"}));
 
     serde_json::json!({"nodes": nodes, "edges": edges}).to_string()
 }
@@ -3799,8 +3868,9 @@ mod tests {
             let gate = def
                 .nodes
                 .iter()
-                .find(|n| n.region.as_deref() == Some(region)
-                    && n.node_type == CRITIC_GATE_NODE_TYPE)
+                .find(|n| {
+                    n.region.as_deref() == Some(region) && n.node_type == CRITIC_GATE_NODE_TYPE
+                })
                 .unwrap_or_else(|| panic!("region {region} lost its critic gate"));
             assert_eq!(
                 gate.config.get("approved_marker").and_then(|v| v.as_str()),
@@ -3809,7 +3879,10 @@ mod tests {
                  otherwise the loop can never end"
             );
             assert_eq!(
-                node_of(entry).config.get("loop_max_iterations").and_then(|v| v.as_i64()),
+                node_of(entry)
+                    .config
+                    .get("loop_max_iterations")
+                    .and_then(|v| v.as_i64()),
                 Some(10),
                 "region {region} must be bounded"
             );
@@ -3839,7 +3912,7 @@ mod tests {
             def,
             &build_registry_for_test(),
         )
-            .expect("the enforced pipeline must compile");
+        .expect("the enforced pipeline must compile");
         let mut gated: Vec<&str> = compiled
             .regions
             .iter()
@@ -3849,7 +3922,6 @@ mod tests {
         gated.sort_unstable();
         assert_eq!(gated, vec!["build_review", "plan_review"]);
     }
-
 
     /// A child may not hold a tool its parent lacks — `agent_spawn` refuses such
     /// a delegation, because otherwise delegating would be a way to gain
@@ -3890,5 +3962,4 @@ mod tests {
             }
         }
     }
-
 }

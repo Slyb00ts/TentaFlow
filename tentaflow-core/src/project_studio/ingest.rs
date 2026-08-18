@@ -818,7 +818,13 @@ pub struct CollectedFile {
 }
 
 fn tree_mime(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "md" | "markdown" => "text/markdown",
         "json" => "application/json",
         "yaml" | "yml" => "application/yaml",
@@ -904,7 +910,11 @@ pub fn collect_tree_files(root: &Path, dir_path: &Path) -> Result<Vec<CollectedF
 
 /// Writes one generated text document (e.g. the api_spec endpoint digest) into
 /// the project's blob store and returns its collected-file descriptor.
-pub fn store_generated_text(dir_path: &Path, rel_path: &str, content: &str) -> Result<CollectedFile> {
+pub fn store_generated_text(
+    dir_path: &Path,
+    rel_path: &str,
+    content: &str,
+) -> Result<CollectedFile> {
     let files_dir = dir_path.join("files");
     std::fs::create_dir_all(&files_dir)?;
     let bytes = content.as_bytes();
@@ -1207,12 +1217,7 @@ pub fn start_job(task: IngestTask) {
                 }
             }
             None => {
-                let _ = repository::finish_ingest_job(
-                    &project_pool,
-                    &job_id_task,
-                    "cancelled",
-                    "",
-                );
+                let _ = repository::finish_ingest_job(&project_pool, &job_id_task, "cancelled", "");
             }
         }
 
@@ -1588,13 +1593,31 @@ mod tests {
         // file name hashes the full (org, user, project, upload_id) key.
         for (user, c0) in [("ua", b"aaa"), ("ub", b"bbb")] {
             let r = accept_upload_chunk(
-                "org", user, "p1", dir, "shared", "s.txt", "text/plain", 0, 2, c0,
+                "org",
+                user,
+                "p1",
+                dir,
+                "shared",
+                "s.txt",
+                "text/plain",
+                0,
+                2,
+                c0,
             )
             .expect("chunk 0");
             assert!(matches!(r, UploadOutcome::Buffered { .. }));
         }
         let sha_a = match accept_upload_chunk(
-            "org", "ua", "p1", dir, "shared", "s.txt", "text/plain", 1, 2, b"111",
+            "org",
+            "ua",
+            "p1",
+            dir,
+            "shared",
+            "s.txt",
+            "text/plain",
+            1,
+            2,
+            b"111",
         )
         .expect("ua finalize")
         {
@@ -1602,7 +1625,16 @@ mod tests {
             _ => panic!("expected finalized"),
         };
         let sha_b = match accept_upload_chunk(
-            "org", "ub", "p1", dir, "shared", "s.txt", "text/plain", 1, 2, b"222",
+            "org",
+            "ub",
+            "p1",
+            dir,
+            "shared",
+            "s.txt",
+            "text/plain",
+            1,
+            2,
+            b"222",
         )
         .expect("ub finalize")
         {

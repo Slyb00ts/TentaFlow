@@ -437,6 +437,24 @@ pub fn open_patch_set(
     let files = scan_worktree(broker, &handle, base_commit)?;
     let patch_set_id = uuid::Uuid::new_v4().to_string();
 
+    // A clean tree gets a TRANSIENT set: nothing is written. The harness runs a
+    // review at the end of every turn, and most turns change nothing (a
+    // question, an explanation, a failed search) — persisting those would fill
+    // the Changes tab with empty rows and supersede an accepted set still
+    // waiting for its commit. Callers already treat an empty set as "nothing to
+    // review" and return early, so the row buys nobody anything.
+    if files.is_empty() {
+        return Ok(PatchSet {
+            id: patch_set_id,
+            session_id: session_id.to_string(),
+            run_id: run_id.map(str::to_string),
+            base_commit: base_commit.to_string(),
+            status: "open".to_string(),
+            scope: scope.clone(),
+            files,
+        });
+    }
+
     let mut conn = pool
         .write()
         .map_err(|e| anyhow!("workspace db write: {e}"))?;

@@ -644,10 +644,7 @@ impl AgentRunManager {
         // here (rather than letting the child ask for one) is what makes that
         // impossible to redirect.
         let extra_meta: Vec<(&str, Value)> = match &caller.code_session {
-            Some(binding) => vec![(
-                crate::code_studio::tools::SESSION_META_KEY,
-                binding.clone(),
-            )],
+            Some(binding) => vec![(crate::code_studio::tools::SESSION_META_KEY, binding.clone())],
             None => Vec::new(),
         };
 
@@ -2131,7 +2128,16 @@ mod tests {
         let mut callers = Vec::new();
         for i in 0..(cap + 1) {
             let parent_run = mgr
-                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], &[], None, None)
+                .spawn(
+                    "parent",
+                    &format!("lead-{i}"),
+                    None,
+                    &principal,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                )
                 .await
                 .expect("spawn parent");
             callers.push(CallerRun {
@@ -2260,7 +2266,16 @@ mod tests {
         // Simulate by giving the child spawn rights and asking it to spawn.
         seed_agent(&pool, "spawner", "midboss", "[]", 2, 1);
         let child_run = mgr
-            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], &[], None, None)
+            .spawn(
+                "spawner",
+                "mid",
+                Some(&parent_run),
+                &principal,
+                &[],
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn mid");
         let mid_caller = CallerRun {

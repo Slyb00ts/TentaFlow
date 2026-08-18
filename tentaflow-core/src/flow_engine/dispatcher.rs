@@ -44,24 +44,23 @@ use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, DelegateCliNodeAdapter, DocumentMergeNodeAdapter,
-    DocumentParseNodeAdapter, DocumentRouterNodeAdapter, EmbedChunksNodeAdapter,
-    EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, ExecCommandNodeAdapter,
-    GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
-    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
+    ConversationHistoryNodeAdapter, CriticGateNodeAdapter, DelegateCliNodeAdapter,
+    DocumentMergeNodeAdapter, DocumentParseNodeAdapter, DocumentRouterNodeAdapter,
+    EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, ExecCommandNodeAdapter,
+    GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
+    MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
     OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
     PageDetectPagesNodeAdapter, PatchReviewNodeAdapter, PdfRasterizeNodeAdapter,
-    PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, PlatformSwitchNodeAdapter, PptxExtractNodeAdapter,
-    ProjectKnowledgeNodeAdapter,
-    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
-    RagGraphSeedNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter,
-    SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter, StoreNodeAdapter,
-    CriticGateNodeAdapter, SttNodeAdapter, TaskGateNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
-    TextExtractNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
-    TtsNodeAdapter, VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter,
-    VisionOcrNodeAdapter, VisionParseNodeAdapter, VisionParsePagesNodeAdapter,
-    WordExtractNodeAdapter, WorkspaceContextNodeAdapter,
+    PersistTurnNodeAdapter, PiiFilterNodeAdapter, PlatformSwitchNodeAdapter,
+    PptxExtractNodeAdapter, ProjectKnowledgeNodeAdapter, RagAccumulateNodeAdapter,
+    RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
+    RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
+    SpeakerContextNodeAdapter, StoreNodeAdapter, SttNodeAdapter, SubagentStatusNodeAdapter,
+    SubflowNodeAdapter, TableStructureNodeAdapter, TaskGateNodeAdapter, TextExtractNodeAdapter,
+    ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
+    VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter,
+    VisionParseNodeAdapter, VisionParsePagesNodeAdapter, WordExtractNodeAdapter,
+    WorkspaceContextNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -1194,9 +1193,7 @@ fn build_registry(
     // the agent's allowlist (§10), `delegate_cli` for the registry database and
     // the node's settings key, which is what opens the provider credential in
     // the node-local vault (§5.2).
-    r.register(Arc::new(PatchReviewNodeAdapter::new(
-        agent_service.clone(),
-    )));
+    r.register(Arc::new(PatchReviewNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(ExecCommandNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(DelegateCliNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(AgentRouterNodeAdapter::new(agent_service.clone())));

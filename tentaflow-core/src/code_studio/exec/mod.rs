@@ -46,7 +46,7 @@ use windows as platform;
 use std::collections::{HashMap, VecDeque};
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
@@ -139,6 +139,42 @@ pub struct NullSink;
 impl ExecSink for NullSink {
     fn on_stdout(&self, _chunk: &[u8]) {}
     fn on_stderr(&self, _chunk: &[u8]) {}
+}
+
+/// Liveness clock of one execution: when the command last produced output.
+///
+/// Shared between the reader threads (which touch it) and the waiter (which
+/// reads it), so the idle budget is measured against real activity instead of
+/// wall-clock time.
+pub struct Activity {
+    /// Milliseconds since `origin`, so the whole thing fits in one atomic and
+    /// the readers never take a lock on the hot path.
+    last_ms: AtomicU64,
+    origin: Instant,
+}
+
+impl Activity {
+    pub fn new() -> Self {
+        Self { last_ms: AtomicU64::new(0), origin: Instant::now() }
+    }
+
+    /// Records that the command is alive right now.
+    pub fn touch(&self) {
+        let ms = self.origin.elapsed().as_millis() as u64;
+        self.last_ms.fetch_max(ms, Ordering::Relaxed);
+    }
+
+    /// How long the command has been silent.
+    pub fn silent_for(&self) -> Duration {
+        let last = self.last_ms.load(Ordering::Relaxed);
+        self.origin.elapsed().saturating_sub(Duration::from_millis(last))
+    }
+}
+
+impl Default for Activity {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -528,14 +564,29 @@ impl Executor {
         let stderr = child.stderr.take();
         let out_capture = Arc::new(Mutex::new(Capture::new(req.max_output_bytes)));
         let err_capture = Arc::new(Mutex::new(Capture::new(req.max_output_bytes)));
+        // Starts ticking at spawn: a command that never writes anything gets
+        // the full idle window before it counts as wedged.
+        let activity = Arc::new(Activity::new());
         let out_thread = stdout.map(|pipe| {
-            spawn_reader(pipe, Arc::clone(&out_capture), Arc::clone(&sink), true)
+            spawn_reader(
+                pipe,
+                Arc::clone(&out_capture),
+                Arc::clone(&sink),
+                true,
+                Arc::clone(&activity),
+            )
         });
         let err_thread = stderr.map(|pipe| {
-            spawn_reader(pipe, Arc::clone(&err_capture), Arc::clone(&sink), false)
+            spawn_reader(
+                pipe,
+                Arc::clone(&err_capture),
+                Arc::clone(&sink),
+                false,
+                Arc::clone(&activity),
+            )
         });
 
-        let status = self.wait_for(&mut child, &guard, &cancelled, req.timeout);
+        let status = self.wait_for(&mut child, &guard, &cancelled, req.timeout, &activity);
         // The direct child is gone; its group may not be. `sh -c 'make & exit
         // 0'` reaps in milliseconds and leaves `make` writing into the layer
         // this command's lease is about to destroy — and holding the stdout the
@@ -650,14 +701,29 @@ impl Executor {
         guard.kill();
     }
 
+    /// Waits for the command, killing it only once it has been SILENT for
+    /// `idle` — never on total elapsed time.
+    ///
+    /// A wall-clock budget cannot tell a wedged command from a slow one, and
+    /// this product's own build takes the better part of an hour: capping the
+    /// total would kill honest work at an arbitrary line. What actually
+    /// distinguishes the two is whether anything is still happening, so the
+    /// budget resets on every byte the command writes (`spawn_reader` →
+    /// `Activity::touch`). A command that goes quiet for the whole window is
+    /// wedged whether it ran for a minute or an hour.
+    ///
+    /// The trade-off is deliberate: a command that legitimately produces NO
+    /// output for longer than the window (a lone linker step, `sleep`) is
+    /// treated as wedged. Making it survive would require the command to prove
+    /// liveness some other way, which nothing in a POSIX pipe offers.
     fn wait_for(
         &self,
         child: &mut std::process::Child,
         guard: &platform::Guard,
         cancelled: &AtomicBool,
-        timeout: Duration,
+        idle: Duration,
+        activity: &Activity,
     ) -> ExitStatus {
-        let deadline = Instant::now() + timeout;
         loop {
             match child.try_wait() {
                 // `cancel_exec` signals the group before this loop observes the
@@ -674,7 +740,7 @@ impl Executor {
             if cancelled.load(Ordering::SeqCst) {
                 return self.stop(child, guard, ExitStatus::Cancelled);
             }
-            if Instant::now() >= deadline {
+            if activity.silent_for() >= idle {
                 return self.stop(child, guard, ExitStatus::Timeout);
             }
             std::thread::sleep(Duration::from_millis(20));
@@ -1182,6 +1248,7 @@ fn spawn_reader<R: Read + Send + 'static>(
     capture: Arc<Mutex<Capture>>,
     sink: Arc<dyn ExecSink>,
     is_stdout: bool,
+    activity: Arc<Activity>,
 ) -> Reader {
     let finished = Arc::new(AtomicBool::new(false));
     let done = Arc::clone(&finished);
@@ -1192,6 +1259,9 @@ fn spawn_reader<R: Read + Send + 'static>(
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
                     let chunk = &buf[..n];
+                    // Every byte the command produces is proof it is alive and
+                    // resets its idle budget (`Activity`).
+                    activity.touch();
                     if let Ok(mut capture) = capture.lock() {
                         capture.push(chunk);
                     }
