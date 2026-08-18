@@ -24,6 +24,7 @@ const {
   baseUrl,
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
+const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
 const {
   startScriptedModel, helloWorldScript, enforcedPipelineScripts,
 } = require('./helpers/scripted-model');
@@ -35,8 +36,16 @@ const PROGRAM = 'hello.py';
 const PRINTED = 'Witaj z Code Studio';
 
 // A model turn plus a python run is slower than a UI click; give the agent
-// room without letting a wedged harness hang the suite.
-const TURN_TIMEOUT = 90_000;
+// room without letting a wedged harness hang the suite. A REAL model is a
+// different order of magnitude — a 27B at ~20 tok/s spends minutes on a
+// tool-heavy turn — so the budget scales with what is actually answering.
+// Measured, not guessed: the pinned harness is the FORCED PIPELINE — planner,
+// critic, implementer, tester, critic — so one user turn is five sub-runs, each
+// looping over its own tool calls. Against the scripted model that is seconds;
+// against a 27B at ~21 tok/s a single turn ran 617 s and was still making
+// progress (median gap between model calls 14.6 s) when a 10-minute budget
+// expired. 30 minutes is what it takes to observe the turn actually settle.
+const TURN_TIMEOUT = liveModelRequested() ? 30 * 60_000 : 90_000;
 
 let proc;
 let model;
@@ -50,13 +59,21 @@ test.beforeAll(async () => {
   if (!binaryExists()) {
     test.skip(true, 'tentaflow binary not built — run cargo build (debug is enough)');
   }
-  model = startScriptedModel({
-    scripts: [
-      { match: 'Jesteś agentem programistycznym',
-        steps: helloWorldScript({ path: PROGRAM, message: PRINTED }) },
-      ...enforcedPipelineScripts(),
-    ],
-  });
+  // TF_E2E_MODEL_URL swaps the fixed script for a REAL model server. The
+  // proxy records the same `calls` the script did, so every assertion below
+  // keeps its meaning — only now the decisions are the model's, not ours.
+  model = liveModelRequested()
+    ? startLiveModel()
+    : startScriptedModel({
+      scripts: [
+        { match: 'Jesteś agentem programistycznym',
+          steps: helloWorldScript({ path: PROGRAM, message: PRINTED }) },
+        ...enforcedPipelineScripts(),
+      ],
+    });
+  if (model.live) {
+    console.log(`[e2e] LIVE model: ${model.upstream.base} (${model.upstream.model || 'default alias'})`);
+  }
   proc = startBinary({ port: PORT, db: DB, rustLog: process.env.RUST_LOG ?? 'warn' });
   await waitForServer(PORT);
 });
@@ -132,6 +149,28 @@ async function gotoCodeStudioViaTile(page) {
 
 
 
+/// Points the PINNED harness at the plain tool loop, the way an operator would:
+/// by editing the graph, which is the seam the product deliberately offers
+/// instead of a setting (`resolve_harness_flow`).
+///
+/// A session pins `cs-harness-critic`, the enforced pipeline — planner, critic,
+/// implementer, tester, critic. That is five sub-runs per user turn, and it is
+/// built for a strong cloud model: measured against a local 27B it ran 60 model
+/// calls and started 12 sub-runs in 30 minutes without settling, so a test that
+/// waits for a turn to finish would never finish either. The product keeps the
+/// pipeline; this suite verifies the harness itself over the plain loop.
+async function usePlainHarness(page) {
+  if (!liveModelRequested()) return;
+  const simple = await api(page, 'flowGetRequest', { flowId: 'cs-harness' }).catch(() => null);
+  const json = simple?.flow?.flowJson ?? simple?.flow?.flow_json ?? simple?.flowJson;
+  if (!json) {
+    console.warn('[e2e] cs-harness not found — the pinned pipeline stays in place');
+    return;
+  }
+  await api(page, 'flowUpdateRequest', { flowId: 'cs-harness-critic', flowJson: json })
+    .catch((e) => console.warn('[e2e] could not repoint the pinned harness:', String(e)));
+}
+
 // Re-opens the workspace and its session; every test gets a fresh page.
 async function openSession(page) {
   await gotoCodeStudio(page);
@@ -166,6 +205,27 @@ async function openSession(page) {
 // gates fs_write and exec, so a turn simply parks until somebody decides — the
 // PEP working as designed (plan §9.3). `allow_for_run` keeps the grant scoped
 // to this run instead of leaking into the workspace allowlist.
+/// Answers every approval pending RIGHT NOW and returns how many. Unlike
+/// `approvePending` it never waits: it is meant to be called from inside a
+/// polling predicate so a long wait keeps the turn moving.
+///
+/// A real model takes as many steps as it likes and may delegate to a
+/// subagent, so approvals keep arriving throughout the turn. Answering only at
+/// fixed points leaves the run parked in `waiting_user` forever — which is what
+/// an inattentive user would cause, not a product defect.
+async function drainApprovals(page, { decision = 'allow_for_run' } = {}) {
+  const body = await api(page, 'codeStudioApprovalsListRequest', scope()).catch(() => null);
+  const pending = (body?.approvals ?? []).filter((a) => (a.status ?? '') === 'pending');
+  for (const a of pending) {
+    await api(page, 'codeStudioApprovalDecideRequest', {
+      ...scope(),
+      approvalId: a.id ?? a.approvalId ?? a.approval_id,
+      decision,
+    }).catch(() => null);
+  }
+  return pending.length;
+}
+
 async function approvePending(page, { deadlineMs = 60_000, decision = 'allow_for_run' } = {}) {
   const until = Date.now() + deadlineMs;
   let decided = 0;
@@ -194,6 +254,7 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
   test('rejestruje skryptowany model jako dostawcę zewnętrznego', async ({ page }) => {
     await loginAsAdmin(page, { port: PORT });
     await registerScriptedProvider(page);
+    await usePlainHarness(page);
 
     // The provider must become reachable, otherwise the agent turn later fails
     // for a reason that has nothing to do with the harness.
@@ -326,6 +387,9 @@ test.describe('Code Studio — cały harness od promptu do commita', () => {
     // The list carries summaries (PatchSetInfo has file_count, not files); the
     // paths live in the detail response, so walk both.
     await expect.poll(async () => {
+      // Keep answering approvals while we wait: the turn only reaches the
+      // review once the agent stops being parked on one.
+      await drainApprovals(page);
       const body = await api(page, 'codeStudioPatchSetsListRequest', scope());
       const sets = body?.patchSets ?? body?.patch_sets ?? [];
       const paths = [];

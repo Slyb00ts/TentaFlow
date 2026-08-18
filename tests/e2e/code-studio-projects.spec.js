@@ -21,6 +21,12 @@ const {
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 const { startScriptedModel, helloWorldScript } = require('./helpers/scripted-model');
+const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
+/// Live models are an order of magnitude slower than the script: a 27B at
+/// ~21 tok/s spends minutes where the stub spends milliseconds. Budgets are
+/// scaled rather than rewritten so the scripted run keeps its tight guard.
+const T = (ms) => (liveModelRequested() ? ms * 6 : ms);
+
 
 const PORT = 18113;
 const DB = '/tmp/e2e-code-studio-proj.db';
@@ -38,7 +44,12 @@ test.beforeAll(async () => {
   if (!binaryExists()) test.skip(true, 'tentaflow binary not built');
   // No agent turn here, but the workspace still needs a provider to exist for
   // the wizard to complete cleanly.
-  model = startScriptedModel({ script: helloWorldScript() });
+  // TF_E2E_MODEL_URL swaps the fixed script for a REAL model server; the
+  // proxy records the same `calls`, so the assertions keep their meaning
+  // while every decision becomes the model's (helpers/live-model.js).
+  model = liveModelRequested()
+    ? startLiveModel()
+    : startScriptedModel({ script: helloWorldScript() });
   proc = startBinary({ port: PORT, db: DB, rustLog: process.env.RUST_LOG ?? 'warn' });
   await waitForServer(PORT);
 });
@@ -58,7 +69,7 @@ async function api(page, action, payload) {
 
 test.describe('Code Studio ↔ Projekty', () => {
   test('zakłada workspace i projekt', async ({ page }) => {
-    test.setTimeout(180_000);
+    test.setTimeout(T(180_000));
     await loginAsAdmin(page, { port: PORT });
 
     const me = await api(page, 'authMeRequest');

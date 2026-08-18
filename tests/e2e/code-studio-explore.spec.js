@@ -26,6 +26,12 @@ const { loginAsAdmin } = require('./helpers/auth');
 const {
   startScriptedModel, helloWorldScript, enforcedPipelineScripts,
 } = require('./helpers/scripted-model');
+const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
+/// Live models are an order of magnitude slower than the script: a 27B at
+/// ~21 tok/s spends minutes where the stub spends milliseconds. Budgets are
+/// scaled rather than rewritten so the scripted run keeps its tight guard.
+const T = (ms) => (liveModelRequested() ? ms * 6 : ms);
+
 
 const PORT = 18114;
 const DB = '/tmp/e2e-code-studio-explore.db';
@@ -46,12 +52,17 @@ test.describe.configure({ mode: 'serial' });
 
 test.beforeAll(async () => {
   if (!binaryExists()) test.skip(true, 'tentaflow binary not built');
-  model = startScriptedModel({
-    scripts: [
-      { match: 'Jesteś agentem programistycznym', steps: helloWorldScript() },
-      ...enforcedPipelineScripts(),
-    ],
-  });
+  // TF_E2E_MODEL_URL swaps the fixed script for a REAL model server; the proxy
+  // records the same `calls`, so the assertions keep their meaning while every
+  // decision becomes the model's (helpers/live-model.js).
+  model = liveModelRequested()
+    ? startLiveModel()
+    : startScriptedModel({
+      scripts: [
+        { match: 'Jesteś agentem programistycznym', steps: helloWorldScript() },
+        ...enforcedPipelineScripts(),
+      ],
+    });
   proc = startBinary({ port: PORT, db: DB, rustLog: process.env.RUST_LOG ?? 'warn' });
   await waitForServer(PORT);
 });
@@ -65,7 +76,11 @@ test.afterAll(async () => {
 // Time-boxes one interaction. A step that hangs becomes a FINDING with the time
 // it burned, instead of eating the whole test budget and hiding everything the
 // walk would have found afterwards.
-async function step(label, fn, budgetMs = 15_000) {
+async function step(label, fn, rawBudgetMs = 15_000) {
+  // Scaled like every other budget here: a step that waits for the AGENT (a
+  // panel showing a file it just wrote) needs the model's pace, and an
+  // unscaled 15 s turns "the model is still typing" into a reported defect.
+  const budgetMs = T(rawBudgetMs);
   const started = Date.now();
   try {
     const out = await Promise.race([
@@ -126,7 +141,7 @@ async function registerProvider(page) {
 
 test.describe('Spacer po Code Studio', () => {
   test('wchodzi, zaklada workspace i otwiera sesje', async ({ page }) => {
-    test.setTimeout(420_000);
+    test.setTimeout(T(420_000));
     watch(page, 'start');
     await step('logowanie', () => loginAsAdmin(page, { port: PORT }), 60_000);
     await step('rejestracja dostawcy modelu', () => registerProvider(page), 60_000);
@@ -188,7 +203,7 @@ test.describe('Spacer po Code Studio', () => {
   });
 
   test('rozmawia z agentem i oglada wszystkie panele', async ({ page }) => {
-    test.setTimeout(300_000);
+    test.setTimeout(T(300_000));
     watch(page, 'sesja');
     await loginAsAdmin(page, { port: PORT });
     await page.goto(`${baseUrl(PORT)}/#/code-studio`);
@@ -356,7 +371,7 @@ test.describe('Spacer po Code Studio', () => {
   });
 
   test('dziala na telefonie', async ({ browser }) => {
-    test.setTimeout(180_000);
+    test.setTimeout(T(180_000));
     // A real phone, not just a narrow window: `hasTouch` is what makes
     // `pointer: coarse` match, and that is the rule tap targets are sized by.
     const context = await browser.newContext({

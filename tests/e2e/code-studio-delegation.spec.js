@@ -25,13 +25,19 @@ const {
 } = require('./helpers/spawn');
 const { loginAsAdmin } = require('./helpers/auth');
 const { startScriptedModel, delegationScripts } = require('./helpers/scripted-model');
+const { startLiveModel, liveModelRequested } = require('./helpers/live-model');
+/// Live models are an order of magnitude slower than the script: a 27B at
+/// ~21 tok/s spends minutes where the stub spends milliseconds. Budgets are
+/// scaled rather than rewritten so the scripted run keeps its tight guard.
+const T = (ms) => (liveModelRequested() ? ms * 6 : ms);
+
 
 const PORT = 18112;
 const DB = '/tmp/e2e-code-studio-deleg.db';
 const WORKSPACE = `deleg-${Date.now().toString(36)}`;
 const PROGRAM = 'from_subagent.py';
 const PRINTED = 'Napisane przez subagenta';
-const TURN_TIMEOUT = 120_000;
+const TURN_TIMEOUT = T(120_000);
 
 let proc;
 let model;
@@ -42,7 +48,12 @@ test.describe.configure({ mode: 'serial' });
 
 test.beforeAll(async () => {
   if (!binaryExists()) test.skip(true, 'tentaflow binary not built');
-  model = startScriptedModel({ scripts: delegationScripts({ path: PROGRAM, message: PRINTED }) });
+  // TF_E2E_MODEL_URL swaps the fixed script for a REAL model server; the
+  // proxy records the same `calls`, so the assertions keep their meaning
+  // while every decision becomes the model's (helpers/live-model.js).
+  model = liveModelRequested()
+    ? startLiveModel()
+    : startScriptedModel({ scripts: delegationScripts({ path: PROGRAM, message: PRINTED }) });
   proc = startBinary({ port: PORT, db: DB, rustLog: process.env.RUST_LOG ?? 'warn' });
   await waitForServer(PORT);
 });
@@ -83,7 +94,7 @@ async function approvePending(page, { deadlineMs = 90_000 } = {}) {
 
 test.describe('Code Studio — delegacja do subagentów i kreator agentów', () => {
   test('przygotowanie: model, grant, workspace i sesja', async ({ page }) => {
-    test.setTimeout(180_000);
+    test.setTimeout(T(180_000));
     await loginAsAdmin(page, { port: PORT });
 
     // Provider.
@@ -216,7 +227,16 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
       .flatMap((m) => m.tool_calls.map((t) => t.function?.name));
     console.log('[diag] tool calls seen by the loop:', JSON.stringify([...new Set(toolCalls)]));
     expect(toolCalls, 'agent_spawn never reached the loop').toContain('core.agent_spawn');
-    expect(toolCalls, 'agent_list never reached the loop').toContain('core.agent_list');
+    // The parent must OBSERVE its child — but which call it uses is its own
+    // choice, not the harness's. `core.agent_list` enumerates children;
+    // `core.agent_wait` blocks on the ones it already knows. The scripted model
+    // did spawn → list → wait because that is what it was told to do; a real
+    // model skips the listing, having just been handed the run id it would be
+    // looking up. Asserting the triple would test our script, not the contract.
+    expect(
+      toolCalls.filter((t) => t === 'core.agent_list' || t === 'core.agent_wait'),
+      'the orchestrator never observed its child (neither agent_list nor agent_wait)',
+    ).not.toHaveLength(0);
     expect(seen.length, 'no tool results were fed back').toBeGreaterThan(0);
 
     // The child's file really landed in the parent's worktree.
@@ -266,7 +286,7 @@ test.describe('Code Studio — delegacja do subagentów i kreator agentów', () 
   });
 
   test('kreator agentów AI zwraca propozycję agenta', async ({ page }) => {
-    test.setTimeout(120_000);
+    test.setTimeout(T(120_000));
     await loginAsAdmin(page, { port: PORT });
 
     // The builder resolves its model through the `curator_model` setting, which
