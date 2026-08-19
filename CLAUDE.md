@@ -369,8 +369,12 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
   truncates extraction on small-RAM machines → CMake "Parse error … bad character".
 - llama.cpp: pinned `LLAMA_CPP_REF=6b80c74f` so everyone shares one prebuilt (`origin/master`
   for fresh, `vendored` for the old tree). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
-  `multi` = cuda+rocm+vulkan+cpu, which requires ALL three runtimes present at link time — use
-  `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm` for single-backend builds). Local patches come from
+  `multi` = (cuda XOR rocm, auto-chosen by the visible GPU when both toolchains exist) + vulkan
+  + cpu — CUDA and HIP ggml backends can NEVER share one static object (same symbols, one
+  `ggml_backend_cuda_reg`); use `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm` to force it). The
+  build scripts find `nvcc`/`hipcc` outside PATH (`/usr/local/cuda`, `/opt/rocm`, `CUDA_HOME`)
+  and wipe a variant's `lib-static`/`lib-dynamic` dirs before install so a stale
+  `libggml-cuda.a` cannot get linked next to a fresh `libggml-hip.a`. Local patches come from
   `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
   auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
 - Whisper autodetection on Linux/Windows covers CUDA, ROCm and Vulkan. AMD chips can be pinned,

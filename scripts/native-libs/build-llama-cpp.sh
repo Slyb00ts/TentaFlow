@@ -15,6 +15,8 @@ LLAMA_CPP_REF="${LLAMA_CPP_REF:-689e227db485c6b33d061555e74034c93a867649}"
 BACKENDS="${LLAMA_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
+# Resolved here (parent shell) so the PATH/CUDACXX/HIPCXX exports reach cmake.
+resolve_gpu_toolchains
 
 if [ "$LLAMA_CPP_REF" = "vendored" ]; then
   SRC="$ROOT/vendor/crates/llama-cpp-sys-2/llama.cpp"
@@ -34,31 +36,6 @@ apply_llama_patches() {
 
 apply_llama_patches
 
-detect_backends() {
-  case "$PLATFORM" in
-    linux-*|windows-*)
-      local detected=()
-      command -v nvcc >/dev/null 2>&1 && detected+=("cuda")
-      if command -v hipcc >/dev/null 2>&1 || command -v amdclang++ >/dev/null 2>&1; then
-        detected+=("rocm")
-      fi
-      if command -v glslc >/dev/null 2>&1 || command -v vulkaninfo >/dev/null 2>&1 || [ -n "${VULKAN_SDK:-}" ]; then
-        detected+=("vulkan")
-      fi
-      printf '%s\n' "${detected[@]}"
-      ;;
-    macos-*|ios-*)
-      printf '%s\n' "metal"
-      ;;
-    android-*)
-      true
-      ;;
-    *)
-      true
-      ;;
-  esac
-}
-
 android_abi_for_platform() {
   case "$1" in
     android-arm64) printf '%s\n' "arm64-v8a" ;;
@@ -71,9 +48,12 @@ android_abi_for_platform() {
 if [ "$BACKENDS" = "auto" ]; then
   BACKEND_LIST=("multi")
   MULTI_BACKENDS=()
+  # Command substitution (not process substitution) so a hard error inside
+  # detect_backends aborts the script under set -e.
+  detected_backends="$(detect_backends)"
   while IFS= read -r backend; do
     [ -n "$backend" ] && MULTI_BACKENDS+=("$backend")
-  done < <(detect_backends)
+  done <<< "$detected_backends"
 else
   IFS=',' read -r -a BACKEND_LIST <<< "$BACKENDS"
   MULTI_BACKENDS=()
