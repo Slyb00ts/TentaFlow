@@ -114,6 +114,19 @@ Trzy warstwy, wzorowane na Trajectory:
 
 Filtry pierwszej klasy: **pochodzenie**, **aktor**, model, status, zakres czasu.
 
+### 4.1a Wejścia — trzy, każde na inne pytanie
+
+1. **Nawigacja → Zarządzanie → Zdarzenia**, obok „Dziennika audytu”. Ta sama rodzina pytań: audyt
+   mówi CO się stało, zdarzenia mówią JAK przebiegło. Zakres wg uprawnień — admin widzi wszystko,
+   zwykły użytkownik swoje przebiegi.
+2. **Zakładka przy przebiegu** — „Oś czasu” obok Konsoli/Plików/Zmian/Gita w sesji Code Studio, a
+   analogicznie przy przebiegu agenta i czacie projektu.
+3. **Odsyłacz z dziennika audytu** — wpis niesie `correlation_id`, więc „pokaż przebieg” otwiera oś
+   czasu w tym miejscu. To domyka pętlę: z zapisu formalnego wchodzi się w diagnostykę.
+
+Wejście nr 3 wymaga, żeby `correlation_id` był stemplowany po obu stronach — to warunek Etapu 1,
+nie dodatek.
+
 ### 4.2 W Code Studio
 Ta sama oś czasu jako zakładka przy sesji, zawężona do jej przebiegu — bez przechodzenia do
 osobnego modułu. Materiał ten sam, inny zakres.
