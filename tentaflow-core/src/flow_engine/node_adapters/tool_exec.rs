@@ -1085,6 +1085,23 @@ impl NodeAdapter for ToolExecNodeAdapter {
         );
         let mut idx = 0usize;
         while idx < calls.len() {
+            // Anulowanie sprawdzane PRZED kazda grupa. Executor zauwaza je dopiero
+            // po UKONCZENIU wezla, wiec bez tego zatrzymany przebieg dokanczalby
+            // cala partie wywolan — a sa wsrod nich zapisy, commity i `exec`.
+            // Zatrzymanie zbiegłego agenta ma go zatrzymac, a nie poprosic.
+            //
+            // Pominietym wywolaniom dopisujemy wynik, zamiast urywac liste: audyt
+            // i wiadomosci `role=tool` paruja sie z tura asystenta po indeksie, a
+            // brakujacy wynik zostawilby wywolanie bez odpowiedzi.
+            if ctx.cancel_token.is_cancelled() {
+                for call in &calls[idx..] {
+                    results.push(error_result(
+                        call,
+                        "run cancelled before this tool call started".to_string(),
+                    ));
+                }
+                break;
+            }
             let group_len = if Self::is_parallel_safe(&calls[idx].name) {
                 calls[idx..]
                     .iter()
@@ -1272,6 +1289,47 @@ mod tests {
         let mut m = ChatMessage::assistant("");
         m.tool_calls = Some(calls);
         m
+    }
+
+    /// Zatrzymany przebieg NIE dokancza partii wywolan. Executor zauwaza
+    /// anulowanie dopiero po ukonczeniu wezla, wiec bez tej bramki zatrzymanie
+    /// zbieglego agenta pozwalaloby mu jeszcze zapisac pliki i zrobic commit.
+    ///
+    /// Pominiete wywolania dostaja WYNIK, a nie znikaja: audyt i wiadomosci
+    /// `role=tool` paruja sie z tura asystenta po indeksie.
+    #[tokio::test]
+    async fn cancelled_run_skips_remaining_tool_calls_but_still_answers_them() {
+        let slot = service(db());
+        let mut env = FlowEnvelope::empty();
+        env.context.messages.push(assistant_with_calls(vec![
+            LlmToolCall {
+                id: "c1".into(),
+                name: "core.fs_write".into(),
+                arguments: "{}".into(),
+            },
+            LlmToolCall {
+                id: "c2".into(),
+                name: "core.fs_write".into(),
+                arguments: "{}".into(),
+            },
+        ]));
+
+        let ctx = stub_ctx();
+        ctx.cancel_token.cancel();
+
+        let out = ToolExecNodeAdapter::new(slot)
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .expect("wezel konczy sie normalnie, anulowanie nie jest bledem tutaj");
+
+        // Kazde wywolanie ma odpowiedz — zadne nie zostalo bez pary.
+        let tool_msgs = out
+            .context
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Tool))
+            .count();
+        assert_eq!(tool_msgs, 2, "oba wywolania musza dostac wynik");
     }
 
     #[tokio::test]
