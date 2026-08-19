@@ -5,105 +5,419 @@
 <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
 <title>TentaFlow — Zdarzenia · przeglądarka (Z01)</title>
 <link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
-<link rel="stylesheet" href="shared/styles.css?v=1">
-<link rel="stylesheet" href="shared/zdarzenia.css?v=1">
+<link rel="stylesheet" href="shared/styles.css?v=2">
+<link rel="stylesheet" href="shared/zdarzenia.css?v=2">
 </head>
 <body>
 <svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
 <symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/></symbol>
-<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/></symbol>
 <symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
 <symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></symbol>
-<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/><path d="M9 13h6"/><path d="M9 17h4"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><path d="M14 2v6h6"/></symbol>
 <symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
 <symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
 <symbol id="i-trend" viewBox="0 0 24 24"><polyline points="23 6 13.5 15.5 8.5 10.5 1 18"/><polyline points="17 6 23 6 23 12"/></symbol>
 </defs></svg>
 
 <div class="app">
-      <aside class="sidebar">
-        <div class="logo"><span class="name">TentaFlow</span></div>
-        <div class="nav-section">
-          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
-          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
-        </div>
-        <div class="nav-section">
-          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
-          <div class="nav-item"><svg class="icon"><use href="#i-terminal"/></svg>Code Studio</div>
-          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
-        </div>
-        <div class="nav-section">
-          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
-          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
-          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
-          <div class="nav-item active"><svg class="icon"><use href="#i-trend"/></svg>Zdarzenia</div>
-        </div>
-        <div class="footer">
-          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Dev</div><div class="role">Euvic · Platforma</div></div></div>
-        </div>
-      </aside>
-      <main class="main">
-<div class="ev-shell">
-  <div class="ev-bar">
-    <span class="ev-chip" data-on><span class="dot o-code"></span>Code Studio</span>
-    <span class="ev-chip" data-on><span class="dot o-project"></span>Projekt</span>
-    <span class="ev-chip"><span class="dot o-api"></span>API zewn.</span>
-    <span class="ev-chip"><span class="dot o-addon"></span>Addon</span>
-    <span class="ev-chip"><span class="dot o-chat"></span>Czat</span>
-    <span class="ev-chip"><span class="dot o-camera"></span>Kamera</span>
-    <span class="ev-chip"><span class="dot o-sched"></span>Harmonogram</span>
-    <span class="ev-chip"><span class="dot o-mesh"></span>Mesh</span>
-    <span class="sp"></span>
-    <span class="ev-chip" data-on>anna.kowalska</span>
-    <span class="ev-chip">ostatnia godzina</span>
-  </div>
-  <div class="ev-timeline">
-    <div class="ev-plot">
-      <div class="ev-lanes-labels"><span>model</span><span>wiadom.</span><span>narzędz.</span></div>
-      <div class="ev-track"><div class="ev-turnline" style="left:2%"><b>T1</b></div><div class="ev-turnline" style="left:34%"><b>T2</b></div><div class="ev-turnline" style="left:61%"><b>T3</b></div><div class="ev-turnline" style="left:86%"><b>T4</b></div>
-      <div class="ev-span lane0" style="left:3%;width:26%"><span class="ttft" style="width:34%"></span><span class="decode" style="width:66%"></span></div>
-      <div class="ev-span lane2" style="left:12%;width:7%"><span class="tool" style="width:100%"></span></div>
-      <div class="ev-span lane2" style="left:12%;width:5%;top:70px"><span class="tool" style="width:100%"></span></div>
-      <div class="ev-span lane1" style="left:3%;width:2%"><span class="decode" style="width:100%"></span></div>
-      <div class="ev-span lane0" style="left:35%;width:22%"><span class="ttft" style="width:22%"></span><span class="decode" style="width:78%"></span></div>
-      <div class="ev-span lane2" style="left:44%;width:11%"><span class="tool" style="width:100%"></span></div>
-      <div class="ev-span lane0" style="left:62%;width:20%"><span class="ttft" style="width:48%"></span><span class="decode" style="width:52%"></span></div>
-      <div class="ev-span lane2" style="left:70%;width:6%"><span class="err" style="width:100%"></span></div>
-      <div class="ev-span lane0" style="left:87%;width:11%"><span class="ttft" style="width:30%"></span><span class="decode" style="width:70%"></span></div>
+  <aside class="sidebar">
+    <div class="logo"><span class="name">TentaFlow</span></div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
     </div>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-terminal"/></svg>Code Studio</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
     </div>
-    <div class="ev-legend">
-      <i><span class="sw" style="background:repeating-linear-gradient(45deg,#4b5563 0 4px,#374151 4px 8px)"></span> oczekiwanie na 1. token (TTFT)</i>
-      <i><span class="sw" style="background:var(--accent-1)"></span> dekodowanie</i>
-      <i><span class="sw" style="background:#0e7490"></span> narzędzie</i>
-      <i><span class="sw" style="background:var(--danger)"></span> błąd</i>
-      <i>przeciągnij = zaznacz przedział · kółko = zoom · prawy = przesuń</i>
+    <div class="nav-section">
+      <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+      <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+      <div class="nav-item active"><svg class="icon"><use href="#i-trend"/></svg>Zdarzenia</div>
     </div>
-  </div>
+    <div class="footer">
+      <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Dev</div><div class="role">Euvic · Platforma</div></div></div>
+    </div>
+  </aside>
 
-  <div class="ev-body">
-    <div class="ev-ledger">
-      <div class="ev-turnhead">Tura 1 <span class="sub">code_studio · anna.kowalska · sesja cs-8f21 · qwen3-27b</span></div>
-      <div class="ev-row"><span class="ix">0001</span><span class="kind"><span class="dot o-code" style="width:7px;height:7px;border-radius:50%"></span>żądanie</span><span class="who">anna.kowalska</span><span class="what">system + 4 wiadomości · 3 narzędzia</span><span class="ms">4 812 ms</span></div>
-      <div class="ev-row"><span class="ix">0002</span><span class="kind">1. token</span><span class="who">—</span><span class="what">TTFT</span><span class="ms">1 640 ms</span></div>
-      <div class="ev-row"><span class="ix">0003</span><span class="kind">asystent</span><span class="who">—</span><span class="what">„Sprawdzę testy zanim ruszę schemat…”</span><span class="ms">3 172 ms</span></div>
-      <div class="ev-row"><span class="ix">0004</span><span class="kind">narzędzie</span><span class="who">core.fs_read</span><span class="what">src/db/seed.rs · call c-a71</span><span class="ms">38 ms</span></div>
-      <div class="ev-row"><span class="ix">0005</span><span class="kind">narzędzie</span><span class="who">core.fs_grep</span><span class="what">„seed_platform” · 12 trafień · call c-a72</span><span class="ms">51 ms</span></div>
-      <div class="ev-row"><span class="ix">0006</span><span class="kind">wynik</span><span class="who">—</span><span class="what">2 wyniki równolegle, zatwierdzone w kolejności modelu</span><span class="ms">—</span></div>
-      <div class="ev-turnhead">Tura 2 <span class="sub">code_studio · anna.kowalska · zapis + przegląd</span></div>
-      <div class="ev-row"><span class="ix">0007</span><span class="kind"><span class="dot o-code" style="width:7px;height:7px;border-radius:50%"></span>żądanie</span><span class="who">anna.kowalska</span><span class="what">system + 9 wiadomości · 3 narzędzia</span><span class="ms">3 940 ms</span></div>
-      <div class="ev-row"><span class="ix">0008</span><span class="kind">narzędzie</span><span class="who">core.fs_write</span><span class="what">src/db/seed.rs · +38 −6 · call c-b13</span><span class="ms">22 ms</span></div>
-      <div class="ev-row"><span class="ix">0009</span><span class="kind">przegląd</span><span class="who">patch_review</span><span class="what">zestaw zmian ps-441 · oczekuje</span><span class="ms">—</span></div>
-      <div class="ev-turnhead">Między turami <span class="sub">projekt · marek.nowak · czat „Umowy 2026”</span></div>
-      <div class="ev-row"><span class="ix">0010</span><span class="kind"><span class="dot o-project" style="width:7px;height:7px;border-radius:50%"></span>żądanie</span><span class="who">marek.nowak</span><span class="what">retrieval multi-hop · hop 1/3</span><span class="ms">2 210 ms</span></div>
-      <div class="ev-row"><span class="ix">0011</span><span class="kind">narzędzie</span><span class="who">vector</span><span class="what">passages · ps-4471 · 6 trafień</span><span class="ms">84 ms</span></div>
-      <div class="ev-row"><span class="ix">0012</span><span class="kind">narzędzie</span><span class="who">reranker</span><span class="what">alias niezwiązany → kolejność wektorowa</span><span class="ms">1 ms</span></div>
-      <div class="ev-row"><span class="ix">0013</span><span class="kind"><span class="dot o-api" style="width:7px;height:7px;border-radius:50%"></span>żądanie</span><span class="who">klucz api „billing-etl”</span><span class="what">chat/completions · gpt-oss-120b</span><span class="ms">1 118 ms</span></div>
+  <main class="main">
+  <div class="ev-shell">
 
+    <div class="ev-bar">
+      <span class="ev-chip" data-origin="code_studio" data-on><span class="dot o-code"></span>Code Studio</span>
+      <span class="ev-chip" data-origin="project" data-on><span class="dot o-project"></span>Projekt</span>
+      <span class="ev-chip" data-origin="api" data-on><span class="dot o-api"></span>API zewn.</span>
+      <span class="ev-chip" data-origin="addon" data-on><span class="dot o-addon"></span>Addon</span>
+      <span class="ev-chip" data-origin="chat" data-on><span class="dot o-chat"></span>Czat</span>
+
+      <span class="ev-picker">
+        <span class="ev-chip" id="actorBtn">Aktor: <b id="actorLabel">wszyscy</b> ▾</span>
+        <div class="ev-menu" id="actorMenu">
+          <input id="actorSearch" placeholder="Szukaj użytkownika lub klucza API…" autocomplete="off">
+          <div id="actorList"></div>
+        </div>
+      </span>
+
+      <span class="sp"></span>
+
+      <span class="ev-ctl" id="rangeCtl">
+        <button data-range="60000">1 min</button>
+        <button data-range="300000">5 min</button>
+        <button data-range="0" aria-pressed="true">wszystko</button>
+      </span>
+      <span class="ev-ctl" id="scaleCtl" title="Przy dużej liczbie zdarzeń krótkie znikają w skali czasu">
+        <button data-scale="time" aria-pressed="true">czas rzeczywisty</button>
+        <button data-scale="equal">równe odstępy</button>
+      </span>
+      <span class="ev-chip" id="resetZoom" hidden>zakres: <b id="zoomLabel"></b> ✕</span>
+    </div>
+
+    <div class="ev-timeline">
+      <div class="ev-plot">
+        <div class="ev-lanes-labels"><span>model</span><span>wiadom.</span><span>narzędz.</span></div>
+        <div class="ev-track" id="track"></div>
+      </div>
+      <div class="ev-minimap" id="minimap"></div>
+      <div class="ev-legend">
+        <i><span class="sw" style="background:repeating-linear-gradient(45deg,#4b5563 0 4px,#374151 4px 8px)"></span> oczekiwanie (TTFT)</i>
+        <i><span class="sw" style="background:var(--accent-1)"></span> dekodowanie</i>
+        <i><span class="sw" style="background:#0e7490"></span> narzędzie</i>
+        <i><span class="sw" style="background:var(--danger)"></span> błąd</i>
+      </div>
+      <div class="ev-hint">
+        <span><kbd>kółko</kbd> zoom w miejscu kursora</span>
+        <span><kbd>przeciągnij</kbd> zaznacz zakres</span>
+        <span><kbd>prawy przycisk</kbd> przesuń (pan)</span>
+        <span><kbd>dwuklik</kbd> pełny zakres</span>
+        <span>minimapa pod spodem = całość + okno widoku</span>
+      </div>
+    </div>
+
+    <div class="ev-body" id="body">
+      <div class="ev-ledger" id="ledger"></div>
+      <aside class="ev-inspector" id="inspector" hidden></aside>
     </div>
   </div>
+  </main>
 </div>
-      </main>
-    </div>
+
+<script>
+const RECS = [{"id": "r1", "seq": 1, "t": 0, "dur": 4420, "lane": 0, "kind": "żądanie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "qwen3-27b", "detail": "system + 6 wiadomości · 3 narzędzia", "turn": 1, "ttft": 1414, "err": false, "key": null}, {"id": "r2", "seq": 2, "t": 1414, "dur": 40, "lane": 1, "kind": "1. token", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "—", "detail": "TTFT", "turn": 1, "ttft": null, "err": false, "key": null}, {"id": "r3", "seq": 3, "t": 2431, "dur": 38, "lane": 2, "kind": "narzędzie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "core.fs_read", "detail": "src/db/seed.rs · call c-a70", "turn": 1, "ttft": null, "err": false, "key": null}, {"id": "r4", "seq": 4, "t": 2461, "dur": 60, "lane": 2, "kind": "narzędzie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "core.fs_grep", "detail": "src/db/seed.rs · call c-a71", "turn": 1, "ttft": null, "err": false, "key": null}, {"id": "r5", "seq": 5, "t": 5320, "dur": 5040, "lane": 0, "kind": "żądanie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "qwen3-27b", "detail": "system + 9 wiadomości · 3 narzędzia", "turn": 2, "ttft": 1612, "err": false, "key": null}, {"id": "r6", "seq": 6, "t": 6932, "dur": 40, "lane": 1, "kind": "1. token", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "—", "detail": "TTFT", "turn": 2, "ttft": null, "err": false, "key": null}, {"id": "r7", "seq": 7, "t": 8092, "dur": 38, "lane": 2, "kind": "narzędzie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "core.fs_read", "detail": "src/db/seed.rs · call c-a70", "turn": 2, "ttft": null, "err": false, "key": null}, {"id": "r8", "seq": 8, "t": 8948, "dur": 22, "lane": 2, "kind": "narzędzie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "core.fs_write", "detail": "src/db/seed.rs · +38 −6", "turn": 2, "ttft": null, "err": false, "key": null}, {"id": "r9", "seq": 9, "t": 11260, "dur": 5660, "lane": 0, "kind": "żądanie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "qwen3-27b", "detail": "system + 12 wiadomości · 3 narzędzia", "turn": 3, "ttft": 1811, "err": false, "key": null}, {"id": "r10", "seq": 10, "t": 13071, "dur": 40, "lane": 1, "kind": "1. token", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "—", "detail": "TTFT", "turn": 3, "ttft": null, "err": false, "key": null}, {"id": "r11", "seq": 11, "t": 14373, "dur": 38, "lane": 2, "kind": "narzędzie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "core.fs_read", "detail": "src/db/seed.rs · call c-a70", "turn": 3, "ttft": null, "err": false, "key": null}, {"id": "r12", "seq": 12, "t": 14656, "dur": 252000, "lane": 2, "kind": "narzędzie", "origin": "code_studio", "actor": "anna.kowalska", "actorKind": "user", "name": "core.exec", "detail": "cargo test --lib db::seed · 28 passed", "turn": 3, "ttft": null, "err": false, "key": null}, {"id": "r13", "seq": 13, "t": 17820, "dur": 2100, "lane": 0, "kind": "żądanie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "qwen3-27b", "detail": "retrieval multi-hop · hop 1/3", "turn": 4, "ttft": 520, "err": false, "key": null}, {"id": "r14", "seq": 14, "t": 18120, "dur": 84, "lane": 2, "kind": "narzędzie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "vector", "detail": "passages · ps-4471 · 6 trafień", "turn": 4, "ttft": null, "err": false, "key": null}, {"id": "r15", "seq": 15, "t": 18240, "dur": 1, "lane": 2, "kind": "narzędzie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "reranker", "detail": "alias niezwiązany → kolejność wektorowa", "turn": 4, "ttft": null, "err": false, "key": null}, {"id": "r16", "seq": 16, "t": 20220, "dur": 2100, "lane": 0, "kind": "żądanie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "qwen3-27b", "detail": "retrieval multi-hop · hop 2/3", "turn": 4, "ttft": 520, "err": false, "key": null}, {"id": "r17", "seq": 17, "t": 20520, "dur": 84, "lane": 2, "kind": "narzędzie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "vector", "detail": "passages · ps-4471 · 6 trafień", "turn": 4, "ttft": null, "err": false, "key": null}, {"id": "r18", "seq": 18, "t": 20640, "dur": 1, "lane": 2, "kind": "narzędzie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "reranker", "detail": "alias niezwiązany → kolejność wektorowa", "turn": 4, "ttft": null, "err": false, "key": null}, {"id": "r19", "seq": 19, "t": 22620, "dur": 2100, "lane": 0, "kind": "żądanie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "qwen3-27b", "detail": "retrieval multi-hop · hop 3/3", "turn": 4, "ttft": 520, "err": false, "key": null}, {"id": "r20", "seq": 20, "t": 22920, "dur": 84, "lane": 2, "kind": "narzędzie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "vector", "detail": "passages · ps-4471 · 6 trafień", "turn": 4, "ttft": null, "err": false, "key": null}, {"id": "r21", "seq": 21, "t": 23040, "dur": 1, "lane": 2, "kind": "narzędzie", "origin": "project", "actor": "marek.nowak", "actorKind": "user", "name": "reranker", "detail": "alias niezwiązany → kolejność wektorowa", "turn": 4, "ttft": null, "err": false, "key": null}, {"id": "r22", "seq": 22, "t": 25020, "dur": 1118, "lane": 0, "kind": "żądanie", "origin": "api", "actor": "billing-etl", "actorKind": "api_key", "name": "gpt-oss-120b", "detail": "chat/completions · 1 wiadomość", "turn": 5, "ttft": 310, "err": false, "key": {"bound": null}}, {"id": "r23", "seq": 23, "t": 26520, "dur": 1840, "lane": 0, "kind": "żądanie", "origin": "api", "actor": "portal-asystent", "actorKind": "api_key", "name": "qwen3-27b", "detail": "chat/completions · 6 wiadomości", "turn": 6, "ttft": 640, "err": false, "key": {"bound": "marek.nowak"}}, {"id": "r24", "seq": 24, "t": 28720, "dur": 940, "lane": 0, "kind": "żądanie", "origin": "addon", "actor": "rag", "actorKind": "addon", "name": "rag-llm", "detail": "sędzia retrievalu · instancja rag-7a1", "turn": 7, "ttft": 250, "err": false, "key": null}, {"id": "r25", "seq": 25, "t": 29920, "dur": 3100, "lane": 0, "kind": "żądanie", "origin": "chat", "actor": "anna.kowalska", "actorKind": "user", "name": "qwen3-27b", "detail": "czat dashboardu", "turn": 8, "ttft": 900, "err": false, "key": null}, {"id": "r26", "seq": 26, "t": 31120, "dur": 900, "lane": 2, "kind": "narzędzie", "origin": "chat", "actor": "anna.kowalska", "actorKind": "user", "name": "notes.search", "detail": "przekroczony budżet 120 s → TOOL_TIMEOUT", "turn": 8, "ttft": null, "err": true, "key": null}];
+const EXT = { min: 0, max: Math.max(...RECS.map(r => r.t + r.dur)) };
+const state = {
+  t0: EXT.min, t1: EXT.max,
+  origins: new Set(['code_studio','project','api','addon','chat']),
+  actor: null, scale: 'time', sel: null, hot: null, brush: null,
+};
+const $ = s => document.querySelector(s);
+const track = $('#track'), ledger = $('#ledger'), minimap = $('#minimap');
+
+const fmt = ms => ms >= 60000 ? (ms/60000).toFixed(1).replace('.',',')+' min'
+  : ms >= 1000 ? (ms/1000).toFixed(2).replace('.',',')+' s' : ms+' ms';
+const clock = ms => new Date(1755600000000 + ms).toLocaleTimeString('pl-PL', {hour12:false});
+
+function visible() {
+  return RECS.filter(r => state.origins.has(r.origin)
+    && (!state.actor || r.actor === state.actor)
+    && r.t + r.dur >= state.t0 && r.t <= state.t1);
+}
+
+/* Skala „równe odstępy” odpowiada na problem, który pojawia się przy dużej
+   liczbie danych: w skali czasu wywołanie 22 ms obok builda 4 min jest
+   niewidoczne. Wtedy każdy rekord dostaje równą szerokość, a oś przestaje być
+   liniowa — dlatego to JAWNY przełącznik, a nie automat. */
+function pos(r, list) {
+  if (state.scale === 'equal') {
+    const i = list.indexOf(r), n = Math.max(1, list.length);
+    return { left: i / n * 100, width: Math.max(1.4, 100 / n * 0.82) };
+  }
+  const span = Math.max(1, state.t1 - state.t0);
+  return { left: (r.t - state.t0) / span * 100, width: Math.max(0.35, r.dur / span * 100) };
+}
+
+function renderTrack() {
+  const list = visible();
+  track.innerHTML = '';
+  if (!list.length) { track.innerHTML = '<div class="ev-empty">Brak zdarzeń w tym zakresie</div>'; }
+  const turns = [...new Set(list.map(r => r.turn))];
+  for (const tn of turns) {
+    const first = list.find(r => r.turn === tn);
+    const p = pos(first, list);
+    if (p.left < -5 || p.left > 105) continue;
+    const d = document.createElement('div');
+    d.className = 'ev-turnline'; d.style.left = p.left + '%';
+    d.innerHTML = '<b>T' + tn + '</b>';
+    track.appendChild(d);
+  }
+  for (const r of list) {
+    const p = pos(r, list);
+    const el = document.createElement('div');
+    el.className = 'ev-span lane' + r.lane;
+    el.style.left = p.left + '%'; el.style.width = p.width + '%';
+    el.dataset.id = r.id;
+    if (r.lane === 2) el.style.top = (56 + (r.seq % 2) * 14) + 'px';
+    if (r.ttft) {
+      const f = Math.min(90, r.ttft / Math.max(1, r.dur) * 100);
+      el.innerHTML = '<span class="ttft" style="width:'+f+'%"></span><span class="decode" style="width:'+(100-f)+'%"></span>';
+    } else {
+      el.innerHTML = '<span class="'+(r.err ? 'err' : r.lane===2 ? 'tool' : 'decode')+'" style="width:100%"></span>';
+    }
+    el.title = r.name + ' · ' + fmt(r.dur) + ' · ' + clock(r.t);
+    track.appendChild(el);
+  }
+  if (state.brush) {
+    const b = document.createElement('div');
+    b.className = 'ev-sel';
+    b.style.left = Math.min(state.brush.a, state.brush.b) + '%';
+    b.style.width = Math.abs(state.brush.b - state.brush.a) + '%';
+    track.appendChild(b);
+  }
+  renderMinimap();
+}
+
+function renderMinimap() {
+  minimap.innerHTML = '';
+  const full = Math.max(1, EXT.max - EXT.min);
+  for (const r of RECS) {
+    if (!state.origins.has(r.origin)) continue;
+    const d = document.createElement('div');
+    d.className = 'ev-mini-tick';
+    d.style.left = (r.t - EXT.min) / full * 100 + '%';
+    d.style.width = Math.max(0.25, r.dur / full * 100) + '%';
+    d.style.background = r.err ? 'var(--danger)' : r.lane === 2 ? '#0e7490' : 'var(--accent-1)';
+    minimap.appendChild(d);
+  }
+  const w = document.createElement('div');
+  w.className = 'ev-mini-win';
+  w.style.left = (state.t0 - EXT.min) / full * 100 + '%';
+  w.style.width = (state.t1 - state.t0) / full * 100 + '%';
+  minimap.appendChild(w);
+}
+
+function renderLedger() {
+  const list = visible();
+  ledger.innerHTML = '';
+  if (!list.length) { ledger.innerHTML = '<div class="ev-empty">Brak zdarzeń. Poszerz zakres albo zmień filtry.</div>'; return; }
+  let turn = null;
+  for (const r of list) {
+    if (r.turn !== turn) {
+      turn = r.turn;
+      const h = document.createElement('div');
+      h.className = 'ev-turnhead';
+      const any = list.find(x => x.turn === turn);
+      h.innerHTML = 'Tura ' + turn + ' <span class="sub">' + any.origin + ' · ' + any.actor +
+        (any.actorKind === 'api_key' ? ' <span class="tag ' + (any.key && any.key.bound ? 'bound' : 'unbound') + '">klucz API</span>' : '') + '</span>';
+      ledger.appendChild(h);
+    }
+    const row = document.createElement('div');
+    row.className = 'ev-row' + (state.sel === r.id ? '' : '');
+    if (state.sel === r.id) row.setAttribute('data-sel', '');
+    row.dataset.id = r.id;
+    row.innerHTML = '<span class="ix">' + String(r.seq).padStart(4,'0') + '</span>' +
+      '<span class="kind"><span class="dot o-' + ({code_studio:'code',project:'project',api:'api',addon:'addon',chat:'chat'})[r.origin] +
+      '" style="width:7px;height:7px;border-radius:50%"></span>' + r.kind + '</span>' +
+      '<span class="who">' + r.name + '</span>' +
+      '<span class="what">' + r.detail + '</span>' +
+      '<span class="ms">' + fmt(r.dur) + '</span>';
+    ledger.appendChild(row);
+  }
+}
+
+/* Sprzężenie w OBIE strony: najechanie na wiersz podświetla pasmo i odwrotnie.
+   Bez tego oś czasu i lista są dwoma osobnymi widokami tych samych danych. */
+function setHot(id) {
+  state.hot = id;
+  for (const el of document.querySelectorAll('.ev-span,.ev-row')) el.classList.remove('hot');
+  if (!id) return;
+  for (const el of document.querySelectorAll('[data-id="' + id + '"]')) el.classList.add('hot');
+  const row = ledger.querySelector('.ev-row[data-id="' + id + '"]');
+  if (row) row.scrollIntoView({ block: 'nearest' });
+}
+
+function renderInspector() {
+  const insp = $('#inspector'), body = $('#body');
+  const r = RECS.find(x => x.id === state.sel);
+  if (!r) { insp.hidden = true; body.classList.remove('with-inspector'); return; }
+  insp.hidden = false; body.classList.add('with-inspector');
+  const keyBlock = r.actorKind !== 'api_key' ? '' :
+    '<div class="ev-sec"><h4>Klucz API</h4><dl class="ev-kv" style="padding:0">' +
+    '<dt>nazwa</dt><dd>' + r.actor + '</dd>' +
+    '<dt>powiązanie</dt><dd>' + (r.key && r.key.bound
+        ? r.key.bound + ' <span class="tag bound">powiązany</span>'
+        : '<span class="tag unbound">brak powiązania</span> klucz serwisowy') + '</dd>' +
+    '<dt>utworzył</dt><dd>' + (r.key && r.key.bound ? 'admin · 12.06.2026' : 'admin · 03.02.2026') + '</dd>' +
+    '</dl><div style="margin-top:8px"><span class="ev-chip">pokaż wszystkie przebiegi tego klucza</span></div></div>';
+  insp.innerHTML =
+    '<div class="ev-insp-head"><div class="ev-insp-title">' + r.kind + ' · ' + r.name + '</div>' +
+    '<div class="ev-insp-sub">seq ' + String(r.seq).padStart(4,'0') + ' · tura ' + r.turn + ' · ' + clock(r.t) + '</div></div>' +
+    '<dl class="ev-kv"><dt>pochodzenie</dt><dd>' + r.origin + '</dd>' +
+    '<dt>aktor</dt><dd>' + r.actor + ' <span style="color:var(--text-3)">(' + r.actorKind + ')</span></dd>' +
+    '<dt>czas</dt><dd>' + fmt(r.dur) + '</dd>' +
+    (r.ttft ? '<dt>TTFT</dt><dd>' + fmt(r.ttft) + '</dd><dt>dekodowanie</dt><dd>' + fmt(r.dur - r.ttft) + '</dd>' : '') +
+    '<dt>korelacja</dt><dd>corr-77ab12</dd></dl>' + keyBlock +
+    '<div class="ev-sec"><h4>Szczegóły</h4><div class="ev-pre">' + r.detail + '</div></div>' +
+    '<div class="ev-sec"><h4>Powiązania</h4><div class="ev-pre">audit_log  #48 122\nflow_executions  run-3c99</div></div>';
+}
+
+function renderAll() { renderTrack(); renderLedger(); renderInspector(); updateZoomChip(); }
+
+function updateZoomChip() {
+  const full = state.t0 === EXT.min && state.t1 === EXT.max;
+  $('#resetZoom').hidden = full;
+  $('#zoomLabel').textContent = clock(state.t0) + '–' + clock(state.t1);
+}
+
+/* ---- interakcje osi ---- */
+track.addEventListener('wheel', (e) => {
+  e.preventDefault();
+  const rect = track.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  const anchor = state.t0 + frac * (state.t1 - state.t0);
+  const factor = e.deltaY > 0 ? 1.25 : 0.8;
+  const span = Math.max(200, Math.min(EXT.max - EXT.min, (state.t1 - state.t0) * factor));
+  state.t0 = Math.max(EXT.min, anchor - frac * span);
+  state.t1 = Math.min(EXT.max, state.t0 + span);
+  state.t0 = Math.max(EXT.min, state.t1 - span);
+  renderAll();
+}, { passive: false });
+
+track.addEventListener('dblclick', () => { state.t0 = EXT.min; state.t1 = EXT.max; state.brush = null; renderAll(); });
+track.addEventListener('contextmenu', e => e.preventDefault());
+
+let drag = null;
+track.addEventListener('pointerdown', (e) => {
+  const rect = track.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width * 100;
+  drag = { mode: e.button === 2 ? 'pan' : 'brush', startFrac: frac, t0: state.t0, t1: state.t1 };
+  if (drag.mode === 'brush') state.brush = { a: frac, b: frac };
+  track.setPointerCapture(e.pointerId);
+});
+track.addEventListener('pointermove', (e) => {
+  const rect = track.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width * 100;
+  if (!drag) {
+    const el = e.target.closest('.ev-span');
+    setHot(el ? el.dataset.id : null);
+    return;
+  }
+  if (drag.mode === 'brush') { state.brush.b = frac; renderTrack(); }
+  else {
+    const span = drag.t1 - drag.t0;
+    const shift = (drag.startFrac - frac) / 100 * span;
+    let a = drag.t0 + shift, b = drag.t1 + shift;
+    if (a < EXT.min) { b += EXT.min - a; a = EXT.min; }
+    if (b > EXT.max) { a -= b - EXT.max; b = EXT.max; }
+    state.t0 = a; state.t1 = b; renderAll();
+  }
+});
+track.addEventListener('pointerup', () => {
+  if (drag && drag.mode === 'brush' && state.brush && Math.abs(state.brush.b - state.brush.a) > 1.2) {
+    const span = state.t1 - state.t0;
+    const a = state.t0 + Math.min(state.brush.a, state.brush.b) / 100 * span;
+    const b = state.t0 + Math.max(state.brush.a, state.brush.b) / 100 * span;
+    state.t0 = a; state.t1 = b;
+  }
+  state.brush = null; drag = null;
+  document.querySelector('#rangeCtl [data-range="0"]').setAttribute('aria-pressed', 'false');
+  renderAll();
+});
+track.addEventListener('pointerleave', () => { if (!drag) setHot(null); });
+track.addEventListener('click', (e) => {
+  const el = e.target.closest('.ev-span');
+  if (el) { state.sel = el.dataset.id; renderAll(); }
+});
+
+/* Minimapa: klik = przesuń okno widoku tam. */
+minimap.addEventListener('pointerdown', (e) => {
+  const rect = minimap.getBoundingClientRect();
+  const frac = (e.clientX - rect.left) / rect.width;
+  const span = state.t1 - state.t0;
+  const center = EXT.min + frac * (EXT.max - EXT.min);
+  state.t0 = Math.max(EXT.min, center - span / 2);
+  state.t1 = Math.min(EXT.max, state.t0 + span);
+  renderAll();
+});
+
+/* ---- filtry ---- */
+for (const chip of document.querySelectorAll('.ev-chip[data-origin]')) {
+  chip.addEventListener('click', () => {
+    const o = chip.dataset.origin;
+    if (state.origins.has(o)) { state.origins.delete(o); chip.removeAttribute('data-on'); }
+    else { state.origins.add(o); chip.setAttribute('data-on', ''); }
+    renderAll();
+  });
+}
+$('#rangeCtl').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  for (const x of e.currentTarget.querySelectorAll('button')) x.setAttribute('aria-pressed', 'false');
+  b.setAttribute('aria-pressed', 'true');
+  const win = Number(b.dataset.range);
+  if (!win) { state.t0 = EXT.min; state.t1 = EXT.max; }
+  else { state.t1 = EXT.max; state.t0 = Math.max(EXT.min, EXT.max - win); }
+  renderAll();
+});
+$('#scaleCtl').addEventListener('click', (e) => {
+  const b = e.target.closest('button'); if (!b) return;
+  for (const x of e.currentTarget.querySelectorAll('button')) x.setAttribute('aria-pressed', 'false');
+  b.setAttribute('aria-pressed', 'true');
+  state.scale = b.dataset.scale; renderAll();
+});
+$('#resetZoom').addEventListener('click', () => {
+  state.t0 = EXT.min; state.t1 = EXT.max;
+  document.querySelector('#rangeCtl [data-range="0"]').setAttribute('aria-pressed', 'true');
+  renderAll();
+});
+
+/* ---- wybór aktora ---- */
+const ACTORS = [
+  { id: null, label: 'wszyscy', sub: 'bez filtra', kind: '' },
+  { id: 'anna.kowalska', label: 'anna.kowalska', sub: 'Anna Kowalska · Platforma', kind: 'user' },
+  { id: 'marek.nowak', label: 'marek.nowak', sub: 'Marek Nowak · Projekty', kind: 'user' },
+  { id: 'billing-etl', label: 'billing-etl', sub: 'klucz serwisowy — BRAK powiązania z użytkownikiem', kind: 'unbound' },
+  { id: 'portal-asystent', label: 'portal-asystent', sub: 'klucz API → marek.nowak', kind: 'bound' },
+  { id: 'rag', label: 'rag', sub: 'addon · instancja rag-7a1', kind: 'user' },
+];
+function renderActors(q = '') {
+  const list = $('#actorList'); list.innerHTML = '';
+  for (const a of ACTORS.filter(a => !q || (a.label + a.sub).toLowerCase().includes(q.toLowerCase()))) {
+    const d = document.createElement('div');
+    d.className = 'ev-opt';
+    d.innerHTML = '<span>' + a.label + '</span>' +
+      (a.kind === 'unbound' ? '<span class="tag unbound">bez usera</span>'
+       : a.kind === 'bound' ? '<span class="tag bound">powiązany</span>' : '<span></span>') +
+      '<span class="sub">' + a.sub + '</span>';
+    d.addEventListener('click', () => {
+      state.actor = a.id; $('#actorLabel').textContent = a.label;
+      $('#actorMenu').removeAttribute('data-open'); renderAll();
+    });
+    list.appendChild(d);
+  }
+}
+$('#actorBtn').addEventListener('click', (e) => {
+  e.stopPropagation();
+  const m = $('#actorMenu');
+  m.toggleAttribute('data-open');
+  if (m.hasAttribute('data-open')) { renderActors(); $('#actorSearch').focus(); }
+});
+$('#actorSearch').addEventListener('input', e => renderActors(e.target.value));
+document.addEventListener('click', () => $('#actorMenu').removeAttribute('data-open'));
+$('#actorMenu').addEventListener('click', e => e.stopPropagation());
+
+/* ---- sprzężenie z listy ---- */
+ledger.addEventListener('pointerover', (e) => {
+  const row = e.target.closest('.ev-row');
+  if (row) setHot(row.dataset.id);
+});
+ledger.addEventListener('pointerleave', () => setHot(null));
+ledger.addEventListener('click', (e) => {
+  const row = e.target.closest('.ev-row');
+  if (row) { state.sel = row.dataset.id; renderAll(); }
+});
+
+renderAll();
+</script>
 </body>
 </html>

@@ -117,3 +117,67 @@
   color: var(--text-2); white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto;
 }
 .ev-track-bar { display: flex; height: 9px; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+
+/* =============================================================================
+   Interakcja: zakres czasu, zoom, przesuwanie, sprzężenie wiersz ↔ pasmo.
+   ============================================================================= */
+
+.ev-ctl { display: inline-flex; align-items: center; gap: 2px; background: var(--bg-3);
+  border: 1px solid var(--border); border-radius: 999px; padding: 2px; }
+.ev-ctl button {
+  appearance: none; border: 0; background: transparent; color: var(--text-2);
+  font: inherit; font-size: 12px; font-weight: 600; padding: 3px 10px;
+  border-radius: 999px; cursor: pointer;
+}
+.ev-ctl button[aria-pressed="true"] { background: var(--accent-1); color: #fff; }
+.ev-ctl button:focus-visible { outline: 2px solid var(--accent-2); outline-offset: 1px; }
+
+.ev-picker { position: relative; }
+.ev-menu {
+  position: absolute; z-index: 40; top: calc(100% + 6px); left: 0; min-width: 300px;
+  background: var(--bg-card); border: 1px solid var(--border-hover);
+  border-radius: var(--radius); box-shadow: var(--shadow); padding: 6px; display: none;
+}
+.ev-menu[data-open] { display: block; }
+.ev-menu input {
+  width: 100%; background: var(--bg-input); border: 1px solid var(--border);
+  border-radius: var(--radius-sm); color: var(--text); padding: 6px 9px; font: inherit;
+  font-size: 12.5px; margin-bottom: 6px;
+}
+.ev-opt {
+  display: grid; grid-template-columns: 1fr auto; gap: 2px 10px;
+  padding: 7px 9px; border-radius: var(--radius-sm); cursor: pointer; font-size: 13px;
+}
+.ev-opt:hover { background: var(--bg-card-hover); }
+.ev-opt .sub { grid-column: 1 / -1; font-size: 11.5px; color: var(--text-3); }
+.ev-opt .tag {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: .05em;
+  padding: 2px 6px; border-radius: 4px; background: var(--bg-3); color: var(--text-2); align-self: start;
+}
+.ev-opt .tag.unbound { background: rgba(245,158,11,.16); color: var(--warning); }
+.ev-opt .tag.bound { background: rgba(34,197,94,.14); color: var(--success); }
+
+/* Minimapa: pełny zakres + okno widoku. Odpowiada na „co, gdy danych przybędzie”. */
+.ev-minimap { position: relative; height: 22px; background: var(--bg-3);
+  border-top: 1px solid var(--border); cursor: grab; overflow: hidden; }
+.ev-minimap.grabbing { cursor: grabbing; }
+.ev-mini-tick { position: absolute; top: 8px; height: 6px; border-radius: 1px; opacity: .7; }
+.ev-mini-win {
+  position: absolute; top: 0; bottom: 0; background: rgba(99,102,241,.18);
+  border-left: 2px solid var(--accent-1); border-right: 2px solid var(--accent-1);
+}
+
+/* Sprzężenie w obie strony */
+.ev-span.hot { outline: 2px solid var(--accent-2); outline-offset: 1px; z-index: 9; }
+.ev-row.hot { background: var(--bg-card-hover); box-shadow: inset 2px 0 0 var(--accent-2); }
+.ev-span { cursor: pointer; }
+
+.ev-hint {
+  padding: 5px 16px; font-size: 11.5px; color: var(--text-3);
+  border-top: 1px solid var(--border); display: flex; gap: 16px; flex-wrap: wrap;
+}
+.ev-hint kbd {
+  background: var(--bg-3); border: 1px solid var(--border); border-bottom-width: 2px;
+  border-radius: 4px; padding: 0 5px; font-family: 'JetBrains Mono', monospace; font-size: 10.5px;
+}
+.ev-empty { padding: 28px 16px; text-align: center; color: var(--text-3); font-size: 13px; }
