@@ -36,9 +36,17 @@ pub enum ProgressEvent {
         status: String,
     },
     /// A tool call began (phase 3/5 harness emits). `name` is the tool name.
-    ToolCallStarted { name: String },
+    /// `call_id` pochodzi wprost z wywolania modelu. Bez niego dwa rownolegle
+    /// wywolania tego samego narzedzia sa nierozroznialne — a odkad wywolania jada
+    /// obok siebie, parowanie po nazwie potrafi zlaczyc start jednego z koncem
+    /// drugiego i wyliczyc z tego bzdurny czas.
+    ToolCallStarted { call_id: String, name: String },
     /// A tool call settled (phase 3/5 harness emits).
-    ToolCallFinished { name: String, status: String },
+    ToolCallFinished {
+        call_id: String,
+        name: String,
+        status: String,
+    },
     /// Context compaction ran for a node (phase 5 harness emits).
     Compaction { node_id: String },
     /// A background child run was spawned (phase 6 emits). `agent` names the

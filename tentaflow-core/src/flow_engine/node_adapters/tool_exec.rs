@@ -793,6 +793,7 @@ impl ToolExecNodeAdapter {
         ctx.progress.emit(
             &ctx.progress_scope,
             ProgressEvent::ToolCallStarted {
+                call_id: call.id.clone(),
                 name: call.name.clone(),
             },
         );
@@ -833,6 +834,7 @@ impl ToolExecNodeAdapter {
         ctx.progress.emit(
             &ctx.progress_scope,
             ProgressEvent::ToolCallFinished {
+                call_id: call.id.clone(),
                 name: call.name.clone(),
                 status: if result.success { "ok" } else { "error" }.to_string(),
             },
