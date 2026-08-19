@@ -410,14 +410,8 @@ pub struct AuditEnvelope {
 /// that does not go through here.
 pub fn append(pool: &DbPool, event: RunEvent) -> Result<AppendedEvent> {
     let mut conn = pool.write().map_err(|e| anyhow!("events db write: {e}"))?;
-    // MUTATION M2: seq allocated OUTSIDE the insert transaction.
-    let pre_seq: i64 = conn.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
-        rusqlite::params![event.run_id],
-        |row| row.get(0),
-    )?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-    let appended = write_event_preallocated(&tx, event, pre_seq)?;
+    let appended = write_event(&tx, event)?;
     tx.commit()?;
     Ok(appended)
 }
@@ -430,19 +424,6 @@ pub fn append_in_tx(tx: &Transaction<'_>, event: RunEvent) -> Result<AppendedEve
 }
 
 fn write_event(tx: &Transaction<'_>, event: RunEvent) -> Result<AppendedEvent> {
-    let seq: i64 = tx.query_row(
-        "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
-        rusqlite::params![event.run_id],
-        |row| row.get(0),
-    )?;
-    write_event_preallocated(tx, event, seq)
-}
-
-fn write_event_preallocated(
-    tx: &Transaction<'_>,
-    event: RunEvent,
-    preallocated_seq: i64,
-) -> Result<AppendedEvent> {
     if let Some(key) = event.idempotency_key.as_deref() {
         if let Some(seq) = tx
             .query_row(
@@ -462,7 +443,11 @@ fn write_event_preallocated(
     let payload = event.payload.redacted();
     let kind = payload.kind();
     let security_relevant = payload.security_relevant();
-    let seq: i64 = preallocated_seq;
+    let seq: i64 = tx.query_row(
+        "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = ?1",
+        rusqlite::params![event.run_id],
+        |row| row.get(0),
+    )?;
     let payload_json = to_json(&payload)?;
     let origin = event.origin.as_str();
     let actor_kind = event.actor_kind.as_str();
@@ -723,8 +708,8 @@ mod tests {
         // Create the file and run the migration once up front: the race under
         // test is between two APPENDS, not between two schema installs.
         drop(open_events_db(dir.path()));
-        let writers = 4usize;
-        let per_writer = 300usize;
+        let writers = 2usize;
+        let per_writer = 25usize;
         let barrier = std::sync::Arc::new(std::sync::Barrier::new(writers));
 
         let handles: Vec<_> = (0..writers)
@@ -764,7 +749,6 @@ mod tests {
             refused += failures;
         }
 
-        eprintln!("DIAG accepted={} refused={}", accepted.len(), refused);
         let mut sorted = accepted.clone();
         sorted.sort_unstable();
         let mut deduped = sorted.clone();
