@@ -179,6 +179,8 @@ mod llamacpp_prompt_mode {
             last_deploy_id: "deploy-1".to_string(),
             deployment_progress_pct: 100,
             progress_message: None,
+            usage_json: None,
+            usage_updated_at: None,
             models: vec![ServiceModelEntry {
                 model_name: MODEL_NAME.to_string(),
                 display_name: None,

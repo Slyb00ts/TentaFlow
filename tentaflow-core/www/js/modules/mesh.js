@@ -320,7 +320,7 @@ function renderActiveTab() {
 
 function renderListSections() {
   if (nodes.length === 0 && pending.length === 0) {
-    return `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('mesh.no_nodes'))}</div></div>`;
+    return `<div class="empty-state"><div class="empty-state-text">${escapeHtml(I18n.t('mesh.noNodes'))}</div></div>`;
   }
 
   const local = nodes.filter(n => n.is_local || n.source === 'local');

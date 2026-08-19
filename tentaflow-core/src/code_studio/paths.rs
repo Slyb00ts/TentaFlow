@@ -10,7 +10,7 @@
 //   <data>/code-studio/<workspace_id>/
 //       repo/                        reference tree + git metadata (NEVER mounted)
 //       worktrees/<session_id>/       working worktree of a session
-//       worktrees/<session_id>-int/   integration worktree of a merge
+//       worktrees/<session_id>_int/   integration worktree of a merge
 //       workspace.db                  runtime state of the owner node
 //       artifacts/<aa>/<sha256>
 //       vectors/
@@ -82,7 +82,10 @@ pub fn session_worktree_dir(workspace_id: &str, session_id: &str) -> Result<Path
 /// separate from the working worktree because a conflict leaves it `held`.
 pub fn integration_worktree_dir(workspace_id: &str, session_id: &str) -> Result<PathBuf> {
     validate_session_id(session_id)?;
-    Ok(worktrees_dir(workspace_id)?.join(format!("{session_id}-int")))
+    // `_` cannot appear in a session id, so this name can never be the WORKING
+    // worktree of another session — which `<id>-int` could be, for a session
+    // literally called `<id>-int`.
+    Ok(worktrees_dir(workspace_id)?.join(format!("{session_id}_int")))
 }
 
 pub fn artifacts_dir(workspace_id: &str) -> Result<PathBuf> {
@@ -154,6 +157,19 @@ fn restrict_permissions(_dir: &Path) -> Result<()> {
             .map_err(|e| anyhow!("code_studio: chmod {}: {e}", _dir.display()))?;
     }
     Ok(())
+}
+
+/// Serialises every test that redirects the Data category, across ALL modules.
+///
+/// `crate::paths::set_category_override` is process-global, so a mutex declared
+/// inside one test module only protects that module against itself: another
+/// module's test could clear the override mid-run and leave the first one
+/// resolving paths under a temporary directory that no longer exists. That is
+/// not theoretical — it produced a `git init` failing to write its own config.
+#[cfg(test)]
+pub(crate) fn test_data_dir_guard() -> std::sync::MutexGuard<'static, ()> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

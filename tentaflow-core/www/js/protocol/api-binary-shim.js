@@ -10,6 +10,43 @@ import { codecReady } from './codec.js';
 import { BinaryWsClient } from './binary-ws-client.js';
 
 const JWT_STORAGE_KEY = 'tentaflow_jwt';
+// Deadline for a whole call through the shim, not just for its round trip. The
+// client's own timer starts AFTER the frame is encoded, so a transport that
+// stalls while connecting used to leave the caller's promise pending forever —
+// a page waiting on a write that will never answer either way. One deadline per
+// call, applied here, is what makes "every request settles" true for all of
+// them instead of for the ones that got as far as the socket.
+const CALL_DEADLINE_MS = 30_000;
+
+/** Rejects `promise` if it has not settled within `timeoutMs`. */
+function withDeadline(promise, timeoutMs, what) {
+  let timer = null;
+  const deadline = new Promise((_, reject) => {
+    timer = setTimeout(
+      () => reject(new Error(`request ${what} timed out after ${timeoutMs}ms`)),
+      timeoutMs,
+    );
+  });
+  return Promise.race([promise, deadline]).finally(() => clearTimeout(timer));
+}
+
+/**
+ * The caller's `{timeoutMs}` options object, read without consuming it —
+ * `BinaryWsClient.request` pops the same argument for its own timer, and both
+ * timers have to describe the same deadline.
+ */
+function requestedTimeout(args) {
+  const last = args[args.length - 1];
+  if (
+    last &&
+    typeof last === 'object' &&
+    last._isRequestOptions === true &&
+    typeof last.timeoutMs === 'number'
+  ) {
+    return last.timeoutMs;
+  }
+  return CALL_DEADLINE_MS;
+}
 
 let _client = null;
 let _connectingPromise = null;
@@ -89,15 +126,19 @@ async function getClient() {
   }
 }
 
-async function dispatch(kind, ...args) {
-  const client = await getClient();
-  const result = await client.request(kind, ...args);
-  if (result.envelope.isError || result.body.variant === 'Error') {
-    const err = new Error(result.body.message ?? `protocol error in ${kind}`);
-    err.code = result.body.code;
-    throw err;
-  }
-  return result.body;
+function dispatch(kind, ...args) {
+  const timeoutMs = requestedTimeout(args);
+  const call = (async () => {
+    const client = await getClient();
+    const result = await client.request(kind, ...args);
+    if (result.envelope.isError || result.body.variant === 'Error') {
+      const err = new Error(result.body.message ?? `protocol error in ${kind}`);
+      err.code = result.body.code;
+      throw err;
+    }
+    return result.body;
+  })();
+  return withDeadline(call, timeoutMs, kind);
 }
 
 export const ApiBinary = {
@@ -119,10 +160,16 @@ export const ApiBinary = {
   },
 
   async subscribe(kind, payload, { onChunk, onEnd, onError } = {}) {
-    const client = await getClient();
+    // Opening a stream waits on the same transport a request does, so it gets
+    // the same deadline; without it a subscribe on a dead socket hangs the
+    // screen that awaited it.
+    const client = await withDeadline(getClient(), CALL_DEADLINE_MS, kind);
     const correlationId = client.nextCorrelationId();
     const sequence = client.takeSequence();
     const codec = await import('./codec.js');
+    if (typeof codec.encode[kind] !== 'function') {
+      throw new Error(`unknown request kind '${kind}': the codec has no encoder for it`);
+    }
     const frame = codec.encode[kind](correlationId, payload, sequence);
 
     const removeListener = client.subscribe(correlationId, ({ envelope, body }) => {

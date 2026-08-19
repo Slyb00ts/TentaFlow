@@ -32,6 +32,7 @@ async fn streaming_handler_emits_chunks_and_end() {
         messages: vec![ChatMessage {
             role: "user".into(),
             content: "hi".into(),
+            reasoning_content: None,
         }],
         temperature: None,
         max_tokens: None,

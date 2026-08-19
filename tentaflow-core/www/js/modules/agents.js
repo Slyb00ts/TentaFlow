@@ -11,6 +11,7 @@
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
+import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
@@ -303,23 +304,19 @@ function parseStringArray(json) {
   }
 }
 
-function parseSkillsSelection(json) {
-  try {
-    const obj = JSON.parse(json || '{}');
-    const names = Array.isArray(obj?.names) ? obj.names.filter((s) => typeof s === 'string') : [];
-    const tags = Array.isArray(obj?.tags) ? obj.tags.filter((s) => typeof s === 'string') : [];
-    return { names, tags };
-  } catch {
-    return { names: [], tags: [] };
-  }
+function normalizeSkillsSelection(obj) {
+  const names = Array.isArray(obj?.names) ? obj.names.filter((s) => typeof s === 'string') : [];
+  const tags = Array.isArray(obj?.tags) ? obj.tags.filter((s) => typeof s === 'string') : [];
+  return { names, tags };
 }
 
-function safeParseParams(json) {
+// The list summary still carries the raw `skills_json` column (it is a display
+// projection, not an upsert payload); the detail row carries the object.
+function parseSkillsSelection(json) {
   try {
-    const obj = JSON.parse(json || '{}');
-    return obj && typeof obj === 'object' && !Array.isArray(obj) ? obj : {};
+    return normalizeSkillsSelection(JSON.parse(json || '{}'));
   } catch {
-    return {};
+    return { names: [], tags: [] };
   }
 }
 
@@ -497,7 +494,8 @@ async function fetchAgentDetail(agentId) {
 }
 
 // A full upsert payload from a detail row — enable/disable and duplicate flows
-// must round-trip every field, not just the one they change.
+// must round-trip every field, not just the one they change. The detail row is
+// already the upsert shape, so this only applies the overrides.
 function payloadFromDetail(agent, overrides = {}) {
   return {
     id: agent.id,
@@ -506,9 +504,9 @@ function payloadFromDetail(agent, overrides = {}) {
     description: agent.description || '',
     system_prompt: agent.system_prompt || null,
     model: agent.model || null,
-    tools: parseStringArray(agent.tools_json),
-    skills: parseSkillsSelection(agent.skills_json),
-    params: safeParseParams(agent.params_json),
+    tools: agent.tools ?? [],
+    skills: normalizeSkillsSelection(agent.skills),
+    params: agent.params ?? {},
     max_iterations: agent.max_iterations ?? 25,
     timeout_secs: agent.timeout_secs ?? 600,
     max_subagents: agent.max_subagents ?? 0,
@@ -730,7 +728,7 @@ function renderPlaygroundHeader() {
     <div class="agents-pg-sub">${escapeHtml(agent.description || '')}</div>
     <div class="agents-pg-chips">
       <tf-chip status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(agent.model || t('model_inherited'))}</tf-chip>
-      <tf-chip status="info">${escapeHtml(t('card_tools_count', { count: parseStringArray(agent.tools_json).length }))}</tf-chip>
+      <tf-chip status="info">${escapeHtml(t('card_tools_count', { count: (agent.tools ?? []).length }))}</tf-chip>
       ${agent.routable ? `<tf-chip>${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
     </div>
   `;
@@ -950,8 +948,8 @@ async function openWizard(agent, { forceCreate = false } = {}) {
   ]);
 
   const mode = agent && agent.id && !forceCreate ? 'edit' : 'create';
-  const selectedTools = agent ? parseStringArray(agent.tools_json) : [];
-  const skillSel = agent ? parseSkillsSelection(agent.skills_json) : { names: [], tags: [] };
+  const selectedTools = agent?.tools ?? [];
+  const skillSel = normalizeSkillsSelection(agent?.skills);
 
   const win = document.createElement('tf-window');
   win.setAttribute('title', t(mode === 'create' ? 'editor_create_title' : 'editor_edit_title'));
@@ -1000,7 +998,7 @@ async function openWizard(agent, { forceCreate = false } = {}) {
   state.wizard = {
     mode,
     agent: mode === 'edit' ? agent : null,
-    sourceParams: agent ? safeParseParams(agent.params_json) : {},
+    sourceParams: agent?.params ?? {},
     win,
     body,
     foot,
@@ -1112,6 +1110,23 @@ function wizardBodyHtml(agent, mode, models) {
           hint="${escapeAttr(t('hint_flow_id'))}"></tf-input>
       </div>
 
+      <div class="agents-editor-grid">
+        <!-- Poziom rozumowania zalezy od MODELU: opcje wypelnia
+             refreshReasoningOptions() z katalogu, a gdy model ich nie ma, cale
+             pole znika zamiast oferowac ustawienie, ktore backend odrzuci. -->
+        <div class="agents-field" id="agent-wz-reasoning-field" hidden>
+          <tf-select id="agent-wz-reasoning" label="${escapeAttr(t('label_reasoning_effort'))}"
+            value="${escapeAttr(agent?.params?.reasoning_effort || '')}"></tf-select>
+          <div class="agents-field-hint">${escapeHtml(t('hint_reasoning_effort'))}</div>
+        </div>
+        <div class="agents-field">
+          <tf-input id="agent-wz-temperature" type="number" min="0" max="2" step="0.1"
+            label="${escapeAttr(t('label_temperature'))}"
+            value="${escapeAttr(agent?.params?.temperature ?? '')}"></tf-input>
+          <div class="agents-field-hint">${escapeHtml(t('hint_temperature'))}</div>
+        </div>
+      </div>
+
       <div class="agents-field">
         <span class="tf-label">${escapeHtml(t('behavior_section'))}</span>
         <div class="agents-slider-row">
@@ -1202,6 +1217,53 @@ function wireWizard() {
   slider?.addEventListener('input', (e) => {
     if (sliderVal) sliderVal.textContent = String(e.detail?.value ?? slider.value);
   });
+
+  // Poziomy rozumowania wynikają z modelu, więc przebudowują się przy każdej
+  // zmianie wyboru — nie ma jednej stałej listy do pokazania.
+  const modelSelect = wz.body.querySelector('#agent-wz-model');
+  modelSelect?.addEventListener('change', () => refreshReasoningOptions(wz));
+  refreshReasoningOptions(wz);
+}
+
+/// Wypełnia listę poziomów rozumowania z katalogu dla AKTUALNIE wybranego modelu.
+///
+/// Trzy stany, celowo rozróżnione:
+///  - model deklaruje poziomy → pokazujemy dokładnie je,
+///  - model deklaruje pustą listę → chowamy pole, bo backend odrzuciłby każdą
+///    wartość,
+///  - katalog nie zna modelu (`null`) → zostawiamy zapisany wybór i pokazujemy
+///    pole, tak jak przy modalnościach: brak wpisu to niewiedza, nie brak
+///    możliwości.
+async function refreshReasoningOptions(wz) {
+  const field = wz.body.querySelector('#agent-wz-reasoning-field');
+  const select = wz.body.querySelector('#agent-wz-reasoning');
+  if (!field || !select) return;
+
+  await ModelModalities.load();
+  const model = (wz.body.querySelector('#agent-wz-model')?.value || '').trim();
+  const levels = ModelModalities.reasoningLevels(model);
+  const current = (select.value || '').trim();
+
+  if (Array.isArray(levels) && levels.length === 0) {
+    field.hidden = true;
+    select.value = '';
+    return;
+  }
+
+  const options = Array.isArray(levels) && levels.length
+    ? levels
+    : (current ? [current] : []);
+  if (!options.length) {
+    field.hidden = true;
+    select.value = '';
+    return;
+  }
+
+  field.hidden = false;
+  // Pusta opcja = "nie ruszaj ustawienia modelu", nie "poziom zerowy".
+  select.innerHTML = `<option value="">${escapeHtml(t('reasoning_effort_default'))}</option>`
+    + options.map((lvl) => `<option value="${escapeAttr(lvl)}">${escapeHtml(lvl)}</option>`).join('');
+  select.value = options.includes(current) ? current : '';
 }
 
 function setWizardStep(step) {
@@ -1527,6 +1589,22 @@ function validateWizardStep(step) {
   return null;
 }
 
+/// Skleja `params_json` agenta z formularza. Nieznane klucze przechodza bez zmian.
+function buildAgentParams(source, field) {
+  const params = { ...(source || {}) };
+
+  const effort = (field('#agent-wz-reasoning')?.value || '').trim();
+  if (effort) params.reasoning_effort = effort;
+  else delete params.reasoning_effort;
+
+  const rawTemp = (field('#agent-wz-temperature')?.value ?? '').toString().trim();
+  const temp = rawTemp === '' ? null : Number(rawTemp);
+  if (temp !== null && Number.isFinite(temp)) params.temperature = temp;
+  else delete params.temperature;
+
+  return params;
+}
+
 async function saveWizard() {
   const wz = state.wizard;
   if (!wz) return;
@@ -1551,7 +1629,11 @@ async function saveWizard() {
       names: [...wz.selectedSkillNames],
       tags: [...wz.selectedSkillTags],
     },
-    params: wz.sourceParams,
+    // Zachowujemy klucze, ktorych ten formularz nie zna (params_json jest
+    // wspolnym workiem), a nadpisujemy tylko te dwa. Puste pole = USUNIECIE
+    // klucza, nie zapis pustej wartosci — inaczej backend dostalby "" jako
+    // poziom rozumowania.
+    params: buildAgentParams(wz.sourceParams, field),
     max_iterations: Number.parseInt(field('#agent-wz-max-iterations')?.value, 10) || 25,
     timeout_secs: intField('#agent-wz-timeout-secs', 600),
     max_subagents: intField('#agent-wz-max-subagents', 0),

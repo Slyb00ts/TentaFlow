@@ -310,3 +310,24 @@ pub fn list_alive(conn: &Connection) -> Result<Vec<ModelWithService>> {
         .collect::<rusqlite::Result<Vec<_>>>()?;
     Ok(rows)
 }
+
+/// The model an agent falls back to when its definition names none.
+///
+/// „Default" means, in order: a model a service explicitly marked default, then
+/// the oldest model of any service that can actually serve. A model whose
+/// service is down would only move the failure one step later, so the join is
+/// part of the answer rather than a filter applied by the caller.
+///
+/// Returns `None` on a node with no usable model at all — the caller turns that
+/// into an actionable message instead of a bare "no model".
+pub fn default_llm_model(conn: &Connection) -> rusqlite::Result<Option<String>> {
+    conn.query_row(
+        "SELECT m.model_name FROM model_registry m \
+         JOIN services s ON s.id = m.service_id \
+         WHERE s.status IN ('running', 'degraded') \
+         ORDER BY m.is_default DESC, m.id ASC LIMIT 1",
+        [],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+}

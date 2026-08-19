@@ -156,7 +156,13 @@ mod serde_array64 {
 // v21: removed both Notes `MessageBody` variants (built-in Notes screen
 // replaced by the notes addon). Dropping mid-enum variants shifts the CBOR tag
 // of every later variant, so old/new peers must not mix.
-pub const SCHEMA_VERSION: u16 = 21;
+// v22: Code Studio. `MessageBody::CodeStudioBody` grew to 131 variants (all
+// appended, so that alone would not force a bump), but `MeshCommandType`
+// gained the `CodeStudio*` commands AND `CodeStudioStreamPull` was RESHAPED
+// in place to carry a `SessionAssertion` — a stream has to be authorized for
+// a USER, not merely for a trusted node. A stale peer would decode the old
+// shape and serve somebody else's session timeline, so old/new must not mix.
+pub const SCHEMA_VERSION: u16 = 22;
 
 // =============================================================================
 // Message kind discriminants

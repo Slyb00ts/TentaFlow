@@ -401,6 +401,9 @@ impl Router {
             .collect();
 
         let request = crate::api::openai::types::ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: payload.model.clone(),
             messages: openai_messages,
             temperature: payload.temperature,
@@ -636,6 +639,7 @@ mod audio_policy_tests {
 
     fn chat_entry(id: &str, inputs: Vec<InputModality>) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.into(),
             kind: CatalogEntryKind::ServiceModel { instances: vec![] },
             service_surfaces: vec![ServiceSurface::Chat],
@@ -712,6 +716,7 @@ mod audio_policy_tests {
         let primary = chat_entry("text-llm", vec![InputModality::Text]);
         let fallback = chat_entry("omni-llm", vec![InputModality::Text, InputModality::Audio]);
         let alias = CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: "smart-chat".into(),
             kind: CatalogEntryKind::Alias {
                 target: "text-llm".into(),
@@ -738,6 +743,7 @@ mod audio_policy_tests {
         let primary = chat_entry("text-a", vec![InputModality::Text]);
         let fallback = chat_entry("text-b", vec![InputModality::Text]);
         let alias = CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: "txt-only".into(),
             kind: CatalogEntryKind::Alias {
                 target: "text-a".into(),
@@ -779,6 +785,7 @@ mod mesh_reverse_flow_discriminator_tests {
 
     fn service_model(id: &str) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.into(),
             kind: CatalogEntryKind::ServiceModel { instances: vec![] },
             service_surfaces: vec![ServiceSurface::Chat],
@@ -790,6 +797,7 @@ mod mesh_reverse_flow_discriminator_tests {
 
     fn published_flow(id: &str, flow_id: &str) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.into(),
             kind: CatalogEntryKind::Flow {
                 flow_id: flow_id.into(),
@@ -823,6 +831,7 @@ mod mesh_reverse_flow_discriminator_tests {
     #[test]
     fn forwarded_alias_to_model_is_not_a_flow() {
         let alias = CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: "chat".into(),
             kind: CatalogEntryKind::Alias {
                 target: "deepseek".into(),
@@ -842,6 +851,7 @@ mod mesh_reverse_flow_discriminator_tests {
     #[test]
     fn forwarded_alias_to_flow_is_a_flow() {
         let alias = CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: "assistant".into(),
             kind: CatalogEntryKind::Alias {
                 target: "my-agent".into(),

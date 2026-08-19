@@ -3660,6 +3660,10 @@ pub struct AgentRunEvent {
     pub node_type: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub status: String,
+    /// Identyfikator wywolania narzedzia — paruje `tool_call_started` z
+    /// `tool_call_finished`, gdy kilka wywolan tej samej nazwy leci rownolegle.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub call_id: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub name: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
@@ -5245,6 +5249,10 @@ pub struct CatalogEntryWire {
     pub service_surfaces: Vec<String>,
     pub input_modalities: Vec<String>,
     pub output_modalities: Vec<String>,
+    /// Poziomy rozumowania wspierane przez model. `#[serde(default)]`, bo wezel
+    /// ze starsza binarka wysle wpis bez tego pola — dekoder musi to znosic.
+    #[serde(default)]
+    pub reasoning_levels: Vec<String>,
     pub diagnostic: Option<CatalogDiagnosticWire>,
     /// `tentaflow-service` | `tentaflow-flow` | `tentaflow-alias`.
     pub owned_by: String,
@@ -9447,7 +9455,9 @@ mod tests {
                 vyaw: Some(0.05),
                 position: vec![1.0, 2.0, 0.3],
                 foot_force: vec![120.0, 118.0, 121.0, 119.0],
-                joints: vec![0.1, -0.8, 1.4, -0.1, -0.8, 1.4, 0.1, -0.9, 1.4, -0.1, -0.9, 1.4],
+                joints: vec![
+                    0.1, -0.8, 1.4, -0.1, -0.8, 1.4, 0.1, -0.9, 1.4, -0.1, -0.9, 1.4,
+                ],
                 imu: Some(RobotImuSnapshot {
                     roll: Some(0.01),
                     pitch: Some(-0.02),

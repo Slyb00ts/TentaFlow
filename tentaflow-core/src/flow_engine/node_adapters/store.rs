@@ -15,14 +15,9 @@ use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::services::org::DEFAULT_ORG_ID;
 use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
-use tentaflow_sdk_spec::{FieldType, FieldValue, Filter};
+use tentaflow_sdk_spec::{FieldType, FieldValue};
 
 const NODE_TYPE: &str = "store";
-
-/// Górny limit zapytania o istniejące wektory dokumentu przy cleanupie. Jeden
-/// dokument nie powinien mieć więcej chunków niż to (a gdy ma — kolejne i tak
-/// zostaną nadpisane deterministycznym ref_id, więc nie ma orphanów).
-const CLEANUP_SEARCH_K: usize = 100_000;
 
 /// Pojedynczy chunk przygotowany do zapisu: deterministyczny ref_id (z doc_id +
 /// chunk_index) + wektor + tekst.
@@ -31,6 +26,9 @@ struct PreparedChunk {
     chunk_index: u64,
     vector: Vec<f32>,
     text: String,
+    /// Human-readable position within the source ("s. 3", "l. 10–42"). Per-chunk,
+    /// bo w jednym dokumencie kazdy chunk siedzi gdzie indziej.
+    location: Option<String>,
 }
 
 pub struct StoreNodeAdapter;
@@ -102,37 +100,16 @@ impl StoreNodeAdapter {
         ))
     }
 
-    /// collection_id z node.config/meta (opcjonalny) — zapisywany jako pole
-    /// wektora, by retrieval mógł filtrować per-kolekcja (lustro vector.rs
-    /// merge_collection_filter).
-    fn pick_collection_id(node: &FlowNode, envelope: &FlowEnvelope) -> Option<String> {
+    /// Opcjonalne pole per-DOKUMENT z node.config, z fallbackiem na envelope.meta.
+    /// Wzorzec `collection_id`: wartosc jest taka sama dla wszystkich chunkow, wiec
+    /// nie ma sensu powtarzac jej w kazdym elemencie `chunks`.
+    fn pick_doc_field(node: &FlowNode, envelope: &FlowEnvelope, key: &str) -> Option<String> {
         node.config
-            .get("collection_id")
+            .get(key)
             .and_then(|v| v.as_str())
-            .or_else(|| envelope.meta.get("collection_id").and_then(|v| v.as_str()))
+            .or_else(|| envelope.meta.get(key).and_then(|v| v.as_str()))
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string())
-    }
-
-    /// Deterministyczny ref_id z (doc_id, chunk_index): hash FNV-1a 64-bit doc_id
-    /// zmieszany z indeksem. Deterministyczny ⇒ re-ingest tego samego chunka
-    /// nadpisuje stary wektor (upsert = replace), a nie tworzy duplikatu. ref_id=0
-    /// jest zarezerwowany (backend zvec go odrzuca), więc wymuszamy >0.
-    fn ref_id_for(doc_id: &str, chunk_index: u64) -> u64 {
-        // FNV-1a 64-bit.
-        let mut hash: u64 = 0xcbf29ce484222325;
-        for b in doc_id.as_bytes() {
-            hash ^= *b as u64;
-            hash = hash.wrapping_mul(0x100000001b3);
-        }
-        // Wmieszaj indeks chunka, by chunki tego samego dokumentu miały różne id.
-        hash ^= chunk_index.wrapping_add(1);
-        hash = hash.wrapping_mul(0x100000001b3);
-        if hash == 0 {
-            1
-        } else {
-            hash
-        }
     }
 
     /// Parsuje wejściowe chunki+embeddingi z payloadu Json. Akceptujemy
@@ -199,11 +176,17 @@ impl StoreNodeAdapter {
                 }
                 Some(_) => {}
             }
+            let location = item
+                .get("location")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_string());
             prepared.push(PreparedChunk {
-                ref_id: Self::ref_id_for(doc_id, chunk_index),
+                ref_id: crate::services::vector::doc_vectors::ref_id_for(doc_id, chunk_index),
                 chunk_index,
                 vector,
                 text,
+                location,
             });
         }
         Ok(prepared)
@@ -246,15 +229,22 @@ impl NodeAdapter for StoreNodeAdapter {
         let namespace = Self::pick_namespace(node)?;
         let metric = Self::pick_metric(node)?;
         let doc_id = Self::pick_doc_id(node, envelope)?;
-        let collection_id = Self::pick_collection_id(node, envelope);
+        let collection_id = Self::pick_doc_field(node, envelope, "collection_id");
+        // Metadane zrodla (Projekty): bez nich cytaty w czacie projektowym trafiaja
+        // na puste nazwe zrodla i pusta sciezke — `knowledge::search` czyta
+        // dokladnie te trzy pola.
+        let source_id = Self::pick_doc_field(node, envelope, "source_id");
+        let path = Self::pick_doc_field(node, envelope, "path");
 
         // Faza 1: pełna walidacja chunków PRZED jakimkolwiek zapisem.
         let prepared = Self::parse_chunks(envelope, &doc_id)?;
         let dim = prepared[0].vector.len() as u32;
 
-        // Schema pól metadanych (stała dla namespace): doc_id, chunk_index, text,
-        // opcjonalnie collection_id. Te same nazwy czyta retrieval (vector.rs
-        // citations_from_hits / merge_collection_filter).
+        // Schema pól metadanych: doc_id, chunk_index, text zawsze; collection_id,
+        // source_id, path i location gdy caller je poda. Te same nazwy czyta
+        // retrieval — vector.rs (citations_from_hits / merge_collection_filter) oraz
+        // project_studio::knowledge::search, ktory z source_id/path/location buduje
+        // cytat w czacie projektowym.
         let mut field_specs = vec![
             FieldSpec {
                 name: "doc_id".to_string(),
@@ -279,6 +269,30 @@ impl NodeAdapter for StoreNodeAdapter {
                 indexed: true,
             });
         }
+        // Pola opcjonalne deklarujemy tylko gdy caller je poda — zapisany schemat
+        // przestrzeni jest nadrzedny przy ponownym otwarciu, wiec przestrzenie
+        // addona (bez tych pol) i projektu (z nimi) nie wchodza sobie w droge.
+        if source_id.is_some() {
+            field_specs.push(FieldSpec {
+                name: "source_id".to_string(),
+                field_type: FieldType::Str,
+                indexed: true,
+            });
+        }
+        if path.is_some() {
+            field_specs.push(FieldSpec {
+                name: "path".to_string(),
+                field_type: FieldType::Str,
+                indexed: false,
+            });
+        }
+        if prepared.iter().any(|c| c.location.is_some()) {
+            field_specs.push(FieldSpec {
+                name: "location".to_string(),
+                field_type: FieldType::Str,
+                indexed: false,
+            });
+        }
 
         // Cleanup-then-reingest: skasuj WSZYSTKIE stare wektory tego dokumentu
         // PRZED zapisem nowych. Re-ingest tego samego doc_id ze ZMIENIONĄ liczbą
@@ -288,17 +302,12 @@ impl NodeAdapter for StoreNodeAdapter {
         // Namespace może jeszcze nie istnieć (pierwszy ingest) — NamespaceNotFound
         // traktujemy jako „nic do sprzątania", nie błąd.
         match ctx.vectors.get(&org, addon, &namespace) {
-            Ok(backend) => {
-                let filter = Filter::Eq("doc_id".to_string(), FieldValue::Str(doc_id.clone()));
-                let existing = backend
-                    .search(&prepared[0].vector, CLEANUP_SEARCH_K, Some(&filter), &[])
-                    .map_err(|e| anyhow!("store: cleanup search dokumentu: {e}"))?;
-                for hit in existing {
-                    backend
-                        .delete(hit.ref_id)
-                        .map_err(|e| anyhow!("store: cleanup delete ref {}: {e}", hit.ref_id))?;
-                }
-            }
+            Ok(backend) => crate::services::vector::doc_vectors::delete_doc_vectors(
+                &*backend,
+                &doc_id,
+                Some(&prepared[0].vector),
+            )
+            .map_err(|e| anyhow!("store: cleanup-then-reingest: {e}"))?,
             Err(crate::services::vector::error::VectorError::NamespaceNotFound { .. }) => {
                 // Pierwszy ingest do tej przestrzeni — nic do sprzątania.
             }
@@ -332,6 +341,24 @@ impl NodeAdapter for StoreNodeAdapter {
                     value: FieldValue::Str(cid.clone()),
                 });
             }
+            if let Some(sid) = &source_id {
+                field_values.push(Field {
+                    name: "source_id".to_string(),
+                    value: FieldValue::Str(sid.clone()),
+                });
+            }
+            if let Some(p) = &path {
+                field_values.push(Field {
+                    name: "path".to_string(),
+                    value: FieldValue::Str(p.clone()),
+                });
+            }
+            if let Some(loc) = &chunk.location {
+                field_values.push(Field {
+                    name: "location".to_string(),
+                    value: FieldValue::Str(loc.clone()),
+                });
+            }
             fields_per_chunk.push(field_values);
         }
 
@@ -355,6 +382,7 @@ impl NodeAdapter for StoreNodeAdapter {
             &field_specs,
             false,
             &items,
+            ctx.vector_home.as_deref(),
         ) {
             // Cleanup-on-failure: batch jest transakcyjny po stronie quoty i
             // robi jeden insert, ale gdyby częściowo zapisał (błąd backendu po
@@ -417,7 +445,6 @@ impl NodeAdapter for StoreNodeAdapter {
 impl StoreNodeAdapter {
     /// Kasuje listę ref_id z przestrzeni (cleanup-on-failure). Zwraca `Some(msg)`
     /// gdy KTÓRYKOLWIEK delete padł — caller doklei to do błędu ingestu.
-    /// Best-effort: próbujemy skasować wszystkie, raportujemy pierwszy błąd.
     fn rollback(
         ctx: &ExecutionContext,
         org: &str,
@@ -432,13 +459,7 @@ impl StoreNodeAdapter {
             Ok(b) => b,
             Err(e) => return Some(format!("backend niedostępny do rollbacku: {e}")),
         };
-        let mut first_err: Option<String> = None;
-        for r in refs {
-            if let Err(e) = backend.delete(*r) {
-                first_err.get_or_insert(format!("ref {r}: {e}"));
-            }
-        }
-        first_err
+        crate::services::vector::doc_vectors::rollback_refs(&*backend, refs)
     }
 }
 
@@ -448,6 +469,7 @@ mod tests {
     use crate::flow_engine::node_adapter::test_support::{stub_ctx, stub_vectors};
     use serde_json::json;
     use std::sync::Arc;
+    use tentaflow_sdk_spec::Filter;
 
     fn node(config: serde_json::Value) -> FlowNode {
         FlowNode {
@@ -522,6 +544,89 @@ mod tests {
         assert_eq!(
             out.meta.get("stored_chunks").and_then(|n| n.as_u64()),
             Some(2)
+        );
+    }
+
+    /// Metadane źródła (`source_id`/`path`/`location`) muszą realnie trafić na
+    /// wektor. `project_studio::knowledge::search` czyta dokładnie te trzy pola i
+    /// buduje z nich cytat — gdyby węzeł ich nie zapisywał, czat projektowy
+    /// pokazywałby puste nazwy źródeł, nie zgłaszając żadnego błędu.
+    #[tokio::test]
+    async fn source_metadata_is_written_to_the_vector() {
+        let v = stub_vectors();
+        let ctx = addon_ctx("ps-proj1", "org-1", v.clone());
+        let store = StoreNodeAdapter::new();
+
+        let payload = FlowValue::Json(json!({"chunks": [
+            {"index": 0, "text": "a", "embedding": [1.0, 0.0, 0.0], "location": "s. 3"},
+        ]}));
+        store
+            .execute(
+                &node(json!({"namespace": "p", "doc_id": "file-1"})),
+                &[input(
+                    payload,
+                    json!({"source_id": "src-9", "path": "docs/readme.md"}),
+                )],
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let backend = ctx.vectors.get("org-1", "ps-proj1", "p").unwrap();
+        let out: Vec<String> = ["source_id", "path", "location"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let hits = backend.search(&[1.0, 0.0, 0.0], 10, None, &out).unwrap();
+        assert_eq!(hits.len(), 1);
+        let got: std::collections::HashMap<String, String> = hits[0]
+            .fields
+            .iter()
+            .filter_map(|f| match &f.value {
+                FieldValue::Str(s) => Some((f.name.clone(), s.clone())),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(got.get("source_id").map(String::as_str), Some("src-9"));
+        assert_eq!(got.get("path").map(String::as_str), Some("docs/readme.md"));
+        assert_eq!(got.get("location").map(String::as_str), Some("s. 3"));
+    }
+
+    /// Wołający, który tych pól nie podaje (addon RAG), nie dostaje ich w
+    /// schemacie — przestrzenie obu właścicieli zostają takie, jakie były.
+    #[tokio::test]
+    async fn optional_fields_stay_absent_when_not_supplied() {
+        let v = stub_vectors();
+        let ctx = addon_ctx("inst-a", "org-1", v.clone());
+        let store = StoreNodeAdapter::new();
+        store
+            .execute(
+                &node(json!({"namespace": "p", "doc_id": "docA"})),
+                &[input(
+                    chunks_payload(&[(0, "a", vec![1.0, 0.0, 0.0])]),
+                    json!({}),
+                )],
+                &ctx,
+            )
+            .await
+            .unwrap();
+        let backend = ctx.vectors.get("org-1", "inst-a", "p").unwrap();
+        // Zapisany chunk jest wyszukiwalny...
+        assert_eq!(
+            backend
+                .search(&[1.0, 0.0, 0.0], 10, None, &[])
+                .unwrap()
+                .len(),
+            1
+        );
+        // ...ale przestrzen NIE ma pol projektowych: backend odrzuca zapytanie o
+        // pole spoza schematu, wiec to twardszy dowod niz pusta wartosc w wyniku.
+        let err = backend
+            .search(&[1.0, 0.0, 0.0], 10, None, &["source_id".to_string()])
+            .expect_err("pole spoza schematu musi byc odrzucone");
+        assert!(
+            format!("{err}").contains("source_id"),
+            "nieoczekiwany blad: {err}"
         );
     }
 

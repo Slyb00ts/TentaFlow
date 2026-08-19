@@ -339,6 +339,91 @@ impl SettingsCipher {
 
         Ok(String::from_utf8(plaintext_bytes)?)
     }
+
+    /// Encrypts a value BOUND to the row it belongs to.
+    ///
+    /// AES-GCM authenticates the ciphertext, not its location: a ciphertext
+    /// stays valid wherever it is pasted. Anyone with write access to the
+    /// database — and no master key at all — could therefore move a row and
+    /// have it decrypt somewhere it was never meant to be used. `context` is
+    /// passed as additional authenticated data, so the row's own identity is
+    /// part of what the tag covers and a moved row fails to decrypt.
+    pub fn encrypt_bound(&self, plaintext: &str, context: &[u8]) -> anyhow::Result<String> {
+        let mut nonce_bytes = [0u8; 12];
+        getrandom::fill(&mut nonce_bytes).expect("OS RNG fill_bytes");
+        let nonce = Nonce::from_slice(&nonce_bytes);
+
+        let ciphertext = self
+            .cipher
+            .encrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: plaintext.as_bytes(),
+                    aad: context,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Blad szyfrowania: {}", e))?;
+
+        let mut combined = Vec::with_capacity(12 + ciphertext.len());
+        combined.extend_from_slice(&nonce_bytes);
+        combined.extend_from_slice(&ciphertext);
+
+        let mut result = String::with_capacity(BOUND_PREFIX.len() + combined.len() * 4 / 3 + 4);
+        result.push_str(BOUND_PREFIX);
+        B64.encode_string(&combined, &mut result);
+        Ok(result)
+    }
+
+    /// Decrypts a value written by `encrypt_bound`, or one written before
+    /// binding existed. `bound == false` says the caller is holding a value
+    /// that is still relocatable and should be rewritten.
+    pub fn decrypt_bound(&self, stored: &str, context: &[u8]) -> anyhow::Result<BoundPlaintext> {
+        let (encoded, aad) = match stored.strip_prefix(BOUND_PREFIX) {
+            Some(encoded) => (encoded, context),
+            None => (
+                stored
+                    .strip_prefix(ENCRYPTED_PREFIX)
+                    .ok_or_else(|| anyhow::anyhow!("Wartosc nie jest zaszyfrowana"))?,
+                &[][..],
+            ),
+        };
+        let bound = stored.starts_with(BOUND_PREFIX);
+
+        let combined = B64
+            .decode(encoded)
+            .map_err(|e| anyhow::anyhow!("Nieprawidlowy base64: {}", e))?;
+        if combined.len() < 28 {
+            anyhow::bail!("Zaszyfrowana wartosc za krotka (min 28 bajtow)");
+        }
+        let (nonce_bytes, ciphertext) = combined.split_at(12);
+        let nonce = Nonce::from_slice(nonce_bytes);
+
+        let plaintext_bytes = self
+            .cipher
+            .decrypt(
+                nonce,
+                aes_gcm::aead::Payload {
+                    msg: ciphertext,
+                    aad,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("Blad deszyfrowania: {}", e))?;
+
+        Ok(BoundPlaintext {
+            value: String::from_utf8(plaintext_bytes)?,
+            bound,
+        })
+    }
+}
+
+/// Prefix of a ciphertext bound to its row identity. A distinct prefix is what
+/// lets a reader tell a bound value from a legacy one without trying both.
+const BOUND_PREFIX: &str = "encb:";
+
+/// A decrypted value plus whether it was bound to its location.
+pub struct BoundPlaintext {
+    pub value: String,
+    pub bound: bool,
 }
 
 /// Migruje istniejace plaintext sekrety do zaszyfrowanej formy

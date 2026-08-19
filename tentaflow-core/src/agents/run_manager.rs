@@ -32,7 +32,7 @@ use tokio_util::task::AbortOnDropHandle;
 use crate::db::models::{AgentRunStatusUpdate, DbAgentRun, NewAgentRun};
 use crate::db::{repository, DbPool};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
-use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, TokenUsage};
 use crate::flow_engine::progress_broker::ProgressBroker;
 
 use super::catalog::tool_in_allowlist;
@@ -132,14 +132,28 @@ enum WatchOutcome {
     NotInRegistry,
 }
 
+/// What one harness flow produced: the answer, and what it cost.
+///
+/// The accounting travels with the text because the run row is settled in one
+/// place — a caller that has to ask a second layer "and how many tokens was
+/// that?" ends up writing zeros, which is precisely what happened while this
+/// carried a bare `String`.
+pub struct AgentFlowOutcome {
+    pub text: String,
+    pub usage: TokenUsage,
+    /// Model the flow's last LLM call resolved to, `None` for a flow that
+    /// called none.
+    pub model: Option<String>,
+}
+
 /// Runs the agent harness flow that backs one background run. Abstracted so the
 /// manager's orchestration (semaphore, watch, cancel, heartbeat) is unit-testable
 /// without a live `FlowDispatcher`. The production impl is `FlowDispatcherRunner`.
 #[async_trait]
 pub trait BackgroundFlowRunner: Send + Sync {
     /// Runs `flow_id` with `initial` as the trigger input under `principal`,
-    /// governed by `deadline` and `cancel`. Returns the final answer text. The
-    /// `agent_run_id` already lives in `initial.meta`, so the harness flow's
+    /// governed by `deadline` and `cancel`. Returns the final answer and what it
+    /// cost. The `agent_run_id` already lives in `initial.meta`, so the harness flow's
     /// `agent_context` reuses the manager-created row instead of opening a new
     /// one. `progress` is the run-scoped sink the harness emits node/tool events
     /// to; `scope` is the run id broadcast key.
@@ -152,7 +166,7 @@ pub trait BackgroundFlowRunner: Send + Sync {
         cancel: CancellationToken,
         progress: Arc<dyn ProgressSink>,
         scope: String,
-    ) -> Result<String>;
+    ) -> Result<AgentFlowOutcome>;
 }
 
 /// Shared slot owning a run's concurrency permit. `agent_wait` takes the permit
@@ -371,6 +385,11 @@ impl AgentRunManager {
     /// the task starts — the atomic path for server-minted bindings (e.g.
     /// Project Studio `ps_generation`): no post-spawn write, no race with the
     /// first tool call.
+    ///
+    /// `flow_override` replaces the harness graph this run executes. It exists
+    /// for Code Studio, where the graph is a property of the SESSION (§16) and
+    /// not of the agent definition.
+    #[allow(clippy::too_many_arguments)]
     pub async fn spawn(
         &self,
         agent_id: &str,
@@ -380,6 +399,40 @@ impl AgentRunManager {
         inherited_tools: &[String],
         extra_meta: &[(&str, Value)],
         target_session_id: Option<&str>,
+        flow_override: Option<&str>,
+    ) -> Result<String> {
+        self.spawn_with_run_id(
+            &uuid::Uuid::new_v4().to_string(),
+            agent_id,
+            prompt,
+            parent_run_id,
+            principal,
+            inherited_tools,
+            extra_meta,
+            target_session_id,
+            flow_override,
+        )
+        .await
+    }
+
+    /// Same spawn, under a run id the caller minted.
+    ///
+    /// The sub-agent path needs the id BEFORE the run exists: a Code Studio
+    /// session claims its run budget by inserting the run's own row, and a
+    /// claim that could not name the run it claims for would have to count
+    /// first and insert later — the exact race the budget is there to close.
+    #[allow(clippy::too_many_arguments)]
+    async fn spawn_with_run_id(
+        &self,
+        run_id: &str,
+        agent_id: &str,
+        prompt: &str,
+        parent_run_id: Option<&str>,
+        principal: &AgentPrincipal,
+        inherited_tools: &[String],
+        extra_meta: &[(&str, Value)],
+        target_session_id: Option<&str>,
+        flow_override: Option<&str>,
     ) -> Result<String> {
         let agent = repository::get_agent(&self.db, agent_id)?
             .ok_or_else(|| anyhow!("agent '{agent_id}' not found"))?;
@@ -392,7 +445,7 @@ impl AgentRunManager {
             self.assert_tools_subset(&agent.tools_json, inherited_tools)?;
         }
 
-        let run_id = uuid::Uuid::new_v4().to_string();
+        let run_id = run_id.to_string();
         repository::create_agent_run(
             &self.db,
             &NewAgentRun {
@@ -406,10 +459,13 @@ impl AgentRunManager {
             },
         )?;
 
-        let flow_id = agent
-            .flow_id
-            .as_deref()
+        // A Code Studio session pins the harness graph its runs execute (§16),
+        // and that pin belongs to the SESSION, not to the agent definition — the
+        // same agent serves every workspace. The caller therefore names the flow
+        // when it has one; everyone else keeps the agent's own harness.
+        let flow_id = flow_override
             .filter(|s| !s.is_empty())
+            .or(agent.flow_id.as_deref().filter(|s| !s.is_empty()))
             .unwrap_or(crate::flow_engine::node_adapters::AGENT_RUN_FLOW_ID)
             .to_string();
 
@@ -530,29 +586,157 @@ impl AgentRunManager {
         let parent_tools: Vec<String> =
             serde_json::from_str(&parent.tools_json).unwrap_or_default();
 
-        let mut run_ids = Vec::with_capacity(tasks.len());
+        // Every child is resolved before any of them starts, because the
+        // session budget below is claimed for the whole batch at once and a
+        // claim for a task that turns out to name no agent would burn budget on
+        // a run that can never exist.
+        // The caller's roster, if it declared one. `None` = unrestricted, which is
+        // what every agent did before the column existed; an empty list means the
+        // agent may delegate to nobody. Parsed once for the whole batch.
+        let roster: Option<Vec<String>> = repository::get_agent(&self.db, &caller.agent_id)?
+            .and_then(|a| a.allowed_agents_json)
+            .map(|raw| serde_json::from_str::<Vec<String>>(&raw))
+            .transpose()
+            .map_err(|e| anyhow!("agent_spawn: caller's allowed_agents is not a list: {e}"))?;
+
+        let mut planned = Vec::with_capacity(tasks.len());
         for task in tasks {
+            // Refuse BEFORE resolving: naming an agent outside the roster must
+            // read the same whether that agent exists or not, otherwise the
+            // error message turns the roster into a directory of every agent
+            // on the node.
+            if let Some(allowed) = &roster {
+                if !allowed.iter().any(|n| n == &task.agent_name) {
+                    return Err(anyhow!(
+                        "agent_spawn: '{}' is not in this agent's delegation roster ({})",
+                        task.agent_name,
+                        if allowed.is_empty() {
+                            "it may not delegate at all".to_string()
+                        } else {
+                            allowed.join(", ")
+                        }
+                    ));
+                }
+            }
             let child = repository::get_agent_by_name(&self.db, &task.agent_name)?
                 .ok_or_else(|| anyhow!("agent_spawn: agent '{}' not found", task.agent_name))?;
             let prompt = match &task.context {
                 Some(c) if !c.is_empty() => format!("{c}\n\n{}", task.task),
                 _ => task.task.clone(),
             };
-            let run_id = self
-                .spawn(
-                    &child.id,
-                    &prompt,
+            planned.push(PlannedChild {
+                run_id: uuid::Uuid::new_v4().to_string(),
+                agent_id: child.id,
+                prompt,
+            });
+        }
+
+        // Session budget (§15): depth bounds one branch and max_subagents
+        // bounds one parent — neither bounds the tree, so a Code Studio session
+        // also carries an absolute count over ALL of its runs, nested ones
+        // included. The refusal stops this SPAWN and nothing else: the runs
+        // already working keep working and the caller sees a recoverable tool
+        // error naming the budget.
+        let session = self.claim_session_runs(caller, &planned)?;
+
+        // The Code Studio binding travels with the delegation: a child that
+        // reviews or tests must land in the parent's worktree, and passing it
+        // here (rather than letting the child ask for one) is what makes that
+        // impossible to redirect.
+        let extra_meta: Vec<(&str, Value)> = match &caller.code_session {
+            Some(binding) => vec![(crate::code_studio::tools::SESSION_META_KEY, binding.clone())],
+            None => Vec::new(),
+        };
+
+        let mut run_ids = Vec::with_capacity(planned.len());
+        for child in &planned {
+            let spawned = self
+                .spawn_with_run_id(
+                    &child.run_id,
+                    &child.agent_id,
+                    &child.prompt,
                     Some(&caller.run_id),
                     &caller.principal,
                     &parent_tools,
-                    &[],
+                    &extra_meta,
                     caller.session_id.as_deref(),
+                    // A sub-agent runs ITS OWN harness, not the caller's: the
+                    // session pin (§16.6) binds the root run's graph, and a
+                    // reviewer or tester is a different agent with a different
+                    // flow. Overriding here would run every specialist through
+                    // the orchestrator's graph.
+                    None,
                 )
-                .await?;
-            run_ids.push(run_id);
+                .await;
+            match spawned {
+                Ok(run_id) => run_ids.push(run_id),
+                Err(e) => {
+                    // The slot was claimed before the launch, so a child that
+                    // never started is closed as failed rather than left
+                    // "running" on the session's timeline for ever.
+                    if let Some((pool, session_id)) = &session {
+                        let end = crate::code_studio::session::SubagentRunEnd {
+                            status: "failed",
+                            error: Some("the run could not be started"),
+                            ..Default::default()
+                        };
+                        for pending in &planned[run_ids.len()..] {
+                            if let Err(error) = crate::code_studio::session::close_subagent_run(
+                                pool,
+                                session_id,
+                                &pending.run_id,
+                                end,
+                            ) {
+                                tracing::warn!(
+                                    run_id = %pending.run_id,
+                                    "cannot close an unstarted sub-agent run: {error:#}"
+                                );
+                            }
+                        }
+                    }
+                    return Err(e);
+                }
+            }
         }
 
         Ok(json!({ "run_ids": run_ids }))
+    }
+
+    /// Claims one session run slot per planned child when the caller runs
+    /// inside a Code Studio session, returning the session's runtime pool so a
+    /// later failure can close the rows it just wrote. `None` for a caller with
+    /// no session binding — an ordinary background agent has no session to
+    /// budget.
+    fn claim_session_runs(
+        &self,
+        caller: &CallerRun,
+        planned: &[PlannedChild],
+    ) -> Result<Option<(DbPool, String)>> {
+        let Some(value) = caller.code_session.as_ref() else {
+            return Ok(None);
+        };
+        // The binding is server-minted; a malformed one means this run's meta
+        // was corrupted, and guessing "then there is no budget" is exactly the
+        // wrong way to resolve that.
+        let binding = crate::code_studio::tools::binding_from_value(value)
+            .ok_or_else(|| anyhow!("agent_spawn: the session binding of this run is malformed"))?;
+        let pool = crate::code_studio::workspace_db::open(&binding.workspace_id)?;
+        let budget = crate::code_studio::session::max_session_runs(&self.db);
+        let runs: Vec<crate::code_studio::session::SubagentRun<'_>> = planned
+            .iter()
+            .map(|child| crate::code_studio::session::SubagentRun {
+                run_id: &child.run_id,
+                parent_run_id: &caller.run_id,
+                agent_id: &child.agent_id,
+            })
+            .collect();
+        crate::code_studio::session::claim_subagent_runs(
+            &pool,
+            &binding.session_id,
+            &runs,
+            budget,
+        )?;
+        Ok(Some((pool, binding.session_id)))
     }
 
     /// `core.agent_wait` handler. Waits for the named runs to settle on their
@@ -993,6 +1177,21 @@ pub struct CallerRun {
     /// session's next interaction via the mailbox. `None` for a background
     /// parent with no originating session.
     pub session_id: Option<String>,
+    /// Server-minted Code Studio session binding of the calling run, carried so
+    /// a delegated `code-reviewer` / `code-tester` / `code-committer` works in
+    /// the SAME worktree as its parent. It is copied, never chosen: the child
+    /// cannot name a workspace, and a caller outside Code Studio has `None`, so
+    /// spawning never grants access that the parent did not already hold.
+    pub code_session: Option<Value>,
+}
+
+/// One child of a delegation, resolved and given its run id before anything is
+/// launched. The id exists this early so a Code Studio session can claim the
+/// run's budget slot by inserting that run's own row.
+struct PlannedChild {
+    run_id: String,
+    agent_id: String,
+    prompt: String,
 }
 
 impl CallerRun {
@@ -1019,11 +1218,16 @@ impl CallerRun {
             .and_then(|v| v.as_str())
             .unwrap_or_default()
             .to_string();
+        let code_session = envelope
+            .meta
+            .get(crate::code_studio::tools::SESSION_META_KEY)
+            .cloned();
         Self {
             run_id,
             agent_id,
             principal,
             session_id,
+            code_session,
         }
     }
 }
@@ -1087,6 +1291,11 @@ async fn run_task(ctx: TaskContext) {
         permit,
     } = ctx;
 
+    // Read once, here: the envelope moves into the runner below, and a
+    // sub-agent registered on a Code Studio session has to close its session
+    // row wherever this task ends.
+    let code_session = crate::code_studio::tools::binding_from_meta(&initial.meta);
+
     // Acquire the global permit before running the flow. While the pool is full
     // the task parks here in `queued`; a cancel before a permit is won still
     // aborts cleanly (the run is finalized cancelled below).
@@ -1113,6 +1322,14 @@ async fn run_task(ctx: TaskContext) {
                 },
             );
             let _ = status.send(RunStatus::Cancelled);
+            close_session_run(
+                code_session.as_ref(),
+                &run_id,
+                crate::code_studio::session::SubagentRunEnd {
+                    status: RunStatus::Cancelled.as_str(),
+                    ..Default::default()
+                },
+            );
             publish_child_finished(
                 &progress,
                 &run_id,
@@ -1168,14 +1385,21 @@ async fn run_task(ctx: TaskContext) {
         )
         .await;
 
+    // The accounting is settled from whatever the flow reported, INDEPENDENT of
+    // the status: a cancelled run still burned the tokens it burned, and a row
+    // that reports the work but not its cost cannot be billed.
+    let (usage, model) = match &outcome {
+        Ok(flow) => (Some(flow.usage), flow.model.clone()),
+        Err(_) => (None, None),
+    };
     let (final_status, exit_reason, result_text) = if cancel.is_cancelled() {
         (RunStatus::Cancelled, "cancelled".to_string(), None)
     } else {
         match outcome {
-            Ok(text) => (
+            Ok(flow) => (
                 RunStatus::Completed,
                 "final_response".to_string(),
-                Some(text),
+                Some(flow.text),
             ),
             Err(e) => (RunStatus::Failed, format!("error:{e}"), None),
         }
@@ -1188,11 +1412,26 @@ async fn run_task(ctx: TaskContext) {
             status: final_status.as_str(),
             result: result_text.as_deref(),
             exit_reason: Some(&exit_reason),
+            total_tokens: usage.map(|u| u.total_tokens as i64),
+            prompt_tokens: usage.map(|u| u.prompt_tokens as i64),
+            completion_tokens: usage.map(|u| u.completion_tokens as i64),
+            model: model.as_deref(),
             set_finished: true,
             ..Default::default()
         },
     );
     let _ = status.send(final_status);
+    close_session_run(
+        code_session.as_ref(),
+        &run_id,
+        crate::code_studio::session::SubagentRunEnd {
+            status: final_status.as_str(),
+            prompt_tokens: usage.map(|u| u.prompt_tokens as i64).unwrap_or(0),
+            completion_tokens: usage.map(|u| u.completion_tokens as i64).unwrap_or(0),
+            model: model.as_deref(),
+            error: Some(exit_reason.as_str()).filter(|r| r.starts_with("error:")),
+        },
+    );
 
     // Drop any open interactions + per-run permission grants this run earned —
     // a settled run leaves no stale waiting questions or cached grants (§3.13).
@@ -1245,6 +1484,29 @@ async fn run_task(ctx: TaskContext) {
         let _ = permit.lock().map(|mut p| p.take());
     }
     runs.remove(&run_id);
+}
+
+/// Closes the Code Studio session row of a settled run, when the run has one.
+///
+/// Best effort by design: the authoritative record of a run is its `agent_runs`
+/// row, and a workspace whose runtime database cannot be opened (moved storage,
+/// a workspace deleted under a live run) must not turn a finished run into a
+/// failing task. `close_subagent_run` ignores the ROOT turn's row, which the
+/// session coordinator's own watcher owns.
+fn close_session_run(
+    binding: Option<&crate::code_studio::tools::SessionBinding>,
+    run_id: &str,
+    end: crate::code_studio::session::SubagentRunEnd<'_>,
+) {
+    let Some(binding) = binding else {
+        return;
+    };
+    let closed = crate::code_studio::workspace_db::open(&binding.workspace_id).and_then(|pool| {
+        crate::code_studio::session::close_subagent_run(&pool, &binding.session_id, run_id, end)
+    });
+    if let Err(error) = closed {
+        tracing::warn!(run_id, "cannot close the session row of a run: {error:#}");
+    }
 }
 
 /// Publishes `ChildFinished` to the run's own scope and, when the run has a
@@ -1362,6 +1624,11 @@ Continue your work using it.",
                 &parent_tools,
                 &[],
                 target_session_id.as_deref(),
+                // The continuation reuses the agent's own flow. `agent_runs`
+                // records no flow id, so the run's pinned graph cannot be
+                // recovered here; this is exactly the behaviour that existed
+                // before `flow_override`, not a new gap opened by it.
+                None,
             )
             .await
         {
@@ -1444,7 +1711,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
         cancel: CancellationToken,
         progress: Arc<dyn ProgressSink>,
         scope: String,
-    ) -> Result<String> {
+    ) -> Result<AgentFlowOutcome> {
         let dispatcher = self
             .dispatcher
             .upgrade()
@@ -1460,6 +1727,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             // Ścieżka agenta (nie-addon) — bez tożsamości instancji addona.
             addon_id: None,
             org_id: None,
+            vector_home: None,
             deadline,
             cancel_token: cancel,
             progress_sink: Some(progress),
@@ -1473,12 +1741,16 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
         if let Some(err) = outcome.error {
             return Err(anyhow!("agent flow failed: {err}"));
         }
-        Ok(outcome
-            .final_envelope
-            .payload
-            .as_text()
-            .unwrap_or("")
-            .to_string())
+        Ok(AgentFlowOutcome {
+            text: outcome
+                .final_envelope
+                .payload
+                .as_text()
+                .unwrap_or("")
+                .to_string(),
+            usage: outcome.usage,
+            model: outcome.model,
+        })
     }
 }
 
@@ -1523,6 +1795,7 @@ mod tests {
                 routable: true,
                 is_enabled: true,
                 on_child_complete: "notify",
+                allowed_agents_json: None,
                 actor_user_id: None,
             },
         )
@@ -1559,6 +1832,7 @@ mod tests {
                 routable: true,
                 is_enabled: true,
                 on_child_complete,
+                allowed_agents_json: None,
                 actor_user_id: None,
             },
         )
@@ -1617,7 +1891,7 @@ mod tests {
             cancel: CancellationToken,
             _progress: Arc<dyn ProgressSink>,
             scope: String,
-        ) -> Result<String> {
+        ) -> Result<AgentFlowOutcome> {
             if self.honor_cancel {
                 tokio::select! {
                     _ = cancel.cancelled() => return Err(anyhow!("cancelled")),
@@ -1626,7 +1900,11 @@ mod tests {
             } else {
                 self.gate.wait().await;
             }
-            Ok(format!("result-of-{scope}"))
+            Ok(AgentFlowOutcome {
+                text: format!("result-of-{scope}"),
+                usage: TokenUsage::default(),
+                model: None,
+            })
         }
     }
 
@@ -1643,8 +1921,12 @@ mod tests {
             _cancel: CancellationToken,
             _progress: Arc<dyn ProgressSink>,
             scope: String,
-        ) -> Result<String> {
-            Ok(format!("done-{scope}"))
+        ) -> Result<AgentFlowOutcome> {
+            Ok(AgentFlowOutcome {
+                text: format!("done-{scope}"),
+                usage: TokenUsage::default(),
+                model: None,
+            })
         }
     }
 
@@ -1681,7 +1963,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn");
 
@@ -1718,7 +2000,7 @@ mod tests {
 
         // A parent run row (created directly — the parent's own flow is elsewhere).
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
 
@@ -1727,6 +2009,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -1781,7 +2064,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let run_id = mgr
-            .spawn("a1", "do it", None, &principal, &[], &[], None)
+            .spawn("a1", "do it", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn");
 
@@ -1845,7 +2128,16 @@ mod tests {
         let mut callers = Vec::new();
         for i in 0..(cap + 1) {
             let parent_run = mgr
-                .spawn("parent", &format!("lead-{i}"), None, &principal, &[], &[], None)
+                .spawn(
+                    "parent",
+                    &format!("lead-{i}"),
+                    None,
+                    &principal,
+                    &[],
+                    &[],
+                    None,
+                    None,
+                )
                 .await
                 .expect("spawn parent");
             callers.push(CallerRun {
@@ -1853,6 +2145,7 @@ mod tests {
                 agent_id: "parent".into(),
                 principal: principal.clone(),
                 session_id: None,
+                code_session: None,
             });
         }
         tokio::time::sleep(Duration::from_millis(150)).await;
@@ -1909,7 +2202,7 @@ mod tests {
         );
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1917,6 +2210,7 @@ mod tests {
             agent_id: "parent".into(),
             principal,
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "t"}))
@@ -1940,7 +2234,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -1948,6 +2242,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
 
         // First child fits max_subagents=1.
@@ -1971,7 +2266,16 @@ mod tests {
         // Simulate by giving the child spawn rights and asking it to spawn.
         seed_agent(&pool, "spawner", "midboss", "[]", 2, 1);
         let child_run = mgr
-            .spawn("spawner", "mid", Some(&parent_run), &principal, &[], &[], None)
+            .spawn(
+                "spawner",
+                "mid",
+                Some(&parent_run),
+                &principal,
+                &[],
+                &[],
+                None,
+                None,
+            )
             .await
             .expect("spawn mid");
         let mid_caller = CallerRun {
@@ -1979,6 +2283,7 @@ mod tests {
             agent_id: "spawner".into(),
             principal,
             session_id: None,
+            code_session: None,
         };
         let grand = mgr
             .handle_agent_spawn(&mid_caller, &json!({"agent_name": "worker", "task": "g"}))
@@ -1996,7 +2301,7 @@ mod tests {
         let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
         let principal = AgentPrincipal::user("u1");
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2004,6 +2309,7 @@ mod tests {
             agent_id: "parent".into(),
             principal,
             session_id: None,
+            code_session: None,
         };
         let out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "x"}))
@@ -2105,7 +2411,7 @@ mod tests {
 
         // First run wins the single permit and parks on the gate.
         let run_a = mgr
-            .spawn("a", "first", None, &principal, &[], &[], None)
+            .spawn("a", "first", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn a");
         tokio::time::sleep(Duration::from_millis(80)).await;
@@ -2169,7 +2475,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2177,6 +2483,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2244,7 +2551,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         // Caller carries the originating session — the mailbox target.
@@ -2253,6 +2560,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: Some("sess-7".into()),
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2305,7 +2613,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2313,6 +2621,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
@@ -2371,7 +2680,7 @@ mod tests {
         let principal = AgentPrincipal::user("u1");
 
         let parent_run = mgr
-            .spawn("parent", "lead", None, &principal, &[], &[], None)
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
             .await
             .expect("spawn parent");
         let caller = CallerRun {
@@ -2379,6 +2688,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: principal.clone(),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))

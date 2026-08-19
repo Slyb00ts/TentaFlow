@@ -3339,7 +3339,7 @@ pub fn set_model_alias_active_audited(
 /// transaction. Used by the addon install path to keep the gated-alias
 /// deactivate inside the same tx as the create/reactivate above.
 pub fn set_model_alias_active_audited_within_tx(
-    tx: &rusqlite::Transaction<'_>,
+    tx: &rusqlite::Connection,
     alias: &str,
     is_active: bool,
     changed_by_addon_id: Option<&str>,
@@ -5252,6 +5252,7 @@ pub fn reseed_core_state_from_current_rows(
                         routable: agent.routable,
                         is_enabled: agent.is_enabled,
                         on_child_complete: &agent.on_child_complete,
+                        allowed_agents_json: agent.allowed_agents_json.as_deref(),
                         actor_user_id: None,
                     };
                     record_core_capture_tx(
@@ -6296,11 +6297,100 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            // Code Studio delegates to `code_studio::sync_capture`, the same
+            // module the live writes use. Reseed must reproduce the exact
+            // capture shape peers materialize, and one implementation is the
+            // only way to keep that true as the registry grows.
+            K::CodeWorkspace => {
+                let ids = collect_text_column(&tx, "SELECT id FROM code_workspaces")?;
+                for workspace_id in ids {
+                    crate::code_studio::sync_capture::capture_workspace(&tx, &workspace_id)?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceMember => {
+                let mut stmt =
+                    tx.prepare("SELECT workspace_id, user_id FROM code_workspace_members")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (workspace_id, user_id) in rows {
+                    crate::code_studio::sync_capture::capture_member(&tx, &workspace_id, &user_id)?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceCreatorGrant => {
+                let mut stmt =
+                    tx.prepare("SELECT org_id, user_id FROM code_workspace_creator_grants")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (grant_org_id, user_id) in rows {
+                    crate::code_studio::sync_capture::capture_creator_grant(
+                        &tx,
+                        &grant_org_id,
+                        &user_id,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceProjectLink => {
+                let mut stmt = tx
+                    .prepare("SELECT workspace_id, project_id FROM code_workspace_project_links")?;
+                let rows = stmt
+                    .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (workspace_id, project_id) in rows {
+                    crate::code_studio::sync_capture::capture_project_link(
+                        &tx,
+                        &workspace_id,
+                        &project_id,
+                    )?;
+                    emitted += 1;
+                }
+            }
+            K::CodeWorkspaceAllowlist => {
+                // The AUTOINCREMENT `id` is deliberately not selected: it is
+                // node-local and plays no part in the replicated identity.
+                let mut stmt = tx.prepare(
+                    "SELECT workspace_id, capability, pattern FROM code_workspace_allowlist",
+                )?;
+                let rows = stmt
+                    .query_map([], |r| {
+                        Ok((
+                            r.get::<_, String>(0)?,
+                            r.get::<_, String>(1)?,
+                            r.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                for (workspace_id, capability, pattern) in rows {
+                    crate::code_studio::sync_capture::capture_allowlist_entry(
+                        &tx,
+                        &workspace_id,
+                        &capability,
+                        &pattern,
+                    )?;
+                    emitted += 1;
+                }
+            }
         }
     }
 
     tx.commit()?;
     Ok(emitted)
+}
+
+fn collect_text_column(tx: &rusqlite::Transaction<'_>, sql: &str) -> Result<Vec<String>> {
+    let mut stmt = tx.prepare(sql)?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// Snapshot of an `addons` row for mesh sync. Built from a SELECT (reseed) or
@@ -6459,7 +6549,7 @@ fn record_core_capture_tx(
     )
 }
 
-fn record_core_capture_for_org_tx(
+pub(crate) fn record_core_capture_for_org_tx(
     tx: &rusqlite::Transaction<'_>,
     kind: crate::sync::core_registry::CoreSyncResourceKind,
     org_id: &str,
@@ -7015,6 +7105,22 @@ pub fn create_flow_model_binding(
 /// `ON DELETE CASCADE`, więc skasowanie flow który już się wykonał (istnieją
 /// wiersze historii) naruszałoby FK przy upgrade używanej instancji. Zachowanie
 /// `id` utrzymuje historię wykonań spójną i pozwala bezpiecznie re-rejestrować
+/// Published-name'y wszystkich flow addona `addon_id` (prefiks `<addon_id>:`).
+/// Filtr po prefiksie liczony w Rust, nie przez `LIKE` — `_` jest w `LIKE`
+/// wieloznacznikiem, wiec id addona z podkresleniem dopasowywaloby cudze wiersze.
+pub fn list_engine_flow_published_names(pool: &DbPool, addon_id: &str) -> Result<Vec<String>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn
+        .prepare("SELECT published_model_name FROM flows WHERE published_model_name IS NOT NULL")?;
+    let prefix = format!("{addon_id}:");
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(0))?
+        .filter_map(std::result::Result::ok)
+        .filter(|n| n.starts_with(&prefix))
+        .collect();
+    Ok(names)
+}
+
 /// nową treść `flow_json` (np. poprawiony retrieval-round).
 pub fn register_engine_flow_atomic(
     pool: &DbPool,
@@ -8099,14 +8205,15 @@ pub const AGENT_RUN_STATES: &[&str] = &[
 
 const AGENT_COLS: &str = "id, name, display_name, description, system_prompt, model, tools_json, \
      skills_json, params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, \
-     flow_id, routable, is_enabled, on_child_complete, created_at, updated_at";
+     flow_id, routable, is_enabled, on_child_complete, allowed_agents_json, created_at, \
+     updated_at";
 
 /// Admissible `agents.on_child_complete` values (mirrors the column CHECK).
 pub const AGENT_ON_CHILD_COMPLETE_VALUES: &[&str] = &["notify", "continue"];
 
 const AGENT_RUN_COLS: &str = "id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, \
-     status, prompt, result, exit_reason, iterations, total_tokens, run_log, last_heartbeat_at, \
-     started_at, finished_at, created_at";
+     status, prompt, result, exit_reason, iterations, total_tokens, prompt_tokens, \
+     completion_tokens, model, run_log, last_heartbeat_at, started_at, finished_at, created_at";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
     Ok(DbAgent {
@@ -8127,8 +8234,9 @@ fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
         routable: row.get::<_, i64>(14)? != 0,
         is_enabled: row.get::<_, i64>(15)? != 0,
         on_child_complete: row.get(16)?,
-        created_at: row.get(17)?,
-        updated_at: row.get(18)?,
+        allowed_agents_json: row.get(17)?,
+        created_at: row.get(18)?,
+        updated_at: row.get(19)?,
     })
 }
 
@@ -8146,11 +8254,14 @@ fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgentRun> {
         exit_reason: row.get(9)?,
         iterations: row.get(10)?,
         total_tokens: row.get(11)?,
-        run_log: row.get(12)?,
-        last_heartbeat_at: row.get(13)?,
-        started_at: row.get(14)?,
-        finished_at: row.get(15)?,
-        created_at: row.get(16)?,
+        prompt_tokens: row.get(12)?,
+        completion_tokens: row.get(13)?,
+        model: row.get(14)?,
+        run_log: row.get(15)?,
+        last_heartbeat_at: row.get(16)?,
+        started_at: row.get(17)?,
+        finished_at: row.get(18)?,
+        created_at: row.get(19)?,
     })
 }
 
@@ -8311,8 +8422,8 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
         "INSERT INTO agents \
          (id, name, display_name, description, system_prompt, model, tools_json, skills_json, \
           params_json, max_iterations, timeout_secs, max_subagents, max_spawn_depth, flow_id, \
-          routable, is_enabled, on_child_complete) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17) \
+          routable, is_enabled, on_child_complete, allowed_agents_json) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18) \
          ON CONFLICT(id) DO UPDATE SET \
          name = excluded.name, display_name = excluded.display_name, \
          description = excluded.description, system_prompt = excluded.system_prompt, \
@@ -8322,6 +8433,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
          max_subagents = excluded.max_subagents, max_spawn_depth = excluded.max_spawn_depth, \
          flow_id = excluded.flow_id, routable = excluded.routable, \
          is_enabled = excluded.is_enabled, on_child_complete = excluded.on_child_complete, \
+         allowed_agents_json = excluded.allowed_agents_json, \
          updated_at = datetime('now')",
         rusqlite::params![
             params.id,
@@ -8341,6 +8453,7 @@ pub fn upsert_agent(pool: &DbPool, params: &AgentParams<'_>) -> Result<()> {
             params.routable as i64,
             params.is_enabled as i64,
             params.on_child_complete,
+            params.allowed_agents_json,
         ],
     )?;
     record_core_capture_tx(
@@ -8433,8 +8546,11 @@ pub fn update_agent_run_status(
          exit_reason = COALESCE(?4, exit_reason), \
          iterations = COALESCE(?5, iterations), \
          total_tokens = COALESCE(?6, total_tokens), \
-         started_at = CASE WHEN ?7 AND started_at IS NULL THEN datetime('now') ELSE started_at END, \
-         finished_at = CASE WHEN ?8 THEN datetime('now') ELSE finished_at END, \
+         prompt_tokens = COALESCE(?7, prompt_tokens), \
+         completion_tokens = COALESCE(?8, completion_tokens), \
+         model = COALESCE(?9, model), \
+         started_at = CASE WHEN ?10 AND started_at IS NULL THEN datetime('now') ELSE started_at END, \
+         finished_at = CASE WHEN ?11 THEN datetime('now') ELSE finished_at END, \
          last_heartbeat_at = datetime('now') \
          WHERE id = ?1",
         rusqlite::params![
@@ -8444,6 +8560,9 @@ pub fn update_agent_run_status(
             update.exit_reason,
             update.iterations,
             update.total_tokens,
+            update.prompt_tokens,
+            update.completion_tokens,
+            update.model,
             update.set_started as i64,
             update.set_finished as i64,
         ],
@@ -8712,6 +8831,7 @@ mod agents_repository_tests {
             routable: true,
             is_enabled: true,
             on_child_complete: "notify",
+            allowed_agents_json: None,
             actor_user_id: None,
         }
     }
@@ -25483,6 +25603,44 @@ mod api_key_access_v2_tests {
                 .unwrap();
             assert_eq!(count, 1, "missing default policy for {resource_type}");
         }
+    }
+
+    /// Registering a descriptor is only half of it — without an enabled policy
+    /// the row never leaves the outbox, so the Code Studio registry has to be
+    /// covered by the startup seeding just like Flow Builder and RBAC.
+    #[test]
+    fn default_policies_cover_code_studio_registry() {
+        let db = fresh_db();
+        ensure_default_core_sync_policies(&db).unwrap();
+        let conn = acquire(&db).unwrap();
+        for resource_type in [
+            "core.code_workspace",
+            "core.code_workspace_member",
+            "core.code_workspace_creator_grant",
+            "core.code_workspace_project_link",
+            "core.code_workspace_allowlist",
+        ] {
+            let count: i64 = conn
+                .query_row(
+                    "SELECT COUNT(*) FROM sync_policies \
+                     WHERE resource_type = ?1 AND mode = 'replicated_by_permission' \
+                       AND is_enabled = 1",
+                    rusqlite::params![resource_type],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert_eq!(count, 1, "missing default policy for {resource_type}");
+        }
+        // The vault never gets a policy, because it never gets a descriptor.
+        let vault: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_policies WHERE resource_type LIKE '%secret%' \
+                   AND resource_type LIKE 'core.code%'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(vault, 0);
     }
 }
 

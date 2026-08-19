@@ -29,10 +29,24 @@ export function isAutoNodeLabel(label, nodeType, fallbackLabel = '') {
   return translated !== key && value === translated;
 }
 
+// Blok, ktorego konfiguracja NAZYWA to, co uruchamia, przedstawia sie lepiej niz
+// jego typ: trzy bloki `spawn` to trzy rozni agenci, a trzykrotne "Uruchom
+// subagenta" nie mowi o nich nic. Typ zostaje na nodzie (ikona, kolor, znacznik)
+// i w podtytule inspektora, wiec nic nie ginie.
+const IDENTITY_CONFIG_KEY = { spawn: 'agent_name', await_subagents: 'run_ids_var' };
+
+/** Nazwa z konfiguracji bloku albo pusty string, gdy blok jej nie niesie. */
+export function getNodeIdentity(node) {
+  const key = IDENTITY_CONFIG_KEY[node?.type];
+  if (!key) return '';
+  const value = node?.config?.[key];
+  return typeof value === 'string' ? value.trim() : '';
+}
+
 export function getNodeDisplayTitle(node, template = null) {
   if (!node) return '';
   if (!isAutoNodeLabel(node.label, node.type, template?.label)) {
     return node.label;
   }
-  return getNodeName(node.type, template?.label);
+  return getNodeIdentity(node) || getNodeName(node.type, template?.label);
 }

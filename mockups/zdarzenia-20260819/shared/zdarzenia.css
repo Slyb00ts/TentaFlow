@@ -1,0 +1,119 @@
+/* =============================================================================
+   Przeglądarka zdarzeń — oś czasu, rejestr, inspektor.
+   Wzorzec interakcji: Trajectory z DeepSeek Harness (trzy tory, granice tur,
+   pasmo asystenta rozcięte na TTFT i dekodowanie).
+   ============================================================================= */
+
+.ev-shell { display: grid; grid-template-rows: auto auto 1fr; height: 100vh; }
+
+/* --- pasek filtrów --- */
+.ev-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  padding: 10px 16px; border-bottom: 1px solid var(--border); background: var(--bg-2);
+}
+.ev-bar .sp { flex: 1; }
+.ev-chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+  border: 1px solid var(--border); background: var(--bg-3); color: var(--text-2); cursor: pointer;
+}
+.ev-chip[data-on] { border-color: var(--accent-1); color: var(--text); background: var(--accent-glow); }
+.ev-chip .dot { width: 7px; height: 7px; border-radius: 50%; }
+
+/* Pochodzenie ma własny kolor — to pierwszy wymiar, po którym się czyta. */
+.o-code    { background: #60a5fa; }
+.o-api     { background: #f59e0b; }
+.o-addon   { background: #a78bfa; }
+.o-project { background: #22c55e; }
+.o-chat    { background: #38bdf8; }
+.o-camera  { background: #f472b6; }
+.o-sched   { background: #94a3b8; }
+.o-mesh    { background: #2dd4bf; }
+
+/* --- oś czasu --- */
+.ev-timeline { border-bottom: 1px solid var(--border); background: var(--bg-2); user-select: none; }
+.ev-plot { display: grid; grid-template-columns: 52px 1fr; height: 82px; }
+.ev-lanes-labels {
+  position: relative; border-right: 1px solid var(--border);
+  font-size: 10px; color: var(--text-3); font-family: 'JetBrains Mono', monospace;
+}
+.ev-lanes-labels span { position: absolute; right: 6px; }
+.ev-lanes-labels span:nth-child(1) { top: 12px; }
+.ev-lanes-labels span:nth-child(2) { top: 36px; }
+.ev-lanes-labels span:nth-child(3) { top: 60px; }
+.ev-track { position: relative; overflow: hidden; cursor: crosshair; }
+.ev-turnline { position: absolute; top: 0; bottom: 0; width: 1px; background: var(--border-hover); }
+.ev-turnline b {
+  position: absolute; top: 2px; left: 4px; font-size: 9px; font-weight: 700;
+  color: var(--text-3); font-family: 'JetBrains Mono', monospace;
+}
+.ev-span {
+  position: absolute; height: 12px; border-radius: 3px; display: flex; overflow: hidden;
+  box-shadow: inset 0 0 0 1px rgba(0,0,0,.35);
+}
+.ev-span.lane0 { top: 8px; }
+.ev-span.lane1 { top: 32px; }
+.ev-span.lane2 { top: 56px; }
+/* Pasmo asystenta jest DWUCZĘŚCIOWE: oczekiwanie na pierwszy token i dekodowanie.
+   Bez tego rozcięcia „model myślał 8 s" nie mówi, czy czekał, czy pisał. */
+.ev-span .ttft { background: repeating-linear-gradient(45deg, #4b5563 0 4px, #374151 4px 8px); }
+.ev-span .decode { background: var(--accent-1); }
+.ev-span .tool { background: #0e7490; }
+.ev-span .err { background: var(--danger); }
+.ev-sel {
+  position: absolute; top: 0; bottom: 0; background: rgba(99,102,241,.16);
+  border-left: 1px solid var(--accent-1); border-right: 1px solid var(--accent-1);
+}
+.ev-legend {
+  display: flex; gap: 14px; flex-wrap: wrap; padding: 6px 16px;
+  border-top: 1px solid var(--border); font-size: 11px; color: var(--text-3);
+}
+.ev-legend i { font-style: normal; display: inline-flex; align-items: center; gap: 5px; }
+.ev-legend .sw { width: 18px; height: 8px; border-radius: 2px; display: inline-block; }
+
+/* --- treść: rejestr + inspektor --- */
+.ev-body { display: grid; grid-template-columns: 1fr; min-height: 0; }
+.ev-body.with-inspector { grid-template-columns: minmax(0,1fr) 380px; }
+.ev-ledger { overflow: auto; min-height: 0; }
+.ev-row {
+  display: grid; grid-template-columns: 54px 130px 108px 1fr 84px;
+  gap: 10px; align-items: center; padding: 7px 16px;
+  border-bottom: 1px solid var(--border); font-size: 13px; cursor: pointer;
+}
+.ev-row:hover { background: var(--bg-card-hover); }
+.ev-row[data-sel] { background: var(--accent-glow); box-shadow: inset 2px 0 0 var(--accent-1); }
+.ev-row .ix { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-3); }
+.ev-row .kind { font-weight: 600; display: flex; align-items: center; gap: 6px; }
+.ev-row .who { color: var(--text-2); font-size: 12px; }
+.ev-row .what { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-row .ms {
+  text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 12px;
+  color: var(--text-2); font-variant-numeric: tabular-nums;
+}
+.ev-turnhead {
+  padding: 9px 16px; background: var(--bg-3); border-bottom: 1px solid var(--border-hover);
+  border-top: 2px solid var(--border-hover);
+  font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--text-2);
+  display: flex; gap: 10px; align-items: center;
+}
+.ev-turnhead .sub { font-weight: 500; text-transform: none; letter-spacing: 0; color: var(--text-3); }
+
+/* --- inspektor --- */
+.ev-inspector { border-left: 1px solid var(--border); background: var(--bg-2); overflow: auto; }
+.ev-insp-head { padding: 14px 16px; border-bottom: 1px solid var(--border); }
+.ev-insp-title { font-size: 15px; font-weight: 700; }
+.ev-insp-sub { font-size: 12px; color: var(--text-3); margin-top: 3px; font-family: 'JetBrains Mono', monospace; }
+.ev-kv { display: grid; grid-template-columns: 96px 1fr; gap: 6px 12px; padding: 12px 16px; font-size: 12.5px; }
+.ev-kv dt { color: var(--text-3); }
+.ev-kv dd { color: var(--text); font-variant-numeric: tabular-nums; }
+.ev-sec { padding: 12px 16px; border-top: 1px solid var(--border); }
+.ev-sec h4 {
+  font-size: 11px; text-transform: uppercase; letter-spacing: .07em;
+  color: var(--text-3); margin-bottom: 7px;
+}
+.ev-pre {
+  background: var(--bg-input); border: 1px solid var(--border); border-radius: var(--radius-sm);
+  padding: 9px 11px; font-family: 'JetBrains Mono', monospace; font-size: 11.5px;
+  color: var(--text-2); white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto;
+}
+.ev-track-bar { display: flex; height: 9px; border-radius: 3px; overflow: hidden; margin-top: 4px; }

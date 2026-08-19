@@ -326,6 +326,10 @@ pub struct CatalogEntry {
     pub service_surfaces: Vec<ServiceSurface>,
     pub input_modalities: Vec<InputModality>,
     pub output_modalities: Vec<OutputModality>,
+    /// Poziomy rozumowania, ktore ten wpis przyjmuje. Pusto = model nie wspiera
+    /// sterowania rozumowaniem; klient ma wtedy NIE pokazywac wyboru, zamiast
+    /// oferowac ustawienie, ktore backend odrzuci.
+    pub reasoning_levels: Vec<String>,
     pub diagnostic: Option<CatalogDiagnostic>,
 }
 
@@ -460,6 +464,7 @@ mod tests {
     #[test]
     fn owned_by_is_kind_specific() {
         let svc = CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: "m".into(),
             kind: CatalogEntryKind::ServiceModel { instances: vec![] },
             service_surfaces: vec![],

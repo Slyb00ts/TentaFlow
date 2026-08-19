@@ -140,6 +140,27 @@ pub enum MessagePart {
         #[serde(default = "default_image_detail")]
         detail: String,
     },
+    /// Audio przez `BlobRef` — mapowane na OpenAI `input_audio` (base64 + krótki
+    /// kod formatu: "wav" / "mp3"). Format wyliczamy z MIME blobu, bo OpenAI nie
+    /// przyjmuje pełnego typu MIME, tylko nazwę kontenera.
+    Audio {
+        blob_ref: crate::flow_engine::blob_store::BlobRef,
+        format: String,
+    },
+}
+
+/// OpenAI `input_audio.format` z typu MIME blobu. Nieznany typ zostaje "wav" —
+/// to jedyny format, który przyjmuje każdy backend audio, więc zły strzał daje
+/// czytelny błąd dekodowania zamiast odrzucenia całego żądania.
+pub fn audio_format_from_mime(mime: &str) -> String {
+    match mime.rsplit('/').next().unwrap_or("wav") {
+        "mpeg" | "mp3" => "mp3",
+        "ogg" | "opus" => "opus",
+        "flac" => "flac",
+        "m4a" | "mp4" | "aac" => "m4a",
+        _ => "wav",
+    }
+    .to_string()
 }
 
 fn default_image_detail() -> String {
@@ -212,7 +233,8 @@ impl ChatMessage {
                 .iter()
                 .filter_map(|p| match p {
                     MessagePart::Text { text } => Some(text.as_str()),
-                    MessagePart::Image { .. } => None,
+                    // Media carry no text; a transcript would be a guess.
+                    MessagePart::Image { .. } | MessagePart::Audio { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(" "),
@@ -398,6 +420,10 @@ pub struct FlowExecutionOutcome {
     pub final_envelope: FlowEnvelope,
     pub trace: Vec<TraceStep>,
     pub usage: TokenUsage,
+    /// Model the last LLM call of this run resolved to. `None` for a flow that
+    /// called no model. Tokens without the model that spent them cannot be
+    /// settled, so the two travel together.
+    pub model: Option<String>,
     /// Per-message metryki wydajnosci z ostatniego LLM chunku (TTFT, prefill/
     /// decode tok/s). `None` gdy backend ich nie zaraportowal.
     pub perf: Option<GenPerf>,

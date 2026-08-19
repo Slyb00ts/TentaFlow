@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Zdarzenia · mockupy (index)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/zdarzenia.css?v=1">
+</head>
+<body>
+
+<div style="max-width:900px;margin:0 auto;padding:40px 24px">
+  <h1 style="font-size:26px;margin-bottom:6px">Śledzenie zdarzeń — mockupy do akceptacji</h1>
+  <p style="color:var(--text-2);margin-bottom:8px">
+    Jedno miejsce, w którym dla każdego wywołania AI widać <strong>skąd przyszło</strong> i
+    <strong>kto je wywołał</strong>. Wzorzec interakcji: Trajectory z DeepSeek Harness — trzy tory,
+    granice tur, pasmo asystenta rozcięte na oczekiwanie i dekodowanie.
+  </p>
+  <p style="color:var(--text-3);font-size:13px;margin-bottom:26px">
+    Plan: <code>docs/PLAN_SLEDZENIE_ZDARZEN.md</code>. Mockupy są statyczne — pokazują układ i
+    hierarchię informacji, nie działają.
+  </p>
+
+  <div style="display:grid;gap:12px">
+    <a href="z01-przegladarka.html" style="display:block;padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-card);color:var(--text);text-decoration:none">
+      <strong>Z01 · Przeglądarka zdarzeń</strong>
+      <div style="color:var(--text-2);font-size:13px;margin-top:4px">
+        Globalny widok. Filtry pochodzenia i aktora jako pierwszy wymiar. Rejestr grupowany turami,
+        z sekcją „między turami” dla zdarzeń spoza tury.
+      </div>
+    </a>
+    <a href="z02-inspektor.html" style="display:block;padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-card);color:var(--text);text-decoration:none">
+      <strong>Z02 · Inspektor rekordu</strong>
+      <div style="color:var(--text-2);font-size:13px;margin-top:4px">
+        Zaznaczony przedział na osi zawęża rejestr. Inspektor pokazuje pochodzenie, aktora,
+        chronometraż z rozbiciem TTFT/dekodowanie oraz odsyłacze do audytu i osi sesji.
+      </div>
+    </a>
+    <a href="z03-code-studio.html" style="display:block;padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-card);color:var(--text);text-decoration:none">
+      <strong>Z03 · Oś czasu w sesji Code Studio</strong>
+      <div style="color:var(--text-2);font-size:13px;margin-top:4px">
+        Ten sam materiał jako zakładka przy sesji, zawężony do jej przebiegu — bez przechodzenia do
+        osobnego modułu.
+      </div>
+    </a>
+  </div>
+
+  <h2 style="font-size:16px;margin:28px 0 8px">Decyzje do akceptacji</h2>
+  <ul style="color:var(--text-2);font-size:13.5px;line-height:1.8;padding-left:20px">
+    <li><strong>Pochodzenie ma własny kolor</strong> i jest pierwszym filtrem — zakładam, że to
+      wymiar, po którym najczęściej się szuka.</li>
+    <li><strong>Pasmo modelu rozcięte na dwie części.</strong> „Model myślał 8 s” nie mówi, czy
+      czekał, czy pisał; rozbicie mówi.</li>
+    <li><strong>Rejestr grupowany turami</strong>, nie płaska lista. Tura jest jednostką, w której
+      człowiek myśli o przebiegu.</li>
+    <li><strong>Równoległe narzędzia jako osobne pasma</strong> w tym samym torze — inaczej
+      zrównoleglenia nie widać.</li>
+    <li><strong>Bez fabrykowania czasu.</strong> Rekord w locie dostaje znacznik startu, nie
+      zmyślony pasek.</li>
+  </ul>
+</div>
+</body>
+</html>

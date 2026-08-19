@@ -7,23 +7,32 @@
       "id": "trigger",
       "type": "trigger",
       "config": {},
-      "position": { "x": 0, "y": 0 }
+      "position": {
+        "x": 0,
+        "y": 0
+      }
     },
     {
       "id": "hops",
       "type": "loop",
       "config": {
-        "body_flow_engine_id": "retrieval-round",
         "until": "has(meta.harness_done) && meta.harness_done == true",
-        "max_iterations": 4
+        "max_iterations": 4,
+        "body_flow_id": "00000000-0000-4000-8000-000000000052"
       },
-      "position": { "x": 240, "y": 0 }
+      "position": {
+        "x": 240,
+        "y": 0
+      }
     },
     {
       "id": "finalize",
       "type": "rag_finalize",
       "config": {},
-      "position": { "x": 480, "y": 0 }
+      "position": {
+        "x": 480,
+        "y": 0
+      }
     },
     {
       "id": "answer",
@@ -32,13 +41,21 @@
         "model": "rag-llm",
         "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (zakumulowane pasaze ponizej, numerowane [i] z doc/chunk). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo (numer pasaza / doc). Nie zmyslaj faktow spoza kontekstu."
       },
-      "position": { "x": 720, "y": 0 }
+      "position": {
+        "x": 720,
+        "y": 0
+      }
     },
     {
       "id": "out",
       "type": "output",
-      "config": { "emit_citations": true },
-      "position": { "x": 960, "y": 0 }
+      "config": {
+        "emit_citations": true
+      },
+      "position": {
+        "x": 960,
+        "y": 0
+      }
     }
   ],
   "edges": [

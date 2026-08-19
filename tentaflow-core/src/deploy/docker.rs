@@ -63,6 +63,35 @@ impl SandboxLimits {
             work_tmpfs: Some(("/var/lib/tentaflow".to_string(), 2 * 1024 * 1024 * 1024)),
         }
     }
+
+    /// Code Studio session profile (§7.2): 8 GiB RAM, 4 cores, 1024 processes,
+    /// a read-only rootfs and a 2 GiB `/tmp` — a build toolchain needs far more
+    /// room than a test run, and everything it writes goes either into the
+    /// worktree mount or into that tmpfs.
+    ///
+    /// `network_mode` is the profile's network axis and has exactly two honest
+    /// values: `"none"` for `network_access = none` (no route at all, so the
+    /// only way out is the git shim socket) and the name of the workspace's
+    /// INTERNAL egress network for `network_access = gateway`. The default
+    /// bridge is never one of them — it would mean unfiltered internet under a
+    /// profile that claims to be filtered.
+    ///
+    /// Two of the requirements of §7.2 are not `HostConfig` fields and are
+    /// therefore enforced where the container is created (`code_studio::
+    /// sandbox`): the non-root user the process runs as, and the absence of any
+    /// docker-socket bind — a mounted socket is a root shell on the host, which
+    /// would make every limit here decoration.
+    pub fn code_session(network_mode: impl Into<String>) -> Self {
+        Self {
+            network_mode: network_mode.into(),
+            memory_bytes: 8 * 1024 * 1024 * 1024,
+            nano_cpus: 4_000_000_000,
+            pids_limit: 1024,
+            readonly_rootfs: true,
+            tmpfs_bytes: 2 * 1024 * 1024 * 1024,
+            work_tmpfs: None,
+        }
+    }
 }
 
 /// Konfiguracja deployu jednego kontenera.

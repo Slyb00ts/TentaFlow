@@ -53,15 +53,39 @@ class TfButton extends HTMLElement {
   constructor() {
     super();
     this._btn = null;
+    this._observer = null;
+    this._onLightMutation = this._onLightMutation.bind(this);
   }
 
   connectedCallback() {
     if (!this._btn) this._build();
     this._update();
+    // A caller that sets textContent/innerHTML on the host AFTER the upgrade
+    // throws away the <button> this component built, leaving unstyled bare
+    // text. Rebuild from whatever the caller left in the light DOM.
+    if (!this._observer && typeof MutationObserver !== 'undefined') {
+      this._observer = new MutationObserver(this._onLightMutation);
+      this._observer.observe(this, { childList: true });
+    }
+  }
+
+  disconnectedCallback() {
+    if (this._observer) {
+      this._observer.disconnect();
+      this._observer = null;
+    }
   }
 
   attributeChangedCallback() {
     if (this._btn) this._update();
+  }
+
+  // The rebuild re-appends the button, which mutates children again; that pass
+  // sees an intact button and returns, so there is no loop.
+  _onLightMutation() {
+    if (!this._btn || this.contains(this._btn)) return;
+    this._build();
+    this._update();
   }
 
   _build() {
@@ -149,8 +173,19 @@ class TfButton extends HTMLElement {
     if (this.hasAttribute('full-width')) classes.push('tf-btn-full-width');
     this._btn.className = classes.join(' ');
 
-    if (this.hasAttribute('disabled')) this._btn.setAttribute('disabled', '');
-    else this._btn.removeAttribute('disabled');
+    if (this.hasAttribute('disabled')) {
+      this._btn.setAttribute('disabled', '');
+      // The host is a custom element, not a form control, so nothing outside
+      // this component treats it as disabled: assistive tech announces it as a
+      // live button and automation happily "clicks" it while the handler above
+      // swallows the event. Both readings have to see the state.
+      this.setAttribute('aria-disabled', 'true');
+      this.style.pointerEvents = 'none';
+    } else {
+      this._btn.removeAttribute('disabled');
+      this.removeAttribute('aria-disabled');
+      this.style.pointerEvents = '';
+    }
 
     const type = this.getAttribute('type');
     if (type) this._btn.setAttribute('type', type);

@@ -158,9 +158,13 @@ class TfWindow extends HTMLElement {
     actionsEl.appendChild(actionsSlot);
     actionsEl.addEventListener('click', this._onActionsClick);
 
-    header.appendChild(controls);
+    // Chrome closes on the RIGHT, after the title and the actions slot:
+    // DESIGN.md §9.5 ("explicit close button top-right") and every mockup drawn
+    // since the first one. On the left, the lone red dot that 36 of ~40 call
+    // sites render read as a status marker rather than as a control.
     header.appendChild(titleEl);
     header.appendChild(actionsEl);
+    header.appendChild(controls);
 
     // body
     const bodyEl = document.createElement('div');
@@ -240,7 +244,9 @@ class TfWindow extends HTMLElement {
       this._iconSvg.style.display = 'none';
     }
 
-    const buttons = (this.getAttribute('buttons') || 'close,minimize,maximize')
+    // Close LAST, because the group now sits at the right edge: the control a
+    // reader reaches for blind is the one in the corner.
+    const buttons = (this.getAttribute('buttons') || 'minimize,maximize,close')
       .split(',')
       .map((s) => s.trim())
       .filter(Boolean);
@@ -453,6 +459,12 @@ class TfWindow extends HTMLElement {
     if (cls === 'minimized') {
       this._win.classList.remove('collapsed');
     }
+  }
+
+  // The body is the scroller, so a window whose slotted content changes in place
+  // (wizard steps, tab panels) needs a way to start the new content at its top.
+  scrollBodyTop() {
+    if (this._bodyEl) this._bodyEl.scrollTop = 0;
   }
 
   // =============================================================================

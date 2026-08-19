@@ -104,6 +104,7 @@ mod tests {
             final_envelope: FlowEnvelope::empty(),
             trace: Vec::new(),
             usage: TokenUsage::default(),
+            model: None,
             perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 0,

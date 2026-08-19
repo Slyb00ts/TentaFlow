@@ -82,7 +82,7 @@ pub fn provision(
         Err(error) => {
             // The workspace stays visible and explicitly broken, with the
             // reason attached. Nothing here pretends the workspace is usable.
-            let detail = format!("{error:#}");
+            let detail = failure_detail(&error);
             if let Err(nested) =
                 repository::set_status(db, &workspace.id, WorkspaceStatus::Error, Some(&detail))
             {
@@ -102,9 +102,13 @@ fn run_steps(
         paths::create_workspace_layout(&workspace.id).map(|_| ())
     })?;
 
+    // S1's "reserve the quotas" lands here rather than in its own step: the
+    // reservation has nowhere to live until the runtime database exists, and a
+    // step that can only ever run together with another one is not a step.
     step(db, &workspace.id, STEP_RUNTIME_DB, || {
         let dir = paths::workspace_dir(&workspace.id)?;
-        workspace_db::open_pool_at(&dir).map(|_| ())
+        let (pool, _) = workspace_db::open_pool_at(&dir)?;
+        workspace_db::set_disk_quota(&pool, workspace.quota_disk_bytes)
     })?;
 
     // The secret is written by the caller before provisioning starts (it holds
@@ -192,6 +196,18 @@ fn repository_step(
         other => Err(anyhow!("unknown repository kind {other}")),
     };
 
+    // A clone is the one step able to fill a disk in a single call, and how big
+    // a remote really is cannot be known before the objects land. So the
+    // reservation is checked against what ACTUALLY arrived, and a repository
+    // that does not fit fails the step — which compensates by removing `repo/`
+    // rather than leaving an over-quota workspace marked active.
+    let result = result.and_then(|outcome| {
+        super::fs::WorkspaceQuota::new(&workspace.id, workspace.quota_disk_bytes)
+            .assert_within()
+            .map_err(|err| anyhow!("{err}"))?;
+        Ok(outcome)
+    });
+
     match result {
         Ok(outcome) => {
             repository::record_saga_step(
@@ -208,7 +224,7 @@ fn repository_step(
             // fail on a non-empty target, so it is removed and the step is
             // marked compensated — which a resume treats as "redo", unlike a
             // plain failure that may still hold a partial effect to inspect.
-            let detail = format!("{error:#}");
+            let detail = failure_detail(&error);
             if let Ok(dir) = paths::repo_dir(&workspace.id) {
                 if let Err(cleanup) = std::fs::remove_dir_all(&dir) {
                     if cleanup.kind() != std::io::ErrorKind::NotFound {
@@ -228,6 +244,17 @@ fn repository_step(
     }
 }
 
+/// The reason a step failed, made safe to keep.
+///
+/// Every one of these strings is PERSISTED — `code_workspaces.status_detail`
+/// and `code_workspace_saga_steps.detail` — and travels to the dashboard and
+/// to every workspace member. A clone failure carries git's own diagnostic,
+/// and git quotes the full remote URL in an authentication message, so the
+/// detail column is a credential sink unless it is scrubbed here (§13.4).
+fn failure_detail(error: &anyhow::Error) -> String {
+    super::redact::redact_text(&format!("{error:#}"))
+}
+
 /// Runs one idempotent step unless it is already recorded as done.
 fn step<F>(db: &DbPool, workspace_id: &str, name: &str, body: F) -> Result<()>
 where
@@ -243,7 +270,7 @@ where
             Ok(())
         }
         Err(error) => {
-            let detail = format!("{error:#}");
+            let detail = failure_detail(&error);
             repository::record_saga_step(
                 db,
                 workspace_id,
@@ -285,7 +312,6 @@ mod tests {
     /// The saga writes into the real workspace root, which is a global path.
     /// These tests redirect the Data category, so they must not run next to
     /// each other or to anything else reading that category.
-    static PATHS_GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct Fixture {
         _data: tempfile::TempDir,
@@ -349,7 +375,7 @@ mod tests {
 
     #[test]
     fn an_empty_workspace_ends_active_with_a_base_commit_to_branch_from() {
-        let _guard = PATHS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
         if !git_available() {
             eprintln!("skipping: git is not installed");
             return;
@@ -381,7 +407,7 @@ mod tests {
 
     #[test]
     fn a_failed_clone_leaves_error_and_no_half_written_repository() {
-        let _guard = PATHS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
         let fx = fixture();
         // A syntactically valid remote that policy refuses: nothing is fetched.
         let ws = repository::create_workspace(
@@ -419,7 +445,7 @@ mod tests {
 
     #[test]
     fn resuming_skips_completed_steps_and_finishes_the_rest() {
-        let _guard = PATHS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
         if !git_available() {
             eprintln!("skipping: git is not installed");
             return;
@@ -442,7 +468,7 @@ mod tests {
 
     #[test]
     fn provisioning_twice_is_a_no_op_rather_than_a_second_clone() {
-        let _guard = PATHS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
         if !git_available() {
             eprintln!("skipping: git is not installed");
             return;
@@ -465,7 +491,7 @@ mod tests {
 
     #[test]
     fn a_repository_needing_credentials_without_a_stored_secret_fails_before_the_network() {
-        let _guard = PATHS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
         let fx = fixture();
         let mut new = new_workspace("ws-nosecret", "git", Some("https://example.invalid/r.git"));
         new.repo_auth_kind = Some("token".into());
@@ -484,7 +510,7 @@ mod tests {
 
     #[test]
     fn a_workspace_interrupted_by_a_restart_is_reported_as_retryable() {
-        let _guard = PATHS_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
         let fx = fixture();
         repository::create_workspace(&fx.db, &new_workspace("ws-stuck", "empty", None)).unwrap();
 

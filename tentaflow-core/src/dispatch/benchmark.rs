@@ -32,34 +32,23 @@ const PERM_READ: &str = "benchmark.read";
 const PERM_WRITE: &str = "benchmark.write";
 const RECENT_RUNS_LIMIT: u32 = 50;
 
-/// Rejestr aktywnych runów: run_id → flaga anulowania. Proces-globalny (wzorzec
-/// jak `log_bus::BUS`), więc StartRun nie musi dotykać AppState. Wpis powstaje
-/// przy starcie runu i znika, gdy zadanie się kończy; Cancel ustawia flagę.
-fn cancel_registry() -> &'static RwLock<HashMap<String, Arc<AtomicBool>>> {
-    static REG: OnceLock<RwLock<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashMap::new()))
-}
+/// Anulowanie biezacych zadan tego procesu. Wspolny typ z
+/// `services::cancel_registry` — kazda z trzech kopii tej mapy miala wlasna
+/// implementacje, a ta w Project Studio wprost nazywala sie lustrem benchmarku.
+static BENCH_CANCEL: crate::services::cancel_registry::CancelRegistry =
+    crate::services::cancel_registry::CancelRegistry::new();
 
 fn register_cancel(run_id: &str) -> Arc<AtomicBool> {
-    let token = Arc::new(AtomicBool::new(false));
-    cancel_registry()
-        .write()
-        .insert(run_id.to_string(), token.clone());
-    token
+    BENCH_CANCEL.register(run_id)
 }
 
 fn unregister_cancel(run_id: &str) {
-    cancel_registry().write().remove(run_id);
+    BENCH_CANCEL.unregister(run_id)
 }
 
+/// Flags a live run for cancellation. `false` = this process does not own it.
 fn signal_cancel(run_id: &str) -> bool {
-    match cancel_registry().read().get(run_id) {
-        Some(token) => {
-            token.store(true, Ordering::Relaxed);
-            true
-        }
-        None => false,
-    }
+    BENCH_CANCEL.signal(run_id)
 }
 
 fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {

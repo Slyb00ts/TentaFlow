@@ -2,6 +2,13 @@
 // File: tf-filter-chips.js
 // Description: <tf-filter-chips> — inline filter bar with toggleable chip
 //              buttons, single or multi select mode. Light DOM.
+//              The `scroll` attribute keeps every chip on ONE horizontally
+//              swipeable line instead of wrapping — on a phone a wrapping bar
+//              of five filters costs three rows of vertical space. A scrolling
+//              row also publishes `data-overflow` (none|start|end|both) on its
+//              container so the edge fade in controls.css can say that there is
+//              more to swipe to; a chip cut flush at the frame reads as a
+//              rendering fault, not as an invitation.
 // Example: const fc = document.querySelector('tf-filter-chips');
 //          fc.filters = [{id:'all', label:'All', active:true}, {id:'open', label:'Open'}];
 // =============================================================================
@@ -15,11 +22,20 @@ class TfFilterChips extends HTMLElement {
     super();
     this._container = null;
     this._filters = [];
+    this._observer = null;
+    this._syncOverflow = this._syncOverflow.bind(this);
   }
 
   connectedCallback() {
     if (!this._container) this._build();
     this._render();
+  }
+
+  disconnectedCallback() {
+    if (this._observer) {
+      this._observer.disconnect();
+      this._observer = null;
+    }
   }
 
   attributeChangedCallback() {
@@ -40,8 +56,29 @@ class TfFilterChips extends HTMLElement {
     const el = document.createElement('div');
     el.className = 'tf-filter-chips';
     el.addEventListener('click', (e) => this._onClick(e));
+    el.addEventListener('scroll', this._syncOverflow, { passive: true });
     this.appendChild(el);
     this._container = el;
+    if (typeof ResizeObserver !== 'undefined') {
+      this._observer = new ResizeObserver(this._syncOverflow);
+      this._observer.observe(el);
+    }
+  }
+
+  // Which way the row can still travel. Read straight from layout rather than
+  // from the filter count: whether five chips overflow depends on the label
+  // lengths of the active locale, not on how many there are.
+  _syncOverflow() {
+    const el = this._container;
+    if (!el) return;
+    if (!this.hasAttribute('scroll')) {
+      el.removeAttribute('data-overflow');
+      return;
+    }
+    const max = el.scrollWidth - el.clientWidth;
+    const start = el.scrollLeft > 1;
+    const end = el.scrollLeft < max - 1;
+    el.setAttribute('data-overflow', start && end ? 'both' : start ? 'start' : end ? 'end' : 'none');
   }
 
   _render() {
@@ -61,6 +98,7 @@ class TfFilterChips extends HTMLElement {
       : '';
 
     this._container.innerHTML = html + clearHtml;
+    this._syncOverflow();
   }
 
   _onClick(e) {

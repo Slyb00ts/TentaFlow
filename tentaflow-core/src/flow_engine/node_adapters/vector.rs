@@ -392,6 +392,7 @@ impl VectorNodeAdapter {
                     &p.values,
                     sparse_ns,
                     p.sparse.as_ref(),
+                    ctx.vector_home.as_deref(),
                 )
                 .map_err(|e| anyhow!("vector adapter: upsert: {e}"))?;
             written += 1;
@@ -424,13 +425,20 @@ impl VectorNodeAdapter {
         let filter = Self::merge_collection_filter(config_filter, envelope);
         let output_fields = parse_output_fields(node.config.get("output_fields"));
 
-        let backend = ctx
-            .vectors
-            .get(&org, addon, &namespace)
-            .map_err(|e| anyhow!("vector adapter: search: {e}"))?;
-        let hits = backend
-            .search(&query, top_k, filter.as_ref(), &output_fields)
-            .map_err(|e| anyhow!("vector adapter: search: {e}"))?;
+        // Wezel flow, ktory pyta o nieistniejaca przestrzen, to blad w grafie, a nie
+        // pusty wynik — stad `missing_is_empty = false` (odwrotnie niz w Projektach).
+        let hits = crate::services::vector::doc_vectors::search_namespace(
+            &ctx.vectors,
+            &org,
+            addon,
+            &namespace,
+            &query,
+            top_k,
+            filter.as_ref(),
+            &output_fields,
+            false,
+        )
+        .map_err(|e| anyhow!("vector adapter: search: {e}"))?;
 
         // RAG E2.0 — realne cytaty z faktycznych hitów retrievalu wędrują w
         // envelope.meta["rag_citations"] (NIE zmyślony SELECT po stronie addona).

@@ -382,6 +382,7 @@ mod tests {
                 &specs,
                 false,
                 &items,
+                None,
             )
             .expect("upsert passage");
     }

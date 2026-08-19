@@ -20,12 +20,14 @@ use crate::agents::{
     is_core_tool, AgentPrincipal, AgentRunManager, AgentService, AgentServiceSlot, CallerRun,
     CoreToolName, PermissionDecision, DEFAULT_INTERACTION_TIMEOUT_SECS,
 };
+use crate::code_studio::tools as code_studio_tools;
 use crate::db::repository;
-use crate::flow_engine::dispatchers::ProgressEvent;
-use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, LlmToolCall, NodeInput};
-use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
-use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::flow_engine::dispatchers::EmbeddingsRequest;
+use crate::flow_engine::dispatchers::ProgressEvent;
+use crate::flow_engine::envelope::{ChatRole, FlowEnvelope, FlowValue, LlmToolCall, NodeInput};
+use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::node_adapters::InteractionGate;
+use crate::flow_engine::types::{FlowDataType, FlowNode};
 use crate::project_studio::{
     generation as project_generation, ingest as project_ingest, knowledge as project_knowledge,
 };
@@ -35,6 +37,10 @@ const NODE_TYPE: &str = "tool_exec";
 const DEFAULT_MAX_RESULT_CHARS: usize = 16_000;
 const DEFAULT_MAX_TOOL_CALLS: usize = 16;
 const TRUNCATION_MARKER: &str = "\n…[truncated]…\n";
+/// Flow variable holding how many tool calls the turn dispatched, summed over
+/// the loop's iterations. A downstream graph reads it to tell a turn that did
+/// work from a turn that only answered.
+pub const TOOL_CALLS_TOTAL_VAR: &str = "tool_calls_total";
 
 /// Budget for a `core.project_search` result JSON — headroom under the default
 /// 16k middle-out truncation, so the model always receives intact JSON (a
@@ -43,6 +49,16 @@ const PROJECT_SEARCH_RESULT_BUDGET: usize = 15_000;
 
 /// Human-wait budget for a permission grant card (§3.13 B). A grant has no
 /// model-supplied timeout (unlike ask_user), so it uses the shared default.
+/// Sufit na JEDNO wywolanie narzedzia, gdy narzedzie nie trzyma wlasnego
+/// deadline'u (patrz `tool_budget`). Bez tego zawieszone narzedzie addonu
+/// zatrzymuje cala ture, a model nie dostaje nawet informacji, ze cos poszlo nie
+/// tak.
+const DEFAULT_TOOL_TIMEOUT_SECS: usize = 120;
+
+/// Ile niezaleznych wywolan wolno miec w locie naraz. Odczyty sa tanie, ale
+/// kazde trzyma bufor wyniku, wiec pula ma sufit.
+const DEFAULT_MAX_PARALLEL_TOOL_CALLS: usize = 4;
+
 const DEFAULT_PERMISSION_TIMEOUT: Duration = Duration::from_secs(DEFAULT_INTERACTION_TIMEOUT_SECS);
 
 /// Shapes a failed tool call into a recoverable `[TOOL_ERROR]`-style result the
@@ -194,6 +210,82 @@ impl ToolExecNodeAdapter {
         CoreToolName::from_public_name(name)
             .map(|c| c.is_case_save())
             .unwrap_or(false)
+    }
+
+    /// True for the Code Studio verbs (§10). Async: every one of them binds its
+    /// session from `envelope.meta["code_session"]`, runs the policy enforcement
+    /// point (which may park the run on a human) and journals an operation.
+    fn is_code_studio(name: &str) -> bool {
+        CoreToolName::from_public_name(name)
+            .map(|c| c.is_code_studio())
+            .unwrap_or(false)
+    }
+
+    /// Runs one Code Studio tool call. The workspace and session are NOT
+    /// parameters: they come from the server-minted binding in the envelope, so
+    /// a model cannot point a write at another person's worktree. A run without
+    /// that binding gets a tool error, exactly like a non-generation run calling
+    /// `core.project_case_save`.
+    async fn run_code_studio_call(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        envelope: &FlowEnvelope,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        let arguments: Value = match serde_json::from_str(&call.arguments) {
+            Ok(v) => v,
+            Err(e) => return error_result(call, format!("invalid arguments JSON: {e}")),
+        };
+        let Some(tool) = CoreToolName::from_public_name(&call.name) else {
+            return error_result(call, format!("unknown core tool '{}'", call.name));
+        };
+        let Some(user_id) = principal.user_id().map(|s| s.to_string()) else {
+            return error_result(
+                call,
+                format!("tool '{}' requires a user identity", call.name),
+            );
+        };
+        let Some(binding) = code_studio_tools::binding_from_meta(&envelope.meta) else {
+            return error_result(
+                call,
+                "this run is not bound to a Code Studio session \
+                 (the workspace tools work only inside a Code Studio run)"
+                    .to_string(),
+            );
+        };
+
+        let registry = crate::agents::interaction_registry_global();
+        let extend = |waited: Duration| ctx.extend_deadline(waited);
+        let gate = InteractionGate::new(
+            &registry,
+            manager,
+            ctx.progress.as_ref(),
+            &ctx.progress_scope,
+            run_id,
+            parent_run_id,
+            &extend,
+        );
+        let call_ctx = code_studio_tools::ToolCallCtx {
+            main_db: service.db(),
+            user_id: &user_id,
+            run_id: (!run_id.is_empty()).then_some(run_id),
+            tool_call_id: &call.id,
+            binding: &binding,
+            gate: &gate,
+        };
+        match code_studio_tools::execute(&call_ctx, tool, &arguments).await {
+            Ok(output) => ToolCallResult {
+                tool_call_id: call.id.clone(),
+                name: call.name.clone(),
+                content: serde_json::to_string(&output).unwrap_or_default(),
+                success: true,
+            },
+            Err(e) => error_result(call, e.to_string()),
+        }
     }
 
     /// Runs one `core.project_case_save` call. The binding comes ONLY from
@@ -657,6 +749,187 @@ impl ToolExecNodeAdapter {
             );
         }
     }
+
+    /// Czy wywolanie tego narzedzia wolno puscic obok innych.
+    ///
+    /// Lista jest ALLOWLISTA, nie denylista, i to jest celowe: narzedzie nieznane
+    /// tej funkcji — w tym KAZDE narzedzie addonu — laduje w trybie wylacznym.
+    /// Pomylka w te strone kosztuje czas; w druga kosztowalaby splatane zapisy
+    /// albo dwa rownolegle pytania do czlowieka.
+    fn is_parallel_safe(name: &str) -> bool {
+        matches!(
+            CoreToolName::from_public_name(name),
+            Some(
+                CoreToolName::FsRead
+                    | CoreToolName::FsList
+                    | CoreToolName::FsGlob
+                    | CoreToolName::FsGrep
+                    | CoreToolName::GitRead
+                    | CoreToolName::CodeSearch
+                    | CoreToolName::WorkspaceInfo
+                    | CoreToolName::AgentList
+                    | CoreToolName::ProjectSearch
+                    | CoreToolName::ProjectListSources
+            )
+        )
+    }
+
+    /// Wykonuje JEDNO wywolanie narzedzia. Wydzielone z petli, zeby ta sama
+    /// sciezka obslugiwala wykonanie pojedyncze i rownolegla grupe.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_one(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        caller: &CallerRun,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        envelope: &FlowEnvelope,
+        tools_json: &str,
+        default_budget: Duration,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            ProgressEvent::ToolCallStarted {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+            },
+        );
+
+        let inner = Self::dispatch_inner(
+            service,
+            manager,
+            ctx,
+            principal,
+            caller,
+            run_id,
+            parent_run_id,
+            envelope,
+            tools_json,
+            call,
+        );
+        let result = match Self::tool_budget(&call.name, default_budget) {
+            None => inner.await,
+            Some(budget) => match tokio::time::timeout(budget, inner).await {
+                Ok(result) => result,
+                // Blad ustrukturyzowany, a nie awaria flow: model widzi, ze
+                // narzedzie nie zdazylo, i moze sprobowac inaczej. Przerwanie
+                // dziala przez DROP futures — zadanie `spawn_blocking`, ktore juz
+                // ruszylo, dobiegnie konca w tle, tylko jego wynik zostanie
+                // porzucony. To granica tego mechanizmu i powod, dla ktorego
+                // `core.exec` ma wlasny, twardszy limit w sandboxie.
+                Err(_) => error_result(
+                    call,
+                    format!(
+                        "tool '{}' exceeded its {} s budget",
+                        call.name,
+                        budget.as_secs()
+                    ),
+                ),
+            },
+        };
+
+        ctx.progress.emit(
+            &ctx.progress_scope,
+            ProgressEvent::ToolCallFinished {
+                call_id: call.id.clone(),
+                name: call.name.clone(),
+                status: if result.success { "ok" } else { "error" }.to_string(),
+            },
+        );
+        result
+    }
+
+    /// Ile czasu ma to narzedzie. `None` = narzedzie SAMO trzyma swoj deadline i
+    /// nadlozenie drugiego tylko by go skrocilo:
+    ///
+    ///  * `ask_user` czeka na czlowieka i ma wlasny `timeout_secs`,
+    ///  * `agent_wait` czeka na dzieci, ktore moga pracowac dowolnie dlugo,
+    ///  * `exec` ma limit wybierany przez model z sufitem ORAZ idle-timeout
+    ///    liczony od aktywnosci — kompilacja godzine milczaca przez minute jest
+    ///    poprawna, a budzet scienny by ja zabil.
+    fn tool_budget(name: &str, default_budget: Duration) -> Option<Duration> {
+        match CoreToolName::from_public_name(name) {
+            Some(CoreToolName::AskUser)
+            | Some(CoreToolName::AgentWait)
+            | Some(CoreToolName::AgentSpawn)
+            | Some(CoreToolName::Exec) => None,
+            _ => Some(default_budget),
+        }
+    }
+
+    /// Rozdzielacz wywolan. Bez pomiaru czasu i bez zdarzen postepu — te trzyma
+    /// `dispatch_one`, zeby przekroczony budzet tez zamykal pare start/koniec.
+    #[allow(clippy::too_many_arguments)]
+    async fn dispatch_inner(
+        service: &Arc<AgentService>,
+        manager: Option<&AgentRunManager>,
+        ctx: &ExecutionContext,
+        principal: &AgentPrincipal,
+        caller: &CallerRun,
+        run_id: &str,
+        parent_run_id: Option<&str>,
+        envelope: &FlowEnvelope,
+        tools_json: &str,
+        call: &LlmToolCall,
+    ) -> ToolCallResult {
+        if !service.tool_allowed(&tools_json, &call.name) {
+            error_result(call, format!("tool '{}' not in agent allowlist", call.name))
+        } else if CoreToolName::from_public_name(&call.name)
+            .map(|c| c.is_ask_user())
+            .unwrap_or(false)
+        {
+            Self::run_ask_user_call(
+                manager.as_deref(),
+                ctx,
+                &run_id,
+                parent_run_id.as_deref(),
+                call,
+            )
+            .await
+        } else if Self::is_subagent_control(&call.name) {
+            match (&manager, run_id.is_empty()) {
+                (Some(mgr), false) => Self::run_manager_call(mgr, &caller, call).await,
+                (Some(_), true) => error_result(
+                    call,
+                    "sub-agent control requires a managed run context".to_string(),
+                ),
+                (None, _) => error_result(
+                    call,
+                    "sub-agent control is not available on this node".to_string(),
+                ),
+            }
+        } else if Self::is_project_knowledge(&call.name) {
+            Self::run_project_knowledge_call(ctx, &principal, call).await
+        } else if Self::is_case_save(&call.name) {
+            Self::run_case_save_call(ctx, &principal, envelope, call).await
+        } else if Self::is_code_studio(&call.name) {
+            Self::run_code_studio_call(
+                &service,
+                manager.as_deref(),
+                ctx,
+                &principal,
+                &run_id,
+                parent_run_id.as_deref(),
+                envelope,
+                call,
+            )
+            .await
+        } else {
+            Self::run_tool_call(
+                &service,
+                manager.as_deref(),
+                ctx,
+                &principal,
+                &run_id,
+                parent_run_id.as_deref(),
+                call,
+            )
+            .await
+        }
+    }
 }
 
 #[async_trait]
@@ -709,6 +982,16 @@ impl NodeAdapter for ToolExecNodeAdapter {
         // End detection: an assistant turn without tool calls is the final
         // response — signal the loop to stop (§1.1, §3.4).
         if calls.is_empty() {
+            // The counter must EXIST after the loop even when the turn called
+            // nothing: a graph downstream asks "did this turn do any work?", and
+            // an absent variable makes that question a hard evaluation error
+            // instead of the answer "no".
+            if !out.variables.contains_key(TOOL_CALLS_TOTAL_VAR) {
+                out.variables.insert(
+                    TOOL_CALLS_TOTAL_VAR.to_string(),
+                    FlowValue::Json(serde_json::json!(0)),
+                );
+            }
             out.meta
                 .insert("harness_done".into(), serde_json::json!(true));
             out.meta.insert(
@@ -724,17 +1007,30 @@ impl NodeAdapter for ToolExecNodeAdapter {
             calls.truncate(max_tool_calls);
         }
 
+        // How much the turn DID, accumulated across the loop's iterations. A
+        // graph downstream of the tool loop has no other way to tell "the agent
+        // answered a question" from "the agent changed the repository", and the
+        // difference decides whether an expensive review pipeline is worth
+        // running at all. Counted before dispatch, because a call that failed
+        // is still work the turn attempted.
+        let executed_before = out
+            .variables
+            .get(TOOL_CALLS_TOTAL_VAR)
+            .and_then(|v| match v {
+                FlowValue::Json(json) => json.as_i64(),
+                _ => None,
+            })
+            .unwrap_or(0);
+        out.variables.insert(
+            TOOL_CALLS_TOTAL_VAR.to_string(),
+            FlowValue::Json(serde_json::json!(executed_before + calls.len() as i64)),
+        );
+
         // The effective tool surface is the agent's allowlist (§3.3); reload it
         // from the agent the harness pinned in meta. No agent id = no allowlist
         // (every call is rejected as out-of-surface — a misconfigured flow).
         let agent_id = envelope.meta.get("agent_id").and_then(|v| v.as_str());
-        let tools_json = match agent_id {
-            Some(id) => service
-                .get_agent(id)?
-                .map(|a| a.tools_json)
-                .unwrap_or_else(|| "[]".to_string()),
-            None => "[]".to_string(),
-        };
+        let tools_json = service.agent_tools_json(agent_id);
 
         let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
         let started_at = Utc::now();
@@ -771,65 +1067,90 @@ impl NodeAdapter for ToolExecNodeAdapter {
                 .and_then(|r| r.parent_run_id)
         };
 
-        for call in &calls {
-            ctx.progress.emit(
-                &ctx.progress_scope,
-                ProgressEvent::ToolCallStarted {
-                    name: call.name.clone(),
-                },
-            );
-
-            let result = if !service.tool_allowed(&tools_json, &call.name) {
-                error_result(call, format!("tool '{}' not in agent allowlist", call.name))
-            } else if CoreToolName::from_public_name(&call.name)
-                .map(|c| c.is_ask_user())
-                .unwrap_or(false)
-            {
-                Self::run_ask_user_call(
-                    manager.as_deref(),
-                    ctx,
-                    &run_id,
-                    parent_run_id.as_deref(),
-                    call,
-                )
-                .await
-            } else if Self::is_subagent_control(&call.name) {
-                match (&manager, run_id.is_empty()) {
-                    (Some(mgr), false) => Self::run_manager_call(mgr, &caller, call).await,
-                    (Some(_), true) => error_result(
+        // Wywolania niezalezne jada ROWNOLEGLE, reszta pojedynczo. Podzial nie
+        // jest optymalizacja "na wszelki wypadek": narzedzia mutujace maja
+        // preconditiony CAS i skutki uboczne, dla ktorych kolejnosc modelu JEST
+        // znaczeniem, a `ask_user` i sterowanie sub-agentami musza widziec stan
+        // ustalony. Rownolegle puszczamy wylacznie odczyty.
+        //
+        // Wyniki i tak wracaja w kolejnosci modelu — `join_all` zachowuje
+        // kolejnosc wejscia — wiec audyt i wiadomosci role=tool ustawiaja sie
+        // dokladnie tak, jak przy wykonaniu sekwencyjnym.
+        let max_parallel = Self::config_usize(
+            node,
+            "max_parallel_tool_calls",
+            DEFAULT_MAX_PARALLEL_TOOL_CALLS,
+        )
+        .max(1);
+        let tool_budget = Duration::from_secs(
+            Self::config_usize(node, "tool_timeout_secs", DEFAULT_TOOL_TIMEOUT_SECS).max(1) as u64,
+        );
+        let mut idx = 0usize;
+        while idx < calls.len() {
+            // Anulowanie sprawdzane PRZED kazda grupa. Executor zauwaza je dopiero
+            // po UKONCZENIU wezla, wiec bez tego zatrzymany przebieg dokanczalby
+            // cala partie wywolan — a sa wsrod nich zapisy, commity i `exec`.
+            // Zatrzymanie zbiegłego agenta ma go zatrzymac, a nie poprosic.
+            //
+            // Pominietym wywolaniom dopisujemy wynik, zamiast urywac liste: audyt
+            // i wiadomosci `role=tool` paruja sie z tura asystenta po indeksie, a
+            // brakujacy wynik zostawilby wywolanie bez odpowiedzi.
+            if ctx.cancel_token.is_cancelled() {
+                for call in &calls[idx..] {
+                    results.push(error_result(
                         call,
-                        "sub-agent control requires a managed run context".to_string(),
-                    ),
-                    (None, _) => error_result(
-                        call,
-                        "sub-agent control is not available on this node".to_string(),
-                    ),
+                        "run cancelled before this tool call started".to_string(),
+                    ));
                 }
-            } else if Self::is_project_knowledge(&call.name) {
-                Self::run_project_knowledge_call(ctx, &principal, call).await
-            } else if Self::is_case_save(&call.name) {
-                Self::run_case_save_call(ctx, &principal, envelope, call).await
+                break;
+            }
+            let group_len = if Self::is_parallel_safe(&calls[idx].name) {
+                calls[idx..]
+                    .iter()
+                    .take(max_parallel)
+                    .take_while(|c| Self::is_parallel_safe(&c.name))
+                    .count()
             } else {
-                Self::run_tool_call(
-                    &service,
-                    manager.as_deref(),
-                    ctx,
-                    &principal,
-                    &run_id,
-                    parent_run_id.as_deref(),
-                    call,
-                )
-                .await
+                1
             };
+            let group = &calls[idx..idx + group_len];
 
-            ctx.progress.emit(
-                &ctx.progress_scope,
-                ProgressEvent::ToolCallFinished {
-                    name: call.name.clone(),
-                    status: if result.success { "ok" } else { "error" }.to_string(),
-                },
-            );
-            results.push(result);
+            if group_len == 1 {
+                results.push(
+                    Self::dispatch_one(
+                        &service,
+                        manager.as_deref(),
+                        ctx,
+                        &principal,
+                        &caller,
+                        &run_id,
+                        parent_run_id.as_deref(),
+                        envelope,
+                        &tools_json,
+                        tool_budget,
+                        &group[0],
+                    )
+                    .await,
+                );
+            } else {
+                let futures_iter = group.iter().map(|call| {
+                    Self::dispatch_one(
+                        &service,
+                        manager.as_deref(),
+                        ctx,
+                        &principal,
+                        &caller,
+                        &run_id,
+                        parent_run_id.as_deref(),
+                        envelope,
+                        &tools_json,
+                        tool_budget,
+                        call,
+                    )
+                });
+                results.extend(futures::future::join_all(futures_iter).await);
+            }
+            idx += group_len;
         }
 
         // Audit + run log against the run's AI event before truncation (the
@@ -940,6 +1261,7 @@ mod tests {
                 routable: true,
                 is_enabled: true,
                 on_child_complete: "notify",
+                allowed_agents_json: None,
                 actor_user_id: None,
             },
         )
@@ -971,6 +1293,47 @@ mod tests {
         m
     }
 
+    /// Zatrzymany przebieg NIE dokancza partii wywolan. Executor zauwaza
+    /// anulowanie dopiero po ukonczeniu wezla, wiec bez tej bramki zatrzymanie
+    /// zbieglego agenta pozwalaloby mu jeszcze zapisac pliki i zrobic commit.
+    ///
+    /// Pominiete wywolania dostaja WYNIK, a nie znikaja: audyt i wiadomosci
+    /// `role=tool` paruja sie z tura asystenta po indeksie.
+    #[tokio::test]
+    async fn cancelled_run_skips_remaining_tool_calls_but_still_answers_them() {
+        let slot = service(db());
+        let mut env = FlowEnvelope::empty();
+        env.context.messages.push(assistant_with_calls(vec![
+            LlmToolCall {
+                id: "c1".into(),
+                name: "core.fs_write".into(),
+                arguments: "{}".into(),
+            },
+            LlmToolCall {
+                id: "c2".into(),
+                name: "core.fs_write".into(),
+                arguments: "{}".into(),
+            },
+        ]));
+
+        let ctx = stub_ctx();
+        ctx.cancel_token.cancel();
+
+        let out = ToolExecNodeAdapter::new(slot)
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .expect("wezel konczy sie normalnie, anulowanie nie jest bledem tutaj");
+
+        // Kazde wywolanie ma odpowiedz — zadne nie zostalo bez pary.
+        let tool_msgs = out
+            .context
+            .messages
+            .iter()
+            .filter(|m| matches!(m.role, ChatRole::Tool))
+            .count();
+        assert_eq!(tool_msgs, 2, "oba wywolania musza dostac wynik");
+    }
+
     #[tokio::test]
     async fn no_tool_calls_sets_harness_done() {
         let slot = service(db());
@@ -992,6 +1355,88 @@ mod tests {
         assert_eq!(
             out.meta.get("harness_exit_reason").and_then(|v| v.as_str()),
             Some("final_response")
+        );
+        // A turn that called nothing still has to ANSWER the question "how much
+        // did this turn do?". Leaving the variable out made a downstream
+        // `vars.tool_calls_total > 0` blow the whole flow up with "No such key"
+        // instead of taking the cheap branch.
+        assert_eq!(
+            out.variables.get(TOOL_CALLS_TOTAL_VAR),
+            Some(&FlowValue::Json(json!(0))),
+            "an idle turn must report zero, not nothing"
+        );
+    }
+
+    /// …and a turn that DID call tools reports how many, summed over the loop's
+    /// iterations rather than reset by each one.
+    #[tokio::test]
+    async fn tool_calls_are_counted_across_iterations() {
+        let pool = db();
+        let slot = service(pool.clone());
+        let ctx = stub_ctx();
+
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("agent_id".into(), json!("agent-count"));
+        crate::db::repository::upsert_agent(
+            &pool,
+            &crate::db::models::AgentParams {
+                id: "agent-count",
+                name: "counter",
+                display_name: None,
+                description: "Liczy wywolania narzedzi w tescie.",
+                system_prompt: None,
+                model: None,
+                tools_json: r#"["core.skill_view"]"#,
+                skills_json: "{}",
+                params_json: "{}",
+                max_iterations: 5,
+                timeout_secs: 60,
+                max_subagents: 0,
+                max_spawn_depth: 1,
+                flow_id: None,
+                routable: false,
+                is_enabled: true,
+                on_child_complete: "notify",
+                allowed_agents_json: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("agent");
+        env.context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "c1".into(),
+                name: "core.skill_view".into(),
+                arguments: r#"{"name":"nieistniejacy"}"#.into(),
+            }]));
+
+        let first = ToolExecNodeAdapter::new(slot.clone())
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .expect("first iteration");
+        assert_eq!(
+            first.variables.get(TOOL_CALLS_TOTAL_VAR),
+            Some(&FlowValue::Json(json!(1)))
+        );
+
+        // Feed the result back in, exactly as the loop region does.
+        let mut second_env = first.clone();
+        second_env
+            .context
+            .messages
+            .push(assistant_with_calls(vec![LlmToolCall {
+                id: "c2".into(),
+                name: "core.skill_view".into(),
+                arguments: r#"{"name":"nieistniejacy"}"#.into(),
+            }]));
+        let second = ToolExecNodeAdapter::new(slot)
+            .execute(&node(json!({})), &[input(second_env)], &ctx)
+            .await
+            .expect("second iteration");
+        assert_eq!(
+            second.variables.get(TOOL_CALLS_TOTAL_VAR),
+            Some(&FlowValue::Json(json!(2))),
+            "the counter must accumulate, not restart each iteration"
         );
     }
 
@@ -1253,6 +1698,109 @@ mod tests {
             assert!(t.contains("not in agent allowlist"), "got: {t}");
         } else {
             panic!("tool content must be text");
+        }
+    }
+
+    /// Rownolegle wolno puszczac WYLACZNIE odczyty. Kazde narzedzie mutujace,
+    /// interaktywne albo sterujace sub-agentami musi zostac wylaczne — inaczej
+    /// dwa zapisy z preconditionem CAS scigalyby sie o ten sam plik, a dwa
+    /// `ask_user` zadalyby czlowiekowi dwoch pytan naraz.
+    #[test]
+    fn only_reads_are_parallel_safe() {
+        for name in [
+            "core.fs_read",
+            "core.fs_list",
+            "core.fs_glob",
+            "core.fs_grep",
+            "core.git_read",
+            "core.code_search",
+            "core.workspace_info",
+            "core.agent_list",
+            "core.project_search",
+            "core.project_list_sources",
+        ] {
+            assert!(
+                ToolExecNodeAdapter::is_parallel_safe(name),
+                "{name} to odczyt i powinien isc rownolegle"
+            );
+        }
+        for name in [
+            "core.fs_write",
+            "core.fs_edit",
+            "core.fs_move",
+            "core.fs_delete",
+            "core.fs_mkdir",
+            "core.exec",
+            "core.git_commit",
+            "core.git_push",
+            "core.git_stage",
+            "core.git_merge",
+            "core.ask_user",
+            "core.agent_spawn",
+            "core.agent_wait",
+            "core.agent_cancel",
+            "core.task_plan",
+            "core.project_case_save",
+        ] {
+            assert!(
+                !ToolExecNodeAdapter::is_parallel_safe(name),
+                "{name} zmienia stan albo wymaga kolejnosci — musi byc wylaczne"
+            );
+        }
+    }
+
+    /// Narzedzie spoza rdzenia (kazdy addon) nie jest znane allowliscie, wiec
+    /// laduje w trybie wylacznym. To jest ta strona pomylki, ktora kosztuje czas,
+    /// a nie poprawnosc.
+    #[test]
+    fn unknown_and_addon_tools_default_to_exclusive() {
+        for name in ["notes.search", "rag.ask", "totally_unknown", ""] {
+            assert!(
+                !ToolExecNodeAdapter::is_parallel_safe(name),
+                "{name} nie jest znane — domyslnie wylaczne"
+            );
+        }
+    }
+
+    /// Narzedzia, ktore SAME trzymaja swoj deadline, nie moga dostac drugiego —
+    /// nalozony budzet scienny tylko by go skrocil i zabil poprawna prace:
+    /// `ask_user` czeka na czlowieka, `agent_wait`/`agent_spawn` na dzieci, a
+    /// `exec` ma limit z sufitem ORAZ idle-timeout liczony od aktywnosci
+    /// (kompilacja milczaca przez minute jest poprawna).
+    #[test]
+    fn tools_owning_their_deadline_get_no_second_one() {
+        let default = Duration::from_secs(120);
+        for name in [
+            "core.ask_user",
+            "core.agent_wait",
+            "core.agent_spawn",
+            "core.exec",
+        ] {
+            assert_eq!(
+                ToolExecNodeAdapter::tool_budget(name, default),
+                None,
+                "{name} trzyma wlasny deadline"
+            );
+        }
+    }
+
+    /// Wszystko inne — w tym KAZDE narzedzie addonu — dostaje budzet. To jest cel:
+    /// zawieszone narzedzie nie moze zatrzymac tury bez sladu.
+    #[test]
+    fn everything_else_gets_a_budget() {
+        let default = Duration::from_secs(90);
+        for name in [
+            "core.fs_read",
+            "core.git_commit",
+            "core.code_search",
+            "notes.search",
+            "totally_unknown",
+        ] {
+            assert_eq!(
+                ToolExecNodeAdapter::tool_budget(name, default),
+                Some(default),
+                "{name} powinien dostac budzet"
+            );
         }
     }
 }

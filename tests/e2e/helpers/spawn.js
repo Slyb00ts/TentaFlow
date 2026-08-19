@@ -18,10 +18,63 @@ const BINARY_CANDIDATES = [
   path.join(__dirname, '../../../target_shared/release/tentaflow'),
   path.join(__dirname, '../../../target_shared/debug/tentaflow'),
 ];
-const BINARY = BINARY_CANDIDATES.find((p) => fs.existsSync(p)) ?? BINARY_CANDIDATES[0];
+// `TENTAFLOW_E2E_BINARY` wins so a run can target a freshly built debug binary
+// without touching a release artifact someone else produced.
+const BINARY = process.env.TENTAFLOW_E2E_BINARY
+  ?? BINARY_CANDIDATES.find((p) => fs.existsSync(p))
+  ?? BINARY_CANDIDATES[0];
+
+// `www/` is compiled INTO the binary (tentaflow-core/build.rs → wwwroot_embed.rs),
+// so a binary older than the dashboard sources serves stale JS. That failure is
+// brutal to read — the served codec simply lacks the encoder a spec asks for and
+// the error names neither the file nor the reason. Warn loudly instead.
+function warnIfDashboardIsStale() {
+  try {
+    const roots = [
+      path.join(__dirname, '../../../tentaflow-core/www'),
+      // Rust sources too: `cargo check` proves the tree compiles but produces no
+      // binary, so a green check next to an old artifact makes a fixed defect
+      // look unfixed — the run then reports the PREVIOUS build's behaviour.
+      path.join(__dirname, '../../../tentaflow-core/src'),
+    ];
+    const binMtime = fs.statSync(BINARY).mtimeMs;
+    let newest = 0;
+    const walk = (dir) => {
+      for (const entry of fs.readdirSync(dir, { withFileTypes: true })) {
+        const full = path.join(dir, entry.name);
+        if (entry.isDirectory()) walk(full);
+        // build.rs regenerates the wasm glue INTO www/, so those files are
+        // always newer than the binary that just embedded them.
+        else if (!/wasm_glue|\/generated\//.test(full)) {
+          newest = Math.max(newest, fs.statSync(full).mtimeMs);
+        }
+      }
+    };
+    for (const root of roots) walk(root);
+    if (newest > binMtime + 60_000) {
+      const age = Math.round((newest - binMtime) / 60000);
+      console.warn(
+        `[e2e] WARNING: ${BINARY} is ~${age} min older than the files in www/. ` +
+        'The dashboard is embedded in the binary, so the served front end will be stale. ' +
+        'Rebuild (cd tentaflow && cargo build) or point TENTAFLOW_E2E_BINARY at a fresh one.',
+      );
+    }
+  } catch { /* diagnostics only — never fail a run on this */ }
+}
+warnIfDashboardIsStale();
 const DEFAULT_PORT = 18099;
 const DEFAULT_DB = '/tmp/e2e-ui-test.db';
 const CONFIG_TEMPLATE = path.join(__dirname, '../config-ui-test.toml');
+/// Storage roots of spawned instances, one directory per port.
+///
+/// On DISK, not under `/tmp`: an instance unpacks ~1.5 GB of container bundles
+/// and `/tmp` is a RAM tmpfs here, so a handful of suites would eat the
+/// machine's memory — and, as this repo already learned with native-lib caches,
+/// a full tmpfs truncates extraction instead of failing loudly. `.runtime/` is
+/// gitignored and is where the project keeps runtime data anyway. The path is
+/// stable per port, so repeated runs reuse one directory instead of leaving a
+/// fresh copy behind every time.
+const HOME_ROOT = path.join(__dirname, '../../../.runtime/e2e-home');
 
 function binaryExists() {
   return fs.existsSync(BINARY);
@@ -50,6 +103,12 @@ function renderConfig(outPath, port) {
   return outPath;
 }
 
+function homeForPort(port) {
+  const home = path.join(HOME_ROOT, `port-${port}`);
+  fs.mkdirSync(home, { recursive: true });
+  return home;
+}
+
 function registerCleanup(child) {
   const cleanup = () => {
     try { if (child && !child.killed) child.kill('SIGTERM'); } catch {}
@@ -68,7 +127,16 @@ function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog
     renderConfig(cfg, port);
   }
   const proc = spawn(BINARY, ['-c', cfg, '--db', db], {
-    env: { ...process.env, RUST_LOG: rustLog },
+    // Every spawned instance gets its OWN storage root. The Sync Ledger (Fjall)
+    // takes an exclusive lock on its directory, so two suites sharing one home
+    // means the second one starts with "FjallError: Locked" and whichever spec
+    // needed the ledger fails for a reason that has nothing to do with it. It
+    // also keeps e2e workspaces out of the developer's real .runtime/data.
+    env: {
+      ...process.env,
+      RUST_LOG: rustLog,
+      TENTAFLOW_HOME: process.env.TENTAFLOW_HOME ?? homeForPort(port),
+    },
   });
   // Keep an in-memory tail of backend logs so specs can attach them to
   // failure diagnostics (e.g. find_connection / PanelOpen traces).

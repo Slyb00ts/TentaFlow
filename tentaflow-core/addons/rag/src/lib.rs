@@ -365,15 +365,18 @@ fn handle_list_collections() -> Value {
     json!({"ok": true, "data": {"collections": collections}})
 }
 
-/// Klucz instancyjnego KV, pod ktorym Core (przy install) zapisuje nazwe
-/// published query-flow tej instancji. Addon nie zna wlasnego addon_id, wiec
-/// odczytuje gotowa nazwe modelu stad.
-const ENGINE_FLOW_STATE_KEY: &str = "engine_flow_model";
+/// Published-name platformowego flow zapytania. Flowy RAG jada z TentaFlow
+/// (seed rdzenia), nie z tego addona, wiec nazwa jest STALA i taka sama na kazdym
+/// wezle — nie ma juz czego odczytywac z instancyjnego KV.
+///
+/// Izolacja per-instancja NIE zalezy od tego, kto jest wlascicielem flow: wezly
+/// vector/store biora scope z `ctx.addon_id`, ktore Core przepisuje z tozsamosci
+/// wolajacego. Wspolny flow, osobne dane.
+const QUERY_FLOW_MODEL: &str = "core:rag-query";
 
-/// Klucz KV (durable), pod ktorym Core zapisuje published-name flow-INGESTU tej
-/// instancji (`{addon_id}:ingest`). Osobny od query, bo `flow_model_bindings`
-/// matchuje po DOKLADNEJ nazwie published, nie po literalnym aliasie modelu.
-const INGEST_FLOW_STATE_KEY: &str = "engine_flow_model:ingest";
+/// Published-name platformowego flow-ingestu. Wiazanie `flow_model_bindings`
+/// matchuje DOKLADNIE te nazwe.
+const INGEST_FLOW_MODEL: &str = "core:rag-ingest";
 
 /// Bufor na odpowiedz query-flow (odpowiedz LLM + kontekst moga byc spore).
 const ASK_BUFFER_SIZE: usize = 262_144;
@@ -408,17 +411,7 @@ fn handle_ask(params: &Value) -> Value {
         Err(e) => return err(&format!("Blad weryfikacji kolekcji: {e}")),
     }
 
-    // Nazwa published query-flow (zapisana przez Core przy install instancji).
-    let model = match state_get(ENGINE_FLOW_STATE_KEY) {
-        Ok(Some(bytes)) => match String::from_utf8(bytes) {
-            Ok(s) if !s.is_empty() => s,
-            _ => return err("Nazwa query-flow w stanie instancji jest nieprawidlowa"),
-        },
-        Ok(None) => {
-            return err("Query-flow nie jest zarejestrowany dla tej instancji (brak engine_flow_model w stanie)")
-        }
-        Err(e) => return err(&format!("Blad odczytu stanu instancji: {e:?}")),
-    };
+    let model = QUERY_FLOW_MODEL;
 
     // Wyzwol flow JAKO MODEL. Pytanie jest promptem (trigger.text -> embeddings),
     // a collection_id/top_k jada w options — Core przeprowadza je do envelope.meta,
@@ -460,7 +453,7 @@ fn handle_ask(params: &Value) -> Value {
     // LLM, citations to REALNE hity retrievalu (doc_id/chunk_index/text/score)
     // zebrane przez output node z meta vector node. Cytaty = dokladnie to, co
     // retrieval zwrocil — zero zmyslania, zero osobnego SELECT-a.
-    let (answer, citations) = match call_query_flow(&model, question, &options) {
+    let (answer, citations) = match call_query_flow(model, question, &options) {
         Ok(a) => a,
         Err(e) => return err(&e),
     };
@@ -807,21 +800,7 @@ fn run_ingest_pipeline(
         .map_err(|e| format!("Cleanup przed re-ingestem nieudany: {e}"))?;
     update_progress(job_id, 10);
 
-    // Nazwa published flow-ingestu TEJ instancji (`{addon_id}:ingest`), zapisana
-    // przez Core przy install pod `engine_flow_model:ingest`. Binding flow_model_bindings
-    // matchuje DOKLADNIE te nazwe — literalny "rag" by sie nie rozwiazal.
-    let model = match state_get(INGEST_FLOW_STATE_KEY) {
-        Ok(Some(bytes)) => match String::from_utf8(bytes) {
-            Ok(s) if !s.is_empty() => s,
-            _ => return Err("Nazwa flow-ingestu w stanie instancji jest nieprawidlowa".to_string()),
-        },
-        Ok(None) => {
-            return Err(
-                "Flow-ingest nie jest zarejestrowany dla tej instancji (brak engine_flow_model:ingest w stanie)".to_string(),
-            )
-        }
-        Err(e) => return Err(format!("Blad odczytu stanu instancji: {e:?}")),
-    };
+    let model = INGEST_FLOW_MODEL;
 
     // Bramka grafu (JEDNO zrodlo prawdy per-instancja). Flow zawsze robi czysty RAG
     // wektorowy; ekstrakcje triple'ow dokleja addon TYLKO gdy graf wlaczony.
@@ -840,7 +819,7 @@ fn run_ingest_pipeline(
 
     // Jedno wywolanie = caly DAG parse->chunk->embed->store. Bledy flow (zly mime,
     // pusty parse, blad store) wracaja jako AbiError -> czytelny komunikat.
-    let result = tentaflow_addon_sdk::ingest_invoke(doc_id_blob, mime, &model, Some(&options_str))
+    let result = tentaflow_addon_sdk::ingest_invoke(doc_id_blob, mime, model, Some(&options_str))
         .map_err(|e| format!("Flow-ingest nieudany: {e:?}"))?;
     update_progress(job_id, 70);
 

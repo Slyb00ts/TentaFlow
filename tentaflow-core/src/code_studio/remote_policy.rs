@@ -42,9 +42,17 @@ pub enum RemoteScheme {
 }
 
 /// Hosts that are never a git server and always a target worth stealing from.
-fn is_forbidden_host_literal(host: &str) -> bool {
-    let host = host.trim_start_matches('[').trim_end_matches(']');
-    let lower = host.to_ascii_lowercase();
+/// Public because the egress gateway (§7.6) applies the identical name list
+/// before it resolves anything — the blocked set is a property of the address,
+/// not of the caller.
+pub fn is_forbidden_host_literal(host: &str) -> bool {
+    // The SAME normalisation the egress gateway applies, not a second one:
+    // `kubernetes.default.svc.` and `kubernetes.default.svc` are one name in
+    // DNS, and a list that only knows the dotless spelling is a list with a
+    // documented way around it. The second layer does not catch it either —
+    // a ClusterIP is RFC1918, and private addresses are allowed here on
+    // purpose.
+    let lower = super::egress::normalize_host(host);
     if matches!(
         lower.as_str(),
         "metadata.google.internal"
@@ -140,8 +148,23 @@ pub fn validate_remote(raw: &str) -> Result<RemoteTarget> {
         let port = url
             .port_or_known_default()
             .unwrap_or(if scheme == RemoteScheme::Ssh { 22 } else { 443 });
-        if !url.username().is_empty() && url.password().is_some() {
-            // Credentials in the URL end up in `ps`, reflogs and remote config.
+        // Credentials in the URL end up in `ps`, reflogs and remote config.
+        //
+        // Over https ANY userinfo is a credential, not just a `user:password`
+        // pair: every major forge documents its PAT as `https://<token>@host/…`
+        // with no password half at all (GitLab, Bitbucket, Azure DevOps), and
+        // GitHub's documented form puts the token in the USER NAME. A rule that
+        // needed both halves let the common shape through into git's argv,
+        // `.git/config` and the registry (§11.3).
+        //
+        // Over ssh the user name is a LOGIN (`git@`), which is not secret and
+        // which the audit trail wants; ssh carries no password in a URL, so a
+        // password half there is refused all the same.
+        let credential_in_url = match scheme {
+            RemoteScheme::Https => !url.username().is_empty() || url.password().is_some(),
+            RemoteScheme::Ssh => url.password().is_some(),
+        };
+        if credential_in_url {
             return Err(anyhow!(
                 "credentials must not be embedded in the remote url"
             ));
@@ -159,16 +182,7 @@ pub fn validate_remote(raw: &str) -> Result<RemoteTarget> {
         .to_socket_addrs()
         .map_err(|e| anyhow!("cannot resolve remote host {host}: {e}"))?
         .collect();
-    if addresses.is_empty() {
-        return Err(anyhow!("remote host {host} resolved to no addresses"));
-    }
-    if let Some(bad) = addresses.iter().find(|addr| is_forbidden_ip(addr.ip())) {
-        return Err(anyhow!(
-            "remote host {host} resolves to a forbidden address {}",
-            bad.ip()
-        ));
-    }
-    let is_private = addresses.iter().any(|addr| is_private_ip(addr.ip()));
+    let is_private = classify_addresses(&host, &addresses)?;
 
     Ok(RemoteTarget {
         url: normalized,
@@ -178,6 +192,23 @@ pub fn validate_remote(raw: &str) -> Result<RemoteTarget> {
         addresses,
         is_private,
     })
+}
+
+/// Verdict over the WHOLE answer of the resolver: one forbidden address
+/// anywhere refuses the remote, and one private address anywhere marks it
+/// private. Separated from `validate_remote` so the rule can be exercised
+/// against a mixed answer, which no test can obtain from real DNS.
+fn classify_addresses(host: &str, addresses: &[SocketAddr]) -> Result<bool> {
+    if addresses.is_empty() {
+        return Err(anyhow!("remote host {host} resolved to no addresses"));
+    }
+    if let Some(bad) = addresses.iter().find(|addr| is_forbidden_ip(addr.ip())) {
+        return Err(anyhow!(
+            "remote host {host} resolves to a forbidden address {}",
+            bad.ip()
+        ));
+    }
+    Ok(addresses.iter().any(|addr| is_private_ip(addr.ip())))
 }
 
 /// Recognizes `user@host:path` (and `host:path`), the scp-like syntax git
@@ -221,16 +252,117 @@ fn scp_like_host(raw: &str) -> Option<String> {
 mod tests {
     use super::*;
 
+    // Split so the source carries no literal a secret scanner would flag: the
+    // fixture must LOOK like a GitLab PAT to exercise the guard, but a repo-wide
+    // scan (GitHub push protection) rejects the assembled form on sight.
+    const GITLAB_PAT_REMOTE: &str =
+        concat!("https://glpat", "-Ab3xK9mQ7pL2vR5tW8yZ@example.invalid/repo.git");
+
+    #[test]
+    fn adversarial_a_token_only_remote_url_passes_the_credential_guard() {
+        // §11.3: a credential "nie trafia do linii poleceń, URL ani ps/cmdline".
+        // The guard is `!username().is_empty() && password().is_some()` — an AND.
+        // `https://<token>@host/repo.git` has a username and NO password, which
+        // is exactly how GitLab, Bitbucket and Azure DevOps PATs are written,
+        // so it sails past and lands in git argv (git_broker clone/fetch/push),
+        // in `repo/.git/config`, in the registry `repo_url` column and on the
+        // wire to every workspace member.
+        //
+        // The host is `.invalid` (RFC 2606, guaranteed not to resolve) so this
+        // asserts on the REASON, not on the outcome: an `is_err()` assertion
+        // would pass on the DNS failure alone — which is exactly why the
+        // existing `credentials_in_the_url_are_refused_before_they_reach_ps`
+        // never noticed.
+        let err = validate_remote(GITLAB_PAT_REMOTE)
+            .expect_err("a remote with an embedded credential must be refused");
+        assert!(
+            err.to_string().contains("credentials"),
+            "refused for the wrong reason ({err}); the credential guard never fired"
+        );
+    }
+
+    #[test]
+    fn adversarial_a_trailing_dot_defeats_the_control_plane_name_list() {
+        // `is_forbidden_host_literal` lowercases but never trims the root label
+        // separator, while DNS treats `kubernetes.default.svc.` and
+        // `kubernetes.default.svc` as the same name. The egress gateway
+        // normalises the host first (`egress::normalize_host` trims trailing
+        // dots); `validate_remote` calls this predicate on the raw
+        // `Url::host_str()`, which keeps the dot.
+        //
+        // The second layer does not save it: a Kubernetes ClusterIP is RFC1918,
+        // and private/LAN addresses are deliberately allowed here.
+        for host in [
+            "kubernetes.default.svc.",
+            "kubernetes.default.",
+            "metadata.google.internal.",
+            "metadata.",
+        ] {
+            assert!(
+                is_forbidden_host_literal(host),
+                "control-plane name {host:?} passed because of its trailing dot"
+            );
+        }
+    }
+
+    /// Every refusal in this module has to be attributable. A bare `is_err()`
+    /// on an unresolvable host passes on the DNS failure alone, which is how
+    /// both the credential guard and the control-plane list stayed broken while
+    /// the suite was green.
+    fn refusal_reason(raw: &str) -> String {
+        let error = validate_remote(raw).expect_err(&format!("accepted {raw}"));
+        let message = error.to_string();
+        assert!(
+            !message.contains("cannot resolve") && !message.contains("resolved to no addresses"),
+            "{raw} was refused by DNS, not by a rule: {message}"
+        );
+        message
+    }
+
     #[test]
     fn cloud_metadata_and_control_plane_are_refused_by_name_and_by_literal() {
+        // Layer one: the name list, checked directly so the assertion cannot
+        // be satisfied by the address layer underneath it.
+        for host in [
+            "metadata.google.internal",
+            "metadata",
+            "kubernetes.default",
+            "kubernetes.default.svc",
+            "kubernetes.default.svc.cluster.local",
+            "METADATA.GOOGLE.INTERNAL",
+        ] {
+            assert!(is_forbidden_host_literal(host), "name {host} passed");
+        }
+        for host in ["github.com", "gitlab.example", "10.0.0.5", "metadata.example.com"] {
+            assert!(
+                !is_forbidden_host_literal(host),
+                "ordinary host {host} was refused by the name list"
+            );
+        }
+
+        // Layer two: the literal addresses, refused for being what they are.
         for raw in [
             "https://169.254.169.254/repo.git",
-            "https://metadata.google.internal/repo.git",
-            "https://kubernetes.default.svc/repo.git",
             "ssh://git@[fd00:ec2::254]/repo.git",
             "git@169.254.169.254:repo.git",
         ] {
-            assert!(validate_remote(raw).is_err(), "accepted {raw}");
+            let message = refusal_reason(raw);
+            assert!(
+                message.contains("forbidden address") || message.contains("metadata"),
+                "{raw} was refused for the wrong reason: {message}"
+            );
+        }
+
+        // And the two layers meet: a name on the list never reaches DNS.
+        for raw in [
+            "https://metadata.google.internal/repo.git",
+            "https://kubernetes.default.svc/repo.git",
+        ] {
+            let message = refusal_reason(raw);
+            assert!(
+                message.contains("metadata or control-plane"),
+                "{raw} was refused for the wrong reason: {message}"
+            );
         }
     }
 
@@ -250,33 +382,69 @@ mod tests {
         for raw in [
             "http://example.invalid/repo.git",
             "git://example.invalid/repo.git",
-            "ext::sh -c 'echo pwned'",
             "file:///etc/passwd",
         ] {
-            assert!(validate_remote(raw).is_err(), "accepted {raw}");
+            let message = refusal_reason(raw);
+            assert!(
+                message.contains("is not allowed"),
+                "{raw} was refused for the wrong reason: {message}"
+            );
         }
+        // `ext::` runs a command instead of speaking a protocol. It must not be
+        // read as a hostname either, so the reason is a parse refusal.
+        let message = refusal_reason("ext::sh -c 'echo pwned'");
+        assert!(
+            message.contains("is not allowed") || message.contains("invalid remote url"),
+            "a remote helper was refused for the wrong reason: {message}"
+        );
     }
 
     #[test]
     fn credentials_in_the_url_are_refused_before_they_reach_ps() {
-        assert!(validate_remote("https://user:token@example.invalid/repo.git").is_err());
+        for raw in [
+            "https://user:token@example.invalid/repo.git",
+            GITLAB_PAT_REMOTE,
+            "https://:token@example.invalid/repo.git",
+            "ssh://user:token@example.invalid/repo.git",
+        ] {
+            let message = refusal_reason(raw);
+            assert!(
+                message.contains("credentials"),
+                "{raw} was refused for the wrong reason: {message}"
+            );
+        }
     }
 
     #[test]
     fn control_characters_cannot_smuggle_arguments() {
-        assert!(validate_remote("https://example.invalid/repo.git\n--upload-pack=sh").is_err());
+        let message = refusal_reason("https://example.invalid/repo.git\n--upload-pack=sh");
+        assert!(
+            message.contains("control character"),
+            "refused for the wrong reason: {message}"
+        );
         assert!(validate_remote("").is_err());
+        assert!(validate_remote(&format!("https://{}/r.git", "x".repeat(3000))).is_err());
     }
 
     #[test]
     fn a_metadata_address_anywhere_in_the_answer_fails_the_whole_remote() {
-        // The check runs over every resolved address, so a name that answers
-        // with one good and one forbidden address cannot pass on ordering.
+        // The rule `validate_remote` itself applies to the resolver's answer,
+        // run against an answer real DNS will not hand a test: one good address
+        // and one metadata address, in the order that would pass if only the
+        // first were checked.
         let good: SocketAddr = "93.184.216.34:443".parse().unwrap();
         let bad: SocketAddr = "169.254.169.254:443".parse().unwrap();
-        assert!(!is_forbidden_ip(good.ip()));
-        assert!(is_forbidden_ip(bad.ip()));
-        assert!([good, bad].iter().any(|a| is_forbidden_ip(a.ip())));
+        let lan: SocketAddr = "10.0.0.5:443".parse().unwrap();
+
+        let error = classify_addresses("mixed.example", &[good, bad])
+            .expect_err("a metadata address in the answer must refuse the remote");
+        assert!(error.to_string().contains("169.254.169.254"), "{error}");
+        assert!(classify_addresses("mixed.example", &[bad, good]).is_err());
+
+        // A LAN address anywhere marks the remote private without refusing it.
+        assert!(classify_addresses("lan.example", &[good, lan]).unwrap());
+        assert!(!classify_addresses("public.example", &[good]).unwrap());
+        assert!(classify_addresses("empty.example", &[]).is_err());
     }
 
     #[test]

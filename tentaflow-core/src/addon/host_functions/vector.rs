@@ -434,6 +434,7 @@ pub fn vector_upsert_v1(
         &field_values,
         spec.sparse,
         input.sparse.as_ref(),
+        None,
     ) {
         Ok(c) => c,
         Err(e) => {

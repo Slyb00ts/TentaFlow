@@ -226,8 +226,12 @@ mod tests {
             _cancel: CancellationToken,
             _progress: Arc<dyn crate::flow_engine::dispatchers::ProgressSink>,
             scope: String,
-        ) -> Result<String> {
-            Ok(format!("result-of-{scope}"))
+        ) -> Result<crate::agents::run_manager::AgentFlowOutcome> {
+            Ok(crate::agents::run_manager::AgentFlowOutcome {
+                text: format!("result-of-{scope}"),
+                usage: crate::flow_engine::envelope::TokenUsage::default(),
+                model: None,
+            })
         }
     }
 
@@ -263,6 +267,7 @@ mod tests {
                 routable: true,
                 is_enabled: true,
                 on_child_complete: "notify",
+                allowed_agents_json: None,
                 actor_user_id: None,
             },
         )
@@ -297,6 +302,7 @@ mod tests {
                 &[],
                 &[],
                 None,
+                None,
             )
             .await
             .expect("parent");
@@ -305,6 +311,7 @@ mod tests {
             agent_id: "parent".into(),
             principal: AgentPrincipal::user("u1"),
             session_id: None,
+            code_session: None,
         };
         let spawn_out = mgr
             .handle_agent_spawn(
@@ -364,6 +371,7 @@ mod tests {
                 &AgentPrincipal::user("u1"),
                 &[],
                 &[],
+                None,
                 None,
             )
             .await

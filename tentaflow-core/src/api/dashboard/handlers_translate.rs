@@ -191,9 +191,13 @@ text, with no explanations, quotes, preface or meta-commentary.",
     let model_id = pick_llm_model(ctx);
 
     let completion_req = ChatCompletionRequest {
+        reasoning_effort: None,
+        modalities: None,
+        audio: None,
         model: model_id.clone(),
         messages: vec![
             Message {
+                audio: None,
                 role: "system".to_string(),
                 content: Some(MessageContent::Text(system_prompt)),
                 reasoning_content: None,
@@ -202,6 +206,7 @@ text, with no explanations, quotes, preface or meta-commentary.",
                 tool_call_id: None,
             },
             Message {
+                audio: None,
                 role: "user".to_string(),
                 content: Some(MessageContent::Text(source_text.to_string())),
                 reasoning_content: None,

@@ -230,8 +230,12 @@ mod tests {
             _cancel: CancellationToken,
             _progress: Arc<dyn crate::flow_engine::dispatchers::ProgressSink>,
             scope: String,
-        ) -> Result<String> {
-            Ok(format!("done-{scope}"))
+        ) -> Result<crate::agents::run_manager::AgentFlowOutcome> {
+            Ok(crate::agents::run_manager::AgentFlowOutcome {
+                text: format!("done-{scope}"),
+                usage: crate::flow_engine::envelope::TokenUsage::default(),
+                model: None,
+            })
         }
     }
 
@@ -267,6 +271,7 @@ mod tests {
                 routable: true,
                 is_enabled: true,
                 on_child_complete: "notify",
+                allowed_agents_json: None,
                 actor_user_id: None,
             },
         )
@@ -295,6 +300,7 @@ mod tests {
             &AgentPrincipal::user("u1"),
             &[],
             &[],
+            None,
             None,
         )
         .await

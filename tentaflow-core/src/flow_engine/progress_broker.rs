@@ -227,6 +227,7 @@ mod tests {
         broker.publish(
             "a",
             ProgressEvent::ToolCallStarted {
+                call_id: "test-call".into(),
                 name: "search".into(),
             },
         );
@@ -234,6 +235,7 @@ mod tests {
         assert_eq!(
             got,
             ProgressEvent::ToolCallStarted {
+                call_id: "test-call".into(),
                 name: "search".into()
             }
         );

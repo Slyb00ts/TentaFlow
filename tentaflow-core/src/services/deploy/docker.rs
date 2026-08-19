@@ -2111,6 +2111,7 @@ mod tests {
         };
         ServiceManifest {
             engine: Engine {
+                reasoning_levels: None,
                 id: id.into(),
                 backend: None,
                 category: Category::Llm,

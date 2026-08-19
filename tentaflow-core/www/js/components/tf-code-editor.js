@@ -13,7 +13,8 @@
 //   highlights) is custom, which is what makes folding + virtualization exact.
 //
 //   Attributes: language (python|javascript|typescript|json|yaml|markdown|
-//     gherkin|plain), readonly, wrap, tab-size, aria-label.
+//     gherkin|rust|csharp|html|css|shell|toml|plain), readonly, wrap, tab-size,
+//     aria-label.
 //   Properties: value, language, readOnly, wrap, tabSize, dirty (read-only),
 //     labels (i18n dict — the component ships English fallbacks only).
 //   Methods : getSelection() -> {from:{line,ch}, to:{line,ch}, text},
@@ -65,7 +66,11 @@ const DEFAULT_LABELS = {
 const INDENT_UNITS = {
   python: 4, plain: 4, markdown: 2, gherkin: 2,
   javascript: 2, typescript: 2, json: 2, yaml: 2,
+  rust: 4, csharp: 4, html: 2, css: 2, shell: 2, toml: 2,
 };
+
+// Languages whose folding follows braces rather than indentation.
+const BRACE_FOLD_LANGS = new Set(['javascript', 'typescript', 'json', 'rust', 'csharp', 'css']);
 
 const PAIRS = { '(': ')', '[': ']', '{': '}' };
 const CLOSERS = { ')': '(', ']': '[', '}': '{' };
@@ -77,7 +82,7 @@ const WORD_RE = /[\p{L}\p{N}_]/u;
 // Tokenizers. tokenizeLine(lang, text, state) -> { toks: [start, end, cls, ...],
 // state: <string state at end of line> }. state '' is the base state; other
 // values encode an open multi-line construct. Token classes: kw str com num fn
-// op dec prop. Untokenized gaps render as plain text.
+// op dec prop typ. Untokenized gaps render as plain text.
 // ---------------------------------------------------------------------------
 
 const PY_KW = new Set(('False None True and as assert async await break class continue def del elif else except '
@@ -484,6 +489,660 @@ function tokGherkin(text, state, toks) {
   return '';
 }
 
+// Runs `fn` over a slice and re-bases the emitted offsets onto the full line.
+// Used by the HTML tokenizer, which delegates <script>/<style> bodies.
+function tokenizeSub(fn, sub, state, toks, offset) {
+  const tmp = [];
+  const end = fn(sub, state, tmp);
+  for (let i = 0; i < tmp.length; i += 3) toks.push(tmp[i] + offset, tmp[i + 1] + offset, tmp[i + 2]);
+  return end;
+}
+
+const RS_KW = new Set(('as async await break const continue crate dyn else enum extern false fn for if impl '
+  + 'in let loop match mod move mut pub ref return self Self static struct super trait true type union '
+  + 'unsafe use where while yield').split(' '));
+const RS_PRIM = new Set(('bool char str u8 u16 u32 u64 u128 usize i8 i16 i32 i64 i128 isize f32 f64').split(' '));
+const RS_NUM_RE = /^(?:0[xX][0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?)(?:[iuf](?:8|16|32|64|128|size))?/;
+
+// Rust block comments nest, so the open state carries the depth.
+function scanRustBlockComment(text, i, depth) {
+  let j = i;
+  while (j < text.length) {
+    if (text[j] === '/' && text[j + 1] === '*') { depth++; j += 2; continue; }
+    if (text[j] === '*' && text[j + 1] === '/') {
+      depth--;
+      j += 2;
+      if (depth === 0) return { end: j, depth: 0 };
+      continue;
+    }
+    j++;
+  }
+  return { end: text.length, depth };
+}
+
+function tokRust(text, state, toks) {
+  let i = 0;
+  if (state.startsWith('rs:c')) {
+    const res = scanRustBlockComment(text, 0, parseInt(state.slice(4), 10) || 1);
+    toks.push(0, res.end, 'com');
+    if (res.depth > 0) return `rs:c${res.depth}`;
+    i = res.end;
+  } else if (state.startsWith('rs:r')) {
+    const hashes = state.slice(4);
+    const close = text.indexOf(`"${hashes}`);
+    if (close === -1) { toks.push(0, text.length, 'str'); return state; }
+    toks.push(0, close + 1 + hashes.length, 'str');
+    i = close + 1 + hashes.length;
+  }
+  let prevWord = '';
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (ch === '/' && text[i + 1] === '/') { toks.push(i, text.length, 'com'); break; }
+    if (ch === '/' && text[i + 1] === '*') {
+      const res = scanRustBlockComment(text, i + 2, 1);
+      toks.push(i, res.end, 'com');
+      if (res.depth > 0) return `rs:c${res.depth}`;
+      i = res.end; continue;
+    }
+    // Attribute: #[...] or inner #![...]
+    if (ch === '#' && (text[i + 1] === '[' || (text[i + 1] === '!' && text[i + 2] === '['))) {
+      let j = text.indexOf('[', i);
+      let depth = 0;
+      while (j < text.length) {
+        if (text[j] === '[') depth++;
+        else if (text[j] === ']') { depth--; if (depth === 0) { j++; break; } }
+        j++;
+      }
+      toks.push(i, j, 'dec');
+      i = j; prevWord = ''; continue;
+    }
+    // Raw string, optionally byte-prefixed: r"…", r#"…"#, br##"…"##
+    const raw = /^b?r(#*)"/.exec(text.slice(i));
+    if (raw) {
+      const hashes = raw[1];
+      const close = text.indexOf(`"${hashes}`, i + raw[0].length);
+      if (close === -1) { toks.push(i, text.length, 'str'); return `rs:r${hashes}`; }
+      toks.push(i, close + 1 + hashes.length, 'str');
+      i = close + 1 + hashes.length; prevWord = ''; continue;
+    }
+    if (ch === '"' || (ch === 'b' && text[i + 1] === '"')) {
+      const end = scanQuoted(text, ch === 'b' ? i + 1 : i, '"');
+      toks.push(i, end, 'str');
+      i = end; prevWord = ''; continue;
+    }
+    if (ch === "'") {
+      // A lifetime is an identifier NOT closed by a second quote — that tells it
+      // apart from a char literal without look-behind guesswork.
+      const life = /^'[A-Za-z_][A-Za-z0-9_]*/.exec(text.slice(i));
+      if (life && text[i + life[0].length] !== "'") {
+        toks.push(i, i + life[0].length, 'dec');
+        i += life[0].length; prevWord = ''; continue;
+      }
+      const end = scanQuoted(text, i, "'");
+      toks.push(i, end, 'str');
+      i = end; prevWord = ''; continue;
+    }
+    if (isIdentStart(ch)) {
+      const j = readIdent(text, i);
+      const word = text.slice(i, j);
+      // Macro invocation / definition: `println!`, `vec!`, `matches!`
+      if (text[j] === '!' && text[j + 1] !== '=') {
+        toks.push(i, j + 1, 'fn');
+        i = j + 1; prevWord = word; continue;
+      }
+      if (RS_KW.has(word)) toks.push(i, j, 'kw');
+      else if (RS_PRIM.has(word) || /^[A-Z]/.test(word)) toks.push(i, j, 'typ');
+      else if (prevWord === 'fn' || text[j] === '(') toks.push(i, j, 'fn');
+      prevWord = word;
+      i = j; continue;
+    }
+    if (/\d/.test(ch)) {
+      const m = RS_NUM_RE.exec(text.slice(i));
+      if (m) { toks.push(i, i + m[0].length, 'num'); i += m[0].length; prevWord = ''; continue; }
+    }
+    if (/[+\-*/%=<>!&|^~?:;,.()[\]{}@$]/.test(ch)) { toks.push(i, i + 1, 'op'); i++; prevWord = ''; continue; }
+    i++; prevWord = '';
+  }
+  return '';
+}
+
+const CS_KW = new Set(('abstract as async await base bool break byte case catch char checked class const continue '
+  + 'decimal default delegate do double dynamic else enum event explicit extern false finally fixed float for '
+  + 'foreach get goto if implicit in init int interface internal is lock long namespace new null object operator '
+  + 'out override params partial private protected public readonly record ref return sbyte sealed set short '
+  + 'sizeof stackalloc static string struct switch this throw true try typeof uint ulong unchecked unsafe ushort '
+  + 'using value var virtual void volatile when where while with yield').split(' '));
+const CS_PRIM = new Set(('bool byte char decimal double dynamic float int long object sbyte short string uint '
+  + 'ulong ushort var void').split(' '));
+
+// Verbatim string body: only "" escapes, and it may run past the line end.
+function scanCsVerbatim(text, tokStart, scanFrom, toks) {
+  let j = scanFrom;
+  while (j < text.length) {
+    if (text[j] === '"') {
+      if (text[j + 1] === '"') { j += 2; continue; }
+      toks.push(tokStart, j + 1, 'str');
+      return { end: j + 1, open: false };
+    }
+    j++;
+  }
+  toks.push(tokStart, text.length, 'str');
+  return { end: text.length, open: true };
+}
+
+// Interpolated string body: {expr} breaks out of the string colouring, {{ }} do not.
+function scanCsInterp(text, tokStart, scanFrom, toks) {
+  let runStart = tokStart;
+  let j = scanFrom;
+  while (j < text.length) {
+    const c = text[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '"') { toks.push(runStart, j + 1, 'str'); return { end: j + 1, open: false }; }
+    if ((c === '{' && text[j + 1] === '{') || (c === '}' && text[j + 1] === '}')) { j += 2; continue; }
+    if (c === '{') {
+      if (j > runStart) toks.push(runStart, j, 'str');
+      toks.push(j, j + 1, 'op');
+      let depth = 1;
+      let k = j + 1;
+      while (k < text.length && depth > 0) {
+        if (text[k] === '{') depth++;
+        else if (text[k] === '}') depth--;
+        if (depth > 0) k++;
+      }
+      if (k < text.length) { toks.push(k, k + 1, 'op'); j = k + 1; } else j = k;
+      runStart = j;
+      continue;
+    }
+    j++;
+  }
+  if (j > runStart) toks.push(runStart, j, 'str');
+  return { end: j, open: true };
+}
+
+function tokCSharp(text, state, toks) {
+  let i = 0;
+  if (state === 'cs:c') {
+    const close = text.indexOf('*/');
+    if (close === -1) { toks.push(0, text.length, 'com'); return state; }
+    toks.push(0, close + 2, 'com');
+    i = close + 2;
+  } else if (state === 'cs:v') {
+    const res = scanCsVerbatim(text, 0, 0, toks);
+    if (res.open) return 'cs:v';
+    i = res.end;
+  }
+  let prevWord = '';
+  let atLineStart = i === 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (ch === '#' && atLineStart) { toks.push(i, text.length, 'dec'); break; }
+    atLineStart = false;
+    if (ch === '/' && text[i + 1] === '/') { toks.push(i, text.length, 'com'); break; }
+    if (ch === '/' && text[i + 1] === '*') {
+      const close = text.indexOf('*/', i + 2);
+      if (close === -1) { toks.push(i, text.length, 'com'); return 'cs:c'; }
+      toks.push(i, close + 2, 'com');
+      i = close + 2; continue;
+    }
+    // @"…", $"…", $@"…", @$"…"
+    const strM = /^(?:\$@|@\$|@|\$)?"/.exec(text.slice(i));
+    if (strM) {
+      const prefix = strM[0].slice(0, -1);
+      const quoteAt = i + prefix.length;
+      if (prefix.includes('@')) {
+        const res = scanCsVerbatim(text, i, quoteAt + 1, toks);
+        if (res.open) return 'cs:v';
+        i = res.end; prevWord = ''; continue;
+      }
+      if (prefix === '$') {
+        const res = scanCsInterp(text, i, quoteAt + 1, toks);
+        i = res.end; prevWord = ''; continue;
+      }
+      const end = scanQuoted(text, quoteAt, '"');
+      toks.push(i, end, 'str');
+      i = end; prevWord = ''; continue;
+    }
+    if (ch === "'") {
+      const end = scanQuoted(text, i, "'");
+      toks.push(i, end, 'str');
+      i = end; prevWord = ''; continue;
+    }
+    // Attribute list at the start of a statement: [Serializable], [HttpGet("…")]
+    if (ch === '[' && !prevWord) {
+      let depth = 0;
+      let j = i;
+      while (j < text.length) {
+        if (text[j] === '[') depth++;
+        else if (text[j] === ']') { depth--; if (depth === 0) { j++; break; } }
+        j++;
+      }
+      if (depth === 0 && j > i + 1) { toks.push(i, j, 'dec'); i = j; continue; }
+    }
+    if (isIdentStart(ch)) {
+      const j = readIdent(text, i);
+      const word = text.slice(i, j);
+      if (CS_PRIM.has(word)) toks.push(i, j, 'typ');
+      else if (CS_KW.has(word)) toks.push(i, j, 'kw');
+      else if (prevWord === 'class' || prevWord === 'struct' || prevWord === 'interface'
+        || prevWord === 'record' || prevWord === 'enum' || prevWord === 'new') toks.push(i, j, 'typ');
+      else if (text[j] === '(' || text[j] === '<') toks.push(i, j, 'fn');
+      else if (/^[A-Z]/.test(word)) toks.push(i, j, 'typ');
+      prevWord = word;
+      i = j; continue;
+    }
+    if (/\d/.test(ch) || (ch === '.' && /\d/.test(text[i + 1] || ''))) {
+      const m = /^(?:0[xX][0-9a-fA-F_]+|0[bB][01_]+|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?)[uUlLfFdDmM]{0,2}/.exec(text.slice(i));
+      if (m) { toks.push(i, i + m[0].length, 'num'); i += m[0].length; prevWord = ''; continue; }
+    }
+    if (/[+\-*/%=<>!&|^~?:;,.()[\]{}]/.test(ch)) { toks.push(i, i + 1, 'op'); i++; prevWord = ''; continue; }
+    i++; prevWord = '';
+  }
+  return '';
+}
+
+// Attribute run inside an open tag. Returns open:true when the tag continues on
+// the next line, so multi-line tags keep their state.
+function scanHtmlTag(text, i, toks) {
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (ch === '>') { toks.push(i, i + 1, 'kw'); return { end: i + 1, open: false, selfClosed: false }; }
+    if (ch === '/' && text[i + 1] === '>') { toks.push(i, i + 2, 'kw'); return { end: i + 2, open: false, selfClosed: true }; }
+    if (ch === '"' || ch === "'") {
+      const end = scanQuoted(text, i, ch);
+      toks.push(i, end, 'str');
+      i = end; continue;
+    }
+    if (ch === '=') { toks.push(i, i + 1, 'op'); i++; continue; }
+    if (/[\w:@.\-[\]()#*]/.test(ch)) {
+      let j = i;
+      while (j < text.length && /[\w:@.\-[\]()#*]/.test(text[j])) j++;
+      toks.push(i, j, 'prop');
+      i = j; continue;
+    }
+    i++;
+  }
+  return { end: i, open: true, selfClosed: false };
+}
+
+function tokHtml(text, state, toks) {
+  let i = 0;
+  let st = state;
+  for (;;) {
+    if (st === 'h:c') {
+      const close = text.indexOf('-->', i);
+      if (close === -1) { toks.push(i, text.length, 'com'); return 'h:c'; }
+      toks.push(i, close + 3, 'com');
+      i = close + 3; st = '';
+      continue;
+    }
+    if (st.startsWith('h:s:') || st.startsWith('h:y:')) {
+      const isJs = st[2] === 's';
+      const closeTag = isJs ? '</script' : '</style';
+      const idx = text.toLowerCase().indexOf(closeTag, i);
+      const sub = idx === -1 ? text.slice(i) : text.slice(i, idx);
+      const endState = tokenizeSub(isJs ? tokJsLike : tokCss, sub, st.slice(4), toks, i);
+      if (idx === -1) return `${isJs ? 'h:s:' : 'h:y:'}${endState}`;
+      i = idx; st = '';
+      continue;
+    }
+    if (st.startsWith('h:t:')) {
+      const tag = st.slice(4);
+      const res = scanHtmlTag(text, i, toks);
+      i = res.end;
+      if (res.open) return st;
+      if (!res.selfClosed && tag === 'script') { st = 'h:s:'; continue; }
+      if (!res.selfClosed && tag === 'style') { st = 'h:y:'; continue; }
+      st = '';
+      continue;
+    }
+    const lt = text.indexOf('<', i);
+    if (lt === -1) return '';
+    if (text.startsWith('<!--', lt)) { st = 'h:c'; i = lt; continue; }
+    if (text[lt + 1] === '!' || text[lt + 1] === '?') {
+      const gt = text.indexOf('>', lt);
+      const end = gt === -1 ? text.length : gt + 1;
+      toks.push(lt, end, 'dec');
+      i = end; continue;
+    }
+    const m = /^<\/?([a-zA-Z][\w:-]*)/.exec(text.slice(lt));
+    if (!m) { i = lt + 1; continue; }
+    toks.push(lt, lt + m[0].length, 'kw');
+    i = lt + m[0].length;
+    st = text[lt + 1] === '/' ? 'h:t:' : `h:t:${m[1].toLowerCase()}`;
+  }
+}
+
+// CSS state: `css:<comment><at-prelude><stack>`, where the stack records for
+// every open brace whether it holds declarations ('d') or nested rules ('a', the
+// body of @media/@supports/@layer). Without that distinction a selector inside
+// @media would be read as a declaration.
+function tokCss(text, state, toks) {
+  let inComment = false;
+  let atPrelude = false;
+  let stack = '';
+  if (state.startsWith('css:')) {
+    inComment = state[4] === 'c';
+    atPrelude = state[5] === 'a';
+    stack = state.slice(6);
+  }
+  const fin = () => (!inComment && !atPrelude && !stack
+    ? ''
+    : `css:${inComment ? 'c' : '-'}${atPrelude ? 'a' : '-'}${stack}`);
+  const inDecl = () => stack.endsWith('d');
+
+  let i = 0;
+  while (i < text.length) {
+    if (inComment) {
+      const close = text.indexOf('*/', i);
+      if (close === -1) { toks.push(i, text.length, 'com'); return fin(); }
+      toks.push(i, close + 2, 'com');
+      i = close + 2; inComment = false; continue;
+    }
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (ch === '/' && text[i + 1] === '*') { inComment = true; continue; }
+    if (ch === '"' || ch === "'") {
+      const end = scanQuoted(text, i, ch);
+      toks.push(i, end, 'str');
+      i = end; continue;
+    }
+    if (ch === '{') {
+      toks.push(i, i + 1, 'op');
+      stack += atPrelude ? 'a' : 'd';
+      atPrelude = false;
+      i++; continue;
+    }
+    if (ch === '}') {
+      toks.push(i, i + 1, 'op');
+      stack = stack.slice(0, -1);
+      atPrelude = false;
+      i++; continue;
+    }
+    if (ch === ';') { toks.push(i, i + 1, 'op'); atPrelude = false; i++; continue; }
+    if (ch === '@') {
+      const j = readIdent(text, i + 1);
+      toks.push(i, j, 'kw');
+      atPrelude = true;
+      i = j; continue;
+    }
+    if (ch === '!') {
+      const bang = /^!\s*[a-zA-Z]+/.exec(text.slice(i));
+      if (bang) { toks.push(i, i + bang[0].length, 'kw'); i += bang[0].length; continue; }
+    }
+    if (ch === '#' && inDecl() && /^#[0-9a-fA-F]{3,8}(?![\w-])/.test(text.slice(i))) {
+      const m = /^#[0-9a-fA-F]{3,8}/.exec(text.slice(i));
+      toks.push(i, i + m[0].length, 'num');
+      i += m[0].length; continue;
+    }
+    if (/\d/.test(ch) || ((ch === '.' || ch === '-') && /\d/.test(text[i + 1] || ''))) {
+      const m = /^-?(?:\d+\.?\d*|\.\d+)(?:%|[a-zA-Z]{1,4})?/.exec(text.slice(i));
+      if (m) { toks.push(i, i + m[0].length, 'num'); i += m[0].length; continue; }
+    }
+    if (!inDecl()) {
+      if (ch === '[') {
+        const close = text.indexOf(']', i);
+        const end = close === -1 ? text.length : close + 1;
+        toks.push(i, end, 'prop');
+        i = end; continue;
+      }
+      // Media features read as declarations: `(max-width: 900px)`.
+      if (atPrelude && isIdentStart(ch)) {
+        let j = i;
+        while (j < text.length && /[-\w]/.test(text[j])) j++;
+        let k = j;
+        while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
+        if (text[k] === ':') { toks.push(i, j, 'prop'); i = j; continue; }
+      }
+      if (ch === ':' && !/[:\w-]/.test(text[i + 1] || '')) { toks.push(i, i + 1, 'op'); i++; continue; }
+      if (ch === '.' || ch === '#' || ch === ':' || ch === '&' || ch === '*' || isIdentStart(ch)) {
+        let j = i;
+        if (!isIdentStart(ch)) j++;
+        if (ch === ':' && text[j] === ':') j++;
+        while (j < text.length && /[-\w]/.test(text[j])) j++;
+        toks.push(i, j > i ? j : i + 1, 'typ');
+        i = j > i ? j : i + 1; continue;
+      }
+      if (/[,>+~]/.test(ch)) { toks.push(i, i + 1, 'op'); i++; continue; }
+      i++; continue;
+    }
+    if (isIdentStart(ch) || (ch === '-' && /[-\w]/.test(text[i + 1] || ''))) {
+      let j = i;
+      while (j < text.length && /[-\w]/.test(text[j])) j++;
+      let k = j;
+      while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
+      if (text[k] === ':') toks.push(i, j, 'prop');
+      else if (text[j] === '(') toks.push(i, j, 'fn');
+      i = j; continue;
+    }
+    if (/[:,()]/.test(ch)) { toks.push(i, i + 1, 'op'); i++; continue; }
+    i++;
+  }
+  return fin();
+}
+
+const SH_KW = new Set(('if then else elif fi case esac for while until do done in function select time coproc '
+  + 'return break continue local export readonly declare typeset unset shift eval exec exit trap set source '
+  + 'alias unalias').split(' '));
+const SH_BUILTIN = new Set(('echo printf read cd pwd test true false let getopts wait kill jobs umask ulimit '
+  + 'pushd popd dirs mapfile').split(' '));
+
+// $VAR, ${…}, $(…), $@ … Returns the index to resume from.
+function scanShellVar(text, i, toks) {
+  const next = text[i + 1];
+  if (next === '{') {
+    let depth = 1;
+    let j = i + 2;
+    while (j < text.length && depth > 0) {
+      if (text[j] === '{') depth++;
+      else if (text[j] === '}') depth--;
+      j++;
+    }
+    toks.push(i, j, 'prop');
+    return j;
+  }
+  // Command substitution: mark the opener and let the caller tokenize the body.
+  if (next === '(') { toks.push(i, i + 2, 'op'); return i + 2; }
+  if (next && /[A-Za-z_]/.test(next)) {
+    let j = i + 1;
+    while (j < text.length && /\w/.test(text[j])) j++;
+    toks.push(i, j, 'prop');
+    return j;
+  }
+  if (next && '@*#?$!-0123456789'.includes(next)) { toks.push(i, i + 2, 'prop'); return i + 2; }
+  return i + 1;
+}
+
+// Double-quoted body: string runs interrupted by variable expansions.
+function scanShellDouble(text, i, toks) {
+  let j = text[i] === '"' ? i + 1 : i;
+  let runStart = i;
+  while (j < text.length) {
+    const c = text[j];
+    if (c === '\\') { j += 2; continue; }
+    if (c === '"') { toks.push(runStart, j + 1, 'str'); return { end: j + 1, open: false }; }
+    if (c === '$') {
+      if (j > runStart) toks.push(runStart, j, 'str');
+      const nj = scanShellVar(text, j, toks);
+      j = nj > j ? nj : j + 1;
+      runStart = j;
+      continue;
+    }
+    j++;
+  }
+  if (j > runStart) toks.push(runStart, j, 'str');
+  return { end: j, open: true };
+}
+
+function tokShell(text, state, toks) {
+  // Heredoc body: everything is literal until the delimiter line.
+  if (state.startsWith('sh:h:')) {
+    const strip = state[5] === '1';
+    const delim = state.slice(7);
+    if ((strip ? text.trim() : text.trimEnd()) === delim) { toks.push(0, text.length, 'kw'); return ''; }
+    toks.push(0, text.length, 'str');
+    return state;
+  }
+
+  let i = 0;
+  if (state === 'sh:q1') {
+    const close = text.indexOf("'");
+    if (close === -1) { toks.push(0, text.length, 'str'); return state; }
+    toks.push(0, close + 1, 'str');
+    i = close + 1;
+  } else if (state === 'sh:q2') {
+    const res = scanShellDouble(text, 0, toks);
+    if (res.open) return 'sh:q2';
+    i = res.end;
+  }
+
+  let heredoc = null;
+  let atCmdStart = true;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (ch === '#' && (i === 0 || /\s/.test(text[i - 1]))) { toks.push(i, text.length, 'com'); break; }
+    const hd = /^<<-?\s*(['"]?)([A-Za-z_]\w*)\1/.exec(text.slice(i));
+    if (hd) {
+      const strip = text[i + 2] === '-';
+      toks.push(i, i + (strip ? 3 : 2), 'op');
+      const dStart = i + hd[0].indexOf(hd[2]);
+      toks.push(dStart, dStart + hd[2].length, 'str');
+      heredoc = `sh:h:${strip ? '1' : '0'}:${hd[2]}`;
+      i += hd[0].length; atCmdStart = false; continue;
+    }
+    if (ch === "'") {
+      const close = text.indexOf("'", i + 1);
+      if (close === -1) { toks.push(i, text.length, 'str'); return 'sh:q1'; }
+      toks.push(i, close + 1, 'str');
+      i = close + 1; atCmdStart = false; continue;
+    }
+    if (ch === '"') {
+      const res = scanShellDouble(text, i, toks);
+      if (res.open) return 'sh:q2';
+      i = res.end; atCmdStart = false; continue;
+    }
+    if (ch === '`') {
+      toks.push(i, i + 1, 'op');
+      i++; atCmdStart = true; continue;
+    }
+    if (ch === '$') {
+      // `$(` opens a command substitution: the body is a command again.
+      const opensCommand = text[i + 1] === '(';
+      const nj = scanShellVar(text, i, toks);
+      i = nj > i ? nj : i + 1; atCmdStart = opensCommand; continue;
+    }
+    if (isIdentStart(ch)) {
+      const j = readIdent(text, i);
+      const word = text.slice(i, j);
+      if (SH_KW.has(word)) { toks.push(i, j, 'kw'); atCmdStart = true; i = j; continue; }
+      if (text[j] === '=') toks.push(i, j, 'prop');
+      else if (text[j] === '(' || atCmdStart || SH_BUILTIN.has(word)) toks.push(i, j, 'fn');
+      i = j; atCmdStart = false; continue;
+    }
+    if (ch === '-' && /[-\w]/.test(text[i + 1] || '')) {
+      let j = i;
+      while (j < text.length && /[-\w]/.test(text[j])) j++;
+      toks.push(i, j, 'prop');
+      i = j; continue;
+    }
+    if (/\d/.test(ch)) {
+      const m = /^\d+/.exec(text.slice(i));
+      toks.push(i, i + m[0].length, 'num');
+      i += m[0].length; continue;
+    }
+    if (/[|&;()<>=!*?[\]{}]/.test(ch)) {
+      toks.push(i, i + 1, 'op');
+      if (/[|&;(]/.test(ch)) atCmdStart = true;
+      i++; continue;
+    }
+    i++;
+  }
+  return heredoc || '';
+}
+
+const TOML_DATE_RE = /^\d{4}-\d{2}-\d{2}(?:[Tt ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:[Zz]|[+-]\d{2}:\d{2})?)?/;
+const TOML_TIME_RE = /^\d{2}:\d{2}:\d{2}(?:\.\d+)?/;
+const TOML_NUM_RE = /^[+-]?(?:0x[0-9a-fA-F_]+|0o[0-7_]+|0b[01_]+|inf|nan|\d[\d_]*(?:\.[\d_]+)?(?:[eE][+-]?\d+)?)/;
+const TOML_KEY_RE = /^(\s*)((?:[A-Za-z0-9_-]+|"[^"]*"|'[^']*')(?:\s*\.\s*(?:[A-Za-z0-9_-]+|"[^"]*"|'[^']*'))*)(\s*)=/;
+
+function tokToml(text, state, toks) {
+  let i = 0;
+  let continued = false;
+  if (state.startsWith('tm:')) {
+    const fence = state.slice(3);
+    const close = text.indexOf(fence);
+    if (close === -1) { toks.push(0, text.length, 'str'); return state; }
+    toks.push(0, close + fence.length, 'str');
+    i = close + fence.length;
+    continued = true;
+  }
+
+  if (!continued) {
+    const trimmed = text.trimStart();
+    const indent = text.length - trimmed.length;
+    if (trimmed.startsWith('#')) { toks.push(indent, text.length, 'com'); return ''; }
+    if (trimmed.startsWith('[')) {
+      // Table header or array-of-tables header — the whole bracketed run.
+      const close = text.lastIndexOf(']');
+      const end = close === -1 ? text.length : close + 1;
+      toks.push(indent, end, 'kw');
+      i = end;
+    } else {
+      const key = TOML_KEY_RE.exec(text);
+      if (key) {
+        const start = key[1].length;
+        toks.push(start, start + key[2].length, 'prop');
+        const eq = start + key[2].length + key[3].length;
+        toks.push(eq, eq + 1, 'op');
+        i = eq + 1;
+      }
+    }
+  }
+
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === ' ' || ch === '\t') { i++; continue; }
+    if (ch === '#') { toks.push(i, text.length, 'com'); break; }
+    if (text.startsWith('"""', i) || text.startsWith("'''", i)) {
+      const fence = text.slice(i, i + 3);
+      const close = text.indexOf(fence, i + 3);
+      if (close === -1) { toks.push(i, text.length, 'str'); return `tm:${fence}`; }
+      toks.push(i, close + 3, 'str');
+      i = close + 3; continue;
+    }
+    if (ch === '"' || ch === "'") {
+      const end = ch === "'" ? (text.indexOf("'", i + 1) === -1 ? text.length : text.indexOf("'", i + 1) + 1)
+        : scanQuoted(text, i, '"');
+      toks.push(i, end, 'str');
+      i = end; continue;
+    }
+    if (/\d/.test(ch) || ch === '+' || ch === '-') {
+      const date = TOML_DATE_RE.exec(text.slice(i)) || TOML_TIME_RE.exec(text.slice(i));
+      if (date) { toks.push(i, i + date[0].length, 'num'); i += date[0].length; continue; }
+      const num = TOML_NUM_RE.exec(text.slice(i));
+      if (num) { toks.push(i, i + num[0].length, 'num'); i += num[0].length; continue; }
+    }
+    if (isIdentStart(ch)) {
+      const j = readIdent(text, i);
+      const word = text.slice(i, j);
+      if (word === 'true' || word === 'false' || word === 'inf' || word === 'nan') toks.push(i, j, 'kw');
+      else {
+        // Bare key inside an inline table.
+        let k = j;
+        while (k < text.length && (text[k] === ' ' || text[k] === '\t')) k++;
+        if (text[k] === '=') toks.push(i, j, 'prop');
+      }
+      i = j; continue;
+    }
+    if (/[[\]{},.=]/.test(ch)) { toks.push(i, i + 1, 'op'); i++; continue; }
+    i++;
+  }
+  return '';
+}
+
 function tokenizeLine(lang, text, state) {
   const toks = [];
   let end = '';
@@ -495,6 +1154,12 @@ function tokenizeLine(lang, text, state) {
     case 'yaml': end = tokYaml(text, state, toks); break;
     case 'markdown': end = tokMarkdown(text, state, toks); break;
     case 'gherkin': end = tokGherkin(text, state, toks); break;
+    case 'rust': end = tokRust(text, state, toks); break;
+    case 'csharp': end = tokCSharp(text, state, toks); break;
+    case 'html': end = tokHtml(text, state, toks); break;
+    case 'css': end = tokCss(text, state, toks); break;
+    case 'shell': end = tokShell(text, state, toks); break;
+    case 'toml': end = tokToml(text, state, toks); break;
     default: break;
   }
   return { toks, state: end };
@@ -650,6 +1315,7 @@ const STYLE = `
 .tk-op { color: var(--text-2); }
 .tk-dec { color: var(--info); }
 .tk-prop { color: var(--info); }
+.tk-typ { color: color-mix(in srgb, var(--warning) 60%, #ffffff); }
 .fold-pill {
   display: inline-block; margin-left: 8px; padding: 0 7px; font-size: 10px;
   line-height: 15px; vertical-align: 2px; cursor: pointer; user-select: none;
@@ -1056,8 +1722,7 @@ export class TfCodeEditor extends HTMLElement {
 
   _ensureFoldable() {
     if (!this._foldableDirty) return;
-    const lang = this.language;
-    this._foldable = (lang === 'javascript' || lang === 'typescript' || lang === 'json')
+    this._foldable = BRACE_FOLD_LANGS.has(this.language)
       ? computeBraceFolds(this._lines)
       : computeIndentFolds(this._lines, this.tabSize);
     // drop active folds that stopped being foldable (their region changed)
@@ -2185,7 +2850,9 @@ export class TfCodeEditor extends HTMLElement {
       }
       // backtick auto-closes only where template literals exist
       const lang = this.language;
-      const quoteOk = ch === '`' ? (lang === 'javascript' || lang === 'typescript' || lang === 'markdown') : QUOTES.has(ch);
+      const quoteOk = ch === '`'
+        ? (lang === 'javascript' || lang === 'typescript' || lang === 'markdown' || lang === 'shell')
+        : QUOTES.has(ch);
       const closer = PAIRS[ch] || (quoteOk ? ch : null);
       if (closer) {
         if (!posEq(from, to)) {

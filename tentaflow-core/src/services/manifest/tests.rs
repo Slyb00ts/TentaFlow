@@ -18,6 +18,7 @@ use tempfile::TempDir;
 /// Buduje minimalny prawidlowy [Engine] dla testow.
 fn make_engine(id: &str, category: Category) -> Engine {
     Engine {
+        reasoning_levels: None,
         id: id.to_string(),
         backend: None,
         category,
@@ -897,18 +898,13 @@ fn loaded_manifest_engine_ids_unique() {
     assert_eq!(sorted.len(), ids.len(), "Duplikaty engine.id wsrod {ids:?}");
 }
 
-/// E4: REGISTRY zawiera kluczowe silniki LLM (llama-cpp, mlx, vllm, sglang, ollama, tensorrt-llm).
+/// E4: REGISTRY zawiera kluczowe silniki LLM. `tensorrt-llm` swiadomie nie ma na
+/// tej liscie — jego manifest zostal usuniety przy reorganizacji bundle'i
+/// kontenerow, a asercja przetrwala i failowala od tamtej pory.
 #[test]
 fn loaded_manifest_contains_known_llm_engines() {
     let reg = super::registry::registry();
-    for id in &[
-        "llama-cpp",
-        "mlx",
-        "vllm",
-        "sglang",
-        "ollama",
-        "tensorrt-llm",
-    ] {
+    for id in &["llama-cpp", "mlx", "vllm", "sglang", "ollama"] {
         assert!(
             reg.by_id(id).is_some(),
             "Brak silnika '{id}' w embedded manifescie"
@@ -992,8 +988,37 @@ mod capability_axes {
         }
     }
 
+    /// Poziomy rozumowania: preset przesłania silnik, a brak deklaracji NIE spada
+    /// na domyslna wartosc kategorii — model, ktory nic nie mowi, po prostu nie
+    /// wspiera sterowania rozumowaniem, wiec UI nie ma czego zaoferowac.
+    #[test]
+    fn reasoning_levels_fall_from_preset_to_engine_to_nothing() {
+        let mut engine = make_engine("eng", Category::Llm);
+        engine.reasoning_levels = Some(vec!["low".into(), "high".into()]);
+        assert_eq!(
+            engine.effective_reasoning_levels(None),
+            vec!["low".to_string(), "high".to_string()]
+        );
+
+        let mut preset = empty_preset();
+        preset.reasoning_levels = Some(vec!["max".into()]);
+        assert_eq!(
+            engine.effective_reasoning_levels(Some(&preset)),
+            vec!["max".to_string()],
+            "preset przesłania silnik"
+        );
+
+        engine.reasoning_levels = None;
+        preset.reasoning_levels = None;
+        assert!(
+            engine.effective_reasoning_levels(Some(&preset)).is_empty(),
+            "brak deklaracji = brak wsparcia, bez domyslnej kategorii"
+        );
+    }
+
     fn empty_preset() -> ModelPreset {
         ModelPreset {
+            reasoning_levels: None,
             id: "preset".into(),
             display_name: "Preset".into(),
             repo: "x/y".into(),

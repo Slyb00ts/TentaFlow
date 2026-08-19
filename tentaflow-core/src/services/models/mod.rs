@@ -251,7 +251,7 @@ mod tests {
     #[test]
     fn create_alias_with_blank_target_is_unbound() {
         let db = fresh_db();
-        let id = create_alias(&db, "rag-embeddings", "", None, None)
+        let id = create_alias(&db, "fixture-embeddings", "", None, None)
             .expect("blank target must create an unbound alias, not error");
 
         let row = db::repository::get_model_alias(&db, id)
@@ -270,12 +270,12 @@ mod tests {
     #[test]
     fn update_alias_clearing_target_unbinds() {
         let db = fresh_db();
-        let id = create_alias(&db, "rag-llm", "some-model", None, None)
+        let id = create_alias(&db, "fixture-llm", "some-model", None, None)
             .expect("bound alias should be created");
         let row = db::repository::get_model_alias(&db, id).unwrap().unwrap();
         assert!(row.is_active, "freshly bound alias must be active");
 
-        update_alias(&db, id, "rag-llm", "", true, None, None)
+        update_alias(&db, id, "fixture-llm", "", true, None, None)
             .expect("clearing target must succeed");
         let row = db::repository::get_model_alias(&db, id).unwrap().unwrap();
         assert!(

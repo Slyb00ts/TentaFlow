@@ -542,6 +542,12 @@ fn message_content_text(content: &MessageContent) -> String {
                 ContentPart::ImageUrl { image_url } => {
                     format!("[image_url:{}]", image_url.url)
                 }
+                // Audit keeps a MARKER, never the payload: a base64 waveform in
+                // the compliance log is megabytes of noise and, unlike a URL,
+                // says nothing a reviewer can act on.
+                ContentPart::InputAudio { input_audio } => {
+                    format!("[input_audio:{} {}B]", input_audio.format, input_audio.data.len())
+                }
             })
             .collect::<Vec<_>>()
             .join("\n"),
@@ -691,6 +697,9 @@ mod tests {
         let db = db();
         let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: "bielik".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -779,6 +788,9 @@ mod tests {
         let db = db();
         let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: "bielik".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -845,6 +857,9 @@ mod tests {
         let db = db();
         let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: "bielik".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -958,6 +973,9 @@ mod tests {
         let db = db();
         let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: "bielik".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -1048,6 +1066,9 @@ mod tests {
         let db = db();
         let gateway = AiGateway::new(db.clone(), "node-test", true);
         let request = ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: "bielik".to_string(),
             messages: vec![Message {
                 role: "user".to_string(),

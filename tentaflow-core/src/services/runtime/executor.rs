@@ -161,6 +161,15 @@ pub struct IngestRequest {
     pub document_bytes: Vec<u8>,
     pub mime: String,
     pub options: serde_json::Map<String, serde_json::Value>,
+    /// Katalog dla NOWEJ przestrzeni wektorowej — patrz
+    /// `ExecutionContext::vector_home`. Osobne pole, NIE klucz w `options`:
+    /// `options` sa przepisywane wprost do `envelope.meta`, ktore addon moze
+    /// nadpisac, a to jest sciezka tworzenia pliku indeksu na dysku.
+    pub vector_home: Option<std::path::PathBuf>,
+    /// Anulowanie przeprowadzone od wolajacego. `execute_ingest` buduje wlasne
+    /// `FlowRequestMeta`, wiec bez tego pola flow dostawalby SWIEZY token i przebieg
+    /// bylby nieanulowalny — job zatrzymany przez uzytkownika dalej mielilby model.
+    pub cancel_token: Option<tokio_util::sync::CancellationToken>,
     pub flow_depth: u8,
 }
 
@@ -654,9 +663,7 @@ impl ModelRuntimeExecutor {
 
         match target {
             ResolvedExecutionTarget::Local {
-                service_id,
-                handle,
-                ..
+                service_id, handle, ..
             } => match handle {
                 BackendHandle::Embedded { .. } => {
                     let rx = self
@@ -1213,9 +1220,7 @@ impl ModelRuntimeExecutor {
         };
         let mut response = match target {
             ResolvedExecutionTarget::Local {
-                service_id,
-                handle,
-                ..
+                service_id, handle, ..
             } => match handle {
                 BackendHandle::Embedded { .. } => self
                     .local_inference
@@ -2232,6 +2237,9 @@ impl ModelRuntimeExecutor {
              Zwróć WYŁĄCZNIE treść dokumentu, bez komentarza.";
 
         let chat_request = ChatCompletionRequest {
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
             model: request.model.clone(),
             messages: vec![Message {
                 role: "user".to_string(),
@@ -2303,6 +2311,11 @@ impl ModelRuntimeExecutor {
         // (jak parse/embeddings przez catalog), tylko po nazwie `<model>:ingest`.
         // `enter_flow` potrzebuje stabilnego identyfikatora w stosie — używamy
         // nazwy modelu, by self-referencyjny ingest narastał `subflow_depth`.
+        // Bramka wspolbieznosci PRZED wejsciem w guard rekursji: przepustka
+        // trzymana jest przez caly przebieg flow i zwalnia sie przy drop, takze
+        // przy panice.
+        let _permit = crate::services::ingest_gate::acquire().await;
+
         let flow_key = format!("{}:ingest", request.model);
         ctx.enter_flow(&flow_key)
             .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
@@ -4027,6 +4040,10 @@ pub(crate) async fn ingest_request_to_initial_envelope(
     }
     let mut meta =
         crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    meta.vector_home = request.vector_home.clone();
+    if let Some(token) = &request.cancel_token {
+        meta.cancel_token = token.clone();
+    }
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -5133,6 +5150,7 @@ mod tests {
             final_envelope: env,
             trace: vec![],
             usage: crate::flow_engine::envelope::TokenUsage::default(),
+            model: None,
             perf: None,
             finish_reason: crate::flow_engine::envelope::FinishReason::Stop,
             total_latency_ms: 0,
@@ -5559,6 +5577,13 @@ mod tests {
     /// rasteryzacja się powiodła (gdyby pdfium padł, dostalibyśmy `Internal`).
     #[tokio::test]
     async fn execute_documents_pdf_rasterizes_then_resolves_per_page() {
+        // `native-libs/` is built locally and never committed, so a fresh
+        // checkout has no pdfium. Skip with a reason instead of failing on a
+        // missing optional prerequisite.
+        if !crate::services::document::rasterize::pdfium_available() {
+            eprintln!("pomijam: libpdfium niedostepny (zbuduj scripts/native-libs/build-all.sh)");
+            return;
+        }
         let exec = dummy_executor();
         let mut ctx = ExecutionContext::default();
         let err = exec

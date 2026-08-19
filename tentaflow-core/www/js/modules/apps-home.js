@@ -14,6 +14,7 @@ import { byId, escapeHtml } from '/js/utils.js';
 // is filtered out before it ever reaches the DOM, mirroring the backend policy.
 const TILES = [
   { id: 'chat',         route: 'chat',         icon: 'chat' },
+  { id: 'code-studio',  route: 'code-studio',  icon: 'terminal' },
   { id: 'projekty',     route: 'projekty',     icon: 'folder' },
   { id: 'ml-studio',    route: 'ml-studio',    icon: 'brain',        requiresPowerUser: true },
   { id: 'images',       route: 'images',       icon: 'image',        soon: true },
@@ -44,21 +45,26 @@ function renderTile(t) {
 // Nieznana lub nieprawidlowa ikona => 'apps'. Walidacja chroni przed XSS:
 // raw input z manifestu addona NIE moze trafic do sprite() niesprawdzona.
 const ICON_WHITELIST = new Set([
-  'alert', 'apps', 'arrow', 'arrow-out', 'audit', 'ban', 'bar-chart', 'bolt',
-  'brain', 'branch', 'catalog', 'chart-line', 'chat', 'check', 'chevron-down',
+  'alert', 'apps', 'arrow', 'arrow-left', 'arrow-out', 'audit', 'ban',
+  'bar-chart', 'bolt', 'bot', 'brain', 'branch', 'catalog', 'chart-line',
+  'chat', 'check', 'check-circle', 'chevron-down',
   'chevron-left', 'chevron-right', 'chip', 'clock', 'clock-glance', 'close',
   'cloud', 'cluster', 'code', 'collapse', 'copy', 'core', 'cpu', 'cylinder',
   'dashboard', 'database', 'desktop', 'docker', 'download', 'edit',
-  'external-link', 'eye', 'file-text', 'filter', 'flow', 'folder', 'globe',
+  'external-link', 'eye', 'file', 'file-text', 'filter', 'flask', 'flow',
+  'folder', 'git', 'globe',
   'globe-grid', 'gpu', 'grid-rows', 'grip', 'home', 'home-simple', 'host',
   'iface-lan', 'iface-loop', 'iface-tb', 'iface-virt', 'iface-vpn',
-  'iface-wifi', 'image', 'info', 'key', 'line-chart', 'list', 'lock', 'logout',
+  'iface-wifi', 'image', 'info', 'key', 'layers', 'line-chart', 'list', 'lock',
+  'logout',
   'management', 'max', 'meeting', 'message', 'mic', 'min', 'model', 'models',
   'network', 'network-svg', 'os', 'paperclip', 'pause', 'pi', 'pin', 'play',
   'plus', 'prompt', 'puzzle', 'question', 'rag-db', 'ram', 'record',
-  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'search', 'send',
+  'record-dot', 'refresh', 'registry', 'rotate', 'rules', 'save', 'search',
+  'send',
   'services', 'settings', 'share', 'shield', 'sparkle', 'speaker',
-  'speaker-alt', 'star', 'stop', 'transform', 'trash', 'trend', 'unlock',
+  'speaker-alt', 'star', 'stop', 'terminal', 'transform', 'trash', 'trend',
+  'unlock',
   'user', 'users', 'volume', 'workflow-app', 'x', 'zap',
 ]);
 

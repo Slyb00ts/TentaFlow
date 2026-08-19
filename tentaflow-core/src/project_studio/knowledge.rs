@@ -11,7 +11,6 @@ use anyhow::{anyhow, Result};
 
 use super::models::ProjectRecord;
 use super::{ingest, project_db, repository};
-use crate::services::vector::error::VectorError;
 use crate::services::vector::NamespaceManager;
 use tentaflow_sdk_spec::{FieldValue, Filter};
 
@@ -75,11 +74,6 @@ pub fn search(
     top_k: usize,
 ) -> Result<Vec<KnowledgeHit>> {
     let scope = ingest::vector_scope(project_id);
-    let backend = match vectors.get(org_id, &scope, ingest::VECTOR_NAMESPACE) {
-        Ok(b) => b,
-        Err(VectorError::NamespaceNotFound { .. }) => return Ok(Vec::new()),
-        Err(e) => return Err(anyhow!("vector namespace: {e}")),
-    };
     let filter = if source_ids.is_empty() {
         None
     } else {
@@ -102,9 +96,20 @@ pub fn search(
     .iter()
     .map(|s| s.to_string())
     .collect();
-    let raw_hits = backend
-        .search(query_vec, top_k, filter.as_ref(), &output_fields)
-        .map_err(|e| anyhow!("vector search: {e}"))?;
+    // Projekt bez zaingestowanej wiedzy nie ma jeszcze przestrzeni — to pusty
+    // wynik, nie blad (stad `missing_is_empty`).
+    let raw_hits = crate::services::vector::doc_vectors::search_namespace(
+        vectors,
+        org_id,
+        &scope,
+        ingest::VECTOR_NAMESPACE,
+        query_vec,
+        top_k,
+        filter.as_ref(),
+        &output_fields,
+        true,
+    )
+    .map_err(|e| anyhow!("vector search: {e}"))?;
     if raw_hits.is_empty() {
         return Ok(Vec::new());
     }

@@ -498,6 +498,9 @@ pub struct DbAgent {
     /// `notify` (default) enqueues the mailbox + emits the event; `continue`
     /// also starts a fresh parent run with the child result (Ralph-style).
     pub on_child_complete: String,
+    /// Which agents this one may delegate to (§ delegation roster).
+    /// `None` = unrestricted, `Some("[]")` = nobody, `Some(json array)` = only those.
+    pub allowed_agents_json: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -526,6 +529,7 @@ pub struct AgentParams<'a> {
     /// `notify` | `continue` (Harness §3.6 level 3). Validated against the set
     /// in `validate_agent_params`; the column CHECK is the fleet-wide backstop.
     pub on_child_complete: &'a str,
+    pub allowed_agents_json: Option<&'a str>,
     pub actor_user_id: Option<&'a str>,
 }
 
@@ -552,6 +556,11 @@ pub struct DbAgentRun {
     pub exit_reason: Option<String>,
     pub iterations: i64,
     pub total_tokens: i64,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    /// Model the run's last LLM call resolved to. NULL for a run that called
+    /// none, or one settled before the accounting existed.
+    pub model: Option<String>,
     pub run_log: Option<String>,
     pub last_heartbeat_at: Option<String>,
     pub started_at: Option<String>,
@@ -580,6 +589,9 @@ pub struct AgentRunStatusUpdate<'a> {
     pub exit_reason: Option<&'a str>,
     pub iterations: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub model: Option<&'a str>,
     /// True once the run reaches a terminal state, stamping `finished_at`.
     pub set_finished: bool,
     /// True the first time the run enters `running`, stamping `started_at`.

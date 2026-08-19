@@ -23,7 +23,7 @@ use crate::flow_engine::envelope::{
     GenPerf, NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
 use crate::flow_engine::io_mapping;
-use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter};
+use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
 use crate::flow_engine::types::FlowNode;
 
 const MAX_NODES_PER_EXECUTION: usize = 256;
@@ -289,6 +289,7 @@ pub async fn execute_blocking(
         final_envelope,
         trace,
         usage: aggregate_usage,
+        model: ctx.usage_sink.model(),
         perf: None,
         finish_reason,
         total_latency_ms,
@@ -371,6 +372,7 @@ pub async fn execute_direct_blocking(
         final_envelope,
         trace,
         usage: aggregate_usage,
+        model: ctx.usage_sink.model(),
         perf: None,
         finish_reason: FinishReason::Stop,
         total_latency_ms: started.elapsed().as_millis() as i64,
@@ -439,6 +441,7 @@ pub async fn execute_direct_streaming(
         cancel,
         FinalizerInputs {
             started,
+            usage_sink: ctx.usage_sink.clone(),
             producer_step_started,
             producer_node_id: node.id.clone(),
             producer_node_type: node.node_type.clone(),
@@ -712,6 +715,7 @@ async fn run_loop_region(
 ) -> Result<FlowEnvelope> {
     let mut current = seed;
     let mut iterations: u32 = 0;
+    let mut truncated = false;
     // Runtime budget override: agent_context stamps `meta.loop_max_iterations`
     // from the agent's per-definition `max_iterations`, so a single seeded
     // region serves agents with different budgets. It overrides the compile-time
@@ -751,6 +755,15 @@ async fn run_loop_region(
         );
         current = execute_subdag(compiled, adapters, ctx, region, current).await?;
         iterations += 1;
+        // Lepkosc uciecia: znacznik jedzie w envelope, wiec przezywa kolejne
+        // iteracje sam z siebie — ale trzymamy go OBOK, zeby zadna zmiana w ciele
+        // petli nie mogla go po cichu zgubic. Wynik tury nie moze twierdzic, ze
+        // wszystko sie udalo, jesli ktorykolwiek krok zostal uciety w polowie.
+        truncated |= current
+            .meta
+            .get(crate::flow_engine::cache::LLM_TRUNCATED_META)
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         ctx.progress.emit(
             &ctx.progress_scope,
             crate::flow_engine::dispatchers::ProgressEvent::IterationFinished {
@@ -759,9 +772,25 @@ async fn run_loop_region(
             },
         );
 
-        // Structural stop: a final assistant turn WITHOUT tool calls means the
-        // agent answered and the loop is done. This replaces meta.harness_done.
-        if !last_assistant_has_tool_calls(&current) {
+        if region.gated {
+            // A gated region spins over deterministic work (delegate → wait →
+            // judge), where no assistant turn carries tool calls, so the tool
+            // -loop stop would end it after one pass. The `critic_gate` block
+            // inside decides instead, and it is visible and deletable in the
+            // Flow Builder: delete it and the region falls back to the rule
+            // below.
+            let satisfied = current
+                .meta
+                .get(crate::flow_engine::cache::LOOP_SHOULD_EXIT_META)
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            if satisfied {
+                break "gate_satisfied";
+            }
+        } else if !last_assistant_has_tool_calls(&current) {
+            // Structural stop: a final assistant turn WITHOUT tool calls means
+            // the agent answered and the loop is done. This replaces
+            // meta.harness_done.
             break "no_tool_calls";
         }
     };
@@ -816,6 +845,15 @@ async fn run_loop_region(
         "loop_exit_reason".into(),
         serde_json::Value::String(exit_reason.to_string()),
     );
+    // Przepisujemy znacznik z NASZEJ lepkiej flagi, a nie zostawiamy go temu, co
+    // przyniosla ostatnia iteracja: grace-pass `final_pass` wola model jeszcze raz
+    // i jego envelope moze juz nie niesc uciecia z iteracji wczesniejszej.
+    if truncated {
+        current.meta.insert(
+            crate::flow_engine::cache::LLM_TRUNCATED_META.to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
     if exit_reason == "cancelled" {
         if matches!(current.payload, FlowValue::Empty) {
             current.payload = FlowValue::Text(String::new());
@@ -1224,14 +1262,36 @@ async fn stream_llm_member(
         .first()
         .map(|i| (*i.envelope).clone())
         .unwrap_or_else(|| (*ctx.initial_envelope).clone());
+    // Same contract as the blocking adapter: the prompt lives only in the
+    // payload, which the next line overwrites with the answer. Without
+    // persisting it the harness loop loses the user's request after the first
+    // iteration (`LlmNodeAdapter::payload_user_message`).
+    if let Some(user) = crate::flow_engine::node_adapters::llm::LlmNodeAdapter::payload_user_message(
+        &out,
+        &out.context.messages,
+    ) {
+        out.context.messages.push(user);
+    }
     out.payload = FlowValue::Text(content.clone());
     let mut assistant = ChatMessage::assistant(content);
     assistant.reasoning_content = (!reasoning_content.is_empty()).then_some(reasoning_content);
-    let calls = tool_calls.finish();
+    // Streaming reassembles arguments from deltas, so a stream cut by the token
+    // budget ends mid-string exactly like the blocking path — and poisons the
+    // history the same way (`LlmNodeAdapter::sanitize_tool_calls`).
+    let (calls, note) = crate::flow_engine::node_adapters::llm::LlmNodeAdapter::sanitize_tool_calls(
+        tool_calls.finish(),
+        // A stream that ended without saying why is treated as complete; only
+        // an explicit `length` marks the cut that truncates arguments.
+        finish_reason.unwrap_or(FinishReason::Stop),
+    );
     if !calls.is_empty() {
         assistant.tool_calls = Some(calls);
     }
     out.context.messages.push(assistant);
+    if let Some(note) = note {
+        tracing::warn!("{note}");
+        out.context.messages.push(ChatMessage::user(note));
+    }
     Ok(out)
 }
 
@@ -1308,6 +1368,35 @@ fn last_assistant_has_tool_calls(envelope: &FlowEnvelope) -> bool {
 /// wszystkich wywołań.
 const NODE_TIMEOUT_SECS: u64 = 600;
 
+/// Hard ceiling on a budget a block declares for itself. `timeout_secs` is
+/// operator input, and without an upper bound a typo parks an executor slot
+/// for years instead of failing.
+const MAX_NODE_TIMEOUT_SECS: u64 = 86_400;
+
+/// Wall-clock budget of one leaf node.
+///
+/// `NODE_TIMEOUT_SECS` is a FLOOR, not a ceiling. Blocks that own a long,
+/// bounded wait declare it in their own config — `delegate_cli` drives a whole
+/// vendor turn, `ask_user` and `patch_review` wait for a person, `exec_command`
+/// runs a build — and a node killed at 600 s while its own limit said 900
+/// reports a timeout that was never the configured one. The floor stays because
+/// it is what protects every node that declares nothing.
+///
+/// It is `max`, not "the declared value when present", because for some blocks
+/// `timeout_secs` bounds an INNER operation (the command, the question) and the
+/// block still has to settle its run, reap a child and write its rows
+/// afterwards. Taking the inner budget as the outer wall would abort exactly
+/// during that cleanup; a floor can only ever lengthen the wall.
+fn node_timeout(node: &FlowNode) -> std::time::Duration {
+    let declared = node
+        .config
+        .get("timeout_secs")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0)
+        .min(MAX_NODE_TIMEOUT_SECS);
+    std::time::Duration::from_secs(declared.max(NODE_TIMEOUT_SECS))
+}
+
 /// Node'y-kontenery, które ORKIESTRUJĄ wiele iteracji/podflow. Ich wewnętrzne
 /// nody-liście są już indywidualnie limitowane przez `NODE_TIMEOUT_SECS`, więc
 /// nałożenie 600 s na sam kontener błędnie ograniczyłoby CAŁĄ pętlę do 600 s
@@ -1330,23 +1419,25 @@ async fn run_node_with_io_mapping(
     inputs: &[NodeInput],
     ctx: &ExecutionContext,
 ) -> Result<FlowEnvelope> {
-    // Kontenery (loop/subflow/map/spawn) napędzają wiele wewnętrznych nodów,
-    // z których każdy ma własne 600 s — nie limitujemy ich tu, inaczej cała
-    // pętla padłaby po 600 s zamiast po wyczerpaniu `max_iterations`.
+    // Containers (loop/subflow/map/spawn) drive many inner nodes, each with its
+    // own budget — bounding the container here would kill the whole loop at one
+    // node's budget instead of at `max_iterations`.
     if is_container_node_type(node.node_type.as_str()) {
         return run_node_io_inner(adapter, node, inbound, inputs, ctx).await;
     }
 
     let node_id = node.id.clone();
+    let budget = node_timeout(node);
     match tokio::time::timeout(
-        std::time::Duration::from_secs(NODE_TIMEOUT_SECS),
+        budget,
         run_node_io_inner(adapter, node, inbound, inputs, ctx),
     )
     .await
     {
         Ok(res) => res,
         Err(_) => Err(anyhow!(
-            "node '{node_id}' timeout after {NODE_TIMEOUT_SECS}s"
+            "node '{node_id}' timeout after {}s",
+            budget.as_secs()
         )),
     }
 }
@@ -1612,6 +1703,7 @@ pub async fn execute_streaming(
         cancel,
         FinalizerInputs {
             started,
+            usage_sink: ctx.usage_sink.clone(),
             producer_step_started,
             producer_node_id,
             producer_node_type,
@@ -1889,6 +1981,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
                 final_envelope: (*ctx.initial_envelope).clone(),
                 trace,
                 usage: TokenUsage::default(),
+                model: ctx.usage_sink.model(),
                 perf: last_perf,
                 finish_reason: finish,
                 total_latency_ms: started.elapsed().as_millis() as i64,
@@ -2011,6 +2104,7 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
         final_envelope: (*final_arc).clone(),
         trace,
         usage: aggregate_usage,
+        model: ctx.usage_sink.model(),
         perf: last_perf,
         finish_reason,
         total_latency_ms: started.elapsed().as_millis() as i64,
@@ -2022,6 +2116,9 @@ async fn run_region_stream_finalizer(inputs: RegionFinalizerInputs) {
 
 struct FinalizerInputs {
     started: Instant,
+    /// Shared with the executing flow: the finalizer settles the outcome, so it
+    /// is the place that has to name the model the tokens were spent on.
+    usage_sink: Arc<UsageSink>,
     producer_step_started: u64,
     producer_node_id: String,
     producer_node_type: String,
@@ -2145,6 +2242,17 @@ async fn finalize_streaming_flow(
         // przez chain (tts_stream_bridge konsumował) lub został
         // pochłonięty wewnątrz bridge. Brak text_buf do append'u.
     } else {
+        // A turn that records an assistant must also record the user that
+        // prompted it: the prompt lives only in the payload, overwritten on the
+        // next line (`LlmNodeAdapter::payload_user_message`).
+        if let Some(user) =
+            crate::flow_engine::node_adapters::llm::LlmNodeAdapter::payload_user_message(
+                &final_envelope,
+                &final_envelope.context.messages,
+            )
+        {
+            final_envelope.context.messages.push(user);
+        }
         final_envelope.payload = FlowValue::Text(text_buf.clone());
         let mut assistant = ChatMessage::assistant(text_buf);
         assistant.reasoning_content = (!reasoning_buf.is_empty()).then_some(reasoning_buf);
@@ -2212,6 +2320,7 @@ async fn finalize_streaming_flow(
         final_envelope,
         trace: inputs.trace,
         usage: aggregate_usage,
+        model: inputs.usage_sink.model(),
         perf: last_perf,
         finish_reason,
         total_latency_ms,
@@ -3146,34 +3255,59 @@ mod concurrent_executor_tests {
             .expect("exec")
     }
 
+    /// Wall-clock budget of everything that is NOT the sleeping: compiling the
+    /// graph, opening the db, scheduling. Measured rather than guessed, because
+    /// a fixed threshold small enough to prove concurrency on a fast machine is
+    /// a threshold that fails on a loaded one — which is exactly how the
+    /// previous version of these two tests spent its life red without ever
+    /// pointing at a real defect.
+    async fn fanout_overhead(json_zero_sleep: &str) -> Duration {
+        let start = Instant::now();
+        let _ = run_with_db(json_zero_sleep, db()).await;
+        start.elapsed()
+    }
+
     #[tokio::test]
     async fn fanout_branches_run_concurrently_and_combine_waits() {
-        // trigger → a(150ms) + b(150ms) → combine → output.
-        // Sekwencyjnie ~300ms; równolegle ~150ms. Combine widzi oba wyniki
-        // (dowód że czekał na wolniejszą gałąź = bariera).
-        let json = r#"{
+        // trigger → a + b → combine → output. Combine seeing both results is
+        // the proof that it waited for the slower branch (a barrier); the
+        // timing is the proof that the two did not queue behind each other.
+        const SLEEP_MS: u64 = 400;
+        let graph = |ms: u64| {
+            format!(
+                r#"{{
             "nodes":[
-                {"id":"t","type":"trigger","config":{}},
-                {"id":"a","type":"sleep","config":{"sleep_ms":150}},
-                {"id":"b","type":"sleep","config":{"sleep_ms":150}},
-                {"id":"c","type":"combine","config":{}},
-                {"id":"o","type":"output","config":{}}
+                {{"id":"t","type":"trigger","config":{{}}}},
+                {{"id":"a","type":"sleep","config":{{"sleep_ms":{ms}}}}},
+                {{"id":"b","type":"sleep","config":{{"sleep_ms":{ms}}}}},
+                {{"id":"c","type":"combine","config":{{}}}},
+                {{"id":"o","type":"output","config":{{}}}}
             ],
             "edges":[
-                {"from":"t","to":"a","from_port":"text","to_port":"in"},
-                {"from":"t","to":"b","from_port":"text","to_port":"in"},
-                {"from":"a","to":"c","from_port":"full","to_port":"in"},
-                {"from":"b","to":"c","from_port":"full","to_port":"in"},
-                {"from":"c","to":"o","from_port":"full","to_port":"text"}
+                {{"from":"t","to":"a","from_port":"text","to_port":"in"}},
+                {{"from":"t","to":"b","from_port":"text","to_port":"in"}},
+                {{"from":"a","to":"c","from_port":"full","to_port":"in"}},
+                {{"from":"b","to":"c","from_port":"full","to_port":"in"}},
+                {{"from":"c","to":"o","from_port":"full","to_port":"text"}}
             ]
-        }"#;
+        }}"#
+            )
+        };
+
+        let overhead = fanout_overhead(&graph(0)).await;
         let db = db();
         let start = Instant::now();
-        let outcome = run_with_db(json, db).await;
+        let outcome = run_with_db(&graph(SLEEP_MS), db).await;
         let elapsed = start.elapsed();
+
+        // Concurrent ≈ one sleep, sequential ≈ two. Half-way between them is the
+        // only threshold that separates the two answers without also measuring
+        // how busy the machine is.
+        let sleeping = elapsed.saturating_sub(overhead);
         assert!(
-            elapsed < Duration::from_millis(280),
-            "branches must run concurrently, took {elapsed:?}"
+            sleeping < Duration::from_millis(SLEEP_MS + SLEEP_MS / 2),
+            "branches must run concurrently: {sleeping:?} of sleeping for two \
+             {SLEEP_MS}ms branches (overhead {overhead:?}, total {elapsed:?})"
         );
         let text = outcome.final_envelope.payload.as_text().unwrap_or("");
         assert!(text.contains("a"), "combine missing branch a: {text:?}");
@@ -3183,43 +3317,54 @@ mod concurrent_executor_tests {
 
     #[tokio::test]
     async fn five_way_fanout_from_one_node_recombines() {
-        // src → 5 niezależnych gałęzi (80ms) → combine. Dowolny fan-out z
-        // dowolnego noda + zbiórka na końcu.
-        let json = r#"{
-            "nodes":[
-                {"id":"t","type":"trigger","config":{}},
-                {"id":"src","type":"sleep","config":{}},
-                {"id":"n1","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n2","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n3","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n4","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"n5","type":"sleep","config":{"sleep_ms":80}},
-                {"id":"c","type":"combine","config":{}},
-                {"id":"o","type":"output","config":{}}
-            ],
-            "edges":[
-                {"from":"t","to":"src","from_port":"text","to_port":"in"},
-                {"from":"src","to":"n1","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n2","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n3","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n4","from_port":"full","to_port":"in"},
-                {"from":"src","to":"n5","from_port":"full","to_port":"in"},
-                {"from":"n1","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n2","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n3","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n4","to":"c","from_port":"full","to_port":"in"},
-                {"from":"n5","to":"c","from_port":"full","to_port":"in"},
-                {"from":"c","to":"o","from_port":"full","to_port":"text"}
-            ]
-        }"#;
+        // src → five independent branches → combine. Sequentially five sleeps,
+        // concurrently one; the gap is what this measures.
+        const SLEEP_MS: u64 = 300;
+        let graph = |ms: u64| {
+            let branches: Vec<String> = (1..=5)
+                .map(|n| format!(r#"{{"id":"n{n}","type":"sleep","config":{{"sleep_ms":{ms}}}}}"#))
+                .collect();
+            let from_src: Vec<String> = (1..=5)
+                .map(|n| {
+                    format!(r#"{{"from":"src","to":"n{n}","from_port":"full","to_port":"in"}}"#)
+                })
+                .collect();
+            let to_combine: Vec<String> = (1..=5)
+                .map(|n| format!(r#"{{"from":"n{n}","to":"c","from_port":"full","to_port":"in"}}"#))
+                .collect();
+            format!(
+                r#"{{
+                    "nodes":[
+                        {{"id":"t","type":"trigger","config":{{}}}},
+                        {{"id":"src","type":"sleep","config":{{}}}},
+                        {},
+                        {{"id":"c","type":"combine","config":{{}}}},
+                        {{"id":"o","type":"output","config":{{}}}}
+                    ],
+                    "edges":[
+                        {{"from":"t","to":"src","from_port":"text","to_port":"in"}},
+                        {},
+                        {},
+                        {{"from":"c","to":"o","from_port":"full","to_port":"text"}}
+                    ]
+                }}"#,
+                branches.join(",\n                        "),
+                from_src.join(",\n                        "),
+                to_combine.join(",\n                        "),
+            )
+        };
+
+        let overhead = fanout_overhead(&graph(0)).await;
         let db = db();
         let start = Instant::now();
-        let outcome = run_with_db(json, db).await;
+        let outcome = run_with_db(&graph(SLEEP_MS), db).await;
         let elapsed = start.elapsed();
-        // Sekwencyjnie 5×80=400ms; równolegle ~80ms.
+
+        let sleeping = elapsed.saturating_sub(overhead);
         assert!(
-            elapsed < Duration::from_millis(280),
-            "5 branches must run concurrently, took {elapsed:?}"
+            sleeping < Duration::from_millis(SLEEP_MS * 2),
+            "5 branches must run concurrently: {sleeping:?} of sleeping for five \
+             {SLEEP_MS}ms branches (overhead {overhead:?}, total {elapsed:?})"
         );
         let text = outcome.final_envelope.payload.as_text().unwrap_or("");
         for id in ["n1", "n2", "n3", "n4", "n5"] {
@@ -4409,6 +4554,7 @@ mod direct_execution_tests {
     impl LlmDispatcher for FakeBlockingLlm {
         async fn execute_chat(&self, _req: LlmRequest) -> Result<LlmResponse> {
             Ok(LlmResponse {
+                audio: None,
                 content: self.content.clone(),
                 reasoning_content: None,
                 usage: self.usage.clone(),
@@ -4598,5 +4744,70 @@ mod direct_execution_tests {
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
         assert_eq!(outcome.trace.len(), 1);
         assert_eq!(outcome.trace[0].node_type, "llm");
+    }
+}
+
+#[cfg(test)]
+mod node_budget_tests {
+    //! The per-node wall clock. A block that declares its own `timeout_secs`
+    //! has to actually get it: `delegate_cli` accepts up to 86400 s and its own
+    //! approval wait is 600 s on its own, so a hard-coded 600 s node budget
+    //! guaranteed the node died first and reported a limit nobody configured.
+    use super::*;
+    use serde_json::json;
+
+    fn node(config: serde_json::Value) -> FlowNode {
+        FlowNode {
+            id: "n1".into(),
+            node_type: "delegate_cli".into(),
+            config,
+            position: None,
+            label: None,
+            region: None,
+        }
+    }
+
+    #[test]
+    fn a_block_without_its_own_limit_keeps_the_global_floor() {
+        assert_eq!(
+            node_timeout(&node(json!({}))).as_secs(),
+            NODE_TIMEOUT_SECS,
+            "a node that declares nothing must stay protected by the global limit"
+        );
+        // A declared value BELOW the floor never shortens the wall: for several
+        // blocks `timeout_secs` bounds an inner operation, and the block still
+        // has to settle its run afterwards.
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": 5}))).as_secs(),
+            NODE_TIMEOUT_SECS
+        );
+    }
+
+    #[test]
+    fn a_declared_limit_longer_than_the_floor_is_the_one_that_applies() {
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": 900}))).as_secs(),
+            900,
+            "the observed defect: a node configured for 900 s died at 600 s"
+        );
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": 86_400}))).as_secs(),
+            86_400
+        );
+    }
+
+    #[test]
+    fn a_declared_limit_is_capped_and_a_nonsense_one_is_ignored() {
+        assert_eq!(
+            node_timeout(&node(json!({"timeout_secs": u64::MAX}))).as_secs(),
+            MAX_NODE_TIMEOUT_SECS,
+            "config is operator input; without a ceiling a typo parks the slot forever"
+        );
+        for bogus in [json!("900"), json!(-5), json!(null)] {
+            assert_eq!(
+                node_timeout(&node(json!({"timeout_secs": bogus}))).as_secs(),
+                NODE_TIMEOUT_SECS
+            );
+        }
     }
 }

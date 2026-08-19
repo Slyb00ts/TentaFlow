@@ -17,6 +17,7 @@ use super::models::{
     NewWorkspace, SagaStepRecord, SagaStepStatus, WorkspaceMemberRecord, WorkspaceRecord,
     WorkspaceRole, WorkspaceStatus,
 };
+use super::{paths, pep, sync_capture, workspace_db};
 use crate::db::DbPool;
 
 fn read_err(e: impl std::fmt::Display) -> anyhow::Error {
@@ -31,6 +32,40 @@ const WORKSPACE_COLS: &str = "id, org_id, owner_user_id, name, slug, node_id, ex
      container_image, egress_enforcement, repo_kind, repo_url, repo_auth_kind, secret_ref, \
      ssh_host_fingerprint, default_branch, target_branch, autonomy_ceiling, egress_policy, \
      index_enabled, quota_disk_bytes, quota_sessions, status, status_detail, created_at, updated_at";
+
+/// Programs a new workspace may run under `core.exec` without asking anyone.
+///
+/// Without a seed the table starts empty, and an empty allowlist makes the
+/// `autonomous` mode ask about `pwd` — a mode that asks about everything is a
+/// mode nobody uses. The line is drawn where Codex draws it (`is_safe_command`)
+/// and then pulled TIGHTER, because our grant grammar and its check are not the
+/// same shape: `pep::Target::Program` names argv[0] and nothing else, so a
+/// pattern cannot say "this program with these arguments". Only the programs
+/// Codex treats as safe REGARDLESS of their arguments can be expressed here at
+/// all.
+///
+/// Everything Codex admits conditionally is therefore absent, and each absence
+/// is an argument that cannot be checked:
+///   * `git` — safe for `status|log|diff|show|branch`, and a seeded `git` would
+///     equally cover `git push`. Git belongs to the broker anyway (§11.1);
+///   * `find` — `-exec`, `-delete` and `-fprintf` execute and write;
+///   * `rg` — `--pre` runs a command per match;
+///   * `base64` — `-o` writes a file;
+///   * `sed` — safe only in the exact shape `sed -n <N,M>p`.
+///
+/// `cd` is absent for a different reason: `core.exec` runs an argv through
+/// `execve`, where `cd` is a shell builtin and not a program. A command's
+/// directory is `ExecRequest::cwd_rel`, so seeding it would grant nothing.
+///
+/// Nothing here writes, and nothing here opens a socket. An operator who wants
+/// more adds it as a standing grant from the workspace's permission list
+/// (`add_allowlist_entry`), which is the same table this seeds — so widening is
+/// a recorded, revocable admin decision rather than an edit to this list.
+const DEFAULT_EXEC_ALLOWLIST: &[&str] = &[
+    "cat", "cut", "echo", "expr", "false", "grep", "head", "id", "ls", "nl", "numfmt", "paste",
+    "pwd", "rev", "seq", "stat", "tac", "tail", "tr", "true", "uname", "uniq", "wc", "which",
+    "whoami",
+];
 
 fn read_workspace(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkspaceRecord> {
     Ok(WorkspaceRecord {
@@ -110,6 +145,20 @@ pub fn create_workspace(db: &DbPool, new: &NewWorkspace) -> Result<WorkspaceReco
         params![new.id, new.owner_user_id],
     )
     .map_err(write_err)?;
+    for program in DEFAULT_EXEC_ALLOWLIST {
+        tx.execute(
+            "INSERT INTO code_workspace_allowlist \
+               (workspace_id, capability, pattern, created_by, created_at) \
+             VALUES (?1, 'exec', ?2, ?3, datetime('now'))",
+            params![new.id, program, new.owner_user_id],
+        )
+        .map_err(write_err)?;
+        sync_capture::capture_allowlist_entry(&tx, &new.id, "exec", program)?;
+    }
+    // Both rows and both captures commit together: the org must never see a
+    // workspace whose owner membership did not travel with it.
+    sync_capture::capture_workspace(&tx, &new.id)?;
+    sync_capture::capture_member(&tx, &new.id, &new.owner_user_id)?;
     tx.commit().map_err(write_err)?;
     drop(conn);
 
@@ -199,8 +248,9 @@ pub fn set_status(
     status: WorkspaceStatus,
     detail: Option<&str>,
 ) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
-    let changed = conn
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let changed = tx
         .execute(
             "UPDATE code_workspaces SET status = ?2, status_detail = ?3, \
              updated_at = datetime('now') WHERE id = ?1",
@@ -218,6 +268,10 @@ pub fn set_status(
     if changed == 0 {
         return Err(anyhow!("workspace not found"));
     }
+    // The status is what a node that cannot run the workspace shows instead of
+    // it, so 'error' and 'archived' have to reach the whole org.
+    sync_capture::capture_workspace(&tx, workspace_id)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
 }
 
@@ -230,13 +284,16 @@ pub fn set_branches(
     default_branch: &str,
     target_branch: &str,
 ) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
-    conn.execute(
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    tx.execute(
         "UPDATE code_workspaces SET default_branch = ?2, target_branch = ?3, \
          updated_at = datetime('now') WHERE id = ?1",
         params![workspace_id, default_branch, target_branch],
     )
     .map_err(write_err)?;
+    sync_capture::capture_workspace(&tx, workspace_id)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
 }
 
@@ -286,14 +343,17 @@ pub fn upsert_member(
     role: WorkspaceRole,
     added_by: &str,
 ) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
-    conn.execute(
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    tx.execute(
         "INSERT INTO code_workspace_members (workspace_id, user_id, role, added_by, added_at) \
          VALUES (?1, ?2, ?3, ?4, datetime('now')) \
          ON CONFLICT(workspace_id, user_id) DO UPDATE SET role = excluded.role",
         params![workspace_id, user_id, role.slug(), added_by],
     )
     .map_err(write_err)?;
+    sync_capture::capture_member(&tx, workspace_id, user_id)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
 }
 
@@ -327,6 +387,9 @@ pub fn remove_member(db: &DbPool, workspace_id: &str, user_id: &str) -> Result<(
         params![workspace_id, user_id],
     )
     .map_err(write_err)?;
+    // A removal replicates as a tombstone; without it a stale grant still in
+    // flight would put the member back on the other nodes.
+    sync_capture::capture_member(&tx, workspace_id, user_id)?;
     tx.commit().map_err(write_err)?;
     Ok(())
 }
@@ -347,24 +410,171 @@ pub fn may_create_workspace(db: &DbPool, org_id: &str, user_id: &str) -> Result<
 }
 
 pub fn grant_creator(db: &DbPool, org_id: &str, user_id: &str, granted_by: &str) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
-    conn.execute(
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    tx.execute(
         "INSERT OR IGNORE INTO code_workspace_creator_grants (org_id, user_id, granted_by, created_at) \
          VALUES (?1, ?2, ?3, datetime('now'))",
         params![org_id, user_id, granted_by],
     )
     .map_err(write_err)?;
+    // The grant is what lets a user create a workspace AT ALL, so it has to
+    // reach the node they happen to be sitting at.
+    sync_capture::capture_creator_grant(&tx, org_id, user_id)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
 }
 
 pub fn revoke_creator(db: &DbPool, org_id: &str, user_id: &str) -> Result<()> {
-    let conn = db.write().map_err(write_err)?;
-    conn.execute(
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    tx.execute(
         "DELETE FROM code_workspace_creator_grants WHERE org_id = ?1 AND user_id = ?2",
         params![org_id, user_id],
     )
     .map_err(write_err)?;
+    sync_capture::capture_creator_grant(&tx, org_id, user_id)?;
+    tx.commit().map_err(write_err)?;
     Ok(())
+}
+
+// =============================================================================
+// Standing capability grants (§9.1)
+// =============================================================================
+
+/// Settings an administrator edits after the workspace exists (§25.4).
+///
+/// It lives here rather than in the handler because every registry write has to
+/// capture for the sync ledger in its own transaction: a workspace whose
+/// settings changed on one node and nowhere else is precisely the failure the
+/// ledger exists to prevent.
+#[allow(clippy::too_many_arguments)]
+pub fn set_settings(
+    db: &DbPool,
+    workspace_id: &str,
+    name: &str,
+    autonomy_ceiling: &str,
+    egress_policy: &str,
+    target_branch: Option<&str>,
+    index_enabled: bool,
+    quota_disk_bytes: Option<i64>,
+    quota_sessions: Option<i64>,
+) -> Result<()> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let changed = tx
+        .execute(
+            "UPDATE code_workspaces SET name = ?2, autonomy_ceiling = ?3, egress_policy = ?4, \
+              target_branch = ?5, index_enabled = ?6, quota_disk_bytes = ?7, \
+              quota_sessions = ?8, updated_at = datetime('now') WHERE id = ?1",
+            params![
+                workspace_id,
+                name,
+                autonomy_ceiling,
+                egress_policy,
+                target_branch,
+                i64::from(index_enabled),
+                quota_disk_bytes,
+                quota_sessions,
+            ],
+        )
+        .map_err(write_err)?;
+    if changed == 0 {
+        return Err(anyhow!("workspace not found"));
+    }
+    sync_capture::capture_workspace(&tx, workspace_id)?;
+    tx.commit().map_err(write_err)?;
+
+    // The registry column DECLARES the allowance; the node holding the bytes
+    // enforces the RESERVATION, and the filesystem layer reads only the latter
+    // (§13.5, `workspace_db::disk_quota`). Refreshing it at the next session
+    // open would leave the old number enforced until then — a raised quota that
+    // does not take effect and a lowered one that is not applied are both wrong
+    // — so the declaration and the reservation move together.
+    //
+    // A node that does not host this workspace has no reservation to refresh:
+    // `workspace_db::open` refuses a directory that was never provisioned, and
+    // materialising one here would fake a runtime database for a workspace that
+    // lives elsewhere.
+    if paths::workspace_dir(workspace_id).is_ok_and(|dir| dir.is_dir()) {
+        let pool = workspace_db::open(workspace_id)?;
+        workspace_db::set_disk_quota(&pool, quota_disk_bytes)?;
+    }
+    Ok(())
+}
+
+/// Records which kind of credential the repository uses and the handle to it.
+///
+/// `secret_ref` replicates as a HANDLE and the material never does: the secret
+/// is sealed with a per-node key and belongs on the node that runs git (§5.2).
+pub fn set_repo_auth(
+    db: &DbPool,
+    workspace_id: &str,
+    repo_auth_kind: &str,
+    ssh_host_fingerprint: Option<&str>,
+) -> Result<()> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    tx.execute(
+        "UPDATE code_workspaces SET repo_auth_kind = ?2, ssh_host_fingerprint = ?3, \
+         updated_at = datetime('now') WHERE id = ?1",
+        params![workspace_id, repo_auth_kind, ssh_host_fingerprint],
+    )
+    .map_err(write_err)?;
+    sync_capture::capture_workspace(&tx, workspace_id)?;
+    tx.commit().map_err(write_err)?;
+    Ok(())
+}
+
+/// Adds a standing `always` grant. Identity is the (workspace, capability,
+/// pattern) triple — the table's AUTOINCREMENT `id` is node-local and plays no
+/// part in either the lookup or the replication.
+pub fn add_allowlist_entry(
+    db: &DbPool,
+    workspace_id: &str,
+    capability: &str,
+    pattern: &str,
+    created_by: &str,
+) -> Result<()> {
+    // The durable choke point for every standing grant, so the pattern rule is
+    // enforced here and not only in the handlers that happen to call it.
+    pep::validate_grant_pattern(pattern).map_err(|e| anyhow!("{e}"))?;
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    tx.execute(
+        "INSERT INTO code_workspace_allowlist \
+           (workspace_id, capability, pattern, created_by, created_at) \
+         VALUES (?1, ?2, ?3, ?4, datetime('now')) \
+         ON CONFLICT(workspace_id, capability, pattern) DO NOTHING",
+        params![workspace_id, capability, pattern, created_by],
+    )
+    .map_err(write_err)?;
+    sync_capture::capture_allowlist_entry(&tx, workspace_id, capability, pattern)?;
+    tx.commit().map_err(write_err)?;
+    Ok(())
+}
+
+/// Withdraws a standing grant. Returns true when a row was removed.
+pub fn remove_allowlist_entry(
+    db: &DbPool,
+    workspace_id: &str,
+    capability: &str,
+    pattern: &str,
+) -> Result<bool> {
+    let mut conn = db.write().map_err(write_err)?;
+    let tx = conn.transaction().map_err(write_err)?;
+    let removed = tx
+        .execute(
+            "DELETE FROM code_workspace_allowlist \
+             WHERE workspace_id = ?1 AND capability = ?2 AND pattern = ?3",
+            params![workspace_id, capability, pattern],
+        )
+        .map_err(write_err)?;
+    // Withdrawing a standing permission must replicate as a tombstone, or a node
+    // that still holds the older grant keeps executing on it.
+    sync_capture::capture_allowlist_entry(&tx, workspace_id, capability, pattern)?;
+    tx.commit().map_err(write_err)?;
+    Ok(removed > 0)
 }
 
 // =============================================================================
@@ -607,6 +817,273 @@ mod tests {
             "a retried step must not append a second row"
         );
         assert!(step_is_done(&db, "ws-1", "clone").unwrap());
+    }
+
+    /// Latest core capture for a resource, as (action, fields). Empty means the
+    /// write never reached the outbox — the registry would be node-local again.
+    fn latest_capture(
+        db: &DbPool,
+        resource_type: &str,
+        resource_id: &str,
+    ) -> Option<(
+        String,
+        std::collections::BTreeMap<String, crate::sync::ledger::FieldValue>,
+    )> {
+        let conn = db.read().expect("db");
+        conn.query_row(
+            "SELECT action, changed_fields_blob FROM __tentaflow_core_sync_captures \
+             WHERE resource_type = ?1 AND resource_id = ?2 \
+             ORDER BY hlc_wall DESC, hlc_logical DESC LIMIT 1",
+            params![resource_type, resource_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        )
+        .optional()
+        .expect("capture query")
+        .map(|(action, blob)| (action, crate::sync::ledger::decode(&blob).unwrap()))
+    }
+
+    fn text_field(
+        fields: &std::collections::BTreeMap<String, crate::sync::ledger::FieldValue>,
+        key: &str,
+    ) -> Option<String> {
+        match fields.get(key) {
+            Some(crate::sync::ledger::FieldValue::String(value)) => Some(value.clone()),
+            _ => None,
+        }
+    }
+
+    #[test]
+    fn a_new_workspace_and_its_owner_membership_both_reach_the_outbox() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+
+        let (action, fields) =
+            latest_capture(&db, "core.code_workspace", "ws-1").expect("workspace capture");
+        assert_eq!(action, "insert");
+        // The owner node travels with the row — that is what makes `is_local`
+        // answerable on a node that did not create the workspace.
+        assert_eq!(text_field(&fields, "node_id").as_deref(), Some("dev-ryzen"));
+        assert_eq!(text_field(&fields, "org_id").as_deref(), Some("org-1"));
+        assert_eq!(
+            text_field(&fields, "status").as_deref(),
+            Some("provisioning")
+        );
+
+        let member_id = crate::sync::resource_id::composite_resource_id(&["ws-1", "u-owner"]);
+        let (action, fields) =
+            latest_capture(&db, "core.code_workspace_member", &member_id).expect("member capture");
+        assert_eq!(action, "insert");
+        assert_eq!(text_field(&fields, "role").as_deref(), Some("owner"));
+    }
+
+    #[test]
+    fn a_status_change_replicates_the_whole_row() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        set_status(&db, "ws-1", WorkspaceStatus::Error, Some("clone refused")).unwrap();
+
+        let (action, fields) =
+            latest_capture(&db, "core.code_workspace", "ws-1").expect("status capture");
+        assert_eq!(action, "insert", "a status change ships the full row");
+        assert_eq!(text_field(&fields, "status").as_deref(), Some("error"));
+        assert_eq!(
+            text_field(&fields, "status_detail").as_deref(),
+            Some("clone refused")
+        );
+    }
+
+    #[test]
+    fn a_removed_member_and_a_revoked_grant_replicate_as_tombstones() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        upsert_member(&db, "ws-1", "u-dev", WorkspaceRole::Editor, "u-owner").unwrap();
+        remove_member(&db, "ws-1", "u-dev").unwrap();
+
+        let member_id = crate::sync::resource_id::composite_resource_id(&["ws-1", "u-dev"]);
+        let (action, _) =
+            latest_capture(&db, "core.code_workspace_member", &member_id).expect("capture");
+        assert_eq!(
+            action, "delete",
+            "a removal must not be undone by an older grant"
+        );
+
+        grant_creator(&db, "org-1", "u-dev", "u-admin").unwrap();
+        revoke_creator(&db, "org-1", "u-dev").unwrap();
+        let grant_id = crate::sync::resource_id::composite_resource_id(&["org-1", "u-dev"]);
+        let (action, _) =
+            latest_capture(&db, "core.code_workspace_creator_grant", &grant_id).expect("capture");
+        assert_eq!(action, "delete");
+    }
+
+    #[test]
+    fn an_allowlist_entry_is_replicated_by_its_triple_not_by_its_rowid() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        add_allowlist_entry(&db, "ws-1", "net_egress", "api.example.com", "u-owner").unwrap();
+
+        let rowid: i64 = {
+            let conn = db.read().expect("db");
+            conn.query_row(
+                "SELECT id FROM code_workspace_allowlist \
+                 WHERE workspace_id = 'ws-1' AND capability = 'net_egress'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("row")
+        };
+        let resource_id = crate::sync::resource_id::composite_resource_id(&[
+            "ws-1",
+            "net_egress",
+            "api.example.com",
+        ]);
+        let (action, fields) = latest_capture(&db, "core.code_workspace_allowlist", &resource_id)
+            .expect("allowlist capture");
+        assert_eq!(action, "insert");
+        assert!(
+            latest_capture(&db, "core.code_workspace_allowlist", &rowid.to_string()).is_none(),
+            "the node-local AUTOINCREMENT id must never be the replicated identity"
+        );
+        assert_eq!(
+            text_field(&fields, "pattern").as_deref(),
+            Some("api.example.com")
+        );
+
+        assert!(remove_allowlist_entry(&db, "ws-1", "net_egress", "api.example.com").unwrap());
+        let (action, _) = latest_capture(&db, "core.code_workspace_allowlist", &resource_id)
+            .expect("removal capture");
+        assert_eq!(action, "delete");
+    }
+
+    /// A new workspace starts with the read-only programs already permitted, or
+    /// `autonomous` asks about `pwd` and is unusable. What it must NOT start
+    /// with is anything that writes, reaches the network, or whose safety
+    /// depends on arguments the grant grammar cannot see.
+    #[test]
+    fn a_new_workspace_starts_with_read_only_programs_permitted_and_nothing_else() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+
+        let seeded: Vec<(String, String)> = {
+            let conn = db.read().expect("db");
+            let mut stmt = conn
+                .prepare("SELECT capability, pattern FROM code_workspace_allowlist WHERE workspace_id = 'ws-1'")
+                .unwrap();
+            let rows = stmt
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap();
+            rows.collect::<rusqlite::Result<Vec<_>>>().unwrap()
+        };
+
+        assert!(
+            seeded.iter().all(|(cap, _)| cap == "exec"),
+            "only `exec` may be seeded: no standing grant is created for writes or the network"
+        );
+        let programs: Vec<&str> = seeded.iter().map(|(_, p)| p.as_str()).collect();
+        for expected in ["ls", "cat", "grep", "wc", "pwd"] {
+            assert!(programs.contains(&expected), "{expected} is not permitted");
+        }
+        // Every one of these is either a writer, a network client, or safe only
+        // for arguments a `Target::Program` pattern cannot constrain.
+        for refused in [
+            "git", "rg", "find", "sed", "base64", "sh", "bash", "cargo", "npm", "curl", "rm", "mv",
+            "*",
+        ] {
+            assert!(
+                !programs.contains(&refused),
+                "{refused} must not be permitted without a person deciding it"
+            );
+        }
+
+        // The seed replicates like any other standing grant, so a second node of
+        // the org sees the same permissions.
+        let resource_id = crate::sync::resource_id::composite_resource_id(&["ws-1", "exec", "ls"]);
+        let (action, fields) = latest_capture(&db, "core.code_workspace_allowlist", &resource_id)
+            .expect("the seeded grant must reach the outbox");
+        assert_eq!(action, "insert");
+        assert_eq!(text_field(&fields, "capability").as_deref(), Some("exec"));
+
+        // And it is a normal row: an operator can withdraw it.
+        assert!(remove_allowlist_entry(&db, "ws-1", "exec", "ls").unwrap());
+    }
+
+    #[test]
+    fn the_vault_never_reaches_the_outbox() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        let conn = db.read().expect("db");
+        let leaked: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM __tentaflow_core_sync_captures \
+                 WHERE table_name IN ('code_workspace_secrets', 'code_agent_credentials', \
+                                      'session_assertion_jti', 'code_workspace_saga_steps')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count");
+        assert_eq!(leaked, 0);
+    }
+
+    /// §13.5: the registry DECLARES the allowance, the owner node RESERVES it,
+    /// and the filesystem layer enforces only the reservation. A change that
+    /// stopped at the registry left the old number in force until somebody
+    /// opened a session — so a raised quota did not raise anything, and the
+    /// operator had no way to tell.
+    #[test]
+    fn a_changed_quota_reaches_the_reservation_that_actually_enforces_it() {
+        let _guard = crate::code_studio::paths::test_data_dir_guard();
+        let data = tempfile::tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        std::fs::create_dir_all(crate::code_studio::paths::workspace_dir("ws-1").unwrap())
+            .expect("workspace layout");
+        let pool = workspace_db::open("ws-1").expect("workspace.db");
+        workspace_db::set_disk_quota(&pool, Some(1_000)).unwrap();
+
+        let raise = |bytes: Option<i64>| {
+            set_settings(
+                &db,
+                "ws-1",
+                "TentaFlow Core",
+                "normal",
+                "org_approved",
+                None,
+                false,
+                bytes,
+                None,
+            )
+            .unwrap();
+        };
+
+        raise(Some(8_000));
+        assert_eq!(
+            workspace_db::disk_quota("ws-1").unwrap(),
+            Some(8_000),
+            "the file layer still enforces the quota the workspace had before"
+        );
+        // Lowering lands the same way; the reservation follows the declaration
+        // in both directions.
+        raise(Some(2_000));
+        assert_eq!(workspace_db::disk_quota("ws-1").unwrap(), Some(2_000));
+        raise(None);
+        assert_eq!(workspace_db::disk_quota("ws-1").unwrap(), None);
+
+        workspace_db::close("ws-1");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// A pattern the matcher gives no reading to is refused where it would be
+    /// stored, not quietly kept for a later reader to interpret.
+    #[test]
+    fn a_standing_grant_needs_a_pattern_that_means_something() {
+        let (_dir, db) = test_db();
+        create_workspace(&db, &sample("ws-1", "u-owner")).unwrap();
+        assert!(add_allowlist_entry(&db, "ws-1", "exec", "", "u-owner").is_err());
+        assert!(add_allowlist_entry(&db, "ws-1", "exec", "cargo\u{7}", "u-owner").is_err());
+        assert!(add_allowlist_entry(&db, "ws-1", "exec", "*", "u-owner").is_ok());
     }
 
     #[test]

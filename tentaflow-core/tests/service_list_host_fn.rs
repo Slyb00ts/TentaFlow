@@ -36,6 +36,8 @@ fn svc(id: i64, node: &str, name: &str, kind: &str, status: &str) -> ServiceInfo
         deployment_progress_pct: 0,
         progress_message: None,
         update_available: false,
+        usage_json: None,
+        usage_updated_at: None,
         models: Vec::new(),
         created_at: "2026-01-01 00:00:00".into(),
         updated_at: "2026-01-01 00:00:00".into(),

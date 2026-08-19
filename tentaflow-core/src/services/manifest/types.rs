@@ -90,6 +90,14 @@ pub struct Engine {
     /// is rejected by validation.
     #[serde(default)]
     pub input_modalities: Option<Vec<String>>,
+    /// Poziomy rozumowania, ktore ten model przyjmuje (`["low","medium","high"]`,
+    /// czasem `xhigh` / `max`). `None` albo pusta lista = model NIE wspiera
+    /// sterowania rozumowaniem — i to jest uczciwa wartosc domyslna, bo wiekszosc
+    /// modeli go nie ma. Swiadomie BEZ domyslnej wartosci per kategoria: zestaw
+    /// poziomow jest wlasnoscia konkretnego modelu, nie rodzaju uslugi.
+    #[serde(default)]
+    pub reasoning_levels: Option<Vec<String>>,
+
     /// Optional output modality list (`["text", "audio", "embedding",
     /// "image"]`). Same fallback rules as the input list.
     #[serde(default)]
@@ -374,6 +382,16 @@ impl Engine {
             .collect()
     }
 
+    /// Poziomy rozumowania modelu: preset > silnik > BRAK. Ostatni stopien celowo
+    /// nie ma domyslnej wartosci kategorii — nie zgadujemy, ze model cokolwiek
+    /// wspiera, bo UI oferowaloby wtedy ustawienie, ktore backend odrzuci.
+    pub fn effective_reasoning_levels(&self, preset: Option<&ModelPreset>) -> Vec<String> {
+        if let Some(list) = preset.and_then(|p| p.reasoning_levels.as_ref()) {
+            return list.clone();
+        }
+        self.reasoning_levels.clone().unwrap_or_default()
+    }
+
     pub fn effective_input_modalities(&self, preset: Option<&ModelPreset>) -> Vec<String> {
         if let Some(p) = preset {
             if let Some(list) = p.input_modalities.as_ref() {
@@ -624,6 +642,14 @@ pub struct ModelPreset {
     pub service_surfaces: Option<Vec<String>>,
     #[serde(default)]
     pub input_modalities: Option<Vec<String>>,
+    /// Poziomy rozumowania, ktore ten model przyjmuje (`["low","medium","high"]`,
+    /// czasem `xhigh` / `max`). `None` albo pusta lista = model NIE wspiera
+    /// sterowania rozumowaniem — i to jest uczciwa wartosc domyslna, bo wiekszosc
+    /// modeli go nie ma. Swiadomie BEZ domyslnej wartosci per kategoria: zestaw
+    /// poziomow jest wlasnoscia konkretnego modelu, nie rodzaju uslugi.
+    #[serde(default)]
+    pub reasoning_levels: Option<Vec<String>>,
+
     #[serde(default)]
     pub output_modalities: Option<Vec<String>>,
     /// HF repo for the matched draft / speculator model used in vLLM

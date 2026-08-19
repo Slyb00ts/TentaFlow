@@ -55,6 +55,7 @@ pub fn flow_outcome_to_chat_response(
         choices: vec![Choice {
             index: 0,
             message: Message {
+                audio: None,
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(content.into_owned())),
                 reasoning_content,
@@ -214,6 +215,7 @@ mod tests {
                 completion_tokens: 5,
                 total_tokens: 15,
             },
+            model: None,
             perf: None,
             finish_reason: finish,
             total_latency_ms: 42,

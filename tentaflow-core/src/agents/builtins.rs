@@ -56,6 +56,63 @@ pub enum CoreToolName {
     /// minted at spawn, so the model can never redirect output to another
     /// project. Async path (per-call membership + editor re-check).
     CaseSave,
+
+    // --- Code Studio (§10). The complete verb set of a coding agent: every
+    // one of these binds its session server-side through
+    // `envelope.meta["code_session"]` (never a model argument), passes
+    // `code_studio::pep::authorize` and journals a `session_operations` row.
+    /// `core.fs_read` — read one file of the session worktree.
+    FsRead,
+    /// `core.fs_list` — list one directory of the session worktree.
+    FsList,
+    /// `core.fs_glob` — match worktree paths against a glob pattern.
+    FsGlob,
+    /// `core.fs_grep` — regex search over worktree file contents.
+    FsGrep,
+    /// `core.fs_write` — write a whole file (CAS precondition).
+    FsWrite,
+    /// `core.fs_edit` — replace one unambiguous literal occurrence in a file.
+    FsEdit,
+    /// `core.fs_move` — rename/move a worktree path (CAS precondition).
+    FsMove,
+    /// `core.fs_delete` — delete a worktree path (CAS precondition).
+    FsDelete,
+    /// `core.fs_mkdir` — create a directory inside the worktree.
+    FsMkdir,
+    /// `core.exec` — run a command in the session sandbox.
+    Exec,
+    /// `core.git_read` — read-only git through the broker.
+    GitRead,
+    /// `core.git_branch` — branch inspection/creation within the session branch.
+    GitBranch,
+    /// `core.git_sync` — `fetch` / `pull` through the broker.
+    GitSync,
+    /// `core.git_stage` — stage worktree paths through the broker.
+    GitStage,
+    /// `core.git_commit` — commit from ACCEPTED blobs (PEP gate 5a).
+    GitCommit,
+    /// `core.git_push` — push the session branch (`mandatory_interactive`).
+    GitPush,
+    /// `core.git_merge` — merge into a detached integration worktree.
+    GitMerge,
+    /// `core.git_merge_finalize` — commit the merge result and move the ref.
+    GitMergeFinalize,
+    /// `core.code_search` — semantic search over the workspace index (§14).
+    /// A shortcut, never the source of truth: grep stays authoritative, and a
+    /// `degraded` answer means the index does not describe the current head.
+    CodeSearch,
+    /// `core.workspace_info` — the session's workspace facts, no host paths.
+    WorkspaceInfo,
+    /// `core.task_plan(tasks)` — writes THE plan as rows: an ordered list of
+    /// tasks with completion criteria, replacing whatever plan the session had.
+    /// A plan in prose cannot be checked; a plan in rows can, which is what
+    /// lets the build loop refuse to finish while work is still open.
+    TaskPlan,
+    /// `core.task_update(ordinal, status, note?)` — moves ONE task of the plan
+    /// between pending / in_progress / done / blocked.
+    TaskUpdate,
+    /// `core.task_list()` — the plan and where each task stands.
+    TaskList,
 }
 
 impl CoreToolName {
@@ -71,39 +128,52 @@ impl CoreToolName {
             CoreToolName::ProjectSearch => "core.project_search",
             CoreToolName::ProjectListSources => "core.project_list_sources",
             CoreToolName::CaseSave => "core.project_case_save",
+            CoreToolName::FsRead => "core.fs_read",
+            CoreToolName::FsList => "core.fs_list",
+            CoreToolName::FsGlob => "core.fs_glob",
+            CoreToolName::FsGrep => "core.fs_grep",
+            CoreToolName::FsWrite => "core.fs_write",
+            CoreToolName::FsEdit => "core.fs_edit",
+            CoreToolName::FsMove => "core.fs_move",
+            CoreToolName::FsDelete => "core.fs_delete",
+            CoreToolName::FsMkdir => "core.fs_mkdir",
+            CoreToolName::Exec => "core.exec",
+            CoreToolName::GitRead => "core.git_read",
+            CoreToolName::GitBranch => "core.git_branch",
+            CoreToolName::GitSync => "core.git_sync",
+            CoreToolName::GitStage => "core.git_stage",
+            CoreToolName::GitCommit => "core.git_commit",
+            CoreToolName::GitPush => "core.git_push",
+            CoreToolName::GitMerge => "core.git_merge",
+            CoreToolName::GitMergeFinalize => "core.git_merge_finalize",
+            CoreToolName::CodeSearch => "core.code_search",
+            CoreToolName::WorkspaceInfo => "core.workspace_info",
+            CoreToolName::TaskPlan => "core.task_plan",
+            CoreToolName::TaskUpdate => "core.task_update",
+            CoreToolName::TaskList => "core.task_list",
         }
     }
 
-    /// Bare tool name (the part after the `core.` prefix).
+    /// Bare tool name (the part after the `core.` prefix). Derived from
+    /// `public_name` so the two can never drift apart.
     pub fn bare_name(self) -> &'static str {
-        match self {
-            CoreToolName::SkillView => "skill_view",
-            CoreToolName::AgentSpawn => "agent_spawn",
-            CoreToolName::AgentWait => "agent_wait",
-            CoreToolName::AgentList => "agent_list",
-            CoreToolName::AgentCancel => "agent_cancel",
-            CoreToolName::AskUser => "ask_user",
-            CoreToolName::ProjectSearch => "project_search",
-            CoreToolName::ProjectListSources => "project_list_sources",
-            CoreToolName::CaseSave => "project_case_save",
-        }
+        self.public_name()
+            .strip_prefix("core.")
+            .expect("every public_name carries the core. prefix")
     }
 
     /// Resolves a public `core.<tool>` name to the enum, or `None` when the
-    /// name is not a known core builtin.
+    /// name is not a known core builtin. Resolved against `all()`, so a variant
+    /// missing from the catalog list is unreachable by name rather than
+    /// silently dispatchable.
     pub fn from_public_name(name: &str) -> Option<Self> {
-        match name.strip_prefix("core.")? {
-            "skill_view" => Some(CoreToolName::SkillView),
-            "agent_spawn" => Some(CoreToolName::AgentSpawn),
-            "agent_wait" => Some(CoreToolName::AgentWait),
-            "agent_list" => Some(CoreToolName::AgentList),
-            "agent_cancel" => Some(CoreToolName::AgentCancel),
-            "ask_user" => Some(CoreToolName::AskUser),
-            "project_search" => Some(CoreToolName::ProjectSearch),
-            "project_list_sources" => Some(CoreToolName::ProjectListSources),
-            "project_case_save" => Some(CoreToolName::CaseSave),
-            _ => None,
+        if !name.starts_with("core.") {
+            return None;
         }
+        Self::all()
+            .iter()
+            .copied()
+            .find(|c| c.public_name() == name)
     }
 
     /// True for builtins handled synchronously by `execute_core_tool` (DB-only).
@@ -149,6 +219,39 @@ impl CoreToolName {
         )
     }
 
+    /// True for the Code Studio tool set (§10) — the coding agent's complete
+    /// verb list. Async in tool_exec: each call binds its session from
+    /// `envelope.meta["code_session"]`, runs the policy enforcement point and
+    /// journals an operation, none of which the synchronous core path can do.
+    pub fn is_code_studio(self) -> bool {
+        matches!(
+            self,
+            CoreToolName::FsRead
+                | CoreToolName::FsList
+                | CoreToolName::FsGlob
+                | CoreToolName::FsGrep
+                | CoreToolName::FsWrite
+                | CoreToolName::FsEdit
+                | CoreToolName::FsMove
+                | CoreToolName::FsDelete
+                | CoreToolName::FsMkdir
+                | CoreToolName::Exec
+                | CoreToolName::GitRead
+                | CoreToolName::GitBranch
+                | CoreToolName::GitSync
+                | CoreToolName::GitStage
+                | CoreToolName::GitCommit
+                | CoreToolName::GitPush
+                | CoreToolName::GitMerge
+                | CoreToolName::GitMergeFinalize
+                | CoreToolName::CodeSearch
+                | CoreToolName::WorkspaceInfo
+                | CoreToolName::TaskPlan
+                | CoreToolName::TaskUpdate
+                | CoreToolName::TaskList
+        )
+    }
+
     /// All core builtins, in catalog order.
     pub fn all() -> &'static [CoreToolName] {
         &[
@@ -161,6 +264,29 @@ impl CoreToolName {
             CoreToolName::ProjectSearch,
             CoreToolName::ProjectListSources,
             CoreToolName::CaseSave,
+            CoreToolName::FsRead,
+            CoreToolName::FsList,
+            CoreToolName::FsGlob,
+            CoreToolName::FsGrep,
+            CoreToolName::FsWrite,
+            CoreToolName::FsEdit,
+            CoreToolName::FsMove,
+            CoreToolName::FsDelete,
+            CoreToolName::FsMkdir,
+            CoreToolName::Exec,
+            CoreToolName::GitRead,
+            CoreToolName::GitBranch,
+            CoreToolName::GitSync,
+            CoreToolName::GitStage,
+            CoreToolName::GitCommit,
+            CoreToolName::GitPush,
+            CoreToolName::GitMerge,
+            CoreToolName::GitMergeFinalize,
+            CoreToolName::CodeSearch,
+            CoreToolName::WorkspaceInfo,
+            CoreToolName::TaskPlan,
+            CoreToolName::TaskUpdate,
+            CoreToolName::TaskList,
         ]
     }
 
@@ -466,6 +592,558 @@ impl CoreToolName {
                     "required": ["title", "priority"]
                 }),
             },
+
+            // --- Code Studio (§10) ---
+            // Every description below is written FOR THE MODEL: what the verb
+            // does, what it refuses, and what it costs. None of them takes a
+            // workspace or session argument — the session is bound server-side.
+            CoreToolName::FsRead => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Read a text file from the repository you are working in. \
+                              Paths are relative to the repository root (e.g. src/main.rs); \
+                              absolute paths, `..` and symlinks leaving the tree are refused. \
+                              Use offset/limit to page through a large file instead of \
+                              re-reading it whole."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path of the file to read."
+                        },
+                        "offset": {
+                            "type": "integer",
+                            "description": "First line to return (1-based). Omit to start at \
+                                            the beginning."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of lines to return."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            CoreToolName::FsList => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "List the entries of one directory in the repository. Returns \
+                              name, kind (file/dir/symlink) and size. It does NOT recurse — \
+                              use core.fs_glob to match paths across the tree."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative directory. Omit or pass \".\" \
+                                            for the repository root."
+                        }
+                    }
+                }),
+            },
+            CoreToolName::FsGlob => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Find files by path pattern (e.g. `src/**/*.rs`, `**/Cargo.toml`). \
+                              Returns matching repository-relative paths, newest first. Use it \
+                              to locate files by name; use core.fs_grep to search their contents."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Glob pattern matched against repository-relative \
+                                            paths."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional subdirectory to search under."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of paths to return."
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            CoreToolName::FsGrep => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Search file CONTENTS with a regular expression. This is the \
+                              AUTHORITATIVE way to find code in this repository: it reads the \
+                              files as they are right now, which core.code_search does not. \
+                              Narrow the search with `path` and `glob` before raising `limit`; \
+                              a pattern that takes too long is aborted rather than truncated \
+                              silently."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "pattern": {
+                            "type": "string",
+                            "description": "Regular expression to match against file contents."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional subdirectory to restrict the search to."
+                        },
+                        "glob": {
+                            "type": "string",
+                            "description": "Optional path glob filter, e.g. `*.rs`."
+                        },
+                        "case_insensitive": {
+                            "type": "boolean",
+                            "description": "Match without regard to case (default false)."
+                        },
+                        "context_lines": {
+                            "type": "integer",
+                            "description": "Lines of context to show around each match (0-10)."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of matches to return."
+                        }
+                    },
+                    "required": ["pattern"]
+                }),
+            },
+            CoreToolName::FsWrite => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Write a file in the repository, creating it or replacing its \
+                              whole content. To replace an EXISTING file you must first read it \
+                              and pass its `expected_sha256` — a mismatch means someone else \
+                              changed the file and the write is refused instead of overwriting \
+                              their work. For a small change prefer core.fs_edit."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path of the file to write."
+                        },
+                        "content": {
+                            "type": "string",
+                            "description": "The complete new content of the file."
+                        },
+                        "expected_sha256": {
+                            "type": "string",
+                            "description": "SHA-256 of the content you read, for an existing \
+                                            file. Pass \"\" (empty) to assert the file does not \
+                                            exist yet."
+                        }
+                    },
+                    "required": ["path", "content"]
+                }),
+            },
+            CoreToolName::FsEdit => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Replace one exact literal occurrence in a file. `old_string` must \
+                              appear EXACTLY ONCE — if it matches zero or several times the \
+                              edit is refused, so include enough surrounding lines to make it \
+                              unique. Pass `expected_sha256` from your read of the file so a \
+                              concurrent change cannot be clobbered."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path of the file to edit."
+                        },
+                        "old_string": {
+                            "type": "string",
+                            "description": "Exact text to replace, unique within the file."
+                        },
+                        "new_string": {
+                            "type": "string",
+                            "description": "Replacement text."
+                        },
+                        "expected_sha256": {
+                            "type": "string",
+                            "description": "SHA-256 of the file content you read."
+                        }
+                    },
+                    "required": ["path", "old_string", "new_string"]
+                }),
+            },
+            CoreToolName::FsMove => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Rename or move a file inside the repository. Both paths stay \
+                              inside the tree. Pass `expected_sha256` of the source so the move \
+                              is refused if the file changed since you read it."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "from": {
+                            "type": "string",
+                            "description": "Current repository-relative path."
+                        },
+                        "to": {
+                            "type": "string",
+                            "description": "New repository-relative path."
+                        },
+                        "expected_sha256": {
+                            "type": "string",
+                            "description": "SHA-256 of the source file content you read."
+                        }
+                    },
+                    "required": ["from", "to"]
+                }),
+            },
+            CoreToolName::FsDelete => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Delete a file from the repository. Pass `expected_sha256` of the \
+                              content you read — deleting a file that changed meanwhile is \
+                              refused. Deleting a directory requires `recursive: true`."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative path to delete."
+                        },
+                        "expected_sha256": {
+                            "type": "string",
+                            "description": "SHA-256 of the file content you read."
+                        },
+                        "recursive": {
+                            "type": "boolean",
+                            "description": "Required to delete a non-empty directory."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            CoreToolName::FsMkdir => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Create a directory (and missing parents) inside the repository. \
+                              Creating a directory that already exists succeeds without change."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "path": {
+                            "type": "string",
+                            "description": "Repository-relative directory to create."
+                        }
+                    },
+                    "required": ["path"]
+                }),
+            },
+            CoreToolName::Exec => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Run a command in the session sandbox — this is how you build, \
+                              run tests and use project tooling. Pass the command as an argv \
+                              ARRAY (e.g. [\"cargo\",\"test\",\"--lib\"]); there is no shell, so \
+                              pipes, redirections and `&&` do not work. Returns exit code, \
+                              stdout and stderr (truncated). Network access and write access \
+                              are decided by policy, not by this call."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "argv": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Program and arguments; the first entry is the \
+                                            executable."
+                        },
+                        "cwd": {
+                            "type": "string",
+                            "description": "Repository-relative working directory (default: \
+                                            repository root)."
+                        },
+                        "timeout_secs": {
+                            "type": "integer",
+                            "description": "Kill the command after this many seconds."
+                        },
+                        "purpose": {
+                            "type": "string",
+                            "description": "One short sentence on why you are running this — \
+                                            shown to the operator when the command needs \
+                                            approval."
+                        }
+                    },
+                    "required": ["argv"]
+                }),
+            },
+            CoreToolName::GitRead => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Read git state through the repository broker: `status`, `diff`, \
+                              `log`, `show`, `ls_files`. Read-only — it never changes the \
+                              repository. Use `diff` to see what you have changed so far."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["status", "diff", "log", "show", "ls_files"],
+                            "description": "Which read to perform."
+                        },
+                        "path": {
+                            "type": "string",
+                            "description": "Optional repository-relative path to restrict the \
+                                            read to."
+                        },
+                        "rev": {
+                            "type": "string",
+                            "description": "Revision for `show`/`log`, or the base of a `diff`."
+                        },
+                        "staged": {
+                            "type": "boolean",
+                            "description": "`diff`: compare the staged content instead of the \
+                                            working tree."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "`log`/`ls_files`: maximum entries to return."
+                        }
+                    },
+                    "required": ["operation"]
+                }),
+            },
+            CoreToolName::GitBranch => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "List the repository's branches with their upstream and how far \
+                              ahead or behind each one is, and say which branch this session \
+                              owns. You cannot leave that branch, and creating a branch is not \
+                              offered — a session gets its branch when it opens."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
+            CoreToolName::GitSync => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Bring remote history in: `fetch` (download only) or `pull` \
+                              (fetch and integrate into the session branch). Runs in the \
+                              broker with the workspace's own credentials; you never see them."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "operation": {
+                            "type": "string",
+                            "enum": ["fetch", "pull"],
+                            "description": "Which sync operation to perform."
+                        },
+                        "remote": {
+                            "type": "string",
+                            "description": "Remote name (default `origin`)."
+                        }
+                    },
+                    "required": ["operation"]
+                }),
+            },
+            CoreToolName::GitStage => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Prepare the change set for review and commit: it closes what you \
+                              have changed so far into one reviewable set and reports which of \
+                              the paths you asked about it captured. Call it with no paths to \
+                              see everything that changed. Removing a changed file from the set \
+                              is the reviewer's decision, not yours."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "paths": {
+                            "type": "array",
+                            "items": {"type": "string"},
+                            "description": "Optional repository-relative paths to report on; \
+                                            omit for every changed path."
+                        }
+                    }
+                }),
+            },
+            CoreToolName::GitCommit => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Commit the reviewed changes. If the operator has not accepted a \
+                              patch set yet, this call does NOT fail — it opens the change \
+                              review and waits for their decision, then commits. The commit is \
+                              always built from the ACCEPTED content, not from whatever is on \
+                              disk at that moment, so editing files after the review does not \
+                              change what gets committed."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Commit message: a concise subject line, and a body \
+                                            explaining WHY when the change is not obvious."
+                        }
+                    },
+                    "required": ["message"]
+                }),
+            },
+            CoreToolName::GitPush => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Push this session's branch to the remote. The operator is asked \
+                              EVERY time — there is no way to pre-approve it — so call it only \
+                              when publishing the work is what the user asked for."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "remote": {
+                            "type": "string",
+                            "description": "Remote name (default `origin`)."
+                        },
+                        "force_with_lease": {
+                            "type": "boolean",
+                            "description": "Allow a non-fast-forward push that still refuses to \
+                                            overwrite unseen remote commits."
+                        }
+                    }
+                }),
+            },
+            CoreToolName::GitMerge => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Merge this session's branch into a target branch inside a \
+                              DETACHED integration worktree. It never moves the target branch — \
+                              it produces the merge result (or the conflicts) for you to test \
+                              and review. The operator is asked every time. Finish with \
+                              core.git_merge_finalize once the result is verified."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "target_branch": {
+                            "type": "string",
+                            "description": "Branch to merge into (e.g. main)."
+                        }
+                    },
+                    "required": ["target_branch"]
+                }),
+            },
+            CoreToolName::GitMergeFinalize => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Complete a merge started with core.git_merge: commit the accepted \
+                              merge result and move the target branch to it. Requires an \
+                              accepted review of the merge result and asks the operator every \
+                              time; it aborts rather than overwrite if the target branch moved \
+                              in the meantime."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "message": {
+                            "type": "string",
+                            "description": "Merge commit message."
+                        }
+                    }
+                }),
+            },
+            CoreToolName::CodeSearch => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Find code by MEANING instead of by exact text: describe what you \
+                              are looking for (\"where the retry budget is applied\") and get \
+                              back the closest code chunks with their path and line range. It \
+                              is a shortcut for locating unfamiliar code, NOT the source of \
+                              truth — core.fs_grep is authoritative here, because it reads the \
+                              files while this searches an index built earlier. When the answer \
+                              comes back with `degraded: true` the index does not describe the \
+                              repository's current state, so treat its hits as leads and verify \
+                              them; a degraded answer with NO hits says nothing at all about \
+                              the code — repeat the search with core.fs_grep before concluding \
+                              that something does not exist."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "query": {
+                            "type": "string",
+                            "description": "What you are looking for, in natural language or as \
+                                            the code idea itself."
+                        },
+                        "prefix": {
+                            "type": "string",
+                            "description": "Optional repository-relative path prefix to restrict \
+                                            results to, e.g. `src/`. Omit to search the whole \
+                                            repository."
+                        },
+                        "limit": {
+                            "type": "integer",
+                            "description": "Maximum number of code chunks to return."
+                        }
+                    },
+                    "required": ["query"]
+                }),
+            },
+            CoreToolName::TaskPlan => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Write THE plan for this session as an ordered list of tasks. \
+                              Replaces any previous plan. Each task needs a title and a \
+                              completion criterion concrete enough that someone else can \
+                              tell whether it was met. The list is what the build loop \
+                              checks before it agrees the work is finished, so a plan left \
+                              in prose is a plan nobody can verify."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "tasks": {
+                            "type": "array",
+                            "description": "Tasks in the order they should be done.",
+                            "items": {
+                                "type": "object",
+                                "properties": {
+                                    "title": {"type": "string", "description": "What to do, in one line."},
+                                    "detail": {"type": "string", "description": "How to tell it is done, and which files it touches."}
+                                },
+                                "required": ["title"]
+                            }
+                        }
+                    },
+                    "required": ["tasks"]
+                }),
+            },
+            CoreToolName::TaskUpdate => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Move one task of the plan to a new state. Use 'in_progress' \
+                              when you start it, 'done' only once its completion criterion \
+                              is actually met, and 'blocked' with a note when something \
+                              stops you — a blocked task keeps the work open rather than \
+                              quietly passing as finished."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {
+                        "ordinal": {"type": "integer", "description": "Task number as shown by core.task_list."},
+                        "status": {
+                            "type": "string",
+                            "enum": ["pending", "in_progress", "done", "blocked"]
+                        },
+                        "note": {"type": "string", "description": "Why, when blocking or reopening."}
+                    },
+                    "required": ["ordinal", "status"]
+                }),
+            },
+            CoreToolName::TaskList => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "The plan of this session and where each task stands."
+                    .to_string(),
+                parameters: serde_json::json!({"type": "object", "properties": {}}),
+            },
+            CoreToolName::WorkspaceInfo => LlmToolSpec {
+                name: self.public_name().to_string(),
+                description: "Describe the repository you are working in: name, current branch, \
+                              base commit, whether the tree is dirty, the detected toolchain and \
+                              the limits in force (autonomy mode, network access). Call it once \
+                              at the start when you need your bearings; it never returns \
+                              credentials or host paths."
+                    .to_string(),
+                parameters: serde_json::json!({
+                    "type": "object",
+                    "properties": {}
+                }),
+            },
         }
     }
 }
@@ -609,6 +1287,126 @@ mod tests {
         let pool: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
         let err = execute_core_tool(&pool, "core.agent_spawn", &serde_json::json!({})).unwrap_err();
         assert!(err.to_string().contains("async"), "{err}");
+    }
+
+    #[test]
+    fn code_studio_set_is_exactly_the_verbs_of_section_ten() {
+        // The tool table of §10 is the WHOLE verb set of a coding agent. Both
+        // directions matter: a missing verb leaves the agent unable to do its
+        // job, and an extra one is a capability nobody reviewed.
+        let mut actual: Vec<&str> = CoreToolName::all()
+            .iter()
+            .filter(|t| t.is_code_studio())
+            .map(|t| t.public_name())
+            .collect();
+        actual.sort_unstable();
+        let mut expected = vec![
+            "core.code_search",
+            "core.exec",
+            "core.fs_delete",
+            "core.fs_edit",
+            "core.fs_glob",
+            "core.fs_grep",
+            "core.fs_list",
+            "core.fs_mkdir",
+            "core.fs_move",
+            "core.fs_read",
+            "core.fs_write",
+            "core.git_branch",
+            "core.git_commit",
+            "core.git_merge",
+            "core.git_merge_finalize",
+            "core.git_push",
+            "core.git_read",
+            "core.git_stage",
+            "core.git_sync",
+            "core.workspace_info",
+            // The plan verbs: §10's verb set is what a coding agent can DO, and
+            // recording the plan it works to is part of that.
+            "core.task_plan",
+            "core.task_update",
+            "core.task_list",
+        ];
+        expected.sort_unstable();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn code_search_offers_the_index_without_unseating_grep() {
+        let tool = CoreToolName::from_public_name("core.code_search").expect("known builtin");
+        assert_eq!(tool, CoreToolName::CodeSearch);
+        assert!(tool.is_code_studio());
+        let spec = tool.spec();
+        assert_eq!(spec.name, "core.code_search");
+        assert_eq!(spec.parameters["required"][0], "query");
+        assert!(spec.parameters["properties"]["prefix"].is_object());
+        assert!(spec.parameters["properties"]["limit"].is_object());
+        // §14 is the whole point of the description: the model must know which
+        // tool is authoritative and what a degraded answer obliges it to do.
+        assert!(spec.description.contains("core.fs_grep"));
+        assert!(spec.description.contains("authoritative"));
+        assert!(spec.description.contains("degraded"));
+        // And grep must no longer claim the index does not exist.
+        assert!(!CoreToolName::FsGrep
+            .spec()
+            .description
+            .contains("no semantic index"));
+    }
+
+    #[test]
+    fn code_studio_tools_never_take_a_session_or_workspace_argument() {
+        // The binding is server-minted (`envelope.meta["code_session"]`). A
+        // parameter with either name would be exactly the redirection the
+        // binding exists to prevent, so it must not appear in any schema.
+        for tool in CoreToolName::all().iter().filter(|t| t.is_code_studio()) {
+            let spec = tool.spec();
+            let rendered = spec.parameters.to_string();
+            for forbidden in ["workspace_id", "session_id", "worktree"] {
+                assert!(
+                    !rendered.contains(forbidden),
+                    "{} exposes '{forbidden}'",
+                    tool.public_name()
+                );
+            }
+            assert_eq!(spec.parameters["type"], "object");
+            assert!(!spec.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn code_studio_tools_are_async_and_not_confused_with_the_other_families() {
+        for tool in CoreToolName::all().iter().filter(|t| t.is_code_studio()) {
+            assert!(!tool.is_synchronous(), "{}", tool.public_name());
+            assert!(!tool.is_subagent_control(), "{}", tool.public_name());
+            assert!(!tool.is_project_knowledge(), "{}", tool.public_name());
+            assert!(!tool.is_case_save(), "{}", tool.public_name());
+            assert!(!tool.is_ask_user(), "{}", tool.public_name());
+        }
+        // And the pre-existing families are not Code Studio.
+        for other in [
+            CoreToolName::SkillView,
+            CoreToolName::AgentSpawn,
+            CoreToolName::AskUser,
+            CoreToolName::ProjectSearch,
+            CoreToolName::CaseSave,
+        ] {
+            assert!(!other.is_code_studio(), "{}", other.public_name());
+        }
+    }
+
+    #[test]
+    fn every_catalog_entry_round_trips_through_its_public_name() {
+        for tool in CoreToolName::all() {
+            assert_eq!(
+                CoreToolName::from_public_name(tool.public_name()),
+                Some(*tool)
+            );
+            assert_eq!(
+                tool.public_name(),
+                format!("core.{}", tool.bare_name()),
+                "bare name must be the public name without the prefix"
+            );
+        }
     }
 
     #[test]

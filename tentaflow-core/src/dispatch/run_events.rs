@@ -76,12 +76,18 @@ fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
             e.total = total;
             e.status = status;
         }
-        ProgressEvent::ToolCallStarted { name } => {
+        ProgressEvent::ToolCallStarted { call_id, name } => {
             e.kind = "tool_call_started".into();
+            e.call_id = call_id;
             e.name = name;
         }
-        ProgressEvent::ToolCallFinished { name, status } => {
+        ProgressEvent::ToolCallFinished {
+            call_id,
+            name,
+            status,
+        } => {
             e.kind = "tool_call_finished".into();
+            e.call_id = call_id;
             e.name = name;
             e.status = status;
         }
@@ -319,6 +325,7 @@ mod tests {
             routable: true,
             is_enabled: true,
             on_child_complete: "notify",
+            allowed_agents_json: None,
             actor_user_id: None,
         };
         let _ = crate::db::repository::upsert_agent(&state.db, &params);
@@ -350,6 +357,7 @@ mod tests {
         let e = to_wire(
             "sess-1",
             ProgressEvent::ToolCallFinished {
+                call_id: "test-call".into(),
                 name: "memory.memory_search".into(),
                 status: "ok".into(),
             },

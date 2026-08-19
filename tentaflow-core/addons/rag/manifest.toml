@@ -102,69 +102,18 @@ display_name = "Zapis stanu instancji"
 description = "Zapis instancyjnego stanu KV (rezerwa pod cache zapytan RAG)."
 risk = "low"
 
-# --- Aliasy modeli wystawiane przez addon ---
-# suggested_default jest pusty dla wszystkich aliasow RAG: swieza instalacja
-# tworzy je ODPIETE (is_active=0), a admin podpina konkretny model recznie
-# (Services -> Aliasy). materialize_addon_aliases jest idempotentne i nie
-# nadpisuje recznych bindowan, wiec reinstall nie cofa wyboru admina.
-
-[[alias]]
-id = "rag-embeddings"
-display_name = "RAG — embeddingi"
-methods = ["embed"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-llm"
-display_name = "RAG — LLM"
-methods = ["chat"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-reranker"
-display_name = "RAG — reranker"
-methods = ["rerank"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-parse"
-display_name = "RAG — parsowanie dokumentow"
-methods = ["parse"]
-suggested_default = ""
-visibility = "private"
-
-# Detektory struktury strony (PARTIA 0 typed-surface Documents) — pod przyszle
-# nody page_detect_pages / table_structure / ocr_pages w flow-ingescie. Wzor rag-parse.
-[[alias]]
-id = "rag-page-elements"
-display_name = "RAG — elementy strony"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-table-structure"
-display_name = "RAG — struktura tabel"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-graphic-elements"
-display_name = "RAG — elementy graficzne"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
-
-[[alias]]
-id = "rag-ocr"
-display_name = "RAG — OCR"
-methods = ["documents"]
-suggested_default = ""
-visibility = "private"
+# --- Aliasy modeli: WLASNOSC PLATFORMY, nie addona ---
+# Aliasy `rag-*` seeduje rdzen (`db/seed.rs::seed_platform_rag_aliases`) i to on jest
+# ich wlascicielem. Addon deklaruje je WYLACZNIE ponizej jako `[[uses_alias]]`.
+#
+# Dlaczego nie `[[alias]]`: wlasciciel-addon podlega
+# `deactivate_aliases_owned_by_addon`, ktore gasi aliasy takze przy zniknieciu
+# ostatniej instancji addona. `rag-embeddings` uzywaja bezposrednio Projekty i
+# Code Studio, wiec zatrzymanie tego addona wylaczalo im baze wiedzy. Alias bez
+# addonowego wlasciciela nie ma tego cyklu zycia.
+#
+# Aliasy platformowe sa `public` — addon wymaga ponizej `required = true`, a
+# `compute_uses_alias_status_within_tx` odrzuca `private` jako `denied`.
 
 # --- Aliasy konsumowane przez addon ---
 # rag-llm i rag-reranker sa dla query slice (Etap 1) — swiadomie required=false.
@@ -274,40 +223,17 @@ name = "label"
 type = "str"
 indexed = true
 
-# --- Flow zapytania (flow_engine) ---
-# Rejestrowany przy install instancji jako published model "{addon_id}:query".
-# Addon wyzwala go przez llm_generate(model=<ta nazwa>); executor przepisuje
-# tozsamosc instancji do ExecutionContext, wiec wezel vector uderza w przestrzen
-# 'passages' TEJ instancji.
-
-# query MUSI byc pierwszy: register_engine_flows zapisuje nazwe PIERWSZEGO
-# engine-flow do KV instancji (engine_flow_model), ktora odczytuje narzedzie ask.
-[[engine_flow]]
-id = "query"
-path = "flows/query.flow.json"
-service_type = "chat"
-description = "Multi-hop RAG: petla retrieval-round (sedzia LLM) -> finalna odpowiedz z cytatami."
-
-# retrieval_round — cialo pojedynczego hopu, wykonywane przez loop block z query.
-# Rejestrowane jako osobny engine-flow, bo loop.body_flow_engine_id rozwiazuje je
-# po install-stabilnej published-name {addon_id}:retrieval_round (id wiersza flow
-# to losowy UUID nadawany przy install). NIE jest wolane bezposrednio jako model.
-[[engine_flow]]
-id = "retrieval-round"
-path = "flows/retrieval_round.flow.json"
-service_type = "chat"
-description = "Cialo jednego hopu petli multi-hop: embed -> vector -> rerank -> akumulacja -> sedzia."
-
-# ingest — flow-ingest JEDNEGO dokumentu. Published-name `{addon_id}:ingest`,
-# wiazanie flow_model_bindings matchuje DOKLADNIE te nazwe. Addon czyta ja z KV
-# (`engine_flow_model:ingest`) i podaje jako `model` do `ingest_invoke`, ktory
-# dispatchuje po (model, service_type="ingest", modality="document"). service_type
-# musi byc "ingest" — execute_ingest resolwuje dokladnie pod tym typem.
-[[engine_flow]]
-id = "ingest"
-path = "flows/ingest.flow.json"
-service_type = "ingest"
-description = "Flow-ingest dokumentu: router -> parse/extract -> combine -> chunk -> embed -> store."
+# --- Flowy: WLASNOSC PLATFORMY, nie addona ---
+# Flowy `ingest`, `query` i `retrieval-round` jada z TentaFlow (seed rdzenia,
+# `db/seed.rs::seed_platform_rag_flows`) pod stalymi nazwami `core:rag-*`. Addon
+# wola je po tych nazwach — patrz QUERY_FLOW_MODEL / INGEST_FLOW_MODEL w src/lib.rs.
+#
+# Dlaczego nie `[[engine_flow]]`: bez zainstalowanego addona nie istnial ZADEN flow
+# ingestu ani zapytania, a Projekty potrzebuja dokladnie tych samych, zeby nie
+# utrzymywac drugiej implementacji parsowania, chunkingu i zapisu wektorow.
+#
+# Izolacja danych sie NIE zmienia: wezly vector/store biora scope z `ctx.addon_id`,
+# ktore Core przepisuje z tozsamosci wolajacego. Wspolny flow, osobne przestrzenie.
 
 # --- Kolekcja grafowa: aktywny widok MemGraphRAG, materializowany z outboxu ---
 # 'kg_active' zawiera TYLKO aktywne fakty (w D1 = wszystkie); pelny ledger faktow

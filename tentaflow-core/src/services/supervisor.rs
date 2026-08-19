@@ -902,7 +902,11 @@ impl Supervisor {
     /// every one of them showed up in the user's session history. The model
     /// list of a CLI changes when the vendor ships a release, not during the
     /// day: one sync per bridge process is enough, and the dashboard can ask
-    /// for a refresh explicitly.
+    /// for a refresh explicitly (defect D1 of §1.2).
+    ///
+    /// The Core-side cache in `coding_agent` is what keeps every OTHER caller
+    /// off the bridge; here it must be dropped first, because "a new bridge
+    /// instance" is exactly the moment a cached answer stops being the truth.
     async fn sync_coding_agent_models(&self, services: &[ServiceRow]) {
         // A bridge that is up but not logged in yet cannot report models, so a
         // failed attempt is retried — just not on every health tick.
@@ -921,11 +925,15 @@ impl Supervisor {
             let instance = (service.runtime_pid, service.restart_count);
             {
                 let mut synced = self.agent_model_sync.lock().await;
-                if synced.get(&service.id).is_some_and(|state| {
+                let known = synced.get(&service.id);
+                if known.is_some_and(|state| {
                     state.instance == instance
                         && (state.done || state.last_attempt.elapsed() < RETRY_AFTER_FAILURE)
                 }) {
                     continue;
+                }
+                if !known.is_some_and(|state| state.instance == instance) {
+                    crate::services::coding_agent::forget_models(service.id);
                 }
                 synced.insert(
                     service.id,

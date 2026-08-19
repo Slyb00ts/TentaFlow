@@ -16,12 +16,28 @@ class TfSelect extends HTMLElement {
     this._labelEl = null;
     this._wrap = null;
     this._select = null;
+    this._observer = null;
     this._onChange = this._onChange.bind(this);
+    this._onLightMutation = this._onLightMutation.bind(this);
   }
 
   connectedCallback() {
     if (!this._wrap) this._build();
     this._update();
+    // Callers that fill a select AFTER the upgrade (async data, a partial
+    // re-render) assign light-DOM <option>s. Without adoption those options sit
+    // outside the built <select> and the browser paints them as bare text.
+    if (!this._observer && typeof MutationObserver !== 'undefined') {
+      this._observer = new MutationObserver(this._onLightMutation);
+      this._observer.observe(this, { childList: true });
+    }
+  }
+
+  disconnectedCallback() {
+    if (this._observer) {
+      this._observer.disconnect();
+      this._observer = null;
+    }
   }
 
   attributeChangedCallback(name, oldVal, newVal) {
@@ -54,6 +70,20 @@ class TfSelect extends HTMLElement {
       this._select.value = String(selected);
       this.setAttribute('value', String(selected));
     }
+  }
+
+  // `innerHTML = '<option>…'` on an upgraded host destroys the built structure,
+  // while `appendChild(option)` leaves it intact — the two need different
+  // repairs, and neither may re-enter (the repair itself mutates children, but
+  // leaves no top-level <option> behind, so the next callback returns early).
+  _onLightMutation() {
+    const loose = Array.from(this.children).filter(
+      (n) => n.tagName === 'OPTION' || n.tagName === 'OPTGROUP'
+    );
+    if (!loose.length) return;
+    if (this._select && this.contains(this._select)) loose.forEach((n) => this._select.appendChild(n));
+    else this._build();
+    this._update();
   }
 
   _build() {

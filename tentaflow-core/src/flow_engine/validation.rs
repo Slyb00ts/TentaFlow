@@ -17,9 +17,19 @@
 //             do node'a "output" z config.mode="stream". Head łańcucha musi być
 //             zarejestrowanym `StreamProducerAdapter` (§3.11 B — nie zakładamy
 //             już LLM). Co najwyżej jedna gałąź streaming na node (poza output).
+//         R8. edge.data_type zgodny z portem producenta i konsumenta
 //         R10. każda zmienna docelowa `output_mapping` node'a musi być
 //             zadeklarowana w sekcji `variables` flow (§3.12). Brak sekcji =
 //             zero dozwolonych zmiennych → output_mapping do czegokolwiek błąd.
+//         R11. integralność inline loop-region: krawędź `loop_back` spina
+//             DOKŁADNIE jeden region (oba końce w tym samym `FlowNode.region`),
+//             region ma jedno wejście i jedno wyjście, a budżet iteracji mieści
+//             się w twardym limicie.
+//
+//       R9 (zgodność typu artefaktu konsument ↔ producent) NIE ISTNIEJE —
+//       `node_adapter.rs` deklaruje `produced_artifacts`/`consumed_artifact_types`
+//       jako dokumentację i odkłada regułę na Etap 3. Realny zestaw to
+//       R1–R8 + R10 + R11; "R1–R11" w opisach jest skrótem, nie stanem.
 // =============================================================================
 
 use std::collections::{HashMap, HashSet};
@@ -126,6 +136,18 @@ pub enum FlowValidationError {
     InvalidLoopRegion {
         region_id: String,
         detail: String,
+    },
+    /// R11: a `loop_back` edge whose two endpoints do not sit in ONE region.
+    /// The kind is not a label but an exemption — it takes the edge out of the
+    /// R4 in-degree count, out of the toposort and out of the executor's input
+    /// collection — so an unregioned back edge would be an invisible edge: a
+    /// second forward input smuggled past R4, and (via R7's region-exit list) a
+    /// waiver of `StreamProducerNotRegistered` for its source.
+    LoopBackOutsideRegion {
+        from_node: String,
+        from_region: Option<String>,
+        to_node: String,
+        to_region: Option<String>,
     },
 }
 
@@ -236,6 +258,25 @@ impl fmt::Display for FlowValidationError {
             Self::InvalidLoopRegion { region_id, detail } => {
                 write!(f, "loop region '{region_id}' is invalid: {detail}")
             }
+            Self::LoopBackOutsideRegion {
+                from_node,
+                from_region,
+                to_node,
+                to_region,
+            } => {
+                let named = |region: &Option<String>| match region {
+                    Some(id) => format!("region '{id}'"),
+                    None => "no region".to_string(),
+                };
+                write!(
+                    f,
+                    "loop_back edge '{from_node}' ({}) -> '{to_node}' ({}) does not close a loop \
+                     region; both endpoints must belong to the SAME region, otherwise the edge is \
+                     invisible to R4, to the toposort and to the executor",
+                    named(from_region),
+                    named(to_region)
+                )
+            }
         }
     }
 }
@@ -327,6 +368,10 @@ pub fn validate(
 
     // R1, R3, R4, R6
     let mut incoming_count: HashMap<&str, usize> = HashMap::new();
+    // Krawedzie liczone TAKZE per port: wezel z typowanymi wejsciami (llm) moze
+    // przyjac kilka krawedzi, ale dwie na TEN SAM port to nadal blad — drugi
+    // producent zostalby po cichu zignorowany przy skladaniu wejsc.
+    let mut incoming_per_port: HashMap<(&str, &str), usize> = HashMap::new();
     for edge in &def.edges {
         let from_node = nodes_by_id.get(edge.from.as_str()).ok_or_else(|| {
             FlowValidationError::UnknownNode {
@@ -419,8 +464,26 @@ pub fn validate(
         // the entry node a second time but is NOT a structural input — without
         // this exclusion the entry node would always read as 2-input and fail
         // the 1-input-edge rule.
-        if !edge.is_loop_back() {
+        //
+        // That exemption is earned by the region, so it is checked HERE, at the
+        // point where it is granted, and BEFORE R4/R7 read the counts: a
+        // `loop_back` edge that does not close one region would otherwise be an
+        // edge nothing sees — not R4, not the toposort, not the executor's
+        // input collection — while still feeding R7's region-exit waiver.
+        if edge.is_loop_back() {
+            if from_node.region.is_none() || from_node.region != to_node.region {
+                return Err(FlowValidationError::LoopBackOutsideRegion {
+                    from_node: from_node.id.clone(),
+                    from_region: from_node.region.clone(),
+                    to_node: to_node.id.clone(),
+                    to_region: to_node.region.clone(),
+                });
+            }
+        } else {
             *incoming_count.entry(to_node.id.as_str()).or_insert(0) += 1;
+            *incoming_per_port
+                .entry((to_node.id.as_str(), edge.to_port.as_str()))
+                .or_insert(0) += 1;
         }
     }
 
@@ -449,6 +512,30 @@ pub fn validate(
         // węzeł, który dla tekstu dekoduje treść, a dla nieznanego binarnego rzuca
         // twardy błąd ingestu — zamiast cichego placeholdera w indeksie.
         if node.node_type == "text_extract" {
+            continue;
+        }
+        // `llm` ma typowane porty per modalnosc (`in`/`image`/`audio`), a jedna
+        // tura multimodalna to LEGALNIE kilka krawedzi naraz: prompt tekstowy z
+        // jednej galezi i zdjecie z drugiej skladaja sie na jedna wiadomosc
+        // uzytkownika. Bez zwolnienia z R4 obrazu nie da sie podpiac inaczej niz
+        // zamiast tekstu — czyli model dostawalby zdjecie bez pytania.
+        //
+        // Zwolnienie jest jednak WYLACZNIE od liczby krawedzi na wezel, nie na
+        // port: dwa zrodla wpiete w ten sam port to nadal blad, bo `merge_inputs`
+        // wybralby jedno z nich na baze, a drugie przepadloby bez sladu.
+        if node.node_type == "llm" {
+            if let Some((port, actual)) = incoming_per_port
+                .iter()
+                .filter(|((n, _), _)| *n == node.id.as_str())
+                .find(|(_, c)| **c > 1)
+                .map(|((_, p), c)| ((*p).to_string(), *c))
+            {
+                tracing::debug!(node = %node.id, port = %port, actual, "llm port has multiple producers");
+                return Err(FlowValidationError::MultipleInputs {
+                    node_id: node.id.clone(),
+                    actual,
+                });
+            }
             continue;
         }
         // `output` ma 6 typed input portow (text/audio/image/video/embedding
@@ -662,7 +749,11 @@ pub fn validate(
     Ok(())
 }
 
-/// R11 — inline loop-region integrity. For every distinct `FlowNode.region` id:
+/// R11 — inline loop-region integrity. Runs after the edge pass, which has
+/// already rejected every `loop_back` edge that does not span ONE region; the
+/// early return on "no node carries a region" is therefore not a hole — a graph
+/// without regions provably has no back edges left. For every distinct
+/// `FlowNode.region` id:
 ///   * exactly one `loop_back` edge, both endpoints in this region;
 ///   * the back edge's target (entry) and source (exit) are members;
 ///   * no forward (non-loop_back) edge crosses the region boundary except an
@@ -838,6 +929,145 @@ mod tests {
         serde_json::from_str(json).unwrap()
     }
 
+    // -------------------------------------------------------------------
+    // R11 — a `loop_back` edge is an EXEMPTION, and it has to be earned
+    // -------------------------------------------------------------------
+
+    /// The hole: `kind:"loop_back"` takes an edge out of the R4 in-degree count,
+    /// out of Kahn's toposort and out of the executor's input collection. With
+    /// no node carrying a `region`, `validate_loop_regions` used to return
+    /// `Ok(())` before looking at a single edge — so labelling a SECOND forward
+    /// edge `loop_back` smuggled it past R4 and left it dead in the graph.
+    #[test]
+    fn r11_rejects_a_loop_back_edge_when_no_node_carries_a_region() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"m","type":"llm","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"m","from_port":"text","to_port":"in"},
+                {"from":"m","to":"o","from_port":"full","to_port":"text"},
+                {"from":"t","to":"m","from_port":"text","to_port":"in","kind":"loop_back"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::LoopBackOutsideRegion { .. }),
+            "expected LoopBackOutsideRegion, got: {err:?}"
+        );
+    }
+
+    /// The same hole from the other side: one endpoint in a region, the other
+    /// outside. Nothing declares which region such an edge belongs to, and R11's
+    /// per-region filter (`touches a member`) would treat it as that region's
+    /// back edge — accepting a "loop" that leaves the region.
+    #[test]
+    fn r11_rejects_a_loop_back_edge_straddling_the_region_boundary() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"m","type":"llm","region":"r","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"m","from_port":"text","to_port":"in"},
+                {"from":"m","to":"o","from_port":"full","to_port":"text"},
+                {"from":"t","to":"m","from_port":"text","to_port":"in","kind":"loop_back"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        match err {
+            FlowValidationError::LoopBackOutsideRegion {
+                from_region,
+                to_region,
+                ..
+            } => {
+                assert_eq!(from_region, None);
+                assert_eq!(to_region.as_deref(), Some("r"));
+            }
+            other => panic!("expected LoopBackOutsideRegion, got: {other:?}"),
+        }
+    }
+
+    /// Two regions, one back edge across them: neither region closes, and R11's
+    /// old per-region view would have counted the same edge for both.
+    #[test]
+    fn r11_rejects_a_loop_back_edge_between_two_different_regions() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"a","type":"llm","region":"r1","config":{}},
+                {"id":"b","type":"llm","region":"r2","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"a","from_port":"text","to_port":"in"},
+                {"from":"a","to":"b","from_port":"full","to_port":"in"},
+                {"from":"b","to":"o","from_port":"full","to_port":"text"},
+                {"from":"b","to":"a","from_port":"full","to_port":"in","kind":"loop_back"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::LoopBackOutsideRegion { .. }),
+            "expected LoopBackOutsideRegion, got: {err:?}"
+        );
+    }
+
+    /// The stray edge is rejected on its own account, not as a side effect of
+    /// some other rule failing first. This graph is otherwise entirely valid —
+    /// a legal streaming shape, R4 satisfied, R7 satisfied (`llm` IS a
+    /// registered producer) — and the ONLY thing wrong with it is a `loop_back`
+    /// edge that closes no region. That is exactly the shape that used to be
+    /// accepted in silence, and the same shape whose source R7 would have
+    /// entered into `region_exit_ids` as a stream-producer waiver.
+    #[test]
+    fn r11_rejects_a_stray_loop_back_in_an_otherwise_valid_flow() {
+        let valid = r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"m","type":"llm","config":{}},
+                {"id":"o","type":"output","config":{"mode":"stream"}}
+            ],"edges":[
+                {"from":"t","to":"m","from_port":"text","to_port":"in"},
+                {"from":"m","to":"o","from_port":"stream","to_port":"text"}
+                PLACEHOLDER
+            ]}"#;
+        // Without the stray edge the flow validates.
+        validate(&parse(&valid.replace("PLACEHOLDER", "")), &registry())
+            .expect("the base flow is a legal streaming shape");
+        // Adding it — and nothing else — must now be an error.
+        let err = validate(
+            &parse(&valid.replace(
+                "PLACEHOLDER",
+                r#",{"from":"m","to":"m","from_port":"full","to_port":"in","kind":"loop_back"}"#,
+            )),
+            &registry(),
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::LoopBackOutsideRegion { .. }),
+            "a stray loop_back must be an error of its own; got: {err:?}"
+        );
+    }
+
+    /// The legitimate shape still validates: both endpoints in ONE region, and
+    /// the back edge stays out of the R4 in-degree count (the region entry keeps
+    /// its single forward input).
+    #[test]
+    fn r11_accepts_a_loop_back_edge_inside_one_region() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"m","type":"llm","region":"r","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"m","from_port":"text","to_port":"in"},
+                {"from":"m","to":"o","from_port":"full","to_port":"text"},
+                {"from":"m","to":"m","from_port":"full","to_port":"in","kind":"loop_back"}
+            ]}"#,
+        );
+        validate(&def, &registry()).expect("a back edge inside one region is the intended shape");
+    }
+
     #[test]
     fn ok_minimal_flow() {
         let def = parse(
@@ -942,6 +1172,29 @@ mod tests {
         );
         let err = validate(&def, &registry()).unwrap_err();
         assert!(matches!(err, FlowValidationError::MultipleInputs { .. }));
+    }
+
+    /// Multimodalna tura to LEGALNIE kilka krawedzi do `llm` — ale kazda na INNY
+    /// port. Tekst z jednej galezi i obraz z drugiej skladaja sie na jedna
+    /// wiadomosc uzytkownika; dwa zrodla na tym samym porcie to nadal blad, bo
+    /// jedno z nich przepadloby przy skladaniu wejsc.
+    #[test]
+    fn accepts_llm_fan_in_on_distinct_ports() {
+        let def = parse(
+            r#"{
+                "nodes":[
+                    {"id":"t","type":"trigger","config":{}},
+                    {"id":"l","type":"llm","config":{"model":"m"}},
+                    {"id":"o","type":"output","config":{}}
+                ],
+                "edges":[
+                    {"from":"t","to":"l","from_port":"text","to_port":"in"},
+                    {"from":"t","to":"l","from_port":"image","to_port":"image"},
+                    {"from":"l","to":"o","to_port":"text"}
+                ]
+            }"#,
+        );
+        validate(&def, &registry()).expect("tekst + obraz na roznych portach jest poprawny");
     }
 
     #[test]

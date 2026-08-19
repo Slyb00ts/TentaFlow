@@ -80,6 +80,7 @@ impl EncodedMessage {
                     .map_err(|e| anyhow!("serialize multimodal content: {e}"))?;
                 let blob_id = parts.iter().find_map(|p| match p {
                     MessagePart::Image { blob_ref, .. } => Some(blob_ref.id.clone()),
+                    MessagePart::Audio { blob_ref, .. } => Some(blob_ref.id.clone()),
                     MessagePart::Text { .. } => None,
                 });
                 match blob_id {

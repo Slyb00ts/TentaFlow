@@ -313,7 +313,7 @@ fn message_to_chat_message(m: &Message) -> Option<ChatMessage> {
                 .iter()
                 .filter_map(|p| match p {
                     ContentPart::Text { text } => Some(text.clone()),
-                    ContentPart::ImageUrl { .. } => None,
+                    ContentPart::ImageUrl { .. } | ContentPart::InputAudio { .. } => None,
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
@@ -401,16 +401,20 @@ pub(crate) fn openai_messages_to_vision(
                 }
                 Some(MessageContent::Parts(parts)) => parts
                     .iter()
-                    .map(|part| match part {
-                        ContentPart::Text { text } => {
-                            tentaflow_protocol::VisionContentPart::Text { text: text.clone() }
-                        }
+                    .filter_map(|part| match part {
+                        ContentPart::Text { text } => Some(
+                            tentaflow_protocol::VisionContentPart::Text { text: text.clone() },
+                        ),
                         ContentPart::ImageUrl { image_url } => {
-                            tentaflow_protocol::VisionContentPart::ImageUrl {
+                            Some(tentaflow_protocol::VisionContentPart::ImageUrl {
                                 url: image_url.url.clone(),
                                 detail: image_url.detail.clone(),
-                            }
+                            })
                         }
+                        // The vision wire has no audio part and inventing one
+                        // would be a protocol change; a vision route simply
+                        // carries no sound.
+                        ContentPart::InputAudio { .. } => None,
                     })
                     .collect(),
                 None => Vec::new(),

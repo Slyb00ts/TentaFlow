@@ -11,7 +11,12 @@
 //       and a child with slot="lead" (e.g. avatar) is kept before the label.
 //       `variant="tag"` + `tone` + `size` renders a static tag (.tf-tag--*
 //       classes) instead of the status pill.
+//       `icon="<sprite-id>"` puts a 12px leading glyph before the label and
+//       `mono` switches the chip to the monospace face with normal casing —
+//       the pair used for machine-readable context (branch name, mode, profile)
+//       that must stay legible character by character.
 // Przyklad: <tf-chip status="online" dot>Online</tf-chip>
+//           <tf-chip mono icon="branch">cs/piotr/9f2a1c4b</tf-chip>
 // =============================================================================
 
 const STATUS_CLASSES = new Set([
@@ -40,7 +45,7 @@ class TfChip extends HTMLElement {
   static get observedAttributes() {
     return [
       'status', 'dot', 'dot-tone', 'clickable', 'active', 'icon',
-      'label', 'variant', 'tone', 'size', 'removable',
+      'label', 'variant', 'tone', 'size', 'removable', 'mono',
     ];
   }
 
@@ -117,6 +122,9 @@ class TfChip extends HTMLElement {
     // i 'active' sa stylowane przez controls.css lub CSS modulu uzywajacego.
     if (this.hasAttribute('clickable')) cls.push('clickable');
     if (this.hasAttribute('active')) cls.push('active');
+    // Monospace face + normal casing: identifiers must not be upper-cased or
+    // letter-spaced, or a branch name stops being copy-readable.
+    if (this.hasAttribute('mono')) cls.push('tf-chip--mono');
     span.className = cls.join(' ');
 
     if (hasDot) {

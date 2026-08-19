@@ -351,25 +351,82 @@ fn initial_state_entries() -> Vec<StateEntry> {
     let empty_arr = || CborValue::Array(vec![]);
     let empty_str = || CborValue::Text("".into());
     vec![
-        StateEntry { path: state_path(SP_ACTIVE_TAB), value: CborValue::Text(DEFAULT_TAB.into()) },
-        StateEntry { path: state_path(SP_NEW_COLLECTION), value: empty_str() },
-        StateEntry { path: state_path(SP_SIDEBAR_SEARCH), value: empty_str() },
-        StateEntry { path: state_path(SP_CREATE_OPEN), value: CborValue::Text("0".into()) },
-        StateEntry { path: state_path(SP_SELECTED_COLLECTION), value: empty_str() },
-        StateEntry { path: state_path(SP_SELECTED_COLLECTION_NAME), value: empty_str() },
-        StateEntry { path: state_path(SP_WS_DOCCOUNT), value: empty_str() },
-        StateEntry { path: state_path(SP_DOCUMENT_ROWS), value: empty_arr() },
-        StateEntry { path: state_path(SP_INGEST_SUMMARY), value: empty_str() },
-        StateEntry { path: state_path(SP_CHAT_INPUT), value: empty_str() },
-        StateEntry { path: state_path(SP_CHAT_MESSAGES), value: empty_arr() },
-        StateEntry { path: state_path(SP_GRAPH_QUERY), value: empty_str() },
-        StateEntry { path: state_path(SP_GRAPH_CENTER), value: empty_str() },
-        StateEntry { path: state_path(SP_NEIGHBOR_ROWS), value: empty_arr() },
-        StateEntry { path: state_path(SP_FACT_ROWS), value: empty_arr() },
-        StateEntry { path: state_path(SP_CONFLICT_STATUS), value: CborValue::Text("open".into()) },
-        StateEntry { path: state_path(SP_CONFLICT_ROWS), value: empty_arr() },
-        StateEntry { path: state_path(SP_CONFLICT_DETAIL), value: empty_str() },
-        StateEntry { path: state_path(SP_STATUS_MESSAGE), value: empty_str() },
+        StateEntry {
+            path: state_path(SP_ACTIVE_TAB),
+            value: CborValue::Text(DEFAULT_TAB.into()),
+        },
+        StateEntry {
+            path: state_path(SP_NEW_COLLECTION),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_SIDEBAR_SEARCH),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_CREATE_OPEN),
+            value: CborValue::Text("0".into()),
+        },
+        StateEntry {
+            path: state_path(SP_SELECTED_COLLECTION),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_SELECTED_COLLECTION_NAME),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_WS_DOCCOUNT),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_DOCUMENT_ROWS),
+            value: empty_arr(),
+        },
+        StateEntry {
+            path: state_path(SP_INGEST_SUMMARY),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_CHAT_INPUT),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_CHAT_MESSAGES),
+            value: empty_arr(),
+        },
+        StateEntry {
+            path: state_path(SP_GRAPH_QUERY),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_GRAPH_CENTER),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_NEIGHBOR_ROWS),
+            value: empty_arr(),
+        },
+        StateEntry {
+            path: state_path(SP_FACT_ROWS),
+            value: empty_arr(),
+        },
+        StateEntry {
+            path: state_path(SP_CONFLICT_STATUS),
+            value: CborValue::Text("open".into()),
+        },
+        StateEntry {
+            path: state_path(SP_CONFLICT_ROWS),
+            value: empty_arr(),
+        },
+        StateEntry {
+            path: state_path(SP_CONFLICT_DETAIL),
+            value: empty_str(),
+        },
+        StateEntry {
+            path: state_path(SP_STATUS_MESSAGE),
+            value: empty_str(),
+        },
         StateEntry {
             path: state_path(SP_GRAPH_ENABLED),
             value: CborValue::Text(if ui_graph_enabled() { "1" } else { "0" }.into()),
@@ -444,7 +501,10 @@ fn workspace_data_overlay(tab: &str) -> Vec<StateEntry> {
     }
     match tab {
         TAB_DOCUMENTS => vec![
-            StateEntry { path: state_path(SP_DOCUMENT_ROWS), value: load_document_rows(&collection) },
+            StateEntry {
+                path: state_path(SP_DOCUMENT_ROWS),
+                value: load_document_rows(&collection),
+            },
             StateEntry {
                 path: state_path(SP_INGEST_SUMMARY),
                 value: CborValue::Text(load_ingest_summary(&collection)),
@@ -492,12 +552,16 @@ fn workspace_field_overlay(tab: &str) -> Vec<StateEntry> {
 
 /// Czy panel inline-create kolekcji jest otwarty (KV sesji "1"/"0").
 fn create_open() -> bool {
-    field_value(SP_CREATE_OPEN).map(|v| v == "1").unwrap_or(false)
+    field_value(SP_CREATE_OPEN)
+        .map(|v| v == "1")
+        .unwrap_or(false)
 }
 
 /// Filtr listy baz w sidebarze (substring, lowercase). Pusty => brak filtra.
 fn sidebar_filter() -> String {
-    field_value(SP_SIDEBAR_SEARCH).unwrap_or_default().to_lowercase()
+    field_value(SP_SIDEBAR_SEARCH)
+        .unwrap_or_default()
+        .to_lowercase()
 }
 
 /// Widok sidebara: naglowek + przycisk "Nowa", wyszukiwarka, lista kart kolekcji.
@@ -621,7 +685,10 @@ fn sidebar_view() -> Component {
 fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) -> Component {
     let id = c.get("id").and_then(|v| v.as_str()).unwrap_or("");
     let name = c.get("name").and_then(|v| v.as_str()).unwrap_or(id);
-    let docs = c.get("document_count").and_then(|v| v.as_i64()).unwrap_or(0);
+    let docs = c
+        .get("document_count")
+        .and_then(|v| v.as_i64())
+        .unwrap_or(0);
     let active = !id.is_empty() && id == selected;
 
     let info = Stack {
@@ -641,7 +708,11 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
 
     let badge = Badge {
         variant: BadgeVariant::Dot,
-        tone: if graph_on { Tone::Success } else { Tone::Neutral },
+        tone: if graph_on {
+            Tone::Success
+        } else {
+            Tone::Neutral
+        },
         label: lit(if graph_on { "graf" } else { "wektor" }),
         icon: None,
         count: None,
@@ -669,7 +740,9 @@ fn collection_card(index: usize, c: &JsonValue, selected: &str, graph_on: bool) 
             CardVariant::Filled,
             Some(Tone::Primary),
             ShadowToken::Subtle,
-            BorderToken::Accent { tone: Tone::Primary },
+            BorderToken::Accent {
+                tone: Tone::Primary,
+            },
             BackgroundToken::Accent,
         )
     } else {
@@ -1025,7 +1098,9 @@ fn message_bubble(index: usize, role: &str, content: &str) -> Component {
         .expect("kodowanie Cluster user bubble")
     } else {
         let avatar = Avatar {
-            source: AvatarRef::Initials { initials: "AI".into() },
+            source: AvatarRef::Initials {
+                initials: "AI".into(),
+            },
             size: AvatarSize::Sm,
             shape: AvatarShape::Circle,
             status: None,
@@ -1202,7 +1277,11 @@ fn empty_state(
     primary: Option<Component>,
 ) -> Component {
     EmptyState {
-        icon: IconRef::Named { name: icon, size: None, tone: None },
+        icon: IconRef::Named {
+            name: icon,
+            size: None,
+            tone: None,
+        },
         heading: lit(heading_text),
         message: message.map(lit),
         primary_action: primary,
@@ -1306,7 +1385,13 @@ fn section_stack(id: &str, children: Vec<Component>) -> Component {
     .expect("kodowanie Stack sekcji")
 }
 
-fn action_button(id: &str, label: &str, action_id: &str, variant: ButtonVariant, tone: Tone) -> Component {
+fn action_button(
+    id: &str,
+    label: &str,
+    action_id: &str,
+    variant: ButtonVariant,
+    tone: Tone,
+) -> Component {
     let mut button = Button {
         variant,
         tone,
@@ -1321,7 +1406,10 @@ fn action_button(id: &str, label: &str, action_id: &str, variant: ButtonVariant,
     }
     .into_component(id)
     .expect("kodowanie Button");
-    button.handlers = Some(HandlerMap(vec![backend_handler(EventKind::Click, action_id)]));
+    button.handlers = Some(HandlerMap(vec![backend_handler(
+        EventKind::Click,
+        action_id,
+    )]));
     button
 }
 
@@ -1425,7 +1513,10 @@ fn row_action(id: &str, label: &str, action_id: &str, tone: Tone) -> Component {
     }
     .into_component(id)
     .expect("kodowanie Button row-action");
-    button.handlers = Some(HandlerMap(vec![backend_handler(EventKind::Click, action_id)]));
+    button.handlers = Some(HandlerMap(vec![backend_handler(
+        EventKind::Click,
+        action_id,
+    )]));
     button
 }
 
@@ -1476,22 +1567,63 @@ fn documents_tab() -> Component {
         "ingest-uploaded",
     )]));
 
-    let refresh = action_button("doc-refresh", "Odswiez", "refresh-documents", ButtonVariant::Secondary, Tone::Neutral);
+    let refresh = action_button(
+        "doc-refresh",
+        "Odswiez",
+        "refresh-documents",
+        ButtonVariant::Secondary,
+        Tone::Neutral,
+    );
 
     let tbl = table(
         "doc-table",
         SP_DOCUMENT_ROWS,
         "id",
         vec![
-            col("d-name", "Nazwa", "filename", TableColumnWidth::Fr { value: 3 }),
+            col(
+                "d-name",
+                "Nazwa",
+                "filename",
+                TableColumnWidth::Fr { value: 3 },
+            ),
             col("d-mime", "Typ", "mime", TableColumnWidth::Fr { value: 2 }),
-            col("d-chunks", "Chunki", "chunk_count", TableColumnWidth::Fr { value: 1 }),
-            col("d-ents", "Encje", "entity_count", TableColumnWidth::Fr { value: 1 }),
-            col("d-rels", "Relacje", "relation_count", TableColumnWidth::Fr { value: 1 }),
-            col("d-graph", "Graf", "graph_flag", TableColumnWidth::Fr { value: 1 }),
-            col("d-status", "Status", "status", TableColumnWidth::Fr { value: 1 }),
+            col(
+                "d-chunks",
+                "Chunki",
+                "chunk_count",
+                TableColumnWidth::Fr { value: 1 },
+            ),
+            col(
+                "d-ents",
+                "Encje",
+                "entity_count",
+                TableColumnWidth::Fr { value: 1 },
+            ),
+            col(
+                "d-rels",
+                "Relacje",
+                "relation_count",
+                TableColumnWidth::Fr { value: 1 },
+            ),
+            col(
+                "d-graph",
+                "Graf",
+                "graph_flag",
+                TableColumnWidth::Fr { value: 1 },
+            ),
+            col(
+                "d-status",
+                "Status",
+                "status",
+                TableColumnWidth::Fr { value: 1 },
+            ),
         ],
-        vec![row_action("doc-delete", "Usun", "delete-document", Tone::Critical)],
+        vec![row_action(
+            "doc-delete",
+            "Usun",
+            "delete-document",
+            Tone::Critical,
+        )],
     );
 
     // Sekcja „Wgraj dokumenty": dropzone + podsumowanie statusu ingestu.
@@ -1500,7 +1632,11 @@ fn documents_tab() -> Component {
         "Wgraj dokumenty",
         Some("Po wgraniu uruchamiany jest pelny ingest: parse -> chunk -> embedding."),
         vec![],
-        vec![upload, summary, muted_caption("doc-status", bound(SP_STATUS_MESSAGE))],
+        vec![
+            upload,
+            summary,
+            muted_caption("doc-status", bound(SP_STATUS_MESSAGE)),
+        ],
     );
 
     // Sekcja „Dokumenty": akcja odswiezenia w naglowku, tabela z oddechem ponizej.
@@ -1520,8 +1656,19 @@ fn documents_tab() -> Component {
 // =============================================================================
 
 fn graph_tab() -> Component {
-    let query = text_input("graph-query", SP_GRAPH_QUERY, "Encja", "Nazwa encji (np. albert einstein)");
-    let explore = action_button("graph-explore", "Eksploruj", "explore-graph", ButtonVariant::Primary, Tone::Neutral);
+    let query = text_input(
+        "graph-query",
+        SP_GRAPH_QUERY,
+        "Encja",
+        "Nazwa encji (np. albert einstein)",
+    );
+    let explore = action_button(
+        "graph-explore",
+        "Eksploruj",
+        "explore-graph",
+        ButtonVariant::Primary,
+        Tone::Neutral,
+    );
     let center = body_text("graph-center", bound(SP_GRAPH_CENTER));
 
     let neighbors = table(
@@ -1529,11 +1676,26 @@ fn graph_tab() -> Component {
         SP_NEIGHBOR_ROWS,
         "key",
         vec![
-            col("n-name", "Sasiad", "name", TableColumnWidth::Fr { value: 3 }),
+            col(
+                "n-name",
+                "Sasiad",
+                "name",
+                TableColumnWidth::Fr { value: 3 },
+            ),
             col("n-rel", "Relacja", "rel", TableColumnWidth::Fr { value: 2 }),
-            col("n-weight", "Waga", "weight", TableColumnWidth::Fr { value: 1 }),
+            col(
+                "n-weight",
+                "Waga",
+                "weight",
+                TableColumnWidth::Fr { value: 1 },
+            ),
         ],
-        vec![row_action("n-open", "Wejdz", "explore-neighbor", Tone::Primary)],
+        vec![row_action(
+            "n-open",
+            "Wejdz",
+            "explore-neighbor",
+            Tone::Primary,
+        )],
     );
 
     let facts = table(
@@ -1541,10 +1703,20 @@ fn graph_tab() -> Component {
         SP_FACT_ROWS,
         "fact_key",
         vec![
-            col("f-src", "Zrodlo", "source", TableColumnWidth::Fr { value: 2 }),
+            col(
+                "f-src",
+                "Zrodlo",
+                "source",
+                TableColumnWidth::Fr { value: 2 },
+            ),
             col("f-rel", "Relacja", "rel", TableColumnWidth::Fr { value: 2 }),
             col("f-tgt", "Cel", "target", TableColumnWidth::Fr { value: 2 }),
-            col("f-prov", "Provenance (dok)", "provenance_document_id", TableColumnWidth::Fr { value: 2 }),
+            col(
+                "f-prov",
+                "Provenance (dok)",
+                "provenance_document_id",
+                TableColumnWidth::Fr { value: 2 },
+            ),
         ],
         vec![],
     );
@@ -1566,13 +1738,26 @@ fn graph_tab() -> Component {
         "Graf wiedzy",
         Some("Eksploruj encje i ich powiazania w bazie."),
         vec![],
-        vec![explore_row, center, muted_caption("graph-status", bound(SP_STATUS_MESSAGE))],
+        vec![
+            explore_row,
+            center,
+            muted_caption("graph-status", bound(SP_STATUS_MESSAGE)),
+        ],
     );
 
-    let neighbors_section = section_card("graph-neighbors-section", "Sasiedztwo", None, vec![], vec![neighbors]);
+    let neighbors_section = section_card(
+        "graph-neighbors-section",
+        "Sasiedztwo",
+        None,
+        vec![],
+        vec![neighbors],
+    );
     let facts_section = section_card("graph-facts-section", "Fakty", None, vec![], vec![facts]);
 
-    section_stack("tab-graph", vec![explore_section, neighbors_section, facts_section])
+    section_stack(
+        "tab-graph",
+        vec![explore_section, neighbors_section, facts_section],
+    )
 }
 
 // =============================================================================
@@ -1599,12 +1784,36 @@ fn conflicts_tab() -> Component {
         SP_CONFLICT_STATUS,
     )]));
 
-    let refresh = action_button("conf-refresh", "Filtruj", "filter-conflicts", ButtonVariant::Secondary, Tone::Neutral);
+    let refresh = action_button(
+        "conf-refresh",
+        "Filtruj",
+        "filter-conflicts",
+        ButtonVariant::Secondary,
+        Tone::Neutral,
+    );
 
     // Reczne wyzwolenie agentow (admin).
-    let scan = action_button("conf-scan", "A_det: skan", "run-conflict-scan", ButtonVariant::Ghost, Tone::Neutral);
-    let resolve = action_button("conf-resolve", "A_res: adjudykuj", "run-conflict-resolve", ButtonVariant::Ghost, Tone::Neutral);
-    let merge = action_button("conf-merge", "A_uni: scal encje", "run-entity-merge-scan", ButtonVariant::Ghost, Tone::Neutral);
+    let scan = action_button(
+        "conf-scan",
+        "A_det: skan",
+        "run-conflict-scan",
+        ButtonVariant::Ghost,
+        Tone::Neutral,
+    );
+    let resolve = action_button(
+        "conf-resolve",
+        "A_res: adjudykuj",
+        "run-conflict-resolve",
+        ButtonVariant::Ghost,
+        Tone::Neutral,
+    );
+    let merge = action_button(
+        "conf-merge",
+        "A_uni: scal encje",
+        "run-entity-merge-scan",
+        ButtonVariant::Ghost,
+        Tone::Neutral,
+    );
     let admin_row = Cluster {
         gap: Spacing::Sm,
         align: FlexAlign::Center,
@@ -1620,16 +1829,46 @@ fn conflicts_tab() -> Component {
         SP_CONFLICT_ROWS,
         "dedup_key",
         vec![
-            col("k-type", "Typ", "conflict_type", TableColumnWidth::Fr { value: 2 }),
-            col("k-head", "Encja (head)", "head_id", TableColumnWidth::Fr { value: 2 }),
+            col(
+                "k-type",
+                "Typ",
+                "conflict_type",
+                TableColumnWidth::Fr { value: 2 },
+            ),
+            col(
+                "k-head",
+                "Encja (head)",
+                "head_id",
+                TableColumnWidth::Fr { value: 2 },
+            ),
             col("k-rel", "Relacja", "rel", TableColumnWidth::Fr { value: 2 }),
-            col("k-members", "Fakty", "member_count", TableColumnWidth::Fr { value: 1 }),
-            col("k-status", "Status", "status", TableColumnWidth::Fr { value: 2 }),
-            col("k-decision", "Decyzja", "decision_action", TableColumnWidth::Fr { value: 2 }),
+            col(
+                "k-members",
+                "Fakty",
+                "member_count",
+                TableColumnWidth::Fr { value: 1 },
+            ),
+            col(
+                "k-status",
+                "Status",
+                "status",
+                TableColumnWidth::Fr { value: 2 },
+            ),
+            col(
+                "k-decision",
+                "Decyzja",
+                "decision_action",
+                TableColumnWidth::Fr { value: 2 },
+            ),
         ],
         vec![
             row_action("k-detail", "Szczegoly", "conflict-detail", Tone::Primary),
-            row_action("k-approve", "Zatwierdz (escalated)", "approve-escalated", Tone::Success),
+            row_action(
+                "k-approve",
+                "Zatwierdz (escalated)",
+                "approve-escalated",
+                Tone::Success,
+            ),
         ],
     );
 
@@ -1652,13 +1891,32 @@ fn conflicts_tab() -> Component {
         "Konflikty",
         Some("Filtruj liste i recznie wyzwalaj agentow detekcji/adjudykacji."),
         vec![],
-        vec![filter_row, admin_row, muted_caption("conf-status-msg", bound(SP_STATUS_MESSAGE))],
+        vec![
+            filter_row,
+            admin_row,
+            muted_caption("conf-status-msg", bound(SP_STATUS_MESSAGE)),
+        ],
     );
 
-    let list_section = section_card("conf-list-section", "Lista konfliktow", None, vec![], vec![tbl]);
-    let detail_section = section_card("conf-detail-section", "Szczegoly konfliktu", None, vec![], vec![detail]);
+    let list_section = section_card(
+        "conf-list-section",
+        "Lista konfliktow",
+        None,
+        vec![],
+        vec![tbl],
+    );
+    let detail_section = section_card(
+        "conf-detail-section",
+        "Szczegoly konfliktu",
+        None,
+        vec![],
+        vec![detail],
+    );
 
-    section_stack("tab-conflicts", vec![controls_section, list_section, detail_section])
+    section_stack(
+        "tab-conflicts",
+        vec![controls_section, list_section, detail_section],
+    )
 }
 
 // =============================================================================
@@ -1797,7 +2055,10 @@ fn load_document_rows(collection_id: &str) -> CborValue {
     let rows: Vec<JsonValue> = docs
         .iter()
         .map(|d| {
-            let partial = d.get("graph_partial").and_then(|v| v.as_bool()).unwrap_or(false);
+            let partial = d
+                .get("graph_partial")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
             json!({
                 "id": d.get("id").and_then(|v| v.as_str()).unwrap_or(""),
                 "filename": d.get("filename").and_then(|v| v.as_str()).unwrap_or(""),
@@ -1970,7 +2231,11 @@ pub fn handle_ui_action(action_id: &str, params: &JsonValue) -> JsonValue {
 /// prawdy dla logiki; tu zapisujemy ten sam klucz instancyjny (Durable, NIE per-sesja:
 /// to ustawienie instancji, ma przetrwac restart i obowiazywac wszystkich userow panelu).
 fn action_set_graph_enabled(params: &JsonValue) -> JsonValue {
-    let raw = params.get("value").and_then(|v| v.as_str()).unwrap_or("0").trim();
+    let raw = params
+        .get("value")
+        .and_then(|v| v.as_str())
+        .unwrap_or("0")
+        .trim();
     let on = raw.eq_ignore_ascii_case("1") || raw.eq_ignore_ascii_case("true");
     let stored = if on { "1" } else { "0" };
     if let Err(e) = crate::state_set(
@@ -2035,11 +2300,7 @@ fn action_set_field(params: &JsonValue) -> JsonValue {
 fn is_known_field(field: &str) -> bool {
     matches!(
         field,
-        SP_NEW_COLLECTION
-            | SP_SIDEBAR_SEARCH
-            | SP_CHAT_INPUT
-            | SP_GRAPH_QUERY
-            | SP_CONFLICT_STATUS
+        SP_NEW_COLLECTION | SP_SIDEBAR_SEARCH | SP_CHAT_INPUT | SP_GRAPH_QUERY | SP_CONFLICT_STATUS
     )
 }
 
@@ -2118,7 +2379,9 @@ fn action_ingest_uploaded(params: &JsonValue) -> JsonValue {
             .and_then(|s| s.as_str())
             .unwrap_or("");
         if status == "duplicate" {
-            patch_status(&format!("Pominieto duplikat '{filename}' — ta sama tresc juz w bazie."));
+            patch_status(&format!(
+                "Pominieto duplikat '{filename}' — ta sama tresc juz w bazie."
+            ));
         } else {
             patch_status(&format!("Dodano '{filename}' do kolejki ingestu."));
         }
@@ -2296,8 +2559,16 @@ fn action_explore_graph(params: &JsonValue, from_neighbor: bool) -> JsonValue {
         .and_then(|c| c.get("name"))
         .and_then(|n| n.as_str())
         .unwrap_or("");
-    let neighbors = data.get("neighbors").and_then(|n| n.as_array()).cloned().unwrap_or_default();
-    let facts = data.get("facts").and_then(|f| f.as_array()).cloned().unwrap_or_default();
+    let neighbors = data
+        .get("neighbors")
+        .and_then(|n| n.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let facts = data
+        .get("facts")
+        .and_then(|f| f.as_array())
+        .cloned()
+        .unwrap_or_default();
 
     let neighbor_rows: Vec<JsonValue> = neighbors
         .iter()
@@ -2323,10 +2594,17 @@ fn action_explore_graph(params: &JsonValue, from_neighbor: bool) -> JsonValue {
         })
         .collect();
 
-    patch_set(SP_GRAPH_CENTER, CborValue::Text(format!("Encja: {center_name}")));
+    patch_set(
+        SP_GRAPH_CENTER,
+        CborValue::Text(format!("Encja: {center_name}")),
+    );
     patch_set(SP_NEIGHBOR_ROWS, rows_to_cbor(neighbor_rows));
     patch_set(SP_FACT_ROWS, rows_to_cbor(fact_rows));
-    patch_status(&format!("{} sasiadow, {} faktow.", neighbors.len(), facts.len()));
+    patch_status(&format!(
+        "{} sasiadow, {} faktow.",
+        neighbors.len(),
+        facts.len()
+    ));
     res
 }
 
@@ -2341,7 +2619,10 @@ fn action_conflict_detail(params: &JsonValue) -> JsonValue {
         return res;
     }
     let d = res.get("data").cloned().unwrap_or(json!({}));
-    patch_set(SP_CONFLICT_DETAIL, CborValue::Text(format_conflict_detail(&d)));
+    patch_set(
+        SP_CONFLICT_DETAIL,
+        CborValue::Text(format_conflict_detail(&d)),
+    );
     patch_status("Wczytano szczegoly konfliktu.");
     res
 }
@@ -2365,7 +2646,10 @@ fn action_approve_escalated(params: &JsonValue) -> JsonValue {
     let winner = data
         .get("members")
         .and_then(|m| m.as_array())
-        .and_then(|arr| arr.iter().find(|f| f.get("active").and_then(|a| a.as_bool()).unwrap_or(false)))
+        .and_then(|arr| {
+            arr.iter()
+                .find(|f| f.get("active").and_then(|a| a.as_bool()).unwrap_or(false))
+        })
         .and_then(|f| f.get("fact_key").and_then(|k| k.as_str()))
         .map(|s| s.to_string());
     let winner = match winner {
@@ -2456,12 +2740,18 @@ fn format_conflict_detail(d: &JsonValue) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "Typ: {} | head: {} | rel: {} | status: {}\n",
-        d.get("conflict_type").and_then(|v| v.as_str()).unwrap_or("-"),
+        d.get("conflict_type")
+            .and_then(|v| v.as_str())
+            .unwrap_or("-"),
         d.get("head_id").and_then(|v| v.as_str()).unwrap_or("-"),
         d.get("rel").and_then(|v| v.as_str()).unwrap_or("-"),
         d.get("status").and_then(|v| v.as_str()).unwrap_or("-"),
     ));
-    if let Some(action) = d.get("decision").and_then(|x| x.get("action")).and_then(|a| a.as_str()) {
+    if let Some(action) = d
+        .get("decision")
+        .and_then(|x| x.get("action"))
+        .and_then(|a| a.as_str())
+    {
         out.push_str(&format!("Decyzja A_res: {action}\n"));
     }
     if let Some(members) = d.get("members").and_then(|m| m.as_array()) {
@@ -2603,9 +2893,15 @@ mod tests {
 
     #[test]
     fn row_key_reads_field_then_generic_fallbacks() {
-        assert_eq!(row_key(&json!({"id": "doc1"}), "id"), Some("doc1".to_string()));
+        assert_eq!(
+            row_key(&json!({"id": "doc1"}), "id"),
+            Some("doc1".to_string())
+        );
         // Generyczny fallback "row_key".
-        assert_eq!(row_key(&json!({"row_key": "k"}), "dedup_key"), Some("k".to_string()));
+        assert_eq!(
+            row_key(&json!({"row_key": "k"}), "dedup_key"),
+            Some("k".to_string())
+        );
         // Pusty -> None.
         assert_eq!(row_key(&json!({"id": ""}), "id"), None);
         assert_eq!(row_key(&json!({}), "id"), None);
@@ -2660,7 +2956,10 @@ mod tests {
         // Format klucza: prefix `f:` + sesja + pole (rozne pola => rozne klucze).
         set_session_user(Some("user-A"));
         set_panel_epoch(7);
-        assert_eq!(session_key(SP_NEW_COLLECTION), "f:user-A:7:new_collection_name");
+        assert_eq!(
+            session_key(SP_NEW_COLLECTION),
+            "f:user-A:7:new_collection_name"
+        );
         assert_ne!(
             session_key(SP_CHAT_INPUT),
             session_key(SP_GRAPH_QUERY),
@@ -2679,7 +2978,10 @@ mod tests {
         // Akcja niesie epoch=5 -> adopcja przeklucza session_key na epoch akcji, nie statyk.
         adopt_action_epoch(5);
         assert_eq!(panel_epoch(), 5, "epoch akcji jest zrodlem prawdy");
-        assert_eq!(session_key(SP_NEW_COLLECTION), "f:user-A:5:new_collection_name");
+        assert_eq!(
+            session_key(SP_NEW_COLLECTION),
+            "f:user-A:5:new_collection_name"
+        );
 
         // Ten sam user, dwie karty (rozne epoch z akcji) => rozne klucze pol (brak kolizji).
         adopt_action_epoch(6);
@@ -2705,10 +3007,18 @@ mod tests {
             STATE_REVISION = 12;
         }
         adopt_action_epoch(4);
-        assert_eq!(unsafe { STATE_REVISION }, 12, "ten sam epoch => rewizja zachowana");
+        assert_eq!(
+            unsafe { STATE_REVISION },
+            12,
+            "ten sam epoch => rewizja zachowana"
+        );
         // Inny epoch (reuzyta instancja) => rewizja startuje per-epoch od 0.
         adopt_action_epoch(8);
-        assert_eq!(unsafe { STATE_REVISION }, 0, "nowy epoch => rewizja per-epoch od 0");
+        assert_eq!(
+            unsafe { STATE_REVISION },
+            0,
+            "nowy epoch => rewizja per-epoch od 0"
+        );
     }
 
     #[test]
@@ -2754,7 +3064,14 @@ mod tests {
                 _ => None,
             })
             .collect();
-        for expected in ["open", "resolving", "escalated", "resolved_auto", "resolved_merge_pending", "all"] {
+        for expected in [
+            "open",
+            "resolving",
+            "escalated",
+            "resolved_auto",
+            "resolved_merge_pending",
+            "all",
+        ] {
             assert!(values.contains(&expected), "brak statusu {expected}");
         }
     }

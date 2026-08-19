@@ -2024,6 +2024,7 @@ mod apply_parameters_deploy_tests {
 
     fn make_engine(id: &str) -> Engine {
         Engine {
+            reasoning_levels: None,
             id: id.into(),
             backend: None,
             category: Category::Llm,
@@ -2310,6 +2311,7 @@ mod hf_token_gate_tests {
         api: ApiKind,
     ) -> Engine {
         Engine {
+            reasoning_levels: None,
             id: "test".into(),
             backend: None,
             category,
@@ -2965,6 +2967,7 @@ mod tests {
     fn dummy_manifest(id: &str, runtime: NativeRuntime) -> ServiceManifest {
         ServiceManifest {
             engine: Engine {
+                reasoning_levels: None,
                 id: id.to_string(),
                 backend: None,
                 category: Category::Llm,
@@ -3001,6 +3004,7 @@ mod tests {
                 external: None,
             },
             model_presets: vec![ModelPreset {
+                reasoning_levels: None,
                 id: "preset-a".into(),
                 display_name: "Preset A".into(),
                 repo: "x/y".into(),

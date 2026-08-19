@@ -127,6 +127,8 @@ pub(crate) async fn parse_image_to_markdown(
     ])];
 
     let req = LlmRequest {
+        audio_out: None,
+        reasoning_effort: None,
         model,
         messages,
         temperature: Some(0.0),

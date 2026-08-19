@@ -51,6 +51,7 @@ fn test_cipher() -> tentaflow_core::crypto::SettingsCipher {
 fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
     ServiceManifest {
         engine: Engine {
+            reasoning_levels: None,
             id: id.into(),
             category: Category::Llm,
             name: id.into(),
@@ -88,6 +89,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             external: None,
         },
         model_presets: vec![ModelPreset {
+            reasoning_levels: None,
             id: "preset-a".into(),
             display_name: "Preset A".into(),
             repo: "org/model".into(),
@@ -136,6 +138,8 @@ fn fake_service_info(id: i64, node_id: &str, model_name: &str) -> ServiceInfo {
         // progress_message: brak raportu fazy startu w tescie
         progress_message: None,
         update_available: false,
+        usage_json: None,
+        usage_updated_at: None,
         models: vec![ServiceModelEntry {
             model_name: model_name.into(),
             display_name: None,

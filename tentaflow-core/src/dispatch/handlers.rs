@@ -3885,6 +3885,7 @@ fn catalog_snapshot_to_wire(
         });
 
         out.push(CatalogEntryWire {
+            reasoning_levels: entry.reasoning_levels.clone(),
             id: entry.id.clone(),
             kind,
             service_surfaces: entry
@@ -5278,6 +5279,28 @@ pub async fn deploy_vllm_recommend(
     };
     if let Some(w) = &gpu_compat.warning {
         warnings.push(w.clone());
+    }
+
+    // A vLLM deploy that cannot call tools is the quietest failure this product
+    // has: the server accepts the `tools` field, answers with prose, logs
+    // nothing, and every agent on that model looks like a model too weak to use
+    // its tools. The recipe carries the parser for 181 of 283 models; anything
+    // outside the snapshot (a private fine-tune, a repo newer than the refresh)
+    // gets none. Say so where the operator is already looking, at deploy time,
+    // rather than leaving it to be discovered from an agent that never acts.
+    if matches!(engine, DeployEngine::Vllm) {
+        let argv: Vec<String> = recommended_vllm_args
+            .split_whitespace()
+            .map(String::from)
+            .collect();
+        if let Some(reason) = crate::deploy::vllm_recipes::tool_calling_gap(&argv) {
+            warnings.push(format!(
+                "Ten model nie będzie wywoływał narzędzi: {reason}. \
+                 Agenci dostaną odpowiedzi tekstowe zamiast wywołań. \
+                 Dodaj `--tool-call-parser <parser> --enable-auto-tool-choice` w argumentach \
+                 (dla rodziny Qwen zwykle `hermes`, dla wariantów coder `qwen3_coder`)."
+            ));
+        }
     }
 
     let model_spec = tentaflow_protocol::DeployVllmModelSpecSummary {
@@ -7445,6 +7468,12 @@ pub fn skills_curator_rollback(
 /// Tool/skill allowlists and per-call params arrive as structured JSON so the
 /// editor never has to hand-build the `*_json` column strings. Defaults mirror
 /// the `agents` table column defaults so the editor may omit unset fields.
+///
+/// `AgentDetail` is the exact mirror of this shape: what `AgentsDetailRequest`
+/// returns can be sent straight back here. The field names MUST stay identical
+/// on both sides — a name that exists only on the read side is silently dropped
+/// on the write side, and for `tools` that would erase an agent's allowlist,
+/// which is the security boundary between roster agents (§15).
 #[derive(serde::Deserialize)]
 struct AgentUpsertInput {
     id: Option<String>,
@@ -7468,6 +7497,10 @@ struct AgentUpsertInput {
     #[serde(default = "default_max_spawn_depth")]
     max_spawn_depth: i64,
     flow_id: Option<String>,
+    /// Which agents this one may delegate to. Absent = unrestricted (what every
+    /// agent did before the roster existed); `[]` = nobody; a list = only those.
+    #[serde(default)]
+    allowed_agents: Option<Vec<String>>,
     #[serde(default = "default_true")]
     routable: bool,
     #[serde(default = "default_true")]
@@ -7501,10 +7534,10 @@ fn default_on_child_complete() -> String {
     "notify".to_string()
 }
 
-/// List projection of `DbAgent` — the columns the list screen renders plus the
-/// tool/skill JSON the editor preloads. Drops nothing today (agents are small),
-/// but kept as an explicit shape so future wide columns (e.g. long prompts) can
-/// be excluded from the list without breaking the detail fetch.
+/// List projection of `DbAgent` — the columns the card grid renders, including
+/// the raw allowlist columns it counts. This is deliberately NOT an upsert
+/// payload (no `system_prompt`, `params`, timeouts or `flow_id`), so it keeps
+/// the storage-level `*_json` names; the round-trippable shape is `AgentDetail`.
 #[derive(serde::Serialize)]
 struct AgentSummary<'a> {
     id: &'a str,
@@ -7519,6 +7552,87 @@ struct AgentSummary<'a> {
     is_enabled: bool,
     created_at: &'a str,
     updated_at: &'a str,
+}
+
+/// Detail projection of `DbAgent` — field-for-field the shape `agents_upsert`
+/// reads, so "fetch, change one field, send back" is lossless. The `*_json`
+/// columns are decoded here because they are a storage detail: the wire carries
+/// the allowlist as an array and the skill/param selections as objects, exactly
+/// as `AgentUpsertInput` expects them. `created_at`/`updated_at` are read-only
+/// extras the upsert side ignores by name.
+#[derive(serde::Serialize)]
+struct AgentDetail<'a> {
+    id: &'a str,
+    name: &'a str,
+    display_name: Option<&'a str>,
+    description: &'a str,
+    system_prompt: Option<&'a str>,
+    model: Option<&'a str>,
+    tools: Vec<String>,
+    skills: serde_json::Value,
+    params: serde_json::Value,
+    max_iterations: i64,
+    timeout_secs: i64,
+    max_subagents: i64,
+    max_spawn_depth: i64,
+    flow_id: Option<&'a str>,
+    routable: bool,
+    is_enabled: bool,
+    on_child_complete: &'a str,
+    /// `None` = unrestricted delegation; a list = only those agents.
+    allowed_agents: Option<Vec<String>>,
+    created_at: &'a str,
+    updated_at: &'a str,
+}
+
+impl<'a> AgentDetail<'a> {
+    /// A column that will not decode is a data-integrity failure, not an empty
+    /// selection: answering with `[]` would hand the editor a payload that wipes
+    /// the allowlist on the way back. `validate_agent_params` keeps every write
+    /// path from producing such a row.
+    fn from_row(agent: &'a db::models::DbAgent) -> Result<Self, ProtocolError> {
+        let tools: Vec<String> = serde_json::from_str(&agent.tools_json).map_err(|e| {
+            ProtocolError::internal(format!("agent {} has invalid tools_json: {e}", agent.id))
+        })?;
+        let skills: serde_json::Value = serde_json::from_str(&agent.skills_json).map_err(|e| {
+            ProtocolError::internal(format!("agent {} has invalid skills_json: {e}", agent.id))
+        })?;
+        let params: serde_json::Value = serde_json::from_str(&agent.params_json).map_err(|e| {
+            ProtocolError::internal(format!("agent {} has invalid params_json: {e}", agent.id))
+        })?;
+        Ok(Self {
+            id: &agent.id,
+            name: &agent.name,
+            display_name: agent.display_name.as_deref(),
+            description: &agent.description,
+            system_prompt: agent.system_prompt.as_deref(),
+            model: agent.model.as_deref(),
+            tools,
+            skills,
+            params,
+            max_iterations: agent.max_iterations,
+            timeout_secs: agent.timeout_secs,
+            max_subagents: agent.max_subagents,
+            max_spawn_depth: agent.max_spawn_depth,
+            flow_id: agent.flow_id.as_deref(),
+            routable: agent.routable,
+            is_enabled: agent.is_enabled,
+            on_child_complete: &agent.on_child_complete,
+            allowed_agents: agent
+                .allowed_agents_json
+                .as_deref()
+                .map(serde_json::from_str::<Vec<String>>)
+                .transpose()
+                .map_err(|e| {
+                    ProtocolError::internal(format!(
+                        "agent {} has invalid allowed_agents_json: {e}",
+                        agent.id
+                    ))
+                })?,
+            created_at: &agent.created_at,
+            updated_at: &agent.updated_at,
+        })
+    }
 }
 
 /// Run-list projection of `DbAgentRun` — every index field except `run_log`,
@@ -7665,7 +7779,7 @@ pub fn agents_detail(
         .ok_or_else(|| {
             ProtocolError::not_found(format!("agent not found: {}", payload.agent_id))
         })?;
-    let agent_json = serde_json::to_string(&agent)
+    let agent_json = serde_json::to_string(&AgentDetail::from_row(&agent)?)
         .map_err(|e| ProtocolError::internal(format!("agent encode failed: {}", e)))?;
     Ok(MessageBody::AgentsBody(
         tentaflow_protocol::AgentsPayload::DetailResponse(
@@ -7734,6 +7848,13 @@ pub fn agents_upsert(
         .as_ref()
         .map(|e| e.id.clone())
         .unwrap_or_else(|| uuid::Uuid::new_v4().to_string());
+    let allowed_agents_json = match &input.allowed_agents {
+        Some(list) => Some(
+            serde_json::to_string(list)
+                .map_err(|e| ProtocolError::bad_request(format!("allowed_agents: {e}")))?,
+        ),
+        None => None,
+    };
     let tools_json = serde_json::to_string(&input.tools)
         .map_err(|e| ProtocolError::internal(format!("agent tools encode failed: {}", e)))?;
     let skills_json = serde_json::to_string(&input.skills)
@@ -7760,6 +7881,7 @@ pub fn agents_upsert(
         is_enabled: input.is_enabled,
         on_child_complete: &input.on_child_complete,
         actor_user_id: Some(&user_id),
+            allowed_agents_json: allowed_agents_json.as_deref(),
     };
     repository::validate_agent_params(&params)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
@@ -8092,7 +8214,16 @@ pub async fn agent_run_start(
     let manager = crate::agents::agent_run_manager_global()
         .ok_or_else(|| ProtocolError::internal("agent run manager not initialized"))?;
     let run_id = manager
-        .spawn(&agent.id, &payload.prompt, None, &principal, &[], &[], None)
+        .spawn(
+            &agent.id,
+            &payload.prompt,
+            None,
+            &principal,
+            &[],
+            &[],
+            None,
+            None,
+        )
         .await
         .map_err(|e| ProtocolError::internal(format!("agent run spawn failed: {e}")))?;
 
@@ -8226,6 +8357,7 @@ pub async fn agent_builder_assist(
 
     let mut messages = Vec::with_capacity(turns.len() + 1);
     messages.push(Message {
+        audio: None,
         role: "system".to_string(),
         content: Some(MessageContent::Text(system_prompt)),
         reasoning_content: None,
@@ -8235,6 +8367,7 @@ pub async fn agent_builder_assist(
     });
     for turn in turns {
         messages.push(Message {
+            audio: None,
             role: turn.role,
             content: Some(MessageContent::Text(turn.content)),
             reasoning_content: None,
@@ -8245,6 +8378,9 @@ pub async fn agent_builder_assist(
     }
 
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
+        modalities: None,
+        audio: None,
         model: crate::skills::resolve_model(&ctx.state.db),
         messages,
         temperature: Some(0.2),
@@ -11049,6 +11185,7 @@ mod catalog_list_tests {
 
     fn service_entry(id: &str, surface: ServiceSurface) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::ServiceModel {
                 instances: vec![ModelInstance {
@@ -11072,6 +11209,7 @@ mod catalog_list_tests {
 
     fn alias_entry(id: &str, target: &str, fallbacks: Vec<&str>) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::Alias {
                 target: target.to_string(),
@@ -11087,6 +11225,7 @@ mod catalog_list_tests {
 
     fn flow_entry(id: &str, flow_id: &str) -> CatalogEntry {
         CatalogEntry {
+            reasoning_levels: Vec::new(),
             id: id.to_string(),
             kind: CatalogEntryKind::Flow {
                 flow_id: flow_id.to_string(),

@@ -21,7 +21,6 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use sha2::{Digest, Sha256};
 
 use super::repository;
@@ -30,14 +29,11 @@ use crate::db::DbPool;
 use crate::deploy::log_bus::{self, BusMessage, LogLine};
 use crate::routing::router::Router;
 use crate::services::document::extract::{
-    classify_source, docx_to_markdown, pptx_to_markdown, split_into_chunks, xlsx_to_markdown,
-    SourceKind, CHUNK_OVERLAP_CHARS, CHUNK_SIZE_CHARS,
+    classify_source, split_into_chunks, SourceKind, CHUNK_OVERLAP_CHARS, CHUNK_SIZE_CHARS,
 };
-use crate::services::document::rasterize::extract_pdf_text;
-use crate::services::document::{MAX_PDF_PAGES, MIN_TEXT_LAYER_CHARS_PER_PAGE};
 use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
 use crate::services::vector::error::VectorError;
-use tentaflow_sdk_spec::{FieldType, FieldValue, Filter};
+use tentaflow_sdk_spec::{FieldType, FieldValue};
 
 /// Embeddings model alias resolved by the platform (same alias the RAG addon
 /// uses, so one embedding space serves both).
@@ -50,19 +46,6 @@ pub const VECTOR_NAMESPACE: &str = "passages";
 /// between batches on large files.
 const EMBED_BATCH: usize = 16;
 
-/// Mirrors `flow_engine::node_adapters::store` — one document never has more
-/// chunks than this, so a filtered search with this `k` returns them all for
-/// cleanup.
-const CLEANUP_SEARCH_K: usize = 100_000;
-
-/// Upper bound on repeated cleanup search+delete passes (see
-/// `delete_doc_vectors`); a well-behaved index empties in one or two passes.
-const CLEANUP_MAX_PASSES: usize = 8;
-
-/// Skip reason for scanned PDFs and images: the vision-parse pipeline needs a
-/// flow/addon execution context that a native core job does not have yet.
-const VISION_REQUIRED_MSG: &str = "PDF/scan parsing requires the vision pipeline (planned)";
-
 /// Vector scope for a project — a pseudo addon id, so the per-tenant quota and
 /// registry rows in `addon_vector_namespaces` apply unchanged.
 pub fn vector_scope(project_id: &str) -> String {
@@ -73,48 +56,27 @@ pub fn vector_scope(project_id: &str) -> String {
 // Global ingest concurrency gate
 // =============================================================================
 
-/// At most this many ingest jobs process files at once. Extraction + embedding
-/// batches of several jobs in parallel can hold hundreds of MiB of chunk text
-/// and vectors in memory — the cap turns a burst of SourceCreate requests into
-/// a queue instead of an OOM.
-const MAX_CONCURRENT_INGEST_JOBS: usize = 2;
-
-fn ingest_semaphore() -> &'static tokio::sync::Semaphore {
-    static SEM: OnceLock<tokio::sync::Semaphore> = OnceLock::new();
-    SEM.get_or_init(|| tokio::sync::Semaphore::new(MAX_CONCURRENT_INGEST_JOBS))
-}
-
 // =============================================================================
 // Cancel registry (module-local mirror of dispatch/benchmark.rs)
 // =============================================================================
 
-fn cancel_registry() -> &'static RwLock<HashMap<String, Arc<AtomicBool>>> {
-    static REG: OnceLock<RwLock<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashMap::new()))
-}
+/// Anulowanie biezacych zadan tego procesu. Wspolny typ z
+/// `services::cancel_registry` — kazda z trzech kopii tej mapy miala wlasna
+/// implementacje, a ta w Project Studio wprost nazywala sie lustrem benchmarku.
+static INGEST_CANCEL: crate::services::cancel_registry::CancelRegistry =
+    crate::services::cancel_registry::CancelRegistry::new();
 
 fn register_cancel(job_id: &str) -> Arc<AtomicBool> {
-    let token = Arc::new(AtomicBool::new(false));
-    cancel_registry()
-        .write()
-        .insert(job_id.to_string(), token.clone());
-    token
+    INGEST_CANCEL.register(job_id)
 }
 
 fn unregister_cancel(job_id: &str) {
-    cancel_registry().write().remove(job_id);
+    INGEST_CANCEL.unregister(job_id)
 }
 
-/// Flags a running job for cancellation. Returns `false` when the job is not
-/// (or no longer) registered.
+/// Flags a live run for cancellation. `false` = this process does not own it.
 pub fn signal_cancel(job_id: &str) -> bool {
-    match cancel_registry().read().get(job_id) {
-        Some(token) => {
-            token.store(true, Ordering::Relaxed);
-            true
-        }
-        None => false,
-    }
+    INGEST_CANCEL.signal(job_id)
 }
 
 // =============================================================================
@@ -461,7 +423,7 @@ pub fn recover_orphaned_jobs(pool: &DbPool) {
         return;
     };
     for job_id in jobs {
-        if cancel_registry().read().contains_key(&job_id) {
+        if INGEST_CANCEL.is_registered(&job_id) {
             continue;
         }
         tracing::warn!(job_id, "marking orphaned ingest job as failed");
@@ -514,24 +476,6 @@ pub async fn embed_texts(router: &Router, texts: Vec<String>) -> Result<Vec<Vec<
 // =============================================================================
 // Vector store plumbing
 // =============================================================================
-
-/// Deterministic ref id from (doc_id, chunk_index) — FNV-1a 64-bit, identical
-/// to `flow_engine::node_adapters::store::ref_id_for` so a re-ingest replaces
-/// the old vector instead of duplicating it. ref_id 0 is reserved by zvec.
-fn ref_id_for(doc_id: &str, chunk_index: u64) -> u64 {
-    let mut hash: u64 = 0xcbf29ce484222325;
-    for b in doc_id.as_bytes() {
-        hash ^= *b as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-    hash ^= chunk_index.wrapping_add(1);
-    hash = hash.wrapping_mul(0x100000001b3);
-    if hash == 0 {
-        1
-    } else {
-        hash
-    }
-}
 
 /// Metadata schema of the `passages` namespace. The same names feed `KbHit`
 /// mapping in the dispatcher.
@@ -586,43 +530,8 @@ pub fn delete_file_vectors(
         Err(VectorError::NamespaceNotFound { .. }) => return Ok(()),
         Err(e) => return Err(anyhow!("vector namespace open: {e}")),
     };
-    delete_doc_vectors(&*backend, file_id, None)
-}
-
-/// Removes every vector whose `doc_id` matches. The backend exposes no
-/// delete-by-filter or full-scan API, so cleanup relies on filtered ANN
-/// searches: a single pass may under-report (HNSW recall is approximate,
-/// especially with a zero-vector probe), therefore search+delete repeats
-/// until a pass returns no hits — deleting found refs improves reachability
-/// of the remainder — bounded by `CLEANUP_MAX_PASSES` as a safety valve.
-fn delete_doc_vectors(
-    backend: &dyn crate::services::vector::backend::VectorBackend,
-    doc_id: &str,
-    probe: Option<&[f32]>,
-) -> Result<()> {
-    let filter = Filter::Eq("doc_id".to_string(), FieldValue::Str(doc_id.to_string()));
-    let zero;
-    let probe: &[f32] = match probe {
-        Some(p) => p,
-        None => {
-            zero = vec![0.0f32; backend.dim() as usize];
-            zero.as_slice()
-        }
-    };
-    for _ in 0..CLEANUP_MAX_PASSES {
-        let existing = backend
-            .search(probe, CLEANUP_SEARCH_K, Some(&filter), &[])
-            .map_err(|e| anyhow!("vector cleanup search: {e}"))?;
-        if existing.is_empty() {
-            return Ok(());
-        }
-        for hit in existing {
-            backend
-                .delete(hit.ref_id)
-                .map_err(|e| anyhow!("vector cleanup delete ref {}: {e}", hit.ref_id))?;
-        }
-    }
-    Ok(())
+    crate::services::vector::doc_vectors::delete_doc_vectors(&*backend, file_id, None)
+        .map_err(|e| anyhow!("vector cleanup: {e}"))
 }
 
 /// Drops every namespace of the project scope `ps-<project_id>` (registry row
@@ -684,7 +593,11 @@ fn store_chunks_blocking(
     // zero vector degenerates under cosine, a fresh vector of the same doc
     // lands near the old ones and maximises cleanup recall (store.rs pattern).
     match mgr.get(org_id, &scope, VECTOR_NAMESPACE) {
-        Ok(backend) => delete_doc_vectors(&*backend, file_id, Some(vectors[0].as_slice()))?,
+        Ok(backend) => crate::services::vector::doc_vectors::delete_doc_vectors(
+            &*backend,
+            file_id,
+            Some(vectors[0].as_slice()),
+        )?,
         Err(VectorError::NamespaceNotFound { .. }) => {}
         Err(e) => return Err(anyhow!("vector namespace open: {e}")),
     }
@@ -739,7 +652,7 @@ fn store_chunks_blocking(
         .zip(vectors.iter())
         .zip(fields_per_chunk.iter())
         .map(|((chunk, vector), fields)| UpsertItem {
-            ref_id: ref_id_for(file_id, chunk.index),
+            ref_id: crate::services::vector::doc_vectors::ref_id_for(file_id, chunk.index),
             vector,
             fields: fields.as_slice(),
             sparse: None,
@@ -755,6 +668,7 @@ fn store_chunks_blocking(
         &specs,
         false,
         &items,
+        None,
     ) {
         // No partial ingest: best-effort delete of every ref of this file.
         if let Ok(backend) = mgr.get(org_id, &scope, VECTOR_NAMESPACE) {
@@ -875,7 +789,13 @@ pub struct CollectedFile {
 }
 
 fn tree_mime(path: &str) -> &'static str {
-    match path.rsplit('.').next().unwrap_or("").to_ascii_lowercase().as_str() {
+    match path
+        .rsplit('.')
+        .next()
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
         "md" | "markdown" => "text/markdown",
         "json" => "application/json",
         "yaml" | "yml" => "application/yaml",
@@ -961,7 +881,11 @@ pub fn collect_tree_files(root: &Path, dir_path: &Path) -> Result<Vec<CollectedF
 
 /// Writes one generated text document (e.g. the api_spec endpoint digest) into
 /// the project's blob store and returns its collected-file descriptor.
-pub fn store_generated_text(dir_path: &Path, rel_path: &str, content: &str) -> Result<CollectedFile> {
+pub fn store_generated_text(
+    dir_path: &Path,
+    rel_path: &str,
+    content: &str,
+) -> Result<CollectedFile> {
     let files_dir = dir_path.join("files");
     std::fs::create_dir_all(&files_dir)?;
     let bytes = content.as_bytes();
@@ -1117,44 +1041,16 @@ fn extract_file(dir_path: &Path, work: &FileWork) -> Result<ExtractOutcome> {
             }
             Ok(ExtractOutcome::Chunks(prose_chunks(&page.text)))
         }
+        // Tu trafiaja juz TYLKO pliki kodu — `process_file` kieruje kazdy inny blob
+        // do wspolnego flow-ingestu. Proza, office, PDF, skany i obrazy sa jego
+        // sprawa; ta sciezka zostaje wylacznie dla chunkowania po liniach z
+        // zakresem linii jako `location`, ktorego wezel `chunk` nie odtwarza.
         WorkPayload::Blob => {
             let blob_path = dir_path.join("files").join(&work.sha256);
             let bytes =
                 std::fs::read(&blob_path).map_err(|e| anyhow!("blob {} read: {e}", work.sha256))?;
-            if let Some(_ext) = code_ext(&work.path) {
-                let content = String::from_utf8_lossy(&bytes);
-                return Ok(ExtractOutcome::Chunks(chunk_code(&work.path, &content)));
-            }
-            match classify_source(&work.mime, &bytes) {
-                SourceKind::Text => {
-                    let content = String::from_utf8_lossy(&bytes);
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&content)))
-                }
-                SourceKind::Xlsx => {
-                    let md = xlsx_to_markdown(&bytes).map_err(|e| anyhow!(e))?;
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&md)))
-                }
-                SourceKind::Docx => {
-                    let md = docx_to_markdown(&bytes).map_err(|e| anyhow!(e))?;
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&md)))
-                }
-                SourceKind::Pptx => {
-                    let md = pptx_to_markdown(&bytes).map_err(|e| anyhow!(e))?;
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&md)))
-                }
-                SourceKind::Pdf => {
-                    let text = extract_pdf_text(&bytes, MAX_PDF_PAGES as usize)
-                        .map_err(|e| anyhow!("pdf text layer: {e}"))?;
-                    let pages = text.page_count.max(1);
-                    if text.total_chars / pages < MIN_TEXT_LAYER_CHARS_PER_PAGE {
-                        // Scan / image-only PDF — needs render + vision-parse.
-                        return Ok(ExtractOutcome::Skip(VISION_REQUIRED_MSG.into()));
-                    }
-                    Ok(ExtractOutcome::Chunks(prose_chunks(&text.markdown)))
-                }
-                SourceKind::Image => Ok(ExtractOutcome::Skip(VISION_REQUIRED_MSG.into())),
-                SourceKind::Unknown => Ok(ExtractOutcome::Skip("unsupported file type".into())),
-            }
+            let content = String::from_utf8_lossy(&bytes);
+            Ok(ExtractOutcome::Chunks(chunk_code(&work.path, &content)))
         }
     }
 }
@@ -1208,68 +1104,42 @@ pub fn start_job(task: IngestTask) {
         let project_pool = task.project_pool.clone();
         let job_id_task = task.job_id.clone();
 
-        // Global concurrency gate: the job row already says 'running' (the
-        // status CHECK list is closed and polling clients treat 'running' as
-        // in-progress either way), so a queued job simply waits here before
-        // touching any file. The wait polls the cancel token so a queued job
-        // can still be cancelled — it then finishes terminally without ever
-        // processing, which the delete paths rely on.
-        let mut queued_notice_sent = false;
-        let permit = loop {
-            if cancel.load(Ordering::Relaxed) {
-                break None;
-            }
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(250),
-                ingest_semaphore().acquire(),
-            )
-            .await
-            {
-                Ok(Ok(permit)) => break Some(permit),
-                // The semaphore is static and never closed; treat a closed
-                // error like cancellation instead of panicking.
-                Ok(Err(_)) => break None,
-                Err(_) => {
-                    if !queued_notice_sent {
-                        queued_notice_sent = true;
-                        emit_line(
-                            &tx,
-                            &job_id_task,
-                            "log",
-                            "queue",
-                            "waiting for a free ingest slot".to_string(),
-                            0,
-                        );
-                    }
-                }
-            }
-        };
-
-        match permit {
-            Some(_permit) => {
-                let run = {
-                    let tx = tx.clone();
-                    let cancel = cancel.clone();
-                    tokio::spawn(async move { run_job(task, tx, cancel).await })
-                };
-                if let Err(join_err) = run.await {
-                    if join_err.is_panic() {
-                        let _ = repository::finish_ingest_job(
-                            &project_pool,
-                            &job_id_task,
-                            "failed",
-                            "ingest task panicked",
-                        );
-                    }
-                }
-            }
-            None => {
-                let _ = repository::finish_ingest_job(
-                    &project_pool,
+        // Wspolbieznosc ogranicza teraz JEDNA bramka w `execute_ingest`
+        // (`services::ingest_gate`), przez ktora przechodzi tez addon RAG — a
+        // liczy ona DOKUMENTY, czyli to, co realnie ogranicza pamiec. Wlasny
+        // semafor na poziomie zadania byl drugim, niezaleznym limitem tego samego
+        // zasobu i przepuszczal jeden dokument z kazdego zadania i tak.
+        //
+        // Zadanie anulowane, zanim tknelo jakikolwiek plik, konczy sie terminalnie
+        // bez przetwarzania — na tym opieraja sie sciezki kasowania — bo `run_job`
+        // sprawdza flage przed kazdym plikiem.
+        if cancel.load(Ordering::Relaxed) {
+            let _ = repository::finish_ingest_job(&project_pool, &job_id_task, "cancelled", "");
+        } else {
+            if crate::services::ingest_gate::would_wait() {
+                emit_line(
+                    &tx,
                     &job_id_task,
-                    "cancelled",
-                    "",
+                    "log",
+                    "queue",
+                    "waiting for a free ingest slot".to_string(),
+                    0,
                 );
+            }
+            let run = {
+                let tx = tx.clone();
+                let cancel = cancel.clone();
+                tokio::spawn(async move { run_job(task, tx, cancel).await })
+            };
+            if let Err(join_err) = run.await {
+                if join_err.is_panic() {
+                    let _ = repository::finish_ingest_job(
+                        &project_pool,
+                        &job_id_task,
+                        "failed",
+                        "ingest task panicked",
+                    );
+                }
             }
         }
 
@@ -1444,6 +1314,95 @@ enum FileResult {
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Published-name platformowego flow-ingestu (seed rdzenia). Ten sam flow obsluguje
+/// addon RAG — rozne sa tylko scope zapisu i katalog przestrzeni wektorowej.
+const INGEST_FLOW_MODEL: &str = "core:rag-ingest";
+
+/// Ingestuje JEDEN plik przez wspolny flow zamiast wlasnej sciezki
+/// extract -> chunk -> embed -> store.
+///
+/// Tozsamosc pisania jedzie w `ExecutionContext` (scope `ps-<project_id>`), a nie w
+/// opcjach: `options` sa przepisywane wprost do `envelope.meta`, ktore moze nadpisac
+/// kazdy wezel. `doc_id`/`source_id`/`path` ida przez meta swiadomie — to metadane
+/// wektora, ktore wezel `store` ma zapisac, a nie decyzje o tym, GDZIE pisze.
+///
+/// Anulowanie: `execute_ingest` nie widzi naszej flagi, wiec pilnujemy jej obok i
+/// przewracamy token. Bez tego zatrzymany job dalej mielilby model do konca pliku.
+async fn ingest_file_via_flow(
+    router: &Arc<Router>,
+    org_id: &str,
+    project_id: &str,
+    dir_path: &Path,
+    source_id: &str,
+    work: &FileWork,
+    bytes: Vec<u8>,
+    cancel: &Arc<AtomicBool>,
+) -> FileResult {
+    let Some(executor) = router.executor() else {
+        return FileResult::Error("model runtime executor not available".to_string());
+    };
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "doc_id".to_string(),
+        serde_json::Value::String(work.file_id.clone()),
+    );
+    options.insert(
+        "source_id".to_string(),
+        serde_json::Value::String(source_id.to_string()),
+    );
+    options.insert(
+        "path".to_string(),
+        serde_json::Value::String(work.path.clone()),
+    );
+
+    let token = tokio_util::sync::CancellationToken::new();
+    let request = crate::services::runtime::executor::IngestRequest {
+        model: INGEST_FLOW_MODEL.to_string(),
+        document_bytes: bytes,
+        mime: work.mime.clone(),
+        options,
+        vector_home: Some(dir_path.join("vectors")),
+        cancel_token: Some(token.clone()),
+        flow_depth: 0,
+    };
+
+    let mut rctx = crate::services::runtime::context::ExecutionContext::new(None);
+    rctx.addon_id = Some(vector_scope(project_id));
+    rctx.org_id = Some(org_id.to_string());
+
+    let fut = executor.execute_ingest(request, &mut rctx);
+    tokio::pin!(fut);
+    loop {
+        tokio::select! {
+            result = &mut fut => {
+                return match result {
+                    Ok(response) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            FileResult::Cancelled
+                        } else if response.chunks == 0 {
+                            FileResult::Skipped("no text content".to_string())
+                        } else {
+                            FileResult::Ready(response.chunks)
+                        }
+                    }
+                    Err(e) => {
+                        if cancel.load(Ordering::Relaxed) {
+                            FileResult::Cancelled
+                        } else {
+                            FileResult::Error(e.to_string())
+                        }
+                    }
+                };
+            }
+            _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {
+                if cancel.load(Ordering::Relaxed) {
+                    token.cancel();
+                }
+            }
+        }
+    }
+}
+
 async fn process_file(
     core_db: &DbPool,
     router: &Arc<Router>,
@@ -1454,6 +1413,25 @@ async fn process_file(
     work: &FileWork,
     cancel: &Arc<AtomicBool>,
 ) -> FileResult {
+    // Pliki binarne, ktore umie wspolny flow (proza / office / PDF / skan /
+    // obraz), ida przez NIEGO — jedna implementacja parsowania, chunkingu,
+    // embeddingu i zapisu, wspolna z addonem RAG. Natywnie zostaja tylko dwa
+    // przypadki bez odpowiednika we flow: kod (chunkowany po liniach, z zakresem
+    // linii jako `location`) i zrodla URL (trigger flow-ingestu przyjmuje wylacznie
+    // blob binarny).
+    if matches!(work.payload, WorkPayload::Blob) && code_ext(&work.path).is_none() {
+        let blob_path = dir_path.join("files").join(&work.sha256);
+        let bytes = match tokio::task::spawn_blocking(move || std::fs::read(&blob_path)).await {
+            Ok(Ok(b)) => b,
+            Ok(Err(e)) => return FileResult::Error(format!("blob read: {e}")),
+            Err(_) => return FileResult::Error("blob read task panicked".to_string()),
+        };
+        return ingest_file_via_flow(
+            router, org_id, project_id, dir_path, source_id, work, bytes, cancel,
+        )
+        .await;
+    }
+
     // Extraction is CPU/IO heavy (pdfium, zip, blocking HTTP) — off the
     // async worker.
     let extracted = {
@@ -1538,11 +1516,20 @@ mod tests {
     fn ref_id_matches_store_adapter_deterministics() {
         // Same doc + index → same id; different index/doc → different id;
         // never zero (reserved by zvec).
-        let a = ref_id_for("doc-1", 0);
-        assert_eq!(a, ref_id_for("doc-1", 0));
-        assert_ne!(a, ref_id_for("doc-1", 1));
-        assert_ne!(a, ref_id_for("doc-2", 0));
-        assert_ne!(ref_id_for("", 0), 0);
+        let a = crate::services::vector::doc_vectors::ref_id_for("doc-1", 0);
+        assert_eq!(
+            a,
+            crate::services::vector::doc_vectors::ref_id_for("doc-1", 0)
+        );
+        assert_ne!(
+            a,
+            crate::services::vector::doc_vectors::ref_id_for("doc-1", 1)
+        );
+        assert_ne!(
+            a,
+            crate::services::vector::doc_vectors::ref_id_for("doc-2", 0)
+        );
+        assert_ne!(crate::services::vector::doc_vectors::ref_id_for("", 0), 0);
     }
 
     #[test]
@@ -1636,13 +1623,31 @@ mod tests {
         // file name hashes the full (org, user, project, upload_id) key.
         for (user, c0) in [("ua", b"aaa"), ("ub", b"bbb")] {
             let r = accept_upload_chunk(
-                "org", user, "p1", dir, "shared", "s.txt", "text/plain", 0, 2, c0,
+                "org",
+                user,
+                "p1",
+                dir,
+                "shared",
+                "s.txt",
+                "text/plain",
+                0,
+                2,
+                c0,
             )
             .expect("chunk 0");
             assert!(matches!(r, UploadOutcome::Buffered { .. }));
         }
         let sha_a = match accept_upload_chunk(
-            "org", "ua", "p1", dir, "shared", "s.txt", "text/plain", 1, 2, b"111",
+            "org",
+            "ua",
+            "p1",
+            dir,
+            "shared",
+            "s.txt",
+            "text/plain",
+            1,
+            2,
+            b"111",
         )
         .expect("ua finalize")
         {
@@ -1650,7 +1655,16 @@ mod tests {
             _ => panic!("expected finalized"),
         };
         let sha_b = match accept_upload_chunk(
-            "org", "ub", "p1", dir, "shared", "s.txt", "text/plain", 1, 2, b"222",
+            "org",
+            "ub",
+            "p1",
+            dir,
+            "shared",
+            "s.txt",
+            "text/plain",
+            1,
+            2,
+            b"222",
         )
         .expect("ub finalize")
         {

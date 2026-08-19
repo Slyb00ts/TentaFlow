@@ -248,6 +248,7 @@ fn build_messages(options: Option<&serde_json::Value>, prompt: String) -> Vec<Me
             system.to_string()
         };
         messages.push(Message {
+            audio: None,
             role: "system".to_string(),
             content: Some(MessageContent::Text(system)),
             reasoning_content: None,
@@ -257,6 +258,7 @@ fn build_messages(options: Option<&serde_json::Value>, prompt: String) -> Vec<Me
         });
     }
     messages.push(Message {
+        audio: None,
         role: "user".to_string(),
         content: Some(MessageContent::Text(prompt)),
         reasoning_content: None,
@@ -475,6 +477,9 @@ pub fn llm_generate(
 
     // Zbuduj ChatCompletionRequest
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
+        modalities: None,
+        audio: None,
         model: model_name.unwrap_or_else(|| "default".to_string()),
         messages: build_messages(_options_json.as_ref(), prompt),
         temperature,
@@ -968,6 +973,9 @@ pub fn llm_generate_stream_start(
         .map(|v| v as f32);
 
     let request = ChatCompletionRequest {
+        reasoning_effort: None,
+        modalities: None,
+        audio: None,
         model: model_name.clone().unwrap_or_else(|| "default".to_string()),
         messages: build_messages(options_json.as_ref(), prompt),
         temperature,

@@ -26,13 +26,28 @@ export function formatDate(epochSeconds) {
   return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
 }
 
+// Intl carries the grammar of every unit in all five shipped locales, so the
+// dashboard needs no key per unit and no hardcoded Polish suffix. i18n.js keeps
+// the document language current, which is why it is the source here.
+const RELATIVE_UNITS = [
+  ['second', 1, 60],
+  ['minute', 60, 3600],
+  ['hour', 3600, 86400],
+  ['day', 86400, 2592000],
+  ['month', 2592000, 31536000],
+  ['year', 31536000, Infinity],
+];
+
 export function formatRelative(epochSeconds) {
   if (!epochSeconds) return '—';
-  const diffSec = Math.floor(Date.now() / 1000) - Number(epochSeconds);
-  if (diffSec < 60) return `${diffSec}s temu`;
-  if (diffSec < 3600) return `${Math.floor(diffSec / 60)}m temu`;
-  if (diffSec < 86400) return `${Math.floor(diffSec / 3600)}h temu`;
-  return `${Math.floor(diffSec / 86400)}d temu`;
+  const seconds = Number(epochSeconds);
+  if (!Number.isFinite(seconds)) return '—';
+  const diffSec = Math.floor(Date.now() / 1000) - seconds;
+  const abs = Math.abs(diffSec);
+  const [unit, size] = RELATIVE_UNITS.find(([, , limit]) => abs < limit);
+  const value = Math.floor(abs / size);
+  return new Intl.RelativeTimeFormat(document.documentElement.lang || undefined, { numeric: 'auto' })
+    .format(diffSec >= 0 ? -value : value, unit);
 }
 
 export function byId(id) {

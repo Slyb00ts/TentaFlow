@@ -15,6 +15,7 @@ import { openVariablesEditor } from '/js/modules/flows-builder/variables.js';
 import { TfWindow } from '/js/components/tf-window.js';
 import { I18n } from '/js/i18n.js';
 import { getNodeDisplayTitle } from '/js/modules/flows-builder/node-i18n.js';
+import { nodeColorVar } from '/js/modules/flows-builder/node-visuals.js';
 
 // Stan aktualnie otwartego buildera (przechowywany poza klasa dla param route'a).
 let pendingFlowId = null;
@@ -37,11 +38,11 @@ const FlowBuilderScreen = {
           <tf-button variant="ghost" size="sm" data-role="back" title="${escapeAttr(I18n.t('flows_builder.back_title'))}"><svg width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true" style="transform:rotate(180deg)"><use href="#i-chevron-right"/></svg>${escapeHtml(I18n.t('flows_builder.back'))}</tf-button>
           <div class="fb-topbar-separator"></div>
           <input class="fb-flow-name" data-role="name" aria-label="${escapeAttr(I18n.t('flows_builder.name_label'))}" placeholder="${escapeAttr(I18n.t('flows_builder.name_placeholder'))}">
-          <select class="fb-status-select" data-role="status" aria-label="${escapeAttr(I18n.t('flows_builder.status_label'))}">
+          <tf-select class="fb-status-select" data-role="status" aria-label="${escapeAttr(I18n.t('flows_builder.status_label'))}">
             <option value="draft">${escapeHtml(I18n.t('flows_builder.status_draft'))}</option>
             <option value="active">${escapeHtml(I18n.t('flows_builder.status_active'))}</option>
             <option value="archived">${escapeHtml(I18n.t('flows_builder.status_archived'))}</option>
-          </select>
+          </tf-select>
           <div class="fb-topbar-separator"></div>
           <span class="fb-autosave" data-role="autosave">
             <svg><use href="#i-check"/></svg>
@@ -279,7 +280,7 @@ const FlowBuilderScreen = {
 
     this._updateStats();
     this._renderMinimap();
-    this._setAutosave('ok', I18n.t('flows_builder.autosave_saved'));
+    this._setAutosave('ok');
   },
 
   async unmount() {
@@ -298,20 +299,30 @@ const FlowBuilderScreen = {
     const s = this._state;
     if (!s) return;
     s.dirty = true;
-    this._setAutosave('pending', I18n.t('flows_builder.autosave_pending'));
+    this._setAutosave('pending');
     this._updateStats();
   },
 
-  _setAutosave(kind, text) {
+  // Jeden punkt, w którym powstaje napis o stanie zapisu — „Zapisano" obok
+  // trzech bloków z czerwoną obwódką i wierszem „wymagane" przeczy płótnu, więc
+  // stan zapisany raportuje też, ile bloków czeka na konfigurację.
+  _setAutosave(kind) {
     const s = this._state;
     if (!s) return;
     const el = s.root.querySelector('[data-role="autosave"]');
     const t = s.root.querySelector('[data-role="autosave-text"]');
     if (!el || !t) return;
-    el.classList.remove('pending', 'error');
-    if (kind === 'pending') el.classList.add('pending');
-    if (kind === 'error') el.classList.add('error');
-    t.textContent = text;
+    const incomplete = s.canvas.incompleteNodeCount();
+    const warn = kind === 'ok' && incomplete > 0;
+    el.classList.toggle('pending', kind === 'pending');
+    el.classList.toggle('error', kind === 'error');
+    el.classList.toggle('warn', warn);
+    const glyph = (kind === 'error' || warn) ? 'alert' : 'check';
+    el.querySelector('svg use')?.setAttribute('href', `#i-${glyph}`);
+    if (kind === 'pending') t.textContent = I18n.t('flows_builder.autosave_pending');
+    else if (kind === 'error') t.textContent = I18n.t('flows_builder.autosave_error');
+    else if (warn) t.textContent = I18n.t('flows_builder.autosave_incomplete', { count: incomplete });
+    else t.textContent = I18n.t('flows_builder.autosave_saved');
   },
 
   _updateStats() {
@@ -329,7 +340,7 @@ const FlowBuilderScreen = {
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
     const errors = s.canvas.validate ? s.canvas.validate() : [];
     if (errors.length > 0) {
-      this._setAutosave('error', I18n.t('flows_builder.autosave_error'));
+      this._setAutosave('error');
       if (!silent) toast(errors[0], 'error');
       return;
     }
@@ -361,10 +372,10 @@ const FlowBuilderScreen = {
         flow_json: graphJson,
       };
       s.dirty = false;
-      this._setAutosave('ok', I18n.t('flows_builder.autosave_saved'));
+      this._setAutosave('ok');
       if (!silent) toast(I18n.t('flows_builder.save_success'), 'success');
     } catch (err) {
-      this._setAutosave('error', I18n.t('flows_builder.autosave_error'));
+      this._setAutosave('error');
       toast(I18n.t('flows_builder.save_error', { error: err.message }), 'error');
     } finally {
       s.saving = false;
@@ -464,17 +475,10 @@ const FlowBuilderScreen = {
     const scale = Math.min(miniW / w, miniH / h) * 0.85;
     const offX = (miniW - w * scale) / 2;
     const offY = (miniH - h * scale) / 2;
-    const TYPE_VAR = {
-      trigger: '--node-trigger', llm: '--node-llm', stt: '--node-stt', tts: '--node-tts',
-      rag: '--node-rag', memory: '--node-memory', embeddings: '--node-embeddings',
-      reranker: '--node-reranker', condition: '--node-condition', switch: '--node-switch',
-      template: '--node-template', pii_filter: '--node-pii_filter', tts_clean: '--node-tts_clean',
-      router: '--node-router', output: '--node-output',
-    };
     for (const n of nodes) {
       const dot = document.createElement('div');
       dot.className = 'fb-minimap-node';
-      dot.style.setProperty('--node-color', `var(${TYPE_VAR[n.type] || '--node-llm'})`);
+      dot.style.setProperty('--node-color', `var(${nodeColorVar(n.type, s.templatesMap.get(n.type)?.category)})`);
       dot.style.left = `${offX + (n.x - minX) * scale}px`;
       dot.style.top = `${offY + (n.y - minY) * scale}px`;
       dot.style.width = `${Math.max(8, 220 * scale)}px`;

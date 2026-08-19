@@ -6895,6 +6895,824 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
+  // ---------------------------------------------------------------------------
+  // CodeStudioBody — "Code Studio" module: the workspace registry and sessions,
+  // then everything a session needs: filesystem, git broker, patch review,
+  // timeline, operation journal, approvals and grants, runs, exec and terminal,
+  // workspace settings and the semantic index.
+  //
+  // The registry and session-lifecycle requests below take positional arguments,
+  // mirroring their wasm_bindgen signatures. Everything from FileTreeRequest on
+  // crosses to WASM as ONE snake_case JSON string parsed by serde into the enum
+  // variant (same policy as the Project Studio F2 requests), so a field appended
+  // to the protocol needs no new argument on this side. Paths are always
+  // relative to the session worktree — the wire has no host paths.
+  // ---------------------------------------------------------------------------
+
+  /** MessageBody::CodeStudioBody(WorkspacesListRequest). payload: { includeArchived } — answers with workspaces + the caller's create grant + the node picker. */
+  codeStudioWorkspacesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspacesListRequest(
+      !!(payload.includeArchived ?? payload.include_archived ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::CodeStudioBody(WorkspaceCreateRequest). payload: { name, nodeId,
+   * execMode, containerImage?, repoKind, repoUrl?, repoAuthKind?, secretMaterial?,
+   * sshHostFingerprint?, defaultBranch?, autonomyCeiling, egressPolicy, indexEnabled,
+   * members:[{userId,role}] }. `secretMaterial` travels ONCE and never comes back;
+   * the answer only carries the id and the `provisioning` status.
+   */
+  codeStudioWorkspaceCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const members = Array.isArray(payload.members) ? payload.members : [];
+    const membersJson = JSON.stringify(members.map((m) => ({
+      user_id: csText(m.userId ?? m.user_id),
+      role: csText(m.role, 'viewer'),
+    })));
+    const body = _wasm.encodeCodeStudioWorkspaceCreateRequest(
+      csText(payload.name),
+      csText(payload.nodeId ?? payload.node_id),
+      csText(payload.execMode ?? payload.exec_mode, 'trusted_native'),
+      csOptText(payload.containerImage ?? payload.container_image),
+      csText(payload.repoKind ?? payload.repo_kind, 'empty'),
+      csOptText(payload.repoUrl ?? payload.repo_url),
+      csOptText(payload.repoAuthKind ?? payload.repo_auth_kind),
+      csOptText(payload.secretMaterial ?? payload.secret_material),
+      csOptText(payload.sshHostFingerprint ?? payload.ssh_host_fingerprint),
+      csOptText(payload.defaultBranch ?? payload.default_branch),
+      csText(payload.autonomyCeiling ?? payload.autonomy_ceiling, 'normal'),
+      csText(payload.egressPolicy ?? payload.egress_policy, 'org_approved'),
+      !!(payload.indexEnabled ?? payload.index_enabled ?? false),
+      membersJson,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceGetRequest). payload: { workspaceId } — detail + members + provisioning steps. */
+  codeStudioWorkspaceGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspaceGetRequest(csText(payload.workspaceId ?? payload.workspace_id));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceRetryRequest). payload: { workspaceId } — resumes provisioning; `done` steps are skipped. */
+  codeStudioWorkspaceRetryRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspaceRetryRequest(csText(payload.workspaceId ?? payload.workspace_id));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceArchiveRequest). payload: { workspaceId, archived }. */
+  codeStudioWorkspaceArchiveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspaceArchiveRequest(
+      csText(payload.workspaceId ?? payload.workspace_id),
+      !!(payload.archived ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceMemberSetRequest). payload: { workspaceId, userId, role } — adds or re-roles a member. */
+  codeStudioWorkspaceMemberSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspaceMemberSetRequest(
+      csText(payload.workspaceId ?? payload.workspace_id),
+      csText(payload.userId ?? payload.user_id),
+      csText(payload.role, 'viewer'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceMemberRemoveRequest). payload: { workspaceId, userId }. */
+  codeStudioWorkspaceMemberRemoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspaceMemberRemoveRequest(
+      csText(payload.workspaceId ?? payload.workspace_id),
+      csText(payload.userId ?? payload.user_id),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceCreatorGrantSetRequest). payload: { userId, granted } — the per-user right to create workspaces. */
+  codeStudioWorkspaceCreatorGrantSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorkspaceCreatorGrantSetRequest(
+      csText(payload.userId ?? payload.user_id),
+      !!(payload.granted ?? false),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionsListRequest). payload: { workspaceId } — the CALLER's sessions; the server filters by user with no admin bypass. */
+  codeStudioSessionsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionsListRequest(csText(payload.workspaceId ?? payload.workspace_id));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionOpenRequest). payload: { workspaceId, title, autonomyMode } — the branch is derived server-side, never sent from the UI. */
+  codeStudioSessionOpenRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionOpenRequest(
+      csText(payload.workspaceId ?? payload.workspace_id),
+      csText(payload.title),
+      csText(payload.autonomyMode ?? payload.autonomy_mode, 'normal'),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionCloseRequest). payload: { workspaceId, sessionId } — drops the worktree, keeps the branch. */
+  codeStudioSessionCloseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionCloseRequest(
+      csText(payload.workspaceId ?? payload.workspace_id),
+      csText(payload.sessionId ?? payload.session_id),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileTreeRequest). payload: { workspaceId, sessionId, path, depth }. */
+  codeStudioFileTreeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      depth: Number(payload.depth ?? 1),
+    };
+    const body = _wasm.encodeCodeStudioFileTreeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileReadRequest). payload: { workspaceId, sessionId, path, startLine?, endLine? } — 1-based inclusive range, both omitted = whole file. */
+  codeStudioFileReadRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const startLine = payload.startLine ?? payload.start_line;
+    const endLine = payload.endLine ?? payload.end_line;
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      start_line: startLine == null || startLine === '' ? null : Number(startLine),
+      end_line: endLine == null || endLine === '' ? null : Number(endLine),
+    };
+    const body = _wasm.encodeCodeStudioFileReadRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileWriteRequest). payload: { workspaceId, sessionId, path, content, expectedBlobSha? } — omitted sha means the file must not exist yet. */
+  codeStudioFileWriteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      content: csText(payload.content),
+      expected_blob_sha: csOptText(payload.expectedBlobSha ?? payload.expected_blob_sha),
+    };
+    const body = _wasm.encodeCodeStudioFileWriteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileCreateRequest). payload: { workspaceId, sessionId, path, content }. */
+  codeStudioFileCreateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      content: csText(payload.content),
+    };
+    const body = _wasm.encodeCodeStudioFileCreateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileDeleteRequest). payload: { workspaceId, sessionId, path, recursive, expectedBlobSha? }. */
+  codeStudioFileDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      recursive: !!(payload.recursive ?? false),
+      expected_blob_sha: csOptText(payload.expectedBlobSha ?? payload.expected_blob_sha),
+    };
+    const body = _wasm.encodeCodeStudioFileDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileRenameRequest). payload: { workspaceId, sessionId, fromPath, toPath, expectedBlobSha? }. */
+  codeStudioFileRenameRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      from_path: csText(payload.fromPath ?? payload.from_path),
+      to_path: csText(payload.toPath ?? payload.to_path),
+      expected_blob_sha: csOptText(payload.expectedBlobSha ?? payload.expected_blob_sha),
+    };
+    const body = _wasm.encodeCodeStudioFileRenameRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileMkdirRequest). payload: { workspaceId, sessionId, path }. */
+  codeStudioFileMkdirRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), path: csText(payload.path) };
+    const body = _wasm.encodeCodeStudioFileMkdirRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(FileGrepRequest). payload: { workspaceId, sessionId, query, glob, regex, maxResults } — regex=false keeps the query literal. */
+  codeStudioFileGrepRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      query: csText(payload.query),
+      glob: csText(payload.glob),
+      regex: !!(payload.regex ?? false),
+      max_results: Number(payload.maxResults ?? payload.max_results ?? 200),
+    };
+    const body = _wasm.encodeCodeStudioFileGrepRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitStatusRequest). payload: { workspaceId, sessionId }. */
+  codeStudioGitStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioGitStatusRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitLogRequest). payload: { workspaceId, sessionId, path, limit } — empty path = whole branch. */
+  codeStudioGitLogRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      limit: Number(payload.limit ?? 50),
+    };
+    const body = _wasm.encodeCodeStudioGitLogRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitBranchesRequest). payload: { workspaceId, sessionId }. */
+  codeStudioGitBranchesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioGitBranchesRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitDiffRequest). payload: { workspaceId, sessionId, path, staged, base } — empty base = the session base commit. */
+  codeStudioGitDiffRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      path: csText(payload.path),
+      staged: !!(payload.staged ?? false),
+      base: csText(payload.base),
+    };
+    const body = _wasm.encodeCodeStudioGitDiffRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitCommitRequest). payload: { workspaceId, sessionId, message, patchSetId? } — no patch set opens the review gate instead of committing. */
+  codeStudioGitCommitRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      message: csText(payload.message),
+      patch_set_id: csOptText(payload.patchSetId ?? payload.patch_set_id),
+    };
+    const body = _wasm.encodeCodeStudioGitCommitRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitPushRequest). payload: { workspaceId, sessionId, remote, setUpstream } — mandatory-interactive, the answer may be an approval question. */
+  codeStudioGitPushRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      remote: csText(payload.remote, 'origin'),
+      set_upstream: !!(payload.setUpstream ?? payload.set_upstream ?? false),
+    };
+    const body = _wasm.encodeCodeStudioGitPushRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitSyncRequest). payload: { workspaceId, sessionId, mode } — 'fetch' | 'pull'. */
+  codeStudioGitSyncRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), mode: csText(payload.mode, 'fetch') };
+    const body = _wasm.encodeCodeStudioGitSyncRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitMergeRequest). payload: { workspaceId, sessionId, sourceBranch, targetBranch } — a conflict comes back as a result, not an error. */
+  codeStudioGitMergeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      source_branch: csText(payload.sourceBranch ?? payload.source_branch),
+      target_branch: csText(payload.targetBranch ?? payload.target_branch),
+    };
+    const body = _wasm.encodeCodeStudioGitMergeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitMergeFinalizeRequest). payload: { workspaceId, sessionId, opId, patchSetId }. */
+  codeStudioGitMergeFinalizeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      op_id: csText(payload.opId ?? payload.op_id),
+      patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
+    };
+    const body = _wasm.encodeCodeStudioGitMergeFinalizeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(GitMergeAbandonRequest). payload: { workspaceId, sessionId, opId } — drops a held integration worktree and its private ref. */
+  codeStudioGitMergeAbandonRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), op_id: csText(payload.opId ?? payload.op_id) };
+    const body = _wasm.encodeCodeStudioGitMergeAbandonRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorktreesListRequest). payload: { workspaceId, sessionId }. */
+  codeStudioWorktreesListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioWorktreesListRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(PatchSetsListRequest). payload: { workspaceId, sessionId, status } — empty status = every status. */
+  codeStudioPatchSetsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), status: csText(payload.status) };
+    const body = _wasm.encodeCodeStudioPatchSetsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(PatchSetGetRequest). payload: { workspaceId, sessionId, patchSetId } — files with their hunks. */
+  codeStudioPatchSetGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
+    };
+    const body = _wasm.encodeCodeStudioPatchSetGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(PatchDecideRequest). payload: { workspaceId, sessionId, patchSetId, files:[{ patchFileId, decision, note, hunks:[{ patchHunkId, decision }] }] } — decision: accept|reject|request_revision. */
+  codeStudioPatchDecideRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const files = (Array.isArray(payload.files) ? payload.files : []).map((f) => ({
+      patch_file_id: csText(f.patchFileId ?? f.patch_file_id),
+      decision: csText(f.decision),
+      note: csOptText(f.note),
+      hunks: (Array.isArray(f.hunks) ? f.hunks : []).map((h) => ({
+        patch_hunk_id: csText(h.patchHunkId ?? h.patch_hunk_id),
+        decision: csText(h.decision),
+      })),
+    }));
+    const request = {
+      ...csScope(payload),
+      patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
+      files,
+    };
+    const body = _wasm.encodeCodeStudioPatchDecideRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(PatchSetAbandonRequest). payload: { workspaceId, sessionId, patchSetId }. */
+  codeStudioPatchSetAbandonRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      patch_set_id: csText(payload.patchSetId ?? payload.patch_set_id),
+    };
+    const body = _wasm.encodeCodeStudioPatchSetAbandonRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionTimelineRequest). payload: { workspaceId, sessionId, afterSeq, limit } — afterSeq is the resume cursor. */
+  codeStudioSessionTimelineRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
+      limit: Number(payload.limit ?? 100),
+    };
+    const body = _wasm.encodeCodeStudioSessionTimelineRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionOperationsRequest). payload: { workspaceId, sessionId, status, limit } — status='unknown' lists what needs a human. */
+  codeStudioSessionOperationsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      status: csText(payload.status),
+      limit: Number(payload.limit ?? 100),
+    };
+    const body = _wasm.encodeCodeStudioSessionOperationsRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(OperationResolveRequest). payload: { workspaceId, sessionId, opId, resolution, note } — resolution: completed|failed. */
+  codeStudioOperationResolveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      op_id: csText(payload.opId ?? payload.op_id),
+      resolution: csText(payload.resolution),
+      note: csText(payload.note),
+    };
+    const body = _wasm.encodeCodeStudioOperationResolveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ApprovalsListRequest). payload: { workspaceId, sessionId, status }. */
+  codeStudioApprovalsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), status: csText(payload.status) };
+    const body = _wasm.encodeCodeStudioApprovalsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ApprovalDecideRequest). payload: { workspaceId, sessionId, approvalId, decision } — allow_once|allow_for_run|allow_for_session|always|deny. */
+  codeStudioApprovalDecideRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      approval_id: csText(payload.approvalId ?? payload.approval_id),
+      decision: csText(payload.decision),
+    };
+    const body = _wasm.encodeCodeStudioApprovalDecideRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionGrantsListRequest). payload: { workspaceId, sessionId }. */
+  codeStudioSessionGrantsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionGrantsListRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionGrantRevokeRequest). payload: { workspaceId, sessionId, capability, pattern }. */
+  codeStudioSessionGrantRevokeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      capability: csText(payload.capability),
+      pattern: csText(payload.pattern),
+    };
+    const body = _wasm.encodeCodeStudioSessionGrantRevokeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceAllowlistListRequest). payload: { workspaceId } — the workspace-wide 'always' scope. */
+  codeStudioWorkspaceAllowlistListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
+    const body = _wasm.encodeCodeStudioWorkspaceAllowlistListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceAllowlistSetRequest). payload: { workspaceId, capability, pattern }. */
+  codeStudioWorkspaceAllowlistSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      capability: csText(payload.capability),
+      pattern: csText(payload.pattern),
+    };
+    const body = _wasm.encodeCodeStudioWorkspaceAllowlistSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceAllowlistRemoveRequest). payload: { workspaceId, capability, pattern }. */
+  codeStudioWorkspaceAllowlistRemoveRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      capability: csText(payload.capability),
+      pattern: csText(payload.pattern),
+    };
+    const body = _wasm.encodeCodeStudioWorkspaceAllowlistRemoveRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionRunsRequest). payload: { workspaceId, sessionId } — the revision chain with the trigger of every turn. */
+  codeStudioSessionRunsRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionRunsRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionTasksRequest). payload: { workspaceId, sessionId } — the session's plan, the rows the build loop's gate checks. */
+  codeStudioSessionTasksRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeCodeStudioSessionTasksRequest(JSON.stringify(csScope(payload)));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionMessageSendRequest). payload: { workspaceId, sessionId, message } — a user turn to the session's root agent. */
+  codeStudioSessionMessageSendRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), message: csText(payload.message) };
+    const body = _wasm.encodeCodeStudioSessionMessageSendRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionCancelRequest). payload: { workspaceId, sessionId, runId? } — no runId cancels the whole session. */
+  codeStudioSessionCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), run_id: csOptText(payload.runId ?? payload.run_id) };
+    const body = _wasm.encodeCodeStudioSessionCancelRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(SessionAutonomySetRequest). payload: { workspaceId, sessionId, autonomyMode } — raising is clamped to the workspace ceiling server-side. */
+  codeStudioSessionAutonomySetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      autonomy_mode: csText(payload.autonomyMode ?? payload.autonomy_mode),
+    };
+    const body = _wasm.encodeCodeStudioSessionAutonomySetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ExecStartRequest). payload: { workspaceId, sessionId, argv:[], cwd, timeoutSecs, mountAccess, networkAccess, ephemeral } — argv is always a vector. */
+  codeStudioExecStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const argv = (Array.isArray(payload.argv) ? payload.argv : []).map(String);
+    const request = {
+      ...csScope(payload),
+      argv,
+      cwd: csText(payload.cwd),
+      timeout_secs: Number(payload.timeoutSecs ?? payload.timeout_secs ?? 300),
+      mount_access: csText(payload.mountAccess ?? payload.mount_access, 'cow'),
+      network_access: csText(payload.networkAccess ?? payload.network_access, 'none'),
+      ephemeral: !!(payload.ephemeral ?? false),
+    };
+    const body = _wasm.encodeCodeStudioExecStartRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ExecCancelRequest). payload: { workspaceId, sessionId, execId }. */
+  codeStudioExecCancelRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { ...csScope(payload), exec_id: csText(payload.execId ?? payload.exec_id) };
+    const body = _wasm.encodeCodeStudioExecCancelRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ExecOutputRequest). payload: { workspaceId, sessionId, execId, afterSeq, limit } — afterSeq is a line cursor. */
+  codeStudioExecOutputRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      exec_id: csText(payload.execId ?? payload.exec_id),
+      after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
+      limit: Number(payload.limit ?? 200),
+    };
+    const body = _wasm.encodeCodeStudioExecOutputRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(TerminalOpenRequest). payload: { workspaceId, sessionId, rows, cols } — the VT machine runs on the owner node. */
+  codeStudioTerminalOpenRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      rows: Number(payload.rows ?? 24),
+      cols: Number(payload.cols ?? 80),
+    };
+    const body = _wasm.encodeCodeStudioTerminalOpenRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(TerminalInputRequest). payload: { workspaceId, sessionId, terminalId, data }. */
+  codeStudioTerminalInputRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      terminal_id: csText(payload.terminalId ?? payload.terminal_id),
+      data: csText(payload.data),
+    };
+    const body = _wasm.encodeCodeStudioTerminalInputRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(TerminalResizeRequest). payload: { workspaceId, sessionId, terminalId, rows, cols }. */
+  codeStudioTerminalResizeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      terminal_id: csText(payload.terminalId ?? payload.terminal_id),
+      rows: Number(payload.rows ?? 24),
+      cols: Number(payload.cols ?? 80),
+    };
+    const body = _wasm.encodeCodeStudioTerminalResizeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(TerminalCloseRequest). payload: { workspaceId, sessionId, terminalId }. */
+  codeStudioTerminalCloseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      terminal_id: csText(payload.terminalId ?? payload.terminal_id),
+    };
+    const body = _wasm.encodeCodeStudioTerminalCloseRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(TerminalSnapshotRequest). payload: { workspaceId, sessionId, terminalId } — full grid after a reload; the stream carries only changed rows. */
+  codeStudioTerminalSnapshotRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      terminal_id: csText(payload.terminalId ?? payload.terminal_id),
+    };
+    const body = _wasm.encodeCodeStudioTerminalSnapshotRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceSettingsUpdateRequest). payload: { workspaceId, name, autonomyCeiling, egressPolicy, targetBranch?, indexEnabled, quotaDiskBytes?, quotaSessions? } — execMode is immutable and has no field. */
+  codeStudioWorkspaceSettingsUpdateRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const quotaDisk = payload.quotaDiskBytes ?? payload.quota_disk_bytes;
+    const quotaSessions = payload.quotaSessions ?? payload.quota_sessions;
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      name: csText(payload.name),
+      autonomy_ceiling: csText(payload.autonomyCeiling ?? payload.autonomy_ceiling),
+      egress_policy: csText(payload.egressPolicy ?? payload.egress_policy),
+      target_branch: csOptText(payload.targetBranch ?? payload.target_branch),
+      index_enabled: !!(payload.indexEnabled ?? payload.index_enabled ?? false),
+      quota_disk_bytes: quotaDisk == null || quotaDisk === '' ? null : Number(quotaDisk),
+      quota_sessions: quotaSessions == null || quotaSessions === '' ? null : Number(quotaSessions),
+    };
+    const body = _wasm.encodeCodeStudioWorkspaceSettingsUpdateRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceSecretSetRequest). payload: { workspaceId, repoAuthKind, secretMaterial?, sshHostFingerprint? } — material travels once and never comes back. */
+  codeStudioWorkspaceSecretSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      repo_auth_kind: csText(payload.repoAuthKind ?? payload.repo_auth_kind, 'none'),
+      secret_material: csOptText(payload.secretMaterial ?? payload.secret_material),
+      ssh_host_fingerprint: csOptText(payload.sshHostFingerprint ?? payload.ssh_host_fingerprint),
+    };
+    const body = _wasm.encodeCodeStudioWorkspaceSecretSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceDeleteRequest). payload: { workspaceId }. */
+  codeStudioWorkspaceDeleteRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
+    const body = _wasm.encodeCodeStudioWorkspaceDeleteRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(IndexStatusRequest). payload: { workspaceId } — index state per branch. */
+  codeStudioIndexStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
+    const body = _wasm.encodeCodeStudioIndexStatusRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(IndexRebuildRequest). payload: { workspaceId, branch }. */
+  codeStudioIndexRebuildRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      branch: csText(payload.branch),
+    };
+    const body = _wasm.encodeCodeStudioIndexRebuildRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(CodeSearchRequest). payload: { workspaceId, sessionId, query, pathPrefix, limit, mode } — a semantic request may answer with grep and degraded=true. */
+  codeStudioCodeSearchRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      query: csText(payload.query),
+      path_prefix: csText(payload.pathPrefix ?? payload.path_prefix),
+      limit: Number(payload.limit ?? 20),
+      mode: csText(payload.mode, 'semantic'),
+    };
+    const body = _wasm.encodeCodeStudioCodeSearchRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe — live session timeline. payload: { workspaceId, sessionId, afterSeq } — chunks = CodeStudioSessionStreamEvent, end = CodeStudioSessionStreamEnd. `afterSeq` is the resume cursor: pass the last `seq` rendered and the stream continues without a gap or a repeat; 0 replays from the first event. */
+  codeStudioSessionStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
+    };
+    const body = _wasm.encodeCodeStudioSessionStreamRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe — live terminal grid. payload: { workspaceId, sessionId, terminalId, afterRevision } — chunks = CodeStudioTerminalStreamSnapshot / CodeStudioTerminalStreamDelta, end = CodeStudioTerminalStreamEnd. Pass the revision already rendered to skip the snapshot; anything else earns a full grid first. Cells arrive parsed — the VT machine runs on the owner node. */
+  codeStudioTerminalStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      terminal_id: csText(payload.terminalId ?? payload.terminal_id),
+      after_revision: Number(payload.afterRevision ?? payload.after_revision ?? 0),
+    };
+    const body = _wasm.encodeCodeStudioTerminalStreamRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** Subscribe — indexing progress. payload: { workspaceId, afterSeq } — end = CodeStudioIndexStreamEnd. The semantic index is phase 7, so the stream closes with reason 'index_unavailable' rather than reporting progress nothing produces. */
+  codeStudioIndexStreamRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      after_seq: Number(payload.afterSeq ?? payload.after_seq ?? 0),
+    };
+    const body = _wasm.encodeCodeStudioIndexStreamRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(PatchBlobGetRequest). payload: { workspaceId, sessionId, blobSha } — one CAS blob, so a partially accepted file is rebuilt whole instead of from hunk windows. */
+  codeStudioPatchBlobGetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      ...csScope(payload),
+      blob_sha: csText(payload.blobSha ?? payload.blob_sha),
+    };
+    const body = _wasm.encodeCodeStudioPatchBlobGetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(TerminalsListRequest). payload: { workspaceId, sessionId } — shells already open in the session, so a reload rebuilds the dock instead of opening a second shell. */
+  codeStudioTerminalsListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = csScope(payload);
+    const body = _wasm.encodeCodeStudioTerminalsListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(WorkspaceMemberCandidatesRequest). payload: { workspaceId?, query, limit } — omit `workspaceId` in the creation wizard, which has no workspace whose members could be excluded yet; pass it on the member tab and the answer leaves the current members out. */
+  codeStudioWorkspaceMemberCandidatesRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csOptText(payload.workspaceId ?? payload.workspace_id),
+      query: csText(payload.query),
+      limit: Number(payload.limit ?? 20),
+    };
+    const body = _wasm.encodeCodeStudioWorkspaceMemberCandidatesRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ProjectLinkListRequest). payload: { workspaceId } — projects this workspace is linked to. */
+  codeStudioProjectLinkListRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = { workspace_id: csText(payload.workspaceId ?? payload.workspace_id) };
+    const body = _wasm.encodeCodeStudioProjectLinkListRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(ProjectLinkSetRequest). payload: { workspaceId, projectId, linked } — `linked` picks the direction; the answer is the whole CodeStudioProjectLinkListResponse, so nothing has to be merged client-side. */
+  codeStudioProjectLinkSetRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      project_id: csText(payload.projectId ?? payload.project_id),
+      linked: !!(payload.linked ?? false),
+    };
+    const body = _wasm.encodeCodeStudioProjectLinkSetRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::CodeStudioBody(RepoTreeRequest). payload: { workspaceId, projectId, commit, pathPrefix, limit } — structure of a PINNED commit of a linked workspace. `commit` is a resolved object id: a branch name would let the listed code drift from the tested one, and no host path exists on this wire. */
+  codeStudioRepoTreeRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const request = {
+      workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+      project_id: csText(payload.projectId ?? payload.project_id),
+      commit: csText(payload.commit),
+      path_prefix: csText(payload.pathPrefix ?? payload.path_prefix),
+      limit: Number(payload.limit ?? 500),
+    };
+    const body = _wasm.encodeCodeStudioRepoTreeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
 };
 
 // =============================================================================
@@ -6974,6 +7792,28 @@ function camelToSnakePayload(obj) {
     out[sk] = camelToSnakePayload(v);
   }
   return out;
+}
+
+/**
+ * Code Studio requests address a workspace and, apart from the workspace-level
+ * ones, a session. Both ids are read from either casing here so fifty encoders
+ * do not repeat the same fallback chain.
+ */
+function csScope(payload) {
+  return {
+    workspace_id: csText(payload.workspaceId ?? payload.workspace_id),
+    session_id: csText(payload.sessionId ?? payload.session_id),
+  };
+}
+
+/** Required snake_case string field: absent becomes `fallback`, never `undefined`. */
+function csText(value, fallback = '') {
+  return value == null ? fallback : String(value);
+}
+
+/** Optional field: absent or empty becomes JSON null, which serde reads as None. */
+function csOptText(value) {
+  return value == null || value === '' ? null : String(value);
 }
 
 function assertReady() {

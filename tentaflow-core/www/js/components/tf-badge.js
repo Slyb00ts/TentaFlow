@@ -2,9 +2,13 @@
 // File: tf-badge.js
 // Opis: Numeric badge component with tone variants. Renders a small pill with
 //       a value from attribute or slot content.
+//       Tones: accent (default) | danger | success | warning | info | neutral |
+//       hot. `hot` is the only SOLID tone — amber fill with dark text plus a
+//       pop-in — reserved for "waiting on you" counters, which must not read as
+//       one more tinted pill among many.
 // =============================================================================
 
-const VALID_TONES = new Set(['accent', 'danger', 'success', 'warning', 'info', 'neutral']);
+const VALID_TONES = new Set(['accent', 'danger', 'success', 'warning', 'info', 'neutral', 'hot']);
 
 class TfBadge extends HTMLElement {
   static get observedAttributes() {

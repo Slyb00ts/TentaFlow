@@ -143,6 +143,7 @@ fn llm_response_to_chat_response(response: &LlmResponse, model: &str) -> ChatCom
         choices: vec![Choice {
             index: 0,
             message: Message {
+                audio: None,
                 role: "assistant".to_string(),
                 content: Some(MessageContent::Text(response.content.clone())),
                 reasoning_content: response.reasoning_content.clone(),
@@ -251,7 +252,28 @@ impl LlmDispatcher for LlmDispatcherImpl {
 
         let finish_reason = openai_finish_to_envelope(choice.finish_reason.as_deref());
 
+        // Native speech from an omni model. Base64 is decoded HERE so nothing
+        // downstream has to know the wire format; a payload we cannot decode is
+        // dropped with a warning rather than passed on as garbage bytes.
+        let audio = choice.message.audio.as_ref().and_then(|a| {
+            match base64::engine::general_purpose::STANDARD.decode(&a.data) {
+                Ok(bytes) if !bytes.is_empty() => Some(crate::flow_engine::dispatchers::LlmAudioOut {
+                    mime: format!(
+                        "audio/{}",
+                        req.audio_out.as_ref().map(|o| o.format.as_str()).unwrap_or("wav")
+                    ),
+                    bytes,
+                    transcript: a.transcript.clone(),
+                }),
+                Ok(_) => None,
+                Err(e) => {
+                    tracing::warn!("model returned audio that is not valid base64: {e}");
+                    None
+                }
+            }
+        });
         let llm_response = LlmResponse {
+            audio,
             content,
             reasoning_content,
             usage,
@@ -494,7 +516,23 @@ async fn build_chat_request(
     for m in &req.messages {
         messages.push(chat_msg_to_openai(m, blobs).await?);
     }
+    // Audio out is opt-in and needs BOTH fields: `modalities` says the turn may
+    // speak, `audio` says with what voice and container. Sending either to a
+    // text-only backend is rejected, so both stay absent unless asked for.
+    let (modalities, audio) = match &req.audio_out {
+        Some(a) => (
+            Some(vec!["text".to_string(), "audio".to_string()]),
+            Some(crate::api::openai::types::AudioConfig {
+                voice: a.voice.clone(),
+                format: a.format.clone(),
+            }),
+        ),
+        None => (None, None),
+    };
     Ok(ChatCompletionRequest {
+        reasoning_effort: req.reasoning_effort.clone(),
+        modalities,
+        audio,
         model: req.model.clone(),
         messages,
         temperature: req.temperature,
@@ -579,12 +617,25 @@ async fn chat_msg_to_openai(m: &ChatMessage, blobs: &dyn BlobStore) -> Result<Me
                             },
                         });
                     }
+                    MessagePart::Audio { blob_ref, format } => {
+                        // OpenAI audio parts carry RAW base64 — no `data:` URL,
+                        // unlike images — and a container code rather than the
+                        // MIME type.
+                        let bytes = blobs.get(blob_ref).await?;
+                        openai_parts.push(ContentPart::InputAudio {
+                            input_audio: crate::api::openai::types::InputAudio {
+                                data: base64::engine::general_purpose::STANDARD.encode(&bytes),
+                                format: format.clone(),
+                            },
+                        });
+                    }
                 }
             }
             Some(MessageContent::Parts(openai_parts))
         }
     };
     Ok(Message {
+        audio: None,
         role: chat_role_to_str(m.role).to_string(),
         content,
         reasoning_content: m.reasoning_content.clone(),
@@ -750,6 +801,7 @@ mod tests {
             .expect("audit event opened");
 
         let response = LlmResponse {
+            audio: None,
             content: "Noted — blue.".into(),
             reasoning_content: None,
             usage: TokenUsage {

@@ -13,7 +13,7 @@
 // `ml_studio::train_autogluon`). The submission body is NEVER logged: it
 // carries the decrypted environment secret.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -21,7 +21,6 @@ use std::time::Duration;
 
 use anyhow::{anyhow, bail, Result};
 use dashmap::DashMap;
-use parking_lot::RwLock;
 use rusqlite::{params, OptionalExtension};
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -89,37 +88,31 @@ fn http_agent() -> ureq::Agent {
 // Cancel registry
 // =============================================================================
 
-fn cancel_registry() -> &'static RwLock<HashMap<String, Arc<AtomicBool>>> {
-    static REG: OnceLock<RwLock<HashMap<String, Arc<AtomicBool>>>> = OnceLock::new();
-    REG.get_or_init(|| RwLock::new(HashMap::new()))
-}
+/// Anulowanie biezacych zadan tego procesu. Wspolny typ z
+/// `services::cancel_registry` — kazda z trzech kopii tej mapy miala wlasna
+/// implementacje, a ta w Project Studio wprost nazywala sie lustrem benchmarku.
+static AUTO_RUN_CANCEL: crate::services::cancel_registry::CancelRegistry =
+    crate::services::cancel_registry::CancelRegistry::new();
 
 fn register_cancel(run_id: &str) -> Arc<AtomicBool> {
-    let token = Arc::new(AtomicBool::new(false));
-    cancel_registry()
-        .write()
-        .insert(run_id.to_string(), token.clone());
-    token
+    AUTO_RUN_CANCEL.register(run_id)
 }
 
 fn unregister_cancel(run_id: &str) {
-    cancel_registry().write().remove(run_id);
+    AUTO_RUN_CANCEL.unregister(run_id)
 }
 
-/// Flags a live run for cancellation. `false` = this process does not own the
-/// run (finished, or lost to a restart).
+/// Flags a live run for cancellation. `false` = this process does not own it.
 pub fn signal_cancel(run_id: &str) -> bool {
-    match cancel_registry().read().get(run_id) {
-        Some(token) => {
-            token.store(true, Ordering::Relaxed);
-            true
-        }
-        None => false,
-    }
+    AUTO_RUN_CANCEL.signal(run_id)
+}
+
+pub fn is_running(run_id: &str) -> bool {
+    AUTO_RUN_CANCEL.is_registered(run_id)
 }
 
 fn is_live(run_id: &str) -> bool {
-    cancel_registry().read().contains_key(run_id)
+    AUTO_RUN_CANCEL.is_registered(run_id)
 }
 
 // =============================================================================

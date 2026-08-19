@@ -572,6 +572,7 @@ mod tests {
     fn make_manifest(id: &str, binary_path: &str) -> ServiceManifest {
         ServiceManifest {
             engine: Engine {
+                reasoning_levels: None,
                 id: id.into(),
                 backend: None,
                 category: Category::Llm,

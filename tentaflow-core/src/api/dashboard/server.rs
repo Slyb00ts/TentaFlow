@@ -276,6 +276,102 @@ impl DashboardServer {
             );
         }
 
+        // Code Studio owner side. A forwarded mesh request is executed here
+        // through the ordinary dispatch handlers, so the receive path needs the
+        // same shared resources a WebSocket connection assembles — but it has no
+        // connection to assemble them from, and a per-connection AppState would
+        // die with its socket. Register a server-lifetime one instead; without
+        // it the owner answers every forwarded call with "code studio mesh
+        // context is not initialized on this node". Registered outside the mesh
+        // `if let` above because the non-mesh readers of `node_state()` must see
+        // it on a node that never paired, and unconditionally on the runtime
+        // because the call also starts assertion-key rotation.
+        let ui_sessions = match crate::addon::ui_session::global_registry() {
+            Some(registry) => registry.clone(),
+            None => {
+                crate::addon::ui_session::init_global_registry(Arc::new(
+                    crate::addon::ui_session::SessionRegistry::new(),
+                ));
+                crate::addon::ui_session::global_registry()
+                    .expect("global_registry must be set after init")
+                    .clone()
+            }
+        };
+        crate::code_studio::remote_proxy::install_owner_context(Arc::new(
+            crate::dispatch::AppState {
+                db: db.clone(),
+                router: router.clone(),
+                mesh_peer_store: mesh_peer_store.clone(),
+                service_manager: service_manager.clone(),
+                metrics: metrics.clone(),
+                settings_cipher: settings_cipher.clone(),
+                cipher: cipher.clone(),
+                quic_mesh: quic_mesh.clone(),
+                local_node_id: local_node_id.clone(),
+                mesh_security: mesh_security.clone(),
+                permission_checker: permission_checker.clone(),
+                addon_manager: addon_manager.clone(),
+                license: license.clone(),
+                meeting_manager: crate::meeting::MeetingManager::new(
+                    db.clone(),
+                    Some(service_manager.clone()),
+                ),
+                vnc_tunnels: Arc::new(dashmap::DashMap::new()),
+                mesh_relay_health: mesh_relay_health.clone(),
+                port_allocator: port_allocator.clone(),
+                mesh_services_registry: mesh_services_registry.clone(),
+                live_handles: service_manager.live_handles.clone(),
+                ui_sessions,
+                progress_broker: crate::flow_engine::progress_broker::global_broker(),
+                agent_run_manager: crate::agents::agent_run_manager_global(),
+            },
+        ));
+
+        // §13 — the durability promise. Everything the previous process left
+        // half-done is settled HERE, before the first connection is accepted:
+        // orphan shells reaped, cached statuses re-derived from the timeline,
+        // unfinished provisioning and live sessions moved to a resumable
+        // terminal state. Same place as the owner context because both are
+        // "this node owns Code Studio state" work, and both must be true on a
+        // node that never paired.
+        {
+            let db_for_recovery = db.clone();
+            let node_for_recovery = local_node_id.clone();
+            match tokio::task::spawn_blocking(move || {
+                reconcile_code_studio(&db_for_recovery, &node_for_recovery)
+            })
+            .await
+            {
+                Ok(report) => {
+                    if report != CodeStudioRecovery::default() {
+                        info!(
+                            "code studio recovery: {} workspace(s) failed, {} session(s) \
+                             interrupted, {} projection(s) corrected, {} terminal(s) reaped, \
+                             {} sandbox(es) closed, {} effect(s) confirmed, {} retryable",
+                            report.workspaces_failed,
+                            report.sessions_interrupted,
+                            report.projections_corrected,
+                            report.terminals_reaped,
+                            report.sandboxes_reconciled,
+                            report.operations_completed,
+                            report.operations_retryable
+                        );
+                    }
+                    // Its own line, at warning level: an effect nobody can
+                    // verify is the one outcome of this pass that needs a
+                    // PERSON, and §22 alerts on one that lingers.
+                    if report.operations_unknown > 0 {
+                        warn!(
+                            "code studio recovery: {} interrupted effect(s) could not be \
+                             verified and are waiting for a decision",
+                            report.operations_unknown
+                        );
+                    }
+                }
+                Err(e) => error!("code studio recovery task panicked: {e}"),
+            }
+        }
+
         loop {
             let (stream, remote_addr) = match listener.accept().await {
                 Ok(conn) => conn,
@@ -2899,6 +2995,212 @@ fn extract_ws_user_session(
     Some((claims.user_id, Some(role)))
 }
 
+/// What one startup reconciliation pass repaired. Returned rather than only
+/// logged so the pass is testable as a whole: §13 promises a crash leaves
+/// RESUMABLE state, and a promise nobody exercises is a comment.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct CodeStudioRecovery {
+    /// Workspaces stuck mid-provisioning, moved to `error` with a retry hint.
+    pub workspaces_failed: usize,
+    /// Sessions left `creating`/`running`/`waiting_user`/`closing`, now
+    /// `interrupted`.
+    pub sessions_interrupted: usize,
+    /// Cached status columns re-derived from the event tail (§13.3).
+    pub projections_corrected: usize,
+    /// Shells inherited from a previous life, killed and reaped.
+    pub terminals_reaped: usize,
+    /// `cli_instances` rows still claiming to be live, now `reaped` (D2).
+    pub cli_instances_reaped: usize,
+    /// Sandbox rows a crash left occupying a shared profile, now closed.
+    pub sandboxes_reconciled: usize,
+    /// Interrupted effects whose postcondition could be PROVEN, now `completed`
+    /// (§13.1).
+    pub operations_completed: usize,
+    /// Interrupted effects that are idempotent and whose precondition still
+    /// holds. They stay `pending` on purpose — the row is the coordinator's
+    /// instruction to re-issue them, and this pass never executes anything.
+    pub operations_retryable: usize,
+    /// Interrupted effects nothing could prove. They wait for a person, and a
+    /// lingering one is what §22 alerts on.
+    pub operations_unknown: usize,
+}
+
+/// Code Studio startup reconciliation (§4.2, §6, §13.3). Runs ONCE per boot,
+/// before the listener starts serving, and never fails the boot: a workspace
+/// that cannot be reconciled is reported and skipped, because a node that
+/// refuses to start is strictly worse than a node with one workspace in
+/// `error`.
+///
+/// The order is the point:
+///   1. reap orphan terminals FIRST — a shell from the previous process still
+///      holds the worktree and would keep writing into it while we reconcile;
+///   2. close the sandboxes of the previous life, for the same reason and
+///      because their rows keep a shared profile occupied for a session that is
+///      about to be resumed;
+///   3. verify the projection against the timeline, while the cached statuses
+///      still say what the crashed process believed;
+///   4. settle the effect journal against the now-quiet worktree — every step
+///      above exists so that what a probe reads is the state the crash left,
+///      not something a survivor is still writing;
+///   5. only then sweep live sessions to `interrupted` — `verify_projection`
+///      deliberately leaves `interrupted` alone, so doing this first would make
+///      step 3 a no-op.
+///
+/// Blocking (SQLite + filesystem): callers run it on a blocking thread.
+pub fn reconcile_code_studio(db: &DbPool, node_id: &str) -> CodeStudioRecovery {
+    use crate::code_studio::models::ExecMode;
+    use crate::code_studio::sandbox::SandboxManager;
+    use crate::code_studio::{
+        cli_bridge, events, operations, provisioning, repository, session, workspace_db,
+    };
+
+    let mut report = CodeStudioRecovery::default();
+
+    match provisioning::reconcile_interrupted(db, node_id) {
+        Ok(count) => report.workspaces_failed = count,
+        Err(e) => warn!("code studio: provisioning reconciliation failed: {e:#}"),
+    }
+
+    let workspaces = match repository::list_workspaces_on_node(db, node_id) {
+        Ok(rows) => rows,
+        Err(e) => {
+            warn!("code studio: cannot list owned workspaces: {e:#}");
+            return report;
+        }
+    };
+
+    for workspace in workspaces {
+        match crate::dispatch::stream_handlers::code_studio_terminal_registry(&workspace.id)
+            .and_then(|registry| registry.reap_orphans())
+        {
+            Ok(reaped) => report.terminals_reaped += reaped.len(),
+            Err(e) => warn!(
+                "code studio: terminal reaping failed for workspace '{}': {e:#}",
+                workspace.id
+            ),
+        }
+
+        let pool = match workspace_db::open(&workspace.id) {
+            Ok(pool) => pool,
+            Err(e) => {
+                // Expected for a workspace whose provisioning never created the
+                // directory — the registry row was just moved to `error` above.
+                warn!(
+                    "code studio: workspace '{}' has no runtime database: {e:#}",
+                    workspace.id
+                );
+                continue;
+            }
+        };
+
+        let sessions = match session::list_session_ids(&pool) {
+            Ok(ids) => ids,
+            Err(e) => {
+                warn!(
+                    "code studio: cannot list sessions of workspace '{}': {e:#}",
+                    workspace.id
+                );
+                Vec::new()
+            }
+        };
+
+        // Reconciliation only closes rows and drops the layers the temporary
+        // sweep already lost, so it needs no container configuration — nothing
+        // here starts a runtime.
+        let sandboxes = ExecMode::from_slug(&workspace.exec_mode)
+            .ok_or_else(|| {
+                anyhow::anyhow!("unknown exec mode '{}'", workspace.exec_mode)
+            })
+            .and_then(|exec_mode| SandboxManager::for_workspace(&workspace.id, exec_mode, None));
+        let sandboxes = match sandboxes {
+            Ok(manager) => Some(manager),
+            Err(e) => {
+                warn!(
+                    "code studio: no sandbox manager for workspace '{}': {e:#}",
+                    workspace.id
+                );
+                None
+            }
+        };
+
+        for session_id in &sessions {
+            if let Some(manager) = &sandboxes {
+                match manager.reconcile_after_restart(&pool, session_id) {
+                    Ok(closed) => report.sandboxes_reconciled += closed,
+                    Err(e) => warn!(
+                        "code studio: sandbox reconciliation failed for session '{session_id}': {e:#}"
+                    ),
+                }
+            }
+
+            match events::verify_projection(&pool, session_id) {
+                Ok(corrections) => {
+                    for correction in &corrections {
+                        info!(
+                            "code studio: {} '{}' status '{}' -> '{}' (from events)",
+                            correction.entity,
+                            correction.id,
+                            correction.projected,
+                            correction.from_events
+                        );
+                    }
+                    report.projections_corrected += corrections.len();
+                }
+                Err(e) => warn!(
+                    "code studio: projection check failed for session '{session_id}': {e:#}"
+                ),
+            }
+
+            // §13.1. Without this the journal is write-only across a restart:
+            // every effect a crash interrupted stays `pending` for the life of
+            // the node, and the `unknown` queue a person is supposed to work
+            // through never fills.
+            match operations::SessionProbe::for_session(&workspace.id, session_id)
+                .and_then(|probe| operations::reconcile(&pool, session_id, &probe))
+            {
+                Ok(settled) => {
+                    report.operations_completed += settled.completed();
+                    report.operations_retryable += settled.retryable();
+                    report.operations_unknown += settled.unknown();
+                    if settled.unknown() > 0 {
+                        warn!(
+                            "code studio: session '{session_id}' left {} operation(s) nobody can \
+                             verify; they need a decision",
+                            settled.unknown()
+                        );
+                    }
+                }
+                Err(e) => warn!(
+                    "code studio: operation reconciliation failed for session '{session_id}': {e:#}"
+                ),
+            }
+        }
+
+        // A vendor CLI instance from the previous life is a process this Core
+        // does not supervise, and the bridge kills those at ITS startup (D2).
+        // Recording them as `reaped` is what makes the ticket registry's
+        // "a ticket outlives nothing" promise true across a restart: there is
+        // no row left claiming a run that could still be spending.
+        match cli_bridge::reap_orphaned_instances(&pool) {
+            Ok(count) => report.cli_instances_reaped += count,
+            Err(e) => warn!(
+                "code studio: CLI instance reaping failed for workspace '{}': {e:#}",
+                workspace.id
+            ),
+        }
+
+        match session::reconcile_interrupted(&pool) {
+            Ok(count) => report.sessions_interrupted += count,
+            Err(e) => warn!(
+                "code studio: session reconciliation failed for workspace '{}': {e:#}",
+                workspace.id
+            ),
+        }
+    }
+
+    report
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2912,6 +3214,374 @@ mod tests {
             format!("bearer.{token}").parse().expect("header value"),
         );
         headers
+    }
+
+    /// §13 — the durability promise, exercised end to end.
+    ///
+    /// A crash leaves four kinds of debris, and this pass has to settle all of
+    /// them in one go: a workspace stuck mid-provisioning, a session column
+    /// that disagrees with its own timeline, a session the dead process still
+    /// claims to be running, and a shell nobody owns. Before this pass was
+    /// wired at boot, `reconcile_interrupted` and `verify_projection` had green
+    /// unit tests and NO caller — the promise held only in the test suite.
+    #[test]
+    fn code_studio_recovery_settles_everything_a_crash_left_behind() {
+        use crate::code_studio::events::{self, EventPayload, SessionEvent};
+        use crate::code_studio::models::{
+            AutonomyMode, EgressEnforcement, ExecMode, NewWorkspace, WorkspaceStatus,
+        };
+        use crate::code_studio::{paths as cs_paths, repository, workspace_db};
+
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let registry = tempdir().expect("registry dir");
+        let main_db = db::init(&registry.path().join("tentaflow.db")).expect("init db");
+
+        let workspace = |id: &str| NewWorkspace {
+            id: id.to_string(),
+            org_id: "org-1".into(),
+            owner_user_id: "u-1".into(),
+            name: format!("Workspace {id}"),
+            slug: id.to_string(),
+            node_id: "node-1".into(),
+            exec_mode: ExecMode::TrustedNative,
+            container_image: None,
+            egress_enforcement: EgressEnforcement::Unrestricted,
+            repo_kind: "empty".into(),
+            repo_url: None,
+            repo_auth_kind: None,
+            secret_ref: None,
+            ssh_host_fingerprint: None,
+            default_branch: None,
+            target_branch: None,
+            autonomy_ceiling: AutonomyMode::Normal,
+            egress_policy: "local_only".into(),
+            index_enabled: false,
+            quota_disk_bytes: None,
+            quota_sessions: None,
+        };
+
+        // (1) a workspace the previous process never finished provisioning.
+        repository::create_workspace(&main_db, &workspace("recstuck")).expect("stuck workspace");
+
+        // (2) a live workspace whose runtime db carries the rest of the debris.
+        repository::create_workspace(&main_db, &workspace("reclive")).expect("live workspace");
+        repository::set_status(&main_db, "reclive", WorkspaceStatus::Active, None)
+            .expect("activate");
+        cs_paths::create_workspace_layout("reclive").expect("layout");
+        let pool = workspace_db::open("reclive").expect("workspace db");
+        {
+            let conn = pool.write().expect("write");
+            conn.execute(
+                "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
+                  flow_id, flow_version_id, status, created_at, updated_at) \
+                 VALUES ('recsess', 'reclive', 'u-1', 'S', 'cs/u/1', 'normal', 'f', 'v', \
+                  'running', datetime('now'), datetime('now'))",
+                [],
+            )
+            .expect("session row");
+            // The projection lies: the column says the run failed, the timeline
+            // (appended below) says it started and never finished.
+            conn.execute(
+                "INSERT INTO session_runs (run_id, session_id, ordinal, kind, trigger, status) \
+                 VALUES ('recrun', 'recsess', 1, 'root', 'user', 'failed')",
+                [],
+            )
+            .expect("run row");
+            // A vendor CLI instance the dead process was supervising. Nobody
+            // supervises it now, and the bridge kills its own children at
+            // startup (D2), so a row still claiming `ready` describes a process
+            // that no longer exists.
+            conn.execute(
+                "INSERT INTO cli_instances (id, session_id, run_id, engine_id, service_id, \
+                  vendor_session_id, model, ticket_id, status, last_seq, started_at) \
+                 VALUES ('recinst', 'recsess', 'recrun', 'codex', 1, 'v-1', 'gpt-5', NULL, \
+                  'ready', 0, datetime('now'))",
+                [],
+            )
+            .expect("cli instance row");
+        }
+        events::append(
+            &pool,
+            "recsess",
+            SessionEvent::new(
+                "rec-run-start",
+                EventPayload::RunStarted {
+                    run_id: "recrun".into(),
+                    kind: "root".into(),
+                    trigger: "user".into(),
+                },
+            ),
+        )
+        .expect("append run start");
+
+        let report = reconcile_code_studio(&main_db, "node-1");
+
+        assert_eq!(
+            report.workspaces_failed, 1,
+            "the interrupted provisioning must become a retryable error"
+        );
+        assert!(
+            report.projections_corrected >= 1,
+            "the stale run column must be re-derived from the timeline: {report:?}"
+        );
+        assert_eq!(
+            report.sessions_interrupted, 1,
+            "the session the dead process claimed to be running must be released"
+        );
+        assert_eq!(
+            report.cli_instances_reaped, 1,
+            "a CLI instance nobody supervises must not stay 'ready': {report:?}"
+        );
+
+        let stuck = repository::get_workspace(&main_db, "recstuck")
+            .expect("read")
+            .expect("row");
+        assert_eq!(stuck.status, "error");
+        assert!(stuck.status_detail.unwrap_or_default().contains("retry"));
+
+        let (session_status, run_status): (String, String) = {
+            let conn = pool.read().expect("read");
+            (
+                conn.query_row("SELECT status FROM sessions WHERE id='recsess'", [], |r| {
+                    r.get(0)
+                })
+                .expect("session status"),
+                conn.query_row(
+                    "SELECT status FROM session_runs WHERE run_id='recrun'",
+                    [],
+                    |r| r.get(0),
+                )
+                .expect("run status"),
+            )
+        };
+        // The run was corrected from the events FIRST (`failed` -> `running`),
+        // and only then did the sweep release the session. The order is not
+        // cosmetic: `verify_projection` arbitrates a session column only while
+        // it reads `idle`/`running`/`waiting_user`, so sweeping to
+        // `interrupted` first would put every session out of its reach.
+        assert_eq!(run_status, "running");
+        assert_eq!(session_status, "interrupted");
+
+        let instance_status: String = {
+            let conn = pool.read().expect("read");
+            conn.query_row(
+                "SELECT status FROM cli_instances WHERE id='recinst'",
+                [],
+                |r| r.get(0),
+            )
+            .expect("instance status")
+        };
+        assert_eq!(
+            instance_status, "reaped",
+            "the honest state of an unsupervised CLI instance is 'reaped', not 'ready'"
+        );
+
+        // Idempotent: a second boot finds nothing left to settle.
+        let again = reconcile_code_studio(&main_db, "node-1");
+        assert_eq!(again, CodeStudioRecovery::default(), "{again:?}");
+
+        workspace_db::close("reclive");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
+    }
+
+    /// §13.1 — the effect journal and the sandboxes are settled BY THE BOOT
+    /// PASS, not only by a function with a unit test.
+    ///
+    /// This is the same trap the test above records: `reconcile_interrupted`
+    /// and `verify_projection` were green and uncalled until the pass was
+    /// wired. `operations::reconcile` and `SandboxManager::reconcile_after_restart`
+    /// repeated it exactly — every effect a crash interrupted stayed `pending`
+    /// for the life of the node, and no operation ever reached the `unknown`
+    /// queue a person is supposed to work through. Asserting the OUTCOME here
+    /// is what makes deleting the call a failing test rather than a silent
+    /// regression.
+    #[test]
+    fn the_boot_pass_settles_the_effect_journal_and_the_sandboxes() {
+        use crate::code_studio::models::{
+            AutonomyMode, EgressEnforcement, ExecMode, NewWorkspace, WorkspaceStatus,
+        };
+        use crate::code_studio::operations::{
+            self, OpKind, OperationInput, OperationRequest, OperationStatus, OriginKind,
+            Postcondition, Precondition,
+        };
+        use crate::code_studio::pep::Capability;
+        use crate::code_studio::{artifacts, fs as cs_fs, paths as cs_paths, repository, workspace_db};
+
+        let _guard = cs_paths::test_data_dir_guard();
+        let data = tempdir().expect("data dir");
+        crate::paths::set_category_override(
+            crate::paths::StorageCategory::Data,
+            Some(data.path().to_string_lossy().to_string()),
+        );
+        let registry = tempdir().expect("registry dir");
+        let main_db = db::init(&registry.path().join("tentaflow.db")).expect("init db");
+
+        repository::create_workspace(
+            &main_db,
+            &NewWorkspace {
+                id: "recops".into(),
+                org_id: "org-1".into(),
+                owner_user_id: "u-1".into(),
+                name: "Workspace recops".into(),
+                slug: "recops".into(),
+                node_id: "node-1".into(),
+                exec_mode: ExecMode::TrustedNative,
+                container_image: None,
+                egress_enforcement: EgressEnforcement::Unrestricted,
+                repo_kind: "empty".into(),
+                repo_url: None,
+                repo_auth_kind: None,
+                secret_ref: None,
+                ssh_host_fingerprint: None,
+                default_branch: None,
+                target_branch: None,
+                autonomy_ceiling: AutonomyMode::Normal,
+                egress_policy: "local_only".into(),
+                index_enabled: false,
+                quota_disk_bytes: None,
+                quota_sessions: None,
+            },
+        )
+        .expect("workspace");
+        repository::set_status(&main_db, "recops", WorkspaceStatus::Active, None).expect("activate");
+        cs_paths::create_workspace_layout("recops").expect("layout");
+        let pool = workspace_db::open("recops").expect("workspace db");
+        {
+            let conn = pool.write().expect("write");
+            conn.execute(
+                "INSERT INTO sessions (id, workspace_id, user_id, title, branch, autonomy_mode, \
+                  flow_id, flow_version_id, status, created_at, updated_at) \
+                 VALUES ('recopsess', 'recops', 'u-1', 'S', 'cs/u/1', 'normal', 'f', 'v', \
+                  'idle', datetime('now'), datetime('now'))",
+                [],
+            )
+            .expect("session row");
+            // A sandbox the previous process never released. Its row keeps the
+            // shared profile occupied for a session that is being resumed.
+            conn.execute(
+                "INSERT INTO sandboxes \
+                  (id, session_id, mount_access, network_access, lease_id, owner_run_id, state, \
+                   ephemeral, created_at) \
+                 VALUES ('sbx-1', 'recopsess', 'rw', 'none', 'lease-1', NULL, 'ready', 0, \
+                  datetime('now'))",
+                [],
+            )
+            .expect("sandbox row");
+        }
+
+        // The write whose content REACHED THE DISK before the crash: fully
+        // verifiable, so the pass has to close it without asking anybody.
+        let worktree = cs_paths::session_worktree_dir("recops", "recopsess").expect("worktree path");
+        std::fs::create_dir_all(&worktree).expect("worktree");
+        let content = b"written before the crash\n";
+        let stored = artifacts::put(&pool, "recops", content, "file_content").expect("input blob");
+        let landed = operations::begin(
+            &pool,
+            &OperationRequest {
+                workspace_id: "recops".into(),
+                session_id: "recopsess".into(),
+                run_id: None,
+                origin_kind: OriginKind::Ui,
+                origin_id: "crash".into(),
+                logical_step: "fs_write:boot.txt".into(),
+                op_kind: OpKind::FsWrite,
+                capability: Capability::FsWrite,
+                input: OperationInput::FileContent {
+                    path: "boot.txt".into(),
+                    content_sha256: stored.sha256,
+                    size_bytes: content.len() as u64,
+                },
+                precondition: Precondition::FileAbsent {
+                    path: "boot.txt".into(),
+                },
+                postcondition: Postcondition::FileBlobIs {
+                    path: "boot.txt".into(),
+                    sha256: cs_fs::blob_sha(content),
+                },
+                profile: None,
+            },
+        )
+        .expect("open the write");
+        std::fs::write(worktree.join("boot.txt"), content).expect("the effect landed");
+
+        // The push nothing on this node can verify: it must become a question.
+        let unverifiable = operations::begin(
+            &pool,
+            &OperationRequest {
+                workspace_id: "recops".into(),
+                session_id: "recopsess".into(),
+                run_id: None,
+                origin_kind: OriginKind::Ui,
+                origin_id: "crash".into(),
+                logical_step: "git_push:cs/u/1".into(),
+                op_kind: OpKind::GitPush,
+                capability: Capability::GitPush,
+                input: OperationInput::Git {
+                    operation: "push".into(),
+                    refname: Some("refs/heads/cs/u/1".into()),
+                    remote: Some("ssh://git@example.invalid/o/r.git".into()),
+                    oids: Vec::new(),
+                },
+                precondition: Precondition::None,
+                postcondition: Postcondition::None,
+                profile: None,
+            },
+        )
+        .expect("open the push");
+
+        let report = reconcile_code_studio(&main_db, "node-1");
+
+        assert_eq!(
+            report.operations_completed, 1,
+            "an effect whose postcondition holds must be closed by the boot pass: {report:?}"
+        );
+        assert_eq!(
+            report.operations_unknown, 1,
+            "an unverifiable effect must reach the queue a person works through: {report:?}"
+        );
+        assert_eq!(
+            report.sandboxes_reconciled, 1,
+            "the sandbox of the previous life still occupies its profile: {report:?}"
+        );
+        assert_eq!(
+            operations::get(&pool, &landed.op_id)
+                .expect("read")
+                .expect("row")
+                .status,
+            OperationStatus::Completed
+        );
+        assert_eq!(
+            operations::get(&pool, &unverifiable.op_id)
+                .expect("read")
+                .expect("row")
+                .status,
+            OperationStatus::Unknown
+        );
+        let live_sandboxes: i64 = {
+            let conn = pool.read().expect("read");
+            conn.query_row(
+                "SELECT COUNT(*) FROM sandboxes WHERE state != 'stopped'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count")
+        };
+        assert_eq!(live_sandboxes, 0);
+
+        // A second boot finds nothing: `unknown` is not a work queue this pass
+        // picks up again, and a closed sandbox stays closed.
+        let again = reconcile_code_studio(&main_db, "node-1");
+        assert_eq!(again.operations_completed, 0, "{again:?}");
+        assert_eq!(again.operations_unknown, 0, "{again:?}");
+        assert_eq!(again.sandboxes_reconciled, 0, "{again:?}");
+
+        workspace_db::close("recops");
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
 
     #[test]

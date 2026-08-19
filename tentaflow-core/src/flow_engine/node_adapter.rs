@@ -30,6 +30,10 @@ use crate::flow_engine::blob_store::BlobStore;
 #[derive(Default)]
 pub struct UsageSink {
     inner: Mutex<Vec<(String, TokenUsage)>>,
+    /// Model the LLM adapter resolved for this run, in call order. The tokens
+    /// alone do not say what spent them, and the caller settling a run (an agent
+    /// run row, a Code Studio turn) has to record both.
+    models: Mutex<Vec<String>>,
 }
 
 impl UsageSink {
@@ -47,6 +51,24 @@ impl UsageSink {
     /// stan (executor woła to per-node po execute żeby dorzucić do TraceStep).
     pub fn snapshot(&self) -> Vec<(String, TokenUsage)> {
         self.inner.lock().map(|g| g.clone()).unwrap_or_default()
+    }
+
+    /// Records the model an LLM call resolved to, at request-build time — the
+    /// only moment both the node config and the envelope fallback have been
+    /// applied, and the moment the streaming path shares with the blocking one.
+    pub fn record_model(&self, model: impl Into<String>) {
+        if let Ok(mut g) = self.models.lock() {
+            let model = model.into();
+            if g.last() != Some(&model) {
+                g.push(model);
+            }
+        }
+    }
+
+    /// The model of the LAST call. A flow may chain several, and the one that
+    /// produced the answer is the one worth naming on the run.
+    pub fn model(&self) -> Option<String> {
+        self.models.lock().ok().and_then(|g| g.last().cloned())
     }
 
     /// Suma wszystkich token usage zarejestrowanych do tej pory.
@@ -148,6 +170,19 @@ pub struct ExecutionContext {
     /// proces-szeroki manager (`services::vector_namespace_manager`); testy wstrzykują
     /// `with_root(tempdir)`.
     pub vectors: Arc<crate::services::vector::NamespaceManager>,
+
+    /// Katalog, w ktorym ma powstac przestrzen wektorowa tego wykonania, gdy
+    /// jeszcze nie istnieje. `None` => domyslne drzewo addonow. Ustawia go
+    /// wlasciciel spoza tego drzewa (Projekty: `<data>/projects/<id>/vectors`),
+    /// zeby generyczny `store`/`vector` zapisal dane u siebie zamiast w
+    /// katalogu addona.
+    ///
+    /// Trzymane TU, nie w `envelope.meta` — z tego samego powodu co
+    /// `subflow_depth` powyzej: meta jest zapisywalne przez kazdy node, w tym
+    /// blok addonu WASM, a to jest sciezka tworzenia pliku na dysku. Dla
+    /// istniejacej przestrzeni pole nie ma znaczenia (wygrywa zapisany
+    /// `file_path`), wiec nie da sie nim przekierowac juz zapisanych danych.
+    pub vector_home: Option<std::path::PathBuf>,
 
     /// RAG E1.1 — rejestr kolekcji grafowych `(org, addon_instance, collection)`.
     /// `GraphSearchNodeAdapter` uderza w niego z `ctx.addon_id`/`ctx.org_id`,
@@ -788,6 +823,7 @@ pub mod test_support {
             user_id: None,
             user_role: None,
             addon_id: None,
+            vector_home: None,
             org_id: None,
             deadline: None,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),

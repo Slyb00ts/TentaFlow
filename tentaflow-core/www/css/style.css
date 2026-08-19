@@ -1244,10 +1244,6 @@ input, textarea, select {
   .pair-cred-value.pin {
     font-size: 20px;
   }
-  /* tf-window header/footer scale down dla male telefony */
-  tf-window [slot="footer"] {
-    padding: 12px 14px;
-  }
 }
 
 .pair-id-hint {

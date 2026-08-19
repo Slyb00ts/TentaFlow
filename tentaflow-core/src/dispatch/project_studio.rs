@@ -5750,6 +5750,7 @@ async fn generation_start_v1(
             &[],
             &[(generation::GENERATION_META_KEY, binding_meta)],
             None,
+            None,
         )
         .await;
     let agent_run_id = match spawned {

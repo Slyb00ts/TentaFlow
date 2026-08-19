@@ -7,6 +7,7 @@
 // cache, and per-addon quotas.
 
 pub mod backend;
+pub mod doc_vectors;
 pub mod error;
 pub mod filter;
 #[cfg(feature = "vector-milvus")]

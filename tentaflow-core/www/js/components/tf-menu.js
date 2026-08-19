@@ -4,6 +4,12 @@
 //       i <tf-menu-divider>. Shadow DOM (open). Animacja Apple-style:
 //       scale 0.9 -> 1 + blur-in 8px -> 0 + stagger itemow co 25ms.
 //       Click-outside zamyka. Metody .open()/.close() oraz atrybut "open".
+//       Ustawienie `.anchor = element` przenosi panel na position:fixed i
+//       ustawia go POD (albo, gdy brak miejsca, NAD) kotwica — kotwica nigdy
+//       nie jest zaslonieta. Bez `.anchor` panel dziala jak dotad.
+//       Atrybut `compact` zdejmuje 180px min-width i zweza wiersze — dla menu
+//       kotwiczonego w tabeli, gdzie panel wisi nad rekordami. Tylko dla
+//       wskaznika: zwezony wiersz jest ponizej celu dotykowego 44px.
 // Przyklad:
 //   <tf-menu placement="bottom-start">
 //     <tf-menu-item action="edit" icon="edit">Edytuj</tf-menu-item>
@@ -124,11 +130,21 @@ class TfMenu extends HTMLElement {
     super();
     this._shadow = this.attachShadow({ mode: 'open' });
     this._box = null;
+    this._anchor = null;
     this._staggerTimers = [];
     this._onDocClick = this._onDocClick.bind(this);
     this._onSelect = this._onSelect.bind(this);
     this._onKey = this._onKey.bind(this);
+    this._onViewportChange = this._onViewportChange.bind(this);
   }
+
+  /** Element the panel must never cover (e.g. the table row it was opened from). */
+  set anchor(el) {
+    this._anchor = el instanceof Element ? el : null;
+    if (this.hasAttribute('open')) this._position();
+  }
+
+  get anchor() { return this._anchor; }
 
   connectedCallback() {
     if (!this._box) this._build();
@@ -142,6 +158,7 @@ class TfMenu extends HTMLElement {
     document.removeEventListener('pointerdown', this._onDocClick, true);
     document.removeEventListener('keydown', this._onKey);
     this.removeEventListener('tf-menu-select', this._onSelect);
+    this._unbindViewport();
     this._clearStagger();
   }
 
@@ -174,15 +191,78 @@ class TfMenu extends HTMLElement {
       if (!this._wasOpen) Sfx.play('menu-open');
       this._wasOpen = true;
       this._box.classList.add('open');
+      this._position();
+      this._bindViewport();
       this._applyStagger();
       this.dispatchEvent(new CustomEvent('open', { bubbles: true }));
     } else {
       if (this._wasOpen) Sfx.play('menu-close');
       this._wasOpen = false;
       this._box.classList.remove('open');
+      this._unbindViewport();
       this._clearStagger();
       this.dispatchEvent(new CustomEvent('close', { bubbles: true }));
     }
+  }
+
+  // With an anchor the panel leaves flow entirely: an absolutely positioned
+  // dropdown inherits the containing block of whatever cell it sits in, which
+  // is how it ended up drawn over its own row.
+  _position() {
+    const box = this._box;
+    if (!this._anchor || !this._anchor.isConnected) {
+      box.style.cssText = '';
+      return;
+    }
+    const a = this._anchor.getBoundingClientRect();
+    box.style.position = 'fixed';
+    box.style.top = '0px';
+    box.style.left = '0px';
+    box.style.right = 'auto';
+    box.style.bottom = 'auto';
+    box.style.maxHeight = '';
+    // Measure with the panel already laid out at its final width.
+    const w = box.offsetWidth;
+    const h = box.offsetHeight;
+    const gap = 6;
+    const margin = 8;
+    const vw = window.innerWidth;
+    const vh = window.innerHeight;
+
+    const below = vh - a.bottom - gap - margin;
+    const above = a.top - gap - margin;
+    // Below the anchor by default; flipping up only when it does not fit and
+    // there is genuinely more room the other way keeps the reading order.
+    const placeAbove = h > below && above > below;
+    const top = placeAbove ? Math.max(margin, a.top - gap - h) : a.bottom + gap;
+    box.setAttribute('data-placement', placeAbove ? 'top-end' : 'bottom-end');
+    const room = placeAbove ? above : below;
+    if (h > room) box.style.maxHeight = `${Math.max(120, room)}px`;
+    box.style.overflowY = h > room ? 'auto' : '';
+
+    const left = Math.min(Math.max(margin, a.right - w), vw - w - margin);
+    box.style.top = `${Math.round(top)}px`;
+    box.style.left = `${Math.round(Math.max(margin, left))}px`;
+  }
+
+  // A fixed panel does not travel with its anchor, so a scroll or resize
+  // dismisses it rather than leaving it stranded over unrelated content.
+  _bindViewport() {
+    if (!this._anchor || this._viewportBound) return;
+    this._viewportBound = true;
+    window.addEventListener('scroll', this._onViewportChange, true);
+    window.addEventListener('resize', this._onViewportChange);
+  }
+
+  _unbindViewport() {
+    if (!this._viewportBound) return;
+    this._viewportBound = false;
+    window.removeEventListener('scroll', this._onViewportChange, true);
+    window.removeEventListener('resize', this._onViewportChange);
+  }
+
+  _onViewportChange() {
+    this.close();
   }
 
   _applyStagger() {

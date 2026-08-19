@@ -148,6 +148,7 @@ impl LlmDispatcher for ScriptedLlm {
         if n == 0 {
             Ok(LlmResponse {
                 content: String::new(),
+                reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::ToolCalls,
                 tool_calls: vec![LlmToolCall {
@@ -159,6 +160,7 @@ impl LlmDispatcher for ScriptedLlm {
         } else {
             Ok(LlmResponse {
                 content: "final answer".into(),
+                reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
                 tool_calls: Vec::new(),

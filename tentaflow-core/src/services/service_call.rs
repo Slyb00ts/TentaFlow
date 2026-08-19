@@ -1156,7 +1156,7 @@ mod tests {
         let db = make_db();
         crate::db::repository::create_or_reactivate_model_alias_with_active(
             &db,
-            "rag-llm",
+            "fixture-llm",
             "big-model",
             "first_available",
             "addon",
@@ -1168,7 +1168,7 @@ mod tests {
         let executor = empty_executor();
         let req = ServiceCallRequest {
             caller: system_caller("rag-addon"),
-            service_name: "rag-llm".to_string(),
+            service_name: "fixture-llm".to_string(),
             payload_json: r#"{"input":"czesc"}"#.to_string(),
             timeout_ms: 0,
             alias_required: true,
@@ -1190,7 +1190,7 @@ mod tests {
         let (result, fallback_used): (String, i64) = conn
             .query_row(
                 "SELECT result, fallback_used FROM alias_calls WHERE alias_name = ?1",
-                rusqlite::params!["rag-llm"],
+                rusqlite::params!["fixture-llm"],
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .expect("alias_calls row written");

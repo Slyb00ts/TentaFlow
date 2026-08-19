@@ -44,22 +44,23 @@ use crate::flow_engine::node_adapters::{
     AgentContextNodeAdapter, AgentNodeAdapter, AgentRouterNodeAdapter, AskUserNodeAdapter,
     AwaitSubagentsNodeAdapter, CameraAlertNodeAdapter, CameraVerdictNodeAdapter, ChunkNodeAdapter,
     CombineNodeAdapter, CompactContextNodeAdapter, ConditionNodeAdapter,
-    ConversationHistoryNodeAdapter, DocumentMergeNodeAdapter, DocumentParseNodeAdapter,
-    DocumentRouterNodeAdapter, EmbedChunksNodeAdapter, EmbeddingsNodeAdapter,
-    ExcelExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
-    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
+    ConversationHistoryNodeAdapter, CriticGateNodeAdapter, DelegateCliNodeAdapter,
+    DocumentMergeNodeAdapter, DocumentParseNodeAdapter, DocumentRouterNodeAdapter,
+    EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, ExecCommandNodeAdapter,
+    GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
+    MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
     OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
-    PageDetectPagesNodeAdapter, PdfRasterizeNodeAdapter, PersistTurnNodeAdapter,
-    PiiFilterNodeAdapter, PlatformSwitchNodeAdapter, PptxExtractNodeAdapter,
-    ProjectKnowledgeNodeAdapter,
-    RagAccumulateNodeAdapter, RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter,
-    RagGraphSeedNodeAdapter, RagJudgeNodeAdapter, RagQuerySeedNodeAdapter, RerankerNodeAdapter,
-    SessionContextNodeAdapter, SpawnNodeAdapter, SpeakerContextNodeAdapter, StoreNodeAdapter,
-    SttNodeAdapter, SubagentStatusNodeAdapter, SubflowNodeAdapter, TableStructureNodeAdapter,
-    TextExtractNodeAdapter, ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter,
-    TtsNodeAdapter, VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter,
-    VisionOcrNodeAdapter, VisionParseNodeAdapter, VisionParsePagesNodeAdapter,
-    WordExtractNodeAdapter,
+    PageDetectPagesNodeAdapter, PatchReviewNodeAdapter, PdfRasterizeNodeAdapter,
+    PersistTurnNodeAdapter, PiiFilterNodeAdapter, PlatformSwitchNodeAdapter,
+    PptxExtractNodeAdapter, ProjectKnowledgeNodeAdapter, RagAccumulateNodeAdapter,
+    RagFinalizeNodeAdapter, RagGraphFactsNodeAdapter, RagGraphSeedNodeAdapter, RagJudgeNodeAdapter,
+    RagQuerySeedNodeAdapter, RerankerNodeAdapter, SessionContextNodeAdapter, SpawnNodeAdapter,
+    SpeakerContextNodeAdapter, StoreNodeAdapter, SttNodeAdapter, SubagentStatusNodeAdapter,
+    SubflowNodeAdapter, TableStructureNodeAdapter, TaskGateNodeAdapter, TextExtractNodeAdapter,
+    ToolExecNodeAdapter, TriggerNodeAdapter, TtsCleanNodeAdapter, TtsNodeAdapter,
+    VectorNodeAdapter, VisionClassifyNodeAdapter, VisionNodeAdapter, VisionOcrNodeAdapter,
+    VisionParseNodeAdapter, VisionParsePagesNodeAdapter, WordExtractNodeAdapter,
+    WorkspaceContextNodeAdapter,
 };
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
@@ -127,6 +128,10 @@ pub struct FlowRequestMeta {
     /// RAG E1.0 — organizacja-właściciel (`CallerContext.org_id`). `None` =>
     /// domyślny tenant rozwiązywany przy użyciu. Kopiowane do `ExecutionContext.org_id`.
     pub org_id: Option<String>,
+    /// Katalog dla NOWEJ przestrzeni wektorowej tego wywolania — patrz
+    /// `ExecutionContext::vector_home`. Osobne pole, nie klucz w `options`/meta:
+    /// caller-addon nie moze sterowac miejscem zapisu indeksu.
+    pub vector_home: Option<std::path::PathBuf>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
     /// §3.11 C — per-request progress fan-out. The caller (a handler holding
@@ -152,6 +157,7 @@ impl FlowRequestMeta {
             user_id: None,
             user_role: None,
             addon_id: None,
+            vector_home: None,
             org_id: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
@@ -250,6 +256,7 @@ impl ContextFactory {
             user_role: meta.user_role.clone(),
             addon_id: meta.addon_id.clone(),
             org_id: meta.org_id.clone(),
+            vector_home: meta.vector_home.clone(),
             deadline: meta.deadline,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: meta.cancel_token.clone(),
@@ -1151,6 +1158,9 @@ fn build_registry(
         Arc::new(AwaitSubagentsNodeAdapter::new()),
         Arc::new(SubagentStatusNodeAdapter::new()),
         Arc::new(IntervalNodeAdapter::new()),
+        // The block that ends a review loop on a VERDICT rather than on the
+        // absence of tool calls.
+        Arc::new(CriticGateNodeAdapter::new()),
     ];
     for a in arcs {
         r.register(a);
@@ -1169,6 +1179,23 @@ fn build_registry(
         agent_service.clone(),
     )));
     r.register(Arc::new(ToolExecNodeAdapter::new(agent_service.clone())));
+    // `workspace_context` reads the running agent's allowlist to publish
+    // `harness_tools`, so it shares the same late-bound service slot.
+    r.register(Arc::new(WorkspaceContextNodeAdapter::new(
+        agent_service.clone(),
+    )));
+    // The plan gate reads the session's task rows, so it needs the same slot to
+    // reach the registry database that names the workspace.
+    r.register(Arc::new(TaskGateNodeAdapter::new(agent_service.clone())));
+    // Code Studio (§16.4). `patch_review`, `exec_command` and `delegate_cli`
+    // reach the process-global interaction registry and run manager directly,
+    // like `ask_user` — and the SAME service slot: `exec_command` needs it for
+    // the agent's allowlist (§10), `delegate_cli` for the registry database and
+    // the node's settings key, which is what opens the provider credential in
+    // the node-local vault (§5.2).
+    r.register(Arc::new(PatchReviewNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(ExecCommandNodeAdapter::new(agent_service.clone())));
+    r.register(Arc::new(DelegateCliNodeAdapter::new(agent_service.clone())));
     r.register(Arc::new(AgentRouterNodeAdapter::new(agent_service.clone())));
     // `spawn` resolves an agent_id config to the agent's name through the service
     // before delegating in the background (§3.3).
@@ -1327,6 +1354,13 @@ mod tests {
             "await_subagents",
             "subagent_status",
             "interval",
+            "critic_gate",
+            "task_gate",
+            // Code Studio (§16.4).
+            "workspace_context",
+            "patch_review",
+            "exec_command",
+            "delegate_cli",
         ] {
             assert!(types.contains(expected), "missing adapter '{expected}'");
         }
@@ -1353,6 +1387,7 @@ mod tests {
                 completion_tokens: 7,
                 total_tokens: 12,
             },
+            model: None,
             perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 42,
@@ -1386,6 +1421,7 @@ mod tests {
             final_envelope: env,
             trace: Vec::new(),
             usage: TokenUsage::default(),
+            model: None,
             perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 0,
@@ -1436,6 +1472,7 @@ mod tests {
             final_envelope: env,
             trace: Vec::new(),
             usage: TokenUsage::default(),
+            model: None,
             perf: None,
             finish_reason: FinishReason::Stop,
             total_latency_ms: 0,
