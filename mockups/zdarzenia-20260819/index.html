@@ -24,10 +24,12 @@
 
   <div style="display:grid;gap:12px">
     <a href="z01-przegladarka.html" style="display:block;padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-card);color:var(--text);text-decoration:none">
-      <strong>Z01 · Przeglądarka zdarzeń</strong>
+      <strong>Z01 · Przeglądarka zdarzeń — DZIAŁAJĄCY PROTOTYP</strong>
       <div style="color:var(--text-2);font-size:13px;margin-top:4px">
-        Globalny widok. Filtry pochodzenia i aktora jako pierwszy wymiar. Rejestr grupowany turami,
-        z sekcją „między turami” dla zdarzeń spoza tury.
+        Ten jeden klika się naprawdę: kółko zoomuje, przeciągnięcie zaznacza zakres, prawy przycisk
+        przesuwa, dwuklik wraca do całości. Najechanie na wiersz podświetla pasmo na osi i odwrotnie.
+        Wybór aktora pokazuje, czy klucz API jest powiązany z użytkownikiem. Przełącznik
+        „czas rzeczywisty / równe odstępy” odpowiada na to, co się dzieje, gdy danych przybywa.
       </div>
     </a>
     <a href="z02-inspektor.html" style="display:block;padding:16px;border:1px solid var(--border);border-radius:var(--radius);background:var(--bg-card);color:var(--text);text-decoration:none">
@@ -79,6 +81,13 @@
       zrównoleglenia nie widać.</li>
     <li><strong>Bez fabrykowania czasu.</strong> Rekord w locie dostaje znacznik startu, nie
       zmyślony pasek.</li>
+    <li><strong>Dwie skale zamiast jednej.</strong> W czasie rzeczywistym wywołanie 22 ms obok
+      builda 4 min jest niewidoczne. „Równe odstępy” dają każdemu rekordowi tę samą szerokość —
+      oś przestaje być liniowa, więc to <em>jawny przełącznik</em>, nigdy automat.</li>
+    <li><strong>Minimapa pokazuje całość i okno widoku.</strong> Przy zoomie trzeba wiedzieć, gdzie
+      się jest — inaczej powiększenie gubi kontekst.</li>
+    <li><strong>Powiązanie klucza API z użytkownikiem jest widoczne od razu</strong> — na liście
+      aktorów i w inspektorze, z rozróżnieniem „powiązany” / „klucz serwisowy bez usera”.</li>
   </ul>
 </div>
 </body>
