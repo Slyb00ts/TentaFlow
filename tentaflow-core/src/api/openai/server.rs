@@ -2632,6 +2632,14 @@ async fn handle_models_list(
     // kind-specific `owned_by` tag (`tentaflow-service` / `tentaflow-flow` /
     // `tentaflow-alias`) instead of being flattened to a single string.
     let snapshot = router.catalog_snapshot();
+    let local_services = router.service_manager.current_snapshot();
+    let local_node_id = router
+        .service_manager
+        .mesh_services_registry
+        .read()
+        .as_ref()
+        .map(|r| r.local().node_id.clone())
+        .unwrap_or_default();
 
     #[derive(serde::Serialize)]
     struct ModelObject {
@@ -2639,6 +2647,8 @@ async fn handle_models_list(
         object: String,
         created: i64,
         owned_by: String,
+        supports_embeddings: bool,
+        supports_structured_output: bool,
     }
 
     #[derive(serde::Serialize)]
@@ -2663,6 +2673,16 @@ async fn handle_models_list(
                 object: "model".to_string(),
                 created: 1686935002,
                 owned_by: entry.owned_by().to_string(),
+                supports_embeddings: entry
+                    .service_surfaces
+                    .contains(&crate::services::catalog::ServiceSurface::Embeddings),
+                supports_structured_output: supports_structured_output(
+                    &snapshot,
+                    &local_services,
+                    &local_node_id,
+                    entry,
+                    0,
+                ),
             })
             .collect(),
         _ => Vec::new(),
@@ -2676,6 +2696,52 @@ async fn handle_models_list(
 
     let body = serde_json::to_vec(&response).unwrap();
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Capability flag for `/v1/models`: whether `response_format` (json_object /
+/// json_schema) reaches the engine intact. True only when the chat surface is
+/// served by a LOCAL service over plain HTTP (vLLM, SGLang, llama-server,
+/// ollama, OpenAI-compatible upstreams) — `BackendClient` serializes the full
+/// `ChatCompletionRequest`. Embedded engines (llama.cpp in-process, MLX),
+/// QUIC sidecars, mesh-forwarded instances and published flows all rebuild the
+/// request without `response_format`, so they report false. An alias inherits
+/// the verdict of its primary target.
+fn supports_structured_output(
+    snapshot: &CatalogSnapshot,
+    local_services: &crate::services::supervisor::ServicesSnapshot,
+    local_node_id: &str,
+    entry: &CatalogEntry,
+    depth: usize,
+) -> bool {
+    use crate::services::catalog::ServiceSurface;
+    use crate::services::transport::Transport;
+
+    if depth > 4 || !entry.service_surfaces.contains(&ServiceSurface::Chat) {
+        return false;
+    }
+    match &entry.kind {
+        CatalogEntryKind::ServiceModel { instances } => instances.iter().any(|inst| {
+            inst.node_id == local_node_id
+                && local_services
+                    .services_by_id
+                    .get(&inst.service_id)
+                    .and_then(|idx| local_services.services.get(*idx))
+                    .is_some_and(|svc| {
+                        matches!(
+                            svc.transport,
+                            Transport::HttpDirect | Transport::ExternalHttp
+                        )
+                    })
+        }),
+        CatalogEntryKind::Alias { target, .. } => snapshot
+            .entries
+            .iter()
+            .find(|e| &e.id == target)
+            .is_some_and(|t| {
+                supports_structured_output(snapshot, local_services, local_node_id, t, depth + 1)
+            }),
+        CatalogEntryKind::Flow { .. } => false,
+    }
 }
 
 /// Sprawdza czy request ma wlaczony debug routing (header lub query param)

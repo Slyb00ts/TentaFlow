@@ -48,6 +48,7 @@ pub async fn run_local_chat(
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
 
     // Odpytanie modelu to SUROWA inferencja LLM — BEZ flow. `route_chat_completion`

@@ -784,6 +784,7 @@ pub async fn router_complete(router: &Router, model: &str, prompt: String) -> Re
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
     let result = router.route_chat_completion(request, None, None).await?;
     let text = result

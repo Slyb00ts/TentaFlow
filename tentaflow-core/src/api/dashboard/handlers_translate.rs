@@ -230,6 +230,7 @@ text, with no explanations, quotes, preface or meta-commentary.",
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
 
     let route_result = ctx

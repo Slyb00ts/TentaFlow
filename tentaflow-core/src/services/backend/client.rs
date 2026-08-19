@@ -1422,6 +1422,7 @@ impl BackendClient {
             response_format: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         // Wyslij POST request (dla formatu openai bezposrednia serializacja, inaczej transformacja)

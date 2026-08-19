@@ -421,6 +421,7 @@ impl Router {
             response_format: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         match self.route_chat_completion(request, None, None).await {

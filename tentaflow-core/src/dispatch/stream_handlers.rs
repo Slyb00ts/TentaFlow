@@ -117,6 +117,7 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
                 }
             }),
             audio_input: None,
+            extra: Default::default(),
         };
 
         // Selektor flow z UI czatu: konkretny flow po ID albo "Default Chat".

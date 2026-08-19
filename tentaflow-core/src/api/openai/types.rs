@@ -153,6 +153,13 @@ pub struct ChatCompletionRequest {
     /// Glos i kontener audio wyjsciowego. Wymagane razem z `modalities`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub audio: Option<AudioConfig>,
+
+    /// Unknown top-level vendor fields (`guided_json`, `guided_regex`,
+    /// `chat_template_kwargs`, `top_k`, `min_p`, `seed`, ...). Captured on
+    /// parse and re-emitted on serialize so an HTTP backend receives them
+    /// untouched. Typed fields above always win on overlap.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Pojedyncza wiadomosc w konwersacji
@@ -167,8 +174,9 @@ pub struct Message {
     pub content: Option<MessageContent>,
 
     /// Reasoning content (dla modeli reasoning jak DeepSeek R1, OpenAI o1)
-    /// Zawiera "chain of thought" / proces myslowy modelu
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// Zawiera "chain of thought" / proces myslowy modelu.
+    /// vLLM 0.27+ returns the field as `reasoning`.
+    #[serde(skip_serializing_if = "Option::is_none", default, alias = "reasoning")]
     pub reasoning_content: Option<String>,
 
     /// Nazwa uzytkownika/bota (opcjonalne)
@@ -255,9 +263,18 @@ pub struct ImageUrl {
 /// Response format specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFormat {
-    /// Typ: "text" lub "json_object"
+    /// Typ: "text", "json_object" lub "json_schema"
     #[serde(rename = "type")]
     pub format_type: String,
+
+    /// Full `json_schema` object (`{"name", "schema", "strict", ...}`) for
+    /// `type = "json_schema"`, passed through verbatim to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<serde_json::Value>,
+
+    /// Vendor-specific sub-fields of `response_format`, preserved verbatim.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Tool definition (function calling)
@@ -610,8 +627,10 @@ pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
-    /// Reasoning content (dla modeli z rozumowaniem, np. o1)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Reasoning content (dla modeli z rozumowaniem, np. o1).
+    /// vLLM 0.27+ streams the field as `reasoning`, older backends
+    /// (DeepSeek, SGLang, vLLM <=0.26) as `reasoning_content`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
 
     /// Tool calls (przyrostowe)

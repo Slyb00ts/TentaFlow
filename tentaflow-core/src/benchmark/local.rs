@@ -84,6 +84,7 @@ impl LocalRunner {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         let mut exec_ctx = ExecutionContext::new(self.user.clone());

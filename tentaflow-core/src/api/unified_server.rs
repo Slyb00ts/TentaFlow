@@ -185,15 +185,37 @@ pub fn start_unified_server_with_permissions(
     let mtls_offers_client_auth = pickup_mtls.requests_client_cert();
     crate::api::mtls::set_pickup_mtls_config(pickup_mtls);
 
-    // Wbudowane certyfikaty TLS z katalogu certs/ repozytorium
+    // Per-installation certificate from <data>/tls (generated on first start,
+    // regenerated when local IPs change). The certificate embedded in the
+    // binary is only the emergency fallback when the data dir is unusable.
     let tls_acceptor = {
-        let cert_pem = include_bytes!("../../../certs/cert.pem");
-        let key_pem = include_bytes!("../../../certs/key.pem");
-
-        let certs = crate::api::tls_pem::parse_certs_pem(cert_pem)
-            .expect("Nie udalo sie sparsowac wbudowanego certyfikatu");
-        let key = crate::api::tls_pem::parse_key_pem(key_pem)
-            .expect("Nie udalo sie sparsowac wbudowanego klucza");
+        let extra_sans = config
+            .server
+            .tls
+            .as_ref()
+            .map(|t| t.extra_sans.clone())
+            .unwrap_or_default();
+        let hostname = crate::mesh::node_info_collector::local_hostname();
+        let (certs, key) = match crate::api::tls_identity::load_or_generate(
+            &crate::paths::tls_dir(),
+            &hostname,
+            &extra_sans,
+        ) {
+            Ok(identity) => (identity.certs, identity.key),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "TLS: per-installation certificate unavailable, using embedded fallback"
+                );
+                let cert_pem = include_bytes!("../../../certs/cert.pem");
+                let key_pem = include_bytes!("../../../certs/key.pem");
+                let certs = crate::api::tls_pem::parse_certs_pem(cert_pem)
+                    .expect("Nie udalo sie sparsowac wbudowanego certyfikatu");
+                let key = crate::api::tls_pem::parse_key_pem(key_pem)
+                    .expect("Nie udalo sie sparsowac wbudowanego klucza");
+                (certs, key)
+            }
+        };
 
         // TLS 1.3 only — F1b is HTTPS-native, no legacy clients to support.
         // Pinning the version here also pins AEAD-only cipher suites and

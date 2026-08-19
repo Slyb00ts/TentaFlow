@@ -699,6 +699,11 @@ pub fn keys_dir() -> PathBuf {
     category_dir(StorageCategory::Keys)
 }
 
+/// Per-installation HTTPS certificate (`<data>/tls/{cert,key}.pem`).
+pub fn tls_dir() -> PathBuf {
+    data_dir().join("tls")
+}
+
 /// Katalog stanu synchronizacji (`<sync>/ledger` — Fjall). Override aplikowany
 /// przy starcie (ledger trzyma otwarty keyspace przez caly czas zycia procesu).
 pub fn sync_dir() -> PathBuf {
@@ -803,6 +808,7 @@ pub fn ensure_app_dirs() -> std::io::Result<()> {
     std::fs::create_dir_all(recordings_dir())?;
     std::fs::create_dir_all(orgs_dir())?;
     std::fs::create_dir_all(keys_dir())?;
+    std::fs::create_dir_all(tls_dir())?;
     std::fs::create_dir_all(sync_dir())?;
 
     let containers_parent = containers_install_root();

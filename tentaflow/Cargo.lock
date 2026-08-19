@@ -11740,6 +11740,7 @@ dependencies = [
  "windows-sys 0.61.2",
  "winreg",
  "x25519-dalek",
+ "x509-parser 0.18.1",
  "zeroize",
  "zip 8.6.0",
  "zstd 0.13.3",

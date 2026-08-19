@@ -2271,6 +2271,7 @@ impl ModelRuntimeExecutor {
             response_format: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         let response = self.execute_chat(chat_request, ctx).await?;
