@@ -1280,6 +1280,15 @@ function classifyRun(ev) {
   if (kind === 'subagent' || kind === 'cli') state.subagentRuns.add(ev.p.run_id || ev.runId);
 }
 
+/// Operacje, po których worktree na dysku wygląda inaczej niż lista, którą panel
+/// plików trzyma w pamięci.
+///
+/// Lista to `OpKind` z `code_studio/operations.rs` MINUS `git_push`: odczyty w
+/// ogóle nie są operacjami, więc każde `operation_finished` poza pushem coś
+/// lokalnie zmienia. Push rusza tylko zdalne ref-y i odświeżanie po nim byłoby
+/// ruchem bez treści.
+const NON_MUTATING_OPS = new Set(['git_push']);
+
 function reactToEvent(ev, refresh) {
   switch (ev.kind) {
     case 'approval_requested':
@@ -1304,9 +1313,15 @@ function reactToEvent(ev, refresh) {
       refresh.add('runs');
       break;
     case 'operation_started':
-    case 'operation_finished':
     case 'operation_reconciled':
       refresh.add('operations');
+      break;
+    case 'operation_finished':
+      refresh.add('operations');
+      // Zapis widać dopiero, gdy ktoś o niego zapyta. Odświeżanie na
+      // `patch_set_opened` przychodzi na KOŃCU tury, więc przez cały czas pracy
+      // agenta drzewo pokazywało stan sprzed jego pierwszego zapisu.
+      if (!NON_MUTATING_OPS.has(String(ev.p.op_kind || ''))) refresh.add('files');
       break;
     // A merge, a push or a commit moves the branch and the worktree list; the
     // git pane rebuilds its merge state from them.
