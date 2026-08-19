@@ -1770,14 +1770,14 @@ mod tests {
         let names = payload_variant_names(SOURCE);
         assert_eq!(
             names.len(),
-            139,
+            141,
             "CodeStudioPayload variant COUNT changed. Appending is fine — update the count and \
              the digest below in the same commit. Live variants:\n{}",
             names.join("\n")
         );
         assert_eq!(
             name_digest(&names),
-            0xd7e5_98a8_a391_abdd,
+            0x22a0_865d_498a_f8db,
             "CodeStudioPayload variant NAMES or their order changed. ciborium tags variants by \
              name, so a rename silently breaks every deployed browser while the round-trip tests \
              stay green. Rename back, or update this digest deliberately. Live variants:\n{}",
@@ -1794,13 +1794,13 @@ mod tests {
         let names: Vec<String> = structs.iter().map(|(n, _)| n.clone()).collect();
         assert_eq!(
             names.len(),
-            34,
+            35,
             "wire struct COUNT changed. Live structs:\n{}",
             names.join("\n")
         );
         assert_eq!(
             name_digest(&names),
-            0x384d_f58e_8d99_17f6,
+            0x3749_e55e_d5a9_3ef5,
             "wire struct NAMES changed. Live structs:\n{}",
             names.join("\n")
         );
@@ -1830,6 +1830,7 @@ mod tests {
             ("ApprovalInfo", 14, 0xb495_12ac_e29d_e01d),
             ("GrantInfo", 5, 0x746f_66e3_5c06_3f72),
             ("AllowlistEntryInfo", 5, 0xfa26_c8fd_98e4_01bf),
+            ("TaskInfo", 5, 0xba5d_338a_d0cd_cc0f),
             ("RunInfo", 14, 0xa39b_bf6c_da1e_37ea),
             ("TerminalCellRow", 3, 0x127a_c330_42a5_759e),
             ("IndexStateInfo", 6, 0x2bdd_bc96_705b_0813),
