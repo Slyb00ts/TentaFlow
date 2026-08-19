@@ -240,7 +240,12 @@ oznacza migrację danych addona i zmianę jego modelu synchronizacji — osobne 
 planu. Po tej zmianie identyczne są mechanizmy *wykonania* (limit, anulowanie), a różna zostaje
 *trwałość zlecenia*.
 
-### Etap 5 — jeden retrieval **[CZĘŚCIOWO WYKONANE; przejście `ps-chat` zablokowane]**
+### Etap 5 — jeden retrieval **[WYKONANE inną drogą, niż zakładał ten opis]**
+
+> **Nieaktualne poniżej.** `ps-chat` PRZESZEDŁ na wspólny retrieval (`053386f19`) — ale reużywając
+> CIAŁO pętli (`retrieval-round`), a nie zewnętrzny flow `query`. Dzięki temu zachował streaming i
+> model z `meta`, więc trzy wymienione niżej regresje w ogóle nie wystąpiły. Aktualny stan i to, co
+> jeszcze zostało, opisuje [`DOKONCZENIE_RAG_I_ZDARZENIA.md`](DOKONCZENIE_RAG_I_ZDARZENIA.md).
 `retrieval_round` i `query` jako flowy systemowe; `project_knowledge` zostaje wyłącznie bramką
 (członkostwo + scope + delegacja), join nazw źródeł zostaje po stronie PS.
 
