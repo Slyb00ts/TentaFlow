@@ -515,7 +515,8 @@ impl NodeAdapter for CompactContextNodeAdapter {
             ),
         };
 
-        let mut req = LlmRequest::new(model);
+        // §2.5 — the compaction call belongs to the run it compacts.
+        let mut req = LlmRequest::new(model, ctx.provenance());
         req.messages = vec![
             ChatMessage::system(system_prompt),
             ChatMessage::user(user_prompt),

@@ -127,6 +127,8 @@ pub(crate) async fn parse_image_to_markdown(
     ])];
 
     let req = LlmRequest {
+        // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+        provenance: ctx.provenance(),
         audio_out: None,
         reasoning_effort: None,
         model,

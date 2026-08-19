@@ -293,13 +293,25 @@ impl SubagentReactor {
             .ok()
             .flatten();
         let result = finished.as_ref().and_then(|r| r.result.clone());
-        // §2.5 — inherit the finished run's caller. The run row persists who and
-        // which org, not the original entry point, so the reactive run reports
-        // `agent` as its origin — which is what it is.
-        let principal = AgentPrincipal::new(
-            finished.as_ref().and_then(|r| r.user_id.clone()),
-            finished.as_ref().and_then(|r| r.org_id.clone()),
-        );
+        // §2.5 — the reactive run inherits the finished run's provenance
+        // VERBATIM off its row: the entry point that started the chain and the
+        // actor behind it, an API key included. Rebuilding a principal from
+        // `user_id` alone would report a service key as a user, and that
+        // derived stamp is what the event log would keep. A row we cannot read
+        // (missing, or a stamp neither `FlowOrigin::parse` nor
+        // `ActorKind::parse` accepts) means we do not know who this run acts
+        // for — we refuse instead of guessing.
+        let principal = match finished.as_ref().and_then(AgentPrincipal::from_run_row) {
+            Some(p) => p,
+            None => {
+                tracing::warn!(
+                    "subagent reactor: run '{}' has no readable provenance — \
+skipping reactive dispatch rather than running under a guessed principal",
+                    event.run_id
+                );
+                return;
+            }
+        };
 
         for flow_id in matching {
             let initial = seed_envelope(&event, result.as_deref());
@@ -496,6 +508,11 @@ mod tests {
                 user_id: Some("u1"),
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create run");

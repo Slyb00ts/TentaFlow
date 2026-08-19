@@ -249,9 +249,18 @@ pub struct RunEvent {
     /// Stable identity of this write; `None` opts out of deduplication, which
     /// is what an event with no natural key (a token, a message) wants.
     pub idempotency_key: Option<String>,
-    /// Tenant the audit COPY belongs to. Never stored in `run_events` — §2.3
-    /// has no such column and the timeline is a per-node artefact — but the
-    /// `audit_log` row it produces has to land in the right organisation.
+    /// Tenant this run belongs to. Stored on the timeline row AND carried into
+    /// the audit copy: retention terms are resolved per organisation, so a row
+    /// that cannot name its tenant cannot be purged on that tenant's term
+    /// (§2.9). Server-minted like `origin` and the actor — it comes from
+    /// `FlowRequestMeta.org_id`, which the entry points fill from
+    /// `CallerContext.org_id` or from an already membership-checked project,
+    /// never from `envelope.meta` (invariant 1).
+    ///
+    /// `None` means no organisation was minted for this run — a camera,
+    /// scheduler or maintenance trigger. It is written as NULL and NOT
+    /// substituted with the default tenant: a guessed owner is a fabricated
+    /// fact (invariant 6).
     pub org_id: Option<String>,
     pub payload: EventPayload,
 }
@@ -358,6 +367,9 @@ pub struct StoredEvent {
     pub actor_kind: String,
     pub actor_id: Option<String>,
     pub actor_user_id: Option<String>,
+    /// Tenant the row belongs to; `None` = no organisation was minted for the
+    /// run, which the browser shows as such rather than as a tenant.
+    pub org_id: Option<String>,
     pub correlation_id: Option<String>,
     pub session_id: Option<String>,
     pub node_id: Option<String>,
@@ -443,8 +455,9 @@ fn write_event(tx: &Transaction<'_>, event: RunEvent) -> Result<AppendedEvent> {
     tx.execute(
         "INSERT INTO run_events \
           (run_id, seq, at_ms, kind, origin, actor_kind, actor_id, actor_user_id, \
-           correlation_id, session_id, node_id, call_id, payload_json, idempotency_key) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+           org_id, correlation_id, session_id, node_id, call_id, payload_json, \
+           idempotency_key) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             event.run_id,
             seq,
@@ -454,6 +467,7 @@ fn write_event(tx: &Transaction<'_>, event: RunEvent) -> Result<AppendedEvent> {
             actor_kind,
             event.actor_id,
             event.actor_user_id,
+            event.org_id,
             event.correlation_id,
             event.session_id,
             event.node_id,
@@ -508,7 +522,7 @@ pub fn read_run(
     let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT run_id, seq, at_ms, kind, origin, actor_kind, actor_id, actor_user_id, \
-          correlation_id, session_id, node_id, call_id, payload_json \
+          org_id, correlation_id, session_id, node_id, call_id, payload_json \
          FROM run_events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
     )?;
     let rows = stmt.query_map(
@@ -527,7 +541,8 @@ pub fn read_run(
                 row.get::<_, Option<String>>(9)?,
                 row.get::<_, Option<String>>(10)?,
                 row.get::<_, Option<String>>(11)?,
-                row.get::<_, String>(12)?,
+                row.get::<_, Option<String>>(12)?,
+                row.get::<_, String>(13)?,
             ))
         },
     )?;
@@ -543,6 +558,7 @@ pub fn read_run(
             actor_kind,
             actor_id,
             actor_user_id,
+            org_id,
             correlation_id,
             session_id,
             node_id,
@@ -560,6 +576,7 @@ pub fn read_run(
             actor_kind,
             actor_id,
             actor_user_id,
+            org_id,
             correlation_id,
             session_id,
             node_id,
@@ -949,6 +966,72 @@ mod tests {
             .query_row("SELECT actor_user_id FROM run_events", [], |row| row.get(0))
             .unwrap();
         assert_eq!(bound, None);
+    }
+
+    /// §2.9 needs every row attributable to a tenant, so the organisation has
+    /// to be ON THE ROW and not only in the audit copy. Read back with SQL:
+    /// asserting the in-memory struct would prove a field exists, not that the
+    /// file carries it.
+    ///
+    /// The value is taken from `FlowRequestMeta` — server-minted at the entry
+    /// point (invariant 1) — and a run with no organisation stays NULL rather
+    /// than borrowing the default tenant (invariant 6).
+    #[test]
+    fn the_tenant_is_stored_on_the_row_and_stays_null_when_there_is_none() {
+        let (_dir, pool) = events_db();
+
+        let mut meta = FlowRequestMeta::new("r-tenant", FlowOrigin::Api, FlowActor::user("u-1"));
+        meta.org_id = Some("org-acme".to_string());
+        append(
+            &pool,
+            RunEvent::from_meta(&meta, now_ms(), request_started()),
+        )
+        .unwrap();
+
+        // A camera / scheduler run: no organisation was minted for it.
+        let system_meta =
+            FlowRequestMeta::new("r-system", FlowOrigin::Camera, FlowActor::system());
+        assert!(system_meta.org_id.is_none());
+        append(
+            &pool,
+            RunEvent::from_meta(&system_meta, now_ms(), request_started()),
+        )
+        .unwrap();
+
+        // The reader surfaces it too — the browser filters by tenant. Taken
+        // BEFORE the guard below: for a single-connection `Db` a read guard IS
+        // the writer mutex, so holding one across `read_run` would deadlock.
+        let stored = read_run(&pool, "r-tenant", 0, 10).unwrap();
+        assert_eq!(stored[0].org_id.as_deref(), Some("org-acme"));
+
+        let conn = pool.read().unwrap();
+        let rows: Vec<(String, Option<String>)> = {
+            let mut stmt = conn
+                .prepare("SELECT run_id, org_id FROM run_events ORDER BY run_id")
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                ("r-system".to_string(), None),
+                ("r-tenant".to_string(), Some("org-acme".to_string())),
+            ],
+            "the timeline row did not keep its tenant"
+        );
+
+        // And the audit copy still carries the same tenant, from the same field.
+        let envelope_org: Option<String> = conn
+            .query_row(
+                "SELECT payload_json ->> '$.org_id' FROM audit_outbox WHERE run_id = 'r-tenant'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(envelope_org.as_deref(), Some("org-acme"));
     }
 
     /// Invariant 4. `run_events` cannot be swept into the Sync Ledger for two

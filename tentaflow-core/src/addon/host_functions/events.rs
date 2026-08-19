@@ -219,6 +219,7 @@ mod tests {
             permission_checker: Arc::new(PermissionChecker::new(db)),
             fuel_consumed: 0,
             is_system_call: true,
+            call_provenance: crate::addon::AddonCallProvenance::addon(),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
             settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),

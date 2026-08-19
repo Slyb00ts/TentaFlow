@@ -10,6 +10,7 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::flow_engine::envelope::TokenUsage;
+use crate::flow_engine::dispatcher::CallProvenance;
 
 #[derive(Debug, Clone)]
 pub struct RerankRequest {
@@ -26,6 +27,12 @@ pub struct RerankRequest {
     /// Dispatcher seeduje nim runtime'owy `flow_stack`, żeby re-wejście
     /// rerankera w flow-surface DZIEDZICZYŁO głębokość zamiast resetować do 0.
     pub flow_depth: u8,
+    /// §2.5 — server-minted provenance of the flow this call belongs to, copied
+    /// from the node's `ExecutionContext`. Threaded for the same reason as
+    /// `flow_depth`: the runtime context the dispatcher builds re-enters the
+    /// executor, and an alias resolving onto a flow surface starts THAT flow
+    /// with this stamp. Not derived from request content.
+    pub provenance: CallProvenance,
 }
 
 /// Pojedynczy wynik rerankingu — odwzorowanie pozycji dokumentu na score.

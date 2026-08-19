@@ -26,6 +26,7 @@ use crate::services::detection_bus::Detection;
 
 use super::cv_pipeline::{self, CvOp, CvPipeline, CvStageInput, CvStageOutput};
 use super::tracker;
+use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 use crate::flow_engine::dispatchers_impl::ModelRuntimeSlot;
 use crate::services::detection_bus;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
@@ -1988,7 +1989,14 @@ async fn engine_loop() {
             };
             // Wywolanie systemowe (silnik kamer) — brak tozsamosci uzytkownika,
             // swiezy kontekst per wywolanie (jak w vision_impl).
-            let mut ctx = RuntimeContext::new(None);
+            // §2.5 — the camera pipeline, with no human in the loop. One batch
+            // carries frames from SEVERAL cameras, so there is no single camera
+            // id to name: the actor is the detect stage itself.
+            let mut ctx = RuntimeContext::new(
+                None,
+                FlowOrigin::Camera,
+                FlowActor::system_component("vision_detect"),
+            );
             let detect_start = Instant::now();
             #[cfg(feature = "vision-ort")]
             let (outcome, vehicles) = tokio::join!(
@@ -2815,6 +2823,24 @@ async fn camera_flow_id(camera_id: &str) -> Option<String> {
     flow_id
 }
 
+/// §2.5 — the camera entry point's stamp, as one named function so it is
+/// testable and so there is a single place that decides what a camera run
+/// reports as.
+///
+/// System-triggered execution: there is no user in the loop, so no per-user ACL
+/// applies (the dispatcher treats `user_id = None` as allow). The real
+/// authorization gate is the camera→flow assignment write path, which is
+/// admin-only and validates flow access before persisting `analysis_flow_id`.
+/// The camera is named as a SYSTEM component: it says which camera acted
+/// without claiming a person did.
+fn camera_flow_request_meta(camera_id: &str) -> crate::flow_engine::dispatcher::FlowRequestMeta {
+    crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        format!("cam-{camera_id}"),
+        FlowOrigin::Camera,
+        FlowActor::system_component(camera_id),
+    )
+}
+
 /// Runs a camera's assigned analysis Flow on one detection frame: stores the raw
 /// RGB frame as an Image blob, builds the initial envelope (payload = Image, meta
 /// carries the pipeline-enriched detections + camera id), dispatches by flow id
@@ -2833,7 +2859,6 @@ async fn run_camera_flow(
     detect_ms: u32,
     detections: Vec<Detection>,
 ) {
-    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 
     // Czas wykonania flow to koszt dodatkowej obrobki tej klatki; proc_ms =
@@ -2869,17 +2894,7 @@ async fn run_camera_flow(
     );
     env.meta.insert("detections".into(), dets_json);
 
-    // System-triggered execution: there is no user in the loop, so no per-user
-    // ACL applies here (the dispatcher treats `user_id = None` as allow). The
-    // real authorization gate is the camera→flow assignment write path, which is
-    // admin-only and validates flow access before persisting `analysis_flow_id`.
-    // A per-frame deadline (well under the dispatcher's 120 s cap) bounds how
-    // long one camera's slot stays held if its flow hangs.
-    let mut meta = FlowRequestMeta::new(
-        format!("cam-{camera_id}"),
-        FlowOrigin::Camera,
-        FlowActor::system_component(camera_id.clone()),
-    );
+    let mut meta = camera_flow_request_meta(&camera_id);
     meta.deadline = Some(Instant::now() + CAMERA_FLOW_DEADLINE);
     match disp.dispatch_by_flow_id(flow_id.clone(), env, meta).await {
         Ok(outcome) => {
@@ -3799,7 +3814,13 @@ async fn run_cold_stages(
         // `read_batch`). Jesli nie (mesh/zdalny/onnx-cv/tryb ADR) — fallback na
         // istniejaca sciezke per-crop przez `execute_camera_cv`.
         let engine = {
-            let mut ctx = RuntimeContext::new(None);
+            // §2.5 — a resolver PROBE (does this alias land on a local embedded
+            // engine?), not a dispatch: nothing is executed under this context.
+            let mut ctx = RuntimeContext::new(
+                None,
+                FlowOrigin::Camera,
+                FlowActor::system_component("vision_stage_probe"),
+            );
             executor.local_camera_cv_engine(&stage.model, &mut ctx)
         };
         plans.push(ColdStagePlan {
@@ -4193,7 +4214,12 @@ async fn classify_crop(
             },
         },
     };
-    let mut ctx = RuntimeContext::new(None);
+    // §2.5 — camera cold path; the crop helper knows its stage, not the camera.
+    let mut ctx = RuntimeContext::new(
+        None,
+        FlowOrigin::Camera,
+        FlowActor::system_component("vision_classify"),
+    );
     match executor.execute_camera_cv(request, &mut ctx).await {
         Ok(CameraCvResult::Labels { stan }) => Some(stan),
         Ok(_) => {
@@ -4233,7 +4259,12 @@ async fn ocr_crop(
             mode,
         },
     };
-    let mut ctx = RuntimeContext::new(None);
+    // §2.5 — camera cold path; the crop helper knows its stage, not the camera.
+    let mut ctx = RuntimeContext::new(
+        None,
+        FlowOrigin::Camera,
+        FlowActor::system_component("vision_ocr"),
+    );
     match executor.execute_camera_cv(request, &mut ctx).await {
         Ok(CameraCvResult::Text { tekst }) => tekst,
         Ok(_) => {
@@ -4894,5 +4925,29 @@ mod tests {
             jobs.is_empty(),
             "trwający forward dokończony i zaaplikowany (await), nie porzucony"
         );
+    }
+
+    /// §2.5 — the camera entry point stamps `camera` origin and names the CAMERA
+    /// as a system actor, with no user behind it. Drives the production builder
+    /// `run_camera_flow` uses, so changing the entry point's stamp fails here;
+    /// constructing a `FlowRequestMeta` in the test body and asserting its own
+    /// arguments would prove nothing about the entry point.
+    #[test]
+    fn camera_entry_point_stamps_camera_origin_and_names_the_camera() {
+        use crate::flow_engine::dispatcher::ActorKind;
+
+        let meta = camera_flow_request_meta("front-door");
+        assert_eq!(meta.origin, FlowOrigin::Camera);
+        assert_eq!(meta.actor_kind, ActorKind::System);
+        assert_eq!(meta.actor_id.as_deref(), Some("front-door"));
+        // No human in the loop: an actor_user_id here would attribute an
+        // unattended pipeline run to a person.
+        assert_eq!(meta.actor_user_id, None);
+        assert!(meta.user_id.is_none());
+        assert_eq!(meta.request_id, "cam-front-door");
+
+        // Distinct cameras stay distinguishable in the log.
+        let other = camera_flow_request_meta("gate-2");
+        assert_eq!(other.actor_id.as_deref(), Some("gate-2"));
     }
 }

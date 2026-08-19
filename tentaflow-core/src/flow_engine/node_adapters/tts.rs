@@ -162,6 +162,8 @@ impl NodeAdapter for TtsNodeAdapter {
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
             cancel_token: ctx.cancel_token.clone(),
+            // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+            provenance: ctx.provenance(),
         };
 
         let response = ctx
@@ -229,6 +231,8 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
         let speed = Self::pick_optional_f32(node, &seed_envelope, "speed");
         let user_id = ctx.user_id.clone();
         let user_role = ctx.user_role.clone();
+        // §2.5 — captured once for the whole stream: the node's own stamp.
+        let provenance = ctx.provenance();
         let cancel = ctx.cancel_token.clone();
         let tts = ctx.tts.clone();
         let cleaning = ctx.tts_cleaning.clone();
@@ -301,6 +305,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
                 let language = language.clone();
                 let user_id = user_id.clone();
                 let user_role = user_role.clone();
+                let provenance = provenance.clone();
                 let cancel = cancel.clone();
                 let tts = tts.clone();
                 let cleaning = cleaning.clone();
@@ -323,6 +328,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
                                         speed,
                                         user_id.clone(),
                                         user_role.clone(),
+                                        provenance.clone(),
                                         cancel.clone(),
                                         &tts,
                                         &cleaning,
@@ -390,6 +396,7 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
                                         speed,
                                         user_id.clone(),
                                         user_role.clone(),
+                                        provenance.clone(),
                                         cancel.clone(),
                                         &tts,
                                         &cleaning,
@@ -459,6 +466,8 @@ async fn synthesize_chunk(
     speed: Option<f32>,
     user_id: Option<String>,
     user_role: Option<String>,
+    // §2.5 — the streaming node's own stamp, cloned per chunk.
+    provenance: crate::flow_engine::dispatcher::CallProvenance,
     cancel: tokio_util::sync::CancellationToken,
     tts: &Arc<dyn crate::flow_engine::dispatchers::TtsDispatcher>,
     cleaning: &Arc<dyn crate::flow_engine::dispatchers::TtsCleaningStore>,
@@ -490,6 +499,7 @@ async fn synthesize_chunk(
         user_id,
         user_role,
         cancel_token: cancel.clone(),
+        provenance,
     };
     let response = tts
         .synthesize(req)

@@ -1090,6 +1090,8 @@ async fn handle_audio_tts_stream(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    // Read before the body is consumed — `into_body` moves the request.
+    let actor = v1_actor(&req);
 
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
@@ -1139,7 +1141,14 @@ async fn handle_audio_tts_stream(
     }
 
     let cancel = tokio_util::sync::CancellationToken::new();
+    // §2.5 — external `/v1` integration; the actor was minted while the API key
+    // was verified (`v1_actor`), so a service key stays a service key here.
+    let provenance = crate::flow_engine::dispatcher::CallProvenance::new(
+        crate::flow_engine::dispatcher::FlowOrigin::Api,
+        actor,
+    );
     let req_dto = crate::flow_engine::dispatchers::TtsRequest {
+        provenance,
         model: api_request.model.clone(),
         text: api_request.input.clone(),
         voice: Some(api_request.voice.clone()),
@@ -1729,6 +1738,8 @@ async fn handle_passthrough(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    // Read before the body is consumed — `collect` moves the request.
+    let actor = v1_actor(&req);
 
     let body_bytes = req.collect().await?.to_bytes();
 
@@ -1788,6 +1799,7 @@ async fn handle_passthrough(
                 model_name,
                 engine_id,
                 router.executor.clone(),
+                actor,
             )
             .await);
         }
@@ -1990,6 +2002,8 @@ async fn infer_embedded_vision(
     model_name: &str,
     engine_id: &str,
     runtime_slot: crate::flow_engine::dispatchers_impl::ModelRuntimeSlot,
+    // §2.5 — the authenticated `/v1` caller, minted while the API key was verified.
+    actor: FlowActor,
 ) -> Response<OpenAIBody> {
     let url = match parsed
         .get("input")
@@ -2050,6 +2064,11 @@ async fn infer_embedded_vision(
             height,
             alias: model_name.to_string(),
             caller_addon_id: None,
+            // §2.5 — external `/v1` integration, with the key's own actor.
+            provenance: crate::flow_engine::dispatcher::CallProvenance::new(
+                crate::flow_engine::dispatcher::FlowOrigin::Api,
+                actor,
+            ),
         };
         use crate::flow_engine::dispatchers::VisionDispatcher;
         return match dispatcher.ocr(req).await {

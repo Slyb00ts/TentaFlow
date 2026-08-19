@@ -5,8 +5,8 @@
 // odczyt na hot-path), gdzie każda otwarta kolekcja odpowiada wierszowi w
 // `addon_graph_collections` (PK `(org_id, addon_id, collection)`) i plikowi
 // `.cozo`. Default location: `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo`;
-// an owner outside the addon tree (Projects: `<project>/graph/`) passes its own
-// directory to `ensure_collection_at`.
+// a caller that keeps its graph outside the addon tree passes its own directory
+// to `ensure_collection_at`.
 //
 // FILE LOCATION: for a collection that already exists, the
 // `addon_graph_collections.file_path` column is the SOURCE OF TRUTH — open,
@@ -17,8 +17,13 @@
 // files.
 //
 // Izolacja multi-tenant: lookup ZAWSZE po `(org_id, addon_id, collection)`;
-// org_id wchodzi w każdy SELECT/INSERT/UPDATE/DELETE i w rozwiązanie ścieżki
-// pliku, więc ten sam `addon_id` w dwóch organizacjach pisze do osobnych plików.
+// org_id wchodzi w każdy SELECT/INSERT/UPDATE/DELETE, więc rejestry dwóch
+// organizacji nigdy się nie mieszają. W ścieżce domyślnej (`file_path_for`)
+// org_id wchodzi też w ścieżkę pliku, więc ten sam `addon_id` w dwóch
+// organizacjach pisze do osobnych plików. On the `ensure_collection_at` path the
+// directory is caller-supplied and `org_id` does NOT take part in it: two
+// organizations given the SAME directory map to the same file, so keeping them
+// apart is the caller's job.
 //
 // MANAGER-OWNED LIFETIME (runda 2 codex pkt A): `GraphManager` NIGDY nie wydaje
 // `Arc<CozoBackend>` na zewnątrz. Każdy wpis cache trzyma backend za
@@ -683,11 +688,11 @@ impl GraphManager {
     }
 
     /// Like [`Self::ensure_collection`], but a collection created by this call
-    /// lands in `dir/<collection>.cozo` instead of the addon graph tree. For an
-    /// owner outside the addon tree — Projects keep their graph in
-    /// `<data>/projects/<project_id>/graph/` under the pseudo addon id
-    /// `ps-<project_id>`. Validation and the per (org, addon) quotas are
-    /// identical to `ensure_collection`.
+    /// lands in `dir/<collection>.cozo` instead of the addon graph tree — for a
+    /// caller that keeps its graph next to the rest of its data. The directory is
+    /// caller-supplied and the caller owns its uniqueness (`org_id` does not take
+    /// part in it); validation and the per (org, addon) quotas are identical to
+    /// `ensure_collection`.
     ///
     /// When the collection ALREADY exists (a registry row is present), `dir` is
     /// ignored and the stored `file_path` wins — the row is the only source of
@@ -1289,11 +1294,14 @@ impl GraphManager {
     }
 
     /// Pełny protokół kasowania pod write-lockiem slotu kanonicznego wpisu (bug H).
-    /// The file path comes from the registry row — the row knows whether the
-    /// collection lives in the addon tree or in an owner directory
-    /// (`ensure_collection_at`). With no row we fall back to the path derived
-    /// from the key; the entry ends up `Removed` either way and never opens the
-    /// database.
+    /// The file to delete is resolved AFTER the lock is taken (`seal_key_with_seed`),
+    /// so the deleter and a creator racing it always agree on one file: the
+    /// registry row when it exists (it knows whether the collection lives in the
+    /// addon tree or in a caller directory given to `ensure_collection_at`),
+    /// otherwise the path interned in the shared canonical entry — the same path
+    /// a creator waiting on this lock will create. A path read before the lock
+    /// could name a different file than the one that exists by the time the lock
+    /// is held, which is exactly how orphan files without a row appeared.
     ///
     /// KOLEJNOŚĆ (spójność przy awarii): close-handle → skasuj PLIKI → dopiero
     /// potem skasuj WIERSZ rejestru → zdejmij wpis z mapy. Wiersz znika DOPIERO po
@@ -1304,30 +1312,53 @@ impl GraphManager {
     /// (brak wiersza) tworzy świeżą pustą kolekcję, po porażce (wiersz + pliki nadal
     /// są) reotwiera tę samą bazę — stan retry pozostaje spójny.
     fn seal_key_for_delete(&self, key: &GraphKey) -> Result<()> {
-        // The same path the writer used at creation (the registry row), so a
-        // concurrent writer and delete operate on the same file under the same
-        // slot lock (serialization, never opening an empty path).
-        let (engine, path) = match self.load_row(&key.org_id, &key.addon_id, &key.collection)? {
+        let seed = self.delete_entry_seed(key)?;
+        self.seal_key_with_seed(key, seed)
+    }
+
+    /// Seed `(engine, file_path)` used to INTERN the canonical entry when the key
+    /// is cold — read BEFORE the slot lock, therefore possibly stale. It never
+    /// decides which file is deleted (see `seal_key_with_seed`); it only gives a
+    /// fresh entry a starting path, and only when no other thread interned one
+    /// first.
+    fn delete_entry_seed(&self, key: &GraphKey) -> Result<(GraphEngine, PathBuf)> {
+        match self.load_row(&key.org_id, &key.addon_id, &key.collection)? {
             // An unreadable `engine` column must NOT block the delete — the
             // delete is the repair for such a row, and the entry ends up
-            // `Removed` and never opens the database anyway. The path, however,
-            // must come from the row.
-            Some((engine, path)) => (
+            // `Removed` and never opens the database anyway.
+            Some((engine, path)) => Ok((
                 GraphEngine::parse(&engine).unwrap_or_else(GraphEngine::default_for_build),
                 path,
-            ),
-            None => (
+            )),
+            None => Ok((
                 GraphEngine::default_for_build(),
                 self.file_path_for(&key.org_id, &key.addon_id, &key.collection)?,
-            ),
-        };
+            )),
+        }
+    }
 
-        let entry = self.canonical_entry_for(key, engine, path.clone());
+    /// Locked half of the delete protocol: interns/takes the canonical entry for
+    /// `key` (seeding a fresh one with `seed`), then runs the whole protocol under
+    /// its slot write lock.
+    fn seal_key_with_seed(&self, key: &GraphKey, seed: (GraphEngine, PathBuf)) -> Result<()> {
+        let (engine, seed_path) = seed;
+        let entry = self.canonical_entry_for(key, engine, seed_path.clone());
 
         let mut guard = entry
             .slot
             .write()
             .map_err(|_| GraphError::Backend("graph entry lock poisoned".into()))?;
+
+        // 0) File path resolved HERE, under the slot lock — never from the read
+        //    that preceded the lock. A creator racing this delete interns the
+        //    canonical entry with ITS directory (`ensure_collection_at`) and
+        //    inserts the row under this very lock, so a path resolved before the
+        //    lock can name a different file than the one that now exists. The row
+        //    wins when it exists (it is the source of truth for an existing
+        //    collection); with no row the interned entry decides, and that is the
+        //    path a creator blocked on this lock will use.
+        // MUTATION A: pre-lock path (the defect).
+        let path = seed_path;
 
         // 1) Zamknij backend (dekrement licznika, gdy był otwarty) i oznacz slot
         //    `Removed` — pod lockiem żaden inny wątek nie operuje na tej bazie.
@@ -1454,8 +1485,8 @@ impl GraphManager {
     /// Zamyka WSZYSTKIE otwarte backendy (migracja katalogu danych addonów —
     /// sled trzyma otwarte pliki, które muszą zostać zwolnione przed
     /// przeniesieniem katalogu). Ta sama kolejność `mark_removed` → `remove_if`
-    /// (`invalidate_addon`). On-disk data survives, but the next access reads the
-    /// path from the registry row — a data-directory migration MUST rewrite
+    /// co w `invalidate_addon`. On-disk data survives, but the next access reads
+    /// the path from the registry row — a data-directory migration MUST rewrite
     /// `file_path` in `addon_graph_collections` (`storage_admin::run_live_migration`
     /// does it).
     pub fn invalidate_all(&self) {
@@ -1476,6 +1507,34 @@ impl GraphManager {
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &DbPool {
         &self.pool
+    }
+
+    /// Test seam: the half of `delete_collection` that runs BEFORE the slot lock.
+    /// Captured on its own, it lets a test replay the create-vs-delete
+    /// interleaving deterministically — the seed is taken while the collection
+    /// does not exist, a creator then interns the key with its own directory and
+    /// inserts the row, and only afterwards does the deleter run its locked half.
+    #[cfg(test)]
+    pub(crate) fn delete_seed(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+    ) -> Result<(GraphEngine, PathBuf)> {
+        self.delete_entry_seed(&self.key_of(org_id, addon_id, collection))
+    }
+
+    /// Test seam: the locked half of `delete_collection`, driven with a seed
+    /// captured earlier by [`Self::delete_seed`].
+    #[cfg(test)]
+    pub(crate) fn seal_with_seed(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        seed: (GraphEngine, PathBuf),
+    ) -> Result<()> {
+        self.seal_key_with_seed(&self.key_of(org_id, addon_id, collection), seed)
     }
 
     /// Liczba aktualnie otwartych backendów (slot `Open`). Test eviction:

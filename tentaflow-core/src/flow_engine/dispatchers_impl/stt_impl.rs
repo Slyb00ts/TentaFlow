@@ -45,6 +45,7 @@ impl SttDispatcher for SttDispatcherImpl {
         let mime = req.audio.mime.clone();
         let filename = blob_filename(&req.audio.id, &mime);
 
+        let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = TranscriptionRequest {
             file,
@@ -61,7 +62,9 @@ impl SttDispatcher for SttDispatcherImpl {
             options: SttRequestOptions::default(),
         };
 
-        let mut rctx = RuntimeContext::new(user);
+        // §2.5 — the calling flow's stamp travels with the request; a fresh
+        // runtime context here would report the nested dispatch as `system`.
+        let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
         let response = runtime
             .execute_stt(api_req, &mut rctx)
             .await

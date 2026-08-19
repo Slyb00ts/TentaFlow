@@ -10,6 +10,7 @@
 use async_trait::async_trait;
 
 use super::ModelRuntimeSlot;
+use crate::flow_engine::dispatcher::CallProvenance;
 use crate::flow_engine::dispatchers::DocumentsDispatcher;
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use crate::services::runtime::executor::{DocumentInferRequest, DocumentParseRequest};
@@ -34,6 +35,7 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
         image: &[u8],
         mime: &str,
         task: &str,
+        provenance: CallProvenance,
     ) -> Result<DocumentInferResult, String> {
         if image.is_empty() {
             return Err("DocumentsDispatcher: empty image".to_string());
@@ -47,7 +49,10 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
             flow_depth: 0,
         };
 
-        let mut rctx = RuntimeContext::default();
+        // §2.5 — the calling flow's stamp, not a fresh one: this dispatcher is
+        // reached only from a document node inside a flow that an entry point
+        // already stamped.
+        let mut rctx = RuntimeContext::new(None, provenance.origin, provenance.actor);
         let runtime = self
             .runtime
             .read()
@@ -64,7 +69,13 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
         })
     }
 
-    async fn parse(&self, model: &str, image: &[u8], mime: &str) -> Result<String, String> {
+    async fn parse(
+        &self,
+        model: &str,
+        image: &[u8],
+        mime: &str,
+        provenance: CallProvenance,
+    ) -> Result<String, String> {
         if image.is_empty() {
             return Err("DocumentsDispatcher: empty image".to_string());
         }
@@ -76,7 +87,10 @@ impl DocumentsDispatcher for DocumentsDispatcherImpl {
             flow_depth: 0,
         };
 
-        let mut rctx = RuntimeContext::default();
+        // §2.5 — the calling flow's stamp, not a fresh one: this dispatcher is
+        // reached only from a document node inside a flow that an entry point
+        // already stamped.
+        let mut rctx = RuntimeContext::new(None, provenance.origin, provenance.actor);
         let runtime = self
             .runtime
             .read()

@@ -228,7 +228,8 @@ impl NodeAdapter for AgentRouterNodeAdapter {
         // One cheap classification call. Tools are deliberately omitted — the
         // router only classifies. Audit correlation rides the same meta keys the
         // llm block uses, so the call shows up in compliance like any other.
-        let mut req = LlmRequest::new(model);
+        // §2.5 — the classification call belongs to the run that routes.
+        let mut req = LlmRequest::new(model, ctx.provenance());
         req.messages = vec![
             ChatMessage::system(Self::system_prompt(node)),
             ChatMessage::user(Self::build_user_message(&candidates, &task)),
@@ -595,6 +596,11 @@ mod tests {
                 user_id: None,
                 org_id: None,
                 prompt: "task",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create run");

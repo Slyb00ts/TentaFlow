@@ -39,6 +39,7 @@ impl RerankDispatcher for RerankDispatcherImpl {
 
         let doc_count = req.documents.len();
         let flow_depth = req.flow_depth;
+        let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = ApiRerankRequest {
             model: req.model,
@@ -47,7 +48,14 @@ impl RerankDispatcher for RerankDispatcherImpl {
             top_n: req.top_n,
         };
 
-        let mut rctx = RuntimeContext::new_with_flow_depth(user, flow_depth);
+        // §2.5 — the calling node's stamp travels with the request; a fresh
+        // runtime context here would report the inner dispatch as `system`.
+        let mut rctx = RuntimeContext::new_with_flow_depth(
+            user,
+            flow_depth,
+            provenance.origin,
+            provenance.actor,
+        );
         let runtime = self
             .runtime
             .read()

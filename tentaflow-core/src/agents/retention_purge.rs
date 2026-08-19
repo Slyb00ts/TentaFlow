@@ -158,6 +158,11 @@ mod tests {
                 user_id: Some("u1"),
                 org_id: None,
                 prompt: "secret prompt",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create run");

@@ -112,6 +112,8 @@ impl NodeAdapter for VisionClassifyNodeAdapter {
                     height: crop.height,
                     alias: alias.clone(),
                     caller_addon_id: None,
+                    // §2.5 — the run's stamp, from `ctx`.
+                    provenance: ctx.provenance(),
                 })
                 .await?;
             det.stan = tags;

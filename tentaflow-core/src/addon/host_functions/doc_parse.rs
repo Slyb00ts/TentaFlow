@@ -122,6 +122,7 @@ pub fn doc_parse_v1(
     let addon_id = caller.data().addon_id.clone();
     let org_id = caller.data().org_id.clone();
     let user_id = caller.data().user_id.clone();
+    let call_provenance = caller.data().call_provenance.clone();
 
     let request = DocumentParseRequest {
         model,
@@ -138,10 +139,12 @@ pub fn doc_parse_v1(
         .filter(|id| !id.is_empty())
         .map(|id| crate::auth::acl::UserContext::new(id, "user"));
 
+    // §2.5 — the per-call stamp on the worker, NOT a hardcoded `Addon`: the
+    // Admin Scheduler lends the same worker with a `Scheduler` provenance.
     let mut ctx = ExecutionContext::new(
         caller_user,
-        crate::flow_engine::dispatcher::FlowOrigin::Addon,
-        crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+        call_provenance.origin,
+        call_provenance.actor_for(&addon_id),
     )
     .with_addon_identity(Some(addon_id), org_id);
 

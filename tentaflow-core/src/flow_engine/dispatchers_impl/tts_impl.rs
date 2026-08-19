@@ -43,6 +43,7 @@ impl TtsDispatcher for TtsDispatcherImpl {
             return Err(anyhow!("TtsDispatcher: empty text"));
         }
 
+        let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = TTSRequest {
             model: req.model,
@@ -53,7 +54,9 @@ impl TtsDispatcher for TtsDispatcherImpl {
             language: req.language.clone(),
         };
 
-        let mut rctx = RuntimeContext::new(user);
+        // §2.5 — the calling flow's stamp travels with the request; a fresh
+        // runtime context here would report the nested dispatch as `system`.
+        let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
         let runtime = self
             .runtime
             .read()

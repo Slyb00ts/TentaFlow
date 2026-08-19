@@ -87,9 +87,17 @@ fn test_ensure_collection_uses_addon_tree() {
     let (dir, mgr) = mgr();
     mgr.ensure_collection(ORG_A, "addon_a", "kg").unwrap();
 
-    let expected = dir.path().join(ORG_A).join("addon_a").join("graph").join("kg.cozo");
+    let expected = dir
+        .path()
+        .join(ORG_A)
+        .join("addon_a")
+        .join("graph")
+        .join("kg.cozo");
     assert!(expected.exists(), "collection file missing at {expected:?}");
-    assert_eq!(row_file_path(&mgr, ORG_A, "addon_a", "kg"), expected.to_string_lossy());
+    assert_eq!(
+        row_file_path(&mgr, ORG_A, "addon_a", "kg"),
+        expected.to_string_lossy()
+    );
     assert_eq!(
         mgr.collection_file_path(ORG_A, "addon_a", "kg").unwrap(),
         expected
@@ -178,6 +186,98 @@ fn test_ensure_collection_at_rejects_traversal_and_relative_dir() {
     assert!(!mgr
         .collection_exists(ORG_A, "ps-proj-1", "kg_active")
         .unwrap());
+}
+
+#[test]
+fn test_delete_collection_removes_file_from_custom_dir() {
+    // A collection created through `ensure_collection_at` lives OUTSIDE the addon
+    // tree, so the delete must take its path from the registry row. Deriving it
+    // from the key would delete nothing and leave the data behind while the row
+    // disappears.
+    let (dir, mgr) = mgr();
+    let owner_dir = dir.path().join("projects").join("proj-del").join("graph");
+
+    mgr.ensure_collection_at(ORG_A, "ps-proj-del", "kg_active", &owner_dir)
+        .unwrap();
+    mgr.upsert_node_with_quota(ORG_A, "ps-proj-del", "kg_active", "n1", "Acme", "{}", "null")
+        .unwrap();
+    let file = owner_dir.join("kg_active.cozo");
+    assert!(file.exists(), "collection file missing at {file:?}");
+
+    mgr.delete_collection(ORG_A, "ps-proj-del", "kg_active")
+        .unwrap();
+
+    assert!(
+        !file.exists(),
+        "graph data survived the delete in the owner directory: {file:?}"
+    );
+    assert!(!mgr
+        .collection_exists(ORG_A, "ps-proj-del", "kg_active")
+        .unwrap());
+    // The key-derived path in the addon tree was never touched — neither created
+    // by the write nor used as the delete target.
+    assert!(!dir.path().join(ORG_A).join("ps-proj-del").exists());
+}
+
+#[test]
+fn test_delete_resolves_path_after_lock_no_orphan() {
+    // Create-vs-delete race with a caller-supplied directory. The deleter reads
+    // the registry BEFORE it can take the per-key slot lock; a creator that wins
+    // that window interns the canonical entry with ITS directory and inserts the
+    // row + files under the very lock the deleter is waiting for. A path resolved
+    // from the pre-lock read points at the KEY-DERIVED file (empty), so the delete
+    // would erase the row while the real data stays behind: orphan files with no
+    // row.
+    //
+    // The interleaving is replayed deterministically instead of by timing: the
+    // delete is split into the pre-lock seed (`delete_seed`) and the locked half
+    // (`seal_with_seed`), and the creator runs between them — exactly the order
+    // the race produces. The fix resolves the file under the lock, so both halves
+    // agree on one file.
+    let (dir, mgr) = mgr();
+    let owner_dir = dir.path().join("projects").join("proj-race").join("graph");
+
+    // Deleter, pre-lock: the collection does not exist yet, so the seed path is
+    // derived from the key (addon tree).
+    let seed = mgr.delete_seed(ORG_A, "ps-proj-race", "kg_active").unwrap();
+    assert_eq!(
+        seed.1,
+        dir.path()
+            .join(ORG_A)
+            .join("ps-proj-race")
+            .join("graph")
+            .join("kg_active.cozo"),
+        "seed must be the key-derived path for a collection with no row"
+    );
+
+    // Creator wins the window: row + files land in its own directory.
+    mgr.ensure_collection_at(ORG_A, "ps-proj-race", "kg_active", &owner_dir)
+        .unwrap();
+    mgr.upsert_node_with_quota(ORG_A, "ps-proj-race", "kg_active", "n1", "Acme", "{}", "null")
+        .unwrap();
+    let created = owner_dir.join("kg_active.cozo");
+    assert!(created.exists(), "collection file missing at {created:?}");
+
+    // Deleter, locked half, still carrying the stale seed.
+    mgr.seal_with_seed(ORG_A, "ps-proj-race", "kg_active", seed)
+        .unwrap();
+
+    // No file without a row.
+    assert!(
+        !created.exists(),
+        "orphan graph file left behind with no registry row: {created:?}"
+    );
+    // No row without a file.
+    assert!(!mgr
+        .collection_exists(ORG_A, "ps-proj-race", "kg_active")
+        .unwrap());
+    // A fresh create afterwards starts from an empty graph in the same directory.
+    mgr.ensure_collection_at(ORG_A, "ps-proj-race", "kg_active", &owner_dir)
+        .unwrap();
+    assert_eq!(
+        mgr.node_count(ORG_A, "ps-proj-race", "kg_active").unwrap(),
+        0
+    );
 }
 
 #[test]

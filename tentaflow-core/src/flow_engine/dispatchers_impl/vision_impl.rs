@@ -13,6 +13,7 @@ use async_trait::async_trait;
 use std::sync::Arc;
 
 use super::ModelRuntimeSlot;
+use crate::flow_engine::dispatcher::CallProvenance;
 use crate::flow_engine::dispatchers::{VisionClassifyRequest, VisionDispatcher, VisionOcrRequest};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
 use crate::services::runtime::executor::ModelRuntimeExecutor;
@@ -53,8 +54,8 @@ fn frame_from(rgb: Vec<u8>, width: u32, height: u32) -> CvFrameLocal {
 /// Kontekst runtime dla wywołania CV z flow — węzły vision nie niosą
 /// tożsamości użytkownika, ale caller addon przechodzi do resolvera
 /// (widoczność aliasów / permission gating).
-fn runtime_ctx(caller_addon_id: Option<String>) -> RuntimeContext {
-    let mut ctx = RuntimeContext::new(None);
+fn runtime_ctx(caller_addon_id: Option<String>, provenance: CallProvenance) -> RuntimeContext {
+    let mut ctx = RuntimeContext::new(None, provenance.origin, provenance.actor);
     ctx.addon_id = caller_addon_id;
     ctx
 }
@@ -78,7 +79,7 @@ async fn ocr_via_executor(
             mode: CvOcrMode::Plate,
         },
     };
-    let mut ctx = runtime_ctx(req.caller_addon_id);
+    let mut ctx = runtime_ctx(req.caller_addon_id, req.provenance);
     match executor.execute_camera_cv(cv_req, &mut ctx).await {
         Ok(CameraCvResult::Text { tekst }) => Ok(tekst),
         Ok(_) => Err(anyhow!(
@@ -104,7 +105,7 @@ async fn classify_via_executor(
             crop: frame_from(req.rgb, req.width, req.height),
         },
     };
-    let mut ctx = runtime_ctx(req.caller_addon_id);
+    let mut ctx = runtime_ctx(req.caller_addon_id, req.provenance);
     match executor.execute_camera_cv(cv_req, &mut ctx).await {
         Ok(CameraCvResult::Labels { stan }) => Ok(stan),
         Ok(_) => Err(anyhow!(

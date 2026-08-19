@@ -170,6 +170,27 @@ impl FlowOrigin {
             FlowOrigin::System => "system",
         }
     }
+
+    /// Exact inverse of [`FlowOrigin::as_str`]. `None` for anything else — a
+    /// stored value we cannot read must REFUSE, not fall back to `System`: a
+    /// silent default would report a Code Studio run as internal core work and
+    /// hide exactly the provenance this enum exists to keep.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "chat" => FlowOrigin::Chat,
+            "dashboard" => FlowOrigin::Dashboard,
+            "project" => FlowOrigin::Project,
+            "code_studio" => FlowOrigin::CodeStudio,
+            "api" => FlowOrigin::Api,
+            "addon" => FlowOrigin::Addon,
+            "camera" => FlowOrigin::Camera,
+            "scheduler" => FlowOrigin::Scheduler,
+            "mesh" => FlowOrigin::Mesh,
+            "agent" => FlowOrigin::Agent,
+            "system" => FlowOrigin::System,
+            _ => return None,
+        })
+    }
 }
 
 /// Kind of authenticated caller behind a request.
@@ -191,6 +212,19 @@ impl ActorKind {
             ActorKind::Addon => "addon",
             ActorKind::System => "system",
         }
+    }
+
+    /// Exact inverse of [`ActorKind::as_str`]. `None` for anything else — see
+    /// [`FlowOrigin::parse`]: reading an unknown actor kind as `System` would
+    /// turn an API key into unattended core work.
+    pub fn parse(value: &str) -> Option<Self> {
+        Some(match value {
+            "user" => ActorKind::User,
+            "api_key" => ActorKind::ApiKey,
+            "addon" => ActorKind::Addon,
+            "system" => ActorKind::System,
+            _ => return None,
+        })
     }
 }
 
@@ -275,6 +309,39 @@ impl FlowActor {
     /// the user an API key is bound to.
     pub fn user_id(&self) -> Option<&str> {
         self.user_id.as_deref()
+    }
+}
+
+/// §2.5 — origin + actor of one call, carried as ONE value so no layer can pair
+/// the wrong actor with the wrong origin.
+///
+/// Threaded through the capability-dispatcher DTOs (`LlmRequest`,
+/// `EmbeddingsRequest`, …) for exactly the reason `flow_depth` is: the runtime
+/// `ExecutionContext` a capability dispatcher builds RE-ENTERS the executor, and
+/// an alias that resolves onto a flow surface starts THAT flow with this stamp.
+/// Without it every capability hop would reset the origin to `system` and the
+/// event log would lose the entry point one node below the top.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallProvenance {
+    pub origin: FlowOrigin,
+    pub actor: FlowActor,
+}
+
+impl CallProvenance {
+    pub fn new(origin: FlowOrigin, actor: FlowActor) -> Self {
+        Self { origin, actor }
+    }
+
+    /// Internal core work with no external caller — a statement, not an
+    /// omission. Deliberately NOT a `Default` impl: a defaulted provenance is
+    /// the silent `system` stamp the whole design exists to prevent, and it
+    /// would compile at a call site that simply forgot to say where it came
+    /// from.
+    pub fn system() -> Self {
+        Self {
+            origin: FlowOrigin::System,
+            actor: FlowActor::system(),
+        }
     }
 }
 
@@ -1448,50 +1515,62 @@ pub fn build_registry_with_runner(subflow_runner: SubflowRunnerSlot) -> AdapterR
     build_registry(Arc::new(parking_lot::RwLock::new(None)), subflow_runner)
 }
 
+/// Minimal `ContextFactory` over the `test_support` stubs — for tests that need
+/// the REAL `FlowRequestMeta` → `ExecutionContext` copy without a live
+/// `FlowDispatcher`. That copy is the last link of the identity chain: caller
+/// (`service_call`) → executor (`FlowRequestMeta` for a flow target) →
+/// `make_context` → the `ExecutionContext` the nodes run under.
+#[cfg(any(test, feature = "test-support"))]
+fn stub_context_factory() -> ContextFactory {
+    use crate::flow_engine::dispatchers::clock::SystemClock;
+    use crate::flow_engine::dispatchers::metrics::NoopMetrics;
+    use crate::flow_engine::node_adapter::test_support::{
+        stub_vectors, StubAudit, StubDocuments, StubEmbeddings, StubHistory, StubLlm,
+        StubMemory, StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
+    };
+    ContextFactory {
+        clock: Arc::new(SystemClock),
+        blobs: Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new()),
+        vectors: stub_vectors(),
+        #[cfg(feature = "graph")]
+        graph: crate::flow_engine::node_adapter::test_support::stub_graph(),
+        llm: Arc::new(StubLlm),
+        embeddings: Arc::new(StubEmbeddings),
+        reranker: Arc::new(StubReranker),
+        documents: Arc::new(StubDocuments),
+        stt: Arc::new(StubStt),
+        tts: Arc::new(StubTts),
+        // Pusty slot executora — stub factory testów idzie ścieżką fallback
+        // (bezpośrednie singletony) w VisionDispatcherImpl.
+        vision: Arc::new(
+            crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(Arc::new(
+                parking_lot::RwLock::new(None),
+            )),
+        ),
+        prompts: Arc::new(StubPrompts),
+        memory: Arc::new(StubMemory),
+        history: Arc::new(StubHistory),
+        audit: Arc::new(StubAudit),
+        metrics: Arc::new(NoopMetrics),
+        pii_rules: Arc::new(StubPiiRules),
+        tts_cleaning: Arc::new(StubTtsCleaning),
+    }
+}
+
+
+/// Builds a flow `ExecutionContext` on stub dispatchers from a `FlowRequestMeta`
+/// — for tests in other modules (the subflow runner) that need the REAL
+/// meta → context copy without a live `FlowDispatcher`.
+#[cfg(any(test, feature = "test-support"))]
+pub(crate) fn make_test_context(
+    meta: &FlowRequestMeta,
+) -> crate::flow_engine::node_adapter::ExecutionContext {
+    stub_context_factory().make_context(meta)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// RAG E1.0 (enabler): `make_context` przepisuje `addon_id`/`org_id` z
-    /// `FlowRequestMeta` do `flow_engine::ExecutionContext`. To finalne ogniwo
-    /// łańcucha tożsamości: caller (service_call) → executor (FlowRequestMeta dla
-    /// flow-targetu) → make_context → ExecutionContext, którego używa węzeł
-    /// vector. Test buduje minimalny ContextFactory na stubach test_support.
-    fn stub_context_factory() -> ContextFactory {
-        use crate::flow_engine::dispatchers::clock::SystemClock;
-        use crate::flow_engine::dispatchers::metrics::NoopMetrics;
-        use crate::flow_engine::node_adapter::test_support::{
-            stub_vectors, StubAudit, StubDocuments, StubEmbeddings, StubHistory, StubLlm,
-            StubMemory, StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
-        };
-        ContextFactory {
-            clock: Arc::new(SystemClock),
-            blobs: Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new()),
-            vectors: stub_vectors(),
-            #[cfg(feature = "graph")]
-            graph: crate::flow_engine::node_adapter::test_support::stub_graph(),
-            llm: Arc::new(StubLlm),
-            embeddings: Arc::new(StubEmbeddings),
-            reranker: Arc::new(StubReranker),
-            documents: Arc::new(StubDocuments),
-            stt: Arc::new(StubStt),
-            tts: Arc::new(StubTts),
-            // Pusty slot executora — stub factory testów idzie ścieżką fallback
-            // (bezpośrednie singletony) w VisionDispatcherImpl.
-            vision: Arc::new(
-                crate::flow_engine::dispatchers_impl::VisionDispatcherImpl::new(Arc::new(
-                    parking_lot::RwLock::new(None),
-                )),
-            ),
-            prompts: Arc::new(StubPrompts),
-            memory: Arc::new(StubMemory),
-            history: Arc::new(StubHistory),
-            audit: Arc::new(StubAudit),
-            metrics: Arc::new(NoopMetrics),
-            pii_rules: Arc::new(StubPiiRules),
-            tts_cleaning: Arc::new(StubTtsCleaning),
-        }
-    }
 
     #[test]
     fn make_context_propagates_addon_identity_from_meta() {
@@ -1514,50 +1593,146 @@ mod tests {
         assert!(ctx.org_id.is_none());
     }
 
-    /// §3 invariant 1 — `origin` / `actor*` are minted by the server and are
-    /// NOT derivable from model output. `envelope.meta` is writable by every
-    /// node (a WASM addon block deserializes a whole envelope from the guest),
-    /// so an envelope carrying its own `origin`/`actor_kind`/`actor_id` must
-    /// change NOTHING about the context the engine runs under.
-    #[test]
-    fn envelope_meta_cannot_forge_server_minted_provenance() {
-        let factory = stub_context_factory();
+    /// Records the provenance the ENGINE ran a node under. Registered into a
+    /// real `AdapterRegistry` and driven through `execute_blocking`, so the
+    /// hostile envelope actually reaches a node instead of being assigned to a
+    /// context after the fact.
+    struct ProvenanceRecorder {
+        seen: Arc<std::sync::Mutex<Option<(FlowOrigin, ActorKind, Option<String>, Option<String>, Option<String>)>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::flow_engine::node_adapter::NodeAdapter for ProvenanceRecorder {
+        fn node_type(&self) -> &str {
+            "provenance_recorder"
+        }
+        fn input_ports(&self) -> Vec<crate::flow_engine::node_adapter::PortSpec> {
+            vec![crate::flow_engine::node_adapter::PortSpec {
+                name: "text".to_string(),
+                data_type: crate::flow_engine::types::FlowDataType::Any,
+            }]
+        }
+        fn output_ports(&self) -> Vec<crate::flow_engine::node_adapter::PortSpec> {
+            vec![crate::flow_engine::node_adapter::PortSpec {
+                name: "text".to_string(),
+                data_type: crate::flow_engine::types::FlowDataType::Any,
+            }]
+        }
+        async fn execute(
+            &self,
+            _node: &crate::flow_engine::types::FlowNode,
+            inputs: &[crate::flow_engine::envelope::NodeInput],
+            ctx: &crate::flow_engine::node_adapter::ExecutionContext,
+        ) -> Result<FlowEnvelope, anyhow::Error> {
+            *self.seen.lock().unwrap() = Some((
+                ctx.origin,
+                ctx.actor_kind,
+                ctx.actor_id.clone(),
+                ctx.actor_user_id.clone(),
+                ctx.correlation_id.clone(),
+            ));
+            Ok(inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(|| (*ctx.initial_envelope).clone()))
+        }
+    }
+
+    fn forgery_test_db() -> DbPool {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("in-memory db");
+        {
+            let conn = pool.write().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'forge', '{}', 'active')",
+                [],
+            )
+            .expect("seed flow");
+        }
+        pool
+    }
+
+    /// §3 invariant 1 — `origin` / `actor*` / `correlation_id` are minted by the
+    /// server and are NOT derivable from model output. `envelope.meta` is
+    /// writable by every node (a WASM addon block deserializes a whole envelope
+    /// from the guest's answer), so an envelope carrying its own
+    /// `origin`/`actor_kind`/`actor_id` must change NOTHING about what a node
+    /// sees.
+    ///
+    /// This drives the REAL path: the hostile envelope is the one
+    /// `execute_blocking` seeds as `ctx.initial_envelope` and hands to the
+    /// nodes, and a recording adapter reports what the engine actually ran
+    /// under. Asserting on a context built by `make_context(&meta)` — which
+    /// takes no envelope — and assigning the envelope afterwards would prove
+    /// nothing, because the forged values never reach anything.
+    #[tokio::test]
+    async fn envelope_meta_cannot_forge_server_minted_provenance() {
+        let seen = Arc::new(std::sync::Mutex::new(None));
+        let mut registry = AdapterRegistry::new();
+        registry.register(Arc::new(
+            crate::flow_engine::node_adapters::TriggerNodeAdapter::new(),
+        ));
+        registry.register(Arc::new(
+            crate::flow_engine::node_adapters::OutputNodeAdapter::new(),
+        ));
+        registry.register(Arc::new(ProvenanceRecorder { seen: seen.clone() }));
+        let registry = Arc::new(registry);
+
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"r1","type":"provenance_recorder","config":{}},
+                {"id":"o1","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t1","to":"r1","from_port":"text","to_port":"text"},
+                {"from":"r1","to":"o1","from_port":"text","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
+        );
+
+        // What a compromised node / model output would try to inject.
+        let mut forged = FlowEnvelope::empty();
+        forged.payload = crate::flow_engine::envelope::FlowValue::Text("hi".into());
+        for (k, v) in [
+            ("origin", "chat"),
+            ("actor_kind", "user"),
+            ("actor_id", "root"),
+            ("actor_user_id", "root"),
+            ("correlation_id", "forged-corr"),
+        ] {
+            forged
+                .meta
+                .insert(k.into(), serde_json::Value::String(v.into()));
+        }
+
         let mut meta = FlowRequestMeta::new(
             "req-forge",
             FlowOrigin::Camera,
             FlowActor::system_component("cam-hall"),
         );
-
-        // What a compromised node / model output would try to inject.
-        let mut forged = FlowEnvelope::empty();
-        forged
-            .meta
-            .insert("origin".into(), serde_json::Value::String("admin".into()));
-        forged.meta.insert(
-            "actor_kind".into(),
-            serde_json::Value::String("user".into()),
-        );
-        forged
-            .meta
-            .insert("actor_id".into(), serde_json::Value::String("root".into()));
-        forged.meta.insert(
-            "actor_user_id".into(),
-            serde_json::Value::String("root".into()),
-        );
-        forged.meta.insert(
-            "correlation_id".into(),
-            serde_json::Value::String("forged-corr".into()),
-        );
         meta.correlation_id = Some("server-corr".into());
+        let ctx = stub_context_factory().make_context(&meta);
 
-        let mut ctx = factory.make_context(&meta);
-        ctx.initial_envelope = Arc::new(forged);
+        crate::flow_engine::executor::execute_blocking(
+            forgery_test_db(),
+            compiled,
+            forged,
+            ctx,
+            registry,
+        )
+        .await
+        .expect("flow runs");
 
-        assert_eq!(ctx.origin, FlowOrigin::Camera);
-        assert_eq!(ctx.actor_kind, ActorKind::System);
-        assert_eq!(ctx.actor_id.as_deref(), Some("cam-hall"));
-        assert_eq!(ctx.actor_user_id, None);
-        assert_eq!(ctx.correlation_id.as_deref(), Some("server-corr"));
+        let (origin, actor_kind, actor_id, actor_user_id, correlation_id) =
+            seen.lock().unwrap().clone().expect("recorder ran");
+        assert_eq!(origin, FlowOrigin::Camera);
+        assert_eq!(actor_kind, ActorKind::System);
+        assert_eq!(actor_id.as_deref(), Some("cam-hall"));
+        assert_eq!(actor_user_id, None);
+        assert_eq!(correlation_id.as_deref(), Some("server-corr"));
     }
 
     /// The copy site in `make_context` — all five provenance fields reach the
@@ -1577,17 +1752,12 @@ mod tests {
         assert_eq!(ctx.actor_id.as_deref(), Some("key-42"));
         assert_eq!(ctx.actor_user_id.as_deref(), Some("user-7"));
         assert_eq!(ctx.correlation_id.as_deref(), Some("corr-9"));
-        // A nested run (subflow / loop / map / agent body) is a CLONE of the
-        // parent context with only its own fields rewritten
-        // (`SubflowRunner::prepare`), so provenance is inherited untouched.
-        let child = ctx.clone();
-        assert_eq!(child.origin, ctx.origin);
-        assert_eq!(child.actor_kind, ctx.actor_kind);
-        assert_eq!(child.actor_id, ctx.actor_id);
-        assert_eq!(child.actor_user_id, ctx.actor_user_id);
-        assert_eq!(child.correlation_id, ctx.correlation_id);
+        // A service key stays a service key: `actor_user_id` is the binding the
+        // server resolved while verifying the key, and nothing downstream may
+        // invent one. Sub-flow inheritance of these values is covered by
+        // `subflow_runner::tests` against the real `SubflowRunner::prepare`.
         assert_eq!(
-            child.actor(),
+            ctx.actor(),
             FlowActor::api_key("key-42", Some("user-7".to_string()))
         );
     }
@@ -1610,37 +1780,6 @@ mod tests {
         assert_eq!(ActorKind::ApiKey.as_str(), "api_key");
         assert_eq!(ActorKind::Addon.as_str(), "addon");
         assert_eq!(ActorKind::System.as_str(), "system");
-    }
-
-    /// §2.5 — a service key has no user behind it and must stay distinguishable
-    /// from a user-bound key, so the UI can say "service key" instead of
-    /// rendering an empty field.
-    #[test]
-    fn api_key_actor_keeps_service_keys_distinct_from_user_bound_keys() {
-        let bound = FlowActor::api_key("key-a", Some("u-1".to_string()));
-        assert_eq!(bound.kind(), ActorKind::ApiKey);
-        assert_eq!(bound.id(), Some("key-a"));
-        assert_eq!(bound.user_id(), Some("u-1"));
-
-        let service = FlowActor::api_key("key-b", None);
-        assert_eq!(service.kind(), ActorKind::ApiKey);
-        assert_eq!(service.id(), Some("key-b"));
-        assert_eq!(service.user_id(), None);
-    }
-
-    /// §2.5 — the camera entry point has no user in the loop but must still say
-    /// WHICH camera acted.
-    #[test]
-    fn camera_entry_stamps_camera_origin_with_the_camera_as_system_actor() {
-        let meta = FlowRequestMeta::new(
-            "cam-front-door",
-            FlowOrigin::Camera,
-            FlowActor::system_component("front-door"),
-        );
-        assert_eq!(meta.origin, FlowOrigin::Camera);
-        assert_eq!(meta.actor_kind, ActorKind::System);
-        assert_eq!(meta.actor_id.as_deref(), Some("front-door"));
-        assert_eq!(meta.actor_user_id, None);
     }
 
     #[test]

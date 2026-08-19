@@ -176,7 +176,7 @@ impl SubflowRunner {
     /// Shared setup for `run` / `run_streaming`: upgrades the registry Weak,
     /// loads + compiles the flow, and builds the child execution context with
     /// the same field rewrites both paths need.
-    async fn prepare(
+    pub(crate) async fn prepare(
         &self,
         flow_id: &str,
         parent_ctx: &ExecutionContext,
@@ -242,10 +242,10 @@ impl SubflowRunner {
 
 /// Output of `SubflowRunner::prepare` — the upgraded registry, the compiled
 /// child flow, and the rewritten child execution context.
-struct Prepared {
-    registry: Arc<AdapterRegistry>,
-    compiled: CompiledFlow,
-    child_ctx: ExecutionContext,
+pub(crate) struct Prepared {
+    pub(crate) registry: Arc<AdapterRegistry>,
+    pub(crate) compiled: CompiledFlow,
+    pub(crate) child_ctx: ExecutionContext,
 }
 
 /// Wraps a blocking child `FlowExecutionOutcome` as a single-delta stream so a
@@ -309,5 +309,74 @@ fn wrap_outcome_as_stream(
     StreamingExecution {
         stream,
         outcome: rx,
+    }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::flow_engine::dispatcher::{
+        build_registry_for_test, ActorKind, FlowActor, FlowOrigin, FlowRequestMeta,
+    };
+    use std::path::Path;
+
+    fn db_with_flow(flow_id: &str, flow_json: &str) -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        {
+            let conn = pool.write().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES (?1, 'body', ?2, 'active')",
+                rusqlite::params![flow_id, flow_json],
+            )
+            .expect("seed flow");
+        }
+        pool
+    }
+
+    /// §2.5 — a sub-flow (and every `loop` / `map` / `agent` body, which share
+    /// this runner) inherits the parent's provenance UNCHANGED, while the fields
+    /// that must differ per child are rewritten.
+    ///
+    /// This drives the real `SubflowRunner::prepare`: it loads and compiles the
+    /// body flow from the DB and builds the child context the executor will run
+    /// under. Cloning a context inside the test would only prove that `Clone`
+    /// copies fields, not that the runner leaves provenance alone.
+    #[tokio::test]
+    async fn subflow_child_context_inherits_parent_provenance() {
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"o1","type":"output","config":{}}
+            ],
+            "edges":[{"from":"t1","to":"o1","from_port":"text","to_port":"text"}]
+        }"#;
+        let db = db_with_flow("body-1", flow_json);
+        let registry = Arc::new(build_registry_for_test());
+        let runner = SubflowRunner::new(db, Arc::downgrade(&registry));
+
+        let mut meta = FlowRequestMeta::new(
+            "req-parent",
+            FlowOrigin::CodeStudio,
+            FlowActor::api_key("key-77", Some("u-3".to_string())),
+        );
+        meta.correlation_id = Some("corr-parent".into());
+        let parent_ctx = crate::flow_engine::dispatcher::make_test_context(&meta);
+
+        let prepared = runner
+            .prepare("body-1", &parent_ctx, 1, false)
+            .await
+            .expect("prepare");
+        let child = &prepared.child_ctx;
+
+        assert_eq!(child.origin, FlowOrigin::CodeStudio);
+        assert_eq!(child.actor_kind, ActorKind::ApiKey);
+        assert_eq!(child.actor_id.as_deref(), Some("key-77"));
+        assert_eq!(child.actor_user_id.as_deref(), Some("u-3"));
+        assert_eq!(child.correlation_id.as_deref(), Some("corr-parent"));
+        // The fields that MUST differ per child still do, so this is not simply
+        // "prepare copies everything".
+        assert_eq!(child.subflow_depth, parent_ctx.subflow_depth + 1);
+        assert!(child.subflow_visited.contains(&"body-1".to_string()));
     }
 }

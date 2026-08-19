@@ -20,7 +20,7 @@ use super::dispatchers::{
     LlmDispatcher, MemoryStore, MetricsSink, PiiRulesStore, ProgressSink, PromptStore,
     RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
-use super::dispatcher::{ActorKind, FlowActor, FlowOrigin};
+use super::dispatcher::{ActorKind, CallProvenance, FlowActor, FlowOrigin};
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
 use crate::flow_engine::blob_store::BlobStore;
@@ -278,6 +278,14 @@ impl ExecutionContext {
             self.actor_id.clone(),
             self.actor_user_id.clone(),
         )
+    }
+
+    /// This run's provenance as one value, for the capability DTOs that carry it
+    /// down into a nested runtime dispatch. Reads the struct fields, never
+    /// `envelope.meta` — a node that rewrote meta must not be able to change
+    /// where its own calls are reported from.
+    pub fn provenance(&self) -> CallProvenance {
+        CallProvenance::new(self.origin, self.actor())
     }
 }
 
@@ -710,6 +718,7 @@ pub mod test_support {
             _image: &[u8],
             _mime: &str,
             _task: &str,
+            _provenance: CallProvenance,
         ) -> std::result::Result<tentaflow_protocol::DocumentInferResult, String> {
             Ok(tentaflow_protocol::DocumentInferResult {
                 regions: Vec::new(),
@@ -720,6 +729,7 @@ pub mod test_support {
             _model: &str,
             _image: &[u8],
             _mime: &str,
+            _provenance: CallProvenance,
         ) -> std::result::Result<String, String> {
             Ok(String::new())
         }

@@ -170,14 +170,18 @@ pub fn stt_transcribe_v1(
         options: SttRequestOptions::default(),
     };
 
+    // §2.5 — the per-call stamp on the worker, NOT a hardcoded `Addon`: the
+    // Admin Scheduler lends the same worker with a `Scheduler` provenance.
+    let call_provenance = caller.data().call_provenance.clone();
+
     // Most async→sync jak w llm_generate — TA SAMA sciezka co node stt
     // (FlowDispatcher: jawny flow albo direct STT execution).
     let result = tokio::task::block_in_place(|| {
         tokio::runtime::Handle::current().block_on(router.route_audio_transcription_for_user(
             request,
             None,
-            crate::flow_engine::dispatcher::FlowOrigin::Addon,
-            crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+            call_provenance.origin,
+            call_provenance.actor_for(&addon_id),
         ))
     });
 

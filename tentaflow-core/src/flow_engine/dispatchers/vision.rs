@@ -10,25 +10,35 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+use crate::flow_engine::dispatcher::CallProvenance;
+
 /// OCR request: a tightly-packed RGB24 crop + its dimensions, the model alias,
 /// and the calling addon (for alias visibility / permission gating).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct VisionOcrRequest {
     pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub alias: String,
     pub caller_addon_id: Option<String>,
+    /// §2.5 — server-minted provenance of the flow this call belongs to. No
+    /// `Default`: a defaulted stamp is the silent `system` value the design
+    /// forbids, so both request types lost their `Default` derive with it.
+    pub provenance: CallProvenance,
 }
 
 /// State-classification request (same shape as OCR; different model alias).
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub struct VisionClassifyRequest {
     pub rgb: Vec<u8>,
     pub width: u32,
     pub height: u32,
     pub alias: String,
     pub caller_addon_id: Option<String>,
+    /// §2.5 — server-minted provenance of the flow this call belongs to. No
+    /// `Default`: a defaulted stamp is the silent `system` value the design
+    /// forbids, so both request types lost their `Default` derive with it.
+    pub provenance: CallProvenance,
 }
 
 #[async_trait]

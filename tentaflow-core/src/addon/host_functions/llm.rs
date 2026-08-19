@@ -329,6 +329,10 @@ pub fn llm_generate(
     }
 
     let addon_id = caller.data().addon_id.clone();
+    // §2.5 — the per-call stamp on the worker, NOT a hardcoded `Addon`: the
+    // Admin Scheduler lends the same worker with a `Scheduler` provenance, and a
+    // scheduled run must not be reported as an addon acting on its own.
+    let call_provenance = caller.data().call_provenance.clone();
 
     info!(
         "llm_generate: addon='{}', model={:?}, prompt_len={}",
@@ -401,8 +405,8 @@ pub fn llm_generate(
             tokio::runtime::Handle::current().block_on(router.route_embeddings_for_user(
                 request,
                 None,
-                crate::flow_engine::dispatcher::FlowOrigin::Addon,
-                crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+                call_provenance.origin,
+                call_provenance.actor_for(&addon_id),
             ))
         });
 
@@ -524,8 +528,8 @@ pub fn llm_generate(
         tokio::runtime::Handle::current().block_on(router.route_chat_completion(
             request,
             None,
-            crate::flow_engine::dispatcher::FlowOrigin::Addon,
-            crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+            call_provenance.origin,
+            call_provenance.actor_for(&addon_id),
             Some(compliance_context),
         ))
     });
@@ -899,6 +903,10 @@ pub fn llm_generate_stream_start(
     }
 
     let addon_id = caller.data().addon_id.clone();
+    // §2.5 — the per-call stamp on the worker, NOT a hardcoded `Addon`: the
+    // Admin Scheduler lends the same worker with a `Scheduler` provenance, and a
+    // scheduled run must not be reported as an addon acting on its own.
+    let call_provenance = caller.data().call_provenance.clone();
 
     // Rate limit tokenow LLM — jak w llm_generate; zuzycie realne rejestruje
     // stream_next per partia.
@@ -1018,13 +1026,16 @@ pub fn llm_generate_stream_start(
 
     let (tx, rx) = mpsc::channel::<LlmStreamEvent>(LLM_STREAM_CHANNEL_CAP);
     let pump_addon = addon_id.clone();
+    // Captured for the pump task: the worker is returned to the pool as soon as
+    // the host fn returns, so the stamp must be COPIED here, not read later.
+    let stream_provenance = call_provenance.clone();
     let task = handle.spawn(async move {
         let result = router
             .route_chat_completion_stream(
                 request,
                 None,
-                crate::flow_engine::dispatcher::FlowOrigin::Addon,
-                crate::flow_engine::dispatcher::FlowActor::addon(pump_addon.clone()),
+                stream_provenance.origin,
+                stream_provenance.actor_for(&pump_addon),
                 Some(compliance_context),
                 crate::routing::streaming::ChatFlowSelector::Auto,
             )
@@ -1289,6 +1300,7 @@ mod tests {
             permission_checker: Arc::new(PermissionChecker::new(db)),
             fuel_consumed: 0,
             is_system_call: true,
+            call_provenance: crate::addon::AddonCallProvenance::addon(),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
             settings_cipher: Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32])),

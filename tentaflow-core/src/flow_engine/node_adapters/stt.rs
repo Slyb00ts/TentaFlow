@@ -139,6 +139,8 @@ impl NodeAdapter for SttNodeAdapter {
             response_format,
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
+            // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+            provenance: ctx.provenance(),
         };
 
         let response = ctx

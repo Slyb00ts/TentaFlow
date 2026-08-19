@@ -73,7 +73,7 @@ impl NodeAdapter for OcrPagesNodeAdapter {
             }
             let result = ctx
                 .documents
-                .infer(&model, &image, &page.blob_ref.mime, TASK)
+                .infer(&model, &image, &page.blob_ref.mime, TASK, ctx.provenance())
                 .await
                 .map_err(|e| anyhow!("ocr_pages: OCR zawiódł (strona {}): {e}", page.index))?;
             let markdown = OcrNodeAdapter::spans_to_text(&result.regions);

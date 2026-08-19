@@ -120,6 +120,7 @@ pub fn ingest_invoke_v1(
         .clone()
         .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let user_id = caller.data().user_id.clone();
+    let call_provenance = caller.data().call_provenance.clone();
 
     // Bajty dokumentu pobrane PO STRONIE HOSTA z document store instancji
     // callera — `read_full_document` widzi tylko dokumenty tej instancji
@@ -169,10 +170,12 @@ pub fn ingest_invoke_v1(
     let caller_user = user_id
         .filter(|id| !id.is_empty())
         .map(|id| crate::auth::acl::UserContext::new(id, "user"));
+    // §2.5 — the per-call stamp on the worker, NOT a hardcoded `Addon`: the
+    // Admin Scheduler lends the same worker with a `Scheduler` provenance.
     let mut ctx = ExecutionContext::new(
         caller_user,
-        crate::flow_engine::dispatcher::FlowOrigin::Addon,
-        crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+        call_provenance.origin,
+        call_provenance.actor_for(&addon_id),
     )
     .with_addon_identity(Some(addon_id), Some(org_id));
 

@@ -431,6 +431,8 @@ impl ToolExecNodeAdapter {
                         user_id: Some(user_id.to_string()),
                         user_role: ctx.user_role.clone(),
                         flow_depth: ctx.subflow_depth,
+                        // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+                        provenance: ctx.provenance(),
                     })
                     .await;
                 match embed {

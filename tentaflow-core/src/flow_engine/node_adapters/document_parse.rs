@@ -90,7 +90,7 @@ impl NodeAdapter for DocumentParseNodeAdapter {
         let model = Self::pick_model(node);
         let markdown = ctx
             .documents
-            .parse(&model, &bytes, &mime)
+            .parse(&model, &bytes, &mime, ctx.provenance())
             .await
             .map_err(|e| anyhow!("document_parse: {e}"))?;
 

@@ -46,6 +46,7 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
         };
 
         let flow_depth = req.flow_depth;
+        let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
         let api_req = EmbeddingRequest {
             model: req.model,
@@ -55,7 +56,14 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             user: None,
         };
 
-        let mut rctx = RuntimeContext::new_with_flow_depth(user, flow_depth);
+        // §2.5 — the calling node's stamp travels with the request; a fresh
+        // runtime context here would report the inner dispatch as `system`.
+        let mut rctx = RuntimeContext::new_with_flow_depth(
+            user,
+            flow_depth,
+            provenance.origin,
+            provenance.actor,
+        );
         let runtime = self
             .runtime
             .read()

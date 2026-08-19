@@ -413,8 +413,8 @@ async fn run_live_migration(
 
     if matches!(cat, StorageCategory::AddonData) {
         // Vector index and graph collection file paths are stored in the DB as
-        // absolute paths and are what decides where a file is opened from —
-        // przepisz prefiks na nową lokalizację.
+        // absolute paths and are what decides where a file is opened from, so
+        // rewrite the prefix to the new location.
         let old_prefix = format!("{}/", old_dir.to_string_lossy());
         let new_prefix = format!("{}/", new_dir.to_string_lossy());
         if let Ok(conn) = deps.db.write() {

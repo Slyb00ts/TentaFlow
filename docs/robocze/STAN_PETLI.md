@@ -38,14 +38,14 @@ Fail-closed: kryterium niezweryfikowane = NIESPEŁNIONE.
 | 1 | R2a `graph_home` w `GraphManager` | zdany | ślepy krytyk #2 | **DOES NOT MEET BAR** — kryt. 7, 8 | 1–6 i 9 zdane; krytyk potwierdził testy MUTACJAMI (3 mutacje, każda złapana) |
 | 2 | R2a poprawka | w toku (nowy wykonawca) | — | — | sprzeczny komentarz w `tests.rs` + angielski w nowych liniach |
 | 1 | M129 migracja | zdany | ślepy krytyk #3 | **DOES NOT MEET BAR** — kryt. 12 | 1–11 zdane z własnymi dowodami krytyka; polska nazwa testu i komentarz w nowym kodzie |
-| 2 | M129 poprawka | w toku (nowy wykonawca) | — | — | angielski + `'events'` w `INITIAL_SCHEMA` (precedens v65) |
+| 2 | M129 poprawka | zdana | **wstrzymany** | — | dowód negatywny OK; testy do POWTÓRZENIA na kompilującym się drzewie |
 
 ## Kolejka (zablokowane zależnościami)
 
 | Tor | Blokada |
 |---|---|
 | T2 `events.db` | **ODBLOKOWANE, w toku** |
-| T3 `FirstToken` | zdany, ślepy krytyk #5 w toku |
+| T3 `FirstToken` | **MEETS BAR** 11/11 (macierz 4 mutacji) — 3 usterki poza kryteriami |
 | T4 metryki | czeka na T2 |
 | T5b rejestr + inspektor + moduł | czeka na T5a i na protokół z T2 |
 | T6 Code Studio + odsyłacz | czeka na T5, T2, M129 |
@@ -223,3 +223,68 @@ prawidłowo — nie zauważyłem, że to, co bezpieczne dla jednego agenta, jest
 3. **Migawka przed każdą falą** — `git diff > snapshot.patch` zanim ruszy kolejna partia agentów.
 4. Do rozważenia z człowiekiem: commity pośrednie na gałęzi roboczej jako sieć bezpieczeństwa
    (commit nie jest pushem; dziś brak commitów oznacza, że jedyną kopią jest drzewo robocze).
+
+## Dług weryfikacyjny po incydencie
+
+Trzy tory mają dowody zebrane PRZED wywaleniem drzewa albo na drzewie, które chwilowo się nie
+kompilowało. **Nie uznaję ich za potwierdzone**, dopóki nie zostaną powtórzone na drzewie zielonym:
+
+| Tor | Co wymaga powtórzenia |
+|---|---|
+| M129 poprawka | pełny przebieg `cargo test -- db::migrations compliance::repository` |
+| R2a poprawka | `cargo test --features graph -- services::graph` + `--test graph_host_functions` |
+| T3 `FirstToken` | krytyk pracował na drzewie w trakcie incydentu — werdykt do potwierdzenia |
+
+Zasada: fail-closed. Dowód zebrany na drzewie, które w międzyczasie zostało cofnięte, jest dowodem
+o nieznanej podstawie.
+
+## T3 — usterki poza kryteriami, do domknięcia w rundzie 2
+
+1. **TTFT, który kłamie, na ścieżce bloku `loop`.** `terminal_stream_from` (`loop_block.rs:592-607`)
+   syntetyzuje JEDNĄ deltę z całą zakumulowaną odpowiedzią, gdy pętla kończy się bez ostatniego
+   przebiegu. Finalizer widzi niepustą deltę i emituje `FirstToken` — już po zakończeniu pętli.
+   `NodeStarted → FirstToken` daje wtedy czas CAŁEJ pętli. **Inwariant 6 mówi: brak wyniku to luka
+   w logu, nie zmyślony wynik.** Emisję na tej ścieżce trzeba stłumić.
+2. **Błędne uzasadnienie w komentarzu.** `chunk_carries_first_token` powołuje się na „bramkę
+   przekazywania" w `finalize_streaming_flow`, która tam nie istnieje (finalizer przekazuje każdy
+   chunk bezwarunkowo). Reguła 6 — komentarz ma trafiać w DLACZEGO.
+3. **`first_token` jako surowy identyfikator w UI.** `tf-agent-activity.js` ma gałąź `default:`,
+   więc nie pada, ale renderuje nieprzetłumaczony `first_token` w osi aktywności Code Studio.
+
+## Luki pomiarowe zgłoszone przez krytyka T3 (nie usterki — ograniczenia do świadomej akceptacji)
+
+- **Ścieżka audio nie ma TTFT w ogóle.** Finalizer patrzy tylko na `EnvelopeDelta::Llm`; flow z
+  `tts_stream_bridge` zamienia LLM→Audio przed finalizerem, więc przebieg głosowy jest niemierzalny.
+- **Blok `loop`, iteracje pośrednie** jadą blokująco (`run_budgeted_iterations`) — brak delt, brak
+  `first_token`. TTFT per krok istnieje tylko w inline'owym regionie pętli, nie w bloku `loop`.
+- **Zagnieżdżone producenty strumienia raportują podwójnie** — `subflow`/`agent` dziedziczą
+  `progress_scope` przez klon kontekstu, więc jeden fizyczny strumień daje dwa `FirstToken`,
+  rozróżnialne tylko po `node_id`. Naiwne zapytanie z §2.7 zobaczy oba.
+
+## NOWY TOR: T3b — mostek `ProgressEvent` → `events.db`
+
+Kryterium etapu 3 („z logu da się policzyć TTFT") **NIE jest spełnione** samym T3. `src/events/`
+definiuje `EventKind::FirstToken`, ale nie ma ANI JEDNEGO wołającego — punkt emisji istnieje,
+ujścia brak. Dodatkowo `AgentRunEvent` nie niesie znacznika czasu, więc konsument drutu może
+stemplować tylko moment odbioru. Bez tego toru T4 (metryki jako zapytania) nie ma na czym stanąć.
+
+## R2a runda 2 — krytyk znalazł błąd, którego nie było w zleceniu
+
+Werdykt: **DOES NOT MEET BAR** (kryt. 6 zdanie dwujęzyczne, kryt. 9 regresja formatowania).
+Obie porażki mechaniczne. Wartość raportu leży w dwóch rzeczach, o które nikt nie prosił:
+
+**F1 — wyścig kasujący pliki bez wiersza.** `seal_key_for_delete` czyta wiersz rejestru PRZED
+wzięciem blokady slotu i kasuje spod lokalnie zapamiętanej ścieżki. Dopóki ścieżka była czystą
+funkcją klucza, niezmiennik „nigdy osierocone pliki bez wiersza" (udokumentowany na
+`delete_collection`) trzymał się z konstrukcji. `ensure_collection_at` usunął tę przesłankę:
+równoległy twórca z własnym katalogiem wstawia wiersz i tworzy pliki pod blokadą, a kasujący
+usuwa nic spod ścieżki z klucza i kasuje cudzy wiersz. **Komentarz napisany przez poprawkę
+rundy 1 twierdzi, że to niemożliwe.**
+
+**F5 — centralne zachowanie zmiany nie jest pilnowane przez żaden test.** Krytyk zmutował ścieżkę
+kasowania tak, by ignorowała wiersz — **wszystkie 44 testy przeszły**. Nic w repo nie kasuje
+kolekcji utworzonej przez `ensure_collection_at`.
+
+**Wniosek metodyczny:** krytyk rundy 1 przeczytał testy i uznał je za nie-puste, bo każdy łapał
+swoją mutację. Krytyk rundy 2 zapytał inaczej — „czy JAKIKOLWIEK test łapie tę zmianę" — i
+odpowiedź brzmiała nie. To są dwa różne pytania i drugie jest ważniejsze.

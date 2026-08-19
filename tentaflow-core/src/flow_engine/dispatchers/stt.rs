@@ -9,8 +9,11 @@ use anyhow::Result;
 use async_trait::async_trait;
 
 use crate::flow_engine::blob_store::BlobRef;
+use crate::flow_engine::dispatcher::CallProvenance;
 
-#[derive(Debug, Clone, Default)]
+/// No `Default`: `provenance` must be stated by the caller, and a defaulted
+/// stamp is exactly the silent `system` value §2.5 forbids.
+#[derive(Debug, Clone)]
 pub struct SttRequest {
     pub model: String,
     pub audio: BlobRef,
@@ -25,6 +28,12 @@ pub struct SttRequest {
     pub response_format: Option<String>,
     pub user_id: Option<String>,
     pub user_role: Option<String>,
+    /// §2.5 — server-minted provenance of the flow this call belongs to, copied
+    /// from the node's `ExecutionContext`. Threaded for the same reason as
+    /// `flow_depth`: the runtime context the dispatcher builds re-enters the
+    /// executor, and an alias resolving onto a flow surface starts THAT flow
+    /// with this stamp. Not derived from request content.
+    pub provenance: CallProvenance,
 }
 
 #[derive(Debug, Clone, Default)]

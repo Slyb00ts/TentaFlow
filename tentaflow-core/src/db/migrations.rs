@@ -687,6 +687,16 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "events_tracking_foundation",
             MigrationStep::RustSelfManaged(create_events_tracking_foundation),
         ),
+        (
+            130,
+            "graph_collection_paths_repair",
+            MigrationStep::Rust(repair_graph_collection_paths),
+        ),
+        (
+            131,
+            "run_provenance_columns",
+            MigrationStep::Rust(add_run_provenance_columns),
+        ),
     ]
 }
 
@@ -875,6 +885,205 @@ fn create_events_tracking_foundation(conn: &Connection, version: i64, name: &str
 
     conn.execute_batch("PRAGMA foreign_keys = ON;")?;
     result
+}
+
+// =============================================================================
+// v130 — repair `addon_graph_collections.file_path` after a data-directory move
+// =============================================================================
+//
+// `GraphManager` now treats the stored `file_path` as the SOURCE OF TRUTH for an
+// existing collection; it used to re-derive the path from the collection key on
+// every open. The live "Ustawienia -> Magazyn danych" migration
+// (`services/storage_admin.rs::run_live_migration`) moved the files and rewrote
+// `addon_vector_namespaces.file_path`, but left the graph registry pointing at
+// the OLD prefix. That was harmless while the path was re-derived; with the row
+// as the source of truth it is silent data loss — such an installation opens a
+// BRAND-NEW empty graph at the stale location, and `delete_collection` would
+// then delete those empty files and drop the row, orphaning the real data for
+// good. `run_live_migration` rewrites both tables now; this repairs the
+// installations that already moved under the old code.
+//
+// WHAT THE CURRENT ORGANIZATIONS DIRECTORY IS, AT MIGRATION TIME.
+// `paths::orgs_dir()` cannot be asked here and would answer wrongly: `main.rs`
+// calls `load_path_overrides(|_| None)` BEFORE `db::init` and only re-loads the
+// live `*_dir` keys from the database AFTER it returns, so while migrations run
+// the process-wide override table still reads "default" no matter what the
+// operator configured — a repair driven by it would rewrite CORRECT rows into
+// wrong ones. The value is nonetheless knowable, from the same persistent source
+// `load_path_overrides` consults a moment later: the `addons_data_dir` row of
+// THIS connection's `settings` table, which `run_live_migration` writes with
+// `set_setting` in the step that moves the files. `current_orgs_dir` therefore
+// reproduces `paths::category_dir(AddonData)` — override, else default — which
+// is the accessor's entire definition, not a fallback chain.
+//
+// WHICH ROWS ARE REWRITTEN. Exactly those whose stored path ends with the tail
+// `GraphManager::file_path_for` derives from the row's own primary key
+// (`<org_id>/addons/<addon_id>/graph/<collection>.cozo`) and does not already
+// sit under the current root. For such a row, prefix replacement (what
+// `run_live_migration` does to the vector table) and re-deriving from the key
+// produce the same string, because a category move preserves every path
+// component below the category root — but re-deriving does not need the old
+// root, which no longer exists anywhere by the time this runs. A row that does
+// NOT end with that tail was created through `GraphManager::ensure_collection_at`
+// with an explicit directory and legitimately lives outside the organizations
+// tree; it is left untouched.
+//
+// `updated_at` is deliberately not bumped: it records graph activity, and this
+// migration corrects bookkeeping without the collection having changed.
+//
+// Idempotent: a second run finds every repairable row already equal to its
+// expected path and issues no UPDATE at all.
+fn repair_graph_collection_paths(conn: &Connection) -> Result<()> {
+    let orgs_root = current_orgs_dir(conn)?;
+
+    let rows: Vec<(String, String, String, String)> = {
+        let mut stmt = conn.prepare(
+            "SELECT org_id, addon_id, collection, file_path FROM addon_graph_collections",
+        )?;
+        let mut collected = Vec::new();
+        let mut cursor = stmt.query([])?;
+        while let Some(row) = cursor.next()? {
+            collected.push((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?));
+        }
+        collected
+    };
+
+    let mut repaired = 0usize;
+    for (org_id, addon_id, collection, file_path) in rows {
+        let tail = std::path::PathBuf::from(&org_id)
+            .join("addons")
+            .join(&addon_id)
+            .join("graph")
+            .join(format!("{collection}.cozo"));
+        let tail = format!("{}{}", std::path::MAIN_SEPARATOR, tail.to_string_lossy());
+        if !file_path.ends_with(&tail) {
+            continue;
+        }
+        let expected = orgs_root
+            .join(&org_id)
+            .join("addons")
+            .join(&addon_id)
+            .join("graph")
+            .join(format!("{collection}.cozo"))
+            .to_string_lossy()
+            .to_string();
+        if expected == file_path {
+            continue;
+        }
+        conn.execute(
+            "UPDATE addon_graph_collections SET file_path = ?4 \
+             WHERE org_id = ?1 AND addon_id = ?2 AND collection = ?3",
+            rusqlite::params![org_id, addon_id, collection, expected],
+        )?;
+        repaired += 1;
+    }
+
+    if repaired > 0 {
+        info!(
+            "v130: rewrote {} stale graph collection path(s) under {}",
+            repaired,
+            orgs_root.display()
+        );
+    }
+    Ok(())
+}
+
+/// The organizations directory as the runtime resolves it, read from the
+/// database rather than from `paths` — the process-wide override table is not
+/// populated yet while migrations run (see the v130 header). Mirrors
+/// `paths::category_dir(StorageCategory::AddonData)`: the operator override when
+/// one is set to a non-blank value, otherwise the category default.
+fn current_orgs_dir(conn: &Connection) -> Result<std::path::PathBuf> {
+    use rusqlite::OptionalExtension;
+
+    let category = crate::paths::StorageCategory::AddonData;
+    let configured: Option<String> = conn
+        .query_row(
+            "SELECT value FROM settings WHERE key = ?1",
+            rusqlite::params![category.setting_key()],
+            |row| row.get(0),
+        )
+        .optional()?;
+    // `paths::override_path` reads a blank setting as "no override".
+    match configured.filter(|value| !value.trim().is_empty()) {
+        Some(dir) => Ok(std::path::PathBuf::from(dir)),
+        None => Ok(category.default_dir()),
+    }
+}
+
+// =============================================================================
+// v131 — provenance columns on `flow_executions` and `agent_runs`
+// =============================================================================
+//
+// Stage 1 of the event-tracking plan (`docs/DOKONCZENIE_RAG_I_ZDARZENIA.md`
+// §2.5, acceptance row §2.11) requires `flow_executions` to answer "from where
+// and who" without a new table, and the same question is asked of an agent run,
+// so both tables get the same five columns and the same index shapes.
+//
+// All five are NULLABLE with no default, and existing rows are NOT backfilled.
+// An `ALTER TABLE ... ADD COLUMN ... NOT NULL` needs a default, and any default
+// here would stamp a provenance the node never observed — spec invariant 6
+// ("origin and actor* NEVER come from anywhere but the entry point"). A NULL
+// origin on a historical run is the honest statement "this predates the stamp";
+// a guessed one is fabrication that no later query can distinguish from a real
+// observation. New rows always carry both non-NULL values
+// (`NewAgentRun.origin` / `.actor_kind` are `&str`, not `Option`), so the NULLs
+// mark exactly the pre-migration population.
+//
+// Index shapes follow the log they will be joined against:
+//   * `(origin, <time> DESC)` and `(actor_id, <time> DESC)` mirror
+//     `ix_run_events_origin` / `ix_run_events_actor` in §2.3 — both browse
+//     queries filter on one value and order by time, so the time column belongs
+//     in the index. `actor_kind` is deliberately NOT the leading column: it has
+//     a handful of distinct values and would only cost a level of B-tree.
+//   * `(correlation_id, <time> DESC)` matches `idx_audit_log_correlation` from
+//     v129 and `idx_compliance_ai_events_correlation`, so the audit deep link
+//     reads the same shape from every table it merges.
+//
+// The columns are NOT folded into `INITIAL_SCHEMA` / `AGENTS_REGISTRY`. v129 set
+// the precedent both ways and the distinguishing factor is cost: it inlined the
+// widened `scope_kind` CHECK because reaching it otherwise means a full table
+// rebuild, and left `audit_log.correlation_id` as a plain migration because
+// `ADD COLUMN` is O(1) metadata. These five are the second kind. For
+// `flow_executions` inlining would additionally be WRONG: migration v2
+// (`FLOW_EXECUTIONS_ALLOW_COMPLETED`) rebuilds that table from a fixed column
+// list and runs on a fresh install too, so anything added to `INITIAL_SCHEMA`
+// would be dropped again three migrations later.
+//
+// Idempotent — every column is guarded by a probe and every index by
+// `IF NOT EXISTS`.
+const RUN_PROVENANCE_COLUMNS: [&str; 5] = [
+    "origin",
+    "actor_kind",
+    "actor_id",
+    "actor_user_id",
+    "correlation_id",
+];
+
+fn add_run_provenance_columns(conn: &Connection) -> Result<()> {
+    for table in ["flow_executions", "agent_runs"] {
+        for column in RUN_PROVENANCE_COLUMNS {
+            if !column_exists(conn, table, column)? {
+                conn.execute_batch(&format!("ALTER TABLE {table} ADD COLUMN {column} TEXT;"))?;
+            }
+        }
+    }
+
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_flow_executions_origin
+             ON flow_executions(origin, started_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_flow_executions_actor
+             ON flow_executions(actor_id, started_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_flow_executions_correlation
+             ON flow_executions(correlation_id, started_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_agent_runs_origin
+             ON agent_runs(origin, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_agent_runs_actor
+             ON agent_runs(actor_id, created_at DESC);
+         CREATE INDEX IF NOT EXISTS idx_agent_runs_correlation
+             ON agent_runs(correlation_id, created_at DESC);",
+    )?;
+    Ok(())
 }
 
 /// Completes the accounting of an agent run: the model it spent tokens on and
@@ -2853,6 +3062,22 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "run principal born TEXT in v64; runtime row, no declared user_accounts FK — \
              the run survives the account's deletion for audit, and a NULL principal is \
              the unattended-call case (§3.3)",
+        ),
+        t(
+            "agent_runs",
+            "actor_user_id",
+            "provenance stamp born TEXT in v131 (post-flip, never held an INTEGER id); \
+             runtime row, no declared user_accounts FK — like the run principal above, \
+             the record of who caused a run outlives the account, and NULL is the \
+             meaningful 'service API key with no user behind it' case (§2.5)",
+        ),
+        t(
+            "flow_executions",
+            "actor_user_id",
+            "provenance stamp born TEXT in v131 (post-flip, never held an INTEGER id); \
+             runtime log row, no declared user_accounts FK — the execution history must \
+             not be cascaded away with an account, and NULL is the 'service API key with \
+             no user behind it' case (§2.5)",
         ),
         t(
             "compliance_data_subjects",
@@ -9112,5 +9337,416 @@ mod tests {
         )
         .unwrap();
         conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    }
+
+    fn index_exists(conn: &Connection, name: &str) -> bool {
+        let found: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = ?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap();
+        found == 1
+    }
+
+    fn index_sql(conn: &Connection, name: &str) -> String {
+        conn.query_row(
+            "SELECT sql FROM sqlite_master WHERE type = 'index' AND name = ?1",
+            rusqlite::params![name],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    fn graph_path(conn: &Connection, org_id: &str, addon_id: &str, collection: &str) -> String {
+        conn.query_row(
+            "SELECT file_path FROM addon_graph_collections \
+             WHERE org_id = ?1 AND addon_id = ?2 AND collection = ?3",
+            rusqlite::params![org_id, addon_id, collection],
+            |r| r.get(0),
+        )
+        .unwrap()
+    }
+
+    /// Inserts one graph collection row verbatim, so a test can plant a path the
+    /// runtime would never mint today.
+    fn seed_graph_collection(
+        conn: &Connection,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        file_path: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO addon_graph_collections \
+                (org_id, addon_id, collection, file_path, engine, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, 'sled', '2026-01-01T00:00:00Z', '2026-01-01T00:00:00Z')",
+            rusqlite::params![org_id, addon_id, collection, file_path],
+        )
+        .unwrap();
+    }
+
+    /// A database whose graph registry still points at the directory the data was
+    /// moved AWAY from — the state v130 exists to repair. `addons_data_dir` is the
+    /// only input `current_orgs_dir` has, so setting it pins the expected target
+    /// without depending on where the test process resolved `tentaflow_home()`.
+    const STALE_ORGS_ROOT: &str = "/srv/tentaflow-old/orgs";
+    const CURRENT_ORGS_ROOT: &str = "/mnt/big/orgs";
+
+    #[test]
+    fn migration_v130_repairs_only_stale_derived_graph_paths() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('addons_data_dir', ?1)",
+            rusqlite::params![CURRENT_ORGS_ROOT],
+        )
+        .unwrap();
+
+        // (a) stale: derived under the OLD root, orphaned by a pre-fix move.
+        seed_graph_collection(
+            &conn,
+            "org-default",
+            "notes",
+            "notes_kg",
+            &format!("{STALE_ORGS_ROOT}/org-default/addons/notes/graph/notes_kg.cozo"),
+        );
+        // (b) already correct: derived under the CURRENT root.
+        seed_graph_collection(
+            &conn,
+            "org-b",
+            "memory",
+            "facts",
+            &format!("{CURRENT_ORGS_ROOT}/org-b/addons/memory/graph/facts.cozo"),
+        );
+        // (c) explicit directory (`ensure_collection_at`): outside the
+        // organizations tree on purpose, and not shaped like a derived path.
+        let custom = "/var/lib/tentaflow-custom/kg_active.cozo";
+        seed_graph_collection(&conn, "org-c", "ps-proj-1", "kg_active", custom);
+
+        conn.execute("DELETE FROM _migrations WHERE version = 130", [])
+            .unwrap();
+        repair_graph_collection_paths(&conn).unwrap();
+
+        assert_eq!(
+            graph_path(&conn, "org-default", "notes", "notes_kg"),
+            format!("{CURRENT_ORGS_ROOT}/org-default/addons/notes/graph/notes_kg.cozo"),
+            "a derived path under a dead root must be moved to the current one"
+        );
+        assert_eq!(
+            graph_path(&conn, "org-b", "memory", "facts"),
+            format!("{CURRENT_ORGS_ROOT}/org-b/addons/memory/graph/facts.cozo"),
+            "a row already under the current root must not be touched"
+        );
+        assert_eq!(
+            graph_path(&conn, "org-c", "ps-proj-1", "kg_active"),
+            custom,
+            "an explicitly placed collection must survive the repair verbatim"
+        );
+
+        // Nothing is lost or invented: three rows in, three rows out.
+        let rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM addon_graph_collections", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!(rows, 3);
+
+        // Idempotency: a second pass changes nothing at all.
+        let before: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT file_path FROM addon_graph_collections ORDER BY org_id")
+                .unwrap();
+            let out = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            out
+        };
+        repair_graph_collection_paths(&conn).unwrap();
+        let after: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT file_path FROM addon_graph_collections ORDER BY org_id")
+                .unwrap();
+            let out = stmt
+                .query_map([], |r| r.get::<_, String>(0))
+                .unwrap()
+                .map(|r| r.unwrap())
+                .collect();
+            out
+        };
+        assert_eq!(before, after, "the repair must be idempotent");
+    }
+
+    #[test]
+    fn current_orgs_dir_prefers_the_setting_over_the_category_default() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // No setting: the category default, exactly like `paths::category_dir`.
+        assert_eq!(
+            current_orgs_dir(&conn).unwrap(),
+            crate::paths::StorageCategory::AddonData.default_dir()
+        );
+
+        // A blank setting is "no override", matching `paths::override_path`.
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('addons_data_dir', '   ')",
+            [],
+        )
+        .unwrap();
+        assert_eq!(
+            current_orgs_dir(&conn).unwrap(),
+            crate::paths::StorageCategory::AddonData.default_dir()
+        );
+
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES ('addons_data_dir', ?1)",
+            rusqlite::params![CURRENT_ORGS_ROOT],
+        )
+        .unwrap();
+        assert_eq!(
+            current_orgs_dir(&conn).unwrap(),
+            std::path::PathBuf::from(CURRENT_ORGS_ROOT)
+        );
+    }
+
+    #[test]
+    fn migration_v131_fresh_database_has_run_provenance() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        for table in ["flow_executions", "agent_runs"] {
+            for column in RUN_PROVENANCE_COLUMNS {
+                assert!(
+                    column_exists(&conn, table, column).unwrap(),
+                    "{table} is missing {column}"
+                );
+                assert!(
+                    column_is_text(&conn, table, column).unwrap(),
+                    "{table}.{column} must be TEXT"
+                );
+            }
+        }
+
+        for name in [
+            "idx_flow_executions_origin",
+            "idx_flow_executions_actor",
+            "idx_flow_executions_correlation",
+            "idx_agent_runs_origin",
+            "idx_agent_runs_actor",
+            "idx_agent_runs_correlation",
+        ] {
+            assert!(index_exists(&conn, name), "missing index {name}");
+        }
+
+        // The browse queries filter on one value and order by time, so the time
+        // column has to be IN the index, not merely available on the row.
+        assert!(index_sql(&conn, "idx_flow_executions_origin").contains("started_at"));
+        assert!(index_sql(&conn, "idx_agent_runs_origin").contains("created_at"));
+        assert!(index_sql(&conn, "idx_flow_executions_actor").contains("actor_id"));
+        assert!(index_sql(&conn, "idx_agent_runs_actor").contains("actor_id"));
+
+        // The provenance stamp must never be forged by a column default.
+        for table in ["flow_executions", "agent_runs"] {
+            let table_sql: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = ?1",
+                    rusqlite::params![table],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            assert!(
+                !table_sql.contains("origin TEXT NOT NULL"),
+                "{table}.origin must stay nullable: {table_sql}"
+            );
+        }
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    /// Strips everything v131 adds, so the migration can be exercised on a
+    /// database that really is at v130. `DROP COLUMN` refuses an indexed column,
+    /// hence the indexes go first.
+    fn rewind_to_v130(conn: &Connection) {
+        for name in [
+            "idx_flow_executions_origin",
+            "idx_flow_executions_actor",
+            "idx_flow_executions_correlation",
+            "idx_agent_runs_origin",
+            "idx_agent_runs_actor",
+            "idx_agent_runs_correlation",
+        ] {
+            conn.execute_batch(&format!("DROP INDEX IF EXISTS {name};"))
+                .unwrap();
+        }
+        for table in ["flow_executions", "agent_runs"] {
+            for column in RUN_PROVENANCE_COLUMNS {
+                conn.execute_batch(&format!("ALTER TABLE {table} DROP COLUMN {column};"))
+                    .unwrap();
+            }
+        }
+        conn.execute("DELETE FROM _migrations WHERE version = 131", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_v131_upgrades_v130_database_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        rewind_to_v130(&conn);
+
+        for column in RUN_PROVENANCE_COLUMNS {
+            assert!(
+                !column_exists(&conn, "flow_executions", column).unwrap(),
+                "the rewind must really land on v130"
+            );
+        }
+
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) \
+             VALUES ('flow-1', 'chat', '{}', 'active')",
+            [],
+        )
+        .unwrap();
+        for (request_id, status, tokens) in [
+            ("req-a", "completed", 120),
+            ("req-b", "error", 0),
+            ("req-c", "running", 45),
+        ] {
+            conn.execute(
+                "INSERT INTO flow_executions \
+                    (flow_id, request_id, started_at, status, total_tokens) \
+                 VALUES ('flow-1', ?1, '2026-08-01T10:00:00Z', ?2, ?3)",
+                rusqlite::params![request_id, status, tokens],
+            )
+            .unwrap();
+        }
+        for (id, status, iterations) in [
+            ("run-a", "completed", 7),
+            ("run-b", "failed", 2),
+        ] {
+            conn.execute(
+                "INSERT INTO agent_runs (id, agent_id, status, prompt, iterations) \
+                 VALUES (?1, 'agent-1', ?2, 'do the thing', ?3)",
+                rusqlite::params![id, status, iterations],
+            )
+            .unwrap();
+        }
+
+        let executions_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r.get(0))
+            .unwrap();
+        let runs_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r.get(0))
+            .unwrap();
+
+        add_run_provenance_columns(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            executions_before,
+            "no flow execution may be lost by the upgrade"
+        );
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            runs_before,
+            "no agent run may be lost by the upgrade"
+        );
+
+        // Spot-check that pre-existing values came through byte for byte.
+        let (status, tokens): (String, i64) = conn
+            .query_row(
+                "SELECT status, total_tokens FROM flow_executions WHERE request_id = 'req-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+        assert_eq!(tokens, 120);
+        let (run_status, iterations): (String, i64) = conn
+            .query_row(
+                "SELECT status, iterations FROM agent_runs WHERE id = 'run-a'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(run_status, "completed");
+        assert_eq!(iterations, 7);
+
+        // Historical rows stay honestly unattributed — a guessed origin would be
+        // indistinguishable from an observed one.
+        let unstamped_executions: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_executions \
+                 WHERE origin IS NULL AND actor_kind IS NULL AND actor_id IS NULL \
+                   AND actor_user_id IS NULL AND correlation_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unstamped_executions, executions_before);
+        let unstamped_runs: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM agent_runs \
+                 WHERE origin IS NULL AND actor_kind IS NULL AND actor_id IS NULL \
+                   AND actor_user_id IS NULL AND correlation_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unstamped_runs, runs_before);
+
+        // A NEW row carries the stamp the entry point supplies — this is the
+        // insert `repository::create_agent_run` issues.
+        conn.execute(
+            "INSERT INTO agent_runs \
+                (id, agent_id, status, prompt, origin, actor_kind, actor_id, \
+                 actor_user_id, correlation_id) \
+             VALUES ('run-c', 'agent-1', 'queued', 'p', 'chat', 'user', 'u-1', 'u-1', 'corr-1')",
+            [],
+        )
+        .unwrap();
+        let stamped: String = conn
+            .query_row(
+                "SELECT origin FROM agent_runs WHERE correlation_id = 'corr-1'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, "chat");
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // Re-running on an already-migrated database is a no-op, not a duplicate
+        // column error and not a second index.
+        add_run_provenance_columns(&conn).unwrap();
+        for name in ["idx_flow_executions_origin", "idx_agent_runs_correlation"] {
+            assert!(index_exists(&conn, name));
+        }
+    }
+
+    #[test]
+    fn fresh_database_migrates_to_131_with_clean_foreign_keys() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let head: i64 = conn
+            .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(head, 131, "131 must be the highest applied migration");
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // Running the whole ladder twice must be a no-op.
+        run(&conn).unwrap();
+        let head_again: i64 = conn
+            .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(head_again, 131);
     }
 }

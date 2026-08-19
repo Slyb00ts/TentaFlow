@@ -162,7 +162,16 @@ mod serde_array64 {
 // in place to carry a `SessionAssertion` — a stream has to be authorized for
 // a USER, not merely for a trusted node. A stale peer would decode the old
 // shape and serve somebody else's session timeline, so old/new must not mix.
-pub const SCHEMA_VERSION: u16 = 22;
+// v23: event tracking. Main-database migration 129 widens
+// `compliance_retention_policies.scope_kind` with an `events` scope, and both
+// `compliance_retention_policies` and `roles` replicate through the Sync Ledger
+// (`sync/core_registry.rs`). No `MessageBody` layout changed, so nothing here
+// forces a bump on wire grounds — but a node on 129 replicates a retention row
+// whose scope a node on 128 rejects on its own CHECK and whose parser fails on
+// the unknown value, and it does so ROW BY ROW, silently, long after the
+// handshake succeeded. Bumping turns that into one loud handshake refusal, which
+// is the failure mode "rebuild all mesh nodes together" (CLAUDE.md) assumes.
+pub const SCHEMA_VERSION: u16 = 23;
 
 // =============================================================================
 // Message kind discriminants

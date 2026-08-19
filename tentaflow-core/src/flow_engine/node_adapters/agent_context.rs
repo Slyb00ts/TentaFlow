@@ -367,6 +367,11 @@ impl NodeAdapter for AgentContextNodeAdapter {
             None => {
                 let id = uuid::Uuid::new_v4().to_string();
                 let prompt = envelope.payload.as_text().unwrap_or("").to_string();
+                // §2.5 — this block IS the run's entry point, so the row is
+                // stamped from the flow's own server-minted provenance. Not from
+                // `envelope.meta`: every node can write meta, so a stamp taken
+                // from there would be derivable from model output.
+                let actor = ctx.actor();
                 repository::create_agent_run(
                     service.db(),
                     &NewAgentRun {
@@ -381,6 +386,11 @@ impl NodeAdapter for AgentContextNodeAdapter {
                         user_id: ctx.user_id.as_deref(),
                         org_id: None,
                         prompt: &prompt,
+                        origin: ctx.origin.as_str(),
+                        actor_kind: actor.kind().as_str(),
+                        actor_id: actor.id(),
+                        actor_user_id: actor.user_id(),
+                        correlation_id: ctx.correlation_id.as_deref(),
                     },
                 )?;
                 let _ = repository::update_agent_run_status(

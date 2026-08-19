@@ -143,7 +143,7 @@ impl NodeAdapter for OcrNodeAdapter {
 
         let result = ctx
             .documents
-            .infer(&model, &image, &mime, TASK)
+            .infer(&model, &image, &mime, TASK, ctx.provenance())
             .await
             .map_err(|e| anyhow!("{NODE_TYPE}: OCR zawiódł: {e}"))?;
 

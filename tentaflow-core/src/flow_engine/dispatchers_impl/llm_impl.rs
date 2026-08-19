@@ -183,8 +183,11 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // request is cancelled mid-flight (the event then finishes failed).
         let audit_event = self.start_audit_event(&req, &api_req);
         let model = api_req.model.clone();
+        let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
-        let mut rctx = RuntimeContext::new(user);
+        // §2.5 — the calling flow's stamp travels with the request; a fresh
+        // runtime context here would report the nested dispatch as `system`.
+        let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
         // Cancel + deadline są egzekwowane na poziomie wrappera bo
         // ModelRuntimeExecutor::execute_chat nie eksponuje tych pól.
         // select! w pierwszej kolejności sprawdza cancel/deadline, więc
@@ -306,8 +309,11 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // whose model is empty for flow chats → usage mis-attributed to "".
         // AuditFinishStream finishes it with the streamed usage (incl reasoning).
         let audit_event = self.start_audit_event(&req, &api_req);
+        let provenance = req.provenance.clone();
         let user = build_user_context(req.user_id, req.user_role.as_deref());
-        let mut rctx = RuntimeContext::new(user);
+        // §2.5 — the calling flow's stamp travels with the request; a fresh
+        // runtime context here would report the nested dispatch as `system`.
+        let mut rctx = RuntimeContext::new(user, provenance.origin, provenance.actor);
         // Pre-handoff: budowa streamu też podlega cancel/deadline. Gdy
         // resolver/strategy się zacina lub backend nie zdąży otworzyć
         // strumienia w czasie, abort'ujemy zanim zwrócimy stream do callera.
@@ -747,6 +753,7 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::flow_engine::blob_store::InMemoryBlobStore;
+    use crate::flow_engine::dispatcher::CallProvenance;
     use crate::flow_engine::dispatchers::LlmResponse;
     use crate::flow_engine::envelope::{ChatMessage, FinishReason, TokenUsage};
     use rusqlite::Connection;
@@ -784,7 +791,7 @@ mod tests {
             .expect("seed user");
         let dispatcher = dispatcher_with_db(db.clone());
 
-        let mut req = LlmRequest::new("bielik");
+        let mut req = LlmRequest::new("bielik", CallProvenance::system());
         req.messages = vec![ChatMessage::user("remember my favorite color")];
         req.user_id = Some("u-agent".into());
         req.flow_id = None;
@@ -867,7 +874,7 @@ mod tests {
         let runtime: ModelRuntimeSlot = Arc::new(parking_lot::RwLock::new(None));
         let blobs: Arc<dyn BlobStore> = Arc::new(InMemoryBlobStore::new());
         let dispatcher = LlmDispatcherImpl::new(runtime, blobs, None, "node-test");
-        let mut req = LlmRequest::new("m");
+        let mut req = LlmRequest::new("m", CallProvenance::system());
         req.messages = vec![ChatMessage::user("hi")];
         let api_req = build_chat_request(&req, false, dispatcher.blobs.as_ref())
             .await
@@ -912,7 +919,7 @@ mod tests {
     async fn build_chat_request_maps_tools_and_tool_choice() {
         use crate::flow_engine::blob_store::InMemoryBlobStore;
         let blobs = InMemoryBlobStore::new();
-        let mut req = LlmRequest::new("m");
+        let mut req = LlmRequest::new("m", CallProvenance::system());
         req.messages = vec![ChatMessage::user("hi")];
         req.tools = vec![LlmToolSpec {
             name: "memory.memory_store".into(),
@@ -943,7 +950,7 @@ mod tests {
     async fn build_chat_request_omits_tools_when_empty() {
         use crate::flow_engine::blob_store::InMemoryBlobStore;
         let blobs = InMemoryBlobStore::new();
-        let mut req = LlmRequest::new("m");
+        let mut req = LlmRequest::new("m", CallProvenance::system());
         req.messages = vec![ChatMessage::user("hi")];
         let api = build_chat_request(&req, false, &blobs).await.unwrap();
         assert!(api.tools.is_none());

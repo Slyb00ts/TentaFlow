@@ -10,6 +10,7 @@ use futures::stream::BoxStream;
 use tokio_util::sync::CancellationToken;
 
 use crate::flow_engine::blob_store::BlobRef;
+use crate::flow_engine::dispatcher::CallProvenance;
 pub use crate::flow_engine::envelope::AudioStreamChunk as TtsStreamChunk;
 
 #[derive(Debug, Clone)]
@@ -29,22 +30,12 @@ pub struct TtsRequest {
     /// Etap 3c: cancel signal dla stream_synthesize (klient disconnect).
     /// Blocking `synthesize` ignoruje (nie ma chunked emit do przerwania).
     pub cancel_token: CancellationToken,
-}
-
-impl Default for TtsRequest {
-    fn default() -> Self {
-        Self {
-            model: String::new(),
-            text: String::new(),
-            voice: None,
-            format: None,
-            language: None,
-            speed: None,
-            user_id: None,
-            user_role: None,
-            cancel_token: CancellationToken::new(),
-        }
-    }
+    /// §2.5 — server-minted provenance of the flow this call belongs to, copied
+    /// from the node's `ExecutionContext`. Threaded for the same reason as
+    /// `flow_depth`: the runtime context the dispatcher builds re-enters the
+    /// executor, and an alias resolving onto a flow surface starts THAT flow
+    /// with this stamp. Not derived from request content.
+    pub provenance: CallProvenance,
 }
 
 #[derive(Debug, Clone)]

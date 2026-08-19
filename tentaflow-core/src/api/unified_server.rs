@@ -29,6 +29,96 @@ use crate::metrics::RouterMetrics;
 use crate::routing::Router;
 use crate::services::runtime::quic_handle::ServiceManager;
 
+/// The three identities a verified `/v1` API key resolves to, minted together so
+/// no caller can pair the wrong `Principal` with the wrong `FlowActor`.
+///
+/// Extracted from the request path because this mapping is load-bearing: it
+/// decides both authorization (`Principal`) and what the event log reports as
+/// the actor (§2.5). A `user` key whose account is gone or inactive must NOT
+/// slip through with no principal, and a `group` / `general` key has no user
+/// behind it — reporting one would name a person for a service call.
+pub(crate) struct ApiKeyIdentity {
+    /// Kept so Tier-1 `*_for_user` paths still work. `None` for keys with no
+    /// user behind them.
+    pub user_ctx: Option<crate::auth::acl::UserContext>,
+    /// The authoritative `/v1` gate principal.
+    pub principal: crate::auth::acl::Principal,
+    /// §2.5 actor. Always an `api_key`; `user_id` is `Some` only when the key is
+    /// bound to a real, active user.
+    pub actor: crate::flow_engine::dispatcher::FlowActor,
+}
+
+/// Maps a VERIFIED api_keys row onto the identities above. `Err` is the JSON
+/// body returned as 401 — every unmapped shape (unknown `key_type`, missing
+/// subject, deleted or deactivated user, unknown group) is a rejection, never a
+/// degraded principal.
+pub(crate) fn identity_for_api_key(
+    db: &crate::db::DbPool,
+    api_key_row: &crate::db::models::DbApiKey,
+) -> std::result::Result<ApiKeyIdentity, &'static str> {
+    use crate::flow_engine::dispatcher::FlowActor;
+
+    match api_key_row.key_type.as_str() {
+        "user" => {
+            // A 'user' key MUST resolve to an existing, ACTIVE user; otherwise
+            // it would slip through with no Principal.
+            let resolved = api_key_row.subject_id.as_deref().and_then(|uid| {
+                crate::db::repository::get_user_account_by_id(db, uid)
+                    .ok()
+                    .flatten()
+                    .map(|u| (uid.to_string(), u))
+            });
+            match resolved {
+                Some((uid, user)) if user.is_active => Ok(ApiKeyIdentity {
+                    user_ctx: Some(crate::auth::acl::UserContext::new(
+                        uid.clone(),
+                        user.role.clone(),
+                    )),
+                    actor: FlowActor::api_key(api_key_row.uid.clone(), Some(uid.clone())),
+                    principal: crate::auth::acl::Principal::User {
+                        user_id: uid,
+                        role: user.role,
+                    },
+                }),
+                _ => Err(INVALID_API_KEY_BODY),
+            }
+        }
+        "group" => {
+            // A 'group' key MUST resolve to an existing group; no UserContext,
+            // no admin-bypass — only group rules apply, and no user is behind it.
+            match api_key_row.subject_id.as_deref().and_then(|gid| {
+                crate::db::repository::get_group_by_id(db, gid)
+                    .ok()
+                    .flatten()
+                    .map(|_| gid.to_string())
+            }) {
+                Some(group_id) => Ok(ApiKeyIdentity {
+                    user_ctx: None,
+                    actor: FlowActor::api_key(api_key_row.uid.clone(), None),
+                    principal: crate::auth::acl::Principal::Group { group_id },
+                }),
+                None => Err(INVALID_API_KEY_BODY),
+            }
+        }
+        "general" => {
+            // A 'general' key carries its own explicit allowlist (subject_type=
+            // 'api_key', subject_id=uid). No role, never admin-bypass, and it is
+            // a SERVICE key: no user binding.
+            Ok(ApiKeyIdentity {
+                user_ctx: None,
+                actor: FlowActor::api_key(api_key_row.uid.clone(), None),
+                principal: crate::auth::acl::Principal::ApiKey {
+                    uid: api_key_row.uid.clone(),
+                },
+            })
+        }
+        _ => Err(INVALID_API_KEY_BODY),
+    }
+}
+
+const INVALID_API_KEY_BODY: &str =
+    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#;
+
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler.
 /// Obejmuje takze publiczna dokumentacje REST (/openapi.json, /docs i jej asety),
 /// ktora jest serwowana przez ten sam handler i — jak /health/ready — bez auth.
@@ -452,98 +542,22 @@ pub fn start_unified_server_with_permissions(
                                                         api_key_row.uid.clone(),
                                                         api_key_row.rate_limit_rps,
                                                     ));
-                                                    match api_key_row.key_type.as_str() {
-                                                        "user" => {
-                                                            // A 'user' key MUST resolve to an
-                                                            // existing, active user; otherwise it
-                                                            // would slip through with no Principal.
-                                                            match api_key_row.subject_id.as_deref().and_then(|uid| {
-                                                                crate::db::repository::get_user_account_by_id(&db, uid)
-                                                                    .ok()
-                                                                    .flatten()
-                                                                    .map(|u| (uid.to_string(), u))
-                                                            }) {
-                                                                Some((uid, user)) if user.is_active => {
-                                                                    // Keep UserContext so Tier1
-                                                                    // `*_for_user` paths still work,
-                                                                    // and add the authoritative /v1
-                                                                    // Principal used by the gate.
-                                                                    owner_user_ctx = Some(
-                                                                        crate::auth::acl::UserContext::new(
-                                                                            uid.clone(), user.role.clone(),
-                                                                        ),
-                                                                    );
-                                                                    flow_actor = Some(
-                                                                        crate::flow_engine::dispatcher::FlowActor::api_key(
-                                                                            api_key_row.uid.clone(),
-                                                                            Some(uid.clone()),
-                                                                        ),
-                                                                    );
-                                                                    principal = Some(
-                                                                        crate::auth::acl::Principal::User {
-                                                                            user_id: uid,
-                                                                            role: user.role,
-                                                                        },
-                                                                    );
-                                                                    None
-                                                                }
-                                                                _ => Some(
-                                                                    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
-                                                                ),
-                                                            }
-                                                        }
-                                                        "group" => {
-                                                            // A 'group' key MUST resolve to an
-                                                            // existing group; no UserContext, no
-                                                            // admin-bypass — only group rules apply.
-                                                            match api_key_row.subject_id.as_deref().and_then(|gid| {
-                                                                crate::db::repository::get_group_by_id(&db, gid)
-                                                                    .ok()
-                                                                    .flatten()
-                                                                    .map(|_| gid.to_string())
-                                                            }) {
-                                                                Some(gid) => {
-                                                                    // Group key: no user behind it.
-                                                                    flow_actor = Some(
-                                                                        crate::flow_engine::dispatcher::FlowActor::api_key(
-                                                                            api_key_row.uid.clone(),
-                                                                            None,
-                                                                        ),
-                                                                    );
-                                                                    principal = Some(
-                                                                        crate::auth::acl::Principal::Group {
-                                                                            group_id: gid,
-                                                                        },
-                                                                    );
-                                                                    None
-                                                                }
-                                                                None => Some(
-                                                                    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
-                                                                ),
-                                                            }
-                                                        }
-                                                        "general" => {
-                                                            // A 'general' key carries its own
-                                                            // explicit allowlist (subject_type=
-                                                            // 'api_key', subject_id=uid). No role,
-                                                            // never admin-bypass.
-                                                            // Service key: no user binding.
-                                                            flow_actor = Some(
-                                                                crate::flow_engine::dispatcher::FlowActor::api_key(
-                                                                    api_key_row.uid.clone(),
-                                                                    None,
-                                                                ),
-                                                            );
-                                                            principal = Some(
-                                                                crate::auth::acl::Principal::ApiKey {
-                                                                    uid: api_key_row.uid.clone(),
-                                                                },
-                                                            );
+                                                    // §2.5 — the actor is
+                                                    // minted HERE with the
+                                                    // principal, because this is
+                                                    // the only place the API key
+                                                    // → user binding is known.
+                                                    match identity_for_api_key(
+                                                        &db,
+                                                        &api_key_row,
+                                                    ) {
+                                                        Ok(identity) => {
+                                                            owner_user_ctx = identity.user_ctx;
+                                                            flow_actor = Some(identity.actor);
+                                                            principal = Some(identity.principal);
                                                             None
                                                         }
-                                                        _ => Some(
-                                                            r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#,
-                                                        ),
+                                                        Err(body) => Some(body),
                                                     }
                                                 }
                                                 _ => Some(
@@ -673,4 +687,130 @@ pub fn start_unified_server_with_permissions(
     });
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::auth::acl::Principal;
+    use crate::db::models::DbApiKey;
+    use crate::flow_engine::dispatcher::ActorKind;
+    use std::path::Path;
+
+    fn fresh_db() -> db::DbPool {
+        db::init(Path::new(":memory:")).expect("in-memory db")
+    }
+
+    fn key_row(uid: &str, key_type: &str, subject_id: Option<&str>) -> DbApiKey {
+        DbApiKey {
+            id: 1,
+            uid: uid.to_string(),
+            key_verifier: "v".to_string(),
+            key_prefix: "tf_".to_string(),
+            name: "test key".to_string(),
+            key_type: key_type.to_string(),
+            subject_id: subject_id.map(|s| s.to_string()),
+            rate_limit_rps: 10,
+            is_active: true,
+            created_at: String::new(),
+            last_used_at: None,
+        }
+    }
+
+    /// A `user` key backed by an ACTIVE account resolves to that user on all
+    /// three axes: the Tier-1 `UserContext`, the `/v1` gate `Principal`, and the
+    /// §2.5 actor — which stays an `api_key` naming the KEY, with the user it is
+    /// bound to. Reporting `ActorKind::User` here would hide that a key was used.
+    #[test]
+    fn user_key_with_active_account_binds_the_actor_to_that_user() {
+        let db = fresh_db();
+        let user_id = crate::db::repository::create_user_account(
+            &db, "alice", "hash", "Alice", "a@example.com",
+        )
+        .expect("user");
+
+        let identity =
+            identity_for_api_key(&db, &key_row("key-user", "user", Some(&user_id))).expect("ok");
+
+        assert_eq!(
+            identity.user_ctx.as_ref().map(|u| u.user_id.as_str()),
+            Some(user_id.as_str())
+        );
+        assert!(matches!(identity.principal, Principal::User { .. }));
+        assert_eq!(identity.actor.kind(), ActorKind::ApiKey);
+        assert_eq!(identity.actor.id(), Some("key-user"));
+        assert_eq!(identity.actor.user_id(), Some(user_id.as_str()));
+    }
+
+    /// An INACTIVE account is a rejection, not a degraded principal: letting the
+    /// key through with `principal = None` would put it on the default-DENY
+    /// path's blind side, and stamping a user would attribute calls to someone
+    /// whose access was revoked.
+    #[test]
+    fn user_key_with_inactive_account_is_refused() {
+        let db = fresh_db();
+        let user_id = crate::db::repository::create_user_account(
+            &db, "bob", "hash", "Bob", "b@example.com",
+        )
+        .expect("user");
+        {
+            let conn = db.write().expect("db lock");
+            conn.execute(
+                "UPDATE user_accounts SET is_active = 0 WHERE id = ?1",
+                rusqlite::params![user_id],
+            )
+            .expect("deactivate");
+        }
+
+        assert!(identity_for_api_key(&db, &key_row("key-user", "user", Some(&user_id))).is_err());
+        // A user key naming an account that does not exist at all is refused too.
+        assert!(identity_for_api_key(&db, &key_row("key-user", "user", Some("ghost"))).is_err());
+    }
+
+    /// A `group` key has NO user behind it. `actor.user_id()` must stay `None`
+    /// so the UI shows a service key instead of naming a person.
+    #[test]
+    fn group_key_resolves_to_the_group_with_no_user_behind_it() {
+        let db = fresh_db();
+        let group_id =
+            crate::db::repository::create_group(&db, "ops", "ops team").expect("group");
+
+        let identity =
+            identity_for_api_key(&db, &key_row("key-group", "group", Some(&group_id))).expect("ok");
+
+        assert!(identity.user_ctx.is_none());
+        assert!(matches!(identity.principal, Principal::Group { .. }));
+        assert_eq!(identity.actor.kind(), ActorKind::ApiKey);
+        assert_eq!(identity.actor.id(), Some("key-group"));
+        assert_eq!(identity.actor.user_id(), None);
+
+        // An unknown group is a rejection, not a group principal with a dangling id.
+        assert!(identity_for_api_key(&db, &key_row("key-group", "group", Some("nope"))).is_err());
+    }
+
+    /// A `general` key is a pure service key: its own allowlist, no role, and no
+    /// user binding. It needs no DB lookup, so it must not acquire one either.
+    #[test]
+    fn general_key_is_a_service_key_with_no_user_binding() {
+        let db = fresh_db();
+        let identity = identity_for_api_key(&db, &key_row("key-general", "general", None))
+            .expect("ok");
+
+        assert!(identity.user_ctx.is_none());
+        match &identity.principal {
+            Principal::ApiKey { uid } => assert_eq!(uid, "key-general"),
+            other => panic!("expected ApiKey principal, got {other:?}"),
+        }
+        assert_eq!(identity.actor.kind(), ActorKind::ApiKey);
+        assert_eq!(identity.actor.id(), Some("key-general"));
+        assert_eq!(identity.actor.user_id(), None);
+    }
+
+    /// An unknown `key_type` is refused. Without this arm a future key type
+    /// would reach the gate with no principal at all.
+    #[test]
+    fn unknown_key_type_is_refused() {
+        let db = fresh_db();
+        assert!(identity_for_api_key(&db, &key_row("key-x", "robot", Some("u-1"))).is_err());
+    }
 }

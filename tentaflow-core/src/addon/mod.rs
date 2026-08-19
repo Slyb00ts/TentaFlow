@@ -477,6 +477,55 @@ pub struct ToolDefinition {
 // AddonState — stan przechowywany w Wasmtime Store
 // =============================================================================
 
+/// §2.5 — provenance of the CALL currently running on a pooled worker.
+///
+/// Workers are reused between callers, so this is rewritten PER CALL exactly
+/// like `user_id` / `is_system_call` in `take_idle_instance`. A stale value
+/// would report the previous caller's origin, which is the same class of bug
+/// the identity rewrite exists to prevent.
+///
+/// It answers "what made core re-enter itself through this addon". A tool a
+/// user invoked is `Addon`; the SAME tool fired by the Admin Scheduler is
+/// `Scheduler`, because nobody typed anything — a job did. `actor` names the
+/// core component behind a non-addon origin (the scheduler job); `None` leaves
+/// the addon instance itself as the actor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddonCallProvenance {
+    pub origin: crate::flow_engine::dispatcher::FlowOrigin,
+    pub actor: Option<crate::flow_engine::dispatcher::FlowActor>,
+}
+
+impl AddonCallProvenance {
+    /// An addon acting on its own behalf — the shape of every ordinary tool
+    /// call and of a worker that has not been lent out yet.
+    pub fn addon() -> Self {
+        Self {
+            origin: crate::flow_engine::dispatcher::FlowOrigin::Addon,
+            actor: None,
+        }
+    }
+
+    /// An Admin Scheduler tick firing an addon tool. The actor is the JOB, not
+    /// the addon: `scheduled_jobs.id` is what an operator can look up, and the
+    /// addon is already named by `addon_id`.
+    pub fn scheduler(job_id: impl Into<String>) -> Self {
+        Self {
+            origin: crate::flow_engine::dispatcher::FlowOrigin::Scheduler,
+            actor: Some(crate::flow_engine::dispatcher::FlowActor::system_component(
+                job_id,
+            )),
+        }
+    }
+
+    /// The actor host functions stamp: the named component when there is one,
+    /// otherwise the addon instance itself.
+    pub fn actor_for(&self, addon_id: &str) -> crate::flow_engine::dispatcher::FlowActor {
+        self.actor
+            .clone()
+            .unwrap_or_else(|| crate::flow_engine::dispatcher::FlowActor::addon(addon_id))
+    }
+}
+
 /// Stan addonu przechowywany w WASM Store — dostepny z host functions
 pub struct AddonState {
     pub addon_id: String,
@@ -495,6 +544,10 @@ pub struct AddonState {
     pub fuel_consumed: u64,
     /// CR-006: Flaga systemowego wywolania — omija sprawdzanie user_id w check_permission
     pub is_system_call: bool,
+    /// §2.5 — see [`AddonCallProvenance`]. Rewritten per call alongside
+    /// `user_id` / `is_system_call`; host functions that re-enter core (llm,
+    /// stt, ingest, document parse) stamp the work they start with it.
+    pub call_provenance: AddonCallProvenance,
     /// K2: In-memory rate limiter — unika zapytan COUNT(*) na audit_log
     pub rate_limiter: Option<Arc<rate_limiter::AddonRateLimiter>>,
     /// Menedzer polaczen sieciowych TCP/UDP (proxy dla addonow)
@@ -1434,6 +1487,7 @@ impl AddonManager {
     /// (`acquire_instance`). `on_start` to inicjalizacja PER-INSTANCJA, więc
     /// każdy worker przechodzi ją niezależnie — zamierzone (instancje są
     /// wymienne, stan trwały idzie przez scope-keyed storage, nie pamięć WASM).
+    #[allow(clippy::too_many_arguments)]
     fn build_ready_instance(
         &self,
         addon_id: &str,
@@ -1442,6 +1496,8 @@ impl AddonManager {
         module: &WasmModule,
         manifest: AddonManifest,
         permissions: Vec<String>,
+        // §2.5 — the provenance of the call this worker is being built FOR.
+        call_provenance: AddonCallProvenance,
     ) -> Result<AddonInstance> {
         let rt_id = manifest
             .runtime
@@ -1460,6 +1516,7 @@ impl AddonManager {
             permission_checker: self.permission_checker.clone(),
             fuel_consumed: 0,
             is_system_call,
+            call_provenance,
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),
@@ -1556,9 +1613,10 @@ impl AddonManager {
         addon_id: &str,
         user_id: Option<String>,
         system: bool,
+        call_provenance: AddonCallProvenance,
     ) -> Result<(AddonInstance, bool)> {
         // (1) wolny, nie-serwisowy worker z puli.
-        if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system) {
+        if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system, &call_provenance) {
             return Ok((inst, false));
         }
 
@@ -1584,6 +1642,7 @@ impl AddonManager {
                     &module,
                     manifest,
                     permissions,
+                    call_provenance,
                 ) {
                     Ok(inst) => Ok((inst, false)),
                     Err(e) => {
@@ -1599,15 +1658,23 @@ impl AddonManager {
         // (3) przy limicie — krótkie oczekiwanie aż ktoś zwróci worker.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system) {
+            if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system, &call_provenance)
+            {
                 return Ok((inst, false));
             }
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
 
         // (4) burst fallback — efemeryczny worker ponad limit (drop przy zwrocie).
-        let inst =
-            self.build_ready_instance(addon_id, user_id, org_id, &module, manifest, permissions)?;
+        let inst = self.build_ready_instance(
+            addon_id,
+            user_id,
+            org_id,
+            &module,
+            manifest,
+            permissions,
+            call_provenance,
+        )?;
         Ok((inst, true))
     }
 
@@ -1626,6 +1693,7 @@ impl AddonManager {
         addon_id: &str,
         user_id: &Option<String>,
         system: bool,
+        call_provenance: &AddonCallProvenance,
     ) -> Option<AddonInstance> {
         // Kolejność locków: ZAWSZE instances przed service_instance_ids (ta sama
         // co w stop_addon) — inaczej groziłoby zakleszczenie.
@@ -1639,6 +1707,9 @@ impl AddonManager {
         let state = inst.store.data_mut();
         state.user_id = user_id.clone();
         state.is_system_call = system;
+        // §2.5 — same reason as the two lines above: the worker last served a
+        // different caller, and a stale origin would credit this call to them.
+        state.call_provenance = call_provenance.clone();
         inst.user_id = user_id.clone();
         Some(inst)
     }
@@ -1731,6 +1802,9 @@ impl AddonManager {
             &module,
             manifest,
             permissions,
+            // A freshly started instance has not been lent to a caller yet;
+            // `take_idle_instance` rewrites this the moment it is.
+            AddonCallProvenance::addon(),
         )?;
         let instance_id = addon_instance.instance_id.clone();
 
@@ -2096,7 +2170,11 @@ impl AddonManager {
     ) -> Result<bool> {
         // Wypożycz worker z puli (rośnie do limitu, bez 3s busy-loopa). Instancja
         // serwisowa jest pomijana, więc panel nie kłóci się z on_tick.
-        let (mut addon_instance, ephemeral) = self.acquire_instance(addon_id, user_id, false)?;
+        // A panel render is the dashboard driving the addon's UI, not the addon
+        // starting work of its own — but nothing here re-enters core through a
+        // model host-fn, so the ordinary addon stamp is the accurate one.
+        let (mut addon_instance, ephemeral) =
+            self.acquire_instance(addon_id, user_id, false, AddonCallProvenance::addon())?;
 
         // Cała praca WASM w domknięciu, żeby worker został ZWRÓCONY na każdej
         // ścieżce (błąd też) — inaczej pula by się kurczyła / licznik przeciekał.
@@ -2384,6 +2462,7 @@ impl AddonManager {
             params,
             CallIdentity::User(user_id),
             false,
+            AddonCallProvenance::addon(),
         )
     }
 
@@ -2406,6 +2485,7 @@ impl AddonManager {
             params,
             CallIdentity::User(user_id),
             true,
+            AddonCallProvenance::addon(),
         )
     }
 
@@ -2424,9 +2504,47 @@ impl AddonManager {
         tool_name: &str,
         params: serde_json::Value,
     ) -> Result<serde_json::Value> {
-        self.call_tool_inner(addon_id, tool_name, params, CallIdentity::System, true)
+        self.call_tool_inner(
+            addon_id,
+            tool_name,
+            params,
+            CallIdentity::System,
+            true,
+            AddonCallProvenance::addon(),
+        )
     }
 
+    /// Invokes a tool on behalf of an Admin Scheduler job.
+    ///
+    /// Identity handling is unchanged from `call_tool` / `call_tool_system`: a
+    /// job an admin created runs under that user and keeps per-user ACL, a core
+    /// auto-job (`user_id = None`) runs as a CR-006 system call. What this entry
+    /// point changes is the §2.5 stamp — everything the tool starts inside core
+    /// (llm / stt / ingest / document parse) is reported as `scheduler` with the
+    /// JOB as the actor, instead of an addon acting on its own initiative.
+    pub fn call_tool_scheduled(
+        &self,
+        addon_id: &str,
+        tool_name: &str,
+        params: serde_json::Value,
+        user_id: Option<&str>,
+        job_id: &str,
+    ) -> Result<serde_json::Value> {
+        let (identity, skip_permission_check) = match user_id {
+            Some(uid) => (CallIdentity::User(uid), false),
+            None => (CallIdentity::System, true),
+        };
+        self.call_tool_inner(
+            addon_id,
+            tool_name,
+            params,
+            identity,
+            skip_permission_check,
+            AddonCallProvenance::scheduler(job_id),
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn call_tool_inner(
         &self,
         addon_id: &str,
@@ -2434,6 +2552,7 @@ impl AddonManager {
         params: serde_json::Value,
         identity: CallIdentity<'_>,
         skip_permission_check: bool,
+        call_provenance: AddonCallProvenance,
     ) -> Result<serde_json::Value> {
         // System calls carry no principal; user calls carry their user_id.
         let acquire_user = match identity {
@@ -2475,7 +2594,7 @@ impl AddonManager {
         // `system` ⇒ worker dostaje user_id=None + is_system_call=true na czas
         // tego wywołania (mirror dawnej semantyki boot/service instancji).
         let (mut addon_instance, ephemeral) =
-            self.acquire_instance(addon_id, acquire_user, system)?;
+            self.acquire_instance(addon_id, acquire_user, system, call_provenance)?;
 
         // Refuel przed wywolaniem — workery są reużywane, więc każde wywołanie
         // dostaje świeży budżet (refuel_store ustawia, nie dodaje).
@@ -2716,6 +2835,9 @@ impl AddonManager {
             permission_checker: self.permission_checker.clone(),
             fuel_consumed: 0,
             is_system_call: user_id.is_none(),
+            // A flow `addon.*` block runs the addon on the flow's behalf; the
+            // flow's own §2.5 stamp travels with the flow, not through here.
+            call_provenance: AddonCallProvenance::addon(),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(
                 host_functions::network::NetworkConnectionManager::new(),
@@ -3506,5 +3628,34 @@ mod tests {
         assert!(req.http_requests_per_minute.is_none());
         assert!(req.memory_mb.is_none());
         assert!(req.fuel_limit.is_none());
+    }
+
+    /// Task C — a scheduled tool call must NOT report as an addon acting on its
+    /// own. `AddonCallProvenance` is what the llm / stt / ingest / doc-parse
+    /// host functions stamp with, so this is the switch that decides whether a
+    /// scheduled LLM call shows up under `scheduler` or under `addon`.
+    ///
+    /// `actor_for` is the interesting part: the scheduler names the JOB, and the
+    /// addon variant falls back to the addon instance. Getting this backwards
+    /// would attribute every scheduled run to whichever addon the job happens to
+    /// call.
+    #[test]
+    fn scheduled_calls_report_the_job_not_the_addon() {
+        use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin};
+
+        let scheduled = AddonCallProvenance::scheduler("job-42");
+        assert_eq!(scheduled.origin, FlowOrigin::Scheduler);
+        let actor = scheduled.actor_for("notes-inst-1");
+        // No user behind a schedule, and the JOB is what an operator looks up.
+        assert_eq!(actor.kind(), ActorKind::System);
+        assert_eq!(actor.id(), Some("job-42"));
+        assert_eq!(actor.user_id(), None);
+
+        let ordinary = AddonCallProvenance::addon();
+        assert_eq!(ordinary.origin, FlowOrigin::Addon);
+        let actor = ordinary.actor_for("notes-inst-1");
+        assert_eq!(actor.kind(), ActorKind::Addon);
+        assert_eq!(actor.id(), Some("notes-inst-1"));
+        assert_eq!(actor.user_id(), None);
     }
 }

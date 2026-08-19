@@ -135,6 +135,8 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
             flow_depth: ctx.subflow_depth,
+            // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+            provenance: ctx.provenance(),
         };
 
         let response = ctx

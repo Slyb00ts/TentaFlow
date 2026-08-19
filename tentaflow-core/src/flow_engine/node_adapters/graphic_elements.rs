@@ -88,7 +88,7 @@ impl NodeAdapter for GraphicElementsNodeAdapter {
 
         let result = ctx
             .documents
-            .infer(&model, &image, &mime, TASK)
+            .infer(&model, &image, &mime, TASK, ctx.provenance())
             .await
             .map_err(|e| anyhow!("{NODE_TYPE}: detektor zawiódł: {e}"))?;
 

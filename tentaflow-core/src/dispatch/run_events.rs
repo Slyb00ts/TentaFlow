@@ -343,6 +343,11 @@ mod tests {
                 user_id: owner,
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .unwrap();

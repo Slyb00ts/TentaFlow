@@ -336,7 +336,6 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
     };
 
     let router = ctx.state.router.clone();
-    let correlation_id = ctx.correlation_id;
     let progress_broker = ctx.state.progress_broker.clone();
     // Authenticated principal of this foreground flow. Bound to the session
     // scope below so run-events ACL (§3.3) can reject a foreign subscriber — the
@@ -382,7 +381,7 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         };
 
         let blobs = fd.blobs();
-        let envelope =
+        let mut envelope =
             match flow_envelope_from_inputs(invoke.inputs, resolved_language, &blobs).await {
                 Ok(e) => e,
                 Err(e) => {
@@ -408,16 +407,30 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             Some(uid) => FlowActor::user(uid),
             None => FlowActor::system(),
         };
+        // §2.5 / §3 invariant 1 — the correlation key is MINTED HERE, after
+        // authorization, and is unique per run. `ctx.correlation_id` is the
+        // client-supplied per-connection frame id: two connections both at frame
+        // 7 would collide, and a client picks it, so it can never be the key the
+        // audit trail joins on.
+        let correlation_key = uuid::Uuid::new_v4().to_string();
         let mut meta = FlowRequestMeta::new(
-            format!("flowinvoke-{correlation_id}"),
+            format!("flowinvoke-{correlation_key}"),
             FlowOrigin::Chat,
             actor,
         );
         meta.session_id = invoke.session_id.clone();
         meta.user_id = actor_id.clone();
-        // Joinable with `request_id` — both are built from the transport's
-        // correlation id, so the audit trail and the run share one key.
-        meta.correlation_id = Some(format!("flowinvoke-{correlation_id}"));
+        // Joinable with `request_id` — both are built from the minted key, so
+        // the audit trail and the run share it.
+        meta.correlation_id = Some(correlation_key.clone());
+        // Same value on the envelope, the way `routing/chat.rs` seeds it: the
+        // per-call `llm` audit rows and the agent/vision nodes read it from meta.
+        // The struct field above stays the authority — a node that rewrites meta
+        // cannot move the run's audit link.
+        envelope.meta.insert(
+            "correlation_id".into(),
+            serde_json::Value::String(correlation_key),
+        );
         meta.cancel_token = cancel.clone();
 
         // Bind the session scope to this principal so run-events ACL (§3.3) can
@@ -1943,7 +1956,6 @@ fn project_studio_chat_stream_handler(
     let model = project_chat_model(&project_id);
     let router = ctx.state.router.clone();
     let db = ctx.state.db.clone();
-    let correlation_id = ctx.correlation_id;
 
     tokio::spawn(async move {
         let Some(fd) = router.flow_dispatcher().cloned() else {
@@ -2001,12 +2013,20 @@ fn project_studio_chat_stream_handler(
         let cancel = CancellationToken::new();
         // §2.5 — project chat. Membership was verified before this point, so
         // `caller_id` is an authorized user, not a claim from the request.
+        // §3 invariant 1 — minted after the membership check, unique per run.
+        // `ctx.correlation_id` is the client's per-connection frame id and
+        // collides across connections, so it cannot be the audit join key.
+        let correlation_key = uuid::Uuid::new_v4().to_string();
+        envelope.meta.insert(
+            "correlation_id".into(),
+            serde_json::Value::String(correlation_key.clone()),
+        );
         let mut meta = FlowRequestMeta::new(
-            format!("ps-chat-{correlation_id}"),
+            format!("ps-chat-{correlation_key}"),
             FlowOrigin::Project,
             FlowActor::user(caller_id.clone()),
         );
-        meta.correlation_id = Some(format!("ps-chat-{correlation_id}"));
+        meta.correlation_id = Some(correlation_key);
         meta.session_id = Some(chat.session_id.clone());
         meta.user_id = Some(caller_id.clone());
         meta.user_role = user_role;
@@ -2849,7 +2869,6 @@ fn project_studio_code_assist_stream_handler(
     let caller_id = org.user_id.clone();
     let org_id = org.org_id.clone();
     let router = ctx.state.router.clone();
-    let correlation_id = ctx.correlation_id;
 
     tokio::spawn(async move {
         let Some(fd) = router.flow_dispatcher().cloned() else {
@@ -2870,12 +2889,19 @@ fn project_studio_code_assist_stream_handler(
 
         let cancel = CancellationToken::new();
         // §2.5 — Code Studio assist.
+        // §3 invariant 1 — minted after authorization, unique per run (see the
+        // dashboard chat entry point for why the frame id cannot serve here).
+        let correlation_key = uuid::Uuid::new_v4().to_string();
+        envelope.meta.insert(
+            "correlation_id".into(),
+            serde_json::Value::String(correlation_key.clone()),
+        );
         let mut meta = FlowRequestMeta::new(
-            format!("ps-assist-{correlation_id}"),
+            format!("ps-assist-{correlation_key}"),
             FlowOrigin::CodeStudio,
             FlowActor::user(caller_id.clone()),
         );
-        meta.correlation_id = Some(format!("ps-assist-{correlation_id}"));
+        meta.correlation_id = Some(correlation_key);
         meta.user_id = Some(caller_id);
         meta.user_role = user_role;
         meta.org_id = Some(org_id);

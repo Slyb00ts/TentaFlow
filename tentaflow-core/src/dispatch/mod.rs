@@ -3125,6 +3125,11 @@ mod tests {
                     user_id: Some(uid),
                     org_id: None,
                     prompt: "do it",
+                    origin: "system",
+                    actor_kind: "system",
+                    actor_id: None,
+                    actor_user_id: None,
+                    correlation_id: None,
                 },
             )
             .unwrap();
@@ -3200,6 +3205,11 @@ mod tests {
                 user_id: Some(&owner),
                 org_id: None,
                 prompt: "secret",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .unwrap();
@@ -3257,6 +3267,11 @@ mod tests {
                 user_id: Some(&owner),
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .unwrap();

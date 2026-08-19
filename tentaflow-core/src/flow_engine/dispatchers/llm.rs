@@ -11,6 +11,7 @@ use futures::stream::BoxStream;
 use std::time::Instant;
 use tokio_util::sync::CancellationToken;
 
+use crate::flow_engine::dispatcher::CallProvenance;
 use crate::flow_engine::envelope::{ChatMessage, LlmStreamChunk, LlmToolCall, TokenUsage};
 
 /// Tool advertised to the model — backend-agnostic shape mapped per
@@ -71,11 +72,21 @@ pub struct LlmRequest {
     /// event's `request_id`). The gateway-aware dispatcher copies it onto the
     /// per-call `compliance_ai_events` row so all rows of one user turn link.
     pub correlation_id: Option<String>,
+    /// §2.5 — server-minted provenance of the flow this call belongs to, copied
+    /// from the node's `ExecutionContext`. Threaded for the same reason as
+    /// `flow_depth`: the runtime context the dispatcher builds re-enters the
+    /// executor, and an alias resolving onto a flow surface starts THAT flow
+    /// with this stamp. Not derived from request content.
+    pub provenance: CallProvenance,
 }
 
 impl LlmRequest {
-    pub fn new(model: impl Into<String>) -> Self {
+    /// `provenance` is a mandatory argument, not a defaulted field: a request
+    /// built without saying where it came from would reach the event log as
+    /// internal `system` work.
+    pub fn new(model: impl Into<String>, provenance: CallProvenance) -> Self {
         Self {
+            provenance,
             audio_out: None,
             reasoning_effort: None,
             model: model.into(),

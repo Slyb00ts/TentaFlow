@@ -181,6 +181,8 @@ CREATE TABLE run_events (
   actor_kind       TEXT    NOT NULL,   -- user | api_key | addon | system
   actor_id         TEXT,               -- user_id / nazwa klucza / addon_id
   actor_user_id    TEXT,               -- user stojący za kluczem API; NULL = klucz serwisowy
+  org_id           TEXT,               -- organizacja przebiegu; NULL = przebieg bez najemcy
+                                       -- (kamera, harmonogram, konserwacja)
   correlation_id   TEXT,
   session_id       TEXT,
   node_id          TEXT,
@@ -193,6 +195,7 @@ CREATE INDEX ix_run_events_time    ON run_events(at_ms);
 CREATE INDEX ix_run_events_origin  ON run_events(origin, at_ms);
 CREATE INDEX ix_run_events_actor   ON run_events(actor_id, at_ms);
 CREATE INDEX ix_run_events_corr    ON run_events(correlation_id);
+CREATE INDEX ix_run_events_org     ON run_events(org_id, at_ms);
 CREATE UNIQUE INDEX ux_run_events_idem ON run_events(run_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 ```
@@ -288,6 +291,13 @@ statystyki na stałe (to konkretna lekcja z DeepSeeka).
 ### 2.9 Retencja, objętość, sync
 
 - **Retencja musi przyjść RAZEM z tabelą**, nie później. Domyślnie 14 dni, konfigurowalnie.
+- **Każdy wiersz kasowany na terminie SWOJEJ organizacji** — dlatego `run_events` ma `org_id`.
+  Termin rozstrzyga się per organizacja (`compliance_retention_policies`, zakres `events`), a
+  polityka jednego najemcy nie może rządzić danymi drugiego; bez przypisania wiersza do najemcy w
+  chwili czyszczenia jedynym bezpiecznym odczytem byłby najkrótszy termin na węźle, czyli kasowanie
+  cudzych danych przed czasem. Wiersze, których żadna organizacja na węźle nie obejmuje (`org_id
+  IS NULL` albo organizacja bez polityki), idą właśnie na najkrótszym obecnym terminie: zgadywanie
+  właściciela byłoby fabrykacją (inwariant 6), a brak reguły — nieśmiertelnym ogonem.
 - **`run_events` NIE wchodzi do Sync Ledger** (jak `flow_executions` i `audit_log`). Inaczej każdy
   węzeł replikuje oś czasu każdego innego.
 - Przy dużej objętości: rotacja miesięczna jako plan B.

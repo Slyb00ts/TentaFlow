@@ -164,6 +164,23 @@ const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA)];
 /// `RESTRICT` would let one stuck row block the whole sweep. §2.8: the
 /// asymmetry is the point — the audit trail may not lose an entry, the
 /// timeline may lose its tail.
+///
+/// `org_id` is NULLABLE by decision. Retention terms are resolved per
+/// organisation, so a row that cannot name its tenant cannot be purged on that
+/// tenant's term — but a run genuinely started by no tenant exists: camera
+/// ingest, the scheduler and internal maintenance carry `FlowRequestMeta.org_id
+/// = None`. `NOT NULL` would force those rows to name an organisation they do
+/// not belong to, and the only value available would be the default tenant —
+/// exactly the fabrication invariant 6 forbids. NULL therefore means "no
+/// organisation was minted for this run", and `retention.rs` gives that state
+/// its own explicit rule instead of guessing an owner.
+///
+/// ONE composite index `(org_id, at_ms)` covers both readers of the column: the
+/// sweep deletes a range per tenant (`org_id = ? AND at_ms < ?`) and the
+/// browser lists a tenant's timeline newest-first. A bare `org_id` index would
+/// leave the sweep scanning a whole tenant, and a second index on top of the
+/// composite would only duplicate its leading column. Rows with a NULL tenant
+/// are indexed too, so the unattributed sweep uses the same index.
 const INITIAL_SCHEMA: &str = "
 CREATE TABLE run_events (
   run_id           TEXT    NOT NULL,
@@ -174,6 +191,7 @@ CREATE TABLE run_events (
   actor_kind       TEXT    NOT NULL,
   actor_id         TEXT,
   actor_user_id    TEXT,
+  org_id           TEXT,
   correlation_id   TEXT,
   session_id       TEXT,
   node_id          TEXT,
@@ -186,6 +204,7 @@ CREATE INDEX ix_run_events_time    ON run_events(at_ms);
 CREATE INDEX ix_run_events_origin  ON run_events(origin, at_ms);
 CREATE INDEX ix_run_events_actor   ON run_events(actor_id, at_ms);
 CREATE INDEX ix_run_events_corr    ON run_events(correlation_id);
+CREATE INDEX ix_run_events_org     ON run_events(org_id, at_ms);
 CREATE UNIQUE INDEX ux_run_events_idem ON run_events(run_id, idempotency_key)
   WHERE idempotency_key IS NOT NULL;
 
@@ -238,6 +257,9 @@ mod tests {
             ("actor_kind", "TEXT", true),
             ("actor_id", "TEXT", false),
             ("actor_user_id", "TEXT", false),
+            // NULLABLE on purpose: a system-triggered run has no tenant, and
+            // naming one anyway would be an invented owner (invariant 6).
+            ("org_id", "TEXT", false),
             ("correlation_id", "TEXT", false),
             ("session_id", "TEXT", false),
             ("node_id", "TEXT", false),
@@ -295,10 +317,25 @@ mod tests {
             "ix_run_events_origin",
             "ix_run_events_actor",
             "ix_run_events_corr",
+            "ix_run_events_org",
             "ux_run_events_idem",
         ] {
             assert!(names.contains(expected), "missing index {expected}: {names:?}");
         }
+
+        let org_sql = indexes
+            .iter()
+            .find(|(name, _)| name == "ix_run_events_org")
+            .and_then(|(_, sql)| sql.clone())
+            .expect("ix_run_events_org has no SQL");
+        assert!(
+            org_sql
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .contains("(org_id, at_ms)"),
+            "the tenant index is not the composite the sweep needs: {org_sql}"
+        );
 
         let idem_sql = indexes
             .iter()

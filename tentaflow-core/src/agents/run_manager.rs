@@ -446,6 +446,9 @@ impl AgentRunManager {
         }
 
         let run_id = run_id.to_string();
+        // §2.5 — the row records the principal's provenance VERBATIM, so a later
+        // continuation rebuilds it from the row instead of re-deriving one from
+        // `user_id` (which would turn an API key into a user).
         repository::create_agent_run(
             &self.db,
             &NewAgentRun {
@@ -456,6 +459,11 @@ impl AgentRunManager {
                 user_id: principal.user_id(),
                 org_id: principal.org_id.as_deref(),
                 prompt,
+                origin: principal.origin.as_str(),
+                actor_kind: principal.actor.kind().as_str(),
+                actor_id: principal.actor.id(),
+                actor_user_id: principal.actor.user_id(),
+                correlation_id: principal.correlation_id.as_deref(),
             },
         )?;
 
@@ -1605,8 +1613,19 @@ fn deliver_child_result(
     // a fresh task — `spawn` returns a run id immediately, and detaching it here
     // keeps `run_task`'s own future non-recursive (and `Send`): a child's
     // finalization does not block on starting the parent's next run.
-    // §2.5 — the continuation inherits the finishing run's provenance verbatim.
-    let principal = AgentPrincipal::new(parent_run.user_id.clone(), parent_run.org_id.clone());
+    // §2.5 — the continuation inherits the parent run's provenance VERBATIM,
+    // read back off the row. Deriving it from `user_id` would report a run
+    // started by a service API key as one started by a user, and the derived
+    // stamp is the one the event log keeps.
+    let Some(principal) = AgentPrincipal::from_run_row(&parent_run) else {
+        tracing::warn!(
+            "auto-continuation: run '{parent_run_id}' has unreadable provenance \
+(origin={:?}, actor_kind={:?}) — refusing to start under a guessed principal",
+            parent_run.origin,
+            parent_run.actor_kind
+        );
+        return;
+    };
     let parent_tools: Vec<String> =
         serde_json::from_str(&parent_agent.tools_json).unwrap_or_default();
     let continuation_prompt = format!(
@@ -2344,6 +2363,11 @@ mod tests {
                 user_id: Some("u1"),
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create");
@@ -2367,6 +2391,11 @@ mod tests {
                 user_id: Some("u1"),
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create");

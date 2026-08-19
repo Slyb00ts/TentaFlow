@@ -9027,6 +9027,11 @@ mod agents_repository_tests {
                 user_id: Some("user-1"),
                 org_id: Some("org-default"),
                 prompt: "find the answer",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create run");
@@ -9132,6 +9137,11 @@ mod agents_repository_tests {
                 user_id: None,
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create");
@@ -9168,6 +9178,11 @@ mod agents_repository_tests {
                 user_id: Some("user-1"),
                 org_id: None,
                 prompt: "parent",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("parent");
@@ -9183,6 +9198,11 @@ mod agents_repository_tests {
                     user_id: Some("user-2"),
                     org_id: None,
                     prompt: label,
+                    origin: "system",
+                    actor_kind: "system",
+                    actor_id: None,
+                    actor_user_id: None,
+                    correlation_id: None,
                 },
             )
             .expect("child");
@@ -9227,6 +9247,11 @@ mod agents_repository_tests {
                 user_id: None,
                 org_id: None,
                 prompt: "p",
+                origin: "system",
+                actor_kind: "system",
+                actor_id: None,
+                actor_user_id: None,
+                correlation_id: None,
             },
         )
         .expect("create run");

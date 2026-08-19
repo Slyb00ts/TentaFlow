@@ -352,6 +352,10 @@ async fn execute_job(
 
     let task = {
         let actor_user_id = actor_user_id.clone();
+        // §2.5 — the job id is the ACTOR of everything this tick starts, and it
+        // is a server value (`scheduled_jobs.id`), never anything the addon or a
+        // model can influence.
+        let job_id = job.id.clone();
         tokio::task::spawn_blocking(move || {
             if actor_user_id.is_empty() {
                 bail!("scheduler run requires an actor user id");
@@ -390,11 +394,20 @@ async fn execute_job(
             // Joby systemowe (auto-harmonogram core, np. ingest_drain) nie maja realnego
             // principala — wolamy jako System (omija per-user ACL, jak inne core-internal
             // wywolania toolow). Joby uzytkownika (created_by=admin) ida normalna sciezka ACL.
-            if actor_user_id == "system" {
-                addon_manager.call_tool_system(&addon_id, &action_id, params)
-            } else {
-                addon_manager.call_tool(&addon_id, &action_id, params, &actor_user_id)
-            }
+            //
+            // §2.5 — both branches go through `call_tool_scheduled`, so whatever
+            // the tool starts inside core (llm / stt / ingest / document parse)
+            // is reported as `scheduler` with THIS job as the actor. Calling
+            // `call_tool` / `call_tool_system` here would stamp `addon`, which
+            // says an addon decided to act — nobody did; a schedule fired.
+            let scheduled_user = (actor_user_id != "system").then_some(actor_user_id.as_str());
+            addon_manager.call_tool_scheduled(
+                &addon_id,
+                &action_id,
+                params,
+                scheduled_user,
+                &job_id,
+            )
         })
     };
     let result = tokio::time::timeout(Duration::from_secs(timeout_seconds), task).await;

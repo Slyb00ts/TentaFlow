@@ -570,8 +570,15 @@ pub struct DbAgentRun {
     /// continuation or a reactive flow can rebuild the principal VERBATIM
     /// instead of deriving one from `user_id` (which turns an API key into a
     /// user). Wire spellings from `FlowOrigin::as_str` / `ActorKind::as_str`.
-    pub origin: String,
-    pub actor_kind: String,
+    ///
+    /// `Option` because migration v131 adds the columns NULLABLE and does NOT
+    /// backfill: a row written before the stamp existed says "unknown", and
+    /// reading that as a `String` would either fail the whole row or invent a
+    /// value. Every row written since carries both (`NewAgentRun` takes `&str`),
+    /// so `None` marks exactly the pre-migration population — and
+    /// `AgentPrincipal::from_run_row` refuses it rather than guessing.
+    pub origin: Option<String>,
+    pub actor_kind: Option<String>,
     /// user_id / API key uid / addon instance id / system component id.
     pub actor_id: Option<String>,
     /// The user behind an API key; NULL marks a service key with no binding.

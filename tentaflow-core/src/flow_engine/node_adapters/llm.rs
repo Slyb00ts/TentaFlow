@@ -453,6 +453,8 @@ impl LlmNodeAdapter {
         let messages = Self::build_messages(node, envelope);
         let (tools, tool_choice) = Self::pick_tools(envelope);
         Ok(LlmRequest {
+            // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+            provenance: ctx.provenance(),
             model,
             messages,
             temperature: Self::pick_optional_f32(node, envelope, "temperature"),
@@ -786,6 +788,8 @@ impl LlmAdapter for LlmNodeAdapter {
         Self::build_llm_request(node, envelope, ctx).unwrap_or_else(|_| {
             let (tools, tool_choice) = Self::pick_tools(envelope);
             LlmRequest {
+                // §2.5 — the run's stamp, from `ctx`, never from `envelope.meta`.
+                provenance: ctx.provenance(),
                 audio_out: None,
                 model: String::new(),
                 messages: Self::build_messages(node, envelope),

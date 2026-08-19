@@ -87,7 +87,7 @@ impl NodeAdapter for PageDetectPagesNodeAdapter {
             }
             let result = ctx
                 .documents
-                .infer(&model, &image, &page.blob_ref.mime, TASK)
+                .infer(&model, &image, &page.blob_ref.mime, TASK, ctx.provenance())
                 .await
                 .map_err(|e| {
                     anyhow!(

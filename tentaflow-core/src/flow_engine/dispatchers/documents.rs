@@ -11,17 +11,24 @@ use async_trait::async_trait;
 
 use tentaflow_protocol::DocumentInferResult;
 
+use crate::flow_engine::dispatcher::CallProvenance;
+
 #[async_trait]
 pub trait DocumentsDispatcher: Send + Sync {
     /// Detekcja struktury strony dokumentu. `task` ∈ {"page_elements",
     /// "table_structure", "graphic_elements", "ocr"}. Błąd jako `String`, bo
     /// node-adaptery składają go w `FlowError` po swojej stronie.
+    ///
+    /// `provenance` is the calling flow's §2.5 stamp (`ctx.provenance()`). The
+    /// impl builds its runtime context from it, so an alias resolving onto a
+    /// flow surface keeps the entry point instead of resetting to `system`.
     async fn infer(
         &self,
         model: &str,
         image: &[u8],
         mime: &str,
         task: &str,
+        provenance: CallProvenance,
     ) -> Result<DocumentInferResult, String>;
 
     /// Parsuje stronę dokumentu (obraz) na markdown ze strukturą (tabele GFM/
@@ -29,5 +36,12 @@ pub trait DocumentsDispatcher: Send + Sync {
     /// (`execute_documents`). Backend dobiera resolver wg urządzenia z failoverem
     /// aliasu: embedded (PaddleOCR-VL MLX na Apple), HTTP (docker nemotron-parse/
     /// paddle-ocr), QUIC, mesh-forward. Zwraca markdown.
-    async fn parse(&self, model: &str, image: &[u8], mime: &str) -> Result<String, String>;
+    /// `provenance` carries the calling flow's §2.5 stamp, like `infer`.
+    async fn parse(
+        &self,
+        model: &str,
+        image: &[u8],
+        mime: &str,
+        provenance: CallProvenance,
+    ) -> Result<String, String>;
 }

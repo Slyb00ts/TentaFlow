@@ -846,6 +846,7 @@ mod tests {
             permission_checker,
             fuel_consumed: 0,
             is_system_call,
+            call_provenance: crate::addon::AddonCallProvenance::addon(),
             rate_limiter: None,
             net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
             settings_cipher,
