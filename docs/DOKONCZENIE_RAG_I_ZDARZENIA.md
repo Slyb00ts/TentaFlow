@@ -33,69 +33,113 @@ zakładano: reużywamy CIAŁO pętli, a nie zewnętrzny flow `query`.
 
 ---
 
-## 1. RAG — co zostało
+## 1. RAG — co zostało (W ZAKRESIE, nie odłożone)
 
-Trzy pozycje. Każda była **świadomie odłożona**, nie zapomniana, i każda ma zapisany warunek, który
-musiałby się zmienić.
+Trzy pozycje. **Decyzja właściciela: wszystkie trzy wchodzą.** Projekty mają dostać graf wiedzy i
+trwałą kolejkę, a graf ma być dostępny **przez bloczki flow**, a nie zaszyty w addonie.
 
-### 1.1 Wspólna trwała kolejka ingestu
+Kolejność jest wymuszona zależnościami: 1.1 i 1.3 są tanie i niezależne, 1.2 dzieli się na część
+tanią (G1) i duży projekt (G2).
 
-**Stan:** addon ma durable `ingest_jobs` w swoim SQLite, drenowane przez Scheduler
-(`ingest_drain`). Projekty mają zadania w procesie (`start_job` → `tokio::spawn`), ginące przy
-restarcie. Wspólne są już: limit współbieżności i rejestr anulowania.
+### 1.1 Trwała kolejka ingestu — wspólna usługa core
 
-**Dlaczego odłożone:** to nie jest jedna zduplikowana mechanika, tylko **dwa różne modele
-trwałości**. Sprowadzenie do jednego wymaga migracji danych addona i zmiany jego modelu
-synchronizacji.
+**Stan:** addon ma `ingest_jobs` w swoim SQLite, drenowane przez Scheduler. Projekty mają zadania w
+procesie (`start_job` → `tokio::spawn`), ginące przy restarcie. Wspólne są już limit współbieżności
+(`services/ingest_gate.rs`) i rejestr anulowania (`services/cancel_registry.rs`).
 
-**Co trzeba zrobić, gdyby wchodziło:**
-1. Usługa core: kolejka + postęp + cancel + limit, z trwałością w **osobnym pliku** (patrz §2.2 —
-   ten sam argument o pojedynczym pisarzu głównej bazy).
-2. `ingest_drain` addona staje się cienkim wywołaniem host-fn zamiast własnego SQL.
-3. Migracja `ingest_jobs` z bazy instancji: albo przeniesienie wierszy, albo odczekanie na
-   opróżnienie kolejki i skasowanie tabeli. **Bundle hash addona się zmieni** — przebudowany addon
-   zostaje wyłączony do zatwierdzenia nowego hasha.
+**Do zrobienia:**
+1. **Osobny plik `<data>/jobs.db`** — ten sam argument co przy `events.db` (§2.2): główna baza ma
+   jedno połączenie pisarza. **Osobny od `events.db`**, bo log zdarzeń ma retencję i rotację, a
+   kolejka nie — wspólny plik znaczyłby, że rotacja zabiera zadania.
+2. Usługa `services/ingest_jobs.rs`: `enqueue`, `claim` (atomowe `UPDATE … RETURNING`, wzorzec z
+   `project_studio` pool-claim), `heartbeat`, `finish`, `reconcile_orphans` przy starcie.
+3. **Projekty**: `start_job` zapisuje zadanie i wraca; osobny worker drenuje. Zadanie przeżywa restart.
+4. **Addon**: `ingest_drain` staje się cienkim wywołaniem host-fn do tej usługi zamiast własnego SQL.
+5. **Migracja `ingest_jobs` addona**: przenieś wiersze `queued`/`running` do `jobs.db`, potem skasuj
+   tabelę w migracji addona. **Bundle hash się zmieni** — przebudowany addon zostaje wyłączony do
+   zatwierdzenia nowego hasha; to normalny tryb, nie awaria.
 
-**Warunek wejścia:** ktoś zgłasza, że zadanie ingestu ginie przy restarcie w Projektach. Dopóki nie
-ginie w praktyce, koszt migracji przewyższa zysk.
+**Odbiór:** zadanie ingestu w Projektach przeżywa restart procesu i jest dokańczane; addon i Projekty
+przechodzą przez tę samą kolejkę; osierocone zadanie po zabiciu procesu jest zamykane przy starcie.
 
-### 1.2 Warstwa grafowa dla Projektów
+### 1.2 MemGraphRAG dla Projektów — graf przez bloczki flow
 
-**Stan:** Projekty nie mają grafu. Ekstrakcja (`extract_chunk_graph`, konflikty A_det/A_res,
-entity merge) żyje **w wasm addona**, nie w nodach flow — flow ingestu nie ma żadnego węzła
-grafowego, graf powstaje w kodzie addona PO flow, czytając teksty chunków z `passages`.
+**Stan:** ekstrakcja (`extract_chunk_graph`) żyje w **wasm addona** i jest wołana PO flow, czytając
+teksty chunków z powrotem z `passages`. Flow ingestu nie ma ŻADNEGO węzła grafowego. Strona
+retrievalowa jest już w core (`rag_graphrag.rs`, `graph_search.rs`) i wpięta w `retrieval-round`.
 
-**Strona retrievalowa JEST w core** (`rag_graphrag.rs`, `graph_search.rs`) i `retrieval-round` ma ją
-wpiętą — dla scope projektowego degraduje się do pass-through, bo nie ma kolekcji `kg_active`.
-`ps-chat` ustawia `graph_enabled=false` jawnie, żeby oszczędzić tej pracy.
+Stan SQL, na którym stoi MemGraphRAG (12 tabel w migracjach addona): `graph_artifacts`,
+`graph_outbox`, `schema_registry`, `fact_schema`, `fact_evidence`, `fact_state`, `conflicts`,
+`conflict_members`, `conflict_scan_cursor`, `entity_aliases`, `entity_merge_log`,
+`entity_merge_scan_cursor`, `relation_cardinality`.
 
-**Dlaczego odłożone:** przeniesienie MemGraphRAG do core to projekt wagi całego RAG_ETAP3, a graf
-**nie jest zduplikowany** — Projekty go po prostu nie mają. To luka, nie dług.
+#### G1 — graf w Projektach i ekstrakcja jako węzeł flow **(rób najpierw)**
 
-**Znane duplikacje w tej warstwie** (do posprzątania niezależnie): `normalize_entity_name` istnieje
-w `addons/rag/src/lib.rs` i lustrzanie w `node_adapters/rag_graphrag.rs`; stała `kg_active`
-powtórzona w trzech miejscach z komentarzem „MUSI byc identyczna".
+To daje 80% wartości przy ułamku kosztu, bo **infrastruktura już jest**: `GraphManager` kluczuje po
+`(org, addon_id, collection)` dokładnie tak jak `NamespaceManager`, a Projekty już używają
+`ps-<project_id>` jako pseudo-addon-id.
 
-### 1.3 Zewnętrzna powłoka retrievalu
+1. **`GraphManager` dostaje wariant z katalogiem** — dokładnie ten sam zabieg, który zrobiliśmy dla
+   wektorów w Etapie 0a/0b: kolekcja NIEISTNIEJĄCA powstaje w katalogu wskazanym przez wołającego
+   (`<project>/graph/`), a dla istniejącej wygrywa zapisana ścieżka. Przeciągnij `graph_home` przez
+   `ExecutionContext` i `FlowRequestMeta` **jako osobne pole, nigdy przez `meta`** — ta sama zasada
+   co przy `vector_home`.
+2. **Nowy węzeł `graph_extract`** (`flow_engine/node_adapters/graph_extract.rs`): wejście = chunki,
+   wywołuje `rag-llm` promptem ekstrakcji, upsertuje węzły i krawędzie do kolekcji `kg_active` w
+   scope z `ctx.addon_id`. Zapisuje provenance (`chunk_id`, wersja ekstraktora) — bez tego kasowanie
+   dokumentu nie umie cofnąć jego wkładu do grafu.
+3. **Wpięcie w platformowy flow ingestu**, za `chunk`, sterowane `graph_enabled` w meta. Domyślnie
+   **wyłączone** — ekstrakcja to dodatkowe wywołania LLM na każdy chunk i musi być świadomym wyborem.
+4. **`ps-chat` przestaje wysyłać `graph_enabled=false`** i zaczyna korzystać z grafu, gdy projekt go ma.
+5. **Kasowanie dokumentu kasuje jego wkład do grafu** — po `graph_artifacts` scope'owanym tak samo.
 
-**Stan:** ciało (`retrieval-round`) jest wspólne. Powłoki są dwie: platformowy flow `query` (używa
-go addon) i `ps-chat` (Projekty).
+**Odbiór G1:** projekt z włączonym grafem po ingeście ma niepuste `kg_active` w SWOIM katalogu;
+`retrieval-round` zwraca fakty grafowe; usunięcie źródła usuwa jego węzły i krawędzie; wyłączony graf
+nie robi ANI JEDNEGO dodatkowego wywołania LLM.
 
-**Czego brakuje do pełnej jedności** — trzy konkretne różnice w `query`:
-1. węzeł `output` ma `emit_citations`, **nie streamuje**; `ps-chat` jest streamingowy,
-2. węzeł `answer` ma **zaszyte `model: rag-llm`**; `ps-chat` bierze model z `envelope.meta`,
-3. `query` jest wołany jako model po nazwie, `ps-chat` po stałym `flow_id`.
+#### G2 — warstwa utrzymania grafu jako usługa core **(duży projekt, osobno)**
+
+Ontologia Candidate→Stable, agenci konfliktów A_det/A_res, entity merge. To jest to, co czyni
+MemGraphRAG czymś więcej niż ekstraktorem trójek — i to jest praca wagi całego RAG_ETAP3.
+
+1. **Stan SQL przenosi się do core**, per scope, do własnego pliku obok danych scope'u
+   (`<scope>/graph.db`). Ta sama zasada co przy wektorach i zdarzeniach: stan runtime pojedynczego
+   węzła, pisany często, poza Sync Ledger.
+2. **Logika przenosi się z wasm do `services/graph_memory/`**: rejestr schematów z progiem τ,
+   skan konfliktów, rozstrzyganie przez `rag-llm`, entity merge z odwracalnością przez outbox.
+3. **Addon staje się klientem** — jego 12 tabel znika, host-fn wołają usługę. Migracja danych
+   istniejących instalacji: przenieś per instancja.
+4. **Sprzątnij duplikaty przy okazji**: `normalize_entity_name` istnieje dziś w addonie i lustrzanie
+   w `rag_graphrag.rs`; stała `kg_active` jest powtórzona w trzech miejscach z komentarzem „MUSI byc
+   identyczna".
+
+**Odbiór G2:** te same fakty wchodzące do Projektu i do kolekcji addona dają identyczny graf,
+identyczne konflikty i identyczne scalenia encji; cofnięcie merge'u działa po obu stronach.
+
+**Uczciwie o kolejności:** G2 nie jest warunkiem G1. Projekt z samym G1 ma działający graf wiedzy —
+bez ontologii i bez rozstrzygania konfliktów, czyli z faktami sprzecznymi obok siebie. To jest
+użyteczne i lepsze niż brak grafu, ale trzeba wiedzieć, czego się nie ma.
+
+### 1.3 Jedna powłoka retrievalu
+
+**Stan:** ciało (`retrieval-round`) wspólne. Powłoki dwie: platformowy `query` (addon) i `ps-chat`
+(Projekty). Różnice: `query` nie streamuje (`emit_citations`), ma zaszyte `model: rag-llm`, jest
+wołany po nazwie zamiast po stałym `flow_id`.
+
+**Do zrobienia:**
+1. Węzeł `output` w `query` obsługuje **oba tryby** — streaming i blok z cytatami — sterowane
+   `meta`, nie zaszyte w configu.
+2. Węzeł `answer` bierze model z `envelope.meta` z **fallbackiem** na `rag-llm`, zamiast go zaszywać.
+3. `ps-chat` przechodzi na `query` jako ciało, zachowując streaming i model projektu.
 
 **Ostrzeżenie z doświadczenia:** wcześniej zapisałem tu czwarty warunek — „reranker wywala flow przy
 niezwiązanym aliasie". **To była pomyłka.** `retrieval-round` karmi reranker trafieniami ze scorami,
 dla których istnieje degradacja do kolejności wektorowej. Błąd dotyczy wyłącznie generycznego
-kontraktu `{query, candidates}`, którego ten flow nie używa. Sprawdzaj kontrakt wejścia, nie
-komentarz w teście.
+kontraktu `{query, candidates}`, którego ten flow nie używa. **Sprawdzaj kontrakt wejścia, nie
+komentarz w teście.**
 
-**Warunek wejścia:** chęć, żeby addon i Projekty miały identyczną powłokę. Dziś różnią się
-uzasadnienie: jedna streamuje do przeglądarki, druga zwraca blok z cytatami.
-
----
+**Odbiór 1.3:** to samo pytanie zadane przez addon i przez czat projektu przechodzi tym samym flow;
+czat nadal streamuje i nadal używa modelu projektu.
 
 ## 2. Śledzenie zdarzeń — specyfikacja
 
@@ -286,12 +330,16 @@ też obsługi klawiatury i widoku mobilnego.
 | 4 | Metryki jako zapytania | te same liczby co ręcznie zmierzone na znanym przebiegu |
 | 5 | Przeglądarka (oś + rejestr + inspektor) | interakcje z §2.10; klucz API pokazuje powiązanie |
 | 6 | Osadzenie w Code Studio + odsyłacz z audytu | z wpisu audytu jedno kliknięcie do miejsca w osi |
+| R1 | §1.1 trwała kolejka (`jobs.db`) | zadanie Projektów przeżywa restart; addon i Projekty w jednej kolejce |
+| R2 | §1.2 G1 — `graph_home` + węzeł `graph_extract` | projekt ma niepuste `kg_active` u siebie; wyłączony graf = zero dodatkowych wywołań LLM |
+| R3 | §1.3 jedna powłoka | to samo pytanie z addona i z czatu przechodzi tym samym flow; czat nadal streamuje |
+| R4 | §1.2 G2 — warstwa utrzymania w core | identyczny graf, konflikty i scalenia po obu stronach; cofnięcie merge'u działa |
 
 ---
 
 ## 3. Inwarianty — złamanie któregokolwiek to błąd, nie kompromis
 
-1. **`origin`, `actor*`, `vector_home` i scope NIGDY nie pochodzą z treści modelu.** Zawsze
+1. **`origin`, `actor*`, `vector_home`, `graph_home` i scope NIGDY nie pochodzą z treści modelu.** Zawsze
    mintowane przez serwer po autoryzacji.
 2. **`seq` alokowany w transakcji insertu**, z ograniczeniem unikalności.
 3. **Redakcja przed zapisem.**
@@ -326,4 +374,8 @@ też obsługi klawiatury i widoku mobilnego.
    objętość.
 3. **Czy oś czasu jest widoczna dla zwykłego użytkownika** (swoje przebiegi), czy tylko dla admina?
    Prototyp zakłada pierwsze.
-4. **Czy wchodzimy w §1.1 lub §1.3**, czy zostają odłożone do zgłoszenia z produkcji.
+4. **Domyślne włączenie grafu w Projektach.** G1 daje graf, ale ekstrakcja to dodatkowe wywołania
+   LLM na każdy chunk. Proponuję domyślnie WYŁĄCZONY, włączany per projekt — inaczej pierwszy duży
+   ingest zaskoczy rachunkiem.
+5. **Czy G2 wchodzi teraz, czy po G1.** G1 daje działający graf bez ontologii i bez rozstrzygania
+   konfliktów — fakty sprzeczne stoją obok siebie. Użyteczne, ale trzeba wiedzieć, czego się nie ma.
