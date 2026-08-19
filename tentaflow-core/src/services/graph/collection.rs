@@ -1357,8 +1357,10 @@ impl GraphManager {
         //    wins when it exists (it is the source of truth for an existing
         //    collection); with no row the interned entry decides, and that is the
         //    path a creator blocked on this lock will use.
-        // MUTATION B: always derive from the key, ignoring the registry row.
-        let path = self.file_path_for(&key.org_id, &key.addon_id, &key.collection)?;
+        let path = match self.load_row(&key.org_id, &key.addon_id, &key.collection)? {
+            Some((_, path)) => path,
+            None => entry.file_path.clone(),
+        };
 
         // 1) Zamknij backend (dekrement licznika, gdy był otwarty) i oznacz slot
         //    `Removed` — pod lockiem żaden inny wątek nie operuje na tej bazie.
