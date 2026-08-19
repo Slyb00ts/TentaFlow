@@ -76,7 +76,7 @@ pub(crate) const PS_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000040";
 /// bindingu agenta 'chat' projektu. Pasaze wiedzy trafiaja do LLM przez
 /// context.system_prompts (project_knowledge), a cytowania przez
 /// meta['rag_citations'].
-const PS_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"k1","type":"project_knowledge","position":{"x":360,"y":0},"config":{"operation":"search","top_k":6}},{"id":"h1","type":"conversation_history","position":{"x":720,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":1080,"y":0},"config":{"system_prompt":"Jesteś asystentem projektu. Odpowiadaj po polsku, opierając się na dostarczonym kontekście z bazy wiedzy projektu (pasaże ponumerowane [i]). Gdy korzystasz z pasażu, cytuj jego numer. Jeśli kontekst nie zawiera odpowiedzi, powiedz to wprost i odpowiedz najlepiej jak potrafisz."}},{"id":"o1","type":"output","position":{"x":1440,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"k1","from_port":"text","to_port":"in","data_type":"text"},{"from_node":"k1","to_node":"h1","from_port":"full","to_port":"in","data_type":"json"},{"from_node":"h1","to_node":"l1","from_port":"full","to_port":"in","data_type":"any"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+const PS_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"hops","type":"loop","position":{"x":300,"y":0},"config":{"body_flow_id":"00000000-0000-4000-8000-000000000052","until":"has(meta.harness_done) && meta.harness_done == true","max_iterations":3}},{"id":"fin","type":"rag_finalize","position":{"x":600,"y":0},"config":{}},{"id":"h1","type":"conversation_history","position":{"x":900,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":1200,"y":0},"config":{"system_prompt":"Jesteś asystentem projektu. Odpowiadaj po polsku, opierając się na dostarczonym kontekście z bazy wiedzy projektu (pasaże ponumerowane [i]). Gdy korzystasz z pasażu, cytuj jego numer. Jeśli kontekst nie zawiera odpowiedzi, powiedz to wprost i odpowiedz najlepiej jak potrafisz."}},{"id":"o1","type":"output","position":{"x":1500,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"hops","from_port":"text","to_port":"in","data_type":"text"},{"from_node":"hops","to_node":"fin","from_port":"full","to_port":"in","data_type":"any"},{"from_node":"fin","to_node":"h1","from_port":"full","to_port":"in","data_type":"text"},{"from_node":"h1","to_node":"l1","from_port":"full","to_port":"in","data_type":"any"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
 
 /// Graf domyslnego flow analizy kamery (patrz `seed_camera_analysis_flow`).
 /// Stala (nie literal w funkcji), zeby test mogl go zwalidowac + skompilowac.
@@ -2247,7 +2247,7 @@ fn seed_code_harness_flows(conn: &Connection) -> Result<()> {
 /// pozostaje idempotentny per-node (staly id, zero duplikatow).
 fn seed_ps_chat_flow(conn: &Connection) -> Result<()> {
     const NAME: &str = "Project Chat";
-    const DESCRIPTION: &str = "Systemowy flow czatu projektowego (Projekty): trigger -> project_knowledge -> conversation_history -> llm(stream) -> output. project_id i model przychodza w envelope.meta.";
+    const DESCRIPTION: &str = "Systemowy flow czatu projektowego (Projekty): trigger -> loop(retrieval-round) -> rag_finalize -> conversation_history -> llm(stream) -> output. project_id i model przychodza w envelope.meta.";
     // Reclaim: the fixed id belongs to the seed. A row on this id stripped of
     // is_system (older binary, manual edit) would dodge the WHERE guard below
     // forever and leave the node with a stale/foreign graph under the id the
@@ -3063,18 +3063,21 @@ mod tests {
         );
         assert_eq!(def_run, 0);
 
-        // ps-chat: streaming RAG chat without tools; project_id rides on
-        // envelope.meta, so the graph carries no pinned project.
+        // ps-chat: streamingowy RAG multi-hop bez narzedzi. `project_id` jedzie w
+        // envelope.meta, a scope przestrzeni wektorowej (`ps-<project_id>`) mintuje
+        // handler PO sprawdzeniu czlonkostwa — graf nie ma wpisanego projektu.
+        // Cialo petli to `retrieval-round`, dokladnie to samo, ktorego uzywa addon.
         let (st_ps, def_ps) = assert_dag(
             "Project Chat",
             &[
                 "trigger",
-                "project_knowledge",
+                "loop",
+                "rag_finalize",
                 "conversation_history",
                 "llm",
                 "output",
             ],
-            4,
+            5,
         );
         assert_eq!(st_ps, None, "ps-chat jest poza resolverem service_type");
         assert_eq!(def_ps, 0);

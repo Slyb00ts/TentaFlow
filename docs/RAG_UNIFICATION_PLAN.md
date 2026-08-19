@@ -256,8 +256,11 @@ Trzy regresje, sprawdzone w definicjach flow, nie założone:
    jawnie streamingowy;
 2. węzeł `answer` ma zaszyte `model: rag-llm`, więc wiązanie modelu czatu projektu byłoby
    ignorowane;
-3. węzeł `reranker` wywala flow przy niezwiązanym `rag-reranker`, a ten alias i `rag-llm` startują
-   niezwiązane z założenia.
+3. ~~węzeł `reranker` wywala flow przy niezwiązanym `rag-reranker`~~ — **to była moja pomyłka**.
+   Sprawdziłem kontrakt wejścia: `retrieval_round` karmi reranker trafieniami z węzła `vector`,
+   czyli kształtem ze scorami, dla którego istnieje degradacja do kolejności wektorowej. Bez
+   rerankera retrieval działa dalej, tylko nieposortowany ponownie. Błąd dotyczy wyłącznie
+   generycznego kontraktu `{query, candidates}`, którego ten flow nie używa.
 
 Każda jest naprawialna, żadna po cichu — to osobna zmiana z tymi trzema warunkami wstępnymi.
 

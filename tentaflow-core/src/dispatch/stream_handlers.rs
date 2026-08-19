@@ -1957,6 +1957,12 @@ fn project_studio_chat_stream_handler(
             "session_id".into(),
             serde_json::Value::String(chat.session_id.clone()),
         );
+        // Projekt nie ma kolekcji grafowej, a brak klucza znaczy "graf wlaczony"
+        // (zgodnosc wstecz). Wezly grafowe i tak zdegradowalyby sie do
+        // pass-through, ale jawne `false` oszczedza im calej pracy.
+        envelope
+            .meta
+            .insert("graph_enabled".into(), serde_json::Value::Bool(false));
         if let Some(m) = model {
             envelope
                 .meta
@@ -1971,6 +1977,11 @@ fn project_studio_chat_stream_handler(
         meta.user_id = Some(caller_id.clone());
         meta.user_role = user_role;
         meta.org_id = Some(org_id);
+        // Scope przestrzeni wektorowej projektu. Mintowany TUTAJ, czyli PO
+        // sprawdzeniu czlonkostwa i po `get_chat` filtrowanym po user_id — nigdy z
+        // wiadomosci modelu. Wzorzec `ps_generation`: to, na czym flow pracuje, ma
+        // byc wiazaniem serwera, a nie parametrem, ktory da sie przekierowac.
+        meta.addon_id = Some(crate::project_studio::ingest::vector_scope(&project_id));
         meta.cancel_token = cancel.clone();
 
         let dispatch = fd
