@@ -152,6 +152,8 @@ impl NodeAdapter for EmbedChunksNodeAdapter {
             inputs: texts,
             dimensions,
             encoding_format: None,
+            user: None,
+            extra: serde_json::Map::new(),
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
             flow_depth: ctx.subflow_depth,

@@ -20,6 +20,12 @@ pub struct EmbeddingsRequest {
     pub encoding_format: Option<String>,
     pub user_id: Option<String>,
     pub user_role: Option<String>,
+    /// OpenAI `user` field of the external request, forwarded verbatim to an
+    /// HTTP backend. Unrelated to `user_id` (the authenticated principal).
+    pub user: Option<String>,
+    /// Unknown vendor fields of the external request, forwarded verbatim to an
+    /// HTTP backend (`truncate`, `input_type`, ...).
+    pub extra: serde_json::Map<String, serde_json::Value>,
     /// RAG C2 (recursion guard) — głębokość zagnieżdżenia flow, z której
     /// pochodzi to wywołanie (`ExecutionContext.subflow_depth` węzła). Dispatcher
     /// seeduje nim runtime'owy `flow_stack`, żeby re-wejście embeddings w

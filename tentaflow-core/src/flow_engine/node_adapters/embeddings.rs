@@ -126,6 +126,17 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             })
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
+        let user = envelope
+            .meta
+            .get("embeddings_user")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string());
+        let extra = envelope
+            .meta
+            .get("embeddings_extra")
+            .and_then(|v| v.as_object())
+            .cloned()
+            .unwrap_or_default();
         let batch_count = inputs.len();
         let req = EmbeddingsRequest {
             model,
@@ -134,6 +145,8 @@ impl NodeAdapter for EmbeddingsNodeAdapter {
             encoding_format,
             user_id: ctx.user_id.clone(),
             user_role: ctx.user_role.clone(),
+            user,
+            extra,
             flow_depth: ctx.subflow_depth,
         };
 
@@ -270,6 +283,58 @@ mod tests {
             fake.last_input.lock().unwrap().as_deref(),
             Some("hello world")
         );
+    }
+
+    /// Captures the full dispatcher request so vendor passthrough fields can
+    /// be asserted, not just the input text.
+    struct CaptureEmbeddings {
+        last: Mutex<Option<crate::flow_engine::dispatchers::EmbeddingsRequest>>,
+    }
+
+    #[async_trait]
+    impl EmbeddingsDispatcher for CaptureEmbeddings {
+        async fn embed(
+            &self,
+            req: crate::flow_engine::dispatchers::EmbeddingsRequest,
+        ) -> Result<EmbeddingsResponse> {
+            *self.last.lock().unwrap() = Some(req);
+            Ok(EmbeddingsResponse {
+                vectors: vec![vec![1.0]],
+                usage: TokenUsage::default(),
+            })
+        }
+    }
+
+    /// `/v1/embeddings` seeds `dimensions`, `user` and unknown vendor fields
+    /// into envelope.meta; the adapter must hand them to the dispatcher so an
+    /// HTTP backend receives them verbatim.
+    #[tokio::test]
+    async fn forwards_dimensions_user_and_vendor_fields_from_meta() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("hello".into());
+        env.meta.insert("dimensions".into(), json!(256));
+        env.meta
+            .insert("embeddings_user".into(), json!("end-user-7"));
+        env.meta.insert(
+            "embeddings_extra".into(),
+            json!({"truncate": "END", "input_type": "query"}),
+        );
+        let mut ctx = stub_ctx();
+        let fake = Arc::new(CaptureEmbeddings {
+            last: Mutex::new(None),
+        });
+        ctx.embeddings = fake.clone();
+
+        EmbeddingsNodeAdapter::new()
+            .execute(&node(json!({"model": "m"})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+
+        let req = fake.last.lock().unwrap().take().expect("dispatcher called");
+        assert_eq!(req.dimensions, Some(256));
+        assert_eq!(req.user.as_deref(), Some("end-user-7"));
+        assert_eq!(req.extra.get("truncate"), Some(&json!("END")));
+        assert_eq!(req.extra.get("input_type"), Some(&json!("query")));
     }
 
     /// Stage 3d-0b-3-fix: batch embeddings przez envelope.meta["embeddings_inputs"].

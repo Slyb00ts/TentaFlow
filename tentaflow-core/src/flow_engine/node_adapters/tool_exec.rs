@@ -428,6 +428,8 @@ impl ToolExecNodeAdapter {
                         inputs: vec![query.to_string()],
                         dimensions: None,
                         encoding_format: None,
+                        user: None,
+                        extra: serde_json::Map::new(),
                         user_id: Some(user_id.to_string()),
                         user_role: ctx.user_role.clone(),
                         flow_depth: ctx.subflow_depth,

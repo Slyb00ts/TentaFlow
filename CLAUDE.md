@@ -63,7 +63,12 @@ fallback when `<data>/tls` is unusable. `/v1/models` reports `supports_embedding
 `supports_structured_output` per entry (the latter is true only for a LOCAL HTTP-transport
 chat service — embedded, QUIC, mesh-forwarded and flow paths drop `response_format`).
 `ChatCompletionRequest.extra` / `ResponseFormat.{json_schema,extra}` pass unknown vendor
-fields through to HTTP backends verbatim.
+fields through to HTTP backends verbatim. `/v1/embeddings` accepts `input` as a string or array
+of strings only (token-id arrays → 400 `invalid_request_error`, no backend is token-in),
+forwards `dimensions`/`user`/`EmbeddingRequest.extra` to HTTP backends (via
+`envelope.meta["embeddings_user"|"embeddings_extra"]` on the flow path), always talks base64
+to the backend and re-encodes at the edge per the client's `encoding_format`
+(`EmbeddingResponse::to_wire_json`); `response.model` echoes the requested id.
 
 ## Transport architecture (2-tier) — every change must respect this split
 

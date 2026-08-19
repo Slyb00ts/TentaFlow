@@ -456,6 +456,7 @@ pub async fn embed_texts(router: &Router, texts: Vec<String>) -> Result<Vec<Vec<
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     let mut rctx = crate::services::runtime::context::ExecutionContext::new(None);
     let response = executor

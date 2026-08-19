@@ -1602,6 +1602,51 @@ async fn handle_audio_transcriptions(
     }
 }
 
+/// Parses the `/v1/embeddings` body and rejects shapes no backend can serve
+/// with a message that names the field. OpenAI accepts `input` as a string,
+/// an array of strings, an array of token ids or an array of token arrays;
+/// every backend behind this gateway (HTTP OpenAI-compatible, embedded
+/// llama.cpp/MLX, QUIC/mesh engines, flow nodes) is text-in, so token-id
+/// inputs are refused explicitly instead of surfacing a serde untagged-enum
+/// error. Empty inputs are refused like OpenAI does.
+pub fn parse_embedding_request(body: &[u8]) -> std::result::Result<EmbeddingRequest, String> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    match raw.get("input") {
+        None => return Err("missing required field 'input'".to_string()),
+        Some(serde_json::Value::String(s)) if s.is_empty() => {
+            return Err("'input' must not be an empty string".to_string());
+        }
+        Some(serde_json::Value::Array(items)) => {
+            if items.is_empty() {
+                return Err("'input' must not be an empty array".to_string());
+            }
+            if items.iter().any(|v| v.is_number() || v.is_array()) {
+                return Err(
+                    "'input' as token ids (array of integers or array of integer \
+                            arrays) is not supported by this gateway; send a string or an \
+                            array of strings"
+                        .to_string(),
+                );
+            }
+            if let Some(pos) = items.iter().position(|v| !v.is_string()) {
+                return Err(format!("'input[{pos}]' must be a string"));
+            }
+            if items
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.is_empty()))
+            {
+                return Err("'input' must not contain empty strings".to_string());
+            }
+        }
+        Some(serde_json::Value::String(_)) => {}
+        Some(_) => {
+            return Err("'input' must be a string or an array of strings".to_string());
+        }
+    }
+    serde_json::from_value(raw).map_err(|e| format!("invalid request: {e}"))
+}
+
 /// Handler dla /v1/embeddings
 async fn handle_embeddings(
     req: Request<Incoming>,
@@ -1627,17 +1672,23 @@ async fn handle_embeddings(
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
 
-    // Parsujemy JSON
-    let request: EmbeddingRequest = match serde_json::from_slice(&body_bytes) {
+    let request = match parse_embedding_request(&body_bytes) {
         Ok(r) => r,
-        Err(e) => {
-            warn!("Blad parsowania JSON: {}", e);
+        Err(message) => {
+            warn!("Embeddings request rejected: {}", message);
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid_json",
-                format!("Niepoprawny JSON: {}", e),
+                "invalid_request_error",
+                message,
             ));
         }
+    };
+    let Some(encoding) = EmbeddingEncoding::parse(request.encoding_format.as_deref()) else {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "encoding_format must be 'float' or 'base64'".to_string(),
+        ));
     };
 
     if let Err(resp) = v1_authorize(&router, principal.as_ref(), &request.model) {
@@ -1649,7 +1700,7 @@ async fn handle_embeddings(
     // Routuj do odpowiedniego backendu
     match router.route_embeddings_for_user(request, user_ctx).await {
         Ok(route_result) => {
-            let body = serde_json::to_vec(&route_result.response).unwrap();
+            let body = route_result.response.to_wire_json(encoding);
             let mut resp = json_response(StatusCode::OK, body);
             if debug_route {
                 if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {

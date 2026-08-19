@@ -3546,6 +3546,18 @@ pub(crate) fn embeddings_request_to_initial_envelope(
             serde_json::Value::String(fmt.clone()),
         );
     }
+    if let Some(user) = &request.user {
+        env.meta.insert(
+            "embeddings_user".into(),
+            serde_json::Value::String(user.clone()),
+        );
+    }
+    if !request.extra.is_empty() {
+        env.meta.insert(
+            "embeddings_extra".into(),
+            serde_json::Value::Object(request.extra.clone()),
+        );
+    }
 
     let mut meta =
         crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
@@ -5051,6 +5063,7 @@ mod tests {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -5166,6 +5179,7 @@ mod tests {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         }
     }
 

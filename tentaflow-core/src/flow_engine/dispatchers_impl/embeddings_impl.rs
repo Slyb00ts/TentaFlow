@@ -52,7 +52,8 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             input,
             encoding_format: req.encoding_format.clone(),
             dimensions: req.dimensions,
-            user: None,
+            user: req.user,
+            extra: req.extra,
         };
 
         let mut rctx = RuntimeContext::new_with_flow_depth(user, flow_depth);

@@ -813,6 +813,7 @@ async fn route_alias_via_executor(
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     match executor.execute_embeddings(emb_req, exec_ctx).await {
         Ok(resp) => {

@@ -395,6 +395,7 @@ pub fn llm_generate(
             encoding_format: None,
             dimensions,
             user: Some(format!("addon:{}", addon_id)),
+            extra: serde_json::Map::new(),
         };
 
         let result = tokio::task::block_in_place(|| {
