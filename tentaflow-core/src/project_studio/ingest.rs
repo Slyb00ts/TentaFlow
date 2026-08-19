@@ -21,6 +21,7 @@ use std::sync::{Arc, OnceLock};
 
 use anyhow::{anyhow, Result};
 use dashmap::DashMap;
+use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::repository;
@@ -31,6 +32,7 @@ use crate::routing::router::Router;
 use crate::services::document::extract::{
     classify_source, split_into_chunks, SourceKind, CHUNK_OVERLAP_CHARS, CHUNK_SIZE_CHARS,
 };
+use crate::services::ingest_jobs;
 use crate::services::vector::backend::{Field, FieldSpec, Metric, UpsertItem};
 use crate::services::vector::error::VectorError;
 use tentaflow_sdk_spec::{FieldType, FieldValue};
@@ -74,9 +76,56 @@ fn unregister_cancel(job_id: &str) {
     INGEST_CANCEL.unregister(job_id)
 }
 
-/// Flags a live run for cancellation. `false` = this process does not own it.
+/// Cancels a job wherever it currently is. `false` = nothing to cancel (the
+/// job is already terminal, or was never queued here).
+///
+/// Three places have to agree, because a job now has three lives: waiting in
+/// the queue, claimed by a worker, and running inside this process.
+///   * waiting  — the queue row is removed here and now and the job is closed
+///     as cancelled, because the callers that cancel (project delete, source
+///     delete) then WAIT for a terminal status, and leaving the row for a busy
+///     worker would make that wait depend on unrelated ingest.
+///   * claimed  — the request is persisted on the row; the worker's next
+///     heartbeat turns it into its local flag.
+///   * running here — the in-memory token is tripped, which is what reaches a
+///     job already inside a file (the flow cancel path).
 pub fn signal_cancel(job_id: &str) -> bool {
-    INGEST_CANCEL.signal(job_id)
+    let outcome = ingest_jobs::pool()
+        .and_then(|pool| ingest_jobs::request_cancel(&pool, job_id))
+        .unwrap_or_else(|e| {
+            tracing::error!(job_id, error = %e, "ingest queue cancel failed");
+            ingest_jobs::CancelOutcome::Unknown
+        });
+    let signalled = INGEST_CANCEL.signal(job_id);
+    match outcome {
+        ingest_jobs::CancelOutcome::Dequeued(payload_json) => {
+            close_dequeued_job(&payload_json);
+            true
+        }
+        ingest_jobs::CancelOutcome::Signalled => true,
+        ingest_jobs::CancelOutcome::Unknown => signalled,
+    }
+}
+
+/// Closes a job cancelled before any worker claimed it: nothing will ever run
+/// it, so the terminal record is written right here, in the same shape a worker
+/// would have produced.
+fn close_dequeued_job(payload_json: &str) {
+    let Ok(payload) = serde_json::from_str::<JobPayload>(payload_json) else {
+        return;
+    };
+    let Ok(project_pool) = super::project_db::open(&payload.project_id) else {
+        return;
+    };
+    close_job_as_cancelled(&project_pool, &payload);
+}
+
+fn close_job_as_cancelled(project_pool: &DbPool, payload: &JobPayload) {
+    let _ = repository::finish_ingest_job(project_pool, &payload.job_id, "cancelled", "");
+    let _ = repository::set_source_status(project_pool, &payload.source_id, "cancelled", "");
+    let tx = log_bus::sender_for(&payload.job_id);
+    emit_end_and_close(&tx, &payload.job_id, "cancelled", "");
+    unregister_cancel(&payload.job_id);
 }
 
 // =============================================================================
@@ -415,15 +464,23 @@ pub fn cleanup_files_dir(pool: &DbPool, dir_path: &Path) {
 }
 
 /// Startup recovery, run when a project pool is freshly opened: a 'running'
-/// job without a cancel-registry entry has no live task behind it (the
-/// process restarted mid-job), so it is closed as failed — otherwise pollers
-/// and the delete paths would wait on it forever.
+/// job the QUEUE no longer holds has no future — either its worker died
+/// mid-job or it was never enqueued — so it is closed as failed, otherwise
+/// pollers and the delete paths would wait on it forever.
+///
+/// The queue is the authority, not the in-process cancel registry: a job that
+/// outlived a restart is still queued here and has not started yet, and killing
+/// it because no task of THIS process holds it would defeat the whole point of
+/// persisting it.
 pub fn recover_orphaned_jobs(pool: &DbPool) {
     let Ok(jobs) = repository::running_job_ids(pool) else {
         return;
     };
+    let Ok(queue) = ingest_jobs::pool() else {
+        return;
+    };
     for job_id in jobs {
-        if INGEST_CANCEL.is_registered(&job_id) {
+        if ingest_jobs::is_pending(&queue, &job_id).unwrap_or(true) {
             continue;
         }
         tracing::warn!(job_id, "marking orphaned ingest job as failed");
@@ -1011,6 +1068,7 @@ enum ExtractOutcome {
 }
 
 /// Where the bytes of one work item come from.
+#[derive(Serialize, Deserialize)]
 pub enum WorkPayload {
     /// Content-addressed blob `<dir_path>/files/<sha256>`.
     Blob,
@@ -1019,6 +1077,7 @@ pub enum WorkPayload {
 }
 
 /// One file to process in an ingest job.
+#[derive(Serialize, Deserialize)]
 pub struct FileWork {
     pub file_id: String,
     pub path: String,
@@ -1065,7 +1124,10 @@ fn extract_file(dir_path: &Path, work: &FileWork) -> Result<ExtractOutcome> {
 // Job runner
 // =============================================================================
 
-/// Everything a job needs, captured before the spawn.
+/// Everything a job needs, captured at the call site. `core_db` and `router`
+/// are process-wide handles and do NOT travel through the queue — they are
+/// published for the workers (see [`WorkerRuntime`]); the rest is the durable
+/// payload.
 pub struct IngestTask {
     pub core_db: DbPool,
     pub router: Arc<Router>,
@@ -1096,78 +1158,333 @@ fn emit_line(
     }));
 }
 
-/// Starts the ingest job for an already-created `ingest_jobs` row: registers
-/// the cancel token, opens the log_bus channel BEFORE spawning (the response
-/// returns to the frontend before the task runs — an immediate stream
-/// subscribe must find the channel) and spawns the pipeline with a panic
-/// guard so the finalizers (job status, End, close, unregister) always run.
-pub fn start_job(task: IngestTask) {
-    let job_id = task.job_id.clone();
-    let cancel = register_cancel(&job_id);
-    let tx = log_bus::sender_for(&job_id);
+/// Everything a queued job needs to run in a process that never saw the
+/// request that created it. Serialized into the durable queue, so the fields
+/// are data only: the runtime handles (`core_db`, `router`) are process-wide
+/// and come from [`WorkerRuntime`].
+#[derive(Serialize, Deserialize)]
+struct JobPayload {
+    org_id: String,
+    project_id: String,
+    dir_path: PathBuf,
+    source_id: String,
+    job_id: String,
+    files: Vec<FileWork>,
+}
 
-    tokio::spawn(async move {
-        let project_pool = task.project_pool.clone();
-        let job_id_task = task.job_id.clone();
+/// Handles a queue worker cannot obtain from a request context — a job
+/// recovered after a restart has no session behind it. Published by whichever
+/// runs first: the startup wiring (`start_workers`) or the first enqueue in an
+/// embedding that has no startup hook.
+struct WorkerRuntime {
+    core_db: DbPool,
+    router: Arc<Router>,
+}
 
-        // Wspolbieznosc ogranicza teraz JEDNA bramka w `execute_ingest`
-        // (`services::ingest_gate`), przez ktora przechodzi tez addon RAG — a
-        // liczy ona DOKUMENTY, czyli to, co realnie ogranicza pamiec. Wlasny
-        // semafor na poziomie zadania byl drugim, niezaleznym limitem tego samego
-        // zasobu i przepuszczal jeden dokument z kazdego zadania i tak.
-        //
-        // Zadanie anulowane, zanim tknelo jakikolwiek plik, konczy sie terminalnie
-        // bez przetwarzania — na tym opieraja sie sciezki kasowania — bo `run_job`
-        // sprawdza flage przed kazdym plikiem.
-        if cancel.load(Ordering::Relaxed) {
-            let _ = repository::finish_ingest_job(&project_pool, &job_id_task, "cancelled", "");
-        } else {
-            if crate::services::ingest_gate::would_wait() {
-                emit_line(
-                    &tx,
-                    &job_id_task,
-                    "log",
-                    "queue",
-                    "waiting for a free ingest slot".to_string(),
-                    0,
-                );
-            }
-            let run = {
-                let tx = tx.clone();
-                let cancel = cancel.clone();
-                tokio::spawn(async move { run_job(task, tx, cancel).await })
+static WORKER_RUNTIME: OnceLock<WorkerRuntime> = OnceLock::new();
+static WORKERS_STARTED: AtomicBool = AtomicBool::new(false);
+
+/// Woken on every enqueue so a waiting worker starts immediately instead of at
+/// the next poll.
+fn wake() -> &'static tokio::sync::Notify {
+    static WAKE: OnceLock<tokio::sync::Notify> = OnceLock::new();
+    WAKE.get_or_init(tokio::sync::Notify::new)
+}
+
+/// Safety net behind the wake signal: a job enqueued by ANOTHER process run —
+/// i.e. one that outlived a restart — has no live notifier behind it.
+const IDLE_POLL: std::time::Duration = std::time::Duration::from_secs(30);
+
+fn publish_runtime(core_db: DbPool, router: Arc<Router>) {
+    let _ = WORKER_RUNTIME.set(WorkerRuntime { core_db, router });
+}
+
+/// Closes every ingest job the queue was still holding for a process run that
+/// no longer exists, and marks the matching project rows failed. Startup only:
+/// a row claimed by THIS run is supervised by definition, and the queue's own
+/// `reconcile_orphans` never touches it.
+pub fn reconcile_orphans() {
+    let Ok(pool) = ingest_jobs::pool() else {
+        return;
+    };
+    let orphans = match ingest_jobs::reconcile_orphans(&pool) {
+        Ok(o) => o,
+        Err(e) => {
+            tracing::error!(error = %e, "ingest queue reconciliation failed");
+            return;
+        }
+    };
+    for job in orphans {
+        if job.queue != ingest_jobs::QUEUE_PROJECT_STUDIO {
+            continue;
+        }
+        let Ok(payload) = serde_json::from_str::<JobPayload>(&job.payload_json) else {
+            continue;
+        };
+        let Ok(project_pool) = super::project_db::open(&payload.project_id) else {
+            continue;
+        };
+        tracing::warn!(job_id = %payload.job_id, "closing ingest job orphaned by a restart");
+        let _ = repository::finish_ingest_job(
+            &project_pool,
+            &payload.job_id,
+            "failed",
+            "interrupted by restart",
+        );
+        let _ = repository::set_source_status(
+            &project_pool,
+            &payload.source_id,
+            "error",
+            "interrupted by restart",
+        );
+    }
+}
+
+/// Starts the queue workers for this process.
+///
+/// The worker COUNT reuses `MAX_CONCURRENT_DOCUMENT_INGESTS` and is not a
+/// second limit: the real bound stays in `execute_ingest`, which counts
+/// DOCUMENTS. Running as many workers as the pipeline admits documents means a
+/// worker never sits idle behind a job that is itself waiting for the gate.
+pub fn start_workers(core_db: DbPool, router: Arc<Router>) {
+    publish_runtime(core_db, router);
+    if WORKERS_STARTED.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    for _ in 0..crate::services::ingest_gate::MAX_CONCURRENT_DOCUMENT_INGESTS {
+        tokio::spawn(worker_loop());
+    }
+}
+
+async fn worker_loop() {
+    loop {
+        // Armed BEFORE the claim attempt, so an enqueue that lands while we are
+        // draining cannot be missed between "queue empty" and "waiting".
+        let notified = wake().notified();
+        tokio::pin!(notified);
+        loop {
+            let Ok(pool) = ingest_jobs::pool() else {
+                break;
             };
-            if let Err(join_err) = run.await {
-                if join_err.is_panic() {
-                    let _ = repository::finish_ingest_job(
-                        &project_pool,
-                        &job_id_task,
-                        "failed",
-                        "ingest task panicked",
-                    );
+            match ingest_jobs::claim(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO) {
+                Ok(Some(job)) => run_claimed(job).await,
+                Ok(None) => break,
+                Err(e) => {
+                    tracing::error!(error = %e, "ingest queue claim failed");
+                    break;
                 }
             }
         }
+        tokio::select! {
+            _ = notified => {}
+            _ = tokio::time::sleep(IDLE_POLL) => {}
+        }
+    }
+}
 
-        // Terminal from the DB row — the single source of truth the polling
-        // endpoint also reads (success | failed | cancelled).
-        let (status, error) = match repository::get_ingest_job(&project_pool, &job_id_task) {
-            Ok(Some(job)) => (job.status, job.error),
-            _ => ("failed".to_string(), "job record missing".to_string()),
+/// Runs one claimed job with the panic guard, so the finalizers (job status,
+/// queue row, End, close, unregister) always run.
+async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
+    let Ok(pool) = ingest_jobs::pool() else {
+        return;
+    };
+    let payload: JobPayload = match serde_json::from_str(&job.payload_json) {
+        Ok(p) => p,
+        Err(e) => {
+            // Nothing can ever run this row; leaving it would make it a job
+            // claimed and released forever.
+            tracing::error!(job_id = %job.job_id, error = %e, "unreadable ingest job payload");
+            let _ = ingest_jobs::finish(&pool, &job.job_id);
+            return;
+        }
+    };
+    let job_id = payload.job_id.clone();
+    let cancel = register_cancel(&job_id);
+    let tx = log_bus::sender_for(&job_id);
+    // Closes the claim window: a cancel that landed between the claim and the
+    // registration above exists ONLY in the queue row.
+    if !matches!(
+        ingest_jobs::heartbeat(&pool, &job_id),
+        Ok(ingest_jobs::JobLiveness::Running)
+    ) {
+        cancel.store(true, Ordering::Relaxed);
+    }
+
+    let project_pool = match super::project_db::open(&payload.project_id) {
+        Ok(p) => p,
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = %e, "ingest job project unavailable");
+            let _ = ingest_jobs::finish(&pool, &job_id);
+            emit_end_and_close(&tx, &job_id, "failed", &format!("project unavailable: {e}"));
+            unregister_cancel(&job_id);
+            return;
+        }
+    };
+
+    // Wspolbieznosc ogranicza JEDNA bramka w `execute_ingest`
+    // (`services::ingest_gate`), przez ktora przechodzi tez addon RAG — a
+    // liczy ona DOKUMENTY, czyli to, co realnie ogranicza pamiec.
+    //
+    // Zadanie anulowane, zanim tknelo jakikolwiek plik, konczy sie terminalnie
+    // bez przetwarzania — na tym opieraja sie sciezki kasowania — bo `run_job`
+    // sprawdza flage przed kazdym plikiem.
+    if cancel.load(Ordering::Relaxed) {
+        let _ = repository::finish_ingest_job(&project_pool, &job_id, "cancelled", "");
+    } else {
+        if crate::services::ingest_gate::would_wait() {
+            emit_line(
+                &tx,
+                &job_id,
+                "log",
+                "queue",
+                "waiting for a free ingest slot".to_string(),
+                0,
+            );
+        }
+        let task = IngestTask {
+            core_db: runtime_core_db(),
+            router: runtime_router(),
+            project_pool: project_pool.clone(),
+            org_id: payload.org_id,
+            project_id: payload.project_id,
+            dir_path: payload.dir_path,
+            source_id: payload.source_id,
+            job_id: job_id.clone(),
+            files: payload.files,
         };
-        let _ = tx.send(BusMessage::End {
-            deploy_id: job_id_task.clone(),
-            final_status: status,
-            image_tag: String::new(),
-            container_name: String::new(),
-            error_message: error,
-            duration_ms: 0,
-        });
-        // Give live subscribers a moment to drain End before the channel dies.
-        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-        log_bus::close(&job_id_task);
-        unregister_cancel(&job_id_task);
+        let tx_run = tx.clone();
+        let cancel_run = cancel.clone();
+        run_guarded(&project_pool, &job_id, async move {
+            run_job(task, tx_run, cancel_run).await
+        })
+        .await;
+    }
+
+    // Terminal from the DB row — the single source of truth the polling
+    // endpoint also reads (success | failed | cancelled).
+    let (status, error) = match repository::get_ingest_job(&project_pool, &job_id) {
+        Ok(Some(job)) => (job.status, job.error),
+        _ => ("failed".to_string(), "job record missing".to_string()),
+    };
+    // The queue row goes only AFTER the project row is terminal: a missing
+    // queue row must always mean the job is accounted for elsewhere.
+    let _ = ingest_jobs::finish(&pool, &job_id);
+    emit_end_and_close(&tx, &job_id, &status, &error);
+    unregister_cancel(&job_id);
+}
+
+/// Runs the pipeline in its own task so a panic cannot escape into the worker
+/// loop, and turns that panic into a terminal job status — a panicking job must
+/// end FAILED, never stay `running` forever.
+async fn run_guarded<F>(project_pool: &DbPool, job_id: &str, fut: F)
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    if let Err(join_err) = tokio::spawn(fut).await {
+        if join_err.is_panic() {
+            let _ = repository::finish_ingest_job(
+                project_pool,
+                job_id,
+                "failed",
+                "ingest task panicked",
+            );
+        }
+    }
+}
+
+/// Runtime handles for a claimed job. A worker only runs after
+/// `start_workers`/`start_job` published them, so the expectation holds.
+fn runtime_core_db() -> DbPool {
+    WORKER_RUNTIME
+        .get()
+        .expect("ingest worker runtime published before any job is claimed")
+        .core_db
+        .clone()
+}
+
+fn runtime_router() -> Arc<Router> {
+    WORKER_RUNTIME
+        .get()
+        .expect("ingest worker runtime published before any job is claimed")
+        .router
+        .clone()
+}
+
+/// Emits the terminal bus message and closes the channel. The 100 ms pause
+/// gives live subscribers a chance to drain `End` first; a subscriber that
+/// still misses it reconciles through `IngestStatusRequest`.
+fn emit_end_and_close(
+    tx: &tokio::sync::broadcast::Sender<BusMessage>,
+    job_id: &str,
+    status: &str,
+    error: &str,
+) {
+    let _ = tx.send(BusMessage::End {
+        deploy_id: job_id.to_string(),
+        final_status: status.to_string(),
+        image_tag: String::new(),
+        container_name: String::new(),
+        error_message: error.to_string(),
+        duration_ms: 0,
     });
+    let job_id = job_id.to_string();
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                log_bus::close(&job_id);
+            });
+        }
+        Err(_) => log_bus::close(&job_id),
+    }
+}
+
+/// Persists the job and returns; a worker drains the queue. The job outlives
+/// the process that accepted it, which is the whole point — before this it was
+/// a `tokio::spawn` that a restart dropped silently.
+///
+/// The log_bus channel is opened BEFORE returning (the response reaches the
+/// frontend before any worker picks the job up — an immediate stream subscribe
+/// must find the channel), and the cancel token is NOT registered here: a
+/// cancel arriving while the job waits is persisted in the queue row instead,
+/// which is the only representation that survives a restart.
+pub fn start_job(task: IngestTask) {
+    let IngestTask {
+        core_db,
+        router,
+        project_pool,
+        org_id,
+        project_id,
+        dir_path,
+        source_id,
+        job_id,
+        files,
+    } = task;
+    publish_runtime(core_db, router);
+    let payload = JobPayload {
+        org_id,
+        project_id,
+        dir_path,
+        source_id: source_id.clone(),
+        job_id: job_id.clone(),
+        files,
+    };
+    let tx = log_bus::sender_for(&job_id);
+
+    let queued = ingest_jobs::pool().and_then(|pool| {
+        let json = serde_json::to_string(&payload)?;
+        ingest_jobs::enqueue(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO, &job_id, &json)
+    });
+    match queued {
+        Ok(()) => wake().notify_waiters(),
+        Err(e) => {
+            tracing::error!(job_id = %job_id, error = %e, "ingest job could not be queued");
+            let message = format!("ingest queue unavailable: {e}");
+            let _ = repository::finish_ingest_job(&project_pool, &job_id, "failed", &message);
+            let _ = repository::set_source_status(&project_pool, &source_id, "error", &message);
+            emit_end_and_close(&tx, &job_id, "failed", &message);
+        }
+    }
 }
 
 async fn run_job(
@@ -1204,6 +1521,17 @@ async fn run_job(
     let mut cancelled = false;
 
     for work in files {
+        // One beat per file: it records that this worker is alive AND reports a
+        // cancel that arrived through the queue (another process, or the window
+        // between the claim and the local registration).
+        if let Ok(queue) = ingest_jobs::pool() {
+            if !matches!(
+                ingest_jobs::heartbeat(&queue, &job_id),
+                Ok(ingest_jobs::JobLiveness::Running)
+            ) {
+                cancel.store(true, Ordering::Relaxed);
+            }
+        }
         if cancel.load(Ordering::Relaxed) {
             cancelled = true;
             break;
@@ -1525,6 +1853,222 @@ async fn process_file(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Publishes ONE process-wide queue for the whole test binary, exactly as
+    /// startup does — `start_job`, `signal_cancel` and `recover_orphaned_jobs`
+    /// read the global handle, and a per-test pool would not exercise them.
+    /// The guard makes queue tests exclusive: they assert on WHICH job a claim
+    /// returns, and a parallel test's job in the same queue would decide that
+    /// for them. The queue is drained before each one for the same reason.
+    fn exclusive_queue() -> (std::sync::MutexGuard<'static, ()>, DbPool) {
+        static QUEUE: OnceLock<(tempfile::TempDir, DbPool)> = OnceLock::new();
+        static LOCK: OnceLock<std::sync::Mutex<()>> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (_dir, pool) = QUEUE.get_or_init(|| {
+            let dir = tempfile::tempdir().expect("queue tempdir");
+            let pool = ingest_jobs::init(&dir.path().join("jobs.db")).expect("queue init");
+            (dir, pool)
+        });
+        while let Some(job) = ingest_jobs::claim(pool, ingest_jobs::QUEUE_PROJECT_STUDIO)
+            .expect("drain claim")
+        {
+            ingest_jobs::finish(pool, &job.job_id).expect("drain finish");
+        }
+        (guard, pool.clone())
+    }
+
+    /// A project database with one source and one job row, WITHOUT the central
+    /// registry — enough for everything that writes a terminal job status.
+    fn project_db_with_job(dir: &Path, job_id: &str) -> DbPool {
+        std::fs::create_dir_all(dir.join("files")).expect("files dir");
+        let (pool, _) = super::super::project_db::open_pool_at(dir).expect("project db");
+        {
+            let conn = pool.write().expect("write");
+            conn.execute(
+                "INSERT INTO sources (source_id, kind, name, created_by) \
+                 VALUES ('src-1', 'document', 'Spec', 'tester')",
+                [],
+            )
+            .expect("source");
+        }
+        repository::create_ingest_job(&pool, job_id, "src-1", 1, "tester").expect("job row");
+        pool
+    }
+
+    fn task_for(
+        state: &Arc<crate::dispatch::state::AppState>,
+        dir: &Path,
+        project_pool: &DbPool,
+        project_id: &str,
+        job_id: &str,
+    ) -> IngestTask {
+        IngestTask {
+            core_db: state.db.clone(),
+            router: state.router.clone(),
+            project_pool: project_pool.clone(),
+            org_id: "org-1".to_string(),
+            project_id: project_id.to_string(),
+            dir_path: dir.to_path_buf(),
+            source_id: "src-1".to_string(),
+            job_id: job_id.to_string(),
+            files: vec![FileWork {
+                file_id: "f-1".to_string(),
+                path: "spec.txt".to_string(),
+                sha256: "deadbeef".to_string(),
+                mime: "text/plain".to_string(),
+                payload: WorkPayload::Blob,
+            }],
+        }
+    }
+
+    /// R1: the job is persisted by `start_job`, outlives the process that
+    /// accepted it (the startup reconciliation leaves it alone) and is still
+    /// there to be claimed and run afterwards.
+    #[test]
+    fn a_queued_job_outlives_the_process_that_accepted_it() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_id = format!("p-{}", uuid::Uuid::new_v4());
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        let project_pool = project_db_with_job(tmp.path(), &job_id);
+
+        start_job(task_for(&state, tmp.path(), &project_pool, &project_id, &job_id));
+        assert!(
+            ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
+            "start_job must persist the job instead of only spawning it"
+        );
+
+        // Startup after a restart: reconciliation must not touch work that has
+        // not started, and the project row must stay open for it.
+        reconcile_orphans();
+        recover_orphaned_jobs(&project_pool);
+        let row = repository::get_ingest_job(&project_pool, &job_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, "running", "a queued job is still outstanding");
+
+        let claimed = ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+            .expect("claim")
+            .expect("the job survived");
+        assert_eq!(claimed.job_id, job_id);
+        let payload: JobPayload = serde_json::from_str(&claimed.payload_json).expect("payload");
+        assert_eq!(payload.project_id, project_id);
+        assert_eq!(payload.files.len(), 1);
+        assert_eq!(payload.dir_path, tmp.path());
+        ingest_jobs::finish(&queue, &job_id).expect("finish");
+    }
+
+    /// A `running` project row whose job the queue no longer holds belongs to a
+    /// worker that died; one still in the queue does not.
+    #[test]
+    fn recovery_closes_only_jobs_the_queue_no_longer_holds() {
+        let (_guard, queue) = exclusive_queue();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let queued_id = format!("job-{}", uuid::Uuid::new_v4());
+        let project_pool = project_db_with_job(tmp.path(), &queued_id);
+        let dead_id = format!("job-{}", uuid::Uuid::new_v4());
+        repository::create_ingest_job(&project_pool, &dead_id, "src-1", 1, "tester").expect("row");
+        ingest_jobs::enqueue(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO, &queued_id, "{}")
+            .expect("enqueue");
+
+        recover_orphaned_jobs(&project_pool);
+
+        let queued = repository::get_ingest_job(&project_pool, &queued_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(queued.status, "running", "queued work must not be killed");
+        let dead = repository::get_ingest_job(&project_pool, &dead_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(dead.status, "failed");
+        assert_eq!(dead.error, "interrupted by restart");
+        ingest_jobs::finish(&queue, &queued_id).expect("finish");
+    }
+
+    /// Cancellation of a job nobody has claimed: it leaves the queue at once
+    /// (the delete paths wait for a terminal status) and the project row and its
+    /// source are closed as cancelled.
+    #[test]
+    fn cancelling_a_waiting_job_closes_it_without_running_it() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let project_id = format!("p-{}", uuid::Uuid::new_v4());
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        let project_pool = project_db_with_job(tmp.path(), &job_id);
+        start_job(task_for(&state, tmp.path(), &project_pool, &project_id, &job_id));
+
+        // `signal_cancel` resolves the project through the central registry;
+        // the terminal write itself is what this asserts.
+        let outcome = ingest_jobs::request_cancel(&queue, &job_id).expect("cancel");
+        let ingest_jobs::CancelOutcome::Dequeued(payload_json) = outcome else {
+            panic!("a job nobody claimed must leave the queue");
+        };
+        let payload: JobPayload = serde_json::from_str(&payload_json).expect("payload");
+        close_job_as_cancelled(&project_pool, &payload);
+
+        assert!(
+            ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+                .expect("claim")
+                .is_none(),
+            "a cancelled job must never be handed to a worker"
+        );
+        let row = repository::get_ingest_job(&project_pool, &job_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, "cancelled");
+        assert!(row.finished_at.is_some());
+        let source = repository::get_source(&project_pool, "src-1")
+            .expect("read")
+            .expect("source");
+        assert_eq!(source.status, "cancelled");
+    }
+
+    /// A cancel that lands on a CLAIMED job is persisted on the row, because the
+    /// worker may be in another process; the worker sees it at its next beat.
+    #[test]
+    fn cancelling_a_claimed_job_reaches_it_through_the_queue() {
+        let (_guard, queue) = exclusive_queue();
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        ingest_jobs::enqueue(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO, &job_id, "{}")
+            .expect("enqueue");
+        ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+            .expect("claim")
+            .expect("job");
+        assert_eq!(
+            ingest_jobs::request_cancel(&queue, &job_id).expect("cancel"),
+            ingest_jobs::CancelOutcome::Signalled
+        );
+        assert_eq!(
+            ingest_jobs::heartbeat(&queue, &job_id).expect("beat"),
+            ingest_jobs::JobLiveness::CancelRequested
+        );
+        ingest_jobs::finish(&queue, &job_id).expect("finish");
+    }
+
+    /// A panicking pipeline must leave the job FAILED. Without the guard the row
+    /// would stay `running` and every poller and delete path would wait on it.
+    #[tokio::test]
+    async fn a_panicking_job_is_recorded_as_failed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        let project_pool = project_db_with_job(tmp.path(), &job_id);
+
+        run_guarded(&project_pool, &job_id, async {
+            panic!("ingest blew up");
+        })
+        .await;
+
+        let row = repository::get_ingest_job(&project_pool, &job_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.error, "ingest task panicked");
+    }
 
     #[test]
     fn ref_id_matches_store_adapter_deterministics() {

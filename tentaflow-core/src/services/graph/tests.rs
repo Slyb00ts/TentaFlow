@@ -199,8 +199,16 @@ fn test_delete_collection_removes_file_from_custom_dir() {
 
     mgr.ensure_collection_at(ORG_A, "ps-proj-del", "kg_active", &owner_dir)
         .unwrap();
-    mgr.upsert_node_with_quota(ORG_A, "ps-proj-del", "kg_active", "n1", "Acme", "{}", "null")
-        .unwrap();
+    mgr.upsert_node_with_quota(
+        ORG_A,
+        "ps-proj-del",
+        "kg_active",
+        "n1",
+        "Acme",
+        "{}",
+        "null",
+    )
+    .unwrap();
     let file = owner_dir.join("kg_active.cozo");
     assert!(file.exists(), "collection file missing at {file:?}");
 
@@ -253,8 +261,16 @@ fn test_delete_resolves_path_after_lock_no_orphan() {
     // Creator wins the window: row + files land in its own directory.
     mgr.ensure_collection_at(ORG_A, "ps-proj-race", "kg_active", &owner_dir)
         .unwrap();
-    mgr.upsert_node_with_quota(ORG_A, "ps-proj-race", "kg_active", "n1", "Acme", "{}", "null")
-        .unwrap();
+    mgr.upsert_node_with_quota(
+        ORG_A,
+        "ps-proj-race",
+        "kg_active",
+        "n1",
+        "Acme",
+        "{}",
+        "null",
+    )
+    .unwrap();
     let created = owner_dir.join("kg_active.cozo");
     assert!(created.exists(), "collection file missing at {created:?}");
 

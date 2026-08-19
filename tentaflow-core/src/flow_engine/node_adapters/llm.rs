@@ -40,10 +40,29 @@ impl LlmNodeAdapter {
         {
             return Ok(m.to_string());
         }
-        // 2. Model z envelope.meta — trigger seed'uje go z requestu.
+        // 2. Model z envelope.meta — trigger seed'uje go z requestu. `model` is
+        //    the default entry, but a flow published AS a model gets its own
+        //    published name seeded there by routing, so a shell that must not
+        //    dispatch itself names a dedicated entry via `model_meta_key`.
+        let meta_key = node
+            .config
+            .get("model_meta_key")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .unwrap_or("model");
         if let Some(m) = envelope
             .meta
-            .get("model")
+            .get(meta_key)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Ok(m.to_string());
+        }
+        // 3. `model_fallback` — the model a caller that supplied none gets. It
+        //    is a fallback, NOT a pin: a caller that names one always wins.
+        if let Some(m) = node
+            .config
+            .get("model_fallback")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
@@ -1067,6 +1086,44 @@ mod tests {
             LlmNodeAdapter::pick_model(&n, &env).unwrap(),
             "envelope-model"
         );
+    }
+
+    /// The shared RAG shell: the answer node names its own meta entry, so the
+    /// project chat's model reaches it while the shell's own published name
+    /// (seeded into `meta["model"]` when the addon asks it by name) does not.
+    #[test]
+    fn pick_model_reads_the_configured_meta_key_not_the_default_one() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), json!("core:rag-query"));
+        env.meta
+            .insert("rag_answer_model".into(), json!("projekt-llm"));
+        let n = node(json!({
+            "model_meta_key": "rag_answer_model",
+            "model_fallback": "rag-llm"
+        }));
+        assert_eq!(LlmNodeAdapter::pick_model(&n, &env).unwrap(), "projekt-llm");
+    }
+
+    /// Same node, caller without a model (the addon's `ask`) — the alias.
+    #[test]
+    fn pick_model_falls_back_when_the_configured_meta_key_is_absent() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), json!("core:rag-query"));
+        let n = node(json!({
+            "model_meta_key": "rag_answer_model",
+            "model_fallback": "rag-llm"
+        }));
+        assert_eq!(LlmNodeAdapter::pick_model(&n, &env).unwrap(), "rag-llm");
+    }
+
+    /// `model_fallback` is a fallback, not a pin: a caller that names a model
+    /// still wins over it.
+    #[test]
+    fn pick_model_prefers_meta_over_fallback() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert("model".into(), json!("caller-model"));
+        let n = node(json!({"model_fallback": "rag-llm"}));
+        assert_eq!(LlmNodeAdapter::pick_model(&n, &env).unwrap(), "caller-model");
     }
 
     #[test]

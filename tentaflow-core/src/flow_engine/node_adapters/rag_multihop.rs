@@ -21,6 +21,7 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
+use crate::flow_engine::node_adapters::output::{OUTPUT_MODE_CITATIONS, OUTPUT_MODE_META};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -476,6 +477,15 @@ impl NodeAdapter for RagFinalizeNodeAdapter {
         // wg score) — przepinamy je na rag_citations, bo output emituje stamtąd.
         out.meta
             .insert(META_CITATIONS.to_string(), Value::Array(accumulated));
+
+        // Terminal shape of the shared RAG shell. A caller that did not choose
+        // one gets the citation block, because a blocking RAG answer stripped
+        // of its citations is exactly what the shell exists to prevent. An
+        // entry point that streams (project chat) stamps its own mode on the
+        // initial envelope, so `entry(..).or_insert` must never overwrite it.
+        out.meta
+            .entry(OUTPUT_MODE_META.to_string())
+            .or_insert_with(|| Value::String(OUTPUT_MODE_CITATIONS.to_string()));
         Ok(out)
     }
 }
@@ -804,6 +814,33 @@ mod tests {
         let ctx_text = out.payload.as_text().unwrap();
         assert!(ctx_text.contains("Pytanie: Q"));
         assert!(ctx_text.contains("p1") && ctx_text.contains("p2"));
+        // A caller that chose no terminal shape gets the citation block — a
+        // blocking RAG answer stripped of its citations is what the shell
+        // exists to prevent.
+        assert_eq!(
+            out.meta.get(OUTPUT_MODE_META).and_then(|v| v.as_str()),
+            Some(OUTPUT_MODE_CITATIONS)
+        );
+    }
+
+    /// The entry point owns the terminal shape: a streaming caller (project
+    /// chat) stamps it on the initial envelope and `rag_finalize` must not
+    /// overwrite it, or the shell would rewrite the streamed answer into JSON.
+    #[tokio::test]
+    async fn finalize_keeps_the_output_mode_chosen_by_the_entry_point() {
+        let mut env = FlowEnvelope::empty();
+        env.meta.insert(META_ORIGINAL_QUESTION.into(), json!("Q"));
+        env.meta.insert(META_ACCUMULATED.into(), json!([]));
+        env.meta
+            .insert(OUTPUT_MODE_META.into(), json!(OUTPUT_MODE_STREAM));
+        let out = RagFinalizeNodeAdapter::new()
+            .execute(&node("rag_finalize"), &[input(env)], &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(
+            out.meta.get(OUTPUT_MODE_META).and_then(|v| v.as_str()),
+            Some(OUTPUT_MODE_STREAM)
+        );
     }
 
     // --- walidacja flow JSON (R1-R10) --------------------------------------

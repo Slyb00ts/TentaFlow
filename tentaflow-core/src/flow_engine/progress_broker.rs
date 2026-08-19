@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
 
+use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin, FlowRequestMeta};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 
 /// Process-global broker. The dashboard server builds one `AppState` per WS
@@ -33,6 +34,71 @@ pub fn global_broker() -> Arc<ProgressBroker> {
 /// on reconnect — §3.11 C), so a dropped tail never blocks the executor.
 const SCOPE_CHANNEL_CAPACITY: usize = 256;
 
+/// Server-minted provenance of the run currently executing under a scope.
+///
+/// A `ProgressEvent` carries none of this and never could: it is emitted from
+/// inside the executor, where the only values in reach are the ones nodes can
+/// write. The event log needs `origin`, the actor, the tenant and the
+/// correlation id for every row it stores (§2.3), so the dispatcher binds them
+/// HERE — once per run, from the `FlowRequestMeta` an entry point stamped after
+/// authorization — and the log copies the binding instead of deriving anything
+/// from the event (invariant 1).
+///
+/// This is NOT an authorization token and must never be used as one: unlike
+/// `session_owners`, a rebinding overwrites, because one session scope carries
+/// many runs one after another and each has its own `request_id`. The ACL that
+/// decides who may subscribe stays `session_owners`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunProvenance {
+    /// `FlowRequestMeta.request_id` — the `run_id` every stored row is keyed by.
+    pub run_id: String,
+    pub origin: FlowOrigin,
+    pub actor_kind: ActorKind,
+    pub actor_id: Option<String>,
+    pub actor_user_id: Option<String>,
+    pub org_id: Option<String>,
+    pub correlation_id: Option<String>,
+    pub session_id: Option<String>,
+}
+
+impl RunProvenance {
+    pub fn from_meta(meta: &FlowRequestMeta) -> Self {
+        Self {
+            run_id: meta.request_id.clone(),
+            origin: meta.origin,
+            actor_kind: meta.actor_kind,
+            actor_id: meta.actor_id.clone(),
+            actor_user_id: meta.actor_user_id.clone(),
+            org_id: meta.org_id.clone(),
+            correlation_id: meta.correlation_id.clone(),
+            session_id: meta.session_id.clone(),
+        }
+    }
+}
+
+/// Announces a run to the progress layer: binds its server-minted provenance to
+/// the broadcast scope and attaches the event-log subscriber to that scope.
+///
+/// Called from `ContextFactory::make_context`, the one place every dispatch
+/// entry passes through holding the authorized `FlowRequestMeta`. Two guards
+/// keep it to actual runs: a request with no `progress_sink` emits nothing at
+/// all (headless, tests), and `flow_depth > 0` is a capability hop re-entering
+/// the engine under the SAME scope — rebinding there would move the parent's
+/// remaining events onto the inner run's id.
+///
+/// Attaching before the flow starts is load-bearing: `ProgressBroker::publish`
+/// is a no-op for a scope nobody subscribed to, so a subscriber created after
+/// the first node started would miss the opening of the run.
+pub fn begin_run(meta: &FlowRequestMeta) {
+    if meta.progress_sink.is_none() || meta.flow_depth > 0 {
+        return;
+    }
+    let scope = meta.progress_scope();
+    let broker = global_broker();
+    broker.bind_run_provenance(&scope, RunProvenance::from_meta(meta));
+    crate::events::progress_log::attach_scope(&scope);
+}
+
 /// Per-scope broadcast registry. A scope is a session id or a run id. Senders
 /// are created lazily on first publish/subscribe and dropped when the last
 /// subscriber goes away AND no fresh event arrives — see `prune_if_idle`.
@@ -49,6 +115,10 @@ pub struct ProgressBroker {
     /// (UserQuestion / PermissionRequest / RouterDecision) — cross-principal
     /// leak (OWASP A01).
     session_owners: DashMap<String, String>,
+    /// §2.5 — server-minted provenance of the run executing under each scope,
+    /// bound by [`begin_run`] and read by the event-log subscriber. See
+    /// [`RunProvenance`] for why this overwrites where `session_owners` does not.
+    run_provenance: DashMap<String, RunProvenance>,
 }
 
 impl ProgressBroker {
@@ -56,7 +126,27 @@ impl ProgressBroker {
         Self {
             scopes: DashMap::new(),
             session_owners: DashMap::new(),
+            run_provenance: DashMap::new(),
         }
+    }
+
+    /// Records the provenance of the run now executing under `scope`.
+    pub fn bind_run_provenance(&self, scope: &str, provenance: RunProvenance) {
+        if scope.is_empty() {
+            return;
+        }
+        self.run_provenance.insert(scope.to_string(), provenance);
+    }
+
+    /// Provenance of the run currently executing under `scope`, if one is bound.
+    pub fn run_provenance(&self, scope: &str) -> Option<RunProvenance> {
+        self.run_provenance.get(scope).map(|p| p.value().clone())
+    }
+
+    /// Drops a scope's provenance binding. Called by the event-log subscriber
+    /// when it stops watching a scope, so an idle node keeps no run metadata.
+    pub fn release_run_provenance(&self, scope: &str) {
+        self.run_provenance.remove(scope);
     }
 
     /// Binds a session-scope key to the principal that started a flow under it.

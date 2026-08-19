@@ -33,18 +33,36 @@ impl ConversationHistoryNodeAdapter {
         Self
     }
 
-    fn pick_session(node: &FlowNode, ctx: &ExecutionContext) -> Result<String> {
+    /// Resolves the conversation to replay. `Ok(None)` means "this run has no
+    /// conversation": a node with `require_session: false` sits in a shell
+    /// shared between a conversational caller and a one-shot one (the RAG
+    /// `query` shell answers both the project chat and the addon's `ask`), and
+    /// a one-shot run has nothing to replay. Without the opt-in a missing
+    /// session stays a hard error, so a chat flow that forgot to pass one still
+    /// fails loudly instead of silently losing its memory.
+    fn pick_session(node: &FlowNode, ctx: &ExecutionContext) -> Result<Option<String>> {
         if let Some(s) = node
             .config
             .get("session_id")
             .and_then(|v| v.as_str())
             .filter(|s| !s.is_empty())
         {
-            return Ok(s.to_string());
+            return Ok(Some(s.to_string()));
         }
-        ctx.session_id.clone().ok_or_else(|| {
-            anyhow!("conversation_history adapter: no session_id (node config nor ctx.session_id)")
-        })
+        if let Some(s) = ctx.session_id.clone() {
+            return Ok(Some(s));
+        }
+        let required = node
+            .config
+            .get("require_session")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        if required {
+            return Err(anyhow!(
+                "conversation_history adapter: no session_id (node config nor ctx.session_id)"
+            ));
+        }
+        Ok(None)
     }
 }
 
@@ -85,7 +103,10 @@ impl NodeAdapter for ConversationHistoryNodeAdapter {
             .map(|n| n as u32)
             .unwrap_or(DEFAULT_MAX_MESSAGES);
 
-        let history = ctx.history.recent(&session, max).await?;
+        let history = match session {
+            Some(ref s) => ctx.history.recent(s, max).await?,
+            None => Vec::new(),
+        };
         let base_len = history.len();
 
         let mut out: FlowEnvelope = (**envelope).clone();
@@ -213,5 +234,45 @@ mod tests {
             Some(&serde_json::Value::from(0usize))
         );
         assert_eq!(*fake.appended.lock().unwrap(), 0);
+    }
+
+    /// A run without a conversation is an error by default — a chat flow that
+    /// forgot its session must fail loudly, not silently lose its memory.
+    #[tokio::test]
+    async fn missing_session_is_an_error_by_default() {
+        let env = FlowEnvelope::empty();
+        let mut ctx = stub_ctx();
+        ctx.session_id = None;
+        let err = ConversationHistoryNodeAdapter::new()
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("no session_id"));
+    }
+
+    /// The shared RAG shell opts out: the addon's one-shot `ask` has nothing to
+    /// replay, so the node passes through with an empty history.
+    #[tokio::test]
+    async fn missing_session_replays_nothing_when_not_required() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("pytanie".into());
+        let mut ctx = stub_ctx();
+        ctx.session_id = None;
+        let fake = Arc::new(FakeHistory {
+            messages: vec![ChatMessage::user("cudza-sesja")],
+            appended: Mutex::new(0),
+        });
+        ctx.history = fake.clone();
+
+        let out = ConversationHistoryNodeAdapter::new()
+            .execute(&node(json!({"require_session": false})), &[input(env)], &ctx)
+            .await
+            .expect("shared shell answers a caller without a conversation");
+        assert!(out.context.messages.is_empty(), "nothing to replay");
+        assert_eq!(
+            out.meta.get(HISTORY_BASE_LEN_META),
+            Some(&serde_json::Value::from(0usize))
+        );
+        assert_eq!(out.payload.as_text(), Some("pytanie"));
     }
 }

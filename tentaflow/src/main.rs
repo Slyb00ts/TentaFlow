@@ -296,6 +296,21 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy Project Studio: {}", e);
         return Err(e);
     }
+    // Durable ingest queue — `data/jobs.db`, its own writer connection (the main
+    // database has ONE writer and a queue claim/heartbeat/finish would serialise
+    // behind settings, flows and audit writes), and a file SEPARATE from
+    // `events.db` because the event log rotates under retention while queued
+    // work must not. Reconciliation runs right after the open, BEFORE any worker
+    // can claim: a job left `running` by a process run that no longer exists is
+    // closed here, and a job still `queued` is kept and drained below.
+    if let Err(e) =
+        tentaflow_core::services::ingest_jobs::init(&paths::data_dir().join("jobs.db"))
+    {
+        error!("Ingest queue initialisation failed: {}", e);
+        return Err(e);
+    }
+    tentaflow_core::project_studio::ingest::reconcile_orphans();
+
     // Event log — `data/events.db`, its own writer connection so a
     // high-frequency timeline never queues behind settings, flows, agents and
     // audit writes on the main database's single writer. Also STARTS the audit
@@ -545,6 +560,11 @@ async fn run_server(args: Args) -> Result<()> {
     // Inicjalizacja routera (non-blocking)
     info!("Inicjalizacja routera...");
     let router: Arc<Router> = Arc::new(Router::new(config.clone(), Some(db.clone()))?);
+
+    // Ingest queue workers. They need the router (the ingest flow runs through
+    // it) and the core pool, which a job recovered after a restart has no
+    // request context to get them from, so the handles are published here.
+    tentaflow_core::project_studio::ingest::start_workers(db.clone(), router.clone());
 
     // === Phase 4 (cont.): wire the supervisor against the router's
     // `LiveHandlesCache` so reconcile() updates the same cache the routing
@@ -1119,6 +1139,9 @@ async fn run_server(args: Args) -> Result<()> {
     }
     if let Err(e) = tentaflow_core::ml_studio::db::checkpoint_wal() {
         tracing::warn!("Checkpoint WAL ML Studio nieudany: {}", e);
+    }
+    if let Err(e) = tentaflow_core::services::ingest_jobs::checkpoint_wal() {
+        error!("WAL checkpoint kolejki ingestu nieudany: {}", e);
     }
     if let Err(e) = tentaflow_core::project_studio::db::checkpoint_wal() {
         tracing::warn!("Checkpoint WAL Project Studio nieudany: {}", e);

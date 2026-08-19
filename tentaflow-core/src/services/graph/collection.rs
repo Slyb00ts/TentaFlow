@@ -1342,7 +1342,7 @@ impl GraphManager {
     /// its slot write lock.
     fn seal_key_with_seed(&self, key: &GraphKey, seed: (GraphEngine, PathBuf)) -> Result<()> {
         let (engine, seed_path) = seed;
-        let entry = self.canonical_entry_for(key, engine, seed_path.clone());
+        let entry = self.canonical_entry_for(key, engine, seed_path);
 
         let mut guard = entry
             .slot
@@ -1357,8 +1357,8 @@ impl GraphManager {
         //    wins when it exists (it is the source of truth for an existing
         //    collection); with no row the interned entry decides, and that is the
         //    path a creator blocked on this lock will use.
-        // MUTATION A: pre-lock path (the defect).
-        let path = seed_path;
+        // MUTATION B: always derive from the key, ignoring the registry row.
+        let path = self.file_path_for(&key.org_id, &key.addon_id, &key.collection)?;
 
         // 1) Zamknij backend (dekrement licznika, gdy był otwarty) i oznacz slot
         //    `Removed` — pod lockiem żaden inny wątek nie operuje na tej bazie.

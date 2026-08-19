@@ -427,7 +427,7 @@ impl FlowRequestMeta {
 
     /// Effective broadcast scope for progress events — session id when present,
     /// else the request id.
-    fn progress_scope(&self) -> String {
+    pub(crate) fn progress_scope(&self) -> String {
         self.session_id
             .clone()
             .unwrap_or_else(|| self.request_id.clone())
@@ -505,6 +505,10 @@ struct ContextFactory {
 
 impl ContextFactory {
     fn make_context(&self, meta: &FlowRequestMeta) -> ExecutionContext {
+        // §2.5 — the one place every dispatch entry passes through holding the
+        // authorized meta. The event log copies the provenance bound here; a
+        // `ProgressEvent` carries none, and nothing a node writes can reach it.
+        crate::flow_engine::progress_broker::begin_run(meta);
         ExecutionContext {
             request_id: meta.request_id.clone(),
             execution_id: 0,

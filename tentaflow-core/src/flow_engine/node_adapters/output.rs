@@ -39,6 +39,22 @@ impl Default for OutputNodeAdapter {
 /// branchy. Modyfikacje listy zmieniaja kolejnosc fallback'a.
 const PORT_PRIORITY: &[&str] = &["text", "audio", "image", "video", "embedding", "other"];
 
+/// Meta key selecting the terminal shape of the answer. It lives in `meta`, not
+/// in the node config, because ONE shell serves two callers: the RAG addon asks
+/// blocking and needs `{answer, citations}` in the payload, while the project
+/// chat streams the same graph and needs the payload untouched. A shell pinned
+/// to one shape in its config could only ever serve one of them.
+pub const OUTPUT_MODE_META: &str = "output_mode";
+
+/// `meta[OUTPUT_MODE_META]` value that serializes `{answer, citations}` from
+/// `meta["rag_citations"]` into the Text payload.
+pub const OUTPUT_MODE_CITATIONS: &str = "citations";
+
+/// `meta[OUTPUT_MODE_META]` value that leaves the payload as produced. Any
+/// value other than [`OUTPUT_MODE_CITATIONS`] — and an absent key — resolves
+/// here, so a flow that never heard of the RAG shell is untouched.
+pub const OUTPUT_MODE_STREAM: &str = "stream";
+
 #[async_trait]
 impl NodeAdapter for OutputNodeAdapter {
     fn node_type(&self) -> &str {
@@ -62,7 +78,7 @@ impl NodeAdapter for OutputNodeAdapter {
 
     async fn execute(
         &self,
-        node: &FlowNode,
+        _node: &FlowNode,
         inputs: &[NodeInput],
         _ctx: &ExecutionContext,
     ) -> Result<FlowEnvelope> {
@@ -92,18 +108,18 @@ impl NodeAdapter for OutputNodeAdapter {
         // fallback, np. Empty / Json).
         let mut out = primary.unwrap_or_else(|| (*inputs[0].envelope).clone());
 
-        // RAG E2.0 — gdy flow jawnie tego zażąda (`emit_citations: true`) i
-        // envelope niesie realne cytaty retrievalu w meta["rag_citations"],
-        // serializuj odpowiedź jako `{answer, citations}` JSON do payloadu Text.
-        // Dzięki temu addon dostaje odpowiedź LLM RAZEM z cytatami wybranymi
-        // dokładnie przez retrieval (jedno źródło prawdy), bez osobnego SELECT-a.
-        // Bez flagi output zachowuje się jak dotąd (passthrough) — generyczne
-        // flow nie są dotknięte.
-        let emit = node
-            .config
-            .get("emit_citations")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
+        // Citation mode: the envelope carries the real retrieval hits in
+        // meta["rag_citations"], so the answer is serialized as `{answer,
+        // citations}` JSON into the Text payload — the caller gets the LLM text
+        // TOGETHER with exactly what retrieval returned (one source of truth,
+        // no second SELECT). The mode comes from meta; `rag_finalize` seeds the
+        // RAG default and an entry point that streams stamps `stream` instead,
+        // so a generic flow (no mode in meta) stays a passthrough.
+        let emit = out
+            .meta
+            .get(OUTPUT_MODE_META)
+            .and_then(|v| v.as_str())
+            .is_some_and(|m| m == OUTPUT_MODE_CITATIONS);
         if emit {
             if let (Some(answer), Some(citations)) = (
                 out.payload.as_text().map(str::to_string),
@@ -194,30 +210,48 @@ mod tests {
         assert_eq!(r.payload.as_text(), Some("priority-wins"));
     }
 
-    #[tokio::test]
-    async fn output_emits_answer_and_citations_when_flagged() {
-        // RAG E2.0 bug 2 — z emit_citations output serializuje {answer, citations}
-        // z meta.rag_citations (realne hity) razem z tekstem LLM.
-        let adapter = OutputNodeAdapter::new();
+    /// One envelope, one node config (`mode: "stream"`, the shell's saved
+    /// shape) — the two RAG modes are told apart ONLY by `meta`.
+    fn rag_answer_envelope(mode: Option<&str>) -> FlowEnvelope {
         let mut env = FlowEnvelope::with_payload(FlowValue::Text("Odpowiedz LLM".into()));
         env.meta.insert(
             "rag_citations".into(),
             serde_json::json!([{"doc_id": "d1", "chunk_index": 3, "text": "t", "score": 0.2}]),
         );
-        let inputs = vec![NodeInput {
-            from_node_id: "llm".into(),
-            from_port: "full".into(),
-            envelope: Arc::new(env),
-        }];
-        let node = FlowNode {
-            id: "out-1".into(),
+        if let Some(m) = mode {
+            env.meta
+                .insert(OUTPUT_MODE_META.into(), serde_json::json!(m));
+        }
+        env
+    }
+
+    /// The node config of the shared RAG shell: `mode: "stream"` is the
+    /// streaming end-shape R7 demands, NOT a mode pin for this adapter.
+    fn shell_output_node() -> FlowNode {
+        FlowNode {
+            id: "out".into(),
             node_type: "output".into(),
-            config: serde_json::json!({ "emit_citations": true }),
+            config: serde_json::json!({ "mode": "stream" }),
             position: None,
             label: None,
             region: None,
-        };
-        let r = adapter.execute(&node, &inputs, &stub_ctx()).await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn output_emits_answer_and_citations_when_meta_selects_citations() {
+        // Blocking caller (RAG addon `ask`): meta picks the citation block, so
+        // the payload carries the LLM text TOGETHER with the real hits.
+        let adapter = OutputNodeAdapter::new();
+        let inputs = vec![NodeInput {
+            from_node_id: "llm".into(),
+            from_port: "full".into(),
+            envelope: Arc::new(rag_answer_envelope(Some(OUTPUT_MODE_CITATIONS))),
+        }];
+        let r = adapter
+            .execute(&shell_output_node(), &inputs, &stub_ctx())
+            .await
+            .unwrap();
         let text = r.payload.as_text().expect("payload Text");
         let parsed: serde_json::Value = serde_json::from_str(text).expect("treść to JSON");
         assert_eq!(parsed["answer"].as_str(), Some("Odpowiedz LLM"));
@@ -227,22 +261,37 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn output_passthrough_without_flag() {
-        // Bez emit_citations output zachowuje się jak passthrough (generyczne flow).
+    async fn output_passes_payload_through_when_meta_selects_stream() {
+        // Same node, same citations in meta — the streaming caller (project
+        // chat) gets the raw answer, never the JSON envelope.
         let adapter = OutputNodeAdapter::new();
-        let mut env = FlowEnvelope::with_payload(FlowValue::Text("plain".into()));
-        env.meta
-            .insert("rag_citations".into(), serde_json::json!([{"doc_id": "d"}]));
         let inputs = vec![NodeInput {
             from_node_id: "llm".into(),
             from_port: "full".into(),
-            envelope: Arc::new(env),
+            envelope: Arc::new(rag_answer_envelope(Some(OUTPUT_MODE_STREAM))),
+        }];
+        let r = adapter
+            .execute(&shell_output_node(), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(r.payload.as_text(), Some("Odpowiedz LLM"));
+    }
+
+    #[tokio::test]
+    async fn output_passthrough_when_meta_carries_no_mode() {
+        // A generic flow whose envelope happens to carry citations (e.g. a
+        // `project_knowledge` node) must not be rewritten into RAG JSON.
+        let adapter = OutputNodeAdapter::new();
+        let inputs = vec![NodeInput {
+            from_node_id: "llm".into(),
+            from_port: "full".into(),
+            envelope: Arc::new(rag_answer_envelope(None)),
         }];
         let r = adapter
             .execute(&output_node(), &inputs, &stub_ctx())
             .await
             .unwrap();
-        assert_eq!(r.payload.as_text(), Some("plain"));
+        assert_eq!(r.payload.as_text(), Some("Odpowiedz LLM"));
     }
 
     #[tokio::test]

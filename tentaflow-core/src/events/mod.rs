@@ -5,13 +5,16 @@
 // mirror and the retention sweep. It answers where a call came from, who made
 // it and how it went, from ONE table so the browser can ask across origins.
 //
-// This module is the STORE. It does not subscribe to the flow engine and it
-// exposes no protocol variant or handler: the progress sink (§2.6) and the
-// browser (§2.10) are separate tracks that call `store::append` and
-// `store::read_run`.
+// The store is `store` + `db`; `progress_log` is what fills it, by subscribing
+// to the flow engine's progress broadcast (§2.6) and translating it — no new
+// instrumentation anywhere, every timing a difference between two rows
+// (invariant 5). `metrics` reads those differences back out (§2.7). The browser
+// (§2.10) is a separate track.
 
 pub mod audit_outbox;
 pub mod db;
+pub mod metrics;
+pub mod progress_log;
 pub mod retention;
 pub mod store;
 #[cfg(test)]
@@ -24,9 +27,9 @@ pub use store::{
     RunEvent, StoredEvent,
 };
 
-/// Opens `<data>/events.db`, publishes the pool and STARTS the two background
-/// loops the log needs to be more than a growing file: the audit-outbox
-/// delivery loop and the retention sweep.
+/// Opens `<data>/events.db`, publishes the pool and STARTS everything the log
+/// needs to be more than an empty file: the progress subscriber that fills it,
+/// the audit-outbox delivery loop and the retention sweep.
 ///
 /// Starting them here is the point. The same two mechanisms exist in
 /// `code_studio` — `audit_outbox::spawn_delivery_loop`,
@@ -39,6 +42,7 @@ pub use store::{
 pub fn init(main_db: &crate::db::DbPool) -> Result<()> {
     let pool = db::init(&crate::paths::data_dir().join("events.db"))?;
     audit_outbox::spawn_delivery_loop(main_db.clone(), pool.clone());
-    retention::start_retention_task(main_db.clone(), pool);
+    retention::start_retention_task(main_db.clone(), pool.clone());
+    progress_log::start(pool);
     Ok(())
 }

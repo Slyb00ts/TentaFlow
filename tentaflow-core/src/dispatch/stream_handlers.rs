@@ -2002,11 +2002,26 @@ fn project_studio_chat_stream_handler(
         envelope
             .meta
             .insert("graph_enabled".into(), serde_json::Value::Bool(false));
+        // The shell reads its answer model from a DEDICATED meta entry, not from
+        // `model`: routing seeds `model` with the flow's own published name when
+        // the addon asks it by name, and the answer node must never dispatch the
+        // shell to itself. No project model = the shell's `rag-llm` fallback.
         if let Some(m) = model {
-            envelope
-                .meta
-                .insert("model".into(), serde_json::Value::String(m));
+            envelope.meta.insert(
+                crate::db::seed::RAG_ANSWER_MODEL_META.into(),
+                serde_json::Value::String(m),
+            );
         }
+        // Terminal shape: the chat streams, so the shell's output node must not
+        // rewrite the answer into the addon's `{answer, citations}` JSON. The
+        // stamp belongs to the entry point (never to the model's content), same
+        // rule as the vector scope minted below.
+        envelope.meta.insert(
+            crate::flow_engine::node_adapters::output::OUTPUT_MODE_META.into(),
+            serde_json::Value::String(
+                crate::flow_engine::node_adapters::output::OUTPUT_MODE_STREAM.into(),
+            ),
+        );
 
         // Cancel bound to the subscription: a dropped/unsubscribed client
         // aborts the flow (push failure below fires this token).
@@ -2040,7 +2055,7 @@ fn project_studio_chat_stream_handler(
 
         let dispatch = fd
             .dispatch_by_flow_id_streaming(
-                crate::db::seed::PS_CHAT_FLOW_ID.to_string(),
+                crate::db::seed::RAG_QUERY_FLOW_ID.to_string(),
                 envelope,
                 meta,
             )
@@ -2086,8 +2101,9 @@ fn project_studio_chat_stream_handler(
             }
         }
 
-        // The final envelope carries the retrieval citations set by the
-        // project_knowledge node (meta["rag_citations"]).
+        // The final envelope carries the retrieval citations accumulated by the
+        // shell's retrieval loop and pinned by `rag_finalize`
+        // (meta["rag_citations"]).
         let (citations_json, flow_error) = match exec.outcome.await {
             Ok(outcome) => {
                 let cites = outcome
