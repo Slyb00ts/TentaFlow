@@ -112,6 +112,172 @@ enum ResolvedFlow {
     CompileFailed,
 }
 
+/// Where a flow request entered the system. An enum, not a `String`, so a typo
+/// cannot reach the event log; the snake_case slug from [`FlowOrigin::as_str`]
+/// is the only spelling that ever leaves the process.
+///
+/// Minted by the entry point AFTER authorization and carried as a struct field
+/// — never as an `envelope.meta` key. Meta is writable by every node, including
+/// a WASM addon block that deserializes a whole envelope from guest memory, so
+/// a provenance stamp living there would be forgeable by model output.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FlowOrigin {
+    /// Dashboard chat / audio surface over the binary protocol.
+    Chat,
+    /// Dashboard administration / builder surfaces over the binary protocol
+    /// that call a model but are not a conversation: a voice preview in
+    /// Settings, Agent Builder assist, an agent playground run. Separate from
+    /// `Chat` because folding them together makes the chat volume wrong and
+    /// hides admin-initiated model spend behind end-user traffic.
+    Dashboard,
+    /// Project Studio (project chat, project ingest).
+    Project,
+    /// Code Studio assist.
+    CodeStudio,
+    /// External `/v1/*` REST integration.
+    Api,
+    /// A WASM addon calling core as a model / ingest client.
+    Addon,
+    /// Camera analysis pipeline (no human in the loop).
+    Camera,
+    /// Admin scheduler tick.
+    Scheduler,
+    /// Reverse mesh path — a peer node forwarded the request.
+    Mesh,
+    /// Agent harness run (including sub-agent and reactive continuations).
+    Agent,
+    /// Internal core work with no external caller (translate, catalog probes,
+    /// benchmarks, ML Studio evaluation). Also the value a context carries
+    /// before an entry point stamps it.
+    #[default]
+    System,
+}
+
+impl FlowOrigin {
+    /// Stable wire spelling — persisted in the event log and rendered by the UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlowOrigin::Chat => "chat",
+            FlowOrigin::Dashboard => "dashboard",
+            FlowOrigin::Project => "project",
+            FlowOrigin::CodeStudio => "code_studio",
+            FlowOrigin::Api => "api",
+            FlowOrigin::Addon => "addon",
+            FlowOrigin::Camera => "camera",
+            FlowOrigin::Scheduler => "scheduler",
+            FlowOrigin::Mesh => "mesh",
+            FlowOrigin::Agent => "agent",
+            FlowOrigin::System => "system",
+        }
+    }
+}
+
+/// Kind of authenticated caller behind a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ActorKind {
+    User,
+    ApiKey,
+    Addon,
+    #[default]
+    System,
+}
+
+impl ActorKind {
+    /// Stable wire spelling — persisted in the event log and rendered by the UI.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ActorKind::User => "user",
+            ActorKind::ApiKey => "api_key",
+            ActorKind::Addon => "addon",
+            ActorKind::System => "system",
+        }
+    }
+}
+
+/// The authenticated caller. Built ONLY by an entry point, after authorization
+/// — the constructors are the whole public surface, so no code path can invent
+/// an actor from request content.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct FlowActor {
+    kind: ActorKind,
+    /// user_id / API key uid / addon instance id / system component id.
+    id: Option<String>,
+    /// The user an API key resolves to; `None` marks a service key.
+    user_id: Option<String>,
+}
+
+impl FlowActor {
+    pub fn user(user_id: impl Into<String>) -> Self {
+        let user_id = user_id.into();
+        Self {
+            kind: ActorKind::User,
+            id: Some(user_id.clone()),
+            user_id: Some(user_id),
+        }
+    }
+
+    /// `bound_user` is the user an API key resolves to; `None` marks a service
+    /// key, which the UI shows explicitly rather than as an empty field. The
+    /// binding is resolved server-side while verifying the key — the call
+    /// itself does not carry it.
+    pub fn api_key(key_uid: impl Into<String>, bound_user: Option<String>) -> Self {
+        Self {
+            kind: ActorKind::ApiKey,
+            id: Some(key_uid.into()),
+            user_id: bound_user,
+        }
+    }
+
+    pub fn addon(addon_id: impl Into<String>) -> Self {
+        Self {
+            kind: ActorKind::Addon,
+            id: Some(addon_id.into()),
+            user_id: None,
+        }
+    }
+
+    pub fn system() -> Self {
+        Self {
+            kind: ActorKind::System,
+            id: None,
+            user_id: None,
+        }
+    }
+
+    /// System actor naming the core component that acted (a camera id, a
+    /// scheduler job id). Keeps `ActorKind::System` — there is no user behind
+    /// it — while still answering "which part of the system".
+    pub fn system_component(id: impl Into<String>) -> Self {
+        Self {
+            kind: ActorKind::System,
+            id: Some(id.into()),
+            user_id: None,
+        }
+    }
+
+    /// Rebuilds an actor from the flat fields it was spread into (a
+    /// `FlowRequestMeta` / `ExecutionContext` carries the three parts, not the
+    /// struct). `pub(crate)` — outside the crate the constructors above stay
+    /// the only way to mint one.
+    pub(crate) fn from_parts(kind: ActorKind, id: Option<String>, user_id: Option<String>) -> Self {
+        Self { kind, id, user_id }
+    }
+
+    pub fn kind(&self) -> ActorKind {
+        self.kind
+    }
+
+    pub fn id(&self) -> Option<&str> {
+        self.id.as_deref()
+    }
+
+    /// The user behind this actor, when there is one: the user themselves, or
+    /// the user an API key is bound to.
+    pub fn user_id(&self) -> Option<&str> {
+        self.user_id.as_deref()
+    }
+}
+
 /// Per-request metadata przekazywane przez callera. FlowDispatcher buduje z
 /// tego `ExecutionContext` (klonując Arc'i dispatcherów + clock + blobs).
 #[derive(Clone)]
@@ -132,6 +298,22 @@ pub struct FlowRequestMeta {
     /// `ExecutionContext::vector_home`. Osobne pole, nie klucz w `options`/meta:
     /// caller-addon nie moze sterowac miejscem zapisu indeksu.
     pub vector_home: Option<std::path::PathBuf>,
+    /// §2.5 — where this request entered the system. Minted by the entry point
+    /// after authorization. A separate field, not a `meta` key, for the same
+    /// reason as `vector_home`: `envelope.meta` is writable by every node
+    /// (a WASM addon block included), so identity kept there would be
+    /// derivable from model output.
+    pub origin: FlowOrigin,
+    /// §2.5 — kind of the authenticated caller. Set together with `actor_id` /
+    /// `actor_user_id` from a [`FlowActor`] built by the entry point.
+    pub actor_kind: ActorKind,
+    /// user_id / API key uid / addon instance id / system component id.
+    pub actor_id: Option<String>,
+    /// The user behind an API key; `None` means a service key with no binding
+    /// (the UI must show that explicitly, not as an empty field).
+    pub actor_user_id: Option<String>,
+    /// Ties this run to the audit trail and to `compliance_ai_events`.
+    pub correlation_id: Option<String>,
     pub deadline: Option<Instant>,
     pub cancel_token: CancellationToken,
     /// §3.11 C — per-request progress fan-out. The caller (a handler holding
@@ -150,7 +332,12 @@ pub struct FlowRequestMeta {
 }
 
 impl FlowRequestMeta {
-    pub fn new(request_id: impl Into<String>) -> Self {
+    /// `origin` and `actor` are mandatory positional arguments on purpose:
+    /// there is no defaulted variant, so an entry point that forgets to say
+    /// where a request came from fails to COMPILE instead of silently logging
+    /// `system`. `correlation_id` starts empty — only callers that already hold
+    /// an audit / compliance request id set it.
+    pub fn new(request_id: impl Into<String>, origin: FlowOrigin, actor: FlowActor) -> Self {
         Self {
             request_id: request_id.into(),
             session_id: None,
@@ -159,6 +346,11 @@ impl FlowRequestMeta {
             addon_id: None,
             vector_home: None,
             org_id: None,
+            origin,
+            actor_kind: actor.kind,
+            actor_id: actor.id,
+            actor_user_id: actor.user_id,
+            correlation_id: None,
             deadline: None,
             cancel_token: CancellationToken::new(),
             progress_sink: None,
@@ -257,6 +449,11 @@ impl ContextFactory {
             addon_id: meta.addon_id.clone(),
             org_id: meta.org_id.clone(),
             vector_home: meta.vector_home.clone(),
+            origin: meta.origin,
+            actor_kind: meta.actor_kind,
+            actor_id: meta.actor_id.clone(),
+            actor_user_id: meta.actor_user_id.clone(),
+            correlation_id: meta.correlation_id.clone(),
             deadline: meta.deadline,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: meta.cancel_token.clone(),
@@ -1299,7 +1496,7 @@ mod tests {
     #[test]
     fn make_context_propagates_addon_identity_from_meta() {
         let factory = stub_context_factory();
-        let mut meta = FlowRequestMeta::new("req-1");
+        let mut meta = FlowRequestMeta::new("req-1", FlowOrigin::Api, FlowActor::system());
         meta.addon_id = Some("inst-rag-1".to_string());
         meta.org_id = Some("org-7".to_string());
         let ctx = factory.make_context(&meta);
@@ -1311,10 +1508,139 @@ mod tests {
     fn make_context_non_addon_call_leaves_identity_none() {
         let factory = stub_context_factory();
         // Domyślne meta (np. routing /v1 user / kamera / agent) — bez tożsamości.
-        let meta = FlowRequestMeta::new("req-2");
+        let meta = FlowRequestMeta::new("req-2", FlowOrigin::Api, FlowActor::system());
         let ctx = factory.make_context(&meta);
         assert!(ctx.addon_id.is_none());
         assert!(ctx.org_id.is_none());
+    }
+
+    /// §3 invariant 1 — `origin` / `actor*` are minted by the server and are
+    /// NOT derivable from model output. `envelope.meta` is writable by every
+    /// node (a WASM addon block deserializes a whole envelope from the guest),
+    /// so an envelope carrying its own `origin`/`actor_kind`/`actor_id` must
+    /// change NOTHING about the context the engine runs under.
+    #[test]
+    fn envelope_meta_cannot_forge_server_minted_provenance() {
+        let factory = stub_context_factory();
+        let mut meta = FlowRequestMeta::new(
+            "req-forge",
+            FlowOrigin::Camera,
+            FlowActor::system_component("cam-hall"),
+        );
+
+        // What a compromised node / model output would try to inject.
+        let mut forged = FlowEnvelope::empty();
+        forged
+            .meta
+            .insert("origin".into(), serde_json::Value::String("admin".into()));
+        forged.meta.insert(
+            "actor_kind".into(),
+            serde_json::Value::String("user".into()),
+        );
+        forged
+            .meta
+            .insert("actor_id".into(), serde_json::Value::String("root".into()));
+        forged.meta.insert(
+            "actor_user_id".into(),
+            serde_json::Value::String("root".into()),
+        );
+        forged.meta.insert(
+            "correlation_id".into(),
+            serde_json::Value::String("forged-corr".into()),
+        );
+        meta.correlation_id = Some("server-corr".into());
+
+        let mut ctx = factory.make_context(&meta);
+        ctx.initial_envelope = Arc::new(forged);
+
+        assert_eq!(ctx.origin, FlowOrigin::Camera);
+        assert_eq!(ctx.actor_kind, ActorKind::System);
+        assert_eq!(ctx.actor_id.as_deref(), Some("cam-hall"));
+        assert_eq!(ctx.actor_user_id, None);
+        assert_eq!(ctx.correlation_id.as_deref(), Some("server-corr"));
+    }
+
+    /// The copy site in `make_context` — all five provenance fields reach the
+    /// context the adapters see.
+    #[test]
+    fn make_context_propagates_provenance_from_meta() {
+        let factory = stub_context_factory();
+        let mut meta = FlowRequestMeta::new(
+            "req-prov",
+            FlowOrigin::Api,
+            FlowActor::api_key("key-42", Some("user-7".to_string())),
+        );
+        meta.correlation_id = Some("corr-9".into());
+        let ctx = factory.make_context(&meta);
+        assert_eq!(ctx.origin, FlowOrigin::Api);
+        assert_eq!(ctx.actor_kind, ActorKind::ApiKey);
+        assert_eq!(ctx.actor_id.as_deref(), Some("key-42"));
+        assert_eq!(ctx.actor_user_id.as_deref(), Some("user-7"));
+        assert_eq!(ctx.correlation_id.as_deref(), Some("corr-9"));
+        // A nested run (subflow / loop / map / agent body) is a CLONE of the
+        // parent context with only its own fields rewritten
+        // (`SubflowRunner::prepare`), so provenance is inherited untouched.
+        let child = ctx.clone();
+        assert_eq!(child.origin, ctx.origin);
+        assert_eq!(child.actor_kind, ctx.actor_kind);
+        assert_eq!(child.actor_id, ctx.actor_id);
+        assert_eq!(child.actor_user_id, ctx.actor_user_id);
+        assert_eq!(child.correlation_id, ctx.correlation_id);
+        assert_eq!(
+            child.actor(),
+            FlowActor::api_key("key-42", Some("user-7".to_string()))
+        );
+    }
+
+    /// The slugs are a wire contract: the event log stores them and the UI
+    /// filters on them, so a rename silently breaks stored history.
+    #[test]
+    fn provenance_slugs_are_stable_wire_spellings() {
+        assert_eq!(FlowOrigin::Chat.as_str(), "chat");
+        assert_eq!(FlowOrigin::Project.as_str(), "project");
+        assert_eq!(FlowOrigin::CodeStudio.as_str(), "code_studio");
+        assert_eq!(FlowOrigin::Api.as_str(), "api");
+        assert_eq!(FlowOrigin::Addon.as_str(), "addon");
+        assert_eq!(FlowOrigin::Camera.as_str(), "camera");
+        assert_eq!(FlowOrigin::Scheduler.as_str(), "scheduler");
+        assert_eq!(FlowOrigin::Mesh.as_str(), "mesh");
+        assert_eq!(FlowOrigin::Agent.as_str(), "agent");
+        assert_eq!(FlowOrigin::System.as_str(), "system");
+        assert_eq!(ActorKind::User.as_str(), "user");
+        assert_eq!(ActorKind::ApiKey.as_str(), "api_key");
+        assert_eq!(ActorKind::Addon.as_str(), "addon");
+        assert_eq!(ActorKind::System.as_str(), "system");
+    }
+
+    /// §2.5 — a service key has no user behind it and must stay distinguishable
+    /// from a user-bound key, so the UI can say "service key" instead of
+    /// rendering an empty field.
+    #[test]
+    fn api_key_actor_keeps_service_keys_distinct_from_user_bound_keys() {
+        let bound = FlowActor::api_key("key-a", Some("u-1".to_string()));
+        assert_eq!(bound.kind(), ActorKind::ApiKey);
+        assert_eq!(bound.id(), Some("key-a"));
+        assert_eq!(bound.user_id(), Some("u-1"));
+
+        let service = FlowActor::api_key("key-b", None);
+        assert_eq!(service.kind(), ActorKind::ApiKey);
+        assert_eq!(service.id(), Some("key-b"));
+        assert_eq!(service.user_id(), None);
+    }
+
+    /// §2.5 — the camera entry point has no user in the loop but must still say
+    /// WHICH camera acted.
+    #[test]
+    fn camera_entry_stamps_camera_origin_with_the_camera_as_system_actor() {
+        let meta = FlowRequestMeta::new(
+            "cam-front-door",
+            FlowOrigin::Camera,
+            FlowActor::system_component("front-door"),
+        );
+        assert_eq!(meta.origin, FlowOrigin::Camera);
+        assert_eq!(meta.actor_kind, ActorKind::System);
+        assert_eq!(meta.actor_id.as_deref(), Some("front-door"));
+        assert_eq!(meta.actor_user_id, None);
     }
 
     #[test]

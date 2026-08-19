@@ -457,7 +457,13 @@ pub async fn embed_texts(router: &Router, texts: Vec<String>) -> Result<Vec<Vec<
         dimensions: None,
         user: None,
     };
-    let mut rctx = crate::services::runtime::context::ExecutionContext::new(None);
+    // §2.5 — project ingest / retrieval embeddings run on behalf of a project,
+    // not of the user who happened to trigger the job.
+    let mut rctx = crate::services::runtime::context::ExecutionContext::new(
+        None,
+        crate::flow_engine::dispatcher::FlowOrigin::Project,
+        crate::flow_engine::dispatcher::FlowActor::system_component("project_studio"),
+    );
     let response = executor
         .execute_embeddings(request, &mut rctx)
         .await
@@ -1366,7 +1372,15 @@ async fn ingest_file_via_flow(
         flow_depth: 0,
     };
 
-    let mut rctx = crate::services::runtime::context::ExecutionContext::new(None);
+    // §2.5 — the acting identity is the project: an ingest job outlives the
+    // session that queued it, so the project id is the honest actor.
+    let mut rctx = crate::services::runtime::context::ExecutionContext::new(
+        None,
+        crate::flow_engine::dispatcher::FlowOrigin::Project,
+        crate::flow_engine::dispatcher::FlowActor::system_component(format!(
+            "project:{project_id}"
+        )),
+    );
     rctx.addon_id = Some(vector_scope(project_id));
     rctx.org_id = Some(org_id.to_string());
 

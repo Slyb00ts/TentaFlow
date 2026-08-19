@@ -86,7 +86,17 @@ impl LocalRunner {
             audio_input: None,
         };
 
-        let mut exec_ctx = ExecutionContext::new(self.user.clone());
+        // §2.5 — a benchmark run is core measurement work; the operator who
+        // started it (when there is one) stays the actor for attribution.
+        let actor = match self.user.as_ref() {
+            Some(u) => crate::flow_engine::dispatcher::FlowActor::user(u.user_id.clone()),
+            None => crate::flow_engine::dispatcher::FlowActor::system_component("benchmark"),
+        };
+        let mut exec_ctx = ExecutionContext::new(
+            self.user.clone(),
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            actor,
+        );
         let mut stream = self
             .executor
             .stream_chat(request, &mut exec_ctx)

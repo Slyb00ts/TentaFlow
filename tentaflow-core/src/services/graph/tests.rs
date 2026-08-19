@@ -70,6 +70,116 @@ fn test_ensure_collection_creates_row_and_file() {
     assert_eq!(n, 1);
 }
 
+/// Reads the registry row's `file_path` for a collection (location assertions).
+fn row_file_path(mgr: &GraphManager, org: &str, addon: &str, collection: &str) -> String {
+    let conn = mgr.pool().read().unwrap();
+    conn.query_row(
+        "SELECT file_path FROM addon_graph_collections \
+         WHERE org_id = ?1 AND addon_id = ?2 AND collection = ?3",
+        rusqlite::params![org, addon, collection],
+        |r| r.get::<_, String>(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn test_ensure_collection_uses_addon_tree() {
+    let (dir, mgr) = mgr();
+    mgr.ensure_collection(ORG_A, "addon_a", "kg").unwrap();
+
+    let expected = dir.path().join(ORG_A).join("addon_a").join("graph").join("kg.cozo");
+    assert!(expected.exists(), "collection file missing at {expected:?}");
+    assert_eq!(row_file_path(&mgr, ORG_A, "addon_a", "kg"), expected.to_string_lossy());
+    assert_eq!(
+        mgr.collection_file_path(ORG_A, "addon_a", "kg").unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn test_ensure_collection_at_creates_in_custom_dir() {
+    let (dir, mgr) = mgr();
+    // The directory deliberately does not exist — opening the backend creates it.
+    let owner_dir = dir.path().join("projects").join("proj-1").join("graph");
+
+    mgr.ensure_collection_at(ORG_A, "ps-proj-1", "kg_active", &owner_dir)
+        .unwrap();
+
+    let expected = owner_dir.join("kg_active.cozo");
+    assert!(expected.exists(), "collection file missing at {expected:?}");
+    // The addon tree stays untouched — the data belongs to the project.
+    assert!(!dir.path().join(ORG_A).join("ps-proj-1").exists());
+    assert_eq!(
+        row_file_path(&mgr, ORG_A, "ps-proj-1", "kg_active"),
+        expected.to_string_lossy()
+    );
+    assert_eq!(
+        mgr.collection_file_path(ORG_A, "ps-proj-1", "kg_active")
+            .unwrap(),
+        expected
+    );
+}
+
+#[test]
+fn test_ensure_collection_at_reopen_keeps_persisted_dir() {
+    let (dir, mgr) = mgr();
+    let first = dir.path().join("first");
+    let second = dir.path().join("second");
+    std::fs::create_dir_all(&first).unwrap();
+    std::fs::create_dir_all(&second).unwrap();
+
+    mgr.ensure_collection_at(ORG_A, "ps-proj-1", "kg_active", &first)
+        .unwrap();
+    mgr.upsert_node_with_quota(ORG_A, "ps-proj-1", "kg_active", "n1", "Acme", "{}", "null")
+        .unwrap();
+
+    // Drop the cache so the reopen goes through the registry row instead of a
+    // live map entry — otherwise the test would prove nothing about the source of
+    // truth.
+    mgr.invalidate_all();
+
+    mgr.ensure_collection_at(ORG_A, "ps-proj-1", "kg_active", &second)
+        .unwrap();
+
+    // The data stays where it was created; the second directory stays empty.
+    assert!(first.join("kg_active.cozo").exists());
+    assert!(!second.join("kg_active.cozo").exists());
+    assert_eq!(
+        row_file_path(&mgr, ORG_A, "ps-proj-1", "kg_active"),
+        first.join("kg_active.cozo").to_string_lossy()
+    );
+    // The collection did not fork — the node is still visible.
+    assert_eq!(mgr.node_count(ORG_A, "ps-proj-1", "kg_active").unwrap(), 1);
+}
+
+#[test]
+fn test_ensure_collection_at_rejects_traversal_and_relative_dir() {
+    let (dir, mgr) = mgr();
+
+    let relative = std::path::PathBuf::from("relative/graph");
+    let err = mgr
+        .ensure_collection_at(ORG_A, "ps-proj-1", "kg_active", &relative)
+        .unwrap_err();
+    assert!(
+        matches!(&err, GraphError::Db(m) if m.contains("must be absolute")),
+        "unexpected error: {err}"
+    );
+
+    let traversal = dir.path().join("..").join("escape");
+    let err = mgr
+        .ensure_collection_at(ORG_A, "ps-proj-1", "kg_active", &traversal)
+        .unwrap_err();
+    assert!(
+        matches!(&err, GraphError::Db(m) if m.contains("must not contain")),
+        "unexpected error: {err}"
+    );
+
+    // Neither rejected attempt left a registry row behind.
+    assert!(!mgr
+        .collection_exists(ORG_A, "ps-proj-1", "kg_active")
+        .unwrap());
+}
+
 #[test]
 fn test_ensure_collection_idempotent() {
     let (_dir, mgr) = mgr();
@@ -1159,12 +1269,12 @@ fn test_stale_handle_after_invalidate_does_not_open() {
 }
 
 #[test]
-fn test_delete_cache_miss_uses_deterministic_nonempty_path() {
-    // Runda 4 bug 2: delete przy CACHE-MISS liczy ścieżkę deterministycznie z
-    // klucza (NIE z wiersza DB, NIE `PathBuf::default()`). Równoległy writer i
-    // deleter operują na tej samej, niepustej ścieżce — zero otwierania pustej
-    // ścieżki, zero paniki/korupcji, a po wszystkim świeże utworzenie startuje
-    // od pustego grafu.
+fn test_delete_cache_miss_resolves_nonempty_path() {
+    // Round 4 bug 2: on a CACHE MISS the delete still resolves a real path — from
+    // the registry row when one exists, otherwise derived from the key — and
+    // never `PathBuf::default()`. A concurrent writer and deleter therefore work
+    // on the same non-empty path: no opening of an empty path, no panic or
+    // corruption, and a fresh create afterwards starts from an empty graph.
     let (_dir, mgr) = mgr();
     let mgr = Arc::new(mgr);
 
@@ -1186,8 +1296,9 @@ fn test_delete_cache_miss_uses_deterministic_nonempty_path() {
         let m = Arc::clone(&mgr);
         std::thread::spawn(move || {
             for _ in 0..200 {
-                // Każdy delete liczy ścieżkę z klucza — nawet gdy wiersza DB nie
-                // ma (cache-miss). Brak pustej ścieżki => brak błędu I/O na "".
+                // Every delete resolves a real path — from the registry row, or
+                // from the key once the row is gone (cache miss). No empty path
+                // => no I/O error on "".
                 m.delete_collection(ORG_A, "addon_p", "kg").unwrap();
             }
         })

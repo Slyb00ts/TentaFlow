@@ -234,7 +234,15 @@ impl NodeAdapter for AgentContextNodeAdapter {
             .get_agent(&agent_id)?
             .ok_or_else(|| anyhow!("agent_context: agent '{agent_id}' not found"))?;
 
-        let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
+        // §2.5 — the run inherits the flow context's provenance verbatim; nothing
+        // here derives an actor from `user_id`.
+        let principal = AgentPrincipal::new(
+            ctx.user_id.clone(),
+            ctx.org_id.clone(),
+            ctx.origin,
+            ctx.actor(),
+        )
+        .with_correlation_id(ctx.correlation_id.clone());
         let skills = service.skill_index(&agent.skills_json)?;
         let tool_specs = service.tool_catalog_from_allowlist(
             &agent.tools_json,

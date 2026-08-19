@@ -9,7 +9,10 @@ use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::models::*;
-use super::MINIMUM_AI_AUDIT_RETENTION_DAYS;
+use super::{
+    EVENTS_RETENTION_DAYS, EVENTS_RETENTION_NAME_TRANSLATIONS, EVENTS_RETENTION_POLICY_BASE_ID,
+    MINIMUM_AI_AUDIT_RETENTION_DAYS,
+};
 
 fn now_utc() -> String {
     chrono::Utc::now().format("%Y-%m-%dT%H:%M:%SZ").to_string()
@@ -223,12 +226,11 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         params![legal_audit, org_id, activity_audit, category_audit],
     )?;
 
-    for (base_id, slug, name_pl, name_en, scope, days, minimum, action) in [
+    for (base_id, slug, name_translations, scope, days, minimum, action) in [
         (
             "ret-core-ai-audit-default",
             "ai_audit_default",
-            "AI audit minimum 6 miesięcy",
-            "AI audit minimum 6 months",
+            r#"{"pl":"AI audit minimum 6 miesięcy","en":"AI audit minimum 6 months"}"#,
             RetentionScopeKind::AiAudit,
             183,
             183,
@@ -237,8 +239,7 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         (
             "ret-core-audit-default",
             "audit_default",
-            "Audit trail minimum 6 miesięcy",
-            "Audit trail minimum 6 months",
+            r#"{"pl":"Audit trail minimum 6 miesięcy","en":"Audit trail minimum 6 months"}"#,
             RetentionScopeKind::Audit,
             183,
             183,
@@ -247,8 +248,7 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         (
             "ret-core-general-default",
             "general_default",
-            "Retencja ogólna",
-            "General retention",
+            r#"{"pl":"Retencja ogólna","en":"General retention"}"#,
             RetentionScopeKind::General,
             365,
             0,
@@ -257,8 +257,7 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         (
             "ret-core-document-default",
             "documents_default",
-            "Dokumenty compliance",
-            "Compliance documents",
+            r#"{"pl":"Dokumenty compliance","en":"Compliance documents"}"#,
             RetentionScopeKind::Document,
             2190,
             0,
@@ -267,8 +266,7 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         (
             "ret-core-dsar-default",
             "dsar_default",
-            "Wnioski DSAR",
-            "DSAR requests",
+            r#"{"pl":"Wnioski DSAR","en":"DSAR requests"}"#,
             RetentionScopeKind::Dsar,
             1095,
             0,
@@ -277,8 +275,7 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         (
             "ret-core-breach-default",
             "breach_default",
-            "Rejestr naruszeń",
-            "Breach register",
+            r#"{"pl":"Rejestr naruszeń","en":"Breach register"}"#,
             RetentionScopeKind::Breach,
             2190,
             0,
@@ -290,10 +287,22 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         (
             "ret-core-agent-runs-default",
             "agent_runs_default",
-            "Przebiegi agentów",
-            "Agent runs",
+            r#"{"pl":"Przebiegi agentów","en":"Agent runs"}"#,
             RetentionScopeKind::AgentRuns,
             30,
+            0,
+            "delete",
+        ),
+        // The event log is a diagnostic timeline, not an accountability record —
+        // it holds redacted operational detail that `compliance_ai_events` (>=183
+        // days, no prompt bodies) deliberately does not. Hence its own, much
+        // shorter term; the two scopes never share a policy.
+        (
+            EVENTS_RETENTION_POLICY_BASE_ID,
+            "events_default",
+            EVENTS_RETENTION_NAME_TRANSLATIONS,
+            RetentionScopeKind::Events,
+            EVENTS_RETENTION_DAYS,
             0,
             "delete",
         ),
@@ -301,13 +310,12 @@ pub fn ensure_org_defaults(conn: &Connection, org_id: &str) -> Result<()> {
         conn.execute(
             "INSERT OR IGNORE INTO compliance_retention_policies \
                 (retention_policy_id, org_id, slug, name_translations, scope_kind, category_id, retention_days, minimum_days, action_after_retention, is_default, is_active) \
-             VALUES (?1, ?2, ?3, json_object('pl',?4,'en',?5), ?6, NULL, ?7, ?8, ?9, 1, 1)",
+             VALUES (?1, ?2, ?3, ?4, ?5, NULL, ?6, ?7, ?8, 1, 1)",
             params![
                 default_record_id(org_id, base_id),
                 org_id,
                 slug,
-                name_pl,
-                name_en,
+                name_translations,
                 scope.as_str(),
                 days,
                 minimum,
@@ -803,6 +811,32 @@ mod tests {
         assert_eq!(policy.scope_kind, RetentionScopeKind::AgentRuns);
         assert_eq!(policy.retention_days, 30);
         assert_eq!(policy.action_after_retention, "delete");
+    }
+
+    #[test]
+    fn events_retention_defaults_to_thirty_days() {
+        let conn = db();
+        let policy = resolve_retention_policy(
+            &conn,
+            crate::services::org::DEFAULT_ORG_ID,
+            RetentionScopeKind::Events,
+            None,
+        )
+        .expect("events retention policy");
+
+        assert_eq!(policy.scope_kind, RetentionScopeKind::Events);
+        assert_eq!(policy.retention_days, EVENTS_RETENTION_DAYS);
+        assert_eq!(policy.action_after_retention, "delete");
+
+        // The shorter event-log term must not shorten the AI-audit commitment.
+        let ai = resolve_retention_policy(
+            &conn,
+            crate::services::org::DEFAULT_ORG_ID,
+            RetentionScopeKind::AiAudit,
+            None,
+        )
+        .expect("AI audit retention policy");
+        assert!(ai.retention_days >= MINIMUM_AI_AUDIT_RETENTION_DAYS);
     }
 
     #[test]

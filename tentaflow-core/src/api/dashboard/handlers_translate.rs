@@ -232,10 +232,24 @@ text, with no explanations, quotes, preface or meta-commentary.",
         audio_input: None,
     };
 
+    // §2.5 — a dashboard translation is an admin surface call made BY the
+    // session user; `current_user_id` is the same value the audit entry carries,
+    // so the run and its audit row name the same actor. An unauthenticated
+    // session has none and stays a system call.
+    let actor = match current_user_id(ctx) {
+        Some(uid) => crate::flow_engine::dispatcher::FlowActor::user(uid),
+        None => crate::flow_engine::dispatcher::FlowActor::system(),
+    };
     let route_result = ctx
         .state
         .router
-        .route_chat_completion(completion_req, None, None)
+        .route_chat_completion(
+            completion_req,
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
+            actor,
+            None,
+        )
         .await
         .map_err(|e| {
             ProtocolError::new(

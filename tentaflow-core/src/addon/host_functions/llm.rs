@@ -398,8 +398,12 @@ pub fn llm_generate(
         };
 
         let result = tokio::task::block_in_place(|| {
-            tokio::runtime::Handle::current()
-                .block_on(router.route_embeddings_for_user(request, None))
+            tokio::runtime::Handle::current().block_on(router.route_embeddings_for_user(
+                request,
+                None,
+                crate::flow_engine::dispatcher::FlowOrigin::Addon,
+                crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+            ))
         });
 
         let route_result = match result {
@@ -520,6 +524,8 @@ pub fn llm_generate(
         tokio::runtime::Handle::current().block_on(router.route_chat_completion(
             request,
             None,
+            crate::flow_engine::dispatcher::FlowOrigin::Addon,
+            crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
             Some(compliance_context),
         ))
     });
@@ -1017,6 +1023,8 @@ pub fn llm_generate_stream_start(
             .route_chat_completion_stream(
                 request,
                 None,
+                crate::flow_engine::dispatcher::FlowOrigin::Addon,
+                crate::flow_engine::dispatcher::FlowActor::addon(pump_addon.clone()),
                 Some(compliance_context),
                 crate::routing::streaming::ChatFlowSelector::Auto,
             )

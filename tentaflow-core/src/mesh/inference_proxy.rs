@@ -183,10 +183,14 @@ pub async fn dispatch_reverse_request(
                             "router executor not wired for mesh-reverse chat",
                         );
                     };
-                    let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
-                        hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
-                        ..crate::services::runtime::context::ExecutionContext::default()
-                    };
+                    // §2.5 — the originating user stays on the initiator's
+                    // node; the acting identity here is the mesh peer.
+                    let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+                        None,
+                        crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                        crate::flow_engine::dispatcher::FlowActor::system_component("mesh_peer"),
+                    );
+                    exec_ctx.hop_count = crate::services::runtime::context::MAX_HOP_COUNT;
                     // EXEMPT-MESH-INBOUND (stage 3d v1.5): mesh reverse chat —
                     // peer forwarduje request, my wykonujemy direct executor
                     // żeby zachować ultra-low latency LAN budżet. Flow żyje
@@ -378,10 +382,14 @@ pub async fn dispatch_reverse_request(
             };
             match build_camera_cv_request(cv_payload) {
                 Ok(cv_request) => {
-                    let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
-                        hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
-                        ..crate::services::runtime::context::ExecutionContext::default()
-                    };
+                    // §2.5 — the originating user stays on the initiator's
+                    // node; the acting identity here is the mesh peer.
+                    let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+                        None,
+                        crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                        crate::flow_engine::dispatcher::FlowActor::system_component("mesh_peer"),
+                    );
+                    exec_ctx.hop_count = crate::services::runtime::context::MAX_HOP_COUNT;
                     match executor.execute_camera_cv(cv_request, &mut exec_ctx).await {
                         Ok(result) => ModelResponse {
                             request_id,
@@ -664,6 +672,10 @@ pub async fn dispatch_reverse_stream_request(
             .route_chat_completion_stream(
                 chat_request,
                 None,
+                // A peer node forwarded this request over the mesh; there is no
+                // local session behind it.
+                crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                crate::flow_engine::dispatcher::FlowActor::system(),
                 None,
                 crate::routing::streaming::ChatFlowSelector::Auto,
             )
@@ -703,10 +715,14 @@ pub async fn dispatch_reverse_stream_request(
             );
             return;
         };
-        let mut exec_ctx = crate::services::runtime::context::ExecutionContext {
-            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
-            ..crate::services::runtime::context::ExecutionContext::default()
-        };
+        // §2.5 — the originating user stays on the initiator's node; the
+        // acting identity here is the mesh peer.
+        let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+            crate::flow_engine::dispatcher::FlowActor::system_component("mesh_peer"),
+        );
+        exec_ctx.hop_count = crate::services::runtime::context::MAX_HOP_COUNT;
         match executor.stream_chat(chat_request, &mut exec_ctx).await {
             Ok(s) => s,
             Err(e) => {

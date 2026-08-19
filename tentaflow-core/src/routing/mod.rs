@@ -63,7 +63,7 @@ use crate::api::openai::types::{
     ChatCompletionRequest, ChatCompletionResponse, ContentPart, Message, MessageContent,
 };
 use crate::error::Result;
-use crate::flow_engine::dispatcher::FlowRequestMeta;
+use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
 use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValue};
 
 /// Buduje seed envelope + per-request meta z `ChatCompletionRequest`. Trigger
@@ -72,9 +72,12 @@ use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValu
 pub(crate) async fn build_initial_envelope_for_user(
     request: &ChatCompletionRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: FlowOrigin,
+    actor: FlowActor,
     blobs: &std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> Result<(FlowEnvelope, FlowRequestMeta)> {
-    let (mut envelope, mut meta) = build_initial_envelope_inner(request, blobs.as_ref()).await?;
+    let (mut envelope, mut meta) =
+        build_initial_envelope_inner(request, origin, actor, blobs.as_ref()).await?;
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -85,6 +88,8 @@ pub(crate) async fn build_initial_envelope_for_user(
 
 async fn build_initial_envelope_inner(
     request: &ChatCompletionRequest,
+    origin: FlowOrigin,
+    actor: FlowActor,
     blobs: &dyn crate::flow_engine::blob_store::BlobStore,
 ) -> Result<(FlowEnvelope, FlowRequestMeta)> {
     let mut env = FlowEnvelope::empty();
@@ -187,7 +192,7 @@ async fn build_initial_envelope_inner(
             .insert("has_audio_input".into(), serde_json::Value::Bool(true));
     }
 
-    let mut meta = FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = FlowRequestMeta::new(uuid::Uuid::new_v4().to_string(), origin, actor);
     if let Some(opts) = request.memory_options.as_ref() {
         meta.session_id = opts.session_id.clone();
         if let Some(person_id) = &opts.person_id {
@@ -505,5 +510,88 @@ mod reasoning_tests {
             protocol_messages[0].reasoning_content.as_deref(),
             Some("reasoning")
         );
+    }
+}
+
+#[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::flow_engine::blob_store::InMemoryBlobStore;
+
+    fn chat_request() -> ChatCompletionRequest {
+        ChatCompletionRequest {
+            model: "m".into(),
+            messages: vec![Message {
+                audio: None,
+                role: "user".into(),
+                content: Some(MessageContent::Text("hi".into())),
+                reasoning_content: None,
+                name: None,
+                tool_calls: None,
+                tool_call_id: None,
+            }],
+            temperature: None,
+            reasoning_effort: None,
+            modalities: None,
+            audio: None,
+            max_tokens: None,
+            top_p: None,
+            frequency_penalty: None,
+            presence_penalty: None,
+            stop: None,
+            stream: false,
+            stream_options: None,
+            user: None,
+            response_format: None,
+            tools: None,
+            tool_choice: None,
+            n: None,
+            memory_options: None,
+            audio_input: None,
+        }
+    }
+
+    /// §2.5 — the `/v1` entry point. `actor_user_id` carries the user an API key
+    /// resolves to, which the unified server resolved while verifying the key.
+    #[tokio::test]
+    async fn v1_entry_stamps_api_origin_and_user_bound_key() {
+        let blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            std::sync::Arc::new(InMemoryBlobStore::new());
+        let (_env, meta) = build_initial_envelope_for_user(
+            &chat_request(),
+            Some(crate::auth::acl::UserContext::new("user-7", "user")),
+            FlowOrigin::Api,
+            FlowActor::api_key("key-42", Some("user-7".to_string())),
+            &blobs,
+        )
+        .await
+        .expect("seed envelope");
+        assert_eq!(meta.origin, FlowOrigin::Api);
+        assert_eq!(
+            meta.actor_kind,
+            crate::flow_engine::dispatcher::ActorKind::ApiKey
+        );
+        assert_eq!(meta.actor_id.as_deref(), Some("key-42"));
+        assert_eq!(meta.actor_user_id.as_deref(), Some("user-7"));
+    }
+
+    /// A service key ("group" / "general") has no user behind it — `NULL`, not
+    /// an empty string, so the UI can say so explicitly.
+    #[tokio::test]
+    async fn v1_entry_marks_service_key_without_bound_user() {
+        let blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            std::sync::Arc::new(InMemoryBlobStore::new());
+        let (_env, meta) = build_initial_envelope_for_user(
+            &chat_request(),
+            None,
+            FlowOrigin::Api,
+            FlowActor::api_key("key-svc", None),
+            &blobs,
+        )
+        .await
+        .expect("seed envelope");
+        assert_eq!(meta.origin, FlowOrigin::Api);
+        assert_eq!(meta.actor_id.as_deref(), Some("key-svc"));
+        assert_eq!(meta.actor_user_id, None);
     }
 }

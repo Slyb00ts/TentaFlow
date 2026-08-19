@@ -10,6 +10,7 @@ use crate::auth::acl::Principal;
 use crate::config::ProtocolConfig;
 use crate::db::DbPool;
 use crate::error::{CoreError, Result};
+use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 use crate::routing::router::Router;
 use crate::services::catalog::{CatalogEntry, CatalogEntryKind, CatalogSnapshot};
 
@@ -33,6 +34,19 @@ use hyper::body::{Bytes, Frame};
 pub type OpenAIBody = StreamBody<
     Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>>,
 >;
+
+/// §2.5 — the `/v1` actor, minted by the unified server while it verified the
+/// API key (the only place the key → user binding is known) and injected into
+/// the request extensions. A request that reached a handler without one is not
+/// an authenticated external caller (a public path, or an internal call that
+/// never went through the HTTP gate), so it degrades to the system actor rather
+/// than inventing a user.
+pub(crate) fn v1_actor(req: &Request<Incoming>) -> FlowActor {
+    req.extensions()
+        .get::<FlowActor>()
+        .cloned()
+        .unwrap_or_else(FlowActor::system)
+}
 
 /// Tworzy error response z podanym statusem, typem bledu i wiadomoscia.
 fn error_response(status: StatusCode, error_type: &str, message: String) -> Response<OpenAIBody> {
@@ -516,6 +530,7 @@ async fn handle_chat_completions(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    let actor = v1_actor(&req);
 
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
@@ -549,6 +564,8 @@ async fn handle_chat_completions(
             .route_chat_completion_stream(
                 request,
                 user_ctx.clone(),
+                FlowOrigin::Api,
+                actor,
                 None,
                 crate::routing::streaming::ChatFlowSelector::Auto,
             )
@@ -623,7 +640,10 @@ async fn handle_chat_completions(
         }
     } else {
         // === NON-STREAMING MODE: JSON ===
-        match router.route_chat_completion(request, user_ctx, None).await {
+        match router
+            .route_chat_completion(request, user_ctx, FlowOrigin::Api, actor, None)
+            .await
+        {
             Ok(route_result) => {
                 let body = serde_json::to_vec(&route_result.response).unwrap();
                 let mut resp = json_response(StatusCode::OK, body);
@@ -925,6 +945,7 @@ async fn handle_audio_tts(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    let actor = v1_actor(&req);
 
     // Parsuj body jako JSON
     let body_bytes = match req.into_body().collect().await {
@@ -979,7 +1000,7 @@ async fn handle_audio_tts(
 
     // Wywolaj Router.synthesize_speech()
     match router
-        .synthesize_speech_for_user(&tts_request, user_ctx)
+        .synthesize_speech_for_user(&tts_request, user_ctx, FlowOrigin::Api, actor)
         .await
     {
         Ok(route_result) => {
@@ -1239,6 +1260,7 @@ async fn handle_audio_speech_flow_stream(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    let actor = v1_actor(&req);
 
     let body_bytes = match req.into_body().collect().await {
         Ok(b) => b.to_bytes(),
@@ -1288,6 +1310,8 @@ async fn handle_audio_speech_flow_stream(
     let (initial, mut meta) = crate::services::runtime::executor::tts_request_to_initial_envelope(
         &api_request,
         user_ctx.clone(),
+        FlowOrigin::Api,
+        actor,
     );
     let cancel = tokio_util::sync::CancellationToken::new();
     meta.cancel_token = cancel.clone();
@@ -1351,6 +1375,7 @@ async fn handle_audio_transcriptions(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    let actor = v1_actor(&req);
 
     // Wyciagnij Content-Type header aby sprawdzic boundary
     let content_type = match req.headers().get("content-type") {
@@ -1558,7 +1583,7 @@ async fn handle_audio_transcriptions(
 
     // Routuj do odpowiedniego backendu
     match router
-        .route_audio_transcription_for_user(transcription_request, user_ctx)
+        .route_audio_transcription_for_user(transcription_request, user_ctx, FlowOrigin::Api, actor)
         .await
     {
         Ok(route_result) => {
@@ -1623,6 +1648,7 @@ async fn handle_embeddings(
         .get::<crate::auth::acl::UserContext>()
         .cloned();
     let principal = req.extensions().get::<Principal>().cloned();
+    let actor = v1_actor(&req);
 
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
@@ -1647,7 +1673,10 @@ async fn handle_embeddings(
     debug!("Embeddings request: model={}", request.model);
 
     // Routuj do odpowiedniego backendu
-    match router.route_embeddings_for_user(request, user_ctx).await {
+    match router
+        .route_embeddings_for_user(request, user_ctx, FlowOrigin::Api, actor)
+        .await
+    {
         Ok(route_result) => {
             let body = serde_json::to_vec(&route_result.response).unwrap();
             let mut resp = json_response(StatusCode::OK, body);
@@ -1891,7 +1920,14 @@ fn resolve_local_v1_target(
         }
     };
 
-    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    // §2.5 — /v1 target resolution only. This context resolves a backend and
+    // never dispatches a flow, so no event carries its actor; the authenticated
+    // /v1 actor is minted in `api::unified_server` and travels the dispatch path.
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(
+        user_ctx,
+        crate::flow_engine::dispatcher::FlowOrigin::Api,
+        crate::flow_engine::dispatcher::FlowActor::system_component("v1_target_resolve"),
+    );
     match executor.resolve_proxy_target(model, surface, input_modalities, &mut ctx) {
         Ok(t) => Ok(t),
         Err(e) => {
@@ -2170,7 +2206,14 @@ pub fn resolve_local_v1_base_url(
         None => return Err("Executor niedostępny".to_string()),
     };
 
-    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    // §2.5 — /v1 target resolution only. This context resolves a backend and
+    // never dispatches a flow, so no event carries its actor; the authenticated
+    // /v1 actor is minted in `api::unified_server` and travels the dispatch path.
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(
+        user_ctx,
+        crate::flow_engine::dispatcher::FlowOrigin::Api,
+        crate::flow_engine::dispatcher::FlowActor::system_component("v1_target_resolve"),
+    );
     let target = match executor.resolve_proxy_target(model, surface, input_modalities, &mut ctx) {
         Ok(t) => t,
         Err(e) => {
@@ -2232,7 +2275,14 @@ async fn try_embedded_rerank(
     context_label: &str,
 ) -> Option<std::result::Result<tentaflow_protocol::RerankResult, String>> {
     let executor = router.executor()?;
-    let mut ctx = crate::services::runtime::context::ExecutionContext::new(user_ctx);
+    // §2.5 — /v1 target resolution only. This context resolves a backend and
+    // never dispatches a flow, so no event carries its actor; the authenticated
+    // /v1 actor is minted in `api::unified_server` and travels the dispatch path.
+    let mut ctx = crate::services::runtime::context::ExecutionContext::new(
+        user_ctx,
+        crate::flow_engine::dispatcher::FlowOrigin::Api,
+        crate::flow_engine::dispatcher::FlowActor::system_component("v1_target_resolve"),
+    );
     let target = executor
         .resolve_proxy_target(
             model,

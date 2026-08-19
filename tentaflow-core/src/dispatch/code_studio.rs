@@ -6699,6 +6699,8 @@ async fn start_session_run(
     let principal = crate::agents::AgentPrincipal::new(
         Some(org.user_id.clone()),
         Some(org.org_id.clone()),
+        crate::flow_engine::dispatcher::FlowOrigin::CodeStudio,
+        crate::flow_engine::dispatcher::FlowActor::user(org.user_id.clone()),
     );
     let run_id = manager
         .spawn(

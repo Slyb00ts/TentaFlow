@@ -6949,5 +6949,36 @@
       "back_desc": "Sesja przez ten czas wykonała {count} {count|zdarzenie|zdarzenia|zdarzeń}. Wczytuję je od kursora seq {seq}, żeby oś czasu była kompletna.",
       "back_progress": "{done} z {total} {total|zdarzenia|zdarzeń|zdarzeń}"
     }
+  },
+  "run_timeline": {
+    "scale_time": "czas rzeczywisty",
+    "scale_equal": "równe odstępy",
+    "scale_hint": "W skali czasu wywołanie 22 ms obok builda 4 min jest niewidoczne. Równe odstępy robią oś nieliniową, dlatego wybór jest jawny.",
+    "lane_model": "model",
+    "lane_messages": "wiadom.",
+    "lane_tools": "narzędz.",
+    "axis_equal": "równe odstępy — oś nie jest liniowa",
+    "legend_wait": "oczekiwanie (TTFT)",
+    "legend_decode": "dekodowanie",
+    "legend_tool": "narzędzie",
+    "legend_error": "błąd",
+    "legend_inflight": "w locie (tylko start)",
+    "key_wheel": "kółko",
+    "key_drag": "przeciągnij",
+    "key_right": "prawy przycisk",
+    "key_dblclick": "dwuklik",
+    "hint_zoom": "zoom w miejscu kursora",
+    "hint_brush": "zaznacz zakres",
+    "hint_pan": "przesuń (pan)",
+    "hint_reset": "pełny zakres",
+    "hint_minimap": "minimapa pod spodem = całość + okno widoku",
+    "range_label": "zakres",
+    "range_reset": "wróć do pełnego zakresu",
+    "in_view": "{count} {count|rekord|rekordy|rekordów} w widoku",
+    "empty": "Brak zdarzeń w tym zakresie",
+    "tip_inflight": "w locie — brak zapisanego końca",
+    "tip_ttft": "TTFT",
+    "tip_decode": "dekodowanie",
+    "tip_turn": "tura {turn}"
   }
 }

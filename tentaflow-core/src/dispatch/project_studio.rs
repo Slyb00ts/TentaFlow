@@ -5738,8 +5738,12 @@ async fn generation_start_v1(
         kind,
         build_profile_hint,
     });
-    let principal =
-        crate::agents::AgentPrincipal::new(Some(org.user_id.clone()), Some(org.org_id.clone()));
+    let principal = crate::agents::AgentPrincipal::new(
+        Some(org.user_id.clone()),
+        Some(org.org_id.clone()),
+        crate::flow_engine::dispatcher::FlowOrigin::Project,
+        crate::flow_engine::dispatcher::FlowActor::user(org.user_id.clone()),
+    );
     let binding_meta = serde_json::json!({ "project_id": project_id, "gen_id": gen_id });
     let spawned = manager
         .spawn(

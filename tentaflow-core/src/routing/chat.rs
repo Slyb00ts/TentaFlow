@@ -32,6 +32,8 @@ impl Router {
         &self,
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
         compliance_context: Option<AiGatewayContext>,
     ) -> Result<crate::routing::RouteResult<ChatCompletionResponse>> {
         if let Some(ref u) = user {
@@ -151,7 +153,11 @@ impl Router {
                     .into());
                 }
             };
-            let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(user);
+            let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+                user,
+                origin,
+                actor.clone(),
+            );
             match executor.execute_chat(request.clone(), &mut exec_ctx).await {
                 Ok(response) => {
                     let usage = response.usage.as_ref().map(|u| {
@@ -201,9 +207,14 @@ impl Router {
         // === FLOW ENGINE: proba wykonania przez konfigurowalny flow ===
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
-            let (mut initial, mut meta) =
-                crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
-                    .await?;
+            let (mut initial, mut meta) = crate::routing::build_initial_envelope_for_user(
+                &request,
+                user.clone(),
+                origin,
+                actor.clone(),
+                &blobs,
+            )
+            .await?;
             // RAG E2.0 (enabler) — przeprowadź tożsamość addona-callera do
             // FlowRequestMeta. Gdy chat jest wyzwolony przez addon (host-fn
             // llm_generate ustawia compliance_context.addon_id/org_id), executor
@@ -234,6 +245,9 @@ impl Router {
                     "correlation_id".into(),
                     serde_json::Value::String(handle.request_id().to_string()),
                 );
+                // §2.5 — the same value as a struct field, so the run's audit
+                // link cannot be rewritten by a node that edits `meta`.
+                meta.correlation_id = Some(handle.request_id().to_string());
             }
 
             match dispatcher
@@ -423,7 +437,17 @@ impl Router {
             audio_input: None,
         };
 
-        match self.route_chat_completion(request, None, None).await {
+        match self
+            .route_chat_completion(
+                request,
+                None,
+                // Reverse mesh path: a peer node forwarded this vision request.
+                crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                crate::flow_engine::dispatcher::FlowActor::system(),
+                None,
+            )
+            .await
+        {
             Ok(route_result) => {
                 let response = route_result.response;
                 let content = crate::routing::extract_response_text(&response);

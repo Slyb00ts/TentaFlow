@@ -23,6 +23,12 @@ pub enum ProgressEvent {
     /// A node settled. `status` is the trace status label (`ok` / `error` /
     /// `skipped`) so the UI mirrors the trace without carrying the full step.
     NodeFinished { node_id: String, status: String },
+    /// The streaming producer delivered its first visible token for the current
+    /// step. TTFT is `request_started -> first_token` and decoding is
+    /// `first_token -> assistant_message`, so this event exists to keep both as
+    /// DIFFERENCES BETWEEN EVENTS — no adapter measures its own latency.
+    /// Emitted once per streaming step (per harness iteration), never per run.
+    FirstToken { node_id: String },
     /// A `loop` body iteration began (phase 5 emits). `max` is the configured
     /// iteration budget (0 = unbounded / until-only).
     IterationStarted { node_id: String, n: u32, max: u32 },

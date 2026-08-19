@@ -286,7 +286,11 @@ mod llamacpp_prompt_mode {
             None,
         );
 
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let response = executor
             .execute_chat(chat_request_with_tool(), &mut ctx)
             .await

@@ -690,6 +690,7 @@ pub async fn handle_messages(
         .extensions()
         .get::<crate::auth::acl::Principal>()
         .cloned();
+    let actor = crate::api::openai::server::v1_actor(&req);
 
     let body_bytes = req.collect().await?.to_bytes();
 
@@ -729,7 +730,14 @@ pub async fn handle_messages(
         };
 
         match router
-            .route_chat_completion_stream(openai_req, user_ctx, None, ChatFlowSelector::Auto)
+            .route_chat_completion_stream(
+                openai_req,
+                user_ctx,
+                crate::flow_engine::dispatcher::FlowOrigin::Api,
+                actor,
+                None,
+                ChatFlowSelector::Auto,
+            )
             .await
         {
             Ok(route_result) => Ok(anthropic_sse_response(route_result.response, model)),
@@ -755,7 +763,13 @@ pub async fn handle_messages(
         };
 
         match router
-            .route_chat_completion(openai_req, user_ctx, None)
+            .route_chat_completion(
+                openai_req,
+                user_ctx,
+                crate::flow_engine::dispatcher::FlowOrigin::Api,
+                actor,
+                None,
+            )
             .await
         {
             Ok(route_result) => {

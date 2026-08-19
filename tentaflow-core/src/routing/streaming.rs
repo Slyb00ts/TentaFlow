@@ -618,6 +618,8 @@ impl Router {
         &self,
         request: ChatCompletionRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
         compliance_context: Option<AiGatewayContext>,
         flow_selector: ChatFlowSelector,
     ) -> Result<
@@ -760,8 +762,11 @@ impl Router {
                     include_usage: true,
                 });
             }
-            let mut exec_ctx =
-                crate::services::runtime::context::ExecutionContext::new(user.clone());
+            let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+                user.clone(),
+                origin,
+                actor.clone(),
+            );
             match executor.stream_chat(direct_req, &mut exec_ctx).await {
                 Ok(stream) => {
                     let filtered: Pin<Box<dyn Stream<Item = Result<ChatCompletionChunk>> + Send>> =
@@ -804,9 +809,15 @@ impl Router {
         if let Some(ref dispatcher) = self.flow_dispatcher {
             let blobs = dispatcher.blobs();
             // Najpierw streamowa sciezka — tylko gdy flow ma edge from_port="stream".
-            let (mut initial_stream, meta_stream) =
-                crate::routing::build_initial_envelope_for_user(&request, user.clone(), &blobs)
-                    .await?;
+            let (mut initial_stream, mut meta_stream) =
+                crate::routing::build_initial_envelope_for_user(
+                    &request,
+                    user.clone(),
+                    origin,
+                    actor.clone(),
+                    &blobs,
+                )
+                .await?;
             // §3.4: seed the turn's correlation key with the session event's
             // request_id so per-call `llm` events in the flow link to this row.
             if let Some(handle) = compliance_event.as_ref() {
@@ -814,6 +825,9 @@ impl Router {
                     "correlation_id".into(),
                     serde_json::Value::String(handle.request_id().to_string()),
                 );
+                // §2.5 — the same value as a struct field, so the run's audit
+                // link cannot be rewritten by a node that edits `meta`.
+                meta_stream.correlation_id = Some(handle.request_id().to_string());
             }
             // Disconnect bridge: ten sam cancel_token co w meta dostaje
             // CancelOnDropStream poniżej, więc gdy hyper droppuje SSE body

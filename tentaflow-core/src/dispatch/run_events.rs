@@ -53,6 +53,10 @@ fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
             e.node_id = node_id;
             e.status = status;
         }
+        ProgressEvent::FirstToken { node_id } => {
+            e.kind = "first_token".into();
+            e.node_id = node_id;
+        }
         ProgressEvent::IterationStarted { node_id, n, max } => {
             e.kind = "iteration_started".into();
             e.node_id = node_id;
@@ -376,6 +380,17 @@ mod tests {
                 choices: vec!["A".into(), "B".into()],
             },
         );
+        // TTFT is read off the wire as `request_started -> first_token`, so the
+        // kind string and the node it names are part of the contract.
+        let ft = to_wire(
+            "sess-1",
+            ProgressEvent::FirstToken {
+                node_id: "llm-1".into(),
+            },
+        );
+        assert_eq!(ft.kind, "first_token");
+        assert_eq!(ft.node_id, "llm-1");
+
         assert_eq!(q.kind, "user_question");
         assert_eq!(q.run_id, "r1");
         assert_eq!(q.choices, vec!["A".to_string(), "B".to_string()]);

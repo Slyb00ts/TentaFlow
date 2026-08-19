@@ -1357,10 +1357,15 @@ impl ModelRuntimeExecutor {
                 let dispatch_result = {
                     let user = ctx.user.clone();
                     let blobs = dispatcher.blobs();
-                    let (initial, mut meta) =
-                        crate::routing::build_initial_envelope_for_user(&request, user, &blobs)
-                            .await
-                            .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
+                    let (initial, mut meta) = crate::routing::build_initial_envelope_for_user(
+                        &request,
+                        user,
+                        ctx.origin,
+                        ctx.actor.clone(),
+                        &blobs,
+                    )
+                    .await
+                    .map_err(|e| ExecutorError::Internal(format!("envelope seed: {e}")))?;
                     // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                     meta.addon_id = ctx.addon_id.clone();
                     meta.org_id = ctx.org_id.clone();
@@ -2000,8 +2005,12 @@ impl ModelRuntimeExecutor {
                 // Codex R3b.1 round 2 H1: propagate user → flow ACL gate.
                 // Without this `dispatch_by_flow_id` sees `user_id = None`
                 // and skips the per-flow ACL check.
-                let (initial, mut meta) =
-                    embeddings_request_to_initial_envelope(&request, ctx.user.clone());
+                let (initial, mut meta) = embeddings_request_to_initial_envelope(
+                    &request,
+                    ctx.user.clone(),
+                    ctx.origin,
+                    ctx.actor.clone(),
+                );
                 // RAG C2: re-wejście w flow dziedziczy bieżącą głębokość (po
                 // `enter_flow`), żeby self-referencyjny embeddings-flow narastał
                 // przez `subflow_depth` zamiast resetować się do 0.
@@ -2172,8 +2181,12 @@ impl ModelRuntimeExecutor {
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
                 ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
-                let (initial, mut meta) =
-                    rerank_request_to_initial_envelope(&request, ctx.user.clone());
+                let (initial, mut meta) = rerank_request_to_initial_envelope(
+                    &request,
+                    ctx.user.clone(),
+                    ctx.origin,
+                    ctx.actor.clone(),
+                );
                 // RAG C2: re-wejście w flow dziedziczy bieżącą głębokość (po
                 // `enter_flow`), żeby self-referencyjny rerank-flow narastał
                 // przez `subflow_depth` zamiast resetować się do 0.
@@ -2321,14 +2334,21 @@ impl ModelRuntimeExecutor {
             .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
 
         let blobs = dispatcher.blobs();
-        let (initial, mut meta) =
-            match ingest_request_to_initial_envelope(&request, ctx.user.clone(), blobs).await {
-                Ok(seed) => seed,
-                Err(e) => {
-                    ctx.leave_flow();
-                    return Err(ExecutorError::Internal(e.to_string()));
-                }
-            };
+        let (initial, mut meta) = match ingest_request_to_initial_envelope(
+            &request,
+            ctx.user.clone(),
+            ctx.origin,
+            ctx.actor.clone(),
+            blobs,
+        )
+        .await
+        {
+            Ok(seed) => seed,
+            Err(e) => {
+                ctx.leave_flow();
+                return Err(ExecutorError::Internal(e.to_string()));
+            }
+        };
         meta.flow_depth = ctx.flow_stack.len() as u8;
         meta.addon_id = ctx.addon_id.clone();
         meta.org_id = ctx.org_id.clone();
@@ -2841,16 +2861,21 @@ impl ModelRuntimeExecutor {
                 ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {}", e)))?;
                 let blobs = dispatcher.blobs();
-                let (initial, mut meta) =
-                    match document_request_to_initial_envelope(&request, ctx.user.clone(), blobs)
-                        .await
-                    {
-                        Ok(seed) => seed,
-                        Err(e) => {
-                            ctx.leave_flow();
-                            return Err(ExecutorError::Internal(e.to_string()));
-                        }
-                    };
+                let (initial, mut meta) = match document_request_to_initial_envelope(
+                    &request,
+                    ctx.user.clone(),
+                    ctx.origin,
+                    ctx.actor.clone(),
+                    blobs,
+                )
+                .await
+                {
+                    Ok(seed) => seed,
+                    Err(e) => {
+                        ctx.leave_flow();
+                        return Err(ExecutorError::Internal(e.to_string()));
+                    }
+                };
                 // RAG E1.2: re-wejście w flow dziedziczy bieżącą głębokość (po
                 // `enter_flow`), żeby self-referencyjny parse-flow narastał przez
                 // `subflow_depth` zamiast resetować się do 0.
@@ -3235,8 +3260,12 @@ impl ModelRuntimeExecutor {
                     .ok_or(ExecutorError::FlowDispatcherUnavailable)?;
                 ctx.enter_flow(flow_id)
                     .map_err(|e| ExecutorError::Internal(format!("flow recursion limit: {e}")))?;
-                let (initial, mut meta) =
-                    tts_request_to_initial_envelope(&request, ctx.user.clone());
+                let (initial, mut meta) = tts_request_to_initial_envelope(
+                    &request,
+                    ctx.user.clone(),
+                    ctx.origin,
+                    ctx.actor.clone(),
+                );
                 // RAG E1.0 — przeprowadź tożsamość addona-callera do flow.
                 meta.addon_id = ctx.addon_id.clone();
                 meta.org_id = ctx.org_id.clone();
@@ -3506,6 +3535,8 @@ fn samples_to_wav_pcm16(samples: &[f32], sample_rate: u32) -> Vec<u8> {
 pub(crate) fn embeddings_request_to_initial_envelope(
     request: &EmbeddingRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: crate::flow_engine::dispatcher::FlowOrigin,
+    actor: crate::flow_engine::dispatcher::FlowActor,
 ) -> (
     crate::flow_engine::envelope::FlowEnvelope,
     crate::flow_engine::dispatcher::FlowRequestMeta,
@@ -3546,8 +3577,11 @@ pub(crate) fn embeddings_request_to_initial_envelope(
         );
     }
 
-    let mut meta =
-        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        uuid::Uuid::new_v4().to_string(),
+        origin,
+        actor,
+    );
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -3562,6 +3596,8 @@ pub(crate) fn embeddings_request_to_initial_envelope(
 pub(crate) fn tts_request_to_initial_envelope(
     request: &TTSRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: crate::flow_engine::dispatcher::FlowOrigin,
+    actor: crate::flow_engine::dispatcher::FlowActor,
 ) -> (
     crate::flow_engine::envelope::FlowEnvelope,
     crate::flow_engine::dispatcher::FlowRequestMeta,
@@ -3592,8 +3628,11 @@ pub(crate) fn tts_request_to_initial_envelope(
         }
     }
 
-    let mut meta =
-        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        uuid::Uuid::new_v4().to_string(),
+        origin,
+        actor,
+    );
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -3886,6 +3925,8 @@ fn camera_cv_result_from_model(
 pub(crate) fn rerank_request_to_initial_envelope(
     request: &RerankRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: crate::flow_engine::dispatcher::FlowOrigin,
+    actor: crate::flow_engine::dispatcher::FlowActor,
 ) -> (
     crate::flow_engine::envelope::FlowEnvelope,
     crate::flow_engine::dispatcher::FlowRequestMeta,
@@ -3909,8 +3950,11 @@ pub(crate) fn rerank_request_to_initial_envelope(
         env.meta
             .insert("top_n".into(), serde_json::Value::Number(n.into()));
     }
-    let mut meta =
-        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        uuid::Uuid::new_v4().to_string(),
+        origin,
+        actor,
+    );
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -3961,6 +4005,8 @@ pub(crate) fn flow_outcome_to_rerank_response(
 pub(crate) async fn document_request_to_initial_envelope(
     request: &DocumentParseRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: crate::flow_engine::dispatcher::FlowOrigin,
+    actor: crate::flow_engine::dispatcher::FlowActor,
     blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> anyhow::Result<(
     crate::flow_engine::envelope::FlowEnvelope,
@@ -3981,8 +4027,11 @@ pub(crate) async fn document_request_to_initial_envelope(
         "parse_model".into(),
         serde_json::Value::String(request.model.clone()),
     );
-    let mut meta =
-        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        uuid::Uuid::new_v4().to_string(),
+        origin,
+        actor,
+    );
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -4001,6 +4050,8 @@ pub(crate) async fn document_request_to_initial_envelope(
 pub(crate) async fn ingest_request_to_initial_envelope(
     request: &IngestRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: crate::flow_engine::dispatcher::FlowOrigin,
+    actor: crate::flow_engine::dispatcher::FlowActor,
     blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> anyhow::Result<(
     crate::flow_engine::envelope::FlowEnvelope,
@@ -4038,8 +4089,11 @@ pub(crate) async fn ingest_request_to_initial_envelope(
     for (key, value) in &request.options {
         env.meta.insert(key.clone(), value.clone());
     }
-    let mut meta =
-        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        uuid::Uuid::new_v4().to_string(),
+        origin,
+        actor,
+    );
     meta.vector_home = request.vector_home.clone();
     if let Some(token) = &request.cancel_token {
         meta.cancel_token = token.clone();
@@ -4199,6 +4253,8 @@ pub(crate) fn parse_blocks_json(blocks: Option<&serde_json::Value>) -> Vec<DocBl
 pub(crate) async fn stt_request_to_initial_envelope(
     request: &TranscriptionRequest,
     user: Option<crate::auth::acl::UserContext>,
+    origin: crate::flow_engine::dispatcher::FlowOrigin,
+    actor: crate::flow_engine::dispatcher::FlowActor,
     blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> anyhow::Result<(
     crate::flow_engine::envelope::FlowEnvelope,
@@ -4242,8 +4298,11 @@ pub(crate) async fn stt_request_to_initial_envelope(
         );
     }
 
-    let mut meta =
-        crate::flow_engine::dispatcher::FlowRequestMeta::new(uuid::Uuid::new_v4().to_string());
+    let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+        uuid::Uuid::new_v4().to_string(),
+        origin,
+        actor,
+    );
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
@@ -4759,6 +4818,85 @@ fn resolve_embedded_tts_repo(engine_id: &str, model_name: &str) -> String {
 }
 
 #[cfg(test)]
+mod provenance_tests {
+    use super::*;
+    use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin};
+
+    /// §2.5 — the shared `/v1` + addon envelope builders must NOT guess where a
+    /// request came from; they stamp exactly what the entry point handed them.
+    #[test]
+    fn embeddings_entry_stamps_the_caller_provenance() {
+        let request = EmbeddingRequest {
+            model: "e".into(),
+            input: EmbeddingInput::Single("t".into()),
+            encoding_format: None,
+            dimensions: None,
+            user: None,
+        };
+        let (_env, meta) = embeddings_request_to_initial_envelope(
+            &request,
+            None,
+            FlowOrigin::Api,
+            FlowActor::api_key("key-1", Some("u-1".to_string())),
+        );
+        assert_eq!(meta.origin, FlowOrigin::Api);
+        assert_eq!(meta.actor_kind, ActorKind::ApiKey);
+        assert_eq!(meta.actor_user_id.as_deref(), Some("u-1"));
+    }
+
+    /// The SAME builder, reached from an addon host function, reports `addon` —
+    /// which is the reason the two parameters exist instead of a default.
+    #[test]
+    fn rerank_entry_from_an_addon_stamps_addon_provenance() {
+        let request = RerankRequest {
+            model: "r".into(),
+            query: "q".into(),
+            documents: vec!["a".into()],
+            top_n: None,
+        };
+        let (_env, meta) = rerank_request_to_initial_envelope(
+            &request,
+            None,
+            FlowOrigin::Addon,
+            FlowActor::addon("inst-rag-1"),
+        );
+        assert_eq!(meta.origin, FlowOrigin::Addon);
+        assert_eq!(meta.actor_kind, ActorKind::Addon);
+        assert_eq!(meta.actor_id.as_deref(), Some("inst-rag-1"));
+        assert_eq!(meta.actor_user_id, None);
+    }
+
+    /// The Projects ingest entry point: a job outlives the session that queued
+    /// it, so the project itself is the actor.
+    #[tokio::test]
+    async fn ingest_entry_stamps_project_provenance() {
+        let blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            std::sync::Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new());
+        let request = IngestRequest {
+            model: "core:rag-ingest".into(),
+            document_bytes: b"hello".to_vec(),
+            mime: "text/plain".into(),
+            options: serde_json::Map::new(),
+            vector_home: None,
+            cancel_token: None,
+            flow_depth: 0,
+        };
+        let (_env, meta) = ingest_request_to_initial_envelope(
+            &request,
+            None,
+            FlowOrigin::Project,
+            FlowActor::system_component("project:p-1"),
+            blobs,
+        )
+        .await
+        .expect("ingest seed");
+        assert_eq!(meta.origin, FlowOrigin::Project);
+        assert_eq!(meta.actor_kind, ActorKind::System);
+        assert_eq!(meta.actor_id.as_deref(), Some("project:p-1"));
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -5096,7 +5234,11 @@ mod tests {
                 engine_id: "test-engine".into(),
             },
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_embeddings_blocking(&target, make_request("qwen-emb"), &mut ctx)
             .await
@@ -5112,7 +5254,11 @@ mod tests {
             service_id: 1,
             model_name: "qwen-emb".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_embeddings_blocking(&target, make_request("qwen-emb"), &mut ctx)
             .await
@@ -5133,7 +5279,11 @@ mod tests {
             flow_id: "1".to_string(),
             published_name: "embed-flow".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_embeddings_blocking(&target, make_request("any"), &mut ctx)
             .await
@@ -5231,7 +5381,11 @@ mod tests {
                 engine_id: "test-engine".into(),
             },
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_rerank_blocking(&target, make_rerank_request("rerank-m"), &mut ctx)
             .await
@@ -5249,7 +5403,11 @@ mod tests {
             service_id: 1,
             model_name: "rerank-m".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_rerank_blocking(&target, make_rerank_request("rerank-m"), &mut ctx)
             .await
@@ -5267,7 +5425,11 @@ mod tests {
             flow_id: "1".to_string(),
             published_name: "rerank-flow".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_rerank_blocking(&target, make_rerank_request("any"), &mut ctx)
             .await
@@ -5281,7 +5443,11 @@ mod tests {
     #[tokio::test]
     async fn execute_rerank_unknown_model_surfaces_resolve_error() {
         let exec = dummy_executor();
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .execute_rerank(make_rerank_request("no-such-reranker"), &mut ctx)
             .await
@@ -5332,7 +5498,11 @@ mod tests {
                 engine_id: "test-engine".into(),
             },
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_documents_blocking(&target, make_doc_request("parse-m"), &mut ctx)
             .await
@@ -5350,7 +5520,11 @@ mod tests {
             service_id: 1,
             model_name: "parse-m".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_documents_blocking(&target, make_doc_request("parse-m"), &mut ctx)
             .await
@@ -5368,7 +5542,11 @@ mod tests {
             flow_id: "1".to_string(),
             published_name: "parse-flow".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_documents_blocking(&target, make_doc_request("any"), &mut ctx)
             .await
@@ -5410,7 +5588,11 @@ mod tests {
                 engine_id: "test-engine".into(),
             },
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
             .await
@@ -5446,7 +5628,11 @@ mod tests {
             model_name: "cv-m".into(),
             handle: BackendHandle::Http(Arc::new(client)),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
             .await
@@ -5463,7 +5649,11 @@ mod tests {
             service_id: 1,
             model_name: "cv-m".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_camera_cv(&target, make_camera_cv_request("cv-m"), &mut ctx)
             .await
@@ -5481,7 +5671,11 @@ mod tests {
             flow_id: "1".to_string(),
             published_name: "cv-flow".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_camera_cv(&target, make_camera_cv_request("any"), &mut ctx)
             .await
@@ -5494,7 +5688,11 @@ mod tests {
     #[tokio::test]
     async fn execute_camera_cv_unknown_model_surfaces_resolve_error() {
         let exec = dummy_executor();
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .execute_camera_cv(make_camera_cv_request("no-such-cv"), &mut ctx)
             .await
@@ -5585,7 +5783,11 @@ mod tests {
             return;
         }
         let exec = dummy_executor();
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .execute_documents(make_pdf_request("rag-parse"), &mut ctx)
             .await
@@ -5602,7 +5804,11 @@ mod tests {
     #[tokio::test]
     async fn execute_documents_unknown_alias_surfaces_resolve_error() {
         let exec = dummy_executor();
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .execute_documents(make_doc_request("rag-parse"), &mut ctx)
             .await
@@ -5697,7 +5903,11 @@ mod tests {
             service_id: 1,
             model_name: "tts".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_tts_blocking(&target, make_tts_request("tts"), &mut ctx)
             .await
@@ -5718,7 +5928,11 @@ mod tests {
             flow_id: "1".to_string(),
             published_name: "tts-flow".into(),
         };
-        let mut ctx = ExecutionContext::default();
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .dispatch_tts_blocking(&target, make_tts_request("any"), &mut ctx)
             .await
@@ -5747,7 +5961,11 @@ mod tests {
             compression_ratio_threshold: None,
             options: crate::api::openai::types::SttRequestOptions::default(),
         };
-        let mut ctx = crate::services::runtime::context::ExecutionContext::default();
+        let mut ctx = crate::services::runtime::context::ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = exec
             .execute_stt(request, &mut ctx)
             .await

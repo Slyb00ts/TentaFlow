@@ -239,8 +239,13 @@ pub async fn dispatch(
         // (host-fn `service_request` + operatory flow_runtime), więc `addon_id`
         // jest tu zawsze instancją addona. Executor przepisze to do
         // `FlowRequestMeta` dla `ResolvedExecutionTarget::Flow`.
-        let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None)
-            .with_addon_identity(Some(req.caller.addon_id.clone()), req.caller.org_id.clone());
+        // §2.5 — addon-as-model: the caller IS the addon instance.
+        let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Addon,
+            crate::flow_engine::dispatcher::FlowActor::addon(req.caller.addon_id.clone()),
+        )
+        .with_addon_identity(Some(req.caller.addon_id.clone()), req.caller.org_id.clone());
         let routed =
             route_alias_via_executor(executor, &service_name, &req.payload_json, &mut exec_ctx)
                 .await;

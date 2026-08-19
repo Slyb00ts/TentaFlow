@@ -138,7 +138,12 @@ pub fn doc_parse_v1(
         .filter(|id| !id.is_empty())
         .map(|id| crate::auth::acl::UserContext::new(id, "user"));
 
-    let mut ctx = ExecutionContext::new(caller_user).with_addon_identity(Some(addon_id), org_id);
+    let mut ctx = ExecutionContext::new(
+        caller_user,
+        crate::flow_engine::dispatcher::FlowOrigin::Addon,
+        crate::flow_engine::dispatcher::FlowActor::addon(addon_id.clone()),
+    )
+    .with_addon_identity(Some(addon_id), org_id);
 
     // Most async→sync: host function jest synchroniczna, executor async.
     let result = tokio::task::block_in_place(|| {

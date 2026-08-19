@@ -23,6 +23,8 @@ impl Router {
         &self,
         request: TranscriptionRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<TranscriptionResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
@@ -53,6 +55,8 @@ impl Router {
             match crate::services::runtime::executor::stt_request_to_initial_envelope(
                 &request,
                 user.clone(),
+                origin,
+                actor.clone(),
                 dispatcher.blobs(),
             )
             .await
@@ -186,7 +190,15 @@ impl Router {
 
                 // route_audio_via_protocol jest wywoływane przez reverse-mesh
                 // path bez user context (internal caller, ACL fail-open).
-                match self.synthesize_speech(&tts_request, None).await {
+                match self
+                    .synthesize_speech(
+                        &tts_request,
+                        None,
+                        crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                        crate::flow_engine::dispatcher::FlowActor::system(),
+                    )
+                    .await
+                {
                     Ok(tts_result) => {
                         let audio_bytes = tts_result.response.bytes;
                         let response = ModelResponse {
@@ -275,7 +287,16 @@ impl Router {
                     Some(executor) => {
                         use crate::services::runtime::context::ExecutionContext;
                         use crate::services::runtime::executor::ExecutorError;
-                        let mut exec_ctx = ExecutionContext::default();
+                        // §2.5 — a peer node forwarded this call; the
+                        // originating user stays on the initiator's node, so
+                        // the acting identity here is the mesh peer.
+                        let mut exec_ctx = ExecutionContext::new(
+                            None,
+                            crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+                            crate::flow_engine::dispatcher::FlowActor::system_component(
+                                "mesh_peer",
+                            ),
+                        );
                         match executor.execute_stt(request.clone(), &mut exec_ctx).await {
                             Ok(response) => Ok(crate::routing::RouteResult {
                                 response,

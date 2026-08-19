@@ -566,6 +566,18 @@ pub struct DbAgentRun {
     pub started_at: Option<String>,
     pub finished_at: Option<String>,
     pub created_at: String,
+    /// §2.5 — provenance of the request that started this run, persisted so a
+    /// continuation or a reactive flow can rebuild the principal VERBATIM
+    /// instead of deriving one from `user_id` (which turns an API key into a
+    /// user). Wire spellings from `FlowOrigin::as_str` / `ActorKind::as_str`.
+    pub origin: String,
+    pub actor_kind: String,
+    /// user_id / API key uid / addon instance id / system component id.
+    pub actor_id: Option<String>,
+    /// The user behind an API key; NULL marks a service key with no binding.
+    pub actor_user_id: Option<String>,
+    /// Ties the run to the audit / compliance trail of the turn that started it.
+    pub correlation_id: Option<String>,
 }
 
 /// Parameters for creating an agent run (the `queued` insert).
@@ -578,6 +590,13 @@ pub struct NewAgentRun<'a> {
     pub user_id: Option<&'a str>,
     pub org_id: Option<&'a str>,
     pub prompt: &'a str,
+    /// §2.5 — see `DbAgentRun`. Written at insert so the row answers "where
+    /// from and who" without any later derivation.
+    pub origin: &'a str,
+    pub actor_kind: &'a str,
+    pub actor_id: Option<&'a str>,
+    pub actor_user_id: Option<&'a str>,
+    pub correlation_id: Option<&'a str>,
 }
 
 /// Status update for an agent run. Counters and terminal fields are optional so

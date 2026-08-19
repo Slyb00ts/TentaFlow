@@ -4,7 +4,17 @@
 // cache `(org_id, addon_id, collection) -> Arc<GraphEntry>` (DashMap, lock-free
 // odczyt na hot-path), gdzie każda otwarta kolekcja odpowiada wierszowi w
 // `addon_graph_collections` (PK `(org_id, addon_id, collection)`) i plikowi
-// `.cozo` pod `<HOME>/.tentaflow/orgs/<org>/addons/<addon>/graph/<collection>.cozo`.
+// `.cozo`. Default location: `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo`;
+// an owner outside the addon tree (Projects: `<project>/graph/`) passes its own
+// directory to `ensure_collection_at`.
+//
+// FILE LOCATION: for a collection that already exists, the
+// `addon_graph_collections.file_path` column is the SOURCE OF TRUTH — open,
+// delete and the `collection_file_path` accessor read it from the row, and the
+// path is derived from the key (`file_path_for`) ONLY when creating a collection
+// with no directory given. Mirrors `vector::namespace` (`get_or_create_at`):
+// honouring a different directory on reopen would fork the collection into two
+// files.
 //
 // Izolacja multi-tenant: lookup ZAWSZE po `(org_id, addon_id, collection)`;
 // org_id wchodzi w każdy SELECT/INSERT/UPDATE/DELETE i w rozwiązanie ścieżki
@@ -58,7 +68,7 @@ use super::csr::Csr;
 use super::error::{GraphError, Result};
 use crate::db::DbPool;
 use crate::services::vector::namespace::{
-    validate_addon_id, validate_namespace_name, validate_org_id,
+    validate_addon_id, validate_custom_dir, validate_namespace_name, validate_org_id,
 };
 
 /// Twardy limit kolekcji grafowych na (org, addon). Każda otwarta kolekcja to
@@ -203,16 +213,23 @@ impl GraphManager {
         }
     }
 
-    /// Deterministyczna ścieżka pliku kolekcji (`<root>/.../<collection>.cozo`).
-    /// Udostępniona publicznie pod testy uninstall (sprawdzenie, że plik znika po
-    /// sukcesie / zostaje przy błędzie kasowania). Nie otwiera bazy.
+    /// Collection file path: from the registry row when the collection exists,
+    /// otherwise derived from the key. Public for the uninstall tests (the file
+    /// must disappear after a successful delete and survive a failed one). Does
+    /// not open the database.
     pub fn collection_file_path(
         &self,
         org_id: &str,
         addon_id: &str,
         collection: &str,
     ) -> Result<PathBuf> {
-        self.file_path_for(org_id, addon_id, collection)
+        validate_org_id(org_id).map_err(map_vector_err)?;
+        validate_addon_id(addon_id).map_err(map_vector_err)?;
+        validate_namespace_name(collection).map_err(map_vector_err)?;
+        match self.load_row(org_id, addon_id, collection)? {
+            Some((_, file_path)) => Ok(file_path),
+            None => self.file_path_for(org_id, addon_id, collection),
+        }
     }
 
     /// Eviction: dopóki w mapie jest więcej wpisów niż `MAX_OPEN_GRAPHS`, zamyka
@@ -318,10 +335,16 @@ impl GraphManager {
     }
 
     /// Interuje (lub pobiera) KANONICZNY wpis cache dla klucza BEZ dotykania DB.
-    /// Ścieżka pliku jest DETERMINISTYCZNA z klucza (`file_path_for`), engine z
-    /// wiersza DB jeśli istnieje, w p.p. domyślny dla buildu. Backend NIE jest tu
-    /// otwierany, wiersz DB NIE jest tu tworzony — to dzieje się POD slot-write-
-    /// lockiem w `with_write` (`ensure_row` + `open_backend`).
+    /// Takes the engine and the file path from the registry row when one exists;
+    /// for a NEW collection the path is `create_dir/<collection>.cozo`, or — when
+    /// no directory was given — the path derived from the key (`file_path_for`).
+    /// The backend is NOT opened here and the DB row is NOT created here — that
+    /// happens UNDER the slot write lock in `with_write` (`ensure_row` +
+    /// `open_backend`).
+    ///
+    /// `create_dir` applies ONLY to a collection that does not exist yet; on
+    /// reopen it is ignored, because the stored `file_path` is the only source of
+    /// truth about where the data lives (see the file header).
     ///
     /// Kluczowe dla bug cold-key create-vs-delete: punkt serializacji per-klucz
     /// (slot-lock kanonicznego wpisu) jest ustanawiany PRZED jakimkolwiek efektem
@@ -333,10 +356,16 @@ impl GraphManager {
         org_id: &str,
         addon_id: &str,
         collection: &str,
+        create_dir: Option<&Path>,
     ) -> Result<Arc<GraphEntry>> {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
         validate_namespace_name(collection).map_err(map_vector_err)?;
+        // Validate before the cache lookup so a bad path is rejected regardless
+        // of whether the collection happens to be cached right now.
+        if let Some(dir) = create_dir {
+            validate_custom_dir(dir).map_err(map_vector_err)?;
+        }
 
         let key = GraphKey {
             org_id: org_id.to_string(),
@@ -348,15 +377,17 @@ impl GraphManager {
             return Ok(entry.value().clone());
         }
 
-        // Engine z wiersza (metadane) jeśli istnieje — czysty odczyt, NIE tworzy
-        // wiersza. Domyślny gdy wiersza brak; ścieżka zawsze deterministyczna.
-        let engine = match self.load_engine(org_id, addon_id, collection)? {
-            Some(engine_str) => GraphEngine::parse(&engine_str).ok_or_else(|| {
-                GraphError::Db(format!("invalid engine '{engine_str}' in DB row"))
-            })?,
-            None => GraphEngine::default_for_build(),
+        // Pure row read — does NOT create the row.
+        let (engine, file_path) = match self.load_row(org_id, addon_id, collection)? {
+            Some((engine, file_path)) => (Self::parse_engine(&engine)?, file_path),
+            None => (
+                GraphEngine::default_for_build(),
+                match create_dir {
+                    Some(dir) => dir.join(format!("{collection}.cozo")),
+                    None => self.file_path_for(org_id, addon_id, collection)?,
+                },
+            ),
         };
-        let file_path = self.file_path_for(org_id, addon_id, collection)?;
         Ok(self.intern_entry(key, engine, file_path))
     }
 
@@ -374,7 +405,7 @@ impl GraphManager {
         engine: GraphEngine,
         file_path: &Path,
     ) -> Result<()> {
-        if self.load_engine(org_id, addon_id, collection)?.is_some() {
+        if self.load_row(org_id, addon_id, collection)?.is_some() {
             return Ok(());
         }
         match self.insert_row(org_id, addon_id, collection, engine, file_path) {
@@ -382,7 +413,7 @@ impl GraphManager {
             // Równoległy insert tej samej nowej kolekcji (bug #6): drugi wątek
             // dostaje UNIQUE-violation → wiersz już jest, traktuj jak sukces.
             // Quota-exceeded propagujemy normalnie.
-            Err(GraphError::Db(_)) if self.load_engine(org_id, addon_id, collection)?.is_some() => {
+            Err(GraphError::Db(_)) if self.load_row(org_id, addon_id, collection)?.is_some() => {
                 Ok(())
             }
             Err(e) => Err(e),
@@ -405,19 +436,17 @@ impl GraphManager {
             entry.last_used.store(self.tick(), Ordering::Relaxed);
             return Ok(entry.value().clone());
         }
-        let Some(engine_str) = self.load_engine(org_id, addon_id, collection)? else {
+        // Path from the row — the row is the source of truth about where the
+        // data lives, so a collection created in an owner directory (Projects)
+        // reopens from there and not from the addon tree.
+        let Some((engine, file_path)) = self.load_row(org_id, addon_id, collection)? else {
             return Err(GraphError::CollectionNotFound {
                 org_id: org_id.to_string(),
                 addon_id: addon_id.to_string(),
                 collection: collection.to_string(),
             });
         };
-        let engine = GraphEngine::parse(&engine_str)
-            .ok_or_else(|| GraphError::Db(format!("invalid engine '{engine_str}' in DB row")))?;
-        // Ścieżka ZAWSZE deterministyczna z klucza (NIGDY z wiersza DB) — wiersz
-        // `file_path` jest tylko informacyjny, nie źródło prawdy dla open.
-        let file_path = self.file_path_for(org_id, addon_id, collection)?;
-        Ok(self.intern_entry(key, engine, file_path))
+        Ok(self.intern_entry(key, Self::parse_engine(&engine)?, file_path))
     }
 
     /// Wykonuje `f` pod READ-lockiem backendu kolekcji (ścieżki query/neighbors/
@@ -489,10 +518,11 @@ impl GraphManager {
         org_id: &str,
         addon_id: &str,
         collection: &str,
+        create_dir: Option<&Path>,
         mut f: impl FnMut(&CozoBackend) -> Result<T>,
     ) -> Result<T> {
         for attempt in 0..MAX_REFETCH_ATTEMPTS {
-            let entry = self.entry_get_or_create(org_id, addon_id, collection)?;
+            let entry = self.entry_get_or_create(org_id, addon_id, collection, create_dir)?;
             {
                 let mut guard = entry
                     .slot
@@ -532,7 +562,7 @@ impl GraphManager {
         }
         // Wyczerpano próby — wymuś otwarcie kanonicznego wpisu BEZ eviction
         // (świadomy, chwilowy over-cap; gwarancja postępu zamiast starvation).
-        let entry = self.entry_get_or_create(org_id, addon_id, collection)?;
+        let entry = self.entry_get_or_create(org_id, addon_id, collection, create_dir)?;
         let guard = self.force_open(&entry, org_id, addon_id, collection, true)?;
         match &*guard {
             BackendSlot::Open(backend) => f(backend),
@@ -649,7 +679,29 @@ impl GraphManager {
         // Wiersz DB (`ensure_row`) i open backendu dzieją się POD slot-write-lockiem
         // wewnątrz `with_write` — ta sama serializacja cold-key vs delete co dla
         // upsertów. Quota kolekcji sprawdzana atomowo w `insert_row` (BEGIN IMMEDIATE).
-        self.with_write(org_id, addon_id, collection, |_| Ok(()))
+        self.with_write(org_id, addon_id, collection, None, |_| Ok(()))
+    }
+
+    /// Like [`Self::ensure_collection`], but a collection created by this call
+    /// lands in `dir/<collection>.cozo` instead of the addon graph tree. For an
+    /// owner outside the addon tree — Projects keep their graph in
+    /// `<data>/projects/<project_id>/graph/` under the pseudo addon id
+    /// `ps-<project_id>`. Validation and the per (org, addon) quotas are
+    /// identical to `ensure_collection`.
+    ///
+    /// When the collection ALREADY exists (a registry row is present), `dir` is
+    /// ignored and the stored `file_path` wins — the row is the only source of
+    /// truth about where the data lives, so honouring a different directory on
+    /// reopen would fork the collection and show the existing graph as empty.
+    /// Mirrors `NamespaceManager::get_or_create_at`.
+    pub fn ensure_collection_at(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        dir: &Path,
+    ) -> Result<()> {
+        self.with_write(org_id, addon_id, collection, Some(dir), |_| Ok(()))
     }
 
     /// Czy kolekcja istnieje w rejestrze (bez otwierania backendu).
@@ -662,7 +714,7 @@ impl GraphManager {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
         validate_namespace_name(collection).map_err(map_vector_err)?;
-        Ok(self.load_engine(org_id, addon_id, collection)?.is_some())
+        Ok(self.load_row(org_id, addon_id, collection)?.is_some())
     }
 
     /// Liczba węzłów kolekcji (z Cozo, źródło prawdy). Read-lock.
@@ -843,7 +895,7 @@ impl GraphManager {
         collection: &str,
         id: &str,
     ) -> Result<(bool, u64, u64)> {
-        self.with_write(org_id, addon_id, collection, |backend| {
+        self.with_write(org_id, addon_id, collection, None, |backend| {
             let removed = backend.delete_node(id)?;
             let nodes = backend.node_count()?;
             let edges = backend.edge_count()?;
@@ -862,7 +914,7 @@ impl GraphManager {
         rel: &str,
         dst: &str,
     ) -> Result<(bool, u64, u64)> {
-        self.with_write(org_id, addon_id, collection, |backend| {
+        self.with_write(org_id, addon_id, collection, None, |backend| {
             let removed = backend.delete_edge(src, rel, dst)?;
             let nodes = backend.node_count()?;
             let edges = backend.edge_count()?;
@@ -907,7 +959,7 @@ impl GraphManager {
     ) -> Result<u64> {
         let max_nodes = self.resolve_node_limit(addon_id);
 
-        self.with_write(org_id, addon_id, collection, |backend| {
+        self.with_write(org_id, addon_id, collection, None, |backend| {
             let is_new = !backend.node_exists(id)?;
             if is_new {
                 // Rezerwacja w atomowym ledgerze PRZED mutacją Cozo.
@@ -943,7 +995,7 @@ impl GraphManager {
     ) -> Result<u64> {
         let max_edges = self.resolve_edge_limit(addon_id);
 
-        self.with_write(org_id, addon_id, collection, |backend| {
+        self.with_write(org_id, addon_id, collection, None, |backend| {
             let is_new = !backend.edge_exists(src, rel, dst)?;
             if is_new {
                 self.reserve_edge_quota(org_id, addon_id, collection, max_edges)?;
@@ -1237,9 +1289,11 @@ impl GraphManager {
     }
 
     /// Pełny protokół kasowania pod write-lockiem slotu kanonicznego wpisu (bug H).
-    /// Ścieżka pliku jest DETERMINISTYCZNA z `GraphKey` (`file_path_for`), więc
-    /// liczymy ją z klucza niezależnie od tego, czy wiersz DB istnieje — wiersz DB
-    /// służy tylko do metadanych (engine), NIGDY do lokalizacji pliku.
+    /// The file path comes from the registry row — the row knows whether the
+    /// collection lives in the addon tree or in an owner directory
+    /// (`ensure_collection_at`). With no row we fall back to the path derived
+    /// from the key; the entry ends up `Removed` either way and never opens the
+    /// database.
     ///
     /// KOLEJNOŚĆ (spójność przy awarii): close-handle → skasuj PLIKI → dopiero
     /// potem skasuj WIERSZ rejestru → zdejmij wpis z mapy. Wiersz znika DOPIERO po
@@ -1250,27 +1304,22 @@ impl GraphManager {
     /// (brak wiersza) tworzy świeżą pustą kolekcję, po porażce (wiersz + pliki nadal
     /// są) reotwiera tę samą bazę — stan retry pozostaje spójny.
     fn seal_key_for_delete(&self, key: &GraphKey) -> Result<()> {
-        // Ścieżka deterministyczna z klucza — ta sama, której użył writer przy
-        // tworzeniu, więc współbieżny writer i delete operują na tym samym pliku
-        // pod tym samym slot-lockiem (serializacja, brak otwierania pustej ścieżki).
-        let path = self.file_path_for(&key.org_id, &key.addon_id, &key.collection)?;
-
-        // Engine z DB (metadane). Domyślny, gdy wiersza nie ma — wpis i tak będzie
-        // `Removed`, nigdy nie otworzy bazy.
-        let engine: GraphEngine = {
-            let conn = self
-                .pool
-                .read()
-                .map_err(|_| GraphError::Db("pool mutex poisoned".into()))?;
-            conn.query_row(
-                "SELECT engine FROM addon_graph_collections \
-                 WHERE org_id = ?1 AND addon_id = ?2 AND collection = ?3",
-                rusqlite::params![key.org_id, key.addon_id, key.collection],
-                |r| r.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|eng| GraphEngine::parse(&eng))
-            .unwrap_or_else(GraphEngine::default_for_build)
+        // The same path the writer used at creation (the registry row), so a
+        // concurrent writer and delete operate on the same file under the same
+        // slot lock (serialization, never opening an empty path).
+        let (engine, path) = match self.load_row(&key.org_id, &key.addon_id, &key.collection)? {
+            // An unreadable `engine` column must NOT block the delete — the
+            // delete is the repair for such a row, and the entry ends up
+            // `Removed` and never opens the database anyway. The path, however,
+            // must come from the row.
+            Some((engine, path)) => (
+                GraphEngine::parse(&engine).unwrap_or_else(GraphEngine::default_for_build),
+                path,
+            ),
+            None => (
+                GraphEngine::default_for_build(),
+                self.file_path_for(&key.org_id, &key.addon_id, &key.collection)?,
+            ),
         };
 
         let entry = self.canonical_entry_for(key, engine, path.clone());
@@ -1405,8 +1454,10 @@ impl GraphManager {
     /// Zamyka WSZYSTKIE otwarte backendy (migracja katalogu danych addonów —
     /// sled trzyma otwarte pliki, które muszą zostać zwolnione przed
     /// przeniesieniem katalogu). Ta sama kolejność `mark_removed` → `remove_if`
-    /// co w `invalidate_addon`; dane na dysku zostają, następny dostęp otwiera
-    /// plik z nowej lokalizacji (`file_path_for` liczy ścieżkę na żądanie).
+    /// (`invalidate_addon`). On-disk data survives, but the next access reads the
+    /// path from the registry row — a data-directory migration MUST rewrite
+    /// `file_path` in `addon_graph_collections` (`storage_admin::run_live_migration`
+    /// does it).
     pub fn invalidate_all(&self) {
         let entries: Vec<(GraphKey, Arc<GraphEntry>)> = self
             .collections
@@ -1458,28 +1509,39 @@ impl GraphManager {
         self.open_backends.load(Ordering::Acquire)
     }
 
-    /// Czyta kolumnę `engine` wiersza kolekcji (metadane). `file_path` wiersza
-    /// jest tylko informacyjny — ścieżka pliku liczona deterministycznie z klucza
-    /// (`file_path_for`), więc tu jej NIE czytamy. `None` gdy wiersza brak.
-    fn load_engine(
+    /// Reads the collection row: the raw engine name (metadata) + `file_path`
+    /// (the source of truth about where the data lives). `None` when there is no
+    /// row.
+    ///
+    /// The engine is left unparsed because the policy belongs to the caller:
+    /// paths that open the database need a readable value (`parse_engine`), while
+    /// delete must work on a row with a corrupted column too.
+    fn load_row(
         &self,
         org_id: &str,
         addon_id: &str,
         collection: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<Option<(String, PathBuf)>> {
         let conn = self
             .pool
             .read()
             .map_err(|_| GraphError::Db("pool mutex poisoned".into()))?;
-        let engine = conn
+        let row = conn
             .query_row(
-                "SELECT engine FROM addon_graph_collections \
+                "SELECT engine, file_path FROM addon_graph_collections \
                  WHERE org_id = ?1 AND addon_id = ?2 AND collection = ?3",
                 rusqlite::params![org_id, addon_id, collection],
-                |r| r.get::<_, String>(0),
+                |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)),
             )
             .ok();
-        Ok(engine)
+        Ok(row.map(|(engine, file_path)| (engine, PathBuf::from(file_path))))
+    }
+
+    /// Engine name from the row -> variant. An error when the column is
+    /// unreadable: paths that open the database must not guess the backend.
+    fn parse_engine(engine: &str) -> Result<GraphEngine> {
+        GraphEngine::parse(engine)
+            .ok_or_else(|| GraphError::Db(format!("invalid engine '{engine}' in DB row")))
     }
 
     /// Wstawia wiersz kolekcji atomowo wobec quoty: `BEGIN IMMEDIATE` bierze
@@ -1556,6 +1618,9 @@ fn map_vector_err(e: crate::services::vector::VectorError) -> GraphError {
         crate::services::vector::VectorError::InvalidNamespaceName(name) => {
             GraphError::InvalidCollectionName(name)
         }
+        // `validate_custom_dir` rejects a path through `VectorError::Db`; that is
+        // not a graph backend failure, so it stays in the `Db` class.
+        crate::services::vector::VectorError::Db(msg) => GraphError::Db(msg),
         other => GraphError::Backend(other.to_string()),
     }
 }

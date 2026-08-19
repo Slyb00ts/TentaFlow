@@ -412,13 +412,19 @@ async fn run_live_migration(
     let _ = paths::ensure_app_dirs();
 
     if matches!(cat, StorageCategory::AddonData) {
-        // Ścieżki indeksów wektorowych są trzymane w bazie jako absolutne —
+        // Vector index and graph collection file paths are stored in the DB as
+        // absolute paths and are what decides where a file is opened from —
         // przepisz prefiks na nową lokalizację.
         let old_prefix = format!("{}/", old_dir.to_string_lossy());
         let new_prefix = format!("{}/", new_dir.to_string_lossy());
         if let Ok(conn) = deps.db.write() {
             let _ = conn.execute(
                 "UPDATE addon_vector_namespaces SET file_path = REPLACE(file_path, ?1, ?2) \
+                 WHERE file_path LIKE ?1 || '%'",
+                rusqlite::params![old_prefix, new_prefix],
+            );
+            let _ = conn.execute(
+                "UPDATE addon_graph_collections SET file_path = REPLACE(file_path, ?1, ?2) \
                  WHERE file_path LIKE ?1 || '%'",
                 rusqlite::params![old_prefix, new_prefix],
             );

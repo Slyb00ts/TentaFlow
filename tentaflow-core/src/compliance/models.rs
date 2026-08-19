@@ -44,6 +44,7 @@ pub enum RetentionScopeKind {
     Breach,
     General,
     AgentRuns,
+    Events,
 }
 
 impl RetentionScopeKind {
@@ -57,6 +58,7 @@ impl RetentionScopeKind {
             Self::Breach => "breach",
             Self::General => "general",
             Self::AgentRuns => "agent_runs",
+            Self::Events => "events",
         }
     }
 
@@ -70,6 +72,7 @@ impl RetentionScopeKind {
             "breach" => Some(Self::Breach),
             "general" => Some(Self::General),
             "agent_runs" => Some(Self::AgentRuns),
+            "events" => Some(Self::Events),
             _ => None,
         }
     }

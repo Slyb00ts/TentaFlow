@@ -133,7 +133,15 @@ impl SpawnNodeAdapter {
         let context = Self::resolve_context(node, envelope);
         let output_variable = Self::output_variable(node);
 
-        let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
+        // §2.5 — the run inherits the flow context's provenance verbatim; nothing
+        // here derives an actor from `user_id`.
+        let principal = AgentPrincipal::new(
+            ctx.user_id.clone(),
+            ctx.org_id.clone(),
+            ctx.origin,
+            ctx.actor(),
+        )
+        .with_correlation_id(ctx.correlation_id.clone());
         let caller = CallerRun::from_envelope(envelope, principal, ctx.session_id.clone());
         if caller.run_id.is_empty() {
             return Err(anyhow!(

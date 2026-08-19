@@ -20,6 +20,7 @@ use super::dispatchers::{
     LlmDispatcher, MemoryStore, MetricsSink, PiiRulesStore, ProgressSink, PromptStore,
     RerankDispatcher, SttDispatcher, TtsCleaningStore, TtsDispatcher, VisionDispatcher,
 };
+use super::dispatcher::{ActorKind, FlowActor, FlowOrigin};
 use super::envelope::{FlowEnvelope, NodeInput, TokenUsage};
 use super::types::{FlowDataType, FlowNode};
 use crate::flow_engine::blob_store::BlobStore;
@@ -184,6 +185,26 @@ pub struct ExecutionContext {
     /// `file_path`), wiec nie da sie nim przekierowac juz zapisanych danych.
     pub vector_home: Option<std::path::PathBuf>,
 
+    /// §2.5 — server-minted provenance of this run: where the request entered
+    /// and who is behind it. Copied verbatim from `FlowRequestMeta` by
+    /// `ContextFactory::make_context` and inherited by every sub-flow / loop /
+    /// map / agent body (the child context is a clone of the parent).
+    ///
+    /// Held HERE, not in `envelope.meta`, for the same reason as
+    /// `subflow_depth` and `vector_home` above: meta is writable by every node,
+    /// including a WASM addon block that deserializes a whole envelope from the
+    /// guest's answer, so an `origin`/`actor` stamp living there could be
+    /// rewritten by model output. This is the value the event log records, so
+    /// it must be underivable from anything the model can say.
+    pub origin: FlowOrigin,
+    pub actor_kind: ActorKind,
+    /// user_id / API key uid / addon instance id / system component id.
+    pub actor_id: Option<String>,
+    /// The user behind an API key; `None` marks a service key.
+    pub actor_user_id: Option<String>,
+    /// Ties this run to the audit trail and to `compliance_ai_events`.
+    pub correlation_id: Option<String>,
+
     /// RAG E1.1 — rejestr kolekcji grafowych `(org, addon_instance, collection)`.
     /// `GraphSearchNodeAdapter` uderza w niego z `ctx.addon_id`/`ctx.org_id`,
     /// dokładnie jak `vectors`. Współdzielony proces-szeroki manager
@@ -246,6 +267,17 @@ impl ExecutionContext {
             waited.as_millis() as u64,
             std::sync::atomic::Ordering::Relaxed,
         );
+    }
+
+    /// Reassembles the actor this run was stamped with, so a nested run started
+    /// from inside the flow (a spawned sub-agent) inherits the caller verbatim
+    /// instead of re-deriving one from node state.
+    pub fn actor(&self) -> FlowActor {
+        FlowActor::from_parts(
+            self.actor_kind,
+            self.actor_id.clone(),
+            self.actor_user_id.clone(),
+        )
     }
 }
 
@@ -825,6 +857,12 @@ pub mod test_support {
             addon_id: None,
             vector_home: None,
             org_id: None,
+            // Test contexts run as the system with no entry point behind them.
+            origin: FlowOrigin::System,
+            actor_kind: ActorKind::System,
+            actor_id: None,
+            actor_user_id: None,
+            correlation_id: None,
             deadline: None,
             deadline_extension_ms: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             cancel_token: CancellationToken::new(),

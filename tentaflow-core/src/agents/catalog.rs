@@ -243,7 +243,12 @@ mod tests {
     #[test]
     fn unattended_principal_gets_only_core_builtins() {
         let tools = vec![tool("memory", "memory_store")];
-        let principal = AgentPrincipal::default();
+        let principal = AgentPrincipal::new(
+            None,
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Api,
+            crate::flow_engine::dispatcher::FlowActor::api_key("key-svc", None),
+        );
         let json = r#"["memory.*","core.skill_view"]"#;
         // Even with a permissive checker, no user_id means no addon tools.
         let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);

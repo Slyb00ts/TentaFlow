@@ -3647,7 +3647,7 @@ pub struct AgentRunEventsSubscribeRequest {
 #[derive(Debug, Clone, Default, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub struct AgentRunEvent {
     pub scope: String,
-    /// One of: node_started | node_finished | iteration_started |
+    /// One of: node_started | node_finished | first_token | iteration_started |
     /// iteration_finished | map_element | tool_call_started | tool_call_finished
     /// | compaction | child_spawned | child_finished | router_decision |
     /// user_question | permission_request | interaction_resolved.

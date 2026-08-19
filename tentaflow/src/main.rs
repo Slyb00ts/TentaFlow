@@ -296,6 +296,15 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy Project Studio: {}", e);
         return Err(e);
     }
+    // Event log — `data/events.db`, its own writer connection so a
+    // high-frequency timeline never queues behind settings, flows, agents and
+    // audit writes on the main database's single writer. Also STARTS the audit
+    // outbox delivery loop and the retention sweep; a store without them is a
+    // file that grows forever and never delivers its audit copies.
+    if let Err(e) = tentaflow_core::events::init(&db) {
+        error!("Event log initialisation failed: {}", e);
+        return Err(e);
+    }
     match tentaflow_core::db::repository::ensure_default_core_sync_policies(&db) {
         Ok(n) if n > 0 => info!("Sync Ledger zasiał {} domyślnych polityk core", n),
         Err(e) => error!("Sync Ledger nie zasiał domyślnych polityk core: {}", e),
@@ -1115,6 +1124,9 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::warn!("Checkpoint WAL Project Studio nieudany: {}", e);
     }
     tentaflow_core::project_studio::project_db::checkpoint_all();
+    if let Err(e) = tentaflow_core::events::db::checkpoint_wal() {
+        tracing::warn!("Event log WAL checkpoint failed: {}", e);
+    }
 
     info!("Router zamkniety.");
     Ok(())

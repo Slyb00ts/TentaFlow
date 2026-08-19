@@ -1,0 +1,119 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>tf-run-timeline — fixture demo</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="/css/style.css">
+<link rel="stylesheet" href="/css/controls.css">
+<style>
+  /* Harness only: the ledger below belongs to the HOST module, not to the
+     component. It exists here to exercise the hover/select coupling. */
+  body { background: var(--bg); color: var(--text); font-family: 'Manrope', system-ui, sans-serif; margin: 0; }
+  .demo-shell { display: grid; grid-template-rows: auto 1fr; height: 100vh; }
+  .demo-ledger { overflow: auto; min-height: 0; }
+  .demo-row {
+    display: grid; grid-template-columns: 54px 130px 108px 1fr 84px;
+    gap: 10px; align-items: center; padding: 7px 16px;
+    border-bottom: 1px solid var(--border); font-size: 13px; cursor: pointer;
+  }
+  .demo-row:hover, .demo-row.hot { background: var(--bg-card-hover); box-shadow: inset 2px 0 0 var(--accent-2); }
+  .demo-row.sel { background: var(--accent-glow); box-shadow: inset 2px 0 0 var(--accent-1); }
+  .demo-row .ix { font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--text-3); }
+  .demo-row .kind { font-weight: 600; }
+  .demo-row .who { color: var(--text-2); font-size: 12px; }
+  .demo-row .what { color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .demo-row .ms { text-align: right; font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text-2); }
+  .demo-turnhead {
+    padding: 9px 16px; background: var(--bg-3); border-bottom: 1px solid var(--border-hover);
+    border-top: 2px solid var(--border-hover); font-size: 12px; font-weight: 700;
+    letter-spacing: .04em; text-transform: uppercase; color: var(--text-2);
+  }
+</style>
+</head>
+<body>
+<div class="demo-shell">
+  <tf-run-timeline id="tl"></tf-run-timeline>
+  <div class="demo-ledger" id="ledger"></div>
+</div>
+
+<script type="module">
+import { I18n } from '/js/i18n.js';
+import '/js/components/tf-run-timeline.js';
+import { RUN_TIMELINE_RECORDS, RUN_TIMELINE_EPOCH } from './run-timeline-records.js';
+
+await I18n.init();
+
+const tl = document.getElementById('tl');
+const ledger = document.getElementById('ledger');
+
+tl.epoch = RUN_TIMELINE_EPOCH;
+tl.records = RUN_TIMELINE_RECORDS;
+
+const fmt = (r) => {
+  if (r.duration === null) return '—';
+  if (r.duration >= 60000) return `${(r.duration / 60000).toFixed(1)} min`;
+  if (r.duration >= 1000) return `${(r.duration / 1000).toFixed(2)} s`;
+  return `${r.duration} ms`;
+};
+
+let turn = null;
+for (const r of RUN_TIMELINE_RECORDS) {
+  if (r.turn !== turn) {
+    turn = r.turn;
+    const h = document.createElement('div');
+    h.className = 'demo-turnhead';
+    h.textContent = `Turn ${turn}`;
+    ledger.appendChild(h);
+  }
+  const row = document.createElement('div');
+  row.className = 'demo-row';
+  row.dataset.id = r.id;
+  for (const [cls, text] of [
+    ['ix', String(r.seq).padStart(4, '0')],
+    ['kind', r.kind],
+    ['who', r.name],
+    ['what', r.detail],
+    ['ms', fmt(r)],
+  ]) {
+    const s = document.createElement('span');
+    s.className = cls;
+    s.textContent = text;
+    row.appendChild(s);
+  }
+  ledger.appendChild(row);
+}
+
+// Band → row: highlight and scroll the row into view.
+tl.addEventListener('record-hover', (e) => {
+  for (const el of ledger.querySelectorAll('.demo-row')) el.classList.remove('hot');
+  if (!e.detail.id) return;
+  const row = ledger.querySelector(`.demo-row[data-id="${e.detail.id}"]`);
+  if (!row) return;
+  row.classList.add('hot');
+  row.scrollIntoView({ block: 'nearest' });
+});
+
+tl.addEventListener('record-select', (e) => {
+  for (const el of ledger.querySelectorAll('.demo-row')) el.classList.toggle('sel', el.dataset.id === e.detail.id);
+});
+
+// Row → band.
+ledger.addEventListener('pointerover', (e) => {
+  const row = e.target.closest('.demo-row');
+  tl.highlight(row ? row.dataset.id : null);
+});
+ledger.addEventListener('pointerleave', () => tl.highlight(null));
+ledger.addEventListener('click', (e) => {
+  const row = e.target.closest('.demo-row');
+  if (!row) return;
+  tl.selected = row.dataset.id;
+  for (const el of ledger.querySelectorAll('.demo-row')) el.classList.toggle('sel', el === row);
+});
+
+window.__tl = tl;
+window.__demoReady = true;
+</script>
+</body>
+</html>

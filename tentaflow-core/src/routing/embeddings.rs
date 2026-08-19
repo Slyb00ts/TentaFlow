@@ -25,6 +25,8 @@ impl Router {
         &self,
         request: EmbeddingRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
@@ -45,7 +47,9 @@ impl Router {
         }
         let model = request.model.clone();
         let user_id = user.as_ref().map(|u| u.user_id.clone());
-        let result = self.route_embeddings_inner(request, user).await;
+        let result = self
+            .route_embeddings_inner(request, user, origin, actor)
+            .await;
         if let Ok(ref outcome) = result {
             self.bump_embedding_usage_best_effort(
                 &model,
@@ -95,6 +99,8 @@ impl Router {
         &self,
         request: EmbeddingRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<EmbeddingResponse>> {
         debug!("Routing embeddings dla modelu: {}", request.model);
 
@@ -108,6 +114,8 @@ impl Router {
                 crate::services::runtime::executor::embeddings_request_to_initial_envelope(
                     &request,
                     user.clone(),
+                    origin,
+                    actor.clone(),
                 );
             match dispatcher
                 .try_dispatch(&request.model, "embeddings", initial, meta)
@@ -209,10 +217,14 @@ impl Router {
         // `enter_hop` call inside the executor's mesh path will reject.
         // Anti-loop on the protocol-native reverse path — a peer's
         // EmbeddingsPayload must land on a local instance, never bounce.
-        let mut exec_ctx = ExecutionContext {
-            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
-            ..ExecutionContext::default()
-        };
+        // §2.5 — a peer node forwarded this call; the originating user stays on
+        // the initiator's node, so the acting identity here is the mesh peer.
+        let mut exec_ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+            crate::flow_engine::dispatcher::FlowActor::system_component("mesh_peer"),
+        );
+        exec_ctx.hop_count = crate::services::runtime::context::MAX_HOP_COUNT;
 
         // EXEMPT-MESH-INBOUND (stage 3d v1.5): protocol-native embeddings
         // mesh reverse path — peer forwarduje CBOR ModelRequest, my
@@ -267,10 +279,14 @@ impl Router {
             top_n: payload.top_n.map(|n| n as u32),
         };
 
-        let mut exec_ctx = ExecutionContext {
-            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
-            ..ExecutionContext::default()
-        };
+        // §2.5 — a peer node forwarded this call; the originating user stays on
+        // the initiator's node, so the acting identity here is the mesh peer.
+        let mut exec_ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+            crate::flow_engine::dispatcher::FlowActor::system_component("mesh_peer"),
+        );
+        exec_ctx.hop_count = crate::services::runtime::context::MAX_HOP_COUNT;
 
         let response = match executor.execute_rerank(request, &mut exec_ctx).await {
             Ok(r) => r,

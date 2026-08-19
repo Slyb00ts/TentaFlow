@@ -682,6 +682,11 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "agents_delegation_roster",
             MigrationStep::Rust(agents_add_delegation_roster),
         ),
+        (
+            129,
+            "events_tracking_foundation",
+            MigrationStep::RustSelfManaged(create_events_tracking_foundation),
+        ),
     ]
 }
 
@@ -705,6 +710,171 @@ fn agents_add_delegation_roster(conn: &Connection) -> Result<()> {
         conn.execute_batch("ALTER TABLE agents ADD COLUMN allowed_agents_json TEXT")?;
     }
     Ok(())
+}
+
+// =============================================================================
+// v129 — main-database groundwork for the event-tracking subsystem
+// =============================================================================
+//
+// The timeline itself lives in a side database (`<data>/events.db`, own version
+// table, outside the Sync Ledger like `flow_executions` and `audit_log`). Three
+// things cannot live there, and they arrive together because each is useless
+// alone:
+//
+//   (a) `audit_log.correlation_id` — the deep link from an accountability entry
+//       to the point on the timeline that produced it. `request_id` is NOT
+//       reusable for this: `code_studio/audit_outbox.rs` already stores an event
+//       id there, and `compliance_ai_events` forces a distinct `request_id` per
+//       row via `UNIQUE(org_id, request_id)`. `correlation_id` is the orthogonal
+//       key tying ONE logical turn across `audit_log`, `compliance_ai_events`
+//       and `run_events` — hence the same column name and the same
+//       `(correlation_id, <time> DESC)` index shape as
+//       `idx_compliance_ai_events_correlation`.
+//
+//   (b) `events.read` / `events.read_all` — reading one's own runs is an
+//       ordinary user capability, reading every run on the node is not. Two
+//       permissions rather than one, so the split is expressible without a
+//       role-name check at the dispatch layer.
+//
+//   (c) retention scope `events` — §2.9: retention ships WITH the log, never
+//       later. `compliance_retention_policies.scope_kind` carries a hardcoded
+//       CHECK list, so widening it means rebuilding the table; and
+//       `compliance_data_subject_retention` holds an FK to it, so the rebuild
+//       needs `PRAGMA foreign_keys = OFF` OUTSIDE a transaction (SQLite ignores
+//       that pragma inside one) — hence `RustSelfManaged`, following v65.
+//
+// The 30-day default is deliberately far below the >=183 days AI audit is bound
+// to: the timeline is a diagnostic tool, the audit trail is a commitment. They
+// are separate rows, so seeding one cannot shorten the other.
+//
+// Fully idempotent: a column probe for (a), `roles_add_permissions` skips
+// permissions already present for (b), and (c) short-circuits the rebuild once
+// the CHECK carries the new scope while the seed is `INSERT OR IGNORE` on a
+// stable id.
+fn create_events_tracking_foundation(conn: &Connection, version: i64, name: &str) -> Result<()> {
+    let scope_already_widened: bool = conn
+        .query_row(
+            "SELECT instr(sql, '''events''') > 0 FROM sqlite_master \
+             WHERE type = 'table' AND name = 'compliance_retention_policies'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|value| value != 0)
+        .unwrap_or(false);
+
+    conn.execute_batch("PRAGMA foreign_keys = OFF;")?;
+
+    let result = (|| -> Result<()> {
+        let tx = conn.unchecked_transaction()?;
+
+        if !column_exists(&tx, "audit_log", "correlation_id")? {
+            tx.execute_batch("ALTER TABLE audit_log ADD COLUMN correlation_id TEXT NULL;")?;
+        }
+        tx.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_audit_log_correlation \
+                 ON audit_log(correlation_id, timestamp DESC);",
+        )?;
+
+        roles_add_permissions(
+            &tx,
+            &[
+                "org_admin",
+                "org_operator",
+                "org_viewer",
+                "dpo",
+                "supervisor",
+            ],
+            &["events.read"],
+        )?;
+        roles_add_permissions(&tx, &["org_admin"], &["events.read_all"])?;
+
+        // The rebuild preserves every other column definition, constraint,
+        // default, index and trigger exactly as v65 left them.
+        if !scope_already_widened {
+            tx.execute_batch(
+                "
+                CREATE TABLE compliance_retention_policies_new (
+                    retention_policy_id TEXT PRIMARY KEY,
+                    org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+                    slug TEXT NOT NULL,
+                    name_translations TEXT NOT NULL DEFAULT '{}',
+                    scope_kind TEXT NOT NULL CHECK(scope_kind IN \
+                        ('audit','ai_audit','data_category','document','dsar','breach','general','agent_runs','events')),
+                    category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
+                    retention_days INTEGER NOT NULL,
+                    minimum_days INTEGER NOT NULL DEFAULT 0,
+                    action_after_retention TEXT NOT NULL DEFAULT 'delete'
+                        CHECK(action_after_retention IN ('delete','anonymize','archive')),
+                    is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+                    is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+                    created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                    CHECK(retention_days >= minimum_days),
+                    UNIQUE(org_id, slug),
+                    CHECK(json_valid(name_translations))
+                );
+                INSERT INTO compliance_retention_policies_new
+                    SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                           category_id, retention_days, minimum_days, action_after_retention, \
+                           is_default, is_active, created_at, updated_at \
+                    FROM compliance_retention_policies;
+                DROP TABLE compliance_retention_policies;
+                ALTER TABLE compliance_retention_policies_new RENAME TO compliance_retention_policies;
+                CREATE INDEX IF NOT EXISTS idx_compliance_retention_policies_lookup
+                    ON compliance_retention_policies(org_id, scope_kind, category_id, is_active);
+                CREATE UNIQUE INDEX IF NOT EXISTS idx_compliance_retention_one_default
+                    ON compliance_retention_policies(org_id, scope_kind)
+                    WHERE is_default = 1 AND category_id IS NULL AND is_active = 1;
+                CREATE TRIGGER IF NOT EXISTS compliance_retention_policies_updated_at
+                AFTER UPDATE ON compliance_retention_policies
+                FOR EACH ROW
+                BEGIN
+                    UPDATE compliance_retention_policies
+                    SET updated_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now')
+                    WHERE retention_policy_id = NEW.retention_policy_id;
+                END;
+                ",
+            )?;
+        }
+
+        // Backfill every existing org: `ensure_org_defaults` runs at org creation
+        // only, so an upgraded fleet would otherwise never see the new scope. The
+        // id matches `default_record_id` (bare base id for the default org,
+        // '{org}:{base}' otherwise), so a later org re-seed is a no-op.
+        tx.execute(
+            "INSERT OR IGNORE INTO compliance_retention_policies \
+                (retention_policy_id, org_id, slug, name_translations, scope_kind, category_id, \
+                 retention_days, minimum_days, action_after_retention, is_default, is_active) \
+             SELECT CASE WHEN org_id = ?1 THEN ?2 ELSE printf('%s:%s', org_id, ?2) END, \
+                    org_id, 'events_default', ?3, 'events', NULL, ?4, 0, 'delete', 1, 1 \
+             FROM organizations WHERE status <> 'deleted'",
+            rusqlite::params![
+                crate::services::org::DEFAULT_ORG_ID,
+                crate::compliance::EVENTS_RETENTION_POLICY_BASE_ID,
+                crate::compliance::EVENTS_RETENTION_NAME_TRANSLATIONS,
+                crate::compliance::EVENTS_RETENTION_DAYS,
+            ],
+        )?;
+
+        let fk_violations = foreign_key_check(&tx)?;
+        if !fk_violations.is_empty() {
+            anyhow::bail!(
+                "create_events_tracking_foundation: foreign_key_check found {} violation(s): {}",
+                fk_violations.len(),
+                fk_violations.join("; ")
+            );
+        }
+
+        tx.execute(
+            "INSERT OR IGNORE INTO _migrations (version, name) VALUES (?1, ?2)",
+            rusqlite::params![version, name],
+        )?;
+        tx.commit()?;
+        Ok(())
+    })();
+
+    conn.execute_batch("PRAGMA foreign_keys = ON;")?;
+    result
 }
 
 /// Completes the accounting of an agent run: the model it spent tokens on and
@@ -6846,7 +7016,7 @@ CREATE TABLE IF NOT EXISTS compliance_retention_policies (
     org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
     slug TEXT NOT NULL,
     name_translations TEXT NOT NULL DEFAULT '{}',
-    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','general','agent_runs')),
+    scope_kind TEXT NOT NULL CHECK(scope_kind IN ('audit','ai_audit','data_category','document','dsar','breach','general','agent_runs','events')),
     category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
     retention_days INTEGER NOT NULL,
     minimum_days INTEGER NOT NULL DEFAULT 0,
@@ -8077,6 +8247,7 @@ mod tests {
 
         // Reproduce a pre-v65 database: rebuild the retention table with the old
         // 7-value CHECK and drop the seeded agent_runs policy + the v65 stamp.
+        // Scopes introduced after v65 go with it — the old CHECK rejects them.
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(
             "
@@ -8104,7 +8275,8 @@ mod tests {
                 SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
                        category_id, retention_days, minimum_days, action_after_retention, \
                        is_default, is_active, created_at, updated_at \
-                FROM compliance_retention_policies WHERE scope_kind <> 'agent_runs';
+                FROM compliance_retention_policies \
+                WHERE scope_kind NOT IN ('agent_runs', 'events');
             DROP TABLE compliance_retention_policies;
             ALTER TABLE compliance_retention_policies_old RENAME TO compliance_retention_policies;
             ",
@@ -8227,6 +8399,281 @@ mod tests {
         assert!(column_exists(&conn, "compliance_ai_events", "agent_id").unwrap());
         assert!(column_exists(&conn, "compliance_ai_events", "agent_run_id").unwrap());
         assert!(column_exists(&conn, "compliance_ai_events", "correlation_id").unwrap());
+    }
+
+    fn role_permissions(conn: &Connection, role: &str) -> Vec<String> {
+        let json: String = conn
+            .query_row(
+                "SELECT permissions_json FROM roles WHERE name = ?1",
+                rusqlite::params![role],
+                |r| r.get(0),
+            )
+            .unwrap();
+        serde_json::from_str(&json).unwrap()
+    }
+
+    /// Rebuilds `compliance_retention_policies` with the pre-v129 CHECK list and
+    /// strips everything else v129 adds, so the migration can be exercised on a
+    /// database that really is at v128.
+    fn rewind_to_v128(conn: &Connection) {
+        conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE compliance_retention_policies_v128 (
+                retention_policy_id TEXT PRIMARY KEY,
+                org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
+                slug TEXT NOT NULL,
+                name_translations TEXT NOT NULL DEFAULT '{}',
+                scope_kind TEXT NOT NULL CHECK(scope_kind IN \
+                    ('audit','ai_audit','data_category','document','dsar','breach','general','agent_runs')),
+                category_id TEXT NULL REFERENCES compliance_data_categories(category_id) ON DELETE SET NULL,
+                retention_days INTEGER NOT NULL,
+                minimum_days INTEGER NOT NULL DEFAULT 0,
+                action_after_retention TEXT NOT NULL DEFAULT 'delete'
+                    CHECK(action_after_retention IN ('delete','anonymize','archive')),
+                is_default INTEGER NOT NULL DEFAULT 0 CHECK(is_default IN (0,1)),
+                is_active INTEGER NOT NULL DEFAULT 1 CHECK(is_active IN (0,1)),
+                created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                updated_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
+                CHECK(retention_days >= minimum_days),
+                UNIQUE(org_id, slug),
+                CHECK(json_valid(name_translations))
+            );
+            INSERT INTO compliance_retention_policies_v128
+                SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                       category_id, retention_days, minimum_days, action_after_retention, \
+                       is_default, is_active, created_at, updated_at \
+                FROM compliance_retention_policies WHERE scope_kind <> 'events';
+            DROP TABLE compliance_retention_policies;
+            ALTER TABLE compliance_retention_policies_v128 RENAME TO compliance_retention_policies;
+            DROP INDEX IF EXISTS idx_audit_log_correlation;
+            ALTER TABLE audit_log DROP COLUMN correlation_id;
+            UPDATE roles SET permissions_json = (
+                SELECT json_group_array(value) FROM json_each(roles.permissions_json)
+                WHERE value NOT IN ('events.read', 'events.read_all')
+            );
+            DELETE FROM _migrations WHERE version = 129;
+            ",
+        )
+        .unwrap();
+        conn.execute_batch("PRAGMA foreign_keys = ON;").unwrap();
+    }
+
+    #[test]
+    fn migration_v129_fresh_database_has_events_foundation() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        assert!(column_exists(&conn, "audit_log", "correlation_id").unwrap());
+        let indexed: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master \
+                 WHERE type = 'index' AND name = 'idx_audit_log_correlation'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            indexed, 1,
+            "the audit -> timeline deep link needs its index"
+        );
+
+        // A fresh install gets the final CHECK straight from INITIAL_SCHEMA, so the
+        // v129 probe finds the scope already there and skips the table rebuild.
+        // A rebuild ends in ALTER TABLE ... RENAME, which leaves the table name
+        // quoted in sqlite_master; an unquoted name proves this is still the
+        // table INITIAL_SCHEMA created.
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'compliance_retention_policies'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            table_sql.contains("'events'"),
+            "INITIAL_SCHEMA must already accept the events scope: {table_sql}"
+        );
+        assert!(
+            table_sql.contains("CREATE TABLE compliance_retention_policies"),
+            "a fresh install must not rebuild the retention table: {table_sql}"
+        );
+
+        let admin = role_permissions(&conn, "org_admin");
+        assert!(admin.iter().any(|p| p == "events.read"));
+        assert!(admin.iter().any(|p| p == "events.read_all"));
+        for role in ["org_operator", "org_viewer", "dpo", "supervisor"] {
+            let perms = role_permissions(&conn, role);
+            assert!(
+                perms.iter().any(|p| p == "events.read"),
+                "{role} must read its own runs"
+            );
+            assert!(
+                !perms.iter().any(|p| p == "events.read_all"),
+                "{role} must not read every run on the node"
+            );
+        }
+
+        let (days, action, minimum, translations): (i64, String, i64, String) = conn
+            .query_row(
+                "SELECT retention_days, action_after_retention, minimum_days, name_translations \
+                 FROM compliance_retention_policies \
+                 WHERE scope_kind = 'events' AND org_id = ?1",
+                rusqlite::params![crate::services::org::DEFAULT_ORG_ID],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?)),
+            )
+            .unwrap();
+        assert_eq!(days, crate::compliance::EVENTS_RETENTION_DAYS);
+        assert_eq!(action, "delete");
+        assert_eq!(minimum, 0);
+        for locale in ["pl", "en", "de", "es", "fr"] {
+            assert!(
+                translations.contains(&format!("\"{locale}\"")),
+                "missing locale {locale} in the seeded policy name"
+            );
+        }
+
+        // The event log's own term must not have touched the AI-audit commitment.
+        let ai_days: i64 = conn
+            .query_row(
+                "SELECT retention_days FROM compliance_retention_policies \
+                 WHERE scope_kind = 'ai_audit' AND org_id = ?1",
+                rusqlite::params![crate::services::org::DEFAULT_ORG_ID],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(ai_days >= crate::compliance::MINIMUM_AI_AUDIT_RETENTION_DAYS);
+    }
+
+    #[test]
+    fn migration_v129_upgrades_v128_database_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        rewind_to_v128(&conn);
+
+        // The rewound CHECK rejects the new scope, proving we are really at v128.
+        assert!(
+            conn.execute(
+                "INSERT INTO compliance_retention_policies \
+                    (retention_policy_id, org_id, slug, name_translations, scope_kind, \
+                     retention_days, is_default, is_active) \
+                 VALUES ('probe', 'org-default', 'probe', '{}', 'events', 30, 0, 1)",
+                [],
+            )
+            .is_err(),
+            "pre-v129 CHECK must reject 'events'"
+        );
+        assert!(!column_exists(&conn, "audit_log", "correlation_id").unwrap());
+
+        for action in ["login", "flow.run", "addon.install"] {
+            conn.execute(
+                "INSERT INTO audit_log (action, result) VALUES (?1, 'ok')",
+                rusqlite::params![action],
+            )
+            .unwrap();
+        }
+        // An operator-tuned policy must survive the table rebuild verbatim.
+        conn.execute(
+            "UPDATE compliance_retention_policies SET retention_days = 999 \
+             WHERE slug = 'general_default'",
+            [],
+        )
+        .unwrap();
+        let policies_before: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_retention_policies",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        create_events_tracking_foundation(&conn, 129, "events_tracking_foundation").unwrap();
+
+        // Upgrading a real v128 database DOES rebuild: the narrow CHECK is gone
+        // and the renamed table is the one the migration created.
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                 WHERE type = 'table' AND name = 'compliance_retention_policies'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            table_sql.contains("'events'"),
+            "the upgrade must widen the CHECK: {table_sql}"
+        );
+
+        let audit_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM audit_log", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(audit_rows, 3, "audit rows must survive the upgrade");
+        let null_correlations: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log WHERE correlation_id IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(null_correlations, 3, "backfilled rows stay uncorrelated");
+
+        let tuned: i64 = conn
+            .query_row(
+                "SELECT retention_days FROM compliance_retention_policies \
+                 WHERE slug = 'general_default'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(tuned, 999, "existing retention policies must be untouched");
+        let policies_after: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_retention_policies",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            policies_after,
+            policies_before + 1,
+            "exactly one new policy"
+        );
+
+        assert!(role_permissions(&conn, "org_admin")
+            .iter()
+            .any(|p| p == "events.read_all"));
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        let stamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM _migrations WHERE version = 129",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stamped, 1);
+
+        // Re-running on an already-migrated database is a no-op, not a duplicate
+        // column, a duplicate policy or a second permission entry.
+        conn.execute("DELETE FROM _migrations WHERE version = 129", [])
+            .unwrap();
+        create_events_tracking_foundation(&conn, 129, "events_tracking_foundation").unwrap();
+        let events_policies: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM compliance_retention_policies WHERE scope_kind = 'events'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(events_policies, 1);
+        assert_eq!(
+            role_permissions(&conn, "org_admin")
+                .iter()
+                .filter(|p| *p == "events.read")
+                .count(),
+            1
+        );
     }
 
     /// v71 rewrites the existing "Agent Run" flow (`…012`) to the single-graph

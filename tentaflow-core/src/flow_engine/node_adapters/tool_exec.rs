@@ -1032,7 +1032,15 @@ impl NodeAdapter for ToolExecNodeAdapter {
         let agent_id = envelope.meta.get("agent_id").and_then(|v| v.as_str());
         let tools_json = service.agent_tools_json(agent_id);
 
-        let principal = AgentPrincipal::new(ctx.user_id.clone(), None);
+        // §2.5 — the run inherits the flow context's provenance verbatim; nothing
+        // here derives an actor from `user_id`.
+        let principal = AgentPrincipal::new(
+            ctx.user_id.clone(),
+            ctx.org_id.clone(),
+            ctx.origin,
+            ctx.actor(),
+        )
+        .with_correlation_id(ctx.correlation_id.clone());
         let started_at = Utc::now();
 
         // The calling run's identity (sub-agent control calls act under it).

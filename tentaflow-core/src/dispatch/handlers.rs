@@ -62,6 +62,18 @@ fn uuid_to_user_id_bytes(id: &str) -> Result<[u8; 16], ProtocolError> {
         .map_err(|_| ProtocolError::internal("user id is not a valid UUID"))
 }
 
+/// §2.5 — the actor behind a dashboard binary-protocol call: the authenticated
+/// session user. A non-session caller (node-to-node, unauthenticated) has no
+/// user, and reporting the system is the honest answer rather than inventing one.
+fn handler_actor(ctx: &HandlerContext) -> crate::flow_engine::dispatcher::FlowActor {
+    match &ctx.session {
+        SessionAuth::UserSession { user_id, .. } => {
+            crate::flow_engine::dispatcher::FlowActor::user(user_id_to_uuid(user_id))
+        }
+        _ => crate::flow_engine::dispatcher::FlowActor::system(),
+    }
+}
+
 fn db_err(e: impl std::fmt::Display) -> ProtocolError {
     ProtocolError::internal(format!("database error: {}", e))
 }
@@ -2910,7 +2922,13 @@ pub async fn tts_preview(
     let result = ctx
         .state
         .router
-        .synthesize_speech(&tts_req, None)
+        .synthesize_speech(
+            &tts_req,
+            None,
+            // §2.5 — a voice preview in Settings is an admin action, not chat.
+            crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
+            handler_actor(ctx),
+        )
         .await
         .map_err(|e| ProtocolError::internal(format!("tts preview: {e}")))?;
     Ok(MessageBody::TtsPreviewResponse {
@@ -8210,6 +8228,10 @@ pub async fn agent_run_start(
     let principal = crate::agents::AgentPrincipal::new(
         Some(user_id.clone()),
         ctx.org_context.as_ref().map(|o| o.org_id.clone()),
+        // §2.5 — the agent playground is a dashboard builder surface, not the
+        // chat/audio conversation surface.
+        crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
+        crate::flow_engine::dispatcher::FlowActor::user(user_id.clone()),
     );
     let manager = crate::agents::agent_run_manager_global()
         .ok_or_else(|| ProtocolError::internal("agent run manager not initialized"))?;
@@ -8402,7 +8424,14 @@ pub async fn agent_builder_assist(
     let result = ctx
         .state
         .router
-        .route_chat_completion(request, None, None)
+        .route_chat_completion(
+            request,
+            None,
+            // §2.5 — Agent Builder assist is a dashboard builder surface.
+            crate::flow_engine::dispatcher::FlowOrigin::Dashboard,
+            handler_actor(ctx),
+            None,
+        )
         .await
         .map_err(|e| ProtocolError::internal(format!("builder assist LLM call failed: {e}")))?;
     let raw = result

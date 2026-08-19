@@ -33,6 +33,8 @@ impl Router {
         &self,
         request: &crate::api::openai::types::TTSRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<TtsBytes>> {
         if let Some(ref u) = user {
             if let Some(ref db) = self.db {
@@ -54,13 +56,15 @@ impl Router {
         // Propaguj user dalej — Etap 2 odblokował TTS-as-flow, więc
         // FlowDispatcher::acl_allow musi widzieć rzeczywistego callera, a
         // resolver/strategy w ModelRuntimeExecutor mogą gateować per-user.
-        self.synthesize_speech(request, user).await
+        self.synthesize_speech(request, user, origin, actor).await
     }
 
     pub async fn synthesize_speech(
         &self,
         request: &crate::api::openai::types::TTSRequest,
         user: Option<crate::auth::acl::UserContext>,
+        origin: crate::flow_engine::dispatcher::FlowOrigin,
+        actor: crate::flow_engine::dispatcher::FlowActor,
     ) -> Result<crate::routing::RouteResult<TtsBytes>> {
         // Strip emoji + apply DB-driven `tts_cleaning_rules` BEFORE
         // dispatch. Without this the TTS engine has to pronounce raw
@@ -96,6 +100,8 @@ impl Router {
                 crate::services::runtime::executor::tts_request_to_initial_envelope(
                     &cleaned_request,
                     user.clone(),
+                    origin,
+                    actor.clone(),
                 );
             match dispatcher
                 .try_dispatch(&cleaned_request.model, "tts", initial, meta)

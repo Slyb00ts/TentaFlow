@@ -401,6 +401,13 @@ pub fn start_unified_server_with_permissions(
                                 let mut owner_user_ctx: Option<crate::auth::acl::UserContext> =
                                     None;
                                 let mut principal: Option<crate::auth::acl::Principal> = None;
+                                // §2.5 — the /v1 actor. Minted HERE because this
+                                // is the only place the API key → user binding is
+                                // known: the call itself never carries it, and a
+                                // service key legitimately has none.
+                                let mut flow_actor: Option<
+                                    crate::flow_engine::dispatcher::FlowActor,
+                                > = None;
                                 // (uid, rate_limit_rps) of the authenticated key,
                                 // captured for every key type so the per-key limiter
                                 // can be enforced after auth (NOT keyed by IP).
@@ -466,6 +473,12 @@ pub fn start_unified_server_with_permissions(
                                                                             uid.clone(), user.role.clone(),
                                                                         ),
                                                                     );
+                                                                    flow_actor = Some(
+                                                                        crate::flow_engine::dispatcher::FlowActor::api_key(
+                                                                            api_key_row.uid.clone(),
+                                                                            Some(uid.clone()),
+                                                                        ),
+                                                                    );
                                                                     principal = Some(
                                                                         crate::auth::acl::Principal::User {
                                                                             user_id: uid,
@@ -490,6 +503,13 @@ pub fn start_unified_server_with_permissions(
                                                                     .map(|_| gid.to_string())
                                                             }) {
                                                                 Some(gid) => {
+                                                                    // Group key: no user behind it.
+                                                                    flow_actor = Some(
+                                                                        crate::flow_engine::dispatcher::FlowActor::api_key(
+                                                                            api_key_row.uid.clone(),
+                                                                            None,
+                                                                        ),
+                                                                    );
                                                                     principal = Some(
                                                                         crate::auth::acl::Principal::Group {
                                                                             group_id: gid,
@@ -507,6 +527,13 @@ pub fn start_unified_server_with_permissions(
                                                             // explicit allowlist (subject_type=
                                                             // 'api_key', subject_id=uid). No role,
                                                             // never admin-bypass.
+                                                            // Service key: no user binding.
+                                                            flow_actor = Some(
+                                                                crate::flow_engine::dispatcher::FlowActor::api_key(
+                                                                    api_key_row.uid.clone(),
+                                                                    None,
+                                                                ),
+                                                            );
                                                             principal = Some(
                                                                 crate::auth::acl::Principal::ApiKey {
                                                                     uid: api_key_row.uid.clone(),
@@ -593,6 +620,9 @@ pub fn start_unified_server_with_permissions(
                                 }
                                 if let Some(p) = principal {
                                     req.extensions_mut().insert(p);
+                                }
+                                if let Some(a) = flow_actor {
+                                    req.extensions_mut().insert(a);
                                 }
                                 let resp =
                                     crate::api::openai::server::handle_request(req, router).await?;

@@ -16,6 +16,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod events;
 pub mod flow_engine;
 pub mod flow_runtime;
 pub mod hub;

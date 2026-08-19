@@ -1605,6 +1605,7 @@ fn deliver_child_result(
     // a fresh task — `spawn` returns a run id immediately, and detaching it here
     // keeps `run_task`'s own future non-recursive (and `Send`): a child's
     // finalization does not block on starting the parent's next run.
+    // §2.5 — the continuation inherits the finishing run's provenance verbatim.
     let principal = AgentPrincipal::new(parent_run.user_id.clone(), parent_run.org_id.clone());
     let parent_tools: Vec<String> =
         serde_json::from_str(&parent_agent.tools_json).unwrap_or_default();
@@ -1728,6 +1729,13 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             addon_id: None,
             org_id: None,
             vector_home: None,
+            // §2.5 — a run inherits the principal's provenance verbatim, so a
+            // sub-agent still reports the entry point that started the chain.
+            origin: principal.origin,
+            actor_kind: principal.actor.kind(),
+            actor_id: principal.actor.id().map(String::from),
+            actor_user_id: principal.actor.user_id().map(String::from),
+            correlation_id: None,
             deadline,
             cancel_token: cancel,
             progress_sink: Some(progress),

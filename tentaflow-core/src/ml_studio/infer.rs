@@ -59,7 +59,13 @@ pub async fn run_local_chat(
         .read()
         .clone()
         .ok_or_else(|| anyhow::anyhow!("runtime executor niedostępny"))?;
-    let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(None);
+    // §2.5 — ML Studio evaluation / distillation drives the model itself; the
+    // request is internal core work, not a call any user or key made directly.
+    let mut exec_ctx = crate::services::runtime::context::ExecutionContext::new(
+        None,
+        crate::flow_engine::dispatcher::FlowOrigin::System,
+        crate::flow_engine::dispatcher::FlowActor::system_component("ml_studio"),
+    );
     let response = executor
         .execute_chat(request, &mut exec_ctx)
         .await

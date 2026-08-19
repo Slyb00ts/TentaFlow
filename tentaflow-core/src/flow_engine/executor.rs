@@ -20,7 +20,7 @@ use crate::db::{repository, DbPool};
 use crate::flow_engine::cache::CompiledFlow;
 use crate::flow_engine::envelope::{
     ChatMessage, EnvelopeDelta, FinishReason, FlowEnvelope, FlowExecutionOutcome, FlowValue,
-    GenPerf, NodeInput, TokenUsage, TraceStatus, TraceStep,
+    GenPerf, LlmStreamChunk, NodeInput, TokenUsage, TraceStatus, TraceStep,
 };
 use crate::flow_engine::io_mapping;
 use crate::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext, NodeAdapter, UsageSink};
@@ -55,6 +55,23 @@ fn emit_node_finished(ctx: &ExecutionContext, node_id: &str, status: &TraceStatu
             status: label.to_string(),
         },
     );
+}
+
+/// Does this chunk carry the first visible token of a streaming step?
+///
+/// Reasoning counts as a token. For a thinking model the stream genuinely
+/// starts with reasoning, and both forwarding gates below already treat text
+/// and reasoning as one class of visible narration; a text-only rule would fold
+/// the entire thinking phase into TTFT and report backend latency that never
+/// happened. Emptiness is tested on the reasoning STRING, not on the `Option` —
+/// backends send `Some("")` alongside tool-call framing, and an empty delta is
+/// not a token.
+fn chunk_carries_first_token(chunk: &LlmStreamChunk) -> bool {
+    !chunk.text_delta.is_empty()
+        || chunk
+            .reasoning_delta
+            .as_ref()
+            .is_some_and(|r| !r.is_empty())
 }
 
 pub struct StreamingExecution {
@@ -1191,6 +1208,10 @@ async fn stream_llm_member(
     let mut reasoning_content = String::new();
     let mut tool_calls = ToolCallAccumulator::new();
     let mut finish_reason: Option<FinishReason> = None;
+    // Per-CALL flag, so the harness gets per-STEP semantics: this function runs
+    // once per loop-region iteration, and TTFT is measured against the
+    // request that started THAT step, not against the whole run.
+    let mut first_token_emitted = false;
 
     while let Some(item) = stream.next().await {
         let chunk = match item {
@@ -1212,6 +1233,16 @@ async fn stream_llm_member(
                 ));
             }
         };
+
+        if !first_token_emitted && chunk_carries_first_token(&chunk) {
+            first_token_emitted = true;
+            ctx.progress.emit(
+                &ctx.progress_scope,
+                crate::flow_engine::dispatchers::ProgressEvent::FirstToken {
+                    node_id: node.id.clone(),
+                },
+            );
+        }
 
         if !content.is_empty() || !chunk.text_delta.is_empty() {
             content.push_str(&chunk.text_delta);
@@ -2152,6 +2183,9 @@ async fn finalize_streaming_flow(
     // dla wire trailers.
     let mut last_audio_finish: Option<FinishReason> = None;
     let mut audio_chunks_emitted: usize = 0;
+    // The plain streaming flow has exactly one producer step, so one flag for
+    // the whole finalizer is the per-step scope here.
+    let mut first_token_emitted = false;
     let producer_attempt_started = Instant::now();
 
     'main: loop {
@@ -2163,6 +2197,15 @@ async fn finalize_streaming_flow(
             }
             delta = envelope_stream.next() => match delta {
                 Some(Ok(EnvelopeDelta::Llm(c))) => {
+                    if !first_token_emitted && chunk_carries_first_token(&c) {
+                        first_token_emitted = true;
+                        inputs.progress.emit(
+                            &inputs.progress_scope,
+                            crate::flow_engine::dispatchers::ProgressEvent::FirstToken {
+                                node_id: inputs.producer_node_id.clone(),
+                            },
+                        );
+                    }
                     if !c.text_delta.is_empty() {
                         text_buf.push_str(&c.text_delta);
                     }
@@ -4809,5 +4852,426 @@ mod node_budget_tests {
                 NODE_TIMEOUT_SECS
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod first_token_tests {
+    //! §2.6 — `FirstToken` is the one emission point TTFT needs, and it fires on
+    //! the first NON-EMPTY delta of a streaming step. Deltas are consumed in two
+    //! separate loops, so both are covered here: the plain streaming finalizer
+    //! (`finalize_streaming_flow`, one producer step per run) and the inline
+    //! harness member (`stream_llm_member`, one call per loop-region iteration).
+    use super::{chunk_carries_first_token, execute_streaming};
+    use crate::db::DbPool;
+    use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::dispatchers::ProgressEvent;
+    use crate::flow_engine::envelope::{
+        EnvelopeDelta, FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
+        ToolCallDelta,
+    };
+    use crate::flow_engine::node_adapter::{
+        test_support::{stub_ctx, CapturingProgress},
+        AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec, StreamProducerAdapter,
+    };
+    use crate::flow_engine::node_adapters::{OutputNodeAdapter, TriggerNodeAdapter};
+    use crate::flow_engine::types::{FlowDataType, FlowNode};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use futures::stream::{BoxStream, StreamExt};
+    use serde_json::json;
+    use std::path::Path;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::{Arc, Mutex};
+    use tokio::sync::mpsc;
+
+    fn db() -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        {
+            let conn = pool.write().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
+                [],
+            )
+            .expect("seed flow");
+        }
+        pool
+    }
+
+    fn text_chunk(text: &str) -> LlmStreamChunk {
+        LlmStreamChunk {
+            text_delta: text.to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn reasoning_chunk(text: &str) -> LlmStreamChunk {
+        LlmStreamChunk {
+            reasoning_delta: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn terminal_chunk() -> LlmStreamChunk {
+        LlmStreamChunk {
+            finish_reason: Some(FinishReason::Stop),
+            ..Default::default()
+        }
+    }
+
+    /// Node ids of every FirstToken the sink saw, in emission order.
+    fn first_tokens(capture: &CapturingProgress) -> Vec<String> {
+        capture
+            .events()
+            .into_iter()
+            .filter_map(|(_, e)| match e {
+                ProgressEvent::FirstToken { node_id } => Some(node_id),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// Stream producer fed from a channel, so a test can advance the stream one
+    /// delta at a time and inspect what was emitted in between.
+    struct ChannelProducer {
+        rx: Mutex<Option<mpsc::Receiver<LlmStreamChunk>>>,
+    }
+
+    impl ChannelProducer {
+        fn new(rx: mpsc::Receiver<LlmStreamChunk>) -> Self {
+            Self {
+                rx: Mutex::new(Some(rx)),
+            }
+        }
+    }
+
+    #[async_trait]
+    impl NodeAdapter for ChannelProducer {
+        fn node_type(&self) -> &str {
+            "first_token_probe"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Text)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Text),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            Ok((*ctx.initial_envelope).clone())
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for ChannelProducer {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            let rx = self
+                .rx
+                .lock()
+                .expect("producer lock")
+                .take()
+                .expect("produce_stream runs once per flow");
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|c| (Ok(EnvelopeDelta::Llm(c)), rx))
+            })
+            .boxed())
+        }
+    }
+
+    /// Plain streaming flow: trigger → probe → output(stream).
+    fn probe_flow() -> serde_json::Value {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "p", "type": "first_token_probe", "config": {}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "to": "p", "from_port": "text", "to_port": "in"},
+                {"from": "p", "to": "o", "from_port": "stream", "to_port": "text"}
+            ]
+        })
+    }
+
+    fn probe_registry(rx: mpsc::Receiver<LlmStreamChunk>) -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_stream_producer(Arc::new(ChannelProducer::new(rx)));
+        Arc::new(r)
+    }
+
+    /// The predicate that decides what counts as the first token. A reasoning
+    /// delta counts (a thinking model's stream genuinely starts there); an
+    /// empty string does not, whether it arrives as text or as `Some("")`.
+    #[test]
+    fn only_a_non_empty_delta_counts_as_the_first_token() {
+        let deltas = ["", "", "a", "b"];
+        let first = deltas
+            .iter()
+            .position(|d| chunk_carries_first_token(&text_chunk(d)));
+        assert_eq!(first, Some(2), "the first two empty deltas are not tokens");
+
+        assert!(chunk_carries_first_token(&reasoning_chunk("thinking")));
+        assert!(
+            !chunk_carries_first_token(&reasoning_chunk("")),
+            "Some(\"\") is an empty delta, not a token"
+        );
+        assert!(
+            !chunk_carries_first_token(&terminal_chunk()),
+            "the finish marker carries no narration"
+        );
+    }
+
+    /// The sequence ["", "", "a", "b"] produces EXACTLY ONE FirstToken, on "a".
+    /// Each delta is only sent after the previous one came back out of the flow,
+    /// so when an assertion runs the executor provably has not seen the next
+    /// delta yet — that is what pins the event to "a" rather than to the run.
+    #[tokio::test]
+    async fn finalizer_emits_one_first_token_on_the_first_non_empty_delta() {
+        let (tx, rx) = mpsc::channel::<LlmStreamChunk>(8);
+        let registry = probe_registry(rx);
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &probe_flow().to_string(), &registry).expect("compile"),
+        );
+
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+        ctx.progress_scope = "ttft".into();
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("go".into());
+
+        let exec = execute_streaming(db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+        let mut stream = exec.stream;
+
+        for _ in 0..2 {
+            tx.send(text_chunk("")).await.expect("send empty delta");
+            let forwarded = stream.next().await.expect("empty delta forwarded");
+            forwarded.expect("empty delta is not an error");
+            assert!(
+                first_tokens(&capture).is_empty(),
+                "an empty delta must not emit FirstToken"
+            );
+        }
+
+        tx.send(text_chunk("a")).await.expect("send 'a'");
+        let forwarded = stream.next().await.expect("'a' forwarded");
+        forwarded.expect("'a' delta is not an error");
+        assert_eq!(
+            first_tokens(&capture),
+            vec!["p".to_string()],
+            "the first non-empty delta emits FirstToken for the producer node"
+        );
+
+        tx.send(text_chunk("b")).await.expect("send 'b'");
+        let forwarded = stream.next().await.expect("'b' forwarded");
+        forwarded.expect("'b' delta is not an error");
+        assert_eq!(
+            first_tokens(&capture).len(),
+            1,
+            "FirstToken must not repeat within a step"
+        );
+
+        drop(tx);
+        while stream.next().await.is_some() {}
+        assert_eq!(first_tokens(&capture).len(), 1);
+        assert_eq!(
+            capture.events()[0].0,
+            "ttft",
+            "events carry the configured broadcast scope"
+        );
+    }
+
+    /// Invariant 6 — a stream that never carries a non-empty delta leaves a GAP
+    /// in the log. The finish marker must not be turned into a fabricated
+    /// FirstToken just to keep the TTFT query tidy.
+    #[tokio::test]
+    async fn no_first_token_when_no_delta_is_ever_non_empty() {
+        let (tx, rx) = mpsc::channel::<LlmStreamChunk>(8);
+        let registry = probe_registry(rx);
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &probe_flow().to_string(), &registry).expect("compile"),
+        );
+
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("go".into());
+
+        let exec = execute_streaming(db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+        let mut stream = exec.stream;
+
+        for chunk in [text_chunk(""), reasoning_chunk(""), terminal_chunk()] {
+            tx.send(chunk).await.expect("send delta");
+        }
+        drop(tx);
+        while stream.next().await.is_some() {}
+        let _ = exec.outcome.await;
+
+        assert!(
+            first_tokens(&capture).is_empty(),
+            "no visible token was ever produced, so no FirstToken may be emitted"
+        );
+    }
+
+    /// Streaming region member. Call 1 ends with a tool call so the harness runs
+    /// again; call 2 answers without tools, which is the region's structural
+    /// stop. Every call opens with empty deltas, so only a per-call flag can
+    /// yield exactly one FirstToken per step.
+    struct RegionStreamBody {
+        calls: AtomicUsize,
+    }
+
+    #[async_trait]
+    impl NodeAdapter for RegionStreamBody {
+        fn node_type(&self) -> &str {
+            "first_token_region_body"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Any)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![
+                PortSpec::new("stream", FlowDataType::Text),
+                PortSpec::new("full", FlowDataType::Any),
+            ]
+        }
+        async fn execute(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            Ok((*ctx.initial_envelope).clone())
+        }
+    }
+
+    #[async_trait]
+    impl StreamProducerAdapter for RegionStreamBody {
+        async fn produce_stream(
+            &self,
+            _node: &FlowNode,
+            _inputs: &[NodeInput],
+            _ctx: &ExecutionContext,
+        ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+            let call = self.calls.fetch_add(1, Ordering::SeqCst);
+            let mut last = terminal_chunk();
+            if call == 0 {
+                last.tool_calls = vec![ToolCallDelta {
+                    index: 0,
+                    id: Some("call-0".into()),
+                    function_name: Some("probe.run".into()),
+                    arguments_delta: Some("{}".into()),
+                }];
+            }
+            let items = vec![
+                Ok(EnvelopeDelta::Llm(text_chunk(""))),
+                Ok(EnvelopeDelta::Llm(reasoning_chunk(""))),
+                Ok(EnvelopeDelta::Llm(text_chunk(&format!("step {call}")))),
+                Ok(EnvelopeDelta::Llm(last)),
+            ];
+            Ok(futures::stream::iter(items).boxed())
+        }
+    }
+
+    /// Inline harness: trigger → [region body] → output(stream), loop_back on
+    /// the single-node region.
+    fn region_flow() -> serde_json::Value {
+        json!({
+            "nodes": [
+                {"id": "t", "type": "trigger", "config": {}},
+                {"id": "b", "type": "first_token_region_body", "region": "loop1",
+                 "config": {"loop_max_iterations": 5}},
+                {"id": "o", "type": "output", "config": {"mode": "stream"}}
+            ],
+            "edges": [
+                {"from": "t", "to": "b", "from_port": "text", "to_port": "in"},
+                {"from": "b", "to": "b", "from_port": "full", "to_port": "in", "kind": "loop_back"},
+                {"from": "b", "to": "o", "from_port": "stream", "to_port": "text"}
+            ]
+        })
+    }
+
+    /// Two harness iterations produce TWO FirstToken events — one per step, each
+    /// inside its own iteration bracket. Per-run semantics would emit one and
+    /// make every step after the first unmeasurable.
+    #[tokio::test]
+    async fn harness_emits_one_first_token_per_region_iteration() {
+        let registry = {
+            let mut r = AdapterRegistry::new();
+            r.register(Arc::new(TriggerNodeAdapter::new()));
+            r.register(Arc::new(OutputNodeAdapter::new()));
+            r.register_stream_producer(Arc::new(RegionStreamBody {
+                calls: AtomicUsize::new(0),
+            }));
+            Arc::new(r)
+        };
+        let compiled = Arc::new(
+            CompiledFlow::from_json("0", &region_flow().to_string(), &registry).expect("compile"),
+        );
+
+        let capture = Arc::new(CapturingProgress::new());
+        let mut ctx = stub_ctx();
+        ctx.progress = capture.clone();
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Text("go".into());
+
+        let exec = execute_streaming(db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+        let mut stream = exec.stream;
+        while stream.next().await.is_some() {}
+        let _ = exec.outcome.await;
+
+        assert_eq!(
+            first_tokens(&capture),
+            vec!["b".to_string(), "b".to_string()],
+            "one FirstToken per harness step, named after the streaming member"
+        );
+
+        // Each FirstToken lands inside its own step's iteration bracket, so
+        // `request_started -> first_token` never spans two steps.
+        let bracket: Vec<&str> = capture
+            .events()
+            .iter()
+            .filter_map(|(_, e)| match e {
+                ProgressEvent::IterationStarted { .. } => Some("iteration_started"),
+                ProgressEvent::FirstToken { .. } => Some("first_token"),
+                ProgressEvent::IterationFinished { .. } => Some("iteration_finished"),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            bracket,
+            vec![
+                "iteration_started",
+                "first_token",
+                "iteration_finished",
+                "iteration_started",
+                "first_token",
+                "iteration_finished",
+            ]
+        );
     }
 }

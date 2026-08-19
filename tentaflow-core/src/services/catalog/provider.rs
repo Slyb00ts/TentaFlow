@@ -1397,7 +1397,11 @@ mod tests {
             Arc::new(LiveHandlesCache::new()),
             "local-node".to_string(),
         );
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let req = ResolveRequest {
             requested_model: "gpt-5-5",
             required_surface: ServiceSurface::Chat,

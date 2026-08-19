@@ -785,7 +785,16 @@ pub async fn router_complete(router: &Router, model: &str, prompt: String) -> Re
         memory_options: None,
         audio_input: None,
     };
-    let result = router.route_chat_completion(request, None, None).await?;
+    // Internal core maintenance job — no external caller, no session.
+    let result = router
+        .route_chat_completion(
+            request,
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+            None,
+        )
+        .await?;
     let text = result
         .response
         .choices

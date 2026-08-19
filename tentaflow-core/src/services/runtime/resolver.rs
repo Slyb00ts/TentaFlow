@@ -571,7 +571,11 @@ mod tests {
         );
         let snap = snapshot(vec![primary, fallback, alias_entry]);
         let resolver = resolver_with_embedded("local", 9, "small-model");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
 
         let outcome = resolver
             .resolve(&chat_request("rag-llm"), &snap, &mut ctx)
@@ -608,7 +612,11 @@ mod tests {
             service_entry_with_service_id("small-model", "local", 9, vec![ServiceSurface::Chat]);
         let snap = snapshot(vec![fallback]);
         let resolver = resolver_with_embedded("local", 9, "small-model");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
 
         let outcome = resolver
             .resolve(&chat_request("small-model"), &snap, &mut ctx)
@@ -651,7 +659,11 @@ mod tests {
         );
         let snap = snapshot(vec![entry]);
         let resolver = resolver_with_embedded("local", 9, "cross-encoder");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
 
         let outcome = resolver
             .resolve(&rerank_request("cross-encoder"), &snap, &mut ctx)
@@ -679,7 +691,11 @@ mod tests {
             service_entry_with_service_id("emb-model", "local", 9, vec![ServiceSurface::Chat]);
         let snap = snapshot(vec![entry]);
         let resolver = resolver_with_embedded("local", 9, "emb-model");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
 
         let outcome = resolver
             .resolve(&chat_request("emb-model"), &snap, &mut ctx)
@@ -691,7 +707,11 @@ mod tests {
     fn unknown_model_returns_unknown_error() {
         let snap = snapshot(vec![]);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = resolver
             .resolve(&chat_request("ghost"), &snap, &mut ctx)
             .unwrap_err();
@@ -705,7 +725,11 @@ mod tests {
         let entry = service_entry("m", "peer", vec![ServiceSurface::Chat], vec![], vec![]);
         let snap = snapshot(vec![entry]);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let outcome = resolver
             .resolve(&chat_request("m"), &snap, &mut ctx)
             .unwrap();
@@ -749,7 +773,11 @@ mod tests {
         let snap = snapshot(vec![primary, fallback, alias_entry]);
         let resolver = resolver_for("local");
 
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let req = ResolveRequest {
             requested_model: "chat-pl",
             required_surface: ServiceSurface::Chat,
@@ -788,7 +816,11 @@ mod tests {
 
         let snap = snapshot(vec![primary, fallback, alias_entry]);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let req = ResolveRequest {
             requested_model: "chat-pl",
             required_surface: ServiceSurface::Chat,
@@ -808,7 +840,11 @@ mod tests {
         let entry = service_entry("m", "local", vec![ServiceSurface::Chat], vec![], vec![]);
         let snap = snapshot(vec![entry]);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = resolver
             .resolve(&chat_request("m"), &snap, &mut ctx)
             .unwrap_err();
@@ -825,7 +861,11 @@ mod tests {
         let entry = service_entry("llama", "peer", vec![ServiceSurface::Chat], vec![], vec![]);
         let snap = snapshot(vec![entry]);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let req = ResolveRequest {
             requested_model: "llama",
             required_surface: ServiceSurface::Stt,
@@ -847,7 +887,11 @@ mod tests {
         ];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = resolver
             .resolve(&chat_request("a"), &snap, &mut ctx)
             .unwrap_err();
@@ -872,7 +916,11 @@ mod tests {
         ];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
 
         // First resolve trips the cycle.
         let _ = resolver.resolve(&chat_request("outer"), &snap, &mut ctx);
@@ -908,7 +956,11 @@ mod tests {
         let entries = vec![alias("loop", "loop", &[], Strategy::FirstAvailable)];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = resolver
             .resolve(&chat_request("loop"), &snap, &mut ctx)
             .unwrap_err();
@@ -950,7 +1002,11 @@ mod tests {
         ];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let outcome = resolver
             .resolve(&chat_request("fb-alias"), &snap, &mut ctx)
             .expect("offline primary must fall through to the live fallback");
@@ -977,7 +1033,11 @@ mod tests {
         )];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         assert!(
             resolver
                 .resolve(&chat_request("stale-alias"), &snap, &mut ctx)
@@ -1024,7 +1084,11 @@ mod tests {
         ];
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let outcome = resolver
             .resolve(&chat_request("umbrella"), &snap, &mut ctx)
             .expect("umbrella with one broken fallback must still resolve");
@@ -1072,7 +1136,11 @@ mod tests {
 
         let snap = snapshot(entries);
         let resolver = resolver_for("local");
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::System,
+            crate::flow_engine::dispatcher::FlowActor::system(),
+        );
         let err = resolver
             .resolve(&chat_request("a0"), &snap, &mut ctx)
             .unwrap_err();

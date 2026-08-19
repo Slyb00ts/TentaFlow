@@ -7,6 +7,7 @@
 // =============================================================================
 
 use crate::auth::acl::UserContext;
+use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 
 /// Hard ceilings — anything deeper trips the guard rather than risk an
 /// infinite chain. `MAX_HOP_COUNT` mirrors the legacy `MAX_HOPS` in
@@ -54,7 +55,11 @@ pub struct RouteMetadata {
 /// (top-level dispatch) and `enter_alias` / `enter_flow` / `enter_hop`
 /// when the runtime recurses; each enter helper bumps the matching guard
 /// and rejects with `ContextLimitError` when the limit would be exceeded.
-#[derive(Debug, Clone, Default)]
+///
+/// Deliberately NOT `Default`: `origin` / `actor` are server-minted provenance
+/// (§2.5, §3 invariant 1) and a defaulted context is exactly the silent
+/// `system` stamp the constructor argument exists to prevent.
+#[derive(Debug, Clone)]
 pub struct ExecutionContext {
     /// User identity for ACL gating. `None` is reserved for internal
     /// callers (addons, reverse mesh, translate) that bypass user-level
@@ -70,6 +75,15 @@ pub struct ExecutionContext {
     /// RAG E1.0 — organizacja-właściciel (`CallerContext.org_id`). `None` =>
     /// domyślny tenant. Przeprowadzana razem z `addon_id`.
     pub org_id: Option<String>,
+    /// §2.5 — where the request entered the system, stamped by the entry point
+    /// and copied into `FlowRequestMeta` when the runtime resolves onto a flow
+    /// target. A mandatory constructor argument, so an entry point that forgets
+    /// to say where a request came from fails to compile.
+    pub origin: FlowOrigin,
+    /// §2.5 — the authenticated caller, resolved at authorization time. Kept as
+    /// one value (not three loose strings) so no layer can pair the wrong id
+    /// with the wrong kind.
+    pub actor: FlowActor,
     /// Total mesh hops this request has crossed. Each forward step must
     /// `enter_hop` to bump it; loops trip `MaxHopCount`.
     pub hop_count: u8,
@@ -101,11 +115,20 @@ pub enum ContextLimitError {
 
 impl ExecutionContext {
     /// Top-level entry — used by HTTP / binary RPC / WebSocket handlers.
-    pub fn new(user: Option<UserContext>) -> Self {
+    ///
+    /// §2.5: `origin` and `actor` are mandatory positional arguments. There is
+    /// no defaulted variant and no optional `with_provenance` step, so a caller
+    /// that does not say where the request came from fails to COMPILE instead
+    /// of silently logging `system`. A caller with genuinely no external
+    /// provenance passes `FlowOrigin::System` + `FlowActor::system()`
+    /// explicitly, which is a statement rather than an omission.
+    pub fn new(user: Option<UserContext>, origin: FlowOrigin, actor: FlowActor) -> Self {
         Self {
             user,
             addon_id: None,
             org_id: None,
+            origin,
+            actor,
             hop_count: 0,
             flow_stack: Vec::new(),
             alias_stack: Vec::new(),
@@ -116,7 +139,7 @@ impl ExecutionContext {
     /// RAG E1.0 — zasiewa tożsamość addona-callera (instance_id) i org. Wołane w
     /// `service_call.rs` z `req.caller`, żeby executor mógł ją przepisać do
     /// `FlowRequestMeta` dla flow-targetu. Builder (zwraca `self`) — zwięzłe
-    /// wpięcie tuż po `ExecutionContext::new(None)`.
+    /// wpięcie tuż po `ExecutionContext::new`.
     pub fn with_addon_identity(mut self, addon_id: Option<String>, org_id: Option<String>) -> Self {
         self.addon_id = addon_id;
         self.org_id = org_id;
@@ -130,8 +153,13 @@ impl ExecutionContext {
     /// the runtime `MAX_FLOW_DEPTH` guard account for the inbound depth, so a
     /// self-referential rerank/embeddings flow trips the limit instead of
     /// recursing forever (each re-entry would otherwise reset to 0).
-    pub fn new_with_flow_depth(user: Option<UserContext>, depth: u8) -> Self {
-        let mut ctx = Self::new(user);
+    pub fn new_with_flow_depth(
+        user: Option<UserContext>,
+        depth: u8,
+        origin: FlowOrigin,
+        actor: FlowActor,
+    ) -> Self {
+        let mut ctx = Self::new(user, origin, actor);
         // Cap przy zasiewie — głębokość ponad limit i tak natychmiast trafi
         // w guard przy pierwszym `enter_flow`, nie potrzeba dłuższego wektora.
         let seed = (depth as usize).min(MAX_FLOW_DEPTH);
@@ -199,7 +227,7 @@ mod tests {
 
     #[test]
     fn alias_cycle_is_caught_before_depth_limit() {
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system());
         ctx.enter_alias("a").unwrap();
         ctx.enter_alias("b").unwrap();
         let err = ctx.enter_alias("a").unwrap_err();
@@ -214,7 +242,7 @@ mod tests {
 
     #[test]
     fn alias_depth_8_passes_9_fails() {
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system());
         for i in 0..MAX_ALIAS_DEPTH {
             ctx.enter_alias(&format!("a{}", i)).unwrap();
         }
@@ -231,7 +259,8 @@ mod tests {
     fn seeded_flow_depth_does_not_reset_the_guard() {
         // Re-wejście na głębokości 1: jeden `enter_flow` jeszcze przejdzie
         // (1 → 2 → 3), czwarty trafia w limit.
-        let mut ctx = ExecutionContext::new_with_flow_depth(None, 1);
+        let mut ctx =
+            ExecutionContext::new_with_flow_depth(None, 1, FlowOrigin::System, FlowActor::system());
         assert_eq!(ctx.flow_stack.len(), 1);
         ctx.enter_flow("a").unwrap();
         ctx.enter_flow("b").unwrap();
@@ -244,7 +273,12 @@ mod tests {
     /// w guard. Dowód, że nieograniczona rekurencja jest przerwana po N.
     #[test]
     fn seeded_at_max_flow_depth_trips_immediately() {
-        let mut ctx = ExecutionContext::new_with_flow_depth(None, MAX_FLOW_DEPTH as u8);
+        let mut ctx = ExecutionContext::new_with_flow_depth(
+            None,
+            MAX_FLOW_DEPTH as u8,
+            FlowOrigin::System,
+            FlowActor::system(),
+        );
         assert_eq!(ctx.flow_stack.len(), MAX_FLOW_DEPTH);
         let err = ctx.enter_flow("self").unwrap_err();
         assert!(matches!(err, ContextLimitError::MaxFlowDepth { .. }));
@@ -255,13 +289,18 @@ mod tests {
     /// i tak trafia od razu.
     #[test]
     fn seeded_depth_is_capped_at_max() {
-        let ctx = ExecutionContext::new_with_flow_depth(None, 250);
+        let ctx = ExecutionContext::new_with_flow_depth(
+            None,
+            250,
+            FlowOrigin::System,
+            FlowActor::system(),
+        );
         assert_eq!(ctx.flow_stack.len(), MAX_FLOW_DEPTH);
     }
 
     #[test]
     fn flow_depth_3_passes_4_fails() {
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system());
         for i in 0..MAX_FLOW_DEPTH {
             ctx.enter_flow(&i.to_string()).unwrap();
         }
@@ -271,7 +310,7 @@ mod tests {
 
     #[test]
     fn hop_count_caps_at_max() {
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system());
         for _ in 0..MAX_HOP_COUNT {
             ctx.enter_hop().unwrap();
         }
@@ -286,7 +325,7 @@ mod tests {
     /// którą przestrzeń instancji uderzać.
     #[test]
     fn with_addon_identity_seeds_instance_and_org() {
-        let ctx = ExecutionContext::new(None)
+        let ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system())
             .with_addon_identity(Some("inst-rag-1".to_string()), Some("org-7".to_string()));
         assert_eq!(ctx.addon_id.as_deref(), Some("inst-rag-1"));
         assert_eq!(ctx.org_id.as_deref(), Some("org-7"));
@@ -297,14 +336,14 @@ mod tests {
     /// więc węzeł vector odmawia zapisu zamiast trafić w cudzą przestrzeń.
     #[test]
     fn new_without_identity_leaves_addon_and_org_none() {
-        let ctx = ExecutionContext::new(None);
+        let ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system());
         assert!(ctx.addon_id.is_none());
         assert!(ctx.org_id.is_none());
     }
 
     #[test]
     fn leave_alias_lets_a_sibling_branch_reuse_the_name() {
-        let mut ctx = ExecutionContext::new(None);
+        let mut ctx = ExecutionContext::new(None, FlowOrigin::System, FlowActor::system());
         ctx.enter_alias("primary").unwrap();
         ctx.enter_alias("fallback-a").unwrap();
         ctx.leave_alias(); // back out of fallback-a

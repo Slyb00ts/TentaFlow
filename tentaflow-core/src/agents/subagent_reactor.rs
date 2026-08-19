@@ -37,6 +37,7 @@ use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 use crate::flow_engine::node_adapters::CompletionFilter;
 use crate::flow_engine::types::FlowDefinition;
 
+use super::principal::AgentPrincipal;
 use super::run_manager::ChildFinishedEvent;
 
 /// How many recently-dispatched run ids the reactor remembers for de-dup. Bounds
@@ -49,10 +50,16 @@ const DEDUP_WINDOW: usize = 4096;
 /// background path.
 #[async_trait]
 pub trait ReactorFlowDispatch: Send + Sync {
-    /// Runs `flow_id` with `initial` as the seeded entry envelope. Best-effort:
-    /// a dispatch error is logged by the reactor, never propagated to the
-    /// finishing run.
-    async fn dispatch(&self, flow_id: String, initial: FlowEnvelope) -> anyhow::Result<()>;
+    /// Runs `flow_id` with `initial` as the seeded entry envelope, under the
+    /// finished child's principal so the reactive run is attributed to the same
+    /// caller. Best-effort: a dispatch error is logged by the reactor, never
+    /// propagated to the finishing run.
+    async fn dispatch(
+        &self,
+        flow_id: String,
+        initial: FlowEnvelope,
+        principal: AgentPrincipal,
+    ) -> anyhow::Result<()>;
 }
 
 /// Production dispatch: drives an event-driven flow through the FlowDispatcher's
@@ -73,13 +80,26 @@ impl FlowDispatcherReactorDispatch {
 
 #[async_trait]
 impl ReactorFlowDispatch for FlowDispatcherReactorDispatch {
-    async fn dispatch(&self, flow_id: String, initial: FlowEnvelope) -> anyhow::Result<()> {
+    async fn dispatch(
+        &self,
+        flow_id: String,
+        initial: FlowEnvelope,
+        principal: AgentPrincipal,
+    ) -> anyhow::Result<()> {
         let dispatcher = self
             .dispatcher
             .upgrade()
             .ok_or_else(|| anyhow::anyhow!("flow dispatcher dropped (shutdown)"))?;
         let request_id = uuid::Uuid::new_v4().to_string();
-        let meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(request_id);
+        // §2.5 — a reactive run is not a fresh anonymous request: it continues
+        // the finished child's work, so it carries that run's provenance.
+        let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
+            request_id,
+            principal.origin,
+            principal.actor.clone(),
+        );
+        meta.user_id = principal.user_id.clone();
+        meta.org_id = principal.org_id.clone();
         let outcome = dispatcher
             .dispatch_by_flow_id_background(flow_id, initial, meta)
             .await
@@ -269,14 +289,25 @@ impl SubagentReactor {
         // The result is the durable persisted answer, not the event (the event
         // carries only ids/status). A run with no result (failure/cancel matched
         // by an explicit match_status) seeds an empty payload.
-        let result = repository::get_agent_run(&self.db, &event.run_id)
+        let finished = repository::get_agent_run(&self.db, &event.run_id)
             .ok()
-            .flatten()
-            .and_then(|r| r.result);
+            .flatten();
+        let result = finished.as_ref().and_then(|r| r.result.clone());
+        // §2.5 — inherit the finished run's caller. The run row persists who and
+        // which org, not the original entry point, so the reactive run reports
+        // `agent` as its origin — which is what it is.
+        let principal = AgentPrincipal::new(
+            finished.as_ref().and_then(|r| r.user_id.clone()),
+            finished.as_ref().and_then(|r| r.org_id.clone()),
+        );
 
         for flow_id in matching {
             let initial = seed_envelope(&event, result.as_deref());
-            if let Err(e) = self.dispatch.dispatch(flow_id.clone(), initial).await {
+            if let Err(e) = self
+                .dispatch
+                .dispatch(flow_id.clone(), initial, principal.clone())
+                .await
+            {
                 tracing::warn!(
                     "subagent reactor: dispatch of flow '{flow_id}' for run '{}' failed: {e}",
                     event.run_id
@@ -381,7 +412,12 @@ mod tests {
 
     #[async_trait]
     impl ReactorFlowDispatch for SpyDispatch {
-        async fn dispatch(&self, flow_id: String, initial: FlowEnvelope) -> anyhow::Result<()> {
+        async fn dispatch(
+            &self,
+            flow_id: String,
+            initial: FlowEnvelope,
+            _principal: AgentPrincipal,
+        ) -> anyhow::Result<()> {
             let payload = initial.payload.as_text().unwrap_or_default().to_string();
             self.calls.lock().unwrap().push((flow_id, payload));
             let _ = self.tx.send(());

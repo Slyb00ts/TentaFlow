@@ -166,18 +166,20 @@ fn namespace_file_path(org_id: &str, addon_id: &str, namespace: &str) -> Result<
         .join(format!("{namespace}.usearch")))
 }
 
-/// Waliduje katalog przekazany przez wolajacego pod utworzenie przestrzeni
-/// (`get_or_create_at` / `*_with_quota`). Musi byc bezwzgledny i wolny od `..` —
-/// sciezka sklada sie potem z nazwa pliku i laduje w `addon_vector_namespaces`
-/// jako trwale zrodlo prawdy o lokalizacji danych, wiec traversal zapisalby
-/// indeks poza obszarem danych na stale.
+/// Validates a caller-supplied directory for creating a data collection (vector:
+/// `get_or_create_at` / `*_with_quota`; graph:
+/// `GraphManager::ensure_collection_at`). It must be absolute and free of `..` —
+/// the path is later joined with a file name and stored in
+/// `addon_vector_namespaces` / `addon_graph_collections` as the durable source of
+/// truth about where the data lives, so a traversal would persist data outside
+/// the data area for good.
 ///
 /// Wartosc jest emitowana przez serwer (rejestr projektow), nie przez wolajacego
 /// addona — to zabezpieczenie w glab, nie jedyna bariera.
-fn validate_custom_dir(dir: &Path) -> Result<()> {
+pub(crate) fn validate_custom_dir(dir: &Path) -> Result<()> {
     if !dir.is_absolute() {
         return Err(VectorError::Db(format!(
-            "vector namespace dir must be absolute: {}",
+            "collection data dir must be absolute: {}",
             dir.display()
         )));
     }
@@ -186,7 +188,7 @@ fn validate_custom_dir(dir: &Path) -> Result<()> {
         .any(|c| matches!(c, std::path::Component::ParentDir))
     {
         return Err(VectorError::Db(format!(
-            "vector namespace dir must not contain '..': {}",
+            "collection data dir must not contain '..': {}",
             dir.display()
         )));
     }

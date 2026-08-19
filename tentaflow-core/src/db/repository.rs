@@ -8213,7 +8213,8 @@ pub const AGENT_ON_CHILD_COMPLETE_VALUES: &[&str] = &["notify", "continue"];
 
 const AGENT_RUN_COLS: &str = "id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, \
      status, prompt, result, exit_reason, iterations, total_tokens, prompt_tokens, \
-     completion_tokens, model, run_log, last_heartbeat_at, started_at, finished_at, created_at";
+     completion_tokens, model, run_log, last_heartbeat_at, started_at, finished_at, created_at, \
+     origin, actor_kind, actor_id, actor_user_id, correlation_id";
 
 fn row_to_agent(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgent> {
     Ok(DbAgent {
@@ -8262,6 +8263,11 @@ fn row_to_agent_run(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbAgentRun> {
         started_at: row.get(17)?,
         finished_at: row.get(18)?,
         created_at: row.get(19)?,
+        origin: row.get(20)?,
+        actor_kind: row.get(21)?,
+        actor_id: row.get(22)?,
+        actor_user_id: row.get(23)?,
+        correlation_id: row.get(24)?,
     })
 }
 
@@ -8498,8 +8504,9 @@ pub fn create_agent_run(pool: &DbPool, run: &NewAgentRun<'_>) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
         "INSERT INTO agent_runs \
-         (id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, status, prompt) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7)",
+         (id, agent_id, parent_run_id, flow_execution_id, user_id, org_id, status, prompt, \
+          origin, actor_kind, actor_id, actor_user_id, correlation_id) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'queued', ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             run.id,
             run.agent_id,
@@ -8508,6 +8515,11 @@ pub fn create_agent_run(pool: &DbPool, run: &NewAgentRun<'_>) -> Result<()> {
             run.user_id,
             run.org_id,
             run.prompt,
+            run.origin,
+            run.actor_kind,
+            run.actor_id,
+            run.actor_user_id,
+            run.correlation_id,
         ],
     )?;
     Ok(())

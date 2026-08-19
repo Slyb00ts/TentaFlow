@@ -2833,7 +2833,7 @@ async fn run_camera_flow(
     detect_ms: u32,
     detections: Vec<Detection>,
 ) {
-    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
 
     // Czas wykonania flow to koszt dodatkowej obrobki tej klatki; proc_ms =
@@ -2875,7 +2875,11 @@ async fn run_camera_flow(
     // admin-only and validates flow access before persisting `analysis_flow_id`.
     // A per-frame deadline (well under the dispatcher's 120 s cap) bounds how
     // long one camera's slot stays held if its flow hangs.
-    let mut meta = FlowRequestMeta::new(format!("cam-{camera_id}"));
+    let mut meta = FlowRequestMeta::new(
+        format!("cam-{camera_id}"),
+        FlowOrigin::Camera,
+        FlowActor::system_component(camera_id.clone()),
+    );
     meta.deadline = Some(Instant::now() + CAMERA_FLOW_DEADLINE);
     match disp.dispatch_by_flow_id(flow_id.clone(), env, meta).await {
         Ok(outcome) => {

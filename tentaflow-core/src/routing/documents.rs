@@ -41,10 +41,14 @@ impl Router {
             flow_depth: 0,
         };
 
-        let mut exec_ctx = ExecutionContext {
-            hop_count: crate::services::runtime::context::MAX_HOP_COUNT,
-            ..ExecutionContext::default()
-        };
+        // §2.5 — a peer node forwarded this call; the originating user stays on
+        // the initiator's node, so the acting identity here is the mesh peer.
+        let mut exec_ctx = ExecutionContext::new(
+            None,
+            crate::flow_engine::dispatcher::FlowOrigin::Mesh,
+            crate::flow_engine::dispatcher::FlowActor::system_component("mesh_peer"),
+        );
+        exec_ctx.hop_count = crate::services::runtime::context::MAX_HOP_COUNT;
 
         let response = match executor
             .execute_document_infer(request, &mut exec_ctx)

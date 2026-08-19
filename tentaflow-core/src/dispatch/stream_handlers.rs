@@ -136,8 +136,20 @@ fn chat_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             )),
             _ => None,
         };
+        // §2.5 — dashboard chat surface; the actor is the session user.
+        let actor = match user.as_ref() {
+            Some(u) => crate::flow_engine::dispatcher::FlowActor::user(u.user_id.clone()),
+            None => crate::flow_engine::dispatcher::FlowActor::system(),
+        };
         let route_result = match router
-            .route_chat_completion_stream(request, user, None, flow_selector)
+            .route_chat_completion_stream(
+                request,
+                user,
+                crate::flow_engine::dispatcher::FlowOrigin::Chat,
+                actor,
+                None,
+                flow_selector,
+            )
             .await
         {
             Ok(r) => r,
@@ -305,7 +317,7 @@ inventory::submit! {
 // =============================================================================
 
 fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscription>) {
-    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::envelope::EnvelopeDelta;
 
     let invoke = match req {
@@ -388,9 +400,24 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 
         // Cancel wiązany z subskrypcją: rozłączenie klienta / barge-in anuluje flow.
         let cancel = CancellationToken::new();
-        let mut meta = FlowRequestMeta::new(format!("flowinvoke-{correlation_id}"));
+        // §2.5 — the dashboard chat surface. The actor is the session principal
+        // resolved above; an unauthenticated subscription has none, and stamping
+        // `system` for it is the honest answer (it can only reach flows the
+        // dispatcher's `user_id = None` path allows).
+        let actor = match actor_id.as_deref() {
+            Some(uid) => FlowActor::user(uid),
+            None => FlowActor::system(),
+        };
+        let mut meta = FlowRequestMeta::new(
+            format!("flowinvoke-{correlation_id}"),
+            FlowOrigin::Chat,
+            actor,
+        );
         meta.session_id = invoke.session_id.clone();
         meta.user_id = actor_id.clone();
+        // Joinable with `request_id` — both are built from the transport's
+        // correlation id, so the audit trail and the run share one key.
+        meta.correlation_id = Some(format!("flowinvoke-{correlation_id}"));
         meta.cancel_token = cancel.clone();
 
         // Bind the session scope to this principal so run-events ACL (§3.3) can
@@ -1829,7 +1856,7 @@ fn project_studio_chat_stream_handler(
     ctx: HandlerContext,
     sub: Arc<Subscription>,
 ) {
-    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue};
     use tentaflow_protocol::project_studio::ProjectStudioPayload;
 
@@ -1972,7 +1999,14 @@ fn project_studio_chat_stream_handler(
         // Cancel bound to the subscription: a dropped/unsubscribed client
         // aborts the flow (push failure below fires this token).
         let cancel = CancellationToken::new();
-        let mut meta = FlowRequestMeta::new(format!("ps-chat-{correlation_id}"));
+        // §2.5 — project chat. Membership was verified before this point, so
+        // `caller_id` is an authorized user, not a claim from the request.
+        let mut meta = FlowRequestMeta::new(
+            format!("ps-chat-{correlation_id}"),
+            FlowOrigin::Project,
+            FlowActor::user(caller_id.clone()),
+        );
+        meta.correlation_id = Some(format!("ps-chat-{correlation_id}"));
         meta.session_id = Some(chat.session_id.clone());
         meta.user_id = Some(caller_id.clone());
         meta.user_role = user_role;
@@ -2718,7 +2752,7 @@ fn project_studio_code_assist_stream_handler(
     ctx: HandlerContext,
     sub: Arc<Subscription>,
 ) {
-    use crate::flow_engine::dispatcher::FlowRequestMeta;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue};
     use crate::project_studio::code_assist;
     use tentaflow_protocol::project_studio::ProjectStudioPayload;
@@ -2835,7 +2869,13 @@ fn project_studio_code_assist_stream_handler(
             .insert("agent_id".into(), serde_json::Value::String(agent.agent_id));
 
         let cancel = CancellationToken::new();
-        let mut meta = FlowRequestMeta::new(format!("ps-assist-{correlation_id}"));
+        // §2.5 — Code Studio assist.
+        let mut meta = FlowRequestMeta::new(
+            format!("ps-assist-{correlation_id}"),
+            FlowOrigin::CodeStudio,
+            FlowActor::user(caller_id.clone()),
+        );
+        meta.correlation_id = Some(format!("ps-assist-{correlation_id}"));
         meta.user_id = Some(caller_id);
         meta.user_role = user_role;
         meta.org_id = Some(org_id);
