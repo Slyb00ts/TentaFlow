@@ -40,6 +40,38 @@ mają być RÓŻNICĄ dwóch zdarzeń, a nie polem, które ktoś musi pamiętać
 
 Brakujące zdarzenie: `FirstToken` (bez niego nie ma TTFT). To jedyny nowy punkt emisji.
 
+### 2.1a Osobny plik SQLite — TAK, i to nie jest optymalizacja „na zapas"
+
+`run_events` idzie do **własnego pliku** `<data>/events.db`, a nie do głównej bazy. Trzy powody,
+z których pierwszy jest rozstrzygający:
+
+1. **Główna baza ma JEDNO połączenie pisarza** i zapisy się w nim serializują (`db/mod.rs`:
+   „`write()` bierze jedyne połączenie pisarza spod `Mutex`"). Log zdarzeń jest z definicji
+   wysokoczęstotliwościowy — wrzucony tam, konkurowałby o ten sam zamek z zapisem ustawień, flow,
+   agentów i audytu. To nie jest kwestia rozmiaru pliku, tylko opóźnienia całego systemu.
+2. **Precedens jest u nas dosłowny.** `code_studio/workspace_db.rs` trzyma zdarzenia sesji w
+   osobnym pliku i uzasadnia to jednym zdaniem, które pasuje tu bez zmiany ani słowa: *„deliberately
+   not in the main database: they are runtime state of a single node, they are written constantly,
+   and they must not travel through the Sync Ledger"*. Ta sama maszyneria (pula LRU, migracje przy
+   otwarciu, `checkpoint_all` przy zamknięciu) już istnieje w `project_db.rs` i `workspace_db.rs`.
+3. **Retencja robi się tania.** Kasowanie starych wierszy z dużej tabeli w głównej bazie zostawia
+   bloat i wymusza VACUUM na pliku, od którego zależy cały system. Osobny plik można przycinać
+   hurtem, a przy skrajnej objętości — rotować, nie ruszając niczego innego.
+
+**Co to kosztuje, wprost:**
+- **Brak JOIN-ów międzyplikowych.** Nazwy użytkowników, flow i agentów dociąga się po stronie
+  aplikacji albo przez `ATTACH` w trybie read-only. Przeglądarka i tak czyta głównie jedną oś czasu.
+- **Brak wspólnej transakcji** ze stanem w głównej bazie. Rozwiązanie jest już wymyślone: wzorzec
+  `audit_outbox` z Code Studio — zdarzenie i jego **już zredagowana** kopia audytowa commitują się
+  razem w pliku zdarzeń, a osobny krok przenosi kopię do `audit_log` w bazie głównej. Dzięki temu
+  compliance nie może stracić wpisu, a diagnostyczna oś czasu może stracić ogon i nikomu to nie
+  szkodzi. To rozróżnienie jest celowe: audyt jest zobowiązaniem, oś czasu jest narzędziem.
+
+**Jeden plik na węzeł, nie na sesję.** Przeglądarka jest globalna i pyta w poprzek pochodzeń, więc
+dzielenie per workspace (jak Code Studio) utrudniłoby główny przypadek użycia. Objętość
+kontrolujemy retencją i `PRAGMA auto_vacuum=INCREMENTAL`, a rotacja miesięczna zostaje jako plan B,
+jeśli produkcja pokaże, że retencja nie wystarcza.
+
 ### 2.2 Pochodzenie — `origin`
 Stemplowane w `FlowRequestMeta` w punkcie wejścia; **nigdy nie pochodzi z treści modelu**.
 
