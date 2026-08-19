@@ -1,0 +1,61 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Zdarzenia · oś czasu w sesji Code Studio (Z03)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/zdarzenia.css?v=1">
+</head>
+<body>
+
+<div class="ev-shell">
+  <div class="ev-bar">
+    <strong style="font-size:14px">Sesja cs-8f21</strong>
+    <span style="color:var(--text-3);font-size:12px">refaktor seeda aliasów · gałąź feat/aliasy</span>
+    <span class="sp"></span>
+    <span class="ev-chip">Konsola</span>
+    <span class="ev-chip">Pliki</span>
+    <span class="ev-chip">Zmiany</span>
+    <span class="ev-chip">Git</span>
+    <span class="ev-chip" data-on>Oś czasu</span>
+  </div>
+  <div class="ev-timeline">
+    <div class="ev-plot">
+      <div class="ev-lanes-labels"><span>model</span><span>wiadom.</span><span>narzędz.</span></div>
+      <div class="ev-track">
+        <div class="ev-turnline" style="left:2%"><b>T1</b></div>
+        <div class="ev-turnline" style="left:38%"><b>T2</b></div>
+        <div class="ev-turnline" style="left:72%"><b>T3</b></div>
+        <div class="ev-span lane0" style="left:3%;width:30%"><span class="ttft" style="width:34%"></span><span class="decode" style="width:66%"></span></div>
+        <div class="ev-span lane2" style="left:14%;width:6%"><span class="tool" style="width:100%"></span></div>
+        <div class="ev-span lane2" style="left:14%;width:9%;top:70px"><span class="tool" style="width:100%"></span></div>
+        <div class="ev-span lane0" style="left:39%;width:26%"><span class="ttft" style="width:20%"></span><span class="decode" style="width:80%"></span></div>
+        <div class="ev-span lane2" style="left:50%;width:4%"><span class="tool" style="width:100%"></span></div>
+        <div class="ev-span lane0" style="left:73%;width:24%"><span class="ttft" style="width:26%"></span><span class="decode" style="width:74%"></span></div>
+      </div>
+    </div>
+    <div class="ev-legend">
+      <i><span class="sw" style="background:repeating-linear-gradient(45deg,#4b5563 0 4px,#374151 4px 8px)"></span> TTFT</i>
+      <i><span class="sw" style="background:var(--accent-1)"></span> dekodowanie</i>
+      <i><span class="sw" style="background:#0e7490"></span> narzędzie</i>
+      <i>dwa równoległe odczyty w turze 1 — widać je jako osobne pasma</i>
+    </div>
+  </div>
+  <div class="ev-body">
+    <div class="ev-ledger">
+      <div class="ev-turnhead">Tura 1 <span class="sub">qwen3-27b · rozumowanie high · 4 812 ms</span></div>
+      <div class="ev-row"><span class="ix">0001</span><span class="kind">żądanie</span><span class="who">anna.kowalska</span><span class="what">system + 4 wiadomości · 3 narzędzia</span><span class="ms">4 812 ms</span></div>
+      <div class="ev-row"><span class="ix">0004</span><span class="kind">narzędzie</span><span class="who">core.fs_read</span><span class="what">src/db/seed.rs · call c-a71</span><span class="ms">38 ms</span></div>
+      <div class="ev-row"><span class="ix">0005</span><span class="kind">narzędzie</span><span class="who">core.fs_grep</span><span class="what">„seed_platform” · 12 trafień · call c-a72</span><span class="ms">51 ms</span></div>
+      <div class="ev-turnhead">Tura 2 <span class="sub">zapis + przegląd · 3 940 ms</span></div>
+      <div class="ev-row"><span class="ix">0008</span><span class="kind">narzędzie</span><span class="who">core.fs_write</span><span class="what">src/db/seed.rs · +38 −6</span><span class="ms">22 ms</span></div>
+      <div class="ev-row"><span class="ix">0009</span><span class="kind">przegląd</span><span class="who">patch_review</span><span class="what">zestaw ps-441 · zaakceptowany</span><span class="ms">—</span></div>
+      <div class="ev-turnhead">Tura 3 <span class="sub">budowa · idle-timeout 10 min od aktywności</span></div>
+      <div class="ev-row"><span class="ix">0012</span><span class="kind">narzędzie</span><span class="who">core.exec</span><span class="what">cargo test --lib db::seed · 28 passed</span><span class="ms">4 min 12 s</span></div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

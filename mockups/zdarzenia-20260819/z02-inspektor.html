@@ -1,0 +1,118 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>TentaFlow — Zdarzenia · inspektor rekordu (Z02)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/zdarzenia.css?v=1">
+</head>
+<body>
+
+<div class="ev-shell">
+  <div class="ev-bar">
+    <span class="ev-chip" data-on><span class="dot o-code"></span>Code Studio</span>
+    <span class="ev-chip" data-on><span class="dot o-project"></span>Projekt</span>
+    <span class="ev-chip"><span class="dot o-api"></span>API zewn.</span>
+    <span class="ev-chip"><span class="dot o-addon"></span>Addon</span>
+    <span class="ev-chip"><span class="dot o-chat"></span>Czat</span>
+    <span class="ev-chip"><span class="dot o-camera"></span>Kamera</span>
+    <span class="ev-chip"><span class="dot o-sched"></span>Harmonogram</span>
+    <span class="ev-chip"><span class="dot o-mesh"></span>Mesh</span>
+    <span class="sp"></span>
+    <span class="ev-chip" data-on>anna.kowalska</span>
+    <span class="ev-chip">ostatnia godzina</span>
+  </div>
+  <div class="ev-timeline">
+    <div class="ev-plot">
+      <div class="ev-lanes-labels"><span>model</span><span>wiadom.</span><span>narzędz.</span></div>
+      <div class="ev-track"><div class="ev-turnline" style="left:2%"><b>T1</b></div><div class="ev-turnline" style="left:34%"><b>T2</b></div><div class="ev-turnline" style="left:61%"><b>T3</b></div><div class="ev-turnline" style="left:86%"><b>T4</b></div>
+      <div class="ev-span lane0" style="left:3%;width:26%"><span class="ttft" style="width:34%"></span><span class="decode" style="width:66%"></span></div>
+      <div class="ev-span lane2" style="left:12%;width:7%"><span class="tool" style="width:100%"></span></div>
+      <div class="ev-span lane2" style="left:12%;width:5%;top:70px"><span class="tool" style="width:100%"></span></div>
+      <div class="ev-span lane1" style="left:3%;width:2%"><span class="decode" style="width:100%"></span></div>
+      <div class="ev-span lane0" style="left:35%;width:22%"><span class="ttft" style="width:22%"></span><span class="decode" style="width:78%"></span></div>
+      <div class="ev-span lane2" style="left:44%;width:11%"><span class="tool" style="width:100%"></span></div>
+      <div class="ev-span lane0" style="left:62%;width:20%"><span class="ttft" style="width:48%"></span><span class="decode" style="width:52%"></span></div>
+      <div class="ev-span lane2" style="left:70%;width:6%"><span class="err" style="width:100%"></span></div>
+      <div class="ev-span lane0" style="left:87%;width:11%"><span class="ttft" style="width:30%"></span><span class="decode" style="width:70%"></span></div>
+    <div class="ev-sel" style="left:34%;width:27%"></div></div>
+    </div>
+    <div class="ev-legend">
+      <i><span class="sw" style="background:repeating-linear-gradient(45deg,#4b5563 0 4px,#374151 4px 8px)"></span> oczekiwanie na 1. token (TTFT)</i>
+      <i><span class="sw" style="background:var(--accent-1)"></span> dekodowanie</i>
+      <i><span class="sw" style="background:#0e7490"></span> narzędzie</i>
+      <i><span class="sw" style="background:var(--danger)"></span> błąd</i>
+      <i>przeciągnij = zaznacz przedział · kółko = zoom · prawy = przesuń</i>
+    </div>
+  </div>
+
+  <div class="ev-body with-inspector">
+    <div class="ev-ledger">
+      <div class="ev-turnhead">Tura 1 <span class="sub">code_studio · anna.kowalska · sesja cs-8f21 · qwen3-27b</span></div>
+      <div class="ev-row"><span class="ix">0001</span><span class="kind"><span class="dot o-code" style="width:7px;height:7px;border-radius:50%"></span>żądanie</span><span class="who">anna.kowalska</span><span class="what">system + 4 wiadomości · 3 narzędzia</span><span class="ms">4 812 ms</span></div>
+      <div class="ev-row"><span class="ix">0002</span><span class="kind">1. token</span><span class="who">—</span><span class="what">TTFT</span><span class="ms">1 640 ms</span></div>
+      <div class="ev-row"><span class="ix">0003</span><span class="kind">asystent</span><span class="who">—</span><span class="what">„Sprawdzę testy zanim ruszę schemat…”</span><span class="ms">3 172 ms</span></div>
+      <div class="ev-row"><span class="ix">0004</span><span class="kind">narzędzie</span><span class="who">core.fs_read</span><span class="what">src/db/seed.rs · call c-a71</span><span class="ms">38 ms</span></div>
+      <div class="ev-row"><span class="ix">0005</span><span class="kind">narzędzie</span><span class="who">core.fs_grep</span><span class="what">„seed_platform” · 12 trafień · call c-a72</span><span class="ms">51 ms</span></div>
+      <div class="ev-row"><span class="ix">0006</span><span class="kind">wynik</span><span class="who">—</span><span class="what">2 wyniki równolegle, zatwierdzone w kolejności modelu</span><span class="ms">—</span></div>
+      <div class="ev-turnhead">Tura 2 <span class="sub">code_studio · anna.kowalska · zapis + przegląd</span></div>
+      <div class="ev-row" data-sel><span class="ix">0007</span><span class="kind"><span class="dot o-code" style="width:7px;height:7px;border-radius:50%"></span>żądanie</span><span class="who">anna.kowalska</span><span class="what">system + 9 wiadomości · 3 narzędzia</span><span class="ms">3 940 ms</span></div>
+      <div class="ev-row"><span class="ix">0008</span><span class="kind">narzędzie</span><span class="who">core.fs_write</span><span class="what">src/db/seed.rs · +38 −6 · call c-b13</span><span class="ms">22 ms</span></div>
+      <div class="ev-row"><span class="ix">0009</span><span class="kind">przegląd</span><span class="who">patch_review</span><span class="what">zestaw zmian ps-441 · oczekuje</span><span class="ms">—</span></div>
+    </div>
+    <aside class="ev-inspector">
+      <div class="ev-insp-head">
+        <div class="ev-insp-title">Żądanie modelu</div>
+        <div class="ev-insp-sub">seq 0007 · turn 2 · step 1</div>
+      </div>
+      <dl class="ev-kv">
+        <dt>pochodzenie</dt><dd>code_studio</dd>
+        <dt>aktor</dt><dd>anna.kowalska <span style="color:var(--text-3)">(user)</span></dd>
+        <dt>sesja</dt><dd>cs-8f21</dd>
+        <dt>przebieg</dt><dd>run-3c99</dd>
+        <dt>model</dt><dd>qwen3-27b</dd>
+        <dt>rozumowanie</dt><dd>high</dd>
+        <dt>temperatura</dt><dd>0,2</dd>
+        <dt>węzeł</dt><dd>l1 (llm)</dd>
+        <dt>korelacja</dt><dd>corr-77ab12</dd>
+      </dl>
+      <div class="ev-sec">
+        <h4>Chronometraż</h4>
+        <div class="ev-track-bar">
+          <span style="width:31%;background:repeating-linear-gradient(45deg,#4b5563 0 4px,#374151 4px 8px)"></span>
+          <span style="width:69%;background:var(--accent-1)"></span>
+        </div>
+        <dl class="ev-kv" style="padding:8px 0 0">
+          <dt>TTFT</dt><dd>1 221 ms</dd>
+          <dt>dekodowanie</dt><dd>2 719 ms</dd>
+          <dt>razem</dt><dd>3 940 ms</dd>
+          <dt>tokeny</dt><dd>3 411 wej. · 486 wyj.</dd>
+          <dt>szybkość</dt><dd>178,7 tok/s</dd>
+        </dl>
+      </div>
+      <div class="ev-sec">
+        <h4>Wejście</h4>
+        <div class="ev-pre">system: Jesteś agentem Code Studio…
+user: dopisz seed aliasów platformowych
+assistant: [wywołanie] core.fs_read(src/db/seed.rs)
+tool: // ===== File: db/seed.rs …</div>
+      </div>
+      <div class="ev-sec">
+        <h4>Wyjście</h4>
+        <div class="ev-pre">Dopiszę seed obok tentavision-*, żeby alias
+nie znikał przy zatrzymaniu addona.
+[wywołanie] core.fs_write(src/db/seed.rs)</div>
+      </div>
+      <div class="ev-sec">
+        <h4>Powiązania</h4>
+        <div class="ev-pre">audit_log      #48 122
+flow_executions run-3c99
+sesja Code Studio  seq 214–219</div>
+      </div>
+    </aside>
+  </div>
+</div>
+</body>
+</html>
