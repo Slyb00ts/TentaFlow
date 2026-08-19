@@ -46,6 +46,27 @@
     </a>
   </div>
 
+  <h2 style="font-size:16px;margin:28px 0 8px">Jak się tu wchodzi</h2>
+  <p style="color:var(--text-2);font-size:13.5px;margin-bottom:10px">
+    Trzy wejścia, każde odpowiada na inne pytanie. To jest odpowiedź na „skąd mam tu trafić”.
+  </p>
+  <ol style="color:var(--text-2);font-size:13.5px;line-height:1.75;padding-left:20px">
+    <li><strong>Nawigacja → Zarządzanie → Zdarzenia</strong> (widoczne na Z01/Z02). Sąsiaduje z
+      „Dziennikiem audytu”, bo to ta sama rodzina pytań: audyt mówi <em>co się stało</em>, zdarzenia
+      mówią <em>jak przebiegło</em>. Zakres zależy od uprawnień — admin widzi wszystko, zwykły
+      użytkownik swoje przebiegi.</li>
+    <li><strong>Z konkretnego przebiegu</strong> — zakładka „Oś czasu” obok Konsoli, Plików, Zmian i
+      Gita w sesji Code Studio (Z03). Analogicznie przy przebiegu agenta i przy czacie projektu.
+      Bez wychodzenia do osobnego modułu.</li>
+    <li><strong>Z dziennika audytu</strong> — wpis ma <code>correlation_id</code>, więc dostaje
+      odsyłacz „pokaż przebieg”, który otwiera oś czasu dokładnie w tym miejscu. To domyka pętlę:
+      z formalnego zapisu wchodzisz w diagnostykę.</li>
+  </ol>
+  <p style="color:var(--text-3);font-size:12.5px;margin-top:10px">
+    Wejście nr 3 wymaga, żeby <code>correlation_id</code> był stemplowany w obu miejscach — jest to
+    warunek Etapu 1 w planie, nie dodatek na później.
+  </p>
+
   <h2 style="font-size:16px;margin:28px 0 8px">Decyzje do akceptacji</h2>
   <ul style="color:var(--text-2);font-size:13.5px;line-height:1.8;padding-left:20px">
     <li><strong>Pochodzenie ma własny kolor</strong> i jest pierwszym filtrem — zakładam, że to
