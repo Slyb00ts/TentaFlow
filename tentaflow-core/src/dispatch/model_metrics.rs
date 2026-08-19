@@ -6,7 +6,7 @@
 // Przykład: ModelMetricsPayload::SummaryRequest zwraca zsumowane metryki grupy.
 // =============================================================================
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
@@ -201,14 +201,132 @@ impl SummaryAgg {
             e2e_p50: percentile_from_histogram(&self.e2e, &e2e_edges, self.e2e_samples, 50.0),
             e2e_p90: percentile_from_histogram(&self.e2e, &e2e_edges, self.e2e_samples, 90.0),
             e2e_p99: percentile_from_histogram(&self.e2e, &e2e_edges, self.e2e_samples, 99.0),
+            display_name: None,
+            subtitle: None,
+            member_count: None,
+            last_seen_at: None,
         }
     }
+}
+
+/// Resolved display data of a node: `sync_nodes.display_name` (empty → `None`,
+/// except the local node which falls back to the hostname) and `last_seen_at`.
+/// The local node is online by definition, so it always reports the current
+/// time regardless of what its own `sync_nodes` row says.
+pub(super) struct NodePresentation {
+    pub display_name: Option<String>,
+    pub last_seen_at: Option<String>,
+}
+
+pub(super) fn now_rfc3339() -> String {
+    chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+}
+
+/// Batched node name/liveness lookup applying the local-node rule above.
+/// Every requested id is present in the result (unknown → both `None`).
+pub(super) fn resolve_nodes(
+    ctx: &HandlerContext,
+    ids: &[String],
+) -> Result<HashMap<String, NodePresentation>, anyhow::Error> {
+    let rows = repository::lookup_sync_node_info(&ctx.state.db, ids)?;
+    let local_id: &str = &ctx.state.local_node_id;
+    let mut out = HashMap::with_capacity(ids.len());
+    for id in ids {
+        let row = rows.get(id);
+        let is_local = id == local_id;
+        let mut display_name = row
+            .map(|(name, _)| name.clone())
+            .filter(|name| !name.is_empty());
+        if display_name.is_none() && is_local {
+            display_name = Some(crate::mesh::node_info_collector::local_hostname());
+        }
+        let last_seen_at = if is_local {
+            Some(now_rfc3339())
+        } else {
+            row.and_then(|(_, seen)| seen.clone())
+        };
+        out.insert(
+            id.clone(),
+            NodePresentation {
+                display_name,
+                last_seen_at,
+            },
+        );
+    }
+    Ok(out)
+}
+
+/// Display name + subtitle of a user per D3: `display_name` → `username` →
+/// `email`; subtitle `email` → `username`.
+pub(super) fn user_presentation(row: &repository::UserNameRow) -> (String, String) {
+    let name = [&row.display_name, &row.username, &row.email]
+        .into_iter()
+        .find(|v| !v.is_empty())
+        .cloned()
+        .unwrap_or_default();
+    let subtitle = if row.email.is_empty() {
+        row.username.clone()
+    } else {
+        row.email.clone()
+    };
+    (name, subtitle)
+}
+
+/// Fills `display_name`/`subtitle`/`member_count`/`last_seen_at` of summary rows
+/// according to the `group_by` dimension. Unknown keys keep `None`.
+fn decorate_summary_rows(
+    ctx: &HandlerContext,
+    group_by: &str,
+    rows: &mut [ModelMetricsRowWire],
+) -> Result<(), anyhow::Error> {
+    let keys: Vec<String> = rows.iter().map(|r| r.key.clone()).collect();
+    match group_by {
+        "user" => {
+            let users = repository::lookup_user_names(&ctx.state.db, &keys)?;
+            for row in rows.iter_mut() {
+                if let Some(u) = users.get(&row.key) {
+                    let (name, subtitle) = user_presentation(u);
+                    row.display_name = Some(name);
+                    row.subtitle = Some(subtitle);
+                }
+            }
+        }
+        "group" => {
+            let groups = repository::lookup_group_info(&ctx.state.db, &keys)?;
+            for row in rows.iter_mut() {
+                if let Some((name, members)) = groups.get(&row.key) {
+                    row.display_name = Some(name.clone());
+                    row.member_count = Some(*members);
+                }
+            }
+        }
+        "node" => {
+            let nodes = resolve_nodes(ctx, &keys)?;
+            for row in rows.iter_mut() {
+                if let Some(n) = nodes.get(&row.key) {
+                    row.display_name = n.display_name.clone();
+                    row.last_seen_at = n.last_seen_at.clone();
+                }
+            }
+        }
+        "model" => {
+            let models = repository::lookup_model_display_names(&ctx.state.db, &keys)?;
+            for row in rows.iter_mut() {
+                row.display_name = models.get(&row.key).cloned();
+            }
+        }
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Zamienia `period`+`period_key` na inkluzywne granice `hour_bucket` (format
 /// `YYYY-MM-DDTHH:00:00Z`). Porównanie leksykograficzne działa, bo bucket ma
 /// stałą szerokość RFC3339.
-fn period_window(period: &str, period_key: &str) -> Result<(String, String), ProtocolError> {
+pub(super) fn period_window(
+    period: &str,
+    period_key: &str,
+) -> Result<(String, String), ProtocolError> {
     match period {
         "hourly" => Ok((
             format!("{period_key}:00:00Z"),
@@ -228,9 +346,20 @@ fn period_window(period: &str, period_key: &str) -> Result<(String, String), Pro
     }
 }
 
-/// Filtr wymiarów, który nie da się wyrazić w SQL (`ModelMetricsFilter` pokrywa
-/// tylko model/user/godziny) — node/service/backend/modality odsiewamy w pamięci.
-fn row_matches_filter(row: &DbModelMetricsRollup, filter: &ModelMetricsFilterWire) -> bool {
+/// Dimension filter that cannot be expressed in SQL (`ModelMetricsFilter` covers
+/// only model/user/hours) — node/service/backend/modality/group are sieved
+/// in memory. `group_users` = members of `filter.group` (an empty set when the
+/// group does not exist or has no members → no row passes).
+fn row_matches_filter(
+    row: &DbModelMetricsRollup,
+    filter: &ModelMetricsFilterWire,
+    group_users: Option<&HashSet<String>>,
+) -> bool {
+    if let Some(users) = group_users {
+        if !users.contains(&row.user_id) {
+            return false;
+        }
+    }
     if let Some(node) = &filter.node {
         if &row.node_id != node {
             return false;
@@ -396,28 +525,43 @@ fn summary_v1(
     filter: &ModelMetricsFilterWire,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
+    if !matches!(
+        group_by,
+        "user" | "group" | "model" | "node" | "service" | "day" | "hour"
+    ) {
+        return Err(ProtocolError::bad_request(format!(
+            "unknown group_by '{group_by}' (expected user|group|model|node|service|day|hour)"
+        )));
+    }
     let (hour_from, hour_to) = period_window(period, period_key)?;
     let db_filter = ModelMetricsFilter {
         model_id: filter.model.as_deref(),
-        user_id: None,
+        user_id: filter.user.as_deref(),
         hour_from: Some(&hour_from),
         hour_to: Some(&hour_to),
     };
     let rows = repository::list_model_metrics_rollup(&ctx.state.db, &org.org_id, &db_filter)
         .map_err(|e| db_error("summary", e))?;
 
-    // Mapa user_id -> grupy tylko gdy grupujemy po grupie.
-    let group_map: HashMap<String, Vec<String>> = if group_by == "group" {
+    // user_id -> group ids map, only when grouping or filtering by group.
+    let group_map: HashMap<String, Vec<String>> = if group_by == "group" || filter.group.is_some() {
         let mut m: HashMap<String, Vec<String>> = HashMap::new();
-        for (user_id, group_name) in repository::list_group_memberships(&ctx.state.db)
+        for (user_id, group_id) in repository::list_group_memberships(&ctx.state.db)
             .map_err(|e| db_error("group_memberships", e))?
         {
-            m.entry(user_id).or_default().push(group_name);
+            m.entry(user_id).or_default().push(group_id);
         }
         m
     } else {
         HashMap::new()
     };
+    let group_users: Option<HashSet<String>> = filter.group.as_ref().map(|group_id| {
+        group_map
+            .iter()
+            .filter(|(_, groups)| groups.contains(group_id))
+            .map(|(user_id, _)| user_id.clone())
+            .collect()
+    });
 
     let mut pricing = PricingCache::new(&ctx.state.db, &org.org_id);
     let mut groups: HashMap<String, SummaryAgg> = HashMap::new();
@@ -425,7 +569,7 @@ fn summary_v1(
     // zbieramy osobna, rozlaczna sume (kazdy wiersz policzony raz).
     let mut grand: Option<SummaryAgg> = (group_by == "group").then(SummaryAgg::default);
     for row in &rows {
-        if !row_matches_filter(row, filter) {
+        if !row_matches_filter(row, filter, group_users.as_ref()) {
             continue;
         }
         let pricing_row = pricing.get(&row.model_id);
@@ -440,15 +584,12 @@ fn summary_v1(
             "node" => vec![row.node_id.clone()],
             "service" => vec![row.service_key.clone()],
             "day" => vec![row.hour_bucket.chars().take(10).collect()],
-            "group" => match group_map.get(&row.user_id) {
-                Some(names) if !names.is_empty() => names.clone(),
+            "hour" => vec![row.hour_bucket.clone()],
+            // Only "group" is left after the up-front group_by validation.
+            _ => match group_map.get(&row.user_id) {
+                Some(ids) if !ids.is_empty() => ids.clone(),
                 _ => vec![NO_GROUP_KEY.to_string()],
             },
-            other => {
-                return Err(ProtocolError::bad_request(format!(
-                    "unknown group_by '{other}' (expected user|group|model|node|service|day)"
-                )));
-            }
         };
         for key in keys {
             groups
@@ -463,6 +604,7 @@ fn summary_v1(
         .map(|(key, agg)| agg.into_wire(key))
         .collect();
     wire.sort_by(|a, b| b.total_tokens.cmp(&a.total_tokens).then(a.key.cmp(&b.key)));
+    decorate_summary_rows(ctx, group_by, &mut wire).map_err(|e| db_error("summary_names", e))?;
     let grand_total = grand.map(|agg| agg.into_wire("__grand_total__".to_string()));
     Ok(MessageBody::ModelMetricsBody(
         ModelMetricsPayload::SummaryResponse {
@@ -573,6 +715,9 @@ fn node_service_v1(
                     agg.decode_samples,
                     99.0,
                 ),
+                node_display_name: None,
+                node_last_seen_at: None,
+                model_display_name: None,
             }
         })
         .collect();
@@ -582,6 +727,28 @@ fn node_service_v1(
             .then(a.node_id.cmp(&b.node_id))
             .then(a.service_key.cmp(&b.service_key))
     });
+    let node_ids: Vec<String> = wire
+        .iter()
+        .map(|r| r.node_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let model_ids: Vec<String> = wire
+        .iter()
+        .map(|r| r.model_id.clone())
+        .collect::<HashSet<_>>()
+        .into_iter()
+        .collect();
+    let nodes = resolve_nodes(ctx, &node_ids).map_err(|e| db_error("node_service_nodes", e))?;
+    let models = repository::lookup_model_display_names(&ctx.state.db, &model_ids)
+        .map_err(|e| db_error("node_service_models", e))?;
+    for row in wire.iter_mut() {
+        if let Some(n) = nodes.get(&row.node_id) {
+            row.node_display_name = n.display_name.clone();
+            row.node_last_seen_at = n.last_seen_at.clone();
+        }
+        row.model_display_name = models.get(&row.model_id).cloned();
+    }
     Ok(MessageBody::ModelMetricsBody(
         ModelMetricsPayload::NodeServiceResponse { rows: wire },
     ))
@@ -649,4 +816,336 @@ fn pricing_set_v1(
             error: None,
         },
     ))
+}
+
+#[cfg(test)]
+pub(crate) mod tests {
+    use super::*;
+    use crate::db::models::{
+        ModelMetricsCounters, ModelMetricsDims, ModelMetricsPerfSamples, ModelMetricsTimes,
+        ModelMetricsTokens,
+    };
+    use crate::dispatch::state::AppState;
+    use crate::services::org::DEFAULT_ORG_ID;
+    use std::collections::HashSet;
+    use tentaflow_protocol::SessionAuth;
+
+    const REMOTE_NODE: &str = "7c02be11f4a3d9e86b5c2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d";
+    /// Known only to `peer_persisted` (mesh heartbeat), no `sync_nodes` row.
+    const PEER_ONLY_NODE: &str = "33f1c904a7b2e5d8c1f4a7b0e3d6c9f2a5b8e1d4c7f0a3b6e9d2c5f8a1b4e7d0";
+
+    /// Writes a peer heartbeat row like the peer registry persistence writer.
+    pub(crate) fn seed_peer_heartbeat(ctx: &HandlerContext, node_hex: &str, last_seen_ms: i64) {
+        let mut id = [0u8; 32];
+        hex::decode_to_slice(node_hex, &mut id).unwrap();
+        repository::upsert_peer_persisted_batch(
+            &ctx.state.db,
+            &[repository::PeerPersistedRow {
+                node_id: id,
+                pubkey: vec![1, 2, 3],
+                trust_state: 0,
+                hostname: None,
+                platform: None,
+                role: 0,
+                last_seen_ms,
+                persisted_ver: 1,
+                updated_at_ms: last_seen_ms,
+            }],
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn reader_ctx() -> HandlerContext {
+        HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0u8; 16],
+                role: Some("admin".to_string()),
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: AppState::for_test(),
+            org_context: Some(OrgContext {
+                user_id: "admin".to_string(),
+                org_id: DEFAULT_ORG_ID.to_string(),
+                role_id: "role-org-admin".to_string(),
+                permissions: ["metrics.read", "tokens.read"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect::<HashSet<_>>(),
+            }),
+        }
+    }
+
+    /// Users u1 (name+email), u2 (username only), group g1 = {u1, u2}, a remote
+    /// sync node with a display name, and a Qwen catalog entry.
+    pub(crate) fn seed_directory(ctx: &HandlerContext) {
+        let conn = ctx.state.db.write().unwrap();
+        conn.execute_batch(
+            "INSERT INTO user_accounts (id, username, password_hash, display_name, email) \
+             VALUES ('u1', 'marta.k', 'x', 'Marta Kowalczyk', 'marta.k@firma.pl'); \
+             INSERT INTO user_accounts (id, username, password_hash) VALUES ('u2', 'piotr.w', 'x'); \
+             INSERT INTO user_groups (id, name) VALUES ('g1', 'Marketing'); \
+             INSERT INTO group_members (group_id, user_id) VALUES ('g1', 'u1'), ('g1', 'u2'); \
+             INSERT INTO sync_nodes (node_id, public_key, display_name, last_seen_at) \
+             VALUES ('7c02be11f4a3d9e86b5c2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d', 'pk', \
+                     'biuro-mini', '2026-08-19T10:00:00Z'); \
+             INSERT INTO services (id, engine_id, category, display_name, deploy_method, transport, status) \
+             VALUES (9001, 'vllm', 'llm', 'vLLM', 'external', 'external_http', 'stopped'); \
+             INSERT INTO model_registry (service_id, model_name, display_name) \
+             VALUES (9001, 'qwen', 'Qwen 3.8 27B AWQ');",
+        )
+        .unwrap();
+    }
+
+    pub(crate) fn bump(
+        ctx: &HandlerContext,
+        node: &str,
+        user: &str,
+        model: &str,
+        hour: &str,
+        tokens: i64,
+    ) {
+        repository::bump_model_metrics_rollup(
+            &ctx.state.db,
+            &ModelMetricsDims {
+                node_id: node,
+                org_id: DEFAULT_ORG_ID,
+                user_id: user,
+                model_id: model,
+                service_key: "vllm:qwen",
+                backend: "vllm",
+                modality: "chat",
+                hour_bucket: hour,
+                histogram_version: MODEL_METRICS_HISTOGRAM_VERSION,
+            },
+            &ModelMetricsCounters {
+                request_count: 1,
+                success_count: 1,
+                error_count: 0,
+            },
+            &ModelMetricsTokens {
+                prompt_tokens: tokens / 2,
+                completion_tokens: tokens - tokens / 2,
+                total_tokens: tokens,
+                ..Default::default()
+            },
+            &ModelMetricsTimes::default(),
+            &ModelMetricsPerfSamples {
+                ttft_ms: Some(120),
+                decode_tps: Some(50.0),
+                e2e_ms: Some(900),
+            },
+        )
+        .unwrap();
+    }
+
+    fn summary_rows(
+        ctx: &HandlerContext,
+        group_by: &str,
+        filter: ModelMetricsFilterWire,
+    ) -> Vec<ModelMetricsRowWire> {
+        match summary_v1(ctx, "monthly", "2026-08", group_by, &filter).unwrap() {
+            MessageBody::ModelMetricsBody(ModelMetricsPayload::SummaryResponse {
+                rows, ..
+            }) => rows,
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+
+    #[test]
+    fn percentile_interpolates_inside_bucket() {
+        let edges = ttft_edges_f64();
+        let mut counts = [0i64; 10];
+        counts[2] = 10; // (50, 100]
+        assert_eq!(
+            percentile_from_histogram(&counts, &edges, 10, 50.0),
+            Some(75.0)
+        );
+        assert_eq!(percentile_from_histogram(&counts, &edges, 0, 50.0), None);
+    }
+
+    #[test]
+    fn summary_resolves_user_group_node_and_model_names() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        let local = ctx.state.local_node_id.to_string();
+        bump(&ctx, &local, "u1", "qwen", "2026-08-19T10:00:00Z", 1000);
+        bump(&ctx, REMOTE_NODE, "u2", "qwen", "2026-08-19T11:00:00Z", 400);
+        bump(&ctx, REMOTE_NODE, "u3", "other", "2026-08-19T11:00:00Z", 50);
+
+        let users = summary_rows(&ctx, "user", ModelMetricsFilterWire::default());
+        let u1 = users.iter().find(|r| r.key == "u1").unwrap();
+        assert_eq!(u1.display_name.as_deref(), Some("Marta Kowalczyk"));
+        assert_eq!(u1.subtitle.as_deref(), Some("marta.k@firma.pl"));
+        let u2 = users.iter().find(|r| r.key == "u2").unwrap();
+        assert_eq!(u2.display_name.as_deref(), Some("piotr.w"));
+        assert_eq!(u2.subtitle.as_deref(), Some("piotr.w"));
+        let u3 = users.iter().find(|r| r.key == "u3").unwrap();
+        assert_eq!(u3.display_name, None);
+
+        let groups = summary_rows(&ctx, "group", ModelMetricsFilterWire::default());
+        let g1 = groups.iter().find(|r| r.key == "g1").unwrap();
+        assert_eq!(g1.display_name.as_deref(), Some("Marketing"));
+        assert_eq!(g1.member_count, Some(2));
+        assert_eq!(g1.total_tokens, 1400);
+        let none = groups.iter().find(|r| r.key == NO_GROUP_KEY).unwrap();
+        assert_eq!(none.total_tokens, 50);
+        assert_eq!(none.display_name, None);
+
+        let nodes = summary_rows(&ctx, "node", ModelMetricsFilterWire::default());
+        let local_row = nodes.iter().find(|r| r.key == local).unwrap();
+        assert_eq!(
+            local_row.display_name.as_deref(),
+            Some(crate::mesh::node_info_collector::local_hostname().as_str())
+        );
+        assert!(local_row.last_seen_at.is_some(), "local node is online now");
+        let remote = nodes.iter().find(|r| r.key == REMOTE_NODE).unwrap();
+        assert_eq!(remote.display_name.as_deref(), Some("biuro-mini"));
+        assert_eq!(remote.last_seen_at.as_deref(), Some("2026-08-19T10:00:00Z"));
+
+        let models = summary_rows(&ctx, "model", ModelMetricsFilterWire::default());
+        let qwen = models.iter().find(|r| r.key == "qwen").unwrap();
+        assert_eq!(qwen.display_name.as_deref(), Some("Qwen 3.8 27B AWQ"));
+        assert_eq!(
+            models
+                .iter()
+                .find(|r| r.key == "other")
+                .unwrap()
+                .display_name,
+            None
+        );
+
+        let hours = summary_rows(&ctx, "hour", ModelMetricsFilterWire::default());
+        assert_eq!(hours.len(), 2);
+        assert!(hours
+            .iter()
+            .any(|r| r.key == "2026-08-19T10:00:00Z" && r.total_tokens == 1000));
+    }
+
+    #[test]
+    fn summary_filters_by_user_and_group() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        let local = ctx.state.local_node_id.to_string();
+        bump(&ctx, &local, "u1", "qwen", "2026-08-19T10:00:00Z", 1000);
+        bump(&ctx, &local, "u2", "qwen", "2026-08-19T10:00:00Z", 400);
+        bump(&ctx, &local, "u3", "qwen", "2026-08-19T10:00:00Z", 50);
+
+        let by_user = summary_rows(
+            &ctx,
+            "model",
+            ModelMetricsFilterWire {
+                user: Some("u2".to_string()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(by_user.len(), 1);
+        assert_eq!(by_user[0].total_tokens, 400);
+
+        let by_group = summary_rows(
+            &ctx,
+            "user",
+            ModelMetricsFilterWire {
+                group: Some("g1".to_string()),
+                ..Default::default()
+            },
+        );
+        let keys: HashSet<&str> = by_group.iter().map(|r| r.key.as_str()).collect();
+        assert_eq!(keys, HashSet::from(["u1", "u2"]));
+
+        let unknown_group = summary_rows(
+            &ctx,
+            "user",
+            ModelMetricsFilterWire {
+                group: Some("missing".to_string()),
+                ..Default::default()
+            },
+        );
+        assert!(unknown_group.is_empty());
+
+        let err = summary_v1(
+            &ctx,
+            "monthly",
+            "2026-08",
+            "week",
+            &ModelMetricsFilterWire::default(),
+        )
+        .unwrap_err();
+        assert!(err.message.contains("unknown group_by"));
+    }
+
+    #[test]
+    fn node_liveness_merges_peer_heartbeats() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        let local = ctx.state.local_node_id.to_string();
+        // 2026-08-19T12:30:00Z — later than the seeded sync_nodes value (10:00).
+        seed_peer_heartbeat(&ctx, REMOTE_NODE, 1_787_142_600_000);
+        // 2026-08-19T11:00:00Z for a node without any sync_nodes row.
+        seed_peer_heartbeat(&ctx, PEER_ONLY_NODE, 1_787_137_200_000);
+        bump(&ctx, REMOTE_NODE, "u1", "qwen", "2026-08-19T10:00:00Z", 10);
+        bump(
+            &ctx,
+            PEER_ONLY_NODE,
+            "u1",
+            "qwen",
+            "2026-08-19T10:00:00Z",
+            10,
+        );
+        bump(&ctx, &local, "u1", "qwen", "2026-08-19T10:00:00Z", 10);
+
+        let nodes = summary_rows(&ctx, "node", ModelMetricsFilterWire::default());
+        let remote = nodes.iter().find(|r| r.key == REMOTE_NODE).unwrap();
+        assert_eq!(remote.display_name.as_deref(), Some("biuro-mini"));
+        assert_eq!(
+            remote.last_seen_at.as_deref(),
+            Some("2026-08-19T12:30:00Z"),
+            "heartbeat newer than sync_nodes wins"
+        );
+        let peer_only = nodes.iter().find(|r| r.key == PEER_ONLY_NODE).unwrap();
+        assert_eq!(peer_only.display_name, None);
+        assert_eq!(
+            peer_only.last_seen_at.as_deref(),
+            Some("2026-08-19T11:00:00Z")
+        );
+
+        // An OLDER heartbeat must not move the resolved liveness backwards.
+        let stale =
+            repository::lookup_sync_node_info(&ctx.state.db, &[REMOTE_NODE.to_string()]).unwrap();
+        assert_eq!(
+            stale[REMOTE_NODE].1.as_deref(),
+            Some("2026-08-19T12:30:00Z")
+        );
+    }
+
+    #[test]
+    fn node_service_rows_carry_node_and_model_names() {
+        let ctx = reader_ctx();
+        seed_directory(&ctx);
+        bump(
+            &ctx,
+            REMOTE_NODE,
+            "u1",
+            "qwen",
+            "2026-08-19T10:00:00Z",
+            1000,
+        );
+        let rows = match node_service_v1(&ctx, "daily", "2026-08-19").unwrap() {
+            MessageBody::ModelMetricsBody(ModelMetricsPayload::NodeServiceResponse { rows }) => {
+                rows
+            }
+            other => panic!("unexpected {other:?}"),
+        };
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].node_display_name.as_deref(), Some("biuro-mini"));
+        assert_eq!(
+            rows[0].node_last_seen_at.as_deref(),
+            Some("2026-08-19T10:00:00Z")
+        );
+        assert_eq!(
+            rows[0].model_display_name.as_deref(),
+            Some("Qwen 3.8 27B AWQ")
+        );
+    }
 }
