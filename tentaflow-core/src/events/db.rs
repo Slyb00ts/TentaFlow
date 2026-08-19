@@ -16,8 +16,10 @@
 // property of WHERE it lives, not a rule someone has to remember: the ledger
 // only ever reads tables listed in `sync::core_registry::CORE_SYNC_DESCRIPTORS`
 // and it reads every one of them from the MAIN pool, so a table in a different
-// file with no descriptor is unreachable to it. `sync_run_events_stays_out_of_
-// the_ledger` in `store.rs` pins both halves.
+// file with no descriptor is unreachable to it.
+// `no_table_of_the_event_log_is_a_core_sync_table` in `store.rs` pins the half
+// that is assertable — no table of this file carries a descriptor. The other
+// half is structural: the ledger reads the main pool, and this is another file.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -151,10 +153,13 @@ const MIGRATIONS: &[(i64, &str)] = &[(1, INITIAL_SCHEMA)];
 
 /// §2.3, verbatim, plus the audit outbox.
 ///
-/// `PRIMARY KEY (run_id, seq)` is load-bearing and not decoration: `seq` is
-/// allocated as `MAX(seq) + 1` inside the insert transaction, so a second
-/// concurrent writer on the same run collides on the key and fails LOUDLY
-/// instead of producing a silently interleaved timeline (invariant 2).
+/// `PRIMARY KEY (run_id, seq)` is load-bearing and not decoration. Concurrent
+/// writers are handled by the IMMEDIATE transaction `store::append` opens —
+/// they queue and each allocates its own `seq`. The key catches the other case:
+/// a writer that allocated `MAX(seq) + 1` OUTSIDE its transaction writes on a
+/// fresh snapshot, which SQLite is happy to accept, and only the constraint
+/// stops it from filing a second row at a `seq` that is already taken
+/// (invariant 2).
 ///
 /// The outbox deliberately carries NO foreign key to `run_events`. Its row is
 /// self-contained — everything `audit_log` needs is in `payload_json` — so the
@@ -284,8 +289,8 @@ mod tests {
             );
         }
 
-        // PRIMARY KEY (run_id, seq) — the constraint that turns a second
-        // concurrent writer into a loud error.
+        // PRIMARY KEY (run_id, seq) — the constraint that refuses a `seq`
+        // allocated outside the insert transaction (invariant 2).
         let pk: Vec<String> = {
             let mut stmt = conn
                 .prepare("SELECT name FROM pragma_table_info('run_events') WHERE pk > 0 ORDER BY pk")

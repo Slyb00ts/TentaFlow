@@ -10,9 +10,13 @@
 // Three properties are enforced here rather than left to callers.
 //
 // **One writer allocates `seq`.** It is taken as `MAX(seq) + 1` INSIDE the
-// insert transaction and `PRIMARY KEY (run_id, seq)` turns a second concurrent
-// writer into a loud failure instead of a silently interleaved log
-// (invariant 2).
+// insert transaction, and the two halves of invariant 2 do different jobs.
+// The IMMEDIATE transaction is what makes concurrent writers safe: they QUEUE
+// on the busy handler and each comes out with a `seq` of its own, so nothing is
+// refused and nothing interleaves. `PRIMARY KEY (run_id, seq)` is the backstop
+// for a writer that allocated OUTSIDE its transaction — its snapshot is fresh,
+// SQLite has nothing to complain about, and only the constraint stops it from
+// filing a second row under a `seq` that is already taken.
 //
 // **A retry is a no-op, not a duplicate and not an error.** The caller's
 // `idempotency_key` is probed first and an existing row comes back as
@@ -185,9 +189,13 @@ impl EventPayload {
     /// so redaction is a property of the write path and not of caller
     /// discipline (invariant 3).
     ///
-    /// Enum-typed and bounded fields (`ok`, `turn`, `status`, `kind`) are left
-    /// alone: they cannot carry a credential, and scrubbing them would only add
-    /// ways for a rule to eat a value the log exists to show.
+    /// Free text is everything a caller can put a credential into: a message,
+    /// a tool argument, a result summary, an error message, and the `status`
+    /// strings, which the engine copies from a node's own outcome. Left alone
+    /// are the fields that cannot carry one — `ok`, `turn` and the `kind` tag —
+    /// and the server-minted labels `step`, `stage`, `name` and the
+    /// `RequestStarted` descriptors: scrubbing those would only add ways for a
+    /// rule to eat a value the log exists to show.
     pub fn redacted(self) -> Self {
         match self {
             EventPayload::AssistantMessage { text, tokens } => EventPayload::AssistantMessage {
@@ -317,11 +325,6 @@ impl RunEvent {
         self
     }
 
-    pub fn with_call(mut self, call_id: impl Into<String>) -> Self {
-        self.call_id = Some(call_id.into());
-        self
-    }
-
     pub fn with_idempotency_key(mut self, key: impl Into<String>) -> Self {
         self.idempotency_key = Some(key.into());
         self
@@ -406,8 +409,8 @@ pub struct AuditEnvelope {
 /// deferred transaction that has already read cannot upgrade behind another
 /// writer — it fails with `SQLITE_BUSY` that no busy-timeout can resolve. Under
 /// IMMEDIATE two writers on two connections queue on the busy handler and come
-/// out with distinct `seq`. The `PRIMARY KEY` stays the backstop for any path
-/// that does not go through here.
+/// out with distinct `seq`; neither is refused. The `PRIMARY KEY` stays the
+/// backstop for any path that allocates `seq` outside its own transaction.
 pub fn append(pool: &DbPool, event: RunEvent) -> Result<AppendedEvent> {
     let mut conn = pool.write().map_err(|e| anyhow!("events db write: {e}"))?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
@@ -694,16 +697,22 @@ mod tests {
         assert_eq!(tool, "search");
     }
 
-    /// §2.11 stage 2: two parallel writes must produce a loud error, never an
-    /// interleave.
+    /// Invariant 2, first half: the IMMEDIATE transaction the append path opens.
     ///
     /// Two THREADS on two independent connections to the same file — going
     /// through one `DbPool` would only demonstrate that a `Mutex` works. Every
-    /// write must either land on a `seq` of its own or fail loudly; what may
-    /// never happen is two rows sharing a `seq`, or a write reporting success
-    /// that the file does not carry.
+    /// write must land on a `seq` of its own, and NONE may be refused: under
+    /// IMMEDIATE the second writer queues on the busy handler and allocates
+    /// after the first commits. A refusal here means the allocation no longer
+    /// happens inside the transaction — two writers then compute the same `seq`
+    /// and one of them dies on the primary key.
+    ///
+    /// §2.11 stage 2 words the acceptance criterion as "a loud error, not an
+    /// interleave". Queuing is the stronger outcome of the two — no writer is
+    /// turned away and no timeline loses a row — so the assertion below pins
+    /// what the code actually guarantees.
     #[test]
-    fn two_concurrent_writers_never_share_a_seq() {
+    fn two_concurrent_writers_queue_and_never_share_a_seq() {
         let dir = tempfile::tempdir().unwrap();
         // Create the file and run the migration once up front: the race under
         // test is between two APPENDS, not between two schema installs.
@@ -720,7 +729,7 @@ mod tests {
                     let pool = open_events_db(&path);
                     barrier.wait();
                     let mut accepted = Vec::new();
-                    let mut refused = 0usize;
+                    let mut refusals = Vec::new();
                     for i in 0..per_writer {
                         let payload = EventPayload::StepStart {
                             step: format!("w{writer}-{i}"),
@@ -730,24 +739,32 @@ mod tests {
                                 assert!(!appended.duplicate);
                                 accepted.push(appended.seq);
                             }
-                            // A loud refusal is an acceptable outcome; a silent
-                            // one is not, which is what the row count below
-                            // checks.
-                            Err(_) => refused += 1,
+                            Err(error) => refusals.push(error.to_string()),
                         }
                     }
-                    (accepted, refused)
+                    (accepted, refusals)
                 })
             })
             .collect();
 
         let mut accepted = Vec::new();
-        let mut refused = 0usize;
+        let mut refusals: Vec<String> = Vec::new();
         for handle in handles {
             let (seqs, failures) = handle.join().expect("writer thread panicked");
             accepted.extend(seqs);
-            refused += failures;
+            refusals.extend(failures);
         }
+
+        assert!(
+            refusals.is_empty(),
+            "a concurrent writer was refused instead of queued — the append path is not \
+             allocating seq inside its IMMEDIATE transaction: {refusals:?}"
+        );
+        assert_eq!(
+            accepted.len(),
+            writers * per_writer,
+            "not every write was accepted"
+        );
 
         let mut sorted = accepted.clone();
         sorted.sort_unstable();
@@ -772,12 +789,74 @@ mod tests {
         assert_eq!(
             rows,
             accepted.len() as i64,
-            "{} write(s) reported success without reaching the file ({refused} refused loudly)",
+            "{} write(s) reported success without reaching the file",
             accepted.len() as i64 - rows
         );
         // A gapless sequence is the whole point of allocating inside the
         // transaction: MAX(seq) may not run ahead of the number of rows.
         assert_eq!(max_seq, rows, "seq allocation left a gap");
+    }
+
+    /// Invariant 2, second half: the uniqueness constraint, on the path where
+    /// the IMMEDIATE transaction is NOT what protects the sequence.
+    ///
+    /// A writer that allocates `seq` before opening its transaction sees a
+    /// FRESH snapshot when it finally writes, so SQLite has no conflict to
+    /// report — a stale-but-plausible `seq` would simply land, and the run
+    /// would carry two rows at the same point on its timeline. The primary key
+    /// is the only thing standing there, and it is exercised here through a
+    /// caller-owned deferred transaction, exactly the shape `append_in_tx`
+    /// accepts from callers whose isolation the store does not control.
+    #[test]
+    fn a_seq_allocated_outside_the_transaction_is_refused_by_the_constraint() {
+        let dir = tempfile::tempdir().unwrap();
+        drop(open_events_db(dir.path()));
+        let stale_writer = open_events_db(dir.path());
+
+        // The allocation a hoisted `MAX(seq) + 1` would produce: read before
+        // anything else writes, and outside any transaction of its own.
+        let stale_seq: i64 = {
+            let conn = stale_writer.read().unwrap();
+            conn.query_row(
+                "SELECT COALESCE(MAX(seq), 0) + 1 FROM run_events WHERE run_id = 'r-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap()
+        };
+
+        let winner = open_events_db(dir.path());
+        let taken = append(&winner, event("r-1", request_started())).unwrap();
+        assert_eq!(taken.seq, stale_seq, "the two writers did not race for one seq");
+
+        let error = {
+            let mut conn = stale_writer.write().unwrap();
+            let tx = conn
+                .transaction_with_behavior(rusqlite::TransactionBehavior::Deferred)
+                .unwrap();
+            tx.execute(
+                "INSERT INTO run_events \
+                  (run_id, seq, at_ms, kind, origin, actor_kind, payload_json) \
+                 VALUES ('r-1', ?1, 1, 'first_token', 'chat', 'user', '{\"kind\":\"first_token\"}')",
+                rusqlite::params![stale_seq],
+            )
+            .expect_err("a seq that is already taken must not be insertable")
+        };
+        assert!(
+            error.to_string().contains("UNIQUE constraint failed"),
+            "the write was refused for the wrong reason: {error}"
+        );
+
+        let (rows, distinct): (i64, i64) = {
+            let conn = stale_writer.read().unwrap();
+            conn.query_row(
+                "SELECT COUNT(*), COUNT(DISTINCT seq) FROM run_events WHERE run_id = 'r-1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+        };
+        assert_eq!((rows, distinct), (1, 1), "the run kept two rows at one seq");
     }
 
     /// §2.4.2 — a repeat under the same key is a no-op returning `duplicate`.
@@ -1034,21 +1113,41 @@ mod tests {
         assert_eq!(envelope_org.as_deref(), Some("org-acme"));
     }
 
-    /// Invariant 4. `run_events` cannot be swept into the Sync Ledger for two
-    /// independent reasons, and both are pinned here: it has no descriptor, and
-    /// the ledger only ever reads the tables it holds descriptors for — every
-    /// one of them out of the MAIN pool (`repository::reseed_core_state_from_
-    /// current_rows`, `ensure_default_core_sync_policies`). A table in a
-    /// different file is not something the ledger can reach even by mistake.
+    /// Invariant 4, over EVERY table the event log actually holds — read out of
+    /// `sqlite_master`, so a table added to this file later is covered without
+    /// anyone remembering to extend a list here. None of them may carry a core
+    /// sync descriptor, and since the ledger only ever reads the tables it holds
+    /// descriptors for, a disjoint set is the whole of the guarantee. That the
+    /// ledger reads them from the MAIN pool is the second, structural half:
+    /// `<data>/events.db` is a different file, and no test can pin that beyond
+    /// the disjointness asserted here.
     #[test]
-    fn run_events_stays_out_of_the_sync_ledger() {
+    fn no_table_of_the_event_log_is_a_core_sync_table() {
         use crate::sync::core_registry::{descriptor_for_table, is_core_sync_table};
-        for table in ["run_events", "audit_outbox", "events_schema_version"] {
+        let (_dir, pool) = events_db();
+        let conn = pool.read().unwrap();
+        let tables: Vec<String> = {
+            let mut stmt = conn
+                .prepare("SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name")
+                .unwrap();
+            stmt.query_map([], |row| row.get::<_, String>(0))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert!(
+            tables.iter().any(|t| t == "run_events"),
+            "the event log has no run_events table: {tables:?}"
+        );
+        for table in &tables {
             assert!(
                 !is_core_sync_table(table),
-                "{table} must stay out of core sync"
+                "{table} lives in events.db and must stay out of core sync"
             );
-            assert!(descriptor_for_table(table).is_none());
+            assert!(
+                descriptor_for_table(table).is_none(),
+                "{table} lives in events.db and must have no sync descriptor"
+            );
         }
     }
 }

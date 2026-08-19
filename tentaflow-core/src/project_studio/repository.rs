@@ -1113,14 +1113,26 @@ pub fn mark_file_indexing(pool: &DbPool, file_id: &str) -> Result<()> {
     Ok(())
 }
 
-pub fn finish_ingest_job(pool: &DbPool, job_id: &str, status: &str, error: &str) -> Result<()> {
+/// Writes the terminal state of a job that is still `running`, and returns
+/// whether it actually wrote — `false` means the row was already terminal and
+/// keeps the status it had.
+///
+/// The guard is in the STATEMENT, not at the call sites, because the window it
+/// closes belongs to no single caller: a worker writes this row and only then
+/// deletes its queue row, so a crash in between leaves a queue row whose job
+/// already succeeded. Startup reconciliation then arrives with "interrupted by
+/// restart" and would bury a correct success. One conditional UPDATE makes
+/// "the first terminal status wins" a property of the table — no caller can
+/// forget it, and no caller needs a read-then-write that a second writer could
+/// interleave.
+pub fn finish_ingest_job(pool: &DbPool, job_id: &str, status: &str, error: &str) -> Result<bool> {
     let conn = pool.write().map_err(write_err)?;
-    conn.execute(
+    let written = conn.execute(
         "UPDATE ingest_jobs SET status = ?1, error = ?2, finished_at = datetime('now') \
-         WHERE job_id = ?3",
+         WHERE job_id = ?3 AND status = 'running'",
         params![status, error, job_id],
     )?;
-    Ok(())
+    Ok(written > 0)
 }
 
 // =============================================================================

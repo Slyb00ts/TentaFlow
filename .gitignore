@@ -257,3 +257,6 @@ tentaflow-infer/kernels/mojo/build/.kernel-build-*/
 # include_bytes!, wiec bez nich nie kompiluja sie u nikogo innego. Wpis MUSI
 # stac po regulach *.bin i *.safetensors, bo w .gitignore wygrywa pozniejszy.
 !tentaflow-infer/crates/*/tests/fixtures/**
+
+# Scratch directories used by verification runs
+.tmp-graph/

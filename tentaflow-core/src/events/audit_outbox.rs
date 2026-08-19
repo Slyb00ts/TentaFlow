@@ -46,7 +46,7 @@ const BACKLOG_ALERT: i64 = 100;
 
 /// Risk class of a run-provenance audit row: operational metadata (origin,
 /// actor, model), no prompt or response body.
-const RISK_CLASS: &str = "A";
+const RISK_CLASS: &str = crate::audit::RiskClass::A.as_db_str();
 
 /// Outcome of one delivery pass.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -190,10 +190,6 @@ fn decode_and_write(main_db: &DbPool, payload: &str) -> Result<()> {
 /// under the SAME lock, so no other writer can extend the chain in between.
 fn write_audit_row(main_db: &DbPool, envelope: &AuditEnvelope) -> Result<()> {
     let action = format!("flow_run.{}", envelope.kind);
-    let org_id = envelope
-        .org_id
-        .clone()
-        .unwrap_or_else(|| crate::services::org::DEFAULT_ORG_ID.to_string());
     let details = serde_json::json!({
         "run_id": envelope.run_id,
         "seq": envelope.seq,
@@ -226,7 +222,11 @@ fn write_audit_row(main_db: &DbPool, envelope: &AuditEnvelope) -> Result<()> {
         resource: None,
         resource_type: Some("flow_run"),
         resource_id: Some(envelope.run_id.as_str()),
-        result: Some("ok"),
+        // The mirrored event records only that a run STARTED, so there is no
+        // outcome to report; `ok` would claim one that has not happened yet.
+        // The run's ending lives on the timeline, reachable through
+        // `correlation_id` (invariant 6).
+        result: None,
         error_message: None,
         details: Some(details.as_str()),
         ip_address: None,
@@ -251,11 +251,17 @@ fn write_audit_row(main_db: &DbPool, envelope: &AuditEnvelope) -> Result<()> {
             action,
             "flow_run",
             envelope.run_id,
-            "ok",
+            None::<&str>,
+            // Severity classifies the ENTRY, not the run: a provenance record
+            // carrying no outcome and no error is informational.
             "info",
             RISK_CLASS,
             details,
-            org_id,
+            // NULL when no organisation was minted for the run (camera,
+            // scheduler, maintenance). The default tenant is not a stand-in:
+            // borrowing it would show a tenant-scoped audit reader runs that
+            // tenant never made (invariant 6, same rule as the timeline row).
+            envelope.org_id,
             request_id,
             // The deep link of §2.10.3 — v129 added the column so an audit
             // entry can be followed to the point on the timeline that produced
@@ -425,6 +431,71 @@ mod tests {
         assert!(details.contains("\"origin\":\"code_studio\""), "{details}");
         assert!(details.contains("\"actor_user_id\":\"u-1\""), "{details}");
         assert_eq!(hash_len, 32, "the row is not part of the audit chain");
+    }
+
+    /// Invariant 6, on the audit side. A camera, scheduler or maintenance run
+    /// carries no organisation, and the audit copy must say so: substituting
+    /// the default tenant would show a tenant-scoped audit reader runs that
+    /// organisation never made. Asserted on the COLUMN — the timeline row
+    /// already stores NULL and the two must not disagree.
+    #[test]
+    fn a_run_with_no_tenant_is_audited_with_no_tenant() {
+        let (_dir, pool) = events_db();
+        let main = main_db();
+
+        append(&pool, request_started("r-tenant").with_org("org-acme")).unwrap();
+
+        let system = RunEvent::new(
+            "r-system",
+            now_ms(),
+            FlowOrigin::Camera,
+            &FlowActor::system(),
+            EventPayload::RequestStarted {
+                model: None,
+                flow_id: None,
+                service_type: None,
+                modality: None,
+            },
+        );
+        assert!(system.org_id.is_none());
+        append(&pool, system).unwrap();
+
+        assert_eq!(deliver_pending(&main, &pool, 10).unwrap().delivered, 2);
+
+        let conn = main.read().unwrap();
+        let rows: Vec<(String, Option<String>, Option<String>)> = {
+            let mut stmt = conn
+                .prepare(
+                    "SELECT resource_id, org_id, result FROM audit_log \
+                     WHERE action = 'flow_run.request_started' ORDER BY resource_id",
+                )
+                .unwrap();
+            stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))
+                .unwrap()
+                .collect::<rusqlite::Result<Vec<_>>>()
+                .unwrap()
+        };
+        assert_eq!(
+            rows,
+            vec![
+                // No outcome is known when a run opens, so `result` stays NULL
+                // for both rows rather than claiming a cheerful `ok`.
+                ("r-system".to_string(), None, None),
+                ("r-tenant".to_string(), Some("org-acme".to_string()), None),
+            ],
+            "the audit copy invented a tenant or an outcome"
+        );
+
+        // A tenant-scoped reader must not pick the unattributed run up.
+        let scoped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM audit_log \
+                 WHERE action = 'flow_run.request_started' AND org_id = 'org-default'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(scoped, 0, "a tenant-less run was filed under the default organisation");
     }
 
     /// The timeline is diagnostic, the audit log is a commitment. Mirroring

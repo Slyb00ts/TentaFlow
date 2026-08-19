@@ -493,6 +493,7 @@ impl NodeAdapter for RagFinalizeNodeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::flow_engine::node_adapters::output::OUTPUT_MODE_STREAM;
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
     use serde_json::json;
     use std::sync::Arc;

@@ -1,10 +1,11 @@
-// ===== File: services/ingest_jobs.rs — durable ingest queue shared by core subsystems =====
+// ===== File: services/ingest_jobs.rs — durable ingest queue for the Project Studio worker =====
 //
 // Ingest work used to live only in the process that accepted it: Project
 // Studio spawned a task and a restart silently dropped everything that had not
 // finished. The queue makes the work durable — it is enqueued before the
 // request returns and a worker claims it afterwards, in this process or in the
-// next one.
+// next one. `queue` namespaces the rows per consumer, so a second consumer
+// needs no second file, but today Project Studio is the only one.
 //
 // WHY A SEPARATE FILE (`<data>/jobs.db`)
 //
@@ -12,9 +13,11 @@
 // connection and every write serialises on it (`db/mod.rs`: "`write()` bierze
 // jedyne polaczenie pisarza spod `Mutex`"), so a queue that claims, heartbeats
 // and finishes would contend with settings, flows, agents and audit writes.
-// And it is separate from `events.db` specifically because the event log has
-// retention and rotation while the queue has neither — sharing one file would
-// mean a retention sweep could delete queued work.
+// It is separate from `events.db` because the event log is the one designed to
+// be thrown away in bulk: its retention sweep is table-scoped today, but the
+// planned monthly ROTATION (`docs/DOKONCZENIE_RAG_I_ZDARZENIA.md` §2.9) retires
+// the FILE, and a rotation that retires the file would take outstanding queue
+// rows with it.
 //
 // The queue therefore cannot enter the Sync Ledger, and that is a property of
 // WHERE it lives rather than a rule someone has to remember: the ledger only
@@ -23,7 +26,7 @@
 // descriptor is unreachable to it. It also MUST NOT sync: a claim names the
 // process instance holding the job, so a replicated row would let one node
 // believe another node's worker is its own — and both would run the same
-// ingest. `ingest_jobs_stays_out_of_the_sync_ledger` pins both halves.
+// ingest.
 //
 // WHAT THE FILE HOLDS: outstanding work only. `finish` DELETES the row, so the
 // table never accumulates history and needs no retention of its own. Terminal
@@ -309,6 +312,26 @@ pub fn finish(pool: &DbPool, job_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// How many jobs of `queue` are outstanding AHEAD of `job_id` — enqueued
+/// earlier in exactly the order `claim` hands them out. The table holds
+/// outstanding work only, so this is a count of real work, not an estimate:
+/// it is what lets a consumer say "queued behind N" without claiming to know
+/// how long that will take. Returns 0 once the job itself is gone.
+pub fn jobs_ahead(pool: &DbPool, queue: &str, job_id: &str) -> Result<i64> {
+    let conn = pool.read().map_err(read_err)?;
+    conn.query_row(
+        "SELECT COUNT(*) FROM ingest_jobs AS other \
+           JOIN ingest_jobs AS self_row ON self_row.job_id = ?2 \
+          WHERE other.queue = ?1 \
+            AND (other.enqueued_at_ms < self_row.enqueued_at_ms \
+                 OR (other.enqueued_at_ms = self_row.enqueued_at_ms \
+                     AND other.job_id < self_row.job_id))",
+        params![queue, job_id],
+        |row| row.get(0),
+    )
+    .map_err(Into::into)
+}
+
 /// Whether the queue still owes work for `job_id`. The consumer's own record
 /// says "running" from the moment the job is accepted, so this is how it tells
 /// a job waiting for a worker from one whose worker died.
@@ -360,18 +383,23 @@ pub fn request_cancel(pool: &DbPool, job_id: &str) -> Result<CancelOutcome> {
     })
 }
 
-/// Closes every job left `running` by a process that no longer exists and
-/// returns them, so each consumer can close its own record. Run at startup,
+/// Closes the jobs of `queue` left `running` by a process that no longer exists
+/// and returns them, so the consumer can close its own record. Run at startup,
 /// before any worker claims: a row claimed by THIS process run is by definition
 /// supervised and is never touched.
-pub fn reconcile_orphans(pool: &DbPool) -> Result<Vec<QueuedJob>> {
+///
+/// The delete is scoped to ONE queue because the returned rows are the only
+/// notification a consumer gets: deleting another queue's row here would erase
+/// the job while its owner never hears about it.
+pub fn reconcile_orphans(pool: &DbPool, queue: &str) -> Result<Vec<QueuedJob>> {
     let conn = pool.write().map_err(write_err)?;
     let mut stmt = conn.prepare(
-        "DELETE FROM ingest_jobs WHERE status = 'running' AND owner_instance <> ?1 \
+        "DELETE FROM ingest_jobs \
+          WHERE queue = ?1 AND status = 'running' AND owner_instance <> ?2 \
          RETURNING job_id, queue, payload_json, cancel_requested, enqueued_at_ms",
     )?;
     let orphans = stmt
-        .query_map(params![instance_id()], read_job)?
+        .query_map(params![queue, instance_id()], read_job)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     if !orphans.is_empty() {
         warn!(
@@ -402,7 +430,7 @@ mod tests {
         }
         // "Restart": the pool (and its connection) is gone, the file is not.
         let pool = open_pool_at(&path).expect("reopen");
-        let orphans = reconcile_orphans(&pool).expect("reconcile");
+        let orphans = reconcile_orphans(&pool, QUEUE_PROJECT_STUDIO).expect("reconcile");
         assert!(orphans.is_empty(), "a queued job was never anyone's to orphan");
 
         let job = claim(&pool, QUEUE_PROJECT_STUDIO)
@@ -490,7 +518,7 @@ mod tests {
             .expect("insert orphan");
         }
 
-        let orphans = reconcile_orphans(&pool).expect("reconcile");
+        let orphans = reconcile_orphans(&pool, QUEUE_PROJECT_STUDIO).expect("reconcile");
         assert_eq!(orphans.len(), 1);
         assert_eq!(orphans[0].job_id, "dead");
         assert!(!is_pending(&pool, "dead").expect("pending"));
@@ -528,9 +556,11 @@ mod tests {
     }
 
     /// The queue is runtime state of a single node and cannot be swept into the
-    /// Sync Ledger. Both halves are pinned: no descriptor names these tables,
-    /// and the ledger reads every table it knows out of the MAIN pool, which
-    /// this file is not.
+    /// Sync Ledger. This pins the half a test can pin: no sync descriptor names
+    /// these tables, so a later edit that adds one fails here. The other half —
+    /// the ledger reading only out of the MAIN pool, which this file is not —
+    /// is a property of `sync::ledger`, not something asserting on table names
+    /// can show.
     #[test]
     fn ingest_jobs_stays_out_of_the_sync_ledger() {
         use crate::sync::core_registry::{descriptor_for_table, is_core_sync_table};

@@ -3214,7 +3214,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 10, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 9, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(

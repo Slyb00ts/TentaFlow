@@ -1026,9 +1026,13 @@ fn current_orgs_dir(conn: &Connection) -> Result<std::path::PathBuf> {
 // ("origin and actor* NEVER come from anywhere but the entry point"). A NULL
 // origin on a historical run is the honest statement "this predates the stamp";
 // a guessed one is fabrication that no later query can distinguish from a real
-// observation. New rows always carry both non-NULL values
-// (`NewAgentRun.origin` / `.actor_kind` are `&str`, not `Option`), so the NULLs
-// mark exactly the pre-migration population.
+// observation. New rows always carry non-NULL `origin` and `actor_kind`:
+// `NewAgentRun` and `NewFlowExecution` type both as `&str`, not `Option`, and
+// the writers (`AgentRunManager::spawn`, `create_execution_record`) fill them
+// from the principal / `ExecutionContext`. So the NULLs mark exactly the
+// pre-migration population. `actor_id`, `actor_user_id` and `correlation_id`
+// stay legitimately NULLABLE on new rows too — a system run has no actor id and
+// a service API key has no user behind it.
 //
 // Index shapes follow the log they will be joined against:
 //   * `(origin, <time> DESC)` and `(actor_id, <time> DESC)` mirror
@@ -9425,8 +9429,6 @@ mod tests {
         let custom = "/var/lib/tentaflow-custom/kg_active.cozo";
         seed_graph_collection(&conn, "org-c", "ps-proj-1", "kg_active", custom);
 
-        conn.execute("DELETE FROM _migrations WHERE version = 130", [])
-            .unwrap();
         repair_graph_collection_paths(&conn).unwrap();
 
         assert_eq!(
@@ -9702,24 +9704,12 @@ mod tests {
             .unwrap();
         assert_eq!(unstamped_runs, runs_before);
 
-        // A NEW row carries the stamp the entry point supplies — this is the
-        // insert `repository::create_agent_run` issues.
-        conn.execute(
-            "INSERT INTO agent_runs \
-                (id, agent_id, status, prompt, origin, actor_kind, actor_id, \
-                 actor_user_id, correlation_id) \
-             VALUES ('run-c', 'agent-1', 'queued', 'p', 'chat', 'user', 'u-1', 'u-1', 'corr-1')",
-            [],
-        )
-        .unwrap();
-        let stamped: String = conn
-            .query_row(
-                "SELECT origin FROM agent_runs WHERE correlation_id = 'corr-1'",
-                [],
-                |r| r.get(0),
-            )
-            .unwrap();
-        assert_eq!(stamped, "chat");
+        // That new rows really carry the stamp is NOT asserted here: an INSERT
+        // written in this test body would prove only that the column accepts a
+        // value, not that the product supplies one. The writers are exercised
+        // through their production entry points instead —
+        // `flow_engine::executor::provenance_persistence_tests` for
+        // `flow_executions` and `agents::run_manager` for `agent_runs`.
 
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 

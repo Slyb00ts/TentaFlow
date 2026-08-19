@@ -288,3 +288,118 @@ kolekcji utworzonej przez `ensure_collection_at`.
 **Wniosek metodyczny:** krytyk rundy 1 przeczytał testy i uznał je za nie-puste, bo każdy łapał
 swoją mutację. Krytyk rundy 2 zapytał inaczej — „czy JAKIKOLWIEK test łapie tę zmianę" — i
 odpowiedź brzmiała nie. To są dwa różne pytania i drugie jest ważniejsze.
+
+---
+
+# INCYDENT 2 — mutacje testowe w zacommitowanym kodzie
+
+## Co się stało
+
+Limit sesji ubił siedmiu agentów jednocześnie, w tym **dwóch krytyków w trakcie testowania
+mutacyjnego**. Mutacje nie zostały przywrócone, bo agent nie zdążył. Ja zacommitowałem drzewo
+(`06b52c59d`) bez sprawdzenia — i wprowadziłem do historii:
+
+1. `events/store.rs:413` — `// MUTATION M2: seq allocated OUTSIDE the insert transaction`.
+   **Wprost złamany inwariant 2.** Krytyk przebudował `write_event` na wariant z prealokacją i
+   przeniósł alokację `seq` przed transakcję, żeby sprawdzić, czy test to złapie.
+2. `services/graph/collection.rs:1360` — `// MUTATION B: always derive from the key, ignoring the
+   registry row`. Defeat dokładnie tego zachowania, którego tor R2a broni.
+
+## Jak wykryte
+
+**Nie przeze mnie.** Zgłosił to wykonawca T3b, przy okazji własnej pracy — zauważył marker w pliku,
+którego nie był właścicielem, i napisał o tym w raporcie zamiast zignorować.
+
+## Naprawa
+
+`store.rs` przywrócony z `5fb01dad5` (czysta wersja, zweryfikowane że nic z zewnątrz nie zależy od
+`write_event_preallocated`). `collection.rs` posprzątany przez żywego agenta R2a po ostrzeżeniu.
+
+## Wnioski wdrożone
+
+1. **Skan przed każdym commitem** — `MUTATION|MUTANT|dbg!\(|todo!\(\)|unimplemented!\(\)` plus
+   atrybucja AI. Zacommitowanie mutacji jest gorsze niż jej brak, bo wygląda jak kod produkcyjny.
+2. **Każdy agent robiący mutację ma obowiązek zweryfikować grepem, że po nim nie został marker** —
+   dopisane do instrukcji.
+3. **Testowanie mutacyjne na współdzielonym drzewie jest z natury niebezpieczne.** Mutacja żyje
+   w plikach, które w tym czasie widzi każdy inny agent i każdy commit. Docelowo krytycy powinni
+   mutować na kopii, nie w miejscu — ale kopia wymaga własnego `target/`, co przy tym repo kosztuje
+   dziesiątki GB. Świadomy kompromis, nie przeoczenie.
+
+## Notatki wydaniowe — ryzyka do zakomunikowania przy wdrożeniu
+
+1. **Okno osieroconych danych grafu.** Instalacja, która chodziła na pośredniej wersji (wiersz
+   `addon_graph_collections` już autorytatywny, migracji 130 jeszcze nie), otworzyła PUSTY graf pod
+   nieaktualną ścieżką. Migracja 130 przekieruje wiersz na prawdziwe dane, ale zapisy dokonane
+   w tym pustym grafie zostają osierocone na dysku. Migracja nie może zrobić lepiej.
+2. **`foreign_key_check` migracji 129 obejmuje CAŁĄ bazę.** Dowolne zastane naruszenie klucza
+   obcego gdziekolwiek blokuje aktualizację i węzeł się nie uruchomi. Nie jest to nowa klasa
+   ryzyka (osiem takich wywołań już istnieje), ale przy tej migracji trzeba to wiedzieć wcześniej.
+3. **`SCHEMA_VERSION` 22 → 23** — stare binarki odpadają na handshake'u. Wszystkie węzły mesh
+   muszą zostać przebudowane razem.
+
+## Zastane usterki repo — znalezione po drodze, NIE przez nas spowodowane, NIE naprawione
+
+1. `tentaflow-protocol`: `code_studio_variant_names_are_pinned` i
+   `code_studio_response_field_names_are_pinned` padają na czystym HEAD (lista pinów 139, enum 141).
+   Dowód niezależny od nas: `git diff d9d98c1fd -- tentaflow-protocol/src/code_studio.rs` jest
+   PUSTY, a enum i lista pinów żyją w tym jednym pliku. **Blokuje T6** — bez naprawy nie odróżnimy
+   własnej regresji od zastanej.
+2. Kopia audytowa Code Studio nigdy nie jest drenowana — `audit_outbox::spawn_delivery_loop`,
+   `workspace_db::spawn_idle_sweeper` i `checkpoint_all` nie mają wołających.
+3. Sześć testów `sync::` pada tylko przy równoległym pełnym przebiegu; pod `--test-threads=1`
+   przechodzą. Zagłodzenie sesji mesh z realnymi timeoutami, nie regresja.
+
+---
+
+# PRZEKAZANIE STANU — 2026-08-19 21:57
+
+## Jeśli sesja zostanie przerwana, zacznij TUTAJ
+
+**HEAD:** `f03dfa768` na gałęzi `feat/zdarzenia-rag`. 15 plików zmienionych, niezacommitowanych.
+Migawka: `scratchpad/snap-2157/{tracked.patch,untracked.tgz}`.
+
+### 1. NAJPIERW: sprawdź skażenie mutacjami
+
+W chwili pisania **żyje jedna mutacja testowa**: `agents/principal.rs:81`, znacznik
+`TF_REVIEW_MUTATION_4`, zostawiona przez krytyka T1 w trakcie pracy. Jeśli agent nie zdążył jej
+cofnąć — **cofnij ręcznie** przed jakimkolwiek commitem.
+
+```
+grep -rn "MUTATION\|MUTANT\|MUTATED\|TF_REVIEW" tentaflow-core/src/ tentaflow/src/ tentaflow-protocol/src/
+```
+Zero trafień = można commitować. Cokolwiek innego = najpierw posprzątać.
+
+### 2. Agenci, którzy byli w locie (mogą mieć niedokończoną pracę na dysku)
+
+| Agent | Zadanie | Pliki |
+|---|---|---|
+| krytyk T1 | ocena pochodzenia, runda 2 | tylko odczyt + mutacje w `agents/`, `flow_engine/` |
+| krytyk R3 | ocena jednej powłoki | tylko odczyt + mutacje w `node_adapters/`, `flows/` |
+| T2 runda 2 | strażnik inwariantu 2, fabrykacja `org_id`, pula odczytu | `src/events/` |
+| R1 runda 2 | tor robotnika, okna awarii | `services/ingest_jobs.rs`, `project_studio/ingest.rs`, `db/repository.rs`, `main.rs` |
+| zapis do `flow_executions` | domknięcie kryterium etapu 1 | `flow_engine/executor.rs`, `db/{repository,models,migrations}.rs` |
+
+### 3. Co jest domknięte i potwierdzone (nie ruszać)
+
+- **T5a** oś czasu — 14/14, `tf-run-timeline.js` + `controls.css` + i18n ×5
+- **T3** `FirstToken` — 11/11, macierz 4 mutacji
+- **Migracje 129/130/131** + `SCHEMA_VERSION` 23 — schemat zdany, brakuje ZAPISU do `flow_executions`
+- **R2a** graf — 3 rundy, wyścig naprawiony, pokrycie dodane
+- **Plomba protokołu Code Studio** — przywrócona, T6 odblokowane
+
+### 4. Kolejność, gdyby wznawiać
+
+1. sprzątnij mutacje, zacommituj to, co przechodzi
+2. dokończ rundy 2 (T2, R1, `flow_executions`) i ich krytyków
+3. **T5b** — rejestr, inspektor, protokół, moduł nawigacji (największy pozostały kawałek)
+4. **T6** — Code Studio + odsyłacz z audytu (odblokowane)
+5. **R2b** — węzeł `graph_extract`
+6. przejście porządkowe: tłumaczenia, „14 dni" → 30 w §2.9, komentarz „133 variants"
+
+### 5. Bramki NIEZAPYTANE
+
+- migracja danych addona RAG (§1.1 części 4–5) — **zmienia bundle hash**
+- wejście w §1.2 G2
+- **push** — nic nie było wypychane
+- regres promptu czatu projektu (patrz niżej) — czeka na potwierdzenie krytyka

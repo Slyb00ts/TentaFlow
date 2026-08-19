@@ -1786,6 +1786,7 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::db::models::{AgentParams, AgentRunListFilter};
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 
     fn db() -> DbPool {
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
@@ -2346,6 +2347,40 @@ mod tests {
             "child tool outside parent surface must reject"
         );
         assert!(out.unwrap_err().to_string().contains("tool surface"));
+    }
+
+    /// §2.5 — the run row must be stamped by the SPAWN PATH, off the principal
+    /// the entry point minted. Building a `NewAgentRun` in a test body and
+    /// handing it to `create_agent_run` would prove only that the columns accept
+    /// values; this drives `AgentRunManager::spawn`, which is what production
+    /// calls, and reads the row back.
+    #[tokio::test]
+    async fn spawn_stamps_the_run_with_the_principals_provenance() {
+        let pool = db();
+        seed_agent(&pool, "a1", "worker", "[]", 0, 1);
+        let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
+        // A SERVICE API key: no user behind it, so nothing may invent one.
+        let principal = AgentPrincipal::new(
+            None,
+            Some("org-1".into()),
+            FlowOrigin::Api,
+            FlowActor::api_key("key-77", None),
+        )
+        .with_correlation_id(Some("corr-9".into()));
+
+        let run_id = mgr
+            .spawn("a1", "do it", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn");
+
+        let row = repository::get_agent_run(&pool, &run_id)
+            .expect("read run")
+            .expect("run exists");
+        assert_eq!(row.origin.as_deref(), Some("api"));
+        assert_eq!(row.actor_kind.as_deref(), Some("api_key"));
+        assert_eq!(row.actor_id.as_deref(), Some("key-77"));
+        assert_eq!(row.actor_user_id, None);
+        assert_eq!(row.correlation_id.as_deref(), Some("corr-9"));
     }
 
     #[tokio::test]

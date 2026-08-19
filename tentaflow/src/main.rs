@@ -1141,7 +1141,7 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::warn!("Checkpoint WAL ML Studio nieudany: {}", e);
     }
     if let Err(e) = tentaflow_core::services::ingest_jobs::checkpoint_wal() {
-        error!("WAL checkpoint kolejki ingestu nieudany: {}", e);
+        error!("Ingest queue WAL checkpoint failed: {}", e);
     }
     if let Err(e) = tentaflow_core::project_studio::db::checkpoint_wal() {
         tracing::warn!("Checkpoint WAL Project Studio nieudany: {}", e);

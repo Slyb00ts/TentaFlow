@@ -338,6 +338,38 @@ pub struct DbFlowExecution {
     pub execution_log: Option<String>,
     pub total_latency_ms: Option<i64>,
     pub total_tokens: Option<i64>,
+    /// §2.5 — server-minted provenance, stamped at insert from
+    /// `ExecutionContext`. Reading it back is what lets this table answer
+    /// "from where and who" without a second table (§2.11 stage 1). `None`
+    /// only on rows written before migration v131.
+    pub origin: Option<String>,
+    pub actor_kind: Option<String>,
+    pub actor_id: Option<String>,
+    pub actor_user_id: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+/// Parameters of a new `flow_executions` row.
+///
+/// The provenance five are `&str`, not `Option`, because the executor reads
+/// them off `ExecutionContext` where both are enum-backed and always present —
+/// a NULL `origin` on a new row would be indistinguishable from the honestly
+/// unattributed pre-v131 population.
+///
+/// `model` is absent on purpose: at insert time no LLM node has run yet, so the
+/// model this run resolved to is only known at finalisation and is written by
+/// `update_flow_execution` from `FlowExecutionOutcome::model`.
+#[derive(Debug, Clone)]
+pub struct NewFlowExecution<'a> {
+    pub flow_id: &'a str,
+    pub request_id: &'a str,
+    pub status: &'a str,
+    pub parent_execution_id: Option<i64>,
+    pub origin: &'a str,
+    pub actor_kind: &'a str,
+    pub actor_id: Option<&'a str>,
+    pub actor_user_id: Option<&'a str>,
+    pub correlation_id: Option<&'a str>,
 }
 
 /// Parametry tworzenia nowego promptu

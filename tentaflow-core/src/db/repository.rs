@@ -368,6 +368,11 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
         execution_log: row.get(7)?,
         total_latency_ms: row.get(8)?,
         total_tokens: row.get(9)?,
+        origin: row.get(10)?,
+        actor_kind: row.get(11)?,
+        actor_id: row.get(12)?,
+        actor_user_id: row.get(13)?,
+        correlation_id: row.get(14)?,
     })
 }
 
@@ -11152,7 +11157,7 @@ pub fn delete_tts_cleaning_rule(pool: &DbPool, id: i64) -> Result<()> {
 
 // --- Flow Executions ---
 
-const FLOW_EXEC_COLS: &str = "id, flow_id, request_id, model, started_at, finished_at, status, execution_log, total_latency_ms, total_tokens";
+const FLOW_EXEC_COLS: &str = "id, flow_id, request_id, model, started_at, finished_at, status, execution_log, total_latency_ms, total_tokens, origin, actor_kind, actor_id, actor_user_id, correlation_id";
 
 pub fn list_flow_executions(
     pool: &DbPool,
@@ -11198,34 +11203,47 @@ pub fn get_flow_execution(pool: &DbPool, id: i64) -> Result<Option<DbFlowExecuti
     Ok(result)
 }
 
-pub fn create_flow_execution(
-    pool: &DbPool,
-    flow_id: &str,
-    request_id: Option<&str>,
-    model: Option<&str>,
-    status: &str,
-    parent_execution_id: Option<i64>,
-) -> Result<i64> {
+/// Opens a run's audit row. The provenance stamp is written HERE, at insert:
+/// the entry point already minted it, and a row that starts unattributed could
+/// never be told apart from a pre-v131 one.
+pub fn create_flow_execution(pool: &DbPool, exec: &NewFlowExecution<'_>) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
-        "INSERT INTO flow_executions (flow_id, request_id, model, started_at, status, parent_execution_id) VALUES (?1, ?2, ?3, datetime('now'), ?4, ?5)",
-        rusqlite::params![flow_id, request_id, model, status, parent_execution_id],
+        "INSERT INTO flow_executions \
+         (flow_id, request_id, started_at, status, parent_execution_id, \
+          origin, actor_kind, actor_id, actor_user_id, correlation_id) \
+         VALUES (?1, ?2, datetime('now'), ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        rusqlite::params![
+            exec.flow_id,
+            exec.request_id,
+            exec.status,
+            exec.parent_execution_id,
+            exec.origin,
+            exec.actor_kind,
+            exec.actor_id,
+            exec.actor_user_id,
+            exec.correlation_id,
+        ],
     )?;
     Ok(conn.last_insert_rowid())
 }
 
+/// Closes a run's audit row. `model` is the model the run's last LLM call
+/// resolved to — only known now, not at insert — and is `None` for a flow that
+/// called no model (spec invariant 6: a gap, not a guess).
 pub fn update_flow_execution(
     pool: &DbPool,
     id: i64,
     status: &str,
+    model: Option<&str>,
     execution_log: Option<&str>,
     total_latency_ms: Option<i64>,
     total_tokens: Option<i64>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "UPDATE flow_executions SET finished_at = datetime('now'), status = ?2, execution_log = ?3, total_latency_ms = ?4, total_tokens = ?5 WHERE id = ?1",
-        rusqlite::params![id, status, execution_log, total_latency_ms, total_tokens],
+        "UPDATE flow_executions SET finished_at = datetime('now'), status = ?2, model = ?3, execution_log = ?4, total_latency_ms = ?5, total_tokens = ?6 WHERE id = ?1",
+        rusqlite::params![id, status, model, execution_log, total_latency_ms, total_tokens],
     )?;
     Ok(())
 }

@@ -121,8 +121,13 @@ fn close_dequeued_job(payload_json: &str) {
 }
 
 fn close_job_as_cancelled(project_pool: &DbPool, payload: &JobPayload) {
-    let _ = repository::finish_ingest_job(project_pool, &payload.job_id, "cancelled", "");
-    let _ = repository::set_source_status(project_pool, &payload.source_id, "cancelled", "");
+    // The source follows the JOB row: if the job was already terminal, this
+    // cancel lost the race and must not relabel a source the finished run left
+    // `ready`.
+    if repository::finish_ingest_job(project_pool, &payload.job_id, "cancelled", "").unwrap_or(false)
+    {
+        let _ = repository::set_source_status(project_pool, &payload.source_id, "cancelled", "");
+    }
     let tx = log_bus::sender_for(&payload.job_id);
     emit_end_and_close(&tx, &payload.job_id, "cancelled", "");
     unregister_cancel(&payload.job_id);
@@ -483,8 +488,11 @@ pub fn recover_orphaned_jobs(pool: &DbPool) {
         if ingest_jobs::is_pending(&queue, &job_id).unwrap_or(true) {
             continue;
         }
-        tracing::warn!(job_id, "marking orphaned ingest job as failed");
-        let _ = repository::finish_ingest_job(pool, &job_id, "failed", "interrupted by restart");
+        if repository::finish_ingest_job(pool, &job_id, "failed", "interrupted by restart")
+            .unwrap_or(false)
+        {
+            tracing::warn!(job_id, "marked orphaned ingest job as failed");
+        }
     }
 }
 
@@ -1207,7 +1215,7 @@ pub fn reconcile_orphans() {
     let Ok(pool) = ingest_jobs::pool() else {
         return;
     };
-    let orphans = match ingest_jobs::reconcile_orphans(&pool) {
+    let orphans = match ingest_jobs::reconcile_orphans(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO) {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(error = %e, "ingest queue reconciliation failed");
@@ -1215,44 +1223,74 @@ pub fn reconcile_orphans() {
         }
     };
     for job in orphans {
-        if job.queue != ingest_jobs::QUEUE_PROJECT_STUDIO {
-            continue;
-        }
         let Ok(payload) = serde_json::from_str::<JobPayload>(&job.payload_json) else {
             continue;
         };
         let Ok(project_pool) = super::project_db::open(&payload.project_id) else {
             continue;
         };
-        tracing::warn!(job_id = %payload.job_id, "closing ingest job orphaned by a restart");
-        let _ = repository::finish_ingest_job(
+        // An orphaned QUEUE row does not prove the job failed: the worker
+        // writes the project row terminal and only then deletes the queue row,
+        // so a crash in between leaves exactly this state behind a SUCCESS.
+        // The guarded write decides, and the source follows it.
+        if repository::finish_ingest_job(
             &project_pool,
             &payload.job_id,
             "failed",
             "interrupted by restart",
-        );
-        let _ = repository::set_source_status(
-            &project_pool,
-            &payload.source_id,
-            "error",
-            "interrupted by restart",
-        );
+        )
+        .unwrap_or(false)
+        {
+            tracing::warn!(job_id = %payload.job_id, "closed ingest job orphaned by a restart");
+            let _ = repository::set_source_status(
+                &project_pool,
+                &payload.source_id,
+                "error",
+                "interrupted by restart",
+            );
+        }
     }
 }
 
+/// How many jobs may be IN PROGRESS at once in this process. It equals
+/// `MAX_CONCURRENT_DOCUMENT_INGESTS` only because both are "two"; they bound
+/// different things and this one is a genuine second limit — the gate in
+/// `execute_ingest` counts DOCUMENTS across Project Studio and the RAG addon,
+/// so a worker CAN sit idle holding a job while the addon holds both document
+/// permits. A job waiting for a worker is reported as queued (`start_job`),
+/// which is the only honest thing to say about it.
+const WORKERS: usize = crate::services::ingest_gate::MAX_CONCURRENT_DOCUMENT_INGESTS;
+
+/// Delay before a worker task that died is replaced, so a worker panicking on
+/// every pass degrades to a slow retry instead of a hot loop.
+const WORKER_RESTART_DELAY: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Starts the queue workers for this process.
-///
-/// The worker COUNT reuses `MAX_CONCURRENT_DOCUMENT_INGESTS` and is not a
-/// second limit: the real bound stays in `execute_ingest`, which counts
-/// DOCUMENTS. Running as many workers as the pipeline admits documents means a
-/// worker never sits idle behind a job that is itself waiting for the gate.
 pub fn start_workers(core_db: DbPool, router: Arc<Router>) {
     publish_runtime(core_db, router);
     if WORKERS_STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    for _ in 0..crate::services::ingest_gate::MAX_CONCURRENT_DOCUMENT_INGESTS {
-        tokio::spawn(worker_loop());
+    for _ in 0..WORKERS {
+        tokio::spawn(supervise_worker());
+    }
+}
+
+/// Keeps one worker slot filled. `worker_loop` never returns, so its task
+/// ending at all means it panicked somewhere the per-job guard does not cover
+/// (the claim, the wake, the select). Without this the pool would shrink
+/// silently — one worker per panic — until nothing ingested for the life of the
+/// process, and `WORKERS_STARTED` would block any restart.
+async fn supervise_worker() {
+    loop {
+        match tokio::spawn(worker_loop()).await {
+            Ok(()) => return,
+            Err(e) if e.is_cancelled() => return,
+            Err(_) => {
+                tracing::error!("ingest worker task panicked; restarting the worker");
+                tokio::time::sleep(WORKER_RESTART_DELAY).await;
+            }
+        }
     }
 }
 
@@ -1260,14 +1298,18 @@ async fn worker_loop() {
     loop {
         // Armed BEFORE the claim attempt, so an enqueue that lands while we are
         // draining cannot be missed between "queue empty" and "waiting".
+        // `enable` is what arms it: `notify_waiters` only reaches futures that
+        // are already registered, and a `Notified` registers when first polled.
         let notified = wake().notified();
         tokio::pin!(notified);
+        notified.as_mut().enable();
         loop {
             let Ok(pool) = ingest_jobs::pool() else {
                 break;
             };
+            retry_undeleted(&pool);
             match ingest_jobs::claim(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO) {
-                Ok(Some(job)) => run_claimed(job).await,
+                Ok(Some(job)) => run_supervised(job).await,
                 Ok(None) => break,
                 Err(e) => {
                     tracing::error!(error = %e, "ingest queue claim failed");
@@ -1282,8 +1324,132 @@ async fn worker_loop() {
     }
 }
 
-/// Runs one claimed job with the panic guard, so the finalizers (job status,
-/// queue row, End, close, unregister) always run.
+/// Runs `fut` on its own task so a panic inside it is captured instead of
+/// unwinding into the caller. `false` = it panicked.
+async fn supervised<F>(job_id: &str, stage: &str, fut: F) -> bool
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    match tokio::spawn(fut).await {
+        Ok(()) => true,
+        Err(e) if e.is_cancelled() => false,
+        Err(_) => {
+            tracing::error!(job_id, stage, "ingest job panicked");
+            false
+        }
+    }
+}
+
+/// Supervises the WHOLE of `run_claimed`, not just the pipeline: opening the
+/// project database, reading back the terminal row and closing the log channel
+/// are as able to panic as the pipeline is, and such a panic used to escape
+/// into `worker_loop` and kill the worker for the life of the process.
+async fn run_supervised(job: crate::services::ingest_jobs::QueuedJob) {
+    let job_id = job.job_id.clone();
+    let payload_json = job.payload_json.clone();
+    if supervised(&job_id, "job", run_claimed(job)).await {
+        return;
+    }
+    // The recovery runs supervised too: it opens the same project database
+    // that may be what panicked.
+    let recovery_id = job_id.clone();
+    supervised(&job_id, "panic recovery", async move {
+        close_panicked_job(&recovery_id, &payload_json);
+    })
+    .await;
+}
+
+/// Accounts for a job whose `run_claimed` panicked. A panic must not leave the
+/// job merely swallowed: the queue row goes (nothing will run it again, and a
+/// `running` row owned by a LIVE instance is invisible to reconciliation), the
+/// project row is closed if the pipeline had not closed it already, and the
+/// stream is ended with whatever the row actually says.
+fn close_panicked_job(job_id: &str, payload_json: &str) {
+    if let Ok(pool) = ingest_jobs::pool() {
+        finish_queue_row(&pool, job_id);
+    }
+    let mut status = "failed".to_string();
+    let mut error = PANIC_ERROR.to_string();
+    if let Ok(payload) = serde_json::from_str::<JobPayload>(payload_json) {
+        if let Ok(project_pool) = super::project_db::open(&payload.project_id) {
+            if repository::finish_ingest_job(&project_pool, job_id, "failed", PANIC_ERROR)
+                .unwrap_or(false)
+            {
+                let _ = repository::set_source_status(
+                    &project_pool,
+                    &payload.source_id,
+                    "error",
+                    PANIC_ERROR,
+                );
+            }
+            // The panic may have happened AFTER the pipeline wrote a real
+            // terminal status; the bus must report that one, not a made-up
+            // failure.
+            if let Ok(Some(row)) = repository::get_ingest_job(&project_pool, job_id) {
+                status = row.status;
+                error = row.error;
+            }
+        }
+    }
+    let tx = log_bus::sender_for(job_id);
+    emit_end_and_close(&tx, job_id, &status, &error);
+    unregister_cancel(job_id);
+}
+
+const PANIC_ERROR: &str = "ingest worker panicked";
+
+/// Queue rows whose job is already accounted for in its project but whose
+/// deletion failed. Discarding that error would make the row immortal: `claim`
+/// only takes `queued`, `is_pending` keeps answering yes, and nothing in this
+/// process would ever look at the row again.
+fn undeleted() -> &'static std::sync::Mutex<std::collections::HashSet<String>> {
+    static UNDELETED: OnceLock<std::sync::Mutex<std::collections::HashSet<String>>> =
+        OnceLock::new();
+    UNDELETED.get_or_init(Default::default)
+}
+
+fn undeleted_lock() -> std::sync::MutexGuard<'static, std::collections::HashSet<String>> {
+    undeleted()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Deletes the queue row of a job that is already recorded in its project. A
+/// failure is REMEMBERED rather than retried on the spot — the worker loop
+/// tries again on its next pass, which bounds the retry to the loop's own
+/// cadence instead of spinning on a file that is not writable.
+fn finish_queue_row(pool: &DbPool, job_id: &str) {
+    match ingest_jobs::finish(pool, job_id) {
+        Ok(()) => {
+            undeleted_lock().remove(job_id);
+        }
+        Err(e) => {
+            tracing::error!(
+                job_id,
+                error = %e,
+                "ingest queue row not deleted; retrying on the next worker pass"
+            );
+            undeleted_lock().insert(job_id.to_string());
+        }
+    }
+}
+
+/// One delete attempt per remembered row per worker pass.
+fn retry_undeleted(pool: &DbPool) {
+    let pending: Vec<String> = undeleted_lock().iter().cloned().collect();
+    for job_id in pending {
+        finish_queue_row(pool, &job_id);
+    }
+}
+
+/// Panic injected into `run_claimed` OUTSIDE the pipeline, so the guard that is
+/// supposed to keep a worker alive through a finalizer panic can be exercised
+/// at all. Consumed by the first job that reads it.
+#[cfg(test)]
+static PANIC_AFTER_PROJECT_OPEN: AtomicBool = AtomicBool::new(false);
+
+/// Runs one claimed job. Every step is inside the supervision of
+/// [`run_supervised`], so a panic here ends the job rather than the worker.
 async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
     let Ok(pool) = ingest_jobs::pool() else {
         return;
@@ -1294,7 +1460,7 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
             // Nothing can ever run this row; leaving it would make it a job
             // claimed and released forever.
             tracing::error!(job_id = %job.job_id, error = %e, "unreadable ingest job payload");
-            let _ = ingest_jobs::finish(&pool, &job.job_id);
+            finish_queue_row(&pool, &job.job_id);
             return;
         }
     };
@@ -1314,12 +1480,17 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
         Ok(p) => p,
         Err(e) => {
             tracing::error!(job_id = %job_id, error = %e, "ingest job project unavailable");
-            let _ = ingest_jobs::finish(&pool, &job_id);
+            finish_queue_row(&pool, &job_id);
             emit_end_and_close(&tx, &job_id, "failed", &format!("project unavailable: {e}"));
             unregister_cancel(&job_id);
             return;
         }
     };
+
+    #[cfg(test)]
+    if PANIC_AFTER_PROJECT_OPEN.swap(false, Ordering::SeqCst) {
+        panic!("finalizer blew up");
+    }
 
     // Wspolbieznosc ogranicza JEDNA bramka w `execute_ingest`
     // (`services::ingest_gate`), przez ktora przechodzi tez addon RAG — a
@@ -1368,27 +1539,19 @@ async fn run_claimed(job: crate::services::ingest_jobs::QueuedJob) {
     };
     // The queue row goes only AFTER the project row is terminal: a missing
     // queue row must always mean the job is accounted for elsewhere.
-    let _ = ingest_jobs::finish(&pool, &job_id);
+    finish_queue_row(&pool, &job_id);
     emit_end_and_close(&tx, &job_id, &status, &error);
     unregister_cancel(&job_id);
 }
 
-/// Runs the pipeline in its own task so a panic cannot escape into the worker
-/// loop, and turns that panic into a terminal job status — a panicking job must
-/// end FAILED, never stay `running` forever.
+/// Runs the pipeline supervised and turns a panic in it into a terminal job
+/// status — a panicking job must end FAILED, never stay `running` forever.
 async fn run_guarded<F>(project_pool: &DbPool, job_id: &str, fut: F)
 where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
-    if let Err(join_err) = tokio::spawn(fut).await {
-        if join_err.is_panic() {
-            let _ = repository::finish_ingest_job(
-                project_pool,
-                job_id,
-                "failed",
-                "ingest task panicked",
-            );
-        }
+    if !supervised(job_id, "pipeline", fut).await {
+        let _ = repository::finish_ingest_job(project_pool, job_id, "failed", "ingest task panicked");
     }
 }
 
@@ -1476,7 +1639,10 @@ pub fn start_job(task: IngestTask) {
         ingest_jobs::enqueue(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO, &job_id, &json)
     });
     match queued {
-        Ok(()) => wake().notify_waiters(),
+        Ok(()) => {
+            wake().notify_waiters();
+            announce_queue_wait(&tx, &job_id);
+        }
         Err(e) => {
             tracing::error!(job_id = %job_id, error = %e, "ingest job could not be queued");
             let message = format!("ingest queue unavailable: {e}");
@@ -1485,6 +1651,33 @@ pub fn start_job(task: IngestTask) {
             emit_end_and_close(&tx, &job_id, "failed", &message);
         }
     }
+}
+
+/// Reports a job that will WAIT for a worker. Before the queue, a job that
+/// could not start said so through the document gate; now it can also sit in
+/// the queue with nobody working on it, and saying nothing would leave the
+/// stream blank until a worker got to it.
+///
+/// It reports only what the queue can prove — how many jobs are outstanding
+/// ahead of this one — and never that the job is running: fewer outstanding
+/// jobs than workers means one is free, so there is no wait worth announcing.
+fn announce_queue_wait(tx: &tokio::sync::broadcast::Sender<BusMessage>, job_id: &str) {
+    let Ok(pool) = ingest_jobs::pool() else {
+        return;
+    };
+    let ahead = ingest_jobs::jobs_ahead(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO, job_id)
+        .unwrap_or_default();
+    if (ahead as usize) < WORKERS {
+        return;
+    }
+    emit_line(
+        tx,
+        job_id,
+        "log",
+        "queue",
+        format!("queued behind {ahead} ingest job(s)"),
+        0,
+    );
 }
 
 async fn run_job(
@@ -2068,6 +2261,314 @@ mod tests {
             .expect("row");
         assert_eq!(row.status, "failed");
         assert_eq!(row.error, "ingest task panicked");
+    }
+
+    /// A project that exists BOTH in the central registry and on disk, so
+    /// `project_db::open` — the call the worker path makes, having no request
+    /// context to inherit a pool from — resolves it exactly as in production.
+    /// Returns the project id, its directory and the sha of one empty code
+    /// blob the pipeline can run on.
+    fn registered_project(root: &Path) -> (String, PathBuf, String) {
+        let _ = super::super::db::init(&root.join("projects.db"));
+        let project_id = format!("p-{}", uuid::Uuid::new_v4());
+        let dir = root.join(&project_id);
+        std::fs::create_dir_all(dir.join("files")).expect("project dir");
+        repository::create_project(
+            &project_id,
+            "org-1",
+            "Projekt kolejkowy",
+            "",
+            "knowledge",
+            "[\"knowledge\"]",
+            "tester",
+            &dir.to_string_lossy(),
+            &[],
+        )
+        .expect("registry row");
+        let pool = super::super::project_db::open(&project_id).expect("project db");
+        repository::create_source(&pool, "src-1", "document", "Spec", "{}", "tester")
+            .expect("source");
+        // An EMPTY source file: the real pipeline extracts it, finds no text
+        // and truthfully skips it, so the job completes without a model
+        // runtime instead of being faked past the pipeline.
+        let sha = hex::encode(Sha256::digest(b""));
+        std::fs::write(dir.join("files").join(&sha), b"").expect("blob");
+        (project_id, dir, sha)
+    }
+
+    /// Registers one more job (row + file) on an already registered project.
+    fn queued_task(
+        state: &Arc<crate::dispatch::state::AppState>,
+        project_id: &str,
+        dir: &Path,
+        sha: &str,
+        job_id: &str,
+        path: &str,
+    ) -> IngestTask {
+        let pool = super::super::project_db::open(project_id).expect("project db");
+        let file_id =
+            repository::upsert_source_file(&pool, "src-1", path, sha, 0, "text/x-rust")
+                .expect("file row");
+        repository::create_ingest_job(&pool, job_id, "src-1", 1, "tester").expect("job row");
+        IngestTask {
+            core_db: state.db.clone(),
+            router: state.router.clone(),
+            project_pool: pool,
+            org_id: "org-1".to_string(),
+            project_id: project_id.to_string(),
+            dir_path: dir.to_path_buf(),
+            source_id: "src-1".to_string(),
+            job_id: job_id.to_string(),
+            files: vec![FileWork {
+                file_id,
+                path: path.to_string(),
+                sha256: sha.to_string(),
+                mime: "text/x-rust".to_string(),
+                payload: WorkPayload::Blob,
+            }],
+        }
+    }
+
+    /// Waits for the project row to leave `running`. The re-notify covers the
+    /// window in which a worker has not yet registered for the wake signal —
+    /// production closes it with `IDLE_POLL`, which no test wants to sit
+    /// through.
+    async fn await_terminal(project_id: &str, job_id: &str) -> super::super::models::IngestJobRecord {
+        for _ in 0..600 {
+            let pool = super::super::project_db::open(project_id).expect("project db");
+            if let Ok(Some(row)) = repository::get_ingest_job(&pool, job_id) {
+                if row.status != "running" {
+                    return row;
+                }
+            }
+            wake().notify_waiters();
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        panic!("the job never reached a terminal status");
+    }
+
+    /// R1 end to end: `start_job` persists the job, it survives the project
+    /// pool being closed and reopened plus a full startup reconciliation, and
+    /// the REAL worker path (`worker_loop` → `run_claimed` → `run_job`) carries
+    /// it to a terminal project row and clears the queue.
+    #[tokio::test]
+    async fn a_persisted_job_is_completed_by_the_worker_after_a_reopen() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+
+        start_job(queued_task(
+            &state,
+            &project_id,
+            &dir,
+            &sha,
+            &job_id,
+            "main.rs",
+        ));
+        assert!(
+            ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
+            "start_job must persist the job instead of only spawning it"
+        );
+
+        // The process that accepted the request is gone: its project pool is
+        // closed, and the next one starts with reconciliation and recovery.
+        super::super::project_db::close(&project_id);
+        reconcile_orphans();
+        let reopened = super::super::project_db::open(&project_id).expect("reopen");
+        recover_orphaned_jobs(&reopened);
+        assert_eq!(
+            repository::get_ingest_job(&reopened, &job_id)
+                .expect("read")
+                .expect("row")
+                .status,
+            "running",
+            "work that has not started must survive the restart intact"
+        );
+
+        let worker = tokio::spawn(worker_loop());
+        let row = await_terminal(&project_id, &job_id).await;
+        worker.abort();
+
+        assert_eq!(row.status, "success", "error: {}", row.error);
+        assert_eq!(row.files_done, 1, "the pipeline really ran the file");
+        assert!(row.finished_at.is_some());
+        assert!(
+            !ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
+            "a completed job must leave the queue"
+        );
+        let source = repository::get_source(&reopened, "src-1")
+            .expect("read")
+            .expect("source");
+        assert_eq!(source.status, "ready");
+    }
+
+    /// `signal_cancel` is the entry point the dispatch layer calls, and it has
+    /// to handle both lives of a job: waiting in the queue (removed and closed
+    /// here and now) and claimed by a worker (persisted on the row, so a worker
+    /// in another process still sees it).
+    #[test]
+    fn signal_cancel_closes_a_waiting_job_and_flags_a_claimed_one() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+
+        let waiting = format!("job-{}", uuid::Uuid::new_v4());
+        start_job(queued_task(
+            &state, &project_id, &dir, &sha, &waiting, "waiting.rs",
+        ));
+        assert!(signal_cancel(&waiting), "a queued job is cancellable");
+        assert!(
+            !ingest_jobs::is_pending(&queue, &waiting).expect("pending"),
+            "a cancelled job must never be handed to a worker"
+        );
+        let project_pool = super::super::project_db::open(&project_id).expect("project db");
+        let row = repository::get_ingest_job(&project_pool, &waiting)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, "cancelled");
+        assert_eq!(
+            repository::get_source(&project_pool, "src-1")
+                .expect("read")
+                .expect("source")
+                .status,
+            "cancelled"
+        );
+
+        // Claimed: the worker may live in another process, so the request is
+        // persisted on the row rather than resolved here.
+        let claimed = format!("job-{}", uuid::Uuid::new_v4());
+        start_job(queued_task(
+            &state, &project_id, &dir, &sha, &claimed, "claimed.rs",
+        ));
+        ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+            .expect("claim")
+            .expect("job");
+        assert!(signal_cancel(&claimed), "a claimed job is cancellable");
+        assert_eq!(
+            ingest_jobs::heartbeat(&queue, &claimed).expect("beat"),
+            ingest_jobs::JobLiveness::CancelRequested,
+            "the worker learns about the cancel at its next beat"
+        );
+        assert_eq!(
+            repository::get_ingest_job(&project_pool, &claimed)
+                .expect("read")
+                .expect("row")
+                .status,
+            "running",
+            "a claimed job is closed by its worker, not by the cancel"
+        );
+        ingest_jobs::finish(&queue, &claimed).expect("finish");
+    }
+
+    /// A panic OUTSIDE the pipeline — in `run_claimed` itself, where the
+    /// project database, the terminal read and the stream close live — must not
+    /// take the worker down with it. The job is recorded, the queue row goes,
+    /// and the SAME worker completes the next job.
+    #[tokio::test]
+    async fn a_panic_in_a_finalizer_records_the_job_and_spares_the_worker() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+
+        let worker = tokio::spawn(worker_loop());
+
+        let exploding = format!("job-{}", uuid::Uuid::new_v4());
+        PANIC_AFTER_PROJECT_OPEN.store(true, Ordering::SeqCst);
+        start_job(queued_task(
+            &state, &project_id, &dir, &sha, &exploding, "boom.rs",
+        ));
+        let row = await_terminal(&project_id, &exploding).await;
+        assert_eq!(row.status, "failed");
+        assert_eq!(row.error, PANIC_ERROR, "the panic is recorded, not swallowed");
+        assert!(
+            !ingest_jobs::is_pending(&queue, &exploding).expect("pending"),
+            "a panicked job must not stay claimed forever"
+        );
+
+        // The proof that the worker is alive: it claims and completes the next
+        // job. Before the guard, one panic ended ingest for the process.
+        let after = format!("job-{}", uuid::Uuid::new_v4());
+        start_job(queued_task(
+            &state, &project_id, &dir, &sha, &after, "after.rs",
+        ));
+        let next = await_terminal(&project_id, &after).await;
+        worker.abort();
+        assert_eq!(next.status, "success", "error: {}", next.error);
+    }
+
+    /// The crash window: the worker wrote the terminal project row and died
+    /// before deleting its queue row. The next startup sees a `running` row of
+    /// a dead instance — and must NOT rewrite a recorded success as
+    /// "interrupted by restart".
+    #[test]
+    fn reconciliation_never_rewrites_a_recorded_success() {
+        let (_guard, queue) = exclusive_queue();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        let project_pool = super::super::project_db::open(&project_id).expect("project db");
+        let file_id = repository::upsert_source_file(&project_pool, "src-1", "done.rs", &sha, 0, "text/x-rust")
+            .expect("file row");
+        repository::create_ingest_job(&project_pool, &job_id, "src-1", 1, "tester").expect("job row");
+
+        // What the worker had already done before the crash.
+        assert!(
+            repository::finish_ingest_job(&project_pool, &job_id, "success", "").expect("finish"),
+            "the first terminal write lands"
+        );
+        repository::set_source_status(&project_pool, "src-1", "ready", "").expect("source");
+
+        // What the crash left behind: a claimed row of a process run that is
+        // gone, holding the very payload the job succeeded with.
+        let payload = serde_json::to_string(&JobPayload {
+            org_id: "org-1".to_string(),
+            project_id: project_id.clone(),
+            dir_path: dir.clone(),
+            source_id: "src-1".to_string(),
+            job_id: job_id.clone(),
+            files: vec![FileWork {
+                file_id,
+                path: "done.rs".to_string(),
+                sha256: sha.clone(),
+                mime: "text/x-rust".to_string(),
+                payload: WorkPayload::Blob,
+            }],
+        })
+        .expect("payload");
+        {
+            let conn = queue.write().expect("write");
+            conn.execute(
+                "INSERT INTO ingest_jobs (job_id, queue, payload_json, status, owner_instance, \
+                 enqueued_at_ms, claimed_at_ms) VALUES (?1, ?2, ?3, 'running', 'gone-instance', 1, 1)",
+                rusqlite::params![job_id, ingest_jobs::QUEUE_PROJECT_STUDIO, payload],
+            )
+            .expect("orphan row");
+        }
+
+        reconcile_orphans();
+        recover_orphaned_jobs(&project_pool);
+
+        let row = repository::get_ingest_job(&project_pool, &job_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, "success", "a recorded success survives recovery");
+        assert_eq!(row.error, "");
+        assert_eq!(
+            repository::get_source(&project_pool, "src-1")
+                .expect("read")
+                .expect("source")
+                .status,
+            "ready",
+            "the source must not be relabelled either"
+        );
+        assert!(
+            !ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
+            "the stale queue row is still cleared"
+        );
     }
 
     #[test]

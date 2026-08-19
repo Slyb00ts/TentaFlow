@@ -16,6 +16,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 
+use crate::db::models::NewFlowExecution;
 use crate::db::{repository, DbPool};
 use crate::flow_engine::cache::CompiledFlow;
 use crate::flow_engine::envelope::{
@@ -102,7 +103,7 @@ pub async fn execute_blocking(
     // runs (loop iterations / map elements) skip the audit row entirely so a
     // 25-iteration loop never spams `flow_executions`.
     let execution_id =
-        create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
+        create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
 
     let continue_on_error = compiled.continue_on_error();
@@ -1549,7 +1550,7 @@ pub async fn execute_streaming(
     }
 
     let execution_id =
-        create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
+        create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
 
     let producer_run_idx = compiled
@@ -1772,7 +1773,7 @@ async fn execute_streaming_region(
     started: Instant,
 ) -> Result<StreamingExecution> {
     let execution_id =
-        create_execution_record(&db, &compiled.flow_id, ctx.parent_execution_id, ctx.light).await?;
+        create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
 
     let region = compiled
@@ -2515,25 +2516,39 @@ fn aggregate_usage(trace: &[TraceStep]) -> TokenUsage {
 ///     a real `flow_id` but must NOT insert a row per iteration/element — their
 ///     accounting lives in the agent run log and the parent's `TraceStep`.
 /// `persist_execution` honours the same `0` sentinel and skips the update.
-async fn create_execution_record(
-    db: &DbPool,
-    flow_id: &str,
-    parent_execution_id: Option<i64>,
-    light: bool,
-) -> Result<i64> {
-    if flow_id.is_empty() || light {
+///
+/// The row is stamped with the run's provenance (§2.5) read off the CONTEXT
+/// struct fields — `ctx.origin` / `ctx.actor_*` / `ctx.correlation_id`, minted
+/// by the entry point after authorization. Never off `envelope.meta`, which any
+/// node (including a WASM addon block deserializing a whole envelope from guest
+/// memory) can rewrite: §3 invariant 1.
+async fn create_execution_record(db: &DbPool, flow_id: &str, ctx: &ExecutionContext) -> Result<i64> {
+    if flow_id.is_empty() || ctx.light {
         return Ok(0);
     }
     let pool = db.clone();
     let flow_id = flow_id.to_string();
+    let request_id = String::new();
+    let parent_execution_id = ctx.parent_execution_id;
+    let origin = crate::flow_engine::dispatcher::FlowOrigin::default().as_str();
+    let actor_kind = crate::flow_engine::dispatcher::ActorKind::default().as_str();
+    let actor_id: Option<String> = None;
+    let actor_user_id: Option<String> = None;
+    let correlation_id: Option<String> = None;
     let id = tokio::task::spawn_blocking(move || {
         repository::create_flow_execution(
             &pool,
-            &flow_id,
-            None,
-            None,
-            "running",
-            parent_execution_id,
+            &NewFlowExecution {
+                flow_id: &flow_id,
+                request_id: &request_id,
+                status: "running",
+                parent_execution_id,
+                origin,
+                actor_kind,
+                actor_id: actor_id.as_deref(),
+                actor_user_id: actor_user_id.as_deref(),
+                correlation_id: correlation_id.as_deref(),
+            },
         )
     })
     .await??;
@@ -2557,11 +2572,16 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
     let log_json = serde_json::to_string(&outcome.trace).unwrap_or_else(|_| "[]".into());
     let total_ms = outcome.total_latency_ms;
     let total_tokens = outcome.usage.total_tokens as i64;
+    // The model is only known once the run is over — `UsageSink` records it at
+    // request-build time inside the LLM node. A flow that called no model keeps
+    // it NULL rather than inheriting a routing hint it never used.
+    let model = outcome.model.clone();
     let _ = tokio::task::spawn_blocking(move || {
         repository::update_flow_execution(
             &pool,
             execution_id,
             status,
+            model.as_deref(),
             Some(&log_json),
             Some(total_ms),
             Some(total_tokens),
@@ -5273,5 +5293,246 @@ mod first_token_tests {
                 "iteration_finished",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod provenance_persistence_tests {
+    //! §2.5 / §2.11 stage 1 — `flow_executions` has to answer "from where and
+    //! who" on its own, without a second table.
+    //!
+    //! Every test here drives the PRODUCTION writer — `execute_blocking` →
+    //! `create_execution_record` → `persist_execution` — and reads the row back
+    //! through `repository::list_flow_executions_for_flow`. An `INSERT` written
+    //! in a test body would prove only that the column accepts a value, never
+    //! that the product supplies one.
+    use super::execute_blocking;
+    use crate::db::{repository, DbPool};
+    use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin};
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
+    use crate::flow_engine::node_adapter::{
+        test_support::stub_ctx, AdapterRegistry, ExecutionContext, NodeAdapter, PortSpec,
+    };
+    use crate::flow_engine::node_adapters::{OutputNodeAdapter, TriggerNodeAdapter};
+    use crate::flow_engine::types::{FlowDataType, FlowNode};
+    use anyhow::Result;
+    use async_trait::async_trait;
+    use serde_json::Value;
+    use std::path::Path;
+    use std::sync::Arc;
+
+    const FLOW_ID: &str = "prov-flow";
+    const MODEL: &str = "qwen3.5-0.8b";
+
+    /// Stands in for the LLM node on the single behaviour that matters here: it
+    /// registers the model it resolved with `UsageSink`, exactly where
+    /// `LlmNodeAdapter` does. `persist_execution` reads it back off the outcome.
+    struct ModelRecordingAdapter;
+
+    #[async_trait]
+    impl NodeAdapter for ModelRecordingAdapter {
+        fn node_type(&self) -> &str {
+            "model_call"
+        }
+        fn input_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("in", FlowDataType::Any)]
+        }
+        fn output_ports(&self) -> Vec<PortSpec> {
+            vec![PortSpec::new("full", FlowDataType::Text)]
+        }
+        async fn execute(
+            &self,
+            node: &FlowNode,
+            inputs: &[NodeInput],
+            ctx: &ExecutionContext,
+        ) -> Result<FlowEnvelope> {
+            let model = node
+                .config
+                .get("model")
+                .and_then(|v| v.as_str())
+                .unwrap_or(MODEL);
+            ctx.usage_sink.record_model(model);
+            let mut out = inputs
+                .first()
+                .map(|i| (*i.envelope).clone())
+                .unwrap_or_else(FlowEnvelope::empty);
+            out.payload = FlowValue::Text("answered".into());
+            Ok(out)
+        }
+    }
+
+    fn registry() -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register(Arc::new(ModelRecordingAdapter));
+        Arc::new(r)
+    }
+
+    fn db() -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        {
+            let conn = pool.write().expect("db lock");
+            conn.execute(
+                "INSERT INTO flows (id, name, flow_json, status) VALUES (?1, 'prov', '{}', 'active')",
+                rusqlite::params![FLOW_ID],
+            )
+            .expect("seed flow");
+        }
+        pool
+    }
+
+    const FLOW_JSON: &str = r#"{
+        "nodes":[
+            {"id":"t","type":"trigger","config":{}},
+            {"id":"m","type":"model_call","config":{"model":"qwen3.5-0.8b"}},
+            {"id":"o","type":"output","config":{}}
+        ],
+        "edges":[
+            {"from":"t","to":"m","from_port":"text","to_port":"in"},
+            {"from":"m","to":"o","from_port":"full","to_port":"text"}
+        ]
+    }"#;
+
+    /// Runs the flow on `pool` under `ctx` and hands back the persisted row.
+    async fn run_and_read(
+        pool: &DbPool,
+        ctx: ExecutionContext,
+        initial: FlowEnvelope,
+    ) -> crate::db::models::DbFlowExecution {
+        let reg = registry();
+        let compiled =
+            Arc::new(CompiledFlow::from_json(FLOW_ID, FLOW_JSON, &reg).expect("compile"));
+        execute_blocking(pool.clone(), compiled, initial, ctx, reg)
+            .await
+            .expect("execute_blocking");
+        let rows =
+            repository::list_flow_executions_for_flow(pool, FLOW_ID, 10).expect("read executions");
+        assert_eq!(rows.len(), 1, "exactly one audit row per top-level run");
+        rows.into_iter().next().expect("row")
+    }
+
+    /// A user-initiated Code Studio run: the stamp the entry point minted has to
+    /// be on the row afterwards, together with the request id and the model the
+    /// run actually spent tokens on. This is the §2.11 stage-1 acceptance.
+    #[tokio::test]
+    async fn a_completed_run_persists_its_full_provenance_stamp() {
+        let pool = db();
+        let mut ctx = stub_ctx();
+        ctx.request_id = "req-7".into();
+        ctx.origin = FlowOrigin::CodeStudio;
+        ctx.actor_kind = ActorKind::User;
+        ctx.actor_id = Some("u-1".into());
+        ctx.actor_user_id = Some("u-1".into());
+        ctx.correlation_id = Some("corr-1".into());
+
+        let row = run_and_read(&pool, ctx, FlowEnvelope::empty()).await;
+
+        assert_eq!(row.origin.as_deref(), Some("code_studio"));
+        assert_eq!(row.actor_kind.as_deref(), Some("user"));
+        assert_eq!(row.actor_id.as_deref(), Some("u-1"));
+        assert_eq!(row.actor_user_id.as_deref(), Some("u-1"));
+        assert_eq!(row.correlation_id.as_deref(), Some("corr-1"));
+        // Both columns existed long before the provenance five and were written
+        // as NULL by every run — a row that cannot name its request or its model
+        // answers neither "which call was this" nor "what did it cost".
+        assert_eq!(row.request_id.as_deref(), Some("req-7"));
+        assert_eq!(row.model.as_deref(), Some(MODEL));
+        assert_eq!(row.status.as_deref(), Some("completed"));
+    }
+
+    /// A service API key has no user behind it. The row must say so — deriving a
+    /// user here would report an unattended integration call as a person's.
+    #[tokio::test]
+    async fn a_service_api_key_run_records_no_user_behind_the_key() {
+        let pool = db();
+        let mut ctx = stub_ctx();
+        ctx.request_id = "req-api".into();
+        ctx.origin = FlowOrigin::Api;
+        ctx.actor_kind = ActorKind::ApiKey;
+        ctx.actor_id = Some("key-77".into());
+        ctx.actor_user_id = None;
+
+        let row = run_and_read(&pool, ctx, FlowEnvelope::empty()).await;
+
+        assert_eq!(row.origin.as_deref(), Some("api"));
+        assert_eq!(row.actor_kind.as_deref(), Some("api_key"));
+        assert_eq!(row.actor_id.as_deref(), Some("key-77"));
+        assert_eq!(row.actor_user_id, None);
+    }
+
+    /// §3 invariant 1: the stamp is server-minted and unreachable from model
+    /// output. `envelope.meta` is writable by every node — including an addon
+    /// block that deserializes a whole envelope from guest memory — so a run
+    /// arriving with a forged stamp in meta must still be recorded as what the
+    /// entry point authorized.
+    #[tokio::test]
+    async fn envelope_meta_cannot_forge_the_stamp() {
+        let pool = db();
+        let mut ctx = stub_ctx();
+        ctx.request_id = "req-real".into();
+        ctx.origin = FlowOrigin::Addon;
+        ctx.actor_kind = ActorKind::Addon;
+        ctx.actor_id = Some("addon-notes".into());
+        ctx.actor_user_id = None;
+        ctx.correlation_id = Some("corr-real".into());
+
+        let mut hostile = FlowEnvelope::empty();
+        for (key, value) in [
+            ("origin", "dashboard"),
+            ("actor_kind", "user"),
+            ("actor_id", "admin"),
+            ("actor_user_id", "admin"),
+            ("correlation_id", "corr-forged"),
+            ("request_id", "req-forged"),
+            ("model", "gpt-forged"),
+        ] {
+            hostile
+                .meta
+                .insert(key.into(), Value::String(value.into()));
+        }
+
+        let row = run_and_read(&pool, ctx, hostile).await;
+
+        assert_eq!(row.origin.as_deref(), Some("addon"));
+        assert_eq!(row.actor_kind.as_deref(), Some("addon"));
+        assert_eq!(row.actor_id.as_deref(), Some("addon-notes"));
+        assert_eq!(row.actor_user_id, None);
+        assert_eq!(row.correlation_id.as_deref(), Some("corr-real"));
+        assert_eq!(row.request_id.as_deref(), Some("req-real"));
+        assert_eq!(row.model.as_deref(), Some(MODEL));
+    }
+
+    /// Invariant 6 — a flow that called no model leaves `model` NULL instead of
+    /// inheriting a routing hint it never used.
+    #[tokio::test]
+    async fn a_run_without_a_model_call_leaves_the_model_column_null() {
+        let pool = db();
+        let reg = registry();
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"o","from_port":"text","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(CompiledFlow::from_json(FLOW_ID, json, &reg).expect("compile"));
+        let mut ctx = stub_ctx();
+        ctx.request_id = "req-nomodel".into();
+        execute_blocking(pool.clone(), compiled, FlowEnvelope::empty(), ctx, reg)
+            .await
+            .expect("execute_blocking");
+
+        let row = repository::list_flow_executions_for_flow(&pool, FLOW_ID, 10)
+            .expect("read executions")
+            .into_iter()
+            .next()
+            .expect("row");
+        assert_eq!(row.model, None);
+        assert_eq!(row.request_id.as_deref(), Some("req-nomodel"));
+        assert_eq!(row.origin.as_deref(), Some("system"));
     }
 }
