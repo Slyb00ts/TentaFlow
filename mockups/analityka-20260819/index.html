@@ -1,0 +1,59 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka: mockupy 2026-08</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .list { max-width: 980px; margin: 40px auto; padding: 0 24px; }
+  .list h1 { font-size: 26px; font-weight: 800; margin-bottom: 6px;
+    background: var(--gradient-logo); -webkit-background-clip: text; background-clip: text;
+    -webkit-text-fill-color: transparent; }
+  .lead { color: var(--text-2); font-size: 14px; line-height: 1.7; margin-bottom: 22px; max-width: 820px; }
+  .mock-link { display: flex; align-items: center; gap: 14px; background: var(--bg-card);
+    border: 1px solid var(--border); border-radius: var(--radius); padding: 15px 18px;
+    margin-bottom: 10px; transition: all .15s; color: var(--text); animation: rise .4s both; }
+  .mock-link:hover { border-color: var(--accent-1); transform: translateX(4px); background: var(--bg-card-hover); }
+  .mock-link .num { background: var(--gradient-accent); color: #fff; font-weight: 800; font-size: 12px;
+    padding: 4px 10px; border-radius: 20px; flex-shrink: 0; }
+  .mock-link .t { font-weight: 800; font-size: 14px; }
+  .mock-link .d { font-size: 12px; color: var(--text-3); margin-top: 2px; }
+  .rules { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; margin: 22px 0 28px; }
+  .rule { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 14px 16px; }
+  .rule h3 { font-size: 11px; text-transform: uppercase; letter-spacing: .1em; color: var(--accent-2); margin-bottom: 7px; }
+  .rule p { font-size: 12px; color: var(--text-2); line-height: 1.6; }
+  @media (max-width: 800px) { .rules { grid-template-columns: 1fr; } }
+</style>
+</head>
+<body>
+<div class="list">
+  <h1>Analityka — unifikacja dwóch ekranów</h1>
+  <p class="lead">„Analityka modeli" + „Zużycie tokenów" → jeden ekran <b>Analityka</b> z sześcioma zakładkami
+  i drill-downem. Pełna diagnoza i decyzje: <a href="SPEC.md">SPEC.md</a>.</p>
+
+  <div class="rules">
+    <div class="rule"><h3>Nazwy, nie UUID</h3><p>User/grupa/node/model zawsze po ludzku (display_name z Core),
+      ID skrócone drugim wierszem. Status noda z last_seen_at, nie hardkod.</p></div>
+    <div class="rule"><h3>Adaptacyjne jednostki</h3><p>842 · 12,4 tys · 121 mln · 3,2 mld — pełna wartość w tooltipie.
+      Wyjątek: Rozliczenia zawsze dokładnie (podstawa faktur).</p></div>
+    <div class="rule"><h3>Szybko i animowane</h3><p>Zero zewnętrznych bibliotek. Rozbudowa TfCartesianChart:
+      animacje transform/opacity, count-up KPI przez rAF, tooltip + crosshair, prefers-reduced-motion.</p></div>
+  </div>
+
+  <a class="mock-link" href="m01-przeglad.html"><span class="num">M01</span>
+    <div><div class="t">Przegląd</div><div class="d">KPI z count-upem · stacked wykres z tooltipem · top modele/userzy/nody z nazwami</div></div></a>
+  <a class="mock-link d1" href="m02-drilldown.html"><span class="num">M02</span>
+    <div><div class="t">Drill-down użytkownika</div><div class="d">breadcrumb · karta encji · per model · per node · trend okresów</div></div></a>
+  <a class="mock-link d2" href="m03-modele.html"><span class="num">M03</span>
+    <div><div class="t">Modele</div><div class="d">percentyle TTFT/decode · porównanie model×node×backend</div></div></a>
+  <a class="mock-link d3" href="m04-nody.html"><span class="num">M04</span>
+    <div><div class="t">Nody i serwisy</div><div class="d">realny liveness (pulsująca kropka) · nazwy nodów · per-serwis tabele</div></div></a>
+  <a class="mock-link d4" href="m05-limity.html"><span class="num">M05</span>
+    <div><div class="t">Limity</div><div class="d">quoty z paskami zużycie/limit · koordynator dzierżaw jako podsekcja</div></div></a>
+  <a class="mock-link d5" href="m06-rozliczenia.html"><span class="num">M06</span>
+    <div><div class="t">Rozliczenia</div><div class="d">dokładne kwoty · struktura kosztów · edytor cennika z wyróżnieniem braków</div></div></a>
+</div>
+</body>
+</html>

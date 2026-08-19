@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka · Przegląd (M01)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+</head>
+<body>
+
+<div class="screen">
+  <div class="screen-header"><span class="num">M01</span><h2>Analityka · Przegląd</h2>
+    <div class="desc">Jeden ekran zamiast dwóch. KPI z count-upem, adaptacyjne jednostki (121 mln, nie 121000000),
+    wykres z tooltipem i legendą, top-listy z NAZWAMI zamiast UUID. Klik w wiersz = drill-down (M02).</div></div>
+  <div class="screen-frame"><div class="app" id="app"></div></div>
+</div>
+
+<template id="tpl">
+<main class="main">
+  <div class="page-head">
+    <div><div class="page-title">Analityka</div>
+      <div class="page-sub">Użycie i wydajność modeli w całym meshu — użytkownicy, modele, nody, limity, rozliczenia</div></div>
+    <button class="btn ghost">⭳ Eksport CSV</button>
+  </div>
+
+  <!--TABS-->
+
+  <div class="an-toolbar">
+    <span class="fl-label">Okres</span>
+    <div class="seg"><button>Godzina</button><button>Dzień</button><button class="on">Miesiąc</button></div>
+    <div class="sel">2026-08 <span class="car">▾</span></div>
+    <span class="fl-sep"></span>
+    <span class="fl-label">Node</span>
+    <div class="sel">Wszystkie nody <span class="car">▾</span></div>
+    <span class="fl-label">Model</span>
+    <div class="sel">Wszystkie modele <span class="car">▾</span></div>
+    <span class="spacer"></span>
+    <span class="chip acc"><span class="dot live"></span> mesh · 3 nody · live</span>
+  </div>
+
+  <div class="an-kpi-grid">
+    <div class="kpi d1"><div class="k-label">◱ Total tokenów</div>
+      <div class="k-value"><span data-count="121437285"></span></div>
+      <div class="k-sub"><span class="up">▲ 18%</span> vs 2026-07</div>
+      <div class="k-spark" data-spark="20,26,22,31,38,35,47,52,49,61"></div></div>
+    <div class="kpi d2"><div class="k-label">▤ Zapytania</div>
+      <div class="k-value"><span data-count="48213"></span></div>
+      <div class="k-sub">błędy: 41 · <span class="up">99,9% OK</span></div>
+      <div class="k-spark" data-spark="12,15,13,18,22,20,27,30,28,34"></div></div>
+    <div class="kpi d3"><div class="k-label">◷ TTFT p50</div>
+      <div class="k-value">204<span class="unit">ms</span></div>
+      <div class="k-sub">p90 512 ms · p99 1,4 s</div></div>
+    <div class="kpi d4"><div class="k-label">⚡ Decode p50</div>
+      <div class="k-value">118<span class="unit">tok/s</span></div>
+      <div class="k-sub">p90 152 · p99 159</div></div>
+    <div class="kpi d5"><div class="k-label">△ Błędy</div>
+      <div class="k-value">0,08<span class="unit">%</span></div>
+      <div class="k-sub">41 / 48 213 zapytań</div></div>
+    <div class="kpi d6"><div class="k-label">◈ Koszt</div>
+      <div class="k-value">2 418<span class="unit">zł</span></div>
+      <div class="k-sub"><span class="chip warn" style="font-size:9.5px">2 modele bez cennika</span></div></div>
+  </div>
+
+  <div class="an-card d2">
+    <div class="c-head"><h3>Tokeny w czasie</h3>
+      <div class="legend" style="margin-left:auto">
+        <span><span class="sw" style="background:var(--accent-2)"></span>prompt</span>
+        <span><span class="sw" style="background:var(--accent-1)"></span>completion</span></div>
+      <div class="hint">najedź na słupek — pełne wartości</div></div>
+    <div class="c-body"><div id="chart"></div></div>
+  </div>
+
+  <div class="an-grid cols-3">
+    <div class="an-card d3">
+      <div class="c-head"><h3>Top modele</h3><div class="hint">udział tokenów</div></div>
+      <table class="an-table"><tbody>
+        <tr><td><div class="ent"><div class="av a1">Q</div><div><div class="cell-title">Qwen 3.8 27B AWQ</div>
+          <div class="cell-sub">cyankiwi/Qwen3.8-27B-AWQ-INT4</div></div></div></td>
+          <td class="num" title="67 812 004">67,8 mln</td>
+          <td><div class="share"><div class="bar"><i style="width:56%"></i></div><span class="pct">56%</span></div></td></tr>
+        <tr><td><div class="ent"><div class="av a2">G</div><div><div class="cell-title">GLM-5-Air</div>
+          <div class="cell-sub">zai-org/GLM-5-Air</div></div></div></td>
+          <td class="num" title="38 145 220">38,1 mln</td>
+          <td><div class="share"><div class="bar"><i style="width:31%;animation-delay:.1s"></i></div><span class="pct">31%</span></div></td></tr>
+        <tr><td><div class="ent"><div class="av a3">W</div><div><div class="cell-title">Whisper large-v3</div>
+          <div class="cell-sub">whisper · STT</div></div></div></td>
+          <td class="num" title="15 480 061">15,5 mln</td>
+          <td><div class="share"><div class="bar"><i style="width:13%;animation-delay:.2s"></i></div><span class="pct">13%</span></div></td></tr>
+      </tbody></table>
+      <div class="an-tfoot"><span>3 modele</span><span>Σ 121,4 mln tok</span></div>
+    </div>
+
+    <div class="an-card d4">
+      <div class="c-head"><h3>Top użytkownicy</h3><div class="hint">klik = szczegóły</div></div>
+      <table class="an-table"><tbody>
+        <tr onclick="location='m02-drilldown.html'"><td><div class="ent"><div>
+          <div class="cell-title">Marta Kowalczyk</div><div class="cell-sub">marta.k@firma.pl</div></div></div></td>
+          <td class="num" title="52 108 440">52,1 mln</td><td class="num" style="color:var(--text-2)">1 044 zł</td></tr>
+        <tr><td><div class="ent"><div>
+          <div class="cell-title">Piotr Wiśniewski</div><div class="cell-sub">piotr.w@firma.pl</div></div></div></td>
+          <td class="num" title="34 902 118">34,9 mln</td><td class="num" style="color:var(--text-2)">712 zł</td></tr>
+        <tr><td><div class="ent"><div>
+          <div class="cell-title">admin</div><div class="cell-sub">konto systemowe</div></div></div></td>
+          <td class="num" title="21 355 019">21,4 mln</td><td class="num" style="color:var(--text-2)">402 zł</td></tr>
+      </tbody></table>
+      <div class="an-tfoot"><span>14 użytkowników</span><span>pełna lista → zakładka</span></div>
+    </div>
+
+    <div class="an-card d5">
+      <div class="c-head"><h3>Top nody</h3><div class="hint">produkcja tokenów</div></div>
+      <table class="an-table"><tbody>
+        <tr><td><div class="ent"><div class="av node"><span class="dot live"></span></div><div>
+          <div class="cell-title">hazai</div><div class="cell-sub">d91a7a85…3967</div></div></div></td>
+          <td class="num" title="98 004 116">98 mln</td><td><span class="chip ok">online</span></td></tr>
+        <tr><td><div class="ent"><div class="av node"><span class="dot live"></span></div><div>
+          <div class="cell-title">biuro-mini</div><div class="cell-sub">7c02be11…8aa2</div></div></div></td>
+          <td class="num" title="19 861 300">19,9 mln</td><td><span class="chip ok">online</span></td></tr>
+        <tr><td><div class="ent"><div class="av node"><span class="dot off"></span></div><div>
+          <div class="cell-title">laptop-pw</div><div class="cell-sub">33f1c904…be77</div></div></div></td>
+          <td class="num" title="3 571 869">3,6 mln</td><td><span class="chip">2 h temu</span></td></tr>
+      </tbody></table>
+      <div class="an-tfoot"><span>3 nody</span><span>liveness z sync_nodes.last_seen_at</span></div>
+    </div>
+  </div>
+</main>
+</template>
+
+<script src="shared/mock.js"></script>
+<script>
+  const app = document.getElementById('app');
+  app.innerHTML = Mock.shell('analytics') + document.getElementById('tpl').innerHTML
+    .replace('<!--TABS-->', Mock.tabs('przeglad'));
+
+  // KPI count-up + sparklines
+  document.querySelectorAll('[data-count]').forEach(el => Mock.countUp(el, +el.dataset.count));
+  document.querySelectorAll('[data-spark]').forEach(el =>
+    el.innerHTML = Mock.sparkline(el.dataset.spark.split(',').map(Number)));
+
+  // Wykres: sierpień, dzień po dniu (prompt/completion)
+  const days = [], base = [3.1,2.8,3.4,4.0,3.7,2.1,1.8,4.2,4.6,4.1,4.9,5.2,4.4,2.3,2.0,5.1,5.6,5.9,6.4];
+  base.forEach((v, i) => days.push({
+    label: String(i + 1).padStart(2, '0') + '.08',
+    a: Math.round(v * 420000), b: Math.round(v * 260000),
+  }));
+  Mock.stackedBars(document.getElementById('chart'), days,
+    { colors: ['var(--accent-2)', 'var(--accent-1)'], height: 250 });
+</script>
+</body>
+</html>

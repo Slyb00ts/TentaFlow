@@ -15,6 +15,8 @@
 //       `mono` switches the chip to the monospace face with normal casing —
 //       the pair used for machine-readable context (branch name, mode, profile)
 //       that must stay legible character by character.
+//       `variant="outline"` keeps the status pill but renders it sentence-case
+//       with a tinted 1px border (.tf-chip--outline).
 // Przyklad: <tf-chip status="online" dot>Online</tf-chip>
 //           <tf-chip mono icon="branch">cs/piotr/9f2a1c4b</tf-chip>
 // =============================================================================
@@ -116,6 +118,7 @@ class TfChip extends HTMLElement {
     const hasDot = this.hasAttribute('dot');
     const icon = safeIconName(this.getAttribute('icon'));
     const cls = ['tf-chip'];
+    if ((this.getAttribute('variant') || '') === 'outline') cls.push('tf-chip--outline');
     if (STATUS_CLASSES.has(status)) cls.push(status);
     else cls.push('info');
     // Tryb klikalny — chip moze pelnic role filtra/togglera. Klasy 'clickable'

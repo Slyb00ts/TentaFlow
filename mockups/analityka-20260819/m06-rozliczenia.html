@@ -1,0 +1,138 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka · Rozliczenia (M06)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .price-in { display: inline-flex; align-items: center; gap: 6px; background: var(--bg-input);
+    border: 1px solid var(--border); border-radius: var(--radius-sm); padding: 5px 9px;
+    font-size: 12px; width: 108px; justify-content: space-between; }
+  .price-in b { font-variant-numeric: tabular-nums; }
+  .price-in span { font-size: 9.5px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<div class="screen">
+  <div class="screen-header"><span class="num">M06</span><h2>Analityka · Rozliczenia</h2>
+    <div class="desc">Tu liczby są DOKŁADNE (separator tysięcy, bez skracania) — podstawa faktur.
+    Cennik pod spodem; model bez cennika podświetlony, jego koszt oznaczony „~".</div></div>
+  <div class="screen-frame"><div class="app" id="app"></div></div>
+</div>
+
+<template id="tpl">
+<main class="main">
+  <div class="page-head">
+    <div><div class="page-title">Analityka</div>
+      <div class="page-sub">Użycie i wydajność modeli w całym meshu</div></div>
+    <button class="btn ghost">⭳ Eksport CSV</button>
+  </div>
+
+  <!--TABS-->
+
+  <div class="an-toolbar">
+    <span class="fl-label">Okres</span>
+    <div class="seg"><button>Dzień</button><button class="on">Miesiąc</button></div>
+    <div class="sel">2026-08 <span class="car">▾</span></div>
+    <span class="fl-sep"></span>
+    <span class="fl-label">Rozliczaj wg</span>
+    <div class="seg"><button class="on">Użytkownik</button><button>Grupa</button></div>
+    <span class="spacer"></span>
+    <span class="chip warn">2 modele bez cennika — koszt częściowy</span>
+  </div>
+
+  <div class="an-grid cols-21">
+    <div class="an-card d1">
+      <div class="c-head"><h3>Koszty wg użytkownika · 2026-08</h3><div class="hint">wartości dokładne</div></div>
+      <table class="an-table">
+        <thead><tr><th>Użytkownik</th><th class="num">Tokeny</th><th class="num">Zapytania</th>
+          <th class="num">Koszt</th><th>Udział kosztów</th></tr></thead>
+        <tbody>
+          <tr><td><div class="ent"><div><div class="cell-title">Marta Kowalczyk</div>
+            <div class="cell-sub">marta.k@firma.pl</div></div></div></td>
+            <td class="num">52 108 440</td><td class="num">18 344</td><td class="num"><b>1 044,18 zł</b></td>
+            <td><div class="share"><div class="bar"><i style="width:43%"></i></div><span class="pct">43%</span></div></td></tr>
+          <tr><td><div class="ent"><div><div class="cell-title">Piotr Wiśniewski</div>
+            <div class="cell-sub">piotr.w@firma.pl</div></div></div></td>
+            <td class="num">34 902 118</td><td class="num">12 019</td><td class="num"><b>712,05 zł</b></td>
+            <td><div class="share"><div class="bar"><i style="width:29%;animation-delay:.08s"></i></div><span class="pct">29%</span></div></td></tr>
+          <tr><td><div class="ent"><div><div class="cell-title">admin</div>
+            <div class="cell-sub">konto systemowe</div></div></div></td>
+            <td class="num">21 355 019</td><td class="num">9 858</td><td class="num"><b>402,71 zł</b></td>
+            <td><div class="share"><div class="bar"><i style="width:17%;animation-delay:.16s"></i></div><span class="pct">17%</span></div></td></tr>
+          <tr><td><div class="ent"><div><div class="cell-title">Janek Nowak</div>
+            <div class="cell-sub">janek.n@firma.pl</div></div></div></td>
+            <td class="num">13 071 708</td><td class="num">7 992</td><td class="num"><b>259,40 zł</b> <span title="część użycia na modelu bez cennika">⚠</span></td>
+            <td><div class="share"><div class="bar"><i style="width:11%;animation-delay:.24s"></i></div><span class="pct">11%</span></div></td></tr>
+        </tbody>
+      </table>
+      <div class="an-tfoot"><span>14 użytkowników</span><span><b>Σ 2 418,34 zł</b> · częściowe (2 modele bez cennika)</span></div>
+    </div>
+
+    <div class="an-card d2">
+      <div class="c-head"><h3>Struktura kosztów</h3><div class="hint">wg modelu</div></div>
+      <div class="c-body">
+        <table class="an-table" style="font-size:12px">
+          <tbody>
+            <tr><td><div class="cell-title">Qwen 3.8 27B AWQ</div></td>
+              <td class="num">1 412,90 zł</td>
+              <td><div class="share"><div class="bar"><i style="width:58%"></i></div><span class="pct">58%</span></div></td></tr>
+            <tr><td><div class="cell-title">GLM-5-Air</div></td>
+              <td class="num">958,12 zł</td>
+              <td><div class="share"><div class="bar"><i style="width:40%;animation-delay:.1s"></i></div><span class="pct">40%</span></div></td></tr>
+            <tr><td><div class="cell-title">embeddings-bge</div></td>
+              <td class="num">47,32 zł</td>
+              <td><div class="share"><div class="bar"><i style="width:2%;animation-delay:.2s"></i></div><span class="pct">2%</span></div></td></tr>
+            <tr style="opacity:.6"><td><div class="cell-title">Whisper large-v3</div>
+              <div class="cell-sub">brak cennika</div></td>
+              <td class="num">~0 zł ⚠</td><td></td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+
+  <div class="an-card d3">
+    <div class="c-head"><h3>Cennik modeli</h3>
+      <div class="hint">stawki za 1 tys tokenów · audio za minutę · obraz za sztukę · zapis per wiersz</div></div>
+    <table class="an-table">
+      <thead><tr><th>Model</th><th class="num">Prompt / 1 tys</th><th class="num">Completion / 1 tys</th>
+        <th class="num">Audio / min</th><th class="num">Obraz / szt</th><th style="width:90px"></th></tr></thead>
+      <tbody>
+        <tr><td><div class="cell-title">Qwen 3.8 27B AWQ</div><div class="cell-sub">cyankiwi/Qwen3.8-27B-AWQ-INT4</div></td>
+          <td class="num"><span class="price-in"><b>0,0180</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b>0,0290</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b>—</b></span></td>
+          <td class="num"><span class="price-in"><b>—</b></span></td>
+          <td><button class="btn" style="padding:5px 12px">Zapisz</button></td></tr>
+        <tr><td><div class="cell-title">GLM-5-Air</div><div class="cell-sub">zai-org/GLM-5-Air</div></td>
+          <td class="num"><span class="price-in"><b>0,0210</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b>0,0340</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b>—</b></span></td>
+          <td class="num"><span class="price-in"><b>—</b></span></td>
+          <td><button class="btn" style="padding:5px 12px">Zapisz</button></td></tr>
+        <tr style="background:rgba(245,158,11,.05)">
+          <td><div class="cell-title">Whisper large-v3 <span class="chip warn" style="margin-left:6px">bez cennika</span></div>
+          <div class="cell-sub">whisper · STT</div></td>
+          <td class="num"><span class="price-in"><b style="color:var(--text-3)">0,0000</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b style="color:var(--text-3)">0,0000</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b style="color:var(--text-3)">0,0000</b><span>zł</span></span></td>
+          <td class="num"><span class="price-in"><b>—</b></span></td>
+          <td><button class="btn primary" style="padding:5px 12px">Zapisz</button></td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>4 modele w katalogu</span><span>koszt = prompt·st. + completion·st. + audio + obrazy</span></div>
+  </div>
+</main>
+</template>
+
+<script src="shared/mock.js"></script>
+<script>
+  document.getElementById('app').innerHTML = Mock.shell('analytics')
+    + document.getElementById('tpl').innerHTML.replace('<!--TABS-->', Mock.tabs('billing'));
+</script>
+</body>
+</html>

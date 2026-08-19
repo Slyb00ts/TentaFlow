@@ -1,0 +1,127 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka · Limity (M05)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .q-usage { display: flex; align-items: center; gap: 10px; }
+  .q-usage .q-nums { font-size: 11px; color: var(--text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+  .coord-head { display: flex; align-items: center; gap: 10px; }
+</style>
+</head>
+<body>
+
+<div class="screen">
+  <div class="screen-header"><span class="num">M05</span><h2>Analityka · Limity</h2>
+    <div class="desc">Quoty + koordynator dzierżaw w JEDNEJ zakładce. Każdy limit pokazuje ŻYWE zużycie vs limit
+    (pasek zielony/żółty/czerwony), podmioty po nazwach. Dzierżawy jako podsekcja, nie osobny ekran.</div></div>
+  <div class="screen-frame"><div class="app" id="app"></div></div>
+</div>
+
+<template id="tpl">
+<main class="main">
+  <div class="page-head">
+    <div><div class="page-title">Analityka</div>
+      <div class="page-sub">Użycie i wydajność modeli w całym meshu</div></div>
+    <button class="btn primary">+ Nowy limit</button>
+  </div>
+
+  <!--TABS-->
+
+  <div class="an-toolbar">
+    <span class="fl-label">Okres</span>
+    <div class="seg"><button class="on">Dzienny</button><button>Miesięczny</button></div>
+    <span class="fl-sep"></span>
+    <span class="fl-label">Zakres</span>
+    <div class="sel">Wszystkie zakresy <span class="car">▾</span></div>
+    <span class="spacer"></span>
+    <span class="chip acc">egzekwowanie: AI gateway · live</span>
+  </div>
+
+  <div class="an-card d1">
+    <div class="c-head"><h3>Limity tokenów</h3><div class="hint">zużycie liczone w bieżącym okresie limitu</div></div>
+    <table class="an-table">
+      <thead><tr><th>Zakres</th><th>Podmiot</th><th>Model</th><th>Okres</th>
+        <th>Zużycie / limit</th><th>Status</th><th style="width:70px"></th></tr></thead>
+      <tbody>
+        <tr>
+          <td><span class="chip acc">użytkownik</span></td>
+          <td><div class="ent"><div><div class="cell-title">Marta Kowalczyk</div>
+            <div class="cell-sub">marta.k@firma.pl</div></div></div></td>
+          <td class="cell-title">wszystkie</td><td>dzienny</td>
+          <td><div class="q-usage"><div class="quota-bar"><i class="warn" style="width:78%"></i></div>
+            <span class="q-nums" title="1 872 000 / 2 400 000">1,9 mln / 2,4 mln · 78%</span></div></td>
+          <td><span class="chip warn">blisko limitu</span></td>
+          <td><button class="btn ghost" style="padding:4px 8px">✎</button></td>
+        </tr>
+        <tr>
+          <td><span class="chip acc">grupa</span></td>
+          <td><div class="ent"><div><div class="cell-title">Marketing</div>
+            <div class="cell-sub">6 członków</div></div></div></td>
+          <td><div class="cell-title">Qwen 3.8 27B AWQ</div></td><td>miesięczny</td>
+          <td><div class="q-usage"><div class="quota-bar"><i class="ok" style="width:41%;animation-delay:.08s"></i></div>
+            <span class="q-nums" title="20 500 000 / 50 000 000">20,5 mln / 50 mln · 41%</span></div></td>
+          <td><span class="chip ok">aktywny</span></td>
+          <td><button class="btn ghost" style="padding:4px 8px">✎</button></td>
+        </tr>
+        <tr>
+          <td><span class="chip acc">org</span></td>
+          <td><div class="cell-title">Cała organizacja</div></td>
+          <td class="cell-title">wszystkie</td><td>miesięczny</td>
+          <td><div class="q-usage"><div class="quota-bar"><i class="err" style="width:97%;animation-delay:.16s"></i></div>
+            <span class="q-nums" title="121 437 285 / 125 000 000">121,4 mln / 125 mln · 97%</span></div></td>
+          <td><span class="chip err">97% — alarm</span></td>
+          <td><button class="btn ghost" style="padding:4px 8px">✎</button></td>
+        </tr>
+        <tr style="opacity:.55">
+          <td><span class="chip">model</span></td>
+          <td><div class="cell-title">—</div></td>
+          <td><div class="cell-title">GLM-5-Air</div></td><td>dzienny</td>
+          <td><div class="q-usage"><div class="quota-bar"><i class="ok" style="width:12%;animation-delay:.24s"></i></div>
+            <span class="q-nums">602 tys / 5 mln · 12%</span></div></td>
+          <td><span class="chip">wyłączony</span></td>
+          <td><button class="btn ghost" style="padding:4px 8px">✎</button></td>
+        </tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>4 limity · 3 aktywne</span><span>przekroczenie = 429 z Retry-After w AI gateway</span></div>
+  </div>
+
+  <div class="an-card d3">
+    <div class="c-head coord-head"><h3>Koordynator dzierżaw</h3>
+      <span class="chip ok"><span class="dot live"></span> hazai</span>
+      <span class="chip">elekcja HRW · lease 30 s · TTL 120 s</span>
+      <div class="hint">dzierżawy dzielą pulę limitu między nody meshu</div></div>
+    <table class="an-table">
+      <thead><tr><th>Limit</th><th>Node</th><th>Okres</th><th class="num">Zużycie bazowe</th>
+        <th class="num">Przyznane</th><th class="num">Wygasa</th></tr></thead>
+      <tbody>
+        <tr><td><div class="cell-title">org · miesięczny</div><div class="cell-sub">q-88c1…04f2</div></td>
+          <td><div class="cell-title">hazai</div><div class="cell-sub">d91a7a85…3967</div></td>
+          <td>2026-08</td><td class="num" title="98 004 116">98 mln</td>
+          <td class="num" title="2 100 000">2,1 mln</td><td class="num">za 26 s</td></tr>
+        <tr><td><div class="cell-title">org · miesięczny</div><div class="cell-sub">q-88c1…04f2</div></td>
+          <td><div class="cell-title">biuro-mini</div><div class="cell-sub">7c02be11…8aa2</div></td>
+          <td>2026-08</td><td class="num" title="19 861 300">19,9 mln</td>
+          <td class="num" title="1 000 000">1 mln</td><td class="num">za 26 s</td></tr>
+        <tr><td><div class="cell-title">Marta K. · dzienny</div><div class="cell-sub">q-3a90…bb17</div></td>
+          <td><div class="cell-title">hazai</div><div class="cell-sub">d91a7a85…3967</div></td>
+          <td>2026-08-19</td><td class="num" title="1 872 000">1,9 mln</td>
+          <td class="num">264 tys</td><td class="num">za 12 s</td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>3 aktywne dzierżawy</span><span>min_lease 1 000 tok · flush co 60 s</span></div>
+  </div>
+</main>
+</template>
+
+<script src="shared/mock.js"></script>
+<script>
+  document.getElementById('app').innerHTML = Mock.shell('analytics')
+    + document.getElementById('tpl').innerHTML.replace('<!--TABS-->', Mock.tabs('limits'));
+</script>
+</body>
+</html>

@@ -13,8 +13,10 @@ const fs = require('fs');
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
 // Cargo uses a shared target dir for all crates (.cargo/config.toml:
-// target-dir = "target_shared" at repo root). Prefer release, accept debug.
+// target-dir = "target_shared" at repo root). Prefer release-fast (the
+// profile used for fresh dev builds), then release, accept debug.
 const BINARY_CANDIDATES = [
+  path.join(__dirname, '../../../target_shared/release-fast/tentaflow'),
   path.join(__dirname, '../../../target_shared/release/tentaflow'),
   path.join(__dirname, '../../../target_shared/debug/tentaflow'),
 ];
@@ -119,12 +121,22 @@ function registerCleanup(child) {
   process.on('uncaughtException', cleanup);
 }
 
-function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog = 'warn' } = {}) {
-  removeDbFiles(db);
+// `home` sets TENTAFLOW_HOME so the instance keeps its own data dir (the
+// embedded Fjall sync ledger holds an exclusive lock — a second instance
+// sharing the default home fails with "FjallError: Locked"). `keepDb` skips
+// the sqlite wipe so a seeded database survives a restart. `env` adds extra
+// environment variables (e.g. TENTAFLOW_WWW_DIR to serve the frontend from disk).
+function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog = 'warn', home, keepDb = false, env = {} } = {}) {
+  if (!keepDb) removeDbFiles(db);
   let cfg = configFile;
   if (!cfg) {
     cfg = `/tmp/e2e-ui-config-${port}.toml`;
     renderConfig(cfg, port);
+  }
+  const extraEnv = { ...env };
+  if (home) {
+    fs.mkdirSync(home, { recursive: true });
+    extraEnv.TENTAFLOW_HOME = home;
   }
   const proc = spawn(BINARY, ['-c', cfg, '--db', db], {
     // Every spawned instance gets its OWN storage root. The Sync Ledger (Fjall)
@@ -136,6 +148,7 @@ function startBinary({ port = DEFAULT_PORT, configFile, db = DEFAULT_DB, rustLog
       ...process.env,
       RUST_LOG: rustLog,
       TENTAFLOW_HOME: process.env.TENTAFLOW_HOME ?? homeForPort(port),
+      ...extraEnv,
     },
   });
   // Keep an in-memory tail of backend logs so specs can attach them to

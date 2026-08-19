@@ -1,12 +1,21 @@
 // =============================================================================
 // Plik: tf-table.js
 // Opis: Komponent <tf-table sortable selectable> z <tf-column key="..." label
-//       renderer="text|chip|num" sortable sticky hide-below="900">.
+//       renderer="text|chip|num" sortable sticky hide-below="900" fill
+//       width="40%" priority="low">.
 //       `hide-below` ukrywa kolumne ponizej podanej szerokosci viewportu
 //       (dozwolone: 480 640 720 900 1024 1180 1280 — regula zyje w controls.css,
 //       a media query nie czyta zmiennej CSS). Komorki zostaja w DOM, wiec stan
 //       tabeli (zaznaczenie, ekspansja, sort) przezywa zmiane szerokosci.
-//       Properties .rows (array) +
+//       `fill` marks the one column that absorbs free width
+//       and ellipsises (flush variant), `width` pins a column width (any CSS
+//       length) so stacked tables share one template, `priority="low"` hides
+//       the column on phones (flush variant, <=480px). Atrybut `narrow` na
+//       tf-table (flush) = tabela w waskiej karcie: kolumna fill traci swoje
+//       minimum, paski udzialu sie kurcza, a na telefonie szablon procentowy
+//       zostaje (tabela miesci sie w karcie zamiast przewijac).
+//       Properties .rows (array;
+//       a row's optional `_class` adds modifier classes to its <tr>) +
 //       .columns (computed z dzieci). Emituje "row-click", "row-dblclick",
 //       "sort", "select-all", "row-expand" i "page-change".
 //       Paginacja (server-side): atrybuty page-size / total / page (1-based).
@@ -14,13 +23,16 @@
 //       klik prev/next emituje "page-change" {page, pageSize} — host laduje
 //       nowa strone i aktualizuje atrybuty `page` + .rows.
 //       Mobile (<=720px): td otrzymuja data-label dla widoku kart.
+//       variant="flush": bez ramki wrapa (karta hosta rysuje ramke), wiersze
+//       klikalne, na mobile tabela NIE zwija sie do kart — wrap przewija sie
+//       poziomo wewnatrz karty.
 // Przyklad:
 //   const t = document.createElement('tf-table');
 //   t.innerHTML = '<tf-column key="name" label="Nazwa" sortable></tf-column>...';
 //   t.rows = [{ name: 'x', status: 'ok' }, ...];
 // =============================================================================
 
-import { adoptControlsInto } from './shared-styles.js';
+import { adoptControlsInto, injectSpriteIntoShadow } from './shared-styles.js';
 
 class TfColumn extends HTMLElement {
   // rola pamietaj-tagu — dane czerpane z atrybutow przez parenta
@@ -48,7 +60,7 @@ const STICKY_COLUMN_WIDTH = 160;
 
 class TfTable extends HTMLElement {
   static get observedAttributes() {
-    return ['sortable', 'selectable', 'variant', 'density', 'page-size', 'total', 'page'];
+    return ['sortable', 'selectable', 'variant', 'density', 'narrow', 'page-size', 'total', 'page'];
   }
 
   constructor() {
@@ -157,6 +169,9 @@ class TfTable extends HTMLElement {
       align: (c.getAttribute('align') || '').toLowerCase(),
       sticky: c.hasAttribute('sticky'),
       hideBelow: hideBelowOf(c),
+      fill: c.hasAttribute('fill'),
+      width: c.getAttribute('width') || '',
+      lowPriority: (c.getAttribute('priority') || '').toLowerCase() === 'low',
     }));
   }
 
@@ -207,6 +222,9 @@ class TfTable extends HTMLElement {
 
   _build() {
     adoptControlsInto(this._shadow);
+    // Row-action tf-buttons render <use href="#i-*"> — the document sprite is
+    // not reachable from inside the shadow root, so clone it in.
+    injectSpriteIntoShadow(this._shadow);
     const wrap = document.createElement('div');
     wrap.className = 'tf-table-wrap';
     const table = document.createElement('table');
@@ -330,7 +348,7 @@ class TfTable extends HTMLElement {
   // unikac rebuildu thead przy kazdym set rows / sort. thead trzymamy
   // wylacznie dla ARIA i sortowania, nie zalezy od liczby wierszy.
   _columnsSignature(cols) {
-    const sig = cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}|${c.sticky ? 1 : 0}|${c.hideBelow}`).join('');
+    const sig = cols.map(c => `${c.key}|${c.label}|${c.sortable ? 1 : 0}|${c.renderer}|${c.align}|${c.sticky ? 1 : 0}|${c.hideBelow}|${c.fill ? 1 : 0}|${c.width}|${c.lowPriority ? 1 : 0}`).join('');
     const selectAll = this._isMultiSelect() ? 'S' : '';
     return `${this._stickyColumns}#${this._expandable ? 'E' : ''}${selectAll}#${sig}`;
   }
@@ -366,6 +384,9 @@ class TfTable extends HTMLElement {
         th.textContent = col.label;
       }
       if (col.align === 'num' || col.renderer === 'num') th.classList.add('num');
+      if (col.fill) th.classList.add('fill');
+      if (col.lowPriority) th.classList.add('lo');
+      if (col.width) th.style.width = col.width;
       if (sortableTable && col.sortable) {
         th.classList.add('sortable');
         th.dataset.key = col.key;
@@ -486,6 +507,7 @@ class TfTable extends HTMLElement {
     const rtr = document.createElement('tr');
     rtr.dataset.idx = String(idx);
     if (row && row._selected) rtr.classList.add('selected');
+    this._applyRowClass(rtr, row);
     const stickySet = this._stickyColumnIndices(cols);
     this._appendLeadingCells(rtr, row, idx);
     cols.forEach((col, i) => {
@@ -493,6 +515,8 @@ class TfTable extends HTMLElement {
       this._applyCardLabel(td, col);
       if (col.renderer === 'num' || col.align === 'num') td.classList.add('num');
       this._applyHideBelow(td, col);
+      if (col.fill) td.classList.add('fill');
+      if (col.lowPriority) td.classList.add('lo');
       if (stickySet.has(i)) this._applySticky(td, i);
       // The select-all box lives in the first header cell, so the per-row box
       // belongs in the matching first data cell — no extra column.
@@ -515,8 +539,19 @@ class TfTable extends HTMLElement {
     return rtr;
   }
 
+  // Optional `_class` on a row object = extra modifier classes on its <tr>
+  // (e.g. a highlighted "needs attention" row); recycled rows drop the old set.
+  _applyRowClass(tr, row) {
+    const prev = tr.dataset.rowClass;
+    if (prev) for (const c of prev.split(' ')) if (c) tr.classList.remove(c);
+    const next = row && typeof row._class === 'string' ? row._class.trim() : '';
+    if (next) for (const c of next.split(' ')) if (c) tr.classList.add(c);
+    if (next) tr.dataset.rowClass = next; else delete tr.dataset.rowClass;
+  }
+
   _updateRowCells(tr, cols, row, idx) {
     const tds = tr.children;
+    this._applyRowClass(tr, row);
     // Sciezka recyklingu dziala tylko gdy _expandable === false, a select-all
     // siedzi w naglowku — body nie ma kolumn wiodacych, wiec td[i] == kolumna i.
     const expected = cols.length + (this._rowActions ? 1 : 0);
@@ -631,7 +666,10 @@ class TfTable extends HTMLElement {
     if (variant) classes.push(`tf-table--variant-${variant}`);
     const density = this.getAttribute('density');
     if (density) classes.push(`tf-table--density-${density}`);
+    if (this.hasAttribute('narrow')) classes.push('tf-table--narrow');
     this._table.className = classes.join(' ');
+    // `flush` also strips the wrap chrome (the host card draws the frame).
+    if (this._wrap) this._wrap.classList.toggle('tf-table-wrap--flush', variant === 'flush');
   }
 
   _sortedRows() {

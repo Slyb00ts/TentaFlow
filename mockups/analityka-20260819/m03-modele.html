@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka · Modele (M03)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .perf { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+  .perf b { font-variant-numeric: tabular-nums; }
+  .perf span { font-size: 10px; color: var(--text-3); }
+</style>
+</head>
+<body>
+
+<div class="screen">
+  <div class="screen-header"><span class="num">M03</span><h2>Analityka · Modele</h2>
+    <div class="desc">Nazwy z katalogu (display_name), percentyle TTFT/decode z histogramów, porównanie
+    node×serwis pod spodem. Klik w model = drill-down z rozbiciem na userów i nody.</div></div>
+  <div class="screen-frame"><div class="app" id="app"></div></div>
+</div>
+
+<template id="tpl">
+<main class="main">
+  <div class="page-head">
+    <div><div class="page-title">Analityka</div>
+      <div class="page-sub">Użycie i wydajność modeli w całym meshu</div></div>
+    <button class="btn ghost">⭳ Eksport CSV</button>
+  </div>
+
+  <!--TABS-->
+
+  <div class="an-toolbar">
+    <span class="fl-label">Okres</span>
+    <div class="seg"><button>Godzina</button><button>Dzień</button><button class="on">Miesiąc</button></div>
+    <div class="sel">2026-08 <span class="car">▾</span></div>
+    <span class="fl-sep"></span>
+    <span class="fl-label">Node</span><div class="sel">Wszystkie nody <span class="car">▾</span></div>
+    <span class="spacer"></span>
+    <span class="chip">filtry auto-przeładowują dane</span>
+  </div>
+
+  <div class="an-card d1">
+    <div class="c-head"><h3>Modele</h3><div class="hint">klik = drill-down modelu</div></div>
+    <table class="an-table">
+      <thead><tr><th>Model</th><th class="num">Tokeny</th><th class="num">Zapytania</th>
+        <th class="num">TTFT</th><th class="num">Decode</th><th class="num">Błędy</th><th class="num">Koszt</th><th>Udział</th></tr></thead>
+      <tbody>
+        <tr><td><div class="ent"><div class="av a1">Q</div><div><div class="cell-title">Qwen 3.8 27B AWQ</div>
+          <div class="cell-sub">cyankiwi/Qwen3.8-27B-AWQ-INT4 · vLLM</div></div></div></td>
+          <td class="num" title="67 812 004"><b>67,8 mln</b></td><td class="num" title="24 811">24,8 tys</td>
+          <td class="num"><div class="perf"><b>198 ms</b><span>p99 1,2 s</span></div></td>
+          <td class="num"><div class="perf"><b>121 tok/s</b><span>p90 152</span></div></td>
+          <td class="num"><span class="chip ok">0,02%</span></td><td class="num">1 412 zł</td>
+          <td><div class="share"><div class="bar"><i style="width:56%"></i></div><span class="pct">56%</span></div></td></tr>
+        <tr><td><div class="ent"><div class="av a2">G</div><div><div class="cell-title">GLM-5-Air</div>
+          <div class="cell-sub">zai-org/GLM-5-Air · llama.cpp</div></div></div></td>
+          <td class="num" title="38 145 220"><b>38,1 mln</b></td><td class="num" title="16 502">16,5 tys</td>
+          <td class="num"><div class="perf"><b>346 ms</b><span>p99 2,1 s</span></div></td>
+          <td class="num"><div class="perf"><b>58 tok/s</b><span>p90 71</span></div></td>
+          <td class="num"><span class="chip ok">0,05%</span></td><td class="num">958 zł</td>
+          <td><div class="share"><div class="bar"><i style="width:31%;animation-delay:.08s"></i></div><span class="pct">31%</span></div></td></tr>
+        <tr><td><div class="ent"><div class="av a3">W</div><div><div class="cell-title">Whisper large-v3</div>
+          <div class="cell-sub">whisper · STT · 41,2 h audio</div></div></div></td>
+          <td class="num" title="15 480 061"><b>15,5 mln</b></td><td class="num">6 900</td>
+          <td class="num"><div class="perf"><b>—</b><span>STT</span></div></td>
+          <td class="num"><div class="perf"><b>—</b></div></td>
+          <td class="num"><span class="chip warn">0,4%</span></td>
+          <td class="num" title="brak cennika">~0 zł ⚠</td>
+          <td><div class="share"><div class="bar"><i style="width:13%;animation-delay:.16s"></i></div><span class="pct">13%</span></div></td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>3 modele</span><span>Σ 121,4 mln tok · percentyle: histogramy v1</span></div>
+  </div>
+
+  <div class="an-card d3">
+    <div class="c-head"><h3>Porównanie: model × node × backend</h3>
+      <div class="hint">ta sama tabela co dziś, ale z nazwami nodów</div></div>
+    <table class="an-table">
+      <thead><tr><th>Model</th><th>Node</th><th>Backend</th><th class="num">Zapytania</th>
+        <th class="num">TTFT p50 / p99</th><th class="num">Decode p50</th><th class="num">Błędy</th></tr></thead>
+      <tbody>
+        <tr><td class="cell-title">Qwen 3.8 27B AWQ</td>
+          <td><div class="cell-title">hazai</div><div class="cell-sub">d91a7a85…3967</div></td>
+          <td><span class="chip acc">vLLM · TP4</span></td>
+          <td class="num" title="22 304">22,3 tys</td><td class="num">191 ms / 1,1 s</td>
+          <td class="num">124 tok/s</td><td class="num"><span class="chip ok">3</span></td></tr>
+        <tr><td class="cell-title">Qwen 3.8 27B AWQ</td>
+          <td><div class="cell-title">biuro-mini</div><div class="cell-sub">7c02be11…8aa2</div></td>
+          <td><span class="chip acc">llama.cpp</span></td>
+          <td class="num">2 507</td><td class="num">402 ms / 2,8 s</td>
+          <td class="num">31 tok/s</td><td class="num"><span class="chip ok">2</span></td></tr>
+        <tr><td class="cell-title">GLM-5-Air</td>
+          <td><div class="cell-title">hazai</div><div class="cell-sub">d91a7a85…3967</div></td>
+          <td><span class="chip acc">llama.cpp · CUDA</span></td>
+          <td class="num" title="16 502">16,5 tys</td><td class="num">346 ms / 2,1 s</td>
+          <td class="num">58 tok/s</td><td class="num"><span class="chip ok">8</span></td></tr>
+        <tr><td class="cell-title">Whisper large-v3</td>
+          <td><div class="cell-title">laptop-pw</div><div class="cell-sub">33f1c904…be77</div></td>
+          <td><span class="chip acc">whisper · CPU</span></td>
+          <td class="num">6 900</td><td class="num">— </td><td class="num">—</td>
+          <td class="num"><span class="chip warn">28</span></td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>4 kombinacje</span><span>filtr Node zawęża obie tabele</span></div>
+  </div>
+</main>
+</template>
+
+<script src="shared/mock.js"></script>
+<script>
+  document.getElementById('app').innerHTML = Mock.shell('analytics')
+    + document.getElementById('tpl').innerHTML.replace('<!--TABS-->', Mock.tabs('models'));
+</script>
+</body>
+</html>

@@ -13,7 +13,7 @@
 
 import {
   SVG_NS, TfCartesianChart,
-  computeDomains, scaleX, scaleY,
+  computeDomains, scaleX, scaleY, applyNarrow, animateLineEnter,
   renderXAxis, renderYAxis, renderGridlinesY,
 } from './tf-line-chart.js';
 
@@ -22,14 +22,14 @@ class TfAreaChart extends TfCartesianChart {
     super();
     this._stacking = 'none';
     this._opacity = 0.4;
-    this._lastStacks = null;
   }
 
-  set stacking(value) { this._stacking = typeof value === 'string' ? value : 'none'; this._render(); }
-  set opacity(value) { const n = Number(value); if (Number.isFinite(n)) this._opacity = n; this._render(); }
+  set stacking(value) { this._stacking = typeof value === 'string' ? value : 'none'; this._requestRender(); }
+  set opacity(value) { const n = Number(value); if (Number.isFinite(n)) this._opacity = n; this._requestRender(); }
 
   _hostClasses() { return ['tf-chart--area', `tf-chart--stacking-${this._stacking}`]; }
   _ariaLabel() { return 'Area chart'; }
+  _tooltipShowsTotal() { return this._stacking === 'stacked'; }
 
   /// Stacked data — each point becomes {x, y0, y1, originalY} (baseline and
   /// top). Stacked: y0 = sum of previous series at this X. Percent: per-X
@@ -97,13 +97,23 @@ class TfAreaChart extends TfCartesianChart {
     return visible.map((_, si) => seriesPoints[si].map((p) => ({ x: p.x, y0: 0, y1: p.y, originalY: p.y })));
   }
 
-  _drawPlot(svg, box) {
+  _drawPlot(svg, box, enter) {
     const { x0, x1, y0, y1 } = box;
     const visible = this._visibleSeries();
-    const seriesPoints = visible.map((s) => s.points || []);
+    let seriesPoints = visible.map((s) => s.points || []);
 
-    const baseDomain = computeDomains(seriesPoints, this._xAxis, this._yAxis);
-    const { xs, categories } = baseDomain;
+    let baseDomain = computeDomains(seriesPoints, this._xAxis, this._yAxis);
+    let { xs, categories } = baseDomain;
+    if (categories) {
+      const sliced = applyNarrow(categories, x1 - x0, this._narrow);
+      if (sliced !== categories) {
+        const keep = new Set(sliced);
+        seriesPoints = seriesPoints.map((pts) => pts.filter((p) => keep.has(p.x)));
+        baseDomain = computeDomains(seriesPoints, this._xAxis, this._yAxis);
+        xs = baseDomain.xs;
+        categories = sliced;
+      }
+    }
     let ys = baseDomain.ys;
 
     let stacks;
@@ -122,7 +132,6 @@ class TfAreaChart extends TfCartesianChart {
       if (ys.min === ys.max) ys.max = ys.min + 1;
     }
     this._lastDomain = { xs, ys, categories };
-    this._lastStacks = stacks;
 
     renderGridlinesY(svg, this._yAxis, ys, x0, x1, y0, y1);
     renderXAxis(svg, this._xAxis, xs, categories, x0, x1, y1, this._locale);
@@ -141,30 +150,35 @@ class TfAreaChart extends TfCartesianChart {
         const pyTop = scaleY(pt.y1, this._yAxis, ys, y0, y1);
         const pyBottom = scaleY(pt.y0, this._yAxis, ys, y0, y1);
         if (px == null || pyTop == null || pyBottom == null) continue;
-        topCoords.push(`${px},${pyTop}`);
+        topCoords.push([px, pyTop]);
         bottomCoords.push(`${px},${pyBottom}`);
+        this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: pt.x, y: pt.originalY, display: pt.originalY, px, py: pyTop });
       }
       if (topCoords.length === 0) continue;
-      const pts = [...topCoords, ...bottomCoords.reverse()].join(' ');
+      const topStr = topCoords.map((c) => `${c[0]},${c[1]}`);
+      const pts = [...topStr, ...bottomCoords.reverse()].join(' ');
       const area = document.createElementNS(SVG_NS, 'polygon');
       area.setAttribute('points', pts);
       area.setAttribute('fill-opacity', String(this._opacity));
       area.classList.add('tf-chart__area');
+      if (enter) area.classList.add('tf-chart__area--enter');
       if (s.tone) area.classList.add(`tf-chart__area--tone-${s.tone}`);
       area.setAttribute('data-series-id', s.id);
       svg.appendChild(area);
 
       // Top edge line for readability (matching tone color).
       const line = document.createElementNS(SVG_NS, 'polyline');
-      line.setAttribute('points', topCoords.join(' '));
+      line.setAttribute('points', topStr.join(' '));
       line.classList.add('tf-chart__series-line');
       line.classList.add(`tf-chart__series-line--style-${s.style}`);
       if (s.tone) line.classList.add(`tf-chart__series-line--tone-${s.tone}`);
+      if (enter) animateLineEnter(line, topCoords, si * 80);
       svg.appendChild(line);
 
       // Points overlay.
       const g = document.createElementNS(SVG_NS, 'g');
       g.classList.add('tf-chart__series-points');
+      if (enter) g.classList.add('tf-chart__series-points--enter');
       g.setAttribute('data-series-id', s.id);
       for (const pt of stack) {
         const px = scaleX(pt.x, this._xAxis, xs, categories, x0, x1);
@@ -179,26 +193,6 @@ class TfAreaChart extends TfCartesianChart {
         g.appendChild(c);
       }
       svg.appendChild(g);
-    }
-  }
-
-  *_tooltipCandidates(box) {
-    if (!this._lastDomain || !this._lastStacks) return;
-    const { xs, ys, categories } = this._lastDomain;
-    const visible = this._visibleSeries();
-    for (let si = 0; si < visible.length; si++) {
-      const s = visible[si];
-      const stack = this._lastStacks[si] || [];
-      for (const pt of stack) {
-        const px = scaleX(pt.x, this._xAxis, xs, categories, box.x0, box.x1);
-        const py = scaleY(pt.y1, this._yAxis, ys, box.y0, box.y1);
-        if (px == null || py == null) continue;
-        yield {
-          seriesId: s.id, seriesName: s.name,
-          x: pt.x, y: pt.originalY, display: pt.originalY,
-          px, py,
-        };
-      }
     }
   }
 }

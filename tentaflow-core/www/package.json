@@ -5,7 +5,7 @@
   "type": "module",
   "description": "TentaFlow dashboard frontend — SDK runtime + dashboard UI. Static assets serwowane przez tentaflow-core.",
   "scripts": {
-    "test": "node --test --test-reporter=spec js/sdk-runtime/*.test.js js/modules/*.test.js js/components/*.test.js js/protocol/*.test.js"
+    "test": "node --test --test-reporter=spec js/*.test.js js/sdk-runtime/*.test.js js/modules/*.test.js js/components/*.test.js js/protocol/*.test.js"
   },
   "devDependencies": {
     "happy-dom": "^20.9.0"

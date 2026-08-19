@@ -1,26 +1,38 @@
 // =============================================================================
 // Plik: components/tf-line-chart.js
 // Opis: Wykres liniowy SVG (LineChart 0x0216) + bazowa klasa TfCartesianChart
-// i helpery rysowania (osie, ticki, domeny, legenda) współdzielone przez
-// tf-area-chart i tf-bar-chart. Light DOM, klasy .tf-chart__* z controls.css.
+// i helpery rysowania (osie, ticki, domeny, legenda, tooltip, crosshair,
+// animacja wejścia) współdzielone przez tf-area-chart i tf-bar-chart.
+// Light DOM, klasy .tf-chart__* z controls.css.
 //
 // Kontrakt danych (property `series`):
 //   Array<{
 //     id: string,                 // stabilny identyfikator serii
 //     name: string,               // etykieta do legendy (już zresolvowana)
-//     tone: string|null,          // neutral/primary/success/warning/critical/info/muted
+//     tone: string|null,          // neutral/primary/accent/success/warning/critical/info/muted
 //     style: 'solid'|'dashed'|'dotted',
 //     showInLegend: boolean,
 //     points: Array<{x: number|string, y: number}>,  // y zawsze skończona liczba
 //   }>
 // Property `xAxis`/`yAxis`: { scale: 'linear'|'log'|'time'|'category',
 //   min: number|null, max: number|null, ticks: number|null,
-//   format: ((value) => string)|null }  // formatter może rzucić → fallback
+//   format: ((value) => string)|null }  // formatter może rzucić → fallback;
+//   null na osi liniowej/log → fmtCompact z utils.js
 // Property `legend`: { position: 'top'|'bottom'|'left'|'right'|'none',
 //   alignment: 'start'|'center'|'end' } | null
-// Property `tooltip`: { enabled: boolean, format: ((value) => string)|null }
-// Property `zoom`: 'none'|'x'|'y'|'both'; `brush`: boolean; `height`: number px;
+// Property `tooltip`: { enabled: boolean (domyślnie true),
+//   format: ((x, items) => string|Element)|null,   // pełna treść tooltipa
+//   valueFormat: ((y) => string)|null,             // wartość w wierszu (domyślnie fmtExact)
+//   totalLabel: string }                           // wiersz sumy przy stacking='stacked'
+//   items = [{ seriesId, seriesName, y, tone }]
+// Property `crosshair`: boolean (pionowa linia na najbliższej kategorii);
+// `animate`: boolean (jednorazowa animacja wejścia po ustawieniu `series`);
+// `narrow`: { breakpoint: 560, maxPoints: 10 } (wąski plot → ostatnie N kategorii);
+// `zoom`: 'none'|'x'|'y'|'both'; `brush`: boolean; `height`: number px;
 // `locale`: string (Intl dla domyślnego formatowania ticków).
+//
+// Rendering: każdy setter renderuje synchronicznie (DOM jest gotowy od razu
+// po przypisaniu, także przed podłączeniem do dokumentu).
 //
 // Eventy (bubbles:false, na hoście):
 //   'series-toggle' detail {series_id, hidden}
@@ -28,9 +40,17 @@
 //   'range-select'  detail {x:{min,max}, y:{min,max}, zoom_mode, brush}
 // =============================================================================
 
+import { fmtCompact, fmtExact } from '../utils.js';
+
 export const SVG_NS = 'http://www.w3.org/2000/svg';
 
 const PLOT_MARGIN = { top: 12, right: 16, bottom: 36, left: 48 };
+// Estimated glyph width of the 10 px axis font — used to thin category labels.
+const LABEL_CHAR_PX = 6.5;
+const LABEL_GAP_PX = 8;
+// Upper bound on category labels even when they would fit (mockup density).
+const MAX_CATEGORY_LABELS = 14;
+const BAR_STAGGER_MS = 12;
 
 // =============================================================================
 // Tick generation
@@ -80,7 +100,8 @@ export function generateLogTicks(min, max) {
 }
 
 /// Tick label. axis.format is a callable formatter (may throw → fallback),
-/// time scale → date string, otherwise number formatting.
+/// time scale → date string, linear/log → fmtCompact for integers and large
+/// magnitudes, plain Intl formatting for fractional ticks.
 export function formatTick(value, axis, locale) {
   if (typeof axis.format === 'function') {
     try { return axis.format(value); }
@@ -94,14 +115,31 @@ export function formatTick(value, axis, locale) {
     } catch { return String(value); }
   }
   if (axis.scale === 'category') return String(value);
-  // Linear/log: nice number formatting.
   if (Number.isFinite(value)) {
-    if (Number.isInteger(value)) return String(value);
-    const abs = Math.abs(value);
-    if (abs >= 1000) return new Intl.NumberFormat(locale).format(value);
+    if (Number.isInteger(value) || Math.abs(value) >= 1e4) return fmtCompact(value, locale);
     return new Intl.NumberFormat(locale, { maximumFractionDigits: 2 }).format(value);
   }
   return String(value);
+}
+
+/// Picks which category indices get a label so neighbouring labels never
+/// overlap (and at most MAX_CATEGORY_LABELS are shown). Keeps the first and
+/// the last category; the last one wins over a regular-step label that would
+/// collide with it.
+export function thinCategoryIndices(labels, stepPx) {
+  const n = labels.length;
+  if (n === 0) return [];
+  const longest = labels.reduce((m, l) => Math.max(m, String(l).length), 0);
+  const labelPx = longest * LABEL_CHAR_PX + LABEL_GAP_PX;
+  const every = Math.max(1, Math.ceil(labelPx / Math.max(1, stepPx)), Math.ceil(n / MAX_CATEGORY_LABELS));
+  const picked = [];
+  for (let i = 0; i < n; i += every) picked.push(i);
+  const last = n - 1;
+  if (picked[picked.length - 1] !== last) {
+    if ((last - picked[picked.length - 1]) * stepPx < labelPx) picked.pop();
+    picked.push(last);
+  }
+  return picked;
 }
 
 // =============================================================================
@@ -124,7 +162,10 @@ export function renderXAxis(parent, axis, domain, categories, x0, x1, y, locale)
   group.appendChild(line);
   let tickValues;
   if (axis.scale === 'category') {
-    tickValues = categories || [];
+    const cats = categories || [];
+    const step = (x1 - x0) / Math.max(1, cats.length);
+    const labels = cats.map((c) => formatTick(c, axis, locale));
+    tickValues = thinCategoryIndices(labels, step).map((i) => cats[i]);
   } else if (axis.scale === 'log') {
     tickValues = generateLogTicks(domain.min, domain.max);
   } else {
@@ -351,11 +392,53 @@ export function pixelToData(px, axis, domain, p0, p1, invertY = false) {
   return domain.min + ratio * (domain.max - domain.min);
 }
 
+/// Keeps only the last `maxPoints` categories when the plot is narrower than
+/// `breakpoint`; returns the (possibly) sliced category list.
+export function applyNarrow(categories, plotWidth, narrow) {
+  if (!Array.isArray(categories) || !narrow) return categories;
+  if (plotWidth >= narrow.breakpoint || categories.length <= narrow.maxPoints) return categories;
+  return categories.slice(-narrow.maxPoints);
+}
+
+/// Polyline length in user units — drives the stroke-dashoffset draw-in.
+export function polylineLength(coords) {
+  let len = 0;
+  for (let i = 1; i < coords.length; i++) {
+    const dx = coords[i][0] - coords[i - 1][0];
+    const dy = coords[i][1] - coords[i - 1][1];
+    len += Math.hypot(dx, dy);
+  }
+  return len;
+}
+
+/// Marks a polyline for the draw-in animation; inline dash styles are dropped
+/// once the animation ends so dashed/dotted line styles are restored.
+export function animateLineEnter(polyline, coords, delayMs = 0) {
+  const len = Math.ceil(polylineLength(coords)) + 2;
+  polyline.style.strokeDasharray = `${len}`;
+  polyline.style.strokeDashoffset = `${len}`;
+  if (delayMs) polyline.style.animationDelay = `${delayMs}ms`;
+  polyline.classList.add('tf-chart__series-line--enter');
+  polyline.addEventListener('animationend', () => {
+    polyline.style.strokeDasharray = '';
+    polyline.style.strokeDashoffset = '';
+    polyline.style.animationDelay = '';
+    polyline.classList.remove('tf-chart__series-line--enter');
+  }, { once: true });
+}
+
+function mediaMatches(query) {
+  if (typeof globalThis.matchMedia !== 'function') return false;
+  try { return globalThis.matchMedia(query).matches; } catch { return false; }
+}
+
 // =============================================================================
 // TfCartesianChart — shared host/layout/legend/tooltip/brush machinery
 // =============================================================================
 
 const DEFAULT_AXIS = { scale: 'linear', min: null, max: null, ticks: null, format: null };
+const DEFAULT_TOOLTIP = { enabled: true, format: null, valueFormat: null, totalLabel: 'Σ' };
+const DEFAULT_NARROW = { breakpoint: 560, maxPoints: 10 };
 
 export class TfCartesianChart extends HTMLElement {
   constructor() {
@@ -364,7 +447,10 @@ export class TfCartesianChart extends HTMLElement {
     this._xAxis = { ...DEFAULT_AXIS };
     this._yAxis = { ...DEFAULT_AXIS };
     this._legend = null;
-    this._tooltip = { enabled: false, format: null };
+    this._tooltip = { ...DEFAULT_TOOLTIP };
+    this._crosshair = true;
+    this._animate = true;
+    this._narrow = { ...DEFAULT_NARROW };
     this._zoom = 'none';
     this._brush = false;
     this._height = 200;
@@ -375,28 +461,43 @@ export class TfCartesianChart extends HTMLElement {
     this._plot = null;
     this._legendEl = null;
     this._tooltipEl = null;
+    this._crosshairEl = null;
+    this._hoverItems = [];
+    this._animPending = false;
+    this._animClearScheduled = false;
     this._brushStart = null;
     this._brushRect = null;
     this._lastDomain = null;
     this._lastPlotBox = null;
+    this._lastSize = null;
     this._ro = null;
     this._onDocUp = (e) => this._handleBrushUp(e);
   }
 
-  set series(value) { this._series = Array.isArray(value) ? value : []; this._render(); }
-  set xAxis(value) { this._xAxis = { ...DEFAULT_AXIS, ...(value || {}) }; this._render(); }
-  set yAxis(value) { this._yAxis = { ...DEFAULT_AXIS, ...(value || {}) }; this._render(); }
-  set legend(value) { this._legend = value || null; this._render(); }
-  set tooltip(value) { this._tooltip = { enabled: false, format: null, ...(value || {}) }; this._render(); }
-  set zoom(value) { this._zoom = typeof value === 'string' ? value : 'none'; this._render(); }
-  set brush(value) { this._brush = Boolean(value); this._render(); }
-  set height(value) { const n = Number(value); if (Number.isFinite(n) && n > 0) this._height = n; this._render(); }
-  set locale(value) { this._locale = value || undefined; this._render(); }
+  set series(value) {
+    this._series = Array.isArray(value) ? value : [];
+    if (this._animate) this._animPending = true;
+    this._requestRender();
+  }
+  set xAxis(value) { this._xAxis = { ...DEFAULT_AXIS, ...(value || {}) }; this._requestRender(); }
+  set yAxis(value) { this._yAxis = { ...DEFAULT_AXIS, ...(value || {}) }; this._requestRender(); }
+  set legend(value) { this._legend = value || null; this._requestRender(); }
+  set tooltip(value) { this._tooltip = { ...DEFAULT_TOOLTIP, ...(value || {}) }; this._requestRender(); }
+  set crosshair(value) { this._crosshair = Boolean(value); this._requestRender(); }
+  set animate(value) { this._animate = Boolean(value); if (!this._animate) this._animPending = false; }
+  set narrow(value) {
+    this._narrow = value ? { ...DEFAULT_NARROW, ...value } : null;
+    this._requestRender();
+  }
+  set zoom(value) { this._zoom = typeof value === 'string' ? value : 'none'; this._requestRender(); }
+  set brush(value) { this._brush = Boolean(value); this._requestRender(); }
+  set height(value) { const n = Number(value); if (Number.isFinite(n) && n > 0) this._height = n; this._requestRender(); }
+  set locale(value) { this._locale = value || undefined; this._requestRender(); }
 
   connectedCallback() {
     document.addEventListener('mouseup', this._onDocUp);
     if (typeof globalThis.ResizeObserver === 'function' && !this._ro) {
-      this._ro = new globalThis.ResizeObserver(() => this._renderPlot());
+      this._ro = new globalThis.ResizeObserver(() => this._renderPlot(false));
       if (this._plot) this._ro.observe(this._plot);
     }
     if (!this._svg) this._render();
@@ -416,15 +517,34 @@ export class TfCartesianChart extends HTMLElement {
   _ariaLabel() { return 'Chart'; }
 
   /// Draws everything inside the svg for the given plot box. Must set
-  /// `this._lastDomain` ({xs, ys, categories}) when brush/tooltip apply.
-  _drawPlot(_svg, _box) {}
+  /// `this._lastDomain` ({xs, ys, categories}) when brush/tooltip apply and
+  /// push hover candidates into `this._hoverItems`:
+  /// {seriesId, seriesName, tone, x, y, display, px, py}.
+  /// `enter` = true on the first paint after `series` changed (animation).
+  _drawPlot(_svg, _box, _enter) {}
 
-  /// Iterates candidate tooltip points: {seriesId, x, y, display, px, py}.
-  _tooltipCandidates(_box) { return []; }
+  /// Whether the default tooltip appends a total row.
+  _tooltipShowsTotal() { return false; }
+
+  /// Tooltip title for the hovered x value.
+  _formatXLabel(x) { return formatTick(x, this._xAxis, this._locale); }
+
+  /// Axis along which hover candidates are grouped ('x' columns, 'y' rows).
+  _hoverAxis() { return 'x'; }
 
   // ---- rendering ------------------------------------------------------------
 
   _visibleSeries() { return this._series.filter((s) => !this._hidden.has(s.id)); }
+
+  _requestRender() { this._render(); }
+
+  _hoverEnabled() {
+    return this._tooltip.enabled && !mediaMatches('(hover: none)');
+  }
+
+  _motionAllowed() {
+    return !mediaMatches('(prefers-reduced-motion: reduce)');
+  }
 
   _render() {
     // Host classes: replace the previously applied managed set.
@@ -451,7 +571,7 @@ export class TfCartesianChart extends HTMLElement {
     this._plot.appendChild(this._svg);
 
     this._tooltipEl = null;
-    if (this._tooltip.enabled) {
+    if (this._hoverEnabled()) {
       this._tooltipEl = document.createElement('div');
       this._tooltipEl.classList.add('tf-chart__tooltip');
       this._tooltipEl.hidden = true;
@@ -467,7 +587,7 @@ export class TfCartesianChart extends HTMLElement {
 
     this._attachSvgListeners();
     if (this._ro) { this._ro.disconnect(); this._ro.observe(this._plot); }
-    this._renderPlot();
+    this._renderPlot(true);
   }
 
   _pixelDimensions() {
@@ -478,12 +598,20 @@ export class TfCartesianChart extends HTMLElement {
     return { w, h };
   }
 
-  _renderPlot() {
+  /// `force=false` (ResizeObserver) skips the rebuild when the measured box
+  /// did not change — the observer fires once right after observe(), which
+  /// would otherwise discard the entry animation of the first paint.
+  _renderPlot(force = true) {
     const svg = this._svg;
     if (!svg) return;
+    const { w, h } = this._pixelDimensions();
+    if (!force && this._lastSize && this._lastSize.w === w && this._lastSize.h === h) return;
+    this._lastSize = { w, h };
     svg.replaceChildren();
     this._brushRect = null;
-    const { w, h } = this._pixelDimensions();
+    this._crosshairEl = null;
+    this._hoverItems = [];
+    if (this._tooltipEl) this._tooltipEl.hidden = true;
     svg.setAttribute('viewBox', `0 0 ${w} ${h}`);
     const box = {
       x0: PLOT_MARGIN.left,
@@ -493,13 +621,33 @@ export class TfCartesianChart extends HTMLElement {
     };
     if (box.x1 <= box.x0 || box.y1 <= box.y0) { this._lastPlotBox = null; return; }
     this._lastPlotBox = box;
-    this._drawPlot(svg, box);
+    const enter = this._animPending && this._motionAllowed();
+    this._drawPlot(svg, box, enter);
+    if (this._animPending && !this._animClearScheduled && typeof globalThis.requestAnimationFrame === 'function') {
+      // Any rebuild inside the same frame still animates; the flag clears
+      // only once the first animated paint is on screen.
+      this._animClearScheduled = true;
+      globalThis.requestAnimationFrame(() => {
+        this._animPending = false;
+        this._animClearScheduled = false;
+      });
+    }
+    if (this._crosshair && this._hoverEnabled()) {
+      this._crosshairEl = document.createElementNS(SVG_NS, 'line');
+      this._crosshairEl.classList.add('tf-chart__crosshair');
+      this._crosshairEl.setAttribute('y1', String(box.y0));
+      this._crosshairEl.setAttribute('y2', String(box.y1));
+      this._crosshairEl.setAttribute('x1', String(box.x0));
+      this._crosshairEl.setAttribute('x2', String(box.x0));
+      this._crosshairEl.style.display = 'none';
+      svg.appendChild(this._crosshairEl);
+    }
     if (this._brush) {
       this._brushRect = document.createElementNS(SVG_NS, 'rect');
       this._brushRect.classList.add('tf-chart__brush');
       this._brushRect.setAttribute('y', String(box.y0));
       this._brushRect.setAttribute('height', String(box.y1 - box.y0));
-      this._brushRect.hidden = true;
+      this._brushRect.style.display = 'none';
       svg.appendChild(this._brushRect);
     }
   }
@@ -546,20 +694,20 @@ export class TfCartesianChart extends HTMLElement {
       const item = this._legendEl.querySelector(`[data-series-id="${sid}"]`);
       if (item) item.classList.toggle('tf-chart__legend-item--hidden', this._hidden.has(sid));
     }
-    this._renderPlot();
+    this._renderPlot(true);
     this.dispatchEvent(new CustomEvent('series-toggle', {
       bubbles: false,
       detail: { series_id: sid, hidden: this._hidden.has(sid) },
     }));
   }
 
-  // ---- tooltip + brush listeners ----------------------------------------------
+  // ---- tooltip + crosshair + brush listeners -----------------------------------
 
   _attachSvgListeners() {
     const svg = this._svg;
-    if (this._tooltip.enabled) {
+    if (this._hoverEnabled()) {
       svg.addEventListener('mousemove', (e) => this._handleTooltipMove(e));
-      svg.addEventListener('mouseleave', () => { if (this._tooltipEl) this._tooltipEl.hidden = true; });
+      svg.addEventListener('mouseleave', () => this._hideHover());
     }
     if (this._brush || this._zoom !== 'none') {
       svg.addEventListener('mousedown', (e) => this._handleBrushDown(e));
@@ -567,42 +715,127 @@ export class TfCartesianChart extends HTMLElement {
     }
   }
 
+  _hideHover() {
+    if (this._tooltipEl) this._tooltipEl.hidden = true;
+    if (this._crosshairEl) this._crosshairEl.style.display = 'none';
+  }
+
+  /// Nearest x column to the pointer → crosshair + one tooltip listing every
+  /// series at that x. The whole plot box is the hit area, so the tooltip
+  /// also works in the gaps between bars.
   _handleTooltipMove(e) {
     const tooltipEl = this._tooltipEl;
     if (!tooltipEl) return;
     const box = this._lastPlotBox;
-    if (!box) { tooltipEl.hidden = true; return; }
+    if (!box) { this._hideHover(); return; }
     const svgRect = this._svg.getBoundingClientRect();
     const mx = e.clientX - svgRect.left;
     const my = e.clientY - svgRect.top;
-    if (mx < box.x0 || mx > box.x1 || my < box.y0 || my > box.y1) { tooltipEl.hidden = true; return; }
+    if (mx < box.x0 || mx > box.x1 || my < box.y0 || my > box.y1) { this._hideHover(); return; }
+    const byRow = this._hoverAxis() === 'y';
+    const key = byRow ? 'py' : 'px';
+    const m = byRow ? my : mx;
     let best = null;
-    for (const cand of this._tooltipCandidates(box)) {
-      const dx = cand.px - mx;
-      const dy = cand.py - my;
-      const d2 = dx * dx + dy * dy;
-      if (best == null || d2 < best.d2) best = { d2, ...cand };
+    for (const cand of this._hoverItems) {
+      if (best == null || Math.abs(cand[key] - m) < Math.abs(best - m)) best = cand[key];
     }
-    if (!best || best.d2 > 32 * 32) { tooltipEl.hidden = true; return; }
-    const yLabel = typeof this._tooltip.format === 'function'
-      ? (() => { try { return this._tooltip.format(best.display); } catch { return String(best.display); } })()
-      : String(best.display);
+    if (best == null) { this._hideHover(); return; }
+    const group = this._hoverItems.filter((c) => Math.abs(c[key] - best) < 0.5);
+    if (group.length === 0) { this._hideHover(); return; }
+    const bestPx = byRow ? Math.max(...group.map((c) => c.px)) : best;
+
+    const xValue = group[0].x;
+    const items = group.map((c) => ({ seriesId: c.seriesId, seriesName: c.seriesName, y: c.display, tone: c.tone }));
     tooltipEl.replaceChildren();
-    const seriesEl = document.createElement('div');
-    seriesEl.classList.add('tf-chart__tooltip-series');
-    seriesEl.textContent = best.seriesName == null ? best.seriesId : String(best.seriesName);
-    tooltipEl.appendChild(seriesEl);
-    const valEl = document.createElement('div');
-    valEl.classList.add('tf-chart__tooltip-value');
-    valEl.textContent = yLabel;
-    tooltipEl.appendChild(valEl);
+    let custom = null;
+    if (typeof this._tooltip.format === 'function') {
+      try { custom = this._tooltip.format(xValue, items); } catch { custom = null; }
+    }
+    if (custom instanceof Element) {
+      tooltipEl.appendChild(custom);
+    } else if (typeof custom === 'string') {
+      tooltipEl.innerHTML = custom;
+    } else {
+      this._buildDefaultTooltip(tooltipEl, xValue, items);
+    }
     tooltipEl.hidden = false;
-    tooltipEl.style.left = `${best.px + 8}px`;
-    tooltipEl.style.top = `${best.py - 8}px`;
+
+    // Clamp inside the plot box: flip to the left of the crosshair when the
+    // right side has no room, keep the top edge within the plot vertically.
+    const tw = tooltipEl.offsetWidth || 0;
+    const th = tooltipEl.offsetHeight || 0;
+    let left = bestPx + 12;
+    if (left + tw > box.x1) left = Math.max(box.x0, bestPx - 12 - tw);
+    let top = my - 10;
+    if (top + th > box.y1) top = Math.max(box.y0, box.y1 - th);
+    if (top < box.y0) top = box.y0;
+    tooltipEl.style.left = `${left}px`;
+    tooltipEl.style.top = `${top}px`;
+
+    if (this._crosshairEl) {
+      if (byRow) {
+        this._crosshairEl.setAttribute('x1', String(box.x0));
+        this._crosshairEl.setAttribute('x2', String(box.x1));
+        this._crosshairEl.setAttribute('y1', String(best));
+        this._crosshairEl.setAttribute('y2', String(best));
+      } else {
+        this._crosshairEl.setAttribute('x1', String(bestPx));
+        this._crosshairEl.setAttribute('x2', String(bestPx));
+      }
+      this._crosshairEl.style.display = '';
+    }
+
+    let nearest = group[0];
+    const other = byRow ? 'px' : 'py';
+    const mo = byRow ? mx : my;
+    for (const c of group) if (Math.abs(c[other] - mo) < Math.abs(nearest[other] - mo)) nearest = c;
     this.dispatchEvent(new CustomEvent('point-hover', {
       bubbles: false,
-      detail: { series_id: best.seriesId, x: best.x, y: best.y },
+      detail: { series_id: nearest.seriesId, x: nearest.x, y: nearest.y },
     }));
+  }
+
+  _formatTooltipValue(y) {
+    if (typeof this._tooltip.valueFormat === 'function') {
+      try { return String(this._tooltip.valueFormat(y)); } catch { /* fall through */ }
+    }
+    return fmtExact(y, this._locale);
+  }
+
+  _buildDefaultTooltip(tooltipEl, xValue, items) {
+    const title = document.createElement('div');
+    title.classList.add('tf-chart__tooltip-title');
+    title.textContent = this._formatXLabel(xValue);
+    tooltipEl.appendChild(title);
+    const addRow = (name, value, tone, extraClass) => {
+      const row = document.createElement('div');
+      row.classList.add('tf-chart__tooltip-row');
+      if (extraClass) row.classList.add(extraClass);
+      const nameEl = document.createElement('span');
+      nameEl.classList.add('tf-chart__tooltip-name');
+      if (tone) {
+        const sw = document.createElement('span');
+        sw.classList.add('tf-chart__legend-swatch', `tf-chart__legend-swatch--tone-${tone}`);
+        nameEl.appendChild(sw);
+      }
+      nameEl.appendChild(document.createTextNode(name));
+      row.appendChild(nameEl);
+      const valueEl = document.createElement('span');
+      valueEl.classList.add('tf-chart__tooltip-value');
+      valueEl.textContent = value;
+      row.appendChild(valueEl);
+      tooltipEl.appendChild(row);
+    };
+    let total = 0;
+    // Stacked charts list the top segment first — the reading order of the stack.
+    const ordered = this._tooltipShowsTotal() ? [...items].reverse() : items;
+    for (const it of ordered) {
+      addRow(it.seriesName == null ? it.seriesId : String(it.seriesName), this._formatTooltipValue(it.y), it.tone, null);
+      if (typeof it.y === 'number' && Number.isFinite(it.y)) total += it.y;
+    }
+    if (this._tooltipShowsTotal() && items.length > 1) {
+      addRow(String(this._tooltip.totalLabel ?? ''), this._formatTooltipValue(total), null, 'tf-chart__tooltip-row--total');
+    }
   }
 
   _handleBrushDown(e) {
@@ -617,7 +850,7 @@ export class TfCartesianChart extends HTMLElement {
     if (this._brushRect) {
       this._brushRect.setAttribute('x', String(mx));
       this._brushRect.setAttribute('width', '0');
-      this._brushRect.hidden = false;
+      this._brushRect.style.display = '';
     }
   }
 
@@ -665,7 +898,7 @@ export class TfCartesianChart extends HTMLElement {
       }));
     }
     this._brushStart = null;
-    if (this._brushRect) this._brushRect.hidden = true;
+    if (this._brushRect) this._brushRect.style.display = 'none';
   }
 }
 
@@ -677,11 +910,20 @@ class TfLineChart extends TfCartesianChart {
   _hostClasses() { return ['tf-chart--line']; }
   _ariaLabel() { return 'Line chart'; }
 
-  _drawPlot(svg, box) {
+  _drawPlot(svg, box, enter) {
     const { x0, x1, y0, y1 } = box;
     const visible = this._visibleSeries();
-    const seriesPoints = visible.map((s) => s.points || []);
-    const { xs, ys, categories } = computeDomains(seriesPoints, this._xAxis, this._yAxis);
+    let seriesPoints = visible.map((s) => s.points || []);
+    let { xs, ys, categories } = computeDomains(seriesPoints, this._xAxis, this._yAxis);
+    if (categories) {
+      const sliced = applyNarrow(categories, x1 - x0, this._narrow);
+      if (sliced !== categories) {
+        const keep = new Set(sliced);
+        seriesPoints = seriesPoints.map((pts) => pts.filter((p) => keep.has(p.x)));
+        ({ xs, ys } = computeDomains(seriesPoints, this._xAxis, this._yAxis));
+        categories = sliced;
+      }
+    }
     this._lastDomain = { xs, ys, categories };
 
     renderGridlinesY(svg, this._yAxis, ys, x0, x1, y0, y1);
@@ -697,19 +939,22 @@ class TfLineChart extends TfCartesianChart {
         const px = scaleX(p.x, this._xAxis, xs, categories, x0, x1);
         const py = scaleY(p.y, this._yAxis, ys, y0, y1);
         if (px == null || py == null) continue;
-        coords.push(`${px},${py}`);
+        coords.push([px, py]);
+        this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: p.x, y: p.y, display: p.y, px, py });
       }
       if (coords.length === 0) continue;
       const polyline = document.createElementNS(SVG_NS, 'polyline');
-      polyline.setAttribute('points', coords.join(' '));
+      polyline.setAttribute('points', coords.map((c) => `${c[0]},${c[1]}`).join(' '));
       polyline.classList.add('tf-chart__series-line');
       polyline.classList.add(`tf-chart__series-line--style-${s.style}`);
       if (s.tone) polyline.classList.add(`tf-chart__series-line--tone-${s.tone}`);
       polyline.setAttribute('data-series-id', s.id);
+      if (enter) animateLineEnter(polyline, coords, i * 80);
       svg.appendChild(polyline);
       // Point dots overlay (hover detection target).
       const g = document.createElementNS(SVG_NS, 'g');
       g.classList.add('tf-chart__series-points');
+      if (enter) g.classList.add('tf-chart__series-points--enter');
       g.setAttribute('data-series-id', s.id);
       let pi = 0;
       for (const p of points) {
@@ -729,23 +974,10 @@ class TfLineChart extends TfCartesianChart {
       svg.appendChild(g);
     }
   }
-
-  *_tooltipCandidates(box) {
-    if (!this._lastDomain) return;
-    const { xs, ys, categories } = this._lastDomain;
-    for (const s of this._visibleSeries()) {
-      for (const p of s.points || []) {
-        const px = scaleX(p.x, this._xAxis, xs, categories, box.x0, box.x1);
-        const py = scaleY(p.y, this._yAxis, ys, box.y0, box.y1);
-        if (px == null || py == null) continue;
-        yield { seriesId: s.id, seriesName: s.name, x: p.x, y: p.y, display: p.y, px, py };
-      }
-    }
-  }
 }
 
 if (!customElements.get('tf-line-chart')) {
   customElements.define('tf-line-chart', TfLineChart);
 }
 
-export { TfLineChart };
+export { TfLineChart, BAR_STAGGER_MS };

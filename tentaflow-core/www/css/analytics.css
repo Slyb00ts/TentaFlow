@@ -1,0 +1,251 @@
+/* =============================================================================
+   File: analytics.css — unified Analytics screen (overview, users & groups,
+   models, nodes, limits, billing). Only --tf-* tokens; classes an-*.
+   Animations use transform/opacity only; reduced motion is neutralized globally
+   by controls.css.
+   ============================================================================= */
+
+.an-root { min-width: 0; }
+
+/* ----- Page head ----- */
+.an-head {
+  display: flex; align-items: flex-end; justify-content: space-between;
+  gap: 16px; margin-bottom: 14px; flex-wrap: wrap;
+}
+.an-title { font-size: 22px; font-weight: 800; letter-spacing: -0.01em; margin: 0; }
+.an-sub { font-size: 12.5px; color: var(--tf-text-3); margin-top: 3px; }
+.an-head-actions { display: flex; gap: 8px; align-items: center; }
+.an-head-actions tf-button[hidden] { display: none; }
+.an-root tf-tabs { margin-bottom: 14px; }
+
+/* ----- Sticky filter toolbar (shared by tabs) ----- */
+.an-toolbar {
+  display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  background: var(--tf-bg-2); border: 1px solid var(--tf-border); border-radius: var(--tf-radius);
+  padding: 10px 12px; margin-bottom: 16px; position: sticky; top: 0; z-index: 5;
+}
+.an-toolbar > tf-select, .an-key-host > tf-select, .an-key-host > tf-input {
+  flex: 0 0 auto; width: auto; min-width: 130px; max-width: 230px;
+}
+.an-key-host { display: inline-flex; gap: 8px; align-items: center; }
+.an-fg { display: inline-flex; align-items: center; gap: 8px; min-width: 0; }
+.an-fg > tf-select { flex: 0 0 auto; width: auto; min-width: 130px; max-width: 230px; }
+.an-fl {
+  font-size: 10.5px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em;
+  color: var(--tf-text-3); margin: 0 0 0 4px; white-space: nowrap;
+}
+/* Compact controls: selects and the date field match the 30px segmented track. */
+.an-toolbar .tf-select { min-height: 30px; padding: 5px 30px 5px 12px; font-size: 12px; border-radius: var(--tf-radius-sm); }
+.an-toolbar .tf-select-wrap::after { right: 11px; width: 6px; height: 6px; }
+.an-toolbar .tf-input-wrap { min-height: 30px; padding: 0 10px; border-radius: var(--tf-radius-sm); }
+.an-toolbar .tf-input-wrap .tf-input { min-height: 28px; padding: 4px 0; font-size: 12px; }
+.an-toolbar tf-chip { margin-left: auto; }
+.an-fl-sep { width: 1px; height: 20px; background: var(--tf-border); margin: 0 6px; }
+.an-spacer { margin-left: auto; }
+.an-subbar { margin-bottom: 12px; }
+.an-subbar > tf-searchbox { flex: 0 1 320px; min-width: 200px; }
+/* Sub-switch and search box share one 32px height. */
+.an-subbar .tf-searchbox { height: 32px; border-radius: var(--tf-radius-sm); }
+.an-subbar .tf-segmented.tf-segmented-md .tf-seg-opt { padding: 6px 12px; }
+
+/* ----- KPI grid (tf-stat-card tuned to the analytics density) ----- */
+.an-kpi-grid {
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+  gap: 12px; margin-bottom: 16px;
+}
+.an-kpi-grid tf-stat-card { animation: an-rise 0.45s cubic-bezier(0.22, 1, 0.36, 1) both; }
+.an-kpi-grid tf-stat-card:nth-child(2) { animation-delay: 0.04s; }
+.an-kpi-grid tf-stat-card:nth-child(3) { animation-delay: 0.09s; }
+.an-kpi-grid tf-stat-card:nth-child(4) { animation-delay: 0.14s; }
+.an-kpi-grid tf-stat-card:nth-child(5) { animation-delay: 0.19s; }
+.an-kpi-grid tf-stat-card:nth-child(6) { animation-delay: 0.24s; }
+.an-kpi-grid .tf-stat-card { position: relative; padding: 14px 16px; gap: 0; overflow: hidden; }
+.an-kpi-grid .tf-stat-card::before {
+  content: ""; position: absolute; inset: 0 0 auto 0; height: 2px;
+  background: var(--tf-gradient-accent); opacity: 0; transition: opacity 0.2s;
+}
+.an-kpi-grid .tf-stat-card:hover::before { opacity: 1; }
+.an-kpi-grid .tf-stat-card-label { font-size: 10.5px; letter-spacing: 0.08em; margin-bottom: 8px; }
+.an-kpi-grid .tf-stat-card-label .tf-stat-card-icon { color: var(--tf-accent-2); width: 13px; height: 13px; }
+.an-kpi-grid .tf-stat-card-value { font-size: 26px; letter-spacing: -0.02em; }
+.an-kpi-grid .tf-stat-card-value .suffix { font-weight: 700; margin-left: 3px; }
+.an-kpi-grid .tf-stat-card-delta { font-size: 11.5px; margin-top: 6px; padding-top: 0; font-variant-numeric: tabular-nums; }
+.an-kpi-grid .tf-stat-card-delta.neutral { color: var(--tf-text-2); }
+@media (min-width: 721px) { .an-kpi-grid .tf-stat-card:has(.an-kpi-spark) .tf-stat-card-delta { padding-right: 58px; } }
+.an-kpi-grid .tf-stat-card-delta { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; letter-spacing: -0.01em; }
+.an-kpi-spark { position: absolute; right: 10px; bottom: 10px; width: 54px; opacity: 0.8; pointer-events: none; }
+.an-kpi-chip { display: block; margin-top: 6px; line-height: 1; }
+
+/* ----- Section cards ----- */
+.an-card {
+  position: relative; display: flex; flex-direction: column;
+  background: var(--tf-bg-card); border: 1px solid var(--tf-border); border-radius: var(--tf-radius);
+  margin-bottom: 16px; overflow: hidden; min-width: 0;
+  animation: an-rise 0.5s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+/* Right-edge mask + chevron over the table while columns are hidden to the
+   right (toggled by watchTableScroll); both vanish at the end of the scroll.
+   At rest the mask is solid from the last full column boundary (its 10px lead
+   fades over that column's right padding); while scrolling it is a thin fade. */
+.an-twrap { position: relative; min-width: 0; }
+.an-twrap::after {
+  content: ""; position: absolute; top: 0; right: 0; bottom: 0; pointer-events: none; z-index: 3;
+  width: calc(var(--tf-table-mask-w, 0px) + 12px);
+  background: linear-gradient(90deg, transparent, var(--tf-bg-card) 12px); opacity: 0; transition: opacity 0.2s;
+}
+.an-twrap--scrolling::after { width: 28px; background: linear-gradient(90deg, transparent, var(--tf-bg-card)); }
+.an-twrap::before {
+  content: "›"; position: absolute; top: 50%; right: 4px; z-index: 4; pointer-events: none;
+  width: 18px; height: 18px; margin-top: -9px; border-radius: 50%;
+  display: flex; align-items: center; justify-content: center;
+  font-size: 14px; line-height: 1; font-weight: 700; color: var(--tf-text-2);
+  background: var(--tf-bg-3); border: 1px solid var(--tf-border-hover);
+  opacity: 0; transition: opacity 0.2s;
+}
+.an-twrap--more::after, .an-twrap--more::before { opacity: 1; }
+.an-d1 { animation-delay: 0.04s; } .an-d2 { animation-delay: 0.09s; } .an-d3 { animation-delay: 0.14s; }
+.an-d4 { animation-delay: 0.19s; } .an-d5 { animation-delay: 0.24s; }
+.an-c-head {
+  display: flex; align-items: center; gap: 10px; padding: 13px 16px;
+  border-bottom: 1px solid var(--tf-border);
+}
+.an-c-head h3 { font-size: 13.5px; font-weight: 800; margin: 0; }
+.an-hint { font-size: 11px; color: var(--tf-text-3); margin-left: auto; }
+.an-head-chips { display: inline-flex; gap: 8px; align-items: center; }
+.an-c-body { padding: 16px; }
+.an-c-body--table { padding: 6px 0; }
+.an-grid { display: grid; gap: 16px; align-items: start; }
+.an-grid > .an-card { margin-bottom: 0; }
+.an-grid { margin-bottom: 16px; }
+/* Top lists stretch to one height; their footers are pinned to the bottom. */
+.an-cols-3 { grid-template-columns: repeat(3, 1fr); align-items: stretch; }
+.an-cols-2 { grid-template-columns: 1fr 1fr; }
+.an-cols-21 { grid-template-columns: 3fr 2fr; }
+@media (max-width: 1180px) { .an-cols-3, .an-cols-2, .an-cols-21 { grid-template-columns: 1fr; } }
+
+/* Card footer under every table — pinned to the card bottom in stretched grids */
+.an-tfoot {
+  display: flex; justify-content: space-between; gap: 14px; flex-wrap: wrap; margin-top: auto;
+  padding: 9px 14px; font-size: 11px; color: var(--tf-text-3);
+  border-top: 1px solid var(--tf-border); background: var(--tf-bg-3);
+}
+.an-tfoot:empty { display: none; }
+.an-card tf-table { display: block; }
+.an-card tf-table[hidden] { display: none; }
+.an-row-actions { display: inline-flex; gap: 4px; }
+
+/* Loading / empty states — a card never renders blank */
+.an-state {
+  display: flex; align-items: center; justify-content: center; gap: 10px;
+  padding: 28px 16px; font-size: 12px; color: var(--tf-text-3);
+}
+.an-empty { text-align: center; }
+
+/* ----- Chart legend (card head) ----- */
+.an-legend { display: flex; gap: 16px; align-items: center; font-size: 11px; color: var(--tf-text-2); margin-left: auto; }
+.an-legend + .an-hint { margin-left: 0; }
+.an-sw { width: 10px; height: 10px; border-radius: 3px; display: inline-block; margin-right: 6px; }
+.an-sw--prompt { background: var(--tf-accent-3); }
+.an-sw--completion { background: var(--tf-accent-1); }
+
+/* ----- Drill-down: breadcrumb + entity hero ----- */
+.an-crumbs { display: block; margin: 4px 0 16px; font-size: 12px; }
+.an-crumbs .tf-breadcrumb-item { padding: 4px 8px; border-radius: var(--tf-radius-sm); }
+.an-crumbs a.tf-breadcrumb-item { color: var(--tf-text-2); }
+.an-crumbs a.tf-breadcrumb-item:hover { background: var(--tf-bg-3); color: var(--tf-text); }
+.an-crumbs .tf-breadcrumb-item.current { font-weight: 700; }
+.an-hero { display: flex; align-items: center; gap: 16px; }
+.an-hero-ident { min-width: 0; }
+.an-hero-name { display: flex; align-items: center; gap: 10px; font-size: 19px; font-weight: 800; }
+.an-hero-sub { font-size: 12px; color: var(--tf-text-3); font-family: var(--tf-font-mono, ui-monospace, monospace); overflow-wrap: anywhere; }
+.an-hero-meta { display: flex; gap: 8px; margin-top: 7px; flex-wrap: wrap; }
+.an-hero-meta:empty { display: none; }
+.an-mini-kpis { display: flex; gap: 28px; margin-left: auto; text-align: right; }
+.an-mk b { display: block; font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.an-mk span { font-size: 10.5px; color: var(--tf-text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+
+/* ----- Node cards ----- */
+.an-node-head { flex-wrap: wrap; row-gap: 8px; }
+.an-node-ident { min-width: 0; }
+.an-node-name { font-size: 15px; font-weight: 800; cursor: pointer; }
+.an-node-name:hover { color: var(--tf-accent-2); }
+.an-node-id {
+  font-size: 10.5px; color: var(--tf-text-3); font-family: var(--tf-font-mono, ui-monospace, monospace);
+  white-space: nowrap;
+}
+.an-node-chips { display: inline-flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+/* Chips sit right of the name block on every card; when they do not fit they
+   wrap under it as a whole group instead of floating to a per-card position. */
+.an-node-head .an-node-chips { flex: 0 1 auto; min-width: 0; }
+.an-node-stats { display: flex; gap: 24px; margin-left: auto; text-align: right; }
+.an-ns b { display: block; font-size: 16px; font-weight: 800; font-variant-numeric: tabular-nums; }
+.an-ns span { font-size: 10px; color: var(--tf-text-3); text-transform: uppercase; letter-spacing: 0.06em; }
+.an-dot { width: 9px; height: 9px; border-radius: 50%; background: var(--tf-text-3); flex-shrink: 0; }
+.an-dot--live { background: var(--tf-success); animation: an-pulse 2s infinite; }
+
+/* ----- Quota editor modal ----- */
+.an-quota-form { display: flex; flex-direction: column; gap: 14px; }
+.an-q-period { display: flex; flex-direction: column; gap: 6px; }
+.an-q-period .tf-segmented { display: flex; width: 100%; }
+.an-q-period .tf-seg-opt { flex: 1; justify-content: center; }
+/* Toggle row follows the label rhythm of the fields above (label, control). */
+.an-q-active { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.an-quota-form .tf-input-group .tf-hint { font-size: 11.5px; color: var(--tf-text-2); }
+.an-modal-footer { display: flex; gap: 8px; align-items: center; width: 100%; }
+
+/* ----- Animations (transform/opacity only) ----- */
+@keyframes an-rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: none; } }
+@keyframes an-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+  70% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+
+/* =============================================================================
+   Responsive — tablet (≤1020px) and phone (≤720px). Tables never widen the
+   page: the tf-table flush wrap scrolls horizontally inside its card.
+   ============================================================================= */
+@media (max-width: 1020px) {
+  .an-cols-3, .an-cols-2, .an-cols-21 { grid-template-columns: 1fr; }
+}
+
+@media (max-width: 720px) {
+  .an-head { flex-direction: column; align-items: stretch; gap: 10px; }
+  .an-title { font-size: 19px; }
+  .an-head-actions { justify-content: flex-start; }
+
+  .an-toolbar { row-gap: 8px; }
+  .an-fl-sep { display: none; }
+  /* One filter per row with the labels in a 56px column, so OKRES / NODE /
+     MODEL line up at the same x. */
+  .an-fg { flex: 1 1 100%; }
+  .an-fl { flex: 0 0 56px; margin: 0; }
+  .an-fg > tf-select, .an-key-host > tf-select, .an-key-host > tf-input { flex: 1 1 120px; min-width: 0; max-width: none; }
+  .an-fg--seg > tf-segmented { flex: 1; }
+  .an-fg--seg .tf-segmented { display: flex; width: 100%; }
+  .an-fg--seg .tf-seg-opt { flex: 1; justify-content: center; }
+  .an-key-host { flex: 1 1 100%; padding-left: 64px; }
+  .an-spacer { display: none; }
+  .an-toolbar tf-chip { margin-left: 0; }
+
+  .an-kpi-grid { grid-template-columns: 1fr 1fr; gap: 8px; }
+  .an-kpi-grid .tf-stat-card { padding: 11px 12px; }
+  .an-kpi-grid .tf-stat-card-value { font-size: 20px; }
+  .an-kpi-spark { display: none; }
+
+  .an-c-head { flex-wrap: wrap; row-gap: 6px; }
+  .an-c-head h3 { white-space: nowrap; }
+  .an-hint { flex-basis: 100%; margin-left: 0; color: var(--tf-text-2); }
+  .an-legend { flex-wrap: wrap; gap: 10px; }
+  .an-tfoot { flex-direction: column; gap: 2px; }
+
+  .an-hero { flex-wrap: wrap; }
+  .an-mini-kpis, .an-node-stats {
+    margin-left: 0; width: 100%; display: grid;
+    grid-template-columns: 1fr 1fr; gap: 10px 16px; text-align: left;
+  }
+  .an-mk b { font-size: 17px; }
+  .an-ns b { font-size: 15px; white-space: nowrap; }
+  .an-node-id { max-width: 100%; }
+  .an-subbar > tf-searchbox { flex: 1 1 100%; }
+}

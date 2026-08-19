@@ -22,6 +22,7 @@
   /* akcenty i statusy */
   --tf-accent-1: #6366f1;
   --tf-accent-2: #818cf8;
+  --tf-accent-3: #a78bfa;
   --tf-accent-glow: rgba(99, 102, 241, 0.18);
   --tf-success: #22c55e;
   --tf-warning: #f59e0b;
@@ -729,6 +730,29 @@ tf-tabs {
   color: var(--tf-accent-2);
 }
 .tf-segmented.tf-segmented-sm .tf-seg-opt { padding: 4px 10px; font-size: 10px; }
+/* size="md": sentence-case filled-pill variant for dense filter toolbars
+   (period / sub-view switches) — square-ish track, 11.5 px labels, solid
+   accent active option. */
+.tf-segmented.tf-segmented-md {
+  padding: 2px;
+  gap: 0;
+  background: var(--tf-bg-input);
+  border-radius: var(--tf-radius-sm);
+}
+.tf-segmented.tf-segmented-md .tf-seg-opt {
+  padding: 5px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--tf-text-2);
+  border-radius: 4px;
+}
+.tf-segmented.tf-segmented-md .tf-seg-opt.active {
+  background: var(--tf-accent-1);
+  color: #fff;
+  transform: none;
+}
 .tf-segmented.tf-segmented-disabled { opacity: 0.5; pointer-events: none; }
 .tf-segmented .tf-seg-opt:focus-visible {
   outline: 2px solid var(--tf-accent-1);
@@ -937,13 +961,13 @@ tf-tabs {
 .tf-tabs-fade.visible { opacity: 1; }
 .tf-tabs-fade-left {
   left: 0;
-  background: linear-gradient(to right, var(--tf-bg-card) 20%, rgba(0, 0, 0, 0) 100%);
+  background: linear-gradient(to right, var(--tf-bg-card) 40%, rgba(0, 0, 0, 0) 100%);
   border-top-left-radius: var(--tf-radius);
   border-bottom-left-radius: var(--tf-radius);
 }
 .tf-tabs-fade-right {
   right: 0;
-  background: linear-gradient(to left, var(--tf-bg-card) 20%, rgba(0, 0, 0, 0) 100%);
+  background: linear-gradient(to left, var(--tf-bg-card) 40%, rgba(0, 0, 0, 0) 100%);
   border-top-right-radius: var(--tf-radius);
   border-bottom-right-radius: var(--tf-radius);
 }
@@ -1144,6 +1168,106 @@ tf-tabs {
 .tf-table--density-comfortable th,
 .tf-table--density-comfortable td { padding: 16px 18px; }
 
+/* variant="flush": the table sits inside a host card that already draws the
+   frame (head / footer around it), so the wrap loses its own chrome, rows are
+   clickable drill rows, and the layout NEVER collapses into mobile cards — the
+   wrap scrolls horizontally inside the host card instead, so a wide table can
+   not push the page wider than the viewport. */
+.tf-table-wrap--flush {
+  background: transparent;
+  border: 0;
+  border-radius: 0;
+  overflow-x: auto;
+}
+.tf-table--variant-flush { font-size: 12.5px; }
+.tf-table--variant-flush thead th {
+  background: transparent;
+  color: var(--tf-text-3);
+  font-size: 10.5px;
+  letter-spacing: 0.07em;
+  padding: 10px 14px;
+  white-space: nowrap;
+}
+.tf-table--variant-flush td {
+  padding: 10px 14px;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+/* The `fill` column (entity name) is capped at 40% of the table and ellipsises
+   its nowrap two-line cell (`max-width: 0` lets auto layout shrink it); the
+   remaining width is shared by the other columns, so numbers sit under their
+   headers without a void after the name. A `width` attribute on the
+   tf-column overrides the cap (inline style). */
+.tf-table--variant-flush th.fill { width: 40%; }
+.tf-table--variant-flush th.fill,
+.tf-table--variant-flush td.fill { max-width: 0; min-width: 220px; }
+.tf-table--variant-flush td.fill .tf-table__cell-title,
+.tf-table--variant-flush td.fill .tf-table__cell-sub { overflow: hidden; text-overflow: ellipsis; }
+.tf-table--variant-flush thead th.num { text-align: right; }
+.tf-table--variant-flush td.num { font-family: inherit; white-space: nowrap; }
+.tf-table--variant-flush td.actions { padding-left: 0; }
+.tf-table--variant-flush tbody tr { cursor: pointer; }
+/* `narrow`: a percentage template that always sums to the card width — the
+   name column has no minimum (it ellipsises instead) and share bars shrink
+   to 60px, so a three-column top list never overflows a ~280px card. */
+.tf-table--narrow th.fill,
+.tf-table--narrow td.fill { min-width: 0; }
+.tf-table--narrow .tf-table__share { min-width: 0; }
+.tf-table--narrow .tf-table__bar { min-width: 60px; }
+.tf-table--narrow .tf-table__share-pct { flex-basis: 30px; }
+@media (max-width: 720px) {
+  /* The generic phone layout turns tables into blocks of cards; flush stays a
+     real table (otherwise the anonymous table box shrinks to its content). */
+  .tf-table--variant-flush { display: table; min-width: max-content; }
+  .tf-table--variant-flush thead { display: table-header-group; }
+  .tf-table--variant-flush tbody { display: table-row-group; }
+  .tf-table--variant-flush tr { display: table-row; padding: 0; border-bottom: 0; }
+  /* Pinned desktop column widths are meaningless in a max-content table. */
+  .tf-table--variant-flush th { padding: 9px 10px; }
+  .tf-table--variant-flush:not(.tf-table--narrow) th { width: auto !important; }
+  .tf-table--variant-flush td {
+    display: table-cell;
+    width: auto !important;
+    padding: 9px 10px;
+  }
+  .tf-table--variant-flush tr + tr td { border-top: 1px solid var(--tf-border); }
+  .tf-table--variant-flush td::before { display: none; }
+  .tf-table--variant-flush td.actions { margin-top: 0; }
+  /* The card scrolls, so the name column keeps a readable fixed cap instead
+     of absorbing width that the phone does not have. */
+  .tf-table--variant-flush th.fill,
+  .tf-table--variant-flush td.fill { max-width: 220px; min-width: 0; }
+  /* A narrow table keeps its percentage template and fits the card. */
+  .tf-table--narrow { min-width: 0; }
+  .tf-table--narrow th.fill,
+  .tf-table--narrow td.fill { max-width: 0; }
+  /* The scrolled wrap rests on a column boundary (snap on the header cells),
+     so the right edge cuts on cell padding, never mid-glyph; a thin always-on
+     scrollbar is the affordance that more columns follow. */
+  .tf-table-wrap--flush {
+    scroll-snap-type: x mandatory;
+    scrollbar-width: thin;
+    scrollbar-color: var(--tf-border-hover, var(--tf-text-3)) transparent;
+  }
+  .tf-table-wrap--flush::-webkit-scrollbar { height: 4px; }
+  .tf-table-wrap--flush::-webkit-scrollbar-thumb { background: var(--tf-border-hover, var(--tf-text-3)); border-radius: 2px; }
+  .tf-table-wrap--flush::-webkit-scrollbar-track { background: transparent; }
+  .tf-table--variant-flush:not(.tf-table--narrow) thead th { scroll-snap-align: end; }
+  /* Entity cells outside the fill column ellipsise too, so one long sub-line
+     cannot widen a column past the phone viewport. */
+  .tf-table--variant-flush td:not(.fill) .tf-table__ent { max-width: 200px; }
+}
+/* Phones: low-priority columns (share %, trend, audio, …) are dropped so most
+   tables fit without a horizontal scroll. */
+@media (max-width: 480px) {
+  .tf-table--variant-flush th.lo,
+  .tf-table--variant-flush td.lo { display: none; }
+  .tf-table--variant-flush th.fill,
+  .tf-table--variant-flush td.fill { max-width: 160px; }
+  .tf-table--narrow th.fill,
+  .tf-table--narrow td.fill { max-width: 0; }
+}
+
 /* =============================================================================
    tf-table-shell (Table 0x0211 SDK renderer) — light-DOM wrapper stacking the
    bulk-actions toolbar, the <tf-table> component, the empty state and the
@@ -1306,6 +1430,64 @@ td:has(> .tf-table__row-select) {
 }
 .tf-table__cell-row > .tf-chip { flex: 0 0 auto; }
 
+/* Monospace identifier sub-line (short ids, emails, model paths). */
+.tf-table__cell-sub--mono { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 10.5px; }
+/* Entity cell: optional lead tile/dot + two-line label. */
+.tf-table__ent { display: flex; align-items: center; gap: 10px; min-width: 0; }
+.tf-table__ent > div { min-width: 0; }
+.tf-table__ent .tf-table__cell-title,
+.tf-table__ent .tf-table__cell-sub { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.tf-table__tile {
+  width: 30px; height: 30px; border-radius: 8px; flex-shrink: 0;
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 11px; font-weight: 800; color: #fff;
+  background: var(--tf-gradient-accent);
+}
+.tf-table__tile--t1 { background: linear-gradient(135deg, #6366f1, #a78bfa); }
+.tf-table__tile--t2 { background: linear-gradient(135deg, #0ea5e9, #2dd4bf); }
+.tf-table__tile--t3 { background: linear-gradient(135deg, #f59e0b, #f472b6); }
+.tf-table__tile--t4 { background: linear-gradient(135deg, #22c55e, #84cc16); }
+.tf-table__tile--t5 { background: linear-gradient(135deg, #ef4444, #f97316); }
+/* Liveness dot: green pulsing = seen within the liveness window, grey = stale. */
+.tf-table__dot { width: 8px; height: 8px; border-radius: 50%; background: var(--tf-text-3); flex-shrink: 0; display: inline-block; }
+.tf-table__dot--live { background: var(--tf-success); animation: tf-dot-pulse 2s infinite; }
+@keyframes tf-dot-pulse {
+  0% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0.45); }
+  70% { box-shadow: 0 0 0 7px rgba(34, 197, 94, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(34, 197, 94, 0); }
+}
+/* Share / usage bar: track + scaleX-animated fill + percentage label. */
+.tf-table__share { display: flex; align-items: center; gap: 8px; min-width: 120px; }
+.tf-table__bar { flex: 1; height: 5px; border-radius: 3px; background: var(--tf-bg-input); overflow: hidden; min-width: 70px; max-width: 130px; }
+.tf-table__bar--thick { height: 7px; border-radius: 4px; min-width: 120px; flex: 0 0 140px; }
+.tf-table__bar-fill {
+  display: block; height: 100%; border-radius: inherit;
+  background: var(--tf-gradient-accent);
+  transform-origin: left;
+  animation: tf-bar-grow 0.7s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.tf-table__bar-fill--ok { background: linear-gradient(90deg, #22c55e, #84cc16); }
+.tf-table__bar-fill--warn { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+.tf-table__bar-fill--err { background: linear-gradient(90deg, #ef4444, #f97316); }
+@keyframes tf-bar-grow { from { transform: scaleX(0); } to { transform: scaleX(1); } }
+.tf-table__share-pct { font-size: 10.5px; color: var(--tf-text-3); flex: 0 0 34px; text-align: right; }
+.tf-table__share-nums { font-size: 11px; color: var(--tf-text-3); white-space: nowrap; font-variant-numeric: tabular-nums; }
+/* Two-line numeric cell: main value + muted secondary (p99 / p90). */
+.tf-table__perf { display: inline-flex; flex-direction: column; align-items: flex-end; line-height: 1.25; }
+.tf-table__perf b { font-variant-numeric: tabular-nums; }
+.tf-table__perf span { font-size: 10px; color: var(--tf-text-3); }
+.tf-table__muted { color: var(--tf-text-2); }
+.tf-table__dim { opacity: 0.55; }
+.tf-table__warn-row { background: rgba(245, 158, 11, 0.05); }
+/* Partial cost: tilde + warning glyph, the tooltip carries the explanation. */
+.tf-table__partial { display: inline-flex; align-items: center; gap: 4px; }
+.tf-table__warn-ico { width: 12px; height: 12px; color: var(--tf-warning); fill: none; stroke: currentColor; stroke-width: 2; stroke-linecap: round; stroke-linejoin: round; flex-shrink: 0; }
+.tf-table__price { display: inline-flex; align-items: center; gap: 6px; }
+.tf-table__price tf-input { width: 108px; }
+/* Pricing cells: the rate input carries the currency suffix, so the cell is
+   the input alone, right-aligned under its numeric header. */
+.tf-table__price--suffix { justify-content: flex-end; }
+
 /* =============================================================================
    tf-chip
    ============================================================================= */
@@ -1323,6 +1505,23 @@ td:has(> .tf-table__row-select) {
   white-space: nowrap;
 }
 tf-chip[data-sdk-chip] .tf-chip { text-transform: none; letter-spacing: normal; }
+/* variant="outline": sentence-case tinted pill with a 1px border — entity
+   facets and status labels that must read as words, not shouting tags. */
+.tf-chip.tf-chip--outline {
+  font-size: 10.5px;
+  letter-spacing: normal;
+  text-transform: none;
+  border: 1px solid var(--tf-border);
+  background: var(--tf-bg-3);
+  color: var(--tf-text-2);
+}
+.tf-chip.tf-chip--outline.ok   { color: var(--tf-success); border-color: rgba(34, 197, 94, 0.35);  background: rgba(34, 197, 94, 0.08); }
+.tf-chip.tf-chip--outline.warn { color: var(--tf-warning); border-color: rgba(245, 158, 11, 0.35); background: rgba(245, 158, 11, 0.08); }
+.tf-chip.tf-chip--outline.err  { color: var(--tf-danger);  border-color: rgba(239, 68, 68, 0.35);  background: rgba(239, 68, 68, 0.08); }
+.tf-chip.tf-chip--outline.accent { color: var(--tf-accent-3); border-color: rgba(167, 139, 250, 0.35); background: rgba(167, 139, 250, 0.08); }
+.tf-chip.tf-chip--outline.neutral { color: var(--tf-text-2); border-color: var(--tf-border-hover); background: var(--tf-bg-3); }
+.tf-chip.tf-chip--outline .tf-chip-dot { width: 7px; height: 7px; animation: none; }
+.tf-chip.tf-chip--outline .tf-chip-dot--tone-success { animation: tf-dot-pulse 2s infinite; }
 tf-chip[data-sdk-chip] .tf-chip.active {
   background: var(--tf-accent-glow);
   color: var(--tf-accent-2);
@@ -6930,14 +7129,19 @@ tf-skeleton {
 }
 .tf-chart__axis-label {
   fill: var(--tf-text-3);
-  font-size: 11px;
+  font-size: 10px;
   font-family: inherit;
 }
 .tf-chart__gridline {
   stroke: var(--tf-border);
   stroke-width: 1;
-  stroke-dasharray: 2 3;
-  opacity: 0.4;
+  stroke-dasharray: 3 4;
+  vector-effect: non-scaling-stroke;
+}
+.tf-chart__crosshair {
+  stroke: var(--tf-border-hover);
+  stroke-width: 1;
+  pointer-events: none;
   vector-effect: non-scaling-stroke;
 }
 .tf-chart__series-line {
@@ -6951,6 +7155,7 @@ tf-skeleton {
 .tf-chart__series-line { stroke: var(--tf-accent-1); }
 .tf-chart__series-line--tone-neutral  { stroke: var(--tf-text); }
 .tf-chart__series-line--tone-primary  { stroke: var(--tf-accent-1); }
+.tf-chart__series-line--tone-accent   { stroke: var(--tf-accent-3); }
 .tf-chart__series-line--tone-info     { stroke: var(--tf-info); }
 .tf-chart__series-line--tone-success  { stroke: var(--tf-success); }
 .tf-chart__series-line--tone-warning  { stroke: var(--tf-warning); }
@@ -6959,6 +7164,7 @@ tf-skeleton {
 .tf-chart__series-point { fill: var(--tf-accent-1); }
 .tf-chart__series-point--tone-neutral  { fill: var(--tf-text); }
 .tf-chart__series-point--tone-primary  { fill: var(--tf-accent-1); }
+.tf-chart__series-point--tone-accent   { fill: var(--tf-accent-3); }
 .tf-chart__series-point--tone-info     { fill: var(--tf-info); }
 .tf-chart__series-point--tone-success  { fill: var(--tf-success); }
 .tf-chart__series-point--tone-warning  { fill: var(--tf-warning); }
@@ -7006,6 +7212,7 @@ tf-skeleton {
 }
 .tf-chart__legend-swatch--tone-neutral  { background: var(--tf-text); }
 .tf-chart__legend-swatch--tone-primary  { background: var(--tf-accent-1); }
+.tf-chart__legend-swatch--tone-accent   { background: var(--tf-accent-3); }
 .tf-chart__legend-swatch--tone-info     { background: var(--tf-info); }
 .tf-chart__legend-swatch--tone-success  { background: var(--tf-success); }
 .tf-chart__legend-swatch--tone-warning  { background: var(--tf-warning); }
@@ -7013,18 +7220,65 @@ tf-skeleton {
 .tf-chart__legend-swatch--tone-muted    { background: var(--tf-text-3); }
 .tf-chart__tooltip {
   position: absolute;
-  background: var(--tf-bg-input);
-  border: 1px solid var(--tf-border);
+  background: var(--tf-bg-2);
+  border: 1px solid var(--tf-border-hover);
   border-radius: var(--tf-radius-sm, 0.25rem);
-  padding: 0.4em 0.6em;
-  font-size: 0.85em;
-  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.1);
+  padding: 8px 11px;
+  font-size: 11px;
+  line-height: 1.5;
+  box-shadow: var(--tf-shadow);
   pointer-events: none;
-  transform: translate(-50%, -100%);
+  white-space: nowrap;
   z-index: 10;
 }
-.tf-chart__tooltip-series { font-weight: 600; color: var(--tf-text); }
-.tf-chart__tooltip-value { color: var(--tf-text-3); font-variant-numeric: tabular-nums; }
+.tf-chart__tooltip-title { font-weight: 800; color: var(--tf-text); margin-bottom: 4px; }
+.tf-chart__tooltip-row {
+  display: flex;
+  justify-content: space-between;
+  gap: 14px;
+  color: var(--tf-text-2);
+}
+.tf-chart__tooltip-row--total {
+  margin-top: 3px;
+  padding-top: 3px;
+  border-top: 1px solid var(--tf-border);
+}
+.tf-chart__tooltip-name { display: inline-flex; align-items: center; gap: 6px; }
+.tf-chart__tooltip-name .tf-chart__legend-swatch { width: 8px; height: 8px; }
+.tf-chart__tooltip-value { color: var(--tf-text); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+/* Entry animations — transform / opacity / stroke-dashoffset only (compositor);
+   the JS side never adds the --enter classes under prefers-reduced-motion. */
+@keyframes tf-chart-bar-grow {
+  from { transform: scaleY(0); }
+  to { transform: scaleY(1); }
+}
+@keyframes tf-chart-line-draw {
+  to { stroke-dashoffset: 0; }
+}
+@keyframes tf-chart-fade-in {
+  from { opacity: 0; }
+  to { opacity: 1; }
+}
+.tf-chart__bar--enter {
+  transform-box: view-box;
+  animation: tf-chart-bar-grow 420ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.tf-chart__series-line--enter {
+  animation: tf-chart-line-draw 900ms cubic-bezier(0.4, 0, 0.2, 1) both;
+}
+.tf-chart__series-points--enter {
+  animation: tf-chart-fade-in 300ms ease-out 700ms both;
+}
+.tf-chart__area--enter {
+  animation: tf-chart-fade-in 600ms ease-out 250ms both;
+}
+@media (prefers-reduced-motion: reduce) {
+  .tf-chart__bar--enter,
+  .tf-chart__series-line--enter,
+  .tf-chart__series-points--enter,
+  .tf-chart__area--enter { animation-delay: 0ms !important; }
+}
 
 /* ============================================================================
    tf-chart--area (AreaChart 0x0218) — chunk 3.3d-9. Reuse tf-chart shared.
@@ -7032,6 +7286,7 @@ tf-skeleton {
 .tf-chart__area { fill: var(--tf-accent-1); }
 .tf-chart__area--tone-neutral  { fill: var(--tf-text); }
 .tf-chart__area--tone-primary  { fill: var(--tf-accent-1); }
+.tf-chart__area--tone-accent   { fill: var(--tf-accent-3); }
 .tf-chart__area--tone-info     { fill: var(--tf-info); }
 .tf-chart__area--tone-success  { fill: var(--tf-success); }
 .tf-chart__area--tone-warning  { fill: var(--tf-warning); }
@@ -7044,6 +7299,7 @@ tf-skeleton {
 .tf-chart__bar { fill: var(--tf-accent-1); }
 .tf-chart__bar--tone-neutral  { fill: var(--tf-text); }
 .tf-chart__bar--tone-primary  { fill: var(--tf-accent-1); }
+.tf-chart__bar--tone-accent   { fill: var(--tf-accent-3); }
 .tf-chart__bar--tone-info     { fill: var(--tf-info); }
 .tf-chart__bar--tone-success  { fill: var(--tf-success); }
 .tf-chart__bar--tone-warning  { fill: var(--tf-warning); }
@@ -7073,6 +7329,7 @@ tf-skeleton {
 .tf-stacked-bar__segment-rest { background: transparent; }
 .tf-stacked-bar__segment--tone-neutral  { background: var(--tf-text); }
 .tf-stacked-bar__segment--tone-primary  { background: var(--tf-accent-1); }
+.tf-stacked-bar__segment--tone-accent   { background: var(--tf-accent-3); }
 .tf-stacked-bar__segment--tone-info     { background: var(--tf-info); }
 .tf-stacked-bar__segment--tone-success  { background: var(--tf-success); }
 .tf-stacked-bar__segment--tone-warning  { background: var(--tf-warning); }
@@ -7092,6 +7349,7 @@ tf-skeleton {
 .tf-stacked-bar__legend-swatch { width: 0.8em; height: 0.8em; border-radius: 2px; flex: 0 0 auto; background: var(--tf-accent-1); }
 .tf-stacked-bar__legend-swatch--tone-neutral  { background: var(--tf-text); }
 .tf-stacked-bar__legend-swatch--tone-primary  { background: var(--tf-accent-1); }
+.tf-stacked-bar__legend-swatch--tone-accent   { background: var(--tf-accent-3); }
 .tf-stacked-bar__legend-swatch--tone-info     { background: var(--tf-info); }
 .tf-stacked-bar__legend-swatch--tone-success  { background: var(--tf-success); }
 .tf-stacked-bar__legend-swatch--tone-warning  { background: var(--tf-warning); }
@@ -7110,6 +7368,7 @@ tf-skeleton {
 .tf-pie-chart__slice:hover { opacity: 0.85; cursor: default; }
 .tf-pie-chart__slice--tone-neutral  { fill: var(--tf-text); }
 .tf-pie-chart__slice--tone-primary  { fill: var(--tf-accent-1); }
+.tf-pie-chart__slice--tone-accent   { fill: var(--tf-accent-3); }
 .tf-pie-chart__slice--tone-info     { fill: var(--tf-info); }
 .tf-pie-chart__slice--tone-success  { fill: var(--tf-success); }
 .tf-pie-chart__slice--tone-warning  { fill: var(--tf-warning); }
@@ -7137,6 +7396,7 @@ tf-skeleton {
 .tf-pie-chart__legend-swatch { width: 0.85em; height: 0.85em; border-radius: 2px; flex: 0 0 auto; }
 .tf-pie-chart__legend-swatch--tone-neutral  { background: var(--tf-text); }
 .tf-pie-chart__legend-swatch--tone-primary  { background: var(--tf-accent-1); }
+.tf-pie-chart__legend-swatch--tone-accent   { background: var(--tf-accent-3); }
 .tf-pie-chart__legend-swatch--tone-info     { background: var(--tf-info); }
 .tf-pie-chart__legend-swatch--tone-success  { background: var(--tf-success); }
 .tf-pie-chart__legend-swatch--tone-warning  { background: var(--tf-warning); }

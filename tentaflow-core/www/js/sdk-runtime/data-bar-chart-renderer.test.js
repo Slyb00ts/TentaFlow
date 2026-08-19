@@ -90,7 +90,7 @@ function stackedBarFields({
 // BarChart
 // ============================================================================
 
-test('BarChart vertical stacking=none renderuje grouped <rect> per series per category', () => {
+test('BarChart vertical stacking=none renderuje grouped bar per series per category', () => {
   setup();
   const store = makeStore();
   store.applySnapshot({
@@ -106,7 +106,7 @@ test('BarChart vertical stacking=none renderuje grouped <rect> per series per ca
   })));
   document.body.appendChild(el);
   // 2 categories × 2 series = 4 bars.
-  assertEq(el.querySelectorAll('rect.tf-chart__bar').length, 4);
+  assertEq(el.querySelectorAll('.tf-chart__bar').length, 4);
   assert(el.querySelector('.tf-chart__bar--tone-success') != null);
   assert(el.querySelector('.tf-chart__bar--tone-critical') != null);
 });
@@ -128,7 +128,7 @@ test('BarChart vertical stacking=stacked renderuje per category stack', () => {
   })));
   document.body.appendChild(el);
   assert(el.classList.contains('tf-chart--stacking-stacked'));
-  assertEq(el.querySelectorAll('rect.tf-chart__bar').length, 4);
+  assertEq(el.querySelectorAll('.tf-chart__bar').length, 4);
 });
 
 test('BarChart vertical stacking=percent normalizuje do 100%', () => {
@@ -147,7 +147,7 @@ test('BarChart vertical stacking=percent normalizuje do 100%', () => {
     stacking: 'percent',
   })));
   document.body.appendChild(el);
-  assertEq(el.querySelectorAll('rect.tf-chart__bar').length, 2);
+  assertEq(el.querySelectorAll('.tf-chart__bar').length, 2);
 });
 
 test('BarChart horizontal renderuje category labels po lewej', () => {
@@ -227,7 +227,7 @@ test('BarChart legend toggle ukrywa bars + emit series_toggle', () => {
   el.addEventListener('series_toggle', (e) => { got = e.detail; });
   el.querySelector('.tf-chart__legend-item').click();
   assertEq(got.hidden, true);
-  assertEq(el.querySelectorAll('rect.tf-chart__bar').length, 0);
+  assertEq(el.querySelectorAll('.tf-chart__bar').length, 0);
 });
 
 test('BarChart reactive: update series rebuilds bars', () => {
@@ -242,12 +242,12 @@ test('BarChart reactive: update series rebuilds bars', () => {
     series: [chartSeries('s', PATH('s'))],
   })));
   document.body.appendChild(el);
-  assertEq(el.querySelectorAll('rect.tf-chart__bar').length, 1);
+  assertEq(el.querySelectorAll('.tf-chart__bar').length, 1);
   store.applyPatch({
     base_revision: 0, new_revision: 1,
     ops: [{ path: PATH('s'), op: { kind: 'set', value: [{ x: 'A', y: 1 }, { x: 'B', y: 2 }, { x: 'C', y: 3 }] } }],
   });
-  assertEq(el.querySelectorAll('rect.tf-chart__bar').length, 3);
+  assertEq(el.querySelectorAll('.tf-chart__bar').length, 3);
 });
 
 test('BarChart pusta series throws', () => {
@@ -496,6 +496,103 @@ test('StackedBar negative segment value treated as 0', () => {
   const segs = el.querySelectorAll('.tf-stacked-bar__segment');
   assertEq(segs[0].style.width, '0%');
   assertEq(segs[1].style.width, '30%');
+});
+
+// ---- <tf-bar-chart> component contract (analytics charts) ----
+
+function makeBarChart(opts = {}) {
+  const el = document.createElement('tf-bar-chart');
+  el.height = opts.height ?? 200;
+  if (opts.stacking) el.stacking = opts.stacking;
+  if (opts.tooltip) el.tooltip = opts.tooltip;
+  if (opts.narrow !== undefined) el.narrow = opts.narrow;
+  el.series = opts.series;
+  document.body.appendChild(el);
+  return el;
+}
+function daySeries(id, tone, n, base) {
+  return {
+    id, name: id, tone, style: 'solid', showInLegend: true,
+    points: Array.from({ length: n }, (_, i) => ({ x: String(i + 1).padStart(2, '0') + '.08', y: base * (i + 1) })),
+  };
+}
+
+test('tf-bar-chart: tooltip domyślnie włączony (element .tf-chart__tooltip + crosshair)', () => {
+  setup();
+  const el = makeBarChart({ series: [daySeries('a', 'primary', 3, 10)] });
+  assert(el.querySelector('.tf-chart__tooltip') != null, 'tooltip element expected by default');
+  assert(el.querySelector('line.tf-chart__crosshair') != null, 'crosshair expected by default');
+  const off = makeBarChart({ series: [daySeries('a', 'primary', 3, 10)], tooltip: { enabled: false } });
+  assertEq(off.querySelector('.tf-chart__tooltip'), null);
+  assertEq(off.querySelector('.tf-chart__crosshair'), null);
+});
+
+test('tf-bar-chart stacked: tylko górny segment to <path> z zaokrąglonym szczytem', () => {
+  setup();
+  const el = makeBarChart({
+    stacking: 'stacked',
+    series: [daySeries('completion', 'primary', 2, 100), daySeries('prompt', 'accent', 2, 50)],
+  });
+  const rects = el.querySelectorAll('rect.tf-chart__bar');
+  const paths = el.querySelectorAll('path.tf-chart__bar');
+  assertEq(rects.length, 2, 'lower segments are plain rects');
+  assertEq(paths.length, 2, 'top segments are paths');
+  for (const p of paths) {
+    assert(p.classList.contains('tf-chart__bar--tone-accent'), 'top segment belongs to the last series');
+    const d = p.getAttribute('d');
+    // Two quadratic corners at the top, straight vertical sides down to the base.
+    assertEq((d.match(/Q/g) || []).length, 2, `expected two rounded corners in ${d}`);
+    assert(/^M[\d.]+,[\d.]+V/.test(d) && d.endsWith('Z'), `path starts at the base and closes: ${d}`);
+  }
+  // Every bar of a category grows from the axis with the same stagger delay.
+  const bars = el.querySelectorAll('.tf-chart__bar--enter');
+  assertEq(bars.length, 4);
+  assertEq(bars[0].style.animationDelay, bars[1].style.animationDelay);
+  assertEq(bars[2].style.animationDelay, '12ms');
+  assert(/^0(px)? [\d.]+px$/.test(bars[0].style.transformOrigin), `origin at the axis: ${bars[0].style.transformOrigin}`);
+});
+
+test('tf-bar-chart narrow: wąski plot rysuje tylko ostatnie maxPoints kategorii', () => {
+  setup();
+  // happy-dom fallback box = height*1.5 = 300 px < breakpoint 560.
+  const el = makeBarChart({ series: [daySeries('a', 'primary', 19, 1000)] });
+  const bars = el.querySelectorAll('.tf-chart__bar');
+  assertEq(bars.length, 10);
+  const labels = Array.from(el.querySelectorAll('.tf-chart__axis--x .tf-chart__axis-label')).map((l) => l.textContent);
+  assertEq(labels[0], '10.08');
+  assertEq(labels[labels.length - 1], '19.08');
+  const wide = makeBarChart({ series: [daySeries('a', 'primary', 19, 1000)], narrow: null });
+  assertEq(wide.querySelectorAll('.tf-chart__bar').length, 19);
+});
+
+test('tf-bar-chart: oś Y formatuje ticki przez fmtCompact (mln/tys)', () => {
+  setup();
+  const el = makeBarChart({ series: [daySeries('a', 'primary', 4, 1_000_000)] });
+  el.locale = 'pl';
+  const labels = Array.from(el.querySelectorAll('.tf-chart__axis--y .tf-chart__axis-label')).map((l) => l.textContent);
+  assert(labels.some((l) => /mln$/.test(l)), `expected "mln" ticks, got ${JSON.stringify(labels)}`);
+  assert(!labels.some((l) => /\d{7}/.test(l)), 'no raw 7-digit numbers on the axis');
+});
+
+test('tf-bar-chart: tone accent → klasa --tone-accent na słupku i swatchu legendy', () => {
+  setup();
+  const el = makeBarChart({ series: [daySeries('prompt', 'accent', 2, 10)] });
+  el.legend = { position: 'top', alignment: 'start' };
+  assert(el.querySelector('.tf-chart__bar--tone-accent') != null);
+  assert(el.querySelector('.tf-chart__legend-swatch--tone-accent') != null);
+});
+
+test('tf-bar-chart: maxBarWidth ogranicza szerokość słupka (domyślnie 34 px)', () => {
+  setup();
+  const el = makeBarChart({ stacking: 'stacked', series: [daySeries('a', 'primary', 2, 10)] });
+  const d = el.querySelector('path.tf-chart__bar').getAttribute('d');
+  const xs = d.match(/[MH]([\d.]+)/g).map((m) => parseFloat(m.slice(1)));
+  const width = Math.max(...xs) - Math.min(...xs) + 3;  // H stops short of the 3 px corner radius
+  assert(Math.abs(width - 34) < 0.01, `expected 34 px bar, got ${width}`);
+  el.maxBarWidth = 20;
+  const d2 = el.querySelector('path.tf-chart__bar').getAttribute('d');
+  const xs2 = d2.match(/[MH]([\d.]+)/g).map((m) => parseFloat(m.slice(1)));
+  assert(Math.abs(Math.max(...xs2) - Math.min(...xs2) + 3 - 20) < 0.01, `expected 20 px bar: ${d2}`);
 });
 
 // ---- report ----

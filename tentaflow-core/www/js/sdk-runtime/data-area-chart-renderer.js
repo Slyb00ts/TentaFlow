@@ -68,7 +68,7 @@ function renderAreaChart(component, ctx) {
   el.xAxis = toComponentAxis(xAxis, ctx.locale);
   el.yAxis = toComponentAxis(yAxis, ctx.locale);
   el.legend = legend;
-  el.tooltip = { enabled: tooltip.enabled, format: makeValueFormatter(tooltip.format, ctx.locale) };
+  el.tooltip = { enabled: tooltip.enabled, valueFormat: makeValueFormatter(tooltip.format, ctx.locale) };
   el.zoom = zoom;
   el.brush = brush;
   el.height = heightPx;
