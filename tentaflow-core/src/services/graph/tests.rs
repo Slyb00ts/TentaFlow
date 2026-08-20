@@ -1386,65 +1386,53 @@ fn test_stale_handle_after_invalidate_does_not_open() {
 
 #[test]
 fn test_delete_cache_miss_resolves_nonempty_path() {
-    // Round 4 bug 2: on a CACHE MISS the delete still resolves a real path — from
-    // the registry row when one exists, otherwise derived from the key — and
-    // never `PathBuf::default()`. A concurrent writer and deleter therefore work
-    // on the same non-empty path: no opening of an empty path, no panic or
-    // corruption, and a fresh create afterwards starts from an empty graph.
-    let (_dir, mgr) = mgr();
-    let mgr = Arc::new(mgr);
-
-    let writer = {
-        let m = Arc::clone(&mgr);
-        std::thread::spawn(move || {
-            for i in 0..200 {
-                let id = format!("w{i}");
-                match m.upsert_node_with_quota(ORG_A, "addon_p", "kg", &id, "", "{}", "null") {
-                    Ok(_) => {}
-                    Err(GraphError::CollectionNotFound { .. }) => {}
-                    Err(GraphError::Backend(_)) => {}
-                    Err(e) => panic!("unexpected writer error: {e}"),
-                }
-            }
-        })
-    };
-    let deleter = {
-        let m = Arc::clone(&mgr);
-        std::thread::spawn(move || {
-            for _ in 0..200 {
-                // Every delete resolves a real path — from the registry row, or
-                // from the key once the row is gone (cache miss). No empty path
-                // => no I/O error on "".
-                m.delete_collection(ORG_A, "addon_p", "kg").unwrap();
-            }
-        })
-    };
-    writer.join().unwrap();
-    deleter.join().unwrap();
-
-    // Domknięcie: brak wiersza, świeże utworzenie pustego grafu.
-    mgr.delete_collection(ORG_A, "addon_p", "kg").unwrap();
+    // Round 4 bug 2: the file a delete erases is resolved UNDER the slot lock —
+    // from the registry row when one exists, otherwise from the path interned in
+    // the canonical cache entry. It must never be `PathBuf::default()`: an empty
+    // path is not an I/O error but a SILENT no-op — `remove_cozo_files("")` finds
+    // nothing to remove, so the delete reports success while the data stays on
+    // disk.
+    //
+    // The row-less branch is the one a CACHE MISS takes, and it is observed
+    // through the file it erases: below, the collection files are on disk while
+    // neither a registry row nor a cache entry exists, so the key-derived path is
+    // the only one the delete can resolve. Resolving anything else — an empty
+    // path included — leaves the files behind.
+    let (dir, mgr) = mgr();
     mgr.ensure_collection(ORG_A, "addon_p", "kg").unwrap();
-    assert_eq!(mgr.node_count(ORG_A, "addon_p", "kg").unwrap(), 0);
+    mgr.upsert_node_with_quota(ORG_A, "addon_p", "kg", "n1", "Acme", "{}", "null")
+        .unwrap();
 
-    // Ścieżka w wierszu DB jest niepusta i deterministyczna (pod tempdir roota).
-    let file_path: String = {
-        let conn = mgr.pool().read().unwrap();
-        conn.query_row(
-            "SELECT file_path FROM addon_graph_collections \
-             WHERE org_id='org-a' AND addon_id='addon_p' AND collection='kg'",
-            [],
-            |r| r.get(0),
+    let expected = dir
+        .path()
+        .join(ORG_A)
+        .join("addon_p")
+        .join("graph")
+        .join("kg.cozo");
+    assert!(expected.exists(), "collection file missing at {expected:?}");
+
+    // Cache miss: the entry and its open backend leave the map, the files stay.
+    mgr.invalidate_addon("addon_p");
+    assert_eq!(mgr.cached_entries(), 0, "invalidate must leave a cache miss");
+
+    // Drop the row while keeping the files, so the delete has nothing but the key
+    // to resolve a path from.
+    {
+        let conn = mgr.pool().write().unwrap();
+        conn.execute(
+            "DELETE FROM addon_graph_collections \
+             WHERE org_id = ?1 AND addon_id = ?2 AND collection = ?3",
+            rusqlite::params![ORG_A, "addon_p", "kg"],
         )
-        .unwrap()
-    };
+        .unwrap();
+    }
+    assert!(expected.exists(), "dropping the row must not touch the files");
+
+    mgr.delete_collection(ORG_A, "addon_p", "kg").unwrap();
+
     assert!(
-        !file_path.is_empty(),
-        "deterministic file path must be non-empty"
-    );
-    assert!(
-        file_path.ends_with("kg.cozo"),
-        "path derived from key: {file_path}"
+        !expected.exists(),
+        "delete resolved a path other than {expected:?} and left the data behind"
     );
 }
 
