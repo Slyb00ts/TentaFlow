@@ -2528,13 +2528,13 @@ async fn create_execution_record(db: &DbPool, flow_id: &str, ctx: &ExecutionCont
     }
     let pool = db.clone();
     let flow_id = flow_id.to_string();
-    let request_id = String::new();
+    let request_id = ctx.request_id.clone();
     let parent_execution_id = ctx.parent_execution_id;
-    let origin = crate::flow_engine::dispatcher::FlowOrigin::default().as_str();
-    let actor_kind = crate::flow_engine::dispatcher::ActorKind::default().as_str();
-    let actor_id: Option<String> = None;
-    let actor_user_id: Option<String> = None;
-    let correlation_id: Option<String> = None;
+    let origin = ctx.origin.as_str();
+    let actor_kind = ctx.actor_kind.as_str();
+    let actor_id = ctx.actor_id.clone();
+    let actor_user_id = ctx.actor_user_id.clone();
+    let correlation_id = ctx.correlation_id.clone();
     let id = tokio::task::spawn_blocking(move || {
         repository::create_flow_execution(
             &pool,
