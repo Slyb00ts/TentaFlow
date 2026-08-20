@@ -339,6 +339,7 @@ pub(crate) fn executor_err_to_core(
             message: format!("executor: {}", err),
             source: None,
         },
+        ExecutorError::SttServiceUnavailable => CoreError::SttServiceUnavailable,
         ExecutorError::TransportPendingCutover(_) => CoreError::AllBackendsUnavailable {
             model_name: model.to_string(),
         },

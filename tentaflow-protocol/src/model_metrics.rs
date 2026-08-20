@@ -69,6 +69,10 @@ pub struct ModelMetricsRowWire {
     /// reports the current time.
     #[serde(default)]
     pub last_seen_at: Option<String>,
+    /// Successful requests whose backend returned no `usage`: their tokens are
+    /// unknown, so `cost` is a lower bound whenever this is non-zero.
+    #[serde(default)]
+    pub usage_missing_count: u64,
 }
 
 /// Wiersz przekroju węzeł×serwis: produkcja modelu na konkretnym node w danym
@@ -109,6 +113,8 @@ pub struct ModelPricingWire {
     pub audio_per_min: f64,
     pub image_each: f64,
     pub updated_at: String,
+    #[serde(default)]
+    pub embedding_per_1k: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, SerdeSerialize, SerdeDeserialize)]
@@ -147,6 +153,8 @@ pub enum ModelMetricsPayload {
         completion_per_1k: f64,
         audio_per_min: f64,
         image_each: f64,
+        #[serde(default)]
+        embedding_per_1k: f64,
     },
     PricingSetResult {
         ok: bool,
@@ -212,6 +220,7 @@ mod tests {
                 subtitle: None,
                 member_count: None,
                 last_seen_at: None,
+                usage_missing_count: 2,
             }],
             grand_total: Some(ModelMetricsRowWire {
                 key: "__grand_total__".to_string(),
@@ -240,6 +249,7 @@ mod tests {
                 subtitle: None,
                 member_count: None,
                 last_seen_at: None,
+                usage_missing_count: 0,
             }),
         });
         let bytes = crate::cbor::encode(&body).expect("encode");
@@ -308,6 +318,7 @@ mod tests {
         assert_eq!(decoded.subtitle, None);
         assert_eq!(decoded.member_count, None);
         assert_eq!(decoded.last_seen_at, None);
+        assert_eq!(decoded.usage_missing_count, 0);
 
         #[derive(serde::Serialize)]
         struct LegacyFilter {

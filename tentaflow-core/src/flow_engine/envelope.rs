@@ -360,8 +360,32 @@ pub struct FlowEnvelope {
     pub trace: Vec<TraceStep>,
 }
 
+/// `envelope.meta` key telling the `tts` node whether the caller wants audio
+/// on the way out. Value is the string `"true"` or `"false"`. A missing key
+/// means `"false"` by contract: a flow produces text unless the caller asked
+/// for audio explicitly, so a shared chat flow with a `tts` node serves text
+/// chat without ever touching a TTS service. Use `FlowEnvelope::wants_output_audio`.
+pub const META_OUTPUT_AUDIO: &str = "output_audio";
+
 impl FlowEnvelope {
     pub const SCHEMA_VERSION: u16 = 1;
+
+    /// Resolves `META_OUTPUT_AUDIO`; only the exact string `"true"` opts in.
+    pub fn wants_output_audio(&self) -> bool {
+        self.meta
+            .get(META_OUTPUT_AUDIO)
+            .and_then(|v| v.as_str())
+            .map(|v| v == "true")
+            .unwrap_or(false)
+    }
+
+    /// Writes `META_OUTPUT_AUDIO` as the `"true"`/`"false"` string contract.
+    pub fn set_output_audio(&mut self, enabled: bool) {
+        self.meta.insert(
+            META_OUTPUT_AUDIO.into(),
+            serde_json::Value::String(if enabled { "true" } else { "false" }.into()),
+        );
+    }
 
     pub fn empty() -> Self {
         Self {

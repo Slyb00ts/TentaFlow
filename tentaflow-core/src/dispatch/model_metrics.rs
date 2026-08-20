@@ -114,6 +114,7 @@ struct SummaryAgg {
     request_count: i64,
     success_count: i64,
     error_count: i64,
+    usage_missing_count: i64,
     cost: f64,
     missing_pricing: bool,
     ttft: [i64; 10],
@@ -136,6 +137,7 @@ impl SummaryAgg {
         self.request_count += row.request_count;
         self.success_count += row.success_count;
         self.error_count += row.error_count;
+        self.usage_missing_count += row.usage_missing_count;
         self.cost += row_cost;
         // Percentyle wolno liczyc tylko z jednej wersji rozkladu — sumowanie
         // kubelkow o roznych krawedziach daloby bezsensowne percentyle. Wiersze
@@ -176,6 +178,7 @@ impl SummaryAgg {
             error_count: self.error_count,
             cost: self.cost,
             missing_pricing: self.missing_pricing,
+            usage_missing_count: u64::try_from(self.usage_missing_count).unwrap_or(0),
             error_rate,
             ttft_p50: percentile_from_histogram(&self.ttft, &ttft_edges, self.ttft_samples, 50.0),
             ttft_p90: percentile_from_histogram(&self.ttft, &ttft_edges, self.ttft_samples, 90.0),
@@ -392,13 +395,18 @@ fn row_cost(row: &DbModelMetricsRollup, pricing: Option<&DbModelPricing>) -> f64
         + (row.completion_tokens as f64 / 1000.0) * p.completion_per_1k
         + (row.audio_ms as f64 / 60_000.0) * p.audio_per_min
         + (row.images as f64) * p.image_each
+        + (row.embedding_tokens as f64 / 1000.0) * p.embedding_per_1k
 }
 
 /// Czy wiersz niesie jakies rozliczalne uzycie (tokeny/audio/obrazy). Brak
 /// cennika ma znaczenie tylko dla takich wierszy — model bez uzycia nie zaklamie
 /// kosztu, wiec nie oznaczamy go jako `missing_pricing`.
 fn row_is_billable(row: &DbModelMetricsRollup) -> bool {
-    row.prompt_tokens > 0 || row.completion_tokens > 0 || row.audio_ms > 0 || row.images > 0
+    row.prompt_tokens > 0
+        || row.completion_tokens > 0
+        || row.audio_ms > 0
+        || row.images > 0
+        || row.embedding_tokens > 0
 }
 
 /// Waliduje pojedyncza wartosc cennika: musi byc skonczona i nieujemna, inaczej
@@ -442,6 +450,7 @@ pub async fn model_metrics_dispatch(
             completion_per_1k,
             audio_per_min,
             image_each,
+            embedding_per_1k,
         } => pricing_set_v1(
             ctx,
             model_id,
@@ -449,6 +458,7 @@ pub async fn model_metrics_dispatch(
             *completion_per_1k,
             *audio_per_min,
             *image_each,
+            *embedding_per_1k,
         ),
         ModelMetricsPayload::SummaryResponse { .. }
         | ModelMetricsPayload::NodeServiceResponse { .. }
@@ -762,6 +772,7 @@ fn pricing_to_wire(p: DbModelPricing) -> ModelPricingWire {
         audio_per_min: p.audio_per_min,
         image_each: p.image_each,
         updated_at: p.updated_at,
+        embedding_per_1k: p.embedding_per_1k,
     }
 }
 
@@ -784,12 +795,14 @@ fn pricing_set_v1(
     completion_per_1k: f64,
     audio_per_min: f64,
     image_each: f64,
+    embedding_per_1k: f64,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_write(ctx)?;
     let validation = validate_pricing_value("prompt_per_1k", prompt_per_1k)
         .and_then(|()| validate_pricing_value("completion_per_1k", completion_per_1k))
         .and_then(|()| validate_pricing_value("audio_per_min", audio_per_min))
-        .and_then(|()| validate_pricing_value("image_each", image_each));
+        .and_then(|()| validate_pricing_value("image_each", image_each))
+        .and_then(|()| validate_pricing_value("embedding_per_1k", embedding_per_1k));
     if let Err(error) = validation {
         return Ok(MessageBody::ModelMetricsBody(
             ModelMetricsPayload::PricingSetResult {
@@ -807,6 +820,7 @@ fn pricing_set_v1(
             completion_per_1k,
             audio_per_min,
             image_each,
+            embedding_per_1k,
         },
     )
     .map_err(|e| db_error("pricing_set", e))?;
@@ -923,6 +937,7 @@ pub(crate) mod tests {
                 request_count: 1,
                 success_count: 1,
                 error_count: 0,
+                usage_missing_count: 0,
             },
             &ModelMetricsTokens {
                 prompt_tokens: tokens / 2,

@@ -85,7 +85,7 @@ impl NodeAdapter for CombineNodeAdapter {
         // Empty payload zostawialy wiszace separatory w prompcie LLM.
         let parts: Vec<String> = sorted
             .iter()
-            .map(|inp| flow_value_to_text(&inp.envelope.payload))
+            .map(|inp| envelope_text(&inp.envelope))
             .filter(|s| !s.is_empty())
             .collect();
         let joined = parts.join(separator);
@@ -111,6 +111,32 @@ impl NodeAdapter for CombineNodeAdapter {
         out.variables = merge_ordered(node, &format!("combine node '{}'", node.id), &sources)?;
         Ok(out)
     }
+}
+
+/// Text representation of one incoming envelope. A textual payload wins;
+/// otherwise the text travels in the trigger's multimodal seed artifacts
+/// (`input_{n}`, e.g. payload=Audio with the typed message in `input_0`), so
+/// the first textual one in key order is used — without it the message would
+/// vanish because Audio renders to "". Blob placeholders stay the last resort.
+fn envelope_text(env: &FlowEnvelope) -> String {
+    if is_textual(&env.payload) {
+        return flow_value_to_text(&env.payload);
+    }
+    let mut keys: Vec<&String> = env
+        .artifacts
+        .iter()
+        .filter(|(k, v)| k.starts_with("input_") && is_textual(v))
+        .map(|(k, _)| k)
+        .collect();
+    keys.sort();
+    match keys.first() {
+        Some(k) => flow_value_to_text(&env.artifacts[*k]),
+        None => flow_value_to_text(&env.payload),
+    }
+}
+
+fn is_textual(v: &FlowValue) -> bool {
+    matches!(v, FlowValue::Text(_) | FlowValue::Json(_))
 }
 
 /// Mapuje dowolny `FlowValue` na string. Dla typow blob-owych zwraca krotki
@@ -288,6 +314,66 @@ mod tests {
             out.payload.as_text(),
             Some("transcript\n\n<file: report.pdf (application/pdf)>")
         );
+    }
+
+    fn audio_value() -> FlowValue {
+        FlowValue::Audio {
+            blob_ref: crate::flow_engine::blob_store::BlobRef {
+                id: "a1".into(),
+                sha256: "cafe".into(),
+                size_bytes: 10,
+                mime: "audio/wav".into(),
+            },
+            mime: "audio/wav".into(),
+            sample_rate: Some(16_000),
+        }
+    }
+
+    #[tokio::test]
+    async fn combine_uses_first_text_input_artifact_when_payload_is_audio() {
+        let adapter = CombineNodeAdapter::new();
+        let mut trigger_env = FlowEnvelope::with_payload(audio_value());
+        trigger_env
+            .artifacts
+            .insert("input_1".into(), FlowValue::Text("second".into()));
+        trigger_env
+            .artifacts
+            .insert("input_0".into(), FlowValue::Text("typed message".into()));
+        let inputs = vec![
+            NodeInput {
+                from_node_id: "a-trigger".into(),
+                from_port: "audio".into(),
+                envelope: Arc::new(trigger_env),
+            },
+            input("b-stt", FlowValue::Text("transcript".into())),
+        ];
+        let out = adapter
+            .execute(&combine_node(None), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.payload.as_text(), Some("typed message\n\ntranscript"));
+    }
+
+    #[tokio::test]
+    async fn combine_skips_audio_input_without_text_artifacts() {
+        let adapter = CombineNodeAdapter::new();
+        let mut trigger_env = FlowEnvelope::with_payload(audio_value());
+        trigger_env
+            .artifacts
+            .insert("input_1".into(), audio_value());
+        let inputs = vec![
+            NodeInput {
+                from_node_id: "a-trigger".into(),
+                from_port: "audio".into(),
+                envelope: Arc::new(trigger_env),
+            },
+            input("b-stt", FlowValue::Text("transcript".into())),
+        ];
+        let out = adapter
+            .execute(&combine_node(None), &inputs, &stub_ctx())
+            .await
+            .unwrap();
+        assert_eq!(out.payload.as_text(), Some("transcript"));
     }
 
     #[tokio::test]

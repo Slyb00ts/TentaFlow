@@ -9,6 +9,8 @@
 //     tekst (do bąbla) obok audio. Oba tryby robią cleaning, więc osobny node
 //     `tts_clean` nie jest wymagany przy używaniu samego TTS.
 // Tekst źródłowy trafia do artifacts['source_text'] (blocking) dla downstream.
+// Gdy envelope.meta[META_OUTPUT_AUDIO] != "true" node jest przezroczysty:
+// tekst/delty LLM płyną 1:1 bez cleaningu i bez rozwiązywania modelu TTS.
 // =============================================================================
 
 use anyhow::{anyhow, Result};
@@ -133,6 +135,18 @@ impl NodeAdapter for TtsNodeAdapter {
             .ok_or_else(|| anyhow!("tts adapter: missing input edge"))?;
         let envelope = &input.envelope;
 
+        // Pass-through is decided before any model lookup so a text-only
+        // caller never depends on a TTS service being configured.
+        if !envelope.wants_output_audio() {
+            return match &envelope.payload {
+                FlowValue::Text(_) => Ok((**envelope).clone()),
+                other => Err(anyhow!(
+                    "tts adapter: payload must be Text, got {}",
+                    other.kind()
+                )),
+            };
+        }
+
         let text = match &envelope.payload {
             FlowValue::Text(t) if !t.is_empty() => t.clone(),
             FlowValue::Text(_) | FlowValue::Empty => {
@@ -210,6 +224,11 @@ impl StreamingNodeAdapter for TtsNodeAdapter {
         seed_envelope: Arc<FlowEnvelope>,
         ctx: &ExecutionContext,
     ) -> Result<BoxStream<'static, Result<EnvelopeDelta>>> {
+        // Pass-through is decided before any model lookup so a text-only
+        // caller never depends on a TTS service being configured.
+        if !seed_envelope.wants_output_audio() {
+            return Ok(upstream);
+        }
         let max_buffer_chars = node
             .config
             .get("max_buffer_chars")
@@ -534,6 +553,12 @@ mod tests {
         }
     }
 
+    fn audio_envelope() -> FlowEnvelope {
+        let mut env = FlowEnvelope::empty();
+        env.set_output_audio(true);
+        env
+    }
+
     fn input(envelope: FlowEnvelope) -> NodeInput {
         NodeInput {
             from_node_id: "trigger".into(),
@@ -600,7 +625,7 @@ mod tests {
 
     #[tokio::test]
     async fn blocking_synthesizes_text_into_audio_with_cleaning() {
-        let mut env = FlowEnvelope::empty();
+        let mut env = audio_envelope();
         env.payload = FlowValue::Text("hello".into());
         let mut ctx = stub_ctx();
         let f = fake();
@@ -654,7 +679,7 @@ mod tests {
             .process_stream(
                 &node(json!({"model": "m"})),
                 upstream,
-                Arc::new(FlowEnvelope::empty()),
+                Arc::new(audio_envelope()),
                 &ctx,
             )
             .await
@@ -689,7 +714,7 @@ mod tests {
             .process_stream(
                 &node(json!({"model": "m", "forward_text": true})),
                 upstream,
-                Arc::new(FlowEnvelope::empty()),
+                Arc::new(audio_envelope()),
                 &ctx,
             )
             .await
@@ -706,5 +731,101 @@ mod tests {
         }
         assert!(text >= 1, "spodziewano się przepuszczonego tekstu");
         assert!(audio >= 1, "spodziewano się audio");
+    }
+
+    /// Dispatcher that fails loudly — pass-through must never reach it.
+    struct PanicTts;
+    #[async_trait]
+    impl TtsDispatcher for PanicTts {
+        async fn synthesize(&self, _req: TtsRequest) -> Result<TtsResponse> {
+            panic!("tts dispatcher must not be called in pass-through mode");
+        }
+        async fn stream_synthesize(
+            &self,
+            _req: TtsRequest,
+        ) -> Result<BoxStream<'static, Result<crate::flow_engine::dispatchers::TtsStreamChunk>>>
+        {
+            panic!("tts dispatcher must not be called in pass-through mode");
+        }
+    }
+
+    #[tokio::test]
+    async fn blocking_pass_through_returns_text_without_model() {
+        let mut env = FlowEnvelope::empty();
+        env.payload = FlowValue::Text("hello".into());
+        let mut ctx = stub_ctx();
+        ctx.tts = Arc::new(PanicTts);
+
+        // No `model` in node config nor meta — pass-through must not need one.
+        let out = TtsNodeAdapter::new()
+            .execute(&node(json!({})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+
+        assert_eq!(out.payload, FlowValue::Text("hello".into()));
+        assert!(out.artifacts.get("source_text").is_none());
+    }
+
+    #[tokio::test]
+    async fn blocking_explicit_false_is_pass_through() {
+        let mut env = FlowEnvelope::empty();
+        env.set_output_audio(false);
+        env.payload = FlowValue::Text("hello".into());
+        let mut ctx = stub_ctx();
+        ctx.tts = Arc::new(PanicTts);
+
+        let out = TtsNodeAdapter::new()
+            .execute(&node(json!({"model": "m"})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.payload, FlowValue::Text("hello".into()));
+    }
+
+    #[tokio::test]
+    async fn streaming_pass_through_forwards_llm_deltas_in_order() {
+        let mut ctx = stub_ctx();
+        ctx.tts = Arc::new(PanicTts);
+
+        let deltas = ["First sentence.", " Second!", " tail without terminator"];
+        let chunks: Vec<Result<EnvelopeDelta>> = deltas
+            .iter()
+            .enumerate()
+            .map(|(i, d)| {
+                Ok(EnvelopeDelta::Llm(LlmStreamChunk {
+                    choice_index: 0,
+                    text_delta: (*d).into(),
+                    finish_reason: (i == deltas.len() - 1).then_some(FinishReason::Stop),
+                    ..Default::default()
+                }))
+            })
+            .collect();
+        let upstream = futures::stream::iter(chunks).boxed();
+
+        // No `model` anywhere and a forward_text config — pass-through ignores both.
+        let mut out = TtsNodeAdapter::new()
+            .process_stream(
+                &node(json!({"forward_text": true})),
+                upstream,
+                Arc::new(FlowEnvelope::empty()),
+                &ctx,
+            )
+            .await
+            .unwrap();
+
+        let mut got = Vec::new();
+        let mut last_finish = None;
+        while let Some(item) = out.next().await {
+            match item.unwrap() {
+                EnvelopeDelta::Llm(c) => {
+                    got.push(c.text_delta);
+                    if c.finish_reason.is_some() {
+                        last_finish = c.finish_reason;
+                    }
+                }
+                other => panic!("pass-through must emit only Llm deltas, got {other:?}"),
+            }
+        }
+        assert_eq!(got, deltas);
+        assert_eq!(last_finish, Some(FinishReason::Stop));
     }
 }

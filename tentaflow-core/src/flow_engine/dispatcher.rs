@@ -90,11 +90,19 @@ pub enum DispatchError {
     Unsupported { service_type: String, model: String },
     #[error("flow dispatch internal: {0}")]
     Internal(String),
+    /// No running STT service on this node (typed so the edge answers 503).
+    #[error("{}", crate::error::CoreError::SttServiceUnavailable)]
+    SttServiceUnavailable,
 }
 
 impl From<anyhow::Error> for DispatchError {
     fn from(e: anyhow::Error) -> Self {
-        DispatchError::Internal(e.to_string())
+        match e.downcast_ref::<crate::error::CoreError>() {
+            Some(crate::error::CoreError::SttServiceUnavailable) => {
+                DispatchError::SttServiceUnavailable
+            }
+            _ => DispatchError::Internal(e.to_string()),
+        }
     }
 }
 
@@ -1053,11 +1061,15 @@ fn wrap_blocking_as_stream(
         }
     })
     .boxed();
+    // No producer ran here — the final envelope is the closest equivalent, it
+    // carries the meta every node wrote on the way.
+    let producer_input = Arc::new(outcome.final_envelope.clone());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(outcome);
     StreamingExecution {
         stream,
         outcome: rx,
+        producer_input,
     }
 }
 

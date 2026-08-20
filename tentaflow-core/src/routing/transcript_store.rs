@@ -179,6 +179,22 @@ pub fn push(builder: TranscriptBuilder) {
     push_entry(builder.build());
 }
 
+/// Ostatnie `limit` wpisow danego spotkania z ring-buffera (chronologicznie).
+/// Zasila kontekst tury Meeting Bota — live bufor wystarcza, bo chodzi o
+/// kilka ostatnich wypowiedzi, nie o pelna historie z DB.
+pub fn recent_for_meeting(meeting_id: &str, limit: usize) -> Vec<TranscriptEntry> {
+    let guard = store().read();
+    let mut out: Vec<TranscriptEntry> = guard
+        .iter()
+        .rev()
+        .filter(|e| e.meeting_id.as_deref() == Some(meeting_id))
+        .take(limit)
+        .cloned()
+        .collect();
+    out.reverse();
+    out
+}
+
 #[allow(dead_code)]
 pub fn clear() {
     store().write().clear();

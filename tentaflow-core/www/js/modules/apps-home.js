@@ -1,6 +1,6 @@
 // =============================================================================
-// File: modules/apps-home.js — User home: greeting banner + tiled apps grid.
-// Rendered as the default screen for role=user. Each tile navigates via Router.
+// File: modules/apps-home.js — Home: greeting banner + tiled apps grid.
+// Rendered as the start screen for every role. Each tile navigates via Router.
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
@@ -8,8 +8,7 @@ import { Router } from '/js/router.js';
 import { I18n } from '/js/i18n.js';
 import { byId, escapeHtml } from '/js/utils.js';
 
-// App tiles. Tiles whose backend handlers are not yet wired carry `soon: true`
-// and render as non-navigable placeholders (kept in sync with app.js USER_NAV).
+// App tiles (kept in sync with app.js APPS_NAV).
 // `requiresPowerUser` tiles are rendered only for Power User / Admin — the tile
 // is filtered out before it ever reaches the DOM, mirroring the backend policy.
 const TILES = [
@@ -17,9 +16,8 @@ const TILES = [
   { id: 'code-studio',  route: 'code-studio',  icon: 'terminal' },
   { id: 'projekty',     route: 'projekty',     icon: 'folder' },
   { id: 'ml-studio',    route: 'ml-studio',    icon: 'brain',        requiresPowerUser: true },
-  { id: 'images',       route: 'images',       icon: 'image',        soon: true },
-  { id: 'meeting',      route: 'meeting',      icon: 'meeting',      soon: true },
-  { id: 'pose',         route: 'pose',         icon: 'image' },
+  { id: 'benchmark-studio', route: 'benchmark-studio', icon: 'trend', requiresPowerUser: true },
+  { id: 'meeting',      route: 'meeting',      icon: 'meeting' },
   { id: 'translate',    route: 'translate',    icon: 'globe' },
 ];
 
@@ -30,11 +28,8 @@ function sprite(id) {
 function renderTile(t) {
   const name = escapeHtml(I18n.t(`apps.${t.id}.name`));
   const desc = escapeHtml(I18n.t(`apps.${t.id}.desc`));
-  const badge = t.soon ? `<span class="badge-soon">${escapeHtml(I18n.t('apps.badge_soon'))}</span>` : '';
-  const cls = `app-tile${t.soon ? ' coming-soon' : ''}`;
   return `
-    <div class="${cls}" data-route="${escapeHtml(t.route)}" data-soon="${t.soon ? '1' : '0'}">
-      ${badge}
+    <div class="app-tile" data-route="${escapeHtml(t.route)}">
       <div class="app-icon">${sprite(t.icon)}</div>
       <div class="app-name">${name}</div>
       <div class="app-desc">${desc}</div>
@@ -166,8 +161,6 @@ const AppsHomeScreen = {
           }
           return;
         }
-        // Soon tiles still navigate — the target screen explains the status
-        // honestly instead of faking a feature.
         const route = el.dataset.route;
         if (route) Router.navigate(route);
       });

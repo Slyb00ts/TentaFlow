@@ -1517,6 +1517,7 @@
     "scheduler": "Scheduler",
     "agents": "Agenten",
     "skills": "Skills",
+    "robots": "Roboter",
     "playground": "Playground",
     "chat": "Chat",
     "rules": "Regeln",
@@ -1525,6 +1526,7 @@
     "logout": "Abmelden",
     "addons": "Addons",
     "users": "Benutzer",
+    "access_keys": "Zugriff & API-Schlüssel",
     "roles_catalog": "Rollenkatalog",
     "audit": "Audit-Protokoll",
     "legal": "DSGVO-Dokumente",
@@ -1534,12 +1536,13 @@
     "section_core": "Kern",
     "section_workflows": "Workflows",
     "section_ai_agents": "KI-Agenten",
-    "section_integrations": "Integrationen",
     "section_management": "Verwaltung",
     "section_apps": "Meine Apps",
     "section_account": "Konto",
     "apps_home": "Alle Anwendungen",
-    "images": "Bilder",
+    "code_studio": "Code Studio",
+    "projekty": "Projekte",
+    "ml_studio": "ML Studio",
     "tts": "Sprachausgabe",
     "translate": "Übersetzer",
     "search_app": "Suchen",
@@ -2791,6 +2794,7 @@
     "minimap_label": "Minikarte",
     "minimap_name": "Karte",
     "autosave_saved": "Gespeichert",
+    "system_readonly": "Dies ist ein TentaFlow-Systemflow — nur Vorschau.",
     "autosave_pending": "Ungespeicherte Änderungen…",
     "autosave_error": "Speicherfehler",
     "save_success": "Flow gespeichert",
@@ -3095,6 +3099,14 @@
     "col_actions": "Aktionen",
     "edit_title": "Bearbeiten",
     "history_title_short": "Ausführungsverlauf",
+    "system_chip": "System",
+    "factory_chip": "Werkseinstellung",
+    "factory_restore": "Werksversion wiederherstellen",
+    "factory_restore_confirm": "Werksversion des Flows \"{name}\" wiederherstellen?",
+    "factory_restore_desc": "Die aktuelle Version wird im Versionsverlauf gespeichert, sodass Sie dorthin zurückkehren können.",
+    "factory_restore_btn": "Wiederherstellen",
+    "factory_restored_ok": "Werksversion des Flows \"{name}\" wiederhergestellt",
+    "preview": "Vorschau",
     "delete_title": "Löschen",
     "close_title": "Schließen",
     "default_name": "Neuer Flow",
@@ -3989,6 +4001,8 @@
     "audio_pipeline_pending": "Starte ein Gespräch mit dem Mikrofon",
     "audio_engine_missing": "No audio engine installed",
     "audio_no_engine": "No engine",
+    "stt_no_service": "Kein STT-Dienst läuft — stellen Sie unter Dienste eine STT-Engine bereit, um per Sprache zu sprechen.",
+    "tts_no_service": "Kein TTS-Dienst läuft — stellen Sie unter Dienste eine TTS-Engine bereit, damit der Assistent sprechen kann.",
     "audio_preview_hint": "Audiomodus — Assistentengesicht mit Leerlauf-Animation. Tippe auf das Mikrofon, um ein Sprachgespräch zu starten.",
     "audio_start_mic": "Click to start the conversation",
     "audio_mic_denied": "Microphone access denied",
@@ -4039,6 +4053,7 @@
     "url_placeholder": "https://teams.microsoft.com/l/meetup-join/...",
     "url_hint": "Vollständige Teams-Meeting-URL einfügen. Der Bot tritt als Teilnehmer bei.",
     "url_required": "Meeting-URL ist erforderlich",
+    "stt_no_service": "Kein STT-Dienst läuft — stellen Sie unter Dienste eine STT-Engine bereit, bevor der Bot einem Meeting beitritt.",
     "join": "Meeting beitreten",
     "leave": "Meeting verlassen",
     "join_success": "Bot tritt dem Meeting bei...",
@@ -4141,7 +4156,7 @@
     "disclaimer_never": "Deaktiviert",
     "sett_pipeline_title": "Audio-Pipeline",
     "sett_pipeline_sub": "STT-Engine und Diarisierung — gilt ab dem nächsten Meeting.",
-    "sett_stt_hint": "Router-Alias, z.B. whisper-large-v3",
+    "sett_stt_hint": "Router-Alias oder Name des bereitgestellten STT-Dienstes (leer = teams-stt)",
     "sett_tts_hint": "Optional — TTS für Bot-Antworten",
     "sett_diarization": "Diarisierung",
     "sett_diarization_hint": "Sprechererkennung",
@@ -4155,8 +4170,8 @@
     "sett_ai_sub": "LLM-Modell für die Zusammenfassung.",
     "sett_llm_hint": "Router-Alias, z.B. qwen-3.5-0.8b",
     "sett_flow": "Flow",
-    "sett_flow_hint": "Orchestrator-Flow des Bots. Standard: \"Default Chat\".",
-    "sett_flow_default": "Standard (Default Chat)",
+    "sett_flow_hint": "Flow für jede Äußerung (STT → LLM → TTS). Standard: \"Meeting Bot\".",
+    "sett_flow_default": "Standard (Meeting Bot)",
     "sett_insights": "KI-Insights-Frequenz",
     "sett_insights_hint": "Wie oft der Bot KI-Anmerkungen einfügt",
     "insights_auto": "Auto (alle 30s oder bei Action Item)",
@@ -4528,7 +4543,6 @@
       "name": "Projekte",
       "desc": "Wissensdatenbank, Chat und Team des Projekts"
     },
-    "badge_soon": "Bald",
     "chat": {
       "name": "Chat",
       "desc": "Mit einem lokalen Modell sprechen"
@@ -4537,9 +4551,9 @@
       "name": "ML Studio",
       "desc": "Vision-Modelle annotieren und trainieren"
     },
-    "images": {
-      "name": "Bilder",
-      "desc": "Bilder mit KI erzeugen"
+    "benchmark-studio": {
+      "name": "Benchmark Studio",
+      "desc": "Leistung und Qualität von Modellen messen"
     },
     "meeting": {
       "name": "Meeting-Bot",
@@ -4571,13 +4585,7 @@
     }
   },
   "coming_soon": {
-    "heading": "Noch nicht verfügbar",
-    "back": "Zurück zu den Apps",
-    "images": "Die Bilderzeugung benötigt eine image-gen Engine (z. B. Stable Diffusion, ComfyUI). Bitte deinen Administrator, eine aus dem Dienstkatalog bereitzustellen.",
-    "meeting": "Meeting-Bot benötigt das teams-bot Addon mit OAuth und einen binären Transkript-Handler. Auf der Roadmap.",
-    "tts": "Sprachausgabe benötigt eine bereitgestellte TTS-Engine und einen Synthese-Handler. Die Admin-Regeln existieren bereits; die Nutzerseite ist auf der Roadmap.",
-    "translate": "Übersetzen wird den Chat-LLM-Backend nutzen, sobald ein eigener Nutzer-Handler angebunden ist. Auf der Roadmap.",
-    "search": "Suche über deine Daten ist auf der Roadmap."
+    "back": "Zurück zu den Apps"
   },
   "profile": {
     "title": "Profil",
@@ -5780,7 +5788,10 @@
     "billing_partial_note": "keine Preise: {count} {count|Modell|Modelle} · Teilkosten",
     "pricing_title": "Modellpreise",
     "pricing_hint": "Sätze pro 1K Tokens · Audio pro Minute · Bild pro Stück · Speichern pro Zeile",
-    "pricing_formula": "Kosten = Prompt·Satz + Completion·Satz + Audio + Bilder",
+    "pricing_formula": "Kosten = Prompt·Satz + Completion·Satz + Audio + Bilder + Embeddings·Satz",
+    "col_price_embedding": "Embedding / 1 Tsd.",
+    "col_usage_missing": "Anfragen ohne Token-Daten",
+    "usage_missing_note": "Kosten unvollständig: {count} {count|Anfrage|Anfragen} ohne Token-Daten",
     "no_pricing": "Keine Modelle zu bepreisen.",
     "pricing_saved": "Preise gespeichert.",
     "pricing_invalid": "Ungültige Sätze."

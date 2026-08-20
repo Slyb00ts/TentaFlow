@@ -73,10 +73,11 @@ const LOBBY_GRACE: Duration = Duration::from_secs(3600);
 /// mic injection przez monkey-patch getUserMedia + MediaStreamTrackGenerator.
 const AUDIO_BRIDGE_JS: &str = include_str!("browser_inject.js");
 
-/// Uruchamia headless Chromium z wczytanymi cookies sesji.
-/// Kazde uruchomienie tworzy UNIKALNY user_data_dir — bez tego Chromium
-/// przy drugim launch'u blokuje sie na "profile locked".
-pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
+/// Uruchamia headless Chromium. Kazde uruchomienie tworzy UNIKALNY
+/// user_data_dir — bez tego Chromium przy drugim launch'u blokuje sie na
+/// "profile locked". Cookies sesji laduje `join_meeting` na juz otwartej
+/// stronie (`load_auth_cookies`), zanim padnie nawigacja do Teams.
+pub async fn launch_chromium() -> Result<Browser> {
     let instance_id = uuid::Uuid::new_v4().to_string();
     // std::env::temp_dir() — przenosne miedzy linux (/tmp), macOS (/var/folders/...)
     // i Windows (C:\Users\<user>\AppData\Local\Temp). Docker dziala dalej tak samo
@@ -210,15 +211,88 @@ pub async fn launch_chromium(config: &MeetingConfig) -> Result<Browser> {
         tracing::info!("Camera/microphone permissions granted for Teams origins");
     }
 
-    // TODO: Wczytanie cookies z config.auth_cookies_path
-    // Cookies Teams sa wymagane do automatycznej autoryzacji.
-    // Format: JSON array z polami name, value, domain, path, httpOnly, secure
-    tracing::info!(
-        cookies_path = %config.auth_cookies_path,
-        "Cookies do wczytania (TODO: implementacja)"
-    );
-
     Ok(browser)
+}
+
+/// Wczytuje cookies sesji Teams z `config.auth_cookies_path` (JSON array w
+/// formacie eksportu przegladarki: `name`, `value`, `domain`, `path`,
+/// `httpOnly`, `secure`, `sameSite`, `expires`/`expirationDate`) i ustawia je
+/// przez CDP zanim strona pojdzie na Teams. Bez pliku bot dolacza jako gosc
+/// albo czeka na reczne logowanie przez VNC — profil Chromium jest za kazdym
+/// razem swiezy, wiec to jedyna droga na zalogowana sesje.
+/// Zwraca liczbe ustawionych cookies.
+async fn load_auth_cookies(page: &Page, cookies_path: &str) -> Result<usize> {
+    use chromiumoxide::cdp::browser_protocol::network::{
+        CookieParam, CookieSameSite, TimeSinceEpoch,
+    };
+
+    let path = std::path::Path::new(cookies_path);
+    if !path.is_file() {
+        tracing::info!(cookies_path, "Brak pliku cookies — sesja bez zalogowania");
+        return Ok(0);
+    }
+    let raw = std::fs::read_to_string(path)
+        .map_err(|e| anyhow::anyhow!("odczyt {cookies_path}: {e}"))?;
+    let entries: Vec<serde_json::Value> = serde_json::from_str(&raw)
+        .map_err(|e| anyhow::anyhow!("{cookies_path} nie jest JSON array cookies: {e}"))?;
+
+    let mut params: Vec<CookieParam> = Vec::with_capacity(entries.len());
+    for entry in &entries {
+        let (Some(name), Some(value)) = (
+            entry.get("name").and_then(|v| v.as_str()),
+            entry.get("value").and_then(|v| v.as_str()),
+        ) else {
+            tracing::warn!("Wpis cookie bez name/value — pomijam");
+            continue;
+        };
+        let mut builder = CookieParam::builder().name(name).value(value);
+        if let Some(domain) = entry.get("domain").and_then(|v| v.as_str()) {
+            builder = builder.domain(domain);
+        }
+        if let Some(cookie_path) = entry.get("path").and_then(|v| v.as_str()) {
+            builder = builder.path(cookie_path);
+        }
+        if let Some(secure) = entry.get("secure").and_then(|v| v.as_bool()) {
+            builder = builder.secure(secure);
+        }
+        if let Some(http_only) = entry.get("httpOnly").and_then(|v| v.as_bool()) {
+            builder = builder.http_only(http_only);
+        }
+        // Eksporty rozjezdzaja sie w nazewnictwie SameSite ("no_restriction"
+        // w rozszerzeniach, "None" w CDP) — normalizujemy do wariantu CDP.
+        if let Some(same_site) = entry.get("sameSite").and_then(|v| v.as_str()) {
+            match same_site.to_ascii_lowercase().as_str() {
+                "strict" => builder = builder.same_site(CookieSameSite::Strict),
+                "lax" => builder = builder.same_site(CookieSameSite::Lax),
+                "none" | "no_restriction" => {
+                    builder = builder.same_site(CookieSameSite::None)
+                }
+                _ => {}
+            }
+        }
+        if let Some(expires) = entry
+            .get("expires")
+            .and_then(|v| v.as_f64())
+            .or_else(|| entry.get("expirationDate").and_then(|v| v.as_f64()))
+        {
+            builder = builder.expires(TimeSinceEpoch::new(expires));
+        }
+        match builder.build() {
+            Ok(param) => params.push(param),
+            Err(e) => tracing::warn!(name, "Cookie odrzucone: {}", e),
+        }
+    }
+
+    if params.is_empty() {
+        tracing::warn!(cookies_path, "Plik cookies nie zawiera zadnego uzytecznego wpisu");
+        return Ok(0);
+    }
+    let count = params.len();
+    page.set_cookies(params)
+        .await
+        .map_err(|e| anyhow::anyhow!("setCookies: {e}"))?;
+    tracing::info!(count, "Cookies sesji Teams ustawione");
+    Ok(count)
 }
 
 /// Nawiguje do URL spotkania Teams i dolacza jako gosc lub czeka na logowanie VNC.
@@ -292,6 +366,12 @@ pub async fn join_meeting(
     // Forward JS console messages z Chromium do naszych logow Rust
     // Dzieki temu bledy ze wstrzyknietego browser_inject.js widac w docker logs
     spawn_console_forwarder(&page).await;
+
+    // Cookies MUSZA byc ustawione przed nawigacja — inaczej Teams zdazy
+    // przekierowac na logowanie zanim sesja bedzie znana przegladarce.
+    if let Err(e) = load_auth_cookies(&page, &config.auth_cookies_path).await {
+        tracing::warn!("Wczytanie cookies nie powiodlo sie: {e}");
+    }
 
     // NIE wywolujemy wait_for_navigation — Teams robi chain redirectow
     // (launcher.html → v2 → light-meetings) i event 'navigation done' nigdy

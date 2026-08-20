@@ -64,6 +64,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             provider: None,
             requires_model: None,
             gpu_supported: None,
+            reverse_requests: false,
             // dgx_spark: brak ograniczen Spark dla testowego silnika
             dgx_spark: None,
             cluster_capable: None,

@@ -17,6 +17,7 @@ use crate::api::openai::types::{SttRequestOptions, TranscriptionRequest};
 use crate::flow_engine::blob_store::BlobStore;
 use crate::flow_engine::dispatchers::{SttDispatcher, SttRequest, SttResponse};
 use crate::services::runtime::context::ExecutionContext as RuntimeContext;
+use crate::services::runtime::executor::ExecutorError;
 
 pub struct SttDispatcherImpl {
     runtime: ModelRuntimeSlot,
@@ -62,10 +63,18 @@ impl SttDispatcher for SttDispatcherImpl {
         };
 
         let mut rctx = RuntimeContext::new(user);
+        // Keep "no STT service" typed (downcastable) through the flow engine
+        // so the HTTP edge can answer 503 instead of a generic 500.
         let response = runtime
             .execute_stt(api_req, &mut rctx)
             .await
-            .map_err(|e| anyhow!("SttDispatcher execute_stt: {e}"))?;
+            .map_err(|e| match e {
+                ExecutorError::SttServiceUnavailable => {
+                    anyhow::Error::from(crate::error::CoreError::SttServiceUnavailable)
+                        .context("SttDispatcher execute_stt")
+                }
+                other => anyhow!("SttDispatcher execute_stt: {other}"),
+            })?;
 
         // Verbose pola serializujemy do JSON żeby przeszły przez SttResponse
         // (envelope artifacts) bez rozszerzania publicznego API

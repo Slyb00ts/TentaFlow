@@ -246,7 +246,10 @@ export const encode = {
    */
   flowInvokeRequest(
     correlationId,
-    { flowId, model, serviceType, mime, sampleRate, audio, language, sessionId },
+    {
+      flowId, model, serviceType, mime, sampleRate, audio, language, sessionId,
+      outputAudio, sttModel, ttsModel,
+    },
     sequence = 1,
   ) {
     assertReady();
@@ -259,6 +262,9 @@ export const encode = {
       audio,
       language ?? undefined,
       sessionId ?? undefined,
+      outputAudio === true,
+      sttModel ?? undefined,
+      ttsModel ?? undefined,
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
@@ -1347,6 +1353,18 @@ export const encode = {
   flowVersionRestoreRequest(correlationId, { flowId, versionId }, sequence = 1) {
     assertReady();
     const body = _wasm.encodeFlowVersionRestoreRequest(String(flowId), String(versionId));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::FlowFactoryRestoreRequest { flowId } */
+  flowFactoryRestoreRequest(correlationId, { flowId }, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeFlowFactoryRestoreRequest(String(flowId));
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),
       BigInt(sequence),
@@ -2651,6 +2669,7 @@ export const encode = {
       Number(payload.completionPer1k ?? payload.completion_per_1k ?? 0),
       Number(payload.audioPerMin ?? payload.audio_per_min ?? 0),
       Number(payload.imageEach ?? payload.image_each ?? 0),
+      Number(payload.embeddingPer1k ?? payload.embedding_per_1k ?? 0),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

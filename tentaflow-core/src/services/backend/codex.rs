@@ -24,7 +24,7 @@ use tracing::warn;
 use crate::api::openai::types::ContentPart;
 use crate::api::openai::types::{
     ChatCompletionChunk, ChatCompletionRequest, ChatCompletionResponse, Choice, ChunkChoice, Delta,
-    Message, MessageContent,
+    Message, MessageContent, Usage,
 };
 use crate::error::{CoreError, Result};
 
@@ -299,9 +299,33 @@ fn apply_headers(req: reqwest::RequestBuilder, creds: &CodexCreds) -> reqwest::R
     req
 }
 
-/// Extract the assistant text from a fully-buffered Responses SSE body.
-fn collect_output_text(sse_body: &str) -> String {
+/// Map `response.usage` from a `response.completed` event onto the OpenAI
+/// chat-completion `Usage`. `output_tokens` already includes
+/// `output_tokens_details.reasoning_tokens`, so reasoning is not added again.
+fn usage_from_completed(ev: &Value) -> Option<Usage> {
+    let usage = ev.get("response")?.get("usage")?;
+    let field = |name: &str| -> Option<u32> {
+        usage
+            .get(name)?
+            .as_u64()
+            .map(|v| v.min(u64::from(u32::MAX)) as u32)
+    };
+    let prompt_tokens = field("input_tokens")?;
+    let completion_tokens = field("output_tokens")?;
+    let total_tokens =
+        field("total_tokens").unwrap_or_else(|| prompt_tokens.saturating_add(completion_tokens));
+    Some(Usage {
+        prompt_tokens,
+        completion_tokens,
+        total_tokens,
+    })
+}
+
+/// Extract the assistant text and the final usage from a fully-buffered
+/// Responses SSE body. Usage is `None` when no `response.completed` arrived.
+fn collect_output_text(sse_body: &str) -> (String, Option<Usage>) {
     let mut out = String::new();
+    let mut usage = None;
     for line in sse_body.lines() {
         let Some(data) = line.trim().strip_prefix("data:") else {
             continue;
@@ -311,17 +335,21 @@ fn collect_output_text(sse_body: &str) -> String {
             continue;
         }
         if let Ok(ev) = serde_json::from_str::<Value>(data) {
-            if ev.get("type").and_then(Value::as_str) == Some("response.output_text.delta") {
-                if let Some(d) = ev.get("delta").and_then(Value::as_str) {
-                    out.push_str(d);
+            match ev.get("type").and_then(Value::as_str) {
+                Some("response.output_text.delta") => {
+                    if let Some(d) = ev.get("delta").and_then(Value::as_str) {
+                        out.push_str(d);
+                    }
                 }
+                Some("response.completed") => usage = usage_from_completed(&ev),
+                _ => {}
             }
         }
     }
-    out
+    (out, usage)
 }
 
-fn build_chat_response(model: &str, text: &str) -> ChatCompletionResponse {
+fn build_chat_response(model: &str, text: &str, usage: Option<Usage>) -> ChatCompletionResponse {
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", uuid::Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -337,7 +365,7 @@ fn build_chat_response(model: &str, text: &str) -> ChatCompletionResponse {
             finish_reason: Some("stop".to_string()),
             logprobs: None,
         }],
-        usage: None,
+        usage,
         system_fingerprint: None,
         transcribed_text: None,
         speaker_id: None,
@@ -475,10 +503,8 @@ pub async fn chat_completion(
         message: format!("Codex responses: read body: {e}"),
         source: Some(e.into()),
     })?;
-    Ok(build_chat_response(
-        &request.model,
-        &collect_output_text(&raw),
-    ))
+    let (text, usage) = collect_output_text(&raw);
+    Ok(build_chat_response(&request.model, &text, usage))
 }
 
 fn role_chunk(id: &str, model: &str, created: u64) -> ChatCompletionChunk {
@@ -489,15 +515,32 @@ fn role_chunk(id: &str, model: &str, created: u64) -> ChatCompletionChunk {
         Some("assistant".to_string()),
         None,
         None,
+        None,
     )
 }
 
 fn content_chunk(id: &str, model: &str, created: u64, delta: &str) -> ChatCompletionChunk {
-    chunk(id, model, created, None, Some(delta.to_string()), None)
+    chunk(
+        id,
+        model,
+        created,
+        None,
+        Some(delta.to_string()),
+        None,
+        None,
+    )
 }
 
-fn finish_chunk(id: &str, model: &str, created: u64) -> ChatCompletionChunk {
-    chunk(id, model, created, None, None, Some("stop".to_string()))
+fn finish_chunk(id: &str, model: &str, created: u64, usage: Option<Usage>) -> ChatCompletionChunk {
+    chunk(
+        id,
+        model,
+        created,
+        None,
+        None,
+        Some("stop".to_string()),
+        usage,
+    )
 }
 
 fn chunk(
@@ -507,6 +550,7 @@ fn chunk(
     role: Option<String>,
     content: Option<String>,
     finish_reason: Option<String>,
+    usage: Option<Usage>,
 ) -> ChatCompletionChunk {
     ChatCompletionChunk {
         id: id.to_string(),
@@ -531,7 +575,7 @@ fn chunk(
         transcribed_text: None,
         speaker_id: None,
         speaker_name: None,
-        usage: None,
+        usage,
         perf: None,
     }
 }
@@ -606,7 +650,7 @@ pub async fn chat_completion_stream(
                         }
                     }
                     Some("response.completed") => {
-                        yield Ok(finish_chunk(&id, &model, created));
+                        yield Ok(finish_chunk(&id, &model, created, usage_from_completed(&ev)));
                         return;
                     }
                     Some("response.failed") => {
@@ -623,9 +667,88 @@ pub async fn chat_completion_stream(
                 }
             }
         }
-        // Stream ended without an explicit response.completed — emit a stop.
-        yield Ok(finish_chunk(&id, &model, created));
+        // Stream ended without an explicit response.completed — emit a stop
+        // without usage rather than guessing token counts.
+        yield Ok(finish_chunk(&id, &model, created, None));
     };
 
     Ok(Box::pin(stream))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const COMPLETED: &str = r#"{"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":120,"input_tokens_details":{"cached_tokens":100},"output_tokens":45,"output_tokens_details":{"reasoning_tokens":30},"total_tokens":165}}}"#;
+
+    #[test]
+    fn usage_from_completed_maps_fields_without_double_counting_reasoning() {
+        let ev: Value = serde_json::from_str(COMPLETED).unwrap();
+        let usage = usage_from_completed(&ev).expect("usage present");
+        assert_eq!(usage.prompt_tokens, 120);
+        assert_eq!(usage.completion_tokens, 45);
+        assert_eq!(usage.total_tokens, 165);
+    }
+
+    #[test]
+    fn usage_from_completed_sums_when_total_missing() {
+        let ev = json!({"type":"response.completed","response":{"usage":{"input_tokens":7,"output_tokens":3}}});
+        let usage = usage_from_completed(&ev).unwrap();
+        assert_eq!(usage.total_tokens, 10);
+    }
+
+    #[test]
+    fn usage_from_completed_none_without_usage() {
+        let ev = json!({"type":"response.completed","response":{"id":"resp_1"}});
+        assert!(usage_from_completed(&ev).is_none());
+    }
+
+    #[test]
+    fn collect_output_text_folds_deltas_and_usage() {
+        let body = [
+            "event: response.created",
+            r#"data: {"type":"response.created"}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","delta":"Hel"}"#,
+            "",
+            r#"data: {"type":"response.output_text.delta","delta":"lo"}"#,
+            "",
+            &format!("data: {COMPLETED}"),
+            "",
+            "data: [DONE]",
+        ]
+        .join("\n");
+        let (text, usage) = collect_output_text(&body);
+        assert_eq!(text, "Hello");
+        let usage = usage.expect("usage from response.completed");
+        assert_eq!(
+            (
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens
+            ),
+            (120, 45, 165)
+        );
+
+        let response = build_chat_response("gpt-5", &text, Some(usage));
+        assert_eq!(response.usage.as_ref().map(|u| u.total_tokens), Some(165));
+    }
+
+    #[test]
+    fn collect_output_text_without_completed_has_no_usage() {
+        let body = r#"data: {"type":"response.output_text.delta","delta":"x"}"#;
+        let (text, usage) = collect_output_text(body);
+        assert_eq!(text, "x");
+        assert!(usage.is_none());
+    }
+
+    #[test]
+    fn finish_chunk_carries_usage_for_metrics_stamping() {
+        let ev: Value = serde_json::from_str(COMPLETED).unwrap();
+        let c = finish_chunk("chatcmpl-1", "gpt-5", 0, usage_from_completed(&ev));
+        assert_eq!(c.choices[0].finish_reason.as_deref(), Some("stop"));
+        assert_eq!(c.usage.as_ref().map(|u| u.completion_tokens), Some(45));
+        assert!(finish_chunk("chatcmpl-1", "gpt-5", 0, None).usage.is_none());
+        assert!(content_chunk("chatcmpl-1", "gpt-5", 0, "a").usage.is_none());
+    }
 }

@@ -276,6 +276,44 @@ pub enum ModelPayload {
     /// klasyfikacja stanu, OCR). Klatki przesyłane binarnie w CBOR
     /// (`serde_bytes`), bez base64.
     CameraCv(CameraCvPayload),
+
+    /// FlowInvoke - jedna tura flow uruchomiona przez serwis sidecar (Meeting
+    /// Bot): audio i/lub tekst wchodzi, Core odpala wskazany flow (STT → LLM →
+    /// TTS) i strumieniuje `Transcript` / `TextDelta` / `AudioChunk` / `Done`.
+    /// Wysyłane wyłącznie jako reverse request (`stream = true`).
+    FlowInvoke(FlowInvokePayload),
+}
+
+/// Segment audio dla `ModelPayload::FlowInvoke` — ten sam kształt danych co
+/// `AudioOperation::STT` (surowe bajty + język), plus `mime`/`sample_rate`,
+/// bo bot wysyła surowe PCM bez nagłówka kontenera.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct FlowInvokeAudio {
+    /// Bajty audio — binarny CBOR byte string (`serde_bytes`), bez base64.
+    #[serde(with = "serde_bytes")]
+    pub audio_data: Vec<u8>,
+    /// Typ zawartości, np. `audio/pcm` (i16 LE mono) albo `audio/wav`.
+    pub mime: String,
+    /// Częstotliwość próbkowania dla surowego PCM (`audio/pcm`).
+    pub sample_rate: Option<u32>,
+    /// Język (ISO-639-1); `None` = autodetekcja po stronie STT.
+    pub language: Option<String>,
+}
+
+/// Payload tury flow wywoływanej przez serwis (patrz `ModelPayload::FlowInvoke`).
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct FlowInvokePayload {
+    /// UUID flow w DB Core. `None` = flow przypisany do sesji po stronie Core.
+    pub flow_id: Option<String>,
+    /// Segment mowy do transkrypcji (trigger `audio`).
+    pub audio: Option<FlowInvokeAudio>,
+    /// Tekst kontekstowy od serwisu (np. podpowiedź o mówcy) — dokładany do
+    /// kontekstu budowanego przez Core, nigdy nie zastępuje transkryptu.
+    pub text: Option<String>,
+    /// Metadane tury (`meeting_id`, `active_speaker`, `roster`, `respond`, ...).
+    pub meta: Vec<(String, String)>,
+    /// Identyfikator sesji po stronie serwisu (np. `meeting_key`).
+    pub session_id: Option<String>,
 }
 
 /// Operacje inspekcji uruchomionej strony przeglądarki w kontenerze bota.
@@ -3026,6 +3064,10 @@ pub enum StreamChunkType {
 
     /// Error podczas streamingu
     Error(ErrorInfo),
+
+    /// Pełny transkrypt wejściowego audio (FlowInvoke). Wysyłany PRZED
+    /// pierwszym `TextDelta`, dokładnie raz na turę.
+    Transcript(String),
 }
 
 /// Informacje z Intent Analyzer (Bielik 1.5B) dla streamingu.
@@ -4006,6 +4048,98 @@ mod camera_cv_tests {
                 assert!(per_frame[1].is_empty());
             }
             _ => panic!("expected CameraCv Detections"),
+        }
+    }
+}
+
+#[cfg(test)]
+mod flow_invoke_tests {
+    use super::*;
+
+    // Roundtrip ModelRequest z FlowInvoke przez CBOR — bajty PCM muszą przeżyć
+    // jako byte string (serde_bytes), a meta/session_id wrócić 1:1.
+    #[test]
+    fn cbor_roundtrip_flow_invoke_request() {
+        let pcm: Vec<u8> = (0..=255).collect();
+        let request = ModelRequest {
+            request_id: "turn-1".to_string(),
+            payload: ModelPayload::FlowInvoke(FlowInvokePayload {
+                flow_id: Some("00000000-0000-4000-8000-000000000060".to_string()),
+                audio: Some(FlowInvokeAudio {
+                    audio_data: pcm.clone(),
+                    mime: "audio/pcm".to_string(),
+                    sample_rate: Some(16_000),
+                    language: Some("pl".to_string()),
+                }),
+                text: Some("Aktywny mówca: Anna".to_string()),
+                meta: vec![
+                    ("meeting_id".to_string(), "mtg-1".to_string()),
+                    ("respond".to_string(), "true".to_string()),
+                ],
+                session_id: Some("mtg-1".to_string()),
+            }),
+            stream: true,
+            metadata: None,
+            session_id: Some("mtg-1".to_string()),
+        };
+        let bytes = crate::cbor::encode(&request).expect("encode");
+        let decoded: ModelRequest = crate::cbor::decode(&bytes).expect("decode");
+        assert!(decoded.stream);
+        match decoded.payload {
+            ModelPayload::FlowInvoke(p) => {
+                assert_eq!(p.flow_id.as_deref(), Some("00000000-0000-4000-8000-000000000060"));
+                let audio = p.audio.expect("audio");
+                assert_eq!(audio.audio_data, pcm);
+                assert_eq!(audio.mime, "audio/pcm");
+                assert_eq!(audio.sample_rate, Some(16_000));
+                assert_eq!(audio.language.as_deref(), Some("pl"));
+                assert_eq!(p.text.as_deref(), Some("Aktywny mówca: Anna"));
+                assert_eq!(p.meta.len(), 2);
+                assert_eq!(p.session_id.as_deref(), Some("mtg-1"));
+            }
+            other => panic!("expected FlowInvoke, got {:?}", other),
+        }
+    }
+
+    // Audio jest opcjonalne — tura czysto tekstowa koduje się bez bajtów.
+    #[test]
+    fn cbor_roundtrip_flow_invoke_text_only() {
+        let request = ModelRequest {
+            request_id: "turn-2".to_string(),
+            payload: ModelPayload::FlowInvoke(FlowInvokePayload {
+                flow_id: None,
+                audio: None,
+                text: Some("hello".to_string()),
+                meta: Vec::new(),
+                session_id: None,
+            }),
+            stream: true,
+            metadata: None,
+            session_id: None,
+        };
+        let bytes = crate::cbor::encode(&request).expect("encode");
+        let decoded: ModelRequest = crate::cbor::decode(&bytes).expect("decode");
+        match decoded.payload {
+            ModelPayload::FlowInvoke(p) => {
+                assert!(p.flow_id.is_none());
+                assert!(p.audio.is_none());
+                assert_eq!(p.text.as_deref(), Some("hello"));
+            }
+            other => panic!("expected FlowInvoke, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cbor_roundtrip_stream_chunk_transcript() {
+        let chunk = ModelStreamChunk {
+            request_id: "turn-3".to_string(),
+            chunk: StreamChunkType::Transcript("Dzień dobry wszystkim".to_string()),
+        };
+        let bytes = crate::cbor::encode(&chunk).expect("encode");
+        let decoded: ModelStreamChunk = crate::cbor::decode(&bytes).expect("decode");
+        match decoded.chunk {
+            StreamChunkType::Transcript(t) => assert_eq!(t, "Dzień dobry wszystkim"),
+            other => panic!("expected Transcript, got {:?}", other),
         }
     }
 }

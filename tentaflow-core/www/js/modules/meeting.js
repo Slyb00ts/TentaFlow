@@ -27,9 +27,11 @@ let sessions = [];
 let selectedHistoryId = null;
 let historyDetail = null;
 let historyTab = 'summary';
+// Wdrozone uslugi STT (katalog modeli) — bez nich start spotkania nie ma sensu.
+let sttServices = [];
 let settings = {
   bot_name: 'TentaFlow Bot',
-  flow_alias: '',
+  flow_id: '',
   stt_alias: '',
   tts_alias: '',
   llm_alias: '',
@@ -161,6 +163,13 @@ async function loadSettings() {
   } catch (_) {
     availableFlows = [];
   }
+  try {
+    const all = (await ApiBinary.list('modelListRequest', { arrayKey: 'models' })) || [];
+    sttServices = (Array.isArray(all) ? all : [])
+      .filter((m) => (m.category || m.service_type || '').toLowerCase() === 'stt');
+  } catch (_) {
+    sttServices = [];
+  }
 }
 
 // ---- Actions --------------------------------------------------------------
@@ -170,6 +179,10 @@ async function onJoinClick() {
   const url = (input?.value || '').trim();
   if (!url) {
     toast(I18n.t('meeting.url_required'), 'error');
+    return;
+  }
+  if (sttServices.length === 0) {
+    toast(I18n.t('meeting.stt_no_service'), 'error');
     return;
   }
   // Zapobiega duplikatom: jesli user ma juz zywa sesje, kierujemy go albo do
@@ -443,7 +456,7 @@ function renderJoinScreen() {
             <h3>${escapeHtml(I18n.t('meeting.config_title'))}</h3>
             <div class="meet-kv">
               <div class="meet-kv-row"><span class="k">${escapeHtml(I18n.t('meeting.bot_display_name'))}</span><span class="v plain">${escapeHtml(settings.bot_name || 'TentaFlow Bot')}</span></div>
-              <div class="meet-kv-row"><span class="k">${escapeHtml(I18n.t('meeting.stt_model'))}</span><span class="v">${escapeHtml(settings.stt_alias || 'whisper-large-v3')}</span></div>
+              <div class="meet-kv-row"><span class="k">${escapeHtml(I18n.t('meeting.stt_model'))}</span><span class="v">${escapeHtml(settings.stt_alias || 'teams-stt')}</span></div>
               <div class="meet-kv-row"><span class="k">${escapeHtml(I18n.t('meeting.diarization'))}</span><span class="v">${escapeHtml(settings.diarization || 'pyannote-3.1')}</span></div>
               <div class="meet-kv-row"><span class="k">${escapeHtml(I18n.t('meeting.ai_summary'))}</span><span class="v">${escapeHtml(settings.llm_alias || 'qwen-3.5-0.8b')}</span></div>
             </div>
@@ -728,10 +741,11 @@ function renderSettingsScreen() {
           .join('')}
       </select>
     </div>`;
-  // Picker flow orchestratora — pusty value = DEFAULT_FLOW_ALIAS ("Default Chat").
+  // Flow picker keyed by flow id (the session row stores the UUID); empty value
+  // = factory "Meeting Bot" flow resolved by Core.
   const flowOptions = [
     { value: '', label: I18n.t('meeting.sett_flow_default') },
-    ...availableFlows.map((f) => ({ value: f.name, label: f.name })),
+    ...availableFlows.map((f) => ({ value: f.id, label: f.name })),
   ];
   return `
     ${header}
@@ -749,7 +763,7 @@ function renderSettingsScreen() {
       <div class="settings-section">
         <h3>${escapeHtml(I18n.t('meeting.sett_pipeline_title'))}</h3>
         <div class="section-sub">${escapeHtml(I18n.t('meeting.sett_pipeline_sub'))}</div>
-        ${textField('stt_alias', 'STT', I18n.t('meeting.sett_stt_hint'), 'whisper-large-v3')}
+        ${textField('stt_alias', 'STT', I18n.t('meeting.sett_stt_hint'), 'teams-stt')}
         ${textField('tts_alias', 'TTS', I18n.t('meeting.sett_tts_hint'), 'sherpa-onnx')}
         ${selectField('diarization', I18n.t('meeting.sett_diarization'), I18n.t('meeting.sett_diarization_hint'), [
           { value: 'pyannote-3.1', label: 'pyannote-3.1' },
@@ -765,7 +779,7 @@ function renderSettingsScreen() {
       <div class="settings-section">
         <h3>${escapeHtml(I18n.t('meeting.sett_ai_title'))}</h3>
         <div class="section-sub">${escapeHtml(I18n.t('meeting.sett_ai_sub'))}</div>
-        ${selectField('flow_alias', I18n.t('meeting.sett_flow'), I18n.t('meeting.sett_flow_hint'), flowOptions)}
+        ${selectField('flow_id', I18n.t('meeting.sett_flow'), I18n.t('meeting.sett_flow_hint'), flowOptions)}
         ${textField('llm_alias', 'LLM', I18n.t('meeting.sett_llm_hint'), 'qwen-3.5-0.8b')}
         ${selectField('insights_frequency', I18n.t('meeting.sett_insights'), I18n.t('meeting.sett_insights_hint'), [
           { value: 'auto', label: I18n.t('meeting.insights_auto') },

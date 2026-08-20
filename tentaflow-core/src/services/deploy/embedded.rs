@@ -291,14 +291,20 @@ impl EmbeddedDeploy {
             return Ok(());
         }
 
-        // Embedded STT: whisper.cpp (engine.id = "whisper", plik ggml) lub
-        // mlx-whisper (engine.id = "mlx-whisper", katalog MLX safetensors).
-        // Model trafia do `shared_stt_manager()`, tego samego singletonu z
-        // ktorego czyta `SttRuntime::transcribe`. Bez tego kroku usluga jest
-        // oznaczona `running`, ale `active_engine()` zostaje None i kazda
-        // transkrypcja konczy sie "no STT engine loaded".
+        // Embedded STT: whisper.cpp (engine.id = "whisper", GGML file) or
+        // mlx-whisper (engine.id = "mlx-whisper", MLX safetensors dir). The
+        // model lands in `shared_stt_manager()`, the singleton behind
+        // `SttBackend::Embedded` — this deploy of a `services` row is the only
+        // place an embedded STT model is ever loaded.
         let engine_id = self.manifest.engine.id.clone();
         let model_repo = self.selected_model_repo();
+        let model_file = self
+            .user_config
+            .get("model_file")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string);
         if let Some(s) = &self.log_sink {
             s.phase(
                 "load-model",
@@ -329,8 +335,9 @@ impl EmbeddedDeploy {
         let info = {
             let mut mgr = shared.write().await;
             mgr.ensure_and_load(
-                Some(&engine_id),
-                Some(&model_repo),
+                &engine_id,
+                &model_repo,
+                model_file.as_deref(),
                 None,
                 self.log_sink.as_ref(),
                 deploy_params,
@@ -339,7 +346,7 @@ impl EmbeddedDeploy {
         }
         .map_err(|e| DeployError::Other(format!("load embedded STT '{engine_id}': {e}")))?;
         if let Some(s) = &self.log_sink {
-            s.info(&format!("[stt] whisper model loaded from {}", info.path));
+            s.info(&format!("[stt] {engine_id} model loaded from {}", info.path));
         }
         Ok(())
     }
@@ -1080,6 +1087,7 @@ mod tests {
                 resource_kind: None,
                 requires_model: None,
                 gpu_supported: None,
+                reverse_requests: false,
                 default_port: 0,
                 dgx_spark: None,
                 cluster_capable: None,

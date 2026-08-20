@@ -2125,6 +2125,7 @@ mod tests {
                 resource_kind: None,
                 requires_model: None,
                 gpu_supported: None,
+                reverse_requests: false,
                 default_port: 8000,
                 dgx_spark: None,
                 cluster_capable: None,

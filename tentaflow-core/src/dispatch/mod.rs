@@ -1330,6 +1330,7 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
         MessageBody::FlowVersionGetResponseBody(_) => "FlowVersionGetResponse",
         MessageBody::FlowVersionRestoreRequestBody(_) => "FlowVersionRestoreRequest",
         MessageBody::FlowVersionRestoreResponseBody(_) => "FlowVersionRestoreResponse",
+        MessageBody::FlowFactoryRestoreRequestBody(_) => "FlowFactoryRestoreRequest",
         MessageBody::SsoProvidersListRequest => "SsoProvidersListRequest",
         MessageBody::SsoProvidersListResponseBody(_) => "SsoProvidersListResponse",
         MessageBody::SsoProviderCreateRequestBody(_) => "SsoProviderCreateRequest",

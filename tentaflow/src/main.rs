@@ -802,6 +802,7 @@ async fn run_server(args: Args) -> Result<()> {
                                 let response = tentaflow_core::mesh::inference_proxy::dispatch_reverse_request(
                                     &router,
                                     request,
+                                    None,
                                 ).await;
 
                                 tentaflow_protocol::cbor::encode(&response)
@@ -837,6 +838,7 @@ async fn run_server(args: Args) -> Result<()> {
                                         &router,
                                         request,
                                         tx,
+                                        None,
                                     )
                                     .await;
                                 })

@@ -141,18 +141,24 @@ pub async fn meeting_session_start(
         return Err(bad_request("meeting_url za dlugi"));
     }
     let owner = current_user_id(ctx);
-    // Flow orchestratora bota jest konfigurowalny per-user w ustawieniach
-    // Meeting Bota (klucz `flow_alias`). Pusty/brak → DEFAULT_FLOW_ALIAS
-    // ("Default Chat") rozwiazany w `resolve_aliases`.
+    // The per-user Meeting Bot setting `flow_id` picks the flow of every turn;
+    // an unset or dangling id falls back to the factory Meeting Bot flow in
+    // `resolve_aliases`, so a deleted flow never breaks the next session.
     let configured_flow = owner
         .as_deref()
         .and_then(|uid| {
-            crate::db::repository::transcripts::get_user_setting(&ctx.state.db, uid, "flow_alias")
+            crate::db::repository::transcripts::get_user_setting(&ctx.state.db, uid, "flow_id")
                 .ok()
                 .flatten()
         })
         .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty())
+        .filter(|id| {
+            crate::db::repository::get_flow(&ctx.state.db, id)
+                .ok()
+                .flatten()
+                .is_some()
+        });
     let start = StartSessionRequest {
         meeting_url: r.meeting_url.clone(),
         title: if r.title.is_empty() {
@@ -193,7 +199,7 @@ pub async fn meeting_session_start(
         } else {
             Some(r.llm_alias.clone())
         },
-        flow_alias: configured_flow,
+        flow_id: configured_flow,
         llm_alias: if r.llm_alias.is_empty() {
             None
         } else {
@@ -214,11 +220,6 @@ pub async fn meeting_session_start(
                     .unwrap_or(false);
             Some(has_explicit || has_default_alias)
         },
-        // Default: pasywny tryb wake_word_intent (bot odpowiada tylko gdy
-        // ktos powie "jarvis"/"asystencie" + LLM uzna to za realne pytanie).
-        // Dashboard moze nadpisac jezeli protocol zostanie rozszerzony.
-        response_mode: None,
-        wake_words: None,
     };
     let desc = ctx
         .state
@@ -701,60 +702,6 @@ pub fn meeting_transcript_export(
     Ok(MessageBody::MeetingBody(
         MeetingPayload::ResTranscriptExport(MeetingTranscriptExportResponse { content: out }),
     ))
-}
-
-// =============================================================================
-// Wake-words CRUD (1 sub-action: list/create/toggle/delete). Pojedynczy
-// handler bo limit 256 wariantow MessageBody — caller robi router-side
-// dispatch przez `WakeWordOp` enum. Wynik to zawsze pelna lista (klient nie
-// musi robic refetch po mutacji).
-// =============================================================================
-
-#[handler(variant = "MeetingWakeWordRequest", since = (1, 0))]
-#[policy(UserSession)]
-#[observed]
-pub fn meeting_wake_word(
-    req: &MessageBody,
-    ctx: &HandlerContext,
-) -> Result<MessageBody, ProtocolError> {
-    let payload = meeting_payload(req)?;
-    let MeetingPayload::ReqWakeWord(r) = payload else {
-        return Err(bad_request("expected ReqWakeWord"));
-    };
-    use crate::db::repository;
-    use tentaflow_protocol::WakeWordOp;
-    match &r.op {
-        WakeWordOp::List => {}
-        WakeWordOp::Create { word } => {
-            let trimmed = word.trim();
-            if trimmed.is_empty() || trimmed.len() > 64 {
-                return Err(bad_request("wake word puste lub za dlugie (max 64)"));
-            }
-            if trimmed.contains(',') {
-                return Err(bad_request("przecinek niedozwolony (separator CSV)"));
-            }
-            repository::add_wake_word(&ctx.state.db, trimmed).map_err(internal)?;
-        }
-        WakeWordOp::Toggle { id, enabled } => {
-            repository::set_wake_word_enabled(&ctx.state.db, *id, *enabled).map_err(internal)?;
-        }
-        WakeWordOp::Delete { id } => {
-            repository::delete_wake_word(&ctx.state.db, *id).map_err(internal)?;
-        }
-    }
-    let words = repository::list_wake_words(&ctx.state.db).map_err(internal)?;
-    let proto_words: Vec<tentaflow_protocol::WakeWord> = words
-        .into_iter()
-        .map(|w| tentaflow_protocol::WakeWord {
-            id: w.id,
-            word: w.word,
-            enabled: w.enabled,
-            created_at: w.created_at,
-        })
-        .collect();
-    Ok(MessageBody::MeetingBody(MeetingPayload::ResWakeWord(
-        tentaflow_protocol::MeetingWakeWordResponse { words: proto_words },
-    )))
 }
 
 // =============================================================================

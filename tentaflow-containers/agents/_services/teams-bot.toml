@@ -11,6 +11,9 @@ license = "MIT"
 default_port = 5000
 api = "custom"
 version = "0.1.0"
+# Bot otwiera strumienie zwrotne do Core (tury flow, eventy spotkania) na
+# polaczeniu, ktore Core nawiazal — Core akceptuje accept_bi tylko z ta flaga.
+reverse_requests = true
 
 [deploy.docker]
 context_path = "agents/docker/teams-bot"

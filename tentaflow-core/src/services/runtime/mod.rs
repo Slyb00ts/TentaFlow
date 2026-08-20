@@ -12,6 +12,7 @@ pub mod executor;
 pub mod local_cv;
 pub mod quic_handle;
 pub mod resolver;
+pub mod reverse_listener;
 pub mod strategy;
 pub mod target;
 pub mod tool_calling;

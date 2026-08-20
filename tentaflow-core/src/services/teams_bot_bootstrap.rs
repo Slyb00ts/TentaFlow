@@ -13,33 +13,14 @@ use crate::db::{repository, DbPool};
 /// ktory robi okresowe podsumowania.
 const TEAMS_ALIASES: &[&str] = &["teams-stt", "teams-summarization", "teams-tts", "teams-llm"];
 
-/// Domyslne wake-words dodawane przy pierwszym deploy teams-bota.
-/// Edytowalne przez UI/API; po edycji tabela jest "user-managed" — nie
-/// nadpisujemy. Ten seed dotyka tylko pustej tabeli.
-const DEFAULT_WAKE_WORDS: &[&str] = &["jarvis", "tentaflow", "asystencie", "asystent", "bot"];
-
 /// Tworzy (jeśli brak) domyślne aliasy dla teams-bota. Bezpieczna do
 /// wywołania wielokrotnie — istniejące wpisy nie są modyfikowane, żeby nie
 /// nadpisać ustawień użytkownika. Flow orchestratora nie jest seedowany —
 /// default to "Default Chat", a konkretny flow przypisuje user w ustawieniach
-/// Meeting Bota (`flow_alias`).
+/// Meeting Bota (`flow_id`).
 pub async fn ensure_teams_bot_defaults(pool: &DbPool) -> Result<()> {
     for alias in TEAMS_ALIASES {
         ensure_alias(pool, alias)?;
-    }
-    ensure_default_wake_words(pool)?;
-    Ok(())
-}
-
-/// Idempotentnie seeduje domyslne wake-words gdy tabela jest pusta. Po
-/// pierwszej edycji uzytkownika (dodanie/usuniecie) zostawiamy w spokoju.
-fn ensure_default_wake_words(pool: &DbPool) -> Result<()> {
-    let existing = repository::list_wake_words(pool)?;
-    if !existing.is_empty() {
-        return Ok(());
-    }
-    for w in DEFAULT_WAKE_WORDS {
-        let _ = repository::add_wake_word(pool, w);
     }
     Ok(())
 }
@@ -76,6 +57,16 @@ mod tests {
         Arc::new(crate::db::Db::from_connection(conn))
     }
 
+    // Seedowany alias jest "parked" (pusty `target_model` → `is_active = 0`),
+    // więc `resolve_model_alias` go nie zwraca — tylko `list_model_aliases`
+    // pokazuje również wpisy nieaktywne.
+    fn find_alias(pool: &DbPool, alias: &str) -> Option<crate::db::models::DbModelAlias> {
+        repository::list_model_aliases(pool)
+            .unwrap()
+            .into_iter()
+            .find(|row| row.alias == alias)
+    }
+
     #[tokio::test]
     async fn ensure_teams_bot_defaults_creates_missing() {
         let pool = setup_pool();
@@ -83,11 +74,14 @@ mod tests {
         ensure_teams_bot_defaults(&pool).await.unwrap();
 
         for alias in TEAMS_ALIASES {
-            let row = repository::resolve_model_alias(&pool, alias, None)
-                .unwrap()
-                .unwrap_or_else(|| panic!("alias {alias} not created"));
+            let row =
+                find_alias(&pool, alias).unwrap_or_else(|| panic!("alias {alias} not created"));
             assert_eq!(row.target_model, "");
             assert_eq!(row.strategy.as_deref(), Some("first_available"));
+            assert!(
+                !row.is_active,
+                "alias {alias} bez target_model musi zostać parked (is_active = 0)"
+            );
         }
     }
 
@@ -98,10 +92,18 @@ mod tests {
         ensure_teams_bot_defaults(&pool).await.unwrap();
         ensure_teams_bot_defaults(&pool).await.unwrap();
 
-        // Każdy alias pojawia się dokładnie raz (resolve zwraca is_active=1).
+        // Każdy alias pojawia się dokładnie raz i pozostaje parked
+        // (is_active = 0) — powtórny seed nie może go "obudzić".
         for alias in TEAMS_ALIASES {
-            let row = repository::resolve_model_alias(&pool, alias, None).unwrap();
-            assert!(row.is_some(), "alias {alias} disappeared");
+            let rows = repository::list_model_aliases(&pool).unwrap();
+            let matching: Vec<_> = rows.iter().filter(|row| row.alias == *alias).collect();
+            assert_eq!(matching.len(), 1, "alias {alias} nie występuje dokładnie raz");
+            assert_eq!(matching[0].target_model, "");
+            assert_eq!(matching[0].strategy.as_deref(), Some("first_available"));
+            assert!(
+                !matching[0].is_active,
+                "powtórny seed nie może aktywować aliasu {alias} bez target_model"
+            );
         }
     }
 

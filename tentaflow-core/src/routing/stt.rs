@@ -294,6 +294,9 @@ impl Router {
                             Err(ExecutorError::SttRuntimeUnavailable) => {
                                 self.route_audio_transcription(request).await
                             }
+                            Err(ExecutorError::SttServiceUnavailable) => {
+                                Err(crate::error::CoreError::SttServiceUnavailable.into())
+                            }
                             Err(e) => Err(crate::error::CoreError::InternalError {
                                 message: format!("executor.execute_stt: {}", e),
                                 source: None,

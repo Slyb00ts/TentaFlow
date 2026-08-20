@@ -47,6 +47,9 @@ export class FlowPalette {
     // nazwa z i18n jest wspólna, więc paleta musi pokazać etykietę szablonu —
     // inaczej 17 różnych presetów to 17 wierszy "Agent".
     this.presetTypes = new Set();
+    // Read-only builder: templates still load (the canvas needs them for
+    // rendering) but nothing can be dragged onto the canvas.
+    this.readOnly = !!opts.readOnly;
     this.filter = '';
     this.collapsedCats = new Set();
     this._ghost = null;
@@ -201,6 +204,7 @@ export class FlowPalette {
   }
 
   _onPointerDown(ev, el) {
+    if (this.readOnly) return;
     if (ev.button !== undefined && ev.button !== 0) return;
     ev.preventDefault();
     // Po indeksie, nie po node_type: presety agentów dzielą jeden typ, więc

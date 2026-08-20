@@ -162,7 +162,11 @@ mod serde_array64 {
 // in place to carry a `SessionAssertion` — a stream has to be authorized for
 // a USER, not merely for a trusted node. A stale peer would decode the old
 // shape and serve somebody else's session timeline, so old/new must not mix.
-pub const SCHEMA_VERSION: u16 = 22;
+// v23: `ModelPayload` gained `FlowInvoke` and `StreamChunkType` gained
+// `Transcript` (both appended). A stale Core would answer a bot's FlowInvoke
+// with "unsupported payload" and a stale bot would drop Transcript chunks,
+// so the sidecar/Core pair must not mix versions.
+pub const SCHEMA_VERSION: u16 = 23;
 
 // =============================================================================
 // Message kind discriminants

@@ -93,16 +93,33 @@ function renderTable() {
 function renderRow(f) {
   const status = f.status || (f.enabled ? 'active' : 'draft');
   const updated = f.updatedAtEpoch || f.updated_at_epoch || f.updated_at;
+  // The server rejects edit/delete/status changes on a system flow, so the row
+  // offers only a read-only preview and no delete action.
+  const isSystem = !!f.isSystem;
+  const systemChip = isSystem
+    ? ` <tf-chip status="info" data-flow-system="${escapeAttr(f.id)}">${escapeHtml(I18n.t('flows.system_chip'))}</tf-chip>`
+    : '';
+  const editIcon = isSystem ? 'eye' : 'settings';
+  const editTitle = I18n.t(isSystem ? 'flows.preview' : 'flows.edit_title');
+  // A factory flow is editable but never deletable; instead of delete it gets
+  // "restore factory version" (the server refuses delete for it anyway).
+  const isFactory = !!f.isFactory;
+  const factoryChip = isFactory
+    ? ` <tf-chip status="neutral" data-flow-factory="${escapeAttr(f.id)}">${escapeHtml(I18n.t('flows.factory_chip'))}</tf-chip>`
+    : '';
+  const factoryBtn = isFactory ? `
+        <tf-button variant="ghost" size="sm" icon="refresh" data-flow-factory-restore="${escapeAttr(f.id)}" data-flow-name="${escapeAttr(f.name)}" title="${escapeAttr(I18n.t('flows.factory_restore'))}"></tf-button>` : '';
+  const deleteBtn = (isSystem || isFactory) ? '' : `
+        <tf-button variant="danger" size="sm" icon="trash" data-flow-delete="${escapeAttr(f.id)}" data-flow-name="${escapeAttr(f.name)}" title="${escapeAttr(I18n.t('flows.delete_title'))}"></tf-button>`;
   return `
     <tr data-key="flow-${escapeAttr(f.id)}">
-      <td data-label="${escapeAttr(I18n.t('flows.col_name'))}"><strong style="color: var(--accent-2);">${escapeHtml(f.name)}</strong></td>
+      <td data-label="${escapeAttr(I18n.t('flows.col_name'))}"><strong style="color: var(--accent-2);">${escapeHtml(f.name)}</strong>${systemChip}${factoryChip}</td>
       <td data-label="${escapeAttr(I18n.t('flows.col_desc'))}">${f.description ? escapeHtml(f.description) : '<span style="color:var(--text-3);">—</span>'}</td>
       <td data-label="${escapeAttr(I18n.t('flows.col_status'))}">${statusChip(status)}</td>
       <td data-label="${escapeAttr(I18n.t('flows.col_updated'))}" style="font-size:12px;color:var(--text-3);">${formatDate(updated)}</td>
       <td data-label="${escapeAttr(I18n.t('flows.col_actions'))}" style="text-align:right;">
-        <tf-button variant="ghost" size="sm" icon="settings" data-flow-edit="${escapeAttr(f.id)}" title="${escapeAttr(I18n.t('flows.edit_title'))}"></tf-button>
-        <tf-button variant="ghost" size="sm" icon="clock" data-flow-execs="${escapeAttr(f.id)}" title="${escapeAttr(I18n.t('flows.history_title_short'))}"></tf-button>
-        <tf-button variant="danger" size="sm" icon="trash" data-flow-delete="${escapeAttr(f.id)}" data-flow-name="${escapeAttr(f.name)}" title="${escapeAttr(I18n.t('flows.delete_title'))}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="${editIcon}" data-flow-edit="${escapeAttr(f.id)}" title="${escapeAttr(editTitle)}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="clock" data-flow-execs="${escapeAttr(f.id)}" title="${escapeAttr(I18n.t('flows.history_title_short'))}"></tf-button>${factoryBtn}${deleteBtn}
       </td>
     </tr>`;
 }
@@ -117,6 +134,27 @@ function bindRowActions() {
   document.querySelectorAll('[data-flow-delete]').forEach((b) => {
     b.onclick = () => deleteFlow(b.dataset.flowDelete, b.dataset.flowName);
   });
+  document.querySelectorAll('[data-flow-factory-restore]').forEach((b) => {
+    b.onclick = () => restoreFactoryFlow(b.dataset.flowFactoryRestore, b.dataset.flowName);
+  });
+}
+
+async function restoreFactoryFlow(flowId, flowName) {
+  const ok = await TfWindow.confirm({
+    title: I18n.t('flows.factory_restore'),
+    message: I18n.t('flows.factory_restore_confirm', { name: flowName }),
+    description: I18n.t('flows.factory_restore_desc'),
+    confirmLabel: I18n.t('flows.factory_restore_btn'),
+    cancelLabel: I18n.t('flows.delete_cancel_btn'),
+  });
+  if (!ok) return;
+  try {
+    await ApiBinary.action('flowFactoryRestoreRequest', { flowId });
+    toast(I18n.t('flows.factory_restored_ok', { name: flowName }), 'success');
+    await load();
+  } catch (err) {
+    toast(`${I18n.t('flows.error_prefix')}: ${err.message}`, 'error');
+  }
 }
 
 async function newFlow() {

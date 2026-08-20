@@ -187,6 +187,9 @@ export class FlowCanvas {
     this.onChange = opts.onChange || (() => {});
     this.onSelect = opts.onSelect || (() => {});
     this.onViewChange = opts.onViewChange || (() => {});
+    // Read-only canvas (system flows): selection, pan and zoom stay, every
+    // graph mutation is refused at the state level, not only hidden in CSS.
+    this.readOnly = !!opts.readOnly;
     this.templates = new Map(); // node_type -> template
     // Typy dostępne w kilku presetach (np. `agent`): dla nich sama nazwa typu
     // nie identyfikuje bloku, więc node musi zapamiętać etykietę presetu.
@@ -273,7 +276,7 @@ export class FlowCanvas {
   // biezacym zaznaczeniu. Otwierane prawym przyciskiem nad wezlem.
   _onContextMenu(ev) {
     const nodeEl = ev.target.closest('.fb-node');
-    if (!nodeEl) { this._closeContextMenu(); return; }
+    if (!nodeEl || this.readOnly) { this._closeContextMenu(); return; }
     ev.preventDefault();
     const id = nodeEl.dataset.nodeId;
     if (!this.selectedIds.has(id)) this.selectNode(id, { additive: ev.shiftKey });
@@ -539,6 +542,7 @@ export class FlowCanvas {
   }
 
   undo() {
+    if (this.readOnly) return;
     if (this.historyIndex <= 0) return;
     this.historyIndex -= 1;
     const snap = structuredClone(this.history[this.historyIndex]);
@@ -551,6 +555,7 @@ export class FlowCanvas {
   }
 
   redo() {
+    if (this.readOnly) return;
     if (this.historyIndex >= this.history.length - 1) return;
     this.historyIndex += 1;
     const snap = structuredClone(this.history[this.historyIndex]);
@@ -564,6 +569,7 @@ export class FlowCanvas {
   // CRUD nody / krawędzie
   // -------------------------------------------------------------------------
   addNodeFromTemplate(tpl, clientX, clientY) {
+    if (this.readOnly) return;
     const pt = this._clientToWorld(clientX, clientY);
     let defaultConfig = {};
     try { defaultConfig = JSON.parse(tpl.default_config || '{}'); } catch (_) {}
@@ -584,6 +590,7 @@ export class FlowCanvas {
   }
 
   updateNodeConfig(nodeId, patch) {
+    if (this.readOnly) return;
     const n = this.nodes.find((x) => x.id === nodeId);
     if (!n) return;
     // Custom elementy (tf-toggle/tf-select/tf-input) potrafia odpalic `change`
@@ -602,6 +609,7 @@ export class FlowCanvas {
   }
 
   updateNodeLabel(nodeId, label) {
+    if (this.readOnly) return;
     const n = this.nodes.find((x) => x.id === nodeId);
     if (!n) return;
     if ((n.label || '') === (label || '')) return;
@@ -625,6 +633,7 @@ export class FlowCanvas {
   }
 
   removeNodes(ids) {
+    if (this.readOnly) return;
     const idSet = new Set(ids);
     this.nodes = this.nodes.filter((n) => !idSet.has(n.id));
     this.edges = this.edges.filter((e) => !idSet.has(e.from_node) && !idSet.has(e.to_node));
@@ -635,6 +644,7 @@ export class FlowCanvas {
   }
 
   duplicateNodes(ids) {
+    if (this.readOnly) return;
     const idMap = new Map();
     const clones = [];
     for (const id of ids) {
@@ -683,6 +693,7 @@ export class FlowCanvas {
   // z zaznaczonych wezlow ma juz region, dolaczamy reszte do niego; w
   // przeciwnym razie generujemy nowy `region` id. Zwraca id regionu.
   groupIntoRegion(ids) {
+    if (this.readOnly) return;
     const idSet = new Set(ids);
     const members = this.nodes.filter((n) => idSet.has(n.id));
     if (members.length === 0) return null;
@@ -699,6 +710,7 @@ export class FlowCanvas {
   // (jeden z koncow opuscil region), degradujemy ja do zwyklej krawedzi, bo
   // loop_back poza regionem jest niewalidowalna (R11).
   ungroupRegion(ids) {
+    if (this.readOnly) return;
     const idSet = new Set(ids);
     let touched = false;
     for (const n of this.nodes) {
@@ -747,6 +759,7 @@ export class FlowCanvas {
   }
 
   deleteSelected() {
+    if (this.readOnly) return;
     if (this.selectedIds.size > 0) {
       this.removeNodes([...this.selectedIds]);
       return;
@@ -1261,6 +1274,7 @@ export class FlowCanvas {
     // kursor wyjdzie poza canvas (drag-line do drugiego node'a).
     const portOut = ev.target.closest('.fb-port-out');
     if (portOut) {
+      if (this.readOnly) return;
       const nodeId = portOut.dataset.nodeId;
       const node = this.nodes.find((n) => n.id === nodeId);
       if (node) {
@@ -1303,6 +1317,7 @@ export class FlowCanvas {
       const additive = ev.shiftKey;
       if (!this.selectedIds.has(id)) this.selectNode(id, { additive });
       this._bringToFront(nodeEl);
+      if (this.readOnly) return;
       const origs = new Map();
       for (const sid of this.selectedIds) {
         const nd = this.nodes.find((n) => n.id === sid);
@@ -1525,7 +1540,7 @@ export class FlowCanvas {
 
     // Klik w X-przycisk na srodku selected edge'a → usun krawedz.
     const deleteBtn = hitTarget.closest('.fb-edge-delete');
-    if (deleteBtn) {
+    if (deleteBtn && !this.readOnly) {
       const edgeId = deleteBtn.dataset.edgeId;
       this.edges = this.edges.filter((e) => e.id !== edgeId);
       this.selectedEdgeId = null;

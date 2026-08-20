@@ -682,7 +682,61 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "agents_delegation_roster",
             MigrationStep::Rust(agents_add_delegation_roster),
         ),
+        (
+            129,
+            "model_pricing_embedding_rate",
+            MigrationStep::Rust(model_pricing_add_embedding_rate),
+        ),
+        (
+            130,
+            "model_metrics_rollup_usage_missing",
+            MigrationStep::Rust(model_metrics_rollup_add_usage_missing),
+        ),
+        (
+            131,
+            "meeting_sessions_pipeline",
+            MigrationStep::Rust(meeting_sessions_add_pipeline_columns),
+        ),
     ]
+}
+
+/// The bot no longer receives STT/LLM/TTS aliases or a flow through env —
+/// every FlowInvoke turn resolves them from the session row, so the effective
+/// pipeline has to be persisted at spawn. NULL on legacy rows: the reader
+/// falls back to the teams-* defaults and the factory Meeting Bot flow.
+fn meeting_sessions_add_pipeline_columns(conn: &Connection) -> Result<()> {
+    for column in ["stt_alias", "llm_alias", "tts_alias", "flow_id"] {
+        if !column_exists(conn, "meeting_sessions", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE meeting_sessions ADD COLUMN {column} TEXT;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Embedding requests were counted (`embedding_tokens`) but never priced, so
+/// every embedding model looked free. Separate rate because embedding tokens
+/// are not prompt tokens (different models, different price lists).
+fn model_pricing_add_embedding_rate(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "model_pricing", "embedding_per_1k")? {
+        conn.execute_batch(
+            "ALTER TABLE model_pricing ADD COLUMN embedding_per_1k REAL NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Successful requests whose backend returned no `usage` landed in the rollup
+/// with zero tokens and a silently zero cost. The counter makes that gap
+/// visible (cost is a lower bound when it is non-zero). Errors never count.
+fn model_metrics_rollup_add_usage_missing(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "model_metrics_rollup", "usage_missing_count")? {
+        conn.execute_batch(
+            "ALTER TABLE model_metrics_rollup ADD COLUMN usage_missing_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Which agents an agent may delegate to.
@@ -2065,7 +2119,7 @@ fn strip_pii_from_default_chat_flow(conn: &Connection) -> Result<()> {
          description = 'Streaming chat pipeline: trigger -> LLM -> output(stream).' \
          WHERE id = ?2 AND is_default = 1 AND flow_json = ?3",
         rusqlite::params![
-            crate::db::seed::DEFAULT_CHAT_FLOW_JSON,
+            crate::db::seed::LEGACY_DEFAULT_CHAT_FLOW_JSON,
             DEFAULT_CHAT_FLOW_ID,
             DEFAULT_CHAT_FLOW_JSON_WITH_PII,
         ],
@@ -2676,6 +2730,13 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "flow_id",
             "agent harness flow id (flows.id is TEXT UUID); born TEXT in v64, no declared \
              FK so the agent row can sync ahead of (or independently of) the flow row",
+        ),
+        t(
+            "meeting_sessions",
+            "flow_id",
+            "meeting pipeline flow id (flows.id is TEXT UUID); born TEXT in v131 \
+             (post-flip, never held an INTEGER id), no declared FK so a session row \
+             keeps its recorded pipeline even if the flow is later deleted",
         ),
         t(
             "agent_runs",
@@ -8432,7 +8493,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(default_json, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
+        assert_eq!(default_json, crate::db::seed::LEGACY_DEFAULT_CHAT_FLOW_JSON);
         assert!(!default_json.contains("pii_filter"), "pii_filter removed");
         assert!(!default_desc.contains("pii_filter"), "description updated");
         let parsed: serde_json::Value = serde_json::from_str(&default_json).unwrap();
@@ -8473,7 +8534,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(again, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
+        assert_eq!(again, crate::db::seed::LEGACY_DEFAULT_CHAT_FLOW_JSON);
     }
 
     /// A fresh `run(&conn)` (all migrations + nothing else) leaves the seeded

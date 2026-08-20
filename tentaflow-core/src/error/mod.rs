@@ -53,6 +53,10 @@ pub enum CoreError {
     #[error("Wszystkie backendy dla modelu '{model_name}' sa niedostepne")]
     AllBackendsUnavailable { model_name: String },
 
+    /// No running STT service row (embedded or HTTP) is registered on this node.
+    #[error("No STT service is running — deploy and start an STT engine in Services")]
+    SttServiceUnavailable,
+
     /// Przekroczono limit requestow (rate limiting)
     #[error("Przekroczono limit requestow: {message}")]
     RateLimitExceeded { message: String },
@@ -141,6 +145,7 @@ impl CoreError {
 
             // 503 Service Unavailable — backendy niedostepne lub kolejka pelna
             CoreError::AllBackendsUnavailable { .. } => 503,
+            CoreError::SttServiceUnavailable => 503,
             CoreError::QueueFull { .. } => 503,
 
             // 504 Gateway Timeout

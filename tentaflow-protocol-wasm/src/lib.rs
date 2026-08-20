@@ -43,7 +43,8 @@ use tentaflow_protocol::{
         ClusterDeployRequest, ClusterDeployStopRequest, ClusterDetailRequest,
         ClusterProbeStreamRequest, ClusterRemoveMemberRequest, ClusterUpdateRequest,
         DeployVllmRecommendRequest, FlowCreateRequest, FlowUpdateRequest, FlowVersionGetRequest,
-        FlowVersionListRequest, FlowVersionRestoreRequest, MePreferencesGetRequest,
+        FlowVersionListRequest, FlowVersionRestoreRequest, FlowFactoryRestoreRequest,
+        MePreferencesGetRequest,
         MePreferencesUpdateRequest, MeshConnectRequest, MeshNodeCommandRequest,
         MeshNodeNetworkConfigRequest, MeshPairInitRequest, MeshPairingConfirmRequest,
         MeshPairingRejectRequest, MeshPairingStartRequest, MeshTrustRetrustRequest,
@@ -423,6 +424,9 @@ pub fn encode_flow_invoke_audio(
     audio: Vec<u8>,
     language: Option<String>,
     session_id: Option<String>,
+    output_audio: bool,
+    stt_model: Option<String>,
+    tts_model: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::FlowInvokeRequestBody(
         tentaflow_protocol::FlowInvokeRequest {
@@ -436,6 +440,9 @@ pub fn encode_flow_invoke_audio(
             }],
             language,
             session_id,
+            output_audio,
+            stt_model,
+            tts_model,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -1816,6 +1823,7 @@ pub fn encode_model_metrics_pricing_set(
     completion_per_1k: f64,
     audio_per_min: f64,
     image_each: f64,
+    embedding_per_1k: f64,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ModelMetricsBody(
         tentaflow_protocol::ModelMetricsPayload::PricingSet {
@@ -1824,6 +1832,7 @@ pub fn encode_model_metrics_pricing_set(
             completion_per_1k,
             audio_per_min,
             image_each,
+            embedding_per_1k,
         },
     ))
     .map_err(|e| JsError::new(&e))
@@ -3797,6 +3806,15 @@ pub fn encode_flow_version_restore_request(
     .map_err(|e| JsError::new(&e))
 }
 
+/// MessageBody::FlowFactoryRestoreRequest { flow_id }.
+#[wasm_bindgen(js_name = encodeFlowFactoryRestoreRequest)]
+pub fn encode_flow_factory_restore_request(flow_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::FlowFactoryRestoreRequestBody(
+        FlowFactoryRestoreRequest { flow_id },
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 // --- Services (Krok N2 — packed in `MessageBody::ServiceBody`) -----------
 
 /// MessageBody::ServiceBody(ServicePayload::ReqList). Empty filter values are
@@ -4662,6 +4680,16 @@ fn model_metrics_summary_row_to_js(r: &tentaflow_protocol::ModelMetricsRowWire) 
     set(&item, "success_count", (r.success_count as f64).into());
     set(&item, "errorCount", (r.error_count as f64).into());
     set(&item, "error_count", (r.error_count as f64).into());
+    set(
+        &item,
+        "usageMissingCount",
+        (r.usage_missing_count as f64).into(),
+    );
+    set(
+        &item,
+        "usage_missing_count",
+        (r.usage_missing_count as f64).into(),
+    );
     set(&item, "cost", r.cost.into());
     set(&item, "missingPricing", r.missing_pricing.into());
     set(&item, "missing_pricing", r.missing_pricing.into());
@@ -4814,6 +4842,8 @@ fn decode_model_metrics_payload(
                 set(&item, "audio_per_min", r.audio_per_min.into());
                 set(&item, "imageEach", r.image_each.into());
                 set(&item, "image_each", r.image_each.into());
+                set(&item, "embeddingPer1k", r.embedding_per_1k.into());
+                set(&item, "embedding_per_1k", r.embedding_per_1k.into());
                 set(&item, "updatedAt", r.updated_at.clone().into());
                 set(&item, "updated_at", r.updated_at.into());
                 arr.push(&item);
@@ -5785,6 +5815,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     }
                     set(&obj, "bytes", js_sys::Uint8Array::from(&bytes[..]).into());
                 }
+                tentaflow_protocol::FlowInvokeChunk::Transcript { text } => {
+                    set(&obj, "kind", "transcript".into());
+                    set(&obj, "text", text.into());
+                }
             }
         }
         MessageBody::FlowInvokeEndBody(end) => {
@@ -5993,6 +6027,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 set(&item, "enabled", f.enabled.into());
                 set(&item, "isDefault", f.is_default.into());
                 set(&item, "is_default", f.is_default.into());
+                set(&item, "isSystem", f.is_system.into());
+                set(&item, "isFactory", f.is_factory.into());
                 if let Some(pmn) = f.published_model_name {
                     set(&item, "publishedModelName", pmn.clone().into());
                     set(&item, "published_model_name", pmn.into());
@@ -6015,6 +6051,8 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             set(&obj, "graphJson", d.graph_json.into());
             set(&obj, "enabled", d.enabled.into());
             set(&obj, "status", d.status.into());
+            set(&obj, "isSystem", d.is_system.into());
+            set(&obj, "isFactory", d.is_factory.into());
         }
         MessageBody::FlowCreateRequestBody(req) => {
             set(&obj, "variant", "FlowCreateRequest".into());
@@ -6132,6 +6170,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         MessageBody::FlowVersionRestoreResponseBody(r) => {
             set(&obj, "variant", "FlowVersionRestoreResponse".into());
             set(&obj, "ok", r.ok.into());
+        }
+        MessageBody::FlowFactoryRestoreRequestBody(r) => {
+            set(&obj, "variant", "FlowFactoryRestoreRequest".into());
+            set(&obj, "flowId", r.flow_id.into());
         }
         MessageBody::SsoProvidersListRequest => {
             set(&obj, "variant", "SsoProvidersListRequest".into());

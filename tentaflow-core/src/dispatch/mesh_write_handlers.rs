@@ -2451,27 +2451,22 @@ async fn run_cluster_deploy_phases(
         crate::services_repo::services::ServiceStatus::Running,
     );
 
-    if prompt_per_1k.is_some()
-        || completion_per_1k.is_some()
-        || audio_per_min.is_some()
-        || image_each.is_some()
-    {
+    let pricing_patch = crate::db::models::ModelPricingPatch {
+        prompt_per_1k,
+        completion_per_1k,
+        audio_per_min,
+        image_each,
+        embedding_per_1k: None,
+    };
+    if !pricing_patch.is_empty() {
         match ctx.org_context.as_ref().map(|o| o.org_id.clone()) {
             Some(org_id) => {
-                let valid = |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
-                if valid(prompt_per_1k)
-                    && valid(completion_per_1k)
-                    && valid(audio_per_min)
-                    && valid(image_each)
-                {
+                if pricing_patch.is_valid() {
                     if let Err(e) = crate::db::repository::upsert_model_pricing_merge(
                         &ctx.state.db,
                         &org_id,
                         &served,
-                        prompt_per_1k,
-                        completion_per_1k,
-                        audio_per_min,
-                        image_each,
+                        &pricing_patch,
                     ) {
                         warn!(model_id = %served, error = %e, "cluster deploy: pricing upsert failed");
                     }

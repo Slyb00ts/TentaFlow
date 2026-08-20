@@ -49,6 +49,15 @@ pub struct Engine {
     pub requires_model: Option<bool>,
     #[serde(default)]
     pub gpu_supported: Option<bool>,
+    /// `true` for a sidecar that opens bidi streams BACK to Core on the
+    /// connection Core dialled (meeting bot: STT/flow turns, meeting events).
+    /// Core attaches its reverse listener only to such services; any other
+    /// service's `open_bi` is never accepted. Today the listener is wired for
+    /// exactly one caller — `MeetingManager` registering `meeting-bot-<id>` —
+    /// and the sidecar policy in `mesh::inference_proxy` assumes it: an
+    /// accepted request must name a meeting the calling service owns.
+    #[serde(default)]
+    pub reverse_requests: bool,
     /// Tri-state DGX Spark (GB10 Grace Blackwell) gate.
     /// `Some(true)`  — engine runs ONLY on Spark hosts (e.g. `vllm-spark`).
     /// `Some(false)` — engine is incompatible with Spark (PyPI wheels target

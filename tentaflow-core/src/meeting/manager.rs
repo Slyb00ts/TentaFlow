@@ -11,8 +11,10 @@ use serde::{Deserialize, Serialize};
 use std::sync::Arc;
 use tracing::{info, warn};
 
+use crate::db::seed::MEETING_BOT_FLOW_ID;
 use crate::db::{repository, DbPool};
-use crate::services::runtime::quic_handle::ServiceManager;
+use crate::services::runtime::quic_handle::{QuicServiceHandle, ServiceManager};
+use crate::services::runtime::reverse_listener::{ReverseWiring, DEFAULT_MAX_REVERSE_STREAMS};
 
 use super::container::{self, SpawnRequest};
 use super::native;
@@ -68,23 +70,19 @@ pub struct StartSessionRequest {
     pub stt_alias: Option<String>,
     pub summarization_alias: Option<String>,
     pub tts_alias: Option<String>,
-    pub flow_alias: Option<String>,
+    /// UUID of the flow that runs every turn (`None` = factory Meeting Bot).
+    pub flow_id: Option<String>,
     pub llm_alias: Option<String>,
     pub respond_enabled: Option<bool>,
-    /// Tryb aktywacji odpowiedzi: `always`/`wake_word`/`wake_word_intent`.
-    /// Default `wake_word_intent` (pasywny dopoki ktos nie wezwie bota).
-    pub response_mode: Option<String>,
-    /// CSV slow aktywujacych. Pusta lista = zawsze aktywne (rownowazne always).
-    pub wake_words: Option<String>,
 }
 
-/// Domyślne aliasy przekazywane do kontenera teams-bota, jeśli caller nie
-/// nadpisze. Zgodne z tymi zainicjalizowanymi przez `ensure_teams_bot_defaults`
-/// w batch T1.5 oraz z `config.rs` bota (odczytuje env `*_ALIAS`).
+/// Default aliases of a session's pipeline when the caller does not override
+/// them. Seeded by `ensure_teams_bot_defaults`; STT/LLM/TTS are resolved by
+/// Core per turn (`meeting/flow_turn.rs`), only the summarization alias still
+/// travels to the bot as env.
 pub const DEFAULT_STT_ALIAS: &str = "teams-stt";
 pub const DEFAULT_SUMMARIZATION_ALIAS: &str = "teams-summarization";
 pub const DEFAULT_TTS_ALIAS: &str = "teams-tts";
-pub const DEFAULT_FLOW_ALIAS: &str = "Default Chat";
 pub const DEFAULT_LLM_ALIAS: &str = "teams-llm";
 /// Aliasy vision dla sesji meeting bota — face detection (SCRFD/YOLOv8-Face)
 /// i emotion classifier (HSEmotion). Pipeline per-uczestnik w
@@ -112,12 +110,13 @@ pub struct SessionDescriptor {
     pub bot_endpoint_id: Option<String>,
     pub container_name: Option<String>,
     pub owner_user_id: Option<String>,
-    /// Aliasy przekazane do kontenera w env vars (efektywne — po zastosowaniu
-    /// defaultów). Widoczne w dashboardzie żeby user wiedział co bot używa.
+    /// Effective pipeline of the session (defaults applied), persisted on the
+    /// row at spawn and read back per turn.
     pub stt_alias: String,
     pub summarization_alias: String,
     pub tts_alias: String,
-    pub flow_alias: String,
+    pub llm_alias: String,
+    pub flow_id: String,
     /// Aktualny etap lifecycle bota. `None` gdy sesja jeszcze nie dotknęła
     /// żadnego stage (np. świeża sesja idle w DB). Patrz `LIFECYCLE_*` w
     /// `tentaflow_protocol`.
@@ -206,26 +205,9 @@ impl MeetingManager {
         let bot_endpoint_id = hex::encode(secret.public().as_bytes());
 
         // Efektywne aliasy — nadpisanie od callera lub domyślne z T1.5.
-        let (stt_alias, summarization_alias, tts_alias, flow_alias, llm_alias) =
+        let (stt_alias, summarization_alias, tts_alias, flow_id, llm_alias) =
             resolve_aliases(&req);
         let respond_enabled = req.respond_enabled.unwrap_or(false);
-        let response_mode = req
-            .response_mode
-            .clone()
-            // TYMCZASOWO: tryb intent classifier wylaczony — patrz komentarz
-            // przy default_response_mode w teams-bot/src/config.rs.
-            .unwrap_or_else(|| "wake_word".to_string());
-        // Wake-words: caller (dashboard / CLI) moze nadpisac, inaczej
-        // bierzemy aktualna liste z DB (tabela `teams_bot_wake_words` —
-        // tylko `enabled=1`). Pusta DB → fallback na hardcoded default.
-        let wake_words = req.wake_words.clone().unwrap_or_else(|| {
-            let from_db = repository::enabled_wake_words_csv(&self.db).unwrap_or_default();
-            if from_db.is_empty() {
-                "jarvis,tentaflow,asystencie,asystent,bot".to_string()
-            } else {
-                from_db
-            }
-        });
 
         // Alokuj porty + spawn — drogi rozne per backend, ale na koniec obie maja
         // ten sam efekt: serwis zarejestrowany w ServiceManager z iroh URL i
@@ -244,7 +226,7 @@ impl MeetingManager {
                     &self.db,
                     session_id,
                     "",
-                    &container::container_name(session_id),
+                    &super::container_name(session_id),
                     ports.quic,
                     ports.vnc,
                     ports.novnc,
@@ -261,14 +243,8 @@ impl MeetingManager {
                     ports,
                     secret_key_hex: secret_key_hex.clone(),
                     bot_name: req.bot_name.clone(),
-                    stt_alias: stt_alias.clone(),
                     summarization_alias: summarization_alias.clone(),
-                    tts_alias: tts_alias.clone(),
-                    flow_alias: flow_alias.clone(),
-                    llm_alias: llm_alias.clone(),
                     respond_enabled,
-                    response_mode: response_mode.clone(),
-                    wake_words: wake_words.clone(),
                 };
 
                 match container::spawn(&spawn_req).await {
@@ -301,7 +277,7 @@ impl MeetingManager {
                 repository::transcripts::update_session_spawned_native(
                     &self.db,
                     session_id,
-                    &native::container_name(session_id),
+                    &super::container_name(session_id),
                     ports.quic,
                     &bot_endpoint_id,
                     &secret_key_hex,
@@ -316,14 +292,8 @@ impl MeetingManager {
                     ports,
                     secret_key_hex: secret_key_hex.clone(),
                     bot_name: req.bot_name.clone(),
-                    stt_alias: stt_alias.clone(),
                     summarization_alias: summarization_alias.clone(),
-                    tts_alias: tts_alias.clone(),
-                    flow_alias: flow_alias.clone(),
-                    llm_alias: llm_alias.clone(),
                     respond_enabled,
-                    response_mode: response_mode.clone(),
-                    wake_words: wake_words.clone(),
                 };
 
                 if let Err(e) = native::spawn(&spawn_req).await {
@@ -354,23 +324,69 @@ impl MeetingManager {
             "Meeting session spawnowana"
         );
 
-        // Meeting bot routing now flows through the V2 services pipeline:
-        // `services::deploy::deploy()` registers the service in the snapshot,
-        // the supervisor materialises a QUIC `BackendHandle` keyed by service
-        // id, and routing call sites resolve it via `find_quic_client_for_model`.
-        let _ = bot_endpoint_id;
-        let _ = quic_port;
+        // The bot never learns these: every FlowInvoke turn resolves the
+        // pipeline from this row, so it must be persisted before the first
+        // segment arrives.
+        repository::transcripts::update_session_pipeline(
+            &self.db,
+            session_id,
+            &stt_alias,
+            &llm_alias,
+            &tts_alias,
+            &flow_id,
+        )
+        .context("persist session pipeline")?;
 
-        // Deskryptor budowany z DB + efektywnych aliasów (te nie są persystowane
-        // w meeting_sessions — pochodzą wyłącznie z env kontenera). Dzięki temu
-        // odpowiedź start_session zawiera wartości faktycznie przekazane botowi.
+        // Core dials the bot (iroh endpoint id + loopback direct address —
+        // identical for Docker and native) and, because the teams-bot manifest
+        // declares `reverse_requests`, accepts the streams the bot opens back.
+        match self.service_manager.as_ref() {
+            Some(sm) => {
+                let name = super::container_name(session_id);
+                let cfg = crate::net::quic::QuicConfig {
+                    name: name.clone(),
+                    url: format!("iroh://{bot_endpoint_id}"),
+                    tls_ca: None,
+                    server_name: None,
+                    alpn: "tentaflow-service/v1".to_string(),
+                    timeout_ms: 30_000,
+                    auto_reconnect: true,
+                    reconnect_interval_ms: 1_000,
+                    keepalive_interval_ms: 5_000,
+                    skip_tls_verify: true,
+                    direct_addrs: vec![format!("127.0.0.1:{quic_port}")],
+                };
+                let handle = Arc::new(QuicServiceHandle::new(cfg));
+                if teams_bot_declares_reverse_requests() {
+                    match sm.reverse_router() {
+                        Some(router) => handle.set_reverse_wiring(ReverseWiring {
+                            router,
+                            service_name: name.clone(),
+                            max_streams: DEFAULT_MAX_REVERSE_STREAMS,
+                        }),
+                        None => warn!(
+                            session = session_id,
+                            "reverse router not wired — bot requests will not be served"
+                        ),
+                    }
+                } else {
+                    warn!(
+                        session = session_id,
+                        "teams-bot manifest lacks reverse_requests — bot requests will not be served"
+                    );
+                }
+                sm.register_meeting_bot(name, handle);
+            }
+            None => warn!(
+                session = session_id,
+                "no ServiceManager — bot spawned but Core will not connect to it"
+            ),
+        }
+
         let mut desc = self
             .session_detail(session_id)?
             .ok_or_else(|| anyhow!("nie udalo sie pobrac sesji po spawnie"))?;
-        desc.stt_alias = stt_alias;
         desc.summarization_alias = summarization_alias;
-        desc.tts_alias = tts_alias;
-        desc.flow_alias = flow_alias;
         Ok(desc)
     }
 
@@ -387,11 +403,11 @@ impl MeetingManager {
     /// task. The session row flips to `ended` once that task finishes.
     pub async fn leave_session(&self, session_id: i64) -> Result<()> {
         repository::transcripts::set_session_status(&self.db, session_id, "leaving")?;
-        // Service deregistration follows the V2 services pipeline: deleting the
-        // services row drops the snapshot entry, the supervisor removes the
-        // matching `BackendHandle` from `live_handles`, and the QUIC reconnect
-        // loop terminates.
-        let _ = &self.service_manager;
+        // Drop the QUIC link first so the reconnect loop does not keep dialling
+        // a container that is being stopped.
+        if let Some(sm) = self.service_manager.as_ref() {
+            sm.unregister_meeting_bot(&super::container_name(session_id));
+        }
         let backend = detect_backend(&self.db);
         let db = self.db.clone();
         tokio::spawn(async move {
@@ -455,6 +471,7 @@ impl MeetingManager {
 }
 
 fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescriptor {
+    let pipeline = super::flow_turn::SessionPipeline::from_row(row);
     SessionDescriptor {
         session_id: row.id,
         meeting_key: row.meeting_key.clone(),
@@ -472,13 +489,14 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
         bot_endpoint_id: row.bot_endpoint_id.clone(),
         container_name: row.container_name.clone(),
         owner_user_id: row.owner_user_id.clone(),
-        // Aliasy nie są persystowane w meeting_sessions — dla listy/detail
-        // zwracamy defaulty. Rzeczywiste wartości są znane tylko w odpowiedzi
-        // start_session (tuż po spawnie kontenera).
-        stt_alias: DEFAULT_STT_ALIAS.to_string(),
+        // Rows older than migration 131 carry NULLs — same defaults the spawn
+        // would have written. Summarization is not on the row (it still goes
+        // to the bot as env), so it is known only in the start_session reply.
+        stt_alias: pipeline.stt_alias,
         summarization_alias: DEFAULT_SUMMARIZATION_ALIAS.to_string(),
-        tts_alias: DEFAULT_TTS_ALIAS.to_string(),
-        flow_alias: DEFAULT_FLOW_ALIAS.to_string(),
+        tts_alias: pipeline.tts_alias,
+        llm_alias: pipeline.llm_alias,
+        flow_id: pipeline.flow_id,
         lifecycle_stage: row.lifecycle_stage.clone(),
         lifecycle_details: row.lifecycle_details.clone(),
         backend_stt_model: row.backend_stt_model.clone(),
@@ -491,9 +509,9 @@ fn row_to_descriptor(row: &repository::transcripts::SessionRow) -> SessionDescri
     }
 }
 
-/// Rozwiązuje aliasy z requesta do konkretnych stringów, używając domyślnych
-/// teams-* gdy caller nie nadpisze. Wyodrębnione żeby można było testować
-/// niezależnie od spawna kontenera.
+/// Resolves the request's aliases to concrete values, teams-* defaults when the
+/// caller did not override; the flow defaults to the factory Meeting Bot.
+/// Returns `(stt, summarization, tts, flow_id, llm)`.
 fn resolve_aliases(req: &StartSessionRequest) -> (String, String, String, String, String) {
     (
         req.stt_alias
@@ -505,22 +523,32 @@ fn resolve_aliases(req: &StartSessionRequest) -> (String, String, String, String
         req.tts_alias
             .clone()
             .unwrap_or_else(|| DEFAULT_TTS_ALIAS.to_string()),
-        req.flow_alias
+        req.flow_id
             .clone()
-            .unwrap_or_else(|| DEFAULT_FLOW_ALIAS.to_string()),
+            .unwrap_or_else(|| MEETING_BOT_FLOW_ID.to_string()),
         req.llm_alias
             .clone()
             .unwrap_or_else(|| DEFAULT_LLM_ALIAS.to_string()),
     )
 }
 
+/// The bundled teams-bot manifest must opt into reverse requests; without the
+/// flag Core dials the bot but never accepts its streams.
+fn teams_bot_declares_reverse_requests() -> bool {
+    crate::services::manifest::registry()
+        .by_id("teams-bot")
+        .map(|m| m.engine.reverse_requests)
+        .unwrap_or(false)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        resolve_aliases, StartSessionRequest, DEFAULT_FLOW_ALIAS, DEFAULT_LLM_ALIAS,
-        DEFAULT_STT_ALIAS, DEFAULT_SUMMARIZATION_ALIAS, DEFAULT_TTS_ALIAS,
+        resolve_aliases, teams_bot_declares_reverse_requests, StartSessionRequest,
+        DEFAULT_LLM_ALIAS, DEFAULT_STT_ALIAS, DEFAULT_SUMMARIZATION_ALIAS, DEFAULT_TTS_ALIAS,
     };
     use crate::db::migrations;
+    use crate::db::seed::MEETING_BOT_FLOW_ID;
     use crate::db::repository;
     use crate::db::DbPool;
     use crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults;
@@ -542,11 +570,9 @@ mod tests {
             stt_alias: stt.map(String::from),
             summarization_alias: sum.map(String::from),
             tts_alias: tts.map(String::from),
-            flow_alias: flow.map(String::from),
+            flow_id: flow.map(String::from),
             llm_alias: None,
             respond_enabled: None,
-            response_mode: None,
-            wake_words: None,
         }
     }
 
@@ -557,8 +583,15 @@ mod tests {
         assert_eq!(stt, DEFAULT_STT_ALIAS);
         assert_eq!(sum, DEFAULT_SUMMARIZATION_ALIAS);
         assert_eq!(tts, DEFAULT_TTS_ALIAS);
-        assert_eq!(flow, DEFAULT_FLOW_ALIAS);
+        assert_eq!(flow, MEETING_BOT_FLOW_ID);
         assert_eq!(llm, DEFAULT_LLM_ALIAS);
+    }
+
+    // The bundled manifest is the gate for the reverse listener; losing the
+    // flag would silently disconnect every bot from STT/flow turns.
+    #[test]
+    fn bundled_teams_bot_manifest_declares_reverse_requests() {
+        assert!(teams_bot_declares_reverse_requests());
     }
 
     #[test]
@@ -594,10 +627,20 @@ mod tests {
     async fn defensive_init_restores_deleted_alias() {
         let pool = setup_pool();
 
+        // Seedowany alias jest "parked" (pusty `target_model` → `is_active = 0`),
+        // więc widać go tylko przez `list_model_aliases`, nie przez resolve.
+        let parked = |pool: &DbPool| {
+            repository::list_model_aliases(pool)
+                .unwrap()
+                .into_iter()
+                .find(|row| row.alias == "teams-stt")
+        };
+
         ensure_teams_bot_defaults(&pool).await.unwrap();
-        assert!(repository::resolve_model_alias(&pool, "teams-stt", None)
-            .unwrap()
-            .is_some());
+        let seeded = parked(&pool).expect("alias teams-stt powinien zostać zaseedowany");
+        assert_eq!(seeded.target_model, "");
+        assert_eq!(seeded.strategy.as_deref(), Some("first_available"));
+        assert!(!seeded.is_active, "alias bez target_model musi być parked");
 
         {
             let conn = pool.write().unwrap();
@@ -609,15 +652,19 @@ mod tests {
                 .unwrap();
             assert_eq!(deleted, 1);
         }
-        assert!(repository::resolve_model_alias(&pool, "teams-stt", None)
-            .unwrap()
-            .is_none());
+        assert!(
+            parked(&pool).is_none(),
+            "wiersz aliasu powinien zniknąć z bazy po DELETE"
+        );
 
         ensure_teams_bot_defaults(&pool).await.unwrap();
 
-        let restored = repository::resolve_model_alias(&pool, "teams-stt", None)
-            .unwrap()
-            .expect("alias teams-stt powinien zostać odtworzony");
+        let restored = parked(&pool).expect("alias teams-stt powinien zostać odtworzony");
+        assert_eq!(restored.target_model, "");
         assert_eq!(restored.strategy.as_deref(), Some("first_available"));
+        assert!(
+            !restored.is_active,
+            "odtworzony alias wraca jako parked, dopóki user nie przypisze modelu"
+        );
     }
 }

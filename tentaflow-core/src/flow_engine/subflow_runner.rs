@@ -304,10 +304,14 @@ fn wrap_outcome_as_stream(
         }
     })
     .boxed();
+    // No producer ran here — the final envelope is the closest equivalent, it
+    // carries the meta every node wrote on the way.
+    let producer_input = Arc::new(outcome.final_envelope.clone());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(outcome);
     StreamingExecution {
         stream,
         outcome: rx,
+        producer_input,
     }
 }

@@ -52,6 +52,7 @@ pub(crate) fn dispatch_error_to_core(
             message: format!("flow dispatch: {msg}"),
             source: None,
         },
+        DispatchError::SttServiceUnavailable => crate::error::CoreError::SttServiceUnavailable,
     }
 }
 pub use router::{
@@ -74,12 +75,11 @@ pub(crate) async fn build_initial_envelope_for_user(
     user: Option<crate::auth::acl::UserContext>,
     blobs: &std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> Result<(FlowEnvelope, FlowRequestMeta)> {
-    let (mut envelope, mut meta) = build_initial_envelope_inner(request, blobs.as_ref()).await?;
+    let (envelope, mut meta) = build_initial_envelope_inner(request, blobs.as_ref()).await?;
     if let Some(u) = user {
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
     }
-    let _ = &mut envelope;
     Ok((envelope, meta))
 }
 

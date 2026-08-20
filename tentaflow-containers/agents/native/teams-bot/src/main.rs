@@ -1,7 +1,8 @@
 // =============================================================================
 // Plik: main.rs
 // Opis: Punkt wejscia sidecara meeting bot. Uruchamia pipeline: przegladarka,
-//       przechwytywanie audio, VAD, serwer QUIC z reverse requestami STT/TTS.
+//       przechwytywanie audio, VAD, serwer QUIC; kazdy segment mowy idzie do
+//       Core jako tura flow (FlowInvoke), z ktorej wraca transkrypt i audio.
 // =============================================================================
 
 mod audio;
@@ -9,15 +10,8 @@ mod audio_ring;
 mod browser;
 mod config;
 mod dom_observer;
-// Intent classifier tymczasowo nieuzywany — gating w `gate_and_respond`
-// jest wylaczony, bot odpowiada zawsze. Modul zostaje w drzewie zeby latwo
-// przywrocic po zmianie wymagan, zob. komentarz w gate_and_respond.
-#[allow(dead_code)]
-mod intent_classifier;
 mod quic_server;
-mod sentence_buffer;
 mod summarizer;
-mod tts_queue;
 mod vad;
 
 use anyhow::Result;
@@ -41,9 +35,10 @@ use tentaflow_protocol::{MeetingEventPayload, LIFECYCLE_CONTAINER_SPAWNED, LIFEC
 const DIARIZATION_MODEL_NAME: &str = "pyannote-3.1";
 
 /// Wysyła jednorazowy MeetingEventPayload::BackendUpdate na start sesji tak,
-/// żeby dashboard pokazał jakie aliasy modeli są w grze. Pola opcjonalne
-/// (liczby) zostają `None` — router może je wypełnić przed broadcastem
-/// (enrolled_speakers z voice_profiles, total_participants z rostera).
+/// żeby dashboard pokazał jakie modele są w grze. STT/TTS zna tylko Core
+/// (wiersz sesji) — wysyłamy puste stringi, Core uzupełnia je przed zapisem.
+/// Pola opcjonalne (liczby) zostają `None` — router może je wypełnić przed
+/// broadcastem (enrolled_speakers z voice_profiles, total_participants z rostera).
 async fn send_backend_update(
     router: &Arc<tokio::sync::Mutex<Option<Arc<quic_server::RouterClient>>>>,
     meeting_id: &str,
@@ -66,8 +61,8 @@ async fn send_backend_update(
             meeting_id,
             ts,
             MeetingEventPayload::BackendUpdate {
-                stt_model: config.stt_alias.clone(),
-                tts_model: config.tts_alias.clone(),
+                stt_model: String::new(),
+                tts_model: String::new(),
                 summarization_model: config.summarization_alias.clone(),
                 diarization_model: DIARIZATION_MODEL_NAME.to_string(),
                 streaming_latency_ms: None,
@@ -203,169 +198,6 @@ async fn emit_lifecycle(
     }
 }
 
-/// Sprawdza czy ktorekolwiek z precompiled `wake_words` wystepuje w tekscie
-/// (case-insensitive, fragment slowa OK). Pusta lista = zawsze TRUE.
-/// `wake_words` musi byc juz znormalizowane (trim + lowercase) — robi to
-/// `MeetingConfig::validate` przy starcie, zeby hot-path STT nie alokowal.
-///
-/// Tymczasowo nieuzywane — gating w `gate_and_respond` jest wylaczony,
-/// bot odpowiada zawsze. Zostaje w kodzie zeby latwo przywrocic gating
-/// po zmianie wymagan.
-#[allow(dead_code)]
-fn matches_wake_word(text: &str, wake_words: &[String]) -> bool {
-    if wake_words.is_empty() {
-        return true;
-    }
-    // Pojedyncza alokacja per call — Polish text wymaga full Unicode lowercase
-    // (np. "GŁOSU" -> "głosu"), `eq_ignore_ascii_case` nie wystarczy.
-    let lower = text.to_lowercase();
-    wake_words.iter().any(|w| lower.contains(w.as_str()))
-}
-
-/// Decyduje czy bot odpowiada na wypowiedz, i jezeli tak — generuje odpowiedz
-/// przez LLM streaming + sentence-boundary parser. Wola `on_sentence(zdanie)`
-/// dla kazdego kompletnego zdania natychmiast po jego dosklejeniu w buforze
-/// — caller odpala TTS dla pierwszego zdania zanim LLM dokonczy reszte.
-///
-/// Zwraca pelny zaakumulowany tekst odpowiedzi (do logow / metryk) albo
-/// `None` gdy bot postanowil milczec (gating odrzucil request, LLM zwrocil
-/// pusta odpowiedz, `<NO_RESPONSE>`, blad albo timeout). Po `None` `on_sentence`
-/// nigdy nie zostalo wolane.
-async fn gate_and_respond(
-    config: &MeetingConfig,
-    client: &Arc<crate::quic_server::RouterClient>,
-    text: &str,
-    on_sentence: impl FnMut(String) + Send + 'static,
-) -> Option<String> {
-    // Etap 1: gating CALKOWICIE WYLACZONY — bot zawsze odpowiada na kazda
-    // wypowiedz. Wczesniej dzialo sie tutaj wake-word matching + lokalny
-    // intent classifier (response_mode = always|wake_word|wake_word_intent),
-    // ale to powodowalo ze bot ignorowal wiekszosc pytan jezeli nie mial
-    // wake_word'a. Na chwile obecna jedziemy bez gating'u — kazda transkrypcja
-    // idzie do LLM. response_mode w configu jest ignorowane.
-    tracing::debug!(
-        text = %text.chars().take(60).collect::<String>(),
-        mode = %config.response_mode,
-        "gating bypassed — bot odpowiada zawsze"
-    );
-
-    // Etap 2: streaming LLM. Kazdy delta-token pcha sentence_buffer; jak
-    // tylko mamy pelne zdanie, wolamy on_sentence natychmiast — caller
-    // odpala TTS dla pierwszego zdania zanim LLM dokonczy reszte odpowiedzi.
-    //
-    // <NO_RESPONSE> to marker LLM "milcz". Pojawia sie zawsze na poczatku
-    // streamu (alone) — gdy pierwsze delty zawieraja go zanim padnie sentence
-    // boundary, ustawiamy `dry_mode` i ignorujemy reszte. Detekcja musi
-    // sledzic granice tokenow: marker moze przybyc rozbity na "<NO" + "_RESP" +
-    // "ONSE>" — wiec szukamy w "guard" zlozonym z kilku ostatnich delt do
-    // momentu, az padnie pierwsze zdanie albo nazbiera sie wiecej niz dlugosc
-    // markera. Po pierwszym wyemitowanym zdaniu zakladamy ze response jest
-    // realny — marker juz sie nie pojawi.
-    let messages = vec![
-        ("system".to_string(), config.response_prompt.clone()),
-        ("user".to_string(), text.to_string()),
-    ];
-
-    let sb = Arc::new(parking_lot::Mutex::new(crate::sentence_buffer::SentenceBuffer::new()));
-    let dry_mode = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let any_emitted = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let early_guard = Arc::new(parking_lot::Mutex::new(String::with_capacity(64)));
-    // 32 bajty wystarcza zeby zlapac "<NO_RESPONSE>" (13 bajtow) nawet jak
-    // przyjdzie rozbity na maly tokenizer'owy strumien.
-    const EARLY_GUARD_MAX: usize = 32;
-
-    type SharedSentenceCb = Arc<parking_lot::Mutex<Box<dyn FnMut(String) + Send>>>;
-    let on_sentence_holder: SharedSentenceCb =
-        Arc::new(parking_lot::Mutex::new(Box::new(on_sentence)));
-
-    let sb_cb = Arc::clone(&sb);
-    let dry_cb = Arc::clone(&dry_mode);
-    let any_cb = Arc::clone(&any_emitted);
-    let guard_cb = Arc::clone(&early_guard);
-    let cb_holder = Arc::clone(&on_sentence_holder);
-
-    let stream_fut = client.chat_completion_stream(
-        &config.llm_alias,
-        messages,
-        move |delta: &str| {
-            if dry_cb.load(Ordering::Relaxed) {
-                return;
-            }
-            // Detekcja markera dopoki nic jeszcze nie wyemitowalismy. Marker
-            // przyjdzie "na poczatku odpowiedzi" — albo w pierwszych deltach,
-            // albo nie pojawi sie wcale.
-            if !any_cb.load(Ordering::Relaxed) {
-                let mut g = guard_cb.lock();
-                g.push_str(delta);
-                if g.contains("<NO_RESPONSE>") {
-                    dry_cb.store(true, Ordering::Relaxed);
-                    return;
-                }
-                if g.len() > EARLY_GUARD_MAX {
-                    // Po przekroczeniu okna nie szukamy juz markera (wczesniej
-                    // by sie pojawil) — czyscimy bufor zeby nie rosnac w
-                    // nieskonczonosc.
-                    g.clear();
-                }
-            }
-
-            let sentences = {
-                let mut s = sb_cb.lock();
-                s.push(delta)
-            };
-            if sentences.is_empty() {
-                return;
-            }
-            // Mamy pierwsze zdanie — wyemituj natychmiast (caller odpali TTS).
-            let mut cb = cb_holder.lock();
-            for sent in sentences {
-                any_cb.store(true, Ordering::Relaxed);
-                (cb)(sent);
-            }
-        },
-    );
-
-    let result = tokio::time::timeout(std::time::Duration::from_secs(20), stream_fut).await;
-
-    let full_text = match result {
-        Ok(Ok(t)) => t,
-        Ok(Err(e)) => {
-            tracing::warn!("LLM stream failed: {}", e);
-            return None;
-        }
-        Err(_) => {
-            tracing::warn!("LLM stream timeout 20s");
-            return None;
-        }
-    };
-
-    let trimmed = full_text.trim().to_string();
-
-    if dry_mode.load(Ordering::Relaxed) || trimmed.is_empty() || trimmed.contains("<NO_RESPONSE>") {
-        tracing::info!(
-            alias = %config.llm_alias,
-            raw_len = trimmed.len(),
-            "LLM zwrocil pusty/<NO_RESPONSE> — bot milczy"
-        );
-        return None;
-    }
-
-    // Po Done — flush ogona bufora (ostatnie zdanie bez konczacej kropki).
-    let tail = sb.lock().flush();
-    if let Some(rest) = tail {
-        let mut cb = on_sentence_holder.lock();
-        (cb)(rest);
-    }
-
-    tracing::info!(
-        alias = %config.llm_alias,
-        "LLM response (stream): {}",
-        trimmed.chars().take(120).collect::<String>()
-    );
-
-    Some(trimmed)
-}
-
 /// Uchwyt aktualnie uruchomionej petli summarizera dla sesji spotkania.
 /// Przy LeaveMeeting / nowym JoinMeeting stary handle jest zamykany, a w jego
 /// miejsce spawnujemy nowy — meeting_key musi pasowac do biezacej sesji.
@@ -437,7 +269,7 @@ async fn main() -> Result<()> {
     });
     tracing::info!(port = config.transport_port, "Serwer iroh kontenera uruchomiony");
 
-    // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do STT/TTS).
+    // 3. Czekaj na polaczenie routera (potrzebujemy RouterClient do tur flow).
     // SKIP_ROUTER_WAIT=1 pozwala uruchomic bota w trybie dev bez routera —
     // Chromium i pipeline video startuja, audio capture do routera failuje
     // best-effort.
@@ -451,7 +283,7 @@ async fn main() -> Result<()> {
             drop(guard);
             tokio::time::sleep(tokio::time::Duration::from_millis(500)).await;
         }
-        tracing::info!("Router polaczony — STT/TTS dostepne");
+        tracing::info!("Router polaczony — tury flow dostepne");
     } else {
         tracing::warn!("SKIP_ROUTER_WAIT=1 — uruchamiam bota bez czekania na router (tryb dev)");
     }
@@ -625,7 +457,7 @@ async fn main() -> Result<()> {
         )
         .await;
 
-        let browser = browser::launch_chromium(&config).await?;
+        let browser = browser::launch_chromium().await?;
         let (p, observer) = match browser::join_meeting(
             &browser,
             &config.meeting_url,
@@ -690,16 +522,16 @@ async fn main() -> Result<()> {
         config.vad_rms_threshold,
     )?;
 
-    // Diarization jest wykonywana po stronie routera (tentaflow-core) razem ze STT.
-    // Bot otrzymuje juz etykiete speakera w ModelResponse. Jesli router nie zwroci
-    // speaker_label, uzywamy fallback "Nieznany".
+    // Diarization i wybor modeli STT/LLM/TTS sa po stronie Core (wiersz sesji);
+    // bot dostaje gotowy transkrypt i audio odpowiedzi w jednej turze flow.
 
-    // 7. Glowna petla: audio -> VAD -> STT (QUIC) -> streaming transcript -> TTS (QUIC)
+    // 7. Glowna petla: audio -> VAD -> FlowInvoke (QUIC) -> transcript + PCM odpowiedzi
     let mut speech_buffer: Vec<i16> = Vec::new();
-    let stt_alias = config.stt_alias.as_str();
-    let tts_alias = config.tts_alias.as_str();
 
-    tracing::info!("Pipeline audio uruchomiony (STT alias: {}, TTS alias: {})", stt_alias, tts_alias);
+    tracing::info!(
+        respond = config.respond_enabled,
+        "Pipeline audio uruchomiony (tury flow przez Core)"
+    );
 
     // Bulletproof audio segmentation dla STT + WeSpeaker diarization.
     //
@@ -874,304 +706,196 @@ async fn main() -> Result<()> {
                         samples = speech_buffer.len(),
                         duration_ms,
                         snr_db = snr,
-                        model = stt_alias,
-                        "Wysylam segment do STT"
+                        "Wysylam segment do Core (tura flow)"
                     );
 
-                    // Doklej kontekst spotkania do metadata STT — router uzywa
-                    // go do diarization, logow i ewentualnej generacji odpowiedzi.
-                    // Sanityzacja rosteru jest juz zrobiona po stronie dom_observer
-                    // (raz, przy kazdej zmianie `known`); tutaj tylko bierzemy
-                    // gotowy JSON jednym atomic load'em.
+                    // Kontekst spotkania dla Core — trafia do kontekstu LLM i do
+                    // diarization/logow. Roster jest juz zsanityzowany przez
+                    // dom_observer; tu tylko jeden atomic load.
                     let mut extra_meta: Vec<(String, String)> = Vec::new();
                     let roster_json = roster_snapshot.load_full();
                     if roster_json.as_str() != "[]" {
                         extra_meta.push(("roster".to_string(), (*roster_json).clone()));
                     }
-                    if let Some(ref speaker) = *current_active_speaker.read().await {
-                        let cleaned: String = speaker.chars()
-                            .filter(|c| !c.is_control())
-                            .take(128)
-                            .collect();
-                        if !cleaned.is_empty() {
-                            extra_meta.push(("active_speaker".to_string(), cleaned));
-                        }
+                    let speaker_label = current_active_speaker
+                        .read()
+                        .await
+                        .as_deref()
+                        .map(|speaker| {
+                            speaker
+                                .chars()
+                                .filter(|c| !c.is_control())
+                                .take(128)
+                                .collect::<String>()
+                        })
+                        .filter(|s| !s.is_empty());
+                    if let Some(ref speaker) = speaker_label {
+                        extra_meta.push(("active_speaker".to_string(), speaker.clone()));
                     }
                     extra_meta.push(("timestamp_ms".to_string(), timestamp_ms.to_string()));
 
-                    // Pobierz klienta raz dla calej iteracji (STT + opcjonalny TTS) —
-                    // osobny lock dla TTS moglby trafic na inny Arc jesli router sie
-                    // zrekonektowal miedzy wywolaniami.
                     let client = {
                         let guard = router_client_handle.lock().await;
                         guard.as_ref().cloned()
                     };
                     let Some(client) = client else {
-                        tracing::warn!("router client not available, skipping STT");
+                        tracing::warn!("router client not available, skipping segment");
                         speech_buffer.clear();
                         collecting_silence_tail = false;
                         silence_tail_samples = 0;
                         continue;
                     };
-                    let stt_started = std::time::Instant::now();
-                    let stt_result = match tokio::time::timeout(
-                        std::time::Duration::from_secs(30),
-                        client.transcribe(&speech_buffer, stt_alias, None, extra_meta),
-                    ).await {
-                        Ok(result) => result,
-                        Err(_) => {
-                            tracing::warn!("STT timeout po 30s — router nie odpowiada");
-                            Err(anyhow::anyhow!("STT timeout"))
-                        }
-                    };
-                    let stt_latency_ms = stt_started.elapsed().as_millis() as u64;
-                    match stt_result {
-                        Ok(text) if !text.is_empty() => {
-                            // Pelen tekst per segment + latency to spam na info —
-                            // przy zywej rozmowie 10-30 wpisow/min, wszystkie z
-                            // duzym `text` polem. Demotujemy do debug; podsumowanie
-                            // info dostarcza linijka "Wysylam segment do STT" wyzej.
-                            tracing::debug!(text = %text, latency_ms = stt_latency_ms, "STT zwrocilo transkrypt");
-                            let _ = transcript_tx.send(("Nieznany".to_string(), text.clone(), timestamp_ms));
+                    if client.current_meeting_id().is_none() {
+                        tracing::debug!("brak aktywnego meeting_id — pomijam segment");
+                        speech_buffer.clear();
+                        collecting_silence_tail = false;
+                        silence_tail_samples = 0;
+                        continue;
+                    }
 
-                            // Wpis do rolling bufferu summarizera. Speaker name
-                            // pochodzi z active_speaker DOM (gdy dostepny) — bez
-                            // diarization po stronie bota uzywamy fallback "Nieznany",
-                            // ktory i tak pojdzie do prompta jako `[Nieznany]`.
-                            let speaker_label = current_active_speaker
-                                .read()
-                                .await
+                    // Callback state: the transcript arrives first and is fanned
+                    // out to the live stream / summarizer buffer / broadcast in a
+                    // spawned task (the callback itself is synchronous); answer
+                    // text is only logged; audio goes straight to the mic.
+                    let turn_started = std::time::Instant::now();
+                    let answer_text = Arc::new(parking_lot::Mutex::new(String::new()));
+                    let total_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let transcript_seen = Arc::new(AtomicBool::new(false));
+
+                    let on_transcript = {
+                        let transcript_tx = transcript_tx.clone();
+                        let transcript_buffer = Arc::clone(&transcript_buffer);
+                        let bcast_client = Arc::clone(&client);
+                        let speaker_label = speaker_label.clone();
+                        let transcript_seen = Arc::clone(&transcript_seen);
+                        move |text: String| {
+                            transcript_seen.store(true, Ordering::Relaxed);
+                            let latency_ms = turn_started.elapsed().as_millis() as u64;
+                            // Metrics only: the utterance is participant
+                            // speech and never reaches the log.
+                            tracing::debug!(
+                                chars = text.chars().count(),
+                                latency_ms,
+                                "Core zwrocilo transkrypt"
+                            );
+                            let display = speaker_label
                                 .clone()
                                 .unwrap_or_else(|| "Nieznany".to_string());
-                            {
-                                let mut buf = transcript_buffer.lock().await;
-                                buf.push(TranscriptEntry {
-                                    timestamp_ms: timestamp_ms as i64,
-                                    speaker_name: speaker_label.clone(),
-                                    text: text.clone(),
-                                });
-                            }
-
-                            // Live broadcast chunku transkryptu — router rozsyła
-                            // do dashboardu i może wzbogacić speaker_id (diarization
-                            // lookup z voice_profiles). Persist chunka do DB leci
-                            // osobno przez STT metadata `meeting_id` → transcript_store,
-                            // więc ten event nie duplikuje zapisu.
-                            //
-                            // Fire-and-forget: broadcast TranscriptEntry to nowy
-                            // bi-stream QUIC RT do routera (~50-200ms). Blokowanie
-                            // na nim opoznialoby start LLM przy kazdej wypowiedzi
-                            // dokladnie o ten czas. Spawnujemy w tle, bledy idzie
-                            // do warn — nie ma czego retryowac.
-                            if let Some(meeting_id) = client.current_meeting_id() {
-                                let bcast_client = Arc::clone(&client);
-                                let bcast_speaker = speaker_label.clone();
-                                let bcast_text = text.clone();
-                                let bcast_alias = stt_alias.to_string();
-                                tokio::spawn(async move {
-                                    let speaker_name = if bcast_speaker == "Nieznany" {
-                                        None
-                                    } else {
-                                        Some(bcast_speaker.clone())
-                                    };
-                                    if let Err(e) = bcast_client
-                                        .send_meeting_event(
-                                            &meeting_id,
-                                            timestamp_ms as i64,
-                                            MeetingEventPayload::TranscriptEntry {
-                                                speaker_id: bcast_speaker,
-                                                speaker_name,
-                                                is_enrolled: false,
-                                                speaker_confidence: None,
-                                                text: bcast_text,
-                                                language: None,
-                                                resolved_stt_model: bcast_alias,
-                                                latency_ms: stt_latency_ms,
-                                            },
-                                        )
-                                        .await
-                                    {
-                                        tracing::warn!(
-                                            "send_meeting_event TranscriptEntry (bg) failed: {}",
-                                            e
-                                        );
-                                    }
-                                });
-                            }
-
-                            // Pelny pipeline z gatowaniem aktywacji:
-                            //   1. echo_mode -> bot powtarza dokladnie (test)
-                            //   2. respond_enabled + llm_alias wpiety
-                            //   3. response_mode determinuje kiedy odpalamy LLM:
-                            //        - "always": kazda wypowiedz
-                            //        - "wake_word" (default): tylko gdy wake_word w tekscie
-                            //        - "wake_word_intent": wake_word + lokalny klasyfikator
-                            //   4. response generation: LLM moze zwrocic <NO_RESPONSE>
-                            //
-                            // Pasywny default `wake_word` gwarantuje 0 LLM calls dla
-                            // normalnej rozmowy bez wezwania bota.
-                            // Echo mode i streaming LLM rozbiegaja sie tutaj:
-                            //   - echo_mode: pojedynczy passthrough -> jeden TTS
-                            //     call (brak korzysci ze streamingu, tekst znamy
-                            //     z gory).
-                            //   - LLM streaming: kazde zdanie z `gate_and_respond`
-                            //     trafia do TtsQueue jako osobny job; pierwszy
-                            //     audio chunk leci do mikrofonu zanim LLM dokonczy.
-                            //
-                            // is_bot_speaking jest ustawiane gdy pojawia sie
-                            // pierwsze zdanie (caller_emit ponizej) i czyszczone
-                            // po `wait_idle` + deferred hold po dlugosci ostatniego
-                            // audio.
-                            let total_bytes = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-                            let tts_queue = crate::tts_queue::TtsQueue::spawn();
-
-                            let tts_alias_owned = tts_alias.to_string();
-                            let meeting_language_owned = config.meeting_language.clone();
-                            let mk_tts_job = {
-                                let tts_queue = Arc::clone(&tts_queue);
-                                let client = Arc::clone(&client);
-                                let audio_playback = Arc::clone(&audio_playback);
-                                let total_bytes = Arc::clone(&total_bytes);
-                                let is_bot_speaking = Arc::clone(&is_bot_speaking);
-                                move |sentence: String| {
-                                    is_bot_speaking.store(true, Ordering::Relaxed);
-                                    let c = Arc::clone(&client);
-                                    let ap = Arc::clone(&audio_playback);
-                                    let total = Arc::clone(&total_bytes);
-                                    let model_alias = tts_alias_owned.clone();
-                                    let lang = meeting_language_owned.clone();
-                                    tts_queue.enqueue(async move {
-                                        let total_in = Arc::clone(&total);
-                                        let ap_in = Arc::clone(&ap);
-                                        let res = tokio::time::timeout(
-                                            std::time::Duration::from_secs(30),
-                                            c.synthesize_stream(
-                                                &sentence,
-                                                "",
-                                                &model_alias,
-                                                Some(lang.as_str()),
-                                                move |pcm| {
-                                                    total_in.fetch_add(pcm.len(), Ordering::Relaxed);
-                                                    ap_in.send(pcm).map_err(|e| {
-                                                        anyhow::anyhow!(
-                                                            "audio_playback.send: {}",
-                                                            e
-                                                        )
-                                                    })
-                                                },
-                                            ),
-                                        )
-                                        .await;
-                                        if res.is_err() {
-                                            tracing::warn!("TTS streaming timeout (zdanie)");
-                                        } else if let Ok(Err(e)) = res {
-                                            tracing::warn!("Blad TTS streaming (zdanie): {:#}", e);
-                                        }
+                            let _ = transcript_tx.send((display.clone(), text.clone(), timestamp_ms));
+                            let buffer = Arc::clone(&transcript_buffer);
+                            let bcast = Arc::clone(&bcast_client);
+                            let speaker_name = speaker_label.clone();
+                            tokio::spawn(async move {
+                                {
+                                    let mut buf = buffer.lock().await;
+                                    buf.push(TranscriptEntry {
+                                        timestamp_ms: timestamp_ms as i64,
+                                        speaker_name: display.clone(),
+                                        text: text.clone(),
                                     });
                                 }
-                            };
-
-                            let response_text: Option<String> = if config.echo_mode {
-                                Some(text.clone())
-                            } else if config.respond_enabled
-                                && !config.llm_alias.trim().is_empty()
-                            {
-                                gate_and_respond(
-                                    &config,
-                                    &client,
-                                    &text,
-                                    mk_tts_job,
-                                ).await
-                            } else {
-                                tracing::debug!(
-                                    respond_enabled = config.respond_enabled,
-                                    llm_alias_empty = config.llm_alias.trim().is_empty(),
-                                    "skip LLM response (bot pasywny — sprawdz respond_enabled / llm_alias)"
-                                );
-                                None
-                            };
-
-                            if let Some(reply) = response_text {
-                                // echo_mode nie idzie przez gate_and_respond
-                                // (i przez to przez TtsQueue w callbacku) — musimy
-                                // tu enqueueowac caly tekst jako jedno zdanie zeby
-                                // pipeline byl spojny.
-                                if config.echo_mode {
-                                    let q = Arc::clone(&tts_queue);
-                                    let c = Arc::clone(&client);
-                                    let ap = Arc::clone(&audio_playback);
-                                    let model_alias = tts_alias.to_string();
-                                    let total = Arc::clone(&total_bytes);
-                                    is_bot_speaking.store(true, Ordering::Relaxed);
-                                    let echo_text = reply.clone();
-                                    let lang = config.meeting_language.clone();
-                                    q.enqueue(async move {
-                                        let total_in = Arc::clone(&total);
-                                        let ap_in = Arc::clone(&ap);
-                                        let res = tokio::time::timeout(
-                                            std::time::Duration::from_secs(30),
-                                            c.synthesize_stream(
-                                                &echo_text,
-                                                "",
-                                                &model_alias,
-                                                Some(lang.as_str()),
-                                                move |pcm| {
-                                                    total_in.fetch_add(pcm.len(), Ordering::Relaxed);
-                                                    ap_in.send(pcm).map_err(|e| {
-                                                        anyhow::anyhow!(
-                                                            "audio_playback.send: {}",
-                                                            e
-                                                        )
-                                                    })
-                                                },
-                                            ),
-                                        )
-                                        .await;
-                                        if res.is_err() {
-                                            tracing::warn!("TTS streaming timeout (echo)");
-                                        } else if let Ok(Err(e)) = res {
-                                            tracing::warn!("Blad TTS streaming (echo): {:#}", e);
-                                        }
-                                    });
+                                // Live broadcast to the dashboard; persistence
+                                // happened in Core when it produced the transcript.
+                                let Some(meeting_id) = bcast.current_meeting_id() else {
+                                    return;
+                                };
+                                if let Err(e) = bcast
+                                    .send_meeting_event(
+                                        &meeting_id,
+                                        timestamp_ms as i64,
+                                        MeetingEventPayload::TranscriptEntry {
+                                            speaker_id: display,
+                                            speaker_name,
+                                            is_enrolled: false,
+                                            speaker_confidence: None,
+                                            text,
+                                            language: None,
+                                            resolved_stt_model: String::new(),
+                                            latency_ms,
+                                        },
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        "send_meeting_event TranscriptEntry (bg) failed: {}",
+                                        e
+                                    );
                                 }
+                            });
+                        }
+                    };
+                    let on_text = {
+                        let answer_text = Arc::clone(&answer_text);
+                        move |delta: String| {
+                            answer_text.lock().push_str(&delta);
+                        }
+                    };
+                    let on_audio = {
+                        let audio_playback = Arc::clone(&audio_playback);
+                        let is_bot_speaking = Arc::clone(&is_bot_speaking);
+                        let total_bytes = Arc::clone(&total_bytes);
+                        move |pcm: Vec<u8>| -> anyhow::Result<()> {
+                            // Echo guard goes up with the FIRST audio chunk so the
+                            // capture never transcribes the bot's own voice.
+                            is_bot_speaking.store(true, Ordering::Relaxed);
+                            total_bytes.fetch_add(pcm.len(), Ordering::Relaxed);
+                            audio_playback
+                                .send(pcm)
+                                .map_err(|e| anyhow::anyhow!("audio_playback.send: {}", e))
+                        }
+                    };
 
-                                // Czekamy az wszystkie zdania pojda przez TTS.
-                                tts_queue.wait_idle().await;
-                                let bytes = total_bytes.load(Ordering::Relaxed);
-                                // 16 kHz mono i16 LE = 32_000 B/s
-                                let duration_ms = (bytes as u64) * 1000 / 32_000;
-                                tracing::info!(
-                                    bytes,
-                                    duration_ms,
-                                    sentence_count = "stream",
-                                    "TTS streaming (per-sentence) zakonczony"
-                                );
-                                let flag = Arc::clone(&is_bot_speaking);
-                                // Safety guard: nawet gdyby duration_ms == 0
-                                // (zerowy stream), trzymamy flage min. 250 ms
-                                // zeby capture nie wbil sie w trakcie zamykania
-                                // mic injection w JS.
-                                let hold_ms = duration_ms.max(250) + 250;
-                                tokio::spawn(async move {
-                                    tokio::time::sleep(
-                                        std::time::Duration::from_millis(hold_ms),
-                                    ).await;
-                                    flag.store(false, Ordering::Relaxed);
-                                });
-                                let _ = reply;
-                            } else {
-                                // Bot postanowil milczec — nic do enqueue, ale
-                                // tts_queue zyje dopoki Arc nie zostanie dropniety.
-                                drop(tts_queue);
-                            }
-                        }
-                        Ok(_) => {
-                            tracing::debug!("STT zwrocil pusty tekst — pomijam");
-                        }
-                        Err(e) => {
-                            tracing::warn!("Blad STT: {} — pomijam segment", e);
-                        }
+                    let turn = tokio::time::timeout(
+                        std::time::Duration::from_secs(90),
+                        client.flow_turn(
+                            &speech_buffer,
+                            SAMPLE_RATE as u32,
+                            Some(config.meeting_language.as_str()),
+                            config.respond_enabled,
+                            extra_meta,
+                            on_transcript,
+                            on_text,
+                            on_audio,
+                        ),
+                    )
+                    .await;
+                    match turn {
+                        Ok(Ok(())) => {}
+                        Ok(Err(e)) => tracing::warn!("Tura flow nieudana: {:#}", e),
+                        Err(_) => tracing::warn!("Tura flow: timeout 90s — Core nie odpowiada"),
                     }
+                    if !transcript_seen.load(Ordering::Relaxed) {
+                        tracing::debug!("Core nie zwrocilo transkryptu — segment pominiety");
+                    }
+                    let answer = std::mem::take(&mut *answer_text.lock());
+                    let answer_chars = answer.trim().chars().count();
+                    if answer_chars > 0 {
+                        // Metrics only: the answer is spoken into a meeting and
+                        // its text is as personal as the transcript.
+                        tracing::info!(
+                            chars = answer_chars,
+                            latency_ms = turn_started.elapsed().as_millis() as u64,
+                            "Odpowiedz bota wygenerowana"
+                        );
+                    }
+
+                    let bytes = total_bytes.load(Ordering::Relaxed);
+                    if bytes > 0 {
+                        // 16 kHz mono i16 LE = 32_000 B/s. The playback side is a
+                        // fire-and-forget queue, so keep the echo guard up for
+                        // the audio's own length plus a safety margin.
+                        let audio_ms = (bytes as u64) * 1000 / 32_000;
+                        tracing::info!(bytes, audio_ms, "Audio odpowiedzi wyslane do mikrofonu");
+                        let flag = Arc::clone(&is_bot_speaking);
+                        let hold_ms = audio_ms.max(250) + 250;
+                        tokio::spawn(async move {
+                            tokio::time::sleep(std::time::Duration::from_millis(hold_ms)).await;
+                            flag.store(false, Ordering::Relaxed);
+                        });
+                    } else {
+                        is_bot_speaking.store(false, Ordering::Relaxed);
+                    }
+
                     speech_buffer.clear();
                     collecting_silence_tail = false;
                     silence_tail_samples = 0;
@@ -1237,7 +961,7 @@ async fn main() -> Result<()> {
                             None,
                         )
                         .await;
-                        match browser::launch_chromium(&config).await {
+                        match browser::launch_chromium().await {
                             Ok(browser) => {
                                 match browser::join_meeting(
                                     &browser,

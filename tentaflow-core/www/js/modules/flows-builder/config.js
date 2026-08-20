@@ -223,6 +223,7 @@ export class FlowConfig {
     this.node = null;
     this.template = null;
     this.activeTab = 'config';
+    this.readOnly = !!opts.readOnly;
     this.root.classList.add('fb-config');
     this.renderEmpty();
   }
@@ -287,10 +288,10 @@ export class FlowConfig {
         <button class="fb-config-tab ${this.activeTab === 'advanced' ? 'active' : ''}" data-tab="advanced">${escapeHtml(I18n.t('flows_config.tab_advanced'))}</button>
       </nav>
       <div class="fb-config-body" data-role="body"></div>
-      <footer class="fb-config-footer">
+      ${this.readOnly ? '' : `<footer class="fb-config-footer">
         <tf-button variant="secondary" size="sm" icon="copy" data-action="duplicate">${escapeHtml(I18n.t('flows_config.duplicate'))}</tf-button>
         <tf-button variant="danger" size="sm" icon="trash" data-action="delete">${escapeHtml(I18n.t('flows_config.delete'))}</tf-button>
-      </footer>
+      </footer>`}
     `;
 
     this.root.querySelectorAll('.fb-config-tab').forEach((t) => {
@@ -324,6 +325,10 @@ export class FlowConfig {
     if (this.activeTab === 'mapping') this._bindMappingInputs(body);
     if (this.activeTab === 'advanced') this._bindAdvancedInputs(body);
     if (this.activeTab === 'ports') this._bindPortsInputs(body);
+    if (this.readOnly) {
+      body.querySelectorAll('input, select, textarea, button, tf-button, tf-input, tf-select, tf-textarea, tf-toggle, tf-checkbox, tf-combobox')
+        .forEach((el) => el.setAttribute('disabled', ''));
+    }
   }
 
   _bindPortsInputs(body) {
