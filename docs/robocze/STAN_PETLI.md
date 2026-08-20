@@ -604,3 +604,65 @@ pochodzenie jako argument obowiązkowy.
 4. Luki pokrycia: punkty wejścia **tts / document / stt** bez testu pochodzenia; trzy handlery
    strumieniowe (Chat / Project / CodeStudio) bez testu jednostkowego (zgłoszone już przez
    wykonawcę rundy 1 — krytyk potwierdza, że stoją na kompilacji i przeglądzie).
+
+---
+
+## Runda: R2a `graph_home` w `GraphManager` (runda 3) — ślepy krytyk, po scaleniu main
+
+**Werdykt: DOES NOT MEET BAR — wyłącznie C7** (cztery nowo dopisane linie komentarza po polsku
+w akapicie, który w połowie zdania przechodzi na angielski). C1–C6, C8, C9 spełnione z własnymi
+dowodami krytyka. Dziewięć cykli mutacyjnych, każdy w osobnym skrypcie pod blokadą, każdy
+zakończony porównaniem bajtowym z migawką.
+
+Baseline po scaleniu: `services::graph` **46 passed**, `graph_host_functions` **18 passed**.
+
+**Odpowiedź na pytanie 2: TAK — teraz jest pilnowane.** Mutacja, która w rundzie 2 przeszła
+przez 44 testy (kasowanie ignoruje wiersz rejestru i wylicza ścieżkę z klucza), czerwieni dziś
+dwa testy — dokładnie te dwa, które poprawka dołożyła. To jest domknięcie znaleziska F5 z
+rundy 2.
+
+Odnotowane dla porządku: **integracyjny `graph_host_functions` (18 testów, w tym oba testy
+odinstalowania) przechodzi tę mutację bez mrugnięcia** — używa wyłącznie drzewa addona, więc cały
+scenariusz osieroconych plików jest dla niego niewidoczny. Pilnują tylko testy lib.
+
+**Wyścig z rundy 2 (F1) naprawiony i udowodniony.** Kod czyta wiersz DWA razy: raz przed
+blokadą (tylko do zasiania kanonicznego wpisu) i raz PO wzięciu blokady, i to ten drugi odczyt
+rozstrzyga, co zostanie skasowane. Mutacja przywracająca stary kształt (rozstrzygnięcie przed
+blokadą, działanie na zapamiętanej ścieżce) czerwieni
+`test_delete_resolves_path_after_lock_no_orphan`. Stare testy wyścigu nie mogły tego złapać —
+używają wyłącznie ścieżki domyślnej, gdzie zasiew i wiersz są takie same.
+
+### Znaleziska poza kryteriami — do rozstrzygnięcia
+
+1. **F1: `ensure_collection_at` NIE MA ŻADNEGO WOŁAJĄCEGO W PRODUKCJI.** Publiczne API, jego
+   ścieżka kwot, walidacja i migracja v130 wyszły przed konsumentem. Konsumentem ma być węzeł
+   `graph_extract` (tor R2b, §5c briefu, w zakresie ale NIEZACZĘTY). Dopóki R2b nie wyląduje,
+   jest to „wire this up later", czyli reguła 1 `CLAUDE.md`. **Wniosek dla kolejności prac:
+   R2b przestaje być opcjonalne — albo wchodzi, albo R2a trzeba wycofać.**
+2. **F2: walidator dopuszcza DOWOLNĄ ścieżkę bezwzględną, a kasowanie grafu jest rekurencyjne.**
+   `validate_custom_dir` wymaga tylko: bezwzględna + bez `..`. Nie zamyka katalogu w obszarze
+   danych i nie kanonizuje, więc dowiązanie symboliczne ucieka. Kolekcje grafu są KATALOGAMI, a
+   `remove_cozo_files` robi na katalogu `remove_dir_all`. Kto w końcu zawoła `ensure_collection_at`,
+   dostaje prymityw „utwórz i rekurencyjnie skasuj `<dowolny katalog>/<kolekcja>.cozo`".
+   **To jest wymaganie projektowe dla R2b, nie kosmetyka:** `graph_home` musi być mintowane przez
+   serwer i zamknięte w katalogu projektu (inwariant 1), bo dziś nie egzekwuje tego NIC.
+3. **F3:** na ścieżce `ensure_collection_at` `org_id` nie wchodzi do ścieżki pliku, więc dwie
+   organizacje z tym samym katalogiem trafiają w ten sam plik. Uczciwie udokumentowane w nagłówku
+   pliku, ale nieegzekwowane kodem — znów: obowiązek przyszłego wołającego.
+4. **F4:** `test_delete_cache_miss_resolves_nonempty_path` pilnuje czegoś innego, niż mówi jego
+   nazwa (mutacja `None => PathBuf::default()` zostawia całe 46 testów zielonych). Zlecone.
+5. **F5 (ZASTANE, nie z tej zmiany, nieudowodnione):** wzajemne wykluczenie kasowania i tworzenia
+   opiera się na tym, że oba wątki trafią na ten sam kanoniczny `Arc<GraphEntry>`. `evict_to_cap`
+   może go usunąć z mapy w oknie między `canonical_entry_for` a wzięciem blokady slotu;
+   `seal_key_with_seed` nie sprawdza po wzięciu blokady, czy jego wpis nadal jest kanoniczny.
+6. **F6 (ZASTANE):** `tests.rs::tempdir()` ma zaszyty fallback `/mnt/e/repos/rust/_scratch/...`,
+   więc na maszynie bez tej ścieżki CAŁY zestaw grafu pada na `PermissionDenied` zamiast pominąć
+   się albo wytłumaczyć. Trzeba ustawiać `TMPDIR`, żeby cokolwiek uruchomić.
+7. **F7:** praca towarzysząca jest zdrowa — migracja v130 naprawia wiersze osierocone przez starą
+   migrację katalogu danych i ŚWIADOMIE nie rusza wierszy niekończących się ogonem z klucza
+   (czyli kolekcji z `ensure_collection_at`); `storage_admin::run_live_migration` przepisuje
+   `file_path`. Bez tego uczynienie wiersza autorytatywnym byłoby cichą utratą danych na każdej
+   instalacji, która przeniosła katalog danych.
+
+**Sprzątnięte:** `tentaflow-core/relative/` — pozostałość po mutacji zdejmującej walidator
+(test utworzył prawdziwy katalog). Ta sama pozostałość co odnotowana wcześniej; tym razem usunięta.
