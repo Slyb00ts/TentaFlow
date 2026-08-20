@@ -211,6 +211,7 @@ impl Router {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         };
 
         // Mesh re-forward guard: max out the hop counter so any further

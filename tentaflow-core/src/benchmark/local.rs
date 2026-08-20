@@ -84,6 +84,7 @@ impl LocalRunner {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         // §2.5 — a benchmark run is core measurement work; the operator who

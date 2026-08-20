@@ -5,7 +5,7 @@
 //       dzieci. `variant` na option: ok|warn|err|accent|neutral (domyslnie).
 //       Emituje event 'change' z detail.value. A11y: role=radiogroup + aria.
 // Przyklad:
-//   <tf-segmented value="auto" size="sm">
+//   <tf-segmented value="auto" size="sm">   (size: sm | md — md = sentence-case filled pill)
 //     <option value="auto" variant="neutral">Auto</option>
 //     <option value="allow" variant="ok">Zezwól</option>
 //     <option value="deny" variant="err">Odmów</option>
@@ -100,6 +100,7 @@ class TfSegmented extends HTMLElement {
     const size = this.getAttribute('size') || '';
     const disabled = this.hasAttribute('disabled');
     this._container.classList.toggle('tf-segmented-sm', size === 'sm');
+    this._container.classList.toggle('tf-segmented-md', size === 'md');
     this._container.classList.toggle('tf-segmented-disabled', disabled);
     for (const btn of this._container.querySelectorAll('.tf-seg-opt')) {
       const active = btn.dataset.value === val;

@@ -808,6 +808,7 @@ mod tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         }
     }
 

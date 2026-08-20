@@ -193,6 +193,13 @@ pub struct LlamaArtifacts {
     pub dynamic_dir: PathBuf,
 }
 
+/// Pooled embedding of one input text plus the token count it consumed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Embedding {
+    pub vector: Vec<f32>,
+    pub prompt_tokens: usize,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LlamaModelMetadata {
     pub name: String,
@@ -626,7 +633,10 @@ impl LlamaRuntime {
         self.model.raw
     }
 
-    pub fn embeddings(&self, text: &str, normalize: bool) -> Result<Vec<f32>, LlamaError> {
+    /// Computes one pooled embedding for `text`. Returns the vector together
+    /// with the number of prompt tokens it was computed from, so callers can
+    /// report real usage instead of estimating it.
+    pub fn embeddings(&self, text: &str, normalize: bool) -> Result<Embedding, LlamaError> {
         let n_embd = self.metadata.embedding_size as usize;
         if n_embd == 0 {
             return Err(LlamaError::EmbeddingsUnsupported);
@@ -657,7 +667,10 @@ impl LlamaRuntime {
                 }
             }
         }
-        Ok(values)
+        Ok(Embedding {
+            vector: values,
+            prompt_tokens: tokens.len(),
+        })
     }
 
     fn context(&self, embeddings: bool) -> Result<LlamaContextGuard, LlamaError> {

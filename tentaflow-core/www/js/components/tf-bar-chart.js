@@ -7,9 +7,12 @@
 //
 // Tryb wykresu (mode='chart', domyślny) — kontrakt jak tf-line-chart:
 //   `series` Array<{id, name, tone, showInLegend, points: [{x, y}]}>,
-//   `xAxis`/`yAxis`, `legend`, `orientation`: 'vertical'|'horizontal',
-//   `stacking`: 'none'|'stacked'|'percent', `height`, `locale`.
-//   Event 'series-toggle' detail {series_id, hidden}.
+//   `xAxis`/`yAxis`, `legend`, `tooltip`, `crosshair`, `animate`, `narrow`,
+//   `orientation`: 'vertical'|'horizontal', `stacking`: 'none'|'stacked'|'percent',
+//   `maxBarWidth`: number px (domyślnie 34, szerokość pojedynczego słupka),
+//   `height`, `locale`. Słupki pionowe: górny segment stosu to <path> z
+//   zaokrąglonym szczytem, niższe segmenty i słupki poziome to <rect>.
+//   Event 'series-toggle' detail {series_id, hidden}, 'point-hover'.
 //
 // Tryb mode='single' (StackedBar) — jeden poziomy pasek 100% szerokości:
 //   `segments`: Array<{id: string, label: string, value: number, tone}>,
@@ -18,13 +21,22 @@
 // =============================================================================
 
 import {
-  SVG_NS, TfCartesianChart,
-  computeDomains, scaleY,
+  SVG_NS, TfCartesianChart, BAR_STAGGER_MS,
+  computeDomains, scaleY, applyNarrow, generateLinearTicks,
   renderXAxis, renderYAxis, renderGridlinesY,
 } from './tf-line-chart.js';
 
-const BAR_GROUP_PADDING_FRACTION = 0.2;  // 20% padding between category groups
-const MAX_BAR_GROUP_WIDTH = 56;          // px — keeps sparse charts readable
+const BAR_GROUP_PADDING_FRACTION = 0.3;  // padding between category groups
+const DEFAULT_MAX_BAR_WIDTH = 34;        // px — keeps sparse charts readable
+const BAR_TOP_RADIUS = 3;
+
+/// Path of a bar whose top corners are rounded (radius capped by size).
+export function roundedTopBarPath(x, y, w, h, radius = BAR_TOP_RADIUS) {
+  const r = Math.max(0, Math.min(radius, w / 2, h));
+  const x1 = x + w;
+  const y1 = y + h;
+  return `M${x},${y1}V${y + r}Q${x},${y} ${x + r},${y}H${x1 - r}Q${x1},${y} ${x1},${y + r}V${y1}Z`;
+}
 
 /// Scales a value along the value axis (linear/log) to pixels — used in
 /// horizontal layout where X carries the value.
@@ -45,6 +57,7 @@ class TfBarChart extends TfCartesianChart {
     this._mode = 'chart';
     this._orientation = 'vertical';
     this._stacking = 'none';
+    this._maxBarWidth = DEFAULT_MAX_BAR_WIDTH;
     // mode='single' state.
     this._segments = [];
     this._total = 0;
@@ -52,18 +65,26 @@ class TfBarChart extends TfCartesianChart {
     this._showPercentages = false;
   }
 
-  set mode(value) { this._mode = value === 'single' ? 'single' : 'chart'; this._render(); }
-  set orientation(value) { this._orientation = typeof value === 'string' ? value : 'vertical'; this._render(); }
-  set stacking(value) { this._stacking = typeof value === 'string' ? value : 'none'; this._render(); }
-  set segments(value) { this._segments = Array.isArray(value) ? value : []; this._render(); }
-  set total(value) { const n = Number(value); this._total = Number.isFinite(n) && n > 0 ? n : 0; this._render(); }
-  set showLegend(value) { this._showLegend = Boolean(value); this._render(); }
-  set showPercentages(value) { this._showPercentages = Boolean(value); this._render(); }
+  set mode(value) { this._mode = value === 'single' ? 'single' : 'chart'; this._requestRender(); }
+  set orientation(value) { this._orientation = typeof value === 'string' ? value : 'vertical'; this._requestRender(); }
+  set stacking(value) { this._stacking = typeof value === 'string' ? value : 'none'; this._requestRender(); }
+  set maxBarWidth(value) {
+    const n = Number(value);
+    this._maxBarWidth = Number.isFinite(n) && n > 0 ? n : DEFAULT_MAX_BAR_WIDTH;
+    this._requestRender();
+  }
+  set segments(value) { this._segments = Array.isArray(value) ? value : []; this._requestRender(); }
+  set total(value) { const n = Number(value); this._total = Number.isFinite(n) && n > 0 ? n : 0; this._requestRender(); }
+  set showLegend(value) { this._showLegend = Boolean(value); this._requestRender(); }
+  set showPercentages(value) { this._showPercentages = Boolean(value); this._requestRender(); }
 
   _hostClasses() {
     return ['tf-chart--bar', `tf-chart--orientation-${this._orientation}`, `tf-chart--stacking-${this._stacking}`];
   }
   _ariaLabel() { return 'Bar chart'; }
+  _tooltipShowsTotal() { return this._stacking === 'stacked'; }
+  _formatXLabel(x) { return String(x); }
+  _hoverAxis() { return this._orientation === 'horizontal' ? 'y' : 'x'; }
 
   _render() {
     if (this._mode === 'single') {
@@ -75,13 +96,13 @@ class TfBarChart extends TfCartesianChart {
 
   // ---- mode='chart' -----------------------------------------------------------
 
-  _drawPlot(svg, box) {
+  _drawPlot(svg, box, enter) {
     const { x0, x1, y0, y1 } = box;
     const visible = this._visibleSeries();
-    const seriesPoints = visible.map((s) => s.points || []);
+    let seriesPoints = visible.map((s) => s.points || []);
 
     // Unique X categories in occurrence order; numeric-only sets sorted.
-    const categories = [];
+    let categories = [];
     const seenCat = new Set();
     for (const pts of seriesPoints) {
       for (const p of pts) {
@@ -94,6 +115,14 @@ class TfBarChart extends TfCartesianChart {
     }
     if (categories.every((x) => typeof x === 'number')) {
       categories.sort((a, b) => a - b);
+    }
+    if (this._orientation === 'vertical') {
+      const sliced = applyNarrow(categories, x1 - x0, this._narrow);
+      if (sliced !== categories) {
+        const keep = new Set(sliced);
+        seriesPoints = seriesPoints.map((pts) => pts.filter((p) => keep.has(p.x)));
+        categories = sliced;
+      }
     }
 
     // Stacking-aware Y domain.
@@ -124,6 +153,15 @@ class TfBarChart extends TfCartesianChart {
       if (this._yAxis.max != null) yDomain.max = this._yAxis.max;
       if (yDomain.min === yDomain.max) yDomain.max = yDomain.min + 1;
     }
+    // Without an explicit max the axis ends on a round tick with ~10 %
+    // headroom above the tallest bar, so the top gridline always clears the
+    // data instead of being grazed by it.
+    if (this._yAxis.max == null && this._yAxis.scale !== 'log' && yDomain.max > yDomain.min) {
+      const target = yDomain.min + (yDomain.max - yDomain.min) * 1.1;
+      const ticks = generateLinearTicks(yDomain.min, target, this._yAxis.ticks || 6);
+      const top = ticks[ticks.length - 1];
+      if (Number.isFinite(top) && top >= yDomain.max) yDomain.max = top;
+    }
     this._lastDomain = { xs: { min: 0, max: 1 }, ys: yDomain, categories };
 
     if (this._orientation === 'vertical') {
@@ -132,13 +170,18 @@ class TfBarChart extends TfCartesianChart {
       renderYAxis(svg, this._yAxis, yDomain, x0, y0, y1, this._locale);
 
       const groupWidth = (x1 - x0) / Math.max(1, categories.length);
+      const barCap = this._maxBarWidth * (this._stacking === 'none' ? Math.max(1, visible.length) : 1);
       for (let ci = 0; ci < categories.length; ci++) {
         const cat = categories[ci];
         // Cap the bar width and centre it in its band: with one or two
         // categories an uncapped bar stretches across half the chart and stops
         // reading as a bar.
-        const innerW = Math.min(groupWidth * (1 - BAR_GROUP_PADDING_FRACTION), MAX_BAR_GROUP_WIDTH);
+        const innerW = Math.min(groupWidth * (1 - BAR_GROUP_PADDING_FRACTION), barCap);
         const groupX = x0 + ci * groupWidth + (groupWidth - innerW) / 2;
+        const centerX = x0 + groupWidth * (ci + 0.5);
+        const yBase = scaleY(Math.max(0, yDomain.min), this._yAxis, yDomain, y0, y1);
+        // Bars of one category share the stagger delay and grow from the axis.
+        const anim = enter ? { delay: ci * BAR_STAGGER_MS, originY: yBase == null ? y1 : yBase } : null;
         if (this._stacking === 'none') {
           // Grouped: per-series sub-bar inside the category group.
           const barW = innerW / Math.max(1, visible.length);
@@ -147,9 +190,9 @@ class TfBarChart extends TfCartesianChart {
             const pt = seriesPoints[si].find((p) => p.x === cat);
             if (!pt) continue;
             const py = scaleY(pt.y, this._yAxis, yDomain, y0, y1);
-            const yBase = scaleY(Math.max(0, yDomain.min), this._yAxis, yDomain, y0, y1);
             if (py == null || yBase == null) continue;
-            this._appendBar(svg, s, groupX + si * barW, Math.min(py, yBase), barW, Math.abs(py - yBase));
+            this._appendBar(svg, s, groupX + si * barW, Math.min(py, yBase), barW, Math.abs(py - yBase), { top: py <= yBase, anim });
+            this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: cat, y: pt.y, display: pt.y, px: centerX, py: Math.min(py, yBase) });
           }
         } else {
           // Stacked / percent: per-category baseline.
@@ -162,6 +205,11 @@ class TfBarChart extends TfCartesianChart {
             }
             if (total === 0) continue;
           }
+          let topIndex = -1;
+          for (let si = visible.length - 1; si >= 0; si--) {
+            const pt = seriesPoints[si].find((p) => p.x === cat);
+            if (pt && pt.y > 0) { topIndex = si; break; }
+          }
           for (let si = 0; si < visible.length; si++) {
             const s = visible[si];
             const pt = seriesPoints[si].find((p) => p.x === cat);
@@ -170,7 +218,8 @@ class TfBarChart extends TfCartesianChart {
             const topY = scaleY(accum + displayVal, this._yAxis, yDomain, y0, y1);
             const botY = scaleY(accum, this._yAxis, yDomain, y0, y1);
             if (topY == null || botY == null) { accum += displayVal; continue; }
-            this._appendBar(svg, s, groupX, topY, innerW, Math.abs(botY - topY));
+            this._appendBar(svg, s, groupX, topY, innerW, Math.abs(botY - topY), { top: si === topIndex, anim });
+            this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: cat, y: pt.y, display: displayVal, px: centerX, py: topY });
             accum += displayVal;
           }
         }
@@ -217,6 +266,7 @@ class TfBarChart extends TfCartesianChart {
             const pxLeft = scaleAlongValueAxis(baselineVal, this._yAxis, yDomain, x0, x1);
             if (pxRight == null || pxLeft == null) continue;
             this._appendBar(svg, s, Math.min(pxRight, pxLeft), groupY + si * barH, Math.abs(pxRight - pxLeft), barH);
+            this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: cat, y: pt.y, display: pt.y, px: pxRight, py: groupY + innerH / 2 });
           }
         } else {
           let accum = 0;
@@ -237,6 +287,7 @@ class TfBarChart extends TfCartesianChart {
             const pxTo = scaleAlongValueAxis(accum + displayVal, this._yAxis, yDomain, x0, x1);
             if (pxFrom == null || pxTo == null) { accum += displayVal; continue; }
             this._appendBar(svg, s, Math.min(pxFrom, pxTo), groupY, Math.abs(pxTo - pxFrom), innerH);
+            this._hoverItems.push({ seriesId: s.id, seriesName: s.name, tone: s.tone, x: cat, y: pt.y, display: displayVal, px: pxTo, py: groupY + innerH / 2 });
             accum += displayVal;
           }
         }
@@ -244,16 +295,30 @@ class TfBarChart extends TfCartesianChart {
     }
   }
 
-  _appendBar(svg, series, x, y, w, h) {
-    const rect = document.createElementNS(SVG_NS, 'rect');
-    rect.setAttribute('x', String(x));
-    rect.setAttribute('y', String(y));
-    rect.setAttribute('width', String(w));
-    rect.setAttribute('height', String(h));
-    rect.classList.add('tf-chart__bar');
-    if (series.tone) rect.classList.add(`tf-chart__bar--tone-${series.tone}`);
-    rect.setAttribute('data-series-id', series.id);
-    svg.appendChild(rect);
+  /// `opts.top` → <path> with rounded top corners (the visible top of a
+  /// stack), otherwise a plain <rect>. `opts.anim` = {delay, originY} marks
+  /// the element for the scaleY entry animation anchored at the axis.
+  _appendBar(svg, series, x, y, w, h, opts = null) {
+    let el;
+    if (opts && opts.top) {
+      el = document.createElementNS(SVG_NS, 'path');
+      el.setAttribute('d', roundedTopBarPath(x, y, w, h));
+    } else {
+      el = document.createElementNS(SVG_NS, 'rect');
+      el.setAttribute('x', String(x));
+      el.setAttribute('y', String(y));
+      el.setAttribute('width', String(w));
+      el.setAttribute('height', String(h));
+    }
+    el.classList.add('tf-chart__bar');
+    if (series.tone) el.classList.add(`tf-chart__bar--tone-${series.tone}`);
+    el.setAttribute('data-series-id', series.id);
+    if (opts && opts.anim) {
+      el.classList.add('tf-chart__bar--enter');
+      el.style.transformOrigin = `0 ${opts.anim.originY}px`;
+      el.style.animationDelay = `${opts.anim.delay}ms`;
+    }
+    svg.appendChild(el);
   }
 
   // ---- mode='single' (StackedBar) ----------------------------------------------

@@ -186,6 +186,10 @@ impl BenchClient {
                         || c["delta"]["reasoning_content"]
                             .as_str()
                             .is_some_and(|s| !s.is_empty())
+                        // vLLM 0.27+ renamed the delta field to `reasoning`
+                        || c["delta"]["reasoning"]
+                            .as_str()
+                            .is_some_and(|s| !s.is_empty())
                 })
             });
             if has_content {

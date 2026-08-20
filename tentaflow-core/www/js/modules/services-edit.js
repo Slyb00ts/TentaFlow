@@ -244,10 +244,10 @@ async function openExternalModelPicker(svc, opts = {}) {
               <tf-chip>${escapeHtml(m.modality || 'chat')}</tf-chip>
             </label>
             <div class="external-model-pricing" style="display:grid;grid-template-columns:repeat(4,1fr);gap:6px;">
-              ${priceCell('promptPer1k', I18n.t('model_metrics.col_price_prompt'), pv('promptPer1k'))}
-              ${priceCell('completionPer1k', I18n.t('model_metrics.col_price_completion'), pv('completionPer1k'))}
-              ${priceCell('audioPerMin', I18n.t('model_metrics.col_price_audio'), pv('audioPerMin'))}
-              ${priceCell('imageEach', I18n.t('model_metrics.col_price_image'), pv('imageEach'))}
+              ${priceCell('promptPer1k', I18n.t('analytics.col_price_prompt'), pv('promptPer1k'))}
+              ${priceCell('completionPer1k', I18n.t('analytics.col_price_completion'), pv('completionPer1k'))}
+              ${priceCell('audioPerMin', I18n.t('analytics.col_price_audio'), pv('audioPerMin'))}
+              ${priceCell('imageEach', I18n.t('analytics.col_price_image'), pv('imageEach'))}
             </div>
           </div>`;
       }).join('');

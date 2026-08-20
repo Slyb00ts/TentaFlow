@@ -686,6 +686,7 @@ impl InferenceEngine for MlxSwiftEngine {
         Ok(EmbeddingResult {
             embeddings,
             dimensions,
+            prompt_tokens: None,
         })
     }
 }

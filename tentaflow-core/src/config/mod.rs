@@ -693,6 +693,21 @@ pub struct ServerConfig {
     /// deploy powinien wlaczyc `pickup_required = true` i wpisac fingerprinty.
     #[serde(default)]
     pub mtls: Option<MtlsConfig>,
+
+    /// Per-installation HTTPS certificate options (`[server.tls]`). The
+    /// certificate itself is generated into `<data>/tls/` at startup.
+    #[serde(default)]
+    pub tls: Option<TlsConfig>,
+}
+
+/// `[server.tls]` — extra subject alternative names added to the generated
+/// per-installation certificate on top of the auto-detected ones (localhost,
+/// hostname, every local IP). Each entry is an IP SAN when it parses as an
+/// IP address, otherwise a DNS SAN.
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
+pub struct TlsConfig {
+    #[serde(default)]
+    pub extra_sans: Vec<String>,
 }
 
 /// Pinning client certificates for HTTP REST tier endpoints. SHA-256
@@ -1301,6 +1316,7 @@ impl Default for NodeConfig {
                 log_level: "info".to_string(),
                 log_format: "json".to_string(),
                 mtls: None,
+                tls: None,
             },
             protocols: ProtocolsConfig {
                 openai_api: ProtocolConfig {

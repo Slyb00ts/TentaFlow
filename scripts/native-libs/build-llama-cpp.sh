@@ -160,8 +160,11 @@ build_backend() {
     if [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
       cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES")
     elif command -v nvidia-smi >/dev/null 2>&1; then
-      cuda_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
-      if [ -n "$cuda_cc" ]; then
+      # `|| true` — martwe nvidia-smi (kod 6, "No devices were found") pod
+      # pipefail zabijałoby cały skrypt; walidacja numeryczna odsiewa komunikaty
+      # błędów, żeby nie trafiły do CMAKE_CUDA_ARCHITECTURES.
+      cuda_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ' || true)"
+      if [[ "$cuda_cc" =~ ^[0-9]+$ ]]; then
         cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
         echo "[llama.cpp] CMAKE_CUDA_ARCHITECTURES=$cuda_cc (z nvidia-smi compute_cap)"
       fi

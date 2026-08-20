@@ -359,6 +359,8 @@ serde_yaml_ng = "0.10.0"
 # z wersją w addonie RAG).
 quick-xml = { version = "0.36", default-features = false }
 rcgen = "0.14.8"
+# Reads SANs back from the stored per-installation HTTPS certificate.
+x509-parser = "0.18"
 
 # Pobieranie modeli z HuggingFace. `tokio` = async API (model_manager, stt);
 # `ureq` = sync API (`api::sync`) wymagane przez loader Apple MLX Kokoro

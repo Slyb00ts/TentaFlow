@@ -2604,6 +2604,8 @@ export const encode = {
       nz(payload.filterService ?? payload.filter_service ?? payload.service),
       nz(payload.filterBackend ?? payload.filter_backend ?? payload.backend),
       nz(payload.filterModality ?? payload.filter_modality ?? payload.modality),
+      nz(payload.filterUser ?? payload.filter_user),
+      nz(payload.filterGroup ?? payload.filter_group),
     );
     return _wasm.encodeEnvelopeDirect(
       BigInt(correlationId),

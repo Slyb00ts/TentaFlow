@@ -248,8 +248,8 @@ build_backend() {
     if [ -n "${CMAKE_CUDA_ARCHITECTURES:-}" ]; then
       cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$CMAKE_CUDA_ARCHITECTURES")
     elif command -v nvidia-smi >/dev/null 2>&1; then
-      cuda_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ')"
-      [ -n "$cuda_cc" ] && cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
+      cuda_cc="$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '. ' || true)"
+      [[ "$cuda_cc" =~ ^[0-9]+$ ]] && cmake_args+=(-DCMAKE_CUDA_ARCHITECTURES="$cuda_cc")
     fi
   fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)

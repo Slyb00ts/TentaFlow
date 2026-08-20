@@ -1,0 +1,160 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka · Drill-down użytkownika (M02)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .ent-hero { display: flex; align-items: center; gap: 16px; }
+  .ent-hero .av { width: 52px; height: 52px; border-radius: 14px; font-size: 18px; }
+  .ent-hero .e-name { font-size: 19px; font-weight: 800; }
+  .ent-hero .e-sub { font-size: 12px; color: var(--text-3); font-family: var(--mono); }
+  .ent-hero .e-meta { display: flex; gap: 8px; margin-top: 7px; }
+  .mini-kpis { display: flex; gap: 28px; margin-left: auto; text-align: right; }
+  .mini-kpis .mk b { display: block; font-size: 19px; font-weight: 800; font-variant-numeric: tabular-nums;
+    white-space: nowrap; }
+  .mini-kpis .mk span { font-size: 10.5px; color: var(--text-3); text-transform: uppercase; letter-spacing: .06em; }
+  @media (max-width: 720px) {
+    .ent-hero { flex-wrap: wrap; }
+    .mini-kpis { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px;
+      margin-left: 0; width: 100%; text-align: left; }
+    .mini-kpis .mk b { font-size: 17px; }
+  }
+</style>
+</head>
+<body>
+
+<div class="screen">
+  <div class="screen-header"><span class="num">M02</span><h2>Analityka · Drill-down: użytkownik</h2>
+    <div class="desc">Klik w wiersz na dowolnej liście otwiera szczegóły W TEJ SAMEJ zakładce: breadcrumb wraca,
+    filtry globalne zostają. Ten sam wzorzec dla grupy, modelu i noda.</div></div>
+  <div class="screen-frame"><div class="app" id="app"></div></div>
+</div>
+
+<template id="tpl">
+<main class="main">
+  <div class="page-head">
+    <div><div class="page-title">Analityka</div>
+      <div class="page-sub">Użycie i wydajność modeli w całym meshu</div></div>
+    <button class="btn ghost">⭳ Eksport CSV</button>
+  </div>
+
+  <!--TABS-->
+
+  <div class="an-toolbar">
+    <span class="fl-label">Okres</span>
+    <div class="seg"><button>Godzina</button><button>Dzień</button><button class="on">Miesiąc</button></div>
+    <div class="sel">2026-08 <span class="car">▾</span></div>
+    <span class="fl-sep"></span>
+    <span class="fl-label">Node</span><div class="sel">Wszystkie nody <span class="car">▾</span></div>
+    <span class="fl-label">Model</span><div class="sel">Wszystkie modele <span class="car">▾</span></div>
+  </div>
+
+  <div class="crumbs">
+    <a href="m01-przeglad.html">Użytkownicy i grupy</a><span class="sep">›</span>
+    <span class="here">Marta Kowalczyk</span>
+  </div>
+
+  <div class="an-card d1"><div class="c-body ent-hero">
+    <div>
+      <div class="e-name">Marta Kowalczyk</div>
+      <div class="e-sub">marta.k@firma.pl · 8d1f02aa-…-c771</div>
+      <div class="e-meta"><span class="chip acc">grupa: Marketing</span>
+        <span class="chip acc">grupa: Zarząd</span><span class="chip">rola: power_user</span></div>
+    </div>
+    <div class="mini-kpis">
+      <div class="mk"><b title="52 108 440">52,1 mln</b><span>tokenów</span></div>
+      <div class="mk"><b title="18 344">18,3 tys</b><span>zapytań</span></div>
+      <div class="mk"><b>1 044 zł</b><span>koszt</span></div>
+      <div class="mk"><b>0,04%</b><span>błędy</span></div>
+    </div>
+  </div></div>
+
+  <div class="an-card d2">
+    <div class="c-head"><h3>Aktywność w sierpniu</h3>
+      <div class="legend" style="margin-left:auto">
+        <span><span class="sw" style="background:var(--accent-2)"></span>prompt</span>
+        <span><span class="sw" style="background:var(--accent-1)"></span>completion</span></div></div>
+    <div class="c-body"><div id="chart"></div></div>
+  </div>
+
+  <div class="an-grid cols-2">
+    <div class="an-card d3">
+      <div class="c-head"><h3>Według modelu</h3><div class="hint">klik = drill na model</div></div>
+      <table class="an-table">
+        <thead><tr><th>Model</th><th class="num">Tokeny</th><th class="num">Zapytania</th><th class="num">Koszt</th><th>Udział</th></tr></thead>
+        <tbody>
+          <tr><td><div class="cell-title">Qwen 3.8 27B AWQ</div><div class="cell-sub">cyankiwi/Qwen3.8-27B-AWQ-INT4</div></td>
+            <td class="num" title="31 240 812">31,2 mln</td><td class="num" title="11 205">11,2 tys</td><td class="num">655 zł</td>
+            <td><div class="share"><div class="bar"><i style="width:60%"></i></div><span class="pct">60%</span></div></td></tr>
+          <tr><td><div class="cell-title">GLM-5-Air</div><div class="cell-sub">zai-org/GLM-5-Air</div></td>
+            <td class="num" title="16 421 300">16,4 mln</td><td class="num" title="5 811">5 811</td><td class="num">341 zł</td>
+            <td><div class="share"><div class="bar"><i style="width:32%;animation-delay:.1s"></i></div><span class="pct">32%</span></div></td></tr>
+          <tr><td><div class="cell-title">Whisper large-v3</div><div class="cell-sub">whisper · STT · 4,1 h audio</div></td>
+            <td class="num" title="4 446 328">4,4 mln</td><td class="num">1 328</td><td class="num">48 zł</td>
+            <td><div class="share"><div class="bar"><i style="width:8%;animation-delay:.2s"></i></div><span class="pct">8%</span></div></td></tr>
+        </tbody>
+      </table>
+      <div class="an-tfoot"><span>3 modele</span><span>Σ 52,1 mln tok · 1 044 zł</span></div>
+    </div>
+
+    <div class="an-card d4">
+      <div class="c-head"><h3>Według noda</h3><div class="hint">gdzie liczyły się jej zapytania</div></div>
+      <table class="an-table">
+        <thead><tr><th>Node</th><th class="num">Tokeny</th><th class="num">TTFT p50</th><th class="num">Decode p50</th><th class="num">Błędy</th></tr></thead>
+        <tbody>
+          <tr><td><div class="ent"><div class="av node"><span class="dot live"></span></div><div>
+            <div class="cell-title">hazai</div><div class="cell-sub">d91a7a85…3967</div></div></div></td>
+            <td class="num" title="44 380 210">44,4 mln</td><td class="num">198 ms</td><td class="num">121 tok/s</td>
+            <td class="num"><span class="chip ok">0</span></td></tr>
+          <tr><td><div class="ent"><div class="av node"><span class="dot live"></span></div><div>
+            <div class="cell-title">biuro-mini</div><div class="cell-sub">7c02be11…8aa2</div></div></div></td>
+            <td class="num" title="7 728 230">7,7 mln</td><td class="num">342 ms</td><td class="num">64 tok/s</td>
+            <td class="num"><span class="chip warn">7</span></td></tr>
+        </tbody>
+      </table>
+      <div class="an-tfoot"><span>2 nody</span><span>percentyle z histogramów rollupu</span></div>
+    </div>
+  </div>
+
+  <div class="an-card d5">
+    <div class="c-head"><h3>Ostatnie okresy</h3><div class="hint">miesiąc po miesiącu</div></div>
+    <table class="an-table">
+      <thead><tr><th>Okres</th><th class="num">Prompt</th><th class="num">Completion</th><th class="num">Razem</th>
+        <th class="num">Zapytania</th><th class="num">Audio</th><th class="num">Koszt</th><th>Trend</th></tr></thead>
+      <tbody>
+        <tr><td class="cell-title">2026-08</td><td class="num" title="33 870 486">33,9 mln</td>
+          <td class="num" title="18 237 954">18,2 mln</td><td class="num" title="52 108 440"><b>52,1 mln</b></td>
+          <td class="num" title="18 344">18,3 tys</td><td class="num">4,1 h</td><td class="num">1 044 zł</td>
+          <td><span data-spark="30,35,32,44,52,49,61,66"></span></td></tr>
+        <tr><td class="cell-title">2026-07</td><td class="num" title="28 104 220">28,1 mln</td>
+          <td class="num" title="16 001 780">16 mln</td><td class="num" title="44 106 000"><b>44,1 mln</b></td>
+          <td class="num" title="15 902">15,9 tys</td><td class="num">2,8 h</td><td class="num">889 zł</td>
+          <td><span data-spark="22,28,26,31,38,35,41,44"></span></td></tr>
+        <tr><td class="cell-title">2026-06</td><td class="num" title="9 411 605">9,4 mln</td>
+          <td class="num" title="5 220 100">5,2 mln</td><td class="num" title="14 631 705"><b>14,6 mln</b></td>
+          <td class="num">6 105</td><td class="num">1,2 h</td><td class="num">302 zł</td>
+          <td><span data-spark="8,11,9,14,12,16,15,18"></span></td></tr>
+      </tbody>
+    </table>
+  </div>
+</main>
+</template>
+
+<script src="shared/mock.js"></script>
+<script>
+  const app = document.getElementById('app');
+  app.innerHTML = Mock.shell('analytics') + document.getElementById('tpl').innerHTML
+    .replace('<!--TABS-->', Mock.tabs('users'));
+  document.querySelectorAll('[data-spark]').forEach(el =>
+    el.innerHTML = Mock.sparkline(el.dataset.spark.split(',').map(Number), 80, 22));
+  const base = [1.4,1.1,1.6,2.0,1.8,0.4,0.3,2.1,2.4,2.2,2.6,2.8,2.2,0.5,0.4,2.7,3.0,3.2,3.4];
+  const days = base.map((v, i) => ({ label: String(i + 1).padStart(2, '0') + '.08',
+    a: Math.round(v * 180000), b: Math.round(v * 98000) }));
+  Mock.stackedBars(document.getElementById('chart'), days,
+    { colors: ['var(--accent-2)', 'var(--accent-1)'], height: 210 });
+</script>
+</body>
+</html>

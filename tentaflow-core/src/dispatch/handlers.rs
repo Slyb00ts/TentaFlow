@@ -8420,6 +8420,7 @@ pub async fn agent_builder_assist(
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
     let result = ctx
         .state

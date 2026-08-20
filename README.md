@@ -396,7 +396,17 @@ Supertonic może nadal korzystać z ORT, ale nie wymusza już ORT dla wizji. NVI
 ### Configuration
 
 A single TOML file passed with `--config`. Main sections: `[server]`, `[server.mtls]`,
-`[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default HTTPS/QUIC port **8090**.
+`[server.tls]`, `[protocols.quic]`, `[mesh]`, `[load_balancing]`, `[monitoring]`. Default
+HTTPS/QUIC port **8090**.
+
+The HTTPS certificate is generated per installation on first start into `<data>/tls/`
+(EC P-256, SANs: `localhost`, the hostname, every local IP) and regenerated automatically
+when the local addresses change. Add names clients will use to reach the node with:
+
+```toml
+[server.tls]
+extra_sans = ["192.168.11.26", "tentaflow.lan"]
+```
 
 ---
 

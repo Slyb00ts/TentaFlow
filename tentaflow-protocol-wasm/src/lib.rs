@@ -1768,6 +1768,8 @@ pub fn encode_model_metrics_summary_request(
     filter_service: Option<String>,
     filter_backend: Option<String>,
     filter_modality: Option<String>,
+    filter_user: Option<String>,
+    filter_group: Option<String>,
 ) -> Result<Vec<u8>, JsError> {
     encode_body_inner(&MessageBody::ModelMetricsBody(
         tentaflow_protocol::ModelMetricsPayload::SummaryRequest {
@@ -1780,6 +1782,8 @@ pub fn encode_model_metrics_summary_request(
                 service: filter_service,
                 backend: filter_backend,
                 modality: filter_modality,
+                user: filter_user,
+                group: filter_group,
             },
         },
     ))
@@ -4681,7 +4685,31 @@ fn model_metrics_summary_row_to_js(r: &tentaflow_protocol::ModelMetricsRowWire) 
     set(&item, "e2e_p90", opt_f64_to_js(r.e2e_p90));
     set(&item, "e2eP99", opt_f64_to_js(r.e2e_p99));
     set(&item, "e2e_p99", opt_f64_to_js(r.e2e_p99));
+    set_nullable_string(&item, "displayName", r.display_name.clone());
+    set_nullable_string(&item, "display_name", r.display_name.clone());
+    set_nullable_string(&item, "subtitle", r.subtitle.clone());
+    set(&item, "memberCount", opt_i64_to_js(r.member_count));
+    set(&item, "member_count", opt_i64_to_js(r.member_count));
+    set_nullable_string(&item, "lastSeenAt", r.last_seen_at.clone());
+    set_nullable_string(&item, "last_seen_at", r.last_seen_at.clone());
     item
+}
+
+/// `Option<i64>` as JS Number|null (an i64 would become a BigInt).
+fn opt_i64_to_js(value: Option<i64>) -> JsValue {
+    match value {
+        Some(v) => (v as f64).into(),
+        None => JsValue::NULL,
+    }
+}
+
+/// `Option<String>` as JS string|null — unlike `set_optional_string`, the key
+/// is always present so consumers can rely on its shape.
+fn set_nullable_string(obj: &js_sys::Object, key: &str, value: Option<String>) {
+    match value {
+        Some(v) => set(obj, key, v.into()),
+        None => set(obj, key, JsValue::NULL),
+    }
 }
 
 /// Decode helper for `MessageBody::ModelMetricsBody`. Response variants become
@@ -4761,6 +4789,12 @@ fn decode_model_metrics_payload(
                 set(&item, "decode_p90", opt_f64_to_js(r.decode_p90));
                 set(&item, "decodeP99", opt_f64_to_js(r.decode_p99));
                 set(&item, "decode_p99", opt_f64_to_js(r.decode_p99));
+                set_nullable_string(&item, "nodeDisplayName", r.node_display_name.clone());
+                set_nullable_string(&item, "node_display_name", r.node_display_name);
+                set_nullable_string(&item, "nodeLastSeenAt", r.node_last_seen_at.clone());
+                set_nullable_string(&item, "node_last_seen_at", r.node_last_seen_at);
+                set_nullable_string(&item, "modelDisplayName", r.model_display_name.clone());
+                set_nullable_string(&item, "model_display_name", r.model_display_name);
                 arr.push(&item);
             }
             set(obj, "rows", arr.into());
@@ -6742,6 +6776,30 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     );
                     set(&item, "isActive", q.is_active.into());
                     set(&item, "is_active", q.is_active.into());
+                    set_nullable_string(
+                        &item,
+                        "subjectDisplayName",
+                        q.subject_display_name.clone(),
+                    );
+                    set_nullable_string(&item, "subject_display_name", q.subject_display_name);
+                    set_nullable_string(&item, "subjectSubtitle", q.subject_subtitle.clone());
+                    set_nullable_string(&item, "subject_subtitle", q.subject_subtitle);
+                    set(
+                        &item,
+                        "subjectMemberCount",
+                        opt_i64_to_js(q.subject_member_count),
+                    );
+                    set(
+                        &item,
+                        "subject_member_count",
+                        opt_i64_to_js(q.subject_member_count),
+                    );
+                    set_nullable_string(&item, "modelDisplayName", q.model_display_name.clone());
+                    set_nullable_string(&item, "model_display_name", q.model_display_name);
+                    set(&item, "periodKey", q.period_key.clone().into());
+                    set(&item, "period_key", q.period_key.into());
+                    set(&item, "usedTokens", (q.used_tokens as f64).into());
+                    set(&item, "used_tokens", (q.used_tokens as f64).into());
                     arr.push(&item);
                 }
                 set(&obj, "quotas", arr.into());
@@ -6756,10 +6814,17 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             tentaflow_protocol::TokenUsagePayload::CoordinatorStatusResponse {
                 coordinator_node_id,
                 leases,
+                coordinator_display_name,
             } => {
                 set(&obj, "variant", "TokenCoordinatorStatusResponse".into());
                 set_optional_string(&obj, "coordinatorNodeId", coordinator_node_id.clone());
                 set_optional_string(&obj, "coordinator_node_id", coordinator_node_id);
+                set_nullable_string(
+                    &obj,
+                    "coordinatorDisplayName",
+                    coordinator_display_name.clone(),
+                );
+                set_nullable_string(&obj, "coordinator_display_name", coordinator_display_name);
                 let arr = js_sys::Array::new();
                 for l in leases {
                     let item = js_sys::Object::new();
@@ -6782,6 +6847,10 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                     set(&item, "coordinator_node_id", l.coordinator_node_id.into());
                     set(&item, "expiresAt", l.expires_at.clone().into());
                     set(&item, "expires_at", l.expires_at.into());
+                    set_nullable_string(&item, "nodeDisplayName", l.node_display_name.clone());
+                    set_nullable_string(&item, "node_display_name", l.node_display_name);
+                    set_nullable_string(&item, "nodeLastSeenAt", l.node_last_seen_at.clone());
+                    set_nullable_string(&item, "node_last_seen_at", l.node_last_seen_at);
                     arr.push(&item);
                 }
                 set(&obj, "leases", arr.into());

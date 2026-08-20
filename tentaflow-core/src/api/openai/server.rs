@@ -1636,6 +1636,51 @@ async fn handle_audio_transcriptions(
     }
 }
 
+/// Parses the `/v1/embeddings` body and rejects shapes no backend can serve
+/// with a message that names the field. OpenAI accepts `input` as a string,
+/// an array of strings, an array of token ids or an array of token arrays;
+/// every backend behind this gateway (HTTP OpenAI-compatible, embedded
+/// llama.cpp/MLX, QUIC/mesh engines, flow nodes) is text-in, so token-id
+/// inputs are refused explicitly instead of surfacing a serde untagged-enum
+/// error. Empty inputs are refused like OpenAI does.
+pub fn parse_embedding_request(body: &[u8]) -> std::result::Result<EmbeddingRequest, String> {
+    let raw: serde_json::Value =
+        serde_json::from_slice(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    match raw.get("input") {
+        None => return Err("missing required field 'input'".to_string()),
+        Some(serde_json::Value::String(s)) if s.is_empty() => {
+            return Err("'input' must not be an empty string".to_string());
+        }
+        Some(serde_json::Value::Array(items)) => {
+            if items.is_empty() {
+                return Err("'input' must not be an empty array".to_string());
+            }
+            if items.iter().any(|v| v.is_number() || v.is_array()) {
+                return Err(
+                    "'input' as token ids (array of integers or array of integer \
+                            arrays) is not supported by this gateway; send a string or an \
+                            array of strings"
+                        .to_string(),
+                );
+            }
+            if let Some(pos) = items.iter().position(|v| !v.is_string()) {
+                return Err(format!("'input[{pos}]' must be a string"));
+            }
+            if items
+                .iter()
+                .any(|v| v.as_str().is_some_and(|s| s.is_empty()))
+            {
+                return Err("'input' must not contain empty strings".to_string());
+            }
+        }
+        Some(serde_json::Value::String(_)) => {}
+        Some(_) => {
+            return Err("'input' must be a string or an array of strings".to_string());
+        }
+    }
+    serde_json::from_value(raw).map_err(|e| format!("invalid request: {e}"))
+}
+
 /// Handler dla /v1/embeddings
 async fn handle_embeddings(
     req: Request<Incoming>,
@@ -1662,17 +1707,23 @@ async fn handle_embeddings(
     // Czytamy body
     let body_bytes = req.collect().await?.to_bytes();
 
-    // Parsujemy JSON
-    let request: EmbeddingRequest = match serde_json::from_slice(&body_bytes) {
+    let request = match parse_embedding_request(&body_bytes) {
         Ok(r) => r,
-        Err(e) => {
-            warn!("Blad parsowania JSON: {}", e);
+        Err(message) => {
+            warn!("Embeddings request rejected: {}", message);
             return Ok(error_response(
                 StatusCode::BAD_REQUEST,
-                "invalid_json",
-                format!("Niepoprawny JSON: {}", e),
+                "invalid_request_error",
+                message,
             ));
         }
+    };
+    let Some(encoding) = EmbeddingEncoding::parse(request.encoding_format.as_deref()) else {
+        return Ok(error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid_request_error",
+            "encoding_format must be 'float' or 'base64'".to_string(),
+        ));
     };
 
     if let Err(resp) = v1_authorize(&router, principal.as_ref(), &request.model) {
@@ -1687,7 +1738,7 @@ async fn handle_embeddings(
         .await
     {
         Ok(route_result) => {
-            let body = serde_json::to_vec(&route_result.response).unwrap();
+            let body = route_result.response.to_wire_json(encoding);
             let mut resp = json_response(StatusCode::OK, body);
             if debug_route {
                 if let Ok(meta_json) = serde_json::to_string(&route_result.metadata) {
@@ -2701,6 +2752,14 @@ async fn handle_models_list(
     // kind-specific `owned_by` tag (`tentaflow-service` / `tentaflow-flow` /
     // `tentaflow-alias`) instead of being flattened to a single string.
     let snapshot = router.catalog_snapshot();
+    let local_services = router.service_manager.current_snapshot();
+    let local_node_id = router
+        .service_manager
+        .mesh_services_registry
+        .read()
+        .as_ref()
+        .map(|r| r.local().node_id.clone())
+        .unwrap_or_default();
 
     #[derive(serde::Serialize)]
     struct ModelObject {
@@ -2708,6 +2767,8 @@ async fn handle_models_list(
         object: String,
         created: i64,
         owned_by: String,
+        supports_embeddings: bool,
+        supports_structured_output: bool,
     }
 
     #[derive(serde::Serialize)]
@@ -2732,6 +2793,16 @@ async fn handle_models_list(
                 object: "model".to_string(),
                 created: 1686935002,
                 owned_by: entry.owned_by().to_string(),
+                supports_embeddings: entry
+                    .service_surfaces
+                    .contains(&crate::services::catalog::ServiceSurface::Embeddings),
+                supports_structured_output: supports_structured_output(
+                    &snapshot,
+                    &local_services,
+                    &local_node_id,
+                    entry,
+                    0,
+                ),
             })
             .collect(),
         _ => Vec::new(),
@@ -2745,6 +2816,52 @@ async fn handle_models_list(
 
     let body = serde_json::to_vec(&response).unwrap();
     Ok(json_response(StatusCode::OK, body))
+}
+
+/// Capability flag for `/v1/models`: whether `response_format` (json_object /
+/// json_schema) reaches the engine intact. True only when the chat surface is
+/// served by a LOCAL service over plain HTTP (vLLM, SGLang, llama-server,
+/// ollama, OpenAI-compatible upstreams) — `BackendClient` serializes the full
+/// `ChatCompletionRequest`. Embedded engines (llama.cpp in-process, MLX),
+/// QUIC sidecars, mesh-forwarded instances and published flows all rebuild the
+/// request without `response_format`, so they report false. An alias inherits
+/// the verdict of its primary target.
+fn supports_structured_output(
+    snapshot: &CatalogSnapshot,
+    local_services: &crate::services::supervisor::ServicesSnapshot,
+    local_node_id: &str,
+    entry: &CatalogEntry,
+    depth: usize,
+) -> bool {
+    use crate::services::catalog::ServiceSurface;
+    use crate::services::transport::Transport;
+
+    if depth > 4 || !entry.service_surfaces.contains(&ServiceSurface::Chat) {
+        return false;
+    }
+    match &entry.kind {
+        CatalogEntryKind::ServiceModel { instances } => instances.iter().any(|inst| {
+            inst.node_id == local_node_id
+                && local_services
+                    .services_by_id
+                    .get(&inst.service_id)
+                    .and_then(|idx| local_services.services.get(*idx))
+                    .is_some_and(|svc| {
+                        matches!(
+                            svc.transport,
+                            Transport::HttpDirect | Transport::ExternalHttp
+                        )
+                    })
+        }),
+        CatalogEntryKind::Alias { target, .. } => snapshot
+            .entries
+            .iter()
+            .find(|e| &e.id == target)
+            .is_some_and(|t| {
+                supports_structured_output(snapshot, local_services, local_node_id, t, depth + 1)
+            }),
+        CatalogEntryKind::Flow { .. } => false,
+    }
 }
 
 /// Sprawdza czy request ma wlaczony debug routing (header lub query param)

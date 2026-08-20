@@ -549,6 +549,42 @@ test('LineChart legend layout=top na początku, layout=bottom na końcu', () => 
   assert(layout.children[0].classList.contains('tf-chart__legend--position-top'));
 });
 
+// ---- <tf-line-chart> component contract (analytics charts) ----
+
+test('tf-line-chart: tooltip domyślnie on, format(x, items) i draw-in linii', () => {
+  setup();
+  const el = document.createElement('tf-line-chart');
+  el.height = 200;
+  el.xAxis = { scale: 'category' };
+  el.series = [
+    { id: 'p50', name: 'p50', tone: 'accent', style: 'solid', showInLegend: true, points: [{ x: 'a', y: 1 }, { x: 'b', y: 2 }] },
+    { id: 'p90', name: 'p90', tone: 'primary', style: 'dashed', showInLegend: true, points: [{ x: 'a', y: 3 }, { x: 'b', y: 4 }] },
+  ];
+  document.body.appendChild(el);
+  assert(el.querySelector('.tf-chart__tooltip') != null, 'tooltip on by default');
+  assert(el.querySelector('.tf-chart__series-line--tone-accent') != null, 'accent tone class');
+  const lines = el.querySelectorAll('.tf-chart__series-line--enter');
+  assertEq(lines.length, 2, 'both lines animate on first paint');
+  assert(parseFloat(lines[0].style.strokeDashoffset) > 0, 'dashoffset starts at the line length');
+  // Custom tooltip format gets the x value and every series at that x.
+  let got = null;
+  el.tooltip = { format: (x, items) => { got = { x, items }; return `<b>${x}</b>`; } };
+  const box = el._lastPlotBox;
+  el._svg.getBoundingClientRect = () => ({ left: 0, top: 0 });
+  el._svg.dispatchEvent(new MouseEvent('mousemove', { clientX: box.x1 - 1, clientY: (box.y0 + box.y1) / 2 }));
+  assertEq(got.x, 'b');
+  assertEq(got.items.map((i) => [i.seriesId, i.y, i.tone]), [['p50', 2, 'accent'], ['p90', 4, 'primary']]);
+  assertEq(el.querySelector('.tf-chart__tooltip').innerHTML, '<b>b</b>');
+  // Default format: title + one row per series with exact values.
+  el.tooltip = { enabled: true };
+  el._svg.getBoundingClientRect = () => ({ left: 0, top: 0 });
+  el._svg.dispatchEvent(new MouseEvent('mousemove', { clientX: box.x0 + 1, clientY: (box.y0 + box.y1) / 2 }));
+  const tip = el.querySelector('.tf-chart__tooltip');
+  assertEq(tip.querySelector('.tf-chart__tooltip-title').textContent, 'a');
+  assertEq(tip.querySelectorAll('.tf-chart__tooltip-row').length, 2);
+  assertEq(el.querySelector('.tf-chart__crosshair').getAttribute('x1'), String(box.x0 + (box.x1 - box.x0) / 4));
+});
+
 // ---- report ----
 function reportResults() {
   let pass = 0, fail = 0;

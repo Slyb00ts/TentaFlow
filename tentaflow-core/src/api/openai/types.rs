@@ -153,6 +153,13 @@ pub struct ChatCompletionRequest {
     /// Glos i kontener audio wyjsciowego. Wymagane razem z `modalities`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub audio: Option<AudioConfig>,
+
+    /// Unknown top-level vendor fields (`guided_json`, `guided_regex`,
+    /// `chat_template_kwargs`, `top_k`, `min_p`, `seed`, ...). Captured on
+    /// parse and re-emitted on serialize so an HTTP backend receives them
+    /// untouched. Typed fields above always win on overlap.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Pojedyncza wiadomosc w konwersacji
@@ -167,8 +174,9 @@ pub struct Message {
     pub content: Option<MessageContent>,
 
     /// Reasoning content (dla modeli reasoning jak DeepSeek R1, OpenAI o1)
-    /// Zawiera "chain of thought" / proces myslowy modelu
-    #[serde(skip_serializing_if = "Option::is_none", default)]
+    /// Zawiera "chain of thought" / proces myslowy modelu.
+    /// vLLM 0.27+ returns the field as `reasoning`.
+    #[serde(skip_serializing_if = "Option::is_none", default, alias = "reasoning")]
     pub reasoning_content: Option<String>,
 
     /// Nazwa uzytkownika/bota (opcjonalne)
@@ -255,9 +263,18 @@ pub struct ImageUrl {
 /// Response format specification
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResponseFormat {
-    /// Typ: "text" lub "json_object"
+    /// Typ: "text", "json_object" lub "json_schema"
     #[serde(rename = "type")]
     pub format_type: String,
+
+    /// Full `json_schema` object (`{"name", "schema", "strict", ...}`) for
+    /// `type = "json_schema"`, passed through verbatim to the backend.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub json_schema: Option<serde_json::Value>,
+
+    /// Vendor-specific sub-fields of `response_format`, preserved verbatim.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Tool definition (function calling)
@@ -610,8 +627,10 @@ pub struct Delta {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub content: Option<String>,
 
-    /// Reasoning content (dla modeli z rozumowaniem, np. o1)
-    #[serde(skip_serializing_if = "Option::is_none")]
+    /// Reasoning content (dla modeli z rozumowaniem, np. o1).
+    /// vLLM 0.27+ streams the field as `reasoning`, older backends
+    /// (DeepSeek, SGLang, vLLM <=0.26) as `reasoning_content`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "reasoning")]
     pub reasoning_content: Option<String>,
 
     /// Tool calls (przyrostowe)
@@ -907,6 +926,12 @@ pub struct EmbeddingRequest {
     /// User identifier
     #[serde(skip_serializing_if = "Option::is_none")]
     pub user: Option<String>,
+
+    /// Unknown top-level vendor fields (`truncate`, `input_type`,
+    /// `priority`, ...). Captured on parse and re-emitted on serialize so an
+    /// HTTP backend receives them untouched. Typed fields above always win.
+    #[serde(flatten, default, skip_serializing_if = "serde_json::Map::is_empty")]
+    pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
 /// Input dla embeddings (string lub array)
@@ -917,6 +942,41 @@ pub enum EmbeddingInput {
     Multiple(Vec<String>),
 }
 
+impl EmbeddingInput {
+    /// Number of texts the request carries (one vector is expected per text).
+    pub fn len(&self) -> usize {
+        match self {
+            EmbeddingInput::Single(_) => 1,
+            EmbeddingInput::Multiple(texts) => texts.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
+/// Wire encoding of `data[].embedding` requested by the external client via
+/// `encoding_format`. OpenAI defaults to `float`; the official Python SDK
+/// sends `base64` unless told otherwise.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingEncoding {
+    Float,
+    Base64,
+}
+
+impl EmbeddingEncoding {
+    /// Maps the request field onto a wire encoding. `None` (field absent) is
+    /// `Float`; any other string is a client error (OpenAI returns 400 too).
+    pub fn parse(value: Option<&str>) -> Option<Self> {
+        match value {
+            None | Some("float") => Some(Self::Float),
+            Some("base64") => Some(Self::Base64),
+            Some(_) => None,
+        }
+    }
+}
+
 /// Response z /v1/embeddings
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EmbeddingResponse {
@@ -924,6 +984,66 @@ pub struct EmbeddingResponse {
     pub data: Vec<EmbeddingData>,
     pub model: String,
     pub usage: EmbeddingUsage,
+}
+
+impl EmbeddingResponse {
+    /// Serializes the response for the external client in the requested wire
+    /// encoding. Internally every vector is `Vec<f32>`; `Base64` packs each one
+    /// as little-endian f32 bytes the way OpenAI does, so SDKs that default to
+    /// base64 decode it verbatim.
+    pub fn to_wire_json(&self, encoding: EmbeddingEncoding) -> Vec<u8> {
+        #[derive(Serialize)]
+        #[serde(untagged)]
+        enum VectorWire<'a> {
+            Floats(&'a [f32]),
+            Base64(String),
+        }
+        #[derive(Serialize)]
+        struct DataWire<'a> {
+            object: &'a str,
+            index: u32,
+            embedding: VectorWire<'a>,
+        }
+        #[derive(Serialize)]
+        struct ResponseWire<'a> {
+            object: &'a str,
+            data: Vec<DataWire<'a>>,
+            model: &'a str,
+            usage: &'a EmbeddingUsage,
+        }
+
+        let data = self
+            .data
+            .iter()
+            .map(|d| DataWire {
+                object: &d.object,
+                index: d.index,
+                embedding: match encoding {
+                    EmbeddingEncoding::Float => VectorWire::Floats(&d.embedding),
+                    EmbeddingEncoding::Base64 => {
+                        VectorWire::Base64(encode_embedding_base64(&d.embedding))
+                    }
+                },
+            })
+            .collect();
+        let wire = ResponseWire {
+            object: &self.object,
+            data,
+            model: &self.model,
+            usage: &self.usage,
+        };
+        serde_json::to_vec(&wire).expect("embedding response serialization is infallible")
+    }
+}
+
+/// Packs an f32 vector as base64 of little-endian bytes (OpenAI wire format).
+pub fn encode_embedding_base64(vector: &[f32]) -> String {
+    use base64::Engine;
+    let mut bytes = Vec::with_capacity(vector.len() * 4);
+    for f in vector {
+        bytes.extend_from_slice(&f.to_le_bytes());
+    }
+    base64::engine::general_purpose::STANDARD.encode(bytes)
 }
 
 /// Pojedynczy embedding
@@ -1062,11 +1182,7 @@ mod embedding_decode_tests {
     use base64::Engine;
 
     fn encode_b64_f32(v: &[f32]) -> String {
-        let mut bytes = Vec::with_capacity(v.len() * 4);
-        for f in v {
-            bytes.extend_from_slice(&f.to_le_bytes());
-        }
-        base64::engine::general_purpose::STANDARD.encode(bytes)
+        encode_embedding_base64(v)
     }
 
     #[test]
@@ -1095,6 +1211,75 @@ mod embedding_decode_tests {
         let bad = base64::engine::general_purpose::STANDARD.encode([1u8, 2, 3]);
         let json = format!(r#"{{"object":"embedding","index":0,"embedding":"{bad}"}}"#);
         assert!(serde_json::from_str::<EmbeddingData>(&json).is_err());
+    }
+
+    #[test]
+    fn embedding_response_wire_base64_roundtrips_bit_exact() {
+        let vector: Vec<f32> = vec![0.0, -1.5, 3.141_592_7, f32::MIN_POSITIVE, 12345.678];
+        let response = EmbeddingResponse {
+            object: "list".into(),
+            data: vec![EmbeddingData {
+                object: "embedding".into(),
+                index: 0,
+                embedding: vector.clone(),
+            }],
+            model: "emb".into(),
+            usage: EmbeddingUsage {
+                prompt_tokens: 3,
+                total_tokens: 3,
+            },
+        };
+
+        let b64: serde_json::Value =
+            serde_json::from_slice(&response.to_wire_json(EmbeddingEncoding::Base64)).unwrap();
+        assert_eq!(b64["object"], "list");
+        assert_eq!(b64["model"], "emb");
+        assert_eq!(b64["usage"]["total_tokens"], 3);
+        assert_eq!(b64["data"][0]["object"], "embedding");
+        assert_eq!(b64["data"][0]["embedding"], encode_b64_f32(&vector));
+        let decoded: EmbeddingData = serde_json::from_value(b64["data"][0].clone()).unwrap();
+        for (got, want) in decoded.embedding.iter().zip(vector.iter()) {
+            assert_eq!(got.to_bits(), want.to_bits());
+        }
+
+        let floats: serde_json::Value =
+            serde_json::from_slice(&response.to_wire_json(EmbeddingEncoding::Float)).unwrap();
+        assert!(floats["data"][0]["embedding"].is_array());
+        assert_eq!(
+            floats["data"][0]["embedding"].as_array().unwrap().len(),
+            vector.len()
+        );
+    }
+
+    #[test]
+    fn embedding_encoding_parse_contract() {
+        assert_eq!(
+            EmbeddingEncoding::parse(None),
+            Some(EmbeddingEncoding::Float)
+        );
+        assert_eq!(
+            EmbeddingEncoding::parse(Some("float")),
+            Some(EmbeddingEncoding::Float)
+        );
+        assert_eq!(
+            EmbeddingEncoding::parse(Some("base64")),
+            Some(EmbeddingEncoding::Base64)
+        );
+        assert_eq!(EmbeddingEncoding::parse(Some("binary")), None);
+    }
+
+    #[test]
+    fn embedding_request_keeps_vendor_fields() {
+        let json = r#"{"model":"m","input":["a","b"],"dimensions":256,"user":"u1","truncate":"END","input_type":"query"}"#;
+        let req: EmbeddingRequest = serde_json::from_str(json).unwrap();
+        assert_eq!(req.dimensions, Some(256));
+        assert_eq!(req.user.as_deref(), Some("u1"));
+        assert_eq!(req.extra.get("truncate"), Some(&serde_json::json!("END")));
+        assert!(!req.extra.contains_key("model"));
+        let out = serde_json::to_value(&req).unwrap();
+        assert_eq!(out["input_type"], "query");
+        assert_eq!(out["dimensions"], 256);
+        assert_eq!(out["input"], serde_json::json!(["a", "b"]));
     }
 
     #[test]

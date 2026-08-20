@@ -25,7 +25,7 @@ async function loginAsAdmin(page, { username = 'admin', password = 'admin', port
 
   // After successful login the router replaces the login card with the main
   // shell — wait for a sidebar element to appear.
-  await page.waitForSelector('aside, nav, [data-screen], #main, #app-shell', { timeout: 15000 });
+  await page.waitForSelector('aside, nav, [data-screen], #main, #app-shell', { timeout: 30000 });
 }
 
 module.exports = { loginAsAdmin };

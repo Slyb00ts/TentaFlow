@@ -53,7 +53,8 @@ impl EmbeddingsDispatcher for EmbeddingsDispatcherImpl {
             input,
             encoding_format: req.encoding_format.clone(),
             dimensions: req.dimensions,
-            user: None,
+            user: req.user,
+            extra: req.extra,
         };
 
         // §2.5 — the calling node's stamp travels with the request; a fresh

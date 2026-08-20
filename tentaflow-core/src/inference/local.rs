@@ -132,10 +132,14 @@ impl LocalInferenceHandler {
             engine.embeddings(params).await?
         };
 
-        let prompt_tokens = texts
-            .iter()
-            .map(|t| t.split_whitespace().count() as u32)
-            .sum::<u32>();
+        // Engines that tokenize themselves report the real count; otherwise
+        // estimate from whitespace-separated words so usage is never zero.
+        let prompt_tokens = result.prompt_tokens.unwrap_or_else(|| {
+            texts
+                .iter()
+                .map(|t| t.split_whitespace().count() as u32)
+                .sum::<u32>()
+        });
 
         let data: Vec<EmbeddingData> = result
             .embeddings

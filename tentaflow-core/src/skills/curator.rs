@@ -784,6 +784,7 @@ pub async fn router_complete(router: &Router, model: &str, prompt: String) -> Re
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
     // Internal core maintenance job — no external caller, no session.
     let result = router

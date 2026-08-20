@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>TentaFlow — Analityka · Nody i serwisy (M04)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css">
+<style>
+  .node-head { display: flex; align-items: center; gap: 12px; }
+  .node-head .n-name { font-size: 15px; font-weight: 800; }
+  .node-head .n-id { font-size: 10.5px; color: var(--text-3); font-family: var(--mono); }
+  .node-stats { display: flex; gap: 24px; margin-left: auto; text-align: right; }
+  .node-stats .ns b { display: block; font-size: 16px; font-weight: 800; font-variant-numeric: tabular-nums; }
+  .node-stats .ns span { font-size: 10px; color: var(--text-3); text-transform: uppercase; letter-spacing: .06em; }
+  @media (max-width: 720px) {
+    .node-head { flex-wrap: wrap; }
+    .node-stats { display: grid; grid-template-columns: 1fr 1fr; gap: 8px 16px;
+      margin-left: 0; width: 100%; text-align: left; }
+    .node-stats .ns b { font-size: 15px; white-space: nowrap; }
+  }
+</style>
+</head>
+<body>
+
+<div class="screen">
+  <div class="screen-header"><span class="num">M04</span><h2>Analityka · Nody i serwisy</h2>
+    <div class="desc">Nazwa noda (sync_nodes.display_name) + skrócone ID; status z last_seen_at
+    (pulsująca kropka = online, szary = offline z czasem), nie hardkod „online".</div></div>
+  <div class="screen-frame"><div class="app" id="app"></div></div>
+</div>
+
+<template id="tpl">
+<main class="main">
+  <div class="page-head">
+    <div><div class="page-title">Analityka</div>
+      <div class="page-sub">Użycie i wydajność modeli w całym meshu</div></div>
+    <button class="btn ghost">⭳ Eksport CSV</button>
+  </div>
+
+  <!--TABS-->
+
+  <div class="an-toolbar">
+    <span class="fl-label">Okres</span>
+    <div class="seg"><button>Godzina</button><button>Dzień</button><button class="on">Miesiąc</button></div>
+    <div class="sel">2026-08 <span class="car">▾</span></div>
+    <span class="fl-sep"></span>
+    <span class="fl-label">Model</span><div class="sel">Wszystkie modele <span class="car">▾</span></div>
+  </div>
+
+  <div class="an-card d1">
+    <div class="c-head node-head">
+      <span class="dot live"></span>
+      <div><div class="n-name">hazai</div><div class="n-id">d91a7a857611b069a1…4fcae86bd7dfe2f1e493f3967</div></div>
+      <span class="chip acc">7× RTX 3090</span><span class="chip">koordynator dzierżaw</span>
+      <div class="node-stats">
+        <div class="ns"><b title="98 004 116">98 mln</b><span>tok produkcji</span></div>
+        <div class="ns"><b title="38 806">38,8 tys</b><span>zapytań</span></div>
+        <div class="ns"><b>0,03%</b><span>błędy</span></div>
+      </div>
+    </div>
+    <table class="an-table">
+      <thead><tr><th>Serwis</th><th>Backend</th><th>Model</th><th class="num">Zapytania</th>
+        <th class="num">TTFT p50 / p99</th><th class="num">Decode p50</th><th class="num">Błędy</th></tr></thead>
+      <tbody>
+        <tr><td><div class="cell-title">vllm-5000</div><div class="cell-sub">llm · port 5000</div></td>
+          <td><span class="chip acc">vLLM 0.27.1 · TP4</span></td>
+          <td class="cell-title">Qwen 3.8 27B AWQ</td>
+          <td class="num" title="22 304">22,3 tys</td><td class="num">191 ms / 1,1 s</td>
+          <td class="num">124 tok/s</td><td class="num"><span class="chip ok">3</span></td></tr>
+        <tr><td><div class="cell-title">llamacpp-embedded</div><div class="cell-sub">llm · in-proc</div></td>
+          <td><span class="chip acc">llama.cpp · CUDA</span></td>
+          <td class="cell-title">GLM-5-Air</td>
+          <td class="num" title="16 502">16,5 tys</td><td class="num">346 ms / 2,1 s</td>
+          <td class="num">58 tok/s</td><td class="num"><span class="chip ok">8</span></td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>2 serwisy</span><span>ostatnio widziany: teraz</span></div>
+  </div>
+
+  <div class="an-card d3">
+    <div class="c-head node-head">
+      <span class="dot live"></span>
+      <div><div class="n-name">biuro-mini</div><div class="n-id">7c02be11f30a889d…90417cc02c18aa2</div></div>
+      <span class="chip">Mac mini M4</span>
+      <div class="node-stats">
+        <div class="ns"><b title="19 861 300">19,9 mln</b><span>tok produkcji</span></div>
+        <div class="ns"><b>8 107</b><span>zapytań</span></div>
+        <div class="ns"><b>0,12%</b><span>błędy</span></div>
+      </div>
+    </div>
+    <table class="an-table">
+      <thead><tr><th>Serwis</th><th>Backend</th><th>Model</th><th class="num">Zapytania</th>
+        <th class="num">TTFT p50 / p99</th><th class="num">Decode p50</th><th class="num">Błędy</th></tr></thead>
+      <tbody>
+        <tr><td><div class="cell-title">mlx-embedded</div><div class="cell-sub">llm · in-proc</div></td>
+          <td><span class="chip acc">MLX</span></td>
+          <td class="cell-title">Qwen 3.8 27B AWQ</td>
+          <td class="num">2 507</td><td class="num">402 ms / 2,8 s</td>
+          <td class="num">31 tok/s</td><td class="num"><span class="chip ok">2</span></td></tr>
+        <tr><td><div class="cell-title">whisper-embedded</div><div class="cell-sub">stt · in-proc</div></td>
+          <td><span class="chip acc">MLX-whisper</span></td>
+          <td class="cell-title">Whisper large-v3</td>
+          <td class="num">5 600</td><td class="num">—</td><td class="num">—</td>
+          <td class="num"><span class="chip ok">8</span></td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>2 serwisy</span><span>ostatnio widziany: 40 s temu</span></div>
+  </div>
+
+  <div class="an-card d5">
+    <div class="c-head node-head">
+      <span class="dot off"></span>
+      <div><div class="n-name">laptop-pw</div><div class="n-id">33f1c9041bd02aa6…7719cbe77</div></div>
+      <span class="chip">offline · 2 h temu</span>
+      <div class="node-stats">
+        <div class="ns"><b title="3 571 869">3,6 mln</b><span>tok produkcji</span></div>
+        <div class="ns"><b>1 300</b><span>zapytań</span></div>
+        <div class="ns"><b>2,2%</b><span>błędy</span></div>
+      </div>
+    </div>
+    <table class="an-table">
+      <thead><tr><th>Serwis</th><th>Backend</th><th>Model</th><th class="num">Zapytania</th>
+        <th class="num">TTFT p50 / p99</th><th class="num">Decode p50</th><th class="num">Błędy</th></tr></thead>
+      <tbody>
+        <tr><td><div class="cell-title">whisper-embedded</div><div class="cell-sub">stt · in-proc</div></td>
+          <td><span class="chip acc">whisper · CPU</span></td>
+          <td class="cell-title">Whisper large-v3</td>
+          <td class="num">1 300</td><td class="num">—</td><td class="num">—</td>
+          <td class="num"><span class="chip warn">28</span></td></tr>
+      </tbody>
+    </table>
+    <div class="an-tfoot"><span>1 serwis</span><span>dane z ostatniej synchronizacji ledgera</span></div>
+  </div>
+</main>
+</template>
+
+<script src="shared/mock.js"></script>
+<script>
+  document.getElementById('app').innerHTML = Mock.shell('analytics')
+    + document.getElementById('tpl').innerHTML.replace('<!--TABS-->', Mock.tabs('nodes'));
+</script>
+</body>
+</html>

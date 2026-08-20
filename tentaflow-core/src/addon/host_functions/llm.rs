@@ -399,6 +399,7 @@ pub fn llm_generate(
             encoding_format: None,
             dimensions,
             user: Some(format!("addon:{}", addon_id)),
+            extra: serde_json::Map::new(),
         };
 
         let result = tokio::task::block_in_place(|| {
@@ -505,6 +506,7 @@ pub fn llm_generate(
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
 
     // Most async→sync: host function jest synchroniczna, router jest async.
@@ -1007,6 +1009,7 @@ pub fn llm_generate_stream_start(
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
 
     // Compliance: zdarzenie AI startuje w route_chat_completion_stream i jest

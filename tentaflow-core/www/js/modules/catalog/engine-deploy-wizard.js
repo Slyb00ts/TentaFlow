@@ -2398,10 +2398,10 @@ function renderStepClusterConfig() {
       <label>${escapeHtml(tCluster('pricing_title'))}</label>
       <div class="form-hint" style="margin-bottom:6px;">${escapeHtml(tCluster('pricing_hint'))}</div>
       <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;">
-        <tf-input id="edw-cluster-price-prompt" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_prompt'))}" value="${escapeAttr(p.promptPer1k == null ? '' : String(p.promptPer1k))}"></tf-input>
-        <tf-input id="edw-cluster-price-completion" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_completion'))}" value="${escapeAttr(p.completionPer1k == null ? '' : String(p.completionPer1k))}"></tf-input>
-        <tf-input id="edw-cluster-price-audio" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_audio'))}" value="${escapeAttr(p.audioPerMin == null ? '' : String(p.audioPerMin))}"></tf-input>
-        <tf-input id="edw-cluster-price-image" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('model_metrics.col_price_image'))}" value="${escapeAttr(p.imageEach == null ? '' : String(p.imageEach))}"></tf-input>
+        <tf-input id="edw-cluster-price-prompt" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('analytics.col_price_prompt'))}" value="${escapeAttr(p.promptPer1k == null ? '' : String(p.promptPer1k))}"></tf-input>
+        <tf-input id="edw-cluster-price-completion" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('analytics.col_price_completion'))}" value="${escapeAttr(p.completionPer1k == null ? '' : String(p.completionPer1k))}"></tf-input>
+        <tf-input id="edw-cluster-price-audio" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('analytics.col_price_audio'))}" value="${escapeAttr(p.audioPerMin == null ? '' : String(p.audioPerMin))}"></tf-input>
+        <tf-input id="edw-cluster-price-image" type="number" min="0" step="0.0001" label="${escapeAttr(I18n.t('analytics.col_price_image'))}" value="${escapeAttr(p.imageEach == null ? '' : String(p.imageEach))}"></tf-input>
       </div>
     </div>
   `;

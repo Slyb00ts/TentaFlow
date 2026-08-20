@@ -721,6 +721,7 @@ mod tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
         let handle = gateway
             .start_chat_event(&request, None, None)
@@ -812,6 +813,7 @@ mod tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
         let handle = gateway
             .start_chat_event(&request, None, None)
@@ -881,6 +883,7 @@ mod tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
         let handle = gateway
             .start_chat_event(&request, None, None)
@@ -997,6 +1000,7 @@ mod tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
         // Two events for the same run; the recording must land on the second
         // (latest), which is the call the tool result answers.
@@ -1090,6 +1094,7 @@ mod tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         // Session/root event with no inbound correlation anchors the turn to its

@@ -317,6 +317,8 @@ function recordingCtx() {
   return {
     calls, rects,
     clearRect() {},
+    setTransform() {},
+    quadraticCurveTo() { calls.lineTo++; },
     beginPath() { calls.beginPath++; },
     moveTo() { calls.moveTo++; },
     lineTo() { calls.lineTo++; },

@@ -521,6 +521,7 @@ pub async fn embed_texts(router: &Router, texts: Vec<String>) -> Result<Vec<Vec<
         encoding_format: None,
         dimensions: None,
         user: None,
+        extra: serde_json::Map::new(),
     };
     // §2.5 — project ingest / retrieval embeddings run on behalf of a project,
     // not of the user who happened to trigger the job.

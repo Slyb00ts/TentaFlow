@@ -1,6 +1,6 @@
 // =============================================================================
 // Plik: utils.js
-// Opis: Helpery: escapeHtml, formatDate, byId, toast.
+// Opis: Helpery: escapeHtml, formatDate, byId, toast, fmtCompact/fmtExact/fmtCurrency/fmtPct/fmtMs/fmtDuration.
 // =============================================================================
 
 export function escapeHtml(s) {
@@ -255,4 +255,128 @@ export function createEchoGuard(windowMs = 1500) {
       record.clear();
     },
   };
+}
+
+// ---------------------------------------------------------------------------
+// Number formatting (analytics). utils.js deliberately does NOT import
+// `I18n` from /js/i18n.js: that module pulls in the binary protocol codec
+// (WASM glue) and would make every consumer of utils.js — and its unit
+// tests — depend on it. The current UI language is read from the DOM/storage
+// instead (i18n.js keeps `document.documentElement.lang` and
+// `localStorage.tentaflow_lang` in sync with its own state).
+// ---------------------------------------------------------------------------
+
+function resolveLang(lang) {
+  if (lang) return lang;
+  if (typeof document !== 'undefined' && document.documentElement?.lang) {
+    return document.documentElement.lang;
+  }
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage.getItem('tentaflow_lang')) {
+      return localStorage.getItem('tentaflow_lang');
+    }
+  } catch {
+    // Storage access can throw (privacy mode); fall through to the default.
+  }
+  return 'pl';
+}
+
+const COMPACT_SCALES = [1e9, 1e6, 1e3];
+
+/// Returns the locale's compact unit word for `scale` (e.g. pl 1e3 → "tys",
+/// en 1e6 → "M") together with the literal that separates digits from the
+/// unit, or null when the locale has no compact form for that scale
+/// (e.g. de has none for thousands, es none for billions).
+function compactUnit(lang, scale) {
+  const parts = new Intl.NumberFormat(lang, { notation: 'compact', compactDisplay: 'short' })
+    .formatToParts(scale);
+  const compactIdx = parts.findIndex((p) => p.type === 'compact');
+  if (compactIdx < 0) return null;
+  const integer = parts.filter((p) => p.type === 'integer').map((p) => p.value).join('');
+  if (integer !== '1') return null;
+  const prev = parts[compactIdx - 1];
+  const separator = prev && prev.type === 'literal' ? prev.value : '';
+  return { separator, word: parts[compactIdx].value.replace(/\.$/, '') };
+}
+
+/// Compact number: |n| < 10 000 → full grouped integer ("8 421"), then
+/// thousands / millions / billions with the locale's compact unit word
+/// ("12,4 tys", "121 mln", "3,2 mld" / "12.4K", "121M", "3.2B"). One decimal
+/// while the scaled value is < 100, none otherwise; trailing ",0" is never
+/// emitted. Locales without a compact word for a scale fall back to the raw
+/// Intl compact output.
+export function fmtCompact(n, lang) {
+  const value = Number(n);
+  if (!Number.isFinite(value)) return '—';
+  const locale = resolveLang(lang);
+  const abs = Math.abs(value);
+  if (abs < 1e4) {
+    return new Intl.NumberFormat(locale, { useGrouping: 'always', maximumFractionDigits: 0 }).format(value);
+  }
+  const scale = COMPACT_SCALES.find((s) => abs >= s);
+  const unit = compactUnit(locale, scale);
+  if (!unit) {
+    return new Intl.NumberFormat(locale, {
+      notation: 'compact',
+      compactDisplay: 'short',
+      maximumFractionDigits: 1,
+    })
+      .formatToParts(value)
+      .map((p) => (p.type === 'compact' ? p.value.replace(/\.$/, '') : p.value))
+      .join('');
+  }
+  const scaled = value / scale;
+  const digits = new Intl.NumberFormat(locale, { maximumFractionDigits: Math.abs(scaled) < 100 ? 1 : 0 }).format(scaled);
+  return `${digits}${unit.separator}${unit.word}`;
+}
+
+/// Exact integer with locale thousands separators ("52 108 440").
+export function fmtExact(n, lang) {
+  const value = Number(n);
+  if (!Number.isFinite(value)) return '—';
+  return new Intl.NumberFormat(resolveLang(lang), { useGrouping: 'always', maximumFractionDigits: 0 }).format(value);
+}
+
+/// Currency amount in the locale's format ("1 044,18 zł").
+export function fmtCurrency(n, currency = 'PLN', lang) {
+  const value = Number(n);
+  if (!Number.isFinite(value)) return '—';
+  return new Intl.NumberFormat(resolveLang(lang), { style: 'currency', currency, useGrouping: 'always' }).format(value);
+}
+
+/// Fraction (0..1) as a percentage string ("0,08%" for fmtPct(0.0008, 2)).
+export function fmtPct(fraction, digits = 1, lang) {
+  const value = Number(fraction);
+  if (!Number.isFinite(value)) return '—';
+  const text = (value * 100).toLocaleString(resolveLang(lang), {
+    maximumFractionDigits: digits,
+    minimumFractionDigits: 0,
+  });
+  return `${text}%`;
+}
+
+/// Latency: "204 ms" below one second, otherwise seconds with one decimal ("1,4 s").
+export function fmtMs(ms, lang) {
+  const value = Number(ms);
+  if (!Number.isFinite(value)) return '—';
+  const locale = resolveLang(lang);
+  if (Math.abs(value) < 1000) {
+    return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(value)} ms`;
+  }
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value / 1000)} s`;
+}
+
+/// Duration (audio length etc.): "4,1 h" / "12 min" / "40 s".
+export function fmtDuration(ms, lang) {
+  const value = Number(ms);
+  if (!Number.isFinite(value)) return '—';
+  const locale = resolveLang(lang);
+  const abs = Math.abs(value);
+  if (abs >= 3600e3) {
+    return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 1 }).format(value / 3600e3)} h`;
+  }
+  if (abs >= 60e3) {
+    return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(value / 60e3)} min`;
+  }
+  return `${new Intl.NumberFormat(locale, { maximumFractionDigits: 0 }).format(value / 1000)} s`;
 }

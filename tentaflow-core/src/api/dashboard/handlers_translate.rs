@@ -230,6 +230,7 @@ text, with no explanations, quotes, preface or meta-commentary.",
         n: None,
         memory_options: None,
         audio_input: None,
+        extra: Default::default(),
     };
 
     // §2.5 — a dashboard translation is an admin surface call made BY the

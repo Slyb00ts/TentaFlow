@@ -49,11 +49,26 @@ for the video pipeline). Key opt-ins:
 
 ## Configuration
 
-`--config <toml>`. Sections: `[server]`, `[server.mtls]`, `[protocols.quic]`, `[mesh]`,
-`[load_balancing]`, `[monitoring]`. Default HTTPS/QUIC port **8090**.
+`--config <toml>`. Sections: `[server]`, `[server.mtls]`, `[server.tls]`, `[protocols.quic]`,
+`[mesh]`, `[load_balancing]`, `[monitoring]`. Default HTTPS/QUIC port **8090**.
 
 `[server.mtls]` (optional) — Service-to-Core mTLS pinning for `/core/frame/pickup`.
 Production: `pickup_required = true` + at least one `client_cert_fingerprints` (SHA-256 hex).
+
+`[server.tls]` (optional) — `extra_sans = [...]` added to the per-installation HTTPS
+certificate (`api/tls_identity.rs`): generated with rcgen into `<data>/tls/{cert,key}.pem`
+(EC P-256, CN = hostname, SANs = localhost + hostname + every local IP + extras), regenerated
+when a desired SAN is missing from the stored cert, `certs/cert.pem` embedded only as the
+fallback when `<data>/tls` is unusable. `/v1/models` reports `supports_embeddings` and
+`supports_structured_output` per entry (the latter is true only for a LOCAL HTTP-transport
+chat service — embedded, QUIC, mesh-forwarded and flow paths drop `response_format`).
+`ChatCompletionRequest.extra` / `ResponseFormat.{json_schema,extra}` pass unknown vendor
+fields through to HTTP backends verbatim. `/v1/embeddings` accepts `input` as a string or array
+of strings only (token-id arrays → 400 `invalid_request_error`, no backend is token-in),
+forwards `dimensions`/`user`/`EmbeddingRequest.extra` to HTTP backends (via
+`envelope.meta["embeddings_user"|"embeddings_extra"]` on the flow path), always talks base64
+to the backend and re-encodes at the edge per the client's `encoding_format`
+(`EmbeddingResponse::to_wire_json`); `response.model` echoes the requested id.
 
 ## Transport architecture (2-tier) — every change must respect this split
 
@@ -222,6 +237,25 @@ RF-DETR and LLM cancel by killing the child process (`RFDETR.train()` is one blo
 classifier and OCR cancel cooperatively per batch. A run orphaned by a Core restart is closed
 by `reconcile_orphan_local_run` — the `register_local_run` marker distinguishes "we supervise
 this" from "nobody watches this", with no time heuristics.
+
+## Analytics (dashboard)
+
+`www/js/modules/analytics.js` + `www/css/analytics.css` (screen id `analytics`, nav `nav.analytics`) is
+the ONLY usage/metrics screen — it replaced `model-metrics.js` and `token-usage.js`. Tabs: overview /
+users & groups / models / nodes & services / limits / billing; sticky filters (period + node + model)
+auto-reload; row click = drill-down in the same tab with a breadcrumb. Data comes ONLY from
+`model_metrics_rollup` (`ModelMetricsBody`); `token_usage_daily` is the AI-gateway enforcement source,
+not a UI source. Quota/lease editing stays on `TokenUsagePayload` (`TokenQuotaWire.used_tokens` is
+computed from the rollup). Wire rows carry Core-resolved names (`display_name`, `subtitle`,
+`member_count`, node `last_seen_at`; `group_by=group` is keyed by group id, `group_by=hour` exists) —
+the UI never shows a bare UUID/64-hex as a title. Node liveness = the later of
+`sync_nodes.last_seen_at` and `peer_persisted.last_seen_ms` (mirrored into `sync_nodes` by the peer
+registry writer); the local node is always "now". Numbers use `fmtCompact` (`12,4 tys / 121 mln`,
+exact value in `title`), billing always exact (`fmtExact`/`fmtCurrency`) — helpers in `www/js/utils.js`.
+Charts: `TfCartesianChart` (tooltip + crosshair on by default, one-time transform/opacity entry
+animation honouring `prefers-reduced-motion`, stacked rounded tops, `narrow` slicing, tone `accent`
+= `--tf-accent-3`). i18n namespace `analytics.*` must stay key-identical across all five locales.
+E2E: `tests/e2e/analytics.spec.js` (fixture `tests/e2e/fixtures/analytics-seed.sql`).
 
 ## Admin Scheduler
 

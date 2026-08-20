@@ -231,6 +231,9 @@ pub struct EmbeddingParams {
 pub struct EmbeddingResult {
     pub embeddings: Vec<Vec<f32>>,
     pub dimensions: usize,
+    /// Prompt tokens consumed across all inputs, when the engine tokenizes on
+    /// its own (llama.cpp). `None` for engines that do not expose counts.
+    pub prompt_tokens: Option<u32>,
 }
 
 /// Snapshot deploy-time parametrow zwiazanych z aktywnym modelem.

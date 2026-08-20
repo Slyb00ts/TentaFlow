@@ -3843,7 +3843,7 @@ async fn run_token_lease_coordinator_tick(
 }
 
 /// Klucz okresu dla dzierzawy: dzienny `YYYY-MM-DD`, miesieczny `YYYY-MM`.
-fn token_period_key(period: &str) -> String {
+pub(crate) fn token_period_key(period: &str) -> String {
     let now = chrono::Utc::now();
     if period == "monthly" {
         now.format("%Y-%m").to_string()

@@ -2284,6 +2284,7 @@ impl ModelRuntimeExecutor {
             response_format: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         let response = self.execute_chat(chat_request, ctx).await?;
@@ -3576,6 +3577,18 @@ pub(crate) fn embeddings_request_to_initial_envelope(
             serde_json::Value::String(fmt.clone()),
         );
     }
+    if let Some(user) = &request.user {
+        env.meta.insert(
+            "embeddings_user".into(),
+            serde_json::Value::String(user.clone()),
+        );
+    }
+    if !request.extra.is_empty() {
+        env.meta.insert(
+            "embeddings_extra".into(),
+            serde_json::Value::Object(request.extra.clone()),
+        );
+    }
 
     let mut meta = crate::flow_engine::dispatcher::FlowRequestMeta::new(
         uuid::Uuid::new_v4().to_string(),
@@ -4832,6 +4845,7 @@ mod provenance_tests {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: Default::default(),
         };
         let (_env, meta) = embeddings_request_to_initial_envelope(
             &request,
@@ -5188,6 +5202,7 @@ mod tests {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         }
     }
 
@@ -5315,6 +5330,7 @@ mod tests {
             encoding_format: None,
             dimensions: None,
             user: None,
+            extra: serde_json::Map::new(),
         }
     }
 

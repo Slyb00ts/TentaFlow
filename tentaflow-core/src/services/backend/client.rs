@@ -730,90 +730,6 @@ impl BackendClient {
         .into())
     }
 
-    /// Wysyla embedding request do backendu.
-    ///
-    /// Konwertuje Vec<String> do EmbeddingRequest, wysyla POST do /v1/embeddings,
-    /// i zwraca wektory embedding.
-    pub async fn embedding(&self, input: Vec<String>) -> Result<Vec<Vec<f32>>> {
-        self.check_circuit_breaker()?;
-
-        let url = &self.embeddings_url;
-        debug!(
-            "Wysylanie embedding request do: {} ({} tekstow)",
-            url,
-            input.len()
-        );
-
-        // Utworz embedding request
-        let request = EmbeddingRequest {
-            model: self
-                .config
-                .model_name_override
-                .clone()
-                .unwrap_or_else(|| "text-embedding-3-small".to_string()),
-            input: EmbeddingInput::Multiple(input),
-            encoding_format: Some("base64".to_string()),
-            dimensions: None,
-            user: None,
-        };
-
-        // Wyslij POST request
-        let response = self
-            .client
-            .post(url)
-            .header("Authorization", self.auth_header_value.as_str())
-            .header("Content-Type", "application/json")
-            .json(&request)
-            .send()
-            .await
-            .map_err(|e| {
-                let error = self.map_reqwest_error(e);
-                self.circuit_breaker.record_failure();
-                error
-            })?;
-
-        let status = response.status();
-        debug!("Embedding response status: {}", status);
-
-        // Sprawdz status code
-        if !status.is_success() {
-            if status.is_server_error() {
-                self.circuit_breaker.record_failure();
-            }
-            let error_body = response.text().await.unwrap_or_else(|_| String::new());
-            return Err(CoreError::BackendError {
-                backend_url: self.url.clone(),
-                message: format!("Embedding API error ({}): {}", status, error_body),
-                source: None,
-            }
-            .into());
-        }
-
-        // Parsuj JSON response
-        let embedding_response =
-            response
-                .json::<EmbeddingResponse>()
-                .await
-                .map_err(|e| CoreError::BackendError {
-                    backend_url: self.url.clone(),
-                    message: format!("Nie mozna sparsowac embedding response: {}", e),
-                    source: Some(e.into()),
-                })?;
-
-        // Sortuj embeddingi po index (na wypadek gdyby byly w innej kolejnosci)
-        let mut data = embedding_response.data;
-        data.sort_by_key(|d| d.index);
-
-        // Wyciagnij wektory embedding
-        let embeddings: Vec<Vec<f32>> = data.into_iter().map(|d| d.embedding).collect();
-
-        debug!("Otrzymano {} embeddingow", embeddings.len());
-
-        self.circuit_breaker.record_success();
-
-        Ok(embeddings)
-    }
-
     /// Wysyla embeddings request do backendu (pelna wersja z EmbeddingRequest).
     ///
     /// Wysyla POST do /v1/embeddings z pelnym EmbeddingRequest i zwraca
@@ -1422,6 +1338,7 @@ impl BackendClient {
             response_format: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
 
         // Wyslij POST request (dla formatu openai bezposrednia serializacja, inaczej transformacja)

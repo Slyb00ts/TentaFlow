@@ -489,12 +489,16 @@ impl InferenceEngine for LlamaCppEngine {
         let result = tokio::task::spawn_blocking(move || -> Result<EmbeddingResult> {
             let dimensions = runtime.metadata().embedding_size as usize;
             let mut embeddings = Vec::with_capacity(texts.len());
+            let mut prompt_tokens = 0usize;
             for text in &texts {
-                embeddings.push(runtime.embeddings(text, normalize)?);
+                let embedding = runtime.embeddings(text, normalize)?;
+                prompt_tokens += embedding.prompt_tokens;
+                embeddings.push(embedding.vector);
             }
             Ok(EmbeddingResult {
                 embeddings,
                 dimensions,
+                prompt_tokens: Some(u32::try_from(prompt_tokens).unwrap_or(u32::MAX)),
             })
         })
         .await

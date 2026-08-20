@@ -1128,6 +1128,7 @@ mod compliance_stream_tests {
             n: None,
             memory_options: None,
             audio_input: None,
+            extra: Default::default(),
         };
         let handle = gateway
             .start_chat_event(&request, None, None)

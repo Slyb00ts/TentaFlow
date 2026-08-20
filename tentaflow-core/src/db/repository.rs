@@ -7,7 +7,7 @@ use super::models::*;
 use super::DbPool;
 use anyhow::Result;
 use rusqlite::OptionalExtension;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 /// Pozyskuje polaczenie z puli (writer pod pelne read+write).
 fn acquire(pool: &DbPool) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
@@ -11795,13 +11795,13 @@ pub fn get_user_groups(pool: &DbPool, user_id: &str) -> Result<Vec<UserGroup>> {
     Ok(rows)
 }
 
-/// Mapa przynależności `user_id -> nazwa grupy` dla agregacji metryk po grupach.
+/// Membership map `user_id -> group id` for per-group metrics aggregation.
 /// Użytkownik w wielu grupach pojawia się w wielu parach; użytkownik bez grupy
 /// nie występuje w wyniku (caller decyduje o placeholderze).
 pub fn list_group_memberships(pool: &DbPool) -> Result<Vec<(String, String)>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT gm.user_id, g.name \
+        "SELECT gm.user_id, gm.group_id \
          FROM group_members gm JOIN user_groups g ON g.id = gm.group_id",
     )?;
     let rows = stmt
@@ -11810,6 +11810,246 @@ pub fn list_group_memberships(pool: &DbPool) -> Result<Vec<(String, String)>> {
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Chunk size for `IN (...)` lookups — stays well below SQLite's default
+/// 32766-variable limit while keeping the number of round trips small.
+const NAME_LOOKUP_CHUNK: usize = 500;
+
+/// Runs `sql_for(placeholders)` once per chunk of `ids` and feeds each row to
+/// `visit`. `sql_for` receives a ready `?1, ?2, …` list for the chunk.
+fn lookup_in_chunks<F, V>(
+    conn: &rusqlite::Connection,
+    ids: &[String],
+    sql_for: F,
+    mut visit: V,
+) -> Result<()>
+where
+    F: Fn(&str) -> String,
+    V: FnMut(&rusqlite::Row<'_>) -> rusqlite::Result<()>,
+{
+    for chunk in ids.chunks(NAME_LOOKUP_CHUNK) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn.prepare(&sql_for(&placeholders))?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|s| s as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        while let Some(row) = rows.next()? {
+            visit(row)?;
+        }
+    }
+    Ok(())
+}
+
+/// Display data of a user for analytics rows (names resolved Core-side).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserNameRow {
+    pub display_name: String,
+    pub username: String,
+    pub email: String,
+}
+
+/// Batched `user_id -> (display_name, username, email)`; unknown ids are absent.
+pub fn lookup_user_names(pool: &DbPool, ids: &[String]) -> Result<HashMap<String, UserNameRow>> {
+    let conn = acquire(pool)?;
+    let mut out = HashMap::with_capacity(ids.len());
+    lookup_in_chunks(
+        &conn,
+        ids,
+        |ph| {
+            format!(
+                "SELECT id, display_name, username, COALESCE(email, '') \
+                 FROM user_accounts WHERE id IN ({ph})"
+            )
+        },
+        |row| {
+            out.insert(
+                row.get::<_, String>(0)?,
+                UserNameRow {
+                    display_name: row.get(1)?,
+                    username: row.get(2)?,
+                    email: row.get(3)?,
+                },
+            );
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Batched `group_id -> (name, member_count)`; unknown ids are absent.
+pub fn lookup_group_info(pool: &DbPool, ids: &[String]) -> Result<HashMap<String, (String, i64)>> {
+    let conn = acquire(pool)?;
+    let mut out = HashMap::with_capacity(ids.len());
+    lookup_in_chunks(
+        &conn,
+        ids,
+        |ph| {
+            format!(
+                "SELECT g.id, g.name, \
+                        (SELECT COUNT(*) FROM group_members gm WHERE gm.group_id = g.id) \
+                 FROM user_groups g WHERE g.id IN ({ph})"
+            )
+        },
+        |row| {
+            out.insert(
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, i64>(2)?),
+            );
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Batched `node_id -> (display_name, last_seen_at)`. The name comes from
+/// `sync_nodes` (may be empty — caller falls back); liveness is the LATER of
+/// `sync_nodes.last_seen_at` and `peer_persisted.last_seen_ms` (the mesh
+/// heartbeat signal), rendered as RFC3339 UTC. Ids unknown to both tables are
+/// absent.
+pub fn lookup_sync_node_info(
+    pool: &DbPool,
+    ids: &[String],
+) -> Result<HashMap<String, (String, Option<String>)>> {
+    let conn = acquire(pool)?;
+    let mut out: HashMap<String, (String, Option<String>)> = HashMap::with_capacity(ids.len());
+    lookup_in_chunks(
+        &conn,
+        ids,
+        |ph| {
+            format!(
+                "SELECT node_id, display_name, last_seen_at FROM sync_nodes WHERE node_id IN ({ph})"
+            )
+        },
+        |row| {
+            out.insert(
+                row.get::<_, String>(0)?,
+                (row.get::<_, String>(1)?, row.get::<_, Option<String>>(2)?),
+            );
+            Ok(())
+        },
+    )?;
+    // peer_persisted keys are the raw 32-byte node ids; non-hex ids cannot
+    // have a peer row and are skipped.
+    let blobs: Vec<[u8; 32]> = ids
+        .iter()
+        .filter_map(|id| {
+            let mut b = [0u8; 32];
+            hex::decode_to_slice(id, &mut b).ok().map(|()| b)
+        })
+        .collect();
+    for chunk in blobs.chunks(NAME_LOOKUP_CHUNK) {
+        let placeholders = (1..=chunk.len())
+            .map(|i| format!("?{i}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let mut stmt = conn.prepare(&format!(
+            "SELECT node_id, last_seen_ms FROM peer_persisted WHERE node_id IN ({placeholders})"
+        ))?;
+        let params: Vec<&dyn rusqlite::ToSql> =
+            chunk.iter().map(|b| b as &dyn rusqlite::ToSql).collect();
+        let mut rows = stmt.query(params.as_slice())?;
+        while let Some(row) = rows.next()? {
+            let node_id = hex::encode(row.get::<_, Vec<u8>>(0)?);
+            let last_seen_ms: i64 = row.get(1)?;
+            let Some(seen) = chrono::DateTime::<chrono::Utc>::from_timestamp_millis(last_seen_ms)
+            else {
+                continue;
+            };
+            let seen = seen.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+            let entry = out.entry(node_id).or_insert_with(|| (String::new(), None));
+            // Both are fixed-width `YYYY-MM-DDTHH:MM:SSZ`, so string order is time order.
+            if entry.1.as_deref().is_none_or(|cur| cur < seen.as_str()) {
+                entry.1 = Some(seen);
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Batched `model_name -> display_name` from `model_registry` (non-empty names
+/// only; the same model served by several services yields one entry).
+pub fn lookup_model_display_names(
+    pool: &DbPool,
+    ids: &[String],
+) -> Result<HashMap<String, String>> {
+    let conn = acquire(pool)?;
+    let mut out = HashMap::with_capacity(ids.len());
+    lookup_in_chunks(
+        &conn,
+        ids,
+        |ph| {
+            format!(
+                "SELECT model_name, display_name FROM model_registry \
+                 WHERE model_name IN ({ph}) AND display_name IS NOT NULL AND display_name <> '' \
+                 ORDER BY id"
+            )
+        },
+        |row| {
+            out.entry(row.get::<_, String>(0)?)
+                .or_insert(row.get::<_, String>(1)?);
+            Ok(())
+        },
+    )?;
+    Ok(out)
+}
+
+/// Sum of `total_tokens` in `model_metrics_rollup` for a quota's scope within an
+/// inclusive `hour_bucket` window — the dashboard's source of truth for "used".
+/// Scope rules mirror `global_usage_for_quota`: user → `user_id`, model →
+/// `model_id`, group → members of the group, org → everything; an extra
+/// `quota.model_id` restriction applies unless the scope itself is a model.
+pub fn rollup_usage_for_quota(
+    pool: &DbPool,
+    quota: &TokenQuota,
+    hour_from: &str,
+    hour_to: &str,
+) -> Result<i64> {
+    let conn = acquire(pool)?;
+    let subject = quota.subject_id.as_deref().unwrap_or("");
+    let (subject_clause, bind_subject) = match quota.scope_type.as_str() {
+        "user" => ("AND user_id = ?4", true),
+        "model" => ("AND model_id = ?4", true),
+        "group" => (
+            "AND user_id IN (SELECT user_id FROM group_members WHERE group_id = ?4)",
+            true,
+        ),
+        _ => ("", false),
+    };
+    let has_model = quota.model_id.is_some() && quota.scope_type != "model";
+    let model = quota.model_id.as_deref().unwrap_or("");
+    let model_clause = match (has_model, bind_subject) {
+        (true, true) => "AND model_id = ?5",
+        (true, false) => "AND model_id = ?4",
+        (false, _) => "",
+    };
+    let sql = format!(
+        "SELECT COALESCE(SUM(total_tokens), 0) FROM model_metrics_rollup \
+         WHERE org_id = ?1 AND hour_bucket >= ?2 AND hour_bucket <= ?3 {subject_clause} {model_clause}"
+    );
+    let mut stmt = conn.prepare(&sql)?;
+    let total: i64 = match (bind_subject, has_model) {
+        (true, true) => stmt.query_row(
+            rusqlite::params![quota.org_id, hour_from, hour_to, subject, model],
+            |row| row.get(0),
+        )?,
+        (true, false) => stmt.query_row(
+            rusqlite::params![quota.org_id, hour_from, hour_to, subject],
+            |row| row.get(0),
+        )?,
+        (false, true) => stmt.query_row(
+            rusqlite::params![quota.org_id, hour_from, hour_to, model],
+            |row| row.get(0),
+        )?,
+        (false, false) => stmt
+            .query_row(rusqlite::params![quota.org_id, hour_from, hour_to], |row| {
+                row.get(0)
+            })?,
+    };
+    Ok(total)
 }
 
 /// Aktualizuje nazwe i opis grupy.
@@ -13196,18 +13436,6 @@ pub fn get_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<Option<Syn
         .query_row(rusqlite::params![node_id], row_to_sync_node_identity)
         .optional()?;
     Ok(result)
-}
-
-/// Aktualizuje czas ostatniej aktywnosci node/device.
-pub fn touch_sync_node_identity(pool: &DbPool, node_id: &str) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE sync_nodes \
-         SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', 'now') \
-         WHERE node_id = ?1",
-        rusqlite::params![node_id],
-    )?;
-    Ok(())
 }
 
 /// Dodaje albo odswieza kryptograficzny klucz uzytkownika.
@@ -20582,6 +20810,22 @@ pub fn upsert_peer_persisted_batch(pool: &DbPool, rows: &[PeerPersistedRow]) -> 
             ])?;
         }
     }
+    {
+        // Mirror peer liveness into the sync identity row (if one exists) so
+        // `sync_nodes.last_seen_at` reflects real heartbeats; monotonic, and
+        // at most one write per 30 s bucket per peer because `last_seen_ms`
+        // is already bucketed by the registry.
+        let mut touch = tx.prepare_cached(
+            "UPDATE sync_nodes \
+             SET last_seen_at = strftime('%Y-%m-%dT%H:%M:%SZ', ?2 / 1000, 'unixepoch') \
+             WHERE node_id = ?1 \
+               AND (last_seen_at IS NULL \
+                    OR last_seen_at < strftime('%Y-%m-%dT%H:%M:%SZ', ?2 / 1000, 'unixepoch'))",
+        )?;
+        for r in rows {
+            touch.execute(rusqlite::params![hex::encode(r.node_id), r.last_seen_ms])?;
+        }
+    }
     tx.commit()?;
     Ok(())
 }
@@ -25864,6 +26108,73 @@ mod token_metrics_tests {
             .into_iter()
             .find(|q| q.id == id)
             .expect("quota present")
+    }
+
+    #[test]
+    fn peer_heartbeat_touches_sync_node_last_seen_monotonically() {
+        let pool = fresh_db();
+        let hex_id = "7c02be11f4a3d9e86b5c2a1f0e9d8c7b6a5f4e3d2c1b0a9f8e7d6c5b4a3f2e1d";
+        let mut id = [0u8; 32];
+        hex::decode_to_slice(hex_id, &mut id).unwrap();
+        acquire(&pool)
+            .unwrap()
+            .execute(
+                "INSERT INTO sync_nodes (node_id, public_key) VALUES (?1, 'pk')",
+                rusqlite::params![hex_id],
+            )
+            .unwrap();
+        let row = |ms: i64, ver: i64| PeerPersistedRow {
+            node_id: id,
+            pubkey: vec![1],
+            trust_state: 0,
+            hostname: None,
+            platform: None,
+            role: 0,
+            last_seen_ms: ms,
+            persisted_ver: ver,
+            updated_at_ms: ms,
+        };
+        // 2026-08-19T12:30:00Z
+        upsert_peer_persisted_batch(&pool, &[row(1_787_142_600_000, 1)]).unwrap();
+        let info = lookup_sync_node_info(&pool, &[hex_id.to_string()]).unwrap();
+        assert_eq!(info[hex_id].1.as_deref(), Some("2026-08-19T12:30:00Z"));
+        let stored: Option<String> = acquire(&pool)
+            .unwrap()
+            .query_row(
+                "SELECT last_seen_at FROM sync_nodes WHERE node_id = ?1",
+                rusqlite::params![hex_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("2026-08-19T12:30:00Z"));
+        // Older heartbeat (e.g. replayed snapshot) never moves the column back.
+        upsert_peer_persisted_batch(&pool, &[row(1_787_137_200_000, 2)]).unwrap();
+        let stored: Option<String> = acquire(&pool)
+            .unwrap()
+            .query_row(
+                "SELECT last_seen_at FROM sync_nodes WHERE node_id = ?1",
+                rusqlite::params![hex_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored.as_deref(), Some("2026-08-19T12:30:00Z"));
+        // Unknown-to-sync_nodes id: lookup still reports heartbeat liveness.
+        let other_hex = "33f1c904a7b2e5d8c1f4a7b0e3d6c9f2a5b8e1d4c7f0a3b6e9d2c5f8a1b4e7d0";
+        let mut other = [0u8; 32];
+        hex::decode_to_slice(other_hex, &mut other).unwrap();
+        upsert_peer_persisted_batch(
+            &pool,
+            &[PeerPersistedRow {
+                node_id: other,
+                ..row(1_787_137_200_000, 1)
+            }],
+        )
+        .unwrap();
+        let info = lookup_sync_node_info(&pool, &[other_hex.to_string()]).unwrap();
+        assert_eq!(
+            info[other_hex],
+            (String::new(), Some("2026-08-19T11:00:00Z".to_string()))
+        );
     }
 
     #[test]

@@ -6779,9 +6779,11 @@ export function encodeModelMetricsPricingSet(model_id, prompt_per_1k, completion
  * @param {string | null} [filter_service]
  * @param {string | null} [filter_backend]
  * @param {string | null} [filter_modality]
+ * @param {string | null} [filter_user]
+ * @param {string | null} [filter_group]
  * @returns {Uint8Array}
  */
-export function encodeModelMetricsSummaryRequest(period, period_key, group_by, filter_model, filter_node, filter_service, filter_backend, filter_modality) {
+export function encodeModelMetricsSummaryRequest(period, period_key, group_by, filter_model, filter_node, filter_service, filter_backend, filter_modality, filter_user, filter_group) {
     const ptr0 = passStringToWasm0(period, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(period_key, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -6798,13 +6800,17 @@ export function encodeModelMetricsSummaryRequest(period, period_key, group_by, f
     var len6 = WASM_VECTOR_LEN;
     var ptr7 = isLikeNone(filter_modality) ? 0 : passStringToWasm0(filter_modality, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len7 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeModelMetricsSummaryRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7);
+    var ptr8 = isLikeNone(filter_user) ? 0 : passStringToWasm0(filter_user, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len8 = WASM_VECTOR_LEN;
+    var ptr9 = isLikeNone(filter_group) ? 0 : passStringToWasm0(filter_group, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len9 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeModelMetricsSummaryRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, ptr5, len5, ptr6, len6, ptr7, len7, ptr8, len8, ptr9, len9);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v9 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v11 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v9;
+    return v11;
 }
 
 /**

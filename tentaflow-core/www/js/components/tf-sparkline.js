@@ -1,7 +1,8 @@
 // =============================================================================
 // Plik: components/tf-sparkline.js
 // Opis: Mikro wykres linii (Specialized::Sparkline). Property `points` jako
-// Array<number>; bez osi, bez legendy.
+// Array<number>; bez osi, bez legendy. `smooth` rysuje linie krzywa (quadratic
+// przez srodki odcinkow), `lineWidth` steruje gruboscia kreski.
 // =============================================================================
 
 class TfSparkline extends HTMLElement {
@@ -13,6 +14,8 @@ class TfSparkline extends HTMLElement {
     this._fill = false;
     this._showDots = false;
     this._variant = 'line';
+    this._smooth = false;
+    this._lineWidth = 1.5;
     this._canvas = null;
   }
 
@@ -40,6 +43,10 @@ class TfSparkline extends HTMLElement {
   get height() { return this._height; }
   set variant(value) { this._variant = (value === 'bar' || value === 'area') ? value : 'line'; if (this.isConnected) this._render(); }
   get variant() { return this._variant; }
+  set smooth(value) { this._smooth = Boolean(value); if (this.isConnected) this._render(); }
+  get smooth() { return this._smooth; }
+  set lineWidth(value) { const n = Number(value); if (Number.isFinite(n) && n > 0) this._lineWidth = n; if (this.isConnected) this._render(); }
+  get lineWidth() { return this._lineWidth; }
 
   _resolveColor() {
     const role = this._color || 'primary';
@@ -54,10 +61,15 @@ class TfSparkline extends HTMLElement {
     if (!cv) return;
     const w = Math.max(60, this.clientWidth || 120);
     const h = this._height;
-    cv.width = w;
-    cv.height = h;
+    // Backing store at device resolution — a 1x canvas blurs on retina phones.
+    const dpr = Math.max(1, window.devicePixelRatio || 1);
+    cv.width = Math.round(w * dpr);
+    cv.height = Math.round(h * dpr);
+    cv.style.width = `${w}px`;
+    cv.style.height = `${h}px`;
     const ctx = cv.getContext('2d');
     if (!ctx) return;
+    ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
     ctx.clearRect(0, 0, w, h);
     const pts = this._points;
     const color = this._resolveColor();
@@ -86,13 +98,23 @@ class TfSparkline extends HTMLElement {
     if (pts.length < 2) return;
     const stepX = (w - pad * 2) / (pts.length - 1);
     ctx.strokeStyle = color;
-    ctx.lineWidth = 1.5;
+    ctx.lineWidth = this._lineWidth;
+    ctx.lineJoin = 'round';
+    ctx.lineCap = 'round';
     ctx.beginPath();
-    pts.forEach((v, i) => {
-      const x = pad + i * stepX;
-      const y = h - pad - ((v - min) / range) * (h - pad * 2);
-      if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y);
-    });
+    const xy = pts.map((v, i) => [pad + i * stepX, h - pad - ((v - min) / range) * (h - pad * 2)]);
+    if (this._smooth) {
+      ctx.moveTo(xy[0][0], xy[0][1]);
+      for (let i = 1; i < xy.length - 1; i += 1) {
+        const mx = (xy[i][0] + xy[i + 1][0]) / 2;
+        const my = (xy[i][1] + xy[i + 1][1]) / 2;
+        ctx.quadraticCurveTo(xy[i][0], xy[i][1], mx, my);
+      }
+      const last = xy[xy.length - 1];
+      ctx.quadraticCurveTo(last[0], last[1], last[0], last[1]);
+    } else {
+      xy.forEach(([x, y], i) => { if (i === 0) ctx.moveTo(x, y); else ctx.lineTo(x, y); });
+    }
     ctx.stroke();
     if (this._fill) {
       ctx.lineTo(pad + (pts.length - 1) * stepX, h - pad);
