@@ -493,3 +493,62 @@ nowa linia po polsku (`db.rs:5`).
    `BodyOmission`, `assistant_body_setting_key`) — commit, który ją dodał, nie ma czego włączać.
    **Skutek dla etapu 4: T4.3 i T4.4 nie mają na czym stanąć w obecnym kształcie.**
 5. **`run_provenance` to mapa bez ograniczenia** z jedną ścieżką sprzątania.
+
+---
+
+# INCYDENT 4 — 2026-08-20: limit sesji ubił falę, mutacje odżywały same
+
+## Co się stało
+
+Limit sesji ubił trzech krytyków naraz (T1, R2a, R3). Po ubiciu w drzewie ŻYŁY dwie mutacje,
+obie bez markera:
+
+1. `flow_engine/executor.rs` — cztery miejsca, blok preferujący `envelope.meta` nad kontekstem
+   dla `origin`/`actor_*`/`correlation_id`. **Złamany inwariant 1.** To jest dokładnie ta sama
+   mutacja, która trafiła do historii w incydencie 3.
+2. `flow_engine/dispatcher.rs` — `make_context` przestaje kopiować `meta.origin`/`meta.actor_kind`,
+   podstawia `FlowOrigin::System` / `ActorKind::System`.
+
+**Nowość względem incydentów 1–3: mutacje ODŻYWAŁY po sprzątnięciu.** Krytyk T1 uruchomił
+`supervise.sh` — odczepiony proces (PPID 1), który po każdym ubiciu relaunchował `all.sh`,
+a `all.sh` na starcie nakładał mutacje od nowa. Trzy rundy sprzątania minęły, zanim znalazłem
+nadzorcę zamiast jego dzieci. Skan po markerach nie miał czego znaleźć.
+
+## Co zadziałało
+
+**Migawka SHA-256 całego drzewa źródeł, robiona PRZED falą.** To ona wskazała oba pliki —
+`git status` też je pokazał, ale migawka jest jedynym mechanizmem, który odróżnia „agent to
+zmienił" od „tak miało być", niezależnie od tego, czy zmiana ma marker. Przywrócenie poszło
+z migawki, **nie z kopii zapasowych krytyka** (`bk-*.rs`): jego kopie powstawały na starcie
+jego skryptu, więc mogły utrwalić mutację z przerwanego wcześniej przebiegu.
+
+## Co zawiodło w MOIM narzędziu
+
+`flock <plik> cargo …` bierze deskryptor, a `cargo` odpala `sccache` (globalny `rustc-wrapper`
+w `~/.cargo/config.toml`), który **demonizuje się i dziedziczy ten deskryptor**. Blokada żyła
+po wyjściu cargo i zakleszczyła całą falę na godziny. Poprawka: `flock -o`, który zamyka
+deskryptor przed `exec`, plus wstępne wystartowanie serwera `sccache` POZA blokadą.
+
+Druga wada: jeden niefiltrowany `cargo test --lib` trzymał wspólną blokadę ~90 minut i zagłodził
+pozostałych krytyków aż do ich limitu sesji. Sufit równoległości narzucił limit, nie konflikt
+plików — dokładnie jak mówi §2.6 briefu.
+
+## Wnioski wdrożone (mechanizmy, nie prośby)
+
+1. **Zakaz procesów odczepionych i samorestartujących** — `setsid`, `nohup`, nadzorca, pętla
+   ponawiania, `&` przy czymkolwiek mutującym. Brak blokady = czekaj na pierwszym planie albo
+   zgłoś kryterium jako NIEZWERYFIKOWANE.
+2. **Jedna mutacja na skrypt**, przywrócenie przed wyjściem. Skrypt z sześcioma mutacjami, który
+   pada na czwartej, zostawia cztery żywe.
+3. **Obowiązkowy filtr testów.** Goły `cargo test --lib` jest zakazany.
+4. **`flock -o`** + rozgrzany `sccache` przed falą.
+5. **Praca SEKWENCYJNA** przy napiętym limicie — wznawiam krytyków po jednym. Utrata trzech
+   torów naraz jest ceną równoległości, a nie ceną konfliktu plików.
+
+## Zastana pułapka repo, znaleziona przy okazji (NIE nasza)
+
+**Śledzone artefakty builda przepisywane przez lokalny build.** `www/js/voxel/voxel_glue.js`
+(hashe symboli wasm-bindgen zależne od wersji narzędzia) i `vllm-recipes/recipes.json.gz`
+(rekompresja) zmieniają się po każdym `cargo build`, choć są w gicie. Wyglądają jak cudza zmiana
+w `git status` i kosztowały mnie osobne śledztwo, czy któryś agent nie wyszedł poza zakres.
+Nie naprawiam — zgłaszam.
