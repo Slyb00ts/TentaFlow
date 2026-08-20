@@ -151,6 +151,7 @@ impl LlmDispatcher for ScriptedLlm {
                 reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::ToolCalls,
+                audio: None,
                 tool_calls: vec![LlmToolCall {
                     id: "call-1".into(),
                     name: "core.skill_view".into(),
@@ -163,6 +164,7 @@ impl LlmDispatcher for ScriptedLlm {
                 reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
+                audio: None,
                 tool_calls: Vec::new(),
             })
         }
@@ -256,6 +258,9 @@ fn seed_agent(pool: &DbPool, id: &str) {
             routable: true,
             is_enabled: true,
             on_child_complete: "notify",
+            // No delegation roster: `None` is unrestricted, and these fixtures
+            // do not exercise the roster.
+            allowed_agents_json: None,
             actor_user_id: None,
         },
     )

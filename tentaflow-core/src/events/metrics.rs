@@ -226,9 +226,10 @@ mod tests {
         wait_before_end: Duration,
     ) -> (tempfile::TempDir, DbPool, RunEventLog) {
         let (dir, events_pool) = crate::events::test_support::events_db();
+        let core_db = main_db();
         let broker = Arc::new(ProgressBroker::new());
         broker.bind_run_provenance(SCOPE, provenance(run_id));
-        let log = RunEventLog::new(events_pool.clone(), broker.clone());
+        let log = RunEventLog::new(events_pool.clone(), core_db.clone(), broker.clone());
         log.attach(SCOPE);
 
         let (tx, rx) = mpsc::channel::<LlmStreamChunk>(8);
@@ -262,7 +263,7 @@ mod tests {
         let mut initial = FlowEnvelope::empty();
         initial.payload = FlowValue::Text("go".into());
 
-        let exec = execute_streaming(main_db(), compiled, initial, ctx, registry)
+        let exec = execute_streaming(core_db, compiled, initial, ctx, registry)
             .await
             .expect("execute_streaming");
         let mut stream = exec.stream;
@@ -357,6 +358,91 @@ mod tests {
         drop(dir);
     }
 
+    /// §2.7 with response bodies OFF — the default state of an unconfigured
+    /// node. Decoding is a difference between two STORED INSTANTS, so it must
+    /// survive the body being omitted: the `assistant_message` row is still
+    /// there, at its own `at_ms`, carrying an omission rather than a text.
+    ///
+    /// Written through `store::append` rather than the progress stream because
+    /// no engine event carries a finished response; what is under test is that
+    /// the writer's omission leaves the timing intact.
+    #[tokio::test]
+    async fn decode_time_still_works_with_response_bodies_off() {
+        use crate::events::store::{append, EventPayload, ResponseBody, RunEvent};
+        use crate::events::{BodyOmission, EventKind};
+
+        let (_dir, pool) = crate::events::test_support::events_db();
+        let core_db = crate::events::test_support::main_db();
+        let actor = FlowActor::user("u-1");
+        let row = |at_ms: i64, payload: EventPayload| {
+            RunEvent::new("run-quiet", at_ms, FlowOrigin::Chat, &actor, payload)
+                .with_node("llm-1")
+                .with_org("org-quiet")
+        };
+
+        append(
+            &pool,
+            &core_db,
+            row(
+                1_000,
+                EventPayload::StepStart {
+                    step: "llm".into(),
+                },
+            ),
+        )
+        .unwrap();
+        append(&pool, &core_db, row(1_150, EventPayload::FirstToken {})).unwrap();
+        append(
+            &pool,
+            &core_db,
+            row(
+                1_640,
+                EventPayload::AssistantMessage {
+                    body: ResponseBody::Text("a long personal answer".into()),
+                    tokens: Some(41),
+                },
+            ),
+        )
+        .unwrap();
+        append(
+            &pool,
+            &core_db,
+            row(
+                1_650,
+                EventPayload::StepEnd {
+                    step: "llm".into(),
+                    status: "ok".into(),
+                },
+            ),
+        )
+        .unwrap();
+
+        let steps = step_latencies(&pool, "run-quiet").expect("latencies");
+        assert_eq!(steps.len(), 1);
+        assert_eq!(steps[0].ttft_ms, 150);
+        assert_eq!(
+            steps[0].decode_ms,
+            Some(500),
+            "the decode time was lost with the body"
+        );
+
+        // And the message the timing belongs to is on the timeline, without a
+        // body and saying so.
+        let message = read_run(&pool, "run-quiet", 0, 100)
+            .expect("read run")
+            .into_iter()
+            .find(|e| e.kind == EventKind::AssistantMessage)
+            .expect("the assistant message was recorded");
+        assert_eq!(message.at_ms, 1_640);
+        match message.payload {
+            EventPayload::AssistantMessage { body, tokens } => {
+                assert_eq!(body, ResponseBody::Omitted(BodyOmission::NotEnabled));
+                assert_eq!(tokens, Some(41));
+            }
+            other => panic!("expected an assistant_message payload, got {other:?}"),
+        }
+    }
+
     /// Drives the progress stream directly for the tool tests: the harness that
     /// emits `ToolCallStarted` needs a live agent service, and what is under test
     /// is the pairing, not the harness.
@@ -372,7 +458,11 @@ mod tests {
             let (dir, pool) = crate::events::test_support::events_db();
             let broker = Arc::new(ProgressBroker::new());
             broker.bind_run_provenance(SCOPE, provenance(run_id));
-            let log = RunEventLog::new(pool.clone(), broker.clone());
+            let log = RunEventLog::new(
+                pool.clone(),
+                crate::events::test_support::main_db(),
+                broker.clone(),
+            );
             log.attach(SCOPE);
             Self {
                 _dir: dir,

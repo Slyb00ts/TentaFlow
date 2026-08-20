@@ -74,6 +74,10 @@ pub struct RunEventLog {
 
 struct Inner {
     pool: DbPool,
+    /// The MAIN database. Carried only so the writer can resolve the
+    /// per-organisation response-body setting (`store::write_event`); nothing
+    /// on this path reads or writes it for any other reason.
+    core_db: DbPool,
     broker: Arc<ProgressBroker>,
     /// Scopes with a live subscriber. An entry is claimed before the task is
     /// spawned and removed by the task on its way out, so `attach` is
@@ -83,10 +87,11 @@ struct Inner {
 }
 
 impl RunEventLog {
-    pub fn new(pool: DbPool, broker: Arc<ProgressBroker>) -> Self {
+    pub fn new(pool: DbPool, core_db: DbPool, broker: Arc<ProgressBroker>) -> Self {
         Self {
             inner: Arc::new(Inner {
                 pool,
+                core_db,
                 broker,
                 scopes: DashMap::new(),
                 cancel: CancellationToken::new(),
@@ -178,7 +183,9 @@ impl RunEventLog {
             }
 
             let pool = self.inner.pool.clone();
-            let write = tokio::task::spawn_blocking(move || write_batch(&pool, rows)).await;
+            let core_db = self.inner.core_db.clone();
+            let write =
+                tokio::task::spawn_blocking(move || write_batch(&pool, &core_db, rows)).await;
             match write {
                 Ok(Ok(())) => {}
                 Ok(Err(error)) => {
@@ -198,13 +205,13 @@ impl RunEventLog {
 /// Writes a batch in ONE immediate transaction. `store::append_in_tx` still
 /// allocates each `seq` inside it, so the batch does not weaken invariant 2 —
 /// it only saves the per-event commit.
-fn write_batch(pool: &DbPool, rows: Vec<RunEvent>) -> anyhow::Result<()> {
+fn write_batch(pool: &DbPool, core_db: &DbPool, rows: Vec<RunEvent>) -> anyhow::Result<()> {
     let mut conn = pool
         .write()
         .map_err(|e| anyhow::anyhow!("events db write: {e}"))?;
     let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
     for row in rows {
-        store::append_in_tx(&tx, row)?;
+        store::append_in_tx(&tx, core_db, row)?;
     }
     tx.commit()?;
     Ok(())
@@ -342,8 +349,8 @@ impl ScopeState {
 /// Publishes the process-wide log. Called by `events::init`, alongside the
 /// audit-outbox loop and the retention sweep, so the store and the thing that
 /// fills it start from the same place.
-pub fn start(pool: DbPool) {
-    let _ = LOG.set(RunEventLog::new(pool, global_broker()));
+pub fn start(pool: DbPool, core_db: DbPool) {
+    let _ = LOG.set(RunEventLog::new(pool, core_db, global_broker()));
 }
 
 /// Starts watching a broadcast scope. Called by `progress_broker::begin_run`;
@@ -400,7 +407,11 @@ mod tests {
             let (dir, pool) = crate::events::test_support::events_db();
             let broker = Arc::new(ProgressBroker::new());
             broker.bind_run_provenance(SCOPE, provenance(run_id));
-            let log = RunEventLog::new(pool.clone(), broker.clone());
+            let log = RunEventLog::new(
+                pool.clone(),
+                crate::events::test_support::main_db(),
+                broker.clone(),
+            );
             log.attach(SCOPE);
             Self {
                 _dir: dir,
@@ -442,7 +453,11 @@ mod tests {
     async fn events_without_bound_provenance_are_not_stored() {
         let (dir, pool) = crate::events::test_support::events_db();
         let broker = Arc::new(ProgressBroker::new());
-        let log = RunEventLog::new(pool.clone(), broker.clone());
+        let log = RunEventLog::new(
+            pool.clone(),
+            crate::events::test_support::main_db(),
+            broker.clone(),
+        );
         log.attach("unbound");
         let sink = BrokerProgressSink::new(broker.clone());
         sink.emit(

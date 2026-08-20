@@ -23,8 +23,8 @@ mod test_support;
 use anyhow::Result;
 
 pub use store::{
-    append, append_in_tx, read_run, AppendedEvent, AuditEnvelope, EventKind, EventPayload,
-    RunEvent, StoredEvent,
+    append, append_in_tx, assistant_body_setting_key, read_run, AppendedEvent, AuditEnvelope,
+    BodyOmission, EventKind, EventPayload, ResponseBody, RunEvent, StoredEvent,
 };
 
 /// Opens `<data>/events.db`, publishes the pool and STARTS everything the log
@@ -43,6 +43,6 @@ pub fn init(main_db: &crate::db::DbPool) -> Result<()> {
     let pool = db::init(&crate::paths::data_dir().join("events.db"))?;
     audit_outbox::spawn_delivery_loop(main_db.clone(), pool.clone());
     retention::start_retention_task(main_db.clone(), pool.clone());
-    progress_log::start(pool);
+    progress_log::start(pool, main_db.clone());
     Ok(())
 }

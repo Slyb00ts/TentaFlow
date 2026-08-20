@@ -20,6 +20,14 @@
 // `no_table_of_the_event_log_is_a_core_sync_table` in `store.rs` pins the half
 // that is assertable — no table of this file carries a descriptor. The other
 // half is structural: the ledger reads the main pool, and this is another file.
+//
+// The file gets its own READ POOL for the same reason it got its own file.
+// `Db::from_connection` builds a pool of one connection, and `Db::read()`
+// without a read pool hands back the WRITER MUTEX — so a browser query would
+// serialise against every append and every append behind the browser, worse
+// than the main database this log moved out of. `Db::with_read_pool` opens the
+// readers WAL already permits; the writer stays single, which is what invariant
+// 2's `seq` allocation depends on.
 
 use std::path::Path;
 use std::sync::{Arc, OnceLock};
@@ -63,6 +71,10 @@ pub fn checkpoint_wal() -> Result<()> {
 /// Opens (creating if absent) the event-log database, applies the pragmas,
 /// runs the module migrations and publishes the pool. Idempotent: a second
 /// call leaves the original pool in place and returns it.
+///
+/// The read pool is built AFTER the pragmas and the migrations: its
+/// connections open read-only, so they would find no schema — and no WAL
+/// journal mode — on a file the writer has not prepared yet.
 pub fn init(db_path: &Path) -> Result<DbPool> {
     if let Some(existing) = EVENTS_POOL.get() {
         return Ok(existing.clone());
@@ -77,7 +89,7 @@ pub fn init(db_path: &Path) -> Result<DbPool> {
     apply_pragmas(&conn)?;
     run_migrations(&conn)?;
 
-    let pool = Arc::new(crate::db::Db::from_connection(conn));
+    let pool = Arc::new(crate::db::Db::with_read_pool(conn, db_path)?);
     let _ = EVENTS_POOL.set(pool.clone());
     info!("event log database ready");
     Ok(pool)
@@ -107,6 +119,9 @@ fn apply_pragmas(conn: &Connection) -> Result<()> {
 /// Opens an event-log database at `db_path` WITHOUT publishing it as the
 /// process-wide pool. Every test gets its own file this way, and the writer
 /// stays a function of the pool it is handed rather than of global state.
+///
+/// Same shape as [`init`] — pragmas, migrations, then the read pool over the
+/// prepared file — so a test exercises the pool production actually runs on.
 pub fn open_pool_at(db_path: &Path) -> Result<DbPool> {
     if let Some(parent) = db_path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -114,7 +129,7 @@ pub fn open_pool_at(db_path: &Path) -> Result<DbPool> {
     let conn = Connection::open(db_path)?;
     apply_pragmas(&conn)?;
     run_migrations(&conn)?;
-    Ok(Arc::new(crate::db::Db::from_connection(conn)))
+    Ok(Arc::new(crate::db::Db::with_read_pool(conn, db_path)?))
 }
 
 /// Versioned migration runner for the event log. Tracks applied versions in

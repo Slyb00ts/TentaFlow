@@ -107,6 +107,38 @@ impl Db {
             read_pool: None,
         }
     }
+
+    /// Writer connection plus a read pool over the same file, for a SIDE
+    /// database that is not the core one (`events.db`). Runs no migrations,
+    /// seeds nothing and does not touch the global pool: the caller has already
+    /// opened `writer`, set its pragmas and brought its schema up to date.
+    ///
+    /// The point is what `from_connection` cannot give such a database. With no
+    /// read pool `read()` hands back the WRITER MUTEX, so every query serialises
+    /// against every write on that file — which is exactly the contention a
+    /// separate database was supposed to escape. WAL already allows many
+    /// readers next to one writer; this adds the reader connections that make
+    /// use of it.
+    ///
+    /// Read connections are sized and initialised exactly as [`init`] does —
+    /// same core-scaled clamp, same lazy `min_idle(1)`, same acquisition
+    /// timeout, same `query_only=ON` initialiser — so a side database cannot
+    /// drift into different pool behaviour than the main one.
+    pub fn with_read_pool(writer: Connection, db_path: &Path) -> Result<Self> {
+        let read_size = (num_cpus::get() as u32 * 2).clamp(4, 16);
+        let manager = SqliteConnectionManager::file(db_path)
+            .with_flags(OpenFlags::SQLITE_OPEN_READ_ONLY)
+            .with_init(init_read_connection);
+        let read_pool = r2d2::Pool::builder()
+            .max_size(read_size)
+            .min_idle(Some(1))
+            .connection_timeout(std::time::Duration::from_secs(5))
+            .build(manager)?;
+        Ok(Db {
+            writer: Mutex::new(writer),
+            read_pool: Some(read_pool),
+        })
+    }
 }
 
 /// Globalny uchwyt do poola — ustawiony w `init()`. Pozwala modulom ktore nie

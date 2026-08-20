@@ -126,8 +126,9 @@ pub fn sweep(main_db: &DbPool, events_pool: &DbPool) -> Result<SweepReport> {
         return Ok(SweepReport::default());
     };
 
-    // ONE guard for the whole sweep: this pool has a single connection, so a
-    // read guard IS the writer mutex and taking a second one would deadlock.
+    // ONE guard for the whole sweep: every statement below writes, and taking
+    // and dropping the writer per organisation would only let a new batch of
+    // events land between the cutoffs of one sweep.
     let conn = events_pool
         .write()
         .map_err(|e| anyhow!("events db write: {e}"))?;
@@ -225,7 +226,7 @@ mod tests {
 
     /// Writes one event of `org` (`None` = a run started by no tenant) at
     /// `at_ms`.
-    fn at(pool: &DbPool, run_id: &str, at_ms: i64, org: Option<&str>) {
+    fn at(pool: &DbPool, main: &DbPool, run_id: &str, at_ms: i64, org: Option<&str>) {
         let mut event = RunEvent::new(
             run_id,
             at_ms,
@@ -236,7 +237,7 @@ mod tests {
             },
         );
         event.org_id = org.map(str::to_string);
-        append(pool, event).unwrap();
+        append(pool, main, event).unwrap();
     }
 
     fn ms_ago(pool: &DbPool, days: i64) -> i64 {
@@ -306,9 +307,9 @@ mod tests {
             "the seeded default is not what the sweeper resolves"
         );
 
-        at(&pool, "old", ms_ago(&pool, 40), Some(DEFAULT_ORG_ID));
-        at(&pool, "recent", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
-        at(&pool, "fresh", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "old", ms_ago(&pool, 40), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "recent", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "fresh", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.unattributed_retention_days, EVENTS_RETENTION_DAYS);
@@ -343,11 +344,11 @@ mod tests {
         assert_eq!(terms.per_org.get("org-lax").copied(), Some(60));
         assert_eq!(terms.unattributed, 3, "the shortest term on the node");
 
-        at(&pool, "strict-stale", ms_ago(&pool, 10), Some("org-strict"));
-        at(&pool, "strict-fresh", ms_ago(&pool, 1), Some("org-strict"));
-        at(&pool, "lax-stale", ms_ago(&pool, 10), Some("org-lax"));
-        at(&pool, "lax-ancient", ms_ago(&pool, 90), Some("org-lax"));
-        at(&pool, "default-mid", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "strict-stale", ms_ago(&pool, 10), Some("org-strict"));
+        at(&pool, &main, "strict-fresh", ms_ago(&pool, 1), Some("org-strict"));
+        at(&pool, &main, "lax-stale", ms_ago(&pool, 10), Some("org-lax"));
+        at(&pool, &main, "lax-ancient", ms_ago(&pool, 90), Some("org-lax"));
+        at(&pool, &main, "default-mid", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.organisations_swept, 3);
@@ -369,14 +370,14 @@ mod tests {
         let main = main_db();
         add_org(&main, "org-strict", 3);
 
-        at(&pool, "system-stale", ms_ago(&pool, 10), None);
-        at(&pool, "system-fresh", ms_ago(&pool, 1), None);
+        at(&pool, &main, "system-stale", ms_ago(&pool, 10), None);
+        at(&pool, &main, "system-fresh", ms_ago(&pool, 1), None);
         // An organisation that has since been deleted from the node: the row
         // still names a tenant, but no policy can be resolved for it.
-        at(&pool, "ghost-stale", ms_ago(&pool, 10), Some("org-gone"));
+        at(&pool, &main, "ghost-stale", ms_ago(&pool, 10), Some("org-gone"));
         // Same age, but this tenant IS on the node and keeps 30 days — proof
         // the unattributed cutoff is not simply applied to everything.
-        at(&pool, "default-mid", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "default-mid", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.events_deleted, 2);
@@ -394,8 +395,8 @@ mod tests {
         let (_dir, pool) = events_db();
         let main = main_db();
         set_policy_days(&main, DEFAULT_ORG_ID, 0);
-        at(&pool, "fresh", ms_ago(&pool, 0), Some(DEFAULT_ORG_ID));
-        at(&pool, "fresh-system", ms_ago(&pool, 0), None);
+        at(&pool, &main, "fresh", ms_ago(&pool, 0), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "fresh-system", ms_ago(&pool, 0), None);
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.unattributed_retention_days, 1);
@@ -413,6 +414,7 @@ mod tests {
         let old = ms_ago(&pool, 90);
         append(
             &pool,
+            &main,
             RunEvent::new(
                 "r-old",
                 old,
@@ -452,7 +454,7 @@ mod tests {
     fn a_delivered_audit_copy_is_swept_on_its_own_cutoff() {
         let (_dir, pool) = events_db();
         let main = main_db();
-        at(&pool, "r-1", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
+        at(&pool, &main, "r-1", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
         {
             let conn = pool.write().unwrap();
             conn.execute(

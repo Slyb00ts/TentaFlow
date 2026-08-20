@@ -80,7 +80,7 @@ fn harness_registry() -> AdapterRegistry {
     r.register(Arc::new(AwaitSubagentsNodeAdapter::new()));
     r.register(Arc::new(PatchReviewNodeAdapter::new(slot.clone())));
     r.register(Arc::new(ExecCommandNodeAdapter::new(slot.clone())));
-    r.register(Arc::new(DelegateCliNodeAdapter::new()));
+    r.register(Arc::new(DelegateCliNodeAdapter::new(slot.clone())));
     r.register(Arc::new(AgentContextNodeAdapter::new(slot.clone())));
     r.register(Arc::new(ToolExecNodeAdapter::new(slot.clone())));
     r.register(Arc::new(SpawnNodeAdapter::new(slot.clone())));
@@ -265,6 +265,7 @@ impl LlmDispatcher for ScriptedLlm {
                 reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::ToolCalls,
+                audio: None,
                 tool_calls: vec![LlmToolCall {
                     id: format!("call-{n}"),
                     name: "core.skill_view".into(),
@@ -277,6 +278,7 @@ impl LlmDispatcher for ScriptedLlm {
                 reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::Stop,
+                audio: None,
                 tool_calls: Vec::new(),
             })
         }
@@ -358,6 +360,9 @@ fn seed_agent(pool: &DbPool, id: &str, name: &str, tools_json: &str, max_subagen
             routable: false,
             is_enabled: true,
             on_child_complete: "notify",
+            // No delegation roster: `None` is unrestricted, and these fixtures
+            // do not exercise the roster.
+            allowed_agents_json: None,
             actor_user_id: None,
         },
     )
