@@ -1,10 +1,10 @@
-// ===== Plik: services/graph/collection.rs — rejestr kolekcji grafowych per (org, addon) =====
+// ===== File: services/graph/collection.rs — graph collection registry per (org, addon) =====
 //
-// Lustro `vector::namespace::NamespaceManager` dla grafu. Trzyma proces-szeroki
+// The graph mirror of `vector::namespace::NamespaceManager`. Keeps a process-wide
 // cache `(org_id, addon_id, collection) -> Arc<GraphEntry>` (DashMap, lock-free
-// odczyt na hot-path), gdzie każda otwarta kolekcja odpowiada wierszowi w
-// `addon_graph_collections` (PK `(org_id, addon_id, collection)`) i plikowi
-// `.cozo`. Default location: `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo`;
+// read on the hot path), where every open collection corresponds to a row in
+// `addon_graph_collections` (PK `(org_id, addon_id, collection)`) and to a `.cozo`
+// file. Default location: `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo`;
 // a caller that keeps its graph outside the addon tree passes its own directory
 // to `ensure_collection_at`.
 //
@@ -16,51 +16,52 @@
 // honouring a different directory on reopen would fork the collection into two
 // files.
 //
-// Izolacja multi-tenant: lookup ZAWSZE po `(org_id, addon_id, collection)`;
-// org_id wchodzi w każdy SELECT/INSERT/UPDATE/DELETE, więc rejestry dwóch
-// organizacji nigdy się nie mieszają. W ścieżce domyślnej (`file_path_for`)
-// org_id wchodzi też w ścieżkę pliku, więc ten sam `addon_id` w dwóch
-// organizacjach pisze do osobnych plików. On the `ensure_collection_at` path the
+// Multi-tenant isolation: lookup is ALWAYS by `(org_id, addon_id, collection)`;
+// `org_id` takes part in every SELECT/INSERT/UPDATE/DELETE, so the registries of
+// two organizations never mix. On the default path (`file_path_for`) `org_id`
+// takes part in the file path as well, so the same `addon_id` in two
+// organizations writes to separate files. On the `ensure_collection_at` path the
 // directory is caller-supplied and `org_id` does NOT take part in it: two
 // organizations given the SAME directory map to the same file, so keeping them
 // apart is the caller's job.
 //
-// MANAGER-OWNED LIFETIME (runda 2 codex pkt A): `GraphManager` NIGDY nie wydaje
-// `Arc<CozoBackend>` na zewnątrz. Każdy wpis cache trzyma backend za
-// `RwLock<Option<CozoBackend>>` (`Option`, bo eviction/delete wyjmuje i drop'uje
-// backend pod write-lockiem). Wszystkie operacje grafowe (upsert/query/neighbors/
-// count/export) wykonują się WEWNĄTRZ managera, trzymając per-kolekcyjny lock —
-// caller dostaje WYNIK, nie uchwyt. To naraz:
-//   - czyni quota check+mutate ATOMOWYM (write-lock obejmuje count i mutację Cozo
-//     — dwóch równoległych piszących NIE przekroczy limitu, bug #4),
-//   - czyni delete/eviction bezpiecznym: write-lock → `take()` backend → drop pod
-//     lockiem (sled flush+close) → remove z mapy → kasuj pliki. Brak operacji w
-//     locie, brak kasowania pod żywym uchwytem (bug #5),
-//   - czyni `MAX_OPEN_GRAPHS` PRAWDZIWYM limitem otwartych baz sled, bo eviction
-//     realnie zamyka backend (nie ma zewnętrznego `Arc`, który by go trzymał, bug #3).
+// MANAGER-OWNED LIFETIME (round 2 codex point A): `GraphManager` NEVER hands an
+// `Arc<CozoBackend>` outside. Every cache entry keeps its backend behind a
+// `RwLock<Option<CozoBackend>>` (`Option`, because eviction/delete takes the
+// backend out and drops it under the write lock). All graph operations
+// (upsert/query/neighbors/count/export) run INSIDE the manager while holding the
+// per-collection lock — the caller gets a RESULT, not a handle. That at once:
+//   - makes quota check+mutate ATOMIC (the write lock spans the count and the
+//     Cozo mutation — two parallel writers can NOT exceed the limit, bug #4),
+//   - makes delete/eviction safe: write lock -> `take()` the backend -> drop it
+//     under the lock (sled flush+close) -> remove from the map -> delete the
+//     files. No operation in flight, no deletion under a live handle (bug #5),
+//   - makes `MAX_OPEN_GRAPHS` a REAL limit on open sled databases, because
+//     eviction really closes the backend (no external `Arc` holds it, bug #3).
 //
-// MODEL LICZNIKÓW (runda 3 codex bug F): Cozo jest źródłem prawdy dla GRAFU
-// (liczba realnych węzłów/krawędzi), a kolumny `node_count`/`edge_count` w
-// `addon_graph_collections` to ATOMOWY LEDGER REZERWACJI QUOTY per (org, addon).
-// Globalna quota per-addon sumuje się MIĘDZY kolekcjami, więc nie da się jej
-// wyegzekwować samym per-kolekcyjnym lockiem — dwóch piszących do RÓŻNYCH
-// kolekcji tego samego addona musi konkurować o jeden globalny licznik. Robi to
-// transakcja `BEGIN IMMEDIATE` (jeden writer SQLite): `SELECT SUM(node_count)
-// WHERE org,addon` → jeśli `+delta > limit` reject → `UPDATE node_count += delta
-// WHERE collection` → COMMIT (rezerwacja). Dopiero potem mutacja Cozo; gdy Cozo
-// padnie, kompensujemy `node_count -= delta` (zwolnienie rezerwacji). Dryf między
-// ledgerem a Cozo (np. po crashu między rezerwacją a mutacją) koryguje
-// `reconcile_counts` przy otwarciu kolekcji — ustawia licznik na realny count z
-// Cozo. Ledger może chwilowo przeszacować (rezerwacja bez mutacji), nigdy nie
-// niedoszacuje pod żywym ruchem, więc quota jest bezpieczna (fail-safe w stronę
-// odrzucenia).
+// COUNTER MODEL (round 3 codex bug F): Cozo is the source of truth for the GRAPH
+// (the real number of nodes/edges), while the `node_count`/`edge_count` columns
+// in `addon_graph_collections` are an ATOMIC QUOTA RESERVATION LEDGER per
+// (org, addon). The global per-addon quota sums ACROSS collections, so it cannot
+// be enforced by the per-collection lock alone — two writers to DIFFERENT
+// collections of the same addon must compete for one global counter. A
+// `BEGIN IMMEDIATE` transaction (the single SQLite writer) does that:
+// `SELECT SUM(node_count) WHERE org,addon` -> if `+delta > limit` reject ->
+// `UPDATE node_count += delta WHERE collection` -> COMMIT (the reservation). Only
+// then comes the Cozo mutation; when Cozo fails we compensate with
+// `node_count -= delta` (releasing the reservation). Drift between the ledger and
+// Cozo (e.g. after a crash between the reservation and the mutation) is corrected
+// by `reconcile_counts` when the collection is opened — it sets the counter to the
+// real count from Cozo. The ledger may briefly overestimate (a reservation without
+// a mutation) but never underestimates under live traffic, so the quota is safe
+// (fail-safe towards rejection).
 //
-// Ograniczenie pamięci: sled bierze 1 GiB cache + flush 500ms na KAŻDĄ otwartą
-// bazę i Cozo NIE przepuszcza tuningu (patrz backend.rs), więc manager trzyma
-// lazy-open + LRU eviction: cap `MAX_OPEN_GRAPHS` jednocześnie otwartych
-// backendów, eviction najdawniej używanego (LRU po `last_used`). Eviction zamyka
-// backend (drop pod write-lockiem); dane na dysku zostają, następny dostęp je
-// odtworzy.
+// Memory limit: sled takes a 1 GiB cache + a 500 ms flush for EVERY open database
+// and Cozo does NOT allow tuning that (see backend.rs), so the manager uses
+// lazy-open + LRU eviction: cap `MAX_OPEN_GRAPHS` simultaneously open backends,
+// evicting the least recently used (LRU by `last_used`). Eviction closes the
+// backend (dropped under the write lock); the on-disk data stays and the next
+// access restores it.
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -76,33 +77,34 @@ use crate::services::vector::namespace::{
     validate_addon_id, validate_custom_dir, validate_namespace_name, validate_org_id,
 };
 
-/// Twardy limit kolekcji grafowych na (org, addon). Każda otwarta kolekcja to
-/// osobny plik Cozo + uchwyt — trzymamy modnie jak vector (10 namespaces).
+/// Hard limit on graph collections per (org, addon). Every open collection is a
+/// separate Cozo file + handle — kept in line with vector (10 namespaces).
 pub const MAX_COLLECTIONS_PER_ADDON: u32 = 10;
 
-/// Twardy limit węzłów na (org, addon) (sumarycznie po kolekcjach). Domyślny
-/// pułap, gdy `addon_resource_limits.graph_nodes_max` jest 0 (nieustawiony).
+/// Hard limit on nodes per (org, addon) (summed across collections). The default
+/// ceiling when `addon_resource_limits.graph_nodes_max` is 0 (unset).
 pub const MAX_NODES_PER_ADDON: u64 = 1_000_000;
 
-/// Twardy limit krawędzi na (org, addon) (sumarycznie po kolekcjach). Domyślny
-/// pułap, gdy `addon_resource_limits.graph_edges_max` jest 0 (nieustawiony).
+/// Hard limit on edges per (org, addon) (summed across collections). The default
+/// ceiling when `addon_resource_limits.graph_edges_max` is 0 (unset).
 pub const MAX_EDGES_PER_ADDON: u64 = 5_000_000;
 
-/// Maksymalna liczba JEDNOCZEŚNIE otwartych backendów `CozoBackend` w cache.
-/// Ponad próg manager zamyka najdawniej używany (LRU) — każdy otwarty sled to
-/// realny narzut pamięci (cache 1 GiB default, nietuningowalny przez Cozo). Na
-/// telefonie (Android/iOS) próg jest niższy: pamięć urządzenia jest dużo mniejsza,
-/// a kilka otwartych baz sled po ~1 GiB cache od razu by ją wysyciło.
+/// Maximum number of `CozoBackend` backends open SIMULTANEOUSLY in the cache.
+/// Above the threshold the manager closes the least recently used one (LRU) —
+/// every open sled is real memory overhead (1 GiB default cache, not tunable
+/// through Cozo). On a phone (Android/iOS) the threshold is lower: device memory
+/// is much smaller and a few open sled databases at ~1 GiB cache each would
+/// saturate it immediately.
 #[cfg(any(target_os = "android", target_os = "ios"))]
 pub const MAX_OPEN_GRAPHS: usize = 4;
 #[cfg(not(any(target_os = "android", target_os = "ios")))]
 pub const MAX_OPEN_GRAPHS: usize = 16;
 
-/// Maksymalna liczba prób re-fetch w pętli `with_read`/`with_write` zanim
-/// wymusimy otwarcie kanonicznego wpisu BEZ eviction (gwarancja postępu).
-/// Pod presją (aktywny zbiór kluczy > `MAX_OPEN_GRAPHS`) caller mógłby w kółko
-/// trafiać na wpis wyeksmitowany tuż przed użyciem (starvation/livelock); po
-/// wyczerpaniu prób akceptujemy CHWILOWY over-cap, byle zagwarantować progres.
+/// Maximum number of re-fetch attempts in the `with_read`/`with_write` loop before
+/// we force the canonical entry open WITHOUT eviction (a progress guarantee).
+/// Under pressure (active key set > `MAX_OPEN_GRAPHS`) a caller could keep hitting
+/// an entry evicted just before use (starvation/livelock); once the attempts are
+/// exhausted we accept a TEMPORARY over-cap just to guarantee progress.
 const MAX_REFETCH_ATTEMPTS: u32 = 64;
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
@@ -112,61 +114,61 @@ struct GraphKey {
     collection: String,
 }
 
-/// Stan otwarcia backendu w obrębie jednego wpisu. Przejścia chronione
-/// write-lockiem wpisu, więc open NIE może się zdublować (dwóch równoległych
-/// openerów tej samej kolekcji serializuje się na write-locku — sled bierze
-/// wyłączny lock pliku, dwa równoległe `sled::open` na tym samym katalogu
-/// skończyłyby się `WouldBlock`).
+/// Backend open state within a single entry. The transitions are protected by the
+/// entry write lock, so an open can NOT be duplicated (two parallel openers of the
+/// same collection serialize on the write lock — sled takes an exclusive file lock
+/// and two parallel `sled::open` calls on the same directory would end in
+/// `WouldBlock`).
 ///
-/// `Removed` to STAN TERMINALNY wpisu (runda 3 codex bug G/H): wpis został
-/// wyeksmitowany (eviction) albo skasowany (delete). Po wejściu w `Removed`
-/// backend jest zamknięty i wpis NIE może już otworzyć bazy — żaden
-/// przeterminowany `Arc<GraphEntry>` trzymany przez inny wątek nie wskrzesi
-/// usuniętej/wyeksmitowanej bazy. Wątek, który widzi `Removed`, re-fetchuje
-/// kanoniczny wpis z mapy (`entry_get*`) i ponawia. Eviction i delete różnią się
-/// tylko tym, czy zostaje wiersz DB: eviction zostawia (re-fetch reotwiera ten
-/// sam plik), delete kasuje (re-fetch widzi brak wiersza → świeża kolekcja).
+/// `Removed` is the entry's TERMINAL STATE (round 3 codex bug G/H): the entry was
+/// evicted (eviction) or deleted (delete). Once in `Removed` the backend is closed
+/// and the entry can no longer open the database — no stale `Arc<GraphEntry>` held
+/// by another thread can resurrect a deleted/evicted database. A thread that sees
+/// `Removed` re-fetches the canonical entry from the map (`entry_get*`) and
+/// retries. Eviction and delete differ only in whether the DB row stays: eviction
+/// keeps it (a re-fetch reopens the same file), delete removes it (a re-fetch sees
+/// no row -> a fresh collection).
 enum BackendSlot {
     Closed,
     Open(CozoBackend),
     Removed,
 }
 
-/// Wynik leniwego otwarcia backendu (`ensure_open`). Rozróżnia, czy ten wątek
-/// realnie otworzył bazę, zastał ją już otwartą, czy wpis jest terminalnie
-/// `Removed` (wymaga re-fetch w pętli wołającego).
+/// Result of lazily opening a backend (`ensure_open`). Distinguishes whether this
+/// thread really opened the database, found it already open, or the entry is
+/// terminally `Removed` (which requires a re-fetch in the calling loop).
 enum OpenOutcome {
     Opened,
     AlreadyOpen,
     Removed,
 }
 
-/// Wpis cache: leniwie otwierany backend za `RwLock` + dane do (ponownego)
-/// otwarcia + znacznik LRU. Backend jest otwierany dopiero w `with_read`/
-/// `with_write` pod write-lockiem (dedup open). `engine`/`file_path` są niemienne
-/// po utworzeniu wpisu — pozwalają odtworzyć backend po eviction.
+/// Cache entry: a lazily opened backend behind an `RwLock` + the data needed to
+/// (re)open it + the LRU marker. The backend is opened only in `with_read`/
+/// `with_write` under the write lock (open dedup). `engine`/`file_path` are
+/// immutable once the entry exists — they allow the backend to be restored after
+/// eviction.
 struct GraphEntry {
     slot: RwLock<BackendSlot>,
     engine: GraphEngine,
     file_path: PathBuf,
-    /// Monotoniczny znacznik ostatniego dostępu (z `GraphManager::clock`) —
-    /// najmniejszy = najdawniej używany, kandydat do eviction.
+    /// Monotonic marker of the last access (from `GraphManager::clock`) — the
+    /// smallest one is the least recently used, the eviction candidate.
     last_used: AtomicU64,
 }
 
 pub struct GraphManager {
     pool: DbPool,
     collections: DashMap<GraphKey, Arc<GraphEntry>>,
-    /// Logiczny zegar LRU — inkrementowany przy każdym dostępie do wpisu.
+    /// Logical LRU clock — incremented on every access to an entry.
     clock: AtomicU64,
-    /// Liczba aktualnie OTWARTYCH backendów sled (slot `Open`). Inkrementowana
-    /// przy `Closed→Open`, dekrementowana przy `Open→{Closed,Removed}`. Twardy
-    /// rachunek otwartych baz — żadna ścieżka nie otwiera backendu bez
-    /// inkrementacji, więc przeterminowany `Arc` nie może otworzyć bazy „obok"
-    /// licznika (bug G).
+    /// Number of CURRENTLY OPEN sled backends (slot `Open`). Incremented on
+    /// `Closed->Open`, decremented on `Open->{Closed,Removed}`. A hard account of
+    /// open databases — no path opens a backend without incrementing it, so a
+    /// stale `Arc` cannot open a database beside the counter (bug G).
     open_backends: AtomicU64,
-    /// Override katalogu na dysku — produkcja używa `dirs::home_dir()`, testy
-    /// wstrzykują tempdir (na `/mnt/e`), żeby nie śmiecić w `~`.
+    /// On-disk directory override — production uses `dirs::home_dir()`, tests
+    /// inject a tempdir (on `/mnt/e`) so they do not litter `~`.
     root_override: Option<PathBuf>,
 }
 
@@ -181,8 +183,8 @@ impl GraphManager {
         }
     }
 
-    /// Konstruktor pinujący katalog danych pod `root` zamiast `~/.tentaflow`.
-    /// Używany przez testy integracyjne i przyszłe CLI.
+    /// Constructor pinning the data directory under `root` instead of
+    /// `~/.tentaflow`. Used by integration tests and a future CLI.
     pub fn with_root(pool: DbPool, root: PathBuf) -> Self {
         Self {
             pool,
@@ -193,14 +195,14 @@ impl GraphManager {
         }
     }
 
-    /// Następny znacznik logicznego zegara (monotoniczny, proces-szeroki).
+    /// Next logical clock marker (monotonic, process-wide).
     fn tick(&self) -> u64 {
         self.clock.fetch_add(1, Ordering::Relaxed)
     }
 
-    /// `<root>/<org>/<addon>/graph/<collection>.cozo` (override testowy) albo
-    /// `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo` — root przez
-    /// `paths::orgs_dir()` (respektuje `addons_data_dir` z Ustawien).
+    /// `<root>/<org>/<addon>/graph/<collection>.cozo` (test override) or
+    /// `<orgs_dir>/<org>/addons/<addon>/graph/<collection>.cozo` — the root comes
+    /// from `paths::orgs_dir()` (which respects `addons_data_dir` from Settings).
     fn file_path_for(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<PathBuf> {
         if let Some(root) = &self.root_override {
             Ok(root
@@ -237,15 +239,15 @@ impl GraphManager {
         }
     }
 
-    /// Eviction: dopóki w mapie jest więcej wpisów niż `MAX_OPEN_GRAPHS`, zamyka
-    /// najdawniej używany (najmniejszy `last_used`). Zamknięcie jest REALNE i
-    /// TERMINALNE dla wpisu (bug G): pod write-lockiem slotu ustawiamy `Removed`
-    /// (drop backendu → sled flush+close, dekrement licznika otwartych), DOPIERO
-    /// potem usuwamy wpis z mapy. Kolejność `mark_removed` PRZED `remove` jest
-    /// kluczowa: przeterminowany `Arc<GraphEntry>` trzymany przez inny wątek,
-    /// który czeka na write-lock, po zwolnieniu locka widzi `Removed` i re-fetchuje
-    /// kanoniczny wpis zamiast otworzyć wyeksmitowaną bazę (brak double-open
-    /// `WouldBlock`, brak przekroczenia `MAX_OPEN_GRAPHS`).
+    /// Eviction: while the map holds more entries than `MAX_OPEN_GRAPHS`, closes
+    /// the least recently used one (smallest `last_used`). The close is REAL and
+    /// TERMINAL for the entry (bug G): under the slot write lock we set `Removed`
+    /// (dropping the backend -> sled flush+close, decrementing the open counter)
+    /// and ONLY THEN remove the entry from the map. The `mark_removed` BEFORE
+    /// `remove` order is crucial: a stale `Arc<GraphEntry>` held by another thread
+    /// waiting for the write lock sees `Removed` once the lock is released and
+    /// re-fetches the canonical entry instead of opening an evicted database (no
+    /// double-open `WouldBlock`, no exceeding `MAX_OPEN_GRAPHS`).
     fn evict_to_cap(&self) {
         while self.collections.len() > MAX_OPEN_GRAPHS {
             let victim = self
@@ -255,13 +257,14 @@ impl GraphManager {
                 .map(|e| e.key().clone());
             match victim {
                 Some(k) => {
-                    // Najpierw `mark_removed` (slot → Removed pod write-lockiem),
-                    // DOPIERO potem zdejmij z mapy. Odwrotna kolejność otwierała
-                    // okno: wątek z przeterminowanym Arc (slot Closed) brał
-                    // write-lock i OTWIERAŁ backend między `remove` a `mark_removed`,
-                    // a równoległy re-fetch interował drugi wpis na ten sam plik
-                    // (double-open, over-cap). Z tą kolejnością przeterminowany Arc
-                    // bierze slot-lock, widzi Removed i re-fetchuje kanoniczny wpis.
+                    // `mark_removed` first (slot -> Removed under the write lock),
+                    // and ONLY THEN take it off the map. The reverse order opened
+                    // a window: a thread with a stale Arc (slot Closed) took the
+                    // write lock and OPENED the backend between `remove` and
+                    // `mark_removed`, while a parallel re-fetch interned a second
+                    // entry for the same file (double-open, over-cap). With this
+                    // order the stale Arc takes the slot lock, sees Removed and
+                    // re-fetches the canonical entry.
                     if let Some(entry) = self.collections.get(&k).map(|e| e.value().clone()) {
                         self.mark_removed(&entry);
                         self.collections
@@ -273,9 +276,10 @@ impl GraphManager {
         }
     }
 
-    /// Przełącza slot wpisu w stan terminalny `Removed` pod write-lockiem, drop'ując
-    /// żywy backend (sled flush+close) i dekrementując licznik otwartych. Wołane
-    /// przez eviction i delete — po nim wpis nigdy nie otworzy bazy. Idempotentne.
+    /// Switches the entry slot to the terminal `Removed` state under the write
+    /// lock, dropping a live backend (sled flush+close) and decrementing the open
+    /// counter. Called by eviction and delete — afterwards the entry never opens
+    /// the database again. Idempotent.
     fn mark_removed(&self, entry: &Arc<GraphEntry>) {
         if let Ok(mut guard) = entry.slot.write() {
             if matches!(&*guard, BackendSlot::Open(_)) {
@@ -285,11 +289,11 @@ impl GraphManager {
         }
     }
 
-    /// Atomowo get-or-insert wpis dla `key` w mapie BEZ otwierania backendu (slot
-    /// `Closed`). Backend otwiera się leniwie w `with_read`/`with_write` pod
-    /// write-lockiem wpisu, więc dwa równoległe dostępy do tej samej kolekcji
-    /// dzielą JEDEN wpis i JEDEN open (dedup, bug #6). Bumpuje LRU i ewentualnie
-    /// eksmituje nadmiar.
+    /// Atomically get-or-insert the entry for `key` in the map WITHOUT opening the
+    /// backend (slot `Closed`). The backend opens lazily in `with_read`/
+    /// `with_write` under the entry write lock, so two parallel accesses to the
+    /// same collection share ONE entry and ONE open (dedup, bug #6). Bumps the LRU
+    /// and evicts the excess if needed.
     fn intern_entry(
         &self,
         key: GraphKey,
@@ -315,8 +319,9 @@ impl GraphManager {
         entry
     }
 
-    /// Synchronizuje best-effort cache `node_count/edge_count` w SQLite z realnym
-    /// stanem Cozo (źródło prawdy). Wywoływane przy otwarciu kolekcji.
+    /// Best-effort synchronization of the `node_count`/`edge_count` cache in SQLite
+    /// with the real Cozo state (the source of truth). Called when a collection is
+    /// opened.
     fn reconcile_counts(
         &self,
         org_id: &str,
@@ -339,7 +344,8 @@ impl GraphManager {
         }
     }
 
-    /// Interuje (lub pobiera) KANONICZNY wpis cache dla klucza BEZ dotykania DB.
+    /// Interns (or fetches) the CANONICAL cache entry for the key WITHOUT touching
+    /// the DB.
     /// Takes the engine and the file path from the registry row when one exists;
     /// for a NEW collection the path is `create_dir/<collection>.cozo`, or — when
     /// no directory was given — the path derived from the key (`file_path_for`).
@@ -351,11 +357,12 @@ impl GraphManager {
     /// reopen it is ignored, because the stored `file_path` is the only source of
     /// truth about where the data lives (see the file header).
     ///
-    /// Kluczowe dla bug cold-key create-vs-delete: punkt serializacji per-klucz
-    /// (slot-lock kanonicznego wpisu) jest ustanawiany PRZED jakimkolwiek efektem
-    /// ubocznym DB/plików. Delete bierze slot-lock TEGO SAMEGO kanonicznego wpisu
-    /// (`canonical_entry_for`), więc cold-create i delete są wzajemnie wykluczające
-    /// — nigdy nie powstaną żywe pliki/backend bez wiersza `addon_graph_collections`.
+    /// Key to the cold-key create-vs-delete bug: the per-key serialization point
+    /// (the slot lock of the canonical entry) is established BEFORE any DB/file
+    /// side effect. Delete takes the slot lock of THE SAME canonical entry
+    /// (`canonical_entry_for`), so cold-create and delete are mutually exclusive —
+    /// live files/backend without an `addon_graph_collections` row can never come
+    /// into existence.
     fn entry_get_or_create(
         &self,
         org_id: &str,
@@ -396,12 +403,13 @@ impl GraphManager {
         Ok(self.intern_entry(key, engine, file_path))
     }
 
-    /// Wstawia wiersz `addon_graph_collections` jeśli go nie ma (insert-if-missing),
-    /// pod slot-write-lockiem kanonicznego wpisu — wszystkie efekty uboczne DB dla
-    /// danego klucza dzieją się tu, wzajemnie wykluczone z delete (ten sam slot-
-    /// lock). Idempotentny: istniejący wiersz → no-op (zachowuje liczniki ledgera).
-    /// Quota kolekcji egzekwowana atomowo w `insert_row` (`BEGIN IMMEDIATE`).
-    /// Wołane TYLKO trzymając write-lock slotu wpisu.
+    /// Inserts the `addon_graph_collections` row when it is missing
+    /// (insert-if-missing), under the slot write lock of the canonical entry — all
+    /// DB side effects for a given key happen here, mutually exclusive with delete
+    /// (the same slot lock). Idempotent: an existing row -> no-op (it preserves the
+    /// ledger counters). The collection quota is enforced atomically in
+    /// `insert_row` (`BEGIN IMMEDIATE`). Called ONLY while holding the entry slot
+    /// write lock.
     fn ensure_row(
         &self,
         org_id: &str,
@@ -415,9 +423,9 @@ impl GraphManager {
         }
         match self.insert_row(org_id, addon_id, collection, engine, file_path) {
             Ok(()) => Ok(()),
-            // Równoległy insert tej samej nowej kolekcji (bug #6): drugi wątek
-            // dostaje UNIQUE-violation → wiersz już jest, traktuj jak sukces.
-            // Quota-exceeded propagujemy normalnie.
+            // A parallel insert of the same new collection (bug #6): the second
+            // thread gets a UNIQUE violation -> the row is already there, treat it
+            // as success. Quota-exceeded is propagated normally.
             Err(GraphError::Db(_)) if self.load_row(org_id, addon_id, collection)?.is_some() => {
                 Ok(())
             }
@@ -425,8 +433,9 @@ impl GraphManager {
         }
     }
 
-    /// Pobiera wpis cache BEZ tworzenia (ścieżka read). Błąd, gdy kolekcja nie
-    /// istnieje w rejestrze. Backend otwierany leniwie w `with_*`.
+    /// Fetches the cache entry WITHOUT creating it (the read path). An error when
+    /// the collection does not exist in the registry. The backend is opened lazily
+    /// in `with_*`.
     fn entry_get(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<Arc<GraphEntry>> {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
@@ -454,12 +463,12 @@ impl GraphManager {
         Ok(self.intern_entry(key, Self::parse_engine(&engine)?, file_path))
     }
 
-    /// Wykonuje `f` pod READ-lockiem backendu kolekcji (ścieżki query/neighbors/
-    /// count/export). Pętla re-fetch (bug G): bierzemy kanoniczny wpis z mapy,
-    /// próbujemy go otworzyć/użyć; jeśli wpis jest `Removed` (wyeksmitowany lub
-    /// skasowany przez równoległy wątek), NIE otwieramy go — re-fetchujemy świeży
-    /// wpis z mapy i ponawiamy. Bez tworzenia (ścieżka read): re-fetch nie znajdzie
-    /// wiersza → `CollectionNotFound`.
+    /// Runs `f` under the READ lock of the collection backend (the
+    /// query/neighbors/count/export paths). Re-fetch loop (bug G): we take the
+    /// canonical entry from the map and try to open/use it; if the entry is
+    /// `Removed` (evicted or deleted by a parallel thread) we do NOT open it — we
+    /// re-fetch a fresh entry from the map and retry. Without creation (the read
+    /// path): the re-fetch will not find a row -> `CollectionNotFound`.
     fn with_read<T>(
         &self,
         org_id: &str,
@@ -476,7 +485,7 @@ impl GraphManager {
                     .map_err(|_| GraphError::Backend("graph entry lock poisoned".into()))?;
                 match &*guard {
                     BackendSlot::Open(backend) => return f(backend),
-                    BackendSlot::Removed => {} // re-fetch poniżej
+                    BackendSlot::Removed => {} // re-fetch below
                     BackendSlot::Closed => {
                         drop(guard);
                         match self.ensure_open(&entry, org_id, addon_id, collection)? {
@@ -484,26 +493,27 @@ impl GraphManager {
                                 let guard = entry.slot.read().map_err(|_| {
                                     GraphError::Backend("graph entry lock poisoned".into())
                                 })?;
-                                // Otwarte → użyj; w p.p. stało się Removed → re-fetch poniżej.
+                                // Open -> use it; otherwise it became Removed and
+                                // the loop below re-fetches.
                                 if let BackendSlot::Open(backend) = &*guard {
                                     return f(backend);
                                 }
                             }
-                            OpenOutcome::Removed => {} // re-fetch poniżej
+                            OpenOutcome::Removed => {} // re-fetch below
                         }
                     }
                 }
             }
-            // `Removed` zaobserwowany — odśwież wpis i spróbuj ponownie. Drobny
-            // backoff przeciw livelockowi pod presją eviction (bug 3).
+            // `Removed` observed — refresh the entry and try again. A small
+            // backoff against livelock under eviction pressure (bug 3).
             self.collections
                 .remove_if(&self.key_of(org_id, addon_id, collection), |_, v| {
                     matches!(&*v.slot.read().unwrap(), BackendSlot::Removed)
                 });
             self.refetch_backoff(attempt);
         }
-        // Wyczerpano próby — wymuś otwarcie kanonicznego wpisu BEZ eviction
-        // (świadomy, chwilowy over-cap; gwarancja postępu zamiast starvation).
+        // Attempts exhausted — force the canonical entry open WITHOUT eviction
+        // (a deliberate, temporary over-cap: progress instead of starvation).
         let entry = self.entry_get(org_id, addon_id, collection)?;
         let guard = self.force_open(&entry, org_id, addon_id, collection, false)?;
         match &*guard {
@@ -512,12 +522,12 @@ impl GraphManager {
         }
     }
 
-    /// Wykonuje `f` pod WRITE-lockiem backendu kolekcji (ścieżki mutacji + quota).
-    /// Lock obejmuje otwarcie (leniwe) ORAZ cały zakres `f`, więc per-kolekcyjne
-    /// count+mutacja są atomowe wobec innych piszących i nie kolidują z
-    /// delete/eviction (które też biorą write-lock). Pętla re-fetch (bug G):
-    /// `Removed` → re-fetch kanonicznego wpisu z mapy (tworzy świeży, bo
-    /// `create=true`) i ponów.
+    /// Runs `f` under the WRITE lock of the collection backend (the mutation +
+    /// quota paths). The lock spans the (lazy) open AND the whole of `f`, so a
+    /// per-collection count+mutation is atomic against other writers and does not
+    /// collide with delete/eviction (which take the write lock too). Re-fetch loop
+    /// (bug G): `Removed` -> re-fetch the canonical entry from the map (creating a
+    /// fresh one, because `create=true`) and retry.
     fn with_write<T>(
         &self,
         org_id: &str,
@@ -536,11 +546,11 @@ impl GraphManager {
                 match &*guard {
                     BackendSlot::Open(backend) => return f(backend),
                     BackendSlot::Closed => {
-                        // Efekty uboczne DB/plików dla cold-key dzieją się TU, pod
-                        // slot-lockiem (wzajemnie wykluczone z delete tego samego
-                        // wpisu): najpierw wiersz `addon_graph_collections`, dopiero
-                        // potem open backendu. Bez tego cold-create wyścigał delete
-                        // (żywe pliki/backend bez wiersza DB).
+                        // DB/file side effects for a cold key happen HERE, under
+                        // the slot lock (mutually exclusive with a delete of the
+                        // same entry): first the `addon_graph_collections` row and
+                        // only then the backend open. Without that, cold-create
+                        // raced delete (live files/backend without a DB row).
                         self.ensure_row(
                             org_id,
                             addon_id,
@@ -556,7 +566,7 @@ impl GraphManager {
                             _ => unreachable!("just set Open under the write lock"),
                         }
                     }
-                    BackendSlot::Removed => {} // re-fetch poniżej
+                    BackendSlot::Removed => {} // re-fetch below
                 }
             }
             self.collections
@@ -565,8 +575,8 @@ impl GraphManager {
                 });
             self.refetch_backoff(attempt);
         }
-        // Wyczerpano próby — wymuś otwarcie kanonicznego wpisu BEZ eviction
-        // (świadomy, chwilowy over-cap; gwarancja postępu zamiast starvation).
+        // Attempts exhausted — force the canonical entry open WITHOUT eviction
+        // (a deliberate, temporary over-cap: progress instead of starvation).
         let entry = self.entry_get_or_create(org_id, addon_id, collection, create_dir)?;
         let guard = self.force_open(&entry, org_id, addon_id, collection, true)?;
         match &*guard {
@@ -575,9 +585,9 @@ impl GraphManager {
         }
     }
 
-    /// Krótki backoff w pętli re-fetch: pierwsze próby ustępują CPU (`yield_now`),
-    /// dalsze śpią mikro-interwał, żeby przeterminowany wpis nie wracał w kółko pod
-    /// presją eviction (bug 3, anty-livelock).
+    /// Short backoff in the re-fetch loop: the first attempts yield the CPU
+    /// (`yield_now`), later ones sleep a micro-interval so a stale entry does not
+    /// keep coming back under eviction pressure (bug 3, anti-livelock).
     fn refetch_backoff(&self, attempt: u32) {
         if attempt < 8 {
             std::thread::yield_now();
@@ -586,17 +596,18 @@ impl GraphManager {
         }
     }
 
-    /// Wymusza otwarcie backendu kanonicznego wpisu pod write-lockiem BEZ eviction
-    /// i zwraca trzymany write-guard ze slotem `Open` (chyba że wpis jest `Removed`
-    /// — wtedy guard niesie `Removed`, a caller zwraca błąd przejściowy). Gwarancja
-    /// postępu po wyczerpaniu pętli re-fetch: akceptujemy CHWILOWY over-cap zamiast
-    /// livelocka. Świadomy transient over-cap — następny `intern_entry`/eviction
-    /// ściągnie liczbę otwartych z powrotem do capu.
+    /// Forces the backend of the canonical entry open under the write lock WITHOUT
+    /// eviction and returns the held write guard with the slot `Open` (unless the
+    /// entry is `Removed` — then the guard carries `Removed` and the caller returns
+    /// a transient error). The progress guarantee once the re-fetch loop is
+    /// exhausted: we accept a TEMPORARY over-cap instead of a livelock. A
+    /// deliberate transient over-cap — the next `intern_entry`/eviction pulls the
+    /// number of open backends back to the cap.
     ///
-    /// `create_row=true` (ścieżka write) wymusza `ensure_row` POD slot-lockiem
-    /// przed open — ta sama serializacja cold-key vs delete co w głównej pętli
-    /// `with_write`. Read przekazuje `false` (NIE tworzy wiersza). Klucz jest
-    /// zawsze potrzebny do rekonsyliacji liczników w `open_backend`.
+    /// `create_row=true` (the write path) forces `ensure_row` UNDER the slot lock
+    /// before the open — the same cold-key vs delete serialization as in the main
+    /// `with_write` loop. Read passes `false` (it does NOT create a row). The key
+    /// is always needed to reconcile the counters in `open_backend`.
     fn force_open<'a>(
         &self,
         entry: &'a Arc<GraphEntry>,
@@ -620,9 +631,9 @@ impl GraphManager {
         Ok(guard)
     }
 
-    /// Leniwie otwiera backend wpisu pod write-lockiem (jeśli `Closed`). Dedup:
-    /// pierwszy wątek otwiera, reszta widzi `Open`. `Removed` (eviction/delete w
-    /// trakcie) → `OpenOutcome::Removed`, bez otwierania bazy (bug G).
+    /// Lazily opens the entry backend under the write lock (when `Closed`). Dedup:
+    /// the first thread opens, the rest see `Open`. `Removed` (an eviction/delete
+    /// in progress) -> `OpenOutcome::Removed`, without opening the database (bug G).
     fn ensure_open(
         &self,
         entry: &Arc<GraphEntry>,
@@ -646,15 +657,17 @@ impl GraphManager {
         }
     }
 
-    /// Otwiera `CozoBackend` z danych wpisu i rekonsyliuje liczniki rejestru z
-    /// Cozo (źródło prawdy). Wołane TYLKO trzymając write-lock slotu wpisu.
+    /// Opens a `CozoBackend` from the entry data and reconciles the registry
+    /// counters with Cozo (the source of truth). Called ONLY while holding the
+    /// entry slot write lock.
     ///
-    /// Klucz `(org, addon, collection)` jest PRZEKAZYWANY przez callera (który go
-    /// zawsze ma), NIE odtwarzany skanem DashMap. Skan mapy pod slot-write-lockiem
-    /// był źródłem zakleszczenia: writer trzymał slot-lock i czekał na read-lock
-    /// sharda DashMap, podczas gdy równoległy delete (`canonical_entry_for` →
-    /// `collections.entry`) trzymał write-lock tego samego sharda i czekał na ten
-    /// slot-lock (AB-BA). Bez skanu mapy pod slot-lockiem cykl znika.
+    /// The `(org, addon, collection)` key is PASSED IN by the caller (which always
+    /// has it), NOT reconstructed by scanning the DashMap. Scanning the map under
+    /// the slot write lock was a deadlock source: a writer held the slot lock and
+    /// waited for the read lock of a DashMap shard, while a parallel delete
+    /// (`canonical_entry_for` -> `collections.entry`) held the write lock of that
+    /// same shard and waited for this slot lock (AB-BA). With no map scan under the
+    /// slot lock the cycle disappears.
     fn open_backend(
         &self,
         entry: &Arc<GraphEntry>,
@@ -667,7 +680,7 @@ impl GraphManager {
         Ok(backend)
     }
 
-    /// Klucz mapy z części składowych (helper pętli re-fetch).
+    /// Map key from its components (a re-fetch loop helper).
     fn key_of(&self, org_id: &str, addon_id: &str, collection: &str) -> GraphKey {
         GraphKey {
             org_id: org_id.to_string(),
@@ -676,14 +689,15 @@ impl GraphManager {
         }
     }
 
-    /// Tworzy kolekcję (jeśli nie istnieje) i otwiera jej backend. Publiczny
-    /// odpowiednik dawnego `get_or_create`, ale NIE zwraca uchwytu — tylko
-    /// potwierdza istnienie. Używane przez ścieżki, które chcą zagwarantować
-    /// utworzenie przed serią operacji.
+    /// Creates the collection (when it does not exist) and opens its backend. The
+    /// public equivalent of the former `get_or_create`, but it does NOT return a
+    /// handle — it only confirms existence. Used by paths that want creation
+    /// guaranteed before a series of operations.
     pub fn ensure_collection(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<()> {
-        // Wiersz DB (`ensure_row`) i open backendu dzieją się POD slot-write-lockiem
-        // wewnątrz `with_write` — ta sama serializacja cold-key vs delete co dla
-        // upsertów. Quota kolekcji sprawdzana atomowo w `insert_row` (BEGIN IMMEDIATE).
+        // The DB row (`ensure_row`) and the backend open happen UNDER the slot
+        // write lock inside `with_write` — the same cold-key vs delete
+        // serialization as for upserts. The collection quota is checked atomically
+        // in `insert_row` (BEGIN IMMEDIATE).
         self.with_write(org_id, addon_id, collection, None, |_| Ok(()))
     }
 
@@ -709,7 +723,7 @@ impl GraphManager {
         self.with_write(org_id, addon_id, collection, Some(dir), |_| Ok(()))
     }
 
-    /// Czy kolekcja istnieje w rejestrze (bez otwierania backendu).
+    /// Whether the collection exists in the registry (without opening the backend).
     pub fn collection_exists(
         &self,
         org_id: &str,
@@ -722,23 +736,24 @@ impl GraphManager {
         Ok(self.load_row(org_id, addon_id, collection)?.is_some())
     }
 
-    /// Liczba węzłów kolekcji (z Cozo, źródło prawdy). Read-lock.
+    /// Node count of the collection (from Cozo, the source of truth). Read lock.
     pub fn node_count(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<u64> {
         self.with_read(org_id, addon_id, collection, |b| b.node_count())
     }
 
-    /// Liczba krawędzi kolekcji (z Cozo, źródło prawdy). Read-lock.
+    /// Edge count of the collection (from Cozo, the source of truth). Read lock.
     pub fn edge_count(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<u64> {
         self.with_read(org_id, addon_id, collection, |b| b.edge_count())
     }
 
-    /// Eksport CSR kolekcji (pod PPR w Rust). Otwiera kolekcję jeśli trzeba.
-    /// Read-lock obejmuje cały eksport, więc CSR jest spójnym snapshotem.
+    /// CSR export of the collection (for PPR in Rust). Opens the collection when
+    /// needed. The read lock spans the whole export, so the CSR is a consistent
+    /// snapshot.
     pub fn export_csr(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<Csr> {
         self.with_read(org_id, addon_id, collection, |b| b.export_edges())
     }
 
-    /// Sąsiedzi węzła (out/in/both, opcjonalny filtr relacji, limit). Read-lock.
+    /// Neighbours of a node (out/in/both, optional relation filter, limit). Read lock.
     #[allow(clippy::too_many_arguments)]
     pub fn neighbors(
         &self,
@@ -755,14 +770,14 @@ impl GraphManager {
         })
     }
 
-    /// Globalny PageRank, top-N malejąco. Read-lock.
+    /// Global PageRank, top-N descending. Read lock.
     ///
-    /// Liczony w Rust nad CSR (`personalized_pagerank` z PUSTYMI seedami =
-    /// jednostajna teleportacja = klasyczny globalny PageRank), bo wbudowany
-    /// PageRank Cozo (`graph-algo`) ciągnie crate `graph_builder`, który
-    /// konfliktuje z wersją rayon binarki (E0271/E0308 przy pełnym buildzie).
-    /// To dokładnie ta sama semantyka co dawny cozo `<~ PageRank`, ale bez
-    /// niezgodnej zależności.
+    /// Computed in Rust over the CSR (`personalized_pagerank` with EMPTY seeds =
+    /// uniform teleportation = classic global PageRank), because the built-in Cozo
+    /// PageRank (`graph-algo`) pulls in the `graph_builder` crate, which conflicts
+    /// with the binary's rayon version (E0271/E0308 in a full build). This is
+    /// exactly the same semantics as the former cozo `<~ PageRank`, but without the
+    /// incompatible dependency.
     pub fn pagerank(
         &self,
         org_id: &str,
@@ -778,21 +793,21 @@ impl GraphManager {
         Ok(scored)
     }
 
-    /// Personalized PageRank liczony w Rust nad CSR z Cozo (`ppr.rs`). Seedy to
-    /// id węzłów stanowiących wektor personalizacji; nieznane id są pomijane.
-    /// Zwraca top-N `(id, score)` malejąco. Read-lock obejmuje eksport CSR, więc
-    /// PPR liczy się nad spójnym snapshotem grafu.
+    /// Personalized PageRank computed in Rust over the CSR from Cozo (`ppr.rs`).
+    /// The seeds are the node ids that form the personalization vector; unknown ids
+    /// are skipped. Returns the top-N `(id, score)` descending. The read lock spans
+    /// the CSR export, so PPR is computed over a consistent graph snapshot.
     ///
-    /// SEMANTYKA SEEDÓW (retrieval z JAWNYMI kotwicami): ta ścieżka jest zawsze
-    /// wołana z jawnie podaną listą seedów (host-fn `graph_ppr_v1`, `graph_search`
-    /// op=ppr, GraphRAG). Rozróżniamy więc dwa przypadki:
-    ///   * `seeds` PUSTE  — caller nie podał kotwic → globalny PageRank (jednostajna
-    ///     teleportacja w `personalized_pagerank`); legalne wejście.
-    ///   * `seeds` NIEPUSTE, ale ŻADEN nie istnieje w grafie (wszystkie odpadły po
-    ///     filtrowaniu przez `id_index`) → PUSTY wynik. Personalized PageRank z
-    ///     zerowymi kotwicami to brak wyniku, NIE globalny ranking — inaczej
-    ///     zapytanie o encje spoza KG dostałoby top globalne encje (szum, łamie
-    ///     degradację „brak encji → sam wektor").
+    /// SEED SEMANTICS (retrieval with EXPLICIT anchors): this path is always called
+    /// with an explicitly given seed list (host-fn `graph_ppr_v1`, `graph_search`
+    /// op=ppr, GraphRAG). We therefore distinguish two cases:
+    ///   * `seeds` EMPTY — the caller gave no anchors -> global PageRank (uniform
+    ///     teleportation in `personalized_pagerank`); a legal input.
+    ///   * `seeds` NON-EMPTY, but NONE of them exists in the graph (all dropped by
+    ///     the `id_index` filter) -> an EMPTY result. Personalized PageRank with no
+    ///     anchors means no result, NOT a global ranking — otherwise a query about
+    ///     entities outside the KG would get the top global entities (noise, and it
+    ///     breaks the "no entities -> vector only" degradation).
     #[allow(clippy::too_many_arguments)]
     pub fn ppr(
         &self,
@@ -806,14 +821,15 @@ impl GraphManager {
     ) -> Result<Vec<(String, f64)>> {
         let csr = self.export_csr(org_id, addon_id, collection)?;
         let index = csr.id_index();
-        // Mapujemy `(id, waga)` -> `(idx, waga)`; nieznane id są pomijane. Wagi
-        // niesie wektor personalizacji `personalized_pagerank` (P_init, R6).
+        // Map `(id, weight)` -> `(idx, weight)`; unknown ids are skipped. The
+        // weights are carried by the `personalized_pagerank` personalization
+        // vector (P_init, R6).
         let seed_indices: Vec<(usize, f64)> = seeds
             .iter()
             .filter_map(|(id, w)| index.get(id.as_str()).map(|&idx| (idx, *w)))
             .collect();
-        // Jawne seedy podane, ale żaden nie trafił w graf → brak ważnych kotwic.
-        // Zwracamy pusto zamiast degenerować do globalnego PageRanku.
+        // Explicit seeds were given, but none hit the graph -> no valid anchors.
+        // Return empty instead of degenerating into global PageRank.
         if !seeds.is_empty() && seed_indices.is_empty() {
             return Ok(Vec::new());
         }
@@ -823,27 +839,29 @@ impl GraphManager {
         Ok(scored)
     }
 
-    /// PPR z pełnym sygnałem P_init structure-aware (MemGraphRAG §6.2) liczonym
-    /// nad JEDNYM snapshotem CSR. To ścieżka GraphRAG retrievalu: kara log-degree,
-    /// cap liczby kotwic i sam PPR MUSZĄ widzieć ten sam graf, więc eksportujemy
-    /// CSR dokładnie raz (inaczej stopnie i ranking byłyby z różnych snapshotów,
-    /// a kotwica capnięta przed przeważeniem nigdy nie zostałaby rozważona).
+    /// PPR with the full structure-aware P_init signal (MemGraphRAG §6.2) computed
+    /// over ONE CSR snapshot. This is the GraphRAG retrieval path: the log-degree
+    /// penalty, the anchor cap and PPR itself MUST see the same graph, so we export
+    /// the CSR exactly once (otherwise the degrees and the ranking would come from
+    /// different snapshots, and an anchor capped before reweighting would never be
+    /// considered).
     ///
-    /// `seeds` to wagi BAZOWE (`base × relevance`, jeszcze NIE capnięte) — caller
-    /// (adapter RAG) dorzuca boost relevance, bo zależy on od pasaży wektorowych.
-    /// Tutaj domykamy P_init dwoma krokami nad tym samym CSR:
-    ///   1. FILTR ZNANYCH: mapujemy kandydatów na indeksy CSR i ODRZUCAMY nieznane
-    ///      ZANIM cokolwiek capniemy. Wysokowagowy seed spoza grafu nie może wyprzeć
-    ///      znanej kotwicy z cap-u — inaczej PPR dostałby pusty/zubożony wektor mimo
-    ///      obecnych znanych kotwic.
-    ///   2. KARA LOG-DEGREE: `w /= 1 + ln(1 + degree)` na ZNANYCH kotwicach z tego
-    ///      CSR (węzeł-hub jest słabą, mało selektywną kotwicą).
-    ///   3. CAP PO PRZEWAŻENIU: sortujemy ZNANE kotwice po wadze FINALNEJ (malejąco)
-    ///      i ucinamy do `max_seeds`. Kotwica z wysoką wagą po log-degree/relevance,
-    ///      ale leksykalnie poza pierwszymi `max_seeds`, dzięki temu JEST rozważona.
+    /// `seeds` are the BASE weights (`base × relevance`, NOT capped yet) — the
+    /// caller (the RAG adapter) adds the relevance boost, because it depends on the
+    /// vector passages. Here we close P_init over that same CSR:
+    ///   1. KNOWN FILTER: map the candidates onto CSR indices and REJECT the unknown
+    ///      ones BEFORE anything is capped. A high-weight seed outside the graph
+    ///      must not push a known anchor out of the cap — otherwise PPR would get an
+    ///      empty/impoverished vector despite known anchors being present.
+    ///   2. LOG-DEGREE PENALTY: `w /= 1 + ln(1 + degree)` on the KNOWN anchors from
+    ///      this CSR (a hub node is a weak, poorly selective anchor).
+    ///   3. CAP AFTER REWEIGHTING: sort the KNOWN anchors by their FINAL weight
+    ///      (descending) and truncate to `max_seeds`. An anchor with a high weight
+    ///      after log-degree/relevance but lexically outside the first `max_seeds`
+    ///      IS therefore considered.
     ///
-    /// Semantyka pustych/nieznanych kotwic jak w [`Self::ppr`]: jawne, ale w całości
-    /// nieznane seedy → pusty wynik (nie degenerujemy do globalnego PageRanku).
+    /// Empty/unknown anchor semantics as in [`Self::ppr`]: explicit but entirely
+    /// unknown seeds -> an empty result (we do not degenerate into global PageRank).
     #[allow(clippy::too_many_arguments)]
     pub fn ppr_with_p_init(
         &self,
@@ -860,24 +878,25 @@ impl GraphManager {
         let index = csr.id_index();
         let degrees = csr.total_degrees();
 
-        // Krok 1: mapuj na indeksy TEGO CSR i ODFILTRUJ nieznane PRZED capem —
-        // nieznana, wysokowagowa kotwica nie może wyprzeć znanej z max_seeds.
+        // Step 1: map onto indices of THIS CSR and FILTER OUT the unknown ones
+        // BEFORE the cap — an unknown, high-weight anchor must not push a known one
+        // out of max_seeds.
         let mut weighted: Vec<(usize, f64)> = seeds
             .iter()
             .filter_map(|(id, w)| index.get(id.as_str()).map(|&idx| (idx, *w)))
             .collect();
-        // Jawne kotwice podane, ale żadna nie trafiła w graf → pusto (degradacja).
+        // Explicit anchors were given, but none hit the graph -> empty (degradation).
         if !seeds.is_empty() && weighted.is_empty() {
             return Ok(Vec::new());
         }
 
-        // Krok 2: kara log-degree na ZNANYCH kotwicach z tego snapshotu.
+        // Step 2: log-degree penalty on the KNOWN anchors from this snapshot.
         for (idx, w) in &mut weighted {
             *w /= 1.0 + (1.0 + degrees[*idx] as f64).ln();
         }
 
-        // Krok 3: cap PO przeważeniu — sort po wadze finalnej, utnij do max_seeds.
-        // Cap dotyczy WYŁĄCZNIE znanych kotwic, więc nieznane nie zajmują slotów.
+        // Step 3: cap AFTER reweighting — sort by final weight, truncate to
+        // max_seeds. The cap covers ONLY known anchors, so unknown ones take no slots.
         weighted.sort_by(|a, b| b.1.total_cmp(&a.1));
         weighted.truncate(max_seeds);
 
@@ -888,11 +907,12 @@ impl GraphManager {
         Ok(scored)
     }
 
-    /// Soft-delete (tombstone) węzła `id` + wykluczenie jego krawędzi z retrievalu.
-    /// Wiersz węzła ZOSTAJE (O(1) `:put` markera), więc liczba węzłów i ledger
-    /// quoty się NIE zmieniają — fizyczny purge to późniejsza kompakcja. Krawędzie
-    /// incydentne są pomijane przez retrieval (join z nie-tombstone węzłami), nie
-    /// kasowane fizycznie. Write-lock. Zwraca `(removed, node_count, edge_count)`.
+    /// Soft-delete (tombstone) of node `id` + exclusion of its edges from
+    /// retrieval. The node row STAYS (an O(1) `:put` of the marker), so the node
+    /// count and the quota ledger do NOT change — a physical purge is a later
+    /// compaction. Incident edges are skipped by retrieval (a join with
+    /// non-tombstone nodes), not physically deleted. Write lock. Returns
+    /// `(removed, node_count, edge_count)`.
     pub fn delete_node_in(
         &self,
         org_id: &str,
@@ -908,8 +928,8 @@ impl GraphManager {
         })
     }
 
-    /// Soft-delete pojedynczej krawędzi `(src, rel, dst)` (`alive=false`, O(1)).
-    /// Wiersz zostaje (ledger quoty bez zmian); retrieval pomija. Write-lock.
+    /// Soft-delete of a single edge `(src, rel, dst)` (`alive=false`, O(1)). The
+    /// row stays (the quota ledger is unchanged); retrieval skips it. Write lock.
     pub fn delete_edge_in(
         &self,
         org_id: &str,
@@ -927,8 +947,8 @@ impl GraphManager {
         })
     }
 
-    /// Alias soft-delete węzła dla wariantu `GraphDeleteTarget::Tombstone` — ta
-    /// sama semantyka co `delete_node_in` (delete węzła w Etapie 0 = tombstone).
+    /// Node soft-delete alias for the `GraphDeleteTarget::Tombstone` variant — the
+    /// same semantics as `delete_node_in` (a node delete in Stage 0 = a tombstone).
     pub fn tombstone_node_in(
         &self,
         org_id: &str,
@@ -939,18 +959,18 @@ impl GraphManager {
         self.delete_node_in(org_id, addon_id, collection, id)
     }
 
-    /// Upsert węzła z egzekwowaniem GLOBALNEJ quoty węzłów na (org, addon),
-    /// atomowej także MIĘDZY kolekcjami (bug F). Protokół: pod write-lockiem
-    /// kolekcji ustalamy `is_new = !node_exists(id)` (replace istniejącego id nie
-    /// zmienia sumy, więc nie rezerwuje quoty). Dla nowego id rezerwujemy 1
-    /// jednostkę w atomowym ledgerze SQLite (`reserve_node_quota`: `BEGIN
-    /// IMMEDIATE` → `SELECT SUM(node_count) WHERE org,addon` → jeśli `+1 > limit`
-    /// reject → `UPDATE node_count+=1 WHERE collection` → COMMIT). Globalny writer
-    /// SQLite serializuje to między WSZYSTKIMI kolekcjami addona — dwóch piszących
-    /// do różnych kolekcji konkuruje o ten sam SUM, więc razem nie przekroczą
-    /// limitu. Potem mutacja Cozo; gdy padnie → kompensata `node_count-=1`
-    /// (zwolnienie rezerwacji), błąd propagowany. Sprawdzenie istnienia id
-    /// parametryzowane (`$id`), nie `format!()`.
+    /// Node upsert enforcing the GLOBAL node quota per (org, addon), atomic ACROSS
+    /// collections too (bug F). Protocol: under the collection write lock we
+    /// establish `is_new = !node_exists(id)` (replacing an existing id does not
+    /// change the sum, so it reserves no quota). For a new id we reserve 1 unit in
+    /// the atomic SQLite ledger (`reserve_node_quota`: `BEGIN IMMEDIATE` ->
+    /// `SELECT SUM(node_count) WHERE org,addon` -> if `+1 > limit` reject ->
+    /// `UPDATE node_count+=1 WHERE collection` -> COMMIT). The global SQLite writer
+    /// serializes this across ALL collections of the addon — two writers to
+    /// different collections compete for the same SUM, so together they cannot
+    /// exceed the limit. Then comes the Cozo mutation; when it fails -> the
+    /// `node_count-=1` compensation (releasing the reservation) and the error is
+    /// propagated. The id existence check is parameterized (`$id`), not `format!()`.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_node_with_quota(
         &self,
@@ -967,9 +987,9 @@ impl GraphManager {
         self.with_write(org_id, addon_id, collection, None, |backend| {
             let is_new = !backend.node_exists(id)?;
             if is_new {
-                // Rezerwacja w atomowym ledgerze PRZED mutacją Cozo.
+                // Reservation in the atomic ledger BEFORE the Cozo mutation.
                 self.reserve_node_quota(org_id, addon_id, collection, max_nodes)?;
-                // Mutacja grafu; przy błędzie zwolnij rezerwację.
+                // Graph mutation; on error release the reservation.
                 if let Err(e) = backend.upsert_node(id, label, props_json, provenance_json) {
                     self.release_node_quota(org_id, addon_id, collection);
                     return Err(e);
@@ -981,10 +1001,9 @@ impl GraphManager {
         })
     }
 
-    /// Upsert krawędzi z egzekwowaniem GLOBALNEJ quoty krawędzi na (org, addon),
-    /// atomowej między kolekcjami (bug F). Symetryczny do
-    /// `upsert_node_with_quota`: rezerwacja w atomowym ledgerze → mutacja Cozo →
-    /// kompensata przy błędzie.
+    /// Edge upsert enforcing the GLOBAL edge quota per (org, addon), atomic across
+    /// collections (bug F). Symmetric to `upsert_node_with_quota`: a reservation in
+    /// the atomic ledger -> the Cozo mutation -> compensation on error.
     #[allow(clippy::too_many_arguments)]
     pub fn upsert_edge_with_quota(
         &self,
@@ -1017,11 +1036,11 @@ impl GraphManager {
         })
     }
 
-    /// Atomowa rezerwacja 1 węzła w globalnym ledgerze quoty (bug F). W jednej
-    /// `BEGIN IMMEDIATE`: liczy sumę `node_count` po WSZYSTKICH kolekcjach
-    /// (org, addon); gdy `suma + 1 > max` zwraca `NodeQuotaExceeded` (rollback),
-    /// w p.p. inkrementuje `node_count` bieżącej kolekcji o 1 i commituje.
-    /// Globalny writer SQLite czyni to wzajemnie wykluczającym między kolekcjami.
+    /// Atomic reservation of 1 node in the global quota ledger (bug F). In a single
+    /// `BEGIN IMMEDIATE`: sums `node_count` over ALL collections of (org, addon);
+    /// when `sum + 1 > max` it returns `NodeQuotaExceeded` (rollback), otherwise it
+    /// increments `node_count` of the current collection by 1 and commits. The
+    /// global SQLite writer makes this mutually exclusive across collections.
     fn reserve_node_quota(
         &self,
         org_id: &str,
@@ -1070,8 +1089,9 @@ impl GraphManager {
         Ok(())
     }
 
-    /// Zwalnia rezerwację 1 węzła (kompensata, gdy mutacja Cozo padła). Najlepszy
-    /// wysiłek — `reconcile_counts` przy otwarciu i tak skoryguje dryf z Cozo.
+    /// Releases the reservation of 1 node (compensation when the Cozo mutation
+    /// failed). Best effort — `reconcile_counts` on open corrects the drift from
+    /// Cozo anyway.
     fn release_node_quota(&self, org_id: &str, addon_id: &str, collection: &str) {
         if let Ok(conn) = self.pool.write() {
             let _ = conn.execute(
@@ -1083,7 +1103,7 @@ impl GraphManager {
         }
     }
 
-    /// Atomowa rezerwacja 1 krawędzi w globalnym ledgerze quoty (bug F).
+    /// Atomic reservation of 1 edge in the global quota ledger (bug F).
     fn reserve_edge_quota(
         &self,
         org_id: &str,
@@ -1132,7 +1152,7 @@ impl GraphManager {
         Ok(())
     }
 
-    /// Zwalnia rezerwację 1 krawędzi (kompensata przy błędzie Cozo).
+    /// Releases the reservation of 1 edge (compensation on a Cozo error).
     fn release_edge_quota(&self, org_id: &str, addon_id: &str, collection: &str) {
         if let Ok(conn) = self.pool.write() {
             let _ = conn.execute(
@@ -1178,8 +1198,8 @@ impl GraphManager {
         Ok(())
     }
 
-    /// Limit węzłów: kolumna `graph_nodes_max` (>0) ma pierwszeństwo, w p.p.
-    /// twarda stała. Bierze własny read-lock (poza per-kolekcyjnym write-lockiem).
+    /// Node limit: the `graph_nodes_max` column (>0) wins, otherwise the hard
+    /// constant. Takes its own read lock (outside the per-collection write lock).
     fn resolve_node_limit(&self, addon_id: &str) -> u64 {
         let Ok(conn) = self.pool.read() else {
             return MAX_NODES_PER_ADDON;
@@ -1216,9 +1236,9 @@ impl GraphManager {
         }
     }
 
-    /// Sprawdza limit kolekcji na (org, addon) przed utworzeniem nowej.
-    /// Atomowość samego sprawdzenia+insertu zapewnia `insert_row`
-    /// (PK `(org_id, addon_id, collection)` + transakcja `BEGIN IMMEDIATE`).
+    /// Checks the collection limit per (org, addon) before a new one is created.
+    /// Atomicity of the check+insert itself is provided by `insert_row`
+    /// (PK `(org_id, addon_id, collection)` + a `BEGIN IMMEDIATE` transaction).
     pub fn check_collection_quota(&self, org_id: &str, addon_id: &str) -> Result<()> {
         let conn = self
             .pool
@@ -1242,20 +1262,20 @@ impl GraphManager {
         Ok(())
     }
 
-    /// Kasuje jedną kolekcję. Protokół (bug H — serializacja per-klucz nawet przy
-    /// cache-miss): WSZYSTKO dzieje się pod write-lockiem slotu KANONICZNEGO wpisu
-    /// (interujemy go, jeśli go nie ma — patrz `seal_key_for_delete`). Pod tym
-    /// lockiem kolejno (files-before-row): zamknięcie backendu i oznaczenie slotu
-    /// `Removed`, potem skasowanie PLIKÓW `.cozo`, dopiero na końcu `DELETE FROM
-    /// addon_graph_collections` i zdjęcie wpisu z mapy. Wiersz znika DOPIERO po
-    /// udanym usunięciu plików, więc błąd I/O przerywa przed `DELETE` (wiersz +
-    /// pliki zostają, retry możliwy) i NIGDY nie powstają osierocone pliki bez
-    /// wiersza. Slot `Removed` pod lockiem sprawia, że równoległy `get_or_create`
-    /// po sukcesie (brak wiersza) tworzy ŚWIEŻĄ pustą kolekcję zamiast wskrzeszać
-    /// stare pliki, a po porażce reotwiera tę samą bazę z zachowanych plików.
-    /// Kasowanie pliku jest atomowe względem każdej innej operacji na tym kluczu,
-    /// więc nigdy nie biegnie równolegle z `sled::open` (brak korupcji).
-    /// Idempotentne (brak wiersza / pliku => OK).
+    /// Deletes a single collection. Protocol (bug H — per-key serialization even on
+    /// a cache miss): EVERYTHING happens under the slot write lock of the CANONICAL
+    /// entry (we intern it when it is missing — see `seal_key_for_delete`). Under
+    /// that lock, in order (files-before-row): close the backend and mark the slot
+    /// `Removed`, then delete the `.cozo` FILES, and only at the end
+    /// `DELETE FROM addon_graph_collections` plus taking the entry off the map. The
+    /// row disappears ONLY after the files are removed successfully, so an I/O error
+    /// aborts before the `DELETE` (row + files stay, a retry is possible) and orphan
+    /// files without a row can NEVER appear. The `Removed` slot under the lock makes
+    /// a parallel `get_or_create` create a FRESH empty collection after a success
+    /// (no row) instead of resurrecting the old files, and reopen the same database
+    /// from the preserved files after a failure. Deleting the file is atomic with
+    /// respect to every other operation on that key, so it never runs in parallel
+    /// with `sled::open` (no corruption). Idempotent (no row / no file => OK).
     pub fn delete_collection(&self, org_id: &str, addon_id: &str, collection: &str) -> Result<()> {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
@@ -1269,10 +1289,11 @@ impl GraphManager {
         self.seal_key_for_delete(&key)
     }
 
-    /// Kanoniczny wpis dla `key` BEZ otwierania backendu i BEZ eviction (delete
-    /// zaraz go usunie). Interuje wpis, jeśli go nie ma — to gwarantuje, że delete
-    /// i równoległy `get_or_create` dzielą TEN SAM `Arc<GraphEntry>` i serializują
-    /// się na jego write-locku (bug H przy cache-miss).
+    /// The canonical entry for `key` WITHOUT opening the backend and WITHOUT
+    /// eviction (the delete is about to remove it). Interns the entry when it is
+    /// missing — that guarantees the delete and a parallel `get_or_create` share
+    /// THE SAME `Arc<GraphEntry>` and serialize on its write lock (bug H on a cache
+    /// miss).
     fn canonical_entry_for(
         &self,
         key: &GraphKey,
@@ -1293,7 +1314,8 @@ impl GraphManager {
             .clone()
     }
 
-    /// Pełny protokół kasowania pod write-lockiem slotu kanonicznego wpisu (bug H).
+    /// The full delete protocol under the slot write lock of the canonical entry
+    /// (bug H).
     /// The file to delete is resolved AFTER the lock is taken (`seal_key_with_seed`),
     /// so the deleter and a creator racing it always agree on one file: the
     /// registry row when it exists (it knows whether the collection lives in the
@@ -1303,14 +1325,15 @@ impl GraphManager {
     /// could name a different file than the one that exists by the time the lock
     /// is held, which is exactly how orphan files without a row appeared.
     ///
-    /// KOLEJNOŚĆ (spójność przy awarii): close-handle → skasuj PLIKI → dopiero
-    /// potem skasuj WIERSZ rejestru → zdejmij wpis z mapy. Wiersz znika DOPIERO po
-    /// udanym usunięciu plików, więc błąd I/O kasowania PRZERYWA przed `DELETE` —
-    /// wiersz zostaje, operacja jest retry-able i NIGDY nie powstają osierocone
-    /// pliki bez wiersza (orphan-files). Slot ustawiamy na `Removed` pod lockiem,
-    /// więc równoległy `get_or_create` czekający na ten lock re-fetchuje: po sukcesie
-    /// (brak wiersza) tworzy świeżą pustą kolekcję, po porażce (wiersz + pliki nadal
-    /// są) reotwiera tę samą bazę — stan retry pozostaje spójny.
+    /// ORDER (crash consistency): close the handle -> delete the FILES -> and only
+    /// then delete the registry ROW -> take the entry off the map. The row
+    /// disappears ONLY after the files are removed successfully, so an I/O error
+    /// while deleting ABORTS before the `DELETE` — the row stays, the operation is
+    /// retry-able and orphan files without a row can NEVER appear. We set the slot
+    /// to `Removed` under the lock, so a parallel `get_or_create` waiting on that
+    /// lock re-fetches: after a success (no row) it creates a fresh empty
+    /// collection, after a failure (row + files still present) it reopens the same
+    /// database — the retry state stays consistent.
     fn seal_key_for_delete(&self, key: &GraphKey) -> Result<()> {
         let seed = self.delete_entry_seed(key)?;
         self.seal_key_with_seed(key, seed)
@@ -1362,23 +1385,23 @@ impl GraphManager {
             None => entry.file_path.clone(),
         };
 
-        // 1) Zamknij backend (dekrement licznika, gdy był otwarty) i oznacz slot
-        //    `Removed` — pod lockiem żaden inny wątek nie operuje na tej bazie.
+        // 1) Close the backend (decrementing the counter when it was open) and mark
+        //    the slot `Removed` — under the lock no other thread touches this database.
         if matches!(&*guard, BackendSlot::Open(_)) {
             self.open_backends.fetch_sub(1, Ordering::AcqRel);
         }
         *guard = BackendSlot::Removed;
 
-        // 2) Skasuj PLIKI. Błąd → PRZERWIJ przed `DELETE` wiersza: wiersz zostaje,
-        //    pliki zostają, operacja jest retry-able, brak orphan-files bez wiersza.
+        // 2) Delete the FILES. On error -> ABORT before the row `DELETE`: the row
+        //    stays, the files stay, the operation is retry-able, no orphan files.
         if let Err(e) = remove_cozo_files(&path) {
-            // Wpis zostaje w mapie z `Removed`; następny dostęp re-fetchnie wiersz
-            // (nadal istnieje) i reotworzy bazę z tych samych plików.
+            // The entry stays in the map as `Removed`; the next access re-fetches
+            // the row (still present) and reopens the database from the same files.
             drop(guard);
             return Err(e);
         }
 
-        // 3) Pliki skasowane → dopiero teraz skasuj WIERSZ rejestru.
+        // 3) Files deleted -> only now delete the registry ROW.
         {
             let conn = self
                 .pool
@@ -1393,18 +1416,18 @@ impl GraphManager {
         }
         drop(guard);
 
-        // 4) Zdejmij kanoniczny wpis tylko jeśli to NADAL ten sam Arc (równoległy
-        //    get_or_create mógł go już zastąpić świeżym po naszym `Removed`).
+        // 4) Take the canonical entry off only when it is STILL the same Arc (a
+        //    parallel get_or_create may already have replaced it after our `Removed`).
         self.collections
             .remove_if(key, |_, v| Arc::ptr_eq(v, &entry));
 
         Ok(())
     }
 
-    /// Kasuje WSZYSTKIE kolekcje grafowe addona W DANEJ ORGANIZACJI: kluczowane
-    /// `(org_id, addon_id)`, NIGDY samym `addon_id` — inny tenant z tym samym
-    /// `addon_id` pozostaje nietknięty. Zamknięcie backendów -> wiersze DB ->
-    /// pliki. Wpinane w `uninstall` w slice B2.
+    /// Deletes ALL graph collections of an addon WITHIN A GIVEN ORGANIZATION: keyed
+    /// by `(org_id, addon_id)`, NEVER by `addon_id` alone — another tenant with the
+    /// same `addon_id` stays untouched. Close the backends -> DB rows -> files.
+    /// Wired into `uninstall` in slice B2.
     pub fn delete_all_for_addon(&self, org_id: &str, addon_id: &str) -> Result<()> {
         validate_org_id(org_id).map_err(map_vector_err)?;
         validate_addon_id(addon_id).map_err(map_vector_err)?;
@@ -1414,11 +1437,11 @@ impl GraphManager {
                 .pool
                 .read()
                 .map_err(|_| GraphError::Db("pool mutex poisoned".into()))?;
-            // Brak tabeli rejestru == addon nie ma żadnych kolekcji grafowych →
-            // nie ma czego sprzątać. Ten przypadek zachodzi na ścieżkach instalacji,
-            // które nigdy nie utworzyły schematu grafu (np. minimalne DB w testach
-            // jednostkowych). Tylko `no such table` traktujemy jako pustą listę;
-            // każdy inny błąd DB propagujemy (nie maskujemy korupcji).
+            // No registry table == the addon has no graph collections at all ->
+            // there is nothing to clean up. This happens on installation paths that
+            // never created the graph schema (e.g. the minimal DBs in unit tests).
+            // Only `no such table` is treated as an empty list; every other DB error
+            // is propagated (we do not mask corruption).
             if !table_exists(&conn, "addon_graph_collections")? {
                 return Ok(());
             }
@@ -1438,8 +1461,8 @@ impl GraphManager {
                 .map_err(|e| GraphError::Db(e.to_string()))?
         };
 
-        // Każdą kolekcję kasujemy tym samym serializowanym per-klucz protokołem co
-        // `delete_collection` (bug H) — wiersz DB + pliki pod slot-write-lockiem.
+        // Every collection is deleted with the same per-key serialized protocol as
+        // `delete_collection` (bug H) — the DB row + files under the slot write lock.
         let mut first_err: Option<GraphError> = None;
         for collection in &collections {
             let key = GraphKey {
@@ -1460,12 +1483,12 @@ impl GraphManager {
         }
     }
 
-    /// Usuwa z cache wszystkie otwarte backendy addona (po WSZYSTKICH org) BEZ
-    /// kasowania danych na dysku — następny dostęp odbuduje backend ze świeżego
-    /// wpisu. Slot przechodzi w `Removed` (terminalny) pod write-lockiem, więc
-    /// żaden przeterminowany `Arc` nie reotworzy tej samej bazy „obok" świeżego
-    /// wpisu (bug G); dane na dysku zostają, więc re-fetch reotwiera ten sam plik.
-    /// Wpinane w `materialize_addon_derived_state` (slice B2).
+    /// Drops all open backends of an addon from the cache (across ALL orgs) WITHOUT
+    /// deleting on-disk data — the next access rebuilds the backend from a fresh
+    /// entry. The slot moves to `Removed` (terminal) under the write lock, so no
+    /// stale `Arc` reopens the same database beside the fresh entry (bug G); the
+    /// on-disk data stays, so a re-fetch reopens the same file. Wired into
+    /// `materialize_addon_derived_state` (slice B2).
     pub fn invalidate_addon(&self, addon_id: &str) {
         let entries: Vec<(GraphKey, Arc<GraphEntry>)> = self
             .collections
@@ -1474,23 +1497,22 @@ impl GraphManager {
             .map(|e| (e.key().clone(), e.value().clone()))
             .collect();
         for (key, entry) in entries {
-            // Najpierw `mark_removed` (slot → Removed pod write-lockiem), DOPIERO
-            // potem zdejmij z mapy. Odwrotna kolejność otwierała okno na re-open
-            // przeterminowanego Arc „obok" świeżego wpisu (double-open na ten sam
-            // plik). Pod tą kolejnością stale-Arc widzi Removed i re-fetchuje.
+            // `mark_removed` first (slot -> Removed under the write lock), and ONLY
+            // THEN take it off the map. The reverse order opened a window for a
+            // stale Arc to re-open beside the fresh entry (double-open on the same
+            // file). With this order the stale Arc sees Removed and re-fetches.
             self.mark_removed(&entry);
             self.collections
                 .remove_if(&key, |_, v| Arc::ptr_eq(v, &entry));
         }
     }
 
-    /// Zamyka WSZYSTKIE otwarte backendy (migracja katalogu danych addonów —
-    /// sled trzyma otwarte pliki, które muszą zostać zwolnione przed
-    /// przeniesieniem katalogu). Ta sama kolejność `mark_removed` → `remove_if`
-    /// co w `invalidate_addon`. On-disk data survives, but the next access reads
-    /// the path from the registry row — a data-directory migration MUST rewrite
-    /// `file_path` in `addon_graph_collections` (`storage_admin::run_live_migration`
-    /// does it).
+    /// Closes ALL open backends (the addon data-directory migration — sled keeps
+    /// files open that must be released before the directory is moved). The same
+    /// `mark_removed` -> `remove_if` order as in `invalidate_addon`. On-disk data
+    /// survives, but the next access reads the path from the registry row — a
+    /// data-directory migration MUST rewrite `file_path` in
+    /// `addon_graph_collections` (`storage_admin::run_live_migration` does it).
     pub fn invalidate_all(&self) {
         let entries: Vec<(GraphKey, Arc<GraphEntry>)> = self
             .collections
@@ -1504,8 +1526,8 @@ impl GraphManager {
         }
     }
 
-    /// Akcesor testowy do współdzielonej puli — pozwala testom asertować na
-    /// wierszach `addon_graph_collections` przez ten sam (in-memory) connection.
+    /// Test accessor for the shared pool — lets tests assert on
+    /// `addon_graph_collections` rows through the same (in-memory) connection.
     #[cfg(test)]
     pub(crate) fn pool(&self) -> &DbPool {
         &self.pool
@@ -1539,8 +1561,8 @@ impl GraphManager {
         self.seal_key_with_seed(&self.key_of(org_id, addon_id, collection), seed)
     }
 
-    /// Liczba aktualnie otwartych backendów (slot `Open`). Test eviction:
-    /// liczy realnie żywe backendy sled, nie wpisy z leniwie zamkniętym slotem.
+    /// Number of currently open backends (slot `Open`). Eviction test: it counts
+    /// really live sled backends, not entries with a lazily closed slot.
     #[cfg(test)]
     pub(crate) fn open_handles(&self) -> usize {
         self.collections
@@ -1555,16 +1577,16 @@ impl GraphManager {
             .count()
     }
 
-    /// Liczba wpisów w mapie (otwarte + leniwie zamknięte). Cap eviction działa
-    /// na tej liczbie; open backendy są jej podzbiorem.
+    /// Number of entries in the map (open + lazily closed). The eviction cap works
+    /// on that number; open backends are a subset of it.
     #[cfg(test)]
     pub(crate) fn cached_entries(&self) -> usize {
         self.collections.len()
     }
 
-    /// Wartość licznika `open_backends` (rachunek otwartych baz sled prowadzony
-    /// przy open/close/evict/delete). Test bug G: licznik nie może przekroczyć
-    /// capu ani się rozjechać ze stanem slotów pod obciążeniem.
+    /// Value of the `open_backends` counter (the account of open sled databases
+    /// kept at open/close/evict/delete). Bug G test: the counter must neither
+    /// exceed the cap nor diverge from the slot state under load.
     #[cfg(test)]
     pub(crate) fn open_backends_counter(&self) -> u64 {
         self.open_backends.load(Ordering::Acquire)
@@ -1605,12 +1627,13 @@ impl GraphManager {
             .ok_or_else(|| GraphError::Db(format!("invalid engine '{engine}' in DB row")))
     }
 
-    /// Wstawia wiersz kolekcji atomowo wobec quoty: `BEGIN IMMEDIATE` bierze
-    /// write-lock SQLite na czas (count kolekcji + INSERT), więc dwa równoległe
-    /// `get_or_create` na progu `MAX_COLLECTIONS_PER_ADDON` nie wstawią obu.
-    /// Konflikt PK (wyścig o tę samą collection) także odpada — drugi INSERT
-    /// failuje, transakcja jest rollbackowana, a `entry_get_or_create` ładuje
-    /// istniejący wiersz (bug #6).
+    /// Inserts the collection row atomically with respect to the quota:
+    /// `BEGIN IMMEDIATE` takes the SQLite write lock for the duration (collection
+    /// count + INSERT), so two parallel `get_or_create` calls at the
+    /// `MAX_COLLECTIONS_PER_ADDON` threshold cannot insert both. A PK conflict (a
+    /// race for the same collection) is ruled out too — the second INSERT fails,
+    /// the transaction is rolled back, and `entry_get_or_create` loads the existing
+    /// row (bug #6).
     fn insert_row(
         &self,
         org_id: &str,
@@ -1670,10 +1693,11 @@ impl GraphManager {
     }
 }
 
-/// Mapuje błąd walidacji z warstwy vector na `GraphError::InvalidCollectionName`.
-/// Walidatory nazw są współdzielone (`validate_org_id` upubliczniony), więc ich
-/// `VectorError::InvalidNamespaceName` tłumaczymy na odpowiednik grafowy zamiast
-/// przeciekać typ vector.
+/// Maps a validation error from the vector layer onto
+/// `GraphError::InvalidCollectionName`. The name validators are shared
+/// (`validate_org_id` was made public), so we translate their
+/// `VectorError::InvalidNamespaceName` into the graph equivalent instead of
+/// leaking the vector type.
 fn map_vector_err(e: crate::services::vector::VectorError) -> GraphError {
     match e {
         crate::services::vector::VectorError::InvalidNamespaceName(name) => {
@@ -1686,9 +1710,9 @@ fn map_vector_err(e: crate::services::vector::VectorError) -> GraphError {
     }
 }
 
-/// Czy tabela istnieje w bieżącej bazie. Pozwala `delete_all_for_addon` tolerować
-/// brak rejestru grafu (DB instalacji, które nigdy nie utworzyły schematu grafu)
-/// bez maskowania innych błędów DB sztywnym dopasowaniem łańcucha błędu.
+/// Whether the table exists in the current database. Lets `delete_all_for_addon`
+/// tolerate a missing graph registry (installation DBs that never created the
+/// graph schema) without masking other DB errors by rigid error-string matching.
 fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
     let count: i64 = conn
         .query_row(
@@ -1700,9 +1724,9 @@ fn table_exists(conn: &rusqlite::Connection, table: &str) -> Result<bool> {
     Ok(count > 0)
 }
 
-/// Usuwa plik kolekcji Cozo wraz z plikami pomocniczymi SQLite (`-wal`/`-shm`).
-/// Idempotentne: brak pliku => OK. Toleruje Windows (plik chwilowo trzymany przez
-/// zamykający się uchwyt): krótki retry zanim zwróci błąd I/O.
+/// Removes the Cozo collection file together with the SQLite auxiliary files
+/// (`-wal`/`-shm`). Idempotent: no file => OK. Tolerates Windows (a file briefly
+/// held by a closing handle): a short retry before it returns an I/O error.
 fn remove_cozo_files(path: &Path) -> Result<()> {
     let candidates = [
         path.to_path_buf(),
@@ -1734,7 +1758,8 @@ fn remove_cozo_files(path: &Path) -> Result<()> {
             }
         }
         if let Some(e) = last_err {
-            // Plik mógł zniknąć między pętlami (inny wątek) — wtedy OK.
+            // The file may have disappeared between the loops (another thread) —
+            // that is fine.
             if p.exists() {
                 return Err(GraphError::Io {
                     path: Some(p),
