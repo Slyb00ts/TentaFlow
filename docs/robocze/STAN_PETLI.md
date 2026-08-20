@@ -416,3 +416,80 @@ najbardziej prawdopodobnie żywe.
 
 Przy tej samej okazji wyszła druga, cudza: `TF_REVIEW_MUTATION_1` w `executor.rs` pozwalała
 `envelope.meta["origin"]` nadpisać `ctx.origin` — żywe złamanie inwariantu 1.
+
+---
+
+# SESJA 2026-08-20 — wznowienie
+
+## Metoda: izolacja mutacji zamiast dyscypliny
+
+Trzy incydenty tej pętli mają jedną przyczynę: mutacja żyjąca w drzewie, które w tym czasie
+kompiluje ktoś inny. Skan po markerach jej nie łapie (incydent 3), a dyscyplina agentów zawodzi
+przy ubiciu sesji (incydent 2). Zamiast czwartej prośby o ostrożność wprowadzone są dwa
+mechanizmy:
+
+1. **Jeden `flock` na wszystkie wywołania cargo.** Agenci wołają `tfcargo` zamiast `cargo`,
+   a CAŁY cykl mutacji (kopia → mutacja → test → przywrócenie → odczyt z powrotem) jedzie w
+   jednym skrypcie pod `tfmutate`, czyli pod tym samym zamkiem. Nikt nie skompiluje drzewa,
+   w którym ktoś inny ma żywą mutację — to własność mechanizmu, nie obietnica agenta.
+2. **Migawka SHA-256 1495 plików źródłowych** przed falą; `verify-tree.sh` wypisuje każdy plik
+   różny od migawki. Łapie mutację bez markera, czyli dokładnie ten przypadek, który przeszedł
+   przez skan w incydencie 3.
+
+Do tego rozłączne zbiory plików do mutacji per agent. Koszt: cargo jest zserializowane, więc
+fala trwa dłużej (jeden krytyk odczekał ~90 min na niefiltrowany `cargo test --lib` sąsiada).
+Wniosek na przyszłość: **każdemu krytykowi narzucać filtr testów**, nie zostawiać wyboru.
+
+## Baseline zmierzony na tym drzewie (2026-08-20)
+
+- `cargo check --lib` / `--tests` / `--tests --features test-support` — wszystkie kompilują się.
+  30 ostrzeżeń lib, 37 lib-test — wszystkie zastane.
+- `tentaflow-protocol`: `cargo test --lib` = **200 passed, 0 failed**. Plomba Code Studio
+  (zastana usterka blokująca T6) jest naprawiona — T6 odblokowane.
+- Zastane czerwone, nie nasze: `e2e_smoke_cbor_test` (3), `vector_gate_enforcement` (izolacja),
+  6 testów `sync::` (tylko równolegle), `code_studio_lifecycle_e2e` (1).
+
+## Runda: T3b mostek `ProgressEvent` → `events.db` — ślepy krytyk
+
+**Werdykt: DOES NOT MEET BAR** — kryteria B4 i B12 z 12. Jedenaście mutacji, każda złapana.
+
+**Odpowiedź na pytanie 2 (czy COKOLWIEK pilnuje sensu toru): TAK.** Mutacja `attach()` → no-op
+(mostek przestaje subskrybować, wszystko inne kompiluje się i działa) czerwieni 8 testów, w tym
+oba liczące TTFT i dekodowanie. To jest tor z realnym pokryciem własnej tezy — w odróżnieniu od
+R2a rundy 2, gdzie analogiczna mutacja przeszła przez 44 testy.
+
+**B4 NIE SPEŁNIONE i jest to wada konstrukcyjna, nie kosmetyka.** `ProgressEvent` nie niesie
+ŻADNEGO znacznika czasu, więc `at_ms` to czas ODBIORU w batchującym konsumencie, nie czas
+zdarzenia. Autor zapisał to wprost (`progress_log.rs:27`) zamiast ukryć — to na plus — ale
+kryterium mówi o czasie zdarzenia. Objaw potwierdzający: asercje TTFT dopuszczają `200..600` ms
+dla pauzy 220 ms, a dekodowanie `240..700` dla 260 ms. Tolerancja 2–3× wartości mierzonej to
+dokładnie cena stemplowania przy odbiorze.
+
+**B12 NIE SPEŁNIONE** — trzy komentarze mijające się z kodem (`stop()` „wołane obok
+`checkpoint_wal`" nie ma wołacza; trzy miejsca twierdzą, że TTFT liczy się
+`request_started → first_token`, a liczy się `step_start → first_token`), nieużywane API i jedna
+nowa linia po polsku (`db.rs:5`).
+
+### Znaleziska krytyka poza kryteriami — do rozstrzygnięcia
+
+1. **Kolizja scope'u może podmienić atrybucję wierszy.** Scope rozgłoszenia to `session_id` —
+   identyfikator mintowany przez KLIENTA. `bind_session_owner` jest first-writer-wins, ale
+   `bind_run_provenance` nadpisuje BEZWARUNKOWO. Drugi principal wysyłający pod cudzym
+   `session_id` przestemplowuje pochodzenie żywego scope'u i pozostałe zdarzenia pierwszego
+   użytkownika lądują z `actor_id`/`org_id` drugiego. Wartości nadal są mintowane przez serwer
+   (inwariant 1 stoi), ale KTÓRY stempel wyląduje, da się sterować kluczem od klienta.
+   To ta sama klasa co `correlation_id` od klienta z rundy T1.
+2. **`EventPayload::redacted()` kończy się arm-em `other => other`**, podczas gdy `translate()`
+   i `to_wire()` są celowo wyczerpujące. Przyszły wariant z wolnym tekstem cicho ominie
+   redakcję — czyli dokładnie ta awaria, przed którą broni B2, w jedynej funkcji, gdzie kosztuje
+   najwięcej (inwariant 3).
+3. **`tool_durations` nie bierze PIERWSZEGO wyniku po wywołaniu** (`step_latencies` bierze),
+   więc `call_id` powtórzony w jednym przebiegu daje duplikaty i pary krzyżowe.
+4. **Kopia audytowa jest martwa w produkcji.** `security_relevant()` jest prawdziwe tylko dla
+   `RequestStarted`, a nikt nie zapisuje `RequestStarted` ani `AssistantMessage`. Więc
+   `events::init` startuje pętlę dostarczania nad trwale pustym outboxem — a doc modułu
+   reklamuje ten plik właśnie jako naprawę nigdy-nie-drenowanego outboxu Code Studio.
+   Razem z tym martwa jest CAŁA maszyneria opt-inu na treść odpowiedzi (`ResponseBody`,
+   `BodyOmission`, `assistant_body_setting_key`) — commit, który ją dodał, nie ma czego włączać.
+   **Skutek dla etapu 4: T4.3 i T4.4 nie mają na czym stanąć w obecnym kształcie.**
+5. **`run_provenance` to mapa bez ograniczenia** z jedną ścieżką sprzątania.
