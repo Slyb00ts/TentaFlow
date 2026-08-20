@@ -226,14 +226,25 @@ function audio(v) { return num(v) > 0 ? fmtDuration(num(v), lang()) : '—'; }
 // Aggregated cost where part of the usage has no pricing: "~1 044 zł ⚠" with
 // the explanation in the tooltip; the card footer repeats it once. Usage
 // entirely without pricing is not "0 zł" but unknown: "—" + "brak cennika".
-function costCell(cost, missing, exactMode = false) {
+// `usageMissing` = successful requests the backend reported no token counts
+// for: the cost is a lower bound, flagged the same way as missing pricing.
+function costCell(cost, missing, exactMode = false, usageMissing = 0) {
   const base = exactMode ? money(cost) : moneyShort(cost);
-  if (!missing) return escapeHtml(base);
-  if (num(cost) === 0) return `<div class="tf-table__perf" title="${escapeAttr(T('missing_pricing_hint'))}"><b>—</b><span>${escapeHtml(T('missing_pricing'))}</span></div>`;
-  return `<span class="tf-table__partial" title="${escapeAttr(T('missing_pricing_hint'))}">~${escapeHtml(base)}<svg class="tf-table__warn-ico" aria-hidden="true"><use href="#i-alert"></use></svg></span>`;
+  const gaps = num(usageMissing) > 0;
+  if (!missing && !gaps) return escapeHtml(base);
+  const hint = [missing ? T('missing_pricing_hint') : '', gaps ? T('usage_missing_note', { count: num(usageMissing) }) : ''].filter(Boolean).join(' · ');
+  if (missing && num(cost) === 0) return `<div class="tf-table__perf" title="${escapeAttr(hint)}"><b>—</b><span>${escapeHtml(T('missing_pricing'))}</span></div>`;
+  return `<span class="tf-table__partial" title="${escapeAttr(hint)}">~${escapeHtml(base)}<svg class="tf-table__warn-ico" aria-hidden="true"><use href="#i-alert"></use></svg></span>`;
 }
 // Footer hint shown once per card when any row carries a partial cost.
-function partialHint(missing) { return missing ? ` · ${escapeHtml(T('partial_cost_note'))}` : ''; }
+function partialHint(missing, usageMissing = 0) {
+  const parts = [];
+  if (missing) parts.push(T('partial_cost_note'));
+  if (num(usageMissing) > 0) parts.push(T('usage_missing_note', { count: num(usageMissing) }));
+  return parts.length ? ` · ${escapeHtml(parts.join(' · '))}` : '';
+}
+function usageMissing(r) { return num(r?.usageMissingCount ?? r?.usage_missing_count); }
+function sumUsageMissing(rows) { return rows.reduce((s, r) => s + usageMissing(r), 0); }
 
 function numTitle(v) { return `title="${escapeAttr(exact(v))}"`; }
 function compactCell(v, bold = false) {
@@ -457,10 +468,11 @@ function sumRows(rows) {
     acc.errorCount += num(r.errorCount);
     acc.cost += num(r.cost);
     acc.missingPricing = acc.missingPricing || !!r.missingPricing;
+    acc.usageMissingCount += usageMissing(r);
     return acc;
   }, {
     promptTokens: 0, completionTokens: 0, totalTokens: 0, audioMs: 0, images: 0,
-    requestCount: 0, errorCount: 0, cost: 0, missingPricing: false,
+    requestCount: 0, errorCount: 0, cost: 0, missingPricing: false, usageMissingCount: 0,
   });
 }
 
@@ -1093,9 +1105,9 @@ async function renderOverview(panel, seq) {
     _row: r,
     name: entCell({ title: rowName(r), sub: rowSub(r, 'user') }),
     total: compactCell(r.totalTokens),
-    cost: `<span class="tf-table__muted">${costCell(r.cost, r.missingPricing)}</span>`,
+    cost: `<span class="tf-table__muted">${costCell(r.cost, r.missingPricing, false, usageMissing(r))}</span>`,
   })));
-  setFoot('an-top-users', escapeHtml(T('users_count', { count: byUser.rows.length })), escapeHtml(T('full_list_tab')) + (topUsers.some((r) => r.missingPricing) ? ` · ${escapeHtml(T('partial_cost_note'))}` : ''));
+  setFoot('an-top-users', escapeHtml(T('users_count', { count: byUser.rows.length })), escapeHtml(T('full_list_tab')) + partialHint(topUsers.some((r) => r.missingPricing), sumUsageMissing(topUsers)));
   onRowClick('an-top-users-table', (row) => openDrill('user', row._row.key, rowName(row._row), rowSub(row._row, 'user')));
 
   const topNodes = sortByTokens(byNode.rows).slice(0, 5);
@@ -1110,8 +1122,8 @@ async function renderOverview(panel, seq) {
   onRowClick('an-top-nodes-table', (row) => openDrill('node', row._row.key, rowName(row._row), shortId(row._row.key)));
 
   state.exportCsv = () => downloadCsv(`analytics-overview-${effectivePeriodKey()}.csv`,
-    [T('col_model'), T('col_prompt'), T('col_completion'), T('col_tokens'), T('col_requests'), T('col_cost')],
-    sortByTokens(byModel.rows).map((r) => [rowName(r), r.promptTokens, r.completionTokens, r.totalTokens, r.requestCount, num(r.cost).toFixed(2)]));
+    [T('col_model'), T('col_prompt'), T('col_completion'), T('col_tokens'), T('col_requests'), T('col_cost'), T('col_usage_missing')],
+    sortByTokens(byModel.rows).map((r) => [rowName(r), r.promptTokens, r.completionTokens, r.totalTokens, r.requestCount, num(r.cost).toFixed(2), usageMissing(r)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1166,12 +1178,12 @@ async function renderUsers(panel, seq) {
       total: compactCell(r.totalTokens, true),
       requests: compactCell(r.requestCount),
       audio: audio(r.audioMs),
-      cost: costCell(r.cost, r.missingPricing),
+      cost: costCell(r.cost, r.missingPricing, false, usageMissing(r)),
       share: shareCell(total ? num(r.totalTokens) / total : 0, i),
     })), T('no_data'));
     const left = T(isGroup ? 'groups_count' : 'users_count', { count: visible.length });
-    const right = `${T('sum_tokens', { value: compact(totals.totalTokens) })} · ${costCell(totals.cost, totals.missingPricing)}`
-      + partialHint(totals.missingPricing)
+    const right = `${T('sum_tokens', { value: compact(totals.totalTokens) })} · ${costCell(totals.cost, totals.missingPricing, false, totals.usageMissingCount)}`
+      + partialHint(totals.missingPricing, totals.usageMissingCount)
       + (isGroup && data.grandTotal ? ` · ${escapeHtml(T('group_overlap_note'))}` : '');
     setFoot('an-users-card', escapeHtml(left), right);
   }
@@ -1179,8 +1191,8 @@ async function renderUsers(panel, seq) {
   onRowClick('an-users-table', (row) => openDrill(state.usersSub, row._row.key, rowName(row._row), rowSub(row._row, state.usersSub)));
 
   state.exportCsv = () => downloadCsv(`analytics-${state.usersSub}-${effectivePeriodKey()}.csv`,
-    [T(isGroup ? 'col_group' : 'col_user'), T('col_prompt'), T('col_completion'), T('col_tokens'), T('col_requests'), T('col_audio'), T('col_cost')],
-    rows.map((r) => [rowName(r), r.promptTokens, r.completionTokens, r.totalTokens, r.requestCount, Math.round(num(r.audioMs) / 1000), r.missingPricing ? T('missing_pricing') : num(r.cost).toFixed(2)]));
+    [T(isGroup ? 'col_group' : 'col_user'), T('col_prompt'), T('col_completion'), T('col_tokens'), T('col_requests'), T('col_audio'), T('col_cost'), T('col_usage_missing')],
+    rows.map((r) => [rowName(r), r.promptTokens, r.completionTokens, r.totalTokens, r.requestCount, Math.round(num(r.audioMs) / 1000), r.missingPricing ? T('missing_pricing') : num(r.cost).toFixed(2), usageMissing(r)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1226,11 +1238,11 @@ async function renderModels(panel, seq) {
       ttft: r.ttftP50 != null && !stt ? perfCell(ms(r.ttftP50), `p99 ${ms(r.ttftP99)}`) : perfCell('—', stt ? 'STT' : ''),
       decode: r.decodeP50 != null && !stt ? perfCell(tokS(r.decodeP50), `p90 ${exact(Math.round(num(r.decodeP90)))}`) : perfCell('—', stt ? 'STT' : ''),
       errors: errorsChip(r.errorRate),
-      cost: costCell(r.cost, r.missingPricing),
+      cost: costCell(r.cost, r.missingPricing, false, usageMissing(r)),
       share: shareCell(num(r.totalTokens) / total, i),
     };
   }));
-  setFoot('an-models-card', escapeHtml(T('models_count', { count: rows.length })), escapeHtml(`${T('sum_tokens', { value: compact(total) })} · ${T('percentiles_note')}`) + partialHint(rows.some((r) => r.missingPricing)));
+  setFoot('an-models-card', escapeHtml(T('models_count', { count: rows.length })), escapeHtml(`${T('sum_tokens', { value: compact(total) })} · ${T('percentiles_note')}`) + partialHint(rows.some((r) => r.missingPricing), sumUsageMissing(rows)));
   onRowClick('an-models-table', (row) => openDrill('model', row._row.key, rowName(row._row), rowSub(row._row, 'model')));
 
   const nodeFilter = state.filters.node;
@@ -1251,8 +1263,8 @@ async function renderModels(panel, seq) {
   onRowClick('an-compare-table', (row) => openDrill('model', row._row.modelId, row._row.modelDisplayName || modelName(row._row.modelId), row._row.modelId));
 
   state.exportCsv = () => downloadCsv(`analytics-models-${effectivePeriodKey()}.csv`,
-    [T('col_model'), T('col_tokens'), T('col_requests'), 'TTFT p50 (ms)', 'TTFT p99 (ms)', 'Decode p50 (tok/s)', T('col_errors'), T('col_cost')],
-    rows.map((r) => [rowName(r), r.totalTokens, r.requestCount, r.ttftP50 ?? '', r.ttftP99 ?? '', r.decodeP50 ?? '', num(r.errorRate), r.missingPricing ? T('missing_pricing') : num(r.cost).toFixed(2)]));
+    [T('col_model'), T('col_tokens'), T('col_requests'), 'TTFT p50 (ms)', 'TTFT p99 (ms)', 'Decode p50 (tok/s)', T('col_errors'), T('col_cost'), T('col_usage_missing')],
+    rows.map((r) => [rowName(r), r.totalTokens, r.requestCount, r.ttftP50 ?? '', r.ttftP99 ?? '', r.decodeP50 ?? '', num(r.errorRate), r.missingPricing ? T('missing_pricing') : num(r.cost).toFixed(2), usageMissing(r)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1418,7 +1430,7 @@ function breakdownRows(dim, rows, total) {
         ? modelCell(r.key, r.displayName, modelSub(r))
         : entCell({ title: rowName(r), sub: rowSub(r, 'user') }),
       requests: compactCell(r.requestCount),
-      cost: costCell(r.cost, r.missingPricing),
+      cost: costCell(r.cost, r.missingPricing, false, usageMissing(r)),
       share: shareCell(total ? num(r.totalTokens) / total : 0, i),
     };
   });
@@ -1453,6 +1465,7 @@ function heroChips(d, row, services = []) {
   }
   // Partial cost is flagged next to the hero KPI (the big number carries no tilde).
   if (d.kind !== 'model' && row?.missingPricing) chips.push(tfChip('warn', T('partial_cost_note')));
+  if (usageMissing(row) > 0) chips.push(tfChip('warn', T('usage_missing_note', { count: usageMissing(row) })));
   return chips.join('');
 }
 
@@ -1532,7 +1545,7 @@ async function renderDrill(panel, seq) {
   };
   mk('an-mk-tokens', compact(selfRow.totalTokens), exact(selfRow.totalTokens));
   mk('an-mk-requests', compact(selfRow.requestCount), exact(selfRow.requestCount));
-  mk('an-mk-cost', moneyShort(selfRow.cost), selfRow.missingPricing ? T('missing_pricing_hint') : money(selfRow.cost));
+  mk('an-mk-cost', moneyShort(selfRow.cost), [selfRow.missingPricing ? T('missing_pricing_hint') : money(selfRow.cost), usageMissing(selfRow) > 0 ? T('usage_missing_note', { count: usageMissing(selfRow) }) : ''].filter(Boolean).join(' · '));
   const er = selfRow.errorRate != null ? num(selfRow.errorRate) : (num(selfRow.requestCount) ? num(selfRow.errorCount) / num(selfRow.requestCount) : 0);
   mk('an-mk-errors', pctFixed2(er));
 
@@ -1545,9 +1558,10 @@ async function renderDrill(panel, seq) {
     const total = rows.reduce((s, r) => s + num(r.totalTokens), 0);
     const cost = rows.reduce((s, r) => s + num(r.cost), 0);
     const missing = rows.some((r) => r.missingPricing);
+    const gaps = sumUsageMissing(rows);
     setRows(`an-bd-${dim}-table`, breakdownRows(dim, rows, total));
     const countKey = { model: 'models_count', node: 'nodes_count', user: 'users_count', service: 'services_count' }[dim];
-    const right = dim === 'node' ? escapeHtml(T('percentiles_note')) : dim === 'service' ? escapeHtml(T('percentiles_note')) : `${escapeHtml(T('sum_tokens', { value: compact(total) }))} · ${costCell(cost, missing)}${partialHint(missing)}`;
+    const right = dim === 'node' ? escapeHtml(T('percentiles_note')) : dim === 'service' ? escapeHtml(T('percentiles_note')) : `${escapeHtml(T('sum_tokens', { value: compact(total) }))} · ${costCell(cost, missing, false, gaps)}${partialHint(missing, gaps)}`;
     setFoot(`an-bd-${dim}`, escapeHtml(T(countKey, { count: rows.length })), right);
     onRowClick(`an-bd-${dim}-table`, (row) => {
       const r = row._row;
@@ -1587,7 +1601,7 @@ async function renderDrill(panel, seq) {
       total: compactCell(p.row.totalTokens, true),
       requests: compactCell(p.row.requestCount),
       audio: audio(p.row.audioMs),
-      cost: costCell(p.row.cost, p.row.missingPricing),
+      cost: costCell(p.row.cost, p.row.missingPricing, false, usageMissing(p.row)),
       trend: '',
     })));
     // Sparklines are live elements — attach after the html cells are in place.
@@ -1598,11 +1612,11 @@ async function renderDrill(panel, seq) {
       if (td) td.replaceChildren(pts.some((v) => v > 0) ? sparkCell(pts) : document.createTextNode('—'));
     });
   }
-  setFoot('an-periods', escapeHtml(T('periods_count', { count: periodRows.length })), partialHint(periodRows.some((p) => p.row.missingPricing)).replace(/^ · /, ''));
+  setFoot('an-periods', escapeHtml(T('periods_count', { count: periodRows.length })), partialHint(periodRows.some((p) => p.row.missingPricing), sumUsageMissing(periodRows.map((p) => p.row))).replace(/^ · /, ''));
 
   state.exportCsv = () => downloadCsv(`analytics-${d.kind}-${d.id.slice(0, 12)}-${effectivePeriodKey()}.csv`,
-    [T('col_period'), T('col_prompt'), T('col_completion'), T('col_total'), T('col_requests'), T('col_cost')],
-    periodRows.map((p) => [p.pk, p.row.promptTokens, p.row.completionTokens, p.row.totalTokens, p.row.requestCount, num(p.row.cost).toFixed(2)]));
+    [T('col_period'), T('col_prompt'), T('col_completion'), T('col_total'), T('col_requests'), T('col_cost'), T('col_usage_missing')],
+    periodRows.map((p) => [p.pk, p.row.promptTokens, p.row.completionTokens, p.row.totalTokens, p.row.requestCount, num(p.row.cost).toFixed(2), usageMissing(p.row)]));
 }
 
 // ---------------------------------------------------------------------------
@@ -1980,6 +1994,7 @@ async function renderBilling(panel, seq) {
       { key: 'completion', label: T('col_price_completion'), renderer: 'html', num: true },
       { key: 'audio', label: T('col_price_audio'), renderer: 'html', num: true },
       { key: 'image', label: T('col_price_image'), renderer: 'html', num: true },
+      { key: 'embedding', label: T('col_price_embedding'), renderer: 'html', num: true },
     ]), cls: 'an-d3' })}`;
 
   const [data, byModel, pricingResp] = await Promise.all([
@@ -2006,11 +2021,11 @@ async function renderBilling(panel, seq) {
     name: entCell({ title: rowName(r), sub: rowSub(r, state.billingBy) }),
     total: exact(r.totalTokens),
     requests: exact(r.requestCount),
-    cost: `<b>${costCell(r.cost, r.missingPricing, true)}</b>`,
+    cost: `<b>${costCell(r.cost, r.missingPricing, true, usageMissing(r))}</b>`,
     share: shareCell(totalCost ? num(r.cost) / totalCost : 0, i),
   })));
   const sumText = `<b>${escapeHtml(T('sum_cost', { value: money(totalCost) }))}</b>`
-    + partialHint(missingModels > 0)
+    + partialHint(missingModels > 0, sumUsageMissing(rows))
     + (isGroup && data.grandTotal ? ` · ${escapeHtml(T('group_overlap_note'))}` : '');
   setFoot('an-bill-card', escapeHtml(T(isGroup ? 'groups_count' : 'users_count', { count: rows.length })), sumText);
   onRowClick('an-bill-table', (row) => openDrill(state.billingBy, row._row.key, rowName(row._row), rowSub(row._row, state.billingBy)));
@@ -2034,8 +2049,8 @@ async function renderBilling(panel, seq) {
   renderPricing(pricing, byModel.rows);
 
   state.exportCsv = () => downloadCsv(`analytics-billing-${state.billingBy}-${effectivePeriodKey()}.csv`,
-    [T(isGroup ? 'col_group' : 'col_user'), T('col_tokens'), T('col_requests'), T('col_cost')],
-    rows.map((r) => [rowName(r), r.totalTokens, r.requestCount, num(r.cost).toFixed(2)]));
+    [T(isGroup ? 'col_group' : 'col_user'), T('col_tokens'), T('col_requests'), T('col_cost'), T('col_usage_missing')],
+    rows.map((r) => [rowName(r), r.totalTokens, r.requestCount, num(r.cost).toFixed(2), usageMissing(r)]));
 }
 
 function renderPricing(pricing, modelRows) {
@@ -2076,6 +2091,7 @@ function renderPricing(pricing, modelRows) {
       completion: priceInput(modelId, 'completion', p?.completionPer1k ?? p?.completion_per_1k),
       audio: priceInput(modelId, 'audio', p?.audioPerMin ?? p?.audio_per_min),
       image: priceInput(modelId, 'image', p?.imageEach ?? p?.image_each),
+      embedding: priceInput(modelId, 'embedding', p?.embeddingPer1k ?? p?.embedding_per_1k),
     };
   }), T('no_pricing'));
   setFoot('an-pricing-card', escapeHtml(T('models_in_catalog', { count: list.length })), escapeHtml(T('pricing_formula')));
@@ -2084,7 +2100,7 @@ function renderPricing(pricing, modelRows) {
 async function savePricingRow(modelId) {
   const table = byId('an-pricing-table');
   if (!table) return;
-  const vals = { prompt: 0, completion: 0, audio: 0, image: 0 };
+  const vals = { prompt: 0, completion: 0, audio: 0, image: 0, embedding: 0 };
   table.shadowRoot?.querySelectorAll('tf-input[data-model]').forEach((el) => {
     if (el.getAttribute('data-model') !== modelId) return;
     const field = el.getAttribute('data-field');
@@ -2097,6 +2113,7 @@ async function savePricingRow(modelId) {
       completionPer1k: vals.completion,
       audioPerMin: vals.audio,
       imageEach: vals.image,
+      embeddingPer1k: vals.embedding,
     });
     if (resp && resp.ok === false) {
       toast(resp.error || T('pricing_invalid'), 'error');

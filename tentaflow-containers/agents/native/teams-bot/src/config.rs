@@ -1,8 +1,8 @@
 // =============================================================================
 // Plik: config.rs
 // Opis: Konfiguracja sidecara meeting bot, ladowana z pliku TOML lub env.
-//       Bot operuje na aliasach serwisow (stt/tts/summarization/flow) —
-//       rozwiazanie aliasu na konkretny silnik/voice/model wykonuje router.
+//       STT/LLM/TTS i flow sa rozwiazywane przez Core per tura z wiersza
+//       sesji; bot zna tylko alias summarizera.
 // =============================================================================
 
 use anyhow::{Context, Result};
@@ -51,62 +51,15 @@ pub struct MeetingConfig {
     /// Sciezka do modelu Silero VAD ONNX (None = prosty detektor RMS)
     pub vad_model_path: Option<String>,
 
-    /// Alias serwisu STT w routerze.
-    #[serde(default = "default_stt_alias")]
-    pub stt_alias: String,
-
     /// Alias serwisu summarization w routerze.
     #[serde(default = "default_summarization_alias")]
     pub summarization_alias: String,
 
-    /// Alias serwisu TTS w routerze.
-    #[serde(default = "default_tts_alias")]
-    pub tts_alias: String,
-
-    /// Alias LLM uzywany do generowania ODPOWIEDZI bota w real-time
-    /// (oddzielny od `summarization_alias` ktory tylko robi summary).
-    /// Pusty string lub brak modelu wpiętego pod ten alias = bot nie odpowiada.
-    #[serde(default = "default_llm_alias")]
-    pub llm_alias: String,
-
-    /// Alias flow w routerze (rezerwacja — flow jest rozwiazywany przez router,
-    /// bot trzyma pole dla spojnosci i przyszlego uzycia).
-    #[serde(default = "default_flow_alias")]
-    pub flow_alias: String,
-
-    /// Czy bot ma odpowiadac w meeting'u (LLM -> TTS). Wymaga `llm_alias`
-    /// wpietego na model. Default false zeby starsze deploymenty nie zaczęly
-    /// nagle rozmawiać.
+    /// Czy bot ma odpowiadac w meeting'u. Przekazywane do Core w kazdej turze
+    /// (`respond`): false = Core zwraca sam transkrypt i nie odpala LLM/TTS.
+    /// Default false zeby starsze deploymenty nie zaczęly nagle rozmawiać.
     #[serde(default)]
     pub respond_enabled: bool,
-
-    /// Tryb aktywacji odpowiedzi:
-    ///   - `always` — kazda wypowiedz idzie do LLM (drogie, glosne, debug)
-    ///   - `wake_word` — tylko gdy `wake_word` w wypowiedzi (proste)
-    ///   - `wake_word_intent` — wake_word + lokalny klasyfikator intencji
-    ///     (regex/keyword, mikrosekundy — patrz `intent_classifier.rs`).
-    ///     Akceptuje pytania ('?'), czasowniki rozkazujace i dluzsze
-    ///     wypowiedzi; odrzuca krotkie powitania (<=3 slowa).
-    /// Caller dashboard moze nadpisac envem RESPONSE_MODE.
-    #[serde(default = "default_response_mode")]
-    pub response_mode: String,
-
-    /// Slowa kluczowe (po przecinku) ktore aktywuja odpowiedz.
-    /// Dopasowanie case-insensitive, fragment slowa wystarczy. Pusta lista =
-    /// zawsze aktywne (rownowazne z `response_mode=always`).
-    #[serde(default = "default_wake_words")]
-    pub wake_words: String,
-
-    /// Lista wake_words po splitcie/trim/lowercase, kompilowana raz w
-    /// `validate()`. Trzymana zeby `matches_wake_word` na hot-pathie STT
-    /// nie alokowal Vec/String per kazda wypowiedz. `#[serde(skip)]` —
-    /// zrodlem prawdy jest `wake_words` (CSV z TOML/env).
-    #[serde(skip)]
-    pub wake_words_compiled: Vec<String>,
-
-    /// Systemowy prompt dla LLM odpowiadajacego (rola bota w spotkaniu).
-    #[serde(default = "default_response_prompt")]
-    pub response_prompt: String,
 
     /// Nazwa bota wyswietlana w spotkaniu Teams
     #[serde(default = "default_bot_name")]
@@ -131,12 +84,6 @@ pub struct MeetingConfig {
     /// or OffscreenCanvas are not available in the Chromium build.
     #[serde(default = "default_bot_video_enabled")]
     pub bot_video_enabled: bool,
-
-    /// Echo mode — gdy true, TTS wypowiada transkrypt ze STT (tryb testowy).
-    /// Domyslnie false, bo bez tego powstaje feedback loop: bot slyszy wlasny glos
-    /// przez glosniki/echo Teams i transkrybuje go ponownie.
-    #[serde(default)]
-    pub echo_mode: bool,
 
     /// Co ile sekund summarizer generuje podsumowanie z rolling bufferu
     /// transkrypcji i wysyla MeetingEvent do routera.
@@ -184,47 +131,8 @@ fn default_bot_video_enabled() -> bool {
     true
 }
 
-fn default_stt_alias() -> String {
-    "teams-stt".to_string()
-}
-
 fn default_summarization_alias() -> String {
     "teams-summarization".to_string()
-}
-
-fn default_tts_alias() -> String {
-    "teams-tts".to_string()
-}
-
-fn default_flow_alias() -> String {
-    "teams-flow".to_string()
-}
-
-fn default_llm_alias() -> String {
-    "teams-llm".to_string()
-}
-
-fn default_response_prompt() -> String {
-    // ZAWSZE odpowiadaj. Bez instrukcji ucieczki typu `<NO_RESPONSE>` ani
-    // klauzul "tylko gdy zadaje pytanie" — bot dostaje wylacznie wypowiedzi
-    // ze slowem aktywujacym (response_mode=wake_word), wiec mowca jasno
-    // skierowal sie do bota i oczekuje reakcji. Krotko, po polsku, do rzeczy.
-    "Jestes asystentem na spotkaniu Teams. Odpowiadaj zawsze, po polsku, \
-1-2 zdaniami."
-        .to_string()
-}
-
-fn default_response_mode() -> String {
-    // Default = sam wake_word: bot zawsze odpowiada gdy w transkrypcie
-    // pojawi sie slowo aktywujace. `wake_word_intent` jest dostepny dla
-    // operatorow ktorzy chca dodatkowo odsiac krotkie powitania —
-    // klasyfikacja jest lokalna (regex/keyword), bez LLM call.
-    "wake_word".to_string()
-}
-
-fn default_wake_words() -> String {
-    // Domyslnie pasujemy na imie bota (jarvis), kilka wariantow.
-    "jarvis,tentaflow,asystencie,asystent,bot".to_string()
 }
 
 fn default_summarization_interval_sec() -> u64 {
@@ -346,27 +254,12 @@ impl MeetingConfig {
             vad_model_path: std::env::var("VAD_MODEL_PATH")
                 .ok()
                 .or_else(default_vad_model_path),
-            stt_alias: std::env::var("STT_ALIAS")
-                .unwrap_or_else(|_| "teams-stt".to_string()),
             summarization_alias: std::env::var("SUMMARIZATION_ALIAS")
                 .unwrap_or_else(|_| "teams-summarization".to_string()),
-            tts_alias: std::env::var("TTS_ALIAS")
-                .unwrap_or_else(|_| "teams-tts".to_string()),
-            flow_alias: std::env::var("FLOW_ALIAS")
-                .unwrap_or_else(|_| "teams-flow".to_string()),
-            llm_alias: std::env::var("LLM_ALIAS")
-                .unwrap_or_else(|_| "teams-llm".to_string()),
             respond_enabled: std::env::var("RESPOND_ENABLED")
                 .ok()
                 .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes" | "on"))
                 .unwrap_or(false),
-            response_prompt: std::env::var("RESPONSE_PROMPT")
-                .unwrap_or_else(|_| default_response_prompt()),
-            response_mode: std::env::var("RESPONSE_MODE")
-                .unwrap_or_else(|_| default_response_mode()),
-            wake_words: std::env::var("WAKE_WORDS")
-                .unwrap_or_else(|_| default_wake_words()),
-            wake_words_compiled: Vec::new(),
             bot_name: std::env::var("BOT_NAME")
                 .unwrap_or_else(|_| "TentaFlow Jarvis".to_string()),
             chunk_duration_ms: std::env::var("CHUNK_DURATION_MS")
@@ -381,8 +274,6 @@ impl MeetingConfig {
             // Operators can still flip it off via BOT_VIDEO_ENABLED=false.
             bot_video_enabled: std::env::var("BOT_VIDEO_ENABLED")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(true),
-            echo_mode: std::env::var("ECHO_MODE")
-                .ok().and_then(|v| v.parse().ok()).unwrap_or(false),
             summarization_interval_sec: std::env::var("SUMMARIZATION_INTERVAL_SEC")
                 .ok().and_then(|v| v.parse().ok()).unwrap_or(60),
             transcript_buffer_minutes: std::env::var("TRANSCRIPT_BUFFER_MINUTES")
@@ -398,10 +289,7 @@ impl MeetingConfig {
         Ok(config)
     }
 
-    /// Walidacja poprawnosci konfiguracji. Przy okazji kompiluje
-    /// `wake_words_compiled` z CSV `wake_words` raz, zeby hot-path
-    /// `matches_wake_word` nie powtarzal split/trim/lowercase per
-    /// kazdy STT result.
+    /// Walidacja poprawnosci konfiguracji.
     fn validate(&mut self) -> Result<()> {
         // meeting_url moze byc pusty — kontener startuje bez spotkania,
         // URL podaje sie pozniej komenda join przez QUIC
@@ -409,13 +297,6 @@ impl MeetingConfig {
         if self.chunk_duration_ms < 100 || self.chunk_duration_ms > 5000 {
             anyhow::bail!("chunk_duration_ms musi byc w zakresie 100-5000");
         }
-
-        self.wake_words_compiled = self
-            .wake_words
-            .split(',')
-            .map(|s| s.trim().to_lowercase())
-            .filter(|s| !s.is_empty())
-            .collect();
 
         Ok(())
     }
@@ -435,10 +316,7 @@ mod tests {
             silence_threshold_ms = 3000
             audio_device = "pulse_monitor"
             vad_model_path = "/models/silero.onnx"
-            stt_alias = "custom-stt"
-            tts_alias = "custom-tts"
             summarization_alias = "custom-sum"
-            flow_alias = "custom-flow"
             secret_key_path = "/data/endpoint-key.bin"
             bot_name = "Testowy Bot"
         "#;
@@ -450,10 +328,7 @@ mod tests {
         assert_eq!(config.silence_threshold_ms, 3000);
         assert_eq!(config.audio_device.as_deref(), Some("pulse_monitor"));
         assert_eq!(config.vad_model_path.as_deref(), Some("/models/silero.onnx"));
-        assert_eq!(config.stt_alias, "custom-stt");
-        assert_eq!(config.tts_alias, "custom-tts");
         assert_eq!(config.summarization_alias, "custom-sum");
-        assert_eq!(config.flow_alias, "custom-flow");
         assert_eq!(config.secret_key_path.as_deref(), Some("/data/endpoint-key.bin"));
     }
 
@@ -470,15 +345,12 @@ mod tests {
         assert_eq!(config.silence_threshold_ms, 500);
         assert!(config.audio_device.is_none());
         assert!(config.vad_model_path.is_none());
-        assert_eq!(config.stt_alias, "teams-stt");
-        assert_eq!(config.tts_alias, "teams-tts");
         assert_eq!(config.summarization_alias, "teams-summarization");
-        assert_eq!(config.flow_alias, "teams-flow");
         assert!(config.secret_key_path.is_none());
         assert!(!config.enable_lan_discovery);
         assert!(!config.enable_dht_discovery);
         assert!(config.bot_video_enabled, "bot_video_enabled domyslnie true (canvas avatar)");
-        assert!(!config.echo_mode, "echo_mode domyslnie false");
+        assert!(!config.respond_enabled, "respond_enabled domyslnie false");
     }
 
     #[test]
@@ -577,36 +449,33 @@ mod tests {
     }
 
     #[test]
-    fn parse_config_with_custom_aliases() {
-        // Konfiguracja z ustawionymi aliasami STT/TTS/summarization/flow
+    fn parse_config_with_custom_summarization_alias() {
+        let toml_str = r#"
+            meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
+            auth_cookies_path = "/tmp/cookies.json"
+            summarization_alias = "prod-sum"
+            respond_enabled = true
+        "#;
+
+        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.summarization_alias, "prod-sum");
+        assert!(config.respond_enabled);
+    }
+
+    // STT/LLM/TTS/flow keys are Core-side now; a stale TOML still parses
+    // (unknown fields are ignored) but cannot steer the pipeline.
+    #[test]
+    fn parse_ignores_legacy_pipeline_alias_keys() {
         let toml_str = r#"
             meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
             auth_cookies_path = "/tmp/cookies.json"
             stt_alias = "prod-stt"
             tts_alias = "prod-tts"
-            summarization_alias = "prod-sum"
+            llm_alias = "prod-llm"
             flow_alias = "prod-flow"
         "#;
 
         let config: MeetingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.stt_alias, "prod-stt");
-        assert_eq!(config.tts_alias, "prod-tts");
-        assert_eq!(config.summarization_alias, "prod-sum");
-        assert_eq!(config.flow_alias, "prod-flow");
-    }
-
-    #[test]
-    fn parse_minimal_config_aliases_use_defaults() {
-        // Minimalna konfiguracja — aliasy przyjmuja wartosci domyslne
-        let toml_str = r#"
-            meeting_url = "https://teams.microsoft.com/l/meetup-join/test"
-            auth_cookies_path = "/tmp/cookies.json"
-        "#;
-
-        let config: MeetingConfig = toml::from_str(toml_str).unwrap();
-        assert_eq!(config.stt_alias, "teams-stt");
-        assert_eq!(config.tts_alias, "teams-tts");
         assert_eq!(config.summarization_alias, "teams-summarization");
-        assert_eq!(config.flow_alias, "teams-flow");
     }
 }

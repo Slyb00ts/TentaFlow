@@ -15,6 +15,7 @@ use tokio::sync::Mutex;
 use tracing::{info, warn};
 
 use super::port_pool::NativeAllocatedPorts;
+use super::container_name;
 
 /// Parametry startu subprocesu — analogiczne do `container::SpawnRequest`,
 /// ale z `bridge_port` (Docker tego nie potrzebuje, ma stale 9999 w kontenerze).
@@ -26,16 +27,8 @@ pub struct SpawnRequest {
     pub ports: NativeAllocatedPorts,
     pub secret_key_hex: String,
     pub bot_name: String,
-    pub stt_alias: String,
     pub summarization_alias: String,
-    pub tts_alias: String,
-    pub flow_alias: String,
-    pub llm_alias: String,
     pub respond_enabled: bool,
-    /// Tryb gatowania odpowiedzi: `always` | `wake_word` | `wake_word_intent`.
-    pub response_mode: String,
-    /// CSV slow aktywujacych ("jarvis,bot,...").
-    pub wake_words: String,
 }
 
 /// Wynik spawn — PID subprocesu (do logowania) + nazwa "kontenera" zgodna
@@ -143,17 +136,11 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         .env("MEETING_ID", &req.meeting_key)
         .env("BOT_SECRET_KEY_HEX", &req.secret_key_hex)
         .env("BOT_NAME", &req.bot_name)
-        .env("STT_ALIAS", &req.stt_alias)
         .env("SUMMARIZATION_ALIAS", &req.summarization_alias)
-        .env("TTS_ALIAS", &req.tts_alias)
-        .env("FLOW_ALIAS", &req.flow_alias)
-        .env("LLM_ALIAS", &req.llm_alias)
         .env(
             "RESPOND_ENABLED",
             if req.respond_enabled { "true" } else { "false" },
         )
-        .env("RESPONSE_MODE", &req.response_mode)
-        .env("WAKE_WORDS", &req.wake_words)
         .env("TRANSPORT_PORT", req.ports.quic.to_string())
         .env("TENTAFLOW_BRIDGE_PORT", req.ports.bridge.to_string())
         // Native = host network namespace, broadcast mDNS i DHT bylby widoczny
@@ -236,7 +223,3 @@ pub async fn cleanup_stale() -> Result<()> {
     Ok(())
 }
 
-/// Nazwa serwisu (taka sama konwencja jak Docker dla spojnosci log/dashboard).
-pub fn container_name(session_id: i64) -> String {
-    format!("meeting-bot-{}", session_id)
-}

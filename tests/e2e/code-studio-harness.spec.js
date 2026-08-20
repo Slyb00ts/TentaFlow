@@ -137,10 +137,9 @@ async function gotoCodeStudio(page) {
 }
 
 async function gotoCodeStudioViaTile(page) {
-  // The shell ignores the URL hash (app.js ends with `Router.init('dashboard')`
-  // and router.js has no hashchange listener), and navigating too early loses
-  // the race with that init. So take the path a user takes: All apps → the
-  // Code Studio tile. It also proves the tile is reachable at all.
+  // Fallback when the deep link did not resolve: take the path a user takes
+  // from the start screen (apps-home for every role) — All apps → the Code
+  // Studio tile. It also proves the tile is reachable at all.
   await page.goto(`${baseUrl(PORT)}/`);
   await page.locator('[data-view="apps-home"]').first().click();
   await page.locator('[data-route="code-studio"]').first().click();

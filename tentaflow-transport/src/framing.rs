@@ -40,6 +40,26 @@ where
     Ok(())
 }
 
+/// Wysyla juz zakodowany payload CBOR jako length-prefixed frame. Uzywane
+/// gdy producent (np. dispatcher streamu w Core) zwraca gotowe bajty chunka
+/// i ponowna (de)serializacja bylaby tylko kosztem.
+pub async fn write_raw_frame(send: &mut SendStream, bytes: &[u8]) -> Result<(), TransportError> {
+    if bytes.len() > MAX_FRAME_SIZE {
+        return Err(TransportError::FrameTooLarge {
+            limit: MAX_FRAME_SIZE,
+            got: bytes.len(),
+        });
+    }
+    let len = (bytes.len() as u32).to_be_bytes();
+    send.write_all(&len)
+        .await
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+    send.write_all(bytes)
+        .await
+        .map_err(|e| TransportError::Io(std::io::Error::other(e.to_string())))?;
+    Ok(())
+}
+
 /// Odczytuje jedna ramke i deserializuje do `T`. Zwraca `None` jesli peer
 /// zamknal stream przed wyslaniem jakiegokolwiek bajtu (clean EOF).
 pub async fn read_frame<T>(recv: &mut RecvStream) -> Result<Option<T>, TransportError>

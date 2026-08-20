@@ -16,7 +16,7 @@ pub mod client;
 pub mod server;
 
 pub use error::TransportError;
-pub use framing::{read_frame, write_frame, MAX_FRAME_SIZE};
+pub use framing::{read_frame, write_frame, write_raw_frame, MAX_FRAME_SIZE};
 pub use endpoint::{build_client_endpoint, build_server_endpoint, parse_iroh_url, ServerEndpointConfig};
 pub use client::{ServiceClient, ServiceClientConfig};
 pub use server::{serve_model_requests, HandleError, ModelHandler, ModelOutcome};

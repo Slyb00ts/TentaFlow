@@ -1128,6 +1128,7 @@ pub fn flow_list(_req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBody
             enabled: f.status == "active",
             is_default: f.is_default,
             published_model_name: f.published_model_name,
+            is_factory: crate::db::seed::is_factory_flow(&f.id),
             is_system: f.is_system,
         })
         .collect();
@@ -1147,7 +1148,12 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .map_err(db_err)?
         .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
 
-    Ok(MessageBody::FlowDetailResponse(FlowDetail {
+    Ok(MessageBody::FlowDetailResponse(flow_detail_body(flow)))
+}
+
+fn flow_detail_body(flow: db::models::DbFlow) -> FlowDetail {
+    FlowDetail {
+        is_factory: crate::db::seed::is_factory_flow(&flow.id),
         id: flow.id.to_string(),
         name: flow.name,
         description: flow.description,
@@ -1155,7 +1161,7 @@ pub fn flow_detail(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         enabled: flow.status == "active",
         status: flow.status,
         is_system: flow.is_system,
-    }))
+    }
 }
 
 #[handler(variant = "FlowCreateRequest", since = (1, 0))]
@@ -1229,6 +1235,11 @@ pub fn flow_delete(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
     if existing.is_system {
         return Err(ProtocolError::bad_request(
             "system flow cannot be deleted — it is managed by the platform",
+        ));
+    }
+    if crate::db::seed::is_factory_flow(flow_id) {
+        return Err(ProtocolError::bad_request(
+            "factory flow cannot be deleted — restore its factory version instead",
         ));
     }
     repository::delete_flow(&ctx.state.db, flow_id).map_err(db_err)?;
@@ -1333,6 +1344,11 @@ pub fn flow_update(req: &MessageBody, ctx: &HandlerContext) -> Result<MessageBod
         .status
         .clone()
         .unwrap_or_else(|| existing.status.clone());
+    if flow_id == crate::db::seed::DEFAULT_CHAT_FLOW_ID && new_status != "active" {
+        return Err(ProtocolError::bad_request(
+            "the default chat flow must stay active — it is the resolver fallback",
+        ));
+    }
 
     // Resolve the publish-name update: `Some(Some)` writes a new value,
     // `Some(None)` clears it, `None` leaves the existing value alone.
@@ -1694,6 +1710,94 @@ pub fn flow_version_restore(
     Ok(MessageBody::FlowVersionRestoreResponseBody(
         tentaflow_protocol::FlowVersionRestoreResponse { ok: true },
     ))
+}
+
+#[handler(variant = "FlowFactoryRestoreRequest", since = (1, 0))]
+#[policy(Admin)]
+#[observed]
+pub fn flow_factory_restore(
+    req: &MessageBody,
+    ctx: &HandlerContext,
+) -> Result<MessageBody, ProtocolError> {
+    let flow_id = match req {
+        MessageBody::FlowFactoryRestoreRequestBody(p) => p.flow_id.as_str(),
+        _ => {
+            return Err(ProtocolError::bad_request(
+                "expected FlowFactoryRestoreRequestBody",
+            ));
+        }
+    };
+    let Some(factory_json) = crate::db::seed::factory_flow_json(flow_id) else {
+        return Err(ProtocolError::bad_request(
+            "not a factory flow — only factory flows have a canonical version to restore",
+        ));
+    };
+
+    let existing = repository::get_flow(&ctx.state.db, flow_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    if existing.is_system {
+        return Err(ProtocolError::bad_request(
+            "system flow cannot be modified — it is managed by the platform",
+        ));
+    }
+    // The canonical graph still goes through R1-R8: a node adapter may have
+    // disappeared from this build since the seed was written.
+    validate_flow_json_str(ctx, factory_json)?;
+
+    let user_id_opt = require_user_id(ctx).ok().map(|b| user_id_to_uuid(&b));
+    // Default Chat is the resolver fallback, so a restore also re-pins its
+    // routing identity; Meeting Bot keeps whatever routing it had.
+    let is_default_chat = flow_id == crate::db::seed::DEFAULT_CHAT_FLOW_ID;
+    let params = db::models::FlowParams {
+        name: &existing.name,
+        description: existing.description.as_deref(),
+        is_default: existing.is_default || is_default_chat,
+        service_type: if is_default_chat {
+            Some("chat")
+        } else {
+            existing.service_type.as_deref()
+        },
+        flow_json: factory_json,
+        status: "active",
+        published_model_name: existing.published_model_name.as_deref(),
+        actor_user_id: user_id_opt.as_deref(),
+    };
+
+    // `update_flow_with_snapshot` writes the CURRENT graph to `flow_versions`
+    // before replacing it, so the user can undo this restore, and records the
+    // sync capture like every other flow write.
+    match repository::update_flow_with_snapshot(
+        &ctx.state.db,
+        flow_id,
+        existing.version,
+        &params,
+        user_id_opt.as_deref(),
+    ) {
+        Ok(()) => {}
+        Err(e) if e.to_string().contains("CONFLICT") => {
+            return Err(ProtocolError::new(
+                ProtocolErrorCode::BadRequest,
+                "flow version conflict",
+            ));
+        }
+        Err(e) => return Err(flow_write_err(e)),
+    }
+    ctx.state.router.rebuild_catalog();
+    invalidate_flow_cache();
+
+    audit(
+        ctx,
+        user_id_opt.as_deref(),
+        "flow.factory.restore",
+        Some(&format!("flow:{}", flow_id)),
+        Some(&existing.name),
+    );
+
+    let restored = repository::get_flow(&ctx.state.db, flow_id)
+        .map_err(db_err)?
+        .ok_or_else(|| ProtocolError::not_found("flow not found"))?;
+    Ok(MessageBody::FlowDetailResponse(flow_detail_body(restored)))
 }
 
 // =============================================================================
@@ -10828,20 +10932,17 @@ pub async fn service_model_selection(
                     }
                     // Skip entries that supply nothing — never create an all-zero
                     // row that would mask `missing_pricing` in metrics.
-                    if entry.prompt_per_1k.is_none()
-                        && entry.completion_per_1k.is_none()
-                        && entry.audio_per_min.is_none()
-                        && entry.image_each.is_none()
-                    {
+                    let patch = crate::db::models::ModelPricingPatch {
+                        prompt_per_1k: entry.prompt_per_1k,
+                        completion_per_1k: entry.completion_per_1k,
+                        audio_per_min: entry.audio_per_min,
+                        image_each: entry.image_each,
+                        embedding_per_1k: None,
+                    };
+                    if patch.is_empty() {
                         continue;
                     }
-                    let valid =
-                        |v: Option<f64>| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true);
-                    if !(valid(entry.prompt_per_1k)
-                        && valid(entry.completion_per_1k)
-                        && valid(entry.audio_per_min)
-                        && valid(entry.image_each))
-                    {
+                    if !patch.is_valid() {
                         tracing::warn!(
                             model_id = %entry.model_id,
                             "service model selection: invalid pricing (non-finite or negative) — skipped"
@@ -10853,10 +10954,7 @@ pub async fn service_model_selection(
                         &ctx.state.db,
                         &org_id,
                         &entry.model_id,
-                        entry.prompt_per_1k,
-                        entry.completion_per_1k,
-                        entry.audio_per_min,
-                        entry.image_each,
+                        &patch,
                     ) {
                         tracing::warn!(
                             model_id = %entry.model_id,

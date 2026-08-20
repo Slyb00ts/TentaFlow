@@ -1532,17 +1532,17 @@
     "legal": "Dokumenty RODO",
     "profiling_sessions": "Profilowanie",
     "meeting": "Meeting Bot",
-    "pose": "Pozy",
     "section_general": "Główne",
     "section_core": "Rdzeń",
     "section_workflows": "Przepływy",
     "section_ai_agents": "Agenci AI",
-    "section_integrations": "Integracje",
     "section_management": "Zarządzanie",
     "section_apps": "Moje aplikacje",
     "section_account": "Konto",
     "apps_home": "Wszystkie aplikacje",
-    "images": "Obrazy",
+    "code_studio": "Code Studio",
+    "projekty": "Projekty",
+    "ml_studio": "ML Studio",
     "tts": "Synteza mowy",
     "translate": "Tłumacz",
     "search_app": "Wyszukaj",
@@ -2965,6 +2965,7 @@
     "minimap_label": "Mini-mapa",
     "minimap_name": "Mapa",
     "autosave_saved": "Zapisano",
+    "system_readonly": "To jest flow systemowy TentaFlow — tylko podgląd.",
     "autosave_pending": "Niezapisane zmiany…",
     "autosave_error": "Błąd zapisu",
     "save_success": "Zapisano flow",
@@ -3271,6 +3272,14 @@
     "col_actions": "Akcje",
     "edit_title": "Edytuj",
     "history_title_short": "Historia wykonań",
+    "system_chip": "Systemowy",
+    "factory_chip": "Fabryczny",
+    "factory_restore": "Przywróć wersję fabryczną",
+    "factory_restore_confirm": "Przywrócić fabryczną wersję przepływu \"{name}\"?",
+    "factory_restore_desc": "Bieżąca wersja zostanie zapisana w historii wersji, więc można do niej wrócić.",
+    "factory_restore_btn": "Przywróć",
+    "factory_restored_ok": "Przywrócono fabryczną wersję przepływu \"{name}\"",
+    "preview": "Podgląd",
     "delete_title": "Usuń",
     "close_title": "Zamknij",
     "default_name": "Nowy flow",
@@ -4926,6 +4935,8 @@
     "audio_pipeline_pending": "Rozpocznij rozmowę mikrofonem",
     "audio_engine_missing": "Brak zainstalowanego silnika audio",
     "audio_no_engine": "Brak silnika",
+    "stt_no_service": "Brak uruchomionej usługi STT — wdróż silnik STT w Usługach, aby rozmawiać głosowo.",
+    "tts_no_service": "Brak uruchomionej usługi TTS — wdróż silnik TTS w Usługach, aby asystent mógł mówić.",
     "audio_preview_hint": "Tryb audio — twarz asystenta z animacją idle. Kliknij mikrofon, aby rozpocząć rozmowę głosową.",
     "audio_start_mic": "Kliknij aby rozpocząć rozmowę",
     "audio_mic_denied": "Brak dostępu do mikrofonu",
@@ -4970,34 +4981,13 @@
     "accept_license": "Zaakceptuj licencję NVIDIA",
     "retry": "Ponów Deploy"
   },
-  "pose": {
-    "title": "Pozy",
-    "subtitle": "Podgląd kamery z lokalnym szkieletem sylwetki",
-    "live_chip": "Live",
-    "model_label": "Model pozy",
-    "camera_label": "Kamera",
-    "camera_front": "Przednia",
-    "camera_back": "Tylna",
-    "fps_label": "Częstotliwość",
-    "start": "Start",
-    "stop": "Stop",
-    "status": "Status",
-    "status_idle": "Gotowe",
-    "status_running": "Analiza na żywo",
-    "latency": "Latencja",
-    "poses": "Sylwetki",
-    "no_model_title": "Brak wdrożonego modelu pozy",
-    "no_model_desc": "Wdróż MoveNet Lightning albo YOLOv8n Pose z katalogu serwisów. Model pobierze się automatycznie podczas deploya.",
-    "camera_error": "Nie udało się uruchomić kamery",
-    "inference_error": "Nie udało się policzyć pozy",
-    "models_error": "Nie udało się pobrać listy modeli"
-  },
   "meeting": {
     "title": "Meeting Bot",
     "url_label": "URL spotkania Teams",
     "url_placeholder": "https://teams.microsoft.com/l/meetup-join/...",
     "url_hint": "Wklej pełny URL spotkania Teams. Bot dołącza jako uczestnik.",
     "url_required": "URL spotkania jest wymagany",
+    "stt_no_service": "Brak uruchomionej usługi STT — wdróż silnik STT w Usługach, zanim bot dołączy do spotkania.",
     "join": "Dołącz do spotkania",
     "leave": "Opuść spotkanie",
     "join_success": "Bot dołącza do spotkania...",
@@ -5110,7 +5100,7 @@
     "disclaimer_never": "Wyłączone",
     "sett_pipeline_title": "Pipeline audio",
     "sett_pipeline_sub": "Silnik STT i diaryzacja — zmiany wchodzą dla następnego spotkania.",
-    "sett_stt_hint": "Alias routera, np. whisper-large-v3",
+    "sett_stt_hint": "Alias routera lub nazwa wdrożonej usługi STT (puste = teams-stt)",
     "sett_tts_hint": "Opcjonalne — TTS dla botowych odpowiedzi",
     "sett_diarization": "Diaryzacja",
     "sett_diarization_hint": "Rozpoznawanie kto mówi",
@@ -5124,8 +5114,8 @@
     "sett_ai_sub": "Model LLM dla podsumowania.",
     "sett_llm_hint": "Alias routera, np. qwen-3.5-0.8b",
     "sett_flow": "Flow",
-    "sett_flow_hint": "Flow orchestratora bota. Domyślnie „Default Chat”.",
-    "sett_flow_default": "Domyślny (Default Chat)",
+    "sett_flow_hint": "Flow uruchamiany dla każdej wypowiedzi (STT → LLM → TTS). Domyślnie „Meeting Bot”.",
+    "sett_flow_default": "Domyślny (Meeting Bot)",
     "sett_insights": "Częstotliwość AI insights",
     "sett_insights_hint": "Jak często bot wstawia AI komentarze",
     "insights_auto": "Auto (co 30s lub na action item)",
@@ -5638,7 +5628,6 @@
       "name": "Projekty",
       "desc": "Baza wiedzy, chat i zespół projektu"
     },
-    "badge_soon": "Wkrótce",
     "chat": {
       "name": "Czat",
       "desc": "Rozmowa z lokalnym modelem"
@@ -5647,17 +5636,13 @@
       "name": "ML Studio",
       "desc": "Anotuj i trenuj modele wizyjne"
     },
-    "images": {
-      "name": "Obrazy",
-      "desc": "Generuj obrazy z AI"
+    "benchmark-studio": {
+      "name": "Benchmark Studio",
+      "desc": "Mierz wydajność i jakość modeli"
     },
     "meeting": {
       "name": "Meeting Bot",
       "desc": "Nagrywanie i streszczenia spotkań"
-    },
-    "pose": {
-      "name": "Pozy",
-      "desc": "Podgląd kamery ze szkieletem sylwetki"
     },
     "flows": {
       "name": "Przepływy",
@@ -5685,13 +5670,7 @@
     }
   },
   "coming_soon": {
-    "heading": "Jeszcze niedostępne",
-    "back": "Wróć do aplikacji",
-    "images": "Aplikacja generowania obrazów wymaga silnika image-gen (np. Stable Diffusion, ComfyUI). Poproś administratora o wdrożenie z Katalogu usług.",
-    "meeting": "Meeting Bot wymaga addona teams-bot z OAuth oraz binarnego handlera transkryptów. Pozycja na roadmapie.",
-    "tts": "TTS wymaga wdrożonego silnika TTS i handlera syntezy. Panel reguł TTS dla admina istnieje; ścieżka użytkownika jest na roadmapie.",
-    "translate": "Tłumacz użyje backendu czatu LLM po dodaniu dedykowanego handlera użytkownika. Pozycja na roadmapie.",
-    "search": "Wyszukiwanie po danych jest na roadmapie."
+    "back": "Wróć do aplikacji"
   },
   "profile": {
     "title": "Profil",
@@ -7011,7 +6990,10 @@
     "billing_partial_note": "brak cennika: {count} {count|model|modele|modeli} · koszt częściowy",
     "pricing_title": "Cennik modeli",
     "pricing_hint": "stawki za 1 tys tokenów · audio za minutę · obraz za sztukę · zapis per wiersz",
-    "pricing_formula": "koszt = prompt·st. + completion·st. + audio + obrazy",
+    "pricing_formula": "koszt = prompt·st. + completion·st. + audio + obrazy + embeddingi·st.",
+    "col_price_embedding": "Embedding / 1 tys",
+    "col_usage_missing": "Żądania bez danych o tokenach",
+    "usage_missing_note": "koszt niepełny: {count} {count|żądanie|żądania|żądań} bez danych o tokenach",
     "no_pricing": "Brak modeli do wyceny.",
     "pricing_saved": "Zapisano cennik.",
     "pricing_invalid": "Nieprawidłowe stawki."

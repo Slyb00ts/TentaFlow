@@ -849,6 +849,8 @@ pub struct DbModelMetricsRollup {
     pub e2e_buckets: [i64; 10],
     pub e2e_sample_count: i64,
     pub updated_at: String,
+    /// Successful requests recorded without backend `usage` (tokens unknown).
+    pub usage_missing_count: i64,
 }
 
 /// Cennik per-model (model_pricing) - wiersz tabeli. Edytowany przez admina,
@@ -862,6 +864,7 @@ pub struct DbModelPricing {
     pub audio_per_min: f64,
     pub image_each: f64,
     pub updated_at: String,
+    pub embedding_per_1k: f64,
 }
 
 /// Wymiary (klucz logiczny) jednego kubelka rollupu metryk modelu. `service_key`
@@ -886,6 +889,8 @@ pub struct ModelMetricsCounters {
     pub request_count: i64,
     pub success_count: i64,
     pub error_count: i64,
+    /// Successes without backend `usage` — a subset of `success_count`.
+    pub usage_missing_count: i64,
 }
 
 /// Sumy tokenow/modalnosci dodawane do rollupu przy jednym `bump`.
@@ -936,6 +941,41 @@ pub struct NewModelPricing<'a> {
     pub completion_per_1k: f64,
     pub audio_per_min: f64,
     pub image_each: f64,
+    pub embedding_per_1k: f64,
+}
+
+/// Partial pricing edit: a `None` rate keeps the stored value (deploy-time and
+/// model-selection forms only know some of the rates).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ModelPricingPatch {
+    pub prompt_per_1k: Option<f64>,
+    pub completion_per_1k: Option<f64>,
+    pub audio_per_min: Option<f64>,
+    pub image_each: Option<f64>,
+    pub embedding_per_1k: Option<f64>,
+}
+
+impl ModelPricingPatch {
+    pub fn is_empty(&self) -> bool {
+        self.prompt_per_1k.is_none()
+            && self.completion_per_1k.is_none()
+            && self.audio_per_min.is_none()
+            && self.image_each.is_none()
+            && self.embedding_per_1k.is_none()
+    }
+
+    /// Every supplied rate must be finite and non-negative.
+    pub fn is_valid(&self) -> bool {
+        [
+            self.prompt_per_1k,
+            self.completion_per_1k,
+            self.audio_per_min,
+            self.image_each,
+            self.embedding_per_1k,
+        ]
+        .iter()
+        .all(|v| v.map(|x| x.is_finite() && x >= 0.0).unwrap_or(true))
+    }
 }
 
 /// Parametry aktualizacji wzorca fast path

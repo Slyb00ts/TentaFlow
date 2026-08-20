@@ -376,85 +376,6 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
     })
 }
 
-// --- Teams Bot Wake Words ---
-
-#[derive(Debug, Clone, serde::Serialize)]
-pub struct WakeWord {
-    pub id: i64,
-    pub word: String,
-    pub enabled: bool,
-    pub created_at: String,
-}
-
-/// Lista wszystkich slow aktywujacych (wlaczonych i wylaczonych).
-pub fn list_wake_words(pool: &DbPool) -> Result<Vec<WakeWord>> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn.prepare_cached(
-        "SELECT id, word, enabled, created_at FROM teams_bot_wake_words ORDER BY word",
-    )?;
-    let rows = stmt
-        .query_map([], |r| {
-            Ok(WakeWord {
-                id: r.get(0)?,
-                word: r.get(1)?,
-                enabled: r.get::<_, i64>(2)? != 0,
-                created_at: r.get(3)?,
-            })
-        })?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(rows)
-}
-
-/// Lista samych wlaczonych slow w postaci CSV — uzywane przy spawn bota.
-pub fn enabled_wake_words_csv(pool: &DbPool) -> Result<String> {
-    let conn = acquire(pool)?;
-    let mut stmt = conn
-        .prepare_cached("SELECT word FROM teams_bot_wake_words WHERE enabled = 1 ORDER BY word")?;
-    let words: Vec<String> = stmt
-        .query_map([], |r| r.get::<_, String>(0))?
-        .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(words.join(","))
-}
-
-/// Dodaje slowo (idempotentnie). Zwraca id istniejacego/nowego rekordu.
-pub fn add_wake_word(pool: &DbPool, word: &str) -> Result<i64> {
-    let trimmed = word.trim();
-    if trimmed.is_empty() {
-        anyhow::bail!("wake_word puste");
-    }
-    let conn = acquire(pool)?;
-    conn.execute(
-        "INSERT OR IGNORE INTO teams_bot_wake_words (word, enabled) VALUES (?1, 1)",
-        rusqlite::params![trimmed],
-    )?;
-    let id: i64 = conn.query_row(
-        "SELECT id FROM teams_bot_wake_words WHERE word = ?1",
-        rusqlite::params![trimmed],
-        |r| r.get(0),
-    )?;
-    Ok(id)
-}
-
-/// Usuwa slowo po id.
-pub fn delete_wake_word(pool: &DbPool, id: i64) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "DELETE FROM teams_bot_wake_words WHERE id = ?1",
-        rusqlite::params![id],
-    )?;
-    Ok(())
-}
-
-/// Toggle enabled/disabled. Zwraca nowy stan.
-pub fn set_wake_word_enabled(pool: &DbPool, id: i64, enabled: bool) -> Result<()> {
-    let conn = acquire(pool)?;
-    conn.execute(
-        "UPDATE teams_bot_wake_words SET enabled = ?2 WHERE id = ?1",
-        rusqlite::params![id, if enabled { 1 } else { 0 }],
-    )?;
-    Ok(())
-}
-
 // --- API Keys ---
 
 const API_KEY_COLS: &str = "id, uid, key_verifier, key_prefix, name, key_type, subject_id, \
@@ -6206,7 +6127,7 @@ pub fn reseed_core_state_from_current_rows(
             K::ModelPricing => {
                 let mut stmt = tx.prepare(
                     "SELECT id, model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, \
-                            image_each FROM model_pricing",
+                            image_each, embedding_per_1k FROM model_pricing",
                 )?;
                 let rows = stmt
                     .query_map([], |r| {
@@ -6218,6 +6139,7 @@ pub fn reseed_core_state_from_current_rows(
                             r.get::<_, f64>(4)?,
                             r.get::<_, f64>(5)?,
                             r.get::<_, f64>(6)?,
+                            r.get::<_, f64>(7)?,
                         ))
                     })?
                     .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -6229,6 +6151,7 @@ pub fn reseed_core_state_from_current_rows(
                     completion_per_1k,
                     audio_per_min,
                     image_each,
+                    embedding_per_1k,
                 ) in rows
                 {
                     record_core_capture_for_org_tx(
@@ -6244,6 +6167,7 @@ pub fn reseed_core_state_from_current_rows(
                             completion_per_1k,
                             audio_per_min,
                             image_each,
+                            embedding_per_1k,
                         }),
                         None,
                     )?;
@@ -10451,7 +10375,7 @@ const MODEL_METRICS_COLS: &str = "id, node_id, org_id, user_id, model_id, servic
     decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
     decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
     e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
-    e2e_sample_count, updated_at";
+    e2e_sample_count, updated_at, usage_missing_count";
 
 fn row_to_model_metrics_rollup(
     r: &rusqlite::Row<'_>,
@@ -10518,6 +10442,7 @@ fn row_to_model_metrics_rollup(
         ],
         e2e_sample_count: r.get(53)?,
         updated_at: r.get(54)?,
+        usage_missing_count: r.get(55)?,
     })
 }
 
@@ -10574,6 +10499,10 @@ pub fn model_metrics_changed_fields(
         FieldValue::I64(row.success_count),
     );
     fields.insert("error_count".to_string(), FieldValue::I64(row.error_count));
+    fields.insert(
+        "usage_missing_count".to_string(),
+        FieldValue::I64(row.usage_missing_count),
+    );
     fields.insert(
         "prompt_tokens".to_string(),
         FieldValue::I64(row.prompt_tokens),
@@ -10653,13 +10582,15 @@ pub fn bump_model_metrics_rollup(
          (id, node_id, org_id, user_id, model_id, service_key, backend, modality, hour_bucket, \
           histogram_version, request_count, success_count, error_count, \
           prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
-          prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, updated_at) \
+          prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, \
+          usage_missing_count, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-          ?19, ?20, ?21, ?22, ?23, strftime('%Y-%m-%d %H:%M:%f','now')) \
+          ?19, ?20, ?21, ?22, ?23, ?24, strftime('%Y-%m-%d %H:%M:%f','now')) \
          ON CONFLICT(id) DO UPDATE SET \
          request_count = request_count + excluded.request_count, \
          success_count = success_count + excluded.success_count, \
          error_count = error_count + excluded.error_count, \
+         usage_missing_count = usage_missing_count + excluded.usage_missing_count, \
          prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
          completion_tokens = completion_tokens + excluded.completion_tokens, \
          total_tokens = total_tokens + excluded.total_tokens, \
@@ -10696,6 +10627,7 @@ pub fn bump_model_metrics_rollup(
             times.decode_secs,
             times.e2e_latency_ms,
             times.queue_ms,
+            counters.usage_missing_count,
         ],
     )?;
     if let Some(ttft) = perf.ttft_ms {
@@ -10850,6 +10782,10 @@ pub fn model_pricing_changed_fields(
     );
     fields.insert("audio_per_min".to_string(), field_f64(params.audio_per_min));
     fields.insert("image_each".to_string(), field_f64(params.image_each));
+    fields.insert(
+        "embedding_per_1k".to_string(),
+        field_f64(params.embedding_per_1k),
+    );
     fields
 }
 
@@ -10864,12 +10800,14 @@ pub fn upsert_model_pricing(
     let id = model_pricing_id(params.org_id, params.model_id);
     tx.execute(
         "INSERT INTO model_pricing \
-         (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
+         (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
+          embedding_per_1k, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, strftime('%Y-%m-%d %H:%M:%f','now')) \
          ON CONFLICT(id) DO UPDATE SET \
          org_id = excluded.org_id, model_id = excluded.model_id, prompt_per_1k = excluded.prompt_per_1k, \
          completion_per_1k = excluded.completion_per_1k, audio_per_min = excluded.audio_per_min, \
-         image_each = excluded.image_each, updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+         image_each = excluded.image_each, embedding_per_1k = excluded.embedding_per_1k, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
         rusqlite::params![
             id,
             params.org_id,
@@ -10878,6 +10816,7 @@ pub fn upsert_model_pricing(
             params.completion_per_1k,
             params.audio_per_min,
             params.image_each,
+            params.embedding_per_1k,
         ],
     )?;
     record_core_capture_for_org_tx(
@@ -10905,38 +10844,33 @@ pub fn upsert_model_pricing_merge(
     pool: &DbPool,
     org_id: &str,
     model_id: &str,
-    prompt_per_1k: Option<f64>,
-    completion_per_1k: Option<f64>,
-    audio_per_min: Option<f64>,
-    image_each: Option<f64>,
+    patch: &crate::db::models::ModelPricingPatch,
 ) -> Result<bool> {
-    if prompt_per_1k.is_none()
-        && completion_per_1k.is_none()
-        && audio_per_min.is_none()
-        && image_each.is_none()
-    {
+    if patch.is_empty() {
         return Ok(false);
     }
     let existing = get_model_pricing(pool, org_id, model_id)?;
-    let (ep, ec, ea, ei) = existing
+    let (ep, ec, ea, ei, ee) = existing
         .map(|r| {
             (
                 r.prompt_per_1k,
                 r.completion_per_1k,
                 r.audio_per_min,
                 r.image_each,
+                r.embedding_per_1k,
             )
         })
-        .unwrap_or((0.0, 0.0, 0.0, 0.0));
+        .unwrap_or((0.0, 0.0, 0.0, 0.0, 0.0));
     upsert_model_pricing(
         pool,
         &crate::db::models::NewModelPricing {
             model_id,
             org_id,
-            prompt_per_1k: prompt_per_1k.unwrap_or(ep),
-            completion_per_1k: completion_per_1k.unwrap_or(ec),
-            audio_per_min: audio_per_min.unwrap_or(ea),
-            image_each: image_each.unwrap_or(ei),
+            prompt_per_1k: patch.prompt_per_1k.unwrap_or(ep),
+            completion_per_1k: patch.completion_per_1k.unwrap_or(ec),
+            audio_per_min: patch.audio_per_min.unwrap_or(ea),
+            image_each: patch.image_each.unwrap_or(ei),
+            embedding_per_1k: patch.embedding_per_1k.unwrap_or(ee),
         },
     )?;
     Ok(true)
@@ -10951,7 +10885,7 @@ pub fn get_model_pricing(
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
-         updated_at FROM model_pricing WHERE org_id = ?1 AND model_id = ?2",
+         updated_at, embedding_per_1k FROM model_pricing WHERE org_id = ?1 AND model_id = ?2",
     )?;
     let row = stmt
         .query_row(rusqlite::params![org_id, model_id], |r| {
@@ -10963,6 +10897,7 @@ pub fn get_model_pricing(
                 audio_per_min: r.get(4)?,
                 image_each: r.get(5)?,
                 updated_at: r.get(6)?,
+                embedding_per_1k: r.get(7)?,
             })
         })
         .optional()?;
@@ -10977,7 +10912,7 @@ pub fn list_model_pricing(
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
         "SELECT model_id, org_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
-         updated_at FROM model_pricing WHERE org_id = ?1 ORDER BY model_id",
+         updated_at, embedding_per_1k FROM model_pricing WHERE org_id = ?1 ORDER BY model_id",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![org_id], |r| {
@@ -10989,6 +10924,7 @@ pub fn list_model_pricing(
                 audio_per_min: r.get(4)?,
                 image_each: r.get(5)?,
                 updated_at: r.get(6)?,
+                embedding_per_1k: r.get(7)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -15142,6 +15078,7 @@ pub fn cleanup_old_voice_temp_speakers(pool: &DbPool, older_than_days: i64) -> R
 pub mod transcripts {
     use super::DbPool;
     use anyhow::Result;
+    use rusqlite::OptionalExtension;
     use serde::Serialize;
 
     #[derive(Debug, Clone, Serialize)]
@@ -15173,6 +15110,13 @@ pub mod transcripts {
         pub backend_streaming_latency_ms: Option<i64>,
         pub backend_enrolled_speakers: Option<i64>,
         pub backend_total_participants: Option<i64>,
+        /// Effective pipeline of this session, written once at spawn so a
+        /// FlowInvoke turn resolves models by session key instead of by env
+        /// passed to the bot. `None` only on rows created before migration 131.
+        pub stt_alias: Option<String>,
+        pub llm_alias: Option<String>,
+        pub tts_alias: Option<String>,
+        pub flow_id: Option<String>,
     }
 
     #[derive(Debug, Clone, Serialize)]
@@ -15223,7 +15167,8 @@ pub mod transcripts {
          s.lifecycle_stage, s.lifecycle_details, s.lifecycle_updated_at, \
          s.backend_stt_model, s.backend_tts_model, s.backend_summarization_model, \
          s.backend_diarization_model, s.backend_streaming_latency_ms, \
-         s.backend_enrolled_speakers, s.backend_total_participants";
+         s.backend_enrolled_speakers, s.backend_total_participants, \
+         s.stt_alias, s.llm_alias, s.tts_alias, s.flow_id";
 
     fn row_to_session(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionRow> {
         Ok(SessionRow {
@@ -15254,6 +15199,10 @@ pub mod transcripts {
             backend_streaming_latency_ms: row.get(24)?,
             backend_enrolled_speakers: row.get(25)?,
             backend_total_participants: row.get(26)?,
+            stt_alias: row.get(27)?,
+            llm_alias: row.get(28)?,
+            tts_alias: row.get(29)?,
+            flow_id: row.get(30)?,
         })
     }
 
@@ -15408,6 +15357,44 @@ pub mod transcripts {
             .query_row(&sql, rusqlite::params![id], row_to_session)
             .ok();
         Ok(row)
+    }
+
+    /// Full session row by `meeting_key` — the key a bot puts in every
+    /// reverse request, so the FlowInvoke path can verify ownership and read
+    /// the session pipeline in one query.
+    pub fn get_session_by_meeting_key(
+        pool: &DbPool,
+        meeting_key: &str,
+    ) -> Result<Option<SessionRow>> {
+        let conn = pool.read().unwrap();
+        let sql = format!(
+            "SELECT {} FROM meeting_sessions s WHERE s.meeting_key = ?1",
+            SESSION_COLS
+        );
+        let row = conn
+            .query_row(&sql, rusqlite::params![meeting_key], row_to_session)
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Persists the effective STT/LLM/TTS aliases and flow id of a session.
+    /// Called once from `start_session` after the defaults were resolved.
+    pub fn update_session_pipeline(
+        pool: &DbPool,
+        id: i64,
+        stt_alias: &str,
+        llm_alias: &str,
+        tts_alias: &str,
+        flow_id: &str,
+    ) -> Result<()> {
+        let conn = pool.write().unwrap();
+        conn.execute(
+            "UPDATE meeting_sessions
+             SET stt_alias = ?2, llm_alias = ?3, tts_alias = ?4, flow_id = ?5
+             WHERE id = ?1",
+            rusqlite::params![id, stt_alias, llm_alias, tts_alias, flow_id],
+        )?;
+        Ok(())
     }
 
     // =========================================================================
@@ -26432,6 +26419,7 @@ mod token_metrics_tests {
             request_count: 1,
             success_count: 1,
             error_count: 0,
+            usage_missing_count: 0,
         };
         let tokens = crate::db::models::ModelMetricsTokens {
             prompt_tokens: 10,
@@ -26494,6 +26482,7 @@ mod token_metrics_tests {
             request_count: 1,
             success_count: 1,
             error_count: 0,
+            usage_missing_count: 0,
         };
         let tokens = crate::db::models::ModelMetricsTokens::default();
         let times = crate::db::models::ModelMetricsTimes::default();
@@ -26525,6 +26514,7 @@ mod token_metrics_tests {
                 completion_per_1k: 1.5,
                 audio_per_min: 0.1,
                 image_each: 0.04,
+                embedding_per_1k: 0.02,
             },
         )
         .unwrap();
@@ -26542,6 +26532,7 @@ mod token_metrics_tests {
                 completion_per_1k: 2.0,
                 audio_per_min: 0.1,
                 image_each: 0.04,
+                embedding_per_1k: 0.02,
             },
         )
         .unwrap();
@@ -26550,6 +26541,86 @@ mod token_metrics_tests {
             .unwrap();
         assert_eq!(pricing.prompt_per_1k, 0.9);
         assert_eq!(pricing.completion_per_1k, 2.0);
+        assert_eq!(pricing.embedding_per_1k, 0.02);
+    }
+
+    #[test]
+    fn model_pricing_merge_keeps_unset_rates() {
+        let pool = fresh_db();
+        upsert_model_pricing(
+            &pool,
+            &crate::db::models::NewModelPricing {
+                model_id: "emb",
+                org_id: DEFAULT_ORG_ID,
+                prompt_per_1k: 0.0,
+                completion_per_1k: 0.0,
+                audio_per_min: 0.0,
+                image_each: 0.0,
+                embedding_per_1k: 0.05,
+            },
+        )
+        .unwrap();
+        let changed = upsert_model_pricing_merge(
+            &pool,
+            DEFAULT_ORG_ID,
+            "emb",
+            &crate::db::models::ModelPricingPatch {
+                prompt_per_1k: Some(0.3),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(changed);
+        let pricing = get_model_pricing(&pool, DEFAULT_ORG_ID, "emb")
+            .unwrap()
+            .unwrap();
+        assert_eq!(pricing.prompt_per_1k, 0.3);
+        assert_eq!(pricing.embedding_per_1k, 0.05);
+        // An all-None patch must not create/touch a row.
+        assert!(!upsert_model_pricing_merge(
+            &pool,
+            DEFAULT_ORG_ID,
+            "other",
+            &crate::db::models::ModelPricingPatch::default(),
+        )
+        .unwrap());
+        assert!(get_model_pricing(&pool, DEFAULT_ORG_ID, "other")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bump_accumulates_usage_missing_count() {
+        let pool = fresh_db();
+        let dims = metrics_dims();
+        let tokens = crate::db::models::ModelMetricsTokens::default();
+        let times = crate::db::models::ModelMetricsTimes::default();
+        let perf = crate::db::models::ModelMetricsPerfSamples::default();
+        let missing = crate::db::models::ModelMetricsCounters {
+            request_count: 1,
+            success_count: 1,
+            error_count: 0,
+            usage_missing_count: 1,
+        };
+        let error = crate::db::models::ModelMetricsCounters {
+            request_count: 1,
+            success_count: 0,
+            error_count: 1,
+            usage_missing_count: 0,
+        };
+        bump_model_metrics_rollup(&pool, &dims, &missing, &tokens, &times, &perf).unwrap();
+        bump_model_metrics_rollup(&pool, &dims, &missing, &tokens, &times, &perf).unwrap();
+        bump_model_metrics_rollup(&pool, &dims, &error, &tokens, &times, &perf).unwrap();
+        let rows = list_model_metrics_rollup(
+            &pool,
+            DEFAULT_ORG_ID,
+            &crate::db::models::ModelMetricsFilter::default(),
+        )
+        .unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_count, 3);
+        assert_eq!(rows[0].error_count, 1);
+        assert_eq!(rows[0].usage_missing_count, 2);
     }
 
     #[test]
@@ -26574,6 +26645,7 @@ mod token_metrics_tests {
                 completion_per_1k: 2.0,
                 audio_per_min: 0.0,
                 image_each: 0.0,
+                embedding_per_1k: 0.0,
             },
         )
         .unwrap();
@@ -26586,6 +26658,7 @@ mod token_metrics_tests {
                 completion_per_1k: 8.0,
                 audio_per_min: 0.0,
                 image_each: 0.0,
+                embedding_per_1k: 0.0,
             },
         )
         .unwrap();

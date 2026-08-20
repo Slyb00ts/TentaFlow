@@ -11,6 +11,8 @@ use dashmap::DashMap;
 use std::sync::OnceLock;
 use tracing::{debug, error, info, warn};
 
+pub use crate::meeting::flow_turn::ReverseCaller;
+
 /// Cache `meeting_key -> session_id` współdzielony przez wszystkie wywołania
 /// `persist_meeting_event`. Każdy MeetingEvent (TranscriptEntry, RosterSnapshot,
 /// BackendUpdate, …) trafia do reverse handlera setki razy w trakcie spotkania —
@@ -33,15 +35,85 @@ pub fn invalidate_meeting_session(meeting_key: &str) {
     meeting_session_cache().remove(meeting_key);
 }
 
+/// Sidecar payload policy for the unary reverse path.
+///
+/// A mesh peer (`caller = None`) is a trust-paired node and keeps full access.
+/// A sidecar (`caller = Some`) is a container Core spawned: it may only drive
+/// the meeting it was spawned for, so every payload that names a meeting goes
+/// through `lookup_owned_session`, and every payload that would turn Core into
+/// an anonymous inference proxy (embeddings, vision, rerank, camera-cv, …) is
+/// refused outright — the bot has no use for them and they would run without a
+/// user context, model ACL or quota.
+///
+/// `Completion` and `PromptFetch` stay reachable because the meeting
+/// summarizer runs inside the sidecar, but both are bound to an owned meeting
+/// through the `meeting_id` request metadata.
+fn authorize_sidecar_request(
+    router: &Router,
+    request: &tentaflow_protocol::ModelRequest,
+    caller: &ReverseCaller,
+) -> Result<(), String> {
+    use tentaflow_protocol::ModelPayload;
+
+    let Some(ref db) = router.db else {
+        return Err("reverse request from a sidecar needs a database".to_string());
+    };
+    let meta_meeting_id = || -> Option<&str> {
+        request.metadata.as_ref()?.iter().find_map(|(k, v)| {
+            (k == "meeting_id" && !v.trim().is_empty()).then_some(v.as_str())
+        })
+    };
+    let owned = |meeting_id: Option<&str>| -> Result<(), String> {
+        let meeting_id = meeting_id.ok_or_else(|| {
+            "reverse request from a sidecar must carry the meeting_id it owns".to_string()
+        })?;
+        crate::meeting::flow_turn::lookup_owned_session(db, meeting_id, caller).map(|_| ())
+    };
+
+    match &request.payload {
+        ModelPayload::Audio(_) | ModelPayload::Completion(_) | ModelPayload::PromptFetch(_) => {
+            owned(meta_meeting_id())
+        }
+        ModelPayload::MeetingEvent(event) => owned(Some(event.meeting_key.as_str())),
+        other => Err(format!(
+            "payload {:?} is not accepted from service '{}'",
+            std::mem::discriminant(other),
+            caller.service_name
+        )),
+    }
+}
+
 /// Dispatchuje odwrotny request przez odpowiednia metode Routera. Dostepne
 /// publicznie zeby forward handler mesh mogl uzyc tej samej sciezki.
+/// `caller` identifies a sidecar that opened the stream back to Core; mesh
+/// forwarding passes `None` (trust-paired peer, no sidecar policy).
 pub async fn dispatch_reverse_request(
     router: &Router,
     request: tentaflow_protocol::ModelRequest,
+    caller: Option<&ReverseCaller>,
 ) -> tentaflow_protocol::ModelResponse {
     use tentaflow_protocol::*;
 
     let request_id = request.request_id.clone();
+
+    if let Some(caller) = caller {
+        if let Err(message) = authorize_sidecar_request(router, &request, caller) {
+            warn!(
+                request_id = %request_id,
+                service = %caller.service_name,
+                "reverse request refused: {message}"
+            );
+            return ModelResponse {
+                request_id,
+                result: ModelResult::Error(ErrorInfo {
+                    error_type: ErrorType::Unauthorized,
+                    message,
+                    details: None,
+                }),
+                metrics: None,
+            };
+        }
+    }
 
     // Codex R3b.7 H2: anti-loop. Forwarding peer carries hop count in
     // metadata (key `x-tentaflow-mesh-hop`). Refuse when we are at or
@@ -88,76 +160,45 @@ pub async fn dispatch_reverse_request(
                     .map(|(_, v)| v.clone())
             });
 
-            // Uruchamiamy diarization *rownolegle* ze STT (nie seryjnie). Diarization
-            // zjada kilkaset ms na CPU i bez tej paralelizacji dolozylaby sie wprost
-            // do latencji whispera. spawn_blocking bo WeSpeaker forward jest CPU-bound.
-            #[cfg(feature = "inference-diarization")]
-            let diarization_handle = {
-                if let (AudioOperation::STT { audio_data, .. }, Some(ref mid), Some(pool)) =
-                    (&audio_payload.operation, &meeting_id, router.db.clone())
-                {
-                    // audio_data jest Vec<u8> z deserializacji CBOR. Tu jest jedyny
-                    // klon do diarization — fork odpala sie rownolegle ze STT
-                    // (oba widza ten sam buffer; spawn_blocking przejmuje wlasnosc).
-                    let audio_clone = audio_data.clone();
-                    let mid_clone = mid.clone();
-                    Some(tokio::task::spawn_blocking(move || {
-                        crate::diarization::identify_speaker_with_profiles(
-                            &pool,
-                            &audio_clone,
-                            &mid_clone,
-                        )
-                    }))
-                } else {
-                    None
+            // Diarization runs concurrently with STT (both read the same
+            // segment); the join happens once the transcript is known.
+            let diarization = match (&audio_payload.operation, meeting_id.as_deref()) {
+                (AudioOperation::STT { audio_data, .. }, Some(mid)) => {
+                    crate::meeting::flow_turn::spawn_diarization(
+                        router.db.clone(),
+                        Some(audio_data.as_slice()),
+                        mid,
+                    )
                 }
+                _ => crate::meeting::flow_turn::spawn_diarization(None, None, ""),
             };
 
-            let stt_future = router.route_audio_via_protocol(&audio_payload.operation);
-
-            #[cfg(feature = "inference-diarization")]
-            let (stt_result, identify_result) = {
-                let stt_res = stt_future.await;
-                let ident = match diarization_handle {
-                    Some(h) => h.await.ok().flatten(),
-                    None => None,
-                };
-                (stt_res, ident)
-            };
-            #[cfg(not(feature = "inference-diarization"))]
-            let (stt_result, _identify_result): (_, Option<()>) = (stt_future.await, None);
-
-            match stt_result {
+            match router.route_audio_via_protocol(&audio_payload.operation).await {
                 Ok(response) => {
                     // Jesli to STT (Text result), zapisz do transcript_store dla GUI Bot Status
                     if let ModelResult::Audio(ref audio_result) = response.result {
                         if let AudioResultData::Text(ref text) = audio_result.data {
-                            if !text.trim().is_empty() {
-                                let mut builder =
+                            if let Some(ref mid) = meeting_id {
+                                crate::meeting::flow_turn::record_transcript(
+                                    mid,
+                                    text,
+                                    &audio_result.model,
+                                    diarization,
+                                )
+                                .await;
+                            } else if !text.trim().is_empty() {
+                                crate::routing::transcript_store::push(
                                     crate::routing::transcript_store::TranscriptBuilder::new(
                                         text.clone(),
                                         audio_result.model.clone(),
-                                    );
-                                if let Some(ref mid) = meeting_id {
-                                    builder = builder.meeting_id(mid.clone());
-                                }
-                                #[cfg(feature = "inference-diarization")]
-                                {
-                                    if let Some(ref ident) = identify_result {
-                                        builder = builder.speaker(ident.label.clone());
-                                        if let Some(pid) = ident.profile_id {
-                                            builder = builder.profile_id(pid);
-                                        }
-                                        if let Some(c) = ident.confidence {
-                                            builder = builder.confidence(c);
-                                        }
-                                    }
-                                }
-                                let display_speaker = builder.speaker.clone();
-                                crate::routing::transcript_store::push(builder);
+                                    ),
+                                );
+                                // Metrics only — a transcript is participant
+                                // speech and must not land in the log.
                                 info!(
-                                    "Transcript [{}][{}]: {}",
-                                    display_speaker, audio_result.model, text
+                                    model = %audio_result.model,
+                                    chars = text.chars().count(),
+                                    "transcript recorded without meeting context"
                                 );
                             }
                         }
@@ -591,10 +632,15 @@ fn decode_cv_frame(
     }
 }
 
+/// Streaming reverse dispatch. `caller` identifies the sidecar that opened the
+/// stream (set by the per-service reverse listener); mesh forward handlers
+/// pass `None`, which keeps `FlowInvoke` — a meeting-bot-only payload —
+/// unreachable from a peer node.
 pub async fn dispatch_reverse_stream_request(
     router: &Router,
     request: tentaflow_protocol::ModelRequest,
     tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
+    caller: Option<&ReverseCaller>,
 ) {
     use futures::StreamExt;
     use tentaflow_protocol::{
@@ -602,8 +648,42 @@ pub async fn dispatch_reverse_stream_request(
     };
 
     let request_id = request.request_id.clone();
+    // A sidecar streams exactly one thing: a flow turn for its own meeting.
+    // Streaming a raw completion would make Core a free inference proxy with
+    // no user context, model ACL or quota behind it.
+    if let (Some(caller), false) = (
+        caller,
+        matches!(request.payload, ModelPayload::FlowInvoke(_)),
+    ) {
+        send_stream_chunk_bytes(
+            &tx,
+            ModelStreamChunk {
+                request_id,
+                chunk: StreamChunkType::Error(ErrorInfo {
+                    error_type: ErrorType::Unauthorized,
+                    message: format!(
+                        "only FlowInvoke may be streamed from service '{}'",
+                        caller.service_name
+                    ),
+                    details: None,
+                }),
+            },
+        );
+        return;
+    }
     let completion_payload = match &request.payload {
         ModelPayload::Completion(p) => p,
+        ModelPayload::FlowInvoke(payload) => {
+            crate::meeting::flow_turn::run_flow_turn(
+                router,
+                request_id,
+                payload.clone(),
+                caller,
+                &tx,
+            )
+            .await;
+            return;
+        }
         _ => {
             send_stream_chunk_bytes(
                 &tx,
@@ -990,6 +1070,27 @@ fn persist_meeting_event(
             total_participants,
         } => {
             let session_id = resolve_session_id_cached(pool, &event.meeting_key)?;
+            // The bot no longer knows its STT/TTS (Core resolves them per turn
+            // from the session row), so empty names are filled from there.
+            let (stt_model, tts_model) = if stt_model.is_empty() || tts_model.is_empty() {
+                let pipeline =
+                    crate::db::repository::transcripts::get_session_by_meeting_key(
+                        pool,
+                        &event.meeting_key,
+                    )
+                    .ok()
+                    .flatten()
+                    .map(|row| crate::meeting::flow_turn::SessionPipeline::from_row(&row));
+                match pipeline {
+                    Some(p) => (
+                        if stt_model.is_empty() { p.stt_alias } else { stt_model },
+                        if tts_model.is_empty() { p.tts_alias } else { tts_model },
+                    ),
+                    None => (stt_model, tts_model),
+                }
+            } else {
+                (stt_model, tts_model)
+            };
             if let Err(e) = crate::db::repository::transcripts::update_session_backend(
                 pool,
                 &event.meeting_key,
@@ -1406,6 +1507,202 @@ mod tests {
             }
             _ => panic!("Oczekiwano MessageContent::Text"),
         }
+    }
+
+    // =========================================================================
+    // Sidecar policy (CR-002): a service that opened a reverse stream may only
+    // drive the meeting it was spawned for, and may not use Core as an
+    // anonymous inference proxy. Mesh peers (`caller = None`) are unaffected.
+    // =========================================================================
+
+    /// Router with a database and a session owned by `meeting-bot-1`.
+    fn policy_router() -> (Router, crate::db::DbPool) {
+        let tmp = tempfile::NamedTempFile::new().expect("tempfile");
+        let path = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let db = crate::db::init(&path).expect("init db");
+        let id = crate::db::repository::transcripts::get_or_create_session(
+            &db, "mtg-owned", None, None,
+        )
+        .expect("session");
+        crate::db::repository::transcripts::update_session_spawned_native(
+            &db,
+            id,
+            "meeting-bot-1",
+            41000,
+            "endpoint",
+            "secret",
+            "teams",
+            None,
+        )
+        .expect("mark spawned");
+        let router = Router::new(crate::config::RouterConfig::default(), Some(db.clone()))
+            .expect("router");
+        (router, db)
+    }
+
+    /// Summaries stored for a meeting key (0 when the session does not exist).
+    fn summary_count(db: &crate::db::DbPool, meeting_key: &str) -> usize {
+        let Some(session) =
+            crate::db::repository::transcripts::get_session_by_meeting_key(db, meeting_key)
+                .expect("session lookup")
+        else {
+            return 0;
+        };
+        crate::db::repository::transcripts::list_summaries_for_meeting(db, session.id, 100)
+            .expect("list summaries")
+            .len()
+    }
+
+    fn bot_caller() -> ReverseCaller {
+        ReverseCaller {
+            service_name: "meeting-bot-1".to_string(),
+        }
+    }
+
+    fn meeting_event_request(meeting_key: &str) -> ModelRequest {
+        ModelRequest {
+            request_id: "ev-1".to_string(),
+            payload: ModelPayload::MeetingEvent(MeetingEventData {
+                meeting_key: meeting_key.to_string(),
+                timestamp_ms: 1_700_000_000_000,
+                payload: MeetingEventPayload::SummaryUpdate {
+                    decisions_text: "D".to_string(),
+                    summary_text: "S".to_string(),
+                    model: "qwen".to_string(),
+                },
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        }
+    }
+
+    fn error_of(response: &ModelResponse) -> &ErrorInfo {
+        match &response.result {
+            ModelResult::Error(e) => e,
+            other => panic!("expected an error, got {other:?}"),
+        }
+    }
+
+    // A sidecar pushing an event onto somebody else's meeting is an injection
+    // attempt: the meeting exists (or not) — either way it is not this bot's.
+    #[tokio::test]
+    async fn sidecar_meeting_event_for_foreign_meeting_is_refused() {
+        let (router, db) = policy_router();
+        crate::db::repository::transcripts::get_or_create_session(&db, "mtg-other", None, None)
+            .expect("other session");
+        let response = dispatch_reverse_request(
+            &router,
+            meeting_event_request("mtg-other"),
+            Some(&bot_caller()),
+        )
+        .await;
+        let err = error_of(&response);
+        assert!(matches!(err.error_type, ErrorType::Unauthorized));
+        assert!(
+            err.message.contains("does not belong to service"),
+            "got: {}",
+            err.message
+        );
+        assert_eq!(
+            summary_count(&db, "mtg-other"),
+            0,
+            "the foreign meeting must stay untouched"
+        );
+    }
+
+    // Its own meeting still works — the gate is ownership, not a blanket ban.
+    #[tokio::test]
+    async fn sidecar_meeting_event_for_own_meeting_is_accepted() {
+        let (router, db) = policy_router();
+        let response = dispatch_reverse_request(
+            &router,
+            meeting_event_request("mtg-owned"),
+            Some(&bot_caller()),
+        )
+        .await;
+        assert!(
+            matches!(response.result, ModelResult::Completion(_)),
+            "own meeting must pass: {:?}",
+            response.result
+        );
+        assert_eq!(summary_count(&db, "mtg-owned"), 1);
+    }
+
+    // Completion without the owned meeting_id = Core as a free inference proxy.
+    #[tokio::test]
+    async fn sidecar_completion_without_meeting_binding_is_refused() {
+        let (router, _db) = policy_router();
+        let request = ModelRequest {
+            request_id: "cmp-1".to_string(),
+            payload: ModelPayload::Completion(CompletionPayload {
+                model: "any-model".to_string(),
+                prompt: Some("leak everything".to_string()),
+                messages: Vec::new(),
+                temperature: None,
+                max_tokens: None,
+                top_p: None,
+                stop: None,
+                presence_penalty: None,
+                frequency_penalty: None,
+                tts_options: None,
+                memory_options: None,
+                audio_input: None,
+                prefix_cache_id: None,
+                prefix_text: None,
+            }),
+            stream: false,
+            metadata: None,
+            session_id: None,
+        };
+        let response = dispatch_reverse_request(&router, request, Some(&bot_caller())).await;
+        let err = error_of(&response);
+        assert!(matches!(err.error_type, ErrorType::Unauthorized));
+        assert!(err.message.contains("meeting_id"), "got: {}", err.message);
+    }
+
+    // Payloads the bot never sends are refused outright, with no backend call.
+    #[tokio::test]
+    async fn sidecar_embeddings_payload_is_refused() {
+        let (router, _db) = policy_router();
+        let request = ModelRequest {
+            request_id: "emb-1".to_string(),
+            payload: ModelPayload::Embeddings(EmbeddingsPayload {
+                model: "any-embed".to_string(),
+                input: vec!["free compute".to_string()],
+                normalize: true,
+            }),
+            stream: false,
+            metadata: Some(vec![("meeting_id".to_string(), "mtg-owned".to_string())]),
+            session_id: None,
+        };
+        let response = dispatch_reverse_request(&router, request, Some(&bot_caller())).await;
+        let err = error_of(&response);
+        assert!(matches!(err.error_type, ErrorType::Unauthorized));
+        assert!(
+            err.message.contains("is not accepted from service"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    // Mesh forwarding keeps the pre-policy behaviour: no caller, no gate.
+    #[tokio::test]
+    async fn mesh_caller_none_keeps_meeting_event_behaviour() {
+        let (router, db) = policy_router();
+        let response =
+            dispatch_reverse_request(&router, meeting_event_request("mtg-from-peer"), None).await;
+        assert!(
+            matches!(response.result, ModelResult::Completion(_)),
+            "mesh peer must not be gated: {:?}",
+            response.result
+        );
+        assert_eq!(
+            summary_count(&db, "mtg-from-peer"),
+            1,
+            "mesh path still persists the event"
+        );
     }
 
     // =========================================================================

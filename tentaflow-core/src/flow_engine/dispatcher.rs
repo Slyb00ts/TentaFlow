@@ -90,11 +90,19 @@ pub enum DispatchError {
     Unsupported { service_type: String, model: String },
     #[error("flow dispatch internal: {0}")]
     Internal(String),
+    /// No running STT service on this node (typed so the edge answers 503).
+    #[error("{}", crate::error::CoreError::SttServiceUnavailable)]
+    SttServiceUnavailable,
 }
 
 impl From<anyhow::Error> for DispatchError {
     fn from(e: anyhow::Error) -> Self {
-        DispatchError::Internal(e.to_string())
+        match e.downcast_ref::<crate::error::CoreError>() {
+            Some(crate::error::CoreError::SttServiceUnavailable) => {
+                DispatchError::SttServiceUnavailable
+            }
+            _ => DispatchError::Internal(e.to_string()),
+        }
     }
 }
 
@@ -140,6 +148,9 @@ pub enum FlowOrigin {
     Addon,
     /// Camera analysis pipeline (no human in the loop).
     Camera,
+    /// Meeting Bot turn. The bot drives the flow, but a person invited it to the
+    /// meeting, so the actor is that owner and not the sidecar.
+    Meeting,
     /// Admin scheduler tick.
     Scheduler,
     /// Reverse mesh path — a peer node forwarded the request.
@@ -163,6 +174,7 @@ impl FlowOrigin {
             FlowOrigin::Api => "api",
             FlowOrigin::Addon => "addon",
             FlowOrigin::Camera => "camera",
+            FlowOrigin::Meeting => "meeting",
             FlowOrigin::Scheduler => "scheduler",
             FlowOrigin::Mesh => "mesh",
             FlowOrigin::Agent => "agent",
@@ -183,6 +195,7 @@ impl FlowOrigin {
             "api" => FlowOrigin::Api,
             "addon" => FlowOrigin::Addon,
             "camera" => FlowOrigin::Camera,
+            "meeting" => FlowOrigin::Meeting,
             "scheduler" => FlowOrigin::Scheduler,
             "mesh" => FlowOrigin::Mesh,
             "agent" => FlowOrigin::Agent,
@@ -1319,11 +1332,15 @@ fn wrap_blocking_as_stream(
         }
     })
     .boxed();
+    // No producer ran here — the final envelope is the closest equivalent, it
+    // carries the meta every node wrote on the way.
+    let producer_input = Arc::new(outcome.final_envelope.clone());
     let (tx, rx) = tokio::sync::oneshot::channel();
     let _ = tx.send(outcome);
     StreamingExecution {
         stream,
         outcome: rx,
+        producer_input,
     }
 }
 

@@ -73,6 +73,10 @@ pub enum ExecutorError {
     /// has not run). The caller should fall back to the legacy STT path.
     #[error("STT runtime is not wired yet")]
     SttRuntimeUnavailable,
+    /// No running STT service row is registered on this node. Typed so the
+    /// HTTP layer can answer 503 instead of burying it in a 500 string.
+    #[error("{}", crate::error::CoreError::SttServiceUnavailable)]
+    SttServiceUnavailable,
     /// Real STT dispatch error from the runtime (engine failure, alias
     /// missing, etc.). The caller should NOT re-dispatch — surface this
     /// directly. Mirrors the chat/embeddings/TTS pattern of returning
@@ -81,6 +85,17 @@ pub enum ExecutorError {
     SttBackend(String),
     #[error("internal error: {0}")]
     Internal(String),
+}
+
+/// Maps an `SttRuntime` error onto the executor's typed variants, keeping
+/// "no STT service" distinguishable from a backend failure.
+fn stt_runtime_error(e: anyhow::Error) -> ExecutorError {
+    match e.downcast_ref::<crate::error::CoreError>() {
+        Some(crate::error::CoreError::SttServiceUnavailable) => {
+            ExecutorError::SttServiceUnavailable
+        }
+        _ => ExecutorError::SttBackend(e.to_string()),
+    }
 }
 
 impl ExecutorError {
@@ -97,7 +112,10 @@ impl ExecutorError {
     fn aborts_fallback_chain(&self) -> bool {
         matches!(
             self,
-            Self::FlowDispatcherUnavailable | Self::SttRuntimeUnavailable | Self::SttBackend(_)
+            Self::FlowDispatcherUnavailable
+                | Self::SttRuntimeUnavailable
+                | Self::SttServiceUnavailable
+                | Self::SttBackend(_)
         )
     }
 }
@@ -336,6 +354,14 @@ impl ModelRuntimeExecutor {
         let model_id = target.requested_model();
         let service_key = format!("{backend}/{model_id}");
         let is_embedding = modality == "embedding";
+        if usage.is_none() {
+            tracing::warn!(
+                backend,
+                model_id,
+                modality,
+                "backend returned no usage — request recorded without token counts (cost incomplete)"
+            );
+        }
         let prompt_tokens = usage.map(|u| u.prompt_tokens as i64).unwrap_or(0);
         let completion_tokens = usage.map(|u| u.completion_tokens as i64).unwrap_or(0);
         let total_tokens = usage.map(|u| u.total_tokens as i64).unwrap_or(0);
@@ -363,6 +389,7 @@ impl ModelRuntimeExecutor {
                     .and_then(|p| (p.decode_tps > 0.0).then_some(p.decode_tps as f64)),
                 e2e_sample: (e2e_latency_ms > 0).then_some(e2e_latency_ms),
                 is_error: false,
+                usage_missing: usage.is_none(),
             },
         );
     }
@@ -401,6 +428,7 @@ impl ModelRuntimeExecutor {
                 decode_tps_sample: None,
                 e2e_sample: None,
                 is_error: true,
+                usage_missing: false,
             },
         );
     }
@@ -3298,8 +3326,9 @@ impl ModelRuntimeExecutor {
     ///   adapter, nie executor).
     /// Resolver error (UnknownModel/CapabilityUnsupported/NoLiveInstance) padamy
     /// `SttBackend(error)` zeby user zobaczyl klarowny blad.
-    /// Gdy `model` jest pusty / brak kandydatow → fallback do default
-    /// local whisper (zachowuje pre-existing UX dla single-engine node'u).
+    /// Gdy `model` jest pusty / brak kandydatow → `SttRuntime::transcribe`
+    /// wybiera sposrod zarejestrowanych lokalnych uslug STT (brak → typed
+    /// `SttServiceUnavailable`).
     // TODO Chunk 2b: TTS/STT metrics need usage/duration plumbing (audio_ms,
     // transcript tokens) before they can feed `model_metrics_rollup`.
     pub async fn execute_stt(
@@ -3315,14 +3344,10 @@ impl ModelRuntimeExecutor {
             .clone()
             .ok_or_else(|| ExecutorError::SttRuntimeUnavailable)?;
 
-        // Pusty model = bezposredni fallback do default local whisper
-        // (handler `/v1/audio/transcriptions` bez `model` field — legacy
-        // zachowanie).
+        // Empty model (handler `/v1/audio/transcriptions` without `model`):
+        // any registered local STT service.
         if request.model.trim().is_empty() {
-            return runtime
-                .transcribe(request)
-                .await
-                .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+            return runtime.transcribe(request).await.map_err(stt_runtime_error);
         }
 
         let snapshot = self.catalog.snapshot();
@@ -3334,20 +3359,21 @@ impl ModelRuntimeExecutor {
                 ..
             })
             | Err(crate::services::runtime::resolver::ResolveError::NoLiveInstance(_)) => {
-                // Model nie zmatchował żadnej usługi STT w katalogu → fallback
-                // do default local whisper (legacy single-node z "whisper-1").
-                // Gdy lokalnego też nie ma — błąd musi nazwać model, żeby user
-                // widział że nazwa w node'ie nie pasuje do wdrożonej usługi STT.
+                // The model matched no STT service in the catalog (legacy
+                // clients send "whisper-1") → any registered local STT service.
+                // The error must name the model so a mismatch between the node
+                // config and the deployed service is visible.
                 let model = request.model.clone();
                 tracing::warn!(
                     requested_model = %model,
-                    "STT: model nie rozwiązał się do usługi w katalogu — fallback na lokalny whisper"
+                    "STT: model did not resolve to a catalog service — using a registered local STT service"
                 );
-                return runtime.transcribe(request).await.map_err(|e| {
-                    ExecutorError::SttBackend(format!(
-                        "model STT '{model}' nie pasuje do żadnej uruchomionej usługi STT \
-                         w katalogu, a lokalny silnik whisper nie jest załadowany ({e})"
-                    ))
+                return runtime.transcribe(request).await.map_err(|e| match stt_runtime_error(e) {
+                    ExecutorError::SttBackend(msg) => ExecutorError::SttBackend(format!(
+                        "STT model '{model}' matches no running STT service in the catalog; \
+                         local STT service: {msg}"
+                    )),
+                    other => other,
                 });
             }
             Err(e) => return Err(ExecutorError::SttBackend(format!("resolver: {}", e))),
@@ -3357,11 +3383,12 @@ impl ModelRuntimeExecutor {
         let ranked = rank(&outcome.candidates, outcome.strategy, &state);
         if ranked.is_empty() {
             let model = request.model.clone();
-            return runtime.transcribe(request).await.map_err(|e| {
-                ExecutorError::SttBackend(format!(
-                    "model STT '{model}' rozwiązany ale bez kandydatów do wykonania, \
-                     a lokalny silnik whisper nie jest załadowany ({e})"
-                ))
+            return runtime.transcribe(request).await.map_err(|e| match stt_runtime_error(e) {
+                ExecutorError::SttBackend(msg) => ExecutorError::SttBackend(format!(
+                    "STT model '{model}' resolved but has no executable candidate; \
+                     local STT service: {msg}"
+                )),
+                other => other,
             });
         }
 
@@ -3372,9 +3399,9 @@ impl ModelRuntimeExecutor {
                     model_name,
                     ..
                 } => {
-                    // Lazy-load + memory guard (best-effort): zaladuj embedded STT
-                    // przez residency (evict innych rezydentnych). Przy bledzie
-                    // transcribe_for_service i tak ma wlasny lazy-load — bez regresji.
+                    // Lazy-load + memory guard: an UNPINNED embedded STT row is
+                    // loaded on first use by residency (from the row's own
+                    // config); pinned rows are loaded by the supervisor.
                     let stt_residency = self.model_residency.read().clone();
                     if let Some(res) = stt_residency {
                         if let Err(e) = res.ensure_loaded(&model_name).await {
@@ -3384,7 +3411,7 @@ impl ModelRuntimeExecutor {
                     return runtime
                         .transcribe_for_service(service_id, request)
                         .await
-                        .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+                        .map_err(stt_runtime_error);
                 }
                 ResolvedExecutionTarget::MeshForward {
                     node_id,
@@ -3403,7 +3430,7 @@ impl ModelRuntimeExecutor {
                         return runtime
                             .transcribe_for_service(service_id, request)
                             .await
-                            .map_err(|e| ExecutorError::SttBackend(e.to_string()));
+                            .map_err(stt_runtime_error);
                     }
                     let model_request = ModelRequest {
                         request_id: uuid::Uuid::new_v4().to_string(),
@@ -4440,6 +4467,9 @@ impl ExternalPerfStream {
             // Exact-once: metryka (success ALBO error) zapisywana DOKLADNIE RAZ na
             // strumien, nawet gdy backend wysle >1 chunk z usage.
             let mut recorded = false;
+            // Upstream EOF without an error and with the consumer still attached:
+            // the request succeeded, the backend just never sent a usage tail.
+            let mut clean_eof = false;
             loop {
                 tokio::select! {
                     // Anti-hang: gdy konsument porzuci `rx`, kończymy nawet jeśli
@@ -4505,18 +4535,31 @@ impl ExternalPerfStream {
                                 let _ = tx.send(Err(e)).await;
                                 break;
                             }
-                            None => break,
+                            None => {
+                                clean_eof = true;
+                                break;
+                            }
                         }
                     }
                 }
             }
-            // Strumien skonczyl sie bez finalnego chunku usage (upstream error,
-            // EOF bez usage-tail, albo drop konsumenta przez `tx.closed()`) —
-            // zapisz wiersz BLEDU raz, zeby error-rate lapal porzucone/blednie
-            // zakonczone strumienie. Guard `recorded` gwarantuje exact-once.
+            // No usage chunk arrived. A clean EOF is still a success — the backend
+            // just never reported tokens — so it goes into `usage_missing_count`
+            // rather than silently costing 0. An upstream error or a consumer drop
+            // (`tx.closed()`) stays an error row so the error rate keeps catching
+            // abandoned/broken streams. `recorded` keeps this exact-once.
             if !recorded {
                 if let Some(rec) = &recorder {
-                    rec.record_error();
+                    if clean_eof {
+                        rec.record_missing_usage(&build_external_perf(
+                            start,
+                            first_token_at,
+                            last_token_at,
+                            None,
+                        ));
+                    } else {
+                        rec.record_error();
+                    }
                 }
             }
         });
@@ -4680,6 +4723,8 @@ struct ModelMetricInput<'a> {
     /// Proba do histogramu e2e — `Some` tylko dla realnego pomiaru (>0).
     e2e_sample: Option<i64>,
     is_error: bool,
+    /// Success recorded without backend `usage` (token counts unknown).
+    usage_missing: bool,
 }
 
 /// Jeden punkt zapisu do `model_metrics_rollup`. Metryki nie moga wywrocic
@@ -4702,6 +4747,11 @@ fn bump_model_metric_row(db: &crate::db::DbPool, input: &ModelMetricInput<'_>) {
         request_count: 1,
         success_count: if input.is_error { 0 } else { 1 },
         error_count: if input.is_error { 1 } else { 0 },
+        usage_missing_count: if !input.is_error && input.usage_missing {
+            1
+        } else {
+            0
+        },
     };
     let tokens = crate::db::models::ModelMetricsTokens {
         prompt_tokens: input.prompt_tokens,
@@ -4778,15 +4828,51 @@ impl StreamMetricsRecorder {
                 decode_tps_sample: (perf.decode_tps > 0.0).then_some(perf.decode_tps as f64),
                 e2e_sample: (e2e_ms > 0).then_some(e2e_ms),
                 is_error: false,
+                usage_missing: false,
+            },
+        );
+    }
+
+    /// Success row for a stream that ended cleanly without a usage tail: the
+    /// backend never reported token counts, so only TTFT/e2e are measured and
+    /// the row is flagged `usage_missing` (cost for this request is unknown).
+    fn record_missing_usage(&self, perf: &crate::api::openai::types::GenPerf) {
+        tracing::warn!(
+            backend = %self.backend,
+            model_id = %self.model_id,
+            modality = "chat",
+            "stream ended without usage — request recorded without token counts (cost incomplete)"
+        );
+        let e2e_ms = perf.total_ms as i64;
+        bump_model_metric_row(
+            &self.db,
+            &ModelMetricInput {
+                node_id: &self.node_id,
+                org_id: &self.org_id,
+                user_id: &self.user_id,
+                model_id: &self.model_id,
+                service_key: &self.service_key,
+                backend: &self.backend,
+                modality: "chat",
+                prompt_tokens: 0,
+                completion_tokens: 0,
+                total_tokens: 0,
+                embedding_tokens: 0,
+                e2e_latency_ms: e2e_ms,
+                ttft_sample: (perf.ttft_ms > 0).then_some(perf.ttft_ms as i64),
+                decode_tps_sample: None,
+                e2e_sample: (e2e_ms > 0).then_some(e2e_ms),
+                is_error: false,
+                usage_missing: true,
             },
         );
     }
 
     /// Wiersz BLEDU dla strumienia, ktory zakonczyl sie bez finalnego chunku
-    /// usage: upstream error, EOF bez usage-tail, albo drop konsumenta
-    /// (`tx.closed()`). Bez tokenow/perf — liczy sie wylacznie do error-rate.
-    /// Rozroznienie "drop konsumenta" vs "blad backendu" jest tu niepewne, wiec
-    /// oba traktujemy jako error (lepsze niz gubienie porzuconych strumieni).
+    /// usage przez upstream error albo drop konsumenta (`tx.closed()`). Bez
+    /// tokenow/perf — liczy sie wylacznie do error-rate. Rozroznienie "drop
+    /// konsumenta" vs "blad backendu" jest tu niepewne, wiec oba traktujemy
+    /// jako error (lepsze niz gubienie porzuconych strumieni).
     fn record_error(&self) {
         bump_model_metric_row(
             &self.db,
@@ -4807,6 +4893,7 @@ impl StreamMetricsRecorder {
                 decode_tps_sample: None,
                 e2e_sample: None,
                 is_error: true,
+                usage_missing: false,
             },
         );
     }
@@ -4942,6 +5029,7 @@ mod tests {
                 decode_tps_sample: None,
                 e2e_sample: Some(120),
                 is_error: false,
+                usage_missing: false,
             },
         );
 
@@ -4988,6 +5076,7 @@ mod tests {
                 decode_tps_sample: None,
                 e2e_sample: None,
                 is_error: true,
+                usage_missing: false,
             },
         );
         let row = &crate::db::repository::list_model_metrics_rollup(
@@ -5021,6 +5110,7 @@ mod tests {
                 decode_tps_sample: None,
                 e2e_sample: Some(5),
                 is_error: false,
+                usage_missing: false,
             },
         );
         let rows = crate::db::repository::list_model_metrics_rollup(
@@ -5036,6 +5126,45 @@ mod tests {
         assert_eq!(emb.modality, "embedding");
         assert_eq!(emb.embedding_tokens, 8);
         assert_eq!(emb.total_tokens, 8);
+    }
+
+    /// A success without backend `usage` bumps `usage_missing_count`; an error
+    /// row never does, even when flagged `usage_missing`.
+    #[test]
+    fn bump_model_metric_row_counts_missing_usage_only_for_successes() {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).expect("init test db");
+        let input = |is_error: bool| ModelMetricInput {
+            node_id: "node-A",
+            org_id: crate::services::org::DEFAULT_ORG_ID,
+            user_id: "u1",
+            model_id: "qwen-chat",
+            service_key: "http/qwen-chat",
+            backend: "http",
+            modality: "chat",
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            embedding_tokens: 0,
+            e2e_latency_ms: 0,
+            ttft_sample: None,
+            decode_tps_sample: None,
+            e2e_sample: None,
+            is_error,
+            usage_missing: true,
+        };
+        bump_model_metric_row(&pool, &input(false));
+        bump_model_metric_row(&pool, &input(true));
+        let rows = crate::db::repository::list_model_metrics_rollup(
+            &pool,
+            crate::services::org::DEFAULT_ORG_ID,
+            &Default::default(),
+        )
+        .expect("list rollup");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].request_count, 2);
+        assert_eq!(rows[0].success_count, 1);
+        assert_eq!(rows[0].error_count, 1);
+        assert_eq!(rows[0].usage_missing_count, 1);
     }
 
     /// `aborts_fallback_chain` flags only the variants that no fallback

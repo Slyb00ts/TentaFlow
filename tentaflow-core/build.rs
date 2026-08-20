@@ -1386,6 +1386,10 @@ mod services_manifest_build {
         pub requires_model: Option<bool>,
         #[serde(default)]
         pub gpu_supported: Option<bool>,
+        /// Mirror of runtime `Engine.reverse_requests` — sidecars allowed to
+        /// open streams back to Core (meeting bot).
+        #[serde(default)]
+        pub reverse_requests: bool,
         /// Tri-state DGX Spark gate. Mirror of runtime `Engine.dgx_spark`.
         #[serde(default)]
         pub dgx_spark: Option<bool>,

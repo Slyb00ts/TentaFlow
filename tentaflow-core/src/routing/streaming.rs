@@ -49,7 +49,9 @@ fn envelope_stream_to_chunk_stream(
     use crate::flow_engine::envelope::EnvelopeDelta;
     use futures::StreamExt;
 
-    let crate::flow_engine::executor::StreamingExecution { stream, outcome } = stream_exec;
+    let crate::flow_engine::executor::StreamingExecution {
+        stream, outcome, ..
+    } = stream_exec;
     let id = format!("flow-{}", uuid::Uuid::new_v4());
     let created = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -829,6 +831,9 @@ impl Router {
                 // link cannot be rewritten by a node that edits `meta`.
                 meta_stream.correlation_id = Some(handle.request_id().to_string());
             }
+            // Text chat never wants synthesized audio: a shared flow with a
+            // `tts` node passes the LLM text through untouched.
+            initial_stream.set_output_audio(false);
             // Disconnect bridge: ten sam cancel_token co w meta dostaje
             // CancelOnDropStream poniżej, więc gdy hyper droppuje SSE body
             // (klient się rozłączył), token zostaje cancelled i finalizer

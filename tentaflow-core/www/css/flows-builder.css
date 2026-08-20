@@ -1352,3 +1352,21 @@
   }
   .fb-map-arrow { text-align: left; }
 }
+
+/* ============================================================================
+   Podgląd flow systemowego (read-only)
+   ============================================================================ */
+.fb-shell.fb-readonly {
+  grid-template-rows: 56px auto 1fr 44px;
+}
+.fb-readonly [data-role="system-readonly"] {
+  margin: 8px 12px 0;
+}
+.fb-readonly .fb-topbar [hidden],
+.fb-readonly .fb-bottombar [hidden] {
+  display: none !important;
+}
+.fb-readonly .fb-palette .fb-node-item {
+  cursor: default;
+  opacity: 0.6;
+}

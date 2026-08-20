@@ -48,7 +48,6 @@ import SettingsUserScreen from '/js/modules/settings-user.js';
 import TranslateScreen from '/js/modules/translate.js';
 import MeetingScreen from '/js/modules/meeting.js';
 import MeetingLiveScreen from '/js/modules/meeting-live.js';
-import PoseScreen from '/js/modules/pose.js';
 import ProfileReportView from '/js/modules/profile-report.js';
 import ProfileCompareView from '/js/modules/profile-compare.js';
 import ProfilePermissionsView from '/js/modules/profile-permissions.js';
@@ -94,7 +93,6 @@ const ProfilePermissionsScreen = {
     await ProfilePermissionsView.render(main);
   },
 };
-import { makeComingSoonScreen } from '/js/modules/coming-soon.js';
 
 // Helper: SVG <use> reference do inline sprite.
 function sprite(id) {
@@ -108,8 +106,6 @@ const ADMIN_NAV = [
     icon: 'settings',
     items: [
       { id: 'dashboard', labelKey: 'nav.dashboard', icon: 'dashboard' },
-      { id: 'services', labelKey: 'nav.services', icon: 'services' },
-      { id: 'settings', labelKey: 'nav.settings', icon: 'settings' },
     ],
   },
   {
@@ -140,43 +136,45 @@ const ADMIN_NAV = [
     ],
   },
   {
-    headingKey: 'nav.section_integrations',
-    icon: 'puzzle',
-    items: [
-      { id: 'catalog', labelKey: 'nav.catalog', icon: 'catalog' },
-    ],
-  },
-  {
     headingKey: 'nav.section_management',
     icon: 'management',
     items: [
+      { id: 'services', labelKey: 'nav.services', icon: 'services' },
+      { id: 'catalog', labelKey: 'nav.catalog', icon: 'catalog' },
+      { id: 'settings', labelKey: 'nav.settings', icon: 'settings' },
       { id: 'addons', labelKey: 'nav.addons', icon: 'puzzle' },
       { id: 'users', labelKey: 'nav.users', icon: 'users' },
       { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
       { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
       { id: 'analytics', labelKey: 'nav.analytics', icon: 'trend' },
-      { id: 'benchmark-studio', labelKey: 'nav.benchmark_studio', icon: 'trend' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
   },
 ];
 
+// Apps section shared by every role — always the first block of the sidebar.
+// `requiresPowerUser` items are dropped at render time for plain users, mirroring
+// the TILES gate in apps-home.js and the backend PowerUser policy.
+const APPS_NAV = {
+  headingKey: 'nav.section_apps',
+  icon: 'apps',
+  items: [
+    { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
+    { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
+    { id: 'code-studio', labelKey: 'nav.code_studio', icon: 'terminal' },
+    { id: 'projekty', labelKey: 'nav.projekty', icon: 'folder' },
+    { id: 'ml-studio', labelKey: 'nav.ml_studio', icon: 'brain', requiresPowerUser: true },
+    { id: 'benchmark-studio', labelKey: 'nav.benchmark_studio', icon: 'trend', requiresPowerUser: true },
+    { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
+    { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
+  ],
+};
+
 // Menu user per mockup #2.
 const USER_NAV = [
-  {
-    headingKey: 'nav.section_apps',
-    icon: 'apps',
-    items: [
-      { id: 'apps-home', labelKey: 'nav.apps_home', icon: 'apps' },
-      { id: 'chat', labelKey: 'nav.chat', icon: 'chat' },
-      { id: 'images', labelKey: 'nav.images', icon: 'image', badge: 'soon' },
-      { id: 'meeting', labelKey: 'nav.meeting', icon: 'meeting' },
-      { id: 'pose', labelKey: 'nav.pose', icon: 'image' },
-      { id: 'translate', labelKey: 'nav.translate', icon: 'globe' },
-    ],
-  },
+  APPS_NAV,
   {
     headingKey: 'nav.section_account',
     icon: 'user',
@@ -288,8 +286,12 @@ async function renderApp() {
   const initials = (me?.username ?? '?').slice(0, 2).toUpperCase();
 
   function paint() {
-    // Admin sees their admin nav plus the user-facing apps appended — admin is a superset of user.
-    const nav = isAdmin ? [...ADMIN_NAV, ...USER_NAV] : USER_NAV;
+    // Admin is a superset of user: apps first, then admin sections, account last.
+    const nav = (isAdmin ? [APPS_NAV, ...ADMIN_NAV, ...USER_NAV.slice(1)] : USER_NAV)
+      .map((section) => ({
+        ...section,
+        items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
+      }));
     const userClass = isAdmin ? 'admin' : isPowerUser ? 'power' : 'user';
     const roleLabel = I18n.t(
       isAdmin ? 'role.administrator' : isPowerUser ? 'users.role_power' : 'role.user',
@@ -322,7 +324,6 @@ async function renderApp() {
                     ${sprite(it.icon)}
                     <span>${escapeHtml(I18n.t(it.labelKey))}</span>
                     <span class="nav-count" data-count-for="${it.id}" hidden></span>
-                    ${it.badge ? `<span class="badge ${it.badge === 'soon' ? 'soon' : ''}">${escapeHtml(it.badge)}</span>` : ''}
                   </div>
                 `).join('')}
               </div>
@@ -504,7 +505,6 @@ async function renderApp() {
   Router.register('chat', ChatScreen);
   Router.register('services', ServicesScreen);
   Router.register('hub', HubScreen);
-  // `catalog` nie ma w menu — serwisy z niego korzystają przy "Nowy serwis".
   Router.register('catalog', CatalogScreen);
   Router.register('prompts', PromptsScreen);
   Router.register('flows', FlowsScreen);
@@ -534,11 +534,8 @@ async function renderApp() {
   Router.register('apps-home', AppsHomeScreen);
   Router.register('profile', ProfileScreen);
   Router.register('settings-user', SettingsUserScreen);
-  // Apps whose binary handlers are not yet wired — honest placeholder, not a stub feature.
-  Router.register('images',         makeComingSoonScreen('images',    'image'));
   Router.register('meeting', MeetingScreen);
   Router.register('meeting-live', MeetingLiveScreen);
-  Router.register('pose', PoseScreen);
   Router.register('translate',      TranslateScreen);
   Router.register('profile-report', ProfileReportScreen);
   Router.register('profile-compare', ProfileCompareScreen);
@@ -551,13 +548,13 @@ async function renderApp() {
   I18n.subscribe(async () => {
     const current = Router.current();
     paint();
-    const initial = document.querySelector(`[data-view="${current ?? (isAdmin ? 'dashboard' : 'apps-home')}"]`);
+    const initial = document.querySelector(`[data-view="${current ?? 'apps-home'}"]`);
     if (initial) initial.classList.add('active');
-    await Router.navigate(current ?? (isAdmin ? 'dashboard' : 'apps-home'));
+    await Router.navigate(current ?? 'apps-home');
   });
 
-  Router.init(isAdmin ? 'dashboard' : 'apps-home');
-  const initial = document.querySelector(`[data-view="${isAdmin ? 'dashboard' : 'apps-home'}"]`);
+  Router.init('apps-home');
+  const initial = document.querySelector('[data-view="apps-home"]');
   if (initial) initial.classList.add('active');
 
   // Liczniki w sidebar menu — pobieramy po zamontowaniu shellu i odswiezamy

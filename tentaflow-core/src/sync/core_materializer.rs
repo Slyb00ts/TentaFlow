@@ -2029,7 +2029,7 @@ fn apply_model_metrics_rollup(
                   decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, \
                   decode_tps_b5, decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
                   e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
-                  e2e_sample_count) \
+                  e2e_sample_count, usage_missing_count) \
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, \
                   ?18, ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, \
                   ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, \
@@ -2058,7 +2058,8 @@ fn apply_model_metrics_rollup(
                  e2e_b0 = excluded.e2e_b0, e2e_b1 = excluded.e2e_b1, e2e_b2 = excluded.e2e_b2, \
                  e2e_b3 = excluded.e2e_b3, e2e_b4 = excluded.e2e_b4, e2e_b5 = excluded.e2e_b5, \
                  e2e_b6 = excluded.e2e_b6, e2e_b7 = excluded.e2e_b7, e2e_b8 = excluded.e2e_b8, \
-                 e2e_b9 = excluded.e2e_b9, e2e_sample_count = excluded.e2e_sample_count",
+                 e2e_b9 = excluded.e2e_b9, e2e_sample_count = excluded.e2e_sample_count, \
+                 usage_missing_count = excluded.usage_missing_count",
                 rusqlite::params![
                     id,
                     field_string(operation, "node_id")?,
@@ -2114,6 +2115,7 @@ fn apply_model_metrics_rollup(
                     field_i64_or(operation, "e2e_b8", 0)?,
                     field_i64_or(operation, "e2e_b9", 0)?,
                     field_i64_or(operation, "e2e_sample_count", 0)?,
+                    field_i64_or(operation, "usage_missing_count", 0)?,
                 ],
             )
             .map_err(sql_error),
@@ -2138,13 +2140,15 @@ fn apply_model_pricing(
         ActionType::Insert | ActionType::Update => tx
             .execute(
                 "INSERT INTO model_pricing \
-                 (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7) \
+                 (id, org_id, model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, \
+                  embedding_per_1k) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8) \
                  ON CONFLICT(id) DO UPDATE SET \
                  org_id = excluded.org_id, model_id = excluded.model_id, \
                  prompt_per_1k = excluded.prompt_per_1k, \
                  completion_per_1k = excluded.completion_per_1k, \
-                 audio_per_min = excluded.audio_per_min, image_each = excluded.image_each",
+                 audio_per_min = excluded.audio_per_min, image_each = excluded.image_each, \
+                 embedding_per_1k = excluded.embedding_per_1k",
                 rusqlite::params![
                     id,
                     field_string(operation, "org_id")?,
@@ -2153,6 +2157,7 @@ fn apply_model_pricing(
                     field_f64_or(operation, "completion_per_1k", 0.0)?,
                     field_f64_or(operation, "audio_per_min", 0.0)?,
                     field_f64_or(operation, "image_each", 0.0)?,
+                    field_f64_or(operation, "embedding_per_1k", 0.0)?,
                 ],
             )
             .map_err(sql_error),
@@ -2766,4 +2771,142 @@ fn optional_present_bool(operation: &SyncOperation, key: &str) -> LedgerResult<O
 
 fn sql_error(error: rusqlite::Error) -> SyncLedgerError {
     SyncLedgerError::Runtime(error.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::models::{
+        ModelMetricsCounters, ModelMetricsDims, ModelMetricsPerfSamples, ModelMetricsTimes,
+        ModelMetricsTokens,
+    };
+    use crate::db::repository;
+    use crate::services::org::DEFAULT_ORG_ID;
+    use crate::sync::ledger::{BaselineEpoch, OperationId, PartitionId, SyncOperationBody};
+    use std::collections::BTreeMap;
+
+    fn rollup_operation(resource_id: &str, fields: BTreeMap<String, FieldValue>) -> SyncOperation {
+        SyncOperation {
+            op_id: OperationId::from_hash([7; 32]),
+            operation_hash: [7; 32],
+            body: SyncOperationBody {
+                org_id: DEFAULT_ORG_ID.to_string(),
+                partition_id: PartitionId::new("core/org/default/model_metrics").unwrap(),
+                node_seq: 1,
+                addon_id: CORE_SYNC_ADDON_ID.to_string(),
+                resource_type: "core.model_metrics_rollup".to_string(),
+                resource_id: resource_id.to_string(),
+                table_name: "model_metrics_rollup".to_string(),
+                primary_key: "id".to_string(),
+                action: ActionType::Insert,
+                changed_fields: fields,
+                before_hash: None,
+                after_hash: None,
+                actor_user_id: String::new(),
+                actor_device_id: "peer".to_string(),
+                actor_node_id: "peer".to_string(),
+                hlc_timestamp: HybridLogicalTimestamp {
+                    wall_time_ms: 1,
+                    logical: 0,
+                    node_id: "peer".to_string(),
+                },
+                epoch: BaselineEpoch::default(),
+                prev_node_hash: None,
+                payload_hash: [0; 32],
+                acl_snapshot_hash: [0; 32],
+                policy_epoch: 0,
+                encryption_info: None,
+            },
+            signature: Vec::new(),
+        }
+    }
+
+    /// The rollup INSERT lists 55 columns by hand; a miscounted placeholder or
+    /// param breaks EVERY replicated rollup at `prepare`. Round-trip a locally
+    /// bumped row through `model_metrics_changed_fields` → `apply` on a second
+    /// DB and compare column by column.
+    #[test]
+    fn model_metrics_rollup_round_trips_through_materializer() {
+        let source = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        repository::bump_model_metrics_rollup(
+            &source,
+            &ModelMetricsDims {
+                node_id: "peer",
+                org_id: DEFAULT_ORG_ID,
+                user_id: "u1",
+                model_id: "qwen",
+                service_key: "vllm/qwen",
+                backend: "vllm",
+                modality: "chat",
+                hour_bucket: "2026-08-20T10:00:00Z",
+                histogram_version: 1,
+            },
+            &ModelMetricsCounters {
+                request_count: 3,
+                success_count: 2,
+                error_count: 1,
+                usage_missing_count: 2,
+            },
+            &ModelMetricsTokens {
+                prompt_tokens: 100,
+                completion_tokens: 50,
+                total_tokens: 150,
+                embedding_tokens: 7,
+                audio_ms: 0,
+                images: 0,
+            },
+            &ModelMetricsTimes {
+                e2e_latency_ms: 900,
+                ..Default::default()
+            },
+            &ModelMetricsPerfSamples {
+                ttft_ms: Some(120),
+                decode_tps: Some(50.0),
+                e2e_ms: Some(900),
+            },
+        )
+        .unwrap();
+        let original =
+            repository::list_model_metrics_rollup(&source, DEFAULT_ORG_ID, &Default::default())
+                .unwrap()
+                .remove(0);
+
+        let target = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        {
+            let mut conn = repository::acquire_for_baseline(&target).unwrap();
+            let tx = conn.transaction().unwrap();
+            let operation = rollup_operation(
+                &original.id,
+                repository::model_metrics_changed_fields(&original),
+            );
+            assert_eq!(apply_model_metrics_rollup(&tx, &operation).unwrap(), 1);
+            // Replaying the same operation must overwrite, not fail or double.
+            assert_eq!(apply_model_metrics_rollup(&tx, &operation).unwrap(), 1);
+            tx.commit().unwrap();
+        }
+        let rows =
+            repository::list_model_metrics_rollup(&target, DEFAULT_ORG_ID, &Default::default())
+                .unwrap();
+        assert_eq!(rows.len(), 1);
+        let got = &rows[0];
+        assert_eq!(got.id, original.id);
+        assert_eq!(got.node_id, "peer");
+        assert_eq!(got.service_key, "vllm/qwen");
+        assert_eq!(got.hour_bucket, "2026-08-20T10:00:00Z");
+        assert_eq!(got.request_count, 3);
+        assert_eq!(got.success_count, 2);
+        assert_eq!(got.error_count, 1);
+        assert_eq!(got.usage_missing_count, 2);
+        assert_eq!(got.prompt_tokens, 100);
+        assert_eq!(got.completion_tokens, 50);
+        assert_eq!(got.total_tokens, 150);
+        assert_eq!(got.embedding_tokens, 7);
+        assert_eq!(got.e2e_latency_ms_sum, 900);
+        assert_eq!(got.ttft_buckets, original.ttft_buckets);
+        assert_eq!(got.ttft_sample_count, 1);
+        assert_eq!(got.decode_tps_buckets, original.decode_tps_buckets);
+        assert_eq!(got.decode_tps_sample_count, 1);
+        assert_eq!(got.e2e_buckets, original.e2e_buckets);
+        assert_eq!(got.e2e_sample_count, 1);
+    }
 }

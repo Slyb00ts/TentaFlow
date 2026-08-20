@@ -3971,6 +3971,23 @@ export function encodeFlowExecutionsListRequest(flow_id) {
 }
 
 /**
+ * MessageBody::FlowFactoryRestoreRequest { flow_id }.
+ * @param {string} flow_id
+ * @returns {Uint8Array}
+ */
+export function encodeFlowFactoryRestoreRequest(flow_id) {
+    const ptr0 = passStringToWasm0(flow_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeFlowFactoryRestoreRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
  * MessageBody::FlowInvokeRequest — uniwersalny most do flow engine. Wariant
  * audio-only dla chat audio (jedno wejście Audio). Multi-input dojdzie później.
  * @param {string | null | undefined} flow_id
@@ -3979,11 +3996,14 @@ export function encodeFlowExecutionsListRequest(flow_id) {
  * @param {string} mime
  * @param {number | null | undefined} sample_rate
  * @param {Uint8Array} audio
- * @param {string | null} [language]
- * @param {string | null} [session_id]
+ * @param {string | null | undefined} language
+ * @param {string | null | undefined} session_id
+ * @param {boolean} output_audio
+ * @param {string | null} [stt_model]
+ * @param {string | null} [tts_model]
  * @returns {Uint8Array}
  */
-export function encodeFlowInvokeAudio(flow_id, model, service_type, mime, sample_rate, audio, language, session_id) {
+export function encodeFlowInvokeAudio(flow_id, model, service_type, mime, sample_rate, audio, language, session_id, output_audio, stt_model, tts_model) {
     var ptr0 = isLikeNone(flow_id) ? 0 : passStringToWasm0(flow_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len0 = WASM_VECTOR_LEN;
     const ptr1 = passStringToWasm0(model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -3998,13 +4018,17 @@ export function encodeFlowInvokeAudio(flow_id, model, service_type, mime, sample
     var len5 = WASM_VECTOR_LEN;
     var ptr6 = isLikeNone(session_id) ? 0 : passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len6 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeFlowInvokeAudio(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, isLikeNone(sample_rate) ? Number.MAX_SAFE_INTEGER : (sample_rate) >>> 0, ptr4, len4, ptr5, len5, ptr6, len6);
+    var ptr7 = isLikeNone(stt_model) ? 0 : passStringToWasm0(stt_model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len7 = WASM_VECTOR_LEN;
+    var ptr8 = isLikeNone(tts_model) ? 0 : passStringToWasm0(tts_model, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len8 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeFlowInvokeAudio(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, isLikeNone(sample_rate) ? Number.MAX_SAFE_INTEGER : (sample_rate) >>> 0, ptr4, len4, ptr5, len5, ptr6, len6, output_audio, ptr7, len7, ptr8, len8);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
-    var v8 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    var v10 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
-    return v8;
+    return v10;
 }
 
 /**
@@ -6756,12 +6780,13 @@ export function encodeModelMetricsPricingGet() {
  * @param {number} completion_per_1k
  * @param {number} audio_per_min
  * @param {number} image_each
+ * @param {number} embedding_per_1k
  * @returns {Uint8Array}
  */
-export function encodeModelMetricsPricingSet(model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each) {
+export function encodeModelMetricsPricingSet(model_id, prompt_per_1k, completion_per_1k, audio_per_min, image_each, embedding_per_1k) {
     const ptr0 = passStringToWasm0(model_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeModelMetricsPricingSet(ptr0, len0, prompt_per_1k, completion_per_1k, audio_per_min, image_each);
+    const ret = wasm.encodeModelMetricsPricingSet(ptr0, len0, prompt_per_1k, completion_per_1k, audio_per_min, image_each, embedding_per_1k);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }

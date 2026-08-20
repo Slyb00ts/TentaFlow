@@ -101,7 +101,9 @@ fn core_error_to_response(e: &anyhow::Error) -> Response<OpenAIBody> {
         let error_type = match err {
             CoreError::ModelNotFound { .. } => "model_not_found",
             CoreError::InvalidRequest { .. } => "invalid_request_error",
-            CoreError::AllBackendsUnavailable { .. } => "service_unavailable",
+            CoreError::AllBackendsUnavailable { .. } | CoreError::SttServiceUnavailable => {
+                "service_unavailable"
+            }
             CoreError::Timeout { .. } => "timeout_error",
             _ => "internal_error",
         };
@@ -2911,5 +2913,30 @@ fn emit_trailer_headers(
         if let Ok(v) = fr.parse() {
             headers.insert("x-tentaflow-finish-reason", v);
         }
+    }
+}
+
+#[cfg(test)]
+mod error_mapping_tests {
+    use super::*;
+
+    /// A missing STT service must reach external clients as 503
+    /// `service_unavailable`, not a generic 500.
+    #[test]
+    fn stt_service_unavailable_maps_to_503() {
+        let err: anyhow::Error = CoreError::SttServiceUnavailable.into();
+        let resp = core_error_to_response(&err);
+        assert_eq!(resp.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    /// The flow-dispatch edge keeps the typed error through `DispatchError`.
+    #[test]
+    fn dispatch_error_keeps_stt_service_unavailable_typed() {
+        let inner: anyhow::Error = CoreError::SttServiceUnavailable.into();
+        let wrapped = inner.context("stt adapter: dispatcher failed");
+        let dispatch = crate::flow_engine::dispatcher::DispatchError::from(wrapped);
+        let core = crate::routing::dispatch_error_to_core(dispatch, "whisper-1");
+        assert!(matches!(core, CoreError::SttServiceUnavailable));
+        assert_eq!(core.status_code(), 503);
     }
 }

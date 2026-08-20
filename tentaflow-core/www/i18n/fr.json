@@ -1517,6 +1517,7 @@
     "scheduler": "Planificateur",
     "agents": "Agents",
     "skills": "Compétences",
+    "robots": "Robots",
     "playground": "Bac à sable",
     "chat": "Chat",
     "rules": "Règles",
@@ -1525,6 +1526,7 @@
     "logout": "Déconnexion",
     "addons": "Addons",
     "users": "Utilisateurs",
+    "access_keys": "Accès et clés API",
     "roles_catalog": "Catalogue des rôles",
     "audit": "Journal d'audit",
     "legal": "Documents RGPD",
@@ -1534,12 +1536,13 @@
     "section_core": "Noyau",
     "section_workflows": "Flux de travail",
     "section_ai_agents": "Agents IA",
-    "section_integrations": "Intégrations",
     "section_management": "Gestion",
     "section_apps": "Mes applications",
     "section_account": "Compte",
     "apps_home": "Toutes les applications",
-    "images": "Images",
+    "code_studio": "Code Studio",
+    "projekty": "Projets",
+    "ml_studio": "ML Studio",
     "tts": "Synthèse vocale",
     "translate": "Traducteur",
     "search_app": "Rechercher",
@@ -2791,6 +2794,7 @@
     "minimap_label": "Mini-carte",
     "minimap_name": "Carte",
     "autosave_saved": "Enregistré",
+    "system_readonly": "Ceci est un flow système TentaFlow — aperçu uniquement.",
     "autosave_pending": "Modifications non enregistrées…",
     "autosave_error": "Erreur d'enregistrement",
     "save_success": "Flow enregistré",
@@ -3095,6 +3099,14 @@
     "col_actions": "Actions",
     "edit_title": "Modifier",
     "history_title_short": "Historique d’exécutions",
+    "system_chip": "Système",
+    "factory_chip": "Usine",
+    "factory_restore": "Restaurer la version d'usine",
+    "factory_restore_confirm": "Restaurer la version d'usine du flux \"{name}\" ?",
+    "factory_restore_desc": "La version actuelle est enregistrée dans l'historique des versions, vous pourrez donc y revenir.",
+    "factory_restore_btn": "Restaurer",
+    "factory_restored_ok": "Version d'usine du flux \"{name}\" restaurée",
+    "preview": "Aperçu",
     "delete_title": "Supprimer",
     "close_title": "Fermer",
     "default_name": "Nouveau flux",
@@ -3989,6 +4001,8 @@
     "audio_pipeline_pending": "Démarrez une conversation avec le micro",
     "audio_engine_missing": "No audio engine installed",
     "audio_no_engine": "No engine",
+    "stt_no_service": "Aucun service STT en cours d'exécution — déployez un moteur STT dans Services pour parler à la voix.",
+    "tts_no_service": "Aucun service TTS en cours d'exécution — déployez un moteur TTS dans Services pour que l'assistant puisse parler.",
     "audio_preview_hint": "Mode audio — visage de l'assistant avec animation au repos. Appuyez sur le micro pour démarrer une conversation vocale.",
     "audio_start_mic": "Click to start the conversation",
     "audio_mic_denied": "Microphone access denied",
@@ -4039,6 +4053,7 @@
     "url_placeholder": "https://teams.microsoft.com/l/meetup-join/...",
     "url_hint": "Collez l'URL complète de la réunion Teams. Le bot rejoint en tant que participant.",
     "url_required": "L'URL de la réunion est obligatoire",
+    "stt_no_service": "Aucun service STT en cours d'exécution — déployez un moteur STT dans Services avant que le bot rejoigne la réunion.",
     "join": "Rejoindre la réunion",
     "leave": "Quitter la réunion",
     "join_success": "Le bot rejoint la réunion...",
@@ -4141,7 +4156,7 @@
     "disclaimer_never": "Désactivé",
     "sett_pipeline_title": "Pipeline audio",
     "sett_pipeline_sub": "Moteur STT et diarisation — s'applique à la prochaine réunion.",
-    "sett_stt_hint": "Alias du router, p. ex. whisper-large-v3",
+    "sett_stt_hint": "Alias du router ou nom du service STT déployé (vide = teams-stt)",
     "sett_tts_hint": "Optionnel — TTS pour les réponses du bot",
     "sett_diarization": "Diarisation",
     "sett_diarization_hint": "Reconnaissance du locuteur",
@@ -4155,8 +4170,8 @@
     "sett_ai_sub": "Modèle LLM pour le résumé.",
     "sett_llm_hint": "Alias du router, p. ex. qwen-3.5-0.8b",
     "sett_flow": "Flow",
-    "sett_flow_hint": "Flow orchestrateur du bot. Par défaut « Default Chat ».",
-    "sett_flow_default": "Par défaut (Default Chat)",
+    "sett_flow_hint": "Flow exécuté pour chaque prise de parole (STT → LLM → TTS). Par défaut « Meeting Bot ».",
+    "sett_flow_default": "Par défaut (Meeting Bot)",
     "sett_insights": "Fréquence des insights IA",
     "sett_insights_hint": "À quelle fréquence le bot insère des annotations",
     "insights_auto": "Auto (toutes les 30s ou sur action item)",
@@ -4528,7 +4543,6 @@
       "name": "Projets",
       "desc": "Base de connaissances, chat et équipe du projet"
     },
-    "badge_soon": "Bientôt",
     "chat": {
       "name": "Chat",
       "desc": "Discute avec un modèle local"
@@ -4537,9 +4551,9 @@
       "name": "ML Studio",
       "desc": "Annoter et entraîner des modèles de vision"
     },
-    "images": {
-      "name": "Images",
-      "desc": "Génère des images avec IA"
+    "benchmark-studio": {
+      "name": "Benchmark Studio",
+      "desc": "Mesurer les performances et la qualité des modèles"
     },
     "meeting": {
       "name": "Meeting Bot",
@@ -4571,13 +4585,7 @@
     }
   },
   "coming_soon": {
-    "heading": "Pas encore disponible",
-    "back": "Retour aux applis",
-    "images": "La génération d’images nécessite un moteur image-gen (p. ex. Stable Diffusion, ComfyUI). Demande à ton administrateur de le déployer via le Catalogue de services.",
-    "meeting": "Meeting Bot nécessite l’addon teams-bot avec OAuth et un handler binaire pour les transcriptions. Dans la feuille de route.",
-    "tts": "La synthèse vocale nécessite un moteur TTS déployé et un handler de synthèse. Les règles admin existent déjà ; le parcours utilisateur est dans la feuille de route.",
-    "translate": "Traduire réutilisera le backend LLM du chat dès qu’un handler utilisateur dédié sera branché. Dans la feuille de route.",
-    "search": "La recherche dans tes données est dans la feuille de route."
+    "back": "Retour aux applis"
   },
   "profile": {
     "title": "Profil",
@@ -5780,7 +5788,10 @@
     "billing_partial_note": "sans tarif : {count} {count|modèle|modèles} · coût partiel",
     "pricing_title": "Tarification des modèles",
     "pricing_hint": "tarifs par 1K tokens · audio à la minute · image à l'unité · enregistrement par ligne",
-    "pricing_formula": "coût = prompt·tarif + complétion·tarif + audio + images",
+    "pricing_formula": "coût = prompt·tarif + complétion·tarif + audio + images + embeddings·tarif",
+    "col_price_embedding": "Embedding / 1k",
+    "col_usage_missing": "Requêtes sans données de jetons",
+    "usage_missing_note": "coût incomplet : {count} {count|requête|requêtes} sans données de jetons",
     "no_pricing": "Aucun modèle à tarifer.",
     "pricing_saved": "Tarification enregistrée.",
     "pricing_invalid": "Tarifs invalides."

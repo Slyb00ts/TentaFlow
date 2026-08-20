@@ -67,21 +67,9 @@ name = "vad_chunk_processing"
 harness = false
 
 [[bench]]
-name = "wake_word_match"
-harness = false
-
-[[bench]]
 name = "prepad_ringbuffer"
 harness = false
 
 [[bench]]
 name = "roster_emit_concurrency"
-harness = false
-
-[[bench]]
-name = "sentence_buffer"
-harness = false
-
-[[bench]]
-name = "intent_classifier"
 harness = false

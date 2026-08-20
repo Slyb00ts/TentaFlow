@@ -21,15 +21,69 @@ const DEFAULT_ADMIN_ID: &str = "00000000-0000-4000-8000-000000000002";
 /// trafia `WHERE id = ?`). Losowy `new_v4()` per-node sprawial, ze ten sam
 /// logiczny flow mial inny id na kazdej maszynie i edycje nie propagowaly sie
 /// (UPDATE 0 wierszy -> "target row not found").
-const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
+pub const DEFAULT_CHAT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000010";
 
-/// Kanoniczny JSON domyslnego flow "Default Chat": czysty streaming przelot
-/// `trigger -> llm -> output(stream)`, BEZ pii_filter. To jest flow rozwiazywany
-/// dla kazdego modelu bez wlasnego flow (jak synthetic), wiec nie moze cicho
-/// redagowac tresci — pii_filter jest dostepny tylko gdy user wstawi go SAM.
-/// Wspoldzielony przez seed INSERT i migracje v113, zeby oba emitowaly
-/// bajt-identyczny JSON.
-pub const DEFAULT_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+/// Shared graph of both factory flows (Default Chat, Meeting Bot). Only the
+/// `llm` node config differs, so the body is assembled from one template
+/// instead of two literals that would drift apart.
+///
+/// `t1 trigger -audio-> s1 stt -full-> c1 combine`, `t1 -text-> c1`,
+/// `c1 -full-> l1 llm -stream-> x1 tts{forward_text} -stream-> o1 output.audio`.
+/// There is deliberately NO `llm.full -> output.text` edge: the streaming
+/// executor never runs it, text reaches the client through `tts.forward_text`.
+/// No node pins a model — stt/llm/tts resolve from `envelope.meta`
+/// (`stt_model` / `model` / `tts_model`).
+macro_rules! factory_chat_graph {
+    ($llm_config:literal) => {
+        concat!(
+            r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"s1","type":"stt","position":{"x":220,"y":120},"config":{}},{"id":"c1","type":"combine","position":{"x":440,"y":0},"config":{"separator":"\n\n"}},{"id":"l1","type":"llm","position":{"x":660,"y":0},"config":"#,
+            $llm_config,
+            r#"},{"id":"x1","type":"tts","position":{"x":880,"y":0},"config":{"forward_text":true}},{"id":"o1","type":"output","position":{"x":1100,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"s1","from_port":"audio","to_port":"in","data_type":"audio"},{"from_node":"t1","to_node":"c1","from_port":"text","to_port":"in","data_type":"text"},{"from_node":"s1","to_node":"c1","from_port":"full","to_port":"in","data_type":"text"},{"from_node":"c1","to_node":"l1","from_port":"full","to_port":"in","data_type":"text"},{"from_node":"l1","to_node":"x1","from_port":"stream","to_port":"in","data_type":"text"},{"from_node":"x1","to_node":"o1","from_port":"stream","to_port":"audio","data_type":"audio"}]}"#
+        )
+    };
+}
+
+/// Canonical JSON of the factory "Default Chat" flow: text OR audio in,
+/// streamed text + audio out (see `factory_chat_graph!`). No pii_filter — this
+/// flow resolves for every model without its own flow, so it must never redact
+/// content silently; users add pii_filter themselves.
+pub const DEFAULT_CHAT_FLOW_JSON: &str = factory_chat_graph!(r#"{}"#);
+
+/// Byte-exact JSON of the previous factory "Default Chat"
+/// (`trigger -> llm -> output(stream)`). Kept ONLY so the seed can tell an
+/// untouched factory row from a user edit: a row still equal to this literal
+/// is upgraded to `DEFAULT_CHAT_FLOW_JSON`, anything else is left alone.
+/// Migration v113 also emits exactly this shape (its historical output).
+pub const LEGACY_DEFAULT_CHAT_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","position":{"x":0,"y":0},"config":{}},{"id":"l1","type":"llm","position":{"x":200,"y":0},"config":{}},{"id":"o1","type":"output","position":{"x":400,"y":0},"config":{"mode":"stream"}}],"edges":[{"from_node":"t1","to_node":"l1","from_port":"text","data_type":"text"},{"from_node":"l1","to_node":"o1","from_port":"stream","to_port":"text","data_type":"text"}]}"#;
+
+/// Fixed UUID of the factory "Meeting Bot" flow. Same graph as Default Chat,
+/// but the LLM carries the meeting-response prompt with the `<NO_RESPONSE>`
+/// convention (the Teams bot treats that marker as "stay silent").
+/// `service_type=NULL`, `is_default=0`: never picked by the resolver, only by
+/// explicit assignment.
+pub const MEETING_BOT_FLOW_ID: &str = "00000000-0000-4000-8000-000000000060";
+
+/// Canonical JSON of the factory "Meeting Bot" flow (see `factory_chat_graph!`).
+pub const MEETING_BOT_FLOW_JSON: &str = factory_chat_graph!(
+    r#"{"system_prompt":"Jestes uprzejmym asystentem w spotkaniu Teams. Odpowiadasz krotko (1-2 zdania), tylko gdy ktos zadaje konkretne pytanie skierowane do bota lub gdy twoja interwencja moze pomoc. Jezeli mowa nie wymaga reakcji, odpowiedz dokladnie '<NO_RESPONSE>' bez zadnego innego tekstu."}"#
+);
+
+/// Factory flows: user-editable (`is_system=0`) but never deletable, and
+/// restorable to the canonical graph via `factory_flow_json`.
+pub const FACTORY_FLOW_IDS: [&str; 2] = [DEFAULT_CHAT_FLOW_ID, MEETING_BOT_FLOW_ID];
+
+pub fn is_factory_flow(id: &str) -> bool {
+    FACTORY_FLOW_IDS.contains(&id)
+}
+
+/// Canonical graph of a factory flow, for the "restore factory version" action.
+pub fn factory_flow_json(id: &str) -> Option<&'static str> {
+    match id {
+        DEFAULT_CHAT_FLOW_ID => Some(DEFAULT_CHAT_FLOW_JSON),
+        MEETING_BOT_FLOW_ID => Some(MEETING_BOT_FLOW_JSON),
+        _ => None,
+    }
+}
 
 /// Stale UUID seedowanych flow harnessa (§3.8). Jak Default Chat: id musi byc
 /// identyczne na kazdym node, bo zasob jest seedowany lokalnie a synchronizowany
@@ -1120,95 +1174,74 @@ Format de la transcription en entrée : chaque intervention est précédée d'un
 
 N'ajoute pas de champs absents du schéma ci-dessus. Ne commente pas. Renvoie uniquement du JSON valide."#;
 
-/// Seeduje domyslne diagramy flow reprezentujace pipeline routera.
+/// Seeds the factory flows (Default Chat, Meeting Bot). Both are user-editable,
+/// so the seed only INSERTs a missing row and never refreshes an existing
+/// graph — except the one case where the Default Chat row still holds the
+/// previous factory JSON byte-for-byte, which proves the user never touched it.
+/// The Default Chat row additionally keeps its resolver contract
+/// (`is_default=1`, `service_type='chat'`, active) on every start.
 fn seed_default_flows(conn: &Connection) -> Result<()> {
-    // Fresh DB seeduje tylko jeden domyslny flow: "Default Chat" (czysty
-    // streaming chat, default=1). Reszta pipeline'ow (TTS, Audio Chat,
-    // teams-flow, osobny "Standardowy pipeline LLM") nie jest zakladana —
-    // brakujace service_type/modality wykonuje sie bezposrednio na executorze
-    // (direct execution), a uzytkownik buduje wlasne flowy w Flow Builderze.
-    //
-    // Flow seedowany jako STREAMING (LLM -> output z mode=stream, edge od LLM
-    // z from_port=stream). Bez tego try_dispatch_streaming wpada na
-    // is_streaming=false -> wrap_blocking_as_stream -> single chunk z całością
-    // odpowiedzi (klient widzi calosc po EOF zamiast token-by-token).
-    //
-    // BEZ pii_filter: to jest domyslny przelot dla kazdego modelu bez wlasnego
-    // flow (jak synthetic), wiec nie moze cicho redagowac zapytania/kontekstu/
-    // odpowiedzi. pii_filter zostaje dostepnym wezlem — user wstawia go SAM w
-    // Flow Builderze, jesli go chce.
-    let flows: &[(&str, &str, &str, &str, i64)] = &[(
-        "Default Chat",
-        "Streaming chat pipeline: trigger -> LLM -> output(stream).",
-        "chat",
-        DEFAULT_CHAT_FLOW_JSON,
-        1,
-    )];
+    const DEFAULT_CHAT_DESCRIPTION: &str =
+        "Streaming chat pipeline: trigger(text|audio) -> stt -> combine -> LLM -> TTS(forward_text) -> output(stream).";
+    let flows: &[(&str, &str, &str, Option<&str>, &str, i64)] = &[
+        (
+            DEFAULT_CHAT_FLOW_ID,
+            "Default Chat",
+            DEFAULT_CHAT_DESCRIPTION,
+            Some("chat"),
+            DEFAULT_CHAT_FLOW_JSON,
+            1,
+        ),
+        (
+            MEETING_BOT_FLOW_ID,
+            "Meeting Bot",
+            "Meeting assistant pipeline: trigger(text|audio) -> stt -> combine -> LLM(<NO_RESPONSE> prompt) -> TTS(forward_text) -> output(stream).",
+            None,
+            MEETING_BOT_FLOW_JSON,
+            0,
+        ),
+    ];
 
-    // Migracja seedów. Dwie generacje legacy do nadpisania:
-    // 1) Stary blocking seed sprzed Krok 6/7 — flow_json bez `from_port":"stream"`.
-    // 2) Streaming seed sprzed wprowadzenia 6 typed input portow w output —
-    //    flow_json z `from_port":"stream"` ale bez `to_port":"text"` lub
-    //    `to_port":"audio"` (czyli edge'y konczace w output uzywaja default
-    //    `to_port="in"` ktory juz nie istnieje w output adapter).
-    // Custom flows (admin zmienil JSON i ma `to_port":"text"`/`audio`) zostaja
-    // nietkniete. Brak rekordu → INSERT.
-    let mut update_stmt = conn.prepare(
-        "UPDATE flows SET description = ?2, service_type = ?3, flow_json = ?4, \
-         is_default = ?5, status = 'active' \
-         WHERE name = ?1 AND ( \
-             flow_json NOT LIKE '%\"from_port\":\"stream\"%' \
-             OR ( \
-                 flow_json NOT LIKE '%\"to_port\":\"text\"%' \
-                 AND flow_json NOT LIKE '%\"to_port\":\"audio\"%' \
-                 AND flow_json NOT LIKE '%\"to_port\":\"image\"%' \
-                 AND flow_json NOT LIKE '%\"to_port\":\"video\"%' \
-                 AND flow_json NOT LIKE '%\"to_port\":\"embedding\"%' \
-                 AND flow_json NOT LIKE '%\"to_port\":\"other\"%' \
-             ) \
-         )",
-    )?;
-    // Guard po nazwie ORAZ po kanonicznym id (?6). Bez czesci `id = ?6` zmiana
-    // nazwy domyslnego flow powodowalaby przy nastepnym starcie INSERT na zajety
-    // staly id -> kolizja PRIMARY KEY i wywrotka seedu (od kiedy id jest staly,
-    // nie losowy).
+    // Guarded by name AND by the fixed id: a renamed factory flow must not be
+    // re-inserted on its (taken) primary key at the next start.
     let mut insert_stmt = conn.prepare(
         "INSERT INTO flows (id, name, description, service_type, flow_json, status, is_default) \
-         SELECT ?6, ?1, ?2, ?3, ?4, 'active', ?5 \
-         WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?1 OR id = ?6)",
+         SELECT ?1, ?2, ?3, ?4, ?5, 'active', ?6 \
+         WHERE NOT EXISTS (SELECT 1 FROM flows WHERE name = ?2 OR id = ?1)",
     )?;
-
-    for (name, description, service_type, flow_json, is_default) in flows {
-        // Streaming-aware seedy (chat + agents) — UPDATE legacy blocking
-        // wariantu, INSERT jeśli rekord nie istnieje. TTS pozostaje
-        // blocking, więc UPDATE nic nie zmieni (LIKE nie matchuje), INSERT
-        // wstawi przy fresh DB.
-        let migrated = update_stmt.execute(rusqlite::params![
+    for (id, name, description, service_type, flow_json, is_default) in flows {
+        let inserted = insert_stmt.execute(rusqlite::params![
+            id,
             name,
             description,
             service_type,
             flow_json,
             is_default
         ])?;
-        if migrated > 0 {
-            tracing::info!(
-                "seed: zmigrowano flow '{}' z blocking na streaming variant",
-                name
-            );
-            continue;
-        }
-        let inserted = insert_stmt.execute(rusqlite::params![
-            name,
-            description,
-            service_type,
-            flow_json,
-            is_default,
-            DEFAULT_CHAT_FLOW_ID
-        ])?;
         if inserted > 0 {
             debug!("Utworzono domyslny flow: {}", name);
         }
     }
+
+    let upgraded = conn.execute(
+        "UPDATE flows SET flow_json = ?2, description = ?3, updated_at = datetime('now') \
+         WHERE id = ?1 AND flow_json = ?4",
+        rusqlite::params![
+            DEFAULT_CHAT_FLOW_ID,
+            DEFAULT_CHAT_FLOW_JSON,
+            DEFAULT_CHAT_DESCRIPTION,
+            LEGACY_DEFAULT_CHAT_FLOW_JSON
+        ],
+    )?;
+    if upgraded > 0 {
+        info!("seed: upgraded untouched factory 'Default Chat' graph to the stt/tts shape");
+    }
+
+    conn.execute(
+        "UPDATE flows SET is_default = 1, service_type = 'chat', status = 'active' \
+         WHERE id = ?1 AND (is_default != 1 OR service_type IS NOT 'chat' OR status != 'active')",
+        rusqlite::params![DEFAULT_CHAT_FLOW_ID],
+    )?;
 
     Ok(())
 }
@@ -3048,8 +3081,8 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
         assert_eq!(
-            total, 9,
-            "oczekiwane 9 flow (Default Chat + Camera Analysis + Agent Run \
+            total, 10,
+            "oczekiwane 10 flow (Default Chat + Meeting Bot + Camera Analysis + Agent Run \
              + Code Harness A/B/C + RAG ingest/query/retrieval-round), jest {}",
             total
         );
@@ -3093,6 +3126,7 @@ mod tests {
                 "Code Harness — wymuszony potok z krytykiem".to_string(),
                 "Code Harness — zespół QA".to_string(),
                 "Default Chat".to_string(),
+                "Meeting Bot".to_string(),
                 "RAG — ingest dokumentu".to_string(),
                 "RAG — jeden hop retrievalu".to_string(),
                 "RAG — zapytanie multi-hop".to_string(),
@@ -3119,9 +3153,13 @@ mod tests {
             (service_type, is_default)
         };
 
-        let (st, def) = assert_dag("Default Chat", &["trigger", "llm", "output"], 2);
+        const FACTORY_TYPES: &[&str] = &["trigger", "stt", "combine", "llm", "tts", "output"];
+        let (st, def) = assert_dag("Default Chat", FACTORY_TYPES, 6);
         assert_eq!(st.as_deref(), Some("chat"));
         assert_eq!(def, 1, "Default Chat jest domyslnym flow");
+        let (st_mb, def_mb) = assert_dag("Meeting Bot", FACTORY_TYPES, 6);
+        assert_eq!(st_mb, None, "Meeting Bot jest poza resolverem service_type");
+        assert_eq!(def_mb, 0);
 
         // Single-graph "Agent Run" with the inline `agent_turn` loop region.
         // The region exit (`tool_exec`) is the stream producer: its `stream`
@@ -3214,7 +3252,7 @@ mod tests {
         let flow_count: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(flow_count, 9, "ponowny seed nie duplikuje flow");
+        assert_eq!(flow_count, 10, "ponowny seed nie duplikuje flow");
 
         let agent_count: i64 = conn
             .query_row(
@@ -3251,7 +3289,7 @@ mod tests {
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM flows", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(total, 9, "rename nie moze tworzyc drugiego flow");
+        assert_eq!(total, 10, "rename nie moze tworzyc drugiego flow");
         let name: String = conn
             .query_row(
                 "SELECT name FROM flows WHERE id = ?1",
@@ -3260,6 +3298,144 @@ mod tests {
             )
             .unwrap();
         assert_eq!(name, "Moj Czat", "rename musi przetrwac ponowny seed");
+    }
+
+    /// Factory flows (Default Chat, Meeting Bot): (1) both graphs pass R1–R8 on
+    /// the full registry and compile as STREAMING; (2) seed is idempotent;
+    /// (3) a Default Chat row still holding the previous factory JSON is
+    /// upgraded; (4) a user-edited graph is never overwritten; (5) a deleted
+    /// factory row comes back; (6) Default Chat keeps its resolver contract.
+    #[test]
+    fn factory_flows_compile_streaming_and_seed_respects_user_edits() {
+        use crate::flow_engine::cache::CompiledFlow;
+        use crate::flow_engine::dispatcher::build_registry_for_test;
+        use crate::flow_engine::types::FlowDefinition;
+        use crate::flow_engine::validation::validate;
+
+        let registry = build_registry_for_test();
+        for id in super::FACTORY_FLOW_IDS {
+            assert!(super::is_factory_flow(id));
+            let json = super::factory_flow_json(id).expect("factory json");
+            let def: FlowDefinition = serde_json::from_str(json).expect("parses");
+            validate(&def, &registry).expect("factory flow passes R1-R8");
+            let compiled = CompiledFlow::from_json(id, json, &registry).expect("compiles");
+            assert!(compiled.is_streaming, "factory flow {id} must be streaming");
+        }
+        assert!(!super::is_factory_flow(super::RAG_QUERY_FLOW_ID));
+        assert!(super::factory_flow_json("nope").is_none());
+
+        // Typed edge contract of the shared graph.
+        let def: FlowDefinition = serde_json::from_str(super::DEFAULT_CHAT_FLOW_JSON).unwrap();
+        let edge = |from: &str, to: &str| {
+            def.edges
+                .iter()
+                .find(|e| e.from == from && e.to == to)
+                .unwrap_or_else(|| panic!("edge {from}->{to}"))
+        };
+        assert_eq!(edge("t1", "s1").from_port, "audio");
+        assert_eq!(edge("t1", "c1").from_port, "text");
+        assert_eq!(edge("s1", "c1").from_port, "full");
+        assert_eq!(edge("c1", "l1").from_port, "full");
+        assert_eq!(edge("l1", "x1").from_port, "stream");
+        assert_eq!(edge("x1", "o1").from_port, "stream");
+        assert_eq!(edge("x1", "o1").to_port, "audio");
+        assert!(
+            !def.edges.iter().any(|e| e.from == "l1" && e.to == "o1"),
+            "no llm -> output edge: text reaches the client via tts.forward_text"
+        );
+        let mb: serde_json::Value = serde_json::from_str(super::MEETING_BOT_FLOW_JSON).unwrap();
+        let prompt = mb["nodes"][3]["config"]["system_prompt"].as_str().unwrap();
+        assert!(prompt.contains("<NO_RESPONSE>"));
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.write().unwrap();
+        let json_of = |id: &str| -> String {
+            conn.query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![id],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        let (is_system, is_default, service_type): (i64, i64, Option<String>) = conn
+            .query_row(
+                "SELECT is_system, is_default, service_type FROM flows WHERE id = ?1",
+                rusqlite::params![super::MEETING_BOT_FLOW_ID],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!((is_system, is_default, service_type), (0, 0, None));
+        assert_eq!(
+            json_of(super::MEETING_BOT_FLOW_ID),
+            super::MEETING_BOT_FLOW_JSON
+        );
+
+        // Idempotent.
+        super::seed_default_flows(&conn).expect("reseed");
+        assert_eq!(
+            json_of(super::DEFAULT_CHAT_FLOW_ID),
+            super::DEFAULT_CHAT_FLOW_JSON
+        );
+
+        // Old factory JSON is upgraded in place.
+        conn.execute(
+            "UPDATE flows SET flow_json = ?2 WHERE id = ?1",
+            rusqlite::params![
+                super::DEFAULT_CHAT_FLOW_ID,
+                super::LEGACY_DEFAULT_CHAT_FLOW_JSON
+            ],
+        )
+        .unwrap();
+        super::seed_default_flows(&conn).expect("reseed upgrades legacy");
+        assert_eq!(
+            json_of(super::DEFAULT_CHAT_FLOW_ID),
+            super::DEFAULT_CHAT_FLOW_JSON
+        );
+
+        // A user-edited graph survives the seed.
+        conn.execute(
+            "UPDATE flows SET flow_json = 'user-json' WHERE id IN (?1, ?2)",
+            rusqlite::params![super::DEFAULT_CHAT_FLOW_ID, super::MEETING_BOT_FLOW_ID],
+        )
+        .unwrap();
+        super::seed_default_flows(&conn).expect("reseed keeps user edits");
+        assert_eq!(json_of(super::DEFAULT_CHAT_FLOW_ID), "user-json");
+        assert_eq!(json_of(super::MEETING_BOT_FLOW_ID), "user-json");
+
+        // A deleted factory row is recreated.
+        conn.execute(
+            "DELETE FROM flows WHERE id IN (?1, ?2)",
+            rusqlite::params![super::DEFAULT_CHAT_FLOW_ID, super::MEETING_BOT_FLOW_ID],
+        )
+        .unwrap();
+        super::seed_default_flows(&conn).expect("reseed recreates");
+        assert_eq!(
+            json_of(super::DEFAULT_CHAT_FLOW_ID),
+            super::DEFAULT_CHAT_FLOW_JSON
+        );
+        assert_eq!(
+            json_of(super::MEETING_BOT_FLOW_ID),
+            super::MEETING_BOT_FLOW_JSON
+        );
+
+        // Default Chat never loses its resolver contract.
+        conn.execute(
+            "UPDATE flows SET is_default = 0, service_type = NULL, status = 'draft' WHERE id = ?1",
+            rusqlite::params![super::DEFAULT_CHAT_FLOW_ID],
+        )
+        .unwrap();
+        super::seed_default_flows(&conn).expect("reseed restores contract");
+        let (is_default, service_type, status): (i64, Option<String>, String) = conn
+            .query_row(
+                "SELECT is_default, service_type, status FROM flows WHERE id = ?1",
+                rusqlite::params![super::DEFAULT_CHAT_FLOW_ID],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(
+            (is_default, service_type.as_deref(), status.as_str()),
+            (1, Some("chat"), "active")
+        );
     }
 
     /// The shared retrieval shell: (1) its graph compiles through the real

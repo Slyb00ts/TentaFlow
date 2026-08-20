@@ -131,6 +131,47 @@ verifies `sender_node_id == iroh remote_id` and the Ed25519 key. Trust state liv
 (`MESH_MSG_HMAC_KEYS_SYNC`), in-memory only (revoke leaves no stale verifier). Cross-node
 frame pickup proxies frame bytes over the mesh stream.
 
+## Meeting Bot
+
+Core is the iroh CLIENT of the per-meeting `teams-bot` sidecar. `MeetingManager::start_session`
+registers a `QuicServiceHandle` (`iroh://<bot_endpoint_id>` + direct addr `127.0.0.1:<quic_port>`)
+under `meeting-bot-<session_id>` via `ServiceManager::register_meeting_bot`; the reconnect loop
+(`handles_cache::spawn_quic_reconnect_loop`) attaches `services/runtime/reverse_listener.rs`
+(`accept_bi` on the connection Core dialled) ONLY when the handle carries a `ReverseWiring` —
+set only for engines whose manifest declares `reverse_requests = true` (teams-bot does). Any other
+service's `open_bi` is never accepted; per-service concurrency is capped
+(`DEFAULT_MAX_REVERSE_STREAMS`), frames by `tentaflow_transport::MAX_FRAME_SIZE`.
+
+The bot never picks models or flows: every speech segment is one `ModelPayload::FlowInvoke`
+(`stream=true`) served by `meeting/flow_turn.rs` — session looked up by `meeting_id`, the
+`container_name` must equal the caller's service name (a bot cannot drive another meeting),
+pipeline (`stt_alias`/`llm_alias`/`tts_alias`/`flow_id`, migration 131, default flow
+`MEETING_BOT_FLOW_ID`) read from the session row. Raw PCM is wrapped into WAV for STT, the
+meeting context (active speaker, roster, last transcripts) is the trigger's `input_0`, meta
+follows the envelope contract (`output_audio`, `model`, `stt_model`, `tts_model`, `format=pcm`).
+Chunk order: `Transcript` (recorded + diarized BEFORE the first token), `TextDelta`, `AudioChunk`,
+`Done`. The first 32 bytes of text are held back for the `<NO_RESPONSE>` marker — on a hit the
+execution is cancelled and nothing (no held audio) reaches the meeting. Only
+`SUMMARIZATION_ALIAS` still travels to the bot as env; `RESPOND_ENABLED=false` makes the bot send
+`respond=false` and Core returns the transcript only.
+
+A sidecar is NOT a trusted peer. Both reverse entry points take `caller: Option<&ReverseCaller>` —
+`None` is mesh forwarding (trust-paired node, unchanged access), `Some` is a container. For a
+container the streaming path accepts ONLY `FlowInvoke`, and the unary path accepts only `Audio`,
+`Completion`, `PromptFetch` and `MeetingEvent`, each bound to a meeting the caller owns through
+the one gate `meeting/flow_turn.rs::lookup_owned_session` (`container_name == service_name`, not
+ended/leaving). Everything else (`Embeddings`, `Vision`, `Rerank`, `CameraCv`, `Documents`, …) is
+`Unauthorized` — Core is not an anonymous inference proxy. `Completion`/`PromptFetch` stay open
+because the bot's summarizer uses them; that is why the bot puts `meeting_id` into
+`ModelRequest.metadata` for both.
+
+A broken reverse stream must stop the work: `run_flow_turn` arms a `DropGuard` on the request's
+`CancellationToken` (disarmed only when the stream ended by itself), so aborting the producer task
+cancels LLM + TTS instead of running to the 120 s turn deadline. Independently,
+`finalize_streaming_flow` cancels when `outbound_tx.send` fails — a dropped consumer never leaves a
+flow grinding. Transcripts and answers are personal data: logs on these paths carry lengths,
+latencies and ids only, never the text.
+
 ## Addons
 
 `tentaflow-core/build.rs` embeds bundled addons from `tentaflow-core/addons/` (addon.wasm +
@@ -256,6 +297,14 @@ Charts: `TfCartesianChart` (tooltip + crosshair on by default, one-time transfor
 animation honouring `prefers-reduced-motion`, stacked rounded tops, `narrow` slicing, tone `accent`
 = `--tf-accent-3`). i18n namespace `analytics.*` must stay key-identical across all five locales.
 E2E: `tests/e2e/analytics.spec.js` (fixture `tests/e2e/fixtures/analytics-seed.sql`).
+
+Billing = `row_cost` in `dispatch/model_metrics.rs` over `DbModelPricing{prompt_per_1k,
+completion_per_1k, embedding_per_1k, audio_per_min, image_each}`. Completion tokens come 1:1 from the
+backend `usage` (streams force `stream_options.include_usage` upstream), so reasoning/thinking tokens
+are billed at the completion rate — Core never estimates tokens. A successful chat/embedding call
+without backend `usage` increments `model_metrics_rollup.usage_missing_count` (never for errors) and
+the UI shows "cost incomplete: N requests without token data" next to `missing_pricing`; a backend
+returning `usage: None` must be fixed at the backend (Codex parses `response.completed`).
 
 ## Admin Scheduler
 

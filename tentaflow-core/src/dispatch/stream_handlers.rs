@@ -382,8 +382,16 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         };
 
         let blobs = fd.blobs();
-        let mut envelope =
-            match flow_envelope_from_inputs(invoke.inputs, resolved_language, &blobs).await {
+        let mut envelope = match flow_envelope_from_inputs(
+            invoke.inputs,
+            resolved_language,
+            invoke.output_audio,
+            invoke.stt_model,
+            invoke.tts_model,
+            &blobs,
+        )
+        .await
+        {
                 Ok(e) => e,
                 Err(e) => {
                     let _ = push_end(
@@ -466,6 +474,29 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
             }
         };
 
+        // Pre-producer nodes (stt) are done by now; surface the transcript
+        // once so the client can render the user's utterance immediately.
+        if let Some(text) = exec
+            .producer_input
+            .meta
+            .get("stt_transcript")
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+        {
+            if push_chunk_async(
+                &sub,
+                MessageBody::FlowInvokeChunkBody(FlowInvokeChunk::Transcript {
+                    text: text.to_string(),
+                }),
+            )
+            .await
+            .is_err()
+            {
+                cancel.cancel();
+                return;
+            }
+        }
+
         let mut stream = exec.stream;
         // Akumulujemy pelny tekst po stronie serwera (autorytatywne zrodlo) — delty
         // streamu moga zostac uciete u klienta gdy audio leci dluzej niz tekst.
@@ -540,6 +571,9 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
 async fn flow_envelope_from_inputs(
     inputs: Vec<FlowInputValue>,
     language: Option<String>,
+    output_audio: bool,
+    stt_model: Option<String>,
+    tts_model: Option<String>,
     blobs: &Arc<dyn crate::flow_engine::blob_store::BlobStore>,
 ) -> anyhow::Result<crate::flow_engine::envelope::FlowEnvelope> {
     use crate::flow_engine::envelope::{ArtifactProvenance, FlowEnvelope, FlowValue};
@@ -613,6 +647,15 @@ async fn flow_envelope_from_inputs(
     if let Some(lang) = language {
         env.meta
             .insert("language".into(), serde_json::Value::String(lang));
+    }
+    env.set_output_audio(output_audio);
+    if let Some(m) = stt_model.filter(|m| !m.is_empty()) {
+        env.meta
+            .insert("stt_model".into(), serde_json::Value::String(m));
+    }
+    if let Some(m) = tts_model.filter(|m| !m.is_empty()) {
+        env.meta
+            .insert("tts_model".into(), serde_json::Value::String(m));
     }
     Ok(env)
 }

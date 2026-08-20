@@ -3699,38 +3699,6 @@ textarea {
   text-transform: uppercase;
 }
 
-/* Honest "backend not wired" screen for user apps. */
-.coming-soon-card {
-  text-align: center;
-  padding: 40px 24px;
-  max-width: 640px;
-  margin: 24px auto;
-}
-.coming-soon-card .coming-soon-badge {
-  display: inline-block;
-  background: var(--warning);
-  color: #111;
-  font-size: 10px;
-  font-weight: 800;
-  padding: 3px 8px;
-  border-radius: 4px;
-  letter-spacing: 0.04em;
-  text-transform: uppercase;
-  margin-bottom: 16px;
-}
-.coming-soon-card .coming-soon-title {
-  font-size: 20px;
-  font-weight: 700;
-  margin: 0 0 8px;
-  color: var(--text);
-}
-.coming-soon-card .coming-soon-body {
-  color: var(--text-2);
-  font-size: 14px;
-  line-height: 1.6;
-  margin: 0 0 20px;
-}
-
 /* Profile page header block. */
 .profile-header {
   display: flex;

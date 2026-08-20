@@ -314,6 +314,7 @@ pub use message_body::{
     FlowVersionListResponse,
     FlowVersionRestoreRequest,
     FlowVersionRestoreResponse,
+    FlowFactoryRestoreRequest,
     FlowVersionSummary,
     GenericMetricPoint,
     GpuProcessInfo,

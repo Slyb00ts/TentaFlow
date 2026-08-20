@@ -181,25 +181,52 @@ pub trait SttEngine: Send + Sync {
     ) -> anyhow::Result<mpsc::Receiver<TranscribeChunk>>;
 }
 
-/// Model Whisper do pobrania z HuggingFace (tylko large-v3-turbo — reszta za slaba)
-pub const WHISPER_MODEL_NAME: &str = "large-v3-turbo";
-pub const WHISPER_MODEL_FILENAME: &str = "ggml-large-v3-turbo.bin";
-pub const WHISPER_MODEL_SIZE: u64 = 1_600_000_000;
+/// HF repo hosting whisper.cpp GGML conversions of every `openai/whisper-*`
+/// checkpoint under the `ggml-<variant>.bin` naming.
+const WHISPER_CPP_GGML_REPO: &str = "ggerganov/whisper.cpp";
 
-const WHISPER_HF_REPO: &str = "ggerganov/whisper.cpp";
-
-/// Domyslne repo MLX Whisper, gdy deploy nie poda jawnego `model_repo`
-/// (np. leniwy reload po restarcie procesu).
-pub const MLX_WHISPER_DEFAULT_REPO: &str = "mlx-community/whisper-large-v3-turbo-4bit";
-
-/// Status modelu Whisper (pobrany / zaladowany)
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct WhisperModelStatus {
-    pub name: String,
+/// Source of the GGML file for the whisper.cpp engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GgmlSource {
+    pub repo: String,
     pub filename: String,
-    pub size_bytes: u64,
-    pub downloaded: bool,
-    pub loaded: bool,
+}
+
+/// Maps the deploy's `(model_repo, model_file)` onto the GGML file whisper.cpp
+/// loads. An explicit `model_file` is taken verbatim from `model_repo`; an
+/// `openai/whisper-<variant>` preset resolves to the whisper.cpp conversion
+/// of that variant. Anything else has no GGML artifact we know how to fetch.
+pub fn resolve_ggml_source(
+    model_repo: &str,
+    model_file: Option<&str>,
+) -> anyhow::Result<GgmlSource> {
+    let repo = model_repo.trim();
+    if repo.is_empty() {
+        anyhow::bail!("whisper.cpp deploy has no model_repo");
+    }
+    if let Some(file) = model_file.map(str::trim).filter(|f| !f.is_empty()) {
+        // The name is appended to a cache directory, so it has to be one plain
+        // component: `components()` collapses separators, `..`, `.` and drive
+        // prefixes that a substring check would miss on Windows paths.
+        let path = std::path::Path::new(file);
+        if path.is_absolute() || path.components().count() != 1 {
+            anyhow::bail!("model_file '{file}' must be a bare file name");
+        }
+        return Ok(GgmlSource {
+            repo: repo.to_string(),
+            filename: file.to_string(),
+        });
+    }
+    match repo.strip_prefix("openai/whisper-") {
+        Some(variant) if !variant.is_empty() => Ok(GgmlSource {
+            repo: WHISPER_CPP_GGML_REPO.to_string(),
+            filename: format!("ggml-{variant}.bin"),
+        }),
+        _ => anyhow::bail!(
+            "whisper.cpp cannot resolve a GGML file for '{repo}': pick an openai/whisper-* \
+             preset or set model_file to the .bin name inside that repo"
+        ),
+    }
 }
 
 /// Manager silnikow STT — wybiera odpowiedni backend.
@@ -213,6 +240,15 @@ pub struct SttManager {
 }
 
 impl SttManager {
+    /// Manager over an explicit engine list (tests plug in fake engines).
+    pub fn with_engines(engines: Vec<Box<dyn SttEngine>>) -> Self {
+        Self {
+            engines,
+            active_engine: None,
+            active_deploy_params: WhisperDeployParams::default(),
+        }
+    }
+
     pub fn new() -> Self {
         #[allow(unused_mut)]
         let mut engines: Vec<Box<dyn SttEngine>> = Vec::new();
@@ -227,11 +263,7 @@ impl SttManager {
         #[cfg(feature = "inference-mlx-whisper")]
         engines.push(Box::new(mlx_whisper::MlxWhisperEngine::new()));
 
-        Self {
-            engines,
-            active_engine: None,
-            active_deploy_params: WhisperDeployParams::default(),
-        }
+        Self::with_engines(engines)
     }
 
     /// Lista dostepnych backendow
@@ -307,87 +339,91 @@ impl SttManager {
         base
     }
 
-    /// Status modelu Whisper (pobrany / zaladowany)
-    pub fn whisper_model_status(&self) -> WhisperModelStatus {
-        let models_dir = Self::whisper_models_dir();
-        let path = models_dir.join(WHISPER_MODEL_FILENAME);
-        let downloaded = path.exists();
-        let loaded = self
-            .active_engine
-            .and_then(|idx| self.engines.get(idx))
-            .and_then(|e| e.model_info())
-            .map(|info| info.path == path.to_string_lossy().as_ref())
-            .unwrap_or(false);
-
-        WhisperModelStatus {
-            name: WHISPER_MODEL_NAME.to_string(),
-            filename: WHISPER_MODEL_FILENAME.to_string(),
-            size_bytes: WHISPER_MODEL_SIZE,
-            downloaded,
-            loaded,
-        }
-    }
-
-    /// Pobierz model STT (jesli brak w cache) i zaladuj go, swiadomie wybierajac
-    /// engine. `engine_id == None` => auto: preferuj `mlx-whisper` gdy dostepny,
-    /// inaczej `whisper` (whisper.cpp). Galaz MLX pobiera katalog z
-    /// `config.json`+`model.safetensors`+tokenizer (przez `prepare_model`);
-    /// galaz whisper.cpp pobiera plik ggml. `log_sink` raportuje postep do
-    /// okienka deploy (uzywany tylko przez galaz MLX).
+    /// Downloads (when not cached) and loads the model of an embedded STT
+    /// service row. `engine_id` and `model_repo` come from the deploy
+    /// (manifest engine id + selected preset / user repo); nothing here has a
+    /// built-in default model. `mlx-whisper` fetches the MLX directory
+    /// (`config.json` + safetensors + tokenizer) via `prepare_model`;
+    /// `whisper` fetches the GGML file resolved by `resolve_ggml_source`.
+    /// `log_sink` reports progress to the deploy window.
     pub async fn ensure_and_load(
         &mut self,
-        engine_id: Option<&str>,
-        model_repo: Option<&str>,
+        engine_id: &str,
+        model_repo: &str,
+        model_file: Option<&str>,
         device: Option<&str>,
         log_sink: Option<&crate::services::deploy::LogSink>,
         deploy_params: WhisperDeployParams,
     ) -> anyhow::Result<SttModelInfo> {
-        // Auto-pick musi zwrocic `&'static str`, zeby immutable borrow przez
-        // `available_backends()` zakonczyl sie przed `&mut self.load_model`.
-        let engine_id: &str = engine_id.unwrap_or_else(|| {
-            if self.available_backends().iter().any(|b| b == "mlx-whisper") {
-                "mlx-whisper"
-            } else {
-                "whisper"
+        match engine_id {
+            #[cfg(feature = "inference-mlx-whisper")]
+            "mlx-whisper" => {
+                let repo = model_repo.trim();
+                if repo.is_empty() {
+                    anyhow::bail!("mlx-whisper deploy has no model_repo");
+                }
+                let dir = mlx_whisper::prepare_model(repo, log_sink).await?;
+                self.load_model(&dir, device, Some("mlx-whisper"), deploy_params)
+                    .await
             }
-        });
-
-        #[cfg(feature = "inference-mlx-whisper")]
-        if engine_id == "mlx-whisper" {
-            let repo = model_repo
-                .map(str::trim)
-                .filter(|s| !s.is_empty())
-                .unwrap_or(MLX_WHISPER_DEFAULT_REPO);
-            let dir = mlx_whisper::prepare_model(repo, log_sink).await?;
-            return self
-                .load_model(&dir, device, Some("mlx-whisper"), deploy_params)
-                .await;
+            "whisper" => {
+                let source = resolve_ggml_source(model_repo, model_file)?;
+                let model_path = Self::whisper_models_dir().join(&source.filename);
+                if !model_path.exists() {
+                    info!(
+                        "Downloading whisper.cpp model {}/{} from HuggingFace...",
+                        source.repo, source.filename
+                    );
+                    if let Some(s) = log_sink {
+                        s.info(&format!(
+                            "[stt] downloading {}/{}",
+                            source.repo, source.filename
+                        ));
+                    }
+                    let api = hf_hub::api::tokio::Api::new()?;
+                    let repo = api.model(source.repo.clone());
+                    let hf_path = repo.get(&source.filename).await?;
+                    std::fs::copy(&hf_path, &model_path)?;
+                    info!("whisper.cpp model downloaded: {:?}", model_path);
+                }
+                self.load_model(&model_path, device, Some("whisper"), deploy_params)
+                    .await
+            }
+            other => anyhow::bail!(
+                "engine '{other}' is not an embedded STT engine available in this build \
+                 (available: {})",
+                self.available_backends().join(", ")
+            ),
         }
+    }
+}
 
-        // Galaz whisper.cpp — laduje wylacznie plik ggml. `engine_id` (gdy MLX
-        // niezbudowany jest tu nieczytany), `model_repo`/`log_sink` sa
-        // nieuzywane (model jest staly: large-v3-turbo z whisper.cpp).
-        let _ = (engine_id, model_repo, log_sink);
-        let filename = WHISPER_MODEL_FILENAME;
-        let models_dir = Self::whisper_models_dir();
-        let model_path = models_dir.join(filename);
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        if !model_path.exists() {
-            info!(
-                "Pobieranie modelu Whisper '{}' z HuggingFace...",
-                WHISPER_MODEL_NAME
-            );
-            let api = hf_hub::api::tokio::Api::new()?;
-            let repo = api.model(WHISPER_HF_REPO.to_string());
-            let hf_path = repo.get(filename).await?;
-            std::fs::copy(&hf_path, &model_path)?;
-            info!(
-                "Model Whisper '{}' pobrany: {:?}",
-                WHISPER_MODEL_NAME, model_path
-            );
-        }
+    #[test]
+    fn ggml_source_from_openai_preset() {
+        let src = resolve_ggml_source("openai/whisper-large-v3-turbo", None).unwrap();
+        assert_eq!(src.repo, WHISPER_CPP_GGML_REPO);
+        assert_eq!(src.filename, "ggml-large-v3-turbo.bin");
+        let src = resolve_ggml_source(" openai/whisper-base ", None).unwrap();
+        assert_eq!(src.filename, "ggml-base.bin");
+    }
 
-        self.load_model(&model_path, device, Some("whisper"), deploy_params)
-            .await
+    #[test]
+    fn ggml_source_explicit_file_wins() {
+        let src =
+            resolve_ggml_source("ggerganov/whisper.cpp", Some("ggml-medium-q5_0.bin")).unwrap();
+        assert_eq!(src.repo, "ggerganov/whisper.cpp");
+        assert_eq!(src.filename, "ggml-medium-q5_0.bin");
+        assert!(resolve_ggml_source("ggerganov/whisper.cpp", Some("../x.bin")).is_err());
+    }
+
+    #[test]
+    fn ggml_source_rejects_unknown_repo_and_empty() {
+        assert!(resolve_ggml_source("", None).is_err());
+        assert!(resolve_ggml_source("openai/whisper-", None).is_err());
+        assert!(resolve_ggml_source("someone/other-model", None).is_err());
     }
 }

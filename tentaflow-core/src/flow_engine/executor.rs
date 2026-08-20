@@ -78,6 +78,10 @@ fn chunk_carries_first_token(chunk: &LlmStreamChunk) -> bool {
 pub struct StreamingExecution {
     pub stream: BoxStream<'static, Result<EnvelopeDelta>>,
     pub outcome: oneshot::Receiver<FlowExecutionOutcome>,
+    /// Envelope fed into the stream producer. Pre-producer nodes (stt,
+    /// combine, …) finish before `execute_streaming` returns, so a handler can
+    /// read their meta (e.g. `stt_transcript`) without waiting for the stream.
+    pub producer_input: Arc<FlowEnvelope>,
 }
 
 /// Blocking execution. Dataflow scheduler: node startuje gdy wszystkie jego
@@ -368,10 +372,12 @@ pub async fn execute_direct_blocking(
                     message: msg.clone(),
                 },
             );
-            return Err(anyhow!(
-                "direct '{}' execution failed: {msg}",
+            // `context` (not a fresh `anyhow!`) keeps the adapter's typed error
+            // downcastable for `DispatchError::from`.
+            return Err(e.context(format!(
+                "direct '{}' execution failed",
                 node.node_type
-            ));
+            )));
         }
     };
 
@@ -463,7 +469,7 @@ pub async fn execute_direct_streaming(
             producer_step_started,
             producer_node_id: node.id.clone(),
             producer_node_type: node.node_type.clone(),
-            producer_input_envelope: initial_arc,
+            producer_input_envelope: initial_arc.clone(),
             trace: Vec::new(),
             db,
             progress,
@@ -478,6 +484,7 @@ pub async fn execute_direct_streaming(
     Ok(StreamingExecution {
         stream,
         outcome: outcome_rx,
+        producer_input: initial_arc,
     })
 }
 
@@ -1625,7 +1632,9 @@ pub async fn execute_streaming(
                         message: e.to_string(),
                     },
                 );
-                anyhow!("pre-producer node '{}' failed: {e}", node.id)
+                // `context` keeps the adapter's typed error (e.g. "no STT
+                // service") downcastable for `DispatchError::from`.
+                e.context(format!("pre-producer node '{}' failed", node.id))
             })?;
         emit_node_finished(&ctx, &node.id, &TraceStatus::Ok);
         let duration_ms = attempt_started.elapsed().as_millis() as u64;
@@ -1739,7 +1748,7 @@ pub async fn execute_streaming(
             producer_step_started,
             producer_node_id,
             producer_node_type,
-            producer_input_envelope,
+            producer_input_envelope: producer_input_envelope.clone(),
             trace,
             db: db_for_task,
             progress,
@@ -1754,6 +1763,7 @@ pub async fn execute_streaming(
     Ok(StreamingExecution {
         stream,
         outcome: outcome_rx,
+        producer_input: producer_input_envelope,
     })
 }
 
@@ -1862,6 +1872,7 @@ async fn execute_streaming_region(
         .first()
         .map(|i| (*i.envelope).clone())
         .unwrap_or_else(|| (*initial_arc).clone());
+    let producer_input = Arc::new(seed.clone());
 
     let entry_def_idx = compiled.execution_order[region.entry_pos];
     let producer_node_id = compiled.definition.nodes[entry_def_idx].id.clone();
@@ -1900,6 +1911,7 @@ async fn execute_streaming_region(
     Ok(StreamingExecution {
         stream,
         outcome: outcome_rx,
+        producer_input,
     })
 }
 
@@ -2229,7 +2241,14 @@ async fn finalize_streaming_flow(
                             break 'main;
                         }
                         send_res = outbound_tx.send(Ok(EnvelopeDelta::Llm(c))) => {
-                            let _ = send_res;
+                            if send_res.is_err() {
+                                // The consumer dropped the stream: nobody will
+                                // read another delta, so cancel instead of
+                                // grinding through the rest of the flow.
+                                cancel.cancel();
+                                cancelled = true;
+                                break 'main;
+                            }
                         }
                     }
                 }
@@ -2245,7 +2264,14 @@ async fn finalize_streaming_flow(
                             break 'main;
                         }
                         send_res = outbound_tx.send(Ok(EnvelopeDelta::Audio(a))) => {
-                            let _ = send_res;
+                            if send_res.is_err() {
+                                // The consumer dropped the stream: nobody will
+                                // read another delta, so cancel instead of
+                                // grinding through the rest of the flow.
+                                cancel.cancel();
+                                cancelled = true;
+                                break 'main;
+                            }
                         }
                     }
                 }
@@ -2952,6 +2978,7 @@ mod chain_integration_tests {
 
         let mut initial = FlowEnvelope::empty();
         initial.payload = FlowValue::Text("hi".into());
+        initial.set_output_audio(true);
 
         let exec = execute_streaming(fresh_db(), compiled, initial, ctx, registry)
             .await
@@ -2991,6 +3018,95 @@ mod chain_integration_tests {
         assert_eq!(audio_chunks[0].mime, "audio/wav");
         assert!(saw_finish, "klient nie dostał finish_reason=Stop dla audio");
 
+        let outcome = exec.outcome.await.expect("outcome");
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+    }
+
+    /// trigger(audio) → stt → llm(stream) → output: the stt node finishes before
+    /// `execute_streaming` returns, so `producer_input` already carries
+    /// `meta["stt_transcript"]` while the LLM stream is still running.
+    #[tokio::test]
+    async fn execute_streaming_exposes_stt_transcript_on_producer_input() {
+        use crate::flow_engine::dispatchers::{SttDispatcher, SttRequest, SttResponse};
+        use crate::flow_engine::node_adapters::SttNodeAdapter;
+
+        struct FakeStt;
+        #[async_trait]
+        impl SttDispatcher for FakeStt {
+            async fn transcribe(&self, _req: SttRequest) -> Result<SttResponse> {
+                Ok(SttResponse {
+                    text: "dzien dobry".into(),
+                    detected_language: Some("pl".into()),
+                    ..SttResponse::default()
+                })
+            }
+        }
+
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(TriggerNodeAdapter::new()));
+        r.register(Arc::new(SttNodeAdapter::new()));
+        r.register(Arc::new(OutputNodeAdapter::new()));
+        r.register_llm(Arc::new(LlmNodeAdapter::new()));
+        let registry = Arc::new(r);
+
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"s1","type":"stt","config":{"model":"whisper"}},
+                {"id":"l1","type":"llm","config":{"model":"qwen3.5-0.8b"}},
+                {"id":"o1","type":"output","config":{"mode":"stream"}}
+            ],
+            "edges":[
+                {"from":"t1","to":"s1","from_port":"audio","to_port":"in"},
+                {"from":"s1","to":"l1","from_port":"full","to_port":"in"},
+                {"from":"l1","to":"o1","from_port":"stream","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
+        );
+
+        let mut ctx = stub_ctx();
+        ctx.stt = Arc::new(FakeStt);
+        ctx.llm = Arc::new(FakeStreamingLlm::new(vec![LlmStreamChunk {
+            choice_index: 0,
+            text_delta: "ok".into(),
+            finish_reason: Some(FinishReason::Stop),
+            ..Default::default()
+        }]));
+
+        let initial = FlowEnvelope::with_payload(FlowValue::Audio {
+            blob_ref: BlobRef {
+                id: "blob1".into(),
+                sha256: "x".into(),
+                size_bytes: 4,
+                mime: "audio/wav".into(),
+            },
+            mime: "audio/wav".into(),
+            sample_rate: Some(16_000),
+        });
+
+        let exec = execute_streaming(fresh_db(), compiled, initial, ctx, registry)
+            .await
+            .expect("execute_streaming");
+
+        assert_eq!(
+            exec.producer_input
+                .meta
+                .get("stt_transcript")
+                .and_then(|v| v.as_str()),
+            Some("dzien dobry")
+        );
+        assert_eq!(
+            exec.producer_input.meta.get("language").and_then(|v| v.as_str()),
+            Some("pl")
+        );
+
+        let mut stream = exec.stream;
+        while let Some(item) = stream.next().await {
+            item.expect("delta ok");
+        }
         let outcome = exec.outcome.await.expect("outcome");
         assert_eq!(outcome.finish_reason, FinishReason::Stop);
     }

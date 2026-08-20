@@ -6,7 +6,7 @@
 //       artifacts['source_audio'] żeby downstream node mógł się odwołać.
 // =============================================================================
 
-use anyhow::{anyhow, Result};
+use anyhow::{anyhow, Context as _, Result};
 use async_trait::async_trait;
 
 use crate::flow_engine::dispatchers::SttRequest;
@@ -147,13 +147,19 @@ impl NodeAdapter for SttNodeAdapter {
             .stt
             .transcribe(req)
             .await
-            .map_err(|e| anyhow!("stt adapter: dispatcher failed: {e}"))?;
+            .context("stt adapter: dispatcher failed")?;
 
         // Output envelope: payload Text(transcript), audio blob ląduje w
         // artifacts['source_audio']. Verbose pola (duration/segments/speakers)
         // lądują w meta — flow_outcome_to_stt_response je rozpakowuje gdy
         // klient prosił o response_format=verbose_json.
         let mut out: FlowEnvelope = (**envelope).clone();
+        // The transcript also rides in meta so a handler can read it from the
+        // streaming producer's input envelope after the payload moved on.
+        out.meta.insert(
+            "stt_transcript".into(),
+            serde_json::Value::String(response.text.clone()),
+        );
         out.payload = FlowValue::Text(response.text);
         out.put_artifact(
             "source_audio",
@@ -282,6 +288,31 @@ mod tests {
             Some("pl")
         );
         assert!(out.artifacts.contains_key("source_audio"));
+        assert_eq!(
+            out.meta.get("stt_transcript").and_then(|v| v.as_str()),
+            Some("transkrypcja")
+        );
+        assert_eq!(
+            out.meta.get("language").and_then(|v| v.as_str()),
+            Some("pl")
+        );
+    }
+
+    #[tokio::test]
+    async fn detected_language_does_not_override_requested_language() {
+        let mut ctx = stub_ctx();
+        ctx.stt = Arc::new(FakeStt);
+        let mut env = audio_envelope();
+        env.meta.insert("language".into(), json!("en"));
+        let out = SttNodeAdapter::new()
+            .execute(&node(json!({"model": "whisper"})), &[input(env)], &ctx)
+            .await
+            .unwrap();
+        assert_eq!(out.meta.get("language").and_then(|v| v.as_str()), Some("en"));
+        assert_eq!(
+            out.meta.get("detected_language").and_then(|v| v.as_str()),
+            Some("pl")
+        );
     }
 
     /// Stage 3d-0b-4-fix: verbose STT round-trip — fake dispatcher zwraca

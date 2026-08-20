@@ -684,20 +684,74 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             129,
+            "model_pricing_embedding_rate",
+            MigrationStep::Rust(model_pricing_add_embedding_rate),
+        ),
+        (
+            130,
+            "model_metrics_rollup_usage_missing",
+            MigrationStep::Rust(model_metrics_rollup_add_usage_missing),
+        ),
+        (
+            131,
+            "meeting_sessions_pipeline",
+            MigrationStep::Rust(meeting_sessions_add_pipeline_columns),
+        ),
+        (
+            132,
             "events_tracking_foundation",
             MigrationStep::RustSelfManaged(create_events_tracking_foundation),
         ),
         (
-            130,
+            133,
             "graph_collection_paths_repair",
             MigrationStep::Rust(repair_graph_collection_paths),
         ),
         (
-            131,
+            134,
             "run_provenance_columns",
             MigrationStep::Rust(add_run_provenance_columns),
         ),
     ]
+}
+
+/// The bot no longer receives STT/LLM/TTS aliases or a flow through env —
+/// every FlowInvoke turn resolves them from the session row, so the effective
+/// pipeline has to be persisted at spawn. NULL on legacy rows: the reader
+/// falls back to the teams-* defaults and the factory Meeting Bot flow.
+fn meeting_sessions_add_pipeline_columns(conn: &Connection) -> Result<()> {
+    for column in ["stt_alias", "llm_alias", "tts_alias", "flow_id"] {
+        if !column_exists(conn, "meeting_sessions", column)? {
+            conn.execute_batch(&format!(
+                "ALTER TABLE meeting_sessions ADD COLUMN {column} TEXT;"
+            ))?;
+        }
+    }
+    Ok(())
+}
+
+/// Embedding requests were counted (`embedding_tokens`) but never priced, so
+/// every embedding model looked free. Separate rate because embedding tokens
+/// are not prompt tokens (different models, different price lists).
+fn model_pricing_add_embedding_rate(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "model_pricing", "embedding_per_1k")? {
+        conn.execute_batch(
+            "ALTER TABLE model_pricing ADD COLUMN embedding_per_1k REAL NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
+}
+
+/// Successful requests whose backend returned no `usage` landed in the rollup
+/// with zero tokens and a silently zero cost. The counter makes that gap
+/// visible (cost is a lower bound when it is non-zero). Errors never count.
+fn model_metrics_rollup_add_usage_missing(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "model_metrics_rollup", "usage_missing_count")? {
+        conn.execute_batch(
+            "ALTER TABLE model_metrics_rollup ADD COLUMN usage_missing_count INTEGER NOT NULL DEFAULT 0;",
+        )?;
+    }
+    Ok(())
 }
 
 /// Which agents an agent may delegate to.
@@ -2448,7 +2502,7 @@ fn strip_pii_from_default_chat_flow(conn: &Connection) -> Result<()> {
          description = 'Streaming chat pipeline: trigger -> LLM -> output(stream).' \
          WHERE id = ?2 AND is_default = 1 AND flow_json = ?3",
         rusqlite::params![
-            crate::db::seed::DEFAULT_CHAT_FLOW_JSON,
+            crate::db::seed::LEGACY_DEFAULT_CHAT_FLOW_JSON,
             DEFAULT_CHAT_FLOW_ID,
             DEFAULT_CHAT_FLOW_JSON_WITH_PII,
         ],
@@ -3059,6 +3113,13 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "flow_id",
             "agent harness flow id (flows.id is TEXT UUID); born TEXT in v64, no declared \
              FK so the agent row can sync ahead of (or independently of) the flow row",
+        ),
+        t(
+            "meeting_sessions",
+            "flow_id",
+            "meeting pipeline flow id (flows.id is TEXT UUID); born TEXT in v131 \
+             (post-flip, never held an INTEGER id), no declared FK so a session row \
+             keeps its recorded pipeline even if the flow is later deleted",
         ),
         t(
             "agent_runs",
@@ -8681,7 +8742,7 @@ mod tests {
                 SELECT json_group_array(value) FROM json_each(roles.permissions_json)
                 WHERE value NOT IN ('events.read', 'events.read_all')
             );
-            DELETE FROM _migrations WHERE version = 129;
+            DELETE FROM _migrations WHERE version = 132;
             ",
         )
         .unwrap();
@@ -8689,7 +8750,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v129_fresh_database_has_events_foundation() {
+    fn migration_v132_fresh_database_has_events_foundation() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
@@ -8776,7 +8837,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v129_upgrades_v128_database_without_data_loss() {
+    fn migration_v132_upgrades_v131_database_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
         rewind_to_v128(&conn);
@@ -8817,7 +8878,7 @@ mod tests {
             )
             .unwrap();
 
-        create_events_tracking_foundation(&conn, 129, "events_tracking_foundation").unwrap();
+        create_events_tracking_foundation(&conn, 132, "events_tracking_foundation").unwrap();
 
         // Upgrading a real v128 database DOES rebuild: the narrow CHECK is gone
         // and the renamed table is the one the migration created.
@@ -8876,7 +8937,7 @@ mod tests {
 
         let stamped: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _migrations WHERE version = 129",
+                "SELECT COUNT(*) FROM _migrations WHERE version = 132",
                 [],
                 |r| r.get(0),
             )
@@ -8885,9 +8946,9 @@ mod tests {
 
         // Re-running on an already-migrated database is a no-op, not a duplicate
         // column, a duplicate policy or a second permission entry.
-        conn.execute("DELETE FROM _migrations WHERE version = 129", [])
+        conn.execute("DELETE FROM _migrations WHERE version = 132", [])
             .unwrap();
-        create_events_tracking_foundation(&conn, 129, "events_tracking_foundation").unwrap();
+        create_events_tracking_foundation(&conn, 132, "events_tracking_foundation").unwrap();
         let events_policies: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM compliance_retention_policies WHERE scope_kind = 'events'",
@@ -9108,7 +9169,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(default_json, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
+        assert_eq!(default_json, crate::db::seed::LEGACY_DEFAULT_CHAT_FLOW_JSON);
         assert!(!default_json.contains("pii_filter"), "pii_filter removed");
         assert!(!default_desc.contains("pii_filter"), "description updated");
         let parsed: serde_json::Value = serde_json::from_str(&default_json).unwrap();
@@ -9149,7 +9210,7 @@ mod tests {
                 |r| r.get(0),
             )
             .unwrap();
-        assert_eq!(again, crate::db::seed::DEFAULT_CHAT_FLOW_JSON);
+        assert_eq!(again, crate::db::seed::LEGACY_DEFAULT_CHAT_FLOW_JSON);
     }
 
     /// A fresh `run(&conn)` (all migrations + nothing else) leaves the seeded
@@ -9399,7 +9460,7 @@ mod tests {
     const CURRENT_ORGS_ROOT: &str = "/mnt/big/orgs";
 
     #[test]
-    fn migration_v130_repairs_only_stale_derived_graph_paths() {
+    fn migration_v133_repairs_only_stale_derived_graph_paths() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
         conn.execute(
@@ -9516,7 +9577,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v131_fresh_database_has_run_provenance() {
+    fn migration_v134_fresh_database_has_run_provenance() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
@@ -9590,12 +9651,12 @@ mod tests {
                     .unwrap();
             }
         }
-        conn.execute("DELETE FROM _migrations WHERE version = 131", [])
+        conn.execute("DELETE FROM _migrations WHERE version = 134", [])
             .unwrap();
     }
 
     #[test]
-    fn migration_v131_upgrades_v130_database_without_data_loss() {
+    fn migration_v134_upgrades_v133_database_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
         rewind_to_v130(&conn);
@@ -9729,7 +9790,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 131, "131 must be the highest applied migration");
+        assert_eq!(head, 134, "134 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9737,6 +9798,6 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 131);
+        assert_eq!(head_again, 134);
     }
 }

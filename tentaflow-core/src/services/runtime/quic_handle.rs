@@ -53,6 +53,11 @@ pub struct QuicServiceHandle {
     /// Sygnal shutdown per serwis
     shutdown_tx: watch::Sender<bool>,
     pub shutdown_rx: watch::Receiver<bool>,
+    /// Present only for services whose engine manifest declares
+    /// `reverse_requests = true`: the reconnect loop then runs an `accept_bi`
+    /// listener on every established connection. `None` = Core never accepts
+    /// streams opened by this service.
+    reverse: parking_lot::RwLock<Option<crate::services::runtime::reverse_listener::ReverseWiring>>,
 }
 
 impl QuicServiceHandle {
@@ -64,7 +69,24 @@ impl QuicServiceHandle {
             config,
             shutdown_tx,
             shutdown_rx,
+            reverse: parking_lot::RwLock::new(None),
         }
+    }
+
+    /// Enables the reverse-request listener for this handle. Must be called
+    /// before the reconnect loop connects; the wiring is read at every
+    /// `Connected` transition.
+    pub fn set_reverse_wiring(
+        &self,
+        wiring: crate::services::runtime::reverse_listener::ReverseWiring,
+    ) {
+        *self.reverse.write() = Some(wiring);
+    }
+
+    pub fn reverse_wiring(
+        &self,
+    ) -> Option<crate::services::runtime::reverse_listener::ReverseWiring> {
+        self.reverse.read().clone()
     }
 
     /// Wyslij sygnal shutdown do tego serwisu
@@ -117,6 +139,20 @@ impl QuicServiceHandle {
             client.shutdown().await;
         }
         self.set_disconnected(reason.to_string()).await;
+    }
+}
+
+/// A registered meeting bot: its QUIC handle plus the reconnect-loop task
+/// that owns the connection (and, through the handle, the reverse listener).
+struct MeetingBotLink {
+    handle: Arc<QuicServiceHandle>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl MeetingBotLink {
+    fn shutdown(self) {
+        self.handle.shutdown();
+        self.task.abort();
     }
 }
 
@@ -195,6 +231,12 @@ pub struct ServiceManager {
     /// Router dla odwrotnych requestow od kontenerow (ustawiany po konstrukcji Routera)
     pub(crate) reverse_router: parking_lot::RwLock<Option<crate::routing::Router>>,
 
+    /// Per-meeting bot sidecars keyed by `meeting-bot-<session_id>`. They are
+    /// not rows in `services` (one process per meeting, spawned by
+    /// `MeetingManager`), so they live outside `live_handles`; the QUIC
+    /// reconnect loop of each entry is owned here and aborted on unregister.
+    meeting_bots: dashmap::DashMap<String, MeetingBotLink>,
+
     /// EventBus addonow — ustawiany po konstrukcji AddonManager (jak reverse_router)
     pub(crate) event_bus: parking_lot::RwLock<Option<Arc<crate::addon::event_bus::EventBus>>>,
 
@@ -235,10 +277,34 @@ impl ServiceManager {
             prompt_registry,
             mesh_services_registry: parking_lot::RwLock::new(None),
             reverse_router: parking_lot::RwLock::new(None),
+            meeting_bots: dashmap::DashMap::new(),
             event_bus: parking_lot::RwLock::new(None),
             snapshot_rx: parking_lot::RwLock::new(None),
             live_handles: Arc::new(crate::services::handles_cache::LiveHandlesCache::new()),
         })
+    }
+
+    /// Registers the QUIC handle of a freshly spawned meeting bot and starts
+    /// its reconnect loop. Re-registering the same name shuts the previous
+    /// link down first.
+    pub fn register_meeting_bot(&self, name: String, handle: Arc<QuicServiceHandle>) {
+        let task = crate::services::handles_cache::spawn_quic_reconnect_loop(handle.clone());
+        if let Some(prev) = self.meeting_bots.insert(name, MeetingBotLink { handle, task }) {
+            prev.shutdown();
+        }
+    }
+
+    /// Drops the link of a meeting bot: the handle's shutdown signal stops the
+    /// reverse listener and closes the connection, the loop task is aborted.
+    pub fn unregister_meeting_bot(&self, name: &str) {
+        if let Some((_, link)) = self.meeting_bots.remove(name) {
+            link.shutdown();
+        }
+    }
+
+    /// Router wired by `set_reverse_router`; `None` until the Router exists.
+    pub fn reverse_router(&self) -> Option<crate::routing::Router> {
+        self.reverse_router.read().clone()
     }
 
     /// Wires the supervisor's services snapshot receiver. Called by
@@ -341,6 +407,13 @@ impl ServiceManager {
         &self,
         service_name: &str,
     ) -> Option<Arc<crate::net::quic::QuicClient>> {
+        let bot_handle = self
+            .meeting_bots
+            .get(service_name)
+            .map(|link| link.handle.clone());
+        if let Some(handle) = bot_handle {
+            return handle.get_client().await;
+        }
         self.find_quic_client_for_model(service_name).await
     }
 

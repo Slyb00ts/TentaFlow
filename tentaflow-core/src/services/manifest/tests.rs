@@ -35,6 +35,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         resource_kind: None,
         requires_model: None,
         gpu_supported: None,
+        reverse_requests: false,
         dgx_spark: None,
         cluster_capable: None,
         preset_only: None,

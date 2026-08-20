@@ -116,6 +116,9 @@ const FlowBuilderScreen = {
       palette: null,
       config: null,
       dirty: false,
+      // System flows (`flows.is_system`) are rejected by the server on update,
+      // so the builder opens them as a pure preview.
+      readOnly: false,
       autosaveTimer: null,
       saving: false,
       templatesMap: new Map(),
@@ -136,6 +139,7 @@ const FlowBuilderScreen = {
         flow_json: detail.graphJson ?? '{"nodes":[],"edges":[]}',
         status: detail.status ?? (detail.enabled ? 'active' : 'draft'),
       };
+      state.readOnly = !!detail.isSystem;
     } catch (err) {
       toast(I18n.t('flows_builder.load_error', { error: err.message }), 'error');
       Router.navigate('flows');
@@ -150,6 +154,7 @@ const FlowBuilderScreen = {
 
     // Paleta
     state.palette = new FlowPalette(root.querySelector('[data-role="palette"]'), {
+      readOnly: state.readOnly,
       onTemplatesLoaded: (list) => {
         for (const t of list) state.templatesMap.set(t.node_type, t);
         state.canvas?.setTemplates(list);
@@ -164,6 +169,7 @@ const FlowBuilderScreen = {
     // Canvas
     const canvasRoot = root.querySelector('[data-role="canvas"]');
     state.canvas = new FlowCanvas(canvasRoot, {
+      readOnly: state.readOnly,
       onChange: () => {
         this._markDirty();
         this._updateStats();
@@ -189,6 +195,7 @@ const FlowBuilderScreen = {
 
     // Config
     state.config = new FlowConfig(root.querySelector('[data-role="config"]'), {
+      readOnly: state.readOnly,
       // Declared flow variables (flow_json.variables) feed the per-node
       // io-mapping editor (§3.12): output_mapping targets must be declared (R10).
       getFlowVariables: () => state.flowVariables || [],
@@ -223,6 +230,20 @@ const FlowBuilderScreen = {
     nameEl.value = state.flow.name || '';
     statusEl.value = state.flow.status || 'draft';
     crumbName.textContent = state.flow.name || I18n.t('flows_builder.crumb_empty');
+
+    if (state.readOnly) {
+      root.classList.add('fb-readonly');
+      nameEl.disabled = true;
+      statusEl.setAttribute('disabled', '');
+      for (const role of ['save', 'variables', 'test', 'undo', 'redo', 'autosave']) {
+        root.querySelector(`[data-role="${role}"]`)?.setAttribute('hidden', '');
+      }
+      const banner = document.createElement('tf-alert');
+      banner.setAttribute('tone', 'info');
+      banner.setAttribute('data-role', 'system-readonly');
+      banner.setAttribute('message', I18n.t('flows_builder.system_readonly'));
+      root.insertBefore(banner, root.querySelector('[data-role="body"]'));
+    }
 
     nameEl.addEventListener('input', () => { this._markDirty(); crumbName.textContent = nameEl.value || I18n.t('flows_builder.crumb_empty'); });
     statusEl.addEventListener('change', () => this._markDirty());
@@ -274,13 +295,15 @@ const FlowBuilderScreen = {
     state.cleanupFns.push(() => document.removeEventListener('keydown', onKey));
 
     // Autosave co 10s gdy dirty
-    state.autosaveTimer = setInterval(() => {
-      if (state.dirty && !state.saving) this._save({ silent: true });
-    }, 10000);
+    if (!state.readOnly) {
+      state.autosaveTimer = setInterval(() => {
+        if (state.dirty && !state.saving) this._save({ silent: true });
+      }, 10000);
+    }
 
     this._updateStats();
     this._renderMinimap();
-    this._setAutosave('ok');
+    if (!state.readOnly) this._setAutosave('ok');
   },
 
   async unmount() {
@@ -297,7 +320,7 @@ const FlowBuilderScreen = {
 
   _markDirty() {
     const s = this._state;
-    if (!s) return;
+    if (!s || s.readOnly) return;
     s.dirty = true;
     this._setAutosave('pending');
     this._updateStats();
@@ -334,7 +357,7 @@ const FlowBuilderScreen = {
 
   async _save({ silent = false } = {}) {
     const s = this._state;
-    if (!s || s.saving) return;
+    if (!s || s.saving || s.readOnly) return;
     // Walidacja klient-side przed wyslaniem do backendu — porty, wiszace
     // krawedzie, cykle. Backend ma swoj validate_flow_json_str, wiec to jest
     // ochrona przed zbednym round-tripem i czytelnym komunikatem inline.
@@ -385,6 +408,7 @@ const FlowBuilderScreen = {
   async _openVariables() {
     const s = this._state;
     if (!s) return;
+    if (s.readOnly) return;
     const result = await openVariablesEditor(s.flowVariables || []);
     if (result === null) return; // anulowano — bez zmian
     s.flowVariables = result;
@@ -397,6 +421,7 @@ const FlowBuilderScreen = {
     if (!s) return;
     const tag = (ev.target.tagName || '').toUpperCase();
     if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+    if (s.readOnly) return;
     if (ev.key === 'Delete' || ev.key === 'Backspace') {
       s.canvas.deleteSelected();
       ev.preventDefault();

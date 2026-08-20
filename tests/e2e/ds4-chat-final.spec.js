@@ -15,6 +15,10 @@ const FLOW_ID = '00000000-0000-4000-8000-000000000010';
     await page.locator('[data-view="chat"]').first().click();
     await page.waitForTimeout(2000);
     if (await page.locator('#chat-new').count()) { await page.locator('#chat-new').click(); await page.waitForTimeout(1200); }
+    // Default Chat (isDefault) must be preselected before any manual pick.
+    const preselected = await page.evaluate(() => document.querySelector('#chat-flow')?.value || '');
+    if (preselected !== FLOW_ID) throw new Error(`expected Default Chat preselected in #chat-flow, got '${preselected}'`);
+    log(`default flow preselected: ${preselected}`);
     await page.evaluate((fid) => { for (const s of ['#chat-flow','#flow-select']) { const el=document.querySelector(s); if(!el)continue; const o=Array.from(el.querySelectorAll('option')).find(x=>x.value===fid); if(o){el.value=o.value; el.dispatchEvent(new Event('change',{bubbles:true}));}}}, FLOW_ID);
     await page.waitForTimeout(600);
     const q = 'W jednym zdaniu: jaka jest stolica Polski i nad jaka rzeka lezy?';

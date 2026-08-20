@@ -809,6 +809,18 @@ pub struct FlowInvokeRequest {
     /// Język (transkrypcja/TTS) → envelope.meta.
     pub language: Option<String>,
     pub session_id: Option<String>,
+    /// `envelope.meta["output_audio"]`: `true` = text + synthesized audio,
+    /// `false` (default) = text only, the flow's `tts` node passes text through.
+    #[serde(default)]
+    pub output_audio: bool,
+    /// Seeds `envelope.meta["stt_model"]` when the flow's `stt` node has no
+    /// pinned model.
+    #[serde(default)]
+    pub stt_model: Option<String>,
+    /// Seeds `envelope.meta["tts_model"]` when the flow's `tts` node has no
+    /// pinned model.
+    #[serde(default)]
+    pub tts_model: Option<String>,
 }
 
 /// Pojedynczy chunk odpowiedzi flow — odwzorowanie `EnvelopeDelta`. Klient
@@ -837,6 +849,11 @@ pub enum FlowInvokeChunk {
         mime: String,
         filename: Option<String>,
         bytes: Vec<u8>,
+    },
+    /// Transcript of the audio input (`stt` node), emitted once before the
+    /// first text/audio chunk so the client can render the user's utterance.
+    Transcript {
+        text: String,
     },
 }
 
@@ -940,6 +957,11 @@ pub struct FlowSummary {
     /// edit/delete/status changes, so the UI can hide those actions.
     #[serde(default)]
     pub is_system: bool,
+    /// Factory flow (`db::seed::FACTORY_FLOW_IDS`): editable but never
+    /// deletable, restorable to its canonical graph via
+    /// `FlowFactoryRestoreRequest`.
+    #[serde(default)]
+    pub is_factory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -956,6 +978,11 @@ pub struct FlowDetail {
     /// edit/delete/status changes, so the UI can hide those actions.
     #[serde(default)]
     pub is_system: bool,
+    /// Factory flow (`db::seed::FACTORY_FLOW_IDS`): editable but never
+    /// deletable, restorable to its canonical graph via
+    /// `FlowFactoryRestoreRequest`.
+    #[serde(default)]
+    pub is_factory: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -5114,6 +5141,15 @@ pub struct FlowVersionRestoreResponse {
     pub ok: bool,
 }
 
+/// Resets a factory flow (`FACTORY_FLOW_IDS`) to its canonical graph. The
+/// current graph is snapshotted into `flow_versions` first, so the action is
+/// itself reversible through `FlowVersionRestoreRequest`. The reply is the
+/// refreshed `FlowDetailResponse`.
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
+pub struct FlowFactoryRestoreRequest {
+    pub flow_id: String,
+}
+
 // ----- SSO / TLS / NGC -----
 
 /// Pojedynczy wpis providera SSO dla listy admina. `client_secret` nie jest
@@ -8121,6 +8157,11 @@ pub enum MessageBody {
     // zeby nie ruszac indeksow istniejacych wariantow. JEDEN wariant na cala
     // rodzine (request+response) w `CodeStudioPayload`.
     CodeStudioBody(crate::code_studio::CodeStudioPayload),
+
+    // ----- Flows: "restore factory version" for FACTORY_FLOW_IDS -----
+    // Appended at the END of the enum (ciborium tags by variant index). The
+    // reply reuses `FlowDetailResponse`.
+    FlowFactoryRestoreRequestBody(FlowFactoryRestoreRequest),
 }
 
 // =============================================================================
@@ -8153,6 +8194,41 @@ mod tests {
     fn round_trip(body: MessageBody) -> MessageBody {
         let bytes = crate::cbor::encode(&body).expect("encode");
         crate::cbor::decode::<MessageBody>(&bytes).expect("decode")
+    }
+
+    #[test]
+    fn flow_invoke_request_roundtrip_with_output_audio_fields() {
+        let req = FlowInvokeRequest {
+            flow_id: Some("f1".into()),
+            model: "m".into(),
+            service_type: "chat".into(),
+            inputs: vec![FlowInputValue::Text("hi".into())],
+            language: Some("pl".into()),
+            session_id: None,
+            output_audio: true,
+            stt_model: Some("whisper".into()),
+            tts_model: Some("piper".into()),
+        };
+        match round_trip(MessageBody::FlowInvokeRequestBody(req.clone())) {
+            MessageBody::FlowInvokeRequestBody(d) => assert_eq!(d, req),
+            other => panic!("unexpected {other:?}"),
+        }
+        // Peers that omit the new fields must decode with output_audio=false.
+        let old_json = serde_json::json!({
+            "flow_id": null, "model": "m", "service_type": "chat",
+            "inputs": [], "language": null, "session_id": null
+        });
+        let d: FlowInvokeRequest = serde_json::from_value(old_json).expect("decode");
+        assert!(!d.output_audio);
+        assert!(d.stt_model.is_none() && d.tts_model.is_none());
+    }
+
+    #[test]
+    fn flow_invoke_chunk_transcript_roundtrip() {
+        let body = MessageBody::FlowInvokeChunkBody(FlowInvokeChunk::Transcript {
+            text: "dzień dobry".into(),
+        });
+        assert_eq!(round_trip(body.clone()), body);
     }
 
     #[test]
@@ -9491,6 +9567,38 @@ mod tests {
         assert_eq!(t.foot_force.len(), 4);
         assert_eq!(t.imu.unwrap().yaw, Some(1.57));
         assert_eq!(t.battery.unwrap().voltage, Some(28.4));
+    }
+
+    #[test]
+    fn flow_factory_restore_request_round_trip() {
+        let body = MessageBody::FlowFactoryRestoreRequestBody(FlowFactoryRestoreRequest {
+            flow_id: "00000000-0000-4000-8000-000000000010".to_string(),
+        });
+        let bytes = crate::cbor::encode(&body).expect("encode");
+        let decoded: MessageBody = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded, body);
+    }
+
+    /// `is_factory` was appended with `#[serde(default)]`: a peer that omits
+    /// it must still decode to `false`.
+    #[test]
+    fn flow_summary_without_is_factory_decodes_as_false() {
+        let mut value = serde_json::json!({
+            "id": "f1",
+            "name": "n",
+            "description": null,
+            "created_at_epoch": 1,
+            "updated_at_epoch": 2,
+            "enabled": true,
+            "is_default": false,
+            "published_model_name": null,
+            "is_system": false,
+        });
+        let summary: FlowSummary = serde_json::from_value(value.clone()).expect("decode");
+        assert!(!summary.is_factory);
+        value["is_factory"] = serde_json::Value::Bool(true);
+        let summary: FlowSummary = serde_json::from_value(value).expect("decode");
+        assert!(summary.is_factory);
     }
 
     #[test]

@@ -1532,17 +1532,17 @@
     "legal": "Legal Documents",
     "profiling_sessions": "Profiling",
     "meeting": "Meeting Bot",
-    "pose": "Pose",
     "section_general": "General",
     "section_core": "Core",
     "section_workflows": "Workflows",
     "section_ai_agents": "AI Agents",
-    "section_integrations": "Integrations",
     "section_management": "Management",
     "section_apps": "My apps",
     "section_account": "Account",
     "apps_home": "All apps",
-    "images": "Images",
+    "code_studio": "Code Studio",
+    "projekty": "Projects",
+    "ml_studio": "ML Studio",
     "tts": "Text-to-Speech",
     "translate": "Translate",
     "search_app": "Search",
@@ -2965,6 +2965,7 @@
     "minimap_label": "Mini-map",
     "minimap_name": "Map",
     "autosave_saved": "Saved",
+    "system_readonly": "This is a TentaFlow system flow — preview only.",
     "autosave_pending": "Unsaved changes…",
     "autosave_error": "Save error",
     "save_success": "Flow saved",
@@ -3271,6 +3272,14 @@
     "col_actions": "Actions",
     "edit_title": "Edit",
     "history_title_short": "Execution history",
+    "system_chip": "System",
+    "factory_chip": "Factory",
+    "factory_restore": "Restore factory version",
+    "factory_restore_confirm": "Restore the factory version of flow \"{name}\"?",
+    "factory_restore_desc": "The current version is saved to the version history, so you can go back to it.",
+    "factory_restore_btn": "Restore",
+    "factory_restored_ok": "Factory version of flow \"{name}\" restored",
+    "preview": "Preview",
     "delete_title": "Delete",
     "close_title": "Close",
     "default_name": "New flow",
@@ -4875,6 +4884,8 @@
     "audio_pipeline_pending": "Start a conversation with the mic",
     "audio_engine_missing": "No audio engine installed",
     "audio_no_engine": "No engine",
+    "stt_no_service": "No STT service is running — deploy an STT engine in Services to talk by voice.",
+    "tts_no_service": "No TTS service is running — deploy a TTS engine in Services so the assistant can speak.",
     "audio_preview_hint": "Audio mode — assistant face with idle animation. Tap the mic to start a voice conversation.",
     "audio_start_mic": "Click to start the conversation",
     "audio_mic_denied": "Microphone access denied",
@@ -4919,34 +4930,13 @@
     "accept_license": "Accept License on NVIDIA",
     "retry": "Retry Deploy"
   },
-  "pose": {
-    "title": "Pose",
-    "subtitle": "Live camera preview with local body skeleton overlay",
-    "live_chip": "Live",
-    "model_label": "Pose model",
-    "camera_label": "Camera",
-    "camera_front": "Front",
-    "camera_back": "Back",
-    "fps_label": "Frame rate",
-    "start": "Start",
-    "stop": "Stop",
-    "status": "Status",
-    "status_idle": "Ready",
-    "status_running": "Analyzing live",
-    "latency": "Latency",
-    "poses": "Bodies",
-    "no_model_title": "No deployed pose model",
-    "no_model_desc": "Deploy MoveNet Lightning or YOLOv8n Pose from the service catalog. The model downloads automatically during deployment.",
-    "camera_error": "Could not start the camera",
-    "inference_error": "Could not estimate pose",
-    "models_error": "Could not load models"
-  },
   "meeting": {
     "title": "Meeting Bot",
     "url_label": "Teams Meeting URL",
     "url_placeholder": "https://teams.microsoft.com/l/meetup-join/...",
     "url_hint": "Paste the full Teams meeting URL. The bot will join as a participant.",
     "url_required": "Meeting URL is required",
+    "stt_no_service": "No STT service is running — deploy an STT engine in Services before the bot joins a meeting.",
     "join": "Join Meeting",
     "leave": "Leave Meeting",
     "join_success": "Bot is joining the meeting...",
@@ -5059,7 +5049,7 @@
     "disclaimer_never": "Disabled",
     "sett_pipeline_title": "Audio pipeline",
     "sett_pipeline_sub": "STT engine and diarization — applies to the next meeting.",
-    "sett_stt_hint": "Router alias, e.g. whisper-large-v3",
+    "sett_stt_hint": "Router alias or deployed STT service name (empty = teams-stt)",
     "sett_tts_hint": "Optional — TTS for bot replies",
     "sett_diarization": "Diarization",
     "sett_diarization_hint": "Speaker recognition",
@@ -5073,8 +5063,8 @@
     "sett_ai_sub": "LLM model for summarization.",
     "sett_llm_hint": "Router alias, e.g. qwen-3.5-0.8b",
     "sett_flow": "Flow",
-    "sett_flow_hint": "Bot orchestrator flow. Defaults to \"Default Chat\".",
-    "sett_flow_default": "Default (Default Chat)",
+    "sett_flow_hint": "Flow run for every utterance (STT → LLM → TTS). Defaults to \"Meeting Bot\".",
+    "sett_flow_default": "Default (Meeting Bot)",
     "sett_insights": "AI insights frequency",
     "sett_insights_hint": "How often the bot inserts AI annotations",
     "insights_auto": "Auto (every 30s or on action item)",
@@ -5587,7 +5577,6 @@
       "name": "Projects",
       "desc": "Project knowledge base, chat and team"
     },
-    "badge_soon": "Soon",
     "chat": {
       "name": "Chat",
       "desc": "Talk with a local model"
@@ -5596,17 +5585,13 @@
       "name": "ML Studio",
       "desc": "Annotate and train vision models"
     },
-    "images": {
-      "name": "Images",
-      "desc": "Generate images with AI"
+    "benchmark-studio": {
+      "name": "Benchmark Studio",
+      "desc": "Measure model performance and quality"
     },
     "meeting": {
       "name": "Meeting Bot",
       "desc": "Capture and summarize meetings"
-    },
-    "pose": {
-      "name": "Pose",
-      "desc": "Camera preview with body skeleton overlay"
     },
     "flows": {
       "name": "Workflows",
@@ -5634,13 +5619,7 @@
     }
   },
   "coming_soon": {
-    "heading": "Not yet available",
-    "back": "Back to apps",
-    "images": "The image generation app requires an image-gen engine (e.g. Stable Diffusion, ComfyUI). Ask your administrator to deploy one from the Service Catalog.",
-    "meeting": "Meeting Bot requires the teams-bot addon with OAuth configured, plus a backend binary handler for transcripts. Tracked on the roadmap.",
-    "tts": "Text-to-Speech requires a deployed TTS engine and a synthesize binary handler. The TTS rules admin already exists; the user-facing synthesize flow is tracked on the roadmap.",
-    "translate": "Translate will reuse the chat LLM backend once a dedicated user-facing handler is wired. Tracked on the roadmap.",
-    "search": "Search across your data is on the roadmap."
+    "back": "Back to apps"
   },
   "profile": {
     "title": "Profile",
@@ -7011,7 +6990,10 @@
     "billing_partial_note": "no pricing: {count} {count|model|models} · partial cost",
     "pricing_title": "Model pricing",
     "pricing_hint": "rates per 1K tokens · audio per minute · image each · save per row",
-    "pricing_formula": "cost = prompt·rate + completion·rate + audio + images",
+    "pricing_formula": "cost = prompt·rate + completion·rate + audio + images + embeddings·rate",
+    "col_price_embedding": "Embedding / 1k",
+    "col_usage_missing": "Requests without token data",
+    "usage_missing_note": "incomplete cost: {count} {count|request|requests} without token data",
     "no_pricing": "No models to price.",
     "pricing_saved": "Pricing saved.",
     "pricing_invalid": "Invalid rates."

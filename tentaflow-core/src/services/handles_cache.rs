@@ -335,9 +335,16 @@ pub fn spawn_quic_reconnect_loop(handle: Arc<QuicServiceHandle>) -> JoinHandle<(
         let reconnect_interval =
             Duration::from_millis(handle.config.reconnect_interval_ms.max(500));
         let mut shutdown_rx = handle.shutdown_rx.clone();
+        // Reverse listener bound to the CURRENT client; a new client (after a
+        // reconnect) gets a new listener, the old one is aborted so it never
+        // keeps polling a closed endpoint.
+        let mut reverse_task: Option<JoinHandle<()>> = None;
 
         loop {
             if *shutdown_rx.borrow() {
+                if let Some(task) = reverse_task.take() {
+                    task.abort();
+                }
                 handle
                     .shutdown_client_and_mark_disconnected("shutdown")
                     .await;
@@ -352,7 +359,11 @@ pub fn spawn_quic_reconnect_loop(handle: Arc<QuicServiceHandle>) -> JoinHandle<(
                 QuicServiceState::ConfigError { .. } => {
                     // Permanent failure — supervisor must replace the handle
                     // explicitly via `cache.insert(...)` after fixing the
-                    // config; the loop simply exits here.
+                    // config; the loop simply exits here. The reverse listener
+                    // belongs to this loop's client, so it dies with it.
+                    if let Some(task) = reverse_task.take() {
+                        task.abort();
+                    }
                     return;
                 }
                 QuicServiceState::Connected => {
@@ -363,12 +374,18 @@ pub fn spawn_quic_reconnect_loop(handle: Arc<QuicServiceHandle>) -> JoinHandle<(
                     tokio::select! {
                         _ = shutdown_rx.changed() => {
                             if *shutdown_rx.borrow() {
+                                if let Some(task) = reverse_task.take() {
+                                    task.abort();
+                                }
                                 handle.shutdown_client_and_mark_disconnected("shutdown").await;
                                 return;
                             }
                         }
                         _ = tokio::time::sleep(Duration::from_secs(5)) => {
                             if !handle.is_available().await {
+                                if let Some(task) = reverse_task.take() {
+                                    task.abort();
+                                }
                                 continue;
                             }
                         }
@@ -379,7 +396,20 @@ pub fn spawn_quic_reconnect_loop(handle: Arc<QuicServiceHandle>) -> JoinHandle<(
                     let inner_shutdown = shutdown_rx.clone();
                     match crate::net::quic::QuicClient::connect(cfg, inner_shutdown).await {
                         Ok(client) => {
-                            handle.set_connected(Arc::new(client)).await;
+                            let client = Arc::new(client);
+                            handle.set_connected(client.clone()).await;
+                            if let Some(task) = reverse_task.take() {
+                                task.abort();
+                            }
+                            if let Some(wiring) = handle.reverse_wiring() {
+                                reverse_task = Some(
+                                    crate::services::runtime::reverse_listener::spawn_reverse_listener(
+                                        client,
+                                        wiring,
+                                        handle.shutdown_rx.clone(),
+                                    ),
+                                );
+                            }
                         }
                         Err(e) => {
                             handle

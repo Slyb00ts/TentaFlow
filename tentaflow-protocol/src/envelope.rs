@@ -162,16 +162,27 @@ mod serde_array64 {
 // in place to carry a `SessionAssertion` — a stream has to be authorized for
 // a USER, not merely for a trusted node. A stale peer would decode the old
 // shape and serve somebody else's session timeline, so old/new must not mix.
-// v23: event tracking. Main-database migration 129 widens
+// v24: two independent v23 bumps met in a merge, so neither number describes the
+// contract that now ships. Leaving both at 23 would let a node carrying only one
+// of the two changes shake hands as compatible and then fail row by row, which is
+// the silent failure this constant exists to prevent.
+//
+// From the event-tracking side: main-database migration 132 widens
 // `compliance_retention_policies.scope_kind` with an `events` scope, and both
 // `compliance_retention_policies` and `roles` replicate through the Sync Ledger
-// (`sync/core_registry.rs`). No `MessageBody` layout changed, so nothing here
-// forces a bump on wire grounds — but a node on 129 replicates a retention row
-// whose scope a node on 128 rejects on its own CHECK and whose parser fails on
-// the unknown value, and it does so ROW BY ROW, silently, long after the
-// handshake succeeded. Bumping turns that into one loud handshake refusal, which
-// is the failure mode "rebuild all mesh nodes together" (CLAUDE.md) assumes.
-pub const SCHEMA_VERSION: u16 = 23;
+// (`sync/core_registry.rs`). No `MessageBody` layout changed, so nothing forces a
+// bump on wire grounds — but a node with that migration replicates a retention row
+// whose scope an older node rejects on its own CHECK and whose parser fails on the
+// unknown value, silently, long after the handshake succeeded.
+//
+// From the meeting side: `ModelPayload` gained `FlowInvoke` and `StreamChunkType`
+// gained `Transcript` (both appended). A stale Core would answer a bot's FlowInvoke
+// with "unsupported payload" and a stale bot would drop Transcript chunks, so the
+// sidecar/Core pair must not mix versions.
+//
+// Both turn into one loud handshake refusal, which is the failure mode
+// "rebuild all mesh nodes together" (CLAUDE.md) assumes.
+pub const SCHEMA_VERSION: u16 = 24;
 
 // =============================================================================
 // Message kind discriminants

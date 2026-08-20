@@ -34,32 +34,17 @@ pub struct SpawnRequest {
     /// EndpointId i połączyć się do bota via iroh.
     pub secret_key_hex: String,
     pub bot_name: String,
-    /// Aliasy router-side używane przez teams-bota (STT/TTS/summarization/flow).
-    /// Manager rozwiązuje defaulty przed spawnem, więc tu zawsze konkretne wartości.
-    pub stt_alias: String,
+    /// The only router-side alias the bot resolves itself (periodic summary);
+    /// STT/LLM/TTS/flow are resolved by Core per turn from the session row.
     pub summarization_alias: String,
-    pub tts_alias: String,
-    pub flow_alias: String,
-    /// Alias LLM odpowiadającego (real-time chat). Zwykle `teams-llm`.
-    pub llm_alias: String,
     /// Czy bot ma odpowiadać w meetingu (LLM → TTS).
     pub respond_enabled: bool,
-    /// Tryb aktywacji: `always`/`wake_word`/`wake_word_intent` (default).
-    pub response_mode: String,
-    /// CSV slow aktywujacych ("jarvis,bot,asystencie,...").
-    pub wake_words: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct SpawnOutcome {
     pub container_id: String,
     pub container_name: String,
-}
-
-/// Nazwa kontenera — deterministyczna po session_id, żeby leave mógł znaleźć
-/// kontener nawet jeśli backend został zrestartowany.
-pub fn container_name(session_id: i64) -> String {
-    format!("meeting-bot-{}", session_id)
 }
 
 #[cfg(feature = "docker")]
@@ -82,7 +67,7 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         );
     }
 
-    let name = container_name(req.session_id);
+    let name = super::container_name(req.session_id);
     // Force-remove ewentualnie istniejacy kontener o tej samej nazwie (stale po crash).
     let _ = docker
         .remove_container(
@@ -179,7 +164,7 @@ pub async fn stop(session_id: i64) -> Result<()> {
     use bollard::Docker;
 
     let docker = Docker::connect_with_local_defaults()?;
-    let name = container_name(session_id);
+    let name = super::container_name(session_id);
     // Grace stop (10s) — pozwala botowi wyslac leave do Teams.
     if let Err(e) = docker
         .stop_container(
@@ -278,18 +263,11 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
         format!("BOT_NAME={}", req.bot_name),
         "DISPLAY=:99".to_string(),
         "XDG_RUNTIME_DIR=/tmp/runtime".to_string(),
-        // Aliasy konsumowane przez teams-bota (tentaflow-containers/agents/docker/teams-bot/src/config.rs).
-        format!("STT_ALIAS={}", req.stt_alias),
         format!("SUMMARIZATION_ALIAS={}", req.summarization_alias),
-        format!("TTS_ALIAS={}", req.tts_alias),
-        format!("FLOW_ALIAS={}", req.flow_alias),
-        format!("LLM_ALIAS={}", req.llm_alias),
         format!(
             "RESPOND_ENABLED={}",
             if req.respond_enabled { "true" } else { "false" }
         ),
-        format!("RESPONSE_MODE={}", req.response_mode),
-        format!("WAKE_WORDS={}", req.wake_words),
     ]
 }
 
@@ -298,7 +276,7 @@ mod tests {
     use super::*;
     use crate::meeting::port_pool::AllocatedPorts;
 
-    fn sample(stt: &str, sum: &str, tts: &str, flow: &str) -> SpawnRequest {
+    fn sample(sum: &str) -> SpawnRequest {
         SpawnRequest {
             session_id: 42,
             meeting_url: "https://teams.example/meet".to_string(),
@@ -310,45 +288,29 @@ mod tests {
             },
             secret_key_hex: "deadbeef".to_string(),
             bot_name: "TF Bot".to_string(),
-            stt_alias: stt.to_string(),
             summarization_alias: sum.to_string(),
-            tts_alias: tts.to_string(),
-            flow_alias: flow.to_string(),
-            llm_alias: "teams-llm".to_string(),
             respond_enabled: false,
-            response_mode: "wake_word_intent".to_string(),
-            wake_words: "jarvis,bot".to_string(),
         }
     }
 
     #[test]
-    fn build_env_emits_alias_keys_expected_by_bot() {
-        let req = sample(
-            "teams-stt",
-            "teams-summarization",
-            "teams-tts",
-            "teams-flow",
-        );
+    fn build_env_emits_keys_expected_by_bot() {
+        let req = sample("teams-summarization");
         let env = build_env(&req);
-        assert!(env.contains(&"STT_ALIAS=teams-stt".to_string()));
         assert!(env.contains(&"SUMMARIZATION_ALIAS=teams-summarization".to_string()));
-        assert!(env.contains(&"TTS_ALIAS=teams-tts".to_string()));
-        assert!(env.contains(&"FLOW_ALIAS=teams-flow".to_string()));
         assert!(env.contains(&"MEETING_URL=https://teams.example/meet".to_string()));
         assert!(env.contains(&"MEETING_ID=mtg-xyz".to_string()));
     }
 
+    // STT/LLM/TTS/flow are resolved by Core per turn — the bot must not get
+    // them, or a stale env would silently win over the session row.
     #[test]
-    fn build_env_propagates_custom_alias_overrides() {
-        let req = sample("my-stt", "my-sum", "my-tts", "my-flow");
+    fn build_env_carries_no_pipeline_aliases() {
+        let req = sample("my-sum");
         let env = build_env(&req);
-        assert!(env.contains(&"STT_ALIAS=my-stt".to_string()));
         assert!(env.contains(&"SUMMARIZATION_ALIAS=my-sum".to_string()));
-        assert!(env.contains(&"TTS_ALIAS=my-tts".to_string()));
-        assert!(env.contains(&"FLOW_ALIAS=my-flow".to_string()));
-        // Stare klucze nie mogą powrócić — bot (T1.5) ich nie czyta.
-        assert!(!env.iter().any(|e| e.starts_with("STT_MODEL=")));
-        assert!(!env.iter().any(|e| e.starts_with("TTS_MODEL=")));
-        assert!(!env.iter().any(|e| e.starts_with("LLM_MODEL=")));
+        for key in ["STT_ALIAS=", "TTS_ALIAS=", "LLM_ALIAS=", "FLOW_ALIAS="] {
+            assert!(!env.iter().any(|e| e.starts_with(key)), "{key} leaked");
+        }
     }
 }

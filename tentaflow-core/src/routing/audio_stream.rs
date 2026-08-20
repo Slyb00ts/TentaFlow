@@ -32,7 +32,9 @@ pub fn envelope_stream_to_audio_chunks(
 ) -> Pin<Box<dyn Stream<Item = std::result::Result<Frame<Bytes>, std::io::Error>> + Send>> {
     use futures::StreamExt;
 
-    let StreamingExecution { stream, outcome } = stream_exec;
+    let StreamingExecution {
+        stream, outcome, ..
+    } = stream_exec;
 
     tokio::spawn(async move {
         match outcome.await {
@@ -113,6 +115,7 @@ mod tests {
         StreamingExecution {
             stream,
             outcome: rx,
+            producer_input: std::sync::Arc::new(FlowEnvelope::empty()),
         }
     }
 

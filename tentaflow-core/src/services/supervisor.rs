@@ -268,10 +268,10 @@ pub struct Supervisor {
     /// peer announce/disconnect propagate to `/v1/models` without an
     /// explicit alias mutation.
     catalog_provider: Option<Arc<crate::services::catalog::CatalogProvider>>,
-    /// Optional STT runtime. Reconcile rejestruje per-service backendow
-    /// (`SttBackend::Http(BackendClient)` dla python-bundle wrapperow STT
-    /// jak qwen-asr/parakeet) zeby `transcribe_for_service(service_id)`
-    /// trafialo na wlasciwy backend zamiast default local whisper.
+    /// Optional STT runtime. Reconcile registers one backend per local STT
+    /// service row (`SttBackend::Http` for python-bundle wrappers such as
+    /// qwen-asr/parakeet, `SttBackend::Embedded` for the in-process engine) —
+    /// `SttRuntime` dispatches only to registered rows.
     stt_runtime: Option<Arc<crate::services::stt::SttRuntime>>,
 }
 
@@ -1233,18 +1233,25 @@ impl Supervisor {
                 BackendHandle::Quic(h) => Some(h.clone()),
                 _ => None,
             };
-            // Zarejestruj backend STT dla lokalnego service category=stt z
-            // HTTP transport (qwen-asr/parakeet/kyutai-tts python-bundle).
-            // Inne kategorie (chat/embeddings/itd.) ida przez ResolvedExecutionTarget
-            // → live_handles i nie potrzebuja STT-specific rejestracji.
+            // Register the STT backend for a local `category=stt` row: HTTP
+            // wrappers (qwen-asr/parakeet python-bundle) by client, embedded
+            // engines as the singleton marker. `SttRuntime` serves ONLY
+            // registered rows, so this is what makes a deployed STT service
+            // reachable; removal above unregisters it. Other categories go
+            // through ResolvedExecutionTarget → live_handles.
             if node_id == self.local_node_id && svc.category == "stt" {
                 if let Some(rt) = self.stt_runtime.as_ref() {
-                    if let BackendHandle::Http(client) = &handle {
-                        rt.register_backend(
-                            service_id,
-                            crate::services::stt::SttBackend::Http(client.clone()),
-                        )
-                        .await;
+                    let backend = match &handle {
+                        BackendHandle::Http(client) => {
+                            Some(crate::services::stt::SttBackend::Http(client.clone()))
+                        }
+                        BackendHandle::Embedded { .. } => {
+                            Some(crate::services::stt::SttBackend::Embedded)
+                        }
+                        _ => None,
+                    };
+                    if let Some(backend) = backend {
+                        rt.register_backend(service_id, backend).await;
                     }
                 }
             }
