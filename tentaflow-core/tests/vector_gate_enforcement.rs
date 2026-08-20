@@ -15,7 +15,7 @@ use tentaflow_core::addon::errors::AbiError;
 use tentaflow_core::addon::host_functions::gate as host_gate;
 use tentaflow_core::addon::host_functions::vector::test_api::enforce_gate_with_policy;
 use tentaflow_core::addon::manifest::{ClaimRequirement, GateSpec, VectorNamespaceSpec};
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::services::policy::{self, NewClaim, NewSignature};
 
 fn open_pool() -> (TempDir, tentaflow_core::db::DbPool) {
@@ -90,6 +90,7 @@ fn make_state(
         )),
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(Mutex::new(
             tentaflow_core::addon::host_functions::network::NetworkConnectionManager::new(),

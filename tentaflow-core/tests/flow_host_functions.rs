@@ -18,7 +18,7 @@ use tentaflow_core::addon::errors::AbiError;
 use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::host_functions::flow::test_api as flow_api;
 use tentaflow_core::addon::permissions::PermissionChecker;
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::flow_runtime::parser::{compile, parse_flow_definition};
 use tentaflow_core::flow_runtime::registry;
 use tentaflow_core::flow_runtime::scheduler::FlowScheduler;
@@ -77,6 +77,7 @@ fn make_state(
         // alternative would be a full user-acl seed which is orthogonal to
         // what these tests cover.
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(PlMutex::new(
             tentaflow_core::addon::host_functions::network::NetworkConnectionManager::new(),

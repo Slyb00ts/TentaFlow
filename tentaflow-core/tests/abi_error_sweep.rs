@@ -391,7 +391,7 @@ fn trigger_camera_vendor_unsupported_via_camera_add() {
     use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
     use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
     use tentaflow_core::addon::permissions::PermissionChecker;
-    use tentaflow_core::addon::AddonState;
+    use tentaflow_core::addon::{AddonCallProvenance, AddonState};
 
     let db = make_db();
     let state = AddonState {
@@ -405,6 +405,7 @@ fn trigger_camera_vendor_unsupported_via_camera_add() {
         permission_checker: Arc::new(PermissionChecker::new(db)),
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),
@@ -458,7 +459,7 @@ fn camera_add_permission_check_precedes_payload_decode() {
     use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
     use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
     use tentaflow_core::addon::permissions::PermissionChecker;
-    use tentaflow_core::addon::AddonState;
+    use tentaflow_core::addon::{AddonCallProvenance, AddonState};
 
     let db = make_db();
     let state = AddonState {
@@ -473,6 +474,7 @@ fn camera_add_permission_check_precedes_payload_decode() {
         permission_checker: Arc::new(PermissionChecker::new(db)),
         fuel_consumed: 0,
         is_system_call: false,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),

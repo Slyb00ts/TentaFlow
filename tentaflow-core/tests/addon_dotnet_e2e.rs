@@ -19,7 +19,7 @@ use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::runtime::{
     adapter_for_runtime, compile_module, create_engine, create_linker, instantiate,
 };
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db;
 
@@ -68,6 +68,7 @@ fn create_addon_state(db: db::DbPool, permissions: Vec<String>) -> AddonState {
         permission_checker: Arc::new(PermissionChecker::new(db)),
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),

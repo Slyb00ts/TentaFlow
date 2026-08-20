@@ -302,7 +302,7 @@ fn audit_log_for_addon_in_org_a_carries_org_id_a() {
     use tentaflow_core::addon::host_functions::audit_log_with_risk;
     use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
     use tentaflow_core::addon::permissions::PermissionChecker;
-    use tentaflow_core::addon::{AddonManifest, AddonState};
+    use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
     use tentaflow_core::audit::RiskClass;
 
     let (_d, pool) = open_pool();
@@ -317,6 +317,7 @@ fn audit_log_for_addon_in_org_a_carries_org_id_a() {
         permission_checker: Arc::new(PermissionChecker::new(pool.clone())),
         fuel_consumed: 0,
         is_system_call: false,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(PlMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32])),

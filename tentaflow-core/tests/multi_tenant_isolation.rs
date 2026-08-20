@@ -27,7 +27,7 @@ use tentaflow_core::addon::host_functions::audit_log_with_risk;
 use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
 use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::storage_sql::{close_addon_db, open_addon_db};
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::audit::RiskClass;
 use tentaflow_core::db::DbPool;
 use tentaflow_core::services::org::{repo as org_repo, DEFAULT_ORG_ID};
@@ -76,6 +76,7 @@ fn make_state(db: DbPool, addon_id: &str, org_id: Option<&str>) -> AddonState {
         permission_checker: Arc::new(PermissionChecker::new(db.clone())),
         fuel_consumed: 0,
         is_system_call: false,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(PlMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32])),

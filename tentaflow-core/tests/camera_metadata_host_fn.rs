@@ -25,7 +25,7 @@ use tentaflow_core::addon::host_functions::camera_metadata::test_api;
 use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
 use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
 use tentaflow_core::addon::permissions::PermissionChecker;
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::db::repository::{insert_camera, set_camera_metadata_supported};
 use tentaflow_core::db::DbPool;
 use tentaflow_core::services::camera_ingest::metadata_bus::{metadata_bus, MetadataMessage};
@@ -58,6 +58,7 @@ fn make_state(
         permission_checker: pc,
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(Mutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(tentaflow_core::crypto::SettingsCipher::new(&[0u8; 32])),

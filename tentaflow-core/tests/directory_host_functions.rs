@@ -20,7 +20,7 @@ use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::host_functions::check_permission;
 use tentaflow_core::addon::host_functions::directory::{test_api, PERM_DIRECTORY_READ};
 use tentaflow_core::addon::permissions::PermissionChecker;
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::db::{init as db_init, repository, DbPool};
 use tentaflow_sdk_spec::{DirectoryOrgOutput, DirectoryUsersOutput};
 
@@ -76,6 +76,7 @@ fn make_state(
         permission_checker: Arc::new(PermissionChecker::new(db)),
         fuel_consumed: 0,
         is_system_call,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(PlMutex::new(
             tentaflow_core::addon::host_functions::network::NetworkConnectionManager::new(),

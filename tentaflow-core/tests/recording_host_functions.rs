@@ -30,7 +30,7 @@ use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
 use tentaflow_core::addon::host_functions::recording::test_api as rec;
 use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
 use tentaflow_core::addon::permissions::PermissionChecker;
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db::repository::{
     get_recording_for_addon, insert_camera, recording_stats_for_addon,
@@ -71,6 +71,7 @@ fn make_state(db: &DbPool, addon_id: &str, permissions: Vec<String>) -> AddonSta
         permission_checker: Arc::new(PermissionChecker::new(db.clone())),
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),

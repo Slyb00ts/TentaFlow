@@ -15,7 +15,7 @@ use tentaflow_core::addon::host_functions::network::NetworkConnectionManager;
 use tentaflow_core::addon::oauth_refresh_guard::OAuthRefreshGuard;
 use tentaflow_core::addon::permissions::PermissionChecker;
 use tentaflow_core::addon::runtime::{compile_module, create_engine, create_linker, instantiate};
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::crypto::SettingsCipher;
 use tentaflow_core::db;
 
@@ -62,6 +62,7 @@ fn create_addon_state(db: db::DbPool, user_id: Option<&str>) -> AddonState {
         permission_checker: Arc::new(PermissionChecker::new(db)),
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(ParkingMutex::new(NetworkConnectionManager::new())),
         settings_cipher: Arc::new(SettingsCipher::new(&[0u8; 32])),

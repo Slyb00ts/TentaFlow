@@ -33,7 +33,7 @@ use tentaflow_core::addon::event_bus::EventBus;
 use tentaflow_core::addon::host_functions::flow::test_api as flow_api;
 use tentaflow_core::addon::lifecycle;
 use tentaflow_core::addon::permissions::PermissionChecker;
-use tentaflow_core::addon::{AddonManifest, AddonState};
+use tentaflow_core::addon::{AddonCallProvenance, AddonManifest, AddonState};
 use tentaflow_core::db::{init as db_init, DbPool};
 use tentaflow_core::flow_runtime::registry;
 use tentaflow_core::flow_runtime::scheduler::FlowScheduler;
@@ -129,6 +129,7 @@ fn make_state(db: DbPool, addon_id: &str, permissions: Vec<String>) -> AddonStat
         permission_checker,
         fuel_consumed: 0,
         is_system_call: true,
+        call_provenance: AddonCallProvenance::addon(),
         rate_limiter: None,
         net_manager: Arc::new(PlMutex::new(
             tentaflow_core::addon::host_functions::network::NetworkConnectionManager::new(),
