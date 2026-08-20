@@ -129,14 +129,21 @@ fn seeded_agent_run_graph_validates_and_compiles_with_region() {
 /// invokes `core.skill_view` (the loop must continue and run the tool). Call 2
 /// returns a plain final answer with no tool calls (the region's structural
 /// stop). `execute_chat` is the only path the blocking llm adapter uses.
+///
+/// `narration` is what call 1 says alongside the tool call. Real models talk
+/// before they act ("Let me check..."), and that text is what the llm step
+/// leaves on the payload — so the two cases are not interchangeable and both
+/// are exercised.
 struct ScriptedLlm {
     calls: AtomicUsize,
+    narration: String,
 }
 
 impl ScriptedLlm {
-    fn new() -> Self {
+    fn new(narration: &str) -> Self {
         Self {
             calls: AtomicUsize::new(0),
+            narration: narration.to_string(),
         }
     }
 }
@@ -147,7 +154,7 @@ impl LlmDispatcher for ScriptedLlm {
         let n = self.calls.fetch_add(1, Ordering::SeqCst);
         if n == 0 {
             Ok(LlmResponse {
-                content: String::new(),
+                content: self.narration.clone(),
                 reasoning_content: None,
                 usage: TokenUsage::default(),
                 finish_reason: FinishReason::ToolCalls,
@@ -304,14 +311,35 @@ fn count_flow_executions(pool: &DbPool) -> i64 {
         .unwrap()
 }
 
+/// A turn that says nothing before calling its tool. This is the cheap case:
+/// the llm step leaves an EMPTY payload behind, which the payload-to-user
+/// derivation ignores on its own.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn region_runs_two_iterations_persists_turn_and_stops_structurally() {
+    blocking_region_run("").await;
+}
+
+/// The same region with a talking model. The narration is what the llm step
+/// writes into the payload, and nothing between two iterations rewrites it —
+/// so on iteration 2 the payload holds the assistant's OWN words. They must
+/// not come back as a user turn: the model would read its own output as an
+/// instruction, and the history it reasons over would be corrupt with no
+/// error anywhere. The blocking path shares
+/// `LlmNodeAdapter::payload_user_message` with the streaming one, so it had
+/// the identical defect — the empty-narration script above simply never
+/// exposed it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_narrating_blocking_turn_is_not_replayed_as_a_user_message() {
+    blocking_region_run("Let me check the skill. ").await;
+}
+
+async fn blocking_region_run(narration: &str) {
     let pool = test_db();
     seed_skill(&pool, "11111111-0000-0000-0000-0000000000aa", "do-thing");
     seed_agent(&pool, "agent-1");
     let slot = service_slot(pool.clone());
 
-    let llm = Arc::new(ScriptedLlm::new());
+    let llm = Arc::new(ScriptedLlm::new(narration));
     let reg = execution_registry(slot, llm.clone());
     let compiled = Arc::new(
         CompiledFlow::from_json(

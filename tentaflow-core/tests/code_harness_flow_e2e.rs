@@ -104,8 +104,19 @@ fn variant_a_validates_and_compiles_with_one_region() {
     let compiled =
         CompiledFlow::from_json(CODE_HARNESS_FLOW_ID, &json, &reg).expect("variant A compiles");
 
-    // 9 blocks exactly (§16.2 A).
-    assert_eq!(compiled.definition.nodes.len(), 9);
+    // Ten blocks: the nine of §16.2 A plus `patch_review`.
+    //
+    // §16.2 A prescribes NINE and lists `patch_review` under "what these
+    // graphs do not have and why", on the grounds that "the review is opened
+    // by gate 5a at `git_commit`". Running the harness against a real model
+    // disproved that premise: an agent told to write something and run it has
+    // no reason to ask for a commit, so gate 5a never fires and the work
+    // reaches the worktree with nothing to accept. `74e12163a` wired the block
+    // into all three seeded harness flows. §16.4 already sanctions exactly
+    // this use — `patch_review` **(optional)** is "for flows that want the
+    // review at a fixed point, regardless of whether the agent reaches for
+    // `git_commit`" — so the graph is right and the prose of §16.2 is stale.
+    assert_eq!(compiled.definition.nodes.len(), 10);
     assert_eq!(compiled.regions.len(), 1);
     let region = &compiled.regions[0];
     assert_eq!(region.id, "code_turn");
@@ -116,7 +127,8 @@ fn variant_a_validates_and_compiles_with_one_region() {
     assert_eq!(exit.node_type, "tool_exec");
     assert_eq!(region.member_pos.len(), 3);
 
-    // The block order §16.2 A prescribes, workspace_context included.
+    // The block order §16.2 A prescribes, workspace_context included, with the
+    // review between the region's exit and the finalizer.
     let types: Vec<&str> = compiled
         .definition
         .nodes
@@ -133,14 +145,31 @@ fn variant_a_validates_and_compiles_with_one_region() {
             "compact_context",
             "llm",
             "tool_exec",
+            "patch_review",
             "persist_turn",
             "output",
         ]
     );
 }
 
+/// Resolves a seeded spawn target back to its roster name. The harness pins
+/// every spawn by `agent_id`, because the block schema declares `agent_id` and
+/// the Flow Builder validates against the schema — a name would render our own
+/// nodes as "missing required: Agent". The assertions stay in names, which is
+/// what the separation of duties is stated in.
+fn spawned_agent_name(pool: &DbPool, node: &FlowNode) -> String {
+    let id = node.config["agent_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("spawn '{}' names no agent_id", node.id));
+    repository::get_agent(pool, id)
+        .expect("query agent")
+        .unwrap_or_else(|| panic!("spawn '{}' points at an unseeded agent {id}", node.id))
+        .name
+}
+
 #[test]
 fn variant_b_validates_and_compiles_with_the_forced_chain() {
+    let pool = test_db();
     let reg = harness_registry();
     let json = code_harness_team_flow_json();
 
@@ -157,12 +186,12 @@ fn variant_b_validates_and_compiles_with_the_forced_chain() {
     // construction, so without the waits the chain would only guarantee that
     // the three STARTED — the graph would promise review-then-test-then-commit
     // and deliver three races.
-    let spawns: Vec<&str> = compiled
+    let spawns: Vec<String> = compiled
         .definition
         .nodes
         .iter()
         .filter(|n| n.node_type == "spawn")
-        .map(|n| n.config["agent_name"].as_str().unwrap())
+        .map(|n| spawned_agent_name(&pool, n))
         .collect();
     assert_eq!(
         spawns,
@@ -553,7 +582,7 @@ impl tentaflow_core::flow_engine::node_adapter::NodeAdapter for StubAdapter {
 fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<AdapterRegistry> {
     use tentaflow_core::flow_engine::node_adapters::*;
 
-    let slot = service_slot(pool);
+    let slot = service_slot(pool.clone());
     let mut r = AdapterRegistry::new();
     r.register(Arc::new(TriggerNodeAdapter::new()));
     r.register(Arc::new(OutputNodeAdapter::new()));
@@ -596,6 +625,44 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
             );
         }),
     )));
+    // `patch_review` reports what a run with no worktree behind it truthfully
+    // has to report: an EMPTY patch set. That is not a stand-in for a decision
+    // — the real block short-circuits on `set.files.is_empty()` and returns
+    // status "empty" WITHOUT ever raising the operator gate, which is the same
+    // path a turn that changed nothing takes in production. A stub that
+    // answered "accepted" would be inventing an operator who never looked, and
+    // the two execution tests below would then be asserting something other
+    // than what they claim.
+    //
+    // Neither graph branches on the outcome: the review has one outgoing edge,
+    // and the committer is steered by its PROMPT ("if an accepted review
+    // exists"), not by a port. So the status this stub reports cannot decide
+    // either test — what the tests get from the block is that it sits in the
+    // chain, runs once, and lets the turn through.
+    r.register(Arc::new(StubAdapter::with(
+        "patch_review",
+        recorder.clone(),
+        Box::new(|node, env, _rec| {
+            let var = node.config["output_variable"]
+                .as_str()
+                .unwrap_or("patch_review")
+                .to_string();
+            env.variables.insert(
+                var,
+                FlowValue::Json(json!({
+                    "patch_set_id": "stub-empty",
+                    "status": "empty",
+                    "accepted": [],
+                    "rejected": [],
+                    "conflicted": [],
+                    "timed_out": false,
+                })),
+            );
+            env.meta.insert("patch_review_status".into(), json!("empty"));
+            env.payload =
+                FlowValue::Text("review empty: 0 accepted, 0 rejected, 0 conflicted".into());
+        }),
+    )));
     r.register(Arc::new(StubAdapter::passthrough(
         "persist_turn",
         recorder.clone(),
@@ -603,12 +670,13 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
     // Variant B only: the delegation pair. `spawn` writes ITS OWN run-id
     // variable, `await_subagents` reads the variable ITS config names — so the
     // recording proves the pairing comes from the graph, not from the test.
+    let spawn_pool = pool;
     r.register(Arc::new(StubAdapter::with(
         "spawn",
         recorder.clone(),
-        Box::new(|node, env, rec| {
+        Box::new(move |node, env, rec| {
             let var = node.config["output_variable"].as_str().expect("var");
-            let agent = node.config["agent_name"].as_str().expect("agent");
+            let agent = spawned_agent_name(&spawn_pool, node);
             let run_id = format!("run-of-{agent}");
             env.variables
                 .insert(var.to_string(), FlowValue::Json(json!([run_id])));
@@ -693,8 +761,9 @@ async fn the_seeded_variant_a_graph_runs_end_to_end_on_stub_adapters() {
     let visits = recorder.visits();
     assert_eq!(
         visits,
-        vec!["h1", "w1", "c0", "p1"],
-        "the seeded prefix and finalizer must run in graph order: {visits:?}"
+        vec!["h1", "w1", "c0", "r1", "p1"],
+        "the seeded prefix, the review and the finalizer must run in graph \
+         order: {visits:?}"
     );
 
     // The loop stopped structurally after the prose turn, not on the budget.
@@ -794,6 +863,10 @@ async fn forced_chain_spawns_all_three_even_when_nothing_changed() {
             "s2",
             "a2:await:run-of-code-tester",
             "a2",
+            // The review sits between the machines that INSPECT and the one
+            // that COMMITS: the committer is told to act "if an accepted
+            // review exists", and nothing else in this chain produces one.
+            "r1",
             "s3:spawn:code-committer",
             "s3",
             "a3:await:run-of-code-committer",

@@ -369,6 +369,28 @@ impl LlmNodeAdapter {
         (kept, Some(note))
     }
 
+    /// The slice of `prior` that belongs to the turn THIS run is building.
+    ///
+    /// `conversation_history` records how many messages it replayed from the
+    /// durable store (`history_base_len`); everything after that boundary was
+    /// produced here. Replayed history has to stay out of the duplicate check,
+    /// or a user who pastes an earlier answer back would have their prompt
+    /// silently dropped.
+    ///
+    /// `prior` is whatever list the caller is appending to, which may carry a
+    /// leading system message that `context.messages` does not
+    /// (`build_messages`). Only the count of live messages is shared between
+    /// the two, so the tail is taken by length rather than by index.
+    fn live_tail<'a>(envelope: &FlowEnvelope, prior: &'a [ChatMessage]) -> &'a [ChatMessage] {
+        let base = envelope
+            .meta
+            .get(crate::flow_engine::node_adapters::conversation_history::HISTORY_BASE_LEN_META)
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0) as usize;
+        let live = envelope.context.messages.len().saturating_sub(base);
+        &prior[prior.len().saturating_sub(live)..]
+    }
+
     pub(crate) fn payload_user_message(
         envelope: &FlowEnvelope,
         prior: &[ChatMessage],
@@ -445,14 +467,25 @@ impl LlmNodeAdapter {
         if t.is_empty() {
             return None;
         }
-        // Comparison only when the last message is plain Text. Parts
-        // (multimodal) always count as "different" — payload.Text is then
-        // appended as another user message.
-        let last_matches = prior
-            .last()
-            .map(|m| m.role == ChatRole::User && m.text() == Some(t.as_str()))
-            .unwrap_or(false);
-        if last_matches {
+        // The payload only becomes a user turn when it is not already the last
+        // thing said in the turn this run is building. It can be that in two
+        // ways. Either the caller seeded the prompt into `context.messages` as
+        // well as into `payload`; or — inside a loop region — the previous
+        // iteration wrote the MODEL'S OWN answer into `payload` and nothing
+        // between two iterations rewrites it, so re-deriving a user message
+        // here would feed the model its own output as if the user had said it.
+        //
+        // Tool messages are stepped over: they sit between the model's request
+        // and its continuation, so the last thing SAID is the assistant message
+        // in front of them. Comparison only when that message is plain Text —
+        // a multimodal turn has no `text()` and always counts as different, so
+        // `payload.Text` is appended as another user message.
+        let already_said = Self::live_tail(envelope, prior)
+            .iter()
+            .rev()
+            .find(|m| matches!(m.role, ChatRole::User | ChatRole::Assistant))
+            .is_some_and(|m| m.text() == Some(t.as_str()));
+        if already_said {
             None
         } else {
             Some(ChatMessage::user(t.clone()))
@@ -947,6 +980,102 @@ mod tests {
                 .iter()
                 .any(|m| m.role == ChatRole::User && m.text() == Some("napisz hello.py")),
             "the user's request must still be in the conversation on iteration 2"
+        );
+    }
+
+    /// The other half of the loop contract: the answer `execute` left on the
+    /// payload must NOT come back as the next iteration's user turn. A model
+    /// that narrates before calling a tool ("Let me check…") would otherwise
+    /// read its own words as an instruction from the user, and the corruption
+    /// is silent — the conversation simply grows a User message nobody wrote.
+    #[test]
+    fn a_model_answer_left_on_the_payload_is_not_a_user_turn() {
+        let mut env = FlowEnvelope::empty();
+        env.context.messages = vec![
+            ChatMessage::user("do the thing"),
+            ChatMessage::assistant("Let me check the skill. "),
+            {
+                let mut tool = ChatMessage::assistant("{\"skill\":\"do-thing\"}");
+                tool.role = ChatRole::Tool;
+                tool.tool_call_id = Some("call-1".into());
+                tool
+            },
+        ];
+        // What the llm step wrote there on the previous iteration; nothing
+        // between two iterations rewrites it.
+        env.payload = FlowValue::Text("Let me check the skill. ".into());
+
+        assert!(
+            LlmNodeAdapter::payload_user_message(&env, &env.context.messages).is_none(),
+            "the model's own answer must not be re-derived as a user turn"
+        );
+
+        let msgs = LlmNodeAdapter::build_messages(&node(json!({})), &env);
+        let roles: Vec<ChatRole> = msgs.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![ChatRole::User, ChatRole::Assistant, ChatRole::Tool],
+            "messages: {msgs:?}"
+        );
+    }
+
+    /// The duplicate check is scoped to the turn this run is building. Text
+    /// that only matches REPLAYED history is a genuine prompt — a user who
+    /// pastes an earlier answer back must not have it silently dropped.
+    #[test]
+    fn a_pasted_answer_from_replayed_history_still_becomes_a_user_turn() {
+        let mut env = FlowEnvelope::empty();
+        env.context.messages = vec![
+            ChatMessage::user("what is it"),
+            ChatMessage::assistant("forty-two"),
+        ];
+        env.meta.insert(
+            crate::flow_engine::node_adapters::conversation_history::HISTORY_BASE_LEN_META
+                .to_string(),
+            serde_json::Value::from(2usize),
+        );
+        env.payload = FlowValue::Text("forty-two".into());
+
+        let user = LlmNodeAdapter::payload_user_message(&env, &env.context.messages)
+            .expect("a prompt matching only replayed history is still a prompt");
+        assert_eq!(user.role, ChatRole::User);
+        assert_eq!(user.text(), Some("forty-two"));
+    }
+
+    /// `build_messages` prepends a system message, so `prior` is longer than
+    /// `context.messages` and the live turn cannot be located by index. Both
+    /// call sites must agree on what counts as "already said".
+    #[test]
+    fn the_live_turn_is_found_past_a_prepended_system_message() {
+        let mut env = FlowEnvelope::empty();
+        env.context = ConversationContext {
+            messages: vec![
+                ChatMessage::user("old"),
+                ChatMessage::assistant("old answer"),
+                ChatMessage::user("do the thing"),
+                ChatMessage::assistant("Let me check. "),
+            ],
+            system_prompts: vec!["sp".into()],
+        };
+        env.meta.insert(
+            crate::flow_engine::node_adapters::conversation_history::HISTORY_BASE_LEN_META
+                .to_string(),
+            serde_json::Value::from(2usize),
+        );
+        env.payload = FlowValue::Text("Let me check. ".into());
+
+        let msgs = LlmNodeAdapter::build_messages(&node(json!({})), &env);
+        let roles: Vec<ChatRole> = msgs.iter().map(|m| m.role).collect();
+        assert_eq!(
+            roles,
+            vec![
+                ChatRole::System,
+                ChatRole::User,
+                ChatRole::Assistant,
+                ChatRole::User,
+                ChatRole::Assistant,
+            ],
+            "messages: {msgs:?}"
         );
     }
 
