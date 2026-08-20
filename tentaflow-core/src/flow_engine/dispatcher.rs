@@ -120,7 +120,7 @@ enum ResolvedFlow {
 /// — never as an `envelope.meta` key. Meta is writable by every node, including
 /// a WASM addon block that deserializes a whole envelope from guest memory, so
 /// a provenance stamp living there would be forgeable by model output.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FlowOrigin {
     /// Dashboard chat / audio surface over the binary protocol.
     Chat,
@@ -147,9 +147,8 @@ pub enum FlowOrigin {
     /// Agent harness run (including sub-agent and reactive continuations).
     Agent,
     /// Internal core work with no external caller (translate, catalog probes,
-    /// benchmarks, ML Studio evaluation). Also the value a context carries
-    /// before an entry point stamps it.
-    #[default]
+    /// benchmarks, ML Studio evaluation). Never a default — a call reaches this
+    /// variant only by naming it.
     System,
 }
 
@@ -194,12 +193,11 @@ impl FlowOrigin {
 }
 
 /// Kind of authenticated caller behind a request.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ActorKind {
     User,
     ApiKey,
     Addon,
-    #[default]
     System,
 }
 
@@ -231,7 +229,7 @@ impl ActorKind {
 /// The authenticated caller. Built ONLY by an entry point, after authorization
 /// — the constructors are the whole public surface, so no code path can invent
 /// an actor from request content.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FlowActor {
     kind: ActorKind,
     /// user_id / API key uid / addon instance id / system component id.
@@ -1560,7 +1558,6 @@ fn stub_context_factory() -> ContextFactory {
         tts_cleaning: Arc::new(StubTtsCleaning),
     }
 }
-
 
 /// Builds a flow `ExecutionContext` on stub dispatchers from a `FlowRequestMeta`
 /// — for tests in other modules (the subflow runner) that need the REAL

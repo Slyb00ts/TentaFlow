@@ -404,6 +404,7 @@ mod tests {
     use super::*;
     use crate::db::migrations;
     use crate::db::models::{AgentParams, AgentRunStatusUpdate, FlowParams, NewAgentRun};
+    use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin};
     use serde_json::json;
     use std::sync::Mutex;
     use std::time::Duration;
@@ -415,10 +416,12 @@ mod tests {
         Arc::new(crate::db::Db::from_connection(conn))
     }
 
-    /// Spy dispatch: records (flow_id, seed payload text) and signals each
-    /// dispatch on an mpsc so the test can await it without sleeping.
+    /// Spy dispatch: records (flow_id, seed payload text, principal) and signals
+    /// each dispatch on an mpsc so the test can await it without sleeping. The
+    /// principal is recorded because it is the §2.5 contract of a reactive run
+    /// — a spy that drops it can watch the inheritance path break in silence.
     struct SpyDispatch {
-        calls: Arc<Mutex<Vec<(String, String)>>>,
+        calls: Arc<Mutex<Vec<(String, String, AgentPrincipal)>>>,
         tx: mpsc::UnboundedSender<()>,
     }
 
@@ -428,13 +431,19 @@ mod tests {
             &self,
             flow_id: String,
             initial: FlowEnvelope,
-            _principal: AgentPrincipal,
+            principal: AgentPrincipal,
         ) -> anyhow::Result<()> {
             let payload = initial.payload.as_text().unwrap_or_default().to_string();
-            self.calls.lock().unwrap().push((flow_id, payload));
+            self.calls.lock().unwrap().push((flow_id, payload, principal));
             let _ = self.tx.send(());
             Ok(())
         }
+    }
+
+    /// The stamp of a run nothing outside started. Stated, never defaulted —
+    /// the same rule the production entry points follow.
+    fn system_principal() -> AgentPrincipal {
+        AgentPrincipal::new(None, None, FlowOrigin::System, FlowActor::system())
     }
 
     fn seed_agent(pool: &DbPool, id: &str, name: &str) {
@@ -494,9 +503,15 @@ mod tests {
         .expect("create flow")
     }
 
-    /// Creates a completed agent_runs row with a result and returns the event the
-    /// manager would broadcast for it.
-    fn finished_run(pool: &DbPool, agent_id: &str, result: &str) -> ChildFinishedEvent {
+    /// Creates a completed agent_runs row stamped with `principal` and returns
+    /// the event the manager would broadcast for it. The stamp is a parameter
+    /// because the row IS the provenance a reactive dispatch must inherit.
+    fn finished_run(
+        pool: &DbPool,
+        agent_id: &str,
+        result: &str,
+        principal: &AgentPrincipal,
+    ) -> ChildFinishedEvent {
         let run_id = uuid::Uuid::new_v4().to_string();
         repository::create_agent_run(
             pool,
@@ -505,14 +520,14 @@ mod tests {
                 agent_id,
                 parent_run_id: None,
                 flow_execution_id: None,
-                user_id: Some("u1"),
-                org_id: None,
+                user_id: principal.user_id(),
+                org_id: principal.org_id.as_deref(),
                 prompt: "p",
-                origin: "system",
-                actor_kind: "system",
-                actor_id: None,
-                actor_user_id: None,
-                correlation_id: None,
+                origin: principal.origin.as_str(),
+                actor_kind: principal.actor.kind().as_str(),
+                actor_id: principal.actor.id(),
+                actor_user_id: principal.actor.user_id(),
+                correlation_id: principal.correlation_id.as_deref(),
             },
         )
         .expect("create run");
@@ -552,13 +567,67 @@ mod tests {
         });
         let mut r = reactor(&pool, spy);
 
-        let event = finished_run(&pool, "a1", "the answer");
+        let event = finished_run(&pool, "a1", "the answer", &system_principal());
         r.handle(event).await;
 
         let got = calls.lock().unwrap().clone();
         assert_eq!(got.len(), 1, "exactly one dispatch");
         assert_eq!(got[0].0, flow_id);
         assert_eq!(got[0].1, "the answer", "seed payload is the child result");
+    }
+
+    /// §2.5 — a reactive run CONTINUES the finished child's work, so it must act
+    /// under that run's stamp. The dangerous shape is a user-bound API key: it
+    /// has a `user_id`, so a principal rebuilt from anything but the row looks
+    /// plausible while the call stops being recognisable as an API key — and
+    /// degrading to `system` would make it unattributable outright.
+    #[tokio::test]
+    async fn reactive_dispatch_inherits_the_finished_runs_origin_and_actor() {
+        let pool = db();
+        seed_agent(&pool, "a1", "worker");
+        seed_event_flow(&pool, "react", json!({"agent_id": "a1"}));
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let spy = Arc::new(SpyDispatch {
+            calls: calls.clone(),
+            tx,
+        });
+        let mut r = reactor(&pool, spy);
+
+        let parent = AgentPrincipal::new(
+            Some("u-5".into()),
+            Some("org-1".into()),
+            FlowOrigin::Api,
+            FlowActor::api_key("key-88", Some("u-5".into())),
+        )
+        .with_correlation_id(Some("corr-3".into()));
+        let event = finished_run(&pool, "a1", "inherited", &parent);
+        r.handle(event).await;
+
+        let got = calls.lock().unwrap().clone();
+        assert_eq!(got.len(), 1, "exactly one dispatch");
+        let dispatched = &got[0].2;
+        assert_eq!(
+            dispatched.origin,
+            FlowOrigin::Api,
+            "reactive run lost the entry point that started the chain"
+        );
+        assert_eq!(
+            dispatched.actor.kind(),
+            ActorKind::ApiKey,
+            "API key degraded to another actor kind"
+        );
+        assert_eq!(dispatched.actor.id(), Some("key-88"));
+        assert_eq!(
+            dispatched.actor.user_id(),
+            Some("u-5"),
+            "the user the key is bound to must survive"
+        );
+        assert_ne!(dispatched.actor, FlowActor::system(), "unattributable actor");
+        assert_eq!(dispatched.user_id.as_deref(), Some("u-5"));
+        assert_eq!(dispatched.org_id.as_deref(), Some("org-1"));
+        assert_eq!(dispatched.correlation_id.as_deref(), Some("corr-3"));
+        assert_eq!(dispatched, &parent, "principal is the parent's, verbatim");
     }
 
     #[tokio::test]
@@ -576,7 +645,7 @@ mod tests {
         let mut r = reactor(&pool, spy);
 
         // A completion of a DIFFERENT agent must not fire the a1-filtered flow.
-        let event = finished_run(&pool, "a2", "nope");
+        let event = finished_run(&pool, "a2", "nope", &system_principal());
         r.handle(event).await;
         assert!(
             calls.lock().unwrap().is_empty(),
@@ -603,7 +672,7 @@ mod tests {
         let mut r = reactor(&pool, spy);
 
         // A COMPLETED run does not match a failed-only filter.
-        let event = finished_run(&pool, "a1", "ok");
+        let event = finished_run(&pool, "a1", "ok", &system_principal());
         r.handle(event).await;
         assert!(
             calls.lock().unwrap().is_empty(),
@@ -624,7 +693,7 @@ mod tests {
         });
         let mut r = reactor(&pool, spy);
 
-        let event = finished_run(&pool, "a1", "once");
+        let event = finished_run(&pool, "a1", "once", &system_principal());
         r.handle(event.clone()).await;
         r.handle(event).await; // same run id again
         assert_eq!(
@@ -651,7 +720,7 @@ mod tests {
         let cancel = CancellationToken::new();
         let _handle = start(pool.clone(), spy, ev_rx, cancel.clone());
 
-        let event = finished_run(&pool, "a1", "streamed");
+        let event = finished_run(&pool, "a1", "streamed", &system_principal());
         ev_tx.send(event).expect("send event");
 
         // Await the spy's signal rather than sleeping.
