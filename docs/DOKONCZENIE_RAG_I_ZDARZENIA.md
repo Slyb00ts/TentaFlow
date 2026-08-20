@@ -290,7 +290,7 @@ statystyki na stałe (to konkretna lekcja z DeepSeeka).
 
 ### 2.9 Retencja, objętość, sync
 
-- **Retencja musi przyjść RAZEM z tabelą**, nie później. Domyślnie 14 dni, konfigurowalnie.
+- **Retencja musi przyjść RAZEM z tabelą**, nie później. Domyślnie 30 dni, konfigurowalnie.
 - **Każdy wiersz kasowany na terminie SWOJEJ organizacji** — dlatego `run_events` ma `org_id`.
   Termin rozstrzyga się per organizacja (`compliance_retention_policies`, zakres `events`), a
   polityka jednego najemcy nie może rządzić danymi drugiego; bez przypisania wiersza do najemcy w
@@ -380,8 +380,10 @@ też obsługi klawiatury i widoku mobilnego.
 
 1. **Czy `origin` jest pierwszym filtrem, czy aktor?** Prototyp zakłada `origin`. Jeśli częściej
    szukasz po użytkowniku, hierarchia w pasku się zamienia.
-2. **Retencja loga zdarzeń** — proponowane 14 dni. Krócej = mniej materiału na diagnozę, dłużej =
-   objętość.
+2. **Retencja loga zdarzeń** — ROZSTRZYGNIĘTE: 30 dni (konfigurowalnie, per organizacja). Krócej =
+   mniej materiału na diagnozę, dłużej = objętość. Termin świadomie stoi daleko poniżej ≥183 dni,
+   którymi związany jest audyt AI: oś czasu jest narzędziem diagnostycznym, a ślad audytowy —
+   zobowiązaniem.
 3. **Czy oś czasu jest widoczna dla zwykłego użytkownika** (swoje przebiegi), czy tylko dla admina?
    Prototyp zakłada pierwsze.
 4. **Domyślne włączenie grafu w Projektach.** G1 daje graf, ale ekstrakcja to dodatkowe wywołania

@@ -1759,12 +1759,13 @@ mod tests {
 
     /// The whole variant surface, pinned by count + digest.
     ///
-    /// The byte goldens cover 21 of 133 variants and no response at all, which
-    /// leaves the far more likely accident uncovered: ciborium tags by NAME, so
-    /// renaming a variant changes the wire while every round-trip test — which
-    /// encodes and decodes with the same new name — stays green, and only the
-    /// browser finds out. Declaration ORDER is pinned too, because the wire
-    /// contract is append-only.
+    /// The byte goldens cover 16 of 141 variants — and of the server's own
+    /// frames only two stream pushes, no `*Response` at all — which leaves the
+    /// far more likely accident uncovered: ciborium tags by NAME, so renaming a
+    /// variant changes the wire while every round-trip test — which encodes and
+    /// decodes with the same new name — stays green, and only the browser finds
+    /// out. Declaration ORDER is pinned too, because the wire contract is
+    /// append-only.
     #[test]
     fn code_studio_variant_names_are_pinned() {
         let names = payload_variant_names(SOURCE);

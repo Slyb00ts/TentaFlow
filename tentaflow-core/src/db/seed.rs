@@ -1809,7 +1809,7 @@ fn code_harness_prefix_edges() -> Vec<serde_json::Value> {
     ]
 }
 
-/// Variant A — "the agent decides" (§16.2), 9 blocks.
+/// Variant A — "the agent decides" (§16.2), 10 blocks.
 ///
 /// Nothing in this graph dictates when to test, review, commit or push: those
 /// are tool calls the agent makes from the conversation. The graph's job is to

@@ -980,7 +980,7 @@ Zależności: `rustix` (albo obecny `libc`, `Cargo.toml:381`) i `windows-sys`.
 | Przedmiot | capability + cel | snapshot zmian (`patch_set`) |
 | Odpowiedź | allow_once / for_run / for_session / always / deny | akceptacja per hunk/plik/całość, odrzucenie, poprawka |
 | Trwałość | `approvals`, `session_grants`, `code_workspace_allowlist` | `patch_sets/files/hunks` |
-| Blok w grafie | brak (mechanizm poprzeczny) | brak w wariancie domyślnym — przegląd otwiera bramka PEP na `git_commit`; blok `patch_review` jest opcjonalny |
+| Blok w grafie | brak (mechanizm poprzeczny) | `patch_review` — wpięty w oba seedowane warianty (§16.2); jako blok flow pozostaje opcjonalny dla flow spoza harnessu (§16.4) |
 
 Zakresy: `allow_once`, `allow_for_run` (istniejący `run_grants`, per run —
 `agents/interaction.rs:152-159`), `allow_for_session` (`session_grants`), `always`
@@ -1482,7 +1482,7 @@ realna potrzeba, wycena z 1.7 zostaje w historii rewizji.
 Harness to **flow jak każdy inny** — jego kształt jest decyzją, nie stałą. Oba warianty poniżej są
 seedowane; workspace wskazuje jeden w `sessions.flow_id`.
 
-#### Wariant A — „agent decyduje" (domyślny, 9 bloków)
+#### Wariant A — „agent decyduje" (domyślny, 10 bloków)
 
 ```
 trigger
@@ -1493,6 +1493,7 @@ trigger
    │  compact_context → llm(tools) → tool_exec                            │
    │                                     ↑ loop_back, dopóki są tool_calls│
    └──────────────────────────────────────────────────────────────────────┘
+ → patch_review                   🆕 przegląd końca tury; czysty worktree = `empty`, graf idzie dalej
  → persist_turn
  → output(stream)
 ```
@@ -1502,15 +1503,21 @@ nie jest zapisana nigdzie w grafie — o testach, przeglądzie, commicie i pushu
 z kontekstu rozmowy. „Popraw i wypchnij" kończy się pushem; „zobacz tylko, co jest nie tak" nie
 dotyka gita. Bramki PEP działają niezależnie od tej decyzji.
 
-#### Wariant B — „wymuszony łańcuch" (12 bloków)
+#### Wariant B — „wymuszony łańcuch" (16 bloków)
 
 ```
 … jak wyżej, aż do wyjścia z regionu …
  → spawn(agent=code-reviewer)  → await_subagents(all)
  → spawn(agent=code-tester)    → await_subagents(all)
+ → patch_review                                        przegląd człowieka przed commitem
  → spawn(agent=code-committer) → await_subagents(all)
  → persist_turn → output(stream)
 ```
+
+Każdy `spawn` jest z założenia odczepiony, więc każda delegacja ma WŁASNY `await_subagents(all)` —
+bez czekania łańcuch gwarantowałby tylko, że trójka wystartowała. `patch_review` stoi między
+maszynami, które zmianę OGLĄDAJĄ, a tą, która ją COMMITUJE: `code-committer` ma polecenie działać
+„jeśli istnieje zaakceptowany przegląd", a nic innego w tym łańcuchu go nie produkuje.
 
 Przegląd, testy i commit wykonają się **zawsze**, niezależnie od tego, co agent uzna za potrzebne.
 Cena jest realna i UI musi ją nazywać: łańcuch rusza **zaraz po turze agenta głównego**, więc agent
@@ -1529,10 +1536,18 @@ ostatnim spawnem; Flow Builder robi to jednym skasowaniem bloku.
 | Nie ma bloku | Bo | Gdzie to jest |
 |---|---|---|
 | `ask_user „doprecyzuj zadanie"` | pytanie zadaje się wtedy, kiedy jest potrzebne, a nie na starcie każdego runu | narzędzie `core.ask_user` w `tool_exec` |
-| `patch_review` | przegląd otwiera bramka 5a przy `git_commit` | §9.3, opcjonalny blok w §16.4 |
 | `git_op(commit/push/merge)` | operacje gita są narzędziami | §10 |
 | `condition verify` po testach | wynik testów czyta agent, nie graf | `core.exec` |
 | `condition intent`, `condition plan_decision` | model rozstrzyga to lepiej niż port `true`/`false` | — |
+
+`patch_review` był tu kiedyś wymieniony — z uzasadnieniem „przegląd otwiera bramka 5a przy
+`git_commit`". Przesłanka okazała się fałszywa: agent, któremu kazano coś napisać i uruchomić, nie
+ma powodu prosić o commit, więc bramka 5a nie odpala, a praca ląduje w worktree i nie ma czego
+zaakceptować. Dlatego blok jest wpięty na stałe w każdym seedowanym harnessie — w wariancie A
+zaraz za wyjściem z regionu, w wariancie B przed `code-committer` — dokładnie w tym zastosowaniu,
+które sankcjonuje §16.4 („blok jest dla flow, które chcą przeglądu w ustalonym punkcie"). Tura,
+która niczego nie zmieniła, przechodzi przez niego bez zatrzymania: pusty patch set to status
+`empty` i żaden wiersz nie zostaje.
 
 Wszystko to nadal **widać** w UI jako zdarzenia i wpisy `session_operations` — niewidoczność
 dotyczyłaby sytuacji, w której harness robi coś poza narzędziami, a takiej nie ma.
