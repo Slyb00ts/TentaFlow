@@ -403,3 +403,16 @@ Zero trafień = można commitować. Cokolwiek innego = najpierw posprzątać.
 - wejście w §1.2 G2
 - **push** — nic nie było wypychane
 - regres promptu czatu projektu (patrz niżej) — czeka na potwierdzenie krytyka
+
+## INCYDENT 3 — mutacja bez markera przeszła przez skan
+
+Trzeci raz mutacja krytyka trafiła do commita. Tym razem **skan jej nie wykrył**, bo była
+podmianą wartości (`ctx.origin` → `FlowOrigin::default()`) bez żadnego komentarza-markera.
+
+**Wniosek: grep po markerach jest niewystarczający.** Łapie tylko mutacje uprzejme.
+Skuteczna zasada: **po masowym ubiciu agentów NIE commituj, dopóki każdy tor nie potwierdzi
+stanu własnych plików.** Commit tuż po ubiciu trafia dokładnie w moment, w którym mutacje są
+najbardziej prawdopodobnie żywe.
+
+Przy tej samej okazji wyszła druga, cudza: `TF_REVIEW_MUTATION_1` w `executor.rs` pozwalała
+`envelope.meta["origin"]` nadpisać `ctx.origin` — żywe złamanie inwariantu 1.

@@ -2276,7 +2276,7 @@ mod tests {
         repository::create_project(
             &project_id,
             "org-1",
-            "Projekt kolejkowy",
+            &format!("Projekt {project_id}"),
             "",
             "knowledge",
             "[\"knowledge\"]",
@@ -2569,6 +2569,59 @@ mod tests {
             !ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
             "the stale queue row is still cleared"
         );
+    }
+
+    /// A job that has to WAIT for a worker says so on its own stream. Before the
+    /// queue, a job that could not start reported it through the document gate;
+    /// with workers bounded, a job can now wait in the QUEUE instead and used to
+    /// emit nothing at all. The line states what the queue can prove — the work
+    /// ahead of it — and claims no progress.
+    #[test]
+    fn a_job_queued_behind_others_reports_the_wait() {
+        let (_guard, queue) = exclusive_queue();
+        let state = crate::dispatch::state::AppState::for_test();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+
+        // Enough outstanding work that no worker could be free.
+        for i in 0..WORKERS {
+            let busy = format!("job-{}", uuid::Uuid::new_v4());
+            start_job(queued_task(
+                &state,
+                &project_id,
+                &dir,
+                &sha,
+                &busy,
+                &format!("busy{i}.rs"),
+            ));
+        }
+
+        let waiting = format!("job-{}", uuid::Uuid::new_v4());
+        let mut rx = log_bus::sender_for(&waiting).subscribe();
+        start_job(queued_task(
+            &state, &project_id, &dir, &sha, &waiting, "waiting.rs",
+        ));
+
+        let mut lines = Vec::new();
+        while let Ok(BusMessage::Line(line)) = rx.try_recv() {
+            lines.push(line);
+        }
+        assert!(
+            lines.iter().any(|l| l.phase == "queue"
+                && l.line == format!("queued behind {WORKERS} ingest job(s)")),
+            "a job waiting for a worker must say so; got {} line(s)",
+            lines.len()
+        );
+        assert!(
+            lines.iter().all(|l| l.progress_pct == 0),
+            "a queued job has made no progress to report"
+        );
+
+        while let Some(job) = ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
+            .expect("drain claim")
+        {
+            ingest_jobs::finish(&queue, &job.job_id).expect("drain finish");
+        }
     }
 
     #[test]
