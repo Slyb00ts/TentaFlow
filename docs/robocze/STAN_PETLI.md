@@ -552,3 +552,55 @@ plików — dokładnie jak mówi §2.6 briefu.
 (rekompresja) zmieniają się po każdym `cargo build`, choć są w gicie. Wyglądają jak cudza zmiana
 w `git status` i kosztowały mnie osobne śledztwo, czy któryś agent nie wyszedł poza zakres.
 Nie naprawiam — zgłaszam.
+
+---
+
+## Runda: T1 pochodzenie (runda 2) — ślepy krytyk, po scaleniu main
+
+**Werdykt: MEETS BAR** — T1.1–T1.8 wszystkie SPEŁNIONE. Pomiary wzięte po scaleniu, na
+`505fed924`; baseline toru: **34 testy, wszystkie zielone**.
+
+**Odpowiedź na pytanie 2 (czy COKOLWIEK pilnuje sensu toru): TAK, na dwóch warstwach.**
+Mutacja: wszystkie CZTERY punkty wejścia egzekutora (`execute_blocking`,
+`execute_direct_blocking`, `execute_direct_streaming`, `execute_streaming`) zaczynają
+przedkładać `envelope.meta` nad kontekst dla wszystkich pięciu pól. Czerwienią się dwa
+niezależne testy: co węzeł widzi w czasie wykonania ORAZ co ląduje w wierszu
+`flow_executions`. Oba są prawdziwe — nie ten pusty test bezpieczeństwa z rundy 1, który
+sprawdzał funkcję nieprzyjmującą envelope'a.
+
+**Pułapka `correlation_id` od klienta jest ROZBROJONA i udokumentowana w kodzie.** Na bazie
+`flow_invoke_handler` używał identyfikatora ramki protokołu — per połączenie, wybieranego przez
+klienta. Tor zamienił to na UUID mintowany PO autoryzacji, z uzasadnieniem zostawionym
+w `stream_handlers.rs:410-414`.
+
+**Krytyk zweryfikował także MOJĄ poprawkę scaleniową** (`tests/openai_embeddings.rs` →
+jawny kontekst zamiast `ExecutionContext::default()`) i potwierdził niezależnie, że nie jest to
+zaklejenie jednego miejsca: zero wystąpień `*::default()` dla typów niosących pochodzenie,
+żadna struktura z polem pochodzenia nie wywodzi `Default`, a wszystkie cztery konstruktory biorą
+pochodzenie jako argument obowiązkowy.
+
+### Dług T1 do domknięcia (zlecony, nie zamknięty tym werdyktem)
+
+1. **`Default` nadal wywodzone na `FlowOrigin`/`ActorKind`/`FlowActor` z `#[default] System`.**
+   Martwe (usunięcie kompiluje się czysto, liczniki ostrzeżeń bez zmian) i **przywraca dokładnie
+   ten cichy stempel `system`, którego cała reszta projektu zakazuje** — `ExecutionContext`,
+   `AgentPrincipal`, `CallProvenance`, `TtsRequest`, `VisionOcrRequest`, `VisionClassifyRequest`
+   świadomie `Default` straciły. Jedno `..Default::default()` w przyszłej strukturze i inwariant
+   znów jest otwarty.
+2. **Dziedziczenie pochodzenia przez sub-agenta (T1.6) NIE MA ŻADNEGO TESTU.** Mutacja
+   zamieniająca dziedziczenie na `Agent` + `system()` **przeżyła 26 testów** (`subagent_reactor`
+   5, `principal` 7, `run_manager` 14 — zero porażek). Przyczyna jest w dublerze:
+   `SpyDispatch::dispatch(..., _principal)` wyrzuca principala, więc żadna asercja nie ma czego
+   zobaczyć. To ten sam wzorzec co F5 z R2a: test istnieje, ale nie ma jak upaść.
+3. **Per-call `correlation_id` compliance nadal czytany z `envelope.meta`** w sześciu adapterach
+   (`llm.rs:548`, `llm.rs:865`, `agent_router.rs:255`, `compact_context.rs:547`,
+   `vision_llm.rs:231`, `vision_parse.rs:159`), podczas gdy ten na poziomie przebiegu jest już
+   polem struktury. Dziś się zgadzają, bo punkty wejścia piszą obie wartości tak samo — ale
+   `envelope.meta` jest zapisywalne przez bloczek addona, więc skompromitowany bloczek może
+   wskazać `compliance_ai_events` na sfałszowaną korelację, podczas gdy `run_events`,
+   `audit_log` i `flow_executions` trzymają prawdziwą. `ctx.correlation_id` jest dostępny w
+   każdym z tych miejsc. **Luka zastana (§3.4), nie wniesiona tym torem** — ale to jedyne
+   miejsce, gdzie nowy inwariant nie jest zastosowany.
+4. Luki pokrycia: punkty wejścia **tts / document / stt** bez testu pochodzenia; trzy handlery
+   strumieniowe (Chat / Project / CodeStudio) bez testu jednostkowego (zgłoszone już przez
+   wykonawcę rundy 1 — krytyk potwierdza, że stoją na kompilacji i przeglądzie).
