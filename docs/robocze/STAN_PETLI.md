@@ -955,3 +955,20 @@ degraduje się tam do no-opu **z powodu widocznego w kodzie**, a nie przez zamro
 Project Studio `graph_home` ustawia — i to ta ścieżka dostaje ekstrakcję, domyślnie wyłączoną
 zgodnie z decyzją człowieka. Głośna odmowa zostaje, ale wyzwala ją wyłącznie **własny config
 węzła**, nigdy odziedziczone `meta` domyślnie ustawione na ON.
+
+### Skutek uboczny INCYDENTU 5: mutacja żyła ~10 minut w cudzym oknie buildu
+
+Zagłodzony wykonawca R2b uruchomił okno mutacyjne ręcznie; `flock` odpadł na timeoucie
+**po nałożeniu mutacji**, więc zmutowany plik został w drzewie przez ok. 10 minut, podczas gdy
+drugi agent się budował. R2b przywrócił plik i zweryfikował odczytem kodu, a okno przerobił na
+jeden atomowy skrypt, który **najpierw bierze blokadę, dopiero potem mutuje**, i przywraca
+w `finally` przed zwolnieniem.
+
+Mutacja była w plikach spoza własności drugiego agenta, więc nie mogła zmienić zachowania jego
+kodu — ale mogła wywrócić build albo test integracyjny przechodzący przez flow. Dlatego
+**wyniki zebrane przez agenta `events` w tym oknie są prowizoryczne**; kazałem powtórzyć pełną
+weryfikację na czystym drzewie przed raportem.
+
+Kolejność w skrypcie okna (blokada → mutacja → test → przywrócenie → zwolnienie) jest właściwym
+kształtem tego mechanizmu i powinna być domyślna w każdym następnym zleceniu. Wariant „nałóż
+mutację, potem czekaj na blokadę" jest z definicji niebezpieczny.
