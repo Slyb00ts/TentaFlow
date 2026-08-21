@@ -37,6 +37,14 @@ use super::{HandlerContext, SessionAuthKind};
 /// Translates one engine `ProgressEvent` into the wire `AgentRunEvent`. The
 /// `scope` the event arrived under is stamped so a multiplexed subscriber routes
 /// it; kind-specific fields are filled, the rest stay at their defaults.
+///
+/// The emission instant the broker now stamps onto every event
+/// (`StampedProgressEvent::at_ms`) is DROPPED here, and deliberately not faked
+/// back in: `AgentRunEvent` has no time field, so a dashboard reading this
+/// stream can only date an event by when it arrived. Carrying it would mean
+/// adding a field to the protocol crate, which is a wire-contract change, not a
+/// change to this handler. The durable timeline is where a timing comes from
+/// (`events::metrics`); this stream is a live view.
 fn to_wire(scope: &str, event: ProgressEvent) -> AgentRunEvent {
     let mut e = AgentRunEvent {
         scope: scope.to_string(),
@@ -257,9 +265,10 @@ fn run_events_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
     tokio::spawn(async move {
         loop {
             match rx.recv().await {
-                Ok(event) => {
+                Ok(stamped) => {
                     let body = MessageBody::AgentsBody(AgentsPayload::RunEvent(to_wire(
-                        &scope_key, event,
+                        &scope_key,
+                        stamped.event,
                     )));
                     // Receiver closed (client disconnected) → stop draining the
                     // broker so the scope can be pruned on its next publish.
@@ -385,8 +394,11 @@ mod tests {
                 choices: vec!["A".into(), "B".into()],
             },
         );
-        // TTFT is read off the wire as `request_started -> first_token`, so the
-        // kind string and the node it names are part of the contract.
+        // The live view highlights the streaming node the moment it produces
+        // something, so the kind string and the node it names are part of the
+        // wire contract. The NUMBER is not read from here — TTFT is
+        // `request_started -> first_token` over the stored timeline, and this
+        // stream carries no timestamps to subtract.
         let ft = to_wire(
             "sess-1",
             ProgressEvent::FirstToken {

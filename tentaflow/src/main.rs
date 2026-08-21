@@ -1149,6 +1149,9 @@ async fn run_server(args: Args) -> Result<()> {
         tracing::warn!("Checkpoint WAL Project Studio nieudany: {}", e);
     }
     tentaflow_core::project_studio::project_db::checkpoint_all();
+    // Stop the event-log subscribers before the checkpoint: a scope task still
+    // draining the progress broadcast would append behind the truncation.
+    tentaflow_core::events::progress_log::stop();
     if let Err(e) = tentaflow_core::events::db::checkpoint_wal() {
         tracing::warn!("Event log WAL checkpoint failed: {}", e);
     }

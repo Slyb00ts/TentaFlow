@@ -218,6 +218,14 @@ pub enum BodyOmission {
     /// trigger), so there is no tenant whose opt-in could apply. Falling back
     /// to another tenant's setting would be borrowing a consent nobody gave.
     NoOrganisation,
+    /// The event this row was translated from did not carry the answer. The
+    /// engine's progress stream announces that a streaming node FINISHED, never
+    /// what it produced, so a row built from it can say when the message
+    /// completed and nothing about what it said (§2.6). Kept apart from
+    /// `NotEnabled` because no setting changes it: only a writer that holds the
+    /// text can, and storing an empty string instead would read as a model that
+    /// answered with nothing (invariant 6).
+    NotCarried,
 }
 
 /// Resolves whether `org_id` opted in to storing response bodies (§2.8: the
@@ -234,6 +242,11 @@ fn resolve_response_body(
     org_id: Option<&str>,
     body: ResponseBody,
 ) -> ResponseBody {
+    // A body that never reached the writer cannot be stored by any policy, and
+    // the reason it is missing is the more specific fact of the two.
+    if matches!(body, ResponseBody::Omitted(_)) {
+        return body;
+    }
     let Some(org_id) = org_id else {
         return ResponseBody::Omitted(BodyOmission::NoOrganisation);
     };
@@ -329,7 +342,15 @@ impl EventPayload {
                 turn,
                 status: redact::redact_text(&status),
             },
-            other => other,
+            // Listed one by one rather than caught by an `other => other` arm:
+            // the arm that costs least to write is the one that would let a
+            // variant added later carry free text past the scrubber without a
+            // compiler error. Everything below has no field a credential fits
+            // in — server-minted labels, a turn number, or no body at all.
+            payload @ (EventPayload::RequestStarted { .. }
+            | EventPayload::FirstToken {}
+            | EventPayload::StepStart { .. }
+            | EventPayload::TurnStart { .. }) => payload,
         }
     }
 }

@@ -2,10 +2,10 @@
 //
 // The timeline lives in `<data>/events.db`, NOT in `tentaflow.db`. The deciding
 // argument is not file size: the main database has ONE writer connection and
-// every write serialises on it (`db/mod.rs`: "`write()` bierze jedyne
-// polaczenie pisarza spod `Mutex`"). An event log is high-frequency, so in the
-// main database it would contend for that lock with settings, flows, agents and
-// audit writes. The literal precedent is `code_studio/workspace_db.rs` —
+// every write serialises on it (`db/mod.rs` — `write()` hands out the single
+// writer connection from under a `Mutex`). An event log is high-frequency, so
+// in the main database it would contend for that lock with settings, flows,
+// agents and audit writes. The literal precedent is `code_studio/workspace_db.rs` —
 // runtime state of a single node, written constantly, outside the Sync Ledger.
 //
 // ONE file per node, not per session (§2.2): the browser asks across origins,

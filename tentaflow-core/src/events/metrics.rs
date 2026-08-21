@@ -20,20 +20,22 @@ use anyhow::{anyhow, Result};
 
 use crate::db::DbPool;
 
-/// One streaming step's two halves. `request_started` is not in the log (no
-/// engine event opens a run), so TTFT is measured from the step that produced
-/// the token — which is exactly §2.7's "in the same step".
+/// One streaming step's two halves, both exactly as §2.7 defines them.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StepLatency {
     pub node_id: String,
-    /// Node type as recorded at `step_start`; empty when the start was never
-    /// seen.
+    /// Node type as recorded at the `step_start` this token belongs to; empty
+    /// when that start was never seen.
     pub step: String,
-    /// `step_start` → `first_token`.
-    pub ttft_ms: i64,
-    /// `first_token` → the step's `step_end`. `None` when the step never
-    /// closed: it failed (stored as `error`) or is still running. A decode time
-    /// that was never completed has no value, and the log will not invent one.
+    /// `request_started` → `first_token`. `None` when the run has no
+    /// `request_started` row — a run whose opening was dropped by a lagging
+    /// subscriber has no start to measure from, and the nearest step start is a
+    /// different number wearing this one's name.
+    pub ttft_ms: Option<i64>,
+    /// `first_token` → `assistant_message` of the same node. `None` when the
+    /// message never completed: the node failed (stored as `error`) or is still
+    /// streaming. A decode time that was never finished has no value, and the
+    /// log will not invent one.
     pub decode_ms: Option<i64>,
 }
 
@@ -46,22 +48,29 @@ pub struct ToolDuration {
 }
 
 /// TTFT and decode time per streaming step of one run.
+///
+/// One row per `first_token`, and every `first_token` gets one: the step label
+/// and both durations are correlated subqueries rather than joins, so a token
+/// whose step start, whose run opening or whose message is missing still
+/// appears — with a hole where the missing half would have been, which is the
+/// difference between "we do not know" and "it was zero".
 pub fn step_latencies(pool: &DbPool, run_id: &str) -> Result<Vec<StepLatency>> {
     let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT f.node_id, \
-                s.payload_json ->> '$.step'                          AS step, \
-                f.at_ms - s.at_ms                                    AS ttft_ms, \
-                (SELECT e.at_ms FROM run_events e \
-                  WHERE e.run_id = f.run_id AND e.node_id = f.node_id \
-                    AND e.kind = 'step_end' AND e.seq > f.seq \
-                  ORDER BY e.seq LIMIT 1) - f.at_ms                   AS decode_ms \
+                (SELECT s.payload_json ->> '$.step' FROM run_events s \
+                  WHERE s.run_id = f.run_id AND s.node_id = f.node_id \
+                    AND s.kind = 'step_start' AND s.seq < f.seq \
+                  ORDER BY s.seq DESC LIMIT 1)                        AS step, \
+                f.at_ms - (SELECT r.at_ms FROM run_events r \
+                            WHERE r.run_id = f.run_id \
+                              AND r.kind = 'request_started' \
+                            ORDER BY r.seq LIMIT 1)                   AS ttft_ms, \
+                (SELECT a.at_ms FROM run_events a \
+                  WHERE a.run_id = f.run_id AND a.node_id = f.node_id \
+                    AND a.kind = 'assistant_message' AND a.seq > f.seq \
+                  ORDER BY a.seq LIMIT 1) - f.at_ms                   AS decode_ms \
            FROM run_events f \
-           JOIN run_events s \
-             ON s.run_id = f.run_id AND s.node_id = f.node_id AND s.kind = 'step_start' \
-            AND s.seq = (SELECT MAX(x.seq) FROM run_events x \
-                          WHERE x.run_id = f.run_id AND x.node_id = f.node_id \
-                            AND x.kind = 'step_start' AND x.seq < f.seq) \
           WHERE f.run_id = ?1 AND f.kind = 'first_token' \
           ORDER BY f.seq",
     )?;
@@ -79,24 +88,38 @@ pub fn step_latencies(pool: &DbPool, run_id: &str) -> Result<Vec<StepLatency>> {
 
 /// Duration of every tool call of one run that closed before its turn did.
 ///
-/// The inner join is what excludes a call that never came back; the `NOT EXISTS`
-/// is what excludes a result that arrived after the turn had already closed, so
-/// a late answer cannot resurrect a call the run had given up on.
+/// One row per `tool_call`, closed by the FIRST `tool_result` that carries the
+/// same `call_id` after it — the same "first match wins" rule `step_latencies`
+/// uses, and for the same reason. A joined form pairs a call with EVERY later
+/// result of that id, so one `call_id` reused within a run (a retried call
+/// replaying a model-supplied id) came back as duplicate rows plus a
+/// cross-paired duration made of one call's start and another call's end. Where
+/// two calls of one id are open at the same time the id is genuinely ambiguous
+/// and the earlier call takes the earlier result; nothing in the log can do
+/// better, and inventing a tie-break would be inventing a fact.
+///
+/// The `NOT EXISTS` excludes a result that arrived after the turn had already
+/// closed, so a late answer cannot resurrect a call the run had given up on;
+/// dropping the `NULL` durations is what excludes a call that never came back.
 pub fn tool_durations(pool: &DbPool, run_id: &str) -> Result<Vec<ToolDuration>> {
     let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
     let mut stmt = conn.prepare(
-        "SELECT c.call_id, \
-                c.payload_json ->> '$.name' AS tool, \
-                r.at_ms - c.at_ms           AS ms \
-           FROM run_events c \
-           JOIN run_events r \
-             ON r.run_id = c.run_id AND r.call_id = c.call_id \
-            AND r.kind = 'tool_result' AND r.seq > c.seq \
-          WHERE c.run_id = ?1 AND c.kind = 'tool_call' \
-            AND NOT EXISTS (SELECT 1 FROM run_events t \
-                             WHERE t.run_id = c.run_id AND t.kind = 'turn_end' \
-                               AND t.seq > c.seq AND t.seq < r.seq) \
-          ORDER BY c.seq",
+        "SELECT call_id, tool, ms FROM ( \
+           SELECT c.seq                       AS seq, \
+                  c.call_id                   AS call_id, \
+                  c.payload_json ->> '$.name' AS tool, \
+                  (SELECT r.at_ms FROM run_events r \
+                    WHERE r.run_id = c.run_id AND r.call_id = c.call_id \
+                      AND r.kind = 'tool_result' AND r.seq > c.seq \
+                      AND NOT EXISTS (SELECT 1 FROM run_events t \
+                                       WHERE t.run_id = c.run_id \
+                                         AND t.kind = 'turn_end' \
+                                         AND t.seq > c.seq AND t.seq < r.seq) \
+                    ORDER BY r.seq LIMIT 1) - c.at_ms AS ms \
+             FROM run_events c \
+            WHERE c.run_id = ?1 AND c.kind = 'tool_call' \
+         ) WHERE ms IS NOT NULL \
+           ORDER BY seq",
     )?;
     let rows = stmt.query_map(rusqlite::params![run_id], |row| {
         Ok(ToolDuration {
@@ -306,6 +329,14 @@ mod tests {
     /// §2.11 stage 3 — TTFT is COMPUTED from the stored rows and checked against
     /// the wait the run actually contained. 220 ms of silence before the first
     /// delta has to come back out of the database as ~220 ms.
+    ///
+    /// The window is what the mechanism guarantees, not a shrug. `at_ms` is now
+    /// stamped where the event is emitted, so the low end is the wait itself:
+    /// `sleep` never returns early, and the only slack below 220 is the single
+    /// millisecond epoch truncation can eat between two stamps. The high end
+    /// covers the flow setup the measurement legitimately contains (TTFT runs
+    /// from `request_started`, i.e. the trigger node, not from the streaming
+    /// node) plus scheduling slack on a loaded machine.
     #[tokio::test]
     async fn ttft_is_computed_from_the_stored_events() {
         let (dir, pool, log) = streaming_run(
@@ -322,18 +353,22 @@ mod tests {
             .find(|s| s.node_id == "p")
             .expect("the streaming node has a first token");
         assert_eq!(step.step, "metrics_probe");
+        let ttft = step
+            .ttft_ms
+            .expect("the run opened with a request_started row");
         assert!(
-            (200..600).contains(&step.ttft_ms),
-            "TTFT {} ms is not the ~220 ms the run waited",
-            step.ttft_ms
+            (219..400).contains(&ttft),
+            "TTFT {ttft} ms is not the ~220 ms the run waited"
         );
         log.stop();
         drop(dir);
     }
 
-    /// §2.11 stage 3 — decode time, likewise computed from the log. The stream
-    /// stayed open 260 ms after its first token, and that is what the two rows
-    /// have to say.
+    /// §2.11 stage 3 — decode time, likewise computed from the log: the
+    /// distance between the `first_token` row and the `assistant_message` row
+    /// the streaming node's finish produced. The stream stayed open 260 ms after
+    /// its first token, and that is what the two rows have to say. Same
+    /// reasoning for the window as in the TTFT test, with less setup inside it.
     #[tokio::test]
     async fn decode_time_is_computed_from_the_stored_events() {
         let (dir, pool, log) = streaming_run(
@@ -342,16 +377,18 @@ mod tests {
             Duration::from_millis(260),
         )
         .await;
-        await_kind(&pool, "run-decode", crate::events::EventKind::StepEnd).await;
+        await_kind(&pool, "run-decode", crate::events::EventKind::AssistantMessage).await;
 
         let steps = step_latencies(&pool, "run-decode").expect("latencies");
         let step = steps
             .iter()
             .find(|s| s.node_id == "p")
             .expect("the streaming node has a first token");
-        let decode = step.decode_ms.expect("the step closed, so decoding has an end");
+        let decode = step
+            .decode_ms
+            .expect("the message completed, so decoding has an end");
         assert!(
-            (240..700).contains(&decode),
+            (259..380).contains(&decode),
             "decode {decode} ms is not the ~260 ms the stream stayed open"
         );
         log.stop();
@@ -380,6 +417,24 @@ mod tests {
                 .with_org("org-quiet")
         };
 
+        append(
+            &pool,
+            &core_db,
+            RunEvent::new(
+                "run-quiet",
+                1_000,
+                FlowOrigin::Chat,
+                &actor,
+                EventPayload::RequestStarted {
+                    model: None,
+                    flow_id: None,
+                    service_type: None,
+                    modality: None,
+                },
+            )
+            .with_org("org-quiet"),
+        )
+        .unwrap();
         append(
             &pool,
             &core_db,
@@ -419,10 +474,10 @@ mod tests {
 
         let steps = step_latencies(&pool, "run-quiet").expect("latencies");
         assert_eq!(steps.len(), 1);
-        assert_eq!(steps[0].ttft_ms, 150);
+        assert_eq!(steps[0].ttft_ms, Some(150));
         assert_eq!(
             steps[0].decode_ms,
-            Some(500),
+            Some(490),
             "the decode time was lost with the body"
         );
 
@@ -556,6 +611,69 @@ mod tests {
             (10..120).contains(&fast.ms),
             "the fast call ran ~30 ms, not {} ms — name pairing would say ~210",
             fast.ms
+        );
+    }
+
+    /// §2.7 — one `call_id` used twice in a run, the way a retried tool call
+    /// replaying a model-supplied id does. Each call has to be closed by ITS OWN
+    /// result: a join over every later row of that id would return three
+    /// durations for two calls, one of them ~330 ms — the first call's start
+    /// against the second call's end, a number neither call ever had.
+    #[tokio::test]
+    async fn a_call_id_reused_in_one_run_pairs_with_its_own_result() {
+        let run = ToolRun::start("run-retry");
+        run.emit(ProgressEvent::IterationStarted {
+            node_id: "loop".into(),
+            n: 1,
+            max: 4,
+        });
+        run.emit(ProgressEvent::ToolCallStarted {
+            call_id: "call-same".into(),
+            name: "search".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(40)).await;
+        run.emit(ProgressEvent::ToolCallFinished {
+            call_id: "call-same".into(),
+            name: "search".into(),
+            status: "error".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        // The retry reuses the id the model handed out the first time.
+        run.emit(ProgressEvent::ToolCallStarted {
+            call_id: "call-same".into(),
+            name: "search".into(),
+        });
+        tokio::time::sleep(Duration::from_millis(180)).await;
+        run.emit(ProgressEvent::ToolCallFinished {
+            call_id: "call-same".into(),
+            name: "search".into(),
+            status: "ok".into(),
+        });
+        run.emit(ProgressEvent::IterationFinished {
+            node_id: "loop".into(),
+            n: 1,
+        });
+        run.await_rows("run-retry", 6).await;
+
+        let durations = tool_durations(&run.pool, "run-retry").expect("durations");
+        assert_eq!(
+            durations.len(),
+            2,
+            "two calls, two durations — not one per (call, later result) pair: {durations:?}"
+        );
+        assert!(
+            durations.iter().all(|d| d.call_id == "call-same"),
+            "both rows belong to the reused id: {durations:?}"
+        );
+        assert!(
+            (39..140).contains(&durations[0].ms),
+            "the first attempt ran ~40 ms, not {} ms",
+            durations[0].ms
+        );
+        assert!(
+            (179..300).contains(&durations[1].ms),
+            "the retry ran ~180 ms, not {} ms — a cross-paired row would say ~340",
+            durations[1].ms
         );
     }
 

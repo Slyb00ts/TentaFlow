@@ -10,9 +10,12 @@
 use std::sync::Arc;
 use std::sync::OnceLock;
 
+use dashmap::mapref::entry::Entry;
 use dashmap::DashMap;
 use tokio::sync::broadcast;
+use tracing::warn;
 
+use crate::events::store::now_ms;
 use crate::flow_engine::dispatcher::{ActorKind, FlowOrigin, FlowRequestMeta};
 use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
 
@@ -27,6 +30,28 @@ pub fn global_broker() -> Arc<ProgressBroker> {
     GLOBAL_BROKER
         .get_or_init(|| Arc::new(ProgressBroker::new()))
         .clone()
+}
+
+/// One published progress event together with the instant it was EMITTED.
+///
+/// The stamp is taken in [`ProgressBroker::publish`] — the single point where an
+/// emitted event enters the broadcast, reached synchronously from every emitter
+/// through `ProgressSink::emit` or a direct `publish`. It travels with the event
+/// because a consumer cannot recover it afterwards: the event log batches, and a
+/// subscriber that a tokio wakeup reaches late, or that is still writing the
+/// previous batch, would date every row by when it happened to look rather than
+/// by when the thing happened. Every duration read back out of the log is a
+/// difference of two of these stamps, so the difference has to be one of
+/// emission instants (§2.7, invariant 5).
+///
+/// Stamping here rather than at each emit site is deliberate: the emitters are
+/// spread across the executor and the harness, and giving each one a clock would
+/// be the per-adapter instrumentation the design forbids.
+#[derive(Debug, Clone, PartialEq)]
+pub struct StampedProgressEvent {
+    /// Epoch milliseconds — the unit `run_events.at_ms` stores.
+    pub at_ms: i64,
+    pub event: ProgressEvent,
 }
 
 /// Capacity of each per-scope broadcast ring. A slow subscriber that lags past
@@ -44,10 +69,11 @@ const SCOPE_CHANNEL_CAPACITY: usize = 256;
 /// authorization — and the log copies the binding instead of deriving anything
 /// from the event (invariant 1).
 ///
-/// This is NOT an authorization token and must never be used as one: unlike
-/// `session_owners`, a rebinding overwrites, because one session scope carries
-/// many runs one after another and each has its own `request_id`. The ACL that
-/// decides who may subscribe stays `session_owners`.
+/// This is NOT an authorization token and must never be used as one: the ACL
+/// that decides who may subscribe stays `session_owners`. A rebinding is still
+/// allowed — one session scope carries many runs one after another, each with
+/// its own `request_id` — but only WITHIN ONE PRINCIPAL, see
+/// [`ProgressBroker::bind_run_provenance`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RunProvenance {
     /// `FlowRequestMeta.request_id` — the `run_id` every stored row is keyed by.
@@ -74,6 +100,37 @@ impl RunProvenance {
             session_id: meta.session_id.clone(),
         }
     }
+
+    /// Whether two bindings name the same authorized PRINCIPAL — the actor and
+    /// the tenant an entry point stamped, not the run. A scope's run id changes
+    /// with every run under it; who is behind it does not.
+    fn same_principal(&self, other: &Self) -> bool {
+        self.actor_kind == other.actor_kind
+            && self.actor_id == other.actor_id
+            && self.actor_user_id == other.actor_user_id
+            && self.org_id == other.org_id
+    }
+}
+
+/// What a scope's provenance slot holds.
+///
+/// The extra state is not bookkeeping: a broadcast scope is keyed by the
+/// session id, which on the foreground path is a value the CLIENT supplies
+/// (`stream_handlers`: `meta.session_id = invoke.session_id`). Two principals
+/// can therefore end up publishing into one ring, and a `ProgressEvent` carries
+/// nothing that says which run it came from — so once that has happened, no
+/// stamp the log could apply to the events still in flight is known to be the
+/// right one. Storing them under either principal would attribute one user's
+/// request to the other, and `request_started` is mirrored into `audit_log`.
+/// A hole in a diagnostic log is acceptable; a forged audit row is not
+/// (invariant 6 over invariant 1).
+#[derive(Debug, Clone)]
+enum ScopeProvenance {
+    Bound(RunProvenance),
+    /// A second principal tried to bind a scope another principal was already
+    /// running under. Cleared with the rest of the scope by
+    /// [`ProgressBroker::release_run_provenance`] when its subscriber stops.
+    Contested,
 }
 
 /// Announces a run to the progress layer: binds its server-minted provenance to
@@ -96,14 +153,22 @@ pub fn begin_run(meta: &FlowRequestMeta) {
     let scope = meta.progress_scope();
     let broker = global_broker();
     broker.bind_run_provenance(&scope, RunProvenance::from_meta(meta));
-    crate::events::progress_log::attach_scope(&scope);
+    if !crate::events::progress_log::attach_scope(&scope) {
+        // Nothing is watching this scope and nothing will: a headless build
+        // that never opened `events.db`, a synchronous test, or a log already
+        // shutting down. The subscriber is what releases a binding on its way
+        // out, so a binding it never took ownership of has to go back now —
+        // otherwise the map grows by one entry per run for the life of the
+        // process.
+        broker.release_run_provenance(&scope);
+    }
 }
 
 /// Per-scope broadcast registry. A scope is a session id or a run id. Senders
 /// are created lazily on first publish/subscribe and dropped when the last
 /// subscriber goes away AND no fresh event arrives — see `prune_if_idle`.
 pub struct ProgressBroker {
-    scopes: DashMap<String, broadcast::Sender<ProgressEvent>>,
+    scopes: DashMap<String, broadcast::Sender<StampedProgressEvent>>,
     /// §3.3 ACL — server-side binding of a session-scope key to the principal
     /// that started the flow under it. A `Session` event scope is the
     /// client-minted conversation id (low entropy, time-correlated); it MUST
@@ -116,9 +181,10 @@ pub struct ProgressBroker {
     /// leak (OWASP A01).
     session_owners: DashMap<String, String>,
     /// §2.5 — server-minted provenance of the run executing under each scope,
-    /// bound by [`begin_run`] and read by the event-log subscriber. See
-    /// [`RunProvenance`] for why this overwrites where `session_owners` does not.
-    run_provenance: DashMap<String, RunProvenance>,
+    /// bound by [`begin_run`] and read by the event-log subscriber. Bounded by
+    /// the number of live subscribers: `begin_run` gives the entry back when no
+    /// subscriber took it, and the subscriber releases it when it stops.
+    run_provenance: DashMap<String, ScopeProvenance>,
 }
 
 impl ProgressBroker {
@@ -131,16 +197,48 @@ impl ProgressBroker {
     }
 
     /// Records the provenance of the run now executing under `scope`.
+    ///
+    /// A rebinding by the SAME principal is the normal case — a session scope
+    /// carries one run after another and each has its own `request_id`. A
+    /// rebinding by a DIFFERENT principal is not: the scope key is
+    /// client-supplied on the foreground path, so this is how a second user
+    /// would re-point a live scope and have the first user's remaining events
+    /// filed under their own actor. It neither overwrites nor silently keeps
+    /// the old stamp for the newcomer's events — the scope goes
+    /// [`ScopeProvenance::Contested`] and stores nothing further.
     pub fn bind_run_provenance(&self, scope: &str, provenance: RunProvenance) {
         if scope.is_empty() {
             return;
         }
-        self.run_provenance.insert(scope.to_string(), provenance);
+        match self.run_provenance.entry(scope.to_string()) {
+            Entry::Occupied(mut occupied) => {
+                if let ScopeProvenance::Bound(current) = occupied.get() {
+                    if current.same_principal(&provenance) {
+                        occupied.insert(ScopeProvenance::Bound(provenance));
+                        return;
+                    }
+                }
+                warn!(
+                    scope = %scope,
+                    "a second principal dispatched under a live progress scope; \
+                     its events are no longer attributable and are not stored"
+                );
+                occupied.insert(ScopeProvenance::Contested);
+            }
+            Entry::Vacant(vacant) => {
+                vacant.insert(ScopeProvenance::Bound(provenance));
+            }
+        }
     }
 
-    /// Provenance of the run currently executing under `scope`, if one is bound.
+    /// Provenance of the run currently executing under `scope`, if one is bound
+    /// and unambiguous. A contested scope answers `None`, which the event log
+    /// already treats as "no bound run; not stored".
     pub fn run_provenance(&self, scope: &str) -> Option<RunProvenance> {
-        self.run_provenance.get(scope).map(|p| p.value().clone())
+        match self.run_provenance.get(scope)?.value() {
+            ScopeProvenance::Bound(provenance) => Some(provenance.clone()),
+            ScopeProvenance::Contested => None,
+        }
     }
 
     /// Drops a scope's provenance binding. Called by the event-log subscriber
@@ -176,7 +274,7 @@ impl ProgressBroker {
     /// ones. The returned receiver only sees events published AFTER it
     /// subscribed (broadcast semantics) — the dashboard reconciles backlog from
     /// `RunDetail`.
-    pub fn subscribe(&self, scope: &str) -> broadcast::Receiver<ProgressEvent> {
+    pub fn subscribe(&self, scope: &str) -> broadcast::Receiver<StampedProgressEvent> {
         if let Some(tx) = self.scopes.get(scope) {
             return tx.subscribe();
         }
@@ -194,7 +292,14 @@ impl ProgressBroker {
         let Some(tx) = self.scopes.get(scope) else {
             return;
         };
-        if tx.send(event).is_err() {
+        // The stamp is taken HERE, still inside the emitter's own call, and
+        // never by whoever pulls the event out of the ring — see
+        // [`StampedProgressEvent`].
+        let stamped = StampedProgressEvent {
+            at_ms: now_ms(),
+            event,
+        };
+        if tx.send(stamped).is_err() {
             // No live receivers — drop the sender lock before removing to avoid
             // a deadlock on the DashMap shard.
             drop(tx);
@@ -256,11 +361,99 @@ mod tests {
         );
         let got = rx.recv().await.expect("event delivered");
         assert_eq!(
-            got,
+            got.event,
             ProgressEvent::NodeStarted {
                 node_id: "n1".into(),
                 node_type: "llm".into(),
             }
+        );
+    }
+
+    /// The seam of §2.7: the stamp belongs to the emitter's call, not to the
+    /// reader's. Both events are drained only AFTER both were published, so a
+    /// stamp taken at receipt would put them within a millisecond of each other
+    /// and every duration read out of the log would be a difference of receipt
+    /// times.
+    #[tokio::test]
+    async fn the_stamp_is_taken_at_publish_not_at_receive() {
+        let broker = Arc::new(ProgressBroker::new());
+        let mut rx = broker.subscribe("stamp");
+        let sink = BrokerProgressSink::new(broker.clone());
+        sink.emit(
+            "stamp",
+            ProgressEvent::NodeStarted {
+                node_id: "n1".into(),
+                node_type: "llm".into(),
+            },
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        sink.emit(
+            "stamp",
+            ProgressEvent::FirstToken {
+                node_id: "n1".into(),
+            },
+        );
+
+        let start = rx.recv().await.expect("start delivered");
+        let token = rx.recv().await.expect("token delivered");
+        let gap = token.at_ms - start.at_ms;
+        assert!(
+            (249..400).contains(&gap),
+            "the two emissions were 250 ms apart, the stamps say {gap} ms"
+        );
+    }
+
+    /// §2.5 — a scope key is client-supplied on the foreground path, so a
+    /// second principal must not be able to re-point a live scope. Neither
+    /// principal's stamp survives the collision: the newcomer's events are not
+    /// stored under the first user's actor either.
+    #[test]
+    fn a_foreign_principal_cannot_repoint_a_live_scope() {
+        use crate::flow_engine::dispatcher::FlowActor;
+
+        let bind = |broker: &ProgressBroker, run: &str, user: &str| {
+            let mut meta = FlowRequestMeta::new(run, FlowOrigin::Chat, FlowActor::user(user));
+            meta.org_id = Some(format!("org-of-{user}"));
+            meta.session_id = Some("shared-session".into());
+            broker.bind_run_provenance("shared-session", RunProvenance::from_meta(&meta));
+        };
+
+        let broker = ProgressBroker::new();
+        bind(&broker, "run-a1", "user-a");
+        let bound = broker
+            .run_provenance("shared-session")
+            .expect("the first principal owns the scope");
+        assert_eq!(bound.run_id, "run-a1");
+
+        // The same principal's next run under the same scope rebinds normally.
+        bind(&broker, "run-a2", "user-a");
+        assert_eq!(
+            broker
+                .run_provenance("shared-session")
+                .expect("still bound")
+                .run_id,
+            "run-a2"
+        );
+
+        // A different principal guessing the session id contests it.
+        bind(&broker, "run-b1", "user-b");
+        assert!(
+            broker.run_provenance("shared-session").is_none(),
+            "a contested scope must stamp nothing at all"
+        );
+
+        // And it stays contested until its subscriber releases the scope — the
+        // attacker cannot claim it by binding once more.
+        bind(&broker, "run-b2", "user-b");
+        assert!(broker.run_provenance("shared-session").is_none());
+        broker.release_run_provenance("shared-session");
+        bind(&broker, "run-a3", "user-a");
+        assert_eq!(
+            broker
+                .run_provenance("shared-session")
+                .expect("a released scope binds again")
+                .run_id,
+            "run-a3"
         );
     }
 
@@ -323,7 +516,7 @@ mod tests {
         );
         let got = rx_a.recv().await.expect("scope a delivered");
         assert_eq!(
-            got,
+            got.event,
             ProgressEvent::ToolCallStarted {
                 call_id: "test-call".into(),
                 name: "search".into()
