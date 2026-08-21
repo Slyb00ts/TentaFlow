@@ -66,6 +66,7 @@ use crate::api::openai::types::{
 use crate::error::Result;
 use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
 use crate::flow_engine::envelope::{ChatMessage, ChatRole, FlowEnvelope, FlowValue};
+use sha2::{Digest, Sha256};
 
 /// Buduje seed envelope + per-request meta z `ChatCompletionRequest`. Trigger
 /// adapter konsumuje envelope (model + messages + payload), dispatcher
@@ -83,8 +84,53 @@ pub(crate) async fn build_initial_envelope_for_user(
         meta.user_id = Some(u.user_id);
         meta.user_role = Some(u.role);
     }
+    if meta.origin == FlowOrigin::Api {
+        let caller_session = meta.session_id.take();
+        meta.session_id = caller_session
+            .as_deref()
+            .and_then(|caller| mint_api_session_id(&meta, caller));
+    }
     Ok((envelope, meta))
 }
+
+/// `conversation_messages` is keyed by `session_id` and by nothing else — the
+/// table carries no owner column, so on `/v1` the request body itself names
+/// which conversation gets replayed into the prompt. A caller who guesses (or
+/// is told) another tenant's session id would read that tenant's history. The
+/// server therefore stops trusting the wire value and mints the effective key
+/// from the authenticated principal plus the caller's name: the caller still
+/// chooses its own session names, but a foreign namespace has no address it
+/// can type. `None` means "this request has no conversation memory", which is
+/// the safe reading of "no identity" — an unowned shared bucket is the same
+/// defect one level down.
+fn mint_api_session_id(meta: &FlowRequestMeta, caller_session: &str) -> Option<String> {
+    // Strongest identity available, in order: the authenticated user, the user
+    // an API key resolved to, then the key itself — a service key has no human
+    // behind it but is still a distinct principal, so it keeps its memory
+    // instead of losing it. All three come from the server-minted
+    // `FlowRequestMeta`, never from the request body or a header.
+    let identity = meta
+        .user_id
+        .as_deref()
+        .or(meta.actor_user_id.as_deref())
+        .or(meta.actor_id.as_deref())?;
+
+    // Length-prefixed framing, because a plain `identity:caller` join is not
+    // injective: ("a", "b:c") and ("a:b", "c") would mint one key and hand two
+    // principals the same conversation — the very collision this exists to
+    // prevent.
+    let mut hasher = Sha256::new();
+    hasher.update(SESSION_KEY_DOMAIN);
+    hasher.update((identity.len() as u64).to_le_bytes());
+    hasher.update(identity.as_bytes());
+    hasher.update((caller_session.len() as u64).to_le_bytes());
+    hasher.update(caller_session.as_bytes());
+    Some(format!("v1s-{}", hex::encode(hasher.finalize())))
+}
+
+/// Domain separator: keeps these digests from ever colliding with another
+/// SHA-256 of the same bytes used elsewhere for a different purpose.
+const SESSION_KEY_DOMAIN: &[u8] = b"tentaflow/v1-session/1";
 
 async fn build_initial_envelope_inner(
     request: &ChatCompletionRequest,
@@ -518,7 +564,7 @@ mod provenance_tests {
     use super::*;
     use crate::flow_engine::blob_store::InMemoryBlobStore;
 
-    fn chat_request() -> ChatCompletionRequest {
+    pub(super) fn chat_request() -> ChatCompletionRequest {
         ChatCompletionRequest {
             model: "m".into(),
             messages: vec![Message {
@@ -594,5 +640,162 @@ mod provenance_tests {
         assert_eq!(meta.origin, FlowOrigin::Api);
         assert_eq!(meta.actor_id.as_deref(), Some("key-svc"));
         assert_eq!(meta.actor_user_id, None);
+    }
+}
+
+/// The `/v1` session key is a tenancy boundary: `conversation_messages` has no
+/// owner column, so the key IS the access control. These tests pin the four
+/// properties that make a foreign conversation unaddressable.
+#[cfg(test)]
+mod v1_session_key_tests {
+    use super::*;
+    use crate::flow_engine::blob_store::InMemoryBlobStore;
+
+    fn request_with_session(session: &str) -> ChatCompletionRequest {
+        let mut request = super::provenance_tests::chat_request();
+        request.memory_options = Some(crate::api::openai::types::MemoryOptions {
+            session_id: Some(session.to_string()),
+            ..Default::default()
+        });
+        request
+    }
+
+    async fn session_key(
+        user: Option<&str>,
+        actor: FlowActor,
+        origin: FlowOrigin,
+        caller_session: &str,
+    ) -> Option<String> {
+        let blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            std::sync::Arc::new(InMemoryBlobStore::new());
+        let (_env, meta) = build_initial_envelope_for_user(
+            &request_with_session(caller_session),
+            user.map(|u| crate::auth::acl::UserContext::new(u, "user")),
+            origin,
+            actor,
+            &blobs,
+        )
+        .await
+        .expect("seed envelope");
+        meta.session_id
+    }
+
+    /// The attack itself: caller B replays caller A's `session_id` verbatim and
+    /// must land somewhere else.
+    #[tokio::test]
+    async fn same_caller_session_isolates_two_identities() {
+        let victim = session_key(
+            Some("user-victim"),
+            FlowActor::api_key("key-victim", Some("user-victim".to_string())),
+            FlowOrigin::Api,
+            "shared-name",
+        )
+        .await
+        .expect("victim key");
+        let attacker = session_key(
+            Some("user-attacker"),
+            FlowActor::api_key("key-attacker", Some("user-attacker".to_string())),
+            FlowOrigin::Api,
+            "shared-name",
+        )
+        .await
+        .expect("attacker key");
+
+        assert_ne!(victim, attacker);
+        assert_ne!(victim, "shared-name");
+        assert_ne!(attacker, "shared-name");
+    }
+
+    /// Two distinct service keys are two distinct principals: each keeps memory,
+    /// neither reaches the other's.
+    #[tokio::test]
+    async fn two_service_keys_do_not_share_a_session() {
+        let first = session_key(
+            None,
+            FlowActor::api_key("key-a", None),
+            FlowOrigin::Api,
+            "shared-name",
+        )
+        .await
+        .expect("first service key");
+        let second = session_key(
+            None,
+            FlowActor::api_key("key-b", None),
+            FlowOrigin::Api,
+            "shared-name",
+        )
+        .await
+        .expect("second service key");
+
+        assert_ne!(first, second);
+    }
+
+    /// Isolation is worthless if it also breaks memory: the legitimate owner must
+    /// reach the same bucket on every request, and still keep separate
+    /// conversations apart.
+    #[tokio::test]
+    async fn same_identity_keeps_a_stable_key_per_conversation() {
+        let actor = || FlowActor::api_key("key-1", Some("user-1".to_string()));
+        let first = session_key(Some("user-1"), actor(), FlowOrigin::Api, "chat-a")
+            .await
+            .expect("first request");
+        let second = session_key(Some("user-1"), actor(), FlowOrigin::Api, "chat-a")
+            .await
+            .expect("second request");
+        let other_conversation = session_key(Some("user-1"), actor(), FlowOrigin::Api, "chat-b")
+            .await
+            .expect("other conversation");
+
+        assert_eq!(first, second);
+        assert_ne!(first, other_conversation);
+    }
+
+    /// No identity means no memory. Sharing one unowned namespace would rebuild
+    /// the very defect this key exists to close.
+    #[tokio::test]
+    async fn request_without_identity_gets_no_session_memory() {
+        let key = session_key(None, FlowActor::system(), FlowOrigin::Api, "chat-a").await;
+        assert_eq!(key, None);
+    }
+
+    /// Injectivity: a naive `identity:caller` join would hand ("u", "a:b") and
+    /// ("u:a", "b") the same conversation.
+    #[tokio::test]
+    async fn separator_shifts_between_identity_and_session_do_not_collide() {
+        let left = session_key(
+            Some("u"),
+            FlowActor::api_key("key-1", Some("u".to_string())),
+            FlowOrigin::Api,
+            "a:b",
+        )
+        .await
+        .expect("left key");
+        let right = session_key(
+            Some("u:a"),
+            FlowActor::api_key("key-1", Some("u:a".to_string())),
+            FlowOrigin::Api,
+            "b",
+        )
+        .await
+        .expect("right key");
+
+        assert_ne!(left, right);
+    }
+
+    /// Only `/v1` is re-keyed. On surfaces where the server already picked the id
+    /// (dashboard chat, project chat) rewriting it would orphan every existing
+    /// conversation.
+    #[tokio::test]
+    async fn non_api_origins_keep_their_server_chosen_session_id() {
+        for origin in [FlowOrigin::Chat, FlowOrigin::Project, FlowOrigin::Addon] {
+            let key = session_key(
+                Some("user-1"),
+                FlowActor::user("user-1"),
+                origin,
+                "conversation-42",
+            )
+            .await;
+            assert_eq!(key.as_deref(), Some("conversation-42"));
+        }
     }
 }
