@@ -1024,3 +1024,31 @@ Dodatkowo: kopia zapasowa **raz na plik**, nigdy raz na mutację.
 Agent zgłosił to sam, zanim ktokolwiek zapytał, podał dokładną przyczynę źródłową i sam
 unieważnił własne wcześniejsze dowody. To jest zachowanie, którego ta pętla wymaga —
 raport bez tej sekcji byłby wart mniej niż nic.
+
+---
+
+## Decyzja: NIE podłączam `delete_file_graph` — podłączenie uzbroiłoby utratę danych
+
+Planowałem sam dopiąć pięć wywołań `delete_file_graph` / `drop_project_graph` w
+`dispatch/project_studio.rs`, obok istniejących `delete_file_vectors`. **Wycofuję to.**
+
+Wykonawca R2b zgłosił w raporcie ograniczenie, którego wcześniej nie znałem: `provenance_json`
+jest **jednowartościowe**. Encja zapisana przez dwa dokumenty pamięta tylko OSTATNIEGO pisarza,
+więc skasowanie tego dokumentu kładzie tombstone na węzeł, którego drugi dokument nadal używa.
+Test `per_document_provenance_makes_one_document_deletable` pilnuje przypadku rozłącznego
+(`(2,1)` zamiast `(4,2)` pod poluzowaną mutacją) — ale nie przypadku encji współdzielonej.
+
+Addon RAG rozwiązał to inaczej: **licznikiem referencji** w tabeli `graph_artifacts`
+(`addons/rag/src/lib.rs:1101-1128`) — węzeł znika dopiero, gdy żaden inny `document_id` go nie
+trzyma. Nasza ścieżka core takiego rejestru nie ma, a dodanie go to **zmiana schematu**, czyli
+bramka człowieka.
+
+Dopóki funkcje są **nieużywane**, ograniczenie jest udokumentowanym długiem. W chwili
+podłączenia pięciu wywołań staje się aktywną ścieżką cichej utraty danych w Projektach.
+Dlatego zostają nieużywane, świadomie, i jest to zapisane tutaj oraz w kodzie — a nie
+„zapomniane do dokończenia".
+
+To jest też odpowiedź na regułę 5 CLAUDE.md („kasuj nieużywany kod"): funkcje NIE są
+pozostałością po usuniętym wołającym, tylko połową mechanizmu, którego drugiej połowy nie wolno
+zbudować bez zgody na migrację. Skasowanie ich byłoby utratą przetestowanej pracy, a podłączenie
+— uzbrojeniem błędu.
