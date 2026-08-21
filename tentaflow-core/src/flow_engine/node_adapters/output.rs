@@ -213,7 +213,7 @@ mod tests {
     /// One envelope, one node config (`mode: "stream"`, the shell's saved
     /// shape) — the two RAG modes are told apart ONLY by `meta`.
     fn rag_answer_envelope(mode: Option<&str>) -> FlowEnvelope {
-        let mut env = FlowEnvelope::with_payload(FlowValue::Text("Odpowiedz LLM".into()));
+        let mut env = FlowEnvelope::with_payload(FlowValue::Text("LLM answer".into()));
         env.meta.insert(
             "rag_citations".into(),
             serde_json::json!([{"doc_id": "d1", "chunk_index": 3, "text": "t", "score": 0.2}]),
@@ -253,8 +253,8 @@ mod tests {
             .await
             .unwrap();
         let text = r.payload.as_text().expect("payload Text");
-        let parsed: serde_json::Value = serde_json::from_str(text).expect("treść to JSON");
-        assert_eq!(parsed["answer"].as_str(), Some("Odpowiedz LLM"));
+        let parsed: serde_json::Value = serde_json::from_str(text).expect("content is JSON");
+        assert_eq!(parsed["answer"].as_str(), Some("LLM answer"));
         assert_eq!(parsed["citations"].as_array().map(|a| a.len()), Some(1));
         assert_eq!(parsed["citations"][0]["doc_id"].as_str(), Some("d1"));
         assert_eq!(parsed["citations"][0]["chunk_index"].as_i64(), Some(3));
@@ -274,7 +274,7 @@ mod tests {
             .execute(&shell_output_node(), &inputs, &stub_ctx())
             .await
             .unwrap();
-        assert_eq!(r.payload.as_text(), Some("Odpowiedz LLM"));
+        assert_eq!(r.payload.as_text(), Some("LLM answer"));
     }
 
     #[tokio::test]
@@ -291,7 +291,7 @@ mod tests {
             .execute(&output_node(), &inputs, &stub_ctx())
             .await
             .unwrap();
-        assert_eq!(r.payload.as_text(), Some("Odpowiedz LLM"));
+        assert_eq!(r.payload.as_text(), Some("LLM answer"));
     }
 
     #[tokio::test]

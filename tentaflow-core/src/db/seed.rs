@@ -1329,14 +1329,14 @@ const PLATFORM_RAG_FLOWS: &[(&str, &str, &str, &str, &str)] = &[
     ),
 ];
 
-/// Seeduje [`PLATFORM_RAG_FLOWS`] jako flowy systemowe wraz z wiazaniem modelu na
-/// nazwie publikowanej. Wzorzec `seed_ps_chat_flow`: `is_system = 1` blokuje
-/// edycje z protokolu i pozwala odswiezac tresc przy kazdym starcie, wiec nowa
-/// binarka dowozi nowa wersje grafu bez migracji.
+/// Seeds [`PLATFORM_RAG_FLOWS`] as system flows together with the model binding
+/// on the published name. `is_system = 1` blocks edits from the protocol and
+/// lets the content be refreshed on every start, so a new binary ships a new
+/// version of the graph without a migration.
 fn seed_platform_rag_flows(conn: &Connection) -> Result<()> {
     for (id, published, service_type, name, flow_json) in PLATFORM_RAG_FLOWS {
-        // Reclaim jak przy ps-chat: wiersz na tym id nalezy do seeda, wiec wiersz
-        // pozbawiony is_system omijalby guard WHERE ponizej na zawsze.
+        // Reclaim: a row on this id belongs to the seed, so a row stripped of
+        // is_system would dodge the WHERE guard below forever.
         let stray: i64 = conn.query_row(
             "SELECT COUNT(*) FROM flows WHERE id = ?1 AND is_system = 0",
             rusqlite::params![id],
@@ -3066,12 +3066,12 @@ mod tests {
         assert_eq!(is_system_all, 5);
     }
 
-    /// Swieza baza ma dokladnie jeden DOMYSLNY flow ("Default Chat", default=1)
-    /// oraz pozostale seedy z is_default=0: "Agent Run" (harness §3.8),
-    /// "Camera Analysis" (ADR PoC), trzy warianty Code Harness (§16.2 A/B/C, do
-    /// ktorych `dispatch/code_studio.rs` przypina sesje) i trzy flowy RAG. NIE
-    /// ma juz osobnego "Project Chat" — czat projektu jedzie powloka
-    /// `core:rag-query`.
+    /// A fresh db has exactly one DEFAULT flow ("Default Chat", default=1) plus
+    /// the remaining seeds with is_default=0: "Agent Run" (harness §3.8),
+    /// "Camera Analysis" (ADR PoC), three Code Harness variants (§16.2 A/B/C,
+    /// which `dispatch/code_studio.rs` pins its sessions to) and three RAG
+    /// flows. There is NO separate "Project Chat" any more — the project chat
+    /// runs the `core:rag-query` shell.
     #[test]
     fn fresh_db_has_expected_default_flows() {
         let pool = crate::db::init(Path::new(":memory:")).expect("init db");
@@ -3207,7 +3207,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(is_system, 1, "powloka RAG musi byc flow systemowym");
+        assert_eq!(is_system, 1, "the RAG shell must be a system flow");
         assert!(!flow_json.contains("\"project_id\""));
         assert!(!flow_json.contains("harness_tools"));
     }
@@ -3465,7 +3465,7 @@ mod tests {
             .expect("rag-query compiles");
         assert!(
             compiled.is_streaming,
-            "powloka RAG musi byc streamingowa (czat projektu streamuje ja po id)"
+            "the RAG shell must be streaming (the project chat streams it by id)"
         );
 
         // Seed refresh: a stale system row is overwritten on the next start.
@@ -3498,7 +3498,7 @@ mod tests {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .unwrap();
-        assert_eq!(reclaimed_system, 1, "seed musi odzyskac wiersz powloki");
+        assert_eq!(reclaimed_system, 1, "the seed must reclaim the shell row");
         assert_eq!(reclaimed_json, flow_json);
 
         // A non-system flow on a DIFFERENT id is never touched by the seed.
@@ -4064,8 +4064,9 @@ mod tests {
         );
         assert_eq!(schema["properties"]["top_k"]["minimum"].as_u64(), Some(1));
         assert_eq!(schema["properties"]["top_k"]["maximum"].as_u64(), Some(50));
-        // project_id is optional: shared system flows (ps-chat) supply it via
-        // envelope.meta, so the schema must not force a pinned project.
+        // project_id is optional: a shared system flow (`core:rag-query`)
+        // supplies it via envelope.meta, so the schema must not force a pinned
+        // project.
         assert_eq!(schema["required"].as_array().map(|a| a.len()), Some(0));
 
         // Re-seed: still exactly one row, not pruned by the backend-owned

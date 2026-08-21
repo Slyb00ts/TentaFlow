@@ -1879,22 +1879,25 @@ inventory::submit! {
 }
 
 // =============================================================================
-// ProjectStudioChatStream — project chat turn over the system ps-chat flow.
+// ProjectStudioChatStream — project chat turn over the shared RAG shell.
 // =============================================================================
 // The frontend subscribes via ApiBinary.subscribe('projectStudioChatStreamRequest',
 // { projectId, chatId, message }). One turn: persist the user message, run the
-// seeded ps-chat flow (trigger -> project_knowledge -> conversation_history ->
-// llm streaming), forward tokens as ChatStreamChunk{kind:"token"}, emit ONE
-// ChatStreamChunk{kind:"citations"} from the final envelope's rag_citations,
+// seeded `core:rag-query` shell by id (trigger -> loop -> rag_finalize ->
+// conversation_history -> llm -> output) — the SAME graph the RAG addon asks,
+// with NO project_knowledge node: retrieval happens inside the loop against the
+// vector scope minted below. Forward tokens as ChatStreamChunk{kind:"token"},
+// emit ONE ChatStreamChunk{kind:"citations"} from the final envelope's rag_citations,
 // persist the assistant reply (content + citations_json) and finish with
 // ChatStreamEnd{message_id}. Dropping the subscription cancels the generation
 // (push failure fires the flow's cancel token — same contract as FlowInvoke).
 
 /// Chat model for a project turn: the project's 'chat' agent binding
-/// (`settings['agents']` in project.db) wins; without a binding (or an agent
-/// without a model) returns None and the llm node's hard "no model" error
-/// surfaces through ChatStreamEnd — the platform deliberately has no global
-/// default model (see `build_initial_envelope_inner`).
+/// (`settings['agents']` in project.db) wins. Without a binding (or with an
+/// agent that names no model) this returns None, `RAG_ANSWER_MODEL_META` is
+/// left unstamped, and the shell's answer node falls back to the platform
+/// `rag-llm` alias — so such a project still gets an answer, on the platform
+/// model, instead of the llm node's hard "no model" error.
 fn project_chat_model(project_id: &str) -> Option<String> {
     let pool = crate::project_studio::project_db::open(project_id).ok()?;
     let raw = crate::project_studio::repository::get_setting(&pool, "agents").ok()??;
@@ -2135,7 +2138,8 @@ fn project_studio_chat_stream_handler(
                         return;
                     }
                 }
-                // ps-chat is text-only; other delta kinds carry no tokens.
+                // The project chat turn is text-only; other delta kinds
+                // carry no tokens.
                 Ok(_) => {}
                 Err(e) => {
                     cancel.cancel();
@@ -2823,9 +2827,9 @@ inventory::submit! {
 // blocks that flow carries (tools, memory, RAG) run for this turn too — this is
 // not a tool-free path. Only the final text is used (the proposal), so a tool
 // call cannot change what the editor inserts, but a flow with side-effecting
-// tools would execute them. A dedicated system flow (the `ps-chat` pattern)
-// would close that off; it needs its own seed + streaming contract, so it is
-// deliberately NOT bolted on here.
+// tools would execute them. A dedicated system flow (the `core:rag-query`
+// pattern) would close that off; it needs its own seed + streaming contract,
+// so it is deliberately NOT bolted on here.
 
 fn project_studio_code_assist_stream_handler(
     req: MessageBody,

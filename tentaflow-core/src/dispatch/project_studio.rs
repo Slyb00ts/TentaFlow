@@ -4,8 +4,8 @@
 //       członkowie i granty tworzenia, źródła wiedzy (chunkowany upload +
 //       joby ingestu), pliki źródeł, przeszukiwanie bazy wiedzy, przegląd i
 //       aktywność, prywatne czaty per użytkownik oraz ustawienia/tagi.
-//       Streaming ingestu żyje w stream_handlers.rs; stream czatu przyjdzie
-//       z seedem flow ps-chat.
+//       Streaming ingestu i stream czatu żyją w stream_handlers.rs; czat
+//       projektu jedzie zaseedowaną powłoką `core:rag-query`.
 // Przykład: ProjectStudioPayload::ProjectsListRequest → ProjectsListResponse.
 // =============================================================================
 

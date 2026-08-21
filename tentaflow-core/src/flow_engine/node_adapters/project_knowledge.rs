@@ -42,9 +42,10 @@ impl ProjectKnowledgeNodeAdapter {
     }
 
     /// Node config wins; an empty config falls back to `envelope.meta
-    /// ["project_id"]`. The fallback exists for shared system flows (ps-chat):
-    /// ONE global flow serves every project, so the project identity must ride
-    /// on the envelope seeded by the caller, not be pinned in the graph.
+    /// ["project_id"]`. The fallback exists for a shared system flow such as
+    /// `core:rag-query`: ONE global flow serves every project, so the project
+    /// identity must ride on the envelope seeded by the caller, not be pinned
+    /// in the graph.
     fn pick_project_id(node: &FlowNode, envelope: &FlowEnvelope) -> Result<String> {
         node.config
             .get("project_id")
@@ -143,8 +144,8 @@ impl ProjectKnowledgeNodeAdapter {
             top_k,
         )?;
 
-        // Real retrieval hits feed the citations meta the output node / ps-chat
-        // consume — same channel the `vector` node uses.
+        // Real retrieval hits feed the citations meta the output node and the
+        // project chat consume — same channel the `vector` node uses.
         out.meta.insert(
             "rag_citations".to_string(),
             knowledge::citations_json(&hits, knowledge::DEFAULT_SNIPPET_CHARS),
@@ -495,9 +496,10 @@ mod tests {
         assert!(out.context.system_prompts[0].contains("[1]"));
     }
 
-    /// ps-chat: ONE global system flow serves every project, so the node must
-    /// resolve the project from `envelope.meta["project_id"]` when the config
-    /// leaves it empty. Missing both is a hard error.
+    /// A shared system flow (`core:rag-query`): ONE global flow serves every
+    /// project, so the node must resolve the project from
+    /// `envelope.meta["project_id"]` when the config leaves it empty. Missing
+    /// both is a hard error.
     #[tokio::test]
     async fn project_id_falls_back_to_envelope_meta() {
         let project_id = seed_project("owner-4", &[]);

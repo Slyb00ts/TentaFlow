@@ -255,11 +255,11 @@ mod tests {
     #[tokio::test]
     async fn missing_session_replays_nothing_when_not_required() {
         let mut env = FlowEnvelope::empty();
-        env.payload = FlowValue::Text("pytanie".into());
+        env.payload = FlowValue::Text("question".into());
         let mut ctx = stub_ctx();
         ctx.session_id = None;
         let fake = Arc::new(FakeHistory {
-            messages: vec![ChatMessage::user("cudza-sesja")],
+            messages: vec![ChatMessage::user("other-session")],
             appended: Mutex::new(0),
         });
         ctx.history = fake.clone();
@@ -273,6 +273,6 @@ mod tests {
             out.meta.get(HISTORY_BASE_LEN_META),
             Some(&serde_json::Value::from(0usize))
         );
-        assert_eq!(out.payload.as_text(), Some("pytanie"));
+        assert_eq!(out.payload.as_text(), Some("question"));
     }
 }
