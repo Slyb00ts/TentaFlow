@@ -2383,6 +2383,65 @@ mod tests {
         assert_eq!(row.correlation_id.as_deref(), Some("corr-9"));
     }
 
+    /// §2.5 / §3.3 — a sub-agent inherits the CALLER's principal verbatim, and
+    /// the only evidence that counts is the CHILD'S OWN ROW: a spy that records
+    /// the `AgentPrincipal` a spawn was handed proves the value travelled
+    /// in-process, not that it was persisted as the child's provenance. The
+    /// parent here runs under a service API key with an org and a correlation
+    /// id — every field differs from a system principal and from anything
+    /// derivable from `user_id`, so a constant or a re-derivation shows up as a
+    /// wrong column instead of the same value by coincidence.
+    #[tokio::test]
+    async fn a_spawned_child_row_carries_the_parents_provenance() {
+        let pool = db();
+        seed_agent(&pool, "parent", "boss", "[]", 4, 2);
+        seed_agent(&pool, "child", "worker", "[]", 0, 1);
+        let mgr = manager(pool.clone(), Arc::new(InstantRunner), 8);
+        let principal = AgentPrincipal::new(
+            None,
+            Some("org-42".into()),
+            FlowOrigin::Api,
+            FlowActor::api_key("key-77", None),
+        )
+        .with_correlation_id(Some("corr-parent".into()));
+
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn parent");
+        let caller = CallerRun {
+            run_id: parent_run,
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: None,
+            code_session: None,
+        };
+        let spawned = mgr
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
+            .await
+            .expect("spawn child");
+        let child_id = spawned["run_ids"][0]
+            .as_str()
+            .expect("child run id")
+            .to_string();
+
+        let row = repository::get_agent_run(&pool, &child_id)
+            .expect("read child run")
+            .expect("child run exists");
+        assert_eq!(row.origin.as_deref(), Some("api"));
+        assert_eq!(row.actor_kind.as_deref(), Some("api_key"));
+        assert_eq!(row.actor_id.as_deref(), Some("key-77"));
+        // The service key has no user; a child stamped with one would report an
+        // unattended integration call as a person's.
+        assert_eq!(row.actor_user_id, None);
+        assert_eq!(row.correlation_id.as_deref(), Some("corr-parent"));
+        assert_eq!(row.org_id.as_deref(), Some("org-42"));
+        // The whole point of the row: a continuation of THIS child rebuilds the
+        // parent's principal from it, so the round trip has to land back on the
+        // value the entry point minted.
+        assert_eq!(AgentPrincipal::from_run_row(&row), Some(principal));
+    }
+
     #[tokio::test]
     async fn restart_marks_orphans_interrupted() {
         let pool = db();
@@ -2731,6 +2790,94 @@ mod tests {
             .prompt
             .contains(&format!("result-of-{child_id}")));
         assert_eq!(continuation.agent_id, "parent");
+    }
+
+    /// §2.5 — the auto-continuation runs under the parent RUN's stamp, read back
+    /// off its row by `AgentPrincipal::from_run_row`. The fixture is the shape
+    /// where the correct code and the tempting shortcut disagree: a key BOUND to
+    /// a user. `user_id` is set, so re-deriving the principal from it produces a
+    /// plausible `FlowActor::user("u-5")` under origin `agent`, and the event log
+    /// would report an integration's autonomous continuation as something a
+    /// person started. A `user(...)` fixture cannot see that — both spellings
+    /// collapse onto the same value there.
+    #[tokio::test]
+    async fn a_continuation_row_keeps_the_parent_runs_api_key_stamp() {
+        let pool = db();
+        seed_agent_with_continue(&pool, "parent", "boss", 4, "continue");
+        seed_agent(&pool, "child", "worker", "[]", 0, 1);
+        let gate = Gate::new();
+        let mgr = manager(
+            pool.clone(),
+            Arc::new(GatedRunner {
+                gate: gate.clone(),
+                honor_cancel: false,
+            }),
+            8,
+        );
+        let principal = AgentPrincipal::new(
+            Some("u-5".into()),
+            Some("org-42".into()),
+            FlowOrigin::Api,
+            FlowActor::api_key("key-77", Some("u-5".into())),
+        )
+        .with_correlation_id(Some("corr-parent".into()));
+
+        let parent_run = mgr
+            .spawn("parent", "lead", None, &principal, &[], &[], None, None)
+            .await
+            .expect("spawn parent");
+        let caller = CallerRun {
+            run_id: parent_run.clone(),
+            agent_id: "parent".into(),
+            principal: principal.clone(),
+            session_id: None,
+            code_session: None,
+        };
+        let spawned = mgr
+            .handle_agent_spawn(&caller, &json!({"agent_name": "worker", "task": "subtask"}))
+            .await
+            .expect("spawn child");
+        let child_id = spawned["run_ids"][0]
+            .as_str()
+            .expect("child run id")
+            .to_string();
+
+        gate.open();
+        wait_until_status(&pool, &child_id, "completed").await;
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let continuation = loop {
+            let runs = repository::list_agent_runs(
+                &pool,
+                &AgentRunListFilter {
+                    agent_id: Some("parent"),
+                    ..Default::default()
+                },
+            )
+            .expect("list parent runs");
+            if let Some(r) = runs
+                .into_iter()
+                .find(|r| r.id != parent_run && r.parent_run_id.is_none())
+            {
+                break r;
+            }
+            if Instant::now() > deadline {
+                panic!("auto-continuation run never started");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+
+        assert_eq!(continuation.origin.as_deref(), Some("api"));
+        assert_eq!(continuation.actor_kind.as_deref(), Some("api_key"));
+        assert_eq!(continuation.actor_id.as_deref(), Some("key-77"));
+        assert_eq!(continuation.actor_user_id.as_deref(), Some("u-5"));
+        assert_eq!(continuation.correlation_id.as_deref(), Some("corr-parent"));
+        assert_eq!(continuation.org_id.as_deref(), Some("org-42"));
+        assert_eq!(
+            AgentPrincipal::from_run_row(&continuation),
+            Some(principal),
+            "the continuation must run under the parent's principal, not a rebuilt one"
+        );
     }
 
     /// §3.6 level 3 default: on_child_complete='notify' (the default) does NOT

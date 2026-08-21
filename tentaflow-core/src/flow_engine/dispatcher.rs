@@ -1586,6 +1586,83 @@ pub(crate) fn make_test_context(
     stub_context_factory().make_context(meta)
 }
 
+/// Walks a closed cycle over the variants of a fieldless enum, returning every
+/// variant it visits.
+///
+/// The point is what the CALLER has to write to use it: `after` is an
+/// exhaustive, wildcard-free match, so a variant added to the enum stops this
+/// crate's tests compiling until it is linked into the cycle. `index` is the
+/// variant's own discriminant, and variants of a fieldless enum are numbered
+/// from zero — a variant left dangling instead of linked in therefore leaves the
+/// walk shorter than the highest discriminant it saw, which is the second net.
+#[cfg(test)]
+fn walk_variant_cycle<T>(start: T, after: fn(T) -> T, index: fn(T) -> usize) -> Vec<T>
+where
+    T: Copy + PartialEq + std::fmt::Debug,
+{
+    let mut walk = vec![start];
+    let mut current = after(start);
+    while current != start {
+        assert!(
+            walk.len() < 256,
+            "the successor match never leads back to {start:?}"
+        );
+        walk.push(current);
+        current = after(current);
+    }
+    let highest = walk
+        .iter()
+        .map(|variant| index(*variant))
+        .max()
+        .expect("the walk always holds at least `start`");
+    assert_eq!(
+        walk.len(),
+        highest + 1,
+        "a variant is missing from the cycle; walked {walk:?}"
+    );
+    walk
+}
+
+/// Every [`FlowOrigin`], enumerated by the compiler rather than by memory.
+///
+/// A hand-written list is what let `Dashboard` and `Meeting` sit outside the
+/// round-trip guard while their `parse` arms were, in `Meeting`'s case, the only
+/// thing keeping meeting-bot rows readable.
+#[cfg(test)]
+pub(crate) fn all_flow_origins() -> Vec<FlowOrigin> {
+    fn after(origin: FlowOrigin) -> FlowOrigin {
+        match origin {
+            FlowOrigin::Chat => FlowOrigin::Dashboard,
+            FlowOrigin::Dashboard => FlowOrigin::Project,
+            FlowOrigin::Project => FlowOrigin::CodeStudio,
+            FlowOrigin::CodeStudio => FlowOrigin::Api,
+            FlowOrigin::Api => FlowOrigin::Addon,
+            FlowOrigin::Addon => FlowOrigin::Camera,
+            FlowOrigin::Camera => FlowOrigin::Meeting,
+            FlowOrigin::Meeting => FlowOrigin::Scheduler,
+            FlowOrigin::Scheduler => FlowOrigin::Mesh,
+            FlowOrigin::Mesh => FlowOrigin::Agent,
+            FlowOrigin::Agent => FlowOrigin::System,
+            FlowOrigin::System => FlowOrigin::Chat,
+        }
+    }
+    walk_variant_cycle(FlowOrigin::Chat, after, |origin| origin as usize)
+}
+
+/// Every [`ActorKind`] — same construction, same reason.
+#[cfg(test)]
+pub(crate) fn all_actor_kinds() -> Vec<ActorKind> {
+    fn after(kind: ActorKind) -> ActorKind {
+        match kind {
+            ActorKind::User => ActorKind::ApiKey,
+            ActorKind::ApiKey => ActorKind::Addon,
+            ActorKind::Addon => ActorKind::System,
+            ActorKind::System => ActorKind::User,
+        }
+    }
+    walk_variant_cycle(ActorKind::User, after, |kind| kind as usize)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1753,6 +1830,126 @@ mod tests {
         assert_eq!(correlation_id.as_deref(), Some("server-corr"));
     }
 
+    /// §2.10.3 — `correlation_id` is the DEEP LINK between an accountability
+    /// entry in `audit_log` and the point on the timeline that produced it, and
+    /// a link is only a link while both ends say the same thing. The two ends
+    /// are written by two different copies of the same value: the run row takes
+    /// it off the `ExecutionContext`, the audit mirror takes it off the
+    /// provenance `begin_run` bound for the run. Checking either end against a
+    /// literal the test itself wrote cannot see them drift apart, so this runs
+    /// ONE execution and compares the two OBSERVED values.
+    #[tokio::test]
+    async fn one_run_stamps_one_correlation_id_on_its_row_and_its_audit_entry() {
+        use rusqlite::OptionalExtension;
+
+        let main_db = forgery_test_db();
+        let events_dir = tempfile::tempdir().expect("tempdir");
+        let events_pool =
+            crate::events::db::open_pool_at(&events_dir.path().join("events.db")).expect("events");
+        // `begin_run` keeps the provenance binding only while something is
+        // watching the scope; without the process-wide log there is no
+        // subscriber, no timeline row and therefore no audit mirror to compare.
+        crate::events::progress_log::start(events_pool.clone(), main_db.clone());
+
+        let run_id = format!("req-{}", uuid::Uuid::new_v4());
+        let mut meta = FlowRequestMeta::new(
+            run_id.clone(),
+            FlowOrigin::Api,
+            FlowActor::api_key("key-77", Some("u-5".into())),
+        );
+        meta.correlation_id = Some(format!("corr-{}", uuid::Uuid::new_v4()));
+        meta.progress_sink = Some(Arc::new(
+            crate::flow_engine::progress_broker::BrokerProgressSink::new(
+                crate::flow_engine::progress_broker::global_broker(),
+            ),
+        ));
+        let ctx = stub_context_factory().make_context(&meta);
+
+        let mut registry = AdapterRegistry::new();
+        registry.register(Arc::new(
+            crate::flow_engine::node_adapters::TriggerNodeAdapter::new(),
+        ));
+        registry.register(Arc::new(
+            crate::flow_engine::node_adapters::OutputNodeAdapter::new(),
+        ));
+        let registry = Arc::new(registry);
+        let flow_json = r#"{
+            "nodes":[
+                {"id":"t1","type":"trigger","config":{}},
+                {"id":"o1","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t1","to":"o1","from_port":"text","to_port":"text"}
+            ]
+        }"#;
+        let compiled = Arc::new(
+            crate::flow_engine::cache::CompiledFlow::from_json("0", flow_json, &registry)
+                .expect("compile"),
+        );
+        crate::flow_engine::executor::execute_blocking(
+            main_db.clone(),
+            compiled,
+            FlowEnvelope::empty(),
+            ctx,
+            registry,
+        )
+        .await
+        .expect("flow runs");
+
+        // The timeline writer is a task and the audit copy crosses databases
+        // through the outbox, so both are polled rather than slept on.
+        let mut audit_correlation = None;
+        for _ in 0..300 {
+            crate::events::audit_outbox::deliver_pending(&main_db, &events_pool, 16)
+                .expect("audit delivery");
+            let conn = main_db.read().expect("db lock");
+            audit_correlation = conn
+                .query_row(
+                    "SELECT correlation_id FROM audit_log \
+                     WHERE resource_type = 'flow_run' AND resource_id = ?1",
+                    rusqlite::params![run_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()
+                .expect("read audit_log");
+            drop(conn);
+            if audit_correlation.is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let audit_correlation =
+            audit_correlation.expect("the run's audit entry reached the main database");
+
+        let run_row = {
+            let conn = main_db.read().expect("db lock");
+            conn.query_row(
+                "SELECT correlation_id FROM flow_executions WHERE request_id = ?1",
+                rusqlite::params![run_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .expect("the run wrote a flow_executions row")
+        };
+
+        assert!(
+            run_row.is_some(),
+            "the run row must carry the correlation id, not NULL"
+        );
+        assert_eq!(
+            run_row, audit_correlation,
+            "the audit entry and the run row of ONE execution must carry the \
+             same correlation id — otherwise the audit entry links to nothing"
+        );
+
+        // `start` publishes a PROCESS-WIDE log that outlives this test, and the
+        // events database goes away with `events_dir` at the end of it. Stopping
+        // the subscribers puts the process back where it was: `attach_scope`
+        // answers `false`, `begin_run` hands its binding straight back, and no
+        // later test's run writes into a directory that no longer exists.
+        crate::events::progress_log::stop();
+        drop(events_dir);
+    }
+
     /// The copy site in `make_context` — all five provenance fields reach the
     /// context the adapters see.
     #[test]
@@ -1782,22 +1979,40 @@ mod tests {
 
     /// The slugs are a wire contract: the event log stores them and the UI
     /// filters on them, so a rename silently breaks stored history.
+    ///
+    /// Driven by [`all_flow_origins`] / [`all_actor_kinds`] and asserted through
+    /// exhaustive, wildcard-free matches, so a variant cannot reach the wire
+    /// without its spelling being written down HERE, where changing it is
+    /// visibly a wire change. The list this test used to carry silently omitted
+    /// `Dashboard` and `Meeting`.
     #[test]
     fn provenance_slugs_are_stable_wire_spellings() {
-        assert_eq!(FlowOrigin::Chat.as_str(), "chat");
-        assert_eq!(FlowOrigin::Project.as_str(), "project");
-        assert_eq!(FlowOrigin::CodeStudio.as_str(), "code_studio");
-        assert_eq!(FlowOrigin::Api.as_str(), "api");
-        assert_eq!(FlowOrigin::Addon.as_str(), "addon");
-        assert_eq!(FlowOrigin::Camera.as_str(), "camera");
-        assert_eq!(FlowOrigin::Scheduler.as_str(), "scheduler");
-        assert_eq!(FlowOrigin::Mesh.as_str(), "mesh");
-        assert_eq!(FlowOrigin::Agent.as_str(), "agent");
-        assert_eq!(FlowOrigin::System.as_str(), "system");
-        assert_eq!(ActorKind::User.as_str(), "user");
-        assert_eq!(ActorKind::ApiKey.as_str(), "api_key");
-        assert_eq!(ActorKind::Addon.as_str(), "addon");
-        assert_eq!(ActorKind::System.as_str(), "system");
+        for origin in all_flow_origins() {
+            let slug = match origin {
+                FlowOrigin::Chat => "chat",
+                FlowOrigin::Dashboard => "dashboard",
+                FlowOrigin::Project => "project",
+                FlowOrigin::CodeStudio => "code_studio",
+                FlowOrigin::Api => "api",
+                FlowOrigin::Addon => "addon",
+                FlowOrigin::Camera => "camera",
+                FlowOrigin::Meeting => "meeting",
+                FlowOrigin::Scheduler => "scheduler",
+                FlowOrigin::Mesh => "mesh",
+                FlowOrigin::Agent => "agent",
+                FlowOrigin::System => "system",
+            };
+            assert_eq!(origin.as_str(), slug);
+        }
+        for kind in all_actor_kinds() {
+            let slug = match kind {
+                ActorKind::User => "user",
+                ActorKind::ApiKey => "api_key",
+                ActorKind::Addon => "addon",
+                ActorKind::System => "system",
+            };
+            assert_eq!(kind.as_str(), slug);
+        }
     }
 
     #[test]

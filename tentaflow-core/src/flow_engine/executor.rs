@@ -5620,6 +5620,51 @@ mod provenance_persistence_tests {
         assert_eq!(row.model.as_deref(), Some(MODEL));
     }
 
+    /// A DOCUMENTED GAP, pinned so it cannot widen or close by accident: a
+    /// synthetic flow (Universal Flow Gateway) is assembled in memory with an
+    /// EMPTY flow id and has no row in `flows`, so `create_execution_record`
+    /// returns the `0` sentinel and writes nothing rather than failing the
+    /// foreign key. A `/v1` call that falls back to a synthetic flow therefore
+    /// leaves no `flow_executions` row at all — the run is accounted for on the
+    /// timeline and nowhere else. Closing it needs a schema change; until then
+    /// this test is what keeps the behaviour deliberate.
+    #[tokio::test]
+    async fn a_synthetic_flow_writes_no_run_row_at_all() {
+        let pool = db();
+        let reg = registry();
+        let json = r#"{
+            "nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"o","type":"output","config":{}}
+            ],
+            "edges":[
+                {"from":"t","to":"o","from_port":"text","to_port":"text"}
+            ]
+        }"#;
+        // The shape `synthetic.rs` builds: no id, because there is no row to
+        // point at.
+        let compiled = Arc::new(CompiledFlow::from_json("", json, &reg).expect("compile"));
+        let mut ctx = stub_ctx();
+        ctx.request_id = "req-synthetic".into();
+        ctx.origin = FlowOrigin::Api;
+        ctx.actor_kind = ActorKind::ApiKey;
+        ctx.actor_id = Some("key-77".into());
+        ctx.correlation_id = Some("corr-synthetic".into());
+        execute_blocking(pool.clone(), compiled, FlowEnvelope::empty(), ctx, reg)
+            .await
+            .expect("execute_blocking");
+
+        let rows: i64 = {
+            let conn = pool.read().expect("db lock");
+            conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |row| row.get(0))
+                .expect("count executions")
+        };
+        assert_eq!(
+            rows, 0,
+            "a synthetic flow has no row in `flows`, so it writes no run row"
+        );
+    }
+
     /// Invariant 6 — a flow that called no model leaves `model` NULL instead of
     /// inheriting a routing hint it never used.
     #[tokio::test]

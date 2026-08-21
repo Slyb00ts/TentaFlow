@@ -73,7 +73,7 @@ impl AgentPrincipal {
     /// `actor_user_id` come back exactly as they were written, so an API key
     /// stays an API key. `None` when `origin` or `actor_kind` is not a spelling
     /// [`FlowOrigin::as_str`] / [`ActorKind::as_str`] produces — an unreadable
-    /// stamp must REFUSE — including a run written BEFORE migration v131, whose
+    /// stamp must REFUSE — including a run written BEFORE migration v134, whose
     /// columns are NULL. Falling back to "a user named by `user_id`" is how a
     /// service key gets reported as a person, and a fallback chain here would be
     /// invisible at exactly the moment it lies.
@@ -318,31 +318,20 @@ mod tests {
     }
 
     /// `FlowOrigin::parse` / `ActorKind::parse` are exact inverses of `as_str`
-    /// — every variant survives a write/read cycle, so adding a variant without
-    /// its parse arm fails here rather than silently becoming unreadable rows.
+    /// — every variant survives a write/read cycle, so a variant without its
+    /// parse arm is caught here rather than silently becoming unreadable rows.
+    ///
+    /// The variant lists come from `all_flow_origins` / `all_actor_kinds`, which
+    /// the compiler keeps complete. The hand-written lists that used to stand
+    /// here had the same failure mode as the bug they were meant to catch: both
+    /// omitted `Dashboard` and `Meeting`, so deleting `"meeting"` from `parse`
+    /// left this test green while every meeting-bot run row became unreadable.
     #[test]
     fn parse_is_the_exact_inverse_of_as_str() {
-        for origin in [
-            FlowOrigin::Chat,
-            FlowOrigin::Dashboard,
-            FlowOrigin::Project,
-            FlowOrigin::CodeStudio,
-            FlowOrigin::Api,
-            FlowOrigin::Addon,
-            FlowOrigin::Camera,
-            FlowOrigin::Scheduler,
-            FlowOrigin::Mesh,
-            FlowOrigin::Agent,
-            FlowOrigin::System,
-        ] {
+        for origin in crate::flow_engine::dispatcher::all_flow_origins() {
             assert_eq!(FlowOrigin::parse(origin.as_str()), Some(origin));
         }
-        for kind in [
-            ActorKind::User,
-            ActorKind::ApiKey,
-            ActorKind::Addon,
-            ActorKind::System,
-        ] {
+        for kind in crate::flow_engine::dispatcher::all_actor_kinds() {
             assert_eq!(ActorKind::parse(kind.as_str()), Some(kind));
         }
         assert_eq!(FlowOrigin::parse(""), None);
@@ -363,7 +352,7 @@ mod tests {
         assert!(unattended.user_id().is_none());
     }
 
-    /// A run written BEFORE migration v131 has NULL provenance columns. That is
+    /// A run written BEFORE migration v134 has NULL provenance columns. That is
     /// the honest "predates the stamp", and it must refuse the same way a
     /// corrupt value does — a continuation of such a run would otherwise be
     /// launched under a principal nobody ever observed.

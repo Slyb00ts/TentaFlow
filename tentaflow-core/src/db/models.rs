@@ -341,7 +341,7 @@ pub struct DbFlowExecution {
     /// §2.5 — server-minted provenance, stamped at insert from
     /// `ExecutionContext`. Reading it back is what lets this table answer
     /// "from where and who" without a second table (§2.11 stage 1). `None`
-    /// only on rows written before migration v131.
+    /// only on rows written before migration v134.
     pub origin: Option<String>,
     pub actor_kind: Option<String>,
     pub actor_id: Option<String>,
@@ -354,7 +354,7 @@ pub struct DbFlowExecution {
 /// The provenance five are `&str`, not `Option`, because the executor reads
 /// them off `ExecutionContext` where both are enum-backed and always present —
 /// a NULL `origin` on a new row would be indistinguishable from the honestly
-/// unattributed pre-v131 population.
+/// unattributed pre-v134 population.
 ///
 /// `model` is absent on purpose: at insert time no LLM node has run yet, so the
 /// model this run resolved to is only known at finalisation and is written by
@@ -603,7 +603,7 @@ pub struct DbAgentRun {
     /// instead of deriving one from `user_id` (which turns an API key into a
     /// user). Wire spellings from `FlowOrigin::as_str` / `ActorKind::as_str`.
     ///
-    /// `Option` because migration v131 adds the columns NULLABLE and does NOT
+    /// `Option` because migration v134 adds the columns NULLABLE and does NOT
     /// backfill: a row written before the stamp existed says "unknown", and
     /// reading that as a `String` would either fail the whole row or invent a
     /// value. Every row written since carries both (`NewAgentRun` takes `&str`),

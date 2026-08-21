@@ -11141,7 +11141,7 @@ pub fn get_flow_execution(pool: &DbPool, id: i64) -> Result<Option<DbFlowExecuti
 
 /// Opens a run's audit row. The provenance stamp is written HERE, at insert:
 /// the entry point already minted it, and a row that starts unattributed could
-/// never be told apart from a pre-v131 one.
+/// never be told apart from a pre-v134 one.
 pub fn create_flow_execution(pool: &DbPool, exec: &NewFlowExecution<'_>) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
