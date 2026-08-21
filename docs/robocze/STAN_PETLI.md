@@ -1236,3 +1236,44 @@ Dwa komentarze w dwóch crate'ach to nie jest asercja.
 5. Kolejka nie ma puli odczytu (`Db::from_connection`), więc każdy `is_pending`/`jobs_ahead`
    serializuje się z każdym `claim` — wbrew temu, co `db/mod.rs:112-130` opisuje jako właściwy
    kształt bazy pomocniczej.
+
+---
+
+## Runda: T2 `events.db` — ślepy krytyk (2026-08-22)
+
+**Werdykt: MEETS BAR.** T2.1–T2.10 spełnione, każde z mutacją. Baseline i stan końcowy:
+`cargo test --lib events::` → **83 passed, 0 failed**.
+
+**Krytyk poprawił SAMĄ POPRZECZKĘ, i miał rację.** Kryterium T2.1 mówi „4 indeksy"; artefakt ma
+pięć nieunikalnych plus częściowy unikalny — i to jest **dosłownie** zgodne ze specyfikacją
+§2.3 (linie 210–216). Nieaktualna była poprzeczka, nie schemat. Sprawdził wobec ŹRÓDŁA PRAWDY,
+a nie wobec zdania, które dostał ode mnie.
+
+Najmocniejszy dowód, T2.5 (redakcja PRZED zapisem): mutacja przeniosła `.redacted()` z zapisu
+do odczytu. Test padł, **wypisując surowy token `ghp_…`, hasło w URL-u i JWT prosto z kolumny**.
+Asercja na strukturze w pamięci przeszłaby pod tą mutacją — ta nie przeszła, bo czyta dysk.
+
+T2.3 udowodnione jako realna rywalizacja: dwa wątki na **dwóch niezależnych połączeniach**
+(nie jeden `DbPool` za muteksem), zwolnione barierą. Mutacja `Immediate → Deferred` dała
+**28 odmów „database is locked"**, więc kontencja jest prawdziwa, a nie pozorna.
+
+### Test przechodzący z niewłaściwego powodu — złapany i poprawnie zaklasyfikowany
+
+`a_service_key_is_stored_as_a_null_binding_not_as_an_empty_one` asertuje `actor_user_id IS NULL`
+— czyli dokładnie to, co zwróci kolumna, która **nigdy nie jest zapisywana**. Krytyk zmutował
+insert na bezwarunkowe `None::<String>`: ten test został zielony, ale **pięć innych** padło.
+Kolumna jest więc pilnowana — tylko nie przez test, którego nazwa to obiecuje.
+
+### Znalezisko poza kryteriami — PRAWDZIWY DEFEKT, potwierdzony przeze mnie osobno
+
+**`RequestStarted` nie niesie żadnego pochodzenia na ścieżce produkcyjnej.**
+`progress_log.rs:331-336` zapisuje ZAWSZE `model: None, flow_id: None, service_type: None,
+modality: None`. Kopia audytowa ma odpowiadać na „który aktor, z jakiego pochodzenia,
+**przeciwko któremu modelowi**" — i model jest tam zawsze pusty. Testy magazynu wypełniają te
+pola ręcznie, więc nic tego nie zauważa. Sprawdziłem kod sam: tak jest.
+
+Pozostałe, odnotowane bez naprawy: doc `retention.rs` mówi „ograniczony `DELETE`", a `LIMIT`
+nie ma; liczba 30 dni to łańcuch tautologii (trzy testy porównują ją z tą samą stałą, którą by
+za sobą pociągnęły); test schematu sprawdza kolumny tylko dwóch z sześciu indeksów; brak
+dzierżawy na wierszach outboxu (dziś jeden wołający, więc utajone); „exactly once" jest w
+rzeczywistości at-least-once i kod to przyznaje.
