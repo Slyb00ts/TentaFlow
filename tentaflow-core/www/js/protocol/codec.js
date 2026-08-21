@@ -1960,6 +1960,67 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // Zdarzenia (Zarzadzanie -> Zdarzenia) — MessageBody::EventsBody
+  // -------------------------------------------------------------------------
+
+  /**
+   * MessageBody::EventsBody(BrowseRequest) — a page of events across runs.
+   *
+   * The filter crosses into wasm as JSON in the wire's own snake_case, so the
+   * `null`s below are load-bearing rather than cosmetic: `origins: null` is NO
+   * origin constraint while `origins: []` matches nothing, and the server keeps
+   * the two apart. `cursor` is echoed back from `next_cursor` of the previous
+   * page, read through both spellings because that is how the decoder emits it.
+   */
+  eventsBrowseRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const rawCursor = payload?.cursor ?? null;
+    const cursor = rawCursor
+      ? {
+          at_ms: Number(rawCursor.atMs ?? rawCursor.at_ms ?? 0),
+          run_id: String(rawCursor.runId ?? rawCursor.run_id ?? ''),
+          seq: Number(rawCursor.seq ?? 0),
+        }
+      : null;
+    const origins = payload?.origins ?? null;
+    const filter = {
+      origins: Array.isArray(origins) ? origins.map(String) : null,
+      actor_id: payload?.actorId ?? payload?.actor_id ?? null,
+      org_id: payload?.orgId ?? payload?.org_id ?? null,
+      session_id: payload?.sessionId ?? payload?.session_id ?? null,
+      correlation_id: payload?.correlationId ?? payload?.correlation_id ?? null,
+      from_ms: payload?.fromMs ?? payload?.from_ms ?? null,
+      to_ms: payload?.toMs ?? payload?.to_ms ?? null,
+      search: payload?.search ?? null,
+      cursor,
+      limit: payload?.limit ?? 0,
+    };
+    const body = _wasm.encodeEventsBrowseRequest(JSON.stringify(filter));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::EventsBody(RunRequest { runId, afterSeq, limit }) — one run's timeline. */
+  eventsRunRequest(correlationId, { runId, afterSeq, limit } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEventsRunRequest(
+      String(runId ?? ''),
+      Number(afterSeq ?? 0),
+      Number(limit ?? 0),
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Network (interfejsy hosta + konfiguracja bind/filter mesh)
   // -------------------------------------------------------------------------
 

@@ -2902,6 +2902,108 @@ pub fn encode_storage_migrate_request(
     .map_err(|e| JsError::new(&e))
 }
 
+// -----------------------------------------------------------------------------
+// Events browser (Zarzadzanie -> Zdarzenia) — MessageBody::EventsBody.
+//
+// The browse filter is all-optional with a nested keyset cursor, so it crosses
+// the boundary as a JSON object (the RoleCatalog precedent) instead of a dozen
+// positional `Option<_>` parameters. `origins` keeps its three states apart:
+// an absent/null key is NO constraint, an empty array matches NOTHING — the UI
+// with every chip switched off must not be read as "show everything".
+// -----------------------------------------------------------------------------
+
+/// MessageBody::EventsBody(BrowseRequest) — filter as a JSON object.
+#[wasm_bindgen(js_name = encodeEventsBrowseRequest)]
+pub fn encode_events_browse_request(filter_json: String) -> Result<Vec<u8>, JsError> {
+    use serde_json::Value;
+    let v: Value = serde_json::from_str(&filter_json)
+        .map_err(|e| JsError::new(&format!("invalid events filter JSON: {e}")))?;
+    let obj = v
+        .as_object()
+        .ok_or_else(|| JsError::new("events filter must be JSON object"))?;
+
+    let origins = match obj.get("origins") {
+        None | Some(Value::Null) => None,
+        Some(Value::Array(items)) => Some(
+            items
+                .iter()
+                .map(|x| {
+                    x.as_str()
+                        .map(String::from)
+                        .ok_or_else(|| JsError::new("origins entries must be strings"))
+                })
+                .collect::<Result<Vec<String>, JsError>>()?,
+        ),
+        Some(_) => return Err(JsError::new("origins must be an array or null")),
+    };
+
+    let cursor = match obj.get("cursor") {
+        None | Some(Value::Null) => None,
+        Some(c) => {
+            let c = c
+                .as_object()
+                .ok_or_else(|| JsError::new("cursor must be a JSON object"))?;
+            Some(tentaflow_protocol::EventsCursor {
+                at_ms: c
+                    .get("at_ms")
+                    .and_then(|x| x.as_i64())
+                    .ok_or_else(|| JsError::new("cursor.at_ms must be an integer"))?,
+                run_id: c
+                    .get("run_id")
+                    .and_then(|x| x.as_str())
+                    .ok_or_else(|| JsError::new("cursor.run_id must be a string"))?
+                    .to_string(),
+                seq: c
+                    .get("seq")
+                    .and_then(|x| x.as_i64())
+                    .ok_or_else(|| JsError::new("cursor.seq must be an integer"))?,
+            })
+        }
+    };
+
+    let request = tentaflow_protocol::EventsBrowseRequest {
+        origins,
+        actor_id: obj.get("actor_id").and_then(|x| x.as_str()).map(String::from),
+        org_id: obj.get("org_id").and_then(|x| x.as_str()).map(String::from),
+        session_id: obj
+            .get("session_id")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        correlation_id: obj
+            .get("correlation_id")
+            .and_then(|x| x.as_str())
+            .map(String::from),
+        from_ms: obj.get("from_ms").and_then(|x| x.as_i64()),
+        to_ms: obj.get("to_ms").and_then(|x| x.as_i64()),
+        search: obj.get("search").and_then(|x| x.as_str()).map(String::from),
+        cursor,
+        limit: obj.get("limit").and_then(|x| x.as_u64()).unwrap_or(0) as u32,
+    };
+
+    encode_body_inner(&MessageBody::EventsBody(
+        tentaflow_protocol::EventsPayload::BrowseRequest(request),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::EventsBody(RunRequest { run_id, after_seq, limit }) — the
+/// timeline of ONE run, so the three scalars travel positionally.
+#[wasm_bindgen(js_name = encodeEventsRunRequest)]
+pub fn encode_events_run_request(
+    run_id: String,
+    after_seq: f64,
+    limit: u32,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EventsBody(
+        tentaflow_protocol::EventsPayload::RunRequest(tentaflow_protocol::EventsRunRequest {
+            run_id,
+            after_seq: after_seq as i64,
+            limit,
+        }),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioVisionModelDeleteRequest)]
 pub fn encode_ml_studio_vision_model_delete_request(
     model_name: String,
@@ -9870,11 +9972,119 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
             }
         }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
+        MessageBody::EventsBody(payload) => decode_events_payload(&obj, payload),
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
     }
     Ok(obj.into())
+}
+
+/// One `EventRowWire` as a JS object. Both spellings are emitted because the
+/// Zdarzenia module reads a row through camelCase first and snake_case second,
+/// and `payload_json` is passed through VERBATIM — the writer already redacted
+/// it, so re-parsing here could only lose or re-expose something.
+fn event_row_to_js(row: tentaflow_protocol::EventRowWire) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "runId", row.run_id.clone().into());
+    set(&o, "run_id", row.run_id.into());
+    set(&o, "seq", (row.seq as f64).into());
+    set(&o, "atMs", (row.at_ms as f64).into());
+    set(&o, "at_ms", (row.at_ms as f64).into());
+    set(&o, "kind", row.kind.into());
+    set(&o, "origin", row.origin.into());
+    set(&o, "actorKind", row.actor_kind.clone().into());
+    set(&o, "actor_kind", row.actor_kind.into());
+    set_pair_opt_string(&o, "actorId", "actor_id", row.actor_id);
+    set_pair_opt_string(&o, "actorUserId", "actor_user_id", row.actor_user_id);
+    set_pair_opt_string(&o, "orgId", "org_id", row.org_id);
+    set_pair_opt_string(&o, "correlationId", "correlation_id", row.correlation_id);
+    set_pair_opt_string(&o, "sessionId", "session_id", row.session_id);
+    set_pair_opt_string(&o, "nodeId", "node_id", row.node_id);
+    set_pair_opt_string(&o, "callId", "call_id", row.call_id);
+    set(&o, "payloadJson", row.payload_json.clone().into());
+    set(&o, "payload_json", row.payload_json.into());
+    o.into()
+}
+
+/// Sets one optional string under both spellings, `null` when absent — the
+/// browser must be able to tell "the writer had no value" from "this layer
+/// dropped the field".
+fn set_pair_opt_string(obj: &js_sys::Object, camel: &str, snake: &str, value: Option<String>) {
+    match value {
+        Some(v) => {
+            set(obj, camel, v.clone().into());
+            set(obj, snake, v.into());
+        }
+        None => {
+            set(obj, camel, JsValue::NULL);
+            set(obj, snake, JsValue::NULL);
+        }
+    }
+}
+
+/// The keyset cursor, in the same shape the encoder reads back: the browser
+/// hands `next_cursor` straight to the next request, so the two spellings here
+/// and the snake_case keys `encode_events_browse_request` looks for must agree.
+fn events_cursor_to_js(cursor: tentaflow_protocol::EventsCursor) -> JsValue {
+    let o = js_sys::Object::new();
+    set(&o, "atMs", (cursor.at_ms as f64).into());
+    set(&o, "at_ms", (cursor.at_ms as f64).into());
+    set(&o, "runId", cursor.run_id.clone().into());
+    set(&o, "run_id", cursor.run_id.into());
+    set(&o, "seq", (cursor.seq as f64).into());
+    o.into()
+}
+
+/// Decodes `EventsPayload` (Zarzadzanie -> Zdarzenia). Only the *Response
+/// variants really reach the GUI; the *Request arms exist to exhaust the match.
+fn decode_events_payload(obj: &js_sys::Object, payload: tentaflow_protocol::EventsPayload) {
+    use tentaflow_protocol::EventsPayload as P;
+    match payload {
+        P::BrowseResponse(resp) => {
+            set(obj, "variant", "EventsBrowseResponse".into());
+            let arr = js_sys::Array::new();
+            for row in resp.rows {
+                arr.push(&event_row_to_js(row));
+            }
+            set(obj, "rows", arr.into());
+            match resp.next_cursor {
+                Some(c) => {
+                    let c = events_cursor_to_js(c);
+                    set(obj, "nextCursor", c.clone());
+                    set(obj, "next_cursor", c);
+                }
+                None => {
+                    set(obj, "nextCursor", JsValue::NULL);
+                    set(obj, "next_cursor", JsValue::NULL);
+                }
+            }
+            set(obj, "scopedToSelf", resp.scoped_to_self.into());
+            set(obj, "scoped_to_self", resp.scoped_to_self.into());
+        }
+        P::RunResponse(resp) => {
+            set(obj, "variant", "EventsRunResponse".into());
+            set(obj, "runId", resp.run_id.clone().into());
+            set(obj, "run_id", resp.run_id.into());
+            let arr = js_sys::Array::new();
+            for row in resp.events {
+                arr.push(&event_row_to_js(row));
+            }
+            set(obj, "events", arr.into());
+            match resp.next_after_seq {
+                Some(s) => {
+                    set(obj, "nextAfterSeq", (s as f64).into());
+                    set(obj, "next_after_seq", (s as f64).into());
+                }
+                None => {
+                    set(obj, "nextAfterSeq", JsValue::NULL);
+                    set(obj, "next_after_seq", JsValue::NULL);
+                }
+            }
+        }
+        P::BrowseRequest(_) => set(obj, "variant", "EventsBrowseRequest".into()),
+        P::RunRequest(_) => set(obj, "variant", "EventsRunRequest".into()),
+    }
 }
 
 /// Dekoduje `StorageAdminPayload` (Ustawienia → Magazyn danych). Tylko *Response
