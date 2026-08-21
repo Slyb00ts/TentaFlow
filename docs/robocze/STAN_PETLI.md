@@ -666,3 +666,53 @@ używają wyłącznie ścieżki domyślnej, gdzie zasiew i wiersz są takie same
 
 **Sprzątnięte:** `tentaflow-core/relative/` — pozostałość po mutacji zdejmującej walidator
 (test utworzył prawdziwy katalog). Ta sama pozostałość co odnotowana wcześniej; tym razem usunięta.
+
+---
+
+## Runda: R3 jedna powłoka retrievalu — ślepy krytyk, po scaleniu main
+
+**Werdykt: DOES NOT MEET BAR — wyłącznie R3.8** (dziesięć nowo dopisanych linii po polsku:
+komunikaty asercji, `expect`, fixtury i jeden doc comment). R3.1–R3.7 spełnione, każde
+z mutacją dowodzącą, że pilnujący test jest czuły. Dziesięć mutacji, każda w osobnym skrypcie
+pod blokadą.
+
+**Odpowiedź na pytanie 2 jest ROZSZCZEPIONA i to jest najważniejsze zdanie tego raportu.**
+
+- **Strona definicji flow i adapterów: TAK.** Obie inwersje sensu toru czerwienią testy —
+  „węzeł `output` ignoruje tryb i zawsze emituje blok z cytatami" oraz „fallback modelu
+  ignoruje envelope i zawsze bierze `rag-llm`". Ten tor NIE powtarza porażki R2a rundy 2.
+- **Strona wołającego: NIE. Zero pokrycia.** Czat projektu wnosi do tego toru dokładnie trzy
+  linie i **żadna nie jest pilnowana**: skasuj `dispatch_by_flow_id_streaming(RAG_QUERY_FLOW_ID)`
+  i wskaż cokolwiek innego — zestaw zielony; skasuj stempel modelu — każdy czat projektu po
+  cichu odpowiada na `rag-llm`, zestaw zielony; skasuj stempel `output_mode` — zielony jest
+  i zestaw, i RUNTIME, bo czat czyta tylko `meta["rag_citations"]`, nigdy payloadu.
+
+  Czyli **dokładnie ta regresja, przed którą stoi R3.4 — czat po cichu tracący własny model —
+  jest łapana przez testy kontraktu flow i przez NIC na okablowaniu.** Krytyk nie mógł tego
+  zmutować: `dispatch/stream_handlers.rs` był poza jego zakresem. Żaden test integracyjny nie
+  przechodzi wspólnej powłoki end-to-end z żadnej z dwóch stron.
+
+**R3.5 potwierdzone: reranker NIE został „naprawiony".** Cały diff `reranker.rs` to dwie linie
+(stempel pochodzenia), a `retrieval_round.flow.json` jest bajtowo identyczny. Kształt wejścia
+niezmieniony, degradacja do kolejności wektorowej nadal obecna i nadal ograniczona do tej
+ścieżki. Błędna diagnoza z §1.3 specyfikacji pozostaje błędna — dobrze, że nikt jej nie „poprawił".
+
+### Decyzje właściciela po raporcie R3 (2026-08-20)
+
+| Znalezisko | Decyzja |
+|---|---|
+| **Persona czatu projektu zmieniła się po cichu** — stary `ps-chat` pozwalał odpowiadać poza bazą wiedzy, wspólna powłoka zabrania | **ZOSTAJE nowe zachowanie.** Do notatek wydaniowych + test pinujący, żeby nie zmieniło się znowu niezauważenie |
+| **Projekt bez przypisanego agenta czatu po cichu odpowiada na modelu platformowym** (`model_fallback: rag-llm`) zamiast błędu | **ZDJĄĆ fallback dla czatu projektu.** Głośny błąd zamiast cichej odpowiedzi na modelu, którego właściciel nie wybrał. Addon zachowuje `rag-llm` jako swój prawdziwy domyślny — fallback zostaje we flow, refuse jest po stronie handlera (addon to bundle WASM, którego nie wolno przebudować) |
+| **`recent_conversation_messages` kluczowane wyłącznie po `session_id`**, bez zakresu org/user, a `/v1` bierze `session_id` dosłownie od wołającego | **ZASCOPE'OWAĆ do właściciela.** Wzorzec: czaty Project Studio filtrowane twardo po `user_id` bez obejścia dla admina. **To naprawa usterki ZASTANEJ** — magazyn był nieoscope'owany od dawna, ten tor tylko poszerzył osiągalną powierzchnię (powłoka `query` nie miała wcześniej węzła historii) |
+
+### Znaleziska R3 poza kryteriami — nie naprawione, do raportu
+
+- **F6: nowe klucze konfiguracji `llm` nie istnieją w palecie Flow Buildera.**
+  `model_meta_key`, `model_fallback`, `require_session`, `output_mode` — `grep` po `www/` pusty.
+  Użytkownik edytujący węzeł `llm` w builderze nie ma UI dla kluczy, na których stoi flow platformowy.
+- **F7: cała unifikacja wylądowała w `06b52c59d [wip]: checkpoint after session interruption`**,
+  a nie w opisanym commicie `[feat]`. Konwencja repo `[type]: description` nie została zachowana.
+- Zastane `ps-chat` w treści produktowej: `seed.rs:883` opis `config_schema` węzła
+  `project_knowledge` (widoczny w Flow Builderze) i prefiks identyfikatora żądania
+  `format!("ps-chat-{correlation_key}")` — ten drugi świadomie nietknięty, bo może występować
+  w złączeniach audytu, więc zmiana nazwy to zmiana zachowania, nie porządki.
