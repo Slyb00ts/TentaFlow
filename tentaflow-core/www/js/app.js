@@ -39,6 +39,7 @@ import UsersScreen from '/js/modules/users.js';
 import AccessKeysScreen from '/js/modules/access-keys.js';
 import SettingsScreen from '/js/modules/settings.js';
 import AuditScreen from '/js/modules/audit.js';
+import EventsScreen from '/js/modules/events.js';
 import AddonsScreen from '/js/modules/addons.js';
 import AddonAppScreen from '/js/modules/addon-app.js';
 import MyAccountsScreen from '/js/modules/my-accounts.js';
@@ -147,12 +148,24 @@ const ADMIN_NAV = [
       { id: 'access-keys', labelKey: 'nav.access_keys', icon: 'key' },
       { id: 'roles-catalog', labelKey: 'nav.roles_catalog', icon: 'key' },
       { id: 'audit', labelKey: 'nav.audit', icon: 'audit' },
+      { id: 'events', labelKey: 'nav.events', icon: 'clock-glance', userVisible: true },
       { id: 'analytics', labelKey: 'nav.analytics', icon: 'trend' },
       { id: 'legal', labelKey: 'nav.legal', icon: 'audit' },
       { id: 'profiling-sessions', labelKey: 'nav.profiling_sessions', icon: 'trend' },
     ],
   },
 ];
+
+// Management entries a plain user may reach. `userVisible` is the per-item
+// counterpart of `requiresPowerUser`: the screen behind such an item narrows
+// itself to what the caller may see (Zdarzenia answers `scoped_to_self` when the
+// caller holds `events.read` but not `events.read_all`), so hiding the entry
+// would only hide the user's own data from them.
+function userVisibleAdminSections() {
+  return ADMIN_NAV
+    .map((section) => ({ ...section, items: section.items.filter((it) => it.userVisible) }))
+    .filter((section) => section.items.length > 0);
+}
 
 // Apps section shared by every role — always the first block of the sidebar.
 // `requiresPowerUser` items are dropped at render time for plain users, mirroring
@@ -287,7 +300,9 @@ async function renderApp() {
 
   function paint() {
     // Admin is a superset of user: apps first, then admin sections, account last.
-    const nav = (isAdmin ? [APPS_NAV, ...ADMIN_NAV, ...USER_NAV.slice(1)] : USER_NAV)
+    const nav = (isAdmin
+      ? [APPS_NAV, ...ADMIN_NAV, ...USER_NAV.slice(1)]
+      : [APPS_NAV, ...userVisibleAdminSections(), ...USER_NAV.slice(1)])
       .map((section) => ({
         ...section,
         items: section.items.filter((it) => !it.requiresPowerUser || isPowerUser),
@@ -526,6 +541,7 @@ async function renderApp() {
   Router.register('rules', RulesScreen);
   Router.register('settings', SettingsScreen);
   Router.register('audit', AuditScreen);
+  Router.register('events', EventsScreen);
   Router.register('legal', LegalScreen);
   Router.register('addons', AddonsScreen);
   // Drill-down: Router.navigate('addon-app', { addonId, panelId }) z apps-home.

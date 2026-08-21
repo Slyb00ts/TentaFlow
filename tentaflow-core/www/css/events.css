@@ -27,6 +27,10 @@
   --ev-o-camera: #f472b6;
   --ev-o-sched: #94a3b8;
   --ev-o-mesh: #2dd4bf;
+  --ev-o-dashboard: #818cf8;
+  --ev-o-meeting: #fb923c;
+  --ev-o-agent: #a3e635;
+  --ev-o-system: #64748b;
 
   --ev-tool: #0e7490;
   --ev-wait-a: #4b5563;
@@ -62,6 +66,14 @@
 .ev-bar .tf-select { min-height: 30px; padding: 5px 30px 5px 12px; font-size: 12px; border-radius: var(--tf-radius-sm); }
 .ev-bar .tf-select-wrap::after { right: 11px; width: 6px; height: 6px; }
 .ev-bar .tf-searchbox { height: 30px; border-radius: var(--tf-radius-sm); }
+/* The actor rows carry the API-key binding, which is the whole reason to open
+   this picker; at the toolbar's field width both the name and the binding
+   ellipsize away, so the popover keeps its own width and gives the binding a
+   line of its own. */
+.ev-bar tf-combobox .tf-combobox-popover { right: auto; width: 360px; max-width: 80vw; }
+.ev-bar tf-combobox .tf-combobox-option { flex-wrap: wrap; align-items: baseline; row-gap: 2px; }
+.ev-bar tf-combobox .tf-combobox-option-label { flex: 1 0 100%; white-space: normal; }
+.ev-bar tf-combobox .tf-combobox-option-desc { flex: 1 1 100%; white-space: normal; }
 
 /* ----- Origin colour -----
    .o-* sets `color`, never `background`, so one class tints a bare dot, a chip
@@ -74,6 +86,10 @@
 .ev-shell .o-camera { color: var(--ev-o-camera); }
 .ev-shell .o-sched { color: var(--ev-o-sched); }
 .ev-shell .o-mesh { color: var(--ev-o-mesh); }
+.ev-shell .o-dashboard { color: var(--ev-o-dashboard); }
+.ev-shell .o-meeting { color: var(--ev-o-meeting); }
+.ev-shell .o-agent { color: var(--ev-o-agent); }
+.ev-shell .o-system { color: var(--ev-o-system); }
 .ev-shell .dot {
   width: 7px; height: 7px; border-radius: 50%;
   background: currentColor; flex: 0 0 auto;
@@ -84,26 +100,6 @@
    controls.css. */
 .ev-chip { flex: 0 0 auto; }
 .ev-bar > .ev-chip:last-of-type { margin-left: auto; }
-
-/* ----- Actor picker -----
-   A popover surface anchored to its trigger. The field inside is a
-   tf-searchbox and the rows carry their own type styles below. */
-.ev-picker { position: relative; flex: 0 0 auto; }
-.ev-menu {
-  position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
-  min-width: 300px; max-width: 380px; padding: 6px;
-  background: var(--tf-bg-card); border: 1px solid var(--tf-border-hover);
-  border-radius: var(--tf-radius); box-shadow: var(--tf-shadow);
-  max-height: 340px; overflow: auto;
-}
-.ev-menu:not([data-open]) { display: none; }
-.ev-menu > tf-searchbox { margin-bottom: 6px; }
-.ev-opt {
-  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px;
-  padding: 7px 9px; border-radius: var(--tf-radius-sm); cursor: pointer; font-size: 13px;
-}
-.ev-opt:hover { background: var(--tf-bg-card-hover); }
-.ev-opt .sub { grid-column: 1 / -1; font-size: 11.5px; color: var(--tf-text-3); }
 
 /* An API key with no user behind it is the finding this screen exists to make
    visible, so bound/unbound is a colour distinction, not a wording one. */
@@ -187,6 +183,7 @@
 .ev-kv dt { color: var(--tf-text-3); }
 .ev-kv dd { margin: 0; color: var(--tf-text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
 .ev-kv dd .muted { color: var(--tf-text-3); }
+.ev-origin { display: inline-flex; align-items: center; gap: 6px; }
 /* Nested in a section the pair list keeps only its top gap — the section
    already supplies the horizontal gutter. */
 .ev-sec .ev-kv { padding: 8px 0 0; }
@@ -234,7 +231,6 @@
   :root { --ev-gutter: 12px; }
   .ev-bar { row-gap: 6px; }
   .ev-bar > .ev-chip:last-of-type { margin-left: 0; }
-  .ev-menu { min-width: 0; width: min(88vw, 380px); }
   /* Two lines per record instead of five columns: index + kind on top, detail
      and duration under them. */
   .ev-row {
