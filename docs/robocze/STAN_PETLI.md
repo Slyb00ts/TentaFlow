@@ -1277,3 +1277,61 @@ nie ma; liczba 30 dni to łańcuch tautologii (trzy testy porównują ją z tą 
 za sobą pociągnęły); test schematu sprawdza kolumny tylko dwóch z sześciu indeksów; brak
 dzierżawy na wierszach outboxu (dziś jeden wołający, więc utajone); „exactly once" jest w
 rzeczywistości at-least-once i kod to przyznaje.
+
+---
+
+## Runda: R2b `graph_extract` — ślepy krytyk (2026-08-22)
+
+**Werdykt: DOES NOT MEET BAR.** Spełnione: R2.1, R2.2, R2.3, R2.4, R2.7, R2.10.
+**Niespełnione: R2.5, R2.6, R2.8, R2.9.** Osiemnaście mutacji, siedemnaście zabitych.
+
+**Jednozdaniowe podsumowanie, które trzeba przeczytać w całości:**
+**ścieżka ekstrakcji jest kompletna, ale NIEOSIĄGALNA, NIECZYTANA i NIESPRZĄTANA.**
+
+- **R2.9 — czat projektu nadal wymusza `graph_enabled=false`** (`dispatch/stream_handlers.rs:2059-2062`),
+  z komentarzem „Projekt nie ma kolekcji grafowej", który strona ingestu właśnie uczyniła
+  nieprawdziwym. Tura dispatchuje `RAG_QUERY_FLOW_ID` z `addon_id = ps-<project_id>` — dokładnie
+  ten zakres, do którego ekstrakcja pisze — a węzły retrievalu zwierają się na tej fladze.
+  **Graf projektu, raz zbudowany, jest z czatu projektu nie do odczytania.**
+- **R2.6 — projektu NIE DA SIĘ włączyć.** `PROJECT_GRAPH_EXTRACTION_DEFAULT` to `const`
+  bez ustawienia, bez pola protokołu, bez UI. Nie istnieje test integracyjny i **nie da się go
+  dziś napisać jako przechodzącego**, bo żaden projekt nie może włączyć grafu.
+- **R2.8 — brak refcountu, potwierdzony sondą.** Dwa dokumenty nazywające „ETH Zurich",
+  `delete_document_in(file-2)` → **`swept 2 nodes / 1 edges`**, `eth_zurich` otombstonowany mimo
+  że file-1 nadal go używa. Istniejący test używa **rozłącznych** zbiorów encji, więc przypadku
+  współdzielonego nigdy nie dotyka. Dodatkowo `delete_file_graph`/`drop_project_graph` mają
+  **zero wołających**, więc graf przeżywa i skasowanie pliku, i skasowanie projektu.
+- **R2.5 — brak `chunk_id` i wersji ekstraktora.** `chunk_id` jest **strukturalnie nieosiągalny**:
+  `batches()` skleja teksty chunków i porzuca `index`. Mutacja **G6** (skasowanie `source_id`
+  i `path` z provenance) **przeżyła** — 16 testów zielonych.
+
+### Ile z tego jest moją winą jako orkiestratora
+
+Uczciwie: **większość**.
+
+- **R2.9 jest moim błędem zakresu.** Wyciąłem `dispatch/**` z własności R2b (bo pracował tam
+  agent przeglądarki zdarzeń), a to jest jedyne miejsce, gdzie ta flaga jest przypinana.
+  Kryterium było w poprzeczce od początku; ja go nie zleciłem.
+- **R2.6 jest moim przeoczeniem.** Kazałem Projektom domyślnie WYŁĄCZYĆ graf (zgodnie z decyzją
+  właściciela) i **nigdy nie zleciłem drugiej połowy — sposobu na włączenie**. Domyślnie
+  wyłączone bez możliwości włączenia to nie jest „domyślnie wyłączone", to jest martwe.
+- **R2.8(c) jest moją świadomą decyzją**, zapisaną wyżej: nie podłączam `delete_file_graph`,
+  bo przy jednowartościowym provenance podłączenie uzbroiłoby cichą utratę danych. Krytyk
+  niezależnie potwierdził sondą, że ta obawa była słuszna — i że addon RAG robi to poprawnie
+  refcountem, więc poprzeczka nie jest hipotetyczna.
+- **R2.5 jest realnym ograniczeniem projektu węzła**, nie przeoczeniem zakresu — wsadowanie
+  chunków dla oszczędności wywołań LLM wyklucza atrybucję per chunk. To jest kompromis do
+  rozstrzygnięcia, nie błąd do naprawienia w locie.
+
+### Co jeszcze krytyk znalazł poza kryteriami
+
+- `pick_model` spada na platformowy alias `rag-llm`, a nie na model czatu projektu — projekt,
+  który włączyłby ekstrakcję, po cichu płaciłby za inny model. To ta sama klasa usterki, którą
+  właściciel kazał usunąć z czatu projektu („zdjąć fallback, głośny błąd zamiast cichej odpowiedzi").
+- `graph_extract` propaguje błąd, więc nieudana ekstrakcja **wywraca cały ingest pliku**,
+  łącznie ze ścieżką wektorową.
+- Zero testów na czapki `MAX_ITEMS_PER_BATCH` (128) i `MAX_NAME_CHARS` (120) — a to jest
+  host-side guard przed wstrzykniętym mega-grafem.
+
+**Sprzątnięte:** `tentaflow-core/relative/` (pozostałość po teście walidacji ścieżki) — ta sama
+pozostałość co dwie sesje temu, usunięta ponownie. Warta wpisu do `.gitignore`.
