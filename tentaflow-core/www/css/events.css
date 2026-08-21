@@ -1,0 +1,251 @@
+/* =============================================================================
+   File: events.css — Zdarzenia (events browser): filter bar, timeline pane,
+   turn-grouped ledger and the record inspector. Only --tf-* tokens plus the
+   ev-* aliases declared below; classes ev-*.
+
+   The timeline is <tf-run-timeline>; its bar, scale switch, lane labels,
+   track, bands, brush, axis, minimap, legend and keyboard hint are dressed by
+   controls.css (.tf-rt__*). This sheet owns the PANE around it and nothing
+   inside it — the prototype names .ev-lanes-labels, .ev-track, .ev-span,
+   .ev-turnline, .ev-sel, .ev-minimap, .ev-legend, .ev-hint and .ev-ctl are
+   deliberately absent here, because re-declaring them would fork the widget.
+   ============================================================================= */
+
+:root {
+  /* Dictionary aliases, not a second palette. Origin is the first dimension
+     this screen is read by and the dashboard tokens name none of the eight
+     sources, so the four that map onto a semantic token borrow it and the
+     other four are declared once here instead of being repeated as literals.
+     The tool teal and the wait hatch mirror tf-run-timeline's own aliases
+     (--tf-rt-tool, --tf-rt-wait-a/-b): a band and the ledger row describing
+     the same record must not drift apart. */
+  --ev-o-code: var(--tf-info);
+  --ev-o-api: var(--tf-warning);
+  --ev-o-addon: var(--tf-accent-3);
+  --ev-o-project: var(--tf-success);
+  --ev-o-chat: #38bdf8;
+  --ev-o-camera: #f472b6;
+  --ev-o-sched: #94a3b8;
+  --ev-o-mesh: #2dd4bf;
+
+  --ev-tool: #0e7490;
+  --ev-wait-a: #4b5563;
+  --ev-wait-b: #374151;
+  --ev-wait: repeating-linear-gradient(45deg, var(--ev-wait-a) 0 4px, var(--ev-wait-b) 4px 8px);
+
+  --ev-inspector-w: 380px;
+  --ev-gutter: 16px;
+  --ev-mono: var(--tf-font-mono, 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace);
+}
+
+/* ----- Shell -----
+   Three stacked bands (filters, timeline, content) where only the content
+   scrolls. Same escape from the .main padding that .chat-shell and tf-screen
+   already use, so the ledger can own the full viewport height. */
+.main:has(.ev-shell) { padding: 0; overflow: hidden; }
+.main:has(.ev-shell) > * { height: 100%; }
+.ev-shell {
+  display: grid; grid-template-rows: auto auto minmax(0, 1fr);
+  height: 100%; min-height: 0; min-width: 0;
+}
+
+/* ----- Filter bar -----
+   Used together with .tf-toolbar, which already pins the controls to content
+   width; this adds only the band chrome and the sticky behaviour. */
+.ev-bar {
+  padding: 10px var(--ev-gutter); row-gap: 8px;
+  background: var(--tf-bg-2); border-bottom: 1px solid var(--tf-border);
+  position: sticky; top: 0; z-index: 5;
+}
+/* Compact fields: the bar carries many filters at once, so the controls match
+   the 30px segmented track rather than the default 38px. */
+.ev-bar .tf-select { min-height: 30px; padding: 5px 30px 5px 12px; font-size: 12px; border-radius: var(--tf-radius-sm); }
+.ev-bar .tf-select-wrap::after { right: 11px; width: 6px; height: 6px; }
+.ev-bar .tf-searchbox { height: 30px; border-radius: var(--tf-radius-sm); }
+
+/* ----- Origin colour -----
+   .o-* sets `color`, never `background`, so one class tints a bare dot, a chip
+   dot (background: currentColor in controls.css) and a text label alike. */
+.ev-shell .o-code { color: var(--ev-o-code); }
+.ev-shell .o-api { color: var(--ev-o-api); }
+.ev-shell .o-addon { color: var(--ev-o-addon); }
+.ev-shell .o-project { color: var(--ev-o-project); }
+.ev-shell .o-chat { color: var(--ev-o-chat); }
+.ev-shell .o-camera { color: var(--ev-o-camera); }
+.ev-shell .o-sched { color: var(--ev-o-sched); }
+.ev-shell .o-mesh { color: var(--ev-o-mesh); }
+.ev-shell .dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: currentColor; flex: 0 0 auto;
+}
+
+/* ----- Chips -----
+   Layout hook on a tf-chip / tf-filter-chips host; the pill itself is
+   controls.css. */
+.ev-chip { flex: 0 0 auto; }
+.ev-bar > .ev-chip:last-of-type { margin-left: auto; }
+
+/* ----- Actor picker -----
+   A popover surface anchored to its trigger. The field inside is a
+   tf-searchbox and the rows carry their own type styles below. */
+.ev-picker { position: relative; flex: 0 0 auto; }
+.ev-menu {
+  position: absolute; z-index: 40; top: calc(100% + 6px); left: 0;
+  min-width: 300px; max-width: 380px; padding: 6px;
+  background: var(--tf-bg-card); border: 1px solid var(--tf-border-hover);
+  border-radius: var(--tf-radius); box-shadow: var(--tf-shadow);
+  max-height: 340px; overflow: auto;
+}
+.ev-menu:not([data-open]) { display: none; }
+.ev-menu > tf-searchbox { margin-bottom: 6px; }
+.ev-opt {
+  display: grid; grid-template-columns: minmax(0, 1fr) auto; gap: 2px 10px;
+  padding: 7px 9px; border-radius: var(--tf-radius-sm); cursor: pointer; font-size: 13px;
+}
+.ev-opt:hover { background: var(--tf-bg-card-hover); }
+.ev-opt .sub { grid-column: 1 / -1; font-size: 11.5px; color: var(--tf-text-3); }
+
+/* An API key with no user behind it is the finding this screen exists to make
+   visible, so bound/unbound is a colour distinction, not a wording one. */
+.ev-shell .tag {
+  font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em;
+  padding: 2px 6px; border-radius: 4px; align-self: start; white-space: nowrap;
+  background: var(--tf-bg-3); color: var(--tf-text-2);
+}
+.ev-shell .tag.bound {
+  background: color-mix(in srgb, var(--tf-success) 14%, transparent);
+  color: var(--tf-success);
+}
+.ev-shell .tag.unbound {
+  background: color-mix(in srgb, var(--tf-warning) 16%, transparent);
+  color: var(--tf-warning);
+}
+
+/* ----- Timeline pane -----
+   Layout only: the band chrome, height and interaction cursors belong to
+   tf-run-timeline. .ev-plot is the host element itself, so it must not gain a
+   second background or border. */
+.ev-timeline { min-width: 0; background: var(--tf-bg-2); }
+.ev-plot { display: block; width: 100%; }
+
+/* ----- Content: ledger + inspector ----- */
+.ev-body { display: grid; grid-template-columns: minmax(0, 1fr); min-height: 0; min-width: 0; }
+.ev-body.with-inspector { grid-template-columns: minmax(0, 1fr) var(--ev-inspector-w); }
+.ev-ledger { overflow: auto; min-height: 0; min-width: 0; }
+
+/* A turn boundary is a real break in the conversation, so it is a band across
+   the list rather than an indent — two adjacent requests from different turns
+   must not read as one sequence. */
+.ev-turnhead {
+  display: flex; gap: 10px; align-items: center; flex-wrap: wrap;
+  padding: 9px var(--ev-gutter);
+  background: var(--tf-bg-3);
+  border-top: 2px solid var(--tf-border-hover); border-bottom: 1px solid var(--tf-border-hover);
+  font-size: 12px; font-weight: 700; letter-spacing: 0.04em; text-transform: uppercase;
+  color: var(--tf-text-2);
+  position: sticky; top: 0; z-index: 2;
+}
+.ev-turnhead .sub {
+  font-weight: 500; text-transform: none; letter-spacing: 0;
+  color: var(--tf-text-3); display: inline-flex; align-items: center; gap: 6px;
+}
+
+.ev-row {
+  display: grid; grid-template-columns: 54px 130px 108px minmax(0, 1fr) 84px;
+  gap: 10px; align-items: center; padding: 7px var(--ev-gutter);
+  border-bottom: 1px solid var(--tf-border); font-size: 13px; cursor: pointer;
+}
+.ev-row:hover { background: var(--tf-bg-card-hover); }
+/* Selection and hover-from-the-timeline are different states and must stay
+   distinguishable: selection is the accent, the coupled hover the softer one. */
+.ev-row[data-sel] { background: var(--tf-accent-glow); box-shadow: inset 2px 0 0 var(--tf-accent-1); }
+.ev-row.hot { background: var(--tf-bg-card-hover); box-shadow: inset 2px 0 0 var(--tf-accent-2); }
+.ev-row .ix { font-family: var(--ev-mono); font-size: 11px; color: var(--tf-text-3); font-variant-numeric: tabular-nums; }
+.ev-row .kind { font-weight: 600; display: flex; align-items: center; gap: 6px; min-width: 0; }
+.ev-row .who { color: var(--tf-text-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-row .what { color: var(--tf-text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev-row .ms {
+  text-align: right; font-family: var(--ev-mono); font-size: 12px;
+  color: var(--tf-text-2); font-variant-numeric: tabular-nums;
+}
+
+/* ----- Inspector ----- */
+.ev-inspector {
+  overflow: auto; min-height: 0; min-width: 0;
+  background: var(--tf-bg-2); border-left: 1px solid var(--tf-border);
+}
+.ev-insp-head { padding: 14px var(--ev-gutter); border-bottom: 1px solid var(--tf-border); }
+.ev-insp-title { font-size: 15px; font-weight: 700; }
+.ev-insp-sub {
+  font-size: 12px; color: var(--tf-text-3); margin-top: 3px;
+  font-family: var(--ev-mono); overflow-wrap: anywhere;
+}
+.ev-kv {
+  display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: 6px 12px;
+  padding: 12px var(--ev-gutter); margin: 0; font-size: 12.5px;
+}
+.ev-kv dt { color: var(--tf-text-3); }
+.ev-kv dd { margin: 0; color: var(--tf-text); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.ev-kv dd .muted { color: var(--tf-text-3); }
+/* Nested in a section the pair list keeps only its top gap — the section
+   already supplies the horizontal gutter. */
+.ev-sec .ev-kv { padding: 8px 0 0; }
+.ev-sec { padding: 12px var(--ev-gutter); border-top: 1px solid var(--tf-border); }
+.ev-sec h4 {
+  font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.07em;
+  color: var(--tf-text-3); margin: 0 0 7px;
+}
+.ev-sec-actions { margin-top: 8px; display: flex; gap: 8px; flex-wrap: wrap; }
+.ev-pre {
+  background: var(--tf-bg-input); border: 1px solid var(--tf-border); border-radius: var(--tf-radius-sm);
+  padding: 9px 11px; font-family: var(--ev-mono); font-size: 11.5px;
+  color: var(--tf-text-2); white-space: pre-wrap; word-break: break-word;
+  max-height: 180px; overflow: auto;
+}
+/* Chronometry bar: the same TTFT/decode split the timeline draws, restated for
+   one record. Segment widths come from the data, so only the fills live here. */
+.ev-track-bar { display: flex; height: 9px; border-radius: 3px; overflow: hidden; margin-top: 4px; }
+.ev-track-bar .ttft { background: var(--ev-wait); }
+.ev-track-bar .decode { background: var(--tf-accent-1); }
+.ev-track-bar .tool { background: var(--ev-tool); }
+.ev-track-bar .err { background: var(--tf-danger); }
+
+/* ----- Empty state ----- */
+.ev-empty { padding: 28px var(--ev-gutter); text-align: center; color: var(--tf-text-3); font-size: 13px; }
+
+/* =============================================================================
+   Responsive — the inspector stops being a column before the ledger columns
+   start colliding, because a 380px aside over a 700px page leaves the ledger
+   unreadable first.
+   ============================================================================= */
+@media (max-width: 1020px) {
+  .ev-body.with-inspector {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-rows: minmax(0, 1fr) minmax(0, 45%);
+  }
+  .ev-inspector { border-left: 0; border-top: 1px solid var(--tf-border); }
+  .ev-row { grid-template-columns: 46px 118px minmax(0, 1fr) 72px; }
+  /* The model/tool name is the one column that can go: the kind cell already
+     carries the origin dot and the detail cell repeats the target. */
+  .ev-row .who { display: none; }
+}
+
+@media (max-width: 720px) {
+  :root { --ev-gutter: 12px; }
+  .ev-bar { row-gap: 6px; }
+  .ev-bar > .ev-chip:last-of-type { margin-left: 0; }
+  .ev-menu { min-width: 0; width: min(88vw, 380px); }
+  /* Two lines per record instead of five columns: index + kind on top, detail
+     and duration under them. */
+  .ev-row {
+    grid-template-columns: 46px minmax(0, 1fr) auto;
+    grid-template-areas: "ix kind ms" ". what what";
+    row-gap: 2px;
+  }
+  .ev-row .ix { grid-area: ix; }
+  .ev-row .kind { grid-area: kind; }
+  .ev-row .ms { grid-area: ms; }
+  .ev-row .what { grid-area: what; white-space: normal; overflow: visible; font-size: 12px; }
+  .ev-kv { grid-template-columns: 84px minmax(0, 1fr); }
+  .ev-body.with-inspector { grid-template-rows: minmax(0, 1fr) minmax(0, 55%); }
+}
