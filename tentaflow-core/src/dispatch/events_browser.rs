@@ -432,6 +432,218 @@ mod tests {
         assert!(!resp.scoped_to_self);
     }
 
+    /// `events.read_all` is the strictly WIDER capability, so it stands on its
+    /// own: an auditor granted only it must see the whole node. Every other
+    /// `read_all` test here grants both permissions, which leaves the ordering
+    /// inside `resolve_scope` unpinned — checking `events.read` first would deny
+    /// exactly this caller everything, which is the failure the doc comment on
+    /// `resolve_scope` warns about and the reason this test grants ONE
+    /// permission and not two.
+    #[tokio::test]
+    async fn read_all_without_read_is_still_the_wider_grant() {
+        let anna = principal();
+        let marek = principal();
+        let auditor = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
+        let auditor_ctx = ctx_with(&auditor, &[PERM_READ_ALL]);
+
+        seed_run(&anna_ctx, "run-anna", &session, &anna.uuid, 100);
+        seed_run(&anna_ctx, "run-marek", &session, &marek.uuid, 200);
+
+        let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &auditor_ctx).await;
+        assert!(!is_err, "read_all alone must not be a denial: {body:?}");
+        let resp = expect_browse(body);
+        let mut runs: Vec<&str> = resp.rows.iter().map(|r| r.run_id.as_str()).collect();
+        runs.sort();
+        assert_eq!(
+            runs,
+            vec!["run-anna", "run-marek"],
+            "read_all alone sees every principal's rows"
+        );
+        assert!(
+            !resp.scoped_to_self,
+            "read_all alone is not a narrowed page"
+        );
+
+        // The same grant reads any run's timeline, including one it does not own
+        // — the per-run ACL is skipped for `Scope::Node`, not merely widened.
+        let run = run_timeline(
+            &auditor_ctx,
+            &EventsRunRequest {
+                run_id: "run-anna".to_string(),
+                ..EventsRunRequest::default()
+            },
+        )
+        .expect("read_all reads a run it does not own");
+        match run {
+            MessageBody::EventsBody(EventsPayload::RunResponse(r)) => {
+                assert_eq!(r.run_id, "run-anna");
+                assert!(!r.events.is_empty());
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    /// The criterion the whole feature exists to satisfy: the visibility scope
+    /// comes from the SESSION, and nothing in the request can widen it.
+    ///
+    /// The restriction and the request filters meet here on purpose. Elsewhere
+    /// they never do — the filter tests run unrestricted and the ACL tests send
+    /// no filters — so a change that let a named `actor_id` (or an org, session
+    /// or free-text filter) escape the narrowing would be invisible. Each filter
+    /// below names a value that belongs to ANOTHER principal, and each must come
+    /// back empty rather than come back with her rows.
+    #[tokio::test]
+    async fn a_restricted_caller_cannot_widen_scope_by_naming_another_principal() {
+        let anna = principal();
+        let marek = principal();
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
+        let marek_ctx = ctx_with(&marek, &[PERM_READ]);
+        let anna_run = format!("run-anna-{}", uuid::Uuid::new_v4());
+        let marek_run = format!("run-marek-{}", uuid::Uuid::new_v4());
+
+        seed_run(&anna_ctx, &anna_run, &session, &anna.uuid, 100);
+        seed_run(&marek_ctx, &marek_run, &session, &marek.uuid, 200);
+
+        // The payload names anna as the actor. `actor_user_id` is derived from
+        // marek's session and the two are ANDed, so the page is empty — the
+        // request field selects WITHIN the caller's scope and never replaces it.
+        let named = EventsBrowseRequest {
+            session_id: Some(session.clone()),
+            actor_id: Some(anna.uuid.clone()),
+            ..EventsBrowseRequest::default()
+        };
+        let resp = expect_browse(browse(&marek_ctx, &named).expect("browse"));
+        assert!(
+            resp.rows.is_empty(),
+            "naming another principal's actor_id must not reach her rows: {:?}",
+            resp.rows.iter().map(|r| &r.run_id).collect::<Vec<_>>()
+        );
+        assert!(resp.scoped_to_self, "the page is still a narrowed one");
+
+        // Free text that matches only anna's run id: the search predicate is
+        // ANDed with the visibility predicate, not substituted for it.
+        let searched = EventsBrowseRequest {
+            session_id: Some(session.clone()),
+            search: Some(anna_run.clone()),
+            ..EventsBrowseRequest::default()
+        };
+        let resp = expect_browse(browse(&marek_ctx, &searched).expect("browse"));
+        assert!(
+            resp.rows.is_empty(),
+            "searching for another principal's run id must not surface it"
+        );
+
+        // Every filter the request carries, all pointed at anna at once.
+        let everything = EventsBrowseRequest {
+            origins: Some(vec!["chat".into()]),
+            actor_id: Some(anna.uuid.clone()),
+            org_id: Some("org-test".into()),
+            session_id: Some(session.clone()),
+            search: Some(anna_run.clone()),
+            from_ms: Some(0),
+            to_ms: Some(1_000),
+            limit: 100,
+            ..EventsBrowseRequest::default()
+        };
+        let resp = expect_browse(browse(&marek_ctx, &everything).expect("browse"));
+        assert!(
+            resp.rows.is_empty(),
+            "no combination of request filters widens a session-derived scope"
+        );
+
+        // And the narrowing is a narrowing, not a blanket empty page: marek
+        // naming HIMSELF still reads his own rows, so the refusals above are the
+        // ACL and not a filter that matches nothing.
+        let own = EventsBrowseRequest {
+            session_id: Some(session.clone()),
+            actor_id: Some(marek.uuid.clone()),
+            ..EventsBrowseRequest::default()
+        };
+        let resp = expect_browse(browse(&marek_ctx, &own).expect("browse"));
+        let runs: Vec<&str> = resp.rows.iter().map(|r| r.run_id.as_str()).collect();
+        assert_eq!(runs, vec![marek_run.as_str()]);
+    }
+
+    /// Invariant 3 at the layer that could actually undo it. The writer's
+    /// omission is proven in `store`; what is proven HERE is that `to_wire`
+    /// cannot put the body back. It does not forward the stored string — it
+    /// re-serialises the decoded payload — so the omission has to survive a
+    /// decode and an encode to reach `EventRowWire.payload_json`, and this
+    /// asserts on that field rather than on the decoded value behind it.
+    #[tokio::test]
+    async fn an_omitted_assistant_body_never_reaches_the_wire() {
+        const SECRET: &str = "the answer nobody opted in to keep";
+        let anna = principal();
+        let anna_ctx = ctx_with(&anna, &[PERM_READ]);
+        let session = format!("sess-{}", uuid::Uuid::new_v4());
+        let run_id = format!("run-{}", uuid::Uuid::new_v4());
+        let pool = events_pool();
+        append(
+            &pool,
+            &anna_ctx.state.db,
+            RunEvent::new(
+                &run_id,
+                100,
+                FlowOrigin::Chat,
+                &FlowActor::user(&anna.uuid),
+                EventPayload::AssistantMessage {
+                    body: crate::events::ResponseBody::Text(SECRET.to_string()),
+                    tokens: Some(12),
+                },
+            )
+            .with_session(&session)
+            // An organisation that never opted in, which is every organisation
+            // by default — so the writer stores the omission marker.
+            .with_org("org-test"),
+        )
+        .expect("append");
+
+        let (body, is_err) = crate::dispatch::dispatch(&browse_body(&session), &anna_ctx).await;
+        assert!(!is_err, "unexpected error body: {body:?}");
+        let resp = expect_browse(body);
+        let row = resp
+            .rows
+            .iter()
+            .find(|r| r.run_id == run_id)
+            .expect("the seeded row is on the page");
+        assert_eq!(row.kind, "assistant_message");
+        assert!(
+            !row.payload_json.contains(SECRET),
+            "the wire payload must not carry a body the writer omitted: {}",
+            row.payload_json
+        );
+        assert!(
+            row.payload_json.contains("\"omitted\""),
+            "the omission must be VISIBLE on the wire, not an absent field: {}",
+            row.payload_json
+        );
+
+        // The same row through the per-run path, which shares `to_wire`.
+        let timeline = run_timeline(
+            &anna_ctx,
+            &EventsRunRequest {
+                run_id: run_id.clone(),
+                ..EventsRunRequest::default()
+            },
+        )
+        .expect("owner reads her own run");
+        match timeline {
+            MessageBody::EventsBody(EventsPayload::RunResponse(r)) => {
+                let wire = r
+                    .events
+                    .iter()
+                    .find(|e| e.kind == "assistant_message")
+                    .expect("the assistant message is on the timeline");
+                assert!(!wire.payload_json.contains(SECRET));
+                assert!(wire.payload_json.contains("\"omitted\""));
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
     /// A non-owner asking for a SPECIFIC run gets `not_found`, not
     /// `PolicyDenied` — and the message is byte-identical to the one a run that
     /// does not exist produces, because the difference between the two is the

@@ -515,6 +515,19 @@ mod tests {
         RunProvenance::from_meta(&meta)
     }
 
+    /// A DIFFERENT principal naming the SAME run — the one shape that could put
+    /// two owners on one run's rows.
+    fn foreign_provenance(run_id: &str) -> RunProvenance {
+        let mut meta = FlowRequestMeta::new(
+            run_id,
+            FlowOrigin::Chat,
+            FlowActor::user("user-99".to_string()),
+        );
+        meta.org_id = Some("org-9".into());
+        meta.session_id = Some(SCOPE.into());
+        RunProvenance::from_meta(&meta)
+    }
+
     /// Wires a broker, a sink and a log over a fresh events database and starts
     /// watching one scope — the same order `begin_run` uses in production.
     struct Harness {
@@ -840,6 +853,84 @@ mod tests {
                 "a node type learnt in another run must not be reused: {step:?}"
             ),
             other => panic!("expected a step_end payload, got {other:?}"),
+        }
+    }
+
+    /// THE INVARIANT THAT KEEPS THE TWO OWNERSHIP MODELS FROM DIVERGING.
+    ///
+    /// The Events browser decides visibility twice over the same table, and the
+    /// two decisions are not the same shape: `browse` restricts per ROW
+    /// (`actor_user_id = ?`), while the per-run read decides per RUN from the
+    /// lowest-`seq` row (`store::run_actor_user_id`). They agree only while a
+    /// run cannot carry two different `actor_user_id` values — if one could, the
+    /// first row's owner would read the whole timeline INCLUDING another
+    /// principal's rows, which `browse` would have hidden.
+    ///
+    /// This file is where such a run would have to be born: `write_batch` is the
+    /// only production writer of `run_events`, and `row()` stamps every column
+    /// from the scope's `RunProvenance`. So the invariant is enforced one level
+    /// up, by `ProgressBroker::bind_run_provenance`: a scope already running
+    /// under one principal cannot be rebound to another. It goes
+    /// `ScopeProvenance::Contested`, `run_provenance` answers `None`, and this
+    /// subscriber stores NOTHING further — a hole in a diagnostic log rather
+    /// than a row filed under the wrong actor.
+    ///
+    /// The rebinding here keeps the run id deliberately: `rebinding_a_scope_
+    /// moves_later_events_onto_the_new_run` covers the same-principal case that
+    /// changes it, and a foreign rebinding that also changed the id would prove
+    /// nothing about a SHARED run.
+    #[tokio::test]
+    async fn a_second_principal_cannot_add_rows_to_a_live_run() {
+        let h = Harness::start("run-shared");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "n".into(),
+            node_type: "llm".into(),
+        });
+        h.rows("run-shared", 2).await;
+        // A positive control taken moments before the rebinding: the subscriber
+        // is provably still draining, so "no new row" below cannot be a task
+        // that had already stopped.
+        h.emit(ProgressEvent::FirstToken { node_id: "n".into() });
+        let before = h.rows("run-shared", 3).await;
+        assert_eq!(before.len(), 3);
+
+        h.broker
+            .bind_run_provenance(SCOPE, foreign_provenance("run-shared"));
+        h.emit(ProgressEvent::NodeFinished {
+            node_id: "n".into(),
+            status: "ok".into(),
+        });
+        // A contested scope stores nothing, so there is no row to wait FOR;
+        // the only honest wait is a bounded one that must expire.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+
+        let rows = read_run(&h.pool, "run-shared", 0, 1000).expect("read run");
+        assert_eq!(
+            rows.len(),
+            3,
+            "a second principal's events must not be appended to another's run: {:?}",
+            rows.iter().map(|r| r.kind).collect::<Vec<_>>()
+        );
+        let owners: std::collections::BTreeSet<Option<String>> =
+            rows.iter().map(|r| r.actor_user_id.clone()).collect();
+        assert_eq!(
+            owners,
+            std::collections::BTreeSet::from([Some("user-7".to_string())]),
+            "one run, one actor_user_id"
+        );
+
+        // The two models, asked the same question about the same run, agree.
+        // `run_actor_user_id` reads ONE row (lowest `seq`) and speaks for all of
+        // them, which is only sound because of the assertion above.
+        let per_run =
+            crate::events::store::run_actor_user_id(&h.pool, "run-shared").expect("run owner");
+        assert_eq!(per_run, Some(Some("user-7".to_string())));
+        for row in &rows {
+            assert_eq!(
+                per_run.clone().flatten(),
+                row.actor_user_id,
+                "the per-run ACL answer must hold for EVERY row of the run"
+            );
         }
     }
 }

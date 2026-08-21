@@ -14,13 +14,28 @@
 // `None` — but on a scalar (`limit`, `after_seq`) it is the whole mechanism,
 // and it keeps the rule one rule instead of two.
 //
-// The row carries `payload_json` VERBATIM rather than a typed payload enum.
-// The typed enum (`events::store::EventPayload`) lives in tentaflow-core and
-// cannot be referenced from here; mirroring it would create a second,
+// The row carries `payload_json` as a STRING rather than as a typed payload
+// enum. The typed enum (`events::store::EventPayload`) lives in tentaflow-core
+// and cannot be referenced from here; mirroring it would create a second,
 // drift-prone spelling of the same contract. The stored JSON is internally
-// tagged with the same `kind` as the column, so it is self-describing, and it
-// is what the writer already redacted — shipping it unchanged is the only form
-// that cannot re-expose something the writer chose to omit.
+// tagged with the same `kind` as the column, so it is self-describing.
+//
+// The string is NOT the stored column passed through. `dispatch/events_browser
+// ::to_wire` decodes the row into `EventPayload` (which is how an unreadable
+// row is refused) and RE-SERIALISES that value, so what ships is this build's
+// spelling of the payload, not the writer's bytes. Two consequences, both
+// deliberate and both load-bearing:
+//
+//   * A body the writer omitted stays omitted, because the decoded value is an
+//     omission marker and there is nothing else for the re-encoding to write.
+//     Pinned by `dispatch::events_browser::tests::
+//     an_omitted_assistant_body_never_reaches_the_wire`.
+//   * `EventPayload` is `#[serde(tag = "kind")]` WITHOUT `deny_unknown_fields`,
+//     so a row written by a NEWER build that added a field to a kind this build
+//     already knows decodes without that field and is re-encoded without it.
+//     The browser silently shows the older shape rather than failing; forward
+//     compatibility is one-way, and a mixed-version node must not be read as
+//     authoritative for fields it predates.
 // =============================================================================
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
@@ -175,6 +190,11 @@ mod tests {
     use super::*;
     use crate::message_body::MessageBody;
 
+    /// Every field carries a value. A `None` left in a fixture is a field a
+    /// dropped-field mutation (`#[serde(skip)]`, a rename) cannot red — and
+    /// `actor_user_id` is the field the whole Events ACL rests on, so leaving it
+    /// unset made the roundtrip pass while the ACL's own column fell off the
+    /// wire.
     fn row() -> EventRowWire {
         EventRowWire {
             run_id: "run-1".into(),
@@ -184,7 +204,7 @@ mod tests {
             origin: "code_studio".into(),
             actor_kind: "api_key".into(),
             actor_id: Some("key-42".into()),
-            actor_user_id: None,
+            actor_user_id: Some("u-9".into()),
             org_id: Some("org-a".into()),
             correlation_id: Some("corr-9".into()),
             session_id: Some("sess-7".into()),
@@ -199,8 +219,8 @@ mod tests {
         let body = MessageBody::EventsBody(EventsPayload::BrowseRequest(EventsBrowseRequest {
             origins: Some(vec!["code_studio".into(), "api".into()]),
             actor_id: Some("key-42".into()),
-            org_id: None,
-            session_id: None,
+            org_id: Some("org-a".into()),
+            session_id: Some("sess-7".into()),
             correlation_id: Some("corr-9".into()),
             from_ms: Some(1),
             to_ms: Some(2),
