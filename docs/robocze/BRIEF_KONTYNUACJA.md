@@ -205,6 +205,9 @@ Nie wchłaniaj ich po cichu. Jeśli którąś ruszysz, powiedz wprost, że to na
 4. **Sześć testów `sync::`** pada wyłącznie przy równoległym pełnym przebiegu; pod
    `--test-threads=1` przechodzą. Zagłodzenie sesji mesh z realnymi timeoutami.
 5. **`repository::list_flow_executions` nie ma wołającego.**
+6. **`dispatch::stream::tests::lidar_local_robot_subscribe_streams_frame` pada na czystym HEAD**
+   (niezgodność bajtów 20–27 ładunku, `src/dispatch/stream.rs:1297`). Znalezione przez krytyka
+   pochodzenia, niezwiązane z żadnym z naszych torów.
 
 ---
 
