@@ -1183,3 +1183,56 @@ z konstrukcji. Krytyk to rozróżnił zamiast policzyć jako lukę.
 3. **Żaden test nie asertuje przypadków `None`.** Dokumentacja twierdzi, że `ttft_ms`/`decode_ms`
    są `None`, nigdy zerem, gdy brakuje `request_started` albo wiadomość się nie skończyła.
    Nigdzie nie ma asercji na `None` — a to ta sama własność „uczciwości", którą M2 dostało.
+
+---
+
+## Runda: R1 trwała kolejka `jobs.db` — ślepy krytyk (2026-08-21)
+
+**Werdykt: DOES NOT MEET BAR.** R1.1–R1.4 spełnione, **R1.5 i R1.6 nie**.
+Tor był w briefie oznaczony jako „gotowy, runda 2" — nie był.
+
+**Odpowiedź na pytanie 2 znowu rozszczepiona:**
+- „przeżywa restart i jest dokańczane" — **PILNOWANE**. Rozbicie `claim` na `SELECT`+`UPDATE`
+  w dwóch osobnych uchwytach pisarza (czyli to, co widzi drugi PROCES) czerwieni test
+  komunikatem „a job was claimed twice — left: 72, right: 64". Test wymusza REALNĄ rywalizację
+  (64 zadania, dwa wątki kręcące się do wyczerpania), a trwałość jest sprawdzana na PRAWDZIWYM
+  pliku (mutacja „otwórz bazę w pamięci" czerwieni dokładnie jeden test).
+- „jest poprawnie zamykane, gdy NIE MOŻE być dokończone" — **NIEPILNOWANE**. Zapisanie sieroty
+  jako `"success"` z pustym błędem: **19 zielonych**. `continue` na pierwszej linii pętli, czyli
+  reconcile nie robi NIC: **wszystkie realne testy zielone**.
+
+**R1.5 NIE DO NAPRAWY BEZ BRAMKI.** Addon i Projekty mają **dwie niezależne implementacje
+kolejki**: inny magazyn (`<data>/jobs.db` vs tabela w SQLite addona), inny `claim`
+(`UPDATE … RETURNING` vs `SELECT` + warunkowy `UPDATE` + `rows_affected`), inna reguła sierot
+(`owner_instance <> instance_id()` vs czysta heurystyka czasowa `updated_at < now - 2400s`),
+inny sterownik, inny stan terminalny (DELETE vs pozostawienie wiersza). Wspólna jest wyłącznie
+**bramka współbieżności** `ingest_gate::acquire()` — to jeden punkt zwężenia, ale nie kolejka
+i nie czyni ingestu addona trwałym. Ujednolicenie = zmiana migracji `ingest_jobs` addona =
+**zmiana bundle hash** = bramka człowieka. **Zatrzymane na bramce, do decyzji.**
+
+**R1.6:** stałe są uporządkowane poprawnie i każda strona ma komentarz nazywający drugą, ale
+zmiana `max_runtime_seconds` z 1800 na 3000 (czyli DŁUŻEJ niż okno reclaimu 2400 s — legalnie
+działający drain zostaje odebrany i jego artefakty sprzątnięte w locie) zostawia **9 zielonych**.
+Dwa komentarze w dwóch crate'ach to nie jest asercja.
+
+### Znaleziska poza kryteriami — w tym DWA prawdziwe błędy produkcyjne
+
+1. **Źródło zostaje NA ZAWSZE w stanie `indexing` po awarii.** `reconcile_orphans` najpierw
+   kasuje osierocony wiersz kolejki, potem `project_db::open` odpala hook, który widzi, że
+   zadania już nie ma w kolejce, i zapisuje `failed`. Po powrocie strzeżony `finish_ingest_job`
+   zwraca **false**, więc `set_source_status(…, "error", …)` w tym samym strażniku jest
+   **pomijany**, a `recover_orphaned_jobs` źródła nie dotyka. Zadanie kończy jako `failed`,
+   źródło zostaje `indexing` **na stałe**. To jest ten sam martwy kod, który mutacja M9
+   pokazała jako niepilnowany — jest martwy także w produkcji.
+2. **Kolejka NIE JEST FIFO poniżej milisekundy.** `enqueued_at_ms` ma rozdzielczość
+   milisekundy, a `claim` i `jobs_ahead` rozstrzygają remisy przez `ORDER BY enqueued_at_ms, job_id`,
+   gdzie `job_id` to **losowy UUID**. Zadania z tej samej milisekundy są obsługiwane w losowej
+   kolejności, a `jobs_ahead` zaniża głębokość kolejki. Stąd test
+   `a_job_queued_behind_others_reports_the_wait` jest **~50% flaky** (zmierzone: 16/30 przebiegów
+   izolowanych). Flaky test w drzewie jest gorszy niż brak testu.
+3. `announce_queue_wait` połyka błędy kolejki: `jobs_ahead(...).unwrap_or_default()` zamienia
+   nieudany odczyt w `ahead = 0`, czyli „brak kolejki".
+4. **`services/ingest_gate.rs` nie ma ANI JEDNEGO testu** — a jest jednym z pięciu plików toru.
+5. Kolejka nie ma puli odczytu (`Db::from_connection`), więc każdy `is_pending`/`jobs_ahead`
+   serializuje się z każdym `claim` — wbrew temu, co `db/mod.rs:112-130` opisuje jako właściwy
+   kształt bazy pomocniczej.
