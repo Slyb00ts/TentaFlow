@@ -180,6 +180,14 @@ mod serde_array64 {
 // with "unsupported payload" and a stale bot would drop Transcript chunks, so the
 // sidecar/Core pair must not mix versions.
 //
+// From the events-browser side: `MessageBody` gained `EventsBody(EventsPayload)`
+// (Zarzadzanie -> Zdarzenia, reading `run_events`). Appended at the enum's end,
+// and ciborium tags variants by NAME, so no existing message re-encodes — but a
+// stale peer has no such variant and cannot decode the browse request at all.
+// No separate v25: 24 has not shipped, so it still describes the contract that
+// will, and a second bump would only invalidate handshakes between two nodes
+// that carry the same code.
+//
 // Both turn into one loud handshake refusal, which is the failure mode
 // "rebuild all mesh nodes together" (CLAUDE.md) assumes.
 pub const SCHEMA_VERSION: u16 = 24;

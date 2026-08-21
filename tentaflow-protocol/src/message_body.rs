@@ -8162,6 +8162,14 @@ pub enum MessageBody {
     // Appended at the END of the enum (ciborium tags by variant index). The
     // reply reuses `FlowDetailResponse`.
     FlowFactoryRestoreRequestBody(FlowFactoryRestoreRequest),
+
+    // ----- Zarzadzanie -> Zdarzenia (przegladarka logu zdarzen przebiegow) -----
+    // Appended at the END of the enum. Ciborium tags an externally-tagged enum
+    // by variant NAME (pinned by `events::tests::message_body_is_tagged_by_
+    // variant_name`), so appending never disturbs an existing variant and
+    // renaming one would break every peer. ONE variant for the whole family
+    // (browse + one run's timeline) in `EventsPayload`.
+    EventsBody(crate::events::EventsPayload),
 }
 
 // =============================================================================

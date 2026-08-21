@@ -33,6 +33,7 @@ pub mod camera_admin;
 pub mod camera_detections;
 pub mod code_studio;
 pub mod compliance_admin;
+pub mod events_browser;
 pub mod handlers;
 pub mod legal_admin;
 pub mod meeting_live_broadcast;
@@ -1683,6 +1684,12 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
             tentaflow_protocol::VisionImportPayload::ImportResponse(_) => {
                 "VisionImportModelResponse"
             }
+        },
+        MessageBody::EventsBody(p) => match p {
+            tentaflow_protocol::EventsPayload::BrowseRequest(_) => "EventsBrowseRequest",
+            tentaflow_protocol::EventsPayload::BrowseResponse(_) => "EventsBrowseResponse",
+            tentaflow_protocol::EventsPayload::RunRequest(_) => "EventsRunRequest",
+            tentaflow_protocol::EventsPayload::RunResponse(_) => "EventsRunResponse",
         },
         MessageBody::StorageAdminBody(p) => match p {
             tentaflow_protocol::StorageAdminPayload::OverviewRequest => "StorageOverviewRequest",

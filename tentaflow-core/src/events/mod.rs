@@ -8,10 +8,12 @@
 // The store is `store` + `db`; `progress_log` is what fills it, by subscribing
 // to the flow engine's progress broadcast (§2.6) and translating it — no new
 // instrumentation anywhere, every timing a difference between two rows
-// (invariant 5). `metrics` reads those differences back out (§2.7). The browser
-// (§2.10) is a separate track.
+// (invariant 5). `metrics` reads those differences back out (§2.7). `browse` is
+// the cross-run query the Events browser (§2.10) reads through
+// `dispatch/events_browser.rs`; `store::read_run` stays the per-run cursor.
 
 pub mod audit_outbox;
+pub mod browse;
 pub mod db;
 pub mod metrics;
 pub mod progress_log;
@@ -22,9 +24,11 @@ mod test_support;
 
 use anyhow::Result;
 
+pub use browse::{browse, EventCursor, EventFilter, EventPage};
 pub use store::{
-    append, append_in_tx, assistant_body_setting_key, read_run, AppendedEvent, AuditEnvelope,
-    BodyOmission, EventKind, EventPayload, ResponseBody, RunEvent, StoredEvent,
+    append, append_in_tx, assistant_body_setting_key, read_run, run_actor_user_id, AppendedEvent,
+    AuditEnvelope, BodyOmission, EventKind, EventPayload, ResponseBody, RunEvent, StoredEvent,
+    MAX_READ_LIMIT,
 };
 
 /// Opens `<data>/events.db`, publishes the pool and STARTS everything the log

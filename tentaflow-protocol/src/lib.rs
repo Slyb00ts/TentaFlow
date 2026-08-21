@@ -21,6 +21,7 @@ pub mod cbor;
 pub mod code_studio;
 pub mod compliance;
 pub mod envelope;
+pub mod events;
 pub mod legal;
 pub mod mesh;
 pub mod message_body;
@@ -782,6 +783,10 @@ pub use profiling::{
     ProfilingSessionsResponse, ProfilingSkippedCollector, ProfilingStartRequest,
     ProfilingStartResponse, ProfilingStopRequest, ProfilingStopResponse,
     ProfilingValidateSudoRequest, ProfilingValidateSudoResponse, TimelineEvent, TransferKind,
+};
+pub use events::{
+    EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
+    EventsRunRequest, EventsRunResponse,
 };
 pub use storage::{
     StorageAdminPayload, StorageBrowseRequest, StorageBrowseResponse, StorageCategoryInfo,

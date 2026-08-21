@@ -43,8 +43,10 @@ use crate::code_studio::redact;
 use crate::db::{repository, DbPool};
 use crate::flow_engine::dispatcher::{ActorKind, FlowActor, FlowOrigin, FlowRequestMeta};
 
-/// Largest page `read_run` will return, whatever the caller asks for.
-const MAX_READ_LIMIT: usize = 1000;
+/// Largest page ANY reader of `run_events` will return, whatever the caller
+/// asks for — `read_run` and the browse query share it, so no entry point can
+/// turn a page request into a full dump of the log.
+pub const MAX_READ_LIMIT: usize = 1000;
 
 /// Prefix of the `settings` key that opts ONE organisation in to storing
 /// assistant response bodies on the timeline. The full key is
@@ -666,6 +668,95 @@ fn write_event(
     })
 }
 
+/// The columns every reader of `run_events` selects, in the order
+/// [`read_stored_row`] expects them. One constant so the browse query and the
+/// per-run cursor cannot drift into different column orders — the kind of bug
+/// that turns a `node_id` into a `call_id` silently.
+pub(super) const STORED_COLUMNS: &str = "run_id, seq, at_ms, kind, origin, actor_kind, actor_id, \
+     actor_user_id, org_id, correlation_id, session_id, node_id, call_id, payload_json";
+
+/// Raw column tuple, before `kind` and `payload_json` are parsed.
+///
+/// Split from the parsing because `query_map` may only fail with a
+/// `rusqlite::Error`, while an unreadable kind or payload is OUR error with our
+/// message — and a row that cannot be parsed must name the run and seq it came
+/// from, which is only knowable after the columns are read.
+pub(super) type StoredRow = (
+    String,
+    i64,
+    i64,
+    String,
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    String,
+);
+
+pub(super) fn read_stored_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<StoredRow> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+        row.get(6)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+        row.get(11)?,
+        row.get(12)?,
+        row.get(13)?,
+    ))
+}
+
+/// Turns a raw row into a [`StoredEvent`], REFUSING a `kind` slug this build
+/// does not know rather than guessing one. A stored value we cannot read is a
+/// gap in the log, and a fallback would report it as some other kind of event.
+pub(super) fn decode_stored_row(raw: StoredRow) -> Result<StoredEvent> {
+    let (
+        run_id,
+        seq,
+        at_ms,
+        kind,
+        origin,
+        actor_kind,
+        actor_id,
+        actor_user_id,
+        org_id,
+        correlation_id,
+        session_id,
+        node_id,
+        call_id,
+        payload_json,
+    ) = raw;
+    let kind = EventKind::from_slug(&kind)
+        .ok_or_else(|| anyhow!("run {run_id} seq {seq} has unknown kind '{kind}'"))?;
+    Ok(StoredEvent {
+        run_id,
+        seq,
+        at_ms,
+        kind,
+        origin,
+        actor_kind,
+        actor_id,
+        actor_user_id,
+        org_id,
+        correlation_id,
+        session_id,
+        node_id,
+        call_id,
+        payload: from_json(&payload_json)?,
+    })
+}
+
 /// Timeline cursor: everything of one run after `after_seq`, oldest first.
 pub fn read_run(
     pool: &DbPool,
@@ -675,71 +766,40 @@ pub fn read_run(
 ) -> Result<Vec<StoredEvent>> {
     let limit = limit.clamp(1, MAX_READ_LIMIT);
     let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
-    let mut stmt = conn.prepare(
-        "SELECT run_id, seq, at_ms, kind, origin, actor_kind, actor_id, actor_user_id, \
-          org_id, correlation_id, session_id, node_id, call_id, payload_json \
-         FROM run_events WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
-    )?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {STORED_COLUMNS} FROM run_events \
+         WHERE run_id = ?1 AND seq > ?2 ORDER BY seq LIMIT ?3",
+    ))?;
     let rows = stmt.query_map(
         rusqlite::params![run_id, after_seq, limit as i64],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, String>(3)?,
-                row.get::<_, String>(4)?,
-                row.get::<_, String>(5)?,
-                row.get::<_, Option<String>>(6)?,
-                row.get::<_, Option<String>>(7)?,
-                row.get::<_, Option<String>>(8)?,
-                row.get::<_, Option<String>>(9)?,
-                row.get::<_, Option<String>>(10)?,
-                row.get::<_, Option<String>>(11)?,
-                row.get::<_, Option<String>>(12)?,
-                row.get::<_, String>(13)?,
-            ))
-        },
+        read_stored_row,
     )?;
 
     let mut events = Vec::new();
     for row in rows {
-        let (
-            run_id,
-            seq,
-            at_ms,
-            kind,
-            origin,
-            actor_kind,
-            actor_id,
-            actor_user_id,
-            org_id,
-            correlation_id,
-            session_id,
-            node_id,
-            call_id,
-            payload_json,
-        ) = row?;
-        let kind = EventKind::from_slug(&kind)
-            .ok_or_else(|| anyhow!("run {run_id} seq {seq} has unknown kind '{kind}'"))?;
-        events.push(StoredEvent {
-            run_id,
-            seq,
-            at_ms,
-            kind,
-            origin,
-            actor_kind,
-            actor_id,
-            actor_user_id,
-            org_id,
-            correlation_id,
-            session_id,
-            node_id,
-            call_id,
-            payload: from_json(&payload_json)?,
-        });
+        events.push(decode_stored_row(row?)?);
     }
     Ok(events)
+}
+
+/// Which principal a run belongs to, for the browser's per-run ACL.
+///
+/// `Ok(None)` = no such run on this node. `Ok(Some(None))` = the run exists but
+/// names no user (a camera, the scheduler, an unbound service key), which is
+/// NOT the same as "belongs to the caller" and must not be read as one.
+///
+/// Answered from the FIRST event of the run: `request_started` is what an entry
+/// point stamps the actor onto, and the primary key `(run_id, seq)` makes that
+/// lookup a single index seek.
+pub fn run_actor_user_id(pool: &DbPool, run_id: &str) -> Result<Option<Option<String>>> {
+    let conn = pool.read().map_err(|e| anyhow!("events db read: {e}"))?;
+    conn.query_row(
+        "SELECT actor_user_id FROM run_events WHERE run_id = ?1 ORDER BY seq LIMIT 1",
+        rusqlite::params![run_id],
+        |row| row.get::<_, Option<String>>(0),
+    )
+    .optional()
+    .map_err(|e| anyhow!("events db read: {e}"))
 }
 
 pub(crate) fn to_json<T: Serialize>(value: &T) -> Result<String> {
