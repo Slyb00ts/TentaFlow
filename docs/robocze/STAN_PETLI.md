@@ -1100,3 +1100,44 @@ Drobniejsze: komentarz w `tentaflow-protocol/src/events.rs` twierdzi, że wiersz
 `payload_json` **„VERBATIM"** — nieprawda, `to_wire` re-serializuje zdekodowaną wartość, więc
 wiersz zapisany przez nowszy build gubi nieznane pole znanego rodzaju. Komentarz mijający się
 z prawdą jest gorszy niż jego brak.
+
+### Poprawka luk E3/E4/E5 + rozstrzygnięcie dwóch modeli własności
+
+Wszystkie trzy luki zamknięte testami z dowodem mutacyjnym; **żadne zachowanie produkcyjne nie
+zostało zmienione** — w każdym przypadku kod był poprawny, brakowało wyłącznie strażnika.
+
+Najważniejszy dowód, E4: przy mutacji „`actor_id` z ładunku kasuje ograniczenie" czerwień
+wypisuje **sam wyciek** — strona marka zawierająca przebieg anny. Test wysyła kolejno cudzy
+`actor_id`, `search` trafiający wyłącznie w cudzy `run_id`, i wszystkie filtry naraz wycelowane
+w cudze dane; na koniec marek podaje WŁASNY `actor_id` i dostaje swój wiersz — żeby odmowy były
+dowodem działania ACL, a nie filtra, który po prostu nic nie trafia.
+
+**Dwa modele własności: NIE ma dziury.** Rozstrzygnięcie oparte na sprawdzalnym inwariancie,
+nie na intuicji:
+
+1. `run_events` ma **dokładnie jednego** pisarza produkcyjnego (`progress_log::write_batch`);
+   żadne miejsce w drzewie nie robi UPDATE na `actor_user_id`.
+2. Każdy wiersz jest stemplowany z `RunProvenance` zakresu, nigdy wyprowadzany ze zdarzenia.
+3. `bind_run_provenance` dopuszcza przepięcie **tylko przy `same_principal`**; inaczej slot
+   przechodzi w `ScopeProvenance::Contested`, `run_provenance()` zwraca `None`, a subskrybent
+   przestaje cokolwiek zapisywać. Przepinanie zakresu jest realne, ale zmienia `run_id`,
+   nigdy właściciela.
+
+Test `a_second_principal_cannot_add_rows_to_a_live_run` pinuje to w PISARZU (tam taki przebieg
+by się urodził), z kontrolą pozytywną, żeby „brak nowych wierszy" nie mógł wynikać z martwego
+subskrybenta, i z asercją międzymodelową: `run_actor_user_id` (odpowiedź z najniższego `seq`)
+równa się `actor_user_id` KAŻDEGO wiersza.
+
+### Dwie miny na przyszłość — nie do naprawy dziś, do zapamiętania
+
+- **`mesh/inference_proxy.rs` przekazuje `request_id` OD SIDECARA** do `meeting::flow_turn::run_flow_turn`
+  → `FlowRequestMeta::new`. To `run_id` **podany przez klienta**. Dziś nie dociera do logu
+  zdarzeń, bo `flow_turn` nie ustawia `progress_sink`, a `begin_run` wychodzi wcześniej.
+  **Gdyby tura spotkania kiedykolwiek dostała progress sink, dwa boty mogłyby złożyć tury pod
+  jednym `run_id` z różnymi `owner_user_id` — i to byłby żywy odczyt międzyprincipalowy.**
+  To jest DOKŁADNIE ta jedna zmiana, która łamie inwariant powyżej.
+- `services/camera_ingest/vision_analysis.rs::camera_flow_request_meta` buduje
+  `request_id = format!("cam-{camera_id}")` — `run_id` nieunikalny per przebieg. Nieszkodliwe
+  (aktor to zawsze `system_component`, więc `actor_user_id` jest NULL, i ścieżka kamery nie
+  ustawia progress sinka), ale to jedyne miejsce, gdzie założenie „run id to świeży uuid"
+  nie trzyma się z konstrukcji.
