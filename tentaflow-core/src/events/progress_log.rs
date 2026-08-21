@@ -296,10 +296,13 @@ impl ScopeState {
     /// subscriber BEFORE the engine touches the first node, so the first
     /// `NodeStarted` under a fresh binding is the earliest instant of that run
     /// this side can observe, and nothing of the run precedes it. Its four
-    /// descriptors stay `None` — `FlowRequestMeta` carries no model, flow id,
-    /// service type or modality, and this file will not guess any of them
-    /// (invariant 6). What the row does carry is the accountability half the
-    /// audit mirror exists for: origin, actor, tenant and correlation id.
+    /// descriptors are COPIED from the run's `RunDescriptor`, minted by the
+    /// dispatcher in the same call that bound the provenance: this is the "which
+    /// model" half of the question the audit mirror exists to answer, and the
+    /// stream carries none of it. A descriptor field the dispatcher left empty
+    /// stays empty here — a run reached by flow id was resolved from no model
+    /// key, and a direct capability call ran no flow — because a borrowed value
+    /// in an audit row is worse than an absent one (invariant 6).
     ///
     /// **`assistant_message` is a streaming node finishing.** A node that
     /// produced a `FirstToken` was generating the answer, so its `NodeFinished`
@@ -329,10 +332,10 @@ impl ScopeState {
                         provenance,
                         at_ms,
                         EventPayload::RequestStarted {
-                            model: None,
-                            flow_id: None,
-                            service_type: None,
-                            modality: None,
+                            model: provenance.descriptor.model.clone(),
+                            flow_id: provenance.descriptor.flow_id.clone(),
+                            service_type: provenance.descriptor.service_type.clone(),
+                            modality: provenance.descriptor.modality.clone(),
                         },
                         None,
                         None,
@@ -499,11 +502,24 @@ mod tests {
     use crate::events::store::{read_run, StoredEvent};
     use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::dispatchers::ProgressSink;
-    use crate::flow_engine::progress_broker::BrokerProgressSink;
+    use crate::flow_engine::progress_broker::{BrokerProgressSink, RunDescriptor};
 
     const SCOPE: &str = "scope-under-test";
 
+    /// The shape `try_dispatch` binds: a run resolved from the
+    /// `{model}:{service_type}:{modality}` key onto a user-defined flow, so all
+    /// four descriptors are facts the dispatcher held.
+    fn descriptor() -> RunDescriptor {
+        RunDescriptor::resolved("qwen3-8b", "llm", "text").with_flow("flow-42")
+    }
+
     fn provenance(run_id: &str) -> RunProvenance {
+        provenance_with(run_id, descriptor())
+    }
+
+    /// The same principal running something else — the shape a second dispatch
+    /// under one session scope produces.
+    fn provenance_with(run_id: &str, descriptor: RunDescriptor) -> RunProvenance {
         let mut meta = FlowRequestMeta::new(
             run_id,
             FlowOrigin::Api,
@@ -512,7 +528,7 @@ mod tests {
         meta.org_id = Some("org-3".into());
         meta.correlation_id = Some("corr-1".into());
         meta.session_id = Some(SCOPE.into());
-        RunProvenance::from_meta(&meta)
+        RunProvenance::from_meta(&meta, descriptor)
     }
 
     /// A DIFFERENT principal naming the SAME run — the one shape that could put
@@ -525,7 +541,7 @@ mod tests {
         );
         meta.org_id = Some("org-9".into());
         meta.session_id = Some(SCOPE.into());
-        RunProvenance::from_meta(&meta)
+        RunProvenance::from_meta(&meta, descriptor())
     }
 
     /// Wires a broker, a sink and a log over a fresh events database and starts
@@ -742,23 +758,13 @@ mod tests {
             ],
             "the timeline shape §2.7 measures over: {rows:?}"
         );
-        // The opening row carries the accountability stamp and nothing invented:
-        // no engine event names the model or the flow, so those stay absent.
+        // The opening row carries the accountability stamp — both halves of it,
+        // the actor and what the actor ran. `the_opening_row_names_what_the_
+        // dispatcher_resolved` below pins the descriptor half on its own.
         match &rows[0].payload {
-            EventPayload::RequestStarted {
-                model,
-                flow_id,
-                service_type,
-                modality,
-            } => {
+            EventPayload::RequestStarted { model, .. } => {
                 assert_eq!(rows[0].actor_id.as_deref(), Some("key-42"));
-                assert!(
-                    model.is_none()
-                        && flow_id.is_none()
-                        && service_type.is_none()
-                        && modality.is_none(),
-                    "descriptors the stream does not carry must stay empty"
-                );
+                assert_eq!(model.as_deref(), Some("qwen3-8b"));
             }
             other => panic!("expected a request_started payload, got {other:?}"),
         }
@@ -789,6 +795,117 @@ mod tests {
             )
             .expect("count outbox");
         assert_eq!(queued, 1, "the opening of a run is mirrored for audit");
+    }
+
+    /// §2.8 — the accountability row answers "which actor, from which origin,
+    /// AGAINST WHICH MODEL". The last third of that question is the run's
+    /// `RunDescriptor`, minted by the dispatcher next to the provenance, and it
+    /// has to survive the whole way to disk: the first cut of this translator
+    /// hardcoded all four fields to `None`, and every store-side test built its
+    /// payload by hand, so the empty audit rows the live path produced were
+    /// invisible.
+    ///
+    /// The assertion is therefore driven END TO END — bind, emit through the
+    /// real `ProgressSink`, read the row back — and compares against the bound
+    /// descriptor rather than against literals of its own, so a translator that
+    /// drops any single field fails here.
+    #[tokio::test]
+    async fn the_opening_row_names_what_the_dispatcher_resolved() {
+        let h = Harness::start("run-descriptor");
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "llm-1".into(),
+            node_type: "llm".into(),
+        });
+        let rows = h.rows("run-descriptor", 2).await;
+        let bound = descriptor();
+        match &rows[0].payload {
+            EventPayload::RequestStarted {
+                model,
+                flow_id,
+                service_type,
+                modality,
+            } => {
+                assert_eq!(
+                    (
+                        model.clone(),
+                        flow_id.clone(),
+                        service_type.clone(),
+                        modality.clone()
+                    ),
+                    (
+                        bound.model.clone(),
+                        bound.flow_id.clone(),
+                        bound.service_type.clone(),
+                        bound.modality.clone()
+                    ),
+                    "the opening row must carry the run's descriptor, not empty fields"
+                );
+            }
+            other => panic!("expected a request_started payload, got {other:?}"),
+        }
+
+        // The audit mirror carries the payload verbatim into `audit_log.details`
+        // (`audit_outbox::write_audit_row`), so what is empty here is empty in
+        // the organisation's audit trail. Asserted on the queued copy: the
+        // delivery loop is not running in this test, and the copy is what it
+        // would deliver.
+        let queued: String = h
+            .pool
+            .read()
+            .expect("read")
+            .query_row(
+                "SELECT payload_json FROM audit_outbox WHERE run_id = ?1",
+                rusqlite::params!["run-descriptor"],
+                |row| row.get(0),
+            )
+            .expect("the mirrored copy");
+        for expected in [
+            r#""model":"qwen3-8b""#,
+            r#""flow_id":"flow-42""#,
+            r#""service_type":"llm""#,
+            r#""modality":"text""#,
+        ] {
+            assert!(
+                queued.contains(expected),
+                "the audit copy dropped {expected}: {queued}"
+            );
+        }
+    }
+
+    /// The other half of the same rule: what the dispatcher did not know stays
+    /// empty. A run reached by flow id was resolved from no model routing key,
+    /// so the row names the flow and says nothing about a model — the log
+    /// COPIES the descriptor and never fills a gap in it (invariant 6).
+    #[tokio::test]
+    async fn a_run_reached_by_flow_id_names_only_the_flow() {
+        let h = Harness::start("run-descriptor-seed");
+        h.broker.bind_run_provenance(
+            SCOPE,
+            provenance_with(
+                "run-by-id",
+                RunDescriptor::default().with_flow("harness-flow"),
+            ),
+        );
+        h.emit(ProgressEvent::NodeStarted {
+            node_id: "trigger".into(),
+            node_type: "trigger".into(),
+        });
+        let rows = h.rows("run-by-id", 2).await;
+        match &rows[0].payload {
+            EventPayload::RequestStarted {
+                model,
+                flow_id,
+                service_type,
+                modality,
+            } => {
+                assert_eq!(flow_id.as_deref(), Some("harness-flow"));
+                assert!(
+                    model.is_none() && service_type.is_none() && modality.is_none(),
+                    "a descriptor the dispatcher left empty must not be filled in here"
+                );
+            }
+            other => panic!("expected a request_started payload, got {other:?}"),
+        }
     }
 
     /// Defect of the first cut, pinned: `at_ms` is the instant of EMISSION.

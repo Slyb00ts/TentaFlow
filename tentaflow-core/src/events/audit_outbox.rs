@@ -431,6 +431,13 @@ mod tests {
         assert_eq!(resource, "r-1");
         assert!(details.contains("\"origin\":\"code_studio\""), "{details}");
         assert!(details.contains("\"actor_user_id\":\"u-1\""), "{details}");
+        // "against which model" — the descriptors ride into `details` inside the
+        // embedded payload, so an entry with an empty one is an audit row that
+        // cannot say what was run. The live producer of that payload is
+        // `progress_log::translate` (`the_opening_row_names_what_the_dispatcher_
+        // resolved`); this end asserts the mirror does not drop it on the way.
+        assert!(details.contains("\"model\":\"qwen3\""), "{details}");
+        assert!(details.contains("\"flow_id\":\"f-1\""), "{details}");
         assert_eq!(hash_len, 32, "the row is not part of the audit chain");
     }
 

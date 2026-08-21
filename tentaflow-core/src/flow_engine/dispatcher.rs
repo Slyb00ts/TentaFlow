@@ -62,6 +62,7 @@ use crate::flow_engine::node_adapters::{
     VisionParseNodeAdapter, VisionParsePagesNodeAdapter, WordExtractNodeAdapter,
     WorkspaceContextNodeAdapter,
 };
+use crate::flow_engine::progress_broker::RunDescriptor;
 use crate::flow_engine::resolver;
 use crate::flow_engine::subflow_runner::{SubflowRunner, SubflowRunnerSlot};
 use crate::flow_engine::types::FlowNode;
@@ -521,11 +522,15 @@ struct ContextFactory {
 }
 
 impl ContextFactory {
-    fn make_context(&self, meta: &FlowRequestMeta) -> ExecutionContext {
+    fn make_context(&self, meta: &FlowRequestMeta, descriptor: RunDescriptor) -> ExecutionContext {
         // §2.5 — the one place every dispatch entry passes through holding the
         // authorized meta. The event log copies the provenance bound here; a
         // `ProgressEvent` carries none, and nothing a node writes can reach it.
-        crate::flow_engine::progress_broker::begin_run(meta);
+        // `descriptor` travels the same way and for the same reason: the
+        // resolved model and the compiled flow exist only in the caller's
+        // frame, and the log's opening row is an audit record that may not
+        // reconstruct them from anything a node could have written.
+        crate::flow_engine::progress_broker::begin_run(meta, descriptor);
         ExecutionContext {
             request_id: meta.request_id.clone(),
             execution_id: 0,
@@ -824,9 +829,14 @@ impl FlowDispatcher {
                         flow_id: cached.flow.id.clone(),
                     });
                 }
-                self.run_blocking(cached.compiled.clone(), initial, meta)
-                    .await
-                    .map_err(DispatchError::from)
+                self.run_blocking(
+                    cached.compiled.clone(),
+                    initial,
+                    meta,
+                    RunDescriptor::resolved(model_name, service_type, modality),
+                )
+                .await
+                .map_err(DispatchError::from)
             }
             ResolvedFlow::NotFound => {
                 // Brak jawnego flow — model wykonywany BEZPOŚREDNIO na
@@ -901,9 +911,17 @@ impl FlowDispatcher {
         if !self.acl_allow(&flow_id, &meta) {
             return Err(DispatchError::Denied { flow_id });
         }
-        self.run_blocking(cached.compiled.clone(), initial, meta)
-            .await
-            .map_err(DispatchError::from)
+        // The caller named a flow outright, so no model, service type or
+        // modality was resolved for this run; `run_blocking` fills in the flow
+        // that executes and the rest stays empty rather than guessed.
+        self.run_blocking(
+            cached.compiled.clone(),
+            initial,
+            meta,
+            RunDescriptor::default(),
+        )
+        .await
+        .map_err(DispatchError::from)
     }
 
     /// Background-run variant (Harness §3.6/§3.7): runs the agent harness flow
@@ -944,7 +962,12 @@ impl FlowDispatcher {
                 });
             }
         };
-        let ctx = self.ctx_factory.make_context(&meta);
+        // A harness flow is named outright by the run manager, so the only
+        // descriptor fact this run has is the flow that executes.
+        let ctx = self.ctx_factory.make_context(
+            &meta,
+            RunDescriptor::default().with_flow(&compiled.flow_id),
+        );
         execute_blocking(
             self.db.clone(),
             compiled,
@@ -995,12 +1018,17 @@ impl FlowDispatcher {
         };
         if !compiled.is_streaming {
             let outcome = self
-                .run_blocking(compiled, initial, meta)
+                .run_blocking(compiled, initial, meta, RunDescriptor::default())
                 .await
                 .map_err(DispatchError::from)?;
             return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
         }
-        let ctx = self.ctx_factory.make_context(&meta);
+        // Dispatched by flow id: no model routing key was resolved, so the flow
+        // is the whole descriptor.
+        let ctx = self.ctx_factory.make_context(
+            &meta,
+            RunDescriptor::default().with_flow(&compiled.flow_id),
+        );
         let stream_exec = execute_streaming(
             self.db.clone(),
             compiled,
@@ -1037,7 +1065,12 @@ impl FlowDispatcher {
                     // User-defined blocking-only flow — wykonaj blocking
                     // i opakuj outcome jako single-chunk stream.
                     let outcome = self
-                        .run_blocking(cached.compiled.clone(), initial, meta)
+                        .run_blocking(
+                            cached.compiled.clone(),
+                            initial,
+                            meta,
+                            RunDescriptor::resolved(model_name, service_type, modality),
+                        )
                         .await
                         .map_err(DispatchError::from)?;
                     return Ok(wrap_blocking_as_stream(outcome, self.blobs()));
@@ -1051,7 +1084,13 @@ impl FlowDispatcher {
                 // single-chunk stream (parytet z user-defined blocking flow).
                 let node = direct_node(service_type, model_name, modality)?;
                 if node.node_type == "llm" {
-                    let ctx = self.ctx_factory.make_context(&meta);
+                    // Direct capability streaming: no flow was resolved, so
+                    // `flow_id` stays absent (same reason as
+                    // `run_direct_blocking`).
+                    let ctx = self.ctx_factory.make_context(
+                        &meta,
+                        RunDescriptor::resolved(model_name, service_type, modality),
+                    );
                     return execute_direct_streaming(
                         self.db.clone(),
                         node,
@@ -1079,7 +1118,11 @@ impl FlowDispatcher {
                 });
             }
         };
-        let ctx = self.ctx_factory.make_context(&meta);
+        let ctx = self.ctx_factory.make_context(
+            &meta,
+            RunDescriptor::resolved(model_name, service_type, modality)
+                .with_flow(&compiled.flow_id),
+        );
         let stream_exec = execute_streaming(
             self.db.clone(),
             compiled,
@@ -1097,8 +1140,15 @@ impl FlowDispatcher {
         compiled: Arc<CompiledFlow>,
         initial: FlowEnvelope,
         meta: FlowRequestMeta,
+        descriptor: RunDescriptor,
     ) -> Result<FlowExecutionOutcome> {
-        let ctx = self.ctx_factory.make_context(&meta);
+        // The flow id is taken from the flow about to execute, not from the id
+        // a caller asked for: the record names what ran. The rest of the
+        // descriptor is whatever the caller resolved on — empty for a dispatch
+        // by flow id, which went through no model routing key at all.
+        let ctx = self
+            .ctx_factory
+            .make_context(&meta, descriptor.with_flow(&compiled.flow_id));
         let flow_id = compiled.flow_id.clone();
         // Per-node 600 s (w executorze) + `max_iterations` w pętlach domykają
         // czas wykonania. Ten globalny `timeout` to wyłącznie backstop na
@@ -1209,7 +1259,14 @@ impl FlowDispatcher {
     ) -> std::result::Result<FlowExecutionOutcome, DispatchError> {
         let node = direct_node(service_type, model, modality)?;
         let node_type = node.node_type.clone();
-        let ctx = self.ctx_factory.make_context(&meta);
+        // No `flow_id`: this path runs ONE capability node straight on the
+        // executor because the resolver found no user-defined flow. There is no
+        // flow to name, and naming the synthetic node type instead would put a
+        // value in the audit row that matches no row in `flows`.
+        let ctx = self.ctx_factory.make_context(
+            &meta,
+            RunDescriptor::resolved(model, service_type, modality),
+        );
         match timeout(
             Duration::from_secs(FLOW_BACKSTOP_SECS),
             execute_direct_blocking(node, initial, ctx, self.registry.clone()),
@@ -1595,7 +1652,7 @@ fn stub_context_factory() -> ContextFactory {
 pub(crate) fn make_test_context(
     meta: &FlowRequestMeta,
 ) -> crate::flow_engine::node_adapter::ExecutionContext {
-    stub_context_factory().make_context(meta)
+    stub_context_factory().make_context(meta, RunDescriptor::default())
 }
 
 /// Walks a closed cycle over the variants of a fieldless enum, returning every
@@ -1685,7 +1742,7 @@ mod tests {
         let mut meta = FlowRequestMeta::new("req-1", FlowOrigin::Api, FlowActor::system());
         meta.addon_id = Some("inst-rag-1".to_string());
         meta.org_id = Some("org-7".to_string());
-        let ctx = factory.make_context(&meta);
+        let ctx = factory.make_context(&meta, RunDescriptor::default());
         assert_eq!(ctx.addon_id.as_deref(), Some("inst-rag-1"));
         assert_eq!(ctx.org_id.as_deref(), Some("org-7"));
     }
@@ -1695,7 +1752,7 @@ mod tests {
         let factory = stub_context_factory();
         // Domyślne meta (np. routing /v1 user / kamera / agent) — bez tożsamości.
         let meta = FlowRequestMeta::new("req-2", FlowOrigin::Api, FlowActor::system());
-        let ctx = factory.make_context(&meta);
+        let ctx = factory.make_context(&meta, RunDescriptor::default());
         assert!(ctx.addon_id.is_none());
         assert!(ctx.org_id.is_none());
     }
@@ -1821,7 +1878,7 @@ mod tests {
             FlowActor::system_component("cam-hall"),
         );
         meta.correlation_id = Some("server-corr".into());
-        let ctx = stub_context_factory().make_context(&meta);
+        let ctx = stub_context_factory().make_context(&meta, RunDescriptor::default());
 
         crate::flow_engine::executor::execute_blocking(
             forgery_test_db(),
@@ -1875,7 +1932,7 @@ mod tests {
                 crate::flow_engine::progress_broker::global_broker(),
             ),
         ));
-        let ctx = stub_context_factory().make_context(&meta);
+        let ctx = stub_context_factory().make_context(&meta, RunDescriptor::default());
 
         let mut registry = AdapterRegistry::new();
         registry.register(Arc::new(
@@ -1973,7 +2030,7 @@ mod tests {
             FlowActor::api_key("key-42", Some("user-7".to_string())),
         );
         meta.correlation_id = Some("corr-9".into());
-        let ctx = factory.make_context(&meta);
+        let ctx = factory.make_context(&meta, RunDescriptor::default());
         assert_eq!(ctx.origin, FlowOrigin::Api);
         assert_eq!(ctx.actor_kind, ActorKind::ApiKey);
         assert_eq!(ctx.actor_id.as_deref(), Some("key-42"));

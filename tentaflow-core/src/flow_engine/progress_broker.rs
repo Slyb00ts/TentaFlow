@@ -85,10 +85,73 @@ pub struct RunProvenance {
     pub org_id: Option<String>,
     pub correlation_id: Option<String>,
     pub session_id: Option<String>,
+    /// WHAT the run executes, the other half of the accountability question
+    /// (§2.8: "which actor, from which origin, against which model"). Minted by
+    /// the dispatcher at the same instant as this binding — see
+    /// [`RunDescriptor`].
+    pub descriptor: RunDescriptor,
+}
+
+/// Server-minted description of what a run executes: the model routing key it
+/// was resolved by and the flow that actually ran.
+///
+/// It is bound together with [`RunProvenance`] rather than derived later
+/// because the dispatcher is the ONLY place that holds these facts as facts.
+/// `FlowRequestMeta` does not carry them, a `ProgressEvent` carries nothing but
+/// a node id, and `envelope.meta` — the one other place a model name appears
+/// near a run — is writable by every node including a WASM addon block, so a
+/// value read from there could be chosen by the thing being audited
+/// (invariant 1). Every field here is passed BY THE DISPATCHER from the
+/// arguments it resolved on, and `flow_id` from the `CompiledFlow` it is about
+/// to execute.
+///
+/// A field is `None` when the run genuinely had no such fact, never as a
+/// stand-in: a flow dispatched by id was not resolved from a model routing key,
+/// and a direct capability call (`try_dispatch` with no user-defined flow) runs
+/// a single node on the executor with no flow at all. An absent field is a gap
+/// in the record; a borrowed one would be a false statement in an audit row
+/// (invariant 6).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RunDescriptor {
+    /// Model name the run was dispatched against — `None` for a run reached by
+    /// flow id, where no model resolution happened.
+    pub model: Option<String>,
+    /// The flow that executed — `None` for a direct capability call, which has
+    /// no flow.
+    pub flow_id: Option<String>,
+    /// Capability the model was addressed as (`llm`, `stt`, `tts`, …), the
+    /// second component of the resolver key.
+    pub service_type: Option<String>,
+    /// Third component of the resolver key, derived by the dispatcher from the
+    /// shape of the initial payload (`derive_modality`) or fixed by the caller
+    /// (`try_dispatch_with_modality`).
+    pub modality: Option<String>,
+}
+
+impl RunDescriptor {
+    /// The descriptor of a run resolved through the `{model}:{service_type}:
+    /// {modality}` key. `flow_id` stays empty until [`Self::with_flow`] names
+    /// the compiled flow, so a direct capability call keeps it absent.
+    pub fn resolved(model: &str, service_type: &str, modality: &str) -> Self {
+        Self {
+            model: Some(model.to_string()),
+            flow_id: None,
+            service_type: Some(service_type.to_string()),
+            modality: Some(modality.to_string()),
+        }
+    }
+
+    /// Names the flow that is about to execute. Taken from the `CompiledFlow`
+    /// itself rather than from the id a caller asked for, so the record names
+    /// what ran.
+    pub fn with_flow(mut self, flow_id: &str) -> Self {
+        self.flow_id = Some(flow_id.to_string());
+        self
+    }
 }
 
 impl RunProvenance {
-    pub fn from_meta(meta: &FlowRequestMeta) -> Self {
+    pub fn from_meta(meta: &FlowRequestMeta, descriptor: RunDescriptor) -> Self {
         Self {
             run_id: meta.request_id.clone(),
             origin: meta.origin,
@@ -98,6 +161,7 @@ impl RunProvenance {
             org_id: meta.org_id.clone(),
             correlation_id: meta.correlation_id.clone(),
             session_id: meta.session_id.clone(),
+            descriptor,
         }
     }
 
@@ -137,7 +201,11 @@ enum ScopeProvenance {
 /// the broadcast scope and attaches the event-log subscriber to that scope.
 ///
 /// Called from `ContextFactory::make_context`, the one place every dispatch
-/// entry passes through holding the authorized `FlowRequestMeta`. Two guards
+/// entry passes through holding the authorized `FlowRequestMeta`. The
+/// `descriptor` is the same call's answer to WHAT is being run: the dispatcher
+/// hands it in because it is the only layer holding the resolved model and the
+/// compiled flow, and by the time an event reaches the log neither is
+/// recoverable from anything but node-writable state. Two guards
 /// keep it to actual runs: a request with no `progress_sink` emits nothing at
 /// all (headless, tests), and `flow_depth > 0` is a capability hop re-entering
 /// the engine under the SAME scope — rebinding there would move the parent's
@@ -146,13 +214,13 @@ enum ScopeProvenance {
 /// Attaching before the flow starts is load-bearing: `ProgressBroker::publish`
 /// is a no-op for a scope nobody subscribed to, so a subscriber created after
 /// the first node started would miss the opening of the run.
-pub fn begin_run(meta: &FlowRequestMeta) {
+pub fn begin_run(meta: &FlowRequestMeta, descriptor: RunDescriptor) {
     if meta.progress_sink.is_none() || meta.flow_depth > 0 {
         return;
     }
     let scope = meta.progress_scope();
     let broker = global_broker();
-    broker.bind_run_provenance(&scope, RunProvenance::from_meta(meta));
+    broker.bind_run_provenance(&scope, RunProvenance::from_meta(meta, descriptor));
     if !crate::events::progress_log::attach_scope(&scope) {
         // Nothing is watching this scope and nothing will: a headless build
         // that never opened `events.db`, a synchronous test, or a log already
@@ -415,7 +483,10 @@ mod tests {
             let mut meta = FlowRequestMeta::new(run, FlowOrigin::Chat, FlowActor::user(user));
             meta.org_id = Some(format!("org-of-{user}"));
             meta.session_id = Some("shared-session".into());
-            broker.bind_run_provenance("shared-session", RunProvenance::from_meta(&meta));
+            broker.bind_run_provenance(
+                "shared-session",
+                RunProvenance::from_meta(&meta, RunDescriptor::resolved("m", "llm", "text")),
+            );
         };
 
         let broker = ProgressBroker::new();

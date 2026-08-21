@@ -158,7 +158,9 @@ mod tests {
         StreamProducerAdapter,
     };
     use crate::flow_engine::node_adapters::{OutputNodeAdapter, TriggerNodeAdapter};
-    use crate::flow_engine::progress_broker::{BrokerProgressSink, ProgressBroker, RunProvenance};
+    use crate::flow_engine::progress_broker::{
+        BrokerProgressSink, ProgressBroker, RunDescriptor, RunProvenance,
+    };
     use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::types::{FlowDataType, FlowNode};
 
@@ -168,7 +170,7 @@ mod tests {
         let mut meta = FlowRequestMeta::new(run_id, FlowOrigin::Chat, FlowActor::user("u-1"));
         meta.org_id = Some("org-1".into());
         meta.session_id = Some(SCOPE.into());
-        RunProvenance::from_meta(&meta)
+        RunProvenance::from_meta(&meta, RunDescriptor::resolved("m-1", "llm", "text"))
     }
 
     fn main_db() -> crate::db::DbPool {
