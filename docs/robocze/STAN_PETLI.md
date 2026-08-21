@@ -1052,3 +1052,51 @@ To jest też odpowiedź na regułę 5 CLAUDE.md („kasuj nieużywany kod"): fun
 pozostałością po usuniętym wołającym, tylko połową mechanizmu, którego drugiej połowy nie wolno
 zbudować bez zgody na migrację. Skasowanie ich byłoby utratą przetestowanej pracy, a podłączenie
 — uzbrojeniem błędu.
+
+---
+
+## Runda: przeglądarka zdarzeń (backend) — ślepy krytyk (2026-08-21)
+
+**Werdykt: DOES NOT MEET BAR.** E1, E2, E6, E7, E8 spełnione i realnie pilnowane.
+E3 częściowo, **E4 wcale**, E5 częściowo. Kod produkcyjny wygląda poprawnie w każdym z tych
+trzech przypadków — brakuje testu, który zauważyłby, gdyby przestał.
+
+**Odpowiedź na pytanie 2 znowu jest ROZSZCZEPIONA, i tym razem rozszczepienie jest groźne:**
+
+- **Ograniczenie DZIAŁA i jest pilnowane.** Usunięcie warunku `actor_user_id = ?` czerwieni dwa
+  testy, na obu warstwach. Ten zestaw NIE przeżywa inwersji własnego sensu.
+- **Ale nikt nie pilnuje ŹRÓDŁA TOŻSAMOŚCI.** Mutacja `Scope::OwnRuns(_) if req.actor_id.is_some() => None`
+  — czyli „ładunek żądania unieważnia ograniczenie" — daje **116 zielonych**. Zmiana pozwalająca
+  DOWOLNEMU wołającemu przeczytać cudze wiersze przez podanie `actor_id` jest dla tego zestawu
+  niewidzialna.
+
+To dokładnie inwariant §6.1 briefu („wartości pochodzenia NIGDY nie pochodzą od wołającego") —
+pilnowany przez konstrukcję typów, ale nie przez ani jeden test.
+
+| Luka | Mutacja | Wynik |
+|---|---|---|
+| **E3** — grant tylko `read_all` | odwrócenie kolejności w `resolve_scope`, tak że `events.read` jest wymagane pierwsze | 116 zielonych. Każdy test `read_all` nadaje OBA uprawnienia, więc kolejność jest niepilnowana |
+| **E4** — poszerzenie własnego zakresu | `actor_id` z ładunku kasuje ograniczenie | 116 zielonych |
+| **E5** — redakcja na warstwie wire | `to_wire` wskrzesza pominiętą treść | żaden test nie padł. Istniejący test czerwieni się od mutacji PISARZA, czyli dubluje test ze `store.rs`, a nie pilnuje ścieżki odczytu |
+
+**Test przechodzący z niewłaściwego powodu:** `events_browse_roundtrip` zostaje zielony przy
+`#[serde(skip)]` na `EventRowWire.actor_user_id` — polu, na którym stoi cała historia ACL —
+bo fikstura zostawia je `None`. Każde inne pole tej fikstury jest wypełnione i by się zaczerwieniło.
+
+### Znalezisko poza kryteriami, potencjalnie ŻYWA dziura, nie luka w testach
+
+**Dwa różne modele własności.** `browse` ogranicza per WIERSZ (`actor_user_id = ?`), a odczyt
+pojedynczego przebiegu rozstrzyga per PRZEBIEG, z wiersza o najniższym `seq`
+(`store.rs:794`, `ORDER BY seq LIMIT 1`). Jeżeli jeden przebieg może nieść wiersze ostemplowane
+DWOMA różnymi `actor_user_id`, to właściciel pierwszego wiersza czyta całą oś czasu — łącznie
+z wierszami drugiego principala — podczas gdy `browse` pokazałby każdemu tylko jego własne.
+
+Test `events::progress_log::tests::rebinding_a_scope_moves_later_events_onto_the_new_run`
+sugeruje, że przepinanie zakresu WEWNĄTRZ przebiegu jest realną operacją. **Zlecone do zbadania
+z jawnym zakazem przeprojektowywania ACL z własnej inicjatywy** — jeśli to żywy defekt, chcę
+dowód i opis, a nie cichą przebudowę modelu uprawnień.
+
+Drobniejsze: komentarz w `tentaflow-protocol/src/events.rs` twierdzi, że wiersz niesie
+`payload_json` **„VERBATIM"** — nieprawda, `to_wire` re-serializuje zdekodowaną wartość, więc
+wiersz zapisany przez nowszy build gubi nieznane pole znanego rodzaju. Komentarz mijający się
+z prawdą jest gorszy niż jego brak.
