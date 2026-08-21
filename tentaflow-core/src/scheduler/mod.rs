@@ -177,6 +177,34 @@ pub fn list_addon_actions(db: &DbPool) -> Result<Vec<SchedulerAction>> {
 /// => upsert nadpisuje ten sam wiersz (bez duplikatow), a wywolanie przy starcie odtwarza
 /// harmonogram po kazdym restarcie. Interwal 30s + `concurrency=skip`: jedno firing mieli
 /// caly backlog (batch-drain), a nastepne sa pomijane dopoki poprzednie trwa.
+/// Wall-clock budget of the auto-registered ingest-drain job. Large PDFs
+/// (hundreds of pages -> thousands of chunks to embed) must not be cut in half,
+/// and the drain is single-flight (`concurrency = skip`), so this is the longest
+/// a legitimate run may take.
+pub const INGEST_DRAIN_MAX_RUNTIME_SECS: i64 = 1800;
+
+/// The addon-side reclaim window, MIRRORED BY HAND from
+/// `tentaflow-core/addons/rag/src/lib.rs:738` (`STALE_RUNNING_SECS` in
+/// `reclaim_stale_running_jobs`). Core cannot import it: the addon is a separate
+/// wasm32 crate shipped as a bundle, and its `bundle_hash` gates approval — a
+/// rebuild made only to export this number would take the addon offline until an
+/// admin re-approves it. Anyone changing the addon constant MUST change this one
+/// in the same commit; the const assert below is what makes forgetting it a
+/// build failure rather than a silent production defect.
+///
+/// The ordering is the contract: the addon re-queues an ingest job whose
+/// `running` row is older than its reclaim window and CLEANS UP the document's
+/// artifacts on the way. If that window were ever shorter than the drain budget,
+/// a run still legitimately embedding a large document would be reclaimed and
+/// have its artifacts deleted mid-flight.
+pub const ADDON_INGEST_RECLAIM_SECS: i64 = 2400;
+
+const _: () = assert!(
+    INGEST_DRAIN_MAX_RUNTIME_SECS < ADDON_INGEST_RECLAIM_SECS,
+    "the addon reclaim window must outlast the drain job's max_runtime, or a \
+     legitimately running drain is reclaimed and its artifacts cleaned mid-flight"
+);
+
 pub fn ensure_addon_ingest_drain_schedules(db: &DbPool) -> Result<usize> {
     let addons: Vec<(String, String)> = {
         let conn = db.read().map_err(|e| anyhow::anyhow!("db lock: {e}"))?;
@@ -208,10 +236,7 @@ pub fn ensure_addon_ingest_drain_schedules(db: &DbPool) -> Result<usize> {
             schedule_kind: "interval".to_string(),
             schedule_expr: "30s".to_string(),
             timezone: "UTC".to_string(),
-            // 1800s: duze PDF-y (setki stron -> tysiace chunkow do embeddingu) nie
-            // moga byc przycinane w polowie. MUSI byc < reclaim STALE_RUNNING_SECS
-            // w addonie, zeby osierocony po przycieciu job zostal odzyskany.
-            max_runtime_seconds: Some(1800),
+            max_runtime_seconds: Some(INGEST_DRAIN_MAX_RUNTIME_SECS),
             retry_policy_json: None,
             concurrency_policy: Some("skip".to_string()),
             org_id: None,
@@ -748,6 +773,54 @@ mod tests {
             concurrency_policy: Some("skip".to_string()),
             org_id: None,
         }
+    }
+
+    fn install_rag_metadata(db: &DbPool) {
+        let conn = db.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO addons (addon_id, name, version, manifest_json, platforms, is_enabled) \
+             VALUES ('rag', 'RAG', '1.0.0', ?1, 'linux,macos,windows', 1)",
+            params![include_str!("../../addons/rag/manifest.toml")],
+        )
+        .expect("insert addon metadata");
+    }
+
+    /// The one coupling core cannot express as a dependency. The RAG addon
+    /// re-queues an ingest job whose `running` row outlived ITS reclaim window
+    /// and DELETES the document's artifacts on the way, so the drain job core
+    /// auto-registers has to finish well inside that window — otherwise a run
+    /// still legitimately embedding a large document is reclaimed mid-flight.
+    ///
+    /// The constants carry a compile-time assert on the ordering; what only a
+    /// test can show is that the registered job actually TAKES its budget from
+    /// the guarded constant, so a literal dropped back into the request cannot
+    /// walk past the assert. Two prose comments in two crates showed neither.
+    #[test]
+    fn the_ingest_drain_budget_fits_inside_the_addon_reclaim_window() {
+        let db = fresh_db();
+        install_rag_metadata(&db);
+        assert_eq!(
+            ensure_addon_ingest_drain_schedules(&db).expect("ensure"),
+            1,
+            "the addon declares `ingest_drain`, so exactly one auto job is registered"
+        );
+
+        let job = list_jobs(&db)
+            .expect("list")
+            .into_iter()
+            .find(|j| j.target_action_id == "ingest_drain")
+            .expect("the auto drain job is registered");
+        assert_eq!(
+            job.max_runtime_seconds, INGEST_DRAIN_MAX_RUNTIME_SECS,
+            "the drain job must take its budget from the constant the assert guards"
+        );
+        assert!(
+            job.max_runtime_seconds < ADDON_INGEST_RECLAIM_SECS,
+            "max_runtime {} must stay under the addon reclaim window {} \
+             (STALE_RUNNING_SECS, tentaflow-core/addons/rag/src/lib.rs:738)",
+            job.max_runtime_seconds,
+            ADDON_INGEST_RECLAIM_SECS
+        );
     }
 
     #[test]

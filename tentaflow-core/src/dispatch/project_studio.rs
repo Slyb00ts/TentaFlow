@@ -1920,11 +1920,12 @@ async fn project_delete_v1(
     //    its writes. A failed open means the directory is already gone
     //    (retried delete) — nothing can be running then.
     if let Ok(pool) = project_db::open(project_id) {
-        if let Ok(jobs) = repository::running_job_ids(&pool) {
-            for job_id in &jobs {
+        if let Ok(jobs) = repository::running_jobs(&pool) {
+            let ids: Vec<String> = jobs.into_iter().map(|(job_id, _)| job_id).collect();
+            for job_id in &ids {
                 ingest::signal_cancel(job_id);
             }
-            wait_for_jobs_terminal(&pool, &jobs).await?;
+            wait_for_jobs_terminal(&pool, &ids).await?;
         }
     }
     // 2. Drop the cached pool (checkpoint + release the SQLite handle).
@@ -2703,13 +2704,11 @@ async fn source_delete_v1(
     // terminal status before ripping its data out — cancel is cooperative
     // and a still-running job would keep writing files/vectors mid-delete.
     let mut source_jobs: Vec<String> = Vec::new();
-    if let Ok(jobs) = repository::running_job_ids(&pool) {
-        for job_id in jobs {
-            if let Ok(Some(job)) = repository::get_ingest_job(&pool, &job_id) {
-                if job.source_id == source_id {
-                    ingest::signal_cancel(&job_id);
-                    source_jobs.push(job_id);
-                }
+    if let Ok(jobs) = repository::running_jobs(&pool) {
+        for (job_id, job_source_id) in jobs {
+            if job_source_id == source_id {
+                ingest::signal_cancel(&job_id);
+                source_jobs.push(job_id);
             }
         }
     }

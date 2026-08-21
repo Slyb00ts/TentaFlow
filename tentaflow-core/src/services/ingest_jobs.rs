@@ -239,6 +239,15 @@ pub enum CancelOutcome {
 /// Adds a job to the back of `queue`. The caller owns `job_id` (Project Studio
 /// reuses the id of its own job row), so a duplicate id is an error rather than
 /// a silent second run.
+///
+/// ARRIVAL ORDER is carried by the row's implicit `rowid`, not by
+/// `enqueued_at_ms`. The timestamp has millisecond resolution and two jobs
+/// accepted in the same millisecond are common (one upload, several sources),
+/// whereas SQLite hands every INSERT a rowid strictly larger than every rowid
+/// currently in the table — and the queue has ONE writer connection, so those
+/// values are assigned in exactly the order the inserts commit. `enqueued_at_ms`
+/// stays the coarse key (it matches `ix_ingest_jobs_ready`, so the ordered scan
+/// needs no sort) and is what the consumer reports; `rowid` decides ties.
 pub fn enqueue(pool: &DbPool, queue: &str, job_id: &str, payload_json: &str) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;
     conn.execute(
@@ -253,7 +262,11 @@ pub fn enqueue(pool: &DbPool, queue: &str, job_id: &str, payload_json: &str) -> 
 /// `UPDATE … RETURNING` — two workers can never claim the same job (SQLite
 /// serialises the statement on the one writer connection and there is no
 /// separate SELECT to race). Splitting this into a SELECT and an UPDATE is
-/// exactly the bug `claim_runs_once_under_two_workers` mutates for.
+/// exactly the bug `claim_hands_each_job_to_exactly_one_worker` mutates for.
+///
+/// "Oldest" means FIRST ENQUEUED, which is why the tie-break is `rowid` and not
+/// `job_id`: a `job_id` is a random UUID, so ordering by it served jobs stamped
+/// with the same millisecond in an order unrelated to their arrival.
 pub fn claim(pool: &DbPool, queue: &str) -> Result<Option<QueuedJob>> {
     let conn = pool.write().map_err(write_err)?;
     conn.query_row(
@@ -261,7 +274,7 @@ pub fn claim(pool: &DbPool, queue: &str) -> Result<Option<QueuedJob>> {
             SET status = 'running', owner_instance = ?2, claimed_at_ms = ?3, heartbeat_at_ms = ?3 \
           WHERE job_id = (SELECT job_id FROM ingest_jobs \
                            WHERE queue = ?1 AND status = 'queued' \
-                           ORDER BY enqueued_at_ms, job_id LIMIT 1) \
+                           ORDER BY enqueued_at_ms, rowid LIMIT 1) \
           RETURNING job_id, queue, payload_json, cancel_requested, enqueued_at_ms",
         params![queue, instance_id(), now_ms()],
         read_job,
@@ -313,10 +326,11 @@ pub fn finish(pool: &DbPool, job_id: &str) -> Result<()> {
 }
 
 /// How many jobs of `queue` are outstanding AHEAD of `job_id` — enqueued
-/// earlier in exactly the order `claim` hands them out. The table holds
-/// outstanding work only, so this is a count of real work, not an estimate:
-/// it is what lets a consumer say "queued behind N" without claiming to know
-/// how long that will take. Returns 0 once the job itself is gone.
+/// earlier in exactly the order `claim` hands them out, tie-break included, so
+/// the count answers "how many jobs will be claimed before mine". The table
+/// holds outstanding work only, so this is a count of real work, not an
+/// estimate: it is what lets a consumer say "queued behind N" without claiming
+/// to know how long that will take. Returns 0 once the job itself is gone.
 pub fn jobs_ahead(pool: &DbPool, queue: &str, job_id: &str) -> Result<i64> {
     let conn = pool.read().map_err(read_err)?;
     conn.query_row(
@@ -325,7 +339,7 @@ pub fn jobs_ahead(pool: &DbPool, queue: &str, job_id: &str) -> Result<i64> {
           WHERE other.queue = ?1 \
             AND (other.enqueued_at_ms < self_row.enqueued_at_ms \
                  OR (other.enqueued_at_ms = self_row.enqueued_at_ms \
-                     AND other.job_id < self_row.job_id))",
+                     AND other.rowid < self_row.rowid))",
         params![queue, job_id],
         |row| row.get(0),
     )
@@ -496,6 +510,47 @@ mod tests {
         unique.dedup();
         assert_eq!(ids.len(), unique.len(), "a job was claimed twice");
         assert_eq!(ids.len(), JOBS, "a job was lost");
+    }
+
+    /// Sub-millisecond arrival order. `enqueued_at_ms` cannot separate jobs
+    /// accepted inside the same millisecond — the normal case for one upload of
+    /// several sources — so on a tie the tie-break decides the order by itself.
+    /// This forces the collision (every row stamped with the SAME ms) rather
+    /// than hoping a fast loop produces one, and pins both readers together:
+    /// `claim` must hand the jobs out in arrival order and `jobs_ahead` must
+    /// count exactly the jobs that will be claimed before a given one. Random
+    /// UUID ids are the point — any ordering derived from the id itself is a
+    /// shuffle here.
+    #[test]
+    fn jobs_stamped_with_the_same_millisecond_keep_their_arrival_order() {
+        let (_dir, pool) = test_pool();
+        const JOBS: usize = 16;
+        let ids: Vec<String> = (0..JOBS)
+            .map(|_| uuid::Uuid::new_v4().to_string())
+            .collect();
+        for id in &ids {
+            enqueue(&pool, QUEUE_PROJECT_STUDIO, id, "{}").expect("enqueue");
+        }
+        {
+            let conn = pool.write().expect("write");
+            conn.execute("UPDATE ingest_jobs SET enqueued_at_ms = 1", [])
+                .expect("collapse the timestamps");
+        }
+
+        for (i, id) in ids.iter().enumerate() {
+            assert_eq!(
+                jobs_ahead(&pool, QUEUE_PROJECT_STUDIO, id).expect("ahead"),
+                i as i64,
+                "job {i} must report exactly the jobs that will be claimed first"
+            );
+        }
+        for (i, id) in ids.iter().enumerate() {
+            let job = claim(&pool, QUEUE_PROJECT_STUDIO)
+                .expect("claim")
+                .expect("job");
+            assert_eq!(&job.job_id, id, "claim {i} broke arrival order");
+            finish(&pool, &job.job_id).expect("finish");
+        }
     }
 
     #[test]

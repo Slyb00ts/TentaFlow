@@ -1067,10 +1067,16 @@ pub fn get_ingest_job(pool: &DbPool, job_id: &str) -> Result<Option<IngestJobRec
     .map_err(Into::into)
 }
 
-pub fn running_job_ids(pool: &DbPool) -> Result<Vec<String>> {
+/// Every job of this project the row still calls `running`, as
+/// `(job_id, source_id)`. The source comes along because every caller needs it:
+/// closing a job that will never resume also has to close the source it was
+/// indexing, and the delete paths cancel by source. Reading it here costs
+/// nothing and saves a `get_ingest_job` round trip per job.
+pub fn running_jobs(pool: &DbPool) -> Result<Vec<(String, String)>> {
     let conn = pool.read().map_err(read_err)?;
-    let mut stmt = conn.prepare("SELECT job_id FROM ingest_jobs WHERE status = 'running'")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut stmt =
+        conn.prepare("SELECT job_id, source_id FROM ingest_jobs WHERE status = 'running'")?;
+    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }

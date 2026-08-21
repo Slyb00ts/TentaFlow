@@ -489,14 +489,23 @@ pub fn cleanup_files_dir(pool: &DbPool, dir_path: &Path) {
 /// outlived a restart is still queued here and has not started yet, and killing
 /// it because no task of THIS process holds it would defeat the whole point of
 /// persisting it.
+///
+/// THIS FUNCTION OWNS THE TERMINAL WRITE for an orphan — the job row AND the
+/// source it was indexing. A source left at `indexing` is a document that is
+/// forever mid-ingest in the UI, and no other caller is in a position to close
+/// it: the write is guarded (`finish_ingest_job` only lands on a row still
+/// `running`), so it happens exactly once, and whoever calls first is the one
+/// that lands it. A second writer elsewhere would have to guess whether the
+/// guard had already fired for it, which is precisely how the source used to be
+/// left behind.
 pub fn recover_orphaned_jobs(pool: &DbPool) {
-    let Ok(jobs) = repository::running_job_ids(pool) else {
+    let Ok(jobs) = repository::running_jobs(pool) else {
         return;
     };
     let Ok(queue) = ingest_jobs::pool() else {
         return;
     };
-    for job_id in jobs {
+    for (job_id, source_id) in jobs {
         if ingest_jobs::is_pending(&queue, &job_id).unwrap_or(true) {
             continue;
         }
@@ -504,6 +513,12 @@ pub fn recover_orphaned_jobs(pool: &DbPool) {
             .unwrap_or(false)
         {
             tracing::warn!(job_id, "marked orphaned ingest job as failed");
+            let _ = repository::set_source_status(
+                pool,
+                &source_id,
+                "error",
+                "interrupted by restart",
+            );
         }
     }
 }
@@ -1261,10 +1276,24 @@ fn publish_runtime(core_db: DbPool, router: Arc<Router>) {
     let _ = WORKER_RUNTIME.set(WorkerRuntime { core_db, router });
 }
 
-/// Closes every ingest job the queue was still holding for a process run that
-/// no longer exists, and marks the matching project rows failed. Startup only:
-/// a row claimed by THIS run is supervised by definition, and the queue's own
-/// `reconcile_orphans` never touches it.
+/// Clears the queue of every job it was still holding for a process run that no
+/// longer exists, and drives the per-project recovery for each one. Startup
+/// only: a row claimed by THIS run is supervised by definition, and the queue's
+/// own `reconcile_orphans` never touches it.
+///
+/// It does NOT write the terminal job or source status itself. Deleting the
+/// queue row is what turns the job into an orphan, and `recover_orphaned_jobs`
+/// is the single owner of what that means for the project — it also runs from
+/// `project_db::open`'s fresh-open hook, so a project this queue sweep never
+/// names still gets recovered. Writing the row here as well produced the bug
+/// this ordering exists to prevent: the open below fires that hook, the hook's
+/// guarded write lands, and a second guarded write here then returned `false`
+/// and skipped the source, leaving the document at `indexing` forever.
+///
+/// The explicit call after `open` is therefore load-bearing rather than
+/// belt-and-braces: `open` only runs the hook on a FRESH open, and a project
+/// already in the pool cache would otherwise be swept in the queue and left
+/// untouched in its own database.
 pub fn reconcile_orphans() {
     let Ok(pool) = ingest_jobs::pool() else {
         return;
@@ -1283,26 +1312,12 @@ pub fn reconcile_orphans() {
         let Ok(project_pool) = super::project_db::open(&payload.project_id) else {
             continue;
         };
+        tracing::warn!(job_id = %payload.job_id, "closing an ingest job orphaned by a restart");
         // An orphaned QUEUE row does not prove the job failed: the worker
         // writes the project row terminal and only then deletes the queue row,
         // so a crash in between leaves exactly this state behind a SUCCESS.
-        // The guarded write decides, and the source follows it.
-        if repository::finish_ingest_job(
-            &project_pool,
-            &payload.job_id,
-            "failed",
-            "interrupted by restart",
-        )
-        .unwrap_or(false)
-        {
-            tracing::warn!(job_id = %payload.job_id, "closed ingest job orphaned by a restart");
-            let _ = repository::set_source_status(
-                &project_pool,
-                &payload.source_id,
-                "error",
-                "interrupted by restart",
-            );
-        }
+        // The guarded write inside decides; a recorded success survives.
+        recover_orphaned_jobs(&project_pool);
     }
 }
 
@@ -1719,8 +1734,17 @@ fn announce_queue_wait(tx: &tokio::sync::broadcast::Sender<BusMessage>, job_id: 
     let Ok(pool) = ingest_jobs::pool() else {
         return;
     };
-    let ahead = ingest_jobs::jobs_ahead(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO, job_id)
-        .unwrap_or_default();
+    // A failed read is not an empty queue. Defaulting to 0 turned "the queue
+    // could not be read" into the positive claim "nothing is ahead of you", so
+    // the one case where the depth is worth knowing was the one case that
+    // silently reported no wait. Unknown depth says nothing and is logged.
+    let ahead = match ingest_jobs::jobs_ahead(&pool, ingest_jobs::QUEUE_PROJECT_STUDIO, job_id) {
+        Ok(ahead) => ahead,
+        Err(e) => {
+            tracing::warn!(job_id = %job_id, error = %e, "ingest queue depth unreadable");
+            return;
+        }
+    };
     if (ahead as usize) < WORKERS {
         return;
     }
@@ -2576,6 +2600,111 @@ mod tests {
         let next = await_terminal(&project_id, &after).await;
         worker.abort();
         assert_eq!(next.status, "success", "error: {}", next.error);
+    }
+
+    /// Leaves behind exactly what a worker killed mid-ingest leaves: a project
+    /// job row still `running`, the source it was writing still `indexing`, and
+    /// a queue row claimed by a process run that no longer exists.
+    fn orphan_mid_ingest(queue: &DbPool, project_id: &str, dir: &Path, sha: &str, job_id: &str) {
+        let pool = super::super::project_db::open(project_id).expect("project db");
+        let file_id =
+            repository::upsert_source_file(&pool, "src-1", "spec.rs", sha, 0, "text/x-rust")
+                .expect("file row");
+        repository::create_ingest_job(&pool, job_id, "src-1", 1, "tester").expect("job row");
+        repository::set_source_status(&pool, "src-1", "indexing", "").expect("source indexing");
+        let payload = serde_json::to_string(&JobPayload {
+            org_id: "org-1".to_string(),
+            project_id: project_id.to_string(),
+            dir_path: dir.to_path_buf(),
+            source_id: "src-1".to_string(),
+            job_id: job_id.to_string(),
+            files: vec![FileWork {
+                file_id,
+                path: "spec.rs".to_string(),
+                sha256: sha.to_string(),
+                mime: "text/x-rust".to_string(),
+                payload: WorkPayload::Blob,
+            }],
+        })
+        .expect("payload");
+        let conn = queue.write().expect("write");
+        conn.execute(
+            "INSERT INTO ingest_jobs (job_id, queue, payload_json, status, owner_instance, \
+             enqueued_at_ms, claimed_at_ms) \
+             VALUES (?1, ?2, ?3, 'running', 'gone-instance', 1, 1)",
+            rusqlite::params![job_id, ingest_jobs::QUEUE_PROJECT_STUDIO, payload],
+        )
+        .expect("orphan row");
+    }
+
+    /// Asserts the ONE outcome an orphan may end in: the job failed with the
+    /// restart reason and the source it was indexing failed with it too.
+    fn assert_closed_by_restart(pool: &DbPool, job_id: &str) {
+        let row = repository::get_ingest_job(pool, job_id)
+            .expect("read")
+            .expect("row");
+        assert_eq!(row.status, "failed", "error: {}", row.error);
+        assert_eq!(row.error, "interrupted by restart");
+        assert!(row.finished_at.is_some());
+        let source = repository::get_source(pool, "src-1")
+            .expect("read")
+            .expect("source");
+        assert_eq!(
+            source.status, "error",
+            "a source left at `indexing` is a document forever mid-ingest"
+        );
+        assert_eq!(source.error, "interrupted by restart");
+    }
+
+    /// The crash shape the reconciliation exists for, with the project pool
+    /// CLOSED — so `project_db::open` inside the sweep is a fresh one and fires
+    /// its recovery hook. That hook used to close the job first, after which the
+    /// sweep's own guarded write found nothing left to guard and skipped the
+    /// source: the job ended `failed` and the document stayed `indexing` for the
+    /// life of the installation.
+    #[test]
+    fn a_restart_never_leaves_a_source_stuck_indexing() {
+        let (_guard, queue) = exclusive_queue();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        orphan_mid_ingest(&queue, &project_id, &dir, &sha, &job_id);
+
+        // The process that owned the job is gone, and so is its project pool.
+        super::super::project_db::close(&project_id);
+        reconcile_orphans();
+
+        // Read the project file through a plain pool, NOT `project_db::open`:
+        // that call would fire the fresh-open recovery hook a second time and
+        // do the sweep's work for it, hiding a sweep that skipped the project.
+        let (pool, _) = super::super::project_db::open_pool_at(&dir).expect("project db");
+        assert_closed_by_restart(&pool, &job_id);
+        assert!(
+            !ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
+            "the orphaned queue row is cleared"
+        );
+    }
+
+    /// The same orphan on a project pool this process ALREADY holds open — the
+    /// case the fresh-open hook does not cover, because there is no fresh open.
+    /// The sweep must recover it through its own explicit call, or the queue row
+    /// disappears while the project database still claims the job is running.
+    #[test]
+    fn reconciliation_recovers_an_orphan_on_an_already_open_project() {
+        let (_guard, queue) = exclusive_queue();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (project_id, dir, sha) = registered_project(tmp.path());
+        let job_id = format!("job-{}", uuid::Uuid::new_v4());
+        orphan_mid_ingest(&queue, &project_id, &dir, &sha, &job_id);
+
+        let pool = super::super::project_db::open(&project_id).expect("project db");
+        reconcile_orphans();
+
+        assert_closed_by_restart(&pool, &job_id);
+        assert!(
+            !ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
+            "the orphaned queue row is cleared"
+        );
     }
 
     /// The crash window: the worker wrote the terminal project row and died
