@@ -2101,7 +2101,8 @@
       "failed": "Awaria",
       "interrupted": "Przerwane",
       "error": "Błąd",
-      "on_demand": "Na żądanie"
+      "on_demand": "Na żądanie",
+      "deleting": "Usuwanie…"
     },
     "tooltip_pin_off": "Trzymaj zawsze w pamięci",
     "tooltip_pin_on": "Trzymany zawsze w pamięci — kliknij, aby wyłączyć",
@@ -2265,7 +2266,8 @@
     "access_granted": "Dostęp nadany",
     "access_revoked": "Dostęp cofnięty",
     "access_consumer_self": "— (zgłoszony przez addon)",
-    "access_visibility_hint_unknown": "Widoczność jeszcze nie załadowana — otwórz panel dostępu, aby pobrać rzeczywisty stan."
+    "access_visibility_hint_unknown": "Widoczność jeszcze nie załadowana — otwórz panel dostępu, aby pobrać rzeczywisty stan.",
+    "deleted": "Serwis „{name}” usunięty"
   },
   "apikeys": {
     "title": "Klucze API",

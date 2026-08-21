@@ -2100,7 +2100,8 @@
       "starting": "Startet",
       "stopped": "Gestoppt",
       "error": "Fehler",
-      "on_demand": "Auf Anfrage"
+      "on_demand": "Auf Anfrage",
+      "deleting": "Wird gelöscht…"
     },
     "deploy": {
       "title": "Neuen Dienst bereitstellen",
@@ -2169,7 +2170,8 @@
     "access_revoked": "Zugriff widerrufen",
     "access_consumer_self": "— (vom Addon angefragt)",
     "alias_visibility_unknown": "Unbekannt",
-    "access_visibility_hint_unknown": "Sichtbarkeit noch nicht geladen — öffnen Sie das Zugriffsfeld, um den echten Status zu laden."
+    "access_visibility_hint_unknown": "Sichtbarkeit noch nicht geladen — öffnen Sie das Zugriffsfeld, um den echten Status zu laden.",
+    "deleted": "Dienst „{name}“ gelöscht"
   },
   "apikeys": {
     "title": "API-Schlüssel",

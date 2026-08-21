@@ -697,8 +697,37 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "meeting_sessions_pipeline",
             MigrationStep::Rust(meeting_sessions_add_pipeline_columns),
         ),
+        (
+            132,
+            "services_config_runtime_truth",
+            MigrationStep::Sql(SERVICES_CONFIG_RUNTIME_TRUTH),
+        ),
     ]
 }
+
+/// Rows deployed before the deploy pipeline reconciled the persisted config with
+/// the runtime carry two fictions: the wizard's suggested `container_name`
+/// (nothing is ever named after it — the real name is derived from the engine id
+/// and the host port) and the requested `port` instead of the granted one. Both
+/// are rewritten from the runtime columns, which have always been the truth.
+const SERVICES_CONFIG_RUNTIME_TRUTH: &str = r#"
+UPDATE services
+   SET config_json = json_remove(config_json, '$.container_name')
+ WHERE json_valid(config_json)
+   AND json_type(config_json, '$.container_name') IS NOT NULL;
+
+UPDATE services
+   SET config_json = json_set(config_json, '$.port', runtime_port)
+ WHERE json_valid(config_json)
+   AND runtime_port IS NOT NULL
+   AND json_extract(config_json, '$.port') IS NOT runtime_port;
+
+UPDATE services
+   SET config_json = json_remove(config_json, '$.port')
+ WHERE json_valid(config_json)
+   AND runtime_port IS NULL
+   AND json_type(config_json, '$.port') IS NOT NULL;
+"#;
 
 /// The bot no longer receives STT/LLM/TTS aliases or a flow through env —
 /// every FlowInvoke turn resolves them from the session row, so the effective
@@ -8459,6 +8488,62 @@ mod tests {
     /// output(stream)` pipeline, while an admin-customized flow that also
     /// contains a pii_filter is left untouched (matched only against the exact
     /// seeded literal).
+    /// Legacy rows: the wizard's container-name suggestion goes away and the
+    /// config port is rewritten from `runtime_port` (dropped when the row has no
+    /// runtime, e.g. an on-demand engine).
+    #[test]
+    fn migration_v132_rewrites_service_config_from_runtime_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO services (engine_id, category, display_name, deploy_method, transport, \
+             status, runtime_port, config_json) \
+             VALUES ('vllm', 'llm', 'vLLM', 'docker', 'http_direct', 'running', 5005, ?1)",
+            rusqlite::params![
+                r#"{"port":5003,"container_name":"tentaflow-vllm-8p7iu","model_repo":"speakleash/Bielik"}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services (engine_id, category, display_name, deploy_method, transport, \
+             status, runtime_port, config_json) \
+             VALUES ('teams-bot', 'agents', 'Teams Bot', 'docker', 'http_direct', 'stopped', NULL, ?1)",
+            rusqlite::params![r#"{"port":5003,"container_name":"tentaflow-teams-bot-ck1mr"}"#],
+        )
+        .unwrap();
+
+        conn.execute_batch(SERVICES_CONFIG_RUNTIME_TRUTH).unwrap();
+
+        let running: String = conn
+            .query_row(
+                "SELECT config_json FROM services WHERE engine_id = 'vllm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&running).unwrap();
+        assert_eq!(cfg.get("port").and_then(|v| v.as_u64()), Some(5005));
+        assert!(cfg.get("container_name").is_none(), "{running}");
+        assert_eq!(
+            cfg.get("model_repo").and_then(|v| v.as_str()),
+            Some("speakleash/Bielik")
+        );
+
+        let on_demand: String = conn
+            .query_row(
+                "SELECT config_json FROM services WHERE engine_id = 'teams-bot'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&on_demand).unwrap();
+        assert!(
+            cfg.get("port").is_none() && cfg.get("container_name").is_none(),
+            "{on_demand}"
+        );
+    }
+
     #[test]
     fn migration_v113_strips_pii_from_seeded_default_chat() {
         let conn = Connection::open_in_memory().unwrap();

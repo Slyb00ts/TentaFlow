@@ -2101,7 +2101,8 @@
       "error": "Error",
       "on_demand": "On demand",
       "deploying": "Deploying",
-      "interrupted": "Interrupted"
+      "interrupted": "Interrupted",
+      "deleting": "Deleting…"
     },
     "tooltip_pin_off": "Always keep in memory",
     "tooltip_pin_on": "Always kept in memory — click to disable",
@@ -2265,7 +2266,8 @@
     "alias_meta_id": "ID",
     "alias_save": "Save changes",
     "alias_cancel": "Cancel",
-    "alias_unsaved": "Unsaved changes"
+    "alias_unsaved": "Unsaved changes",
+    "deleted": "Service \"{name}\" deleted"
   },
   "apikeys": {
     "title": "API Keys",

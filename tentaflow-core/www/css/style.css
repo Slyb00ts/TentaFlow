@@ -5904,6 +5904,35 @@ tf-screen {
   color: var(--accent-2, #a78bfa);
 }
 
+/* A row whose delete is in flight: dimmed, with every action in the row inert
+   so a slow container teardown cannot be triggered twice. */
+.svc-row-deleting {
+  opacity: 0.55;
+}
+.svc-row-deleting td {
+  pointer-events: none;
+}
+/* Live deployment phase + percentage under the status chip. The phase can be a
+   whole docker step, so it wraps instead of stretching the column. */
+.svc-deploy-progress {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-3);
+}
+.svc-deploy-phase {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.svc-deploy-pct {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
+}
+
 /* Baseline-adopt modal (mesh-baseline-adopt.js) */
 .baseline-adopt-body { min-width: 420px; max-width: 560px; }
 .baseline-loading { display: flex; justify-content: center; padding: 32px 0; }

@@ -2100,7 +2100,8 @@
       "starting": "Iniciando",
       "stopped": "Detenido",
       "error": "Error",
-      "on_demand": "Bajo demanda"
+      "on_demand": "Bajo demanda",
+      "deleting": "Eliminando…"
     },
     "deploy": {
       "title": "Desplegar nuevo servicio",
@@ -2169,7 +2170,8 @@
     "access_revoked": "Acceso revocado",
     "access_consumer_self": "— (solicitado por el addon)",
     "alias_visibility_unknown": "Desconocida",
-    "access_visibility_hint_unknown": "Visibilidad aún no cargada — abre el panel de acceso para cargar el estado real."
+    "access_visibility_hint_unknown": "Visibilidad aún no cargada — abre el panel de acceso para cargar el estado real.",
+    "deleted": "Servicio «{name}» eliminado"
   },
   "apikeys": {
     "title": "Claves API",
