@@ -274,7 +274,7 @@ case "$PLATFORM" in
     # iOS jest celem cross-compile: appka nie moze wozic luznego .dylib, wiec
     # build.rs linkuje DWA statyczne archiwa (uklad "model B"):
     #   * libzvec_c_api.a  — wlasny kod zvec (binding C + 4 wewnetrzne biblioteki
-    #     zvec_db/zvec_core/zvec_ailego/zvec_turbo, ktore nosza rejestracje
+    #     zvec (src/db) / zvec_core / zvec_ailego / zvec_turbo, ktore nosza rejestracje
     #     static-init indeksow/metryk). Linkowane przez whole-archive.
     #   * libzvec_deps.a   — third-party (protobuf/Arrow/RocksDB/...). Zwykly link.
     # zvec na iOS buduje wszystkie biblioteki statycznie (_add_library: na IOS glowny
@@ -346,7 +346,7 @@ case "$PLATFORM" in
     # Krok 3: scal archiwa w dwa wynikowe pliki.
     echo "  [3/3] scalanie archiwow (libtool -static)..."
     OWN_LIBS=()
-    for name in zvec_db zvec_core zvec_ailego zvec_turbo; do
+    for name in zvec zvec_core zvec_ailego zvec_turbo; do
         a="$IOS_BUILD/lib/lib${name}.a"
         [ -f "$a" ] || a="$(find "$IOS_BUILD" -name "lib${name}.a" -type f | head -n1)"
         if [ -z "$a" ] || [ ! -f "$a" ]; then
@@ -369,7 +369,7 @@ case "$PLATFORM" in
     while IFS= read -r a; do
         base="$(basename "$a")"
         case "$base" in
-            libzvec_*.a) continue ;;          # kod zvec jest juz w 4 PACKED bibliotekach
+            libzvec.a|libzvec_*.a) continue ;;          # kod zvec jest juz w 4 PACKED bibliotekach
         esac
         case "$seen_bases" in
             *"|$base|"*) continue ;;
@@ -468,7 +468,7 @@ case "$PLATFORM" in
 
     echo "  [3/3] scalanie archiwow (llvm-ar MRI)..."
     OWN_LIBS=()
-    for name in zvec_db zvec_core zvec_ailego zvec_turbo; do
+    for name in zvec zvec_core zvec_ailego zvec_turbo; do
         a="$ANDROID_BUILD/lib/lib${name}.a"
         [ -f "$a" ] || a="$(find "$ANDROID_BUILD" -name "lib${name}.a" -type f | head -n1)"
         if [ -z "$a" ] || [ ! -f "$a" ]; then
@@ -488,7 +488,7 @@ case "$PLATFORM" in
     while IFS= read -r a; do
         base="$(basename "$a")"
         case "$base" in
-            libzvec_*.a) continue ;;
+            libzvec.a|libzvec_*.a) continue ;;
         esac
         case "$seen_bases" in
             *"|$base|"*) continue ;;
