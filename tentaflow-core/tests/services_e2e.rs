@@ -76,6 +76,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            lifecycle: None,
             backend: None,
         },
         deploy: DeploySection {
@@ -112,6 +113,7 @@ fn dummy_embedded_manifest(id: &str) -> ServiceManifest {
         parameters: vec![],
         docker_source_hash: String::new(),
         native_source_hash: String::new(),
+        required_assets: Vec::new(),
     }
 }
 

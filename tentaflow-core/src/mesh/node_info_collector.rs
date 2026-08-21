@@ -240,6 +240,8 @@ fn detect_gpus_wgpu() -> Vec<PeerGpuInfo> {
                         fan_speed_percent: None,
                         pcie_link_gen: None,
                         pcie_link_width: None,
+                        pcie_link_gen_current: None,
+                        pcie_link_width_current: None,
                     }
                 })
                 .collect()
@@ -622,8 +624,10 @@ fn detect_gpus_with_live_metrics() -> Vec<PeerGpuInfo> {
                         pci_bus_id: e.pci_bus_id,
                         uuid: e.uuid,
                         fan_speed_percent: e.fan_speed,
-                        pcie_link_gen: e.pcie_gen,
-                        pcie_link_width: e.pcie_width,
+                        pcie_link_gen: e.pcie_gen_max,
+                        pcie_link_width: e.pcie_width_max,
+                        pcie_link_gen_current: e.pcie_gen_current,
+                        pcie_link_width_current: e.pcie_width_current,
                     }
                 })
                 .collect();
@@ -682,12 +686,17 @@ pub(super) struct NvidiaEntry {
     pub pci_bus_id: Option<String>,
     pub uuid: Option<String>,
     pub fan_speed: Option<u8>,
-    pub pcie_gen: Option<u8>,
-    pub pcie_width: Option<u8>,
+    /// Momentary link state — NVIDIA drops idle cards to Gen1, so this is not
+    /// a hardware characteristic.
+    pub pcie_gen_current: Option<u8>,
+    pub pcie_width_current: Option<u8>,
+    /// Slot/board capability — what the card can negotiate under load.
+    pub pcie_gen_max: Option<u8>,
+    pub pcie_width_max: Option<u8>,
 }
 
 /// Parser czystego stdoutu z `nvidia-smi --query-gpu=...,--format=csv,noheader,nounits`.
-/// Wydzielony zeby byl testowalny bez spawnowania procesu. Tolerujacy: wiersze 5..13 pol,
+/// Wydzielony zeby byl testowalny bez spawnowania procesu. Tolerujacy: wiersze 5..14 pol,
 /// wartosci `[N/A]` (typowe dla unified-memory GB10) traktowane jak 0/None.
 pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
     stdout
@@ -715,8 +724,10 @@ pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
                     .filter(|s| !s.is_empty() && !s.starts_with('['))
                     .map(|s| s.to_string()),
                 fan_speed: parts.get(9).and_then(|s| s.parse().ok()),
-                pcie_gen: parts.get(10).and_then(|s| s.parse().ok()),
-                pcie_width: parts.get(11).and_then(|s| s.parse().ok()),
+                pcie_gen_current: parts.get(10).and_then(|s| s.parse().ok()),
+                pcie_width_current: parts.get(11).and_then(|s| s.parse().ok()),
+                pcie_gen_max: parts.get(12).and_then(|s| s.parse().ok()),
+                pcie_width_max: parts.get(13).and_then(|s| s.parse().ok()),
             })
         })
         .collect()
@@ -728,7 +739,7 @@ pub(super) fn parse_nvidia_smi_output(stdout: &str) -> Vec<NvidiaEntry> {
 pub(super) fn query_nvidia_smi() -> Vec<NvidiaEntry> {
     let output = match std::process::Command::new("nvidia-smi")
         .args([
-            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,power.limit,pci.bus_id,uuid,fan.speed,pcie.link.gen.current,pcie.link.width.current",
+            "--query-gpu=name,memory.total,memory.used,utilization.gpu,temperature.gpu,power.draw,power.limit,pci.bus_id,uuid,fan.speed,pcie.link.gen.current,pcie.link.width.current,pcie.link.gen.max,pcie.link.width.max",
             "--format=csv,noheader,nounits",
         ])
         .output()
@@ -770,8 +781,10 @@ fn enrich_nvidia_live(gpus: &mut [PeerGpuInfo]) {
             gpu.pci_bus_id = nv.pci_bus_id.clone();
             gpu.uuid = nv.uuid.clone();
             gpu.fan_speed_percent = nv.fan_speed;
-            gpu.pcie_link_gen = nv.pcie_gen;
-            gpu.pcie_link_width = nv.pcie_width;
+            gpu.pcie_link_gen = nv.pcie_gen_max;
+            gpu.pcie_link_width = nv.pcie_width_max;
+            gpu.pcie_link_gen_current = nv.pcie_gen_current;
+            gpu.pcie_link_width_current = nv.pcie_width_current;
 
             // Unified memory GPU (np. DGX Spark GB10) — nvidia-smi zwraca [N/A] dla VRAM.
             // Wtedy VRAM = RAM systemowy (wspoldzielona pamiec CPU/GPU).
@@ -1813,22 +1826,43 @@ mod nvidia_smi_tests {
 
     #[test]
     fn parses_identity_and_pcie_fields() {
-        let out = "NVIDIA GeForce RTX 3090, 24576, 1024, 35, 62, 250.5, 350.0, 00000000:82:00.0, GPU-abc-123, 30, 4, 16\n\
-NVIDIA GB10, [N/A], [N/A], 12, 55, [N/A], [N/A], [N/A], GPU-def, [N/A], [N/A], [N/A]\n";
+        // Idle 3090: negotiated Gen1 while the slot is Gen4 x16.
+        let out = "NVIDIA GeForce RTX 3090, 24576, 1024, 35, 62, 250.5, 350.0, 00000000:82:00.0, GPU-abc-123, 30, 1, 16, 4, 16\n\
+NVIDIA GB10, [N/A], [N/A], 12, 55, [N/A], [N/A], [N/A], GPU-def, [N/A], [N/A], [N/A], [N/A], [N/A]\n";
         let entries = parse_nvidia_smi_output(out);
         assert_eq!(entries.len(), 2);
         let e = &entries[0];
         assert_eq!(e.pci_bus_id.as_deref(), Some("00000000:82:00.0"));
         assert_eq!(e.uuid.as_deref(), Some("GPU-abc-123"));
         assert_eq!(e.fan_speed, Some(30));
-        assert_eq!(e.pcie_gen, Some(4));
-        assert_eq!(e.pcie_width, Some(16));
+        assert_eq!(e.pcie_gen_current, Some(1));
+        assert_eq!(e.pcie_width_current, Some(16));
+        assert_eq!(e.pcie_gen_max, Some(4));
+        assert_eq!(e.pcie_width_max, Some(16));
         let e = &entries[1];
         assert_eq!(e.pci_bus_id, None);
         assert_eq!(e.uuid.as_deref(), Some("GPU-def"));
         assert_eq!(e.fan_speed, None);
-        assert_eq!(e.pcie_gen, None);
-        assert_eq!(e.pcie_width, None);
+        assert_eq!(e.pcie_gen_current, None);
+        assert_eq!(e.pcie_width_current, None);
+        assert_eq!(e.pcie_gen_max, None);
+        assert_eq!(e.pcie_width_max, None);
+    }
+
+    #[test]
+    fn pcie_max_stays_none_when_driver_omits_or_na_it() {
+        // Older drivers print [N/A] for the max columns, or omit them entirely.
+        // Neither may be back-filled from the current values.
+        let out = "NVIDIA GeForce RTX 3090, 24576, 1024, 35, 62, 250.5, 350.0, 00000000:82:00.0, GPU-abc, 30, 1, 16, [N/A], [N/A]\n\
+NVIDIA GeForce RTX 3090, 24576, 1024, 35, 62, 250.5, 350.0, 00000000:83:00.0, GPU-def, 30, 1, 16\n";
+        let entries = parse_nvidia_smi_output(out);
+        assert_eq!(entries.len(), 2);
+        for e in &entries {
+            assert_eq!(e.pcie_gen_current, Some(1));
+            assert_eq!(e.pcie_width_current, Some(16));
+            assert_eq!(e.pcie_gen_max, None);
+            assert_eq!(e.pcie_width_max, None);
+        }
     }
 
     #[test]

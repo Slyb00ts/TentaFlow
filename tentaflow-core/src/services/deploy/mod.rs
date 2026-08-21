@@ -13,6 +13,7 @@ pub mod embedded;
 pub mod external;
 pub mod gpu_topology;
 pub mod python_bundle;
+pub mod required_assets;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -503,6 +504,24 @@ pub async fn deploy(
         }
     }
 
+    // 1c. Materialise the engine's `[[required_asset]]` files into the central
+    // host directory. Shared by docker (read-only bind mount) and native (env
+    // path), so it must happen BEFORE the strategy — a missing/corrupt model
+    // has to fail the deploy here, not silently at engine start.
+    if let Err(e) = required_assets::ensure_required_assets(manifest, sink.as_ref()).await {
+        if let Some(s) = &sink {
+            s.emit("error", &format!("[fetch-assets-failed] {}", e));
+        }
+        mark_finished(
+            db,
+            job.deployment_id,
+            DeploymentStatus::Failed,
+            Some(&e.to_string()),
+        );
+        mark_worker_deploy_failed(db, &job, &slug, &e.to_string());
+        return Err(e);
+    }
+
     // 2. Pick strategy.
     let mut strategy: Box<dyn DeployStrategy> = match method {
         DeployMethod::NativeEmbedded => Box::new(embedded::EmbeddedDeploy::new(
@@ -685,6 +704,10 @@ pub async fn respawn(
             .flatten()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+
+    // Same central asset step as `deploy()` — a respawn after a wiped models
+    // directory must restore the engine's files instead of starting without them.
+    required_assets::ensure_required_assets(&manifest, None).await?;
 
     let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
         DeployMethod::NativeEmbedded => {
@@ -1197,8 +1220,9 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
     // Zapamietujemy hash drzewa zrodel z momentu deployu, aby pozniej wykryc, ze
     // wbudowany bundle zostal zaktualizowany (snapshot porownuje go z aktualnym
     // hashem manifestu). embedded/external nie maja buildowalnego drzewa -> pusty.
-    let deployed_source_hash = crate::services::manifest::registry()
-        .by_id(&prepared.engine_id)
+    let manifest = crate::services::manifest::registry().by_id(&prepared.engine_id);
+    let on_demand = manifest.map(|m| m.engine.is_on_demand()).unwrap_or(false);
+    let deployed_source_hash = manifest
         .map(|m| match prepared.deploy_method {
             DeployMethod::Docker => m.docker_source_hash.clone(),
             DeployMethod::NativeBinary
@@ -1224,7 +1248,11 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         // head-a przez supervisora zrestartowalby `ray start --head` bez
         // ponownego dolaczenia workerow (martwa sesja Ray) — redeployem steruje
         // koordynator klastra, nie supervisor.
-        pinned: if prepared.config_json.contains("\"_distributed\"") {
+        //
+        // On-demand engines are never pinned either: `auto_start_pinned`
+        // respawns every pinned row it finds Stopped, which would re-run the
+        // deploy of an engine that is meant to stay down between requests.
+        pinned: if prepared.config_json.contains("\"_distributed\"") || on_demand {
             false
         } else {
             default_pinned()
@@ -1237,7 +1265,7 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         config_json: prepared.config_json.clone(),
         active_deploy_id: String::new(),
         last_deploy_id: String::new(),
-        deployment_progress_pct: if status == ServiceStatus::Running {
+        deployment_progress_pct: if status == ServiceStatus::Running || on_demand {
             100
         } else {
             0
@@ -1258,6 +1286,20 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
 /// Lazy loading dziala tam tez, ale wlaczany recznie przez odpiecie serwisu.
 pub(crate) fn default_pinned() -> bool {
     !cfg!(any(target_os = "ios", target_os = "android"))
+}
+
+/// Status a finished deploy writes on the `services` row.
+///
+/// `Running` for a normal engine (the deploy left a live process behind).
+/// `Stopped` for an `on-demand` engine: the artifact is built and the engine is
+/// registered, but nothing runs until the owning subsystem starts an instance.
+/// `Stopped` is exactly that state — no runtime, deploy finished, startable.
+pub(crate) fn deployed_status(manifest: &ServiceManifest) -> ServiceStatus {
+    if manifest.engine.is_on_demand() {
+        ServiceStatus::Stopped
+    } else {
+        ServiceStatus::Running
+    }
 }
 
 fn build_placeholder_service(
@@ -2049,6 +2091,7 @@ mod apply_parameters_deploy_tests {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            lifecycle: None,
         }
     }
 
@@ -2077,6 +2120,7 @@ mod apply_parameters_deploy_tests {
             parameters,
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -2337,6 +2381,7 @@ mod hf_token_gate_tests {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            lifecycle: None,
         }
     }
 
@@ -2410,6 +2455,7 @@ mod hf_token_gate_tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -2961,6 +3007,59 @@ pub(crate) fn category_tag(manifest: &ServiceManifest) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `services` row a finished on-demand deploy leaves behind: registered
+    /// and startable, but with no runtime and never auto-started. `teams-bot` is
+    /// the shipped on-demand engine, so this also pins its manifest declaration.
+    #[test]
+    fn on_demand_deploy_writes_registered_but_not_running_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+
+        let prepared = PreparedDeploy {
+            engine_id: "teams-bot".into(),
+            category: "agents".into(),
+            display_name: "Teams Bot".into(),
+            deploy_method: DeployMethod::Docker,
+            transport: Transport::HttpDirect,
+            runtime: RuntimeHandle {
+                pid: None,
+                port: None,
+                sidecar_port: None,
+                endpoint_url: None,
+                container_id: None,
+                instance_dir: None,
+            },
+            models: Vec::new(),
+            config_json: "{}".into(),
+            allocated_ports: Vec::new(),
+        };
+        let manifest = crate::services::manifest::registry()
+            .by_id("teams-bot")
+            .expect("teams-bot manifest is bundled");
+        assert!(
+            manifest.engine.is_on_demand(),
+            "teams-bot must declare lifecycle = \"on-demand\""
+        );
+
+        let status = deployed_status(manifest);
+        let new = build_new_service(&prepared, status);
+        let id = services_repo::insert(&conn, &new).unwrap();
+        let mut tx_conn = conn;
+        let tx = tx_conn.transaction().unwrap();
+        services_repo::finish_deploy_in_tx(&tx, id, &new, status).unwrap();
+        tx.commit().unwrap();
+
+        let row = services_repo::get(&tx_conn, id).unwrap().unwrap();
+        assert_eq!(row.status, ServiceStatus::Stopped);
+        assert_eq!(row.engine_id, "teams-bot");
+        assert_eq!(row.runtime_pid, None);
+        assert_eq!(row.runtime_port, None);
+        assert_eq!(row.endpoint_url, None);
+        // Pinned would make `auto_start_pinned` redeploy it on every boot.
+        assert!(!row.pinned, "an on-demand engine must not be pinned");
+        assert_eq!(row.deployment_progress_pct, 100);
+    }
     use crate::services::manifest::{
         ApiKind, Category, DeploySection, Engine, ModelPreset, NativeDeploy, NativeRuntime,
         TargetOs,
@@ -2994,6 +3093,7 @@ mod tests {
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,
+                lifecycle: None,
             },
             deploy: DeploySection {
                 docker: None,
@@ -3028,6 +3128,7 @@ mod tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 

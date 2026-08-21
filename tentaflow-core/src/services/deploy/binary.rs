@@ -24,7 +24,7 @@ use super::{
 use crate::services::manifest::{NativeRuntime, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
-use crate::services_repo::services::{self as services_repo, DeployMethod, ServiceStatus};
+use crate::services_repo::services::{self as services_repo, DeployMethod};
 
 pub struct BinaryDeploy {
     manifest: ServiceManifest,
@@ -224,6 +224,54 @@ impl DeployStrategy for BinaryDeploy {
         }
 
         let root = self.binary_root()?;
+
+        // On-demand engine: the native bundle is the deployable artifact and the
+        // process is started per request by the subsystem that owns it
+        // (teams-bot → `MeetingManager::start_session` spawns `tentaflow-meeting`
+        // per meeting). There is no server to spawn here — the startup-script
+        // candidates below are builders for such a bundle, and running one as a
+        // server would exit immediately and fail the deploy on the health probe.
+        if self.manifest.engine.is_on_demand() {
+            let (_param_app, request_time) = super::apply_parameters_deploy(
+                &self.manifest,
+                &self.user_config,
+                super::DeployTarget::NativeBinary,
+            )
+            .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+            let config_json = super::merge_config_json(&self.user_config, &request_time)
+                .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+            if let Some(s) = &self.log_sink {
+                s.progress(
+                    "ready",
+                    100,
+                    &format!(
+                        "[binary] bundle {} ready; engine '{}' is on-demand — no process started, \
+                         instances are launched per request",
+                        root.display(),
+                        self.manifest.engine.id
+                    ),
+                );
+            }
+            return Ok(PreparedDeploy {
+                engine_id: self.manifest.engine.id.clone(),
+                category: category_tag(&self.manifest).to_string(),
+                display_name: resolve_display_name(&self.manifest),
+                deploy_method: DeployMethod::NativeBinary,
+                transport: Transport::HttpDirect,
+                runtime: RuntimeHandle {
+                    pid: None,
+                    port: None,
+                    sidecar_port: None,
+                    endpoint_url: None,
+                    container_id: None,
+                    instance_dir: None,
+                },
+                models: Vec::new(),
+                config_json,
+                allocated_ports: Vec::new(),
+            });
+        }
+
         let managed_cli_executable = if native.runtime == NativeRuntime::ManagedCli {
             let source_hash = self.manifest.native_source_hash.trim();
             if source_hash.is_empty() {
@@ -527,12 +575,10 @@ impl DeployStrategy for BinaryDeploy {
         service_id: i64,
         prepared: &PreparedDeploy,
     ) -> DeployResult<()> {
-        let new = build_new_service(prepared, ServiceStatus::Running);
+        let status = super::deployed_status(&self.manifest);
+        let new = build_new_service(prepared, status);
         Ok(services_repo::finish_deploy_in_tx(
-            tx,
-            service_id,
-            &new,
-            ServiceStatus::Running,
+            tx, service_id, &new, status,
         )?)
     }
 
@@ -565,7 +611,8 @@ impl BinaryDeploy {
 mod tests {
     use super::*;
     use crate::services::manifest::{
-        ApiKind, Category, DeploySection, Engine, NativeDeploy, NativeRuntime, TargetOs,
+        ApiKind, Category, DeploySection, Engine, EngineLifecycle, NativeDeploy, NativeRuntime,
+        TargetOs,
     };
     use std::collections::HashSet;
 
@@ -597,6 +644,7 @@ mod tests {
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,
+                lifecycle: None,
             },
             deploy: DeploySection {
                 docker: None,
@@ -613,6 +661,7 @@ mod tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -646,6 +695,51 @@ fi
         let mut perms = f.metadata().unwrap().permissions();
         perms.set_mode(0o755);
         std::fs::set_permissions(&path, perms).unwrap();
+    }
+
+    /// `lifecycle = "on-demand"`: prepare must build nothing runnable — no
+    /// child process, no leased port, no endpoint to probe. The bundle dir here
+    /// holds a `build.sh`, which the normal path would happily launch AS the
+    /// server and then fail on the readiness probe when it exits.
+    #[tokio::test]
+    async fn on_demand_engine_skips_spawn_and_probe() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("build.sh"), "#!/bin/sh\nexit 0\n").unwrap();
+        let mut manifest = make_manifest("bin-on-demand", dir.path().to_str().unwrap());
+        manifest.engine.lifecycle = Some(EngineLifecycle::OnDemand);
+        let ports = Arc::new(PortAllocator::new((49_910, 49_920), HashSet::new()).unwrap());
+        let mut s = BinaryDeploy::new(manifest, serde_json::json!({}), ports.clone(), None, None);
+
+        let prepared = s.prepare().await.expect("prepare succeeds");
+
+        assert_eq!(prepared.runtime.pid, None, "no process may be spawned");
+        assert_eq!(prepared.runtime.port, None);
+        assert_eq!(prepared.runtime.endpoint_url, None);
+        assert!(prepared.allocated_ports.is_empty(), "no port may be leased");
+        assert!(
+            s.child.lock().unwrap().is_none(),
+            "no child handle may be stored"
+        );
+        // Every port stays free for a real service.
+        for _ in 0..10 {
+            ports.acquire().expect("no port was leased by the deploy");
+        }
+    }
+
+    /// The status a finished deploy writes: an on-demand engine is registered
+    /// but not running, a normal engine is running.
+    #[test]
+    fn deployed_status_follows_lifecycle() {
+        let mut manifest = make_manifest("bin-status", "/nonexistent");
+        assert_eq!(
+            super::super::deployed_status(&manifest),
+            crate::services_repo::services::ServiceStatus::Running
+        );
+        manifest.engine.lifecycle = Some(EngineLifecycle::OnDemand);
+        assert_eq!(
+            super::super::deployed_status(&manifest),
+            crate::services_repo::services::ServiceStatus::Stopped
+        );
     }
 
     #[cfg(unix)]

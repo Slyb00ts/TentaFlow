@@ -113,6 +113,13 @@ export function isPresetOnly(service) {
   return service?.engine?.preset_only === true;
 }
 
+/// `[engine] lifecycle = "on-demand"` — silnik nie trzyma dlugozyjacego procesu,
+/// instancje powstaja per zadanie. Dla takiego serwisu brak procesu to stan
+/// normalny, a nie awaria, wiec UI nie moze go pokazywac jako "zatrzymany".
+export function isOnDemand(service) {
+  return String(service?.engine?.lifecycle || '').toLowerCase() === 'on-demand';
+}
+
 export function isEngineCompatible(service, hostOs, host) {
   if (!service) return false;
   // Cluster target ma os=null (heterogeniczne wezly) — nie filtrujemy po OS,

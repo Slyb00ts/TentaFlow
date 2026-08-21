@@ -1286,6 +1286,24 @@ mod services_manifest_build {
         /// embedded/external runtimes.
         #[serde(default)]
         pub native_source_hash: String,
+        /// Mirror of runtime `ServiceManifest.required_assets` — runtime model
+        /// files the bundle excludes (`*.onnx` & friends). Must be carried
+        /// through, otherwise deploy never learns what to fetch.
+        #[serde(default, rename = "required_asset")]
+        pub required_assets: Vec<RequiredAsset>,
+    }
+
+    /// Mirror runtime `RequiredAsset`.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct RequiredAsset {
+        pub path: String,
+        pub mount_path: String,
+        pub url: String,
+        pub sha256: String,
+        #[serde(default)]
+        pub repo_path: Option<String>,
+        #[serde(default)]
+        pub env_var: Option<String>,
     }
 
     /// Mirror runtime `EngineParameter`. Build-time type — synchronizowany
@@ -1421,6 +1439,18 @@ mod services_manifest_build {
         /// (deploy wizard + service editor) can gate the VRAM calculator on it.
         #[serde(default)]
         pub backend: Option<String>,
+        /// Mirror of runtime `Engine.lifecycle`. Without it the field would be
+        /// dropped when the TOML is re-serialised into the embedded JSON, and
+        /// an `on-demand` engine would be deployed as a long-lived service.
+        #[serde(default)]
+        pub lifecycle: Option<EngineLifecycle>,
+    }
+
+    #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "kebab-case")]
+    pub enum EngineLifecycle {
+        Service,
+        OnDemand,
     }
 
     #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -1855,11 +1885,90 @@ mod services_manifest_build {
         }
 
         validate_parameters(manifest, &mut errors);
+        validate_required_assets(manifest, &mut errors);
 
         if errors.is_empty() {
             Ok(())
         } else {
             Err(errors)
+        }
+    }
+
+    /// Walidacja sekcji [[required_asset]]: `path` to sama nazwa pliku w
+    /// centralnym katalogu (bez separatorow), `mount_path` sciezka absolutna
+    /// w kontenerze, `repo_path` (opcjonalny) sciezka wzgledna w repo bez
+    /// `..`, URL http(s), sha256 jako 64 znaki lowercase hex. Bledna
+    /// deklaracja zatrzymuje build — w deployu objawilaby sie dopiero jako
+    /// silnik startujacy bez modelu.
+    fn validate_required_assets(manifest: &ServiceManifest, errors: &mut Vec<String>) {
+        let eid = &manifest.engine.id;
+        let mut seen: std::collections::HashSet<&str> = Default::default();
+        for asset in &manifest.required_assets {
+            if !seen.insert(asset.path.as_str()) {
+                errors.push(format!(
+                    "engine '{}': required_asset.path '{}' zduplikowany",
+                    eid, asset.path
+                ));
+            }
+            let name_ok = !asset.path.is_empty()
+                && !asset.path.contains('/')
+                && !asset.path.contains('\\')
+                && asset.path != "."
+                && asset.path != "..";
+            if !name_ok {
+                errors.push(format!(
+                    "engine '{}': required_asset.path '{}' musi byc sama nazwa pliku (bez separatorow sciezki)",
+                    eid, asset.path
+                ));
+            }
+            if !asset.mount_path.starts_with('/') {
+                errors.push(format!(
+                    "engine '{}': required_asset.mount_path '{}' musi byc sciezka absolutna",
+                    eid, asset.mount_path
+                ));
+            }
+            if let Some(repo) = &asset.repo_path {
+                let p = std::path::Path::new(repo);
+                let ok = p.is_relative()
+                    && p.components()
+                        .all(|c| matches!(c, std::path::Component::Normal(_)));
+                if !ok {
+                    errors.push(format!(
+                        "engine '{}': required_asset.repo_path '{}' musi byc wzgledna sciezka w repo",
+                        eid, repo
+                    ));
+                }
+            }
+            if let Some(env) = &asset.env_var {
+                let ok = !env.is_empty()
+                    && env
+                        .bytes()
+                        .all(|b| b.is_ascii_uppercase() || b.is_ascii_digit() || b == b'_')
+                    && env.as_bytes()[0].is_ascii_uppercase();
+                if !ok {
+                    errors.push(format!(
+                        "engine '{}': required_asset.env_var '{}' musi pasowac do '^[A-Z][A-Z0-9_]*$'",
+                        eid, env
+                    ));
+                }
+            }
+            if !(asset.url.starts_with("https://") || asset.url.starts_with("http://")) {
+                errors.push(format!(
+                    "engine '{}': required_asset.url '{}' musi byc adresem http(s)",
+                    eid, asset.url
+                ));
+            }
+            if asset.sha256.len() != 64
+                || !asset
+                    .sha256
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+            {
+                errors.push(format!(
+                    "engine '{}': required_asset.sha256 '{}' musi byc 64-znakowym lowercase hex",
+                    eid, asset.sha256
+                ));
+            }
         }
     }
 

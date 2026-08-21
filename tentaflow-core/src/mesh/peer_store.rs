@@ -122,11 +122,18 @@ pub struct PeerGpuInfo {
     pub uuid: Option<String>,
     #[serde(default)]
     pub fan_speed_percent: Option<u8>,
-    /// Current PCIe link generation / lane width (NVIDIA only).
+    /// Maximum PCIe link generation / lane width — the slot/board capability
+    /// (NVIDIA only). This is what describes the hardware.
     #[serde(default)]
     pub pcie_link_gen: Option<u8>,
     #[serde(default)]
     pub pcie_link_width: Option<u8>,
+    /// Momentary negotiated link — an idle card drops to Gen1, so this only
+    /// describes the current power state, never the hardware.
+    #[serde(default)]
+    pub pcie_link_gen_current: Option<u8>,
+    #[serde(default)]
+    pub pcie_link_width_current: Option<u8>,
 }
 
 /// One inter-GPU link of a peer (`nvidia-smi topo -m`), `a < b` are GPU
@@ -1357,6 +1364,8 @@ mod tests {
             fan_speed_percent: Some(35),
             pcie_link_gen: Some(4),
             pcie_link_width: Some(16),
+            pcie_link_gen_current: Some(1),
+            pcie_link_width_current: Some(16),
         };
 
         let bytes = crate::mesh::cbor::encode(&gpu).expect("encode");
@@ -1375,6 +1384,8 @@ mod tests {
         assert_eq!(decoded.fan_speed_percent, Some(35));
         assert_eq!(decoded.pcie_link_gen, Some(4));
         assert_eq!(decoded.pcie_link_width, Some(16));
+        assert_eq!(decoded.pcie_link_gen_current, Some(1));
+        assert_eq!(decoded.pcie_link_width_current, Some(16));
     }
 
     #[test]

@@ -947,16 +947,26 @@ function categoryChipClass(category) {
 
 function renderRow(s) {
   const paused = !!s.paused;
-  const statusInfo = mapStatusToChip(s.status, paused);
+  // Silnik on-demand nie ma dlugozyjacego procesu — brak procesu jest jego
+  // stanem docelowym. Bez tego wiersz wyglada identycznie jak serwis, ktory
+  // padl (szary chip "Zatrzymany" + przycisk "Uruchom" sugerujacy naprawe).
+  const onDemandIdle = ManifestStore.isOnDemand(ManifestStore.byId(s.engine_id || s.engineId))
+    && !paused
+    && (s.status || '').toLowerCase() === 'stopped';
+  const statusInfo = onDemandIdle
+    ? { variant: 'info', dot: false, key: 'on_demand' }
+    : mapStatusToChip(s.status, paused);
   const statusLabel = I18n.t(`services.status.${statusInfo.key}`)
     || s.status || '—';
   // progress_message niesie krotki opis fazy startu od supervisor
   // heartbeat (np. "warming up — alive 30s, waiting for /v1/models").
   // Renderujemy pod chipem statusu, zeby user widzial PROGRES startu
   // serwisu a nie tylko "Starting" przez minuty.
-  const progressMsg = typeof s.progress_message === 'string' && s.progress_message.length > 0
-    ? s.progress_message
-    : '';
+  const progressMsg = onDemandIdle
+    ? I18n.t('services.on_demand_hint')
+    : (typeof s.progress_message === 'string' && s.progress_message.length > 0
+        ? s.progress_message
+        : '');
   const progressBadge = progressMsg
     ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(progressMsg)}</div>`
     : '';
@@ -1004,6 +1014,8 @@ function renderRow(s) {
   const isStarting = ['starting', 'deploying'].includes((s.status || '').toLowerCase());
   const isRunning = ['running', 'degraded'].includes((s.status || '').toLowerCase()) && !paused;
   const showPlay = paused || !isRunning;
+  // Reczny start silnika on-demand nie ma sensu — nie ma czego uruchamiac.
+  const hidePausePlay = onDemandIdle;
   const ppIcon = isStarting ? 'rotate' : (showPlay ? 'play' : 'pause');
   const ppAction = showPlay ? 'start' : 'pause';
   const ppTooltip = showPlay
@@ -1087,13 +1099,13 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
         ${codingAgentActions}
-        <tf-button variant="ghost" size="sm" icon="${ppIcon}"
+        ${hidePausePlay ? '' : `<tf-button variant="ghost" size="sm" icon="${ppIcon}"
           data-svc-pause-play="${svcId}"
           data-svc-action="${ppAction}"
           data-svc-node="${svcNodeId}"
           data-svc-key="${svcActionKey}"
           ${isStarting ? 'disabled' : ''}
-          title="${escapeAttr(ppTooltip)}"></tf-button>
+          title="${escapeAttr(ppTooltip)}"></tf-button>`}
         <tf-button variant="ghost" size="sm" icon="pin"
           class="svc-pin-toggle${pinned ? ' pinned' : ''}"
           data-svc-pin-toggle="${svcId}"
@@ -2003,6 +2015,7 @@ async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
         throw new Error(resp.message || 'stop klastra nieudany');
       }
       await refreshServiceList();
+      window.dispatchEvent(new CustomEvent('tf:nav-counts-stale'));
       return;
     }
     // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
@@ -2016,6 +2029,7 @@ async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
       throw new Error(resp.error || 'Unknown error');
     }
     await refreshServiceList();
+    window.dispatchEvent(new CustomEvent('tf:nav-counts-stale'));
   } catch (err) {
     showRowError(`${nodeId || 'unknown'}:${id}`, err.message);
   }

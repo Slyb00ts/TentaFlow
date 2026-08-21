@@ -562,6 +562,9 @@ async function renderApp() {
   // w utils.js i tak uchroni przed spam'em bledow).
   refreshNavCounts();
   setInterval(refreshNavCounts, 30000);
+  // Ekrany, ktore same dodaja/usuwaja zliczane obiekty, nie moga czekac do 30 s
+  // na kolejny tick — inaczej badge pokazuje nieistniejacy juz serwis.
+  window.addEventListener('tf:nav-counts-stale', () => { refreshNavCounts(); });
 }
 
 async function refreshNavCounts() {

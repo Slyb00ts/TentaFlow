@@ -1,5 +1,7 @@
 {
   "gpu_topology": {
+    "pcie_link": "PCIe Gen{gen} x{width}",
+    "pcie_current_hint": "currently Gen{gen} x{width} — idle power saving",
     "title": "GPU topology",
     "pair": "Pair {letter} · {link}",
     "no_pair": "no pair",
@@ -2083,6 +2085,7 @@
     "node_local_badge": "local",
     "confirm_delete_title": "Delete service",
     "confirm_delete_body": "Delete \"{name}\" from {node}?",
+    "on_demand_hint": "ready — instances are created per request",
     "status": {
       "none": "None",
       "connected": "Connected",
@@ -3803,6 +3806,9 @@
     "profile_node_btn": "Profile node",
     "profile_gpu_btn": "Profile this GPU",
     "profile_view_sessions": "Sessions",
+    "profiling_section": "Profiling",
+    "profiling_hint": "Capture multi-source profiling sessions for this node and review the reports on the dedicated screen.",
+    "profile_start": "Start profiling…",
     "profile_started": "Profiling session started",
     "profile_unavailable": "Profiling is not available on this node.",
     "profile_error": "Profiling error",
@@ -4820,7 +4826,10 @@
     "continue_background": "Continue in background",
     "success": "Deploy succeeded",
     "failed": "Deploy failed",
-    "err_generic": "Unknown error"
+    "err_generic": "Unknown error",
+    "status_reconnecting": "Reconnecting",
+    "stream_lost": "Log stream interrupted — the deploy is still running",
+    "stream_resumed": "Log stream resumed"
   },
   "chat": {
     "title": "Chat",

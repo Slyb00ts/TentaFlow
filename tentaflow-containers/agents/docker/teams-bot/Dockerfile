@@ -65,9 +65,9 @@ RUN useradd -m -s /bin/bash sidecar
 # Konfiguracja PulseAudio
 COPY tentaflow-containers/agents/docker/teams-bot/pulseaudio.conf /etc/pulse/default.pa
 
-# Model Silero VAD (diarization jest w routerze, nie w bocie)
+# Model Silero VAD montowany read-only z hosta (manifest [[required_asset]]) —
+# obraz go nie zawiera, diarization jest w routerze, nie w bocie.
 RUN mkdir -p /opt/models
-COPY tentaflow-containers/agents/native/teams-bot/models/silero_vad.onnx /opt/models/silero_vad.onnx
 
 # Binary z etapu budowania (skopiowane poza cache mount do /artifacts)
 COPY --from=builder /artifacts/tentaflow-meeting /usr/local/bin/tentaflow-meeting

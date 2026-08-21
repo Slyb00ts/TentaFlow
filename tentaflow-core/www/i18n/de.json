@@ -1,5 +1,7 @@
 {
   "gpu_topology": {
+    "pcie_link": "PCIe Gen{gen} x{width}",
+    "pcie_current_hint": "aktuell Gen{gen} x{width} — Energiesparen im Leerlauf",
     "title": "GPU-Topologie",
     "pair": "Paar {letter} · {link}",
     "no_pair": "ohne Paar",
@@ -2086,6 +2088,7 @@
     "model_col_nodes": "Verfügbar auf",
     "model_loaded": "Geladen",
     "model_unloaded": "Nicht geladen",
+    "on_demand_hint": "bereit — Instanzen werden pro Anfrage erstellt",
     "status": {
       "none": "Keiner",
       "connected": "Verbunden",
@@ -2096,7 +2099,8 @@
       "running": "Läuft",
       "starting": "Startet",
       "stopped": "Gestoppt",
-      "error": "Fehler"
+      "error": "Fehler",
+      "on_demand": "Auf Anfrage"
     },
     "deploy": {
       "title": "Neuen Dienst bereitstellen",
@@ -3645,6 +3649,9 @@
     "profile_node_btn": "Knoten profilieren",
     "profile_gpu_btn": "Diese GPU profilieren",
     "profile_view_sessions": "Sitzungen",
+    "profiling_section": "Profiling",
+    "profiling_hint": "Erfassen Sie Profiling-Sitzungen aus mehreren Quellen für diesen Knoten und prüfen Sie die Berichte im eigenen Bildschirm.",
+    "profile_start": "Profiling starten…",
     "profile_started": "Profiling-Sitzung gestartet",
     "profile_unavailable": "Profiling ist auf diesem Knoten nicht verfügbar.",
     "profile_error": "Profiling-Fehler",
@@ -3942,7 +3949,10 @@
     "continue_background": "Im Hintergrund fortsetzen",
     "success": "Deploy erfolgreich",
     "failed": "Deploy fehlgeschlagen",
-    "err_generic": "Unbekannter Fehler"
+    "err_generic": "Unbekannter Fehler",
+    "status_reconnecting": "Verbindung wird wiederhergestellt",
+    "stream_lost": "Log-Stream unterbrochen — das Deploy läuft weiter",
+    "stream_resumed": "Log-Stream fortgesetzt"
   },
   "chat": {
     "title": "Chat",

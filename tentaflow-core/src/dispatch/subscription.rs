@@ -29,6 +29,27 @@ use tracing::{debug, warn};
 /// upstream stream handler na push_chunk_async. Backpressure przez `send().await`.
 pub const DEFAULT_CHANNEL_CAPACITY: usize = 256;
 
+/// Pojemnosc kanalu dla wysokowolumenowych strumieni TEKSTOWYCH (logi deployu,
+/// benchmarku, ingestu). Docker build potrafi wypluc tysiace linii w sekundy,
+/// a zrodlem jest broadcast log_bus o glebokosci 1024 — plytszy kanal
+/// subscription zmuszalby producenta do czekania tak dlugo, ze broadcast
+/// zaczyna gubic linie (RecvError::Lagged). Rowna glebokosc = burst miesci sie
+/// w buforze i zaden log nie ginie. To DODATEK do backpressure, nie zamiennik.
+pub const LOG_STREAM_CHANNEL_CAPACITY: usize = 1024;
+
+/// Pojemnosc kanalu subscription dobrana per wariant requestu. Strumienie
+/// logow dostaja glebszy bufor (patrz `LOG_STREAM_CHANNEL_CAPACITY`), reszta
+/// domyslny.
+pub fn channel_capacity_for(variant_name: &str) -> usize {
+    match variant_name {
+        "DeploymentLogStreamRequest"
+        | "BenchmarkRunStreamRequest"
+        | "ProjectStudioIngestStreamRequest"
+        | "ProjectStudioArchiveStreamRequest" => LOG_STREAM_CHANNEL_CAPACITY,
+        _ => DEFAULT_CHANNEL_CAPACITY,
+    }
+}
+
 // =============================================================================
 // Globalny registry
 // =============================================================================
@@ -117,7 +138,17 @@ impl SubscriptionRegistry {
         correlation_id: u64,
         bucket: Option<BucketTier>,
     ) -> (Arc<Subscription>, mpsc::Receiver<SubscriptionEvent>) {
-        let (tx, rx) = mpsc::channel(DEFAULT_CHANNEL_CAPACITY);
+        self.create_with_capacity(correlation_id, bucket, DEFAULT_CHANNEL_CAPACITY)
+    }
+
+    /// Jak `create`, ale z jawna pojemnoscia kanalu (patrz `channel_capacity_for`).
+    pub fn create_with_capacity(
+        &self,
+        correlation_id: u64,
+        bucket: Option<BucketTier>,
+        capacity: usize,
+    ) -> (Arc<Subscription>, mpsc::Receiver<SubscriptionEvent>) {
+        let (tx, rx) = mpsc::channel(capacity);
         let sub = Arc::new(Subscription {
             correlation_id,
             bucket,
@@ -238,6 +269,53 @@ pub async fn push_end_async(
         .send(SubscriptionEvent::End(final_body))
         .await
         .map_err(|e| format!("end send: {}", e))
+}
+
+// =============================================================================
+// Strażnik ramki terminalnej
+// =============================================================================
+
+/// RAII guard gwarantujacy, ze subscription ZAWSZE dostanie ramke terminalna.
+/// Bez tego kazdy wczesny `return` w tasku streamujacym (blad wysylki, zamkniety
+/// odbiorca, panika) zostawialby klienta z otwartym oknem, ktore nigdy sie nie
+/// domknie — dokladnie objaw "konsola stoi i nic nie widac".
+pub struct StreamEndGuard {
+    sub: Arc<Subscription>,
+    armed: bool,
+}
+
+impl StreamEndGuard {
+    pub fn new(sub: Arc<Subscription>) -> Self {
+        Self { sub, armed: true }
+    }
+
+    /// Wysyla ramke terminalna z backpressure i rozbraja guard.
+    pub async fn finish(mut self, final_body: Option<MessageBody>) {
+        self.armed = false;
+        let _ = push_end_async(&self.sub, final_body).await;
+    }
+}
+
+impl Drop for StreamEndGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        match self.sub.tx.try_send(SubscriptionEvent::End(None)) {
+            // Zamkniety odbiorca to normalne zakonczenie (klient odszedl), nie blad.
+            Ok(()) | Err(mpsc::error::TrySendError::Closed(_)) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                // Drop nie moze czekac; oddaj ramke osobnemu taskowi, zeby chwilowo
+                // pelna kolejka writera nie zjadla konca strumienia.
+                let sub = Arc::clone(&self.sub);
+                if let Ok(handle) = tokio::runtime::Handle::try_current() {
+                    handle.spawn(async move {
+                        let _ = push_end_async(&sub, None).await;
+                    });
+                }
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -388,6 +466,110 @@ mod tests {
             }
         }
         assert_eq!(accepted, DEFAULT_CHANNEL_CAPACITY);
+    }
+
+    #[tokio::test]
+    async fn end_guard_emits_terminal_frame_on_drop() {
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1, None);
+        {
+            let _guard = StreamEndGuard::new(Arc::clone(&sub));
+        }
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SubscriptionEvent::End(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn end_guard_finish_sends_body_and_disarms() {
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(1, None);
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
+        guard
+            .finish(Some(MessageBody::MetaHeartbeat { sent_at_epoch: 9 }))
+            .await;
+
+        match rx.recv().await.unwrap() {
+            SubscriptionEvent::End(Some(MessageBody::MetaHeartbeat { sent_at_epoch })) => {
+                assert_eq!(sent_at_epoch, 9)
+            }
+            other => panic!("expected End(body), got {:?}", other),
+        }
+        // Rozbrojony guard nie moze dosypac drugiej ramki terminalnej.
+        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+    }
+
+    #[tokio::test]
+    async fn end_guard_on_closed_receiver_does_not_panic() {
+        let reg = SubscriptionRegistry::new();
+        let (sub, rx) = reg.create(1, None);
+        drop(rx);
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
+        drop(guard);
+        // Rowniez jawna sciezka finish na zamknietym kanale musi byc no-op.
+        StreamEndGuard::new(sub).finish(None).await;
+    }
+
+    #[tokio::test]
+    async fn end_guard_delivers_terminal_frame_despite_full_channel() {
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create_with_capacity(1, None, 2);
+        push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 1 }).unwrap();
+        push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 2 }).unwrap();
+        drop(StreamEndGuard::new(Arc::clone(&sub)));
+        drop(sub);
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SubscriptionEvent::Chunk(_)
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SubscriptionEvent::Chunk(_)
+        ));
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SubscriptionEvent::End(None)
+        ));
+    }
+
+    #[tokio::test]
+    async fn push_chunk_async_waits_instead_of_failing() {
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create_with_capacity(1, None, 1);
+        push_chunk(&sub, MessageBody::MetaHeartbeat { sent_at_epoch: 1 }).unwrap();
+
+        let sender = Arc::clone(&sub);
+        let task = tokio::spawn(async move {
+            push_chunk_async(&sender, MessageBody::MetaHeartbeat { sent_at_epoch: 2 }).await
+        });
+
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SubscriptionEvent::Chunk(_)
+        ));
+        task.await.unwrap().expect("slow consumer must not kill the stream");
+        assert!(matches!(
+            rx.recv().await.unwrap(),
+            SubscriptionEvent::Chunk(_)
+        ));
+    }
+
+    #[test]
+    fn log_streams_get_a_deeper_channel() {
+        assert_eq!(
+            channel_capacity_for("DeploymentLogStreamRequest"),
+            LOG_STREAM_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            channel_capacity_for("BenchmarkRunStreamRequest"),
+            LOG_STREAM_CHANNEL_CAPACITY
+        );
+        assert_eq!(
+            channel_capacity_for("ChatStreamRequest"),
+            DEFAULT_CHANNEL_CAPACITY
+        );
     }
 
     #[tokio::test]

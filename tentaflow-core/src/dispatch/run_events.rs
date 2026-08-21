@@ -270,12 +270,16 @@ fn run_events_subscribe_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                 Err(RecvError::Closed) => break,
             }
         }
+
+        // The broker scope closing is the only way this task ends with a live
+        // client; emit the terminal frame so the run view is not left waiting.
+        let _ = push_end(&sub, None);
     });
 
-    // `push_end` is intentionally NOT called here: the subscription lives until
-    // the client cancels or disconnects (the broker channel never closes for a
-    // healthy session). The spawned task drains until the WS writer drops the
-    // receiver.
+    // `push_end` is intentionally NOT called on this path: the subscription
+    // lives until the client cancels or disconnects (the broker channel never
+    // closes for a healthy session). The spawned task drains until the WS writer
+    // drops the receiver, and ends the stream if the scope closes.
 }
 
 inventory::submit! {

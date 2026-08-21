@@ -11,10 +11,20 @@ license = "MIT"
 default_port = 5000
 api = "custom"
 version = "0.1.0"
+# Bot nie jest dlugozyjacym serwisem: instancja powstaje per spotkanie
+# (`MeetingManager::start_session` -> kontener `meeting-bot-<id>` / subprocess
+# `tentaflow-meeting`). Deploy z katalogu ma wiec TYLKO przygotowac artefakt
+# (obraz dockera / bundle native) i zarejestrowac silnik — bez startu instancji
+# i bez sondy gotowosci.
+lifecycle = "on-demand"
 # Bot otwiera strumienie zwrotne do Core (tury flow, eventy spotkania) na
 # polaczeniu, ktore Core nawiazal — Core akceptuje accept_bi tylko z ta flaga.
 reverse_requests = true
 
+# `transport` opisuje jak Core rozmawia z DLUGOZYJACA instancja serwisu i dla
+# `lifecycle = "on-demand"` nie ma zastosowania: sesyjny kontener bota jest
+# serwerem iroh na ALPN `tentaflow-service/v1`, a Core laczy sie z nim przez
+# `MeetingManager` (rejestracja `meeting-bot-<id>`), nie przez wiersz `services`.
 [deploy.docker]
 context_path = "agents/docker/teams-bot"
 platforms = ["linux"]
@@ -27,3 +37,15 @@ transport = "direct-http"
 platforms = ["linux", "macos", "windows"]
 runtime = "binary"
 binary_path = "agents/native/teams-bot"
+
+# Silero VAD ONNX. Nie wchodzi do obrazu ani do binarki (build.rs wyklucza
+# `*.onnx`) — deploy pobiera go raz do `<models>/engine-assets/teams-bot/`,
+# docker montuje read-only pod `mount_path`, native dostaje sciezke hosta w
+# `VAD_MODEL_PATH`.
+[[required_asset]]
+path = "silero_vad.onnx"
+mount_path = "/opt/models/silero_vad.onnx"
+url = "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx"
+sha256 = "2623a2953f6ff3d2c1e61740c6cdb7168133479b267dfef114a4a3cc5bdd788f"
+repo_path = "tentaflow-containers/agents/native/teams-bot/models/silero_vad.onnx"
+env_var = "VAD_MODEL_PATH"

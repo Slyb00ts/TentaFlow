@@ -424,11 +424,16 @@ pub fn tentaflow_home() -> &'static Path {
     })
 }
 
-/// Walk up from likely source-tree anchors looking for a directory that
-/// contains both a top-level crate (`tentaflow/Cargo.toml`) and either a
-/// `.git/` directory or a `target_shared/` sibling. Returns
-/// `<anchor>/.runtime/` when matched.
+/// `<repo_root>/.runtime/` when the binary runs from a source checkout.
 fn detect_repo_runtime() -> Option<PathBuf> {
+    repo_root().map(|root| root.join(".runtime"))
+}
+
+/// Root of the source checkout the binary was built from, when it is still
+/// reachable. Walks up from likely anchors (crate dir, cwd, exe dir) looking
+/// for a `.git/` directory or the `tentaflow` + `tentaflow-core` crate pair.
+/// `None` for an installed binary outside any checkout.
+pub fn repo_root() -> Option<PathBuf> {
     let mut candidates: Vec<PathBuf> = Vec::new();
     if let Some(manifest) = option_env!("CARGO_MANIFEST_DIR") {
         candidates.push(PathBuf::from(manifest));
@@ -448,7 +453,7 @@ fn detect_repo_runtime() -> Option<PathBuf> {
                 || (dir.join("tentaflow").join("Cargo.toml").exists()
                     && dir.join("tentaflow-core").join("Cargo.toml").exists());
             if is_repo_root {
-                return Some(dir.join(".runtime"));
+                return Some(dir.to_path_buf());
             }
             cur = dir.parent();
         }
@@ -653,6 +658,13 @@ pub const CONTAINER_VLLM_CACHE_PATH: &str = "/data/vllm-cache";
 /// the same way it redirects bundle templates.
 pub fn vllm_cache_dir() -> PathBuf {
     cache_dir().join("vllm")
+}
+
+/// Host directory holding the `[[required_asset]]` files of one engine
+/// (`<models>/engine-assets/<engine_id>/`). ONE copy serves every deploy
+/// variant: docker bind-mounts it read-only, native passes the path via env.
+pub fn engine_assets_dir(engine_id: &str) -> PathBuf {
+    models_root().join("engine-assets").join(engine_id)
 }
 
 /// Where the extracted `tentaflow-containers/` bundle lives at runtime.

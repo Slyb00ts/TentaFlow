@@ -15,7 +15,7 @@ import { I18n } from '/js/i18n.js';
 import * as Manifest from '/js/modules/catalog/manifest-store.js';
 import { deployIcon, render as renderIcon } from '/js/modules/catalog/catalog-icons.js';
 import { isCameraCvEngineId } from '/js/modules/catalog/camera-cv-bundles.js';
-import { computeGpuGroups, gpuPairChipHtml, gpuTopologyLegendHtml, selectionLinkHintHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
+import { computeGpuGroups, gpuPairChipHtml, gpuTopologyLegendHtml, pcieLinkHtml, selectionLinkHintHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
 import '/js/components/tf-progress-bar.js';
 
 let currentStep = 1;
@@ -2787,16 +2787,13 @@ function renderStepGpu() {
   const topology = computeGpuGroups(gpus.length, gpuLinks);
 
   const rows = gpus.map((g, idx) => {
-    const pcie = (g.pcie_link_gen != null && g.pcie_link_width != null)
-      ? `PCIe Gen${g.pcie_link_gen} x${g.pcie_link_width}`
-      : '';
     const meta = [
-      g.pci_bus_id ? shortPciBusId(g.pci_bus_id) : '',
-      pcie,
-      g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '',
-      g.usage_percent != null ? `util ${Math.round(g.usage_percent)}%` : '',
+      g.pci_bus_id ? escapeHtml(shortPciBusId(g.pci_bus_id)) : '',
+      pcieLinkHtml(g),
+      g.temperature_c != null ? escapeHtml(`${Math.round(g.temperature_c)}°C`) : '',
+      g.usage_percent != null ? escapeHtml(`util ${Math.round(g.usage_percent)}%`) : '',
     ].filter(Boolean);
-    const metaHtml = meta.map((m, i) => i < meta.length - 1 ? `<span>${escapeHtml(m)}</span><span class="sep">·</span>` : `<span>${escapeHtml(m)}</span>`).join(' ');
+    const metaHtml = meta.map((m, i) => i < meta.length - 1 ? `<span>${m}</span><span class="sep">·</span>` : `<span>${m}</span>`).join(' ');
     const total = Number(g.vram_total_mb) || 0;
     let vramHtml;
     if (total > 0 && g.vram_used_mb != null) {

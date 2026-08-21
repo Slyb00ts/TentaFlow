@@ -32,6 +32,12 @@ enum BotBackend {
 /// subprocess (`runtime=binary` po `deploy.native`) czy kontener Docker.
 /// Brak wpisu = Docker (wstecznie kompatybilne — przed dodaniem native
 /// botow tabela `services` nie zawierala teams-bota wcale).
+///
+/// Patrzymy na WSZYSTKIE wiersze, nie tylko `running`: teams-bot jest silnikiem
+/// `lifecycle = "on-demand"`, wiec po deployu jego wiersz stoi w `stopped`
+/// (artefakt gotowy, instancja startuje dopiero tutaj). Liczy sie NAJNOWSZY
+/// wiersz (najwyzsze id) — po przedeployowaniu z native na docker wygrywa ten
+/// ostatni, a nie pierwszy z brzegu.
 fn detect_backend(db: &DbPool) -> BotBackend {
     use crate::services_repo::services::{self as services_repo, DeployMethod};
 
@@ -42,22 +48,21 @@ fn detect_backend(db: &DbPool) -> BotBackend {
             return BotBackend::Docker;
         }
     };
-    let services = match services_repo::list_alive(&conn) {
+    let services = match services_repo::list_all(&conn) {
         Ok(s) => s,
         Err(e) => {
-            warn!("detect_backend: list_alive blad ({}), fallback Docker", e);
+            warn!("detect_backend: list_all blad ({}), fallback Docker", e);
             return BotBackend::Docker;
         }
     };
-    for svc in &services {
-        if svc.engine_id != "teams-bot" {
-            continue;
-        }
-        if matches!(svc.deploy_method, DeployMethod::NativeBinary) {
-            return BotBackend::Native;
-        }
+    let latest = services
+        .iter()
+        .filter(|svc| svc.engine_id == "teams-bot")
+        .max_by_key(|svc| svc.id);
+    match latest {
+        Some(svc) if matches!(svc.deploy_method, DeployMethod::NativeBinary) => BotBackend::Native,
+        _ => BotBackend::Docker,
     }
-    BotBackend::Docker
 }
 
 #[derive(Debug, Clone)]

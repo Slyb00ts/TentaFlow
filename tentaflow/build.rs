@@ -724,26 +724,6 @@ fn build_meeting_bot() {
         return;
     }
 
-    // Kopiuj model Silero VAD obok binarki — bot na native szuka go w
-    // `current_exe()/silero_vad.onnx` jako fallback do `/opt/models/...`.
-    let vad_src = bot_dir.join("models").join("silero_vad.onnx");
-    if vad_src.exists() {
-        let vad_dest = target_dir.join("silero_vad.onnx");
-        if let Err(e) = std::fs::copy(&vad_src, &vad_dest) {
-            println!(
-                "cargo:warning=tentaflow: copy silero_vad.onnx nieudane: {}",
-                e
-            );
-        }
-    } else {
-        // Brak modelu w repo — bot przejdzie na fallback RMS, builder dostaje warning
-        // raz, zeby nie spamowac na kazdym buildzie nie-Linux.
-        println!(
-            "cargo:warning=tentaflow: brak {} — bot uzyje fallback RMS dla VAD (gorsza jakosc)",
-            vad_src.display()
-        );
-    }
-
     println!(
         "cargo:warning=tentaflow: tentaflow-meeting gotowy ({})",
         dest_bin.display()

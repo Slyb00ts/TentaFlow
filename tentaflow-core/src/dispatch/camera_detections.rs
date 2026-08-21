@@ -258,11 +258,16 @@ fn camera_detections_subscribe_handler(
                 Err(RecvError::Closed) => break,
             }
         }
+
+        // The detection bus is process-wide and never closes for a healthy node,
+        // but if it does the client must learn the overlay stream ended instead
+        // of waiting on a producer that no longer exists.
+        let _ = push_end(&sub, None);
     });
 
-    // No `push_end` here: the subscription lives until the client cancels or
-    // disconnects. The spawned task drains until the WS writer drops the
-    // receiver.
+    // No `push_end` on this path: the subscription lives until the client
+    // cancels or disconnects. The spawned task drains until the WS writer drops
+    // the receiver, and emits the terminal frame if the bus itself closes.
 }
 
 inventory::submit! {

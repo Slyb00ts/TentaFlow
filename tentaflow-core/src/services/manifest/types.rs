@@ -23,6 +23,38 @@ pub struct ServiceManifest {
     /// time. Empty for embedded/external runtimes. Populated by build.rs.
     #[serde(default)]
     pub native_source_hash: String,
+    /// Runtime files an engine needs but the binary must not carry (large
+    /// model weights; `build.rs` excludes `*.onnx`/`*.gguf`/`*.pth`/
+    /// `*.safetensors` from the embedded bundle). Deploy materialises each
+    /// entry into `paths::engine_assets_dir(engine_id)` BEFORE any variant
+    /// starts: docker bind-mounts it read-only at `mount_path`, native points
+    /// at the host copy. The image never contains the file.
+    #[serde(default, rename = "required_asset")]
+    pub required_assets: Vec<RequiredAsset>,
+}
+
+/// One `[[required_asset]]` entry: a runtime file fetched once into the
+/// central engine-assets directory and shared by every deploy variant.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RequiredAsset {
+    /// File name under `paths::engine_assets_dir(engine_id)`.
+    pub path: String,
+    /// Absolute path the container sees (read-only bind mount target).
+    pub mount_path: String,
+    /// Stable public download URL.
+    pub url: String,
+    /// Lowercase hex sha256 of the expected content. A file that does not
+    /// match is deleted and the deploy fails.
+    pub sha256: String,
+    /// Path inside the source checkout (relative to the repo root) where a
+    /// developer machine already has the file — copied instead of downloaded
+    /// after the checksum matches.
+    #[serde(default)]
+    pub repo_path: Option<String>,
+    /// Environment variable that carries the resolved path to the engine
+    /// process: `mount_path` for a container, the host path for native.
+    #[serde(default)]
+    pub env_var: Option<String>,
 }
 
 /// `[engine]` section with catalog metadata.
@@ -119,9 +151,35 @@ pub struct Engine {
     /// deploy wizard. `None` = bespoke server (whisper, sherpa, custom HTTP).
     #[serde(default)]
     pub backend: Option<String>,
+    /// How the engine's runtime is started. `None`/`service` = the deploy owns
+    /// a long-lived process the supervisor probes and restarts. `on-demand` =
+    /// the deploy only PREPARES the artifact (docker image, native bundle) and
+    /// registers the engine; the instance is started later, per request, by the
+    /// Core subsystem that owns it (`teams-bot` → `MeetingManager::start_session`
+    /// spawns one `meeting-bot-<session>` container per meeting). Starting such
+    /// an engine at deploy time would hang on a readiness probe no instance can
+    /// ever satisfy and leave an orphaned container behind.
+    #[serde(default)]
+    pub lifecycle: Option<EngineLifecycle>,
+}
+
+/// Value of `[engine].lifecycle`.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "kebab-case")]
+pub enum EngineLifecycle {
+    /// Long-lived process owned by the deploy + supervisor (every other engine).
+    #[default]
+    Service,
+    /// Artifact prepared by the deploy, instance started per request elsewhere.
+    OnDemand,
 }
 
 impl Engine {
+    /// True when the deploy must not start a runtime for this engine.
+    pub fn is_on_demand(&self) -> bool {
+        self.lifecycle == Some(EngineLifecycle::OnDemand)
+    }
+
     /// True when this engine is served by CUDA vLLM and therefore accepts the
     /// `--gpu-memory-utilization` budget. Excludes the Metal variant: vLLM on
     /// Apple has no CUDA memory budget to set.

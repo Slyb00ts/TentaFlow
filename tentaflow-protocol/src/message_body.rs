@@ -4107,11 +4107,17 @@ pub struct MeshNodeGpuInfo {
     pub power_limit_w: Option<f32>,
     #[serde(default)]
     pub fan_speed_percent: Option<u8>,
-    /// Current (not max) PCIe link generation / lane width.
+    /// Maximum PCIe link generation / lane width — the slot/board capability.
     #[serde(default)]
     pub pcie_link_gen: Option<u8>,
     #[serde(default)]
     pub pcie_link_width: Option<u8>,
+    /// Momentarily negotiated link; an idle card drops to Gen1, so it reflects
+    /// the power state, not the hardware.
+    #[serde(default)]
+    pub pcie_link_gen_current: Option<u8>,
+    #[serde(default)]
+    pub pcie_link_width_current: Option<u8>,
 }
 
 /// One inter-GPU link from `nvidia-smi topo -m`; `a`/`b` are the node's GPU

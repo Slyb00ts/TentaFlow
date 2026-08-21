@@ -343,6 +343,15 @@ impl Supervisor {
     /// the initial snapshot is non-empty. PID liveness is consulted before any
     /// probe; a stale row is marked `failed` (the loop will respawn it).
     pub async fn run_first_tick(&self) -> Result<(), SupervisorError> {
+        // `list_supervised` covers running/degraded/starting only, so a row left
+        // in `deploying` by a Core restart mid-deploy is invisible to every later
+        // tick: no process runs, no probe touches it, and the UI shows a deploy
+        // that never ends. At boot no deploy can legitimately be in flight yet,
+        // so every such row is a leftover and gets the honest terminal state.
+        if let Err(e) = self.fail_interrupted_deploys().await {
+            tracing::warn!("supervisor: fail_interrupted_deploys failed: {}", e);
+        }
+
         let services = self.read_supervised().await?;
 
         for svc in &services {
@@ -430,6 +439,40 @@ impl Supervisor {
 
         let snapshot = self.build_snapshot().await?;
         let _ = self.snapshot_tx.send(Arc::new(snapshot));
+        Ok(())
+    }
+
+    /// Marks every `deploying` row as failed. Run once, at the top of the boot
+    /// tick — see the call site for why such a row can only be a leftover.
+    async fn fail_interrupted_deploys(&self) -> Result<(), SupervisorError> {
+        let db = self.db.clone();
+        let stale: Vec<i64> = tokio::task::spawn_blocking(move || {
+            let conn = db
+                .read()
+                .map_err(|e| SupervisorError::Database(format!("db read: {}", e)))?;
+            let rows = services_repo::list_all(&conn)
+                .map_err(|e| SupervisorError::Database(e.to_string()))?;
+            Ok::<_, SupervisorError>(
+                rows.into_iter()
+                    .filter(|r| r.status == ServiceStatus::Deploying)
+                    .map(|r| r.id)
+                    .collect(),
+            )
+        })
+        .await
+        .map_err(|e| SupervisorError::Database(format!("join: {}", e)))??;
+        for id in stale {
+            tracing::warn!(
+                "supervisor: service {} still 'deploying' at boot — deploy was interrupted",
+                id
+            );
+            self.mark_status(
+                id,
+                ServiceStatus::Failed,
+                Some("deploy interrupted by core restart"),
+            )
+            .await;
+        }
         Ok(())
     }
 
@@ -1975,6 +2018,46 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Failed);
+    }
+
+    /// A row left in `deploying` by a Core restart is invisible to every later
+    /// supervisor pass, so the boot tick has to close it. Rows the supervisor
+    /// does watch must not be touched.
+    #[tokio::test]
+    async fn boot_fails_rows_stuck_in_deploying() {
+        let db = open_db();
+        let (sup, _rx) = Supervisor::new(
+            &cfg(1_000, 5, 60_000),
+            db.clone(),
+            ports_for_test(50_700, 50_710),
+            cipher_for_test(),
+            "test-node".to_string(),
+            Arc::new(MeshServicesRegistry::new()),
+            Arc::new(LiveHandlesCache::new()),
+        );
+
+        let mut row = NewService::minimal("stuck", DeployMethod::Docker, Transport::HttpDirect);
+        row.status = ServiceStatus::Deploying;
+        let (stuck, running) = {
+            let conn = db.write().unwrap();
+            let stuck = services_repo::insert(&conn, &row).unwrap();
+            let mut ok = NewService::minimal("ok", DeployMethod::Docker, Transport::HttpDirect);
+            ok.status = ServiceStatus::Running;
+            let running = services_repo::insert(&conn, &ok).unwrap();
+            (stuck, running)
+        };
+
+        sup.fail_interrupted_deploys().await.unwrap();
+
+        let conn = db.read().unwrap();
+        assert_eq!(
+            services_repo::get(&conn, stuck).unwrap().unwrap().status,
+            ServiceStatus::Failed
+        );
+        assert_eq!(
+            services_repo::get(&conn, running).unwrap().unwrap().status,
+            ServiceStatus::Running
+        );
     }
 
     #[tokio::test]

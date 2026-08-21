@@ -19916,8 +19916,8 @@ pub mod deployments {
     ) -> Result<()> {
         let conn = pool.write().unwrap();
         conn.execute(
-            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status, config_json)
-             VALUES (?1, ?2, ?3, ?4, 'deploying', ?5)",
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'deploying', ?5, CURRENT_TIMESTAMP)",
             params![deploy_id, engine_id, deploy_method, node_id, config_json],
         )?;
         Ok(())
