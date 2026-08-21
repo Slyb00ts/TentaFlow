@@ -802,3 +802,69 @@ Dwie pułapki po drodze, obie tej samej klasy co wcześniejszy błąd `sha256sum
 próbuje kopiować katalog — potrzebne `cp -Pp`; oraz **zlokalizowany `diff` pisze „Tylko w",
 nie „Only in"**, więc filtr plików nieśledzonych przepuszczał wszystko. `LC_ALL=C` jest
 nośne, nie kosmetyczne — bez niego `verify-tree.sh` raportowałby czyste drzewo zawsze.
+
+---
+
+## Rekonesans przed trzema niezaczętymi torami (2026-08-21)
+
+Trzy agenty tylko czytające, bez kompilacji i bez edycji. Wynik zmienia treść trzech zleceń,
+a jedno zadanie z §5b briefu **kasuje**.
+
+### §5b.1 — „`CODE_STUDIO_PLAN.md` §16.2 mówi 9 bloków, kod ma 10" — **NIEPRAWDA, zadanie odpada**
+
+Wszystkie trzy człony zarzutu obalone dowodem:
+- §16.2 (`:1485`) mówi **10 bloków**, graf `:1487-1498` wymienia dokładnie dziesięć, a kod
+  (`seed.rs:1850-1874`, 7 wspólnych + `patch_review` + `persist_turn` + `output`) daje 10.
+  Doc comment `seed.rs:1844` też mówi „10 blocks". **Zgodność, nie rozjazd.**
+- `patch_review` **NIE MA** w tabeli „czego tu nie ma" (`:1536-1542`, cztery wiersze). Został
+  z niej usunięty świadomie, z uzasadnieniem wypisanym wprost w `:1544-1551`.
+- §16.4 istotnie pisze „opcjonalny", ale w znaczeniu „opcjonalny jako blok dla flow SPOZA
+  harnessu" — §9.1 (`:983`) godzi obie sekcje wprost.
+
+Jedyny nieaktualny tekst to dwa wiersze changelogu 1.7→1.8 (`:31-32`), opisujące stan sprzed
+poprawki. Changelog z definicji opisuje przeszłość. **Nie ruszam.**
+
+### `audit_log.correlation_id` — brief mówi „nikt nie pisze"; to już nieaktualne
+
+Pisarz **istnieje**: `events/audit_outbox.rs:242-274`, z testem
+`the_delivered_row_carries_the_correlation_link_and_the_chain` (`:414-435`). Powstał na TEJ
+gałęzi, więc brief opisywał stan sprzed własnej pracy. Brakuje **wyłącznie strony odczytu**:
+`AuditLogEntry` (`message_body.rs:1074`) nie ma pola, `list_audit_logs`
+(`repository.rs:12269`) go nie SELECT-uje, `audit.js:331` nie pokazuje.
+
+**Pułapka:** `correlation_id` jest ŚWIADOMIE poza łańcuchem haszy (`audit_outbox.rs:266-269`).
+Dodanie go do `AuditRowHashInput` unieważniłoby każdy istniejący hasz. Nie wolno.
+
+### Pozostałe ustalenia, które wchodzą do zleceń
+
+- **`ensure_collection_at` ma ZERO produkcyjnych wołających** — potwierdzone wyczerpująco
+  (wszystkie trafienia to `services/graph/tests.rs` albo komentarze). R2b będzie pierwszym.
+- **`graph_home` nie istnieje nigdzie** — trzeba odtworzyć całą nić `vector_home`
+  (`dispatcher.rs:378`, `:533`, `node_adapter.rs:186` + `IngestRequest` + `stub_ctx`).
+- **`dispatch/run_events.rs` to pułapka nazwy** — to strumień postępu agentów, nie `events.db`.
+  Handler przeglądarki musi trafić gdzie indziej.
+- **Dziennik audytu NIE jest wzorcem filtra widoczności** — `audit_log_list` jest płaskim
+  `#[policy(Admin)]`. Wzorzec to `agent_runs_list` (`handlers.rs:8061-8083`): filtr wchodzi
+  **do SQL**, a `agent_run_detail` (`:8112-8140`) zwraca `not_found`, nie `PolicyDenied`,
+  żeby nie wyciekło istnienie cudzego przebiegu.
+- **Pasek zakładek Code Studio jest w `code-studio-session.js`**, nie `code-studio.js`
+  (`DOCK_CATEGORIES:40-47`, `VIEW_MAP:58-67`, `mountExternalPanes:724-756`).
+- **`CodeStudioPayload` ma 141 wariantów i DWIE plomby** — nazw wariantów (`:1769-1789`)
+  i nazw pól struktur wire (`:1792-1871`). Dodanie wariantu rusza obie.
+- **`tf-run-timeline` nie ma ANI JEDNEGO produkcyjnego konsumenta** — tylko fixture.
+
+### Sprzeczność w regule protokołu — do rozstrzygnięcia, nie zgadywana
+
+`CLAUDE.md:334` mówi „ciborium tags by variant NAME", a komentarze w pięciu plikach
+(`camera.rs:6`, `legal.rs:7`, `vision.rs:6`, `pii.rs:5`, `profiling.rs:891`) mówią o twardym
+limicie **256 wariantów w `MessageBody`** i przypisują go „CBOR 0.8". Obie rzeczy nie mogą
+być prawdą naraz, a dwie z nich są sprawdzalne:
+
+- `MessageBody` ma **312 wariantów** i działa w produkcji — czyli limitu 256 nie ma.
+- Zależność to **ciborium 0.2.2**, nie 0.8. Wersji 0.8 ciborium nie ma.
+
+Plomba `code_studio.rs:1781` mówi wprost „ciborium tags variants by name, so a rename silently
+breaks every deployed browser" — czyli krytyczne jest **nieprzemianowywanie**, a nie kolejność.
+Komentarze indeksowe sugerują odwrotnie (kolejność krytyczna, nazwa obojętna) i to jest rada
+niebezpieczna. **Nie poprawiam pięciu plików na podstawie rozumowania** — to wymaga dowodu
+empirycznego z kodowania, a ten należy do toru protokołowego.
