@@ -972,3 +972,55 @@ weryfikację na czystym drzewie przed raportem.
 Kolejność w skrypcie okna (blokada → mutacja → test → przywrócenie → zwolnienie) jest właściwym
 kształtem tego mechanizmu i powinna być domyślna w każdym następnym zleceniu. Wariant „nałóż
 mutację, potem czekaj na blokadę" jest z definicji niebezpieczny.
+
+---
+
+## INCYDENT 6: weryfikacja mutacji była PUSTA — `cmp` porównywał dwa równie zmutowane pliki
+
+Najpoważniejszy incydent tej sesji, bo trafił dokładnie w mechanizm, który miał chronić przed
+poprzednimi trzema.
+
+Harness okna mutacyjnego R2b robił kopię zapasową **per MUTACJA**, nie **per PLIK**:
+
+```python
+for m in spec["mutations"]:
+    backups[path] = path + ".gebak"
+    shutil.copy2(path, backups[path])   # <- wykonuje sie ZNOWU dla tego samego pliku
+```
+
+Przy kilku mutacjach w jednym pliku druga kopia łapała drzewo **z już nałożoną pierwszą
+mutacją**. Przywrócenie wpisywało z powrotem plik nadal zmutowany, a kontrola `cmp` porównywała
+dwa równie zmutowane pliki — i **przechodziła**. Każde okno raportowało „RESTORED (byte-identical)".
+
+**Wyciekło 9 mutacji** (7 w `graph_extract.rs`, 1 w `collection.rs` — dopasowanie provenance do
+DOWOLNEGO `doc_id`, czyli błąd międzydokumentowej utraty danych; +1 z ubitego okna d1).
+Nic nie zostało zacommitowane. Agent zauważył dopiero dlatego, że G4 **nie skompilowało się**,
+a on przeczytał źródło, żeby zdiagnozować — i zobaczył mutację w kodzie właśnie ogłoszonym
+jako przywrócony.
+
+### Wniosek, który wchodzi do reguł na stałe
+
+**`cmp` z kopią zapasową NIE JEST weryfikacją przywrócenia — nie wykrywa złej kopii.**
+Reguła §2.2 mówiła „przywróć z kopii i zweryfikuj CZYTAJĄC KOD Z POWROTEM". Odczyt kodu jest
+niezastąpiony właśnie dlatego, że jest niezależny od kopii. Harness zastąpił go `cmp`, czyli
+kontrolą zależną od tego samego zepsutego artefaktu, i zrobił z weryfikacji rytuał.
+
+**Nowy wymóg w każdym zleceniu:** po przywróceniu sprawdź, że **oryginalna kotwica każdej
+mutacji jest obecna w pliku** (asercja na tekst źródłowy), a nie że plik równa się kopii.
+Kontrola musi być niezależna od artefaktu, któremu nie ufamy.
+
+Dodatkowo: kopia zapasowa **raz na plik**, nigdy raz na mutację.
+
+### Status dowodów R2b
+
+- **G1 i G2 STOJĄ** — okna jednomutacyjne, więc błąd kopii ich nie dotyczył; miejsca
+  ponownie odczytane. G1: obie połowy kryterium (licznik `0 → 1` oraz panika `StubLlm`).
+  G2: bramka `graph_home` udowodniona licznikiem.
+- **G3 ODRZUCONE i do powtórki** — czerwienie były prawdziwe, ale powstały pod harnessem
+  kumulującym mutacje w rundzie, więc atrybucja jest niewiarygodna. Sam fakt „test spadł"
+  nic nie mówi, jeśli nie wiadomo, KTÓRA zmiana go spowodowała.
+- G4 (naprawione), D1, D2, S1 lecą pod poprawionym harnessem z kontrolą kotwic.
+
+Agent zgłosił to sam, zanim ktokolwiek zapytał, podał dokładną przyczynę źródłową i sam
+unieważnił własne wcześniejsze dowody. To jest zachowanie, którego ta pętla wymaga —
+raport bez tej sekcji byłby wart mniej niż nic.
