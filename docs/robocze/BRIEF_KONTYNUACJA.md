@@ -74,6 +74,15 @@ Trzy incydenty, wszystkie z winy orkiestratora. Wnioski wdrożone:
 6. **Limit sesji ubija wszystkich naraz.** Sufit równoległości narzuca limit, nie konflikt plików.
    Przy napiętym limicie **pracuj sekwencyjnie** — przerwanie kosztuje wtedy jeden tor, nie sześć.
 7. **Rozdzielaj własność plików jawnie** w każdym zleceniu (co wolno ruszyć, czego nie).
+8. **Weryfikacja przywrócenia musi być NIEZALEŻNA od kopii zapasowej.** Po przywróceniu sprawdź,
+   że **oryginalna kotwica każdej mutacji jest obecna w pliku** (asercja na tekst źródłowy).
+   `cmp` z kopią NIE wykrywa złej kopii — harness kopiujący raz na MUTACJĘ zamiast raz na PLIK
+   zapisywał kopię z już nałożoną poprzednią mutacją i przechodził własną kontrolę, wypuszczając
+   9 mutacji do drzewa z komunikatem „RESTORED (byte-identical)".
+9. **Blokada mutacji obejmuje TYLKO okno mutacji** (weź blokadę → mutuj → jeden odfiltrowany
+   test → przywróć → zwolnij). Zwykły build bez blokady. Nigdy nie mutuj przed wzięciem blokady.
+   Nigdy nie uruchamiaj nieodfiltrowanego `cargo test --lib` (~45 min, wiesza się na
+   `services::storage_proxy::server::tests::central_kv_proxy_writes_and_reads_on_authority`).
 
 ---
 
