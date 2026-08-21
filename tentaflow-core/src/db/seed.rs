@@ -2869,6 +2869,87 @@ mod tests {
         assert_eq!(history["require_session"].as_bool(), Some(false));
     }
 
+    /// The project chat runs the shared shell, so the shell's answer prompt IS
+    /// the project chat's persona. The retired ps-chat prompt told the model to
+    /// say the context was insufficient and then answer as best it could; the
+    /// shell confines it to the retrieved passages. That narrowing was a
+    /// deliberate, approved decision — this test keeps a later prompt edit from
+    /// reversing it silently. It asserts the OBLIGATIONS, not one sentence, so
+    /// rewording stays free while dropping a constraint fails here.
+    #[test]
+    fn shell_answer_prompt_grounds_the_model_in_the_retrieved_context() {
+        /// Case- and diacritic-insensitive, so the assertions survive a Polish
+        /// prompt written with or without diacritics.
+        fn normalize(text: &str) -> String {
+            text.to_lowercase()
+                .chars()
+                .map(|c| match c {
+                    '\u{105}' => 'a',
+                    '\u{107}' => 'c',
+                    '\u{119}' => 'e',
+                    '\u{142}' => 'l',
+                    '\u{144}' => 'n',
+                    '\u{f3}' => 'o',
+                    '\u{15b}' => 's',
+                    '\u{17a}' | '\u{17c}' => 'z',
+                    other => other,
+                })
+                .collect()
+        }
+
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        let flow_json: String = conn
+            .query_row(
+                "SELECT flow_json FROM flows WHERE id = ?1",
+                rusqlite::params![super::RAG_QUERY_FLOW_ID],
+                |r| r.get(0),
+            )
+            .expect("query flow");
+        let v: serde_json::Value = serde_json::from_str(&flow_json).unwrap();
+        let prompt = normalize(
+            v["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["type"] == "llm")
+                .expect("answer node")["config"]["system_prompt"]
+                .as_str()
+                .expect("answer node must carry a system prompt"),
+        );
+
+        // 1. The answer is confined to the supplied context, not merely informed
+        //    by it — a bare mention of "kontekst" is not the obligation.
+        assert!(
+            prompt.contains("kontekst"),
+            "answer prompt must speak about the retrieved context: {prompt}"
+        );
+        assert!(
+            ["wylacznie", "tylko", "jedynie"]
+                .iter()
+                .any(|w| prompt.contains(w)),
+            "answer prompt must confine the answer to the context, not just mention it: {prompt}"
+        );
+
+        // 2. Missing evidence is admitted, never papered over.
+        assert!(
+            ["nie wiesz", "nie wiem", "nie znasz"]
+                .iter()
+                .any(|w| prompt.contains(w)),
+            "answer prompt must tell the model to say it does not know when the \
+             context lacks the answer: {prompt}"
+        );
+
+        // 3. Nothing outside the context may be produced. This is what stops the
+        //    project chat from drifting back to answering from model knowledge.
+        assert!(
+            ["nie zmyslaj", "nie wymyslaj", "nie halucynuj", "nie dopowiadaj"]
+                .iter()
+                .any(|w| prompt.contains(w)),
+            "answer prompt must forbid inventing facts outside the context: {prompt}"
+        );
+    }
+
     /// Aliasy RAG naleza do platformy, nie do addona: istnieja po samym seedzie
     /// (bez instalacji addona), sa `public` i NIE maja wiersza wlasciciela.
     /// Wlasciciel-addon oznaczalby, ze `deactivate_aliases_owned_by_addon` gasi je

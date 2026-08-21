@@ -138,6 +138,22 @@ dla których istnieje degradacja do kolejności wektorowej. Błąd dotyczy wył�
 kontraktu `{query, candidates}`, którego ten flow nie używa. **Sprawdzaj kontrakt wejścia, nie
 komentarz w teście.**
 
+**Decyzje właściciela — zatwierdzone, nie cofać bez ponownej zgody:**
+
+1. **Czat projektu odpowiada WYŁĄCZNIE z bazy wiedzy.** Prompt węzła `answer` we wspólnej powłoce
+   nakazuje: brak odpowiedzi w kontekście = powiedz wprost, że nie wiesz, i nie zmyślaj faktów spoza
+   kontekstu. Wycofany `ps-chat` pozwalał domówić resztę „najlepiej jak umiesz". To zmiana persony,
+   świadoma i przyjęta. Pilnuje jej test
+   `db::seed::tests::shell_answer_prompt_grounds_the_model_in_the_retrieved_context` — sprawdza
+   obowiązki promptu, nie jego brzmienie, więc przeredagowanie jest wolne, a usunięcie warunku nie.
+2. **Projekt bez przypisanego agenta czatu odmawia głośno.** Handler streamu przerywa turę PRZED
+   dispatchem i zwraca `ChatStreamEnd{status:"error"}` z komunikatem, że projekt nie ma
+   skonfigurowanego modelu czatu i gdzie go ustawić. `model_fallback: "rag-llm"` zostaje w flow, bo
+   to własny domyślny model addona RAG (bundla WASM nie wolno przebudowywać) — ale czat projektu
+   już do niego nie dociera. Cichy fallback odpowiadałby właścicielowi modelem, którego nigdy nie
+   wybrał, i nic w UI by tego nie powiedziało. Test:
+   `dispatch::stream_handlers::tests::project_chat_refuses_a_project_with_no_chat_model`.
+
 **Odbiór 1.3:** to samo pytanie zadane przez addon i przez czat projektu przechodzi tym samym flow;
 czat nadal streamuje i nadal używa modelu projektu.
 

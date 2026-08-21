@@ -1893,11 +1893,11 @@ inventory::submit! {
 // (push failure fires the flow's cancel token — same contract as FlowInvoke).
 
 /// Chat model for a project turn: the project's 'chat' agent binding
-/// (`settings['agents']` in project.db) wins. Without a binding (or with an
-/// agent that names no model) this returns None, `RAG_ANSWER_MODEL_META` is
-/// left unstamped, and the shell's answer node falls back to the platform
-/// `rag-llm` alias — so such a project still gets an answer, on the platform
-/// model, instead of the llm node's hard "no model" error.
+/// (`settings['agents']` in project.db) wins; an agent naming no model counts
+/// as no binding. `None` means the turn is REFUSED before dispatch — the shell's
+/// `rag-llm` fallback exists for the RAG addon (whose WASM bundle pins it as its
+/// own default), and letting a project chat drift into it would answer the owner
+/// on a platform model they never chose, with nothing in the UI saying so.
 fn project_chat_model(project_id: &str) -> Option<String> {
     let pool = crate::project_studio::project_db::open(project_id).ok()?;
     let raw = crate::project_studio::repository::get_setting(&pool, "agents").ok()??;
@@ -2000,7 +2000,18 @@ fn project_studio_chat_stream_handler(
     };
     let caller_id = org.user_id.clone();
     let org_id = org.org_id.clone();
-    let model = project_chat_model(&project_id);
+    // Refuse BEFORE dispatch (and before persisting the turn): no binding means
+    // no model the owner picked, and the shell would otherwise answer on the
+    // addon's `rag-llm` fallback. Loud failure, not a plausible answer.
+    let Some(model) = project_chat_model(&project_id) else {
+        end_error(
+            &sub,
+            &chat_id,
+            "this project has no chat model configured: assign a chat agent in the project settings before starting a conversation"
+                .into(),
+        );
+        return;
+    };
     let router = ctx.state.router.clone();
     let db = ctx.state.db.clone();
 
@@ -2052,13 +2063,13 @@ fn project_studio_chat_stream_handler(
         // The shell reads its answer model from a DEDICATED meta entry, not from
         // `model`: routing seeds `model` with the flow's own published name when
         // the addon asks it by name, and the answer node must never dispatch the
-        // shell to itself. No project model = the shell's `rag-llm` fallback.
-        if let Some(m) = model {
-            envelope.meta.insert(
-                crate::db::seed::RAG_ANSWER_MODEL_META.into(),
-                serde_json::Value::String(m),
-            );
-        }
+        // shell to itself. Always stamped here — the turn was refused above when
+        // the project binds no model, so the shell's fallback is unreachable from
+        // the project chat.
+        envelope.meta.insert(
+            crate::db::seed::RAG_ANSWER_MODEL_META.into(),
+            serde_json::Value::String(model),
+        );
         // Terminal shape: the chat streams, so the shell's output node must not
         // rewrite the answer into the addon's `{answer, citations}` JSON. The
         // stamp belongs to the entry point (never to the model's content), same
@@ -6041,5 +6052,167 @@ mod tests {
                 super::super::CS_END_PERMISSION_REVOKED
             );
         }
+    }
+
+    /// A project that binds no chat agent must FAIL the turn loudly instead of
+    /// answering. The shared retrieval shell keeps a `rag-llm` fallback because
+    /// that alias is the RAG addon's own default (its WASM bundle pins it), so
+    /// without this gate a project owner would get plausible answers from a
+    /// model they never chose, billed to the platform, with nothing in the UI
+    /// saying so. The refusal happens before dispatch — no flow runs, and the
+    /// end frame carries no assistant message id.
+    #[tokio::test]
+    async fn project_chat_refuses_a_project_with_no_chat_model() {
+        use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
+        use crate::services::rbac::middleware::OrgContext;
+        use tentaflow_protocol::project_studio::ProjectStudioPayload;
+        use tentaflow_protocol::{MessageBody, SessionAuth};
+
+        let state = super::super::state::AppState::for_test();
+
+        // Both Project Studio pools are process-wide `OnceLock`s, so this works
+        // on freshly minted ids and the directory must outlive the handle.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let _ = crate::project_studio::db::init(&root.join("projects.db"));
+
+        let user_id = format!("u-{}", uuid::Uuid::new_v4());
+        let org_id = format!("org-{}", uuid::Uuid::new_v4());
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let dir = root.join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project dir");
+        crate::project_studio::repository::create_project(
+            &project_id,
+            &org_id,
+            &format!("chat gate {project_id}"),
+            "",
+            "blank",
+            r#"["knowledge","chat"]"#,
+            &user_id,
+            dir.to_str().expect("utf-8 project dir"),
+            &[],
+        )
+        .expect("create project");
+        let chat = crate::project_studio::repository::create_chat(&project_id, &user_id, "turn")
+            .expect("create chat");
+
+        // The project exists and is reachable — what it lacks is a chat binding.
+        assert!(
+            super::project_chat_model(&project_id).is_none(),
+            "fixture must have no chat agent binding"
+        );
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, mut rx) = reg.create(11, None);
+        let h = find_stream_handler("ProjectStudioChatStreamRequest").unwrap();
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [0x11u8; 16],
+                role: None,
+            },
+            correlation_id: 11,
+            connection_id: 0,
+            resume_secret: None,
+            state,
+            org_context: Some(OrgContext {
+                user_id: user_id.clone(),
+                org_id: org_id.clone(),
+                role_id: "org_admin".into(),
+                permissions: ["project_studio.read".to_string()].into_iter().collect(),
+            }),
+        };
+        (h.handler_fn)(
+            MessageBody::ProjectStudioBody(ProjectStudioPayload::ChatStreamRequest {
+                project_id: project_id.clone(),
+                chat_id: chat.chat_id.clone(),
+                message: "will this answer?".into(),
+            }),
+            ctx,
+            sub,
+        );
+
+        match rx.recv().await.expect("terminal frame") {
+            SubscriptionEvent::End(Some(MessageBody::ProjectStudioBody(
+                ProjectStudioPayload::ChatStreamEnd {
+                    status,
+                    error,
+                    message_id,
+                    ..
+                },
+            ))) => {
+                assert_eq!(status, "error", "the turn must fail, not answer");
+                let msg = error.expect("a refusal must carry a message");
+                assert!(
+                    msg.contains("chat model"),
+                    "the owner must learn WHAT is missing, got: {msg}"
+                );
+                assert!(
+                    msg.contains("settings"),
+                    "the owner must learn WHERE to fix it, got: {msg}"
+                );
+                assert!(
+                    message_id.is_empty(),
+                    "a refused turn produces no assistant message"
+                );
+            }
+            other => panic!("expected a loud refusal, got {other:?}"),
+        }
+    }
+
+    /// The other half of the gate: a project that DOES bind a chat agent
+    /// resolves that agent's model, so the refusal above is about the missing
+    /// binding and not a blanket block on every project chat.
+    #[test]
+    fn project_chat_model_resolves_the_bound_agent() {
+        let _state = super::super::state::AppState::for_test();
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::mem::forget(tmp);
+        let _ = crate::project_studio::db::init(&root.join("projects.db"));
+
+        let agent_id = uuid::Uuid::new_v4().to_string();
+        {
+            let core = crate::db::global_pool().expect("core pool");
+            let conn = core.write().expect("core write");
+            conn.execute(
+                "INSERT INTO agents (id, name, description, model) VALUES (?1, ?2, '', ?3)",
+                rusqlite::params![agent_id, "bound-agent", "team-llm"],
+            )
+            .expect("insert agent");
+        }
+
+        let user_id = format!("u-{}", uuid::Uuid::new_v4());
+        let org_id = format!("org-{}", uuid::Uuid::new_v4());
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let dir = root.join(&project_id);
+        std::fs::create_dir_all(&dir).expect("project dir");
+        crate::project_studio::repository::create_project(
+            &project_id,
+            &org_id,
+            &format!("bound {project_id}"),
+            "",
+            "blank",
+            r#"["knowledge","chat"]"#,
+            &user_id,
+            dir.to_str().expect("utf-8 project dir"),
+            &[],
+        )
+        .expect("create project");
+
+        let pool = crate::project_studio::project_db::open(&project_id).expect("project db");
+        crate::project_studio::repository::set_setting(
+            &pool,
+            "agents",
+            &format!(r#"{{"chat":"{agent_id}"}}"#),
+        )
+        .expect("bind chat agent");
+
+        assert_eq!(
+            super::project_chat_model(&project_id).as_deref(),
+            Some("team-llm")
+        );
     }
 }
