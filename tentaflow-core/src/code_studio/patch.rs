@@ -425,6 +425,16 @@ pub fn rescan_patch_set(pool: &DbPool, broker: &Broker, patch_set_id: &str) -> R
 /// and the session's own work are two different trees waiting for two different
 /// decisions. An ACCEPTED set is left alone too: it is waiting for its commit,
 /// and that commit no longer depends on the worktree at all.
+///
+/// A set over a CLEAN tree is persisted like any other. The id is handed to
+/// callers that have to find the row again later — `delegate_cli` opens the set
+/// before the vendor CLI starts, precisely so the base is the pre-delegation
+/// HEAD, and calls `rescan_patch_set` on that id when the turn ends; the merge
+/// path puts the id on the wire for the reviewer to fetch. An id that resolves
+/// to nothing turns the delegated work into a review nobody can open. This does
+/// not accumulate rows per turn: `tools::current_patch_set` reuses the open set
+/// of the scope, so the next turn journals into this one instead of adding
+/// another.
 pub fn open_patch_set(
     pool: &DbPool,
     broker: &Broker,
@@ -436,24 +446,6 @@ pub fn open_patch_set(
     let handle = worktree_handle(broker, session_id, scope)?;
     let files = scan_worktree(broker, &handle, base_commit)?;
     let patch_set_id = uuid::Uuid::new_v4().to_string();
-
-    // A clean tree gets a TRANSIENT set: nothing is written. The harness runs a
-    // review at the end of every turn, and most turns change nothing (a
-    // question, an explanation, a failed search) — persisting those would fill
-    // the Changes tab with empty rows and supersede an accepted set still
-    // waiting for its commit. Callers already treat an empty set as "nothing to
-    // review" and return early, so the row buys nobody anything.
-    if files.is_empty() {
-        return Ok(PatchSet {
-            id: patch_set_id,
-            session_id: session_id.to_string(),
-            run_id: run_id.map(str::to_string),
-            base_commit: base_commit.to_string(),
-            status: "open".to_string(),
-            scope: scope.clone(),
-            files,
-        });
-    }
 
     let mut conn = pool
         .write()
