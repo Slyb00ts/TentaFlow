@@ -716,3 +716,65 @@ niezmieniony, degradacja do kolejności wektorowej nadal obecna i nadal ogranicz
   `project_knowledge` (widoczny w Flow Builderze) i prefiks identyfikatora żądania
   `format!("ps-chat-{correlation_key}")` — ten drugi świadomie nietknięty, bo może występować
   w złączeniach audytu, więc zmiana nazwy to zmiana zachowania, nie porządki.
+
+---
+
+## Decyzje R3 wykonane (2026-08-21)
+
+| Decyzja | Wykonanie | Dowód |
+|---|---|---|
+| Persona czatu ZOSTAJE | test `shell_answer_prompt_grounds_the_model_in_the_retrieved_context` pinuje ZOBOWIĄZANIA promptu (kontekst + „nie wiem" + zakaz zmyślania), z alternatywnymi sformułowaniami — przeredagowanie przechodzi, usunięcie warunku pada | mutacja: podmiana promptu na ps-chatowy → test czerwony; po przywróceniu sha256 zgodny |
+| Fallback modelu ZDJĘTY dla czatu projektu | odmowa w punkcie wejścia, PRZED dispatchem i PRZED utrwaleniem wiadomości użytkownika; komunikat nazywa brak („przypisz agenta czatu w ustawieniach projektu"). Flow zachowuje `model_fallback` — to prawdziwy domyślny model addona, a addona (bundle WASM) nie wolno przebudować | mutacja: przywrócenie cichego fallbacku → test czerwony, i to z komunikatem „dispatch failed: pre-producer node 'hops' failed" — czyli dowód, że bez bramki właściciel dostaje błąd wewnętrzny zamiast instrukcji |
+| Historia ZASCOPE'OWANA | **zmiana planu po rekonesansie** — patrz niżej | 6 testów + 2 mutacje |
+
+### Dlaczego historia NIE dostała predykatu, tylko mintowany klucz
+
+Wykonawca zatrzymał się i **nie zrobił niczego**, zamiast dowieźć naprawę pozorną. Powód:
+`conversation_messages` **nie ma ŻADNEJ kolumny właściciela** — ani user, ani org, ani tabeli
+sesji do złączenia (`id, session_id, seq, role, content, tool_calls, tool_call_id, name,
+payload_ref, payload_kind, node_id, created_at, reasoning_content, citations_json`). Nie ma czego
+filtrować. Predykat po stronie odczytu albo by się nie skompilował, albo traktowałby „brak
+właściciela" jako wildcard — czyli nie naprawiałby nic.
+
+Dodatkowo zauważył, że `org_id` **nigdy nie jest ustawiane na ścieżce `/v1`**, więc filtr po
+organizacji zdegenerowałby się do „NULL pasuje do NULL" **dokładnie na ścieżce ataku**.
+
+Decyzja właściciela: zamiast migracji — **mintowanie klucza w punkcie wejścia**. Skoro problem
+brzmi „adres wybiera wołający", to serwer zaczyna składać adres. Cudzej rozmowy nie da się
+zaadresować Z KONSTRUKCJI, bez kolumny, bez migracji, bez zmiany ścieżki zapisu.
+
+Preimage jest **prefiksowany długościami obu części**, więc nie istnieje separator do przesunięcia:
+`("u", "a:b")` i `("u:a", "b")` kodują się różnie. Wykonawca sam zgłosił, że własność bezpieczeństwa
+opiera się na odporności SHA-256 na kolizje, a nie na bijekcji, i że wariant jawnotekstowy jest
+obronialną alternatywą — odnotowane, wybór zostaje (ogranicza długość klucza i nie wpuszcza
+identyfikatorów użytkowników do tabeli rozmów).
+
+**Koszt zaakceptowany świadomie:** zewnętrzny klient `/v1` liczący na pamięć między żądaniami raz
+zaczyna od pustej rozmowy (stare wiersze są nieosiągalne, nie skasowane), a status przebiegu
+agenta odpytywany po identyfikatorze, który klient wysłał, nie rozwiąże się. Do notatek wydaniowych.
+
+### NOWE ZNALEZISKO: druga furtka tej samej klasy — NIE naprawiona
+
+Wykonawca przeszukał drzewo i znalazł **drugi punkt wejścia o tym samym kształcie**, w pliku poza
+jego zakresem, więc go nie ruszył:
+
+- **`dispatch/stream_handlers.rs:113`** — czat pulpitu. `stream_req.session_id` (od klienta, po
+  protokole binarnym) opakowane w `MemoryOptions` i podane temu samemu builderowi.
+- **`dispatch/stream_handlers.rs:430`** — ścieżka `FlowInvoke`, przypisanie wprost.
+
+Ta sama tabela, ten sam brak właściciela. Różnica w osiągalności: `/v1` wymagało tylko klucza API,
+te dwa wymagają uwierzytelnionej sesji pulpitu — więc to user-do-usera, nie najemca-do-najemcy.
+Ale zalogowany użytkownik nadal może nazwać cudzy identyfikator rozmowy.
+
+**Rekomendacja wykonawcy (podzielam): NIE naprawiać przez przekluczowanie** — osierociłoby to każdą
+istniejącą rozmowę pulpitu, a te identyfikatory są już serwerowymi UUID-ami pokazywanymi w UI.
+Wzorzec w repo: `dispatch/run_events.rs:196-211` odmawia `AgentRunEventScope::Session`, dopóki
+`progress_broker.session_owner(session_id)` nie zmapuje jej na wołającego. Sprawdzenie własności
+na tym samym modelu pasuje tu bez zmiany żadnego zapisanego klucza.
+
+**Do decyzji człowieka.** Nie wchodzę w to z własnej inicjatywy.
+
+Zweryfikowane jako poprawnie mintowane przez serwer i świadomie nietknięte: czat Project Studio
+(`chat.session_id` z wiersza `project_chats`, tworzony `Uuid::new_v4()`, wyszukiwany z twardym
+filtrem po `user_id`) oraz `meeting/flow_turn.rs` (`meeting_id`). Test
+`non_api_origins_keep_their_server_chosen_session_id` pinuje, że te ścieżki zostają nietknięte.
