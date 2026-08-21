@@ -891,6 +891,15 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "database",
             r#"{"properties":{"namespace":{"type":"string","title":"Namespace","default":"passages","description":"Przestrzeń wektorowa w instancji addona"},"metric":{"type":"string","title":"Metryka","enum":[{"value":"cosine","label":"Cosine"},{"value":"euclidean","label":"Euclidean"},{"value":"dot","label":"Dot product"}],"default":"cosine"},"doc_id":{"type":"string","title":"Doc ID (opcjonalnie)","description":"Pomiń aby wziąć z envelope.meta['doc_id']"},"collection_id":{"type":"string","title":"Collection ID (opcjonalnie)","description":"Filtr per-kolekcja przy retrievalu"}},"required":["namespace"],"order":["namespace","metric","doc_id","collection_id"]}"#,
         ),
+        (
+            "graph_extract",
+            "service",
+            "Ekstrakcja grafu wiedzy",
+            "Wyciąga encje i relacje z chunków dokumentu (model czatu) i zapisuje je do kolekcji grafowej instancji, z provenancją per dokument. Wyłączony (`graph_enabled=false`) przepuszcza envelope bez ani jednego wywołania modelu.",
+            r#"{"model":"rag-llm","collection":"kg_active"}"#,
+            "share-2",
+            r#"{"properties":{"model":{"type":"string","title":"Model / alias ekstrakcji","description":"Model czatu wyciągający encje i relacje z chunków; domyślnie rag-llm","dynamic_enum":{"source":"models","category":"chat"},"default":"rag-llm"},"collection":{"type":"string","title":"Kolekcja grafu","description":"Kolekcja grafowa instancji, do której trafiają encje i relacje","default":"kg_active"},"batch_chars":{"type":"integer","title":"Znaków na wywołanie","description":"Ile znaków tekstu chunków trafia do JEDNEGO wywołania modelu (mniej = więcej wywołań)","minimum":500,"maximum":24000,"default":6000},"graph_enabled":{"type":"boolean","title":"Ekstrakcja włączona","description":"Wyłączenie sprawia, że węzeł przepuszcza envelope bez ani jednego wywołania modelu; puste = decyduje envelope.meta['graph_enabled']"}},"order":["model","collection","batch_chars","graph_enabled"]}"#,
+        ),
     ];
 
     // INSERT OR REPLACE — przy unique node_type aktualizujemy istniejace
@@ -3840,6 +3849,88 @@ mod tests {
             CompiledFlow::from_json(id, json, &registry)
                 .unwrap_or_else(|e| panic!("flow '{}': kompilacja nie przechodzi: {:?}", id, e));
         }
+    }
+
+    /// The platform ingest flow AS SEEDED. `flows.name` is the human label, not
+    /// the published model name, so the row is resolved through
+    /// `PLATFORM_RAG_FLOWS` by its published binding and then read by id.
+    #[cfg(test)]
+    fn seeded_ingest_flow_json() -> String {
+        let (id, ..) = super::PLATFORM_RAG_FLOWS
+            .iter()
+            .find(|(_, published, ..)| *published == "core:rag-ingest")
+            .expect("core:rag-ingest is a platform flow");
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.read().unwrap();
+        conn.query_row(
+            "SELECT flow_json FROM flows WHERE id = ?1",
+            rusqlite::params![id],
+            |r| r.get(0),
+        )
+        .expect("core:rag-ingest seeded")
+    }
+
+    /// The ingest flow's response is `pick_final_envelope`'s pick, and that is
+    /// the output of the node with the HIGHEST topological rank — not the node
+    /// the author thinks of as terminal. `graph_extract` hangs off `chunk` as a
+    /// second leaf, so the flow now has TWO terminal nodes and the rank order
+    /// between them decides whether `flow_outcome_to_ingest_response` receives
+    /// `store`'s `Json{markdown,chunks,page_count}` or a bag of chunk texts.
+    ///
+    /// What keeps `store` last is WHERE the branch hangs: `graph_extract` is a
+    /// leaf off `chunk`, two hops upstream of `store`, so it can never outrank
+    /// it. Re-parenting it onto `embed` or `store` would, and that is silent in
+    /// the JSON — it would surface only as ingest answering with a bag of chunk
+    /// texts at runtime. This pins it at build time instead.
+    #[test]
+    fn rag_ingest_flow_ends_at_the_store_node() {
+        use crate::flow_engine::cache::CompiledFlow;
+        use crate::flow_engine::dispatcher::build_registry_for_test;
+
+        let flow_json = seeded_ingest_flow_json();
+        let compiled = CompiledFlow::from_json("ingest", &flow_json, &build_registry_for_test())
+            .expect("ingest flow compiles");
+
+        let last_def_idx = *compiled
+            .execution_order
+            .last()
+            .expect("ingest flow has nodes");
+        assert_eq!(
+            compiled.definition.nodes[last_def_idx].id, "store",
+            "the highest topological rank must be `store`, got `{}` — final_envelope \
+             is taken from the LAST produced output, so ingest would answer with the \
+             wrong payload",
+            compiled.definition.nodes[last_def_idx].id
+        );
+        assert!(
+            compiled.definition.nodes.iter().any(|n| n.node_type == "graph_extract"),
+            "the ingest flow must still carry the graph_extract branch"
+        );
+    }
+
+    /// The shared platform ingest flow must NOT freeze `graph_enabled` into the
+    /// `graph_extract` node. Whether extraction runs is decided per CALLER, by
+    /// whether that caller established a `graph_home` — the RAG addon passes
+    /// none (it builds its own `kg_active` through host functions), Projects
+    /// pass one. A hardcoded `false` here would read as "off" and behave as
+    /// "permanently broken", and a hardcoded `true` would double-write the
+    /// addon's collection and hard-fail every default-features build.
+    #[test]
+    fn rag_ingest_flow_leaves_the_graph_toggle_to_the_caller() {
+        use crate::flow_engine::types::FlowDefinition;
+
+        let flow_json = seeded_ingest_flow_json();
+        let parsed: FlowDefinition = serde_json::from_str(&flow_json).expect("flow parses");
+        let node = parsed
+            .nodes
+            .iter()
+            .find(|n| n.node_type == "graph_extract")
+            .expect("ingest flow carries a graph_extract node");
+        assert!(
+            node.config.get("graph_enabled").is_none(),
+            "the shared ingest flow must not pin graph_enabled on the node: {:?}",
+            node.config
+        );
     }
 
     /// §16.6 — a session is pinned to a `flow_versions` row at open time, and

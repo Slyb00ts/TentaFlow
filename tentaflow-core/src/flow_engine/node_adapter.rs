@@ -185,6 +185,18 @@ pub struct ExecutionContext {
     /// `file_path`), wiec nie da sie nim przekierowac juz zapisanych danych.
     pub vector_home: Option<std::path::PathBuf>,
 
+    /// Directory in which this run's graph collection is to be created when it
+    /// does not exist yet. `None` => the default addon graph tree. Set by an
+    /// owner outside that tree (Projects: `<data>/projects/<id>/graph`), so the
+    /// generic `graph_extract` node writes into the owner's own directory.
+    ///
+    /// Held HERE, not in `envelope.meta`, for exactly the reason spelled out
+    /// for `vector_home` above: meta is writable by every node, a WASM addon
+    /// block included, and this value decides where a file is created on disk.
+    /// For an EXISTING collection the field is irrelevant (the stored
+    /// `file_path` wins), so it cannot redirect already-written data either.
+    pub graph_home: Option<std::path::PathBuf>,
+
     /// §2.5 — server-minted provenance of this run: where the request entered
     /// and who is behind it. Copied verbatim from `FlowRequestMeta` by
     /// `ContextFactory::make_context` and inherited by every sub-flow / loop /
@@ -866,6 +878,7 @@ pub mod test_support {
             user_role: None,
             addon_id: None,
             vector_home: None,
+            graph_home: None,
             org_id: None,
             // Test contexts run as the system with no entry point behind them.
             origin: FlowOrigin::System,

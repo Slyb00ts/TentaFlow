@@ -1748,6 +1748,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
             addon_id: None,
             org_id: None,
             vector_home: None,
+            graph_home: None,
             // §2.5 — a run inherits the principal's provenance verbatim, so a
             // sub-agent still reports the entry point that started the chain.
             origin: principal.origin,

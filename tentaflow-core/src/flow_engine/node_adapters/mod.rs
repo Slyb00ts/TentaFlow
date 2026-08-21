@@ -28,6 +28,9 @@ pub mod document_router;
 pub mod embed_chunks;
 pub mod exec_command;
 pub mod embeddings;
+// Registered UNCONDITIONALLY: a seeded flow naming `graph_extract` must still
+// validate on a build without cozo (the writes inside are feature-gated).
+pub mod graph_extract;
 #[cfg(feature = "graph")]
 pub mod graph_search;
 pub mod graphic_elements;
@@ -99,6 +102,7 @@ pub use document_router::DocumentRouterNodeAdapter;
 pub use exec_command::ExecCommandNodeAdapter;
 pub use embed_chunks::EmbedChunksNodeAdapter;
 pub use embeddings::EmbeddingsNodeAdapter;
+pub use graph_extract::GraphExtractNodeAdapter;
 #[cfg(feature = "graph")]
 pub use graph_search::GraphSearchNodeAdapter;
 pub use graphic_elements::GraphicElementsNodeAdapter;

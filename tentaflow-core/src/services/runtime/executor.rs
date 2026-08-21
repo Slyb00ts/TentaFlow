@@ -184,6 +184,10 @@ pub struct IngestRequest {
     /// `options` sa przepisywane wprost do `envelope.meta`, ktore addon moze
     /// nadpisac, a to jest sciezka tworzenia pliku indeksu na dysku.
     pub vector_home: Option<std::path::PathBuf>,
+    /// Katalog dla NOWEJ kolekcji grafowej — patrz
+    /// `ExecutionContext::graph_home`. Osobne pole, NIE klucz w `options`, z tego
+    /// samego powodu co `vector_home`.
+    pub graph_home: Option<std::path::PathBuf>,
     /// Anulowanie przeprowadzone od wolajacego. `execute_ingest` buduje wlasne
     /// `FlowRequestMeta`, wiec bez tego pola flow dostawalby SWIEZY token i przebieg
     /// bylby nieanulowalny — job zatrzymany przez uzytkownika dalej mielilby model.
@@ -4135,6 +4139,7 @@ pub(crate) async fn ingest_request_to_initial_envelope(
         actor,
     );
     meta.vector_home = request.vector_home.clone();
+    meta.graph_home = request.graph_home.clone();
     if let Some(token) = &request.cancel_token {
         meta.cancel_token = token.clone();
     }
@@ -4967,6 +4972,51 @@ mod provenance_tests {
         assert_eq!(meta.actor_user_id, None);
     }
 
+    /// `graph_home` is the graph twin of `vector_home`: a server-minted field on
+    /// the REQUEST, copied onto `FlowRequestMeta` and never into `envelope.meta`.
+    /// If it ever leaked into meta, a WASM addon block could rewrite the
+    /// directory a Cozo database is created in.
+    #[tokio::test]
+    async fn ingest_entry_threads_graph_home_off_the_envelope() {
+        let blobs: std::sync::Arc<dyn crate::flow_engine::blob_store::BlobStore> =
+            std::sync::Arc::new(crate::flow_engine::blob_store::InMemoryBlobStore::new());
+        let home = std::path::PathBuf::from("/data/projects/p-1/graph");
+        let mut options = serde_json::Map::new();
+        options.insert("graph_enabled".into(), serde_json::Value::Bool(false));
+        let request = IngestRequest {
+            model: "core:rag-ingest".into(),
+            document_bytes: b"hello".to_vec(),
+            mime: "text/plain".into(),
+            options,
+            vector_home: None,
+            graph_home: Some(home.clone()),
+            cancel_token: None,
+            flow_depth: 0,
+        };
+        let (env, meta) = ingest_request_to_initial_envelope(
+            &request,
+            None,
+            FlowOrigin::Project,
+            FlowActor::system_component("project:p-1"),
+            blobs,
+        )
+        .await
+        .expect("ingest seed");
+
+        assert_eq!(meta.graph_home.as_deref(), Some(home.as_path()));
+        assert!(
+            !env.meta.contains_key("graph_home"),
+            "graph_home must never travel in envelope.meta: {:?}",
+            env.meta.get("graph_home")
+        );
+        // The toggle, by contrast, IS a meta key — it is a behaviour switch, not
+        // a filesystem decision, so a node is allowed to read it from there.
+        assert_eq!(
+            env.meta.get("graph_enabled"),
+            Some(&serde_json::Value::Bool(false))
+        );
+    }
+
     /// The Projects ingest entry point: a job outlives the session that queued
     /// it, so the project itself is the actor.
     #[tokio::test]
@@ -4979,6 +5029,7 @@ mod provenance_tests {
             mime: "text/plain".into(),
             options: serde_json::Map::new(),
             vector_home: None,
+            graph_home: None,
             cancel_token: None,
             flow_depth: 0,
         };

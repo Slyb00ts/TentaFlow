@@ -333,7 +333,7 @@ pub fn parse_judge_verdict(raw: &str) -> JudgeVerdict {
 /// Wyłuskuje pierwszy obiekt JSON z tekstu (model może owinąć go w prozę albo
 /// fence ```json). Najpierw próba parsowania całości, potem wycinek od pierwszego
 /// `{` do ostatniego `}`.
-fn extract_json_object(raw: &str) -> Option<Value> {
+pub(crate) fn extract_json_object(raw: &str) -> Option<Value> {
     let trimmed = raw.trim();
     if let Ok(v) = serde_json::from_str::<Value>(trimmed) {
         if v.is_object() {

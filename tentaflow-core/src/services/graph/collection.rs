@@ -947,6 +947,69 @@ impl GraphManager {
         })
     }
 
+    /// Soft-deletes everything one DOCUMENT contributed to the collection: every
+    /// edge and every node whose stored `provenance` JSON carries
+    /// `doc_id == doc_id`. Returns `(nodes_removed, edges_removed)`.
+    ///
+    /// The whole sweep runs under ONE write lock, so a concurrent ingest of the
+    /// same document cannot interleave a half-deleted state with fresh writes.
+    /// Provenance is scanned in Rust rather than matched in Datalog because the
+    /// column holds an opaque JSON document, not a typed field — a substring
+    /// match would also hit a `source_id` or a `path` that happens to contain the
+    /// same text, and delete another document's rows.
+    ///
+    /// KNOWN LIMIT of single-valued provenance: an entity mentioned by several
+    /// documents keeps only the provenance of the LAST writer, so deleting that
+    /// last document tombstones a node another document also relies on. The
+    /// alternative — a per-document mirror table — is a schema change; a
+    /// re-ingest of the surviving document restores the node (an upsert revives
+    /// both the label and `alive`).
+    pub fn delete_document_in(
+        &self,
+        org_id: &str,
+        addon_id: &str,
+        collection: &str,
+        doc_id: &str,
+    ) -> Result<(u64, u64)> {
+        // A collection that was never created contributed nothing — and going
+        // through `with_write` would CREATE it, in the default addon tree.
+        if !self.collection_exists(org_id, addon_id, collection)? {
+            return Ok((0, 0));
+        }
+        self.with_write(org_id, addon_id, collection, None, |backend| {
+            let edge_rows = backend.run_query("?[src, rel, dst, provenance] := *edges{src, rel, dst, provenance}")?;
+            let mut edges_removed = 0u64;
+            for row in &edge_rows.rows {
+                let (Some(src), Some(rel), Some(dst), Some(prov)) = (
+                    row.first().and_then(|v| v.get_str()),
+                    row.get(1).and_then(|v| v.get_str()),
+                    row.get(2).and_then(|v| v.get_str()),
+                    row.get(3).and_then(|v| v.get_str()),
+                ) else {
+                    continue;
+                };
+                if provenance_names_doc(prov, doc_id) && backend.delete_edge(src, rel, dst)? {
+                    edges_removed += 1;
+                }
+            }
+
+            let node_rows = backend.run_query("?[id, provenance] := *nodes{id, provenance}")?;
+            let mut nodes_removed = 0u64;
+            for row in &node_rows.rows {
+                let (Some(id), Some(prov)) = (
+                    row.first().and_then(|v| v.get_str()),
+                    row.get(1).and_then(|v| v.get_str()),
+                ) else {
+                    continue;
+                };
+                if provenance_names_doc(prov, doc_id) && backend.delete_node(id)? {
+                    nodes_removed += 1;
+                }
+            }
+            Ok((nodes_removed, edges_removed))
+        })
+    }
+
     /// Node soft-delete alias for the `GraphDeleteTarget::Tombstone` variant — the
     /// same semantics as `delete_node_in` (a node delete in Stage 0 = a tombstone).
     pub fn tombstone_node_in(
@@ -1769,4 +1832,17 @@ fn remove_cozo_files(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Whether a stored `provenance` JSON names `doc_id` in its `doc_id` field.
+/// A row whose provenance is absent, `null` or unparsable belongs to no document
+/// and is never swept — deleting on a parse failure would make a malformed row
+/// match EVERY document.
+fn provenance_names_doc(provenance_json: &str, doc_id: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(provenance_json)
+        .ok()
+        .as_ref()
+        .and_then(|v| v.get("doc_id"))
+        .and_then(|v| v.as_str())
+        == Some(doc_id)
 }

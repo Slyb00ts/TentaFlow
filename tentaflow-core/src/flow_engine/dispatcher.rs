@@ -47,7 +47,7 @@ use crate::flow_engine::node_adapters::{
     ConversationHistoryNodeAdapter, CriticGateNodeAdapter, DelegateCliNodeAdapter,
     DocumentMergeNodeAdapter, DocumentParseNodeAdapter, DocumentRouterNodeAdapter,
     EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, ExecCommandNodeAdapter,
-    GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
+    GraphExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
     MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
     OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
     PageDetectPagesNodeAdapter, PatchReviewNodeAdapter, PdfRasterizeNodeAdapter,
@@ -376,6 +376,11 @@ pub struct FlowRequestMeta {
     /// `ExecutionContext::vector_home`. Osobne pole, nie klucz w `options`/meta:
     /// caller-addon nie moze sterowac miejscem zapisu indeksu.
     pub vector_home: Option<std::path::PathBuf>,
+    /// Directory for a NEW graph collection of this call — see
+    /// `ExecutionContext::graph_home`. A separate field for the same reason as
+    /// `vector_home`: a caller addon must not steer where a graph file is
+    /// created on disk.
+    pub graph_home: Option<std::path::PathBuf>,
     /// §2.5 — where this request entered the system. Minted by the entry point
     /// after authorization. A separate field, not a `meta` key, for the same
     /// reason as `vector_home`: `envelope.meta` is writable by every node
@@ -423,6 +428,7 @@ impl FlowRequestMeta {
             user_role: None,
             addon_id: None,
             vector_home: None,
+            graph_home: None,
             org_id: None,
             origin,
             actor_kind: actor.kind,
@@ -531,6 +537,7 @@ impl ContextFactory {
             addon_id: meta.addon_id.clone(),
             org_id: meta.org_id.clone(),
             vector_home: meta.vector_home.clone(),
+            graph_home: meta.graph_home.clone(),
             origin: meta.origin,
             actor_kind: meta.actor_kind,
             actor_id: meta.actor_id.clone(),
@@ -1444,6 +1451,11 @@ fn build_registry(
         // The block that ends a review loop on a VERDICT rather than on the
         // absence of tool calls.
         Arc::new(CriticGateNodeAdapter::new()),
+        // Knowledge-graph write side of an ingest. Registered UNCONDITIONALLY,
+        // unlike `graph_search` below: a flow seeded with this node has to pass
+        // adapter validation on a default-features build too, and the node
+        // degrades to a passthrough there instead of failing to resolve.
+        Arc::new(GraphExtractNodeAdapter::new()),
     ];
     for a in arcs {
         r.register(a);
@@ -2054,6 +2066,9 @@ mod tests {
             "interval",
             "critic_gate",
             "task_gate",
+            // Registered without the `graph` feature as well — the seeded RAG
+            // ingest flow names it, so its adapter must resolve in every build.
+            "graph_extract",
             // Code Studio (§16.4).
             "workspace_context",
             "patch_review",

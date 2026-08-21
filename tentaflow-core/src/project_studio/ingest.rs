@@ -44,6 +44,18 @@ pub const EMBEDDINGS_ALIAS: &str = "rag-embeddings";
 /// Vector namespace holding the project's knowledge chunks.
 pub const VECTOR_NAMESPACE: &str = "passages";
 
+/// Whether a project ingest builds a knowledge graph. Off by owner decision —
+/// extraction costs one extra LLM pass per document, so a project opts in rather
+/// than paying for it silently. Flipping this to a per-project setting is a
+/// one-line change here; the node itself needs nothing (Projects already pass a
+/// `graph_home`, which is the structural gate).
+const PROJECT_GRAPH_EXTRACTION_DEFAULT: bool = false;
+
+/// Graph collection holding the project's knowledge graph — the same collection
+/// name the RAG retrieval nodes read, so a project graph is queryable by the
+/// existing graph nodes without a second naming scheme.
+pub const GRAPH_COLLECTION: &str = "kg_active";
+
 /// Chunks per embeddings request — bounds request size and lets cancel react
 /// between batches on large files.
 const EMBED_BATCH: usize = 16;
@@ -628,6 +640,47 @@ pub fn drop_project_namespaces(core_db: &DbPool, org_id: &str, project_id: &str)
         dropped += 1;
     }
     Ok(dropped)
+}
+
+/// Graph sibling of [`delete_file_vectors`]: soft-deletes every entity and
+/// relation `graph_extract` attributed to `file_id` (its `provenance.doc_id`).
+/// Returns `(nodes, edges)` removed. A build with no graph backend, and a
+/// project that never had a graph collection, both removed nothing.
+pub fn delete_file_graph(
+    core_db: &DbPool,
+    org_id: &str,
+    project_id: &str,
+    file_id: &str,
+) -> Result<(u64, u64)> {
+    #[cfg(feature = "graph")]
+    {
+        // Same instance scope as the vector side — one project, one pseudo addon
+        // id, so quota and registry rows line up across both stores.
+        crate::services::graph_manager(core_db)
+            .delete_document_in(org_id, &vector_scope(project_id), GRAPH_COLLECTION, file_id)
+            .map_err(|e| anyhow!("graph cleanup: {e}"))
+    }
+    #[cfg(not(feature = "graph"))]
+    {
+        let _ = (core_db, org_id, project_id, file_id);
+        Ok((0, 0))
+    }
+}
+
+/// Graph sibling of [`drop_project_namespaces`]: drops every graph collection of
+/// the project scope (registry rows + on-disk Cozo files) at project teardown.
+pub fn drop_project_graph(core_db: &DbPool, org_id: &str, project_id: &str) -> Result<()> {
+    #[cfg(feature = "graph")]
+    {
+        crate::services::graph_manager(core_db)
+            .delete_all_for_addon(org_id, &vector_scope(project_id))
+            .map_err(|e| anyhow!("drop project graph: {e}"))
+    }
+    #[cfg(not(feature = "graph"))]
+    {
+        let _ = (core_db, org_id, project_id);
+        Ok(())
+    }
 }
 
 /// One extracted chunk ready for embedding + storage.
@@ -1846,6 +1899,41 @@ enum FileResult {
 /// addon RAG — rozne sa tylko scope zapisu i katalog przestrzeni wektorowej.
 const INGEST_FLOW_MODEL: &str = "core:rag-ingest";
 
+/// `IngestRequest.options` for one file. They are copied verbatim into
+/// `envelope.meta`, so this carries only vector METADATA and the graph toggle —
+/// never a decision about WHERE anything is written (that rides on the request's
+/// `vector_home` / `graph_home` fields, which no node can rewrite).
+fn ingest_flow_options(
+    file_id: &str,
+    source_id: &str,
+    path: &str,
+) -> serde_json::Map<String, serde_json::Value> {
+    let mut options = serde_json::Map::new();
+    options.insert(
+        "doc_id".to_string(),
+        serde_json::Value::String(file_id.to_string()),
+    );
+    options.insert(
+        "source_id".to_string(),
+        serde_json::Value::String(source_id.to_string()),
+    );
+    options.insert(
+        "path".to_string(),
+        serde_json::Value::String(path.to_string()),
+    );
+    // Projects DO establish a graph home (`<project>/graph` on the request), so
+    // the structural gate in `graph_extract` is open here — this is the caller
+    // the node is aimed at. Extraction is nevertheless off by owner decision:
+    // building a knowledge graph costs an extra LLM pass over every ingested
+    // file, so it is opt-in, not something a project silently starts paying for.
+    // Stamped explicitly because the shared key defaults to ON when absent.
+    options.insert(
+        "graph_enabled".to_string(),
+        serde_json::Value::Bool(PROJECT_GRAPH_EXTRACTION_DEFAULT),
+    );
+    options
+}
+
 /// Ingestuje JEDEN plik przez wspolny flow zamiast wlasnej sciezki
 /// extract -> chunk -> embed -> store.
 ///
@@ -1869,19 +1957,7 @@ async fn ingest_file_via_flow(
     let Some(executor) = router.executor() else {
         return FileResult::Error("model runtime executor not available".to_string());
     };
-    let mut options = serde_json::Map::new();
-    options.insert(
-        "doc_id".to_string(),
-        serde_json::Value::String(work.file_id.clone()),
-    );
-    options.insert(
-        "source_id".to_string(),
-        serde_json::Value::String(source_id.to_string()),
-    );
-    options.insert(
-        "path".to_string(),
-        serde_json::Value::String(work.path.clone()),
-    );
+    let options = ingest_flow_options(&work.file_id, source_id, &work.path);
 
     let token = tokio_util::sync::CancellationToken::new();
     let request = crate::services::runtime::executor::IngestRequest {
@@ -1890,6 +1966,7 @@ async fn ingest_file_via_flow(
         mime: work.mime.clone(),
         options,
         vector_home: Some(dir_path.join("vectors")),
+        graph_home: Some(dir_path.join("graph")),
         cancel_token: Some(token.clone()),
         flow_depth: 0,
     };
@@ -2823,5 +2900,35 @@ mod tests {
             &big
         )
         .is_err());
+    }
+    /// The owner decision for Projects: a project ingest does NOT build a
+    /// knowledge graph. The shared `graph_enabled` key means ON when absent, so
+    /// this must be stamped explicitly — a missing key silently turns an extra
+    /// LLM pass on for every ingested file.
+    #[test]
+    fn project_ingest_options_turn_graph_extraction_off() {
+        let options = super::ingest_flow_options("file-1", "src-1", "docs/a.pdf");
+        assert_eq!(
+            options.get("graph_enabled"),
+            Some(&serde_json::Value::Bool(super::PROJECT_GRAPH_EXTRACTION_DEFAULT)),
+            "Projects ingest must state the graph decision, not stay silent — an \
+             absent key means ON in the shared node"
+        );
+        assert!(
+            !super::PROJECT_GRAPH_EXTRACTION_DEFAULT,
+            "the recorded owner decision is graph OFF by default in Projects"
+        );
+        assert_eq!(
+            options.get("doc_id").and_then(|v| v.as_str()),
+            Some("file-1")
+        );
+        assert_eq!(
+            options.get("source_id").and_then(|v| v.as_str()),
+            Some("src-1")
+        );
+        assert_eq!(
+            options.get("path").and_then(|v| v.as_str()),
+            Some("docs/a.pdf")
+        );
     }
 }

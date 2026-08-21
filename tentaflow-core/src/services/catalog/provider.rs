@@ -475,6 +475,10 @@ pub(crate) const MODALITY_CONTRIBUTING_NODE_TYPES: &[&str] = &[
     "document_parse",
     // Project Studio knowledge search (text query → text with citations).
     "project_knowledge",
+    // Knowledge-graph extraction: reads chunk TEXT through a chat model. It
+    // emits no media of its own (the graph is a side effect and the payload
+    // passes through), so it contributes the input constraint only.
+    "graph_extract",
 ];
 
 /// Node types that intentionally do not contribute modalities — they do
@@ -607,6 +611,12 @@ fn infer_flow_modalities(flow_json: &str) -> (Vec<InputModality>, Vec<OutputModa
             }
             "page_detect" | "graphic_elements" => {
                 inputs.insert(InputModality::Image);
+            }
+            // graph_extract reads chunk text with a chat model and writes a
+            // graph; its output port carries the INPUT payload through, so it
+            // adds a Text input constraint and no output modality.
+            "graph_extract" => {
+                inputs.insert(InputModality::Text);
             }
             "embeddings" => {
                 // Codex R3b.1 round 2 M2: declare text input so
