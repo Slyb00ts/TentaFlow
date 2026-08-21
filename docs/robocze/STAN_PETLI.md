@@ -1141,3 +1141,45 @@ równa się `actor_user_id` KAŻDEGO wiersza.
   (aktor to zawsze `system_component`, więc `actor_user_id` jest NULL, i ścieżka kamery nie
   ustawia progress sinka), ale to jedyne miejsce, gdzie założenie „run id to świeży uuid"
   nie trzyma się z konstrukcji.
+
+---
+
+## Runda: T4 metryki jako zapytania — ślepy krytyk (2026-08-21)
+
+**Werdykt: MEETS BAR.** M1–M6 spełnione, 13 mutacji, każda w osobnym oknie, każda z kontrolą
+kotwicy.
+
+**Najważniejszy wynik tej rundy dotyczy METODY, nie kodu.** Kazałem krytykowi polować na
+asercje na PRZEDZIAŁ zamiast na WARTOŚĆ. Znalazł dokładnie taki przypadek i to nie teoretyczny:
+
+> Mutacja 5 podmieniła wzór dekodowania na `request_started → assistant_message`. Wynik ~300 ms
+> **zmieścił się w oknie `(259..380)`** i test przedziałowy **przeszedł**. Złapała to wyłącznie
+> fikstura o ustalonych znacznikach czasu, asertująca `ttft_ms == Some(150)` i
+> `decode_ms == Some(490)` — wartości dokładne, bez tolerancji.
+
+Odwrotnie: mutacje 8 i 12 (stała równa oczekiwaniu fikstury) przechodzą fiksturę i łapie je
+tylko test przedziałowy. **Oba style są komplementarne i żaden nie jest zbędny** — to jest
+wniosek do przeniesienia na inne tory, bo tolerancja szersza niż różnica między dobrym a złym
+wzorem nie jest testem, tylko dekoracją.
+
+Drugi wynik metodyczny: mutacja 7 (start TTFT z pierwszego `step_start` zamiast
+`request_started`) zostaje zielona, ale to **mutant równoważny, nie dziura** — `progress_log::translate`
+wypycha oba wiersze z jednego `NodeStarted` z tą samą zmienną `at_ms`, więc dziś są równe
+z konstrukcji. Krytyk to rozróżnił zamiast policzyć jako lukę.
+
+### Znaleziska poza kryteriami
+
+1. **`events::metrics` NIE MA ANI JEDNEGO WOŁAJĄCEGO.** Ani handlera, ani UI, ani innego modułu —
+   `step_latencies`, `tool_durations`, `StepLatency`, `ToolDuration` są `pub` i martwe poza
+   własnymi testami. Derywacja jest poprawna i nieskonsumowana.
+   **To jest realny problem architektoniczny, nie kosmetyka:** przeglądarka zdarzeń wyprowadza
+   pasma **po stronie JS**, więc mamy DWIE derywacje tych samych wielkości — jedną w Ruście
+   (nieużywaną) i jedną w JS (używaną). Reguła 4 CLAUDE.md („sprawdź, czy funkcja już istnieje,
+   zanim napiszesz nową") jest tu złamana w skali modułu. Rozstrzygnięcie, która strona ma
+   liczyć, jest decyzją projektową — odnotowuję, nie rozstrzygam sam.
+2. **Etykieta kroku niepowiązana z węzłem** — mutacja 10 (`s.node_id = s.node_id`) zielona.
+   `StepLatency.step` mógłby pochodzić z `step_start` INNEGO węzła i żadna fikstura by nie
+   zauważyła. To niepilnowana połowa kryterium M3 („w tym samym kroku").
+3. **Żaden test nie asertuje przypadków `None`.** Dokumentacja twierdzi, że `ttft_ms`/`decode_ms`
+   są `None`, nigdy zerem, gdy brakuje `request_started` albo wiadomość się nie skończyła.
+   Nigdzie nie ma asercji na `None` — a to ta sama własność „uczciwości", którą M2 dostało.
