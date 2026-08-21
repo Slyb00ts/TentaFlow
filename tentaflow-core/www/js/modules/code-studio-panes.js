@@ -2,8 +2,8 @@
 //
 // Content of the Code Studio shell: the file/editor pane, the patch-set review
 // pane with per-hunk decisions (K02), the git pane driving a merge through an
-// integration worktree (K03), the terminal pane, the commit pane, and the four
-// dock lists that index them.
+// integration worktree (K03), the terminal pane, the commit pane, the run
+// timeline of the session, and the four dock lists that index them.
 //
 // The shell itself (tabs, drawer, composer, streams) belongs to code-studio.js;
 // every entry point here takes a host element plus a context object and returns
@@ -29,7 +29,8 @@
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { I18n } from '/js/i18n.js';
-import { el, toast, formatRelative } from '/js/utils.js';
+import { el, toast, formatRelative, fmtMs } from '/js/utils.js';
+import { normalizeRow, plotFrom } from '/js/lib/run-events.js';
 import '/js/components/tf-button.js';
 import '/js/components/tf-chip.js';
 import '/js/components/tf-tabs.js';
@@ -40,6 +41,7 @@ import '/js/components/tf-empty-state.js';
 import '/js/components/tf-code-editor.js';
 import '/js/components/tf-diff.js';
 import '/js/components/tf-terminal.js';
+import '/js/components/tf-run-timeline.js';
 
 const T = (key, vars) => I18n.t(key, vars);
 
@@ -1753,6 +1755,146 @@ export function renderCommitPane(hostEl, ctx) {
     },
     destroy() {
       disposed = true;
+      hostEl.replaceChildren();
+    },
+  };
+}
+
+// ===========================================================================
+// Timeline pane — the run event log of THIS session
+// ===========================================================================
+//
+// The bands come from `events.db` through the cross-run browse filtered by
+// `session_id`, not from `codeStudioSessionTimeline`: that call carries no
+// duration, no TTFT and no turn, so a band built from it would be invented
+// time. Rows are turned into records by `lib/run-events.js` — the same
+// derivation the Zdarzenia browser uses, so both screens state the same
+// numbers for the same run.
+
+const TIMELINE_PAGE = 500;
+
+export function renderTimelinePane(hostEl, ctx) {
+  const { head, body, foot } = paneShell(hostEl, { withFoot: true });
+  let disposed = false;
+  let loading = false;
+  let rows = [];
+  let records = [];
+
+  const titleEl = el('strong', {
+    class: 'cs-pane-strong',
+    text: T('code_studio.panes.timeline.title'),
+  });
+  const subEl = el('span', {
+    class: 'cs-stage-sub',
+    text: T('code_studio.panes.timeline.subtitle'),
+  });
+  const countChip = el('tf-chip', { variant: 'tag', tone: 'muted', size: 'xs', label: '' });
+  const reloadBtn = button(
+    { variant: 'secondary', icon: 'refresh', onClick: () => void load() },
+    T('code_studio.panes.timeline.reload'),
+  );
+  head.append(el('span', {}, titleEl, subEl), spacer(), countChip, reloadBtn);
+
+  const timeline = el('tf-run-timeline', { class: 'cs-timeline' });
+  const empty = el('tf-empty-state', {
+    icon: 'clock-glance',
+    title: T('code_studio.panes.timeline.empty_title'),
+    message: T('code_studio.panes.timeline.empty_text'),
+  });
+  const detail = el('div', { class: 'cs-timeline-detail' });
+  detail.hidden = true;
+  body.append(timeline, detail, empty);
+  // Until the first page lands there is nothing to plot, and an empty plot
+  // would read as "this session ran nothing".
+  body.dataset.state = 'empty';
+
+  foot.appendChild(hint(T('code_studio.panes.timeline.scope_hint')));
+
+  // Only a gesture on the widget emits, so mirroring the selection back into
+  // `.selected` cannot loop.
+  timeline.addEventListener('record-select', (e) => paintDetail(e.detail && e.detail.id));
+
+  function lang() {
+    return I18n.getLanguage ? I18n.getLanguage() : 'pl';
+  }
+
+  function paintDetail(id) {
+    const record = id ? records.find((r) => r.id === id) : null;
+    detail.replaceChildren();
+    detail.hidden = !record;
+    if (!record) return;
+    const bits = [record.name, record.actor, record.detail].filter(Boolean);
+    const span = record.duration === null
+      ? T('code_studio.panes.timeline.in_flight')
+      : fmtMs(record.duration, lang());
+    detail.append(
+      el('span', { class: 'cs-timeline-detail-name', text: bits.join(' · ') }),
+      el('span', { class: 'cs-timeline-detail-ms', text: span }),
+    );
+  }
+
+  function paint() {
+    const plot = plotFrom(rows);
+    records = plot.records;
+    timeline.epoch = plot.epoch;
+    timeline.records = plot.shifted;
+    // `hidden` is not enough: both tf-* hosts carry `display: block` in
+    // controls.css, which outranks the UA rule for [hidden]. The pane body
+    // states which of the two it is showing and code-studio.css hides the
+    // other one.
+    body.dataset.state = records.length ? 'plot' : 'empty';
+    countChip.setAttribute(
+      'label',
+      T('code_studio.panes.timeline.count', { count: records.length }),
+    );
+    // The selection survives a reload only when the same band came back.
+    paintDetail(timeline.selected);
+  }
+
+  // One page is the whole view on purpose: a session's log is bounded and the
+  // widget plots an extent, not a scrollback. A session longer than the page
+  // says so instead of silently plotting a prefix.
+  async function load() {
+    if (disposed || loading) return;
+    loading = true;
+    try {
+      const resp = await ApiBinary.one('eventsBrowseRequest', {
+        sessionId: ctx.sessionId,
+        limit: TIMELINE_PAGE,
+      });
+      if (disposed) return;
+      const raw = resp.rows || [];
+      rows = raw.map(normalizeRow);
+      paint();
+      if (resp.nextCursor || resp.next_cursor) {
+        toast(T('code_studio.panes.timeline.truncated', { count: TIMELINE_PAGE }), 'info');
+      }
+    } catch (err) {
+      failed(err, 'code_studio.panes.timeline.load_failed');
+    } finally {
+      loading = false;
+    }
+  }
+
+  // The pane is reached by two routes — the desktop dock tab and the phone
+  // bottom bar — and only the first one activates a tab, so a tab-driven load
+  // would leave the phone route showing an empty plot forever. Loading on
+  // VISIBILITY covers both, and a session that never opens the timeline pays
+  // nothing for it. The pane is `display: none` until its stage is selected, so
+  // the observer fires exactly when it comes on screen.
+  const appeared = new IntersectionObserver((entries) => {
+    if (entries.some((entry) => entry.isIntersecting)) void load();
+  });
+  appeared.observe(hostEl);
+
+  // No `update`: this pane takes no patch from the shell. Its content is the
+  // event log of the session it was constructed with, and the only refresh is
+  // the one the operator asks for.
+  return {
+    destroy() {
+      disposed = true;
+      appeared.disconnect();
+      timeline.destroy();
       hostEl.replaceChildren();
     },
   };

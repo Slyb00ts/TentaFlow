@@ -1097,6 +1097,8 @@ pub struct AuditLogEntry {
     pub details: Option<String>,
     pub ip_address: Option<String>,
     pub node_id: Option<String>,
+    /// Korelacja z przebiegiem, ktory wygenerowal wpis (kolumna z migracji 132).
+    pub correlation_id: Option<String>,
 }
 
 /// Zainstalowany addon

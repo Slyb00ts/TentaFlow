@@ -3603,7 +3603,9 @@
     "sev_info": "info",
     "sev_warn": "warn",
     "sev_err": "err",
-    "sev_ok": "ok"
+    "sev_ok": "ok",
+    "correlation": "Korelacja",
+    "open_events": "Pokaż przebieg w Zdarzeniach"
   },
   "mesh": {
     "title": "Mesh",
@@ -6370,7 +6372,8 @@
       "count_title": "{name}: {count} {count|pozycja|pozycje|pozycji} na liście",
       "plan": "Plan",
       "plan_open": "{count} {count|otwarte zadanie|otwarte zadania|otwartych zadań}",
-      "plan_done": "wszystko zrobione"
+      "plan_done": "wszystko zrobione",
+      "timeline": "Oś czasu"
     },
     "legend": {
       "run": "pracuje",
@@ -6746,6 +6749,18 @@
         "superseded": "zastąpiony",
         "conflicted": "konflikt",
         "unknown": "nieznany"
+      },
+      "timeline": {
+        "title": "Oś czasu sesji",
+        "subtitle": "z dziennika zdarzeń",
+        "reload": "Odśwież",
+        "count": "{count} {count|pasmo|pasma|pasm}",
+        "empty_title": "Brak zapisanych zdarzeń",
+        "empty_text": "Ta sesja nie zapisała jeszcze żadnego zdarzenia przebiegu.",
+        "scope_hint": "Tylko zdarzenia tej sesji. Pasmo bez zapisanego końca rysowane jest jako znacznik startu — czas trwania nie jest zgadywany.",
+        "in_flight": "w trakcie",
+        "load_failed": "Nie udało się wczytać osi czasu.",
+        "truncated": "Wykres pokazuje najnowsze {count} {count|zdarzenie|zdarzenia|zdarzeń} tej sesji."
       }
     },
     "connection": {
@@ -6770,6 +6785,12 @@
       "back_heading": "Dociągam, co się wydarzyło",
       "back_desc": "Sesja przez ten czas wykonała {count} {count|zdarzenie|zdarzenia|zdarzeń}. Wczytuję je od kursora seq {seq}, żeby oś czasu była kompletna.",
       "back_progress": "{done} z {total} {total|zdarzenia|zdarzeń|zdarzeń}"
+    },
+    "timeline": {
+      "tab": "Oś czasu",
+      "title": "Oś czasu sesji",
+      "dock_title": "Oś czasu",
+      "dock_note": "Nie ma tu listy do przeglądania — scena pokazuje jeden wykres przebiegów tej sesji."
     }
   },
   "analytics": {
@@ -7110,6 +7131,7 @@
     "link_org": "organizacja",
     "seq_label": "seq {seq}",
     "turn_unknown": "bez tury",
-    "payload_unreadable": "Nie udało się odczytać zapisanej treści zdarzenia."
+    "payload_unreadable": "Nie udało się odczytać zapisanej treści zdarzenia.",
+    "correlation_filter": "Korelacja: {id}"
   }
 }

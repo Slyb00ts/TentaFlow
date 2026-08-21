@@ -6763,6 +6763,13 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
                 if let Some(n) = e.node_id {
                     set(&item, "nodeId", n.into());
                 }
+                // Without this projection the field exists on the Rust struct
+                // and is simply absent in the browser, so the audit deep link
+                // would silently never appear.
+                if let Some(c) = e.correlation_id {
+                    set(&item, "correlationId", c.clone().into());
+                    set(&item, "correlation_id", c.into());
+                }
                 arr.push(&item.into());
             }
             set(&obj, "entries", arr.into());

@@ -3360,7 +3360,9 @@
     "sev_info": "info",
     "sev_warn": "warn",
     "sev_err": "err",
-    "sev_ok": "ok"
+    "sev_ok": "ok",
+    "correlation": "Correlación",
+    "open_events": "Ver el recorrido en Eventos"
   },
   "mesh": {
     "title": "Malla",
@@ -5136,7 +5138,8 @@
       "count_title": "{name}: {count} {count|elemento|elementos} en la lista",
       "plan": "Plan",
       "plan_open": "{count} {count|tarea abierta|tareas abiertas}",
-      "plan_done": "todo hecho"
+      "plan_done": "todo hecho",
+      "timeline": "Línea de tiempo"
     },
     "legend": {
       "run": "trabajando",
@@ -5512,6 +5515,18 @@
         "superseded": "sustituido",
         "conflicted": "conflicto",
         "unknown": "desconocido"
+      },
+      "timeline": {
+        "title": "Línea de tiempo de la sesión",
+        "subtitle": "del registro de eventos",
+        "reload": "Recargar",
+        "count": "{count} {count|banda|bandas}",
+        "empty_title": "Sin eventos registrados",
+        "empty_text": "Esta sesión todavía no ha escrito ningún evento de ejecución.",
+        "scope_hint": "Solo eventos de esta sesión. Una banda sin final registrado se dibuja como una marca de inicio: no se adivina ninguna duración.",
+        "in_flight": "en curso",
+        "load_failed": "No se pudo cargar la línea de tiempo.",
+        "truncated": "El gráfico muestra los {count} {count|evento|eventos} más recientes de esta sesión."
       }
     },
     "connection": {
@@ -5536,6 +5551,12 @@
       "back_heading": "Recuperando lo que ha pasado",
       "back_desc": "Mientras tanto la sesión produjo {count} {count|evento|eventos}. Los cargo desde el cursor seq {seq} para que la línea de tiempo esté completa.",
       "back_progress": "{done} de {total} {total|evento|eventos}"
+    },
+    "timeline": {
+      "tab": "Línea de tiempo",
+      "title": "Línea de tiempo de la sesión",
+      "dock_title": "Línea de tiempo",
+      "dock_note": "Aquí no hay nada que recorrer: el escenario muestra un único gráfico de las ejecuciones de esta sesión."
     }
   },
   "external": {
@@ -5908,6 +5929,7 @@
     "link_org": "organización",
     "seq_label": "seq {seq}",
     "turn_unknown": "sin turno",
-    "payload_unreadable": "No se pudo leer el contenido almacenado del evento."
+    "payload_unreadable": "No se pudo leer el contenido almacenado del evento.",
+    "correlation_filter": "Correlación: {id}"
   }
 }

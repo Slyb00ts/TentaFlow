@@ -3360,7 +3360,9 @@
     "sev_info": "info",
     "sev_warn": "warn",
     "sev_err": "err",
-    "sev_ok": "ok"
+    "sev_ok": "ok",
+    "correlation": "Corrélation",
+    "open_events": "Voir le déroulé dans Événements"
   },
   "mesh": {
     "title": "Mesh",
@@ -5136,7 +5138,8 @@
       "count_title": "{name} : {count} {count|élément|éléments} dans la liste",
       "plan": "Plan",
       "plan_open": "{count} {count|tâche ouverte|tâches ouvertes}",
-      "plan_done": "tout est fait"
+      "plan_done": "tout est fait",
+      "timeline": "Chronologie"
     },
     "legend": {
       "run": "travaille",
@@ -5512,6 +5515,18 @@
         "superseded": "remplacé",
         "conflicted": "conflit",
         "unknown": "inconnu"
+      },
+      "timeline": {
+        "title": "Chronologie de la session",
+        "subtitle": "depuis le journal des événements",
+        "reload": "Recharger",
+        "count": "{count} {count|bande|bandes}",
+        "empty_title": "Aucun événement enregistré",
+        "empty_text": "Cette session n’a encore écrit aucun événement d’exécution.",
+        "scope_hint": "Uniquement les événements de cette session. Une bande sans fin enregistrée est tracée comme un repère de départ — aucune durée n’est devinée.",
+        "in_flight": "en cours",
+        "load_failed": "Impossible de charger la chronologie.",
+        "truncated": "Le tracé montre les {count} {count|événement|événements} les plus récents de cette session."
       }
     },
     "connection": {
@@ -5536,6 +5551,12 @@
       "back_heading": "Je récupère ce qui s'est passé",
       "back_desc": "La session a produit {count} {count|événement|événements} pendant ce temps. Je les charge depuis le curseur seq {seq} pour que la chronologie soit complète.",
       "back_progress": "{done} sur {total} {total|événement|événements}"
+    },
+    "timeline": {
+      "tab": "Chronologie",
+      "title": "Chronologie de la session",
+      "dock_title": "Chronologie",
+      "dock_note": "Rien à parcourir ici — la scène affiche un seul tracé des exécutions de cette session."
     }
   },
   "external": {
@@ -5908,6 +5929,7 @@
     "link_org": "organisation",
     "seq_label": "seq {seq}",
     "turn_unknown": "sans tour",
-    "payload_unreadable": "Le contenu enregistré de l'événement n'a pas pu être lu."
+    "payload_unreadable": "Le contenu enregistré de l'événement n'a pas pu être lu.",
+    "correlation_filter": "Corrélation : {id}"
   }
 }

@@ -1082,6 +1082,13 @@ pub struct AuditLogEntry {
     pub details: Option<String>,
     pub ip_address: Option<String>,
     pub node_id: Option<String>,
+    /// Ties this row to the run that produced it (`run_events.correlation_id`).
+    /// Appended after the fact and `#[serde(default)]`, so a peer that predates
+    /// the column still decodes the entry instead of failing the frame. It is
+    /// deliberately NOT part of `AuditRowHashInput`: hashing it would
+    /// invalidate every chain hash already written to disk.
+    #[serde(default)]
+    pub correlation_id: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
@@ -8202,6 +8209,75 @@ mod tests {
     fn round_trip(body: MessageBody) -> MessageBody {
         let bytes = crate::cbor::encode(&body).expect("encode");
         crate::cbor::decode::<MessageBody>(&bytes).expect("decode")
+    }
+
+    /// A peer built before `correlation_id` was appended sends the entry
+    /// without that key. `#[serde(default)]` is the whole mechanism that keeps
+    /// such a frame decodable, so it is pinned rather than assumed: this is the
+    /// append-only promise the whole audit surface rests on.
+    #[test]
+    fn an_audit_entry_from_a_peer_without_the_correlation_field_still_decodes() {
+        #[derive(SerdeSerialize)]
+        struct EntryWithoutCorrelation {
+            id: i64,
+            timestamp: String,
+            action: String,
+            user_id: Option<String>,
+            addon_id: Option<String>,
+            resource: Option<String>,
+            details: Option<String>,
+            ip_address: Option<String>,
+            node_id: Option<String>,
+        }
+
+        let bytes = crate::cbor::encode(&EntryWithoutCorrelation {
+            id: 7,
+            timestamp: "2026-08-21T10:00:00Z".to_string(),
+            action: "flow_run".to_string(),
+            user_id: Some("u-1".to_string()),
+            addon_id: None,
+            resource: None,
+            details: None,
+            ip_address: None,
+            node_id: None,
+        })
+        .expect("encode");
+
+        let decoded: AuditLogEntry = crate::cbor::decode(&bytes).expect("decode");
+        assert_eq!(decoded.id, 7);
+        assert_eq!(decoded.action, "flow_run");
+        assert_eq!(
+            decoded.correlation_id, None,
+            "an absent key is an absent value, never a substituted one"
+        );
+    }
+
+    /// The field survives the wire. Without this the read side could carry the
+    /// column all the way to the encoder and still lose it in the frame.
+    #[test]
+    fn an_audit_entry_carries_its_correlation_id_over_the_wire() {
+        let body = MessageBody::AuditLogListResponseBody(AuditLogListResponse {
+            entries: vec![AuditLogEntry {
+                id: 11,
+                timestamp: "2026-08-21T10:00:00Z".to_string(),
+                action: "flow_run".to_string(),
+                user_id: None,
+                addon_id: None,
+                resource: Some("run-9".to_string()),
+                details: None,
+                ip_address: None,
+                node_id: None,
+                correlation_id: Some("corr-42".to_string()),
+            }],
+            total_count: 1,
+        });
+
+        match round_trip(body) {
+            MessageBody::AuditLogListResponseBody(resp) => {
+                assert_eq!(resp.entries[0].correlation_id.as_deref(), Some("corr-42"));
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 
     #[test]

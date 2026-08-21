@@ -5,13 +5,18 @@
 //       Komunikacja wylacznie przez binary protocol (AuditLog*Request).
 //       Live update laczy server-push AuditEvent (prepend nowych zdarzen)
 //       z polling co 10s (fallback dla sync z baza po odlaczeniu WS).
+//       Wpis przebiegu niesie `correlation_id` — okno szczegolow pokazuje go
+//       jako wiersz i oferuje przejscie do ekranu Zdarzenia zawezonego do tej
+//       korelacji (#/events?correlation=<id>).
 // =============================================================================
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
 import { byId, escapeHtml, escapeAttr, toast, formatDate } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import { Router } from '/js/router.js';
 import { createRefresher } from '/js/lib/refresh.js';
+import '/js/components/tf-button.js';
 
 // Stale modulu
 const PAGE_SIZE = 100;
@@ -328,6 +333,9 @@ function updateSubtitle() {
 
 function openEntryDetail(entry) {
   const prettyDetails = entry.details ? tryPrettyJson(entry.details) : '—';
+  // Written by events/audit_outbox.rs for flow-run rows only; an entry from
+  // another writer has none and the row says so rather than inventing a link.
+  const correlationId = entry.correlationId ?? entry.correlation_id ?? null;
   const rows = [
     ['id', entry.id],
     [I18n.t('audit.timestamp'), formatTimestamp(entry.timestamp)],
@@ -337,6 +345,7 @@ function openEntryDetail(entry) {
     [I18n.t('audit.resource'), entry.resource ?? '—'],
     [I18n.t('audit.ip'), entry.ipAddress ?? '—'],
     [I18n.t('audit.node'), entry.nodeId ?? '—'],
+    [I18n.t('audit.correlation'), correlationId ?? '—'],
   ];
   const html = `
     <div style="display: grid; grid-template-columns: 140px 1fr; gap: 8px 16px; font-size: 13px;">
@@ -345,14 +354,28 @@ function openEntryDetail(entry) {
         <div style="font-family: 'SF Mono', monospace; word-break: break-all;">${escapeHtml(String(v))}</div>
       `).join('')}
     </div>
+    ${correlationId ? `<div style="margin-top: 12px;" id="audit-detail-actions">
+      <tf-button variant="secondary" size="sm" icon="clock-glance" id="audit-open-events">
+        ${escapeHtml(I18n.t('audit.open_events'))}
+      </tf-button>
+    </div>` : ''}
     <div style="margin-top: 14px;">
       <div style="color: var(--text-3); font-size: 12px; margin-bottom: 6px;">${escapeHtml(I18n.t('audit.details'))}</div>
       <pre style="background: var(--bg-2); padding: 10px; border-radius: 6px; overflow: auto; max-height: 320px; font-size: 12px; white-space: pre-wrap; word-break: break-all;">${escapeHtml(prettyDetails)}</pre>
     </div>
   `;
+  // TfWindow.open takes `body` and accepts a Node; building the node here is
+  // what lets the deep link be a real tf-button. The value column escapes every
+  // string, so an interactive control can never come out of a stored value.
+  const bodyEl = document.createElement('div');
+  bodyEl.innerHTML = html;
+  bodyEl.querySelector('#audit-open-events')?.addEventListener('click', () => {
+    Router.navigate('events', { correlation: correlationId });
+  });
+
   TfWindow.open({
     title: I18n.t('audit.detail_title', { id: entry.id }),
-    content: html,
+    body: bodyEl,
     width: 640,
   });
 }

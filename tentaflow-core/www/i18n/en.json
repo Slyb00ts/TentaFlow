@@ -3552,7 +3552,9 @@
     "sev_info": "info",
     "sev_warn": "warn",
     "sev_err": "err",
-    "sev_ok": "ok"
+    "sev_ok": "ok",
+    "correlation": "Correlation",
+    "open_events": "Show the run in Events"
   },
   "mesh": {
     "title": "Mesh",
@@ -6319,7 +6321,8 @@
       "count_title": "{name}: {count} {count|item|items} in the list",
       "plan": "Plan",
       "plan_open": "{count} {count|open task|open tasks}",
-      "plan_done": "all done"
+      "plan_done": "all done",
+      "timeline": "Timeline"
     },
     "legend": {
       "run": "working",
@@ -6695,6 +6698,18 @@
         "superseded": "superseded",
         "conflicted": "conflicted",
         "unknown": "unknown"
+      },
+      "timeline": {
+        "title": "Session timeline",
+        "subtitle": "from the run event log",
+        "reload": "Reload",
+        "count": "{count} {count|band|bands}",
+        "empty_title": "No recorded events",
+        "empty_text": "This session has not written a run event yet.",
+        "scope_hint": "Only this session’s events. A band with no recorded end is drawn as a start marker — no duration is guessed.",
+        "in_flight": "in flight",
+        "load_failed": "The timeline could not be loaded.",
+        "truncated": "The plot shows the newest {count} {count|event|events} of this session."
       }
     },
     "connection": {
@@ -6719,6 +6734,12 @@
       "back_heading": "Catching up on what happened",
       "back_desc": "The session produced {count} {count|event|events} in the meantime. Loading them from cursor seq {seq} so the timeline is complete.",
       "back_progress": "{done} of {total} {total|event|events}"
+    },
+    "timeline": {
+      "tab": "Timeline",
+      "title": "Session timeline",
+      "dock_title": "Timeline",
+      "dock_note": "Nothing to navigate here — the stage shows one plot of this session’s runs."
     }
   },
   "addon_bindings": {
@@ -7110,6 +7131,7 @@
     "link_org": "organisation",
     "seq_label": "seq {seq}",
     "turn_unknown": "no turn",
-    "payload_unreadable": "The stored event body could not be read."
+    "payload_unreadable": "The stored event body could not be read.",
+    "correlation_filter": "Correlation: {id}"
   }
 }

@@ -1156,7 +1156,8 @@
 .cs-shell[data-dock="pliki"]    .cs-dock-pane[data-pane="pliki"],
 .cs-shell[data-dock="zmiany"]   .cs-dock-pane[data-pane="zmiany"],
 .cs-shell[data-dock="git"]      .cs-dock-pane[data-pane="git"],
-.cs-shell[data-dock="terminal"] .cs-dock-pane[data-pane="terminal"] { display: block; }
+.cs-shell[data-dock="terminal"] .cs-dock-pane[data-pane="terminal"],
+.cs-shell[data-dock="timeline"] .cs-dock-pane[data-pane="timeline"] { display: block; }
 
 /* =========================================================================
    THE STAGE IS THE MAIN CONTENT WINDOW
@@ -1190,7 +1191,44 @@
 .cs-shell[data-stage="subagent"] .cs-spane[data-spane="subagent"],
 .cs-shell[data-stage="runs"]     .cs-spane[data-spane="runs"],
 .cs-shell[data-stage="exec"]     .cs-spane[data-spane="exec"],
-.cs-shell[data-stage="commit"]   .cs-spane[data-spane="commit"] { display: flex; }
+.cs-shell[data-stage="commit"]   .cs-spane[data-spane="commit"],
+.cs-shell[data-stage="timeline"] .cs-spane[data-spane="timeline"] { display: flex; }
+
+/* ==================== TIMELINE PANE ======================================
+   <tf-run-timeline> is a fixed-height plot, so the pane body does not stretch
+   it: the widget keeps its own geometry and the row under it names whichever
+   band the operator picked. Without that row a click on a band would light up
+   and say nothing. */
+.cs-spane[data-spane="timeline"] .cs-pane-body {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  overflow: auto;
+}
+.cs-timeline { flex-shrink: 0; border-radius: 8px; border: 1px solid var(--border); }
+/* Exactly one of the plot and the empty state is on screen. Both hosts are
+   `display: block` in controls.css, so the switch is a rule, not `hidden`. */
+.cs-spane[data-spane="timeline"] .cs-pane-body[data-state="empty"] .cs-timeline,
+.cs-spane[data-spane="timeline"] .cs-pane-body[data-state="empty"] .cs-timeline-detail,
+.cs-spane[data-spane="timeline"] .cs-pane-body[data-state="plot"] tf-empty-state,
+.cs-timeline-detail[hidden] { display: none; }
+.cs-timeline-detail {
+  display: flex;
+  align-items: baseline;
+  gap: 12px;
+  padding: 8px 12px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  font-size: 12.5px;
+}
+.cs-timeline-detail-name { min-width: 0; overflow-wrap: anywhere; color: var(--text-1); }
+.cs-timeline-detail-ms {
+  margin-left: auto;
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-3);
+}
 
 /* Bar above the stage content (file path, diff summary, actions) */
 .cs-pane-head {
@@ -1530,7 +1568,8 @@
   .cs-shell[data-view="pliki"] .cs-dock,
   .cs-shell[data-view="zmiany"] .cs-dock,
   .cs-shell[data-view="git"] .cs-dock,
-  .cs-shell[data-view="terminal"] .cs-dock { display: none; }
+  .cs-shell[data-view="terminal"] .cs-dock,
+  .cs-shell[data-view="timeline"] .cs-dock { display: none; }
   .cs-shell[data-view="agenci"] .cs-dock { display: flex; }
 
   /* …but over content the dock comes back as a navigator drawer from the

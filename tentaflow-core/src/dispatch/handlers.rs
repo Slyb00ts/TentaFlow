@@ -6525,6 +6525,7 @@ fn proto_entry_from_db(e: crate::db::models::AuditLogEntry) -> tentaflow_protoco
         details: e.details,
         ip_address: e.ip_address,
         node_id: e.node_id,
+        correlation_id: e.correlation_id,
     }
 }
 

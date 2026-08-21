@@ -28,6 +28,7 @@ import '/js/components/tf-tooltip.js';
 
 import {
   renderFilePane, renderChangesPane, renderGitPane, renderTerminalPane, renderCommitPane,
+  renderTimelinePane,
   renderFileTreeDock, renderChangesDock, renderGitDock, renderTerminalDock,
 } from './code-studio-panes.js';
 
@@ -43,9 +44,10 @@ const DOCK_CATEGORIES = [
   { id: 'zmiany', icon: 'code', stage: 'zmiany' },
   { id: 'git', icon: 'branch', stage: 'git' },
   { id: 'terminal', icon: 'desktop', stage: 'terminal' },
+  { id: 'timeline', icon: 'clock-glance', stage: 'timeline' },
 ];
 
-// Phone bottom bar: six entries, each switching the view ABOVE itself.
+// Phone bottom bar: one entry per view, each switching the view ABOVE itself.
 const PHONE_VIEWS = [
   { id: 'konsola', icon: 'message' },
   { id: 'agenci', icon: 'brain' },
@@ -53,6 +55,7 @@ const PHONE_VIEWS = [
   { id: 'pliki', icon: 'file-text' },
   { id: 'git', icon: 'branch' },
   { id: 'terminal', icon: 'desktop' },
+  { id: 'timeline', icon: 'clock-glance' },
 ];
 
 // view -> { stage, dock }. Mirrors the K01 script: a content view shows the
@@ -64,6 +67,7 @@ const VIEW_MAP = {
   zmiany: { stage: 'zmiany', dock: 'zmiany' },
   git: { stage: 'git', dock: 'git' },
   terminal: { stage: 'terminal', dock: 'terminal' },
+  timeline: { stage: 'timeline', dock: 'timeline' },
 };
 
 // Autonomy modes, weakest first. A session may be lowered freely and raised
@@ -154,7 +158,9 @@ function freshState() {
     openRunId: '',
     profile: null,
     autonomy: '',
-    tabs: { agenci: [], pliki: [], zmiany: [], git: [], terminal: [] },
+    tabs: {
+      agenci: [], pliki: [], zmiany: [], git: [], terminal: [], timeline: [],
+    },
     tabSeq: 0,
     panes: {},
     docks: {},
@@ -521,6 +527,7 @@ function buildStage() {
       <div class="cs-spane" data-spane="git"></div>
       <div class="cs-spane" data-spane="terminal"></div>
       <div class="cs-spane" data-spane="commit"></div>
+      <div class="cs-spane" data-spane="timeline"></div>
 
       <div class="cs-spane" data-spane="subagent">
         <div class="cs-pane-head">
@@ -640,6 +647,13 @@ function buildDock() {
         <div class="cs-dock-pane" id="cs-dock-pane-zmiany" data-pane="zmiany"></div>
         <div class="cs-dock-pane" id="cs-dock-pane-git" data-pane="git"></div>
         <div class="cs-dock-pane" id="cs-dock-pane-terminal" data-pane="terminal"></div>
+        <!-- The timeline has nothing to navigate to: it is one plot of one
+             session, so the column states what the stage is showing instead of
+             listing entries that do not exist. -->
+        <div class="cs-dock-pane" id="cs-dock-pane-timeline" data-pane="timeline">
+          <div class="cs-dock-title">${escapeHtml(t('timeline.dock_title'))}</div>
+          <div class="cs-empty"><p>${escapeHtml(t('timeline.dock_note'))}</p></div>
+        </div>
       </div>
     </div>
   `);
@@ -747,6 +761,7 @@ function mountExternalPanes() {
   state.panes.git = renderGitPane(spane('git'), scope);
   state.panes.terminal = renderTerminalPane(spane('terminal'), scope);
   state.panes.commit = renderCommitPane(spane('commit'), scope);
+  state.panes.timeline = renderTimelinePane(spane('timeline'), scope);
 
   state.docks.pliki = renderFileTreeDock(dpane('pliki'), scope);
   state.docks.zmiany = renderChangesDock(dpane('zmiany'), scope);
@@ -1026,8 +1041,9 @@ function onStageTabClose(e) {
   if (el) closeTab(el.dataset.csCat, el.dataset.csTab);
 }
 
-// Two categories have something to show before anything is opened: the run
-// inspector and the branch overview. They are pinned, so they cannot be closed.
+// Three categories have something to show before anything is opened: the run
+// inspector, the branch overview and the session timeline. They are pinned, so
+// they cannot be closed.
 function seedTabs() {
   state.tabs.agenci.push({
     id: 'runs', stage: 'runs', pinned: true, mono: false, icon: 'list',
@@ -1036,6 +1052,10 @@ function seedTabs() {
   state.tabs.git.push({
     id: 'branch', stage: 'git', pinned: true, mono: false, icon: 'branch',
     label: t('git.tab'), title: ctx.session.branch || '', sub: '',
+  });
+  state.tabs.timeline.push({
+    id: 'timeline', stage: 'timeline', pinned: true, mono: false, icon: 'clock-glance',
+    label: t('timeline.tab'), title: t('timeline.title'), sub: '',
   });
 }
 

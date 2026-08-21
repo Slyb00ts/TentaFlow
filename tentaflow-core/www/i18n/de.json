@@ -3360,7 +3360,9 @@
     "sev_info": "info",
     "sev_warn": "warn",
     "sev_err": "err",
-    "sev_ok": "ok"
+    "sev_ok": "ok",
+    "correlation": "Korrelation",
+    "open_events": "Lauf in Ereignissen zeigen"
   },
   "mesh": {
     "title": "Mesh",
@@ -5136,7 +5138,8 @@
       "count_title": "{name}: {count} {count|Eintrag|Einträge} in der Liste",
       "plan": "Plan",
       "plan_open": "{count} {count|offene Aufgabe|offene Aufgaben}",
-      "plan_done": "alles erledigt"
+      "plan_done": "alles erledigt",
+      "timeline": "Zeitachse"
     },
     "legend": {
       "run": "arbeitet",
@@ -5512,6 +5515,18 @@
         "superseded": "ersetzt",
         "conflicted": "Konflikt",
         "unknown": "unbekannt"
+      },
+      "timeline": {
+        "title": "Zeitachse der Sitzung",
+        "subtitle": "aus dem Ereignisprotokoll",
+        "reload": "Neu laden",
+        "count": "{count} {count|Band|Bänder}",
+        "empty_title": "Keine aufgezeichneten Ereignisse",
+        "empty_text": "Diese Sitzung hat noch kein Laufereignis geschrieben.",
+        "scope_hint": "Nur Ereignisse dieser Sitzung. Ein Band ohne aufgezeichnetes Ende wird als Startmarke gezeichnet — keine Dauer wird geraten.",
+        "in_flight": "läuft",
+        "load_failed": "Die Zeitachse konnte nicht geladen werden.",
+        "truncated": "Die Grafik zeigt die neuesten {count} {count|Ereignis|Ereignisse} dieser Sitzung."
       }
     },
     "connection": {
@@ -5536,6 +5551,12 @@
       "back_heading": "Ich hole nach, was passiert ist",
       "back_desc": "Die Sitzung hat in der Zwischenzeit {count} {count|Ereignis|Ereignisse} erzeugt. Ich lade sie ab Cursor seq {seq}, damit die Zeitleiste vollständig ist.",
       "back_progress": "{done} von {total} {total|Ereignis|Ereignissen}"
+    },
+    "timeline": {
+      "tab": "Zeitachse",
+      "title": "Zeitachse der Sitzung",
+      "dock_title": "Zeitachse",
+      "dock_note": "Hier gibt es nichts zu navigieren — die Bühne zeigt eine Grafik der Läufe dieser Sitzung."
     }
   },
   "external": {
@@ -5908,6 +5929,7 @@
     "link_org": "Organisation",
     "seq_label": "Seq {seq}",
     "turn_unknown": "ohne Zug",
-    "payload_unreadable": "Der gespeicherte Ereignisinhalt konnte nicht gelesen werden."
+    "payload_unreadable": "Der gespeicherte Ereignisinhalt konnte nicht gelesen werden.",
+    "correlation_filter": "Korrelation: {id}"
   }
 }

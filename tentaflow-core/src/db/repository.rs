@@ -12267,7 +12267,7 @@ pub fn list_audit_logs(
     let conn = acquire(pool)?;
 
     let mut sql = String::from(
-        "SELECT id, timestamp, user_id, addon_id, action, resource, details, ip_address, node_id \
+        "SELECT id, timestamp, user_id, addon_id, action, resource, details, ip_address, node_id, correlation_id \
          FROM audit_log WHERE 1=1",
     );
     let mut params: Vec<Box<dyn rusqlite::types::ToSql>> = Vec::new();
@@ -12322,6 +12322,7 @@ pub fn list_audit_logs(
                 details: row.get(6)?,
                 ip_address: row.get(7)?,
                 node_id: row.get(8)?,
+                correlation_id: row.get(9)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -12365,6 +12366,67 @@ pub fn count_audit_logs(pool: &DbPool, filters: &AuditLogFilters) -> Result<u64>
     let param_refs: Vec<&dyn rusqlite::types::ToSql> = params.iter().map(|p| p.as_ref()).collect();
     let count: i64 = conn.query_row(&sql, param_refs.as_slice(), |row| row.get(0))?;
     Ok(count.max(0) as u64)
+}
+
+#[cfg(test)]
+mod audit_log_repository_tests {
+    use super::*;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        crate::db::init(Path::new(":memory:")).expect("cannot build test DB")
+    }
+
+    /// `correlation_id` (migration 132) is written by the events outbox and is
+    /// the only thing tying an audit row to the run that produced it. It lives
+    /// or dies in this SELECT: the column can be present on disk and still be
+    /// invisible to the screen if the projection forgets it, which is exactly
+    /// how the deep link was missing before.
+    #[test]
+    fn list_audit_logs_returns_the_stored_correlation_id() {
+        let db = fresh_db();
+        {
+            let conn = acquire(&db).unwrap();
+            conn.execute(
+                "INSERT INTO audit_log (timestamp, action, resource, correlation_id) \
+                 VALUES ('2026-08-21T10:00:00Z', 'flow_run', 'run-a', 'corr-42')",
+                [],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO audit_log (timestamp, action, resource) \
+                 VALUES ('2026-08-21T09:00:00Z', 'flow_run', 'run-b')",
+                [],
+            )
+            .unwrap();
+        }
+
+        let rows = list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("flow_run".to_string()),
+                ..Default::default()
+            },
+            0,
+            10,
+        )
+        .unwrap();
+
+        let with = rows
+            .iter()
+            .find(|r| r.resource.as_deref() == Some("run-a"))
+            .expect("the correlated row is listed");
+        assert_eq!(with.correlation_id.as_deref(), Some("corr-42"));
+
+        let without = rows
+            .iter()
+            .find(|r| r.resource.as_deref() == Some("run-b"))
+            .expect("the uncorrelated row is listed");
+        assert_eq!(
+            without.correlation_id, None,
+            "a row written without a correlation must not borrow another row's"
+        );
+    }
 }
 
 /// Usuwa wpisy logu audytowego starsze niz podana liczba dni.
