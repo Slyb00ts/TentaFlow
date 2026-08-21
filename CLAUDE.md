@@ -332,9 +332,13 @@ shutdown). UI `www/js/modules/project-studio.js`, apps-home tile `projekty` WITH
 
 **Wire contract.** One `MessageBody::ProjectStudioBody(ProjectStudioPayload)`, currently 248
 variants — strictly append-only (ciborium tags by variant NAME: never rename or reorder; golden
-test `project_studio_wire_golden`). That is close to the 256-variant budget of the frame format,
-so new features belong in a NEW sub-enum. Struct FIELDS are append-only the same way — add with
-`#[serde(default)]` so peers that omit them still decode.
+test `project_studio_wire_golden`). There is **no** 256-variant cap — that claim, still repeated
+in a few file headers, is wrong on both counts: the dependency is ciborium 0.2.2 (there is no
+0.8), and `MessageBody` ships well over 256 variants. Tags are NAMES, proved by
+`events::tests::message_body_is_tagged_by_variant_name`. So the binding rule is **never rename a
+variant** — a rename silently breaks every deployed peer while round-trip tests stay green.
+A new feature still belongs in a NEW sub-enum, for readability, not for capacity. Struct FIELDS
+are append-only the same way — add with `#[serde(default)]` so peers that omit them still decode.
 
 **Permissions.** Migration 119: `project_studio.read` (all roles) + `project_studio.admin`
 (org_admin). Creating a project needs a per-user grant (`project_creator_grants`); in-project

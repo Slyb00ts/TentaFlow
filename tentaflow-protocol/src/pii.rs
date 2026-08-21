@@ -1,8 +1,9 @@
 // =============================================================================
 // Plik: pii.rs
 // Opis: Inner-enum pack dla operacji na regulach PII. Spakowany w jednym
-//       slocie `MessageBody::PiiRuleBody`, zeby zaoszczedzic miejsce w
-//       enumie MessageBody (CBOR 0.8 hard limit 256 wariantow).
+//       slocie `MessageBody::PiiRuleBody`, zeby jedna funkcja zajmowala
+//       jeden wariant i enum MessageBody zostal czytelny (limitu 256
+//       wariantow NIE ma — ciborium taguje po NAZWIE).
 //       Pattern: `ProfilingPayload`.
 // =============================================================================
 

@@ -2,9 +2,9 @@
 // File: legal.rs
 // Purpose: Admin-side binary protocol for RODO/GDPR legal document management
 //          (F2 P8.c). All RPCs are packed into a single `LegalAdminPayload`
-//          inner enum so the whole legal surface burns one `MessageBody`
-//          discriminant slot — same pattern as `CameraAdminPayload` and
-//          `ProfilingPayload` (CBOR 0.8 256-variant cap).
+//          inner enum so the whole legal surface occupies one `MessageBody`
+//          variant — same pattern as `CameraAdminPayload` and
+//          `ProfilingPayload`. (There is no 256-variant cap: tags are NAMES.)
 // =============================================================================
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};

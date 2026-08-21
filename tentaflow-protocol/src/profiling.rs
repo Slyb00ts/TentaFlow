@@ -888,8 +888,15 @@ pub struct ProfilingCollectorsStatusResponse {
 }
 
 /// Inner-enum pack — keeps every multi-source profiling message in a single
-/// `MessageBody::ProfilingBody` slot to avoid using up the CBOR 256-variant
-/// budget of `MessageBody`.
+/// `MessageBody::ProfilingBody` variant, so one feature is one slot and that
+/// enum stays readable.
+///
+/// This is organisation, NOT a capacity limit. ciborium tags externally-tagged
+/// enums by variant NAME (proved by `events::tests::message_body_is_tagged_by_variant_name`,
+/// which finds the literal strings in the encoded bytes), and `MessageBody`
+/// already carries well over 256 variants in production. The rule that DOES
+/// bind: renaming a variant silently breaks every deployed peer, so variants
+/// are append-only and never renamed.
 #[derive(
     SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
 )]

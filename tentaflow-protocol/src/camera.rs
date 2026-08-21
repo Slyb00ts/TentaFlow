@@ -2,9 +2,9 @@
 // File: camera.rs
 // Purpose: Admin-side binary protocol for camera discovery + add (F2 P7.a).
 //          Packed into a single `CameraAdminPayload` inner enum so the whole
-//          camera-wizard surface burns one `MessageBody` discriminant slot
-//          (CBOR 0.8 caps `MessageBody` at 256 variants — see profiling.rs
-//          / vision.rs for the same pack pattern).
+//          camera-wizard surface occupies one `MessageBody` variant, keeping
+//          that enum readable — see profiling.rs / vision.rs for the same pack
+//          pattern. (There is no 256-variant cap: ciborium tags by NAME.)
 // =============================================================================
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
@@ -162,8 +162,8 @@ pub struct CameraDetectionsFrame {
 }
 
 /// Inner-enum pack — keeps every admin camera RPC in a single
-/// `MessageBody::CameraAdminBody` slot (CBOR 256-variant budget). Matches the
-/// `ProfilingPayload` / `VisionInferPayload` pattern.
+/// `MessageBody::CameraAdminBody` variant, so one feature is one slot. Matches
+/// the `ProfilingPayload` / `VisionInferPayload` pattern.
 #[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum CameraAdminPayload {
     DiscoverRequest(CameraDiscoverRequest),

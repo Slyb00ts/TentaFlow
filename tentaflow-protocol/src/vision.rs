@@ -2,8 +2,9 @@
 // Plik: vision.rs
 // Opis: Typy protokolu dla inference vision (face detection / age+gender /
 //       emotion). Spakowane jako jeden `VisionInferPayload` enum z 2 parami
-//       request/response — zeby zaoszczedzic sloty w MessageBody (CBOR 0.8
-//       ma twardy limit 256 wariantow w enumie). Patrn `ProfilingPayload`.
+//       request/response — zeby jedna funkcja zajmowala jeden wariant
+//       MessageBody (limitu 256 wariantow NIE ma — ciborium taguje po
+//       NAZWIE). Patrz `ProfilingPayload`.
 // =============================================================================
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
