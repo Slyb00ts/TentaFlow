@@ -910,3 +910,48 @@ dłuższa lista.
 
 Zlecona poprawka (świeży wykonawca, nie autor, nie krytyk) obejmuje S1–S4, prozę i test
 pinujący wartownika. Nowa krytyka po poprawce musi iść do **kolejnego** świeżego krytyka.
+
+---
+
+## INCYDENT 5 (mój błąd, nie agenta): blokada mutacji użyta jako blokada buildu
+
+Kazałem obu wykonawcom owijać **każde** wywołanie `cargo` w `with-mutation-lock.sh`. Blokada
+istnieje po to, żeby jeden agent nie kompilował się na ZMUTOWANYM drzewie drugiego — a ja
+zrobiłem z niej globalną blokadę buildu. Skutek: pełny `cargo test --lib` jednego agenta
+(43 min, 1225% CPU, 25 GB RSS — pracował, nie wisiał) zagłodził drugiego na 40 minut, a ten
+oddał **kod niezweryfikowany**: 12 zmienionych plików i 1 nowy, zero kompilacji, zero testów,
+zero dowodów mutacyjnych.
+
+Agent zachował się poprawnie — trzymał się reguły 3 zamiast ją obejść, i powiedział wprost
+„traktuj kod jako niezwalidowany". Wina jest po stronie zlecenia.
+
+**Reguła poprawiona:**
+- blokada TYLKO wokół okna mutacji: nałóż → jeden odfiltrowany test → przywróć → odczytaj kod
+  z powrotem. Zwolnij między oknami.
+- zwykły `cargo check` / `cargo test` na niezmutowanym drzewie: **bez blokady**. Własna blokada
+  katalogu `target` w cargo i tak serializuje buildy bezpiecznie.
+- **nigdy nieodfiltrowany `cargo test --lib`** — ~45 min na tej maszynie i wiesza się na
+  `services::storage_proxy::server::tests::central_kv_proxy_writes_and_reads_on_authority`.
+
+Wniosek ogólny, ten sam co przy INCYDENCIE 4: mechanizm, który wymusza dyscyplinę, musi być
+wąsko zakresowany. Zbyt szeroki działa jak awaria.
+
+### Znalezisko R2b, które zmienia projekt węzła
+
+Addon RAG **już buduje własny graf** przez host-funkcje, z własnym rejestrem sprzątającym
+(`graph_artifacts`), i domyślnie ustawia `graph_enabled: true` (`addons/rag/src/lib.rs:807-817`).
+Wpięcie `graph_extract` we WSPÓLNY flow ingestu podwójnie zapisywałoby graf dla ścieżki addona,
+a przy moim pierwotnym rozstrzygnięciu („jawnie włączony graf na buildzie bez `feature = graph`
+= głośny błąd") **hard-failowałoby każdy ingest RAG na domyślnym buildzie**.
+
+Wykonawca rozwiązał to przypinając `"graph_enabled": false` w configu zasianego węzła i dając
+configowi pierwszeństwo nad meta. To usuwa błąd, ale czyni funkcję **martwą** — a kryterium
+brzmi „wpięty w platformowy flow ingestu **sterowany `graph_enabled`**".
+
+**Rozstrzygnięcie właściciela: sygnałem opt-in jest OBECNOŚĆ `graph_home`.** Węzeł ekstrahuje
+tylko gdy `ctx.graph_home.is_some()` ∧ graf nie jest jawnie wyłączony ∧ feature skompilowany.
+Ścieżka addona nie niesie `graph_home` (pisze do drzewa addona przez host-fn), więc węzeł
+degraduje się tam do no-opu **z powodu widocznego w kodzie**, a nie przez zamrożoną flagę.
+Project Studio `graph_home` ustawia — i to ta ścieżka dostaje ekstrakcję, domyślnie wyłączoną
+zgodnie z decyzją człowieka. Głośna odmowa zostaje, ale wyzwala ją wyłącznie **własny config
+węzła**, nigdy odziedziczone `meta` domyślnie ustawione na ON.
