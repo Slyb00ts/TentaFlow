@@ -452,17 +452,27 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
   truncates extraction on small-RAM machines → CMake "Parse error … bad character".
 - llama.cpp: pinned `LLAMA_CPP_REF=6b80c74f` so everyone shares one prebuilt (`origin/master`
   for fresh, `vendored` for the old tree). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
-  `multi` = (cuda XOR rocm, auto-chosen by the visible GPU when both toolchains exist) + vulkan
-  + cpu — CUDA and HIP ggml backends can NEVER share one static object (same symbols, one
-  `ggml_backend_cuda_reg`); use `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm` to force it). The
+  `multi` = cuda + vulkan + cpu on a Linux/Windows machine with a VISIBLE NVIDIA GPU, otherwise
+  vulkan + cpu). Apple is a separate branch entirely — macOS/iOS resolve to **metal** and nothing
+  else, so none of the CUDA/ROCm/Vulkan rules below apply there.
+  **On Linux/Windows, autodetection never picks ROCm**: NVIDIA runs on CUDA, everything else on the portable Vulkan
+  backend. ROCm is still built on request — `LLAMA_CPP_BACKENDS=rocm` — but never by accident,
+  because CUDA and HIP ggml backends can NEVER share one static object (same symbols, one
+  `ggml_backend_cuda_reg`), so an auto-pick between them turns "which driver answered at build
+  time" into a different artifact. A CUDA toolkit alone is NOT the signal either: a box that
+  keeps `/opt/cuda` with no NVIDIA card in the slot builds vulkan. Force any of it with
+  `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`. The
   build scripts find `nvcc`/`hipcc` outside PATH (`/usr/local/cuda`, `/opt/rocm`, `CUDA_HOME`)
   and wipe a variant's `lib-static`/`lib-dynamic` dirs before install so a stale
   `libggml-cuda.a` cannot get linked next to a fresh `libggml-hip.a`. Local patches come from
   `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
   auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
-- Whisper autodetection on Linux/Windows covers CUDA, ROCm and Vulkan. AMD chips can be pinned,
-  e.g. `CMAKE_HIP_ARCHITECTURES=gfx1201` before
-  `LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh`.
+- Whisper autodetection on Linux/Windows follows the same rule (`WHISPER_CPP_BACKENDS`); on Apple
+  it is metal, and `inference-whisper` is not linked there at all. Building ROCm on purpose
+  needs an architecture pin and a real Clang, because CMake >= 4 REFUSES the `hipcc` wrapper as
+  the HIP compiler: `HIPCXX=/opt/rocm/llvm/bin/clang++ CMAKE_HIP_ARCHITECTURES=gfx1201
+  LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh` (the scripts now default `HIPCXX`
+  to the ROCm clang, falling back to `hipcc` only when no clang is next to it).
 - CUDA NV12/RGB preprocessing for the zero-copy ORT path is opt-in via `gpu-cuda` or
   `vision-cuda`; a plain AMD/Intel build never invokes `nvcc` and preprocesses on the host. The
   portable WGPU/Vulkan backend is Burn's default for the main vision pipeline

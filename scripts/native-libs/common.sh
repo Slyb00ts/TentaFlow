@@ -94,7 +94,19 @@ resolve_gpu_toolchains() {
       /opt/rocm/bin/hipcc)"; then
     expose_compiler_on_path "$hipcc"
     export NATIVE_HIPCC="$hipcc"
-    export HIPCXX="${HIPCXX:-$hipcc}"
+    # CMake >= 4 REFUSES the hipcc wrapper as the HIP compiler and aborts
+    # ("This is not supported. Use Clang directly"), so point HIPCXX at the
+    # ROCm clang next to it and keep hipcc only as the last resort.
+    local hip_clang
+    for hip_clang in \
+        "${HIP_PATH:+$HIP_PATH/llvm/bin/clang++}" \
+        "${ROCM_PATH:+$ROCM_PATH/llvm/bin/clang++}" \
+        /opt/rocm/llvm/bin/clang++ \
+        "$(command -v amdclang++ 2>/dev/null || true)"; do
+      [ -n "$hip_clang" ] && [ -x "$hip_clang" ] && break
+      hip_clang=""
+    done
+    export HIPCXX="${HIPCXX:-${hip_clang:-$hipcc}}"
   fi
 }
 
@@ -102,11 +114,6 @@ nvidia_gpu_visible() {
   [ "$(nvidia-smi -L 2>/dev/null | grep -c '^GPU ')" -ge 1 ] 2>/dev/null
 }
 
-amd_gpu_visible() {
-  rocm-smi --showid >/dev/null 2>&1 && return 0
-  [ -e /sys/class/kfd/kfd ] && return 0
-  lspci 2>/dev/null | grep -iE 'VGA|3D' | grep -qi amd
-}
 
 # Prints the auto-detected GPU backends for $PLATFORM, one per line, and a
 # one-line summary (with compiler paths) on stderr so a silent miss is visible.
@@ -121,20 +128,27 @@ detect_backends() {
       if [ -z "$hipcc" ] && command -v amdclang++ >/dev/null 2>&1; then
         hipcc="$(command -v amdclang++)"
       fi
-      if [ -n "$NATIVE_NVCC" ] && [ -n "$hipcc" ]; then
-        # ggml-hip is ggml-cuda built for HIP (same symbols, one
-        # ggml_backend_cuda_reg), so a static ggml can hold only one of them:
-        # pick by the GPU that is actually visible on this machine.
-        local pick reason
-        if nvidia_gpu_visible; then
-          pick="cuda"; reason="NVIDIA GPU visible"
-        elif amd_gpu_visible; then
-          pick="rocm"; reason="AMD GPU visible"
-        else
-          pick="cuda"; reason="no GPU visible, default"
-        fi
-        echo "[native-libs] cuda and rocm toolchains both present; static ggml can hold only one — choosing $pick ($reason). Override with LLAMA_CPP_BACKENDS/WHISPER_CPP_BACKENDS." >&2
-        if [ "$pick" = "cuda" ]; then hipcc=""; else NATIVE_NVCC=""; fi
+      # Shipping policy: NVIDIA runs on CUDA, everything else runs on the
+      # portable Vulkan backend. ROCm is therefore never chosen automatically —
+      # it stays reachable, but only when asked for by name
+      # (LLAMA_CPP_BACKENDS=rocm / WHISPER_CPP_BACKENDS=rocm).
+      #
+      # This also removes the machine-dependent coin flip that used to decide it:
+      # ggml-hip is ggml-cuda built for HIP (same symbols, one
+      # ggml_backend_cuda_reg), so a static ggml can hold only one of them, and
+      # the choice was made by whichever driver happened to answer at build time.
+      # On a box that has both toolkits and swaps cards, that silently produced a
+      # different artifact from one build to the next.
+      if [ -n "$hipcc" ]; then
+        echo "[native-libs] rocm toolchain present but not auto-selected: AMD ships on vulkan. Ask for it by name with LLAMA_CPP_BACKENDS=rocm / WHISPER_CPP_BACKENDS=rocm." >&2
+        hipcc=""
+      fi
+      # CUDA is built for an NVIDIA GPU that is actually here. A toolkit alone is
+      # not the signal: this repo is built on machines that keep /opt/cuda around
+      # with no NVIDIA card in the slot.
+      if [ -n "$NATIVE_NVCC" ] && ! nvidia_gpu_visible; then
+        echo "[native-libs] cuda toolkit found but no NVIDIA GPU is visible — building vulkan instead. Force it with LLAMA_CPP_BACKENDS=cuda." >&2
+        NATIVE_NVCC=""
       fi
       if [ -n "$NATIVE_NVCC" ]; then
         detected+=("cuda")
