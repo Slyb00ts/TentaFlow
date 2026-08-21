@@ -868,3 +868,45 @@ breaks every deployed browser" — czyli krytyczne jest **nieprzemianowywanie**,
 Komentarze indeksowe sugerują odwrotnie (kolejność krytyczna, nazwa obojętna) i to jest rada
 niebezpieczna. **Nie poprawiam pięciu plików na podstawie rozumowania** — to wymaga dowodu
 empirycznego z kodowania, a ten należy do toru protokołowego.
+
+---
+
+## Runda: zapis pochodzenia do `flow_executions` — ślepy krytyk (2026-08-21)
+
+**Werdykt: DOES NOT MEET BAR.** Czternaście mutacji, **jedenaście złapanych, cztery żywe**.
+P1, P2, P3, P6, P7 spełnione i realnie pilnowane. **P4 i P5 niespełnione.**
+
+Co ważne: w każdym z czterech przypadków **kod produkcyjny jest poprawny** — brakuje testu,
+który zauważyłby, gdyby przestał być. To luka pokrycia, nie usterka zachowania.
+
+| Mutacja | Miejsce | Skutek |
+|---|---|---|
+| **M7** | `run_manager.rs:667`, `handle_agent_spawn` bierze stałą zamiast `&caller.principal` | **64 testy agentów zielone.** Sonda `eprintln!` dowiodła, że DZIEWIĘĆ testów wykonuje zmutowaną linię i żaden nie asertuje na jej wyniku |
+| **M8/M8b** | `run_manager.rs:1620`, autokontynuacja pod stałym principalem albo wyprowadzonym z `user_id` | zielone. `user_id` to **dokładnie ten błąd, przed którym ostrzega komentarz obok** — przeżywa, bo fikstura testu to `AgentPrincipal::user("u1")`, gdzie błąd i poprawność dają tę samą wartość |
+| **M11** | skasowanie ramienia `"meeting" => FlowOrigin::Meeting` z `parse` | zielone. Dwa testy „pilnujące" round-tripu iterują **listę pisaną ręcznie**, w której brakuje `Dashboard` i `Meeting`. `Meeting` jest mintowany produkcyjnie (`meeting/flow_turn.rs:244`) — czyli wariant dodany W TEJ SESJI nie ma pokrycia round-tripu |
+| **M14** | `ContextFactory::make_context` daje `begin_run` inny `correlation_id` niż `ExecutionContext` | **1025 testów zielonych.** Dwa istniejące testy sprawdzają po jednej stronie, każdy wobec literału wpisanego we własnym ciele |
+
+**Odpowiedź na pytanie 2 jest ROZSZCZEPIONA**, tak samo jak w R3. Strona flow: TAK — inwersja
+sensu toru (pisarz utrwala stałą; stempel jednak z `envelope.meta`) czerwieni testy. Strona
+sub-agenta: NIE — inwersja „dziecko dziedziczy stały `system` zamiast rodzica" przechodzi
+niezauważona mimo dziewięciu testów wykonujących tę linię.
+
+**Nauka z M11, ważniejsza niż sama mutacja:** test iterujący ręczną listę wariantów ma tę samą
+wadę co brak testu, tylko odroczoną — nowy wariant po prostu nie trafia na listę. Poprawka musi
+być **strukturalna** (wyczerpujący `match`, który nie kompiluje się po dodaniu wariantu), nie
+dłuższa lista.
+
+### Znaleziska poza kryteriami
+
+1. **Flow syntetyczne NIE tworzą wiersza przebiegu w ogóle.** `create_execution_record` zwraca
+   wartownika `0`, gdy `flow_id.is_empty()`, a tak właśnie powstają flow syntetyczne
+   (`dispatcher.rs:831`, `:1070`). Czyli wywołanie `/v1` spadające na flow syntetyczne odpowiada
+   na „skąd i kto" **brakiem wiersza**. Świadome (klucz obcy do `flows`) i okomentowane, ale
+   istotnie kwalifikuje tezę „dla każdego przebiegu", a żaden test tego nie pinuje.
+2. **Nowa zastana czerwień, nie z naszej listy:** `dispatch::stream::tests::lidar_local_robot_subscribe_streams_frame`
+   pada na czystym HEAD (niezgodność bajtów 20–27 ładunku). Niezwiązane z tym torem.
+3. **Rozjazd numeru migracji w prozie:** `repository.rs` i `principal.rs` mówią o „pre-v131",
+   podczas gdy kolumny dodaje **v134**. Kosmetyczne, ale wysyła czytelnika do złej migracji.
+
+Zlecona poprawka (świeży wykonawca, nie autor, nie krytyk) obejmuje S1–S4, prozę i test
+pinujący wartownika. Nowa krytyka po poprawce musi iść do **kolejnego** świeżego krytyka.
