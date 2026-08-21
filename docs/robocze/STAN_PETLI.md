@@ -778,3 +778,27 @@ Zweryfikowane jako poprawnie mintowane przez serwer i świadomie nietknięte: cz
 (`chat.session_id` z wiersza `project_chats`, tworzony `Uuid::new_v4()`, wyszukiwany z twardym
 filtrem po `user_id`) oraz `meeting/flow_turn.rs` (`meeting_id`). Test
 `non_api_origins_keep_their_server_chosen_session_id` pinuje, że te ścieżki zostają nietknięte.
+
+---
+
+## Wznowienie po limicie sesji (2026-08-21, po południu)
+
+**Stan drzewa po ubiciu krytyka `flow_executions`:** czysty. Krytyk zginął ze słowami
+„teraz próba podrobienia E2", czyli **przed** nałożeniem mutacji podrabiającej `envelope.meta`
+w `flow_engine/executor.rs`. Potwierdzone nie grepem, tylko porównaniem: zmodyfikowane pliki to
+dokładnie zestaw T3b rundy 2 (966 linii = raportowane +781/−185), a `flow_engine/executor.rs`
+i `db/**` nietknięte. Żadnych osieroconych procesów.
+
+**T3b runda 2 zacommitowana** jako `41db12484`.
+
+**Odbudowa mechanizmu izolacji mutacji.** Katalog roboczy sesji został wyczyszczony przy
+restarcie maszyny, więc blokada i migawka z INCYDENTU 4 przepadły. Odtworzone:
+`snapshot.sh` (migawka wszystkich śledzonych plików, własność ORKIESTRATORA),
+`verify-tree.sh` (porównanie drzewa z migawką — wykrywa mutację bez markera, czego grep nie robi),
+`with-mutation-lock.sh` (`flock -o`, żeby sccache nie odziedziczył deskryptora blokady).
+
+Dwie pułapki po drodze, obie tej samej klasy co wcześniejszy błąd `sha256sum -c`:
+`cp -p` na śledzonym SYMLINKU do katalogu spoza repo (`mockups/component-catalog/face-data`)
+próbuje kopiować katalog — potrzebne `cp -Pp`; oraz **zlokalizowany `diff` pisze „Tylko w",
+nie „Only in"**, więc filtr plików nieśledzonych przepuszczał wszystko. `LC_ALL=C` jest
+nośne, nie kosmetyczne — bez niego `verify-tree.sh` raportowałby czyste drzewo zawsze.
