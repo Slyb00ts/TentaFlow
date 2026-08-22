@@ -293,6 +293,37 @@ mod tests {
             .unwrap()
     }
 
+    /// §5.2 of `docs/DOKONCZENIE_RAG_I_ZDARZENIA.md` — "ROZSTRZYGNIĘTE: 30 dni".
+    ///
+    /// This is the ONE assertion in the file that spells the number out, and it
+    /// does so deliberately. Every other test here reads `EVENTS_RETENTION_DAYS`
+    /// because what they check is that the sweeper follows the POLICY, whatever
+    /// it says — a literal there would only re-test SQLite's date arithmetic.
+    /// The default term itself is not a variable, though: it is an owner
+    /// decision, weighed in the document against the ≥183 days the AI audit
+    /// trail is bound by, and a test that reads the same constant it guards
+    /// moves with it. Raising `EVENTS_RETENTION_DAYS` to 90 would leave all
+    /// three of the other assertions green while silently overturning the
+    /// decision. Changing this number therefore means changing the document.
+    #[test]
+    fn the_default_term_is_the_thirty_days_the_decision_fixed() {
+        assert_eq!(
+            EVENTS_RETENTION_DAYS, 30,
+            "30 days is a recorded owner decision (§5.2), not a tuning knob — \
+             move the document first"
+        );
+
+        // And the seed a fresh node comes up with really is that term, so the
+        // decision governs live data and not just a constant nothing reads.
+        let main = main_db();
+        let terms = resolve_retention_terms(&main).unwrap().unwrap();
+        assert_eq!(
+            terms.per_org.get(DEFAULT_ORG_ID).copied(),
+            Some(30),
+            "a fresh node does not keep its timeline for the decided 30 days"
+        );
+    }
+
     /// §2.9 — the term comes from the compliance policy. The assertion is on
     /// the RESOLVED value, and the sweep is then run against a policy that was
     /// MOVED: a hardcoded 30 would pass the first half and fail the second.

@@ -146,7 +146,7 @@ mod tests {
     use tokio::sync::mpsc;
 
     use crate::events::progress_log::RunEventLog;
-    use crate::events::store::read_run;
+    use crate::events::store::{append, read_run, EventPayload, ResponseBody, RunEvent};
     use crate::flow_engine::cache::CompiledFlow;
     use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
     use crate::flow_engine::envelope::{
@@ -407,7 +407,6 @@ mod tests {
     /// the writer's omission leaves the timing intact.
     #[tokio::test]
     async fn decode_time_still_works_with_response_bodies_off() {
-        use crate::events::store::{append, EventPayload, ResponseBody, RunEvent};
         use crate::events::{BodyOmission, EventKind};
 
         let (_dir, pool) = crate::events::test_support::events_db();
@@ -498,6 +497,197 @@ mod tests {
             }
             other => panic!("expected an assistant_message payload, got {other:?}"),
         }
+    }
+
+
+    /// Writes one event of `run-*` at a fixed instant, so the numbers below are
+    /// exact rather than a window around a sleep. Timing accuracy is already
+    /// covered by the two streaming tests; what these fixtures need instead is
+    /// an INTERLEAVING that a real run reproduces only by luck.
+    fn append_at(
+        pool: &DbPool,
+        core_db: &DbPool,
+        run_id: &str,
+        at_ms: i64,
+        node_id: Option<&str>,
+        payload: EventPayload,
+    ) {
+        let actor = FlowActor::user("u-1");
+        let mut event = RunEvent::new(run_id, at_ms, FlowOrigin::Chat, &actor, payload)
+            .with_org("org-1");
+        if let Some(node_id) = node_id {
+            event = event.with_node(node_id);
+        }
+        append(pool, core_db, event).expect("append");
+    }
+
+    fn request_started() -> EventPayload {
+        EventPayload::RequestStarted {
+            model: None,
+            flow_id: None,
+            service_type: None,
+            modality: None,
+        }
+    }
+
+    /// §2.7 — "within the same step" means WITHIN THE SAME NODE. Two nodes
+    /// stream side by side and `tts-1` opens its step BETWEEN `llm-1`'s step
+    /// start and `llm-1`'s first token, which is the only arrangement that can
+    /// separate the two readings: with the node binding gone the label is
+    /// merely "the most recent step start in the run", so `llm-1`'s token comes
+    /// back labelled `tts` — another node's step wearing this one's name.
+    ///
+    /// The messages are interleaved the same way, `tts-1` finishing first, so
+    /// the decode half is bound to its own node too: unbound, `llm-1`'s token
+    /// would be closed by `tts-1`'s message and report 400 ms instead of 800.
+    #[test]
+    fn a_step_belongs_to_its_own_node_not_to_the_latest_start_in_the_run() {
+        let (_dir, pool) = crate::events::test_support::events_db();
+        let core_db = crate::events::test_support::main_db();
+        let run = "run-interleaved";
+        let at = |at_ms: i64, node: Option<&str>, payload: EventPayload| {
+            append_at(&pool, &core_db, run, at_ms, node, payload)
+        };
+
+        at(1_000, None, request_started());
+        at(
+            1_010,
+            Some("llm-1"),
+            EventPayload::StepStart { step: "llm".into() },
+        );
+        at(
+            1_020,
+            Some("tts-1"),
+            EventPayload::StepStart { step: "tts".into() },
+        );
+        at(1_100, Some("llm-1"), EventPayload::FirstToken {});
+        at(1_200, Some("tts-1"), EventPayload::FirstToken {});
+        at(
+            1_500,
+            Some("tts-1"),
+            EventPayload::AssistantMessage {
+                body: ResponseBody::Text("spoken".into()),
+                tokens: None,
+            },
+        );
+        at(
+            1_900,
+            Some("llm-1"),
+            EventPayload::AssistantMessage {
+                body: ResponseBody::Text("written".into()),
+                tokens: None,
+            },
+        );
+
+        let steps = step_latencies(&pool, run).expect("latencies");
+        assert_eq!(steps.len(), 2, "one row per first_token: {steps:?}");
+        assert_eq!(steps[0].node_id, "llm-1");
+        assert_eq!(steps[1].node_id, "tts-1");
+        assert_eq!(
+            steps[0].step, "llm",
+            "the label came from another node's step start: {steps:?}"
+        );
+        assert_eq!(steps[1].step, "tts", "{steps:?}");
+        assert_eq!(steps[0].ttft_ms, Some(100));
+        assert_eq!(steps[1].ttft_ms, Some(200));
+        assert_eq!(
+            steps[0].decode_ms,
+            Some(800),
+            "the message closing this token belongs to another node: {steps:?}"
+        );
+        assert_eq!(steps[1].decode_ms, Some(300), "{steps:?}");
+    }
+
+    /// §2.7 — a run whose `request_started` never reached the log has NO TTFT.
+    /// `None`, never `Some(0)`: a zero reads as "the first token arrived the
+    /// instant the request did", which is a measurement, and there is nothing
+    /// here to measure from. The decode half of the same row is a real number
+    /// on purpose — it proves the row reached the query, so the `None` is the
+    /// missing start and not an empty fixture.
+    #[test]
+    fn a_run_with_no_request_started_has_no_ttft_rather_than_zero() {
+        let (_dir, pool) = crate::events::test_support::events_db();
+        let core_db = crate::events::test_support::main_db();
+        let run = "run-no-open";
+        let at = |at_ms: i64, node: Option<&str>, payload: EventPayload| {
+            append_at(&pool, &core_db, run, at_ms, node, payload)
+        };
+
+        // The opening event is absent: a lagging subscriber dropped it, which
+        // is exactly the case §2.6 says the reader has to survive.
+        at(
+            1_010,
+            Some("llm-1"),
+            EventPayload::StepStart { step: "llm".into() },
+        );
+        at(1_100, Some("llm-1"), EventPayload::FirstToken {});
+        at(
+            1_600,
+            Some("llm-1"),
+            EventPayload::AssistantMessage {
+                body: ResponseBody::Text("an answer".into()),
+                tokens: Some(7),
+            },
+        );
+
+        let steps = step_latencies(&pool, run).expect("latencies");
+        assert_eq!(steps.len(), 1, "the token is still on the timeline: {steps:?}");
+        assert_eq!(steps[0].step, "llm");
+        assert_eq!(
+            steps[0].ttft_ms, None,
+            "a missing request_started must leave a hole, not a zero: {steps:?}"
+        );
+        assert_eq!(
+            steps[0].decode_ms,
+            Some(500),
+            "the half that CAN be measured still is: {steps:?}"
+        );
+    }
+
+    /// §2.7 — a message that never completed has NO decode time. The node
+    /// failed mid-stream, so there is no `assistant_message` to measure to;
+    /// `Some(0)` would claim the answer finished the instant it started and
+    /// would sit in that step's average forever. The TTFT half is a real
+    /// number, so the assertion is about the missing END and not about a row
+    /// that never reached the query.
+    #[test]
+    fn a_message_that_never_completed_has_no_decode_time_rather_than_zero() {
+        let (_dir, pool) = crate::events::test_support::events_db();
+        let core_db = crate::events::test_support::main_db();
+        let run = "run-cut-short";
+        let at = |at_ms: i64, node: Option<&str>, payload: EventPayload| {
+            append_at(&pool, &core_db, run, at_ms, node, payload)
+        };
+
+        at(1_000, None, request_started());
+        at(
+            1_010,
+            Some("llm-1"),
+            EventPayload::StepStart { step: "llm".into() },
+        );
+        at(1_150, Some("llm-1"), EventPayload::FirstToken {});
+        // The stream died after its first token: an `error` closes the node and
+        // no `assistant_message` is ever written.
+        at(
+            1_400,
+            Some("llm-1"),
+            EventPayload::Error {
+                stage: "llm".into(),
+                message: "backend closed the stream".into(),
+            },
+        );
+
+        let steps = step_latencies(&pool, run).expect("latencies");
+        assert_eq!(steps.len(), 1, "the token is still on the timeline: {steps:?}");
+        assert_eq!(
+            steps[0].ttft_ms,
+            Some(150),
+            "the half that CAN be measured still is: {steps:?}"
+        );
+        assert_eq!(
+            steps[0].decode_ms, None,
+            "an unfinished message must leave a hole, not a zero: {steps:?}"
+        );
     }
 
     /// Drives the progress stream directly for the tool tests: the harness that

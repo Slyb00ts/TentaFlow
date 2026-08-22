@@ -245,7 +245,6 @@ CREATE INDEX ix_events_audit_outbox_due ON audit_outbox(delivered_at, next_attem
 #[cfg(test)]
 mod tests {
     use crate::events::test_support::events_db;
-    use std::collections::BTreeSet;
 
     /// §2.3 is the contract another track writes SQL against, so it is asserted
     /// against `sqlite_master` — what actually reached the file — and not
@@ -317,67 +316,115 @@ mod tests {
         };
         assert_eq!(pk, vec!["run_id".to_string(), "seq".to_string()]);
 
-        let indexes: Vec<(String, Option<String>)> = {
+        // §2.3 specifies SIX indexes on `run_events` AND the columns of each.
+        // A name proves nothing on its own — an index on the wrong columns
+        // still answers to it — so every entry below is transcribed from
+        // `docs/DOKONCZENIE_RAG_I_ZDARZENIA.md` §2.3 and not from
+        // `INITIAL_SCHEMA`, which would only compare the constant with itself.
+        // The set is compared for EQUALITY, so an index nobody wrote down has
+        // to reach the specification before it can reach the schema.
+        let expected_indexes: &[(&str, &[&str], bool, bool)] = &[
+            ("ix_run_events_actor", &["actor_id", "at_ms"], false, false),
+            ("ix_run_events_corr", &["correlation_id"], false, false),
+            ("ix_run_events_org", &["org_id", "at_ms"], false, false),
+            ("ix_run_events_origin", &["origin", "at_ms"], false, false),
+            ("ix_run_events_time", &["at_ms"], false, false),
+            (
+                "ux_run_events_idem",
+                &["run_id", "idempotency_key"],
+                true,
+                true,
+            ),
+        ];
+
+        // `origin` separates the indexes §2.3 writes out ('c') from the one
+        // SQLite builds for `PRIMARY KEY (run_id, seq)` ('pk'), which has no
+        // CREATE INDEX of its own and is asserted above through
+        // `pragma_table_info`. Anything else — a UNIQUE constraint smuggled
+        // into the table body, say — would show up here as a third class.
+        let index_list: Vec<(String, bool, String, bool)> = {
             let mut stmt = conn
                 .prepare(
-                    "SELECT name, sql FROM sqlite_master \
-                     WHERE type = 'index' AND tbl_name = 'run_events'",
+                    "SELECT name, \"unique\", origin, partial \
+                     FROM pragma_index_list('run_events') ORDER BY name",
                 )
                 .unwrap();
             stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?))
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)? != 0,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, i64>(3)? != 0,
+                ))
             })
             .unwrap()
             .collect::<rusqlite::Result<Vec<_>>>()
             .unwrap()
         };
-        let names: BTreeSet<&str> = indexes.iter().map(|(name, _)| name.as_str()).collect();
-        for expected in [
-            "ix_run_events_time",
-            "ix_run_events_origin",
-            "ix_run_events_actor",
-            "ix_run_events_corr",
-            "ix_run_events_org",
-            "ux_run_events_idem",
-        ] {
-            assert!(names.contains(expected), "missing index {expected}: {names:?}");
+        let implicit = index_list
+            .iter()
+            .filter(|(_, _, origin, _)| origin != "c")
+            .count();
+        assert_eq!(
+            implicit, 1,
+            "the primary key is the only index §2.3 leaves to SQLite: {index_list:?}"
+        );
+
+        let created: Vec<&(String, bool, String, bool)> = index_list
+            .iter()
+            .filter(|(_, _, origin, _)| origin == "c")
+            .collect();
+        let names: Vec<&str> = created.iter().map(|(name, ..)| name.as_str()).collect();
+        let expected_names: Vec<&str> = expected_indexes.iter().map(|(name, ..)| *name).collect();
+        assert_eq!(
+            names, expected_names,
+            "the index set is not the one §2.3 lists"
+        );
+
+        for (name, columns, unique, partial) in expected_indexes {
+            let actual = created
+                .iter()
+                .find(|(actual_name, ..)| actual_name.as_str() == *name)
+                .expect("the name set was compared above");
+            assert_eq!(actual.1, *unique, "index {name} has the wrong uniqueness");
+            assert_eq!(
+                actual.3, *partial,
+                "index {name} covers a different share of the table than §2.3 says"
+            );
+            let actual_columns: Vec<String> = {
+                let mut stmt = conn
+                    .prepare(&format!(
+                        "SELECT name FROM pragma_index_info('{name}') ORDER BY seqno"
+                    ))
+                    .unwrap();
+                stmt.query_map([], |row| row.get::<_, String>(0))
+                    .unwrap()
+                    .collect::<rusqlite::Result<Vec<_>>>()
+                    .unwrap()
+            };
+            let actual_columns: Vec<&str> = actual_columns.iter().map(String::as_str).collect();
+            assert_eq!(
+                actual_columns,
+                columns.to_vec(),
+                "index {name} covers the wrong columns"
+            );
         }
 
-        let org_sql = indexes
-            .iter()
-            .find(|(name, _)| name == "ix_run_events_org")
-            .and_then(|(_, sql)| sql.clone())
-            .expect("ix_run_events_org has no SQL");
-        assert!(
-            org_sql
-                .split_whitespace()
-                .collect::<Vec<_>>()
-                .join(" ")
-                .contains("(org_id, at_ms)"),
-            "the tenant index is not the composite the sweep needs: {org_sql}"
-        );
-
-        let idem_sql = indexes
-            .iter()
-            .find(|(name, _)| name == "ux_run_events_idem")
-            .and_then(|(_, sql)| sql.clone())
-            .expect("ux_run_events_idem has no SQL");
+        // WHICH rows the one partial index leaves out. The `partial` flag above
+        // only says that a predicate exists; §2.3 names it, and a different one
+        // would quietly change which repeats deduplicate.
+        let idem_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master \
+                  WHERE type = 'index' AND name = 'ux_run_events_idem'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
         let normalized = idem_sql.split_whitespace().collect::<Vec<_>>().join(" ");
         assert!(
-            normalized.contains("UNIQUE"),
-            "the idempotency index is not unique: {normalized}"
-        );
-        assert!(
-            normalized.contains("(run_id, idempotency_key)"),
-            "the idempotency index covers the wrong columns: {normalized}"
-        );
-        // PARTIAL, not plain unique: without the WHERE clause every event that
-        // opts out of deduplication would collide on NULL in SQLite's
-        // stricter dialects and, more to the point, the index would carry a
-        // row for each of them.
-        assert!(
             normalized.contains("WHERE idempotency_key IS NOT NULL"),
-            "the idempotency index is not partial: {normalized}"
+            "the idempotency index skips the wrong rows: {normalized}"
         );
 
         let auto_vacuum: i64 = conn
