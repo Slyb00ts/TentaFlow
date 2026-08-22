@@ -1128,6 +1128,30 @@
   line-height: 1.5;
 }
 
+/* The graph toggle spends model calls, so its price sits next to the switch
+   rather than in a hint the eye skips. */
+.ps-graph-cost {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 10px 0 14px;
+  padding: 9px 11px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-2);
+  font-size: 11.5px;
+  line-height: 1.5;
+  color: var(--text-2);
+}
+
+.ps-graph-cost .icon {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  margin-top: 1px;
+  color: var(--warning);
+}
+
 .ps-fn-controls {
   display: flex;
   align-items: center;

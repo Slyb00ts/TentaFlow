@@ -167,8 +167,24 @@ pub trait GraphBackend: Send + Sync {
     /// żadnego `format!()` z danych addona (poprawka codex pkt 4).
     fn node_exists(&self, id: &str) -> Result<bool>;
 
-    /// Czy krawędź `(src, rel, dst)` istnieje. Parametryzowane (`$src/$rel/$dst`).
-    fn edge_exists(&self, src: &str, rel: &str, dst: &str) -> Result<bool>;
+    /// Stored provenance JSON of node `id`, `None` when the node does not exist.
+    /// The upsert path reads it to union the document set (`provenance::merge`),
+    /// so it answers existence and membership in ONE parameterized query.
+    fn node_provenance(&self, id: &str) -> Result<Option<String>>;
+
+    /// Stored provenance JSON of edge `(src, rel, dst)`, `None` when absent.
+    fn edge_provenance(&self, src: &str, rel: &str, dst: &str) -> Result<Option<String>>;
+
+    /// Replaces ONLY the provenance of node `id`, keeping label, props and `ts`.
+    /// Used when a per-document delete leaves other documents naming the node:
+    /// an `upsert_node` would have to invent a label and would move `ts`.
+    fn set_node_provenance(&self, id: &str, provenance_json: &str) -> Result<()>;
+
+    /// Replaces ONLY the provenance of edge `(src, rel, dst)`. Preserving `alive`
+    /// is load-bearing: `upsert_edge` REVIVES an edge, so rewriting a shrunken
+    /// document set through it would resurrect a soft-deleted edge.
+    fn set_edge_provenance(&self, src: &str, rel: &str, dst: &str, provenance_json: &str)
+        -> Result<()>;
 
     /// Read-only zapytanie Cozo budowane przez HOST (`Immutable`). Addon NIE
     /// podaje skryptu — to wewnętrzna ścieżka (pagerank/tombstone-list/export);
@@ -467,7 +483,26 @@ impl GraphBackend for CozoBackend {
         Ok(!rows.rows.is_empty())
     }
 
-    fn edge_exists(&self, src: &str, rel: &str, dst: &str) -> Result<bool> {
+    fn node_provenance(&self, id: &str) -> Result<Option<String>> {
+        let mut params = BTreeMap::new();
+        params.insert("id".to_string(), cozo::DataValue::from(id));
+        let rows = self
+            .db
+            .run_script(
+                "?[provenance] := *nodes{id, provenance}, id == $id\n:limit 1",
+                params,
+                ScriptMutability::Immutable,
+            )
+            .map_err(|e| GraphError::Datalog(e.to_string()))?;
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.get_str())
+            .map(str::to_string))
+    }
+
+    fn edge_provenance(&self, src: &str, rel: &str, dst: &str) -> Result<Option<String>> {
         let mut params = BTreeMap::new();
         params.insert("src".to_string(), cozo::DataValue::from(src));
         params.insert("rel".to_string(), cozo::DataValue::from(rel));
@@ -475,12 +510,72 @@ impl GraphBackend for CozoBackend {
         let rows = self
             .db
             .run_script(
-                "?[src] := *edges{src, rel, dst}, src == $src, rel == $rel, dst == $dst\n:limit 1",
+                "?[provenance] := *edges{src, rel, dst, provenance}, src == $src, rel == $rel, dst == $dst\n:limit 1",
                 params,
                 ScriptMutability::Immutable,
             )
             .map_err(|e| GraphError::Datalog(e.to_string()))?;
-        Ok(!rows.rows.is_empty())
+        Ok(rows
+            .rows
+            .first()
+            .and_then(|r| r.first())
+            .and_then(|v| v.get_str())
+            .map(str::to_string))
+    }
+
+    fn set_node_provenance(&self, id: &str, provenance_json: &str) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("id".to_string(), cozo::DataValue::from(id));
+        params.insert(
+            "provenance".to_string(),
+            cozo::DataValue::from(provenance_json),
+        );
+        // The rule reads the row it rewrites, so label/props/ts come from the
+        // stored tuple; a row that does not exist yields no tuple and `:put`
+        // writes nothing.
+        self.db
+            .run_script(
+                r"
+                ?[id, label, props, provenance, ts] :=
+                    *nodes{id, label, props, ts},
+                    id == $id, provenance = $provenance
+                :put nodes {id => label, props, provenance, ts}
+                ",
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| GraphError::Datalog(e.to_string()))?;
+        Ok(())
+    }
+
+    fn set_edge_provenance(
+        &self,
+        src: &str,
+        rel: &str,
+        dst: &str,
+        provenance_json: &str,
+    ) -> Result<()> {
+        let mut params = BTreeMap::new();
+        params.insert("src".to_string(), cozo::DataValue::from(src));
+        params.insert("rel".to_string(), cozo::DataValue::from(rel));
+        params.insert("dst".to_string(), cozo::DataValue::from(dst));
+        params.insert(
+            "provenance".to_string(),
+            cozo::DataValue::from(provenance_json),
+        );
+        self.db
+            .run_script(
+                r"
+                ?[src, rel, dst, weight, props, provenance, ts, alive] :=
+                    *edges{src, rel, dst, weight, props, ts, alive},
+                    src == $src, rel == $rel, dst == $dst, provenance = $provenance
+                :put edges {src, rel, dst => weight, props, provenance, ts, alive}
+                ",
+                params,
+                ScriptMutability::Mutable,
+            )
+            .map_err(|e| GraphError::Datalog(e.to_string()))?;
+        Ok(())
     }
 
     fn run_query(&self, script: &str) -> Result<NamedRows> {

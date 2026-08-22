@@ -258,6 +258,11 @@ pub struct ProjectSettings {
     pub modules: Vec<String>,
     pub agents: Vec<ProjectAgentBinding>,
     pub tags: Vec<TagInfo>,
+    /// Whether an ingest of this project also extracts a knowledge graph.
+    /// Appended field: a peer predating it omits it, and `false` is the same
+    /// answer the server gives for a project that never opted in.
+    #[serde(default)]
+    pub graph_extraction: bool,
 }
 
 /// Attachment reference stored on cases, run items, steps and tasks.
@@ -1152,6 +1157,11 @@ pub enum ProjectStudioPayload {
         /// "turn a module off" case impossible to express.
         #[serde(default)]
         modules: Option<Vec<String>>,
+        /// Knowledge-graph extraction during ingest. `None` leaves the current
+        /// value alone, so the basics/modules/agents saves that share this
+        /// request cannot flip it by omission.
+        #[serde(default)]
+        graph_extraction: Option<bool>,
     },
     SettingsSaveResult {
         ok: bool,

@@ -5897,7 +5897,7 @@ export const encode = {
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 
-  /** MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save, absent fields untouched. payload: { projectId, name?, description?, agents?|agentsJson?, modules? }. `modules` replaces the enabled module set. */
+  /** MessageBody::ProjectStudioBody(SettingsSaveRequest) — partial save, absent fields untouched. payload: { projectId, name?, description?, agents?|agentsJson?, modules?, graphExtraction? }. `modules` replaces the enabled module set; `graphExtraction` is the knowledge-graph ingest toggle. */
   projectStudioSettingsSaveRequest(correlationId, payload = {}, sequence = 1) {
     assertReady();
     let agentsJson;
@@ -5909,12 +5909,17 @@ export const encode = {
       agentsJson = JSON.stringify(payload.agents);
     }
     const modulesJson = Array.isArray(payload.modules) ? JSON.stringify(payload.modules.map(String)) : undefined;
+    // Tri-state: only a real boolean writes the toggle — `undefined` must stay
+    // undefined so an unrelated save leaves the stored value alone.
+    const rawGraph = payload.graphExtraction ?? payload.graph_extraction;
+    const graphExtraction = rawGraph == null ? undefined : Boolean(rawGraph);
     const body = _wasm.encodeProjectStudioSettingsSaveRequest(
       String(payload.projectId ?? payload.project_id ?? ''),
       payload.name == null ? undefined : String(payload.name),
       payload.description == null ? undefined : String(payload.description),
       agentsJson,
       modulesJson,
+      graphExtraction,
     );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },

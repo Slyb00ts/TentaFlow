@@ -1646,3 +1646,121 @@ fn build_sample_graph() -> (TempDir, CozoBackend) {
     }
     (dir, be)
 }
+
+/// Two documents naming the SAME entity. Cozo's `:put` is last-writer-wins, so a
+/// single-valued provenance remembered only the document that wrote last, and
+/// deleting THAT document tombstoned a node the first document still named. The
+/// document set is what keeps the shared node alive.
+#[test]
+fn test_delete_document_keeps_a_node_named_by_another_document() {
+    let (_dir, mgr) = mgr();
+    let doc1 = r#"{"doc_ids":["file-1"]}"#;
+    let doc2 = r#"{"doc_ids":["file-2"]}"#;
+    write_document(&mgr, "einstein", "eth_zurich", doc1);
+    // The second document names the same organisation, and writes it LAST.
+    write_document(&mgr, "curie", "eth_zurich", doc2);
+    assert_eq!(mgr.node_count(ORG_A, "addon_a", "kg").unwrap(), 3);
+
+    let (nodes, edges) = mgr
+        .delete_document_in(ORG_A, "addon_a", "kg", "file-2")
+        .unwrap();
+    assert_eq!(
+        (nodes, edges),
+        (1, 1),
+        "only curie and her relation lost their last document"
+    );
+
+    let csr = mgr.export_csr(ORG_A, "addon_a", "kg").unwrap();
+    assert!(
+        csr.ids.iter().any(|id| id == "eth_zurich"),
+        "the shared organisation is still named by file-1: {:?}",
+        csr.ids
+    );
+    assert!(
+        csr.ids.iter().any(|id| id == "einstein"),
+        "file-1's own entity must survive: {:?}",
+        csr.ids
+    );
+    assert!(
+        !csr.ids.iter().any(|id| id == "curie"),
+        "file-2's own entity is gone: {:?}",
+        csr.ids
+    );
+    assert_eq!(csr.edge_count(), 1, "only file-1's relation survives");
+}
+
+/// The shrunken document set has to be STORED, not just computed: after the last
+/// naming document goes the shared node must finally tombstone.
+#[test]
+fn test_delete_document_tombstones_once_the_last_document_goes() {
+    let (_dir, mgr) = mgr();
+    write_document(&mgr, "einstein", "eth_zurich", r#"{"doc_ids":["file-1"]}"#);
+    write_document(&mgr, "curie", "eth_zurich", r#"{"doc_ids":["file-2"]}"#);
+
+    mgr.delete_document_in(ORG_A, "addon_a", "kg", "file-2")
+        .unwrap();
+    let (nodes, edges) = mgr
+        .delete_document_in(ORG_A, "addon_a", "kg", "file-1")
+        .unwrap();
+    assert_eq!(
+        (nodes, edges),
+        (2, 1),
+        "einstein and the now-unclaimed organisation both go"
+    );
+
+    let csr = mgr.export_csr(ORG_A, "addon_a", "kg").unwrap();
+    assert!(csr.ids.is_empty(), "nothing is left named: {:?}", csr.ids);
+}
+
+/// Rewriting a shrunken document set must not revive a soft-deleted edge —
+/// `upsert_edge` sets `alive=true`, which is why the rewrite is its own
+/// provenance-only primitive.
+#[test]
+fn test_shrinking_an_edge_document_set_does_not_resurrect_it() {
+    let (_dir, mgr) = mgr();
+    write_document(&mgr, "einstein", "eth_zurich", r#"{"doc_ids":["file-1"]}"#);
+    // The SAME relation is extracted from a second document, so its set holds two.
+    mgr.upsert_edge_with_quota(
+        ORG_A,
+        "addon_a",
+        "kg",
+        "einstein",
+        "worked_at",
+        "eth_zurich",
+        1.0,
+        "{}",
+        r#"{"doc_ids":["file-2"]}"#,
+    )
+    .unwrap();
+    let (removed, _, _) = mgr
+        .delete_edge_in(ORG_A, "addon_a", "kg", "einstein", "worked_at", "eth_zurich")
+        .unwrap();
+    assert!(removed, "the edge was alive before the manual tombstone");
+
+    mgr.delete_document_in(ORG_A, "addon_a", "kg", "file-2")
+        .unwrap();
+
+    let csr = mgr.export_csr(ORG_A, "addon_a", "kg").unwrap();
+    assert_eq!(csr.edge_count(), 0, "a tombstoned edge stays tombstoned");
+}
+
+/// One document's contribution: two entities and the relation between them,
+/// carrying that document's provenance.
+fn write_document(mgr: &GraphManager, person: &str, org: &str, provenance: &str) {
+    mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", person, "person", "{}", provenance)
+        .unwrap();
+    mgr.upsert_node_with_quota(ORG_A, "addon_a", "kg", org, "org", "{}", provenance)
+        .unwrap();
+    mgr.upsert_edge_with_quota(
+        ORG_A,
+        "addon_a",
+        "kg",
+        person,
+        "worked_at",
+        org,
+        1.0,
+        "{}",
+        provenance,
+    )
+    .unwrap();
+}

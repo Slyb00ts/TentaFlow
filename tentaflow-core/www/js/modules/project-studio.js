@@ -3719,6 +3719,7 @@ async function renderSettings() {
   const enabledModules = new Set(
     Array.isArray(settings.modules) ? settings.modules : (Array.isArray(state.project?.modules) ? state.project.modules : []),
   );
+  const graphExtraction = fv(settings, 'graph_extraction') === true;
 
   const bindingOf = (fn) => agents.find((a) => a.function === fn)
     || { function: fn, agent_id: '', agent_name: '', model_label: '' };
@@ -3782,6 +3783,19 @@ async function renderSettings() {
         `).join('')}
       </div>
       <tf-button variant="primary" icon="check" id="ps-set-modules-save">${escapeHtml(t('settings_save'))}</tf-button>
+    </tf-section-card>
+
+    <tf-section-card title="${escapeAttr(t('settings_graph_title'))}" icon="network">
+      <span slot="subtitle">${escapeHtml(t('settings_graph_sub'))}</span>
+      <div class="ps-setting-row">
+        <div class="ps-sr-main">
+          <div class="ps-sr-label">${escapeHtml(t('settings_graph_label'))}</div>
+          <div class="ps-sr-desc">${escapeHtml(t('settings_graph_desc'))}</div>
+        </div>
+        <tf-toggle id="ps-set-graph" ${graphExtraction ? 'checked' : ''}></tf-toggle>
+      </div>
+      <div class="ps-graph-cost">${sprite('alert')}<span>${escapeHtml(t('settings_graph_cost'))}</span></div>
+      <tf-button variant="primary" icon="check" id="ps-set-graph-save">${escapeHtml(t('settings_save'))}</tf-button>
     </tf-section-card>
 
     <tf-section-card title="${escapeAttr(t('agents_title'))}" icon="brain">
@@ -3863,6 +3877,30 @@ async function renderSettings() {
       // Modules drive the tab strip, so the shell must be rebuilt from the
       // freshly read project row rather than the stale one in state.
       await refreshProjectHeader();
+    } catch (err) {
+      toast(`${t('settings_save_failed')}: ${err.message}`, 'error');
+    }
+  });
+
+  // The toggle is submitted ALONE: `graph_extraction` is `None` on every other
+  // save, so turning it on is a deliberate act and no unrelated save can flip
+  // it. Re-reads the stored value afterwards rather than trusting the switch.
+  byId('ps-set-graph-save')?.addEventListener('click', async () => {
+    const toggle = byId('ps-set-graph');
+    const enabled = toggle?.hasAttribute('checked') === true;
+    try {
+      await ApiBinary.one('projectStudioSettingsSaveRequest', {
+        projectId: projectId(),
+        graphExtraction: enabled,
+      });
+      const resp = await ApiBinary.one('projectStudioSettingsGetRequest', { projectId: projectId() });
+      state.settings = resp.settings;
+      const stored = fv(resp.settings ?? {}, 'graph_extraction') === true;
+      if (toggle) {
+        if (stored) toggle.setAttribute('checked', '');
+        else toggle.removeAttribute('checked');
+      }
+      toast(t(stored ? 'settings_graph_on' : 'settings_graph_off'), 'success');
     } catch (err) {
       toast(`${t('settings_save_failed')}: ${err.message}`, 'error');
     }

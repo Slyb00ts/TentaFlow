@@ -72,6 +72,7 @@ use dashmap::DashMap;
 use super::backend::{CozoBackend, GraphBackend, GraphEngine};
 use super::csr::Csr;
 use super::error::{GraphError, Result};
+use super::provenance::{self, DocRemoval};
 use crate::db::DbPool;
 use crate::services::vector::namespace::{
     validate_addon_id, validate_custom_dir, validate_namespace_name, validate_org_id,
@@ -947,9 +948,11 @@ impl GraphManager {
         })
     }
 
-    /// Soft-deletes everything one DOCUMENT contributed to the collection: every
-    /// edge and every node whose stored `provenance` JSON carries
-    /// `doc_id == doc_id`. Returns `(nodes_removed, edges_removed)`.
+    /// Withdraws one DOCUMENT from the collection: every node and edge whose
+    /// stored `provenance` names it drops that membership, and only a row left
+    /// with NO document behind it is soft-deleted. A row several documents named
+    /// survives with a shrunken set (see `provenance::without_doc`), which is why
+    /// `(nodes_removed, edges_removed)` counts TOMBSTONES, not touched rows.
     ///
     /// The whole sweep runs under ONE write lock, so a concurrent ingest of the
     /// same document cannot interleave a half-deleted state with fresh writes.
@@ -957,13 +960,6 @@ impl GraphManager {
     /// column holds an opaque JSON document, not a typed field — a substring
     /// match would also hit a `source_id` or a `path` that happens to contain the
     /// same text, and delete another document's rows.
-    ///
-    /// KNOWN LIMIT of single-valued provenance: an entity mentioned by several
-    /// documents keeps only the provenance of the LAST writer, so deleting that
-    /// last document tombstones a node another document also relies on. The
-    /// alternative — a per-document mirror table — is a schema change; a
-    /// re-ingest of the surviving document restores the node (an upsert revives
-    /// both the label and `alive`).
     pub fn delete_document_in(
         &self,
         org_id: &str,
@@ -988,8 +984,16 @@ impl GraphManager {
                 ) else {
                     continue;
                 };
-                if provenance_names_doc(prov, doc_id) && backend.delete_edge(src, rel, dst)? {
-                    edges_removed += 1;
+                match provenance::without_doc(prov, doc_id) {
+                    DocRemoval::NotNamed => {}
+                    DocRemoval::Shrunk(remaining) => {
+                        backend.set_edge_provenance(src, rel, dst, &remaining)?
+                    }
+                    DocRemoval::Emptied => {
+                        if backend.delete_edge(src, rel, dst)? {
+                            edges_removed += 1;
+                        }
+                    }
                 }
             }
 
@@ -1002,8 +1006,14 @@ impl GraphManager {
                 ) else {
                     continue;
                 };
-                if provenance_names_doc(prov, doc_id) && backend.delete_node(id)? {
-                    nodes_removed += 1;
+                match provenance::without_doc(prov, doc_id) {
+                    DocRemoval::NotNamed => {}
+                    DocRemoval::Shrunk(remaining) => backend.set_node_provenance(id, &remaining)?,
+                    DocRemoval::Emptied => {
+                        if backend.delete_node(id)? {
+                            nodes_removed += 1;
+                        }
+                    }
                 }
             }
             Ok((nodes_removed, edges_removed))
@@ -1023,8 +1033,9 @@ impl GraphManager {
     }
 
     /// Node upsert enforcing the GLOBAL node quota per (org, addon), atomic ACROSS
-    /// collections too (bug F). Protocol: under the collection write lock we
-    /// establish `is_new = !node_exists(id)` (replacing an existing id does not
+    /// collections too (bug F). Protocol: under the collection write lock we read
+    /// the stored provenance, which answers at once `is_new` (an absent row) and
+    /// which documents already name this node (replacing an existing id does not
     /// change the sum, so it reserves no quota). For a new id we reserve 1 unit in
     /// the atomic SQLite ledger (`reserve_node_quota`: `BEGIN IMMEDIATE` ->
     /// `SELECT SUM(node_count) WHERE org,addon` -> if `+1 > limit` reject ->
@@ -1048,17 +1059,23 @@ impl GraphManager {
         let max_nodes = self.resolve_node_limit(addon_id);
 
         self.with_write(org_id, addon_id, collection, None, |backend| {
-            let is_new = !backend.node_exists(id)?;
+            let stored = backend.node_provenance(id)?;
+            let is_new = stored.is_none();
+            // Cozo's `:put` is last-writer-wins with no set-union, so the union
+            // of the document sets is computed HERE, inside the write lock that
+            // already spans the quota check+mutate. Doing it in the caller would
+            // read a set another ingest may replace before this `:put` lands.
+            let provenance_json = provenance::merge(stored.as_deref(), provenance_json);
             if is_new {
                 // Reservation in the atomic ledger BEFORE the Cozo mutation.
                 self.reserve_node_quota(org_id, addon_id, collection, max_nodes)?;
                 // Graph mutation; on error release the reservation.
-                if let Err(e) = backend.upsert_node(id, label, props_json, provenance_json) {
+                if let Err(e) = backend.upsert_node(id, label, props_json, &provenance_json) {
                     self.release_node_quota(org_id, addon_id, collection);
                     return Err(e);
                 }
             } else {
-                backend.upsert_node(id, label, props_json, provenance_json)?;
+                backend.upsert_node(id, label, props_json, &provenance_json)?;
             }
             backend.node_count()
         })
@@ -1083,17 +1100,19 @@ impl GraphManager {
         let max_edges = self.resolve_edge_limit(addon_id);
 
         self.with_write(org_id, addon_id, collection, None, |backend| {
-            let is_new = !backend.edge_exists(src, rel, dst)?;
+            let stored = backend.edge_provenance(src, rel, dst)?;
+            let is_new = stored.is_none();
+            let provenance_json = provenance::merge(stored.as_deref(), provenance_json);
             if is_new {
                 self.reserve_edge_quota(org_id, addon_id, collection, max_edges)?;
                 if let Err(e) =
-                    backend.upsert_edge(src, rel, dst, weight, props_json, provenance_json)
+                    backend.upsert_edge(src, rel, dst, weight, props_json, &provenance_json)
                 {
                     self.release_edge_quota(org_id, addon_id, collection);
                     return Err(e);
                 }
             } else {
-                backend.upsert_edge(src, rel, dst, weight, props_json, provenance_json)?;
+                backend.upsert_edge(src, rel, dst, weight, props_json, &provenance_json)?;
             }
             backend.edge_count()
         })
@@ -1832,17 +1851,4 @@ fn remove_cozo_files(path: &Path) -> Result<()> {
         }
     }
     Ok(())
-}
-
-/// Whether a stored `provenance` JSON names `doc_id` in its `doc_id` field.
-/// A row whose provenance is absent, `null` or unparsable belongs to no document
-/// and is never swept — deleting on a parse failure would make a malformed row
-/// match EVERY document.
-fn provenance_names_doc(provenance_json: &str, doc_id: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(provenance_json)
-        .ok()
-        .as_ref()
-        .and_then(|v| v.get("doc_id"))
-        .and_then(|v| v.as_str())
-        == Some(doc_id)
 }

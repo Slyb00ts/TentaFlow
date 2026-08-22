@@ -501,6 +501,7 @@ pub async fn project_studio_dispatch(
             description,
             agents_json,
             modules,
+            graph_extraction,
         } => settings_save_v1(
             ctx,
             project_id,
@@ -508,6 +509,7 @@ pub async fn project_studio_dispatch(
             description.as_deref(),
             agents_json.as_deref(),
             modules.as_deref(),
+            *graph_extraction,
         ),
         P::TagSaveRequest {
             project_id,
@@ -1934,7 +1936,11 @@ async fn project_delete_v1(
     //    tentaflow.db + on-disk data inside the project dir).
     ingest::drop_project_namespaces(&ctx.state.db, &org.org_id, project_id)
         .map_err(|e| db_error("drop_namespaces", e))?;
-    // 4. Remove the project directory (project.db, files/, vectors/).
+    // 4. Same for the knowledge graph: the registry rows live in tentaflow.db,
+    //    so removing the project directory alone would leave them dangling.
+    ingest::drop_project_graph(&ctx.state.db, &org.org_id, project_id)
+        .map_err(|e| db_error("drop_graph", e))?;
+    // 5. Remove the project directory (project.db, files/, vectors/, graph/).
     let dir = std::path::PathBuf::from(&record.dir_path);
     let removed = tokio::task::spawn_blocking(move || std::fs::remove_dir_all(&dir))
         .await
@@ -1944,7 +1950,7 @@ async fn project_delete_v1(
             return Err(ProtocolError::internal(format!("project dir removal: {e}")));
         }
     }
-    // 5. Central registry rows last — a crash above leaves the project
+    // 6. Central registry rows last — a crash above leaves the project
     //    visible (and the delete retryable) instead of orphaning data.
     repository::delete_project_rows(project_id).map_err(|e| db_error("project_delete", e))?;
     // The schedule loop reads the hint table, not `projects` — a leftover row
@@ -2647,6 +2653,8 @@ fn source_update_v1(
             for f in &files {
                 ingest::delete_file_vectors(&ctx.state.db, &org.org_id, project_id, &f.file_id)
                     .map_err(|e| db_error("delete_vectors", e))?;
+                ingest::delete_file_graph(&ctx.state.db, &org.org_id, project_id, &f.file_id)
+                    .map_err(|e| db_error("delete_graph", e))?;
                 let _ = repository::delete_source_file_row(&pool, &f.file_id);
             }
             repository::upsert_source_file(&pool, source_id, new_url, "", 0, "text/html")
@@ -2716,7 +2724,8 @@ async fn source_delete_v1(
 
     let files = repository::files_for_ingest(&pool, source_id, None)
         .map_err(|e| db_error("files_for_ingest", e))?;
-    // Cleanup-then-delete: vectors first, rows second, unreferenced blobs last.
+    // Cleanup-then-delete: derived stores first, rows second, unreferenced blobs
+    // last.
     {
         let core_db = ctx.state.db.clone();
         let org_id = org.org_id.clone();
@@ -2725,12 +2734,13 @@ async fn source_delete_v1(
         tokio::task::spawn_blocking(move || {
             for file_id in &file_ids {
                 ingest::delete_file_vectors(&core_db, &org_id, &project_id_owned, file_id)?;
+                ingest::delete_file_graph(&core_db, &org_id, &project_id_owned, file_id)?;
             }
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| ProtocolError::internal("vector cleanup task panicked"))?
-        .map_err(|e| db_error("delete_vectors", e))?;
+        .map_err(|_| ProtocolError::internal("knowledge cleanup task panicked"))?
+        .map_err(|e| db_error("delete_knowledge", e))?;
     }
     let ok = repository::delete_source_rows(&pool, source_id)
         .map_err(|e| db_error("source_delete", e))?;
@@ -2906,11 +2916,13 @@ async fn source_file_delete_v1(
         let project_id_owned = project_id.to_string();
         let file_id_owned = file_id.to_string();
         tokio::task::spawn_blocking(move || {
-            ingest::delete_file_vectors(&core_db, &org_id, &project_id_owned, &file_id_owned)
+            ingest::delete_file_vectors(&core_db, &org_id, &project_id_owned, &file_id_owned)?;
+            ingest::delete_file_graph(&core_db, &org_id, &project_id_owned, &file_id_owned)?;
+            Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| ProtocolError::internal("vector cleanup task panicked"))?
-        .map_err(|e| db_error("delete_vectors", e))?;
+        .map_err(|_| ProtocolError::internal("knowledge cleanup task panicked"))?
+        .map_err(|e| db_error("delete_knowledge", e))?;
     }
     let ok = repository::delete_source_file_row(&pool, file_id)
         .map_err(|e| db_error("file_delete", e))?;
@@ -3399,6 +3411,7 @@ fn settings_get_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody
             modules: parse_modules_json(&record.modules_json),
             agents,
             tags,
+            graph_extraction: ingest::graph_extraction_enabled(&pool),
         },
     }))
 }
@@ -3410,6 +3423,7 @@ fn settings_save_v1(
     description: Option<&str>,
     agents_json: Option<&str>,
     modules: Option<&[String]>,
+    graph_extraction: Option<bool>,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (record, _role) = require_project(org, project_id, ProjectRole::Manager)?;
@@ -3463,6 +3477,26 @@ fn settings_save_v1(
             .map_err(|e| ProtocolError::internal(format!("agents serialize: {e}")))?;
         repository::set_setting(&pool, "agents", &canonical)
             .map_err(|e| db_error("settings_save", e))?;
+    }
+    if let Some(enabled) = graph_extraction {
+        // Recorded like the module toggle: enabling it changes what every future
+        // ingest of this project SPENDS (one extra model pass per chunk batch),
+        // so who turned it on has to be answerable from the activity log.
+        repository::set_setting(
+            &pool,
+            ingest::GRAPH_EXTRACTION_SETTING,
+            ingest::graph_extraction_value(enabled),
+        )
+        .map_err(|e| db_error("settings_save", e))?;
+        activity::record(
+            &pool,
+            &org.user_id,
+            "user",
+            "settings.graph_extraction_changed",
+            "settings",
+            "",
+            &serde_json::json!({ "enabled": enabled }).to_string(),
+        );
     }
     if let Some(requested) = modules {
         let normalized = normalize_modules(requested)?;
@@ -6402,12 +6436,13 @@ async fn source_refresh_v1(
         tokio::task::spawn_blocking(move || {
             for file_id in &removed_ids {
                 ingest::delete_file_vectors(&core_db, &org_id, &project_owned, file_id)?;
+                ingest::delete_file_graph(&core_db, &org_id, &project_owned, file_id)?;
             }
             Ok::<(), anyhow::Error>(())
         })
         .await
-        .map_err(|_| ProtocolError::internal("vector cleanup task panicked"))?
-        .map_err(|e| db_error("delete_vectors", e))?;
+        .map_err(|_| ProtocolError::internal("knowledge cleanup task panicked"))?
+        .map_err(|e| db_error("delete_knowledge", e))?;
     }
     if file_ids.is_empty() {
         // Nothing changed: the source stays ready, no job is started. The

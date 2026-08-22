@@ -12,6 +12,7 @@ pub mod compute_guard;
 pub mod csr;
 pub mod error;
 pub mod ppr;
+pub mod provenance;
 
 pub use backend::{CozoBackend, GraphBackend, GraphEngine, NeighborDir, TOMBSTONE_LABEL};
 pub use collection::{

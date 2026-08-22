@@ -18525,6 +18525,8 @@ pub fn encode_project_studio_settings_get_request(project_id: String) -> Result<
 /// fields are left untouched. `agents_json` is a JSON array of
 /// ProjectAgentBinding objects; `modules_json` is a JSON array of module names
 /// that REPLACES the enabled set (absent, empty or `null` = leave untouched).
+/// `graph_extraction` is the per-project knowledge-graph toggle; `None` leaves
+/// it alone, so a basics or modules save cannot flip it by omission.
 #[wasm_bindgen(js_name = encodeProjectStudioSettingsSaveRequest)]
 pub fn encode_project_studio_settings_save_request(
     project_id: String,
@@ -18532,6 +18534,7 @@ pub fn encode_project_studio_settings_save_request(
     description: Option<String>,
     agents_json: Option<String>,
     modules_json: Option<String>,
+    graph_extraction: Option<bool>,
 ) -> Result<Vec<u8>, JsError> {
     let modules: Option<Vec<String>> = match modules_json
         .as_deref()
@@ -18551,6 +18554,7 @@ pub fn encode_project_studio_settings_save_request(
             description,
             agents_json,
             modules,
+            graph_extraction,
         },
     ))
     .map_err(|e| JsError::new(&e))

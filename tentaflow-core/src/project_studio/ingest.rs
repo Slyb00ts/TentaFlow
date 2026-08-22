@@ -44,12 +44,52 @@ pub const EMBEDDINGS_ALIAS: &str = "rag-embeddings";
 /// Vector namespace holding the project's knowledge chunks.
 pub const VECTOR_NAMESPACE: &str = "passages";
 
-/// Whether a project ingest builds a knowledge graph. Off by owner decision —
-/// extraction costs one extra LLM pass per document, so a project opts in rather
-/// than paying for it silently. Flipping this to a per-project setting is a
-/// one-line change here; the node itself needs nothing (Projects already pass a
-/// `graph_home`, which is the structural gate).
+/// Project setting deciding whether an ingest of THIS project also builds a
+/// knowledge graph. Stored in the project's own `settings` table, written by
+/// `SettingsSaveRequest` and read by [`graph_extraction_enabled`].
+pub const GRAPH_EXTRACTION_SETTING: &str = "graph_extraction";
+
+/// Value of [`GRAPH_EXTRACTION_SETTING`] for a project that never set it. Off by
+/// owner decision — extraction costs one extra LLM pass per chunk batch on every
+/// ingest, so a project opts in rather than paying for it silently.
+///
+/// This is the DEFAULT OF THE SETTING, not a second switch: nothing outside
+/// [`graph_extraction_enabled`] reads it, so a stored value always wins and the
+/// two cannot disagree.
 const PROJECT_GRAPH_EXTRACTION_DEFAULT: bool = false;
+
+/// Reads the project's graph-extraction toggle. The only reader of
+/// [`PROJECT_GRAPH_EXTRACTION_DEFAULT`].
+///
+/// An unreadable setting falls back to the default rather than to "on": a
+/// database hiccup must not start charging a project for extraction it never
+/// asked for.
+pub fn graph_extraction_enabled(project_pool: &DbPool) -> bool {
+    match repository::get_setting(project_pool, GRAPH_EXTRACTION_SETTING) {
+        Ok(Some(raw)) => parse_graph_extraction(&raw),
+        Ok(None) => PROJECT_GRAPH_EXTRACTION_DEFAULT,
+        Err(e) => {
+            tracing::warn!("project graph-extraction setting unreadable: {e}");
+            PROJECT_GRAPH_EXTRACTION_DEFAULT
+        }
+    }
+}
+
+/// Stored spelling of the toggle. Only the two canonical truthy spellings count;
+/// anything else (including a value written by an older build) means off, which
+/// is the safe side of a setting that spends model calls.
+fn parse_graph_extraction(raw: &str) -> bool {
+    matches!(raw.trim(), "1" | "true")
+}
+
+/// Stored spelling written by the settings handler.
+pub fn graph_extraction_value(enabled: bool) -> &'static str {
+    if enabled {
+        "1"
+    } else {
+        "0"
+    }
+}
 
 /// Graph collection holding the project's knowledge graph — the same collection
 /// name the RAG retrieval nodes read, so a project graph is queryable by the
@@ -657,9 +697,10 @@ pub fn drop_project_namespaces(core_db: &DbPool, org_id: &str, project_id: &str)
     Ok(dropped)
 }
 
-/// Graph sibling of [`delete_file_vectors`]: soft-deletes every entity and
-/// relation `graph_extract` attributed to `file_id` (its `provenance.doc_id`).
-/// Returns `(nodes, edges)` removed. A build with no graph backend, and a
+/// Graph sibling of [`delete_file_vectors`]: withdraws `file_id` from every
+/// entity and relation `graph_extract` attributed to it. A row several files
+/// named survives with the remaining ones, so the returned `(nodes, edges)`
+/// counts what was actually tombstoned. A build with no graph backend, and a
 /// project that never had a graph collection, both removed nothing.
 pub fn delete_file_graph(
     core_db: &DbPool,
@@ -1785,6 +1826,20 @@ async fn run_job(
         0,
     );
 
+    // Read once per job, not per file: a toggle flipped mid-job would otherwise
+    // give one source a half-extracted graph.
+    let graph_extraction = graph_extraction_enabled(&project_pool);
+    if graph_extraction {
+        emit_line(
+            &tx,
+            &job_id,
+            "log",
+            "extract",
+            "knowledge graph extraction is on — one extra model pass per chunk batch".to_string(),
+            0,
+        );
+    }
+
     let total = files.len().max(1) as u32;
     let mut done = 0u32;
     let mut ready = 0u32;
@@ -1825,6 +1880,7 @@ async fn run_job(
             &dir_path,
             &source_id,
             &work,
+            graph_extraction,
             &cancel,
         )
         .await;
@@ -1931,6 +1987,7 @@ fn ingest_flow_options(
     file_id: &str,
     source_id: &str,
     path: &str,
+    graph_extraction: bool,
 ) -> serde_json::Map<String, serde_json::Value> {
     let mut options = serde_json::Map::new();
     options.insert(
@@ -1947,15 +2004,60 @@ fn ingest_flow_options(
     );
     // Projects DO establish a graph home (`<project>/graph` on the request), so
     // the structural gate in `graph_extract` is open here — this is the caller
-    // the node is aimed at. Extraction is nevertheless off by owner decision:
-    // building a knowledge graph costs an extra LLM pass over every ingested
-    // file, so it is opt-in, not something a project silently starts paying for.
-    // Stamped explicitly because the shared key defaults to ON when absent.
+    // the node is aimed at. Whether extraction actually runs is the project's
+    // own `graph_extraction` setting (default off: it costs an extra LLM pass
+    // per chunk batch on every ingest). Stamped explicitly in BOTH directions
+    // because the shared key defaults to ON when absent.
     options.insert(
         "graph_enabled".to_string(),
-        serde_json::Value::Bool(PROJECT_GRAPH_EXTRACTION_DEFAULT),
+        serde_json::Value::Bool(graph_extraction),
     );
     options
+}
+
+/// Withdraws the file's PREVIOUS graph contribution before a re-ingest writes
+/// the new one.
+///
+/// The vector side has done this since the beginning (`store_chunks_blocking`
+/// deletes the doc's vectors before upserting), and the graph needs it for the
+/// same reason plus a sharper one: graph rows are keyed by NORMALIZED entity id,
+/// not by chunk index, so a re-ingest cannot overwrite the rows it no longer
+/// produces. An entity that only the old version of the file named would keep
+/// naming that file forever, and `graph_search` would answer with it.
+///
+/// Only the entities THIS document still names are withdrawn — the provenance
+/// document set keeps a row alive for every other document naming it, so a
+/// shared entity is never collateral damage.
+///
+/// A failure is fatal for the file: continuing would write the new contribution
+/// on top of the stale one, which is precisely the state this prevents.
+async fn clear_stale_file_graph(
+    core_db: &DbPool,
+    org_id: &str,
+    project_id: &str,
+    file_id: &str,
+) -> std::result::Result<(), String> {
+    let db = core_db.clone();
+    let org = org_id.to_string();
+    let project = project_id.to_string();
+    let file = file_id.to_string();
+    // Cozo writes are blocking and take the collection write lock — off the
+    // async worker, like every other store call on this path.
+    match tokio::task::spawn_blocking(move || delete_file_graph(&db, &org, &project, &file)).await {
+        Ok(Ok((nodes, edges))) => {
+            if nodes > 0 || edges > 0 {
+                tracing::debug!(
+                    file_id,
+                    nodes,
+                    edges,
+                    "re-ingest withdrew the file's previous graph contribution"
+                );
+            }
+            Ok(())
+        }
+        Ok(Err(e)) => Err(format!("graph cleanup before re-ingest: {e}")),
+        Err(_) => Err("graph cleanup task panicked".to_string()),
+    }
 }
 
 /// Ingestuje JEDEN plik przez wspolny flow zamiast wlasnej sciezki
@@ -1968,7 +2070,9 @@ fn ingest_flow_options(
 ///
 /// Anulowanie: `execute_ingest` nie widzi naszej flagi, wiec pilnujemy jej obok i
 /// przewracamy token. Bez tego zatrzymany job dalej mielilby model do konca pliku.
+#[allow(clippy::too_many_arguments)]
 async fn ingest_file_via_flow(
+    core_db: &DbPool,
     router: &Arc<Router>,
     org_id: &str,
     project_id: &str,
@@ -1976,12 +2080,20 @@ async fn ingest_file_via_flow(
     source_id: &str,
     work: &FileWork,
     bytes: Vec<u8>,
+    graph_extraction: bool,
     cancel: &Arc<AtomicBool>,
 ) -> FileResult {
     let Some(executor) = router.executor() else {
         return FileResult::Error("model runtime executor not available".to_string());
     };
-    let options = ingest_flow_options(&work.file_id, source_id, &work.path);
+    // Cleanup-then-reingest for the graph, the sibling of what
+    // `store_chunks_blocking` does for vectors. Unconditional on the toggle: a
+    // project that extracted a graph and then switched extraction OFF must not
+    // keep entities describing a version of the file that no longer exists.
+    if let Err(e) = clear_stale_file_graph(core_db, org_id, project_id, &work.file_id).await {
+        return FileResult::Error(e);
+    }
+    let options = ingest_flow_options(&work.file_id, source_id, &work.path, graph_extraction);
 
     let token = tokio_util::sync::CancellationToken::new();
     let request = crate::services::runtime::executor::IngestRequest {
@@ -2040,6 +2152,7 @@ async fn ingest_file_via_flow(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn process_file(
     core_db: &DbPool,
     router: &Arc<Router>,
@@ -2048,6 +2161,7 @@ async fn process_file(
     dir_path: &Path,
     source_id: &str,
     work: &FileWork,
+    graph_extraction: bool,
     cancel: &Arc<AtomicBool>,
 ) -> FileResult {
     // Pliki binarne, ktore umie wspolny flow (proza / office / PDF / skan /
@@ -2064,7 +2178,16 @@ async fn process_file(
             Err(_) => return FileResult::Error("blob read task panicked".to_string()),
         };
         return ingest_file_via_flow(
-            router, org_id, project_id, dir_path, source_id, work, bytes, cancel,
+            core_db,
+            router,
+            org_id,
+            project_id,
+            dir_path,
+            source_id,
+            work,
+            bytes,
+            graph_extraction,
+            cancel,
         )
         .await;
     }
@@ -3035,29 +3158,186 @@ mod tests {
     /// this must be stamped explicitly — a missing key silently turns an extra
     /// LLM pass on for every ingested file.
     #[test]
-    fn project_ingest_options_turn_graph_extraction_off() {
-        let options = super::ingest_flow_options("file-1", "src-1", "docs/a.pdf");
+    fn project_ingest_options_state_the_graph_decision_in_both_directions() {
+        let off = super::ingest_flow_options("file-1", "src-1", "docs/a.pdf", false);
         assert_eq!(
-            options.get("graph_enabled"),
-            Some(&serde_json::Value::Bool(super::PROJECT_GRAPH_EXTRACTION_DEFAULT)),
+            off.get("graph_enabled"),
+            Some(&serde_json::Value::Bool(false)),
             "Projects ingest must state the graph decision, not stay silent — an \
              absent key means ON in the shared node"
+        );
+        let on = super::ingest_flow_options("file-1", "src-1", "docs/a.pdf", true);
+        assert_eq!(
+            on.get("graph_enabled"),
+            Some(&serde_json::Value::Bool(true)),
+            "a project that opted in must reach the node with the toggle ON — \
+             otherwise the setting is unreachable and the feature is dead"
+        );
+        assert_eq!(
+            off.get("doc_id").and_then(|v| v.as_str()),
+            Some("file-1")
+        );
+        assert_eq!(
+            off.get("source_id").and_then(|v| v.as_str()),
+            Some("src-1")
+        );
+        assert_eq!(
+            off.get("path").and_then(|v| v.as_str()),
+            Some("docs/a.pdf")
+        );
+    }
+
+    /// The default lives in exactly one place: it is the fallback of the READER,
+    /// so a project that never touched the setting is off, and a stored value
+    /// always wins. Two sources of truth would show up here as a stored "1" that
+    /// still reads back false.
+    #[test]
+    fn graph_extraction_defaults_off_and_a_stored_value_wins() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (pool, _) = super::super::project_db::open_pool_at(tmp.path()).expect("project db");
+
+        assert!(
+            !super::graph_extraction_enabled(&pool),
+            "a project that never opted in must not pay for extraction"
         );
         assert!(
             !super::PROJECT_GRAPH_EXTRACTION_DEFAULT,
             "the recorded owner decision is graph OFF by default in Projects"
         );
-        assert_eq!(
-            options.get("doc_id").and_then(|v| v.as_str()),
-            Some("file-1")
+
+        repository::set_setting(
+            &pool,
+            super::GRAPH_EXTRACTION_SETTING,
+            super::graph_extraction_value(true),
+        )
+        .expect("store on");
+        assert!(
+            super::graph_extraction_enabled(&pool),
+            "enabling must be reachable — this is the whole point of the setting"
+        );
+
+        repository::set_setting(
+            &pool,
+            super::GRAPH_EXTRACTION_SETTING,
+            super::graph_extraction_value(false),
+        )
+        .expect("store off");
+        assert!(
+            !super::graph_extraction_enabled(&pool),
+            "turning it back off must stick"
+        );
+
+        // A value no build ever writes is not a licence to spend model calls.
+        repository::set_setting(&pool, super::GRAPH_EXTRACTION_SETTING, "yes")
+            .expect("store junk");
+        assert!(
+            !super::graph_extraction_enabled(&pool),
+            "an unrecognised stored value must fall to the safe side"
+        );
+    }
+
+    /// Part B: re-ingesting a CHANGED file must withdraw the entities only the
+    /// previous version named, and must NOT touch an entity another document
+    /// still names — that second half is what the provenance document set exists
+    /// for, and a naive "delete the collection" cleanup would fail it.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn reingest_drops_stale_entities_but_keeps_one_another_document_names() {
+        const ORG: &str = "org-reingest";
+        const PROJECT: &str = "p-reingest";
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let core_db = {
+            let conn = rusqlite::Connection::open_in_memory().expect("core db");
+            crate::db::migrations::run(&conn).expect("migrations");
+            Arc::new(crate::db::Db::from_connection(conn))
+        };
+        // Seeding goes through the SAME process-wide manager the cleanup uses, so
+        // the test does not depend on which pool bound the global first.
+        let mgr = crate::services::graph_manager(&core_db);
+        let scope = super::vector_scope(PROJECT);
+        let graph_home = tmp.path().join("graph");
+        mgr.ensure_collection_at(ORG, &scope, super::GRAPH_COLLECTION, &graph_home)
+            .expect("collection at project home");
+
+        let write = |doc: &str, person: &str, org: &str| {
+            let provenance = format!(r#"{{"doc_ids":["{doc}"]}}"#);
+            mgr.upsert_node_with_quota(
+                ORG,
+                &scope,
+                super::GRAPH_COLLECTION,
+                person,
+                "person",
+                "{}",
+                &provenance,
+            )
+            .expect("person");
+            mgr.upsert_node_with_quota(
+                ORG,
+                &scope,
+                super::GRAPH_COLLECTION,
+                org,
+                "org",
+                "{}",
+                &provenance,
+            )
+            .expect("org");
+            mgr.upsert_edge_with_quota(
+                ORG,
+                &scope,
+                super::GRAPH_COLLECTION,
+                person,
+                "worked_at",
+                org,
+                1.0,
+                "{}",
+                &provenance,
+            )
+            .expect("relation");
+        };
+
+        // First ingest of file-1, and a second document naming the same employer,
+        // so `eth_zurich` ends up named by BOTH.
+        write("file-1", "einstein", "eth_zurich");
+        write("file-2", "curie", "eth_zurich");
+
+        // file-1 changed on disk and is ingested again: the pre-ingest cleanup
+        // runs first, then the new contribution is written. The new version no
+        // longer mentions the shared employer — that is deliberate, so nothing
+        // after the cleanup can re-create `eth_zurich` and mask a cleanup that
+        // wrongly took it.
+        super::clear_stale_file_graph(&core_db, ORG, PROJECT, "file-1")
+            .await
+            .expect("pre-ingest graph cleanup");
+        write("file-1", "bohr", "mit");
+
+        let csr = mgr
+            .export_csr(ORG, &scope, super::GRAPH_COLLECTION)
+            .expect("csr");
+        assert!(
+            !csr.ids.iter().any(|id| id == "einstein"),
+            "the entity only the OLD version of file-1 named must be gone: {:?}",
+            csr.ids
+        );
+        assert!(
+            csr.ids.iter().any(|id| id == "bohr") && csr.ids.iter().any(|id| id == "mit"),
+            "the entities the NEW version names must be present: {:?}",
+            csr.ids
+        );
+        assert!(
+            csr.ids.iter().any(|id| id == "eth_zurich"),
+            "file-2 still names the employer — the cleanup must not take it: {:?}",
+            csr.ids
+        );
+        assert!(
+            csr.ids.iter().any(|id| id == "curie"),
+            "another document's own entity is not collateral damage: {:?}",
+            csr.ids
         );
         assert_eq!(
-            options.get("source_id").and_then(|v| v.as_str()),
-            Some("src-1")
-        );
-        assert_eq!(
-            options.get("path").and_then(|v| v.as_str()),
-            Some("docs/a.pdf")
+            csr.edge_count(),
+            2,
+            "curie's and bohr's relations survive, einstein's does not"
         );
     }
 }

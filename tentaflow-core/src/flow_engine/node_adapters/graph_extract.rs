@@ -385,8 +385,13 @@ Every relation endpoint must appear in \"entities\". An empty list is a valid an
                  keyed by document is what makes a document's contribution deletable"
             )
         })?;
+        // The document reference is a SET (`services::graph::provenance`): entity
+        // ids are normalized, so two documents naming the same entity write the
+        // same row, and `GraphManager` unions this singleton into whatever is
+        // already stored. That is what lets an entity outlive the deletion of one
+        // of the documents that named it.
         let provenance = serde_json::json!({
-            "doc_id": doc_id,
+            "doc_ids": [doc_id],
             "source_id": doc_identity(node, envelope, "source_id"),
             "path": doc_identity(node, envelope, "path"),
             "flow_node_id": node.id,
@@ -908,7 +913,12 @@ mod tests {
 
         /// Provenance is what makes a document's contribution deletable, so the
         /// write side and `GraphManager::delete_document_in` are tested together:
-        /// two documents write into one collection, deleting one leaves the other.
+        /// two documents write into one collection, and they SHARE an entity —
+        /// the case that matters, because entity ids are normalized, so both
+        /// documents write the same `eth_zurich` row and the second one writes it
+        /// last. Deleting the second must leave the shared entity standing (it is
+        /// still named by the first), and deleting the first as well must finally
+        /// take it down.
         #[tokio::test]
         async fn per_document_provenance_makes_one_document_deletable() {
             let graph = stub_graph();
@@ -932,11 +942,11 @@ mod tests {
                 .await
                 .expect("doc 1");
 
-            // A SECOND document contributing its own entity, so the delete has
-            // something to leave behind.
+            // A SECOND document naming its own entity AND the one file-1 already
+            // wrote, so it becomes the last writer of the shared row.
             let other = RecordingLlm::new(
-                r#"{"entities":[{"name":"Marie Curie","type":"person"},{"name":"Sorbonne","type":"org"}],
-                    "relations":[{"source":"Marie Curie","relation":"worked_at","target":"Sorbonne"}]}"#,
+                r#"{"entities":[{"name":"Marie Curie","type":"person"},{"name":"ETH Zurich","type":"org"}],
+                    "relations":[{"source":"Marie Curie","relation":"worked_at","target":"ETH Zurich"}]}"#,
             );
             ctx.llm = other.clone();
             adapter
@@ -948,27 +958,48 @@ mod tests {
                 .await
                 .expect("doc 2");
 
-            assert_eq!(graph.node_count("org-1", "ps-p1", "kg_active").unwrap(), 4);
+            assert_eq!(
+                graph.node_count("org-1", "ps-p1", "kg_active").unwrap(),
+                3,
+                "the shared organisation is ONE row"
+            );
 
             let (nodes, edges) = graph
-                .delete_document_in("org-1", "ps-p1", "kg_active", "file-1")
-                .expect("delete doc 1");
-            assert_eq!((nodes, edges), (2, 1), "only file-1's rows are swept");
+                .delete_document_in("org-1", "ps-p1", "kg_active", "file-2")
+                .expect("delete doc 2");
+            assert_eq!(
+                (nodes, edges),
+                (1, 1),
+                "only rows whose LAST document was file-2 are swept"
+            );
 
             // Deletes are tombstones, so the counts stay; what proves the sweep
             // is the RETRIEVAL view — the CSR excludes tombstoned nodes.
             let csr = graph.export_csr("org-1", "ps-p1", "kg_active").unwrap();
-            assert_eq!(csr.ids.len(), 2, "file-2's two entities survive");
             assert!(
-                csr.ids.iter().any(|id| id == "marie_curie"),
-                "surviving ids: {:?}",
+                csr.ids.iter().any(|id| id == "eth_zurich"),
+                "the shared entity is still named by file-1, surviving ids: {:?}",
                 csr.ids
             );
             assert!(
-                !csr.ids.iter().any(|id| id == "albert_einstein"),
+                csr.ids.iter().any(|id| id == "albert_einstein"),
+                "file-1's own entity survives: {:?}",
+                csr.ids
+            );
+            assert!(
+                !csr.ids.iter().any(|id| id == "marie_curie"),
                 "deleted ids still visible: {:?}",
                 csr.ids
             );
+
+            // The shared entity's set shrank to file-1 alone; withdrawing that
+            // document too must finally take it down.
+            let (nodes, edges) = graph
+                .delete_document_in("org-1", "ps-p1", "kg_active", "file-1")
+                .expect("delete doc 1");
+            assert_eq!((nodes, edges), (2, 1), "the last document takes the rest");
+            let csr = graph.export_csr("org-1", "ps-p1", "kg_active").unwrap();
+            assert!(csr.ids.is_empty(), "nothing is left named: {:?}", csr.ids);
         }
 
         /// A collection the project never created contributed nothing — and the

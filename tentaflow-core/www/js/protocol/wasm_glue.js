@@ -9115,14 +9115,17 @@ export function encodeProjectStudioSettingsGetRequest(project_id) {
  * fields are left untouched. `agents_json` is a JSON array of
  * ProjectAgentBinding objects; `modules_json` is a JSON array of module names
  * that REPLACES the enabled set (absent, empty or `null` = leave untouched).
+ * `graph_extraction` is the per-project knowledge-graph toggle; `None` leaves
+ * it alone, so a basics or modules save cannot flip it by omission.
  * @param {string} project_id
  * @param {string | null} [name]
  * @param {string | null} [description]
  * @param {string | null} [agents_json]
  * @param {string | null} [modules_json]
+ * @param {boolean | null} [graph_extraction]
  * @returns {Uint8Array}
  */
-export function encodeProjectStudioSettingsSaveRequest(project_id, name, description, agents_json, modules_json) {
+export function encodeProjectStudioSettingsSaveRequest(project_id, name, description, agents_json, modules_json, graph_extraction) {
     const ptr0 = passStringToWasm0(project_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     const len0 = WASM_VECTOR_LEN;
     var ptr1 = isLikeNone(name) ? 0 : passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
@@ -9133,7 +9136,7 @@ export function encodeProjectStudioSettingsSaveRequest(project_id, name, descrip
     var len3 = WASM_VECTOR_LEN;
     var ptr4 = isLikeNone(modules_json) ? 0 : passStringToWasm0(modules_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
     var len4 = WASM_VECTOR_LEN;
-    const ret = wasm.encodeProjectStudioSettingsSaveRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4);
+    const ret = wasm.encodeProjectStudioSettingsSaveRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3, ptr4, len4, isLikeNone(graph_extraction) ? 0xFFFFFF : graph_extraction ? 1 : 0);
     if (ret[3]) {
         throw takeFromExternrefTable0(ret[2]);
     }
