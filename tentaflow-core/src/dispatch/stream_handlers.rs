@@ -1939,13 +1939,69 @@ fn project_chat_model(project_id: &str) -> Option<String> {
     }
 }
 
+/// Builds the envelope for ONE project chat turn. Everything here is an entry
+/// point stamp — a fact about who is asking and in what shape the answer must
+/// come back — never a decision the flow itself is allowed to make.
+///
+/// `graph_enabled` is deliberately ABSENT. The shared key means ON when missing
+/// (`rag_graphrag::META_GRAPH_ENABLED`), so leaving it out hands the decision to
+/// the caller and to the retrieval nodes, which resolve the project's own graph
+/// collection under the scope the handler mints. Stamping `false` here made a
+/// project graph unreadable from chat the moment `graph_extract` started writing
+/// one: both graph adapters short-circuit on the flag, and no configuration
+/// could reopen them. Deriving a value from the collection's existence would
+/// only duplicate — one turn earlier, and able to go stale — the check the read
+/// path already makes: `entry_get` is non-creating, so a project with no graph
+/// pays one registry lookup that finds nothing and the hop degrades to the plain
+/// vector context without a single model call.
+fn project_chat_envelope(
+    message: String,
+    project_id: &str,
+    session_id: &str,
+    answer_model: String,
+) -> crate::flow_engine::envelope::FlowEnvelope {
+    use crate::flow_engine::envelope::{FlowEnvelope, FlowValue};
+
+    let mut envelope = FlowEnvelope::empty();
+    envelope.payload = FlowValue::Text(message);
+    envelope.meta.insert(
+        "project_id".into(),
+        serde_json::Value::String(project_id.to_string()),
+    );
+    envelope.meta.insert(
+        "session_id".into(),
+        serde_json::Value::String(session_id.to_string()),
+    );
+    // The shell reads its answer model from a DEDICATED meta entry, not from
+    // `model`: routing seeds `model` with the flow's own published name when
+    // the addon asks it by name, and the answer node must never dispatch the
+    // shell to itself. Always stamped — the turn is refused before this point
+    // when the project binds no model, so the shell's fallback is unreachable
+    // from the project chat.
+    envelope.meta.insert(
+        crate::db::seed::RAG_ANSWER_MODEL_META.into(),
+        serde_json::Value::String(answer_model),
+    );
+    // Terminal shape: the chat streams, so the shell's output node must not
+    // rewrite the answer into the addon's `{answer, citations}` JSON. The
+    // stamp belongs to the entry point (never to the model's content), same
+    // rule as the vector scope minted by the handler.
+    envelope.meta.insert(
+        crate::flow_engine::node_adapters::output::OUTPUT_MODE_META.into(),
+        serde_json::Value::String(
+            crate::flow_engine::node_adapters::output::OUTPUT_MODE_STREAM.into(),
+        ),
+    );
+    envelope
+}
+
 fn project_studio_chat_stream_handler(
     req: MessageBody,
     ctx: HandlerContext,
     sub: Arc<Subscription>,
 ) {
     use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
-    use crate::flow_engine::envelope::{EnvelopeDelta, FlowEnvelope, FlowValue};
+    use crate::flow_engine::envelope::EnvelopeDelta;
     use tentaflow_protocol::project_studio::ProjectStudioPayload;
 
     let (project_id, chat_id, message) = match req {
@@ -2072,42 +2128,7 @@ fn project_studio_chat_stream_handler(
         }
         let _ = crate::project_studio::repository::touch_chat(&project_id, &chat_id, &caller_id);
 
-        let mut envelope = FlowEnvelope::empty();
-        envelope.payload = FlowValue::Text(message);
-        envelope.meta.insert(
-            "project_id".into(),
-            serde_json::Value::String(project_id.clone()),
-        );
-        envelope.meta.insert(
-            "session_id".into(),
-            serde_json::Value::String(chat.session_id.clone()),
-        );
-        // Projekt nie ma kolekcji grafowej, a brak klucza znaczy "graf wlaczony"
-        // (zgodnosc wstecz). Wezly grafowe i tak zdegradowalyby sie do
-        // pass-through, ale jawne `false` oszczedza im calej pracy.
-        envelope
-            .meta
-            .insert("graph_enabled".into(), serde_json::Value::Bool(false));
-        // The shell reads its answer model from a DEDICATED meta entry, not from
-        // `model`: routing seeds `model` with the flow's own published name when
-        // the addon asks it by name, and the answer node must never dispatch the
-        // shell to itself. Always stamped here — the turn was refused above when
-        // the project binds no model, so the shell's fallback is unreachable from
-        // the project chat.
-        envelope.meta.insert(
-            crate::db::seed::RAG_ANSWER_MODEL_META.into(),
-            serde_json::Value::String(model),
-        );
-        // Terminal shape: the chat streams, so the shell's output node must not
-        // rewrite the answer into the addon's `{answer, citations}` JSON. The
-        // stamp belongs to the entry point (never to the model's content), same
-        // rule as the vector scope minted below.
-        envelope.meta.insert(
-            crate::flow_engine::node_adapters::output::OUTPUT_MODE_META.into(),
-            serde_json::Value::String(
-                crate::flow_engine::node_adapters::output::OUTPUT_MODE_STREAM.into(),
-            ),
-        );
+        let mut envelope = project_chat_envelope(message, &project_id, &chat.session_id, model);
 
         // Cancel bound to the subscription: a dropped/unsubscribed client
         // aborts the flow (push failure below fires this token).
@@ -6401,6 +6422,200 @@ mod tests {
         assert_eq!(
             super::project_chat_model(&project_id).as_deref(),
             Some("team-llm")
+        );
+    }
+
+    // --- graph gate of a project chat turn ---------------------------------
+    //
+    // The turn's envelope decides whether the shell's graph hop runs at all:
+    // the shared `graph_enabled` key means ON when absent, so a stamped `false`
+    // is the one thing that can make a project's own knowledge graph unreadable
+    // from chat. Both directions are pinned on the REAL retrieval adapters
+    // (`rag_graph_seed` -> `rag_graph_facts`), not on the meta key alone — the
+    // key matters only through what those nodes then do.
+
+    fn graph_node(node_type: &str) -> crate::flow_engine::types::FlowNode {
+        crate::flow_engine::types::FlowNode {
+            id: format!("{node_type}-1"),
+            node_type: node_type.into(),
+            config: serde_json::Value::Null,
+            position: None,
+            label: None,
+            region: None,
+        }
+    }
+
+    fn graph_input(
+        env: crate::flow_engine::envelope::FlowEnvelope,
+    ) -> crate::flow_engine::envelope::NodeInput {
+        crate::flow_engine::envelope::NodeInput {
+            from_node_id: "prev".into(),
+            from_port: "full".into(),
+            envelope: std::sync::Arc::new(env),
+        }
+    }
+
+    /// Context text `rag_accumulate` hands the facts node in a real hop: the
+    /// question plus the retrieved passages.
+    const VECTOR_CONTEXT: &str = "Pytanie: gdzie pracowal Einstein?\n\npasaz wektorowy\n";
+
+    /// A project that HAS a knowledge graph must be able to read it from chat.
+    /// `graph_extract` writes into the project's graph home under the very scope
+    /// this turn dispatches against, so the retrieval hop has to reach it: with
+    /// the turn's own envelope the seed node anchors PPR on the question's
+    /// entities and the facts node fuses the edge into the answer context.
+    #[cfg(feature = "graph")]
+    #[tokio::test]
+    async fn project_chat_turn_reads_an_existing_project_graph() {
+        use crate::flow_engine::envelope::FlowValue;
+        use crate::flow_engine::node_adapter::test_support::{stub_ctx, stub_graph};
+        use crate::flow_engine::node_adapter::NodeAdapter;
+
+        // Collection the retrieval hop reads (`rag_graphrag::KG_COLLECTION`,
+        // private there) and `graph_extract` writes.
+        const KG_COLLECTION: &str = "kg_active";
+
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let scope = crate::project_studio::ingest::vector_scope(&project_id);
+        let org_id = "org-1";
+        let graph = stub_graph();
+        let mut ctx = stub_ctx();
+        ctx.addon_id = Some(scope.clone());
+        ctx.org_id = Some(org_id.to_string());
+        ctx.graph = graph.clone();
+
+        // The project's graph as extraction leaves it: one edge under the turn's
+        // own scope. Where the file sits is irrelevant to the read path — the
+        // registry row is what resolves a collection, so one created at a project
+        // graph home reopens exactly like this one.
+        for id in ["einstein", "princeton"] {
+            graph
+                .upsert_node_with_quota(org_id, &scope, KG_COLLECTION, id, "Entity", "{}", "null")
+                .expect("seed graph node");
+        }
+        graph
+            .upsert_edge_with_quota(
+                org_id,
+                &scope,
+                KG_COLLECTION,
+                "einstein",
+                "pracowal_w",
+                "princeton",
+                1.0,
+                "{}",
+                "null",
+            )
+            .expect("seed graph edge");
+
+        let envelope = super::project_chat_envelope(
+            "gdzie pracowal Einstein".into(),
+            &project_id,
+            "sess-1",
+            "team-llm".into(),
+        );
+        // Read before the envelope is consumed: asserted at the END, so a pinned
+        // stamp fails this test on the unreadable graph first and on the contract
+        // second.
+        let pinned_toggle = envelope.meta.get("graph_enabled").cloned();
+        let seeded = crate::flow_engine::node_adapters::RagGraphSeedNodeAdapter::new()
+            .execute(
+                &graph_node("rag_graph_seed"),
+                &[graph_input(envelope)],
+                &ctx,
+            )
+            .await
+            .expect("rag_graph_seed");
+        let mut accumulated = seeded;
+        accumulated.payload = FlowValue::Text(VECTOR_CONTEXT.into());
+        let out = crate::flow_engine::node_adapters::RagGraphFactsNodeAdapter::new()
+            .execute(
+                &graph_node("rag_graph_facts"),
+                &[graph_input(accumulated)],
+                &ctx,
+            )
+            .await
+            .expect("rag_graph_facts");
+
+        let fused = out.payload.as_text().expect("text context");
+        assert!(
+            fused.contains("pasaz wektorowy"),
+            "the vector context must survive the fusion: {fused}"
+        );
+        assert!(
+            fused.contains("einstein — pracowal_w → princeton"),
+            "a project graph must reach the answer context: {fused}"
+        );
+        assert!(
+            pinned_toggle.is_none(),
+            "the turn must not pin the graph toggle — a stamped value is the one \
+             thing no configuration can reopen"
+        );
+    }
+
+    /// Every project that exists today has NO graph collection, so that state is
+    /// the regression that matters. With the toggle absent the hop DOES run: it
+    /// resolves nothing for the scope (the read path is non-creating —
+    /// `entry_get` -> `CollectionNotFound`) and degrades to the plain vector
+    /// context, byte-identical, with an empty fact state proving the node itself
+    /// ran instead of being skipped upstream. Cost of that degradation: NOT ONE
+    /// model call — `stub_ctx` carries an `LlmDispatcher` that panics on any
+    /// call, so a model call on this path would fail the test rather than pass
+    /// unnoticed.
+    #[tokio::test]
+    async fn project_chat_turn_without_a_graph_degrades_without_spending_a_model_call() {
+        use crate::flow_engine::envelope::FlowValue;
+        use crate::flow_engine::node_adapter::test_support::stub_ctx;
+        use crate::flow_engine::node_adapter::NodeAdapter;
+        use crate::flow_engine::node_adapters::rag_graphrag::{
+            META_GRAPH_FACTS, META_GRAPH_SEEDS,
+        };
+
+        let project_id = uuid::Uuid::new_v4().to_string();
+        let mut ctx = stub_ctx();
+        ctx.addon_id = Some(crate::project_studio::ingest::vector_scope(&project_id));
+        ctx.org_id = Some("org-1".to_string());
+
+        let envelope = super::project_chat_envelope(
+            "gdzie pracowal Einstein".into(),
+            &project_id,
+            "sess-1",
+            "team-llm".into(),
+        );
+        let seeded = crate::flow_engine::node_adapters::RagGraphSeedNodeAdapter::new()
+            .execute(
+                &graph_node("rag_graph_seed"),
+                &[graph_input(envelope)],
+                &ctx,
+            )
+            .await
+            .expect("a project without a graph must not fail the seed hop");
+        assert!(
+            seeded.meta.get(META_GRAPH_SEEDS).is_some(),
+            "the open gate must let the seed node run — it is the facts node \
+             that discovers there is no collection"
+        );
+
+        let mut accumulated = seeded;
+        accumulated.payload = FlowValue::Text(VECTOR_CONTEXT.into());
+        let out = crate::flow_engine::node_adapters::RagGraphFactsNodeAdapter::new()
+            .execute(
+                &graph_node("rag_graph_facts"),
+                &[graph_input(accumulated)],
+                &ctx,
+            )
+            .await
+            .expect("a project without a graph must not fail the turn");
+
+        assert_eq!(
+            out.payload.as_text(),
+            Some(VECTOR_CONTEXT),
+            "no graph means the answer context is the vector context, unchanged"
+        );
+        assert_eq!(
+            out.meta.get(META_GRAPH_FACTS).and_then(|v| v.as_str()),
+            Some(""),
+            "the facts node must have run and found nothing — a missing key would \
+             mean the hop was gated off before it ever looked"
         );
     }
 }
