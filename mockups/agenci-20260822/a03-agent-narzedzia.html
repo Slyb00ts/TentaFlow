@@ -1,0 +1,396 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Agenci · Narzędzia agenta (A03)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/agenci.css?v=1">
+<style>
+  .form-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-save" viewBox="0 0 24 24"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-message" viewBox="0 0 24 24"><path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-git" viewBox="0 0 24 24"><line x1="6" y1="3" x2="6" y2="15"/><circle cx="18" cy="6" r="3"/><circle cx="6" cy="18" r="3"/><path d="M18 9a9 9 0 0 1-9 9"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-terminal" viewBox="0 0 24 24"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+<symbol id="i-target" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><circle cx="12" cy="12" r="6"/><circle cx="12" cy="12" r="2"/></symbol>
+<symbol id="i-key" viewBox="0 0 24 24"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0 3 3L22 7l-3-3"/></symbol>
+<symbol id="i-book" viewBox="0 0 24 24"><path d="M4 19.5A2.5 2.5 0 0 1 6.5 17H20"/><path d="M6.5 2H20v20H6.5A2.5 2.5 0 0 1 4 19.5v-15A2.5 2.5 0 0 1 6.5 2z"/></symbol>
+<symbol id="i-users-plus" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><line x1="19" y1="8" x2="19" y2="14"/><line x1="22" y1="11" x2="16" y2="11"/></symbol>
+<symbol id="i-download" viewBox="0 0 24 24"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></symbol>
+<symbol id="i-external" viewBox="0 0 24 24"><path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A03</span>
+    <h2>Szczegóły agenta · Narzędzia i umiejętności</h2>
+    <div class="desc">Katalog narzędzi widzi WSZYSTKIE addony zadeklarowane w manifestach — także pakiety niezainstalowane (wyróżnione), których dziś brakuje na liście (deep-research!).</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <div class="breadcrumb">
+          <span class="crumb" onclick="location.href='a01-lista.html'">Agenci</span>
+          <span class="sep"><svg viewBox="0 0 24 24" style="width:12px;height:12px;stroke:currentColor;fill:none;stroke-width:2;"><polyline points="9 18 15 12 9 6"/></svg></span>
+          <span class="crumb current">Generator scenariuszy</span>
+        </div>
+
+        <div class="detail-header">
+          <div class="big-ico bot"><svg viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></svg></div>
+          <div class="d-meta">
+            <div class="d-name">Generator scenariuszy
+              <span class="chip success"><span class="dot"></span>Włączony</span>
+              <span class="chip info">Kierowalny do czatu</span>
+            </div>
+            <div class="d-id">generator-scenariuszy · utworzono 2026-07-02 · zmieniono dzisiaj 09:14</div>
+            <div class="d-badges">
+              <span class="chip accent">Model: GPT-5.2</span>
+              <span class="chip">7 narzędzi</span>
+              <span class="chip">3 umiejętności</span>
+            </div>
+          </div>
+          <div class="d-actions">
+            <button class="btn btn-primary"><!-- otwiera: A04 --><svg class="icon"><use href="#i-play"/></svg>Uruchom test</button>
+          </div>
+        </div>
+
+        <div class="tabs-bar">
+          <button class="tab"><!-- otwiera: A02 --><svg class="icon"><use href="#i-settings"/></svg>Konfiguracja</button>
+          <button class="tab active"><svg class="icon"><use href="#i-zap"/></svg>Narzędzia i umiejętności <span class="count">7+3</span></button>
+          <button class="tab"><!-- otwiera: A04 --><svg class="icon"><use href="#i-play"/></svg>Testowanie</button>
+          <button class="tab"><!-- otwiera: A05 --><svg class="icon"><use href="#i-clock"/></svg>Przebiegi <span class="count">23</span></button>
+        </div>
+
+        <!-- ============ ZAKŁADKA: NARZĘDZIA I UMIEJĘTNOŚCI ============ -->
+
+        <div class="tools-summary">
+          <svg class="icon" style="color:var(--accent-1);"><use href="#i-zap"/></svg>
+          Wybrano <b>7 narzędzi</b>: 4 z addonów · 3 rdzeniowe &nbsp;·&nbsp;
+          <span class="chip accent mono" style="font-family:ui-monospace,'JetBrains Mono',monospace;">deep-research.search_web</span>
+          <span class="chip accent mono" style="font-family:ui-monospace,'JetBrains Mono',monospace;">deep-research.fetch_url</span>
+          <span class="chip mono" style="font-family:ui-monospace,'JetBrains Mono',monospace;">+5 więcej</span>
+        </div>
+
+        <div class="tools-layout">
+          <!-- ===== lewa kolumna: drzewo narzędzi ===== -->
+          <div>
+            <div class="search-box" style="margin-bottom:12px;">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input type="text" placeholder="Filtruj narzędzia po nazwie lub opisie…">
+            </div>
+
+            <!-- grupa addonu: instancja zainstalowana -->
+            <div class="tool-group open">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-globe"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Deep Research <span class="chip success" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Instancja aktywna</span></div>
+                  <div class="tg-id">deep-research-043b6b64 · pakiet deep-research v0.1.0</div>
+                  <div class="tg-sub">Wyszukiwanie internetu i czytanie publicznych stron przez Core Web Research.</div>
+                </div>
+                <span class="toggle on" title="Przełącz całość (deep-research.*)"></span>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows">
+                <div class="tool-row">
+                  <span class="tr-name">deep-research.search_web</span>
+                  <span class="tr-desc">Szuka publicznych stron przez skonfigurowany provider search.</span>
+                  <span class="toggle on"></span>
+                </div>
+                <div class="tool-row">
+                  <span class="tr-name">deep-research.fetch_url</span>
+                  <span class="tr-desc">Pobiera publiczny URL HTTP/HTTPS i ekstrahuje czytelny tekst.</span>
+                  <span class="toggle on"></span>
+                </div>
+                <div class="tool-row">
+                  <span class="tr-name">deep-research.read_search_results</span>
+                  <span class="tr-desc">Wyszukuje i czyta treść wybranych wyników bez syntezy LLM.</span>
+                  <span class="toggle"></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- grupa addonu: wildcard włączony, wiersze zablokowane -->
+            <div class="tool-group open locked">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-file"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Notes <span class="chip accent" style="font-size:9.5px;padding:1px 7px;">cały addon</span></div>
+                  <div class="tg-id">notes-91f2c8d0 · pakiet notes v1.4.2</div>
+                  <div class="tg-sub">Notatki i wiedza projektowa: wyszukiwanie hybrydowe RRF, graf wiedzy.</div>
+                </div>
+                <span class="toggle on" title="notes.* — wszystkie narzędzia addonu"></span>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows">
+                <div class="tool-row">
+                  <span class="tr-name">notes.search_notes</span>
+                  <span class="tr-desc">Hybrydowe wyszukiwanie notatek (wektory + pełnotekstowe).</span>
+                  <span class="toggle on"></span>
+                </div>
+                <div class="tool-row">
+                  <span class="tr-name">notes.create_note</span>
+                  <span class="tr-desc">Tworzy notatkę w wybranym notebooku.</span>
+                  <span class="toggle on"></span>
+                </div>
+                <div class="tool-row">
+                  <span class="tr-name">notes.graph_query</span>
+                  <span class="tr-desc">Zapytanie do grafu wiedzy notatek (Cozo).</span>
+                  <span class="toggle on"></span>
+                </div>
+              </div>
+            </div>
+
+            <!-- grupy zwinięte, niewybrane -->
+            <div class="tool-group">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-brain"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Memory</div>
+                  <div class="tg-id">memory-7c1a55e2</div>
+                  <div class="tg-sub">Długoterminowa pamięć rozmów i faktów o użytkownikach.</div>
+                </div>
+                <span class="toggle"></span>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows" hidden>
+                <div class="tool-row"><span class="tr-name">memory.remember</span><span class="tr-desc">Zapisuje fakt do pamięci długotrwałej.</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">memory.recall</span><span class="tr-desc">Odczytuje fakty pasujące do zapytania.</span><span class="toggle"></span></div>
+              </div>
+            </div>
+
+            <div class="tool-group">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-users"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Contacts (CRM)</div>
+                  <div class="tg-id">contacts-2ea90d41</div>
+                  <div class="tg-sub">Katalog firm i kontaktów — źródło prawdy CRM.</div>
+                </div>
+                <span class="toggle"></span>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows" hidden>
+                <div class="tool-row"><span class="tr-name">contacts.find_company</span><span class="tr-desc">Szuka firmy po nazwie, NIP lub domenie.</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">contacts.list_people</span><span class="tr-desc">Lista kontaktów powiązanych z firmą.</span><span class="toggle"></span></div>
+              </div>
+            </div>
+
+            <!-- === FIX: pakiety z katalogu BEZ instalowanej instancji są WIDOCZNE === -->
+            <div class="core-subhead">Katalog addonów — zadeklarowane, jeszcze nie zainstalowane</div>
+
+            <div class="tool-group not-installed">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-globe"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Tentavision <span class="install-hint"><svg class="icon"><use href="#i-alert"/></svg>wymaga instalacji</span></div>
+                  <div class="tg-id">pakiet tentavision v2.1.0</div>
+                  <div class="tg-sub">Analiza obrazu i wideo: detekcja obiektów, OCR tablic ADR.</div>
+                </div>
+                <span class="toggle" title="Zainstaluj instancję, aby włączyć"></span>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows" hidden>
+                <div class="tool-row"><span class="tr-name">tentavision.detect</span><span class="tr-desc">Detekcja obiektów na obrazie (17 klas ADR).</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">tentavision.read_plate</span><span class="tr-desc">OCR numerów kemler/ON z tablic.</span><span class="toggle"></span></div>
+              </div>
+              <div style="padding:10px 14px; border-top:1px solid var(--border); display:flex; align-items:center; gap:10px;">
+                <span style="font-size:11.5px;color:var(--text-3);">Narzędzia tego pakietu odblokują się po instalacji instancji.</span>
+                <button class="btn btn-secondary btn-sm" style="margin-left:auto;"><svg class="icon"><use href="#i-download"/></svg>Zainstaluj z katalogu addonów</button>
+              </div>
+            </div>
+
+            <div class="tool-group not-installed">
+              <div class="tool-group-head">
+                <div class="tg-ico"><svg class="icon"><use href="#i-layers"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Eureka <span class="install-hint"><svg class="icon"><use href="#i-alert"/></svg>wymaga instalacji</span></div>
+                  <div class="tg-id">pakiet eureka v0.9.1</div>
+                  <div class="tg-sub">Wiedza domena organizacji: procedury, instrukcje stanowiskowe.</div>
+                </div>
+                <span class="toggle" title="Zainstaluj instancję, aby włączyć"></span>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+            </div>
+
+            <!-- ===== rdzeniowe core.* pogrupowane ===== -->
+            <div class="core-subhead">Rdzeniowe narzędzia platformy (core.*)</div>
+
+            <div class="tool-group open">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-bot"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Współpraca i delegacja <span class="chip" style="font-size:9.5px;padding:1px 7px;">wymaga sub-agentów &gt; 0</span></div>
+                  <div class="tg-sub">Delegowanie zadań i pytania do użytkownika.</div>
+                </div>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows">
+                <div class="tool-row"><span class="tr-name">core.agent_spawn</span><span class="tr-desc">Deleguje zadanie do innego agenta w tle.</span><span class="toggle on"></span></div>
+                <div class="tool-row"><span class="tr-name">core.agent_wait</span><span class="tr-desc">Czeka na zakończenie wskazanych sub-runów.</span><span class="toggle on"></span></div>
+                <div class="tool-row"><span class="tr-name">core.agent_list</span><span class="tr-desc">Lista aktywnych zadań dzieci.</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">core.ask_user</span><span class="tr-desc">Pyta użytkownika o doprecyzowanie i czeka na odpowiedź.</span><span class="toggle on"></span></div>
+              </div>
+            </div>
+
+            <div class="tool-group open">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-folder"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Projekt</div>
+                  <div class="tg-sub">Wiedza Project Studio i zapis przypadków testowych.</div>
+                </div>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows">
+                <div class="tool-row"><span class="tr-name">core.project_search</span><span class="tr-desc">Wyszukiwanie semantyczne w bazie wiedzy projektu.</span><span class="toggle on"></span></div>
+                <div class="tool-row"><span class="tr-name">core.project_list_sources</span><span class="tr-desc">Katalog źródeł wiedzy projektu.</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">core.project_case_save</span><span class="tr-desc">Zapis jednego przypadku testowego do generacji.</span><span class="toggle on"></span></div>
+              </div>
+            </div>
+
+            <div class="tool-group">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-code"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Kod i repozytorium <span class="chip" style="font-size:9.5px;padding:1px 7px;">Code Studio</span></div>
+                  <div class="tg-sub">Pliki, komendy, git — dla agentów pracujących na kodzie.</div>
+                </div>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows" hidden>
+                <div class="tool-row"><span class="tr-name">core.fs_read / fs_write / fs_edit…</span><span class="tr-desc">Operacje plikowe w worktree sesji.</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">core.exec</span><span class="tr-desc">Uruchomienie komendy w sandboxie sesji.</span><span class="toggle"></span></div>
+                <div class="tool-row"><span class="tr-name">core.git_* / task_plan / task_update…</span><span class="tr-desc">Git i plan zadań sesji.</span><span class="toggle"></span></div>
+              </div>
+            </div>
+
+            <div class="tool-group">
+              <div class="tool-group-head" onclick="this.parentElement.classList.toggle('open'); this.parentElement.querySelector('.tool-rows').hidden = !this.parentElement.querySelector('.tool-rows').hidden;">
+                <div class="tg-ico"><svg class="icon"><use href="#i-sparkles"/></svg></div>
+                <div class="tg-meta">
+                  <div class="tg-title">Umiejętności</div>
+                  <div class="tg-sub">Ładowanie plików SKILL.md do kontekstu przebiegu.</div>
+                </div>
+                <svg class="icon chev"><use href="#i-chevron-d"/></svg>
+              </div>
+              <div class="tool-rows" hidden>
+                <div class="tool-row"><span class="tr-name">core.skill_view</span><span class="tr-desc">Wczytuje SKILL.md wybranej umiejętności.</span><span class="toggle"></span></div>
+              </div>
+            </div>
+          </div>
+
+          <!-- ===== prawa kolumna: umiejętności + podsumowanie ===== -->
+          <div>
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-shield"/></svg>Jak to działa</h3>
+              <p style="font-size:12px;color:var(--text-2);line-height:1.65;">
+                Agent widzi tylko zaznaczone narzędzia <b>i tylko te, do których ma uprawnienia uruchamiający użytkownik</b>.
+                Przebiegi bez użytkownika (harmonogram) widzą wyłącznie narzędzia rdzeniowe.
+              </p>
+              <p style="font-size:12px;color:var(--text-2);line-height:1.65;margin-top:8px;">
+                Przełącznik przy addonie wybiera wszystkie jego narzędzia (<span class="mono" style="font-size:10.5px;">addon.*</span>).
+                Pakiety „wymagają instalacji" pokazują swoje deklaracje, ale odblokują się dopiero po dodaniu instancji w katalogu addonów.
+              </p>
+            </div>
+
+            <div class="section-card">
+              <h3><svg class="icon"><use href="#i-sparkles"/></svg>Umiejętności</h3>
+              <div class="field" style="margin-bottom:10px;">
+                <label>Według tagu</label>
+                <div class="skill-row"><span class="toggle on" style="transform:scale(.85);"></span><span class="chip info">#qa</span><span class="sk-desc">testowanie, scenariusze, UAT</span></div>
+                <div class="skill-row"><span class="toggle on" style="transform:scale(.85);"></span><span class="chip info">#research</span><span class="sk-desc">źródła, cytowania, fact-check</span></div>
+                <div class="skill-row"><span class="toggle" style="transform:scale(.85);"></span><span class="chip">#dokumentacja</span><span class="sk-desc">README, changelog</span></div>
+              </div>
+              <div class="field" style="margin-bottom:0;">
+                <label>Według nazwy</label>
+                <div class="skill-row"><span class="toggle on" style="transform:scale(.85);"></span><span class="sk-name">pisanie-scenariuszy</span><span class="sk-desc">format Gherkin + priorytety</span></div>
+                <div class="skill-row"><span class="toggle" style="transform:scale(.85);"></span><span class="sk-name">analiza-risks</span><span class="sk-desc">macierz ryzyka wymagań</span></div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div class="save-bar">
+          <span class="sb-text"><svg class="icon"><use href="#i-alert"/></svg>Zmieniono zestaw narzędzi: +1 (deep-research.read_search_results)</span>
+          <div class="sb-actions">
+            <button class="btn btn-secondary">Odrzuć</button>
+            <button class="btn btn-primary"><svg class="icon"><use href="#i-save"/></svg>Zapisz zmiany</button>
+          </div>
+        </div>
+
+      </main>
+
+    </div>
+  </div>
+</section>
+
+<script>
+  // rozwijanie grup narzędzi (statyczny mockup)
+  document.querySelectorAll('[onclick]').forEach(() => {});
+</script>
+</body>
+</html>

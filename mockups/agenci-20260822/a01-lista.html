@@ -1,0 +1,277 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Agenci · Lista (A01)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/agenci.css?v=1">
+<style>
+  /* górne zakładki modułu (Agenci | Przebiegi) — tf-tabs underline */
+  .module-tabs { display: flex; gap: 0; border-bottom: 1px solid var(--border); margin-bottom: 18px; }
+  .module-tabs .tab { padding: 10px 14px; font-size: 13px; font-weight: 600; color: var(--text-3); cursor: pointer; border-bottom: 2px solid transparent; display: flex; align-items: center; gap: 7px; background: transparent; border-left: 0; border-right: 0; border-top: 0; }
+  .module-tabs .tab.active { color: var(--text); border-bottom-color: var(--accent-1); }
+  .module-tabs .tab .count { font-size: 10px; background: var(--bg-3); padding: 1px 6px; border-radius: 8px; color: var(--text-2); }
+</style>
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-home" viewBox="0 0 24 24"><path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"/><polyline points="9 22 9 12 15 12 15 22"/></symbol>
+<symbol id="i-services" viewBox="0 0 24 24"><rect x="4" y="4" width="6" height="6" rx="1"/><rect x="14" y="4" width="6" height="6" rx="1"/><rect x="4" y="14" width="6" height="6" rx="1"/><rect x="14" y="14" width="6" height="6" rx="1"/></symbol>
+<symbol id="i-settings" viewBox="0 0 24 24"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.6 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></symbol>
+<symbol id="i-cpu" viewBox="0 0 24 24"><rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><line x1="9" y1="1" x2="9" y2="4"/><line x1="15" y1="1" x2="15" y2="4"/><line x1="9" y1="20" x2="9" y2="23"/><line x1="15" y1="20" x2="15" y2="23"/><line x1="20" y1="9" x2="23" y2="9"/><line x1="20" y1="14" x2="23" y2="14"/><line x1="1" y1="9" x2="4" y2="9"/><line x1="1" y1="14" x2="4" y2="14"/></symbol>
+<symbol id="i-activity" viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></symbol>
+<symbol id="i-users" viewBox="0 0 24 24"><path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M22 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></symbol>
+<symbol id="i-audit" viewBox="0 0 24 24"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/></symbol>
+<symbol id="i-folder" viewBox="0 0 24 24"><path d="M22 19a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h5l2 3h9a2 2 0 0 1 2 2z"/></symbol>
+<symbol id="i-brain" viewBox="0 0 24 24"><path d="M12 5a3 3 0 1 0-5.5 1.5A3 3 0 0 0 5 12a3 3 0 0 0 1.5 5.5A3 3 0 0 0 12 19zm0 0a3 3 0 1 1 5.5 1.5A3 3 0 0 1 19 12a3 3 0 0 1-1.5 5.5A3 3 0 0 1 12 19z"/></symbol>
+<symbol id="i-flask" viewBox="0 0 24 24"><path d="M10 2v7.5L4.5 19a2 2 0 0 0 1.8 3h11.4a2 2 0 0 0 1.8-3L14 9.5V2"/><line x1="8" y1="2" x2="16" y2="2"/><line x1="7" y1="15" x2="17" y2="15"/></symbol>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-plus" viewBox="0 0 24 24"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></symbol>
+<symbol id="i-search" viewBox="0 0 24 24"><circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></symbol>
+<symbol id="i-filter" viewBox="0 0 24 24"><polygon points="22 3 2 3 10 12.46 10 19 14 21 14 12.46 22 3"/></symbol>
+<symbol id="i-edit" viewBox="0 0 24 24"><path d="M11 4H4a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h14a2 2 0 0 0 2-2v-7"/><path d="M18.5 2.5a2.12 2.12 0 0 1 3 3L12 15l-4 1 1-4z"/></symbol>
+<symbol id="i-trash" viewBox="0 0 24 24"><polyline points="3 6 5 6 21 6"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></symbol>
+<symbol id="i-copy" viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2"/><path d="M5 15H4a2 2 0 0 1-2-2V4a2 2 0 0 1 2-2h9a2 2 0 0 1 2 2v1"/></symbol>
+<symbol id="i-more" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"/><circle cx="19" cy="12" r="1"/><circle cx="5" cy="12" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-play" viewBox="0 0 24 24"><polygon points="5 3 19 12 5 21 5 3"/></symbol>
+<symbol id="i-clock" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><polyline points="12 6 12 12 16 14"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-layers" viewBox="0 0 24 24"><polygon points="12 2 2 7 12 12 22 7 12 2"/><polyline points="2 17 12 22 22 17"/><polyline points="2 12 12 17 22 12"/></symbol>
+<symbol id="i-chevron-d" viewBox="0 0 24 24"><polyline points="6 9 12 15 18 9"/></symbol>
+<symbol id="i-shield" viewBox="0 0 24 24"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+<symbol id="i-file" viewBox="0 0 24 24"><path d="M13 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9z"/><polyline points="13 2 13 9 20 9"/></symbol>
+<symbol id="i-code" viewBox="0 0 24 24"><polyline points="16 18 22 12 16 6"/><polyline points="8 6 2 12 8 18"/></symbol>
+<symbol id="i-eye" viewBox="0 0 24 24"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></symbol>
+<symbol id="i-star" viewBox="0 0 24 24"><polygon points="12 2 15.09 8.26 22 9.27 17 14.14 18.18 21.02 12 17.77 5.82 21.02 7 14.14 2 9.27 8.91 8.26 12 2"/></symbol>
+<symbol id="i-list" viewBox="0 0 24 24"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A01</span>
+    <h2>Agenci: lista</h2>
+    <div class="desc">Ekran główny modułu. Kliknięcie karty otwiera SZCZEGÓŁY AGENTA (A02) — konfigurację, nie playground. Playground i przebiegi są zakładkami wewnątrz szczegółów.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app">
+
+      <aside class="sidebar">
+        <div class="logo"><span class="name">TentaFlow</span></div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-settings"/></svg>Ogólne</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-home"/></svg>Pulpit</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-services"/></svg>Serwisy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-cpu"/></svg>Nody mesh</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-activity"/></svg>Aplikacje</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-folder"/></svg>Projekty</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-brain"/></svg>ML Studio</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-flask"/></svg>Benchmark Studio</div>
+          <div class="nav-item active"><svg class="icon"><use href="#i-bot"/></svg>Agenci</div>
+        </div>
+        <div class="nav-section">
+          <div class="heading"><svg class="icon"><use href="#i-users"/></svg>Zarządzanie</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-users"/></svg>Użytkownicy</div>
+          <div class="nav-item"><svg class="icon"><use href="#i-audit"/></svg>Dziennik audytu</div>
+        </div>
+        <div class="footer">
+          <div class="user-chip"><div class="avatar">AK</div><div><div class="name-t">Anna · Menedżer</div><div class="role">Euvic · QA</div></div></div>
+        </div>
+      </aside>
+
+      <main class="main">
+        <!-- page-header jak w reszcie aplikacji: tytuł + podtytuł po lewej, akcje po prawej -->
+        <div class="page-head">
+          <div>
+            <div class="page-title">Agenci</div>
+            <div class="page-sub">6 agentów · 5 włączonych · dostępni w całej organizacji</div>
+          </div>
+          <div class="page-actions">
+            <div class="search-box">
+              <svg class="icon"><use href="#i-search"/></svg>
+              <input type="text" placeholder="Szukaj agenta…">
+            </div>
+            <button class="btn"><!-- otwiera: A09 -->
+              <svg class="icon"><use href="#i-layers"/></svg>Szablony zespołów
+            </button>
+            <button class="btn btn-primary"><!-- otwiera: A07 -->
+              <svg class="icon"><use href="#i-plus"/></svg>Nowy agent
+            </button>
+          </div>
+        </div>
+
+        <!-- górne zakładki modułu: lista / globalne przebiegi (A06) -->
+        <div class="module-tabs">
+          <button class="tab active"><svg class="icon"><use href="#i-bot"/></svg>Agenci <span class="count">6</span></button>
+          <button class="tab"><!-- otwiera: A06 --><svg class="icon"><use href="#i-clock"/></svg>Przebiegi <span class="count">23</span></button>
+        </div>
+
+        <div class="filters-row">
+          <span class="fl-label"><svg class="icon"><use href="#i-filter"/></svg>Filtruj</span>
+          <span class="filter-chip active">Wszystkie <span style="opacity:.7">6</span></span>
+          <span class="filter-chip">Włączone <span style="opacity:.7">5</span></span>
+          <span class="filter-chip">Wyłączone <span style="opacity:.7">1</span></span>
+          <span class="filter-chip">Kierowalni do czatu <span style="opacity:.7">4</span></span>
+        </div>
+
+        <div class="ag-grid">
+          <!-- klik w kartę = A02 (szczegóły/konfiguracja) -->
+          <div class="ag-card" onclick="location.href='a02-agent-konfiguracja.html'">
+            <div class="ac-top">
+              <div class="ac-av"><svg class="icon"><use href="#i-search"/></svg></div>
+              <div>
+                <div class="ac-name">Generator scenariuszy <span class="chip success" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Włączony</span></div>
+                <div class="ac-id">generator-scenariuszy</div>
+              </div>
+              <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+            </div>
+            <div class="ac-desc">Tworzy przypadki testowe z wymagań i wiedzy projektu, samodzielnie wyszukuje brakujące informacje.</div>
+            <div class="ac-meta">
+              <span><svg class="icon"><use href="#i-zap"/></svg>7 narzędzi</span>
+              <span><svg class="icon"><use href="#i-sparkles"/></svg>3 umiejętności</span>
+              <span><svg class="icon"><use href="#i-brain"/></svg>GPT-5.2</span>
+            </div>
+            <div class="ac-foot">
+              <span class="chip info">Kierowalny do czatu</span>
+              <span class="chip accent">Sub-agenci: 4</span>
+            </div>
+          </div>
+
+          <div class="ag-card">
+            <div class="ac-top">
+              <div class="ac-av"><svg class="icon"><use href="#i-eye"/></svg></div>
+              <div>
+                <div class="ac-name">Krytyk wymagań <span class="chip success" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Włączony</span></div>
+                <div class="ac-id">krytyk-wymagan</div>
+              </div>
+              <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+            </div>
+            <div class="ac-desc">Recenzuje scenariusze i wymagania: wykrywa luki, sprzeczności i niedomknięte ścieżki.</div>
+            <div class="ac-meta">
+              <span><svg class="icon"><use href="#i-zap"/></svg>3 narzędzia</span>
+              <span><svg class="icon"><use href="#i-sparkles"/></svg>1 umiejętność</span>
+              <span><svg class="icon"><use href="#i-brain"/></svg>Claude Opus</span>
+            </div>
+            <div class="ac-foot">
+              <span class="chip info">Kierowalny do czatu</span>
+            </div>
+          </div>
+
+          <div class="ag-card">
+            <div class="ac-top">
+              <div class="ac-av"><svg class="icon"><use href="#i-file"/></svg></div>
+              <div>
+                <div class="ac-name">Dokumentalista <span class="chip success" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Włączony</span></div>
+                <div class="ac-id">dokumentalista</div>
+              </div>
+              <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+            </div>
+            <div class="ac-desc">Prowadzi dokumentację projektu: opisy modułów, changelog, notatki ze spotkań.</div>
+            <div class="ac-meta">
+              <span><svg class="icon"><use href="#i-zap"/></svg>notes.* (wildcard)</span>
+              <span><svg class="icon"><use href="#i-brain"/></svg>domyślny z routingu</span>
+            </div>
+            <div class="ac-foot">
+              <span class="chip info">Kierowalny do czatu</span>
+            </div>
+          </div>
+
+          <div class="ag-card">
+            <div class="ac-top">
+              <div class="ac-av"><svg class="icon"><use href="#i-globe"/></svg></div>
+              <div>
+                <div class="ac-name">Researcher rynkowy <span class="chip success" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Włączony</span></div>
+                <div class="ac-id">researcher-rynkowy</div>
+              </div>
+              <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+            </div>
+            <div class="ac-desc">Monitoruje konkurencję i trendy; czyta publiczne źródła przez Deep Research.</div>
+            <div class="ac-meta">
+              <span><svg class="icon"><use href="#i-zap"/></svg>5 narzędzi</span>
+              <span><svg class="icon"><use href="#i-brain"/></svg>GPT-5.2</span>
+            </div>
+            <div class="ac-foot">
+              <span class="chip accent">Auto-kontynuacja</span>
+            </div>
+          </div>
+
+          <div class="ag-card">
+            <div class="ac-top">
+              <div class="ac-av"><svg class="icon"><use href="#i-code"/></svg></div>
+              <div>
+                <div class="ac-name">Refaktoryzer <span class="chip success" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Włączony</span></div>
+                <div class="ac-id">refaktoryzer</div>
+              </div>
+              <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+            </div>
+            <div class="ac-desc">Drobne refaktoringi w Code Studio: plan zadań, edycja plików, commit na gałęzi sesji.</div>
+            <div class="ac-meta">
+              <span><svg class="icon"><use href="#i-zap"/></svg>18 narzędzi (core.*)</span>
+              <span><svg class="icon"><use href="#i-brain"/></svg>Claude Sonnet</span>
+            </div>
+            <div class="ac-foot"></div>
+          </div>
+
+          <div class="ag-card disabled">
+            <div class="ac-top">
+              <div class="ac-av off"><svg class="icon"><use href="#i-list"/></svg></div>
+              <div>
+                <div class="ac-name">Audyt zgodności <span class="chip warning" style="font-size:9.5px;padding:1px 7px;"><span class="dot"></span>Wyłączony</span></div>
+                <div class="ac-id">audyt-zgodnosci</div>
+              </div>
+              <button class="card-more" title="Więcej"><svg class="icon"><use href="#i-more"/></svg></button>
+            </div>
+            <div class="ac-desc">Sprawdza artefakty projektu pod kątem RODO i polityk organizacji. Tymczasowo wyłączony.</div>
+            <div class="ac-meta">
+              <span><svg class="icon"><use href="#i-zap"/></svg>4 narzędzia</span>
+              <span><svg class="icon"><use href="#i-brain"/>domyślny z routingu</span>
+            </div>
+            <div class="ac-foot"></div>
+          </div>
+
+          <!-- karta dodawania -->
+          <div class="ag-card add-card"><!-- otwiera: A07 -->
+            <div>
+              <div class="add-ico"><svg class="icon"><use href="#i-plus"/></svg></div>
+              <div class="add-name">Nowy agent</div>
+              <div class="add-sub">Od zera (kreator) albo z pomocą asystenta AI</div>
+            </div>
+          </div>
+        </div>
+      </main>
+
+    </div>
+  </div>
+</section>
+
+<script>
+  // tylko pokazanie menu ⋯ na pierwszej karcie (statyczne w mockupie)
+  document.querySelectorAll('.card-more').forEach((b) => {
+    b.addEventListener('click', (e) => {
+      e.stopPropagation();
+      const old = b.parentElement.querySelector('.tf-menu');
+      if (old) { old.remove(); return; }
+      const m = document.createElement('div');
+      m.className = 'tf-menu';
+      m.innerHTML = `
+        <button onclick="location.href='a02-agent-konfiguracja.html'"><svg class="icon"><use href="#i-edit"/></svg>Otwórz szczegóły</button>
+        <button><!-- otwiera: A04 --><svg class="icon"><use href="#i-play"/></svg>Testuj</button>
+        <button><svg class="icon"><use href="#i-copy"/></svg>Duplikuj</button>
+        <button><svg class="icon"><use href="#i-check"/></svg>Wyłącz</button>
+        <div class="mn-sep"></div>
+        <button class="danger"><svg class="icon"><use href="#i-trash"/></svg>Usuń</button>`;
+      b.parentElement.appendChild(m);
+    });
+  });
+  document.addEventListener('click', () => document.querySelectorAll('.tf-menu').forEach((m) => m.remove()));
+</script>
+</body>
+</html>

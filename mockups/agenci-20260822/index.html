@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Agenci (przeprojektowanie) · Mockupy</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<style>
+  .grp { margin-bottom: 34px; }
+  .grp-title { font-size: 13px; text-transform: uppercase; letter-spacing: 0.1em; color: var(--accent-2); font-weight: 800; margin: 0 0 12px; display: flex; align-items: center; gap: 8px; }
+  .grp-title .icon { color: var(--accent-1); }
+  .grp-title .ln { flex: 1; height: 1px; background: var(--border); margin-left: 6px; }
+  .index-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 14px; }
+  .index-card { background: var(--bg-2); border: 1px solid var(--border); border-radius: var(--radius); padding: 16px; color: inherit; display: block; transition: all .12s; }
+  .index-card:hover { border-color: var(--accent-1); transform: translateY(-2px); box-shadow: var(--shadow); }
+  .index-card .id { font-size: 10px; font-weight: 800; letter-spacing: .08em; color: var(--accent-2); margin-bottom: 6px; }
+  .index-card h3 { font-size: 14px; font-weight: 800; color: var(--text); }
+  .index-card p { font-size: 11.5px; color: var(--text-3); line-height: 1.55; margin-top: 4px; }
+</style>
+</head>
+<body>
+
+<div class="intro">
+  <h1>Agenci · przeprojektowanie modułu (2026-08)</h1>
+  <p class="lead">
+    Zakres zmian względem obecnej implementacji (<span class="mono">www/js/modules/agents.js</span>):
+    <b>wejście w agenta pokazuje KONFIGURACJĘ do edycji na miejscu</b> — opis, prompt systemowy, model, narzędzia, umiejętności i limity.
+    Playground czatowy i przebiegi stają się zakładkami wewnątrz szczegółów agenta. Szczegóły używają kanonicznego szkieletu aplikacji
+    (breadcrumb → detail-header → tf-tabs), tak jak szczegóły addonu. Katalog narzędzi widzi <b>wszystkie addony zadeklarowane w manifestach</b>,
+    również pakiety niezainstalowane (np. deep-research przed instalacją instancji) — dziś znikają one całkowicie.
+    Kreator zostaje tylko dla TWORZENIA; edycja odbywa się w zakładkach szczegółów.
+  </p>
+  <div class="rules">
+    <div class="rule"><h3>Problem 1</h3><p>Wejście w agenta odpalało playground z przebiegiem na żywo. Konfiguracja była schowana w modalnym kreatorze 3-krokowym.</p></div>
+    <div class="rule"><h3>Problem 2</h3><p>Nagłówek playgroundu był własny (przycisk „wstecz” + awatar), niespójny z resztą aplikacji.</p></div>
+    <div class="rule"><h3>Problem 3</h3><p>Pickernarzędzi listował wyłącznie zarejestrowane instancje addonów; pakiety katalogowe bez instalacji (deep-research) były niewidoczne, a po restarcie Core rejestr narzędzi jest pusty do czasu reinstallu.</p></div>
+  </div>
+</div>
+
+<div class="screen">
+  <div class="grp">
+    <div class="grp-title">Moduł <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="a01-lista.html"><div class="id">A01</div><h3>Lista agentów</h3><p>Karty agentów + filtry; górne zakładki modułu: Agenci / Przebiegi (A06). Klik = szczegóły (A02).</p></a>
+      <a class="index-card" href="a06-przebiegi-globalne.html"><div class="id">A06</div><h3>Przebiegi wszystkich agentów</h3><p>KPI, filtry, tabela przekrojowa; szczegóły pojedynczego przebiegu w kontekście agenta (A05).</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Szczegóły agenta — zakładki <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="a02-agent-konfiguracja.html"><div class="id">A02</div><h3>Konfiguracja</h3><p>Tożsamość, prompt systemowy, model, pętla i limity, flagi — edytowalne inline ze sticky paskiem zapisu.</p></a>
+      <a class="index-card" href="a03-agent-narzedzia.html"><div class="id">A03</div><h3>Narzędzia i umiejętności</h3><p>Grupy addonów (wildcard), core.* pogrupowane, umiejętności po tagach; pakiety niezainstalowane widoczne z deklaracjami.</p></a>
+      <a class="index-card" href="a04-agent-testowanie.html"><div class="id">A04</div><h3>Testowanie (playground)</h3><p>Czat sandboxowy + oś przebiegu na żywo + pytania ask_user — dawny playground jako zakładka.</p></a>
+      <a class="index-card" href="a05-agent-przebiegi.html"><div class="id">A05</div><h3>Przebiegi agenta</h3><p>Tabela uruchomień tego agenta + szczegół: podsumowanie KV i replay osi zdarzeń.</p></a>
+    </div>
+  </div>
+
+  <div class="grp">
+    <div class="grp-title">Okna <span class="ln"></span></div>
+    <div class="index-grid">
+      <a class="index-card" href="a07-kreator.html"><div class="id">A07 · okno</div><h3>Kreator nowego agenta</h3><p>Tylko tworzenie: persona → narzędzia → model; po utworzeniu lądujemy w A02.</p></a>
+      <a class="index-card" href="a08-asystent-ai.html"><div class="id">A08 · okno</div><h3>Asystent budowy (AI)</h3><p>Opis słowny → propozycja kompletnego szkicu agenta z narzędziami i ostrzeżeniem o nieistniejących instancjach.</p></a>
+      <a class="index-card" href="a09-szablony-zespolow.html"><div class="id">A09 · okno</div><h3>Szablony zespołów</h3><p>Zestawy współpracujących agentów (delegacja + pętla recenzji) tworzone jednym kliknięciem.</p></a>
+    </div>
+  </div>
+</div>
+
+</body>
+</html>

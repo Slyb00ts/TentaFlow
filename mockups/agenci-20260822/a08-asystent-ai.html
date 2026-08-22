@@ -1,0 +1,100 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+<meta charset="UTF-8">
+<title>TentaFlow — Agenci · Asystent budowy agenta (A08)</title>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@400;500;600;700;800&family=JetBrains+Mono:wght@500;700&display=swap" rel="stylesheet">
+<link rel="stylesheet" href="shared/styles.css?v=1">
+<link rel="stylesheet" href="shared/agenci.css?v=1">
+</head>
+<body>
+
+<svg width="0" height="0" style="position:absolute" aria-hidden="true"><defs>
+<symbol id="i-bot" viewBox="0 0 24 24"><rect x="3" y="8" width="18" height="12" rx="2"/><path d="M12 8V4M8 4h8"/><circle cx="9" cy="14" r="1"/><circle cx="15" cy="14" r="1"/></symbol>
+<symbol id="i-x" viewBox="0 0 24 24"><line x1="18" y1="6" x2="6" y2="18"/><line x1="6" y1="6" x2="18" y2="18"/></symbol>
+<symbol id="i-wand" viewBox="0 0 24 24"><path d="M15 4V2M15 16v-2M8 9h2M20 9h2M17.8 11.8 19 13M15 9h0M17.8 6.2 19 5M3 21l9-9M12.2 6.2 11 5"/></symbol>
+<symbol id="i-sparkles" viewBox="0 0 24 24"><path d="M12 3l1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9L12 3z"/><path d="M5 3v4M19 17v4M3 5h4M17 19h4"/></symbol>
+<symbol id="i-check" viewBox="0 0 24 24"><polyline points="20 6 9 17 4 12"/></symbol>
+<symbol id="i-zap" viewBox="0 0 24 24"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2"/></symbol>
+<symbol id="i-refresh" viewBox="0 0 24 24"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></symbol>
+<symbol id="i-send" viewBox="0 0 24 24"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></symbol>
+<symbol id="i-alert" viewBox="0 0 24 24"><path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/></symbol>
+<symbol id="i-globe" viewBox="0 0 24 24"><circle cx="12" cy="12" r="10"/><line x1="2" y1="12" x2="22" y2="12"/><path d="M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></symbol>
+</defs></svg>
+
+<section class="screen">
+  <div class="screen-header">
+    <span class="num">A08 · okno</span>
+    <h2>Asystent budowy agenta (AI)</h2>
+    <div class="desc">Opisujesz zadanie słowami — asystent proponuje kompletny szkic agenta (opis, prompt, narzędzia) i wstawia go do formularza po Twojej akceptacji.</div>
+  </div>
+  <div class="screen-frame">
+    <div class="app" style="grid-template-columns:1fr;">
+      <main class="main">
+        <div style="position:relative;">
+          <!-- okno asystenta jako karta na środku ekranu -->
+          <div class="window" style="position:relative;margin:0 auto;width:min(760px,100%);max-height:none;">
+            <div class="window-head">
+              <div class="window-title"><svg class="icon"><use href="#i-wand"/></svg>Asystent budowy agenta</div>
+              <button class="window-close"><svg class="icon icon-sm"><use href="#i-x"/></svg></button>
+            </div>
+            <div class="window-body">
+              <!-- rozmowa -->
+              <div style="display:flex;flex-direction:column;gap:12px;">
+                <div class="bubble assistant" style="max-width:100%;">
+                  <div class="b-sender">Asystent</div>
+                  Opisz, co agent ma robić — język naturalny wystarczy. Uwzględnię dostępne narzędzia i przygotuję prompt.
+                </div>
+                <div class="bubble user" style="max-width:100%;">
+                  Agent do monitorowania wzmianek o naszej firmie w internecie. Raz dziennie zbiera nowe artykuły i wpisy, ocenia sentyment i przygotowuje krótkie podsumowanie z linkami.
+                </div>
+                <div class="bubble assistant" style="max-width:100%;">
+                  <div class="b-sender">Asystent · propozycja</div>
+                  Przygotowałem szkic agenta <b>„monitor-wzmianek"</b>. Sprawdź szczegóły poniżej:
+                  <div style="border:1px solid var(--border);border-radius:var(--radius-sm);padding:12px;margin-top:10px;background:var(--bg-card);">
+                    <div style="display:flex;gap:8px;align-items:center;margin-bottom:8px;">
+                      <span class="chip accent">nazwa</span><span class="mono" style="font-size:11.5px;">monitor-wzmianek</span>
+                      <span class="chip accent" style="margin-left:8px;">wyświetlana</span><span>Monitor wzmianek</span>
+                    </div>
+                    <div style="font-size:11px;color:var(--text-3);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">opis</div>
+                    <div style="font-size:12px;color:var(--text-2);margin-bottom:10px;">Codzienny monitoring publicznych wzmianek o firmie: artykuły, wpisy, ocena sentymentu, poranne podsumowanie.</div>
+                    <div style="font-size:11px;color:var(--text-3);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin-bottom:4px;">prompt systemowy (fragment)</div>
+                    <div class="mono" style="font-size:11px;color:var(--text-2);background:var(--bg-input);border:1px solid var(--border);border-radius:6px;padding:10px;line-height:1.6;">Jesteś analitykiem mediów. Wyszukujesz wzmianki o firmie „Acme S.A.", klasyfikujesz sentyment (pozytywny / neutralny / negatywny / kryzysowy), a wynik przedstawiasz jako tabelę: źródło, data, tytuł, sentyment, link. Kryzysowe sygnały wyróżnij na początku raportu.</div>
+                    <div style="font-size:11px;color:var(--text-3);font-weight:700;text-transform:uppercase;letter-spacing:.06em;margin:10px 0 6px;">proponowane narzędzia</div>
+                    <div style="display:flex;gap:6px;flex-wrap:wrap;">
+                      <span class="chip success mono" style="font-family:ui-monospace,monospace;"><svg class="icon" style="width:11px;height:11px;"><use href="#i-check"/></svg>deep-research.search_web</span>
+                      <span class="chip success mono" style="font-family:ui-monospace,monospace;"><svg class="icon" style="width:11px;height:11px;"><use href="#i-check"/></svg>deep-research.read_search_results</span>
+                      <span class="chip mono"><svg class="icon" style="width:11px;height:11px;"><use href="#i-zap"/></svg>core.ask_user</span>
+                    </div>
+                    <div style="display:flex;align-items:center;gap:8px;margin-top:10px;font-size:11px;color:var(--warning);">
+                      <svg class="icon" style="width:12px;height:12px;"><use href="#i-alert"/></svg>
+                      Pakiet deep-research nie ma jeszcze instancji na tym nodzie — zainstaluj go w katalogu addonów, aby narzędzia działały.
+                    </div>
+                  </div>
+                  <div style="display:flex;gap:8px;margin-top:10px;">
+                    <button class="btn btn-primary btn-sm"><svg class="icon"><use href="#i-check"/></svg>Wstaw do formularza</button>
+                    <button class="btn btn-secondary btn-sm"><svg class="icon"><use href="#i-refresh"/></svg>Zaproponuj ponownie</button>
+                    <button class="btn btn-ghost btn-sm">Odrzuć</button>
+                  </div>
+                </div>
+              </div>
+
+              <div class="pg-composer" style="border-top:1px solid var(--border);padding:12px 0 0;margin-top:14px;">
+                <input class="input" placeholder="Doprecyzuj propozycję, np. „dodaj filtr języka polskiego”…">
+                <button class="btn btn-primary"><svg class="icon"><use href="#i-send"/></svg>Wyślij</button>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <p class="section-sub" style="text-align:center;margin-top:14px;">
+          Asystent widzi ten sam katalog narzędzi co edytor (A03) — nie zaproponuje narzędzia, którego nie można włączyć.
+          Propozycja trafia do kreatora (A07) lub prosto do zakładki Konfiguracja (A02), jeśli edytujesz istniejącego agenta.
+        </p>
+      </main>
+    </div>
+  </div>
+</section>
+
+</body>
+</html>
