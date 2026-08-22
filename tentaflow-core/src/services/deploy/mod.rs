@@ -13,6 +13,7 @@ pub mod embedded;
 pub mod external;
 pub mod gpu_topology;
 pub mod python_bundle;
+pub mod required_assets;
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -263,6 +264,65 @@ pub(crate) fn strip_hf_token(user_config: &serde_json::Value) -> serde_json::Val
     sanitized
 }
 
+/// Config key the deploy wizard fills with a client-side suggested container
+/// name (`tentaflow-<engine>-<random>`). No deploy path honours it: the runtime
+/// name is derived as `tentaflow-<engine>-<host_port>` when the container is
+/// created and re-derived the same way by every teardown/sweep path. Persisting
+/// the suggestion on the `services` row would therefore name a container that
+/// does not exist, so it is kept only in the `deployments` audit row (what the
+/// operator asked for) and stripped from everything describing the runtime.
+const CONTAINER_NAME_CONFIG_KEY: &str = "container_name";
+
+/// Config key carrying the host port. In the request it is a wish (the form's
+/// port field); on the `services` row it is rewritten at commit to the port the
+/// allocator actually granted, and kept in step with `services.runtime_port` by
+/// every statement that writes that column.
+const PORT_CONFIG_KEY: &str = "port";
+
+/// Returns a copy of the deploy config without the wizard's container-name
+/// suggestion. Applied to everything that ends up describing the runtime
+/// (`services.config_json`), never to the `deployments` audit row.
+pub(crate) fn strip_container_name(user_config: &serde_json::Value) -> serde_json::Value {
+    let mut sanitized = user_config.clone();
+    if let Some(map) = sanitized.as_object_mut() {
+        map.remove(CONTAINER_NAME_CONFIG_KEY);
+    }
+    sanitized
+}
+
+/// Rewrites the runtime-shaped hints in a prepared `config_json` so the row we
+/// are about to commit describes what the deploy GOT instead of what the form
+/// asked for: `port` becomes the allocator's answer, and is REMOVED when no port
+/// was allocated (on-demand engine, embedded/external service — nothing listens,
+/// so any number there is fiction). `container_name` is dropped for the same
+/// reason. `runtime_port`/`endpoint_url` stay the source of truth; this only
+/// stops the config from contradicting them.
+fn reconcile_config_with_runtime(prepared: &mut PreparedDeploy) -> DeployResult<()> {
+    let mut value: serde_json::Value = if prepared.config_json.trim().is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        serde_json::from_str(&prepared.config_json)
+            .map_err(|e| DeployError::Other(format!("commit: parse config_json: {}", e)))?
+    };
+    if !value.is_object() {
+        value = serde_json::Value::Object(serde_json::Map::new());
+    }
+    if let Some(map) = value.as_object_mut() {
+        map.remove(CONTAINER_NAME_CONFIG_KEY);
+        match prepared.runtime.port {
+            Some(port) => {
+                map.insert(PORT_CONFIG_KEY.to_string(), serde_json::json!(port));
+            }
+            None => {
+                map.remove(PORT_CONFIG_KEY);
+            }
+        }
+    }
+    prepared.config_json = serde_json::to_string(&value)
+        .map_err(|e| DeployError::Other(format!("commit: serialize config_json: {}", e)))?;
+    Ok(())
+}
+
 /// Config key holding a cloud external provider's API key (OpenAI, Anthropic, …).
 pub const API_KEY_CONFIG_KEY: &str = "api_key";
 
@@ -356,7 +416,13 @@ pub fn create_deploy_job(
     let sanitized_config = strip_hf_token(user_config);
     let config_json = serde_json::to_string(&sanitized_config)
         .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
-    let placeholder = build_placeholder_service(method, manifest, &config_json, &slug);
+    // The `services` row describes the runtime, the `deployments` row records the
+    // request — so the wizard's container-name suggestion stays in the audit row
+    // only. The port is still a wish here (nothing is allocated yet); commit
+    // replaces it with the granted one.
+    let row_config_json = serde_json::to_string(&strip_container_name(&sanitized_config))
+        .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+    let placeholder = build_placeholder_service(method, manifest, &row_config_json, &slug);
     let (service_id, deployment_id) = with_tx(db, |tx| {
         let sid = services_repo::insert_in_tx(tx, &placeholder)?;
         let did = deployments_repo::create_with_slug(
@@ -407,8 +473,10 @@ pub fn create_redeploy_job(
     let sanitized_config = strip_hf_token(user_config);
     let config_json = serde_json::to_string(&sanitized_config)
         .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+    let row_config_json = serde_json::to_string(&strip_container_name(&sanitized_config))
+        .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
     let deployment_id = with_tx(db, |tx| {
-        services_repo::begin_redeploy_in_tx(tx, existing_service_id, &slug, &config_json)
+        services_repo::begin_redeploy_in_tx(tx, existing_service_id, &slug, &row_config_json)
             .map_err(|e| DeployError::Database(e.to_string()))?;
         let did = deployments_repo::create_with_slug(
             tx,
@@ -503,6 +571,24 @@ pub async fn deploy(
         }
     }
 
+    // 1c. Materialise the engine's `[[required_asset]]` files into the central
+    // host directory. Shared by docker (read-only bind mount) and native (env
+    // path), so it must happen BEFORE the strategy — a missing/corrupt model
+    // has to fail the deploy here, not silently at engine start.
+    if let Err(e) = required_assets::ensure_required_assets(manifest, sink.as_ref()).await {
+        if let Some(s) = &sink {
+            s.emit("error", &format!("[fetch-assets-failed] {}", e));
+        }
+        mark_finished(
+            db,
+            job.deployment_id,
+            DeploymentStatus::Failed,
+            Some(&e.to_string()),
+        );
+        mark_worker_deploy_failed(db, &job, &slug, &e.to_string());
+        return Err(e);
+    }
+
     // 2. Pick strategy.
     let mut strategy: Box<dyn DeployStrategy> = match method {
         DeployMethod::NativeEmbedded => Box::new(embedded::EmbeddedDeploy::new(
@@ -547,7 +633,7 @@ pub async fn deploy(
     };
 
     // 3. PREPARE.
-    let prepared = match strategy.prepare().await {
+    let mut prepared = match strategy.prepare().await {
         Ok(p) => p,
         Err(e) => {
             if let Some(s) = &sink {
@@ -563,6 +649,26 @@ pub async fn deploy(
             return Err(e);
         }
     };
+
+    // Align the config we are about to persist with the runtime the strategy
+    // actually produced, before any row sees it.
+    if let Err(e) = reconcile_config_with_runtime(&mut prepared) {
+        let rb_msg = match strategy.rollback(prepared).await {
+            Ok(()) => format!("{} (rolled back)", e),
+            Err(rb) => format!("{} ; rollback also failed: {}", e, rb),
+        };
+        if let Some(s) = &sink {
+            s.emit("error", &rb_msg);
+        }
+        mark_finished(
+            db,
+            job.deployment_id,
+            DeploymentStatus::Failed,
+            Some(&rb_msg),
+        );
+        mark_worker_deploy_failed(db, &job, &slug, &rb_msg);
+        return Err(e);
+    }
 
     if let Some(s) = &sink {
         s.info("[commit] writing services + model_registry");
@@ -685,6 +791,10 @@ pub async fn respawn(
             .flatten()
             .map(|value| value.trim().to_string())
             .filter(|value| !value.is_empty());
+
+    // Same central asset step as `deploy()` — a respawn after a wiped models
+    // directory must restore the engine's files instead of starting without them.
+    required_assets::ensure_required_assets(&manifest, None).await?;
 
     let mut strategy: Box<dyn DeployStrategy> = match deploy_method {
         DeployMethod::NativeEmbedded => {
@@ -1197,8 +1307,9 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
     // Zapamietujemy hash drzewa zrodel z momentu deployu, aby pozniej wykryc, ze
     // wbudowany bundle zostal zaktualizowany (snapshot porownuje go z aktualnym
     // hashem manifestu). embedded/external nie maja buildowalnego drzewa -> pusty.
-    let deployed_source_hash = crate::services::manifest::registry()
-        .by_id(&prepared.engine_id)
+    let manifest = crate::services::manifest::registry().by_id(&prepared.engine_id);
+    let on_demand = manifest.map(|m| m.engine.is_on_demand()).unwrap_or(false);
+    let deployed_source_hash = manifest
         .map(|m| match prepared.deploy_method {
             DeployMethod::Docker => m.docker_source_hash.clone(),
             DeployMethod::NativeBinary
@@ -1224,7 +1335,11 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         // head-a przez supervisora zrestartowalby `ray start --head` bez
         // ponownego dolaczenia workerow (martwa sesja Ray) — redeployem steruje
         // koordynator klastra, nie supervisor.
-        pinned: if prepared.config_json.contains("\"_distributed\"") {
+        //
+        // On-demand engines are never pinned either: `auto_start_pinned`
+        // respawns every pinned row it finds Stopped, which would re-run the
+        // deploy of an engine that is meant to stay down between requests.
+        pinned: if prepared.config_json.contains("\"_distributed\"") || on_demand {
             false
         } else {
             default_pinned()
@@ -1237,7 +1352,7 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
         config_json: prepared.config_json.clone(),
         active_deploy_id: String::new(),
         last_deploy_id: String::new(),
-        deployment_progress_pct: if status == ServiceStatus::Running {
+        deployment_progress_pct: if status == ServiceStatus::Running || on_demand {
             100
         } else {
             0
@@ -1258,6 +1373,20 @@ pub(crate) fn build_new_service(prepared: &PreparedDeploy, status: ServiceStatus
 /// Lazy loading dziala tam tez, ale wlaczany recznie przez odpiecie serwisu.
 pub(crate) fn default_pinned() -> bool {
     !cfg!(any(target_os = "ios", target_os = "android"))
+}
+
+/// Status a finished deploy writes on the `services` row.
+///
+/// `Running` for a normal engine (the deploy left a live process behind).
+/// `Stopped` for an `on-demand` engine: the artifact is built and the engine is
+/// registered, but nothing runs until the owning subsystem starts an instance.
+/// `Stopped` is exactly that state — no runtime, deploy finished, startable.
+pub(crate) fn deployed_status(manifest: &ServiceManifest) -> ServiceStatus {
+    if manifest.engine.is_on_demand() {
+        ServiceStatus::Stopped
+    } else {
+        ServiceStatus::Running
+    }
 }
 
 fn build_placeholder_service(
@@ -2049,6 +2178,7 @@ mod apply_parameters_deploy_tests {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            lifecycle: None,
         }
     }
 
@@ -2077,6 +2207,7 @@ mod apply_parameters_deploy_tests {
             parameters,
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -2337,6 +2468,7 @@ mod hf_token_gate_tests {
             service_surfaces: None,
             input_modalities: None,
             output_modalities: None,
+            lifecycle: None,
         }
     }
 
@@ -2410,6 +2542,7 @@ mod hf_token_gate_tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -2961,6 +3094,59 @@ pub(crate) fn category_tag(manifest: &ServiceManifest) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The `services` row a finished on-demand deploy leaves behind: registered
+    /// and startable, but with no runtime and never auto-started. `teams-bot` is
+    /// the shipped on-demand engine, so this also pins its manifest declaration.
+    #[test]
+    fn on_demand_deploy_writes_registered_but_not_running_row() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+
+        let prepared = PreparedDeploy {
+            engine_id: "teams-bot".into(),
+            category: "agents".into(),
+            display_name: "Teams Bot".into(),
+            deploy_method: DeployMethod::Docker,
+            transport: Transport::HttpDirect,
+            runtime: RuntimeHandle {
+                pid: None,
+                port: None,
+                sidecar_port: None,
+                endpoint_url: None,
+                container_id: None,
+                instance_dir: None,
+            },
+            models: Vec::new(),
+            config_json: "{}".into(),
+            allocated_ports: Vec::new(),
+        };
+        let manifest = crate::services::manifest::registry()
+            .by_id("teams-bot")
+            .expect("teams-bot manifest is bundled");
+        assert!(
+            manifest.engine.is_on_demand(),
+            "teams-bot must declare lifecycle = \"on-demand\""
+        );
+
+        let status = deployed_status(manifest);
+        let new = build_new_service(&prepared, status);
+        let id = services_repo::insert(&conn, &new).unwrap();
+        let mut tx_conn = conn;
+        let tx = tx_conn.transaction().unwrap();
+        services_repo::finish_deploy_in_tx(&tx, id, &new, status).unwrap();
+        tx.commit().unwrap();
+
+        let row = services_repo::get(&tx_conn, id).unwrap().unwrap();
+        assert_eq!(row.status, ServiceStatus::Stopped);
+        assert_eq!(row.engine_id, "teams-bot");
+        assert_eq!(row.runtime_pid, None);
+        assert_eq!(row.runtime_port, None);
+        assert_eq!(row.endpoint_url, None);
+        // Pinned would make `auto_start_pinned` redeploy it on every boot.
+        assert!(!row.pinned, "an on-demand engine must not be pinned");
+        assert_eq!(row.deployment_progress_pct, 100);
+    }
     use crate::services::manifest::{
         ApiKind, Category, DeploySection, Engine, ModelPreset, NativeDeploy, NativeRuntime,
         TargetOs,
@@ -2994,6 +3180,7 @@ mod tests {
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,
+                lifecycle: None,
             },
             deploy: DeploySection {
                 docker: None,
@@ -3028,6 +3215,7 @@ mod tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -3364,6 +3552,144 @@ mod tests {
             "mesh command config_json leaked token value: {forwarded}"
         );
         assert!(forwarded.contains("speakleash/Bielik"));
+    }
+
+    /// A docker deploy that asked for 5003 and was granted 5005 must persist the
+    /// GRANTED port, and must not persist the wizard's container-name
+    /// suggestion — the runtime container is `tentaflow-<engine>-<granted port>`.
+    #[test]
+    fn commit_persists_granted_port_and_drops_container_name() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+
+        let mut prepared = PreparedDeploy {
+            engine_id: "teams-bot".into(),
+            category: "agents".into(),
+            display_name: "Teams Bot".into(),
+            deploy_method: DeployMethod::Docker,
+            transport: Transport::HttpDirect,
+            runtime: RuntimeHandle {
+                pid: None,
+                port: Some(5005),
+                sidecar_port: None,
+                endpoint_url: Some("http://127.0.0.1:5005".into()),
+                container_id: Some("abc123".into()),
+                instance_dir: None,
+            },
+            models: Vec::new(),
+            config_json: serde_json::json!({
+                "port": 5003,
+                "container_name": "tentaflow-teams-bot-8p7iu",
+                "model_repo": "speakleash/Bielik",
+            })
+            .to_string(),
+            allocated_ports: vec![5005],
+        };
+        reconcile_config_with_runtime(&mut prepared).unwrap();
+
+        let new = build_new_service(&prepared, ServiceStatus::Running);
+        let id = services_repo::insert(&conn, &new).unwrap();
+        let row = services_repo::get(&conn, id).unwrap().unwrap();
+
+        assert_eq!(row.runtime_port, Some(5005));
+        assert_eq!(row.endpoint_url.as_deref(), Some("http://127.0.0.1:5005"));
+        let cfg: serde_json::Value = serde_json::from_str(&row.config_json).unwrap();
+        assert_eq!(cfg.get("port").and_then(|v| v.as_u64()), Some(5005));
+        assert!(
+            cfg.get("container_name").is_none(),
+            "wizard container-name suggestion must not be persisted: {}",
+            row.config_json
+        );
+        assert_eq!(
+            cfg.get("model_repo").and_then(|v| v.as_str()),
+            Some("speakleash/Bielik"),
+            "unrelated config keys must survive"
+        );
+    }
+
+    /// On-demand deploy: no container, no port. The row must say exactly that
+    /// instead of carrying the form's port and an invented container name.
+    #[test]
+    fn on_demand_commit_leaves_no_port_and_no_container_name() {
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        crate::db::migrations::run(&conn).unwrap();
+
+        let mut prepared = PreparedDeploy {
+            engine_id: "teams-bot".into(),
+            category: "agents".into(),
+            display_name: "Teams Bot".into(),
+            deploy_method: DeployMethod::Docker,
+            transport: Transport::HttpDirect,
+            runtime: RuntimeHandle::default(),
+            models: Vec::new(),
+            config_json: serde_json::json!({
+                "port": 5003,
+                "container_name": "tentaflow-teams-bot-ck1mr",
+            })
+            .to_string(),
+            allocated_ports: Vec::new(),
+        };
+        reconcile_config_with_runtime(&mut prepared).unwrap();
+
+        let new = build_new_service(&prepared, ServiceStatus::Stopped);
+        let id = services_repo::insert(&conn, &new).unwrap();
+        let row = services_repo::get(&conn, id).unwrap().unwrap();
+
+        assert_eq!(row.runtime_port, None);
+        assert_eq!(row.endpoint_url, None);
+        let cfg: serde_json::Value = serde_json::from_str(&row.config_json).unwrap();
+        assert!(
+            cfg.get("port").is_none() && cfg.get("container_name").is_none(),
+            "on-demand row must not claim a port or a container: {}",
+            row.config_json
+        );
+    }
+
+    /// The `services` row describes the runtime, the `deployments` row records
+    /// the request: the container-name suggestion belongs only to the latter.
+    #[test]
+    fn create_deploy_job_keeps_container_name_only_in_audit_row() {
+        let db = open_db();
+        let manifest = dummy_manifest("llama-cpp", NativeRuntime::Embedded);
+        let cfg = serde_json::json!({
+            "container_name": "tentaflow-llama-cpp-8p7iu",
+            "port": 5003,
+        });
+        let job = create_deploy_job(
+            DeployMethod::NativeEmbedded,
+            &manifest,
+            &cfg,
+            &db,
+            "node-test",
+            Some("1"),
+            None,
+        )
+        .unwrap();
+
+        let conn = db.read().unwrap();
+        let svc_config: String = conn
+            .query_row(
+                "SELECT config_json FROM services WHERE id = ?1",
+                rusqlite::params![job.service_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let dep_config: String = conn
+            .query_row(
+                "SELECT config_json FROM deployments WHERE id = ?1",
+                rusqlite::params![job.deployment_id],
+                |r| r.get(0),
+            )
+            .unwrap();
+
+        assert!(
+            !svc_config.contains("container_name"),
+            "services row must not carry the suggested name: {svc_config}"
+        );
+        assert!(
+            dep_config.contains("tentaflow-llama-cpp-8p7iu"),
+            "deployments row must keep the request verbatim: {dep_config}"
+        );
     }
 
     #[test]

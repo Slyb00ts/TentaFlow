@@ -3291,6 +3291,8 @@ fn all_gpus_to_proto(gpus: &[StoreGpu]) -> Vec<tentaflow_protocol::MeshNodeGpuIn
                 fan_speed_percent: g.fan_speed_percent,
                 pcie_link_gen: g.pcie_link_gen,
                 pcie_link_width: g.pcie_link_width,
+                pcie_link_gen_current: g.pcie_link_gen_current,
+                pcie_link_width_current: g.pcie_link_width_current,
             }
         })
         .collect()

@@ -3944,8 +3944,26 @@ textarea {
 .gpu-topo-title { font-size: 12px; font-weight: 700; color: var(--text-2); margin: 14px 0 8px; text-transform: uppercase; letter-spacing: 0.06em; }
 .gpu-topo-matrix {
   display: grid;
-  grid-template-columns: auto repeat(var(--gpu-topo-n), minmax(44px, 1fr));
-  gap: 3px; max-width: 640px; overflow-x: auto;
+  /* minmax(0, 1fr) — an implicit `auto` minimum would let the row-label column
+     and the cell text push the tracks past the grid box, so the matrix would
+     report horizontal overflow inside its own width:100% box. */
+  grid-template-columns: minmax(34px, auto) repeat(var(--gpu-topo-n), minmax(0, 1fr));
+  gap: 3px; width: 100%;
+  /* Cell cap: 280px is the largest column that still lets a 4-GPU matrix reach
+     the edge of a ~1180px node section (4 * 283 + 36 = 1168), so every rig from
+     4 to 16 cards fills the width, while 2 GPUs stop at ~600px instead of
+     stretching two cells across the whole screen. The +3px is the column gap,
+     which is part of the track budget. */
+  max-width: calc(36px + var(--gpu-topo-n) * 283px);
+}
+/* Only a narrow screen can run out of room for a large matrix; letting the
+   cells shrink below the minimum (label ellipsized, full value in the cell
+   tooltip) keeps it inside the section without a scroll box — a scroll box
+   would also clip the tooltips it scrolls. */
+@media (max-width: 720px) {
+  .gpu-topo-matrix {
+    grid-template-columns: minmax(28px, auto) repeat(var(--gpu-topo-n), minmax(0, 1fr));
+  }
 }
 .gpu-topo-matrix .gpu-topo-head {
   font-size: 10px; font-weight: 700; color: var(--text-3);
@@ -3953,10 +3971,16 @@ textarea {
   display: flex; align-items: center; justify-content: center; padding: 2px 6px;
 }
 .gpu-topo-matrix tf-tooltip, .gpu-topo-matrix .tf-tooltip-wrap { display: block; }
+/* The tooltip bubble is absolutely positioned and centred on its cell, so on the
+   last column it hangs outside the matrix box and shows up as horizontal
+   overflow (scrollWidth > clientWidth). Clamping it to the cell width keeps the
+   whole matrix inside its own box; the text wraps instead of hanging out. */
+.gpu-topo-matrix .tf-tooltip-bubble { max-width: 100%; white-space: normal; text-align: center; }
 .gpu-topo-cell {
-  font-size: 10px; font-weight: 700; text-align: center; padding: 6px 4px;
+  font-size: 10px; font-weight: 700; text-align: center; padding: 6px 3px;
   border-radius: 4px; font-family: 'JetBrains Mono', ui-monospace, monospace;
   background: var(--bg-3); color: var(--text-3); border: 1px solid transparent;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .gpu-topo-cell.self { opacity: 0.4; }
 .gpu-topo-cell.link-nvl { background: rgba(34, 197, 94, 0.32); color: #4ade80; }
@@ -3967,6 +3991,10 @@ textarea {
 .gpu-topo-cell.link-sys { background: rgba(239, 68, 68, 0.16); color: #ef4444; }
 .gpu-topo-cell.no-p2p { border-color: rgba(239, 68, 68, 0.6); border-style: dashed; }
 .nd-gpu .gc-title-wrap .gpu-pair-chip { margin-left: 6px; vertical-align: middle; }
+/* PCIe link that currently idles below the slot maximum — dotted underline hints
+   the tooltip explaining the downshift instead of looking like a bad reading. */
+.gpu-pcie-idle { border-bottom: 1px dotted currentColor; cursor: help; }
+.gpu-pcie-idle::after { content: '↓'; margin-left: 2px; opacity: 0.7; }
 
 /* =============================================================================
    Meeting Bot — per-meeting container app
@@ -4272,8 +4300,14 @@ textarea {
   font-size: 11px; line-height: 1.5;
   color: var(--text-2); background: var(--bg-input, #0b0e22);
   border: 1px solid var(--border); border-radius: var(--radius, 10px);
-  padding: 12px 14px; margin: 0; white-space: pre-wrap; word-break: break-all;
+  padding: 12px 14px; margin: 0; white-space: pre-wrap;
+  /* `anywhere` instead of `break-all`: a token that fits stays whole (break-all
+     split words mid-letter on every wrap), while a long sha256/URL still breaks
+     instead of overflowing the box. */
+  word-break: normal; overflow-wrap: anywhere;
 }
+/* Kroki builda i granice faz sa naglowkami postepu w scianie logu. */
+.deploy-log-line.is-step { color: var(--text); font-weight: 600; }
 .deploy-progress-error {
   padding: 12px 14px; border-radius: var(--radius, 10px);
   background: rgba(239,68,68,0.08); border: 1px solid rgba(239,68,68,0.3);
@@ -5868,6 +5902,35 @@ tf-screen {
   border-radius: 4px;
   background: rgba(99,102,241,0.18);
   color: var(--accent-2, #a78bfa);
+}
+
+/* A row whose delete is in flight: dimmed, with every action in the row inert
+   so a slow container teardown cannot be triggered twice. */
+.svc-row-deleting {
+  opacity: 0.55;
+}
+.svc-row-deleting td {
+  pointer-events: none;
+}
+/* Live deployment phase + percentage under the status chip. The phase can be a
+   whole docker step, so it wraps instead of stretching the column. */
+.svc-deploy-progress {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  margin-top: 4px;
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--text-3);
+}
+.svc-deploy-phase {
+  min-width: 0;
+  overflow-wrap: anywhere;
+}
+.svc-deploy-pct {
+  margin-left: auto;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-2);
 }
 
 /* Baseline-adopt modal (mesh-baseline-adopt.js) */

@@ -20,6 +20,33 @@ export function shortPciBusId(id) {
   return String(id || '').replace(/^[0-9a-f]+:/i, '').replace(/\.[0-9a-f]+$/i, '').toLowerCase();
 }
 
+// PCIe link presentation. `pcie_link_gen`/`pcie_link_width` carry the slot
+// maximum; `*_current` (append-only, absent on older nodes) is the negotiated
+// link, which idles down to Gen1 and must not read as the card's capability.
+export function pcieLinkInfo(gpu) {
+  const gen = gpu?.pcie_link_gen ?? null;
+  const width = gpu?.pcie_link_width ?? null;
+  if (gen == null || width == null) return null;
+  const curGen = gpu?.pcie_link_gen_current ?? null;
+  const curWidth = gpu?.pcie_link_width_current ?? null;
+  const lower = (curGen != null && curGen < gen) || (curWidth != null && curWidth < width);
+  return {
+    label: I18n.t('gpu_topology.pcie_link', { gen, width }),
+    hint: lower
+      ? I18n.t('gpu_topology.pcie_current_hint', { gen: curGen ?? gen, width: curWidth ?? width })
+      : '',
+  };
+}
+
+// Escaped PCIe label, wrapped in a tooltip only when the live link is lower.
+export function pcieLinkHtml(gpu) {
+  const info = pcieLinkInfo(gpu);
+  if (!info) return '';
+  const label = escapeHtml(info.label);
+  if (!info.hint) return label;
+  return `<tf-tooltip text="${escapeAttr(info.hint)}"><span class="gpu-pcie-idle">${label}</span></tf-tooltip>`;
+}
+
 function normLink(link) {
   const l = String(link || 'UNKNOWN').toUpperCase();
   return l in FAST_RANK || l === 'NODE' || l === 'SYS' ? l : 'UNKNOWN';

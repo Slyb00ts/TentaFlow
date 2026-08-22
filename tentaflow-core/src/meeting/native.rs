@@ -152,6 +152,16 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
         .stderr(std::process::Stdio::inherit())
         .kill_on_drop(false);
 
+    // Sciezki modeli (VAD_MODEL_PATH) wprost z manifestu — ten sam plik na
+    // hoscie, ktory kontenerowy wariant montuje pod `mount_path`. Brak pliku to
+    // twardy blad: bot cicho zszedlby na detektor RMS.
+    let manifest = super::container::bot_manifest()?;
+    crate::services::deploy::required_assets::verify_present(manifest)
+        .map_err(|e| anyhow!("Meeting Bot: {}", e))?;
+    for (key, value) in crate::services::deploy::required_assets::asset_env(manifest, false) {
+        cmd.env(key, value);
+    }
+
     let child = cmd
         .spawn()
         .with_context(|| format!("spawn subprocess {}", bin.display()))?;

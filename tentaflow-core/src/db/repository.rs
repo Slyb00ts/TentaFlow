@@ -11141,7 +11141,7 @@ pub fn get_flow_execution(pool: &DbPool, id: i64) -> Result<Option<DbFlowExecuti
 
 /// Opens a run's audit row. The provenance stamp is written HERE, at insert:
 /// the entry point already minted it, and a row that starts unattributed could
-/// never be told apart from a pre-v134 one.
+/// never be told apart from a pre-v135 one.
 pub fn create_flow_execution(pool: &DbPool, exec: &NewFlowExecution<'_>) -> Result<i64> {
     let conn = acquire(pool)?;
     conn.execute(
@@ -20033,8 +20033,8 @@ pub mod deployments {
     ) -> Result<()> {
         let conn = pool.write().unwrap();
         conn.execute(
-            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status, config_json)
-             VALUES (?1, ?2, ?3, ?4, 'deploying', ?5)",
+            "INSERT INTO deployments (deploy_id, engine_id, deploy_method, node_id, status, config_json, updated_at)
+             VALUES (?1, ?2, ?3, ?4, 'deploying', ?5, CURRENT_TIMESTAMP)",
             params![deploy_id, engine_id, deploy_method, node_id, config_json],
         )?;
         Ok(())

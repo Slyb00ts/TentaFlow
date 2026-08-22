@@ -681,7 +681,11 @@ pub async fn handle_ws_connection<S>(
                         continue;
                     }
                     let registry = subscription::global();
-                    let (sub, rx) = registry.create(envelope.correlation_id, None);
+                    let (sub, rx) = registry.create_with_capacity(
+                        envelope.correlation_id,
+                        None,
+                        subscription::channel_capacity_for(variant_name),
+                    );
                     owned_subscription_ids.push(envelope.correlation_id);
                     (stream_meta.handler_fn)(body.clone(), ctx.clone(), sub);
 

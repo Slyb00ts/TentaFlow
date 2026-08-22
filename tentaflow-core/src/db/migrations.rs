@@ -699,21 +699,50 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
         ),
         (
             132,
+            "services_config_runtime_truth",
+            MigrationStep::Sql(SERVICES_CONFIG_RUNTIME_TRUTH),
+        ),
+        (
+            133,
             "events_tracking_foundation",
             MigrationStep::RustSelfManaged(create_events_tracking_foundation),
         ),
         (
-            133,
+            134,
             "graph_collection_paths_repair",
             MigrationStep::Rust(repair_graph_collection_paths),
         ),
         (
-            134,
+            135,
             "run_provenance_columns",
             MigrationStep::Rust(add_run_provenance_columns),
         ),
     ]
 }
+
+/// Rows deployed before the deploy pipeline reconciled the persisted config with
+/// the runtime carry two fictions: the wizard's suggested `container_name`
+/// (nothing is ever named after it — the real name is derived from the engine id
+/// and the host port) and the requested `port` instead of the granted one. Both
+/// are rewritten from the runtime columns, which have always been the truth.
+const SERVICES_CONFIG_RUNTIME_TRUTH: &str = r#"
+UPDATE services
+   SET config_json = json_remove(config_json, '$.container_name')
+ WHERE json_valid(config_json)
+   AND json_type(config_json, '$.container_name') IS NOT NULL;
+
+UPDATE services
+   SET config_json = json_set(config_json, '$.port', runtime_port)
+ WHERE json_valid(config_json)
+   AND runtime_port IS NOT NULL
+   AND json_extract(config_json, '$.port') IS NOT runtime_port;
+
+UPDATE services
+   SET config_json = json_remove(config_json, '$.port')
+ WHERE json_valid(config_json)
+   AND runtime_port IS NULL
+   AND json_type(config_json, '$.port') IS NOT NULL;
+"#;
 
 /// The bot no longer receives STT/LLM/TTS aliases or a flow through env —
 /// every FlowInvoke turn resolves them from the session row, so the effective
@@ -777,7 +806,7 @@ fn agents_add_delegation_roster(conn: &Connection) -> Result<()> {
 }
 
 // =============================================================================
-// v132 — main-database groundwork for the event-tracking subsystem
+// v133 — main-database groundwork for the event-tracking subsystem
 // =============================================================================
 //
 // The timeline itself lives in a side database (`<data>/events.db`, own version
@@ -942,7 +971,7 @@ fn create_events_tracking_foundation(conn: &Connection, version: i64, name: &str
 }
 
 // =============================================================================
-// v133 — repair `addon_graph_collections.file_path` after a data-directory move
+// v134 — repair `addon_graph_collections.file_path` after a data-directory move
 // =============================================================================
 //
 // `GraphManager` now treats the stored `file_path` as the SOURCE OF TRUTH for an
@@ -1034,7 +1063,7 @@ fn repair_graph_collection_paths(conn: &Connection) -> Result<()> {
 
     if repaired > 0 {
         info!(
-            "v133: rewrote {} stale graph collection path(s) under {}",
+            "v134: rewrote {} stale graph collection path(s) under {}",
             repaired,
             orgs_root.display()
         );
@@ -1044,7 +1073,7 @@ fn repair_graph_collection_paths(conn: &Connection) -> Result<()> {
 
 /// The organizations directory as the runtime resolves it, read from the
 /// database rather than from `paths` — the process-wide override table is not
-/// populated yet while migrations run (see the v133 header). Mirrors
+/// populated yet while migrations run (see the v134 header). Mirrors
 /// `paths::category_dir(StorageCategory::AddonData)`: the operator override when
 /// one is set to a non-blank value, otherwise the category default.
 fn current_orgs_dir(conn: &Connection) -> Result<std::path::PathBuf> {
@@ -1066,7 +1095,7 @@ fn current_orgs_dir(conn: &Connection) -> Result<std::path::PathBuf> {
 }
 
 // =============================================================================
-// v134 — provenance columns on `flow_executions` and `agent_runs`
+// v135 — provenance columns on `flow_executions` and `agent_runs`
 // =============================================================================
 //
 // Stage 1 of the event-tracking plan (`docs/DOKONCZENIE_RAG_I_ZDARZENIA.md`
@@ -1095,10 +1124,10 @@ fn current_orgs_dir(conn: &Connection) -> Result<std::path::PathBuf> {
 //     in the index. `actor_kind` is deliberately NOT the leading column: it has
 //     a handful of distinct values and would only cost a level of B-tree.
 //   * `(correlation_id, <time> DESC)` matches `idx_audit_log_correlation` from
-//     v132 and `idx_compliance_ai_events_correlation`, so the audit deep link
+//     v133 and `idx_compliance_ai_events_correlation`, so the audit deep link
 //     reads the same shape from every table it merges.
 //
-// The columns are NOT folded into `INITIAL_SCHEMA` / `AGENTS_REGISTRY`. v132 set
+// The columns are NOT folded into `INITIAL_SCHEMA` / `AGENTS_REGISTRY`. v133 set
 // the precedent both ways and the distinguishing factor is cost: it inlined the
 // widened `scope_kind` CHECK because reaching it otherwise means a full table
 // rebuild, and left `audit_log.correlation_id` as a plain migration because
@@ -3131,7 +3160,7 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
         t(
             "agent_runs",
             "actor_user_id",
-            "provenance stamp born TEXT in v134 (post-flip, never held an INTEGER id); \
+            "provenance stamp born TEXT in v135 (post-flip, never held an INTEGER id); \
              runtime row, no declared user_accounts FK — like the run principal above, \
              the record of who caused a run outlives the account, and NULL is the \
              meaningful 'service API key with no user behind it' case (§2.5)",
@@ -3139,7 +3168,7 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
         t(
             "flow_executions",
             "actor_user_id",
-            "provenance stamp born TEXT in v134 (post-flip, never held an INTEGER id); \
+            "provenance stamp born TEXT in v135 (post-flip, never held an INTEGER id); \
              runtime log row, no declared user_accounts FK — the execution history must \
              not be cascaded away with an account, and NULL is the 'service API key with \
              no user behind it' case (§2.5)",
@@ -8702,14 +8731,14 @@ mod tests {
         serde_json::from_str(&json).unwrap()
     }
 
-    /// Rebuilds `compliance_retention_policies` with the pre-v132 CHECK list and
-    /// strips everything else v132 adds, so the migration can be exercised on a
-    /// database that really is at v131.
-    fn rewind_to_v131(conn: &Connection) {
+    /// Rebuilds `compliance_retention_policies` with the pre-v133 CHECK list and
+    /// strips everything else v133 adds, so the migration can be exercised on a
+    /// database that really is at v132 (main's services migration stays applied).
+    fn rewind_to_v132(conn: &Connection) {
         conn.execute_batch("PRAGMA foreign_keys = OFF;").unwrap();
         conn.execute_batch(
             "
-            CREATE TABLE compliance_retention_policies_v131 (
+            CREATE TABLE compliance_retention_policies_v132 (
                 retention_policy_id TEXT PRIMARY KEY,
                 org_id TEXT NOT NULL REFERENCES organizations(org_id) ON DELETE CASCADE,
                 slug TEXT NOT NULL,
@@ -8729,20 +8758,20 @@ mod tests {
                 UNIQUE(org_id, slug),
                 CHECK(json_valid(name_translations))
             );
-            INSERT INTO compliance_retention_policies_v131
+            INSERT INTO compliance_retention_policies_v132
                 SELECT retention_policy_id, org_id, slug, name_translations, scope_kind, \
                        category_id, retention_days, minimum_days, action_after_retention, \
                        is_default, is_active, created_at, updated_at \
                 FROM compliance_retention_policies WHERE scope_kind <> 'events';
             DROP TABLE compliance_retention_policies;
-            ALTER TABLE compliance_retention_policies_v131 RENAME TO compliance_retention_policies;
+            ALTER TABLE compliance_retention_policies_v132 RENAME TO compliance_retention_policies;
             DROP INDEX IF EXISTS idx_audit_log_correlation;
             ALTER TABLE audit_log DROP COLUMN correlation_id;
             UPDATE roles SET permissions_json = (
                 SELECT json_group_array(value) FROM json_each(roles.permissions_json)
                 WHERE value NOT IN ('events.read', 'events.read_all')
             );
-            DELETE FROM _migrations WHERE version = 132;
+            DELETE FROM _migrations WHERE version = 133;
             ",
         )
         .unwrap();
@@ -8750,7 +8779,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v132_fresh_database_has_events_foundation() {
+    fn migration_v133_fresh_database_has_events_foundation() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
@@ -8769,7 +8798,7 @@ mod tests {
         );
 
         // A fresh install gets the final CHECK straight from INITIAL_SCHEMA, so the
-        // v132 probe finds the scope already there and skips the table rebuild.
+        // v133 probe finds the scope already there and skips the table rebuild.
         // A rebuild ends in ALTER TABLE ... RENAME, which leaves the table name
         // quoted in sqlite_master; an unquoted name proves this is still the
         // table INITIAL_SCHEMA created.
@@ -8837,12 +8866,12 @@ mod tests {
     }
 
     #[test]
-    fn migration_v132_upgrades_v131_database_without_data_loss() {
+    fn migration_v133_upgrades_v132_database_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        rewind_to_v131(&conn);
+        rewind_to_v132(&conn);
 
-        // The rewound CHECK rejects the new scope, proving we are really at v131.
+        // The rewound CHECK rejects the new scope, proving we are really at v132.
         assert!(
             conn.execute(
                 "INSERT INTO compliance_retention_policies \
@@ -8852,7 +8881,7 @@ mod tests {
                 [],
             )
             .is_err(),
-            "pre-v132 CHECK must reject 'events'"
+            "pre-v133 CHECK must reject 'events'"
         );
         assert!(!column_exists(&conn, "audit_log", "correlation_id").unwrap());
 
@@ -8878,9 +8907,9 @@ mod tests {
             )
             .unwrap();
 
-        create_events_tracking_foundation(&conn, 132, "events_tracking_foundation").unwrap();
+        create_events_tracking_foundation(&conn, 133, "events_tracking_foundation").unwrap();
 
-        // Upgrading a real v131 database DOES rebuild: the narrow CHECK is gone
+        // Upgrading a real v132 database DOES rebuild: the narrow CHECK is gone
         // and the renamed table is the one the migration created.
         let table_sql: String = conn
             .query_row(
@@ -8937,7 +8966,7 @@ mod tests {
 
         let stamped: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM _migrations WHERE version = 132",
+                "SELECT COUNT(*) FROM _migrations WHERE version = 133",
                 [],
                 |r| r.get(0),
             )
@@ -8946,9 +8975,9 @@ mod tests {
 
         // Re-running on an already-migrated database is a no-op, not a duplicate
         // column, a duplicate policy or a second permission entry.
-        conn.execute("DELETE FROM _migrations WHERE version = 132", [])
+        conn.execute("DELETE FROM _migrations WHERE version = 133", [])
             .unwrap();
-        create_events_tracking_foundation(&conn, 132, "events_tracking_foundation").unwrap();
+        create_events_tracking_foundation(&conn, 133, "events_tracking_foundation").unwrap();
         let events_policies: i64 = conn
             .query_row(
                 "SELECT COUNT(*) FROM compliance_retention_policies WHERE scope_kind = 'events'",
@@ -9135,6 +9164,62 @@ mod tests {
     /// output(stream)` pipeline, while an admin-customized flow that also
     /// contains a pii_filter is left untouched (matched only against the exact
     /// seeded literal).
+    /// Legacy rows: the wizard's container-name suggestion goes away and the
+    /// config port is rewritten from `runtime_port` (dropped when the row has no
+    /// runtime, e.g. an on-demand engine).
+    #[test]
+    fn migration_v132_rewrites_service_config_from_runtime_columns() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO services (engine_id, category, display_name, deploy_method, transport, \
+             status, runtime_port, config_json) \
+             VALUES ('vllm', 'llm', 'vLLM', 'docker', 'http_direct', 'running', 5005, ?1)",
+            rusqlite::params![
+                r#"{"port":5003,"container_name":"tentaflow-vllm-8p7iu","model_repo":"speakleash/Bielik"}"#
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO services (engine_id, category, display_name, deploy_method, transport, \
+             status, runtime_port, config_json) \
+             VALUES ('teams-bot', 'agents', 'Teams Bot', 'docker', 'http_direct', 'stopped', NULL, ?1)",
+            rusqlite::params![r#"{"port":5003,"container_name":"tentaflow-teams-bot-ck1mr"}"#],
+        )
+        .unwrap();
+
+        conn.execute_batch(SERVICES_CONFIG_RUNTIME_TRUTH).unwrap();
+
+        let running: String = conn
+            .query_row(
+                "SELECT config_json FROM services WHERE engine_id = 'vllm'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&running).unwrap();
+        assert_eq!(cfg.get("port").and_then(|v| v.as_u64()), Some(5005));
+        assert!(cfg.get("container_name").is_none(), "{running}");
+        assert_eq!(
+            cfg.get("model_repo").and_then(|v| v.as_str()),
+            Some("speakleash/Bielik")
+        );
+
+        let on_demand: String = conn
+            .query_row(
+                "SELECT config_json FROM services WHERE engine_id = 'teams-bot'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        let cfg: serde_json::Value = serde_json::from_str(&on_demand).unwrap();
+        assert!(
+            cfg.get("port").is_none() && cfg.get("container_name").is_none(),
+            "{on_demand}"
+        );
+    }
+
     #[test]
     fn migration_v113_strips_pii_from_seeded_default_chat() {
         let conn = Connection::open_in_memory().unwrap();
@@ -9453,14 +9538,14 @@ mod tests {
     }
 
     /// A database whose graph registry still points at the directory the data was
-    /// moved AWAY from — the state v133 exists to repair. `addons_data_dir` is the
+    /// moved AWAY from — the state v134 exists to repair. `addons_data_dir` is the
     /// only input `current_orgs_dir` has, so setting it pins the expected target
     /// without depending on where the test process resolved `tentaflow_home()`.
     const STALE_ORGS_ROOT: &str = "/srv/tentaflow-old/orgs";
     const CURRENT_ORGS_ROOT: &str = "/mnt/big/orgs";
 
     #[test]
-    fn migration_v133_repairs_only_stale_derived_graph_paths() {
+    fn migration_v134_repairs_only_stale_derived_graph_paths() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
         conn.execute(
@@ -9577,7 +9662,7 @@ mod tests {
     }
 
     #[test]
-    fn migration_v134_fresh_database_has_run_provenance() {
+    fn migration_v135_fresh_database_has_run_provenance() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
@@ -9630,10 +9715,10 @@ mod tests {
         assert!(foreign_key_check(&conn).unwrap().is_empty());
     }
 
-    /// Strips everything v134 adds, so the migration can be exercised on a
-    /// database that really is at v133. `DROP COLUMN` refuses an indexed column,
+    /// Strips everything v135 adds, so the migration can be exercised on a
+    /// database that really is at v134. `DROP COLUMN` refuses an indexed column,
     /// hence the indexes go first.
-    fn rewind_to_v133(conn: &Connection) {
+    fn rewind_to_v134(conn: &Connection) {
         for name in [
             "idx_flow_executions_origin",
             "idx_flow_executions_actor",
@@ -9651,20 +9736,20 @@ mod tests {
                     .unwrap();
             }
         }
-        conn.execute("DELETE FROM _migrations WHERE version = 134", [])
+        conn.execute("DELETE FROM _migrations WHERE version = 135", [])
             .unwrap();
     }
 
     #[test]
-    fn migration_v134_upgrades_v133_database_without_data_loss() {
+    fn migration_v135_upgrades_v134_database_without_data_loss() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
-        rewind_to_v133(&conn);
+        rewind_to_v134(&conn);
 
         for column in RUN_PROVENANCE_COLUMNS {
             assert!(
                 !column_exists(&conn, "flow_executions", column).unwrap(),
-                "the rewind must really land on v133"
+                "the rewind must really land on v134"
             );
         }
 
@@ -9790,7 +9875,7 @@ mod tests {
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 134, "134 must be the highest applied migration");
+        assert_eq!(head, 135, "135 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9798,6 +9883,6 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 134);
+        assert_eq!(head_again, 135);
     }
 }

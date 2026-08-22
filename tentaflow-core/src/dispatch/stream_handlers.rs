@@ -19,7 +19,8 @@ use tokio_util::sync::CancellationToken;
 use super::recorder;
 use super::resume_token::{self, ResumeError};
 use super::subscription::{
-    push_chunk, push_chunk_async, push_end, push_end_async, StreamHandlerMeta, Subscription,
+    push_chunk, push_chunk_async, push_end, push_end_async, StreamEndGuard, StreamHandlerMeta,
+    Subscription,
 };
 use super::{HandlerContext, SessionAuthKind};
 
@@ -1327,14 +1328,19 @@ fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
             }
         };
 
+        // Od tego miejsca replay moze wyslac tysiace ramek z recordera — kazde
+        // wyjscie musi domknac strumien, zeby klient nie czekal w nieskonczonosc.
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
+
         // Token ok — emit ack jako pierwszy chunk, potem replay.
-        if push_chunk(
+        if push_chunk_async(
             &sub,
             MessageBody::SubscribeResumeAck {
                 accepted: true,
                 error: None,
             },
         )
+        .await
         .is_err()
         {
             return;
@@ -1352,27 +1358,28 @@ fn subscribe_resume_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subs
                         if let Ok(body) =
                             tentaflow_protocol::cbor::decode::<MessageBody>(&frame.body_bytes)
                         {
-                            if push_chunk(&sub, body).is_err() {
+                            // Backpressure: wolny klient spowalnia replay zamiast
+                            // gubic ramki i konczyc task bez ramki terminalnej.
+                            if push_chunk_async(&sub, body).await.is_err() {
                                 return;
                             }
                         }
                     }
                 }
                 Err(e) => {
-                    let _ = push_end(
-                        &sub,
-                        Some(MessageBody::SubscribeResumeAck {
+                    guard
+                        .finish(Some(MessageBody::SubscribeResumeAck {
                             accepted: false,
                             error: Some(format!("recorder query failed: {}", e)),
-                        }),
-                    );
+                        }))
+                        .await;
                     return;
                 }
             }
         }
 
         // Koniec replay — klient teraz live.
-        let _ = push_end(&sub, None);
+        guard.finish(None).await;
     });
 }
 
@@ -1414,6 +1421,10 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
 
     let db = ctx.state.db.clone();
     tokio::spawn(async move {
+        // Kazde wyjscie z tego tasku musi domknac strumien — bez ramki terminalnej
+        // okno logow w GUI zostaje otwarte i wyglada na zawieszone.
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
+
         // Replay historycznych linii — najpierw z deployments po slug,
         // fallback do legacy `deployments` jesli rekord nie istnieje w v2.
         if replay_tail {
@@ -1430,10 +1441,13 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         progress_pct: 0,
                         ts_ms: idx as i64,
                     };
-                    if push_chunk(
+                    // Backpressure zamiast try_send: wolny klient ma spowalniac
+                    // replay, a nie ucinac strumien przy pierwszym pelnym buforze.
+                    if push_chunk_async(
                         &sub,
                         MessageBody::DeploymentBody(DeploymentPayload::StreamChunk(chunk)),
                     )
+                    .await
                     .is_err()
                     {
                         return;
@@ -1457,12 +1471,11 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         error_message: v2.error_text.unwrap_or_default(),
                         duration_ms: 0,
                     };
-                    let _ = push_end(
-                        &sub,
-                        Some(MessageBody::DeploymentBody(DeploymentPayload::StreamEnd(
-                            end,
-                        ))),
-                    );
+                    guard
+                        .finish(Some(MessageBody::DeploymentBody(
+                            DeploymentPayload::StreamEnd(end),
+                        )))
+                        .await;
                     return;
                 }
             }
@@ -1473,8 +1486,7 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
             Some(r) => r,
             None => {
                 // Kanał już zamknięty — deployment albo skończony albo nie istnieje.
-                // Rolę fallback pełni replay powyżej; tu po prostu end.
-                let _ = push_end(&sub, None);
+                // Rolę fallback pełni replay powyżej; guard domyka strumień.
                 return;
             }
         };
@@ -1491,10 +1503,11 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         progress_pct: line.progress_pct as i32,
                         ts_ms: line.ts_ms,
                     };
-                    if push_chunk(
+                    if push_chunk_async(
                         &sub,
                         MessageBody::DeploymentBody(DeploymentPayload::StreamChunk(chunk)),
                     )
+                    .await
                     .is_err()
                     {
                         return;
@@ -1516,16 +1529,14 @@ fn deployment_log_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc
                         error_message,
                         duration_ms,
                     };
-                    let _ = push_end(
-                        &sub,
-                        Some(MessageBody::DeploymentBody(DeploymentPayload::StreamEnd(
-                            end,
-                        ))),
-                    );
+                    guard
+                        .finish(Some(MessageBody::DeploymentBody(
+                            DeploymentPayload::StreamEnd(end),
+                        )))
+                        .await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = push_end(&sub, None);
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
@@ -1585,12 +1596,14 @@ fn benchmark_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
     }
 
     tokio::spawn(async move {
+        // Ramka terminalna na kazdej sciezce wyjscia — inaczej panel benchmarku
+        // zostaje w stanie "trwa" po cichej smierci tasku.
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
         let mut rx = match crate::deploy::log_bus::subscribe(&run_id) {
             Some(r) => r,
             None => {
                 // Kanał zamknięty — run już skończony (albo nie istnieje). Front
                 // rekoncyliuje stan przez RunStatus/RunResults.
-                let _ = push_end(&sub, None);
                 return;
             }
         };
@@ -1607,7 +1620,11 @@ fn benchmark_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                         progress_pct: line.progress_pct,
                         ts_ms: line.ts_ms,
                     };
-                    if push_chunk(&sub, MessageBody::BenchmarkBody(chunk)).is_err() {
+                    // Backpressure: burst logow benchmarku nie moze zabic strumienia.
+                    if push_chunk_async(&sub, MessageBody::BenchmarkBody(chunk))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1627,11 +1644,10 @@ fn benchmark_run_stream_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<
                         status: final_status,
                         error,
                     };
-                    let _ = push_end(&sub, Some(MessageBody::BenchmarkBody(end)));
+                    guard.finish(Some(MessageBody::BenchmarkBody(end))).await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = push_end(&sub, None);
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1717,12 +1733,14 @@ fn project_studio_ingest_stream_handler(
     }
 
     tokio::spawn(async move {
+        // Every exit path must close the stream, otherwise the ingest progress
+        // panel stays open with no terminal frame.
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
         let mut rx = match crate::deploy::log_bus::subscribe(&job_id) {
             Some(r) => r,
             None => {
                 // Channel closed — the job already finished. The frontend
                 // reconciles state via IngestStatusRequest.
-                let _ = push_end(&sub, None);
                 return;
             }
         };
@@ -1739,7 +1757,12 @@ fn project_studio_ingest_stream_handler(
                         progress_pct: line.progress_pct,
                         ts_ms: line.ts_ms,
                     };
-                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                    // Backpressure: a slow client must throttle ingest progress,
+                    // not silently terminate the stream.
+                    if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1759,11 +1782,10 @@ fn project_studio_ingest_stream_handler(
                         status: final_status,
                         error,
                     };
-                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    guard.finish(Some(MessageBody::ProjectStudioBody(end))).await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = push_end(&sub, None);
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -1818,12 +1840,14 @@ fn project_studio_archive_stream_handler(
     }
 
     tokio::spawn(async move {
+        // Guarantees the terminal frame on every exit path (send error, closed
+        // receiver, bus closed), so the export/import panel can never hang.
+        let guard = StreamEndGuard::new(Arc::clone(&sub));
         let mut rx = match crate::deploy::log_bus::subscribe(&job_id) {
             Some(rx) => rx,
             None => {
                 // Channel closed — the job already finished; the frontend
                 // reconciles through the status request.
-                let _ = push_end(&sub, None);
                 return;
             }
         };
@@ -1838,7 +1862,12 @@ fn project_studio_archive_stream_handler(
                         progress_pct: line.progress_pct,
                         ts_ms: line.ts_ms,
                     };
-                    if push_chunk(&sub, MessageBody::ProjectStudioBody(chunk)).is_err() {
+                    // Backpressure instead of try_send — a burst of archive
+                    // progress lines must not drop the stream.
+                    if push_chunk_async(&sub, MessageBody::ProjectStudioBody(chunk))
+                        .await
+                        .is_err()
+                    {
                         return;
                     }
                 }
@@ -1857,11 +1886,10 @@ fn project_studio_archive_stream_handler(
                             Some(error_message)
                         },
                     };
-                    let _ = push_end(&sub, Some(MessageBody::ProjectStudioBody(end)));
+                    guard.finish(Some(MessageBody::ProjectStudioBody(end))).await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
-                    let _ = push_end(&sub, None);
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -4899,6 +4927,166 @@ mod tests {
     fn subscribe_resume_handler_registered() {
         let h = find_stream_handler("SubscribeResumeRequest").unwrap();
         assert_eq!(h.required_auth, SessionAuthKind::UserSession);
+    }
+
+    /// Wolny konsument (kanal pelny) NIE moze zabic strumienia logow deployu:
+    /// wszystkie linie musza dotrzec i strumien musi zakonczyc sie ramka
+    /// terminalna. Regresja: `push_chunk` (try_send) gubil chunk i konczyl task
+    /// bez `push_end`, przez co okno logow w GUI wisialo puste.
+    #[tokio::test]
+    async fn deployment_log_stream_survives_slow_consumer() {
+        use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
+        use crate::deploy::log_bus::{self, BusMessage, LogLine};
+        use tentaflow_protocol::{
+            DeploymentLogStreamRequest, DeploymentPayload, MessageBody, SessionAuth,
+        };
+
+        let deploy_id = "slow-consumer-deploy";
+        let tx = log_bus::sender_for(deploy_id);
+
+        let reg = SubscriptionRegistry::new();
+        // Kanal plytszy niz burst — bez backpressure task zginalby na 5. linii.
+        let (sub, mut rx) = reg.create_with_capacity(1, None, 4);
+        let h = find_stream_handler("DeploymentLogStreamRequest").unwrap();
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [1u8; 16],
+                role: None,
+            },
+            correlation_id: 1,
+            connection_id: 0,
+            resume_secret: None,
+            state: super::super::state::AppState::for_test(),
+            org_context: None,
+        };
+        (h.handler_fn)(
+            MessageBody::DeploymentBody(DeploymentPayload::ReqLogStream(
+                DeploymentLogStreamRequest {
+                    deploy_id: deploy_id.to_string(),
+                    replay_tail: false,
+                },
+            )),
+            ctx,
+            sub,
+        );
+
+        // Czekaj az handler faktycznie zasubskrybuje szyne (inaczej burst ucieka).
+        while tx.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+
+        const LINES: usize = 40;
+        for i in 0..LINES {
+            tx.send(BusMessage::Line(LogLine {
+                deploy_id: deploy_id.to_string(),
+                kind: "log".to_string(),
+                line: format!("line-{i}"),
+                phase: String::new(),
+                progress_pct: 0,
+                ts_ms: i as i64,
+            }))
+            .unwrap();
+        }
+        tx.send(BusMessage::End {
+            deploy_id: deploy_id.to_string(),
+            final_status: "success".to_string(),
+            image_tag: String::new(),
+            container_name: String::new(),
+            error_message: String::new(),
+            duration_ms: 7,
+        })
+        .unwrap();
+
+        // Konsument startuje dopiero teraz — kanal subscription jest dawno pelny.
+        let mut seen = Vec::new();
+        let mut ended = false;
+        while let Some(event) = rx.recv().await {
+            match event {
+                SubscriptionEvent::Chunk(MessageBody::DeploymentBody(
+                    DeploymentPayload::StreamChunk(c),
+                )) => seen.push(c.line),
+                SubscriptionEvent::End(Some(MessageBody::DeploymentBody(
+                    DeploymentPayload::StreamEnd(e),
+                ))) => {
+                    assert_eq!(e.final_status, "success");
+                    ended = true;
+                    break;
+                }
+                other => panic!("unexpected event: {:?}", other),
+            }
+        }
+
+        assert!(ended, "stream must deliver a terminal frame");
+        assert_eq!(seen.len(), LINES, "no log line may be dropped");
+        assert_eq!(seen[0], "line-0");
+        assert_eq!(seen[LINES - 1], format!("line-{}", LINES - 1));
+        log_bus::close(deploy_id);
+    }
+
+    /// Odejscie klienta (drop receivera) konczy task bez paniki — guard probuje
+    /// wyslac ramke terminalna na zamkniety kanal i to musi byc no-op.
+    #[tokio::test]
+    async fn deployment_log_stream_ends_when_receiver_is_dropped() {
+        use super::super::subscription::SubscriptionRegistry;
+        use super::super::HandlerContext;
+        use crate::deploy::log_bus::{self, BusMessage, LogLine};
+        use tentaflow_protocol::{
+            DeploymentLogStreamRequest, DeploymentPayload, MessageBody, SessionAuth,
+        };
+
+        let deploy_id = "dropped-receiver-deploy";
+        let tx = log_bus::sender_for(deploy_id);
+
+        let reg = SubscriptionRegistry::new();
+        let (sub, rx) = reg.create_with_capacity(2, None, 4);
+        let h = find_stream_handler("DeploymentLogStreamRequest").unwrap();
+        let ctx = HandlerContext {
+            session: SessionAuth::UserSession {
+                user_id: [2u8; 16],
+                role: None,
+            },
+            correlation_id: 2,
+            connection_id: 0,
+            resume_secret: None,
+            state: super::super::state::AppState::for_test(),
+            org_context: None,
+        };
+        (h.handler_fn)(
+            MessageBody::DeploymentBody(DeploymentPayload::ReqLogStream(
+                DeploymentLogStreamRequest {
+                    deploy_id: deploy_id.to_string(),
+                    replay_tail: false,
+                },
+            )),
+            ctx,
+            sub,
+        );
+        while tx.receiver_count() == 0 {
+            tokio::task::yield_now().await;
+        }
+        drop(rx);
+
+        for i in 0..10 {
+            let _ = tx.send(BusMessage::Line(LogLine {
+                deploy_id: deploy_id.to_string(),
+                kind: "log".to_string(),
+                line: format!("line-{i}"),
+                phase: String::new(),
+                progress_pct: 0,
+                ts_ms: i,
+            }));
+        }
+
+        // Task musi sam zwolnic subskrypcje szyny — brak receivera = koniec pracy.
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            while tx.receiver_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("handler task must exit after the client is gone");
+        log_bus::close(deploy_id);
     }
 
     #[tokio::test]

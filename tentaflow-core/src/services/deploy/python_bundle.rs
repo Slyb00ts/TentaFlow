@@ -740,6 +740,7 @@ mod tests {
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,
+                lifecycle: None,
             },
             deploy: DeploySection {
                 docker: None,
@@ -756,6 +757,7 @@ mod tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         };
         let ports = Arc::new(PortAllocator::new((48_000, 48_010), HashSet::new()).unwrap());
         let mut s = PythonBundleDeploy::new(manifest, serde_json::json!({}), ports, None, None);

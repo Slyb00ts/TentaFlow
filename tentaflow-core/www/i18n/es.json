@@ -1,5 +1,7 @@
 {
   "gpu_topology": {
+    "pcie_link": "PCIe Gen{gen} x{width}",
+    "pcie_current_hint": "actualmente Gen{gen} x{width} — ahorro de energía en reposo",
     "title": "Topología de GPU",
     "pair": "Par {letter} · {link}",
     "no_pair": "sin par",
@@ -2087,6 +2089,7 @@
     "model_col_nodes": "Disponible en",
     "model_loaded": "Cargado",
     "model_unloaded": "No cargado",
+    "on_demand_hint": "listo: las instancias se crean por solicitud",
     "status": {
       "none": "Ninguno",
       "connected": "Conectado",
@@ -2097,7 +2100,9 @@
       "running": "Ejecutándose",
       "starting": "Iniciando",
       "stopped": "Detenido",
-      "error": "Error"
+      "error": "Error",
+      "on_demand": "Bajo demanda",
+      "deleting": "Eliminando…"
     },
     "deploy": {
       "title": "Desplegar nuevo servicio",
@@ -2166,7 +2171,8 @@
     "access_revoked": "Acceso revocado",
     "access_consumer_self": "— (solicitado por el addon)",
     "alias_visibility_unknown": "Desconocida",
-    "access_visibility_hint_unknown": "Visibilidad aún no cargada — abre el panel de acceso para cargar el estado real."
+    "access_visibility_hint_unknown": "Visibilidad aún no cargada — abre el panel de acceso para cargar el estado real.",
+    "deleted": "Servicio «{name}» eliminado"
   },
   "apikeys": {
     "title": "Claves API",
@@ -3648,6 +3654,9 @@
     "profile_node_btn": "Perfilar nodo",
     "profile_gpu_btn": "Perfilar esta GPU",
     "profile_view_sessions": "Sesiones",
+    "profiling_section": "Perfilado",
+    "profiling_hint": "Captura sesiones de perfilado multiorigen para este nodo y revisa los informes en la pantalla dedicada.",
+    "profile_start": "Iniciar perfilado…",
     "profile_started": "Sesión de perfilado iniciada",
     "profile_unavailable": "El perfilado no está disponible en este nodo.",
     "profile_error": "Error de perfilado",
@@ -3945,7 +3954,10 @@
     "continue_background": "Continuar en segundo plano",
     "success": "Despliegue exitoso",
     "failed": "Despliegue falló",
-    "err_generic": "Error desconocido"
+    "err_generic": "Error desconocido",
+    "status_reconnecting": "Reconectando",
+    "stream_lost": "Flujo de registros interrumpido — el despliegue continúa",
+    "stream_resumed": "Flujo de registros reanudado"
   },
   "chat": {
     "title": "Chat",

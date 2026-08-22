@@ -98,9 +98,13 @@ pub fn create_with_slug(
     config_json: &str,
 ) -> Result<i64> {
     conn.execute(
+        // `updated_at` defaults to '' in the schema, so it is stamped here as
+        // well: a row that never reached a progress update must still expose a
+        // usable timestamp to the UI and to stale-deploy diagnostics.
         "INSERT INTO deployments (
-             engine_id, deploy_method, status, deploy_id, node_id, target_service_id, config_json
-         ) VALUES (?1, ?2, 'deploying', ?3, ?4, ?5, ?6)",
+             engine_id, deploy_method, status, deploy_id, node_id, target_service_id, config_json,
+             updated_at
+         ) VALUES (?1, ?2, 'deploying', ?3, ?4, ?5, ?6, CURRENT_TIMESTAMP)",
         params![
             engine_id,
             deploy_method,

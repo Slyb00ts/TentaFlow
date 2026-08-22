@@ -43,6 +43,7 @@ fn make_engine(id: &str, category: Category) -> Engine {
         service_surfaces: None,
         input_modalities: None,
         output_modalities: None,
+        lifecycle: None,
     }
 }
 
@@ -128,12 +129,46 @@ fn make_manifest(engine: Engine, deploy: DeploySection) -> ServiceManifest {
         parameters: Vec::new(),
         docker_source_hash: String::new(),
         native_source_hash: String::new(),
+        required_assets: Vec::new(),
     }
 }
 
 // =============================================================================
 // GRUPA A: Parsowanie TOML
 // =============================================================================
+
+/// `[engine].lifecycle` steruje tym, czy deploy uruchamia runtime. Brak pola =
+/// zwykly, dlugozyjacy serwis; `on-demand` = deploy tylko przygotowuje artefakt.
+#[test]
+fn parse_engine_lifecycle() {
+    let toml_src = r#"
+[engine]
+id = "on-demand-engine"
+category = "agents"
+name = "On demand"
+description_pl = "p"
+description_en = "e"
+homepage = "https://example.com"
+license = "MIT"
+default_port = 5000
+api = "custom"
+version = "0.1.0"
+lifecycle = "on-demand"
+
+[deploy.docker]
+context_path = "agents/docker/on-demand-engine"
+platforms = ["linux"]
+transport = "direct-http"
+"#;
+    let parsed: ServiceManifest = toml::from_str(toml_src).expect("parse manifestu on-demand");
+    assert_eq!(parsed.engine.lifecycle, Some(EngineLifecycle::OnDemand));
+    assert!(parsed.engine.is_on_demand());
+
+    let default_lifecycle = toml_src.replace("lifecycle = \"on-demand\"\n", "");
+    let parsed: ServiceManifest = toml::from_str(&default_lifecycle).expect("parse bez lifecycle");
+    assert_eq!(parsed.engine.lifecycle, None);
+    assert!(!parsed.engine.is_on_demand());
+}
 
 /// A1: Minimalny TOML (engine + tylko [deploy.docker]) deserializuje sie poprawnie.
 #[test]
@@ -973,6 +1008,7 @@ mod capability_axes {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -986,6 +1022,7 @@ mod capability_axes {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 

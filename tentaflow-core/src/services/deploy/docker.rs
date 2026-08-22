@@ -30,13 +30,39 @@ use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
 #[cfg(feature = "docker")]
 use crate::services_repo::services::DeployMethod;
-use crate::services_repo::services::{self as services_repo, ServiceStatus};
+use crate::services_repo::services as services_repo;
 
 /// Fixed container-side QUIC port the sidecar binds (its baked
 /// `config.default.toml [transport].port`). The host-allocated sidecar port maps
 /// to this inside the container.
 #[cfg_attr(not(feature = "docker"), allow(dead_code))]
 const SIDECAR_QUIC_CONTAINER_PORT: u16 = 5000;
+
+/// Tag suffix carrying the docker build-context hash. A changed Dockerfile or
+/// context yields a new tag, which is what makes "build only when missing"
+/// rebuild instead of silently reusing a stale image.
+fn image_source_suffix(source_hash: &str) -> String {
+    if source_hash.is_empty() {
+        String::new()
+    } else {
+        format!("-{}", &source_hash[..source_hash.len().min(12)])
+    }
+}
+
+/// Image tag of an engine built from a plain docker context — one with no GPU
+/// build-args matrix, so the tag carries no arch/build-args fingerprint. This is
+/// the single source of truth for such a tag: callers that start containers
+/// outside the deploy (`MeetingManager` spawning a bot per meeting) must resolve
+/// the image through this function, or they would look for an image the deploy
+/// never built.
+pub fn plain_image_tag(manifest: &ServiceManifest) -> String {
+    format!(
+        "tentaflow/{}:{}{}",
+        manifest.engine.id,
+        manifest.engine.version,
+        image_source_suffix(&manifest.docker_source_hash)
+    )
+}
 
 pub struct DockerDeploy {
     manifest: ServiceManifest,
@@ -710,6 +736,54 @@ mod backend {
         Ok(())
     }
 
+    /// One `Step N/M : <instruction>` line of the classic docker builder.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(super) struct BuildStep {
+        pub index: u32,
+        pub total: u32,
+        pub instruction: String,
+    }
+
+    /// Parses `Step N/M : <instruction>`. The match is deliberately strict —
+    /// build output routinely contains the word "Step" inside a tool's own logs
+    /// (cmake, pip, pytest), and treating those as build steps would make the
+    /// progress bar jump backwards.
+    pub(super) fn parse_build_step(line: &str) -> Option<BuildStep> {
+        let rest = line.strip_prefix("Step ")?;
+        let (index, rest) = rest.split_once('/')?;
+        let index: u32 = index.parse().ok()?;
+        let (total, instruction) = match rest.split_once(':') {
+            Some((total, instruction)) => (total, instruction),
+            None => (rest, ""),
+        };
+        let total: u32 = total.trim().parse().ok()?;
+        if index == 0 || total == 0 || index > total {
+            return None;
+        }
+        Some(BuildStep {
+            index,
+            total,
+            instruction: instruction.trim().to_string(),
+        })
+    }
+
+    /// Percentage of the build reported for a finished-so-far step count.
+    pub(super) fn build_step_pct(step: &BuildStep) -> u8 {
+        let pct = (step.index as f64 / step.total as f64 * 100.0).round();
+        pct.clamp(0.0, 100.0) as u8
+    }
+
+    /// Percentage of a base-image layer pull. `None` when the daemon sent no
+    /// usable `progress_detail` — the bar must not be fed an invented value.
+    pub(super) fn pull_pct(current: Option<i64>, total: Option<i64>) -> Option<u8> {
+        match (current, total) {
+            (Some(c), Some(t)) if t > 0 && c >= 0 => {
+                Some(((c as f64 / t as f64) * 100.0).round().clamp(0.0, 100.0) as u8)
+            }
+            _ => None,
+        }
+    }
+
     /// Builds an image from `context` jako KORZENIA bundla (tar root). Dockerfile'e
     /// kopiuja sciezki wzgledem korzenia bundla (`tentaflow-protocol`, `vendor`,
     /// `tentaflow-containers/...`), wiec kontekstem jest korzen bundla, a `dockerfile_rel`
@@ -761,6 +835,27 @@ mod backend {
                 tracing::info!(target: "docker_build", "{}", msg);
             }
         };
+        let emit_phase = |phase: &str, msg: &str| {
+            if let Some(s) = log {
+                s.phase(phase, msg);
+            } else {
+                tracing::info!(target: "docker_build", "[{}] {}", phase, msg);
+            }
+        };
+        // A progress update carries the same text as the plain log line would,
+        // so a step is written to `log_tail` exactly once.
+        let emit_progress = |phase: &str, pct: u8, msg: &str| {
+            if let Some(s) = log {
+                s.progress(phase, pct, msg);
+            } else {
+                tracing::info!(target: "docker_build", "[{}] {}% {}", phase, pct, msg);
+            }
+        };
+
+        emit_phase(
+            "build-image",
+            &format!("[docker build] budowanie obrazu {}", tag),
+        );
 
         // Heartbeat: the classic builder relays a long RUN step's stdout, but
         // tools that draw progress with `\r` (pip, cmake/ninja, nvcc, git clone)
@@ -770,6 +865,7 @@ mod backend {
         let start = std::time::Instant::now();
         let mut last_output = std::time::Instant::now();
         let mut current_step = String::new();
+        let mut pulling_base = false;
         let mut ticker = tokio::time::interval(std::time::Duration::from_secs(15));
         ticker.tick().await; // first tick fires immediately — drop it
 
@@ -783,10 +879,18 @@ mod backend {
                             if let Some(line) = info.stream {
                                 let trimmed = line.trim_end();
                                 if !trimmed.is_empty() {
-                                    if trimmed.starts_with("Step ") {
-                                        current_step = trimmed.to_string();
+                                    let msg = format!("[docker build] {}", trimmed);
+                                    match parse_build_step(trimmed) {
+                                        Some(step) => {
+                                            current_step = trimmed.to_string();
+                                            emit_progress(
+                                                "build-image",
+                                                build_step_pct(&step),
+                                                &msg,
+                                            );
+                                        }
+                                        None => emit(&msg),
                                     }
-                                    emit(&format!("[docker build] {}", trimmed));
                                     emitted = true;
                                 }
                             }
@@ -796,16 +900,24 @@ mod backend {
                                 if let Some(status) = info.status {
                                     let status = status.trim();
                                     if !status.is_empty() {
+                                        if !pulling_base {
+                                            pulling_base = true;
+                                            emit_phase(
+                                                "pull-base",
+                                                "[docker build] pobieranie obrazu bazowego",
+                                            );
+                                        }
                                         let detail = info.progress_detail.and_then(|p| {
-                                            match (p.current, p.total) {
-                                                (Some(c), Some(t)) if t > 0 => {
-                                                    Some(format!(" {}/{}", c, t))
-                                                }
-                                                _ => None,
-                                            }
+                                            pull_pct(p.current, p.total).map(|pct| {
+                                                (pct, format!(" {}/{}", p.current.unwrap_or(0), p.total.unwrap_or(0)))
+                                            })
                                         });
                                         match detail {
-                                            Some(d) => emit(&format!("[docker build] {}{}", status, d)),
+                                            Some((pct, d)) => emit_progress(
+                                                "pull-base",
+                                                pct,
+                                                &format!("[docker build] {}{}", status, d),
+                                            ),
                                             None => emit(&format!("[docker build] {}", status)),
                                         }
                                         emitted = true;
@@ -832,6 +944,8 @@ mod backend {
                         } else {
                             current_step.clone()
                         };
+                        // Liveness only: a heartbeat carries no percentage, so
+                        // a silent `RUN` cannot rewind the bar to the phase start.
                         emit(&format!(
                             "[docker build] … {} — pracuje ({}s ciszy, {}s łącznie)",
                             step,
@@ -843,6 +957,13 @@ mod backend {
                 }
             }
         }
+        // Reported as progress, not a bare phase: `phase()` persists 0 %, which
+        // would drop a just-finished build back to an empty bar.
+        emit_progress(
+            "image-built",
+            100,
+            &format!("[docker build] obraz {} gotowy", tag),
+        );
         Ok(())
     }
 
@@ -1174,12 +1295,7 @@ impl DeployStrategy for DockerDeploy {
         // Bez tego plaski tag :v1 nigdy sie nie zmienial -> kazda zmiana Dockerfile
         // byla cicho ignorowana (deploy "0 ms", stary obraz reuzyty), a fix w
         // Dockerfile (np. TORCH_CUDA_ARCH_LIST) nigdy sie nie kompilowal.
-        let src = self.manifest.docker_source_hash.as_str();
-        let src_suffix = if src.is_empty() {
-            String::new()
-        } else {
-            format!("-{}", &src[..src.len().min(12)])
-        };
+        let src_suffix = image_source_suffix(&self.manifest.docker_source_hash);
         let image_tag = if arch_aware {
             // Gruby arch_tag (cuda_arch_tag) NIE rozroznia kart w tej samej rodzinie:
             // B200 (cc 10.0) i B300 (cc 10.3) mapuja sie oba na "cuda-blackwell", choc
@@ -1205,10 +1321,7 @@ impl DeployStrategy for DockerDeploy {
                 self.manifest.engine.id, self.manifest.engine.version, arch_tag, ba8, src_suffix
             )
         } else {
-            format!(
-                "tentaflow/{}:{}{}",
-                self.manifest.engine.id, self.manifest.engine.version, src_suffix
-            )
+            plain_image_tag(&self.manifest)
         };
         let build_args = if build_args.is_empty() {
             None
@@ -1268,6 +1381,55 @@ impl DeployStrategy for DockerDeploy {
                 self.log_sink.as_ref(),
             )
             .await?;
+        }
+
+        // On-demand engine: the image IS the deployable artifact. Its instances
+        // are created per request by the Core subsystem that owns them (teams-bot
+        // → one `meeting-bot-<session>` container per meeting), so there is no
+        // long-lived container to start, no port to lease and no endpoint to
+        // probe. Starting one here would wait forever on a readiness probe the
+        // engine can never answer and leave the container orphaned.
+        if self.manifest.engine.is_on_demand() {
+            // Containers left by earlier deploys of this engine (including ones
+            // stranded by a probe that never returned) must not survive a deploy
+            // that ends with nothing running.
+            super::stop_engine_orphans(&self.manifest.engine.id, &[]).await;
+            let (_param_app, request_time) = super::apply_parameters_deploy(
+                &self.manifest,
+                &self.user_config,
+                super::DeployTarget::Docker,
+            )
+            .map_err(|e| DeployError::Manifest(format!("apply parameters: {}", e)))?;
+            let config_json = super::merge_config_json(&self.user_config, &request_time)
+                .map_err(|e| DeployError::Other(format!("serialize config: {}", e)))?;
+            if let Some(s) = &self.log_sink {
+                s.progress(
+                    "ready",
+                    100,
+                    &format!(
+                        "[docker] image {} ready; engine '{}' is on-demand — no container started,                          instances are created per request",
+                        image_tag, self.manifest.engine.id
+                    ),
+                );
+            }
+            return Ok(PreparedDeploy {
+                engine_id: self.manifest.engine.id.clone(),
+                category: category_tag(&self.manifest).to_string(),
+                display_name: resolve_display_name(&self.manifest),
+                deploy_method: DeployMethod::Docker,
+                transport: self.pick_transport(),
+                runtime: RuntimeHandle {
+                    pid: None,
+                    port: None,
+                    sidecar_port: None,
+                    endpoint_url: None,
+                    container_id: None,
+                    instance_dir: None,
+                },
+                models: models_from_manifest(&self.manifest, &self.user_config),
+                config_json,
+                allocated_ports: Vec::new(),
+            });
         }
 
         // Distributed (multi-node TP): host-networking, no allocator lease. Head
@@ -1335,6 +1497,10 @@ impl DeployStrategy for DockerDeploy {
         // DGX Spark: Marlin NVFP4 GEMM (CUTLASS fp4 pada na sm_121). No-op dla
         // nie-fp4, wiec bezwarunkowo dla vllm-spark. Single-node docker.
         for (k, v) in super::spark_engine_env(&self.manifest.engine.id) {
+            env.insert(k, v);
+        }
+        // Required assets are visible at their `mount_path` inside the container.
+        for (k, v) in super::required_assets::asset_env(&self.manifest, true) {
             env.insert(k, v);
         }
         env.insert("PORT".into(), internal_port.to_string());
@@ -1519,10 +1685,13 @@ impl DeployStrategy for DockerDeploy {
 
         let container_name = format!("tentaflow-{}-{}", self.manifest.engine.id, host_http);
         if let Some(s) = &self.log_sink {
-            s.info(&format!(
-                "[docker] starting container '{}' image={} host_port={}",
-                container_name, image_tag, host_http
-            ));
+            s.phase(
+                "starting",
+                &format!(
+                    "[docker] starting container '{}' image={} host_port={}",
+                    container_name, image_tag, host_http
+                ),
+            );
         }
 
         // Mount the shared host models cache so HF / Torch downloads from a
@@ -1548,6 +1717,10 @@ impl DeployStrategy for DockerDeploy {
                 false,
             ),
         ];
+        // Engine model files live ONCE on the host (`engine_assets_dir`) and are
+        // bind-mounted read-only; the image never carries them.
+        binds.extend(super::required_assets::container_binds(&self.manifest)?);
+
         if matches!(self.manifest.engine.id.as_str(), "codex" | "claude-code") {
             let workspace = self
                 .user_config
@@ -1871,6 +2044,12 @@ impl DeployStrategy for DockerDeploy {
         // `--distributed-executor-backend ray` naturally BLOCKS until the workers
         // join, so no hard timeout (the workers are launched right after by the
         // coordinator).
+        if let Some(s) = &self.log_sink {
+            s.phase(
+                "health-check",
+                &format!("[docker] czekam na gotowosc '{}'", container_name),
+            );
+        }
         let outcome = if is_worker {
             wait_worker_alive_grace(
                 &docker,
@@ -2013,12 +2192,10 @@ impl DeployStrategy for DockerDeploy {
         service_id: i64,
         prepared: &PreparedDeploy,
     ) -> DeployResult<()> {
-        let new = build_new_service(prepared, ServiceStatus::Running);
+        let status = super::deployed_status(&self.manifest);
+        let new = build_new_service(prepared, status);
         Ok(services_repo::finish_deploy_in_tx(
-            tx,
-            service_id,
-            &new,
-            ServiceStatus::Running,
+            tx, service_id, &new, status,
         )?)
     }
 
@@ -2136,6 +2313,7 @@ mod tests {
                 service_surfaces: None,
                 input_modalities: None,
                 output_modalities: None,
+                lifecycle: None,
             },
             deploy: DeploySection {
                 docker: Some(DockerSec {
@@ -2155,6 +2333,7 @@ mod tests {
             parameters: vec![],
             docker_source_hash: String::new(),
             native_source_hash: String::new(),
+            required_assets: Vec::new(),
         }
     }
 
@@ -2244,6 +2423,69 @@ mod tests {
         assert!(docker_baseline_args("llama-cpp").is_empty());
         assert!(docker_baseline_args("trt-llm").is_empty());
         assert!(!docker_baseline_args("vllm-metal").is_empty());
+    }
+
+    /// Klasyczny builder: kazda linia `Step N/M : <instr>` przesuwa pasek.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn build_step_parses_classic_builder_lines() {
+        use super::backend::{build_step_pct, parse_build_step};
+        let first = parse_build_step("Step 1/24 : FROM nvidia/cuda:12.4.1-devel AS base")
+            .expect("step 1/24");
+        assert_eq!(first.index, 1);
+        assert_eq!(first.total, 24);
+        assert_eq!(first.instruction, "FROM nvidia/cuda:12.4.1-devel AS base");
+        assert_eq!(build_step_pct(&first), 4);
+
+        let mid = parse_build_step("Step 12/24 : RUN pip install -r requirements.txt")
+            .expect("step 12/24");
+        assert_eq!(build_step_pct(&mid), 50);
+
+        let last = parse_build_step("Step 24/24 : ENTRYPOINT [\"/entrypoint.sh\"]").expect("24/24");
+        assert_eq!(build_step_pct(&last), 100);
+
+        // Instrukcja moze zawierac dwukropki — liczy sie tylko pierwszy separator.
+        let colons = parse_build_step("Step 3/9 : LABEL a=b:c d=e:f").expect("3/9");
+        assert_eq!(colons.instruction, "LABEL a=b:c d=e:f");
+    }
+
+    /// „Step ” w tresci logu innego narzedzia NIE moze ruszac paska.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn build_step_rejects_non_step_lines() {
+        use super::backend::parse_build_step;
+        for line in [
+            "[docker build] Step 1/24 : FROM alpine",
+            " Step 1/24 : FROM alpine",
+            "cmake: Step 4/7 done",
+            "Running Step 2/3 of the pipeline",
+            "Step 1 of 24 : FROM alpine",
+            "Step abc/24 : FROM alpine",
+            "Step 1/abc : FROM alpine",
+            "Step 3/0 : RUN true",
+            "Step 0/12 : RUN true",
+            "Step 13/12 : RUN true",
+            "Step ",
+            "Successfully built 0123456789ab",
+        ] {
+            assert!(parse_build_step(line).is_none(), "nie powinno parsowac: {line}");
+        }
+    }
+
+    /// Pull warstw bazy: procent tylko gdy docker poda current/total.
+    #[cfg(feature = "docker")]
+    #[test]
+    fn pull_pct_only_from_reported_totals() {
+        use super::backend::pull_pct;
+        assert_eq!(pull_pct(Some(0), Some(1_000)), Some(0));
+        assert_eq!(pull_pct(Some(500), Some(1_000)), Some(50));
+        assert_eq!(pull_pct(Some(1_000), Some(1_000)), Some(100));
+        // Docker potrafi zaraportowac wiecej niz total (bufory) — clamp, nie panika.
+        assert_eq!(pull_pct(Some(1_200), Some(1_000)), Some(100));
+        assert_eq!(pull_pct(None, Some(1_000)), None);
+        assert_eq!(pull_pct(Some(500), None), None);
+        assert_eq!(pull_pct(Some(500), Some(0)), None);
+        assert_eq!(pull_pct(Some(-1), Some(1_000)), None);
     }
 
     /// Live docker test — gated on a running daemon. Skipped silently when

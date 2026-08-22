@@ -25,7 +25,7 @@ import { ProfilingLaunchModal } from '/js/modules/profiling-launch.js';
 import { ProfilingActiveBanner } from '/js/modules/profiling-active-banner.js';
 import { profilingCollectorsStatus } from '/js/protocol/profiling.js';
 import { ProfileRecPill } from '/js/modules/profile-rec-pill.js';
-import { computeGpuGroups, gpuPairChipHtml, gpuTopologyMatrixHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
+import { computeGpuGroups, gpuPairChipHtml, gpuTopologyMatrixHtml, pcieLinkHtml, shortPciBusId } from '/js/modules/gpu-topology-view.js';
 
 let currentNodeId = null;
 let nodeData = null;
@@ -621,10 +621,9 @@ function renderGpus(n) {
     const temp = g.temperature_c != null ? `${Math.round(g.temperature_c)}°C` : '—';
     const fan = g.fan_speed_percent != null ? `${Math.round(g.fan_speed_percent)}%` : '—';
     const profileBtn = gpuProfileButtonHtml(n, g, idx);
-    const pcie = (g.pcie_link_gen != null && g.pcie_link_width != null) ? `PCIe Gen${g.pcie_link_gen} x${g.pcie_link_width}` : null;
     const pcieLine = [
-      g.pci_bus_id ? shortPciBusId(g.pci_bus_id) : null,
-      pcie,
+      g.pci_bus_id ? escapeHtml(shortPciBusId(g.pci_bus_id)) : null,
+      pcieLinkHtml(g) || null,
     ].filter(Boolean).join(' · ');
     const vendor = [
       g.driver_version ? `driver ${g.driver_version}` : null,
@@ -638,7 +637,7 @@ function renderGpus(n) {
             <span class="gc-idx">${idx}</span>
             <span class="gc-name">${escapeHtml(g.name || '—')}</span>
             ${gpuPairChipHtml(idx, topology)}
-            ${pcieLine ? `<div class="gc-pcie">${escapeHtml(pcieLine)}</div>` : ''}
+            ${pcieLine ? `<div class="gc-pcie">${pcieLine}</div>` : ''}
             ${vendor ? `<div class="gc-vendor">${escapeHtml(vendor)}</div>` : ''}
           </div>
           <div class="gc-actions">${profileBtn}</div>

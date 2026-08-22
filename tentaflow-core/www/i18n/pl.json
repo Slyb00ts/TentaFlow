@@ -1,5 +1,7 @@
 {
   "gpu_topology": {
+    "pcie_link": "PCIe Gen{gen} x{width}",
+    "pcie_current_hint": "obecnie Gen{gen} x{width} — oszczędzanie energii w spoczynku",
     "title": "Topologia GPU",
     "pair": "Para {letter} · {link}",
     "no_pair": "bez pary",
@@ -2084,6 +2086,7 @@
     "node_local_badge": "lokalny",
     "confirm_delete_title": "Usuń serwis",
     "confirm_delete_body": "Usunąć \"{name}\" z {node}?",
+    "on_demand_hint": "gotowy — instancje tworzone per żądanie",
     "status": {
       "none": "Brak",
       "connected": "Połączony",
@@ -2099,7 +2102,8 @@
       "failed": "Awaria",
       "interrupted": "Przerwane",
       "error": "Błąd",
-      "on_demand": "Na żądanie"
+      "on_demand": "Na żądanie",
+      "deleting": "Usuwanie…"
     },
     "tooltip_pin_off": "Trzymaj zawsze w pamięci",
     "tooltip_pin_on": "Trzymany zawsze w pamięci — kliknij, aby wyłączyć",
@@ -2263,7 +2267,8 @@
     "access_granted": "Dostęp nadany",
     "access_revoked": "Dostęp cofnięty",
     "access_consumer_self": "— (zgłoszony przez addon)",
-    "access_visibility_hint_unknown": "Widoczność jeszcze nie załadowana — otwórz panel dostępu, aby pobrać rzeczywisty stan."
+    "access_visibility_hint_unknown": "Widoczność jeszcze nie załadowana — otwórz panel dostępu, aby pobrać rzeczywisty stan.",
+    "deleted": "Serwis „{name}” usunięty"
   },
   "apikeys": {
     "title": "Klucze API",
@@ -3857,6 +3862,9 @@
     "profile_node_btn": "Profiluj noda",
     "profile_gpu_btn": "Profiluj tę kartę",
     "profile_view_sessions": "Sesje",
+    "profiling_section": "Profilowanie",
+    "profiling_hint": "Nagrywaj sesje profilowania z wielu źródeł dla tego noda i przeglądaj raporty na dedykowanym ekranie.",
+    "profile_start": "Uruchom profilowanie…",
     "profile_started": "Sesja profilowania uruchomiona",
     "profile_unavailable": "Profilowanie niedostępne na tym nodzie",
     "profile_error": "Błąd profilowania",
@@ -4874,7 +4882,10 @@
     "continue_background": "Kontynuuj w tle",
     "success": "Deploy zakończony sukcesem",
     "failed": "Deploy nieudany",
-    "err_generic": "Nieznany błąd"
+    "err_generic": "Nieznany błąd",
+    "status_reconnecting": "Wznawianie podglądu",
+    "stream_lost": "Podgląd logów przerwany — deploy trwa dalej",
+    "stream_resumed": "Wznowiono podgląd logów"
   },
   "chat": {
     "title": "Chat",

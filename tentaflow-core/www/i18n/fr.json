@@ -1,5 +1,7 @@
 {
   "gpu_topology": {
+    "pcie_link": "PCIe Gen{gen} x{width}",
+    "pcie_current_hint": "actuellement Gen{gen} x{width} — économie d'énergie au repos",
     "title": "Topologie GPU",
     "pair": "Paire {letter} · {link}",
     "no_pair": "sans paire",
@@ -2087,6 +2089,7 @@
     "model_col_nodes": "Disponible sur",
     "model_loaded": "Chargé",
     "model_unloaded": "Non chargé",
+    "on_demand_hint": "prêt — les instances sont créées par requête",
     "status": {
       "none": "Aucun",
       "connected": "Connecté",
@@ -2097,7 +2100,9 @@
       "running": "En cours",
       "starting": "Démarrage",
       "stopped": "Arrêté",
-      "error": "Erreur"
+      "error": "Erreur",
+      "on_demand": "À la demande",
+      "deleting": "Suppression…"
     },
     "deploy": {
       "title": "Déployer un nouveau service",
@@ -2166,7 +2171,8 @@
     "access_revoked": "Accès révoqué",
     "access_consumer_self": "— (demandé par l'addon)",
     "alias_visibility_unknown": "Inconnue",
-    "access_visibility_hint_unknown": "Visibilité pas encore chargée — ouvrez le panneau d’accès pour charger l’état réel."
+    "access_visibility_hint_unknown": "Visibilité pas encore chargée — ouvrez le panneau d’accès pour charger l’état réel.",
+    "deleted": "Service « {name} » supprimé"
   },
   "apikeys": {
     "title": "Clés API",
@@ -3648,6 +3654,9 @@
     "profile_node_btn": "Profiler le nœud",
     "profile_gpu_btn": "Profiler ce GPU",
     "profile_view_sessions": "Sessions",
+    "profiling_section": "Profilage",
+    "profiling_hint": "Capturez des sessions de profilage multi-sources pour ce nœud et consultez les rapports sur l'écran dédié.",
+    "profile_start": "Démarrer le profilage…",
     "profile_started": "Session de profilage démarrée",
     "profile_unavailable": "Le profilage n'est pas disponible sur ce nœud.",
     "profile_error": "Erreur de profilage",
@@ -3945,7 +3954,10 @@
     "continue_background": "Continuer en arrière-plan",
     "success": "Déploiement réussi",
     "failed": "Déploiement échoué",
-    "err_generic": "Erreur inconnue"
+    "err_generic": "Erreur inconnue",
+    "status_reconnecting": "Reconnexion",
+    "stream_lost": "Flux de journaux interrompu — le déploiement continue",
+    "stream_resumed": "Flux de journaux repris"
   },
   "chat": {
     "title": "Chat",

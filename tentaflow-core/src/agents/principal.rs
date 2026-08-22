@@ -73,7 +73,7 @@ impl AgentPrincipal {
     /// `actor_user_id` come back exactly as they were written, so an API key
     /// stays an API key. `None` when `origin` or `actor_kind` is not a spelling
     /// [`FlowOrigin::as_str`] / [`ActorKind::as_str`] produces — an unreadable
-    /// stamp must REFUSE — including a run written BEFORE migration v134, whose
+    /// stamp must REFUSE — including a run written BEFORE migration v135, whose
     /// columns are NULL. Falling back to "a user named by `user_id`" is how a
     /// service key gets reported as a person, and a fallback chain here would be
     /// invisible at exactly the moment it lies.
@@ -352,7 +352,7 @@ mod tests {
         assert!(unattended.user_id().is_none());
     }
 
-    /// A run written BEFORE migration v134 has NULL provenance columns. That is
+    /// A run written BEFORE migration v135 has NULL provenance columns. That is
     /// the honest "predates the stamp", and it must refuse the same way a
     /// corrupt value does — a continuation of such a run would otherwise be
     /// launched under a principal nobody ever observed.

@@ -15,7 +15,7 @@
 //                        and `actor_id` would carry the key's uid instead.
 //   neither           -> PolicyDenied.
 //
-// Two permissions rather than a role-name check because migration v132 created
+// Two permissions rather than a role-name check because migration v133 created
 // them for exactly this split (`db/migrations.rs`), and a role string would put
 // the policy in a place no grant can change.
 //

@@ -16,6 +16,7 @@ import { Router } from '/js/router.js';
 import { patchInner } from '/js/lib/patch.js';
 import { createRefresher } from '/js/lib/refresh.js';
 import { TfWindow } from '/js/components/tf-window.js';
+import '/js/components/tf-spinner.js';
 import * as ManifestStore from '/js/modules/catalog/manifest-store.js';
 import { openDeployProgressModal } from '/js/modules/catalog/deploy-progress-modal.js';
 import * as Access from '/js/modules/services/access.js';
@@ -55,6 +56,15 @@ let currentUserIsAdmin = false;
 // Per-model visibility map keyed by modelId — merged from modelVisibilityListRequest
 // over the modelListRequest catalog (default 'restricted' when a model is absent).
 let modelVisibility = new Map();
+// Rows with a delete in flight, keyed `${nodeId}:${serviceId}`. Container/native
+// teardown takes seconds and the row survives every list refresh until the
+// backend drops it, so without this the click leaves no trace at all.
+let deletingServices = new Set();
+// Live deployment telemetry keyed by deployId: { unsubscribe, phase, pct, ended }.
+// serviceListRequest carries the DB snapshot, which lags a running deploy by whole
+// phases, so a deploying row follows the same deploymentLogStreamRequest the
+// deploy-progress window streams.
+let deployWatchers = new Map();
 
 function sprite(id) {
   return `<svg class="icon"><use href="#i-${id}"/></svg>`;
@@ -109,6 +119,8 @@ const ServicesScreen = {
   unmount() {
     if (refresher) refresher.dispose();
     refresher = null;
+    stopDeployWatchers();
+    deletingServices = new Set();
     services = [];
     aliases = [];
     meshNodes = [];
@@ -244,6 +256,7 @@ function renderTab() {
   else if (currentTab === 'aliases') body.innerHTML = renderAliasesTab();
   else if (currentTab === 'models') body.innerHTML = renderModelsTab();
   bindTabEvents();
+  syncDeployWatchers();
 }
 
 function patchListTab() {
@@ -252,6 +265,7 @@ function patchListTab() {
   if (!body) return;
   patchInner(body, renderListTab());
   bindTabEvents();
+  syncDeployWatchers();
 }
 
 function patchAliasesTab() {
@@ -286,6 +300,7 @@ function bindTabEvents() {
   body.querySelectorAll('[data-svc-delete]').forEach((b) => {
     b.onclick = (e) => {
       e.stopPropagation();
+      if (b.hasAttribute('disabled')) return;
       stopService(
         b.dataset.svcDelete,
         b.dataset.svcName,
@@ -910,6 +925,136 @@ function nodeLabelFor(nodeId) {
   return { label, isLocal: !!node?.is_local, hostname, full: nodeId };
 }
 
+// Row identity used by the delete/pause/pin state maps and by the inline error
+// slot. node_id is part of it because the same service id can exist on two nodes.
+function serviceActionKey(s) {
+  return `${s.node_id || s.nodeId || 'unknown'}:${s.id}`;
+}
+
+// deployId of the row's deployment — the very id the deploy-progress window
+// streams, so the row can follow the same stream.
+function deployIdFor(s) {
+  return s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
+}
+
+function clampPct(value) {
+  return Math.max(0, Math.min(100, Math.round(Number(value) || 0)));
+}
+
+// ---- Live deploy progress -------------------------------------------------
+
+// Opens a stream for every deploying row and closes the ones that stopped
+// deploying. Called after each list render, so it must stay idempotent: a
+// deployId already in `deployWatchers` (even one whose subscribe() has not
+// resolved yet, even one already ended) is never subscribed twice.
+function syncDeployWatchers() {
+  if (currentTab !== 'list') {
+    stopDeployWatchers();
+    return;
+  }
+  const wanted = new Set();
+  for (const s of services) {
+    if ((s.status || '').toLowerCase() !== 'deploying') continue;
+    const deployId = deployIdFor(s);
+    if (deployId) wanted.add(String(deployId));
+  }
+  for (const deployId of [...deployWatchers.keys()]) {
+    if (!wanted.has(deployId)) closeDeployWatcher(deployId);
+  }
+  for (const deployId of wanted) {
+    if (!deployWatchers.has(deployId)) startDeployWatcher(deployId);
+  }
+}
+
+function startDeployWatcher(deployId) {
+  // The entry claims the slot BEFORE the await, otherwise a list refresh landing
+  // mid-subscribe would open a second stream for the same deployment.
+  const entry = { unsubscribe: null, phase: '', pct: null, ended: false, closed: false };
+  deployWatchers.set(deployId, entry);
+  ApiBinary.subscribe(
+    'deploymentLogStreamRequest',
+    { deployId, replayTail: false },
+    {
+      onChunk: (chunk) => onDeployChunk(deployId, chunk),
+      onEnd: () => endDeployWatcher(deployId),
+      onError: () => endDeployWatcher(deployId),
+    },
+  ).then((unsubscribe) => {
+    if (entry.closed) {
+      try { unsubscribe(); } catch (_) { /* stream already gone */ }
+      return;
+    }
+    entry.unsubscribe = unsubscribe;
+  }).catch(() => {
+    // A stream that could not be opened must not poison the slot — the next
+    // render retries, and until then the row falls back to the list snapshot.
+    if (deployWatchers.get(deployId) === entry) deployWatchers.delete(deployId);
+  });
+}
+
+function onDeployChunk(deployId, chunk) {
+  const entry = deployWatchers.get(deployId);
+  if (!entry || entry.closed) return;
+  if (!chunk || chunk.variant !== 'DeploymentStreamChunk') return;
+  if (chunk.deployId && String(chunk.deployId) !== String(deployId)) return;
+  // Only phase/progress frames carry row-level state; plain log lines belong to
+  // the deploy window, not to a table cell.
+  if (chunk.kind !== 'phase' && chunk.kind !== 'progress') return;
+  const pct = Number(chunk.progressPct);
+  if (Number.isFinite(pct)) entry.pct = clampPct(pct);
+  const phase = chunk.phase || (chunk.kind === 'phase' ? chunk.line : '');
+  if (phase) entry.phase = String(phase);
+  paintDeployProgress(deployId, entry);
+}
+
+// Writes the two live cells in place. A docker build emits phases in bursts, so
+// re-rendering the whole table per chunk would be pure waste; the next list
+// patch rebuilds the row from the same entry anyway.
+function paintDeployProgress(deployId, entry) {
+  const body = byId('svc-tab-body');
+  if (!body) return;
+  const selector = CSS.escape(String(deployId));
+  body.querySelectorAll(`[data-svc-deploy-phase="${selector}"]`).forEach((el) => {
+    el.textContent = entry.phase;
+  });
+  body.querySelectorAll(`[data-svc-deploy-pct="${selector}"]`).forEach((el) => {
+    el.textContent = `${clampPct(entry.pct ?? 0)}%`;
+  });
+}
+
+// Terminal frame: drop the socket but KEEP the entry, so the next sync does not
+// immediately resubscribe to a finished deployment (the list still says
+// "deploying" until the backend writes the final status). The entry dies with
+// the row's deploying status.
+function endDeployWatcher(deployId) {
+  const entry = deployWatchers.get(deployId);
+  if (!entry || entry.ended) return;
+  entry.ended = true;
+  dropDeploySubscription(entry);
+  refreshServiceList().catch(() => { /* the periodic refresher retries */ });
+}
+
+function closeDeployWatcher(deployId) {
+  const entry = deployWatchers.get(deployId);
+  deployWatchers.delete(deployId);
+  if (entry) dropDeploySubscription(entry);
+}
+
+function dropDeploySubscription(entry) {
+  entry.closed = true;
+  if (!entry.unsubscribe) return;
+  try {
+    entry.unsubscribe();
+  } catch (_) {
+    /* stream already closed server-side */
+  }
+  entry.unsubscribe = null;
+}
+
+function stopDeployWatchers() {
+  for (const deployId of [...deployWatchers.keys()]) closeDeployWatcher(deployId);
+}
+
 // Maps services.status × paused flag onto the tf-chip palette. The paused flag
 // wins over the underlying status because a paused row has no live process.
 function mapStatusToChip(status, paused) {
@@ -947,24 +1092,54 @@ function categoryChipClass(category) {
 
 function renderRow(s) {
   const paused = !!s.paused;
-  const statusInfo = mapStatusToChip(s.status, paused);
+  // Wiersz z trwajacym usuwaniem: status i akcje sa zastapione stanem
+  // "usuwanie", zeby uzytkownik nie klikal drugi raz w cos, co juz leci.
+  const deleting = deletingServices.has(serviceActionKey(s));
+  // Silnik on-demand nie ma dlugozyjacego procesu — brak procesu jest jego
+  // stanem docelowym. Bez tego wiersz wyglada identycznie jak serwis, ktory
+  // padl (szary chip "Zatrzymany" + przycisk "Uruchom" sugerujacy naprawe).
+  const onDemandIdle = ManifestStore.isOnDemand(ManifestStore.byId(s.engine_id || s.engineId))
+    && !paused
+    && (s.status || '').toLowerCase() === 'stopped';
+  const statusInfo = deleting
+    ? { variant: 'warn', dot: true, key: 'deleting' }
+    : (onDemandIdle
+      ? { variant: 'info', dot: false, key: 'on_demand' }
+      : mapStatusToChip(s.status, paused));
+  // Podawany do tf-chip przez atrybut `label`: morphdom nie schodzi w dzieci
+  // komponentu tf-*, wiec tekst wpisany miedzy tagi zamarzlby na wartosci, z
+  // ktora chip zostal zbudowany, i wiersz nigdy nie zmienilby statusu.
   const statusLabel = I18n.t(`services.status.${statusInfo.key}`)
     || s.status || '—';
   // progress_message niesie krotki opis fazy startu od supervisor
   // heartbeat (np. "warming up — alive 30s, waiting for /v1/models").
   // Renderujemy pod chipem statusu, zeby user widzial PROGRES startu
   // serwisu a nie tylko "Starting" przez minuty.
-  const progressMsg = typeof s.progress_message === 'string' && s.progress_message.length > 0
-    ? s.progress_message
-    : '';
+  const progressMsg = onDemandIdle
+    ? I18n.t('services.on_demand_hint')
+    : (statusInfo.key === 'deploying'
+      ? ''
+      : (typeof s.progress_message === 'string' && s.progress_message.length > 0
+        ? s.progress_message
+        : ''));
   const progressBadge = progressMsg
     ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(progressMsg)}</div>`
     : '';
-  const deployPct = Number.isFinite(s.deployment_progress_pct)
+  // Faza i procent wdrozenia: wartosc ze strumienia wygrywa nad snapshotem z
+  // listy, bo lista przychodzi co 5 s i potrafi byc o cala faze do tylu.
+  const watchedDeployId = statusInfo.key === 'deploying' ? deployIdFor(s) : '';
+  const liveDeploy = watchedDeployId ? deployWatchers.get(watchedDeployId) : null;
+  const snapshotPct = Number.isFinite(s.deployment_progress_pct)
     ? s.deployment_progress_pct
     : (Number.isFinite(s.deploymentProgressPct) ? s.deploymentProgressPct : 0);
+  const deployPct = Number.isFinite(liveDeploy?.pct) ? liveDeploy.pct : snapshotPct;
+  const deployPhase = liveDeploy?.phase
+    || (typeof s.progress_message === 'string' ? s.progress_message : '');
   const deployProgress = statusInfo.key === 'deploying'
-    ? `<div style="font-size:11px;color:var(--text-3);margin-top:4px;line-height:1.3;">${escapeHtml(String(Math.max(0, Math.min(100, deployPct))))}%</div>`
+    ? `<div class="svc-deploy-progress">
+        <span class="svc-deploy-phase" data-svc-deploy-phase="${escapeAttr(watchedDeployId)}">${escapeHtml(deployPhase)}</span>
+        <span class="svc-deploy-pct" data-svc-deploy-pct="${escapeAttr(watchedDeployId)}">${escapeHtml(String(clampPct(deployPct)))}%</span>
+      </div>`
     : '';
   const models = Array.isArray(s.models) ? s.models : [];
   const modelChips = models.length === 0
@@ -1004,6 +1179,8 @@ function renderRow(s) {
   const isStarting = ['starting', 'deploying'].includes((s.status || '').toLowerCase());
   const isRunning = ['running', 'degraded'].includes((s.status || '').toLowerCase()) && !paused;
   const showPlay = paused || !isRunning;
+  // Reczny start silnika on-demand nie ma sensu — nie ma czego uruchamiac.
+  const hidePausePlay = onDemandIdle;
   const ppIcon = isStarting ? 'rotate' : (showPlay ? 'play' : 'pause');
   const ppAction = showPlay ? 'start' : 'pause';
   const ppTooltip = showPlay
@@ -1020,7 +1197,7 @@ function renderRow(s) {
   const svcNodeId = escapeAttr(serviceNodeId);
   const svcNodeLabel = escapeAttr(nodeInfo.label);
   const rowKey = escapeAttr(`svc-${serviceNodeId || 'unknown'}-${s.id}`);
-  const svcActionKey = escapeAttr(`${serviceNodeId || 'unknown'}:${s.id}`);
+  const svcActionKey = escapeAttr(serviceActionKey(s));
   // Badge "Aktualizacja dostepna" jest klikalny — otwiera kreator wdrozenia
   // (pre-targetowany na ten silnik/wezel) zeby wdrozyc serwis ponownie ze
   // zaktualizowanego zrodla bundla (handler [data-svc-redeploy]).
@@ -1033,7 +1210,7 @@ function renderRow(s) {
           data-svc-node="${svcNodeId}"
           title="${escapeAttr(I18n.t('services.update_available_tooltip'))}">${escapeHtml(I18n.t('services.update_available'))}</tf-chip>`
     : '';
-  const deployId = s.active_deploy_id || s.activeDeployId || s.last_deploy_id || s.lastDeployId || '';
+  const deployId = deployIdFor(s);
   const deployAction = deployId
     ? `<tf-button variant="ghost" size="sm" icon="terminal"
           data-svc-deploy-log="${escapeAttr(deployId)}"
@@ -1061,7 +1238,7 @@ function renderRow(s) {
         : `<span class="mono">${escapeHtml(gpuSel)}</span>`);
 
   return `
-    <tr data-key="${rowKey}">
+    <tr data-key="${rowKey}"${deleting ? ' class="svc-row-deleting"' : ''}>
       <td data-label="${escapeAttr(I18n.t('services.col_node'))}">${nodeCell}</td>
       ${SHOW_ENGINE_COL ? `<td data-label="${escapeAttr(I18n.t('services.col_engine'))}">
         <strong style="color: var(--accent-2);">${escapeHtml(engineLabel)}</strong>
@@ -1074,7 +1251,7 @@ function renderRow(s) {
       </td>
       <td data-label="${escapeAttr(I18n.t('services.col_status'))}">
         <div style="display:flex;align-items:center;gap:6px;flex-wrap:wrap;">
-          <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''}>${escapeHtml(statusLabel)}</tf-chip>
+          <tf-chip status="${statusInfo.variant}"${statusInfo.dot ? ' dot' : ''} label="${escapeAttr(statusLabel)}"></tf-chip>
           ${updateBadge}
         </div>
         ${progressBadge}
@@ -1086,14 +1263,17 @@ function renderRow(s) {
       <td data-label="${escapeAttr(I18n.t('services.col_gpu'))}">${gpuCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_restart'))}">${restartCell}</td>
       <td data-label="${escapeAttr(I18n.t('services.col_actions'))}" style="text-align:right;white-space:nowrap;">
+        ${deleting ? `<tf-spinner size="sm" tone="warning"
+          aria-label="${escapeAttr(I18n.t('services.status.deleting'))}"
+          title="${escapeAttr(I18n.t('services.status.deleting'))}"></tf-spinner>` : `
         ${codingAgentActions}
-        <tf-button variant="ghost" size="sm" icon="${ppIcon}"
+        ${hidePausePlay ? '' : `<tf-button variant="ghost" size="sm" icon="${ppIcon}"
           data-svc-pause-play="${svcId}"
           data-svc-action="${ppAction}"
           data-svc-node="${svcNodeId}"
           data-svc-key="${svcActionKey}"
           ${isStarting ? 'disabled' : ''}
-          title="${escapeAttr(ppTooltip)}"></tf-button>
+          title="${escapeAttr(ppTooltip)}"></tf-button>`}
         <tf-button variant="ghost" size="sm" icon="pin"
           class="svc-pin-toggle${pinned ? ' pinned' : ''}"
           data-svc-pin-toggle="${svcId}"
@@ -1113,7 +1293,7 @@ function renderRow(s) {
           data-svc-node="${svcNodeId}"
           data-svc-node-label="${svcNodeLabel}"
           data-svc-cluster-dep="${escapeAttr(s.cluster_deployment_id || s.clusterDeploymentId || '')}"
-          title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>
+          title="${escapeAttr(I18n.t('services.btn_delete'))}"></tf-button>`}
         <span class="svc-row-error" data-svc-error="${svcActionKey}" hidden></span>
       </td>
     </tr>
@@ -1991,6 +2171,13 @@ async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
     danger: true,
   });
   if (!ok) return;
+  // Teardown kontenera trwa sekundy, a wiersz zostaje w tabeli do momentu, az
+  // backend go skasuje. Znacznik przelacza wiersz w stan "usuwanie" i blokuje
+  // ponowne klikniecie az do rozstrzygniecia.
+  const rowKey = `${nodeId || 'unknown'}:${id}`;
+  if (deletingServices.has(rowKey)) return;
+  deletingServices.add(rowKey);
+  patchListTab();
   try {
     if (isCluster) {
       // Pusty clusterId — backend wyprowadza go z rekordu deploymentu; teardown
@@ -2002,22 +2189,29 @@ async function stopService(id, name, nodeId, nodeLabel, clusterDep) {
       if (resp && resp.ok === false) {
         throw new Error(resp.message || 'stop klastra nieudany');
       }
-      await refreshServiceList();
-      return;
+    } else {
+      // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
+      // wipes attached model_registry rows. When nodeId points at a remote peer
+      // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.
+      const resp = await ApiBinary.action('serviceDeleteRequest', {
+        serviceId: id,
+        nodeId: nodeId || undefined,
+      });
+      if (resp && resp.success === false) {
+        throw new Error(resp.error || 'Unknown error');
+      }
     }
-    // ServiceDeleteRequest stops the runtime AND removes the row; FK cascade
-    // wipes attached model_registry rows. When nodeId points at a remote peer
-    // the dispatcher forwards the call as `MeshCommandType::ServiceDeleteRemote`.
-    const resp = await ApiBinary.action('serviceDeleteRequest', {
-      serviceId: id,
-      nodeId: nodeId || undefined,
-    });
-    if (resp && resp.success === false) {
-      throw new Error(resp.error || 'Unknown error');
-    }
-    await refreshServiceList();
+    toast(I18n.t('services.deleted', { name: name || id }), 'success');
+    window.dispatchEvent(new CustomEvent('tf:nav-counts-stale'));
   } catch (err) {
-    showRowError(`${nodeId || 'unknown'}:${id}`, err.message);
+    const message = err?.message || String(err);
+    showRowError(rowKey, message);
+    toast(I18n.t('services.delete_error', { error: message }), 'error');
+  } finally {
+    // Zdejmujemy znacznik PRZED odswiezeniem: jesli usuwanie sie nie udalo,
+    // wiersz wraca do poprzedniego stanu, a jesli sie udalo — i tak znika.
+    deletingServices.delete(rowKey);
+    await refreshServiceList();
   }
 }
 

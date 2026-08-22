@@ -19,7 +19,27 @@ use tracing::{info, warn};
 
 use super::port_pool::AllocatedPorts;
 
-pub const IMAGE_TAG: &str = "tentaflow/teams-bot:latest";
+/// Tag obrazu bota — DOKLADNIE ten, ktory buduje deploy silnika `teams-bot`
+/// (`services::deploy::docker`). Tag zawiera wersje z manifestu i hash kontekstu
+/// budowania, wiec nie mozna go zapisac na sztywno: zmiana Dockerfile'a daje nowy
+/// tag i staly `:latest` wskazywalby na obraz, ktorego deploy nigdy nie zbudowal.
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+fn image_tag() -> Result<String> {
+    let manifest = bot_manifest()?;
+    let docker = manifest.deploy.docker.as_ref().ok_or_else(|| {
+        anyhow::anyhow!("manifest 'teams-bot' nie ma sekcji [deploy.docker]")
+    })?;
+    // Silnik z build-argsami dostaje tag per architektura GPU; odtworzenie go tutaj
+    // wymagaloby powtorzenia calego wyboru build-argsow z deployu. Bot ich nie ma —
+    // gdyby doszly, lepiej zatrzymac sie z czytelnym bledem niz szukac zlego tagu.
+    if !docker.default_build_args.is_empty() || !docker.arch_variants.is_empty() {
+        anyhow::bail!(
+            "manifest 'teams-bot' deklaruje docker build-args — tag obrazu jest wtedy \
+             zalezny od architektury GPU i musi byc pobrany z deployu, nie odtworzony"
+        );
+    }
+    Ok(crate::services::deploy::docker::plain_image_tag(manifest))
+}
 
 /// Parametry startu kontenera Meeting Bot dla pojedynczej sesji.
 #[derive(Debug, Clone)]
@@ -59,11 +79,12 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
     // Upewnij sie ze obraz istnieje — jesli nie, zwracamy wyraźny błąd żeby
     // frontend pokazał "addon nie wdrozony". Inaczej bollard sam spróbuje pullować
     // z Docker Hub i wisimy przez minute.
-    let image_exists = docker.inspect_image(IMAGE_TAG).await.is_ok();
+    let image_tag = image_tag()?;
+    let image_exists = docker.inspect_image(&image_tag).await.is_ok();
     if !image_exists {
         anyhow::bail!(
             "Obraz {} nie istnieje — zbuduj kontener teams-bot z Services (agents/teams-bot)",
-            IMAGE_TAG
+            image_tag
         );
     }
 
@@ -106,15 +127,23 @@ pub async fn spawn(req: &SpawnRequest) -> Result<SpawnOutcome> {
     let exposed_ports: Vec<String> = vec!["5000/udp".into(), "5900/tcp".into(), "6080/tcp".into()];
 
     let env = build_env(req);
+    // Model Silero VAD nie jest w obrazie — deploy pobral go raz do
+    // `<models>/engine-assets/teams-bot/`, kontener widzi go read-only pod
+    // `mount_path` z manifestu.
+    let binds: Vec<String> = asset_binds()?
+        .into_iter()
+        .map(|(host, target, _)| format!("{}:{}:ro", host.display(), target))
+        .collect();
     let host_config = HostConfig {
         port_bindings: Some(port_bindings),
+        binds: if binds.is_empty() { None } else { Some(binds) },
         // Publish=all=false; używamy eksplicitnych bindings.
         auto_remove: Some(false),
         ..Default::default()
     };
 
     let config = Config {
-        image: Some(IMAGE_TAG.to_string()),
+        image: Some(image_tag.clone()),
         env: Some(env),
         exposed_ports: Some(exposed_ports),
         host_config: Some(host_config),
@@ -249,9 +278,26 @@ pub async fn cleanup_stale_containers() -> Result<()> {
     Ok(())
 }
 
+/// Manifest of the bot engine — source of truth for its required assets.
+pub(super) fn bot_manifest() -> Result<&'static crate::services::manifest::ServiceManifest> {
+    crate::services::manifest::registry()
+        .by_id("teams-bot")
+        .ok_or_else(|| anyhow::anyhow!("manifest 'teams-bot' nie istnieje w rejestrze silnikow"))
+}
+
+/// Read-only bind mounts for the bot's required assets. Fails loudly when a
+/// file is missing — a bot started without the VAD model would silently fall
+/// back to RMS detection.
+#[cfg_attr(not(feature = "docker"), allow(dead_code))]
+fn asset_binds() -> Result<Vec<(std::path::PathBuf, String, bool)>> {
+    let manifest = bot_manifest()?;
+    crate::services::deploy::required_assets::container_binds(manifest)
+        .map_err(|e| anyhow::anyhow!("Meeting Bot: {}", e))
+}
+
 #[cfg_attr(not(feature = "docker"), allow(dead_code))]
 pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
-    vec![
+    let mut env = vec![
         format!("MEETING_URL={}", req.meeting_url),
         // Klucz sesji — bot kopiuje do każdego transkrypt eventu, router zapisuje
         // pod tym kluczem do meeting_sessions (get_or_create znajdzie naszą sesję).
@@ -268,7 +314,14 @@ pub(super) fn build_env(req: &SpawnRequest) -> Vec<String> {
             "RESPOND_ENABLED={}",
             if req.respond_enabled { "true" } else { "false" }
         ),
-    ]
+    ];
+    // Sciezki modeli w kontenerze (VAD_MODEL_PATH) — z manifestu, nie zgadywane.
+    if let Ok(manifest) = bot_manifest() {
+        for (key, value) in crate::services::deploy::required_assets::asset_env(manifest, true) {
+            env.push(format!("{}={}", key, value));
+        }
+    }
+    env
 }
 
 #[cfg(test)]
@@ -291,6 +344,26 @@ mod tests {
             summarization_alias: sum.to_string(),
             respond_enabled: false,
         }
+    }
+
+    /// Obraz startowany per spotkanie musi byc TYM, ktory buduje deploy silnika:
+    /// wersja z manifestu + hash kontekstu budowania, nigdy staly `:latest`.
+    #[test]
+    fn image_tag_matches_engine_deploy_tag() {
+        let manifest = bot_manifest().expect("manifest teams-bot jest wbudowany");
+        let tag = image_tag().expect("tag obrazu");
+        assert_eq!(
+            tag,
+            crate::services::deploy::docker::plain_image_tag(manifest)
+        );
+        assert!(
+            tag.starts_with(&format!(
+                "tentaflow/teams-bot:{}",
+                manifest.engine.version
+            )),
+            "nieoczekiwany tag: {tag}"
+        );
+        assert!(!tag.ends_with(":latest"), "tag nie moze byc ruchomy: {tag}");
     }
 
     #[test]

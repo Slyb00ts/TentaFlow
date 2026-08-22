@@ -606,6 +606,12 @@ pub fn increment_restart(conn: &Connection, id: i64) -> Result<i64> {
 }
 
 /// Updates runtime metadata (pid, ports, endpoint) once the engine is up.
+///
+/// `config_json.port` is rewritten in the SAME statement: it mirrors the granted
+/// host port (the redeploy path re-reads the stored config, and a compose stack
+/// derives its project name from that port), so letting the column move without
+/// it is how the row starts lying about where the service listens. No port ->
+/// the key is dropped, never left pointing at a dead runtime.
 pub fn update_runtime(
     conn: &Connection,
     id: i64,
@@ -616,7 +622,11 @@ pub fn update_runtime(
 ) -> Result<()> {
     let n = conn.execute(
         "UPDATE services SET runtime_pid = ?2, runtime_port = ?3, sidecar_quic_port = ?4, \
-         endpoint_url = ?5, updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
+         endpoint_url = ?5, config_json = CASE \
+             WHEN NOT json_valid(config_json) THEN config_json \
+             WHEN ?3 IS NULL THEN json_remove(config_json, '$.port') \
+             ELSE json_set(config_json, '$.port', ?3) END, \
+         updated_at = CURRENT_TIMESTAMP WHERE id = ?1",
         params![
             id,
             pid,
@@ -717,6 +727,9 @@ pub fn mark_failed_clear_runtime(conn: &Connection, id: i64, err_msg: &str) -> R
                 runtime_port = NULL,
                 sidecar_quic_port = NULL,
                 endpoint_url = NULL,
+                config_json = CASE WHEN json_valid(config_json)
+                                   THEN json_remove(config_json, '$.port')
+                                   ELSE config_json END,
                 health_last_err = ?3,
                 progress_message = ?3,
                 updated_at = CURRENT_TIMESTAMP
@@ -843,6 +856,61 @@ mod tests {
         update_status(&conn, id, ServiceStatus::Running).unwrap();
         let row = get(&conn, id).unwrap().unwrap();
         assert_eq!(row.status, ServiceStatus::Running);
+    }
+
+    /// A respawn that lands on a different port must move `config_json.port`
+    /// with `runtime_port` — the redeploy path re-reads that config, so a stale
+    /// value there sends the next deploy at the wrong port.
+    #[test]
+    fn update_runtime_keeps_config_port_in_step() {
+        let conn = open_test_db();
+        let mut new = sample_new("vllm");
+        new.config_json = r#"{"port":5003,"model_repo":"speakleash/Bielik"}"#.to_string();
+        let id = insert(&conn, &new).unwrap();
+
+        update_runtime(
+            &conn,
+            id,
+            None,
+            Some(5005),
+            None,
+            Some("http://127.0.0.1:5005"),
+        )
+        .unwrap();
+        let row = get(&conn, id).unwrap().unwrap();
+        assert_eq!(row.runtime_port, Some(5005));
+        let cfg: serde_json::Value = serde_json::from_str(&row.config_json).unwrap();
+        assert_eq!(cfg.get("port").and_then(|v| v.as_u64()), Some(5005));
+        assert_eq!(
+            cfg.get("model_repo").and_then(|v| v.as_str()),
+            Some("speakleash/Bielik")
+        );
+
+        update_runtime(&conn, id, None, None, None, None).unwrap();
+        let row = get(&conn, id).unwrap().unwrap();
+        assert_eq!(row.runtime_port, None);
+        let cfg: serde_json::Value = serde_json::from_str(&row.config_json).unwrap();
+        assert!(
+            cfg.get("port").is_none(),
+            "a runtime without a port must not leave one in the config: {}",
+            row.config_json
+        );
+    }
+
+    #[test]
+    fn mark_failed_clear_runtime_drops_config_port() {
+        let conn = open_test_db();
+        let mut new = sample_new("vllm");
+        new.config_json = r#"{"port":5005}"#.to_string();
+        let id = insert(&conn, &new).unwrap();
+        update_runtime(&conn, id, None, Some(5005), None, None).unwrap();
+
+        mark_failed_clear_runtime(&conn, id, "redeploy stop failed").unwrap();
+        let row = get(&conn, id).unwrap().unwrap();
+        assert_eq!(row.status, ServiceStatus::Failed);
+        assert_eq!(row.runtime_port, None);
+        let cfg: serde_json::Value = serde_json::from_str(&row.config_json).unwrap();
+        assert!(cfg.get("port").is_none(), "{}", row.config_json);
     }
 
     #[test]
