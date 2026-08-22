@@ -2711,6 +2711,18 @@ function shouldSkipGpuStep() {
   return false;
 }
 
+// GPU mode actually sent to the backend. An engine whose manifest declares
+// `gpu_supported = false` never shows the GPU step, so `selection.gpuSelectMode`
+// keeps its 'all' default — emitting that hands a CPU-only container every card
+// on the host. Such an engine is pinned to an explicit 'none' rather than
+// omitting the key: 'none' is already part of the deploy contract and reads back
+// unambiguously from a stored config_json, whereas a missing key means "decide
+// from the manifest/host" and would depend on the manifest carrying `gpus`.
+function effectiveGpuSelectMode(entry, mode) {
+  if (entry?.engine?.gpu_supported === false) return 'none';
+  return mode || 'all';
+}
+
 function nodeGpus(nodeId) {
   if (!nodeId) return [];
   if (gpuListByNode.has(nodeId)) return gpuListByNode.get(nodeId);
@@ -3525,6 +3537,7 @@ async function startDeploy() {
     genericParameters = {};
     manifestParams().forEach((p) => { genericParameters[p.key] = genericParamValue(p); });
   }
+  const gpuSelectMode = effectiveGpuSelectMode(engineEntry, selection.gpuSelectMode);
   const configJson = JSON.stringify({
     parameters: genericParameters || mlxParameters,
     model_preset_id: selection.modelPresetId || null,
@@ -3539,8 +3552,8 @@ async function startDeploy() {
       ? (selection.port || eng.default_port)
       : null,
     container_name: selection.containerName || null,
-    gpu_select_mode: selection.gpuSelectMode,
-    gpu_ids: selection.gpuSelectMode === 'specific' ? selection.gpuIds : null,
+    gpu_select_mode: gpuSelectMode,
+    gpu_ids: gpuSelectMode === 'specific' ? selection.gpuIds : null,
     // gpu_memory_utilization wysylamy gdy user wybral manual albo poruszyl
     // suwakiem w auto. Nietykany default 0.9 zostaje po stronie backendu jako
     // auto-clamp z aktualnego free VRAM.

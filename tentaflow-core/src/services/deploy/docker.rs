@@ -494,15 +494,31 @@ enum GpuSelection {
     Devices(Vec<String>),
 }
 
-/// Wybor GPU pochodzi z kreatora deploy (`gpu_select_mode` + `gpu_ids` w
-/// config_json), bo to operator decyduje ktore karty dostaje kontener. Manifest
-/// sluzy tylko jako fallback, gdy kreator nie przeslal wyboru — np. serwisy
-/// CPU-only (searxng) nie pokazuja kroku GPU i ida sciezka manifestu.
+/// True when the manifest declares the engine cannot use a GPU at all:
+/// `[engine] gpu_supported = false`, or an explicit `[deploy.docker] gpus`
+/// that resolves to no device ("none"/"0"/""/garbage). An absent `gpus` key is
+/// "unspecified", not a veto — it keeps the host-probe default.
+#[cfg(feature = "docker")]
+fn manifest_forbids_gpu(manifest_gpus: Option<&str>, gpu_supported: Option<bool>) -> bool {
+    gpu_supported == Some(false)
+        || (manifest_gpus.is_some() && resolve_gpu_count(manifest_gpus).is_none())
+}
+
+/// The operator picks which cards a container gets (`gpu_select_mode` + `gpu_ids`
+/// in config_json), and the manifest is the fallback when no choice was sent.
+/// The manifest wins in ONE direction only: an engine declared CPU-only never
+/// receives a GPU, no matter what the wizard, the API, a mesh peer or a stale
+/// `config_json` in the database asks for. It can only take the GPU away, never
+/// grant one against the operator's choice.
 #[cfg(feature = "docker")]
 fn resolve_gpu_selection(
     user_config: &serde_json::Value,
     manifest_gpus: Option<&str>,
+    gpu_supported: Option<bool>,
 ) -> GpuSelection {
+    if manifest_forbids_gpu(manifest_gpus, gpu_supported) {
+        return GpuSelection::None;
+    }
     match user_config.get("gpu_select_mode").and_then(|v| v.as_str()) {
         Some("none") => GpuSelection::None,
         Some("all") => GpuSelection::Count(-1),
@@ -1915,6 +1931,7 @@ impl DeployStrategy for DockerDeploy {
                 .docker
                 .as_ref()
                 .and_then(|d| d.gpus.as_deref()),
+            self.manifest.engine.gpu_supported,
         );
         if let Some(s) = &self.log_sink {
             match &gpu {
@@ -2250,17 +2267,22 @@ mod tests {
     fn resolve_gpu_selection_honors_wizard_mode() {
         // Explicit "none" overrides any host default.
         assert!(matches!(
-            resolve_gpu_selection(&serde_json::json!({"gpu_select_mode": "none"}), Some("all")),
+            resolve_gpu_selection(
+                &serde_json::json!({"gpu_select_mode": "none"}),
+                Some("all"),
+                None
+            ),
             GpuSelection::None
         ));
         // "all" → every GPU.
         assert!(matches!(
-            resolve_gpu_selection(&serde_json::json!({"gpu_select_mode": "all"}), None),
+            resolve_gpu_selection(&serde_json::json!({"gpu_select_mode": "all"}), None, None),
             GpuSelection::Count(-1)
         ));
         // "specific" with ids (numbers or strings) → device list.
         match resolve_gpu_selection(
             &serde_json::json!({"gpu_select_mode": "specific", "gpu_ids": [0, "3"]}),
+            None,
             None,
         ) {
             GpuSelection::Devices(ids) => assert_eq!(ids, vec!["0".to_string(), "3".to_string()]),
@@ -2270,15 +2292,82 @@ mod tests {
         assert!(matches!(
             resolve_gpu_selection(
                 &serde_json::json!({"gpu_select_mode": "specific", "gpu_ids": []}),
-                Some("all")
+                Some("all"),
+                None
             ),
             GpuSelection::Count(-1)
         ));
         // Manifest gpus="none" with no wizard mode → no GPU.
         assert!(matches!(
-            resolve_gpu_selection(&serde_json::json!({}), Some("none")),
+            resolve_gpu_selection(&serde_json::json!({}), Some("none"), None),
             GpuSelection::None
         ));
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn cpu_only_manifest_vetoes_any_requested_gpu() {
+        // searxng: gpus = "none" + gpu_supported = false. Whatever the wizard,
+        // the API or a stale config_json asks for, the container stays CPU-only.
+        for user in [
+            serde_json::json!({"gpu_select_mode": "all"}),
+            serde_json::json!({"gpu_select_mode": "specific", "gpu_ids": [0, 1]}),
+            serde_json::json!({"gpu_select_mode": "2"}),
+        ] {
+            assert_eq!(
+                resolve_gpu_selection(&user, Some("none"), Some(false)),
+                GpuSelection::None,
+                "user config {user} must not reach a GPU"
+            );
+            // gpu_supported=false alone (manifest without a `gpus` key) is enough.
+            assert_eq!(
+                resolve_gpu_selection(&user, None, Some(false)),
+                GpuSelection::None,
+                "user config {user} must not reach a GPU"
+            );
+            // An explicit gpus="none" alone is enough as well.
+            assert_eq!(
+                resolve_gpu_selection(&user, Some("none"), None),
+                GpuSelection::None,
+                "user config {user} must not reach a GPU"
+            );
+        }
+    }
+
+    #[cfg(feature = "docker")]
+    #[test]
+    fn gpu_engine_keeps_operator_choice() {
+        // gpu_supported = true must not turn the manifest into a grant: the
+        // operator's "none" still wins, and "all"/"specific" still work.
+        assert_eq!(
+            resolve_gpu_selection(
+                &serde_json::json!({"gpu_select_mode": "none"}),
+                Some("all"),
+                Some(true)
+            ),
+            GpuSelection::None
+        );
+        assert_eq!(
+            resolve_gpu_selection(
+                &serde_json::json!({"gpu_select_mode": "all"}),
+                Some("all"),
+                Some(true)
+            ),
+            GpuSelection::Count(-1)
+        );
+        assert_eq!(
+            resolve_gpu_selection(
+                &serde_json::json!({"gpu_select_mode": "specific", "gpu_ids": [1, "5"]}),
+                Some("all"),
+                Some(true)
+            ),
+            GpuSelection::Devices(vec!["1".to_string(), "5".to_string()])
+        );
+        // A manifest count stays the fallback when the wizard sent nothing.
+        assert_eq!(
+            resolve_gpu_selection(&serde_json::json!({}), Some("2"), Some(true)),
+            GpuSelection::Count(2)
+        );
     }
 
     fn skeleton_manifest(id: &str) -> ServiceManifest {
