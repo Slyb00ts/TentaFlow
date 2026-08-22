@@ -2851,7 +2851,7 @@ mod tests {
         let admin = agents_ctx("admin", seeded_admin_bytes(), state.clone());
 
         let upsert = MessageBody::AgentsBody(AgentsPayload::UpsertRequest(AgentsUpsertRequest {
-            agent_json: r#"{"name":"researcher","description":"Finds things","tools":["memory.memory_store","core.skill_view"]}"#.to_string(),
+            agent_json: r#"{"name":"agents-roundtrip-test","description":"Finds things","tools":["memory.memory_store","core.skill_view"]}"#.to_string(),
         }));
         let (resp, is_err) = dispatch(&upsert, &admin).await;
         assert!(!is_err, "upsert failed: {:?}", resp);
@@ -2872,16 +2872,19 @@ mod tests {
             other => panic!("expected ListResponse, got {:?}", other),
         };
         let rows: serde_json::Value = serde_json::from_str(&agents_json).unwrap();
-        // The list also contains the seeded system `general` agent (§3.8), so
-        // assert the upserted researcher is present rather than the exact count.
-        let researcher = rows
+        // The list also carries the seeded system agents (§3.8), so assert the
+        // upserted row is present rather than the exact count. The fixture name
+        // is test-owned on purpose: every plausible production name (`general`,
+        // `researcher`, `critic`, `code-*`, `generator-*`) is taken by the seed
+        // and the soft-uniqueness check would reject the upsert.
+        let created = rows
             .as_array()
             .unwrap()
             .iter()
-            .find(|a| a["name"] == "researcher")
-            .expect("researcher in list");
+            .find(|a| a["name"] == "agents-roundtrip-test")
+            .expect("upserted agent in list");
         // The list summary preloads the tools_json the editor needs.
-        assert!(researcher["tools_json"]
+        assert!(created["tools_json"]
             .as_str()
             .unwrap()
             .contains("memory.memory_store"));

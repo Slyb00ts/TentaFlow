@@ -3740,6 +3740,49 @@ mod tests {
         }
     }
 
+    /// Agent names carry a soft-uniqueness contract (`AgentsUpsertRequest`
+    /// rejects a duplicate), so every seeded name is reserved process-wide: a
+    /// test fixture that upserts one of them against a seeded database fails.
+    /// Pinning the roster makes adding a system agent a visible change and
+    /// keeps the reserved set readable in one place for fixture authors, who
+    /// must pick a name outside it (`*-test` by convention).
+    #[test]
+    fn seeded_system_agent_names_are_the_pinned_roster() {
+        let pool = crate::db::init(Path::new(":memory:")).expect("init db");
+        let conn = pool.write().unwrap();
+        let mut stmt = conn
+            .prepare("SELECT name FROM agents ORDER BY name")
+            .unwrap();
+        let names: Vec<String> = stmt
+            .query_map([], |r| r.get::<_, String>(0))
+            .unwrap()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                "code-committer",
+                "code-critic",
+                "code-implementer",
+                "code-orchestrator",
+                "code-planner",
+                "code-reviewer",
+                "code-searcher",
+                "code-tester",
+                "critic",
+                "documentalist",
+                "general",
+                "generator-api",
+                "generator-manual",
+                "generator-perf",
+                "generator-security",
+                "generator-ui",
+                "generator-unit",
+                "researcher",
+            ]
+        );
+    }
+
     /// The `general` upgrade follows the Default Chat rule: it reconciles a row
     /// that is still byte-exact what the seed wrote, and never an admin's edit.
     #[test]
