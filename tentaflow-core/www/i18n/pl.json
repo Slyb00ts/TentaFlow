@@ -1687,6 +1687,8 @@
     "tools_section_hint": "Przełącznik grupy = cała wtyczka (addon.*). Rozwiń grupę, aby wybrać pojedyncze narzędzia.",
     "tools_group_core": "Podstawowe (core)",
     "tools_core_sub": "Wbudowane możliwości każdego agenta",
+    "tools_group_no_description": "Ten addon nie ma opisu w manifeście.",
+    "tools_group_instance_id": "Identyfikator instancji: {id}",
     "tools_footer_hint": "Lista pochodzi z zainstalowanych wtyczek i rdzenia. Dostęp do danych jest zawsze sprawdzany uprawnieniami osoby uruchamiającej agenta.",
     "skills_section": "Umiejętności (skille)",
     "behavior_section": "Zachowanie",

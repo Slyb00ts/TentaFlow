@@ -7793,6 +7793,11 @@ struct CatalogTool {
 struct CatalogAddonGroup {
     addon_id: String,
     tools: Vec<CatalogTool>,
+    /// Human label of the addon INSTANCE (`addons.display_name`, falling back to
+    /// `addons.name`) — the picker shows this instead of the raw instance id.
+    display_name: String,
+    /// Manifest one-liner, so the admin knows what the addon actually does.
+    description: String,
 }
 
 #[derive(serde::Serialize)]
@@ -7804,8 +7809,21 @@ struct ToolsCatalog {
 /// Builds the pickable tool catalog: addon tools grouped by `addon_id`, then
 /// the `core.*` builtins. Shared by the ToolsCatalog handler and the
 /// agent-builder assistant so both see the exact same tool universe.
-fn build_tools_catalog(ctx: &HandlerContext) -> ToolsCatalog {
+fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolError> {
     use std::collections::BTreeMap;
+    let meta: std::collections::HashMap<String, (String, String)> =
+        repository::list_addons(&ctx.state.db)
+            .map_err(db_err)?
+            .into_iter()
+            .map(|a| {
+                let label = if a.display_name.trim().is_empty() {
+                    a.name.clone()
+                } else {
+                    a.display_name.clone()
+                };
+                (a.addon_id, (label, a.description))
+            })
+            .collect();
     let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
     if let Some(manager) = &ctx.state.addon_manager {
         for tool in manager.list_tools() {
@@ -7823,7 +7841,16 @@ fn build_tools_catalog(ctx: &HandlerContext) -> ToolsCatalog {
         .into_iter()
         .map(|(addon_id, mut tools)| {
             tools.sort_by(|a, b| a.name.cmp(&b.name));
-            CatalogAddonGroup { addon_id, tools }
+            let (display_name, description) = meta
+                .get(&addon_id)
+                .cloned()
+                .unwrap_or_else(|| (addon_id.clone(), String::new()));
+            CatalogAddonGroup {
+                addon_id,
+                tools,
+                display_name,
+                description,
+            }
         })
         .collect();
     let core = crate::agents::CoreToolName::all()
@@ -7837,7 +7864,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> ToolsCatalog {
             }
         })
         .collect();
-    ToolsCatalog { addons, core }
+    Ok(ToolsCatalog { addons, core })
 }
 
 /// True when the acting session is an admin. Non-admins only ever see their own
@@ -8006,7 +8033,7 @@ pub fn agents_upsert(
         is_enabled: input.is_enabled,
         on_child_complete: &input.on_child_complete,
         actor_user_id: Some(&user_id),
-            allowed_agents_json: allowed_agents_json.as_deref(),
+        allowed_agents_json: allowed_agents_json.as_deref(),
     };
     repository::validate_agent_params(&params)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
@@ -8287,7 +8314,7 @@ pub fn tools_catalog(
     // disclosure admin-scoped. The catalog is the universe; the agent's
     // allowlist is the selection, intersected with live permissions at
     // execution time (§3.3).
-    let catalog = build_tools_catalog(ctx);
+    let catalog = build_tools_catalog(ctx)?;
     let tools_json = serde_json::to_string(&catalog)
         .map_err(|e| ProtocolError::internal(format!("tools catalog encode failed: {}", e)))?;
     Ok(MessageBody::AgentsBody(
@@ -8313,9 +8340,7 @@ pub async fn agent_run_start(
         return Err(ProtocolError::bad_request("prompt must not be empty"));
     }
     if payload.prompt.chars().count() > 8000 {
-        return Err(ProtocolError::bad_request(
-            "prompt exceeds 8000 characters",
-        ));
+        return Err(ProtocolError::bad_request("prompt exceeds 8000 characters"));
     }
     let agent = repository::get_agent(&ctx.state.db, &payload.agent_id)
         .map_err(db_err)?
@@ -8464,7 +8489,7 @@ pub async fn agent_builder_assist(
 
     // The LLM picks tools by name: one flat "name — description" line per tool
     // keeps the prompt small, while the sets validate the picks afterwards.
-    let catalog = build_tools_catalog(ctx);
+    let catalog = build_tools_catalog(ctx)?;
     let mut tool_lines: Vec<String> = Vec::new();
     let mut valid_names: HashSet<&str> = HashSet::new();
     let mut valid_addon_ids: HashSet<&str> = HashSet::new();

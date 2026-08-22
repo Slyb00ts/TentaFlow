@@ -1687,6 +1687,8 @@
     "tools_section_hint": "Der Gruppenschalter = das ganze Addon (addon.*). Klappe eine Gruppe auf, um einzelne Werkzeuge zu wählen.",
     "tools_group_core": "Integriert (core)",
     "tools_core_sub": "Eingebaute Fähigkeiten jedes Agenten",
+    "tools_group_no_description": "Dieses Add-on hat keine Beschreibung im Manifest.",
+    "tools_group_instance_id": "Instanz-ID: {id}",
     "tools_footer_hint": "Die Liste stammt aus den installierten Addons und dem Kern. Der Datenzugriff wird immer gegen die Berechtigungen der ausführenden Person geprüft.",
     "skills_section": "Fähigkeiten (Skills)",
     "behavior_section": "Verhalten",

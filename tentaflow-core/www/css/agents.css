@@ -390,6 +390,32 @@
   cursor: pointer;
 }
 
+/* Dwuliniowa glowka grupy: nazwa addonu nad opisem, surowy identyfikator
+   instancji obok tytulu (dwie instancje tego samego pakietu maja te sama nazwe). */
+.agents-tool-group-meta {
+  flex: 1;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.agents-tool-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.agents-tool-group-id {
+  font-family: var(--font-mono, monospace);
+  font-size: 11px;
+  color: var(--text-3);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .agents-tool-group-sub {
   flex: 1;
   min-width: 0;

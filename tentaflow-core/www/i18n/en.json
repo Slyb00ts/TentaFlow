@@ -1687,6 +1687,8 @@
     "tools_section_hint": "The group switch = the whole addon (addon.*). Expand a group to pick individual tools.",
     "tools_group_core": "Built-in (core)",
     "tools_core_sub": "Built-in capabilities of every agent",
+    "tools_group_no_description": "This addon has no description in its manifest.",
+    "tools_group_instance_id": "Instance id: {id}",
     "tools_footer_hint": "The list comes from installed addons and the core. Data access is always checked against the permissions of the person running the agent.",
     "skills_section": "Skills",
     "behavior_section": "Behaviour",

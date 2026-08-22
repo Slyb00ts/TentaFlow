@@ -1325,6 +1325,15 @@ function applyPersona(personaId) {
 // Tool picker (collapsible addon groups with wildcard group toggles + core)
 // =============================================================================
 
+/** Group head texts: the addon's own name over its manifest one-liner. The raw
+ *  instance id stays visible next to the title, because two instances of the
+ *  same package share a display name and only the id tells them apart. */
+function addonGroupLabel(group) {
+  const title = String(group.display_name ?? '').trim() || group.addon_id;
+  const subtitle = String(group.description ?? '').trim() || t('tools_group_no_description');
+  return { title, subtitle };
+}
+
 function renderToolPicker() {
   const wz = state.wizard;
   const host = wz?.body.querySelector('#agent-wz-tools');
@@ -1347,12 +1356,18 @@ function renderToolPicker() {
   const addonGroup = (group) => {
     const wildcard = `${group.addon_id}.*`;
     const wildcardOn = wz.selectedTools.has(wildcard);
+    const { title, subtitle } = addonGroupLabel(group);
     return `
       <div class="agents-tool-group" data-group="${escapeAttr(group.addon_id)}">
         <div class="agents-tool-group-head" data-group-head role="button" tabindex="0">
-          <tf-chip status="accent">${escapeHtml(group.addon_id)}</tf-chip>
-          <span class="agents-tool-group-sub">${escapeHtml(t('tool_wildcard_hint'))}</span>
-          <tf-toggle data-group-toggle="${escapeAttr(wildcard)}" ${wildcardOn ? 'checked' : ''}></tf-toggle>
+          <div class="agents-tool-group-meta">
+            <div class="agents-tool-group-title">
+              <tf-chip status="accent">${escapeHtml(title)}</tf-chip>
+              <span class="agents-tool-group-id" title="${escapeAttr(t('tools_group_instance_id', { id: group.addon_id }))}">${escapeHtml(group.addon_id)}</span>
+            </div>
+            <span class="agents-tool-group-sub" title="${escapeAttr(subtitle)}">${escapeHtml(subtitle)}</span>
+          </div>
+          <tf-toggle data-group-toggle="${escapeAttr(wildcard)}" title="${escapeAttr(t('tool_wildcard_hint'))}" ${wildcardOn ? 'checked' : ''}></tf-toggle>
           <span class="agents-tool-chev">${sprite('chevron-down')}</span>
         </div>
         <div class="agents-tool-group-body" hidden>
