@@ -1335,3 +1335,55 @@ Uczciwie: **większość**.
 
 **Sprzątnięte:** `tentaflow-core/relative/` (pozostałość po teście walidacji ścieżki) — ta sama
 pozostałość co dwie sesje temu, usunięta ponownie. Warta wpisu do `.gitignore`.
+
+---
+
+## Domknięcie R2b: graf osiągalny, kasowalny i czytelny (2026-08-22)
+
+Cztery niespełnione kryteria R2b zamknięte. **R2.8** — provenance jest teraz zbiorem `doc_ids`
+scalanym przy upsercie i zmniejszanym przy kasowaniu; tombstone dopiero gdy zbiór pustoszeje,
+a zmniejszony zbiór **zapisywany z powrotem** (bez tego wiersz przeżyłby swój ostatni dokument
+na zawsze). **R2.9** — czat projektu nie przypina już `graph_enabled=false`. **R2.6** — ustawienie
+per projekt, domyślnie wyłączone, za bramką Managera. **Sprzątanie przy re-ingeście** —
+odpowiednik tego, co ścieżka wektorowa robiła od dawna. Bez zmiany schematu.
+
+Weryfikacja orkiestratora: **233 zielone** (`--features graph`), **153** (domyślne), parzystość
+i18n 1487 kluczy w pięciu lokalizacjach, zero surowych elementów HTML.
+
+### Lekcja 1: mutacja wykryła błąd w TEŚCIE, nie w kodzie
+
+Pierwsza wersja testu na współdzieloną encję kazała nowej wersji pliku ponownie nazwać
+`eth_zurich`. Mutacja „tombstone zamiast zapisu zmniejszonego zbioru" **przeżyła**, bo kolejny
+zapis po prostu wskrzeszał węzeł — asercja nie była nośna. Wykonawca przepisał test tak, żeby
+nowa wersja nazywała inny podmiot, i dopiero wtedy mutacja padła. **Zgłosił to sam**, pisząc,
+że przeżywający mutant jest jedynym powodem, dla którego ta asercja jest teraz prawdziwa.
+
+To jest przypadek, dla którego warto robić dowody mutacyjne nawet gdy kod jest poprawny:
+mutacja pilnuje nie tylko implementacji, ale i tego, czy test w ogóle coś mierzy.
+
+### Lekcja 2 (ZASTANA PUŁAPKA): `services::graph::tests` wymaga `TMPDIR`
+
+Moja niezależna weryfikacja pokazała **sześć czerwonych** testów kwot i współbieżności —
+dokładnie tej ścieżki, którą refcount przerabiał. Wyglądało to jak regresja i wstrzymałem
+drugiego agenta, żeby odróżnić regresję od skażenia.
+
+Przyczyna: helper `tempdir()` (`services/graph/tests.rs:36`) przy nieustawionym `TMPDIR` spada
+na **zaszytą ścieżkę z cudzej maszyny** `/mnt/e/repos/rust/_scratch/tf-graph-tests`. Na tym
+pudle `/mnt/e` należy do roota (755), więc `create_dir_all` zwraca `PermissionDenied` i KAŻDY
+test w module ginie w tej jednej linii, zanim dotknie logiki grafu.
+
+**Zawsze eksportuj `TMPDIR` przy `services::graph::tests`** — i nie na `/tmp` (tmpfs 31G,
+w tej sesji zapełniony do 100% przez pozostałości po testach; komentarz helpera wprost chce
+prawdziwego dysku). Zielony przebieg tego modułu bez `TMPDIR` jest **niemożliwy**, więc to
+sprawdzalna deklaracja — każę ją agentom podawać przy cytowanym wyniku.
+
+Helper NIE został naprawiony: to zastana usterka przenośności, zasługująca na własne
+uzasadnienie, a nie na doklejenie do commitu z funkcjonalnością.
+
+### Czego ten push nie obejmuje
+
+Nikt nie przeklikał przełącznika przez żywy serwer. Ścieżka `codec.js` → wasm →
+`SettingsSaveRequest` kompiluje się, a zregenerowany `wasm_glue.js` niesie nowy parametr, ale
+runtime'owo nie została wykonana. Zrzut ekranu dowodzi renderu markupu, komponentów i tekstów —
+nie przejścia przez protokół binarny. Wykonawca napisał to wprost, zamiast sprzedać zrzut jako
+dowód end-to-end.
