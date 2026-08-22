@@ -15,8 +15,13 @@ rozmowy, bo jej nie masz. Zacznij tutaj, potem od źródła prawdy.
 | `docs/robocze/STAN_PETLI.md` | rejestr rund, werdyktów, incydentów i wniosków |
 | `CLAUDE.md` | reguły repo — obowiązują każdego sub-agenta |
 
-Gałąź: **`feat/zdarzenia-rag`**, 12 commitów ponad `d9d98c1fd`, drzewo czyste.
-Nic nie było wypychane. Push jest bramką człowieka.
+Gałąź: **`feat/zdarzenia-rag`**. **WYPCHNIĘTE NA `main` 2026-08-22** (decyzja właściciela,
+`main` = `8320b3307`, 59 commitów ponad poprzedni `origin/main`). Bramka pushu została
+przekroczona świadomie, mimo niespełnionych kryteriów R2b — patrz `STAN_PETLI.md`.
+
+**Skutek dla wdrożeń:** `SCHEMA_VERSION` 23 → **24**, więc stare i nowe binarki odrzucają się
+na handshake'u — węzły mesh trzeba przebudować RAZEM. Migracje tej pracy to **133/134/135**
+(main zajął 132).
 
 ---
 
