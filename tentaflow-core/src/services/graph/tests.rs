@@ -1,13 +1,13 @@
-// ===== Plik: services/graph/tests.rs — testy jednostkowe warstwy grafowej =====
+// ===== File: services/graph/tests.rs — unit tests for the graph layer =====
 //
-// Realne testy (nie zaślepki): tworzenie kolekcji, upsert węzłów/krawędzi,
-// zapytanie sąsiadów Datalogiem, wbudowany PageRank Cozo, PPR w Rust nad CSR,
-// izolacja dwóch GraphKey (różne org / różne addon), egzekwowanie quoty oraz —
-// runda 2 — współbieżność: atomowa quota pod równoległym zapisem, realne
-// zamknięcie backendu przy eviction (plik daje się skasować/ponownie otworzyć),
-// delete czekający na write-lock w trakcie zapisu z innego wątku, oraz wyścig
-// dwóch wątków o tę samą NOWĄ kolekcję (UNIQUE → load existing).
-// Wszystkie pliki lądują w tempdir na `/mnt/e` (TMPDIR ustawiany przez runner).
+// Real tests (no stubs): collection creation, node/edge upsert, neighbour
+// lookup in Datalog, Cozo's built-in PageRank, PPR in Rust over CSR, isolation
+// of two GraphKeys (different org / different addon), quota enforcement and —
+// round 2 — concurrency: atomic quota under parallel writes, a real backend
+// close on eviction (the file can be deleted and reopened again), a delete
+// waiting for the write lock while another thread writes, and two threads
+// racing for the same NEW collection (UNIQUE -> load existing).
+// Every file lands in a tempdir resolved by `tempdir()` below.
 
 use std::sync::Arc;
 
@@ -31,15 +31,68 @@ fn in_memory_db() -> DbPool {
     Arc::new(crate::db::Db::from_connection(conn))
 }
 
-/// Tempdir pod `/mnt/e` (a nie `/tmp` w RAM). Honoruje `TMPDIR` ustawiony przez
-/// runner; gdy nie ustawiono, fallback na katalog scratch projektu.
+/// Prefix of every scratch directory this module creates, so the sweep below
+/// can tell our leftovers from whatever else shares the base directory.
+const SCRATCH_PREFIX: &str = "graph-test-";
+
+/// Tempdir for one test. Honours `TMPDIR` when the runner sets one; otherwise
+/// falls back to a scratch tree in the repo's shared build directory.
+///
+/// WHY not `std::env::temp_dir()`: on our dev boxes `/tmp` is a RAM-backed
+/// tmpfs (31 GB on this machine) shared with everything else running there.
+/// These tests write real Cozo databases, and `TempDir` only removes its
+/// directory on a NORMAL drop — a panicking test leaks one. That combination
+/// filled `/tmp` to 100% during development, which is the same reason CLAUDE.md
+/// keeps the native-library cache out of `/tmp`.
+///
+/// The fallback is DERIVED from `CARGO_MANIFEST_DIR` instead of a hard-coded
+/// mount point, so it resolves on any checkout. It targets `target_shared/`
+/// because this repo deliberately keeps exactly ONE build directory
+/// (`target-dir` in `.cargo/config.toml`); a per-crate `target/` would put the
+/// scratch somewhere the layout says should not exist, and it would survive
+/// every cleanup of the shared tree. The `target[-_]*/` ignore rule keeps it
+/// out of git.
 fn tempdir() -> TempDir {
     if std::env::var_os("TMPDIR").is_some() {
-        TempDir::new().unwrap()
-    } else {
-        let base = std::path::Path::new("/mnt/e/repos/rust/_scratch/tf-graph-tests");
-        std::fs::create_dir_all(base).unwrap();
-        TempDir::new_in(base).unwrap()
+        return TempDir::new().unwrap();
+    }
+    let base = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .expect("crate directory always has a parent (the repo root)")
+        .join("target_shared")
+        .join("graph-tests");
+    std::fs::create_dir_all(&base).unwrap();
+    static SWEEP: std::sync::Once = std::sync::Once::new();
+    SWEEP.call_once(|| sweep_leaked(&base));
+    tempfile::Builder::new()
+        .prefix(SCRATCH_PREFIX)
+        .tempdir_in(&base)
+        .unwrap()
+}
+
+/// Reap scratch directories leaked by earlier panicking tests. Age-based on
+/// purpose: anything touched within the last day is left alone, so a developer
+/// re-running a test that just failed still has the database to inspect.
+fn sweep_leaked(base: &std::path::Path) {
+    const MAX_AGE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+    let Ok(entries) = std::fs::read_dir(base) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        if !entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with(SCRATCH_PREFIX)
+        {
+            continue;
+        }
+        let leaked = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .is_ok_and(|touched| touched.elapsed().is_ok_and(|age| age > MAX_AGE));
+        if leaked {
+            let _ = std::fs::remove_dir_all(entry.path());
+        }
     }
 }
 

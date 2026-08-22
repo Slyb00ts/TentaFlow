@@ -169,7 +169,7 @@ pub struct GraphManager {
     /// stale `Arc` cannot open a database beside the counter (bug G).
     open_backends: AtomicU64,
     /// On-disk directory override — production uses `dirs::home_dir()`, tests
-    /// inject a tempdir (on `/mnt/e`) so they do not litter `~`.
+    /// inject a tempdir (see `tests::tempdir`) so they do not litter `~`.
     root_override: Option<PathBuf>,
 }
 
