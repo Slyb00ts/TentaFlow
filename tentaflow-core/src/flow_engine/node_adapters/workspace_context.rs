@@ -117,7 +117,7 @@ impl WorkspaceContextNodeAdapter {
             .iter()
             .filter(|tool| tool.is_code_studio())
             .map(|tool| tool.public_name())
-            .filter(|name| crate::agents::tool_in_allowlist(&tools_json, name))
+            .filter(|name| crate::agents::tool_in_allowlist(&tools_json, name, None))
             .map(str::to_string)
             .collect()
     }

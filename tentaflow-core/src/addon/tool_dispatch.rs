@@ -205,6 +205,7 @@ mod tests {
     fn tool(addon_id: &str, tool_name: &str) -> ToolDefinition {
         ToolDefinition {
             addon_id: addon_id.to_string(),
+            package_id: addon_id.to_string(),
             tool_name: tool_name.to_string(),
             description: format!("{tool_name} description"),
             parameters_schema: serde_json::json!({

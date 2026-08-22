@@ -3053,7 +3053,7 @@ mod tests {
                 "{name} lost its seeded allowlist"
             );
             assert!(
-                tool_in_allowlist(&agent.tools_json, "core.fs_read"),
+                tool_in_allowlist(&agent.tools_json, "core.fs_read", None),
                 "{name} must still be able to read"
             );
         }
@@ -3064,17 +3064,31 @@ mod tests {
                 .unwrap()
                 .tools_json
         };
-        assert!(!tool_in_allowlist(&tools("code-committer"), "core.fs_write"));
+        assert!(!tool_in_allowlist(
+            &tools("code-committer"),
+            "core.fs_write",
+            None
+        ));
         assert!(tool_in_allowlist(
             &tools("code-committer"),
-            "core.git_commit"
+            "core.git_commit",
+            None
         ));
-        assert!(!tool_in_allowlist(&tools("code-reviewer"), "core.fs_write"));
+        assert!(!tool_in_allowlist(
+            &tools("code-reviewer"),
+            "core.fs_write",
+            None
+        ));
         assert!(!tool_in_allowlist(
             &tools("code-implementer"),
-            "core.git_push"
+            "core.git_push",
+            None
         ));
-        assert!(!tool_in_allowlist(&tools("code-tester"), "core.git_push"));
+        assert!(!tool_in_allowlist(
+            &tools("code-tester"),
+            "core.git_push",
+            None
+        ));
     }
 
     #[tokio::test]

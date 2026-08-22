@@ -5716,6 +5716,7 @@ async fn generation_start_v1(
     if !crate::agents::tool_in_allowlist(
         &agent.tools_json,
         crate::agents::CoreToolName::CaseSave.public_name(),
+        None,
     ) {
         return Err(ProtocolError::bad_request(
             "the selected agent has no core.project_case_save in its tool allowlist",

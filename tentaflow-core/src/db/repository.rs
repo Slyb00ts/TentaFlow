@@ -12501,6 +12501,40 @@ pub fn list_addons(pool: &DbPool) -> Result<Vec<Addon>> {
     Ok(rows)
 }
 
+/// What an agent's system prompt says about one addon: the name a human gave
+/// it, the manifest description and — when the addon shipped a SKILL.md — the
+/// name of the skill holding its detailed instructions. Read as one row instead
+/// of `get_addon` because the prompt needs three short fields, not the addon's
+/// whole `manifest_json`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AddonPromptInfo {
+    pub addon_id: String,
+    pub display_name: String,
+    pub description: String,
+    pub skill_name: Option<String>,
+}
+
+/// Prompt-facing metadata of one installed addon. `None` when the instance does
+/// not exist. Names are soft-unique for skills, so the oldest active addon skill
+/// wins deterministically (same rule as `get_skill_by_name`).
+pub fn get_addon_prompt_info(pool: &DbPool, addon_id: &str) -> Result<Option<AddonPromptInfo>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT COALESCE(NULLIF(a.display_name, ''), a.name), COALESCE(a.description, ''),          (SELECT s.name FROM skills s           WHERE s.source = 'addon' AND s.source_ref = a.addon_id AND s.status = 'active'           ORDER BY s.created_at, s.id LIMIT 1)          FROM addons a WHERE a.addon_id = ?1",
+    )?;
+    let result = stmt
+        .query_row(rusqlite::params![addon_id], |row| {
+            Ok(AddonPromptInfo {
+                addon_id: addon_id.to_string(),
+                display_name: row.get(0)?,
+                description: row.get(1)?,
+                skill_name: row.get(2)?,
+            })
+        })
+        .optional()?;
+    Ok(result)
+}
+
 /// Pobiera addon po addon_id.
 pub fn get_addon(pool: &DbPool, addon_id: &str) -> Result<Option<Addon>> {
     let conn = acquire(pool)?;

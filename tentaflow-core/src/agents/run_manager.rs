@@ -40,8 +40,13 @@ use super::principal::AgentPrincipal;
 
 /// Global concurrency cap setting key and default (§3.6). Bounds how many
 /// background runs hold a semaphore permit at once across the whole process.
+///
+/// The default sits above the fan-out of one conversation: `general` may open
+/// six children at once, and at 8 a second conversation would queue behind the
+/// first. A parent releases its permit inside `agent_wait`, so the steady-state
+/// cost of a fan-out is the children, not children + parent.
 pub const MAX_CONCURRENT_RUNS_SETTING: &str = "agents.max_concurrent_runs";
-const DEFAULT_MAX_CONCURRENT_RUNS: usize = 8;
+const DEFAULT_MAX_CONCURRENT_RUNS: usize = 16;
 
 /// Heartbeat cadence for a live run (§3.6) — the watchdog reads
 /// `last_heartbeat_at`, so a long, quiet run still proves liveness.
@@ -288,7 +293,8 @@ impl AgentRunManager {
         self.runs.clone()
     }
 
-    /// Builds a manager reading the concurrency cap from settings (default 8).
+    /// Builds a manager reading the concurrency cap from settings
+    /// (default [`DEFAULT_MAX_CONCURRENT_RUNS`]).
     pub fn from_setting(
         db: DbPool,
         runner: Arc<dyn BackgroundFlowRunner>,
@@ -1160,7 +1166,9 @@ impl AgentRunManager {
         for tool in &child {
             // A child tool is admissible if the parent allowlist admits it (an
             // addon wildcard on the parent covers the child's exact tool).
-            if !tool_in_allowlist(&parent_json, tool) && !parent_tools.contains(tool) {
+            // Declaration-level comparison: both sides are allowlist entries,
+            // not live tools, so no package resolution applies here.
+            if !tool_in_allowlist(&parent_json, tool, None) && !parent_tools.contains(tool) {
                 return Err(anyhow!(
                     "agent_spawn: child tool '{tool}' is outside the parent's tool surface"
                 ));

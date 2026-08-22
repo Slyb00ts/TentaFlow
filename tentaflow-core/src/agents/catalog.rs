@@ -12,6 +12,12 @@ use super::principal::AgentPrincipal;
 /// One parsed allowlist entry. The agent's `tools_json` is a JSON array of
 /// public names: `"addon_id.tool"`, an `"addon_id.*"` wildcard, or a
 /// `"core.<tool>"` builtin. Anything else is rejected on parse.
+///
+/// The head of an addon entry names EITHER a package (`deep-research`) or one
+/// instance (`deep-research-043b6b64`). An instance id is minted at install with
+/// a random suffix, so a package head is the only form that survives a seed, an
+/// export or a second installation; an instance head stays available when an
+/// agent must be pinned to exactly one instance of a multi-instance package.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AllowlistEntry {
     /// Exact `addon_id.tool_name`.
@@ -45,14 +51,19 @@ impl AllowlistEntry {
         })
     }
 
-    /// True when this entry admits a given addon tool.
-    fn matches_addon_tool(&self, addon_id: &str, tool_name: &str) -> bool {
+    /// True when this entry admits a given addon tool. `package_id` is the
+    /// package the instance `addon_id` was created from (empty when unknown);
+    /// matching either id is what makes a package-level entry cover every
+    /// instance while an instance-level entry still names exactly one of them.
+    fn matches_addon_tool(&self, addon_id: &str, package_id: &str, tool_name: &str) -> bool {
+        let head_matches =
+            |head: &str| head == addon_id || (!package_id.is_empty() && head == package_id);
         match self {
             AllowlistEntry::Tool {
                 addon_id: a,
                 tool_name: t,
-            } => a == addon_id && t == tool_name,
-            AllowlistEntry::AddonWildcard { addon_id: a } => a == addon_id,
+            } => head_matches(a) && t == tool_name,
+            AllowlistEntry::AddonWildcard { addon_id: a } => head_matches(a),
             AllowlistEntry::Core(_) => false,
         }
     }
@@ -72,7 +83,13 @@ pub fn parse_allowlist(tools_json: &str) -> Vec<AllowlistEntry> {
 /// Convenience predicate: is `name` admitted by `tools_json` for an addon tool
 /// or a core builtin? Used by tool_exec to reject a model-issued call to a tool
 /// outside the agent's surface before dispatching it.
-pub fn tool_in_allowlist(tools_json: &str, name: &str) -> bool {
+///
+/// `package_id` is the package behind the instance named in `name`, resolved
+/// from the live tool registry by the caller (`AgentService::tool_allowed`). It
+/// is `None` for a core builtin and for a caller that compares DECLARATIONS
+/// rather than live tools (sub-agent subset check): without it only the literal
+/// head matches, which is the fail-closed answer.
+pub fn tool_in_allowlist(tools_json: &str, name: &str, package_id: Option<&str>) -> bool {
     let entries = parse_allowlist(tools_json);
     if let Some(core) = CoreToolName::from_public_name(name) {
         return entries.iter().any(|e| e == &AllowlistEntry::Core(core));
@@ -80,7 +97,7 @@ pub fn tool_in_allowlist(tools_json: &str, name: &str) -> bool {
     match name.split_once('.') {
         Some((addon_id, tool_name)) if !addon_id.is_empty() && !tool_name.is_empty() => entries
             .iter()
-            .any(|e| e.matches_addon_tool(addon_id, tool_name)),
+            .any(|e| e.matches_addon_tool(addon_id, package_id.unwrap_or(""), tool_name)),
         _ => false,
     }
 }
@@ -120,9 +137,9 @@ impl ToolCatalog {
 
         if principal.user_id().is_some() {
             for tool in addon_tools {
-                let admitted = entries
-                    .iter()
-                    .any(|e| e.matches_addon_tool(&tool.addon_id, &tool.tool_name));
+                let admitted = entries.iter().any(|e| {
+                    e.matches_addon_tool(&tool.addon_id, &tool.package_id, &tool.tool_name)
+                });
                 if admitted && is_permitted(&tool.addon_id) {
                     out.push(tool_definition_to_spec(tool));
                 }
@@ -146,9 +163,24 @@ impl ToolCatalog {
 mod tests {
     use super::*;
 
+    /// A tool of an INSTANCE `{package_id}-{8 hex}` — the shape every installed
+    /// addon really has.
+    fn instance_tool(package_id: &str, suffix: &str, tool_name: &str) -> ToolDefinition {
+        ToolDefinition {
+            addon_id: format!("{package_id}-{suffix}"),
+            package_id: package_id.to_string(),
+            tool_name: tool_name.to_string(),
+            description: format!("{tool_name} desc"),
+            parameters_schema: serde_json::json!({"type": "object"}),
+            return_schema: None,
+            keywords: Vec::new(),
+        }
+    }
+
     fn tool(addon_id: &str, tool_name: &str) -> ToolDefinition {
         ToolDefinition {
             addon_id: addon_id.to_string(),
+            package_id: addon_id.to_string(),
             tool_name: tool_name.to_string(),
             description: format!("{tool_name} desc"),
             parameters_schema: serde_json::json!({"type": "object"}),
@@ -276,8 +308,8 @@ mod tests {
         assert!(AllowlistEntry::parse("core.fs_chmod").is_none());
         // A typo does not fall through to "an addon called core".
         let json = r#"["core.fs_read","core.fs_chmod"]"#;
-        assert!(tool_in_allowlist(json, "core.fs_read"));
-        assert!(!tool_in_allowlist(json, "core.fs_chmod"));
+        assert!(tool_in_allowlist(json, "core.fs_read", None));
+        assert!(!tool_in_allowlist(json, "core.fs_chmod", None));
         assert_eq!(parse_allowlist(json).len(), 1);
     }
 
@@ -297,9 +329,135 @@ mod tests {
     #[test]
     fn tool_in_allowlist_matches_addon_and_core() {
         let json = r#"["memory.*","core.skill_view"]"#;
-        assert!(tool_in_allowlist(json, "memory.memory_store"));
-        assert!(tool_in_allowlist(json, "core.skill_view"));
-        assert!(!tool_in_allowlist(json, "contacts.lookup"));
-        assert!(!tool_in_allowlist(json, "core.agent_spawn"));
+        assert!(tool_in_allowlist(json, "memory.memory_store", None));
+        assert!(tool_in_allowlist(json, "core.skill_view", None));
+        assert!(!tool_in_allowlist(json, "contacts.lookup", None));
+        assert!(!tool_in_allowlist(json, "core.agent_spawn", None));
+    }
+
+    #[test]
+    fn package_entry_admits_every_instance_of_that_package() {
+        // An allowlist can only be seeded, exported or moved between installs if
+        // it names the PACKAGE: the instance suffix is minted per installation.
+        let tools = vec![
+            instance_tool("deep-research", "043b6b64", "search_web"),
+            instance_tool("deep-research", "ff00ff00", "search_web"),
+            instance_tool("memory", "aa11bb22", "memory_store"),
+        ];
+        let principal = AgentPrincipal::user("u1");
+        let json = r#"["deep-research.*","memory.memory_store"]"#;
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(
+            names,
+            vec![
+                "deep-research-043b6b64.search_web",
+                "deep-research-ff00ff00.search_web",
+                "memory-aa11bb22.memory_store"
+            ]
+        );
+        // The same entry admits the call at dispatch time (tool_exec's sieve).
+        assert!(tool_in_allowlist(
+            json,
+            "deep-research-043b6b64.search_web",
+            Some("deep-research")
+        ));
+        assert!(tool_in_allowlist(
+            json,
+            "memory-aa11bb22.memory_store",
+            Some("memory")
+        ));
+    }
+
+    #[test]
+    fn instance_entry_pins_one_instance_and_excludes_its_siblings() {
+        let tools = vec![
+            instance_tool("deep-research", "043b6b64", "search_web"),
+            instance_tool("deep-research", "ff00ff00", "search_web"),
+        ];
+        let principal = AgentPrincipal::user("u1");
+        let json = r#"["deep-research-043b6b64.*"]"#;
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["deep-research-043b6b64.search_web"]);
+        assert!(tool_in_allowlist(
+            json,
+            "deep-research-043b6b64.search_web",
+            Some("deep-research")
+        ));
+        // The sibling instance of the SAME package stays out — knowing the
+        // package must not widen an entry that named one instance.
+        assert!(!tool_in_allowlist(
+            json,
+            "deep-research-ff00ff00.search_web",
+            Some("deep-research")
+        ));
+    }
+
+    #[test]
+    fn package_entry_does_not_admit_an_unrelated_package() {
+        let tools = vec![
+            instance_tool("deep-research", "043b6b64", "search_web"),
+            instance_tool("contacts", "043b6b64", "lookup"),
+        ];
+        let principal = AgentPrincipal::user("u1");
+        let json = r#"["deep-research.*"]"#;
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["deep-research-043b6b64.search_web"]);
+        assert!(!tool_in_allowlist(
+            json,
+            "contacts-043b6b64.lookup",
+            Some("contacts")
+        ));
+    }
+
+    #[test]
+    fn a_package_entry_needs_the_exact_tool_name_too() {
+        // Package matching widens the HEAD only: the tool part still has to match.
+        let tools = vec![
+            instance_tool("memory", "aa11bb22", "memory_store"),
+            instance_tool("memory", "aa11bb22", "memory_forget"),
+        ];
+        let principal = AgentPrincipal::user("u1");
+        let json = r#"["memory.memory_store"]"#;
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |_| true);
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["memory-aa11bb22.memory_store"]);
+        assert!(!tool_in_allowlist(
+            json,
+            "memory-aa11bb22.memory_forget",
+            Some("memory")
+        ));
+    }
+
+    #[test]
+    fn without_a_resolved_package_only_the_literal_head_matches() {
+        // A caller that cannot resolve the package (declaration-level checks)
+        // gets the fail-closed answer, never a guess from the id's shape.
+        let json = r#"["deep-research.*"]"#;
+        assert!(!tool_in_allowlist(
+            json,
+            "deep-research-043b6b64.search_web",
+            None
+        ));
+        assert!(tool_in_allowlist(json, "deep-research.search_web", None));
+    }
+
+    #[test]
+    fn permission_is_still_checked_per_instance_not_per_package() {
+        // A package entry widens the ALLOWLIST; it must not widen the grant —
+        // permissions are granted to an installed instance.
+        let tools = vec![
+            instance_tool("deep-research", "043b6b64", "search_web"),
+            instance_tool("deep-research", "ff00ff00", "search_web"),
+        ];
+        let principal = AgentPrincipal::user("u1");
+        let json = r#"["deep-research.*"]"#;
+        let specs = ToolCatalog::resolve(json, &principal, &tools, false, |addon_id| {
+            addon_id == "deep-research-043b6b64"
+        });
+        let names: Vec<&str> = specs.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["deep-research-043b6b64.search_web"]);
     }
 }

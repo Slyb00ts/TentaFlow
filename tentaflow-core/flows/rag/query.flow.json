@@ -21,7 +21,7 @@
         "body_flow_id": "00000000-0000-4000-8000-000000000052"
       },
       "position": {
-        "x": 240,
+        "x": 360,
         "y": 0
       }
     },
@@ -30,7 +30,7 @@
       "type": "rag_finalize",
       "config": {},
       "position": {
-        "x": 480,
+        "x": 720,
         "y": 0
       }
     },
@@ -41,7 +41,7 @@
         "require_session": false
       },
       "position": {
-        "x": 720,
+        "x": 1080,
         "y": 0
       }
     },
@@ -54,7 +54,7 @@
         "system_prompt": "Jestes asystentem RAG. Odpowiadaj WYLACZNIE na podstawie dostarczonego kontekstu (zakumulowane pasaze ponizej, numerowane [i] z doc/chunk). Jesli kontekst nie zawiera odpowiedzi, napisz wprost ze nie wiesz. Po kazdym twierdzeniu cytuj zrodlo (numer pasaza / doc). Nie zmyslaj faktow spoza kontekstu."
       },
       "position": {
-        "x": 960,
+        "x": 1440,
         "y": 0
       }
     },
@@ -65,7 +65,7 @@
         "mode": "stream"
       },
       "position": {
-        "x": 1200,
+        "x": 1800,
         "y": 0
       }
     }

@@ -17,8 +17,8 @@
       "type": "document_router",
       "config": {},
       "position": {
-        "x": 220,
-        "y": 120
+        "x": 360,
+        "y": 0
       }
     },
     {
@@ -28,8 +28,8 @@
         "model": "rag-parse"
       },
       "position": {
-        "x": 220,
-        "y": -120
+        "x": 360,
+        "y": -200
       }
     },
     {
@@ -37,8 +37,8 @@
       "type": "pdf_rasterize",
       "config": {},
       "position": {
-        "x": 440,
-        "y": -40
+        "x": 720,
+        "y": 0
       }
     },
     {
@@ -48,8 +48,8 @@
         "model": "rag-parse"
       },
       "position": {
-        "x": 660,
-        "y": -40
+        "x": 1080,
+        "y": 200
       }
     },
     {
@@ -57,8 +57,8 @@
       "type": "document_merge",
       "config": {},
       "position": {
-        "x": 880,
-        "y": -40
+        "x": 1440,
+        "y": 200
       }
     },
     {
@@ -66,8 +66,8 @@
       "type": "excel_extract",
       "config": {},
       "position": {
-        "x": 440,
-        "y": 60
+        "x": 720,
+        "y": 200
       }
     },
     {
@@ -75,8 +75,8 @@
       "type": "word_extract",
       "config": {},
       "position": {
-        "x": 440,
-        "y": 160
+        "x": 720,
+        "y": 400
       }
     },
     {
@@ -84,8 +84,8 @@
       "type": "pptx_extract",
       "config": {},
       "position": {
-        "x": 440,
-        "y": 260
+        "x": 720,
+        "y": 600
       }
     },
     {
@@ -93,8 +93,8 @@
       "type": "text_extract",
       "config": {},
       "position": {
-        "x": 660,
-        "y": 360
+        "x": 720,
+        "y": 800
       }
     },
     {
@@ -102,8 +102,8 @@
       "type": "combine",
       "config": {},
       "position": {
-        "x": 1100,
-        "y": 60
+        "x": 1800,
+        "y": 0
       }
     },
     {
@@ -111,8 +111,8 @@
       "type": "chunk",
       "config": {},
       "position": {
-        "x": 1320,
-        "y": 60
+        "x": 2160,
+        "y": 0
       }
     },
     {
@@ -122,8 +122,8 @@
         "model": "rag-embeddings"
       },
       "position": {
-        "x": 1540,
-        "y": 60
+        "x": 2520,
+        "y": 0
       }
     },
     {
@@ -133,8 +133,8 @@
         "namespace": "passages"
       },
       "position": {
-        "x": 1760,
-        "y": 60
+        "x": 2880,
+        "y": 0
       }
     },
     {
@@ -145,8 +145,8 @@
         "collection": "kg_active"
       },
       "position": {
-        "x": 1540,
-        "y": 260
+        "x": 2520,
+        "y": 200
       }
     }
   ],

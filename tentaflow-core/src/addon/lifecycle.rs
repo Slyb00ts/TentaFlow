@@ -1441,6 +1441,42 @@ pub fn sync_manifest_metadata(db: &crate::db::DbPool, manifest: &AddonManifest) 
         repository::upsert_permission_catalog(db, &entry)?;
         keep_ids.push(perm.id.clone());
     }
+
+    // Every addon exposing at least one `[[tool]]` also needs the "llm" entry:
+    // that permission decides whether an agent may see and call those tools, and
+    // no addon declares it in `[[permission]]`. Without a catalog row the admin
+    // matrix (which renders catalog entries only) has nothing to click, so the
+    // grant is unreachable and the tools stay invisible to every non-admin. The
+    // entry is catalogued, never granted — deny-by-default is unchanged.
+    if !manifest.tools.is_empty()
+        && !manifest
+            .declared_permissions
+            .iter()
+            .any(|p| p.id == crate::addon::permissions::LLM_PERMISSION_ID)
+    {
+        let entry = repository::DbAddonPermissionCatalogEntry {
+            addon_id: addon_id.clone(),
+            permission_id: crate::addon::permissions::LLM_PERMISSION_ID.to_string(),
+            display_name: "Udostepnij narzedzia addonu agentom AI".to_string(),
+            description: format!(
+                "Pozwala agentom i modelom wywolywac narzedzia tego addonu ({}). \
+                 Bez tej zgody narzedzia nie pojawiaja sie w katalogu agenta.",
+                manifest
+                    .tools
+                    .iter()
+                    .map(|t| t.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+            risk: "high".to_string(),
+            sort_order: manifest.declared_permissions.len() as i32,
+        };
+        repository::upsert_permission_catalog(db, &entry)?;
+        keep_ids.push(entry.permission_id);
+    }
+
+    // `keep_ids` carries the synthetic entry too, so the diff-delete below never
+    // removes it.
     repository::delete_permission_catalog_missing(db, addon_id, &keep_ids)?;
 
     // 2. OAuth providers — upsert deklaracji
@@ -4839,5 +4875,99 @@ slot = "sidebar"
         assert_eq!(skill.content, "New body\n");
         assert_eq!(skill.tags_json, r#"["admin-tag"]"#);
         assert!(count_skill_captures() > after_edit);
+    }
+
+    /// An addon exposing tools gets the synthetic "llm" catalog entry — the only
+    /// thing that makes the grant clickable in the admin matrix, which renders
+    /// catalog entries and nothing else. Declared permissions are untouched and
+    /// NO grant is created: the entry is an offer, not a decision.
+    #[test]
+    fn tool_addon_gets_synthetic_llm_permission_in_catalog() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let toml = "[addon]\nid = \"deep-research-043b6b64\"\nname = \"Deep Research\"\n\
+                    version = \"1.0.0\"\nwasm_file = \"addon.wasm\"\n\
+                    [[permission]]\nid = \"web.research\"\ndisplay_name = \"Web research\"\n\
+                    description = \"Reads public pages.\"\nrisk = \"critical\"\n\
+                    [[tool]]\nid = \"search_web\"\ndescription = \"Search the public web.\"\n\
+                    [[tool]]\nid = \"read_url\"\ndescription = \"Read one public page.\"\n";
+        let manifest = parse_manifest_toml(toml).expect("manifest");
+        assert_eq!(manifest.tools.len(), 2);
+
+        sync_manifest_metadata(&db, &manifest).expect("sync");
+
+        let catalog = crate::db::repository::list_permission_catalog(&db, &manifest.addon_id)
+            .expect("catalog");
+        let ids: Vec<&str> = catalog.iter().map(|e| e.permission_id.as_str()).collect();
+        assert_eq!(ids, vec!["web.research", "llm"]);
+        let llm = catalog
+            .iter()
+            .find(|e| e.permission_id == crate::addon::permissions::LLM_PERMISSION_ID)
+            .expect("synthetic llm entry");
+        assert!(!llm.display_name.is_empty());
+        assert!(llm.description.contains("search_web"));
+        assert!(llm.description.contains("read_url"));
+        assert_eq!(llm.risk, "high");
+
+        // Deny-by-default survives: cataloguing grants nothing.
+        let granted: i64 = db
+            .read()
+            .unwrap()
+            .query_row(
+                "SELECT COUNT(*) FROM addon_permissions WHERE addon_id = ?1",
+                rusqlite::params![manifest.addon_id],
+                |r| r.get(0),
+            )
+            .expect("count grants");
+        assert_eq!(granted, 0);
+
+        // Re-running the sync (upgrade path) keeps the entry — the diff-delete
+        // must not treat it as a permission the manifest dropped.
+        sync_manifest_metadata(&db, &manifest).expect("resync");
+        let ids: Vec<String> =
+            crate::db::repository::list_permission_catalog(&db, &manifest.addon_id)
+                .expect("catalog")
+                .into_iter()
+                .map(|e| e.permission_id)
+                .collect();
+        assert_eq!(ids, vec!["web.research".to_string(), "llm".to_string()]);
+    }
+
+    /// No `[[tool]]` → no synthetic entry: an addon that exposes nothing to a
+    /// model must not offer the admin a permission that grants nothing.
+    #[test]
+    fn addon_without_tools_gets_no_synthetic_llm_permission() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let toml = "[addon]\nid = \"quiet\"\nname = \"Quiet\"\nversion = \"1.0.0\"\n\
+                    wasm_file = \"addon.wasm\"\n\
+                    [[permission]]\nid = \"storage.read\"\ndisplay_name = \"Read storage\"\n\
+                    description = \"Reads KV.\"\nrisk = \"low\"\n";
+        let manifest = parse_manifest_toml(toml).expect("manifest");
+        sync_manifest_metadata(&db, &manifest).expect("sync");
+        let ids: Vec<String> = crate::db::repository::list_permission_catalog(&db, "quiet")
+            .expect("catalog")
+            .into_iter()
+            .map(|e| e.permission_id)
+            .collect();
+        assert_eq!(ids, vec!["storage.read".to_string()]);
+    }
+
+    /// A manifest that declares "llm" itself keeps ITS wording — the synthetic
+    /// entry must not overwrite an author's declaration.
+    #[test]
+    fn declared_llm_permission_is_not_replaced_by_the_synthetic_entry() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("db");
+        let toml = "[addon]\nid = \"talker\"\nname = \"Talker\"\nversion = \"1.0.0\"\n\
+                    wasm_file = \"addon.wasm\"\n\
+                    [[permission]]\nid = \"llm\"\ndisplay_name = \"Author wording\"\n\
+                    description = \"Declared by the package author.\"\nrisk = \"medium\"\n\
+                    [[tool]]\nid = \"say\"\ndescription = \"Say something.\"\n";
+        let manifest = parse_manifest_toml(toml).expect("manifest");
+        sync_manifest_metadata(&db, &manifest).expect("sync");
+        let catalog =
+            crate::db::repository::list_permission_catalog(&db, "talker").expect("catalog");
+        assert_eq!(catalog.len(), 1);
+        assert_eq!(catalog[0].permission_id, "llm");
+        assert_eq!(catalog[0].display_name, "Author wording");
+        assert_eq!(catalog[0].risk, "medium");
     }
 }

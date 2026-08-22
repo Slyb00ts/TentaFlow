@@ -465,6 +465,10 @@ pub struct AddonDeclaredPermission {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ToolDefinition {
     pub addon_id: String,
+    /// Pakiet, z ktorego pochodzi instancja `addon_id`. Instancja nazywa sie
+    /// `{package_id}-{8 hex}`, wiec sam `addon_id` jest per-instalacja losowy —
+    /// allowlista agenta moze dzieki temu wskazac pakiet zamiast instancji.
+    pub package_id: String,
     pub tool_name: String,
     pub description: String,
     pub parameters_schema: serde_json::Value,
@@ -3157,6 +3161,16 @@ impl AddonManager {
         self.registered_tools.read().clone()
     }
 
+    /// Pakiet narzedzia zarejestrowanego przez instancje `addon_id`. `None` gdy
+    /// narzedzie nie jest zarejestrowane (np. addon wylaczony).
+    pub fn tool_package_id(&self, addon_id: &str, tool_name: &str) -> Option<String> {
+        self.registered_tools
+            .read()
+            .iter()
+            .find(|t| t.addon_id == addon_id && t.tool_name == tool_name)
+            .map(|t| t.package_id.clone())
+    }
+
     /// Zwraca referencje do event bus
     pub fn event_bus(&self) -> &Arc<EventBus> {
         &self.event_bus
@@ -3299,11 +3313,15 @@ impl AddonManager {
 
     /// Rejestruje narzedzia z manifestu addonu
     fn register_tools_from_manifest(&self, manifest: &AddonManifest) -> Result<()> {
+        // Pakiet czytamy z wiersza instancji (`addons.package_id`) — manifest
+        // zna tylko addon_id instancji, a allowlista agenta dopasowuje pakiet.
+        let (package_id, _) = self.addon_package_ref(&manifest.addon_id)?;
         let mut tools = self.registered_tools.write();
 
         for tool in &manifest.tools {
             tools.push(ToolDefinition {
                 addon_id: manifest.addon_id.clone(),
+                package_id: package_id.clone(),
                 tool_name: tool.name.clone(),
                 description: tool.description.clone(),
                 parameters_schema: tool.parameters_schema.clone(),

@@ -70,7 +70,9 @@ impl AgentService {
     /// set. See `services_repo::models::default_llm_model` for what counts.
     pub fn default_llm_model(&self) -> Option<String> {
         let conn = self.db.read().ok()?;
-        crate::services_repo::models::default_llm_model(&conn).ok().flatten()
+        crate::services_repo::models::default_llm_model(&conn)
+            .ok()
+            .flatten()
     }
 
     /// Direct DB handle — the agent_context block uses it to read the skills
@@ -124,6 +126,36 @@ impl AgentService {
     }
 
     // ------------------------------------------------------------------
+    // Addon index
+    // ------------------------------------------------------------------
+
+    /// The addons a model may actually use this turn, derived from the RESOLVED
+    /// tool catalog — the allowlist ∩ permission intersection is computed once,
+    /// in `tool_catalog_from_allowlist`, and this reads its result. An addon the
+    /// principal cannot call therefore never appears in the prompt.
+    ///
+    /// Order follows first appearance in `specs` (i.e. the registry order the
+    /// tools were advertised in), deduplicated. `core.*` builtins carry no addon
+    /// and are skipped; an instance whose row disappeared between catalog
+    /// resolution and this read contributes nothing to describe.
+    pub fn addon_index(&self, specs: &[LlmToolSpec]) -> Result<Vec<repository::AddonPromptInfo>> {
+        let mut seen = std::collections::HashSet::new();
+        let mut out = Vec::new();
+        for spec in specs {
+            let Some((addon_id, _)) = spec.name.split_once('.') else {
+                continue;
+            };
+            if addon_id == super::builtins::CORE_ADDON_ID || !seen.insert(addon_id.to_string()) {
+                continue;
+            }
+            if let Some(info) = repository::get_addon_prompt_info(&self.db, addon_id)? {
+                out.push(info);
+            }
+        }
+        Ok(out)
+    }
+
+    // ------------------------------------------------------------------
     // Tool catalog
     // ------------------------------------------------------------------
 
@@ -155,7 +187,14 @@ impl AgentService {
             // circuits, but keep the check explicit). Admin bypass and grant
             // logic live entirely in the permission engine.
             match user_id.as_deref() {
-                Some(uid) => checker.check(addon_id, uid, "llm", None).is_granted(),
+                Some(uid) => checker
+                    .check(
+                        addon_id,
+                        uid,
+                        crate::addon::permissions::LLM_PERMISSION_ID,
+                        None,
+                    )
+                    .is_granted(),
                 None => false,
             }
         })
@@ -291,8 +330,14 @@ impl AgentService {
 
     /// Whether a model-issued tool name is inside the agent's allowlist — the
     /// tool_exec block rejects out-of-surface calls before dispatch (§3.3).
+    /// The package behind the called instance comes from the SAME live registry
+    /// the catalog resolves against, so a package-level allowlist entry admits
+    /// the call here exactly when it advertised the tool to the model.
     pub fn tool_allowed(&self, tools_json: &str, name: &str) -> bool {
-        tool_in_allowlist(tools_json, name)
+        let package_id = name.split_once('.').and_then(|(addon_id, tool_name)| {
+            self.addon_manager.tool_package_id(addon_id, tool_name)
+        });
+        tool_in_allowlist(tools_json, name, package_id.as_deref())
     }
 
     /// The allowlist of the agent the harness pinned on the run
@@ -421,6 +466,61 @@ mod tests {
         Arc::new(crate::db::Db::from_connection(conn))
     }
 
+    fn addon_manager(pool: DbPool) -> Arc<crate::addon::AddonManager> {
+        let cipher = Arc::new(crate::crypto::SettingsCipher::new(&[0u8; 32]));
+        Arc::new(crate::addon::AddonManager::new(pool, cipher).expect("addon manager"))
+    }
+
+    fn spec(name: &str) -> LlmToolSpec {
+        LlmToolSpec {
+            name: name.to_string(),
+            description: format!("{name} description"),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    /// One installed instance row: `addon_id` is the instance, `package_id` the
+    /// package it was created from.
+    fn seed_addon_row(
+        pool: &DbPool,
+        addon_id: &str,
+        package_id: &str,
+        display_name: &str,
+        description: &str,
+    ) {
+        pool.write()
+            .unwrap()
+            .execute(
+                "INSERT INTO addons (addon_id, name, display_name, version, package_id, \
+                 package_version, description, platforms, manifest_json) \
+                 VALUES (?1, ?2, ?3, '1.0.0', ?4, '1.0.0', ?5, 'linux', '{}')",
+                rusqlite::params![addon_id, package_id, display_name, package_id, description],
+            )
+            .expect("seed addon row");
+    }
+
+    /// A skill materialized from an addon's SKILL.md (source='addon').
+    fn seed_addon_skill(pool: &DbPool, id: &str, name: &str, addon_id: &str) {
+        repository::upsert_skill(
+            pool,
+            &SkillParams {
+                id,
+                name,
+                display_name: None,
+                description: "Addon skill",
+                content: "# How to use this addon",
+                tags_json: "[]",
+                category: None,
+                source: "addon",
+                source_ref: Some(addon_id),
+                status: "active",
+                created_by: None,
+                actor_user_id: None,
+            },
+        )
+        .expect("seed addon skill");
+    }
+
     fn seed_skill(pool: &DbPool, id: &str, name: &str) {
         seed_skill_full(pool, id, name, "A test skill", "[]", "active");
     }
@@ -547,5 +647,77 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("nope"));
+    }
+
+    /// The addon index is DERIVED from the resolved catalog: one entry per addon
+    /// that actually contributed a tool, in first-appearance order, with the
+    /// display name/description an operator sees and the addon's skill when it
+    /// has one. `core.*` never yields an addon.
+    // `AddonManager::new` starts the permission-cache refresh task, so the
+    // service needs a reactor.
+    #[tokio::test]
+    async fn addon_index_describes_only_addons_present_in_the_resolved_catalog() {
+        let pool = db();
+        seed_addon_row(
+            &pool,
+            "deep-research-043b6b64",
+            "deep-research",
+            "Deep Research",
+            "Searches the public web.",
+        );
+        seed_addon_row(&pool, "memory-aa11bb22", "memory", "", "Remembers facts.");
+        seed_addon_skill(
+            &pool,
+            "33333333-0000-0000-0000-000000000001",
+            "deep-research",
+            "deep-research-043b6b64",
+        );
+
+        let specs = vec![
+            spec("deep-research-043b6b64.search_web"),
+            spec("deep-research-043b6b64.read_url"),
+            spec("memory-aa11bb22.memory_store"),
+            spec("core.skill_view"),
+        ];
+        let service = AgentService::new(pool.clone(), addon_manager(pool));
+        let index = service.addon_index(&specs).expect("addon index");
+
+        assert_eq!(index.len(), 2, "one entry per addon, deduplicated");
+        assert_eq!(index[0].addon_id, "deep-research-043b6b64");
+        assert_eq!(index[0].display_name, "Deep Research");
+        assert_eq!(index[0].description, "Searches the public web.");
+        assert_eq!(index[0].skill_name.as_deref(), Some("deep-research"));
+        // No display_name → the manifest name carries the label; no skill → None.
+        assert_eq!(index[1].addon_id, "memory-aa11bb22");
+        assert_eq!(index[1].display_name, "memory");
+        assert_eq!(index[1].skill_name, None);
+    }
+
+    /// An addon the catalog did NOT admit contributes no line — the prompt can
+    /// never advertise an addon whose tools the principal may not call.
+    // `AddonManager::new` starts the permission-cache refresh task, so the
+    // service needs a reactor.
+    #[tokio::test]
+    async fn addon_index_omits_an_addon_with_no_admitted_tool() {
+        let pool = db();
+        seed_addon_row(
+            &pool,
+            "memory-aa11bb22",
+            "memory",
+            "Memory",
+            "Remembers facts.",
+        );
+        seed_addon_row(
+            &pool,
+            "contacts-cc33dd44",
+            "contacts",
+            "Contacts",
+            "CRM source of truth.",
+        );
+        let specs = vec![spec("memory-aa11bb22.memory_store")];
+        let service = AgentService::new(pool.clone(), addon_manager(pool));
+        let index = service.addon_index(&specs).expect("addon index");
+        let ids: Vec<&str> = index.iter().map(|a| a.addon_id.as_str()).collect();
+        assert_eq!(ids, vec!["memory-aa11bb22"]);
     }
 }

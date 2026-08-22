@@ -21,6 +21,13 @@ use crate::db::DbPool;
 // Typy uprawnien
 // =============================================================================
 
+/// Permission id gating "may a model/agent call this addon's tools" and the
+/// addon's own `llm_*` host functions. Addons do not declare it in
+/// `[[permission]]`; `sync_manifest_metadata` synthesizes a catalog entry for
+/// every addon that exposes at least one `[[tool]]`, so an admin can grant it
+/// in the permission matrix. Never granted by default.
+pub const LLM_PERMISSION_ID: &str = "llm";
+
 /// Wynik sprawdzenia uprawnienia
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PermissionResult {

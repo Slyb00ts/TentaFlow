@@ -13,13 +13,13 @@
       "id": "seed",
       "type": "rag_query_seed",
       "config": {},
-      "position": { "x": 200, "y": 0 }
+      "position": { "x": 360, "y": 0 }
     },
     {
       "id": "graph_seed",
       "type": "rag_graph_seed",
       "config": {},
-      "position": { "x": 300, "y": 0 }
+      "position": { "x": 720, "y": 0 }
     },
     {
       "id": "embed_query",
@@ -27,7 +27,7 @@
       "config": {
         "model": "rag-embeddings"
       },
-      "position": { "x": 400, "y": 0 }
+      "position": { "x": 1080, "y": 0 }
     },
     {
       "id": "retrieve",
@@ -38,7 +38,7 @@
         "metric": "cosine",
         "output_fields": ["text", "doc_id", "chunk_index", "collection_id"]
       },
-      "position": { "x": 600, "y": 0 }
+      "position": { "x": 1440, "y": 0 }
     },
     {
       "id": "rerank",
@@ -47,19 +47,19 @@
         "model": "rag-reranker",
         "top_n": 5
       },
-      "position": { "x": 800, "y": 0 }
+      "position": { "x": 1800, "y": 0 }
     },
     {
       "id": "accumulate",
       "type": "rag_accumulate",
       "config": {},
-      "position": { "x": 1000, "y": 0 }
+      "position": { "x": 2160, "y": 0 }
     },
     {
       "id": "graph_facts",
       "type": "rag_graph_facts",
       "config": {},
-      "position": { "x": 1100, "y": 0 }
+      "position": { "x": 2520, "y": 0 }
     },
     {
       "id": "judge",
@@ -68,19 +68,19 @@
         "model": "rag-llm",
         "system_prompt": "Jestes SEDZIA retrievalu RAG. Dostajesz oryginalne pytanie uzytkownika i zakumulowane pasaze (kontekst). Oce, czy kontekst WYSTARCZA do pelnej, popartej zrodlami odpowiedzi na pytanie. Odpowiedz WYLACZNIE jednym obiektem JSON, bez zadnego innego tekstu: {\"enough\": true} gdy kontekst starczy, albo {\"enough\": false, \"next_query\": \"<konkretne pod-pytanie do nastepnego wyszukiwania>\"} gdy brakuje informacji. next_query ma byc samodzielnym zapytaniem wyszukiwarki (nie meta-komentarzem). Nie odpowiadaj na samo pytanie — tylko ocen wystarczalnosc kontekstu."
       },
-      "position": { "x": 1200, "y": 0 }
+      "position": { "x": 2880, "y": 0 }
     },
     {
       "id": "verdict",
       "type": "rag_judge",
       "config": {},
-      "position": { "x": 1400, "y": 0 }
+      "position": { "x": 3240, "y": 0 }
     },
     {
       "id": "out",
       "type": "output",
       "config": {},
-      "position": { "x": 1600, "y": 0 }
+      "position": { "x": 3600, "y": 0 }
     }
   ],
   "edges": [
