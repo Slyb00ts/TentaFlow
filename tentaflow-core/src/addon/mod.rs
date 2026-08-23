@@ -1941,6 +1941,87 @@ impl AddonManager {
         }
     }
 
+    /// Boot-time re-registration of runtime artifacts (tools, custom flow
+    /// blocks) for every ENABLED installed instance. The registries are
+    /// in-memory and start empty each process — without this pass the agent
+    /// tool catalog and the LLM tool dispatch lose every addon group after a
+    /// restart until something reinstalls or sync-reconciles the instance.
+    /// Deliberately narrower than `register_addon_runtime`: aliases stay as the
+    /// DB left them (activation is durable state, not a boot side effect), and
+    /// no instance is STARTED — service mode keeps its own auto-start path.
+    pub fn register_installed_runtimes(&self) {
+        let addons = match crate::db::repository::list_addons(&self.db) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("register_installed_runtimes: list_addons: {}", e);
+                return;
+            }
+        };
+        let mut registered = 0usize;
+        for a in &addons {
+            if !a.is_enabled {
+                continue;
+            }
+            // Idempotence guard: install/update/sync-reconcile may already have
+            // populated this instance's entries earlier in the same process.
+            if self.registered_tools.read().iter().any(|t| t.addon_id == a.addon_id)
+                && self.flow_blocks_registry.has_addon_blocks(&a.addon_id)
+            {
+                continue;
+            }
+            // manifest_json to RAW manifest.toml (kolumna myli nazwą — patrz
+            // lifecycle.rs), parsujemy jak auto_start_services.
+            let manifest = match lifecycle::parse_manifest_toml(&a.manifest_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "register_installed_runtimes: '{}' manifest niepoprawny: {}",
+                        a.addon_id, e
+                    );
+                    continue;
+                }
+            };
+            let mut tools = self.registered_tools.write();
+            if !tools.iter().any(|t| t.addon_id == a.addon_id) && !manifest.tools.is_empty() {
+                let Ok((package_id, _)) = self.addon_package_ref(&a.addon_id) else {
+                    drop(tools);
+                    continue;
+                };
+                for tool in &manifest.tools {
+                    tools.push(ToolDefinition {
+                        addon_id: a.addon_id.clone(),
+                        package_id: package_id.clone(),
+                        tool_name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        parameters_schema: tool.parameters_schema.clone(),
+                        return_schema: tool.return_schema.clone(),
+                        keywords: tool.keywords.clone(),
+                    });
+                }
+            }
+            drop(tools);
+            // Custom flow bloki czytamy z katalogu wersjonowanego pakietu; ich
+            // brak jest normalny (addon ich nie deklaruje).
+            let pkg_dir = bundled::package_dir(&a.package_id, &a.package_version);
+            match flow_blocks::load_blocks_from_addon(&a.addon_id, &pkg_dir) {
+                Ok(blocks) if !blocks.is_empty() => {
+                    self.flow_blocks_registry
+                        .register_addon_blocks(&a.addon_id, blocks);
+                }
+                Ok(_) => {}
+                Err(e) => warn!(
+                    "register_installed_runtimes: '{}': blocks.json: {}",
+                    a.addon_id, e
+                ),
+            }
+            registered += 1;
+        }
+        info!(
+            "register_installed_runtimes: przejście po {} włączonych instancjach zakończone",
+            registered
+        );
+    }
+
     /// Toggle `is_enabled` flagi w DB + runtime side-effects:
     /// - `enabled = false`: zatrzymuje wszystkie running instances tego addonu
     ///   (anulujac service tick loops). Konfiguracja zostaje w DB, mozna

@@ -669,6 +669,10 @@ async fn run_server(args: Args) -> Result<()> {
             .expect("Blad inicjalizacji AddonManager"),
     );
     addon_manager.set_router(router.clone());
+    // Narzedzia i custom flow bloki sa rejestrowane w pamieci procesu — po
+    // restarcie bez tego przejscia katalog narzedzi agenta i dispatch narzedzi
+    // LLM tracilyby wszystkie grupy addonow az do reinstallu / sync-reconcile.
+    addon_manager.register_installed_runtimes();
     // Wpiecie reconcilera mesh-sync: gdy zreplikowana instancja addona wyladuje,
     // sync runtime kaze AddonManagerowi zaladowac/odladowac runtime wg stanu DB.
     tentaflow_core::sync::runtime::set_global_addon_reconciler(addon_manager.clone());

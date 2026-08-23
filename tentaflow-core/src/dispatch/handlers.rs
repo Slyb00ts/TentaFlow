@@ -7798,6 +7798,10 @@ struct CatalogAddonGroup {
     display_name: String,
     /// Manifest one-liner, so the admin knows what the addon actually does.
     description: String,
+    /// True when a live instance backs this group (tools are callable once the
+    /// allowlist admits them). False = catalog package without an installed
+    /// instance: the tools render read-only until the admin installs one.
+    installed: bool,
 }
 
 #[derive(serde::Serialize)]
@@ -7807,23 +7811,25 @@ struct ToolsCatalog {
 }
 
 /// Builds the pickable tool catalog: addon tools grouped by `addon_id`, then
-/// the `core.*` builtins. Shared by the ToolsCatalog handler and the
-/// agent-builder assistant so both see the exact same tool universe.
+/// the `core.*` builtins. Groups backed by a live instance come from the
+/// in-memory tool registry; catalog packages WITHOUT an installed instance are
+/// still listed (`installed: false`) with their manifest-declared tools, so an
+/// agent author can see what an addon would offer and what installing it
+/// unlocks. Shared by the ToolsCatalog handler and the agent-builder assistant
+/// so both see the exact same tool universe.
 fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolError> {
     use std::collections::BTreeMap;
-    let meta: std::collections::HashMap<String, (String, String)> =
-        repository::list_addons(&ctx.state.db)
-            .map_err(db_err)?
-            .into_iter()
-            .map(|a| {
-                let label = if a.display_name.trim().is_empty() {
-                    a.name.clone()
-                } else {
-                    a.display_name.clone()
-                };
-                (a.addon_id, (label, a.description))
-            })
-            .collect();
+    let instances = repository::list_addons(&ctx.state.db).map_err(db_err)?;
+    let mut meta: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::with_capacity(instances.len());
+    for a in instances {
+        let label = if a.display_name.trim().is_empty() {
+            a.name.clone()
+        } else {
+            a.display_name.clone()
+        };
+        meta.insert(a.addon_id, (label, a.description));
+    }
     let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
     if let Some(manager) = &ctx.state.addon_manager {
         for tool in manager.list_tools() {
@@ -7837,22 +7843,53 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
                 });
         }
     }
-    let addons = grouped
+    let mut group_of = |addon_id: String, tools: Vec<CatalogTool>, installed: bool| {
+        let mut tools = tools;
+        tools.sort_by(|a, b| a.name.cmp(&b.name));
+        let (display_name, description) = meta
+            .get(&addon_id)
+            .cloned()
+            .unwrap_or_else(|| (addon_id.clone(), String::new()));
+        CatalogAddonGroup {
+            addon_id,
+            tools,
+            display_name,
+            description,
+            installed,
+        }
+    };
+    let mut addons: Vec<CatalogAddonGroup> = grouped
         .into_iter()
-        .map(|(addon_id, mut tools)| {
-            tools.sort_by(|a, b| a.name.cmp(&b.name));
-            let (display_name, description) = meta
-                .get(&addon_id)
-                .cloned()
-                .unwrap_or_else(|| (addon_id.clone(), String::new()));
-            CatalogAddonGroup {
-                addon_id,
-                tools,
-                display_name,
-                description,
-            }
-        })
+        .map(|(addon_id, tools)| group_of(addon_id, tools, true))
         .collect();
+    // Catalog packages without an instance: latest version wins (the listing is
+    // ordered newest first per package). A package whose id already has an
+    // instance group is skipped — its live tools are the source of truth.
+    let mut covered: std::collections::HashSet<String> =
+        addons.iter().map(|g| g.addon_id.clone()).collect();
+    for row in repository::list_addon_packages(&ctx.state.db).unwrap_or_default() {
+        if !covered.insert(row.package_id.clone()) || row.package_id == crate::agents::CORE_ADDON_ID
+        {
+            continue;
+        }
+        let Ok(manifest) = crate::addon::lifecycle::parse_manifest_toml(&row.manifest_json) else {
+            continue;
+        };
+        let tools: Vec<CatalogTool> = manifest
+            .tools
+            .iter()
+            .map(|t| CatalogTool {
+                name: format!("{}.{}", row.package_id, t.name),
+                description: t.description.clone(),
+                parameters: t.parameters_schema.clone(),
+            })
+            .collect();
+        if tools.is_empty() {
+            continue;
+        }
+        addons.push(group_of(row.package_id, tools, false));
+    }
+    addons.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
     let core = crate::agents::CoreToolName::all()
         .iter()
         .map(|t| {

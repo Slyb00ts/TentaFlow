@@ -276,6 +276,12 @@ impl AddonFlowRegistry {
         );
     }
 
+    /// Czy addon ma jakiekolwiek zarejestrowane bloczki (guard idempotencji
+    /// bootowej rejestracji runtime).
+    pub fn has_addon_blocks(&self, addon_id: &str) -> bool {
+        self.blocks.read().iter().any(|b| b.addon_id == addon_id)
+    }
+
     /// Wyrejestrowuje wszystkie bloczki addonu
     pub fn unregister_addon_blocks(&self, addon_id: &str) {
         let mut blocks = self.blocks.write();
