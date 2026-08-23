@@ -502,56 +502,100 @@
   gap: 14px;
 }
 
-.agents-pg-header {
+/* --- Detail shell (A02-A05): breadcrumb -> header card -> tabs --- */
+
+.ag-detail {
   display: flex;
-  align-items: flex-start;
+  flex-direction: column;
   gap: 14px;
-  flex-wrap: wrap;
 }
 
-.agents-pg-av {
-  width: 46px;
-  height: 46px;
-  flex-shrink: 0;
-  border-radius: var(--radius);
-  background: var(--gradient-soft);
+.ag-breadcrumb {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 12px;
+  color: var(--text-3);
+}
+
+.ag-breadcrumb .crumb {
+  cursor: pointer;
+}
+
+.ag-breadcrumb .crumb:hover {
   color: var(--accent-2);
+}
+
+.ag-breadcrumb .crumb.active {
+  color: var(--text);
+  cursor: default;
+  font-weight: 600;
+}
+
+.ag-breadcrumb .sep {
+  opacity: 0.6;
+}
+
+.ag-breadcrumb .sep .icon {
+  width: 12px;
+  height: 12px;
+}
+
+.ag-detail-header .big-ico {
+  width: 60px;
+  height: 60px;
+  border-radius: var(--radius);
+  background: var(--gradient-accent);
+  color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
+  flex-shrink: 0;
 }
 
-.agents-pg-heading {
+.ag-detail-header .big-ico .icon {
+  width: 28px;
+  height: 28px;
+}
+
+.ag-detail-header .d-meta {
   flex: 1;
-  min-width: 240px;
+  min-width: 260px;
 }
 
-.agents-pg-name {
+.ag-detail-header .d-name {
   display: flex;
   align-items: center;
   gap: 10px;
-  font-size: 16px;
+  font-size: 20px;
   font-weight: 800;
   color: var(--text);
+  flex-wrap: wrap;
 }
 
-.agents-pg-sub {
+.ag-detail-header .d-sub {
   font-size: 12px;
   color: var(--text-3);
   margin-top: 3px;
 }
 
-.agents-pg-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-  margin-top: 8px;
+.ag-detail-header .d-sub.mono,
+.mono {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
 }
 
-.agents-pg-actions {
+.ag-detail-header .d-badges {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+
+.ag-detail-header .d-actions {
   display: flex;
   align-items: center;
   gap: 8px;
+  flex-wrap: wrap;
 }
 
 .agents-pg-banner {
@@ -575,11 +619,22 @@
   color: var(--info);
 }
 
-.agents-pg-cols {
+.ag-test-cols {
   display: grid;
-  grid-template-columns: 1fr 1fr;
+  grid-template-columns: 1.2fr 1fr;
   gap: 14px;
   align-items: start;
+}
+
+.ag-test-side {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  min-width: 0;
+}
+
+.ag-test-banner {
+  margin-bottom: 0;
 }
 
 .agents-pg-chat {
@@ -1011,5 +1066,186 @@
 
   .agents-slider-row > div:first-child {
     grid-column: 1 / -1;
+  }
+}
+
+/* --- Config tab (A02): sectioned inline editor + sticky save bar --- */
+
+.agents-section {
+  padding: 16px 18px;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+}
+
+.agents-section-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 0;
+  font-size: 11px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: var(--accent-2);
+}
+
+.agents-section-title .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.ag-prompt-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.ag-prompt-count {
+  font-size: 11px;
+  color: var(--text-3);
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+}
+
+.ag-save-bar {
+  position: sticky;
+  bottom: 12px;
+  z-index: 5;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  padding: 10px 16px;
+  border: 1px solid var(--accent-1);
+  border-radius: var(--radius);
+  background: var(--bg-2);
+  box-shadow: 0 -8px 24px rgba(0, 0, 0, 0.35);
+}
+
+.ag-save-bar-text {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.ag-save-bar-text .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--warning);
+}
+
+.ag-save-bar-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* --- Tools tab (A03): two-column picker with catalog packages --- */
+
+.ag-tools-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  font-size: 12.5px;
+  color: var(--text-2);
+}
+
+.ag-tools-summary .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent-1);
+}
+
+.ag-tools-layout {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
+  gap: 14px;
+  align-items: start;
+}
+
+.ag-tools-main {
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  min-width: 0;
+}
+
+.ag-tools-side {
+  position: sticky;
+  top: 0;
+}
+
+.ag-core-subhead {
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-3);
+  margin-top: 6px;
+}
+
+.agents-tool-group-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+
+.agents-tool-group-ico {
+  width: 22px;
+  height: 22px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--accent-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.agents-tool-group-ico .icon {
+  width: 13px;
+  height: 13px;
+}
+
+/* Catalog packages without an installed instance stay visible but read-only:
+   the group renders dashed and its toggles are inert until the admin installs
+   one from the addon catalog. */
+.agents-tool-group.is-not-installed {
+  border-style: dashed;
+  opacity: 0.85;
+}
+
+.agents-tool-group.is-not-installed .agents-tool-item tf-toggle {
+  opacity: 0.4;
+  pointer-events: none;
+}
+
+.ag-install-hint {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 10.5px;
+  font-weight: 700;
+  color: var(--warning);
+}
+
+.ag-install-hint .icon {
+  width: 12px;
+  height: 12px;
+}
+
+@media (max-width: 1000px) {
+  .ag-tools-layout,
+  .ag-test-cols {
+    grid-template-columns: 1fr;
+  }
+
+  .ag-tools-side {
+    position: static;
   }
 }
