@@ -190,9 +190,10 @@ Host fns `directory_users/groups/roles/org_v1` (scope `directory.read`) expose t
 catalog. Rust addons get typed UI catalog v1 bindings via `scripts/gen-rust.sh` →
 `addon-sdk/sdk/src/ui_v1/` (same codegen pipeline as C#/Python).
 
-Tool/block registries live only in memory: at boot `register_installed_addon_runtimes`
-restores them from every ENABLED row in `addons` — a restart must not hide addon tools
-from agents. `call_tool`/`invoke_block` honor guest return code 3
+Tool/block registries live only in memory: at boot `register_installed_runtimes`
+restores tools and custom flow blocks from every ENABLED row in `addons` (aliases
+stay as the DB left them; instances start via auto-start) — a restart must not hide
+addon tools from agents. `call_tool`/`invoke_block` honor guest return code 3
 (`ABI_OUTPUT_BUFFER_TOO_SMALL`: required length on `out_len_ptr`) by reallocating the
 `on_request` output buffer and retrying, up to 8 MB; code 2 and other errors still fail.
 

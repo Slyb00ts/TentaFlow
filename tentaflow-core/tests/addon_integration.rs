@@ -327,7 +327,7 @@ async fn addon_tool_registry_restored_after_restart() {
     );
 
     // Boot restore zaslania to z wierszy `addons` (tylko is_enabled=1).
-    restarted.register_installed_addon_runtimes();
+    restarted.register_installed_runtimes();
     assert!(
         restarted
             .list_tools()
@@ -338,7 +338,7 @@ async fn addon_tool_registry_restored_after_restart() {
 
     // Idempotencja: powtorka restore nie moze duplikowac wpisow.
     let before = restarted.list_tools().len();
-    restarted.register_installed_addon_runtimes();
+    restarted.register_installed_runtimes();
     assert_eq!(
         restarted.list_tools().len(),
         before,
@@ -355,7 +355,7 @@ async fn addon_tool_registry_restored_after_restart() {
         .unwrap();
     }
     let third = AddonManager::new(db.clone(), cipher.clone()).expect("AddonManager::new");
-    third.register_installed_addon_runtimes();
+    third.register_installed_runtimes();
     assert!(
         !third
             .list_tools()
