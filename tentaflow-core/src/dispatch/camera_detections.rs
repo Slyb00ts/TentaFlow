@@ -208,18 +208,10 @@ fn camera_detections_subscribe_handler(
         // starting a local loop too would double-publish overlays.
         #[cfg(feature = "inference-vision-gpu")]
         {
-            #[cfg(all(
-                unix,
-                feature = "camera",
-                feature = "inference-vision-gpu",
-            ))]
+            #[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu",))]
             let worker_owned =
                 crate::services::vision_worker::fleet::is_worker_camera(&camera_id).is_some();
-            #[cfg(not(all(
-                unix,
-                feature = "camera",
-                feature = "inference-vision-gpu",
-            )))]
+            #[cfg(not(all(unix, feature = "camera", feature = "inference-vision-gpu",)))]
             let worker_owned = false;
             if !worker_owned {
                 crate::services::camera_ingest::vision_analysis::ensure_analysis(&camera_id);

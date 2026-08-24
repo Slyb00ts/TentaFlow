@@ -325,7 +325,8 @@ mod tests {
             .unwrap();
         }
 
-        let error = append(&pool, &main, request_started("r-1")).expect_err("the append must fail loudly");
+        let error =
+            append(&pool, &main, request_started("r-1")).expect_err("the append must fail loudly");
         assert!(
             error.to_string().contains("outbox unavailable"),
             "the failure was reported as something else: {error:#}"
@@ -385,7 +386,8 @@ mod tests {
         // Recovery replays it: one duplicate, never a loss.
         {
             let conn = pool.write().unwrap();
-            conn.execute_batch("DROP TRIGGER cannot_mark_delivered;").unwrap();
+            conn.execute_batch("DROP TRIGGER cannot_mark_delivered;")
+                .unwrap();
         }
         let report = deliver_pending(&main, &pool, 10).unwrap();
         assert_eq!(report.delivered, 1);
@@ -451,7 +453,12 @@ mod tests {
         let (_dir, pool) = events_db();
         let main = main_db();
 
-        append(&pool, &main, request_started("r-tenant").with_org("org-acme")).unwrap();
+        append(
+            &pool,
+            &main,
+            request_started("r-tenant").with_org("org-acme"),
+        )
+        .unwrap();
 
         let system = RunEvent::new(
             "r-system",
@@ -503,7 +510,10 @@ mod tests {
                 |row| row.get(0),
             )
             .unwrap();
-        assert_eq!(scoped, 0, "a tenant-less run was filed under the default organisation");
+        assert_eq!(
+            scoped, 0,
+            "a tenant-less run was filed under the default organisation"
+        );
     }
 
     /// The timeline is diagnostic, the audit log is a commitment. Mirroring
@@ -587,7 +597,10 @@ mod tests {
         assert!(next.is_some(), "no backoff was scheduled");
 
         let immediate = deliver_pending(&main, &pool, 10).unwrap();
-        assert_eq!(immediate.failed, 0, "a deferred row was retried immediately");
+        assert_eq!(
+            immediate.failed, 0,
+            "a deferred row was retried immediately"
+        );
 
         {
             let conn = main.write().unwrap();

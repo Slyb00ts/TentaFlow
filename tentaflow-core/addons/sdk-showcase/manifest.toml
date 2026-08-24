@@ -225,6 +225,12 @@ description = "Permission id to test."
 required = true
 
 [[tool]]
+id = "test_generic_error"
+display_name = "Generic guest error"
+description = "Fixture: returns guest error code 2 (no host retry)."
+keywords = ["test"]
+
+[[tool]]
 id = "test_log"
 display_name = "Log test"
 description = "Test structured logging from the guest."

@@ -704,10 +704,15 @@ impl SandboxManager {
         worktree: &Path,
     ) -> std::result::Result<Started, SandboxError> {
         let sandbox_id = uuid::Uuid::new_v4().to_string();
-        let lease_id = profile
-            .ephemeral
-            .then(|| uuid::Uuid::new_v4().to_string());
-        self.insert_row(pool, &sandbox_id, session_id, profile, &lease_id, owner_run_id)?;
+        let lease_id = profile.ephemeral.then(|| uuid::Uuid::new_v4().to_string());
+        self.insert_row(
+            pool,
+            &sandbox_id,
+            session_id,
+            profile,
+            &lease_id,
+            owner_run_id,
+        )?;
 
         let runtime = self.container.as_ref().map(|c| c.runtime);
         let workplace = self
@@ -845,7 +850,8 @@ impl SandboxManager {
                 if state.holders > 0 || state.sandbox.is_none() {
                     continue;
                 }
-                let idle = matches!(state.idle_since, Some(since) if since.elapsed() >= self.idle_ttl);
+                let idle =
+                    matches!(state.idle_since, Some(since) if since.elapsed() >= self.idle_ttl);
                 if !idle {
                     continue;
                 }
@@ -879,10 +885,15 @@ impl SandboxManager {
         // the one place restart reconciliation records the outcome.
         for sandbox in take_session_sandboxes(&self.root, session_id) {
             if let Err(e) = sandbox.tear_down() {
-                warn!(session_id, "shared sandbox not torn down at reconcile: {e:#}");
+                warn!(
+                    session_id,
+                    "shared sandbox not torn down at reconcile: {e:#}"
+                );
             }
         }
-        let conn = pool.write().map_err(|e| anyhow!("workspace db write: {e}"))?;
+        let conn = pool
+            .write()
+            .map_err(|e| anyhow!("workspace db write: {e}"))?;
         let closed = conn.execute(
             "UPDATE sandboxes SET state='stopped', stopped_at=datetime('now'), lease_id=NULL \
              WHERE session_id = ?1 AND state != 'stopped'",
@@ -941,7 +952,9 @@ impl SandboxManager {
     }
 
     fn mark_ready(&self, pool: &DbPool, sandbox_id: &str, runtime_ref: Option<&str>) -> Result<()> {
-        let conn = pool.write().map_err(|e| anyhow!("workspace db write: {e}"))?;
+        let conn = pool
+            .write()
+            .map_err(|e| anyhow!("workspace db write: {e}"))?;
         conn.execute(
             "UPDATE sandboxes SET state='ready', runtime_ref=?2 WHERE id = ?1",
             rusqlite::params![sandbox_id, runtime_ref],
@@ -986,8 +999,9 @@ impl SandboxManager {
             .map_err(SandboxError::Other)?;
         let base = self.toolchain_base();
         for dir in [&base, &overlay] {
-            std::fs::create_dir_all(dir)
-                .map_err(|e| SandboxError::Other(anyhow!("toolchain cache {}: {e}", dir.display())))?;
+            std::fs::create_dir_all(dir).map_err(|e| {
+                SandboxError::Other(anyhow!("toolchain cache {}: {e}", dir.display()))
+            })?;
         }
         std::fs::create_dir_all(workplace.join("tmp"))
             .map_err(|e| SandboxError::Other(anyhow!("sandbox tmp: {e}")))?;
@@ -998,9 +1012,8 @@ impl SandboxManager {
             ExecMode::TrustedNative => {
                 self.materialise_native(profile, worktree, workplace, &base, &overlay)
             }
-            ExecMode::Container => self.materialise_container(
-                sandbox_id, profile, worktree, workplace, &base, &overlay,
-            ),
+            ExecMode::Container => self
+                .materialise_container(sandbox_id, profile, worktree, workplace, &base, &overlay),
         }
     }
 
@@ -1134,7 +1147,10 @@ impl SandboxManager {
             (overlay, CONTAINER_TOOLCHAIN_OVERLAY, "rw"),
         ] {
             let host = host.to_str().ok_or_else(|| {
-                SandboxError::Other(anyhow!("sandbox path is not valid UTF-8: {}", host.display()))
+                SandboxError::Other(anyhow!(
+                    "sandbox path is not valid UTF-8: {}",
+                    host.display()
+                ))
             })?;
             argv.push("--volume".into());
             argv.push(format!("{host}:{guest}:{mode}"));
@@ -1243,8 +1259,9 @@ impl SandboxManager {
         };
 
         let copy = root.join("work");
-        std::fs::create_dir_all(&copy)
-            .map_err(|e| SandboxError::cow(format!("{overlay_reason}create copy directory: {e}")))?;
+        std::fs::create_dir_all(&copy).map_err(|e| {
+            SandboxError::cow(format!("{overlay_reason}create copy directory: {e}"))
+        })?;
         match LayerPass::Materialise.run(worktree, &copy, &self.cow_budget, Mirror::default()) {
             Ok(pass) => Ok(BuiltLayer {
                 work_dir: copy.clone(),
@@ -1483,8 +1500,8 @@ fn mount_overlay(lower: &Path, upper: &Path, work: &Path, merged: &Path) -> Resu
         options.push_str(text);
     }
     let fstype = CString::new("overlay").map_err(|e| e.to_string())?;
-    let target = CString::new(merged.as_os_str().to_string_lossy().as_bytes())
-        .map_err(|e| e.to_string())?;
+    let target =
+        CString::new(merged.as_os_str().to_string_lossy().as_bytes()).map_err(|e| e.to_string())?;
     let data = CString::new(options).map_err(|e| e.to_string())?;
     let rc = unsafe {
         libc::mount(
@@ -1521,7 +1538,10 @@ fn unmount_overlay(merged: &Path) -> Result<()> {
     if rc == 0 {
         Ok(())
     } else {
-        Err(anyhow!("umount overlay: {}", std::io::Error::last_os_error()))
+        Err(anyhow!(
+            "umount overlay: {}",
+            std::io::Error::last_os_error()
+        ))
     }
 }
 
@@ -1890,7 +1910,8 @@ fn remove_layer_path(path: &Path) -> Result<(), String> {
 /// tree is reproduced as written, because inside the copy it resolves inside
 /// the copy.
 fn copy_symlink(root: &Path, from: &Path, to: &Path) -> Result<(), String> {
-    let target = std::fs::read_link(from).map_err(|e| format!("readlink {}: {e}", from.display()))?;
+    let target =
+        std::fs::read_link(from).map_err(|e| format!("readlink {}: {e}", from.display()))?;
     if !link_stays_inside(root, from, &target) {
         return Err(format!(
             "{} is a symbolic link to {}, which is outside the tree being copied; a copy-on-write \
@@ -2076,7 +2097,11 @@ mod tests {
             std::os::unix::fs::symlink("main.rs", worktree.join("src/alias.rs")).unwrap();
         }
         // A worktree's `.git` is a pointer file into the reference repository.
-        std::fs::write(worktree.join(".git"), b"gitdir: ../../repo/.git/worktrees/s-1\n").unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            b"gitdir: ../../repo/.git/worktrees/s-1\n",
+        )
+        .unwrap();
         worktree
     }
 
@@ -2144,7 +2169,10 @@ mod tests {
         std::fs::write(cwd.join("target/binary"), b"built").unwrap();
         std::fs::write(cwd.join("src/main.rs"), b"fn main() { panic!() }\n").unwrap();
 
-        assert!(!worktree.join("target").exists(), "target/ escaped into the worktree");
+        assert!(
+            !worktree.join("target").exists(),
+            "target/ escaped into the worktree"
+        );
         assert_eq!(
             std::fs::read(worktree.join("src/main.rs")).unwrap(),
             b"fn main() {}\n",
@@ -2463,7 +2491,10 @@ mod tests {
 
         // Releasing one leaves the other working.
         manager.release(&pool, first).expect("release a");
-        assert!(b.join("only-in-b").exists(), "releasing a lease destroyed another");
+        assert!(
+            b.join("only-in-b").exists(),
+            "releasing a lease destroyed another"
+        );
         manager.release(&pool, second).expect("release b");
     }
 
@@ -2531,7 +2562,9 @@ mod tests {
         };
         std::fs::create_dir_all(first_dir.join("target/debug")).unwrap();
         std::fs::write(first_dir.join("target/debug/app"), b"built").unwrap();
-        manager.release(&pool, first).expect("release after command 1");
+        manager
+            .release(&pool, first)
+            .expect("release after command 1");
 
         let second = manager
             .acquire(&pool, "s-1", profile, Some("run-2"))
@@ -2550,7 +2583,9 @@ mod tests {
         );
         // Sharing a layer is not sharing the worktree: the copy is still a copy.
         assert!(!worktree.join("target").exists());
-        manager.release(&pool, second).expect("release after command 2");
+        manager
+            .release(&pool, second)
+            .expect("release after command 2");
 
         // And the layer dies with the session, not with the command.
         let layer = dir.path().join("tmp/s-1/sandbox");
@@ -2589,11 +2624,17 @@ mod tests {
         std::fs::create_dir_all(layer.join("target/debug")).unwrap();
         std::fs::write(layer.join("target/debug/app"), b"built").unwrap();
         std::fs::write(layer.join("build.log"), b"first command").unwrap();
-        manager.release(&pool, first).expect("release after command 1");
+        manager
+            .release(&pool, first)
+            .expect("release after command 1");
 
         // Between the commands the agent works on the WORKTREE, which is where
         // every `fs_write` lands.
-        std::fs::write(worktree.join("src/main.rs"), b"fn main() { second::run() }\n").unwrap();
+        std::fs::write(
+            worktree.join("src/main.rs"),
+            b"fn main() { second::run() }\n",
+        )
+        .unwrap();
         std::fs::create_dir_all(worktree.join("src/second")).unwrap();
         std::fs::write(worktree.join("src/second/mod.rs"), b"pub fn run() {}\n").unwrap();
         std::fs::remove_file(worktree.join("Cargo.toml")).unwrap();
@@ -2666,8 +2707,14 @@ mod tests {
 
         std::fs::write(a.join("only-in-s-1"), b"1").unwrap();
         std::fs::write(b.join("only-in-s-2"), b"2").unwrap();
-        assert!(!b.join("only-in-s-1").exists(), "session 2 saw session 1's layer");
-        assert!(!a.join("only-in-s-2").exists(), "session 1 saw session 2's layer");
+        assert!(
+            !b.join("only-in-s-1").exists(),
+            "session 2 saw session 1's layer"
+        );
+        assert!(
+            !a.join("only-in-s-2").exists(),
+            "session 1 saw session 2's layer"
+        );
 
         manager.release(&pool, first).unwrap();
         manager.release(&pool, second).unwrap();
@@ -2678,7 +2725,10 @@ mod tests {
             1
         );
         assert!(!a.exists());
-        assert!(b.join("only-in-s-2").exists(), "closing s-1 destroyed s-2's layer");
+        assert!(
+            b.join("only-in-s-2").exists(),
+            "closing s-1 destroyed s-2's layer"
+        );
         release_session_sandboxes(dir.path(), &pool, "s-2").unwrap();
     }
 
@@ -2764,7 +2814,12 @@ mod tests {
             lease.tools_read_only,
             "a ro lease must tell the caller to withhold write tools"
         );
-        assert_eq!(lease.target(), &ExecTarget::Local { cwd: worktree.clone() });
+        assert_eq!(
+            lease.target(),
+            &ExecTarget::Local {
+                cwd: worktree.clone()
+            }
+        );
 
         // The gap, demonstrated rather than described: the process this lease
         // describes runs as the service user, in the worktree, and the OS lets
@@ -2914,7 +2969,9 @@ mod tests {
         let (_dir, manager, pool) = workspace(ExecMode::TrustedNative);
         seed_worktree(&manager);
         let profile = SandboxProfile::new(MountAccess::ReadWrite, NetworkAccess::None, false);
-        let leaked = manager.acquire(&pool, "s-1", profile, None).expect("acquire");
+        let leaked = manager
+            .acquire(&pool, "s-1", profile, None)
+            .expect("acquire");
         // Simulates a crash: the row stays behind with no owner.
         std::mem::forget(leaked);
 
@@ -3010,14 +3067,20 @@ mod tests {
             panic!("expected a local target");
         };
 
-        assert_eq!(std::fs::read(cwd.join("src/main.rs")).unwrap(), b"fn main() {}\n");
+        assert_eq!(
+            std::fs::read(cwd.join("src/main.rs")).unwrap(),
+            b"fn main() {}\n"
+        );
         for missing in ["target", "node_modules", ".venv", "src/__pycache__"] {
             assert!(
                 !cwd.join(missing).exists(),
                 "{missing} was copied into the layer"
             );
         }
-        assert!(cwd.join("build").is_file(), "a file was skipped by its name");
+        assert!(
+            cwd.join("build").is_file(),
+            "a file was skipped by its name"
+        );
 
         // Not silent: the caller can tell the model what the layer does not have.
         let mut reported = lease.skipped_dirs.clone();

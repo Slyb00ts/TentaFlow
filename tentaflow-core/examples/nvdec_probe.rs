@@ -19,14 +19,20 @@ const RUN_FOR: Duration = Duration::from_secs(15);
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let clip = args.next().expect("usage: nvdec_probe <clip.mp4> [gpu_index]");
+    let clip = args
+        .next()
+        .expect("usage: nvdec_probe <clip.mp4> [gpu_index]");
     let gpu: u32 = args.next().and_then(|s| s.parse().ok()).unwrap_or(7);
 
     gst::init().expect("gst init");
 
     println!("== registered nvcodec elements ==");
     for name in [
-        "nvh264dec", "nvh264sldec", "nvautogpuh264dec", "nvcudah264dec", "cudaconvert",
+        "nvh264dec",
+        "nvh264sldec",
+        "nvautogpuh264dec",
+        "nvcudah264dec",
+        "cudaconvert",
     ] {
         let found = gst::ElementFactory::find(name).is_some();
         println!("  {name:<18} {}", if found { "present" } else { "MISSING" });
@@ -40,7 +46,11 @@ fn main() {
         println!("\n== {decoder} on GPU {gpu} ==");
         match probe(&clip, decoder, gpu) {
             Ok((frames, first_ms)) => {
-                let verdict = if frames == 0 { "  <-- DECODES NOTHING" } else { "" };
+                let verdict = if frames == 0 {
+                    "  <-- DECODES NOTHING"
+                } else {
+                    ""
+                };
                 println!(
                     "  frames={frames} first_frame_after={}{}",
                     first_ms
@@ -72,7 +82,11 @@ fn probe(clip: &str, decoder: &str, gpu: u32) -> Result<(u64, Option<u128>), Str
             .unwrap_or(false);
         println!(
             "  cuda-device-id writable: {} (requested gpu {gpu})",
-            if writable { "yes" } else { "NO — decode lands on the process default device" }
+            if writable {
+                "yes"
+            } else {
+                "NO — decode lands on the process default device"
+            }
         );
         if writable {
             dec.set_property("cuda-device-id", gpu as i32);
@@ -125,7 +139,9 @@ fn probe(clip: &str, decoder: &str, gpu: u32) -> Result<(u64, Option<u128>), Str
     let deadline = Instant::now() + RUN_FOR;
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
-        match bus.timed_pop(gst::ClockTime::from_mseconds(left.as_millis().min(500) as u64)) {
+        match bus.timed_pop(gst::ClockTime::from_mseconds(
+            left.as_millis().min(500) as u64
+        )) {
             Some(msg) => match msg.view() {
                 gst::MessageView::Eos(_) => break,
                 gst::MessageView::Error(e) => {

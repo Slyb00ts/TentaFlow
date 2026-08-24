@@ -144,7 +144,11 @@ pub struct TaskInput<'a> {
 }
 
 /// Creates a task; `task_no` is `COALESCE(MAX)+1` in the same transaction.
-pub fn create_task(pool: &DbPool, input: &TaskInput<'_>, created_by: &str) -> Result<(String, u32)> {
+pub fn create_task(
+    pool: &DbPool,
+    input: &TaskInput<'_>,
+    created_by: &str,
+) -> Result<(String, u32)> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
     let task_no: i64 = tx.query_row(
@@ -271,7 +275,12 @@ pub fn get_comment(pool: &DbPool, comment_id: &str) -> Result<Option<TaskComment
     .map_err(Into::into)
 }
 
-pub fn add_comment(pool: &DbPool, task_id: &str, author: &str, body_md: &str) -> Result<TaskCommentRecord> {
+pub fn add_comment(
+    pool: &DbPool,
+    task_id: &str,
+    author: &str,
+    body_md: &str,
+) -> Result<TaskCommentRecord> {
     let comment_id = uuid::Uuid::new_v4().to_string();
     let conn = pool.write().map_err(write_err)?;
     conn.execute(

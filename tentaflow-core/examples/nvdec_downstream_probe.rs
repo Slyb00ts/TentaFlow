@@ -35,7 +35,14 @@ fn main() {
     // is confirmed as a missing-DTS reorder stall — provable off-camera.
     let strip_dts = std::env::args().nth(2).as_deref() == Some("strip-dts");
     gst::init().expect("gst init");
-    println!("== mode: {} ==", if strip_dts { "STRIP DTS (simulate live RTP)" } else { "normal (file DTS intact)" });
+    println!(
+        "== mode: {} ==",
+        if strip_dts {
+            "STRIP DTS (simulate live RTP)"
+        } else {
+            "normal (file DTS intact)"
+        }
+    );
 
     println!("== element registry ==");
     for n in ["nvh264dec", "cudadownload", "cudaconvert", "cudascale"] {
@@ -121,9 +128,9 @@ fn probe(clip: &str, strip_dts: bool) -> Result<(), String> {
     let deadline = Instant::now() + RUN_FOR;
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
-        if let Some(msg) =
-            bus.timed_pop(gst::ClockTime::from_mseconds(left.as_millis().min(500) as u64))
-        {
+        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(
+            left.as_millis().min(500) as u64
+        )) {
             match msg.view() {
                 gst::MessageView::Eos(_) => break,
                 gst::MessageView::Error(e) => {
@@ -143,8 +150,14 @@ fn probe(clip: &str, strip_dts: bool) -> Result<(), String> {
     let d = dec_n.load(Ordering::Relaxed);
     let dl = dl_n.load(Ordering::Relaxed);
     println!("\n== result ==");
-    println!("  nvh264dec src frames = {d}{}", if d == 0 { "  <-- DECODER SILENT" } else { "" });
-    println!("  cudadownload src frames = {dl}{}", if dl == 0 { "  <-- DOWNLOAD SILENT" } else { "" });
+    println!(
+        "  nvh264dec src frames = {d}{}",
+        if d == 0 { "  <-- DECODER SILENT" } else { "" }
+    );
+    println!(
+        "  cudadownload src frames = {dl}{}",
+        if dl == 0 { "  <-- DOWNLOAD SILENT" } else { "" }
+    );
     Ok(())
 }
 

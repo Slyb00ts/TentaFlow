@@ -9772,10 +9772,7 @@ mod tests {
             )
             .unwrap();
         }
-        for (id, status, iterations) in [
-            ("run-a", "completed", 7),
-            ("run-b", "failed", 2),
-        ] {
+        for (id, status, iterations) in [("run-a", "completed", 7), ("run-b", "failed", 2)] {
             conn.execute(
                 "INSERT INTO agent_runs (id, agent_id, status, prompt, iterations) \
                  VALUES (?1, 'agent-1', ?2, 'do the thing', ?3)",
@@ -9801,7 +9798,8 @@ mod tests {
             "no flow execution may be lost by the upgrade"
         );
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r.get::<_, i64>(0))
+            conn.query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r
+                .get::<_, i64>(0))
                 .unwrap(),
             runs_before,
             "no agent run may be lost by the upgrade"

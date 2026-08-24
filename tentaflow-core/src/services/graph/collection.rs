@@ -973,7 +973,8 @@ impl GraphManager {
             return Ok((0, 0));
         }
         self.with_write(org_id, addon_id, collection, None, |backend| {
-            let edge_rows = backend.run_query("?[src, rel, dst, provenance] := *edges{src, rel, dst, provenance}")?;
+            let edge_rows = backend
+                .run_query("?[src, rel, dst, provenance] := *edges{src, rel, dst, provenance}")?;
             let mut edges_removed = 0u64;
             for row in &edge_rows.rows {
                 let (Some(src), Some(rel), Some(dst), Some(prov)) = (

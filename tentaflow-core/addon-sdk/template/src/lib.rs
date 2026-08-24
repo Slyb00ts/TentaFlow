@@ -226,17 +226,13 @@ fn write_response(out_ptr: i32, out_cap: i32, out_len_ptr: i32, value: &Value) -
         Ok(s) => s,
         Err(_) => return 1,
     };
-    let response_bytes = response_str.as_bytes();
 
-    if response_bytes.len() > out_cap as usize {
-        log::error("Bufor wyjsciowy za maly na odpowiedz");
-        return 2;
-    }
-
-    // Zapisz odpowiedz do bufora
-    let written = tentaflow_addon_sdk::write_string(out_ptr, out_cap, &response_str);
+    // Zapisz odpowiedz do bufora (overflow: write_string zglosi wymagany
+    // rozmiar do out_len_ptr i zwroci -1)
+    let written = tentaflow_addon_sdk::write_string(out_ptr, out_cap, out_len_ptr, &response_str);
     if written < 0 {
-        return 3;
+        log::error("Bufor wyjsciowy za maly na odpowiedz");
+        return tentaflow_addon_sdk::ABI_OUTPUT_BUFFER_TOO_SMALL;
     }
 
     // Zapisz dlugosc odpowiedzi (4 bajty little-endian)

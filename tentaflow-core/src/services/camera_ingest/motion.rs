@@ -51,10 +51,10 @@ const SEARCH: i32 = 8; //   horizontal search range +/- cells (~1/15 of DS_W)
 
 // Robustness thresholds.
 const MATCH_MIN: f32 = 0.55; //   min ZNCC peak to trust a block's displacement.
-//                                A rigidly translating textured object scores
-//                                ~1.0; random noise's best-of-many-shifts peak
-//                                sits well below this, so raising the gate here
-//                                rejects incoherent noise without losing motion.
+                             //                                A rigidly translating textured object scores
+                             //                                ~1.0; random noise's best-of-many-shifts peak
+                             //                                sits well below this, so raising the gate here
+                             //                                rejects incoherent noise without losing motion.
 const TEX_FLOOR: f32 = 4.0; //    min block variance to be a texture (evaluated)
 const DISP_THRESH: i32 = 1; //    |displacement| >= this counts as "moving"
 const COHERENCE_MIN: f32 = 0.20; // fraction of evaluated blocks that must agree
@@ -308,8 +308,14 @@ fn region_bbox(zones: &[Vec<(f32, f32)>], w: usize, h: usize) -> Option<Geom> {
         let x0 = (minx * w as f32).floor() as usize;
         let y0 = (miny * h as f32).floor() as usize;
         // ceil the far edge so a thin polygon still spans >= 1 px, then clamp.
-        let x1 = ((maxx * w as f32).ceil() as usize).min(w).max(x0 + 1).min(w);
-        let y1 = ((maxy * h as f32).ceil() as usize).min(h).max(y0 + 1).min(h);
+        let x1 = ((maxx * w as f32).ceil() as usize)
+            .min(w)
+            .max(x0 + 1)
+            .min(w);
+        let y1 = ((maxy * h as f32).ceil() as usize)
+            .min(h)
+            .max(y0 + 1)
+            .min(h);
         (x0.min(w - 1), y0.min(h - 1), x1, y1)
     } else {
         (0, 0, w, h)
@@ -637,8 +643,7 @@ mod tests {
         let mut m = MotionEstimator::new();
         est(&mut m, &prev, w, h); // primes at full-frame geometry
                                   // Switch to a zone: geometry differs -> treated as first frame.
-        let zone: Vec<Vec<(f32, f32)>> =
-            vec![vec![(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]];
+        let zone: Vec<Vec<(f32, f32)>> = vec![vec![(0.1, 0.1), (0.9, 0.1), (0.9, 0.9), (0.1, 0.9)]];
         let s = m.estimate(&cur, w as u32, h as u32, w as u32, 0, &zone);
         assert!(!s.moving, "geometry change should default, got {:?}", s);
     }

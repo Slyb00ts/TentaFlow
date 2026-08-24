@@ -81,10 +81,8 @@ fn overview_blocking() -> StorageOverviewResponse {
         } else {
             // Move zaplanowany na restart LUB zmiana ścieżki bez przenoszenia
             // zapisana w conf, która jeszcze nie obowiązuje.
-            paths::pending_boot_migration(cat).or_else(|| {
-                paths::boot_override_value(cat)
-                    .filter(|v| PathBuf::from(v) != path)
-            })
+            paths::pending_boot_migration(cat)
+                .or_else(|| paths::boot_override_value(cat).filter(|v| PathBuf::from(v) != path))
         };
         categories.push(StorageCategoryInfo {
             key: cat.setting_key().to_string(),
@@ -363,7 +361,14 @@ async fn run_live_migration(
     let old_dir = paths::category_dir(cat);
 
     // ---- Faza 1: wstrzymanie zależnych ----------------------------------
-    emit(sender, &job_id, "phase", "pause", 0, "Wstrzymywanie usług zależnych".into());
+    emit(
+        sender,
+        &job_id,
+        "phase",
+        "pause",
+        0,
+        "Wstrzymywanie usług zależnych".into(),
+    );
     let stopped = pause_dependents(deps, cat, sender, &job_id).await?;
     if matches!(cat, StorageCategory::AddonData) {
         crate::addon::storage_sql::set_addon_storage_frozen(true);
@@ -406,7 +411,14 @@ async fn run_live_migration(
     }
 
     // ---- Faza 3: przełączenie ścieżki -----------------------------------
-    emit(sender, &job_id, "phase", "switch", 0, "Przełączanie ścieżki i weryfikacja".into());
+    emit(
+        sender,
+        &job_id,
+        "phase",
+        "switch",
+        0,
+        "Przełączanie ścieżki i weryfikacja".into(),
+    );
     crate::db::repository::set_setting(&deps.db, key, &new_dir.to_string_lossy())?;
     paths::set_category_override(cat, Some(new_dir.to_string_lossy().to_string()));
     let _ = paths::ensure_app_dirs();
@@ -433,7 +445,14 @@ async fn run_live_migration(
     }
 
     // ---- Faza 4: wznowienie ---------------------------------------------
-    emit(sender, &job_id, "phase", "resume", 0, "Wznawianie usług".into());
+    emit(
+        sender,
+        &job_id,
+        "phase",
+        "resume",
+        0,
+        "Wznawianie usług".into(),
+    );
     resume_services(deps, &stopped, sender, &job_id).await;
 
     let _ = crate::db::repository::log_audit(
@@ -483,9 +502,7 @@ async fn pause_dependents(
             ) && !s.paused
         })
         .filter(|s| match cat {
-            StorageCategory::Models => {
-                MODEL_BOUND_CATEGORIES.contains(&s.category.as_str())
-            }
+            StorageCategory::Models => MODEL_BOUND_CATEGORIES.contains(&s.category.as_str()),
             // Cache: natywne bundle Pythona ruszają z venvów w cache, a
             // kontenery Docker mają bind-mount vllm-cache — pauzujemy oba.
             StorageCategory::Cache => {

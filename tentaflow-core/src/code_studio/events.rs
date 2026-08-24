@@ -844,10 +844,7 @@ pub fn read_after(
 ///
 /// The last `run_finished` of a run wins: a run reconciled after a restart
 /// settles a second time, and that later verdict is the current one.
-pub fn run_failure_reasons(
-    pool: &DbPool,
-    session_id: &str,
-) -> Result<BTreeMap<String, String>> {
+pub fn run_failure_reasons(pool: &DbPool, session_id: &str) -> Result<BTreeMap<String, String>> {
     let conn = pool.read().map_err(|e| anyhow!("workspace db read: {e}"))?;
     let mut stmt = conn.prepare(
         "SELECT payload_cbor FROM session_events \

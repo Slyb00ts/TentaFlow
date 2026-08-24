@@ -38,8 +38,7 @@ use super::events::{self, EventPayload, GitOperation, SessionEvent};
 use super::exec::{ExecEnv, ExecRequest, Executor, NullSink, Program};
 use super::fs::{self, GrepQuery, LineRange, Precondition as FsPrecondition, RelPath, SessionRoot};
 use super::git_broker::{
-    record_session_head, Broker, CommitIdentity, CommitSpec, GitAuth, MergeOutcome,
-    RepoHandle,
+    record_session_head, Broker, CommitIdentity, CommitSpec, GitAuth, MergeOutcome, RepoHandle,
 };
 use super::index::{CodeIndex, CodeSearchOutcome};
 use super::models::{AutonomyMode, WorkspaceRecord, WorkspaceRole};
@@ -745,9 +744,7 @@ pub(crate) fn allowlist_holds(
             row.get(0)
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(patterns
-        .iter()
-        .any(|p| pep::pattern_matches(p, target)))
+    Ok(patterns.iter().any(|p| pep::pattern_matches(p, target)))
 }
 
 /// `allow_for_session` grants (§9.1), stored in the workspace runtime db.
@@ -766,9 +763,7 @@ pub(crate) fn session_grant_holds(
             row.get(0)
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
-    Ok(patterns
-        .iter()
-        .any(|p| pep::pattern_matches(p, target)))
+    Ok(patterns.iter().any(|p| pep::pattern_matches(p, target)))
 }
 
 /// Suspends the call: writes the `approvals` row, puts the question to the
@@ -2136,11 +2131,8 @@ async fn git_commit_call(ctx: &ToolCallCtx<'_>, bound: &Bound, args: &Value) -> 
     let message = require_str(args, "message")?.to_string();
     // The WORK review, not "the newest acceptance of this session": a merge
     // result accepted for the target branch is a decision about another tree.
-    let set = patch::accepted_patch_set_for_scope(
-        &bound.pool,
-        &bound.session.id,
-        &PatchScope::Work,
-    )?;
+    let set =
+        patch::accepted_patch_set_for_scope(&bound.pool, &bound.session.id, &PatchScope::Work)?;
 
     let workspace_id = bound.workspace.id.clone();
     let session_id = bound.session.id.clone();
@@ -2602,15 +2594,7 @@ pub fn record_work_edit(
         Some(bytes) => Some(broker.hash_object(&broker.reference(), bytes)?),
         None => None,
     };
-    patch::record_edit(
-        pool,
-        broker,
-        &set.id,
-        path,
-        kind,
-        oid.as_deref(),
-        expect,
-    )
+    patch::record_edit(pool, broker, &set.id, path, kind, oid.as_deref(), expect)
 }
 
 /// Writes what a review decided into the worktree.
@@ -2642,10 +2626,8 @@ pub fn apply_review_rewrites(
     let root = match scope {
         PatchScope::Work => SessionRoot::open_session(workspace_id, session_id)
             .map_err(|e| anyhow!("{}", fs_error_text(&e)))?,
-        PatchScope::Merge { .. } => {
-            SessionRoot::open(&broker.integration_worktree(session_id)?)
-                .map_err(|e| anyhow!("{}", fs_error_text(&e)))?
-        }
+        PatchScope::Merge { .. } => SessionRoot::open(&broker.integration_worktree(session_id)?)
+            .map_err(|e| anyhow!("{}", fs_error_text(&e)))?,
     };
     let reference = broker.reference();
     for rewrite in rewrites {
@@ -3536,8 +3518,14 @@ mod tests {
         // empty string, which no reader gives a meaning to.
         let blanket = pep::grant_pattern(None);
         assert_eq!(blanket, "*");
-        repository::add_allowlist_entry(&db, "ws-1", Capability::GitRead.slug(), blanket, "u-owner")
-            .expect("store the blanket grant");
+        repository::add_allowlist_entry(
+            &db,
+            "ws-1",
+            Capability::GitRead.slug(),
+            blanket,
+            "u-owner",
+        )
+        .expect("store the blanket grant");
         assert!(allowlist_holds(&db, "ws-1", Capability::GitRead, None).expect("read"));
         assert!(
             allowlist_holds(&db, "ws-1", Capability::GitRead, Some("src/main.rs")).expect("read")
@@ -3882,5 +3870,4 @@ mod tests {
 
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
     }
-
 }

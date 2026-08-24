@@ -176,7 +176,9 @@ pub fn compute_next_run(
                 .with_timezone(&Utc);
             Ok(if at > now { Some(at) } else { None })
         }
-        "interval" => Ok(Some(now + ChronoDuration::seconds(parse_interval_secs(expr)?))),
+        "interval" => Ok(Some(
+            now + ChronoDuration::seconds(parse_interval_secs(expr)?),
+        )),
         "cron" => {
             let tz = parse_timezone(timezone)?;
             let time = parse_daily_cron(expr)?;
@@ -491,15 +493,14 @@ fn record_attempt(
     // run — a configuration state, not a failure, so it never trips the breaker.
     let failures: i64 = match outcome {
         "started" => 0,
-        "error" => {
-            tx.query_row(
+        "error" => tx
+            .query_row(
                 "SELECT consecutive_failures + 1 FROM schedules WHERE schedule_id = ?1",
                 params![schedule_id],
                 |row| row.get(0),
             )
             .optional()?
-            .unwrap_or(1)
-        }
+            .unwrap_or(1),
         _ => tx
             .query_row(
                 "SELECT consecutive_failures FROM schedules WHERE schedule_id = ?1",
@@ -904,7 +905,10 @@ fn notify_blocked(project: &DueProject, schedule: &ScheduleRecord, reason: &str)
             &project.project_id,
             "schedule_blocked",
             "Harmonogram wstrzymany",
-            &format!("„{}” w projekcie „{}”: {reason}", schedule.name, project.name),
+            &format!(
+                "„{}” w projekcie „{}”: {reason}",
+                schedule.name, project.name
+            ),
             &link,
         );
     }
@@ -1069,20 +1073,20 @@ async fn fire(
     // 5. No runner (or one this node may not use) is a transient environment
     //    problem, NOT a schedule failure — the schedule stays enabled.
     let core_db = ctx.core_db.clone();
-    let discovered = match tokio::task::spawn_blocking(move || {
-        super::auto_runs::list_runners(&core_db)
-    })
-    .await
-    {
-        Ok(Ok(runners)) => runners,
-        Ok(Err(e)) => return TriggerOutcome::refused("skipped", format!("brak runnera: {e}")),
-        Err(_) => return TriggerOutcome::refused("error", "runner discovery task panicked"),
-    };
-    let runner =
-        match super::auto_runs::select_runner(discovered, &schedule.runner_service_id, &runnable_language) {
-            Ok(runner) => runner,
-            Err(e) => return TriggerOutcome::refused("skipped", format!("brak runnera: {e}")),
+    let discovered =
+        match tokio::task::spawn_blocking(move || super::auto_runs::list_runners(&core_db)).await {
+            Ok(Ok(runners)) => runners,
+            Ok(Err(e)) => return TriggerOutcome::refused("skipped", format!("brak runnera: {e}")),
+            Err(_) => return TriggerOutcome::refused("error", "runner discovery task panicked"),
         };
+    let runner = match super::auto_runs::select_runner(
+        discovered,
+        &schedule.runner_service_id,
+        &runnable_language,
+    ) {
+        Ok(runner) => runner,
+        Err(e) => return TriggerOutcome::refused("skipped", format!("brak runnera: {e}")),
+    };
     if let Some(reason) = super::auto_runs::isolation_refusal(&ctx.core_db, &runner) {
         return TriggerOutcome::refused("skipped", reason);
     }
@@ -1090,7 +1094,8 @@ async fn fire(
     // 6. Re-resolve the address: an environment approved as public may point at
     //    a private host by now (DNS rebinding).
     let recheck = environment.clone();
-    match tokio::task::spawn_blocking(move || super::environments::recheck_private(&recheck)).await {
+    match tokio::task::spawn_blocking(move || super::environments::recheck_private(&recheck)).await
+    {
         Ok(Ok(now_private)) if now_private && !environment.is_private_address => {
             super::activity::record_org_security(
                 &ctx.core_db,
@@ -1277,7 +1282,10 @@ fn fire_manual(
             &project.project_id,
             "run_item_assigned",
             "Przydzielono Ci testy",
-            &format!("{count} przypadkow w przebiegu #{run_no} „{}”", schedule.name),
+            &format!(
+                "{count} przypadkow w przebiegu #{run_no} „{}”",
+                schedule.name
+            ),
             &serde_json::json!({ "project_id": project.project_id, "run_id": run_id }).to_string(),
         );
     }
@@ -1608,7 +1616,13 @@ mod unit_tests {
     #[test]
     fn previous_running_run_skips_the_trigger() {
         let pool = pool();
-        seed(&pool, "sc1", "interval", "30m", Some("2026-07-01T10:00:00Z"));
+        seed(
+            &pool,
+            "sc1",
+            "interval",
+            "30m",
+            Some("2026-07-01T10:00:00Z"),
+        );
         {
             let conn = pool.write().expect("write");
             conn.execute(
@@ -1732,7 +1746,13 @@ mod unit_tests {
     #[test]
     fn breaker_stops_the_schedule_after_five_errors() {
         let pool = pool();
-        seed(&pool, "sc1", "interval", "30m", Some("2026-07-01T10:00:00Z"));
+        seed(
+            &pool,
+            "sc1",
+            "interval",
+            "30m",
+            Some("2026-07-01T10:00:00Z"),
+        );
         for i in 1..BREAKER_THRESHOLD {
             let tripped =
                 record_attempt(&pool, "sc1", "", "error", "runner padl", "", "").expect("record");
@@ -1767,7 +1787,13 @@ mod unit_tests {
     #[test]
     fn settle_applies_the_terminal_run_status() {
         let pool = pool();
-        seed(&pool, "sc1", "interval", "30m", Some("2026-07-01T10:00:00Z"));
+        seed(
+            &pool,
+            "sc1",
+            "interval",
+            "30m",
+            Some("2026-07-01T10:00:00Z"),
+        );
         record_attempt(&pool, "sc1", "", "started", "", "r1", "").expect("record");
         assert_eq!(
             get(&pool, "sc1").expect("get").expect("row").last_status,
@@ -1792,24 +1818,38 @@ mod unit_tests {
     #[test]
     fn claim_advances_the_slot_exactly_once() {
         let pool = pool();
-        seed(&pool, "sc1", "interval", "30m", Some("2026-07-01T10:00:00Z"));
+        seed(
+            &pool,
+            "sc1",
+            "interval",
+            "30m",
+            Some("2026-07-01T10:00:00Z"),
+        );
         let schedule = get(&pool, "sc1").expect("get").expect("row");
         let now = ts("2026-07-01T10:00:05Z");
         assert!(claim(&pool, &schedule, now).expect("claim"));
         let after = get(&pool, "sc1").expect("get").expect("row");
-        assert_eq!(after.next_run_at.as_deref(), Some("2026-07-01T10:30:05+00:00"));
+        assert_eq!(
+            after.next_run_at.as_deref(),
+            Some("2026-07-01T10:30:05+00:00")
+        );
         // The second claim carries the stale next_run_at and must lose.
         assert!(!claim(&pool, &schedule, now).expect("second claim"));
 
         // A one-shot claim disables the schedule instead of rescheduling it.
-        seed(&pool, "sc2", "once", "2026-07-01T10:00:00Z", Some("2026-07-01T10:00:00Z"));
+        seed(
+            &pool,
+            "sc2",
+            "once",
+            "2026-07-01T10:00:00Z",
+            Some("2026-07-01T10:00:00Z"),
+        );
         let once = get(&pool, "sc2").expect("get").expect("row");
         assert!(claim(&pool, &once, now).expect("claim once"));
         let after = get(&pool, "sc2").expect("get").expect("row");
         assert!(after.next_run_at.is_none());
         assert!(!after.enabled);
     }
-
 
     /// An environment whose approval was WITHDRAWN after the schedule was saved
     /// blocks the trigger. 'blocked' is not a failure: it never advances the

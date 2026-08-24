@@ -456,18 +456,14 @@ fn anthropic_message_to_openai(
                     ..Default::default()
                 });
             }
-            AnthropicContentBlock::Thinking { thinking } => {
-                match reasoning_content.as_mut() {
-                    Some(existing) => existing.push_str(&thinking),
-                    None => reasoning_content = Some(thinking),
-                }
-            }
-            AnthropicContentBlock::RedactedThinking { data } => {
-                match reasoning_content.as_mut() {
-                    Some(existing) => existing.push_str(&data),
-                    None => reasoning_content = Some(data),
-                }
-            }
+            AnthropicContentBlock::Thinking { thinking } => match reasoning_content.as_mut() {
+                Some(existing) => existing.push_str(&thinking),
+                None => reasoning_content = Some(thinking),
+            },
+            AnthropicContentBlock::RedactedThinking { data } => match reasoning_content.as_mut() {
+                Some(existing) => existing.push_str(&data),
+                None => reasoning_content = Some(data),
+            },
             AnthropicContentBlock::Unsupported => {
                 warn!("nieznany typ bloku zawartosci pominiety");
             }
@@ -1492,10 +1488,7 @@ mod tests {
         }));
         let openai = to_openai_request(req, false).expect("nieznane bloki nie sa bledem");
         assert_eq!(openai.messages.len(), 1);
-        assert_eq!(
-            openai.messages[0].reasoning_content.as_deref(),
-            Some("hmm")
-        );
+        assert_eq!(openai.messages[0].reasoning_content.as_deref(), Some("hmm"));
         match openai.messages[0].content.as_ref().expect("content") {
             MessageContent::Text(t) => assert_eq!(t, "gotowe"),
             other => panic!("oczekiwano tekstu, jest {:?}", other),

@@ -245,7 +245,11 @@ pub struct OcrExport {
 
 /// Eksportuje checkpoint do ONNX przez `POST /export` serwisu. Serwis sam
 /// weryfikuje zgodność liczbową torch↔onnxruntime i odrzuca rozjechany eksport.
-async fn run_export(base: &str, checkpoint_path: &str, output_dir: &str) -> anyhow::Result<OcrExport> {
+async fn run_export(
+    base: &str,
+    checkpoint_path: &str,
+    output_dir: &str,
+) -> anyhow::Result<OcrExport> {
     let url = format!("{}/export", base.trim_end_matches('/'));
     let body = json!({
         "checkpoint_path": checkpoint_path,

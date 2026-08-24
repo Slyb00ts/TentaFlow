@@ -72,10 +72,7 @@ fn assert_refused(result: Result<MessageBody, tentaflow_protocol::ProtocolError>
     assert!(err.message.contains("system flow"), "{}", err.message);
 }
 
-fn update_request(
-    status: Option<&str>,
-    published_model_name: Option<Option<&str>>,
-) -> MessageBody {
+fn update_request(status: Option<&str>, published_model_name: Option<Option<&str>>) -> MessageBody {
     MessageBody::FlowUpdateRequestBody(FlowUpdateRequest {
         flow_id: SYSTEM_FLOW_ID.to_string(),
         name: None,
@@ -95,7 +92,10 @@ fn system_flow_cannot_change_status() {
     assert_refused(flow_update(&update_request(Some("draft"), None), &ctx));
 
     let (is_default, published, status, is_system) = row_state(&state);
-    assert_eq!((is_default, published, status.as_str(), is_system), (1, None, "active", 1));
+    assert_eq!(
+        (is_default, published, status.as_str(), is_system),
+        (1, None, "active", 1)
+    );
 }
 
 #[test]

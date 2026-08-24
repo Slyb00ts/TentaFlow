@@ -395,10 +395,7 @@ pub fn summary(ml_project_id: &str) -> Result<Option<MlProjectSummary>> {
 /// requires ownership: the sync writes through owner-only repository calls, so
 /// a link created by a non-owner could never apply anything.
 pub fn owned_candidates(pool: &DbPool, user_id: &str) -> Result<Vec<MlProjectSummary>> {
-    let linked: Vec<String> = list(pool)?
-        .into_iter()
-        .map(|l| l.ml_project_id)
-        .collect();
+    let linked: Vec<String> = list(pool)?.into_iter().map(|l| l.ml_project_id).collect();
     let mut out = Vec::new();
     for project in crate::ml_studio::repository::list_projects(user_id)? {
         if !project.is_owner || linked.contains(&project.project.project_id) {
@@ -455,9 +452,7 @@ pub fn sync_link(project_id: &str, pool: &DbPool, link: &MlLinkRecord) -> SyncOu
     let mut outcome = SyncOutcome::default();
     if summary(&link.ml_project_id).ok().flatten().is_none() {
         outcome.result = "ml_project_missing".to_string();
-        outcome
-            .errors
-            .push("projekt ML nie istnieje".to_string());
+        outcome.errors.push("projekt ML nie istnieje".to_string());
         record_sync_result(pool, &link.link_id, &outcome.result);
         return outcome;
     }
@@ -684,8 +679,9 @@ fn apply_role_map(
             skipped += 1;
             continue;
         };
-        let existing =
-            crate::ml_studio::repository::member_role(ml_project_id, &member.user_id).ok().flatten();
+        let existing = crate::ml_studio::repository::member_role(ml_project_id, &member.user_id)
+            .ok()
+            .flatten();
         let applied = match existing {
             Some(current) if current == role => Ok(()),
             Some(_) => crate::ml_studio::repository::set_member_role(
@@ -919,8 +915,9 @@ mod unit_tests {
         assert_eq!(mapped, 3, "manager + tester + viewer are granted");
         assert_eq!(skipped, 1, "the creator is already the ML owner");
 
-        let ml_role = |user: &str| crate::ml_studio::repository::member_role(&ml_project_id, user)
-            .expect("role");
+        let ml_role = |user: &str| {
+            crate::ml_studio::repository::member_role(&ml_project_id, user).expect("role")
+        };
         assert_eq!(ml_role(&creator).as_deref(), Some("owner"));
         assert_eq!(
             ml_role(&manager).as_deref(),
@@ -931,8 +928,7 @@ mod unit_tests {
         assert_eq!(ml_role(&viewer).as_deref(), Some("viewer"));
 
         // A promoted tester is UPDATED, not re-invited.
-        super::super::repository::set_member_role(&project_id, &tester, "editor")
-            .expect("promote");
+        super::super::repository::set_member_role(&project_id, &tester, "editor").expect("promote");
         let link = get(&pool, &link_id).expect("get").expect("row");
         let outcome = sync_link(&project_id, &pool, &link);
         assert_eq!(outcome.result, "ok", "errors: {:?}", outcome.errors);
@@ -946,7 +942,11 @@ mod unit_tests {
         let outcome = sync_link(&project_id, &pool, &link);
         assert_eq!(outcome.applied_remove, 1, "errors: {:?}", outcome.errors);
         assert!(ml_role(&viewer).is_none(), "removal propagates immediately");
-        assert_eq!(ml_role(&creator).as_deref(), Some("owner"), "the ML owner row is never touched");
+        assert_eq!(
+            ml_role(&creator).as_deref(),
+            Some("owner"),
+            "the ML owner row is never touched"
+        );
         let refreshed = get(&pool, &link_id).expect("get").expect("row");
         assert_eq!(refreshed.last_sync_result, "ok");
         assert!(!refreshed.last_sync_at.is_empty());
@@ -1093,9 +1093,14 @@ mod unit_tests {
         .expect("create project");
 
         // An ML project with a team of its own, built in ML Studio.
-        let created =
-            crate::ml_studio::repository::create_project(&owner, "org-ml", "Wizja", "", "recognition")
-                .expect("ml project");
+        let created = crate::ml_studio::repository::create_project(
+            &owner,
+            "org-ml",
+            "Wizja",
+            "",
+            "recognition",
+        )
+        .expect("ml project");
         let ml_project_id = created.project.project_id.clone();
         crate::ml_studio::repository::invite_member(&ml_project_id, &owner, &outsider, "editor")
             .expect("invite outsider");

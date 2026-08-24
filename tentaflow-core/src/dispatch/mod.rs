@@ -2138,17 +2138,11 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::ProjectLinkSetRequest { .. } => "CodeStudioProjectLinkSetRequest",
                 Cs::RepoTreeRequest { .. } => "CodeStudioRepoTreeRequest",
                 Cs::RepoTreeResponse { .. } => "CodeStudioRepoTreeResponse",
-                Cs::AgentCredentialsListRequest { .. } => {
-                    "CodeStudioAgentCredentialsListRequest"
-                }
-                Cs::AgentCredentialsListResponse { .. } => {
-                    "CodeStudioAgentCredentialsListResponse"
-                }
+                Cs::AgentCredentialsListRequest { .. } => "CodeStudioAgentCredentialsListRequest",
+                Cs::AgentCredentialsListResponse { .. } => "CodeStudioAgentCredentialsListResponse",
                 Cs::AgentCredentialSetRequest { .. } => "CodeStudioAgentCredentialSetRequest",
                 Cs::AgentCredentialSetResponse { .. } => "CodeStudioAgentCredentialSetResponse",
-                Cs::AgentCredentialDeleteRequest { .. } => {
-                    "CodeStudioAgentCredentialDeleteRequest"
-                }
+                Cs::AgentCredentialDeleteRequest { .. } => "CodeStudioAgentCredentialDeleteRequest",
                 Cs::AgentCredentialDeleteResponse { .. } => {
                     "CodeStudioAgentCredentialDeleteResponse"
                 }

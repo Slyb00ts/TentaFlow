@@ -259,7 +259,10 @@ mod tests {
                 rusqlite::params![days, org_id],
             )
             .unwrap();
-        assert!(changed > 0, "no seeded 'events' policy for {org_id} to move");
+        assert!(
+            changed > 0,
+            "no seeded 'events' policy for {org_id} to move"
+        );
     }
 
     /// A second organisation on the node with an `events` term of its own.
@@ -339,8 +342,20 @@ mod tests {
         );
 
         at(&pool, &main, "old", ms_ago(&pool, 40), Some(DEFAULT_ORG_ID));
-        at(&pool, &main, "recent", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
-        at(&pool, &main, "fresh", ms_ago(&pool, 1), Some(DEFAULT_ORG_ID));
+        at(
+            &pool,
+            &main,
+            "recent",
+            ms_ago(&pool, 10),
+            Some(DEFAULT_ORG_ID),
+        );
+        at(
+            &pool,
+            &main,
+            "fresh",
+            ms_ago(&pool, 1),
+            Some(DEFAULT_ORG_ID),
+        );
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.unattributed_retention_days, EVENTS_RETENTION_DAYS);
@@ -375,11 +390,41 @@ mod tests {
         assert_eq!(terms.per_org.get("org-lax").copied(), Some(60));
         assert_eq!(terms.unattributed, 3, "the shortest term on the node");
 
-        at(&pool, &main, "strict-stale", ms_ago(&pool, 10), Some("org-strict"));
-        at(&pool, &main, "strict-fresh", ms_ago(&pool, 1), Some("org-strict"));
-        at(&pool, &main, "lax-stale", ms_ago(&pool, 10), Some("org-lax"));
-        at(&pool, &main, "lax-ancient", ms_ago(&pool, 90), Some("org-lax"));
-        at(&pool, &main, "default-mid", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
+        at(
+            &pool,
+            &main,
+            "strict-stale",
+            ms_ago(&pool, 10),
+            Some("org-strict"),
+        );
+        at(
+            &pool,
+            &main,
+            "strict-fresh",
+            ms_ago(&pool, 1),
+            Some("org-strict"),
+        );
+        at(
+            &pool,
+            &main,
+            "lax-stale",
+            ms_ago(&pool, 10),
+            Some("org-lax"),
+        );
+        at(
+            &pool,
+            &main,
+            "lax-ancient",
+            ms_ago(&pool, 90),
+            Some("org-lax"),
+        );
+        at(
+            &pool,
+            &main,
+            "default-mid",
+            ms_ago(&pool, 10),
+            Some(DEFAULT_ORG_ID),
+        );
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.organisations_swept, 3);
@@ -405,10 +450,22 @@ mod tests {
         at(&pool, &main, "system-fresh", ms_ago(&pool, 1), None);
         // An organisation that has since been deleted from the node: the row
         // still names a tenant, but no policy can be resolved for it.
-        at(&pool, &main, "ghost-stale", ms_ago(&pool, 10), Some("org-gone"));
+        at(
+            &pool,
+            &main,
+            "ghost-stale",
+            ms_ago(&pool, 10),
+            Some("org-gone"),
+        );
         // Same age, but this tenant IS on the node and keeps 30 days — proof
         // the unattributed cutoff is not simply applied to everything.
-        at(&pool, &main, "default-mid", ms_ago(&pool, 10), Some(DEFAULT_ORG_ID));
+        at(
+            &pool,
+            &main,
+            "default-mid",
+            ms_ago(&pool, 10),
+            Some(DEFAULT_ORG_ID),
+        );
 
         let report = sweep(&main, &pool).unwrap();
         assert_eq!(report.events_deleted, 2);
@@ -426,7 +483,13 @@ mod tests {
         let (_dir, pool) = events_db();
         let main = main_db();
         set_policy_days(&main, DEFAULT_ORG_ID, 0);
-        at(&pool, &main, "fresh", ms_ago(&pool, 0), Some(DEFAULT_ORG_ID));
+        at(
+            &pool,
+            &main,
+            "fresh",
+            ms_ago(&pool, 0),
+            Some(DEFAULT_ORG_ID),
+        );
         at(&pool, &main, "fresh-system", ms_ago(&pool, 0), None);
 
         let report = sweep(&main, &pool).unwrap();

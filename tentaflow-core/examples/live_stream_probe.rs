@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use gstreamer as gst;
 use gstreamer::prelude::*;
-use gstreamer_app as gstreamer_app;
+use gstreamer_app;
 
 use tentaflow_core::services::camera_ingest::credentials::credentials_cipher;
 
@@ -28,7 +28,9 @@ const RUN_FOR: Duration = Duration::from_secs(20);
 
 fn main() {
     let mut args = std::env::args().skip(1);
-    let url = args.next().expect("usage: live_stream_probe <rtsp-url> <creds-hex>");
+    let url = args
+        .next()
+        .expect("usage: live_stream_probe <rtsp-url> <creds-hex>");
     let creds_hex = args.next().expect("missing creds-hex");
 
     // Surface the decoder's own reasoning for THIS throwaway process only.
@@ -86,7 +88,9 @@ fn probe(url: &str) -> Result<(), String> {
     ssink.set_property("sync", false);
 
     pipeline
-        .add_many([&src, &depay, &parse, &tee, &hq, &hdec, &hsink, &sq, &sdec, &ssink])
+        .add_many([
+            &src, &depay, &parse, &tee, &hq, &hdec, &hsink, &sq, &sdec, &ssink,
+        ])
         .map_err(|e| e.to_string())?;
     gst::Element::link_many([&depay, &parse, &tee]).map_err(|e| e.to_string())?;
 
@@ -95,7 +99,8 @@ fn probe(url: &str) -> Result<(), String> {
         .field("alignment", "au")
         .build();
     gst::Element::link(&tee, &hq).map_err(|e| e.to_string())?;
-    hq.link_filtered(&hdec, &bs).map_err(|e| format!("hq->hdec: {e}"))?;
+    hq.link_filtered(&hdec, &bs)
+        .map_err(|e| format!("hq->hdec: {e}"))?;
     if full_downstream {
         // The app's real NvdecNv12 tail: nvh264dec → cudadownload → tee →
         // queue → appsink that actually pulls (mimicking analysis consumption).
@@ -122,7 +127,9 @@ fn probe(url: &str) -> Result<(), String> {
             .property("sync", false)
             .build()
             .map_err(|e| e.to_string())?;
-        pipeline.add_many([&dl, &dtee, &qd, &asink]).map_err(|e| e.to_string())?;
+        pipeline
+            .add_many([&dl, &dtee, &qd, &asink])
+            .map_err(|e| e.to_string())?;
         if fixed_tail {
             let protect = mk("queue")?;
             protect.set_property_from_str("leaky", "downstream");
@@ -194,24 +201,34 @@ fn probe(url: &str) -> Result<(), String> {
     let hw = count_src(&hdec, "nvh264dec", &started);
     let sw = count_src(&sdec, "avdec_h264", &started);
 
-    pipeline.set_state(gst::State::Playing).map_err(|e| e.to_string())?;
+    pipeline
+        .set_state(gst::State::Playing)
+        .map_err(|e| e.to_string())?;
     let bus = pipeline.bus().ok_or("no bus")?;
     let deadline = Instant::now() + RUN_FOR;
     while Instant::now() < deadline {
         let left = deadline.saturating_duration_since(Instant::now());
-        if let Some(msg) =
-            bus.timed_pop(gst::ClockTime::from_mseconds(left.as_millis().min(500) as u64))
-        {
+        if let Some(msg) = bus.timed_pop(gst::ClockTime::from_mseconds(
+            left.as_millis().min(500) as u64
+        )) {
             match msg.view() {
                 gst::MessageView::Eos(_) => break,
                 gst::MessageView::Error(e) => {
-                    println!("  bus ERROR from {:?}: {} ({:?})",
-                        e.src().map(|s| s.name().to_string()), e.error(), e.debug());
+                    println!(
+                        "  bus ERROR from {:?}: {} ({:?})",
+                        e.src().map(|s| s.name().to_string()),
+                        e.error(),
+                        e.debug()
+                    );
                     break;
                 }
                 gst::MessageView::Warning(w) => {
-                    println!("  bus WARNING from {:?}: {} ({:?})",
-                        w.src().map(|s| s.name().to_string()), w.error(), w.debug());
+                    println!(
+                        "  bus WARNING from {:?}: {} ({:?})",
+                        w.src().map(|s| s.name().to_string()),
+                        w.error(),
+                        w.debug()
+                    );
                 }
                 _ => {}
             }
@@ -223,10 +240,20 @@ fn probe(url: &str) -> Result<(), String> {
     let s = sw.load(Ordering::Relaxed);
     let secs = started.elapsed().as_secs_f64().max(0.001);
     println!("\n== result over {:.1}s ==", secs);
-    println!("  nvh264dec (HARDWARE) frames = {h}  ({:.1} fps){}",
-        h as f64 / secs, if h == 0 { "  <-- HARDWARE SILENT" } else { "" });
-    println!("  avdec_h264 (software)  frames = {s}  ({:.1} fps){}",
-        s as f64 / secs, if s == 0 { "  <-- stream itself dead" } else { "" });
+    println!(
+        "  nvh264dec (HARDWARE) frames = {h}  ({:.1} fps){}",
+        h as f64 / secs,
+        if h == 0 { "  <-- HARDWARE SILENT" } else { "" }
+    );
+    println!(
+        "  avdec_h264 (software)  frames = {s}  ({:.1} fps){}",
+        s as f64 / secs,
+        if s == 0 {
+            "  <-- stream itself dead"
+        } else {
+            ""
+        }
+    );
     Ok(())
 }
 
@@ -237,8 +264,11 @@ fn count_src(el: &gst::Element, label: &str, started: &Instant) -> Arc<AtomicU64
         pad.add_probe(gst::PadProbeType::BUFFER, move |p, _| {
             if nc.fetch_add(1, Ordering::Relaxed) == 0 {
                 let caps = p.current_caps().map(|c| c.to_string()).unwrap_or_default();
-                println!("  [{lab}] first frame @ {} ms  caps={}",
-                    st.elapsed().as_millis(), &caps[..caps.len().min(150)]);
+                println!(
+                    "  [{lab}] first frame @ {} ms  caps={}",
+                    st.elapsed().as_millis(),
+                    &caps[..caps.len().min(150)]
+                );
             }
             gst::PadProbeReturn::Ok
         });
@@ -255,7 +285,9 @@ fn splice_credentials(url: &str, creds: &str) -> String {
 
 fn redact(url: &str) -> String {
     // host:port/path only.
-    url.strip_prefix("rtsp://").map(|r| format!("rtsp://{r}")).unwrap_or_else(|| url.into())
+    url.strip_prefix("rtsp://")
+        .map(|r| format!("rtsp://{r}"))
+        .unwrap_or_else(|| url.into())
 }
 
 fn hex_to_bytes(s: &str) -> Option<Vec<u8>> {

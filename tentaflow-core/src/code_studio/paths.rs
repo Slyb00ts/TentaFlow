@@ -169,7 +169,9 @@ fn restrict_permissions(_dir: &Path) -> Result<()> {
 #[cfg(test)]
 pub(crate) fn test_data_dir_guard() -> std::sync::MutexGuard<'static, ()> {
     static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 #[cfg(test)]

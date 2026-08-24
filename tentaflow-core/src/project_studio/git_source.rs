@@ -177,9 +177,7 @@ fn authenticated_url(repo_url: &str, token: &str) -> Result<String> {
 const MAX_PIPE_BYTES: usize = 1024 * 1024;
 
 /// Drains a child pipe on its own thread, keeping at most `MAX_PIPE_BYTES`.
-fn drain_pipe<R: std::io::Read + Send + 'static>(
-    mut pipe: R,
-) -> std::thread::JoinHandle<Vec<u8>> {
+fn drain_pipe<R: std::io::Read + Send + 'static>(mut pipe: R) -> std::thread::JoinHandle<Vec<u8>> {
     std::thread::spawn(move || {
         let mut out = Vec::new();
         let mut chunk = [0u8; 8192];
@@ -266,7 +264,14 @@ fn run_git(args: &[&str], cwd: Option<&Path>, redacted: &str) -> Result<String> 
         .unwrap_or_default();
     if !status.success() {
         let stderr = String::from_utf8_lossy(&stderr);
-        let tail: String = stderr.chars().rev().take(1000).collect::<String>().chars().rev().collect();
+        let tail: String = stderr
+            .chars()
+            .rev()
+            .take(1000)
+            .collect::<String>()
+            .chars()
+            .rev()
+            .collect();
         bail!("git {redacted} failed: {}", tail.trim());
     }
     Ok(String::from_utf8_lossy(&stdout).to_string())
@@ -307,14 +312,21 @@ fn resolve_tree_root(clone_dir: &Path, subdir: &str) -> Result<PathBuf> {
 }
 
 fn head_commit(clone_dir: &Path) -> Result<String> {
-    Ok(run_git(&["rev-parse", "HEAD"], Some(clone_dir), "rev-parse")?
-        .trim()
-        .to_string())
+    Ok(
+        run_git(&["rev-parse", "HEAD"], Some(clone_dir), "rev-parse")?
+            .trim()
+            .to_string(),
+    )
 }
 
 /// Shallow-clones the repository into the source's working tree, replacing any
 /// previous content. Blocking — call from `spawn_blocking`.
-pub fn clone(project_id: &str, source_id: &str, config: &GitConfig, token: &str) -> Result<Checkout> {
+pub fn clone(
+    project_id: &str,
+    source_id: &str,
+    config: &GitConfig,
+    token: &str,
+) -> Result<Checkout> {
     ensure_public_repo_url(&config.repo_url)?;
     let dir = source_dir(project_id, source_id)?;
     if dir.exists() {
@@ -377,7 +389,13 @@ pub fn refresh(
     // `--ff-only` is the whole point: it fails on divergence instead of writing
     // a merge commit into a tree nobody will ever push.
     let target = format!("refs/remotes/tf/{}", config.branch);
-    if run_git(&["merge", "--ff-only", &target], Some(&dir), "merge --ff-only").is_err() {
+    if run_git(
+        &["merge", "--ff-only", &target],
+        Some(&dir),
+        "merge --ff-only",
+    )
+    .is_err()
+    {
         // Diverged history (force push / rebase) — a full re-clone is the only
         // correct recovery for a depth-1 tree.
         return clone(project_id, source_id, config, token);
@@ -397,8 +415,7 @@ pub fn stored_file_hashes(
     let conn = pool
         .read()
         .map_err(|e| anyhow!("project_studio git read: {e}"))?;
-    let mut stmt =
-        conn.prepare("SELECT path, sha256 FROM source_files WHERE source_id = ?1")?;
+    let mut stmt = conn.prepare("SELECT path, sha256 FROM source_files WHERE source_id = ?1")?;
     let rows = stmt.query_map(rusqlite::params![source_id], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
     })?;
@@ -430,7 +447,9 @@ mod unit_tests {
         assert!(parse_config(r#"{"repo_url":"ssh://git@example.com/r.git"}"#).is_err());
         assert!(parse_config(r#"{"repo_url":"file:///etc"}"#).is_err());
         assert!(parse_config("{}").is_err());
-        assert!(parse_config(r#"{"repo_url":"https://e.com/r","branch":"--upload-pack=x"}"#).is_err());
+        assert!(
+            parse_config(r#"{"repo_url":"https://e.com/r","branch":"--upload-pack=x"}"#).is_err()
+        );
         assert!(parse_config(r#"{"repo_url":"https://e.com/r","subdir":"../../etc"}"#).is_err());
     }
 
@@ -476,7 +495,10 @@ mod unit_tests {
                 "clone must refuse {private}, got: {err}"
             );
             let err = refresh(project, "src-1", &config, "").expect_err(private);
-            assert!(err.to_string().contains("private"), "refresh must refuse {private}");
+            assert!(
+                err.to_string().contains("private"),
+                "refresh must refuse {private}"
+            );
         }
         assert!(!repo_url_is_private("https://1.1.1.1/x.git").expect("public"));
     }

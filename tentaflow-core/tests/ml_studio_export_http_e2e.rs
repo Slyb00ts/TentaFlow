@@ -43,9 +43,7 @@ const AUDIT_ACTION: &str = "ml_studio_export_url_access";
 fn exports_base() -> &'static PathBuf {
     static BASE: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
     BASE.get_or_init(|| {
-        let td = Box::leak(Box::new(
-            tempfile::TempDir::new().expect("cache tempdir"),
-        ));
+        let td = Box::leak(Box::new(tempfile::TempDir::new().expect("cache tempdir")));
         std::env::set_var("TENTAFLOW_CACHE_DIR", td.path());
         let base = tentaflow_core::paths::ml_studio_exports_dir();
         std::fs::create_dir_all(&base).expect("create exports dir");
@@ -223,7 +221,9 @@ async fn router(
         ExportOutcome::Denied(_) => Response::builder()
             .status(auth_status)
             .header("Content-Type", "application/json")
-            .body(Full::new(Bytes::from_static(b"{\"error\":\"export_denied\"}")))
+            .body(Full::new(Bytes::from_static(
+                b"{\"error\":\"export_denied\"}",
+            )))
             .unwrap(),
     }
 }
@@ -527,7 +527,11 @@ async fn test_unknown_query_key_is_rejected() {
     .await
     .expect("request");
     assert_eq!(resp.status(), 400);
-    assert!(resp.text().await.expect("body").contains("unknown_query_key"));
+    assert!(resp
+        .text()
+        .await
+        .expect("body")
+        .contains("unknown_query_key"));
 }
 
 #[tokio::test]

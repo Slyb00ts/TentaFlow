@@ -1795,10 +1795,11 @@ pub async fn handle_request(
                         // STREAMED, never slurped: a clip can be gigabytes. `<video>`
                         // seeks via Range — without 206 + Content-Range the browser
                         // abandons the source and reports a bare "Format error".
-                        let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
-                            Some((s, e)) => (206u16, s, e - s + 1),
-                            None => (200u16, 0, size),
-                        };
+                        let (code, start, length) =
+                            match parse_byte_range(range_header.as_deref(), size) {
+                                Some((s, e)) => (206u16, s, e - s + 1),
+                                None => (200u16, 0, size),
+                            };
                         if start > 0 {
                             use tokio::io::AsyncSeekExt;
                             if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
@@ -1897,9 +1898,12 @@ pub async fn handle_request(
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
-        if let Err(resp) =
-            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/ml-studio/exports")
-        {
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/ml-studio/exports",
+        ) {
             return Ok(resp);
         }
         // Capture Range BEFORE `req` is released — the streamed response below
@@ -1938,10 +1942,11 @@ pub async fn handle_request(
                     ExportFileOutcome::Ok { mut file, size } => {
                         // STREAMED, never slurped: an export can be gigabytes.
                         // A paused download resumes via Range → 206 + Content-Range.
-                        let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
-                            Some((s, e)) => (206u16, s, e - s + 1),
-                            None => (200u16, 0, size),
-                        };
+                        let (code, start, length) =
+                            match parse_byte_range(range_header.as_deref(), size) {
+                                Some((s, e)) => (206u16, s, e - s + 1),
+                                None => (200u16, 0, size),
+                            };
                         if start > 0 {
                             use tokio::io::AsyncSeekExt;
                             if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
@@ -2027,15 +2032,18 @@ pub async fn handle_request(
         && path.len() > "/project-studio/exports/".len()
     {
         use crate::api::project_studio_export::{
-            export_download_filename, handle_project_studio_export_url, parse_query, read_export_file,
-            ExportFileOutcome, ExportOutcome, RequestContext,
+            export_download_filename, handle_project_studio_export_url, parse_query,
+            read_export_file, ExportFileOutcome, ExportOutcome, RequestContext,
         };
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
-        if let Err(resp) =
-            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/project-studio/exports")
-        {
+        if let Err(resp) = check_signed_url_rate_limit(
+            &db,
+            &client_ip,
+            user_agent.as_deref(),
+            "/project-studio/exports",
+        ) {
             return Ok(resp);
         }
         // Capture Range BEFORE `req` is released — the streamed response below
@@ -2074,10 +2082,11 @@ pub async fn handle_request(
                     ExportFileOutcome::Ok { mut file, size } => {
                         // STREAMED, never slurped: an export can be gigabytes.
                         // A paused download resumes via Range → 206 + Content-Range.
-                        let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
-                            Some((s, e)) => (206u16, s, e - s + 1),
-                            None => (200u16, 0, size),
-                        };
+                        let (code, start, length) =
+                            match parse_byte_range(range_header.as_deref(), size) {
+                                Some((s, e)) => (206u16, s, e - s + 1),
+                                None => (200u16, 0, size),
+                            };
                         if start > 0 {
                             use tokio::io::AsyncSeekExt;
                             if file.seek(std::io::SeekFrom::Start(start)).await.is_err() {
@@ -2349,12 +2358,9 @@ pub async fn handle_request(
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
-        if let Err(resp) = check_signed_url_rate_limit(
-            &db,
-            &client_ip,
-            user_agent.as_deref(),
-            "/ml-studio/share",
-        ) {
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/ml-studio/share")
+        {
             return Ok(resp);
         }
         let bearer_token = models_bearer_token(req.headers());
@@ -2440,12 +2446,9 @@ pub async fn handle_request(
         if let Err(resp) = reject_unauth_get_body(req.headers()) {
             return Ok(resp);
         }
-        if let Err(resp) = check_signed_url_rate_limit(
-            &db,
-            &client_ip,
-            user_agent.as_deref(),
-            "/ml-studio/share",
-        ) {
+        if let Err(resp) =
+            check_signed_url_rate_limit(&db, &client_ip, user_agent.as_deref(), "/ml-studio/share")
+        {
             return Ok(resp);
         }
         // Capture Range BEFORE `req` is released — the streamed response needs
@@ -2495,7 +2498,11 @@ pub async fn handle_request(
         let outcome = handle_share_archive(project_id, &auth, issuer, &db, ctx).await;
         let status = outcome.http_status();
         return match outcome {
-            ShareArchiveOutcome::Ok { mut file, size, sha256 } => {
+            ShareArchiveOutcome::Ok {
+                mut file,
+                size,
+                sha256,
+            } => {
                 // STREAMED, never slurped: an archive can be gigabytes. A paused
                 // download resumes via Range → 206 + Content-Range.
                 let (code, start, length) = match parse_byte_range(range_header.as_deref(), size) {
@@ -3108,9 +3115,7 @@ pub fn reconcile_code_studio(db: &DbPool, node_id: &str) -> CodeStudioRecovery {
         // sweep already lost, so it needs no container configuration — nothing
         // here starts a runtime.
         let sandboxes = ExecMode::from_slug(&workspace.exec_mode)
-            .ok_or_else(|| {
-                anyhow::anyhow!("unknown exec mode '{}'", workspace.exec_mode)
-            })
+            .ok_or_else(|| anyhow::anyhow!("unknown exec mode '{}'", workspace.exec_mode))
             .and_then(|exec_mode| SandboxManager::for_workspace(&workspace.id, exec_mode, None));
         let sandboxes = match sandboxes {
             Ok(manager) => Some(manager),
@@ -3146,9 +3151,9 @@ pub fn reconcile_code_studio(db: &DbPool, node_id: &str) -> CodeStudioRecovery {
                     }
                     report.projections_corrected += corrections.len();
                 }
-                Err(e) => warn!(
-                    "code studio: projection check failed for session '{session_id}': {e:#}"
-                ),
+                Err(e) => {
+                    warn!("code studio: projection check failed for session '{session_id}': {e:#}")
+                }
             }
 
             // §13.1. Without this the journal is write-only across a restart:
@@ -3410,7 +3415,9 @@ mod tests {
             Postcondition, Precondition,
         };
         use crate::code_studio::pep::Capability;
-        use crate::code_studio::{artifacts, fs as cs_fs, paths as cs_paths, repository, workspace_db};
+        use crate::code_studio::{
+            artifacts, fs as cs_fs, paths as cs_paths, repository, workspace_db,
+        };
 
         let _guard = cs_paths::test_data_dir_guard();
         let data = tempdir().expect("data dir");
@@ -3448,7 +3455,8 @@ mod tests {
             },
         )
         .expect("workspace");
-        repository::set_status(&main_db, "recops", WorkspaceStatus::Active, None).expect("activate");
+        repository::set_status(&main_db, "recops", WorkspaceStatus::Active, None)
+            .expect("activate");
         cs_paths::create_workspace_layout("recops").expect("layout");
         let pool = workspace_db::open("recops").expect("workspace db");
         {
@@ -3476,7 +3484,8 @@ mod tests {
 
         // The write whose content REACHED THE DISK before the crash: fully
         // verifiable, so the pass has to close it without asking anybody.
-        let worktree = cs_paths::session_worktree_dir("recops", "recopsess").expect("worktree path");
+        let worktree =
+            cs_paths::session_worktree_dir("recops", "recopsess").expect("worktree path");
         std::fs::create_dir_all(&worktree).expect("worktree");
         let content = b"written before the crash\n";
         let stored = artifacts::put(&pool, "recops", content, "file_content").expect("input blob");

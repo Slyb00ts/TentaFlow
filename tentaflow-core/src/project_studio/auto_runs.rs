@@ -236,9 +236,7 @@ pub fn select_runner(
                     .any(|t| t.language.eq_ignore_ascii_case(language))
             })
         })
-        .ok_or_else(|| {
-            anyhow!("no running test runner advertises the '{language}' toolchain")
-        })
+        .ok_or_else(|| anyhow!("no running test runner advertises the '{language}' toolchain"))
 }
 
 /// Whether a runner may execute untrusted scripts on this node: an isolated
@@ -633,8 +631,14 @@ pub fn get_artifact(pool: &DbPool, artifact_id: &str) -> Result<Option<RunArtifa
 pub fn delete_run_artifacts(pool: &DbPool, run_id: &str) -> Result<()> {
     let conn = pool.write().map_err(write_err)?;
     let tx = conn.unchecked_transaction()?;
-    tx.execute("DELETE FROM run_artifacts WHERE run_id = ?1", params![run_id])?;
-    tx.execute("DELETE FROM auto_run_meta WHERE run_id = ?1", params![run_id])?;
+    tx.execute(
+        "DELETE FROM run_artifacts WHERE run_id = ?1",
+        params![run_id],
+    )?;
+    tx.execute(
+        "DELETE FROM auto_run_meta WHERE run_id = ?1",
+        params![run_id],
+    )?;
     tx.commit()?;
     Ok(())
 }
@@ -1163,7 +1167,13 @@ struct ArtifactBudget {
     exhausted: bool,
 }
 
-fn emit(tx: &tokio::sync::broadcast::Sender<BusMessage>, run_id: &str, kind: &str, phase: &str, line: String) {
+fn emit(
+    tx: &tokio::sync::broadcast::Sender<BusMessage>,
+    run_id: &str,
+    kind: &str,
+    phase: &str,
+    line: String,
+) {
     let _ = tx.send(BusMessage::Line(LogLine {
         deploy_id: run_id.to_string(),
         kind: kind.to_string(),
@@ -1242,7 +1252,13 @@ async fn watch_loop(
         watchdog_deadline_ms,
         secret,
     } = task;
-    emit(&tx, &run_id, "phase", "queued", "run submitted to the runner".into());
+    emit(
+        &tx,
+        &run_id,
+        "phase",
+        "queued",
+        "run submitted to the runner".into(),
+    );
     let mut budget = ArtifactBudget::default();
 
     loop {
@@ -1310,14 +1326,10 @@ async fn watch_loop(
                 if failed >= MAX_FAILED_POLLS {
                     let endpoint = endpoint_url.clone();
                     let job = job_id.clone();
+                    let _ = tokio::task::spawn_blocking(move || cancel_runner_job(&endpoint, &job))
+                        .await;
                     let _ =
-                        tokio::task::spawn_blocking(move || cancel_runner_job(&endpoint, &job)).await;
-                    let _ = finish_run(
-                        &pool,
-                        &run_id,
-                        "error",
-                        "the test runner stopped answering",
-                    );
+                        finish_run(&pool, &run_id, "error", "the test runner stopped answering");
                     return;
                 }
                 continue;
@@ -1336,7 +1348,13 @@ async fn watch_loop(
             emit(&tx, &run_id, "item", "execute", item.clone());
         }
         for artifact in &outcome.applied.new_artifacts {
-            emit(&tx, &run_id, "artifact", "execute", artifact.artifact_id.clone());
+            emit(
+                &tx,
+                &run_id,
+                "artifact",
+                "execute",
+                artifact.artifact_id.clone(),
+            );
         }
         if outcome.applied.perf_changed {
             emit(&tx, &run_id, "perf", "execute", String::new());
@@ -1403,9 +1421,7 @@ fn poll_once(
             if budget.exhausted {
                 continue;
             }
-            if budget.count >= MAX_ARTIFACTS_PER_RUN
-                || budget.bytes >= MAX_ARTIFACT_TOTAL_BYTES
-            {
+            if budget.count >= MAX_ARTIFACTS_PER_RUN || budget.bytes >= MAX_ARTIFACT_TOTAL_BYTES {
                 budget.exhausted = true;
                 budget_notice = Some(format!(
                     "artifact budget reached ({} files / {} MiB) — the remaining \
@@ -1470,7 +1486,12 @@ pub async fn submit_and_watch(
     let job_id = match job_id {
         Ok(job_id) => job_id,
         Err(e) => {
-            let _ = finish_run(&pool, &run_id, "error", &format!("runner refused the run: {e}"));
+            let _ = finish_run(
+                &pool,
+                &run_id,
+                "error",
+                &format!("runner refused the run: {e}"),
+            );
             return Err(e);
         }
     };
@@ -1609,7 +1630,12 @@ pub fn run_try_item(
     deadline_ms: i64,
     mut on_event: impl FnMut(&str, &str),
 ) -> Result<serde_json::Value> {
-    let job_id = submit_run(endpoint_url, try_id, std::slice::from_ref(item), environment)?;
+    let job_id = submit_run(
+        endpoint_url,
+        try_id,
+        std::slice::from_ref(item),
+        environment,
+    )?;
     let scrub = |text: &str| -> String {
         if environment.secret.len() < 4 {
             return text.to_string();
@@ -1655,7 +1681,10 @@ pub fn run_try_item(
                 );
             }
         }
-        if matches!(snapshot.status.as_str(), "completed" | "cancelled" | "error") {
+        if matches!(
+            snapshot.status.as_str(),
+            "completed" | "cancelled" | "error"
+        ) {
             let item_state = snapshot.items.first();
             return Ok(serde_json::json!({
                 "job_status": snapshot.status,
@@ -1993,7 +2022,10 @@ mod unit_tests {
     fn try_run_registry_is_owner_scoped_and_single_use() {
         let try_id = uuid::Uuid::new_v4().to_string();
         let cancel = register_try_run(&try_id, "user-a").expect("register");
-        assert!(register_try_run(&try_id, "user-a").is_none(), "no double use");
+        assert!(
+            register_try_run(&try_id, "user-a").is_none(),
+            "no double use"
+        );
         assert!(!cancel_try_run(&try_id, "user-b"), "cancel is owner-scoped");
         assert!(!cancel.load(Ordering::Relaxed));
         assert!(cancel_try_run(&try_id, "user-a"));

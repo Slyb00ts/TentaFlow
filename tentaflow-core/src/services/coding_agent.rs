@@ -350,14 +350,13 @@ pub async fn execute_chat(
                         seq: 0,
                         object: data.clone(),
                     }),
-                    _ => data
-                        .get("method")
-                        .and_then(Value::as_str)
-                        .map(|method| BridgeEvent::Notification {
+                    _ => data.get("method").and_then(Value::as_str).map(|method| {
+                        BridgeEvent::Notification {
                             seq: 0,
                             method: method.to_string(),
                             params: data.get("params").cloned().unwrap_or(Value::Null),
-                        }),
+                        }
+                    }),
                 };
                 match structured.as_ref().and_then(turn_state) {
                     Some(TurnState::Completed) => completed = true,

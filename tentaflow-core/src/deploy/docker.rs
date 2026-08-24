@@ -201,10 +201,7 @@ async fn build_image(docker: &Docker, context: &Path, container: &str, tag: &str
 /// Applies `SandboxLimits` to a `HostConfig`. Additive: fields the sandbox does
 /// not touch (ports, binds, GPU) stay as they are.
 #[cfg(feature = "docker")]
-pub fn apply_sandbox_limits(
-    host_config: &mut bollard::models::HostConfig,
-    limits: &SandboxLimits,
-) {
+pub fn apply_sandbox_limits(host_config: &mut bollard::models::HostConfig, limits: &SandboxLimits) {
     host_config.network_mode = Some(limits.network_mode.clone());
     host_config.memory = Some(limits.memory_bytes);
     host_config.nano_cpus = Some(limits.nano_cpus);

@@ -557,7 +557,10 @@ impl InferenceEngine for MlxSwiftEngine {
         let decode_duration = first_token_time
             .map(|t| total_elapsed - t.duration_since(start))
             .unwrap_or(total_elapsed);
-        let engine_completion_tps = final_token.as_ref().map(|t| t.completion_tps).unwrap_or(0.0);
+        let engine_completion_tps = final_token
+            .as_ref()
+            .map(|t| t.completion_tps)
+            .unwrap_or(0.0);
         let engine_ttft_ms = final_token.as_ref().map(|t| t.ttft_ms).unwrap_or(0);
         let reported_completion = final_token
             .as_ref()

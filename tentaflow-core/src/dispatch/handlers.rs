@@ -2011,19 +2011,17 @@ fn build_cluster_deployment(
             .map(|m| m.hostname.clone())
     };
 
-    let dep_members = repository::list_cluster_deployment_members(
-        &ctx.state.db,
-        &dep.deployment_cluster_id,
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .map(|m| tentaflow_protocol::ClusterDeploymentMemberInfo {
-        hostname: hostname_of(&m.node_id),
-        node_id: m.node_id,
-        role: m.role,
-        container_name: m.container_name,
-    })
-    .collect();
+    let dep_members =
+        repository::list_cluster_deployment_members(&ctx.state.db, &dep.deployment_cluster_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| tentaflow_protocol::ClusterDeploymentMemberInfo {
+                hostname: hostname_of(&m.node_id),
+                node_id: m.node_id,
+                role: m.role,
+                container_name: m.container_name,
+            })
+            .collect();
 
     Some(tentaflow_protocol::ClusterDeploymentInfo {
         deployment_cluster_id: dep.deployment_cluster_id,

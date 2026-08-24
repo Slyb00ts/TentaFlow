@@ -1466,7 +1466,11 @@ fn test_delete_cache_miss_resolves_nonempty_path() {
 
     // Cache miss: the entry and its open backend leave the map, the files stay.
     mgr.invalidate_addon("addon_p");
-    assert_eq!(mgr.cached_entries(), 0, "invalidate must leave a cache miss");
+    assert_eq!(
+        mgr.cached_entries(),
+        0,
+        "invalidate must leave a cache miss"
+    );
 
     // Drop the row while keeping the files, so the delete has nothing but the key
     // to resolve a path from.
@@ -1479,7 +1483,10 @@ fn test_delete_cache_miss_resolves_nonempty_path() {
         )
         .unwrap();
     }
-    assert!(expected.exists(), "dropping the row must not touch the files");
+    assert!(
+        expected.exists(),
+        "dropping the row must not touch the files"
+    );
 
     mgr.delete_collection(ORG_A, "addon_p", "kg").unwrap();
 
@@ -1786,7 +1793,14 @@ fn test_shrinking_an_edge_document_set_does_not_resurrect_it() {
     )
     .unwrap();
     let (removed, _, _) = mgr
-        .delete_edge_in(ORG_A, "addon_a", "kg", "einstein", "worked_at", "eth_zurich")
+        .delete_edge_in(
+            ORG_A,
+            "addon_a",
+            "kg",
+            "einstein",
+            "worked_at",
+            "eth_zurich",
+        )
         .unwrap();
     assert!(removed, "the edge was alive before the manual tombstone");
 

@@ -97,7 +97,11 @@ mod tests {
         for alias in TEAMS_ALIASES {
             let rows = repository::list_model_aliases(&pool).unwrap();
             let matching: Vec<_> = rows.iter().filter(|row| row.alias == *alias).collect();
-            assert_eq!(matching.len(), 1, "alias {alias} nie występuje dokładnie raz");
+            assert_eq!(
+                matching.len(),
+                1,
+                "alias {alias} nie występuje dokładnie raz"
+            );
             assert_eq!(matching[0].target_model, "");
             assert_eq!(matching[0].strategy.as_deref(), Some("first_available"));
             assert!(

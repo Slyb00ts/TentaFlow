@@ -361,7 +361,11 @@ impl OnnxOcrEngine {
                 i64::MAX
             }
         };
-        boxes.sort_by(|a, b| band_of(a).cmp(&band_of(b)).then_with(|| a.x1.total_cmp(&b.x1)));
+        boxes.sort_by(|a, b| {
+            band_of(a)
+                .cmp(&band_of(b))
+                .then_with(|| a.x1.total_cmp(&b.x1))
+        });
 
         let mut lines: Vec<String> = Vec::with_capacity(boxes.len());
         for b in &boxes {

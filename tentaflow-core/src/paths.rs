@@ -245,8 +245,7 @@ pub fn schedule_boot_migration(category: StorageCategory, new_path: &str) -> std
 
 /// Zaplanowana (jeszcze nie wykonana) migracja kategorii, jesli istnieje.
 pub fn pending_boot_migration(category: StorageCategory) -> Option<String> {
-    read_conf(&pending_migrations_conf())
-        .remove(category.setting_key())
+    read_conf(&pending_migrations_conf()).remove(category.setting_key())
 }
 
 /// Wartosc override kategorii restartowej zapisana w storage-paths.conf
@@ -258,10 +257,7 @@ pub fn boot_override_value(category: StorageCategory) -> Option<String> {
 
 /// Zapisuje override kategorii restartowej do storage-paths.conf (bez
 /// przenoszenia danych — nowa sciezka obowiazuje od nastepnego startu).
-pub fn set_boot_override(
-    category: StorageCategory,
-    value: Option<&str>,
-) -> std::io::Result<()> {
+pub fn set_boot_override(category: StorageCategory, value: Option<&str>) -> std::io::Result<()> {
     let conf_path = storage_paths_conf();
     let mut map = read_conf(&conf_path);
     match value {
@@ -288,7 +284,10 @@ pub fn apply_pending_boot_migrations() {
     let mut conf = boot_overrides();
     for (key, new_path) in &pending {
         let Some(cat) = StorageCategory::from_setting_key(key) else {
-            eprintln!("tentaflow: pending storage migration: nieznana kategoria '{}'", key);
+            eprintln!(
+                "tentaflow: pending storage migration: nieznana kategoria '{}'",
+                key
+            );
             continue;
         };
         let src = category_dir_from_conf(cat, &conf);
@@ -356,7 +355,11 @@ pub fn move_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     // Pusty katalog docelowy (np. swiezo utworzony w pickerze) usuwamy, zeby
     // szybki `rename` na tym samym systemie plikow byl mozliwy.
-    if dst.is_dir() && std::fs::read_dir(dst).map(|mut d| d.next().is_none()).unwrap_or(false) {
+    if dst.is_dir()
+        && std::fs::read_dir(dst)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+    {
         let _ = std::fs::remove_dir(dst);
     }
     if !dst.exists() {

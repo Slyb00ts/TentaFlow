@@ -50,7 +50,10 @@ fn chat_request_round_trip_keeps_vendor_fields() {
 
     let rf: &ResponseFormat = parsed.response_format.as_ref().unwrap();
     assert_eq!(rf.format_type, "json_schema");
-    assert_eq!(rf.json_schema, Some(input["response_format"]["json_schema"].clone()));
+    assert_eq!(
+        rf.json_schema,
+        Some(input["response_format"]["json_schema"].clone())
+    );
     assert_eq!(rf.extra.get("vendor_hint"), Some(&json!("keep-me")));
     assert_eq!(parsed.max_tokens, Some(64));
     assert!(!parsed.stream);
@@ -87,7 +90,10 @@ async fn backend_client_forwards_json_schema_and_guided_json() {
             let expected = client_request_json();
             assert_eq!(body["response_format"], expected["response_format"]);
             assert_eq!(body["guided_json"], expected["guided_json"]);
-            assert_eq!(body["chat_template_kwargs"], expected["chat_template_kwargs"]);
+            assert_eq!(
+                body["chat_template_kwargs"],
+                expected["chat_template_kwargs"]
+            );
             assert_eq!(body["top_k"], json!(40));
             assert_eq!(body["model"], json!("qwen"));
             ResponseTemplate::new(200).set_body_json(json!({
@@ -126,7 +132,10 @@ async fn backend_client_forwards_json_schema_and_guided_json() {
     let client = BackendClient::new(backend, None).expect("backend client");
 
     let request: ChatCompletionRequest = serde_json::from_value(client_request_json()).unwrap();
-    let response = client.chat_completion(request).await.expect("chat completion");
+    let response = client
+        .chat_completion(request)
+        .await
+        .expect("chat completion");
 
     let content = match response.choices[0].message.content.as_ref() {
         Some(MessageContent::Text(text)) => text.clone(),

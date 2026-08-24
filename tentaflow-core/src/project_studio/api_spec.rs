@@ -56,8 +56,7 @@ pub fn parse_spec(bytes: &[u8]) -> Result<ParsedSpec> {
     if bytes.len() > MAX_SPEC_BYTES {
         return Err(anyhow!("spec exceeds {MAX_SPEC_BYTES} bytes"));
     }
-    let text = std::str::from_utf8(bytes)
-        .map_err(|_| anyhow!("spec is not valid UTF-8 text"))?;
+    let text = std::str::from_utf8(bytes).map_err(|_| anyhow!("spec is not valid UTF-8 text"))?;
     let document: Value = match serde_json::from_str::<Value>(text) {
         Ok(value) => value,
         Err(json_err) => serde_yaml_ng::from_str::<Value>(text).map_err(|yaml_err| {

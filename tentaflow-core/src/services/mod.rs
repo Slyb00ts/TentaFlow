@@ -74,11 +74,7 @@ pub mod streaming;
 pub mod supervisor;
 pub mod transport;
 pub mod vector;
-#[cfg(all(
-    unix,
-    feature = "camera",
-    feature = "inference-vision-gpu"
-))]
+#[cfg(all(unix, feature = "camera", feature = "inference-vision-gpu"))]
 pub mod vision_worker;
 
 pub use tts::{TTSClient, TTSConfigCompat};
@@ -335,7 +331,8 @@ pub fn project_studio_export_url_issuer() -> &'static Arc<signed_urls::SignedUrl
         let issuer = Arc::new(signed_urls::SignedUrlIssuer::new(
             signed_urls::UrlScope::ProjectStudioExport,
         ));
-        if let Ok(path) = key_storage::key_path(signed_urls::UrlScope::ProjectStudioExport.key_name())
+        if let Ok(path) =
+            key_storage::key_path(signed_urls::UrlScope::ProjectStudioExport.key_name())
         {
             let weak = Arc::downgrade(&issuer);
             key_storage::watcher::spawn_key_watcher(

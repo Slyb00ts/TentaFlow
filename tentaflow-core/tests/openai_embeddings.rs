@@ -11,12 +11,12 @@ use tentaflow_core::api::openai::types::{
     encode_embedding_base64, EmbeddingEncoding, EmbeddingInput, EmbeddingRequest,
 };
 use tentaflow_core::config::{ConnectionType, ServiceBackend};
+use tentaflow_core::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 use tentaflow_core::inference::InferenceManager;
 use tentaflow_core::services::backend::BackendClient;
 use tentaflow_core::services::catalog::CatalogProvider;
 use tentaflow_core::services::handles_cache::{BackendHandle, LiveHandlesCache};
 use tentaflow_core::services::mesh_registry::MeshServicesRegistry;
-use tentaflow_core::flow_engine::dispatcher::{FlowActor, FlowOrigin};
 use tentaflow_core::services::runtime::{AliasResolver, ExecutionContext, ModelRuntimeExecutor};
 use tentaflow_protocol::{RequestTimeParameters, ServiceInfo, ServiceModelEntry};
 use wiremock::matchers::{method, path};
@@ -188,7 +188,8 @@ async fn run_through_executor(base64_backend: bool) -> (Value, Value) {
     let request: EmbeddingRequest =
         parse_embedding_request(&serde_json::to_vec(&client_body()).unwrap()).expect("valid");
     let encoding = EmbeddingEncoding::parse(request.encoding_format.as_deref()).unwrap();
-    let mut ctx = ExecutionContext::new(None, FlowOrigin::Api, FlowActor::api_key("test-key", None));
+    let mut ctx =
+        ExecutionContext::new(None, FlowOrigin::Api, FlowActor::api_key("test-key", None));
     let response = executor
         .execute_embeddings(request, &mut ctx)
         .await
@@ -274,7 +275,10 @@ async fn backend_error_becomes_executor_error() {
         extra: serde_json::Map::new(),
     };
     let err = executor
-        .execute_embeddings(request, &mut ExecutionContext::new(None, FlowOrigin::Api, FlowActor::api_key("test-key", None)))
+        .execute_embeddings(
+            request,
+            &mut ExecutionContext::new(None, FlowOrigin::Api, FlowActor::api_key("test-key", None)),
+        )
         .await
         .expect_err("500 from backend must fail");
     assert!(err.to_string().contains("500"), "got: {err}");

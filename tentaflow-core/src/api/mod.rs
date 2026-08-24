@@ -27,8 +27,8 @@ pub mod dashboard;
 
 pub mod unified_server;
 
-pub mod tls_pem;
 /// Per-installation HTTPS certificate generation and reuse.
 pub mod tls_identity;
+pub mod tls_pem;
 
 pub mod mtls;

@@ -650,10 +650,7 @@ impl Broker {
             MAX_BLOB_BYTES,
         )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "git cat-file failed: {}",
-                stderr_text(&out.stderr)
-            ));
+            return Err(anyhow!("git cat-file failed: {}", stderr_text(&out.stderr)));
         }
         Ok(out.stdout)
     }
@@ -681,10 +678,7 @@ impl Broker {
         validate_start_point(tree)?;
         let out = self.run(Some(handle), &["ls-tree", "-r", "-z", tree], &GitAuth::None)?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "git ls-tree failed: {}",
-                stderr_text(&out.stderr)
-            ));
+            return Err(anyhow!("git ls-tree failed: {}", stderr_text(&out.stderr)));
         }
         let raw = String::from_utf8_lossy(&out.stdout).to_string();
         let mut entries = Vec::new();
@@ -829,10 +823,7 @@ impl Broker {
             &GitAuth::None,
         )?;
         if !out.status.success() {
-            return Err(anyhow!(
-                "git diff failed: {}",
-                stderr_text(&out.stderr)
-            ));
+            return Err(anyhow!("git diff failed: {}", stderr_text(&out.stderr)));
         }
         Ok(String::from_utf8_lossy(&out.stdout).to_string())
     }
@@ -978,11 +969,10 @@ impl Broker {
         // happens before any addition, so a path that the accepted patch set
         // recreates survives (§11.5: what is committed is what the human saw).
         for file in &spec.files {
-            let removals = file
-                .old_path
-                .iter()
-                .map(String::as_str)
-                .chain(matches!(file.change, CommitChange::Delete).then_some(file.path.as_str()));
+            let removals =
+                file.old_path.iter().map(String::as_str).chain(
+                    matches!(file.change, CommitChange::Delete).then_some(file.path.as_str()),
+                );
             for path in removals {
                 let out = self.exec(
                     Some(handle),
@@ -1153,7 +1143,10 @@ impl Broker {
 
     pub fn integration_worktree(&self, session_id: &str) -> Result<PathBuf> {
         paths::validate_session_id(session_id)?;
-        Ok(self.root.join("worktrees").join(integration_name(session_id)))
+        Ok(self
+            .root
+            .join("worktrees")
+            .join(integration_name(session_id)))
     }
 
     /// Handle of the integration worktree. As everywhere else, the git
@@ -1291,10 +1284,7 @@ impl Broker {
         if paths.is_empty() {
             // No conflicted path means the merge failed for another reason —
             // a dirty worktree, an unreadable ref. That IS an error.
-            return Err(anyhow!(
-                "git merge failed: {}",
-                stderr_text(&out.stderr)
-            ));
+            return Err(anyhow!("git merge failed: {}", stderr_text(&out.stderr)));
         }
         Ok(MergeOutcome::Conflict { paths })
     }
@@ -1597,12 +1587,15 @@ impl Broker {
             .stdout
             .take()
             .map(|pipe| std::thread::spawn(move || drain_capped(pipe, stdout_cap)));
-        let stderr = child.stderr.take().map(|pipe| {
-            std::thread::spawn(move || drain_capped(pipe, MAX_STDERR_BYTES))
-        });
+        let stderr = child
+            .stderr
+            .take()
+            .map(|pipe| std::thread::spawn(move || drain_capped(pipe, MAX_STDERR_BYTES)));
 
         if let Some(writer) = writer {
-            writer.join().map_err(|_| anyhow!("git stdin writer panicked"))?;
+            writer
+                .join()
+                .map_err(|_| anyhow!("git stdin writer panicked"))?;
         }
         let stdout = match stdout {
             Some(handle) => handle
@@ -2279,7 +2272,11 @@ mod tests {
         broker.init_repository("main").unwrap();
 
         let out = broker
-            .run(Some(&broker.reference()), &["config", "--list"], &GitAuth::None)
+            .run(
+                Some(&broker.reference()),
+                &["config", "--list"],
+                &GitAuth::None,
+            )
             .unwrap();
         let effective = String::from_utf8_lossy(&out.stdout).to_ascii_lowercase();
         for expected in [
@@ -2423,7 +2420,9 @@ mod tests {
                 .first()
                 .expect("no key was written for an ssh clone")
                 .clone();
-            assert!(std::fs::read_to_string(&key).unwrap().contains("PRIVATE KEY"));
+            assert!(std::fs::read_to_string(&key)
+                .unwrap()
+                .contains("PRIVATE KEY"));
             #[cfg(unix)]
             assert_eq!(mode_of(&key), 0o600, "the private key is world readable");
             assert!(
@@ -2646,7 +2645,10 @@ mod tests {
         let script = dir.path().join("payload.sh");
         std::fs::write(
             &script,
-            format!("#!/bin/sh\ntouch {}\ncat \"$1\" 2>/dev/null\n", marker.display()),
+            format!(
+                "#!/bin/sh\ntouch {}\ncat \"$1\" 2>/dev/null\n",
+                marker.display()
+            ),
         )
         .unwrap();
         std::fs::set_permissions(&script, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -2970,7 +2972,9 @@ mod tests {
             "README.md",
             "two\n",
         );
-        broker.sync_worktree_index("s-1", &commit.commit_oid).unwrap();
+        broker
+            .sync_worktree_index("s-1", &commit.commit_oid)
+            .unwrap();
 
         let status = broker.status("s-1").unwrap();
         assert!(
@@ -3286,8 +3290,18 @@ mod tests {
         // must not be a name the broker agrees to commit. Both guards read the
         // same `fs::validate_component`, so this asserts they still do.
         for name in [
-            "COM1", "com1.log", "NUL", "aux.txt", "CONIN$", "x.", "x ", ".GIT", ".Git", "a:b",
-            "star*name", "pipe|name",
+            "COM1",
+            "com1.log",
+            "NUL",
+            "aux.txt",
+            "CONIN$",
+            "x.",
+            "x ",
+            ".GIT",
+            ".Git",
+            "a:b",
+            "star*name",
+            "pipe|name",
         ] {
             let by_fs = crate::code_studio::fs::RelPath::parse(&format!("src/{name}")).is_err();
             let by_broker = validate_repo_path(&format!("src/{name}")).is_err();
@@ -3618,7 +3632,11 @@ mod regression_tests {
         // A name the repository does not know is a plain "no such remote", not
         // a parse error about a url nobody wrote.
         let pushed = broker.push_branch(&handle, "origin", "main", &GitAuth::None);
-        let message = pushed.as_ref().err().map(|e| e.to_string()).unwrap_or_default();
+        let message = pushed
+            .as_ref()
+            .err()
+            .map(|e| e.to_string())
+            .unwrap_or_default();
         assert!(
             !message.contains("invalid remote url"),
             "core.git_push's default remote is refused before git is ever reached: {message}"
@@ -3734,11 +3752,7 @@ mod regression_tests {
             .remove_session_worktree("s-1")
             .expect("worktree removal must not depend on the pointer file either");
         assert!(!worktree.exists(), "the worktree directory survived");
-        let admin = broker
-            .reference()
-            .git_dir
-            .join("worktrees")
-            .join("s-1");
+        let admin = broker.reference().git_dir.join("worktrees").join("s-1");
         assert!(
             !admin.exists(),
             "the administrative entry was left behind, so the id cannot be reused"

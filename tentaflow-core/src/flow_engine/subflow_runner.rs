@@ -316,7 +316,6 @@ fn wrap_outcome_as_stream(
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -136,6 +136,16 @@ impl core::fmt::Display for AbiError {
     }
 }
 
+/// Guest `on_request` ABI return code: the response did not fit into the
+/// caller-provided output buffer. On this code the guest MUST have written
+/// the required byte length (u32 LE) to `out_len_ptr`; the host deallocates
+/// the buffer, allocates the required size (up to 8 MB) and re-invokes
+/// `on_request` with a bounded retry. Distinct from
+/// `AbiError::OutputBufferTooSmall` (6), which is the host-function-level
+/// code for the 5-param host fns, and from code 2, which stays a generic
+/// guest error (no retry).
+pub const ABI_OUTPUT_BUFFER_TOO_SMALL: i32 = 3;
+
 // =============================================================================
 // Bindingi do host functions (importowane z Core przez WASM)
 // =============================================================================
@@ -666,15 +676,26 @@ pub fn read_string(ptr: i32, len: i32) -> String {
 }
 
 /// Zapisuje string do bufora w pamieci guest WASM.
-/// Zwraca liczbe zapisanych bajtow lub -1 jesli bufor za maly.
-pub fn write_string(ptr: i32, max: i32, s: &str) -> i32 {
+/// Zwraca liczbe zapisanych bajtow. Gdy string nie miesci sie w buforze,
+/// wpisuje wymagany rozmiar (u32 LE) pod `out_len_ptr` i zwraca -1 —
+/// kontrakt kodu `ABI_OUTPUT_BUFFER_TOO_SMALL`: host realokuje bufor i
+/// powtarza on_request (ograniczony retry, max 8 MB).
+pub fn write_string(ptr: i32, max: i32, out_len_ptr: i32, s: &str) -> i32 {
+    write_string_raw(ptr as *mut u8, max as usize, out_len_ptr as *mut u8, s)
+}
+
+/// Rdzen `write_string` na surowych wskaznikach. Logika jest wydzielona, bo
+/// hostowy wskaznik 64-bitowy nie przezywa okrazenia do `i32` ABI — testy
+/// moga wiec celowac w nia realnymi wskaznikami takze poza wasm32.
+fn write_string_raw(buf: *mut u8, max: usize, out_len_ptr: *mut u8, s: &str) -> i32 {
     let bytes = s.as_bytes();
-    if bytes.len() > max as usize {
+    if bytes.len() > max {
+        // Wymagany rozmiar dla hosta (kontrakt retry).
+        let dest = unsafe { std::slice::from_raw_parts_mut(out_len_ptr, 4) };
+        dest.copy_from_slice(&(bytes.len() as u32).to_le_bytes());
         return -1;
     }
-    let dest = unsafe {
-        std::slice::from_raw_parts_mut(ptr as *mut u8, max as usize)
-    };
+    let dest = unsafe { std::slice::from_raw_parts_mut(buf, max) };
     dest[..bytes.len()].copy_from_slice(bytes);
     bytes.len() as i32
 }
@@ -2428,7 +2449,7 @@ pub fn webrtc_register_camera(
 pub mod prelude {
     pub use crate::ui;
     pub use crate::{
-        read_string, write_string,
+        read_string, write_string, ABI_OUTPUT_BUFFER_TOO_SMALL,
         generate,
         store_get, store_set,
         state_get, state_set, state_delete, state_list,
@@ -4560,5 +4581,42 @@ mod state_wrapper_tests {
             StateTier::from_wire(StateTier::Ephemeral.to_wire()),
             StateTier::Ephemeral
         );
+    }
+}
+
+#[cfg(test)]
+mod memory_helper_tests {
+    use super::write_string_raw;
+
+    /// Overflow must return -1 AND report the required length (u32 LE) to
+    /// out_len_ptr — that is the contract the host retry depends on.
+    #[test]
+    fn write_string_overflow_reports_required_length() {
+        let mut buf = [0u8; 64];
+        let mut len_slot = [0u8; 4];
+
+        let long = "x".repeat(200);
+        let written =
+            write_string_raw(buf.as_mut_ptr(), buf.len(), len_slot.as_mut_ptr(), &long);
+        assert_eq!(written, -1, "overflow must return -1");
+        assert_eq!(
+            u32::from_le_bytes(len_slot),
+            200,
+            "required length must land in out_len_ptr"
+        );
+    }
+
+    /// The fitting path is unchanged: returns the byte count and leaves
+    /// out_len_ptr alone (only the overflow path writes it).
+    #[test]
+    fn write_string_fitting_path_unchanged() {
+        let mut buf = [0u8; 16];
+        let mut len_slot = [0u8; 4];
+
+        let written =
+            write_string_raw(buf.as_mut_ptr(), buf.len(), len_slot.as_mut_ptr(), "hello");
+        assert_eq!(written, 5, "success must return the written byte count");
+        assert_eq!(&buf[..5], b"hello");
+        assert_eq!(len_slot, [0u8; 4]);
     }
 }

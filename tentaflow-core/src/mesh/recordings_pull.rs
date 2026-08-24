@@ -228,7 +228,10 @@ async fn await_landed_file(pull_dir: &std::path::Path, rec_ref: &str) -> anyhow:
             return Ok(p);
         }
         if tokio::time::Instant::now() >= deadline {
-            anyhow::bail!("pulled recording {rec_ref} never landed in {}", pull_dir.display());
+            anyhow::bail!(
+                "pulled recording {rec_ref} never landed in {}",
+                pull_dir.display()
+            );
         }
         tokio::time::sleep(FILE_SETTLE_POLL).await;
     }
@@ -278,8 +281,7 @@ pub async fn validate_local_recording_path(
 /// `.tentaflow/recordings` directory pair — identical to `api/recording.rs`.
 async fn path_within_recordings_base(canonical: &std::path::Path) -> bool {
     if let Ok(canonical_base) = tokio::fs::canonicalize(crate::paths::recordings_dir()).await {
-        return canonical.starts_with(&canonical_base)
-            && path_traverses_recordings_dir(canonical);
+        return canonical.starts_with(&canonical_base) && path_traverses_recordings_dir(canonical);
     }
     path_traverses_recordings_dir(canonical)
 }
@@ -318,7 +320,11 @@ fn find_landed_file(pull_dir: &std::path::Path, rec_ref: &str) -> Option<PathBuf
             continue;
         };
         // Stored as `<ref>` (no ext) or `<ref>.<ext>`.
-        if name == rec_ref || name.strip_prefix(rec_ref).is_some_and(|r| r.starts_with('.')) {
+        if name == rec_ref
+            || name
+                .strip_prefix(rec_ref)
+                .is_some_and(|r| r.starts_with('.'))
+        {
             return Some(path);
         }
     }

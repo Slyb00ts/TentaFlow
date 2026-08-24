@@ -171,9 +171,8 @@ impl DelegationConfig {
         // The same resolution `issue_ticket` performs, run at configuration
         // time so an unbindable model is a validation error on save instead of
         // a delegation that dies after the run row and the CLI instance exist.
-        cli_adapter::ticket_model_binding(engine, model).map_err(|reason| {
-            anyhow!("delegate_cli node '{}': {reason}", node.id)
-        })?;
+        cli_adapter::ticket_model_binding(engine, model)
+            .map_err(|reason| anyhow!("delegate_cli node '{}': {reason}", node.id))?;
         Ok(Self {
             engine: engine.to_string(),
             service_id,
@@ -628,7 +627,9 @@ async fn pump(
         // traffic mid-response, so polling on would only add latency to a
         // decided outcome; under the reported one this check IS the stop.
         if let Some(why) = spend.exhausted(&pumped.reported) {
-            return Err(anyhow!("delegate_cli: the delegation stopped because {why}"));
+            return Err(anyhow!(
+                "delegate_cli: the delegation stopped because {why}"
+            ));
         }
         for event in bridge.poll(pool, instance).await? {
             ordinal += 1;
@@ -702,7 +703,8 @@ async fn pump(
                 BridgeEvent::VendorSession {
                     vendor_session_id, ..
                 } => {
-                    if !vendor_session_id.is_empty() && *vendor_session_id != instance.vendor_session_id
+                    if !vendor_session_id.is_empty()
+                        && *vendor_session_id != instance.vendor_session_id
                     {
                         instance.vendor_session_id = vendor_session_id.clone();
                         cli_bridge::set_instance_vendor_session(
@@ -813,8 +815,12 @@ async fn authorize_delegation(
     // The engine is the grant's target: "always allow delegating to codex" is a
     // permission an operator can actually reason about, whereas a grant with no
     // target would cover every engine ever configured.
-    let session_ctx =
-        tools::session_ctx_for(call_ctx.main_db, bound, Capability::CliDelegate, Some(engine_id))?;
+    let session_ctx = tools::session_ctx_for(
+        call_ctx.main_db,
+        bound,
+        Capability::CliDelegate,
+        Some(engine_id),
+    )?;
     let summary = match cli_adapter::authorize_delegation(&session_ctx, true) {
         DelegateDecision::Allow => return Ok(session_ctx),
         DelegateDecision::Deny { reason } => return Err(anyhow!("delegate_cli: {reason}")),
@@ -1104,15 +1110,7 @@ impl NodeAdapter for DelegateCliNodeAdapter {
         )?;
 
         let outcome = delegate(
-            &call_ctx,
-            &bound,
-            &bridge,
-            &config,
-            &cipher,
-            &run_id,
-            &worktree,
-            &prompt,
-            ctx,
+            &call_ctx, &bound, &bridge, &config, &cipher, &run_id, &worktree, &prompt, ctx,
         )
         .await;
         settle_if_cancelled.disarm();
@@ -1694,8 +1692,13 @@ mod tests {
         );
         tokio::spawn(async move {
             while let Ok((mut socket, _)) = listener.accept().await {
-                let (script, a, p, c, auth) =
-                    (script.clone(), a.clone(), p.clone(), c.clone(), auth.clone());
+                let (script, a, p, c, auth) = (
+                    script.clone(),
+                    a.clone(),
+                    p.clone(),
+                    c.clone(),
+                    auth.clone(),
+                );
                 tokio::spawn(async move {
                     let mut buffer = Vec::new();
                     let mut chunk = [0_u8; 4096];
@@ -1801,7 +1804,8 @@ mod tests {
     /// `resolve_bridge` would read in production.
     fn db_with_bridge(engine: &str, addr: SocketAddr) -> (crate::db::DbPool, i64) {
         let db = crate::db::init(std::path::Path::new(":memory:")).expect("init db");
-        let mut new = NewService::minimal(engine, DeployMethod::NativeManagedCli, Transport::AgentRpc);
+        let mut new =
+            NewService::minimal(engine, DeployMethod::NativeManagedCli, Transport::AgentRpc);
         new.category = "coding-agent".to_string();
         new.status = ServiceStatus::Running;
         new.endpoint_url = Some(format!("http://{addr}"));
@@ -2027,9 +2031,7 @@ mod tests {
     /// making every caller thread a database it does not care about.
     fn test_registry_db() -> &'static DbPool {
         static DB: std::sync::OnceLock<DbPool> = std::sync::OnceLock::new();
-        DB.get_or_init(|| {
-            crate::db::init(std::path::Path::new(":memory:")).expect("registry db")
-        })
+        DB.get_or_init(|| crate::db::init(std::path::Path::new(":memory:")).expect("registry db"))
     }
 
     fn approval_context<'a>(
@@ -2085,7 +2087,11 @@ mod tests {
                 bytes_down: 64,
             },
         );
-        assert_eq!(crossed, Some("tokens"), "4000 tokens against a ceiling of 100");
+        assert_eq!(
+            crossed,
+            Some("tokens"),
+            "4000 tokens against a ceiling of 100"
+        );
         assert_eq!(tickets.exhausted(&ticket.claims.ticket_id), Some("tokens"));
 
         // The CLI's own next call no longer buys anything.
@@ -2106,8 +2112,7 @@ mod tests {
         // Nobody answers in a test, and an unanswered question is a refusal.
         let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
         let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
-        let approvals =
-            approval_context("codex", &grants, data.path(), "run-budget", &gate, &pool);
+        let approvals = approval_context("codex", &grants, data.path(), "run-budget", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let error = pump(
             &bridge,
@@ -2153,10 +2158,7 @@ mod tests {
         // --- refused: `plan` mode runs no commands at all ---
         let data = tempfile::tempdir().expect("data dir");
         let cwd = data.path().to_string_lossy().to_string();
-        crate::paths::set_category_override(
-            crate::paths::StorageCategory::Data,
-            Some(cwd.clone()),
-        );
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, Some(cwd.clone()));
         let pool = workspace_fixture("wsappr", "run-appr");
         let stub = stub_bridge(script(&cwd)).await;
         let (db, service_id) = db_with_bridge("codex", stub.addr);
@@ -2191,8 +2193,7 @@ mod tests {
         // Nobody answers in a test, and an unanswered question is a refusal.
         let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
         let refusing = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Plan);
-        let approvals =
-            approval_context("codex", &refusing, data.path(), "run-appr", &gate, &pool);
+        let approvals = approval_context("codex", &refusing, data.path(), "run-appr", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2226,10 +2227,7 @@ mod tests {
         // --- allowed: the same request, a mode and a grant that permit it ---
         let data = tempfile::tempdir().expect("data dir");
         let cwd = data.path().to_string_lossy().to_string();
-        crate::paths::set_category_override(
-            crate::paths::StorageCategory::Data,
-            Some(cwd.clone()),
-        );
+        crate::paths::set_category_override(crate::paths::StorageCategory::Data, Some(cwd.clone()));
         let pool = workspace_fixture("wsappr2", "run-appr2");
         let stub = stub_bridge(script(&cwd)).await;
         let (db, service_id) = db_with_bridge("codex", stub.addr);
@@ -2314,8 +2312,7 @@ mod tests {
         // Nobody answers in a test, and an unanswered question is a refusal.
         let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
         let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
-        let approvals =
-            approval_context("codex", &grants, data.path(), "run-secret", &gate, &pool);
+        let approvals = approval_context("codex", &grants, data.path(), "run-secret", &gate, &pool);
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2335,7 +2332,9 @@ mod tests {
             pumped.transcript
         );
         assert!(
-            pumped.transcript.contains(crate::code_studio::redact::REDACTED),
+            pumped
+                .transcript
+                .contains(crate::code_studio::redact::REDACTED),
             "the line survives, the credential does not: {}",
             pumped.transcript
         );
@@ -2460,7 +2459,14 @@ mod tests {
         // Nobody answers in a test, and an unanswered question is a refusal.
         let gate = tools::ScriptedGate::answering(tools::ApprovalDecision::Deny);
         let grants = |_: Capability, _: Option<&str>| ticket_ctx(AutonomyMode::Normal);
-        let approvals = approval_context("claude-code", &grants, data.path(), "run-claude", &gate, &pool);
+        let approvals = approval_context(
+            "claude-code",
+            &grants,
+            data.path(),
+            "run-claude",
+            &gate,
+            &pool,
+        );
         let cancel = tokio_util::sync::CancellationToken::new();
         let pumped = pump(
             &bridge,
@@ -2509,8 +2515,8 @@ mod tests {
         let pool = workspace_fixture("wscancel", "run-seed");
 
         // --- the run row ---
-        let settle = open_run(&pool, "sess-1", "run-cancel", None, "claude-sonnet-4-6")
-            .expect("open run");
+        let settle =
+            open_run(&pool, "sess-1", "run-cancel", None, "claude-sonnet-4-6").expect("open run");
         assert_eq!(run_status(&pool, "run-cancel"), "running");
         drop(settle);
         assert_eq!(
@@ -2811,13 +2817,17 @@ mod tests {
             .iter()
             .filter(|(kind, _)| kind == "approval_decided")
             .count();
-        assert_eq!(decided, 3, "every question reaches the timeline with an answer");
+        assert_eq!(
+            decided, 3,
+            "every question reaches the timeline with an answer"
+        );
         assert!(events
             .iter()
             .any(|(kind, payload)| kind == "approval_decided" && contains(payload, "denied")));
         assert!(
-            events.iter().any(|(kind, payload)| kind == "approval_requested"
-                && contains(payload, "exec")),
+            events
+                .iter()
+                .any(|(kind, payload)| kind == "approval_requested" && contains(payload, "exec")),
             "the refused command is on the timeline as the capability it asked for"
         );
 
@@ -2858,7 +2868,10 @@ mod tests {
         // true, and that has not changed.
         crate::db::repository::set_setting(
             &db,
-            &format!("{}claude-code", cli_adapter::BASE_URL_OVERRIDE_VERIFIED_PREFIX),
+            &format!(
+                "{}claude-code",
+                cli_adapter::BASE_URL_OVERRIDE_VERIFIED_PREFIX
+            ),
             "true",
         )
         .expect("flag");
@@ -3035,7 +3048,10 @@ mod tests {
         );
         // The adapter's ticket was never touched: nothing on this path went
         // through it.
-        assert_eq!(tickets.usage(&ticket.claims.ticket_id), Some(Default::default()));
+        assert_eq!(
+            tickets.usage(&ticket.claims.ticket_id),
+            Some(Default::default())
+        );
         workspace_db::close("wsreport");
         crate::paths::set_category_override(crate::paths::StorageCategory::Data, None);
 
@@ -3146,14 +3162,8 @@ mod tests {
     #[tokio::test]
     async fn the_prompt_reaches_the_cli_and_closing_records_the_reaped_state() {
         let _guard = cs_paths::test_data_dir_guard();
-        let (_data, pool, bridge, _tickets, _ticket, instance, stub) = scenario(
-            "wsturn",
-            "run-turn",
-            "cli-turn",
-            10_000,
-            Vec::new(),
-        )
-        .await;
+        let (_data, pool, bridge, _tickets, _ticket, instance, stub) =
+            scenario("wsturn", "run-turn", "cli-turn", 10_000, Vec::new()).await;
 
         bridge
             .turn(&instance, "add a regression test for the parser")

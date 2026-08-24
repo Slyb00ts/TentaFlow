@@ -183,8 +183,13 @@ pub trait GraphBackend: Send + Sync {
     /// Replaces ONLY the provenance of edge `(src, rel, dst)`. Preserving `alive`
     /// is load-bearing: `upsert_edge` REVIVES an edge, so rewriting a shrunken
     /// document set through it would resurrect a soft-deleted edge.
-    fn set_edge_provenance(&self, src: &str, rel: &str, dst: &str, provenance_json: &str)
-        -> Result<()>;
+    fn set_edge_provenance(
+        &self,
+        src: &str,
+        rel: &str,
+        dst: &str,
+        provenance_json: &str,
+    ) -> Result<()>;
 
     /// Read-only zapytanie Cozo budowane przez HOST (`Immutable`). Addon NIE
     /// podaje skryptu — to wewnętrzna ścieżka (pagerank/tombstone-list/export);

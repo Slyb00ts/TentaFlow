@@ -5,9 +5,7 @@ use std::time::Instant;
 
 use futures::StreamExt;
 
-use crate::api::openai::types::{
-    ChatCompletionRequest, Message, MessageContent, StreamOptions,
-};
+use crate::api::openai::types::{ChatCompletionRequest, Message, MessageContent, StreamOptions};
 use crate::auth::acl::UserContext;
 use crate::services::runtime::context::ExecutionContext;
 use crate::services::runtime::executor::ModelRuntimeExecutor;
@@ -111,10 +109,7 @@ impl LocalRunner {
             // streams reasoning_content before content, and ignoring it would
             // report a TTFT that never happened.
             let has_content = chunk.choices.iter().any(|c| {
-                c.delta
-                    .content
-                    .as_deref()
-                    .is_some_and(|s| !s.is_empty())
+                c.delta.content.as_deref().is_some_and(|s| !s.is_empty())
                     || c.delta
                         .reasoning_content
                         .as_deref()

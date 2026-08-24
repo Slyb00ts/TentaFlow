@@ -18,7 +18,7 @@ mod ui_search;
 mod ui_share;
 
 use serde_json::{json, Value};
-use tentaflow_addon_sdk::{log, read_string, write_string};
+use tentaflow_addon_sdk::{log, read_string, write_string, ABI_OUTPUT_BUFFER_TOO_SMALL};
 
 // Raw binding: the SDK's typed get_current_user expects a numeric user_id,
 // but the host returns {"id": <string>, ...} — parse the JSON directly.
@@ -168,10 +168,10 @@ fn write_response(out_ptr: i32, out_cap: i32, out_len_ptr: i32, value: &Value) -
         Ok(s) => s,
         Err(_) => return 1,
     };
-    let written = write_string(out_ptr, out_cap, &response);
+    let written = write_string(out_ptr, out_cap, out_len_ptr, &response);
     if written < 0 {
         log::error("notes: output buffer too small for response");
-        return 2;
+        return ABI_OUTPUT_BUFFER_TOO_SMALL;
     }
     let len_bytes = written.to_le_bytes();
     let dest = unsafe { std::slice::from_raw_parts_mut(out_len_ptr as *mut u8, 4) };

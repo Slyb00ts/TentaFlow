@@ -566,11 +566,7 @@ pub fn append_in_tx(
 /// policy can be applied. It runs BEFORE the insert on purpose: a body filtered
 /// at read time would already be on disk, which is the whole thing the opt-in
 /// exists to prevent.
-fn write_event(
-    tx: &Transaction<'_>,
-    core_db: &DbPool,
-    event: RunEvent,
-) -> Result<AppendedEvent> {
+fn write_event(tx: &Transaction<'_>, core_db: &DbPool, event: RunEvent) -> Result<AppendedEvent> {
     if let Some(key) = event.idempotency_key.as_deref() {
         if let Some(seq) = tx
             .query_row(
@@ -653,12 +649,7 @@ fn write_event(
         tx.execute(
             "INSERT INTO audit_outbox (run_id, seq, payload_json, created_at) \
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![
-                event.run_id,
-                seq,
-                to_json(&envelope)?,
-                envelope.created_at
-            ],
+            rusqlite::params![event.run_id, seq, to_json(&envelope)?, envelope.created_at],
         )?;
     }
 
@@ -1027,7 +1018,10 @@ mod tests {
                 |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .unwrap();
-        assert_eq!(rows, distinct, "the log interleaved: {rows} rows, {distinct} distinct seq");
+        assert_eq!(
+            rows, distinct,
+            "the log interleaved: {rows} rows, {distinct} distinct seq"
+        );
         assert_eq!(
             rows,
             accepted.len() as i64,
@@ -1070,7 +1064,10 @@ mod tests {
 
         let winner = open_events_db(dir.path());
         let taken = append(&winner, &main, event("r-1", request_started())).unwrap();
-        assert_eq!(taken.seq, stale_seq, "the two writers did not race for one seq");
+        assert_eq!(
+            taken.seq, stale_seq,
+            "the two writers did not race for one seq"
+        );
 
         let error = {
             let mut conn = stale_writer.write().unwrap();
@@ -1122,7 +1119,10 @@ mod tests {
         )
         .unwrap();
         assert!(second.duplicate, "the retry was not recognised");
-        assert_eq!(second.seq, first.seq, "the retry pointed at a different row");
+        assert_eq!(
+            second.seq, first.seq,
+            "the retry pointed at a different row"
+        );
 
         // The log has a READ POOL, so this guard is a connection of its own and
         // stays held across the append below. It used to have to be scoped:
@@ -1264,8 +1264,14 @@ mod tests {
         append(
             &pool,
             &main,
-            RunEvent::new("r-1", 1_050, FlowOrigin::Api, &actor, EventPayload::FirstToken {})
-                .with_node("llm-1"),
+            RunEvent::new(
+                "r-1",
+                1_050,
+                FlowOrigin::Api,
+                &actor,
+                EventPayload::FirstToken {},
+            )
+            .with_node("llm-1"),
         )
         .unwrap();
 
@@ -1329,8 +1335,7 @@ mod tests {
         .unwrap();
 
         // A camera / scheduler run: no organisation was minted for it.
-        let system_meta =
-            FlowRequestMeta::new("r-system", FlowOrigin::Camera, FlowActor::system());
+        let system_meta = FlowRequestMeta::new("r-system", FlowOrigin::Camera, FlowActor::system());
         assert!(system_meta.org_id.is_none());
         append(
             &pool,
@@ -1410,7 +1415,11 @@ mod tests {
                 &main,
                 event("r-1", EventPayload::FirstToken {}),
             );
-            let _ = tx.send(outcome.map(|appended| appended.seq).map_err(|e| e.to_string()));
+            let _ = tx.send(
+                outcome
+                    .map(|appended| appended.seq)
+                    .map_err(|e| e.to_string()),
+            );
         });
 
         let seq = rx
@@ -1427,7 +1436,10 @@ mod tests {
         let after: i64 = reader
             .query_row("SELECT COUNT(*) FROM run_events", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(after, 2, "the reader connection did not see the committed append");
+        assert_eq!(
+            after, 2,
+            "the reader connection did not see the committed append"
+        );
     }
 
     /// §2.8 — a node nobody configured stores NO response body. The event still

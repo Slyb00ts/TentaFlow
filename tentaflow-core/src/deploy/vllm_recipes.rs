@@ -555,7 +555,10 @@ mod tests {
         };
         let (argv, _) = build_args(&entry, None, 1, 1);
         assert!(!argv.iter().any(|a| a == "--tool-call-parser"));
-        assert!(tool_calling_gap(&argv).is_some(), "the gap must be reported");
+        assert!(
+            tool_calling_gap(&argv).is_some(),
+            "the gap must be reported"
+        );
     }
 
     /// Tool flags live in `base_argv`, never in a hardware override, so tool

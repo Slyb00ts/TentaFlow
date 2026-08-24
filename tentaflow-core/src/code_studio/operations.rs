@@ -487,11 +487,13 @@ impl WorktreeProbe {
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Verdict::Unsatisfied),
             Err(e) => return Err(anyhow!("read {}: {e}", resolved.display())),
         };
-        Ok(if super::fs::blob_sha(&bytes) == blob_sha.to_ascii_lowercase() {
-            Verdict::Satisfied
-        } else {
-            Verdict::Unsatisfied
-        })
+        Ok(
+            if super::fs::blob_sha(&bytes) == blob_sha.to_ascii_lowercase() {
+                Verdict::Satisfied
+            } else {
+                Verdict::Unsatisfied
+            },
+        )
     }
 
     fn absent(&self, path: &str) -> Result<Verdict> {
@@ -1265,7 +1267,6 @@ mod tests {
     use super::*;
     use crate::code_studio::{events::EventKind, paths, workspace_db};
 
-
     struct Fixture {
         _data: tempfile::TempDir,
         worktree: tempfile::TempDir,
@@ -1833,8 +1834,13 @@ mod tests {
 
         // With the outcome stored, the same call closes the operation and the
         // postcondition it promised is now true.
-        let outcome =
-            artifacts::put(&fx.pool, &fx.workspace_id, b"{\"exit_code\":0}", "exec_result").unwrap();
+        let outcome = artifacts::put(
+            &fx.pool,
+            &fx.workspace_id,
+            b"{\"exit_code\":0}",
+            "exec_result",
+        )
+        .unwrap();
         let done = complete(&fx.pool, &opened.op_id, &[], Some(&outcome.sha256)).unwrap();
         assert_eq!(done.status, OperationStatus::Completed);
         assert_eq!(done.result_ref.as_deref(), Some(outcome.sha256.as_str()));

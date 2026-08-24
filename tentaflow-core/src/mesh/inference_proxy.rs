@@ -58,11 +58,12 @@ fn authorize_sidecar_request(
     let Some(ref db) = router.db else {
         return Err("reverse request from a sidecar needs a database".to_string());
     };
-    let meta_meeting_id = || -> Option<&str> {
-        request.metadata.as_ref()?.iter().find_map(|(k, v)| {
-            (k == "meeting_id" && !v.trim().is_empty()).then_some(v.as_str())
-        })
-    };
+    let meta_meeting_id =
+        || -> Option<&str> {
+            request.metadata.as_ref()?.iter().find_map(|(k, v)| {
+                (k == "meeting_id" && !v.trim().is_empty()).then_some(v.as_str())
+            })
+        };
     let owned = |meeting_id: Option<&str>| -> Result<(), String> {
         let meeting_id = meeting_id.ok_or_else(|| {
             "reverse request from a sidecar must carry the meeting_id it owns".to_string()
@@ -173,7 +174,10 @@ pub async fn dispatch_reverse_request(
                 _ => crate::meeting::flow_turn::spawn_diarization(None, None, ""),
             };
 
-            match router.route_audio_via_protocol(&audio_payload.operation).await {
+            match router
+                .route_audio_via_protocol(&audio_payload.operation)
+                .await
+            {
                 Ok(response) => {
                     // Jesli to STT (Text result), zapisz do transcript_store dla GUI Bot Status
                     if let ModelResult::Audio(ref audio_result) = response.result {
@@ -1073,18 +1077,25 @@ fn persist_meeting_event(
             // The bot no longer knows its STT/TTS (Core resolves them per turn
             // from the session row), so empty names are filled from there.
             let (stt_model, tts_model) = if stt_model.is_empty() || tts_model.is_empty() {
-                let pipeline =
-                    crate::db::repository::transcripts::get_session_by_meeting_key(
-                        pool,
-                        &event.meeting_key,
-                    )
-                    .ok()
-                    .flatten()
-                    .map(|row| crate::meeting::flow_turn::SessionPipeline::from_row(&row));
+                let pipeline = crate::db::repository::transcripts::get_session_by_meeting_key(
+                    pool,
+                    &event.meeting_key,
+                )
+                .ok()
+                .flatten()
+                .map(|row| crate::meeting::flow_turn::SessionPipeline::from_row(&row));
                 match pipeline {
                     Some(p) => (
-                        if stt_model.is_empty() { p.stt_alias } else { stt_model },
-                        if tts_model.is_empty() { p.tts_alias } else { tts_model },
+                        if stt_model.is_empty() {
+                            p.stt_alias
+                        } else {
+                            stt_model
+                        },
+                        if tts_model.is_empty() {
+                            p.tts_alias
+                        } else {
+                            tts_model
+                        },
                     ),
                     None => (stt_model, tts_model),
                 }
@@ -1521,10 +1532,9 @@ mod tests {
         let path = tmp.path().to_path_buf();
         std::mem::forget(tmp);
         let db = crate::db::init(&path).expect("init db");
-        let id = crate::db::repository::transcripts::get_or_create_session(
-            &db, "mtg-owned", None, None,
-        )
-        .expect("session");
+        let id =
+            crate::db::repository::transcripts::get_or_create_session(&db, "mtg-owned", None, None)
+                .expect("session");
         crate::db::repository::transcripts::update_session_spawned_native(
             &db,
             id,
@@ -1536,8 +1546,8 @@ mod tests {
             None,
         )
         .expect("mark spawned");
-        let router = Router::new(crate::config::RouterConfig::default(), Some(db.clone()))
-            .expect("router");
+        let router =
+            Router::new(crate::config::RouterConfig::default(), Some(db.clone())).expect("router");
         (router, db)
     }
 

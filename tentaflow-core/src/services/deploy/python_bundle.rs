@@ -591,10 +591,9 @@ impl PythonBundleDeploy {
         // gdy zawisna na NCCL). Osierocone workery obnizaly wolna pamiec na
         // kartach i KOLEJNY deploy padal na „Free memory ... less than desired".
         let pid = state.pid;
-        let _ = tokio::task::spawn_blocking(move || {
-            crate::deploy::process_ctl::terminate_group(pid)
-        })
-        .await;
+        let _ =
+            tokio::task::spawn_blocking(move || crate::deploy::process_ctl::terminate_group(pid))
+                .await;
         // Krotka pauza przed ewentualnym czyszczeniem venva przez callera.
         tokio::time::sleep(Duration::from_millis(500)).await;
     }

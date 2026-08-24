@@ -673,7 +673,9 @@ pub fn disk_quota(workspace_id: &str) -> Result<Option<i64>> {
 /// node enforces what the organization asked for rather than a copy that was
 /// right once.
 pub fn set_disk_quota(pool: &DbPool, disk_bytes: Option<i64>) -> Result<()> {
-    let conn = pool.write().map_err(|e| anyhow!("workspace db write: {e}"))?;
+    let conn = pool
+        .write()
+        .map_err(|e| anyhow!("workspace db write: {e}"))?;
     conn.execute(
         "INSERT INTO workspace_reservation (id, disk_bytes, updated_at) \
          VALUES (1, ?1, datetime('now')) \

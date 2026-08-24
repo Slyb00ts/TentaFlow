@@ -328,9 +328,7 @@ fn perf_compare(pool: &DbPool, run_ids: &[String]) -> Result<Vec<serde_json::Val
         bail!("perf_compare requires exactly two run ids");
     }
     let conn = pool.read().map_err(read_err)?;
-    let mut stmt = conn.prepare(&format!(
-        "{PERF_RUN_COLS} AND r.run_id IN (?1, ?2)"
-    ))?;
+    let mut stmt = conn.prepare(&format!("{PERF_RUN_COLS} AND r.run_id IN (?1, ?2)"))?;
     let runs = stmt
         .query_map(params![run_ids[0], run_ids[1]], read_perf_run)?
         .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -714,10 +712,22 @@ mod unit_tests {
                 .expect("insert item");
             }
             for (actor, created, details) in [
-                ("tester-a", "2026-07-01T12:00:00Z", r#"{"status":"approved"}"#),
-                ("tester-a", "2026-07-01T13:00:00Z", r#"{"status":"approved"}"#),
+                (
+                    "tester-a",
+                    "2026-07-01T12:00:00Z",
+                    r#"{"status":"approved"}"#,
+                ),
+                (
+                    "tester-a",
+                    "2026-07-01T13:00:00Z",
+                    r#"{"status":"approved"}"#,
+                ),
                 ("tester-a", "2026-07-01T14:00:00Z", r#"{"status":"draft"}"#),
-                ("reviewer", "2026-07-03T09:00:00Z", r#"{"status":"approved"}"#),
+                (
+                    "reviewer",
+                    "2026-07-03T09:00:00Z",
+                    r#"{"status":"approved"}"#,
+                ),
             ] {
                 conn.execute(
                     "INSERT INTO activity_log (actor_user_id, action, object_type, \

@@ -90,10 +90,8 @@ static HASH_CACHE: OnceLock<parking_lot::Mutex<HashMap<String, (u64, u64, String
 pub fn validate_project_id(project_id: &str) -> bool {
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        )
-        .expect("ml studio project id regex compiles")
+        regex::Regex::new(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            .expect("ml studio project id regex compiles")
     });
     re.is_match(project_id)
 }
@@ -321,10 +319,8 @@ async fn ensure_archive(project_id: &str) -> Result<CachedArchive, ArchiveBuildE
 
     let pid = project_id.to_string();
     let dest = path.clone();
-    let built = tokio::task::spawn_blocking(move || {
-        build_export(&pid, SHARE_EXPORT_OPTIONS, &dest)
-    })
-    .await;
+    let built =
+        tokio::task::spawn_blocking(move || build_export(&pid, SHARE_EXPORT_OPTIONS, &dest)).await;
     match built {
         Ok(Ok(_summary)) => {}
         Ok(Err(e)) => {
@@ -356,16 +352,20 @@ async fn ensure_archive(project_id: &str) -> Result<CachedArchive, ArchiveBuildE
 
 /// Streaming SHA-256 of the cached archive with a per-project (mtime, size)
 /// cache. Reuses `model_bundle::sha256_file_hex` (runs on the blocking pool).
-async fn cached_archive_sha256(project_id: &str, cached: &CachedArchive) -> std::io::Result<String> {
+async fn cached_archive_sha256(
+    project_id: &str,
+    cached: &CachedArchive,
+) -> std::io::Result<String> {
     if let Some((m, s, hash)) = hash_cache().lock().get(project_id) {
         if *m == cached.mtime && *s == cached.size {
             return Ok(hash.clone());
         }
     }
     let hash = crate::api::model_bundle::sha256_file_hex(&cached.path).await?;
-    hash_cache()
-        .lock()
-        .insert(project_id.to_string(), (cached.mtime, cached.size, hash.clone()));
+    hash_cache().lock().insert(
+        project_id.to_string(),
+        (cached.mtime, cached.size, hash.clone()),
+    );
     Ok(hash)
 }
 
@@ -375,7 +375,9 @@ async fn cached_archive_sha256(project_id: &str, cached: &CachedArchive) -> std:
 
 #[derive(Debug)]
 pub enum ShareManifestOutcome {
-    Ok { body: String },
+    Ok {
+        body: String,
+    },
     BadRequest(&'static str),
     Denied(SignedUrlError),
     /// API-key caller without an `allow` scope on this project.
@@ -575,13 +577,15 @@ async fn handle_share_manifest_inner(
     // what keeps the manifest well under the 30 s request-response limit even for
     // multi-gigabyte projects; the archive is built lazily at download time.
     let pid = project_id.to_string();
-    let preview =
-        match tokio::task::spawn_blocking(move || project_archive::load_project_preview(&pid)).await
-        {
-            Ok(Ok(Some(p))) => p,
-            Ok(Ok(None)) => return ShareManifestOutcome::NotFound,
-            _ => return ShareManifestOutcome::InternalError("project_preview_failed"),
-        };
+    let preview = match tokio::task::spawn_blocking(move || {
+        project_archive::load_project_preview(&pid)
+    })
+    .await
+    {
+        Ok(Ok(Some(p))) => p,
+        Ok(Ok(None)) => return ShareManifestOutcome::NotFound,
+        _ => return ShareManifestOutcome::InternalError("project_preview_failed"),
+    };
 
     let datasets: Vec<serde_json::Value> = preview
         .datasets
@@ -600,21 +604,23 @@ async fn handle_share_manifest_inner(
     // size and cached sha256; otherwise size is an on-disk ESTIMATE (no zip) and the
     // sha256 is omitted (empty) — the authoritative digest is the archive endpoint's
     // `X-Archive-Sha256` header, which the puller verifies against.
-    let (archive_size, archive_sha256) = match cached_if_fresh(&share_cache_path(project_id), project_id).await
-    {
-        Some(cached) => {
-            let sha = cached_archive_sha256(project_id, &cached).await.unwrap_or_default();
-            (cached.size, sha)
-        }
-        None => {
-            let pid = project_id.to_string();
-            let est = tokio::task::spawn_blocking(move || {
-                project_archive::estimate_export_size(&pid, SHARE_EXPORT_OPTIONS.include_models)
-            })
-            .await;
-            (est.ok().and_then(|r| r.ok()).unwrap_or(0), String::new())
-        }
-    };
+    let (archive_size, archive_sha256) =
+        match cached_if_fresh(&share_cache_path(project_id), project_id).await {
+            Some(cached) => {
+                let sha = cached_archive_sha256(project_id, &cached)
+                    .await
+                    .unwrap_or_default();
+                (cached.size, sha)
+            }
+            None => {
+                let pid = project_id.to_string();
+                let est = tokio::task::spawn_blocking(move || {
+                    project_archive::estimate_export_size(&pid, SHARE_EXPORT_OPTIONS.include_models)
+                })
+                .await;
+                (est.ok().and_then(|r| r.ok()).unwrap_or(0), String::new())
+            }
+        };
 
     // Signed callers get a per-ref signed archive URL bound to the manifest
     // token's expiry; API-key callers carry a plain path and repeat the Bearer
@@ -818,13 +824,15 @@ mod tests {
         let manifest = iss.issue(PROJ_A.to_string(), 3600).expect("issue");
         // Archive URL derived from the manifest token's expiry, signing the
         // composite `<project_id>/archive`.
-        let url = mint_archive_url(&iss, PROJ_A, manifest.expiry_unix_ms).expect("mint archive url");
+        let url =
+            mint_archive_url(&iss, PROJ_A, manifest.expiry_unix_ms).expect("mint archive url");
         assert!(url.starts_with(&format!("/ml-studio/share/{PROJ_A}/archive?")));
         let q = query_from_url(&url);
         let composite = archive_ref(PROJ_A);
         let (token, exp) = checked_query(&q, &composite).expect("query ok");
         assert_eq!(exp, manifest.expiry_unix_ms);
-        iss.verify(&composite, exp, token).expect("verify archive token");
+        iss.verify(&composite, exp, token)
+            .expect("verify archive token");
 
         // The manifest token itself must NOT verify as the archive token.
         assert_eq!(
@@ -836,7 +844,13 @@ mod tests {
 
     #[test]
     fn manifest_outcome_status_codes() {
-        assert_eq!(ShareManifestOutcome::Ok { body: String::new() }.http_status(), 200);
+        assert_eq!(
+            ShareManifestOutcome::Ok {
+                body: String::new()
+            }
+            .http_status(),
+            200
+        );
         assert_eq!(ShareManifestOutcome::BadRequest("x").http_status(), 400);
         assert_eq!(ShareManifestOutcome::Forbidden("x").http_status(), 403);
         assert_eq!(
@@ -878,7 +892,16 @@ mod tests {
             .map(|p| vec![(ML_STUDIO_SHARE_RESOURCE_TYPE.to_string(), p.to_string())])
             .unwrap_or_default();
         let (_id, uid) = crate::db::repository::create_api_key_with_scopes(
-            db, &verifier, "sk-...cdef", "share-key", "general", None, 60, &scopes, None, None,
+            db,
+            &verifier,
+            "sk-...cdef",
+            "share-key",
+            "general",
+            None,
+            60,
+            &scopes,
+            None,
+            None,
         )
         .expect("create key");
         (raw.to_string(), uid)

@@ -339,7 +339,15 @@ pub fn spawn_detection_stub(camera_id: String) -> tokio::task::JoinHandle<()> {
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as u64)
                 .unwrap_or(0);
-            publish_detections(&camera_id, ts_ms, None, 0, false, items, MotionSignal::default());
+            publish_detections(
+                &camera_id,
+                ts_ms,
+                None,
+                0,
+                false,
+                items,
+                MotionSignal::default(),
+            );
         }
     })
 }

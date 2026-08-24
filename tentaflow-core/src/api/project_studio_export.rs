@@ -39,10 +39,8 @@ const AUDIT_RISK_CLASS: &str = "unclassified";
 pub fn validate_ref_format(ref_id: &str) -> bool {
     static RE: std::sync::OnceLock<regex::Regex> = std::sync::OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(
-            r"^psexp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
-        )
-        .expect("project studio export ref regex compiles")
+        regex::Regex::new(r"^psexp_[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
+            .expect("project studio export ref regex compiles")
     });
     re.is_match(ref_id)
 }
@@ -251,19 +249,34 @@ pub fn handle_project_studio_export_url(
     let token = match query.token.as_deref() {
         Some(t) if !t.is_empty() => t,
         _ => {
-            return audit_and_return(pool, path_ref, ctx, ExportOutcome::BadRequest("missing_token"))
+            return audit_and_return(
+                pool,
+                path_ref,
+                ctx,
+                ExportOutcome::BadRequest("missing_token"),
+            )
         }
     };
     let exp_ms = match query.exp_ms {
         Some(v) => v,
         None => {
-            return audit_and_return(pool, path_ref, ctx, ExportOutcome::BadRequest("missing_exp"))
+            return audit_and_return(
+                pool,
+                path_ref,
+                ctx,
+                ExportOutcome::BadRequest("missing_exp"),
+            )
         }
     };
     let ref_param = match query.ref_param.as_deref() {
         Some(r) if !r.is_empty() => r,
         _ => {
-            return audit_and_return(pool, path_ref, ctx, ExportOutcome::BadRequest("missing_ref"))
+            return audit_and_return(
+                pool,
+                path_ref,
+                ctx,
+                ExportOutcome::BadRequest("missing_ref"),
+            )
         }
     };
     if ref_param != path_ref {

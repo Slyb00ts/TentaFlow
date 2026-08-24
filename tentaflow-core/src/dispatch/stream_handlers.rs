@@ -393,19 +393,19 @@ fn flow_invoke_handler(req: MessageBody, ctx: HandlerContext, sub: Arc<Subscript
         )
         .await
         {
-                Ok(e) => e,
-                Err(e) => {
-                    let _ = push_end(
-                        &sub,
-                        Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
-                            finish_reason: "error".into(),
-                            error: Some(format!("input build failed: {e}")),
-                            text: None,
-                        })),
-                    );
-                    return;
-                }
-            };
+            Ok(e) => e,
+            Err(e) => {
+                let _ = push_end(
+                    &sub,
+                    Some(MessageBody::FlowInvokeEndBody(FlowInvokeEnd {
+                        finish_reason: "error".into(),
+                        error: Some(format!("input build failed: {e}")),
+                        text: None,
+                    })),
+                );
+                return;
+            }
+        };
 
         // Cancel wiązany z subskrypcją: rozłączenie klienta / barge-in anuluje flow.
         let cancel = CancellationToken::new();
@@ -1782,7 +1782,9 @@ fn project_studio_ingest_stream_handler(
                         status: final_status,
                         error,
                     };
-                    guard.finish(Some(MessageBody::ProjectStudioBody(end))).await;
+                    guard
+                        .finish(Some(MessageBody::ProjectStudioBody(end)))
+                        .await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -1886,7 +1888,9 @@ fn project_studio_archive_stream_handler(
                             Some(error_message)
                         },
                     };
-                    guard.finish(Some(MessageBody::ProjectStudioBody(end))).await;
+                    guard
+                        .finish(Some(MessageBody::ProjectStudioBody(end)))
+                        .await;
                     return;
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Closed) => {
@@ -2319,7 +2323,8 @@ fn project_studio_stream_guard(
     if !org.has("project_studio.read") {
         return None;
     }
-    let project = crate::project_studio::repository::get_project(&org.org_id, project_id).ok()??;
+    let project =
+        crate::project_studio::repository::get_project(&org.org_id, project_id).ok()??;
     let is_member = matches!(
         crate::project_studio::repository::member_role(project_id, &org.user_id),
         Ok(Some(_))
@@ -2527,30 +2532,37 @@ fn project_studio_try_run_stream_handler(
     use crate::project_studio::{auto_runs, environments, generation};
     use tentaflow_protocol::project_studio::ProjectStudioPayload;
 
-    let (project_id, try_id, case_id, environment_id, content_override, language, perf_profile_json) =
-        match req {
-            MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunStartRequest {
-                project_id,
-                try_id,
-                case_id,
-                environment_id,
-                content_json_override,
-                language,
-                perf_profile_json,
-            }) => (
-                project_id,
-                try_id,
-                case_id,
-                environment_id,
-                content_json_override,
-                language,
-                perf_profile_json,
-            ),
-            _ => {
-                let _ = push_end(&sub, None);
-                return;
-            }
-        };
+    let (
+        project_id,
+        try_id,
+        case_id,
+        environment_id,
+        content_override,
+        language,
+        perf_profile_json,
+    ) = match req {
+        MessageBody::ProjectStudioBody(ProjectStudioPayload::TryRunStartRequest {
+            project_id,
+            try_id,
+            case_id,
+            environment_id,
+            content_json_override,
+            language,
+            perf_profile_json,
+        }) => (
+            project_id,
+            try_id,
+            case_id,
+            environment_id,
+            content_json_override,
+            language,
+            perf_profile_json,
+        ),
+        _ => {
+            let _ = push_end(&sub, None);
+            return;
+        }
+    };
 
     let end_error = |sub: &Arc<Subscription>, try_id: &str, error: String| {
         let _ = push_end(
@@ -2630,11 +2642,12 @@ fn project_studio_try_run_stream_handler(
         // host approved as public can point at loopback or the metadata address
         // by now, so the class is re-derived right before the runner connects.
         let probe = environment.clone();
-        let now_private = tokio::task::spawn_blocking(move || environments::recheck_private(&probe))
-            .await
-            .ok()
-            .and_then(|r| r.ok())
-            .unwrap_or(true);
+        let now_private =
+            tokio::task::spawn_blocking(move || environments::recheck_private(&probe))
+                .await
+                .ok()
+                .and_then(|r| r.ok())
+                .unwrap_or(true);
         if now_private && !environment.is_private_address {
             crate::project_studio::activity::record_org_security(
                 &core_db,
@@ -2718,17 +2731,15 @@ fn project_studio_try_run_stream_handler(
         }
 
         let discovery_db = core_db.clone();
-        let runners = match tokio::task::spawn_blocking(move || {
-            auto_runs::list_runners(&discovery_db)
-        })
-        .await
-        {
-            Ok(Ok(runners)) => runners,
-            _ => {
-                end_error(&sub, &try_id, "runner discovery failed".into());
-                return;
-            }
-        };
+        let runners =
+            match tokio::task::spawn_blocking(move || auto_runs::list_runners(&discovery_db)).await
+            {
+                Ok(Ok(runners)) => runners,
+                _ => {
+                    end_error(&sub, &try_id, "runner discovery failed".into());
+                    return;
+                }
+            };
         let runner = match auto_runs::select_runner(runners, "", &language) {
             Ok(runner) => runner,
             Err(e) => {
@@ -2794,8 +2805,8 @@ fn project_studio_try_run_stream_handler(
         let endpoint = runner.endpoint_url.clone();
         let try_for_task = try_id.clone();
         let cancel_for_task = cancel.clone();
-        let deadline_ms = crate::deploy::log_bus::now_ms()
-            + auto_runs::TRY_RUN_TTL.as_millis() as i64;
+        let deadline_ms =
+            crate::deploy::log_bus::now_ms() + auto_runs::TRY_RUN_TTL.as_millis() as i64;
         let execution = tokio::task::spawn_blocking(move || {
             auto_runs::run_try_item(
                 &endpoint,
@@ -6566,9 +6577,7 @@ mod tests {
         use crate::flow_engine::envelope::FlowValue;
         use crate::flow_engine::node_adapter::test_support::stub_ctx;
         use crate::flow_engine::node_adapter::NodeAdapter;
-        use crate::flow_engine::node_adapters::rag_graphrag::{
-            META_GRAPH_FACTS, META_GRAPH_SEEDS,
-        };
+        use crate::flow_engine::node_adapters::rag_graphrag::{META_GRAPH_FACTS, META_GRAPH_SEEDS};
 
         let project_id = uuid::Uuid::new_v4().to_string();
         let mut ctx = stub_ctx();

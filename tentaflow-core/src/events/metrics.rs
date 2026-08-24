@@ -148,6 +148,7 @@ mod tests {
     use crate::events::progress_log::RunEventLog;
     use crate::events::store::{append, read_run, EventPayload, ResponseBody, RunEvent};
     use crate::flow_engine::cache::CompiledFlow;
+    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::dispatchers::{ProgressEvent, ProgressSink};
     use crate::flow_engine::envelope::{
         EnvelopeDelta, FinishReason, FlowEnvelope, FlowValue, LlmStreamChunk, NodeInput,
@@ -161,7 +162,6 @@ mod tests {
     use crate::flow_engine::progress_broker::{
         BrokerProgressSink, ProgressBroker, RunDescriptor, RunProvenance,
     };
-    use crate::flow_engine::dispatcher::{FlowActor, FlowOrigin, FlowRequestMeta};
     use crate::flow_engine::types::{FlowDataType, FlowNode};
 
     const SCOPE: &str = "metrics-scope";
@@ -232,12 +232,10 @@ mod tests {
                 .expect("producer lock")
                 .take()
                 .expect("produce_stream runs once per flow");
-            Ok(
-                futures::stream::unfold(rx, |mut rx| async move {
-                    rx.recv().await.map(|c| (Ok(EnvelopeDelta::Llm(c)), rx))
-                })
-                .boxed(),
-            )
+            Ok(futures::stream::unfold(rx, |mut rx| async move {
+                rx.recv().await.map(|c| (Ok(EnvelopeDelta::Llm(c)), rx))
+            })
+            .boxed())
         }
     }
 
@@ -300,7 +298,11 @@ mod tests {
         })
         .await
         .expect("send first delta");
-        stream.next().await.expect("first delta forwarded").expect("delta is not an error");
+        stream
+            .next()
+            .await
+            .expect("first delta forwarded")
+            .expect("delta is not an error");
 
         tokio::time::sleep(wait_before_end).await;
         tx.send(LlmStreamChunk {
@@ -325,7 +327,10 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
-        panic!("timed out waiting for a {} row of run {run_id}", kind.slug());
+        panic!(
+            "timed out waiting for a {} row of run {run_id}",
+            kind.slug()
+        );
     }
 
     /// §2.11 stage 3 — TTFT is COMPUTED from the stored rows and checked against
@@ -379,7 +384,12 @@ mod tests {
             Duration::from_millis(260),
         )
         .await;
-        await_kind(&pool, "run-decode", crate::events::EventKind::AssistantMessage).await;
+        await_kind(
+            &pool,
+            "run-decode",
+            crate::events::EventKind::AssistantMessage,
+        )
+        .await;
 
         let steps = step_latencies(&pool, "run-decode").expect("latencies");
         let step = steps
@@ -439,12 +449,7 @@ mod tests {
         append(
             &pool,
             &core_db,
-            row(
-                1_000,
-                EventPayload::StepStart {
-                    step: "llm".into(),
-                },
-            ),
+            row(1_000, EventPayload::StepStart { step: "llm".into() }),
         )
         .unwrap();
         append(&pool, &core_db, row(1_150, EventPayload::FirstToken {})).unwrap();
@@ -499,7 +504,6 @@ mod tests {
         }
     }
 
-
     /// Writes one event of `run-*` at a fixed instant, so the numbers below are
     /// exact rather than a window around a sleep. Timing accuracy is already
     /// covered by the two streaming tests; what these fixtures need instead is
@@ -513,8 +517,8 @@ mod tests {
         payload: EventPayload,
     ) {
         let actor = FlowActor::user("u-1");
-        let mut event = RunEvent::new(run_id, at_ms, FlowOrigin::Chat, &actor, payload)
-            .with_org("org-1");
+        let mut event =
+            RunEvent::new(run_id, at_ms, FlowOrigin::Chat, &actor, payload).with_org("org-1");
         if let Some(node_id) = node_id {
             event = event.with_node(node_id);
         }
@@ -631,7 +635,11 @@ mod tests {
         );
 
         let steps = step_latencies(&pool, run).expect("latencies");
-        assert_eq!(steps.len(), 1, "the token is still on the timeline: {steps:?}");
+        assert_eq!(
+            steps.len(),
+            1,
+            "the token is still on the timeline: {steps:?}"
+        );
         assert_eq!(steps[0].step, "llm");
         assert_eq!(
             steps[0].ttft_ms, None,
@@ -678,7 +686,11 @@ mod tests {
         );
 
         let steps = step_latencies(&pool, run).expect("latencies");
-        assert_eq!(steps.len(), 1, "the token is still on the timeline: {steps:?}");
+        assert_eq!(
+            steps.len(),
+            1,
+            "the token is still on the timeline: {steps:?}"
+        );
         assert_eq!(
             steps[0].ttft_ms,
             Some(150),
@@ -725,7 +737,11 @@ mod tests {
 
         async fn await_rows(&self, run_id: &str, count: usize) {
             for _ in 0..300 {
-                if read_run(&self.pool, run_id, 0, 1000).expect("read run").len() >= count {
+                if read_run(&self.pool, run_id, 0, 1000)
+                    .expect("read run")
+                    .len()
+                    >= count
+                {
                     return;
                 }
                 tokio::time::sleep(Duration::from_millis(10)).await;

@@ -445,14 +445,20 @@ mod tests {
         // "Restart": the pool (and its connection) is gone, the file is not.
         let pool = open_pool_at(&path).expect("reopen");
         let orphans = reconcile_orphans(&pool, QUEUE_PROJECT_STUDIO).expect("reconcile");
-        assert!(orphans.is_empty(), "a queued job was never anyone's to orphan");
+        assert!(
+            orphans.is_empty(),
+            "a queued job was never anyone's to orphan"
+        );
 
         let job = claim(&pool, QUEUE_PROJECT_STUDIO)
             .expect("claim")
             .expect("the job outlived the process");
         assert_eq!(job.job_id, "job-1");
         assert_eq!(job.payload_json, "{\"n\":1}");
-        assert_eq!(heartbeat(&pool, "job-1").expect("beat"), JobLiveness::Running);
+        assert_eq!(
+            heartbeat(&pool, "job-1").expect("beat"),
+            JobLiveness::Running
+        );
         finish(&pool, "job-1").expect("finish");
         assert!(!is_pending(&pool, "job-1").expect("pending"));
         assert!(claim(&pool, QUEUE_PROJECT_STUDIO).expect("claim").is_none());
@@ -558,7 +564,9 @@ mod tests {
         let (_dir, pool) = test_pool();
         enqueue(&pool, QUEUE_PROJECT_STUDIO, "mine", "{}").expect("enqueue");
         enqueue(&pool, QUEUE_PROJECT_STUDIO, "waiting", "{}").expect("enqueue");
-        let mine = claim(&pool, QUEUE_PROJECT_STUDIO).expect("claim").expect("job");
+        let mine = claim(&pool, QUEUE_PROJECT_STUDIO)
+            .expect("claim")
+            .expect("job");
         assert_eq!(mine.job_id, "mine");
 
         // A row left `running` by a process run that no longer exists.
@@ -578,7 +586,10 @@ mod tests {
         assert_eq!(orphans[0].job_id, "dead");
         assert!(!is_pending(&pool, "dead").expect("pending"));
         // The job THIS process supervises is untouched, and so is the queued one.
-        assert_eq!(heartbeat(&pool, "mine").expect("beat"), JobLiveness::Running);
+        assert_eq!(
+            heartbeat(&pool, "mine").expect("beat"),
+            JobLiveness::Running
+        );
         assert!(is_pending(&pool, "waiting").expect("pending"));
     }
 
@@ -593,7 +604,9 @@ mod tests {
         assert!(claim(&pool, QUEUE_PROJECT_STUDIO).expect("claim").is_none());
 
         enqueue(&pool, QUEUE_PROJECT_STUDIO, "live", "{}").expect("enqueue");
-        claim(&pool, QUEUE_PROJECT_STUDIO).expect("claim").expect("job");
+        claim(&pool, QUEUE_PROJECT_STUDIO)
+            .expect("claim")
+            .expect("job");
         assert_eq!(
             request_cancel(&pool, "live").expect("cancel"),
             CancelOutcome::Signalled

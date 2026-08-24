@@ -54,8 +54,7 @@ fn require_org(ctx: &HandlerContext) -> Result<&OrgContext, ProtocolError> {
 /// Bearer key never travels in clear text. The rebuilt manifest URL drops any query
 /// and fragment from the pasted link.
 fn parse_share_url(raw: &str) -> std::result::Result<(reqwest::Url, String), String> {
-    let parsed =
-        reqwest::Url::parse(raw.trim()).map_err(|e| format!("nieprawidłowy URL: {e}"))?;
+    let parsed = reqwest::Url::parse(raw.trim()).map_err(|e| format!("nieprawidłowy URL: {e}"))?;
     if parsed.scheme() != "https" {
         return Err("URL udostępniania musi używać https".to_string());
     }
@@ -329,8 +328,7 @@ async fn download_archive(
             request = request.header(reqwest::header::AUTHORIZATION, format!("Bearer {bearer}"));
         }
         if resume_from > 0 {
-            request =
-                request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
+            request = request.header(reqwest::header::RANGE, format!("bytes={resume_from}-"));
         }
 
         let response = match request.send().await {
@@ -684,9 +682,15 @@ pub async fn ml_studio_remote_import_start(
     let org_id = org.org_id.clone();
     let job_task = job_id.clone();
     tokio::spawn(async move {
-        if let Err(e) =
-            run_remote_import(&job_task, manifest_url, api_key, name_override, owner_user_id, org_id)
-                .await
+        if let Err(e) = run_remote_import(
+            &job_task,
+            manifest_url,
+            api_key,
+            name_override,
+            owner_user_id,
+            org_id,
+        )
+        .await
         {
             tracing::warn!(job_id = %job_task, error = %e, "ml studio remote import failed");
             set_progress(&job_task, |p| {
@@ -830,7 +834,10 @@ pub async fn ml_studio_remote_import_status(
         .ok_or_else(|| ProtocolError::new(ProtocolErrorCode::NotFound, "unknown job"))?;
     // A job id alone must not expose another user's import progress.
     if progress.owner_user_id != org.user_id {
-        return Err(ProtocolError::new(ProtocolErrorCode::NotFound, "unknown job"));
+        return Err(ProtocolError::new(
+            ProtocolErrorCode::NotFound,
+            "unknown job",
+        ));
     }
 
     Ok(MessageBody::MlStudioBody(

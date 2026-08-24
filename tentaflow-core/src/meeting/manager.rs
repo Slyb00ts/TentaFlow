@@ -210,8 +210,7 @@ impl MeetingManager {
         let bot_endpoint_id = hex::encode(secret.public().as_bytes());
 
         // Efektywne aliasy — nadpisanie od callera lub domyślne z T1.5.
-        let (stt_alias, summarization_alias, tts_alias, flow_id, llm_alias) =
-            resolve_aliases(&req);
+        let (stt_alias, summarization_alias, tts_alias, flow_id, llm_alias) = resolve_aliases(&req);
         let respond_enabled = req.respond_enabled.unwrap_or(false);
 
         // Alokuj porty + spawn — drogi rozne per backend, ale na koniec obie maja
@@ -333,12 +332,7 @@ impl MeetingManager {
         // pipeline from this row, so it must be persisted before the first
         // segment arrives.
         repository::transcripts::update_session_pipeline(
-            &self.db,
-            session_id,
-            &stt_alias,
-            &llm_alias,
-            &tts_alias,
-            &flow_id,
+            &self.db, session_id, &stt_alias, &llm_alias, &tts_alias, &flow_id,
         )
         .context("persist session pipeline")?;
 
@@ -553,8 +547,8 @@ mod tests {
         DEFAULT_LLM_ALIAS, DEFAULT_STT_ALIAS, DEFAULT_SUMMARIZATION_ALIAS, DEFAULT_TTS_ALIAS,
     };
     use crate::db::migrations;
-    use crate::db::seed::MEETING_BOT_FLOW_ID;
     use crate::db::repository;
+    use crate::db::seed::MEETING_BOT_FLOW_ID;
     use crate::db::DbPool;
     use crate::services::teams_bot_bootstrap::ensure_teams_bot_defaults;
     use rusqlite::Connection;

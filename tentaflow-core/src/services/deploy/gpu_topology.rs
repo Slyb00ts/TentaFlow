@@ -113,14 +113,8 @@ impl GpuTopology {
     pub fn pairs(&self) -> impl Iterator<Item = (u32, u32, Link, Option<bool>)> + '_ {
         let mut keys: Vec<(u32, u32)> = self.links.keys().copied().collect();
         keys.sort_unstable();
-        keys.into_iter().map(move |(a, b)| {
-            (
-                a,
-                b,
-                self.link(a, b),
-                self.p2p_ok.get(&(a, b)).copied(),
-            )
-        })
+        keys.into_iter()
+            .map(move |(a, b)| (a, b, self.link(a, b), self.p2p_ok.get(&(a, b)).copied()))
     }
 }
 

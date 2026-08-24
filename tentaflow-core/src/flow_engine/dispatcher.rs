@@ -47,8 +47,8 @@ use crate::flow_engine::node_adapters::{
     ConversationHistoryNodeAdapter, CriticGateNodeAdapter, DelegateCliNodeAdapter,
     DocumentMergeNodeAdapter, DocumentParseNodeAdapter, DocumentRouterNodeAdapter,
     EmbedChunksNodeAdapter, EmbeddingsNodeAdapter, ExcelExtractNodeAdapter, ExecCommandNodeAdapter,
-    GraphExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter, LoopNodeAdapter,
-    MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
+    GraphExtractNodeAdapter, GraphicElementsNodeAdapter, IntervalNodeAdapter, LlmNodeAdapter,
+    LoopNodeAdapter, MapNodeAdapter, MemoryNodeAdapter, OcrNodeAdapter, OcrPagesNodeAdapter,
     OnSubagentCompleteNodeAdapter, OutputNodeAdapter, PageDetectNodeAdapter,
     PageDetectPagesNodeAdapter, PatchReviewNodeAdapter, PdfRasterizeNodeAdapter,
     PersistTurnNodeAdapter, PiiFilterNodeAdapter, PlatformSwitchNodeAdapter,
@@ -964,10 +964,9 @@ impl FlowDispatcher {
         };
         // A harness flow is named outright by the run manager, so the only
         // descriptor fact this run has is the flow that executes.
-        let ctx = self.ctx_factory.make_context(
-            &meta,
-            RunDescriptor::default().with_flow(&compiled.flow_id),
-        );
+        let ctx = self
+            .ctx_factory
+            .make_context(&meta, RunDescriptor::default().with_flow(&compiled.flow_id));
         execute_blocking(
             self.db.clone(),
             compiled,
@@ -1025,10 +1024,9 @@ impl FlowDispatcher {
         }
         // Dispatched by flow id: no model routing key was resolved, so the flow
         // is the whole descriptor.
-        let ctx = self.ctx_factory.make_context(
-            &meta,
-            RunDescriptor::default().with_flow(&compiled.flow_id),
-        );
+        let ctx = self
+            .ctx_factory
+            .make_context(&meta, RunDescriptor::default().with_flow(&compiled.flow_id));
         let stream_exec = execute_streaming(
             self.db.clone(),
             compiled,
@@ -1613,8 +1611,8 @@ fn stub_context_factory() -> ContextFactory {
     use crate::flow_engine::dispatchers::clock::SystemClock;
     use crate::flow_engine::dispatchers::metrics::NoopMetrics;
     use crate::flow_engine::node_adapter::test_support::{
-        stub_vectors, StubAudit, StubDocuments, StubEmbeddings, StubHistory, StubLlm,
-        StubMemory, StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
+        stub_vectors, StubAudit, StubDocuments, StubEmbeddings, StubHistory, StubLlm, StubMemory,
+        StubPiiRules, StubPrompts, StubReranker, StubStt, StubTts, StubTtsCleaning,
     };
     ContextFactory {
         clock: Arc::new(SystemClock),
@@ -1762,7 +1760,17 @@ mod tests {
     /// hostile envelope actually reaches a node instead of being assigned to a
     /// context after the fact.
     struct ProvenanceRecorder {
-        seen: Arc<std::sync::Mutex<Option<(FlowOrigin, ActorKind, Option<String>, Option<String>, Option<String>)>>>,
+        seen: Arc<
+            std::sync::Mutex<
+                Option<(
+                    FlowOrigin,
+                    ActorKind,
+                    Option<String>,
+                    Option<String>,
+                    Option<String>,
+                )>,
+            >,
+        >,
     }
 
     #[async_trait::async_trait]

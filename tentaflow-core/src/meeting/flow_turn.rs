@@ -22,12 +22,8 @@ use tentaflow_protocol::{
 use crate::db::repository::transcripts::{self as sessions_repo, SessionRow};
 use crate::db::seed::MEETING_BOT_FLOW_ID;
 use crate::db::DbPool;
-use crate::flow_engine::dispatcher::{
-    DispatchError, FlowActor, FlowOrigin, FlowRequestMeta,
-};
-use crate::flow_engine::envelope::{
-    ArtifactProvenance, EnvelopeDelta, FlowEnvelope, FlowValue,
-};
+use crate::flow_engine::dispatcher::{DispatchError, FlowActor, FlowOrigin, FlowRequestMeta};
+use crate::flow_engine::envelope::{ArtifactProvenance, EnvelopeDelta, FlowEnvelope, FlowValue};
 use crate::meeting::manager::{DEFAULT_LLM_ALIAS, DEFAULT_STT_ALIAS, DEFAULT_TTS_ALIAS};
 use crate::routing::transcript_store::{self, TranscriptBuilder};
 use crate::routing::Router;
@@ -65,7 +61,10 @@ pub(crate) enum PumpOutcome {
     /// Nothing was forwarded and the execution was cancelled.
     Silenced(SilenceReason),
     /// Text/audio were forwarded; counts are for logs and tests.
-    Completed { text_chunks: usize, audio_chunks: usize },
+    Completed {
+        text_chunks: usize,
+        audio_chunks: usize,
+    },
     Failed(String),
 }
 
@@ -117,7 +116,10 @@ pub async fn run_flow_turn(
         return;
     };
     let Some(db) = router.db.clone() else {
-        emit(error_chunk(ErrorType::InternalError, "FlowInvoke: router without DB"));
+        emit(error_chunk(
+            ErrorType::InternalError,
+            "FlowInvoke: router without DB",
+        ));
         return;
     };
     let Some(dispatcher) = router.flow_dispatcher().cloned() else {
@@ -216,7 +218,10 @@ pub async fn run_flow_turn(
 
     let mut envelope = match build_turn_envelope(
         dispatcher.blobs(),
-        payload.audio.as_ref().map(|a| (a.audio_data.clone(), a.mime.clone(), a.sample_rate)),
+        payload
+            .audio
+            .as_ref()
+            .map(|a| (a.audio_data.clone(), a.mime.clone(), a.sample_rate)),
         &context,
         &meeting_id,
     )
@@ -224,11 +229,20 @@ pub async fn run_flow_turn(
     {
         Ok(e) => e,
         Err(e) => {
-            emit(error_chunk(ErrorType::InternalError, &format!("FlowInvoke: {e}")));
+            emit(error_chunk(
+                ErrorType::InternalError,
+                &format!("FlowInvoke: {e}"),
+            ));
             return;
         }
     };
-    apply_pipeline_meta(&mut envelope, &pipeline, &meeting_id, language.as_deref(), respond);
+    apply_pipeline_meta(
+        &mut envelope,
+        &pipeline,
+        &meeting_id,
+        language.as_deref(),
+        respond,
+    );
 
     // §2.5 — a person invited the bot to this meeting, and the session row
     // records who. The bot cannot claim it: `lookup_owned_session` already tied
@@ -240,8 +254,7 @@ pub async fn run_flow_turn(
         Some(owner) => FlowActor::user(owner),
         None => FlowActor::system_component(meeting_id.clone()),
     };
-    let mut req_meta =
-        FlowRequestMeta::new(request_id.clone(), FlowOrigin::Meeting, actor);
+    let mut req_meta = FlowRequestMeta::new(request_id.clone(), FlowOrigin::Meeting, actor);
     req_meta.user_id = session.owner_user_id.clone();
     req_meta.session_id = Some(meeting_id.clone());
     req_meta.deadline = Some(Instant::now() + TURN_DEADLINE);
@@ -421,7 +434,11 @@ pub(crate) async fn build_turn_envelope(
         Some((bytes, mime, sample_rate)) => {
             let (bytes, mime, sample_rate) = if is_raw_pcm(&mime) {
                 let rate = sample_rate.unwrap_or(16_000);
-                (wrap_pcm16_in_wav(&bytes, rate), "audio/wav".to_string(), Some(rate))
+                (
+                    wrap_pcm16_in_wav(&bytes, rate),
+                    "audio/wav".to_string(),
+                    Some(rate),
+                )
             } else {
                 (bytes, mime, sample_rate)
             };
@@ -462,13 +479,18 @@ pub(crate) fn apply_pipeline_meta(
     env.set_output_audio(respond);
     env.meta
         .insert("model".into(), Value::String(pipeline.llm_alias.clone()));
-    env.meta
-        .insert("stt_model".into(), Value::String(pipeline.stt_alias.clone()));
-    env.meta
-        .insert("tts_model".into(), Value::String(pipeline.tts_alias.clone()));
+    env.meta.insert(
+        "stt_model".into(),
+        Value::String(pipeline.stt_alias.clone()),
+    );
+    env.meta.insert(
+        "tts_model".into(),
+        Value::String(pipeline.tts_alias.clone()),
+    );
     env.meta
         .insert("meeting_id".into(), Value::String(meeting_id.to_string()));
-    env.meta.insert("format".into(), Value::String("pcm".into()));
+    env.meta
+        .insert("format".into(), Value::String("pcm".into()));
     if let Some(lang) = language.filter(|l| !l.trim().is_empty()) {
         env.meta
             .insert("language".into(), Value::String(lang.to_string()));
@@ -524,7 +546,12 @@ fn roster_names(roster_json: Option<&str>) -> Vec<String> {
                 .or_else(|| e.get("speaker_id").and_then(|v| v.as_str()))
                 .or_else(|| e.get("name").and_then(|v| v.as_str()))
         })
-        .map(|s| s.chars().filter(|c| !c.is_control()).take(128).collect::<String>())
+        .map(|s| {
+            s.chars()
+                .filter(|c| !c.is_control())
+                .take(128)
+                .collect::<String>()
+        })
         .filter(|s| !s.trim().is_empty())
         .take(64)
         .collect()
@@ -817,7 +844,9 @@ mod tests {
         }))
     }
 
-    fn collect(items: Vec<anyhow::Result<EnvelopeDelta>>) -> (PumpOutcome, Vec<StreamChunkType>, CancellationToken) {
+    fn collect(
+        items: Vec<anyhow::Result<EnvelopeDelta>>,
+    ) -> (PumpOutcome, Vec<StreamChunkType>, CancellationToken) {
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
         let cancel = CancellationToken::new();
@@ -977,7 +1006,9 @@ mod tests {
             Arc::new(InMemoryBlobStore::new());
         let ctx = TurnContext {
             active_speaker: Some("Anna".into()),
-            roster_json: Some(r#"[{"speaker_id":"a","speaker_name":"Anna"},{"speaker_id":"b"}]"#.into()),
+            roster_json: Some(
+                r#"[{"speaker_id":"a","speaker_name":"Anna"},{"speaker_id":"b"}]"#.into(),
+            ),
             hint: Some("hint".into()),
         };
         let env = build_turn_envelope(
@@ -988,7 +1019,12 @@ mod tests {
         )
         .await
         .unwrap();
-        let FlowValue::Audio { blob_ref, mime, sample_rate } = &env.payload else {
+        let FlowValue::Audio {
+            blob_ref,
+            mime,
+            sample_rate,
+        } = &env.payload
+        else {
             panic!("payload must be audio");
         };
         assert_eq!(mime, "audio/wav");
@@ -1011,8 +1047,8 @@ mod tests {
     use crate::flow_engine::dispatcher::build_registry_for_test;
     use crate::flow_engine::dispatchers::audit::AuditEvent;
     use crate::flow_engine::dispatchers::{
-        AuditSink, LlmDispatcher, LlmRequest, LlmResponse, SttDispatcher, SttRequest,
-        SttResponse, TtsDispatcher, TtsRequest, TtsResponse, TtsStreamChunk,
+        AuditSink, LlmDispatcher, LlmRequest, LlmResponse, SttDispatcher, SttRequest, SttResponse,
+        TtsDispatcher, TtsRequest, TtsResponse, TtsStreamChunk,
     };
     use crate::flow_engine::executor::{execute_streaming, StreamingExecution};
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
@@ -1030,7 +1066,10 @@ mod tests {
     impl SttDispatcher for ScriptedStt {
         async fn transcribe(&self, req: SttRequest) -> anyhow::Result<SttResponse> {
             self.calls.lock().unwrap().push("stt");
-            assert_eq!(req.model, "stt-alias", "stt model must come from envelope meta");
+            assert_eq!(
+                req.model, "stt-alias",
+                "stt model must come from envelope meta"
+            );
             assert_eq!(req.audio.mime, "audio/wav");
             if self.unavailable {
                 return Err(anyhow::Error::from(
@@ -1058,15 +1097,24 @@ mod tests {
             req: LlmRequest,
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<LlmStreamChunk>>> {
             self.calls.lock().unwrap().push("llm");
-            assert_eq!(req.model, "llm-alias", "llm model must come from envelope meta");
+            assert_eq!(
+                req.model, "llm-alias",
+                "llm model must come from envelope meta"
+            );
             let user = req
                 .messages
                 .iter()
                 .filter_map(|m| m.text())
                 .collect::<Vec<_>>()
                 .join("\n");
-            assert!(user.contains("New utterance:"), "context must reach the model: {user}");
-            assert!(user.contains("status projektu"), "transcript must reach the model: {user}");
+            assert!(
+                user.contains("New utterance:"),
+                "context must reach the model: {user}"
+            );
+            assert!(
+                user.contains("status projektu"),
+                "transcript must reach the model: {user}"
+            );
             let n = self.deltas.len();
             let items: Vec<anyhow::Result<LlmStreamChunk>> = self
                 .deltas
@@ -1099,7 +1147,10 @@ mod tests {
         // chunks the blob itself, so this is the path the seeded flow takes.
         async fn synthesize(&self, req: TtsRequest) -> anyhow::Result<TtsResponse> {
             self.calls.lock().unwrap().push("tts");
-            assert_eq!(req.model, "tts-alias", "tts model must come from envelope meta");
+            assert_eq!(
+                req.model, "tts-alias",
+                "tts model must come from envelope meta"
+            );
             assert_eq!(req.format.as_deref(), Some("pcm"));
             let audio = self.blobs.put(vec![1, 2, 3, 4, 5, 6], "audio/pcm").await?;
             Ok(TtsResponse {
@@ -1113,7 +1164,10 @@ mod tests {
             req: TtsRequest,
         ) -> anyhow::Result<BoxStream<'static, anyhow::Result<TtsStreamChunk>>> {
             self.calls.lock().unwrap().push("tts");
-            assert_eq!(req.model, "tts-alias", "tts model must come from envelope meta");
+            assert_eq!(
+                req.model, "tts-alias",
+                "tts model must come from envelope meta"
+            );
             assert_eq!(req.format.as_deref(), Some("pcm"));
             let chunks = vec![
                 Ok(TtsStreamChunk {
@@ -1258,7 +1312,10 @@ mod tests {
         };
         assert!(text_chunks >= 1, "answer text must stream");
         assert!(audio_chunks >= 1, "TTS audio must reach the bot");
-        assert!(matches!(chunks.first(), Some(StreamChunkType::TextDelta(_))));
+        assert!(matches!(
+            chunks.first(),
+            Some(StreamChunkType::TextDelta(_))
+        ));
         let text: String = chunks
             .iter()
             .filter_map(|c| match c {
@@ -1283,8 +1340,12 @@ mod tests {
 
     #[tokio::test]
     async fn seeded_flow_no_response_sends_no_audio() {
-        let (exec, _) =
-            run_seeded_flow("Jaki jest status projektu?", false, vec!["<NO_", "RESPONSE>"]).await;
+        let (exec, _) = run_seeded_flow(
+            "Jaki jest status projektu?",
+            false,
+            vec!["<NO_", "RESPONSE>"],
+        )
+        .await;
         let exec = exec.expect("flow starts");
         let out = Arc::new(Mutex::new(Vec::new()));
         let sink = out.clone();
@@ -1294,7 +1355,10 @@ mod tests {
         })
         .await;
         assert_eq!(outcome, PumpOutcome::Silenced(SilenceReason::Marker));
-        assert!(out.lock().unwrap().is_empty(), "no text and no audio may leak");
+        assert!(
+            out.lock().unwrap().is_empty(),
+            "no text and no audio may leak"
+        );
         assert!(cancel.is_cancelled());
     }
 
@@ -1380,13 +1444,8 @@ mod tests {
             total: 500,
             calls: calls.clone(),
         });
-        let (exec, cancel) = run_seeded_flow_with_llm(
-            "Jaki jest status projektu?",
-            false,
-            llm,
-            calls.clone(),
-        )
-        .await;
+        let (exec, cancel) =
+            run_seeded_flow_with_llm("Jaki jest status projektu?", false, llm, calls.clone()).await;
         let exec = exec.expect("flow starts");
         assert!(!cancel.is_cancelled());
 
@@ -1400,7 +1459,10 @@ mod tests {
             cancel.is_cancelled(),
             "dropping the consumer must cancel the execution"
         );
-        assert_eq!(outcome.finish_reason, crate::flow_engine::envelope::FinishReason::Cancelled);
+        assert_eq!(
+            outcome.finish_reason,
+            crate::flow_engine::envelope::FinishReason::Cancelled
+        );
         let seen = pulled.load(Ordering::SeqCst);
         assert!(
             seen < 500,

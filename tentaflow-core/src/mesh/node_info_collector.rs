@@ -427,12 +427,14 @@ pub fn local_gpu_links() -> Vec<crate::mesh::peer_store::PeerGpuLink> {
     crate::services::deploy::gpu_topology::host_topology()
         .map(|t| {
             t.pairs()
-                .map(|(a, b, link, p2p_ok)| crate::mesh::peer_store::PeerGpuLink {
-                    a,
-                    b,
-                    link: link.as_str().to_string(),
-                    p2p_ok,
-                })
+                .map(
+                    |(a, b, link, p2p_ok)| crate::mesh::peer_store::PeerGpuLink {
+                        a,
+                        b,
+                        link: link.as_str().to_string(),
+                        p2p_ok,
+                    },
+                )
                 .collect()
         })
         .unwrap_or_default()

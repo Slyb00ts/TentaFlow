@@ -671,7 +671,9 @@ mod tests {
                 total: 2,
                 status: "ok".into(),
             },
-            ProgressEvent::Compaction { node_id: "c".into() },
+            ProgressEvent::Compaction {
+                node_id: "c".into(),
+            },
             ProgressEvent::ChildSpawned {
                 run_id: "child".into(),
                 agent: "a".into(),
@@ -957,7 +959,8 @@ mod tests {
         });
         h.rows("run-first", 2).await;
 
-        h.broker.bind_run_provenance(SCOPE, provenance("run-second"));
+        h.broker
+            .bind_run_provenance(SCOPE, provenance("run-second"));
         h.emit(ProgressEvent::NodeFinished {
             node_id: "n".into(),
             status: "ok".into(),
@@ -1007,7 +1010,9 @@ mod tests {
         // A positive control taken moments before the rebinding: the subscriber
         // is provably still draining, so "no new row" below cannot be a task
         // that had already stopped.
-        h.emit(ProgressEvent::FirstToken { node_id: "n".into() });
+        h.emit(ProgressEvent::FirstToken {
+            node_id: "n".into(),
+        });
         let before = h.rows("run-shared", 3).await;
         assert_eq!(before.len(), 3);
 

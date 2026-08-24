@@ -102,10 +102,7 @@ impl RecordingOutcome {
 pub enum RecordingFileOutcome {
     /// Open handle + size — the HTTP layer STREAMS it (optionally a byte range),
     /// so a multi-GB clip never lands in memory and `<video>` can seek.
-    Ok {
-        file: tokio::fs::File,
-        size: u64,
-    },
+    Ok { file: tokio::fs::File, size: u64 },
     /// File row exists in DB but the on-disk file is gone — wire-mapped to 404
     /// rather than 500 because the caller's signed URL is now stale.
     FileMissing,
@@ -645,9 +642,8 @@ mod tests {
         assert_eq!(RecordingFileOutcome::FileIntegrityError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::IoError.http_status(), 500);
         assert_eq!(RecordingFileOutcome::PathTraversal.http_status(), 403);
-        let f = tokio::fs::File::from_std(
-            std::fs::File::open("/dev/null").expect("open /dev/null"),
-        );
+        let f =
+            tokio::fs::File::from_std(std::fs::File::open("/dev/null").expect("open /dev/null"));
         assert_eq!(
             RecordingFileOutcome::Ok { file: f, size: 0 }.http_status(),
             200

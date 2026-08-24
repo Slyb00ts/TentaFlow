@@ -143,9 +143,7 @@ pub fn validate(toolchain: &str, install_cmd: &str, test_cmd: &str, workdir: &st
         || workdir.starts_with('\\')
         || workdir.split(['/', '\\']).any(|p| p == "..")
     {
-        return Err(anyhow!(
-            "workdir must be a relative path inside the source"
-        ));
+        return Err(anyhow!("workdir must be a relative path inside the source"));
     }
     Ok(())
 }
@@ -245,7 +243,10 @@ pub fn detect_toolchain(paths: &[String]) -> Option<ProposedProfile> {
         let Some((_, toolchain, base_image, install, test)) = matched else {
             continue;
         };
-        if best.as_ref().is_some_and(|(best_depth, _)| depth >= *best_depth) {
+        if best
+            .as_ref()
+            .is_some_and(|(best_depth, _)| depth >= *best_depth)
+        {
             continue;
         }
         best = Some((

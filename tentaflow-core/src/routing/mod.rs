@@ -453,9 +453,9 @@ pub(crate) fn openai_messages_to_vision(
                 Some(MessageContent::Parts(parts)) => parts
                     .iter()
                     .filter_map(|part| match part {
-                        ContentPart::Text { text } => Some(
-                            tentaflow_protocol::VisionContentPart::Text { text: text.clone() },
-                        ),
+                        ContentPart::Text { text } => {
+                            Some(tentaflow_protocol::VisionContentPart::Text { text: text.clone() })
+                        }
                         ContentPart::ImageUrl { image_url } => {
                             Some(tentaflow_protocol::VisionContentPart::ImageUrl {
                                 url: image_url.url.clone(),

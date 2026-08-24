@@ -107,7 +107,9 @@ pub fn needs_regeneration(existing: &BTreeSet<San>, desired: &BTreeSet<San>) -> 
 /// SANs of the first certificate in a PEM bundle.
 pub fn sans_from_cert_pem(cert_pem: &[u8]) -> anyhow::Result<BTreeSet<San>> {
     let certs = crate::api::tls_pem::parse_certs_pem(cert_pem)?;
-    let leaf = certs.first().ok_or_else(|| anyhow!("no certificate in PEM"))?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| anyhow!("no certificate in PEM"))?;
     let (_, cert) = x509_parser::parse_x509_certificate(leaf.as_ref())
         .map_err(|e| anyhow!("x509 parse: {e}"))?;
     let mut out = BTreeSet::new();
@@ -151,9 +153,7 @@ pub fn generate(hostname: &str, sans: &BTreeSet<San>) -> anyhow::Result<(String,
         .iter()
         .map(San::to_rcgen)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    params
-        .distinguished_name
-        .push(DnType::CommonName, hostname);
+    params.distinguished_name.push(DnType::CommonName, hostname);
     params
         .distinguished_name
         .push(DnType::OrganizationName, "TentaFlow");
@@ -164,7 +164,9 @@ pub fn generate(hostname: &str, sans: &BTreeSet<San>) -> anyhow::Result<(String,
     params.not_before = rcgen::date_time_ymd(now.year() - 1, now.month() as u8, day);
     params.not_after = rcgen::date_time_ymd(now.year() + VALIDITY_YEARS, now.month() as u8, day);
     let key_pair = KeyPair::generate_for(&PKCS_ECDSA_P256_SHA256).context("generate EC key")?;
-    let cert = params.self_signed(&key_pair).context("self-sign certificate")?;
+    let cert = params
+        .self_signed(&key_pair)
+        .context("self-sign certificate")?;
     Ok((cert.pem(), key_pair.serialize_pem()))
 }
 
@@ -222,8 +224,7 @@ pub fn load_or_generate(
 
     let (cert_pem, key_pem) = generate(hostname, &desired)?;
     let identity = parse_identity(cert_pem.as_bytes(), key_pem.as_bytes())?;
-    write_private(&key_path, &key_pem)
-        .with_context(|| format!("write {}", key_path.display()))?;
+    write_private(&key_path, &key_pem).with_context(|| format!("write {}", key_path.display()))?;
     std::fs::write(&cert_path, &cert_pem)
         .with_context(|| format!("write {}", cert_path.display()))?;
     info!(
@@ -264,24 +265,42 @@ mod tests {
 
     #[test]
     fn san_parse_distinguishes_ip_and_dns() {
-        assert_eq!(San::parse("192.168.1.5"), Some(San::Ip("192.168.1.5".parse().unwrap())));
+        assert_eq!(
+            San::parse("192.168.1.5"),
+            Some(San::Ip("192.168.1.5".parse().unwrap()))
+        );
         assert_eq!(San::parse("::1"), Some(San::Ip("::1".parse().unwrap())));
-        assert_eq!(San::parse(" Host.Local "), Some(San::Dns("host.local".into())));
+        assert_eq!(
+            San::parse(" Host.Local "),
+            Some(San::Dns("host.local".into()))
+        );
         assert_eq!(San::parse("  "), None);
     }
 
     #[test]
     fn regeneration_only_when_a_desired_san_is_missing() {
         let existing = set(&["localhost", "127.0.0.1", "10.0.0.5", "::1"]);
-        assert!(!needs_regeneration(&existing, &set(&["localhost", "127.0.0.1"])));
+        assert!(!needs_regeneration(
+            &existing,
+            &set(&["localhost", "127.0.0.1"])
+        ));
         assert!(!needs_regeneration(&existing, &existing));
-        assert!(needs_regeneration(&existing, &set(&["localhost", "10.0.0.6"])));
-        assert!(needs_regeneration(&existing, &set(&["localhost", "newhost"])));
+        assert!(needs_regeneration(
+            &existing,
+            &set(&["localhost", "10.0.0.6"])
+        ));
+        assert!(needs_regeneration(
+            &existing,
+            &set(&["localhost", "newhost"])
+        ));
     }
 
     #[test]
     fn desired_sans_include_extras_and_loopback() {
-        let sans = desired_sans("myhost", &["10.9.8.7".into(), "api.example.org".into(), "".into()]);
+        let sans = desired_sans(
+            "myhost",
+            &["10.9.8.7".into(), "api.example.org".into(), "".into()],
+        );
         assert!(sans.contains(&San::Dns("localhost".into())));
         assert!(sans.contains(&San::Dns("myhost".into())));
         assert!(sans.contains(&San::Ip("127.0.0.1".parse().unwrap())));
@@ -304,7 +323,10 @@ mod tests {
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = std::fs::metadata(dir.path().join(KEY_FILE)).unwrap().permissions().mode();
+            let mode = std::fs::metadata(dir.path().join(KEY_FILE))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o777, 0o600);
         }
 
@@ -316,7 +338,8 @@ mod tests {
         let more = vec!["198.51.100.4".to_string()];
         let third = load_or_generate(dir.path(), "unit-host", &more).unwrap();
         assert_ne!(first.certs[0].as_ref(), third.certs[0].as_ref());
-        let stored = sans_from_cert_pem(&std::fs::read(dir.path().join(CERT_FILE)).unwrap()).unwrap();
+        let stored =
+            sans_from_cert_pem(&std::fs::read(dir.path().join(CERT_FILE)).unwrap()).unwrap();
         assert!(stored.contains(&San::Ip("198.51.100.4".parse().unwrap())));
     }
 

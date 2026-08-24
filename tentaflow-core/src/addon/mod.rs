@@ -70,6 +70,25 @@ const DEFAULT_TICK_FUEL_BUDGET: u64 = 50_000_000;
 /// Domyslny limit pamieci WASM w bajtach (256 MB)
 const DEFAULT_MEMORY_LIMIT_BYTES: usize = 256 * 1024 * 1024;
 
+/// Kod ABI on_request: odpowiedz nie zmiescila sie w buforze wyjsciowym.
+/// Guest musi wtedy wpisac wymagany rozmiar (u32 LE) do out_len_ptr — host
+/// dealokuje stary bufor, alokuje wymagany i powtarza on_request (ograniczone
+/// proby). Lustro `ABI_OUTPUT_BUFFER_TOO_SMALL` z addon-sdk. Kod 2 zostaje
+/// ogolnym bledem guesta (bez retry).
+const ABI_OUTPUT_BUFFER_TOO_SMALL: i32 = 3;
+
+/// Twardy limit rozmiaru odpowiedzi z on_request (8 MB) — spójny z limitem
+/// host function `service_call` (PayloadKind::ServiceCall).
+const MAX_ON_REQUEST_OUTPUT_BYTES: usize = 8 * 1024 * 1024;
+
+/// Maksymalna liczba wywolani on_request na jedno call_tool/invoke_block:
+/// pierwsze + retry po OUTPUT_BUFFER_TOO_SMALL. Kolejny overflow = blad.
+const MAX_ON_REQUEST_ATTEMPTS: u32 = 3;
+
+/// Poczatkowy bufor wyjsciowy on_request — retry podnosi go do rozmiaru
+/// wymaganego przez guesta, wiec to soft default, nie limit.
+const INITIAL_OUTPUT_CAP: i32 = 65536;
+
 // =============================================================================
 // AddonManifest — parsowany z manifest.toml
 // =============================================================================
@@ -995,6 +1014,84 @@ impl AddonManager {
         Ok(())
     }
 
+    /// Odtworzenie w pamieci runtime'owych rejestrów (toole, flow bloki,
+    /// aliasy, [runtime] overrides) po restarcie core. `registered_tools`
+    /// to jedyne zrodlo katalogu narzedzi agenta (`list_tools`) — zyje tylko
+    /// w pamieci i zostaje puste po boocie, az addon nie zostanie
+    /// zainstalowany ponownie. Metoda zaslania to z wierszy `addons`
+    /// (tylko `is_enabled=1`): manifest parsowany z kolumny `manifest_json`
+    /// (RAW manifest.toml, patrz auto_start_services), katalog pakietu
+    /// resoluowany tak jak w `update_instance`. Bled pojedynczego addonu
+    /// tylko logujemy — uszkodzony addon nie moze oslepic reszty.
+    pub fn register_installed_addon_runtimes(&self) {
+        let addons = match crate::db::repository::list_addons(&self.db) {
+            Ok(a) => a,
+            Err(e) => {
+                warn!("Boot restore addonow: list_addons: {e}");
+                return;
+            }
+        };
+
+        let total = addons.len();
+        let mut restored = 0usize;
+        for addon in addons {
+            if !addon.is_enabled {
+                continue;
+            }
+            // UWAGA: `manifest_json` w DB to RAW manifest.toml (nazwa kolumny
+            // myli) — parsujemy przez TOML, nie JSON.
+            let manifest = match lifecycle::parse_manifest_toml(&addon.manifest_json) {
+                Ok(m) => m,
+                Err(e) => {
+                    warn!(
+                        "Boot restore addonow: '{}' manifest niepoprawny: {e}",
+                        addon.addon_id
+                    );
+                    continue;
+                }
+            };
+            // Ten sam fallback co `addon_package_ref`: puste kolumny pakietu
+            // (stare wiersze) oznaczaja (addon_id, version).
+            let package_id = if addon.package_id.is_empty() {
+                addon.addon_id.clone()
+            } else {
+                addon.package_id.clone()
+            };
+            let package_version = if addon.package_version.is_empty() {
+                addon.version.clone()
+            } else {
+                addon.package_version.clone()
+            };
+            let pkg_dir = bundled::package_dir(&package_id, &package_version);
+            if !pkg_dir.join("manifest.toml").exists() {
+                warn!(
+                    "Boot restore addonow: '{}' brak pakietu v{} w {:?} — pomijam",
+                    addon.addon_id, package_version, pkg_dir
+                );
+                continue;
+            }
+            match self.register_addon_runtime(&manifest, &pkg_dir) {
+                Ok(()) => {
+                    restored += 1;
+                    info!(
+                        "Boot restore addonow: '{}' v{} zaladowany ({} narzedzi)",
+                        addon.addon_id,
+                        package_version,
+                        manifest.tools.len()
+                    );
+                }
+                Err(e) => warn!(
+                    "Boot restore addonow: '{}' rejestracja runtime nieudana: {e}",
+                    addon.addon_id
+                ),
+            }
+        }
+        info!(
+            "Boot restore addonow: {} z {} instancji zaladowanych",
+            restored, total
+        );
+    }
+
     /// Make the local runtime match the (possibly just-replicated) `addons` row:
     /// load + materialize derived state when the instance is installed & enabled,
     /// unload when it is disabled or removed. Idempotent. Called by the mesh-sync
@@ -1662,7 +1759,8 @@ impl AddonManager {
         // (3) przy limicie — krótkie oczekiwanie aż ktoś zwróci worker.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system, &call_provenance)
+            if let Some(inst) =
+                self.take_idle_instance(addon_id, &user_id, system, &call_provenance)
             {
                 return Ok((inst, false));
             }
@@ -2738,9 +2836,11 @@ impl AddonManager {
             memory.data_mut(&mut addon_instance.store)[input_ptr as usize..input_end]
                 .copy_from_slice(&request_bytes);
 
-            // Alokuj bufor wyjsciowy (64KB)
-            let out_cap: i32 = 65536;
-            let out_ptr = alloc_fn
+            // Alokuj bufor wyjsciowy (poczatkowo 64KB — retry po kodzie
+            // ABI_OUTPUT_BUFFER_TOO_SMALL powieki go do rozmiaru wymaganego
+            // przez guesta)
+            let mut out_cap: i32 = INITIAL_OUTPUT_CAP;
+            let mut out_ptr = alloc_fn
                 .call(&mut addon_instance.store, out_cap)
                 .map_err(|e| anyhow::anyhow!("Blad alokacji bufora wyjsciowego: {e}"))?;
 
@@ -2775,21 +2875,88 @@ impl AddonManager {
                     anyhow::anyhow!("Addon nie eksportuje funkcji {}(): {e}", req_export)
                 })?;
 
-            let result_code = on_request
-                .call(
-                    &mut addon_instance.store,
-                    (
-                        input_ptr,
-                        request_bytes.len() as i32,
-                        out_ptr,
-                        out_cap,
-                        out_len_ptr,
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
+            // Wykonaj on_request z retry semantyka: kod 3 = guest zglosil za
+            // maly bufor i wpisal wymagany rozmiar (u32 LE) do out_len_ptr;
+            // host realokuje bufor i powtarza. Trap/fuel-out na jakiejkolwiek
+            // probie = czysty blad, petla ograniczona do 3 prob.
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                let result_code = on_request
+                    .call(
+                        &mut addon_instance.store,
+                        (
+                            input_ptr,
+                            request_bytes.len() as i32,
+                            out_ptr,
+                            out_cap,
+                            out_len_ptr,
+                        ),
+                    )
+                    .map_err(|e| anyhow::anyhow!("Blad wywolania on_request(): {e}"))?;
 
-            if result_code != 0 {
-                bail!("on_request() zwrocil blad: {}", result_code);
+                if result_code == 0 {
+                    break;
+                }
+                if result_code != ABI_OUTPUT_BUFFER_TOO_SMALL {
+                    bail!("on_request() zwrocil blad: {result_code}");
+                }
+
+                // CR-005: sprawdz granice pamieci przy odczycie wymaganej dlugosci
+                let mem_data = memory.data(&addon_instance.store);
+                let out_len_end = (out_len_ptr as usize).checked_add(4).ok_or_else(|| {
+                    anyhow::anyhow!("Przepelnienie przy obliczaniu konca out_len")
+                })?;
+                if out_len_end > mem_data.len() {
+                    bail!("out_len_ptr wykracza poza pamiec guest");
+                }
+                let required = u32::from_le_bytes([
+                    mem_data[out_len_ptr as usize],
+                    mem_data[out_len_ptr as usize + 1],
+                    mem_data[out_len_ptr as usize + 2],
+                    mem_data[out_len_ptr as usize + 3],
+                ]) as usize;
+
+                if required > MAX_ON_REQUEST_OUTPUT_BYTES {
+                    bail!(
+                        "on_request() wymaga {required} bajtow odpowiedzi — \
+                         przekracza limit {} MB",
+                        MAX_ON_REQUEST_OUTPUT_BYTES / (1024 * 1024)
+                    );
+                }
+                if required <= out_cap as usize {
+                    bail!(
+                        "on_request() zglosil za maly bufor, ale wymagany rozmiar \
+                         ({required}) nie przekracza alokowanego ({out_cap}) — \
+                         bledny kontrakt guesta"
+                    );
+                }
+                if attempts >= MAX_ON_REQUEST_ATTEMPTS {
+                    bail!(
+                        "on_request() po {attempts} probach ponownie wymaga \
+                         {required} bajtow — porzucam retry"
+                    );
+                }
+
+                // Realokacja: stary bufor schodzi przed nowa alokacja.
+                if let Ok(dealloc_fn) = addon_instance
+                    .instance
+                    .get_typed_func::<(i32, i32), ()>(&mut addon_instance.store, "dealloc")
+                {
+                    let _ = dealloc_fn.call(&mut addon_instance.store, (out_ptr, out_cap));
+                }
+                out_cap = required as i32;
+                out_ptr = alloc_fn
+                    .call(&mut addon_instance.store, out_cap)
+                    .map_err(|e| {
+                        anyhow::anyhow!("Blad alokacji poszerzonego bufora wyjsciowego: {e}")
+                    })?;
+                if out_ptr < 0 {
+                    bail!(
+                        "alloc() zwrocil niepoprawny wskaznik wyjsciowy: {}",
+                        out_ptr
+                    );
+                }
             }
 
             // Odczytaj dlugosc wyniku
@@ -3026,10 +3193,12 @@ impl AddonManager {
             memory.data_mut(&mut store)[input_ptr as usize..input_end]
                 .copy_from_slice(&request_bytes);
 
-            // 256KB output buffer — flow blocks moga zwracac caly envelope z
-            // historia, wiec wiekszy niz tool calls (64KB).
-            let out_cap: i32 = 256 * 1024;
-            let out_ptr = alloc_fn
+            // Poczatkowo 64KB — ten sam retry kontrakt co call_tool: kod 3
+            // = guest wpisal wymagany rozmiar do out_len_ptr, host realokuje
+            // (flow bloki potrafi zwracac caly envelope z historia wiec
+            // retry podnosi bufor do rozmiaru odpowiedzi).
+            let mut out_cap: i32 = INITIAL_OUTPUT_CAP;
+            let mut out_ptr = alloc_fn
                 .call(&mut store, out_cap)
                 .map_err(|e| anyhow::anyhow!("alloc(output): {e}"))?;
             if out_ptr < 0 {
@@ -3047,21 +3216,76 @@ impl AddonManager {
                 .get_typed_func::<(i32, i32, i32, i32, i32), i32>(&mut store, block_req_export)
                 .map_err(|e| anyhow::anyhow!("brak {}: {e}", block_req_export))?;
 
-            let result_code = on_request
-                .call(
-                    &mut store,
-                    (
-                        input_ptr,
-                        request_bytes.len() as i32,
-                        out_ptr,
-                        out_cap,
-                        out_len_ptr,
-                    ),
-                )
-                .map_err(|e| anyhow::anyhow!("{} fail: {e}", block_req_export))?;
+            let mut attempts: u32 = 0;
+            loop {
+                attempts += 1;
+                let result_code = on_request
+                    .call(
+                        &mut store,
+                        (
+                            input_ptr,
+                            request_bytes.len() as i32,
+                            out_ptr,
+                            out_cap,
+                            out_len_ptr,
+                        ),
+                    )
+                    .map_err(|e| anyhow::anyhow!("{} fail: {e}", block_req_export))?;
 
-            if result_code != 0 {
-                bail!("{} zwrocil kod bledu: {}", block_req_export, result_code);
+                if result_code == 0 {
+                    break;
+                }
+                if result_code != ABI_OUTPUT_BUFFER_TOO_SMALL {
+                    bail!("{} zwrocil kod bledu: {}", block_req_export, result_code);
+                }
+
+                // CR-005: sprawdz granice pamieci przy odczycie wymaganej dlugosci
+                let mem_data = memory.data(&store);
+                let out_len_end = (out_len_ptr as usize)
+                    .checked_add(4)
+                    .ok_or_else(|| anyhow::anyhow!("out_len range overflow"))?;
+                if out_len_end > mem_data.len() {
+                    bail!("out_len_ptr poza guest memory");
+                }
+                let required = u32::from_le_bytes([
+                    mem_data[out_len_ptr as usize],
+                    mem_data[out_len_ptr as usize + 1],
+                    mem_data[out_len_ptr as usize + 2],
+                    mem_data[out_len_ptr as usize + 3],
+                ]) as usize;
+
+                if required > MAX_ON_REQUEST_OUTPUT_BYTES {
+                    bail!(
+                        "on_request() wymaga {required} bajtow — przekracza limit {} MB",
+                        MAX_ON_REQUEST_OUTPUT_BYTES / (1024 * 1024)
+                    );
+                }
+                if required <= out_cap as usize {
+                    bail!(
+                        "on_request() zglosil za maly bufor, ale {required} <= {out_cap} — \
+                         bledny kontrakt guesta"
+                    );
+                }
+                if attempts >= MAX_ON_REQUEST_ATTEMPTS {
+                    bail!(
+                        "on_request() po {attempts} probach ponownie wymaga \
+                         {required} bajtow — porzucam retry"
+                    );
+                }
+
+                // Realokacja: stary bufor schodzi przed nowa alokacja.
+                if let Ok(dealloc_fn) =
+                    instance.get_typed_func::<(i32, i32), ()>(&mut store, "dealloc")
+                {
+                    let _ = dealloc_fn.call(&mut store, (out_ptr, out_cap));
+                }
+                out_cap = required as i32;
+                out_ptr = alloc_fn
+                    .call(&mut store, out_cap)
+                    .map_err(|e| anyhow::anyhow!("alloc(output): {e}"))?;
+                if out_ptr < 0 {
+                    bail!("alloc(output) zwrocil {}", out_ptr);
+                }
             }
 
             let mem_data = memory.data(&store);
@@ -3398,6 +3622,10 @@ impl AddonManager {
         // zna tylko addon_id instancji, a allowlista agenta dopasowuje pakiet.
         let (package_id, _) = self.addon_package_ref(&manifest.addon_id)?;
         let mut tools = self.registered_tools.write();
+        // Idempotencja: ponowna rejestracja tego samego addonu (boot restore,
+        // hot-update, reconcile) najpierw schodzi jego stare wpisy, wiec
+        // katalog agenta nigdy nie nosi duplikatow narzedzi.
+        tools.retain(|t| t.addon_id != manifest.addon_id);
 
         for tool in &manifest.tools {
             tools.push(ToolDefinition {

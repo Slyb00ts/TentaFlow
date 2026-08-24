@@ -26,9 +26,11 @@ use super::port_pool::AllocatedPorts;
 #[cfg_attr(not(feature = "docker"), allow(dead_code))]
 fn image_tag() -> Result<String> {
     let manifest = bot_manifest()?;
-    let docker = manifest.deploy.docker.as_ref().ok_or_else(|| {
-        anyhow::anyhow!("manifest 'teams-bot' nie ma sekcji [deploy.docker]")
-    })?;
+    let docker = manifest
+        .deploy
+        .docker
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("manifest 'teams-bot' nie ma sekcji [deploy.docker]"))?;
     // Silnik z build-argsami dostaje tag per architektura GPU; odtworzenie go tutaj
     // wymagaloby powtorzenia calego wyboru build-argsow z deployu. Bot ich nie ma —
     // gdyby doszly, lepiej zatrzymac sie z czytelnym bledem niz szukac zlego tagu.
@@ -357,10 +359,7 @@ mod tests {
             crate::services::deploy::docker::plain_image_tag(manifest)
         );
         assert!(
-            tag.starts_with(&format!(
-                "tentaflow/teams-bot:{}",
-                manifest.engine.version
-            )),
+            tag.starts_with(&format!("tentaflow/teams-bot:{}", manifest.engine.version)),
             "nieoczekiwany tag: {tag}"
         );
         assert!(!tag.ends_with(":latest"), "tag nie moze byc ruchomy: {tag}");

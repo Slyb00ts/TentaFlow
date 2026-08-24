@@ -33,7 +33,8 @@
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::{
     EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
-    EventsRunRequest, EventsRunResponse, MessageBody, ProtocolError, ProtocolErrorCode, SessionAuth,
+    EventsRunRequest, EventsRunResponse, MessageBody, ProtocolError, ProtocolErrorCode,
+    SessionAuth,
 };
 
 use super::handlers::user_id_to_uuid;
@@ -106,8 +107,8 @@ fn db_error(scope: &str, error: anyhow::Error) -> ProtocolError {
 /// The content is unchanged — including an `assistant_message` whose body the
 /// writer omitted, which stays an omission marker here.
 fn to_wire(event: StoredEvent) -> Result<EventRowWire, ProtocolError> {
-    let payload_json = crate::events::store::to_json(&event.payload)
-        .map_err(|e| db_error("payload_encode", e))?;
+    let payload_json =
+        crate::events::store::to_json(&event.payload).map_err(|e| db_error("payload_encode", e))?;
     Ok(EventRowWire {
         run_id: event.run_id,
         seq: event.seq,
@@ -195,7 +196,10 @@ fn browse(ctx: &HandlerContext, req: &EventsBrowseRequest) -> Result<MessageBody
     )))
 }
 
-fn run_timeline(ctx: &HandlerContext, req: &EventsRunRequest) -> Result<MessageBody, ProtocolError> {
+fn run_timeline(
+    ctx: &HandlerContext,
+    req: &EventsRunRequest,
+) -> Result<MessageBody, ProtocolError> {
     if req.run_id.is_empty() {
         return Err(ProtocolError::bad_request("run_id is required"));
     }
@@ -363,8 +367,14 @@ mod tests {
         append(
             &pool,
             &ctx.state.db,
-            RunEvent::new(run_id, at_ms, FlowOrigin::Chat, &FlowActor::user(who), request_started())
-                .with_session(session_id),
+            RunEvent::new(
+                run_id,
+                at_ms,
+                FlowOrigin::Chat,
+                &FlowActor::user(who),
+                request_started(),
+            )
+            .with_session(session_id),
         )
         .expect("append");
     }
@@ -404,7 +414,9 @@ mod tests {
         let runs: Vec<&str> = resp.rows.iter().map(|r| r.run_id.as_str()).collect();
         assert_eq!(runs, vec!["run-marek"]);
         assert!(
-            resp.rows.iter().all(|r| r.actor_user_id.as_deref() == Some(marek.uuid.as_str())),
+            resp.rows
+                .iter()
+                .all(|r| r.actor_user_id.as_deref() == Some(marek.uuid.as_str())),
             "every row on a scoped page belongs to the caller"
         );
         assert!(resp.scoped_to_self, "the page was narrowed and says so");

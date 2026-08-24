@@ -163,8 +163,7 @@ async fn serve_stream(
     router: Router,
     caller: ReverseCaller,
 ) {
-    let Some(request) =
-        read_request(&mut recv, &caller.service_name, REQUEST_FRAME_TIMEOUT).await
+    let Some(request) = read_request(&mut recv, &caller.service_name, REQUEST_FRAME_TIMEOUT).await
     else {
         return;
     };
@@ -340,7 +339,11 @@ mod tests {
         assert_eq!(chunk.request_id, "turn-stream");
         match chunk.chunk {
             StreamChunkType::Error(e) => {
-                assert!(e.message.contains("unknown meeting_id"), "got: {}", e.message)
+                assert!(
+                    e.message.contains("unknown meeting_id"),
+                    "got: {}",
+                    e.message
+                )
             }
             other => panic!("expected Error chunk, got {other:?}"),
         }
