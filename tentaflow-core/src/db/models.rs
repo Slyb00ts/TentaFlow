@@ -884,7 +884,7 @@ pub struct ModelMetricsDims<'a> {
 }
 
 /// Liczniki zadan dodawane do rollupu przy jednym `bump`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelMetricsCounters {
     pub request_count: i64,
     pub success_count: i64,
@@ -894,7 +894,7 @@ pub struct ModelMetricsCounters {
 }
 
 /// Sumy tokenow/modalnosci dodawane do rollupu przy jednym `bump`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelMetricsTokens {
     pub prompt_tokens: i64,
     pub completion_tokens: i64,
@@ -905,7 +905,7 @@ pub struct ModelMetricsTokens {
 }
 
 /// Sumy czasow dodawane do rollupu przy jednym `bump`.
-#[derive(Debug, Clone, Copy, Default)]
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct ModelMetricsTimes {
     pub prefill_secs: f64,
     pub decode_secs: f64,

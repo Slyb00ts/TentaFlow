@@ -432,10 +432,9 @@ impl AiEventHandle {
         let usage = usage.cloned();
         let tool_calls = tool_calls.to_vec();
         dispatch_write(move || {
-            // Token accounting takes its own short writer lock inside
-            // bump_token_usage, so it must run BEFORE we hold `conn` here.
+            // Token accounting only touches the in-memory usage cache (no DB
+            // lock), so ordering against `conn` below does not matter.
             bump_token_usage_for(
-                &db,
                 quota_enabled,
                 &node_id,
                 &org_id,
@@ -546,7 +545,11 @@ fn message_content_text(content: &MessageContent) -> String {
                 // the compliance log is megabytes of noise and, unlike a URL,
                 // says nothing a reviewer can act on.
                 ContentPart::InputAudio { input_audio } => {
-                    format!("[input_audio:{} {}B]", input_audio.format, input_audio.data.len())
+                    format!(
+                        "[input_audio:{} {}B]",
+                        input_audio.format,
+                        input_audio.data.len()
+                    )
                 }
             })
             .collect::<Vec<_>>()
@@ -589,13 +592,13 @@ fn dispatch_write(work: impl FnOnce() -> Result<()> + Send + 'static) -> Result<
     }
 }
 
-/// Token-usage accounting for one finished call. Extracted from the old
-/// `AiEventHandle::bump_usage` method so it can run inside a deferred write
-/// closure. No-op when quota is disabled, usage is absent, or the event has no
-/// resolved model (a flow/session-level row — per-node LLM events own the
-/// attribution, so bumping here would mis-attribute and double-count).
+/// Token-usage accounting for one finished call. The increment goes to the
+/// in-memory `token_usage_cache` (the metrics worker flushes deltas batched), so
+/// this never takes a SQLite writer lock. No-op when quota is disabled, usage is
+/// absent, or the event has no resolved model (a flow/session-level row —
+/// per-node LLM events own the attribution, so bumping here would mis-attribute
+/// and double-count).
 fn bump_token_usage_for(
-    db: &DbPool,
     quota_enabled: bool,
     node_id: &str,
     org_id: &str,
@@ -612,19 +615,14 @@ fn bump_token_usage_for(
     if model_id.trim().is_empty() {
         return;
     }
-    let today = chrono::Utc::now().format("%Y-%m-%d").to_string();
-    if let Err(err) = crate::db::repository::bump_token_usage(
-        db,
+    crate::services::runtime::token_usage_cache::record_chat_usage(
         node_id,
         org_id,
         user_id,
         model_id,
-        &today,
         i64::from(usage.prompt_tokens),
         i64::from(usage.completion_tokens),
-    ) {
-        tracing::warn!(error = %err, "zliczenie zuzycia tokenow nieudane");
-    }
+    );
 }
 
 fn insert_ai_audit_row(

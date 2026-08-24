@@ -62,8 +62,10 @@ impl Router {
     }
 
     /// Best-effort doliczenie tokenow embeddingow do dziennego licznika tego
-    /// wezla. Blad metryki nigdy nie psuje odpowiedzi. Liczymy `prompt_tokens`
-    /// (gdy 0 — fallback na `total_tokens`), bo embeddingi nie maja completion.
+    /// wezla. Inkrement idzie do in-memory `token_usage_cache` (metrics-worker
+    /// flushuje delty batchowo), wiec nic nie blokuje odpowiedzi. Liczymy
+    /// `prompt_tokens` (gdy 0 — fallback na `total_tokens`), bo embeddingi nie
+    /// maja completion.
     fn bump_embedding_usage_best_effort(
         &self,
         model: &str,
@@ -81,13 +83,10 @@ impl Router {
         });
         let node_id = self.local_node_id();
         let org_id = crate::db::repository::primary_org_for_user(db, user_id);
-        let usage_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         let user_id = user_id.unwrap_or(crate::db::repository::TOKEN_USAGE_SYSTEM_USER);
-        if let Err(err) = crate::db::repository::bump_embedding_usage(
-            db, &node_id, &org_id, user_id, model, &usage_day, tokens,
-        ) {
-            tracing::warn!(error = %err, "zliczenie zuzycia embeddingow nieudane");
-        }
+        crate::services::runtime::token_usage_cache::record_embedding_tokens(
+            &node_id, &org_id, user_id, model, tokens,
+        );
     }
 
     /// Obsluguje zarowno Single jak i Multiple input przez flow_engine.

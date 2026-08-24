@@ -24,6 +24,9 @@ tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+# Logi na stdout (pty) ida non-blocking: bufor + watek tla, wiec watek
+# requestu nie blokuje sie na wolnym terminalu (patrz setup_logging).
+tracing-appender = "0.2"
 anyhow = "1.0"
 clap = { version = "4.6.1", features = ["derive"] }
 rustls = { version = "0.23.40", features = ["ring"] }

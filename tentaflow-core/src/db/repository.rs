@@ -9502,7 +9502,7 @@ fn row_to_token_lease(row: &rusqlite::Row<'_>) -> rusqlite::Result<TokenLease> {
 
 /// Deterministyczne id licznika zuzycia: ten sam klucz na kazdym wezle (klucz
 /// zawiera node_id, wiec sumowanie mesh-wide nie powoduje kolizji miedzy wezlami).
-fn token_usage_id(
+pub(crate) fn token_usage_id(
     node_id: &str,
     org_id: &str,
     user_id: &str,
@@ -9575,8 +9575,72 @@ pub fn token_usage_changed_fields(
     fields
 }
 
-/// Lokalny UPSERT licznika zuzycia. Sciezka goraca — BEZ capture (flusher
-/// kolejno emituje capture batchem). Kazde wywolanie to jedno zliczone zadanie.
+/// Delta zuzycia dla jednego wiersza `token_usage_daily` — wszystkie pola sa
+/// PRZYROSTAMI do doliczenia, nie stanami absolutnymi. Jedna struktura obsluguje
+/// kazda modalnosc (chat/embedding/STT), bo wiersz dzienny moze mieszac pola.
+pub(crate) struct TokenUsageDelta<'a> {
+    pub node_id: &'a str,
+    pub org_id: &'a str,
+    pub user_id: &'a str,
+    pub model_id: &'a str,
+    pub usage_day: &'a str,
+    pub prompt_tokens: i64,
+    pub completion_tokens: i64,
+    pub embedding_tokens: i64,
+    pub audio_ms: i64,
+    pub request_count: i64,
+}
+
+/// JEDNA implementacja UPSERT-a licznika zuzycia (INSERT .. ON CONFLICT dodaje
+/// kazde pole). Tokeny embeddingow i audio NIE wliczaja sie do `total_tokens`
+/// (`total = prompt + completion`) — to inne modalnosci niz chat LLM.
+pub(crate) fn bump_token_usage_delta_on_tx(
+    tx: &rusqlite::Transaction<'_>,
+    delta: &TokenUsageDelta<'_>,
+) -> Result<()> {
+    let id = token_usage_id(
+        delta.node_id,
+        delta.org_id,
+        delta.user_id,
+        delta.model_id,
+        delta.usage_day,
+    );
+    tx.execute(
+        "INSERT INTO token_usage_daily \
+         (id, node_id, org_id, user_id, model_id, usage_day, \
+          prompt_tokens, completion_tokens, total_tokens, request_count, \
+          audio_ms, images, embedding_tokens, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, 0, ?12, \
+          strftime('%Y-%m-%d %H:%M:%f','now')) \
+         ON CONFLICT(id) DO UPDATE SET \
+         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
+         completion_tokens = completion_tokens + excluded.completion_tokens, \
+         total_tokens = total_tokens + excluded.total_tokens, \
+         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
+         audio_ms = audio_ms + excluded.audio_ms, \
+         request_count = request_count + excluded.request_count, \
+         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
+        rusqlite::params![
+            id,
+            delta.node_id,
+            delta.org_id,
+            delta.user_id,
+            delta.model_id,
+            delta.usage_day,
+            delta.prompt_tokens,
+            delta.completion_tokens,
+            delta.prompt_tokens + delta.completion_tokens,
+            delta.request_count,
+            delta.audio_ms,
+            delta.embedding_tokens,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Lokalny UPSERT licznika zuzycia chat we wlasnej transakcji. Na sciezce
+/// requestu zapisy idą przez batchowy flush (`token_usage_cache` +
+/// metrics-worker); ta funkcja zostaje dla zapisow jednorazowych i testow.
 pub fn bump_token_usage(
     pool: &DbPool,
     node_id: &str,
@@ -9587,22 +9651,11 @@ pub fn bump_token_usage(
     prompt_tokens: i64,
     completion_tokens: i64,
 ) -> Result<()> {
-    let conn = acquire(pool)?;
-    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
-    let total = prompt_tokens + completion_tokens;
-    conn.execute(
-        "INSERT INTO token_usage_daily \
-         (id, node_id, org_id, user_id, model_id, usage_day, \
-          prompt_tokens, completion_tokens, total_tokens, request_count, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 1, strftime('%Y-%m-%d %H:%M:%f','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-         prompt_tokens = prompt_tokens + excluded.prompt_tokens, \
-         completion_tokens = completion_tokens + excluded.completion_tokens, \
-         total_tokens = total_tokens + excluded.total_tokens, \
-         request_count = request_count + 1, \
-         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
-        rusqlite::params![
-            id,
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    bump_token_usage_delta_on_tx(
+        &tx,
+        &TokenUsageDelta {
             node_id,
             org_id,
             user_id,
@@ -9610,9 +9663,12 @@ pub fn bump_token_usage(
             usage_day,
             prompt_tokens,
             completion_tokens,
-            total,
-        ],
+            embedding_tokens: 0,
+            audio_ms: 0,
+            request_count: 1,
+        },
     )?;
+    tx.commit()?;
     Ok(())
 }
 
@@ -9637,79 +9693,6 @@ pub fn primary_org_for_user(pool: &DbPool, user_id: Option<&str>) -> String {
     .ok()
     .flatten()
     .unwrap_or(default)
-}
-
-/// Lokalny UPSERT zuzycia embeddingow. Tokeny embeddingow trzymamy w osobnym
-/// liczniku (`embedding_tokens`) i NIE wliczamy ich do `prompt_tokens` ani
-/// `total_tokens` — to inna modalnosc niz chat LLM. Sciezka goraca, BEZ capture.
-pub fn bump_embedding_usage(
-    pool: &DbPool,
-    node_id: &str,
-    org_id: &str,
-    user_id: &str,
-    model_id: &str,
-    usage_day: &str,
-    embedding_tokens: i64,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
-    conn.execute(
-        "INSERT INTO token_usage_daily \
-         (id, node_id, org_id, user_id, model_id, usage_day, \
-          prompt_tokens, completion_tokens, total_tokens, request_count, \
-          audio_ms, images, embedding_tokens, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, 0, 0, ?7, strftime('%Y-%m-%d %H:%M:%f','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-         embedding_tokens = embedding_tokens + excluded.embedding_tokens, \
-         request_count = request_count + 1, \
-         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
-        rusqlite::params![
-            id,
-            node_id,
-            org_id,
-            user_id,
-            model_id,
-            usage_day,
-            embedding_tokens,
-        ],
-    )?;
-    Ok(())
-}
-
-/// Lokalny UPSERT zuzycia STT — kumuluje milisekundy przetworzonego audio.
-/// Sciezka goraca, BEZ capture (flusher emituje capture batchem).
-pub fn bump_audio_usage(
-    pool: &DbPool,
-    node_id: &str,
-    org_id: &str,
-    user_id: &str,
-    model_id: &str,
-    usage_day: &str,
-    audio_ms: i64,
-) -> Result<()> {
-    let conn = acquire(pool)?;
-    let id = token_usage_id(node_id, org_id, user_id, model_id, usage_day);
-    conn.execute(
-        "INSERT INTO token_usage_daily \
-         (id, node_id, org_id, user_id, model_id, usage_day, \
-          prompt_tokens, completion_tokens, total_tokens, request_count, \
-          audio_ms, images, embedding_tokens, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, 0, 0, 0, 1, ?7, 0, 0, strftime('%Y-%m-%d %H:%M:%f','now')) \
-         ON CONFLICT(id) DO UPDATE SET \
-         audio_ms = audio_ms + excluded.audio_ms, \
-         request_count = request_count + 1, \
-         updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
-        rusqlite::params![
-            id,
-            node_id,
-            org_id,
-            user_id,
-            model_id,
-            usage_day,
-            audio_ms,
-        ],
-    )?;
-    Ok(())
 }
 
 /// Lokalny UPSERT zuzycia generacji obrazow — kumuluje liczbe wygenerowanych
@@ -10451,7 +10434,7 @@ fn row_to_model_metrics_rollup(
 /// bucket minted on different nodes therefore keeps a distinct `id` per node
 /// (single-writer-per-row), while a bucketing change re-keys rows instead of
 /// mixing incompatible histograms.
-fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
+pub(crate) fn model_metrics_id(dims: &crate::db::models::ModelMetricsDims<'_>) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
     for field in [
@@ -10561,31 +10544,39 @@ pub fn model_metrics_changed_fields(
     fields
 }
 
-/// Local UPSERT of one model-metrics bucket. Hot path — NO capture (the flusher
-/// emits captures batched, exactly like `bump_token_usage`). Accumulates counters,
-/// tokens and time sums and increments the matching histogram bucket + its
-/// `sample_count` ONLY for measured samples (a `None` perf value leaves that
-/// histogram untouched, so a bucket sum of 0 means "no samples", not "measured 0").
-pub fn bump_model_metrics_rollup(
-    pool: &DbPool,
+/// JEDNA implementacja UPSERT-a rollupu metryk: INSERT z pelnym wierszem
+/// (liczniki + sumy + KUBEŁKI histogramów i ich sample_count), ON CONFLICT
+/// dodaje kazde pole do istniejacego wiersza. Sciezka probkowa (`perf`) przelicza
+/// pomiary na indeksy kubelkow i przekazuje wektory z jedynka na zmierzonym
+/// indeksie; sciezka batchowa (metrics-worker) przekazuje zsumowane kubelki.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn upsert_model_metrics_row_on_tx(
+    tx: &rusqlite::Transaction<'_>,
+    id: &str,
     dims: &crate::db::models::ModelMetricsDims<'_>,
     counters: &crate::db::models::ModelMetricsCounters,
     tokens: &crate::db::models::ModelMetricsTokens,
     times: &crate::db::models::ModelMetricsTimes,
-    perf: &crate::db::models::ModelMetricsPerfSamples,
+    ttft_buckets: &[i64; TTFT_BUCKETS],
+    decode_tps_buckets: &[i64; DECODE_TPS_BUCKETS],
+    e2e_buckets: &[i64; E2E_BUCKETS],
 ) -> Result<()> {
-    let mut conn = acquire(pool)?;
-    let id = model_metrics_id(dims);
-    let tx = conn.transaction()?;
     tx.execute(
         "INSERT INTO model_metrics_rollup \
          (id, node_id, org_id, user_id, model_id, service_key, backend, modality, hour_bucket, \
-          histogram_version, request_count, success_count, error_count, \
+          histogram_version, request_count, success_count, error_count, usage_missing_count, \
           prompt_tokens, completion_tokens, total_tokens, embedding_tokens, audio_ms, images, \
           prefill_secs_sum, decode_secs_sum, e2e_latency_ms_sum, queue_ms_sum, \
-          usage_missing_count, updated_at) \
+          ttft_b0, ttft_b1, ttft_b2, ttft_b3, ttft_b4, ttft_b5, ttft_b6, ttft_b7, ttft_b8, ttft_b9, \
+          ttft_sample_count, \
+          decode_tps_b0, decode_tps_b1, decode_tps_b2, decode_tps_b3, decode_tps_b4, decode_tps_b5, \
+          decode_tps_b6, decode_tps_b7, decode_tps_sample_count, \
+          e2e_b0, e2e_b1, e2e_b2, e2e_b3, e2e_b4, e2e_b5, e2e_b6, e2e_b7, e2e_b8, e2e_b9, \
+          e2e_sample_count, updated_at) \
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, \
-          ?19, ?20, ?21, ?22, ?23, ?24, strftime('%Y-%m-%d %H:%M:%f','now')) \
+          ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35, \
+          ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46, ?47, ?48, ?49, ?50, ?51, ?52, \
+          ?53, ?54, ?55, strftime('%Y-%m-%d %H:%M:%f','now')) \
          ON CONFLICT(id) DO UPDATE SET \
          request_count = request_count + excluded.request_count, \
          success_count = success_count + excluded.success_count, \
@@ -10601,6 +10592,27 @@ pub fn bump_model_metrics_rollup(
          decode_secs_sum = decode_secs_sum + excluded.decode_secs_sum, \
          e2e_latency_ms_sum = e2e_latency_ms_sum + excluded.e2e_latency_ms_sum, \
          queue_ms_sum = queue_ms_sum + excluded.queue_ms_sum, \
+         ttft_b0 = ttft_b0 + excluded.ttft_b0, ttft_b1 = ttft_b1 + excluded.ttft_b1, \
+         ttft_b2 = ttft_b2 + excluded.ttft_b2, ttft_b3 = ttft_b3 + excluded.ttft_b3, \
+         ttft_b4 = ttft_b4 + excluded.ttft_b4, ttft_b5 = ttft_b5 + excluded.ttft_b5, \
+         ttft_b6 = ttft_b6 + excluded.ttft_b6, ttft_b7 = ttft_b7 + excluded.ttft_b7, \
+         ttft_b8 = ttft_b8 + excluded.ttft_b8, ttft_b9 = ttft_b9 + excluded.ttft_b9, \
+         ttft_sample_count = ttft_sample_count + excluded.ttft_sample_count, \
+         decode_tps_b0 = decode_tps_b0 + excluded.decode_tps_b0, \
+         decode_tps_b1 = decode_tps_b1 + excluded.decode_tps_b1, \
+         decode_tps_b2 = decode_tps_b2 + excluded.decode_tps_b2, \
+         decode_tps_b3 = decode_tps_b3 + excluded.decode_tps_b3, \
+         decode_tps_b4 = decode_tps_b4 + excluded.decode_tps_b4, \
+         decode_tps_b5 = decode_tps_b5 + excluded.decode_tps_b5, \
+         decode_tps_b6 = decode_tps_b6 + excluded.decode_tps_b6, \
+         decode_tps_b7 = decode_tps_b7 + excluded.decode_tps_b7, \
+         decode_tps_sample_count = decode_tps_sample_count + excluded.decode_tps_sample_count, \
+         e2e_b0 = e2e_b0 + excluded.e2e_b0, e2e_b1 = e2e_b1 + excluded.e2e_b1, \
+         e2e_b2 = e2e_b2 + excluded.e2e_b2, e2e_b3 = e2e_b3 + excluded.e2e_b3, \
+         e2e_b4 = e2e_b4 + excluded.e2e_b4, e2e_b5 = e2e_b5 + excluded.e2e_b5, \
+         e2e_b6 = e2e_b6 + excluded.e2e_b6, e2e_b7 = e2e_b7 + excluded.e2e_b7, \
+         e2e_b8 = e2e_b8 + excluded.e2e_b8, e2e_b9 = e2e_b9 + excluded.e2e_b9, \
+         e2e_sample_count = e2e_sample_count + excluded.e2e_sample_count, \
          histogram_version = excluded.histogram_version, \
          updated_at = strftime('%Y-%m-%d %H:%M:%f','now')",
         rusqlite::params![
@@ -10617,6 +10629,7 @@ pub fn bump_model_metrics_rollup(
             counters.request_count,
             counters.success_count,
             counters.error_count,
+            counters.usage_missing_count,
             tokens.prompt_tokens,
             tokens.completion_tokens,
             tokens.total_tokens,
@@ -10627,51 +10640,94 @@ pub fn bump_model_metrics_rollup(
             times.decode_secs,
             times.e2e_latency_ms,
             times.queue_ms,
-            counters.usage_missing_count,
+            ttft_buckets[0], ttft_buckets[1], ttft_buckets[2], ttft_buckets[3], ttft_buckets[4],
+            ttft_buckets[5], ttft_buckets[6], ttft_buckets[7], ttft_buckets[8], ttft_buckets[9],
+            ttft_buckets.iter().sum::<i64>(),
+            decode_tps_buckets[0], decode_tps_buckets[1], decode_tps_buckets[2],
+            decode_tps_buckets[3], decode_tps_buckets[4], decode_tps_buckets[5],
+            decode_tps_buckets[6], decode_tps_buckets[7],
+            decode_tps_buckets.iter().sum::<i64>(),
+            e2e_buckets[0], e2e_buckets[1], e2e_buckets[2], e2e_buckets[3], e2e_buckets[4],
+            e2e_buckets[5], e2e_buckets[6], e2e_buckets[7], e2e_buckets[8], e2e_buckets[9],
+            e2e_buckets.iter().sum::<i64>(),
         ],
     )?;
-    if let Some(ttft) = perf.ttft_ms {
-        bump_histogram_bucket(
-            &tx,
-            &id,
-            "ttft",
-            histogram_bucket_index(&TTFT_MS_EDGES, ttft),
-        )?;
-    }
-    if let Some(tps) = perf.decode_tps {
-        bump_histogram_bucket(
-            &tx,
-            &id,
-            "decode_tps",
-            histogram_bucket_index(&DECODE_TPS_EDGES, tps),
-        )?;
-    }
-    if let Some(e2e) = perf.e2e_ms {
-        bump_histogram_bucket(&tx, &id, "e2e", histogram_bucket_index(&E2E_MS_EDGES, e2e))?;
-    }
+    Ok(())
+}
+
+/// Liczba kubelkow kazdego histogramu (krawedzie zawieraja wartownik nieskonczonosci).
+pub(crate) const TTFT_BUCKETS: usize = TTFT_MS_EDGES.len();
+pub(crate) const DECODE_TPS_BUCKETS: usize = DECODE_TPS_EDGES.len();
+pub(crate) const E2E_BUCKETS: usize = E2E_MS_EDGES.len();
+
+/// Zapis jednego probkowego bumpu rollupu we wlasnej transakcji. Pomiary (`perf`
+/// `Some`) trafiaja do wlasciwego kubelka histogramu razem ze zwiekszeniem jego
+/// `sample_count`; `None` NIE dotyka danego histogramu (suma 0 = brak probek,
+/// nie "zmierzone 0").
+pub fn bump_model_metrics_rollup(
+    pool: &DbPool,
+    dims: &crate::db::models::ModelMetricsDims<'_>,
+    counters: &crate::db::models::ModelMetricsCounters,
+    tokens: &crate::db::models::ModelMetricsTokens,
+    times: &crate::db::models::ModelMetricsTimes,
+    perf: &crate::db::models::ModelMetricsPerfSamples,
+) -> Result<()> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction()?;
+    bump_model_metrics_rollup_on_tx(&tx, dims, counters, tokens, times, perf)?;
     tx.commit()?;
     Ok(())
 }
 
-/// Increment one histogram bucket and its `sample_count`. `prefix` is a fixed
-/// literal and `idx` is bounded by the edge arrays, so the formatted column names
-/// are injection-safe.
-fn bump_histogram_bucket(
+/// Jak `bump_model_metrics_rollup`, ale na CUDZEJ transakcji — flush batchowy
+/// metrics-workera wpisuje wiele kubelkow w jednym COMMIT-cie.
+pub(crate) fn bump_model_metrics_rollup_on_tx(
     tx: &rusqlite::Transaction<'_>,
-    id: &str,
-    prefix: &str,
-    idx: usize,
+    dims: &crate::db::models::ModelMetricsDims<'_>,
+    counters: &crate::db::models::ModelMetricsCounters,
+    tokens: &crate::db::models::ModelMetricsTokens,
+    times: &crate::db::models::ModelMetricsTimes,
+    perf: &crate::db::models::ModelMetricsPerfSamples,
 ) -> Result<()> {
-    let bucket_col = format!("{prefix}_b{idx}");
-    let sample_col = format!("{prefix}_sample_count");
-    tx.execute(
-        &format!(
-            "UPDATE model_metrics_rollup SET {bucket_col} = {bucket_col} + 1, \
-             {sample_col} = {sample_col} + 1 WHERE id = ?1"
-        ),
-        rusqlite::params![id],
-    )?;
-    Ok(())
+    // Jedynki na zmierzonych indeksach kubelkow; brak pomiaru = same zera.
+    let mut ttft = [0i64; TTFT_BUCKETS];
+    let mut decode_tps = [0i64; DECODE_TPS_BUCKETS];
+    let mut e2e = [0i64; E2E_BUCKETS];
+    if let Some(v) = perf.ttft_ms {
+        ttft[histogram_bucket_index(&TTFT_MS_EDGES, v)] = 1;
+    }
+    if let Some(v) = perf.decode_tps {
+        decode_tps[histogram_bucket_index(&DECODE_TPS_EDGES, v)] = 1;
+    }
+    if let Some(v) = perf.e2e_ms {
+        e2e[histogram_bucket_index(&E2E_MS_EDGES, v)] = 1;
+    }
+    let id = model_metrics_id(dims);
+    upsert_model_metrics_row_on_tx(
+        tx,
+        &id,
+        dims,
+        counters,
+        tokens,
+        times,
+        &ttft,
+        &decode_tps,
+        &e2e,
+    )
+}
+
+/// Otwiera jedna transakcje IMMEDIATE na pisarzu i przekazuje ja callbackowi.
+/// Wszystko co callback zapisze, laduje albo w calosci, albo w nic — tak flush
+/// metrics-workera atomizuje cala partie inkrementacji.
+pub(crate) fn with_writer_tx<T>(
+    pool: &DbPool,
+    f: impl FnOnce(&rusqlite::Transaction<'_>) -> Result<T>,
+) -> Result<T> {
+    let mut conn = acquire(pool)?;
+    let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+    let out = f(&tx)?;
+    tx.commit()?;
+    Ok(out)
 }
 
 /// Emit captures for THIS node's own rollup rows changed after `since_watermark`.

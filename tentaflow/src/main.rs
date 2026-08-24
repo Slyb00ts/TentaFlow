@@ -270,6 +270,16 @@ async fn run_server(args: Args) -> Result<()> {
         error!("Blad inicjalizacji bazy danych: {}", e);
         e
     })?;
+    // Zapisy metryk (model_metrics_rollup) i licznikow zuzycia
+    // (token_usage_daily) schodza z hot-path: worker tla akumuluje inkrementy i
+    // flushuje je batchowo jedna transakcja co ~200 ms / 512 jobow, a enforcement
+    // czyta niesflushowana czesc z pamieci (patrz services/runtime/
+    // metrics_worker.rs oraz token_usage_cache.rs). Inicjalizacja PO db::init —
+    // worker potrzebuje puli do batchowego flusha. Cache inicjalizujemy PRZED
+    // workerem (init jest odporny na kazda kolejnosc, ale ta jest naturalna):
+    // petla workera lapie globalna instancje cache'a przy pierwszym flushu.
+    tentaflow_core::services::runtime::token_usage_cache::init_token_usage_cache(db.clone());
+    tentaflow_core::services::runtime::metrics_worker::init_metrics_worker(db.clone());
     // Wczytaj konfigurowalne lokalizacje katalogow danych (Ustawienia → Magazyn
     // danych) i zastosuj jako runtime override w `paths`. Wolane PO `db::init`
     // (pool dostepny), wiec ponawiamy `ensure_app_dirs()` — jest idempotentne —
@@ -1226,12 +1236,23 @@ fn setup_logging(verbose: bool) -> Result<()> {
     let filter_str = format!("{},{}", user_level, BASE_FILTER);
     let filter = EnvFilter::new(filter_str);
 
+    // Non-blocking writer: logi ida przez bufor + watek tla zamiast
+    // synchronicznego zapisu na stdout (pty). Watek requestu nigdy nie blokuje
+    // sie na wolnym terminalu. `WorkerGuard` musi zyca, dopoki proces loguje —
+    // jego drop zamknilby kanal i cisnal reszte bufora, wiec trzymany jest w
+    // `static` na cale zycie procesu.
+    static LOG_WORKER: std::sync::OnceLock<tracing_appender::non_blocking::WorkerGuard> =
+        std::sync::OnceLock::new();
+    let (non_blocking, worker) = tracing_appender::non_blocking(std::io::stdout());
+    let _ = LOG_WORKER.set(worker);
+
     fmt()
         .with_env_filter(filter)
         .with_target(false)
         .with_thread_ids(false)
         .with_file(true)
         .with_line_number(true)
+        .with_writer(non_blocking)
         .init();
 
     Ok(())

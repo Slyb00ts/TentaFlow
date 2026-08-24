@@ -10,11 +10,13 @@ pub mod circuit_breaker;
 pub mod context;
 pub mod executor;
 pub mod local_cv;
+pub mod metrics_worker;
 pub mod quic_handle;
 pub mod resolver;
 pub mod reverse_listener;
 pub mod strategy;
 pub mod target;
+pub mod token_usage_cache;
 pub mod tool_calling;
 pub mod transport_client;
 

@@ -3726,6 +3726,26 @@ fn spawn_token_lease_coordinator(
     });
 }
 
+/// Zuzycie dla limitu z doliczonym in-memory overlayem `token_usage_cache`.
+/// Zapisy na sciezce requestu sa batchowane (metrics-worker flushuje co ~200 ms),
+/// wiec bez overlaya dzierzawy liczylby zuzycie z opoznieniem do okna flusha.
+/// `node = None` liczy wszystkie wezly (global), `Some(node)` tylko jeden.
+fn quota_usage_with_overlay(
+    pool: &crate::db::DbPool,
+    quota: &crate::db::models::TokenQuota,
+    period_key: &str,
+    node: Option<&str>,
+) -> anyhow::Result<i64> {
+    let persisted = match node {
+        Some(node) => crate::db::repository::node_usage_for_quota(pool, node, quota, period_key)?,
+        None => crate::db::repository::global_usage_for_quota(pool, quota, period_key)?,
+    };
+    let unflushed = crate::services::runtime::token_usage_cache::overlay_usage_for_quota(
+        quota, period_key, node,
+    );
+    Ok(persisted + unflushed)
+}
+
 async fn run_token_lease_coordinator_tick(
     qm: &Arc<IrohMeshManager>,
     mesh_security: &Arc<MeshSecurity>,
@@ -3789,14 +3809,13 @@ async fn run_token_lease_coordinator_tick(
         }
         for quota in org_quotas {
             let period_key = token_period_key(&quota.period);
-            let global_used =
-                match crate::db::repository::global_usage_for_quota(pool, quota, &period_key) {
-                    Ok(v) => v,
-                    Err(e) => {
-                        warn!(quota = %quota.id, "token-lease: global_usage nieudany: {}", e);
-                        continue;
-                    }
-                };
+            let global_used = match quota_usage_with_overlay(pool, quota, &period_key, None) {
+                Ok(v) => v,
+                Err(e) => {
+                    warn!(quota = %quota.id, "token-lease: global_usage nieudany: {}", e);
+                    continue;
+                }
+            };
             let remaining = (quota.max_total_tokens - global_used).max(0);
             let per_node = remaining / n;
             // Reszta z dzielenia idzie do koordynatora — suma(granted) == remaining,
@@ -3807,12 +3826,8 @@ async fn run_token_lease_coordinator_tick(
             .to_rfc3339();
 
             for node in &candidates {
-                let base_used = match crate::db::repository::node_usage_for_quota(
-                    pool,
-                    node,
-                    quota,
-                    &period_key,
-                ) {
+                let base_used = match quota_usage_with_overlay(pool, quota, &period_key, Some(node))
+                {
                     Ok(v) => v,
                     Err(e) => {
                         warn!(quota = %quota.id, node = %node, "token-lease: node_usage nieudany: {}", e);
@@ -3973,6 +3988,105 @@ pub(crate) async fn run_sync_repair_scheduler_tick_with<BuildPush, BuildRepairs>
 mod tests {
     use crate::code_studio::assertion;
     use crate::code_studio::mesh_stream::{self, StreamOpen, KIND_DATA, REASON_TRUST_LOST};
+
+    /// Zapis przez `token_usage_cache` BEZ flusha musi natychmiast podbijac
+    /// zuzycie widziane przez koordynatora dzierzaw (read-your-writes): overlay
+    /// doklada niesflushowany przyrost do stanu z bazy, a dzierzawa (base_used +
+    /// granted) wypada z tego powiekszonego zuzycia.
+    #[test]
+    fn lease_usage_grows_immediately_from_unflushed_cache() {
+        let db = crate::db::init(std::path::Path::new(":memory:")).expect("test db");
+        // Unikalna org — globalny cache jest wspoldzielony w procesie testowym,
+        // a wszystkie odczyty overlay filtruja po org_id, wiec nic nie cieknie
+        // do innych testow.
+        let org = "org-lease-overlay-test";
+        let node_self = "node-lease-overlay-test";
+        let user = "u-lease-overlay";
+        let model = "m-lease-overlay";
+        // token_usage_daily/token_quota mają FK na organizations — org musi istnieć.
+        {
+            let conn = db.write().expect("db write");
+            conn.execute(
+                "INSERT INTO organizations (org_id, name, slug, created_at) \
+                 VALUES (?1, 'Lease Overlay Test', 'lease-overlay-test', datetime('now'))",
+                rusqlite::params![org],
+            )
+            .expect("seed org");
+        }
+
+        // Persistowany baseline: 100 tokenow juz w bazie.
+        crate::db::repository::bump_token_usage(
+            &db,
+            node_self,
+            org,
+            user,
+            model,
+            &super::token_period_key("daily"),
+            100,
+            0,
+        )
+        .expect("seed usage row");
+        let quota_id = crate::db::repository::create_token_quota(
+            &db,
+            &crate::db::models::NewTokenQuota {
+                org_id: org,
+                scope_type: "user",
+                subject_id: Some(user),
+                model_id: None,
+                period: "daily",
+                max_total_tokens: 1000,
+                is_active: true,
+            },
+        )
+        .expect("seed quota");
+
+        // Niesflushowany przyrost +75 (50 prompt / 25 completion) — BEZ flusha.
+        crate::services::runtime::token_usage_cache::record_chat_usage(
+            node_self, org, user, model, 50, 25,
+        );
+
+        let quota = crate::db::repository::list_all_active_token_quotas(&db)
+            .expect("quotas")
+            .into_iter()
+            .find(|q| q.id == quota_id)
+            .expect("seeded quota");
+        let period_key = super::token_period_key("daily");
+
+        // Dokladnie to, co liczy tick koordynatora: node/global z overlayem.
+        assert_eq!(
+            super::quota_usage_with_overlay(&db, &quota, &period_key, Some(node_self))
+                .expect("node usage"),
+            175,
+            "base_used musi uwzgledniac niesflushowane +75"
+        );
+        assert_eq!(
+            super::quota_usage_with_overlay(&db, &quota, &period_key, None).expect("global usage"),
+            175
+        );
+
+        // Upsert dzierzawy jak w tiku (n=1 kandydat → reszta do koordynatora).
+        let granted = (quota.max_total_tokens - 175).max(0);
+        crate::db::repository::upsert_token_lease(
+            &db,
+            &crate::db::models::TokenLeaseUpsert {
+                org_id: org,
+                quota_id: &quota.id,
+                node_id: node_self,
+                period_key: &period_key,
+                base_used: 175,
+                granted_tokens: granted,
+                coordinator_node_id: node_self,
+                expires_at: "2099-01-01T00:00:00Z",
+            },
+        )
+        .expect("lease upsert");
+        let lease =
+            crate::db::repository::get_token_lease(&db, org, &quota.id, node_self, &period_key)
+                .expect("lease read")
+                .expect("lease row");
+        assert_eq!(lease.base_used, 175);
+        assert_eq!(lease.granted_tokens, 825);
+    }
 
     #[tokio::test]
     async fn revoking_trust_closes_the_peers_streams_and_forgets_its_assertion_keys() {
