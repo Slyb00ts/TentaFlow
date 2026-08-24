@@ -33,6 +33,7 @@ import '/js/components/tf-filter-chips.js';
 import '/js/components/tf-chat-bubble.js';
 import '/js/components/tf-chat-composer.js';
 import '/js/components/tf-empty-state.js';
+import '/js/components/tf-stat-card.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
 import { activityLabels } from '/js/lib/agent-activity-bridge.js';
 
@@ -40,6 +41,17 @@ import { activityLabels } from '/js/lib/agent-activity-bridge.js';
 // instead of as backend bad_request round-trips.
 const NAME_MAX_CHARS = 64;
 const MAX_ITERATIONS_CAP = 100;
+const MAX_SUBAGENTS_CAP = 16;
+const MAX_SPAWN_DEPTH_CAP = 5;
+const TOOLS_SUMMARY_CHIPS = 4;
+
+// Run-list period presets. 0 = no cut-off; the labels live in i18n.
+const RUN_PERIODS = [
+  { days: 30, key: 'runs_period_30d' },
+  { days: 7, key: 'runs_period_7d' },
+  { days: 1, key: 'runs_period_today' },
+  { days: 0, key: 'runs_period_all' },
+];
 const KEBAB_REGEX = /^[a-z0-9]+(-[a-z0-9]+)*$/;
 
 // Run status → tf-chip status colour. Mirrors the agent_runs CHECK set.
@@ -70,7 +82,7 @@ const PERSONAS = [
   { id: 'custom', icon: 'sparkle' },
 ];
 
-// Team templates (A05). Prompts reuse the persona presets where the role
+// Team templates (A09). Prompts reuse the persona presets where the role
 // matches; the extra roles carry their own prompt keys. Tools stay empty on
 // purpose — installed addons differ per node, so the admin picks them in the
 // editor after the team is created.
@@ -161,14 +173,6 @@ const CORE_TOOL_GROUPS = [
   },
 ];
 
-function coreToolGroupId(name) {
-  for (const g of CORE_TOOL_GROUPS) {
-    if (g.names?.includes(name)) return g.id;
-    if (g.prefixes?.some((p) => name.startsWith(p))) return g.id;
-  }
-  return 'other';
-}
-
 const state = {
   agents: [],
   searchQuery: '',
@@ -188,6 +192,12 @@ const state = {
   topTab: 'agents',
   runs: [],
   runsStatusFilter: 'all',
+  runsAgentFilter: 'all',
+  runsPeriodDays: 30,
+  runsQuery: '',
+  // run principal id -> display name, filled once per mount for admins.
+  userNames: new Map(),
+  myUserId: null,
   selectedRunId: null,
   // Live AgentRunEvent steps keyed by run id (in-memory, ephemeral). Reconciled
   // from RunDetail.run_log on open and appended from the run-events stream.
@@ -218,12 +228,13 @@ const AgentsScreen = {
 
   render() {
     return `
-      <div class="page-header">
+      <div class="page-header" id="agents-page-header">
         <div>
-          <h1>${sprite('brain')} ${escapeHtml(t('title'))}</h1>
+          <h1>${sprite('brain')} <span id="agents-title">${escapeHtml(t('title'))}</span></h1>
           <div class="sub" id="agents-sub"></div>
         </div>
         <div class="actions">
+          <tf-button variant="ghost" icon="download" id="runs-export" hidden>${escapeHtml(t('runs_export_csv'))}</tf-button>
           <tf-button variant="ghost" icon="refresh" id="agents-refresh">${escapeHtml(t('refresh'))}</tf-button>
           <tf-button variant="ghost" icon="users" id="agents-templates">${escapeHtml(t('team_templates'))}</tf-button>
           <tf-button variant="primary" icon="plus" id="agents-new">${escapeHtml(t('new_agent'))}</tf-button>
@@ -237,8 +248,9 @@ const AgentsScreen = {
 
       <div class="agents-top-panel" data-top-panel="agents">
         <div id="agents-list-view">
-          <div class="agents-toolbar agents-toolbar-cards">
+          <div class="tf-toolbar agents-toolbar-cards">
             <tf-searchbox id="agents-search" placeholder="${escapeAttr(t('search_placeholder'))}" debounce="200"></tf-searchbox>
+            <span class="agents-filter-label">${sprite('filter')} ${escapeHtml(t('filter_label'))}</span>
             <tf-filter-chips id="agents-filter-enabled" mode="single"></tf-filter-chips>
           </div>
           <div id="agents-grid-host"></div>
@@ -247,19 +259,25 @@ const AgentsScreen = {
       </div>
 
       <div class="agents-top-panel" data-top-panel="runs" hidden>
-        <section class="card agents-card">
-          <div class="agents-toolbar">
-            <tf-select id="runs-filter-status" class="agents-filter" value="all">
-              <option value="all">${escapeHtml(t('runs_filter_status_all'))}</option>
-              <option value="active">${escapeHtml(t('runs_filter_status_active'))}</option>
-              <option value="completed">${escapeHtml(t('run_status_completed'))}</option>
-              <option value="failed">${escapeHtml(t('run_status_failed'))}</option>
-            </tf-select>
-            <tf-button variant="ghost" icon="refresh" id="runs-refresh">${escapeHtml(t('refresh'))}</tf-button>
-          </div>
-          <div id="runs-table-host" class="agents-runs-host"></div>
-          <div id="runs-detail-host" class="agents-run-detail"></div>
-        </section>
+        <div class="agents-kpi-grid" id="runs-kpi-host"></div>
+        <div class="tf-toolbar agents-runs-toolbar">
+          <tf-select id="runs-filter-agent" value="all">
+            <option value="all">${escapeHtml(t('runs_filter_agent_all'))}</option>
+          </tf-select>
+          <tf-select id="runs-filter-status" value="all">
+            <option value="all">${escapeHtml(t('runs_filter_status_all'))}</option>
+            <option value="active">${escapeHtml(t('runs_filter_status_active'))}</option>
+            <option value="completed">${escapeHtml(t('run_status_completed'))}</option>
+            <option value="failed">${escapeHtml(t('run_status_failed'))}</option>
+          </tf-select>
+          <tf-select id="runs-filter-period" value="30">
+            ${RUN_PERIODS.map((p) => `<option value="${escapeAttr(String(p.days))}">${escapeHtml(t(p.key))}</option>`).join('')}
+          </tf-select>
+          <tf-searchbox id="runs-search" placeholder="${escapeAttr(t('runs_search_placeholder'))}" debounce="200"></tf-searchbox>
+        </div>
+        <div id="runs-table-host" class="agents-runs-host"></div>
+        <div id="runs-table-footer" class="agents-table-footer"></div>
+        <div id="runs-detail-host" class="agents-run-detail"></div>
       </div>
     `;
   },
@@ -269,6 +287,8 @@ const AgentsScreen = {
     // admin-only actions stay hidden for non-admins instead of failing on save.
     const me = await ApiBinary.one('authMeRequest').catch(() => null);
     state.isAdmin = (me?.role ?? 'user').toLowerCase() === 'admin';
+    state.myUserId = me?.id ?? me?.user_id ?? null;
+    loadUserNames();
     if (!state.isAdmin) {
       byId('agents-new')?.setAttribute('hidden', '');
       byId('agents-templates')?.setAttribute('hidden', '');
@@ -284,27 +304,31 @@ const AgentsScreen = {
       state.searchQuery = String(e.detail?.value ?? '');
       renderGrid();
     });
-    const filterChips = byId('agents-filter-enabled');
-    if (filterChips) {
-      filterChips.filters = [
-        { id: 'all', label: t('filter_all'), active: state.enabledFilter === 'all' },
-        { id: 'enabled', label: t('filter_enabled'), active: state.enabledFilter === 'enabled' },
-        { id: 'disabled', label: t('filter_disabled'), active: state.enabledFilter === 'disabled' },
-      ];
-      filterChips.addEventListener('change', (e) => {
-        state.enabledFilter = e.detail?.id ?? 'all';
-        renderGrid();
-      });
-    }
+    byId('agents-filter-enabled')?.addEventListener('change', (e) => {
+      state.enabledFilter = e.detail?.id ?? 'all';
+      renderGrid();
+    });
     byId('agents-top-tabs')?.addEventListener('change', (e) => {
       const id = e.detail?.value;
       if (id) switchTopTab(id);
     });
-    byId('runs-refresh')?.addEventListener('click', () => loadRunsTab());
     byId('runs-filter-status')?.addEventListener('change', (e) => {
       state.runsStatusFilter = e.detail?.value ?? e.target.value ?? 'all';
-      renderRunsTable();
+      renderRunsView();
     });
+    byId('runs-filter-agent')?.addEventListener('change', (e) => {
+      state.runsAgentFilter = e.detail?.value ?? e.target.value ?? 'all';
+      renderRunsView();
+    });
+    byId('runs-filter-period')?.addEventListener('change', (e) => {
+      state.runsPeriodDays = Number(e.detail?.value ?? e.target.value ?? 30);
+      renderRunsView();
+    });
+    byId('runs-search')?.addEventListener('search', (e) => {
+      state.runsQuery = String(e.detail?.value ?? '').toLowerCase();
+      renderRunsView();
+    });
+    byId('runs-export')?.addEventListener('click', () => exportRunsCsv());
     wireGridEvents();
     await loadAgents();
   },
@@ -323,6 +347,12 @@ const AgentsScreen = {
     state.enabledFilter = 'all';
     state.topTab = 'agents';
     state.runs = [];
+    state.userNames.clear();
+    state.myUserId = null;
+    state.runsStatusFilter = 'all';
+    state.runsAgentFilter = 'all';
+    state.runsPeriodDays = 30;
+    state.runsQuery = '';
     state.selectedRunId = null;
     state.runSteps = new Map();
   },
@@ -346,6 +376,7 @@ async function loadAgents() {
     state.agents = [];
   }
   document.querySelector('#agents-top-tabs tf-tab#agents')?.setAttribute('count', String(state.agents.length));
+  renderFilterChips();
   updateSubLine();
   renderGrid();
 }
@@ -353,13 +384,38 @@ async function loadAgents() {
 function updateSubLine() {
   const sub = byId('agents-sub');
   if (!sub) return;
-  if (state.detail) {
-    sub.textContent = t('detail_open_sub', { name: state.detail.agent.display_name || state.detail.agent.name });
+  // The detail view hides the module header entirely, so its subtitle is only
+  // ever read after closing back to the list.
+  if (state.topTab === 'runs') {
+    sub.textContent = t('runs_sub');
     return;
   }
   const total = state.agents.length;
   const enabled = state.agents.filter((a) => a.is_enabled).length;
   sub.textContent = t('list_sub', { total, enabled });
+}
+
+// A06 exports the filtered cross-agent view. Values are quoted and embedded
+// quotes doubled, so a prompt containing a comma or a newline stays one field.
+function exportRunsCsv() {
+  const rows = filteredRuns();
+  const header = [t('runs_col_id'), t('runs_col_agent'), t('runs_col_status'), t('runs_col_started'),
+    t('runs_col_duration'), t('runs_col_iterations'), t('runs_col_tokens'), t('runs_col_prompt'), t('runs_col_initiator')];
+  const cell = (v) => `"${String(v ?? '').replace(/"/g, '""')}"`;
+  const body = rows.map((r) => [
+    r.id, agentLabel(r.agent_id).title, runStatusLabel(r.status), formatTimestamp(r.started_at || r.created_at),
+    runDuration(r), r.iterations ?? 0, r.total_tokens ?? 0, runPromptText(r), runInitiator(r),
+  ].map(cell).join(','));
+  // The BOM makes Excel read the file as UTF-8 instead of the system codepage.
+  const blob = new Blob(['\ufeff', [header.map(cell).join(','), ...body].join('\r\n')], { type: 'text/csv;charset=utf-8' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = 'agent-runs.csv';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
 }
 
 function parseStringArray(json) {
@@ -388,11 +444,26 @@ function parseSkillsSelection(json) {
   }
 }
 
+// Counts come from the loaded roster, so a chip never promises rows the grid
+// cannot show.
+function renderFilterChips() {
+  const host = byId('agents-filter-enabled');
+  if (!host) return;
+  const rows = state.agents;
+  host.filters = [
+    { id: 'all', label: t('filter_all'), count: rows.length, active: state.enabledFilter === 'all' },
+    { id: 'enabled', label: t('filter_enabled'), count: rows.filter((a) => a.is_enabled).length, active: state.enabledFilter === 'enabled' },
+    { id: 'disabled', label: t('filter_disabled'), count: rows.filter((a) => !a.is_enabled).length, active: state.enabledFilter === 'disabled' },
+    { id: 'routable', label: t('chip_routable'), count: rows.filter((a) => a.routable).length, active: state.enabledFilter === 'routable' },
+  ];
+}
+
 function filteredAgents() {
   const q = state.searchQuery.trim().toLowerCase();
   return state.agents.filter((agent) => {
     if (state.enabledFilter === 'enabled' && !agent.is_enabled) return false;
     if (state.enabledFilter === 'disabled' && agent.is_enabled) return false;
+    if (state.enabledFilter === 'routable' && !agent.routable) return false;
     if (!q) return true;
     const hay = `${agent.display_name || ''} ${agent.name} ${agent.description || ''}`.toLowerCase();
     return hay.includes(q);
@@ -454,7 +525,7 @@ function agentCardHtml(agent) {
   // an Admin-only upsert/delete, so the whole menu collapses to one entry.
   const menu = state.isAdmin
     ? `<div class="agent-card-menu-wrap">
-        <tf-button variant="ghost" size="sm" icon="chevron-down" data-more title="${escapeAttr(t('action_more'))}"></tf-button>
+        <tf-button variant="ghost" size="sm" icon="more" data-more title="${escapeAttr(t('action_more'))}"></tf-button>
         <tf-menu placement="bottom-end" data-card-menu>
           <tf-menu-item action="edit" icon="edit">${escapeHtml(t('action_edit'))}</tf-menu-item>
           <tf-menu-item action="duplicate" icon="copy">${escapeHtml(t('action_duplicate'))}</tf-menu-item>
@@ -470,21 +541,25 @@ function agentCardHtml(agent) {
   return `
     <div class="agent-card ${agent.is_enabled ? '' : 'is-disabled'}" data-agent-id="${escapeAttr(agent.id)}" role="button" tabindex="0">
       <div class="agent-card-top">
-        <div class="agent-card-av">${sprite(agentIcon(agent.name))}</div>
+        <div class="agent-card-av${agent.is_enabled ? '' : ' is-off'}">${sprite(agentIcon(agent.name))}</div>
         <div class="agent-card-heading">
-          <div class="agent-card-name">${escapeHtml(agent.display_name || agent.name)}</div>
-          <div class="agent-card-role">${escapeHtml(agent.name)} · ${escapeHtml(agent.model || t('model_inherited'))}</div>
+          <div class="agent-card-name">
+            <span class="agent-card-name-text">${escapeHtml(agent.display_name || agent.name)}</span>
+            <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
+          </div>
+          <div class="agent-card-role">${escapeHtml(agent.name)}</div>
         </div>
+        ${menu}
       </div>
       <div class="agent-card-desc">${escapeHtml(agent.description || '')}</div>
       <div class="agent-card-meta">
         <span>${sprite('bolt')}${escapeHtml(t('card_tools_count', { count: toolsCount }))}</span>
-        <span>${sprite('sparkle')}${escapeHtml(t('card_skills_count', { count: skillsCount }))}</span>
+        ${skillsCount ? `<span>${sprite('sparkle')}${escapeHtml(t('card_skills_count', { count: skillsCount }))}</span>` : ''}
+        <span>${sprite('brain')}${escapeHtml(agent.model || t('model_inherited'))}</span>
       </div>
       <div class="agent-card-foot">
         ${agent.routable ? `<tf-chip status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
-        <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
-        ${menu}
+        ${(agent.max_subagents ?? 0) > 0 ? `<tf-chip status="accent">${escapeHtml(t('hdr_subagents', { count: agent.max_subagents }))}</tf-chip>` : ''}
       </div>
     </div>
   `;
@@ -708,6 +783,8 @@ async function openDetail(agentId, tab = 'config') {
     runsLoaded: false,
     agentRuns: [],
     agentRunsFilter: 'all',
+    agentRunsPeriodDays: 30,
+    agentRunsQuery: '',
     selectedAgentRunId: null,
     agentRunSteps: new Map(),
     agentRunsUnsub: null,
@@ -718,32 +795,69 @@ async function openDetail(agentId, tab = 'config') {
   const detailView = byId('agents-detail-view');
   if (listView) listView.hidden = true;
   if (!detailView) return;
+  setModuleChromeHidden(true);
   detailView.hidden = false;
   detailView.innerHTML = `
     <div class="ag-detail">
-      <div class="breadcrumb ag-breadcrumb">
+      <div class="tf-breadcrumb ag-breadcrumb">
         <span class="crumb" data-crumb-root>${escapeHtml(t('title'))}</span>
         <span class="sep">${sprite('chevron-right')}</span>
-        <span class="crumb active" data-crumb-current></span>
+        <span class="crumb current" data-crumb-current></span>
       </div>
       <div id="ag-detail-header-host"></div>
       <div id="ag-detail-tabs-host"></div>
       <div id="ag-detail-body"></div>
     </div>
   `;
-  detailView.querySelector('[data-crumb-root]')?.addEventListener('click', () => closeDetail());
+  detailView.querySelector('[data-crumb-root]')?.addEventListener('click', () => leaveDetail());
   renderDetailHeader();
   renderDetailTabs();
   // Picker/model data feeds every tab; loading it up front keeps the first
   // paint of each tab complete instead of popping options in afterwards.
-  const [catalogRows, skillRows, modelRows] = await Promise.all([loadToolsCatalog(), loadSkillList(), loadModelOptions()]);
+  const [catalogRows, skillRows, modelRows, runRows] = await Promise.all([
+    loadToolsCatalog(),
+    loadSkillList(),
+    loadModelOptions(),
+    fetchAgentRuns(agentId).catch(() => []),
+  ]);
   const dd = state.detail;
   if (!dd || dd.agentId !== agentId) return;
   dd.catalog = catalogRows;
   dd.skills = skillRows;
   dd.models = modelRows;
+  dd.agentRuns = runRows;
+  dd.runsLoaded = true;
+  renderDetailTabs();
   await switchDetailTab(tab);
   updateSubLine();
+}
+
+// Leaving the detail throws the draft away, and the save bar is only rendered on
+// the two tabs that can edit it — from Testowanie or Przebiegi the operator has
+// no on-screen reminder that anything is unsaved.
+async function leaveDetail() {
+  const d = state.detail;
+  if (d?.dirty) {
+    const ok = await TfWindow.confirm({
+      title: t('leave_dirty_title'),
+      message: t('leave_dirty_message'),
+      confirmLabel: t('leave_dirty_discard'),
+      cancelLabel: t('action_cancel'),
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  closeDetail();
+}
+
+// A02-A05 give the agent detail the whole main column: the module page header
+// and the Agenci/Przebiegi tab strip belong to the list view only, and leaving
+// them up stacks a second tab strip above the detail tabs.
+function setModuleChromeHidden(hidden) {
+  const header = byId('agents-page-header');
+  const tabs = byId('agents-top-tabs');
+  if (header) header.hidden = hidden;
+  if (tabs) tabs.hidden = hidden;
 }
 
 function closeDetail({ keepList = false } = {}) {
@@ -759,6 +873,7 @@ function closeDetail({ keepList = false } = {}) {
   const detailView = byId('agents-detail-view');
   if (detailView) { detailView.hidden = true; detailView.innerHTML = ''; }
   if (listView) listView.hidden = false;
+  setModuleChromeHidden(false);
   loadAgents();
   updateSubLine();
 }
@@ -789,7 +904,7 @@ function renderDetailHeader() {
     `<tf-chip>${escapeHtml(t('hdr_loop_limits', { iterations: agent.max_iterations ?? 25, timeout: agent.timeout_secs ?? 600 }))}</tf-chip>`,
   ];
   if ((agent.max_subagents ?? 0) > 0) {
-    badges.push(`<tf-chip>${escapeHtml(t('hdr_subagents', { count: agent.max_subagents }))}</tf-chip>`);
+    badges.push(`<tf-chip>${escapeHtml(t('hdr_subagents', { count: agent.max_subagents, depth: agent.max_spawn_depth ?? 1 }))}</tf-chip>`);
   }
   const adminActions = state.isAdmin ? `
     <tf-button variant="primary" icon="play" data-hdr-test>${escapeHtml(t('hdr_run_test'))}</tf-button>
@@ -798,7 +913,7 @@ function renderDetailHeader() {
     <tf-button variant="danger" icon="trash" data-hdr-delete>${escapeHtml(t('action_delete'))}</tf-button>
   ` : '';
   host.innerHTML = `
-    <div class="detail-header ag-detail-header">
+    <div class="tf-detail-header">
       <div class="big-ico">${sprite(agentIcon(agent.name))}</div>
       <div class="d-meta">
         <div class="d-name">
@@ -806,7 +921,11 @@ function renderDetailHeader() {
           <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
           ${agent.routable ? `<tf-chip status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
         </div>
-        <div class="d-sub mono">${escapeHtml(agent.name)}</div>
+        <div class="d-sub mono">${escapeHtml([
+          agent.name,
+          agent.created_at ? t('hdr_created', { at: formatTimestamp(agent.created_at) }) : null,
+          agent.updated_at ? t('hdr_updated', { at: formatTimestamp(agent.updated_at) }) : null,
+        ].filter(Boolean).join(' · '))}</div>
         <div class="d-badges">${badges.join('')}</div>
       </div>
       <div class="d-actions">${adminActions}</div>
@@ -826,8 +945,8 @@ function renderDetailTabs() {
   const host = byId('ag-detail-tabs-host');
   if (!d || !host) return;
   const counts = {
-    tools: String(d.selectedTools.size),
-    runs: d.agent.run_count_30d != null ? String(d.agent.run_count_30d) : null,
+    tools: detailToolsCount(d),
+    runs: d.runsLoaded ? String(d.agentRuns.length) : null,
   };
   host.innerHTML = `
     <tf-tabs variant="underline" value="${escapeAttr(d.tab)}" id="agent-detail-tabs">
@@ -846,8 +965,24 @@ function renderDetailTabs() {
 // this runs inside a change event bubbling out of that very strip.
 function updateDetailTabCounts() {
   const d = state.detail;
-  const tab = document.querySelector('#agent-detail-tabs tf-tab#tools');
-  if (d && tab) tab.setAttribute('count', String(d.selectedTools.size));
+  if (!d) return;
+  const tools = document.querySelector('#agent-detail-tabs tf-tab#tools');
+  if (tools) tools.setAttribute('count', detailToolsCount(d));
+  const runs = document.querySelector('#agent-detail-tabs tf-tab#runs');
+  if (runs && d.runsLoaded) runs.setAttribute('count', String(d.agentRuns.length));
+}
+
+// A wildcard is one entry but stands for a whole addon, so it is counted as a
+// selection everywhere — badge, header chip and the summary line alike. Before
+// this the summary excluded wildcards and disagreed with the badge on the same
+// screen.
+function selectedToolCount(d) {
+  return d.selectedTools.size;
+}
+
+function detailToolsCount(d) {
+  const skills = d.skillNames.size + d.skillTags.size;
+  return skills ? `${selectedToolCount(d)}+${skills}` : String(selectedToolCount(d));
 }
 
 async function switchDetailTab(tab) {
@@ -1024,15 +1159,13 @@ async function loadModelOptions() {
   return opts;
 }
 
-/// Wypełnia listę poziomów rozumowania z katalogu dla AKTUALNIE wybranego modelu.
-///
-/// Trzy stany, celowo rozróżnione:
-///  - model deklaruje poziomy → pokazujemy dokładnie je,
-///  - model deklaruje pustą listę → chowamy pole, bo backend odrzuciłby każdą
-///    wartość,
-///  - katalog nie zna modelu (`null`) → zostawiamy zapisany wybór i pokazujemy
-///    pole, tak jak przy modalnościach: brak wpisu to niewiedza, nie brak
-///    możliwości.
+// Fills the reasoning-effort list from the catalog for the CURRENTLY selected
+// model. Three states, deliberately distinct:
+//   - the model declares levels    -> show exactly those,
+//   - the model declares an empty list -> hide the field, since the backend
+//     would reject any value,
+//   - the catalog does not know the model (`null`) -> keep the stored choice and
+//     show the field: a missing entry is ignorance, not absence.
 async function refreshReasoningOptionsFor(select, fieldHost) {
   if (!select || !fieldHost) return;
   await ModelModalities.load();
@@ -1064,11 +1197,34 @@ function sectionCard(icon, titleKey, inner) {
   `;
 }
 
+function clampInt(value, min, max, fallback) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(Math.round(n), min), max);
+}
+
+// A02 edits every loop limit on a slider with its value pinned to the right.
+function sliderRow(field, labelKey, descKey, min, max, value) {
+  return `
+    <div class="agents-slider-row">
+      <div>
+        <div class="agents-slider-name">${escapeHtml(t(labelKey))}</div>
+        <div class="agents-field-hint">${escapeHtml(t(descKey))}</div>
+      </div>
+      <tf-slider data-cfg-slider="${escapeAttr(field)}" min="${min}" max="${max}" step="1"
+        value="${escapeAttr(String(value))}"></tf-slider>
+      <div class="agents-slider-val" data-slider-val="${escapeAttr(field)}">${escapeHtml(String(value))}</div>
+    </div>
+  `;
+}
+
 function renderConfigTab(body) {
   const d = state.detail;
   if (!d || !body) return;
   const c = d.cfg;
-  const iterations = Math.min(Math.max(Number(c.max_iterations) || 25, 1), MAX_ITERATIONS_CAP);
+  const iterations = clampInt(c.max_iterations, 1, MAX_ITERATIONS_CAP, 25);
+  const subagents = clampInt(c.max_subagents, 0, MAX_SUBAGENTS_CAP, 0);
+  const spawnDepth = clampInt(c.max_spawn_depth, 1, MAX_SPAWN_DEPTH_CAP, 1);
 
   body.innerHTML = `
     ${sectionCard('bot', 'section_identity', `
@@ -1090,6 +1246,8 @@ function renderConfigTab(body) {
         value="${escapeAttr(c.system_prompt)}"></tf-textarea>
       <div class="ag-prompt-foot">
         <span class="ag-prompt-count" data-prompt-count></span>
+        <span data-prompt-vars></span>
+        <span class="ag-prompt-spacer"></span>
         ${state.isAdmin ? `
           <tf-button variant="ghost" size="sm" icon="sparkle" data-prompt-assist>${escapeHtml(t('prompt_improve_ai'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="refresh" data-prompt-restore>${escapeHtml(t('prompt_restore'))}</tf-button>
@@ -1098,7 +1256,7 @@ function renderConfigTab(body) {
     `)}
 
     ${sectionCard('brain', 'section_model', `
-      <div class="agents-editor-grid">
+      <div class="agents-editor-grid agents-model-grid">
         <div>
           <tf-select data-cfg="model" label="${escapeAttr(t('label_model'))}">
             <option value="">${escapeHtml(t('model_inherited'))}</option>
@@ -1120,22 +1278,12 @@ function renderConfigTab(body) {
     `)}
 
     ${sectionCard('clock', 'section_loop', `
-      <div class="agents-slider-row">
-        <div>
-          <div class="agents-slider-name">${escapeHtml(t('label_max_iterations'))}</div>
-          <div class="agents-field-hint">${escapeHtml(t('slider_iterations_desc'))}</div>
-        </div>
-        <tf-slider data-cfg-slider="max_iterations" min="1" max="${MAX_ITERATIONS_CAP}" step="1"
-          value="${escapeAttr(String(iterations))}"></tf-slider>
-        <div class="agents-slider-val" data-iterations-val>${escapeHtml(String(iterations))}</div>
-      </div>
+      ${sliderRow('max_iterations', 'label_max_iterations', 'slider_iterations_desc', 1, MAX_ITERATIONS_CAP, iterations)}
+      ${sliderRow('max_subagents', 'label_max_subagents', 'slider_subagents_desc', 0, MAX_SUBAGENTS_CAP, subagents)}
+      ${sliderRow('max_spawn_depth', 'label_max_spawn_depth', 'slider_depth_desc', 1, MAX_SPAWN_DEPTH_CAP, spawnDepth)}
       <div class="agents-editor-grid agents-limits">
         <tf-input data-cfg="timeout_secs" type="number" label="${escapeAttr(t('label_timeout_secs'))}"
           value="${escapeAttr(String(c.timeout_secs ?? 600))}" min="1"></tf-input>
-        <tf-input data-cfg="max_subagents" type="number" label="${escapeAttr(t('label_max_subagents'))}"
-          value="${escapeAttr(String(c.max_subagents ?? 0))}" min="0"></tf-input>
-        <tf-input data-cfg="max_spawn_depth" type="number" label="${escapeAttr(t('label_max_spawn_depth'))}"
-          value="${escapeAttr(String(c.max_spawn_depth ?? 1))}" min="1"></tf-input>
         <div>
           <tf-select data-cfg="on_child_complete" label="${escapeAttr(t('label_on_child_complete'))}">
             <option value="notify" ${c.on_child_complete !== 'continue' ? 'selected' : ''}>${escapeHtml(t('on_child_complete_notify'))}</option>
@@ -1167,6 +1315,8 @@ function renderConfigTab(body) {
     `)}
   `;
 
+  renderSaveBar(body);
+  updateSaveBar();
   wireConfigInputs(body);
   updatePromptCount();
   refreshReasoningOptionsFor(
@@ -1185,8 +1335,8 @@ function wireConfigInputs(body) {
       d.cfg[key] = el.hasAttribute('checked');
     } else if (el.tagName === 'TF-SLIDER') {
       d.cfg[key] = el.value;
-      const val = body.querySelector('[data-iterations-val]');
-      if (val && key === 'max_iterations') val.textContent = String(el.value);
+      const val = body.querySelector(`[data-slider-val="${key}"]`);
+      if (val) val.textContent = String(el.value);
     } else {
       d.cfg[key] = el.value ?? '';
     }
@@ -1236,8 +1386,20 @@ function updatePromptCount() {
   if (!el) return;
   const prompt = state.detail?.cfg.system_prompt || '';
   el.textContent = prompt
-    ? t('prompt_chars', { chars: prompt.length })
+    ? t('prompt_chars', { chars: prompt.length, tokens: estimateTokens(prompt) })
     : t('prompt_empty_hint');
+  const vars = document.querySelector('#ag-detail-body [data-prompt-vars]');
+  if (vars) {
+    const names = [...new Set([...prompt.matchAll(/\{\{\s*([\w.-]+)\s*\}\}/g)].map((m) => m[1]))];
+    vars.innerHTML = names.map((n) => `<span class="ag-prompt-var">{{${escapeHtml(n)}}}</span>`).join(' ');
+  }
+}
+
+// Rough count for the editor's footer — 4 characters per token is the usual
+// English/Polish approximation. It is a budgeting hint, never a billed number
+// (those come from the backend `usage` block).
+function estimateTokens(text) {
+  return Math.max(1, Math.round(text.length / 4));
 }
 
 // =============================================================================
@@ -1276,7 +1438,11 @@ async function renderToolsTab(body) {
     const known = new Set(d.catalog.core.map((tool) => tool.name));
     for (const group of d.catalog.addons) {
       known.add(`${group.addon_id}.*`);
-      for (const tool of group.tools) known.add(tool.name);
+      if (group.instance_id) known.add(`${group.instance_id}.*`);
+      for (const tool of group.tools) {
+        known.add(tool.name);
+        if (tool.alias) known.add(tool.alias);
+      }
     }
     for (const entry of [...d.selectedTools]) {
       if (!known.has(entry)) d.selectedTools.delete(entry);
@@ -1322,14 +1488,44 @@ async function renderToolsTab(body) {
   updateSaveBar();
 }
 
-function toolRowHtml(name, description, checked, disabled, notInstalled) {
+// True when the allowlist holds this tool under either spelling: the catalog
+// names it by PACKAGE (`deep-research.search_web`), while an agent configured
+// before that carries the instance form (`deep-research-043b6b64.search_web`).
+// Both admit the tool at run time, so both must read as selected.
+function toolSelected(sel, tool) {
+  return sel.has(tool.name) || (!!tool.alias && sel.has(tool.alias));
+}
+
+// Selecting writes the package-scoped name; deselecting clears both spellings so
+// a legacy instance-scoped entry cannot silently survive the toggle.
+function setToolSelected(sel, tool, on) {
+  sel.delete(tool.name);
+  if (tool.alias) sel.delete(tool.alias);
+  if (on) sel.add(tool.name);
+}
+
+function toolByName(d, name) {
+  for (const group of d.catalog.addons) {
+    const hit = group.tools.find((t) => t.name === name || t.alias === name);
+    if (hit) return hit;
+  }
+  return d.catalog.core.find((t) => t.name === name) || null;
+}
+
+function toolRowHtml(name, description, checked, disabled) {
   return `
-    <div class="agents-tool-item ${notInstalled ? 'is-not-installed' : ''}">
+    <div class="agents-tool-item">
       <span class="agents-tool-name mono">${escapeHtml(name)}</span>
       <span class="agents-tool-desc" title="${escapeAttr(description || '')}">${escapeHtml(description || '')}</span>
       <tf-toggle data-tool="${escapeAttr(name)}" ${checked ? 'checked' : ''} ${disabled ? 'disabled' : ''}></tf-toggle>
     </div>
   `;
+}
+
+// While a filter is active every surviving group opens: a match hidden inside a
+// collapsed head reads as "nothing found".
+function searchOpen() {
+  return !!state.detail?.toolsSearch;
 }
 
 function groupMatchesSearch(group, search) {
@@ -1344,35 +1540,40 @@ function addonGroupHtml(group, opts = {}) {
   const search = d.toolsSearch;
   if (!groupMatchesSearch(group, search)) return '';
   const wildcard = `${group.addon_id}.*`;
-  const wildcardOn = d.selectedTools.has(wildcard);
+  const instanceWildcard = group.instance_id ? `${group.instance_id}.*` : '';
+  const wildcardOn = d.selectedTools.has(wildcard) || (!!instanceWildcard && d.selectedTools.has(instanceWildcard));
   const { title, subtitle } = addonGroupLabel(group);
   const visibleTools = search
     ? group.tools.filter((tool) => `${tool.name} ${tool.description || ''}`.toLowerCase().includes(search))
     : group.tools;
   const headBadges = opts.notInstalled
     ? `<span class="ag-install-hint">${sprite('alert')} ${escapeHtml(t('tools_requires_install'))}</span>`
-    : `<tf-chip status="accent">${escapeHtml(t('tools_group_instance'))}</tf-chip>`;
-  const anySelected = wildcardOn || group.tools.some((tool) => d.selectedTools.has(tool.name));
+    : `<tf-chip status="ok" dot>${escapeHtml(t('tools_group_instance'))}</tf-chip>`;
+  const hasSelection = wildcardOn || group.tools.some((tool) => toolSelected(d.selectedTools, tool));
   return `
-    <div class="agents-tool-group ${opts.notInstalled ? 'is-not-installed' : ''} ${anySelected ? 'is-selected' : ''}" data-group="${escapeAttr(group.addon_id)}">
+    <div class="agents-tool-group ${opts.notInstalled ? 'is-not-installed' : ''} ${hasSelection ? 'is-selected' : ''} ${hasSelection || searchOpen() ? 'is-open' : ''}" data-group="${escapeAttr(group.addon_id)}">
       <div class="agents-tool-group-head" data-group-head role="button" tabindex="0">
+        <span class="agents-tool-group-ico">${sprite(opts.icon || 'puzzle')}</span>
         <div class="agents-tool-group-meta">
           <div class="agents-tool-group-title">
-            <span class="agents-tool-group-ico">${sprite(opts.icon || 'puzzle')}</span>
             ${escapeHtml(title)}
             ${headBadges}
           </div>
           <span class="agents-tool-group-id mono">${escapeHtml(opts.subline || group.addon_id)}</span>
-          <span class="agents-tool-group-sub" title="${escapeAttr(subtitle)}">${escapeHtml(subtitle)}</span>
+          ${subtitle ? `<span class="agents-tool-group-sub" title="${escapeAttr(subtitle)}">${escapeHtml(subtitle)}</span>` : ''}
         </div>
-        ${opts.notInstalled
-          ? `<tf-button variant="secondary" size="sm" icon="download" data-install-package="${escapeAttr(group.addon_id)}">${escapeHtml(t('tools_install_cta'))}</tf-button>`
-          : `<tf-toggle data-group-toggle="${escapeAttr(wildcard)}" title="${escapeAttr(t('tool_wildcard_hint'))}" ${wildcardOn ? 'checked' : ''}></tf-toggle>`}
+        <tf-toggle data-group-toggle="${escapeAttr(wildcard)}" data-group-toggle-alias="${escapeAttr(instanceWildcard)}" title="${escapeAttr(opts.notInstalled ? t('tools_install_toggle_hint') : t('tool_wildcard_hint'))}" ${wildcardOn ? 'checked' : ''} ${opts.notInstalled ? 'disabled' : ''}></tf-toggle>
         <span class="agents-tool-chev">${sprite('chevron-down')}</span>
       </div>
-      <div class="agents-tool-group-body" hidden>
-        ${visibleTools.map((tool) => toolRowHtml(tool.name, tool.description, d.selectedTools.has(tool.name), wildcardOn, !!opts.notInstalled)).join('')}
+      <div class="agents-tool-group-body" ${hasSelection || searchOpen() ? '' : 'hidden'}>
+        ${visibleTools.map((tool) => toolRowHtml(tool.name, tool.description, toolSelected(d.selectedTools, tool), wildcardOn || !!opts.notInstalled)).join('')}
       </div>
+      ${opts.notInstalled ? `
+        <div class="agents-tool-group-foot">
+          <span>${escapeHtml(t('tools_install_footer'))}</span>
+          <tf-button variant="secondary" size="sm" icon="download" data-install-package="${escapeAttr(group.addon_id)}">${escapeHtml(t('tools_install_cta'))}</tf-button>
+        </div>
+      ` : ''}
     </div>
   `;
 }
@@ -1384,7 +1585,7 @@ function renderAddonGroups() {
   const installed = d.catalog.addons.filter((g) => g.installed !== false);
   host.innerHTML = installed.map((group) => addonGroupHtml(group, {
     icon: 'puzzle',
-    subline: group.addon_id,
+    subline: [group.instance_id || group.addon_id, packageLine(group)].filter(Boolean).join(' · '),
   })).join('') || `<div class="agents-tree-empty">${escapeHtml(t('tools_addons_none_installed'))}</div>`;
   wireGroupToggles(host);
   wireInstallButtons(host);
@@ -1398,7 +1599,7 @@ function renderPackageGroups() {
   host.innerHTML = packages.map((group) => addonGroupHtml(group, {
     icon: 'layers',
     notInstalled: true,
-    subline: t('tools_package_line', { id: group.addon_id }),
+    subline: packageLine(group),
   })).join('') || `<div class="agents-tree-empty">${escapeHtml(t('tools_packages_all_installed'))}</div>`;
   wireGroupToggles(host, { readOnly: true });
   wireInstallButtons(host);
@@ -1423,44 +1624,41 @@ function renderCoreGroups() {
       }
     }
     if (!tools.length) return '';
-    const anySelected = tools.some((tool) => d.selectedTools.has(tool.name));
+    const hasSelection = tools.some((tool) => toolSelected(d.selectedTools, tool));
     const visibleTools = d.toolsSearch
       ? tools.filter((tool) => `${tool.name} ${tool.description || ''}`.toLowerCase().includes(d.toolsSearch))
       : tools;
     if (!visibleTools.length) return '';
     return `
-      <div class="agents-tool-group ${anySelected ? 'is-selected' : ''}" data-core-group="${escapeAttr(g.id)}">
+      <div class="agents-tool-group ${hasSelection ? 'is-selected' : ''} ${hasSelection || searchOpen() ? 'is-open' : ''}" data-core-group="${escapeAttr(g.id)}">
         <div class="agents-tool-group-head" data-group-head role="button" tabindex="0">
+          <span class="agents-tool-group-ico">${sprite(g.icon)}</span>
           <div class="agents-tool-group-meta">
-            <div class="agents-tool-group-title">
-              <span class="agents-tool-group-ico">${sprite(g.icon)}</span>
-              ${escapeHtml(t(g.titleKey))}
-            </div>
+            <div class="agents-tool-group-title">${escapeHtml(t(g.titleKey))}</div>
             <span class="agents-tool-group-sub">${escapeHtml(t(g.subKey))}</span>
           </div>
           <span class="agents-tool-chev">${sprite('chevron-down')}</span>
         </div>
-        <div class="agents-tool-group-body">
-          ${visibleTools.map((tool) => toolRowHtml(tool.name, tool.description, d.selectedTools.has(tool.name), false, false)).join('')}
+        <div class="agents-tool-group-body" ${hasSelection || searchOpen() ? '' : 'hidden'}>
+          ${visibleTools.map((tool) => toolRowHtml(tool.name, tool.description, toolSelected(d.selectedTools, tool), false)).join('')}
         </div>
       </div>
     `;
   }).join('');
   const otherTools = d.catalog.core.filter((tool) => !groupedIds.has(tool.name));
   if (otherTools.length && (!d.toolsSearch || otherTools.some((tool) => `${tool.name} ${tool.description || ''}`.toLowerCase().includes(d.toolsSearch)))) {
+    const otherSelection = otherTools.some((tool) => toolSelected(d.selectedTools, tool));
     html += `
-      <div class="agents-tool-group" data-core-group="other">
+      <div class="agents-tool-group ${otherSelection ? 'is-selected' : ''} ${otherSelection || searchOpen() ? 'is-open' : ''}" data-core-group="other">
         <div class="agents-tool-group-head" data-group-head role="button" tabindex="0">
+          <span class="agents-tool-group-ico">${sprite('settings')}</span>
           <div class="agents-tool-group-meta">
-            <div class="agents-tool-group-title">
-              <span class="agents-tool-group-ico">${sprite('settings')}</span>
-              ${escapeHtml(t('tools_core_other'))}
-            </div>
+            <div class="agents-tool-group-title">${escapeHtml(t('tools_core_other'))}</div>
           </div>
           <span class="agents-tool-chev">${sprite('chevron-down')}</span>
         </div>
-        <div class="agents-tool-group-body">
-          ${otherTools.filter((tool) => !d.toolsSearch || `${tool.name} ${tool.description || ''}`.toLowerCase().includes(d.toolsSearch)).map((tool) => toolRowHtml(tool.name, tool.description, d.selectedTools.has(tool.name), false, false)).join('')}
+        <div class="agents-tool-group-body" ${otherSelection || searchOpen() ? '' : 'hidden'}>
+          ${otherTools.filter((tool) => !d.toolsSearch || `${tool.name} ${tool.description || ''}`.toLowerCase().includes(d.toolsSearch)).map((tool) => toolRowHtml(tool.name, tool.description, toolSelected(d.selectedTools, tool), false)).join('')}
         </div>
       </div>
     `;
@@ -1497,8 +1695,10 @@ function wireGroupToggles(host, { readOnly = false } = {}) {
     if (groupToggle) {
       const wildcard = groupToggle.dataset.groupToggle;
       const checked = e.detail?.checked ?? groupToggle.hasAttribute('checked');
+      const instanceWildcard = groupToggle.dataset.groupToggleAlias;
+      d.selectedTools.delete(wildcard);
+      if (instanceWildcard) d.selectedTools.delete(instanceWildcard);
       if (checked) d.selectedTools.add(wildcard);
-      else d.selectedTools.delete(wildcard);
       // A wildcard covers the whole addon — individual rows lock while it is on.
       const group = groupToggle.closest('.agents-tool-group');
       group?.querySelectorAll('tf-toggle[data-tool]').forEach((tg) => {
@@ -1515,8 +1715,7 @@ function wireGroupToggles(host, { readOnly = false } = {}) {
     if (toolToggle.closest('.is-not-installed')) return;
     const name = toolToggle.dataset.tool;
     const checked = e.detail?.checked ?? toolToggle.hasAttribute('checked');
-    if (checked) d.selectedTools.add(name);
-    else d.selectedTools.delete(name);
+    setToolSelected(d.selectedTools, toolByName(d, name) ?? { name, alias: '' }, checked);
     markDirty();
     updateToolsSummary();
     updateDetailTabCounts();
@@ -1527,7 +1726,7 @@ function wireInstallButtons(host) {
   host?.querySelectorAll('[data-install-package]').forEach((btn) => {
     btn.addEventListener('click', (e) => {
       e.stopPropagation();
-      window.Router?.navigate('addons', { installPackage: btn.dataset.installPackage });
+      window.Router?.navigate('addons');
     });
   });
 }
@@ -1539,14 +1738,22 @@ function updateToolsSummary() {
   const wildcards = [...d.selectedTools].filter((entry) => entry.endsWith('.*'));
   const exactAddon = [...d.selectedTools].filter((entry) => !entry.startsWith('core.') && !entry.endsWith('.*'));
   const coreCount = [...d.selectedTools].filter((entry) => entry.startsWith('core.')).length;
+  // A03 names the picks after the counts: the wildcards first (they cover a whole
+  // addon), then the exact tools, capped so a 20-tool agent keeps one line.
+  const named = [...wildcards, ...exactAddon, ...[...d.selectedTools].filter((e) => e.startsWith('core.'))];
+  const shown = named.slice(0, TOOLS_SUMMARY_CHIPS);
+  const rest = named.length - shown.length;
   host.innerHTML = `
     ${sprite('bolt')}
     ${escapeHtml(t('tools_summary_selected', {
-      selected: exactAddon.length + coreCount,
-      addon: exactAddon.length,
+      selected: selectedToolCount(d),
+      addon: exactAddon.length + wildcards.length,
       core: coreCount,
     }))}
-    ${wildcards.map((w) => `<tf-chip status="accent" class="mono">${escapeHtml(w)}</tf-chip>`).join('')}
+    ${shown.map((name) => name.endsWith('.*')
+      ? `<tf-chip status="accent" class="mono">${escapeHtml(name)}</tf-chip>`
+      : `<tf-chip status="neutral" class="mono">${escapeHtml(name)}</tf-chip>`).join('')}
+    ${rest > 0 ? `<tf-chip status="neutral" class="mono">${escapeHtml(t('tools_summary_more', { count: rest }))}</tf-chip>` : ''}
   `;
 }
 
@@ -1593,7 +1800,6 @@ function renderSkillsPanel() {
           </label>
         `).join('')}
       ` : ''}
-    </section>
   `;
 
   host.addEventListener('change', (e) => {
@@ -1611,10 +1817,16 @@ function renderSkillsPanel() {
   });
 }
 
+// "pakiet <id> v<version>" — the version is dropped when the catalog has none.
+function packageLine(group) {
+  return group.version
+    ? t('tools_package_line_version', { id: group.addon_id, version: group.version })
+    : t('tools_package_line', { id: group.addon_id });
+}
+
 function addonGroupLabel(group) {
   const title = String(group.display_name ?? '').trim() || group.addon_id;
-  const subtitle = String(group.description ?? '').trim() || t('tools_group_no_description');
-  return { title, subtitle };
+  return { title, subtitle: String(group.description ?? '').trim() };
 }
 
 // =============================================================================
@@ -1626,9 +1838,6 @@ function renderTestTab(body) {
   if (!d || !body) return;
 
   body.innerHTML = `
-    <div class="agents-pg-banner ag-test-banner">
-      ${sprite('info')} <span>${escapeHtml(t('pg_banner'))}</span>
-    </div>
     <div class="ag-test-cols">
       <section class="card agents-pg-chat">
         <div class="agents-pg-panel-head">
@@ -1637,15 +1846,25 @@ function renderTestTab(body) {
           <tf-button variant="ghost" size="sm" icon="refresh" data-pg-new-session>${escapeHtml(t('pg_new_session'))}</tf-button>
         </div>
         <div class="agents-pg-msgs" data-pg-msgs></div>
-        <tf-chat-composer placeholder="${escapeAttr(t('pg_placeholder'))}"></tf-chat-composer>
+        <div class="agents-pg-composer">
+          <tf-chat-composer placeholder="${escapeAttr(t('pg_placeholder'))}"></tf-chat-composer>
+          <tf-button variant="danger" icon="stop" data-pg-stop hidden>${escapeHtml(t('pg_stop'))}</tf-button>
+        </div>
       </section>
       <div class="ag-test-side">
-        <div data-pg-widget></div>
+        <div class="ag-test-widget" data-pg-widget hidden></div>
         <section class="card agents-pg-run">
           <div class="agents-pg-panel-head">
-            <span class="agents-pg-panel-title">${sprite('clock')} ${escapeHtml(t('pg_run_title'))}</span>
+            <span class="agents-pg-panel-title">${sprite('clock')} <span data-pg-run-title>${escapeHtml(t('pg_run_title'))}</span></span>
+            <span data-pg-run-status></span>
           </div>
           <div class="agents-pg-timeline" data-pg-timeline></div>
+        </section>
+        <section class="card agents-pg-stats">
+          <div class="agents-pg-panel-head">
+            <span class="agents-pg-panel-title">${sprite('sparkle')} ${escapeHtml(t('pg_stats_title'))}</span>
+          </div>
+          <div class="agents-kv" data-pg-stats></div>
         </section>
       </div>
     </div>
@@ -1660,6 +1879,7 @@ function renderTestTab(body) {
       unsub: null,
       runId: null,
       busy: false,
+      stats: emptyPgStats(),
     };
   }
 
@@ -1699,6 +1919,7 @@ function renderTestTab(body) {
   state.pg.widget = widget;
 
   body.querySelector('[data-pg-new-session]')?.addEventListener('click', () => resetPlaygroundSession());
+  body.querySelector('[data-pg-stop]')?.addEventListener('click', () => cancelPlaygroundRun());
   body.querySelector('tf-chat-composer')?.addEventListener('send', (e) => {
     const text = String(e.detail?.text ?? '').trim();
     if (text) startPlaygroundRun(text);
@@ -1706,6 +1927,11 @@ function renderTestTab(body) {
 
   renderPlaygroundMessages();
   renderPlaygroundTimeline();
+  renderPlaygroundStats();
+}
+
+function emptyPgStats() {
+  return { iteration: 0, maxIterations: null, tokens: 0, toolCalls: 0, startedMs: null, endedMs: null };
 }
 
 function nowTime() {
@@ -1732,6 +1958,17 @@ function renderPlaygroundMessages() {
     if (pg.busy) composer.setAttribute('disabled', '');
     else composer.removeAttribute('disabled');
   }
+  document.querySelector('#ag-detail-body [data-pg-stop]')?.toggleAttribute('hidden', !pg.busy);
+}
+
+async function cancelPlaygroundRun() {
+  const pg = state.pg;
+  if (!pg?.runId || !pg.busy) return;
+  try {
+    await ApiBinary.action('agentRunCancelRequest', { runId: pg.runId });
+  } catch (err) {
+    toast(`${t('run_cancel_failed')}: ${err.message}`, 'error');
+  }
 }
 
 function renderPlaygroundTimeline() {
@@ -1740,6 +1977,36 @@ function renderPlaygroundTimeline() {
   if (!pg || !host) return;
   host.innerHTML = TfAgentActivity.renderTimeline(pg.steps, activityLabels());
   host.scrollTop = host.scrollHeight;
+  const title = document.querySelector('#ag-detail-body [data-pg-run-title]');
+  if (title) {
+    title.textContent = pg.runId ? t('pg_run_title_id', { id: shortId(pg.runId) }) : t('pg_run_title');
+  }
+  const widgetHost = document.querySelector('#ag-detail-body [data-pg-widget]');
+  if (widgetHost) widgetHost.hidden = !pg.runId;
+  const status = document.querySelector('#ag-detail-body [data-pg-run-status]');
+  if (status) {
+    status.innerHTML = pg.runId
+      ? `<tf-chip status="${pg.busy ? 'accent' : 'ok'}"${pg.busy ? ' dot' : ''}>${escapeHtml(pg.busy ? t('run_status_running') : t('run_status_completed'))}</tf-chip>`
+      : '';
+  }
+}
+
+function renderPlaygroundStats() {
+  const pg = state.pg;
+  const host = document.querySelector('#ag-detail-body [data-pg-stats]');
+  if (!pg || !host) return;
+  const st = pg.stats;
+  const cap = st.maxIterations ?? state.detail?.agent?.max_iterations ?? null;
+  const elapsed = st.startedMs ? Math.round(((st.endedMs ?? Date.now()) - st.startedMs) / 1000) : null;
+  const rows = [
+    [t('pg_stat_iterations'), cap ? `${st.iteration} / ${cap}` : String(st.iteration)],
+    [t('pg_stat_tokens'), st.tokens ? st.tokens.toLocaleString(I18n.getLanguage()) : '—'],
+    [t('pg_stat_tool_calls'), String(st.toolCalls)],
+    [t('pg_stat_elapsed'), elapsed == null ? '—' : (elapsed < 60 ? `${elapsed} s` : `${Math.floor(elapsed / 60)} min ${String(elapsed % 60).padStart(2, '0')} s`)],
+  ];
+  host.innerHTML = rows
+    .map(([k, v]) => `<span class="k">${escapeHtml(k)}</span><span class="v mono">${escapeHtml(v)}</span>`)
+    .join('');
 }
 
 async function startPlaygroundRun(prompt) {
@@ -1748,8 +2015,11 @@ async function startPlaygroundRun(prompt) {
   pg.messages.push({ role: 'user', content: prompt, time: nowTime() });
   pg.busy = true;
   pg.steps = [];
+  pg.stats = emptyPgStats();
+  pg.stats.startedMs = Date.now();
   renderPlaygroundMessages();
   renderPlaygroundTimeline();
+  renderPlaygroundStats();
 
   let runId = null;
   try {
@@ -1786,10 +2056,12 @@ async function startPlaygroundRun(prompt) {
           if (!body || body.variant !== 'AgentRunEvent') return;
           if (state.pg !== pg || pg.runId !== runId) return;
           pg.widget?.applyEvent(body);
+          applyPlaygroundStatsEvent(pg, body);
           const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
           step.ts = new Date().toLocaleTimeString();
           pg.steps.push(step);
           renderPlaygroundTimeline();
+          renderPlaygroundStats();
           const eventRunId = body.run_id || body.runId;
           if (body.kind === 'child_finished' && eventRunId === runId) {
             finishPlaygroundRun(pg, runId);
@@ -1861,8 +2133,26 @@ async function finishPlaygroundRun(pg, runId) {
   }
   const content = run?.result
     || (run?.exit_reason ? `${runStatusLabel(run.status)} · ${run.exit_reason}` : t('pg_no_result'));
+  pg.stats.endedMs = Date.now();
+  if (run) {
+    pg.stats.iteration = run.iterations ?? pg.stats.iteration;
+    pg.stats.tokens = run.total_tokens ?? pg.stats.tokens;
+  }
   pg.messages.push({ role: 'assistant', content, time: nowTime() });
   renderPlaygroundMessages();
+  renderPlaygroundTimeline();
+  renderPlaygroundStats();
+}
+
+// The event stream is the only live source of iteration/tool counters; the
+// totals in `agent_runs` land only when the run is over.
+function applyPlaygroundStatsEvent(pg, ev) {
+  if (ev.kind === 'iteration_started') {
+    pg.stats.iteration = ev.n ?? pg.stats.iteration;
+    if (ev.max) pg.stats.maxIterations = ev.max;
+  } else if (ev.kind === 'tool_call_started') {
+    pg.stats.toolCalls += 1;
+  }
 }
 
 async function resetPlaygroundSession() {
@@ -1879,9 +2169,11 @@ async function resetPlaygroundSession() {
   pg.busy = false;
   pg.runId = null;
   pg.steps = [];
+  pg.stats = emptyPgStats();
   pg.messages = [{ role: 'assistant', content: t('pg_greeting'), time: nowTime() }];
   renderPlaygroundMessages();
   renderPlaygroundTimeline();
+  renderPlaygroundStats();
 }
 
 function teardownPg() {
@@ -1899,19 +2191,23 @@ async function renderAgentRunsTab(body) {
   const d = state.detail;
   if (!d || !body) return;
   body.innerHTML = `
-    <section class="card agents-card">
-      <div class="agents-toolbar">
-        <tf-select id="agent-runs-filter-status" class="agents-filter" value="${escapeAttr(d.agentRunsFilter)}">
-          <option value="all">${escapeHtml(t('runs_filter_status_all'))}</option>
-          <option value="active">${escapeHtml(t('runs_filter_status_active'))}</option>
-          <option value="completed">${escapeHtml(t('run_status_completed'))}</option>
-          <option value="failed">${escapeHtml(t('run_status_failed'))}</option>
-        </tf-select>
-        <tf-button variant="ghost" icon="refresh" id="agent-runs-refresh">${escapeHtml(t('refresh'))}</tf-button>
-      </div>
-      <div id="agent-runs-table-host" class="agents-runs-host"></div>
-      <div id="agent-runs-detail-host" class="agents-run-detail"></div>
-    </section>
+    <div class="tf-toolbar agents-runs-toolbar">
+      <tf-select id="agent-runs-filter-status" value="${escapeAttr(d.agentRunsFilter)}">
+        <option value="all">${escapeHtml(t('runs_filter_status_all'))}</option>
+        <option value="active">${escapeHtml(t('runs_filter_status_active'))}</option>
+        <option value="completed">${escapeHtml(t('run_status_completed'))}</option>
+        <option value="failed">${escapeHtml(t('run_status_failed'))}</option>
+      </tf-select>
+      <tf-select id="agent-runs-filter-period" value="${escapeAttr(String(d.agentRunsPeriodDays))}">
+        ${RUN_PERIODS.map((p) => `<option value="${escapeAttr(String(p.days))}">${escapeHtml(t(p.key))}</option>`).join('')}
+      </tf-select>
+      <tf-searchbox id="agent-runs-search" placeholder="${escapeAttr(t('runs_search_placeholder'))}" debounce="200"></tf-searchbox>
+      <span class="tf-toolbar-spacer"></span>
+      <tf-button variant="ghost" icon="refresh" id="agent-runs-refresh">${escapeHtml(t('refresh'))}</tf-button>
+    </div>
+    <div id="agent-runs-table-host" class="agents-runs-host"></div>
+    <div id="agent-runs-table-footer" class="agents-table-footer"></div>
+    <div id="agent-runs-detail-host" class="agents-run-detail"></div>
   `;
   body.querySelector('#agent-runs-refresh')?.addEventListener('click', () => loadAgentRuns());
   body.querySelector('#agent-runs-filter-status')?.addEventListener('change', (e) => {
@@ -1920,7 +2216,26 @@ async function renderAgentRunsTab(body) {
     dd.agentRunsFilter = e.detail?.value ?? e.target.value ?? 'all';
     renderAgentRunsTable();
   });
-  await loadAgentRuns();
+  body.querySelector('#agent-runs-filter-period')?.addEventListener('change', (e) => {
+    const dd = state.detail;
+    if (!dd) return;
+    dd.agentRunsPeriodDays = Number(e.detail?.value ?? e.target.value ?? 30);
+    renderAgentRunsTable();
+  });
+  body.querySelector('#agent-runs-search')?.addEventListener('search', (e) => {
+    const dd = state.detail;
+    if (!dd) return;
+    dd.agentRunsQuery = String(e.detail?.value ?? '').toLowerCase();
+    renderAgentRunsTable();
+  });
+  if (d.runsLoaded) renderAgentRunsTable();
+  else await loadAgentRuns();
+}
+
+async function fetchAgentRuns(agentId) {
+  const resp = await ApiBinary.one('agentRunsListRequest', { agentId });
+  const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
+  return Array.isArray(rows) ? rows : [];
 }
 
 async function loadAgentRuns() {
@@ -1928,28 +2243,29 @@ async function loadAgentRuns() {
   const host = byId('agent-runs-table-host');
   if (!d || !host) return;
   host.innerHTML = `<div class="agents-tree-empty">${escapeHtml(t('runs_loading'))}</div>`;
+  let rows;
   try {
-    const resp = await ApiBinary.one('agentRunsListRequest', { agentId: d.agentId });
-    const rows = JSON.parse(resp.runsJson ?? resp.runs_json ?? '[]');
-    d.agentRuns = Array.isArray(rows) ? rows : [];
+    rows = await fetchAgentRuns(d.agentId);
   } catch (err) {
     if (state.detail === d && byId('agent-runs-table-host')) {
       host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${t('runs_failed')}: ${err.message}`)}</div>`;
     }
     return;
   }
+  if (state.detail !== d) return;
+  d.agentRuns = rows;
   d.runsLoaded = true;
+  updateDetailTabCounts();
   renderAgentRunsTable();
 }
 
 function filteredAgentRuns() {
   const d = state.detail;
   if (!d) return [];
-  const f = d.agentRunsFilter;
-  return d.agentRuns.filter((r) => {
-    if (f === 'all') return true;
-    if (f === 'active') return !TERMINAL_RUN_STATUSES.includes(r.status);
-    return r.status === f;
+  return applyRunFilters(d.agentRuns, {
+    status: d.agentRunsFilter,
+    days: d.agentRunsPeriodDays,
+    query: d.agentRunsQuery,
   });
 }
 
@@ -1958,28 +2274,35 @@ function renderAgentRunsTable() {
   const host = byId('agent-runs-table-host');
   if (!d || !host) return;
   const runs = filteredAgentRuns();
+  renderTableFooter('agent-runs-table-footer', runs.length, d.agentRuns.length);
   if (!runs.length) {
     host.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(t('runs_empty'))}"></tf-empty-state>`;
     return;
   }
   host.innerHTML = `
     <tf-table id="agent-runs-table" sortable>
+      <tf-column key="run" label="${escapeAttr(t('runs_col_id'))}"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
-      <tf-column key="iterations" label="${escapeAttr(t('runs_col_iterations'))}" renderer="num" sortable></tf-column>
+      <tf-column key="started" label="${escapeAttr(t('runs_col_started'))}" sortable></tf-column>
+      <tf-column key="duration" label="${escapeAttr(t('runs_col_duration'))}"></tf-column>
+      <tf-column key="iterations" label="${escapeAttr(t('runs_col_iterations'))}" sortable></tf-column>
       <tf-column key="tokens" label="${escapeAttr(t('runs_col_tokens'))}" renderer="num" sortable></tf-column>
-      <tf-column key="exit_reason" label="${escapeAttr(t('runs_col_exit'))}"></tf-column>
-      <tf-column key="created" label="${escapeAttr(t('runs_col_created'))}" sortable></tf-column>
+      <tf-column key="prompt" label="${escapeAttr(t('runs_col_prompt'))}" renderer="html" fill></tf-column>
+      <tf-column key="initiator" label="${escapeAttr(t('runs_col_initiator'))}"></tf-column>
     </tf-table>
   `;
   const table = host.querySelector('#agent-runs-table');
   table.rows = runs.map((r) => ({
     _id: r.id,
     _status: r.status,
+    run: shortId(r.id),
     status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
-    iterations: r.iterations ?? 0,
+    started: formatTimestamp(r.started_at || r.created_at),
+    duration: runDuration(r),
+    iterations: iterationsLabel(r),
     tokens: r.total_tokens ?? 0,
-    exit_reason: r.exit_reason || '—',
-    created: formatTimestamp(r.created_at),
+    prompt: runPromptCell(r),
+    initiator: runInitiator(r),
   }));
   table.rowActions = (row) => buildRunRowActions(row, 'agent');
   table.addEventListener('row-click', (e) => {
@@ -2050,12 +2373,17 @@ async function openRunDetail(runId, hostId = 'runs-detail-host', scope = 'global
       toast(t('run_copy_ok'), 'success');
     } catch { /* clipboard denied — nothing to recover */ }
   });
+  host.querySelector('[data-run-export]')?.addEventListener('click', () => exportRunLog(run));
   host.querySelector('[data-run-rerun]')?.addEventListener('click', async () => {
     if (!run.prompt) return;
     if (scope === 'agent' && d) {
       await switchDetailTab('test');
     } else {
+      // From the cross-agent view there is no open agent: land on the one this
+      // run belongs to, otherwise the prompt would go nowhere (or, worse, to
+      // whichever agent happened to be open).
       switchTopTab('agents');
+      await openDetail(run.agent_id, 'test');
     }
     // Give the test tab one tick to build its composer before starting.
     setTimeout(() => startPlaygroundRun(String(run.prompt)), 50);
@@ -2123,33 +2451,116 @@ function runLogToSteps(run) {
   }));
 }
 
+// A05: a titled head, then a two-column grid — a key/value summary card beside
+// the replayed event timeline. The action row lives inside the summary card.
 function renderRunDetail(run) {
   const d = state.detail;
   const inAgentTab = !!(d && byId('agent-runs-detail-host'));
   const stepsMap = inAgentTab ? d.agentRunSteps : state.runSteps;
   const steps = stepsMap.get(run.id) || [];
-  const actions = `
-    <div class="agents-run-meta">
-      <tf-button variant="ghost" size="sm" icon="copy" data-run-copy-id>${escapeHtml(t('run_copy_id'))}</tf-button>
-      ${run.prompt ? `<tf-button variant="ghost" size="sm" icon="play" data-run-rerun>${escapeHtml(t('run_rerun'))}</tf-button>` : ''}
-    </div>`;
-  const meta = `
-    <div class="agents-run-meta">
-      <tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}">${escapeHtml(runStatusLabel(run.status))}</tf-chip>
-      <span>${escapeHtml(t('runs_col_iterations'))}: ${escapeHtml(String(run.iterations ?? 0))}</span>
-      <span>${escapeHtml(t('runs_col_tokens'))}: ${escapeHtml(String(run.total_tokens ?? 0))}</span>
-      ${run.exit_reason ? `<span>${escapeHtml(t('runs_col_exit'))}: ${escapeHtml(run.exit_reason)}</span>` : ''}
-    </div>`;
-  const prompt = run.prompt
-    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(t('run_prompt'))}</span><pre>${escapeHtml(run.prompt)}</pre></div>`
-    : '';
-  const result = run.result
-    ? `<div class="agents-run-block"><span class="tf-label">${escapeHtml(t('run_result'))}</span><pre>${escapeHtml(run.result)}</pre></div>`
-    : '';
-  const timeline = `<div data-run-timeline>${TfAgentActivity.renderTimeline(steps, activityLabels())}</div>`;
-  // Buttons are wired by openRunDetail right after this markup hits the DOM.
-  return `${meta}${actions}${prompt}${result}
-    <div class="agents-run-block"><span class="tf-label">${escapeHtml(t('run_timeline'))}</span>${timeline}</div>`;
+  const agent = agentLabel(run.agent_id);
+  const subRuns = (inAgentTab ? d.agentRuns : state.runs).filter((r) => r.parent_run_id === run.id);
+
+  const kv = [
+    [t('runs_col_status'), `<tf-chip status="${RUN_STATUS_CHIP[run.status] || 'info'}">${escapeHtml(runStatusLabel(run.status))}</tf-chip>`],
+    [t('runs_col_agent'), escapeHtml(agent.title)],
+    [t('runs_col_exit'), run.exit_reason ? `<span class="mono">${escapeHtml(run.exit_reason)}</span>` : '—'],
+    [t('run_prompt'), run.prompt ? escapeHtml(run.prompt) : '—'],
+    [t('run_result'), run.result ? escapeHtml(run.result) : '—'],
+    [t('runs_col_initiator'), escapeHtml(runInitiator(run))],
+    [t('run_span'), `<span class="mono">${escapeHtml(runSpan(run))}</span>`],
+    [t('runs_col_iterations'), `<span class="mono">${escapeHtml(iterationsLabel(run))}</span>`],
+    [t('runs_col_tokens'), `<span class="mono">${escapeHtml(String(run.total_tokens ?? 0))}</span>`],
+    [t('run_subruns'), subRuns.length
+      ? subRuns.map((r) => `${escapeHtml(shortId(r.id))} — ${escapeHtml(runStatusLabel(r.status))}`).join('<br>')
+      : '—'],
+  ];
+
+  return `
+    <div class="agents-run-detail-head">
+      <div class="title">${sprite('clock')} ${escapeHtml(t('run_detail_title', { id: shortId(run.id), status: runStatusLabel(run.status) }))}</div>
+      <div class="hint">${escapeHtml(runDetailHint(run, subRuns.length))}</div>
+    </div>
+    <div class="agents-run-detail-grid">
+      <section class="card agents-pg-run">
+        <div class="agents-pg-panel-head">
+          <span class="agents-pg-panel-title">${sprite('check-circle')} ${escapeHtml(t('run_summary'))}</span>
+        </div>
+        <div class="agents-kv">
+          ${kv.map(([k, v]) => `<span class="k">${escapeHtml(k)}</span><span class="v">${v}</span>`).join('')}
+        </div>
+        <div class="agents-run-actions">
+          <tf-button variant="ghost" size="sm" icon="copy" data-run-copy-id>${escapeHtml(t('run_copy_id'))}</tf-button>
+          <tf-button variant="ghost" size="sm" icon="download" data-run-export>${escapeHtml(t('run_export_log'))}</tf-button>
+          ${run.prompt ? `<tf-button variant="ghost" size="sm" icon="play" data-run-rerun>${escapeHtml(t('run_rerun'))}</tf-button>` : ''}
+        </div>
+      </section>
+      <section class="card agents-pg-run">
+        <div class="agents-pg-panel-head">
+          <span class="agents-pg-panel-title">${sprite('clock')} ${escapeHtml(t('run_timeline'))}</span>
+        </div>
+        <div class="agents-pg-timeline" data-run-timeline>${TfAgentActivity.renderTimeline(steps, activityLabels())}</div>
+      </section>
+    </div>
+  `;
+}
+
+// What identifies a run to a human. A failed run often has no prompt worth
+// reading on its own, so its exit reason stands in rather than an empty cell.
+function runPromptText(run) {
+  const excerpt = String(run.prompt_excerpt ?? '').trim();
+  return excerpt || String(run.exit_reason ?? '') || '';
+}
+
+// Table form of the same text, clamped to one line: a failed run's reason is a
+// whole error chain and would otherwise grow every row to three lines.
+function runPromptCell(run) {
+  const text = runPromptText(run) || '—';
+  return `<div class="tf-table__cell-clamp" title="${escapeAttr(text)}">${escapeHtml(text)}</div>`;
+}
+
+// An unattended run (schedule, mesh) carries no principal — that absence is the
+// information, so it gets its own label instead of an empty cell.
+function runInitiator(run) {
+  if (!run.user_id) return t('run_initiator_unattended');
+  const named = state.userNames.get(run.user_id);
+  if (named) return named;
+  return run.user_id === state.myUserId ? t('run_initiator_me') : t('run_initiator_unknown');
+}
+
+// The IAM roster is Admin-only; for everyone else the map stays empty and
+// `runInitiator` falls back — the list only returns their own runs anyway.
+async function loadUserNames() {
+  if (!state.isAdmin || state.userNames.size) return;
+  try {
+    const resp = await ApiBinary.action('iamListUsersRequest');
+    for (const u of resp?.users ?? []) {
+      const label = u.display_name || u.displayName || u.full_name || u.username || u.email;
+      if (u.id && label) state.userNames.set(u.id, label);
+    }
+  } catch { /* roster unavailable — the fallback labels stay */ }
+}
+
+function runSpan(run) {
+  const start = sqliteTime(run.started_at || run.created_at);
+  const end = sqliteTime(run.finished_at);
+  if (start == null) return '—';
+  const fmt = (ms) => new Date(ms).toLocaleTimeString(I18n.getLanguage());
+  if (end == null) return `${fmt(start)} → …`;
+  return `${fmt(start)} → ${fmt(end)} (${runDuration(run)})`;
+}
+
+function iterationsLabel(run) {
+  const cap = state.detail?.agent?.max_iterations;
+  const n = run.iterations ?? 0;
+  return cap ? `${n} / ${cap}` : String(n);
+}
+
+function runDetailHint(run, subRunCount) {
+  const parts = [];
+  if (run.flow_execution_id != null) parts.push(t('run_flow_execution', { id: run.flow_execution_id }));
+  parts.push(t('run_subruns_count', { count: subRunCount }));
+  return parts.join(' · ');
 }
 
 
@@ -2168,6 +2579,13 @@ function switchTopTab(tabId) {
   document.querySelectorAll('[data-top-panel]').forEach((panel) => {
     panel.hidden = panel.getAttribute('data-top-panel') !== state.topTab;
   });
+  const runsTab = state.topTab === 'runs';
+  const title = byId('agents-title');
+  if (title) title.textContent = runsTab ? t('runs_title') : t('title');
+  byId('runs-export')?.toggleAttribute('hidden', !runsTab);
+  byId('agents-templates')?.toggleAttribute('hidden', runsTab || !state.isAdmin);
+  byId('agents-new')?.toggleAttribute('hidden', runsTab || !state.isAdmin);
+  updateSubLine();
   if (state.topTab === 'runs') loadRunsTab();
   else {
     // Leaving Runs: cancel the detail stream and invalidate any in-flight
@@ -2188,67 +2606,219 @@ async function loadRunsTab() {
     if (host) host.innerHTML = `<div class="agents-form-error">${escapeHtml(`${t('runs_failed')}: ${err.message}`)}</div>`;
     return;
   }
+  syncRunsAgentFilter();
+  document.querySelector('#agents-top-tabs tf-tab#runs')?.setAttribute('count', String(state.runs.length));
+  renderRunsView();
+}
+
+// Tiles and table read the same filtered set, so they are repainted together.
+function renderRunsView() {
+  renderRunsKpis();
   renderRunsTable();
 }
 
+function syncRunsAgentFilter() {
+  const select = byId('runs-filter-agent');
+  if (!select) return;
+  const ids = [...new Set(state.runs.map((r) => r.agent_id).filter(Boolean))];
+  if (!ids.includes(state.runsAgentFilter)) state.runsAgentFilter = 'all';
+  select.innerHTML = `
+    <option value="all">${escapeHtml(t('runs_filter_agent_all'))}</option>
+    ${ids.map((id) => `<option value="${escapeAttr(id)}">${escapeHtml(agentLabel(id).title)}</option>`).join('')}
+  `;
+  select.setAttribute('value', state.runsAgentFilter);
+}
+
 function filteredRuns() {
-  const f = state.runsStatusFilter;
-  return state.runs.filter((r) => {
-    if (f === 'all') return true;
-    if (f === 'active') return !TERMINAL_RUN_STATUSES.includes(r.status);
-    return r.status === f;
+  return applyRunFilters(state.runs, {
+    status: state.runsStatusFilter,
+    agent: state.runsAgentFilter,
+    days: state.runsPeriodDays,
+    query: state.runsQuery,
   });
+}
+
+// One filter body for both run tables (A05 per agent, A06 across agents).
+function applyRunFilters(rows, { status = 'all', agent = 'all', days = 0, query = '' } = {}) {
+  const cutoff = days ? Date.now() - days * 86400000 : null;
+  return rows.filter((r) => {
+    if (agent !== 'all' && r.agent_id !== agent) return false;
+    if (cutoff != null) {
+      const created = sqliteTime(r.created_at);
+      if (created != null && created < cutoff) return false;
+    }
+    if (query) {
+      const hay = `${r.prompt_excerpt || ''} ${r.exit_reason || ''}`.toLowerCase();
+      if (!hay.includes(query)) return false;
+    }
+    if (status === 'all') return true;
+    if (status === 'active') return !TERMINAL_RUN_STATUSES.includes(r.status);
+    return r.status === status;
+  });
+}
+
+// A run row carries the agent UUID only; the roster in `state.agents` turns it
+// into the display name the mockup's Agent column shows (a bare UUID as a table
+// title is what A06 explicitly replaces).
+function agentLabel(agentId) {
+  const row = state.agents.find((x) => x.id === agentId);
+  if (!row) return { title: t('runs_agent_unknown'), sub: shortId(agentId) };
+  return { title: row.display_name || row.name, sub: row.name };
+}
+
+// Two-line table cell (title + muted identifier), the shape every list in this
+// app uses for an entity column.
+function twoLineCell(title, sub) {
+  return `<div class="tf-table__ent"><div>`
+    + `<div class="tf-table__cell-title" title="${escapeAttr(title)}"><b>${escapeHtml(title)}</b></div>`
+    + `<div class="tf-table__cell-sub tf-table__cell-sub--mono" title="${escapeAttr(sub)}">${escapeHtml(sub)}</div>`
+    + `</div></div>`;
+}
+
+function shortId(id) {
+  const raw = String(id ?? '');
+  return raw ? `#${raw.slice(0, 8)}` : '—';
+}
+
+// Wall-clock length of a run. `started_at`/`finished_at` are SQLite
+// `datetime('now')` strings (UTC, no zone marker), so they are parsed as such.
+function runDuration(run) {
+  const start = sqliteTime(run.started_at || run.created_at);
+  const end = sqliteTime(run.finished_at) ?? (TERMINAL_RUN_STATUSES.includes(run.status) ? null : Date.now());
+  if (start == null || end == null || end < start) return '—';
+  const secs = Math.round((end - start) / 1000);
+  if (secs < 60) return `${secs} s`;
+  const mins = Math.floor(secs / 60);
+  return `${mins} min ${String(secs % 60).padStart(2, '0')} s`;
+}
+
+function sqliteTime(value) {
+  if (!value) return null;
+  const iso = /Z|[+-]\d{2}:?\d{2}$/.test(value) ? value : `${String(value).replace(' ', 'T')}Z`;
+  const ms = Date.parse(iso);
+  return Number.isNaN(ms) ? null : ms;
+}
+
+// KPI strip (A06) over the FILTERED rows: the tiles sit directly above the
+// table, so counting the raw list would have them contradict it the moment a
+// period or status filter is on.
+function renderRunsKpis() {
+  const host = byId('runs-kpi-host');
+  if (!host) return;
+  const rows = filteredRuns();
+  const done = rows.filter((r) => r.status === 'completed').length;
+  const failed = rows.filter((r) => r.status === 'failed').length;
+  const cancelled = rows.filter((r) => r.status === 'cancelled' || r.status === 'interrupted').length;
+  const active = rows.filter((r) => !TERMINAL_RUN_STATUSES.includes(r.status));
+  const terminal = done + failed + cancelled;
+  const rate = terminal ? Math.round((done / terminal) * 100) : 0;
+  const tokens = rows.reduce((sum, r) => sum + (r.total_tokens ?? 0), 0);
+  const perAgent = new Map();
+  for (const r of rows) perAgent.set(r.agent_id, (perAgent.get(r.agent_id) ?? 0) + (r.total_tokens ?? 0));
+  const agentsWithRuns = perAgent.size;
+  const topTokenAgent = [...perAgent.entries()].sort((a, b) => b[1] - a[1])[0]?.[0] ?? null;
+  host.innerHTML = `
+    <tf-stat-card label="${escapeAttr(t('kpi_runs'))}" value="${escapeAttr(String(rows.length))}"
+      delta-type="neutral" delta="${escapeAttr(t('kpi_runs_delta', { agents: agentsWithRuns }))}"></tf-stat-card>
+    <tf-stat-card label="${escapeAttr(t('kpi_success'))}" value="${escapeAttr(String(rate))}" suffix="%"
+      delta-type="neutral" delta="${escapeAttr(t('kpi_success_delta', { done, failed, cancelled }))}"></tf-stat-card>
+    <tf-stat-card label="${escapeAttr(t('kpi_tokens'))}" value="${escapeAttr(tokens.toLocaleString(I18n.getLanguage()))}"
+      delta-type="neutral" delta="${escapeAttr(topTokenAgent ? t('kpi_tokens_delta', { agent: agentLabel(topTokenAgent).title }) : t('kpi_tokens_none'))}"></tf-stat-card>
+    <tf-stat-card label="${escapeAttr(t('kpi_active'))}" value="${escapeAttr(String(active.length))}"
+      accent="${active.length ? 'info' : ''}"
+      delta-type="neutral" delta="${escapeAttr(active.length
+        ? `${shortId(active[0].id)} · ${agentLabel(active[0].agent_id).title}`
+        : t('kpi_active_none'))}"></tf-stat-card>
+  `;
 }
 
 function renderRunsTable() {
   const host = byId('runs-table-host');
   if (!host) return;
   const runs = filteredRuns();
+  renderTableFooter('runs-table-footer', runs.length, state.runs.length);
   if (!runs.length) {
     host.innerHTML = `<tf-empty-state icon="clock" title="${escapeAttr(t('runs_empty'))}"></tf-empty-state>`;
     return;
   }
   host.innerHTML = `
     <tf-table id="runs-tab-table" sortable>
+      <tf-column key="run" label="${escapeAttr(t('runs_col_id'))}"></tf-column>
+      <tf-column key="agent" label="${escapeAttr(t('runs_col_agent'))}" renderer="html" sortable></tf-column>
       <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
-      <tf-column key="agent" label="${escapeAttr(t('runs_col_agent'))}" sortable></tf-column>
+      <tf-column key="started" label="${escapeAttr(t('runs_col_started'))}" sortable></tf-column>
+      <tf-column key="duration" label="${escapeAttr(t('runs_col_duration'))}"></tf-column>
       <tf-column key="iterations" label="${escapeAttr(t('runs_col_iterations'))}" renderer="num" sortable></tf-column>
       <tf-column key="tokens" label="${escapeAttr(t('runs_col_tokens'))}" renderer="num" sortable></tf-column>
-      <tf-column key="exit_reason" label="${escapeAttr(t('runs_col_exit'))}"></tf-column>
-      <tf-column key="created" label="${escapeAttr(t('runs_col_created'))}" sortable></tf-column>
+      <tf-column key="prompt" label="${escapeAttr(t('runs_col_prompt'))}" renderer="html" fill></tf-column>
+      <tf-column key="initiator" label="${escapeAttr(t('runs_col_initiator'))}"></tf-column>
     </tf-table>
   `;
   const table = host.querySelector('#runs-tab-table');
-  table.rows = runs.map((r) => ({
-    _id: r.id,
-    _status: r.status,
-    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
-    agent: r.agent_id || '—',
-    iterations: r.iterations ?? 0,
-    tokens: r.total_tokens ?? 0,
-    exit_reason: r.exit_reason || '—',
-    created: formatTimestamp(r.created_at),
-  }));
-  table.rowActions = buildRunRowActions;
+  table.rows = runs.map((r) => {
+    const agent = agentLabel(r.agent_id);
+    return {
+      _id: r.id,
+      _status: r.status,
+      run: shortId(r.id),
+      agent: twoLineCell(agent.title, agent.sub),
+      status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
+      started: formatTimestamp(r.started_at || r.created_at),
+      duration: runDuration(r),
+      iterations: r.iterations ?? 0,
+      tokens: r.total_tokens ?? 0,
+      prompt: runPromptCell(r),
+      initiator: runInitiator(r),
+    };
+  });
+  table.rowActions = (row) => buildRunRowActions(row, 'global');
   table.addEventListener('row-click', (e) => {
     const id = e.detail?.row?._id;
     if (id) openRunDetail(id);
   });
 }
 
-function buildRunRowActions(row) {
-  const active = !TERMINAL_RUN_STATUSES.includes(row._status);
-  if (!active) return null;
+// Every run list closes with the mockup's "showing N of M" line, so a filtered
+// table never reads as the whole history.
+function renderTableFooter(hostId, shown, total) {
+  const host = byId(hostId);
+  if (!host) return;
+  host.textContent = total ? t('runs_footer', { shown, total }) : '';
+}
+
+function buildRunRowActions(row, scope = 'global') {
   const btn = document.createElement('tf-button');
   btn.setAttribute('variant', 'ghost');
   btn.setAttribute('size', 'sm');
+  if (TERMINAL_RUN_STATUSES.includes(row._status)) {
+    btn.textContent = t('action_details');
+    btn.addEventListener('click', () => (scope === 'agent'
+      ? openRunDetail(row._id, 'agent-runs-detail-host', 'agent')
+      : openRunDetail(row._id)));
+    return btn;
+  }
+  btn.setAttribute('variant', 'danger');
   btn.textContent = t('action_cancel');
-  btn.addEventListener('click', () => cancelRun(row._id, 'global'));
+  btn.addEventListener('click', () => cancelRun(row._id, scope));
   return btn;
 }
 
+// The full run_log is the only complete record of a run; the list keeps a
+// truncated projection, so the export writes the durable row verbatim.
+function exportRunLog(run) {
+  const blob = new Blob([JSON.stringify(run, null, 2)], { type: 'application/json' });
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = `agent-run-${String(run.id ?? 'unknown').slice(0, 8)}.json`;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  URL.revokeObjectURL(url);
+}
+
 // =============================================================================
-// Wizard (A02 mockup) — CREATE-only 3-step window
+// Wizard (A07 mockup) — CREATE-only 3-step window
 // =============================================================================
 
 async function openWizard(agent, { forceCreate = false } = {}) {
@@ -2417,9 +2987,10 @@ function wizardBodyHtml(agent, mode, models) {
       </div>
 
       <div class="agents-editor-grid">
-        <!-- Poziom rozumowania zalezy od MODELU: opcje wypelnia
-             refreshReasoningOptions() z katalogu, a gdy model ich nie ma, cale
-             pole znika zamiast oferowac ustawienie, ktore backend odrzuci. -->
+        <!-- Reasoning effort follows the MODEL: refreshReasoningOptions()
+             fills the options from the catalog, and when the model declares none
+             the whole field disappears rather than offering a setting the
+             backend would reject. -->
         <div class="agents-field" id="agent-wz-reasoning-field" hidden>
           <tf-select id="agent-wz-reasoning" label="${escapeAttr(t('label_reasoning_effort'))}"
             value="${escapeAttr(agent?.params?.reasoning_effort || '')}"></tf-select>
@@ -2524,8 +3095,8 @@ function wireWizard() {
     if (sliderVal) sliderVal.textContent = String(e.detail?.value ?? slider.value);
   });
 
-  // Poziomy rozumowania wynikają z modelu, więc przebudowują się przy każdej
-  // zmianie wyboru — nie ma jednej stałej listy do pokazania.
+  // Reasoning levels follow the model, so they are rebuilt on every model
+  // change — there is no single fixed list to show.
   const modelSelect = wz.body.querySelector('#agent-wz-model');
   modelSelect?.addEventListener('change', () => refreshReasoningOptions(wz));
   refreshReasoningOptions(wz);
@@ -2560,7 +3131,7 @@ async function refreshReasoningOptions(wz) {
   }
 
   field.hidden = false;
-  // Pusta opcja = "nie ruszaj ustawienia modelu", nie "poziom zerowy".
+  // The empty option means "leave the model's own setting alone", not "level zero".
   select.innerHTML = `<option value="">${escapeHtml(t('reasoning_effort_default'))}</option>`
     + options.map((lvl) => `<option value="${escapeAttr(lvl)}">${escapeHtml(lvl)}</option>`).join('');
   select.value = options.includes(current) ? current : '';
@@ -2682,8 +3253,8 @@ async function saveWizard() {
       names: [...wz.selectedSkillNames],
       tags: [...wz.selectedSkillTags],
     },
-    // Zachowujemy klucze, ktorych ten formularz nie zna (params_json jest
-    // wspolnym workiem), a nadpisujemy tylko te dwa. Puste pole = USUNIECIE
+    // Keep the keys this form does not know about (params_json is a shared
+    // bag) and overwrite only these two. An empty field means REMOVAL
     // klucza, nie zapis pustej wartosci — inaczej backend dostalby "" jako
     // poziom rozumowania.
     params: buildAgentParams(wz.sourceParams, field),

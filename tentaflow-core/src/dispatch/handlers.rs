@@ -7761,6 +7761,10 @@ impl<'a> AgentDetail<'a> {
 /// Run-list projection of `DbAgentRun` — every index field except `run_log`,
 /// which holds the full step timeline and is fetched on demand by
 /// `AgentRunDetailRequest`.
+///
+/// `prompt` is truncated here rather than in the UI: a run list of a few
+/// hundred rows would otherwise ship every full prompt to the browser only for
+/// it to render one clipped line per row.
 #[derive(serde::Serialize)]
 struct AgentRunSummary<'a> {
     id: &'a str,
@@ -7768,6 +7772,7 @@ struct AgentRunSummary<'a> {
     parent_run_id: Option<&'a str>,
     flow_execution_id: Option<i64>,
     user_id: Option<&'a str>,
+    prompt_excerpt: String,
     status: &'a str,
     exit_reason: Option<&'a str>,
     iterations: i64,
@@ -7778,17 +7783,42 @@ struct AgentRunSummary<'a> {
     created_at: &'a str,
 }
 
+/// First line of a run prompt, capped so one row of a run table stays one row.
+/// Char-based, not byte-based: slicing a UTF-8 prompt at a byte offset panics.
+const PROMPT_EXCERPT_CHARS: usize = 160;
+
+fn prompt_excerpt(prompt: &str) -> String {
+    let line = prompt.lines().find(|l| !l.trim().is_empty()).unwrap_or("").trim();
+    if line.chars().count() <= PROMPT_EXCERPT_CHARS {
+        return line.to_string();
+    }
+    let head: String = line.chars().take(PROMPT_EXCERPT_CHARS).collect();
+    format!("{}…", head.trim_end())
+}
+
 /// One pickable tool in the catalog the editor renders as a checkbox tree:
 /// addon tools grouped by `addon_id`, then the `core.*` builtins.
 #[derive(serde::Serialize)]
 struct CatalogTool {
     name: String,
+    /// Instance-scoped spelling of the same tool (`<instance_id>.<tool>`), empty
+    /// when the group has no instance or already IS instance-scoped. An agent
+    /// configured before the picker moved to package-scoped names still holds
+    /// this form in `tools_json`, and both admit the tool at run time — so the
+    /// editor must recognise it instead of pruning the selection away.
+    #[serde(default)]
+    alias: String,
     description: String,
     parameters: serde_json::Value,
 }
 
 #[derive(serde::Serialize)]
 struct CatalogAddonGroup {
+    /// The head an allowlist entry uses for this group: the PACKAGE id whenever
+    /// the instance carries one. `catalog::AllowlistEntry::matches_addon_tool`
+    /// admits a package-level head for every instance of that package, so a
+    /// package-scoped selection survives reinstalling the addon (which mints a
+    /// fresh instance id) and reads the same on every node in the fleet.
     addon_id: String,
     tools: Vec<CatalogTool>,
     /// Human label of the addon INSTANCE (`addons.display_name`, falling back to
@@ -7800,6 +7830,11 @@ struct CatalogAddonGroup {
     /// allowlist admits them). False = catalog package without an installed
     /// instance: the tools render read-only until the admin installs one.
     installed: bool,
+    /// Instance id backing the group, empty for a catalog package. The picker
+    /// prints it under the title; it is NOT what an allowlist entry names.
+    instance_id: String,
+    /// Package version, empty when unknown — shown next to the package name.
+    version: String,
 }
 
 #[derive(serde::Serialize)]
@@ -7817,8 +7852,15 @@ struct ToolsCatalog {
 /// so both see the exact same tool universe.
 fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolError> {
     use std::collections::BTreeMap;
+    /// Everything the catalog needs to know about one installed instance.
+    struct InstanceMeta {
+        label: String,
+        description: String,
+        package_id: String,
+        version: String,
+    }
     let instances = repository::list_addons(&ctx.state.db).map_err(db_err)?;
-    let mut meta: std::collections::HashMap<String, (String, String)> =
+    let mut meta: std::collections::HashMap<String, InstanceMeta> =
         std::collections::HashMap::with_capacity(instances.len());
     for a in instances {
         let label = if a.display_name.trim().is_empty() {
@@ -7826,7 +7868,20 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         } else {
             a.display_name.clone()
         };
-        meta.insert(a.addon_id, (label, a.description));
+        let version = if a.package_version.trim().is_empty() {
+            a.version.clone()
+        } else {
+            a.package_version.clone()
+        };
+        meta.insert(
+            a.addon_id,
+            InstanceMeta {
+                label,
+                description: a.description,
+                package_id: a.package_id,
+                version,
+            },
+        );
     }
     let mut grouped: BTreeMap<String, Vec<CatalogTool>> = BTreeMap::new();
     if let Some(manager) = &ctx.state.addon_manager {
@@ -7835,25 +7890,47 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
                 .entry(tool.addon_id.clone())
                 .or_default()
                 .push(CatalogTool {
-                    name: format!("{}.{}", tool.addon_id, tool.tool_name),
+                    name: tool.tool_name.clone(),
+                    alias: String::new(),
                     description: tool.description,
                     parameters: tool.parameters_schema,
                 });
         }
     }
-    let mut group_of = |addon_id: String, tools: Vec<CatalogTool>, installed: bool| {
-        let mut tools = tools;
+    // One group per installed instance, HEADED BY ITS PACKAGE id. A package-level
+    // allowlist entry admits every instance of that package (see
+    // `agents::catalog::AllowlistEntry::matches_addon_tool`), so naming the group
+    // after the package is what keeps a selection alive across a reinstall — and
+    // what stops the same addon appearing twice (once live, once as an
+    // "uninstalled" catalog package, which is how a real selection ended up
+    // rendered as read-only).
+    let mut group_of = |instance_id: String, tools: Vec<CatalogTool>, installed: bool| {
+        let m = meta.get(&instance_id);
+        let package_id = m
+            .map(|m| m.package_id.trim().to_string())
+            .filter(|p| !p.is_empty())
+            .unwrap_or_else(|| instance_id.clone());
+        let mut tools: Vec<CatalogTool> = tools
+            .into_iter()
+            .map(|t| CatalogTool {
+                name: format!("{}.{}", package_id, t.name),
+                alias: if installed && package_id != instance_id {
+                    format!("{}.{}", instance_id, t.name)
+                } else {
+                    String::new()
+                },
+                ..t
+            })
+            .collect();
         tools.sort_by(|a, b| a.name.cmp(&b.name));
-        let (display_name, description) = meta
-            .get(&addon_id)
-            .cloned()
-            .unwrap_or_else(|| (addon_id.clone(), String::new()));
         CatalogAddonGroup {
-            addon_id,
+            addon_id: package_id,
             tools,
-            display_name,
-            description,
+            display_name: m.map(|m| m.label.clone()).unwrap_or_else(|| instance_id.clone()),
+            description: m.map(|m| m.description.clone()).unwrap_or_default(),
             installed,
+            instance_id: if installed { instance_id } else { String::new() },
+            version: m.map(|m| m.version.clone()).unwrap_or_default(),
         }
     };
     let mut addons: Vec<CatalogAddonGroup> = grouped
@@ -7861,7 +7938,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         .map(|(addon_id, tools)| group_of(addon_id, tools, true))
         .collect();
     // Catalog packages without an instance: latest version wins (the listing is
-    // ordered newest first per package). A package whose id already has an
+    // ordered newest first per package). A package whose id already heads an
     // instance group is skipped — its live tools are the source of truth.
     let mut covered: std::collections::HashSet<String> =
         addons.iter().map(|g| g.addon_id.clone()).collect();
@@ -7877,7 +7954,8 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
             .tools
             .iter()
             .map(|t| CatalogTool {
-                name: format!("{}.{}", row.package_id, t.name),
+                name: t.name.clone(),
+                alias: String::new(),
                 description: t.description.clone(),
                 parameters: t.parameters_schema.clone(),
             })
@@ -7885,7 +7963,14 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         if tools.is_empty() {
             continue;
         }
-        addons.push(group_of(row.package_id, tools, false));
+        let mut group = group_of(row.package_id.clone(), tools, false);
+        // No instance backs it, so the manifest carries the label and version.
+        if !manifest.display_name.trim().is_empty() {
+            group.display_name = manifest.display_name.clone();
+        }
+        group.description = manifest.description.clone().unwrap_or_default();
+        group.version = manifest.version.clone();
+        addons.push(group);
     }
     addons.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
     let core = crate::agents::CoreToolName::all()
@@ -7894,6 +7979,7 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
             let spec = t.spec();
             CatalogTool {
                 name: spec.name,
+                alias: String::new(),
                 description: spec.description,
                 parameters: spec.parameters,
             }
@@ -8156,6 +8242,7 @@ pub fn agent_runs_list(
             parent_run_id: r.parent_run_id.as_deref(),
             flow_execution_id: r.flow_execution_id,
             user_id: r.user_id.as_deref(),
+            prompt_excerpt: prompt_excerpt(&r.prompt),
             status: &r.status,
             exit_reason: r.exit_reason.as_deref(),
             iterations: r.iterations,

@@ -1,39 +1,45 @@
 /* ===== File: agents.css — Agents module: card grid, wizard, playground, runs ===== */
 
-.agents-card {
-  padding: 0;
-  overflow: hidden;
-}
-
-.agents-toolbar {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 12px;
-  padding: 12px 14px;
-  border-bottom: 1px solid var(--border);
-}
-
 .agents-toolbar-cards {
-  border-bottom: 0;
-  padding: 0 0 14px;
+  margin-bottom: 16px;
 }
 
-.agents-toolbar tf-searchbox {
-  flex: 1 1 220px;
-  max-width: 340px;
+/* A01 labels the filter row the way the mockup does; tf-filter-chips has no
+   label slot of its own. */
+.agents-filter-label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--text-3);
 }
 
-.agents-filter {
-  min-width: 170px;
+.agents-filter-label .icon {
+  width: 13px;
+  height: 13px;
+  color: var(--accent-1);
 }
 
 /* --- Card grid (A01) --- */
 
 .agents-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(290px, 1fr));
+  /* minmax(0, 1fr): a bare 1fr floors at the card's min-content width, which a
+     long agent name plus its status chip pushes past the track and overflows
+     the grid sideways. */
+  grid-template-columns: repeat(3, minmax(0, 1fr));
   gap: 14px;
+}
+
+@media (max-width: 1400px) {
+  .agents-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 820px) {
+  .agents-grid { grid-template-columns: minmax(0, 1fr); }
 }
 
 .agent-card {
@@ -64,7 +70,7 @@
 
 .agent-card-top {
   display: flex;
-  align-items: center;
+  align-items: flex-start;
   gap: 12px;
 }
 
@@ -73,15 +79,19 @@
   height: 40px;
   flex-shrink: 0;
   border-radius: var(--radius);
-  background: var(--gradient-soft);
-  color: var(--accent-2);
+  background: var(--gradient-accent);
+  color: #fff;
   display: flex;
   align-items: center;
   justify-content: center;
 }
 
-.agent-card-av .icon,
-.agents-pg-av .icon {
+.agent-card-av.is-off {
+  background: var(--bg-3);
+  color: var(--text-3);
+}
+
+.agent-card-av .icon {
   width: 20px;
   height: 20px;
 }
@@ -92,17 +102,25 @@
 }
 
 .agent-card-name {
-  font-size: 14px;
-  font-weight: 700;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 14.5px;
+  font-weight: 800;
   color: var(--text);
+}
+
+.agent-card-name-text {
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
 
 .agent-card-role {
-  font-size: 11.5px;
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 11px;
   color: var(--text-3);
+  margin-top: 2px;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
@@ -123,6 +141,8 @@
   display: flex;
   flex-wrap: wrap;
   gap: 12px;
+  padding-top: 10px;
+  border-top: 1px solid var(--border);
   font-size: 11px;
   color: var(--text-3);
 }
@@ -141,17 +161,19 @@
 .agent-card-foot {
   display: flex;
   align-items: center;
-  gap: 6px;
+  flex-wrap: wrap;
+  gap: 8px;
   margin-top: auto;
 }
 
-.agent-card-foot tf-chip:first-child {
-  margin-left: 0;
+.agent-card-foot:empty {
+  display: none;
 }
 
 .agent-card-menu-wrap {
   position: relative;
   margin-left: auto;
+  flex-shrink: 0;
 }
 
 .agent-card-menu-wrap tf-menu {
@@ -204,7 +226,7 @@
   line-height: 1.5;
 }
 
-/* --- Wizard window (A02) --- */
+/* --- Wizard window (A07) --- */
 
 .agents-wizard {
   display: flex;
@@ -385,13 +407,36 @@
 .agents-tool-group-head {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 10px 12px;
+  gap: 12px;
+  padding: 12px 14px;
   cursor: pointer;
+  transition: background 0.12s ease;
 }
 
-/* Dwuliniowa glowka grupy: nazwa addonu nad opisem, surowy identyfikator
-   instancji obok tytulu (dwie instancje tego samego pakietu maja te sama nazwe). */
+.agents-tool-group-head:hover {
+  background: var(--bg-card);
+}
+
+.agents-tool-group-ico {
+  width: 34px;
+  height: 34px;
+  border-radius: var(--radius-sm);
+  background: var(--bg-3);
+  color: var(--accent-2);
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex-shrink: 0;
+}
+
+.agents-tool-group-ico .icon {
+  width: 17px;
+  height: 17px;
+}
+
+/* Three-line group head: addon name, then the instance/package identifier line,
+   then the manifest one-liner. Two instances of one package share a display
+   name, so the identifier line is what tells them apart. */
 .agents-tool-group-meta {
   flex: 1;
   min-width: 0;
@@ -405,6 +450,10 @@
   align-items: center;
   gap: 8px;
   min-width: 0;
+  flex-wrap: wrap;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
 }
 
 .agents-tool-group-id {
@@ -439,15 +488,19 @@
 
 .agents-tool-group-body {
   border-top: 1px solid var(--border);
-  padding: 6px 12px;
 }
 
 .agents-tool-item {
   display: flex;
   align-items: center;
-  gap: 10px;
-  padding: 6px 0;
+  gap: 12px;
+  padding: 9px 14px 9px 60px;
+  border-bottom: 1px solid var(--border);
   font-size: 12.5px;
+}
+
+.agents-tool-item:last-child {
+  border-bottom: 0;
 }
 
 .agents-tool-item tf-toggle {
@@ -458,10 +511,15 @@
 
 .agents-slider-row {
   display: grid;
-  grid-template-columns: minmax(180px, 240px) 1fr 52px;
-  gap: 16px;
+  grid-template-columns: 1fr 220px 56px;
+  gap: 14px;
   align-items: center;
   padding: 10px 0;
+  border-bottom: 1px solid var(--border);
+}
+
+.agents-slider-row:last-of-type {
+  border-bottom: 0;
 }
 
 .agents-slider-name {
@@ -494,46 +552,36 @@
   color: var(--text);
 }
 
-/* --- Playground (A03) --- */
-
-.agents-pg {
-  display: flex;
-  flex-direction: column;
-  gap: 14px;
-}
+/* --- Playground (A04) --- */
 
 /* --- Detail shell (A02-A05): breadcrumb -> header card -> tabs --- */
 
+/* `.page-header` and `tf-tabs` both set `display`, which outranks the UA rule
+   behind the `hidden` attribute — without these the detail view keeps the
+   module chrome and shows two tab strips above one another. */
+#agents-page-header[hidden],
+#agents-top-tabs[hidden] {
+  display: none;
+}
+
+/* A02 spaces the shell unevenly on purpose: 12px under the breadcrumb, 16px
+   under the header card, 20px under the tab strip. One flex `gap` cannot express
+   that, so each band carries its own margin. */
 .ag-detail {
   display: flex;
   flex-direction: column;
-  gap: 14px;
 }
 
 .ag-breadcrumb {
-  display: flex;
-  align-items: center;
-  gap: 6px;
-  font-size: 12px;
-  color: var(--text-3);
+  margin-bottom: 12px;
 }
 
-.ag-breadcrumb .crumb {
-  cursor: pointer;
+#ag-detail-header-host {
+  margin-bottom: 16px;
 }
 
-.ag-breadcrumb .crumb:hover {
-  color: var(--accent-2);
-}
-
-.ag-breadcrumb .crumb.active {
-  color: var(--text);
-  cursor: default;
-  font-weight: 600;
-}
-
-.ag-breadcrumb .sep {
-  opacity: 0.6;
+#ag-detail-tabs-host {
+  margin-bottom: 20px;
 }
 
 .ag-breadcrumb .sep .icon {
@@ -541,61 +589,10 @@
   height: 12px;
 }
 
-.ag-detail-header .big-ico {
-  width: 60px;
-  height: 60px;
-  border-radius: var(--radius);
-  background: var(--gradient-accent);
-  color: #fff;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-
-.ag-detail-header .big-ico .icon {
-  width: 28px;
-  height: 28px;
-}
-
-.ag-detail-header .d-meta {
-  flex: 1;
-  min-width: 260px;
-}
-
-.ag-detail-header .d-name {
-  display: flex;
-  align-items: center;
-  gap: 10px;
-  font-size: 20px;
-  font-weight: 800;
-  color: var(--text);
-  flex-wrap: wrap;
-}
-
-.ag-detail-header .d-sub {
-  font-size: 12px;
-  color: var(--text-3);
-  margin-top: 3px;
-}
-
-.ag-detail-header .d-sub.mono,
-.mono {
+.ag-detail .mono,
+.agents-tool-group .mono,
+.agent-card .mono {
   font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
-}
-
-.ag-detail-header .d-badges {
-  display: flex;
-  gap: 6px;
-  margin-top: 8px;
-  flex-wrap: wrap;
-}
-
-.ag-detail-header .d-actions {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
 }
 
 .agents-pg-banner {
@@ -621,25 +618,22 @@
 
 .ag-test-cols {
   display: grid;
-  grid-template-columns: 1.2fr 1fr;
-  gap: 14px;
+  grid-template-columns: 1.25fr 1fr;
+  gap: 16px;
   align-items: start;
 }
 
 .ag-test-side {
   display: flex;
   flex-direction: column;
-  gap: 14px;
+  gap: 16px;
   min-width: 0;
-}
-
-.ag-test-banner {
-  margin-bottom: 0;
 }
 
 .agents-pg-chat {
   display: flex;
   flex-direction: column;
+  min-height: 560px;
   padding: 0;
   overflow: hidden;
 }
@@ -672,22 +666,57 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
-  padding: 14px;
+  flex: 1;
+  padding: 16px;
   min-height: 260px;
-  max-height: 480px;
+  max-height: 470px;
   overflow-y: auto;
 }
 
-.agents-pg-side {
+/* A04 keeps a visible stop next to the composer while a test run is in flight;
+   the composer itself grows, the stop stays at its content width. */
+.agents-pg-composer {
   display: flex;
-  flex-direction: column;
-  gap: 14px;
+  align-items: flex-end;
+  gap: 8px;
+  padding: 12px 14px;
+  border-top: 1px solid var(--border);
+}
+
+/* A flex child with no content still consumes one `gap`, which pushed the whole
+   right column below the chat card while no run was live. */
+.ag-test-widget[hidden] {
+  display: none;
+}
+
+.agents-pg-composer tf-chat-composer {
+  flex: 1;
   min-width: 0;
 }
 
-.agents-pg-run {
+.agents-pg-run,
+.agents-pg-stats {
   padding: 0;
   overflow: hidden;
+}
+
+/* A04/A05 summary grid: label column fixed, value column takes the rest. */
+.agents-kv {
+  display: grid;
+  grid-template-columns: 150px 1fr;
+  gap: 6px 12px;
+  padding: 12px 14px;
+  font-size: 12px;
+}
+
+.agents-kv .k {
+  color: var(--text-3);
+}
+
+.agents-kv .v {
+  color: var(--text);
+  min-width: 0;
+  overflow-wrap: anywhere;
 }
 
 .agents-pg-timeline {
@@ -696,7 +725,7 @@
   overflow-y: auto;
 }
 
-/* --- Builder assistant window (A04) --- */
+/* --- Builder assistant window (A08) --- */
 
 .agents-assist {
   display: flex;
@@ -713,6 +742,28 @@
   overflow-y: auto;
 }
 
+.agents-assist-proposal-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--accent-2);
+}
+
+.agents-assist-proposal-title .icon {
+  width: 14px;
+  height: 14px;
+}
+
+.agents-tpl-agents {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
 .agents-assist-proposal {
   display: flex;
   flex-direction: column;
@@ -727,43 +778,7 @@
   display: none;
 }
 
-.agents-assist-chips {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.agents-assist-prompt {
-  padding: 12px 14px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg);
-  font-size: 12.5px;
-  line-height: 1.6;
-  color: var(--text-2);
-  white-space: pre-wrap;
-  max-height: 220px;
-  overflow-y: auto;
-}
-
-.agents-assist-tool {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border: 1px solid var(--border);
-  border-radius: var(--radius-sm);
-  background: var(--bg-card);
-  margin-bottom: 6px;
-}
-
-.agents-assist-tool .icon {
-  width: 13px;
-  height: 13px;
-  color: var(--accent-2);
-}
-
-/* --- Team templates window (A05) --- */
+/* --- Team templates window (A09) --- */
 
 .agents-templates {
   display: flex;
@@ -908,8 +923,13 @@
   gap: 12px;
 }
 
+/* A02 lays the model row and the remaining limits out three-up. `auto-fit`
+   collapses the empty track when the reasoning field hides itself for a model
+   with no reasoning catalog, so the survivors share the full width instead of
+   leaving a dead third column. */
+.agents-model-grid,
 .agents-limits {
-  grid-template-columns: repeat(4, 1fr);
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
 }
 
 .agents-field {
@@ -953,6 +973,15 @@
   white-space: nowrap;
 }
 
+/* A03 lines the descriptions up in a column of their own rather than letting
+   each one start wherever its tool name happens to end. */
+.agents-tool-item .agents-tool-name {
+  flex: 0 0 auto;
+  min-width: 190px;
+  font-weight: 700;
+  font-size: 12.5px;
+}
+
 .agents-tool-desc,
 .agents-skill-desc {
   color: var(--text-3);
@@ -987,6 +1016,81 @@
 
 /* --- Runs tab --- */
 
+.agents-kpi-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 1100px) {
+  .agents-kpi-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+@media (max-width: 640px) {
+  .agents-kpi-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+.agents-runs-toolbar {
+  margin-bottom: 14px;
+}
+
+.agents-table-footer {
+  margin-top: 8px;
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.agents-table-footer:empty {
+  display: none;
+}
+
+.agents-run-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  margin-bottom: 14px;
+}
+
+.agents-run-detail-head .title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--text);
+}
+
+.agents-run-detail-head .title .icon {
+  width: 14px;
+  height: 14px;
+  color: var(--accent-1);
+}
+
+.agents-run-detail-head .hint {
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.agents-run-detail-grid {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1.2fr);
+  gap: 16px;
+  align-items: start;
+}
+
+@media (max-width: 1100px) {
+  .agents-run-detail-grid { grid-template-columns: minmax(0, 1fr); }
+}
+
+.agents-run-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  padding: 0 14px 14px;
+}
+
 .agents-runs-host {
   display: flex;
   flex-direction: column;
@@ -997,34 +1101,6 @@
   display: flex;
   flex-direction: column;
   gap: 12px;
-}
-
-.agents-run-meta {
-  display: flex;
-  flex-wrap: wrap;
-  align-items: center;
-  gap: 14px;
-  font-size: 12.5px;
-  color: var(--text-2);
-}
-
-.agents-run-block {
-  display: flex;
-  flex-direction: column;
-  gap: 6px;
-}
-
-.agents-run-block pre {
-  margin: 0;
-  padding: 10px 12px;
-  border: 1px solid var(--border);
-  border-radius: 8px;
-  background: var(--bg-2);
-  font-size: 12px;
-  white-space: pre-wrap;
-  word-break: break-word;
-  max-height: 220px;
-  overflow-y: auto;
 }
 
 .agents-form-error {
@@ -1040,17 +1116,14 @@
   width: 100%;
 }
 
+/* The editor footer splits left (secondary/destructive) from right (primary);
+   both halves need a row of their own or their buttons stack. */
+.agents-footer-left,
 .agents-footer-right {
   display: flex;
   align-items: center;
   gap: 8px;
   margin-left: auto;
-}
-
-@media (max-width: 1100px) {
-  .agents-pg-cols {
-    grid-template-columns: 1fr;
-  }
 }
 
 @media (max-width: 720px) {
@@ -1071,8 +1144,16 @@
 
 /* --- Config tab (A02): sectioned inline editor + sticky save bar --- */
 
+/* Every tab body is a stack of cards; without the gap the section cards butt
+   their borders together and the tab reads as one undivided slab. */
+#ag-detail-body {
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
 .agents-section {
-  padding: 16px 18px;
+  padding: 18px 20px;
   display: flex;
   flex-direction: column;
   gap: 12px;
@@ -1083,7 +1164,7 @@
   align-items: center;
   gap: 8px;
   margin: 0;
-  font-size: 11px;
+  font-size: 12px;
   font-weight: 800;
   text-transform: uppercase;
   letter-spacing: 0.1em;
@@ -1100,6 +1181,22 @@
   align-items: center;
   gap: 10px;
   flex-wrap: wrap;
+}
+
+/* A02 keeps the counter and the {{var}} chips left and pushes the AI actions
+   to the far edge. */
+.ag-prompt-spacer {
+  flex: 1 1 auto;
+}
+
+.ag-prompt-var {
+  font-family: ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+  font-size: 10.5px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  color: var(--accent-2);
+  border-radius: 10px;
+  padding: 1px 7px;
 }
 
 .ag-prompt-count {
@@ -1163,7 +1260,7 @@
 .ag-tools-layout {
   display: grid;
   grid-template-columns: minmax(0, 1fr) minmax(240px, 320px);
-  gap: 14px;
+  gap: 16px;
   align-items: start;
 }
 
@@ -1175,8 +1272,24 @@
 }
 
 .ag-tools-side {
-  position: sticky;
-  top: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 16px;
+}
+
+/* The group hosts hold a flat run of cards; the gap is what separates them. */
+.ag-tools-main [data-addon-groups],
+.ag-tools-main [data-package-groups],
+.ag-tools-main [data-core-groups] {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+/* A group holding a selected tool is marked so the picks stay findable in a
+   long catalog without expanding every head. */
+.agents-tool-group.is-selected {
+  border-color: var(--accent-1);
 }
 
 .ag-core-subhead {
@@ -1188,30 +1301,6 @@
   margin-top: 6px;
 }
 
-.agents-tool-group-title {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  flex-wrap: wrap;
-}
-
-.agents-tool-group-ico {
-  width: 22px;
-  height: 22px;
-  border-radius: var(--radius-sm);
-  background: var(--bg-3);
-  color: var(--accent-2);
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  flex-shrink: 0;
-}
-
-.agents-tool-group-ico .icon {
-  width: 13px;
-  height: 13px;
-}
-
 /* Catalog packages without an installed instance stay visible but read-only:
    the group renders dashed and its toggles are inert until the admin installs
    one from the addon catalog. */
@@ -1220,9 +1309,40 @@
   opacity: 0.85;
 }
 
-.agents-tool-group.is-not-installed .agents-tool-item tf-toggle {
-  opacity: 0.4;
+.agents-tool-group.is-not-installed .agents-tool-group-ico {
+  background: transparent;
+  border: 1px dashed var(--border-hover);
+  color: var(--text-3);
+}
+
+.agents-tool-group.is-not-installed .agents-tool-item {
+  opacity: 0.6;
+}
+
+/* tf-toggle already dims itself at aria-disabled; a second opacity layer here
+   faded the track away and left a bare floating knob. */
+.agents-tool-group.is-not-installed tf-toggle {
   pointer-events: none;
+}
+
+.agents-tool-group-foot {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-top: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-3);
+}
+
+.agents-tool-group-foot tf-button {
+  margin-left: auto;
+}
+
+/* The install strip belongs to the opened package, not to every collapsed row
+   in the catalog list — repeated once per package it doubles the list height. */
+.agents-tool-group:not(.is-open) .agents-tool-group-foot {
+  display: none;
 }
 
 .ag-install-hint {
@@ -1245,7 +1365,4 @@
     grid-template-columns: 1fr;
   }
 
-  .ag-tools-side {
-    position: static;
-  }
 }

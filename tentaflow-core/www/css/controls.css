@@ -1432,6 +1432,16 @@ td:has(> .tf-table__row-select) {
 
 /* Monospace identifier sub-line (short ids, emails, model paths). */
 .tf-table__cell-sub--mono { font-family: var(--tf-font-mono, ui-monospace, monospace); font-size: 10.5px; }
+/* One-line cell for long free text (a prompt excerpt, an error reason).
+   `table-layout` is auto, so a `td` cannot be clamped directly — the injected
+   content carries its own box. Lives here because controls.css is the only
+   sheet adopted into the tf-table shadow root. */
+.tf-table__cell-clamp {
+  max-width: 380px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
 /* Entity cell: optional lead tile/dot + two-line label. */
 .tf-table__ent { display: flex; align-items: center; gap: 10px; min-width: 0; }
 .tf-table__ent > div { min-width: 0; }
