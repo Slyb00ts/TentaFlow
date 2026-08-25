@@ -1084,6 +1084,15 @@ mod backend {
                 Some(binds_vec)
             },
             device_requests,
+            // `unless-stopped`, so a container survives a docker daemon restart
+            // or a host reboot and comes back without waiting for Core to run a
+            // supervisor tick. `unless-stopped` rather than `always`: a service
+            // an operator stopped through the dashboard must STAY stopped across
+            // a reboot, which `always` would override.
+            restart_policy: Some(bollard::models::RestartPolicy {
+                name: Some(bollard::models::RestartPolicyNameEnum::UNLESS_STOPPED),
+                maximum_retry_count: None,
+            }),
             ..Default::default()
         };
         // Distributed (multi-node TP): swap to host-networking + RDMA passthrough.
