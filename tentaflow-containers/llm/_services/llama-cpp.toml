@@ -79,11 +79,11 @@ LLAMA_RUNTIME_PACKAGES = "libvulkan1 mesa-vulkan-drivers"
 
 [[parameter]]
 key = "ctx_size"
-label_pl = "Okno kontekstu (na slot)"
-label_en = "Context window (per slot)"
+label_pl = "Okno kontekstu na slot (0 = pelny kontekst modelu)"
+label_en = "Context window per slot (0 = the model's full context)"
 kind = "int"
-default = 8192
-range = { min = 512.0, max = 262144.0, step = 512.0 }
+default = 0
+range = { min = 0.0, max = 1048576.0, step = 512.0 }
 bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "ctx_size" } ]
 
 [[parameter]]
@@ -91,7 +91,7 @@ key = "n_parallel"
 label_pl = "Rownolegle sloty"
 label_en = "Parallel slots"
 kind = "int"
-default = 8
+default = 1
 range = { min = 1.0, max = 64.0, step = 1.0 }
 bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "n_parallel" } ]
 

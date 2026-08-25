@@ -24,7 +24,9 @@ use crate::native::{NativeError, NativeLayout};
 pub use llama_cpp_sys_2 as sys;
 
 pub const ENGINE_ID: &str = "llama-cpp";
-pub const DEFAULT_CTX_SIZE: u32 = 4096;
+// 0 = pelny kontekst modelu. Rozwiazywane przy ladowaniu z naglowka GGUF —
+// zadna stala nie moze byc mniejsza od tego, co model faktycznie uniesie.
+pub const DEFAULT_CTX_SIZE: u32 = 0;
 pub const DEFAULT_GPU_LAYERS: u32 = 99;
 pub const DEFAULT_BATCH_SIZE: u32 = 512;
 pub const DEFAULT_MTP_TOKENS: u32 = 4;

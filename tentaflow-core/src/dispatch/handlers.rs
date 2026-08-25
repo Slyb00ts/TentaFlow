@@ -6023,7 +6023,7 @@ pub fn addon_access_decision(
 /// Dispatch po `engine_id`:
 ///   * vllm/vllm-metal/sglang/tensorrt-llm — uzywa `auto_fit_config` jako
 ///     core, mapuje pola na kanoniczne klucze schema parametrow.
-///   * llama-cpp — `ctx_size` z HF max_position_embeddings (clamp 32k),
+///   * llama-cpp — `ctx_size=0` (pelny kontekst modelu, rozwiazywany z GGUF),
 ///     `n_gpu_layers=999`, `threads=cpus/2`.
 ///   * ollama — defaultowe wartosci context_size/num_gpu/num_thread/num_batch.
 ///   * whisper/mlx-whisper — beam_size=5, n_threads=cpus/2.
@@ -6232,7 +6232,9 @@ pub async fn engine_recommend(
             let cpus = std::thread::available_parallelism()
                 .map(|n| n.get())
                 .unwrap_or(8);
-            push(&mut parameters, "ctx_size", serde_json::json!(8192));
+            // 0 = pelny kontekst modelu; rekomendacja nie zaniza okna ponizej
+            // tego, co model uniesie — zawezenie to swiadoma decyzja uzytkownika.
+            push(&mut parameters, "ctx_size", serde_json::json!(0));
             push(&mut parameters, "n_gpu_layers", serde_json::json!(999));
             push(
                 &mut parameters,

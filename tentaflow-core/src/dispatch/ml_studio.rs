@@ -4741,7 +4741,6 @@ pub async fn ml_studio_ft_deploy(
         let config_json = serde_json::json!({
             "model_repo": model_name,
             "model_file": deploy_path,
-            "ctx_size": 2048,
         })
         .to_string();
         let deploy_req = tentaflow_protocol::ServiceManifestDeployRequest {
@@ -5021,7 +5020,6 @@ async fn run_remote_deploy(
     let config_json = serde_json::json!({
         "model_repo": model_name,
         "model_file": deploy_path,
-        "ctx_size": 2048,
     })
     .to_string();
     let cmd = tentaflow_protocol::mesh::MeshCommandType::ServiceDeployRemote {

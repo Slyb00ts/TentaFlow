@@ -30,6 +30,19 @@ use crate::inference::{
 // Daje realną współbieżność out-of-the-box bez zalewania VRAM.
 const DEFAULT_N_SEQ_MAX: u32 = 8;
 
+/// Okno kontekstu, gdy deploy nie narzuca wlasnego: tyle, ile model faktycznie
+/// potrafi, ograniczone tym samym pulapem co budzet odpowiedzi. Model bez
+/// zadeklarowanego kontekstu w naglowku dostaje pelny pulap, a nie zaniżoną
+/// stalą — o zawezeniu decyduje uzytkownik parametrem deployu, nie kod.
+fn resolve_full_context(context_train: u32) -> u32 {
+    let ceiling = crate::inference::RESPONSE_TOKEN_CEILING;
+    if context_train > 0 {
+        context_train.min(ceiling)
+    } else {
+        ceiling
+    }
+}
+
 // Stan jednego załadowanego modelu. `engine` to silnik continuous batching
 // (generation-only). `embed_runtime` to leniwie tworzona, osobna ścieżka
 // embeddingów (patrz niżej — silnik nie liczy embeddingów). Oba żyją tu, żeby
@@ -259,7 +272,18 @@ impl InferenceEngine for LlamaCppEngine {
     ) -> Result<ModelInfo> {
         let path = model_path.to_path_buf();
         let load = Self::load_config(deploy_params);
-        let engine_config = Self::engine_config(deploy_params, &load);
+        let mut engine_config = Self::engine_config(deploy_params, &load);
+
+        // Metadane GGUF czytamy PRZED zaladowaniem wag — tani odczyt naglowka,
+        // ale to on rozstrzyga okno kontekstu. `ctx_size = 0` znaczy "tyle, ile
+        // model potrafi", zeby zadna stala nie ucinala odpowiedzi ponizej
+        // mozliwosci modelu.
+        let gguf = tentaflow_wrappers::llama::inspect_gguf(&path)
+            .context("Nie udalo sie odczytac metadanych GGUF")?;
+        let context_train = gguf.context_length.unwrap_or(0) as u32;
+        if engine_config.ctx_per_seq == 0 {
+            engine_config.ctx_per_seq = resolve_full_context(context_train);
+        }
 
         info!(
             "Ladowanie modelu GGUF (continuous batching): {} (n_seq_max={}, ctx_per_seq={}, n_batch={}, n_ubatch={}, gpu_layers={}, threads={:?}, flash_attn={:?}, speculative={:?})",
@@ -283,11 +307,6 @@ impl InferenceEngine for LlamaCppEngine {
             .context("Blad w spawn_blocking podczas ladowania silnika")?
             .context("Nie udalo sie zaladowac modelu do silnika llama.cpp")?;
 
-        // Metadane modelu czytamy osobno z GGUF (silnik nie wystawia ich, a info
-        // dashboardu ich potrzebuje). Tani odczyt nagłówka, bez ładowania wag.
-        let gguf = tentaflow_wrappers::llama::inspect_gguf(&path)
-            .context("Nie udalo sie odczytac metadanych GGUF")?;
-        let context_train = gguf.context_length.unwrap_or(0) as u32;
         let info = ModelInfo {
             name: gguf.name.clone(),
             path: path.to_string_lossy().to_string(),
@@ -511,5 +530,31 @@ impl InferenceEngine for LlamaCppEngine {
 impl Default for LlamaCppEngine {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+#[cfg(test)]
+mod context_tests {
+    use super::*;
+
+    #[test]
+    fn full_context_follows_the_model() {
+        assert_eq!(resolve_full_context(32_768), 32_768);
+    }
+
+    #[test]
+    fn full_context_stops_at_the_ceiling() {
+        assert_eq!(
+            resolve_full_context(262_144),
+            crate::inference::RESPONSE_TOKEN_CEILING
+        );
+    }
+
+    #[test]
+    fn model_without_declared_context_gets_the_ceiling() {
+        assert_eq!(
+            resolve_full_context(0),
+            crate::inference::RESPONSE_TOKEN_CEILING
+        );
     }
 }
