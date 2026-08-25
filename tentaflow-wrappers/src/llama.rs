@@ -331,7 +331,12 @@ impl LlamaLoadConfig {
         if let Some(value) = read("batch_size").and_then(|v| v.as_u64()) {
             config.batch_size = value as u32;
         }
-        config.threads = read("threads").and_then(|v| v.as_u64()).map(|v| v as u32);
+        // 0 = auto (silnik dobiera sam) — parametr deployu wystawia 0 jako
+        // wartosc domyslna, a llama.cpp nie umie startowac z zerem watkow.
+        config.threads = read("threads")
+            .and_then(|v| v.as_u64())
+            .filter(|v| *v > 0)
+            .map(|v| v as u32);
         if let Some(value) = read("flash_attn").and_then(parse_flash_attention_mode) {
             config.flash_attn = value;
         }
@@ -1263,6 +1268,16 @@ mod tests {
         assert_eq!(config.n_gpu_layers, 999);
         assert_eq!(config.batch_size, 256);
         assert_eq!(config.threads, Some(8));
+    }
+
+    #[test]
+    fn zero_threads_means_auto() {
+        let mut map = HashMap::new();
+        map.insert("threads".to_string(), serde_json::json!(0));
+
+        let config = LlamaLoadConfig::from_deploy_hash_map(&map);
+
+        assert_eq!(config.threads, None);
     }
 
     #[test]
