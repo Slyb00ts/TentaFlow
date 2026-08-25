@@ -402,7 +402,16 @@ fn parse_call_body(inner: &str) -> Option<(String, String)> {
     if let Some(call) = parse_xml_call_body(inner) {
         return Some(call);
     }
-    let value: serde_json::Value = serde_json::from_str(inner).ok()?;
+    // The body must BEGIN with a JSON object; whatever trails it is noise.
+    // `from_str` demands the whole string be one value, so a single stray
+    // brace — which models emit constantly, e.g. `{"name":…,"arguments":{…}}}`
+    // — failed the block outright and the call was never made. Reading just
+    // the first value tolerates that without accepting malformed objects:
+    // the object itself still has to parse.
+    let value = serde_json::Deserializer::from_str(inner)
+        .into_iter::<serde_json::Value>()
+        .next()?
+        .ok()?;
     let obj = value.as_object()?;
     let name = obj.get("name")?.as_str()?.trim().to_string();
     if name.is_empty() {
@@ -718,6 +727,28 @@ mod tests {
         assert_eq!(args_json(&calls[0]), json!({"fact":"x"}));
         assert!(calls[0].id.starts_with("call_0_"));
         assert_eq!(calls[0].id.len(), "call_0_".len() + 8);
+    }
+
+    /// The other half of the same real turn: every body carried one brace too
+    /// many. The object parses; only the trailing junk did not, and demanding
+    /// the whole body be exactly one value threw the call away for it.
+    #[test]
+    fn stray_trailing_brace_does_not_lose_the_call() {
+        let (name, arguments) =
+            parse_call_body(r#"{"name":"search","arguments":{"query":"a"}}}"#)
+                .expect("obiekt jest poprawny, nadmiarowa klamra to szum");
+
+        assert_eq!(name, "search");
+        let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(args["query"], "a");
+    }
+
+    /// Tolerating trailing noise must not turn into tolerating broken objects:
+    /// a body whose JSON itself is malformed still has to be rejected, so it
+    /// stays visible in the text instead of becoming a silently wrong call.
+    #[test]
+    fn malformed_object_is_still_rejected() {
+        assert!(parse_call_body(r#"{"name":"search","arguments":{"query":"a""#).is_none());
     }
 
     /// The shape a real turn produced: five searches emitted in one message,
