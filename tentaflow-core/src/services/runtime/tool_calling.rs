@@ -253,11 +253,23 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
     while let Some(rel_open) = text[search_from..].find(OPEN_TAG) {
         let open = search_from + rel_open;
         let inner_start = open + OPEN_TAG.len();
-        let Some(rel_close) = text[inner_start..].find(CLOSE_TAG) else {
-            break;
+        let rest = &text[inner_start..];
+        // A block ends at its closing tag OR at the start of the next one,
+        // whichever comes first. Models routinely emit several calls in one
+        // turn while closing only the last: `<tool_call>{a}<tool_call>{b}</tool_call>`.
+        // Scanning to the first closer swallowed every call but the last into
+        // one body, which then failed to parse as a single JSON object — so a
+        // turn that asked for five searches executed none of them and printed
+        // its own markup instead.
+        let next_close = rest.find(CLOSE_TAG);
+        let next_open = rest.find(OPEN_TAG);
+        let (inner_end, close_end) = match (next_close, next_open) {
+            (Some(c), Some(o)) if o < c => (inner_start + o, inner_start + o),
+            (Some(c), _) => (inner_start + c, inner_start + c + CLOSE_TAG.len()),
+            // Unclosed final block: `strip_truncated_tool_call` owns the tail,
+            // so leave it in place rather than guessing where it ended.
+            (None, _) => break,
         };
-        let inner_end = inner_start + rel_close;
-        let close_end = inner_end + CLOSE_TAG.len();
         search_from = close_end;
 
         let inner = strip_inner_fence(text[inner_start..inner_end].trim());
@@ -706,6 +718,29 @@ mod tests {
         assert_eq!(args_json(&calls[0]), json!({"fact":"x"}));
         assert!(calls[0].id.starts_with("call_0_"));
         assert_eq!(calls[0].id.len(), "call_0_".len() + 8);
+    }
+
+    /// The shape a real turn produced: five searches emitted in one message,
+    /// each opened, only the last one closed. Before this every call but the
+    /// last was swallowed into one body, nothing parsed, and the agent printed
+    /// its own markup instead of searching.
+    #[test]
+    fn consecutive_calls_parse_when_only_the_last_is_closed() {
+        let text = concat!(
+            r#"<tool_call>{"name":"search","arguments":{"query":"a"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"b"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"c"}}</tool_call>"#,
+        );
+
+        let (clean, calls) = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 3, "kazde wywolanie musi zostac sparsowane");
+        assert_eq!(args_json(&calls[0])["query"], "a");
+        assert_eq!(args_json(&calls[1])["query"], "b");
+        assert_eq!(args_json(&calls[2])["query"], "c");
+        assert!(clean.trim().is_empty(), "markup nie moze zostac w tekscie");
     }
 
     #[test]
