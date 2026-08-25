@@ -263,6 +263,15 @@ function renderBubble(msg) {
   // Stopka metryk inferencji — tylko dla gotowych (nie-streaming) odpowiedzi
   // asystenta z dostepnymi liczbami z ChatStreamEnd.
   const perf = (!isUser && !isStreaming) ? renderPerfFooter(msg.perf) : '';
+  // Live step of an answer still being generated ("narzędzie · search_web",
+  // "Odpalam 3 agentów"). Only while streaming: once the turn settles the
+  // timeline in the activity widget is the record, not this line.
+  const statusRow = (!isUser && isStreaming && msg.status)
+    ? `<div class="bubble-status" role="status" aria-live="polite">
+        <span class="bubble-status-dot"></span>
+        <span class="bubble-status-text">${escapeHtml(msg.status)}</span>
+      </div>`
+    : '';
 
   const actions = isUser ? renderUserActions() : renderAssistantActions();
 
@@ -279,6 +288,7 @@ function renderBubble(msg) {
         ${avatar}
         <div class="bubble-wrap">
           ${meta}
+          ${statusRow}
           <div class="bubble">${bubbleHtml}${streamCaret}</div>
           ${perf}
           ${actions}
@@ -788,7 +798,17 @@ function rebindAgentActivity() {
   if (agentActivityTeardown) { agentActivityTeardown(); agentActivityTeardown = null; }
   const widget = byId('chat-agent-activity');
   if (!widget || !activeConvId) return;
-  agentActivityTeardown = attachAgentActivity(widget, activeConvId);
+  agentActivityTeardown = attachAgentActivity(widget, activeConvId, {
+    // Mirror the live step into the answer that is still streaming, so a slow
+    // local model shows "narzędzie · search_web" instead of an empty bubble.
+    onStatus: (status) => {
+      const conv = conversations.find((c) => c.id === activeConvId);
+      const streamingMsg = conv?.messages?.find((m) => m.streaming);
+      if (!streamingMsg || streamingMsg.status === status) return;
+      streamingMsg.status = status;
+      onStreamTick();
+    },
+  });
 }
 
 function selectConversation(id) {
@@ -902,6 +922,7 @@ function sendMessageInternal(text, opts = {}) {
       onEnd: (endBody) => {
         unsubscribe = null;
         assistantMsg.streaming = false;
+        assistantMsg.status = '';
         // ChatStreamEnd.text = pelny zakumulowany tekst z serwera — uzyj go
         // gdy zlozone delty sa puste (np. zgubione chunki), zanim pokazemy
         // "(pusta odpowiedz)".
@@ -932,6 +953,7 @@ function sendMessageInternal(text, opts = {}) {
       },
       onError: (err) => {
         assistantMsg.streaming = false;
+        assistantMsg.status = '';
         assistantMsg.text = `[error] ${err.message ?? 'stream error'}`;
         toast(`${I18n.t('common.error')}: ${err.message ?? 'stream error'}`, 'error');
         saveConversations();

@@ -35,7 +35,8 @@ import '/js/components/tf-chat-composer.js';
 import '/js/components/tf-empty-state.js';
 import '/js/components/tf-stat-card.js';
 import { TfAgentActivity } from '/js/components/tf-agent-activity.js';
-import { activityLabels } from '/js/lib/agent-activity-bridge.js';
+import { activityLabels, activityStatusText } from '/js/lib/agent-activity-bridge.js';
+import { renderMarkdown } from '/js/lib/md-lite.js';
 
 // Limits mirror db::repository AGENT_* constants so violations surface inline
 // instead of as backend bad_request round-trips.
@@ -1879,6 +1880,7 @@ function renderTestTab(body) {
       unsub: null,
       runId: null,
       busy: false,
+      status: '',
       stats: emptyPgStats(),
     };
   }
@@ -1943,13 +1945,20 @@ function renderPlaygroundMessages() {
   const host = document.querySelector('#ag-detail-body [data-pg-msgs]');
   if (!pg || !host) return;
   const agent = state.detail?.agent;
-  const bubbles = pg.messages.map((m) => `
+  // Markdown, not escaped text: `<think>` is a RENDERED feature (md-lite turns
+  // it into the collapsible thinking block), and escaping it printed the raw
+  // tags here while the chat screen showed them properly.
+  const bubbles = pg.messages.map((m, idx) => `
     <tf-chat-bubble role="${m.role === 'user' ? 'user' : 'assistant'}"
       sender="${escapeAttr(m.role === 'user' ? '' : (agent?.display_name || agent?.name || ''))}"
-      time="${escapeAttr(m.time || '')}">${escapeHtml(m.content)}</tf-chat-bubble>
+      time="${escapeAttr(m.time || '')}">${m.role === 'user'
+        ? escapeHtml(m.content)
+        : renderMarkdown(m.content || '', { thinkKeyPrefix: `pg-${idx}` })}</tf-chat-bubble>
   `).join('');
   const typing = pg.busy
-    ? `<tf-chat-bubble role="assistant" streaming sender="${escapeAttr(agent?.display_name || agent?.name || '')}">${escapeHtml(t('pg_running'))}</tf-chat-bubble>`
+    ? `<tf-chat-bubble role="assistant" streaming
+        sender="${escapeAttr(agent?.display_name || agent?.name || '')}"
+        ${pg.status ? `status="${escapeAttr(pg.status)}"` : ''}>${escapeHtml(t('pg_running'))}</tf-chat-bubble>`
     : '';
   host.innerHTML = bubbles + typing;
   host.scrollTop = host.scrollHeight;
@@ -2017,6 +2026,7 @@ async function startPlaygroundRun(prompt) {
   pg.steps = [];
   pg.stats = emptyPgStats();
   pg.stats.startedMs = Date.now();
+  pg.status = '';
   renderPlaygroundMessages();
   renderPlaygroundTimeline();
   renderPlaygroundStats();
@@ -2056,12 +2066,17 @@ async function startPlaygroundRun(prompt) {
           if (!body || body.variant !== 'AgentRunEvent') return;
           if (state.pg !== pg || pg.runId !== runId) return;
           pg.widget?.applyEvent(body);
+          const statusBefore = pg.status;
           applyPlaygroundStatsEvent(pg, body);
           const step = TfAgentActivity.stepsFromEvents([body], activityLabels())[0];
           step.ts = new Date().toLocaleTimeString();
           pg.steps.push(step);
           renderPlaygroundTimeline();
           renderPlaygroundStats();
+          // The status rides on the typing bubble, so it only becomes visible
+          // when the message list is redrawn — repainting just the timeline
+          // left the line permanently empty.
+          if (pg.status !== statusBefore) renderPlaygroundMessages();
           const eventRunId = body.run_id || body.runId;
           if (body.kind === 'child_finished' && eventRunId === runId) {
             finishPlaygroundRun(pg, runId);
@@ -2134,6 +2149,7 @@ async function finishPlaygroundRun(pg, runId) {
   const content = run?.result
     || (run?.exit_reason ? `${runStatusLabel(run.status)} · ${run.exit_reason}` : t('pg_no_result'));
   pg.stats.endedMs = Date.now();
+  pg.status = '';
   if (run) {
     pg.stats.iteration = run.iterations ?? pg.stats.iteration;
     pg.stats.tokens = run.total_tokens ?? pg.stats.tokens;
@@ -2147,6 +2163,8 @@ async function finishPlaygroundRun(pg, runId) {
 // The event stream is the only live source of iteration/tool counters; the
 // totals in `agent_runs` land only when the run is over.
 function applyPlaygroundStatsEvent(pg, ev) {
+  const status = activityStatusText(ev);
+  if (status) pg.status = status;
   if (ev.kind === 'iteration_started') {
     pg.stats.iteration = ev.n ?? pg.stats.iteration;
     if (ev.max) pg.stats.maxIterations = ev.max;
@@ -3546,7 +3564,9 @@ function renderAssist() {
   if (!chat) return;
   chat.innerHTML = as.messages.map((m) => `
     <tf-chat-bubble role="${m.role === 'user' ? 'user' : 'assistant'}"
-      sender="${escapeAttr(m.role === 'user' ? '' : t('assist_sender'))}">${escapeHtml(m.content)}</tf-chat-bubble>
+      sender="${escapeAttr(m.role === 'user' ? '' : t('assist_sender'))}">${m.role === 'user'
+        ? escapeHtml(m.content)
+        : renderMarkdown(m.content || '', { thinkKeyPrefix: 'assist' })}</tf-chat-bubble>
   `).join('');
   if (as.proposal) chat.appendChild(assistProposalHtml(as.proposal));
   chat.scrollTop = chat.scrollHeight;

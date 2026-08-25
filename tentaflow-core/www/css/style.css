@@ -4569,6 +4569,33 @@ tf-screen {
 .tf-page-header .sub { font-size: 12px; color: var(--text-3); margin-top: 2px; }
 .tf-page-header .actions { margin-left: auto; display: flex; gap: 8px; align-items: center; }
 
+/* Live status of an answer in flight ("narzędzie · search_web", "Odpalam 3
+   agentów"). Lives above the text inside the bubble wrap and is removed with
+   the `status` attribute when the turn settles. */
+.bubble-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  margin-bottom: 6px;
+  padding: 3px 10px;
+  border-radius: 12px;
+  background: var(--bg-3);
+  border: 1px solid var(--border);
+  font-size: 11.5px;
+  color: var(--text-2);
+}
+.bubble-status-dot {
+  width: 7px; height: 7px; border-radius: 50%;
+  background: var(--accent-1);
+  box-shadow: 0 0 8px var(--accent-1);
+  animation: bubble-status-pulse 1.1s ease infinite;
+}
+.bubble-status-text { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 42ch; }
+@keyframes bubble-status-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+@media (prefers-reduced-motion: reduce) {
+  .bubble-status-dot { animation: none; }
+}
+
 /* Detail header jako karta — wzor .detail-header z addons-permissions mockupa.
    Duza ikona po lewej, meta (name/sub/badges) w srodku, akcje po prawej. */
 .tf-detail-header {

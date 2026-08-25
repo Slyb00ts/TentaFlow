@@ -5932,7 +5932,8 @@
     "step_question": "question",
     "step_permission": "permission",
     "step_resolved": "resolved",
-    "finished_toast": "{agent} finished — view result"
+    "finished_toast": "{agent} finished — view result",
+    "status_spawn_many": "Spawning {count} agents"
   },
   "addon_access": {
     "help_text": "The sections below are generated from [[uses_alias]] and [[uses_model]] declarations in the addon manifest. \"Required\" means the addon will not start without a grant; \"Optional\" — the addon handles its absence itself.",

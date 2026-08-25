@@ -49,7 +49,44 @@ export function activityLabels() {
 
 // Wire a widget to a session scope. Returns a teardown function that unsubscribes
 // the stream and detaches listeners. Re-call on session change.
-export function attachAgentActivity(widget, sessionId) {
+/// One-line "what is the model doing right now", built from the raw
+/// AgentRunEvent stream. Shared so the chat and the agent playground say the
+/// same thing about the same event instead of each inventing its own wording.
+///
+/// Spawns are counted rather than listed: an agent that delegates five tasks in
+/// one iteration should read as "Odpalam 5 agentów", not five separate lines
+/// racing each other.
+export function activityStatusText(event, labels = activityLabels()) {
+  if (!event || !event.kind) return '';
+  const l = labels;
+  switch (event.kind) {
+    case 'iteration_started':
+      return event.max
+        ? `${l.step_iteration} ${event.n}/${event.max}`
+        : `${l.step_iteration} ${event.n}`;
+    case 'tool_call_started':
+      return `${l.step_tool} · ${event.name ?? ''}`.trim();
+    case 'child_spawned': {
+      const count = Number(event.count ?? 0);
+      return count > 1
+        ? t('agent_activity.status_spawn_many', 'Odpalam {count} agentów').replace('{count}', String(count))
+        : `${l.step_child} · ${event.agent ?? ''}`.trim();
+    }
+    case 'user_question':
+      return l.step_question;
+    case 'permission_request':
+      return l.step_permission;
+    case 'compaction':
+      return l.step_compaction;
+    default:
+      return '';
+  }
+}
+
+/// `opts.onStatus` receives the one-line "what is happening now" for every
+/// event that has one. The chat feeds it into the streaming bubble; the widget
+/// keeps its own timeline either way.
+export function attachAgentActivity(widget, sessionId, opts = {}) {
   if (!widget || !sessionId) return () => {};
 
   widget.labels = activityLabels();
@@ -108,6 +145,10 @@ export function attachAgentActivity(widget, sessionId) {
       onChunk: (body) => {
         if (!body || body.variant !== 'AgentRunEvent') return;
         widget.applyEvent(body);
+        if (typeof opts.onStatus === 'function') {
+          const status = activityStatusText(body);
+          if (status) opts.onStatus(status, body);
+        }
         // A successfully finished background child → a subtle toast (§3.9).
         // Only `completed` claims completion; a failed/cancelled child must not.
         if (body.kind === 'child_finished' && (body.run_id || body.runId)) {

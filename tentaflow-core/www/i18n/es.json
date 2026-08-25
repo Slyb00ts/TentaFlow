@@ -4889,7 +4889,8 @@
     "step_question": "pregunta",
     "step_permission": "permiso",
     "step_resolved": "resuelto",
-    "finished_toast": "{agent} terminó — ver resultado"
+    "finished_toast": "{agent} terminó — ver resultado",
+    "status_spawn_many": "Lanzando {count} agentes"
   },
   "addon_access": {
     "help_text": "Las secciones siguientes se generan a partir de las declaraciones [[uses_alias]] y [[uses_model]] del manifiesto del addon. «Required» significa que el addon no arrancará sin la concesión; «Optional» — el addon gestiona su ausencia.",

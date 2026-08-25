@@ -5983,7 +5983,8 @@
     "step_question": "pytanie",
     "step_permission": "uprawnienie",
     "step_resolved": "rozwiązano",
-    "finished_toast": "{agent} ukończył — zobacz wynik"
+    "finished_toast": "{agent} ukończył — zobacz wynik",
+    "status_spawn_many": "Odpalam {count} agentów"
   },
   "addon_access": {
     "help_text": "Sekcje poniżej są generowane z deklaracji [[uses_alias]] i [[uses_model]] w manifeście addona. „Required” oznacza że addon nie wystartuje bez grantu; „Optional” — addon sam radzi sobie z brakiem.",
