@@ -1,7 +1,7 @@
 [addon]
 id = "deep-research"
 name = "Deep Research"
-version = "0.2.0"
+version = "0.2.1"
 description = "Wyszukiwanie internetu, pobieranie publicznych stron i ekstrakcja tekstu przez Core Web Research SDK."
 category = "ai"
 keywords = ["research", "web", "search", "crawler", "internet", "sources"]
@@ -135,7 +135,7 @@ required = false
 [[tool.parameter]]
 name = "read_limit"
 param_type = "number"
-description = "Ile stron przeczytac i strescic (domyslnie 5)."
+description = "Ile stron przeczytac i strescic (domyslnie 3). Kazda strona to jedno wywolanie modelu."
 required = false
 
 [[tool.parameter]]

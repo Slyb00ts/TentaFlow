@@ -1734,7 +1734,14 @@ pub fn agent_run_flow_json() -> String {
              // No max_tokens: an unset budget follows the model's own context
              // (inference::default_response_budget). A fixed number here cut
              // every agent answer at 4096 tokens regardless of the model.
-             "config": {"model": "", "temperature": 0.7, "stream": true}},
+             //
+             // timeout_secs above the executor's 600 s default: composing an
+             // answer from a full research fan-out is one long generation, and
+             // a node budget shorter than the agent's own run budget kills the
+             // run from the inside — the run reports failure while still well
+             // inside the time the operator gave it.
+             "config": {"model": "", "temperature": 0.7, "stream": true,
+                        "timeout_secs": 1800}},
             {"id": "x1", "type": "tool_exec", "position": {"x": 1800, "y": 0},
              "region": "agent_turn",
              "config": {"max_result_chars": 16000, "max_tool_calls_per_iteration": 16}},
@@ -2418,12 +2425,16 @@ fn general_agent_tools(has_memory_addon: bool) -> &'static str {
 const RESEARCHER_AGENT_PROMPT: &str = concat!(
     "Jestes agentem badawczym. Dostajesz zadanie i masz na nie odpowiedziec na podstawie tego, ",
     "co faktycznie znajdziesz w internecie — nie rozszerzasz zakresu poza zlecone pytanie.\n\n",
-    "ZACZNIJ od rozbicia zadania na kilka (zwykle 3-6) ROZNYCH zapytan, ktore razem pokrywaja ",
-    "jego strony: rozne aspekty, rozne sformulowania, rozne zrodla. Nastepnie wywolaj ",
-    "deep-research.research_query OSOBNO dla kazdego zapytania W TEJ SAMEJ TURZE — takie ",
-    "wywolania wykonaja sie rownolegle, wiec jedna tura z szescioma zapytaniami jest znacznie ",
-    "szybsza niz szesc kolejnych tur. W `question` podaj cale zadanie, zeby kazda strona byla ",
-    "streszczana pod to, co naprawde chcesz wiedziec.\n\n",
+    "ZACZNIJ od rozbicia zadania na 3-5 ROZNYCH zapytan, ktore razem pokrywaja jego strony: ",
+    "rozne aspekty, rozne sformulowania, rozne zrodla. Wywolaj deep-research.research_query ",
+    "OSOBNO dla kazdego zapytania W TEJ SAMEJ TURZE — takie wywolania wykonaja sie rownolegle, ",
+    "wiec jedna tura z pieciona zapytaniami jest znacznie szybsza niz piec kolejnych tur. W ",
+    "`question` podaj cale zadanie, zeby kazda strona byla streszczana pod to, co naprawde ",
+    "chcesz wiedziec.\n\n",
+    "JEDNA runda zwykle wystarcza. Kazde zapytanie czyta i streszcza kilka stron, wiec dwadziescia ",
+    "zapytan to setki wywolan modelu i odpowiedz, ktora nie zdazy powstac. Po pierwszej rundzie ",
+    "ODPOWIEDZ na podstawie tego, co masz. Druga runda tylko wtedy, gdy w ustaleniach brakuje ",
+    "czegos, o co zadanie wprost pyta — i wtedy maksymalnie 2-3 zapytania celowane w te luke.\n\n",
     "`research_query` czyta strony i zwraca ustalenia z KAZDEJ osobno, juz streszczone — to ",
     "jest twoje podstawowe narzedzie i w typowym zadaniu jedyne, ktorego uzywasz.\n\n",
     "fetch_url jest WYJATKIEM, nie uzupelnieniem. Wolno go uzyc tylko wtedy, gdy adres nie ",
