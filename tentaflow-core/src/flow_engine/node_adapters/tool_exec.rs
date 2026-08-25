@@ -780,8 +780,19 @@ impl ToolExecNodeAdapter {
     /// tej funkcji — w tym KAZDE narzedzie addonu — laduje w trybie wylacznym.
     /// Pomylka w te strone kosztuje czas; w druga kosztowalaby splatane zapisy
     /// albo dwa rownolegle pytania do czlowieka.
-    fn is_parallel_safe(name: &str) -> bool {
-        matches!(
+    /// Whether `name` may run alongside the other calls of the same turn.
+    ///
+    /// Core read-only tools are listed here. An addon tool qualifies only when
+    /// its manifest declares `read_only` — the harness cannot infer it, and
+    /// guessing wrong means running a mutating tool concurrently with itself.
+    /// Addon instances already come from a bounded pool, so concurrency is safe
+    /// for the runtime; what needed declaring is the tool's own semantics.
+    ///
+    /// Without this an agent that emits five searches in one turn ran them
+    /// strictly one after another, because every addon tool fell through to the
+    /// sequential path.
+    fn is_parallel_safe(name: &str, addon_tools: &[crate::addon::ToolDefinition]) -> bool {
+        if matches!(
             CoreToolName::from_public_name(name),
             Some(
                 CoreToolName::FsRead
@@ -795,7 +806,12 @@ impl ToolExecNodeAdapter {
                     | CoreToolName::ProjectSearch
                     | CoreToolName::ProjectListSources
             )
-        )
+        ) {
+            return true;
+        }
+        crate::addon::tool_dispatch::resolve_tool(addon_tools, name)
+            .map(|t| t.read_only)
+            .unwrap_or(false)
     }
 
     /// Wykonuje JEDNO wywolanie narzedzia. Wydzielone z petli, zeby ta sama
@@ -1108,6 +1124,9 @@ impl NodeAdapter for ToolExecNodeAdapter {
         // Wyniki i tak wracaja w kolejnosci modelu — `join_all` zachowuje
         // kolejnosc wejscia — wiec audyt i wiadomosci role=tool ustawiaja sie
         // dokladnie tak, jak przy wykonaniu sekwencyjnym.
+        // Read once per turn: the grouping below asks about every call, and the
+        // catalog is a clone of the whole registry.
+        let addon_tools = service.addon_tool_catalog();
         let max_parallel = Self::config_usize(
             node,
             "max_parallel_tool_calls",
@@ -1136,11 +1155,11 @@ impl NodeAdapter for ToolExecNodeAdapter {
                 }
                 break;
             }
-            let group_len = if Self::is_parallel_safe(&calls[idx].name) {
+            let group_len = if Self::is_parallel_safe(&calls[idx].name, &addon_tools) {
                 calls[idx..]
                     .iter()
                     .take(max_parallel)
-                    .take_while(|c| Self::is_parallel_safe(&c.name))
+                    .take_while(|c| Self::is_parallel_safe(&c.name, &addon_tools))
                     .count()
             } else {
                 1
@@ -1778,7 +1797,7 @@ mod tests {
             "core.project_list_sources",
         ] {
             assert!(
-                ToolExecNodeAdapter::is_parallel_safe(name),
+                ToolExecNodeAdapter::is_parallel_safe(name, &[]),
                 "{name} to odczyt i powinien isc rownolegle"
             );
         }
@@ -1801,7 +1820,7 @@ mod tests {
             "core.project_case_save",
         ] {
             assert!(
-                !ToolExecNodeAdapter::is_parallel_safe(name),
+                !ToolExecNodeAdapter::is_parallel_safe(name, &[]),
                 "{name} zmienia stan albo wymaga kolejnosci — musi byc wylaczne"
             );
         }
@@ -1811,13 +1830,51 @@ mod tests {
     /// laduje w trybie wylacznym. To jest ta strona pomylki, ktora kosztuje czas,
     /// a nie poprawnosc.
     #[test]
-    fn unknown_and_addon_tools_default_to_exclusive() {
+    fn unknown_and_undeclared_addon_tools_default_to_exclusive() {
         for name in ["notes.search", "rag.ask", "totally_unknown", ""] {
             assert!(
-                !ToolExecNodeAdapter::is_parallel_safe(name),
+                !ToolExecNodeAdapter::is_parallel_safe(name, &[]),
                 "{name} nie jest znane — domyslnie wylaczne"
             );
         }
+    }
+
+    fn catalog_entry(addon_id: &str, tool_name: &str, read_only: bool) -> crate::addon::ToolDefinition {
+        crate::addon::ToolDefinition {
+            addon_id: addon_id.to_string(),
+            package_id: addon_id.to_string(),
+            tool_name: tool_name.to_string(),
+            description: String::new(),
+            parameters_schema: json!({"type": "object"}),
+            return_schema: None,
+            keywords: Vec::new(),
+            read_only,
+        }
+    }
+
+    /// An addon tool the manifest declares read-only joins the parallel group;
+    /// one that does not stays exclusive even from the same addon. This is what
+    /// lets an agent emit five searches in one turn and have them actually run
+    /// at the same time.
+    #[test]
+    fn addon_tool_goes_parallel_only_when_declared_read_only() {
+        let catalog = vec![
+            catalog_entry("deep-research", "search_web", true),
+            catalog_entry("deep-research", "save_report", false),
+        ];
+
+        assert!(ToolExecNodeAdapter::is_parallel_safe(
+            "deep-research.search_web",
+            &catalog
+        ));
+        assert!(!ToolExecNodeAdapter::is_parallel_safe(
+            "deep-research.save_report",
+            &catalog
+        ));
+        assert!(
+            !ToolExecNodeAdapter::is_parallel_safe("deep-research.absent", &catalog),
+            "narzedzie spoza katalogu zostaje wylaczne"
+        );
     }
 
     /// Narzedzia, ktore SAME trzymaja swoj deadline, nie moga dostac drugiego —

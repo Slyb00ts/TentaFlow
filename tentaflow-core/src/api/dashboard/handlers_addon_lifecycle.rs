@@ -1993,6 +1993,7 @@ mod declared_status_tests {
             }),
             return_schema: Some(serde_json::json!({ "type": "object" })),
             keywords: vec![],
+            read_only: false,
         };
         let decl = tool_decl_from_manifest(&t);
         assert_eq!(decl.name, "search");

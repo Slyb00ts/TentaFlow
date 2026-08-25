@@ -420,6 +420,15 @@ pub struct ManifestTool {
     pub return_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Deklaracja, ze wywolanie nie zmienia stanu addonu ani niczego poza nim.
+    ///
+    /// Tylko takie narzedzie wolno uruchomic rownolegle z innym wywolaniem tej
+    /// samej tury. Domyslnie `false`, bo dla dowolnego addonu nie da sie tego
+    /// zalozyc — `notes.create` wywolane piec razy naraz to piec notatek w
+    /// nieokreslonej kolejnosci. Deklaruje autor addonu, ktory jako jedyny wie,
+    /// co jego narzedzie robi.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 /// Parametr narzedzia z [[tool.parameter]] — skladany do `parameters_schema`.
@@ -494,6 +503,10 @@ pub struct ToolDefinition {
     pub return_schema: Option<serde_json::Value>,
     #[serde(default)]
     pub keywords: Vec<String>,
+    /// Carried from the manifest: the tool declares it changes no state, so the
+    /// harness may run it alongside other calls from the same turn.
+    #[serde(default)]
+    pub read_only: bool,
 }
 
 // =============================================================================
@@ -2016,6 +2029,7 @@ impl AddonManager {
                         parameters_schema: tool.parameters_schema.clone(),
                         return_schema: tool.return_schema.clone(),
                         keywords: tool.keywords.clone(),
+                        read_only: tool.read_only,
                     });
                 }
             }
@@ -3558,6 +3572,7 @@ impl AddonManager {
                 parameters_schema: tool.parameters_schema.clone(),
                 return_schema: tool.return_schema.clone(),
                 keywords: tool.keywords.clone(),
+                read_only: tool.read_only,
             });
         }
 

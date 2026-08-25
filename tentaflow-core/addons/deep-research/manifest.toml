@@ -41,6 +41,7 @@ auto_start = false
 
 [[tool]]
 id = "search_web"
+read_only = true
 display_name = "Szukaj w internecie"
 description = "Wyszukuje publiczne strony przez skonfigurowany provider search i zwraca liste wynikow."
 keywords = ["search", "web", "internet", "research"]
@@ -65,6 +66,7 @@ required = false
 
 [[tool]]
 id = "fetch_url"
+read_only = true
 display_name = "Pobierz strone"
 description = "Pobiera publiczny URL HTTP/HTTPS i ekstrahuje czytelny tekst."
 keywords = ["fetch", "read", "url", "page"]
@@ -83,6 +85,7 @@ required = false
 
 [[tool]]
 id = "read_search_results"
+read_only = true
 display_name = "Czytaj wyniki wyszukiwania"
 description = "Wyszukuje publiczne strony i czyta tresc wybranych wynikow bez syntezy LLM."
 keywords = ["deep", "research", "sources", "read", "content"]

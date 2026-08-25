@@ -245,6 +245,12 @@ impl AgentService {
     /// Permission enforcement happens inside `AddonManager::call_tool`; this is
     /// the synchronous wasmtime path the tool_exec block wraps in
     /// `spawn_blocking` (§2.12).
+    /// Every registered addon tool definition, for callers that need a tool's
+    /// declared properties rather than its result.
+    pub fn addon_tool_catalog(&self) -> Vec<crate::addon::ToolDefinition> {
+        self.tool_dispatcher.tool_catalog()
+    }
+
     pub fn dispatch_addon_tool(
         &self,
         tool_name: &str,

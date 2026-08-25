@@ -95,6 +95,13 @@ impl ToolDispatcher {
         Self { addon_manager }
     }
 
+    /// Every registered addon tool definition. Read once per turn by the
+    /// harness, which needs each tool's `read_only` declaration to decide what
+    /// may run alongside what.
+    pub fn tool_catalog(&self) -> Vec<ToolDefinition> {
+        self.addon_manager.list_tools()
+    }
+
     /// Executes a single tool call. Permission enforcement (the per-addon
     /// "llm" permission) happens inside `AddonManager::call_tool`, so a
     /// denied user fails there — no separate pre-check needed here.
@@ -215,6 +222,7 @@ mod tests {
             }),
             return_schema: None,
             keywords: vec!["remember".to_string()],
+            read_only: false,
         }
     }
 

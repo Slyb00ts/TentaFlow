@@ -2410,6 +2410,10 @@ pub fn parse_manifest_toml(content: &str) -> Result<AddonManifest> {
                         parameters_schema: build_parameters_schema(&parameters),
                         return_schema: None,
                         keywords: keywords_t,
+                        read_only: t
+                            .get("read_only")
+                            .and_then(|v| v.as_bool())
+                            .unwrap_or(false),
                     }
                 })
                 .collect()
