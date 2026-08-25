@@ -160,15 +160,40 @@ pub fn apply_prompt_mode_response(response: &mut ChatCompletionResponse, tools: 
 /// Complete `<tool_call>` blocks are likewise none of this function's business;
 /// `parse_tool_calls` has already turned those into structured calls.
 fn strip_truncated_tool_call(text: &str) -> String {
-    let Some(open) = text.rfind(OPEN_TAG) else {
-        return text.to_string();
+    let trimmed = strip_orphan_call_closers(text);
+    let Some(open) = trimmed.rfind(OPEN_TAG) else {
+        return trimmed;
     };
     // A closing tag after the last opener means the block is complete and was
     // handled upstream; nothing to trim.
-    if text[open..].contains(CLOSE_TAG) {
-        return text.to_string();
+    if trimmed[open..].contains(CLOSE_TAG) {
+        return trimmed;
     }
-    text[..open].trim_end().to_string()
+    trimmed[..open].trim_end().to_string()
+}
+
+/// Closing markers with no opener left in the text. A model that mixes the JSON
+/// form we ask for with its own tag form trails `</parameter>`, `</function>` or
+/// `</tool_call>` after the block `parse_tool_calls` already removed, and those
+/// leftovers were shown to the reader as part of the answer. Only unmatched
+/// closers are dropped — a closer that still has its opener belongs to a block
+/// handled elsewhere and is left alone.
+fn strip_orphan_call_closers(text: &str) -> String {
+    const PAIRS: [(&str, &str); 3] = [
+        (OPEN_TAG, CLOSE_TAG),
+        ("<function=", "</function>"),
+        ("<parameter=", "</parameter>"),
+    ];
+    let mut out = text.to_string();
+    for (opener, closer) in PAIRS {
+        while !out.contains(opener) {
+            let Some(at) = out.find(closer) else {
+                break;
+            };
+            out.replace_range(at..at + closer.len(), "");
+        }
+    }
+    collapse_blank_lines(out.trim_end())
 }
 
 /// Renders the system-prompt section advertising `tools` to a model without
@@ -362,6 +387,9 @@ fn strip_inner_fence(inner: &str) -> &str {
 /// ways). Returns the OpenAI-compatible `(name, arguments-as-JSON-string)`
 /// pair, or `None` when the block is not a usable call.
 fn parse_call_body(inner: &str) -> Option<(String, String)> {
+    if let Some(call) = parse_xml_call_body(inner) {
+        return Some(call);
+    }
     let value: serde_json::Value = serde_json::from_str(inner).ok()?;
     let obj = value.as_object()?;
     let name = obj.get("name")?.as_str()?.trim().to_string();
@@ -382,6 +410,46 @@ fn parse_call_body(inner: &str) -> Option<(String, String)> {
         Some(other) => other.to_string(),
     };
     Some((name, arguments))
+}
+
+/// Second accepted body shape: the tag form some open-weight models emit from
+/// their own training instead of the JSON we ask for —
+/// `<function=name><parameter=key>value</parameter></function>`. Without this
+/// the block failed JSON parsing, the call was never executed, and its markup
+/// stayed in the answer the reader sees. Values arrive untyped; `coerce_arguments`
+/// casts them against the tool schema afterwards, exactly as for the JSON form.
+fn parse_xml_call_body(inner: &str) -> Option<(String, String)> {
+    let open = inner.find("<function=")?;
+    let rest = &inner[open + "<function=".len()..];
+    let name_end = rest.find('>')?;
+    let name = rest[..name_end].trim().trim_matches('"').to_string();
+    if name.is_empty() {
+        return None;
+    }
+    let body = &rest[name_end + 1..];
+
+    let mut arguments = serde_json::Map::new();
+    let mut cursor = body;
+    while let Some(param_open) = cursor.find("<parameter=") {
+        let after = &cursor[param_open + "<parameter=".len()..];
+        let Some(key_end) = after.find('>') else {
+            break;
+        };
+        let key = after[..key_end].trim().trim_matches('"').to_string();
+        let value_part = &after[key_end + 1..];
+        let Some(value_end) = value_part.find("</parameter>") else {
+            break;
+        };
+        if !key.is_empty() {
+            arguments.insert(
+                key,
+                serde_json::Value::String(value_part[..value_end].trim().to_string()),
+            );
+        }
+        cursor = &value_part[value_end + "</parameter>".len()..];
+    }
+
+    Some((name, serde_json::Value::Object(arguments).to_string()))
 }
 
 /// When the whole block is wrapped in a markdown fence
@@ -469,7 +537,7 @@ fn collapse_blank_lines(text: &str) -> String {
 
 #[cfg(test)]
 mod markup_tests {
-    use super::strip_truncated_tool_call;
+    use super::{parse_call_body, strip_truncated_tool_call};
 
     /// Generation cut off by the token budget leaves an opener with no partner;
     /// everything from it on is an unfinished machine block, not prose.
@@ -491,6 +559,42 @@ mod markup_tests {
     fn think_block_survives_untouched() {
         let text = "<think>weighing options</think>\n\nSearXNG is a metasearch engine.";
         assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    #[test]
+    fn orphan_closers_from_mixed_syntax_are_dropped() {
+        let text = "Sprawdzam.\n\n</parameter>\n</function>\n</tool_call>";
+
+        assert_eq!(strip_truncated_tool_call(text), "Sprawdzam.");
+    }
+
+    #[test]
+    fn closer_with_its_opener_survives() {
+        let text = "<function=x</function>";
+
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    #[test]
+    fn tag_form_call_body_is_parsed() {
+        let (name, arguments) = parse_call_body(
+            "<function=search_web>\n<parameter=query>RADV mesa</parameter>\n             <parameter=limit>3</parameter>\n</function>",
+        )
+        .expect("tag form should parse");
+
+        assert_eq!(name, "search_web");
+        let args: serde_json::Value = serde_json::from_str(&arguments).unwrap();
+        assert_eq!(args["query"], "RADV mesa");
+        assert_eq!(args["limit"], "3");
+    }
+
+    #[test]
+    fn tag_form_without_parameters_yields_empty_arguments() {
+        let (name, arguments) =
+            parse_call_body("<function=ping></function>").expect("tag form should parse");
+
+        assert_eq!(name, "ping");
+        assert_eq!(arguments, "{}");
     }
 
     #[test]
