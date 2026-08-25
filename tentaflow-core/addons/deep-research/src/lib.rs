@@ -137,7 +137,7 @@ fn handle_read_search_results(params: &Value) -> Value {
 
 fn provider_from_params(params: &Value) -> Value {
     if let Some(provider) = params.get("provider") {
-        return provider.clone();
+        return normalize_provider(provider);
     }
     if let Some(base_url) = params.get("searxng_base_url").and_then(Value::as_str) {
         return json!({"kind": "searxng", "base_url": base_url});
@@ -188,6 +188,55 @@ fn call_sdk(call: impl FnOnce() -> Result<Value, AbiError>) -> Value {
             value
         }
         Err(e) => error(format!("Blad web research SDK: {}", e)),
+    }
+}
+
+/// Turns whatever the model put in `provider` into the tagged shape Core
+/// deserializes, or drops it so Core falls back to local/mesh/public search.
+///
+/// `SearchProviderConfig` is tagged by `kind`, and a model asked for "the
+/// duckduckgo provider" naturally writes `"duckduckgo"` or `{"name": ...}` —
+/// both of which used to travel to Core untouched and die there as
+/// `missing field \`kind\``, three times in a row, with no way for the model to
+/// recover. A JSON null is likewise not a provider: it means "you choose".
+fn normalize_provider(provider: &Value) -> Value {
+    match provider {
+        // Explicit null / empty string = no preference.
+        Value::Null => Value::Null,
+        Value::String(name) => match name.trim().to_ascii_lowercase().as_str() {
+            "" => Value::Null,
+            // Only the two providers that need no credentials can be named by a
+            // bare string; brave and tavily require an api key, so they can only
+            // arrive as a full object.
+            "duckduckgo" | "ddg" => json!({"kind": "duckduckgo"}),
+            "searxng" => json!({"kind": "searxng"}),
+            _ => Value::Null,
+        },
+        Value::Object(obj) => {
+            if obj.is_empty() {
+                return Value::Null;
+            }
+            if obj.contains_key("kind") {
+                return provider.clone();
+            }
+            // Accept the near-misses a model produces instead of failing deep in
+            // Core: the tag under another name, or a bare searxng base_url.
+            for alias in ["type", "name", "provider"] {
+                if let Some(kind) = obj.get(alias).and_then(Value::as_str) {
+                    let mut normalized = obj.clone();
+                    normalized.remove(alias);
+                    normalized.insert("kind".to_string(), Value::String(kind.to_string()));
+                    return Value::Object(normalized);
+                }
+            }
+            if obj.contains_key("base_url") {
+                let mut normalized = obj.clone();
+                normalized.insert("kind".to_string(), Value::String("searxng".to_string()));
+                return Value::Object(normalized);
+            }
+            Value::Null
+        }
+        _ => Value::Null,
     }
 }
 

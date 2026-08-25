@@ -60,7 +60,7 @@ required = false
 [[tool.parameter]]
 name = "provider"
 param_type = "object"
-description = "Opcjonalna konfiguracja providera search. Gdy puste, Core uzyje lokalnego SearXNG, zdalnego SearXNG przez mesh albo publicznego DuckDuckGo."
+description = "Opcjonalny wybor providera. ZOSTAW PUSTE, zeby Core sam wybral lokalny SearXNG, zdalny SearXNG przez mesh albo publiczny DuckDuckGo. Gdy podajesz jawnie, uzyj obiektu z polem kind: {\"kind\":\"duckduckgo\"} albo {\"kind\":\"searxng\",\"base_url\":\"http://host:port\"}. Sam napis \"duckduckgo\" lub \"searxng\" tez zadziala."
 required = false
 
 [[tool]]
@@ -102,5 +102,5 @@ required = false
 [[tool.parameter]]
 name = "provider"
 param_type = "object"
-description = "Opcjonalna konfiguracja providera search. Gdy puste, Core uzyje lokalnego SearXNG, zdalnego SearXNG przez mesh albo publicznego DuckDuckGo."
+description = "Opcjonalny wybor providera. ZOSTAW PUSTE, zeby Core sam wybral lokalny SearXNG, zdalny SearXNG przez mesh albo publiczny DuckDuckGo. Gdy podajesz jawnie, uzyj obiektu z polem kind: {\"kind\":\"duckduckgo\"} albo {\"kind\":\"searxng\",\"base_url\":\"http://host:port\"}. Sam napis \"duckduckgo\" lub \"searxng\" tez zadziala."
 required = false

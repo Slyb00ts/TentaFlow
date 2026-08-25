@@ -72,6 +72,21 @@ fn error_result(call: &LlmToolCall, error: String) -> ToolCallResult {
     }
 }
 
+/// True when a tool that RAN says in its own payload that it failed.
+///
+/// The addon SDK wraps every answer as `{"ok": true, ...}` / `{"ok": false,
+/// "error": "..."}`, and a host function that fails still hands the guest a
+/// well-formed response — so the wasm call succeeds while the operation did not.
+/// Reading the flag here is what makes that difference visible to the agent loop,
+/// the run log, the audit trail and the run timeline; without it a whole research
+/// run of nothing but errors reported as sixteen successful tool calls.
+///
+/// A payload with no `ok` field is NOT a failure: core tools and hand-written
+/// addons return bare result objects, and only the SDK helpers add the flag.
+fn addon_payload_failed(output: &Value) -> bool {
+    output.get("ok").and_then(Value::as_bool) == Some(false)
+}
+
 /// Resolves an ask_user `timeout_secs` argument (clamped to a sane ceiling),
 /// defaulting to the shared 600 s budget when absent (§3.13 A).
 fn resolve_timeout(args: &Value) -> Duration {
@@ -706,11 +721,16 @@ impl ToolExecNodeAdapter {
         })
         .await;
         match outcome {
+            // A wasm tool that ran to completion still reports its own outcome in
+            // the payload: the addon SDK envelope carries `ok: false` plus an
+            // `error` when the call failed. Without reading it a failed research
+            // call reached the model, the run log and the timeline as a success,
+            // and the agent loop had no reason to stop retrying.
             Ok(Ok(output)) => ToolCallResult {
                 tool_call_id: call.id.clone(),
                 name: call.name.clone(),
                 content: serde_json::to_string(&output).unwrap_or_default(),
-                success: true,
+                success: !addon_payload_failed(&output),
             },
             Ok(Err(e)) => error_result(call, e.to_string()),
             Err(e) => error_result(&call_for_err, format!("tool dispatch join failed: {e}")),
@@ -1202,6 +1222,32 @@ impl NodeAdapter for ToolExecNodeAdapter {
             .extend(format_results_as_messages(&truncated));
 
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod payload_tests {
+    use super::addon_payload_failed;
+    use serde_json::json;
+
+    /// The SDK failure envelope must mark the call failed — otherwise a whole
+    /// research run of errors reports as successful tool calls.
+    #[test]
+    fn ok_false_is_a_failure() {
+        assert!(addon_payload_failed(&json!({"ok": false, "error": "http status 404"})));
+    }
+
+    #[test]
+    fn ok_true_is_a_success() {
+        assert!(!addon_payload_failed(&json!({"ok": true, "results": []})));
+    }
+
+    /// Core tools and hand-written addons return bare objects with no flag;
+    /// treating those as failures would break every one of them.
+    #[test]
+    fn missing_flag_is_not_a_failure() {
+        assert!(!addon_payload_failed(&json!({"results": [1, 2]})));
+        assert!(!addon_payload_failed(&json!("plain string")));
     }
 }
 
