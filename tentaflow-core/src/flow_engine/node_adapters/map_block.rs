@@ -135,6 +135,33 @@ impl MapNodeAdapter {
             )),
         }
     }
+
+    /// Splices one level of nesting out of the resolved items.
+    ///
+    /// A fan-out that first searches N queries in parallel arrives at the next
+    /// stage holding N result LISTS, and what it wants to distribute is the
+    /// flat list of individual results. CEL has no flatten macro, so without
+    /// this the flow would have to nest a second map inside the first — which
+    /// multiplies the concurrency caps instead of applying one. Opt-in per node
+    /// (`flatten_items`), one level only: deeper nesting is a modelling
+    /// mistake, not something to silently collapse.
+    fn flatten_one_level(items: Vec<Value>) -> Vec<Value> {
+        let mut out = Vec::with_capacity(items.len());
+        for item in items {
+            match item {
+                Value::Array(inner) => out.extend(inner),
+                other => out.push(other),
+            }
+        }
+        out
+    }
+
+    fn flatten_enabled(node: &FlowNode) -> bool {
+        node.config
+            .get("flatten_items")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
 }
 
 /// One element body result paired with its input index, so out-of-order
@@ -246,7 +273,10 @@ impl NodeAdapter for MapNodeAdapter {
             .map(|i| (*i.envelope).clone())
             .unwrap_or_else(|| (*ctx.initial_envelope).clone());
 
-        let items = Self::resolve_items(&Self::items_expr(node), &base)?;
+        let mut items = Self::resolve_items(&Self::items_expr(node), &base)?;
+        if Self::flatten_enabled(node) {
+            items = Self::flatten_one_level(items);
+        }
         let total = items.len() as u32;
         let concurrency = Self::concurrency(node, &base);
         let policy = Self::error_policy(node);
@@ -563,6 +593,38 @@ mod tests {
             from_port: "full".into(),
             envelope: Arc::new(env),
         }
+    }
+
+    #[test]
+    fn flatten_splices_one_level_of_nesting() {
+        let items = vec![
+            json!([{"url": "a"}, {"url": "b"}]),
+            json!([{"url": "c"}]),
+            json!({"url": "d"}),
+        ];
+
+        let flat = MapNodeAdapter::flatten_one_level(items);
+
+        assert_eq!(flat.len(), 4);
+        assert_eq!(flat[0]["url"], "a");
+        assert_eq!(flat[3]["url"], "d");
+    }
+
+    #[test]
+    fn flatten_stops_after_one_level() {
+        let items = vec![json!([[1, 2], [3]])];
+
+        let flat = MapNodeAdapter::flatten_one_level(items);
+
+        assert_eq!(flat, vec![json!([1, 2]), json!([3])]);
+    }
+
+    #[test]
+    fn flatten_is_opt_in() {
+        assert!(!MapNodeAdapter::flatten_enabled(&node(json!({}))));
+        assert!(MapNodeAdapter::flatten_enabled(
+            &node(json!({"flatten_items": true}))
+        ));
     }
 
     #[test]
