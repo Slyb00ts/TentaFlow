@@ -2450,7 +2450,7 @@ pub mod prelude {
     pub use crate::ui;
     pub use crate::{
         read_string, write_string, ABI_OUTPUT_BUFFER_TOO_SMALL,
-        generate,
+        generate, generate_with_options,
         store_get, store_set,
         state_get, state_set, state_delete, state_list,
         StateTier, StateError, StateEntryMeta, StateListResult,

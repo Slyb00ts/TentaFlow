@@ -20,6 +20,12 @@ description = "Wyszukuje i czyta publiczne strony przez kontrolowany Core Web Re
 risk = "critical"
 
 [[permission]]
+id = "llm"
+display_name = "Model jezykowy"
+description = "Streszcza kazda przeczytana strone osobnym wywolaniem modelu, zeby surowa tresc nie trafiala do kontekstu agenta."
+risk = "medium"
+
+[[permission]]
 id = "flow_blocks"
 display_name = "Research flow blocks"
 description = "Udostepnia wyszukiwanie i czytanie stron jako bloki flow buildera."
@@ -106,4 +112,34 @@ required = false
 name = "provider"
 param_type = "object"
 description = "Opcjonalny wybor providera. ZOSTAW PUSTE, zeby Core sam wybral lokalny SearXNG, zdalny SearXNG przez mesh albo publiczny DuckDuckGo. Gdy podajesz jawnie, uzyj obiektu z polem kind: {\"kind\":\"duckduckgo\"} albo {\"kind\":\"searxng\",\"base_url\":\"http://host:port\"}. Sam napis \"duckduckgo\" lub \"searxng\" tez zadziala."
+required = false
+
+[[tool]]
+id = "research_query"
+read_only = true
+display_name = "Zbadaj zapytanie"
+description = "Wyszukuje jedno zapytanie, czyta najlepsze wyniki i zwraca ustalenia z KAZDEJ strony osobno, juz streszczone pod zadane pytanie. Uzyj tego zamiast czytania stron samodzielnie: surowa tresc nie wchodzi do rozmowy. Mozesz wywolac to narzedzie kilka razy w jednej turze, po jednym zapytaniu na wywolanie — beda wykonane rownolegle."
+
+[[tool.parameter]]
+name = "query"
+param_type = "string"
+description = "Pojedyncze zapytanie do wyszukiwarki."
+required = true
+
+[[tool.parameter]]
+name = "question"
+param_type = "string"
+description = "Pytanie, pod ktore streszczana jest kazda strona. Domyslnie samo zapytanie."
+required = false
+
+[[tool.parameter]]
+name = "read_limit"
+param_type = "number"
+description = "Ile stron przeczytac i strescic (domyslnie 5)."
+required = false
+
+[[tool.parameter]]
+name = "search_limit"
+param_type = "number"
+description = "Ile wynikow wyszukiwania rozwazyc jako kandydatow (domyslnie 10)."
 required = false
