@@ -83,12 +83,26 @@ impl MapNodeAdapter {
             .to_string()
     }
 
-    fn concurrency(node: &FlowNode) -> usize {
-        node.config
+    /// Resolves the fan-out width: `meta.map_max_concurrency` (set by
+    /// agent_context from the agent's subagent budget) overrides node config,
+    /// which overrides the default; always clamped to `MAX_CONCURRENCY`.
+    /// The agent budget wins because it is the operator's cap on how much one
+    /// agent may run at once — a flow author's number must not raise it.
+    fn concurrency(node: &FlowNode, envelope: &FlowEnvelope) -> usize {
+        let from_meta = envelope
+            .meta
+            .get("map_max_concurrency")
+            .and_then(|v| v.as_i64())
+            .filter(|n| *n > 0)
+            .map(|n| n as usize);
+        let from_config = node
+            .config
             .get("concurrency")
             .and_then(|v| v.as_u64())
             .map(|n| n as usize)
-            .filter(|n| *n > 0)
+            .filter(|n| *n > 0);
+        from_meta
+            .or(from_config)
             .unwrap_or(DEFAULT_CONCURRENCY)
             .min(MAX_CONCURRENCY)
     }
@@ -234,7 +248,7 @@ impl NodeAdapter for MapNodeAdapter {
 
         let items = Self::resolve_items(&Self::items_expr(node), &base)?;
         let total = items.len() as u32;
-        let concurrency = Self::concurrency(node);
+        let concurrency = Self::concurrency(node, &base);
         let policy = Self::error_policy(node);
 
         let semaphore = Arc::new(Semaphore::new(concurrency));
@@ -549,6 +563,41 @@ mod tests {
             from_port: "full".into(),
             envelope: Arc::new(env),
         }
+    }
+
+    #[test]
+    fn agent_budget_governs_fan_out_width() {
+        let mut env = FlowEnvelope::empty();
+        env.meta
+            .insert("map_max_concurrency".into(), json!(5));
+
+        // The flow author asked for 12; the operator's agent budget is 5 and wins.
+        assert_eq!(
+            MapNodeAdapter::concurrency(&node(json!({"concurrency": 12})), &env),
+            5
+        );
+    }
+
+    #[test]
+    fn node_config_applies_without_an_agent_budget() {
+        let env = FlowEnvelope::empty();
+
+        assert_eq!(
+            MapNodeAdapter::concurrency(&node(json!({"concurrency": 3})), &env),
+            3
+        );
+    }
+
+    #[test]
+    fn fan_out_width_is_clamped_to_the_hard_cap() {
+        let mut env = FlowEnvelope::empty();
+        env.meta
+            .insert("map_max_concurrency".into(), json!(9_999));
+
+        assert_eq!(
+            MapNodeAdapter::concurrency(&node(json!({})), &env),
+            MAX_CONCURRENCY
+        );
     }
 
     #[tokio::test]
