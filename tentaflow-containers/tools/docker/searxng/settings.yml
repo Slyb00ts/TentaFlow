@@ -13,7 +13,11 @@ general:
 search:
   safe_search: 0
   autocomplete: ""
-  default_lang: "auto"
+  # Zapytania badawcze sa techniczne i pisane po angielsku, a "auto" zostawia
+  # silnikom geolokalizacje po IP — Bing odpowiadal wtedy lokalnymi sklepami,
+  # ktore w dodatku blokuja pobieranie (403), zamiast dokumentacja i danymi
+  # producenta. Jezyk konkretnego zapytania i tak mozna podac per-request.
+  default_lang: "en"
   formats:
     - html
     - json
