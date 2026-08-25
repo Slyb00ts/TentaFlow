@@ -39,8 +39,12 @@ impl LocalInferenceHandler {
         request: &ChatCompletionRequest,
     ) -> anyhow::Result<ChatCompletionResponse> {
         let template = self.get_chat_template().await;
-        let deploy_params = self.inference_manager.read().await.get_deploy_params();
-        let params = Self::request_to_generate_params(request, &template, &deploy_params);
+        let (deploy_params, context_length) = {
+            let manager = self.inference_manager.read().await;
+            (manager.get_deploy_params(), manager.active_context_length())
+        };
+        let params =
+            Self::request_to_generate_params(request, &template, &deploy_params, context_length);
         let model_name = self
             .loaded_model_name()
             .await
@@ -72,8 +76,12 @@ impl LocalInferenceHandler {
         request: &ChatCompletionRequest,
     ) -> anyhow::Result<mpsc::Receiver<ChatCompletionChunk>> {
         let template = self.get_chat_template().await;
-        let deploy_params = self.inference_manager.read().await.get_deploy_params();
-        let params = Self::request_to_generate_params(request, &template, &deploy_params);
+        let (deploy_params, context_length) = {
+            let manager = self.inference_manager.read().await;
+            (manager.get_deploy_params(), manager.active_context_length())
+        };
+        let params =
+            Self::request_to_generate_params(request, &template, &deploy_params, context_length);
         let model_name = self
             .loaded_model_name()
             .await
@@ -232,6 +240,7 @@ impl LocalInferenceHandler {
         request: &ChatCompletionRequest,
         template: &ChatTemplate,
         deploy_params: &super::DeployParamsSnapshot,
+        context_length: Option<u32>,
     ) -> GenerateParams {
         // Konwertuj wiadomosci OpenAI na ChatMessage
         let chat_messages: Vec<ChatMessage> = request
@@ -274,6 +283,13 @@ impl LocalInferenceHandler {
         // load-time przez `LlamaCppEngine::load_model`, tu czytamy tylko
         // `mlx` mape — llama-cpp request-time używa `Default::default()`.
         let defaults = GenerateParams::from_mlx_deploy_defaults(&deploy_params.mlx);
+        // Only an EXPLICIT deploy-time value counts as a configured cap; the
+        // struct default must not masquerade as one.
+        let configured_max_tokens = deploy_params
+            .mlx
+            .get("default_max_tokens")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as u32);
 
         debug!(
             "Sformatowano prompt szablonem {:?}: {} znakow, {} stop sequences",
@@ -296,7 +312,15 @@ impl LocalInferenceHandler {
 
         GenerateParams {
             prompt,
-            max_tokens: request.max_tokens.unwrap_or(defaults.max_tokens),
+            // Precedence: what the caller asked for, else what the deploy
+            // configured, else the model's own context. `defaults.max_tokens`
+            // is NOT usable as the last resort — `GenerateParams::default()`
+            // fills it with a constant, and that constant used to cap every
+            // answer from an engine with no deploy-time override (llama.cpp).
+            max_tokens: request
+                .max_tokens
+                .or(configured_max_tokens)
+                .unwrap_or_else(|| super::default_response_budget(context_length)),
             temperature: request.temperature.unwrap_or(defaults.temperature),
             top_p: request.top_p.unwrap_or(defaults.top_p),
             top_k: defaults.top_k,

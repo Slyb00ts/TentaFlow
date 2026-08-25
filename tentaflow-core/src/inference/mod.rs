@@ -71,6 +71,24 @@ pub struct GenerateParams {
     pub memory_budget_mb: u32,
 }
 
+/// Ceiling on a single answer, in tokens. Not a product limit — a guard against
+/// a model with a huge advertised window running away forever. Anything the
+/// model can hold below this is allowed in full.
+pub const RESPONSE_TOKEN_CEILING: u32 = 128_000;
+
+/// How many tokens one answer may use when nothing asked for a specific number.
+///
+/// The whole context when the model is smaller than the ceiling, the ceiling
+/// otherwise. Emphatically NOT a small constant: the previous 2048 silently
+/// truncated long answers, and a tool-calling model cut off mid-`<tool_call>`
+/// left a half-written block in the chat and a call the harness never ran.
+pub fn default_response_budget(context_length: Option<u32>) -> u32 {
+    match context_length {
+        Some(ctx) => ctx.min(RESPONSE_TOKEN_CEILING),
+        None => RESPONSE_TOKEN_CEILING,
+    }
+}
+
 impl Default for GenerateParams {
     fn default() -> Self {
         Self {
@@ -357,6 +375,16 @@ impl InferenceManager {
     /// per chat completion request zeby zbudowac `GenerateParams` z
     /// `default_temperature`/`default_max_tokens`/`default_top_p` z
     /// `mlx` mapy jako baseline.
+    /// Context window of the loaded model, when an engine is active.
+    ///
+    /// Feeds the response budget: an answer is capped by what the model can
+    /// actually hold, not by a constant. See `default_response_budget`.
+    pub fn active_context_length(&self) -> Option<u32> {
+        let idx = self.active_engine?;
+        let info = self.engines.get(idx)?.model_info()?;
+        (info.context_length > 0).then_some(info.context_length)
+    }
+
     pub fn get_deploy_params(&self) -> DeployParamsSnapshot {
         self.active_deploy_params.clone()
     }

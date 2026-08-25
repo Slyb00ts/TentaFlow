@@ -108,7 +108,14 @@ pub fn apply_prompt_mode_response(response: &mut ChatCompletionResponse, tools: 
             continue;
         };
         let (cleaned, calls) = parse_tool_calls(text);
+        // Runs even when no call was parsed: a response cut short by the token
+        // budget leaves a dangling `<tool_call>` opener in an otherwise ordinary
+        // answer, and that fragment used to reach the chat bubble verbatim.
+        let cleaned = strip_truncated_tool_call(&cleaned);
         if calls.is_empty() {
+            if cleaned.as_str() != text.as_str() {
+                choice.message.content = Some(MessageContent::Text(cleaned));
+            }
             continue;
         }
         let tool_calls = calls
@@ -141,6 +148,27 @@ pub fn apply_prompt_mode_response(response: &mut ChatCompletionResponse, tools: 
         choice.message.tool_calls = Some(tool_calls);
         choice.finish_reason = Some("tool_calls".to_string());
     }
+}
+
+/// Drops an UNTERMINATED `<tool_call>` opener — the tail left when generation
+/// stops on the token budget mid-call.
+///
+/// Deliberately narrow. `<think>` blocks are NOT touched: they are a rendered
+/// feature, not noise. `md-lite.js` turns them into the collapsible thinking
+/// block the chat shows, keyed per message so the reader's open/closed choice
+/// sticks — stripping them here would delete a working part of the product.
+/// Complete `<tool_call>` blocks are likewise none of this function's business;
+/// `parse_tool_calls` has already turned those into structured calls.
+fn strip_truncated_tool_call(text: &str) -> String {
+    let Some(open) = text.rfind(OPEN_TAG) else {
+        return text.to_string();
+    };
+    // A closing tag after the last opener means the block is complete and was
+    // handled upstream; nothing to trim.
+    if text[open..].contains(CLOSE_TAG) {
+        return text.to_string();
+    }
+    text[..open].trim_end().to_string()
 }
 
 /// Renders the system-prompt section advertising `tools` to a model without
@@ -438,6 +466,40 @@ fn collapse_blank_lines(text: &str) -> String {
     }
     out.trim().to_string()
 }
+
+#[cfg(test)]
+mod markup_tests {
+    use super::strip_truncated_tool_call;
+
+    /// Generation cut off by the token budget leaves an opener with no partner;
+    /// everything from it on is an unfinished machine block, not prose.
+    #[test]
+    fn truncated_opener_is_cut() {
+        let text = "Here is the answer.\n\n<tool_call>{\"name\":\"deep-research-0";
+        assert_eq!(strip_truncated_tool_call(text), "Here is the answer.");
+    }
+
+    /// A complete block belongs to `parse_tool_calls`; this pass must not touch it.
+    #[test]
+    fn complete_block_is_left_alone() {
+        let text = "before <tool_call>{\"name\":\"x\"}</tool_call> after";
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    /// Reasoning is a RENDERED feature (md-lite's thinking block), never noise.
+    #[test]
+    fn think_block_survives_untouched() {
+        let text = "<think>weighing options</think>\n\nSearXNG is a metasearch engine.";
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+
+    #[test]
+    fn plain_text_is_untouched() {
+        let text = "Compare a < b and 2 > 1.";
+        assert_eq!(strip_truncated_tool_call(text), text);
+    }
+}
+
 
 #[cfg(test)]
 mod tests {
