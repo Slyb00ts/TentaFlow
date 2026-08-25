@@ -149,11 +149,14 @@ pub struct AgentFlowOutcome {
     /// Model the flow's last LLM call resolved to, `None` for a flow that
     /// called none.
     pub model: Option<String>,
+    /// Harness iterations the loop block actually ran, from
+    /// `meta.loop_iterations`. `None` for a flow without a loop block — a run
+    /// row must not claim zero iterations when nobody counted them.
+    pub iterations: Option<i64>,
 }
 
 /// Runs the agent harness flow that backs one background run. Abstracted so the
 /// manager's orchestration (semaphore, watch, cancel, heartbeat) is unit-testable
-/// without a live `FlowDispatcher`. The production impl is `FlowDispatcherRunner`.
 #[async_trait]
 pub trait BackgroundFlowRunner: Send + Sync {
     /// Runs `flow_id` with `initial` as the trigger input under `principal`,
@@ -1404,9 +1407,9 @@ async fn run_task(ctx: TaskContext) {
     // The accounting is settled from whatever the flow reported, INDEPENDENT of
     // the status: a cancelled run still burned the tokens it burned, and a row
     // that reports the work but not its cost cannot be billed.
-    let (usage, model) = match &outcome {
-        Ok(flow) => (Some(flow.usage), flow.model.clone()),
-        Err(_) => (None, None),
+    let (usage, model, iterations) = match &outcome {
+        Ok(flow) => (Some(flow.usage), flow.model.clone(), flow.iterations),
+        Err(_) => (None, None, None),
     };
     let (final_status, exit_reason, result_text) = if cancel.is_cancelled() {
         (RunStatus::Cancelled, "cancelled".to_string(), None)
@@ -1428,6 +1431,7 @@ async fn run_task(ctx: TaskContext) {
             status: final_status.as_str(),
             result: result_text.as_deref(),
             exit_reason: Some(&exit_reason),
+            iterations,
             total_tokens: usage.map(|u| u.total_tokens as i64),
             prompt_tokens: usage.map(|u| u.prompt_tokens as i64),
             completion_tokens: usage.map(|u| u.completion_tokens as i64),
@@ -1777,6 +1781,11 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
         if let Some(err) = outcome.error {
             return Err(anyhow!("agent flow failed: {err}"));
         }
+        let iterations = outcome
+            .final_envelope
+            .meta
+            .get("loop_iterations")
+            .and_then(|v| v.as_i64());
         Ok(AgentFlowOutcome {
             text: outcome
                 .final_envelope
@@ -1786,6 +1795,7 @@ impl BackgroundFlowRunner for FlowDispatcherRunner {
                 .to_string(),
             usage: outcome.usage,
             model: outcome.model,
+            iterations,
         })
     }
 }
@@ -1941,6 +1951,7 @@ mod tests {
                 text: format!("result-of-{scope}"),
                 usage: TokenUsage::default(),
                 model: None,
+                iterations: None,
             })
         }
     }
@@ -1963,6 +1974,7 @@ mod tests {
                 text: format!("done-{scope}"),
                 usage: TokenUsage::default(),
                 model: None,
+                iterations: None,
             })
         }
     }

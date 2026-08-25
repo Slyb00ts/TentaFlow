@@ -172,6 +172,7 @@ mod tests {
                 text: format!("done-{scope}"),
                 usage: crate::flow_engine::envelope::TokenUsage::default(),
                 model: None,
+                iterations: None,
             })
         }
     }
