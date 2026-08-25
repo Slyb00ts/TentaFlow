@@ -196,9 +196,22 @@ fn execute_search_request(
     if req.provider.is_some() {
         return web_research::search::search(&req);
     }
-    if let Ok(provider) = web_research::resolve_local_searxng_provider(&state.db) {
+    // Try every local SearXNG, not just the first one the registry reports as
+    // running: a row whose container is gone keeps that status, and it used to
+    // shadow a healthy instance sitting right behind it. Falling through to the
+    // next candidate (and finally to mesh / public search) is what makes local
+    // search survive a stale row.
+    let mut local_error = None;
+    for provider in web_research::resolve_local_searxng_providers(&state.db) {
         req.provider = Some(provider);
-        return web_research::search::search(&req);
+        match web_research::search::search(&req) {
+            Ok(response) => return Ok(response),
+            Err(e) => local_error = Some(e),
+        }
+    }
+    req.provider = None;
+    if let Some(e) = local_error {
+        tracing::warn!("web research: every local searxng candidate failed: {}", e);
     }
     if let Some(target_node) = find_remote_service_node(state, "searxng") {
         return match execute_remote_request(state, target_node, WebResearchRequest::Search(req))? {

@@ -87,6 +87,20 @@ pub fn resolve_local_searxng_provider(db: &DbPool) -> Result<SearchProviderConfi
     })
 }
 
+/// Every local SearXNG worth trying, best candidate first. A caller that can
+/// retry uses this instead of `resolve_local_searxng_provider`, because the
+/// service registry can hold a row that still says `running` after its container
+/// is gone — and that stale row would otherwise be the only one ever tried.
+pub fn resolve_local_searxng_providers(db: &DbPool) -> Vec<SearchProviderConfig> {
+    resolve_local_service_endpoints(db, "searxng")
+        .into_iter()
+        .map(|base_url| SearchProviderConfig::Searxng {
+            base_url,
+            internal: true,
+        })
+        .collect()
+}
+
 pub fn resolve_local_browser_renderer_endpoint(db: &DbPool) -> Result<String> {
     resolve_local_service_endpoint(db, "browser-renderer", "Browser Renderer")
 }
@@ -96,36 +110,56 @@ fn resolve_local_service_endpoint(
     engine_id: &str,
     display_name: &str,
 ) -> Result<String> {
-    let conn = db.read().map_err(|_| {
-        WebResearchError::SearchProvider("services database lock failed".to_string())
-    })?;
-    let services = services_repo::list_all(&conn)
-        .map_err(|e| WebResearchError::SearchProvider(format!("services lookup failed: {}", e)))?;
-    let endpoint = services
-        .iter()
-        .find(|svc| {
-            svc.engine_id == engine_id
-                && !svc.paused
-                && svc.status == ServiceStatus::Running
-                && svc.endpoint_url.is_some()
-        })
-        .or_else(|| {
-            services.iter().find(|svc| {
-                svc.engine_id == engine_id
-                    && !svc.paused
-                    && svc.status == ServiceStatus::Degraded
-                    && svc.endpoint_url.is_some()
-            })
-        })
-        .and_then(|svc| svc.endpoint_url.clone())
+    resolve_local_service_endpoints(db, engine_id)
+        .into_iter()
+        .next()
         .ok_or_else(|| {
             WebResearchError::SearchProvider(format!(
                 "no running local {} service found",
                 display_name
             ))
-        })?;
+        })
+}
 
-    Ok(endpoint)
+/// Endpoints of every local instance of `engine_id`, `Running` before `Degraded`
+/// and, within each status, the most recently updated row first.
+///
+/// Ordering matters and status alone is not enough to pick a winner: nothing
+/// reconciles a service row when its container disappears, so a dead instance
+/// keeps `status = Running` with a live-looking endpoint. Handing back only the
+/// first match let such a row shadow a healthy instance deployed next to it —
+/// every search then failed against a port nothing listened on. Returning the
+/// whole list lets the caller fail over, and the newest-first order means a fresh
+/// deploy is tried before a stale leftover.
+fn resolve_local_service_endpoints(db: &DbPool, engine_id: &str) -> Vec<String> {
+    let Ok(conn) = db.read() else {
+        return Vec::new();
+    };
+    let Ok(services) = services_repo::list_all(&conn) else {
+        return Vec::new();
+    };
+    let mut candidates: Vec<_> = services
+        .iter()
+        .filter(|svc| {
+            svc.engine_id == engine_id
+                && !svc.paused
+                && matches!(
+                    svc.status,
+                    ServiceStatus::Running | ServiceStatus::Degraded
+                )
+                && svc.endpoint_url.is_some()
+        })
+        .collect();
+    candidates.sort_by(|a, b| {
+        let rank = |s: &ServiceStatus| if *s == ServiceStatus::Running { 0 } else { 1 };
+        rank(&a.status)
+            .cmp(&rank(&b.status))
+            .then_with(|| b.updated_at.cmp(&a.updated_at))
+    });
+    candidates
+        .into_iter()
+        .filter_map(|svc| svc.endpoint_url.clone())
+        .collect()
 }
 
 fn read_search_results(req: ReadSearchResultsRequest) -> Result<WebResearchResponse> {
