@@ -635,6 +635,39 @@ impl EmbeddedDeploy {
         }
         #[cfg(not(test))]
         {
+            // Preflight PRZED pobraniem modelu. Backend embedded jest wkompilowany
+            // za feature flagiem (`[deploy.native].feature_flag`), a domyslna
+            // binarka `tentaflow` swiadomie nie linkuje `inference-llamacpp` —
+            // kolizja symboli ggml whisper.cpp <-> llama.cpp. Bez tej kontroli
+            // deploy pobieral caly GGUF (16 GB przy 27B Q4) i dopiero potem
+            // przewracal sie na `load_model` z "Backend nie jest dostepny".
+            // Sprawdzenie jest tanie i wyklucza wylacznie przypadek, ktory i tak
+            // nie ma szansy sie powiesc.
+            {
+                let shared = crate::inference::shared_inference_manager();
+                let available = shared.read().await.available_backends();
+                if !available.iter().any(|b| b == preferred_backend) {
+                    let hint = self
+                        .manifest
+                        .deploy
+                        .native
+                        .as_ref()
+                        .and_then(|n| n.feature_flag.as_deref())
+                        .map(|flag| format!(" — zbuduj binarke z feature '{}'", flag))
+                        .unwrap_or_default();
+                    return Err(DeployError::Other(format!(
+                        "backend '{}' nie jest wkompilowany w te binarke{} (dostepne: {})",
+                        preferred_backend,
+                        hint,
+                        if available.is_empty() {
+                            "brak".to_string()
+                        } else {
+                            available.join(", ")
+                        }
+                    )));
+                }
+            }
+
             // Persisted `model_path` to absolutna sciezka zapisana po pierwszym
             // deployu. Na iOS katalog Data aplikacji ma UUID rotowany przy
             // reinstalacji — stara absolutna sciezka wskazuje wtedy na nieistniejacy

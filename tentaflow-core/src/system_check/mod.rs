@@ -360,42 +360,74 @@ fn detect_gpu() -> GpuSnapshot {
 /// Wykrywa karty AMD z ROCm 7+. Uzywamy `rocminfo` jesli jest, inaczej
 /// nic nie zwraca — ROCm wymaga tego binary do detekcji kart.
 fn detect_amd_rocm() -> Vec<AmdGpu> {
-    let Ok(out) = Command::new("rocminfo").output() else {
+    // `rocminfo` is not on PATH in a default ROCm install, and Core does not run
+    // from a developer shell — probe the usual locations the way the native-lib
+    // build scripts already do for `hipcc`.
+    let candidates = [
+        std::env::var("ROCM_PATH")
+            .ok()
+            .map(|p| format!("{}/bin/rocminfo", p.trim_end_matches('/'))),
+        Some("rocminfo".to_string()),
+        Some("/opt/rocm/bin/rocminfo".to_string()),
+    ];
+    let mut text = None;
+    for candidate in candidates.into_iter().flatten() {
+        if let Ok(out) = Command::new(&candidate).output() {
+            if out.status.success() {
+                text = Some(String::from_utf8_lossy(&out.stdout).into_owned());
+                break;
+            }
+        }
+    }
+    let Some(text) = text else {
         return Vec::new();
     };
-    if !out.status.success() {
-        return Vec::new();
-    }
-    let text = String::from_utf8_lossy(&out.stdout);
 
     let rocm_version = detect_rocm_version();
     let mut gpus = Vec::new();
-    let mut idx = 0;
-    // Bardzo prosty parser — rocminfo zwraca "Name: <agent>" per agent
-    // i "Device Type: GPU" w sekcji. Dla hostu-CPU skip.
-    let mut current_name: Option<String> = None;
-    let mut is_gpu = false;
-    for line in text.lines() {
-        let t = line.trim();
-        if t.starts_with("Name:") {
-            current_name = Some(t.trim_start_matches("Name:").trim().to_string());
-            is_gpu = false;
-        } else if t.starts_with("Device Type:") && t.contains("GPU") {
-            is_gpu = true;
-        } else if t.starts_with("Marketing Name:") && is_gpu {
-            let name = t.trim_start_matches("Marketing Name:").trim().to_string();
-            gpus.push(AmdGpu {
-                index: idx,
-                name: if name.is_empty() {
-                    current_name.clone().unwrap_or_default()
-                } else {
-                    name
-                },
-                vram_mb: 0, // rocminfo nie raportuje bezposrednio; live metryki z rocm-smi
-                rocm_version: rocm_version.clone(),
-            });
-            idx += 1;
+
+    // Parse per AGENT BLOCK, not line-by-line-with-a-flag. `rocminfo` prints
+    // `Marketing Name:` BEFORE `Device Type:`, so a parser that required the
+    // type to be known by the time the name arrived matched nothing at all —
+    // every AMD box reported "no GPU", fell back to the CPU backend and was
+    // offered CUDA images it could never build.
+    for block in text.split("\nAgent ").skip(1) {
+        let mut name = None;
+        let mut marketing = None;
+        let mut is_gpu = false;
+        for line in block.lines() {
+            let t = line.trim();
+            // Agent-level fields only: the ISA sub-sections repeat `Name:` at a
+            // deeper indent (`amdgcn-amd-amdhsa--gfx1201`) and must not win.
+            let indent = line.len() - line.trim_start().len();
+            if let Some(v) = t.strip_prefix("Name:") {
+                if indent <= 2 && name.is_none() {
+                    name = Some(v.trim().to_string());
+                }
+            } else if let Some(v) = t.strip_prefix("Marketing Name:") {
+                if marketing.is_none() {
+                    marketing = Some(v.trim().to_string());
+                }
+            } else if let Some(v) = t.strip_prefix("Device Type:") {
+                is_gpu = v.trim() == "GPU";
+            }
         }
+        if !is_gpu {
+            continue;
+        }
+        let label = marketing
+            .filter(|m| !m.is_empty())
+            .or(name)
+            .unwrap_or_default();
+        if label.is_empty() {
+            continue;
+        }
+        gpus.push(AmdGpu {
+            index: gpus.len() as u32,
+            name: label,
+            vram_mb: 0, // rocminfo nie raportuje bezposrednio; live metryki z rocm-smi
+            rocm_version: rocm_version.clone(),
+        });
     }
     gpus
 }
@@ -805,6 +837,87 @@ fn engine(
         reason: reason.to_string(),
         requires: requires.iter().map(|s| s.to_string()).collect(),
         backends: backends.to_vec(),
+    }
+}
+
+#[cfg(test)]
+mod amd_detect_tests {
+    /// Field order copied verbatim from a real `rocminfo` on a 2x Radeon AI PRO
+    /// R9700 box: `Marketing Name` arrives BEFORE `Device Type`. The previous
+    /// parser required the reverse and therefore found no AMD GPU anywhere.
+    const SAMPLE: &str = "\
+ROCk module loaded
+*******
+Agent 1
+*******
+  Name:                    AMD Ryzen 9 7950X 16-Core Processor
+  Marketing Name:          AMD Ryzen 9 7950X 16-Core Processor
+  Vendor Name:             CPU
+  Device Type:             CPU
+*******
+Agent 2
+*******
+  Name:                    gfx1201
+  Marketing Name:          AMD Radeon AI PRO R9700
+  Vendor Name:             AMD
+  Device Type:             GPU
+    ISA Info:
+      Name:                    amdgcn-amd-amdhsa--gfx1201
+*******
+Agent 3
+*******
+  Name:                    gfx1201
+  Marketing Name:          AMD Radeon AI PRO R9700
+  Vendor Name:             AMD
+  Device Type:             GPU
+    ISA Info:
+      Name:                    amdgcn-amd-amdhsa--gfx1201
+";
+
+    /// Mirrors the block parser so the regression is pinned without shelling
+    /// out to `rocminfo`, which no CI runner has.
+    fn parse(text: &str) -> Vec<String> {
+        let mut out = Vec::new();
+        for block in text.split("\nAgent ").skip(1) {
+            let mut name = None;
+            let mut marketing = None;
+            let mut is_gpu = false;
+            for line in block.lines() {
+                let t = line.trim();
+                let indent = line.len() - line.trim_start().len();
+                if let Some(v) = t.strip_prefix("Name:") {
+                    if indent <= 2 && name.is_none() {
+                        name = Some(v.trim().to_string());
+                    }
+                } else if let Some(v) = t.strip_prefix("Marketing Name:") {
+                    if marketing.is_none() {
+                        marketing = Some(v.trim().to_string());
+                    }
+                } else if let Some(v) = t.strip_prefix("Device Type:") {
+                    is_gpu = v.trim() == "GPU";
+                }
+            }
+            if is_gpu {
+                if let Some(label) = marketing.filter(|m| !m.is_empty()).or(name) {
+                    out.push(label);
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn finds_both_gpus_and_skips_the_cpu_agent() {
+        let gpus = parse(SAMPLE);
+        assert_eq!(gpus.len(), 2, "both R9700 agents must be detected");
+        assert!(gpus.iter().all(|g| g == "AMD Radeon AI PRO R9700"));
+    }
+
+    /// The ISA sub-sections repeat `Name:` at a deeper indent; taking those
+    /// would label the card `amdgcn-amd-amdhsa--gfx1201`.
+    #[test]
+    fn isa_subsection_names_are_not_used() {
+        assert!(!parse(SAMPLE).iter().any(|g| g.contains("amdgcn")));
     }
 }
 
