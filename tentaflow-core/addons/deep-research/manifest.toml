@@ -1,7 +1,7 @@
 [addon]
 id = "deep-research"
 name = "Deep Research"
-version = "0.4.2"
+version = "0.4.3"
 description = "Wyszukiwanie internetu, pobieranie publicznych stron i ekstrakcja tekstu przez Core Web Research SDK."
 category = "ai"
 keywords = ["research", "web", "search", "crawler", "internet", "sources"]

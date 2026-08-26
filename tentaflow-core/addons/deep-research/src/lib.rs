@@ -212,6 +212,14 @@ fn handle_research_query(params: &Value) -> Value {
     json!({
         "ok": true,
         "type": "research_query",
+        // Pages that WERE read, separate from findings. Without it "read but the
+        // page did not answer" and "could not read the page at all" look
+        // identical from outside — and they call for opposite fixes.
+        "read_count": read
+            .get("pages")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0),
         "query": query,
         "question": question,
         "findings": findings,
