@@ -390,18 +390,23 @@ fn kv_set(
         Some(value.clone()),
         actor_user_id,
     );
-    let mut conn = db
-        .write()
-        .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
-    let tx = conn.transaction()?;
-    let rows = tx.execute(
-        "INSERT OR REPLACE INTO addon_storage \
-         (addon_id, instance_id, storage_key, storage_value, value_size_bytes, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
-        rusqlite::params![addon_id, instance_id, key, &value, value.len() as i64],
-    )?;
-    crate::sync::kv_capture::record_kv_write_capture(&tx, &capture)?;
-    tx.commit()?;
+    // The write guard must be released before ledger_kv_capture_now, which re-locks
+    // the same pool (same scoping as blob_put_chunk below).
+    let rows = {
+        let mut conn = db
+            .write()
+            .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "INSERT OR REPLACE INTO addon_storage \
+             (addon_id, instance_id, storage_key, storage_value, value_size_bytes, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, datetime('now'))",
+            rusqlite::params![addon_id, instance_id, key, &value, value.len() as i64],
+        )?;
+        crate::sync::kv_capture::record_kv_write_capture(&tx, &capture)?;
+        tx.commit()?;
+        rows
+    };
     crate::sync::kv_capture::ledger_kv_capture_now(db, &capture)?;
     Ok(rows as u64)
 }
@@ -422,16 +427,20 @@ fn kv_delete(
         None,
         actor_user_id,
     );
-    let mut conn = db
-        .write()
-        .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
-    let tx = conn.transaction()?;
-    let rows = tx.execute(
-        "DELETE FROM addon_storage WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
-        rusqlite::params![addon_id, instance_id, key],
-    )?;
-    crate::sync::kv_capture::record_kv_write_capture(&tx, &capture)?;
-    tx.commit()?;
+    // Same guard scoping as kv_set: release the pool lock before the ledger capture.
+    let rows = {
+        let mut conn = db
+            .write()
+            .map_err(|e| anyhow::anyhow!("storage proxy kv db lock: {e}"))?;
+        let tx = conn.transaction()?;
+        let rows = tx.execute(
+            "DELETE FROM addon_storage WHERE addon_id = ?1 AND instance_id = ?2 AND storage_key = ?3",
+            rusqlite::params![addon_id, instance_id, key],
+        )?;
+        crate::sync::kv_capture::record_kv_write_capture(&tx, &capture)?;
+        tx.commit()?;
+        rows
+    };
     crate::sync::kv_capture::ledger_kv_capture_now(db, &capture)?;
     Ok(rows as u64)
 }
