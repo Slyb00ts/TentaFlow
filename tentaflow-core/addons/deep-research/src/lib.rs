@@ -175,7 +175,7 @@ fn handle_research_query(params: &Value) -> Value {
         // Each page costs one model call, so the default trades a little
         // coverage for a fan-out that finishes: five queries at five pages is
         // twenty-five summarisations before the answer can even start.
-        read_limit: bounded_usize(params, "read_limit", 3, 1, 25),
+        read_limit: bounded_usize(params, "read_limit", 2, 1, 25),
         max_chars_per_page: SUMMARY_INPUT_CHARS,
         provider: provider_from_params(params),
         mode: optional_string(params, "mode").unwrap_or_else(|| "auto".to_string()),

@@ -2435,6 +2435,8 @@ const RESEARCHER_AGENT_PROMPT: &str = concat!(
     "wiec jedna tura z pieciona zapytaniami jest znacznie szybsza niz piec kolejnych tur. W ",
     "`question` podaj cale zadanie, zeby kazda strona byla streszczana pod to, co naprawde ",
     "chcesz wiedziec.\n\n",
+    "Masz budzet TRZECH iteracji i nie da sie go przekroczyc: pierwsza na zapytania, druga na ",
+    "ewentualne uzupelnienie luki, trzecia na odpowiedz. Planuj pod to od razu.\n\n",
     "JEDNA runda zwykle wystarcza. Kazde zapytanie czyta i streszcza kilka stron, wiec dwadziescia ",
     "zapytan to setki wywolan modelu i odpowiedz, ktora nie zdazy powstac. Po pierwszej rundzie ",
     "ODPOWIEDZ na podstawie tego, co masz. Druga runda tylko wtedy, gdy w ustaleniach brakuje ",
@@ -2550,7 +2552,7 @@ fn seed_system_agents(conn: &Connection) -> Result<()> {
              max_spawn_depth, flow_id, routable, is_enabled) \
          SELECT ?1, 'researcher', 'Agent badawczy', ?2, ?3, NULL, \
                 '[\"deep-research.research_query\",\"deep-research.search_web\"]', \
-                '{}', '{}', 20, 1800, 0, 1, NULL, 0, 1 \
+                '{}', '{}', 3, 1800, 0, 1, NULL, 0, 1 \
          WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1 OR name = 'researcher')",
         rusqlite::params![
             RESEARCHER_AGENT_ID,
