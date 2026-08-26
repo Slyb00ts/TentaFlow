@@ -6,6 +6,7 @@
 
 use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
+use crate::environment::EnvironmentBundleTableCount;
 use crate::profiling::{
     ProfilingActiveInfoRequest, ProfilingActiveInfoResponse, ProfilingDeleteRequest,
     ProfilingDeleteResponse, ProfilingDownloadRequest, ProfilingDownloadResponse,
@@ -672,6 +673,12 @@ pub enum MeshCommandType {
         assertion: SessionAssertion,
         request_cbor: Vec<u8>,
     },
+
+    /// ROADMAP Z12 — donor side of the manual config-bundle pull wizard: the
+    /// requester's `EnvironmentPullStartRequest` handler sends this to the
+    /// donor node over QUIC and gets back the donor's OWN current
+    /// (whitelist-only, no secrets) config bundle. Appended at END.
+    ConfigBundleExport,
 }
 
 // =============================================================================
@@ -1114,6 +1121,17 @@ pub enum MeshCommandResponsePayload {
         highest_seq: u64,
         error: Option<crate::ProtocolError>,
     },
+
+    /// ROADMAP Z12 — response to `MeshCommandType::ConfigBundleExport`: the
+    /// donor's own current config bundle (whitelist tables only, no secrets).
+    /// Appended at END.
+    ConfigBundleExport {
+        archive_bytes: Vec<u8>,
+        filename: String,
+        manifest_sha256: String,
+        source_environment: crate::environment::NodeEnvironment,
+        table_counts: Vec<EnvironmentBundleTableCount>,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -1448,6 +1466,7 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("jti", &assertion.jti)
                 .field("request_bytes", &request_cbor.len())
                 .finish(),
+            Self::ConfigBundleExport => write!(f, "ConfigBundleExport"),
         }
     }
 }
@@ -1778,6 +1797,14 @@ pub struct MeshPairingRequestPayload {
     pub from_node_id: String,
     pub public_key: String,
     pub pin: String,
+    /// The sender's declared node environment (ROADMAP Z12, P1-2), mirroring
+    /// `PairingFirstContactRequest::sender_environment` — this legacy path
+    /// re-sends a pairing request over an already-connected `mesh` stream
+    /// (e.g. after a reconnect), so it needs the same field to let the
+    /// receiver stamp `trusted_nodes.environment` on confirm. `#[serde(default)]`
+    /// decodes an un-upgraded peer's request as `Prod`.
+    #[serde(default)]
+    pub environment: crate::environment::NodeEnvironment,
 }
 
 /// Payload pierwszego kontaktu na osobnym ALPN `tentaflow-pairing/v2`.
@@ -1792,6 +1819,13 @@ pub struct PairingFirstContactRequest {
     pub pin: String,
     pub sender_addresses: Vec<String>,
     pub sender_relay_url: String,
+    /// The sender's declared node environment (Dev/Test/Prod, ROADMAP Z12).
+    /// `#[serde(default)]` decodes an un-upgraded peer's request as `Prod`
+    /// (the conservative default) rather than failing the frame — a strict
+    /// receiver then either fences it (different environment) or lets it
+    /// through as same-environment, never silently skipping the check.
+    #[serde(default)]
+    pub sender_environment: crate::environment::NodeEnvironment,
 }
 
 #[derive(Debug, Clone, SerdeSerialize, SerdeDeserialize)]
@@ -1812,6 +1846,11 @@ pub enum PairingFirstContactResponse {
         receiver_public_key_hex: String,
         receiver_hostname: String,
         trusted_keys: Vec<PairingTrustedKeyEntry>,
+        /// The receiver's declared node environment (ROADMAP Z12), mirroring
+        /// `sender_environment` on the request. `#[serde(default)]` for the
+        /// same reason — a stale receiver decodes as `Prod`.
+        #[serde(default)]
+        receiver_environment: crate::environment::NodeEnvironment,
     },
     Pending {
         receiver_hostname: String,
@@ -1829,6 +1868,13 @@ pub struct MeshPairingConfirmPayload {
     pub public_key: String,
     pub hostname: String,
     pub pin: String,
+    /// The confirmer's (i.e. `from_node_id`'s) OWN declared environment
+    /// (ROADMAP Z12, P1-2) — lets the INITIATOR stamp `trusted_nodes.
+    /// environment` for the confirming node the same way the first-contact
+    /// ALPN flow does via `receiver_environment`. `#[serde(default)]` decodes
+    /// an un-upgraded peer's confirm as `Prod`.
+    #[serde(default)]
+    pub environment: crate::environment::NodeEnvironment,
 }
 
 /// Wire payload dla `MESH_MSG_PAIRING_REJECT` — wysylany gdy admin odrzuca prosbe.

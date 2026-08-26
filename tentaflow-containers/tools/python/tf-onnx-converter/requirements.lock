@@ -1,0 +1,17 @@
+fastapi==0.135.3
+uvicorn[standard]==0.44.0
+# Pinned at 2.15.1 — the last TensorFlow release that still defaults to
+# Keras 2 (`tf.keras`). TF 2.16+ bundles Keras 3 by default, and tf2onnx
+# 1.16.1's `convert.from_keras` (server.py::_convert_to_onnx, the H5 path)
+# walks the Keras 2 layer-graph API; against Keras 3 it either fails outright
+# or needs the separate `tf-keras` legacy shim + `TF_USE_LEGACY_KERAS=1` env
+# var, which would add a second, independently-versioned Keras runtime to
+# this bundle for a converter tf2onnx 1.16.1 was never tested against. The
+# SavedModel path (`convert.from_saved_model`) is format-level and is not
+# affected either way. Revisit once tf2onnx ships verified Keras 3 support.
+tensorflow==2.15.1
+tf2onnx==1.16.1
+onnx==1.16.2
+onnxruntime==1.19.2
+onnxconverter-common==1.14.0
+numpy==1.26.4

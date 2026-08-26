@@ -418,6 +418,7 @@ mod tests {
                     counter: 0,
                     origin_node: String::new(),
                 },
+                environment: crate::sync::ledger::NodeEnvironment::default(),
                 payload_hash: [1; 32],
                 acl_snapshot_hash: [2; 32],
                 policy_epoch: 1,

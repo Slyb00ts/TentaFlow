@@ -373,6 +373,7 @@ fn row_to_flow_execution(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbFlowExec
         actor_id: row.get(12)?,
         actor_user_id: row.get(13)?,
         correlation_id: row.get(14)?,
+        result_metadata_json: row.get(15)?,
     })
 }
 
@@ -803,6 +804,17 @@ pub fn get_setting(pool: &DbPool, key: &str) -> Result<Option<String>> {
 pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     let conn = acquire(pool)?;
     let tx = conn.unchecked_transaction()?;
+    set_setting_tx(&tx, key, value)?;
+    tx.commit()?;
+    Ok(())
+}
+
+/// Transaction-scoped core of `set_setting`, for a caller that already holds
+/// an open write transaction on `pool` (e.g. `config_bundle::apply_bundle`)
+/// and must not re-acquire the pool's connection — `DbPool::write()` is a
+/// plain, non-reentrant `Mutex`, so calling `set_setting(pool, ..)` mid-
+/// transaction on the same thread would self-deadlock.
+pub fn set_setting_tx(tx: &rusqlite::Transaction<'_>, key: &str, value: &str) -> Result<()> {
     tx.execute(
         "INSERT INTO settings (key, value) VALUES (?1, ?2) ON CONFLICT(key) DO UPDATE SET value = ?2, updated_at = datetime('now')",
         rusqlite::params![key, value],
@@ -813,7 +825,7 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
     // through this same chokepoint never leave the node.
     if is_shared_setting_key(key) {
         record_core_capture_tx(
-            &tx,
+            tx,
             crate::sync::core_registry::CoreSyncResourceKind::SharedSettingSecret,
             key,
             crate::sync::runtime::SqlWriteAction::Update,
@@ -821,7 +833,6 @@ pub fn set_setting(pool: &DbPool, key: &str, value: &str) -> Result<()> {
             None,
         )?;
     }
-    tx.commit()?;
     Ok(())
 }
 
@@ -11093,7 +11104,7 @@ pub fn delete_tts_cleaning_rule(pool: &DbPool, id: i64) -> Result<()> {
 
 // --- Flow Executions ---
 
-const FLOW_EXEC_COLS: &str = "id, flow_id, request_id, model, started_at, finished_at, status, execution_log, total_latency_ms, total_tokens, origin, actor_kind, actor_id, actor_user_id, correlation_id";
+const FLOW_EXEC_COLS: &str = "id, flow_id, request_id, model, started_at, finished_at, status, execution_log, total_latency_ms, total_tokens, origin, actor_kind, actor_id, actor_user_id, correlation_id, result_metadata_json";
 
 pub fn list_flow_executions(
     pool: &DbPool,
@@ -11166,7 +11177,11 @@ pub fn create_flow_execution(pool: &DbPool, exec: &NewFlowExecution<'_>) -> Resu
 
 /// Closes a run's audit row. `model` is the model the run's last LLM call
 /// resolved to — only known now, not at insert — and is `None` for a flow that
-/// called no model (spec invariant 6: a gap, not a guess).
+/// called no model (spec invariant 6: a gap, not a guess). `result_metadata`
+/// is the domain-specific JSON blob (migration v136, `flow_executions.result_metadata_json`)
+/// the run produced — also only known at finalization, e.g. exam type or
+/// patient pseudonym for CMC SILESIA — and `None` when the run's flow wrote
+/// none.
 pub fn update_flow_execution(
     pool: &DbPool,
     id: i64,
@@ -11175,11 +11190,20 @@ pub fn update_flow_execution(
     execution_log: Option<&str>,
     total_latency_ms: Option<i64>,
     total_tokens: Option<i64>,
+    result_metadata: Option<&str>,
 ) -> Result<()> {
     let conn = acquire(pool)?;
     conn.execute(
-        "UPDATE flow_executions SET finished_at = datetime('now'), status = ?2, model = ?3, execution_log = ?4, total_latency_ms = ?5, total_tokens = ?6 WHERE id = ?1",
-        rusqlite::params![id, status, model, execution_log, total_latency_ms, total_tokens],
+        "UPDATE flow_executions SET finished_at = datetime('now'), status = ?2, model = ?3, execution_log = ?4, total_latency_ms = ?5, total_tokens = ?6, result_metadata_json = ?7 WHERE id = ?1",
+        rusqlite::params![
+            id,
+            status,
+            model,
+            execution_log,
+            total_latency_ms,
+            total_tokens,
+            result_metadata
+        ],
     )?;
     Ok(())
 }
@@ -13130,7 +13154,7 @@ pub fn add_trusted_node(
 pub fn list_trusted_nodes(pool: &DbPool) -> Result<Vec<TrustedNode>> {
     let conn = acquire(pool)?;
     let mut stmt = conn.prepare_cached(
-        "SELECT id, node_id, public_key, hostname, approved_by, approved_at, is_active, last_addresses \
+        "SELECT id, node_id, public_key, hostname, approved_by, approved_at, is_active, last_addresses, environment \
          FROM trusted_nodes WHERE is_active = 1 ORDER BY approved_at DESC",
     )?;
     let rows = stmt
@@ -13144,10 +13168,83 @@ pub fn list_trusted_nodes(pool: &DbPool) -> Result<Vec<TrustedNode>> {
                 approved_at: row.get(5)?,
                 is_active: row.get(6)?,
                 last_addresses: row.get(7)?,
+                environment: row.get(8)?,
             })
         })?
         .collect::<std::result::Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Persists the environment (Dev/Test/Prod, ROADMAP Z12) a peer declared at
+/// pairing handshake time. A no-op (not an error) when the peer is not yet
+/// (or no longer) a trusted node — the handshake writes `trusted_nodes` via
+/// `add_trusted_node` first, so the row exists by the time this is called on
+/// the happy path; a stale/rejected handshake simply has nothing to stamp.
+pub fn set_trusted_node_environment(
+    pool: &DbPool,
+    node_id: &str,
+    environment: tentaflow_protocol::environment::NodeEnvironment,
+) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE trusted_nodes SET environment = ?2 WHERE node_id = ?1 AND is_active = 1",
+        rusqlite::params![node_id, environment.as_str()],
+    )?;
+    Ok(())
+}
+
+/// Environment declared by `node_id` at pairing time. `None` ("unknown") when
+/// the node is not a currently-active trusted node OR was trust-paired before
+/// this column existed (a NULL row) — callers MUST treat `None` as
+/// fail-closed (never a same-environment match), never silently default it to
+/// `Prod`. The only place that still applies a `Prod` default for a missing
+/// value is per-OPERATION admission (`SyncOperationBody::environment`'s
+/// `#[serde(default)]`, ROADMAP Z12 P1-2) — that keeps an existing Prod-Prod
+/// mesh syncing across the v25->v26 upgrade without a migration step. This
+/// function is the trust-table lookup used by the outbox environment filter
+/// (`sync::runtime::outbox_target_still_allowed`), the catalog builder
+/// (`services::catalog::provider::build_service_model_entries`) and the
+/// config-bundle donor list — all of which must fail closed on `None`.
+pub fn get_trusted_node_environment(
+    pool: &DbPool,
+    node_id: &str,
+) -> Result<Option<tentaflow_protocol::environment::NodeEnvironment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare_cached(
+        "SELECT environment FROM trusted_nodes WHERE node_id = ?1 AND is_active = 1",
+    )?;
+    let raw: Option<String> = stmt
+        .query_row(rusqlite::params![node_id], |row| row.get(0))
+        .optional()?
+        .flatten();
+    Ok(raw.and_then(|s| tentaflow_protocol::environment::NodeEnvironment::parse(&s)))
+}
+
+/// Environment per active trusted node id — batch form of
+/// `get_trusted_node_environment`, used when building the catalog snapshot
+/// (one query instead of one per mesh service entry). A node absent from the
+/// returned map (or mapped to `None`) is "unknown" and MUST be treated
+/// fail-closed by callers, same as the single-node lookup above.
+pub fn list_trusted_node_environments(
+    pool: &DbPool,
+) -> Result<
+    std::collections::HashMap<String, Option<tentaflow_protocol::environment::NodeEnvironment>>,
+> {
+    let conn = acquire(pool)?;
+    let mut stmt =
+        conn.prepare_cached("SELECT node_id, environment FROM trusted_nodes WHERE is_active = 1")?;
+    let rows = stmt.query_map([], |row| {
+        let node_id: String = row.get(0)?;
+        let raw: Option<String> = row.get(1)?;
+        Ok((node_id, raw))
+    })?;
+    let mut map = std::collections::HashMap::new();
+    for row in rows {
+        let (node_id, raw) = row?;
+        let environment = raw.and_then(|s| tentaflow_protocol::environment::NodeEnvironment::parse(&s));
+        map.insert(node_id, environment);
+    }
+    Ok(map)
 }
 
 /// Aktualizuje ostatnie znane adresy trusted noda

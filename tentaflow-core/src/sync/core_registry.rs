@@ -4,7 +4,7 @@
 //       Sync Ledgera jako zasoby core zamiast zasobow addonow.
 // =============================================================================
 
-use super::ledger::{LedgerResult, PartitionId};
+use super::ledger::{LedgerResult, NodeEnvironment, PartitionId};
 
 pub const CORE_SYNC_ADDON_ID: &str = "core";
 
@@ -78,19 +78,30 @@ pub struct CoreSyncDescriptor {
 }
 
 impl CoreSyncDescriptor {
+    /// `environment` MUST sit right after the `core/` prefix
+    /// (`core/env/{env}/org/{org_id}/{suffix}`), never in front of it — a
+    /// leading `env/{env}/core/...` segment would fall OUTSIDE
+    /// `reset_partitions_with_prefix(CORE_PARTITION_PREFIX)` (`CORE_PARTITION_PREFIX
+    /// = "core/"`), silently turning a core baseline reset into a no-op that
+    /// leaves stale operations in the ledger (ZADANIA.md Z12 pitfall #5,
+    /// coordinator decision after the Z12 delta review).
     pub fn partition_id(
         &self,
         org_id: &str,
         owner_user_id: Option<&str>,
+        environment: NodeEnvironment,
     ) -> LedgerResult<PartitionId> {
         match self.scope {
-            CoreSyncScope::Organization => {
-                PartitionId::new(format!("core/org/{org_id}/{}", self.partition_suffix))
-            }
+            CoreSyncScope::Organization => PartitionId::new(format!(
+                "core/env/{}/org/{org_id}/{}",
+                environment.as_str(),
+                self.partition_suffix
+            )),
             CoreSyncScope::User => {
                 let user_id = owner_user_id.unwrap_or("system");
                 PartitionId::new(format!(
-                    "core/org/{org_id}/user/{user_id}/{}",
+                    "core/env/{}/org/{org_id}/user/{user_id}/{}",
+                    environment.as_str(),
                     self.partition_suffix
                 ))
             }
@@ -622,8 +633,11 @@ mod tests {
         );
         let skill = descriptor_for_kind(CoreSyncResourceKind::Skill);
         assert_eq!(
-            skill.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/skills"
+            skill
+                .partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/skills"
         );
     }
 
@@ -635,8 +649,11 @@ mod tests {
         );
         let agent = descriptor_for_kind(CoreSyncResourceKind::Agent);
         assert_eq!(
-            agent.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/agents"
+            agent
+                .partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/agents"
         );
         // agent_runs is runtime state and must never become a sync resource.
         assert!(descriptor_for_table("agent_runs").is_none());
@@ -672,8 +689,11 @@ mod tests {
         );
         let rollup = descriptor_for_kind(CoreSyncResourceKind::ModelMetricsRollup);
         assert_eq!(
-            rollup.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/metrics"
+            rollup
+                .partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/metrics"
         );
     }
 
@@ -716,10 +736,10 @@ mod tests {
             // after the workspace it references.
             assert_eq!(
                 descriptor
-                    .partition_id("org-default", None)
+                    .partition_id("org-default", None, NodeEnvironment::Prod)
                     .unwrap()
                     .as_str(),
-                "core/org/org-default/code-studio"
+                "core/env/prod/org/org-default/code-studio"
             );
         }
     }
@@ -781,12 +801,45 @@ mod tests {
         let role = descriptor_for_kind(CoreSyncResourceKind::Role);
 
         assert_eq!(
-            flow.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/flows"
+            flow.partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/flows"
         );
         assert_eq!(
-            role.partition_id("org-default", None).unwrap().as_str(),
-            "core/org/org-default/roles"
+            role.partition_id("org-default", None, NodeEnvironment::Prod)
+                .unwrap()
+                .as_str(),
+            "core/env/prod/org/org-default/roles"
         );
+    }
+
+    /// The environment segment sits AFTER the `core/` prefix (`core/env/{env}/
+    /// org/...`), never before it — `reset_core_partitions` wipes by matching
+    /// the `core/` prefix (`CORE_PARTITION_PREFIX`), so a leading `env/{env}/
+    /// core/...` segment would silently escape the wipe (ZADANIA.md Z12
+    /// pitfall #5, coordinator's binding decision after the delta review).
+    #[test]
+    fn partition_id_keys_by_environment_after_the_core_prefix() {
+        let flow = descriptor_for_kind(CoreSyncResourceKind::Flow);
+        assert_eq!(
+            flow.partition_id("org-default", None, NodeEnvironment::Dev)
+                .unwrap()
+                .as_str(),
+            "core/env/dev/org/org-default/flows"
+        );
+        assert_eq!(
+            flow.partition_id("org-default", None, NodeEnvironment::Test)
+                .unwrap()
+                .as_str(),
+            "core/env/test/org/org-default/flows"
+        );
+        // `CORE_PARTITION_PREFIX` itself ("core/") — asserted as a literal so
+        // this test does not depend on importing it from `sync::ledger`.
+        assert!(flow
+            .partition_id("org-default", None, NodeEnvironment::Prod)
+            .unwrap()
+            .as_str()
+            .starts_with("core/"));
     }
 }

@@ -201,6 +201,91 @@ impl MeshCommandExecutor {
                 }
             }
 
+            MeshCommandType::ConfigBundleExport => match self.service_action_ctx().await {
+                Some(ctx) => {
+                    let local_environment =
+                        crate::services::environment::get_node_environment(&ctx.db);
+                    let requester_environment =
+                        crate::db::repository::get_trusted_node_environment(&ctx.db, from_node_id)
+                            .ok()
+                            .flatten();
+                    // Donor-side gate (P2-6): `environment_isolation=strict`
+                    // means this node refuses to export config to a peer
+                    // outside its own environment — mirrors the pairing
+                    // handshake's `strict` rejection (`net::iroh::pairing::
+                    // verify_request`), applied here to the donor role
+                    // specifically because a config bundle is the one
+                    // deliberate path that is allowed to cross environments
+                    // AT ALL (everything else fences it outright).
+                    let strict = crate::services::environment::is_isolation_strict(&ctx.db);
+                    if strict && requester_environment != Some(local_environment) {
+                        let _ = crate::db::repository::log_audit(
+                            &ctx.db,
+                            None,
+                            None,
+                            "environment.bundle_export_denied",
+                            Some(&format!("node:{from_node_id}")),
+                            Some(&serde_json::json!({
+                                "requester_node_id": from_node_id,
+                                "requester_environment": requester_environment.map(|e| e.as_str()),
+                                "donor_environment": local_environment.as_str(),
+                            }).to_string()),
+                            None,
+                            Some(&self.local_node_id),
+                        );
+                        return CommandResponse::fail(format!(
+                            "environment isolation is strict on this node ('{}') — refusing config \
+                             bundle export to peer '{}' (environment '{}')",
+                            local_environment,
+                            from_node_id,
+                            requester_environment
+                                .map(|e| e.to_string())
+                                .unwrap_or_else(|| "unknown".to_string())
+                        ));
+                    }
+                    match crate::services::config_bundle::export_bundle(
+                        &ctx.db,
+                        &self.local_node_id,
+                    ) {
+                        Ok(exported) => {
+                            let table_counts = exported
+                                .table_counts
+                                .into_iter()
+                                .map(|(table, row_count)| {
+                                    tentaflow_protocol::environment::EnvironmentBundleTableCount {
+                                        table,
+                                        row_count,
+                                    }
+                                })
+                                .collect();
+                            let _ = crate::db::repository::log_audit(
+                                &ctx.db,
+                                None,
+                                None,
+                                "environment.bundle_exported",
+                                Some(&format!("node:{from_node_id}")),
+                                Some(&serde_json::json!({
+                                    "requester_node_id": from_node_id,
+                                    "requester_environment": requester_environment.map(|e| e.as_str()),
+                                    "donor_environment": local_environment.as_str(),
+                                }).to_string()),
+                                None,
+                                Some(&self.local_node_id),
+                            );
+                            CommandResponse::ok(MeshCommandResponsePayload::ConfigBundleExport {
+                                archive_bytes: exported.archive_bytes,
+                                filename: exported.filename,
+                                manifest_sha256: exported.manifest_sha256,
+                                source_environment: exported.bundle.source_environment,
+                                table_counts,
+                            })
+                        }
+                        Err(e) => CommandResponse::fail(format!("config bundle export failed: {e}")),
+                    }
+                }
+                None => CommandResponse::fail("service action context not wired"),
+            },
+
             MeshCommandType::RoceProbe => {
                 // Enumeracja RoCE/RDMA kart noda — czysto lokalne czytanie /sys.
                 let interfaces = crate::mesh::roce_config::enumerate_roce_interfaces();
@@ -3288,7 +3373,8 @@ mod tests {
                 approved_by TEXT DEFAULT '',
                 approved_at TEXT NOT NULL DEFAULT (datetime('now')),
                 is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT DEFAULT NULL
+                last_addresses TEXT DEFAULT NULL,
+                environment TEXT
             );
             CREATE TABLE IF NOT EXISTS pending_pairings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,

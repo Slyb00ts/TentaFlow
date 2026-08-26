@@ -114,7 +114,7 @@ fn build_entries(registry: &MeshServicesRegistry, pool: &DbPool) -> Result<Vec<C
     let mut entries = Vec::new();
     let mut taken_ids: HashSet<String> = HashSet::new();
 
-    let service_entries = build_service_model_entries(registry);
+    let service_entries = build_service_model_entries(registry, pool);
     for entry in service_entries {
         taken_ids.insert(entry.id.clone());
         entries.push(entry);
@@ -190,10 +190,19 @@ fn build_capabilities_index(entries: &[CatalogEntry]) -> HashMap<String, EntryCa
 /// the local-vs-remote sort inverted (every service compares equal to the
 /// blank id). `Router::start()` enforces this ordering by calling
 /// `rebuild_catalog()` after `set_mesh_services_registry`.
-fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEntry> {
+fn build_service_model_entries(
+    registry: &MeshServicesRegistry,
+    pool: &DbPool,
+) -> Vec<CatalogEntry> {
     let local = registry.local();
     let local_node_id = local.node_id.clone();
     let manifests = crate::services::manifest::registry();
+    // Environment per node_id (ROADMAP Z12) — one batch query instead of one
+    // per mesh service entry. The local node's own environment does not live
+    // in `trusted_nodes` (it never trust-pairs with itself), so it is read
+    // separately and takes priority over any stale row that might exist.
+    let local_environment = crate::services::environment::get_node_environment(pool);
+    let peer_environments = repository::list_trusted_node_environments(pool).unwrap_or_default();
 
     // (model_name) → instances grouped with their local/remote tag
     let mut by_name: HashMap<String, Vec<(bool, ModelInstance)>> = HashMap::new();
@@ -212,6 +221,21 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
 
     for svc in registry.visible_services() {
         let is_local = svc.node_id == local_node_id;
+        // Environment fence (ROADMAP Z12, P2-7 / N7 delta-review) — checked
+        // per SERVICE (the environment is a node-level attribute, not a
+        // per-model one) and BEFORE any capability aggregation. Filtering
+        // only the `ModelInstance` further down while still folding a
+        // cross-env service's surfaces/modalities/reasoning levels into the
+        // entry-level union would advertise a capability that no VISIBLE
+        // instance actually offers — skip the whole service up front instead.
+        let service_environment = if is_local {
+            Some(local_environment)
+        } else {
+            peer_environments.get(&svc.node_id).copied().flatten()
+        };
+        if service_environment != Some(local_environment) {
+            continue;
+        }
         let manifest = manifests.by_id(&svc.engine_id);
         for model in &svc.models {
             // Resolve this service's effective capabilities. Surfaces and
@@ -306,6 +330,12 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
             instance_inputs.sort_by_key(|v| *v as u8);
             let mut instance_outputs: Vec<OutputModality> = svc_outputs.into_iter().collect();
             instance_outputs.sort_by_key(|v| *v as u8);
+            // Environment fence (ROADMAP Z12, P2-7) already excluded the
+            // whole service above (fail-closed on unknown per P1-2) — at
+            // catalog CONSTRUCTION time, not merely annotated: the resolver,
+            // `/v1/models` and alias entries all read instances off this same
+            // catalog snapshot, so an instance that never enters `by_name`
+            // can never be selectable anywhere downstream.
             let instance = ModelInstance {
                 node_id: svc.node_id.clone(),
                 // Display name carries the human-readable peer label (e.g.
@@ -319,6 +349,7 @@ fn build_service_model_entries(registry: &MeshServicesRegistry) -> Vec<CatalogEn
                 loaded: matches!(svc.status.as_str(), "running" | "ready"),
                 input_modalities: instance_inputs,
                 output_modalities: instance_outputs,
+                environment: local_environment,
             };
             by_name
                 .entry(model.model_name.clone())
@@ -1336,7 +1367,7 @@ mod tests {
                 external_service_info(2, &local_node, "openai", "llm", "gpt-5.5"),
             ],
         );
-        let entries = build_service_model_entries(&registry);
+        let entries = build_service_model_entries(&registry, &fresh_db());
         for name in ["gpt-5-5", "gpt-5.5"] {
             let entry = entries
                 .iter()
@@ -1358,6 +1389,17 @@ mod tests {
     #[test]
     fn unknown_engine_falls_back_to_category_surfaces_and_modalities() {
         let registry = MeshServicesRegistry::new();
+        // `peer-node` represents a PEER offering this external service (a
+        // remote node with its own provider integration, reached via
+        // MeshForward) — a real scenario the environment fence (ROADMAP Z12,
+        // P2-7) must not reject just because this test never trust-paired
+        // it. Stamp it same-environment (Prod, the ledger default) so the
+        // instance is not silently dropped as "unknown environment".
+        let db = fresh_db();
+        repository::add_trusted_node(&db, "peer-node", "pub", "peer-node", "test-harness", None)
+            .expect("trust peer-node for test");
+        repository::set_trusted_node_environment(&db, "peer-node", tentaflow_protocol::environment::NodeEnvironment::Prod)
+            .expect("stamp peer-node environment");
         registry.replace_local(
             "local-node".to_string(),
             vec![external_service_info(
@@ -1368,7 +1410,7 @@ mod tests {
                 "mystery-model",
             )],
         );
-        let entries = build_service_model_entries(&registry);
+        let entries = build_service_model_entries(&registry, &db);
         let entry = entries
             .iter()
             .find(|e| e.id == "mystery-model")
@@ -1389,6 +1431,14 @@ mod tests {
 
         let pool = fresh_db();
         let registry = MeshServicesRegistry::new();
+        // `peer-node` offers this external service via MeshForward — same
+        // reasoning as `unknown_engine_falls_back_to_category_surfaces_and_
+        // modalities` above, must be trust-paired + same-environment so the
+        // ROADMAP Z12 (P2-7) fence does not drop it as "unknown".
+        repository::add_trusted_node(&pool, "peer-node", "pub", "peer-node", "test-harness", None)
+            .expect("trust peer-node for test");
+        repository::set_trusted_node_environment(&pool, "peer-node", tentaflow_protocol::environment::NodeEnvironment::Prod)
+            .expect("stamp peer-node environment");
         registry.replace_local(
             "local-node".to_string(),
             vec![external_service_info(

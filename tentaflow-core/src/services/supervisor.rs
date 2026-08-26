@@ -16,6 +16,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
+use crate::db::repository;
 use crate::db::DbPool;
 use crate::services::deploy::{self, RuntimeHandle};
 use crate::services::handles_cache::{
@@ -1451,15 +1452,21 @@ impl Supervisor {
 
                 if state.attempts >= self.max_restart_attempts {
                     let msg = format!("permanent failure after {} attempts", state.attempts);
+                    let attempts_made = state.attempts;
                     drop(states);
                     self.mark_status(svc.id, ServiceStatus::Failed, Some(&msg))
                         .await;
+                    self.audit_restart_failed(svc, attempts_made).await;
                     return;
                 }
                 if !state.ready() {
                     return;
                 }
 
+                // Backoff that gated THIS attempt — captured before
+                // `record_attempt` doubles it for the next one, so the audit
+                // trail records the delay actually observed, not the future one.
+                let backoff_ms = state.next_backoff.as_millis() as u64;
                 state.record_attempt(self.restart_backoff_max);
                 let attempt = state.attempts;
                 drop(states);
@@ -1481,6 +1488,7 @@ impl Supervisor {
                 self.mark_status(svc.id, ServiceStatus::Starting, None)
                     .await;
                 self.increment_restart(svc.id).await;
+                self.audit_restart_attempted(svc, attempt, backoff_ms).await;
 
                 match deploy::respawn(
                     &svc.engine_id,
@@ -1532,6 +1540,73 @@ impl Supervisor {
     async fn clear_restart_state(&self, id: i64) {
         let mut g = self.restart_state.lock().await;
         g.remove(&id);
+    }
+
+    /// Audit trail for an auto-restart attempt (`apply_health`, `HealthStatus::Failed`
+    /// branch, just before `deploy::respawn` is invoked).
+    async fn audit_restart_attempted(&self, svc: &ServiceRow, attempt: u32, backoff_ms: u64) {
+        self.audit_restart(
+            svc,
+            "service.restart_attempted",
+            serde_json::json!({
+                "engine_id": svc.engine_id,
+                "display_name": svc.display_name,
+                "attempt_number": attempt,
+                "backoff_ms": backoff_ms,
+                "max_restart_attempts": self.max_restart_attempts,
+            }),
+        )
+        .await;
+    }
+
+    /// Audit trail for the permanent-failure transition (`apply_health`, past
+    /// `max_restart_attempts`) — the row is marked `failed` and stays down until
+    /// an operator intervenes.
+    async fn audit_restart_failed(&self, svc: &ServiceRow, attempts_made: u32) {
+        self.audit_restart(
+            svc,
+            "service.restart_failed",
+            serde_json::json!({
+                "engine_id": svc.engine_id,
+                "display_name": svc.display_name,
+                "attempts_made": attempts_made,
+                "max_restart_attempts": self.max_restart_attempts,
+            }),
+        )
+        .await;
+    }
+
+    /// Shared hash-chained audit write for the two restart events above.
+    /// Fire-and-forget: a failed audit write must never block the restart
+    /// itself, so the error is logged and dropped rather than propagated — a
+    /// service that needs restarting still gets restarted when the audit table
+    /// is unavailable.
+    async fn audit_restart(
+        &self,
+        svc: &ServiceRow,
+        action: &'static str,
+        details: serde_json::Value,
+    ) {
+        let db = self.db.clone();
+        let resource = format!("service:{}", svc.id);
+        let details = details.to_string();
+        let node_id = self.local_node_id.clone();
+        tokio::task::spawn_blocking(move || {
+            if let Err(e) = repository::log_audit(
+                &db,
+                None,
+                None,
+                action,
+                Some(&resource),
+                Some(&details),
+                None,
+                Some(&node_id),
+            ) {
+                tracing::warn!(%action, %resource, "supervisor: audit write failed: {}", e);
+            }
+        })
+        .await
+        .ok();
     }
 }
 
@@ -1865,6 +1940,7 @@ fn parse_backend_meta(config_json: &str) -> BackendMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::models::AuditLogFilters;
     use crate::services_repo::services::{DeployMethod, NewService};
     use std::sync::Arc;
 
@@ -1994,9 +2070,12 @@ mod tests {
             .unwrap()
         };
 
-        // Drive the supervisor manually: read the row, fail it twice, third
-        // time it must flip to permanently `failed` and stop trying.
-        for _ in 0..3 {
+        // Drive the supervisor manually. With HEALTH_FAILURE_THRESHOLD=3 and
+        // max_restart_attempts=2, the sequence is: calls 1-2 only bump
+        // consecutive_failures (no restart yet), call 3 fires restart attempt
+        // #1, call 4 fires restart attempt #2, call 5 finds attempts >= max
+        // and marks the row permanently `failed` without a further respawn.
+        for _ in 0..5 {
             let svc = {
                 let conn = db.read().unwrap();
                 services_repo::get(&conn, id).unwrap().unwrap()
@@ -2018,6 +2097,73 @@ mod tests {
             services_repo::get(&conn, id).unwrap().unwrap().status
         };
         assert_eq!(final_status, ServiceStatus::Failed);
+
+        // Every respawn attempt must leave an audit trail (`service.restart_attempted`,
+        // one row per attempt) and the permanent-failure transition must leave
+        // exactly one `service.restart_failed` row referencing the same service.
+        let resource = format!("service:{}", id);
+        let attempted = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("service.restart_attempted".to_string()),
+                ..Default::default()
+            },
+            0,
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.resource.as_deref() == Some(resource.as_str()))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            attempted.len(),
+            2,
+            "expected one service.restart_attempted row per respawn attempt, got {:?}",
+            attempted
+        );
+        // `list_audit_logs` orders newest-first; sort ascending by id so
+        // `attempt_number` can be checked against arrival order.
+        let mut attempted = attempted;
+        attempted.sort_by_key(|e| e.id);
+        for (idx, entry) in attempted.iter().enumerate() {
+            assert_eq!(entry.node_id.as_deref(), Some("test-node"));
+            let details: serde_json::Value =
+                serde_json::from_str(entry.details.as_deref().unwrap_or("{}")).unwrap();
+            assert_eq!(
+                details["attempt_number"].as_u64(),
+                Some((idx + 1) as u64),
+                "attempt_number must reflect the ordinal of this restart attempt"
+            );
+            assert!(
+                details["backoff_ms"].as_u64().is_some(),
+                "backoff_ms must be recorded"
+            );
+        }
+
+        let failed = repository::list_audit_logs(
+            &db,
+            &AuditLogFilters {
+                action: Some("service.restart_failed".to_string()),
+                ..Default::default()
+            },
+            0,
+            100,
+        )
+        .unwrap()
+        .into_iter()
+        .filter(|e| e.resource.as_deref() == Some(resource.as_str()))
+        .collect::<Vec<_>>();
+        assert_eq!(
+            failed.len(),
+            1,
+            "permanent failure must leave exactly one service.restart_failed row, got {:?}",
+            failed
+        );
+        let failed_details: serde_json::Value =
+            serde_json::from_str(failed[0].details.as_deref().unwrap_or("{}")).unwrap();
+        assert_eq!(failed_details["attempts_made"].as_u64(), Some(2));
+        assert_eq!(failed_details["max_restart_attempts"].as_u64(), Some(2));
+        assert_eq!(failed[0].node_id.as_deref(), Some("test-node"));
     }
 
     /// A row left in `deploying` by a Core restart is invisible to every later

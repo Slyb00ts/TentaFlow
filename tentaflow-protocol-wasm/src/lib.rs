@@ -3004,6 +3004,189 @@ pub fn encode_events_run_request(
     .map_err(|e| JsError::new(&e))
 }
 
+// -----------------------------------------------------------------------------
+// TF→ONNX model conversion (deploy wizard step, ROADMAP Z11) —
+// MessageBody::ModelConversionBody.
+// -----------------------------------------------------------------------------
+
+/// MessageBody::ModelConversionBody(StartRequest) — starts an async TF→ONNX
+/// conversion for an existing `services` row (`service_id`).
+#[wasm_bindgen(js_name = encodeModelConversionStartRequest)]
+pub fn encode_model_conversion_start_request(
+    service_id: f64,
+    source_path: String,
+    source_format: String,
+    precision: String,
+    tolerance: f64,
+    test_input_path: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelConversionBody(
+        tentaflow_protocol::ModelConversionPayload::StartRequest(
+            tentaflow_protocol::ModelConversionStartRequest {
+                service_id: service_id as i64,
+                source_path,
+                source_format,
+                precision,
+                tolerance,
+                test_input_path,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// MessageBody::ModelConversionBody(StatusRequest) — polls the last known
+/// conversion state for `service_id`.
+#[wasm_bindgen(js_name = encodeModelConversionStatusRequest)]
+pub fn encode_model_conversion_status_request(service_id: f64) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::ModelConversionBody(
+        tentaflow_protocol::ModelConversionPayload::StatusRequest(
+            tentaflow_protocol::ModelConversionStatusRequest {
+                service_id: service_id as i64,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+// -----------------------------------------------------------------------------
+// Node environment identity + config-bundle pull (ROADMAP Z12) —
+// MessageBody::EnvironmentPromotionBody.
+// -----------------------------------------------------------------------------
+
+fn parse_node_environment(kind: &str) -> Result<tentaflow_protocol::environment::NodeEnvironment, JsError> {
+    tentaflow_protocol::environment::NodeEnvironment::parse(kind)
+        .ok_or_else(|| JsError::new(&format!("unknown environment kind: {kind}")))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentGetKindRequest)]
+pub fn encode_environment_get_kind_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::GetKindRequest(
+            tentaflow_protocol::EnvironmentGetKindRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `new_kind`: "dev" | "test" | "prod". `confirm_environment_name` is
+/// REQUIRED (must be exactly `"PROD"`) when switching to Prod — validated
+/// server-side, this is not a client-side convenience.
+#[wasm_bindgen(js_name = encodeEnvironmentSetKindRequest)]
+pub fn encode_environment_set_kind_request(
+    new_kind: String,
+    confirm_environment_name: Option<String>,
+) -> Result<Vec<u8>, JsError> {
+    let new_kind = parse_node_environment(&new_kind)?;
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::SetKindRequest(
+            tentaflow_protocol::EnvironmentSetKindRequest {
+                new_kind,
+                confirm_environment_name,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentSetStrictIsolationRequest)]
+pub fn encode_environment_set_strict_isolation_request(strict: bool) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::SetStrictIsolationRequest(
+            tentaflow_protocol::EnvironmentSetStrictIsolationRequest { strict },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentExportBundleRequest)]
+pub fn encode_environment_export_bundle_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::ExportBundleRequest(
+            tentaflow_protocol::EnvironmentExportBundleRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `archive_bytes` arrives from JS as a Uint8Array (the file the admin
+/// picked via `tf-file-input`) and wasm-bindgen materializes it directly
+/// into `Vec<u8>`.
+#[wasm_bindgen(js_name = encodeEnvironmentImportFromFileRequest)]
+pub fn encode_environment_import_from_file_request(
+    archive_bytes: Vec<u8>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::ImportFromFileRequest(
+            tentaflow_protocol::EnvironmentImportFromFileRequest { archive_bytes },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentPullDonorListRequest)]
+pub fn encode_environment_pull_donor_list_request() -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::PullDonorListRequest(
+            tentaflow_protocol::EnvironmentPullDonorListRequest {},
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentPullStartRequest)]
+pub fn encode_environment_pull_start_request(donor_node_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::PullStartRequest(
+            tentaflow_protocol::EnvironmentPullStartRequest { donor_node_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentPullStatusRequest)]
+pub fn encode_environment_pull_status_request(pull_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::PullStatusRequest(
+            tentaflow_protocol::EnvironmentPullStatusRequest { pull_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+#[wasm_bindgen(js_name = encodeEnvironmentImportPreviewDiffRequest)]
+pub fn encode_environment_import_preview_diff_request(pull_id: String) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::ImportPreviewDiffRequest(
+            tentaflow_protocol::EnvironmentImportPreviewDiffRequest { pull_id },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
+/// `confirm_environment_name` is REQUIRED (must equal the target
+/// environment's name, uppercased) when the pull promotes UPWARD (in
+/// particular onto Prod) — validated server-side (D-Z12.8).
+/// `selected_resource_keys` are `"table:resource_id"` strings, one per
+/// checked row in the diff table.
+#[wasm_bindgen(js_name = encodeEnvironmentImportApplyRequest)]
+pub fn encode_environment_import_apply_request(
+    pull_id: String,
+    confirm_environment_name: Option<String>,
+    selected_resource_keys: Vec<String>,
+) -> Result<Vec<u8>, JsError> {
+    encode_body_inner(&MessageBody::EnvironmentPromotionBody(
+        tentaflow_protocol::EnvironmentPromotionPayload::ImportApplyRequest(
+            tentaflow_protocol::EnvironmentImportApplyRequest {
+                pull_id,
+                confirm_environment_name,
+                selected_resource_keys,
+            },
+        ),
+    ))
+    .map_err(|e| JsError::new(&e))
+}
+
 #[wasm_bindgen(js_name = encodeMlStudioVisionModelDeleteRequest)]
 pub fn encode_ml_studio_vision_model_delete_request(
     model_name: String,
@@ -9980,6 +10163,12 @@ pub fn decode_message_body(bytes: &[u8]) -> Result<JsValue, JsError> {
         }
         MessageBody::RobotsBody(payload) => decode_robots_payload(&obj, payload),
         MessageBody::EventsBody(payload) => decode_events_payload(&obj, payload),
+        MessageBody::ModelConversionBody(payload) => {
+            decode_model_conversion_payload(&obj, payload)
+        }
+        MessageBody::EnvironmentPromotionBody(payload) => {
+            decode_environment_promotion_payload(&obj, payload)
+        }
         MessageBody::StorageAdminBody(payload) => decode_storage_admin_payload(&obj, payload),
         MessageBody::ProjectStudioBody(payload) => decode_project_studio_payload(&obj, payload),
         MessageBody::CodeStudioBody(payload) => decode_code_studio_payload(&obj, payload),
@@ -10091,6 +10280,196 @@ fn decode_events_payload(obj: &js_sys::Object, payload: tentaflow_protocol::Even
         }
         P::BrowseRequest(_) => set(obj, "variant", "EventsBrowseRequest".into()),
         P::RunRequest(_) => set(obj, "variant", "EventsRunRequest".into()),
+    }
+}
+
+/// Decodes `ModelConversionPayload` (TF→ONNX deploy-wizard step, ROADMAP Z11).
+/// Only the `*Response` variants reach the GUI; the `*Request` arms exist to
+/// exhaust the match, same convention as `decode_events_payload`.
+fn decode_model_conversion_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::ModelConversionPayload,
+) {
+    use tentaflow_protocol::ModelConversionPayload as P;
+    match payload {
+        P::StartResponse(resp) => {
+            set(obj, "variant", "ModelConversionStartResponse".into());
+            set(obj, "serviceId", (resp.service_id as f64).into());
+            set(obj, "service_id", (resp.service_id as f64).into());
+            set(obj, "status", resp.status.into());
+        }
+        P::StatusResponse(resp) => {
+            set(obj, "variant", "ModelConversionStatusResponse".into());
+            set(obj, "serviceId", (resp.service_id as f64).into());
+            set(obj, "service_id", (resp.service_id as f64).into());
+            set(obj, "status", resp.status.into());
+            set_pair_opt_string(obj, "onnxPath", "onnx_path", resp.onnx_path);
+            match resp.max_abs_diff {
+                Some(v) => {
+                    set(obj, "maxAbsDiff", v.into());
+                    set(obj, "max_abs_diff", v.into());
+                }
+                None => {
+                    set(obj, "maxAbsDiff", JsValue::NULL);
+                    set(obj, "max_abs_diff", JsValue::NULL);
+                }
+            }
+            match resp.tolerance_passed {
+                Some(v) => {
+                    set(obj, "tolerancePassed", v.into());
+                    set(obj, "tolerance_passed", v.into());
+                }
+                None => {
+                    set(obj, "tolerancePassed", JsValue::NULL);
+                    set(obj, "tolerance_passed", JsValue::NULL);
+                }
+            }
+            set_pair_opt_string(obj, "error", "error", resp.error);
+            set(obj, "validated", resp.validated.into());
+        }
+        P::StartRequest(_) => set(obj, "variant", "ModelConversionStartRequest".into()),
+        P::StatusRequest(_) => set(obj, "variant", "ModelConversionStatusRequest".into()),
+    }
+}
+
+/// A `DiffEntry` array (`added`/`changed`/`skipped` of `ImportPreviewDiffResponse`)
+/// as a JS array of `{table, resourceId, label}` objects.
+fn diff_entries_to_js(entries: Vec<tentaflow_protocol::environment::EnvironmentDiffEntry>) -> JsValue {
+    let arr = js_sys::Array::new();
+    for e in entries {
+        let o = js_sys::Object::new();
+        set(&o, "table", e.table.into());
+        set(&o, "resourceId", e.resource_id.clone().into());
+        set(&o, "resource_id", e.resource_id.into());
+        set(&o, "label", e.label.into());
+        arr.push(&o);
+    }
+    arr.into()
+}
+
+/// Decodes `EnvironmentPromotionPayload` (node environment identity + manual
+/// config-bundle pull, ROADMAP Z12). Only the `*Response` variants reach the
+/// GUI; the `*Request` arms exist to exhaust the match, same convention as
+/// `decode_model_conversion_payload`.
+fn decode_environment_promotion_payload(
+    obj: &js_sys::Object,
+    payload: tentaflow_protocol::EnvironmentPromotionPayload,
+) {
+    use tentaflow_protocol::EnvironmentPromotionPayload as P;
+    match payload {
+        P::GetKindResponse(resp) => {
+            set(obj, "variant", "EnvironmentGetKindResponse".into());
+            set(obj, "kind", resp.kind.as_str().into());
+            set(obj, "isolationStrict", resp.isolation_strict.into());
+            set(obj, "isolation_strict", resp.isolation_strict.into());
+        }
+        P::SetKindResponse(resp) => {
+            set(obj, "variant", "EnvironmentSetKindResponse".into());
+            set(obj, "kind", resp.kind.as_str().into());
+            set(obj, "reseededOperations", (resp.reseeded_operations as f64).into());
+            set(obj, "reseeded_operations", (resp.reseeded_operations as f64).into());
+        }
+        P::SetStrictIsolationResponse(resp) => {
+            set(obj, "variant", "EnvironmentSetStrictIsolationResponse".into());
+            set(obj, "strict", resp.strict.into());
+        }
+        P::ExportBundleResponse(resp) => {
+            set(obj, "variant", "EnvironmentExportBundleResponse".into());
+            set(obj, "filename", resp.filename.into());
+            set(
+                obj,
+                "archiveBytes",
+                js_sys::Uint8Array::from(&resp.archive_bytes[..]).into(),
+            );
+            set(
+                obj,
+                "archive_bytes",
+                js_sys::Uint8Array::from(&resp.archive_bytes[..]).into(),
+            );
+            set(obj, "manifestSha256", resp.manifest_sha256.clone().into());
+            set(obj, "manifest_sha256", resp.manifest_sha256.into());
+            set(obj, "sourceEnvironment", resp.source_environment.as_str().into());
+            set(obj, "source_environment", resp.source_environment.as_str().into());
+            let arr = js_sys::Array::new();
+            for tc in resp.table_counts {
+                let o = js_sys::Object::new();
+                set(&o, "table", tc.table.into());
+                set(&o, "rowCount", (tc.row_count as f64).into());
+                set(&o, "row_count", (tc.row_count as f64).into());
+                arr.push(&o);
+            }
+            set(obj, "tableCounts", arr.clone().into());
+            set(obj, "table_counts", arr.into());
+        }
+        P::PullDonorListResponse(resp) => {
+            set(obj, "variant", "EnvironmentPullDonorListResponse".into());
+            let arr = js_sys::Array::new();
+            for d in resp.donors {
+                let o = js_sys::Object::new();
+                set(&o, "nodeId", d.node_id.clone().into());
+                set(&o, "node_id", d.node_id.into());
+                set(&o, "hostname", d.hostname.into());
+                set(&o, "environment", d.environment.as_str().into());
+                arr.push(&o);
+            }
+            set(obj, "donors", arr.into());
+        }
+        P::PullStartResponse(resp) => {
+            set(obj, "variant", "EnvironmentPullStartResponse".into());
+            set(obj, "pullId", resp.pull_id.clone().into());
+            set(obj, "pull_id", resp.pull_id.into());
+            set(obj, "phase", resp.phase.into());
+            set_pair_opt_string(obj, "error", "error", resp.error);
+        }
+        P::PullStatusResponse(resp) => {
+            set(obj, "variant", "EnvironmentPullStatusResponse".into());
+            set(obj, "pullId", resp.pull_id.clone().into());
+            set(obj, "pull_id", resp.pull_id.into());
+            set(obj, "phase", resp.phase.into());
+            set_pair_opt_string(obj, "error", "error", resp.error);
+        }
+        P::ImportPreviewDiffResponse(resp) => {
+            set(obj, "variant", "EnvironmentImportPreviewDiffResponse".into());
+            set(obj, "pullId", resp.pull_id.clone().into());
+            set(obj, "pull_id", resp.pull_id.into());
+            set(obj, "fromEnvironment", resp.from_environment.as_str().into());
+            set(obj, "from_environment", resp.from_environment.as_str().into());
+            set(obj, "toEnvironment", resp.to_environment.as_str().into());
+            set(obj, "to_environment", resp.to_environment.as_str().into());
+            set(obj, "added", diff_entries_to_js(resp.added));
+            set(obj, "changed", diff_entries_to_js(resp.changed));
+            set(obj, "skipped", diff_entries_to_js(resp.skipped));
+            set(obj, "flowsCount", (resp.flows_count as f64).into());
+            set(obj, "flows_count", (resp.flows_count as f64).into());
+            set(obj, "settingsCount", (resp.settings_count as f64).into());
+            set(obj, "settings_count", (resp.settings_count as f64).into());
+            set(obj, "aliasesCount", (resp.aliases_count as f64).into());
+            set(obj, "aliases_count", (resp.aliases_count as f64).into());
+        }
+        P::ImportApplyResponse(resp) => {
+            set(obj, "variant", "EnvironmentImportApplyResponse".into());
+            set(obj, "applied", resp.applied.into());
+            set(obj, "importedCount", (resp.imported_count as f64).into());
+            set(obj, "imported_count", (resp.imported_count as f64).into());
+        }
+        P::GetKindRequest(_) => set(obj, "variant", "EnvironmentGetKindRequest".into()),
+        P::SetKindRequest(_) => set(obj, "variant", "EnvironmentSetKindRequest".into()),
+        P::SetStrictIsolationRequest(_) => {
+            set(obj, "variant", "EnvironmentSetStrictIsolationRequest".into())
+        }
+        P::ExportBundleRequest(_) => set(obj, "variant", "EnvironmentExportBundleRequest".into()),
+        P::ImportFromFileRequest(_) => {
+            set(obj, "variant", "EnvironmentImportFromFileRequest".into())
+        }
+        P::PullDonorListRequest(_) => {
+            set(obj, "variant", "EnvironmentPullDonorListRequest".into())
+        }
+        P::PullStartRequest(_) => set(obj, "variant", "EnvironmentPullStartRequest".into()),
+        P::PullStatusRequest(_) => set(obj, "variant", "EnvironmentPullStatusRequest".into()),
+        P::ImportPreviewDiffRequest(_) => {
+            set(obj, "variant", "EnvironmentImportPreviewDiffRequest".into())
+        }
+        P::ImportApplyRequest(_) => set(obj, "variant", "EnvironmentImportApplyRequest".into()),
     }
 }
 

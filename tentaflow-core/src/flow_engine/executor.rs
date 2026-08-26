@@ -2581,6 +2581,20 @@ async fn create_execution_record(db: &DbPool, flow_id: &str, ctx: &ExecutionCont
     Ok(id)
 }
 
+/// `envelope.variables` key a flow can write (via any node's existing
+/// `output_mapping`, §3.12 — no new UI needed) to attach domain-specific
+/// metadata about what the run analyzed to its `flow_executions` row
+/// (migration v136, `result_metadata_json`). Deliberately NOT
+/// `envelope.meta`: that channel is engine plumbing writable by any node
+/// including a WASM addon deserializing a whole envelope from guest memory
+/// (see `create_execution_record`'s provenance note), so it cannot carry data
+/// meant to be trusted as this run's own reported result. `variables` is the
+/// channel already documented as "user-facing flow variables"
+/// (`flow_engine::envelope::FlowEnvelope::variables`).
+/// Non-object/array values (string/number/bool) are still accepted — the
+/// column is opaque JSON, not a schema.
+pub const RESULT_METADATA_VARIABLE: &str = "result_metadata";
+
 async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecutionOutcome) {
     // execution_id == 0 = no audit row was created (synthetic or light run —
     // see create_execution_record). Nothing to update.
@@ -2602,6 +2616,15 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
     // request-build time inside the LLM node. A flow that called no model keeps
     // it NULL rather than inheriting a routing hint it never used.
     let model = outcome.model.clone();
+    // Same story as `model`: only known once the flow finished producing it,
+    // so it is read off the final envelope, not `ctx`, and serialized to the
+    // TEXT column verbatim.
+    let result_metadata = outcome
+        .final_envelope
+        .variables
+        .get(RESULT_METADATA_VARIABLE)
+        .map(io_mapping::variable_to_json)
+        .map(|v| serde_json::to_string(&v).unwrap_or_else(|_| "null".into()));
     let _ = tokio::task::spawn_blocking(move || {
         repository::update_flow_execution(
             &pool,
@@ -2611,6 +2634,7 @@ async fn persist_execution(db: &DbPool, execution_id: i64, outcome: &FlowExecuti
             Some(&log_json),
             Some(total_ms),
             Some(total_tokens),
+            result_metadata.as_deref(),
         )
     })
     .await;

@@ -120,6 +120,7 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, DATASET_PROFILE),
     (4, RESOURCE_GRANTS),
     (5, DATASET_RAW_DATA),
+    (6, DATASET_LINEAGE),
 ];
 
 const INITIAL_SCHEMA: &str = "
@@ -262,3 +263,145 @@ CREATE INDEX idx_resource_grants_node ON resource_grants(node_id);
 const DATASET_RAW_DATA: &str = "
 ALTER TABLE datasets ADD COLUMN raw_data BLOB;
 ";
+
+// Z9 (ML 66) — full model lineage: links a training run to the dataset it
+// trained on, and a model back to both its dataset and the run that produced
+// it. `training_runs.model_id` already points a run at its model; `models
+// .training_run_id` is the reverse edge, kept so a model can be found from
+// either side without a self-join. All three columns are NULLable and
+// deliberately NOT backfilled: `training_runs`/`models` rows inserted before
+// this migration never recorded a dataset link, and there is no reliable way
+// to reconstruct it after the fact. A lineage read must treat NULL as
+// "unknown", not as a broken reference.
+const DATASET_LINEAGE: &str = "
+ALTER TABLE training_runs ADD COLUMN dataset_id TEXT;
+ALTER TABLE models ADD COLUMN dataset_id TEXT;
+ALTER TABLE models ADD COLUMN training_run_id TEXT;
+";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Highest migration version this binary knows. A guard test below fails
+    /// loudly if `MIGRATIONS` moves without this constant following — the same
+    /// role `LATEST_SCHEMA_VERSION` plays in `code_studio/workspace_db.rs`.
+    const LATEST_SCHEMA_VERSION: i64 = 6;
+
+    fn migrate_fresh() -> Connection {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let conn = Connection::open(tmp.path().join("ml_studio_test.db")).expect("open db");
+        run_migrations(&conn).expect("run migrations");
+        // Keep the tempdir alive for the connection's lifetime by leaking it —
+        // these are short-lived test processes, not a long-running leak.
+        std::mem::forget(tmp);
+        conn
+    }
+
+    /// Head-of-ladder guard: a fresh database lands exactly on
+    /// `LATEST_SCHEMA_VERSION`, and re-running the whole ladder is a no-op
+    /// (no duplicate-column error from the v6 `ALTER TABLE`s, no re-recorded
+    /// version rows). Catches the exact mistake Z9's pitfall #1 warns about —
+    /// landing a migration in the wrong ladder never even reaches this test,
+    /// but a version bump forgotten here would.
+    #[test]
+    fn migrations_reach_the_declared_head_and_are_idempotent() {
+        let conn = migrate_fresh();
+        let version: i64 = conn
+            .query_row(
+                "SELECT COALESCE(MAX(version), 0) FROM ml_studio_schema_version",
+                [],
+                |row| row.get(0),
+            )
+            .expect("version");
+        assert_eq!(version, LATEST_SCHEMA_VERSION);
+        assert_eq!(
+            MIGRATIONS.last().map(|(v, _)| *v),
+            Some(LATEST_SCHEMA_VERSION),
+            "MIGRATIONS head must match LATEST_SCHEMA_VERSION"
+        );
+
+        run_migrations(&conn).expect("re-run migrations");
+        let applied: i64 = conn
+            .query_row("SELECT COUNT(*) FROM ml_studio_schema_version", [], |row| {
+                row.get(0)
+            })
+            .expect("applied count");
+        assert_eq!(
+            applied,
+            MIGRATIONS.len() as i64,
+            "reopening re-applied a migration"
+        );
+    }
+
+    /// v6 adds nullable lineage columns to `training_runs`/`models`. Historic
+    /// rows (inserted before this migration, simulated here by inserting
+    /// without the new columns) must read them back as NULL rather than error
+    /// — the future lineage view has to render "no dataset recorded" instead
+    /// of crashing on old data (Z9 pitfall #2). A fresh write into the new
+    /// columns must round-trip.
+    #[test]
+    fn v6_lineage_columns_are_nullable_and_round_trip() {
+        let conn = migrate_fresh();
+        conn.execute(
+            "INSERT INTO projects (project_id, name, project_type, owner_user_id, org_id) \
+             VALUES ('p1', 'Projekt', 'recognition', 'u1', 'o1')",
+            [],
+        )
+        .expect("insert project");
+        conn.execute(
+            "INSERT INTO training_runs (run_id, project_id, status, config_json) \
+             VALUES ('r1', 'p1', 'succeeded', '{}')",
+            [],
+        )
+        .expect("insert run without dataset_id");
+        conn.execute(
+            "INSERT INTO models (model_id, project_id, name) VALUES ('m1', 'p1', 'Model')",
+            [],
+        )
+        .expect("insert model without dataset_id/training_run_id");
+
+        let (run_dataset, model_dataset, model_run): (
+            Option<String>,
+            Option<String>,
+            Option<String>,
+        ) = conn
+            .query_row(
+                "SELECT \
+                   (SELECT dataset_id FROM training_runs WHERE run_id = 'r1'), \
+                   (SELECT dataset_id FROM models WHERE model_id = 'm1'), \
+                   (SELECT training_run_id FROM models WHERE model_id = 'm1')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read lineage columns");
+        assert_eq!(run_dataset, None, "historic run has no dataset link");
+        assert_eq!(model_dataset, None, "historic model has no dataset link");
+        assert_eq!(model_run, None, "historic model has no run-back-link");
+
+        conn.execute(
+            "UPDATE training_runs SET dataset_id = 'd1' WHERE run_id = 'r1'",
+            [],
+        )
+        .expect("set run dataset_id");
+        conn.execute(
+            "UPDATE models SET dataset_id = 'd1', training_run_id = 'r1' WHERE model_id = 'm1'",
+            [],
+        )
+        .expect("set model lineage columns");
+
+        let written: (String, String, String) = conn
+            .query_row(
+                "SELECT t.dataset_id, m.dataset_id, m.training_run_id \
+                 FROM training_runs t JOIN models m ON m.model_id = 'm1' \
+                 WHERE t.run_id = 'r1'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .expect("read written lineage columns");
+        assert_eq!(
+            written,
+            ("d1".to_string(), "d1".to_string(), "r1".to_string())
+        );
+    }
+}

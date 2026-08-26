@@ -11,6 +11,11 @@
 //            <tf-radio value="red" label="Red"></tf-radio>
 //            <tf-radio value="blue" label="Blue"></tf-radio>
 //          </tf-radio-group>
+// The `nested` attribute on tf-radio-group opts into DESCENDANT (not just
+// direct-child) tf-radio discovery and leaves caller-provided light-DOM
+// markup untouched (no move-into-wrap) — for renderers that interleave
+// section headings between radios (e.g. donor lists grouped by environment)
+// and still need one logical group/selection across the whole list.
 // =============================================================================
 
 class TfRadio extends HTMLElement {
@@ -166,6 +171,18 @@ class TfRadioGroup extends HTMLElement {
   }
 
   _build() {
+    if (this.hasAttribute('nested')) {
+      // Caller owns the light-DOM layout (section headings interleaved with
+      // tf-radio elements at any depth) — track selection only, never move
+      // nodes around. The non-nested path below sets `role="radiogroup"` on
+      // the generated `wrap` div; nested mode has no such wrapper, so the
+      // role has to land on the host itself or assistive tech never learns
+      // this is a single logical radio group.
+      this.setAttribute('role', 'radiogroup');
+      this._wrap = this;
+      this._labelEl = null;
+      return;
+    }
     const existing = Array.from(this.querySelectorAll(':scope > tf-radio'));
     const labelText = this.getAttribute('label') || '';
 

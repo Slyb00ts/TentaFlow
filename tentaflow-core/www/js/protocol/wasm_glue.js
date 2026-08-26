@@ -3876,6 +3876,175 @@ export function encodeEnvelopeDirect(correlation_id, sequence, message_kind, bod
 }
 
 /**
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentExportBundleRequest() {
+    const ret = wasm.encodeEnvironmentExportBundleRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentGetKindRequest() {
+    const ret = wasm.encodeEnvironmentGetKindRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * `confirm_environment_name` is REQUIRED (must equal the target
+ * environment's name, uppercased) when the pull promotes UPWARD (in
+ * particular onto Prod) — validated server-side (D-Z12.8).
+ * `selected_resource_keys` are `"table:resource_id"` strings, one per
+ * checked row in the diff table.
+ * @param {string} pull_id
+ * @param {string | null | undefined} confirm_environment_name
+ * @param {string[]} selected_resource_keys
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentImportApplyRequest(pull_id, confirm_environment_name, selected_resource_keys) {
+    const ptr0 = passStringToWasm0(pull_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(confirm_environment_name) ? 0 : passStringToWasm0(confirm_environment_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ptr2 = passArrayJsValueToWasm0(selected_resource_keys, wasm.__wbindgen_malloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeEnvironmentImportApplyRequest(ptr0, len0, ptr1, len1, ptr2, len2);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * `archive_bytes` arrives from JS as a Uint8Array (the file the admin
+ * picked via `tf-file-input`) and wasm-bindgen materializes it directly
+ * into `Vec<u8>`.
+ * @param {Uint8Array} archive_bytes
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentImportFromFileRequest(archive_bytes) {
+    const ptr0 = passArray8ToWasm0(archive_bytes, wasm.__wbindgen_malloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeEnvironmentImportFromFileRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} pull_id
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentImportPreviewDiffRequest(pull_id) {
+    const ptr0 = passStringToWasm0(pull_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeEnvironmentImportPreviewDiffRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentPullDonorListRequest() {
+    const ret = wasm.encodeEnvironmentPullDonorListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} donor_node_id
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentPullStartRequest(donor_node_id) {
+    const ptr0 = passStringToWasm0(donor_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeEnvironmentPullStartRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} pull_id
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentPullStatusRequest(pull_id) {
+    const ptr0 = passStringToWasm0(pull_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeEnvironmentPullStatusRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `new_kind`: "dev" | "test" | "prod". `confirm_environment_name` is
+ * REQUIRED (must be exactly `"PROD"`) when switching to Prod — validated
+ * server-side, this is not a client-side convenience.
+ * @param {string} new_kind
+ * @param {string | null} [confirm_environment_name]
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentSetKindRequest(new_kind, confirm_environment_name) {
+    const ptr0 = passStringToWasm0(new_kind, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(confirm_environment_name) ? 0 : passStringToWasm0(confirm_environment_name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeEnvironmentSetKindRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {boolean} strict
+ * @returns {Uint8Array}
+ */
+export function encodeEnvironmentSetStrictIsolationRequest(strict) {
+    const ret = wasm.encodeEnvironmentSetStrictIsolationRequest(strict);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
  * MessageBody::EventsBody(BrowseRequest) — filter as a JSON object.
  * @param {string} filter_json
  * @returns {Uint8Array}
@@ -6709,6 +6878,51 @@ export function encodeModelConsumerRevokeRequest(model_id, addon_id) {
     var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
     wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
     return v3;
+}
+
+/**
+ * MessageBody::ModelConversionBody(StartRequest) — starts an async TF→ONNX
+ * conversion for an existing `services` row (`service_id`).
+ * @param {number} service_id
+ * @param {string} source_path
+ * @param {string} source_format
+ * @param {string} precision
+ * @param {number} tolerance
+ * @param {string | null} [test_input_path]
+ * @returns {Uint8Array}
+ */
+export function encodeModelConversionStartRequest(service_id, source_path, source_format, precision, tolerance, test_input_path) {
+    const ptr0 = passStringToWasm0(source_path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(source_format, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(precision, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    var ptr3 = isLikeNone(test_input_path) ? 0 : passStringToWasm0(test_input_path, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeModelConversionStartRequest(service_id, ptr0, len0, ptr1, len1, ptr2, len2, tolerance, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * MessageBody::ModelConversionBody(StatusRequest) — polls the last known
+ * conversion state for `service_id`.
+ * @param {number} service_id
+ * @returns {Uint8Array}
+ */
+export function encodeModelConversionStatusRequest(service_id) {
+    const ret = wasm.encodeModelConversionStatusRequest(service_id);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
 }
 
 /**

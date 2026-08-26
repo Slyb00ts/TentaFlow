@@ -305,6 +305,54 @@ pub async fn run_donor_session<S: FrameStream>(
         ));
     }
 
+    // Donor-side environment fence (N4, ROADMAP Z12 delta-review). The joiner
+    // already refuses to PULL from a cross-environment donor
+    // (`IrohMeshManager::pull_baseline_from_donor`, P1-4), but that guard
+    // lives entirely on the joiner's side of the wire — a peer that dials
+    // ALPN_BASELINE directly (bug or otherwise) would still be served here.
+    // Unlike pairing (`net::iroh::pairing`), where a cross-env peer is only
+    // WARNED unless `strict` is on, a baseline carries a full org snapshot
+    // with DECRYPTED secrets: cross-environment baseline exchange is never
+    // legal, strict or not (the only legal cross-env channel is the
+    // allowlisted, secret-free config bundle). Fails closed on an unknown
+    // (`None`) requester environment, same as every other environment gate.
+    let local_environment = crate::services::environment::get_node_environment(&security.db);
+    let requester_environment =
+        crate::db::repository::get_trusted_node_environment(&security.db, remote_node_id)
+            .unwrap_or(None);
+    if requester_environment != Some(local_environment) {
+        let requester_environment_label = requester_environment
+            .map(|e| e.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let _ = crate::db::repository::log_audit(
+            &security.db,
+            None,
+            None,
+            "sync.baseline_donor_cross_env_denied",
+            Some(&format!("node:{remote_node_id}")),
+            Some(&format!(
+                "{{\"local_environment\":\"{}\",\"requester_environment\":\"{}\"}}",
+                local_environment, requester_environment_label
+            )),
+            None,
+            Some(local_node_id),
+        );
+        let nack = BaselineAck {
+            accepted: false,
+            donor: local_node_id.to_string(),
+            joiner: remote_node_id.to_string(),
+            epoch: 0,
+        };
+        let _ = write_frame(stream, &nack, "ack").await;
+        return Err(transport_err(
+            "elect",
+            format!(
+                "refusing cross-environment baseline donation to {remote_node_id} \
+                 (local environment '{local_environment}', requester environment '{requester_environment_label}')"
+            ),
+        ));
+    }
+
     // Content-aware role decision. The node that HOLDS MORE content is the donor;
     // we compare our own ledger op count against the count the requester
     // advertised in `BaselineElect`, so the empty node adopts from the

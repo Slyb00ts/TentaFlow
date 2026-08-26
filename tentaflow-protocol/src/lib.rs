@@ -21,10 +21,12 @@ pub mod cbor;
 pub mod code_studio;
 pub mod compliance;
 pub mod envelope;
+pub mod environment;
 pub mod events;
 pub mod legal;
 pub mod mesh;
 pub mod message_body;
+pub mod model_conversion;
 pub mod model_metrics;
 pub mod pii;
 pub mod profiling;
@@ -787,6 +789,21 @@ pub use profiling::{
 pub use events::{
     EventRowWire, EventsBrowseRequest, EventsBrowseResponse, EventsCursor, EventsPayload,
     EventsRunRequest, EventsRunResponse,
+};
+pub use model_conversion::{
+    ModelConversionPayload, ModelConversionStartRequest, ModelConversionStartResponse,
+    ModelConversionStatusRequest, ModelConversionStatusResponse,
+};
+pub use environment::{
+    EnvironmentBundleTableCount, EnvironmentDiffEntry, EnvironmentExportBundleRequest,
+    EnvironmentExportBundleResponse, EnvironmentGetKindRequest, EnvironmentGetKindResponse,
+    EnvironmentImportApplyRequest, EnvironmentImportApplyResponse,
+    EnvironmentImportFromFileRequest, EnvironmentImportPreviewDiffRequest,
+    EnvironmentImportPreviewDiffResponse, EnvironmentPromotionPayload,
+    EnvironmentPullDonorInfo, EnvironmentPullDonorListRequest, EnvironmentPullDonorListResponse,
+    EnvironmentPullStartRequest, EnvironmentPullStartResponse, EnvironmentPullStatusRequest,
+    EnvironmentPullStatusResponse, EnvironmentSetKindRequest, EnvironmentSetKindResponse,
+    EnvironmentSetStrictIsolationRequest, EnvironmentSetStrictIsolationResponse, NodeEnvironment,
 };
 pub use storage::{
     StorageAdminPayload, StorageBrowseRequest, StorageBrowseResponse, StorageCategoryInfo,

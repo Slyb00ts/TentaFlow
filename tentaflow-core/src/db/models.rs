@@ -347,6 +347,11 @@ pub struct DbFlowExecution {
     pub actor_id: Option<String>,
     pub actor_user_id: Option<String>,
     pub correlation_id: Option<String>,
+    /// Domain-specific metadata about what the run analyzed (exam type,
+    /// patient pseudonym, ...), stored as opaque JSON — migration v136. `None`
+    /// until finalization writes it (see `flow_engine::executor::persist_execution`)
+    /// and on every row written before v136.
+    pub result_metadata_json: Option<String>,
 }
 
 /// Parameters of a new `flow_executions` row.
@@ -1174,6 +1179,11 @@ pub struct TrustedNode {
     pub approved_at: String,
     pub is_active: bool,
     pub last_addresses: String,
+    /// Environment declared by the peer at pairing handshake time (ROADMAP
+    /// Z12), `dev`/`test`/`prod`. `None` for a peer trust-paired before this
+    /// column existed — callers treat that as `NodeEnvironment::default()`
+    /// (Prod), never as "same environment as local".
+    pub environment: Option<String>,
 }
 
 /// Oczekujace parowanie z innym nodem

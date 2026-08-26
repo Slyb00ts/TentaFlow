@@ -1762,6 +1762,7 @@ pub fn ml_studio_tabular_train(
         &config_json,
         &metrics_json,
         &history,
+        &payload.dataset_id,
     )
     .map_err(db_err)?;
 
@@ -2268,8 +2269,11 @@ pub async fn ml_studio_ft_train_start(
     })
     .to_string();
 
+    // LLM fine-tune is not an ML 66 lineage-instrumented track (Z9 scope:
+    // recognition/classifier/OCR/tabular/autogluon) — the dataset the run used
+    // is recorded in `config_json` above, but not as a lineage link.
     let run_id =
-        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+        repository::create_training_run(&payload.project_id, &config_json, None).map_err(db_err)?;
 
     match target_node {
         None => {
@@ -2762,12 +2766,16 @@ fn sync_remote_ft_status(run_id: &str, run: &repository::TrainingRunRow, status_
             })
             .to_string();
             let model_name = format!("{}-{}", base_model, method);
+            // LLM fine-tune is not an ML 66 lineage-instrumented track (Z9
+            // scope: recognition/classifier/OCR/tabular/autogluon).
             if let Ok(model_id) = repository::insert_model(
                 &run.project_id,
                 &model_name,
                 "huggingface",
                 base_model,
                 &metrics_json,
+                None,
+                None,
             ) {
                 let _ = repository::set_training_run_model(run_id, &model_id);
             }
@@ -2850,8 +2858,12 @@ pub async fn ml_studio_recog_train_start(
     })
     .to_string();
 
-    let run_id =
-        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+    let run_id = repository::create_training_run(
+        &payload.project_id,
+        &config_json,
+        Some(&payload.dataset_id),
+    )
+    .map_err(db_err)?;
 
     let target_was_remote = target_node.is_some();
     match target_node {
@@ -3255,8 +3267,12 @@ pub async fn ml_studio_classifier_train_start(
     })
     .to_string();
 
-    let run_id =
-        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+    let run_id = repository::create_training_run(
+        &payload.project_id,
+        &config_json,
+        Some(&payload.dataset_id),
+    )
+    .map_err(db_err)?;
 
     let target_was_remote = target_node.is_some();
     match target_node {
@@ -3485,8 +3501,12 @@ pub async fn ml_studio_ocr_train_start(
     })
     .to_string();
 
-    let run_id =
-        repository::create_training_run(&payload.project_id, &config_json).map_err(db_err)?;
+    let run_id = repository::create_training_run(
+        &payload.project_id,
+        &config_json,
+        Some(&payload.dataset_id),
+    )
+    .map_err(db_err)?;
 
     let target_was_remote = target_node.is_some();
     match target_node {
@@ -3895,6 +3915,8 @@ fn sync_remote_classifier_status(
                 "classifier-timm",
                 variant,
                 &metrics_json,
+                run.dataset_id.as_deref(),
+                Some(run_id),
             ) {
                 let _ = repository::set_training_run_model(run_id, &model_id);
             }
@@ -4223,6 +4245,8 @@ fn sync_remote_recog_status(
                 "rfdetr",
                 &format!("RF-DETR {} @{}", variant, node),
                 &metrics_json,
+                run.dataset_id.as_deref(),
+                Some(run_id),
             ) {
                 let _ = repository::set_training_run_model(run_id, &model_id);
             }

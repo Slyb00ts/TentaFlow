@@ -2811,6 +2811,7 @@ mod tests {
                     node_id: "peer".to_string(),
                 },
                 epoch: BaselineEpoch::default(),
+                environment: crate::sync::ledger::NodeEnvironment::default(),
                 prev_node_hash: None,
                 payload_hash: [0; 32],
                 acl_snapshot_hash: [0; 32],

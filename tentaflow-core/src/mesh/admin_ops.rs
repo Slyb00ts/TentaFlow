@@ -236,7 +236,8 @@ async fn send_pairing_bootstrap(
     target_node_id: &str,
     local_node_id: &str,
 ) -> Result<(), AdminError> {
-    let local_info = node_info_collector::collect_node_info(local_node_id);
+    let mut local_info = node_info_collector::collect_node_info(local_node_id);
+    local_info.environment = crate::services::environment::get_node_environment(&security.db);
     let info_bytes = crate::mesh::cbor::encode(&local_info).map_err(|e| {
         error!(target_node = %target_node_id, "CBOR encode NodeInfo failed: {}", e);
         AdminError::new(AdminErrorKind::Internal, "internal mesh error")
@@ -607,6 +608,7 @@ pub async fn initiate_pairing(
             from_node_id: security.ed25519_public_key_hex(),
             public_key: security.public_key_hex(),
             pin: pin.clone(),
+            environment: crate::services::environment::get_node_environment(&security.db),
         };
         let data = crate::mesh::cbor::encode(&payload).map_err(|e| {
             error!(target_node = %remote_hints.node_id, "CBOR encode PairingRequest failed: {}", e);
@@ -770,8 +772,23 @@ pub async fn confirm_pairing(
 
     let hostname = peer_store.get_hostname(remote_node_id).unwrap_or_default();
 
+    // The peer's declared environment (ROADMAP Z12, P1-2) was persisted when
+    // its pairing request first arrived (`MeshSecurity::receive_pairing_
+    // request`) — this manual-confirm path has no direct access to that
+    // original request/response, so it reads the value back rather than
+    // defaulting silently.
+    let peer_environment = security
+        .pending_pairing_environment(remote_node_id)
+        .unwrap_or_default();
+
     security
-        .confirm_pairing(remote_node_id, &remote_public_key, &hostname, "admin")
+        .confirm_pairing(
+            remote_node_id,
+            &remote_public_key,
+            &hostname,
+            "admin",
+            peer_environment,
+        )
         .map_err(|e| {
             error!(target_node = %remote_node_id, "security.confirm_pairing failed: {}", e);
             AdminError::new(AdminErrorKind::BadRequest, "failed to confirm pairing")
@@ -819,6 +836,7 @@ pub async fn confirm_pairing(
             public_key: security.public_key_hex(),
             hostname: hostname.clone(),
             pin: provided.to_string(),
+            environment: crate::services::environment::get_node_environment(&security.db),
         };
         let data = match crate::mesh::cbor::encode(&payload) {
             Ok(d) => d,

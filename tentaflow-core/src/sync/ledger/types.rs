@@ -7,6 +7,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::fmt;
 
+pub use tentaflow_protocol::environment::NodeEnvironment;
 pub use tentaflow_protocol::mesh::BaselineEpoch;
 
 pub type LedgerResult<T> = std::result::Result<T, SyncLedgerError>;
@@ -83,6 +84,18 @@ pub enum SyncLedgerError {
     EpochMismatch {
         expected: BaselineEpoch,
         actual: BaselineEpoch,
+    },
+    /// Independent from `EpochMismatch` — a node's environment (Dev/Test/Prod)
+    /// and its baseline epoch are two separate fencing dimensions (ROADMAP
+    /// Z12). An operation minted under a different declared environment than
+    /// the local node's is rejected outright, never repaired, mirroring
+    /// `NodeEquivocation`/`EpochMismatch`. Enforced at the SAME admission
+    /// point as `EpochMismatch` (`fjall_store.rs::put_verified_in_inbox` /
+    /// `admit_verified_operation`).
+    #[error("operacja z innego srodowiska: expected={expected}, actual={actual}")]
+    EnvironmentMismatch {
+        expected: NodeEnvironment,
+        actual: NodeEnvironment,
     },
     #[error("merkle summary wymaga przynajmniej jednej operacji")]
     EmptyMerkleSummary,
@@ -272,6 +285,11 @@ pub struct NewSyncOperation {
     pub actor_node_id: String,
     pub hlc_timestamp: HybridLogicalTimestamp,
     pub epoch: BaselineEpoch,
+    // Independent, append-only field alongside `epoch` (ROADMAP Z12) — the
+    // node's declared environment (Dev/Test/Prod) at mint time. NOT a
+    // replacement for `epoch`: a schema migration inside one environment
+    // still bumps `epoch` alone, and switching environment bumps both.
+    pub environment: NodeEnvironment,
     pub payload_hash: [u8; 32],
     pub acl_snapshot_hash: [u8; 32],
     pub policy_epoch: u64,
@@ -305,6 +323,13 @@ pub struct SyncOperationBody {
     // (EpochMismatch), instead of a hard CBOR `missing field` failure.
     #[serde(default)]
     pub epoch: BaselineEpoch,
+    // Same compatibility pattern as `epoch` above, independent dimension
+    // (ROADMAP Z12). A pre-Z12 operation (or one from an un-upgraded peer)
+    // decodes as `NodeEnvironment::default()` (Prod) and is then fenced by
+    // `EnvironmentMismatch` in admission like any other cross-environment
+    // operation — never silently accepted as same-environment.
+    #[serde(default)]
+    pub environment: NodeEnvironment,
     // Hash of the previous operation in THIS node's chain (None = node genesis).
     pub prev_node_hash: Option<[u8; 32]>,
     pub payload_hash: [u8; 32],
@@ -352,6 +377,7 @@ impl SyncOperation {
             actor_node_id: new_operation.actor_node_id,
             hlc_timestamp: new_operation.hlc_timestamp,
             epoch: new_operation.epoch,
+            environment: new_operation.environment,
             prev_node_hash,
             payload_hash: new_operation.payload_hash,
             acl_snapshot_hash: new_operation.acl_snapshot_hash,
@@ -760,6 +786,19 @@ pub trait SyncLedgerStore: Send + Sync {
     /// Persists `epoch` as the locally-active baseline epoch. Called during a
     /// baseline reset (phase B/C cutover) to advance past every prior operation.
     fn set_epoch(&self, epoch: BaselineEpoch) -> LedgerResult<()>;
+    /// Returns the locally-declared node environment (Dev/Test/Prod, ROADMAP
+    /// Z12), stamped on every operation minted here and checked against every
+    /// operation admitted into the inbox — independent of, and enforced
+    /// alongside, `current_epoch`. Defaults to `Prod` (the conservative
+    /// choice) before the node has ever declared an environment.
+    fn current_environment(&self) -> LedgerResult<NodeEnvironment>;
+    /// Persists `environment` as the locally-declared node environment.
+    /// Called by `SetKind` (after server-side confirmation for a Prod
+    /// target) together with a core baseline wipe+reseed
+    /// (`reset_core_partitions` + `bump_epoch`) — a node's environment
+    /// identity change fences it from every sync partner still on its old
+    /// core partitions.
+    fn set_environment(&self, environment: NodeEnvironment) -> LedgerResult<()>;
     /// Returns the last persisted HLC state, used to resume the local clock
     /// after a restart so monotonicity survives across process boundaries.
     fn current_hlc(&self) -> LedgerResult<Option<HybridLogicalTimestamp>>;
@@ -893,6 +932,7 @@ mod tests {
                 counter: 5,
                 origin_node: "node_a".to_string(),
             },
+            environment: NodeEnvironment::Test,
             prev_node_hash: Some([9; 32]),
             payload_hash: [1; 32],
             acl_snapshot_hash: [2; 32],
@@ -970,6 +1010,21 @@ mod tests {
         assert_eq!(decoded.epoch, BaselineEpoch::default());
         assert_eq!(decoded.epoch.counter, 0);
         assert!(decoded.epoch.origin_node.is_empty());
+        // Same append-only pattern for `environment` (ROADMAP Z12) — a
+        // pre-Z12 operation decodes as `Prod`, the conservative default. On
+        // an existing all-Prod mesh this MATCHES the local node's own
+        // environment, so admission's environment fence does not reject it
+        // (P1-2's whole point: upgrading an existing Prod-Prod deployment
+        // must not break sync). This is decode-only, not proof that a
+        // byte-identical legacy operation replays cleanly through admission
+        // end-to-end — the operation hash used to exclude `environment` from
+        // its input and now includes it, so a REAL legacy blob would fail
+        // signature/hash verification (`InvalidOperationHash`) before the
+        // environment/epoch fence is ever reached; that failure mode is
+        // unrelated to what this test exercises (`SyncOperationBody`'s serde
+        // defaulting alone).
+        assert_eq!(decoded.environment, NodeEnvironment::default());
+        assert_eq!(decoded.environment, NodeEnvironment::Prod);
     }
 
     #[test]

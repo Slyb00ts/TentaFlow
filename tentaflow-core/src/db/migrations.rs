@@ -61,6 +61,17 @@ pub fn run(conn: &Connection) -> Result<()> {
     let crossing_identity_flip =
         current_version > 0 && current_version < CORE_IDENTITY_FLIP_VERSION;
 
+    // v145 widens the core sync partition namespace with an environment
+    // segment (`core/org/...` -> `core/env/{env}/org/...`, ROADMAP Z12). An
+    // EXISTING installation's local Fjall ledger still holds partitions under
+    // the OLD format after this migration runs — `partition_id()` from here
+    // on only ever emits the new format, so those old partitions become
+    // permanently unreadable by fresh code unless remapped. A FRESH install
+    // never held anything under the old format, so it must not arm this
+    // (mirrors `crossing_identity_flip` above).
+    let crossing_env_partition_format =
+        current_version > 0 && current_version < ENV_PARTITION_FORMAT_VERSION;
+
     for (version, name, step) in get_migrations() {
         if version > current_version {
             info!("Migracja {}: {}", version, name);
@@ -100,6 +111,13 @@ pub fn run(conn: &Connection) -> Result<()> {
         )?;
     }
 
+    if crossing_env_partition_format {
+        conn.execute(
+            "INSERT OR REPLACE INTO settings (key, value) VALUES (?1, '1')",
+            rusqlite::params![ENV_PARTITION_REMAP_PENDING_KEY],
+        )?;
+    }
+
     Ok(())
 }
 
@@ -111,6 +129,29 @@ pub const CORE_IDENTITY_FLIP_VERSION: i64 = 56;
 /// flag. Written by `run` when v56 is crossed, consumed (and cleared) by the
 /// sync runtime once it owns the ledger.
 pub const CORE_BASELINE_RESET_PENDING_KEY: &str = "core_baseline_reset_pending";
+
+/// Migration version that widened the core sync partition namespace with an
+/// environment segment (ROADMAP Z12). Crossing it arms a one-shot partition
+/// remap (wipe+reseed local core partitions under the new
+/// `core/env/{env}/org/...` format).
+pub const ENV_PARTITION_FORMAT_VERSION: i64 = 145;
+
+/// `settings` key holding the one-shot "environment partition remap pending"
+/// flag. Written by `run` when `ENV_PARTITION_FORMAT_VERSION` is crossed,
+/// consumed (and cleared) by the sync runtime once it owns the ledger
+/// (`sync::runtime::run_pending_env_partition_remap`).
+pub const ENV_PARTITION_REMAP_PENDING_KEY: &str = "sync_env_partition_remap_pending";
+
+/// `settings` key holding the target environment of an in-progress `SetKind`
+/// change (ROADMAP Z12, P3) — mirrors `CORE_BASELINE_RESET_PENDING_KEY`'s
+/// resume pattern. `perform_environment_change` writes it BEFORE flipping the
+/// ledger's environment and wiping+reseeding core partitions, and clears it
+/// only after both complete; a crash in between leaves it set so
+/// `sync::runtime::run_pending_environment_change_resume` (called at startup,
+/// alongside the other two pending-marker resumes) finishes the switch
+/// instead of leaving the node with a flipped ledger environment but stale
+/// (pre-switch) core partitions.
+pub const ENV_CHANGE_RESET_PENDING_KEY: &str = "sync_env_change_reset_pending";
 
 fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
     vec![
@@ -717,6 +758,21 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "run_provenance_columns",
             MigrationStep::Rust(add_run_provenance_columns),
         ),
+        (
+            136,
+            "flow_executions_result_metadata_column",
+            MigrationStep::Rust(add_flow_executions_result_metadata_column),
+        ),
+        // v137-144 are reserved for other Phase 0 CMC SILESIA items landing in
+        // parallel branches (notifications, IP allowlist, CORS, blue-green,
+        // OAuth server, OpenAPI import, transfer anomalies, dedup/quota); this
+        // migration intentionally lands as the next FREE number per the
+        // coordinator's assignment table, not the next contiguous integer.
+        (
+            145,
+            "trusted_nodes_environment_column",
+            MigrationStep::Rust(add_trusted_nodes_environment_column),
+        ),
     ]
 }
 
@@ -1170,6 +1226,44 @@ fn add_run_provenance_columns(conn: &Connection) -> Result<()> {
          CREATE INDEX IF NOT EXISTS idx_agent_runs_correlation
              ON agent_runs(correlation_id, created_at DESC);",
     )?;
+    Ok(())
+}
+
+/// Domain-specific metadata about what a flow run analyzed — exam type,
+/// patient pseudonym, and whatever else CMC SILESIA needs, none of it fixed
+/// yet. The column is deliberately schema-less JSON rather than dedicated
+/// columns so the medical team can settle the field set without a follow-up
+/// migration; written at finalization from the run's `result_metadata`
+/// envelope variable (`flow_engine::executor::RESULT_METADATA_VARIABLE`),
+/// never at insert time, since the value only exists once the flow produced
+/// it. No expression index yet: which field will actually be filtered on is
+/// still undecided (Z6 soft blocker) — indexing now would guess at a query
+/// shape and index the wrong thing. Idempotent — guarded by a column probe,
+/// same pattern as `add_run_provenance_columns`.
+fn add_flow_executions_result_metadata_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "flow_executions", "result_metadata_json")? {
+        conn.execute_batch("ALTER TABLE flow_executions ADD COLUMN result_metadata_json TEXT;")?;
+    }
+    Ok(())
+}
+
+/// Persists the node environment (`dev`/`test`/`prod`) declared by a peer at
+/// mesh-pairing handshake time (Z12). Every row that predates this column (or
+/// was written before a peer ever declared one) is backfilled to `prod` — the
+/// only reachable default for an upgrade, matching the Prod-default already
+/// applied to the per-operation admission fence (`SyncOperationBody::environment`'s
+/// `#[serde(default)]`, ROADMAP Z12 P1-2). NULL is otherwise fail-closed
+/// everywhere (`get_trusted_node_environment`, the outbox filter, the catalog
+/// builder, the baseline/config-bundle donor checks) — this backfill exists so
+/// an already-trusted pre-v145 peer does not silently lose sync/catalog access
+/// the moment it upgrades. Idempotent — guarded by a column probe, same
+/// pattern as `add_flow_executions_result_metadata_column`; the backfill's
+/// `WHERE environment IS NULL` is naturally a no-op on a second run.
+fn add_trusted_nodes_environment_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "trusted_nodes", "environment")? {
+        conn.execute_batch("ALTER TABLE trusted_nodes ADD COLUMN environment TEXT;")?;
+    }
+    conn.execute_batch("UPDATE trusted_nodes SET environment = 'prod' WHERE environment IS NULL;")?;
     Ok(())
 }
 
@@ -9868,14 +9962,173 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_134_with_clean_foreign_keys() {
+    fn migration_v136_fresh_database_has_result_metadata_column() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        assert!(
+            column_exists(&conn, "flow_executions", "result_metadata_json").unwrap(),
+            "flow_executions is missing result_metadata_json"
+        );
+        assert!(
+            column_is_text(&conn, "flow_executions", "result_metadata_json").unwrap(),
+            "flow_executions.result_metadata_json must be TEXT"
+        );
+
+        // Z6 soft blocker: the field CMC will filter on is not decided yet, so
+        // no expression index exists — indexing now would guess wrong.
+        let table_sql: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type = 'table' AND name = 'flow_executions'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert!(
+            table_sql.contains("result_metadata_json TEXT"),
+            "result_metadata_json must stay nullable: {table_sql}"
+        );
+        assert!(
+            !table_sql.contains("result_metadata_json TEXT NOT NULL"),
+            "result_metadata_json must stay nullable: {table_sql}"
+        );
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    /// Round-trips the column through the same repository entry points the
+    /// product uses: `create_flow_execution` (no metadata yet at insert) then
+    /// an `UPDATE ... result_metadata_json` at finalization, exactly what
+    /// `flow_engine::executor::persist_execution` performs.
+    #[test]
+    fn migration_v136_result_metadata_column_round_trips_through_repository() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) \
+             VALUES ('flow-cmc', 'exam', '{}', 'active')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO flow_executions (flow_id, request_id, started_at, status) \
+             VALUES ('flow-cmc', 'req-cmc', '2026-08-25T10:00:00Z', 'running')",
+            [],
+        )
+        .unwrap();
+        let id = conn.last_insert_rowid();
+
+        // Not set at insert — nobody knows the exam's metadata until the flow
+        // finishes producing it.
+        let before: Option<String> = conn
+            .query_row(
+                "SELECT result_metadata_json FROM flow_executions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(before, None);
+
+        let json = r#"{"exam_type":"CT","patient_pseudonym":"P-9137"}"#;
+        conn.execute(
+            "UPDATE flow_executions SET result_metadata_json = ?2 WHERE id = ?1",
+            rusqlite::params![id, json],
+        )
+        .unwrap();
+
+        let after: Option<String> = conn
+            .query_row(
+                "SELECT result_metadata_json FROM flow_executions WHERE id = ?1",
+                [id],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(after.as_deref(), Some(json));
+    }
+
+    /// Strips what v136 adds, so the migration can be exercised on a database
+    /// that really is at v135.
+    fn rewind_to_v135(conn: &Connection) {
+        conn.execute_batch("ALTER TABLE flow_executions DROP COLUMN result_metadata_json;")
+            .unwrap();
+        conn.execute("DELETE FROM _migrations WHERE version = 136", [])
+            .unwrap();
+    }
+
+    #[test]
+    fn migration_v136_upgrades_v135_database_without_data_loss() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+        rewind_to_v135(&conn);
+
+        assert!(
+            !column_exists(&conn, "flow_executions", "result_metadata_json").unwrap(),
+            "the rewind must really land on v135"
+        );
+
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) \
+             VALUES ('flow-1', 'chat', '{}', 'active')",
+            [],
+        )
+        .unwrap();
+        for (request_id, status) in [("req-a", "completed"), ("req-b", "error")] {
+            conn.execute(
+                "INSERT INTO flow_executions (flow_id, request_id, started_at, status) \
+                 VALUES ('flow-1', ?1, '2026-08-01T10:00:00Z', ?2)",
+                rusqlite::params![request_id, status],
+            )
+            .unwrap();
+        }
+
+        let executions_before: i64 = conn
+            .query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r.get(0))
+            .unwrap();
+
+        add_flow_executions_result_metadata_column(&conn).unwrap();
+
+        assert_eq!(
+            conn.query_row("SELECT COUNT(*) FROM flow_executions", [], |r| r
+                .get::<_, i64>(0))
+                .unwrap(),
+            executions_before,
+            "no flow execution may be lost by the upgrade"
+        );
+        let (status,): (String,) = conn
+            .query_row(
+                "SELECT status FROM flow_executions WHERE request_id = 'req-a'",
+                [],
+                |r| Ok((r.get(0)?,)),
+            )
+            .unwrap();
+        assert_eq!(status, "completed");
+
+        let unstamped: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM flow_executions WHERE result_metadata_json IS NULL",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(unstamped, executions_before);
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+
+        // Re-running on an already-migrated database is a no-op, not a
+        // duplicate column error.
+        add_flow_executions_result_metadata_column(&conn).unwrap();
+        assert!(column_exists(&conn, "flow_executions", "result_metadata_json").unwrap());
+    }
+
+    #[test]
+    fn fresh_database_migrates_to_145_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 135, "135 must be the highest applied migration");
+        assert_eq!(head, 145, "145 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -9883,6 +10136,74 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 135);
+        assert_eq!(head_again, 145);
+    }
+
+    #[test]
+    fn trusted_nodes_environment_column_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        assert!(column_exists(&conn, "trusted_nodes", "environment").unwrap());
+
+        // Re-running on an already-migrated database is a no-op, not a
+        // duplicate column error.
+        add_trusted_nodes_environment_column(&conn).unwrap();
+        assert!(column_exists(&conn, "trusted_nodes", "environment").unwrap());
+    }
+
+    #[test]
+    fn trusted_nodes_environment_column_backfills_null_to_prod() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Simulate a pre-v145 trusted peer: the column exists (fresh install
+        // ran the full ladder) but the row predates any pairing-time
+        // environment stamp, i.e. environment stayed NULL.
+        conn.execute(
+            "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+             VALUES ('legacy-peer', 'pubkey-legacy', NULL)",
+            [],
+        )
+        .unwrap();
+        // A peer that already declared an environment must survive the
+        // backfill unchanged.
+        conn.execute(
+            "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+             VALUES ('dev-peer', 'pubkey-dev', 'dev')",
+            [],
+        )
+        .unwrap();
+
+        add_trusted_nodes_environment_column(&conn).unwrap();
+
+        let legacy_env: String = conn
+            .query_row(
+                "SELECT environment FROM trusted_nodes WHERE node_id = 'legacy-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(legacy_env, "prod");
+
+        let dev_env: String = conn
+            .query_row(
+                "SELECT environment FROM trusted_nodes WHERE node_id = 'dev-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dev_env, "dev");
+
+        // Re-running is idempotent: no already-stamped row is touched.
+        add_trusted_nodes_environment_column(&conn).unwrap();
+        let dev_env_again: String = conn
+            .query_row(
+                "SELECT environment FROM trusted_nodes WHERE node_id = 'dev-peer'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(dev_env_again, "dev");
     }
 }

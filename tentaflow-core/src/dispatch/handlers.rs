@@ -3313,6 +3313,7 @@ fn gpu_links_to_proto(
 }
 
 async fn store_peer_to_proto(
+    db: &crate::db::DbPool,
     p: &StorePeerInfo,
     local_node_id: &str,
     is_trusted: bool,
@@ -3320,6 +3321,17 @@ async fn store_peer_to_proto(
     connection: Option<tentaflow_protocol::MeshConnectionInfo>,
 ) -> tentaflow_protocol::MeshNodeInfo {
     let is_local = p.node_id == local_node_id;
+    // ROADMAP Z12 — settings is canonical for the local node; `trusted_nodes.
+    // environment` (kept current by pairing confirm + the periodic NodeInfo
+    // exchange, P2-1) for everyone else. `None` ("unknown") for a discovered,
+    // not-yet-trusted peer.
+    let environment = if is_local {
+        Some(crate::services::environment::get_node_environment(db))
+    } else {
+        repository::get_trusted_node_environment(db, &p.node_id)
+            .ok()
+            .flatten()
+    };
     let source = if is_local {
         "local"
     } else if is_trusted {
@@ -3458,6 +3470,7 @@ async fn store_peer_to_proto(
         nsys_version,
         profiling_collectors_available,
         gpu_links,
+        environment,
     }
 }
 
@@ -3527,7 +3540,7 @@ pub async fn mesh_node_list(
                 now_ms,
             ))
         });
-        nodes.push(store_peer_to_proto(local, local_node_id, true, route, connection).await);
+        nodes.push(store_peer_to_proto(&ctx.state.db, local, local_node_id, true, route, connection).await);
         emitted.insert(local.node_id.clone());
     }
 
@@ -3564,7 +3577,7 @@ pub async fn mesh_node_list(
                         Some(r.next_hop.clone())
                     },
                 });
-            nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, connection).await);
+            nodes.push(store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, connection).await);
         } else {
             // No peer_store entry — trusted node offline (or freshly seeded).
             // Render with whatever the registry knows; rich device fields stay
@@ -3595,6 +3608,9 @@ pub async fn mesh_node_list(
                 nsys_version: String::new(),
                 profiling_collectors_available: Vec::new(),
                 gpu_links: Vec::new(),
+                environment: repository::get_trusted_node_environment(&ctx.state.db, &node_id_hex)
+                    .ok()
+                    .flatten(),
             });
         }
         emitted.insert(node_id_hex);
@@ -3622,7 +3638,7 @@ pub async fn mesh_node_list(
                     Some(r.next_hop.clone())
                 },
             });
-        nodes.push(store_peer_to_proto(p, local_node_id, is_trusted, route, None).await);
+        nodes.push(store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, None).await);
     }
 
     Ok(MessageBody::MeshNodeListResponseBody(
@@ -3700,7 +3716,7 @@ pub async fn mesh_node_detail(
     let connection = summary
         .as_ref()
         .map(|s| crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms));
-    let info = store_peer_to_proto(&peer, local_node_id, is_trusted, route, connection).await;
+    let info = store_peer_to_proto(&ctx.state.db, &peer, local_node_id, is_trusted, route, connection).await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
     ))
@@ -3717,18 +3733,30 @@ pub fn mesh_pending_list(
     let pairings = repository::list_pending_pairings(&ctx.state.db).map_err(db_err)?;
     let pending: Vec<tentaflow_protocol::MeshPendingPair> = pairings
         .into_iter()
-        .map(|p| tentaflow_protocol::MeshPendingPair {
-            pair_id: p.id.to_string(),
-            remote_node_id: p.remote_node_id,
-            remote_hostname: None,
-            remote_ip: None,
-            initiated_at: parse_ts(&p.expires_at) as i64,
-            state: p.direction,
-            pin: if p.pin_code.is_empty() {
-                None
-            } else {
-                Some(p.pin_code)
-            },
+        .map(|p| {
+            // Declared on the still-pending request itself (ROADMAP Z12,
+            // P1-2/Luka ii) — persisted by `MeshSecurity::receive_pairing_
+            // request`, read back here so the pending card can show a
+            // cross-env warning before the operator confirms.
+            let environment = ctx
+                .state
+                .mesh_security
+                .as_ref()
+                .and_then(|s| s.pending_pairing_environment(&p.remote_node_id));
+            tentaflow_protocol::MeshPendingPair {
+                pair_id: p.id.to_string(),
+                remote_node_id: p.remote_node_id,
+                remote_hostname: None,
+                remote_ip: None,
+                initiated_at: parse_ts(&p.expires_at) as i64,
+                state: p.direction,
+                pin: if p.pin_code.is_empty() {
+                    None
+                } else {
+                    Some(p.pin_code)
+                },
+                environment,
+            }
         })
         .collect();
     Ok(MessageBody::MeshPendingListResponseBody(
@@ -3850,17 +3878,25 @@ pub fn mesh_trusted_list(
             reg.snapshot_summary()
                 .into_iter()
                 .filter(|s| matches!(s.trust, TrustStateTag::Trusted))
-                .map(|s| tentaflow_protocol::MeshTrustedNode {
-                    node_id: hex::encode(s.node_id),
-                    hostname: if s.hostname.is_empty() {
-                        None
-                    } else {
-                        Some((*s.hostname).to_string())
-                    },
-                    // PeerSummary does not carry an explicit "trusted since"
-                    // timestamp; expose 0 ("unknown") rather than fabricating
-                    // one. GUI tolerates 0.
-                    trusted_since_epoch: 0,
+                .map(|s| {
+                    let node_id = hex::encode(s.node_id);
+                    let environment =
+                        repository::get_trusted_node_environment(&ctx.state.db, &node_id)
+                            .ok()
+                            .flatten();
+                    tentaflow_protocol::MeshTrustedNode {
+                        node_id,
+                        hostname: if s.hostname.is_empty() {
+                            None
+                        } else {
+                            Some((*s.hostname).to_string())
+                        },
+                        // PeerSummary does not carry an explicit "trusted since"
+                        // timestamp; expose 0 ("unknown") rather than fabricating
+                        // one. GUI tolerates 0.
+                        trusted_since_epoch: 0,
+                        environment,
+                    }
                 })
                 .collect::<Vec<_>>()
         })
@@ -11391,6 +11427,7 @@ mod catalog_list_tests {
                     loaded: true,
                     input_modalities: vec![InputModality::Text],
                     output_modalities: vec![OutputModality::Text],
+                    environment: tentaflow_protocol::environment::NodeEnvironment::default(),
                 }],
             },
             service_surfaces: vec![surface],

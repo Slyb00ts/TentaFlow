@@ -126,6 +126,7 @@ async fn run_training(
     let result = run_training_against_dir(
         run_id,
         project_id,
+        dataset_id,
         variant,
         hyperparams,
         &endpoint,
@@ -166,6 +167,7 @@ impl PreparedDataset {
 async fn run_training_against_dir(
     run_id: &str,
     project_id: &str,
+    dataset_id: &str,
     variant: &str,
     hyperparams: &tentaflow_protocol::MlStudioRecogHyperparams,
     endpoint: &str,
@@ -254,6 +256,8 @@ async fn run_training_against_dir(
                     "rfdetr",
                     &format!("RF-DETR {}", variant),
                     &metrics_json,
+                    Some(dataset_id),
+                    Some(run_id),
                 )?;
                 repository::set_training_run_model(run_id, &model_id)?;
                 repository::update_training_run_status(run_id, "succeeded")?;

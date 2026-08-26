@@ -323,6 +323,7 @@ async function renderApp() {
             <img src="/tentaflow.png" alt="" width="24">
             <span>TentaFlow</span>
           </div>
+          <div class="env-mobile-badge" id="env-mobile-badge" hidden></div>
         </header>
         <div class="sidebar-backdrop" id="sidebar-backdrop"></div>
         <aside class="sidebar" id="app-sidebar">
@@ -345,6 +346,7 @@ async function renderApp() {
             `).join('')}
           </div>
           <div class="footer">
+            <div class="env-sidebar-badge" id="env-sidebar-badge" hidden></div>
             <div class="lang-switcher" id="lang-switcher">
               <select class="lang-select" id="lang-select" title="${escapeHtml(I18n.t('lang.label'))}">
                 ${SUPPORTED_LANGS.map((l) => `
@@ -559,6 +561,10 @@ async function renderApp() {
   Router.register('profiling-sessions', ProfilingSessionsScreen);
 
   paint();
+  refreshEnvironmentBadge();
+  // Zmiana środowiska węzła (Ustawienia → Środowisko) bije w ten sam badge —
+  // odświeżamy bez pełnego re-paint powłoki (wzorem `tf:nav-counts-stale`).
+  window.addEventListener('tf:environment-changed', refreshEnvironmentBadge);
 
   // Po zmianie jezyka odswiezamy shell + biezacy widok zeby wszystkie label'e zostaly przelozone.
   I18n.subscribe(async () => {
@@ -567,6 +573,7 @@ async function renderApp() {
     const initial = document.querySelector(`[data-view="${current ?? 'apps-home'}"]`);
     if (initial) initial.classList.add('active');
     await Router.navigate(current ?? 'apps-home');
+    refreshEnvironmentBadge();
   });
 
   Router.init('apps-home');
@@ -581,6 +588,31 @@ async function renderApp() {
   // Ekrany, ktore same dodaja/usuwaja zliczane obiekty, nie moga czekac do 30 s
   // na kolejny tick — inaczej badge pokazuje nieistniejacy juz serwis.
   window.addEventListener('tf:nav-counts-stale', () => { refreshNavCounts(); });
+}
+
+// D1 (rozstrzygnięte, ROADMAP Z12): odznaka środowiska węzła żyje w stopce
+// sidebara (obok `.user-chip`), z parytetem w `.mobile-header` — NIE w
+// topbarze (aplikacja go nie ma na desktopie). PROD renderuje się kolorem
+// ostrzegawczym (`--danger`), TEST bursztynowym (`--warning`), DEV neutralnym.
+function paintEnvBadge(kind) {
+  const label = I18n.t(`settings_environment.badge_${kind}`);
+  const sidebar = document.getElementById('env-sidebar-badge');
+  if (sidebar) {
+    sidebar.textContent = label;
+    sidebar.className = `env-sidebar-badge env-${kind}`;
+    sidebar.hidden = false;
+  }
+  const mobile = document.getElementById('env-mobile-badge');
+  if (mobile) {
+    mobile.textContent = label;
+    mobile.className = `env-mobile-badge env-${kind}`;
+    mobile.hidden = false;
+  }
+}
+
+async function refreshEnvironmentBadge() {
+  const resp = await ApiBinary.one('environmentGetKindRequest').catch(() => null);
+  if (resp?.kind) paintEnvBadge(resp.kind);
 }
 
 async function refreshNavCounts() {

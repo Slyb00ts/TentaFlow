@@ -190,7 +190,26 @@ mod serde_array64 {
 //
 // Both turn into one loud handshake refusal, which is the failure mode
 // "rebuild all mesh nodes together" (CLAUDE.md) assumes.
-pub const SCHEMA_VERSION: u16 = 24;
+//
+// v25: added `MessageBody::ModelConversionBody(ModelConversionPayload)` (TF→ONNX
+// deploy-wizard step, ROADMAP Z11) — async start + poll, same contract as the
+// PyTorch→ONNX LLM export. Appended at the enum's end, and ciborium tags
+// variants by NAME, so no existing message re-encodes — but a stale peer has
+// no such variant and cannot decode either half of the exchange.
+//
+// v26: added `MessageBody::EnvironmentPromotionBody(EnvironmentPromotionPayload)`
+// (node environment identity Dev/Test/Prod + manual config-bundle pull,
+// ROADMAP Z12). Appended at the enum's end, same wire-safety reasoning as v25.
+// Also widens `PairingFirstContactRequest` with `sender_environment` and
+// `PairingFirstContactResponse::Confirm` with `receiver_environment` — both
+// `#[serde(default)]`, so a stale peer still decodes the handshake, but it
+// silently treats the other side as `Prod` (the conservative default) rather
+// than fencing on the declared environment. `SyncOperationBody`/
+// `NewSyncOperation` gain `environment: NodeEnvironment` alongside the
+// existing `epoch`, same append-only pattern — a stale peer's operations
+// decode as `Prod` and get fenced by `EnvironmentMismatch` like any other
+// cross-environment operation, never silently accepted.
+pub const SCHEMA_VERSION: u16 = 26;
 
 // =============================================================================
 // Message kind discriminants

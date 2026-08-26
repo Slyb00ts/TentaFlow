@@ -2021,6 +2021,55 @@ export const encode = {
   },
 
   // -------------------------------------------------------------------------
+  // TF→ONNX model conversion (deploy wizard step, ROADMAP Z11) —
+  // MessageBody::ModelConversionBody
+  // -------------------------------------------------------------------------
+
+  /**
+   * MessageBody::ModelConversionBody(StartRequest) — starts an async TF→ONNX
+   * conversion for an existing `services` row (`serviceId`). `sourceFormat`
+   * is 'tensorflow_savedmodel' | 'tensorflow_h5', `precision` is
+   * 'fp32' | 'fp16'. `tolerance` is the max acceptable numeric drift the
+   * converter's compatibility check measures against. `testInputPath` is an
+   * OPTIONAL path to a real `.npy` sample input — omitted, the conversion may
+   * still finish, but the wizard must show it as unvalidated (`validated:
+   * false` on the status response), never a silent pass.
+   */
+  modelConversionStartRequest(
+    correlationId,
+    { serviceId, sourcePath, sourceFormat, precision, tolerance, testInputPath } = {},
+    sequence = 1,
+  ) {
+    assertReady();
+    const body = _wasm.encodeModelConversionStartRequest(
+      Number(serviceId ?? 0),
+      String(sourcePath ?? ''),
+      String(sourceFormat ?? ''),
+      String(precision ?? 'fp32'),
+      Number(tolerance ?? 0),
+      testInputPath ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  /** MessageBody::ModelConversionBody(StatusRequest { serviceId }) — polls the conversion state. */
+  modelConversionStatusRequest(correlationId, { serviceId } = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeModelConversionStatusRequest(Number(serviceId ?? 0));
+    return _wasm.encodeEnvelopeDirect(
+      BigInt(correlationId),
+      BigInt(sequence),
+      _messageKind.META_HEARTBEAT,
+      body,
+    );
+  },
+
+  // -------------------------------------------------------------------------
   // Network (interfejsy hosta + konfiguracja bind/filter mesh)
   // -------------------------------------------------------------------------
 
@@ -7797,6 +7846,106 @@ export const encode = {
       limit: Number(payload.limit ?? 500),
     };
     const body = _wasm.encodeCodeStudioRepoTreeRequest(JSON.stringify(request));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  // -------------------------------------------------------------------------
+  // Node environment identity + manual config-bundle pull (ROADMAP Z12)
+  // -------------------------------------------------------------------------
+
+  /** MessageBody::EnvironmentPromotionBody(GetKindRequest) (unit). */
+  environmentGetKindRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentGetKindRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(SetKindRequest { newKind, confirmEnvironmentName }).
+   * `newKind`: "dev"|"test"|"prod". `confirmEnvironmentName` is REQUIRED
+   * (must equal exactly "PROD") when switching to Prod — the server rejects
+   * anything else, this is not a client-side convenience gate.
+   */
+  environmentSetKindRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentSetKindRequest(
+      String(payload.newKind ?? payload.new_kind ?? ''),
+      payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(SetStrictIsolationRequest { strict }). */
+  environmentSetStrictIsolationRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentSetStrictIsolationRequest(!!payload.strict);
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(ExportBundleRequest) (unit) — file-transport export of the local node's current config bundle. */
+  environmentExportBundleRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentExportBundleRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(ImportFromFileRequest { archiveBytes }).
+   * `archiveBytes` is a Uint8Array read from a `tf-file-input` file picker.
+   * Answers with a `PullStartResponse` (`pullId`) — the file path converges
+   * with the QUIC pull path immediately after upload, same diff/apply steps.
+   */
+  environmentImportFromFileRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const bytes = payload.archiveBytes ?? payload.archive_bytes;
+    const body = _wasm.encodeEnvironmentImportFromFileRequest(new Uint8Array(bytes));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullDonorListRequest) (unit) — trusted peers eligible as a pull donor, with their declared environment. */
+  environmentPullDonorListRequest(correlationId, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullDonorListRequest();
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullStartRequest { donorNodeId }) — fetches the donor's bundle over QUIC, ready for preview/apply. */
+  environmentPullStartRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullStartRequest(
+      String(payload.donorNodeId ?? payload.donor_node_id ?? ''),
+    );
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(PullStatusRequest { pullId }). */
+  environmentPullStatusRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentPullStatusRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /** MessageBody::EnvironmentPromotionBody(ImportPreviewDiffRequest { pullId}) — diff a fetched pull against local state, before anything is written. */
+  environmentImportPreviewDiffRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentImportPreviewDiffRequest(String(payload.pullId ?? payload.pull_id ?? ''));
+    return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
+  },
+
+  /**
+   * MessageBody::EnvironmentPromotionBody(ImportApplyRequest { pullId, confirmEnvironmentName, selectedResourceKeys }).
+   * `confirmEnvironmentName` is REQUIRED (must equal the TARGET environment's
+   * name, uppercased) for an upward promotion (in particular onto Prod) —
+   * validated server-side (D-Z12.8). `selectedResourceKeys` are
+   * `"table:resourceId"` strings, one per checked diff row.
+   */
+  environmentImportApplyRequest(correlationId, payload = {}, sequence = 1) {
+    assertReady();
+    const body = _wasm.encodeEnvironmentImportApplyRequest(
+      String(payload.pullId ?? payload.pull_id ?? ''),
+      payload.confirmEnvironmentName ?? payload.confirm_environment_name ?? null,
+      (payload.selectedResourceKeys ?? payload.selected_resource_keys ?? []).map(String),
+    );
     return _wasm.encodeEnvelopeDirect(BigInt(correlationId), BigInt(sequence), _messageKind.META_HEARTBEAT, body);
   },
 

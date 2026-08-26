@@ -1266,6 +1266,31 @@ impl IrohMeshManager {
             ));
         }
 
+        // Explicit environment check (ROADMAP Z12, P1-4) — a baseline adopt
+        // wipes and reseeds the local node's ENTIRE core partition set from
+        // the donor's SQLite snapshot, bypassing the per-operation admission
+        // fence entirely (`import_baseline` writes straight to SQLite, the
+        // same "bypasses the inbox" shape as the sync snapshot path P1-1
+        // fences). Every call site (epoch-reconcile after an admitted
+        // cross-env op with a higher epoch, pairing-triggered adopt, admin
+        // ops) funnels through here, so this is the one place that can
+        // refuse a cross-environment donor regardless of caller. Fails
+        // closed on an unknown donor environment, same as everywhere else
+        // (P1-2).
+        let local_environment = crate::services::environment::get_node_environment(&self.security.db);
+        let donor_environment =
+            crate::db::repository::get_trusted_node_environment(&self.security.db, donor_node_id)
+                .map_err(|e| anyhow::anyhow!("baseline pull: donor environment lookup: {e}"))?;
+        if donor_environment != Some(local_environment) {
+            return Err(anyhow::anyhow!(
+                "baseline pull: refusing cross-environment baseline adopt from donor {donor_node_id} \
+                 (local environment '{local_environment}', donor environment '{}')",
+                donor_environment
+                    .map(|e| e.to_string())
+                    .unwrap_or_else(|| "unknown".to_string())
+            ));
+        }
+
         let hints = load_trusted_contact_hints(&self.security.db, donor_node_id)
             .map_err(|e| anyhow::anyhow!("baseline pull: load donor hints: {e}"))?
             .ok_or_else(|| {
@@ -3340,7 +3365,8 @@ mod tie_break_tests {
                 approved_by TEXT DEFAULT '',
                 approved_at TEXT NOT NULL DEFAULT (datetime('now')),
                 is_active INTEGER NOT NULL DEFAULT 1,
-                last_addresses TEXT NOT NULL DEFAULT ''
+                last_addresses TEXT NOT NULL DEFAULT '',
+                environment TEXT
             );
             CREATE TABLE IF NOT EXISTS pending_pairings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -3399,6 +3425,62 @@ mod tie_break_tests {
         assert!(
             mgr.should_proactively_dial(&peer_high),
             "nizszy node_id powinien dialowac proaktywnie"
+        );
+    }
+
+    /// ROADMAP Z12, N6(c) delta-review regression: `pull_baseline_from_donor`
+    /// (P1-4) must refuse a donor stamped with a DIFFERENT environment before
+    /// it ever attempts to connect — the environment check runs before
+    /// `load_trusted_contact_hints`/`endpoint.connect`, so this never touches
+    /// the network.
+    #[tokio::test]
+    async fn pull_baseline_from_donor_rejects_cross_environment_donor() {
+        let mgr = make_manager().await;
+        let donor_node_id = "a".repeat(64);
+        {
+            let conn = mgr.security.db.write().expect("db write lock");
+            conn.execute(
+                "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+                 VALUES (?1, 'pub', 'test')",
+                rusqlite::params![donor_node_id],
+            )
+            .expect("insert cross-environment donor");
+        }
+
+        let err = mgr
+            .pull_baseline_from_donor(&donor_node_id, 0)
+            .await
+            .expect_err("cross-environment donor must be refused");
+        assert!(
+            format!("{err}").contains("cross-environment"),
+            "expected cross-environment error, got: {err}"
+        );
+    }
+
+    /// ROADMAP Z12, N6(c) delta-review regression: a donor with NO recorded
+    /// environment (`NULL`, pre-Z12 trust row) must fail closed the same way
+    /// — never treated as "same environment" by default.
+    #[tokio::test]
+    async fn pull_baseline_from_donor_rejects_unstamped_donor_environment() {
+        let mgr = make_manager().await;
+        let donor_node_id = "b".repeat(64);
+        {
+            let conn = mgr.security.db.write().expect("db write lock");
+            conn.execute(
+                "INSERT INTO trusted_nodes (node_id, public_key, environment) \
+                 VALUES (?1, 'pub', NULL)",
+                rusqlite::params![donor_node_id],
+            )
+            .expect("insert unstamped donor");
+        }
+
+        let err = mgr
+            .pull_baseline_from_donor(&donor_node_id, 0)
+            .await
+            .expect_err("unstamped-environment donor must be refused");
+        assert!(
+            format!("{err}").contains("cross-environment"),
+            "expected cross-environment error, got: {err}"
         );
     }
 

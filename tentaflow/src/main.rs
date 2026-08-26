@@ -403,6 +403,22 @@ async fn run_server(args: Args) -> Result<()> {
                 Ok(None) => {}
                 Err(e) => error!("Sync Ledger baseline cutover failed: {}", e),
             }
+            match tentaflow_core::sync::runtime::run_pending_env_partition_remap() {
+                Ok(Some(reseeded)) => info!(
+                    "Sync Ledger core partitions remapped to the environment-scoped namespace after v145: re-seeded {} core ops",
+                    reseeded
+                ),
+                Ok(None) => {}
+                Err(e) => error!("Sync Ledger environment partition remap failed: {}", e),
+            }
+            match tentaflow_core::sync::runtime::run_pending_environment_change_resume() {
+                Ok(Some(reseeded)) => info!(
+                    "Sync Ledger resumed an interrupted environment change (SetKind): re-seeded {} core ops",
+                    reseeded
+                ),
+                Ok(None) => {}
+                Err(e) => error!("Sync Ledger environment change resume failed: {}", e),
+            }
             match tentaflow_core::addon::storage_sql_exec::drain_installed_sql_captures(&db, 1000) {
                 Ok(drained) => info!("Sync Ledger drained {} pending SQL captures", drained),
                 Err(e) => error!("Sync Ledger SQL capture drain failed: {}", e),
