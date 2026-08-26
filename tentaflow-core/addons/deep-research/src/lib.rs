@@ -216,7 +216,15 @@ fn handle_research_query(params: &Value) -> Value {
         "query": query,
         "question": question,
         "findings": findings,
-        "skipped": read.get("skipped").cloned().unwrap_or_else(|| json!([])),
+        // Count, not the list. Every skipped URL with its HTTP reason was text
+        // the agent re-read on every later iteration, for information it cannot
+        // act on — and the conversation is re-prefilled each turn, so that noise
+        // is paid for again and again.
+        "skipped_count": read
+            .get("skipped")
+            .and_then(Value::as_array)
+            .map(|a| a.len())
+            .unwrap_or(0),
     })
 }
 

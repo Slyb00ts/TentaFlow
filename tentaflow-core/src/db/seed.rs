@@ -1744,7 +1744,11 @@ pub fn agent_run_flow_json() -> String {
                         "timeout_secs": 1800}},
             {"id": "x1", "type": "tool_exec", "position": {"x": 1800, "y": 0},
              "region": "agent_turn",
-             "config": {"max_result_chars": 16000, "max_tool_calls_per_iteration": 16}},
+             // 16000 was sized for tools that hand back raw documents. A research
+             // result is already condensed, and the whole conversation is
+             // re-prefilled every iteration, so an oversized cap is paid for on
+             // every turn that follows it.
+             "config": {"max_result_chars": 6000, "max_tool_calls_per_iteration": 8}},
             {"id": "p1", "type": "persist_turn", "position": {"x": 2160, "y": 200}, "config": {}},
             {"id": "o1", "type": "output", "position": {"x": 2520, "y": 0},
              "config": {"mode": "stream"}}
