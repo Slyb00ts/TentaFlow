@@ -186,11 +186,21 @@ fn handle_research_query(params: &Value) -> Value {
         return read;
     }
 
-    // One call per page. Batching them into a single call was tried and cost
-    // correctness: it depends on the model reproducing per-page markers, and a
-    // dropped marker yields NO findings at all rather than fewer. The speed it
-    // bought is no longer needed — the long answer, not the summaries, was what
-    // made a run slow.
+    // Excerpt by default, model summary only on request.
+    //
+    // The point of this tool is that RAW pages never enter the calling agent's
+    // conversation — not that a model must rewrite them. An extracted excerpt
+    // already achieves that: readability output trimmed to `EXCERPT_CHARS` is a
+    // ~95% cut from the page, and the agent reading it is perfectly able to pull
+    // the facts itself. Summarising instead costs ONE FULL GENERATION PER PAGE,
+    // which is what turned a research turn into a twenty-minute wait once pages
+    // actually started reading. `summarize: true` restores the old behaviour for
+    // callers who want the tighter context and can pay for it.
+    let summarize = params
+        .get("summarize")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+
     let mut findings = Vec::new();
     if let Some(pages) = read.get("pages").and_then(Value::as_array) {
         for page in pages {
@@ -199,13 +209,19 @@ fn handle_research_query(params: &Value) -> Value {
                 continue;
             }
             let title = page.get("title").and_then(Value::as_str).unwrap_or_default();
-            if let Some(summary) = summarize_page(&question, title, content) {
-                findings.push(json!({
-                    "url": page.get("url").and_then(Value::as_str).unwrap_or_default(),
-                    "title": title,
-                    "summary": summary,
-                }));
-            }
+            let extract = if summarize {
+                match summarize_page(&question, title, content) {
+                    Some(s) => s,
+                    None => continue,
+                }
+            } else {
+                excerpt(content)
+            };
+            findings.push(json!({
+                "url": page.get("url").and_then(Value::as_str).unwrap_or_default(),
+                "title": title,
+                "summary": extract,
+            }));
         }
     }
 
@@ -241,6 +257,21 @@ fn handle_research_query(params: &Value) -> Value {
             .cloned()
             .unwrap_or(Value::Null),
     })
+}
+
+/// How much readable text one page contributes when not summarised. Enough for
+/// a specification table or the substance of an article, far below what a raw
+/// page would cost the conversation.
+const EXCERPT_CHARS: usize = 1_800;
+
+/// Trims extracted text on a character boundary, so a multi-byte character is
+/// never split — the payload is JSON and a broken one would poison the result.
+fn excerpt(content: &str) -> String {
+    let trimmed = content.trim();
+    match trimmed.char_indices().nth(EXCERPT_CHARS) {
+        Some((idx, _)) => format!("{}…", &trimmed[..idx]),
+        None => trimmed.to_string(),
+    }
 }
 
 /// One page, one model call. `None` when the page carries no answer or the call
