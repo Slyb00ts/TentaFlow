@@ -279,6 +279,7 @@ fn get_text(url: Url, accept: &str) -> Result<String> {
         .to_string();
     let addrs = resolve_public_addrs(&url)?;
     let client = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT)
         .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
         .resolve_to_addrs(&host, &addrs)
         .build()
@@ -305,7 +306,8 @@ fn get_json(url: Url, brave_key: Option<&str>, internal: bool) -> Result<Value> 
         .host_str()
         .ok_or_else(|| WebResearchError::PolicyDenied("url has no host".to_string()))?
         .to_string();
-    let mut builder = Client::builder().timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS));
+    let mut builder = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT).timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS));
     if !internal {
         let addrs = resolve_public_addrs(&url)?;
         builder = builder.resolve_to_addrs(&host, &addrs);
@@ -341,6 +343,7 @@ fn post_json(url: Url, body: &Value) -> Result<Value> {
         .to_string();
     let addrs = resolve_public_addrs(&url)?;
     let client = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT)
         .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
         .resolve_to_addrs(&host, &addrs)
         .build()

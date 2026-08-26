@@ -92,6 +92,7 @@ fn fetch_with_redirects(
             .ok_or_else(|| WebResearchError::PolicyDenied("url has no host".to_string()))?
             .to_string();
         let client = Client::builder()
+        .user_agent(crate::web_research::types::WEB_RESEARCH_USER_AGENT)
             .timeout(Duration::from_millis(DEFAULT_TIMEOUT_MS))
             .redirect(Policy::none())
             .resolve_to_addrs(&host, &addrs)

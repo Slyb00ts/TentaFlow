@@ -215,15 +215,23 @@ fn handle_research_query(params: &Value) -> Value {
         "query": query,
         "question": question,
         "findings": findings,
-        // Count, not the list. Every skipped URL with its HTTP reason was text
-        // the agent re-read on every later iteration, for information it cannot
-        // act on — and the conversation is re-prefilled each turn, so that noise
-        // is paid for again and again.
+        // A count plus the first reason. The full list was context the agent
+        // re-read every turn for something it cannot act on, but replacing it
+        // with a bare number made a total read failure indistinguishable from a
+        // topic with no sources — the difference between "fix the fetcher" and
+        // "search for something else".
         "skipped_count": read
             .get("skipped")
             .and_then(Value::as_array)
             .map(|a| a.len())
             .unwrap_or(0),
+        "skipped_reason": read
+            .get("skipped")
+            .and_then(Value::as_array)
+            .and_then(|a| a.first())
+            .and_then(|s| s.get("reason"))
+            .cloned()
+            .unwrap_or(Value::Null),
     })
 }
 
