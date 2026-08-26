@@ -26,6 +26,94 @@ pub struct LocalInferenceHandler {
     inference_manager: Arc<RwLock<InferenceManager>>,
 }
 
+/// Marker recognised by the Qwen-family chat templates as "answer without a
+/// thinking block". Harmless to models that do not know it — it reads as a
+/// short instruction rather than corrupting the turn.
+const NO_THINK_MARKER: &str = "/no_think";
+
+/// Whether the caller asked for no reasoning. `reasoning_effort` is the field
+/// the OpenAI wire already carries, so callers do not need a second one; the
+/// embedded path simply never read it until now.
+fn reasoning_disabled(effort: Option<&str>) -> bool {
+    effort.is_some_and(|e| matches!(e.trim().to_ascii_lowercase().as_str(), "none" | "off"))
+}
+
+/// Appends the marker to the system turn, or inserts a system turn when the
+/// request has none. Appending rather than replacing keeps whatever the caller
+/// actually asked the model to do.
+fn apply_no_think(messages: &mut Vec<ChatMessage>) {
+    if let Some(system) = messages.iter_mut().find(|m| m.role == "system") {
+        if !system.content.contains(NO_THINK_MARKER) {
+            system.content.push(' ');
+            system.content.push_str(NO_THINK_MARKER);
+        }
+        return;
+    }
+    messages.insert(
+        0,
+        ChatMessage {
+            role: "system".to_string(),
+            content: NO_THINK_MARKER.to_string(),
+        },
+    );
+}
+
+
+#[cfg(test)]
+mod reasoning_tests {
+    use super::{apply_no_think, reasoning_disabled, NO_THINK_MARKER};
+    use crate::routing::chat_template::ChatMessage;
+
+    #[test]
+    fn only_an_explicit_off_disables_reasoning() {
+        assert!(reasoning_disabled(Some("none")));
+        assert!(reasoning_disabled(Some("OFF")));
+        assert!(!reasoning_disabled(Some("low")));
+        // Absent must not change a model that thinks by default.
+        assert!(!reasoning_disabled(None));
+    }
+
+    #[test]
+    fn the_marker_joins_the_existing_system_turn() {
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: "Extract the facts.".into(),
+        }];
+
+        apply_no_think(&mut messages);
+
+        assert_eq!(messages.len(), 1, "nie dokladamy drugiej tury systemowej");
+        assert!(messages[0].content.starts_with("Extract the facts."));
+        assert!(messages[0].content.ends_with(NO_THINK_MARKER));
+    }
+
+    #[test]
+    fn a_request_without_a_system_turn_gets_one() {
+        let mut messages = vec![ChatMessage {
+            role: "user".into(),
+            content: "hi".into(),
+        }];
+
+        apply_no_think(&mut messages);
+
+        assert_eq!(messages[0].role, "system");
+        assert_eq!(messages[1].role, "user");
+    }
+
+    #[test]
+    fn applying_twice_does_not_repeat_the_marker() {
+        let mut messages = vec![ChatMessage {
+            role: "system".into(),
+            content: "x".into(),
+        }];
+
+        apply_no_think(&mut messages);
+        apply_no_think(&mut messages);
+
+        assert_eq!(messages[0].content.matches(NO_THINK_MARKER).count(), 1);
+    }
+}
+
 impl LocalInferenceHandler {
     pub fn new(manager: Arc<RwLock<InferenceManager>>) -> Self {
         Self {
@@ -269,6 +357,17 @@ impl LocalInferenceHandler {
                 })
             })
             .collect();
+
+        // Reasoning off: a request that asks for no thinking gets the marker the
+        // Qwen-family templates recognise, appended to the system turn. Embedded
+        // models build their prompt HERE — there is no server-side template to
+        // pass `enable_thinking` to — so this is the one place the switch can
+        // exist. Extraction work (summarise this page, classify this text) pays
+        // the full cost of a thinking block for no benefit.
+        let mut chat_messages = chat_messages;
+        if reasoning_disabled(request.reasoning_effort.as_deref()) {
+            apply_no_think(&mut chat_messages);
+        }
 
         // Sformatuj prompt wedlug szablonu chatu
         let prompt = template.format_messages(&chat_messages, true);

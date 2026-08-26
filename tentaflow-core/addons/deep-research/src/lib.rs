@@ -232,7 +232,10 @@ fn handle_research_query(params: &Value) -> Value {
 /// single unreachable model call must not sink the whole query.
 fn summarize_page(question: &str, title: &str, content: &str) -> Option<String> {
     let prompt = format!("Question: {question}\n\nPage title: {title}\n\nPage content:\n{content}");
-    let options = json!({"system": SUMMARY_SYSTEM, "temperature": 0.2});
+    // No thinking: this is extraction, not deliberation. A reasoning block here
+    // is generated at full price and then thrown away — the caller only ever
+    // sees the extracted sentences.
+    let options = json!({"system": SUMMARY_SYSTEM, "temperature": 0.2, "reasoning": "none"});
     let summary = generate_with_options(&prompt, None, Some(&options)).ok()?;
     let summary = summary.trim();
     if summary.is_empty() || summary.eq_ignore_ascii_case("NO_ANSWER") {
