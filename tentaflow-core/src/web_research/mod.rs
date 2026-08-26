@@ -37,6 +37,13 @@ pub fn execute_with_local_services(
             resolve_local_searxng_provider(db).unwrap_or_else(|_| default_public_search_provider());
         set_provider(&mut request, provider);
     }
+    dispatch_with_db(request, db)
+}
+
+/// Runs a request with the database in hand, so reads can use a local Browser
+/// Renderer. Shared by every db-aware entry point — a second copy of this match
+/// is how the addon path ended up on the renderer-blind reader.
+fn dispatch_with_db(request: WebResearchRequest, db: &DbPool) -> Result<WebResearchResponse> {
     match request {
         WebResearchRequest::Search(req) => search::search(&req).map(WebResearchResponse::Search),
         WebResearchRequest::ReadUrl(req) => {
@@ -56,7 +63,13 @@ pub fn execute_with_local_searxng(
         let provider = resolve_local_searxng_provider(db)?;
         set_provider(&mut request, provider);
     }
-    execute(request)
+    // Hands the db onward instead of dropping it. This entry resolved the local
+    // searxng from the database and then called the db-less `execute`, which
+    // cannot reach the Browser Renderer — so every read on this path took the
+    // static reader even with a renderer running next to it, and a JS-built page
+    // came back as "no readable text found in html". The renderer was reachable
+    // only from an entry point nothing on the addon path ever took.
+    dispatch_with_db(request, db)
 }
 
 pub fn request_needs_provider(request: &WebResearchRequest) -> bool {
