@@ -179,10 +179,14 @@ fn strip_truncated_tool_call(text: &str) -> String {
 /// closers are dropped — a closer that still has its opener belongs to a block
 /// handled elsewhere and is left alone.
 fn strip_orphan_call_closers(text: &str) -> String {
-    const PAIRS: [(&str, &str); 3] = [
+    // Every closer a model has been seen to trail after a block the parser
+    // already consumed. Each shape reached a reader as part of the answer.
+    const PAIRS: [(&str, &str); 5] = [
         (OPEN_TAG, CLOSE_TAG),
         ("<function=", "</function>"),
         ("<parameter=", "</parameter>"),
+        ("<function_calls>", "</function_calls>"),
+        ("<search>", "</search>"),
     ];
     let mut out = text.to_string();
     for (opener, closer) in PAIRS {
