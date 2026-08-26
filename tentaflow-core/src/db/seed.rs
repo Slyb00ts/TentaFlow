@@ -2437,12 +2437,9 @@ const RESEARCHER_AGENT_PROMPT: &str = concat!(
     "czegos, o co zadanie wprost pyta — i wtedy maksymalnie 2-3 zapytania celowane w te luke.\n\n",
     "`research_query` czyta strony i zwraca ustalenia z KAZDEJ osobno, juz streszczone — to ",
     "jest twoje podstawowe narzedzie i w typowym zadaniu jedyne, ktorego uzywasz.\n\n",
-    "fetch_url jest WYJATKIEM, nie uzupelnieniem. Wolno go uzyc tylko wtedy, gdy adres nie ",
-    "pojawil sie w zadnym wyniku `research_query` — na przyklad podal go uzytkownik albo ",
-    "znalazles go w tresci ustalen. NIGDY nie pobieraj adresu, ktory juz wrocil jako ustalenie: ",
-    "masz z niego to, co istotne, a surowa strona kosztuje dziesiatki tysiecy tokenow i wypycha ",
-    "z kontekstu wlasciwa odpowiedz. Jesli kusi cie sprawdzenie strony, ktora juz badales, to ",
-    "znak, ze potrzebujesz LEPSZEGO zapytania, a nie tej samej strony w surowej postaci.\n\n",
+    "Nie masz narzedzia do pobierania pojedynczych stron i nie potrzebujesz go: `research_query` ",
+    "czyta strony za ciebie i oddaje z nich ustalenia. `search_web` sluzy wylacznie do szybkiego ",
+    "sprawdzenia, czy temat w ogole ma zrodla — nie czyta stron, wiec nie zastepuje badania.\n\n",
     "Jesli pokrycie jest slabe, dorzuc kolejna ture przeformulowanych zapytan przez ",
     "`research_query`, maksymalnie kilka razy.\n\n",
     "Na koniec ZLOZ ustalenia w spojna odpowiedz na zadanie: fakty pogrupowane tematycznie, a ",
@@ -2544,8 +2541,8 @@ fn seed_system_agents(conn: &Connection) -> Result<()> {
              skills_json, params_json, max_iterations, timeout_secs, max_subagents, \
              max_spawn_depth, flow_id, routable, is_enabled) \
          SELECT ?1, 'researcher', 'Agent badawczy', ?2, ?3, NULL, \
-                '[\"deep-research.*\"]', \
-                '{}', '{}', 20, 900, 0, 1, NULL, 0, 1 \
+                '[\"deep-research.research_query\",\"deep-research.search_web\"]', \
+                '{}', '{}', 20, 1800, 0, 1, NULL, 0, 1 \
          WHERE NOT EXISTS (SELECT 1 FROM agents WHERE id = ?1 OR name = 'researcher')",
         rusqlite::params![
             RESEARCHER_AGENT_ID,
@@ -3769,7 +3766,18 @@ mod tests {
 
         assert_eq!(id, super::RESEARCHER_AGENT_ID);
         let tools: Vec<String> = serde_json::from_str(&tools).unwrap();
-        assert_eq!(tools, vec!["deep-research.*".to_string()]);
+        // Deliberately NOT the `deep-research.*` wildcard: fetch_url pulls a raw
+        // page into the agent's own conversation, which is exactly what
+        // research_query exists to avoid. Asking the model not to use it did not
+        // hold — a run fired a whole batch of fetch_url in one turn and stalled
+        // — so the tool is not offered at all.
+        assert_eq!(
+            tools,
+            vec![
+                "deep-research.research_query".to_string(),
+                "deep-research.search_web".to_string()
+            ]
+        );
         assert_eq!(max_subagents, 0, "a worker must not delegate further");
         assert_eq!(routable, 0, "the chat router must not pick a worker");
         assert_eq!(enabled, 1);
