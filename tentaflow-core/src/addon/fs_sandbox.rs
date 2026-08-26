@@ -117,6 +117,25 @@ pub(crate) fn test_home_lock() -> &'static std::sync::Mutex<()> {
     LOCK.get_or_init(|| std::sync::Mutex::new(()))
 }
 
+/// Per-test unique addon id for `open_addon_db`-based fixtures.
+///
+/// `tentaflow_home()` caches its resolved path in a process-wide `OnceLock`
+/// on FIRST call — a `with_tmp_home`-style env override only takes effect if
+/// this test's thread happens to be the very first caller in the whole test
+/// binary; any earlier caller elsewhere (a near-certainty under `cargo test`'s
+/// default parallelism) permanently pins every later `open_addon_db` call,
+/// including this one, to that first-resolved directory (often the repo-local
+/// `.runtime/`, which survives across separate `cargo test` invocations). A
+/// static addon id (`"sync-capture-test"`, ...) then collides with leftover
+/// tables from a previous run or a concurrently running test using the same
+/// id. Suffixing with a fresh UUID makes every test invocation land on a
+/// brand-new addon directory regardless of caching or leftovers — safer under
+/// parallel threads than cleaning up a shared path on entry.
+#[cfg(test)]
+pub(crate) fn unique_test_addon_id(prefix: &str) -> String {
+    format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
