@@ -4997,6 +4997,7 @@ mod node_budget_tests {
     }
 }
 
+#[cfg(test)]
 mod usage_attribution_tests {
     //! Both execution paths sum the SAME trace, but only one of them used to
     //! fill it in. A streaming flow therefore reported zero tokens whatever it
