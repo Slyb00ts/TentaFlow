@@ -2333,6 +2333,39 @@ fn compute_source_hash(root: &Path) -> String {
 /// więc edycja treści w DOWOLNYM z katalogów triggeruje rerun build.rs. Używane
 /// dla docker_source_hash obejmującego context (Dockerfile/entrypoint) + python
 /// bundle (server.py), które obraz dockera materializuje razem.
+/// Repo-relative `COPY` sources of a Dockerfile, restricted to paths under
+/// `tentaflow-containers/`. The docker build context is the REPO ROOT, so a
+/// Dockerfile may pull in files that live outside its own `context_path` —
+/// shared patch scripts, for instance. Those files end up baked into the image,
+/// so `docker_source_hash` has to cover them; otherwise editing only a patch
+/// leaves the tag unchanged and the deploy silently reuses the stale image.
+/// Stage copies (`COPY --from=`) reference an earlier build stage, not the
+/// context, and are skipped.
+fn dockerfile_external_copy_sources(dockerfile: &Path) -> Vec<String> {
+    let Ok(text) = std::fs::read_to_string(dockerfile) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for line in text.lines() {
+        let Some(rest) = line.trim_start().strip_prefix("COPY ") else {
+            continue;
+        };
+        let mut args: Vec<&str> = rest.split_whitespace().collect();
+        if args.iter().any(|a| a.starts_with("--from=")) {
+            continue;
+        }
+        args.retain(|a| !a.starts_with("--"));
+        // Last argument is the destination inside the image, never a source.
+        args.pop();
+        for src in args {
+            if let Some(rel) = src.strip_prefix("tentaflow-containers/") {
+                out.push(rel.to_string());
+            }
+        }
+    }
+    out
+}
+
 fn compute_source_hash_multi(roots: &[PathBuf]) -> String {
     use sha2::{Digest, Sha256};
     let mut hasher = Sha256::new();
@@ -2450,7 +2483,10 @@ fn generate_services_manifest(out_dir: &Path) {
                 // ORAZ python-bundle (server.py + helpery), bo Dockerfile COPY'uje
                 // go z `deploy.native.bundle_path`. Bez bundla zmiana server.py
                 // była niewykrywalna → dashboard nie pokazywał "Aktualizuj".
-                let mut roots = vec![ctx_path];
+                let mut roots = vec![ctx_path.clone()];
+                for rel in dockerfile_external_copy_sources(&ctx_path.join("Dockerfile")) {
+                    roots.push(containers_dir.join(rel));
+                }
                 if let Some(native) = manifest.deploy.native.as_ref() {
                     if let Some(rel) = native
                         .binary_path
