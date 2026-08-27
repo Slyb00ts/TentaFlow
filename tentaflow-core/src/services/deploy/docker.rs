@@ -1204,6 +1204,217 @@ mod backend {
     }
 }
 
+#[cfg(feature = "docker")]
+/// `ensure_engine_image` for a caller that holds only an engine id and no Docker
+/// handle — the cluster deploy's P0, which needs the engine image to exist before
+/// it can run the model download inside it.
+pub(crate) async fn ensure_engine_image_by_id(engine_id: &str) -> DeployResult<String> {
+    let manifest = crate::services::manifest::registry()
+        .by_id(engine_id)
+        .ok_or_else(|| DeployError::Manifest(format!("no manifest for engine '{engine_id}'")))?;
+    let docker = backend::connect().await?;
+    backend::ping(&docker).await?;
+    ensure_engine_image(&docker, manifest, true, None).await
+}
+
+#[cfg(feature = "docker")]
+/// Resolves an engine's docker image tag and builds it when missing.
+///
+/// The SINGLE source of truth for that tag. The cluster deploy's P0 runs the
+/// model download inside the engine's own image, but the image is only built at
+/// P2, so the first cluster deploy of a new engine used to die on "brak
+/// lokalnego obrazu". P0 calls this instead. Both callers therefore derive the
+/// tag the same way -- an arch or build-args difference cannot produce one image
+/// for the download and a second one for the serve.
+pub(crate) async fn ensure_engine_image(
+    docker: &bollard::Docker,
+    manifest: &ServiceManifest,
+    distributed: bool,
+    log: Option<&LogSink>,
+) -> DeployResult<String> {
+    use std::collections::HashMap;
+    let docker_section = manifest.deploy.docker.as_ref().ok_or_else(|| {
+        DeployError::Manifest(format!("engine '{}' has no [deploy.docker]", manifest.engine.id))
+    })?;
+    let context_path = docker_section.context_path.as_deref().ok_or_else(|| {
+        DeployError::Manifest(format!(
+            "engine '{}' is compose-only — it has no single image to build",
+            manifest.engine.id
+        ))
+    })?;
+    // Walidacja: podkatalog silnika musi istniec (czytelny blad gdy context_path zly).
+    let context_dir = crate::paths::containers_root().join(context_path);
+    if !context_dir.exists() {
+        return Err(DeployError::Manifest(format!(
+            "docker context_path does not exist: {}",
+            context_dir.display()
+        )));
+    }
+    // Kontekstem budowania jest KORZEN bundla (rodzic `tentaflow-containers/`),
+    // bo Dockerfile'e kopiuja sciezki wzgledem korzenia bundla. Dockerfile
+    // lezy pod podscieszka silnika.
+    let bundle_root = crate::paths::containers_root()
+        .parent()
+        .map(|p| p.to_path_buf())
+        .ok_or_else(|| {
+            DeployError::Manifest(
+                "cannot resolve bundle root (containers_root has no parent)".into(),
+            )
+        })?;
+    let dockerfile_rel = format!("tentaflow-containers/{}/Dockerfile", context_path);
+
+    // Hardware-aware build: wykryj arch-tag GPU hosta i wybierz build-args
+    // (CUDA base / torch index / wersja pakietu / arch list) z manifestu.
+    // default_build_args + arch_variants[arch] (arch wygrywa). Gdy silnik
+    // deklaruje `arch_variants`, tag obrazu dostaje sufiks arch, zeby obrazy
+    // pod rozne karty (np. sglang Ampere vs Blackwell) nie kolidowaly w
+    // cache "build only when missing".
+    let gpu = crate::system_check::collect().gpu;
+    let arch_tag = gpu.cuda_arch_tag();
+    let mut build_args: std::collections::HashMap<String, String> =
+        docker_section.default_build_args.clone();
+    if let Some(variant) = docker_section.arch_variants.get(&arch_tag) {
+        for (k, v) in &variant.build_args {
+            build_args.insert(k.clone(), v.clone());
+        }
+    }
+    // Hardware-aware build custom-kerneli CUDA: wstrzykujemy dokladny
+    // TORCH_CUDA_ARCH_LIST pod wykryte GPU jako build-arg, zeby host
+    // kompilowal kernele (OCR quad_nms, yolox FastCOCOEvalOp) pod swoja
+    // realna karte. Manifest WYGRYWA (default_build_args/arch_variants),
+    // np. vllm-spark `12.1a` — nie nadpisujemy. Bez GPU (None) zostawiamy
+    // Dockerfile'owy default (fat-binary ARG).
+    //
+    // Gate na realnej deklaracji `ARG TORCH_CUDA_ARCH_LIST` w Dockerfile:
+    // tylko nemotron-ocr/yolox kompiluja custom-kernel i deklaruja ten ARG.
+    // Wstrzykniecie build-arga niekonsumowanego przez Dockerfile (rerank-vl,
+    // parse, embed-vl, comfyui) daje docker warning "build-args were not
+    // consumed" ORAZ niepotrzebny arch-aware tag -> zbedny per-arch rebuild
+    // serwisu bez custom-kernela. Czytamy DOKLADNIE ten plik, ktory idzie do
+    // Bollard build (`bundle_root.join(dockerfile_rel)`); IO error = nie
+    // wstrzykujemy (bezpieczny default, brak warningu).
+    if !build_args.contains_key("TORCH_CUDA_ARCH_LIST") {
+        let dockerfile_declares_arch_arg =
+            std::fs::read_to_string(bundle_root.join(&dockerfile_rel))
+                .map(|contents| {
+                    contents
+                        .lines()
+                        .any(|l| l.trim_start().starts_with("ARG TORCH_CUDA_ARCH_LIST"))
+                })
+                .unwrap_or(false);
+        if dockerfile_declares_arch_arg {
+            if let Some(arch_list) = gpu.torch_cuda_arch_list() {
+                build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
+            }
+        }
+    }
+    // Silnik korzystajacy z build-args (jakikolwiek default/arch) dostaje
+    // tag z sufiksem arch, zeby obrazy pod rozne karty nie kolidowaly.
+    // Silniki bez build-args (searxng, browser-renderer) zostaja przy plaskim
+    // tagu (brak niepotrzebnych przebudow).
+    // UWAGA: liczymy PO wstrzyknieciu TORCH_CUDA_ARCH_LIST powyzej. Silniki z
+    // custom-kernelem (nemotron-ocr, yolox; deklaruja `ARG TORCH_CUDA_ARCH_LIST`)
+    // dostaja wstrzykniety arch-list, wiec ich tag staje sie arch-aware — inaczej
+    // obraz zbudowany raz pod jeden arch (np. 8.6 na 3090) zostalby cicho reuzyty
+    // na B300 (ten sam plaski tag) i odpalil zly kernel. Serwisy bez tego ARG
+    // (rerank-vl, parse, embed-vl, comfyui) nie dostaja wstrzykniecia -> plaski tag.
+    let arch_aware = !build_args.is_empty() || !docker_section.arch_variants.is_empty();
+    // Source-hash w tagu: zmiana Dockerfile/kontekstu (docker_source_hash —
+    // TEN SAM ktory steruje badge'em "Aktualizacja dostepna") daje NOWY tag,
+    // wiec `if !image_exists` ponizej zwraca false i obraz SIE PRZEBUDOWUJE.
+    // Bez tego plaski tag :v1 nigdy sie nie zmienial -> kazda zmiana Dockerfile
+    // byla cicho ignorowana (deploy "0 ms", stary obraz reuzyty), a fix w
+    // Dockerfile (np. TORCH_CUDA_ARCH_LIST) nigdy sie nie kompilowal.
+    let src_suffix = image_source_suffix(&manifest.docker_source_hash);
+    let image_tag = if arch_aware {
+        // Gruby arch_tag (cuda_arch_tag) NIE rozroznia kart w tej samej rodzinie:
+        // B200 (cc 10.0) i B300 (cc 10.3) mapuja sie oba na "cuda-blackwell", choc
+        // dostaja rozne TORCH_CUDA_ARCH_LIST ("10.0+PTX" vs "10.3+PTX"). Obraz
+        // zbudowany na B300 (SASS 10.3, brak 10.0) reuzyty na B200 by NIE odpalil
+        // (PTX forward-compat tylko w gore). Dlatego doklejamy krotki hash
+        // zdeterminizowanego odcisku build_args: KAZDA roznica (arch list, torch
+        // index, base image, wersja pakietu) -> inny tag -> rebuild; identyczne
+        // build-args (dwa B300) -> ten sam tag -> reuse.
+        use sha2::{Digest, Sha256};
+        let mut keys: Vec<_> = build_args.keys().collect();
+        keys.sort();
+        let mut hasher = Sha256::new();
+        for k in keys {
+            hasher.update(k.as_bytes());
+            hasher.update(b"=");
+            hasher.update(build_args[k].as_bytes());
+            hasher.update(b"\n");
+        }
+        let ba8 = hex::encode(hasher.finalize())[..8].to_string();
+        format!(
+            "tentaflow/{}:{}-{}-{}{}",
+            manifest.engine.id, manifest.engine.version, arch_tag, ba8, src_suffix
+        )
+    } else {
+        plain_image_tag(manifest)
+    };
+    let build_args = if build_args.is_empty() {
+        None
+    } else {
+        Some(build_args)
+    };
+
+    // Distributed vllm-spark: zamiast 20-40 min rebuildu vLLM ZE ZRODEL na
+    // kazdym deployu, budujemy CIENKA warstwe (ray + rdma-core) na JUZ
+    // ZBUDOWANEJ bazie from-source `tentaflow/vllm-spark:<ver>`. Cienki obraz
+    // `tentaflow/vllm-spark-ray:<ver>` powstaje w ~1-2 min (potem z cache).
+    // Baza MUSI istniec na nodzie — jej brak to czytelny blad (NIE cichy
+    // rebuild from-source). Inne silniki (np. `vllm` z PyPI) maja ray we
+    // wlasnym, szybkim Dockerfile i ida normalna sciezka.
+    let (image_tag, dockerfile_rel, build_args) =
+        if distributed && manifest.engine.id == "vllm-spark" {
+            let base = backend::resolve_existing_base_image(
+                docker,
+                &[
+                    // Tag z normalnego deployu bazy (ten sam co `image_tag` tutaj),
+                    image_tag.clone(),
+                    // Plaski tag (manualnie zbudowana baza / spike).
+                    format!("tentaflow/vllm-spark:{}", manifest.engine.version),
+                ],
+            )
+            .await?;
+            let thin_tag = format!("tentaflow/vllm-spark-ray:{}", manifest.engine.version);
+            let mut ba: HashMap<String, String> = HashMap::new();
+            ba.insert("BASE_IMAGE".to_string(), base);
+            (
+                thin_tag,
+                "tentaflow-containers/llm/docker/vllm-spark-ray/Dockerfile".to_string(),
+                Some(ba),
+            )
+        } else {
+            (image_tag, dockerfile_rel, build_args)
+        };
+
+    // Build only when missing — repeated deploys reuse the cached image.
+    if !backend::image_exists(docker, &image_tag).await? {
+        if let Some(s) = log {
+            s.info(&format!(
+                "[docker] building image {} from {} (dockerfile {}, arch {}, build_args {})",
+                image_tag,
+                bundle_root.display(),
+                dockerfile_rel,
+                arch_tag,
+                build_args.as_ref().map(|m| m.len()).unwrap_or(0)
+            ));
+        }
+        backend::build_image_from_context(
+            docker,
+            &bundle_root,
+            &dockerfile_rel,
+            &image_tag,
+            build_args,
+            log,
+        )
+        .await?;
+    }
+    Ok(image_tag)
+}
+
 #[async_trait]
 impl DeployStrategy for DockerDeploy {
     #[cfg(feature = "docker")]
@@ -1218,16 +1429,12 @@ impl DeployStrategy for DockerDeploy {
         // Multi-container engines (infra stacks like Milvus / iroh-relay) declare
         // `compose_path` instead of `context_path`: launch the whole stack via
         // `docker compose up` rather than building a single image.
-        let context_path = match docker_section.context_path.clone() {
-            Some(p) => p,
-            None => {
-                let compose_path = docker_section.compose_path.clone().ok_or_else(|| {
-                    DeployError::Manifest("docker deploy needs context_path or compose_path".into())
-                })?;
-                return self.prepare_compose(&compose_path).await;
-            }
-        };
-        let context_path = context_path.as_str();
+        if docker_section.context_path.is_none() {
+            let compose_path = docker_section.compose_path.clone().ok_or_else(|| {
+                DeployError::Manifest("docker deploy needs context_path or compose_path".into())
+            })?;
+            return self.prepare_compose(&compose_path).await;
+        }
 
         let docker = backend::connect().await?;
         backend::ping(&docker).await?;
@@ -1237,176 +1444,13 @@ impl DeployStrategy for DockerDeploy {
         // from-source), zeby nie odpalac 20-40 min rebuildu przy kazdym deployu.
         let distributed = parse_distributed(&self.user_config);
 
-        // Walidacja: podkatalog silnika musi istniec (czytelny blad gdy context_path zly).
-        let context_dir = crate::paths::containers_root().join(context_path);
-        if !context_dir.exists() {
-            return Err(DeployError::Manifest(format!(
-                "docker context_path does not exist: {}",
-                context_dir.display()
-            )));
-        }
-        // Kontekstem budowania jest KORZEN bundla (rodzic `tentaflow-containers/`),
-        // bo Dockerfile'e kopiuja sciezki wzgledem korzenia bundla. Dockerfile
-        // lezy pod podscieszka silnika.
-        let bundle_root = crate::paths::containers_root()
-            .parent()
-            .map(|p| p.to_path_buf())
-            .ok_or_else(|| {
-                DeployError::Manifest(
-                    "cannot resolve bundle root (containers_root has no parent)".into(),
-                )
-            })?;
-        let dockerfile_rel = format!("tentaflow-containers/{}/Dockerfile", context_path);
-
-        // Hardware-aware build: wykryj arch-tag GPU hosta i wybierz build-args
-        // (CUDA base / torch index / wersja pakietu / arch list) z manifestu.
-        // default_build_args + arch_variants[arch] (arch wygrywa). Gdy silnik
-        // deklaruje `arch_variants`, tag obrazu dostaje sufiks arch, zeby obrazy
-        // pod rozne karty (np. sglang Ampere vs Blackwell) nie kolidowaly w
-        // cache "build only when missing".
-        let gpu = crate::system_check::collect().gpu;
-        let arch_tag = gpu.cuda_arch_tag();
-        let mut build_args: std::collections::HashMap<String, String> =
-            docker_section.default_build_args.clone();
-        if let Some(variant) = docker_section.arch_variants.get(&arch_tag) {
-            for (k, v) in &variant.build_args {
-                build_args.insert(k.clone(), v.clone());
-            }
-        }
-        // Hardware-aware build custom-kerneli CUDA: wstrzykujemy dokladny
-        // TORCH_CUDA_ARCH_LIST pod wykryte GPU jako build-arg, zeby host
-        // kompilowal kernele (OCR quad_nms, yolox FastCOCOEvalOp) pod swoja
-        // realna karte. Manifest WYGRYWA (default_build_args/arch_variants),
-        // np. vllm-spark `12.1a` — nie nadpisujemy. Bez GPU (None) zostawiamy
-        // Dockerfile'owy default (fat-binary ARG).
-        //
-        // Gate na realnej deklaracji `ARG TORCH_CUDA_ARCH_LIST` w Dockerfile:
-        // tylko nemotron-ocr/yolox kompiluja custom-kernel i deklaruja ten ARG.
-        // Wstrzykniecie build-arga niekonsumowanego przez Dockerfile (rerank-vl,
-        // parse, embed-vl, comfyui) daje docker warning "build-args were not
-        // consumed" ORAZ niepotrzebny arch-aware tag -> zbedny per-arch rebuild
-        // serwisu bez custom-kernela. Czytamy DOKLADNIE ten plik, ktory idzie do
-        // Bollard build (`bundle_root.join(dockerfile_rel)`); IO error = nie
-        // wstrzykujemy (bezpieczny default, brak warningu).
-        if !build_args.contains_key("TORCH_CUDA_ARCH_LIST") {
-            let dockerfile_declares_arch_arg =
-                std::fs::read_to_string(bundle_root.join(&dockerfile_rel))
-                    .map(|contents| {
-                        contents
-                            .lines()
-                            .any(|l| l.trim_start().starts_with("ARG TORCH_CUDA_ARCH_LIST"))
-                    })
-                    .unwrap_or(false);
-            if dockerfile_declares_arch_arg {
-                if let Some(arch_list) = gpu.torch_cuda_arch_list() {
-                    build_args.insert("TORCH_CUDA_ARCH_LIST".to_string(), arch_list);
-                }
-            }
-        }
-        // Silnik korzystajacy z build-args (jakikolwiek default/arch) dostaje
-        // tag z sufiksem arch, zeby obrazy pod rozne karty nie kolidowaly.
-        // Silniki bez build-args (searxng, browser-renderer) zostaja przy plaskim
-        // tagu (brak niepotrzebnych przebudow).
-        // UWAGA: liczymy PO wstrzyknieciu TORCH_CUDA_ARCH_LIST powyzej. Silniki z
-        // custom-kernelem (nemotron-ocr, yolox; deklaruja `ARG TORCH_CUDA_ARCH_LIST`)
-        // dostaja wstrzykniety arch-list, wiec ich tag staje sie arch-aware — inaczej
-        // obraz zbudowany raz pod jeden arch (np. 8.6 na 3090) zostalby cicho reuzyty
-        // na B300 (ten sam plaski tag) i odpalil zly kernel. Serwisy bez tego ARG
-        // (rerank-vl, parse, embed-vl, comfyui) nie dostaja wstrzykniecia -> plaski tag.
-        let arch_aware = !build_args.is_empty() || !docker_section.arch_variants.is_empty();
-        // Source-hash w tagu: zmiana Dockerfile/kontekstu (docker_source_hash —
-        // TEN SAM ktory steruje badge'em "Aktualizacja dostepna") daje NOWY tag,
-        // wiec `if !image_exists` ponizej zwraca false i obraz SIE PRZEBUDOWUJE.
-        // Bez tego plaski tag :v1 nigdy sie nie zmienial -> kazda zmiana Dockerfile
-        // byla cicho ignorowana (deploy "0 ms", stary obraz reuzyty), a fix w
-        // Dockerfile (np. TORCH_CUDA_ARCH_LIST) nigdy sie nie kompilowal.
-        let src_suffix = image_source_suffix(&self.manifest.docker_source_hash);
-        let image_tag = if arch_aware {
-            // Gruby arch_tag (cuda_arch_tag) NIE rozroznia kart w tej samej rodzinie:
-            // B200 (cc 10.0) i B300 (cc 10.3) mapuja sie oba na "cuda-blackwell", choc
-            // dostaja rozne TORCH_CUDA_ARCH_LIST ("10.0+PTX" vs "10.3+PTX"). Obraz
-            // zbudowany na B300 (SASS 10.3, brak 10.0) reuzyty na B200 by NIE odpalil
-            // (PTX forward-compat tylko w gore). Dlatego doklejamy krotki hash
-            // zdeterminizowanego odcisku build_args: KAZDA roznica (arch list, torch
-            // index, base image, wersja pakietu) -> inny tag -> rebuild; identyczne
-            // build-args (dwa B300) -> ten sam tag -> reuse.
-            use sha2::{Digest, Sha256};
-            let mut keys: Vec<_> = build_args.keys().collect();
-            keys.sort();
-            let mut hasher = Sha256::new();
-            for k in keys {
-                hasher.update(k.as_bytes());
-                hasher.update(b"=");
-                hasher.update(build_args[k].as_bytes());
-                hasher.update(b"\n");
-            }
-            let ba8 = hex::encode(hasher.finalize())[..8].to_string();
-            format!(
-                "tentaflow/{}:{}-{}-{}{}",
-                self.manifest.engine.id, self.manifest.engine.version, arch_tag, ba8, src_suffix
-            )
-        } else {
-            plain_image_tag(&self.manifest)
-        };
-        let build_args = if build_args.is_empty() {
-            None
-        } else {
-            Some(build_args)
-        };
-
-        // Distributed vllm-spark: zamiast 20-40 min rebuildu vLLM ZE ZRODEL na
-        // kazdym deployu, budujemy CIENKA warstwe (ray + rdma-core) na JUZ
-        // ZBUDOWANEJ bazie from-source `tentaflow/vllm-spark:<ver>`. Cienki obraz
-        // `tentaflow/vllm-spark-ray:<ver>` powstaje w ~1-2 min (potem z cache).
-        // Baza MUSI istniec na nodzie — jej brak to czytelny blad (NIE cichy
-        // rebuild from-source). Inne silniki (np. `vllm` z PyPI) maja ray we
-        // wlasnym, szybkim Dockerfile i ida normalna sciezka.
-        let (image_tag, dockerfile_rel, build_args) =
-            if distributed.is_some() && self.manifest.engine.id == "vllm-spark" {
-                let base = backend::resolve_existing_base_image(
-                    &docker,
-                    &[
-                        // Tag z normalnego deployu bazy (ten sam co `image_tag` tutaj),
-                        image_tag.clone(),
-                        // Plaski tag (manualnie zbudowana baza / spike).
-                        format!("tentaflow/vllm-spark:{}", self.manifest.engine.version),
-                    ],
-                )
-                .await?;
-                let thin_tag = format!("tentaflow/vllm-spark-ray:{}", self.manifest.engine.version);
-                let mut ba: HashMap<String, String> = HashMap::new();
-                ba.insert("BASE_IMAGE".to_string(), base);
-                (
-                    thin_tag,
-                    "tentaflow-containers/llm/docker/vllm-spark-ray/Dockerfile".to_string(),
-                    Some(ba),
-                )
-            } else {
-                (image_tag, dockerfile_rel, build_args)
-            };
-
-        // Build only when missing — repeated deploys reuse the cached image.
-        if !backend::image_exists(&docker, &image_tag).await? {
-            if let Some(s) = &self.log_sink {
-                s.info(&format!(
-                    "[docker] building image {} from {} (dockerfile {}, arch {}, build_args {})",
-                    image_tag,
-                    bundle_root.display(),
-                    dockerfile_rel,
-                    arch_tag,
-                    build_args.as_ref().map(|m| m.len()).unwrap_or(0)
-                ));
-            }
-            backend::build_image_from_context(
-                &docker,
-                &bundle_root,
-                &dockerfile_rel,
-                &image_tag,
-                build_args,
-                self.log_sink.as_ref(),
-            )
-            .await?;
-        }
+        let image_tag = ensure_engine_image(
+            &docker,
+            &self.manifest,
+            distributed.is_some(),
+            self.log_sink.as_ref(),
+        )
+        .await?;
 
         // On-demand engine: the image IS the deployable artifact. Its instances
         // are created per request by the Core subsystem that owns them (teams-bot

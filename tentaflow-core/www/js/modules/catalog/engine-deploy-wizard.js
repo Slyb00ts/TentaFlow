@@ -504,7 +504,7 @@ function manifestParams() {
 
 // Engines whose Advanced step is the bespoke VRAM/KV calculator (vLLM family +
 // llama.cpp + MLX). They must NOT fall into the generic manifest-param renderer.
-const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'llama-cpp', 'tensorrt-llm', 'mlx'];
+const ADV_CALC_ENGINES = ['vllm', 'vllm-spark', 'sglang', 'sglang-glm53', 'llama-cpp', 'tensorrt-llm', 'mlx'];
 
 // vLLM-backed engines (embed / rerank / VL pooling models) carry backend="vllm"
 // in the manifest — they get the SAME VRAM calculator + gpu_memory_utilization

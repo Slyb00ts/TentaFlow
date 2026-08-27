@@ -760,12 +760,23 @@ async fn download_model_via_container(
     // Bezpiecznik gornego limitu calkowitego czasu (postep to glowny mechanizm).
     const MAX_SECS: u64 = 4 * 3600;
 
-    let image = resolve_download_image(engine_id).await.ok_or_else(|| {
-        format!(
-            "brak lokalnego obrazu 'tentaflow/{engine_id}...' do pobrania modelu — \
-             zbuduj najpierw obraz silnika (deploy single-node)"
-        )
-    })?;
+    // Pobieranie leci w obrazie SILNIKA (ma `python` + huggingface_hub, i to ten
+    // sam obraz, ktory pozniej serwuje). Przy PIERWSZYM deployu nowego silnika
+    // obrazu jeszcze nie ma — P0 idzie przed buildem kontenera — wiec budujemy go
+    // tutaj. `ensure_engine_image` to ta sama funkcja, ktorej uzywa deploy, wiec
+    // build nie moze wyprodukowac innego tagu niz ten, ktory potem wystartuje.
+    let image = match resolve_download_image(engine_id).await {
+        Some(img) => img,
+        None => {
+            tracing::info!(
+                engine = %engine_id,
+                "P0: obraz silnika jeszcze nie zbudowany — buduje go przed pobraniem modelu"
+            );
+            crate::services::deploy::docker::ensure_engine_image_by_id(engine_id)
+                .await
+                .map_err(|e| format!("build obrazu silnika '{engine_id}': {e}"))?
+        }
+    };
     let models_host = crate::paths::models_root();
     std::fs::create_dir_all(&models_host).map_err(|e| format!("mkdir models_root: {e}"))?;
     let cache_dir = models_host.join(model_dir_name(model_repo));
