@@ -204,7 +204,10 @@ fn handle_research_query(params: &Value) -> Value {
     let mut findings = Vec::new();
     if let Some(pages) = read.get("pages").and_then(Value::as_array) {
         for page in pages {
-            let content = page.get("content").and_then(Value::as_str).unwrap_or_default();
+            // `text` is what ReadPageResult carries. Reading a "content" field
+            // that never existed is why this tool returned an empty findings list
+            // on every call it ever made, whatever the pages actually said.
+            let content = page.get("text").and_then(Value::as_str).unwrap_or_default();
             if content.trim().is_empty() {
                 continue;
             }
