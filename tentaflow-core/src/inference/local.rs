@@ -128,6 +128,22 @@ mod grammar_tests {
     fn the_trigger_is_the_opening_tag() {
         assert_eq!(TOOL_CALL_TRIGGER, "<tool_call>");
     }
+
+    /// llama.cpp feeds the grammar the CAPTURE GROUP of the trigger pattern.
+    /// Without a group it hands over everything generated so far, the grammar
+    /// rejects the prose and the process is terminated by a C++ exception —
+    /// twice observed, both times fatal to Core mid-run.
+    #[test]
+    fn the_trigger_pattern_captures_from_the_opening_tag() {
+        use super::TOOL_CALL_TRIGGER_PATTERN as p;
+
+        assert!(p.contains('('), "wzorzec musi miec grupe: {p}");
+        let group = &p[p.find('(').unwrap()..];
+        assert!(
+            group.starts_with("(<tool_call>"),
+            "grupa musi zaczynac sie od znacznika: {group}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -185,9 +201,15 @@ mod reasoning_tests {
     }
 }
 
-/// Literal that switches the tool-call grammar on. Prose before it is free;
-/// everything after it must be a valid call.
+/// Literal that opens a call. Prose before it is free; everything after it must
+/// be a valid call.
 const TOOL_CALL_TRIGGER: &str = "<tool_call>";
+
+/// Pattern that switches the grammar on. The CAPTURE GROUP matters: llama.cpp
+/// feeds the grammar exactly what the group holds, so it must start at the
+/// opening tag. A pattern without one hands over every character generated so
+/// far, the grammar rejects the prose, and llama.cpp terminates the process.
+const TOOL_CALL_TRIGGER_PATTERN: &str = r"[\s\S]*?(<tool_call>[\s\S]*)";
 
 /// GBNF for "a JSON object naming one of THESE tools with ITS arguments".
 ///
@@ -567,7 +589,7 @@ impl LocalInferenceHandler {
             // freely, as it always has.
             grammar: tool_call_grammar.unwrap_or_default(),
             grammar_triggers: if tools_present {
-                vec![TOOL_CALL_TRIGGER.to_string()]
+                vec![TOOL_CALL_TRIGGER_PATTERN.to_string()]
             } else {
                 Vec::new()
             },
@@ -793,5 +815,29 @@ impl LocalInferenceHandler {
                 break;
             }
         }
+    }
+}
+
+#[cfg(all(test, feature = "inference-llamacpp"))]
+mod grammar_dump {
+    use super::tool_call_grammar;
+    use crate::api::openai::types::{FunctionDefinition, Tool};
+
+    #[test]
+    #[ignore = "diagnostic: prints the generated grammar"]
+    fn dump() {
+        let tools = vec![Tool {
+            tool_type: "function".into(),
+            function: FunctionDefinition {
+                name: "search_web".into(),
+                description: None,
+                parameters: Some(serde_json::json!({
+                    "type":"object",
+                    "properties":{"query":{"type":"string"}},
+                    "required":["query"]
+                })),
+            },
+        }];
+        println!("=== GRAMATYKA ===\n{}", tool_call_grammar(&tools).unwrap());
     }
 }

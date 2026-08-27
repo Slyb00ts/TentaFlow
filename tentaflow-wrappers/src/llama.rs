@@ -1013,7 +1013,12 @@ pub struct GrammarSpec {
     pub grammar: String,
     /// Root rule name inside `grammar`.
     pub root: String,
-    /// Literal strings that switch the grammar on, e.g. `<tool_call>`.
+    /// Regex patterns that switch the grammar on. Each MUST contain a capture
+    /// group: llama.cpp feeds the grammar the contents of that group, not the
+    /// whole output. Without one it hands over everything generated so far —
+    /// prose included — and the grammar rejects it on the first character,
+    /// which llama.cpp reports by throwing a C++ exception that terminates the
+    /// process.
     pub triggers: Vec<String>,
 }
 
@@ -1101,7 +1106,10 @@ fn init_lazy_grammar(
     let trigger_ptrs: Vec<*const c_char> = triggers.iter().map(|t| t.as_ptr()).collect();
 
     let raw = unsafe {
-        sys::llama_rs_sampler_init_grammar_lazy(
+        // The PATTERNS variant, not the word one: the word variant regex-escapes
+        // each trigger, producing a pattern with no capture group, and llama.cpp
+        // then feeds the grammar the entire generated text instead of the call.
+        sys::llama_rs_sampler_init_grammar_lazy_patterns(
             vocab,
             grammar.as_ptr(),
             root.as_ptr(),
