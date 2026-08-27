@@ -21,6 +21,13 @@ FROM lmsysorg/sglang:glm-5.3-flash-arm64
 COPY tentaflow-containers/llm/patches/glm53/patch_tilelang_gb10.py /tmp/patch_tilelang_gb10.py
 RUN python3 /tmp/patch_tilelang_gb10.py && rm /tmp/patch_tilelang_gb10.py
 
+# Upstream drops the quant config for every modelopt_fp4 NextN block, which is
+# right for DeepSeek (BF16 MTP) and fatal here: GLM-5.3's MTP block ships
+# NVFP4-packed routed experts, so the draft would build BF16 experts and MTP
+# could not load at all.
+COPY tentaflow-containers/llm/patches/glm53/patch_nextn_nvfp4.py /tmp/patch_nextn_nvfp4.py
+RUN python3 /tmp/patch_nextn_nvfp4.py && rm /tmp/patch_nextn_nvfp4.py
+
 # Fabric variables (NCCL_IB_HCA / NCCL_SOCKET_IFNAME / NCCL_IB_GID_INDEX) and the
 # HF cache are per node and injected by the cluster deploy, never baked.
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
