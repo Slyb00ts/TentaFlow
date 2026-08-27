@@ -278,6 +278,12 @@ fn sglang_mp_engine_args(engine_id: &str) -> Vec<String> {
         "1",
         "--speculative-num-draft-tokens",
         "6",
+        // The draft's quantization defaults to `--quantization`, which is unset
+        // here because the target auto-detects NVFP4 from the checkpoint. Left
+        // unset the draft builds its MoE unquantized and the NVFP4-packed
+        // experts fail to load (4096 vs 2048 on the w13 input dim).
+        "--speculative-draft-model-quantization",
+        "modelopt_fp4",
     ]
     .into_iter()
     .map(String::from)
@@ -1680,6 +1686,7 @@ mod tests {
         assert!(cmd.contains("'--speculative-eagle-topk' '1'"));
         assert!(cmd.contains("'--speculative-num-draft-tokens' '6'"));
         assert!(!cmd.contains("--speculative-draft-model-path"));
+        assert!(cmd.contains("'--speculative-draft-model-quantization' 'modelopt_fp4'"));
     }
 
     #[test]
