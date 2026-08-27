@@ -109,16 +109,41 @@ fn sh_quote(s: &str) -> String {
     out
 }
 
-/// Czy silnik deklaruje multi-node przez natywny vLLM mp (`cluster_launch =
-/// "vllm-mp"` w manifescie) zamiast Raya. Brak manifestu = false (Ray).
-pub fn engine_is_vllm_mp(engine_id: &str) -> bool {
-    crate::services::manifest::registry()
-        .by_id(engine_id)
-        .map(|m| m.engine.cluster_launch.as_deref() == Some("vllm-mp"))
-        .unwrap_or(false)
+/// Sposob spiecia czlonkow klastra, deklarowany przez `engine.cluster_launch`.
+/// Brak manifestu albo brak pola = Ray (historyczny domyslny tryb vLLM).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ClusterMode {
+    /// Ray GCS + `vllm serve --distributed-executor-backend ray`.
+    Ray,
+    /// Natywny multi-node vLLM (`--nnodes/--node-rank/--headless`).
+    VllmMp,
+    /// Natywny multi-node sglang (`--nnodes/--node-rank/--dist-init-addr`).
+    SglangMp,
 }
 
-/// Rank czlonka w trybie vllm-mp — koordynator wstrzykuje `_mp_node_rank` do
+impl ClusterMode {
+    /// Natywny multi-node silnika, bez Raya. Orkiestracja jest wtedy identyczna
+    /// dla obu dialektow: worker startuje OD RAZU pelna komende i blokuje sie na
+    /// masterze, a koordynator odpala rank 0 na samym koncu — wiec fazy Ray (GCS,
+    /// gate ClusterReady) nie maja czego sondowac i sa pomijane.
+    pub fn is_native_mp(self) -> bool {
+        matches!(self, ClusterMode::VllmMp | ClusterMode::SglangMp)
+    }
+}
+
+pub fn cluster_mode(engine_id: &str) -> ClusterMode {
+    match crate::services::manifest::registry()
+        .by_id(engine_id)
+        .and_then(|m| m.engine.cluster_launch.clone())
+        .as_deref()
+    {
+        Some("vllm-mp") => ClusterMode::VllmMp,
+        Some("sglang-mp") => ClusterMode::SglangMp,
+        _ => ClusterMode::Ray,
+    }
+}
+
+/// Rank czlonka w trybie natywnego mp — koordynator wstrzykuje `_mp_node_rank` do
 /// `config_json` spec-a (head=0, workery 1..). Brak klucza = blad (spec zbudowany
 /// przez koordynatora bez rankow nie moze odpalic `--node-rank`).
 fn mp_node_rank(spec: &DistributedDeploySpec) -> Result<u32, String> {
@@ -126,7 +151,7 @@ fn mp_node_rank(spec: &DistributedDeploySpec) -> Result<u32, String> {
         .ok()
         .and_then(|v| v.get("_mp_node_rank").and_then(|x| x.as_u64()))
         .map(|r| r as u32)
-        .ok_or_else(|| "vllm-mp: brak _mp_node_rank w config_json spec-a".to_string())
+        .ok_or_else(|| "native mp: brak _mp_node_rank w config_json spec-a".to_string())
 }
 
 /// Stale argumenty `vllm serve` dla silnika w trybie vllm-mp. `vllm-dspark` =
@@ -190,6 +215,104 @@ fn vllm_mp_engine_args(engine_id: &str, spec_num_tokens: Option<u32>) -> Vec<Str
     .into_iter()
     .map(String::from)
     .collect()
+}
+
+/// Stale argumenty `sglang.launch_server` dla silnika w trybie sglang-mp.
+/// `sglang-glm53` = zweryfikowany profil GLM-5.3-Flash NVFP4 na 2x GB10.
+///
+/// Kazda z tych flag jest nosna na sm_121 i zadna nie wynika z domyslnych
+/// ustawien sglang:
+///   * `dsa` + `tilelang` — jedyny backend DSA z kernelem NoPE (`tail_dim == 0`).
+///     GLM-5.3-Flash ma `qk_rope_head_dim = 0`, a `flashinfer_sparse_mla` zaklada
+///     strone 448+64 z RoPE; warianty `flashmla_*` odpada `index_kpool = 4`.
+///   * `--kv-cache-dtype bfloat16` — TileLang na CUDA obsluguje TYLKO bf16-KV,
+///     a samo POMINIECIE flagi nie wystarcza: domyslka DSA wybiera fp8.
+///   * `--disable-shared-experts-fusion` — w tym checkpoincie kwantyzowane sa
+///     wylacznie eksperci ROUTOWANI; shared expert zostal w BF16, wiec fuzja
+///     upakowalaby go do bufora NVFP4 i load pada na niezgodnosci ksztaltow.
+///   * `--moe-runner-backend flashinfer_cutlass` — runner NVFP4 sam wybiera
+///     backend datacenter-Blackwell dla `(12, 1)`; `marlin` tez dziala, ale jego
+///     repack kosztuje ~19 GiB na rank, ktorych tu nie ma.
+///   * `--reasoning-parser glm45` — model otwiera blok rozumowania BEZ tagu
+///     `<think>` (robi to chat template) i zamyka `</think>`. Bez parsera caly
+///     slad rozumowania laduje w `content`, a `reasoning_content` zostaje null.
+///   * `--tool-call-parser glm47` — GLM-5.x ma inny format niz `glm` (4.5).
+///     `glm` NIE zwraca bledu: konsumuje wywolanie i oddaje puste `content`
+///     z `tool_calls: null`, czyli cicha utrata narzedzi.
+///
+/// `--max-running-requests` jest tu, bo stan rekurencyjny 34 warstw KDA jest
+/// alokowany PER REQUEST i konkuruje z pula KV o te sama pamiec — przy zbyt
+/// wysokiej wspolbieznosci sglang konczy na `max_num_reqs=0`. Nadpisywalny przez
+/// `vllm_args` (ostatnie wystapienie wygrywa).
+fn sglang_mp_engine_args(engine_id: &str) -> Vec<String> {
+    if engine_id != "sglang-glm53" {
+        return Vec::new();
+    }
+    [
+        "--attention-backend",
+        "dsa",
+        "--dsa-prefill-backend",
+        "tilelang",
+        "--dsa-decode-backend",
+        "tilelang",
+        "--moe-runner-backend",
+        "flashinfer_cutlass",
+        "--kv-cache-dtype",
+        "bfloat16",
+        "--disable-shared-experts-fusion",
+        "--reasoning-parser",
+        "glm45",
+        "--tool-call-parser",
+        "glm47",
+        "--max-running-requests",
+        "2",
+    ]
+    .into_iter()
+    .map(String::from)
+    .collect()
+}
+
+/// Pelna komenda `sglang.launch_server` w trybie sglang-mp — IDENTYCZNA na kazdym
+/// czlonku poza `--node-rank`. sglang nie ma odpowiednika `--headless`: serwer
+/// HTTP wystawia rank 0, pozostale ranki prowadza tylko swoje shardy TP.
+/// `--dist-init-addr` to ta sama para `ray_head_ip:dist_port` co master TCPStore
+/// w trybie vllm-mp. KAZDY token jest shell-quote'owany (argi silnika niosa
+/// JSON-y ze spacjami/nawiasami).
+fn build_sglang_mp_serve_command(
+    spec: &DistributedDeploySpec,
+    rank: u32,
+) -> Result<String, String> {
+    let nnodes = (spec.tp_size / spec.num_gpus.max(1)).max(1);
+    let mut serve = format!(
+        "python3 -m sglang.launch_server --model-path {model} \
+         --host 0.0.0.0 \
+         --port {port} \
+         --served-model-name {served} \
+         --tp-size {tp} \
+         --mem-fraction-static {util:.2} \
+         --context-length {maxlen} \
+         --nnodes {nnodes} \
+         --node-rank {rank} \
+         --dist-init-addr {master}",
+        model = sh_quote(&spec.model),
+        port = spec.port,
+        served = sh_quote(&spec.served_model_name),
+        tp = spec.tp_size,
+        util = spec.gpu_memory_utilization,
+        maxlen = spec.max_model_len,
+        nnodes = nnodes,
+        rank = rank,
+        master = sh_quote(&format!("{}:{}", spec.ray_head_ip, spec.dist_port)),
+    );
+    for tok in sglang_mp_engine_args(&spec.engine_id) {
+        serve.push(' ');
+        serve.push_str(&sh_quote(&tok));
+    }
+    for tok in user_vllm_arg_tokens(spec)? {
+        serve.push(' ');
+        serve.push_str(&sh_quote(&tok));
+    }
+    Ok(serve)
 }
 
 /// Pelna komenda `vllm serve` w trybie vllm-mp — IDENTYCZNA na kazdym czlonku
@@ -258,17 +381,27 @@ fn build_mp_serve_command(
 /// odpala `vllm serve` przez `docker exec` DOPIERO gdy `ray status` pokaze pelny
 /// klaster (patrz `build_serve_command`). Worker = ray join + `--block`.
 ///
-/// Tryb vllm-mp (natywny multi-node vLLM, bez Raya): worker startuje OD RAZU
-/// pelne `vllm serve --headless --node-rank N` (worker-first — czeka na mastera
-/// TCPStore), a head trzyma kontener na `sleep infinity`; serve head-a (rank 0,
-/// binduje master port) odpala koordynator przez `docker exec` w P5 — czyli
-/// dokladnie ostatni, jak wymaga tego mp init.
+/// Tryby natywnego mp (bez Raya) zachowuja sie identycznie: worker startuje OD
+/// RAZU pelna komende z wlasnym `--node-rank` (worker-first — blokuje sie na
+/// masterze), a head trzyma kontener na `sleep infinity`; komende rank-a 0
+/// (binduje master port) odpala koordynator przez `docker exec` w P5 — czyli
+/// dokladnie ostatni, jak wymaga tego mp init. vLLM dostaje `--headless` na
+/// workerach, sglang nie ma odpowiednika: tam HTTP wystawia po prostu rank 0.
 fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> {
-    if engine_is_vllm_mp(&spec.engine_id) {
-        if spec.role == "worker" {
-            return build_mp_serve_command(spec, mp_node_rank(spec)?, true);
+    match cluster_mode(&spec.engine_id) {
+        ClusterMode::VllmMp => {
+            if spec.role == "worker" {
+                return build_mp_serve_command(spec, mp_node_rank(spec)?, true);
+            }
+            return Ok("sleep infinity".to_string());
         }
-        return Ok("sleep infinity".to_string());
+        ClusterMode::SglangMp => {
+            if spec.role == "worker" {
+                return build_sglang_mp_serve_command(spec, mp_node_rank(spec)?);
+            }
+            return Ok("sleep infinity".to_string());
+        }
+        ClusterMode::Ray => {}
     }
     let ray_addr = format!("{}:{}", spec.ray_head_ip, spec.ray_port);
     if spec.role == "worker" {
@@ -295,10 +428,13 @@ fn build_launch_command(spec: &DistributedDeploySpec) -> Result<String, String> 
 /// VLLM_HOST_IP, HF_HUB_CACHE/OFFLINE) dziedziczone z konfiguracji kontenera.
 /// Shell-quoting jak w `build_launch_command`. Tylko dla roli head.
 pub fn build_serve_command(spec: &DistributedDeploySpec) -> Result<String, String> {
-    if engine_is_vllm_mp(&spec.engine_id) {
+    match cluster_mode(&spec.engine_id) {
         // Head = rank 0, nie-headless (serwuje API); workery juz czekaja na
         // mastera TCPStore, wiec ten exec domyka init caly klaster.
-        return build_mp_serve_command(spec, 0, false);
+        ClusterMode::VllmMp => return build_mp_serve_command(spec, 0, false),
+        // sglang: rank 0 binduje `--dist-init-addr` i wystawia HTTP.
+        ClusterMode::SglangMp => return build_sglang_mp_serve_command(spec, 0),
+        ClusterMode::Ray => {}
     }
     let mut serve = format!(
         "cd /root && vllm serve {model} \
@@ -365,10 +501,11 @@ fn nccl_env(spec: &DistributedDeploySpec) -> Map<String, Value> {
     m.insert("VLLM_HOST_IP".into(), json!(spec.rdma_ip));
     // Native PyTorch sampler zamiast FlashInfer: FlashInfer robi wolny kernel JIT (ninja)
     // na GB10 (sm_121a, brak prebuiltu), co blokuje faze profiling w TP init.
-    // Tryb vllm-mp NIE dostaje tego override'u: obraz (np. vllm-dspark) wypala
-    // wlasna, zweryfikowana wartosc (FlashInfer sampler=1 jest czescia garble-fixa
-    // DSpark) i ma prebuiltowe kernele dla sm_121.
-    if !engine_is_vllm_mp(&spec.engine_id) {
+    // Dotyczy WYLACZNIE trybu Ray, czyli stockowego vLLM. Silniki mp jada na
+    // obrazach per-model (vllm-dspark, sglang-glm53), ktore wypalaja wlasne,
+    // zweryfikowane ustawienia i maja prebuiltowe kernele dla sm_121 — a dla
+    // sglang ta zmienna nie znaczy w ogole nic.
+    if cluster_mode(&spec.engine_id) == ClusterMode::Ray {
         m.insert("VLLM_USE_FLASHINFER_SAMPLER".into(), json!("0"));
     }
     // Persist fp4_gemm autotune (leci wielokrotnie przy starcie) w bind-montowanym cache.
@@ -1460,6 +1597,72 @@ mod tests {
     fn worker_config_has_no_endpoint() {
         assert!(endpoint_url_for(&spec("worker")).is_none());
         assert!(endpoint_url_for(&spec("head")).is_some());
+    }
+
+    fn sglang_spec(role: &str, rank: u32) -> DistributedDeploySpec {
+        let mut s = spec(role);
+        s.engine_id = "sglang-glm53".into();
+        s.model = "LibertAIDAI/GLM-5.3-Flash-NVFP4".into();
+        s.served_model_name = "glm-5-3-flash".into();
+        s.port = 30000;
+        s.max_model_len = 1_048_576;
+        s.config_json = format!(r#"{{"_mp_node_rank":{rank}}}"#);
+        s
+    }
+
+    #[test]
+    fn sglang_mp_worker_launches_its_own_rank() {
+        // sglang has no `--headless`: every rank runs the same command and only
+        // rank 0 exposes HTTP, so the worker's command must be complete.
+        let cmd = build_launch_command(&sglang_spec("worker", 1)).unwrap();
+        assert!(cmd.starts_with("python3 -m sglang.launch_server --model-path"));
+        assert!(cmd.contains("--node-rank 1"));
+        assert!(cmd.contains("--nnodes 2"));
+        assert!(cmd.contains("--tp-size 2"));
+        assert!(cmd.contains("--dist-init-addr '10.10.10.24:8101'"));
+        assert!(cmd.contains("--context-length 1048576"));
+        assert!(!cmd.contains("--headless"));
+        assert!(!cmd.contains("ray start"));
+    }
+
+    #[test]
+    fn sglang_mp_head_container_waits_for_the_coordinator() {
+        // Rank 0 binds the init address, so it must be the LAST thing started —
+        // the coordinator execs it in P5, not the container entrypoint.
+        let cmd = build_launch_command(&sglang_spec("head", 0)).unwrap();
+        assert_eq!(cmd, "sleep infinity");
+        let serve = build_serve_command(&sglang_spec("head", 0)).unwrap();
+        assert!(serve.contains("--node-rank 0"));
+    }
+
+    #[test]
+    fn sglang_mp_carries_the_load_bearing_sm121_profile() {
+        let cmd = build_serve_command(&sglang_spec("head", 0)).unwrap();
+        // The only DSA backend with a NoPE (tail_dim == 0) kernel.
+        assert!(cmd.contains("'--attention-backend' 'dsa'"));
+        assert!(cmd.contains("'--dsa-prefill-backend' 'tilelang'"));
+        assert!(cmd.contains("'--dsa-decode-backend' 'tilelang'"));
+        // TileLang on CUDA is bf16-KV-only; omitting the flag re-selects fp8.
+        assert!(cmd.contains("'--kv-cache-dtype' 'bfloat16'"));
+        // The shared expert stayed BF16 in this checkpoint — fusing it into the
+        // NVFP4 buffer fails the load on a shape mismatch.
+        assert!(cmd.contains("'--disable-shared-experts-fusion'"));
+        assert!(cmd.contains("'--reasoning-parser' 'glm45'"));
+        // `glm` (4.5 format) fails SILENTLY here: it eats the call and returns
+        // empty content with tool_calls: null.
+        assert!(cmd.contains("'--tool-call-parser' 'glm47'"));
+    }
+
+    #[test]
+    fn sglang_mp_user_args_win_over_the_profile() {
+        // argparse takes the last occurrence, so the wizard's free-text field
+        // must be appended AFTER the built-in profile.
+        let mut s = sglang_spec("head", 0);
+        s.config_json = r#"{"_mp_node_rank":0,"vllm_args":"--max-running-requests 4"}"#.into();
+        let cmd = build_serve_command(&s).unwrap();
+        let profile = cmd.find("'--max-running-requests' '2'").unwrap();
+        let user = cmd.find("'--max-running-requests' '4'").unwrap();
+        assert!(user > profile, "cmd: {cmd}");
     }
 
     #[cfg(feature = "docker")]

@@ -1,17 +1,17 @@
 # =============================================================================
 # Plik: embeddings/python/nemotron-embed/bundle.toml
 # Opis: NVIDIA Llama-Nemotron Embed jako natywny python-bundle — vLLM (PyPI
-#       pinned 0.27.1) serwowany w trybie embeddings (--task embed). CUDA (cu130)
+#       pinned 0.28.0) serwowany w trybie embeddings (--task embed). CUDA (cu130)
 #       oraz ROCm (rocm7.0). Eksponuje OpenAI-compatible /v1/embeddings.
 # =============================================================================
 
 [bundle]
 engine = "nemotron-embed"
-description = "NVIDIA Llama-Nemotron Embed via vLLM (PyPI, pinned 0.27.1, --task embed)"
+description = "NVIDIA Llama-Nemotron Embed via vLLM (PyPI, pinned 0.28.0, --task embed)"
 python_version = "3.12"
-# Pinned na 0.27.1 dla reproducibility — git main moze rozjechac sie z deps.
+# Pinned na 0.28.0 dla reproducibility — git main moze rozjechac sie z deps.
 source = "pypi"
-pypi_package = "vllm==0.27.1"
+pypi_package = "vllm==0.28.0"
 
 [launch]
 command = "python"

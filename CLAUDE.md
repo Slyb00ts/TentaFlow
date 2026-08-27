@@ -236,11 +236,11 @@ native (`python-bundle`) deployment.
   private/local subresource requests inside Playwright routing.
 - `test-runner` — see Project Studio below.
 
-LLM engine versions live in the container manifests: vLLM 0.27.1 on PyTorch 2.13.0 +
+LLM engine versions live in the container manifests: vLLM 0.28.0 on PyTorch 2.13.0 +
 torchvision 0.28.0, SGLang 0.5.17 on PyTorch 2.11.0; ROCm vLLM variants install from the
-official ROCm wheel index. DGX Spark builds vLLM 0.27.1 from source and the DeepSeek DSpark
+official ROCm wheel index. DGX Spark builds vLLM 0.28.0 from source and the DeepSeek DSpark
 variant applies only the local `nvfp4_ds_mla` patch (DSpark support landed upstream). Profile
-`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.27.1 needs
+`vllm-dspark` is legacy (external vLLM 0.24 image + old overlay) — 0.28.0 needs
 `vllm-dspark-src`, because the old overlay no longer applies to current sources.
 
 vLLM recipes (`tentaflow-core/src/deploy/vllm_recipes.rs`) resolve in a cascade: exact HF id →

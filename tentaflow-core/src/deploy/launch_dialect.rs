@@ -44,13 +44,14 @@ pub enum Dialect {
 }
 
 /// Mapuje `engine_id` na dialekt. `vllm-spark`/`vllm-metal`/`qwen3-vl`/`granite*`
-/// dziela CLI vLLM (uruchamiaja vllm serve), `sglang` ma wlasny, GGUF idzie na
+/// dziela CLI vLLM (uruchamiaja vllm serve), `sglang`/`sglang-glm53` maja wlasny
+/// (ten drugi to obraz per-model na 2x GB10), GGUF idzie na
 /// llama.cpp, `mlx*` na MLX. Nieznane LLM-y traktujemy jak vLLM (najszerszy
 /// wspolny mianownik OpenAI-compatible), reszta to Generic.
 pub fn dialect_for(engine_id: &str) -> Dialect {
     let id = engine_id.to_lowercase().replace('.', "-");
     match id.as_str() {
-        "sglang" => Dialect::Sglang,
+        "sglang" | "sglang-glm53" => Dialect::Sglang,
         "llama-cpp" | "llamacpp" => Dialect::LlamaCpp,
         "mlx" | "mlx-lm" | "mlx-vlm" | "qwen3-vl-mlx" => Dialect::Mlx,
         "vllm" | "vllm-spark" | "vllm-metal" | "qwen3-vl" => Dialect::Vllm,

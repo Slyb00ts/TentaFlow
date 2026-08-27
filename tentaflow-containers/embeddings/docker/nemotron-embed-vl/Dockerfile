@@ -7,7 +7,7 @@
 # =============================================================================
 
 # --- vLLM z PyPI ---
-# CUDA 13.0 + cudnn runtime — vLLM 0.27.1 wymaga PyTorch 2.13 + cu130. Runtime
+# CUDA 13.0 + cudnn runtime — vLLM 0.28.0 wymaga PyTorch 2.13 + cu130. Runtime
 # variant (nie devel) bo nie kompilujemy z source — wheels z PyPI maja prebuilt
 # extensions (vllm, xformers, flashinfer).
 FROM nvidia/cuda:13.0.3-cudnn-runtime-ubuntu24.04
@@ -20,7 +20,7 @@ RUN python3 -m venv /opt/vllm-venv
 ENV PATH="/opt/vllm-venv/bin:$PATH"
 RUN pip install --no-cache-dir --upgrade pip wheel
 
-# vLLM 0.27.1 + torch 2.13 z cu130 index. torch idzie z pytorch.org (PyPI ma
+# vLLM 0.28.0 + torch 2.13 z cu130 index. torch idzie z pytorch.org (PyPI ma
 # wariant CPU). vLLM wymaga jawnego wheela +cu130 dla B300 (sm_103) — domyslny
 # wheel PyPI to cu129, dlatego bierzemy go z indeksu nightly cu130 vLLM.
 RUN pip install --no-cache-dir \
@@ -28,7 +28,7 @@ RUN pip install --no-cache-dir \
       torch==2.13.0 torchvision==0.28.0 torchaudio==2.11.0 \
     && pip install --no-cache-dir \
       --extra-index-url https://wheels.vllm.ai/nightly/cu130 \
-      vllm==0.27.1
+      vllm==0.28.0
 
 # hf CLI do pobierania zrodel safetensors z HF.
 # hf_transfer = szybsze rownolegle pobieranie.

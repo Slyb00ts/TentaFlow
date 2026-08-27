@@ -1,0 +1,66 @@
+# Manifest serwisu sglang-glm53 — GLM-5.3-Flash NVFP4 (320B MoE, 18B aktywnych)
+# na klaster 2x DGX Spark. Osobny silnik od `sglang.toml`, bo architektura
+# `glm5_next` nie jest ani w sglang, ani w vLLM upstream (sglang#36507 i
+# vllm#53906 sa otwarte) — runtime musi przyjsc z vendorowego tagu per-model.
+#
+# Dlaczego sglang, a nie vLLM, akurat na tym sprzecie: checkpoint jest NoPE
+# (`qk_rope_head_dim = 0`), a na sm_121 jedynym rzadkim backendem MLA w vLLM jest
+# FLASHINFER_MLA_SPARSE_SM120, ktorego implementacja twardo wymaga ukladu strony
+# `fp8_ds_mla` (512 NoPE + 64 RoPE). Reszta backendow jest zamknieta architektura
+# przez `supports_compute_capability`: FLASH_ATTN_MLA_SPARSE major == 9,
+# FLASHMLA_SPARSE major in [9, 10]. Efekt na Sparku to nie blad, tylko bledny
+# tekst z czystym `finish_reason: stop`.
+#
+# Cluster-ONLY: 181 GiB wag nie miesci sie na jednym Sparku (119 GiB). Multi-node
+# idzie natywnym mp sglang (`--nnodes/--node-rank/--dist-init-addr`), nie Rayem —
+# patrz `cluster_launch = "sglang-mp"` i `services/deploy/distributed.rs`.
+
+[engine]
+id = "sglang-glm53"
+category = "llm"
+name = "GLM-5.3-Flash SGLang (2x Spark)"
+description_pl = "GLM-5.3-Flash 320B MoE (18B akt.) NVFP4, multimodalny, 1M kontekstu. SGLang z backendem DSA TileLang na klaster 2x DGX Spark."
+description_en = "GLM-5.3-Flash 320B MoE (18B active) NVFP4, natively multimodal, 1M context. SGLang with the TileLang DSA backend on a 2x DGX Spark cluster."
+homepage = "https://github.com/sgl-project/sglang"
+license = "MIT"
+icon = "sglang"
+default_port = 30000
+api = "openai-compatible"
+version = "glm-5.3-flash"
+# Silnik widoczny TYLKO na Sparku — manifest-store filtruje po polu engine.dgx_spark.
+# Kafelek TileLang jest przestrojony pod limit shared memory GB10 i nie ma sensu
+# na Blackwellu datacenter.
+dgx_spark = true
+cluster_capable = true
+cluster_launch = "sglang-mp"
+# Obraz jest zbudowany wokol JEDNEGO checkpointu, wiec silnik nie ma sensu w
+# oderwaniu od swojego presetu — katalog pokazuje tylko kafelek modelu.
+preset_only = true
+
+[deploy.docker]
+context_path = "llm/docker/sglang-glm53"
+platforms = ["linux"]
+transport = "direct-http"
+
+# Kontekst (`--context-length`) i `--mem-fraction-static` ustawia wizard; reszta
+# profilu (backend DSA, bf16 KV, brak fuzji shared-expert, parsery) jest stala i
+# siedzi w `sglang_mp_engine_args`, bo kazda z tych flag jest nosna na sm_121.
+#
+# Budzet na rank przy TP=2: 90,5 GiB wag + KV. KV to MLA — tylko 11 z 45 warstw
+# ma cache, po `kv_lora_rank = 512` bez RoPE, czyli ~11,8 kB/token razem ze
+# skompresowanym cache indeksera. 1M tokenow to ~11,6 GiB i MLA NIE dzieli sie po
+# TP, wiec tyle na kazdym wezle. Do tego stan rekurencyjny 34 warstw KDA, ~70 MB
+# na RownolegLY request — dlatego `--max-running-requests` jest niskie: kontekst i
+# wspolbieznosc konkuruja o te sama pamiec, a przy zbyt wielu slotach sglang
+# konczy na `max_num_reqs=0`.
+[[model_preset]]
+id = "glm-5-3-flash-nvfp4"
+display_name = "GLM-5.3-Flash (NVFP4, 1M ctx, cluster 2x Spark)"
+repo = "LibertAIDAI/GLM-5.3-Flash-NVFP4"
+quantization = "nvfp4"
+recommended = true
+featured = true
+# Bez bloku [model_preset.sampling]: ten blok jedzie do vLLM-owego
+# `--override-generation-config`, ktorego sglang nie ma. sglang startuje z
+# `--sampling-defaults model`, wiec sam czyta generation_config.json checkpointu
+# (temperature 1.0, top_p 0.95) — zapisanie tego tutaj byloby martwa konfiguracja.

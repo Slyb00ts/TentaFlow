@@ -2144,12 +2144,13 @@ async fn run_cluster_deploy_phases(
         return;
     }
 
-    // Tryb vllm-mp (natywny multi-node vLLM): brak Raya — P3 (GCS) i pozniejszy
+    // Tryby natywnego mp (vLLM/sglang): brak Raya — P3 (GCS) i pozniejszy
     // gate ClusterReady nie maja czego sondowac. Workery startuja pelne
-    // `vllm serve --headless` juz w P4 i czekaja na mastera TCPStore, ktorego
-    // binduje dopiero serve head-a w P5 (worker-first, jak wymaga mp init).
-    let vllm_mp = crate::services::deploy::distributed::engine_is_vllm_mp(&engine_id);
-    if !vllm_mp {
+    // swoja komende juz w P4 i czekaja na mastera, ktorego
+    // binduje dopiero rank 0 w P5 (worker-first, jak wymaga mp init).
+    let native_mp =
+        crate::services::deploy::distributed::cluster_mode(&engine_id).is_native_mp();
+    if !native_mp {
         cdeploy_phase(
             &ctx.state.db,
             &log_sender,
@@ -2268,7 +2269,7 @@ async fn run_cluster_deploy_phases(
         }
     }
 
-    if !vllm_mp {
+    if !native_mp {
         cdeploy_phase(
             &ctx.state.db,
             &log_sender,

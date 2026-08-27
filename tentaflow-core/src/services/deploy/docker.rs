@@ -1555,7 +1555,10 @@ impl DeployStrategy for DockerDeploy {
         // PRZED torch.distributed init i rank0 dostaje EADDRINUSE na wlasnym
         // master porcie. Bez env vLLM sam wybiera wolne porty wewnetrzne.
         let vllm_mp = distributed.is_some()
-            && super::distributed::engine_is_vllm_mp(&self.manifest.engine.id);
+            && matches!(
+                super::distributed::cluster_mode(&self.manifest.engine.id),
+                super::distributed::ClusterMode::VllmMp
+            );
         if !vllm_mp {
             env.insert("VLLM_PORT".into(), vllm_port.to_string());
         }
