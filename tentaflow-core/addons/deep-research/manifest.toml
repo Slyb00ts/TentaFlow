@@ -1,7 +1,7 @@
 [addon]
 id = "deep-research"
 name = "Deep Research"
-version = "0.5.0"
+version = "0.5.1"
 description = "Wyszukiwanie internetu, pobieranie publicznych stron i ekstrakcja tekstu przez Core Web Research SDK."
 category = "ai"
 keywords = ["research", "web", "search", "crawler", "internet", "sources"]
@@ -142,10 +142,4 @@ required = false
 name = "search_limit"
 param_type = "number"
 description = "Ile wynikow wyszukiwania rozwazyc jako kandydatow (domyslnie 10)."
-required = false
-
-[[tool.parameter]]
-name = "summarize"
-param_type = "boolean"
-description = "Streszczaj kazda strone modelem zamiast zwracac wyciety tekst. Dokladniejsze, ale kosztuje jedno wywolanie modelu na strone — domyslnie wylaczone."
 required = false

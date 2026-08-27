@@ -270,9 +270,15 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
         let (inner_end, close_end) = match (next_close, next_open) {
             (Some(c), Some(o)) if o < c => (inner_start + o, inner_start + o),
             (Some(c), _) => (inner_start + c, inner_start + c + CLOSE_TAG.len()),
+            // No closer anywhere, but another block starts: the previous one was
+            // simply never closed. A turn that emits 73 openers and NOT ONE
+            // closer is not an edge case — it happened — and treating it as
+            // "unclosed tail" parsed none of the 73 and printed them all as the
+            // answer.
+            (None, Some(o)) => (inner_start + o, inner_start + o),
             // Unclosed final block: `strip_truncated_tool_call` owns the tail,
             // so leave it in place rather than guessing where it ended.
-            (None, _) => break,
+            (None, None) => break,
         };
         search_from = close_end;
 
@@ -731,6 +737,27 @@ mod tests {
         assert_eq!(args_json(&calls[0]), json!({"fact":"x"}));
         assert!(calls[0].id.starts_with("call_0_"));
         assert_eq!(calls[0].id.len(), "call_0_".len() + 8);
+    }
+
+    /// A turn that closed NOTHING. Before this, the absence of any closing tag
+    /// made the parser give up on the first block and print every call as prose.
+    #[test]
+    fn calls_parse_when_no_block_is_closed_at_all() {
+        let text = concat!(
+            r#"<tool_call>{"name":"search","arguments":{"query":"a"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"b"}}"#,
+            "\n",
+            r#"<tool_call>{"name":"search","arguments":{"query":"c"}}"#,
+        );
+
+        let (_clean, calls) = parse_tool_calls(text);
+
+        // The last block has no terminator of any kind, so it stays for
+        // `strip_truncated_tool_call`; the two before it are unambiguous.
+        assert_eq!(calls.len(), 2);
+        assert_eq!(args_json(&calls[0])["query"], "a");
+        assert_eq!(args_json(&calls[1])["query"], "b");
     }
 
     /// The other half of the same real turn: every body carried one brace too
