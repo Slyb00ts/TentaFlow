@@ -69,6 +69,14 @@ pub struct GenerateParams {
     /// Upper bound (MB) on how much memory the MLX model may use. 0 = no cap.
     /// Enforced via `GPU.set(memoryLimit:)` + a per-token memory snapshot check.
     pub memory_budget_mb: u32,
+    /// GBNF that constrains generation once one of `grammar_triggers` appears.
+    /// Empty = unconstrained sampling. Used for tool calls: a model told only in
+    /// prose to emit `<tool_call>{…}</tool_call>` produces near-misses
+    /// constantly, and each one is a call that never runs.
+    pub grammar: String,
+    /// Literal strings that switch the grammar on, so prose stays free and only
+    /// the machine-readable part is forced into shape.
+    pub grammar_triggers: Vec<String>,
 }
 
 /// Ceiling on a single answer, in tokens. Not a product limit — a guard against
@@ -105,6 +113,9 @@ impl Default for GenerateParams {
             repeat_penalty: 1.0,
             stop_sequences: vec![],
             system_prompt: None,
+            // Unconstrained by default: a grammar is opt-in per request.
+            grammar: String::new(),
+            grammar_triggers: Vec::new(),
             // 0 = native max / no cap; the deploy wizard pins real values that
             // persist via the mlx `[[parameter]]` bindings.
             max_context_tokens: 0,

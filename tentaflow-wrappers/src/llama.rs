@@ -996,14 +996,55 @@ fn detect_quantization(path: &Path) -> Option<String> {
     })
 }
 
+/// Grammar that constrains generation once a trigger appears in the output.
+///
+/// Tool calls are the reason this exists. Told only in prose to answer with
+/// `<tool_call>{...}</tool_call>`, a model produces near-misses constantly —
+/// a missing closing tag, one brace too many, a foreign tag syntax — and every
+/// one of those is a call that never runs. A grammar makes the malformed
+/// version unreachable: the sampler will not emit a token the grammar forbids.
+///
+/// LAZY, not global: the grammar activates only after `triggers` matches, so
+/// ordinary prose is unconstrained and only the machine-readable part is
+/// forced into shape.
+#[derive(Debug, Clone)]
+pub struct GrammarSpec {
+    /// GBNF source. Build it from a JSON schema with [`json_schema_to_grammar`].
+    pub grammar: String,
+    /// Root rule name inside `grammar`.
+    pub root: String,
+    /// Literal strings that switch the grammar on, e.g. `<tool_call>`.
+    pub triggers: Vec<String>,
+}
+
+/// Converts a JSON schema into GBNF using llama.cpp's own converter, so the
+/// grammar always matches what that version of the library accepts.
+#[cfg(feature = "llama")]
+pub fn json_schema_to_grammar(schema: &serde_json::Value) -> Result<String, LlamaError> {
+    let schema_json = schema.to_string();
+    let c_schema = std::ffi::CString::new(schema_json).map_err(|_| LlamaError::SamplerFailed)?;
+    let mut out: *mut c_char = std::ptr::null_mut();
+    let status = unsafe { sys::llama_rs_json_schema_to_grammar(c_schema.as_ptr(), true, &mut out) };
+    if status != 0 || out.is_null() {
+        return Err(LlamaError::SamplerFailed);
+    }
+    let grammar = unsafe { CStr::from_ptr(out) }
+        .to_string_lossy()
+        .into_owned();
+    unsafe { sys::llama_rs_string_free(out) };
+    Ok(grammar)
+}
+
 #[cfg(feature = "llama")]
 pub(crate) fn build_sampler_chain(
+    vocab: *const sys::llama_vocab,
     n_vocab: i32,
     repeat_penalty: f32,
     top_k: u32,
     top_p: f32,
     temperature: f32,
     seed: u32,
+    grammar: Option<&GrammarSpec>,
 ) -> Result<LlamaSamplerGuard, LlamaError> {
     let params = unsafe { sys::llama_sampler_chain_default_params() };
     let chain = unsafe { sys::llama_sampler_chain_init(params) };
@@ -1011,6 +1052,14 @@ pub(crate) fn build_sampler_chain(
         return Err(LlamaError::SamplerFailed);
     }
     let mut sampler = LlamaSamplerGuard { raw: chain };
+
+    // Grammar goes FIRST: it removes forbidden tokens before any other sampler
+    // reasons about the distribution. Added after them it would be choosing
+    // among candidates the others already narrowed, which is not the same
+    // constraint.
+    if let Some(spec) = grammar {
+        sampler.add(init_lazy_grammar(vocab, spec)?)?;
+    }
 
     if repeat_penalty > 1.0 {
         sampler.add(unsafe {
@@ -1031,6 +1080,41 @@ pub(crate) fn build_sampler_chain(
     }
 
     Ok(sampler)
+}
+
+/// Builds the lazy grammar sampler. A spec that llama.cpp rejects is an error
+/// rather than a silent fallback: generating unconstrained when the caller
+/// asked for a grammar is exactly the failure the grammar was meant to prevent.
+#[cfg(feature = "llama")]
+fn init_lazy_grammar(
+    vocab: *const sys::llama_vocab,
+    spec: &GrammarSpec,
+) -> Result<*mut sys::llama_sampler, LlamaError> {
+    let grammar = std::ffi::CString::new(spec.grammar.as_str())
+        .map_err(|_| LlamaError::SamplerFailed)?;
+    let root = std::ffi::CString::new(spec.root.as_str()).map_err(|_| LlamaError::SamplerFailed)?;
+    let triggers: Vec<std::ffi::CString> = spec
+        .triggers
+        .iter()
+        .filter_map(|t| std::ffi::CString::new(t.as_str()).ok())
+        .collect();
+    let trigger_ptrs: Vec<*const c_char> = triggers.iter().map(|t| t.as_ptr()).collect();
+
+    let raw = unsafe {
+        sys::llama_rs_sampler_init_grammar_lazy(
+            vocab,
+            grammar.as_ptr(),
+            root.as_ptr(),
+            trigger_ptrs.as_ptr() as *mut *const c_char,
+            trigger_ptrs.len(),
+            std::ptr::null(),
+            0,
+        )
+    };
+    if raw.is_null() {
+        return Err(LlamaError::SamplerFailed);
+    }
+    Ok(raw)
 }
 
 #[cfg(feature = "llama")]

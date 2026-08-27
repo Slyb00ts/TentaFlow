@@ -293,6 +293,14 @@ pub fn parse_tool_calls(text: &str) -> (String, Vec<LlmToolCall>) {
                 });
                 removals.push(expand_span_over_wrapping_fence(text, open, close_end));
             }
+            None if is_only_markup(inner) => {
+                // A block whose body is nothing but tags carries nothing for a
+                // reader. A degenerate turn emits hundreds of them
+                // (`<tool_call></function></tool_call>` over and over) and every
+                // one reached the answer as visible noise. Dropped, not shown —
+                // keeping it would only ask the reader to ignore it.
+                removals.push(expand_span_over_wrapping_fence(text, open, close_end));
+            }
             None => {
                 // char-based truncation: a byte slice could split a
                 // multibyte character in arbitrary model output and panic.
@@ -443,6 +451,24 @@ fn parse_call_body(inner: &str) -> Option<(String, String)> {
     Some((name, arguments))
 }
 
+/// Whether a block body is empty once every tag is removed — nothing but
+/// markup, so nothing a reader could act on. Kept narrow deliberately: a block
+/// with real text that merely failed to parse still stays visible, because that
+/// text may be the answer the model meant to give.
+fn is_only_markup(inner: &str) -> bool {
+    let mut out = String::with_capacity(inner.len());
+    let mut depth = 0usize;
+    for ch in inner.chars() {
+        match ch {
+            '<' => depth += 1,
+            '>' => depth = depth.saturating_sub(1),
+            c if depth == 0 => out.push(c),
+            _ => {}
+        }
+    }
+    out.trim().is_empty()
+}
+
 /// Second accepted body shape: the tag form some open-weight models emit from
 /// their own training instead of the JSON we ask for —
 /// `<function=name><parameter=key>value</parameter></function>`. Without this
@@ -472,10 +498,17 @@ fn parse_xml_call_body(inner: &str) -> Option<(String, String)> {
             break;
         };
         if !key.is_empty() {
-            arguments.insert(
-                key,
-                serde_json::Value::String(value_part[..value_end].trim().to_string()),
-            );
+            let raw = value_part[..value_end].trim();
+            // A tag body is plain text, but a parameter whose value IS json —
+            // `agent_spawn`'s `tasks` array is the common one — must arrive as
+            // that array, not as a string containing it. Anything that does not
+            // parse stays the string it looks like.
+            let value = match raw.chars().next() {
+                Some('[') | Some('{') => serde_json::from_str(raw)
+                    .unwrap_or_else(|_| serde_json::Value::String(raw.to_string())),
+                _ => serde_json::Value::String(raw.to_string()),
+            };
+            arguments.insert(key, value);
         }
         cursor = &value_part[value_end + "</parameter>".len()..];
     }
@@ -737,6 +770,47 @@ mod tests {
         assert_eq!(args_json(&calls[0]), json!({"fact":"x"}));
         assert!(calls[0].id.starts_with("call_0_"));
         assert_eq!(calls[0].id.len(), "call_0_".len() + 8);
+    }
+
+    /// The shape a degenerate chat turn produced: one real call in tag form,
+    /// then hundreds of blocks containing nothing but tags. The real call has to
+    /// execute, and the empty ones must not reach the reader.
+    #[test]
+    fn markup_only_blocks_are_dropped_and_the_real_call_survives() {
+        let text = concat!(
+            "Rozbijam porownanie.\n",
+            "<tool_call>\n<function=core.agent_spawn>\n<parameter=agent>\nresearcher\n",
+            "</parameter>\n<parameter=tasks>\n[\"a\",\"b\"]\n</parameter>\n</function>\n</tool_call>\n",
+            "<tool_call>\n</function>\n</tool_call>\n",
+            "<tool_call>\n</function>\n</tool_call>\n",
+        );
+
+        let (clean, calls) = parse_tool_calls(text);
+
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "core.agent_spawn");
+        let args = args_json(&calls[0]);
+        assert_eq!(args["agent"], "researcher");
+        // `tasks` must arrive as the ARRAY it is, not a string holding one.
+        assert!(args["tasks"].is_array(), "tasks: {}", args["tasks"]);
+        assert_eq!(args["tasks"][1], "b");
+        assert!(
+            !clean.contains("tool_call"),
+            "puste bloki nie moga dotrzec do czytelnika: {clean}"
+        );
+        assert!(clean.contains("Rozbijam porownanie."));
+    }
+
+    /// A block that failed to parse but carries real text stays visible — that
+    /// text may be the answer the model meant to give.
+    #[test]
+    fn an_unparsable_block_with_prose_is_kept() {
+        let text = "<tool_call>przepraszam, nie umiem tego wywolac</tool_call>";
+
+        let (clean, calls) = parse_tool_calls(text);
+
+        assert!(calls.is_empty());
+        assert!(clean.contains("przepraszam"));
     }
 
     /// A turn that closed NOTHING. Before this, the absence of any closing tag

@@ -59,6 +59,67 @@ fn apply_no_think(messages: &mut Vec<ChatMessage>) {
 }
 
 
+/// Without llama.cpp there is no grammar engine to compile against, and the
+/// other backends enforce tool shape themselves. Constraining is a llama.cpp
+/// capability, not a platform one.
+#[cfg(not(feature = "inference-llamacpp"))]
+fn tool_call_grammar(_tools: &[crate::api::openai::types::Tool]) -> Option<String> {
+    None
+}
+
+#[cfg(all(test, feature = "inference-llamacpp"))]
+mod grammar_tests {
+    use super::{tool_call_grammar, TOOL_CALL_TRIGGER};
+    use crate::api::openai::types::{FunctionDefinition, Tool};
+
+    fn tool(name: &str, params: serde_json::Value) -> Tool {
+        Tool {
+            tool_type: "function".to_string(),
+            function: FunctionDefinition {
+                name: name.to_string(),
+                description: None,
+                parameters: Some(params),
+            },
+        }
+    }
+
+    #[test]
+    fn no_tools_means_no_grammar() {
+        assert!(tool_call_grammar(&[]).is_none());
+    }
+
+    /// The grammar has to come from llama.cpp's own converter, so it always
+    /// matches what that build accepts. If this stops producing a grammar the
+    /// constraint is silently gone and malformed calls come back.
+    #[test]
+    fn schemas_compile_to_a_grammar() {
+        let tools = vec![
+            tool(
+                "search_web",
+                serde_json::json!({
+                    "type": "object",
+                    "properties": {"query": {"type": "string"}},
+                    "required": ["query"]
+                }),
+            ),
+            tool("ping", serde_json::json!({"type": "object"})),
+        ];
+
+        let grammar = tool_call_grammar(&tools).expect("llama.cpp musi skompilowac schemat");
+
+        assert!(grammar.contains("root"), "brak reguly root: {grammar}");
+        // Both tool names must survive into the grammar, or one of them became
+        // unreachable for the model.
+        assert!(grammar.contains("search_web"), "brak search_web: {grammar}");
+        assert!(grammar.contains("ping"), "brak ping: {grammar}");
+    }
+
+    #[test]
+    fn the_trigger_is_the_opening_tag() {
+        assert_eq!(TOOL_CALL_TRIGGER, "<tool_call>");
+    }
+}
+
 #[cfg(test)]
 mod reasoning_tests {
     use super::{apply_no_think, reasoning_disabled, NO_THINK_MARKER};
@@ -114,6 +175,56 @@ mod reasoning_tests {
     }
 }
 
+/// Literal that switches the tool-call grammar on. Prose before it is free;
+/// everything after it must be a valid call.
+const TOOL_CALL_TRIGGER: &str = "<tool_call>";
+
+/// GBNF for "a JSON object naming one of THESE tools with ITS arguments".
+///
+/// Prompt mode can only ask for the shape in words, and a model asked in words
+/// misses constantly — a brace too many, a tag form from another vendor, a tool
+/// name that does not exist. Each miss is a call that never runs. Compiled from
+/// the real schemas, the wrong output stops being reachable: the sampler cannot
+/// emit a token the grammar forbids.
+///
+/// `None` when there is nothing to constrain or llama.cpp rejects the schema —
+/// unconstrained sampling is what happened before, so falling back to it costs
+/// nothing that was not already being paid.
+#[cfg(feature = "inference-llamacpp")]
+fn tool_call_grammar(tools: &[crate::api::openai::types::Tool]) -> Option<String> {
+    if tools.is_empty() {
+        return None;
+    }
+    let variants: Vec<serde_json::Value> = tools
+        .iter()
+        .map(|t| {
+            let arguments = t
+                .function
+                .parameters
+                .clone()
+                .unwrap_or_else(|| serde_json::json!({"type": "object"}));
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "name": {"const": t.function.name},
+                    "arguments": arguments,
+                },
+                "required": ["name", "arguments"],
+                "additionalProperties": false,
+            })
+        })
+        .collect();
+
+    let schema = serde_json::json!({ "oneOf": variants });
+    match tentaflow_wrappers::llama::json_schema_to_grammar(&schema) {
+        Ok(grammar) => Some(grammar),
+        Err(e) => {
+            warn!("tool-call grammar rejected by llama.cpp, sampling unconstrained: {e}");
+            None
+        }
+    }
+}
+
 impl LocalInferenceHandler {
     pub fn new(manager: Arc<RwLock<InferenceManager>>) -> Self {
         Self {
@@ -125,6 +236,7 @@ impl LocalInferenceHandler {
     pub async fn handle_chat_completion(
         &self,
         request: &ChatCompletionRequest,
+        tools: Option<&[crate::api::openai::types::Tool]>,
     ) -> anyhow::Result<ChatCompletionResponse> {
         let template = self.get_chat_template().await;
         let (deploy_params, context_length) = {
@@ -132,7 +244,7 @@ impl LocalInferenceHandler {
             (manager.get_deploy_params(), manager.active_context_length())
         };
         let params =
-            Self::request_to_generate_params(request, &template, &deploy_params, context_length);
+            Self::request_to_generate_params(request, &template, &deploy_params, context_length, tools);
         let model_name = self
             .loaded_model_name()
             .await
@@ -162,6 +274,7 @@ impl LocalInferenceHandler {
     pub async fn stream_chat_chunks(
         &self,
         request: &ChatCompletionRequest,
+        tools: Option<&[crate::api::openai::types::Tool]>,
     ) -> anyhow::Result<mpsc::Receiver<ChatCompletionChunk>> {
         let template = self.get_chat_template().await;
         let (deploy_params, context_length) = {
@@ -169,7 +282,7 @@ impl LocalInferenceHandler {
             (manager.get_deploy_params(), manager.active_context_length())
         };
         let params =
-            Self::request_to_generate_params(request, &template, &deploy_params, context_length);
+            Self::request_to_generate_params(request, &template, &deploy_params, context_length, tools);
         let model_name = self
             .loaded_model_name()
             .await
@@ -329,6 +442,7 @@ impl LocalInferenceHandler {
         template: &ChatTemplate,
         deploy_params: &super::DeployParamsSnapshot,
         context_length: Option<u32>,
+        tools: Option<&[crate::api::openai::types::Tool]>,
     ) -> GenerateParams {
         // Konwertuj wiadomosci OpenAI na ChatMessage
         let chat_messages: Vec<ChatMessage> = request
@@ -409,6 +523,12 @@ impl LocalInferenceHandler {
             _ => defaults.repeat_penalty,
         };
 
+        // Prompt mode takes the tools off the request and describes them in
+        // prose; the schemas come back in here so the sampler can enforce what
+        // the prose only asks for.
+        let tools_present = tools.is_some_and(|t| !t.is_empty());
+        let tool_call_grammar = tools.and_then(tool_call_grammar);
+
         GenerateParams {
             prompt,
             // Precedence: what the caller asked for, else what the deploy
@@ -420,6 +540,15 @@ impl LocalInferenceHandler {
                 .max_tokens
                 .or(configured_max_tokens)
                 .unwrap_or_else(|| super::default_response_budget(context_length)),
+            // Tool calls get a grammar so a malformed one cannot be generated.
+            // Empty when the request carries no tools — ordinary chat samples
+            // freely, as it always has.
+            grammar: tool_call_grammar.unwrap_or_default(),
+            grammar_triggers: if tools_present {
+                vec![TOOL_CALL_TRIGGER.to_string()]
+            } else {
+                Vec::new()
+            },
             temperature: request.temperature.unwrap_or(defaults.temperature),
             top_p: request.top_p.unwrap_or(defaults.top_p),
             top_k: defaults.top_k,

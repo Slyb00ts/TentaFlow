@@ -728,7 +728,7 @@ impl ModelRuntimeExecutor {
                 BackendHandle::Embedded { .. } => {
                     let rx = self
                         .local_inference
-                        .stream_chat_chunks(&request)
+                        .stream_chat_chunks(&request, request.tools.as_deref())
                         .await
                         .map_err(|e| ExecutorError::Internal(e.to_string()))?;
                     let stream = futures::stream::unfold(rx, |mut rx| async move {
@@ -1284,7 +1284,7 @@ impl ModelRuntimeExecutor {
             } => match handle {
                 BackendHandle::Embedded { .. } => self
                     .local_inference
-                    .handle_chat_completion(&request)
+                    .handle_chat_completion(&request, prompt_tools.as_deref())
                     .await
                     .map_err(|e| ExecutorError::Internal(e.to_string())),
                 BackendHandle::Http(client) => client

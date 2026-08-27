@@ -145,6 +145,10 @@ pub struct GenRequest {
     pub sampling: SamplingParams,
     pub max_tokens: u32,
     pub stop_sequences: Vec<String>,
+    /// Optional grammar that constrains generation once its trigger appears.
+    /// `None` samples freely, which is what every caller did before tool calls
+    /// needed a shape the model could not miss.
+    pub grammar: Option<crate::llama::GrammarSpec>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1495,12 +1499,14 @@ fn start_job(
     let vocab = unsafe { sys::llama_model_get_vocab(model) };
     let n_vocab = unsafe { sys::llama_vocab_n_tokens(vocab) };
     let sampler = match build_sampler_chain(
+        vocab,
         n_vocab,
         request.sampling.repeat_penalty,
         request.sampling.top_k,
         request.sampling.top_p,
         request.sampling.temperature,
         request.sampling.seed,
+        request.grammar.as_ref(),
     ) {
         Ok(s) => s,
         Err(e) => {

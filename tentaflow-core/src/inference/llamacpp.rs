@@ -231,6 +231,16 @@ impl LlamaCppEngine {
             },
             max_tokens: params.max_tokens,
             stop_sequences: params.stop_sequences.clone(),
+            // A grammar without a trigger would constrain the whole answer,
+            // prose included; both must be present for it to mean "tool calls
+            // only".
+            grammar: (!params.grammar.is_empty() && !params.grammar_triggers.is_empty()).then(
+                || tentaflow_wrappers::llama::GrammarSpec {
+                    grammar: params.grammar.clone(),
+                    root: "root".to_string(),
+                    triggers: params.grammar_triggers.clone(),
+                },
+            ),
         }
     }
 
