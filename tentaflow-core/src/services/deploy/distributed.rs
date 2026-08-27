@@ -266,6 +266,18 @@ fn sglang_mp_engine_args(engine_id: &str) -> Vec<String> {
         "glm47",
         "--max-running-requests",
         "2",
+        // The NVFP4 checkpoint ships the MTP/NextN module (layer 45 next to the
+        // 45 trunk layers: eh_proj/enorm/hnorm/shared_head), so NEXTN reuses the
+        // target weights instead of loading a second draft model. 5/1/6 is the
+        // vendor low-latency recipe; DSA implements target_verify/draft_extend.
+        "--speculative-algorithm",
+        "NEXTN",
+        "--speculative-num-steps",
+        "5",
+        "--speculative-eagle-topk",
+        "1",
+        "--speculative-num-draft-tokens",
+        "6",
     ]
     .into_iter()
     .map(String::from)
@@ -1662,6 +1674,12 @@ mod tests {
         // `glm` (4.5 format) fails SILENTLY here: it eats the call and returns
         // empty content with tool_calls: null.
         assert!(cmd.contains("'--tool-call-parser' 'glm47'"));
+        // NEXTN reuses the checkpoint's own MTP module, so no draft model path.
+        assert!(cmd.contains("'--speculative-algorithm' 'NEXTN'"));
+        assert!(cmd.contains("'--speculative-num-steps' '5'"));
+        assert!(cmd.contains("'--speculative-eagle-topk' '1'"));
+        assert!(cmd.contains("'--speculative-num-draft-tokens' '6'"));
+        assert!(!cmd.contains("--speculative-draft-model-path"));
     }
 
     #[test]

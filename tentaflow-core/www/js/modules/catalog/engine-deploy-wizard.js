@@ -1892,7 +1892,7 @@ function renderAdvancedManualControls(adv, rec) {
       ${isLcpp ? '' : `
       <div class="adv-form-row">
         <label><span>${escapeHtml(tAdv('mem_label'))} ${lockMark('gpu_memory_utilization')}</span><span class="v" id="edw-adv-mem-val">${(memUtil * 100).toFixed(0)}%</span></label>
-        <input type="range" class="adv-range" id="edw-adv-mem" min="0.15" max="0.9" step="0.05" value="${memUtil}">
+        <input type="range" class="adv-range" id="edw-adv-mem" min="0.15" max="0.95" step="0.05" value="${memUtil}">
         <div class="adv-hint">${escapeHtml(tAdv('mem_hint'))}</div>
         ${memAdjust}
       </div>`}
