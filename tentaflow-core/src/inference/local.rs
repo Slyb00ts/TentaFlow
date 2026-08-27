@@ -570,8 +570,27 @@ impl LocalInferenceHandler {
         // Prompt mode takes the tools off the request and describes them in
         // prose; the schemas come back in here so the sampler can enforce what
         // the prose only asks for.
-        let tools_present = tools.is_some_and(|t| !t.is_empty());
-        let tool_call_grammar = tools.and_then(tool_call_grammar);
+        // OFF unless the deploy asks for it. The grammar works — llama.cpp
+        // compiles it and it contains the right rules — but the LAZY trigger
+        // semantics are not understood well enough yet: whatever the trigger
+        // pattern captures, llama.cpp reports "Unexpected empty grammar stack
+        // after accepting piece: <tool_call>" and answers it with a C++
+        // exception that TERMINATES THE PROCESS. Three runs died that way.
+        //
+        // A feature that kills the server when it misfires does not belong on
+        // by default, whatever it fixes when it works. The parser stays the
+        // working defence until the trigger semantics are pinned down.
+        let grammar_enabled = deploy_params
+            .llamacpp
+            .get("tool_call_grammar")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let tools_present = grammar_enabled && tools.is_some_and(|t| !t.is_empty());
+        let tool_call_grammar = if grammar_enabled {
+            tools.and_then(tool_call_grammar)
+        } else {
+            None
+        };
 
         GenerateParams {
             prompt,

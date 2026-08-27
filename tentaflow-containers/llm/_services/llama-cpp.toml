@@ -78,6 +78,14 @@ LLAMA_BUILD_PACKAGES = "libvulkan-dev glslc"
 LLAMA_RUNTIME_PACKAGES = "libvulkan1 mesa-vulkan-drivers"
 
 [[parameter]]
+key = "tool_call_grammar"
+label_pl = "Wymuszaj ksztalt wywolan narzedzi (eksperymentalne)"
+label_en = "Constrain tool calls with a grammar (experimental)"
+kind = "bool"
+default = false
+bindings = [ { when = "native_embedded", type = "llamacpp_field", field = "tool_call_grammar" } ]
+
+[[parameter]]
 key = "ctx_size"
 label_pl = "Okno kontekstu na slot (0 = pelny kontekst modelu)"
 label_en = "Context window per slot (0 = the model's full context)"
