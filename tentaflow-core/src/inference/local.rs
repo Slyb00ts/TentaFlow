@@ -107,7 +107,17 @@ mod grammar_tests {
 
         let grammar = tool_call_grammar(&tools).expect("llama.cpp musi skompilowac schemat");
 
-        assert!(grammar.contains("root"), "brak reguly root: {grammar}");
+        assert!(grammar.contains("root ::="), "brak reguly root: {grammar}");
+        // The trigger is fed into the grammar when it fires; a root that does
+        // not accept it empties the stack and llama.cpp terminates the process.
+        assert!(
+            grammar.starts_with("root ::= \"<tool_call>\""),
+            "root musi zaczynac sie wyzwalaczem: {grammar}"
+        );
+        assert!(
+            grammar.contains("</tool_call>"),
+            "domkniecie musi byc w gramatyce: {grammar}"
+        );
         // Both tool names must survive into the grammar, or one of them became
         // unreachable for the model.
         assert!(grammar.contains("search_web"), "brak search_web: {grammar}");
@@ -216,13 +226,25 @@ fn tool_call_grammar(tools: &[crate::api::openai::types::Tool]) -> Option<String
         .collect();
 
     let schema = serde_json::json!({ "oneOf": variants });
-    match tentaflow_wrappers::llama::json_schema_to_grammar(&schema) {
-        Ok(grammar) => Some(grammar),
+    let body = match tentaflow_wrappers::llama::json_schema_to_grammar(&schema) {
+        Ok(grammar) => grammar,
         Err(e) => {
             warn!("tool-call grammar rejected by llama.cpp, sampling unconstrained: {e}");
-            None
+            return None;
         }
-    }
+    };
+
+    // The trigger text is fed INTO the grammar once it fires, so the root has
+    // to accept it. A grammar that starts at the JSON leaves the stack empty on
+    // `<tool_call>` and llama.cpp raises a C++ exception that terminates the
+    // process — this cost a Core crash mid-run to learn.
+    //
+    // Wrapping also lets the closing tag be part of the constraint, so the
+    // block cannot be left unterminated the way models kept leaving it.
+    let body = body.replacen("root ::=", "tool-json ::=", 1);
+    Some(format!(
+        "root ::= \"{TOOL_CALL_TRIGGER}\" tool-json \"</tool_call>\"\n{body}"
+    ))
 }
 
 impl LocalInferenceHandler {
