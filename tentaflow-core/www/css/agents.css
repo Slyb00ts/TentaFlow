@@ -1366,3 +1366,79 @@
   }
 
 }
+
+/* =============================================================================
+   A02-A05 typography and grid contract (mockups/agenci-20260822)
+   ========================================================================== */
+
+/* Both mockup sets reserve shouting caps for SECTION TITLES and set field
+   labels as words. The shared tf-input label is uppercase app-wide, so the
+   detail view — the only surface the redesign covers — restates it locally
+   rather than reflowing every other screen. */
+#agents-detail-view .tf-input-group .tf-label {
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: normal;
+  text-transform: none;
+  color: var(--text-2);
+}
+
+/* The model row and the remaining limits are three-up in A02. A fixed track
+   keeps a two-field row at a third of the width each — stretching the pair to
+   half the card each is what made the timeout box read as a long text field. */
+.agents-model-grid,
+.agents-limits {
+  grid-template-columns: repeat(3, 1fr);
+}
+
+/* A02 keeps the identity line and the action row on the header's first rows;
+   centring pushed the buttons down against the badge rows. */
+#agents-detail-view .tf-detail-header {
+  align-items: flex-start;
+}
+
+#agents-detail-view .tf-detail-header .d-actions {
+  margin-top: 2px;
+}
+
+/* The slug + timestamps line is one line in the mockup; wrapping it shoved the
+   badge rows down and collided with the action row. */
+#agents-detail-view .tf-detail-header .d-sub {
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* A01 cards let a long agent name use a second line — clipping it to one line
+   left six of the seeded agents with an unreadable title. */
+.agent-card-name {
+  align-items: flex-start;
+}
+
+.agent-card-name-text {
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
+/* `mono` on a field is about the VALUE the operator types (a flow id), not the
+   label and hint around it — those stay in the interface face. */
+#agents-detail-view tf-input.mono .tf-label,
+#agents-detail-view tf-input.mono .tf-hint,
+#agents-detail-view tf-input.mono + .agents-field-hint {
+  font-family: 'Manrope', -apple-system, system-ui, sans-serif;
+}
+
+/* A02 draws the unfilled part of a slider track as a visible light rail; the
+   app default sinks it into the card so only the filled segment reads. */
+#agents-detail-view .agents-slider-row .tf-slider {
+  background: linear-gradient(
+    to right,
+    var(--tf-accent-1) 0%,
+    var(--tf-accent-1) var(--tf-slider-pct, 0%),
+    var(--tf-border-hover) var(--tf-slider-pct, 0%),
+    var(--tf-border-hover) 100%
+  );
+}

@@ -13,7 +13,7 @@
 // tf-* components only.
 
 import { ApiBinary } from '/js/protocol/api-binary-shim.js';
-import { byId, escapeHtml, escapeAttr, toast } from '/js/utils.js';
+import { byId, escapeHtml, escapeAttr, toast, fmtCompact } from '/js/utils.js';
 import { I18n } from '/js/i18n.js';
 import { ModelModalities } from '/js/modules/flows-builder/model-modalities.js';
 import { TfWindow } from '/js/components/tf-window.js';
@@ -546,7 +546,7 @@ function agentCardHtml(agent) {
         <div class="agent-card-heading">
           <div class="agent-card-name">
             <span class="agent-card-name-text">${escapeHtml(agent.display_name || agent.name)}</span>
-            <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
+            <tf-chip variant="outline" status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
           </div>
           <div class="agent-card-role">${escapeHtml(agent.name)}</div>
         </div>
@@ -559,7 +559,7 @@ function agentCardHtml(agent) {
         <span>${sprite('brain')}${escapeHtml(agent.model || t('model_inherited'))}</span>
       </div>
       <div class="agent-card-foot">
-        ${agent.routable ? `<tf-chip status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
+        ${agent.routable ? `<tf-chip variant="outline" status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
         ${(agent.max_subagents ?? 0) > 0 ? `<tf-chip status="accent">${escapeHtml(t('hdr_subagents', { count: agent.max_subagents }))}</tf-chip>` : ''}
       </div>
     </div>
@@ -899,28 +899,28 @@ function renderDetailHeader() {
   const toolsCount = d.selectedTools.size;
   const skillsCount = d.skillNames.size + d.skillTags.size;
   const badges = [
-    `<tf-chip status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(agent.model || t('model_inherited'))}</tf-chip>`,
-    `<tf-chip>${escapeHtml(t('card_tools_count', { count: toolsCount }))}</tf-chip>`,
-    `<tf-chip>${escapeHtml(t('card_skills_count', { count: skillsCount }))}</tf-chip>`,
-    `<tf-chip>${escapeHtml(t('hdr_loop_limits', { iterations: agent.max_iterations ?? 25, timeout: agent.timeout_secs ?? 600 }))}</tf-chip>`,
+    `<tf-chip variant="outline" status="accent">${escapeHtml(t('label_model'))}: ${escapeHtml(agent.model || t('model_inherited'))}</tf-chip>`,
+    `<tf-chip variant="outline" status="neutral">${escapeHtml(t('card_tools_count', { count: toolsCount }))}</tf-chip>`,
+    `<tf-chip variant="outline" status="neutral">${escapeHtml(t('card_skills_count', { count: skillsCount }))}</tf-chip>`,
   ];
   if ((agent.max_subagents ?? 0) > 0) {
-    badges.push(`<tf-chip>${escapeHtml(t('hdr_subagents', { count: agent.max_subagents, depth: agent.max_spawn_depth ?? 1 }))}</tf-chip>`);
+    badges.push(`<tf-chip variant="outline" status="neutral">${escapeHtml(t('hdr_subagents', { count: agent.max_subagents, depth: agent.max_spawn_depth ?? 1 }))}</tf-chip>`);
   }
+  badges.push(`<tf-chip variant="outline" status="neutral">${escapeHtml(t('hdr_loop_limits', { iterations: agent.max_iterations ?? 25, timeout: agent.timeout_secs ?? 600 }))}</tf-chip>`);
   const adminActions = state.isAdmin ? `
     <tf-button variant="primary" icon="play" data-hdr-test>${escapeHtml(t('hdr_run_test'))}</tf-button>
-    <tf-button variant="ghost" icon="copy" data-hdr-duplicate>${escapeHtml(t('action_duplicate'))}</tf-button>
-    <tf-button variant="ghost" icon="${agent.is_enabled ? 'ban' : 'check'}" data-hdr-toggle>${escapeHtml(t(agent.is_enabled ? 'disable_agent' : 'enable_agent'))}</tf-button>
+    <tf-button variant="secondary" icon="copy" data-hdr-duplicate>${escapeHtml(t('action_duplicate'))}</tf-button>
+    <tf-button variant="secondary" icon="${agent.is_enabled ? 'ban' : 'check'}" data-hdr-toggle>${escapeHtml(t(agent.is_enabled ? 'disable_agent' : 'enable_agent'))}</tf-button>
     <tf-button variant="danger" icon="trash" data-hdr-delete>${escapeHtml(t('action_delete'))}</tf-button>
   ` : '';
   host.innerHTML = `
     <div class="tf-detail-header">
-      <div class="big-ico">${sprite(agentIcon(agent.name))}</div>
+      <div class="big-ico">${sprite('bot')}</div>
       <div class="d-meta">
         <div class="d-name">
           ${escapeHtml(agent.display_name || agent.name)}
-          <tf-chip status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
-          ${agent.routable ? `<tf-chip status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
+          <tf-chip variant="outline" status="${agent.is_enabled ? 'ok' : 'warn'}" dot>${escapeHtml(t(agent.is_enabled ? 'enabled_yes' : 'enabled_no'))}</tf-chip>
+          ${agent.routable ? `<tf-chip variant="outline" status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
         </div>
         <div class="d-sub mono">${escapeHtml([
           agent.name,
@@ -1237,20 +1237,20 @@ function renderConfigTab(body) {
         <tf-input data-cfg="display_name" label="${escapeAttr(t('label_display_name'))}"
           value="${escapeAttr(c.display_name)}"></tf-input>
       </div>
-      <tf-textarea data-cfg="description" label="${escapeAttr(t('label_description'))}"
+      <tf-textarea data-cfg="description" rows="3" label="${escapeAttr(t('label_description'))}"
         rows="2" hint="${escapeAttr(t('hint_description'))}"
         value="${escapeAttr(c.description)}"></tf-textarea>
     `)}
 
     ${sectionCard('terminal', 'section_prompt', `
-      <tf-textarea data-cfg="system_prompt" class="mono" rows="9" hint="${escapeAttr(t('hint_system_prompt'))}"
+      <tf-textarea data-cfg="system_prompt" class="mono" rows="9"
         value="${escapeAttr(c.system_prompt)}"></tf-textarea>
       <div class="ag-prompt-foot">
         <span class="ag-prompt-count" data-prompt-count></span>
         <span data-prompt-vars></span>
         <span class="ag-prompt-spacer"></span>
         ${state.isAdmin ? `
-          <tf-button variant="ghost" size="sm" icon="sparkle" data-prompt-assist>${escapeHtml(t('prompt_improve_ai'))}</tf-button>
+          <tf-button variant="secondary" size="sm" icon="sparkle" data-prompt-assist>${escapeHtml(t('prompt_improve_ai'))}</tf-button>
           <tf-button variant="ghost" size="sm" icon="refresh" data-prompt-restore>${escapeHtml(t('prompt_restore'))}</tf-button>
         ` : ''}
       </div>
@@ -1310,8 +1310,9 @@ function renderConfigTab(body) {
           <div class="agents-field-hint">${escapeHtml(t('enabled_desc'))}</div>
         </div>
       </div>
-      <tf-input data-cfg="flow_id" label="${escapeAttr(t('label_flow_id'))}"
+      <tf-input data-cfg="flow_id" class="mono" label="${escapeAttr(t('label_flow_id'))}"
         value="${escapeAttr(c.flow_id || '')}"
+        placeholder="${escapeAttr(t('ph_flow_id'))}"
         hint="${escapeAttr(t('hint_flow_id'))}"></tf-input>
     `)}
   `;
@@ -1752,9 +1753,9 @@ function updateToolsSummary() {
       core: coreCount,
     }))}
     ${shown.map((name) => name.endsWith('.*')
-      ? `<tf-chip status="accent" class="mono">${escapeHtml(name)}</tf-chip>`
-      : `<tf-chip status="neutral" class="mono">${escapeHtml(name)}</tf-chip>`).join('')}
-    ${rest > 0 ? `<tf-chip status="neutral" class="mono">${escapeHtml(t('tools_summary_more', { count: rest }))}</tf-chip>` : ''}
+      ? `<tf-chip mono status="accent">${escapeHtml(name)}</tf-chip>`
+      : `<tf-chip mono status="neutral">${escapeHtml(name)}</tf-chip>`).join('')}
+    ${rest > 0 ? `<tf-chip mono status="neutral">${escapeHtml(t('tools_summary_more', { count: rest }))}</tf-chip>` : ''}
   `;
 }
 
@@ -2302,7 +2303,7 @@ function renderAgentRunsTable() {
       <tf-column key="run" label="${escapeAttr(t('runs_col_id'))}"></tf-column>
       <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
       <tf-column key="started" label="${escapeAttr(t('runs_col_started'))}" sortable></tf-column>
-      <tf-column key="duration" label="${escapeAttr(t('runs_col_duration'))}"></tf-column>
+      <tf-column key="duration" label="${escapeAttr(t('runs_col_duration'))}" nowrap></tf-column>
       <tf-column key="iterations" label="${escapeAttr(t('runs_col_iterations'))}" sortable></tf-column>
       <tf-column key="tokens" label="${escapeAttr(t('runs_col_tokens'))}" renderer="num" sortable></tf-column>
       <tf-column key="prompt" label="${escapeAttr(t('runs_col_prompt'))}" renderer="html" fill></tf-column>
@@ -2314,11 +2315,11 @@ function renderAgentRunsTable() {
     _id: r.id,
     _status: r.status,
     run: shortId(r.id),
-    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
+    status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status), dot: true },
     started: formatTimestamp(r.started_at || r.created_at),
     duration: runDuration(r),
     iterations: iterationsLabel(r),
-    tokens: r.total_tokens ?? 0,
+    tokens: { value: r.total_tokens ?? 0, display: fmtCompact(r.total_tokens ?? 0, I18n.getLanguage()) },
     prompt: runPromptCell(r),
     initiator: runInitiator(r),
   }));
@@ -2707,7 +2708,7 @@ function runDuration(run) {
   const secs = Math.round((end - start) / 1000);
   if (secs < 60) return `${secs} s`;
   const mins = Math.floor(secs / 60);
-  return `${mins} min ${String(secs % 60).padStart(2, '0')} s`;
+  return `${mins} m ${String(secs % 60).padStart(2, '0')} s`;
 }
 
 function sqliteTime(value) {
@@ -2765,7 +2766,7 @@ function renderRunsTable() {
       <tf-column key="agent" label="${escapeAttr(t('runs_col_agent'))}" renderer="html" sortable></tf-column>
       <tf-column key="status" label="${escapeAttr(t('runs_col_status'))}" renderer="chip"></tf-column>
       <tf-column key="started" label="${escapeAttr(t('runs_col_started'))}" sortable></tf-column>
-      <tf-column key="duration" label="${escapeAttr(t('runs_col_duration'))}"></tf-column>
+      <tf-column key="duration" label="${escapeAttr(t('runs_col_duration'))}" nowrap></tf-column>
       <tf-column key="iterations" label="${escapeAttr(t('runs_col_iterations'))}" renderer="num" sortable></tf-column>
       <tf-column key="tokens" label="${escapeAttr(t('runs_col_tokens'))}" renderer="num" sortable></tf-column>
       <tf-column key="prompt" label="${escapeAttr(t('runs_col_prompt'))}" renderer="html" fill></tf-column>
@@ -2780,11 +2781,11 @@ function renderRunsTable() {
       _status: r.status,
       run: shortId(r.id),
       agent: twoLineCell(agent.title, agent.sub),
-      status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status) },
+      status: { status: RUN_STATUS_CHIP[r.status] || 'info', label: runStatusLabel(r.status), dot: true },
       started: formatTimestamp(r.started_at || r.created_at),
       duration: runDuration(r),
       iterations: r.iterations ?? 0,
-      tokens: r.total_tokens ?? 0,
+      tokens: { value: r.total_tokens ?? 0, display: fmtCompact(r.total_tokens ?? 0, I18n.getLanguage()) },
       prompt: runPromptCell(r),
       initiator: runInitiator(r),
     };

@@ -1027,7 +1027,12 @@ tf-tabs {
   background: var(--tf-bg-card);
   border: 1px solid var(--tf-border);
   border-radius: var(--tf-radius);
-  overflow: hidden;
+  /* A table wider than its card scrolls inside the card — `overflow: hidden`
+     clipped the trailing columns (the row-actions cell among them) with no way
+     to reach them, which reads as a missing feature rather than a full table.
+     Matches what the flush variant already does. */
+  overflow-x: auto;
+  overflow-y: hidden;
 }
 .tf-table {
   width: 100%;
@@ -1087,6 +1092,12 @@ tf-tabs {
 .tf-table tbody tr.selected td { color: var(--tf-text); }
 .tf-table td.tf-table__actions-cell {
   text-align: right;
+  white-space: nowrap;
+}
+/* A cell that must stay one line high — a duration or an initiator that would
+   otherwise wrap and leave the rows at uneven heights. */
+.tf-table th.nowrap,
+.tf-table td.nowrap {
   white-space: nowrap;
 }
 .tf-table td.num {
