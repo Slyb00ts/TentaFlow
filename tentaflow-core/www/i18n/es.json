@@ -6048,5 +6048,13 @@
     "turn_unknown": "sin turno",
     "payload_unreadable": "No se pudo leer el contenido almacenado del evento.",
     "correlation_filter": "Correlación: {id}"
+  },
+  "composer": {
+    "attach": "Adjuntar archivo",
+    "voice": "Dictar",
+    "send": "Enviar",
+    "hint_send": "enviar",
+    "hint_newline": "nueva línea",
+    "placeholder": "Escribe un mensaje…"
   }
 }

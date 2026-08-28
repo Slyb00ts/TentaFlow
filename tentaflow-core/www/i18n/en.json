@@ -7249,5 +7249,13 @@
     "turn_unknown": "no turn",
     "payload_unreadable": "The stored event body could not be read.",
     "correlation_filter": "Correlation: {id}"
+  },
+  "composer": {
+    "attach": "Attach a file",
+    "voice": "Dictate",
+    "send": "Send",
+    "hint_send": "send",
+    "hint_newline": "new line",
+    "placeholder": "Write a message…"
   }
 }

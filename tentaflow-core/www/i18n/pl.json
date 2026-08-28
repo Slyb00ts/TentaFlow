@@ -7249,5 +7249,13 @@
     "turn_unknown": "bez tury",
     "payload_unreadable": "Nie udało się odczytać zapisanej treści zdarzenia.",
     "correlation_filter": "Korelacja: {id}"
+  },
+  "composer": {
+    "attach": "Załącz plik",
+    "voice": "Dyktowanie",
+    "send": "Wyślij",
+    "hint_send": "wyślij",
+    "hint_newline": "nowa linia",
+    "placeholder": "Napisz wiadomość…"
   }
 }

@@ -1442,3 +1442,16 @@
     var(--tf-border-hover) 100%
   );
 }
+
+/* The run tables carry nine columns plus row actions; the default prompt clamp
+   is wide enough to push the actions column out of the card at 1440px. */
+#agent-runs-table,
+#runs-table {
+  --tf-cell-clamp: 260px;
+}
+
+/* A01 sits the search in the title row; it needs a fixed track there or the
+   flex actions row lets it collapse to its placeholder. */
+#agents-page-header .actions #agents-search {
+  width: 240px;
+}

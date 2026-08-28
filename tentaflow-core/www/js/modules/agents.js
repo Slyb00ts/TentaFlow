@@ -235,6 +235,7 @@ const AgentsScreen = {
           <div class="sub" id="agents-sub"></div>
         </div>
         <div class="actions">
+          <tf-searchbox id="agents-search" placeholder="${escapeAttr(t('search_placeholder'))}" debounce="200"></tf-searchbox>
           <tf-button variant="ghost" icon="download" id="runs-export" hidden>${escapeHtml(t('runs_export_csv'))}</tf-button>
           <tf-button variant="ghost" icon="refresh" id="agents-refresh">${escapeHtml(t('refresh'))}</tf-button>
           <tf-button variant="ghost" icon="users" id="agents-templates">${escapeHtml(t('team_templates'))}</tf-button>
@@ -250,7 +251,6 @@ const AgentsScreen = {
       <div class="agents-top-panel" data-top-panel="agents">
         <div id="agents-list-view">
           <div class="tf-toolbar agents-toolbar-cards">
-            <tf-searchbox id="agents-search" placeholder="${escapeAttr(t('search_placeholder'))}" debounce="200"></tf-searchbox>
             <span class="agents-filter-label">${sprite('filter')} ${escapeHtml(t('filter_label'))}</span>
             <tf-filter-chips id="agents-filter-enabled" mode="single"></tf-filter-chips>
           </div>
@@ -560,7 +560,7 @@ function agentCardHtml(agent) {
       </div>
       <div class="agent-card-foot">
         ${agent.routable ? `<tf-chip variant="outline" status="info">${escapeHtml(t('chip_routable'))}</tf-chip>` : ''}
-        ${(agent.max_subagents ?? 0) > 0 ? `<tf-chip status="accent">${escapeHtml(t('hdr_subagents', { count: agent.max_subagents }))}</tf-chip>` : ''}
+        ${(agent.max_subagents ?? 0) > 0 ? `<tf-chip variant="outline" status="accent">${escapeHtml(t('hdr_subagents', { count: agent.max_subagents }))}</tf-chip>` : ''}
       </div>
     </div>
   `;
@@ -2602,6 +2602,7 @@ function switchTopTab(tabId) {
   const title = byId('agents-title');
   if (title) title.textContent = runsTab ? t('runs_title') : t('title');
   byId('runs-export')?.toggleAttribute('hidden', !runsTab);
+  byId('agents-search')?.toggleAttribute('hidden', runsTab);
   byId('agents-templates')?.toggleAttribute('hidden', runsTab || !state.isAdmin);
   byId('agents-new')?.toggleAttribute('hidden', runsTab || !state.isAdmin);
   updateSubLine();

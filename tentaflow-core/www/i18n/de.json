@@ -6048,5 +6048,13 @@
     "turn_unknown": "ohne Zug",
     "payload_unreadable": "Der gespeicherte Ereignisinhalt konnte nicht gelesen werden.",
     "correlation_filter": "Korrelation: {id}"
+  },
+  "composer": {
+    "attach": "Datei anhängen",
+    "voice": "Diktieren",
+    "send": "Senden",
+    "hint_send": "senden",
+    "hint_newline": "neue Zeile",
+    "placeholder": "Nachricht schreiben…"
   }
 }

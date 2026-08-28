@@ -6048,5 +6048,13 @@
     "turn_unknown": "sans tour",
     "payload_unreadable": "Le contenu enregistré de l'événement n'a pas pu être lu.",
     "correlation_filter": "Corrélation : {id}"
+  },
+  "composer": {
+    "attach": "Joindre un fichier",
+    "voice": "Dicter",
+    "send": "Envoyer",
+    "hint_send": "envoyer",
+    "hint_newline": "nouvelle ligne",
+    "placeholder": "Écrivez un message…"
   }
 }
