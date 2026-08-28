@@ -2222,7 +2222,7 @@ async function renderAgentRunsTab(body) {
       </tf-select>
       <tf-searchbox id="agent-runs-search" placeholder="${escapeAttr(t('runs_search_placeholder'))}" debounce="200"></tf-searchbox>
       <span class="tf-toolbar-spacer"></span>
-      <tf-button variant="ghost" icon="refresh" id="agent-runs-refresh">${escapeHtml(t('refresh'))}</tf-button>
+      <tf-button variant="secondary" icon="refresh" id="agent-runs-refresh">${escapeHtml(t('refresh'))}</tf-button>
     </div>
     <div id="agent-runs-table-host" class="agents-runs-host"></div>
     <div id="agent-runs-table-footer" class="agents-table-footer"></div>
@@ -2808,7 +2808,7 @@ function renderTableFooter(hostId, shown, total) {
 
 function buildRunRowActions(row, scope = 'global') {
   const btn = document.createElement('tf-button');
-  btn.setAttribute('variant', 'ghost');
+  btn.setAttribute('variant', 'secondary');
   btn.setAttribute('size', 'sm');
   if (TERMINAL_RUN_STATUSES.includes(row._status)) {
     btn.textContent = t('action_details');
@@ -2817,7 +2817,7 @@ function buildRunRowActions(row, scope = 'global') {
       : openRunDetail(row._id)));
     return btn;
   }
-  btn.setAttribute('variant', 'danger');
+  btn.setAttribute('variant', 'danger-outline');
   btn.textContent = t('action_cancel');
   btn.addEventListener('click', () => cancelRun(row._id, scope));
   return btn;
