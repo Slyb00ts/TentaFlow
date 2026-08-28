@@ -19,6 +19,16 @@
 # `layers_to_capture` is compared against the loop index BEFORE the layer runs,
 # so capturing "the output of layer N" means testing for N+1.
 #
+# The second edit fixes the capture site itself. `Glm5NextModel` still uses the
+# legacy inline form (`hidden_states + residual`), unlike `deepseek_v2`, which
+# has moved to an AuxHiddenStatePacker handed into the layer. That inline form
+# assumes `residual` is always set -- false for a hybrid stack, where a layer
+# that folded the residual in leaves it None, and capturing right after one
+# crashes with `unsupported operand type(s) for +: 'Tensor' and 'NoneType'`.
+# When residual is None the pre-layer hidden state ALREADY IS the full residual
+# stream; this is the same case the model handles explicitly at its final norm
+# (`self.norm(hidden_states)` vs `self.norm(hidden_states, residual)`).
+#
 # Anchored on the eagle3 setter so the method lands on the right class.
 # Idempotent; a missing or ambiguous anchor is a hard error.
 import sys
@@ -46,6 +56,34 @@ ADDITION = """    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
 """
 
 
+CAPTURE_STOCK = """                if i in self.layers_to_capture:
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(
+                            hidden_states + residual, dim=0
+                        )
+                        aux_hidden_states.append(aux_hidden_state)
+                    else:
+                        aux_hidden_states.append(hidden_states + residual)
+"""
+
+CAPTURE_FIXED = """                if i in self.layers_to_capture:
+                    # A hybrid stack leaves `residual` unset wherever a layer
+                    # folded it in, so the pre-layer hidden state already IS the
+                    # full residual stream -- the same case handled explicitly
+                    # at this model's final norm.
+                    captured = (
+                        hidden_states if residual is None else hidden_states + residual
+                    )
+                    if self.enable_a2a_moe and i > self.first_k_dense_replace:
+                        aux_hidden_state = get_parallel().attn_tp_group.all_gather(
+                            captured, dim=0
+                        )
+                        aux_hidden_states.append(aux_hidden_state)
+                    else:
+                        aux_hidden_states.append(captured)
+"""
+
+
 def _sglang_root() -> Path:
     """Katalog pakietu `sglang`, rozpoznawany po ZAWARTOSCI, nie po nazwie."""
     if len(sys.argv) > 1:
@@ -64,17 +102,33 @@ def _sglang_root() -> Path:
 root = _sglang_root()
 path = root / MODEL_REL
 text = path.read_text()
+notes = []
 
 if "set_dflash_layers_to_capture" in text:
-    print(f"GLM-5.3 DFLASH capture hook -> {path}\n  = juz nalozone")
-    raise SystemExit(0)
+    notes.append("= hook juz obecny")
+else:
+    hits = text.count(ANCHOR)
+    if hits != 1:
+        raise SystemExit(
+            f"oczekiwano 1 wystapienia settera eagle3 w {path}, znaleziono {hits}\n"
+            f"upstream przesunal ten kod — przenies latke i zaktualizuj obraz bazowy"
+        )
+    text = text.replace(ANCHOR, ADDITION + ANCHOR, 1)
+    notes.append("* set_dflash_layers_to_capture dodane")
 
-occurrences = text.count(ANCHOR)
-if occurrences != 1:
-    raise SystemExit(
-        f"oczekiwano 1 wystapienia settera eagle3 w {path}, znaleziono {occurrences}\n"
-        f"upstream przesunal ten kod — przenies latke i zaktualizuj obraz bazowy"
-    )
+if CAPTURE_FIXED in text:
+    notes.append("= przechwytywanie juz odporne na pusty residual")
+else:
+    hits = text.count(CAPTURE_STOCK)
+    if hits != 1:
+        raise SystemExit(
+            f"oczekiwano 1 wystapienia miejsca przechwytywania w {path}, znaleziono {hits}\n"
+            f"upstream przesunal ten kod — przenies latke i zaktualizuj obraz bazowy"
+        )
+    text = text.replace(CAPTURE_STOCK, CAPTURE_FIXED, 1)
+    notes.append("* przechwytywanie odporne na pusty residual (hybryda KDA/DSA)")
 
-path.write_text(text.replace(ANCHOR, ADDITION + ANCHOR, 1))
-print(f"GLM-5.3 DFLASH capture hook -> {path}\n  * set_dflash_layers_to_capture dodane")
+path.write_text(text)
+print(f"GLM-5.3 DFLASH capture hook -> {path}")
+for n in notes:
+    print(f"  {n}")
