@@ -297,6 +297,18 @@ fn execute_read_search_results_request(
                 user_id: req.user_id.clone(),
             },
         ) {
+            Ok(page) if is_navigation_page(&page.text) => {
+                // Read fine, carries nothing to read. A landing page returns its
+                // own menu, and taking the first N results meant a research
+                // finding held "Store Shop Mac iPad iPhone" — non-empty and
+                // worthless, which reads as success. Skipping lets the next
+                // candidate, usually the article the query was really about,
+                // take its place.
+                skipped.push(web_research::SkippedResult {
+                    url: result.url.clone(),
+                    reason: "navigation page, no readable content".to_string(),
+                });
+            }
             Ok(page) => pages.push(page),
             Err(e) => skipped.push(web_research::SkippedResult {
                 url: result.url.clone(),
@@ -313,6 +325,69 @@ fn execute_read_search_results_request(
             skipped,
         },
     ))
+}
+
+/// Whether extracted text is a navigation menu rather than content.
+///
+/// Menus are many very short lines — one or two words per link — while prose
+/// runs long and carries sentence punctuation. Averaging words per line
+/// separates the two cleanly and needs no tuning per site, unlike the extractor
+/// quality scores, which are on different scales for the static and browser
+/// paths and cannot be compared against one threshold.
+fn is_navigation_page(text: &str) -> bool {
+    let lines: Vec<&str> = text
+        .lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty())
+        .collect();
+    // Too little text to judge; let the caller decide on the content itself.
+    if lines.len() < 15 {
+        return false;
+    }
+    let words: usize = lines.iter().map(|l| l.split_whitespace().count()).sum();
+    let words_per_line = words as f32 / lines.len() as f32;
+    // Three is generous: a link label is one or two words, a sentence many more.
+    words_per_line < 3.0
+}
+
+#[cfg(test)]
+mod navigation_tests {
+    use super::is_navigation_page;
+
+    /// The exact shape a research finding came back holding: apple.com's own
+    /// menu, one link per line, reported as a successful read.
+    #[test]
+    fn a_menu_is_recognised() {
+        let menu = [
+            "Apple", "Store", "Shop", "Mac", "iPad", "iPhone", "Apple Watch",
+            "AirPods", "Accessories", "Find a Store", "Order Status", "Financing",
+            "Education", "Business", "Government", "Explore Mac", "MacBook Air",
+        ]
+        .join("\n");
+
+        assert!(is_navigation_page(&menu));
+    }
+
+    #[test]
+    fn prose_is_not_a_menu() {
+        let prose = (0..20)
+            .map(|i| {
+                format!("Zdanie numer {i} opisuje parametr techniczny urzadzenia i jego wartosc.")
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!is_navigation_page(&prose));
+    }
+
+    /// A short page is not judged: a specification table can be terse, and
+    /// rejecting it would throw away the very content worth reading.
+    #[test]
+    fn a_short_page_is_left_alone() {
+        let short = ["A", "B", "C"].join("\n");
+
+        assert!(!is_navigation_page(&short));
+    }
 }
 
 fn set_user_id(request: &mut WebResearchRequest, user_id: Option<&str>) {
