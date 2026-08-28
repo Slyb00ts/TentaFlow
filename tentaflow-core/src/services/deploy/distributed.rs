@@ -268,16 +268,22 @@ fn sglang_mp_engine_args(engine_id: &str) -> Vec<String> {
         "2",
         // The NVFP4 checkpoint ships the MTP/NextN module (layer 45 next to the
         // 45 trunk layers: eh_proj/enorm/hnorm/shared_head), so NEXTN reuses the
-        // target weights instead of loading a second draft model. 5/1/6 is the
-        // vendor low-latency recipe; DSA implements target_verify/draft_extend.
+        // target weights instead of loading a second draft model.
+        //
+        // 3/1/4, not the vendor's 5/1/6: DSA gathers `index_topk` (2048) KV
+        // entries PER VERIFIED POSITION, so a longer draft chain makes the
+        // verify pass proportionally more expensive here, and the extra
+        // acceptance does not pay for it. Measured on 2x DGX Spark, 6 runs each:
+        // 5/1/6 -> 21.4 tok/s (accept len 3.38), 3/1/4 -> 23.7 tok/s
+        // (accept len 2.58). Without speculation: 14.7 tok/s.
         "--speculative-algorithm",
         "NEXTN",
         "--speculative-num-steps",
-        "5",
+        "3",
         "--speculative-eagle-topk",
         "1",
         "--speculative-num-draft-tokens",
-        "6",
+        "4",
         // The draft's quantization defaults to `--quantization`, which is unset
         // here because the target auto-detects NVFP4 from the checkpoint. Left
         // unset the draft builds its MoE unquantized and the NVFP4-packed
@@ -1792,9 +1798,9 @@ mod tests {
         assert!(cmd.contains("'--tool-call-parser' 'glm47'"));
         // NEXTN reuses the checkpoint's own MTP module, so no draft model path.
         assert!(cmd.contains("'--speculative-algorithm' 'NEXTN'"));
-        assert!(cmd.contains("'--speculative-num-steps' '5'"));
+        assert!(cmd.contains("'--speculative-num-steps' '3'"));
         assert!(cmd.contains("'--speculative-eagle-topk' '1'"));
-        assert!(cmd.contains("'--speculative-num-draft-tokens' '6'"));
+        assert!(cmd.contains("'--speculative-num-draft-tokens' '4'"));
         assert!(!cmd.contains("--speculative-draft-model-path"));
         assert!(cmd.contains("'--speculative-draft-model-quantization' 'modelopt_fp4'"));
     }
