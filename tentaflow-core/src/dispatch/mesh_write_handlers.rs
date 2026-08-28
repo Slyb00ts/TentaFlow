@@ -2586,7 +2586,7 @@ async fn poll_node_readiness(
     let start = std::time::Instant::now();
     let mut last = String::from("brak odpowiedzi");
     while start.elapsed() < timeout {
-        let (container_running, gcs_up, ray_nodes, serve_ready) = probe_node_once(
+        let (container_running, gcs_up, ray_nodes, serve_ready, engine_error) = probe_node_once(
             ctx,
             qm,
             target_node,
@@ -2597,6 +2597,11 @@ async fn poll_node_readiness(
             expected_nodes,
         )
         .await;
+        // The engine process is gone. Waiting out the remaining timeout — hours,
+        // for a model this size — would only delay a failure that already happened.
+        if let Some(err) = engine_error {
+            return Err(format!("{target_node}: {err}"));
+        }
         let done = match phase {
             ReadyPhase::ContainerUp => container_running,
             ReadyPhase::GcsUp => gcs_up,
@@ -2631,7 +2636,7 @@ async fn probe_node_once(
     ray_port: u16,
     serve_port: u16,
     expected_nodes: u32,
-) -> (bool, bool, u32, bool) {
+) -> (bool, bool, u32, bool, Option<String>) {
     if target_node == local_id {
         let s = crate::services::deploy::distributed::probe_readiness(
             deployment_cluster_id,
@@ -2644,6 +2649,7 @@ async fn probe_node_once(
             s.ray_gcs_up,
             s.ray_nodes,
             s.serve_ready,
+            s.error,
         );
     }
     let cmd = MeshCommandType::DistributedReadiness {
@@ -2659,11 +2665,12 @@ async fn probe_node_once(
                 ray_gcs_up,
                 ray_nodes,
                 serve_ready,
-                ..
-            } => (container_running, ray_gcs_up, ray_nodes, serve_ready),
-            _ => (false, false, 0, false),
+                error,
+            } => (container_running, ray_gcs_up, ray_nodes, serve_ready, error),
+            _ => (false, false, 0, false, None),
         },
-        _ => (false, false, 0, false),
+        // A transient mesh error is "not ready yet", never "the engine died".
+        _ => (false, false, 0, false, None),
     }
 }
 

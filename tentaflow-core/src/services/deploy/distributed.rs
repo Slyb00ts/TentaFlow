@@ -1039,7 +1039,10 @@ pub fn build_member_config_json(spec: &DistributedDeploySpec) -> Result<String, 
 /// rekord w DB pozostaje wtedy `running`/stale; sprzatniecie stanu DB tego obcego
 /// deploymentu wymagaloby przekazania `db` do preflight — follow-up).
 #[cfg(feature = "docker")]
-async fn remove_all_distributed_containers(current_deployment_cluster_id: &str) {
+/// Removes every distributed container on this node and reports how many were
+/// actually torn down — the caller needs that to know whether it has to wait
+/// for the freed memory to come back.
+async fn remove_all_distributed_containers(current_deployment_cluster_id: &str) -> usize {
     let Ok(out) = tokio::process::Command::new("docker")
         .args([
             "ps",
@@ -1050,8 +1053,9 @@ async fn remove_all_distributed_containers(current_deployment_cluster_id: &str) 
         .output()
         .await
     else {
-        return;
+        return 0;
     };
+    let mut removed = 0usize;
     for id in String::from_utf8_lossy(&out.stdout).split_whitespace() {
         let other_id = tokio::process::Command::new("docker")
             .args([
@@ -1079,8 +1083,77 @@ async fn remove_all_distributed_containers(current_deployment_cluster_id: &str) 
             .args(["rm", "-f", id])
             .output()
             .await;
+        removed += 1;
     }
+    removed
 }
+
+/// Reclaimable memory on this host, in KiB.
+#[cfg(all(feature = "docker", target_os = "linux"))]
+fn mem_available_kib() -> Option<i64> {
+    let text = std::fs::read_to_string("/proc/meminfo").ok()?;
+    text.lines()
+        .find_map(|line| line.strip_prefix("MemAvailable:"))
+        .and_then(|rest| rest.split_whitespace().next())
+        .and_then(|kib| kib.parse().ok())
+}
+
+/// Waits until the memory freed by a container teardown has actually come back.
+///
+/// `docker rm -f` returns as soon as the container record is gone, but a process
+/// holding ~90 GB needs seconds longer for the kernel to reclaim its pages. An
+/// engine started inside that window measures the memory as still taken and
+/// refuses to start — sglang aborts with "The memory capacity is unbalanced",
+/// which reads like a misconfiguration and is really this race. On a unified
+/// memory node (DGX Spark) "GPU memory" IS host memory, so the same wait covers
+/// both.
+///
+/// Waits for a PLATEAU rather than a threshold: how much memory an engine needs
+/// is its own business, while "the previous tenant has finished releasing" is
+/// the only thing the deploy can meaningfully wait for.
+#[cfg(all(feature = "docker", target_os = "linux"))]
+async fn wait_for_memory_release() {
+    const SAMPLE: std::time::Duration = std::time::Duration::from_secs(2);
+    const PLATEAU_SAMPLES: u32 = 3;
+    const MAX_WAIT: std::time::Duration = std::time::Duration::from_secs(120);
+    // A teardown that big moves GiB per sample; 256 MiB is noise from everything else.
+    const NOISE_KIB: i64 = 256 * 1024;
+
+    let started = std::time::Instant::now();
+    let Some(mut last) = mem_available_kib() else {
+        return;
+    };
+    let first = last;
+    let mut stable = 0u32;
+    while started.elapsed() < MAX_WAIT {
+        tokio::time::sleep(SAMPLE).await;
+        let Some(now) = mem_available_kib() else {
+            return;
+        };
+        if (now - last).abs() < NOISE_KIB {
+            stable += 1;
+            if stable >= PLATEAU_SAMPLES {
+                tracing::info!(
+                    reclaimed_mib = (now - first) / 1024,
+                    waited_s = started.elapsed().as_secs(),
+                    "preflight: memory released by the previous deployment has settled"
+                );
+                return;
+            }
+        } else {
+            stable = 0;
+        }
+        last = now;
+    }
+    tracing::warn!(
+        mem_available_mib = last / 1024,
+        "preflight: memory was still moving after {}s — starting the engine anyway",
+        MAX_WAIT.as_secs()
+    );
+}
+
+#[cfg(all(feature = "docker", not(target_os = "linux")))]
+async fn wait_for_memory_release() {}
 
 /// Czy port TCP jest wolny na hoscie (probny bind 0.0.0.0). Krotki retry na
 /// zwolnienie po `docker rm` (TCP_LISTEN→CLOSED w jadrze).
@@ -1104,7 +1177,9 @@ pub async fn preflight_member(spec: &DistributedDeploySpec) -> Result<(), String
     // Hard cleanup: drop EVERY distributed-label container on this node (any prior
     // deployment, this id included) so host-network ports are released BEFORE the
     // free-checks below — a leftover process is exactly what makes serve EADDRINUSE.
-    remove_all_distributed_containers(&spec.deployment_cluster_id).await;
+    if remove_all_distributed_containers(&spec.deployment_cluster_id).await > 0 {
+        wait_for_memory_release().await;
+    }
 
     // torch.distributed master port (allocated `spec.dist_port`) + serve port must
     // be free on every member — a leftover process on either silently breaks
@@ -1155,6 +1230,21 @@ pub struct ReadinessStatus {
     pub error: Option<String>,
 }
 
+/// Exit code of the engine process on this node, or `None` while it still runs.
+#[cfg(feature = "docker")]
+async fn serve_exit_code(deployment_cluster_id: &str) -> Option<i32> {
+    let cid = head_container_id(deployment_cluster_id).await?;
+    let out = tokio::process::Command::new("docker")
+        .args(["exec", &cid, "cat", SERVE_EXIT_PATH])
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout).trim().parse().ok()
+}
+
 /// Sonduje gotowosc czlonka NA TYM nodzie: czy kontener dziala (faza build),
 /// GCS Ray (TCP), czlonkostwo (`ray status` w kontenerze head-a) i endpoint
 /// OpenAI. Bezstanowa. GCS/serve maja sens tylko dla head-a; container_running
@@ -1169,12 +1259,19 @@ pub async fn probe_readiness(
     let ray_gcs_up = tcp_reachable("127.0.0.1", ray_port).await;
     let serve_ready = http_models_ok(serve_port).await;
     let ray_nodes = ray_active_node_count(deployment_cluster_id).await;
+    // A finished engine that never answered is a dead deploy, not a slow one.
+    let error = match serve_exit_code(deployment_cluster_id).await {
+        Some(code) if !serve_ready => Some(format!(
+            "silnik zakonczyl sie z kodem {code} zanim wystawil endpoint"
+        )),
+        _ => None,
+    };
     ReadinessStatus {
         container_running,
         ray_gcs_up,
         ray_nodes,
         serve_ready,
-        error: None,
+        error,
     }
 }
 
@@ -1225,6 +1322,14 @@ async fn head_container_id(deployment_cluster_id: &str) -> Option<String> {
 #[cfg(feature = "docker")]
 const SERVE_LOG_PATH: &str = "/tmp/vllm-serve.log";
 
+/// Written by the serve wrapper the moment the engine process terminates. Its
+/// existence is the only reliable "the engine is gone" signal: the container
+/// itself stays up (its CMD is `sleep infinity`), so container liveness says
+/// nothing, and readiness polling would otherwise sit at `serve_ready=false`
+/// until the full deploy timeout — hours, for a large model.
+#[cfg(feature = "docker")]
+const SERVE_EXIT_PATH: &str = "/tmp/vllm-serve.exit";
+
 /// Odpala `vllm serve` NA HEADZIE przez `docker exec -d` (detached) DOPIERO gdy
 /// klaster Ray jest kompletny. Env dziedziczone z kontenera (NCCL/RoCE/HF). Blad
 /// gdy kontener head-a nie istnieje albo exec sie nie powiodl. stdout+stderr serve
@@ -1240,7 +1345,12 @@ pub async fn exec_serve_on_head(
         .ok_or_else(|| "kontener head-a nie istnieje (vllm serve)".to_string())?;
     // `serve_cmd` is already a shell command string; wrap it in a group with the
     // log redirect so the detached process captures stdout+stderr to a file.
-    let logged = format!("{{ {serve_cmd} ; }} > {SERVE_LOG_PATH} 2>&1");
+    // The exit marker is written AFTER the redirect group closes, so a crashed
+    // engine is distinguishable from one that is merely slow to bind its port.
+    let logged = format!(
+        "rm -f {SERVE_EXIT_PATH}; {{ {serve_cmd} ; }} > {SERVE_LOG_PATH} 2>&1; \
+         echo $? > {SERVE_EXIT_PATH}"
+    );
     let out = tokio::process::Command::new("docker")
         .args(["exec", "-d", &cid, "bash", "-c", &logged])
         .output()
