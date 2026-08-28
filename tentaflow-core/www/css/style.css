@@ -3259,6 +3259,36 @@ input, textarea, select {
   min-height: 40px; max-height: 200px;
   width: 100%;
 }
+/* The compact composer is a plain row: the three-column grid above assumes an
+   attach button in the first track, so without it the textarea inherits the
+   `auto` track and collapses while the send button takes the flexible one. The
+   box also moves off the wrapper and onto the field, so the button stands
+   beside the input instead of inside a shared frame. */
+tf-chat-composer[compact] .composer {
+  grid-template-columns: 1fr auto;
+  align-items: center;
+  max-width: none;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+}
+tf-chat-composer[compact] .composer:focus-within {
+  border-color: transparent;
+  box-shadow: none;
+}
+tf-chat-composer[compact] .composer .tf-textarea,
+tf-chat-composer[compact] .composer textarea {
+  background: var(--bg-input);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  padding: 10px 12px;
+}
+tf-chat-composer[compact] .composer .tf-textarea:focus,
+tf-chat-composer[compact] .composer textarea:focus {
+  border-color: var(--accent-1);
+}
+
 .composer-hints {
   max-width: 800px; margin: 8px auto 0;
   display: flex; align-items: center; gap: 16px;

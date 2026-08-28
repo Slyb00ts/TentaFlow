@@ -1844,7 +1844,7 @@ function renderTestTab(body) {
       <section class="card agents-pg-chat">
         <div class="agents-pg-panel-head">
           <span class="agents-pg-panel-title">${sprite('message')} ${escapeHtml(t('pg_chat_title'))}</span>
-          <tf-chip status="accent" dot>${escapeHtml(t('pg_session_chip'))}</tf-chip>
+          <tf-chip variant="outline" status="accent" dot>${escapeHtml(t('pg_session_chip'))}</tf-chip>
           <tf-button variant="ghost" size="sm" icon="refresh" data-pg-new-session>${escapeHtml(t('pg_new_session'))}</tf-button>
         </div>
         <div class="agents-pg-msgs" data-pg-msgs></div>
