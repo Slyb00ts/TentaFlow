@@ -43,6 +43,11 @@ struct RenderResponse {
     status: u16,
     title: String,
     text: String,
+    /// Rendered DOM. Asked for so the SAME readability pass the static reader
+    /// uses can run here too; without it the browser path returned raw page
+    /// text — navigation menus, footers and cookie banners included.
+    #[serde(default)]
+    html: Option<String>,
 }
 
 pub fn read_url(endpoint: &str, request: &ReadUrlRequest) -> Result<ReadPageResult> {
@@ -63,7 +68,7 @@ pub fn read_url(endpoint: &str, request: &ReadUrlRequest) -> Result<ReadPageResu
         max_scrolls: DEFAULT_SCROLLS,
         viewport_width: DEFAULT_VIEWPORT_WIDTH,
         viewport_height: DEFAULT_VIEWPORT_HEIGHT,
-        include_html: false,
+        include_html: true,
         include_screenshot: false,
         reset_context: false,
     };
@@ -85,8 +90,39 @@ pub fn read_url(endpoint: &str, request: &ReadUrlRequest) -> Result<ReadPageResu
         .json()
         .map_err(|e| WebResearchError::Serialization(format!("browser render json: {}", e)))?;
     validate_public_http_url(&rendered.final_url)?;
-    let original_len = rendered.text.chars().count();
-    let text = truncate_chars(&rendered.text, max_chars);
+    // Readability over the rendered DOM, exactly as the static reader does over
+    // a fetched document. Taking the renderer's plain text verbatim meant the
+    // first characters of a page were its navigation: apple.com came back as
+    // "Store Shop Mac iPad iPhone…" and a research finding held a menu instead
+    // of a specification.
+    let final_url_parsed = Url::parse(&rendered.final_url).ok();
+    let extracted = rendered
+        .html
+        .as_deref()
+        .filter(|h| !h.trim().is_empty())
+        .zip(final_url_parsed.as_ref())
+        .and_then(|(html, url)| super::extract::extract_content(html, "text/html", url).ok());
+
+    let (source_text, method, quality) = match extracted {
+        Some(e) if !e.text.trim().is_empty() => (
+            e.text,
+            format!("browser-renderer+{}", e.method),
+            e.quality_score,
+        ),
+        // No usable extraction: the raw text is worse but it is what there is,
+        // and an empty page would look like a read failure it is not.
+        _ => (
+            rendered.text.clone(),
+            "browser-renderer".to_string(),
+            browser_quality_score(
+                rendered.text.chars().count(),
+                count_words(&rendered.text),
+            ),
+        ),
+    };
+
+    let original_len = source_text.chars().count();
+    let text = truncate_chars(&source_text, max_chars);
     let excerpt = truncate_chars(&text, 900);
     let char_count = text.chars().count();
     let word_count = count_words(&text);
@@ -101,10 +137,10 @@ pub fn read_url(endpoint: &str, request: &ReadUrlRequest) -> Result<ReadPageResu
         content_type: "text/html; rendered=browser".to_string(),
         fetched_at: unix_time(),
         extraction: ExtractionInfo {
-            method: "browser-renderer".to_string(),
+            method,
             char_count,
             word_count,
-            quality_score: browser_quality_score(char_count, word_count),
+            quality_score: quality,
             truncated: original_len > max_chars,
         },
     })
