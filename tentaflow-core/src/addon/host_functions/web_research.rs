@@ -335,7 +335,15 @@ fn execute_read_search_results_request(
 /// quality scores, which are on different scales for the static and browser
 /// paths and cannot be compared against one threshold.
 fn is_navigation_page(text: &str) -> bool {
-    let lines: Vec<&str> = text
+    // Judge the OPENING of the page, not its whole body. A caller quotes the
+    // first characters, so that is the part that decides whether the page is
+    // worth quoting — and averaging over everything hid the problem: apple.com
+    // opens with 131 lines of menu, then enough later text to pull the whole
+    // page's average above any sane threshold, so the check passed a page whose
+    // usable part was pure navigation.
+    const JUDGED_CHARS: usize = 2_500;
+    let head: String = text.chars().take(JUDGED_CHARS).collect();
+    let lines: Vec<&str> = head
         .lines()
         .map(str::trim)
         .filter(|l| !l.is_empty())
@@ -378,6 +386,19 @@ mod navigation_tests {
             .join("\n");
 
         assert!(!is_navigation_page(&prose));
+    }
+
+    /// The case that slipped through: a page whose OPENING is 131 lines of menu
+    /// but whose later text lifts the whole-page average above the threshold.
+    /// The caller quotes the opening, so the opening is what must be judged.
+    #[test]
+    fn a_menu_followed_by_prose_is_still_rejected() {
+        let mut page = vec!["Apple".to_string(); 130];
+        page.extend((0..40).map(|i| {
+            format!("Akapit {i} zawiera pelne zdanie z wieloma slowami opisujacymi produkt i jego parametry.")
+        }));
+
+        assert!(is_navigation_page(&page.join("\n")));
     }
 
     /// A short page is not judged: a specification table can be terse, and

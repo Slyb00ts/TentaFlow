@@ -270,11 +270,51 @@ const EXCERPT_CHARS: usize = 1_800;
 /// Trims extracted text on a character boundary, so a multi-byte character is
 /// never split — the payload is JSON and a broken one would poison the result.
 fn excerpt(content: &str) -> String {
-    let trimmed = content.trim();
+    let trimmed = skip_leading_navigation(content.trim());
     match trimmed.char_indices().nth(EXCERPT_CHARS) {
         Some((idx, _)) => format!("{}…", &trimmed[..idx]),
         None => trimmed.to_string(),
     }
+}
+
+/// Drops the menu a page opens with, so the excerpt starts at its content.
+///
+/// A site's navigation is the first thing in the extracted text — apple.com
+/// spends 131 lines on it — and taking the first characters therefore returned
+/// "Store Shop Mac iPad iPhone" as a research finding: non-empty, worthless,
+/// and indistinguishable from success. Rejecting such pages outright is worse
+/// than trimming them: the content below the menu is usually exactly what was
+/// searched for.
+///
+/// Navigation lines are link labels — a word or two. Content starts where
+/// several full sentences run together, so the scan drops short leading lines
+/// until it finds that, and gives up (returning everything) rather than risk
+/// discarding a page whose content really is terse.
+fn skip_leading_navigation(text: &str) -> &str {
+    const CONTENT_WORDS: usize = 8;
+    const CONTENT_RUN: usize = 2;
+
+    let mut offset = 0usize;
+    let mut run = 0usize;
+    let mut content_start: Option<usize> = None;
+
+    for line in text.split_inclusive('\n') {
+        let words = line.split_whitespace().count();
+        if words >= CONTENT_WORDS {
+            if run == 0 {
+                content_start = Some(offset);
+            }
+            run += 1;
+            if run >= CONTENT_RUN {
+                return &text[content_start.unwrap_or(0)..];
+            }
+        } else {
+            run = 0;
+            content_start = None;
+        }
+        offset += line.len();
+    }
+    text
 }
 
 /// One page, one model call. `None` when the page carries no answer or the call
