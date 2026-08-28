@@ -28,6 +28,12 @@ RUN python3 /tmp/patch_tilelang_gb10.py && rm /tmp/patch_tilelang_gb10.py
 COPY tentaflow-containers/llm/patches/glm53/patch_nextn_nvfp4.py /tmp/patch_nextn_nvfp4.py
 RUN python3 /tmp/patch_nextn_nvfp4.py && rm /tmp/patch_nextn_nvfp4.py
 
+# A DFlash2 drafter cannot attach without a DFLASH-named aux-hidden hook AND an
+# mHC contraction: this model runs hc_mult parallel residual streams, so a raw
+# capture is hc_mult times too wide for the drafter's projection.
+COPY tentaflow-containers/llm/patches/glm53/patch_dflash_capture.py /tmp/patch_dflash_capture.py
+RUN python3 /tmp/patch_dflash_capture.py && rm /tmp/patch_dflash_capture.py
+
 # Fabric variables (NCCL_IB_HCA / NCCL_SOCKET_IFNAME / NCCL_IB_GID_INDEX) and the
 # HF cache are per node and injected by the cluster deploy, never baked.
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
