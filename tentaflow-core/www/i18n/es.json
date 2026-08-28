@@ -1691,7 +1691,7 @@
     "pg_chat_title": "Chat de prueba",
     "pg_session_chip": "sandbox — no se escribe en los proyectos",
     "pg_new_session": "Nueva sesión",
-    "pg_placeholder": "Pregunta al agente en modo de prueba…",
+    "pg_placeholder": "Escribe un mensaje de prueba…",
     "pg_greeting": "Modo de prueba iniciado. Describe una tarea — la ejecutaré y mostraré toda la ejecución en el panel de al lado.",
     "pg_run_title": "Ejecución en vivo",
     "pg_running": "El agente está trabajando…",

@@ -1849,7 +1849,7 @@ function renderTestTab(body) {
         </div>
         <div class="agents-pg-msgs" data-pg-msgs></div>
         <div class="agents-pg-composer">
-          <tf-chat-composer placeholder="${escapeAttr(t('pg_placeholder'))}"></tf-chat-composer>
+          <tf-chat-composer compact placeholder="${escapeAttr(t('pg_placeholder'))}"></tf-chat-composer>
           <tf-button variant="danger" icon="stop" data-pg-stop hidden>${escapeHtml(t('pg_stop'))}</tf-button>
         </div>
       </section>

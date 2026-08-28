@@ -1691,7 +1691,7 @@
     "pg_chat_title": "Czat testowy",
     "pg_session_chip": "sandbox — bez zapisu do projektów",
     "pg_new_session": "Nowa sesja",
-    "pg_placeholder": "Zapytaj agenta w trybie testowym…",
+    "pg_placeholder": "Napisz wiadomość testową…",
     "pg_greeting": "Tryb testowy uruchomiony. Opisz zadanie — wykonam je i pokażę cały przebieg w panelu obok.",
     "pg_run_title": "Przebieg na żywo",
     "pg_running": "Agent pracuje…",

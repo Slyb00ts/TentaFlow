@@ -1691,7 +1691,7 @@
     "pg_chat_title": "Test chat",
     "pg_session_chip": "sandbox — nothing is written to projects",
     "pg_new_session": "New session",
-    "pg_placeholder": "Ask the agent in test mode…",
+    "pg_placeholder": "Write a test message…",
     "pg_greeting": "Test mode started. Describe a task — I will run it and show the whole run in the panel next to the chat.",
     "pg_run_title": "Live run",
     "pg_running": "The agent is working…",

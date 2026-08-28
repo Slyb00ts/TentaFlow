@@ -1691,7 +1691,7 @@
     "pg_chat_title": "Discussion de test",
     "pg_session_chip": "bac à sable — rien n’est écrit dans les projets",
     "pg_new_session": "Nouvelle session",
-    "pg_placeholder": "Interrogez l'agent en mode test…",
+    "pg_placeholder": "Écrivez un message de test…",
     "pg_greeting": "Mode test démarré. Décrivez une tâche — je l'exécuterai et montrerai toute l'exécution dans le panneau à côté.",
     "pg_run_title": "Exécution en direct",
     "pg_running": "L'agent travaille…",

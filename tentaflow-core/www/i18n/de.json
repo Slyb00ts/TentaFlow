@@ -1691,7 +1691,7 @@
     "pg_chat_title": "Test-Chat",
     "pg_session_chip": "Sandbox — kein Schreiben in Projekte",
     "pg_new_session": "Neue Sitzung",
-    "pg_placeholder": "Frage den Agenten im Testmodus…",
+    "pg_placeholder": "Testnachricht schreiben…",
     "pg_greeting": "Testmodus gestartet. Beschreibe eine Aufgabe — ich führe sie aus und zeige den ganzen Lauf im Panel daneben.",
     "pg_run_title": "Live-Lauf",
     "pg_running": "Der Agent arbeitet…",
