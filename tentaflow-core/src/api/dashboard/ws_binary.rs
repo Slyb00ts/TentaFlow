@@ -561,7 +561,7 @@ pub async fn handle_ws_connection<S>(
                             let response = MessageBody::MetaSchemaVersionAck {
                                 server_version: SCHEMA_VERSION,
                                 accepted,
-                                asset_build_hash: super::static_files::ASSET_BUILD_HASH.to_string(),
+                                asset_build_hash: super::static_files::asset_build_hash(),
                             };
                             let _ = send_body(
                                 &control_tx,
