@@ -882,10 +882,15 @@ input, textarea, select {
   background: var(--bg-3);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
-  padding: 14px;
+  /* Narrow side padding on purpose: the ring needs the cell width more than the
+     cell needs air, and a byte value ("242.3 GB") only fits the inner disc when
+     the ring can grow. */
+  padding: 12px 6px;
 }
 .gauge-ring {
-  width: 64px; height: 64px; border-radius: 50%;
+  /* Grows to 76px (inner disc 64px) where the cell allows it and never wider
+     than its cell, so a narrow grid shrinks the ring instead of clipping it. */
+  width: min(76px, 100%); height: auto; aspect-ratio: 1; border-radius: 50%;
   margin: 0 auto 8px;
   background: conic-gradient(var(--success) calc(var(--pct) * 1%), var(--bg-2) 0);
   position: relative;
@@ -909,13 +914,16 @@ input, textarea, select {
   position: relative; z-index: 1;
   font-size: 14px; font-weight: 700; color: var(--text);
   line-height: 1.05;
+  /* Unit sits next to the value while both fit inside the inner disc, and drops
+     to a second line instead of crossing the ring when they do not. */
+  display: flex; flex-wrap: wrap;
+  align-items: baseline; justify-content: center;
+  column-gap: 2px;
+  max-width: calc(100% - 14px);
 }
 .gauge-val span {
-  /* Inline obok wartosci ("17.4 GB" zamiast "17.4" + linia "GB"). */
-  display: inline;
   font-size: 10px; font-weight: 600;
   color: var(--text-3);
-  margin-left: 2px;
 }
 .gauge-label { font-size: 10px; font-weight: 700; color: var(--text-3); text-transform: uppercase; letter-spacing: 0.06em; margin-top: 4px; }
 .gauge-sub { font-size: 11px; color: var(--text-3); margin-top: 2px; }
@@ -2245,8 +2253,7 @@ input, textarea, select {
   .mesh-grid { grid-template-columns: 1fr; }
   .mesh-detail-grid { grid-template-columns: 1fr; }
   .gauges { grid-template-columns: repeat(2, 1fr); }
-  .gauge { padding: 10px; }
-  .gauge-ring { width: 56px; height: 56px; }
+  .gauge { padding: 10px 6px; }
   .catalog-grid { grid-template-columns: 1fr; }
   .target-grid { grid-template-columns: 1fr; }
 
