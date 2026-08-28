@@ -58,6 +58,16 @@ ADDITION = """    def set_dflash_layers_to_capture(self, layer_ids: List[int]):
 
 """
 
+INIT_ANCHOR = """        self.layers_to_capture = []
+"""
+
+INIT_ADDITION = """        self.layers_to_capture = []
+        # `Glm5NextModel` keeps no `config` reference, so the mHC stream count
+        # has to be resolved here, where `config` is still in scope. 1 means
+        # "no contraction needed".
+        self.hc_capture_mult = int(config.hc_mult) if getattr(config, "mhc", False) else 1
+"""
+
 CAPTURE_STOCK = """                if i in self.layers_to_capture:
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_parallel().attn_tp_group.all_gather(
@@ -78,10 +88,9 @@ CAPTURE_FIXED = """                if i in self.layers_to_capture:
                     # one, the way deepseek_v4 contracts its own mHC capture. The
                     # stream axis is flattened here and stream-major, so the view
                     # is the exact inverse of that model's `flatten(1)`.
-                    if getattr(self.config, "mhc", False):
-                        hc_mult = int(self.config.hc_mult)
+                    if self.hc_capture_mult > 1:
                         captured = captured.view(
-                            captured.shape[0], hc_mult, -1
+                            captured.shape[0], self.hc_capture_mult, -1
                         ).mean(dim=1)
                     if self.enable_a2a_moe and i > self.first_k_dense_replace:
                         aux_hidden_state = get_parallel().attn_tp_group.all_gather(
@@ -124,6 +133,18 @@ else:
         )
     text = text.replace(ANCHOR, ADDITION + ANCHOR, 1)
     notes.append("* set_dflash_layers_to_capture dodane")
+
+if "hc_capture_mult" in text:
+    notes.append("= mnoznik mHC juz zapamietany")
+else:
+    hits = text.count(INIT_ANCHOR)
+    if hits != 1:
+        raise SystemExit(
+            f"oczekiwano 1 wystapienia inicjalizacji layers_to_capture w {path}, znaleziono {hits}\n"
+            f"upstream przesunal ten kod — przenies latke i zaktualizuj obraz bazowy"
+        )
+    text = text.replace(INIT_ANCHOR, INIT_ADDITION, 1)
+    notes.append("* mnoznik mHC zapamietany przy inicjalizacji")
 
 if CAPTURE_FIXED in text:
     notes.append("= przechwytywanie juz z kontrakcja mHC")
