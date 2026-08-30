@@ -34,6 +34,16 @@ RUN python3 /tmp/patch_nextn_nvfp4.py && rm /tmp/patch_nextn_nvfp4.py
 COPY tentaflow-containers/llm/patches/glm53/patch_dflash_capture.py /tmp/patch_dflash_capture.py
 RUN python3 /tmp/patch_dflash_capture.py && rm /tmp/patch_dflash_capture.py
 
+# On a 2-node TP group the NEXTN draft worker deadlocks in multimem init: the
+# symmetric-memory all-gather probes same-node-ness with a COLLECTIVE that only
+# ranks with a published parallel config join — the draft context is exactly the
+# unpublished case, so rank 0 sits in broadcast_object_list forever while rank
+# 1's draft never joins. The probe's only cross-node outcome is disabling
+# multimem anyway, so the patch skips the probe and disables it whenever the
+# group spans nodes (single-node keeps multimem unchanged).
+COPY tentaflow-containers/llm/patches/glm53/patch_crossnode_symm_mem.py /tmp/patch_crossnode_symm_mem.py
+RUN python3 /tmp/patch_crossnode_symm_mem.py && rm /tmp/patch_crossnode_symm_mem.py
+
 # Fabric variables (NCCL_IB_HCA / NCCL_SOCKET_IFNAME / NCCL_IB_GID_INDEX) and the
 # HF cache are per node and injected by the cluster deploy, never baked.
 ENV PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True \
