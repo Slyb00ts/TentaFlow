@@ -672,6 +672,14 @@ pub enum MeshCommandType {
         assertion: SessionAssertion,
         request_cbor: Vec<u8>,
     },
+    /// Diagnostyka deployow: ogon stdout+stderr kontenera Docker na tym nodzie.
+    /// coordinator bierze go w sciezce PORAŻKI deployu rozproszonego, bo ogon
+    /// logu serve z head-a nie zawiera bledu, ktory padl na workerze.
+    /// Appended at END.
+    ContainerLogs {
+        container_id: String,
+        tail_lines: u32,
+    },
 }
 
 // =============================================================================
@@ -1114,6 +1122,11 @@ pub enum MeshCommandResponsePayload {
         highest_seq: u64,
         error: Option<crate::ProtocolError>,
     },
+    /// Wynik `ContainerLogs` — ogon logow kontenera (stdout+stderr, bez
+    /// podzialu na strumienie). Appended at END.
+    ContainerLogsResult {
+        logs: String,
+    },
 }
 
 impl std::fmt::Debug for MeshCommandType {
@@ -1447,6 +1460,14 @@ impl std::fmt::Debug for MeshCommandType {
                 .field("session", &assertion.session)
                 .field("jti", &assertion.jti)
                 .field("request_bytes", &request_cbor.len())
+                .finish(),
+            Self::ContainerLogs {
+                container_id,
+                tail_lines,
+            } => f
+                .debug_struct("ContainerLogs")
+                .field("container_id", container_id)
+                .field("tail_lines", tail_lines)
                 .finish(),
         }
     }

@@ -2405,17 +2405,56 @@ async fn run_cluster_deploy_phases(
     .await
     {
         serve_stop.store(true, std::sync::atomic::Ordering::Relaxed);
-        let reason = if head_node_id == local_id {
-            match crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300)
-                .await
-            {
-                Some(tail) => format!(
-                    "klaster nie zaczął serwować w czasie: {e}\n--- vllm serve log ---\n{tail}"
-                ),
-                None => format!("klaster nie zaczął serwować w czasie: {e}"),
-            }
+        let reason = format!("klaster nie zaczął serwować w czasie: {e}");
+        let head_tail = if head_node_id == local_id {
+            crate::services::deploy::distributed::serve_log_tail(&deployment_cluster_id, 300).await
         } else {
-            format!("klaster nie zaczął serwować w czasie: {e}")
+            None
+        };
+        // Ogon logu serve z head-a pokazuje tylko symptom gloo ("connection
+        // closed by peer") — REALNY bląd pada na workerze i po jego kontenerze.
+        // Teardown jeszcze nie biegł (dzieje się w cdeploy_fail), wiec kontenery
+        // czlonkow wciaz zyja — zbieramy ich ogony TERAZ, nie po sprzatnieciu.
+        let mut member_logs = String::new();
+        for m in persisted_members.iter().filter(|m| m.role != "head") {
+            if m.container_name.is_empty() {
+                continue;
+            }
+            let cmd = MeshCommandType::ContainerLogs {
+                container_id: m.container_name.clone(),
+                tail_lines: 60,
+            };
+            let tail = if m.node_id == local_id {
+                match qm.command_executor().await {
+                    Some(ex) => match ex.execute(local_id, cmd).await {
+                        resp if resp.ok => match resp.payload {
+                            MeshCommandResponsePayload::ContainerLogsResult { logs } => Some(logs),
+                            _ => None,
+                        },
+                        _ => None,
+                    },
+                    None => None,
+                }
+            } else {
+                match qm.send_command_and_wait(&m.node_id, cmd, 15).await {
+                    Ok(resp) if resp.ok => match resp.payload {
+                        MeshCommandResponsePayload::ContainerLogsResult { logs } => Some(logs),
+                        _ => None,
+                    },
+                    _ => None,
+                }
+            };
+            let short_id: String = m.node_id.chars().take(8).collect();
+            member_logs.push_str(&format!(
+                "\n--- log workera {}@{} ---\n{}",
+                m.container_name,
+                short_id,
+                tail.unwrap_or_else(|| "niedostępny".to_string()),
+            ));
+        }
+        let reason = match head_tail {
+            Some(t) => format!("{reason}\n--- vllm serve log ---\n{t}{member_logs}"),
+            None => format!("{reason}{member_logs}"),
         };
         cdeploy_fail(
             ctx,

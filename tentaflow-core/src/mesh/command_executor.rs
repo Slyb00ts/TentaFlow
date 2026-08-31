@@ -218,6 +218,11 @@ impl MeshCommandExecutor {
             }
             MeshCommandType::SystemPrune { volumes } => self.handle_system_prune(volumes).await,
 
+            MeshCommandType::ContainerLogs {
+                container_id,
+                tail_lines,
+            } => self.handle_container_logs(&container_id, tail_lines).await,
+
             MeshCommandType::BandwidthProbe {
                 target_ip,
                 target_port,
@@ -2827,6 +2832,59 @@ impl MeshCommandExecutor {
         #[cfg(not(feature = "docker"))]
         {
             let _ = container_id;
+            CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
+        }
+    }
+
+    async fn handle_container_logs(&self, container_id: &str, tail_lines: u32) -> CommandResponse {
+        if let Err(e) = Self::validate_container_id(container_id) {
+            return CommandResponse::fail(e);
+        }
+        #[cfg(feature = "docker")]
+        {
+            let docker = match Self::connect_docker().await {
+                Ok(d) => d,
+                Err(e) => return CommandResponse::fail(e),
+            };
+            // `tail=0` means ALL lines for the docker daemon; a failed deploy
+            // wants the last handful, so only 0 maps to "all".
+            let tail = if tail_lines == 0 {
+                "0".to_string()
+            } else {
+                tail_lines.to_string()
+            };
+            let opts = bollard::query_parameters::LogsOptionsBuilder::default()
+                .stdout(true)
+                .stderr(true)
+                .follow(false)
+                .tail(tail)
+                .build();
+            use futures::StreamExt;
+            let mut stream = docker.logs(container_id, Some(opts));
+            let mut logs = String::new();
+            while let Some(item) = stream.next().await {
+                match item {
+                    Ok(out) => {
+                        let line = out.to_string();
+                        let line = line.trim_end_matches(['\r', '\n']);
+                        logs.push_str(line);
+                        logs.push('\n');
+                    }
+                    Err(e) => {
+                        // Partial logs are still diagnostic gold — return what we
+                        // have instead of failing the whole fetch.
+                        if logs.is_empty() {
+                            return CommandResponse::fail(format!("logs: {}", e));
+                        }
+                        break;
+                    }
+                }
+            }
+            CommandResponse::ok(MeshCommandResponsePayload::ContainerLogsResult { logs })
+        }
+        #[cfg(not(feature = "docker"))]
+        {
+            let _ = (container_id, tail_lines);
             CommandResponse::fail("docker feature nie jest aktywne w tej kompilacji")
         }
     }
