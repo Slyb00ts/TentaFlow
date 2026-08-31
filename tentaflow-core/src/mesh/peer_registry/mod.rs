@@ -155,7 +155,17 @@ impl PeerRegistry {
         if self.persist_tx.get().is_none() {
             return;
         }
-        g.persisted_version = g.persisted_version.saturating_add(1);
+        // The DB gate is `persisted_ver > existing`. Pairing writes wall-clock
+        // versions (~1.79e12) via next_persisted_ver; a registry entry hydrated
+        // from such a row carries a counter in that domain, and a plain
+        // counter bump (16k) could NEVER beat it again — heartbeats and hints
+        // would be silently dropped until restart. Floor every bump at
+        // wall-clock ms so both writers live in one monotonic domain.
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+        g.persisted_version = g.persisted_version.max(now_ms).saturating_add(1);
         if let Some(snap) = Self::snapshot_for_persist(g) {
             self.schedule_persist(PersistOp::UpsertEntry {
                 node_id: g.node_id,
@@ -297,7 +307,9 @@ impl PeerRegistry {
             if self.persist_tx.get().is_some() {
                 let pubkey_bytes: Option<Vec<u8>> = g.pubkey.as_ref().map(|pk| pk.to_vec());
                 if let Some(pubkey_vec) = pubkey_bytes {
-                    g.persisted_version = g.persisted_version.saturating_add(1);
+                    // Same wall-clock floor as persist_entry: pairing's
+                    // next_persisted_ver writes must not shadow heartbeats.
+                    g.persisted_version = g.persisted_version.max(now_ms as u64).saturating_add(1);
                     let snap = PeerPersistSnapshot {
                         pubkey: pubkey_vec,
                         trust_state: g.trust.clone(),

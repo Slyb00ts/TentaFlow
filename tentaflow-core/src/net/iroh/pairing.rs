@@ -21,6 +21,7 @@ use tentaflow_protocol::mesh::{
 use tracing::{info, warn};
 
 use crate::db;
+use crate::mesh::peer_registry::persistence::bucketize_30s;
 use crate::mesh::security::MeshSecurity;
 
 const MAX_FRAME_BYTES: usize = 64 * 1024;
@@ -518,7 +519,12 @@ fn store_contact_hints_to_peer_db(
         },
         platform: None,
         role: db::repository::ROLE_NODE,
-        last_seen_ms: 0,
+        // Pairing itself is contact evidence: stamp the CURRENT time, not 0.
+        // A 0 here means the trust-expiry prune sees "never seen" and (with
+        // Bug #2 unfixed) revokes trust on the next boot after 30 idle days,
+        // even though the peers talk every day. The registry's heartbeat
+        // writer takes over from the first bucket after connect.
+        last_seen_ms: bucketize_30s(now_ms),
         persisted_ver,
         updated_at_ms: now_ms,
     };

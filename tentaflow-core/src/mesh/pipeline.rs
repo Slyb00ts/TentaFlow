@@ -3532,7 +3532,15 @@ fn spawn_trust_expiry_prune(
         let ttl_ms = (trust_expiry_days as i64).saturating_mul(86_400_000);
         // Daily cadence is far finer than a 30-day TTL, so the check is cheap and a node
         // crossing the threshold is removed within a day without spamming the DB/log.
+        // The FIRST tick fires immediately (tokio interval semantics), i.e. at boot
+        // when the mesh has not dialled anyone yet — revoking peers there revoked
+        // daily-used pairings whose last_seen heartbeat had not been re-persisted
+        // yet. Skip it: the first evaluation happens after the first daily period,
+        // when every live peer is either reconnected (fresh heartbeats) or genuinely
+        // unreachable.
         let mut interval = tokio::time::interval(Duration::from_secs(24 * 60 * 60));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        interval.tick().await; // consume the immediate boot tick
         loop {
             interval.tick().await;
             let trusted = match crate::db::repository::list_trusted_nodes(&mesh_security.db) {
