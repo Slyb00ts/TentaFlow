@@ -32,7 +32,7 @@ use tracing::warn;
 
 use super::classifier_stan::StateClassifier;
 use super::ocr_plate::PlateOcr;
-use crate::services::camera_ingest::vision_analysis::{get_classifier, get_ocr};
+use crate::vision::runners::{get_classifier, get_ocr};
 
 /// Max jobs per batched forward. Matches the models' TensorRT dynamic profile
 /// upper bound (1..=16) — a bigger batch would fall out of the profile and force

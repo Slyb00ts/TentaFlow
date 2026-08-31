@@ -6,7 +6,10 @@
 pub mod audio;
 #[cfg(feature = "inference-mlx-whisper")]
 pub mod mlx_whisper;
-#[cfg(feature = "inference-whisper")]
+#[cfg(all(
+    feature = "inference-whisper",
+    not(any(target_os = "macos", target_os = "ios"))
+))]
 pub mod whisper;
 
 use async_trait::async_trait;
@@ -253,7 +256,10 @@ impl SttManager {
         #[allow(unused_mut)]
         let mut engines: Vec<Box<dyn SttEngine>> = Vec::new();
 
-        #[cfg(feature = "inference-whisper")]
+        #[cfg(all(
+            feature = "inference-whisper",
+            not(any(target_os = "macos", target_os = "ios"))
+        ))]
         engines.push(Box::new(whisper::WhisperEngine::new()));
 
         // mlx-whisper PRZED whisper.cpp — gdy uzytkownik ma macOS i wybral

@@ -5,8 +5,30 @@ edition = "2021"
 description = "TentaFlow — API Gateway i mesh node"
 build = "build.rs"
 
+# Dwie edycje dystrybucyjne. `full` (domyslna) to dotychczasowy zestaw: kamery,
+# wizja i wszystkie wbudowane silniki mowy. `slim` to `--no-default-features` —
+# gateway, mesh, flow engine, dashboard, addony i zarzadzanie kontenerami, BEZ
+# whispera, wizji, sherpy i Supertonica. Slim jest przeznaczony dla maszyn bez
+# GPU (slabe integry), gdzie lokalna inferencja i tak nie ma sensu, a kazda
+# natywna biblioteka to tylko waga instalacji i kolejna zaleznosc runtime.
 [features]
+default = ["full"]
+full = [
+    "camera",
+    "whisper",
+    "vision",
+    "tentaflow-core/inference-sherpa",
+    "tentaflow-core/inference-supertonic",
+    "tentaflow-core/inference-diarization",
+]
+# Whisper.cpp (STT), wlaczany przez `full`. Na Apple flaga jest no-opem:
+# `whisper-rs-sys` jest tam odciety targetem w tentaflow-wrappers, a modul
+# `stt::whisper` nie istnieje — STT idzie przez MLX-whisper. Ten binary nie
+# zaciaga inference-llamacpp, wiec nie ma kolizji symboli ggml.
+whisper = ["tentaflow-core/inference-whisper"]
 camera = ["tentaflow-core/camera"]
+# Wizja (RF-DETR, klasyfikator, OCR) + flota workerow GPU.
+vision = ["tentaflow-core/inference-vision-gpu"]
 rdma-probe = ["tentaflow-core/rdma-probe"]
 gpu-cuda = ["tentaflow-core/gpu-cuda"]
 vision-cuda = ["tentaflow-core/vision-cuda"]
@@ -14,10 +36,9 @@ gpu-vulkan = ["tentaflow-core/gpu-vulkan"]
 gpu-metal = ["tentaflow-core/gpu-metal"]
 
 [dependencies]
-# Wspolna baza dla WSZYSTKICH platform (Apple tez). default-features = false,
-# whisper.cpp dokladany per-target ponizej (zawsze na nie-Apple, nigdy na Apple).
-# `camera` re-dodane jawnie.
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "inference-diarization", "inference-sherpa", "inference-supertonic", "camera", "vector-milvus", "inference-vision-gpu", "graph"] }
+# Wspolna baza dla WSZYSTKICH platform i dla OBU edycji. Zostaje tu tylko to,
+# czego slim tez potrzebuje; reszta wchodzi przez feature `full` powyzej.
+tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["docker", "vector-milvus", "graph"] }
 tentaflow-protocol = { path = "../tentaflow-protocol" }
 tokio = { version = "1.52.2", features = ["full"] }
 tracing = "0.1"
@@ -34,14 +55,6 @@ parking_lot = "0.12"
 # i podmienia biezaca binarke (external updater process — Windows nie blokuje
 # pliku w trakcie kopiowania).
 axoupdater = { version = "0.10.0", features = ["blocking"] }
-
-# Whisper.cpp (STT) ZAWSZE wbudowany na nie-Apple (Linux/Windows). To NIE jest
-# feature opt-in — engine `whisper` musi byc dostepny w runtime na tych
-# platformach. Apple (macOS/iOS) STT idzie wylacznie przez MLX-whisper (blok
-# nizej), wiec tam whisper.cpp sie nie linkuje. Ten binary nie zaciaga
-# inference-llamacpp, wiec nie ma kolizji symboli ggml whisper.cpp <-> llama.cpp.
-[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
-tentaflow-core = { path = "../tentaflow-core", default-features = false, features = ["inference-whisper"] }
 
 # MLX inference — tylko na macOS. Implementacja przez Swift bridge
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i

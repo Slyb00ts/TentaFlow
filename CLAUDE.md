@@ -42,10 +42,40 @@ for the video pipeline). Key opt-ins:
 | `inference-diarization` | speaker diarization (tentaflow-voice) |
 | `gpu-cuda` | CUDA accel for llama.cpp + whisper |
 | `gpu-vulkan` | Vulkan for llama.cpp + portable WGPU vision backend |
-| `gpu-rocm` / `vision-rocm` | HIP/ROCm for llama.cpp + optional Burn vision backend |
 | `vision-cuda` | Burn vision CUDA backend + zero-copy CUDA preprocessing |
 | `vision-ort` | ORT/TensorRT/CUDA for the main vision path; pulled in by `gpu-cuda` |
 | `test-support` | exposes `flow_engine::node_adapter::test_support` (for benches) |
+
+## Distribution editions (`tentaflow` crate)
+
+`full` (default) is the historical set: cameras, vision, whisper, sherpa, Supertonic,
+diarization. `slim` is `--no-default-features`: gateway, mesh, flow engine, dashboard,
+addons and container management with NO local inference engine — for machines whose GPU
+(a weak integrated one) makes local inference pointless, where every native library is
+only install weight and another runtime dependency. `cargo tree` proves the split: slim
+pulls zero whisper/llama/sherpa crates.
+
+Two invariants make this work:
+
+- **Whisper is target-gated, not just feature-gated.** `whisper-rs-sys` sits in a
+  `cfg(not(macos/ios))` dependency block of `tentaflow-wrappers` and
+  `tentaflow_wrappers::whisper` / `stt::whisper` carry the same `not(apple)` condition, so
+  enabling `whisper` (via `full`) on Apple is a no-op instead of linking whisper.cpp next
+  to MLX-whisper. Cargo cannot express "feature only on target X"; this is where that
+  invariant is enforced.
+- **The catalog is filtered where it is generated.** `build.rs::is_slim_edition()` (no
+  local-engine feature set) makes the service-manifest generator keep only utility infra
+  (`resource_kind = "infra"`) and remote-only providers (`[deploy.external]` as the sole
+  deploy section) — 20 entries instead of 94. It filters in the ONE generator because both
+  the Rust registry (`services_generated.rs`) and the GUI catalog
+  (`www/js/generated/services-manifest.js`) come out of it; filtering one path only would
+  show tiles the backend then refuses to deploy.
+
+Model runners (RF-DETR detector, vehicle detector, state classifier, plate OCR) live in
+`vision/runners.rs`, NOT under `services::camera_ingest`: they are shared by the camera
+analysis engine, the flow vision node, local CV and the inference batcher, and only the
+first of those is camera-bound. Keeping them under the camera-gated module made every
+non-camera build fail.
 
 ## Configuration
 
@@ -465,25 +495,20 @@ sources with `--update` / `-Update`. Platform layout: `include/`, `lib-static/`,
   for fresh, `vendored` for the old tree). Variant via `LLAMA_CPP_NATIVE_VARIANT` (default
   `multi` = cuda + vulkan + cpu on a Linux/Windows machine with a VISIBLE NVIDIA GPU, otherwise
   vulkan + cpu). Apple is a separate branch entirely — macOS/iOS resolve to **metal** and nothing
-  else, so none of the CUDA/ROCm/Vulkan rules below apply there.
-  **On Linux/Windows, autodetection never picks ROCm**: NVIDIA runs on CUDA, everything else on the portable Vulkan
-  backend. ROCm is still built on request — `LLAMA_CPP_BACKENDS=rocm` — but never by accident,
-  because CUDA and HIP ggml backends can NEVER share one static object (same symbols, one
-  `ggml_backend_cuda_reg`), so an auto-pick between them turns "which driver answered at build
-  time" into a different artifact. A CUDA toolkit alone is NOT the signal either: a box that
-  keeps `/opt/cuda` with no NVIDIA card in the slot builds vulkan. Force any of it with
-  `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan|rocm`. The
-  build scripts find `nvcc`/`hipcc` outside PATH (`/usr/local/cuda`, `/opt/rocm`, `CUDA_HOME`)
+  else, so none of the CUDA/Vulkan rules below apply there.
+  **There is no HIP/ROCm build target anywhere in this repo**: NVIDIA runs on CUDA, AMD and Intel
+  run on the portable Vulkan backend. That is deliberate — CUDA and HIP ggml backends can NEVER
+  share one static object (same symbols, one `ggml_backend_cuda_reg`), so supporting both turned
+  "which driver answered at build time" into a different artifact. A CUDA toolkit alone is NOT the
+  signal either: a box that keeps `/opt/cuda` with no NVIDIA card in the slot builds vulkan. Force
+  a backend with `LLAMA_CPP_BACKENDS=cuda|cpu|vulkan`. The
+  build scripts find `nvcc` outside PATH (`/usr/local/cuda`, `CUDA_HOME`)
   and wipe a variant's `lib-static`/`lib-dynamic` dirs before install so a stale
-  `libggml-cuda.a` cannot get linked next to a fresh `libggml-hip.a`. Local patches come from
+  `libggml-cuda.a` cannot get linked next to a fresh `libggml-vulkan.a`. Local patches come from
   `scripts/native-libs/patches/llama-cpp/` (current one turns the fused Gated Delta Net
   auto-detect `SIGABRT` on Qwen3.6/MTP into a warning).
 - Whisper autodetection on Linux/Windows follows the same rule (`WHISPER_CPP_BACKENDS`); on Apple
-  it is metal, and `inference-whisper` is not linked there at all. Building ROCm on purpose
-  needs an architecture pin and a real Clang, because CMake >= 4 REFUSES the `hipcc` wrapper as
-  the HIP compiler: `HIPCXX=/opt/rocm/llvm/bin/clang++ CMAKE_HIP_ARCHITECTURES=gfx1201
-  LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh` (the scripts now default `HIPCXX`
-  to the ROCm clang, falling back to `hipcc` only when no clang is next to it).
+  it is metal, and `inference-whisper` is not linked there at all.
 - CUDA NV12/RGB preprocessing for the zero-copy ORT path is opt-in via `gpu-cuda` or
   `vision-cuda`; a plain AMD/Intel build never invokes `nvcc` and preprocesses on the host. The
   portable WGPU/Vulkan backend is Burn's default for the main vision pipeline

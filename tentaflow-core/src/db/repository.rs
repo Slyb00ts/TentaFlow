@@ -22559,6 +22559,11 @@ pub fn get_camera_cv_pipeline(
 /// seed-owned, so an upsert preserves the existing flag (new rows get 0).
 /// The upsert is org-guarded: an id collision with another org's row changes
 /// nothing and is refused. Captures the write for mesh sync like flow saves.
+///
+/// The pipeline schema lives in `camera_ingest`, so this writer only exists in a
+/// build that has camera ingest — without it there is nothing that could run the
+/// stored pipeline.
+#[cfg(feature = "camera")]
 pub fn save_camera_cv_pipeline(
     pool: &DbPool,
     id: &str,

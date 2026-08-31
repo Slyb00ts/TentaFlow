@@ -1150,6 +1150,23 @@ fn guess_mime(path: &str) -> &'static str {
     }
 }
 
+/// Czy to build bez ANI JEDNEGO lokalnego silnika inferencji (edycja slim).
+/// Czytane z features samego rdzenia, wiec sygnal jest ten sam niezaleznie od
+/// tego, kto sklada liste features (binarka, testy, inny crate).
+fn is_slim_edition() -> bool {
+    const LOCAL_ENGINE_FEATURES: &[&str] = &[
+        "CARGO_FEATURE_INFERENCE_WHISPER",
+        "CARGO_FEATURE_INFERENCE_LLAMACPP",
+        "CARGO_FEATURE_INFERENCE_SHERPA",
+        "CARGO_FEATURE_INFERENCE_SUPERTONIC",
+        "CARGO_FEATURE_INFERENCE_VISION_GPU",
+        "CARGO_FEATURE_INFERENCE_MLX",
+    ];
+    LOCAL_ENGINE_FEATURES
+        .iter()
+        .all(|f| std::env::var_os(f).is_none())
+}
+
 // =============================================================================
 // Pakowanie kontekstu Docker (tentaflow-containers + shared Rust crates)
 // w tar.gz wbudowany w binarce. Pozwala na deploy bez zewnetrznych zrodel.
@@ -2377,7 +2394,7 @@ fn compute_source_hash_multi(roots: &[PathBuf]) -> String {
 }
 
 fn generate_services_manifest(out_dir: &Path) {
-    use services_manifest_build::{validate, ServiceManifest};
+    use services_manifest_build::{validate, ResourceKind, ServiceManifest};
     use std::collections::HashSet;
 
     let workspace_root = Path::new("..")
@@ -2522,6 +2539,31 @@ fn generate_services_manifest(out_dir: &Path) {
         }
 
         loaded.push(manifest);
+    }
+
+    // Edycja slim: bez zadnego lokalnego silnika inferencji nie ma czym uruchomic
+    // kontenera z modelem, wiec katalog pokazuje tylko to, co na takim wezle
+    // realnie dziala — uslugi uzytkowe (`resource_kind = "infra"`: searxng,
+    // browser-renderer, milvus, iroh-relay, test-runner) oraz dostawcow, ktorzy
+    // zyja wylacznie po zdalnym API (`[deploy.external]` jako jedyna sekcja).
+    // Filtrujemy TU, w jednym generatorze, bo z niego powstaja OBIE sciezki:
+    // rejestr Rust (services_generated.rs) i katalog GUI (services-manifest.js).
+    // Inaczej dashboard pokazywalby kafelki, ktorych backend odmawia uruchomic.
+    if is_slim_edition() {
+        let before = loaded.len();
+        loaded.retain(|m| {
+            let infra = m.engine.resource_kind == Some(ResourceKind::Infra);
+            let remote_only = m.deploy.external.is_some()
+                && m.deploy.docker.is_none()
+                && m.deploy.native.is_none();
+            infra || remote_only
+        });
+        println!(
+            "cargo:warning=Edycja slim: katalog ograniczony do {} pozycji z {} \
+             (ukryto silniki modelowe — brak lokalnej inferencji w tym buildzie)",
+            loaded.len(),
+            before
+        );
     }
 
     // Serializuj wszystko do JSON. pretty dla GUI, compact dla embed Rust (size).

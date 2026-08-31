@@ -79,6 +79,11 @@ pub mod ocr_plate;
 // crop dumps. Feeds both the plate and ADR readers before the model.
 #[cfg(feature = "inference-vision-gpu")]
 pub mod ocr_prep;
+// Process-wide runner singletons (detector / vehicle / classifier / OCR). Shared
+// by the camera analysis engine, the flow vision node, local CV and the batcher —
+// none of which requires the `camera` ingest feature to exist.
+#[cfg(feature = "inference-vision-gpu")]
+pub mod runners;
 
 // Apple Vision OCR (VNRecognizeTextRequest) — ZAWSZE skompilowany na macOS/iOS,
 // bez feature flag (jak apple-tts). Systemowy silnik, nie wymaga modelu na dysku.

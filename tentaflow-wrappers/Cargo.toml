@@ -42,8 +42,14 @@ serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
 llama-cpp-sys-2 = { version = "0.1.146", optional = true }
-whisper-rs-sys = { version = "0.15.0", optional = true }
 sherpa-rs-sys = { version = "0.6.8", optional = true }
+
+# whisper.cpp NIE istnieje na Apple: tam STT idzie przez MLX-whisper. Wpis jest
+# odciety targetem, wiec feature `whisper` wlaczony na macOS/iOS nie ma czego
+# zaciagnac i jest no-opem — platformowy warunek pilnuje build system, a nie
+# pamiec tego, kto sklada liste features.
+[target.'cfg(not(any(target_os = "macos", target_os = "ios")))'.dependencies]
+whisper-rs-sys = { version = "0.15.0", optional = true }
 
 [patch.crates-io]
 llama-cpp-sys-2 = { path = "../vendor/crates/llama-cpp-sys-2" }

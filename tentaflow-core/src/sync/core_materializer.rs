@@ -2186,21 +2186,29 @@ fn apply_camera_cv_pipeline(
             // should have rejected it; a bad payload here means a buggy or
             // hostile peer). Alias existence is deliberately NOT checked:
             // `model_aliases` rows may replicate after the pipeline does.
-            let structurally_valid = serde_json::from_str::<
-                crate::services::camera_ingest::cv_pipeline::CvPipeline,
-            >(&pipeline_json)
-            .map_err(|e| e.to_string())
-            .and_then(|p| {
-                crate::services::camera_ingest::cv_pipeline::validate(&p).map_err(|e| e.to_string())
-            });
-            if let Err(err) = structurally_valid {
-                tracing::warn!(
-                    "core sync: skipping invalid camera cv pipeline '{}' from node '{}': {}",
-                    id,
-                    operation.body.actor_node_id,
-                    err
-                );
-                return Ok(0);
+            // The schema lives in `camera_ingest`, so a build without camera ingest
+            // cannot validate it — and does not need to: nothing here runs the
+            // pipeline, the row is inert. It is still written so the ledger
+            // converges, and every node that does run cameras validates its own copy.
+            #[cfg(feature = "camera")]
+            {
+                let structurally_valid = serde_json::from_str::<
+                    crate::services::camera_ingest::cv_pipeline::CvPipeline,
+                >(&pipeline_json)
+                .map_err(|e| e.to_string())
+                .and_then(|p| {
+                    crate::services::camera_ingest::cv_pipeline::validate(&p)
+                        .map_err(|e| e.to_string())
+                });
+                if let Err(err) = structurally_valid {
+                    tracing::warn!(
+                        "core sync: skipping invalid camera cv pipeline '{}' from node '{}': {}",
+                        id,
+                        operation.body.actor_node_id,
+                        err
+                    );
+                    return Ok(0);
+                }
             }
             // The default flag is seed-owned: only the fixed seed row may carry
             // is_default=1 (the partial unique index enforces at most one).

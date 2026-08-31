@@ -340,7 +340,7 @@ impl Router {
             // by sciezki HOT (detekcja) i COLD (stan/OCR) szly przez
             // `execute_camera_cv`; pusty slot = fallback na singletony
             // (bootstrap/testy bez regresji).
-            #[cfg(feature = "inference-vision-gpu")]
+            #[cfg(all(feature = "camera", feature = "inference-vision-gpu"))]
             crate::services::camera_ingest::vision_analysis::set_runtime_slot(
                 executor_slot.clone(),
             );

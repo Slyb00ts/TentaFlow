@@ -1069,7 +1069,7 @@ async fn run_server(args: Args) -> Result<()> {
     // hydrate below: the hydrate consults the worker fleet to decide which
     // cameras stay in-process — a late fleet install would double-ingest
     // worker cameras locally.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "camera", feature = "vision"))]
     let vision_workers =
         tentaflow_core::services::vision_worker::supervisor::VisionWorkerSupervisor::start(
             &config.vision,
@@ -1081,6 +1081,7 @@ async fn run_server(args: Args) -> Result<()> {
     // produkuje klatek, analiza Flow nie ma na czym pracować, status zostaje
     // "starting" forever. Cameras are a core resource (not an addon resource),
     // so they must come up at boot just like the dashboard server itself.
+    #[cfg(feature = "camera")]
     tokio::spawn(async {
         if let Err(e) =
             tentaflow_core::addon::host_functions::camera::ensure_supervisor_started().await
@@ -1100,7 +1101,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Stop the vision worker fleet first: each worker gets a link Shutdown
     // (drain + clean exit), then a bounded group kill — GPU memory must be
     // released before anything else races the teardown.
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "camera", feature = "vision"))]
     if let Some(sup) = &vision_workers {
         sup.stop().await;
     }
@@ -1141,6 +1142,7 @@ async fn run_server(args: Args) -> Result<()> {
     // Stop every active camera session (drains the F1a CameraIngestSupervisor
     // singleton). GStreamer pipelines must terminate before the runtime
     // shuts down, otherwise EOS messages race the tokio worker teardown.
+    #[cfg(feature = "camera")]
     tentaflow_core::addon::host_functions::camera::shutdown_camera_supervisor_global().await;
 
     // Graceful shutdown mesh — zamyka QUIC endpoint (zwalnia port UDP) i wyrejestruje mDNS
@@ -1644,7 +1646,7 @@ fn run_vision_worker_mode(
     db: Option<PathBuf>,
     vision_config: Option<String>,
 ) -> Result<()> {
-    #[cfg(unix)]
+    #[cfg(all(unix, feature = "camera", feature = "vision"))]
     {
         let vision: tentaflow_core::config::VisionConfig = match vision_config.as_deref() {
             Some(json) => serde_json::from_str(json)
@@ -1670,10 +1672,13 @@ fn run_vision_worker_mode(
             },
         ))
     }
-    #[cfg(not(unix))]
+    #[cfg(not(all(unix, feature = "camera", feature = "vision")))]
     {
         let _ = (worker_id, gpu, link, token, db, vision_config);
-        anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)")
+        #[cfg(not(unix))]
+        anyhow::bail!("vision-worker mode requires Unix domain sockets (Linux/macOS only)");
+        #[cfg(unix)]
+        anyhow::bail!("this build has no vision pipeline (slim edition)")
     }
 }
 

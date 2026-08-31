@@ -125,7 +125,7 @@ async fn detect_local(
 ) -> Result<CameraCvResult, String> {
     use tentaflow_protocol::CvDetection;
 
-    let detector = crate::services::camera_ingest::vision_analysis::get_detector()
+    let detector = crate::vision::runners::get_detector()
         .await
         .ok_or_else(|| "detektor RF-DETR niedostępny (load nie powiódł się)".to_string())?;
     let batch = tokio::task::spawn_blocking(move || {
@@ -165,7 +165,7 @@ async fn detect_local(
 ) -> Result<CameraCvResult, String> {
     use tentaflow_protocol::CvDetection;
 
-    let detector = crate::services::camera_ingest::vision_analysis::get_detector()
+    let detector = crate::vision::runners::get_detector()
         .await
         .ok_or_else(|| "detektor RF-DETR niedostępny (load nie powiódł się)".to_string())?;
     let batch = crate::vision::burn_backend::run_blocking(move || {
@@ -202,7 +202,7 @@ async fn detect_local(
 /// detektorem.
 #[cfg(all(feature = "inference-vision-gpu", feature = "vision-ort"))]
 async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
-    let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
+    let classifier = crate::vision::runners::get_classifier()
         .await
         .ok_or_else(|| "klasyfikator stanu niedostępny (load nie powiódł się)".to_string())?;
     let stan = tokio::task::spawn_blocking(move || {
@@ -220,7 +220,7 @@ async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
 /// pamięć przy równoległych forwardach).
 #[cfg(all(feature = "inference-vision-gpu", not(feature = "vision-ort")))]
 async fn classify_local(crop: CvFrameLocal) -> Result<CameraCvResult, String> {
-    let classifier = crate::services::camera_ingest::vision_analysis::get_classifier()
+    let classifier = crate::vision::runners::get_classifier()
         .await
         .ok_or_else(|| "klasyfikator stanu niedostępny (load nie powiódł się)".to_string())?;
     let stan = crate::vision::burn_backend::run_blocking(move || {
@@ -243,7 +243,7 @@ async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult
     if matches!(mode, CvOcrMode::Adr) {
         return ocr_adr_local(crop).await;
     }
-    let ocr = crate::services::camera_ingest::vision_analysis::get_ocr()
+    let ocr = crate::vision::runners::get_ocr()
         .await
         .ok_or_else(|| "OCR tablic niedostępny (load nie powiódł się)".to_string())?;
     let tekst = tokio::task::spawn_blocking(move || {
@@ -263,7 +263,7 @@ async fn ocr_local(crop: CvFrameLocal, mode: CvOcrMode) -> Result<CameraCvResult
     if matches!(mode, CvOcrMode::Adr) {
         return ocr_adr_local(crop).await;
     }
-    let ocr = crate::services::camera_ingest::vision_analysis::get_ocr()
+    let ocr = crate::vision::runners::get_ocr()
         .await
         .ok_or_else(|| "OCR tablic niedostępny (load nie powiódł się)".to_string())?;
     let tekst = crate::vision::burn_backend::run_blocking(move || {
