@@ -13,7 +13,7 @@ WHISPER_CPP_REF="${WHISPER_CPP_REF:-v1.8.3}"
 BACKENDS="${WHISPER_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
-# Resolved here (parent shell) so the PATH/CUDACXX/HIPCXX exports reach cmake.
+# Resolved here (parent shell) so the PATH/CUDACXX exports reach cmake.
 resolve_gpu_toolchains
 
 SRC="$(repo_checkout whisper.cpp https://github.com/ggml-org/whisper.cpp.git "$WHISPER_CPP_REF")"
@@ -60,7 +60,7 @@ else
   MULTI_BACKENDS=()
   for backend in "${BACKEND_LIST[@]}"; do
     case "$backend" in
-      cuda|vulkan|rocm|metal) MULTI_BACKENDS+=("$backend") ;;
+      cuda|vulkan|metal) MULTI_BACKENDS+=("$backend") ;;
     esac
   done
 fi
@@ -87,7 +87,7 @@ build_isolated_dylib() {
   local cxx="${CXX:-c++}"
 
   # Wciagamy WSZYSTKIE zbudowane archiwa whisper.cpp (whisper + ggml + kazdy
-  # backend: cpu/cuda/metal/blas/vulkan/hip). Kazdy backend rejestruje sie w
+  # backend: cpu/cuda/metal/blas/vulkan). Kazdy backend rejestruje sie w
   # ggml_backend_registry() przez symbol `*_reg`, wiec pominiecie ktoregos (np.
   # ggml-blas auto-wykrytego z Accelerate na macOS) = "Undefined symbols:
   # _ggml_backend_blas_reg". Glob jest odporny na to, ktore backendy cmake
@@ -98,14 +98,6 @@ build_isolated_dylib() {
   done
   if [ "${#archives[@]}" -eq 0 ]; then
     echo "[whisper.cpp] brak archiwow .a w $static_dir" >&2
-    exit 1
-  fi
-  # ggml-hip is ggml-cuda compiled for HIP: same object names, same symbols,
-  # one ggml_backend_cuda_reg() registration — the two can never share one link.
-  if [ -f "$static_dir/libggml-cuda.a" ] && [ -f "$static_dir/libggml-hip.a" ]; then
-    echo "[whisper.cpp] $static_dir contains both libggml-cuda.a and libggml-hip.a;" >&2
-    echo "  the CUDA and HIP ggml backends define the same symbols and cannot be linked into one object." >&2
-    echo "  Build them as separate variants (WHISPER_CPP_BACKENDS=cuda or rocm)." >&2
     exit 1
   fi
   # Liby systemowe/frameworki dobieramy po OBECNOSCI archiwum backendu, nie po
@@ -163,10 +155,6 @@ build_isolated_dylib() {
         syslibs+=(-lcudart -lcublas -lcublasLt -lcuda -lculibos)
       fi
       has_lib ggml-vulkan && syslibs+=(-lvulkan)
-      if has_lib ggml-hip; then
-        local hip="${HIP_PATH:-/opt/rocm}"
-        syslibs+=(-L"$hip/lib" -lhipblas -lrocblas -lamdhip64)
-      fi
       has_lib ggml-blas && syslibs+=(-lopenblas)
       "$cxx" -shared -fPIC \
         -o "$out_dir/libwhisper_tf.so" \
@@ -190,7 +178,7 @@ build_backend() {
   reset_dir "$build"
   # Wipe the variant's outputs before copying: build_isolated_dylib globs
   # lib*.a, so a stale archive from a previous build (e.g. libggml-cuda.a next
-  # to a fresh libggml-hip.a) would be linked in and clash on ggml symbols.
+  # to a fresh libggml-vulkan.a) would be linked in and clash on ggml symbols.
   reset_dir "$static_dir"
   reset_dir "$dynamic_dir"
 
@@ -208,7 +196,6 @@ build_backend() {
     -DCMAKE_C_COMPILER_LAUNCHER=
     -DCMAKE_CXX_COMPILER_LAUNCHER=
     -DCMAKE_CUDA_COMPILER_LAUNCHER=
-    -DCMAKE_HIP_COMPILER_LAUNCHER=
   )
 
   if [ "$backend" = "multi" ]; then
@@ -218,7 +205,7 @@ build_backend() {
   fi
 
   case "$backend" in
-    multi|cuda|metal|vulkan|rocm|cpu) ;;
+    multi|cuda|metal|vulkan|cpu) ;;
     *) echo "Nieobsługiwany backend whisper.cpp: $backend" >&2; exit 1 ;;
   esac
 
@@ -254,10 +241,6 @@ build_backend() {
   fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
   backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
-  if backend_enabled rocm "${enabled_backends[@]}"; then
-    cmake_args+=(-DGGML_HIP=ON)
-    [ -n "${CMAKE_HIP_ARCHITECTURES:-}" ] && cmake_args+=(-DCMAKE_HIP_ARCHITECTURES="$CMAKE_HIP_ARCHITECTURES")
-  fi
 
   if backend_enabled cuda "${enabled_backends[@]}"; then
     jobs="${WHISPER_CPP_CUDA_JOBS:-4}"
@@ -269,14 +252,12 @@ build_backend() {
   backend_enabled cuda "${enabled_backends[@]}" && targets+=(ggml-cuda)
   backend_enabled metal "${enabled_backends[@]}" && targets+=(ggml-metal)
   backend_enabled vulkan "${enabled_backends[@]}" && targets+=(ggml-vulkan)
-  backend_enabled rocm "${enabled_backends[@]}" && targets+=(ggml-hip)
 
   echo "[whisper.cpp] build backend: $backend (${enabled_backends[*]:-cpu})"
   env \
     -u CMAKE_C_COMPILER_LAUNCHER \
     -u CMAKE_CXX_COMPILER_LAUNCHER \
     -u CMAKE_CUDA_COMPILER_LAUNCHER \
-    -u CMAKE_HIP_COMPILER_LAUNCHER \
     cmake "${cmake_args[@]}"
   cmake --build "$build" --target "${targets[@]}" -j"$jobs"
 

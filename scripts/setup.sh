@@ -15,15 +15,14 @@ BOLD='\033[1m'
 NC='\033[0m'
 
 # Flagi GPU. Domyslnie WSZYSTKIE wlaczone — srodowisko deweloperskie buduje
-# wariant 'multi' llama.cpp, ktory linkuje CUDA + ROCm + Vulkan naraz, wiec
+# wariant 'multi' llama.cpp, ktory linkuje CUDA + Vulkan naraz, wiec
 # runtime'y wszystkich trzech musza byc obecne, inaczej link binarki pada na
-# "unable to find library -lvulkan/-lamdhip64/...". Na maszynach bez danego
-# GPU instalacja jest nieszkodliwa (na Debian/Ubuntu ROCm bez repo AMD po prostu
-# sie pomija z ostrzezeniem). Wylacz pojedynczo: --no-cuda/--no-vulkan/--no-rocm,
+# "unable to find library -lvulkan/...". Na maszynach bez danego GPU instalacja
+# jest nieszkodliwa. Karty AMD i Intel jada na Vulkanie — nie budujemy ROCm/HIP.
+# Wylacz pojedynczo: --no-cuda/--no-vulkan,
 # albo wszystkie: --minimal (build CPU-only / per-backend variant).
 INSTALL_CUDA=true
 INSTALL_VULKAN=true
-INSTALL_ROCM=true
 # TensorRT — akceleracja inferencji vision (RF-DETR przez crate `ort`, TensorRT EP).
 # Domyslnie wlaczone na NVIDIA; pomijane bez GPU NVIDIA i na macOS (tam CoreML).
 INSTALL_TENSORRT=true
@@ -56,23 +55,21 @@ ${BOLD}TentaFlow - instalator zaleznosci${NC}
 
 Uzycie: $0 [OPCJE]
 
-GPU backends sa DOMYSLNIE instalowane (CUDA + Vulkan + ROCm) — srodowisko
+GPU backends sa DOMYSLNIE instalowane (CUDA + Vulkan) — srodowisko
 deweloperskie buduje wariant 'multi' llama.cpp, ktory linkuje wszystkie trzy.
 
 Opcje:
   --no-cuda     Pomin NVIDIA CUDA toolkit
   --no-vulkan   Pomin Vulkan SDK
-  --no-rocm     Pomin AMD ROCm (HIP runtime)
   --no-tensorrt Pomin NVIDIA TensorRT (akceleracja vision przez ort TensorRT EP)
   --no-ocr      Pomin Tesseract + langpack pol (OCR tablic ADR; narzedzie CPU)
   --minimal     Pomin WSZYSTKIE GPU backends (build CPU-only / per-backend variant)
-  --cuda/--vulkan/--rocm/--all-gpu  (zachowane dla zgodnosci — wlaczaja dany backend)
+  --cuda/--vulkan/--all-gpu  (zachowane dla zgodnosci — wlaczaja dany backend)
   -h, --help    Pokaz te pomoc
 
 Przyklady:
   $0                  # Baza + wszystkie GPU backends (domyslnie)
   $0 --minimal        # Tylko bazowe zaleznosci (bez GPU)
-  $0 --no-rocm        # Baza + CUDA + Vulkan, bez ROCm
 
 Obslugiwane systemy:
   - Arch Linux / CachyOS / Manjaro
@@ -88,15 +85,13 @@ for arg in "$@"; do
     case $arg in
         --cuda)    INSTALL_CUDA=true ;;
         --vulkan)  INSTALL_VULKAN=true ;;
-        --rocm)    INSTALL_ROCM=true ;;
         --tensorrt) INSTALL_TENSORRT=true ;;
-        --all-gpu) INSTALL_CUDA=true; INSTALL_VULKAN=true; INSTALL_ROCM=true; INSTALL_TENSORRT=true ;;
+        --all-gpu) INSTALL_CUDA=true; INSTALL_VULKAN=true; INSTALL_TENSORRT=true ;;
         --no-cuda)   INSTALL_CUDA=false ;;
         --no-vulkan) INSTALL_VULKAN=false ;;
-        --no-rocm)   INSTALL_ROCM=false ;;
         --no-tensorrt) INSTALL_TENSORRT=false ;;
         --no-ocr)    INSTALL_OCR=false ;;
-        --minimal|--cpu) INSTALL_CUDA=false; INSTALL_VULKAN=false; INSTALL_ROCM=false; INSTALL_TENSORRT=false ;;
+        --minimal|--cpu) INSTALL_CUDA=false; INSTALL_VULKAN=false; INSTALL_TENSORRT=false ;;
         --help|-h) usage; exit 0 ;;
         *)
             log_error "Nieznana opcja: $arg"
@@ -1585,156 +1580,6 @@ install_vulkan() {
     log_ok "Vulkan SDK zainstalowany"
 }
 
-# --- ROCm ---
-
-install_rocm() {
-    log_section "AMD ROCm (HIP runtime + hipBLAS)"
-
-    case "$DISTRO" in
-        arch)
-            local rocm_pkgs=(
-                hip-runtime-amd
-                hipblas
-                rocblas
-                rocsolver
-                rocm-cmake
-            )
-            log_info "Instalacja: ${rocm_pkgs[*]}"
-            run_privileged pacman -S --needed --noconfirm "${rocm_pkgs[@]}"
-            INSTALLED+=("rocm (hip-runtime-amd hipblas rocblas rocsolver)")
-
-            # ROCm instaluje sie do /opt/rocm/bin — dodaj do PATH
-            if [[ -d /opt/rocm/bin ]]; then
-                export PATH="/opt/rocm/bin:$PATH"
-
-                # bash/zsh: /etc/profile.d/
-                if ! grep -q '/opt/rocm/bin' /etc/profile.d/rocm.sh 2>/dev/null; then
-                    echo 'export PATH="/opt/rocm/bin:$PATH"' | run_privileged tee /etc/profile.d/rocm.sh >/dev/null
-                    log_info "Utworzono /etc/profile.d/rocm.sh (bash/zsh)"
-                    INSTALLED+=("rocm-path-profile")
-                fi
-
-                # fish
-                local fish_config="$HOME/.config/fish/config.fish"
-                if [[ -d "$HOME/.config/fish" ]] && ! grep -q '/opt/rocm/bin' "$fish_config" 2>/dev/null; then
-                    echo 'fish_add_path /opt/rocm/bin' >> "$fish_config"
-                    log_info "Dodano /opt/rocm/bin do fish config"
-                    INSTALLED+=("rocm-path-fish")
-                fi
-            fi
-            ;;
-        debian)
-            log_info "Sprawdzanie dostepnosci ROCm w repo..."
-            local rocm_pkgs=(rocm-dev hipblas-dev rocblas-dev)
-            if run_privileged apt-get install -y "${rocm_pkgs[@]}" 2>/dev/null; then
-                INSTALLED+=("rocm-dev hipblas-dev rocblas-dev")
-            else
-                log_warn "ROCm nie jest dostepny w obecnych repo. Dodaj repo AMD:"
-                echo ""
-                log_info "  curl -fsSL https://repo.radeon.com/rocm/rocm.gpg.key | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg"
-                log_info "  echo 'deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] https://repo.radeon.com/rocm/apt/latest \$(lsb_release -cs) main' | sudo tee /etc/apt/sources.list.d/rocm.list"
-                log_info "  sudo apt-get update && sudo apt-get install -y ${rocm_pkgs[*]}"
-                echo ""
-                log_warn "Po dodaniu repo uruchom skrypt ponownie z --rocm"
-            fi
-
-            # PATH
-            if [[ -d /opt/rocm/bin ]] && ! echo "$PATH" | grep -q "/opt/rocm/bin"; then
-                export PATH="/opt/rocm/bin:$PATH"
-                if ! grep -q '/opt/rocm/bin' /etc/profile.d/rocm.sh 2>/dev/null; then
-                    echo 'export PATH="/opt/rocm/bin:$PATH"' | run_privileged tee /etc/profile.d/rocm.sh >/dev/null
-                    INSTALLED+=("rocm-path-profile")
-                fi
-            fi
-            ;;
-        fedora)
-            # Fedora ships ROCm in its own repos (F36+). Install the known set by
-            # NAME in one transaction — llama.cpp/whisper HIP builds need the HIP
-            # runtime + hipcc, hipBLAS/rocBLAS/hipBLASLt, device-libs and comgr —
-            # then verify the three link-time libraries and fill any gap through
-            # a fixed list of alternative package names (names drift between releases).
-            local rocm_pkgs=(
-                rocm-hip-devel
-                hipblas-devel
-                rocblas-devel
-                hipcc
-                rocm-device-libs
-                rocm-comgr-devel
-                rocminfo
-                rocm-cmake
-                hipblaslt-devel
-                rocm-runtime-devel
-            )
-            # dnf5 (F41+) has --skip-unavailable; dnf4 only knows --skip-broken.
-            local dnf_skip_flag="--skip-unavailable"
-            if ! dnf --version 2>/dev/null | head -1 | grep -q '^dnf5'; then
-                dnf_skip_flag="--skip-broken"
-            fi
-            local rocm_err
-            rocm_err="$(mktemp)"
-            local rocm_ok=true
-            log_info "Instalacja: ${rocm_pkgs[*]}"
-            log_info "(moze potrwac — dnf pobiera metadane repozytoriow)"
-            if ! run_privileged dnf install -y "$dnf_skip_flag" "${rocm_pkgs[@]}" </dev/null 2> >(tee "$rocm_err" >&2); then
-                rocm_ok=false
-                log_error "dnf install pakietow ROCm nie powiodl sie:"
-                tail -n 5 "$rocm_err" | while IFS= read -r line; do log_error "  $line"; done
-            fi
-
-            # Verify the libraries the 'multi' llama.cpp variant links against.
-            # No `repoquery --whatprovides "*/lib.so"` here: a file-path query makes
-            # dnf5 download the huge filelists metadata, which looks like a hang.
-            # For a missing lib we try a fixed list of alternative package names.
-            local rocm_libs=(libamdhip64.so librocblas.so libhipblas.so)
-            local rocm_extra=()
-            local lib pkg alt_pkgs found
-            for lib in "${rocm_libs[@]}"; do
-                if ldconfig -p 2>/dev/null | grep -q "$lib" \
-                    || ls /usr/lib64/"$lib"* /opt/rocm/lib/"$lib"* &>/dev/null; then
-                    continue
-                fi
-                case "$lib" in
-                    libamdhip64.so) alt_pkgs=(rocm-hip-devel hip-devel hip-runtime-amd rocm-hip-runtime) ;;
-                    librocblas.so)  alt_pkgs=(rocblas-devel rocblas) ;;
-                    libhipblas.so)  alt_pkgs=(hipblas-devel hipblas) ;;
-                esac
-                found=false
-                for pkg in "${alt_pkgs[@]}"; do
-                    log_info "Brak $lib — probuje pakiet $pkg"
-                    if run_privileged dnf install -y "$pkg" </dev/null 2> >(tee "$rocm_err" >&2); then
-                        rocm_extra+=("$pkg")
-                        found=true
-                        break
-                    fi
-                    tail -n 5 "$rocm_err" | while IFS= read -r line; do log_error "  $line"; done
-                done
-                if [ "$found" = false ]; then
-                    log_error "Nie udalo sie zainstalowac pakietu dostarczajacego $lib (probowano: ${alt_pkgs[*]})"
-                    rocm_ok=false
-                fi
-            done
-            rm -f "$rocm_err"
-
-            if [ "$rocm_ok" = true ]; then
-                INSTALLED+=("rocm: ${rocm_pkgs[*]} ${rocm_extra[*]}")
-            else
-                log_warn "ROCm nie zainstalowal sie w calosci — sprawdz bledy dnf powyzej"
-                log_warn "(brak repo, GPG, konflikty). Dodaj repo AMD (repo.radeon.com)"
-                log_warn "lub odpal z --no-rocm jesli ta maszyna nie ma karty AMD."
-            fi
-
-            # PATH
-            if [[ -d /opt/rocm/bin ]] && ! echo "$PATH" | grep -q "/opt/rocm/bin"; then
-                export PATH="/opt/rocm/bin:$PATH"
-                if ! grep -q '/opt/rocm/bin' /etc/profile.d/rocm.sh 2>/dev/null; then
-                    echo 'export PATH="/opt/rocm/bin:$PATH"' | run_privileged tee /etc/profile.d/rocm.sh >/dev/null
-                    INSTALLED+=("rocm-path-profile")
-                fi
-            fi
-            ;;
-    esac
-}
-
 # --- Weryfikacja ---
 
 download_meeting_bot_assets() {
@@ -1986,15 +1831,6 @@ verify_installation() {
         fi
     fi
 
-    # Opcjonalne: ROCm
-    if [[ "$INSTALL_ROCM" == true ]]; then
-        if command -v hipcc &>/dev/null; then
-            log_ok "hipcc (ROCm): $(hipcc --version 2>/dev/null | head -1)"
-        else
-            log_warn "hipcc (ROCm): NIE ZNALEZIONO"
-        fi
-    fi
-
     # zvec — feature 'vector' jest OBOWIAZKOWY dla binarki tentaflow, wiec
     # natywna biblioteka musi byc obecna w vendorze, inaczej projekt sie nie zbuduje.
     local zvec_plat
@@ -2155,10 +1991,6 @@ main() {
 
     if [[ "$INSTALL_VULKAN" == true ]]; then
         install_vulkan
-    fi
-
-    if [[ "$INSTALL_ROCM" == true ]]; then
-        install_rocm
     fi
 
     verify_installation

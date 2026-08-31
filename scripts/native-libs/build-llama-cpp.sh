@@ -15,7 +15,7 @@ LLAMA_CPP_REF="${LLAMA_CPP_REF:-689e227db485c6b33d061555e74034c93a867649}"
 BACKENDS="${LLAMA_CPP_BACKENDS:-auto}"
 prepare_layout "$PLATFORM"
 require_cmd git cmake
-# Resolved here (parent shell) so the PATH/CUDACXX/HIPCXX exports reach cmake.
+# Resolved here (parent shell) so the PATH/CUDACXX exports reach cmake.
 resolve_gpu_toolchains
 
 if [ "$LLAMA_CPP_REF" = "vendored" ]; then
@@ -59,7 +59,7 @@ else
   MULTI_BACKENDS=()
   for backend in "${BACKEND_LIST[@]}"; do
     case "$backend" in
-      cuda|vulkan|rocm|metal) MULTI_BACKENDS+=("$backend") ;;
+      cuda|vulkan|metal) MULTI_BACKENDS+=("$backend") ;;
     esac
   done
 fi
@@ -101,7 +101,6 @@ build_backend() {
     -DCMAKE_C_COMPILER_LAUNCHER=
     -DCMAKE_CXX_COMPILER_LAUNCHER=
     -DCMAKE_CUDA_COMPILER_LAUNCHER=
-    -DCMAKE_HIP_COMPILER_LAUNCHER=
   )
 
   case "$PLATFORM" in
@@ -145,7 +144,7 @@ build_backend() {
   fi
 
   case "$backend" in
-    multi|cuda|metal|vulkan|rocm|cpu) ;;
+    multi|cuda|metal|vulkan|cpu) ;;
     *) echo "Nieobsługiwany backend llama.cpp: $backend" >&2; exit 1 ;;
   esac
 
@@ -172,10 +171,6 @@ build_backend() {
   fi
   backend_enabled metal "${enabled_backends[@]}" && cmake_args+=(-DGGML_METAL=ON)
   backend_enabled vulkan "${enabled_backends[@]}" && cmake_args+=(-DGGML_VULKAN=ON)
-  if backend_enabled rocm "${enabled_backends[@]}"; then
-    cmake_args+=(-DGGML_HIP=ON)
-    [ -n "${CMAKE_HIP_ARCHITECTURES:-}" ] && cmake_args+=(-DCMAKE_HIP_ARCHITECTURES="$CMAKE_HIP_ARCHITECTURES")
-  fi
 
   if backend_enabled cuda "${enabled_backends[@]}"; then
     jobs="${LLAMA_CPP_CUDA_JOBS:-4}"
@@ -187,14 +182,12 @@ build_backend() {
   backend_enabled cuda "${enabled_backends[@]}" && targets+=(ggml-cuda)
   backend_enabled metal "${enabled_backends[@]}" && targets+=(ggml-metal)
   backend_enabled vulkan "${enabled_backends[@]}" && targets+=(ggml-vulkan)
-  backend_enabled rocm "${enabled_backends[@]}" && targets+=(ggml-hip)
 
   echo "[llama.cpp] build backend: $backend (${enabled_backends[*]:-cpu})"
   env \
     -u CMAKE_C_COMPILER_LAUNCHER \
     -u CMAKE_CXX_COMPILER_LAUNCHER \
     -u CMAKE_CUDA_COMPILER_LAUNCHER \
-    -u CMAKE_HIP_COMPILER_LAUNCHER \
     cmake "${cmake_args[@]}"
   # Output łapiemy do zmiennej i grepujemy z here-stringa, a nie przez potok:
   # pod `set -o pipefail` `grep -q` zamyka potok po dopasowaniu, cmake dostaje
@@ -219,7 +212,7 @@ build_backend() {
     exit 1
   fi
 
-  append_manifest_library "$PLATFORM" "llama-cpp-$backend" "static-preferred" "$LLAMA_CPP_REF" "Backend: ${enabled_backends[*]:-cpu}. CUDA/ROCm/Vulkan mogą nadal wymagać dynamicznych bibliotek sterownika/runtime."
+  append_manifest_library "$PLATFORM" "llama-cpp-$backend" "static-preferred" "$LLAMA_CPP_REF" "Backend: ${enabled_backends[*]:-cpu}. CUDA/Vulkan mogą nadal wymagać dynamicznych bibliotek sterownika/runtime."
 }
 
 for backend in "${BACKEND_LIST[@]}"; do

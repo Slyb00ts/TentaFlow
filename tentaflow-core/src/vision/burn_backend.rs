@@ -4,7 +4,8 @@
 //
 // One backend type for all camera-CV models, chosen by feature so the same
 // codegen'd models run natively per platform: CUDA (NVIDIA, NVRTC), Metal
-// (Apple), ROCm (AMD), or wgpu (Vulkan/DX12/WebGPU) as the universal fallback.
+// (Apple), or wgpu (Vulkan/DX12/WebGPU) as the universal fallback. AMD and Intel
+// GPUs run on the wgpu/Vulkan path.
 // The model architectures are vendored in `generated/` (build-time ONNX→Burn
 // codegen); only the `.bpk` weights load at runtime.
 
@@ -20,28 +21,9 @@ pub type VisionBackend = burn::backend::Metal<f32, i32>;
 #[cfg(all(feature = "vision-metal", not(feature = "vision-cuda")))]
 pub type VisionDevice = burn::backend::wgpu::WgpuDevice;
 
-#[cfg(all(
-    feature = "vision-rocm",
-    not(any(feature = "vision-cuda", feature = "vision-metal"))
-))]
-pub type VisionBackend = burn::backend::Rocm<f32, i32>;
-#[cfg(all(
-    feature = "vision-rocm",
-    not(any(feature = "vision-cuda", feature = "vision-metal"))
-))]
-pub type VisionDevice = burn::backend::rocm::RocmDevice;
-
-#[cfg(not(any(
-    feature = "vision-cuda",
-    feature = "vision-metal",
-    feature = "vision-rocm"
-)))]
+#[cfg(not(any(feature = "vision-cuda", feature = "vision-metal")))]
 pub type VisionBackend = burn::backend::wgpu::Wgpu<f32, i32>;
-#[cfg(not(any(
-    feature = "vision-cuda",
-    feature = "vision-metal",
-    feature = "vision-rocm"
-)))]
+#[cfg(not(any(feature = "vision-cuda", feature = "vision-metal")))]
 pub type VisionDevice = burn::backend::wgpu::WgpuDevice;
 
 /// Default device for the selected backend.

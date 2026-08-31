@@ -91,9 +91,9 @@ managed services:
 | **Speaker diarization** | pure-Rust VAD + speaker embeddings (`tentaflow-voice`), voice-profile enrollment |
 
 Services deploy as **Docker containers, native bundles (Python venv / prebuilt binaries) or external
-endpoints** — the 4-step wizard detects your hardware (CUDA / ROCm / Metal / Vulkan / XPU / CPU),
+endpoints** — the 4-step wizard detects your hardware (CUDA / Metal / Vulkan / XPU / CPU),
 searches HuggingFace Hub, estimates VRAM and lets you pick GPUs per deployment. GPU acceleration is
-available for llama.cpp and Whisper via CUDA, Vulkan, ROCm and Metal. A built-in **vector database**
+available for llama.cpp and Whisper via CUDA, Vulkan and Metal. A built-in **vector database**
 (`tentaflow-zvec`, embedded on every platform) powers semantic search, RAG and long-term memory;
 external **Milvus** is supported for hybrid dense+sparse retrieval.
 
@@ -369,7 +369,7 @@ Open the dashboard at **https://localhost:8090**.
 
 Useful `tentaflow-core` features: `inference-llamacpp`,
 `inference-whisper` (default), `inference-sherpa`, `inference-mlx*` (Apple), `inference-diarization`,
-`gpu-cuda`, `gpu-vulkan`, `gpu-rocm`, `vision-rocm`, `docker`.
+`gpu-cuda`, `gpu-vulkan`, `docker`.
 
 Warianty głównej ścieżki vision:
 
@@ -379,16 +379,12 @@ cargo build --release --features gpu-cuda
 
 # AMD/Intel: Burn przez WGPU/Vulkan
 cargo build --release --features gpu-vulkan
-
-# AMD: Burn przez ROCm/HIP
-cargo build --release --features gpu-rocm
 ```
 
-Na kartach AMD i Intel rekomendowany jest build z Vulkan/WGPU dla głównej ścieżki
-vision (RF-DETR, Stan i OCR) oraz llama.cpp. Nie wymaga on CUDA ani `nvcc`; ROCm/HIP
-warto włączyć dla lokalnego llama.cpp lub jako natywny backend Burn na AMD. Przykład
-dla Radeon AI PRO R9700:
-`CMAKE_HIP_ARCHITECTURES=gfx1201 LLAMA_CPP_BACKENDS=rocm ./scripts/native-libs/build-all.sh`.
+Karty AMD i Intel jadą na Vulkan/WGPU — zarówno główna ścieżka vision (RF-DETR, Stan
+i OCR), jak i llama.cpp. Nie wymaga to CUDA ani `nvcc`. HIP/ROCm nie jest wspierany:
+utrzymywanie dwóch wykluczających się backendów ggml (te same symbole) dawało build
+zależny od tego, który sterownik odpowiedział w trakcie kompilacji.
 CUDA-owy preprocessing zero-copy pozostaje osobną, jawną funkcją `gpu-cuda`/`vision-cuda`;
 Supertonic może nadal korzystać z ORT, ale nie wymusza już ORT dla wizji. NVIDIA z
 `gpu-cuda` zachowuje ścieżkę ORT/TensorRT/CUDA.

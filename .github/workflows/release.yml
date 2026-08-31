@@ -1,11 +1,11 @@
 # =============================================================================
 # File:        .github/workflows/release.yml
 # Description: Builds one monolithic tentaflow binary per platform with every
-#              available GPU backend compiled in (CUDA + ROCm + Vulkan + RDMA
-#              on Linux x86_64, CUDA + Vulkan on Linux aarch64 and Windows,
-#              Metal + MLX on macOS). At runtime tentaflow / llama.cpp-style
-#              ggml pick the best backend that the host actually has — same
-#              binary works on NVIDIA, AMD, Intel, CPU-only without rebuild.
+#              available GPU backend compiled in (CUDA + Vulkan + RDMA on Linux
+#              x86_64, CUDA + Vulkan on Linux aarch64 and Windows, Metal + MLX
+#              on macOS). At runtime tentaflow / llama.cpp-style ggml pick the
+#              best backend that the host actually has — same binary works on
+#              NVIDIA, CPU-only without rebuild; AMD and Intel run on Vulkan.
 # =============================================================================
 
 name: release
@@ -29,7 +29,7 @@ jobs:
         include:
           - target: x86_64-unknown-linux-gnu
             runner: ubuntu-latest
-            features: "rdma-probe,gpu-cuda,gpu-vulkan,gpu-rocm"
+            features: "rdma-probe,gpu-cuda,gpu-vulkan"
             cache_id: "linux-x64-all"
           - target: aarch64-unknown-linux-gnu
             runner: ubuntu-24.04-arm
@@ -295,68 +295,11 @@ jobs:
           Write-Host "Vulkan headers + lib verified."
 
       # ---------------------------------------------------------------------
-      # ROCm — tylko Linux x86_64 (ARM Linux ROCm = tylko Instinct, pomijamy;
-      # Windows ROCm jest w preview, SDK install w CI niestabilny).
-      # ---------------------------------------------------------------------
-      # ---------------------------------------------------------------------
-      # RDMA — Linux. Instalujemy PRZED ROCm, zeby libnl-3-dev / librdmacm1t64
-      # nie wpadly w tangel z ROCm deps.
+      # RDMA — Linux.
       # ---------------------------------------------------------------------
       - name: Install RDMA headers
         if: contains(matrix.features, 'rdma-probe')
         run: sudo apt-get install -y libibverbs-dev librdmacm-dev libnl-3-dev libnl-route-3-dev
-
-      - name: Install ROCm (latest stable)
-        if: contains(matrix.features, 'gpu-rocm')
-        run: |
-          sudo apt-get install -y wget gnupg
-          wget -qO- https://repo.radeon.com/rocm/rocm.gpg.key \
-            | sudo gpg --dearmor -o /etc/apt/trusted.gpg.d/rocm.gpg
-          CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
-          # Pinujemy na konkretna wersje ROCm (7.2) zamiast `latest`.
-          # `latest` = floating tag — AMD usuwa stare .deb pliki z poola gdy
-          # pushuje nowy release, a Packages index nie jest jeszcze odswiezony
-          # → apt widzi referencje do pliku ktorego CDN juz nie ma (404).
-          # `apt/7.2` to zamrozona wersja, pliki stabilne.
-          echo "deb [arch=amd64] https://repo.radeon.com/rocm/apt/7.2 ${CODENAME} main" \
-            | sudo tee /etc/apt/sources.list.d/rocm.list
-          # Pin=600 forsuje ROCm wersje z repo.radeon.com nad Ubuntu (500).
-          # KONIECZNE — Ubuntu noble ma swoje `rocminfo 5.7.1`, `rocm-cmake 6.0.0`,
-          # `hipcc 5.7.1` (stare, niekompatybilne z ROCm 7.x meta-packageami).
-          # Bez pin>500 apt wybiera Ubuntu version i `rocm-hip-runtime` z AMD
-          # (ktore wymaga rocminfo 1.0.0.70201 from ROCm 7) konfliktuje.
-          echo -e "Package: *\nPin: release o=repo.radeon.com\nPin-Priority: 600" \
-            | sudo tee /etc/apt/preferences.d/rocm-pin-600
-          sudo apt-get update
-          # NIE uzywamy `rocm-hip-sdk` / `rocm-hip-runtime` meta-packageow —
-          # AMD CDN ma niekompletny pool dla tych meta .deb (7.2.1.70201
-          # zwraca 404 na rocm-hip-runtime_*.deb mimo obecnosci w Packages
-          # index). Zamiast tego instalujemy konkretne biblioteki ktorych
-          # ggml-hip / llama.cpp HIP backend faktycznie potrzebuje —
-          # omijamy brakujacy meta plik.
-          ROCM_PKGS="hipcc hip-dev hip-runtime-amd hsa-rocr-dev \
-            hipblas hipblas-dev rocblas rocblas-dev \
-            rocsolver rocsolver-dev rocsparse rocsparse-dev \
-            rocrand rocrand-dev hiprand-dev \
-            rocm-device-libs rocm-llvm rocm-cmake comgr \
-            rocthrust-dev hipcub-dev rocprim-dev"
-          for attempt in 1 2 3; do
-            if sudo apt-get install -y $ROCM_PKGS; then
-              break
-            fi
-            echo "ROCm install attempt $attempt failed, retrying in 15s..."
-            sleep 15
-            sudo apt-get update
-          done
-          dpkg -s hipcc hipblas-dev rocblas-dev hip-dev >/dev/null 2>&1 \
-            || { echo "ROCm install incomplete after 3 attempts"; exit 1; }
-          ROCM_VERSION=$(ls -d /opt/rocm-* 2>/dev/null | sed 's|/opt/rocm-||' | sort -V | tail -n1)
-          echo "Installed ROCm: ${ROCM_VERSION:-unknown}"
-          echo "/opt/rocm/lib" | sudo tee /etc/ld.so.conf.d/rocm.conf
-          sudo ldconfig
-          echo "ROCM_PATH=/opt/rocm" >> "$GITHUB_ENV"
-          echo "HIP_PATH=/opt/rocm" >> "$GITHUB_ENV"
-          echo "/opt/rocm/bin" >> "$GITHUB_PATH"
 
       # ---------------------------------------------------------------------
       # Cache + build
