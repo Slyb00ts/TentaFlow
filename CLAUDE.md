@@ -64,9 +64,11 @@ Two invariants make this work:
   to MLX-whisper. Cargo cannot express "feature only on target X"; this is where that
   invariant is enforced.
 - **The catalog is filtered where it is generated.** `build.rs::is_slim_edition()` (no
-  local-engine feature set) makes the service-manifest generator keep only utility infra
-  (`resource_kind = "infra"`) and remote-only providers (`[deploy.external]` as the sole
-  deploy section) — 20 entries instead of 94. It filters in the ONE generator because both
+  local-engine feature set) makes the service-manifest generator keep utility infra
+  (`resource_kind = "infra"`) and every cloud provider (anything with `[deploy.external]`)
+  — 21 entries instead of 94. An engine reachable both remotely and locally (ollama) keeps
+  only its external section: the local deploy would pull a model, which is the one thing
+  this edition does not do. It filters in the ONE generator because both
   the Rust registry (`services_generated.rs`) and the GUI catalog
   (`www/js/generated/services-manifest.js`) come out of it; filtering one path only would
   show tiles the backend then refuses to deploy.

@@ -2552,17 +2552,27 @@ fn generate_services_manifest(out_dir: &Path) {
     if is_slim_edition() {
         let before = loaded.len();
         loaded.retain(|m| {
-            let infra = m.engine.resource_kind == Some(ResourceKind::Infra);
-            let remote_only = m.deploy.external.is_some()
-                && m.deploy.docker.is_none()
-                && m.deploy.native.is_none();
-            infra || remote_only
+            m.engine.resource_kind == Some(ResourceKind::Infra) || m.deploy.external.is_some()
         });
+        // Silnik dostepny i zdalnie, i lokalnie (ollama) zostaje w katalogu, ale
+        // wylacznie jako endpoint — lokalny deploy sciaga model, czyli dokladnie
+        // to, czego slim nie robi.
+        let mut trimmed = 0usize;
+        for m in loaded.iter_mut() {
+            if m.engine.resource_kind != Some(ResourceKind::Infra)
+                && (m.deploy.docker.is_some() || m.deploy.native.is_some())
+            {
+                m.deploy.docker = None;
+                m.deploy.native = None;
+                trimmed += 1;
+            }
+        }
         println!(
             "cargo:warning=Edycja slim: katalog ograniczony do {} pozycji z {} \
-             (ukryto silniki modelowe — brak lokalnej inferencji w tym buildzie)",
+             (ukryto silniki modelowe; {} zostawiono tylko jako zdalny endpoint)",
             loaded.len(),
-            before
+            before,
+            trimmed
         );
     }
 
