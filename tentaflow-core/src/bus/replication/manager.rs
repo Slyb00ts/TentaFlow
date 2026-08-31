@@ -1557,6 +1557,10 @@ impl ReplicationCoordinator for ReplicationManager {
     fn isr_shrink_total(&self) -> u64 {
         self.isr_shrink_total.load(Ordering::Relaxed)
     }
+
+    fn local_node_id(&self) -> String {
+        self.local_node_id.clone()
+    }
 }
 
 // ===== Real production implementations ======================================

@@ -1339,6 +1339,25 @@ pub trait ReplicationCoordinator: Send + Sync {
     /// Snapshot for the M06 UI/`ReplicaListResponse` (`topic: None` means
     /// every topic in `org`).
     fn snapshot(&self, org: &str, topic: Option<&str>) -> ReplicationSnapshot;
+    /// This node's own identity — independent of `snapshot()`, whose
+    /// `nodes` list is populated ENTIRELY from existing partition
+    /// assignments (`registry`'s own `replicas` lists). `create_topic`
+    /// used to derive its own node id by searching `snapshot(org, None)
+    /// .nodes` for `is_local`, which is circular: a fresh org (or, as a
+    /// live krytyk pass on a real cluster found, ANY org where nothing has
+    /// ever successfully proposed an assignment) has an empty registry, so
+    /// `is_local` is never found, `create_topic` silently proposes NO
+    /// assignment for ANY topic, forever — the registry can never
+    /// bootstrap its own first entry. Defaulted to `""` (matching
+    /// `isr_shrink_total`'s precedent) so a test fake that never exercises
+    /// `create_topic`'s placement path keeps compiling unchanged;
+    /// `ReplicationManager` is the only override that matters. Returns an
+    /// owned `String` (not `&str`) so a test double can keep this behind a
+    /// `Mutex` — this is only ever called once per `create_topic`, never a
+    /// hot path.
+    fn local_node_id(&self) -> String {
+        String::new()
+    }
     /// M2 (PLAN §8.4): running total of ISR-membership shrinks this
     /// coordinator has observed across every partition it manages — feeds
     /// `tentaflow_bus_isr_shrink_total`. Defaulted to `0` so every existing
@@ -2408,24 +2427,32 @@ impl BusService {
         let env = crate::services::environment::get_node_environment(&self.db);
 
         let coordinator = self.replication();
-        // `local_node_id`/`same_env_replicas`: only computed when a
-        // coordinator is installed AND it can identify itself in its own
-        // snapshot (`ReplicaNodeInfo.is_local`) — a coordinator that cannot
-        // (e.g. a stub in a test that never populates `snapshot`) leaves
-        // `opts.replication_factor` exactly as the caller passed it and
-        // proposes no assignments, same as "no coordinator" would.
+        // `local_node_id` comes straight from the coordinator's own
+        // identity (`ReplicationCoordinator::local_node_id`), NOT by
+        // searching `snapshot(org, None).nodes` for `is_local` (the bug a
+        // live krytyk pass on M2 found): `snapshot()`'s `nodes` list is
+        // populated ENTIRELY from existing partition assignments, so a
+        // fresh org's empty registry can never contain an `is_local` entry
+        // to find — every `create_topic` call silently proposed zero
+        // assignments, forever, because the registry could never bootstrap
+        // its own first row. `same_env_replicas` still comes from the
+        // snapshot (a real, lesser limitation: the very first topic in a
+        // brand-new multi-node cluster still can't discover OTHER peers
+        // this way and settles for RF=1 on this node alone — but unlike
+        // the identity check, this self-corrects, since every topic after
+        // that first one sees the growing registry). An empty
+        // `local_node_id()` (a coordinator that never overrides the
+        // trait's default, e.g. a test fake) leaves `opts.replication_
+        // factor` exactly as the caller passed it and proposes no
+        // assignments, same as "no coordinator" would.
         let mut placement: Option<(String, Vec<String>)> = None;
         if let Some(coordinator) = &coordinator {
+            let local_node_id = coordinator.local_node_id();
             let snapshot = coordinator.snapshot(&ctx.org_id, None);
-            let local_node_id = snapshot
-                .nodes
-                .iter()
-                .find(|n| n.is_local)
-                .map(|n| n.node_id.clone());
             let mut same_env: Vec<String> = snapshot
                 .nodes
                 .iter()
-                .filter(|n| n.environment == env && n.reachable && !n.is_local)
+                .filter(|n| n.environment == env && n.reachable && n.node_id != local_node_id)
                 .map(|n| n.node_id.clone())
                 .collect();
             same_env.sort();
@@ -2436,7 +2463,7 @@ impl BusService {
                 let healthy = (same_env.len() as u32 + 1).min(3);
                 opts.replication_factor = Some(healthy);
             }
-            if let Some(local_node_id) = local_node_id {
+            if !local_node_id.is_empty() {
                 placement = Some((local_node_id, same_env));
             }
         }
@@ -9855,6 +9882,7 @@ mod tests {
         note_offset_commit_calls: parking_lot::Mutex<Vec<(String, String, String, u32, u64, u32)>>,
         snapshot: parking_lot::Mutex<ReplicationSnapshot>,
         reassign_calls: parking_lot::Mutex<Vec<(String, String, Option<u32>)>>,
+        local_node_id: parking_lot::Mutex<String>,
     }
 
     impl FakeCoordinator {
@@ -9870,6 +9898,7 @@ mod tests {
                 note_offset_commit_calls: parking_lot::Mutex::new(Vec::new()),
                 snapshot: parking_lot::Mutex::new(ReplicationSnapshot::default()),
                 reassign_calls: parking_lot::Mutex::new(Vec::new()),
+                local_node_id: parking_lot::Mutex::new(String::new()),
             })
         }
         fn set_role(&self, role: PartitionRole) {
@@ -9883,6 +9912,9 @@ mod tests {
         }
         fn set_snapshot(&self, snapshot: ReplicationSnapshot) {
             *self.snapshot.lock() = snapshot;
+        }
+        fn set_local_node_id(&self, id: &str) {
+            *self.local_node_id.lock() = id.to_string();
         }
     }
 
@@ -9968,6 +10000,9 @@ mod tests {
         }
         fn snapshot(&self, _org: &str, _topic: Option<&str>) -> ReplicationSnapshot {
             self.snapshot.lock().clone()
+        }
+        fn local_node_id(&self) -> String {
+            self.local_node_id.lock().clone()
         }
     }
 
@@ -10236,6 +10271,128 @@ mod tests {
             .peek(&ctx, "orders.repl-consume-not-leader", 0, 0, 10, 1024)
             .unwrap_err();
         assert!(matches!(err, BusServiceError::NotLeader { .. }));
+    }
+
+    /// Full-migration fixture (real `sync::runtime` + a REAL `Sqlite
+    /// LedgerAssignmentStore`), separate from `test_service()`'s lighter
+    /// bus-tables-only DB — needed because `create_topic`'s placement path
+    /// (`assignment_store().propose`) round-trips through the sync runtime,
+    /// which `test_service()`'s minimal fixture never initializes. Same
+    /// pattern as `db::repository::bus_repository_tests::
+    /// locked_ledger_fixture` and `replication::assignment::tests`'s own
+    /// copy — confirmed safe to coexist (`sync::runtime::init` is
+    /// idempotent process-wide; the returned guard serializes every test
+    /// using any of these three copies against each other).
+    fn locked_ledger_fixture() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if INITIALIZED.get().is_none() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("TENTAFLOW_HOME", tmp.path());
+            let conn = rusqlite::Connection::open_in_memory().expect("open db");
+            crate::db::migrations::run(&conn).expect("run migrations");
+            let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+            let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[13u8; 32]));
+            let security = std::sync::Arc::new(
+                crate::mesh::security::MeshSecurity::new(db.clone(), cipher.clone())
+                    .expect("mesh security"),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                    Ok(_) => break,
+                    Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("sync runtime init: {e:?}"),
+                }
+            }
+            std::mem::forget(tmp);
+            let _ = INITIALIZED.set(());
+        }
+        guard
+    }
+
+    /// Fala 4 finding (root cause, not just the `NotLeader` symptom the
+    /// test above covers): `create_topic` used to derive its own node
+    /// identity by searching `coordinator.snapshot(org, None).nodes` for
+    /// `is_local` — but that list is populated ENTIRELY from existing
+    /// partition assignments, so a fresh org's empty registry can never
+    /// contain an `is_local` entry, and `create_topic` silently proposed
+    /// ZERO assignments for every topic it ever created. Verified live: a
+    /// brand-new topic created through the running release app's own UI
+    /// (real coordinator, real mesh) left `bus_partition_assignments`
+    /// completely empty for it. This test proves the fix (`coordinator.
+    /// local_node_id()`, independent of the registry) on a REAL runtime/
+    /// ledger: a `FakeCoordinator` whose `snapshot()` still reports ZERO
+    /// nodes (the exact bootstrap-bug scenario) but whose `local_node_id`
+    /// IS set must still get a real assignment proposed and materialized.
+    #[test]
+    fn create_topic_proposes_an_assignment_even_when_the_registry_snapshot_is_still_empty() {
+        let _guard = locked_ledger_fixture();
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let bus_dir = dir.path().join("bus");
+        // A fully-migrated DB of its own (not the throwaway one `locked_
+        // ledger_fixture` used only to install the process-wide sync
+        // runtime singleton) — `store.propose`/`create_topic` write
+        // directly into whatever pool they are handed, same convention as
+        // `db::repository::bus_repository_tests`'s own tests.
+        let conn = rusqlite::Connection::open_in_memory().expect("open db");
+        crate::db::migrations::run(&conn).expect("run migrations");
+        let db: DbPool = Arc::new(crate::db::Db::from_connection(conn));
+        let svc = BusService::new(BusInitConfig {
+            bus_dir,
+            db: db.clone(),
+            authorizer: Arc::new(AllowAllAuthorizer),
+            retention_interval: None,
+            dedup_expected_rate_per_sec: 10_000,
+            partition_handle_lru: None,
+            publish_ack_timeout: DEFAULT_PUBLISH_ACK_TIMEOUT,
+        })
+        .expect("bus service");
+
+        let coord = FakeCoordinator::leader(1);
+        coord.set_local_node_id("self-node");
+        // Deliberately still empty — the exact registry state a fresh org
+        // (or, as the live krytyk pass found, this cluster after DAYS of
+        // real use) has before its first assignment ever lands.
+        coord.set_snapshot(ReplicationSnapshot::default());
+        svc.set_replication(coord);
+        svc.set_assignment_store(Arc::new(
+            replication::assignment::SqliteLedgerAssignmentStore::new(db.clone()),
+        ));
+
+        let ctx = test_ctx("org-bootstrap");
+        svc.create_topic(
+            &ctx,
+            "krytyk.regression.bootstrap",
+            topics::TopicOptions {
+                partitions: Some(2),
+                ..Default::default()
+            },
+        )
+        .expect("create_topic");
+
+        let store = replication::assignment::SqliteLedgerAssignmentStore::new(db);
+        let mut rows = store.list_for_node("self-node").expect("list_for_node");
+        rows.sort_by_key(|a| a.partition);
+        assert_eq!(
+            rows.len(),
+            2,
+            "create_topic must propose one assignment per partition even when \
+             coordinator.snapshot() still reports zero nodes — got {rows:?}"
+        );
+        for (i, row) in rows.iter().enumerate() {
+            assert_eq!(row.partition, i as u32);
+            assert_eq!(row.leader_node_id, "self-node");
+            assert_eq!(row.replicas, vec!["self-node".to_string()]);
+            assert_eq!(row.leader_epoch, 1);
+        }
     }
 
     #[test]
