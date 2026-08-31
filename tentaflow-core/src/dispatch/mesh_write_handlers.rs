@@ -2426,7 +2426,7 @@ async fn run_cluster_deploy_phases(
             };
             let tail = if m.node_id == local_id {
                 match qm.command_executor().await {
-                    Some(ex) => match ex.execute(local_id, cmd).await {
+                    Some(ex) => match ex.execute(&local_id, cmd).await {
                         resp if resp.ok => match resp.payload {
                             MeshCommandResponsePayload::ContainerLogsResult { logs } => Some(logs),
                             _ => None,

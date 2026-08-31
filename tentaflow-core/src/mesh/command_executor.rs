@@ -2857,7 +2857,7 @@ impl MeshCommandExecutor {
                 .stdout(true)
                 .stderr(true)
                 .follow(false)
-                .tail(tail)
+                .tail(&tail)
                 .build();
             use futures::StreamExt;
             let mut stream = docker.logs(container_id, Some(opts));

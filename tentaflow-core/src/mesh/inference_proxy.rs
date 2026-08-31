@@ -876,6 +876,8 @@ fn relay_chat_chunk(
     chat_chunk: crate::api::openai::types::ChatCompletionChunk,
     tx: &tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
 ) {
+    use tentaflow_protocol::{ModelStreamChunk, StreamChunkType};
+
     let Some(choice) = chat_chunk.choices.into_iter().next() else {
         return;
     };
