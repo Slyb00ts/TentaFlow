@@ -156,12 +156,23 @@ pub async fn init(cfg: ReplicationInitConfig) -> anyhow::Result<Arc<ReplicationM
     spawn_peer_disconnect_loop(Arc::clone(&manager), Arc::clone(&cfg.mesh));
     spawn_assignment_poll_loop(
         Arc::clone(&manager),
-        ledger_store,
+        Arc::clone(&ledger_store),
         cfg.local_node_id.clone(),
     );
 
     match crate::bus::global() {
-        Some(svc) => svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>),
+        Some(svc) => {
+            svc.set_replication(Arc::clone(&manager) as Arc<dyn ReplicationCoordinator>);
+            // Without this, `create_topic`'s assignment-proposal block
+            // (`bus::mod`'s `self.assignment_store()`) is permanently `None`
+            // on every production node — `set_replication` alone wires the
+            // coordinator (role/preflight/snapshot), not the store
+            // `create_topic` proposes new partition assignments into. A live
+            // krytyk pass on M2 found the registry never got its first row
+            // on a real cluster even after the `local_node_id` bootstrap fix
+            // landed, because this call was simply missing.
+            svc.set_assignment_store(ledger_store.clone());
+        }
         None => {
             tracing::warn!(
                 "replication::init: bus::global() has no BusService yet — \
