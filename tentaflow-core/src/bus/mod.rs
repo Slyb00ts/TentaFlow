@@ -84,6 +84,7 @@ pub mod dlq;
 pub mod groups;
 pub mod producer;
 pub mod quota;
+pub mod reactor;
 pub mod replication;
 pub mod retention;
 pub mod topics;

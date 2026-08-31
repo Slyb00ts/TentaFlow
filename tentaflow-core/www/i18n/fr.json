@@ -3101,7 +3101,10 @@
       "workspace_context": "Contexte du workspace",
       "patch_review": "Revue des modifications",
       "exec_command": "Commande dans le bac à sable",
-      "delegate_cli": "Déléguer à un agent CLI"
+      "delegate_cli": "Déléguer à un agent CLI",
+      "bus_consume": "Consommation du bus",
+      "bus_publish": "Publication sur le bus",
+      "bus_transform": "Transformation du bus"
     },
     "node_descriptions": {
       "trigger": "Point d'entrée du flow (HTTP, QUIC, webhook)",
@@ -3138,7 +3141,10 @@
       "workspace_context": "Rattache le tour à une session Code Studio : état du dépôt via le broker, branche, fichiers modifiés, chaîne d'outils, et AGENTS.md / CLAUDE.md insérés comme données derrière une clôture anti-injection. Publie les outils Code Studio autorisés pour l'agent.",
       "patch_review": "Ferme le jeu de modifications, présente le diff et bloque l'exécution jusqu'à la décision d'une personne. Enregistre les verdicts par fichier ou par hunk, reconstruit un fichier à partir des hunks acceptés et détecte un conflit d'édition concurrente. La même implémentation sert de porte à core.git_commit.",
       "exec_command": "Une commande exécutée par le graphe, pas par le modèle : argv uniquement (il n'y a pas de shell). L'accès au montage et au réseau demandé ne peut que restreindre ce que la politique a autorisé.",
-      "delegate_cli": "Confie un tour à un agent CLI externe (Codex, Claude Code) : délivre un ticket d'adaptateur via le PEP, démarre une instance de la CLI sur le service passerelle choisi, diffuse ses événements dans la chronologie de la session et répond à ses demandes d'autorisation avec le même PEP que le reste de la session. Les identifiants de l'organisation n'entrent jamais dans le processus de la CLI : il reçoit un ticket lié à cette exécution, au modèle et à un budget de jetons ; un budget dépassé coupe le trafic et termine l'exécution par une erreur."
+      "delegate_cli": "Confie un tour à un agent CLI externe (Codex, Claude Code) : délivre un ticket d'adaptateur via le PEP, démarre une instance de la CLI sur le service passerelle choisi, diffuse ses événements dans la chronologie de la session et répond à ses demandes d'autorisation avec le même PEP que le reste de la session. Les identifiants de l'organisation n'entrent jamais dans le processus de la CLI : il reçoit un ticket lié à cette exécution, au modèle et à un budget de jetons ; un budget dépassé coupe le trafic et termine l'exécution par une erreur.",
+      "bus_consume": "Point d'entrée réactif : le flow démarre quand le réacteur du bus (TentaBus) récupère un nouveau lot d'enregistrements du sujet/groupe souscrit",
+      "bus_publish": "Publie le payload de l'envelope comme un enregistrement sur un sujet TentaBus et laisse passer l'envelope inchangé",
+      "bus_transform": "Transforme le payload de l'envelope avec une expression CEL (payload/vars/artifacts/meta) et le remplace par le résultat"
     },
     "fields": {
       "model": "Modèle",

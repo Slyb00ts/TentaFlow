@@ -3101,7 +3101,10 @@
       "workspace_context": "Contexto del workspace",
       "patch_review": "Revisión de cambios",
       "exec_command": "Comando en el sandbox",
-      "delegate_cli": "Delegar en un agente CLI"
+      "delegate_cli": "Delegar en un agente CLI",
+      "bus_consume": "Consumo del bus",
+      "bus_publish": "Publicación en el bus",
+      "bus_transform": "Transformación del bus"
     },
     "node_descriptions": {
       "trigger": "Punto de entrada del flow (HTTP, QUIC, webhook)",
@@ -3138,7 +3141,10 @@
       "workspace_context": "Vincula el turno a una sesión de Code Studio: estado del repositorio desde el broker, rama, archivos modificados, toolchain y AGENTS.md / CLAUDE.md insertados como datos tras una valla anti-inyección. Publica las herramientas de Code Studio que el agente puede usar.",
       "patch_review": "Cierra el conjunto de cambios, muestra el diff y detiene la ejecución hasta que una persona decida. Registra los veredictos por archivo o por hunk, reconstruye un archivo a partir de los hunks aceptados y detecta un conflicto por edición concurrente. La misma implementación sostiene la puerta de core.git_commit.",
       "exec_command": "Un comando que ejecuta el grafo, no el modelo: solo argv (no hay shell). El acceso de montaje y de red solicitado únicamente puede restringir lo que la política permitió.",
-      "delegate_cli": "Entrega un turno a un agente CLI externo (Codex, Claude Code): emite un tique del adaptador a través del PEP, arranca una instancia de la CLI en el servicio puente elegido, transmite sus eventos a la cronología de la sesión y responde a sus solicitudes de permiso con el mismo PEP que el resto de la sesión. La credencial de la organización nunca entra en el proceso de la CLI: recibe un tique ligado a esta ejecución, al modelo y a un presupuesto de tokens; superar el presupuesto corta el tráfico y termina la ejecución con un error."
+      "delegate_cli": "Entrega un turno a un agente CLI externo (Codex, Claude Code): emite un tique del adaptador a través del PEP, arranca una instancia de la CLI en el servicio puente elegido, transmite sus eventos a la cronología de la sesión y responde a sus solicitudes de permiso con el mismo PEP que el resto de la sesión. La credencial de la organización nunca entra en el proceso de la CLI: recibe un tique ligado a esta ejecución, al modelo y a un presupuesto de tokens; superar el presupuesto corta el tráfico y termina la ejecución con un error.",
+      "bus_consume": "Punto de entrada reactivo: el flow arranca cuando el reactor del bus (TentaBus) obtiene un nuevo lote de registros del tema/grupo suscrito",
+      "bus_publish": "Publica el payload del envelope como un registro en un tema de TentaBus y deja pasar el envelope sin cambios",
+      "bus_transform": "Transforma el payload del envelope con una expresión CEL (payload/vars/artifacts/meta) y lo sustituye por el resultado"
     },
     "fields": {
       "model": "Modelo",

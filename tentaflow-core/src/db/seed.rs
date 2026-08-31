@@ -952,6 +952,33 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "share-2",
             r#"{"properties":{"model":{"type":"string","title":"Model / alias ekstrakcji","description":"Model czatu wyciągający encje i relacje z chunków; domyślnie rag-llm","dynamic_enum":{"source":"models","category":"chat"},"default":"rag-llm"},"collection":{"type":"string","title":"Kolekcja grafu","description":"Kolekcja grafowa instancji, do której trafiają encje i relacje","default":"kg_active"},"batch_chars":{"type":"integer","title":"Znaków na wywołanie","description":"Ile znaków tekstu chunków trafia do JEDNEGO wywołania modelu (mniej = więcej wywołań)","minimum":500,"maximum":24000,"default":6000},"graph_enabled":{"type":"boolean","title":"Ekstrakcja włączona","description":"Wyłączenie sprawia, że węzeł przepuszcza envelope bez ani jednego wywołania modelu; puste = decyduje envelope.meta['graph_enabled']"}},"order":["model","collection","batch_chars","graph_enabled"]}"#,
         ),
+        (
+            "bus_consume",
+            "trigger",
+            "Odbiór z magistrali",
+            "Reaktywny punkt wejścia: flow startuje, gdy reaktor magistrali (TentaBus) pobierze nową partię rekordów z subskrybowanego tematu/grupy",
+            r#"{"topic":"","group":"","batch_size":1,"max_wait_ms":1000,"commit_mode":"auto_after_success","on_error":"dlq"}"#,
+            "inbox",
+            r#"{"properties":{"topic":{"type":"string","title":"Temat"},"group":{"type":"string","title":"Grupa konsumentów"},"batch_size":{"type":"integer","title":"Rozmiar partii","minimum":1,"maximum":1000,"default":1},"max_wait_ms":{"type":"integer","title":"Maks. czas oczekiwania (ms)","minimum":1,"maximum":60000,"default":1000},"commit_mode":{"type":"string","title":"Tryb zatwierdzania","enum":[{"value":"auto_after_success","label":"Automatycznie po sukcesie"},{"value":"explicit","label":"Ręczny"},{"value":"at_most_once","label":"Najwyżej raz"}],"default":"auto_after_success"},"on_error":{"type":"string","title":"Przy błędzie","enum":[{"value":"dlq","label":"Do DLQ"},{"value":"skip","label":"Pomiń"},{"value":"halt","label":"Zatrzymaj subskrypcję"}],"default":"dlq"},"org_id":{"type":"string","title":"Org ID (opcjonalnie)","description":"Puste = organizacja domyślna"}},"required":["topic","group"],"order":["topic","group","batch_size","max_wait_ms","commit_mode","on_error","org_id"]}"#,
+        ),
+        (
+            "bus_publish",
+            "output",
+            "Publikacja do magistrali",
+            "Publikuje payload envelope jako jeden rekord na temat TentaBus i przepuszcza envelope bez zmian",
+            r#"{"topic":"","key":"","content_type":"application/json","create_if_missing":false}"#,
+            "send-horizontal",
+            r#"{"properties":{"topic":{"type":"string","title":"Temat"},"key":{"type":"string","title":"Klucz partycjonowania (CEL, opcjonalnie)","description":"Wyrażenie CEL, np. payload.id"},"headers":{"type":"object","title":"Nagłówki (CEL, opcjonalnie)"},"content_type":{"type":"string","title":"Content-Type (opcjonalnie)"},"create_if_missing":{"type":"boolean","title":"Utwórz temat, jeśli nie istnieje","default":false}},"required":["topic"],"order":["topic","key","headers","content_type","create_if_missing"]}"#,
+        ),
+        (
+            "bus_transform",
+            "transform",
+            "Przekształcenie magistrali",
+            "Przekształca payload envelope wyrażeniem CEL (payload/vars/artifacts/meta) i zastępuje nim payload",
+            r#"{"expression":""}"#,
+            "shuffle",
+            r#"{"properties":{"expression":{"type":"string","title":"Wyrażenie CEL","format":"textarea","placeholder":"{'wynik': payload.value}"}},"required":["expression"],"order":["expression"]}"#,
+        ),
     ];
 
     // INSERT OR REPLACE — przy unique node_type aktualizujemy istniejace

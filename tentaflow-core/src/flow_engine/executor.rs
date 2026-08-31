@@ -5720,3 +5720,87 @@ mod provenance_persistence_tests {
         assert_eq!(row.origin.as_deref(), Some("system"));
     }
 }
+
+/// M3a (PLAN §6.3): `bus_consume` → `bus_transform` → output, run through the
+/// real executor and real adapters (CEL reshape included). `bus_publish` is
+/// exercised separately (`bus_publish::tests` + `bus::reactor::tests`, which
+/// go through a real `BusService`) rather than here — its `execute` reaches
+/// the process-global `bus::global()` singleton directly, which this file's
+/// test suite has no shared, race-safe fixture for (see `bus::reactor::
+/// tests::test_bus_service`'s own doc on why that singleton is a hazard to
+/// share across test modules).
+#[cfg(test)]
+mod bus_chain_tests {
+    use super::*;
+    use crate::flow_engine::node_adapter::test_support::stub_ctx;
+    use crate::flow_engine::node_adapters::{BusConsumeNodeAdapter, BusTransformNodeAdapter};
+    use serde_json::json;
+    use std::path::Path;
+
+    fn registry() -> Arc<AdapterRegistry> {
+        let mut r = AdapterRegistry::new();
+        r.register(Arc::new(BusConsumeNodeAdapter::new()));
+        r.register(Arc::new(BusTransformNodeAdapter::new()));
+        Arc::new(r)
+    }
+
+    fn db() -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("in-memory db");
+        let conn = pool.write().expect("db lock");
+        conn.execute(
+            "INSERT INTO flows (id, name, flow_json, status) VALUES ('0', 'test', '{}', 'active')",
+            [],
+        )
+        .expect("seed flow");
+        drop(conn);
+        pool
+    }
+
+    /// A `bus_consume`-seeded FHIR-shaped record flows through `bus_transform`
+    /// — the CEL expression reads `payload.valueQuantity.value` off the SEEDED
+    /// envelope (bus_consume itself is a dumb passthrough of `ctx.
+    /// initial_envelope`, per its own doc) and the reshaped result is the
+    /// flow's `final_envelope` (`bus_transform` is the sink here — no `output`
+    /// node needed, `pick_final_envelope` takes the last resolved node's
+    /// result; a real flow chains this into `bus_publish` instead, which
+    /// needs a live `bus::global()` and so is exercised separately —
+    /// `bus_publish::tests` + `bus::reactor::tests`).
+    #[tokio::test]
+    async fn bus_consume_seeds_bus_transform_reshapes_the_payload() {
+        let json_flow = r#"{
+            "nodes":[
+                {"id":"c","type":"bus_consume","config":{"topic":"orders.raw","group":"g1"}},
+                {"id":"x","type":"bus_transform","config":{
+                    "expression":"{'wynik': payload.valueQuantity.value, 'wersja': 'cmc-wynik-v2'}"
+                }}
+            ],
+            "edges":[
+                {"from":"c","to":"x","from_port":"message","to_port":"in"}
+            ]
+        }"#;
+        let reg = registry();
+        let compiled = Arc::new(CompiledFlow::from_json("0", json_flow, &reg).expect("compile"));
+
+        let mut initial = FlowEnvelope::empty();
+        initial.payload = FlowValue::Json(json!({
+            "resourceType": "Observation",
+            "valueQuantity": {"value": 5.6}
+        }));
+        initial
+            .meta
+            .insert("bus_topic".into(), json!("orders.raw"));
+
+        let outcome = execute_blocking(db(), compiled, initial, stub_ctx(), reg)
+            .await
+            .expect("execute_blocking");
+
+        assert_eq!(outcome.finish_reason, FinishReason::Stop);
+        match &outcome.final_envelope.payload {
+            FlowValue::Json(v) => {
+                assert_eq!(v["wynik"], json!(5.6));
+                assert_eq!(v["wersja"], json!("cmc-wynik-v2"));
+            }
+            other => panic!("expected Json payload, got {other:?}"),
+        }
+    }
+}

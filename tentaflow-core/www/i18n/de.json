@@ -3101,7 +3101,10 @@
       "workspace_context": "Workspace-Kontext",
       "patch_review": "Änderungsprüfung",
       "exec_command": "Befehl in der Sandbox",
-      "delegate_cli": "An CLI-Agent delegieren"
+      "delegate_cli": "An CLI-Agent delegieren",
+      "bus_consume": "Bus-Konsum",
+      "bus_publish": "Bus-Veröffentlichung",
+      "bus_transform": "Bus-Transformation"
     },
     "node_descriptions": {
       "trigger": "Flow-Einstiegspunkt (HTTP, QUIC, Webhook)",
@@ -3138,7 +3141,10 @@
       "workspace_context": "Bindet den Zug an eine Code-Studio-Sitzung: Repository-Status vom Broker, Branch, geänderte Dateien, Toolchain sowie AGENTS.md / CLAUDE.md als Daten hinter einer Anti-Injection-Umzäunung. Veröffentlicht die für den Agenten freigegebenen Code-Studio-Werkzeuge.",
       "patch_review": "Schließt den Änderungssatz ab, zeigt das Diff und hält den Lauf bis zur Entscheidung eines Menschen an. Hält Urteile pro Datei oder pro Hunk fest, baut eine Datei aus den akzeptierten Hunks neu auf und erkennt einen Konflikt durch parallele Bearbeitung. Dieselbe Implementierung trägt auch das Tor vor core.git_commit.",
       "exec_command": "Ein Befehl, den der Graph ausführt, nicht das Modell: ausschließlich argv (es gibt keine Shell). Der angeforderte Mount- und Netzzugriff kann das von der Richtlinie Erlaubte nur einschränken.",
-      "delegate_cli": "Übergibt einen Zug an einen externen CLI-Agenten (Codex, Claude Code): stellt über den PEP ein Adapter-Ticket aus, startet eine CLI-Instanz auf dem gewählten Bridge-Dienst, überträgt deren Ereignisse in die Sitzungs-Chronik und beantwortet ihre Freigabeanfragen mit demselben PEP wie der Rest der Sitzung. Die Zugangsdaten der Organisation gelangen nie in den CLI-Prozess — er erhält ein Ticket, das an diesen Lauf, das Modell und ein Token-Budget gebunden ist; ein überschrittenes Budget kappt den Verkehr und beendet den Lauf mit einem Fehler."
+      "delegate_cli": "Übergibt einen Zug an einen externen CLI-Agenten (Codex, Claude Code): stellt über den PEP ein Adapter-Ticket aus, startet eine CLI-Instanz auf dem gewählten Bridge-Dienst, überträgt deren Ereignisse in die Sitzungs-Chronik und beantwortet ihre Freigabeanfragen mit demselben PEP wie der Rest der Sitzung. Die Zugangsdaten der Organisation gelangen nie in den CLI-Prozess — er erhält ein Ticket, das an diesen Lauf, das Modell und ein Token-Budget gebunden ist; ein überschrittenes Budget kappt den Verkehr und beendet den Lauf mit einem Fehler.",
+      "bus_consume": "Reaktiver Einstiegspunkt: Der Flow startet, wenn der Bus-Reaktor (TentaBus) eine neue Charge Datensätze aus dem abonnierten Thema/der Gruppe abruft",
+      "bus_publish": "Veröffentlicht den Payload des Envelope als einen Datensatz auf einem TentaBus-Thema und lässt den Envelope unverändert durch",
+      "bus_transform": "Formt den Payload des Envelope mit einem CEL-Ausdruck (payload/vars/artifacts/meta) um und ersetzt den Payload damit"
     },
     "fields": {
       "model": "Modell",

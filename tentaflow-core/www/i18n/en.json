@@ -3272,7 +3272,10 @@
       "patch_review": "Change review",
       "exec_command": "Sandbox command",
       "delegate_cli": "Delegate to CLI agent",
-      "sentence_buffer": "Buffer sentences"
+      "sentence_buffer": "Buffer sentences",
+      "bus_consume": "Bus consume",
+      "bus_publish": "Bus publish",
+      "bus_transform": "Bus transform"
     },
     "node_descriptions": {
       "trigger": "Flow entry point (HTTP, QUIC, webhook)",
@@ -3310,7 +3313,10 @@
       "patch_review": "Closes the change set, shows the diff and blocks the run until a person decides. Records per-file or per-hunk verdicts, rebuilds a file from the accepted hunks and detects a concurrent-edit conflict. The same implementation backs the gate on core.git_commit.",
       "exec_command": "A command the graph runs, not the model: argv only (there is no shell). The requested mount and network access can only narrow what the policy allowed.",
       "delegate_cli": "Hands one turn to an external CLI agent (Codex, Claude Code): issues an adapter ticket through the PEP, starts a CLI instance on the chosen bridge service, streams its events onto the session timeline and answers its approval requests with the same PEP as the rest of the session. The organization's credential never enters the CLI process — it gets a ticket bound to this run, model and token budget; an exceeded budget cuts the traffic and ends the run with an error.",
-      "sentence_buffer": "Joins streaming LLM output into whole sentences before TTS"
+      "sentence_buffer": "Joins streaming LLM output into whole sentences before TTS",
+      "bus_consume": "Reactive entry point: the flow starts when the bus reactor (TentaBus) fetches a new batch of records from the subscribed topic/group",
+      "bus_publish": "Publishes the envelope's payload as one record on a TentaBus topic and passes the envelope through unchanged",
+      "bus_transform": "Reshapes the envelope's payload with a CEL expression (payload/vars/artifacts/meta) and replaces the payload with it"
     },
     "fields": {
       "model": "Model",

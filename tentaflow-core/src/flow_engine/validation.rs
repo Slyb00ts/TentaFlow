@@ -10,7 +10,8 @@
 //             edge.to_port ∈ input_ports konsumenta
 //         R4. strict 1-input-edge dla każdego non-entry node'a
 //         R5. dokładnie jeden węzeł-entry; entry ∈ {`trigger`,
-//             `on_subagent_complete`} — request-driven XOR event-driven flow
+//             `on_subagent_complete`, `bus_consume`} — request-driven XOR
+//             event-driven (sub-agent) XOR event-driven (bus) flow
 //         R6. condition edges (from_port "true"/"false") tylko z node'a
 //             "condition"
 //         R7. streaming end-shape — edge `from_port="stream"` musi prowadzić
@@ -65,7 +66,8 @@ pub enum FlowValidationError {
         actual: usize,
     },
     /// R5: a flow must have exactly one entry node, where an entry is either a
-    /// `trigger` (request-driven) or an `on_subagent_complete` (event-driven).
+    /// `trigger` (request-driven), an `on_subagent_complete` (event-driven,
+    /// sub-agent completion), or a `bus_consume` (event-driven, TentaBus record).
     EntryNodeCount {
         actual: usize,
     },
@@ -189,7 +191,7 @@ impl fmt::Display for FlowValidationError {
             ),
             Self::EntryNodeCount { actual } => write!(
                 f,
-                "flow must have exactly one entry node (trigger or on_subagent_complete), found {actual}"
+                "flow must have exactly one entry node (trigger, on_subagent_complete, or bus_consume), found {actual}"
             ),
             Self::ConditionEdgeFromNonCondition {
                 node_id,
@@ -283,12 +285,17 @@ impl fmt::Display for FlowValidationError {
 
 impl std::error::Error for FlowValidationError {}
 
-/// Entry node types — the two mutually exclusive flow entries. `trigger` is
-/// request-driven; `on_subagent_complete` is event-driven (the reactor seeds it
-/// when a sub-agent run settles). Both are sources (0 incoming edges) and emit
-/// the seeded initial envelope. R5 requires exactly one entry of either kind.
+/// Entry node types — the three mutually exclusive flow entries. `trigger` is
+/// request-driven; `on_subagent_complete` is event-driven (the subagent reactor
+/// seeds it when a sub-agent run settles); `bus_consume` is event-driven (the
+/// `bus::reactor` seeds it when a fetched batch is ready on its subscribed
+/// topic/group). All three are sources (0 incoming edges) and emit the seeded
+/// initial envelope. R5 requires exactly one entry of either kind.
 pub fn is_entry_node_type(node_type: &str) -> bool {
-    matches!(node_type, "trigger" | "on_subagent_complete")
+    matches!(
+        node_type,
+        "trigger" | "on_subagent_complete" | "bus_consume"
+    )
 }
 
 /// Walidacja STRUKTURALNA bez rejestru adapterów (RAG E2.0 bug 4). Sprawdza
@@ -910,8 +917,8 @@ fn validate_mapping_shape(
 mod tests {
     use super::*;
     use crate::flow_engine::node_adapters::{
-        ConditionNodeAdapter, LlmNodeAdapter, OnSubagentCompleteNodeAdapter, OutputNodeAdapter,
-        TriggerNodeAdapter,
+        BusConsumeNodeAdapter, BusTransformNodeAdapter, ConditionNodeAdapter, LlmNodeAdapter,
+        OnSubagentCompleteNodeAdapter, OutputNodeAdapter, TriggerNodeAdapter,
     };
     use std::sync::Arc;
 
@@ -919,6 +926,8 @@ mod tests {
         let mut r = AdapterRegistry::new();
         r.register(Arc::new(TriggerNodeAdapter::new()));
         r.register(Arc::new(OnSubagentCompleteNodeAdapter::new()));
+        r.register(Arc::new(BusConsumeNodeAdapter::new()));
+        r.register(Arc::new(BusTransformNodeAdapter::new()));
         r.register(Arc::new(OutputNodeAdapter::new()));
         r.register(Arc::new(ConditionNodeAdapter::new()));
         r.register_llm(Arc::new(LlmNodeAdapter::new()));
@@ -1141,6 +1150,81 @@ mod tests {
                 {"id":"c","type":"condition","config":{}}
             ],"edges":[
                 {"from":"c","to":"e","from_port":"true","to_port":"text"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(
+            matches!(err, FlowValidationError::InvalidInputPort { .. }),
+            "an entry node has no input ports, so an inbound edge must be rejected; got {err:?}"
+        );
+    }
+
+    /// R5 (M3a): `bus_consume` is the third mutually exclusive entry kind — a
+    /// valid sole entry (bus-driven flow), PLAN §6.3. Routed through
+    /// `bus_transform` (`Any` input port) rather than straight to `output`:
+    /// `bus_consume`'s ports are `Json`-typed and `output` has no `Json`/`Any`
+    /// input port, so a direct edge would fail R3's port-type check, not R5 —
+    /// this test isolates R5.
+    #[test]
+    fn ok_bus_consume_as_sole_entry() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"e","type":"bus_consume","config":{"topic":"orders.raw","group":"g1"}},
+                {"id":"x","type":"bus_transform","config":{"expression":"payload"}}
+            ],"edges":[{"from":"e","to":"x","from_port":"message","to_port":"in"}]}"#,
+        );
+        validate(&def, &registry()).expect("bus_consume entry must validate as the one entry");
+    }
+
+    /// R5: `trigger` + `bus_consume` together is two entries of mixed kind —
+    /// rejected the same way `trigger` + `on_subagent_complete` is.
+    #[test]
+    fn rejects_trigger_plus_bus_consume_entry() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"t","type":"trigger","config":{}},
+                {"id":"e","type":"bus_consume","config":{"topic":"t","group":"g"}},
+                {"id":"o","type":"output","config":{}}
+            ],"edges":[
+                {"from":"t","to":"o","from_port":"text","to_port":"text"}
+            ]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::EntryNodeCount { actual: 2 }
+        ));
+    }
+
+    /// R5: `on_subagent_complete` + `bus_consume` together is also two entries
+    /// of mixed kind — the three entry kinds are pairwise exclusive, not just
+    /// `trigger` against each event kind.
+    #[test]
+    fn rejects_on_subagent_complete_plus_bus_consume_entry() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"e1","type":"on_subagent_complete","config":{"agent_id":"a1"}},
+                {"id":"e2","type":"bus_consume","config":{"topic":"t","group":"g"}}
+            ],"edges":[]}"#,
+        );
+        let err = validate(&def, &registry()).unwrap_err();
+        assert!(matches!(
+            err,
+            FlowValidationError::EntryNodeCount { actual: 2 }
+        ));
+    }
+
+    /// A `bus_consume` entry is a source with NO input ports, so any inbound
+    /// edge is structurally rejected — same guarantee as `trigger`/
+    /// `on_subagent_complete`.
+    #[test]
+    fn rejects_bus_consume_entry_with_incoming_edge() {
+        let def = parse(
+            r#"{"nodes":[
+                {"id":"e","type":"bus_consume","config":{"topic":"t","group":"g"}},
+                {"id":"c","type":"condition","config":{}}
+            ],"edges":[
+                {"from":"c","to":"e","from_port":"true","to_port":"message"}
             ]}"#,
         );
         let err = validate(&def, &registry()).unwrap_err();

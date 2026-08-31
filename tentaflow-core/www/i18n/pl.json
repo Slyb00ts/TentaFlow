@@ -3272,7 +3272,10 @@
       "workspace_context": "Kontekst workspace",
       "patch_review": "Przegląd zmian",
       "exec_command": "Komenda w sandboxie",
-      "delegate_cli": "Deleguj do agenta CLI"
+      "delegate_cli": "Deleguj do agenta CLI",
+      "bus_consume": "Odbiór z magistrali",
+      "bus_publish": "Publikacja do magistrali",
+      "bus_transform": "Przekształcenie magistrali"
     },
     "node_descriptions": {
       "trigger": "Punkt wejścia flow (HTTP, QUIC, webhook)",
@@ -3310,7 +3313,10 @@
       "workspace_context": "Wiąże turę z sesją Code Studio: stan repozytorium z brokera, gałąź, zmienione pliki, toolchain oraz AGENTS.md / CLAUDE.md wstawione jako dane w ogrodzeniu anty-wstrzyknięciowym. Publikuje listę narzędzi Code Studio dostępnych agentowi.",
       "patch_review": "Domyka zestaw zmian, pokazuje diff i blokuje przebieg do decyzji człowieka. Zapisuje decyzje per plik lub per hunk, odtwarza plik z zaakceptowanych fragmentów i wykrywa konflikt równoległej edycji. Ta sama implementacja obsługuje bramkę przy core.git_commit.",
       "exec_command": "Komenda uruchamiana przez graf, nie przez model: wyłącznie argv (nie ma powłoki). Żądany dostęp do drzewa i sieci może tylko zawęzić to, na co pozwoliła polityka.",
-      "delegate_cli": "Oddaje jedną turę zewnętrznemu agentowi CLI (Codex, Claude Code): wydaje ticket adaptera przez PEP, uruchamia instancję CLI na wskazanej usłudze-moście, streamuje jej zdarzenia na oś czasu sesji i odpowiada na jej prośby o zgodę tym samym PEP-em co reszta sesji. Poświadczenie organizacji nigdy nie trafia do procesu CLI — dostaje ticket związany z tym przebiegiem, modelem i budżetem tokenów; przekroczony budżet ucina ruch i kończy przebieg błędem."
+      "delegate_cli": "Oddaje jedną turę zewnętrznemu agentowi CLI (Codex, Claude Code): wydaje ticket adaptera przez PEP, uruchamia instancję CLI na wskazanej usłudze-moście, streamuje jej zdarzenia na oś czasu sesji i odpowiada na jej prośby o zgodę tym samym PEP-em co reszta sesji. Poświadczenie organizacji nigdy nie trafia do procesu CLI — dostaje ticket związany z tym przebiegiem, modelem i budżetem tokenów; przekroczony budżet ucina ruch i kończy przebieg błędem.",
+      "bus_consume": "Reaktywny punkt wejścia: flow startuje, gdy reaktor magistrali (TentaBus) pobierze nową partię rekordów z subskrybowanego tematu/grupy",
+      "bus_publish": "Publikuje payload envelope jako jeden rekord na temat TentaBus i przepuszcza envelope bez zmian",
+      "bus_transform": "Przekształca payload envelope wyrażeniem CEL (payload/vars/artifacts/meta) i zastępuje nim payload"
     },
     "fields": {
       "model": "Model",
