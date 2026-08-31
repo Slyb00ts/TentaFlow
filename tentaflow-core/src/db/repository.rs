@@ -17,6 +17,13 @@ fn acquire(pool: &DbPool) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connec
 
 /// Public connection handle for the baseline-adopt path, which drives its whole
 /// snapshot/import inside a single externally-managed transaction.
+///
+/// HOLD IT LIGHTLY. This is `acquire`, i.e. the one process-wide writer mutex,
+/// and `parking_lot::Mutex` is not reentrant: calling any other `repository`
+/// function that takes `pool` while this guard is alive blocks the caller on a
+/// lock it already owns (observed in this file's own consumer: a test that
+/// still held a baseline guard read `bus_topic_get` and hung until the process
+/// was killed). Keep the guard to the transaction it exists for.
 pub fn acquire_for_baseline(
     pool: &DbPool,
 ) -> Result<parking_lot::MutexGuard<'_, rusqlite::Connection>> {
@@ -4711,6 +4718,12 @@ pub fn reseed_core_state_from_current_rows(
     let mut conn = acquire(pool)?;
     let tx = conn.transaction()?;
     let mut emitted = 0usize;
+    // Bus rows are read here (harmless SELECTs inside the tx already held)
+    // but published AFTER this function drops its `acquire(pool)` guard —
+    // see the note below the loop. Collected here so the loop below stays
+    // one flat match over `CORE_SYNC_DESCRIPTORS` like every other arm.
+    let mut bus_topics_to_publish: Vec<DbBusTopic> = Vec::new();
+    let mut bus_assignments_to_publish: Vec<DbBusPartitionAssignment> = Vec::new();
 
     for descriptor in CORE_SYNC_DESCRIPTORS {
         match descriptor.kind {
@@ -6318,10 +6331,94 @@ pub fn reseed_core_state_from_current_rows(
                     emitted += 1;
                 }
             }
+            // K-M2-4 close-out (open item nr 2, M2-WYNIKI.md): both writers
+            // for these two resources are the IMMEDIATE-PUBLISH path
+            // (`publish_bus_topic_capture` / `SqliteLedgerAssignmentStore::
+            // propose`), never the `__tentaflow_core_sync_captures` journal
+            // every other arm above uses — `bus_topics` deliberately has NO
+            // FK to `organizations` (see `bus_topic_write_capture`'s doc:
+            // test topics live under orgs like "org-1" that never exist in
+            // `organizations`), so routing these through
+            // `record_core_capture_for_org_tx` would turn a reseed into an
+            // FK error for exactly the rows this table is allowed to hold.
+            // Rows are only READ here (harmless inside this tx); the actual
+            // publish happens after the loop, once `conn`'s guard on the
+            // one process-wide writer mutex is dropped — `publish_bus_topic_
+            // capture`/`propose` each re-`acquire(pool)` internally, and
+            // `parking_lot::Mutex` is not reentrant (`acquire`'s own doc:
+            // a held guard + any other `repository` call on the same pool
+            // hangs the caller on a lock it already owns).
+            K::BusTopic => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics ORDER BY org_id, name"
+                ))?;
+                let rows = stmt
+                    .query_map([], map_bus_topic_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                bus_topics_to_publish = rows;
+            }
+            K::BusPartitionAssignment => {
+                let mut stmt = tx.prepare(&format!(
+                    "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
+                     ORDER BY org_id, topic, partition"
+                ))?;
+                let rows = stmt
+                    .query_map([], map_bus_assignment_row)?
+                    .collect::<std::result::Result<Vec<_>, _>>()?;
+                drop(stmt);
+                bus_assignments_to_publish = rows;
+            }
         }
     }
 
     tx.commit()?;
+    // Release the writer-mutex guard before the immediate-publish calls
+    // below re-acquire it (see the K::BusTopic doc above) — `conn` must not
+    // merely go out of scope at function end, it must be gone BEFORE the
+    // next line runs.
+    drop(conn);
+
+    for row in &bus_topics_to_publish {
+        // `Insert` regardless of the row's own history — same upsert
+        // convention `SqliteLedgerAssignmentStore::propose` documents for
+        // its own resource, and every non-bus arm above uses too.
+        // Uninitialized sync runtime (baseline-adopt run before mesh sync
+        // starts) is a silent no-op here (`Ok(None)`), matching every other
+        // best-effort skip in this function — never fails the whole reseed.
+        if crate::db::repository::publish_bus_topic_capture(
+            pool,
+            row,
+            crate::sync::runtime::SqlWriteAction::Insert,
+        )?
+        .is_some()
+        {
+            emitted += 1;
+        }
+    }
+    if !bus_assignments_to_publish.is_empty() {
+        let assignments =
+            crate::bus::replication::assignment::SqliteLedgerAssignmentStore::new(pool.clone());
+        for row in bus_assignments_to_publish {
+            let assignment = crate::bus::replication::assignment::PartitionAssignment::from(row);
+            // `propose` errors when the sync runtime is not initialized
+            // (`ok_or_else` on a `None` capture) — unlike `publish_bus_topic_
+            // capture`'s graceful `Ok(None)`, so that case is treated the
+            // same way here explicitly rather than bailing the whole reseed
+            // out via `?` on one skipped resource.
+            match assignments.propose(&assignment) {
+                Ok(_) => emitted += 1,
+                Err(e) => {
+                    tracing::debug!(
+                        org_id = %assignment.org_id, topic = %assignment.topic,
+                        partition = assignment.partition, error = %e,
+                        "reseed: bus_partition_assignment publish skipped"
+                    );
+                }
+            }
+        }
+    }
+
     Ok(emitted)
 }
 
@@ -13241,7 +13338,8 @@ pub fn list_trusted_node_environments(
     let mut map = std::collections::HashMap::new();
     for row in rows {
         let (node_id, raw) = row?;
-        let environment = raw.and_then(|s| tentaflow_protocol::environment::NodeEnvironment::parse(&s));
+        let environment =
+            raw.and_then(|s| tentaflow_protocol::environment::NodeEnvironment::parse(&s));
         map.insert(node_id, environment);
     }
     Ok(map)
@@ -27544,5 +27642,1367 @@ mod vision_model_tests {
         .expect("alias with fallback");
         let err = delete_vision_model(&db, "stanik", None).unwrap_err();
         assert!(err.to_string().contains("alias-fb"), "{err}");
+    }
+}
+
+// =============================================================================
+// TentaBus M1 (PLAN.md tentabus/PLAN.md §7.1, §9 M1) — `bus_topics` /
+// `bus_groups` repository functions.
+//
+// COORDINATION: these two tables are created by migration v146 (owned by
+// the parallel DB/RBAC agent, tor D per PLAN.md §9.1 — this task does not
+// touch `db/migrations.rs`). The functions below assume the exact schema
+// spelled out in the `CREATE TABLE` statements inside
+// `bus_test_support::create_bus_tables` (used only under `#[cfg(test)]` so
+// `bus/mod.rs`'s own tests can exercise this repository layer before v146
+// merges) — when v146 lands, verify its DDL matches this fixture 1:1
+// (column names/types/PK) rather than editing call sites here.
+// =============================================================================
+
+/// Mirrors one row of `bus_topics`. All enum-like fields are stored as their
+/// `as_str()` TEXT representation (`bus::topics::*Policy::as_str`), decoded
+/// back by `bus::topics::TopicConfig::try_from`.
+///
+/// `Serialize`/`Deserialize` (M2, PLAN-M2 §1c): `core_materializer::
+/// apply_bus_topic` (wave 1, agent L) ships the WHOLE row as one JSON field
+/// (`changed_fields["row_json"]`) rather than one `FieldValue` per column —
+/// see that function's doc for why — so this type must round-trip through
+/// `serde_json` exactly. The producer of that field is
+/// `publish_bus_topic_capture` below, called by every `bus_topic_*` writer.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct DbBusTopic {
+    pub org_id: String,
+    pub name: String,
+    pub partitions: u32,
+    pub retention_ms: i64,
+    pub retention_bytes: i64,
+    pub cleanup_policy: String,
+    pub delivery: String,
+    pub idempotency_key: Option<String>,
+    pub dedup_window_ms: i64,
+    pub max_delivery_attempts: u32,
+    pub retry_backoff_ms: u32,
+    pub schema_id: Option<String>,
+    pub validation: String,
+    pub content_type: String,
+    pub replication_factor: u32,
+    pub acks: String,
+    pub durability: String,
+    /// v148 (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/R5-7): NULL = `durability`
+    /// was set as an explicit override; `Some("standard"/"critical")` = the
+    /// class it was last resolved from. See the migration's own doc
+    /// comment (`bus_topics_add_durability_class_column`,
+    /// `db/migrations.rs`) for the full contract and the pre-v148 backfill
+    /// assumption.
+    pub durability_class: Option<String>,
+    pub max_inline_bytes: i64,
+    pub compression: String,
+    pub environment: String,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+fn map_bus_topic_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusTopic> {
+    Ok(DbBusTopic {
+        org_id: row.get(0)?,
+        name: row.get(1)?,
+        partitions: row.get(2)?,
+        retention_ms: row.get(3)?,
+        retention_bytes: row.get(4)?,
+        cleanup_policy: row.get(5)?,
+        delivery: row.get(6)?,
+        idempotency_key: row.get(7)?,
+        dedup_window_ms: row.get(8)?,
+        max_delivery_attempts: row.get(9)?,
+        retry_backoff_ms: row.get(10)?,
+        schema_id: row.get(11)?,
+        validation: row.get(12)?,
+        content_type: row.get(13)?,
+        replication_factor: row.get(14)?,
+        acks: row.get(15)?,
+        durability: row.get(16)?,
+        max_inline_bytes: row.get(17)?,
+        compression: row.get(18)?,
+        environment: row.get(19)?,
+        created_at_ms: row.get(20)?,
+        updated_at_ms: row.get(21)?,
+        durability_class: row.get(22)?,
+    })
+}
+
+const BUS_TOPIC_COLUMNS: &str = "org_id, name, partitions, retention_ms, retention_bytes, \
+    cleanup_policy, delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+    retry_backoff_ms, schema_id, validation, content_type, replication_factor, acks, \
+    durability, max_inline_bytes, compression, environment, created_at_ms, updated_at_ms, \
+    durability_class";
+
+/// Builds the `core.bus_topic` capture for one `bus_topics` row: the composite
+/// resource id and the one-field `row_json` payload. Split out of
+/// `publish_bus_topic_capture` because the resource's other half —
+/// `sync/core_materializer.rs::apply_bus_topic` — has to agree with this
+/// shape byte for byte, and its tests now construct their op from HERE rather
+/// than re-deriving the payload and drifting.
+pub(crate) fn bus_topic_write_capture(
+    row: &DbBusTopic,
+    action: crate::sync::runtime::SqlWriteAction,
+) -> Result<crate::sync::core_capture::CoreWriteCapture> {
+    use crate::sync::core_registry::CoreSyncResourceKind;
+    use crate::sync::resource_id::composite_resource_id;
+    let mut changed_fields = BTreeMap::new();
+    changed_fields.insert(
+        "row_json".to_string(),
+        field_string(&serde_json::to_string(row)?),
+    );
+    Ok(crate::sync::core_capture::CoreWriteCapture::new(
+        CoreSyncResourceKind::BusTopic,
+        row.org_id.clone(),
+        composite_resource_id(&[&row.org_id, &row.name]),
+        action,
+        changed_fields,
+        // The admin actor lives in the `bus.topic.*` audit rows
+        // (`bus/mod.rs`); the op's `actor_user_id` defaults to "system".
+        None,
+        crate::sync::runtime::core_hlc_now(),
+        crate::sync::runtime::core_epoch(),
+    ))
+}
+
+/// Mints the `core.bus_topic` ledger operation that makes one `bus_topics`
+/// write visible to the rest of the mesh, so a replica can materialize the
+/// topic CONFIG (`sync/core_materializer.rs::apply_bus_topic`) that its own
+/// assignment row refers to. Without this the only bus resource that ever
+/// replicated was the assignment: a follower got `bus_partition_assignments`
+/// rows whose parent `bus_topics` row could not exist locally, and
+/// `apply_bus_partition_assignment` therefore deferred them forever (K-M2-4).
+///
+/// WHY the immediate-publish path and not the `__tentaflow_core_sync_captures`
+/// journal the other core resources use (`record_core_capture_for_org_tx`):
+/// the journal's `org_id` column carries
+/// `REFERENCES organizations(org_id) ON DELETE CASCADE`, while `bus_topics`
+/// deliberately has NO such FK — see `db/migrations.rs`'s
+/// `BUS_TOPICS_AND_GROUPS` comment ("`bus/mod.rs` tests exercise topics under
+/// `org_id = \"org-1\"`, which never exists in `organizations`"). Recording a
+/// journal row inside the write transaction would therefore turn
+/// `create_topic` into an FK error for exactly the rows this table is allowed
+/// to hold. `core.bus_partition_assignment` — the sibling resource on the same
+/// ledger partition, and the one this resource's ordering contract exists to
+/// serve — already publishes through
+/// `SqliteLedgerAssignmentStore::propose` for the same reason, so both bus
+/// resources mint their ops the same way.
+///
+/// WHAT THAT COSTS, stated plainly: the mint happens after the local write
+/// commits rather than inside its transaction, so a process that dies in
+/// between has the row locally and no op in the ledger. `core_resource_versions`
+/// is stamped here (the journal variant gets it for free inside
+/// `record_core_capture_for_org_tx`) because the local author must have an LWW
+/// watermark: without it a peer's older op for the same topic would be admitted
+/// locally while the local op's HLC wins everywhere else, and the two nodes
+/// would converge to DIFFERENT rows. Returns `Ok(None)` without publishing when
+/// this process has no sync runtime (sync disabled, or a unit test that only
+/// opened a DB) — a single-node broker is a supported configuration, so a
+/// missing ledger is not a failed write.
+pub(crate) fn publish_bus_topic_capture(
+    pool: &DbPool,
+    row: &DbBusTopic,
+    action: crate::sync::runtime::SqlWriteAction,
+) -> Result<Option<crate::sync::ledger::OperationId>> {
+    let capture = bus_topic_write_capture(row, action)?;
+    let resource_id = capture.resource_id.clone();
+    let hlc = capture.hlc.clone();
+    let Some(recorded) = crate::sync::runtime::record_core_capture(capture)? else {
+        return Ok(None);
+    };
+    let descriptor = crate::sync::core_registry::descriptor_for_kind(
+        crate::sync::core_registry::CoreSyncResourceKind::BusTopic,
+    );
+    let conn = acquire(pool)?;
+    conn.execute(
+        "INSERT INTO core_resource_versions (resource_type, resource_id, hlc_wall, hlc_logical, hlc_node) \
+         VALUES (?1, ?2, ?3, ?4, ?5) \
+         ON CONFLICT(resource_type, resource_id) DO UPDATE SET \
+         hlc_wall = excluded.hlc_wall, hlc_logical = excluded.hlc_logical, hlc_node = excluded.hlc_node",
+        rusqlite::params![
+            descriptor.resource_type,
+            resource_id,
+            hlc.wall_time_ms,
+            hlc.logical as i64,
+            hlc.node_id,
+        ],
+    )?;
+    // The op id is returned for the round-trip test
+    // (`bus/replication/assignment.rs::
+    // a_topic_write_publishes_a_core_bus_topic_op_a_replica_can_materialize`);
+    // a local config write has nothing to do with it.
+    Ok(Some(recorded.op_id))
+}
+
+pub fn bus_topic_create(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO bus_topics ({BUS_TOPIC_COLUMNS}) VALUES \
+             (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23)"
+        ),
+        rusqlite::params![
+            row.org_id,
+            row.name,
+            row.partitions,
+            row.retention_ms,
+            row.retention_bytes,
+            row.cleanup_policy,
+            row.delivery,
+            row.idempotency_key,
+            row.dedup_window_ms,
+            row.max_delivery_attempts,
+            row.retry_backoff_ms,
+            row.schema_id,
+            row.validation,
+            row.content_type,
+            row.replication_factor,
+            row.acks,
+            row.durability,
+            row.max_inline_bytes,
+            row.compression,
+            row.environment,
+            row.created_at_ms,
+            row.updated_at_ms,
+            row.durability_class,
+        ],
+    )?;
+    // Released before the publish: `record_core_capture` reads and writes the
+    // same pool through the sync runtime, and holding a connection across it
+    // would put two borrowers against one pool slot on a small rig.
+    drop(conn);
+    let _ = publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Insert)?;
+    Ok(())
+}
+
+pub fn bus_topic_update(pool: &DbPool, row: &DbBusTopic) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        "UPDATE bus_topics SET partitions=?3, retention_ms=?4, retention_bytes=?5, \
+         cleanup_policy=?6, delivery=?7, idempotency_key=?8, dedup_window_ms=?9, \
+         max_delivery_attempts=?10, retry_backoff_ms=?11, schema_id=?12, validation=?13, \
+         content_type=?14, replication_factor=?15, acks=?16, durability=?17, \
+         max_inline_bytes=?18, compression=?19, environment=?20, updated_at_ms=?21, \
+         durability_class=?22 \
+         WHERE org_id=?1 AND name=?2",
+        rusqlite::params![
+            row.org_id,
+            row.name,
+            row.partitions,
+            row.retention_ms,
+            row.retention_bytes,
+            row.cleanup_policy,
+            row.delivery,
+            row.idempotency_key,
+            row.dedup_window_ms,
+            row.max_delivery_attempts,
+            row.retry_backoff_ms,
+            row.schema_id,
+            row.validation,
+            row.content_type,
+            row.replication_factor,
+            row.acks,
+            row.durability,
+            row.max_inline_bytes,
+            row.compression,
+            row.environment,
+            // `created_at_ms` is deliberately not bound here: this
+            // statement never sets it (a row's creation time is immutable),
+            // so binding it as an unreferenced `?21` was misleading busywork
+            // (review P3-10) — every bound parameter here is referenced by
+            // the SQL above.
+            row.updated_at_ms,
+            row.durability_class,
+        ],
+    )?;
+    // Released before the publish: `record_core_capture` reads and writes the
+    // same pool through the sync runtime, and holding a connection across it
+    // would put two borrowers against one pool slot on a small rig.
+    drop(conn);
+    let _ = publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Update)?;
+    Ok(())
+}
+
+pub fn bus_topic_get(pool: &DbPool, org_id: &str, name: &str) -> Result<Option<DbBusTopic>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        &format!("SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics WHERE org_id = ?1 AND name = ?2"),
+        rusqlite::params![org_id, name],
+        map_bus_topic_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Deletes one topic row and publishes the matching `core.bus_topic` Delete
+/// op. The row is read first because `apply_bus_topic` decodes `row_json`
+/// before it dispatches on the action — the payload it needs in order to
+/// re-derive the composite key it deletes by. A row that is already gone
+/// (the caller checked, then lost the race) deletes zero rows and publishes
+/// nothing: there is nothing left for a peer to agree with us about.
+pub fn bus_topic_delete(pool: &DbPool, org_id: &str, name: &str) -> Result<()> {
+    let conn = acquire(pool)?;
+    let row: Option<DbBusTopic> = conn
+        .query_row(
+            &format!("SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics WHERE org_id = ?1 AND name = ?2"),
+            rusqlite::params![org_id, name],
+            map_bus_topic_row,
+        )
+        .optional()?;
+    let Some(row) = row else { return Ok(()) };
+    conn.execute(
+        "DELETE FROM bus_topics WHERE org_id = ?1 AND name = ?2",
+        rusqlite::params![org_id, name],
+    )?;
+    drop(conn);
+    let _ = publish_bus_topic_capture(pool, &row, crate::sync::runtime::SqlWriteAction::Delete)?;
+    Ok(())
+}
+
+/// Backs `bus::topics::list_topics`, which nothing calls yet — kept for the
+/// topic-listing admin UI/dispatch layer (PLAN.md tentabus/PLAN.md tor U/P)
+/// that will call it once that layer is wired up.
+pub fn bus_topic_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusTopic>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics WHERE org_id = ?1 ORDER BY name"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], map_bus_topic_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every `__dlq.*` topic row across EVERY org — used once at
+/// `BusService::new` startup (owner decision B follow-up, `SUM/tentabus/
+/// KRYTYK-M1-R5.md` b.8) to find and retroactively fix any DLQ topic
+/// created before `dlq::dlq_topic_options` started hardcoding
+/// `FsyncInterval{ms: STANDARD_FSYNC_INTERVAL_MS}` regardless of source.
+/// `substr` rather than `LIKE` avoids the escaping subtlety of `_` being a
+/// single-char `LIKE` wildcard that happens to be literally what
+/// `dlq::DLQ_TOPIC_PREFIX` starts with.
+pub fn bus_topic_list_all_dlq(pool: &DbPool) -> Result<Vec<DbBusTopic>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_TOPIC_COLUMNS} FROM bus_topics \
+         WHERE substr(name, 1, 6) = '__dlq.' ORDER BY org_id, name"
+    ))?;
+    let rows = stmt
+        .query_map([], map_bus_topic_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Mirrors one row of `bus_groups` — group-level bookkeeping (default
+/// commit mode, pause state) surfaced to the admin UI/dispatch layer.
+/// Offsets themselves live in fjall (`bus::groups::GroupOffsetStore`), not
+/// here (PLAN §3.2: SQLite is the administrative plane only).
+#[derive(Debug, Clone)]
+pub struct DbBusGroup {
+    pub org_id: String,
+    pub group_id: String,
+    pub topic: String,
+    pub commit_mode: String,
+    pub paused: bool,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+fn map_bus_group_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusGroup> {
+    Ok(DbBusGroup {
+        org_id: row.get(0)?,
+        group_id: row.get(1)?,
+        topic: row.get(2)?,
+        commit_mode: row.get(3)?,
+        paused: row.get::<_, i64>(4)? != 0,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+    })
+}
+
+const BUS_GROUP_COLUMNS: &str =
+    "org_id, group_id, topic, commit_mode, paused, created_at_ms, updated_at_ms";
+
+pub fn bus_group_upsert(pool: &DbPool, row: &DbBusGroup) -> Result<()> {
+    let conn = acquire(pool)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO bus_groups ({BUS_GROUP_COLUMNS}) VALUES (?1,?2,?3,?4,?5,?6,?7) \
+             ON CONFLICT(org_id, group_id, topic) DO UPDATE SET \
+             commit_mode = excluded.commit_mode, paused = excluded.paused, \
+             updated_at_ms = excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            row.org_id,
+            row.group_id,
+            row.topic,
+            row.commit_mode,
+            row.paused as i64,
+            row.created_at_ms,
+            row.updated_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn bus_group_get(
+    pool: &DbPool,
+    org_id: &str,
+    group_id: &str,
+    topic: &str,
+) -> Result<Option<DbBusGroup>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        &format!(
+            "SELECT {BUS_GROUP_COLUMNS} FROM bus_groups WHERE org_id = ?1 AND group_id = ?2 AND topic = ?3"
+        ),
+        rusqlite::params![org_id, group_id, topic],
+        map_bus_group_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+/// Not yet called from anywhere — the topic-listing admin UI/dispatch layer
+/// (PLAN.md tentabus/PLAN.md tor U/P) that needs "every group in an org"
+/// will call this once wired up. `bus::mod::pause_group`/`resume_group` set
+/// pause state through `bus_group_upsert`, so there is deliberately no
+/// separate "set paused" statement here.
+pub fn bus_group_list(pool: &DbPool, org_id: &str) -> Result<Vec<DbBusGroup>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_GROUP_COLUMNS} FROM bus_groups WHERE org_id = ?1 ORDER BY group_id, topic"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id], map_bus_group_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Deletes every `bus_topics` row for `org_id`, returning how many rows
+/// were removed. Part of the RODO/GDPR org-deletion path (review M1
+/// coordinator decision #9): does not touch anything on disk under
+/// `bus_dir/<org_id>/` — the caller (the org-deletion flow, wired up in a
+/// later change) is responsible for `remove_dir_all` on that directory
+/// alongside calling this.
+pub fn bus_topics_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+    // K-M2-4 close-out (open item nr 1, M2-WYNIKI.md): this is the ONLY
+    // writer of `bus_topics` that does not go through `core.bus_topic`
+    // capture (`bus_topic_create`/`bus_topic_update`/`bus_topic_delete` all
+    // call `publish_bus_topic_capture` — see their own bodies) — an org
+    // purged here without a capture stays present on every peer's own
+    // `bus_topics` (config rows AND the `bus_dir/<org_id>/` data those
+    // peers never learn to remove), the opposite of what an org purge
+    // means. The delete and the read of what got deleted happen as ONE
+    // statement (`DELETE ... RETURNING`) under a single guard acquisition,
+    // closing a TOCTOU a separate SELECT-then-DELETE would leave open: a
+    // topic created for this org between the SELECT and the DELETE would
+    // match the DELETE's `WHERE org_id = ?1` and be removed locally with
+    // no capture ever published for it. The guard is dropped before
+    // publishing (same reentrancy note as `reseed_core_state_from_current_
+    // rows` above: `publish_bus_topic_capture` re-`acquire`s the same
+    // non-reentrant writer mutex this function's own `conn` would still be
+    // holding otherwise), so captures are published for exactly the rows
+    // this call actually deleted.
+    let rows = {
+        let conn = acquire(pool)?;
+        let mut stmt = conn.prepare(&format!(
+            "DELETE FROM bus_topics WHERE org_id = ?1 RETURNING {BUS_TOPIC_COLUMNS}"
+        ))?;
+        let rows = stmt
+            .query_map(rusqlite::params![org_id], map_bus_topic_row)?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        rows
+    };
+    for row in &rows {
+        // Best-effort, same convention as every other capture call in this
+        // purge path (`bus::purge_org`'s `reassign` calls, `bus_assignment_
+        // delete_by_org`'s caller): a capture failure must never block the
+        // LOCAL purge — the row is already deleted either way, and an
+        // RODO deadline does not wait on mesh sync being up.
+        if let Err(e) =
+            publish_bus_topic_capture(pool, row, crate::sync::runtime::SqlWriteAction::Delete)
+        {
+            tracing::warn!(
+                org_id = %org_id, topic = %row.name, error = %e,
+                "bus_topics_delete_by_org: capture publish failed; already deleted locally"
+            );
+        }
+    }
+    Ok(rows.len())
+}
+
+/// Deletes every `bus_groups` row for `org_id`, returning how many rows
+/// were removed. Same RODO/GDPR org-deletion path as
+/// `bus_topics_delete_by_org` — offsets themselves live in fjall under
+/// `bus_dir/<org_id>/`, not here, so this alone does not purge consumer
+/// progress; the caller must still remove that directory.
+pub fn bus_groups_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_groups WHERE org_id = ?1",
+        rusqlite::params![org_id],
+    )?;
+    Ok(count)
+}
+
+/// Deletes every `bus_groups` row for `(org_id, topic)`, returning how many
+/// rows were removed. Called by `BusService::delete_topic`: `bus_groups`
+/// rows ARE per-topic (unlike the fjall offset/attempt/producer-seq keys,
+/// which need their own topic-scoped prefix scans, see `groups::
+/// GroupOffsetStore::purge_topic`/`producer::ProducerSeqStore::purge_topic`),
+/// so a direct `DELETE ... WHERE topic = ?` is enough — a later
+/// `create_topic` of the same name must not resurrect a stale group row
+/// whose `paused` flag or committed-offset expectations belong to the
+/// deleted topic's previous incarnation.
+pub fn bus_groups_delete_by_topic(pool: &DbPool, org_id: &str, topic: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_groups WHERE org_id = ?1 AND topic = ?2",
+        rusqlite::params![org_id, topic],
+    )?;
+    Ok(count)
+}
+
+/// Deletes every `bus_groups` row with this exact `group_id`, across EVERY
+/// org — used by `BusService::new` at startup to purge a leftover row for a
+/// retired ephemeral/internal group name (e.g. `tf-system-probe`,
+/// `bus::LEGACY_PROBE_GROUP_ID`; M1-R2 review N-1/N-7, coordinator decision
+/// 3). Deliberately not org-scoped: an internal probe's group row was never
+/// really "owned" by any one org's data lifecycle the way a real consumer's
+/// is, and the whole point of this call is to sweep up whatever org(s) it
+/// happened to accumulate a row under before this cleanup existed. Returns
+/// the number of rows removed.
+pub fn bus_groups_delete_by_group_id(pool: &DbPool, group_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_groups WHERE group_id = ?1",
+        rusqlite::params![group_id],
+    )?;
+    Ok(count)
+}
+
+// =============================================================================
+// TentaBus M2 (SUM/tentabus/PLAN-M2.md §1c/§2, K-M2-4) — `bus_partition_
+// assignments` repository functions. This table (migration v149) is a
+// MATERIALIZATION of the sync ledger's `CoreSyncResourceKind::
+// BusPartitionAssignment` resource, not a second source of truth: every
+// steady-state row here is written by `core_materializer::
+// apply_bus_partition_assignment` (wave 1, agent L) inside the SAME
+// transaction `apply_core_operation` opens, via raw SQL against that
+// transaction — NOT through `bus_assignment_upsert` below, which acquires
+// its own pool lock and would deadlock/reenter if called from inside that
+// transaction. `bus_assignment_upsert`/`_delete_by_topic`/`_delete_by_org`
+// exist for: (a) this module's own round-trip tests, and (b) the same
+// direct-SQL GDPR/org-purge exception `bus_topics_delete_by_org` already
+// documents — an irreversible erasure must be immediate and local, not
+// eventually-consistent through the ledger.
+// =============================================================================
+
+/// Mirrors one row of `bus_partition_assignments`. `replicas`/`isr` are
+/// stored as JSON array TEXT in the table; this struct decodes them to
+/// `Vec<String>` at the repository boundary, matching how `bus::
+/// replication::assignment::PartitionAssignment` (the ledger's own domain
+/// shape for this resource) never touches the JSON encoding either.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct DbBusPartitionAssignment {
+    pub org_id: String,
+    pub topic: String,
+    pub partition: u32,
+    pub leader_node_id: String,
+    pub replicas: Vec<String>,
+    pub isr: Vec<String>,
+    pub leader_epoch: u32,
+    pub environment: String,
+    pub updated_at_ms: i64,
+}
+
+fn decode_bus_assignment_node_list(raw: String, column: &str) -> rusqlite::Result<Vec<String>> {
+    serde_json::from_str(&raw).map_err(|e| {
+        rusqlite::Error::FromSqlConversionFailure(
+            0,
+            rusqlite::types::Type::Text,
+            format!("bus_partition_assignments.{column} is not a JSON array: {e}").into(),
+        )
+    })
+}
+
+fn map_bus_assignment_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DbBusPartitionAssignment> {
+    let replicas_raw: String = row.get(4)?;
+    let isr_raw: String = row.get(5)?;
+    Ok(DbBusPartitionAssignment {
+        org_id: row.get(0)?,
+        topic: row.get(1)?,
+        partition: row.get(2)?,
+        leader_node_id: row.get(3)?,
+        replicas: decode_bus_assignment_node_list(replicas_raw, "replicas")?,
+        isr: decode_bus_assignment_node_list(isr_raw, "isr")?,
+        leader_epoch: row.get(6)?,
+        environment: row.get(7)?,
+        updated_at_ms: row.get(8)?,
+    })
+}
+
+const BUS_ASSIGNMENT_COLUMNS: &str =
+    "org_id, topic, partition, leader_node_id, replicas, isr, leader_epoch, environment, updated_at_ms";
+
+pub fn bus_assignment_get(
+    pool: &DbPool,
+    org_id: &str,
+    topic: &str,
+    partition: u32,
+) -> Result<Option<DbBusPartitionAssignment>> {
+    let conn = acquire(pool)?;
+    conn.query_row(
+        &format!(
+            "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
+             WHERE org_id = ?1 AND topic = ?2 AND partition = ?3"
+        ),
+        rusqlite::params![org_id, topic, partition],
+        map_bus_assignment_row,
+    )
+    .optional()
+    .map_err(Into::into)
+}
+
+pub fn bus_assignment_list_for_topic(
+    pool: &DbPool,
+    org_id: &str,
+    topic: &str,
+) -> Result<Vec<DbBusPartitionAssignment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
+         WHERE org_id = ?1 AND topic = ?2 ORDER BY partition"
+    ))?;
+    let rows = stmt
+        .query_map(rusqlite::params![org_id, topic], map_bus_assignment_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Every assignment where `node_id` is either the leader OR a member of the
+/// replica set — used at startup (`SqliteLedgerAssignmentStore`, wave 1
+/// agent L) to rebuild which partitions this node must feed/follow.
+///
+/// Decode-filter (fetch every row, decode `replicas`/`isr`, filter in Rust)
+/// rather than `WHERE replicas LIKE '%"node_id"%'`: the table is expected to
+/// stay small (one row per partition, across every topic in every org this
+/// node has ever seen — low thousands of rows at most), so a full scan plus
+/// JSON-decode is cheap, and unlike `LIKE` it is immune to both wildcard
+/// characters inside a node id and substring false positives (a stored
+/// `"node-10"` must never match a query for `"node-1"`, which a naive
+/// `LIKE '%"node-1"%'` would get wrong).
+pub fn bus_assignment_list_for_node(
+    pool: &DbPool,
+    node_id: &str,
+) -> Result<Vec<DbBusPartitionAssignment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
+         ORDER BY org_id, topic, partition"
+    ))?;
+    let rows: Vec<DbBusPartitionAssignment> = stmt
+        .query_map([], map_bus_assignment_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows
+        .into_iter()
+        .filter(|row| {
+            row.leader_node_id == node_id || row.replicas.iter().any(|replica| replica == node_id)
+        })
+        .collect())
+}
+
+/// Every assignment in the database, across every org/topic — used once at
+/// startup (`ReplicationManager`, wave 1 agent EL) to rebuild the in-memory
+/// replication state from what was last materialized.
+pub fn bus_assignment_list_all(pool: &DbPool) -> Result<Vec<DbBusPartitionAssignment>> {
+    let conn = acquire(pool)?;
+    let mut stmt = conn.prepare(&format!(
+        "SELECT {BUS_ASSIGNMENT_COLUMNS} FROM bus_partition_assignments \
+         ORDER BY org_id, topic, partition"
+    ))?;
+    let rows = stmt
+        .query_map([], map_bus_assignment_row)?
+        .collect::<std::result::Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+/// Full-row upsert keyed on `(org_id, topic, partition)`. NOT called by the
+/// materializer (see this section's header comment) — for tests and any
+/// future direct-repair tooling.
+pub fn bus_assignment_upsert(pool: &DbPool, row: &DbBusPartitionAssignment) -> Result<()> {
+    let conn = acquire(pool)?;
+    let replicas_json = serde_json::to_string(&row.replicas)?;
+    let isr_json = serde_json::to_string(&row.isr)?;
+    conn.execute(
+        &format!(
+            "INSERT INTO bus_partition_assignments ({BUS_ASSIGNMENT_COLUMNS}) \
+             VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+             ON CONFLICT(org_id, topic, partition) DO UPDATE SET \
+             leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
+             isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
+             environment = excluded.environment, updated_at_ms = excluded.updated_at_ms"
+        ),
+        rusqlite::params![
+            row.org_id,
+            row.topic,
+            row.partition,
+            row.leader_node_id,
+            replicas_json,
+            isr_json,
+            row.leader_epoch,
+            row.environment,
+            row.updated_at_ms,
+        ],
+    )?;
+    Ok(())
+}
+
+/// Direct-SQL cleanup, bypassing the ledger — see this section's header
+/// comment (same exception `bus_topics_delete_by_org` documents). Returns
+/// how many rows were removed.
+pub fn bus_assignment_delete_by_topic(pool: &DbPool, org_id: &str, topic: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_partition_assignments WHERE org_id = ?1 AND topic = ?2",
+        rusqlite::params![org_id, topic],
+    )?;
+    Ok(count)
+}
+
+/// Direct-SQL cleanup, bypassing the ledger — RODO/GDPR org-deletion path,
+/// same exception as `bus_topics_delete_by_org`/`bus_groups_delete_by_org`.
+/// Returns how many rows were removed.
+pub fn bus_assignment_delete_by_org(pool: &DbPool, org_id: &str) -> Result<usize> {
+    let conn = acquire(pool)?;
+    let count = conn.execute(
+        "DELETE FROM bus_partition_assignments WHERE org_id = ?1",
+        rusqlite::params![org_id],
+    )?;
+    Ok(count)
+}
+
+/// Test-only fixture recreating `bus_topics`/`bus_groups` with the exact
+/// shape the functions above assume, so `bus/` unit tests can run against a
+/// plain `crate::db::init(":memory:")` database before migration v146
+/// (which creates these tables for real) lands. DELETE THIS MODULE once
+/// v146 is merged and re-point tests at `crate::db::migrations::run`
+/// directly — kept `#[cfg(test)]` so it can never leak into a production
+/// binary in the meantime.
+#[cfg(test)]
+pub mod bus_test_support {
+    use super::DbPool;
+    use anyhow::Result;
+
+    pub fn create_bus_tables(pool: &DbPool) -> Result<()> {
+        let conn = super::acquire(pool)?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS bus_topics (
+                org_id TEXT NOT NULL,
+                name TEXT NOT NULL,
+                partitions INTEGER NOT NULL,
+                retention_ms INTEGER NOT NULL,
+                retention_bytes INTEGER NOT NULL,
+                cleanup_policy TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                idempotency_key TEXT,
+                dedup_window_ms INTEGER NOT NULL,
+                max_delivery_attempts INTEGER NOT NULL,
+                retry_backoff_ms INTEGER NOT NULL,
+                schema_id TEXT,
+                validation TEXT NOT NULL,
+                content_type TEXT NOT NULL,
+                replication_factor INTEGER NOT NULL,
+                acks TEXT NOT NULL,
+                durability TEXT NOT NULL,
+                max_inline_bytes INTEGER NOT NULL,
+                compression TEXT NOT NULL,
+                environment TEXT NOT NULL,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                durability_class TEXT,
+                PRIMARY KEY (org_id, name)
+            );
+            CREATE TABLE IF NOT EXISTS bus_groups (
+                org_id TEXT NOT NULL,
+                group_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                commit_mode TEXT NOT NULL,
+                paused INTEGER NOT NULL DEFAULT 0,
+                created_at_ms INTEGER NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (org_id, group_id, topic)
+            );
+            CREATE TABLE IF NOT EXISTS bus_partition_assignments (
+                org_id TEXT NOT NULL,
+                topic TEXT NOT NULL,
+                partition INTEGER NOT NULL,
+                leader_node_id TEXT NOT NULL,
+                replicas TEXT NOT NULL,
+                isr TEXT NOT NULL,
+                leader_epoch INTEGER NOT NULL,
+                environment TEXT NOT NULL,
+                updated_at_ms INTEGER NOT NULL,
+                PRIMARY KEY (org_id, topic, partition)
+            );
+            CREATE INDEX IF NOT EXISTS idx_bus_assign_leader
+                ON bus_partition_assignments(leader_node_id);",
+        )?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod bus_repository_tests {
+    use super::bus_test_support::create_bus_tables;
+    use super::*;
+    use std::path::Path;
+
+    fn fresh_db() -> DbPool {
+        let pool = crate::db::init(Path::new(":memory:")).expect("cannot build test DB");
+        create_bus_tables(&pool).expect("bus fixture tables");
+        pool
+    }
+
+    fn topic_row(org_id: &str, name: &str) -> DbBusTopic {
+        DbBusTopic {
+            org_id: org_id.to_string(),
+            name: name.to_string(),
+            partitions: 4,
+            retention_ms: 86_400_000,
+            retention_bytes: 1_073_741_824,
+            cleanup_policy: "delete".to_string(),
+            delivery: "at_least_once".to_string(),
+            idempotency_key: None,
+            dedup_window_ms: 60_000,
+            max_delivery_attempts: 5,
+            retry_backoff_ms: 1_000,
+            schema_id: None,
+            validation: "none".to_string(),
+            content_type: "application/json".to_string(),
+            replication_factor: 1,
+            acks: "all".to_string(),
+            durability: "fsync_batch".to_string(),
+            max_inline_bytes: 1_048_576,
+            compression: "lz4".to_string(),
+            environment: "test".to_string(),
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+            durability_class: Some("critical".to_string()),
+        }
+    }
+
+    fn group_row(org_id: &str, group_id: &str, topic: &str) -> DbBusGroup {
+        DbBusGroup {
+            org_id: org_id.to_string(),
+            group_id: group_id.to_string(),
+            topic: topic.to_string(),
+            commit_mode: "manual".to_string(),
+            paused: false,
+            created_at_ms: 1_000,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn topic_create_get_update_delete_round_trips() {
+        let db = fresh_db();
+        let mut row = topic_row("org-1", "orders.created");
+        bus_topic_create(&db, &row).unwrap();
+
+        let fetched = bus_topic_get(&db, "org-1", "orders.created")
+            .unwrap()
+            .expect("topic must exist");
+        assert_eq!(fetched.partitions, 4);
+        assert_eq!(fetched.acks, "all");
+        assert_eq!(fetched.durability_class.as_deref(), Some("critical"));
+
+        row.partitions = 8;
+        row.acks = "leader".to_string();
+        row.updated_at_ms = 2_000;
+        // Simulate an explicit-override update: `durability_class` clears
+        // to NULL independent of every other column.
+        row.durability_class = None;
+        bus_topic_update(&db, &row).unwrap();
+
+        let updated = bus_topic_get(&db, "org-1", "orders.created")
+            .unwrap()
+            .expect("topic must still exist");
+        assert_eq!(updated.partitions, 8);
+        assert_eq!(updated.acks, "leader");
+        assert_eq!(updated.updated_at_ms, 2_000);
+        assert_eq!(updated.durability_class, None);
+        // created_at_ms must never change via `bus_topic_update` (review
+        // P3-10: the statement never sets it).
+        assert_eq!(updated.created_at_ms, 1_000);
+
+        bus_topic_delete(&db, "org-1", "orders.created").unwrap();
+        assert!(bus_topic_get(&db, "org-1", "orders.created")
+            .unwrap()
+            .is_none());
+    }
+
+    /// The wire shape of `core.bus_topic` has exactly one producer
+    /// (`bus_topic_write_capture`) and one consumer
+    /// (`sync/core_materializer.rs::apply_bus_topic`, whose own tests build
+    /// their op from this same function). Pinned here as well because the
+    /// materializer's guard compares `resource_id` against a composite id it
+    /// recomputes from the payload: if this function ever changed how it builds
+    /// either half, every op would start being rejected instead of silently
+    /// landing under the wrong topic.
+    #[test]
+    fn bus_topic_write_capture_matches_the_materializer_payload_contract() {
+        let row = topic_row("org-1", "orders.created");
+        let capture = bus_topic_write_capture(&row, crate::sync::runtime::SqlWriteAction::Insert)
+            .expect("capture");
+        assert_eq!(capture.org_id, "org-1");
+        assert_eq!(capture.resource_type, "core.bus_topic");
+        assert_eq!(capture.table_name, "bus_topics");
+        assert_eq!(capture.primary_key, "org_id,name");
+        assert_eq!(
+            capture.resource_id,
+            crate::sync::resource_id::composite_resource_id(&["org-1", "orders.created"])
+        );
+        // The journal's `actor_user_id` column is FK-bound to `user_accounts`;
+        // bus actors live in the `bus.topic.*` audit rows instead, so nothing
+        // may start putting a raw actor string on the wire here.
+        assert_eq!(capture.actor_user_id, None);
+        let json = match capture
+            .changed_fields
+            .get("row_json")
+            .expect("row_json is the payload the materializer reads")
+        {
+            crate::sync::ledger::FieldValue::String(value) => value.clone(),
+            other => panic!("row_json must be a string field, got {other:?}"),
+        };
+        let decoded: DbBusTopic = serde_json::from_str(&json).expect("payload decodes");
+        assert_eq!(
+            serde_json::to_string(&decoded).expect("re-encode"),
+            json,
+            "the payload must round-trip through `DbBusTopic` unchanged"
+        );
+    }
+
+    /// Mirrors `bus/replication/assignment.rs`'s `locked_ledger_fixture`:
+    /// one process-global `SYNC_RUNTIME`/Fjall ledger for the whole test
+    /// binary. `sync::runtime::init` is itself idempotent (a second call
+    /// from any test module just returns the existing `Arc`, never
+    /// re-opens the exclusively-locked Fjall store — see its own doc), so
+    /// this fixture races safely against that other module's copy: whichever
+    /// runs first in this binary wins, and every caller's own `pool`
+    /// argument (never the runtime's) is what actually receives the
+    /// `core_resource_versions`/`bus_*` rows these tests assert on.
+    fn locked_ledger_fixture() -> std::sync::MutexGuard<'static, ()> {
+        let guard = crate::addon::fs_sandbox::test_home_lock()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        static INITIALIZED: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+        if INITIALIZED.get().is_none() {
+            let tmp = tempfile::tempdir().expect("tempdir");
+            std::env::set_var("HOME", tmp.path());
+            std::env::set_var("TENTAFLOW_HOME", tmp.path());
+            let conn = rusqlite::Connection::open_in_memory().expect("open db");
+            crate::db::migrations::run(&conn).expect("run migrations");
+            let db: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
+            let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[11u8; 32]));
+            let security = std::sync::Arc::new(
+                crate::mesh::security::MeshSecurity::new(db.clone(), cipher.clone())
+                    .expect("mesh security"),
+            );
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                match crate::sync::runtime::init(db.clone(), security.clone(), cipher.clone()) {
+                    Ok(_) => break,
+                    Err(crate::sync::ledger::SyncLedgerError::Fjall(fjall::Error::Locked))
+                        if std::time::Instant::now() < deadline =>
+                    {
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    Err(e) => panic!("sync runtime init: {e:?}"),
+                }
+            }
+            std::mem::forget(tmp);
+            let _ = INITIALIZED.set(());
+        }
+        guard
+    }
+
+    /// K-M2-4 close-out, open item nr 1 (M2-WYNIKI.md): an RODO/GDPR org
+    /// purge must not leave peers holding the purged org's topics forever.
+    /// Proves the fix on the REAL runtime/ledger — not just that a capture
+    /// object was built (`bus_topic_write_capture_matches_the_materializer_
+    /// payload_contract` above already covers that in isolation), but that
+    /// `bus_topics_delete_by_org` actually mints one AND, just as
+    /// importantly, that it returns instead of deadlocking on its own
+    /// writer-mutex guard (the bug this fix's lock-ordering note exists to
+    /// prevent — the watermark table's own guard, `acquire_for_baseline`,
+    /// would hang right here if it did). `publish_bus_topic_capture` ->
+    /// `apply_core_operation` -> a replica seeing the delete is the SAME
+    /// round trip `a_topic_write_publishes_a_core_bus_topic_op_a_replica_
+    /// can_materialize` (assignment.rs) already proves end-to-end; this
+    /// test's job is only to prove THIS call site actually reaches that
+    /// primitive, not to re-prove the primitive itself.
+    #[test]
+    fn bus_topics_delete_by_org_publishes_a_delete_and_does_not_deadlock() {
+        let _guard = locked_ledger_fixture();
+        let author = fresh_db();
+        let org = "org-purge";
+        let name = "orders.deleted-source";
+        // `bus_topic_create` (unlike `bus_topics_delete_by_org` before this
+        // fix) already mints its own capture on the way in — so the
+        // baseline here is "a watermark from the CREATE", and the purge
+        // must leave a STRICTLY NEWER one behind, not the create's leftover
+        // value (which is what "no capture emitted" would look like).
+        bus_topic_create(&author, &topic_row(org, name)).expect("create");
+        let after_create = resource_watermark(&author, "core.bus_topic", org, &[name])
+            .expect("bus_topic_create must mint its own capture");
+
+        let deleted = bus_topics_delete_by_org(&author, org).expect("purge must not deadlock");
+        assert_eq!(deleted, 1);
+        assert!(bus_topic_get(&author, org, name).unwrap().is_none());
+        let after_delete = resource_watermark(&author, "core.bus_topic", org, &[name])
+            .expect("the purge must have minted its own capture for the deleted row");
+        assert!(
+            after_delete > after_create,
+            "the purge's capture must carry a strictly newer HLC than the create's \
+             (before this fix, the watermark never moved past `after_create` at all: \
+             after_create={after_create:?} after_delete={after_delete:?})"
+        );
+    }
+
+    /// K-M2-4 close-out, open item nr 2 (M2-WYNIKI.md): `perform_core_
+    /// baseline_reset`'s reseed must re-publish `bus_topics`/
+    /// `bus_partition_assignments` too, not just skip them silently as it
+    /// did before. Two different baselines, since the two tables' own
+    /// writers differ (`bus_topic_create` mints its own capture on the way
+    /// in; `bus_assignment_upsert` is pure SQL, no capture at all — see
+    /// each function's body): the topic's watermark must move STRICTLY
+    /// PAST what the create already left behind, and the assignment's must
+    /// go from absent to present. Neither call may hang on its own
+    /// `acquire(pool)` guard.
+    #[test]
+    fn reseed_publishes_bus_topics_and_assignments() {
+        let _guard = locked_ledger_fixture();
+        let author = fresh_db();
+        let org = "org-reseed";
+        let topic = "orders.reseeded";
+        bus_topic_create(&author, &topic_row(org, topic)).expect("create topic");
+        bus_assignment_upsert(
+            &author,
+            &DbBusPartitionAssignment {
+                org_id: org.to_string(),
+                topic: topic.to_string(),
+                partition: 0,
+                leader_node_id: "node-a".to_string(),
+                replicas: vec!["node-a".to_string(), "node-b".to_string()],
+                isr: vec!["node-a".to_string(), "node-b".to_string()],
+                leader_epoch: 1,
+                environment: "prod".to_string(),
+                updated_at_ms: 1,
+            },
+        )
+        .expect("seed assignment");
+        let topic_watermark_before_reseed =
+            resource_watermark(&author, "core.bus_topic", org, &[topic])
+                .expect("bus_topic_create must mint its own capture");
+        assert_eq!(
+            resource_watermark(&author, "core.bus_partition_assignment", org, &[topic, "0"]),
+            None,
+            "bus_assignment_upsert must not itself mint a capture"
+        );
+
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[11u8; 32]));
+        let emitted =
+            reseed_core_state_from_current_rows(&author, &cipher).expect("reseed must not hang");
+        assert!(emitted >= 2, "reseed must publish both the topic and the assignment");
+        let topic_watermark_after_reseed =
+            resource_watermark(&author, "core.bus_topic", org, &[topic])
+                .expect("reseed must have minted its own core.bus_topic capture");
+        assert!(
+            topic_watermark_after_reseed > topic_watermark_before_reseed,
+            "reseed's topic capture must carry a strictly newer HLC than the create's"
+        );
+        assert!(
+            resource_watermark(&author, "core.bus_partition_assignment", org, &[topic, "0"])
+                .is_some(),
+            "reseed must have minted a core.bus_partition_assignment capture"
+        );
+    }
+
+    /// The `core_resource_versions` HLC watermark for one resource, if a
+    /// capture through the immediate-publish path (`publish_bus_topic_
+    /// capture`/`SqliteLedgerAssignmentStore::propose` — the ONLY writers
+    /// that touch this table for `core.bus_topic`/`core.bus_partition_
+    /// assignment`, see their own docs) has ever bumped it. `None` here is
+    /// itself a meaningful assertion: these two resources' raw SQL writers
+    /// (`bus_topic_create`, `bus_assignment_upsert`) never touch this
+    /// table on their own.
+    fn resource_watermark(
+        db: &DbPool,
+        resource_type: &str,
+        org_id: &str,
+        id_parts: &[&str],
+    ) -> Option<(i64, i64)> {
+        let mut parts = vec![org_id];
+        parts.extend_from_slice(id_parts);
+        let resource_id = crate::sync::resource_id::composite_resource_id(&parts);
+        let conn = acquire_for_baseline(db).expect("conn");
+        conn.query_row(
+            "SELECT hlc_wall, hlc_logical FROM core_resource_versions \
+             WHERE resource_type = ?1 AND resource_id = ?2",
+            rusqlite::params![resource_type, resource_id],
+            |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)),
+        )
+        .optional()
+        .expect("query")
+    }
+
+    #[test]
+    fn topic_list_is_scoped_to_org_and_sorted_by_name() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row("org-1", "b.topic")).unwrap();
+        bus_topic_create(&db, &topic_row("org-1", "a.topic")).unwrap();
+        bus_topic_create(&db, &topic_row("org-2", "c.topic")).unwrap();
+
+        let org1 = bus_topic_list(&db, "org-1").unwrap();
+        let names: Vec<&str> = org1.iter().map(|t| t.name.as_str()).collect();
+        assert_eq!(names, vec!["a.topic", "b.topic"]);
+
+        let org2 = bus_topic_list(&db, "org-2").unwrap();
+        assert_eq!(org2.len(), 1);
+        assert_eq!(org2[0].name, "c.topic");
+    }
+
+    #[test]
+    fn group_upsert_get_and_list_round_trip() {
+        let db = fresh_db();
+        let row = group_row("org-1", "workers", "orders.created");
+        bus_group_upsert(&db, &row).unwrap();
+
+        let fetched = bus_group_get(&db, "org-1", "workers", "orders.created")
+            .unwrap()
+            .expect("group must exist");
+        assert_eq!(fetched.commit_mode, "manual");
+        assert!(!fetched.paused);
+
+        let mut paused_row = row.clone();
+        paused_row.paused = true;
+        paused_row.commit_mode = "auto".to_string();
+        paused_row.updated_at_ms = 2_000;
+        bus_group_upsert(&db, &paused_row).unwrap();
+
+        let updated = bus_group_get(&db, "org-1", "workers", "orders.created")
+            .unwrap()
+            .expect("group must still exist");
+        assert!(updated.paused);
+        assert_eq!(updated.commit_mode, "auto");
+
+        let listed = bus_group_list(&db, "org-1").unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].group_id, "workers");
+    }
+
+    /// Decision 9 (RODO): the org-purge repository functions must delete
+    /// every row for the target org, report how many rows they removed, and
+    /// never touch another org's rows.
+    #[test]
+    fn delete_by_org_removes_only_the_target_orgs_rows_and_returns_the_count() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row("org-1", "orders.created")).unwrap();
+        bus_topic_create(&db, &topic_row("org-1", "orders.shipped")).unwrap();
+        bus_topic_create(&db, &topic_row("org-2", "invoices.created")).unwrap();
+        bus_group_upsert(&db, &group_row("org-1", "workers", "orders.created")).unwrap();
+        bus_group_upsert(&db, &group_row("org-1", "shippers", "orders.shipped")).unwrap();
+        bus_group_upsert(&db, &group_row("org-2", "billing", "invoices.created")).unwrap();
+
+        let deleted_topics = bus_topics_delete_by_org(&db, "org-1").unwrap();
+        assert_eq!(deleted_topics, 2);
+        let deleted_groups = bus_groups_delete_by_org(&db, "org-1").unwrap();
+        assert_eq!(deleted_groups, 2);
+
+        assert!(bus_topic_list(&db, "org-1").unwrap().is_empty());
+        assert!(bus_group_list(&db, "org-1").unwrap().is_empty());
+
+        // org-2's rows are untouched.
+        assert_eq!(bus_topic_list(&db, "org-2").unwrap().len(), 1);
+        assert_eq!(bus_group_list(&db, "org-2").unwrap().len(), 1);
+
+        // Deleting an org with no rows is a no-op that reports zero, not an
+        // error.
+        assert_eq!(bus_topics_delete_by_org(&db, "org-1").unwrap(), 0);
+        assert_eq!(bus_groups_delete_by_org(&db, "org-1").unwrap(), 0);
+    }
+
+    #[test]
+    fn delete_by_topic_removes_only_that_topics_groups_in_the_same_org() {
+        let db = fresh_db();
+        bus_topic_create(&db, &topic_row("org-1", "orders.created")).unwrap();
+        bus_topic_create(&db, &topic_row("org-1", "orders.shipped")).unwrap();
+        bus_group_upsert(&db, &group_row("org-1", "workers", "orders.created")).unwrap();
+        bus_group_upsert(&db, &group_row("org-1", "shippers", "orders.shipped")).unwrap();
+        bus_group_upsert(&db, &group_row("org-2", "workers", "orders.created")).unwrap();
+
+        let deleted = bus_groups_delete_by_topic(&db, "org-1", "orders.created").unwrap();
+        assert_eq!(deleted, 1);
+
+        assert!(bus_group_get(&db, "org-1", "workers", "orders.created")
+            .unwrap()
+            .is_none());
+        assert!(bus_group_get(&db, "org-1", "shippers", "orders.shipped")
+            .unwrap()
+            .is_some());
+        assert!(
+            bus_group_get(&db, "org-2", "workers", "orders.created")
+                .unwrap()
+                .is_some(),
+            "a different org's identically named group must survive"
+        );
+
+        assert_eq!(
+            bus_groups_delete_by_topic(&db, "org-1", "orders.created").unwrap(),
+            0,
+            "deleting an already-empty topic's groups is a no-op, not an error"
+        );
+    }
+
+    fn assignment_row(org_id: &str, topic: &str, partition: u32) -> DbBusPartitionAssignment {
+        DbBusPartitionAssignment {
+            org_id: org_id.to_string(),
+            topic: topic.to_string(),
+            partition,
+            leader_node_id: "node-a".to_string(),
+            replicas: vec!["node-a".to_string(), "node-b".to_string()],
+            isr: vec!["node-a".to_string(), "node-b".to_string()],
+            leader_epoch: 1,
+            environment: "test".to_string(),
+            updated_at_ms: 1_000,
+        }
+    }
+
+    #[test]
+    fn assignment_upsert_get_and_list_for_topic_round_trip() {
+        let db = fresh_db();
+        let mut row = assignment_row("org-1", "orders.created", 0);
+        bus_assignment_upsert(&db, &row).unwrap();
+
+        let fetched = bus_assignment_get(&db, "org-1", "orders.created", 0)
+            .unwrap()
+            .expect("assignment must exist");
+        assert_eq!(fetched, row);
+
+        // Upsert is a full-row replace on the (org, topic, partition) key.
+        row.leader_node_id = "node-b".to_string();
+        row.isr = vec!["node-b".to_string()];
+        row.leader_epoch = 2;
+        row.updated_at_ms = 2_000;
+        bus_assignment_upsert(&db, &row).unwrap();
+
+        let updated = bus_assignment_get(&db, "org-1", "orders.created", 0)
+            .unwrap()
+            .expect("assignment must still exist");
+        assert_eq!(updated.leader_node_id, "node-b");
+        assert_eq!(updated.isr, vec!["node-b".to_string()]);
+        assert_eq!(updated.leader_epoch, 2);
+
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 1)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.shipped", 0)).unwrap();
+        let listed = bus_assignment_list_for_topic(&db, "org-1", "orders.created").unwrap();
+        let partitions: Vec<u32> = listed.iter().map(|r| r.partition).collect();
+        assert_eq!(partitions, vec![0, 1]);
+    }
+
+    #[test]
+    fn assignment_get_returns_none_for_unknown_partition() {
+        let db = fresh_db();
+        assert!(bus_assignment_get(&db, "org-1", "orders.created", 0)
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn assignment_list_for_node_matches_leader_and_replica_membership_only() {
+        let db = fresh_db();
+        // node-a: leader here.
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 0)).unwrap();
+        // node-c: neither leader nor replica — must not match.
+        let mut unrelated = assignment_row("org-1", "orders.created", 1);
+        unrelated.leader_node_id = "node-x".to_string();
+        unrelated.replicas = vec!["node-x".to_string(), "node-y".to_string()];
+        unrelated.isr = vec!["node-x".to_string()];
+        bus_assignment_upsert(&db, &unrelated).unwrap();
+        // Substring trap: "node-a" must not spuriously match a row whose
+        // membership is actually "node-a1" (a different node id).
+        let mut lookalike = assignment_row("org-1", "orders.shipped", 0);
+        lookalike.leader_node_id = "node-a1".to_string();
+        lookalike.replicas = vec!["node-a1".to_string()];
+        lookalike.isr = vec!["node-a1".to_string()];
+        bus_assignment_upsert(&db, &lookalike).unwrap();
+
+        let for_node_a = bus_assignment_list_for_node(&db, "node-a").unwrap();
+        assert_eq!(for_node_a.len(), 1);
+        assert_eq!(for_node_a[0].topic, "orders.created");
+        assert_eq!(for_node_a[0].partition, 0);
+
+        let for_node_b = bus_assignment_list_for_node(&db, "node-b").unwrap();
+        assert_eq!(
+            for_node_b.len(),
+            1,
+            "node-b is a replica (not leader) of orders.created/0"
+        );
+
+        assert!(bus_assignment_list_for_node(&db, "node-nowhere")
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn assignment_list_all_returns_every_row_across_orgs() {
+        let db = fresh_db();
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row("org-2", "invoices.created", 0)).unwrap();
+        let all = bus_assignment_list_all(&db).unwrap();
+        assert_eq!(all.len(), 2);
+    }
+
+    #[test]
+    fn assignment_delete_by_topic_and_by_org_scope_correctly() {
+        let db = fresh_db();
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.created", 1)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row("org-1", "orders.shipped", 0)).unwrap();
+        bus_assignment_upsert(&db, &assignment_row("org-2", "invoices.created", 0)).unwrap();
+
+        let deleted = bus_assignment_delete_by_topic(&db, "org-1", "orders.created").unwrap();
+        assert_eq!(deleted, 2);
+        assert!(
+            bus_assignment_list_for_topic(&db, "org-1", "orders.created")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            bus_assignment_list_for_topic(&db, "org-1", "orders.shipped")
+                .unwrap()
+                .len(),
+            1,
+            "a different topic in the same org must survive"
+        );
+
+        let deleted_org = bus_assignment_delete_by_org(&db, "org-1").unwrap();
+        assert_eq!(deleted_org, 1, "only the remaining orders.shipped row");
+        assert_eq!(bus_assignment_list_all(&db).unwrap().len(), 1);
+        assert_eq!(
+            bus_assignment_list_all(&db).unwrap()[0].org_id,
+            "org-2",
+            "org-2's row must survive an org-1-scoped delete"
+        );
+
+        assert_eq!(
+            bus_assignment_delete_by_topic(&db, "org-1", "orders.created").unwrap(),
+            0,
+            "deleting an already-empty topic's assignments is a no-op, not an error"
+        );
     }
 }

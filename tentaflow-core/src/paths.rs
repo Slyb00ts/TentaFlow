@@ -47,9 +47,10 @@ pub enum StorageCategory {
     Keys = 6,
     Sync = 7,
     Data = 8,
+    Bus = 9,
 }
 
-pub const STORAGE_CATEGORY_COUNT: usize = 9;
+pub const STORAGE_CATEGORY_COUNT: usize = 10;
 
 pub const ALL_STORAGE_CATEGORIES: [StorageCategory; STORAGE_CATEGORY_COUNT] = [
     StorageCategory::Models,
@@ -61,6 +62,7 @@ pub const ALL_STORAGE_CATEGORIES: [StorageCategory; STORAGE_CATEGORY_COUNT] = [
     StorageCategory::Keys,
     StorageCategory::Sync,
     StorageCategory::Data,
+    StorageCategory::Bus,
 ];
 
 impl StorageCategory {
@@ -78,6 +80,7 @@ impl StorageCategory {
             StorageCategory::Keys => "keys_dir",
             StorageCategory::Sync => "sync_dir",
             StorageCategory::Data => "data_dir",
+            StorageCategory::Bus => "bus_dir",
         }
     }
 
@@ -101,14 +104,20 @@ impl StorageCategory {
             StorageCategory::Keys => home.join("keys"),
             StorageCategory::Sync => home.join("sync"),
             StorageCategory::Data => home.join("data"),
+            StorageCategory::Bus => home.join("bus"),
         }
     }
 
     /// Czy dane tej kategorii da sie przeniesc bez restartu (uchwyty da sie
     /// zamknac / sa per-wywolanie). Data i Sync wymagaja restartu — sa trzymane
-    /// w globalnych OnceLockach bez API zamkniecia.
+    /// w globalnych OnceLockach bez API zamkniecia. Bus dolacza do tej listy:
+    /// silnik logu trzyma otwarte uchwyty plikow segmentow per partycja, ktore
+    /// nie maja API zamkniecia na zywo (wzorzec Data/Sync, `PLAN.md` §2.2).
     pub fn live_migratable(self) -> bool {
-        !matches!(self, StorageCategory::Data | StorageCategory::Sync)
+        !matches!(
+            self,
+            StorageCategory::Data | StorageCategory::Sync | StorageCategory::Bus
+        )
     }
 }
 
@@ -116,7 +125,7 @@ impl StorageCategory {
 /// OnceLock. Override czytane przy KAZDYM wywolaniu paths (tani read-lock) —
 /// celowo nie cache'owane, zeby zmiana ustawienia dzialala natychmiast.
 static PATH_OVERRIDES: RwLock<[Option<PathBuf>; STORAGE_CATEGORY_COUNT]> =
-    RwLock::new([None, None, None, None, None, None, None, None, None]);
+    RwLock::new([None, None, None, None, None, None, None, None, None, None]);
 
 /// Zamienia opcjonalny string ustawienia na sciezke: pusty/bialy → None
 /// (uzyj domyslnej), niepusty → `Some(PathBuf)`.
@@ -245,8 +254,7 @@ pub fn schedule_boot_migration(category: StorageCategory, new_path: &str) -> std
 
 /// Zaplanowana (jeszcze nie wykonana) migracja kategorii, jesli istnieje.
 pub fn pending_boot_migration(category: StorageCategory) -> Option<String> {
-    read_conf(&pending_migrations_conf())
-        .remove(category.setting_key())
+    read_conf(&pending_migrations_conf()).remove(category.setting_key())
 }
 
 /// Wartosc override kategorii restartowej zapisana w storage-paths.conf
@@ -258,10 +266,7 @@ pub fn boot_override_value(category: StorageCategory) -> Option<String> {
 
 /// Zapisuje override kategorii restartowej do storage-paths.conf (bez
 /// przenoszenia danych — nowa sciezka obowiazuje od nastepnego startu).
-pub fn set_boot_override(
-    category: StorageCategory,
-    value: Option<&str>,
-) -> std::io::Result<()> {
+pub fn set_boot_override(category: StorageCategory, value: Option<&str>) -> std::io::Result<()> {
     let conf_path = storage_paths_conf();
     let mut map = read_conf(&conf_path);
     match value {
@@ -288,7 +293,10 @@ pub fn apply_pending_boot_migrations() {
     let mut conf = boot_overrides();
     for (key, new_path) in &pending {
         let Some(cat) = StorageCategory::from_setting_key(key) else {
-            eprintln!("tentaflow: pending storage migration: nieznana kategoria '{}'", key);
+            eprintln!(
+                "tentaflow: pending storage migration: nieznana kategoria '{}'",
+                key
+            );
             continue;
         };
         let src = category_dir_from_conf(cat, &conf);
@@ -356,7 +364,11 @@ pub fn move_dir_contents(src: &Path, dst: &Path) -> std::io::Result<()> {
     }
     // Pusty katalog docelowy (np. swiezo utworzony w pickerze) usuwamy, zeby
     // szybki `rename` na tym samym systemie plikow byl mozliwy.
-    if dst.is_dir() && std::fs::read_dir(dst).map(|mut d| d.next().is_none()).unwrap_or(false) {
+    if dst.is_dir()
+        && std::fs::read_dir(dst)
+            .map(|mut d| d.next().is_none())
+            .unwrap_or(false)
+    {
         let _ = std::fs::remove_dir(dst);
     }
     if !dst.exists() {
@@ -947,6 +959,33 @@ mod tests {
                 .exists());
             assert!(tmp.path().join("containers").join(".bundle_hash").exists());
         }
+    }
+
+    #[test]
+    fn bus_storage_category_matches_plan() {
+        // Guards the exact trap called out in `SUM/tentabus/PLAN.md` §2.2:
+        // `STORAGE_CATEGORY_COUNT` and the `PATH_OVERRIDES` array literal
+        // must track `ALL_STORAGE_CATEGORIES` in lockstep, or the crate
+        // fails to compile (array-length mismatch) or silently drops the
+        // new category's override slot.
+        assert_eq!(STORAGE_CATEGORY_COUNT, ALL_STORAGE_CATEGORIES.len());
+        assert!(ALL_STORAGE_CATEGORIES.contains(&StorageCategory::Bus));
+        assert_eq!(StorageCategory::Bus.setting_key(), "bus_dir");
+        assert_eq!(
+            StorageCategory::from_setting_key("bus_dir"),
+            Some(StorageCategory::Bus)
+        );
+        assert!(
+            !StorageCategory::Bus.live_migratable(),
+            "Bus holds open segment file handles like Data/Sync — restart required"
+        );
+
+        let _guard = OVERRIDE_GUARD.lock().unwrap_or_else(|e| e.into_inner());
+        set_category_override(StorageCategory::Bus, None);
+        assert_eq!(
+            StorageCategory::Bus.default_dir(),
+            tentaflow_home().join("bus")
+        );
     }
 
     #[test]

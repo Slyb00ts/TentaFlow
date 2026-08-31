@@ -13,16 +13,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 // =============================================================================
 
 /// GPU vendor families recognised by the multi-source collector layer.
-#[derive(
-    SerdeSerialize,
-    SerdeDeserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GpuVendor {
     Nvidia,
     Amd,
@@ -31,9 +22,7 @@ pub enum GpuVendor {
 }
 
 /// Selector describing which GPUs a profiling session should target.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum GpuTargets {
     /// No GPU profiling requested.
     None,
@@ -46,9 +35,7 @@ pub enum GpuTargets {
 }
 
 /// Process scope of the profiling run.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ProfileTarget {
     /// Whole-system profiling (root / cap_sys_admin usually required).
     SystemWide,
@@ -59,16 +46,7 @@ pub enum ProfileTarget {
 }
 
 /// Top-level taxonomy used to group `TimelineEvent` entries in the GUI.
-#[derive(
-    SerdeSerialize,
-    SerdeDeserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EventCategory {
     CpuSample,
     CpuCounter,
@@ -90,9 +68,7 @@ pub enum EventCategory {
 }
 
 /// Power telemetry domain (CPU package, GPU index, ANE, ...).
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum PowerDomain {
     CpuPkg,
     CpuCore,
@@ -104,9 +80,7 @@ pub enum PowerDomain {
 }
 
 /// Hardware / software counter kind for `EventPayload::CpuCounter`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum CounterKind {
     Ipc,
     CacheMissL1,
@@ -120,15 +94,7 @@ pub enum CounterKind {
 }
 
 /// Direction / kind of GPU memory transfer.
-#[derive(
-    SerdeSerialize,
-    SerdeDeserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransferKind {
     /// Host-to-Device.
     H2D,
@@ -141,9 +107,7 @@ pub enum TransferKind {
 }
 
 /// Outcome of an individual collector inside a session.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum CollectorStatus {
     /// Collector ran and produced data that landed in the report.
     Used,
@@ -156,9 +120,7 @@ pub enum CollectorStatus {
 }
 
 /// Privilege a collector needs to operate.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub enum ElevationRequirement {
     None,
     Sudo,
@@ -175,16 +137,7 @@ pub enum ElevationRequirement {
 /// Stored as a plain `u32` so CBOR can derive `Archive` without any custom
 /// resolver. Constants are associated `u32` values (not enum variants) so that
 /// callers can `OR` them together at compile time: `CPU_SAMPLING | GPU`.
-#[derive(
-    SerdeSerialize,
-    SerdeDeserialize,
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    Hash,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct ProfileSourceFlags(pub u32);
 
 impl ProfileSourceFlags {
@@ -267,9 +220,7 @@ pub const MAX_PROFILE_LABEL_LEN: usize = 128;
 pub const MAX_GPU_INDICES: usize = 32;
 
 /// Multi-source profile session scope.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfileScope {
     pub sources: ProfileSourceFlags,
     pub gpu_targets: GpuTargets,
@@ -369,9 +320,7 @@ impl ProfileScope {
 pub const MAX_COLLECTOR_ID_LEN: usize = 64;
 
 /// Per-collector run accounting attached to a `ProfileReportV2`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct CollectorRunInfo {
     /// Stable collector identifier (regex `^[a-z0-9][a-z0-9_.-]{0,63}$`).
     pub id: String,
@@ -447,9 +396,7 @@ pub fn validate_collector_id(s: &str) -> Result<(), CollectorIdError> {
 // =============================================================================
 
 /// One stack frame — index into `ProfileReportV2.frames` is the `FrameId`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct Frame {
     pub symbol: String,
     pub module: String,
@@ -463,9 +410,7 @@ pub struct Frame {
 
 /// Per-event payload. Each variant encodes one row in the timeline; the parent
 /// `TimelineEvent` carries timestamps, lane hint and category tag.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum EventPayload {
     /// CPU sampler hit. `stack_id` indexes `ProfileReportV2.stacks`.
     CpuSample {
@@ -579,9 +524,7 @@ pub enum EventPayload {
 
 /// One row on the unified timeline. Ranges have `t_end_ns > t_start_ns`; point
 /// events set both fields equal.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct TimelineEvent {
     /// Index into `ProfileReportV2.collectors` of the source collector.
     pub source_idx: u16,
@@ -603,9 +546,7 @@ pub const DRIFT_TOLERANCE_NS: u64 = 5_000_000;
 
 /// Per-collector clock samples used to estimate drift against the session's
 /// monotonic reference clock.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ClockSamples {
     pub collector_id: String,
     /// Pairs of `(local_clock_ns_collector, monotonic_session_ns)`.
@@ -613,9 +554,7 @@ pub struct ClockSamples {
 }
 
 /// Aggregated drift report attached to every `ProfileReportV2`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct DriftReport {
     pub per_collector: Vec<ClockSamples>,
     pub max_observed_drift_ns: u64,
@@ -643,9 +582,7 @@ impl DriftReport {
 pub const PROFILE_REPORT_V2_SCHEMA_VERSION: u32 = 2;
 
 /// Multi-source profile report.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfileReportV2 {
     /// Always `PROFILE_REPORT_V2_SCHEMA_VERSION`.
     pub schema_version: u32,
@@ -675,9 +612,7 @@ pub struct ProfileReportV2 {
 // =============================================================================
 
 /// Lightweight session row used by `ProfilingSessionsResponse`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingSessionEntry {
     pub session_id: String,
     pub label: String,
@@ -692,9 +627,7 @@ pub struct ProfilingSessionEntry {
 
 /// One skipped collector — mirrors the storage `SkippedCollector` so it can
 /// travel over CBOR without depending on serde JSON.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingSkippedCollector {
     pub id: String,
     pub reason: String,
@@ -702,9 +635,7 @@ pub struct ProfilingSkippedCollector {
 
 /// Snapshot of the orchestrator's currently-active session, returned from
 /// `ProfilingActiveInfoResponse`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingActiveSessionInfo {
     pub session_id: String,
     pub node_id: String,
@@ -716,9 +647,7 @@ pub struct ProfilingActiveSessionInfo {
     pub collectors_skipped: Vec<ProfilingSkippedCollector>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingStartRequest {
     pub node_id: String,
     pub scope: ProfileScope,
@@ -728,9 +657,7 @@ pub struct ProfilingStartRequest {
     pub elevation_password: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingStartResponse {
     pub session_id: String,
     pub started_at_unix_ns: u64,
@@ -738,79 +665,59 @@ pub struct ProfilingStartResponse {
     pub collectors_skipped: Vec<ProfilingSkippedCollector>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingStopRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingStopResponse {
     pub session_id: String,
     pub report: ProfileReportV2,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingSessionsRequest {
     pub node_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingSessionsResponse {
     pub node_id: String,
     pub entries: Vec<ProfilingSessionEntry>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingReportRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingReportResponse {
     pub report: ProfileReportV2,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingDeleteRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingDeleteResponse {
     pub session_id: String,
     pub deleted: bool,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingDownloadRequest {
     pub node_id: String,
     pub session_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingDownloadResponse {
     pub session_id: String,
     /// Suggested filename — `profiling-<session_id>.tar.gz`.
@@ -819,16 +726,12 @@ pub struct ProfilingDownloadResponse {
     pub tarball_bytes: Vec<u8>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingActiveInfoRequest {
     pub node_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct ProfilingActiveInfoResponse {
     /// `Some` while a session is running, `None` otherwise.
     pub info: Option<ProfilingActiveSessionInfo>,
@@ -838,18 +741,14 @@ pub struct ProfilingActiveInfoResponse {
 // ValidateSudo + CollectorsStatus — settings/permissions screen.
 // =============================================================================
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingValidateSudoRequest {
     pub node_id: String,
     /// Used once and zeroized; never logged, never persisted.
     pub password: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingValidateSudoResponse {
     pub ok: bool,
     pub message: String,
@@ -858,16 +757,12 @@ pub struct ProfilingValidateSudoResponse {
     pub reason: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingCollectorsStatusRequest {
     pub node_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingCollectorStatus {
     pub id: String,
     pub name: String,
@@ -878,9 +773,7 @@ pub struct ProfilingCollectorStatus {
     pub note: Option<String>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq, Eq)]
 pub struct ProfilingCollectorsStatusResponse {
     pub collectors: Vec<ProfilingCollectorStatus>,
     /// Cached snapshot age in seconds; 0 = just recomputed.
@@ -897,9 +790,7 @@ pub struct ProfilingCollectorsStatusResponse {
 /// already carries well over 256 variants in production. The rule that DOES
 /// bind: renaming a variant silently breaks every deployed peer, so variants
 /// are append-only and never renamed.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum ProfilingPayload {
     StartRequest(ProfilingStartRequest),
     StartResponse(ProfilingStartResponse),

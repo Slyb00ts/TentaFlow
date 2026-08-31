@@ -1252,7 +1252,10 @@ mod tests {
         let mut env = FlowEnvelope::empty();
         env.meta.insert("model".into(), json!("caller-model"));
         let n = node(json!({"model_fallback": "rag-llm"}));
-        assert_eq!(LlmNodeAdapter::pick_model(&n, &env).unwrap(), "caller-model");
+        assert_eq!(
+            LlmNodeAdapter::pick_model(&n, &env).unwrap(),
+            "caller-model"
+        );
     }
 
     #[test]

@@ -546,7 +546,11 @@ fn message_content_text(content: &MessageContent) -> String {
                 // the compliance log is megabytes of noise and, unlike a URL,
                 // says nothing a reviewer can act on.
                 ContentPart::InputAudio { input_audio } => {
-                    format!("[input_audio:{} {}B]", input_audio.format, input_audio.data.len())
+                    format!(
+                        "[input_audio:{} {}B]",
+                        input_audio.format,
+                        input_audio.data.len()
+                    )
                 }
             })
             .collect::<Vec<_>>()

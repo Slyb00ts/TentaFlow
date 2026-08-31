@@ -226,13 +226,7 @@ pub fn resize(master: libc::c_int, rows: u16, cols: u16) -> io::Result<()> {
         ws_xpixel: 0,
         ws_ypixel: 0,
     };
-    let rc = unsafe {
-        libc::ioctl(
-            master,
-            libc::TIOCSWINSZ as _,
-            &size as *const libc::winsize,
-        )
-    };
+    let rc = unsafe { libc::ioctl(master, libc::TIOCSWINSZ as _, &size as *const libc::winsize) };
     if rc == -1 {
         return Err(io::Error::last_os_error());
     }

@@ -106,8 +106,7 @@ pub async fn execute_blocking(
     // to the run that spawned it; top-level runs leave it `None`. Light-mode
     // runs (loop iterations / map elements) skip the audit row entirely so a
     // 25-iteration loop never spams `flow_executions`.
-    let execution_id =
-        create_execution_record(&db, &compiled.flow_id, &ctx).await?;
+    let execution_id = create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
 
     let continue_on_error = compiled.continue_on_error();
@@ -374,10 +373,7 @@ pub async fn execute_direct_blocking(
             );
             // `context` (not a fresh `anyhow!`) keeps the adapter's typed error
             // downcastable for `DispatchError::from`.
-            return Err(e.context(format!(
-                "direct '{}' execution failed",
-                node.node_type
-            )));
+            return Err(e.context(format!("direct '{}' execution failed", node.node_type)));
         }
     };
 
@@ -1556,8 +1552,7 @@ pub async fn execute_streaming(
         return execute_streaming_region(db, compiled, initial_arc, ctx, adapters, started).await;
     }
 
-    let execution_id =
-        create_execution_record(&db, &compiled.flow_id, &ctx).await?;
+    let execution_id = create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
 
     let producer_run_idx = compiled
@@ -1782,8 +1777,7 @@ async fn execute_streaming_region(
     adapters: Arc<AdapterRegistry>,
     started: Instant,
 ) -> Result<StreamingExecution> {
-    let execution_id =
-        create_execution_record(&db, &compiled.flow_id, &ctx).await?;
+    let execution_id = create_execution_record(&db, &compiled.flow_id, &ctx).await?;
     ctx.execution_id = execution_id;
 
     let region = compiled
@@ -2548,7 +2542,11 @@ fn aggregate_usage(trace: &[TraceStep]) -> TokenUsage {
 /// by the entry point after authorization. Never off `envelope.meta`, which any
 /// node (including a WASM addon block deserializing a whole envelope from guest
 /// memory) can rewrite: §3 invariant 1.
-async fn create_execution_record(db: &DbPool, flow_id: &str, ctx: &ExecutionContext) -> Result<i64> {
+async fn create_execution_record(
+    db: &DbPool,
+    flow_id: &str,
+    ctx: &ExecutionContext,
+) -> Result<i64> {
     if flow_id.is_empty() || ctx.light {
         return Ok(0);
     }
@@ -3123,7 +3121,10 @@ mod chain_integration_tests {
             Some("dzien dobry")
         );
         assert_eq!(
-            exec.producer_input.meta.get("language").and_then(|v| v.as_str()),
+            exec.producer_input
+                .meta
+                .get("language")
+                .and_then(|v| v.as_str()),
             Some("pl")
         );
 
@@ -5628,9 +5629,7 @@ mod provenance_persistence_tests {
             ("request_id", "req-forged"),
             ("model", "gpt-forged"),
         ] {
-            hostile
-                .meta
-                .insert(key.into(), Value::String(value.into()));
+            hostile.meta.insert(key.into(), Value::String(value.into()));
         }
 
         let row = run_and_read(&pool, ctx, hostile).await;

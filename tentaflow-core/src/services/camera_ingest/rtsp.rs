@@ -1978,8 +1978,8 @@ fn link_nvdec_branch(
     // cudadownload, so nothing decoupled the decoder from the download. This queue
     // drops decoded frames when the download falls behind, keeping nvh264dec free-
     // running; the analysis path already consumes latest-only, so dropping is fine.
-    let decode_out = build_raw_leaky_queue("queue_nvdec_out")
-        .map_err(|e| format!("nvdec leaky queue: {e}"))?;
+    let decode_out =
+        build_raw_leaky_queue("queue_nvdec_out").map_err(|e| format!("nvdec leaky queue: {e}"))?;
     pipeline
         .add(&decode_out)
         .map_err(|e| format!("add nvdec leaky queue: {e}"))?;
@@ -2313,8 +2313,8 @@ fn attach_mp4_branch_preview(
     let dec = gst::ElementFactory::make("avdec_h264")
         .build()
         .map_err(|e| format!("avdec_h264 build: {e}"))?;
-    let queue_dec =
-        build_raw_leaky_queue(&format!("queue_decoded_b{name_suffix}")).map_err(|e| e.to_string())?;
+    let queue_dec = build_raw_leaky_queue(&format!("queue_decoded_b{name_suffix}"))
+        .map_err(|e| e.to_string())?;
     let convert = gst::ElementFactory::make("videoconvert")
         .build()
         .map_err(|e| format!("videoconvert build: {e}"))?;
@@ -2928,8 +2928,10 @@ pub async fn run_rtsp_session(
         // `upgrade()` JEST sygnałem, że subskrybent już odszedł.
         // Para: publisher czekający na wpięcie + moment zaparkowania (do wykrycia
         // czekania, które trwa podejrzanie długo).
-        let mut pending_attach_full: Option<(std::sync::Weak<Mp4StreamPublisher>, tokio::time::Instant)> =
-            None;
+        let mut pending_attach_full: Option<(
+            std::sync::Weak<Mp4StreamPublisher>,
+            tokio::time::Instant,
+        )> = None;
         let mut pending_attach_preview: Option<(
             std::sync::Weak<Mp4StreamPublisher>,
             tokio::time::Instant,
@@ -3598,8 +3600,7 @@ pub async fn run_rtsp_session(
         // wracamy tą SAMĄ ścieżką (z backoffem), a nie o szczebel niżej.
         // A failed branch BUILD is conclusive on its own — no need to also rule out
         // a transport fault, the branch was never going to carry frames.
-        let hw_chain_broken =
-            branch_build_failed || !is_transport_failure(&reason);
+        let hw_chain_broken = branch_build_failed || !is_transport_failure(&reason);
         if matches!(
             ingest_path,
             IngestPath::GpuResidentNvidia | IngestPath::NvdecNv12 | IngestPath::NvdecCpuConvert

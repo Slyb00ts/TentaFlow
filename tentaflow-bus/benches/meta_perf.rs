@@ -3,12 +3,11 @@
 // PLAN §2.1/§10 R2: data never lives in fjall, only metadata (committed
 // offsets, producer-idempotency dedup).
 //
-// Coordinator decision #4 (review, 26.08.2026) supersedes the original
-// bench's framing: the 300k ops/s target applies to **layer 2** (optional
-// per-record dedup by `idempotency_key`, PLAN §3.1), not layer 1
-// (per-batch producer idempotency, which is ~hundreds of ops/s at realistic
-// batch sizes and was the thing the original single `target=300000 ops/s`
-// line actually measured — a category error the review flagged).
+// The 300k ops/s target applies to **layer 2** (optional per-record dedup
+// by `idempotency_key`, PLAN §3.1), not layer 1 (per-batch producer
+// idempotency, which is ~hundreds of ops/s at realistic batch sizes) — a
+// single combined `target=300000 ops/s` number would silently measure the
+// wrong layer.
 //
 // This file now measures the two layers separately:
 //   - `bench_layer1_producer_idempotency_commit`: **informational only, no
@@ -120,7 +119,7 @@ fn bench_layer1_producer_idempotency_commit(_c: &mut criterion::Criterion) {
 /// Layer 2 raw lookup cost — the dataset is preloaded with a small
 /// `max_memtable_size` so most of `PRELOAD` keys are flushed to SSTs
 /// before the timed loop starts, forcing lookups through bloom
-/// filters/block reads rather than an in-memory map (review P2-10).
+/// filters/block reads rather than an in-memory map.
 fn bench_layer2_dedup_lookup_beyond_memtable(_c: &mut criterion::Criterion) {
     const PRELOAD: u64 = 400_000;
     let db = open_db("layer2-dedup-lookup");
@@ -171,12 +170,12 @@ fn bench_layer2_dedup_lookup_beyond_memtable(_c: &mut criterion::Criterion) {
 /// offset upsert *per record*, committed atomically (PLAN §3.2:
 /// "atomowość ACK-a i deduplikacji") — against the same beyond-memtable
 /// dataset as above, with an explicit `PersistMode` declared on every
-/// commit (review P2-10's third gap: the original measured buffering into
-/// the WAL, never a persisted commit). Both `Buffer` (matches the
-/// original's implicit behavior, an upper bound) and `SyncData` (an actual
-/// durability barrier per ack) are measured and reported side by side —
-/// the M0 report must say which one the 300k figure refers to, not leave
-/// it implicit.
+/// commit — measuring buffering into the WAL without ever declaring a
+/// `PersistMode` would silently skip the persisted-commit cost. Both
+/// `Buffer` (an upper bound, no durability barrier) and `SyncData` (an
+/// actual durability barrier per ack) are measured and reported side by
+/// side, so a report using this number can say which one it refers to
+/// instead of leaving it implicit.
 fn bench_layer2_combined_ack(_c: &mut criterion::Criterion) {
     const PRELOAD: u64 = 400_000;
     const TARGET_OPS_S: f64 = 300_000.0;

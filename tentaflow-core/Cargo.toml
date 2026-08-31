@@ -175,6 +175,16 @@ ciborium = "0.2"
 # Database
 rusqlite = { version = "0.39.0", features = ["bundled", "blob"] }
 fjall = "3.1.5"
+
+# TentaBus (M0 log engine, standalone crate — no workspace, path dep per
+# PLAN.md §5.4/§9 M1). Consumed by `bus/` for topic partitions.
+tentaflow-bus = { path = "../tentaflow-bus" }
+# TentaBus dedup.rs plan B store (M0-WYNIKI.md verdict: fjall measured at
+# 12% of the 300k ops/s per-record dedup target, own mmap store instead —
+# offsets/producer sequences stay on fjall, only per-record dedup moves).
+# Same version tentaflow-bus already pins for its (currently unused)
+# `mmap-read` feature.
+memmap2 = "0.9.11"
 # Per-addon SQLite connection pool (F1a §6.5 M1.W4). r2d2_sqlite 0.34 jest
 # zgodne z rusqlite 0.39 — sprawdzone manualnie. Pool size + timeouts
 # konfigurowane w addon/storage_sql.rs.
@@ -524,6 +534,21 @@ required-features = ["inference-vision-gpu"]
 name = "onnx_cv_trt"
 harness = false
 required-features = ["inference-supertonic"]
+
+# TentaBus M1 full-service-path gates (PLAN §5.1-5.4: P1, P4, P5, P10, P13) —
+# drives `bus::BusService`, not the bare `tentaflow-bus` engine (that is
+# tentaflow-bus/benches/{log_perf,device_ceiling}.rs, M0's own benches).
+[[bench]]
+name = "bus_path"
+harness = false
+
+# TentaBus M2 (SUM/tentabus/PLAN-M2.md §1g / PLAN.md §5.2: P6, P7, P9) —
+# replication gates over an in-memory duplex transport (three real
+# `BusService`+`ReplicationManager` instances). See the bench file's own
+# module doc for methodology and the one upstream-bug workaround it needs.
+[[bench]]
+name = "bus_replication"
+harness = false
 
 [[example]]
 name = "cv_bench"

@@ -38,12 +38,13 @@ pub fn resolve_agent(core_db: &DbPool, project_pool: &DbPool, kind: &str) -> Res
     let function = super::generation::agent_function_for_kind(kind)
         .ok_or_else(|| anyhow!("unknown case kind '{kind}'"))?;
     let bound: Option<String> = super::repository::get_setting(project_pool, "agents")?
-        .and_then(|raw| serde_json::from_str::<std::collections::HashMap<String, String>>(&raw).ok())
+        .and_then(|raw| {
+            serde_json::from_str::<std::collections::HashMap<String, String>>(&raw).ok()
+        })
         .and_then(|map| map.get(function).cloned())
         .filter(|a| !a.is_empty());
-    let agent_id = bound.unwrap_or_else(|| {
-        super::generation::default_agent_id_for_kind(kind).to_string()
-    });
+    let agent_id =
+        bound.unwrap_or_else(|| super::generation::default_agent_id_for_kind(kind).to_string());
     let agent = crate::db::repository::get_agent(core_db, &agent_id)?
         .ok_or_else(|| anyhow!("generator agent for '{kind}' not found"))?;
     if !agent.is_enabled {

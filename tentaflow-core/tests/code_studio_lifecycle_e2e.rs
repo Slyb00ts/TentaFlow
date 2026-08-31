@@ -71,7 +71,9 @@ const REPO_FILE: &str = "src/lib.rs";
 /// the workspace root under a temporary directory the other one just dropped.
 fn env_guard() -> MutexGuard<'static, ()> {
     static GUARD: Mutex<()> = Mutex::new(());
-    GUARD.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    GUARD
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 /// The ssh transport the broker will use. Written once per test process and
@@ -299,9 +301,12 @@ async fn call(
 
 async fn ok(ctx: &HandlerContext, payload: CodeStudioPayload) -> CodeStudioPayload {
     let described = format!("{payload:?}");
-    call(ctx, payload)
-        .await
-        .unwrap_or_else(|error| panic!("{described} was refused: {:?} / {}", error.code, error.message))
+    call(ctx, payload).await.unwrap_or_else(|error| {
+        panic!(
+            "{described} was refused: {:?} / {}",
+            error.code, error.message
+        )
+    })
 }
 
 /// The pending approval of a capability, as the UI would find it.
@@ -552,8 +557,7 @@ async fn the_whole_cycle_runs_from_an_empty_state_to_a_merged_target_branch() {
             hunk.content
         );
         assert!(
-            hunk.content
-                .starts_with([' ', '+', '-', '\\'].as_slice()),
+            hunk.content.starts_with([' ', '+', '-', '\\'].as_slice()),
             "the first body row is not a diff row:\n{}",
             hunk.content
         );
@@ -770,7 +774,10 @@ async fn the_whole_cycle_runs_from_an_empty_state_to_a_merged_target_branch() {
     else {
         panic!("expected GitMergeResponse");
     };
-    assert_eq!(outcome, "clean", "the merge conflicted on {conflict_files:?}");
+    assert_eq!(
+        outcome, "clean",
+        "the merge conflicted on {conflict_files:?}"
+    );
     let merge_set = merge_set.expect("a clean merge opens its review");
     // ONE list describes the whole saga, merge half and publish half alike.
     assert_eq!(
@@ -788,7 +795,10 @@ async fn the_whole_cycle_runs_from_an_empty_state_to_a_merged_target_branch() {
     );
     // The merge does not run tests (§11.6 pkt 4), and the answer says so with a
     // reason code instead of borrowing another step's outcome.
-    let tests = steps.iter().find(|s| s.step == "tests").expect("tests step");
+    let tests = steps
+        .iter()
+        .find(|s| s.step == "tests")
+        .expect("tests step");
     assert_eq!(tests.status, "pending");
     assert_eq!(tests.detail.as_deref(), Some("tests_not_run_by_merge"));
     for step in &steps {
@@ -802,8 +812,8 @@ async fn the_whole_cycle_runs_from_an_empty_state_to_a_merged_target_branch() {
     let integration = integration_worktree.expect("a merge records its integration worktree");
     assert_eq!(integration.purpose, "integration");
 
-    let integration_dir =
-        paths::integration_worktree_dir(&fx.workspace_id, &fx.session_id).expect("integration path");
+    let integration_dir = paths::integration_worktree_dir(&fx.workspace_id, &fx.session_id)
+        .expect("integration path");
     assert!(
         integration_dir.is_dir(),
         "the merge did not run in an integration worktree"
@@ -906,7 +916,11 @@ async fn the_whole_cycle_runs_from_an_empty_state_to_a_merged_target_branch() {
         .collect();
     assert_eq!(
         publish,
-        vec![("review", "done"), ("approval", "done"), ("update_ref", "done")],
+        vec![
+            ("review", "done"),
+            ("approval", "done"),
+            ("update_ref", "done")
+        ],
     );
     let merge_commit = merge_commit_oid.expect("a published merge names its commit");
 
@@ -1112,7 +1126,10 @@ async fn a_second_commit_builds_on_the_first_instead_of_re_parenting_the_session
     .await;
     let (first_set, first_files) = open_review(&fx, &first_turn, "turn one").await;
     assert_eq!(
-        first_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        first_files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>(),
         vec![REPO_FILE.to_string()],
         "the first review does not describe the first turn"
     );
@@ -1138,7 +1155,10 @@ async fn a_second_commit_builds_on_the_first_instead_of_re_parenting_the_session
     .await;
     let (second_set, second_files) = open_review(&fx, &second_turn, "turn two").await;
     assert_eq!(
-        second_files.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
+        second_files
+            .iter()
+            .map(|f| f.path.clone())
+            .collect::<Vec<_>>(),
         vec!["docs/second.md".to_string()],
         "the second review re-proposes the first turn, so its base is stale"
     );
@@ -1188,7 +1208,11 @@ async fn a_second_commit_builds_on_the_first_instead_of_re_parenting_the_session
         "the second commit lost the first turn's content:\n{head}"
     );
     assert_eq!(
-        git_ok(&[&fx.repo_git_dir(), "show", &format!("{second}:docs/second.md")]),
+        git_ok(&[
+            &fx.repo_git_dir(),
+            "show",
+            &format!("{second}:docs/second.md")
+        ]),
         "written in the second turn",
     );
 }
@@ -1241,7 +1265,14 @@ async fn a_rejected_file_is_gone_from_the_worktree_and_from_the_next_review() {
 
     // The next turn touches something else entirely.
     let second_turn = fx.turn(22);
-    write_file(&fx, &second_turn, "docs/second.md", "the second turn\n", None).await;
+    write_file(
+        &fx,
+        &second_turn,
+        "docs/second.md",
+        "the second turn\n",
+        None,
+    )
+    .await;
     let (_, next) = open_review(&fx, &second_turn, "turn two").await;
     assert_eq!(
         next.iter().map(|f| f.path.clone()).collect::<Vec<_>>(),
@@ -1475,11 +1506,7 @@ async fn the_boot_recovery_pass_settles_the_operation_journal() {
     let still_open: Vec<String> = [&write_op, &push_op]
         .into_iter()
         .filter(|op_id| {
-            operations::get(&pool, op_id)
-                .unwrap()
-                .unwrap()
-                .status
-                == OperationStatus::Pending
+            operations::get(&pool, op_id).unwrap().unwrap().status == OperationStatus::Pending
         })
         .cloned()
         .collect();
@@ -1533,10 +1560,7 @@ fn diverge_main(fx: &Fixture, content: &str) -> String {
     std::fs::write(&blob_source, content).expect("scratch content");
     let index = scratch.path().join("index");
     let index_env = [("GIT_INDEX_FILE", index.display().to_string())];
-    let index_env: Vec<(&str, &str)> = index_env
-        .iter()
-        .map(|(k, v)| (*k, v.as_str()))
-        .collect();
+    let index_env: Vec<(&str, &str)> = index_env.iter().map(|(k, v)| (*k, v.as_str())).collect();
 
     let git_dir = fx.repo_git_dir();
     let blob = git_ok(&[
@@ -1827,9 +1851,7 @@ async fn a_turn_reaches_the_timeline_even_when_no_run_starts() {
         error.message
     );
     assert!(
-        messages
-            .iter()
-            .any(|json| json.contains("no run started")),
+        messages.iter().any(|json| json.contains("no run started")),
         "a failed start left no trace at all; the timeline holds: {messages:?}"
     );
 }

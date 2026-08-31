@@ -419,10 +419,10 @@ pub fn api_key_list_request(
 fn validate_scope_resource(resource_type: &str, resource_id: &str) -> Result<(), ProtocolError> {
     if !matches!(
         resource_type,
-        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export"
+        "model" | "flow" | "alias" | "model_bundle" | "ml_studio_export" | "topic"
     ) {
         return Err(ProtocolError::bad_request(
-            "resource_type must be 'model', 'flow', 'alias', 'model_bundle' or 'ml_studio_export'",
+            "resource_type must be 'model', 'flow', 'alias', 'model_bundle', 'ml_studio_export' or 'topic'",
         ));
     }
     if resource_id.is_empty() {
@@ -2011,19 +2011,17 @@ fn build_cluster_deployment(
             .map(|m| m.hostname.clone())
     };
 
-    let dep_members = repository::list_cluster_deployment_members(
-        &ctx.state.db,
-        &dep.deployment_cluster_id,
-    )
-    .unwrap_or_default()
-    .into_iter()
-    .map(|m| tentaflow_protocol::ClusterDeploymentMemberInfo {
-        hostname: hostname_of(&m.node_id),
-        node_id: m.node_id,
-        role: m.role,
-        container_name: m.container_name,
-    })
-    .collect();
+    let dep_members =
+        repository::list_cluster_deployment_members(&ctx.state.db, &dep.deployment_cluster_id)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|m| tentaflow_protocol::ClusterDeploymentMemberInfo {
+                hostname: hostname_of(&m.node_id),
+                node_id: m.node_id,
+                role: m.role,
+                container_name: m.container_name,
+            })
+            .collect();
 
     Some(tentaflow_protocol::ClusterDeploymentInfo {
         deployment_cluster_id: dep.deployment_cluster_id,
@@ -3540,7 +3538,9 @@ pub async fn mesh_node_list(
                 now_ms,
             ))
         });
-        nodes.push(store_peer_to_proto(&ctx.state.db, local, local_node_id, true, route, connection).await);
+        nodes.push(
+            store_peer_to_proto(&ctx.state.db, local, local_node_id, true, route, connection).await,
+        );
         emitted.insert(local.node_id.clone());
     }
 
@@ -3577,7 +3577,17 @@ pub async fn mesh_node_list(
                         Some(r.next_hop.clone())
                     },
                 });
-            nodes.push(store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, connection).await);
+            nodes.push(
+                store_peer_to_proto(
+                    &ctx.state.db,
+                    p,
+                    local_node_id,
+                    is_trusted,
+                    route,
+                    connection,
+                )
+                .await,
+            );
         } else {
             // No peer_store entry — trusted node offline (or freshly seeded).
             // Render with whatever the registry knows; rich device fields stay
@@ -3638,7 +3648,9 @@ pub async fn mesh_node_list(
                     Some(r.next_hop.clone())
                 },
             });
-        nodes.push(store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, None).await);
+        nodes.push(
+            store_peer_to_proto(&ctx.state.db, p, local_node_id, is_trusted, route, None).await,
+        );
     }
 
     Ok(MessageBody::MeshNodeListResponseBody(
@@ -3716,7 +3728,15 @@ pub async fn mesh_node_detail(
     let connection = summary
         .as_ref()
         .map(|s| crate::mesh::proto_conv::build_conn_info(s, iroh_snapshot.as_ref(), now_ms));
-    let info = store_peer_to_proto(&ctx.state.db, &peer, local_node_id, is_trusted, route, connection).await;
+    let info = store_peer_to_proto(
+        &ctx.state.db,
+        &peer,
+        local_node_id,
+        is_trusted,
+        route,
+        connection,
+    )
+    .await;
     Ok(MessageBody::MeshNodeDetailResponseBody(
         tentaflow_protocol::MeshNodeDetailResponse { node: info },
     ))
@@ -7925,7 +7945,11 @@ fn build_tools_catalog(ctx: &HandlerContext) -> Result<ToolsCatalog, ProtocolErr
         }
         addons.push(group_of(row.package_id, tools, false));
     }
-    addons.sort_by(|a, b| a.display_name.to_lowercase().cmp(&b.display_name.to_lowercase()));
+    addons.sort_by(|a, b| {
+        a.display_name
+            .to_lowercase()
+            .cmp(&b.display_name.to_lowercase())
+    });
     let core = crate::agents::CoreToolName::all()
         .iter()
         .map(|t| {

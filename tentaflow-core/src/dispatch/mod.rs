@@ -27,6 +27,7 @@ pub mod addon_document_upload;
 pub mod addon_perm_broadcast;
 pub mod audit_broadcast;
 pub mod benchmark;
+pub mod bus;
 #[cfg(feature = "camera")]
 pub mod camera_admin;
 #[cfg(feature = "camera")]
@@ -2213,20 +2214,67 @@ pub fn variant_name_of(body: &MessageBody) -> &'static str {
                 Cs::ProjectLinkSetRequest { .. } => "CodeStudioProjectLinkSetRequest",
                 Cs::RepoTreeRequest { .. } => "CodeStudioRepoTreeRequest",
                 Cs::RepoTreeResponse { .. } => "CodeStudioRepoTreeResponse",
-                Cs::AgentCredentialsListRequest { .. } => {
-                    "CodeStudioAgentCredentialsListRequest"
-                }
-                Cs::AgentCredentialsListResponse { .. } => {
-                    "CodeStudioAgentCredentialsListResponse"
-                }
+                Cs::AgentCredentialsListRequest { .. } => "CodeStudioAgentCredentialsListRequest",
+                Cs::AgentCredentialsListResponse { .. } => "CodeStudioAgentCredentialsListResponse",
                 Cs::AgentCredentialSetRequest { .. } => "CodeStudioAgentCredentialSetRequest",
                 Cs::AgentCredentialSetResponse { .. } => "CodeStudioAgentCredentialSetResponse",
-                Cs::AgentCredentialDeleteRequest { .. } => {
-                    "CodeStudioAgentCredentialDeleteRequest"
-                }
+                Cs::AgentCredentialDeleteRequest { .. } => "CodeStudioAgentCredentialDeleteRequest",
                 Cs::AgentCredentialDeleteResponse { .. } => {
                     "CodeStudioAgentCredentialDeleteResponse"
                 }
+            }
+        }
+        MessageBody::BusBody(p) => {
+            use tentaflow_protocol::BusPayload as Bp;
+            match p {
+                Bp::TopicListRequest => "BusTopicListRequest",
+                Bp::TopicListResponse { .. } => "BusTopicListResponse",
+                Bp::TopicCreateRequest { .. } => "BusTopicCreateRequest",
+                Bp::TopicCreateResponse { .. } => "BusTopicCreateResponse",
+                Bp::TopicUpdateRequest { .. } => "BusTopicUpdateRequest",
+                Bp::TopicUpdateResponse { .. } => "BusTopicUpdateResponse",
+                Bp::TopicDeleteRequest { .. } => "BusTopicDeleteRequest",
+                Bp::TopicDeleteResponse => "BusTopicDeleteResponse",
+                Bp::TopicDetailRequest { .. } => "BusTopicDetailRequest",
+                Bp::TopicDetailResponse { .. } => "BusTopicDetailResponse",
+                Bp::GroupListRequest => "BusGroupListRequest",
+                Bp::GroupListResponse { .. } => "BusGroupListResponse",
+                Bp::GroupDetailRequest { .. } => "BusGroupDetailRequest",
+                Bp::GroupDetailResponse { .. } => "BusGroupDetailResponse",
+                Bp::GroupPauseRequest { .. } => "BusGroupPauseRequest",
+                Bp::GroupPauseResponse => "BusGroupPauseResponse",
+                Bp::GroupResumeRequest { .. } => "BusGroupResumeRequest",
+                Bp::GroupResumeResponse => "BusGroupResumeResponse",
+                Bp::OffsetResetRequest { .. } => "BusOffsetResetRequest",
+                Bp::OffsetResetResponse { .. } => "BusOffsetResetResponse",
+                Bp::MessagesBrowseRequest { .. } => "BusMessagesBrowseRequest",
+                Bp::MessagesBrowseResponse { .. } => "BusMessagesBrowseResponse",
+                Bp::DlqListRequest { .. } => "BusDlqListRequest",
+                Bp::DlqListResponse { .. } => "BusDlqListResponse",
+                Bp::DlqRetryRequest { .. } => "BusDlqRetryRequest",
+                Bp::DlqRetryResponse { .. } => "BusDlqRetryResponse",
+                Bp::DlqDiscardRequest { .. } => "BusDlqDiscardRequest",
+                Bp::DlqDiscardResponse => "BusDlqDiscardResponse",
+                Bp::DlqRetryAllRequest { .. } => "BusDlqRetryAllRequest",
+                Bp::DlqRetryAllResponse { .. } => "BusDlqRetryAllResponse",
+                Bp::AclListRequest { .. } => "BusAclListRequest",
+                Bp::AclListResponse { .. } => "BusAclListResponse",
+                Bp::AclSetRequest { .. } => "BusAclSetRequest",
+                Bp::AclSetResponse => "BusAclSetResponse",
+                Bp::StatsSnapshotRequest => "BusStatsSnapshotRequest",
+                Bp::StatsSnapshotResponse { .. } => "BusStatsSnapshotResponse",
+                Bp::QuotaGetRequest => "BusQuotaGetRequest",
+                Bp::QuotaGetResponse { .. } => "BusQuotaGetResponse",
+                Bp::QuotaSetRequest { .. } => "BusQuotaSetRequest",
+                Bp::QuotaSetResponse { .. } => "BusQuotaSetResponse",
+                Bp::CapabilitiesRequest => "BusCapabilitiesRequest",
+                Bp::CapabilitiesResponse { .. } => "BusCapabilitiesResponse",
+                Bp::ReplicaListRequest { .. } => "BusReplicaListRequest",
+                Bp::ReplicaListResponse { .. } => "BusReplicaListResponse",
+                Bp::ReassignRequest { .. } => "BusReassignRequest",
+                Bp::ReassignResponse { .. } => "BusReassignResponse",
+                Bp::LeaderTransferRequest { .. } => "BusLeaderTransferRequest",
+                Bp::LeaderTransferResponse { .. } => "BusLeaderTransferResponse",
             }
         }
     }

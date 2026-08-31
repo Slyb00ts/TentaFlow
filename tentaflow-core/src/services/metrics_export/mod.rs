@@ -123,6 +123,24 @@ pub struct ExportedMetrics {
     pub fs_available_bytes: u64,
     pub fs_used_percent: f32,
     pub system_uptime_seconds: u64,
+    // ---- TentaBus M2 (PLAN §8.4) — see `collect_bus_metrics`'s doc for how
+    // each of these is sourced and what "best-effort" means for it. ----
+    pub bus_publish_msgs_total: u64,
+    pub bus_publish_bytes_total: u64,
+    pub bus_consume_msgs_total: u64,
+    pub bus_throttled_total: u64,
+    pub bus_fsync_p99_us: u64,
+    pub bus_append_p99_us: u64,
+    pub bus_consumer_lag_max: u64,
+    pub bus_consumer_lag_sum: u64,
+    pub bus_dlq_depth: u64,
+    pub bus_topic_count: u64,
+    pub bus_partition_count: u64,
+    pub bus_disk_bytes: u64,
+    pub bus_isr_size_min: u64,
+    pub bus_isr_shrink_total: u64,
+    pub bus_leader_epoch_max: u64,
+    pub bus_replication_lag_bytes_max: u64,
 }
 
 /// Aggregates the snapshot from live in-process state (`router_metrics`,
@@ -176,6 +194,8 @@ pub fn collect(
         (used as f64 / fs_total_bytes as f64 * 100.0) as f32
     };
 
+    let bus = collect_bus_metrics(db);
+
     ExportedMetrics {
         cpu_usage_percent: fast.cpu_usage_percent,
         cpu_temperature_c: fast.cpu_temperature_c,
@@ -208,7 +228,257 @@ pub fn collect(
         fs_available_bytes,
         fs_used_percent,
         system_uptime_seconds: sysinfo::System::uptime(),
+        bus_publish_msgs_total: bus.publish_msgs_total,
+        bus_publish_bytes_total: bus.publish_bytes_total,
+        bus_consume_msgs_total: bus.consume_msgs_total,
+        bus_throttled_total: bus.throttled_total,
+        bus_fsync_p99_us: bus.fsync_p99_us,
+        bus_append_p99_us: bus.append_p99_us,
+        bus_consumer_lag_max: bus.consumer_lag_max,
+        bus_consumer_lag_sum: bus.consumer_lag_sum,
+        bus_dlq_depth: bus.dlq_depth,
+        bus_topic_count: bus.topic_count,
+        bus_partition_count: bus.partition_count,
+        bus_disk_bytes: bus.disk_bytes,
+        bus_isr_size_min: bus.isr_size_min,
+        bus_isr_shrink_total: bus.isr_shrink_total,
+        bus_leader_epoch_max: bus.leader_epoch_max,
+        bus_replication_lag_bytes_max: bus.replication_lag_bytes_max,
     }
+}
+
+/// Intermediate result of `collect_bus_metrics`, before being flattened into
+/// [`ExportedMetrics`]'s `bus_*` fields.
+#[derive(Default)]
+struct BusMetricsRollup {
+    publish_msgs_total: u64,
+    publish_bytes_total: u64,
+    consume_msgs_total: u64,
+    throttled_total: u64,
+    fsync_p99_us: u64,
+    append_p99_us: u64,
+    consumer_lag_max: u64,
+    consumer_lag_sum: u64,
+    dlq_depth: u64,
+    topic_count: u64,
+    partition_count: u64,
+    disk_bytes: u64,
+    isr_size_min: u64,
+    isr_shrink_total: u64,
+    leader_epoch_max: u64,
+    replication_lag_bytes_max: u64,
+}
+
+/// TentaBus M2 (PLAN §8.4): the 16 `tentaflow_bus_*` metrics. Best-effort,
+/// same convention as every other collector in this file — `crate::bus::
+/// global()` returning `None` (the bus never initialized on this node)
+/// yields an all-zero rollup rather than failing the whole scrape.
+///
+/// Replication-derived fields (`isr_size_min`, `isr_shrink_total`,
+/// `leader_epoch_max`, `replication_lag_bytes_max`, `dlq_depth`,
+/// `consumer_lag_max`/`consumer_lag_sum`) additionally need a live
+/// `ReplicationCoordinator` (`BusService::replication()`): with none
+/// installed (M1 behavior / RF=1 build), high-watermark and live-ISR state
+/// are only visible per-partition through an authenticated `partition_stats`
+/// call this collector has no `BusCallContext` to make, so those fields stay
+/// `0` rather than growing this exporter a privileged bypass just for a
+/// metrics endpoint.
+fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
+    let Some(svc) = crate::bus::global() else {
+        return BusMetricsRollup::default();
+    };
+
+    let (publish_msgs_total, publish_bytes_total, consume_msgs_total, throttled_total) =
+        svc.bus_metrics_snapshot();
+    let (append_p99_us, fsync_p99_us) = crate::bus::BusService::bus_engine_p99_us();
+    let (topic_count, partition_count) = bus_topic_and_partition_counts(db);
+    let disk_bytes = dir_size_bytes(&paths::category_dir(paths::StorageCategory::Bus));
+
+    let mut rollup = BusMetricsRollup {
+        publish_msgs_total,
+        publish_bytes_total,
+        consume_msgs_total,
+        throttled_total,
+        append_p99_us,
+        fsync_p99_us,
+        topic_count,
+        partition_count,
+        disk_bytes,
+        ..Default::default()
+    };
+
+    if let Some(coordinator) = svc.replication() {
+        // No per-org scope to work from here (unlike every authenticated
+        // `BusService` method, this collector has no `BusCallContext`), so
+        // every org this node knows a bus topic for is rolled into one
+        // node-wide figure — matching this whole endpoint's per-node (not
+        // per-org) scope, same as `services_total`/`flow_executions_total`
+        // above.
+        let orgs = bus_org_ids(db);
+        let mut isr_min: Option<u64> = None;
+        let mut leader_epoch_max = 0u64;
+        let mut lag_bytes_max = 0u64;
+        let mut dlq_depth = 0u64;
+        // (org, topic, partition) -> high_watermark, collected alongside
+        // the rollup above so the consumer-lag join below never has to
+        // re-derive which partitions exist.
+        let mut hw_by_key: std::collections::HashMap<(String, String, u32), u64> =
+            std::collections::HashMap::new();
+
+        for org in &orgs {
+            let snapshot = coordinator.snapshot(org, None);
+            for p in &snapshot.partitions {
+                let isr_len = p.isr.len() as u64;
+                isr_min = Some(isr_min.map_or(isr_len, |m| m.min(isr_len)));
+                leader_epoch_max = leader_epoch_max.max(p.leader_epoch as u64);
+                if let Some(max_lag) = p.lagging.iter().map(|l| l.lag_bytes).max() {
+                    lag_bytes_max = lag_bytes_max.max(max_lag);
+                }
+                if p.topic.starts_with(crate::bus::dlq::DLQ_TOPIC_PREFIX) {
+                    dlq_depth += p.log_end_offset;
+                }
+                hw_by_key.insert(
+                    (org.clone(), p.topic.clone(), p.partition),
+                    p.high_watermark,
+                );
+            }
+        }
+
+        rollup.isr_size_min = isr_min.unwrap_or(0);
+        rollup.isr_shrink_total = coordinator.isr_shrink_total();
+        rollup.leader_epoch_max = leader_epoch_max;
+        rollup.replication_lag_bytes_max = lag_bytes_max;
+        rollup.dlq_depth = dlq_depth;
+
+        // Consumer lag: join every registered (org, group, topic)
+        // subscription (`bus_groups`) against the high-watermarks just
+        // collected above, one committed-offset lookup per (partition) the
+        // topic's own snapshot rows describe. Fjall's `GroupOffsetStore`
+        // has no enumeration API (only point lookups keyed by (org, group,
+        // topic, partition)), so a group with no `bus_groups` row (never
+        // opened a consumer here) is correctly invisible to this join —
+        // this reports lag only for currently-registered subscriptions,
+        // not a full historical scan.
+        for (org, group, topic) in bus_group_subscriptions(db) {
+            for ((o, t, partition), hw) in &hw_by_key {
+                if *o != org || *t != topic {
+                    continue;
+                }
+                if let Ok(committed) = svc.group_committed_offset(&org, &group, &topic, *partition)
+                {
+                    let lag = hw.saturating_sub(committed);
+                    rollup.consumer_lag_max = rollup.consumer_lag_max.max(lag);
+                    rollup.consumer_lag_sum += lag;
+                }
+            }
+        }
+    }
+    // No coordinator installed: every replication-derived field above stays
+    // at `BusMetricsRollup::default()`'s `0` — including `isr_shrink_total`,
+    // which is a true reading here (no coordinator means nothing has ever
+    // shrunk an ISR on this node), not a placeholder.
+
+    rollup
+}
+
+/// Distinct org ids that have at least one row in `bus_topics` — this
+/// collector has no per-request org scope of its own, so every
+/// replication-derived bus metric aggregates across every org this node
+/// knows about (see `collect_bus_metrics`'s doc).
+fn bus_org_ids(db: &DbPool) -> Vec<String> {
+    let Ok(conn) = db.read() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT DISTINCT org_id FROM bus_topics") else {
+        return Vec::new();
+    };
+    let Ok(mapped) = stmt.query_map([], |row| row.get::<_, String>(0)) else {
+        return Vec::new();
+    };
+    mapped.filter_map(std::result::Result::ok).collect()
+}
+
+/// Every registered consumer-group subscription — `(org_id, group_id,
+/// topic)` rows from `bus_groups` — feeding the consumer-lag join in
+/// `collect_bus_metrics`.
+fn bus_group_subscriptions(db: &DbPool) -> Vec<(String, String, String)> {
+    let Ok(conn) = db.read() else {
+        return Vec::new();
+    };
+    let Ok(mut stmt) = conn.prepare("SELECT org_id, group_id, topic FROM bus_groups") else {
+        return Vec::new();
+    };
+    let Ok(mapped) = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    }) else {
+        return Vec::new();
+    };
+    mapped.filter_map(std::result::Result::ok).collect()
+}
+
+/// `(topic_count, partition_count)`. `topic_count` excludes internal
+/// `__dlq.*` topics (`bus::dlq::DLQ_TOPIC_PREFIX`) — an operator's alerting
+/// on "how many topics exist" should not double-count the DLQ TentaBus
+/// auto-creates per source topic. `partition_count` sums every real topic's
+/// configured `partitions` column, DLQ topics included: a DLQ topic's
+/// partitions are still real on-disk footprint this node carries.
+fn bus_topic_and_partition_counts(db: &DbPool) -> (u64, u64) {
+    let Ok(conn) = db.read() else {
+        return (0, 0);
+    };
+    let topic_count = conn
+        .query_row(
+            "SELECT COUNT(*) FROM bus_topics WHERE name NOT LIKE '__dlq.%'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0);
+    let partition_count = conn
+        .query_row(
+            "SELECT COALESCE(SUM(partitions), 0) FROM bus_topics",
+            [],
+            |row| row.get::<_, i64>(0),
+        )
+        .map(|n| n.max(0) as u64)
+        .unwrap_or(0);
+    (topic_count, partition_count)
+}
+
+/// Best-effort recursive size (bytes) of every regular file under `dir` —
+/// backs `tentaflow_bus_disk_bytes`. Plain `std::fs`, deliberately not a new
+/// bus-engine API (PLAN §8.4): this is a metrics-only figure, not something
+/// the engine itself needs to expose. Any error at any level (missing dir,
+/// permissions, a file racing a concurrent delete) collapses that entry to
+/// `0` rather than failing the whole scrape, matching every other collector
+/// in this file. Depth-bounded purely as a defense against a symlink cycle,
+/// not because the bus directory layout nests anywhere near this deep.
+fn dir_size_bytes(dir: &std::path::Path) -> u64 {
+    fn walk(dir: &std::path::Path, depth: u32) -> u64 {
+        if depth > 64 {
+            return 0;
+        }
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return 0;
+        };
+        let mut total = 0u64;
+        for entry in entries.filter_map(std::result::Result::ok) {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                total += walk(&entry.path(), depth + 1);
+            } else if file_type.is_file() {
+                total += entry.metadata().map(|m| m.len()).unwrap_or(0);
+            }
+        }
+        total
+    }
+    walk(dir, 0)
 }
 
 /// (total, running, degraded, failed, stopped). `deploying`/`starting`/
@@ -302,7 +572,7 @@ fn push_float(lines: &mut Vec<(&'static str, String)>, key: &'static str, value:
 /// exposes no CPU temperature sensor (or a non-finite reading) rather than
 /// emitting a sentinel value a trigger could mistake for a real reading.
 pub fn format_zabbix(m: &ExportedMetrics) -> String {
-    let mut lines: Vec<(&'static str, String)> = Vec::with_capacity(31);
+    let mut lines: Vec<(&'static str, String)> = Vec::with_capacity(47);
     push_float(
         &mut lines,
         "tentaflow_cpu_usage_percent",
@@ -403,6 +673,70 @@ pub fn format_zabbix(m: &ExportedMetrics) -> String {
         &mut lines,
         "tentaflow_system_uptime_seconds",
         m.system_uptime_seconds,
+    );
+
+    // ---- TentaBus M2 (PLAN §8.4): counters, p99s, lag, dlq, counts, disk,
+    // isr, epoch, replication lag, throttled — see `collect_bus_metrics`'s
+    // doc for how each is sourced. ----
+    push_int(
+        &mut lines,
+        "tentaflow_bus_publish_msgs_total",
+        m.bus_publish_msgs_total,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_publish_bytes_total",
+        m.bus_publish_bytes_total,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_consume_msgs_total",
+        m.bus_consume_msgs_total,
+    );
+    push_int(&mut lines, "tentaflow_bus_fsync_p99_us", m.bus_fsync_p99_us);
+    push_int(
+        &mut lines,
+        "tentaflow_bus_append_p99_us",
+        m.bus_append_p99_us,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_consumer_lag_max",
+        m.bus_consumer_lag_max,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_consumer_lag_sum",
+        m.bus_consumer_lag_sum,
+    );
+    push_int(&mut lines, "tentaflow_bus_dlq_depth", m.bus_dlq_depth);
+    push_int(&mut lines, "tentaflow_bus_topic_count", m.bus_topic_count);
+    push_int(
+        &mut lines,
+        "tentaflow_bus_partition_count",
+        m.bus_partition_count,
+    );
+    push_int(&mut lines, "tentaflow_bus_disk_bytes", m.bus_disk_bytes);
+    push_int(&mut lines, "tentaflow_bus_isr_size_min", m.bus_isr_size_min);
+    push_int(
+        &mut lines,
+        "tentaflow_bus_isr_shrink_total",
+        m.bus_isr_shrink_total,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_leader_epoch_max",
+        m.bus_leader_epoch_max,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_replication_lag_bytes_max",
+        m.bus_replication_lag_bytes_max,
+    );
+    push_int(
+        &mut lines,
+        "tentaflow_bus_throttled_total",
+        m.bus_throttled_total,
     );
 
     let mut out = String::new();
@@ -634,11 +968,27 @@ mod tests {
             fs_available_bytes: 400_000_000,
             fs_used_percent: 60.0,
             system_uptime_seconds: 86_400,
+            bus_publish_msgs_total: 1_234,
+            bus_publish_bytes_total: 987_654,
+            bus_consume_msgs_total: 1_100,
+            bus_throttled_total: 7,
+            bus_fsync_p99_us: 850,
+            bus_append_p99_us: 120,
+            bus_consumer_lag_max: 42,
+            bus_consumer_lag_sum: 88,
+            bus_dlq_depth: 3,
+            bus_topic_count: 5,
+            bus_partition_count: 20,
+            bus_disk_bytes: 5_000_000,
+            bus_isr_size_min: 2,
+            bus_isr_shrink_total: 1,
+            bus_leader_epoch_max: 4,
+            bus_replication_lag_bytes_max: 65_536,
         }
     }
 
     /// Every non-empty line is exactly `key value` (one space), the key set
-    /// is the stable 31-entry list, every key is a legal label-less
+    /// is the stable 47-entry list, every key is a legal label-less
     /// Prometheus metric name (`tentaflow_*`, no dots), and every value
     /// parses as a plain, finite f64 — no thousands separators, no
     /// locale-dependent decimal comma, no NaN/inf.
@@ -646,7 +996,7 @@ mod tests {
     fn format_zabbix_produces_stable_key_value_lines() {
         let text = format_zabbix(&sample_metrics());
         let lines: Vec<&str> = text.lines().collect();
-        assert_eq!(lines.len(), 31, "expected 31 metric lines, got: {text}");
+        assert_eq!(lines.len(), 47, "expected 47 metric lines, got: {text}");
 
         let mut keys = Vec::with_capacity(lines.len());
         for line in &lines {
@@ -670,6 +1020,22 @@ mod tests {
         assert!(keys.contains(&"tentaflow_cpu_temperature_c"));
         assert!(keys.contains(&"tentaflow_fs_used_percent"));
         assert!(keys.contains(&"tentaflow_system_uptime_seconds"));
+        assert!(keys.contains(&"tentaflow_bus_publish_msgs_total"));
+        assert!(keys.contains(&"tentaflow_bus_publish_bytes_total"));
+        assert!(keys.contains(&"tentaflow_bus_consume_msgs_total"));
+        assert!(keys.contains(&"tentaflow_bus_throttled_total"));
+        assert!(keys.contains(&"tentaflow_bus_fsync_p99_us"));
+        assert!(keys.contains(&"tentaflow_bus_append_p99_us"));
+        assert!(keys.contains(&"tentaflow_bus_consumer_lag_max"));
+        assert!(keys.contains(&"tentaflow_bus_consumer_lag_sum"));
+        assert!(keys.contains(&"tentaflow_bus_dlq_depth"));
+        assert!(keys.contains(&"tentaflow_bus_topic_count"));
+        assert!(keys.contains(&"tentaflow_bus_partition_count"));
+        assert!(keys.contains(&"tentaflow_bus_disk_bytes"));
+        assert!(keys.contains(&"tentaflow_bus_isr_size_min"));
+        assert!(keys.contains(&"tentaflow_bus_isr_shrink_total"));
+        assert!(keys.contains(&"tentaflow_bus_leader_epoch_max"));
+        assert!(keys.contains(&"tentaflow_bus_replication_lag_bytes_max"));
         assert_eq!(
             keys.iter().collect::<std::collections::HashSet<_>>().len(),
             keys.len(),
@@ -686,7 +1052,7 @@ mod tests {
         metrics.cpu_temperature_c = None;
         let text = format_zabbix(&metrics);
         assert!(!text.contains("tentaflow_cpu_temperature_c"));
-        assert_eq!(text.lines().count(), 30);
+        assert_eq!(text.lines().count(), 46);
     }
 
     /// A NaN or infinite reading is dropped from the body instead of being
@@ -770,6 +1136,22 @@ mod tests {
             fs_available_bytes: 0,
             fs_used_percent: 0.0,
             system_uptime_seconds: 0,
+            bus_publish_msgs_total: 0,
+            bus_publish_bytes_total: 0,
+            bus_consume_msgs_total: 0,
+            bus_throttled_total: 0,
+            bus_fsync_p99_us: 0,
+            bus_append_p99_us: 0,
+            bus_consumer_lag_max: 0,
+            bus_consumer_lag_sum: 0,
+            bus_dlq_depth: 0,
+            bus_topic_count: 0,
+            bus_partition_count: 0,
+            bus_disk_bytes: 0,
+            bus_isr_size_min: 0,
+            bus_isr_shrink_total: 0,
+            bus_leader_epoch_max: 0,
+            bus_replication_lag_bytes_max: 0,
         }
     }
 

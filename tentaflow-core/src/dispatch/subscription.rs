@@ -497,7 +497,10 @@ mod tests {
             other => panic!("expected End(body), got {:?}", other),
         }
         // Rozbrojony guard nie moze dosypac drugiej ramki terminalnej.
-        assert!(matches!(rx.try_recv(), Err(mpsc::error::TryRecvError::Empty)));
+        assert!(matches!(
+            rx.try_recv(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
     }
 
     #[tokio::test]
@@ -549,7 +552,9 @@ mod tests {
             rx.recv().await.unwrap(),
             SubscriptionEvent::Chunk(_)
         ));
-        task.await.unwrap().expect("slow consumer must not kill the stream");
+        task.await
+            .unwrap()
+            .expect("slow consumer must not kill the stream");
         assert!(matches!(
             rx.recv().await.unwrap(),
             SubscriptionEvent::Chunk(_)

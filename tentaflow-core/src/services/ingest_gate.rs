@@ -39,8 +39,8 @@ pub fn would_wait() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
 
     /// Takes the WHOLE gate for the duration of a test. The semaphore is a
     /// process-lifetime static shared by every caller in the test binary, so a
@@ -73,7 +73,10 @@ mod tests {
     async fn the_gate_admits_exactly_the_documented_number_of_documents() {
         let (_turn, mut all) = own_the_gate().await;
         assert_eq!(semaphore().available_permits(), 0);
-        assert!(would_wait(), "with the bound reached the gate reports a wait");
+        assert!(
+            would_wait(),
+            "with the bound reached the gate reports a wait"
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(200), acquire())
                 .await
@@ -87,7 +90,10 @@ mod tests {
             .await
             .expect("the freed permit is handed out")
             .expect("the gate is open");
-        assert!(would_wait(), "the last permit is out; the bound still holds");
+        assert!(
+            would_wait(),
+            "the last permit is out; the bound still holds"
+        );
 
         drop(mine);
         let again = tokio::time::timeout(std::time::Duration::from_secs(5), acquire())

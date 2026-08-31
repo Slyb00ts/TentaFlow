@@ -346,7 +346,10 @@ impl EmbeddedDeploy {
         }
         .map_err(|e| DeployError::Other(format!("load embedded STT '{engine_id}': {e}")))?;
         if let Some(s) = &self.log_sink {
-            s.info(&format!("[stt] {engine_id} model loaded from {}", info.path));
+            s.info(&format!(
+                "[stt] {engine_id} model loaded from {}",
+                info.path
+            ));
         }
         Ok(())
     }

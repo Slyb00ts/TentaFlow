@@ -332,7 +332,10 @@ fn decision_result(decision: &str) -> &'static str {
         "allow" | "allowed" | "approve" | "approved" | "grant" | "granted" => "allowed",
         "deny" | "denied" | "refuse" | "refused" | "reject" | "rejected" => "denied",
         other => {
-            warn!(decision = other, "audit delivery: unknown approval decision");
+            warn!(
+                decision = other,
+                "audit delivery: unknown approval decision"
+            );
             "unknown"
         }
     }

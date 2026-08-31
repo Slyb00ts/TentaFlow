@@ -501,7 +501,8 @@ mod tests {
     /// bundle` runs every imported flow through R1-R8 validation, so a
     /// bare-`{}` flow (valid only for pre-Z12 diff-only tests) can no longer
     /// stand in for an APPLIED flow.
-    const VALID_FLOW_JSON: &str = r#"{"nodes":[{"id":"t1","type":"trigger","config":{}}],"edges":[]}"#;
+    const VALID_FLOW_JSON: &str =
+        r#"{"nodes":[{"id":"t1","type":"trigger","config":{}}],"edges":[]}"#;
 
     fn test_adapter_registry() -> crate::flow_engine::node_adapter::AdapterRegistry {
         let mut registry = crate::flow_engine::node_adapter::AdapterRegistry::new();
@@ -696,7 +697,10 @@ mod tests {
                 r.get(0)
             })
             .unwrap();
-        assert_eq!(count, 0, "the transaction must roll back, not partially apply");
+        assert_eq!(
+            count, 0,
+            "the transaction must roll back, not partially apply"
+        );
     }
 
     /// A `format_version` newer than this build understands must be rejected

@@ -2453,7 +2453,9 @@ mod tests {
         let bytes = crate::cbor::encode(&envs).expect("encode");
         assert_eq!(
             bytes,
-            hex_bytes("a177456e7669726f6e6d656e74734c69737452657175657374a16a70726f6a6563745f6964627031"),
+            hex_bytes(
+                "a177456e7669726f6e6d656e74734c69737452657175657374a16a70726f6a6563745f6964627031"
+            ),
             "EnvironmentsListRequest wire drift"
         );
 

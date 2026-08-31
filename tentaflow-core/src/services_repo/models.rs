@@ -226,7 +226,10 @@ pub fn replace_discovered(
 ) -> Result<()> {
     use std::collections::HashSet;
 
-    let names: HashSet<&str> = discovered.iter().map(|model| model.model_name.as_str()).collect();
+    let names: HashSet<&str> = discovered
+        .iter()
+        .map(|model| model.model_name.as_str())
+        .collect();
     for row in list_for_service(conn, service_id)? {
         if !names.contains(row.model_name.as_str()) {
             conn.execute("DELETE FROM model_registry WHERE id = ?1", params![row.id])

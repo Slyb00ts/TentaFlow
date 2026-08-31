@@ -3183,9 +3183,7 @@ pub struct ErrorInfo {
 }
 
 /// Typy błędów.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum ErrorType {
     /// Invalid request (nieprawidłowe parametry)
     InvalidRequest,
@@ -3214,15 +3212,7 @@ pub enum ErrorType {
 // ============================================================================
 
 /// Kategoria modelu dla prefix cache
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    SerdeSerialize,
-    SerdeDeserialize,
-)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum PrefixCacheModelCategory {
     /// Główny LLM (bielik-11b) - odpowiedzi użytkownikowi
     MainLlm,
@@ -3231,9 +3221,7 @@ pub enum PrefixCacheModelCategory {
 }
 
 /// Typ prompta w prefix cache
-#[derive(
-    Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize,
-)]
+#[derive(Debug, Clone, PartialEq, Eq, SerdeSerialize, SerdeDeserialize)]
 pub enum PrefixCachePromptType {
     /// System prompt - pełny, stały
     System,
@@ -3548,8 +3536,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => {
@@ -3601,8 +3588,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => {
@@ -3649,8 +3635,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
@@ -3720,8 +3705,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
@@ -3762,8 +3746,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::MeetingEvent(ev) => match ev.payload {
@@ -3805,8 +3788,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::PromptFetch(req) => {
@@ -3831,8 +3813,7 @@ mod meeting_event_tests {
         };
 
         let bytes = crate::cbor::encode(&response).expect("encode");
-        let decoded: ModelResponse =
-            crate::cbor::decode::<ModelResponse>(&bytes).expect("decode");
+        let decoded: ModelResponse = crate::cbor::decode::<ModelResponse>(&bytes).expect("decode");
 
         match decoded.result {
             ModelResult::PromptFetched(p) => {
@@ -3937,8 +3918,7 @@ mod camera_cv_tests {
         };
 
         let bytes = crate::cbor::encode(&request).expect("encode");
-        let decoded: ModelRequest =
-            crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
+        let decoded: ModelRequest = crate::cbor::decode::<ModelRequest>(&bytes).expect("decode");
 
         match decoded.payload {
             ModelPayload::CameraCv(p) => {
@@ -4034,8 +4014,7 @@ mod camera_cv_tests {
         };
 
         let bytes = crate::cbor::encode(&response).expect("encode");
-        let decoded: ModelResponse =
-            crate::cbor::decode::<ModelResponse>(&bytes).expect("decode");
+        let decoded: ModelResponse = crate::cbor::decode::<ModelResponse>(&bytes).expect("decode");
 
         match decoded.result {
             ModelResult::CameraCv(CameraCvResult::Detections { per_frame }) => {
@@ -4087,7 +4066,10 @@ mod flow_invoke_tests {
         assert!(decoded.stream);
         match decoded.payload {
             ModelPayload::FlowInvoke(p) => {
-                assert_eq!(p.flow_id.as_deref(), Some("00000000-0000-4000-8000-000000000060"));
+                assert_eq!(
+                    p.flow_id.as_deref(),
+                    Some("00000000-0000-4000-8000-000000000060")
+                );
                 let audio = p.audio.expect("audio");
                 assert_eq!(audio.audio_data, pcm);
                 assert_eq!(audio.mime, "audio/pcm");

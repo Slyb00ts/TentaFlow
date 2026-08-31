@@ -7,18 +7,18 @@
 // writes, what a replication stream would forward (M2), and what every
 // fan-out reader slices from.
 //
-// Compressed body format (review P2-13): when `flags` selects `Codec::Lz4`,
-// the stored body is `lz4_flex::block::compress_prepend_size` output, i.e. a
-// 4-byte little-endian *uncompressed* length prefix followed by the raw lz4
-// block — not documented in PLAN §2.3's on-wire diagram, written down here
-// so a second implementation reading `body_len` bytes after the header knows
-// it must also strip/interpret those first 4 body bytes before calling an
-// lz4 block decompressor.
+// Compressed body format: when `flags` selects `Codec::Lz4`, the stored body
+// is `lz4_flex::block::compress_prepend_size` output, i.e. a 4-byte
+// little-endian *uncompressed* length prefix followed by the raw lz4 block —
+// not documented in PLAN §2.3's on-wire diagram, written down here so a
+// second implementation reading `body_len` bytes after the header knows it
+// must also strip/interpret those first 4 body bytes before calling an lz4
+// block decompressor.
 //
-// CRC (review P2-13, decision #3): `crc32c` is true Castagnoli CRC-32C (the
-// `crc32c` crate, hardware-accelerated where available), computed over the
-// *stored* (post-compression) body — matching both the field name and PLAN
-// §2.3's "crc32c nad body".
+// CRC: `crc32c` is true Castagnoli CRC-32C (the `crc32c` crate,
+// hardware-accelerated where available), computed over the *stored*
+// (post-compression) body — matching both the field name and PLAN §2.3's
+// "crc32c nad body".
 
 use bytes::Bytes;
 use smallvec::SmallVec;
@@ -39,8 +39,8 @@ const FLAG_CODEC_MASK: u16 = 0b0000_0000_0000_0011;
 // Bits 2-3 of the batch-level `flags` field are reserved by PLAN §2.3 for
 // "external"/"encrypted" batch markers. Nothing in this crate sets or reads
 // them yet (M0 has no `BlobRef`/encryption support), so no named constant or
-// accessor is defined for them here — review P3-1: do not carry accessors
-// that are dead code just because the wire format sets bits aside for later.
+// accessor is defined for them here: do not carry accessors that are dead
+// code just because the wire format sets bits aside for later.
 
 /// Record-level flag: payload is a `BlobRef`, not inline bytes (PLAN §2.4).
 /// M0 never sets this — large-payload handling is M1 scope — but the bit is
@@ -52,7 +52,7 @@ pub const RECORD_FLAG_EXTERNAL: u16 = 1 << 0;
 /// KiB"). Below the threshold lz4 framing overhead is not worth the CPU.
 /// Only applies to `BatchBuilder`'s default (`Codec`-unset) mode — a
 /// producer that pins a codec via `with_codec` bypasses this heuristic
-/// entirely (review P2-12, PLAN §7.1 `compression = lz4 | none` per topic).
+/// entirely (PLAN §7.1 `compression = lz4 | none` per topic).
 pub const LZ4_COMPRESS_THRESHOLD: usize = 32 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -113,9 +113,9 @@ impl BatchHeader {
     /// Decodes the first `BATCH_HEADER_LEN` bytes of `buf`. `buf` may be
     /// longer than the header (the body follows) or, safely, shorter than
     /// it — the length check happens *before* any indexing, so a caller
-    /// never needs to pre-slice `buf` to exactly 40 bytes itself (review
-    /// P1-2: `&batch[..BATCH_HEADER_LEN]` at a call site panics on a short
-    /// buffer before this function's own bounds check ever runs).
+    /// never needs to pre-slice `buf` to exactly 40 bytes itself:
+    /// `&batch[..BATCH_HEADER_LEN]` at a call site would panic on a short
+    /// buffer before this function's own bounds check ever ran.
     pub fn decode(buf: &[u8]) -> Result<Self> {
         if buf.len() < BATCH_HEADER_LEN {
             return Err(BusError::TruncatedBatch {
@@ -192,9 +192,9 @@ impl RecordInput {
 /// `raw_body` reserves its first `BATCH_HEADER_LEN` bytes up front and
 /// records are appended after them, so the common (uncompressed) `build()`
 /// path patches the header in place and hands the same buffer to `Bytes`
-/// with zero extra copies of the body (review P2-6 — the previous version
-/// built the body into `raw_body` at offset 0, then `Vec::extend_from_slice`d
-/// the whole thing into a second, header-prefixed buffer on every batch).
+/// with zero extra copies of the body (the previous version built the body
+/// into `raw_body` at offset 0, then `Vec::extend_from_slice`d the whole
+/// thing into a second, header-prefixed buffer on every batch).
 pub struct BatchBuilder {
     base_offset: u64,
     producer_epoch: u32,
@@ -204,8 +204,8 @@ pub struct BatchBuilder {
     raw_body: Vec<u8>,
     /// `None` = auto (default heuristic: compress when the body clears
     /// `LZ4_COMPRESS_THRESHOLD` *and* compression actually shrinks it).
-    /// `Some(codec)` pins the codec unconditionally (review P2-12, PLAN
-    /// §7.1 per-topic `compression = lz4 | none`).
+    /// `Some(codec)` pins the codec unconditionally (PLAN §7.1 per-topic
+    /// `compression = lz4 | none`).
     codec: Option<Codec>,
 }
 
@@ -229,7 +229,7 @@ impl BatchBuilder {
     }
 
     /// Pins the codec `build()` uses, overriding the size-threshold
-    /// heuristic entirely (review P2-12). `Codec::None` never compresses;
+    /// heuristic entirely. `Codec::None` never compresses;
     /// `Codec::Lz4` always compresses (even below `LZ4_COMPRESS_THRESHOLD`),
     /// still falling back to storing the raw body if compression would not
     /// shrink it.
@@ -421,7 +421,7 @@ impl BatchView {
         let header = BatchHeader::decode(&raw[..BATCH_HEADER_LEN])?;
         // `body_len` is attacker/corruption-controlled input (it comes
         // straight off the wire); a 32-bit target could see this overflow
-        // `usize` (review P3-6).
+        // `usize`, hence the checked add below instead of a plain `+`.
         let needed = (header.body_len as usize)
             .checked_add(BATCH_HEADER_LEN)
             .ok_or(BusError::BatchTooLarge {
@@ -476,13 +476,13 @@ impl BatchView {
     /// Iterates only the records whose absolute offset
     /// (`header.base_offset + offset_delta`) is `>= from_offset`.
     ///
-    /// `PartitionReader::fetch_from_offset` returns whole batches (review
-    /// P3-13/P3-12): its sparse index only gives a *floor* position, so the
-    /// first returned batch may start before the requested offset, same as
-    /// Kafka. Callers that need to resume reading from an exact offset
-    /// should drive iteration through this helper on the first batch of a
-    /// fetch result rather than `records()` directly, instead of
-    /// re-deriving the filter themselves.
+    /// `PartitionReader::fetch_from_offset` returns whole batches: its
+    /// sparse index only gives a *floor* position, so the first returned
+    /// batch may start before the requested offset, same as Kafka. Callers
+    /// that need to resume reading from an exact offset should drive
+    /// iteration through this helper on the first batch of a fetch result
+    /// rather than `records()` directly, instead of re-deriving the filter
+    /// themselves.
     pub fn records_from(&self, from_offset: u64) -> impl Iterator<Item = Result<RecordView>> + '_ {
         let base = self.header.base_offset;
         self.records().filter(move |r| match r {
@@ -606,7 +606,7 @@ impl<'a> RecordIter<'a> {
         // corruption-induced) large `key_len`/`payload_len` that would
         // otherwise still fall inside the buffer but past this record's
         // end must be rejected, not silently handed back as if it were
-        // this record's data (review P1-1).
+        // this record's data.
         Self::checked_range(record_end, p, key_len, "key_len")?;
         let key = if key_len > 0 {
             let k = self.body.slice(p..p + key_len);
@@ -830,10 +830,9 @@ mod tests {
         assert!(matches!(err, BusError::BadMagic(_)));
     }
 
-    /// Review P1-1 / test gap #7: a record whose `payload_len` claims far
-    /// more bytes than remain in the record (and would even reach past the
-    /// whole batch buffer) must be rejected with a clean error, never a
-    /// `Bytes::slice` panic.
+    /// A record whose `payload_len` claims far more bytes than remain in
+    /// the record (and would even reach past the whole batch buffer) must
+    /// be rejected with a clean error, never a `Bytes::slice` panic.
     #[test]
     fn malicious_field_lengths_are_rejected_not_panicking() {
         let mut b = BatchBuilder::new(0, 1);

@@ -3372,13 +3372,16 @@ impl ModelRuntimeExecutor {
                     requested_model = %model,
                     "STT: model did not resolve to a catalog service — using a registered local STT service"
                 );
-                return runtime.transcribe(request).await.map_err(|e| match stt_runtime_error(e) {
-                    ExecutorError::SttBackend(msg) => ExecutorError::SttBackend(format!(
-                        "STT model '{model}' matches no running STT service in the catalog; \
+                return runtime
+                    .transcribe(request)
+                    .await
+                    .map_err(|e| match stt_runtime_error(e) {
+                        ExecutorError::SttBackend(msg) => ExecutorError::SttBackend(format!(
+                            "STT model '{model}' matches no running STT service in the catalog; \
                          local STT service: {msg}"
-                    )),
-                    other => other,
-                });
+                        )),
+                        other => other,
+                    });
             }
             Err(e) => return Err(ExecutorError::SttBackend(format!("resolver: {}", e))),
         };
@@ -3387,13 +3390,16 @@ impl ModelRuntimeExecutor {
         let ranked = rank(&outcome.candidates, outcome.strategy, &state);
         if ranked.is_empty() {
             let model = request.model.clone();
-            return runtime.transcribe(request).await.map_err(|e| match stt_runtime_error(e) {
-                ExecutorError::SttBackend(msg) => ExecutorError::SttBackend(format!(
-                    "STT model '{model}' resolved but has no executable candidate; \
+            return runtime
+                .transcribe(request)
+                .await
+                .map_err(|e| match stt_runtime_error(e) {
+                    ExecutorError::SttBackend(msg) => ExecutorError::SttBackend(format!(
+                        "STT model '{model}' resolved but has no executable candidate; \
                      local STT service: {msg}"
-                )),
-                other => other,
-            });
+                    )),
+                    other => other,
+                });
         }
 
         for target in ranked {

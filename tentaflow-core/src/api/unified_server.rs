@@ -116,8 +116,7 @@ pub(crate) fn identity_for_api_key(
     }
 }
 
-const INVALID_API_KEY_BODY: &str =
-    r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#;
+const INVALID_API_KEY_BODY: &str = r#"{"error":{"type":"authentication_error","message":"Niepoprawny API key","code":"invalid_api_key"}}"#;
 
 /// Sprawdza czy request powinien byc obsluzony przez OpenAI API handler.
 /// Obejmuje takze publiczna dokumentacje REST (/openapi.json, /docs i jej asety),
@@ -833,7 +832,11 @@ mod tests {
     fn user_key_with_active_account_binds_the_actor_to_that_user() {
         let db = fresh_db();
         let user_id = crate::db::repository::create_user_account(
-            &db, "alice", "hash", "Alice", "a@example.com",
+            &db,
+            "alice",
+            "hash",
+            "Alice",
+            "a@example.com",
         )
         .expect("user");
 
@@ -857,10 +860,9 @@ mod tests {
     #[test]
     fn user_key_with_inactive_account_is_refused() {
         let db = fresh_db();
-        let user_id = crate::db::repository::create_user_account(
-            &db, "bob", "hash", "Bob", "b@example.com",
-        )
-        .expect("user");
+        let user_id =
+            crate::db::repository::create_user_account(&db, "bob", "hash", "Bob", "b@example.com")
+                .expect("user");
         {
             let conn = db.write().expect("db lock");
             conn.execute(
@@ -880,8 +882,7 @@ mod tests {
     #[test]
     fn group_key_resolves_to_the_group_with_no_user_behind_it() {
         let db = fresh_db();
-        let group_id =
-            crate::db::repository::create_group(&db, "ops", "ops team").expect("group");
+        let group_id = crate::db::repository::create_group(&db, "ops", "ops team").expect("group");
 
         let identity =
             identity_for_api_key(&db, &key_row("key-group", "group", Some(&group_id))).expect("ok");
@@ -901,8 +902,8 @@ mod tests {
     #[test]
     fn general_key_is_a_service_key_with_no_user_binding() {
         let db = fresh_db();
-        let identity = identity_for_api_key(&db, &key_row("key-general", "general", None))
-            .expect("ok");
+        let identity =
+            identity_for_api_key(&db, &key_row("key-general", "general", None)).expect("ok");
 
         assert!(identity.user_ctx.is_none());
         match &identity.principal {

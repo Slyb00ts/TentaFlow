@@ -566,7 +566,10 @@ mod tests {
 
         // Prawie cały pierwotny budżet mija bez wpięcia gałęzi.
         tokio::time::sleep(INIT_SEGMENT_TIMEOUT - Duration::from_millis(250)).await;
-        assert!(!waiter.is_finished(), "budżet nie powinien jeszcze wygasnąć");
+        assert!(
+            !waiter.is_finished(),
+            "budżet nie powinien jeszcze wygasnąć"
+        );
 
         // Gałąź wreszcie się wpina — od tego momentu liczymy 10 s od nowa.
         pub_.mark_branch_attached();

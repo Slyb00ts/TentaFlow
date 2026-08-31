@@ -1076,7 +1076,9 @@ pub fn running_jobs(pool: &DbPool) -> Result<Vec<(String, String)>> {
     let conn = pool.read().map_err(read_err)?;
     let mut stmt =
         conn.prepare("SELECT job_id, source_id FROM ingest_jobs WHERE status = 'running'")?;
-    let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?;
+    let rows = stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
     rows.collect::<std::result::Result<Vec<_>, _>>()
         .map_err(Into::into)
 }
@@ -1560,7 +1562,11 @@ mod unit_tests {
         assert_eq!(stored.get("a.rs").map(String::as_str), Some("aaa"));
 
         // b.rs changed, c.rs is new, a.rs is untouched.
-        let current = vec![file("a.rs", "aaa"), file("b.rs", "BBB2"), file("c.rs", "ccc")];
+        let current = vec![
+            file("a.rs", "aaa"),
+            file("b.rs", "BBB2"),
+            file("c.rs", "ccc"),
+        ];
         let delta = super::super::ingest::diff_tree(&stored, &current);
         assert_eq!(delta.added, vec!["c.rs".to_string()]);
         assert_eq!(delta.changed, vec!["b.rs".to_string()]);
@@ -1576,7 +1582,11 @@ mod unit_tests {
             .expect("a.rs id")
         };
         let (work, removed) = sync_tree_files(&pool, "s1", &current, &delta).expect("delta sync");
-        assert_eq!(work.len(), 2, "only the changed + added files are re-ingested");
+        assert_eq!(
+            work.len(),
+            2,
+            "only the changed + added files are re-ingested"
+        );
         assert!(removed.is_empty());
         assert!(
             !work.contains(&unchanged_id),
@@ -1589,8 +1599,15 @@ mod unit_tests {
         let delta = super::super::ingest::diff_tree(&stored, &current);
         assert_eq!(delta.removed, vec!["b.rs".to_string()]);
         let (work, removed) = sync_tree_files(&pool, "s1", &current, &delta).expect("removal sync");
-        assert!(work.is_empty(), "nothing changed, so nothing is re-embedded");
-        assert_eq!(removed.len(), 1, "the vanished file id feeds vector cleanup");
+        assert!(
+            work.is_empty(),
+            "nothing changed, so nothing is re-embedded"
+        );
+        assert_eq!(
+            removed.len(),
+            1,
+            "the vanished file id feeds vector cleanup"
+        );
         let stored = super::super::git_source::stored_file_hashes(&pool, "s1").expect("hashes");
         assert_eq!(stored.len(), 2);
         assert!(!stored.contains_key("b.rs"));
@@ -1712,8 +1729,12 @@ mod code_studio_mirror_tests {
         );
 
         assert_eq!(
-            add_members(&project_id, &[(member.clone(), "viewer".to_string())], &owner)
-                .expect("add member"),
+            add_members(
+                &project_id,
+                &[(member.clone(), "viewer".to_string())],
+                &owner
+            )
+            .expect("add member"),
             1
         );
         assert_eq!(
@@ -1768,8 +1789,14 @@ mod code_studio_mirror_tests {
         workspace(&core, &unlinked);
         project_with_owner(&project_id, &owner);
         project_link::link(&core, ORG, &linked, &project_id, &owner).expect("link");
-        code_repo::upsert_member(&core, &linked, &by_hand, WorkspaceRole::Editor, "u-ws-owner")
-            .expect("manual grant");
+        code_repo::upsert_member(
+            &core,
+            &linked,
+            &by_hand,
+            WorkspaceRole::Editor,
+            "u-ws-owner",
+        )
+        .expect("manual grant");
 
         assert_eq!(
             add_members(

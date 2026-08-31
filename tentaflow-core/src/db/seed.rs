@@ -61,8 +61,10 @@ macro_rules! factory_chat_graph {
 /// keeping the block a stream producer, so streaming stays end-to-end.
 /// The agent id is spelled out because `concat!` takes literals only —
 /// `default_chat_targets_general_agent` pins it to [`GENERAL_AGENT_ID`].
-pub const DEFAULT_CHAT_FLOW_JSON: &str =
-    factory_chat_graph!("agent", r#"{"agent_id":"00000000-0000-4000-8000-000000000014"}"#);
+pub const DEFAULT_CHAT_FLOW_JSON: &str = factory_chat_graph!(
+    "agent",
+    r#"{"agent_id":"00000000-0000-4000-8000-000000000014"}"#
+);
 
 /// Byte-exact JSON of the previous factory "Default Chat"
 /// (`trigger -> llm -> output(stream)`). Kept ONLY so the seed can tell an
@@ -3123,9 +3125,14 @@ mod tests {
         // 3. Nothing outside the context may be produced. This is what stops the
         //    project chat from drifting back to answering from model knowledge.
         assert!(
-            ["nie zmyslaj", "nie wymyslaj", "nie halucynuj", "nie dopowiadaj"]
-                .iter()
-                .any(|w| prompt.contains(w)),
+            [
+                "nie zmyslaj",
+                "nie wymyslaj",
+                "nie halucynuj",
+                "nie dopowiadaj"
+            ]
+            .iter()
+            .any(|w| prompt.contains(w)),
             "answer prompt must forbid inventing facts outside the context: {prompt}"
         );
     }
@@ -3491,11 +3498,17 @@ mod tests {
         let mut graphs: Vec<(&'static str, String)> = vec![
             ("Default Chat", super::DEFAULT_CHAT_FLOW_JSON.to_string()),
             ("Meeting Bot", super::MEETING_BOT_FLOW_JSON.to_string()),
-            ("Camera Analysis", super::CAMERA_ANALYSIS_FLOW_JSON.to_string()),
+            (
+                "Camera Analysis",
+                super::CAMERA_ANALYSIS_FLOW_JSON.to_string(),
+            ),
             ("Agent Run", super::agent_run_flow_json()),
             ("Code Harness", super::code_harness_flow_json()),
             ("Code Harness — team", super::code_harness_team_flow_json()),
-            ("Code Harness — critic", super::code_harness_critic_flow_json()),
+            (
+                "Code Harness — critic",
+                super::code_harness_critic_flow_json(),
+            ),
         ];
         for (_, published, _, _, flow_json) in super::PLATFORM_RAG_FLOWS {
             graphs.push((published, flow_json.to_string()));
@@ -3515,11 +3528,15 @@ mod tests {
         for (label, flow_json) in all_seeded_graphs() {
             let def: serde_json::Value =
                 serde_json::from_str(&flow_json).unwrap_or_else(|e| panic!("{label}: {e}"));
-            let nodes = def["nodes"].as_array().unwrap_or_else(|| panic!("{label}: no nodes"));
+            let nodes = def["nodes"]
+                .as_array()
+                .unwrap_or_else(|| panic!("{label}: no nodes"));
             let placed: Vec<(&str, i64, i64)> = nodes
                 .iter()
                 .map(|n| {
-                    let id = n["id"].as_str().unwrap_or_else(|| panic!("{label}: node without id"));
+                    let id = n["id"]
+                        .as_str()
+                        .unwrap_or_else(|| panic!("{label}: node without id"));
                     let pos = &n["position"];
                     let x = pos["x"]
                         .as_i64()
@@ -3598,7 +3615,11 @@ mod tests {
         use crate::flow_engine::types::FlowDefinition;
 
         let def: FlowDefinition = serde_json::from_str(super::MEETING_BOT_FLOW_JSON).unwrap();
-        let l1 = def.nodes.iter().find(|n| n.id == "l1").expect("answer node");
+        let l1 = def
+            .nodes
+            .iter()
+            .find(|n| n.id == "l1")
+            .expect("answer node");
         assert_eq!(l1.node_type, "llm");
         let prompt = l1
             .config
@@ -3808,7 +3829,10 @@ mod tests {
         .unwrap();
         super::seed_system_agents(&conn).expect("reseed upgrades the untouched row");
         assert_eq!(read("system_prompt"), super::GENERAL_AGENT_PROMPT);
-        assert_eq!(read("allowed_agents_json"), super::GENERAL_AGENT_ALLOWED_AGENTS);
+        assert_eq!(
+            read("allowed_agents_json"),
+            super::GENERAL_AGENT_ALLOWED_AGENTS
+        );
 
         // One edited column and the whole row is left alone: an admin who
         // rewrote the prompt keeps it, and keeps their tool surface too.
@@ -4405,7 +4429,11 @@ mod tests {
             compiled.definition.nodes[last_def_idx].id
         );
         assert!(
-            compiled.definition.nodes.iter().any(|n| n.node_type == "graph_extract"),
+            compiled
+                .definition
+                .nodes
+                .iter()
+                .any(|n| n.node_type == "graph_extract"),
             "the ingest flow must still carry the graph_extract branch"
         );
     }

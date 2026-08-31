@@ -572,7 +572,11 @@ fn run_import(
     // surface as per-recording skips below.
     let remote_by_ref: Option<HashMap<String, RemotePulled>>;
     let _temp_guard: Option<TempPullFiles>;
-    match spec.source_node_id.as_deref().filter(|s| !s.trim().is_empty()) {
+    match spec
+        .source_node_id
+        .as_deref()
+        .filter(|s| !s.trim().is_empty())
+    {
         Some(node) => {
             update_progress(job_id, |p| p.phase = format!("pobieranie z węzła {node}"));
             let pulled = handle
@@ -701,9 +705,9 @@ fn extract_recording(
     // missing from the map is one the node refused to stream.
     let (src, kind) = match remote {
         Some(map) => {
-            let pulled = map.get(recording_ref).ok_or_else(|| {
-                anyhow::anyhow!("węzeł nie udostępnił tego nagrania do pobrania")
-            })?;
+            let pulled = map
+                .get(recording_ref)
+                .ok_or_else(|| anyhow::anyhow!("węzeł nie udostępnił tego nagrania do pobrania"))?;
             (pulled.path.clone(), pulled.kind.clone())
         }
         None => {

@@ -271,11 +271,22 @@ mod tests {
         let main = main_db();
         let anna = FlowActor::user("anna");
         for (run, at) in [("r-a", 100), ("r-b", 300), ("r-c", 200)] {
-            seed(&pool, &main, run, at, FlowOrigin::Chat, &anna, request_started());
+            seed(
+                &pool,
+                &main,
+                run,
+                at,
+                FlowOrigin::Chat,
+                &anna,
+                request_started(),
+            );
         }
 
         let page = browse(&pool, &EventFilter::default(), 10).unwrap();
-        assert_eq!(run_ids(&page), vec![("r-b", 300), ("r-c", 200), ("r-a", 100)]);
+        assert_eq!(
+            run_ids(&page),
+            vec![("r-b", 300), ("r-c", 200), ("r-a", 100)]
+        );
         assert!(
             page.next_cursor.is_none(),
             "a short page has seen the end of the result set"
@@ -292,16 +303,42 @@ mod tests {
         let main = main_db();
         let anna = FlowActor::user("anna");
         for (run, at) in [("r-1", 100), ("r-2", 200), ("r-3", 300), ("r-4", 400)] {
-            seed(&pool, &main, run, at, FlowOrigin::Chat, &anna, request_started());
+            seed(
+                &pool,
+                &main,
+                run,
+                at,
+                FlowOrigin::Chat,
+                &anna,
+                request_started(),
+            );
         }
 
         let first = browse(&pool, &EventFilter::default(), 2).unwrap();
         assert_eq!(run_ids(&first), vec![("r-4", 400), ("r-3", 300)]);
-        let cursor = first.next_cursor.expect("a full page yields a resume point");
+        let cursor = first
+            .next_cursor
+            .expect("a full page yields a resume point");
 
         // Two newer runs arrive while the reader is looking at page one.
-        seed(&pool, &main, "r-5", 500, FlowOrigin::Chat, &anna, request_started());
-        seed(&pool, &main, "r-6", 600, FlowOrigin::Chat, &anna, request_started());
+        seed(
+            &pool,
+            &main,
+            "r-5",
+            500,
+            FlowOrigin::Chat,
+            &anna,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-6",
+            600,
+            FlowOrigin::Chat,
+            &anna,
+            request_started(),
+        );
 
         let second = browse(
             &pool,
@@ -328,7 +365,15 @@ mod tests {
         let main = main_db();
         let anna = FlowActor::user("anna");
         for run in ["r-1", "r-2", "r-3", "r-4"] {
-            seed(&pool, &main, run, 777, FlowOrigin::Chat, &anna, request_started());
+            seed(
+                &pool,
+                &main,
+                run,
+                777,
+                FlowOrigin::Chat,
+                &anna,
+                request_started(),
+            );
         }
 
         let mut seen: Vec<String> = Vec::new();
@@ -364,9 +409,33 @@ mod tests {
         let (_dir, pool) = events_db();
         let main = main_db();
         let anna = FlowActor::user("anna");
-        seed(&pool, &main, "r-chat", 100, FlowOrigin::Chat, &anna, request_started());
-        seed(&pool, &main, "r-code", 200, FlowOrigin::CodeStudio, &anna, request_started());
-        seed(&pool, &main, "r-api", 300, FlowOrigin::Api, &anna, request_started());
+        seed(
+            &pool,
+            &main,
+            "r-chat",
+            100,
+            FlowOrigin::Chat,
+            &anna,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-code",
+            200,
+            FlowOrigin::CodeStudio,
+            &anna,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-api",
+            300,
+            FlowOrigin::Api,
+            &anna,
+            request_started(),
+        );
 
         let origins = [FlowOrigin::Chat, FlowOrigin::Api];
         let page = browse(
@@ -388,7 +457,15 @@ mod tests {
         let (_dir, pool) = events_db();
         let main = main_db();
         let anna = FlowActor::user("anna");
-        seed(&pool, &main, "r-chat", 100, FlowOrigin::Chat, &anna, request_started());
+        seed(
+            &pool,
+            &main,
+            "r-chat",
+            100,
+            FlowOrigin::Chat,
+            &anna,
+            request_started(),
+        );
 
         let page = browse(
             &pool,
@@ -417,10 +494,42 @@ mod tests {
         // A service key with no binding: nobody's run.
         let service = FlowActor::api_key("key-svc", None);
 
-        seed(&pool, &main, "r-anna", 100, FlowOrigin::Chat, &anna, request_started());
-        seed(&pool, &main, "r-marek", 200, FlowOrigin::Chat, &marek, request_started());
-        seed(&pool, &main, "r-anna-key", 300, FlowOrigin::Api, &anna_key, request_started());
-        seed(&pool, &main, "r-service", 400, FlowOrigin::Api, &service, request_started());
+        seed(
+            &pool,
+            &main,
+            "r-anna",
+            100,
+            FlowOrigin::Chat,
+            &anna,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-marek",
+            200,
+            FlowOrigin::Chat,
+            &marek,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-anna-key",
+            300,
+            FlowOrigin::Api,
+            &anna_key,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-service",
+            400,
+            FlowOrigin::Api,
+            &service,
+            request_started(),
+        );
 
         let page = browse(
             &pool,
@@ -444,8 +553,24 @@ mod tests {
         let main = main_db();
         let anna = FlowActor::user("anna");
         let anna_key = FlowActor::api_key("key-42", Some("anna".into()));
-        seed(&pool, &main, "r-anna", 100, FlowOrigin::Chat, &anna, request_started());
-        seed(&pool, &main, "r-key", 200, FlowOrigin::Api, &anna_key, request_started());
+        seed(
+            &pool,
+            &main,
+            "r-anna",
+            100,
+            FlowOrigin::Chat,
+            &anna,
+            request_started(),
+        );
+        seed(
+            &pool,
+            &main,
+            "r-key",
+            200,
+            FlowOrigin::Api,
+            &anna_key,
+            request_started(),
+        );
 
         let page = browse(
             &pool,
@@ -465,7 +590,15 @@ mod tests {
         let main = main_db();
         let anna = FlowActor::user("anna");
         for (run, at) in [("r-1", 100), ("r-2", 200), ("r-3", 300)] {
-            seed(&pool, &main, run, at, FlowOrigin::Chat, &anna, request_started());
+            seed(
+                &pool,
+                &main,
+                run,
+                at,
+                FlowOrigin::Chat,
+                &anna,
+                request_started(),
+            );
         }
 
         let page = browse(
@@ -539,7 +672,15 @@ mod tests {
         )
         .unwrap();
         // A camera trigger: no organisation was minted for it.
-        seed(&pool, &main, "r-none", 200, FlowOrigin::Camera, &FlowActor::system(), request_started());
+        seed(
+            &pool,
+            &main,
+            "r-none",
+            200,
+            FlowOrigin::Camera,
+            &FlowActor::system(),
+            request_started(),
+        );
 
         let page = browse(
             &pool,

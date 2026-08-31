@@ -280,7 +280,9 @@ impl MeshCommandExecutor {
                                 table_counts,
                             })
                         }
-                        Err(e) => CommandResponse::fail(format!("config bundle export failed: {e}")),
+                        Err(e) => {
+                            CommandResponse::fail(format!("config bundle export failed: {e}"))
+                        }
                     }
                 }
                 None => CommandResponse::fail("service action context not wired"),
@@ -621,9 +623,7 @@ impl MeshCommandExecutor {
                 self.handle_ml_train_start(run_id, spec_json).await
             }
             MeshCommandType::MlTrainStatus { run_id } => self.handle_ml_train_status(run_id).await,
-            MeshCommandType::MlTrainCancel { run_id } => {
-                self.handle_ml_train_cancel(run_id).await
-            }
+            MeshCommandType::MlTrainCancel { run_id } => self.handle_ml_train_cancel(run_id).await,
             MeshCommandType::MlDatasetChunk {
                 dataset_hash,
                 seq,
@@ -795,7 +795,10 @@ impl MeshCommandExecutor {
         let db = ctx.db.clone();
         let result = tokio::task::spawn_blocking(move || {
             let limit = filters.limit.clamp(1, 1000);
-            let camera_id = filters.camera_id.as_deref().filter(|s| !s.trim().is_empty());
+            let camera_id = filters
+                .camera_id
+                .as_deref()
+                .filter(|s| !s.trim().is_empty());
             // Wire timestamps are unix MILLISECONDS; the recordings table is SECONDS.
             let created_from = filters.date_from_ms.map(|ms| ms / 1000);
             let created_to = filters.date_to_ms.map(|ms| ms / 1000);
@@ -830,9 +833,11 @@ impl MeshCommandExecutor {
             })
             .collect();
         match serde_json::to_string(&items) {
-            Ok(recordings_json) => CommandResponse::ok(
-                MeshCommandResponsePayload::CameraRecordingsListResult { recordings_json },
-            ),
+            Ok(recordings_json) => {
+                CommandResponse::ok(MeshCommandResponsePayload::CameraRecordingsListResult {
+                    recordings_json,
+                })
+            }
             Err(e) => CommandResponse::fail(format!("serialize recordings list: {e}")),
         }
     }

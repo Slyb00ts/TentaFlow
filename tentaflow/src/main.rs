@@ -444,6 +444,32 @@ async fn run_server(args: Args) -> Result<()> {
         Err(e) => error!("Sync Ledger runtime init failed: {}", e),
     }
 
+    // TentaBus M1 (SUM/tentabus/PLAN.md §9 M1) — production single-node
+    // service layer singleton, wired the same way as `sync::runtime::init`
+    // above. `RbacBusAuthorizer` is the production `BusAuthorizer`
+    // (`services::bus_authorizer`) — real `bus.read`/`bus.write`/
+    // `bus.admin` (migration v147) + per-topic `resource_permissions` ACL.
+    // Retention sweep every 5 minutes is PLAN's own stated M1 default; a
+    // `None` here (as every unit test uses) would leave expired segments on
+    // disk forever on a real node.
+    match tentaflow_core::bus::init(tentaflow_core::bus::BusInitConfig {
+        bus_dir: paths::category_dir(paths::StorageCategory::Bus),
+        db: db.clone(),
+        authorizer: std::sync::Arc::new(
+            tentaflow_core::services::bus_authorizer::RbacBusAuthorizer::new(db.clone()),
+        ),
+        retention_interval: Some(std::time::Duration::from_secs(5 * 60)),
+        dedup_expected_rate_per_sec: 10_000,
+        // M2 (PLAN-M2 §1e, A9): LRU disabled — real startup keeps M1's
+        // unbounded partition-handle behavior until wave 2 (agent S) wires
+        // the eviction logic itself.
+        publish_ack_timeout: tentaflow_core::bus::DEFAULT_PUBLISH_ACK_TIMEOUT,
+        partition_handle_lru: None,
+    }) {
+        Ok(_) => info!("TentaBus initialized"),
+        Err(e) => error!("TentaBus init failed: {}", e),
+    }
+
     // Store peerow mesh — wspoldzielony miedzy mDNS discovery a dashboard API
     let mut mesh_peer_store = tentaflow_core::mesh::peer_store::MeshPeerStore::new();
     // PR2: parallel peer registry — receives shadow writes from every
@@ -790,6 +816,9 @@ async fn run_server(args: Args) -> Result<()> {
         Arc<parking_lot::RwLock<tentaflow_core::mesh::relay_health::RelayHealth>>,
     > = None;
     let local_node_id_for_server: Arc<str> = Arc::from(local_node_id_str.as_str());
+    let mut bus_replication_for_shutdown: Option<
+        Arc<tentaflow_core::bus::replication::manager::ReplicationManager>,
+    > = None;
     let _mesh_handles;
 
     if let Some(ref mesh_config) = config.mesh {
@@ -823,6 +852,30 @@ async fn run_server(args: Args) -> Result<()> {
                     // zwraca ten sam hex — nie ma potrzeby podmieniac peer_store entry.
                     if let Some(ref mesh_mgr) = handles.quic_mesh {
                         router.set_mesh_manager(mesh_mgr.clone());
+
+                        // TentaBus replication rides on the mesh (ALPN_BUS), so it
+                        // starts only once the mesh manager exists; without a
+                        // coordinator BusService keeps the single-node (RF=1) path.
+                        if let Some(bus_service) = tentaflow_core::bus::global() {
+                            let provider: Arc<dyn tentaflow_core::bus::replication::glue::PartitionProvider> =
+                                bus_service.clone();
+                            let repl_cfg = tentaflow_core::bus::replication::init::ReplicationInitConfig {
+                                db: db.clone(),
+                                mesh: mesh_mgr.clone(),
+                                local_node_id: local_node_id_str.clone(),
+                                local_env: tentaflow_core::services::environment::get_node_environment(&db),
+                                provider,
+                                lease_check_interval:
+                                    tentaflow_core::bus::replication::init::ReplicationInitConfig::DEFAULT_LEASE_CHECK_INTERVAL,
+                            };
+                            match tentaflow_core::bus::replication::init::init(repl_cfg).await {
+                                Ok(manager) => {
+                                    bus_replication_for_shutdown = Some(manager);
+                                    info!("TentaBus replication initialized");
+                                }
+                                Err(e) => tracing::error!("TentaBus replication init failed: {e}"),
+                            }
+                        }
 
                         // Ustaw forward handler — zdalny node uzywa routera do obslugi forwardowanych requestow
                         let router_for_forward = router.clone();
@@ -1143,6 +1196,21 @@ async fn run_server(args: Args) -> Result<()> {
         }
     }
     router.shutdown();
+
+    // Stop TentaBus's background retention-sweep thread (if `bus::init` was
+    // ever called with a `retention_interval`) and flush any pending
+    // windowed audit occurrences immediately rather than leaving them for
+    // whichever wakes first — the sweeper thread's own next tick or the
+    // process just exiting under it (follow-up toru P task 2). A no-op when
+    // TentaBus was never initialized (`bus::global()` is `None`).
+    // Replication streams stop before the sweeper so no follower observes a
+    // half-torn-down leader; a no-op when replication never started.
+    if let Some(manager) = bus_replication_for_shutdown.take() {
+        tentaflow_core::bus::replication::init::stop(&manager);
+    }
+    if let Some(bus_service) = tentaflow_core::bus::global() {
+        bus_service.stop_background_sweeper();
+    }
 
     // Stop every active camera session (drains the F1a CameraIngestSupervisor
     // singleton). GStreamer pipelines must terminate before the runtime

@@ -12,9 +12,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 /// One row in `legal_documents` projected onto the wire. Mirrors the columns
 /// the dashboard list view needs without exposing the on-disk PDF path —
 /// downloads always go through the signed-URL endpoint, never the listing.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentSummary {
     pub doc_id: String,
     pub org_id: String,
@@ -31,34 +29,26 @@ pub struct LegalDocumentSummary {
     pub revoked_at_ms: i64,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentsListRequest {
     /// When `true`, soft-deleted rows are included. Default `false` matches
     /// the default dashboard view.
     pub include_revoked: bool,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentsListResponse {
     pub documents: Vec<LegalDocumentSummary>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentGenerateRequest {
     /// Canonical lowercase variant string: `short` | `standard` | `full`.
     /// Validated against `services::legal::RodoVariant::from_str` server-side.
     pub variant: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentGenerateResponse {
     pub doc_id: String,
     /// 64 lowercase hex chars (blake3 hex of the on-disk PDF).
@@ -69,16 +59,12 @@ pub struct LegalDocumentGenerateResponse {
     pub signed_url: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentRevokeRequest {
     pub doc_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct LegalDocumentRevokeResponse {
     pub doc_id: String,
     pub revoked_at_ms: i64,
@@ -86,9 +72,7 @@ pub struct LegalDocumentRevokeResponse {
 
 /// Inner-enum pack — keeps every admin legal RPC in a single
 /// `MessageBody::LegalAdminBody` slot. Same shape as `CameraAdminPayload`.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum LegalAdminPayload {
     ListRequest(LegalDocumentsListRequest),
     ListResponse(LegalDocumentsListResponse),

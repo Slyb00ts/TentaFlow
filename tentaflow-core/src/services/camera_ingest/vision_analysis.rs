@@ -997,10 +997,7 @@ fn resolve_inflight_limit(inflight: Option<usize>, detector_sessions: usize) -> 
 /// YUV→RGB matrix so one `detect_batch_gpu` call applies a single conversion).
 /// Without the ort GPU features NV12 frames are never produced, so every frame
 /// keys as RGB.
-#[cfg(all(
-    feature = "vision-ort",
-    feature = "vision-cuda-preprocess"
-))]
+#[cfg(all(feature = "vision-ort", feature = "vision-cuda-preprocess"))]
 fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
     match fmt {
         super::fakefile::DetectFrameFormat::Rgb24 => None,
@@ -1009,10 +1006,7 @@ fn detect_batch_key(fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u3
         } => Some((kr.to_bits(), kb.to_bits(), *full_range as u32)),
     }
 }
-#[cfg(not(all(
-    feature = "vision-ort",
-    feature = "vision-cuda-preprocess"
-)))]
+#[cfg(not(all(feature = "vision-ort", feature = "vision-cuda-preprocess")))]
 fn detect_batch_key(_fmt: &super::fakefile::DetectFrameFormat) -> Option<(u32, u32, u32)> {
     None
 }
@@ -1768,24 +1762,15 @@ async fn engine_loop() {
         });
         // A homogeneous batch is device (zero-copy), NV12 (download preprocess) or
         // RGB (executor). Device jobs carry the sentinel key so they never mix.
-        #[cfg(all(
-            feature = "vision-ort",
-            feature = "vision-cuda-preprocess"
-        ))]
+        #[cfg(all(feature = "vision-ort", feature = "vision-cuda-preprocess"))]
         let batch_is_device = matches!(target_key, Some(Some(k)) if k == DEVICE_BATCH_KEY);
         #[allow(unused_variables)]
         let batch_is_nv12 = matches!(target_key, Some(Some(_))) && {
-            #[cfg(all(
-                feature = "vision-ort",
-                feature = "vision-cuda-preprocess"
-            ))]
+            #[cfg(all(feature = "vision-ort", feature = "vision-cuda-preprocess"))]
             {
                 !batch_is_device
             }
-            #[cfg(not(all(
-                feature = "vision-ort",
-                feature = "vision-cuda-preprocess"
-            )))]
+            #[cfg(not(all(feature = "vision-ort", feature = "vision-cuda-preprocess")))]
             {
                 true
             }
@@ -2196,10 +2181,9 @@ fn compute_zone_motion(
             let mut y = vec![0u8; n];
             for (i, px) in y.iter_mut().enumerate() {
                 let p = i * 3;
-                *px = ((77 * frame[p] as u32
-                    + 150 * frame[p + 1] as u32
-                    + 29 * frame[p + 2] as u32)
-                    >> 8) as u8;
+                *px =
+                    ((77 * frame[p] as u32 + 150 * frame[p + 1] as u32 + 29 * frame[p + 2] as u32)
+                        >> 8) as u8;
             }
             (std::borrow::Cow::Owned(y), w, 0)
         }
@@ -3680,9 +3664,14 @@ async fn cold_stage_forward(
                     if !missed.is_empty() {
                         let missed_items: Vec<_> =
                             missed.iter().map(|&i| items[i].clone()).collect();
-                        let fallback =
-                            cold_stage_per_crop(executor, model, op, ocr_mode.clone(), &missed_items)
-                                .await;
+                        let fallback = cold_stage_per_crop(
+                            executor,
+                            model,
+                            op,
+                            ocr_mode.clone(),
+                            &missed_items,
+                        )
+                        .await;
                         for (&i, value) in missed.iter().zip(fallback) {
                             outputs[i] = value;
                         }
@@ -4371,11 +4360,7 @@ mod tests {
         // A vehicle box detection self-assigns.
         stage_dets.push((
             "veh".to_string(),
-            vec![mk(
-                "vehicle",
-                [0.1, 0.1, 0.6, 0.6],
-                9,
-            )],
+            vec![mk("vehicle", [0.1, 0.1, 0.6, 0.6], 9)],
         ));
         stamp_vehicle_ids(&mut stage_dets, &vehicles);
         assert_eq!(stage_dets[0].1[0].vehicle_id, 9, "ADR sits on vehicle 9");

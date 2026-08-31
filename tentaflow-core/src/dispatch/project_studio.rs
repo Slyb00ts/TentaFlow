@@ -21,15 +21,15 @@ use tentaflow_protocol::project_studio::{
     ProjectInfo, ProjectSettings, ProjectStudioPayload, RunAssignmentWire, RunItemWire,
     RunStepWire, RunnerInfo, RunnerToolchain, ScheduleInfo, ScheduleRunWire, SourceFileInfo,
     SourceInfo, SuiteCaseRef, SuiteInfo, TagInfo, TaskCommentWire, TaskDetail, TaskInfo,
-    TestCaseDetail, TestCaseInfo, TestRunItemAutoWire, TestRunInfo, UserRefWire,
+    TestCaseDetail, TestCaseInfo, TestRunInfo, TestRunItemAutoWire, UserRefWire,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::HandlerContext;
 use crate::project_studio::models::{
     ActivityRecord, CaseListItem, EnvironmentRecord, GenerationRunRecord, IngestJobRecord,
-    ProjectRecord, ProjectRole, RunCounts, RunItemRecord, RunRecord, RunStepRecord,
-    SourceListItem, TaskCommentRecord, TaskRecord,
+    ProjectRecord, ProjectRole, RunCounts, RunItemRecord, RunRecord, RunStepRecord, SourceListItem,
+    TaskCommentRecord, TaskRecord,
 };
 use crate::project_studio::{
     activity, api_spec, archive, auto_runs, build_profiles, environments, generation, git_source,
@@ -619,7 +619,14 @@ pub async fn project_studio_dispatch(
             name,
             description,
             case_ids,
-        } => suite_save_v1(ctx, project_id, suite_id.as_deref(), name, description, case_ids),
+        } => suite_save_v1(
+            ctx,
+            project_id,
+            suite_id.as_deref(),
+            name,
+            description,
+            case_ids,
+        ),
         P::SuiteDeleteRequest {
             project_id,
             suite_id,
@@ -680,7 +687,15 @@ pub async fn project_studio_dispatch(
             status,
             note,
             attachments_json,
-        } => run_step_set_v1(ctx, project_id, item_id, *step_index, status, note, attachments_json),
+        } => run_step_set_v1(
+            ctx,
+            project_id,
+            item_id,
+            *step_index,
+            status,
+            note,
+            attachments_json,
+        ),
         P::RunItemFinishRequest {
             project_id,
             item_id,
@@ -710,7 +725,15 @@ pub async fn project_studio_dispatch(
             limit,
             severity,
         } => tasks_list_v1(
-            ctx, project_id, task_type, status, assigned_to, search, *offset, *limit, severity,
+            ctx,
+            project_id,
+            task_type,
+            status,
+            assigned_to,
+            search,
+            *offset,
+            *limit,
+            severity,
         ),
         P::TaskGetRequest {
             project_id,
@@ -782,7 +805,9 @@ pub async fn project_studio_dispatch(
             .await
         }
         P::GenerationsListRequest { project_id } => generations_list_v1(ctx, project_id),
-        P::GenerationGetRequest { project_id, gen_id } => generation_get_v1(ctx, project_id, gen_id),
+        P::GenerationGetRequest { project_id, gen_id } => {
+            generation_get_v1(ctx, project_id, gen_id)
+        }
         P::GenerationCancelRequest { project_id, gen_id } => {
             generation_cancel_v1(ctx, project_id, gen_id)
         }
@@ -812,7 +837,9 @@ pub async fn project_studio_dispatch(
             // Consumed by the F4 report kinds (perf_compare, tester_activity);
             // bound explicitly so a further field addition still fails to compile.
             run_ids,
-        } => report_query_v1(ctx, project_id, report, from_date, to_date, suite_id, run_ids),
+        } => report_query_v1(
+            ctx, project_id, report, from_date, to_date, suite_id, run_ids,
+        ),
         // ---- F3: environments, build profiles, automated runs, code sources ----
         P::EnvironmentsListRequest { project_id } => environments_list_v1(ctx, project_id),
         P::EnvironmentSaveRequest {
@@ -866,7 +893,14 @@ pub async fn project_studio_dispatch(
             test_cmd,
             workdir,
         } => build_profile_save_v1(
-            ctx, project_id, source_id, toolchain, base_image, install_cmd, test_cmd, workdir,
+            ctx,
+            project_id,
+            source_id,
+            toolchain,
+            base_image,
+            install_cmd,
+            test_cmd,
+            workdir,
         ),
         P::RunnersListRequest { project_id } => runners_list_v1(ctx, project_id).await,
         P::RunStartAutoRequest {
@@ -896,9 +930,7 @@ pub async fn project_studio_dispatch(
         P::RunAutoCancelRequest { project_id, run_id } => {
             run_auto_cancel_v1(ctx, project_id, run_id)
         }
-        P::TryRunCancelRequest { project_id, try_id } => {
-            try_run_cancel_v1(ctx, project_id, try_id)
-        }
+        P::TryRunCancelRequest { project_id, try_id } => try_run_cancel_v1(ctx, project_id, try_id),
         P::SourceRefreshRequest {
             project_id,
             source_id,
@@ -1047,27 +1079,14 @@ pub async fn project_studio_dispatch(
             seq,
             total_chunks,
             bytes,
-        } => project_import_upload_chunk_v1(
-            ctx,
-            upload_id,
-            filename,
-            *seq,
-            *total_chunks,
-            bytes,
-        ),
+        } => project_import_upload_chunk_v1(ctx, upload_id, filename, *seq, *total_chunks, bytes),
         P::ProjectImportPreviewRequest { upload_id } => project_import_preview_v1(ctx, upload_id),
         P::ProjectImportApplyRequest {
             upload_id,
             name_override,
             import_vectors,
             import_runs,
-        } => project_import_apply_v1(
-            ctx,
-            upload_id,
-            name_override,
-            *import_vectors,
-            *import_runs,
-        ),
+        } => project_import_apply_v1(ctx, upload_id, name_override, *import_vectors, *import_runs),
         P::ProjectImportStatusRequest { job_id } => project_import_status_v1(ctx, job_id),
         // F3/F4 stream-initiating requests are served by dedicated stream handlers.
         P::TryRunStartRequest { .. }
@@ -3141,7 +3160,8 @@ fn overview_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, Pr
     // forever — reconcile before reading the counters.
     auto_runs::reconcile_running(&pool);
     let kpis = repository::project_kpis(&pool).map_err(|e| db_error("kpis", e))?;
-    let f2 = repository::project_f2_kpis(&pool, &org.user_id).map_err(|e| db_error("kpis_f2", e))?;
+    let f2 =
+        repository::project_f2_kpis(&pool, &org.user_id).map_err(|e| db_error("kpis_f2", e))?;
     let f3 = repository::project_f3_kpis(&pool).map_err(|e| db_error("kpis_f3", e))?;
     let f4 = schedules::project_f4_kpis(&pool).map_err(|e| db_error("kpis_f4", e))?;
     let member_count =
@@ -3466,7 +3486,10 @@ fn settings_save_v1(
                     binding.function
                 )));
             }
-            if map.insert(binding.function.clone(), binding.agent_id).is_some() {
+            if map
+                .insert(binding.function.clone(), binding.agent_id)
+                .is_some()
+            {
                 return Err(ProtocolError::bad_request(format!(
                     "duplicate agent function '{}'",
                     binding.function
@@ -3645,7 +3668,12 @@ fn normalize_links(raw: &str) -> Result<String, ProtocolError> {
                 "unknown link kind '{kind}'"
             )));
         }
-        if entry.get("id").and_then(|i| i.as_str()).unwrap_or("").is_empty() {
+        if entry
+            .get("id")
+            .and_then(|i| i.as_str())
+            .unwrap_or("")
+            .is_empty()
+        {
             return Err(ProtocolError::bad_request("link entry requires 'id'"));
         }
     }
@@ -3781,8 +3809,7 @@ fn run_to_wire(
     suite_name: String,
     names: &HashMap<String, (String, String)>,
 ) -> TestRunInfo {
-    let (environment_name, runner_service_id, errored, perf_summary_json) =
-        extras.for_run(&record);
+    let (environment_name, runner_service_id, errored, perf_summary_json) = extras.for_run(&record);
     TestRunInfo {
         created_by_name: display_name(names, &record.created_by),
         run_id: record.run_id,
@@ -3914,10 +3941,7 @@ fn generation_to_wire(
 }
 
 fn cases_to_wire(items: Vec<CaseListItem>) -> Vec<TestCaseInfo> {
-    let ids: Vec<String> = items
-        .iter()
-        .map(|i| i.record.created_by.clone())
-        .collect();
+    let ids: Vec<String> = items.iter().map(|i| i.record.created_by.clone()).collect();
     let names = repository::resolve_user_refs(&ids);
     items
         .into_iter()
@@ -4021,7 +4045,9 @@ fn validate_case_fields(
     }
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 200 {
-        return Err(ProtocolError::bad_request("title must be 1..200 characters"));
+        return Err(ProtocolError::bad_request(
+            "title must be 1..200 characters",
+        ));
     }
     if !ps_tests::CASE_PRIORITIES.contains(&priority) {
         return Err(ProtocolError::bad_request(format!(
@@ -4224,7 +4250,9 @@ fn cases_bulk_status_v1(
         )));
     }
     if case_ids.is_empty() || case_ids.len() > 200 {
-        return Err(ProtocolError::bad_request("case_ids must contain 1..200 ids"));
+        return Err(ProtocolError::bad_request(
+            "case_ids must contain 1..200 ids",
+        ));
     }
     let pool = open_project_pool(project_id)?;
     let mut updated = 0u32;
@@ -4246,7 +4274,9 @@ fn cases_bulk_status_v1(
             &serde_json::json!({ "status": status, "count": updated }).to_string(),
         );
     }
-    Ok(ps(ProjectStudioPayload::CasesBulkStatusResponse { updated }))
+    Ok(ps(ProjectStudioPayload::CasesBulkStatusResponse {
+        updated,
+    }))
 }
 
 fn case_duplicate_v1(
@@ -4295,8 +4325,8 @@ fn case_delete_v1(
             "approved cases cannot be deleted — deprecate instead",
         ));
     }
-    let refs = ps_tests::case_run_item_refs(&pool, case_id)
-        .map_err(|e| db_error("case_refs", e))?;
+    let refs =
+        ps_tests::case_run_item_refs(&pool, case_id).map_err(|e| db_error("case_refs", e))?;
     if refs > 0 {
         return Err(ProtocolError::bad_request(
             "case is referenced by test runs — deprecate instead",
@@ -4377,8 +4407,7 @@ fn case_restore_version_v1(
                 "case.restored",
                 "case",
                 case_id,
-                &serde_json::json!({ "from_version": version, "version": new_version })
-                    .to_string(),
+                &serde_json::json!({ "from_version": version, "version": new_version }).to_string(),
             );
             Ok(ps(ProjectStudioPayload::CaseRestoreVersionResponse {
                 case_id: case_id.to_string(),
@@ -4386,9 +4415,9 @@ fn case_restore_version_v1(
             }))
         }
         ps_tests::CaseUpdateOutcome::Conflict => Err(conflict()),
-        ps_tests::CaseUpdateOutcome::NotFound => Err(ProtocolError::not_found(
-            "case or version not found",
-        )),
+        ps_tests::CaseUpdateOutcome::NotFound => {
+            Err(ProtocolError::not_found("case or version not found"))
+        }
         ps_tests::CaseUpdateOutcome::NotEditable => Err(ProtocolError::bad_request(
             "only draft/review cases are editable",
         )),
@@ -4415,13 +4444,17 @@ fn cases_import_csv_v1(
     // All-or-nothing: any invalid row (or a dry run) writes nothing.
     if dry_run || !errors.is_empty() {
         return Ok(ps(ProjectStudioPayload::CasesImportCsvResponse {
-            created: if errors.is_empty() { rows.len() as u32 } else { 0 },
+            created: if errors.is_empty() {
+                rows.len() as u32
+            } else {
+                0
+            },
             errors,
         }));
     }
     let pool = open_project_pool(project_id)?;
-    let created =
-        ps_tests::import_cases(&pool, &rows, &org.user_id).map_err(|e| db_error("csv_import", e))?;
+    let created = ps_tests::import_cases(&pool, &rows, &org.user_id)
+        .map_err(|e| db_error("csv_import", e))?;
     activity::record(
         &pool,
         &org.user_id,
@@ -4456,8 +4489,8 @@ fn attachment_get_v1(
     let blob = std::path::Path::new(&record.dir_path)
         .join("files")
         .join(sha256);
-    let bytes = std::fs::read(&blob)
-        .map_err(|_| ProtocolError::not_found("attachment not found"))?;
+    let bytes =
+        std::fs::read(&blob).map_err(|_| ProtocolError::not_found("attachment not found"))?;
     let truncated = bytes.len() > cap;
     let mut bytes = bytes;
     bytes.truncate(cap);
@@ -4483,8 +4516,7 @@ fn suite_item_to_wire(
     let last_run = match item.last_run {
         Some((record, counts)) => {
             let suite_name = item.record.name.clone();
-            let names =
-                repository::resolve_user_refs(std::slice::from_ref(&record.created_by));
+            let names = repository::resolve_user_refs(std::slice::from_ref(&record.created_by));
             Some(run_to_wire(extras, record, counts, suite_name, &names))
         }
         None => None,
@@ -4569,7 +4601,9 @@ fn suite_save_v1(
         return Err(ProtocolError::bad_request("suite name is required"));
     }
     if case_ids.len() > 500 {
-        return Err(ProtocolError::bad_request("a suite holds at most 500 cases"));
+        return Err(ProtocolError::bad_request(
+            "a suite holds at most 500 cases",
+        ));
     }
     let pool = open_project_pool(project_id)?;
     let suite_id = ps_tests::save_suite(
@@ -4651,7 +4685,10 @@ fn runs_list_v1(
     let runs_wire = rows
         .into_iter()
         .map(|(record, counts)| {
-            let suite_name = suite_names.get(&record.suite_id).cloned().unwrap_or_default();
+            let suite_name = suite_names
+                .get(&record.suite_id)
+                .cloned()
+                .unwrap_or_default();
             run_to_wire(&extras, record, counts, suite_name, &names)
         })
         .collect();
@@ -4857,7 +4894,10 @@ fn run_create_v1(
         &per_user,
     );
     let _ = repository::touch_project(project_id);
-    Ok(ps(ProjectStudioPayload::RunCreateResponse { run_id, run_no }))
+    Ok(ps(ProjectStudioPayload::RunCreateResponse {
+        run_id,
+        run_no,
+    }))
 }
 
 fn load_run_wire(
@@ -4867,7 +4907,10 @@ fn load_run_wire(
 ) -> Result<TestRunInfo, ProtocolError> {
     let suite_names = ps_tests::suite_names(pool, std::slice::from_ref(&record.suite_id))
         .map_err(|e| db_error("suite_names", e))?;
-    let suite_name = suite_names.get(&record.suite_id).cloned().unwrap_or_default();
+    let suite_name = suite_names
+        .get(&record.suite_id)
+        .cloned()
+        .unwrap_or_default();
     let names = repository::resolve_user_refs(std::slice::from_ref(&record.created_by));
     let extras = RunExtras::load(pool, std::slice::from_ref(&record.run_id));
     Ok(run_to_wire(&extras, record, counts, suite_name, &names))
@@ -4947,8 +4990,7 @@ fn run_close_v1(
                         "Przebieg testów zamknięty"
                     },
                     &format!("#{} „{}”", run.run_no, run.name),
-                    &serde_json::json!({ "project_id": project_id, "run_id": run_id })
-                        .to_string(),
+                    &serde_json::json!({ "project_id": project_id, "run_id": run_id }).to_string(),
                 );
             }
         }
@@ -5151,8 +5193,15 @@ fn run_step_set_v1(
     if item.status != "in_progress" {
         return Err(ProtocolError::bad_request("item is not in progress"));
     }
-    let ok = runs::set_step(&pool, item_id, step_index, status, note.trim(), &attachments_json)
-        .map_err(|e| db_error("step_set", e))?;
+    let ok = runs::set_step(
+        &pool,
+        item_id,
+        step_index,
+        status,
+        note.trim(),
+        &attachments_json,
+    )
+    .map_err(|e| db_error("step_set", e))?;
     if !ok {
         return Err(ProtocolError::not_found("step not found"));
     }
@@ -5232,8 +5281,7 @@ fn run_item_finish_v1(
         "run_item.finished",
         "run_item",
         item_id,
-        &serde_json::json!({ "status": final_status, "duration_secs": duration_secs })
-            .to_string(),
+        &serde_json::json!({ "status": final_status, "duration_secs": duration_secs }).to_string(),
     );
     let next_item = runs::next_claimable(&pool, &item.run_id, &org.user_id)
         .map_err(|e| db_error("next_claimable", e))?
@@ -5402,7 +5450,9 @@ fn task_save_v1(
     }
     let title = title.trim();
     if title.is_empty() || title.chars().count() > 200 {
-        return Err(ProtocolError::bad_request("title must be 1..200 characters"));
+        return Err(ProtocolError::bad_request(
+            "title must be 1..200 characters",
+        ));
     }
     if !tasks::TASK_PRIORITIES.contains(&priority) {
         return Err(ProtocolError::bad_request(format!(
@@ -5422,7 +5472,9 @@ fn task_save_v1(
             ));
         }
     } else if !severity.is_empty() {
-        return Err(ProtocolError::bad_request("severity applies only to defects"));
+        return Err(ProtocolError::bad_request(
+            "severity applies only to defects",
+        ));
     }
     if !assigned_to.is_empty()
         && repository::effective_role(project_id, assigned_to)
@@ -5450,8 +5502,8 @@ fn task_save_v1(
     let pool = open_project_pool(project_id)?;
     let (task_id, task_no, assignment_changed) = match task_id {
         None => {
-            let (id, no) =
-                tasks::create_task(&pool, &input, &org.user_id).map_err(|e| db_error("task_create", e))?;
+            let (id, no) = tasks::create_task(&pool, &input, &org.user_id)
+                .map_err(|e| db_error("task_create", e))?;
             activity::record(
                 &pool,
                 &org.user_id,
@@ -5504,7 +5556,10 @@ fn task_save_v1(
             &serde_json::json!({ "project_id": project_id, "task_id": task_id }).to_string(),
         );
     }
-    Ok(ps(ProjectStudioPayload::TaskSaveResponse { task_id, task_no }))
+    Ok(ps(ProjectStudioPayload::TaskSaveResponse {
+        task_id,
+        task_no,
+    }))
 }
 
 fn task_delete_v1(
@@ -5521,8 +5576,8 @@ fn task_delete_v1(
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
     // Manager anytime; the author only while nobody commented.
-    let allowed = role >= ProjectRole::Manager
-        || (task.created_by == org.user_id && task.comment_count == 0);
+    let allowed =
+        role >= ProjectRole::Manager || (task.created_by == org.user_id && task.comment_count == 0);
     if !allowed {
         return Err(ProtocolError::new(
             ProtocolErrorCode::PolicyDenied,
@@ -5555,14 +5610,16 @@ fn task_comment_add_v1(
     require_active(&record)?;
     let body = body_md.trim();
     if body.is_empty() || body.chars().count() > 8000 {
-        return Err(ProtocolError::bad_request("comment must be 1..8000 characters"));
+        return Err(ProtocolError::bad_request(
+            "comment must be 1..8000 characters",
+        ));
     }
     let pool = open_project_pool(project_id)?;
     tasks::get_task(&pool, task_id)
         .map_err(|e| db_error("task_get", e))?
         .ok_or_else(|| ProtocolError::not_found("task not found"))?;
-    let comment =
-        tasks::add_comment(&pool, task_id, &org.user_id, body).map_err(|e| db_error("comment_add", e))?;
+    let comment = tasks::add_comment(&pool, task_id, &org.user_id, body)
+        .map_err(|e| db_error("comment_add", e))?;
     activity::record(
         &pool,
         &org.user_id,
@@ -5589,7 +5646,9 @@ fn task_comment_edit_v1(
     require_active(&record)?;
     let body = body_md.trim();
     if body.is_empty() || body.chars().count() > 8000 {
-        return Err(ProtocolError::bad_request("comment must be 1..8000 characters"));
+        return Err(ProtocolError::bad_request(
+            "comment must be 1..8000 characters",
+        ));
     }
     let pool = open_project_pool(project_id)?;
     // Author-scoped UPDATE: another user's comment simply does not match.
@@ -5669,7 +5728,9 @@ async fn generation_start_v1(
         return Err(ProtocolError::bad_request("select at least one source"));
     }
     if instructions.chars().count() > generation::MAX_INSTRUCTIONS_CHARS {
-        return Err(ProtocolError::bad_request("instructions exceed 4000 characters"));
+        return Err(ProtocolError::bad_request(
+            "instructions exceed 4000 characters",
+        ));
     }
     let pool = open_project_pool(project_id)?;
     let mut source_meta: Vec<(String, String, String)> = Vec::with_capacity(source_ids.len());
@@ -5871,8 +5932,8 @@ fn generation_get_v1(
         .map_err(|e| db_error("generation_get", e))?
         .ok_or_else(|| ProtocolError::not_found("generation not found"))?;
     let names = repository::resolve_user_refs(std::slice::from_ref(&record.started_by));
-    let pending = generation::pending_cases(&pool, gen_id)
-        .map_err(|e| db_error("pending_cases", e))?;
+    let pending =
+        generation::pending_cases(&pool, gen_id).map_err(|e| db_error("pending_cases", e))?;
     Ok(ps(ProjectStudioPayload::GenerationGetResponse {
         run: generation_to_wire(record, &names),
         pending_cases: cases_to_wire(pending),
@@ -5919,7 +5980,9 @@ fn generation_cancel_v1(
         gen_id,
         "{}",
     );
-    Ok(ps(ProjectStudioPayload::GenerationCancelResult { ok: true }))
+    Ok(ps(ProjectStudioPayload::GenerationCancelResult {
+        ok: true,
+    }))
 }
 
 fn generation_review_v1(
@@ -5981,8 +6044,8 @@ fn generation_delete_v1(
             "only finished generations can be deleted",
         ));
     }
-    let ok =
-        generation::delete_generation(&pool, gen_id).map_err(|e| db_error("generation_delete", e))?;
+    let ok = generation::delete_generation(&pool, gen_id)
+        .map_err(|e| db_error("generation_delete", e))?;
     if ok {
         activity::record(
             &pool,
@@ -6245,7 +6308,11 @@ async fn code_source_create(
                 ProtocolError::bad_request("zip source requires one uploaded file_ref")
             })?;
             ingest::finalized_meta(&org.org_id, &org.user_id, &project_id, sha).ok_or_else(
-                || ProtocolError::bad_request(format!("unknown file_ref '{sha}' (upload expired?)")),
+                || {
+                    ProtocolError::bad_request(format!(
+                        "unknown file_ref '{sha}' (upload expired?)"
+                    ))
+                },
             )?;
             let archive = dir_path.join("files").join(sha);
             let project = project_id.clone();
@@ -6411,25 +6478,23 @@ async fn source_refresh_v1(
     let source_owned = source_id.to_string();
     let dir = std::path::PathBuf::from(&record.dir_path);
     let token_for_msg = token.clone();
-    let collected = tokio::task::spawn_blocking(
-        move || -> anyhow::Result<Vec<ingest::CollectedFile>> {
+    let collected =
+        tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<ingest::CollectedFile>> {
             let checkout = git_source::refresh(&project, &source_owned, &config, &token)?;
             ingest::collect_tree_files(&checkout.tree_root, &dir)
-        },
-    )
-    .await
-    .map_err(|_| ProtocolError::internal("git refresh task panicked"))?
-    .map_err(|e| {
-        ProtocolError::bad_request(format!(
-            "git refresh failed: {}",
-            git_source::scrub_token(&e.to_string(), &token_for_msg)
-        ))
-    })?;
+        })
+        .await
+        .map_err(|_| ProtocolError::internal("git refresh task panicked"))?
+        .map_err(|e| {
+            ProtocolError::bad_request(format!(
+                "git refresh failed: {}",
+                git_source::scrub_token(&e.to_string(), &token_for_msg)
+            ))
+        })?;
 
     let delta = ingest::diff_tree(&stored, &collected);
-    let (file_ids, removed_ids) =
-        repository::sync_tree_files(&pool, source_id, &collected, &delta)
-            .map_err(|e| db_error("sync_tree_files", e))?;
+    let (file_ids, removed_ids) = repository::sync_tree_files(&pool, source_id, &collected, &delta)
+        .map_err(|e| db_error("sync_tree_files", e))?;
     if !removed_ids.is_empty() {
         let core_db = ctx.state.db.clone();
         let org_id = org.org_id.clone();
@@ -6493,9 +6558,10 @@ fn api_spec_endpoints_v1(
     if source.kind != "api_spec" {
         return Err(ProtocolError::bad_request("source is not an API spec"));
     }
-    let endpoints_json = repository::get_setting(&pool, &api_spec::endpoints_setting_key(source_id))
-        .map_err(|e| db_error("api_spec_endpoints", e))?
-        .unwrap_or_else(|| "[]".to_string());
+    let endpoints_json =
+        repository::get_setting(&pool, &api_spec::endpoints_setting_key(source_id))
+            .map_err(|e| db_error("api_spec_endpoints", e))?
+            .unwrap_or_else(|| "[]".to_string());
     Ok(ps(ProjectStudioPayload::ApiSpecEndpointsResponse {
         endpoints_json,
     }))
@@ -6783,8 +6849,8 @@ fn environment_delete_v1(
 /// decides on LAN targets without opening every project.
 fn env_approvals_list_v1(ctx: &HandlerContext) -> Result<MessageBody, ProtocolError> {
     let org = require_admin(ctx)?;
-    let projects = repository::list_projects(&org.org_id, false)
-        .map_err(|e| db_error("projects_list", e))?;
+    let projects =
+        repository::list_projects(&org.org_id, false).map_err(|e| db_error("projects_list", e))?;
     let mut items = Vec::new();
     for project in projects {
         let Ok(pool) = project_db::open(&project.project_id) else {
@@ -6903,7 +6969,9 @@ fn build_profile_get_v1(
             workdir: p.workdir,
             proposed_by: p.proposed_by,
         });
-    Ok(ps(ProjectStudioPayload::BuildProfileGetResponse { profile }))
+    Ok(ps(ProjectStudioPayload::BuildProfileGetResponse {
+        profile,
+    }))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7157,7 +7225,10 @@ async fn run_start_auto_v1(
             "completed",
             "nothing to execute on this runner",
         );
-        return Ok(ps(ProjectStudioPayload::RunStartAutoResponse { run_id, run_no }));
+        return Ok(ps(ProjectStudioPayload::RunStartAutoResponse {
+            run_id,
+            run_no,
+        }));
     }
 
     recheck_environment_address(ctx, org, project_id, &environment, Some((&pool, &run_id))).await?;
@@ -7210,7 +7281,10 @@ async fn run_start_auto_v1(
         .to_string(),
     );
     let _ = repository::touch_project(project_id);
-    Ok(ps(ProjectStudioPayload::RunStartAutoResponse { run_id, run_no }))
+    Ok(ps(ProjectStudioPayload::RunStartAutoResponse {
+        run_id,
+        run_no,
+    }))
 }
 
 fn artifact_to_wire(record: &crate::project_studio::models::RunArtifactRecord) -> ArtifactRef {
@@ -7229,10 +7303,9 @@ fn auto_run_response(
     run: TestRunInfo,
     run_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
-    let items = auto_runs::list_auto_items(pool, run_id)
-        .map_err(|e| db_error("auto_items", e))?;
-    let artifacts = auto_runs::list_artifacts(pool, run_id)
-        .map_err(|e| db_error("run_artifacts", e))?;
+    let items = auto_runs::list_auto_items(pool, run_id).map_err(|e| db_error("auto_items", e))?;
+    let artifacts =
+        auto_runs::list_artifacts(pool, run_id).map_err(|e| db_error("run_artifacts", e))?;
     let mut by_item: HashMap<String, Vec<ArtifactRef>> = HashMap::new();
     for artifact in &artifacts {
         by_item
@@ -7260,8 +7333,7 @@ fn auto_run_response(
     let meta = auto_runs::get_meta(pool, run_id).map_err(|e| db_error("auto_run_meta", e))?;
     let (perf_stats, perf_timeline) = match meta {
         Some(meta) => (
-            serde_json::from_str::<Vec<PerfStatsWire>>(&meta.perf_summary_json)
-                .unwrap_or_default(),
+            serde_json::from_str::<Vec<PerfStatsWire>>(&meta.perf_summary_json).unwrap_or_default(),
             serde_json::from_str::<Vec<PerfTimelinePoint>>(&meta.perf_timeline_json)
                 .unwrap_or_default(),
         ),
@@ -7433,10 +7505,8 @@ fn schedule_to_wire(
     names: &HashMap<String, (String, String)>,
     now: chrono::DateTime<chrono::Utc>,
 ) -> ScheduleInfo {
-    let case_ids: Vec<String> =
-        serde_json::from_str(&record.case_ids_json).unwrap_or_default();
-    let assignees: Vec<String> =
-        serde_json::from_str(&record.assignees_json).unwrap_or_default();
+    let case_ids: Vec<String> = serde_json::from_str(&record.case_ids_json).unwrap_or_default();
+    let assignees: Vec<String> = serde_json::from_str(&record.assignees_json).unwrap_or_default();
     let (environment_name, environment_status) = environments
         .get(&record.environment_id)
         .cloned()
@@ -7505,10 +7575,7 @@ fn environment_index(pool: &crate::db::DbPool) -> HashMap<String, (String, Strin
         .collect()
 }
 
-fn schedules_list_v1(
-    ctx: &HandlerContext,
-    project_id: &str,
-) -> Result<MessageBody, ProtocolError> {
+fn schedules_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, _role) = require_project(org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
@@ -7621,13 +7688,9 @@ fn validate_schedule(
     schedules::parse_timezone(wire.timezone)
         .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     let now = chrono::Utc::now();
-    let next = schedules::compute_next_run(
-        wire.schedule_kind,
-        wire.schedule_expr,
-        wire.timezone,
-        now,
-    )
-    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let next =
+        schedules::compute_next_run(wire.schedule_kind, wire.schedule_expr, wire.timezone, now)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     if wire.schedule_kind == "once" && next.is_none() {
         return Err(ProtocolError::bad_request(
             "the one-shot instant is already in the past",
@@ -7947,10 +8010,7 @@ fn role_map_from_wire(entries: &[MlRoleMapEntry]) -> Vec<(String, String)> {
         .collect()
 }
 
-fn ml_links_list_v1(
-    ctx: &HandlerContext,
-    project_id: &str,
-) -> Result<MessageBody, ProtocolError> {
+fn ml_links_list_v1(ctx: &HandlerContext, project_id: &str) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let (_record, role) = require_project(org, project_id, ProjectRole::Viewer)?;
     let pool = open_project_pool(project_id)?;
@@ -8032,12 +8092,14 @@ fn ml_project_create_from_project_v1(
         })
         .to_string(),
     );
-    Ok(ps(ProjectStudioPayload::MlProjectCreateFromProjectResponse {
-        link_id,
-        ml_project_id,
-        members_mapped,
-        members_skipped,
-    }))
+    Ok(ps(
+        ProjectStudioPayload::MlProjectCreateFromProjectResponse {
+            link_id,
+            ml_project_id,
+            members_mapped,
+            members_skipped,
+        },
+    ))
 }
 
 fn ml_project_candidates_v1(
@@ -8177,8 +8239,8 @@ fn ml_link_detach_v1(
     let link = ml_link::get(&pool, link_id)
         .map_err(|e| db_error("ml_link_get", e))?
         .ok_or_else(|| ProtocolError::not_found("link not found"))?;
-    let members_removed = ml_link::detach(&pool, &link, revoke_members)
-        .map_err(|e| db_error("ml_link_detach", e))?;
+    let members_removed =
+        ml_link::detach(&pool, &link, revoke_members).map_err(|e| db_error("ml_link_detach", e))?;
     activity::record(
         &pool,
         &org.user_id,
@@ -8233,8 +8295,8 @@ fn ml_link_sync_now_v1(
 fn spawn_ml_permission_sync(project_id: &str) {
     let project = project_id.to_string();
     tokio::spawn(async move {
-        let _ = tokio::task::spawn_blocking(move || ml_link::sync_project_memberships(project))
-            .await;
+        let _ =
+            tokio::task::spawn_blocking(move || ml_link::sync_project_memberships(project)).await;
     });
 }
 
@@ -8291,7 +8353,6 @@ fn task_status_set_v1(
         updated_at,
     }))
 }
-
 
 // =============================================================================
 // F4: project export / import
@@ -8486,7 +8547,9 @@ fn project_export_start_v1(
             .to_string(),
         );
     }
-    Ok(ps(ProjectStudioPayload::ProjectExportStartResponse { job_id }))
+    Ok(ps(ProjectStudioPayload::ProjectExportStartResponse {
+        job_id,
+    }))
 }
 
 fn project_export_status_v1(
@@ -8750,7 +8813,9 @@ fn project_import_apply_v1(
         &job_id,
         upload_id,
     );
-    Ok(ps(ProjectStudioPayload::ProjectImportApplyResponse { job_id }))
+    Ok(ps(ProjectStudioPayload::ProjectImportApplyResponse {
+        job_id,
+    }))
 }
 
 fn project_import_status_v1(
@@ -8939,7 +9004,13 @@ mod tests {
     #[test]
     fn environment_wire_exposes_only_has_secret() {
         let pool = f3_pool();
-        seed_environment(&pool, "env-secret", "https://example.com/", false, "enc:CIPHERTEXT");
+        seed_environment(
+            &pool,
+            "env-secret",
+            "https://example.com/",
+            false,
+            "enc:CIPHERTEXT",
+        );
         seed_environment(&pool, "env-plain", "https://plain.example.com/", false, "");
 
         let wire = environments_to_wire(environments::list(&pool).expect("list"));
@@ -8974,7 +9045,9 @@ mod tests {
         assert_eq!(err.code, ProtocolErrorCode::BadRequest);
         assert!(err.message.contains("not approved"), "{}", err.message);
 
-        assert!(environments::decide(&pool, "env-lan", false, "brak zgody", "admin").expect("reject"));
+        assert!(
+            environments::decide(&pool, "env-lan", false, "brak zgody", "admin").expect("reject")
+        );
         let err = require_approved_environment(&pool, "env-lan").expect_err("rejected refused");
         assert!(err.message.contains("rejected"), "{}", err.message);
 
@@ -9246,7 +9319,10 @@ mod tests {
 
         schedule_delete_v1(&ctx, &project_id, &schedule_id).expect("delete");
         let (hint_next, enabled_count) = hint().expect("hint after delete");
-        assert!(hint_next.is_none(), "a deleted schedule leaves no due instant");
+        assert!(
+            hint_next.is_none(),
+            "a deleted schedule leaves no due instant"
+        );
         assert_eq!(enabled_count, 0);
 
         // A manual schedule must not bind an environment, and an automated one
@@ -9273,7 +9349,11 @@ mod tests {
             ProtocolErrorCode::BadRequest
         );
         // Firing-rule bounds are refused before anything is written.
-        for (kind, expr) in [("interval", "1m"), ("interval", "400d"), ("cron", "* * * * *")] {
+        for (kind, expr) in [
+            ("interval", "1m"),
+            ("interval", "400d"),
+            ("cron", "* * * * *"),
+        ] {
             let invalid = ScheduleWire {
                 schedule_kind: kind,
                 schedule_expr: expr,
@@ -9293,5 +9373,4 @@ mod tests {
         };
         assert!(schedule_save_v1(&ctx, &project_id, None, &bad_zone).is_err());
     }
-
 }

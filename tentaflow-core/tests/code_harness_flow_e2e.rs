@@ -658,7 +658,8 @@ fn stub_registry(pool: DbPool, recorder: Arc<Recorder>, agent_id: &str) -> Arc<A
                     "timed_out": false,
                 })),
             );
-            env.meta.insert("patch_review_status".into(), json!("empty"));
+            env.meta
+                .insert("patch_review_status".into(), json!("empty"));
             env.payload =
                 FlowValue::Text("review empty: 0 accepted, 0 rejected, 0 conflicted".into());
         }),
@@ -875,7 +876,11 @@ async fn forced_chain_spawns_all_three_even_when_nothing_changed() {
         ],
         "the forced chain must be the graph's doing: {visits:?}"
     );
-    assert_eq!(recorder.count("p1"), 1, "the turn is persisted exactly once");
+    assert_eq!(
+        recorder.count("p1"),
+        1,
+        "the turn is persisted exactly once"
+    );
 }
 
 // -----------------------------------------------------------------------------

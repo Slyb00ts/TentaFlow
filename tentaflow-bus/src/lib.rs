@@ -12,6 +12,8 @@
 pub mod batch;
 pub mod error;
 pub mod index;
+pub mod meta;
+pub mod metrics;
 pub mod partition;
 pub mod segment;
 
@@ -20,7 +22,11 @@ pub use batch::{
 };
 pub use error::{BusError, Result};
 pub use index::{OffsetEntry, OffsetIndex, TimeEntry, TimeIndex};
-pub use partition::{AppendResult, Durability, Partition, PartitionReader};
+pub use meta::PartitionMeta;
+pub use partition::{
+    AppendResult, Durability, HwTracking, Partition, PartitionReader, RawBatch, SealedSegmentInfo,
+    WeakPartition,
+};
 pub use segment::{RecoveredBatch, RollPolicy, Segment};
 
 /// Test-only scratch directory helper shared by every module's unit tests.

@@ -1127,8 +1127,7 @@ impl CoreToolName {
             },
             CoreToolName::TaskList => LlmToolSpec {
                 name: self.public_name().to_string(),
-                description: "The plan of this session and where each task stands."
-                    .to_string(),
+                description: "The plan of this session and where each task stands.".to_string(),
                 parameters: serde_json::json!({"type": "object", "properties": {}}),
             },
             CoreToolName::WorkspaceInfo => LlmToolSpec {

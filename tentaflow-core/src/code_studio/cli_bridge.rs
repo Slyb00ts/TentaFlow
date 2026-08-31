@@ -195,7 +195,9 @@ pub fn turn_state(event: &BridgeEvent) -> Option<TurnState> {
 /// STATUS says how it ended.
 fn codex_turn_state(method: &str, params: &Value) -> Option<TurnState> {
     let lowered = method.to_ascii_lowercase();
-    let mut segments = lowered.split(['/', '.', '_', '-']).filter(|s| !s.is_empty());
+    let mut segments = lowered
+        .split(['/', '.', '_', '-'])
+        .filter(|s| !s.is_empty());
     if !segments.clone().any(|segment| segment == "turn") {
         return None;
     }
@@ -368,7 +370,8 @@ impl ProviderReportedUsage {
             BridgeEvent::StreamObject { object, .. } => {
                 match object.get("type").and_then(Value::as_str) {
                     Some("assistant") => {
-                        if let Some((input, output)) = usage_tokens(object.pointer("/message/usage"))
+                        if let Some((input, output)) =
+                            usage_tokens(object.pointer("/message/usage"))
                         {
                             self.streamed_input = self.streamed_input.saturating_add(input);
                             self.streamed_output = self.streamed_output.saturating_add(output);
@@ -1563,7 +1566,10 @@ mod tests {
             2,
             "the timeline records ask and answer"
         );
-        assert!(gate.asked().is_empty(), "nobody is asked about a kind we cannot bound");
+        assert!(
+            gate.asked().is_empty(),
+            "nobody is asked about a kind we cannot bound"
+        );
         assert!(
             fixture.approvals().is_empty(),
             "a refusal nobody was asked about opens no approval card"
@@ -1592,7 +1598,10 @@ mod tests {
         .await;
         assert_eq!(outcome.decision, "denied");
         assert_eq!(outcome.capability, Some(Capability::Exec));
-        assert!(gate.asked().is_empty(), "a target out of bounds is not a question");
+        assert!(
+            gate.asked().is_empty(),
+            "a target out of bounds is not a question"
+        );
         assert!(fixture.approvals().is_empty());
     }
 
@@ -1662,7 +1671,11 @@ mod tests {
 
         assert_eq!(
             *gate.seen.lock().expect("seen"),
-            vec![("exec".to_string(), "cargo".to_string(), "pending".to_string())],
+            vec![(
+                "exec".to_string(),
+                "cargo".to_string(),
+                "pending".to_string()
+            )],
             "the operator was asked before the question existed anywhere they could see it"
         );
         // And the row is closed by the answer, with the target it was asked
@@ -1681,7 +1694,10 @@ mod tests {
         assert!(outcome.events.is_empty());
         assert_eq!(
             fixture.event_kinds(),
-            vec!["approval_requested".to_string(), "approval_decided".to_string()],
+            vec![
+                "approval_requested".to_string(),
+                "approval_decided".to_string()
+            ],
             "one question and one decision, each written once"
         );
     }
@@ -1734,7 +1750,10 @@ mod tests {
             method: method.to_string(),
             params: serde_json::json!({}),
         };
-        assert_eq!(turn_state(&note("turn/completed")), Some(TurnState::Completed));
+        assert_eq!(
+            turn_state(&note("turn/completed")),
+            Some(TurnState::Completed)
+        );
         assert_eq!(
             turn_state(&note("codex/turn.completed")),
             Some(TurnState::Completed)
@@ -2022,7 +2041,13 @@ mod tests {
             ..ctx()
         };
         let grants = |_: Capability, _: Option<&str>| session.clone();
-        let context = context(&fixture, ask, &grants, "gemini-cli", Path::new("/w/session-1"));
+        let context = context(
+            &fixture,
+            ask,
+            &grants,
+            "gemini-cli",
+            Path::new("/w/session-1"),
+        );
         let outcome = resolve_approval(
             &context,
             &ApprovalRequest {

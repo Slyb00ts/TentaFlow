@@ -255,8 +255,10 @@ mod tests {
     // Split so the source carries no literal a secret scanner would flag: the
     // fixture must LOOK like a GitLab PAT to exercise the guard, but a repo-wide
     // scan (GitHub push protection) rejects the assembled form on sight.
-    const GITLAB_PAT_REMOTE: &str =
-        concat!("https://glpat", "-Ab3xK9mQ7pL2vR5tW8yZ@example.invalid/repo.git");
+    const GITLAB_PAT_REMOTE: &str = concat!(
+        "https://glpat",
+        "-Ab3xK9mQ7pL2vR5tW8yZ@example.invalid/repo.git"
+    );
 
     #[test]
     fn adversarial_a_token_only_remote_url_passes_the_credential_guard() {
@@ -333,7 +335,12 @@ mod tests {
         ] {
             assert!(is_forbidden_host_literal(host), "name {host} passed");
         }
-        for host in ["github.com", "gitlab.example", "10.0.0.5", "metadata.example.com"] {
+        for host in [
+            "github.com",
+            "gitlab.example",
+            "10.0.0.5",
+            "metadata.example.com",
+        ] {
             assert!(
                 !is_forbidden_host_literal(host),
                 "ordinary host {host} was refused by the name list"

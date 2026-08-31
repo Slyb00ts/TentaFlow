@@ -587,6 +587,91 @@ pub fn acknowledged_outbox_count(operation_id: OperationId) -> LedgerResult<Opti
     runtime.acknowledged_outbox_count(operation_id).map(Some)
 }
 
+/// PLAN-M2 §1c (`SUM/tentabus/PLAN-M2.md`): the plan calls the ledger-level
+/// majority-observability primitive "already exists, nothing to build"
+/// (`OutboxEntry`/`list_outbox_for_operation`, `sync/ledger/
+/// fjall_store.rs:414-466,765-785`), but it sits behind this module's
+/// private `ledger` field with no public accessor besides the COUNT
+/// `acknowledged_outbox_count` above already exposes. `bus::replication::
+/// assignment::SqliteLedgerAssignmentStore::admitted_by` (wave 1, agent L)
+/// needs the actual target node ids, not just how many, so election logic
+/// can report WHO has acknowledged a proposed partition assignment — this
+/// sibling wrapper exposes exactly that, same `Option`-wraps-"no runtime"
+/// convention as every other function in this block.
+pub fn acknowledged_outbox_targets(operation_id: OperationId) -> LedgerResult<Option<Vec<String>>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    Ok(Some(
+        runtime
+            .ledger
+            .list_outbox_for_operation(operation_id)?
+            .into_iter()
+            .filter(|entry| entry.acknowledged)
+            .map(|entry| entry.target.as_str().to_string())
+            .collect(),
+    ))
+}
+
+/// Fetches one operation by id from the local ledger's content store.
+/// Used by `bus::replication::assignment`'s propose -> materialize
+/// round-trip test (wave 1, agent L) to hand `core_materializer::
+/// apply_core_operation` the exact `SyncOperation` `propose` just minted —
+/// the same way production code reaches it after a pull/push delivers it
+/// into the inbox, just without the network hop.
+pub fn get_operation(op_id: OperationId) -> LedgerResult<Option<SyncOperation>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    runtime.ledger.get_operation(op_id).map(Some)
+}
+
+/// Applies an operation this node ITSELF just minted through the local
+/// materializer, under the same admission gates a peer's copy of the same
+/// op goes through (HLC-LWW outer gate, resource-specific inner gates).
+///
+/// WHY THIS EXISTS (P8, M2-WYNIKI "promocja nie jest wyłączna", converge
+/// locally): a local capture is minted into the ledger and queued to the
+/// outbox for PEERS — nothing ever applies it to the LOCAL SQLite. For
+/// every resource whose writer writes its own row first (topics, flows,
+/// …) that is invisible: the local row already exists. The one exception
+/// is `core.bus_partition_assignment`, whose only writer IS the
+/// materializer (`SqliteLedgerAssignmentStore::propose`, K-M2-4): without
+/// a local apply, the authoring node's own `bus_partition_assignments`
+/// row stays missing/stale until a peer relays the op back. Measured
+/// consequence in the 3-process chaos run: the election winner proposed
+/// `(leader=b, epoch=2)`, a peer's simultaneous LOSER proposal
+/// `(leader=c, epoch=2)` materialized on b FIRST (admitted against the
+/// still-stored `(leader=a, epoch=1)` row), and b's own assignment poll
+/// then REGRESSED b's registry from its freshly-executed leadership to
+/// "follower of c" — b answered publishes `not the leader (leader is c)`
+/// for ~40 s while the ledger was already settled in its favor, until the
+/// dead peer's QUIC teardown incidentally let the sync relay catch up.
+/// Materializing the author's own op at mint time stamps the author's HLC
+/// watermark FIRST, so a same-epoch loser op arriving later is rejected by
+/// the admission gate on the author's node — the row converges
+/// deterministically at propose time, with zero dependence on mesh
+/// latency.
+///
+/// `Ok(None)` when no sync runtime is running (a proposal cannot exist in
+/// that world — `record_core_capture` already returned `None` — so this
+/// is a defensive no-op for symmetric call sites).
+/// `pool` is the caller's own `DbPool` — the same object the runtime was
+/// initialized with in production (`replication::init` hands one `db` to
+/// both), threaded through the caller so a test harness can point the
+/// apply at ITS pool while still using the runtime's ledger + cipher.
+pub fn apply_core_operation_locally(
+    op_id: OperationId,
+    pool: &crate::db::DbPool,
+) -> LedgerResult<Option<usize>> {
+    let Some(runtime) = SYNC_RUNTIME.get() else {
+        return Ok(None);
+    };
+    let operation = runtime.ledger.get_operation(op_id)?;
+    crate::sync::core_materializer::apply_core_operation(pool, &runtime.settings_cipher, &operation)
+        .map(Some)
+}
+
 /// Local node id of the running sync runtime, if started. Used by callers that
 /// must address the local node's own chain (e.g. building a pull for it).
 pub fn local_node_id() -> Option<String> {

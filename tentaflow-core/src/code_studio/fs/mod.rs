@@ -128,9 +128,7 @@ pub(crate) fn is_git_metadata(name: &str) -> bool {
 /// a name the other refuses.
 pub(crate) fn validate_component(name: &str) -> Result<(), String> {
     if name.len() > MAX_COMPONENT_CHARS {
-        return Err(format!(
-            "component longer than {MAX_COMPONENT_CHARS} bytes"
-        ));
+        return Err(format!("component longer than {MAX_COMPONENT_CHARS} bytes"));
     }
     if name.ends_with('.') || name.ends_with(' ') {
         return Err(format!(
@@ -619,7 +617,9 @@ struct UsageCell {
 fn usage_cell(workspace_id: &str) -> Arc<Mutex<UsageCell>> {
     static CELLS: OnceLock<Mutex<HashMap<String, Arc<Mutex<UsageCell>>>>> = OnceLock::new();
     let cells = CELLS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut guard = cells.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = cells
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     guard
         .entry(workspace_id.to_string())
         .or_insert_with(|| {
@@ -2103,7 +2103,11 @@ mod tests {
         // The broker already knows this: `git_broker::validate_repo_path` uses
         // `segment.eq_ignore_ascii_case(".git")`. The two guards disagree.
         for hostile in [
-            ".GIT", ".Git", ".gIt", ".GIT/config", ".Git/hooks/pre-commit",
+            ".GIT",
+            ".Git",
+            ".gIt",
+            ".GIT/config",
+            ".Git/hooks/pre-commit",
             "src/.GIT/config",
         ] {
             assert!(
@@ -2136,7 +2140,11 @@ mod tests {
         // `fs_delete` on the directory above it.
         let fx = Fixture::new();
         std::fs::create_dir_all(fx.path().join("vendor/lib/.git")).unwrap();
-        std::fs::write(fx.path().join("vendor/lib/.git/HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(
+            fx.path().join("vendor/lib/.git/HEAD"),
+            b"ref: refs/heads/main",
+        )
+        .unwrap();
         std::fs::write(fx.path().join("vendor/lib/src.rs"), b"fn main() {}").unwrap();
 
         let _ = fx.root.remove(&rel("vendor"), true, Precondition::Any);
@@ -2154,7 +2162,11 @@ mod tests {
         // stripped down to the metadata that had to survive.
         let fx = Fixture::new();
         std::fs::create_dir_all(fx.path().join("vendor/lib/.git")).unwrap();
-        std::fs::write(fx.path().join("vendor/lib/.git/HEAD"), b"ref: refs/heads/main").unwrap();
+        std::fs::write(
+            fx.path().join("vendor/lib/.git/HEAD"),
+            b"ref: refs/heads/main",
+        )
+        .unwrap();
         std::fs::write(fx.path().join("vendor/lib/src.rs"), b"fn main() {}").unwrap();
         std::fs::write(fx.path().join("vendor/notes.md"), b"# notes").unwrap();
 

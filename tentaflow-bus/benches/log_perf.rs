@@ -5,22 +5,22 @@
 // msg/s, MiB/s, p50/p95/p99 append latency. Only `Partition::append_batch`
 // — channel send, group-commit draining, offset patch, pwrite, index
 // append, fsync-per-policy — is timed; `build_batch`'s own cost (including
-// lz4 when it fires) is measured completely separately, see
-// `bench_build_batch_cost` (review P2-12/bullet f: it used to be built
-// before the clock started and never reported at all).
+// lz4 when it fires) is measured completely separately and reported on its
+// own, see `bench_build_batch_cost`, rather than being built before the
+// clock started and left out of every number in this file.
 //
-// Review P3-10: percentile/msg-per-second numbers come from
-// `support::measure_latencies`, which runs an explicit warm-up loop
-// (discarded) before the timed loop, instead of accumulating every call
-// Criterion's own `iter_custom` warm-up phase makes into the same `Vec` the
-// final report reads from. Criterion's own `bench_with_input` call still
-// runs alongside it (for the HTML report), driven by a throwaway swallow
-// closure that never touches that Vec.
+// Percentile/msg-per-second numbers come from `support::measure_latencies`,
+// which runs an explicit warm-up loop (discarded) before the timed loop,
+// instead of accumulating every call Criterion's own `iter_custom` warm-up
+// phase makes into the same `Vec` the final report reads from. Criterion's
+// own `bench_with_input` call still runs alongside it (for the HTML
+// report), driven by a throwaway swallow closure that never touches that
+// Vec.
 //
 // Run only once the machine is otherwise idle (criterion numbers under
 // contention are meaningless per repo policy) — except `bench_multi_producer`,
-// which is contention *by design* (review decision #5 / bullet d): it is
-// the one number in this file group commit is supposed to move.
+// which is contention *by design*: it is the one number in this file group
+// commit is supposed to move.
 
 use std::sync::Arc;
 use std::thread;
@@ -69,10 +69,10 @@ fn report(label: &str, r: &LatencyReport, on_wire_bytes_per_batch: u64, records_
     // Binary MiB/s (bytes / 2^20) of the actual on-wire bytes written per
     // batch (header + stored, possibly-compressed body) — matching
     // `device_ceiling.rs`'s definition of "bytes written" exactly, so the
-    // "% of device ceiling" ratio compares like with like (review P3-11:
-    // the previous version used *payload* bytes here against *written*
-    // bytes in device_ceiling, silently including header/compression
-    // overhead in the engine number only).
+    // "% of device ceiling" ratio compares like with like — payload bytes
+    // alone would compare against *written* bytes in device_ceiling,
+    // silently including header/compression overhead in the engine number
+    // only.
     let mib_s = batches_s * on_wire_bytes_per_batch as f64 / (1024.0 * 1024.0);
     eprintln!(
         "[log_perf] {label:<80} n={:<6} msg/s={msg_s:>10.0} MiB/s={mib_s:>9.2} p50={:>8.2?} p95={:>8.2?} p99={:>8.2?}",
@@ -115,7 +115,7 @@ fn bench_append_matrix(c: &mut Criterion) {
 
                 // The exact on-wire size of one built batch — used both to
                 // drive our custom measurement loop and to report bytes
-                // consistently with device_ceiling.rs (review P3-11).
+                // consistently with device_ceiling.rs.
                 let probe = build_batch(records_per_batch, record_size, 1, None);
                 let on_wire_bytes_per_batch = probe.len() as u64;
 
@@ -139,7 +139,9 @@ fn bench_append_matrix(c: &mut Criterion) {
 
                 // Criterion's own HTML-report timing, independent of the
                 // custom percentiles above — its internal warm-up/sample
-                // mixing is fine here, this is not what P3-10 objects to.
+                // mixing only affects this report, never the percentiles
+                // `support::measure_latencies` computed and printed just
+                // above.
                 group.throughput(Throughput::Bytes(on_wire_bytes_per_batch));
                 let mut criterion_seed = 900_000u64;
                 group.bench_with_input(BenchmarkId::from_parameter(&label), &label, |b, _| {
@@ -167,16 +169,14 @@ fn bench_append_matrix(c: &mut Criterion) {
     group.finish();
 }
 
-/// Review decision #5 / bullet (d), extended per coordinator follow-up
-/// (26.08.2026): a single-threaded harness cannot show group commit's
-/// effect at all — one producer never has anything to share a group/fsync
-/// with. This spins up `N` producer threads hammering the *same* partition
-/// concurrently and reports aggregate msg/s/MiB/s *and* per-append
-/// p50/p99 (measured per producer thread, merged), for both the original
-/// ~64 KiB batch size and — the point of the follow-up — PLAN §5.2 P1's
-/// actual 1 MiB batch size, at 1/2/4/8 concurrent producers. This is what
-/// resolves whether P1's absolute 300k msg/s target is reachable under
-/// realistic concurrency even though the single-producer number
+/// A single-threaded harness cannot show group commit's effect at all — one
+/// producer never has anything to share a group/fsync with. This spins up
+/// `N` producer threads hammering the *same* partition concurrently and
+/// reports aggregate msg/s/MiB/s *and* per-append p50/p99 (measured per
+/// producer thread, merged), for both a ~64 KiB batch size and PLAN §5.2
+/// P1's actual 1 MiB batch size, at 1/2/4/8 concurrent producers. This is
+/// what resolves whether P1's absolute 300k msg/s target is reachable
+/// under realistic concurrency even though the single-producer number
 /// (`bench_append_matrix`) falls short of it.
 ///
 /// No Criterion `bench_with_input`/`iter_custom` registration here (unlike
@@ -284,12 +284,11 @@ fn bench_multi_producer(_c: &mut Criterion) {
     }
 }
 
-/// Review P2-12/bullet (f): `BatchBuilder::build()`'s own cost — including
-/// lz4 `safe-encode` when it fires — reported on its own, separate from
-/// append latency. `log_perf.rs` previously built the batch *before*
-/// starting the clock on `append_batch`, which hid this cost from every
-/// number in the M0 report even though, at ~1 MiB, it is comparable to a
-/// single fsync (review "Ocena bramki" item 6).
+/// `BatchBuilder::build()`'s own cost — including lz4 `safe-encode` when
+/// it fires — reported on its own, separate from append latency. Building
+/// the batch *before* starting the clock on `append_batch` (as the other
+/// benches in this file do) would hide this cost, even though, at ~1 MiB,
+/// it is comparable to a single fsync.
 fn bench_build_batch_cost(c: &mut Criterion) {
     const RECORD_SIZE: usize = 1024;
     const RECORDS_PER_BATCH: usize = 1024; // ~1 MiB batch, compressible payload below
@@ -309,9 +308,9 @@ fn bench_build_batch_cost(c: &mut Criterion) {
         // Each record gets its *own* payload (fresh random bytes, or the
         // same repeated byte for the intentionally-repetitive variant) —
         // reusing one buffer across every record in the batch would make
-        // even the "random" case accidentally compressible (the same
-        // review P3-11/P2-12 byte-accounting-fidelity issue found in
-        // `build_batch` above).
+        // even the "random" case accidentally compressible, the same
+        // byte-accounting-fidelity concern `build_batch` above guards
+        // against.
         let make_payload = |seed: &mut u64| -> Vec<u8> {
             if seed_kind == u64::MAX {
                 vec![0x42u8; RECORD_SIZE]

@@ -896,10 +896,7 @@ mod tests {
             Capability::SecretManage,
         ] {
             assert!(
-                matches!(
-                    authorize(&c, cap, &on_branch),
-                    Decision::AskUser { .. }
-                ),
+                matches!(authorize(&c, cap, &on_branch), Decision::AskUser { .. }),
                 "{} stopped asking",
                 cap.slug()
             );

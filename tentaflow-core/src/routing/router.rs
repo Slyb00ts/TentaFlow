@@ -261,9 +261,11 @@ impl Router {
                     if let Err(e) = std::fs::create_dir_all(&root) {
                         tracing::warn!("FileBlobStore init {}: {e}", root.display());
                     }
-                    Arc::new(crate::flow_engine::blob_store::FileBlobStore::with_settings_root(
-                        db_clone.as_ref().cloned(),
-                    ))
+                    Arc::new(
+                        crate::flow_engine::blob_store::FileBlobStore::with_settings_root(
+                            db_clone.as_ref().cloned(),
+                        ),
+                    )
                 }
             };
         let flow_dispatcher = db.map(|pool| {

@@ -5,19 +5,19 @@
 // is the denominator every append-throughput number in the M0 report is
 // expressed against as "% of device ceiling" (PLAN §5.2).
 //
-// Review P1-4 / "Ocena bramki": the original version only measured a
-// *growing* file (`write_all` extending it on every chunk), which is
-// exactly the inefficiency `Segment::create_new` also used to pay before
-// this review round added preallocation — so "silnik / pułap" landed near
-// 100% by both numerator and denominator hiding the *same* cost, not by the
-// engine being efficient. This version adds a `preallocated` variant
+// A file that grows on every write (`write_all` extending it chunk by
+// chunk) pays the same journal/metadata-update cost `Segment::create_new`'s
+// preallocation exists to avoid — measuring the ceiling against a growing
+// file would make "engine / ceiling" land near 100% because numerator and
+// denominator hide the *same* cost, not because the engine is efficient.
+// This bench therefore measures a `preallocated` variant
 // (`F_PREALLOCATE`/`fallocate`, writes into the *middle* of the file at a
-// fixed offset so the file never grows during the timed loop at all) next
-// to the original `growing` variant, so the gap between the two — not
-// either number alone — is what "physics of the disk" actually means here.
-// It also adds an `F_FULLFSYNC` variant on macOS (PLAN §5.3.6) alongside
-// the existing `fsync_data`/`sync_data` one, since `sync_data()` alone is
-// not a durability barrier on Apple platforms (review P1-4 item 4).
+// fixed offset so the file never grows during the timed loop at all)
+// alongside a `growing` variant, so the gap between the two — not either
+// number alone — is what "physics of the disk" actually means here. It
+// also measures an `F_FULLFSYNC` variant on macOS (PLAN §5.3.6) alongside
+// the `fsync_data`/`sync_data` one, since `sync_data()` alone is not a
+// durability barrier on Apple platforms.
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
@@ -140,9 +140,9 @@ fn bench_device_ceiling(c: &mut Criterion) {
         let chunk = pseudo_random_bytes(chunk_size, chunk_size as u64);
 
         for &(durability_name, durability) in &durabilities {
-            // --- growing variant: file extends on every write, exactly the
-            // pre-review behavior and exactly what Segment::append used to
-            // do before preallocation was added. ---
+            // --- growing variant: file extends on every write, exactly
+            // what `Segment::append` used to do before preallocation was
+            // added. ---
             {
                 let label =
                     format!("chunk={chunk_size}B/durability={durability_name}/layout=growing");
@@ -173,8 +173,7 @@ fn bench_device_ceiling(c: &mut Criterion) {
             // --- preallocated variant: F_PREALLOCATE/fallocate up front,
             // then every write in the timed loop lands at the *same* fixed
             // offset (never extends the file) — isolates pure write+fsync
-            // cost from the metadata/journal cost of growing a file
-            // (review P1-4 item 3 / "Ocena bramki" §3). ---
+            // cost from the metadata/journal cost of growing a file. ---
             if chunk_size as u64 <= PREALLOC_TOTAL - MIDDLE_OFFSET {
                 let label =
                     format!("chunk={chunk_size}B/durability={durability_name}/layout=preallocated");

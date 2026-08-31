@@ -52,10 +52,7 @@ impl CvBundle {
     /// `cfg!(...)` is a plain runtime bool, so one const array serves both builds.
     fn effective_files(&self) -> Vec<&'static CvFile> {
         let ort = cfg!(feature = "vision-ort");
-        self.files
-            .iter()
-            .filter(|f| ort || !f.ort_only)
-            .collect()
+        self.files.iter().filter(|f| ort || !f.ort_only).collect()
     }
 }
 
@@ -406,7 +403,11 @@ const ALLOW_INVALID_TLS_SETTING: &str = "vision_bundle_allow_invalid_tls";
 /// Read a boolean global setting (accepts `1`/`true`/`yes`), default false.
 fn bundle_bool_setting(key: &str) -> bool {
     crate::db::global_pool()
-        .and_then(|pool| crate::db::repository::get_setting(&pool, key).ok().flatten())
+        .and_then(|pool| {
+            crate::db::repository::get_setting(&pool, key)
+                .ok()
+                .flatten()
+        })
         .map(|v| {
             let v = v.trim().to_ascii_lowercase();
             v == "1" || v == "true" || v == "yes"

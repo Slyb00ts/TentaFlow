@@ -1034,11 +1034,7 @@ pub fn accepted_commit_spec(
 /// another person's decision about another branch — and to the scope, because
 /// unlocking a merge finalize with a work acceptance publishes a tree nobody
 /// reviewed onto the target branch.
-pub fn has_accepted_patch_set(
-    pool: &DbPool,
-    session_id: &str,
-    scope: &PatchScope,
-) -> Result<bool> {
+pub fn has_accepted_patch_set(pool: &DbPool, session_id: &str, scope: &PatchScope) -> Result<bool> {
     let conn = pool.read().map_err(|e| anyhow!("workspace db read: {e}"))?;
     let count: i64 = conn.query_row(
         "SELECT COUNT(*) FROM patch_sets \
@@ -1571,7 +1567,10 @@ mod tests {
         let merge = PatchScope::Merge {
             op_id: "op-1".into(),
         };
-        assert_eq!(load_patch_set(&fx.pool, &set.id).unwrap().scope, PatchScope::Work);
+        assert_eq!(
+            load_patch_set(&fx.pool, &set.id).unwrap().scope,
+            PatchScope::Work
+        );
         assert!(has_accepted_patch_set(&fx.pool, "s-1", &PatchScope::Work).unwrap());
         assert_eq!(
             accepted_patch_set_for_scope(&fx.pool, "s-1", &PatchScope::Work)
@@ -2405,7 +2404,10 @@ mod tests {
         fx.write("new.txt", "fresh\n");
 
         // Without the rescan this is what the review still sees.
-        assert!(load_patch_set(&fx.pool, &opened.id).unwrap().files.is_empty());
+        assert!(load_patch_set(&fx.pool, &opened.id)
+            .unwrap()
+            .files
+            .is_empty());
 
         let refreshed = rescan_patch_set(&fx.pool, &fx.broker, &opened.id).unwrap();
         assert_eq!(refreshed.id, opened.id, "the set keeps its identity");

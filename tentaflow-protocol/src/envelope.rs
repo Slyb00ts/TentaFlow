@@ -209,7 +209,12 @@ mod serde_array64 {
 // existing `epoch`, same append-only pattern — a stale peer's operations
 // decode as `Prod` and get fenced by `EnvironmentMismatch` like any other
 // cross-environment operation, never silently accepted.
-pub const SCHEMA_VERSION: u16 = 26;
+//
+// v27: added `MessageBody::BusBody(crate::bus::BusPayload)` (TentaBus M1,
+// SUM/tentabus/PLAN.md §6.2 — topics, consumer groups, DLQ, ACL, quotas,
+// message preview, stats snapshot). Appended at the enum's end, same
+// wire-safety reasoning as v25/v26.
+pub const SCHEMA_VERSION: u16 = 27;
 
 // =============================================================================
 // Message kind discriminants
@@ -605,7 +610,10 @@ mod tests {
         // meaningful corrupted-tail case.)
         bytes.pop();
         let result = crate::cbor::decode::<Envelope>(&bytes);
-        assert!(result.is_err(), "truncated tail must fail structural decode");
+        assert!(
+            result.is_err(),
+            "truncated tail must fail structural decode"
+        );
     }
 
     #[test]

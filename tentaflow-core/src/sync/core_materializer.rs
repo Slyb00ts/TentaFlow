@@ -57,6 +57,16 @@ fn is_lww_tracked(kind: CoreSyncResourceKind) -> bool {
             | CoreSyncResourceKind::CodeWorkspaceCreatorGrant
             | CoreSyncResourceKind::CodeWorkspaceProjectLink
             | CoreSyncResourceKind::CodeWorkspaceAllowlist
+            // M2 (PLAN-M2 §1c): both bus resources are concurrently edited
+            // (a topic's config from any node; a partition's assignment on
+            // every leader/replica-set change), so both need the same
+            // HLC-LWW gate every other multi-writer resource above uses.
+            // `BusPartitionAssignment` gets an ADDITIONAL epoch/node_id gate
+            // ON TOP of this one — see `apply_bus_partition_assignment`'s
+            // doc; HLC-LWW alone is not enough to prevent two same-epoch
+            // leaders from clobbering each other (K-M2-2/K-M2-3).
+            | CoreSyncResourceKind::BusTopic
+            | CoreSyncResourceKind::BusPartitionAssignment
     )
 }
 
@@ -166,6 +176,10 @@ pub fn apply_core_operation(
         }
         CoreSyncResourceKind::CodeWorkspaceAllowlist => {
             apply_code_workspace_allowlist(&tx, operation)?
+        }
+        CoreSyncResourceKind::BusTopic => apply_bus_topic(&tx, operation)?,
+        CoreSyncResourceKind::BusPartitionAssignment => {
+            apply_bus_partition_assignment(&tx, operation)?
         }
     };
 
@@ -2623,6 +2637,242 @@ fn apply_code_workspace_allowlist(
     }
 }
 
+/// Materializes a replicated `core.bus_topic` op into `bus_topics`
+/// (migration v146; M2 makes this table ledger-tracked, K-M2-4). Payload
+/// shape: unlike every `apply_*` function above (one `FieldValue` per
+/// column), the WHOLE row travels as a single JSON-encoded field,
+/// `changed_fields["row_json"]` — the serialized `DbBusTopic`
+/// (`db/repository.rs`, which derives `Serialize`/`Deserialize`
+/// specifically for this). Chosen deliberately for this resource:
+/// `DbBusTopic` has 23 columns, every write replaces the row wholesale (no
+/// per-field partial-update semantics to preserve), and the capture side
+/// (`bus::mod::create_topic`/`update_topic`, wave 2 agent S) already has a
+/// complete `DbBusTopic` in hand before writing it locally — re-flattening
+/// it into 23 individual `FieldValue`s would be pure busywork with no
+/// correctness benefit this resource actually needs. The producer is
+/// `db::repository::publish_bus_topic_capture`, called by every local
+/// `bus_topics` writer (create, update — including the startup legacy-DLQ
+/// durability sweep — delete, and the `__dlq.*` auto-create).
+fn apply_bus_topic(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let row_json = field_string(operation, "row_json")?;
+    let row: crate::db::repository::DbBusTopic = serde_json::from_str(&row_json)
+        .map_err(|e| SyncLedgerError::Runtime(format!("invalid bus_topic payload: {e}")))?;
+    // Defensive: the op's own resource_id must match the composite key
+    // embedded in the payload (mirrors `apply_resource_permission`'s
+    // `expected_id` check) so a malformed/mismatched payload cannot land
+    // under a DIFFERENT topic's ledger slot than the one it claims to be.
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[&row.org_id, &row.name]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "bus_topic composite id mismatch: body={}, payload={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+    // Z12 needs no check here, and adding one would be dead code: an op whose
+    // `body.environment` is not this node's is rejected at LEDGER ADMISSION,
+    // before any materializer runs (`sync/ledger/fjall_store.rs`'s two
+    // `operation.body.environment != local_environment` gates, pinned by
+    // `inbox_rejects_operation_from_other_environment`). That fence is
+    // generic — it covers `core.bus_topic` exactly as it covers every other
+    // core resource — so the row this function writes is always an
+    // same-environment row, and `row.environment` is the environment being
+    // recorded rather than a second thing to verify against.
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => tx
+            .execute(
+                "INSERT INTO bus_topics \
+                 (org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                  delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                  retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                  acks, durability, max_inline_bytes, compression, environment, created_at_ms, \
+                  updated_at_ms, durability_class) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14,?15,?16,?17,?18,?19,?20,?21,?22,?23) \
+                 ON CONFLICT(org_id, name) DO UPDATE SET \
+                 partitions = excluded.partitions, retention_ms = excluded.retention_ms, \
+                 retention_bytes = excluded.retention_bytes, cleanup_policy = excluded.cleanup_policy, \
+                 delivery = excluded.delivery, idempotency_key = excluded.idempotency_key, \
+                 dedup_window_ms = excluded.dedup_window_ms, \
+                 max_delivery_attempts = excluded.max_delivery_attempts, \
+                 retry_backoff_ms = excluded.retry_backoff_ms, schema_id = excluded.schema_id, \
+                 validation = excluded.validation, content_type = excluded.content_type, \
+                 replication_factor = excluded.replication_factor, acks = excluded.acks, \
+                 durability = excluded.durability, max_inline_bytes = excluded.max_inline_bytes, \
+                 compression = excluded.compression, environment = excluded.environment, \
+                 updated_at_ms = excluded.updated_at_ms, durability_class = excluded.durability_class",
+                rusqlite::params![
+                    row.org_id,
+                    row.name,
+                    row.partitions,
+                    row.retention_ms,
+                    row.retention_bytes,
+                    row.cleanup_policy,
+                    row.delivery,
+                    row.idempotency_key,
+                    row.dedup_window_ms,
+                    row.max_delivery_attempts,
+                    row.retry_backoff_ms,
+                    row.schema_id,
+                    row.validation,
+                    row.content_type,
+                    row.replication_factor,
+                    row.acks,
+                    row.durability,
+                    row.max_inline_bytes,
+                    row.compression,
+                    row.environment,
+                    row.created_at_ms,
+                    row.updated_at_ms,
+                    row.durability_class,
+                ],
+            )
+            .map_err(sql_error),
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM bus_topics WHERE org_id = ?1 AND name = ?2",
+                rusqlite::params![row.org_id, row.name],
+            )
+            .map_err(sql_error),
+    }
+}
+
+/// Materializes a replicated `core.bus_partition_assignment` op into
+/// `bus_partition_assignments` (migration v149). Payload shape mirrors
+/// `apply_bus_topic`: the whole `PartitionAssignment` (the ledger's own
+/// domain type, `bus::replication::assignment`) travels as ONE JSON field,
+/// `changed_fields["assignment_json"]`.
+///
+/// K-M2-2/K-M2-3/K-M2-4 (`SUM/tentabus/PLAN-M2.md` §0, §1c): on top of the
+/// OUTER HLC-LWW gate (`is_lww_tracked`, `apply_core_operation`), this
+/// resource needs a SECOND, epoch-based gate — HLC alone would let a stale
+/// ex-leader's op (minted at an OLDER epoch but observed with a NEWER
+/// wall-clock HLC, e.g. through clock skew) clobber a legitimately
+/// promoted leader's row. The gate: admit when
+/// `incoming.leader_epoch > stored.leader_epoch`, or on a tie,
+/// `incoming.leader_node_id < stored.leader_node_id` (lowest node id wins
+/// the tie — the same rule `election.rs`, wave 1 agent EL, uses to pick a
+/// candidate when `LeoQuery` also ties). No stored row yet: always
+/// admitted.
+///
+/// A rejected (stale-epoch) op returns `Ok(0)` — "applied but no-op", the
+/// same convention the outer HLC gate itself uses for a stale op — NOT an
+/// error. Note this means `apply_core_operation` still advances
+/// `core_resource_versions` for this resource_id afterwards regardless of
+/// this function's return value (that bump is unconditional in the caller,
+/// not gated on `rows > 0`): a stale-epoch op still moves the HLC-LWW
+/// watermark forward. Accepted tradeoff, not a bug: the only way this bites
+/// is a LATER op that legitimately carries a HIGHER epoch but (through
+/// clock skew) an OLDER HLC than the stale one — it would then be rejected
+/// by the OUTER gate first and never reach this function at all. Given
+/// epoch only advances on a real election (K-M2-3's `LeoQuery`/majority
+/// handshake takes far longer than realistic clock skew), this is treated
+/// as acceptable rather than worth complicating the shared HLC-LWW gate
+/// every OTHER resource kind also relies on.
+fn apply_bus_partition_assignment(
+    tx: &rusqlite::Transaction<'_>,
+    operation: &SyncOperation,
+) -> LedgerResult<usize> {
+    let payload = field_string(operation, "assignment_json")?;
+    let incoming: crate::bus::replication::assignment::PartitionAssignment =
+        serde_json::from_str(&payload).map_err(|e| {
+            SyncLedgerError::Runtime(format!("invalid bus_partition_assignment payload: {e}"))
+        })?;
+    let expected_id = crate::sync::resource_id::composite_resource_id(&[
+        &incoming.org_id,
+        &incoming.topic,
+        &incoming.partition.to_string(),
+    ]);
+    if expected_id != operation.body.resource_id {
+        return Err(SyncLedgerError::Runtime(format!(
+            "bus_partition_assignment composite id mismatch: body={}, payload={}",
+            operation.body.resource_id, expected_id
+        )));
+    }
+
+    match operation.body.action {
+        ActionType::Insert | ActionType::Update => {
+            let stored: Option<(u32, String)> = tx
+                .query_row(
+                    "SELECT leader_epoch, leader_node_id FROM bus_partition_assignments \
+                     WHERE org_id = ?1 AND topic = ?2 AND partition = ?3",
+                    rusqlite::params![incoming.org_id, incoming.topic, incoming.partition],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let admit = match &stored {
+                None => true,
+                Some((stored_epoch, stored_leader)) => {
+                    incoming.leader_epoch > *stored_epoch
+                        || (incoming.leader_epoch == *stored_epoch
+                            && incoming.leader_node_id < *stored_leader)
+                }
+            };
+            if !admit {
+                return Ok(0);
+            }
+            // The parent topic's row carries `environment`
+            // (`PartitionAssignment` itself deliberately does not — see that
+            // type's doc). Both resources share the "bus" ledger partition,
+            // which orders a topic's own op before any of its assignments'
+            // ops (`core_registry.rs`'s descriptor table comment), so the
+            // topic row is expected to already be materialized here. Its
+            // absence is a genuine ordering gap (the topic's own op is
+            // still in flight), not a data error, so this defers rather
+            // than drops or errors outright.
+            let environment: Option<String> = tx
+                .query_row(
+                    "SELECT environment FROM bus_topics WHERE org_id = ?1 AND name = ?2",
+                    rusqlite::params![incoming.org_id, incoming.topic],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(sql_error)?;
+            let Some(environment) = environment else {
+                return Err(SyncLedgerError::DeferredOrdering(format!(
+                    "bus topic not yet materialized: {}/{}",
+                    incoming.org_id, incoming.topic
+                )));
+            };
+            let replicas_json = serde_json::to_string(&incoming.replicas)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            let isr_json = serde_json::to_string(&incoming.isr)
+                .map_err(|e| SyncLedgerError::Runtime(e.to_string()))?;
+            tx.execute(
+                "INSERT INTO bus_partition_assignments \
+                 (org_id, topic, partition, leader_node_id, replicas, isr, leader_epoch, \
+                  environment, updated_at_ms) \
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9) \
+                 ON CONFLICT(org_id, topic, partition) DO UPDATE SET \
+                 leader_node_id = excluded.leader_node_id, replicas = excluded.replicas, \
+                 isr = excluded.isr, leader_epoch = excluded.leader_epoch, \
+                 environment = excluded.environment, updated_at_ms = excluded.updated_at_ms",
+                rusqlite::params![
+                    incoming.org_id,
+                    incoming.topic,
+                    incoming.partition,
+                    incoming.leader_node_id,
+                    replicas_json,
+                    isr_json,
+                    incoming.leader_epoch,
+                    environment,
+                    incoming.updated_at_ms,
+                ],
+            )
+            .map_err(sql_error)
+        }
+        ActionType::Delete => tx
+            .execute(
+                "DELETE FROM bus_partition_assignments \
+                 WHERE org_id = ?1 AND topic = ?2 AND partition = ?3",
+                rusqlite::params![incoming.org_id, incoming.topic, incoming.partition],
+            )
+            .map_err(sql_error),
+    }
+}
+
 /// UPDATE matched no row: the INSERT that creates this resource has not been
 /// materialized yet (causal-ordering gap), not a data conflict. Surface it as a
 /// deferred-ordering error so the inbox keeps the entry retryable until the
@@ -2909,5 +3159,396 @@ mod tests {
         assert_eq!(got.decode_tps_sample_count, 1);
         assert_eq!(got.e2e_buckets, original.e2e_buckets);
         assert_eq!(got.e2e_sample_count, 1);
+    }
+
+    // -------------------------------------------------------------------
+    // TentaBus M2 (SUM/tentabus/PLAN-M2.md §1c) — `apply_bus_topic` /
+    // `apply_bus_partition_assignment`.
+    // -------------------------------------------------------------------
+
+    fn bus_db() -> crate::db::DbPool {
+        let pool = crate::db::init(std::path::Path::new(":memory:")).unwrap();
+        repository::bus_test_support::create_bus_tables(&pool).unwrap();
+        pool
+    }
+
+    fn bus_topic_row(org_id: &str, name: &str) -> repository::DbBusTopic {
+        repository::DbBusTopic {
+            org_id: org_id.to_string(),
+            name: name.to_string(),
+            partitions: 4,
+            retention_ms: 1,
+            retention_bytes: 1,
+            cleanup_policy: "delete".to_string(),
+            delivery: "at_least_once".to_string(),
+            idempotency_key: None,
+            dedup_window_ms: 1,
+            max_delivery_attempts: 1,
+            retry_backoff_ms: 1,
+            schema_id: None,
+            validation: "none".to_string(),
+            content_type: "application/json".to_string(),
+            replication_factor: 1,
+            acks: "all".to_string(),
+            durability: "fsync_batch".to_string(),
+            durability_class: Some("critical".to_string()),
+            max_inline_bytes: 1,
+            compression: "lz4".to_string(),
+            environment: "test".to_string(),
+            created_at_ms: 1,
+            updated_at_ms: 1,
+        }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn bus_operation(
+        org_id: &str,
+        resource_type: &str,
+        resource_id: &str,
+        table_name: &str,
+        primary_key: &str,
+        action: ActionType,
+        fields: BTreeMap<String, FieldValue>,
+    ) -> SyncOperation {
+        SyncOperation {
+            op_id: OperationId::from_hash([9; 32]),
+            operation_hash: [9; 32],
+            body: SyncOperationBody {
+                org_id: org_id.to_string(),
+                partition_id: PartitionId::new("core/org/default/bus").unwrap(),
+                node_seq: 1,
+                addon_id: CORE_SYNC_ADDON_ID.to_string(),
+                resource_type: resource_type.to_string(),
+                resource_id: resource_id.to_string(),
+                table_name: table_name.to_string(),
+                primary_key: primary_key.to_string(),
+                action,
+                changed_fields: fields,
+                before_hash: None,
+                after_hash: None,
+                actor_user_id: String::new(),
+                actor_device_id: "peer".to_string(),
+                actor_node_id: "peer".to_string(),
+                hlc_timestamp: HybridLogicalTimestamp {
+                    wall_time_ms: 1,
+                    logical: 0,
+                    node_id: "peer".to_string(),
+                },
+                epoch: BaselineEpoch::default(),
+                environment: crate::sync::ledger::NodeEnvironment::default(),
+                prev_node_hash: None,
+                payload_hash: [0; 32],
+                acl_snapshot_hash: [0; 32],
+                policy_epoch: 0,
+                encryption_info: None,
+            },
+            signature: Vec::new(),
+        }
+    }
+
+    /// Builds the inbound op exactly as the writer side mints it: the capture
+    /// comes from `repository::bus_topic_write_capture` — the function the
+    /// local `bus_topics` writers call — so this test suite cannot drift from
+    /// the payload contract it is meant to be checking.
+    fn bus_topic_op(row: &repository::DbBusTopic, action: ActionType) -> SyncOperation {
+        let capture = repository::bus_topic_write_capture(
+            row,
+            match action {
+                ActionType::Insert => crate::sync::runtime::SqlWriteAction::Insert,
+                ActionType::Update => crate::sync::runtime::SqlWriteAction::Update,
+                ActionType::Delete => crate::sync::runtime::SqlWriteAction::Delete,
+            },
+        )
+        .expect("capture");
+        bus_operation(
+            &capture.org_id,
+            &capture.resource_type.clone(),
+            &capture.resource_id.clone(),
+            &capture.table_name.clone(),
+            &capture.primary_key.clone(),
+            action,
+            capture.changed_fields.clone(),
+        )
+    }
+
+    fn test_assignment(
+        org_id: &str,
+        topic: &str,
+        partition: u32,
+        leader_node_id: &str,
+        leader_epoch: u32,
+    ) -> crate::bus::replication::assignment::PartitionAssignment {
+        crate::bus::replication::assignment::PartitionAssignment {
+            org_id: org_id.to_string(),
+            topic: topic.to_string(),
+            partition,
+            leader_node_id: leader_node_id.to_string(),
+            replicas: vec![leader_node_id.to_string(), "node-b".to_string()],
+            isr: vec![leader_node_id.to_string(), "node-b".to_string()],
+            leader_epoch,
+            updated_at_ms: 1_000,
+        }
+    }
+
+    fn bus_assignment_op(
+        assignment: &crate::bus::replication::assignment::PartitionAssignment,
+        action: ActionType,
+    ) -> SyncOperation {
+        let resource_id = crate::sync::resource_id::composite_resource_id(&[
+            &assignment.org_id,
+            &assignment.topic,
+            &assignment.partition.to_string(),
+        ]);
+        let mut fields = BTreeMap::new();
+        fields.insert(
+            "assignment_json".to_string(),
+            FieldValue::String(serde_json::to_string(assignment).unwrap()),
+        );
+        bus_operation(
+            &assignment.org_id,
+            "core.bus_partition_assignment",
+            &resource_id,
+            "bus_partition_assignments",
+            "org_id,topic,partition",
+            action,
+            fields,
+        )
+    }
+
+    #[test]
+    fn bus_topic_insert_then_update_then_delete_round_trips() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+
+        let row = bus_topic_row("org-1", "orders.created");
+        let insert_op = bus_topic_op(&row, ActionType::Insert);
+        assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
+        let fetched = repository::bus_topic_get(&db, "org-1", "orders.created")
+            .unwrap()
+            .expect("topic materialized");
+        assert_eq!(fetched.partitions, 4);
+        assert_eq!(fetched.acks, "all");
+
+        let mut updated_row = row.clone();
+        updated_row.partitions = 8;
+        updated_row.acks = "leader".to_string();
+        let mut update_op = bus_operation(
+            &updated_row.org_id,
+            "core.bus_topic",
+            &insert_op.body.resource_id,
+            "bus_topics",
+            "org_id,name",
+            ActionType::Update,
+            {
+                let mut fields = BTreeMap::new();
+                fields.insert(
+                    "row_json".to_string(),
+                    FieldValue::String(serde_json::to_string(&updated_row).unwrap()),
+                );
+                fields
+            },
+        );
+        // A strictly-later HLC is needed for the outer LWW gate to accept a
+        // second op for the same resource_id.
+        update_op.body.hlc_timestamp.wall_time_ms = 2;
+        assert_eq!(apply_core_operation(&db, &cipher, &update_op).unwrap(), 1);
+        let fetched = repository::bus_topic_get(&db, "org-1", "orders.created")
+            .unwrap()
+            .expect("topic still materialized");
+        assert_eq!(fetched.partitions, 8);
+        assert_eq!(fetched.acks, "leader");
+
+        let mut delete_op = bus_topic_op(&updated_row, ActionType::Delete);
+        delete_op.body.hlc_timestamp.wall_time_ms = 3;
+        assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert!(repository::bus_topic_get(&db, "org-1", "orders.created")
+            .unwrap()
+            .is_none());
+    }
+
+    #[test]
+    fn bus_topic_resource_id_mismatch_is_rejected() {
+        let db = bus_db();
+        let row = bus_topic_row("org-1", "orders.created");
+        let mut op = bus_topic_op(&row, ActionType::Insert);
+        op.body.resource_id = "not-the-right-composite-id".to_string();
+        let mut conn = repository::acquire_for_baseline(&db).unwrap();
+        let tx = conn.transaction().unwrap();
+        let result = apply_bus_topic(&tx, &op);
+        assert!(result.is_err(), "mismatched resource_id must be rejected");
+    }
+
+    #[test]
+    fn bus_partition_assignment_applies_when_no_stored_row_and_topic_exists() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+        let topic_op = bus_topic_op(
+            &bus_topic_row("org-1", "orders.created"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+
+        let assignment = test_assignment("org-1", "orders.created", 0, "node-a", 1);
+        let op = bus_assignment_op(&assignment, ActionType::Insert);
+        assert_eq!(apply_core_operation(&db, &cipher, &op).unwrap(), 1);
+
+        let stored = repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
+            .unwrap()
+            .expect("assignment materialized");
+        assert_eq!(stored.leader_node_id, "node-a");
+        assert_eq!(stored.leader_epoch, 1);
+        assert_eq!(
+            stored.environment, "test",
+            "environment is inherited from the topic row"
+        );
+    }
+
+    #[test]
+    fn bus_partition_assignment_defers_when_topic_not_yet_materialized() {
+        let db = bus_db();
+        let assignment = test_assignment("org-1", "orders.created", 0, "node-a", 1);
+        let op = bus_assignment_op(&assignment, ActionType::Insert);
+        {
+            let mut conn = repository::acquire_for_baseline(&db).unwrap();
+            let tx = conn.transaction().unwrap();
+            let result = apply_bus_partition_assignment(&tx, &op);
+            assert!(
+                matches!(result, Err(SyncLedgerError::DeferredOrdering(_))),
+                "missing parent topic row must defer, not drop or hard-error: {result:?}"
+            );
+        }
+        // The scope above is load-bearing, not decoration: `acquire_for_baseline`
+        // hands out the process-wide writer mutex and `parking_lot` is NOT
+        // reentrant, so any `repository::*` call that takes `pool` — including
+        // the two reads below — self-deadlocks the thread that still holds the
+        // guard. Dropping only the `Transaction` was not enough: it borrows
+        // `conn`, so the guard lived to the end of the function.
+        // The deferral must not have quietly manufactured the config it was
+        // waiting for: `replication`'s `PartitionProvider` reads `bus_topics`,
+        // so a fabricated row here would let this node serve a partition whose
+        // retention/acks/durability policy nobody ever wrote down. Policy
+        // arrives only through the topic's own `core.bus_topic` op.
+        assert!(
+            repository::bus_topic_get(&db, "org-1", "orders.created")
+                .unwrap()
+                .is_none(),
+            "a deferred assignment op must leave no topic row behind"
+        );
+        assert!(
+            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
+                .unwrap()
+                .is_none(),
+            "a deferred assignment op must not materialize its own row either"
+        );
+    }
+
+    #[test]
+    fn bus_partition_assignment_stale_epoch_is_rejected_as_noop() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+        let topic_op = bus_topic_op(
+            &bus_topic_row("org-1", "orders.created"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+
+        let fresh = test_assignment("org-1", "orders.created", 0, "node-a", 5);
+        let mut fresh_op = bus_assignment_op(&fresh, ActionType::Insert);
+        fresh_op.body.hlc_timestamp.wall_time_ms = 10;
+        assert_eq!(apply_core_operation(&db, &cipher, &fresh_op).unwrap(), 1);
+
+        // Same resource, LOWER leader_epoch, but a strictly NEWER HLC so the
+        // OUTER LWW gate would admit it — only the epoch gate inside
+        // `apply_bus_partition_assignment` must reject it.
+        let stale = test_assignment("org-1", "orders.created", 0, "node-z", 4);
+        let mut stale_op = bus_assignment_op(&stale, ActionType::Insert);
+        stale_op.body.hlc_timestamp.wall_time_ms = 20;
+        assert_eq!(
+            apply_core_operation(&db, &cipher, &stale_op).unwrap(),
+            0,
+            "a lower leader_epoch must be rejected as a no-op even with a newer HLC"
+        );
+
+        let stored = repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
+            .unwrap()
+            .expect("assignment still materialized from the fresh op");
+        assert_eq!(stored.leader_node_id, "node-a");
+        assert_eq!(stored.leader_epoch, 5);
+    }
+
+    #[test]
+    fn bus_partition_assignment_equal_epoch_tiebreaks_by_lowest_node_id() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+        let topic_op = bus_topic_op(
+            &bus_topic_row("org-1", "orders.created"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+
+        let first = test_assignment("org-1", "orders.created", 0, "node-m", 7);
+        let mut first_op = bus_assignment_op(&first, ActionType::Insert);
+        first_op.body.hlc_timestamp.wall_time_ms = 10;
+        assert_eq!(apply_core_operation(&db, &cipher, &first_op).unwrap(), 1);
+
+        // Same epoch, HIGHER node id: must lose the tie-break even though its
+        // HLC is newer.
+        let higher_node = test_assignment("org-1", "orders.created", 0, "node-z", 7);
+        let mut higher_op = bus_assignment_op(&higher_node, ActionType::Insert);
+        higher_op.body.hlc_timestamp.wall_time_ms = 20;
+        assert_eq!(
+            apply_core_operation(&db, &cipher, &higher_op).unwrap(),
+            0,
+            "a higher node_id at the same epoch must lose the tie-break"
+        );
+        assert_eq!(
+            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
+            "node-m"
+        );
+
+        // Same epoch, LOWER node id: must win the tie-break.
+        let lower_node = test_assignment("org-1", "orders.created", 0, "node-a", 7);
+        let mut lower_op = bus_assignment_op(&lower_node, ActionType::Insert);
+        lower_op.body.hlc_timestamp.wall_time_ms = 30;
+        assert_eq!(
+            apply_core_operation(&db, &cipher, &lower_op).unwrap(),
+            1,
+            "a lower node_id at the same epoch must win the tie-break"
+        );
+        assert_eq!(
+            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
+                .unwrap()
+                .unwrap()
+                .leader_node_id,
+            "node-a"
+        );
+    }
+
+    #[test]
+    fn bus_partition_assignment_delete_removes_row() {
+        let db = bus_db();
+        let cipher = std::sync::Arc::new(crate::crypto::SettingsCipher::new(&[3u8; 32]));
+        let topic_op = bus_topic_op(
+            &bus_topic_row("org-1", "orders.created"),
+            ActionType::Insert,
+        );
+        apply_core_operation(&db, &cipher, &topic_op).unwrap();
+
+        let assignment = test_assignment("org-1", "orders.created", 0, "node-a", 1);
+        let mut insert_op = bus_assignment_op(&assignment, ActionType::Insert);
+        insert_op.body.hlc_timestamp.wall_time_ms = 10;
+        assert_eq!(apply_core_operation(&db, &cipher, &insert_op).unwrap(), 1);
+
+        let mut delete_op = bus_assignment_op(&assignment, ActionType::Delete);
+        delete_op.body.hlc_timestamp.wall_time_ms = 20;
+        assert_eq!(apply_core_operation(&db, &cipher, &delete_op).unwrap(), 1);
+        assert!(
+            repository::bus_assignment_get(&db, "org-1", "orders.created", 0)
+                .unwrap()
+                .is_none()
+        );
     }
 }

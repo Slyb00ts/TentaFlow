@@ -471,7 +471,8 @@ fn walk_sorted(root: &Path) -> Result<Vec<(String, PathBuf)>> {
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
-    let mut f = std::fs::File::open(path).with_context(|| format!("otwarcie {}", path.display()))?;
+    let mut f =
+        std::fs::File::open(path).with_context(|| format!("otwarcie {}", path.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_BUF];
     loop {
@@ -888,7 +889,11 @@ fn export_into(
     // DB rows last (before the manifest) so their JSON already reflects the rewritten
     // dataset paths decided above.
     files.push(write_json(&mut zip, "db/projects.json", &vec![&project])?);
-    files.push(write_json(&mut zip, "db/datasets.json", &archived_datasets)?);
+    files.push(write_json(
+        &mut zip,
+        "db/datasets.json",
+        &archived_datasets,
+    )?);
     files.push(write_json(&mut zip, "db/schemas.json", &schemas)?);
     files.push(write_json(&mut zip, "db/lookup_dicts.json", &dicts)?);
     if opts.include_models {
@@ -976,8 +981,7 @@ fn deflated_options() -> zip::write::FileOptions<'static, ()> {
 /// file is read exactly once regardless of size.
 fn write_stored_file(zip: &mut ZipOut, arch_path: &str, src: &Path) -> Result<FileEntry> {
     zip.start_file(arch_path.to_string(), stored_options())?;
-    let mut f =
-        std::fs::File::open(src).with_context(|| format!("otwarcie {}", src.display()))?;
+    let mut f = std::fs::File::open(src).with_context(|| format!("otwarcie {}", src.display()))?;
     let mut hasher = Sha256::new();
     let mut buf = vec![0u8; COPY_BUF];
     let mut size = 0u64;
@@ -1106,13 +1110,16 @@ struct CocoCounts {
 /// streaming reader so the (potentially huge) images/annotations arrays never
 /// materialize in RAM.
 fn coco_counts(path: &Path) -> Result<(u64, u64, Vec<String>)> {
-    let file =
-        std::fs::File::open(path).with_context(|| format!("otwarcie {}", path.display()))?;
+    let file = std::fs::File::open(path).with_context(|| format!("otwarcie {}", path.display()))?;
     let counts: CocoCounts = serde_json::from_reader(std::io::BufReader::new(file))
         .with_context(|| format!("parsowanie {}", path.display()))?;
     let images = counts.images.map(|c| c.0).unwrap_or(0);
     let anns = counts.annotations.map(|c| c.0).unwrap_or(0);
-    let cats = counts.categories.into_iter().filter_map(|c| c.name).collect();
+    let cats = counts
+        .categories
+        .into_iter()
+        .filter_map(|c| c.name)
+        .collect();
     Ok((images, anns, cats))
 }
 
@@ -1378,12 +1385,10 @@ pub fn read_manifest(zip_path: &Path) -> Result<ArchiveManifest> {
     Ok(manifest)
 }
 
-fn read_manifest_from<R: Read + Seek>(
-    archive: &mut zip::ZipArchive<R>,
-) -> Result<ArchiveManifest> {
-    let mut entry = archive
-        .by_name(MANIFEST_ENTRY)
-        .map_err(|_| anyhow::anyhow!("archiwum bez {MANIFEST_ENTRY} — to nie jest eksport projektu ML Studio"))?;
+fn read_manifest_from<R: Read + Seek>(archive: &mut zip::ZipArchive<R>) -> Result<ArchiveManifest> {
+    let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(|_| {
+        anyhow::anyhow!("archiwum bez {MANIFEST_ENTRY} — to nie jest eksport projektu ML Studio")
+    })?;
     if entry.size() > MAX_MANIFEST_BYTES {
         bail!("manifest przekracza dopuszczalny rozmiar {MAX_MANIFEST_BYTES} B");
     }
@@ -1468,13 +1473,14 @@ fn extract_all(
     manifest: &ArchiveManifest,
     job_id: Option<&str>,
 ) -> Result<()> {
-    let expected: HashMap<&str, &FileEntry> =
-        manifest.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let expected: HashMap<&str, &FileEntry> = manifest
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
     let total_bytes: u64 = manifest.files.iter().map(|f| f.size).sum();
     if total_bytes > MAX_IMPORT_BYTES {
-        bail!(
-            "archiwum deklaruje {total_bytes} B po rozpakowaniu — limit to {MAX_IMPORT_BYTES} B"
-        );
+        bail!("archiwum deklaruje {total_bytes} B po rozpakowaniu — limit to {MAX_IMPORT_BYTES} B");
     }
     if let Some(jid) = job_id {
         update_progress(jid, |p| {
@@ -1583,9 +1589,7 @@ pub fn spawn_import(
     org_id: String,
 ) -> Result<String> {
     let (key, target_project) = match &mode {
-        ImportMode::NewProject { .. } => {
-            (format!("import:{}", zip_path.display()), String::new())
-        }
+        ImportMode::NewProject { .. } => (format!("import:{}", zip_path.display()), String::new()),
         ImportMode::MergeInto {
             project_id,
             dataset_id,
@@ -1783,9 +1787,8 @@ fn import_as_new_project(
                     if let Some(parent) = dest.parent() {
                         std::fs::create_dir_all(parent)?;
                     }
-                    std::fs::rename(&src, &dest).with_context(|| {
-                        format!("przeniesienie datasetu do {}", dest.display())
-                    })?;
+                    std::fs::rename(&src, &dest)
+                        .with_context(|| format!("przeniesienie datasetu do {}", dest.display()))?;
                     moved_dirs.push(dest.clone());
                     dataset_paths.insert(
                         new_id.clone(),
@@ -1830,9 +1833,8 @@ fn import_as_new_project(
                 if dest.exists() {
                     std::fs::remove_dir_all(&dest)?;
                 }
-                std::fs::rename(&src, &dest).with_context(|| {
-                    format!("przeniesienie artefaktow do {}", dest.display())
-                })?;
+                std::fs::rename(&src, &dest)
+                    .with_context(|| format!("przeniesienie artefaktow do {}", dest.display()))?;
                 moved_dirs.push(dest);
             }
         }
@@ -1970,7 +1972,8 @@ fn insert_new_project_rows(
                     ],
                 )?;
                 let rowid = tx.last_insert_rowid();
-                let mut blob = tx.blob_open(rusqlite::MAIN_DB, c"datasets", c"raw_data", rowid, false)?;
+                let mut blob =
+                    tx.blob_open(rusqlite::MAIN_DB, c"datasets", c"raw_data", rowid, false)?;
                 let mut file = std::io::BufReader::new(
                     std::fs::File::open(path)
                         .with_context(|| format!("otwarcie {}", path.display()))?,
@@ -2018,11 +2021,7 @@ fn insert_new_project_rows(
         let remapped = remap_dict_ids(&s.json, dict_ids)?;
         tx.execute(
             "INSERT INTO schemas (schema_id, project_id, json) VALUES (?1, ?2, ?3)",
-            params![
-                uuid::Uuid::new_v4().to_string(),
-                new_project_id,
-                remapped
-            ],
+            params![uuid::Uuid::new_v4().to_string(), new_project_id, remapped],
         )?;
     }
 
@@ -2560,9 +2559,7 @@ fn merge_into_dataset(
             let mut anns = SeqOut::new(&mut w);
             {
                 let f = std::fs::File::open(&target_coco_path)?;
-                stream_array_field(std::io::BufReader::new(f), "annotations", |v| {
-                    anns.elem(&v)
-                })?;
+                stream_array_field(std::io::BufReader::new(f), "annotations", |v| anns.elem(&v))?;
             }
             for (i, src_dataset) in source_dirs.iter().enumerate() {
                 let src_train = src_dataset.join("train");
@@ -2583,8 +2580,7 @@ fn merge_into_dataset(
                         let Some(obj) = ann.as_object_mut() else {
                             return Ok(());
                         };
-                        let old_cat =
-                            obj.get("category_id").and_then(|v| v.as_i64()).unwrap_or(0);
+                        let old_cat = obj.get("category_id").and_then(|v| v.as_i64()).unwrap_or(0);
                         let Some(&new_cat) = cat_remap.get(&old_cat) else {
                             bail!("adnotacja wskazuje nieznaną kategorię {old_cat}");
                         };
@@ -2607,9 +2603,8 @@ fn merge_into_dataset(
         // leaves unreferenced files (harmless, re-merge dedupes them) rather than COCO
         // records pointing at images that never arrived.
         for (src, dest) in &copies {
-            std::fs::copy(src, dest).with_context(|| {
-                format!("kopiowanie {} -> {}", src.display(), dest.display())
-            })?;
+            std::fs::copy(src, dest)
+                .with_context(|| format!("kopiowanie {} -> {}", src.display(), dest.display()))?;
         }
 
         std::fs::rename(&tmp, &target_coco_path)
@@ -2661,7 +2656,10 @@ fn resolve_coco_dataset_dir(project_id: &str, dataset_id: &str) -> Result<PathBu
         .unwrap_or_default();
     let dir = PathBuf::from(path.trim());
     if !dir.is_dir() {
-        bail!("katalog datasetu docelowego nie istnieje: {}", dir.display());
+        bail!(
+            "katalog datasetu docelowego nie istnieje: {}",
+            dir.display()
+        );
     }
     Ok(dir)
 }
@@ -2769,8 +2767,7 @@ mod tests {
             ],
             &["tablica_adr", "termometr"],
         );
-        std::fs::write(train.join(COCO_FILE), serde_json::to_vec(&coco).unwrap())
-            .expect("coco");
+        std::fs::write(train.join(COCO_FILE), serde_json::to_vec(&coco).unwrap()).expect("coco");
 
         exec(
             "INSERT INTO projects (project_id, name, description, project_type, owner_user_id, org_id) \
@@ -2820,8 +2817,7 @@ mod tests {
 
     fn read_target_coco(project_id: &str, dataset_id: &str) -> Value {
         let dir = resolve_coco_dataset_dir(project_id, dataset_id).expect("dataset dir");
-        serde_json::from_slice(&std::fs::read(dir.join("train").join(COCO_FILE)).unwrap())
-            .unwrap()
+        serde_json::from_slice(&std::fs::read(dir.join("train").join(COCO_FILE)).unwrap()).unwrap()
     }
 
     #[test]
@@ -3018,7 +3014,11 @@ mod tests {
             "bbox": [0, 0, 1, 1], "area": 1, "iscrowd": 0,
             "attributes": {"stan": "brudna"},
         }));
-        std::fs::write(src_train.join(COCO_FILE), serde_json::to_vec(&coco).unwrap()).unwrap();
+        std::fs::write(
+            src_train.join(COCO_FILE),
+            serde_json::to_vec(&coco).unwrap(),
+        )
+        .unwrap();
         let _ = src_dataset;
 
         let zip_path = crate::paths::data_dir().join("merge2.zip");
@@ -3057,7 +3057,10 @@ mod tests {
             .iter()
             .map(|a| a["id"].as_i64().unwrap())
             .collect();
-        assert_eq!(ann_ids.len(), target["annotations"].as_array().unwrap().len());
+        assert_eq!(
+            ann_ids.len(),
+            target["annotations"].as_array().unwrap().len()
+        );
 
         // The colliding name was rewritten, the original left untouched.
         let renamed = images
@@ -3107,7 +3110,11 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"id": 99, "name": "nalepka_nieznana"}));
-        std::fs::write(src_train.join(COCO_FILE), serde_json::to_vec(&coco).unwrap()).unwrap();
+        std::fs::write(
+            src_train.join(COCO_FILE),
+            serde_json::to_vec(&coco).unwrap(),
+        )
+        .unwrap();
 
         let zip_path = crate::paths::data_dir().join("cat.zip");
         build_export(
@@ -3161,7 +3168,8 @@ mod tests {
         });
         zip.start_file(MANIFEST_ENTRY.to_string(), deflated_options())
             .unwrap();
-        zip.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
         zip.finish().unwrap();
 
         let err = read_manifest(&zip_path).expect_err("newer version must be rejected");
@@ -3212,7 +3220,8 @@ mod tests {
         zip.write_all(&payload).unwrap();
         zip.start_file(MANIFEST_ENTRY.to_string(), deflated_options())
             .unwrap();
-        zip.write_all(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        zip.write_all(&serde_json::to_vec(&manifest).unwrap())
+            .unwrap();
         zip.finish().unwrap();
 
         let staging = crate::paths::data_dir().join("slip-staging");

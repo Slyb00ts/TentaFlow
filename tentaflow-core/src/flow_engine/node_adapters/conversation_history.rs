@@ -265,7 +265,11 @@ mod tests {
         ctx.history = fake.clone();
 
         let out = ConversationHistoryNodeAdapter::new()
-            .execute(&node(json!({"require_session": false})), &[input(env)], &ctx)
+            .execute(
+                &node(json!({"require_session": false})),
+                &[input(env)],
+                &ctx,
+            )
             .await
             .expect("shared shell answers a caller without a conversation");
         assert!(out.context.messages.is_empty(), "nothing to replay");

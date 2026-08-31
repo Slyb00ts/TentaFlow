@@ -20,9 +20,7 @@ use serde::{Deserialize as SerdeDeserialize, Serialize as SerdeSerialize};
 
 /// Inner payload for `MessageBody::StreamBody`. See module docs for the
 /// request/response ordering contract.
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub enum StreamPayload {
     /// Client -> server. Asks the hub to subscribe this WS connection to the
     /// named stream. The server first answers with `SubscribeResponse`
@@ -47,9 +45,7 @@ pub enum StreamPayload {
     Closed(StreamClosedPayload),
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct StreamSubscribeRequest {
     /// Hub-registered stream id, e.g. `camera:<uuid>` for the camera tier.
     pub stream_id: String,
@@ -63,9 +59,7 @@ pub struct StreamSubscribeRequest {
     pub preview: bool,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct StreamSubscribeResponse {
     pub stream_id: String,
     /// MIME type ready to feed into `MediaSource.addSourceBuffer`.
@@ -80,9 +74,7 @@ pub struct StreamSubscribeResponse {
     pub base_pts_ns: Option<u64>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct StreamFramePayload {
     pub stream_id: String,
     /// `true` for the MSE init segment (ftyp+moov), `false` for media chunks.
@@ -96,16 +88,12 @@ pub struct StreamFramePayload {
     pub data: Vec<u8>,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct StreamCloseRequest {
     pub stream_id: String,
 }
 
-#[derive(
-    SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq,
-)]
+#[derive(SerdeSerialize, SerdeDeserialize, Debug, Clone, PartialEq)]
 pub struct StreamClosedPayload {
     pub stream_id: String,
     /// Static reason tag. One of `subscriber_lagged`, `source_unregistered`,

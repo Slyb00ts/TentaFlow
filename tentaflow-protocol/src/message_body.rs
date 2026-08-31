@@ -8216,6 +8216,12 @@ pub enum MessageBody {
     // export/import bundle, QUIC pull wizard, diff preview + apply) in
     // `EnvironmentPromotionPayload`.
     EnvironmentPromotionBody(crate::environment::EnvironmentPromotionPayload),
+
+    // ----- TentaBus M1 (SUM/tentabus/PLAN.md) -----
+    // Appended at the END of the enum, same reasoning as EventsBody above.
+    // ONE variant for the whole family (topics, consumer groups, DLQ, ACL,
+    // quotas, message preview, stats snapshot) in `bus::BusPayload`.
+    BusBody(crate::bus::BusPayload),
 }
 
 // =============================================================================

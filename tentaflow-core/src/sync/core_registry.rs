@@ -52,6 +52,19 @@ pub enum CoreSyncResourceKind {
     CodeWorkspaceCreatorGrant,
     CodeWorkspaceProjectLink,
     CodeWorkspaceAllowlist,
+    /// M2 (PLAN-M2 §1c, K-M2-4): a topic's own config as a mesh-wide sync
+    /// resource — `create_topic` on any node must be visible everywhere,
+    /// same as any other org-scoped config. Materialized into
+    /// `bus_topics`; wave 1 (agent L) wires the real `apply_bus_topic`.
+    BusTopic,
+    /// M2 (PLAN-M2 §1c, K-M2-4): `PartitionAssignment` (leader/replicas/
+    /// ISR/epoch) as a mesh-wide sync resource, materialized into
+    /// `bus_partition_assignments` — a MATERIALIZATION of the ledger
+    /// resource, not a second source of truth (K-M2-4's whole point).
+    /// `core_materializer::apply_bus_partition_assignment` (wave 1, agent
+    /// L) adds the epoch/node_id tiebreak gate ON TOP of HLC-LWW that this
+    /// one resource kind needs — see that function's doc once it exists.
+    BusPartitionAssignment,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -573,6 +586,29 @@ pub const CORE_SYNC_DESCRIPTORS: &[CoreSyncDescriptor] = &[
         scope: CoreSyncScope::Organization,
         retention: CoreSyncRetention::Durable,
         partition_suffix: "code-studio",
+    },
+    // M2 (PLAN-M2 §1c): both bus resources share the "bus" partition
+    // suffix — a topic's assignments must always be ordered after the
+    // topic's own config, which one shared partition guarantees the same
+    // way `code-studio`'s satellite rows are ordered after their
+    // workspace above.
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusTopic,
+        table_name: "bus_topics",
+        resource_type: "core.bus_topic",
+        primary_key_column: "org_id,name",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
+    },
+    CoreSyncDescriptor {
+        kind: CoreSyncResourceKind::BusPartitionAssignment,
+        table_name: "bus_partition_assignments",
+        resource_type: "core.bus_partition_assignment",
+        primary_key_column: "org_id,topic,partition",
+        scope: CoreSyncScope::Organization,
+        retention: CoreSyncRetention::Durable,
+        partition_suffix: "bus",
     },
 ];
 

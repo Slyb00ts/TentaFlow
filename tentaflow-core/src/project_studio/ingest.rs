@@ -176,7 +176,8 @@ fn close_job_as_cancelled(project_pool: &DbPool, payload: &JobPayload) {
     // The source follows the JOB row: if the job was already terminal, this
     // cancel lost the race and must not relabel a source the finished run left
     // `ready`.
-    if repository::finish_ingest_job(project_pool, &payload.job_id, "cancelled", "").unwrap_or(false)
+    if repository::finish_ingest_job(project_pool, &payload.job_id, "cancelled", "")
+        .unwrap_or(false)
     {
         let _ = repository::set_source_status(project_pool, &payload.source_id, "cancelled", "");
     }
@@ -553,12 +554,8 @@ pub fn recover_orphaned_jobs(pool: &DbPool) {
             .unwrap_or(false)
         {
             tracing::warn!(job_id, "marked orphaned ingest job as failed");
-            let _ = repository::set_source_status(
-                pool,
-                &source_id,
-                "error",
-                "interrupted by restart",
-            );
+            let _ =
+                repository::set_source_status(pool, &source_id, "error", "interrupted by restart");
         }
     }
 }
@@ -1661,7 +1658,8 @@ where
     F: std::future::Future<Output = ()> + Send + 'static,
 {
     if !supervised(job_id, "pipeline", fut).await {
-        let _ = repository::finish_ingest_job(project_pool, job_id, "failed", "ingest task panicked");
+        let _ =
+            repository::finish_ingest_job(project_pool, job_id, "failed", "ingest task panicked");
     }
 }
 
@@ -2290,8 +2288,8 @@ mod tests {
             let pool = ingest_jobs::init(&dir.path().join("jobs.db")).expect("queue init");
             (dir, pool)
         });
-        while let Some(job) = ingest_jobs::claim(pool, ingest_jobs::QUEUE_PROJECT_STUDIO)
-            .expect("drain claim")
+        while let Some(job) =
+            ingest_jobs::claim(pool, ingest_jobs::QUEUE_PROJECT_STUDIO).expect("drain claim")
         {
             ingest_jobs::finish(pool, &job.job_id).expect("drain finish");
         }
@@ -2354,7 +2352,13 @@ mod tests {
         let job_id = format!("job-{}", uuid::Uuid::new_v4());
         let project_pool = project_db_with_job(tmp.path(), &job_id);
 
-        start_job(task_for(&state, tmp.path(), &project_pool, &project_id, &job_id));
+        start_job(task_for(
+            &state,
+            tmp.path(),
+            &project_pool,
+            &project_id,
+            &job_id,
+        ));
         assert!(
             ingest_jobs::is_pending(&queue, &job_id).expect("pending"),
             "start_job must persist the job instead of only spawning it"
@@ -2418,7 +2422,13 @@ mod tests {
         let project_id = format!("p-{}", uuid::Uuid::new_v4());
         let job_id = format!("job-{}", uuid::Uuid::new_v4());
         let project_pool = project_db_with_job(tmp.path(), &job_id);
-        start_job(task_for(&state, tmp.path(), &project_pool, &project_id, &job_id));
+        start_job(task_for(
+            &state,
+            tmp.path(),
+            &project_pool,
+            &project_id,
+            &job_id,
+        ));
 
         // `signal_cancel` resolves the project through the central registry;
         // the terminal write itself is what this asserts.
@@ -2531,9 +2541,8 @@ mod tests {
         path: &str,
     ) -> IngestTask {
         let pool = super::super::project_db::open(project_id).expect("project db");
-        let file_id =
-            repository::upsert_source_file(&pool, "src-1", path, sha, 0, "text/x-rust")
-                .expect("file row");
+        let file_id = repository::upsert_source_file(&pool, "src-1", path, sha, 0, "text/x-rust")
+            .expect("file row");
         repository::create_ingest_job(&pool, job_id, "src-1", 1, "tester").expect("job row");
         IngestTask {
             core_db: state.db.clone(),
@@ -2558,7 +2567,10 @@ mod tests {
     /// window in which a worker has not yet registered for the wake signal —
     /// production closes it with `IDLE_POLL`, which no test wants to sit
     /// through.
-    async fn await_terminal(project_id: &str, job_id: &str) -> super::super::models::IngestJobRecord {
+    async fn await_terminal(
+        project_id: &str,
+        job_id: &str,
+    ) -> super::super::models::IngestJobRecord {
         for _ in 0..600 {
             let pool = super::super::project_db::open(project_id).expect("project db");
             if let Ok(Some(row)) = repository::get_ingest_job(&pool, job_id) {
@@ -2642,7 +2654,12 @@ mod tests {
 
         let waiting = format!("job-{}", uuid::Uuid::new_v4());
         start_job(queued_task(
-            &state, &project_id, &dir, &sha, &waiting, "waiting.rs",
+            &state,
+            &project_id,
+            &dir,
+            &sha,
+            &waiting,
+            "waiting.rs",
         ));
         assert!(signal_cancel(&waiting), "a queued job is cancellable");
         assert!(
@@ -2666,7 +2683,12 @@ mod tests {
         // persisted on the row rather than resolved here.
         let claimed = format!("job-{}", uuid::Uuid::new_v4());
         start_job(queued_task(
-            &state, &project_id, &dir, &sha, &claimed, "claimed.rs",
+            &state,
+            &project_id,
+            &dir,
+            &sha,
+            &claimed,
+            "claimed.rs",
         ));
         ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
             .expect("claim")
@@ -2704,11 +2726,19 @@ mod tests {
         let exploding = format!("job-{}", uuid::Uuid::new_v4());
         PANIC_AFTER_PROJECT_OPEN.store(true, Ordering::SeqCst);
         start_job(queued_task(
-            &state, &project_id, &dir, &sha, &exploding, "boom.rs",
+            &state,
+            &project_id,
+            &dir,
+            &sha,
+            &exploding,
+            "boom.rs",
         ));
         let row = await_terminal(&project_id, &exploding).await;
         assert_eq!(row.status, "failed");
-        assert_eq!(row.error, PANIC_ERROR, "the panic is recorded, not swallowed");
+        assert_eq!(
+            row.error, PANIC_ERROR,
+            "the panic is recorded, not swallowed"
+        );
         assert!(
             !ingest_jobs::is_pending(&queue, &exploding).expect("pending"),
             "a panicked job must not stay claimed forever"
@@ -2718,7 +2748,12 @@ mod tests {
         // job. Before the guard, one panic ended ingest for the process.
         let after = format!("job-{}", uuid::Uuid::new_v4());
         start_job(queued_task(
-            &state, &project_id, &dir, &sha, &after, "after.rs",
+            &state,
+            &project_id,
+            &dir,
+            &sha,
+            &after,
+            "after.rs",
         ));
         let next = await_terminal(&project_id, &after).await;
         worker.abort();
@@ -2841,9 +2876,17 @@ mod tests {
         let (project_id, dir, sha) = registered_project(tmp.path());
         let job_id = format!("job-{}", uuid::Uuid::new_v4());
         let project_pool = super::super::project_db::open(&project_id).expect("project db");
-        let file_id = repository::upsert_source_file(&project_pool, "src-1", "done.rs", &sha, 0, "text/x-rust")
-            .expect("file row");
-        repository::create_ingest_job(&project_pool, &job_id, "src-1", 1, "tester").expect("job row");
+        let file_id = repository::upsert_source_file(
+            &project_pool,
+            "src-1",
+            "done.rs",
+            &sha,
+            0,
+            "text/x-rust",
+        )
+        .expect("file row");
+        repository::create_ingest_job(&project_pool, &job_id, "src-1", 1, "tester")
+            .expect("job row");
 
         // What the worker had already done before the crash.
         assert!(
@@ -2885,7 +2928,10 @@ mod tests {
         let row = repository::get_ingest_job(&project_pool, &job_id)
             .expect("read")
             .expect("row");
-        assert_eq!(row.status, "success", "a recorded success survives recovery");
+        assert_eq!(
+            row.status, "success",
+            "a recorded success survives recovery"
+        );
         assert_eq!(row.error, "");
         assert_eq!(
             repository::get_source(&project_pool, "src-1")
@@ -2929,7 +2975,12 @@ mod tests {
         let waiting = format!("job-{}", uuid::Uuid::new_v4());
         let mut rx = log_bus::sender_for(&waiting).subscribe();
         start_job(queued_task(
-            &state, &project_id, &dir, &sha, &waiting, "waiting.rs",
+            &state,
+            &project_id,
+            &dir,
+            &sha,
+            &waiting,
+            "waiting.rs",
         ));
 
         let mut lines = Vec::new();
@@ -2947,8 +2998,8 @@ mod tests {
             "a queued job has made no progress to report"
         );
 
-        while let Some(job) = ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO)
-            .expect("drain claim")
+        while let Some(job) =
+            ingest_jobs::claim(&queue, ingest_jobs::QUEUE_PROJECT_STUDIO).expect("drain claim")
         {
             ingest_jobs::finish(&queue, &job.job_id).expect("drain finish");
         }
@@ -3173,18 +3224,9 @@ mod tests {
             "a project that opted in must reach the node with the toggle ON — \
              otherwise the setting is unreachable and the feature is dead"
         );
-        assert_eq!(
-            off.get("doc_id").and_then(|v| v.as_str()),
-            Some("file-1")
-        );
-        assert_eq!(
-            off.get("source_id").and_then(|v| v.as_str()),
-            Some("src-1")
-        );
-        assert_eq!(
-            off.get("path").and_then(|v| v.as_str()),
-            Some("docs/a.pdf")
-        );
+        assert_eq!(off.get("doc_id").and_then(|v| v.as_str()), Some("file-1"));
+        assert_eq!(off.get("source_id").and_then(|v| v.as_str()), Some("src-1"));
+        assert_eq!(off.get("path").and_then(|v| v.as_str()), Some("docs/a.pdf"));
     }
 
     /// The default lives in exactly one place: it is the fallback of the READER,
@@ -3228,8 +3270,7 @@ mod tests {
         );
 
         // A value no build ever writes is not a licence to spend model calls.
-        repository::set_setting(&pool, super::GRAPH_EXTRACTION_SETTING, "yes")
-            .expect("store junk");
+        repository::set_setting(&pool, super::GRAPH_EXTRACTION_SETTING, "yes").expect("store junk");
         assert!(
             !super::graph_extraction_enabled(&pool),
             "an unrecognised stored value must fall to the safe side"

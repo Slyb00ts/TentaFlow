@@ -308,7 +308,10 @@ mod tests {
             .execute(&node(json!({"model": "whisper"})), &[input(env)], &ctx)
             .await
             .unwrap();
-        assert_eq!(out.meta.get("language").and_then(|v| v.as_str()), Some("en"));
+        assert_eq!(
+            out.meta.get("language").and_then(|v| v.as_str()),
+            Some("en")
+        );
         assert_eq!(
             out.meta.get("detected_language").and_then(|v| v.as_str()),
             Some("pl")

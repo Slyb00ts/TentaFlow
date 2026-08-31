@@ -1036,9 +1036,9 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
-            gpu_selection: String::new(),
-                            cluster_deployment_id: String::new(),
-}],
+                gpu_selection: String::new(),
+                cluster_deployment_id: String::new(),
+            }],
         );
 
         let provider = CatalogProvider::new();
@@ -1116,9 +1116,9 @@ mod tests {
                 created_at: String::new(),
                 updated_at: String::new(),
                 request_time_parameters: Default::default(),
-            gpu_selection: String::new(),
-                            cluster_deployment_id: String::new(),
-}],
+                gpu_selection: String::new(),
+                cluster_deployment_id: String::new(),
+            }],
         );
 
         let provider = CatalogProvider::new();
@@ -1183,8 +1183,8 @@ mod tests {
             updated_at: String::new(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-                    cluster_deployment_id: String::new(),
-};
+            cluster_deployment_id: String::new(),
+        };
         registry.replace_local(
             local_node.clone(),
             vec![
@@ -1347,8 +1347,8 @@ mod tests {
             updated_at: String::new(),
             request_time_parameters: Default::default(),
             gpu_selection: String::new(),
-                    cluster_deployment_id: String::new(),
-}
+            cluster_deployment_id: String::new(),
+        }
     }
 
     /// External cloud provider (openai) z presetem o `id != repo`
@@ -1398,8 +1398,12 @@ mod tests {
         let db = fresh_db();
         repository::add_trusted_node(&db, "peer-node", "pub", "peer-node", "test-harness", None)
             .expect("trust peer-node for test");
-        repository::set_trusted_node_environment(&db, "peer-node", tentaflow_protocol::environment::NodeEnvironment::Prod)
-            .expect("stamp peer-node environment");
+        repository::set_trusted_node_environment(
+            &db,
+            "peer-node",
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        )
+        .expect("stamp peer-node environment");
         registry.replace_local(
             "local-node".to_string(),
             vec![external_service_info(
@@ -1437,8 +1441,12 @@ mod tests {
         // ROADMAP Z12 (P2-7) fence does not drop it as "unknown".
         repository::add_trusted_node(&pool, "peer-node", "pub", "peer-node", "test-harness", None)
             .expect("trust peer-node for test");
-        repository::set_trusted_node_environment(&pool, "peer-node", tentaflow_protocol::environment::NodeEnvironment::Prod)
-            .expect("stamp peer-node environment");
+        repository::set_trusted_node_environment(
+            &pool,
+            "peer-node",
+            tentaflow_protocol::environment::NodeEnvironment::Prod,
+        )
+        .expect("stamp peer-node environment");
         registry.replace_local(
             "local-node".to_string(),
             vec![external_service_info(

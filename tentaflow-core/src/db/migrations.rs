@@ -773,6 +773,26 @@ fn get_migrations() -> Vec<(i64, &'static str, MigrationStep)> {
             "trusted_nodes_environment_column",
             MigrationStep::Rust(add_trusted_nodes_environment_column),
         ),
+        (
+            146,
+            "bus_topics_and_groups",
+            MigrationStep::Sql(BUS_TOPICS_AND_GROUPS),
+        ),
+        (
+            147,
+            "bus_rbac_permissions",
+            MigrationStep::Rust(roles_add_bus_permissions),
+        ),
+        (
+            148,
+            "bus_topics_durability_class_column",
+            MigrationStep::Rust(bus_topics_add_durability_class_column),
+        ),
+        (
+            149,
+            "bus_partition_assignments",
+            MigrationStep::Sql(BUS_PARTITION_ASSIGNMENTS),
+        ),
     ]
 }
 
@@ -3333,6 +3353,14 @@ fn intentionally_text_non_identity() -> Vec<IntentionalTextNonIdentity> {
             "created_by",
             "attribution inside the NODE-LOCAL vault; same rationale as \
              code_workspace_secrets.created_by",
+        ),
+        t(
+            "bus_groups",
+            "group_id",
+            "TentaBus consumer-group identifier (PLAN.md §7.1); own-generated PK on \
+             this table, matches the `group_id` naming pattern used for the unrelated \
+             user_groups(id) FK by coincidence, born TEXT in v146 (post-flip), no \
+             user_groups FK",
         ),
     ]
 }
@@ -7966,6 +7994,177 @@ INSERT INTO role_catalog (id, org_id, slug, kind, name_translations, description
  'i-user-cog', 0, 'assigned');
 "#;
 
+// v146 — TentaBus core plane (M1, tor D): topic definitions and consumer
+// group bookkeeping live in SQLite as the administrative source of truth;
+// the log itself (segments, offsets, dedup) lives outside SQLite per
+// `SUM/tentabus/PLAN.md` §2.1/§3.2. Idempotent via `CREATE TABLE/INDEX IF
+// NOT EXISTS` — safe to re-run against an already-migrated database.
+//
+// COORDINATION: shape (column names/types/PK) is a byte-for-byte match of
+// `db/repository.rs`'s `bus_test_support::create_bus_tables` fixture (the
+// parallel `tentaflow-core/src/bus/` track's `DbBusTopic`/`DbBusGroup` +
+// `BUS_TOPIC_COLUMNS`/`BUS_GROUP_COLUMNS` raw-SQL column lists depend on
+// these exact names — a rename here is a silent "no such column" at
+// runtime, not a compile error, since those are runtime-built SQL strings).
+// Deliberately no CHECK constraints beyond PK/NOT NULL and no FK to
+// `organizations`: `bus::topics`/`bus::groups` already validate ranges and
+// enum strings in Rust before an INSERT/UPDATE reaches here (partitions
+// 1-256, replication_factor 1-7 clamped, enum fields via `as_str()`), and
+// `bus/mod.rs` tests exercise topics under `org_id = "org-1"`, which never
+// exists in `organizations` — an FK would reject every one of them.
+// Replica node assignment (PLAN §4.1 `replicas: [node_id]`) is NOT a column
+// here: it lives in the Sync Ledger (`CoreSyncResourceKind::
+// BusPartitionAssignment`, M2 scope), not in this administrative table.
+const BUS_TOPICS_AND_GROUPS: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_topics (
+    org_id                 TEXT NOT NULL,
+    name                   TEXT NOT NULL,
+    partitions             INTEGER NOT NULL,
+    retention_ms           INTEGER NOT NULL,
+    retention_bytes        INTEGER NOT NULL,
+    cleanup_policy         TEXT NOT NULL,
+    delivery               TEXT NOT NULL,
+    idempotency_key        TEXT,
+    dedup_window_ms        INTEGER NOT NULL,
+    max_delivery_attempts  INTEGER NOT NULL,
+    retry_backoff_ms       INTEGER NOT NULL,
+    schema_id              TEXT,
+    validation             TEXT NOT NULL,
+    content_type           TEXT NOT NULL,
+    replication_factor     INTEGER NOT NULL,
+    acks                   TEXT NOT NULL,
+    durability             TEXT NOT NULL,
+    max_inline_bytes       INTEGER NOT NULL,
+    compression            TEXT NOT NULL,
+    environment            TEXT NOT NULL,
+    created_at_ms          INTEGER NOT NULL,
+    updated_at_ms          INTEGER NOT NULL,
+    PRIMARY KEY (org_id, name)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_topics_org
+    ON bus_topics(org_id, environment);
+
+CREATE TABLE IF NOT EXISTS bus_groups (
+    org_id         TEXT NOT NULL,
+    group_id       TEXT NOT NULL,
+    topic          TEXT NOT NULL,
+    commit_mode    TEXT NOT NULL,
+    paused         INTEGER NOT NULL DEFAULT 0,
+    created_at_ms  INTEGER NOT NULL,
+    updated_at_ms  INTEGER NOT NULL,
+    PRIMARY KEY (org_id, group_id, topic)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_groups_org
+    ON bus_groups(org_id);
+"#;
+
+/// v147 — RBAC for TentaBus (`SUM/tentabus/PLAN.md` §8.1): `bus.read` from
+/// `org_viewer` upward, `bus.write` from `org_operator` upward, `bus.admin`
+/// only `org_admin`. Mirrors the `document.read`/`document.write` and
+/// `graph.read`/`graph.write` tiering (`roles_add_document_permissions`,
+/// `roles_add_graph_permissions`). Idempotent via `roles_add_permissions`.
+fn roles_add_bus_permissions(conn: &Connection) -> Result<()> {
+    roles_add_permissions(
+        conn,
+        &["org_admin", "org_operator", "org_viewer"],
+        &["bus.read"],
+    )?;
+    roles_add_permissions(conn, &["org_admin", "org_operator"], &["bus.write"])?;
+    roles_add_permissions(conn, &["org_admin"], &["bus.admin"])
+}
+
+/// v148 — owner decision B follow-up (`SUM/tentabus/KRYTYK-M1-R5.md` R5-1/
+/// R5-7): persists the durability CLASS separately from the resolved POLICY
+/// string, so the UI can finally tell "class-derived" apart from "explicit
+/// override" honestly instead of guessing from `durability` alone (the old
+/// guess, `TopicConfig::durability_class()`, maps every `os` override —
+/// explicit or not — to "standard" and every `fsync_batch*` policy —
+/// explicit or not — to "critical", so a Critical-class topic with an
+/// explicit `os` override showed up identically to a genuine Standard-class
+/// topic; R5-1/R5-7 in the linked critique round).
+///
+/// NULL = explicit policy (`durability` was set directly via
+/// `TopicOptions::durability`, independent of any class); `'standard'` /
+/// `'critical'` = the class this topic's `durability` was last resolved
+/// from (`bus::topics::DurabilityClass::resolve`), kept in sync by
+/// `TopicConfig::from_options`/`apply_options` from here on.
+///
+/// BACKFILL ASSUMPTION (documented because it cannot be re-derived from
+/// anything else once this migration has run): every row that existed
+/// before this column was added was written by `TopicConfig::from_options`/
+/// `apply_options` in a build that had no way to distinguish "explicit"
+/// from "class-derived" at all — both paths funnelled through the same
+/// `durability` string. This migration therefore treats every pre-v148 row
+/// as if it had been class-derived, using the exact same family split
+/// `TopicConfig::durability_class()` already used for display:
+/// `fsync_batch`/`fsync_batch_full` -> `'critical'`, everything else
+/// (`os`/`fsync_interval:*`) -> `'standard'`. A row that actually WAS an
+/// intentional explicit override before v148 will incorrectly read back as
+/// class-derived after it — there was no prior column to tell the two
+/// apart, which is precisely the gap this migration closes going forward.
+/// Idempotent: `run()` only invokes migration steps once per version per
+/// database (see `run`'s `version > current_version` guard), so in normal
+/// operation this backfill UPDATE only ever touches genuinely NULL rows
+/// once; the `WHERE durability_class IS NULL` guards on both UPDATEs also
+/// make a direct second call to this function (e.g. in the idempotency
+/// test below) a no-op rather than re-overwriting a value a later
+/// `apply_options` call has since set explicitly to NULL.
+fn bus_topics_add_durability_class_column(conn: &Connection) -> Result<()> {
+    if !column_exists(conn, "bus_topics", "durability_class")? {
+        conn.execute_batch("ALTER TABLE bus_topics ADD COLUMN durability_class TEXT;")?;
+    }
+    conn.execute_batch(
+        "UPDATE bus_topics SET durability_class = 'critical' \
+         WHERE durability_class IS NULL AND durability LIKE 'fsync_batch%';",
+    )?;
+    conn.execute_batch(
+        "UPDATE bus_topics SET durability_class = 'standard' \
+         WHERE durability_class IS NULL AND durability NOT LIKE 'fsync_batch%';",
+    )?;
+    Ok(())
+}
+
+/// v149 — TentaBus M2 replication (`SUM/tentabus/PLAN-M2.md` §1c/§2,
+/// K-M2-4): `bus_partition_assignments` is a MATERIALIZATION of the sync
+/// ledger's `CoreSyncResourceKind::BusPartitionAssignment` resource, not a
+/// second source of truth — every write to this table goes through
+/// capture -> ledger -> `core_materializer::apply_bus_partition_assignment`
+/// (wave 1, agent L), never a direct `INSERT`/`UPDATE` from `bus/mod.rs` or
+/// `bus::replication`. `isr` is a fast-changing snapshot kept here for the
+/// M06 UI and for "candidate must be in the last assignment's ISR"
+/// (PLAN-M2 §0 K-M2-3) — it is pushed to the ledger only alongside a
+/// leader or replica-set change, never on every shrink/expand (PLAN-M2 §2:
+/// pushing it on every ISR change would turn the ledger into a streaming
+/// channel, exactly what PLAN §1.2 warns against).
+///
+/// `replicas`/`isr` are JSON arrays (stable order for `replicas`) rather
+/// than a satellite table, matching `bus_topics`' own precedent of storing
+/// small structured config as a single column instead of normalizing it —
+/// nothing here needs to filter/join on individual replica node ids in
+/// SQL, only read the whole set for one partition at a time (UI, election
+/// candidate check).
+///
+/// No `environment` FK/CHECK: `bus_topics.environment` already fences
+/// which nodes may be assigned (`create_topic` filters replica candidates
+/// to the topic's own environment, PLAN-M2 §1b's "Fencing środowisk" point
+/// 1) — this table trusts that upstream decision the same way it trusts
+/// `bus_topics` for every other per-topic config.
+const BUS_PARTITION_ASSIGNMENTS: &str = r#"
+CREATE TABLE IF NOT EXISTS bus_partition_assignments (
+    org_id          TEXT NOT NULL,
+    topic           TEXT NOT NULL,
+    partition       INTEGER NOT NULL,
+    leader_node_id  TEXT NOT NULL,
+    replicas        TEXT NOT NULL,
+    isr             TEXT NOT NULL,
+    leader_epoch    INTEGER NOT NULL,
+    environment     TEXT NOT NULL,
+    updated_at_ms   INTEGER NOT NULL,
+    PRIMARY KEY (org_id, topic, partition)
+);
+CREATE INDEX IF NOT EXISTS idx_bus_assign_leader ON bus_partition_assignments(leader_node_id);
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -9866,10 +10065,7 @@ mod tests {
             )
             .unwrap();
         }
-        for (id, status, iterations) in [
-            ("run-a", "completed", 7),
-            ("run-b", "failed", 2),
-        ] {
+        for (id, status, iterations) in [("run-a", "completed", 7), ("run-b", "failed", 2)] {
             conn.execute(
                 "INSERT INTO agent_runs (id, agent_id, status, prompt, iterations) \
                  VALUES (?1, 'agent-1', ?2, 'do the thing', ?3)",
@@ -9895,7 +10091,8 @@ mod tests {
             "no flow execution may be lost by the upgrade"
         );
         assert_eq!(
-            conn.query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r.get::<_, i64>(0))
+            conn.query_row("SELECT COUNT(*) FROM agent_runs", [], |r| r
+                .get::<_, i64>(0))
                 .unwrap(),
             runs_before,
             "no agent run may be lost by the upgrade"
@@ -10121,14 +10318,14 @@ mod tests {
     }
 
     #[test]
-    fn fresh_database_migrates_to_145_with_clean_foreign_keys() {
+    fn fresh_database_migrates_to_149_with_clean_foreign_keys() {
         let conn = Connection::open_in_memory().unwrap();
         run(&conn).unwrap();
 
         let head: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head, 145, "145 must be the highest applied migration");
+        assert_eq!(head, 149, "149 must be the highest applied migration");
         assert!(foreign_key_check(&conn).unwrap().is_empty());
 
         // Running the whole ladder twice must be a no-op.
@@ -10136,7 +10333,208 @@ mod tests {
         let head_again: i64 = conn
             .query_row("SELECT MAX(version) FROM _migrations", [], |r| r.get(0))
             .unwrap();
-        assert_eq!(head_again, 145);
+        assert_eq!(head_again, 149);
+    }
+
+    #[test]
+    fn bus_partition_assignments_table_exists_after_migration() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_partition_assignments \
+             (org_id, topic, partition, leader_node_id, replicas, isr, leader_epoch, \
+              environment, updated_at_ms) \
+             VALUES ('org-1', 'orders', 0, 'node-a', '[\"node-a\",\"node-b\"]', \
+              '[\"node-a\",\"node-b\"]', 1, 'prod', 0)",
+            [],
+        )
+        .unwrap();
+        let leader: String = conn
+            .query_row(
+                "SELECT leader_node_id FROM bus_partition_assignments \
+                 WHERE org_id='org-1' AND topic='orders' AND partition=0",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(leader, "node-a");
+    }
+
+    #[test]
+    fn bus_topics_durability_class_column_is_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        assert!(column_exists(&conn, "bus_topics", "durability_class").unwrap());
+
+        // Re-running on an already-migrated database is a no-op, not a
+        // duplicate column error.
+        bus_topics_add_durability_class_column(&conn).unwrap();
+        assert!(column_exists(&conn, "bus_topics", "durability_class").unwrap());
+    }
+
+    #[test]
+    fn bus_topics_durability_class_backfill_splits_by_policy_family() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let insert = |name: &str, durability: &str| {
+            conn.execute(
+                "INSERT INTO bus_topics (\
+                    org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                    delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                    retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                    acks, durability, max_inline_bytes, compression, environment, \
+                    created_at_ms, updated_at_ms \
+                 ) VALUES (\
+                    'org-default', ?1, 8, 604800000, 10737418240, 'delete', \
+                    'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                    'application/octet-stream', 1, 'leader', ?2, 1048576, \
+                    'lz4', 'prod', 1000, 1000 \
+                 )",
+                rusqlite::params![name, durability],
+            )
+            .unwrap();
+        };
+        // The column already exists post-`run`, so simulate a pre-v148 row
+        // by inserting straight into the (already migrated) table with
+        // `durability_class` left at its column default (NULL) — same
+        // shape a row written before this migration existed would have had.
+        insert("orders.created", "fsync_interval:50");
+        insert("telemetry.raw", "os");
+        insert("lab.results", "fsync_batch_full");
+        insert("orders.audit", "fsync_batch");
+
+        // Force every row back to NULL first (the fixture rows above were
+        // inserted after the column already existed, so the migration's own
+        // backfill already ran once and left them non-NULL) so the second
+        // call below exercises the actual backfill logic, not a no-op.
+        conn.execute_batch("UPDATE bus_topics SET durability_class = NULL;")
+            .unwrap();
+        bus_topics_add_durability_class_column(&conn).unwrap();
+
+        let class_of = |name: &str| -> Option<String> {
+            conn.query_row(
+                "SELECT durability_class FROM bus_topics WHERE name = ?1",
+                rusqlite::params![name],
+                |r| r.get(0),
+            )
+            .unwrap()
+        };
+        assert_eq!(class_of("orders.created").as_deref(), Some("standard"));
+        assert_eq!(class_of("telemetry.raw").as_deref(), Some("standard"));
+        assert_eq!(class_of("lab.results").as_deref(), Some("critical"));
+        assert_eq!(class_of("orders.audit").as_deref(), Some("critical"));
+
+        // A row already carrying an explicit-policy NULL marker must not be
+        // clobbered by re-running the backfill.
+        conn.execute(
+            "UPDATE bus_topics SET durability_class = NULL, durability = 'os' \
+             WHERE name = 'lab.results'",
+            [],
+        )
+        .unwrap();
+        bus_topics_add_durability_class_column(&conn).unwrap();
+        assert_eq!(
+            class_of("lab.results").as_deref(),
+            Some("standard"),
+            "the WHERE durability_class IS NULL guard cannot distinguish this from a real \
+             pre-v148 row — documented in this migration's own doc comment as the known gap"
+        );
+    }
+
+    #[test]
+    fn bus_topics_and_groups_tables_are_idempotent() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        // Re-applying the batch (CREATE TABLE/INDEX IF NOT EXISTS) must not
+        // error on an already-migrated database.
+        conn.execute_batch(BUS_TOPICS_AND_GROUPS).unwrap();
+
+        conn.execute(
+            "INSERT INTO bus_topics (\
+                org_id, name, partitions, retention_ms, retention_bytes, cleanup_policy, \
+                delivery, idempotency_key, dedup_window_ms, max_delivery_attempts, \
+                retry_backoff_ms, schema_id, validation, content_type, replication_factor, \
+                acks, durability, max_inline_bytes, compression, environment, \
+                created_at_ms, updated_at_ms \
+             ) VALUES (\
+                'org-default', 'orders.created', 8, 604800000, 10737418240, 'delete', \
+                'at_least_once', NULL, 86400000, 5, 1000, NULL, 'off', \
+                'application/octet-stream', 1, 'leader', 'fsync_batch_full', 1048576, \
+                'lz4', 'prod', 1000, 1000 \
+             )",
+            [],
+        )
+        .unwrap();
+        let (partitions, retention_ms, acks): (i64, i64, String) = conn
+            .query_row(
+                "SELECT partitions, retention_ms, acks FROM bus_topics \
+                 WHERE org_id = 'org-default' AND name = 'orders.created'",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(partitions, 8);
+        assert_eq!(retention_ms, 604_800_000);
+        assert_eq!(acks, "leader");
+
+        conn.execute(
+            "INSERT INTO bus_groups (org_id, group_id, topic, commit_mode, paused, \
+                created_at_ms, updated_at_ms) \
+             VALUES ('org-default', 'grp-1', 'orders.created', 'auto_after_success', 0, 1000, 1000)",
+            [],
+        )
+        .unwrap();
+        let commit_mode: String = conn
+            .query_row(
+                "SELECT commit_mode FROM bus_groups \
+                 WHERE org_id = 'org-default' AND group_id = 'grp-1' AND topic = 'orders.created'",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(commit_mode, "auto_after_success");
+
+        assert!(foreign_key_check(&conn).unwrap().is_empty());
+    }
+
+    #[test]
+    fn bus_permissions_land_on_the_right_role_tiers() {
+        let conn = Connection::open_in_memory().unwrap();
+        run(&conn).unwrap();
+
+        let admin = role_permissions(&conn, "org_admin");
+        let operator = role_permissions(&conn, "org_operator");
+        let viewer = role_permissions(&conn, "org_viewer");
+
+        for perm in ["bus.read", "bus.write", "bus.admin"] {
+            assert!(
+                admin.contains(&perm.to_string()),
+                "org_admin must carry {perm}"
+            );
+        }
+        assert!(operator.contains(&"bus.read".to_string()));
+        assert!(operator.contains(&"bus.write".to_string()));
+        assert!(!operator.contains(&"bus.admin".to_string()));
+
+        assert!(viewer.contains(&"bus.read".to_string()));
+        assert!(!viewer.contains(&"bus.write".to_string()));
+        assert!(!viewer.contains(&"bus.admin".to_string()));
+
+        // Idempotent — re-running the grant must not duplicate entries or error.
+        roles_add_bus_permissions(&conn).unwrap();
+        let admin_again = role_permissions(&conn, "org_admin");
+        assert_eq!(
+            admin_again
+                .iter()
+                .filter(|p| p.as_str() == "bus.admin")
+                .count(),
+            1,
+            "re-running the grant must not duplicate bus.admin"
+        );
     }
 
     #[test]

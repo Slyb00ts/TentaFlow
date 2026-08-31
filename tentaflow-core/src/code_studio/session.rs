@@ -314,7 +314,10 @@ pub fn close_session(workspace_id: &str, pool: &DbPool, session_id: &str) -> Res
     ) {
         Ok(0) => {}
         Ok(count) => tracing::debug!(session_id, count, "shared sandboxes destroyed with session"),
-        Err(error) => warn!(session_id, "shared sandbox not destroyed at close: {error:#}"),
+        Err(error) => warn!(
+            session_id,
+            "shared sandbox not destroyed at close: {error:#}"
+        ),
     }
 
     let broker = Broker::for_workspace(workspace_id)?;
@@ -465,7 +468,13 @@ pub fn claim_subagent_runs(
                         ?3, ?4, 'running', datetime('now') \
                  FROM session_runs WHERE session_id = ?2 \
                  HAVING COUNT(*) < ?5",
-                rusqlite::params![run.run_id, session_id, run.parent_run_id, run.agent_id, budget],
+                rusqlite::params![
+                    run.run_id,
+                    session_id,
+                    run.parent_run_id,
+                    run.agent_id,
+                    budget
+                ],
             )?;
             if claimed == 0 {
                 used = Some(tx.query_row(
@@ -597,7 +606,6 @@ mod tests {
     use super::*;
     use crate::code_studio::models::{EgressEnforcement, ExecMode, NewWorkspace, WorkspaceStatus};
     use crate::code_studio::{paths, provisioning, repository};
-
 
     struct Fixture {
         _data: tempfile::TempDir,
@@ -880,7 +888,9 @@ mod tests {
             "{opened} sessions opened against a quota of {quota}; refusals: {refusals:?}"
         );
         assert!(
-            refusals.iter().all(|reason| reason.contains("open session")),
+            refusals
+                .iter()
+                .all(|reason| reason.contains("open session")),
             "a request failed for a reason other than the quota: {refusals:?}"
         );
 
@@ -942,7 +952,13 @@ mod tests {
         .unwrap();
     }
 
-    fn claim_one(pool: &DbPool, session_id: &str, run_id: &str, parent: &str, budget: i64) -> Result<()> {
+    fn claim_one(
+        pool: &DbPool,
+        session_id: &str,
+        run_id: &str,
+        parent: &str,
+        budget: i64,
+    ) -> Result<()> {
         claim_subagent_runs(
             pool,
             session_id,
@@ -1003,7 +1019,10 @@ mod tests {
             )
             .unwrap()
         };
-        assert_eq!(running, budget, "runs already started must survive a refusal");
+        assert_eq!(
+            running, budget,
+            "runs already started must survive a refusal"
+        );
         release();
     }
 

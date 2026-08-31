@@ -364,7 +364,9 @@ pub struct GenerationBinding {
 /// Extracts the binding from `envelope.meta[GENERATION_META_KEY]`. Absent or
 /// malformed = the run was not spawned by GenerationStart → the tool must
 /// refuse (the model cannot forge the binding: meta is server-owned).
-pub fn binding_from_meta(meta: &std::collections::BTreeMap<String, Value>) -> Option<GenerationBinding> {
+pub fn binding_from_meta(
+    meta: &std::collections::BTreeMap<String, Value>,
+) -> Option<GenerationBinding> {
     let value = meta.get(GENERATION_META_KEY)?;
     let project_id = value.get("project_id")?.as_str()?.trim();
     let gen_id = value.get("gen_id")?.as_str()?.trim();
@@ -433,8 +435,8 @@ pub fn validate_case_content(
     language: &str,
     content_json: &str,
 ) -> std::result::Result<(), String> {
-    let content: Value = serde_json::from_str(content_json)
-        .map_err(|e| format!("invalid content_json: {e}"))?;
+    let content: Value =
+        serde_json::from_str(content_json).map_err(|e| format!("invalid content_json: {e}"))?;
     if !content.is_object() {
         return Err("content_json must be an object".to_string());
     }
@@ -938,7 +940,9 @@ pub fn build_generation_prompt(input: &GenerationPromptInput<'_>) -> String {
     ));
     prompt.push_str("<<<SOURCES>>>\n");
     for (source_id, name, kind) in input.sources {
-        prompt.push_str(&format!("- source_id={source_id} kind={kind} name={name}\n"));
+        prompt.push_str(&format!(
+            "- source_id={source_id} kind={kind} name={name}\n"
+        ));
     }
     prompt.push_str("<<<END SOURCES>>>\n\n");
     if !input.instructions.trim().is_empty() {
@@ -989,17 +993,20 @@ pub fn build_generation_prompt(input: &GenerationPromptInput<'_>) -> String {
 
 /// D.4 mapping of a terminal agent-run status onto the generation status.
 /// Returns `(status, error)`.
-fn map_terminal(run_status: &str, run_error: Option<&str>, cases_generated: u32) -> (String, String) {
+fn map_terminal(
+    run_status: &str,
+    run_error: Option<&str>,
+    cases_generated: u32,
+) -> (String, String) {
     match run_status {
         "completed" if cases_generated > 0 => ("review".to_string(), String::new()),
         "completed" => (
             "failed".to_string(),
             "agent zakończył pracę bez zapisania przypadków".to_string(),
         ),
-        "cancelled" if cases_generated > 0 => (
-            "review".to_string(),
-            "anulowano — częściowe".to_string(),
-        ),
+        "cancelled" if cases_generated > 0 => {
+            ("review".to_string(), "anulowano — częściowe".to_string())
+        }
         "cancelled" => ("cancelled".to_string(), String::new()),
         other => (
             "failed".to_string(),
@@ -1094,9 +1101,7 @@ fn record_compliance_sources(
     if rows.is_empty() {
         return Ok(());
     }
-    let conn = core_db
-        .write()
-        .map_err(|e| anyhow!("core db write: {e}"))?;
+    let conn = core_db.write().map_err(|e| anyhow!("core db write: {e}"))?;
     let Some(event_id) =
         crate::compliance::repository::latest_ai_event_id_for_run(&conn, &generation.agent_run_id)?
     else {
@@ -1201,10 +1206,7 @@ pub fn reconcile_running(core_db: &DbPool, pool: &DbPool, org_id: &str, project_
     for generation in running {
         let (status, error) = if generation.agent_run_id.is_empty() {
             // Start crashed between the row insert and the spawn update.
-            (
-                "failed".to_string(),
-                "agent run never started".to_string(),
-            )
+            ("failed".to_string(), "agent run never started".to_string())
         } else {
             match crate::db::repository::get_agent_run(core_db, &generation.agent_run_id) {
                 Ok(Some(run)) => {
@@ -1222,16 +1224,19 @@ pub fn reconcile_running(core_db: &DbPool, pool: &DbPool, org_id: &str, project_
                         continue;
                     }
                 }
-                Ok(None) => (
-                    "failed".to_string(),
-                    "agent run record missing".to_string(),
-                ),
+                Ok(None) => ("failed".to_string(), "agent run record missing".to_string()),
                 Err(_) => continue,
             }
         };
-        if let Err(e) =
-            finalize_generation(core_db, pool, org_id, project_id, &generation, &status, &error)
-        {
+        if let Err(e) = finalize_generation(
+            core_db,
+            pool,
+            org_id,
+            project_id,
+            &generation,
+            &status,
+            &error,
+        ) {
             tracing::warn!(gen_id = %generation.gen_id, "generation reconcile failed: {e}");
         }
     }
@@ -1285,8 +1290,12 @@ mod unit_tests {
             r#"{"script":"x","config":{"viewport":{"width":1280,"height":720},"headed":true}}"#
         )
         .is_ok());
-        assert!(validate_case_content("api", "python", r#"{"script":"x","config":{"timeout_ms":5}}"#)
-            .is_err());
+        assert!(validate_case_content(
+            "api",
+            "python",
+            r#"{"script":"x","config":{"timeout_ms":5}}"#
+        )
+        .is_err());
         assert!(
             validate_case_content("perf", "python", r#"{"script":"x","profile":{"users":0}}"#)
                 .is_err()
@@ -1313,10 +1322,12 @@ mod unit_tests {
             r#"{"script":"x","checklist":["brak IDOR"]}"#
         )
         .is_ok());
-        assert!(
-            validate_case_content("unit", "python", r#"{"script":"x","build_profile_ref":""}"#)
-                .is_err()
-        );
+        assert!(validate_case_content(
+            "unit",
+            "python",
+            r#"{"script":"x","build_profile_ref":""}"#
+        )
+        .is_err());
 
         // Structural junk.
         assert!(validate_case_content("api", "python", "not json").is_err());
@@ -1336,7 +1347,10 @@ mod unit_tests {
         assert_eq!(agent_function_for_kind("security"), Some("security"));
         assert_eq!(agent_function_for_kind("nope"), None);
         assert_eq!(default_agent_id_for_kind("perf"), GENERATOR_PERF_AGENT_ID);
-        assert_eq!(default_agent_id_for_kind("manual"), GENERATOR_MANUAL_AGENT_ID);
+        assert_eq!(
+            default_agent_id_for_kind("manual"),
+            GENERATOR_MANUAL_AGENT_ID
+        );
         assert_eq!(default_agent_id_for_kind("nope"), GENERATOR_MANUAL_AGENT_ID);
 
         // The prompt embeds the contract and fences the user instructions.
@@ -1452,7 +1466,10 @@ mod unit_tests {
         .expect_err("foreign source rejected");
         assert!(err.contains("outside the sources"), "{err}");
         assert_eq!(
-            get_generation(&pool, &gen_id).unwrap().unwrap().cases_generated,
+            get_generation(&pool, &gen_id)
+                .unwrap()
+                .unwrap()
+                .cases_generated,
             0
         );
 
@@ -1477,7 +1494,10 @@ mod unit_tests {
             assert_eq!(out["remaining"], 2 - (i as u64) - 1);
         }
         assert_eq!(
-            get_generation(&pool, &gen_id).unwrap().unwrap().cases_generated,
+            get_generation(&pool, &gen_id)
+                .unwrap()
+                .unwrap()
+                .cases_generated,
             2
         );
         let err = save_generated_case(

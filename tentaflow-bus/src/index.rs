@@ -166,6 +166,27 @@ impl OffsetIndex {
         })
     }
 
+    /// Drops every entry at or past `new_len` bytes and truncates the
+    /// backing file to match what remains (M2, PLAN-M2 §1a:
+    /// `Partition::truncate_to_offset`). Entries are appended in
+    /// increasing `file_pos` order, so "keep entries with `file_pos <
+    /// new_len`" is always a prefix of the array — the same
+    /// rebuild-in-lockstep discipline `reset()` uses for full-segment
+    /// recovery, but for a partial cut back to an earlier valid boundary
+    /// instead of to empty.
+    pub fn truncate_to_file_pos(&mut self, new_len: u32) -> Result<()> {
+        let keep = {
+            let mut entries = self.entries.write();
+            entries.retain(|e| e.file_pos < new_len);
+            entries.len()
+        };
+        self.file
+            .set_len((keep * OffsetEntry::ENCODED_LEN) as u64)
+            .map_err(|e| BusError::io(&self.path, e))?;
+        self.file = open_append(&self.path)?;
+        Ok(())
+    }
+
     pub fn entries(&self) -> Vec<OffsetEntry> {
         self.entries.read().clone()
     }
@@ -208,8 +229,8 @@ impl TimeIndex {
 
     /// Appends `entry`, *unless* its timestamp does not strictly increase
     /// over the last appended entry, in which case the entry is silently
-    /// dropped (review P2-2). `binary_search_by` in `floor_by` assumes a
-    /// sorted key sequence; nothing enforces `base_timestamp_ms`
+    /// dropped. `binary_search_by` in `floor_by` assumes a sorted key
+    /// sequence; nothing enforces `base_timestamp_ms`
     /// monotonicity upstream (it comes straight from a producer-supplied
     /// `RecordInput::timestamp_ms`, PLAN §2.3), so with multiple producers
     /// or clock drift the raw sequence of batch timestamps is not
@@ -243,6 +264,26 @@ impl TimeIndex {
 
     pub fn floor(&self, target_ts_ms: i64) -> Option<TimeEntry> {
         floor_by(&self.entries.read(), target_ts_ms, |e| e.ts_ms)
+    }
+
+    /// Drops every entry at or past `max_offset_delta` and truncates the
+    /// backing file to match (M2, PLAN-M2 §1a:
+    /// `Partition::truncate_to_offset`). Filtered by `offset_delta` rather
+    /// than by position/count the way `OffsetIndex::truncate_to_file_pos`
+    /// is: `TimeIndex::append` silently drops non-increasing timestamps, so
+    /// this index can have fewer entries than the offset index for the same
+    /// segment and the two cannot be kept in lockstep by count alone.
+    pub fn truncate_to_offset_delta(&mut self, max_offset_delta: u32) -> Result<()> {
+        let keep = {
+            let mut entries = self.entries.write();
+            entries.retain(|e| e.offset_delta < max_offset_delta);
+            entries.len()
+        };
+        self.file
+            .set_len((keep * TimeEntry::ENCODED_LEN) as u64)
+            .map_err(|e| BusError::io(&self.path, e))?;
+        self.file = open_append(&self.path)?;
+        Ok(())
     }
 
     pub fn entries(&self) -> Vec<TimeEntry> {
@@ -320,6 +361,52 @@ mod tests {
     }
 
     #[test]
+    fn offset_index_truncate_to_file_pos_keeps_only_the_prefix() {
+        let dir = temp_dir("oidx-truncate");
+        let path = dir.join("idx.oidx");
+        let mut idx = OffsetIndex::open_or_create(&path).unwrap();
+        for i in 0..5u32 {
+            idx.append(OffsetEntry {
+                offset_delta: i,
+                file_pos: i * 100,
+            })
+            .unwrap();
+        }
+        // Keep entries with file_pos < 300: deltas 0,1,2 (pos 0,100,200).
+        idx.truncate_to_file_pos(300).unwrap();
+        assert_eq!(
+            idx.entries(),
+            vec![
+                OffsetEntry {
+                    offset_delta: 0,
+                    file_pos: 0
+                },
+                OffsetEntry {
+                    offset_delta: 1,
+                    file_pos: 100
+                },
+                OffsetEntry {
+                    offset_delta: 2,
+                    file_pos: 200
+                },
+            ]
+        );
+
+        // Reload from disk to prove the file itself was truncated.
+        let reloaded = OffsetIndex::open_or_create(&path).unwrap();
+        assert_eq!(reloaded.entries().len(), 3);
+
+        // Appending after a truncate resumes correctly.
+        let mut idx = reloaded;
+        idx.append(OffsetEntry {
+            offset_delta: 10,
+            file_pos: 300,
+        })
+        .unwrap();
+        assert_eq!(idx.entries().len(), 4);
+    }
+
+    #[test]
     fn offset_index_reset() {
         let dir = temp_dir("oidx-reset");
         let path = dir.join("idx.oidx");
@@ -362,10 +449,10 @@ mod tests {
         assert_eq!(idx.floor(999_999).unwrap().offset_delta, 4);
     }
 
-    /// Review P2-2: a non-increasing timestamp (clock drift between
-    /// producers, or a batch that is simply out of order) must be dropped
-    /// rather than appended, since `floor` relies on `binary_search_by`
-    /// over a sorted sequence.
+    /// A non-increasing timestamp (clock drift between producers, or a
+    /// batch that is simply out of order) must be dropped rather than
+    /// appended, since `floor` relies on `binary_search_by` over a sorted
+    /// sequence.
     #[test]
     fn time_index_drops_non_increasing_timestamps() {
         let dir = temp_dir("tidx-monotonic");
@@ -402,5 +489,27 @@ mod tests {
         // written, not just filtered in memory.
         let reloaded = TimeIndex::open_or_create(&path).unwrap();
         assert_eq!(reloaded.entries().len(), 2);
+    }
+
+    #[test]
+    fn time_index_truncate_to_offset_delta_keeps_only_the_prefix() {
+        let dir = temp_dir("tidx-truncate");
+        let path = dir.join("idx.tidx");
+        let mut idx = TimeIndex::open_or_create(&path).unwrap();
+        for i in 0..5i64 {
+            idx.append(TimeEntry {
+                ts_ms: 1_000 + i * 100,
+                offset_delta: i as u32,
+            })
+            .unwrap();
+        }
+        // Keep entries with offset_delta < 3: deltas 0,1,2.
+        idx.truncate_to_offset_delta(3).unwrap();
+        let entries = idx.entries();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].offset_delta, 2);
+
+        let reloaded = TimeIndex::open_or_create(&path).unwrap();
+        assert_eq!(reloaded.entries().len(), 3);
     }
 }

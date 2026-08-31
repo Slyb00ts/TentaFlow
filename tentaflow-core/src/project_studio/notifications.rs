@@ -82,7 +82,16 @@ fn insert_deduped(
     conn.execute(
         "INSERT INTO notifications (notification_id, org_id, user_id, project_id, kind, \
             title, body, link_json) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![notification_id, org_id, user_id, project_id, kind, title, body, link_json],
+        params![
+            notification_id,
+            org_id,
+            user_id,
+            project_id,
+            kind,
+            title,
+            body,
+            link_json
+        ],
     )?;
     Ok(Some(notification_id))
 }

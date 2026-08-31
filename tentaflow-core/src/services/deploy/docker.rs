@@ -28,9 +28,9 @@ use super::{
 use crate::services::manifest::{DockerTransport, ServiceManifest};
 use crate::services::ports::PortAllocator;
 use crate::services::transport::Transport;
+use crate::services_repo::services as services_repo;
 #[cfg(feature = "docker")]
 use crate::services_repo::services::DeployMethod;
-use crate::services_repo::services as services_repo;
 
 /// Fixed container-side QUIC port the sidecar binds (its baked
 /// `config.default.toml [transport].port`). The host-allocated sidecar port maps
@@ -1996,7 +1996,8 @@ impl DeployStrategy for DockerDeploy {
         // The test runner executes agent-authored scripts: the container is the
         // security boundary, so it runs with a read-only rootfs, dropped
         // capabilities and hard memory/CPU/PID caps.
-        let sandbox = (self.manifest.engine.id == crate::project_studio::auto_runs::RUNNER_ENGINE_ID)
+        let sandbox = (self.manifest.engine.id
+            == crate::project_studio::auto_runs::RUNNER_ENGINE_ID)
             .then(crate::deploy::docker::SandboxLimits::test_runner);
         let id = backend::run(
             &docker,
@@ -2557,7 +2558,10 @@ mod tests {
             "Step ",
             "Successfully built 0123456789ab",
         ] {
-            assert!(parse_build_step(line).is_none(), "nie powinno parsowac: {line}");
+            assert!(
+                parse_build_step(line).is_none(),
+                "nie powinno parsowac: {line}"
+            );
         }
     }
 

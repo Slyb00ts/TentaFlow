@@ -260,14 +260,19 @@ impl LlmDispatcher for LlmDispatcherImpl {
         // dropped with a warning rather than passed on as garbage bytes.
         let audio = choice.message.audio.as_ref().and_then(|a| {
             match base64::engine::general_purpose::STANDARD.decode(&a.data) {
-                Ok(bytes) if !bytes.is_empty() => Some(crate::flow_engine::dispatchers::LlmAudioOut {
-                    mime: format!(
-                        "audio/{}",
-                        req.audio_out.as_ref().map(|o| o.format.as_str()).unwrap_or("wav")
-                    ),
-                    bytes,
-                    transcript: a.transcript.clone(),
-                }),
+                Ok(bytes) if !bytes.is_empty() => {
+                    Some(crate::flow_engine::dispatchers::LlmAudioOut {
+                        mime: format!(
+                            "audio/{}",
+                            req.audio_out
+                                .as_ref()
+                                .map(|o| o.format.as_str())
+                                .unwrap_or("wav")
+                        ),
+                        bytes,
+                        transcript: a.transcript.clone(),
+                    })
+                }
                 Ok(_) => None,
                 Err(e) => {
                     tracing::warn!("model returned audio that is not valid base64: {e}");

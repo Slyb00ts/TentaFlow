@@ -22,12 +22,12 @@ use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::{json, Value};
 
+use crate::agents::AgentServiceSlot;
 use crate::code_studio::{repository, tools, workspace_db};
 use crate::flow_engine::cache::LOOP_SHOULD_EXIT_META;
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
-use crate::agents::AgentServiceSlot;
 
 const NODE_TYPE: &str = "task_gate";
 const DEFAULT_OUTPUT_VARIABLE: &str = "open_tasks";

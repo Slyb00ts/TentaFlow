@@ -1662,7 +1662,8 @@ impl AddonManager {
         // (3) przy limicie — krótkie oczekiwanie aż ktoś zwróci worker.
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         while std::time::Instant::now() < deadline {
-            if let Some(inst) = self.take_idle_instance(addon_id, &user_id, system, &call_provenance)
+            if let Some(inst) =
+                self.take_idle_instance(addon_id, &user_id, system, &call_provenance)
             {
                 return Ok((inst, false));
             }
@@ -1964,7 +1965,11 @@ impl AddonManager {
             }
             // Idempotence guard: install/update/sync-reconcile may already have
             // populated this instance's entries earlier in the same process.
-            if self.registered_tools.read().iter().any(|t| t.addon_id == a.addon_id)
+            if self
+                .registered_tools
+                .read()
+                .iter()
+                .any(|t| t.addon_id == a.addon_id)
                 && self.flow_blocks_registry.has_addon_blocks(&a.addon_id)
             {
                 continue;

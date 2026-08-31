@@ -113,6 +113,78 @@ fn insert_pending_pull(pull_id: String, pending: PendingPull) {
 // Own environment identity — GetKind / SetKind / SetStrictIsolation
 // =============================================================================
 
+/// PLAN-M2 §1b fencing point 4 (`SUM/tentabus/PLAN-M2.md`): a `SetKind`
+/// environment switch must evict this node from every bus replica set it
+/// belongs to under its OLD environment identity — the same fencing
+/// principle `invalidate_environment_cache` already applies to publish/
+/// consume (a stale cached identity must not keep serving decisions for an
+/// environment the node no longer declares), here applied to replication.
+///
+/// `coordinator` is threaded in rather than read from `bus::global()`
+/// directly: `BusService` (`bus/mod.rs`) has no public getter for its
+/// private `replication` field yet (`set_replication`'s own doc: "nothing
+/// in this file's publish/open_consumer/fetch/commit reads `self.
+/// replication` yet — that wiring is wave-2, agent S"), and `bus/mod.rs` is
+/// PLAN-M2 §3's "jedyny właściciel" file for that wave — out of scope
+/// here. The call site below passes `None` until that getter lands, at
+/// which point it becomes
+/// `crate::bus::global().and_then(|s| s.replication_coordinator())`; this
+/// function's own logic (eviction + one audit entry) is complete and
+/// tested independently of that missing wire.
+///
+/// `None` (no coordinator wired — M1 behavior, or wave-2 wiring not landed
+/// yet) is a no-op, matching every `ReplicationCoordinator` call site's
+/// "`None` means unchanged M1 behavior" convention (`bus/mod.rs`'s doc on
+/// `set_replication`). A coordinator error is logged and swallowed — a
+/// `SetKind` must not fail because bus replication eviction failed, the
+/// same "best effort, never block the primary action" posture
+/// `invalidate_environment_cache`'s own call site takes.
+///
+/// One audit entry per call, not per partition (PLAN-M2 §1b pt.4,
+/// explicit): a single environment switch may evict this node from many
+/// partitions' replica sets at once; the operator needs "this switch
+/// evicted N partitions", not N individual rows.
+pub(crate) fn evict_node_from_replica_sets_on_environment_change(
+    coordinator: Option<std::sync::Arc<dyn crate::bus::ReplicationCoordinator>>,
+    db: &crate::db::DbPool,
+    local_node_id: &str,
+    from: NodeEnvironment,
+    to: NodeEnvironment,
+) {
+    let Some(coordinator) = coordinator else {
+        return;
+    };
+    let evicted = match coordinator.evict_node_from_replica_sets(local_node_id, "env_change") {
+        Ok(n) => n,
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                node_id = local_node_id,
+                "environment switch: bus replica-set eviction failed"
+            );
+            return;
+        }
+    };
+    let _ = repository::log_audit(
+        db,
+        None,
+        None,
+        "bus.replica.evicted_env_change",
+        None,
+        Some(
+            &json!({
+                "node_id": local_node_id,
+                "from": from.as_str(),
+                "to": to.as_str(),
+                "partitions_evicted": evicted,
+            })
+            .to_string(),
+        ),
+        None,
+        Some(local_node_id),
+    );
+}
+
 #[handler(variant = "EnvironmentGetKindRequest", since = (1, 0))]
 #[policy(UserSession)]
 #[observed]
@@ -168,6 +240,32 @@ pub fn environment_set_kind(
     let reseeded = crate::sync::runtime::switch_node_environment(payload.new_kind)
         .map_err(|e| ProtocolError::internal(format!("environment switch failed: {e}")))?;
     env_settings::set_node_environment(&ctx.state.db, payload.new_kind).map_err(db_err)?;
+
+    // TentaBus Z12 fencing (SUM/tentabus/PLAN.md §4.4 pt.1): `BusService`
+    // caches the node's environment (`publish`/`open_consumer`'s hot paths
+    // must not re-read `settings.node_environment` from SQLite on every
+    // call) — a `SetKind` that lands after the cache was primed must
+    // invalidate it immediately, or every open `ConsumerHandle` and the
+    // service itself keep enforcing fencing against the STALE environment
+    // until this node restarts. `None` (bus not running on this node) is a
+    // no-op, not an error.
+    if let Some(bus_service) = crate::bus::global() {
+        bus_service.invalidate_environment_cache();
+    }
+
+    // PLAN-M2 §1b fencing point 4 (`SUM/tentabus/PLAN-M2.md`): a `SetKind`
+    // must also evict this node from every bus replica set it belongs to
+    // under its OLD environment identity. `bus::global().replication()` is
+    // the getter wave-2 (agent S) added to `BusService` — `None` (bus not
+    // running, or no coordinator ever wired, i.e. RF=1/M1 behavior) is a
+    // no-op inside `evict_node_from_replica_sets_on_environment_change`.
+    evict_node_from_replica_sets_on_environment_change(
+        crate::bus::global().and_then(|s| s.replication()),
+        &ctx.state.db,
+        &ctx.state.local_node_id,
+        from,
+        payload.new_kind,
+    );
 
     // Immediate rebuild (P2-8) — the catalog stamps `trusted_nodes.environment`
     // vs the LOCAL environment at snapshot-build time (`build_service_model_
@@ -610,8 +708,8 @@ pub fn environment_import_apply(
     // donor's own signed `ConfigBundleExport` response does, so a bundle
     // that lies about being "prod" (same rank as the local node, so the
     // rank check above would not fire) must not bypass confirmation.
-    let requires_confirmation =
-        to_environment > from_environment || (pending.from_file && to_environment == NodeEnvironment::Prod);
+    let requires_confirmation = to_environment > from_environment
+        || (pending.from_file && to_environment == NodeEnvironment::Prod);
     if requires_confirmation {
         let expected = to_environment.as_str().to_uppercase();
         if payload.confirm_environment_name.as_deref() != Some(expected.as_str()) {
@@ -1123,5 +1221,151 @@ mod tests {
             ),
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    // -------------------------------------------------------------------
+    // TentaBus M2 (SUM/tentabus/PLAN-M2.md §1b pt.4) —
+    // `evict_node_from_replica_sets_on_environment_change`. No dispatch
+    // harness needed for this one: it is a plain function taking an
+    // `Option<Arc<dyn ReplicationCoordinator>>`, so a mock coordinator
+    // exercises it directly without going through `SetKind`'s full
+    // handler (which cannot supply a real coordinator yet — see the
+    // function's own doc for why).
+    // -------------------------------------------------------------------
+
+    struct MockCoordinator {
+        evict_result: std::sync::Mutex<Option<Result<u32, crate::bus::ReplError>>>,
+    }
+
+    impl crate::bus::ReplicationCoordinator for MockCoordinator {
+        fn role(&self, _org: &str, _topic: &str, _partition: u32) -> crate::bus::PartitionRole {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+        fn preflight(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _acks: crate::bus::topics::Acks,
+        ) -> Result<u32, crate::bus::ReplError> {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+        fn await_acks(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _next_offset: u64,
+            _acks: crate::bus::topics::Acks,
+            _timeout: std::time::Duration,
+        ) -> Result<crate::bus::AckOutcome, crate::bus::ReplError> {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+        fn note_offset_commit(
+            &self,
+            _org: &str,
+            _group: &str,
+            _topic: &str,
+            _partition: u32,
+            _offset: u64,
+            _attempts: u32,
+        ) {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+        fn evict_node_from_replica_sets(
+            &self,
+            _node_id: &str,
+            _reason: &'static str,
+        ) -> Result<u32, crate::bus::ReplError> {
+            self.evict_result
+                .lock()
+                .unwrap()
+                .take()
+                .expect("evict_result configured once per test")
+        }
+        fn transfer_leader(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: u32,
+            _target: &str,
+        ) -> Result<u32, crate::bus::ReplError> {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+        fn reassign(
+            &self,
+            _org: &str,
+            _topic: &str,
+            _partition: Option<u32>,
+            _replicas: &[String],
+        ) -> Result<u32, crate::bus::ReplError> {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+        fn snapshot(&self, _org: &str, _topic: Option<&str>) -> crate::bus::ReplicationSnapshot {
+            unimplemented!("not exercised by the environment-switch eviction hook")
+        }
+    }
+
+    fn audit_count(db: &crate::db::DbPool, action: &str) -> i64 {
+        let conn = db.read().expect("db lock");
+        conn.query_row(
+            "SELECT COUNT(*) FROM audit_log WHERE action = ?1",
+            rusqlite::params![action],
+            |row| row.get(0),
+        )
+        .expect("count audit_log rows")
+    }
+
+    #[test]
+    fn evict_hook_is_noop_when_no_coordinator_is_wired() {
+        let state = crate::dispatch::state::AppState::for_test();
+        evict_node_from_replica_sets_on_environment_change(
+            None,
+            &state.db,
+            "node-1",
+            NodeEnvironment::Test,
+            NodeEnvironment::Prod,
+        );
+        assert_eq!(audit_count(&state.db, "bus.replica.evicted_env_change"), 0);
+    }
+
+    #[test]
+    fn evict_hook_writes_one_audit_entry_carrying_the_eviction_count() {
+        let state = crate::dispatch::state::AppState::for_test();
+        let coordinator: std::sync::Arc<dyn crate::bus::ReplicationCoordinator> =
+            std::sync::Arc::new(MockCoordinator {
+                evict_result: std::sync::Mutex::new(Some(Ok(3))),
+            });
+        evict_node_from_replica_sets_on_environment_change(
+            Some(coordinator),
+            &state.db,
+            "node-1",
+            NodeEnvironment::Test,
+            NodeEnvironment::Prod,
+        );
+        assert_eq!(audit_count(&state.db, "bus.replica.evicted_env_change"), 1);
+    }
+
+    #[test]
+    fn evict_hook_writes_no_audit_entry_when_the_coordinator_errors() {
+        let state = crate::dispatch::state::AppState::for_test();
+        let coordinator: std::sync::Arc<dyn crate::bus::ReplicationCoordinator> =
+            std::sync::Arc::new(MockCoordinator {
+                evict_result: std::sync::Mutex::new(Some(Err(
+                    crate::bus::ReplError::NotAReplica {
+                        topic: "orders.created".to_string(),
+                        partition: 0,
+                        node_id: "node-1".to_string(),
+                    },
+                ))),
+            });
+        evict_node_from_replica_sets_on_environment_change(
+            Some(coordinator),
+            &state.db,
+            "node-1",
+            NodeEnvironment::Test,
+            NodeEnvironment::Prod,
+        );
+        assert_eq!(audit_count(&state.db, "bus.replica.evicted_env_change"), 0);
     }
 }

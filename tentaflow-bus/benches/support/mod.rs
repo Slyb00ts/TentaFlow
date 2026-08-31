@@ -5,12 +5,12 @@
 // `benches/`) does not try to build it as its own binary. Included via
 // plain `mod support;` from each bench's crate-root file.
 //
-// Review P1-4 item 5 / bullet (e): every bench that writes to disk uses
-// `bench_dir()` here instead of a hand-rolled `std::env::temp_dir()` call,
-// so `TENTABUS_BENCH_DIR` consistently overrides where benchmark data lands
-// (some Linux setups have `/tmp` on tmpfs, which would silently turn a
-// durability benchmark into a memory-throughput benchmark) and the chosen
-// path/filesystem is always printed once per process.
+// Every bench that writes to disk uses `bench_dir()` here instead of a
+// hand-rolled `std::env::temp_dir()` call, so `TENTABUS_BENCH_DIR`
+// consistently overrides where benchmark data lands (some Linux setups
+// have `/tmp` on tmpfs, which would silently turn a durability benchmark
+// into a memory-throughput benchmark) and the chosen path/filesystem is
+// always printed once per process.
 
 // This module is shared by all four bench binaries, each of which uses a
 // different subset of it — `cfg(any(test, ...))`-style per-binary allows
@@ -52,9 +52,9 @@ pub fn percentile(sorted: &[Duration], q: f64) -> Duration {
 /// Root directory every bench in this crate writes datasets under.
 /// `TENTABUS_BENCH_DIR` overrides the default (`std::env::temp_dir()`) —
 /// set it to point at the disk the M0 gate numbers are meant to describe
-/// (review P1-4 item 5: `std::env::temp_dir()` on Linux is frequently
-/// tmpfs, which would make every "durability" number free and every
-/// "device ceiling" number a memory-bandwidth number instead).
+/// `std::env::temp_dir()` on Linux is frequently tmpfs, which would make
+/// every "durability" number free and every "device ceiling" number a
+/// memory-bandwidth number instead.
 fn bench_root() -> PathBuf {
     match std::env::var_os("TENTABUS_BENCH_DIR") {
         Some(dir) => PathBuf::from(dir),
@@ -66,9 +66,9 @@ static PRINT_ROOT_ONCE: Once = Once::new();
 
 /// Returns a fresh, empty directory under the bench root for one dataset,
 /// removing any stale directory of the same name left by a previous run
-/// (review P3-12: distinct labels never share a directory, so three bench
-/// functions in the same file no longer race to delete each other's
-/// dataset). Prints the resolved root path and filesystem once per process.
+/// so distinct labels never share a directory and multiple bench
+/// functions in the same file cannot race to delete each other's dataset.
+/// Prints the resolved root path and filesystem once per process.
 pub fn bench_dir(bench_name: &str, label: &str) -> PathBuf {
     let root = bench_root();
     PRINT_ROOT_ONCE.call_once(|| {
@@ -92,8 +92,8 @@ pub fn bench_dir(bench_name: &str, label: &str) -> PathBuf {
     dir
 }
 
-/// Best-effort filesystem name for `path`'s volume, for the report header
-/// (review bullet e). macOS reports the real fs name (`apfs`, `hfs`,
+/// Best-effort filesystem name for `path`'s volume, for the report
+/// header. macOS reports the real fs name (`apfs`, `hfs`,
 /// `nfs`, ...) via `statfs`; other platforms report a fixed placeholder
 /// rather than guessing wrong — accurate-but-limited beats confidently
 /// wrong for a number this load-bearing.
@@ -136,18 +136,17 @@ fn filesystem_name(_path: &Path) -> String {
 /// returned sorted — used for every percentile/msg-per-second number this
 /// crate's benches report outside of Criterion's own HTML report.
 ///
-/// Review P3-10: Criterion's own `iter_custom` warm-up phase calls the
-/// supplied routine an indeterminate number of times before the "real"
-/// measurement phase begins, with no signal distinguishing the two from
-/// inside the routine — so a routine that pushes into a shared `Vec` across
-/// every invocation (the previous version of these benches) mixes warm-up
-/// latencies into the reported p50/p95/p99 and msg/s. This helper sidesteps
-/// Criterion's sampler entirely for those custom numbers: warm-up and
-/// measurement are two explicit, separate loops driven directly by this
-/// function, with nothing but the `samples` loop ever recorded. Criterion's
-/// own `bench_with_input`/`iter_custom` calls (used separately, for the
-/// HTML report) are unaffected and keep doing their own internal
-/// warm-up/measurement — that report was never the P3-10 complaint.
+/// Criterion's own `iter_custom` warm-up phase calls the supplied routine
+/// an indeterminate number of times before the "real" measurement phase
+/// begins, with no signal distinguishing the two from inside the routine —
+/// so a routine that pushes into a shared `Vec` across every invocation
+/// would mix warm-up latencies into the reported p50/p95/p99 and msg/s.
+/// This helper sidesteps Criterion's sampler entirely for those custom
+/// numbers: warm-up and measurement are two explicit, separate loops driven
+/// directly by this function, with nothing but the `samples` loop ever
+/// recorded. Criterion's own `bench_with_input`/`iter_custom` calls (used
+/// separately, for the HTML report) are unaffected and keep doing their
+/// own internal warm-up/measurement.
 pub fn measure_latencies<F: FnMut() -> Duration>(
     warmup: usize,
     samples: usize,

@@ -18,19 +18,16 @@ use std::time::Duration;
 
 use tentaflow_macros::{handler, observed, policy};
 use tentaflow_protocol::code_studio::{
-    AgentCredentialInfo, AllowlistEntryInfo, ApprovalInfo, CodeStudioPayload, DiffHunkInfo,
-    FileEntryInfo, GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo, GrepHitInfo,
-    OperationInfo,
-    CodeSearchHit, IndexStateInfo, PatchFileDecision, PatchFileInfo, PatchHunkInfo, PatchSetInfo,
-    ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo, RunInfo, SessionInfo, TaskInfo,
-    TerminalCellRow,
-    TimelineEventInfo, WorkspaceInfo, WorkspaceMemberInfo, WorkspaceMemberInput,
-    WorkspaceNodeInfo, WorkspaceUserCandidate, WorktreeInfo,
+    AgentCredentialInfo, AllowlistEntryInfo, ApprovalInfo, CodeSearchHit, CodeStudioPayload,
+    DiffHunkInfo, FileEntryInfo, GitBranchInfo, GitCommitInfo, GitStatusEntry, GrantInfo,
+    GrepHitInfo, IndexStateInfo, OperationInfo, PatchFileDecision, PatchFileInfo, PatchHunkInfo,
+    PatchSetInfo, ProjectLinkInfo, ProvisionStepInfo, RepoEntryInfo, RunInfo, SessionInfo,
+    TaskInfo, TerminalCellRow, TimelineEventInfo, WorkspaceInfo, WorkspaceMemberInfo,
+    WorkspaceMemberInput, WorkspaceNodeInfo, WorkspaceUserCandidate, WorktreeInfo,
 };
 use tentaflow_protocol::{MessageBody, ProtocolError, ProtocolErrorCode};
 
 use super::HandlerContext;
-use rusqlite::OptionalExtension;
 use crate::agents::{InteractionReply, PermissionDecision};
 use crate::code_studio::egress;
 use crate::code_studio::events::{EventPayload, GitOperation, SessionEvent};
@@ -44,8 +41,8 @@ use crate::code_studio::models::{
     WorkspaceStatus,
 };
 use crate::code_studio::operations::{
-    OpKind, Operation, OperationInput, OperationRequest, OperationStatus, OriginKind, Postcondition,
-    UnknownDecision,
+    OpKind, Operation, OperationInput, OperationRequest, OperationStatus, OriginKind,
+    Postcondition, UnknownDecision,
 };
 use crate::code_studio::patch::{CommitRequest, Decisions, EditKind, FileVerdict, PatchScope};
 use crate::code_studio::pep::{
@@ -65,6 +62,7 @@ use crate::code_studio::{
 use crate::db::seed::CODE_HARNESS_CRITIC_FLOW_ID;
 use crate::db::DbPool;
 use crate::services::rbac::OrgContext;
+use rusqlite::OptionalExtension;
 
 const PERM_READ: &str = "code_studio.read";
 const PERM_ADMIN: &str = "code_studio.admin";
@@ -186,8 +184,8 @@ fn require_workspace(
     if record.org_id != org.org_id || record.status == WorkspaceStatus::Deleted.slug() {
         return Err(not_found());
     }
-    let role = repository::role_of(db, workspace_id, &org.user_id)
-        .map_err(|e| db_error("role_of", e))?;
+    let role =
+        repository::role_of(db, workspace_id, &org.user_id).map_err(|e| db_error("role_of", e))?;
     let min = match access {
         Access::Metadata => WorkspaceRole::Viewer,
         Access::Member(required) => required,
@@ -542,7 +540,10 @@ fn workspace_to_wire(
         index_enabled: record.index_enabled,
         status: record.status.clone(),
         status_detail: record.status_detail.clone(),
-        my_role: my_role.map(|role| role.slug()).unwrap_or("none").to_string(),
+        my_role: my_role
+            .map(|role| role.slug())
+            .unwrap_or("none")
+            .to_string(),
         member_count,
         open_sessions: sessions.open,
         disk_used_bytes,
@@ -988,9 +989,7 @@ pub async fn code_studio_dispatch(
 
     use CodeStudioPayload as P;
     match payload {
-        P::WorkspacesListRequest { include_archived } => {
-            workspaces_list_v1(ctx, *include_archived)
-        }
+        P::WorkspacesListRequest { include_archived } => workspaces_list_v1(ctx, *include_archived),
         P::WorkspaceCreateRequest {
             name,
             node_id,
@@ -1366,14 +1365,7 @@ pub async fn code_studio_dispatch(
             exec_id,
             after_seq,
             limit,
-        } => exec_output_v1(
-            ctx,
-            workspace_id,
-            session_id,
-            exec_id,
-            *after_seq,
-            *limit,
-        ),
+        } => exec_output_v1(ctx, workspace_id, session_id, exec_id, *after_seq, *limit),
         P::TerminalOpenRequest {
             workspace_id,
             session_id,
@@ -1622,7 +1614,8 @@ fn roles_of_user(
         .map_err(|e| db_error("roles_of_user", anyhow::anyhow!("{e}")))?;
     let mut roles = HashMap::new();
     for row in rows {
-        let (workspace_id, role) = row.map_err(|e| db_error("roles_of_user", anyhow::anyhow!("{e}")))?;
+        let (workspace_id, role) =
+            row.map_err(|e| db_error("roles_of_user", anyhow::anyhow!("{e}")))?;
         if let Some(role) = WorkspaceRole::from_slug(&role) {
             roles.insert(workspace_id, role);
         }
@@ -1767,7 +1760,10 @@ async fn workspace_create_v1(
     }
 
     let auth_kind = input.repo_auth_kind.map(str::trim).unwrap_or("none");
-    let material = input.secret_material.map(str::trim).filter(|m| !m.is_empty());
+    let material = input
+        .secret_material
+        .map(str::trim)
+        .filter(|m| !m.is_empty());
     let secret_kind = match auth_kind {
         "none" => {
             if material.is_some() {
@@ -1914,12 +1910,9 @@ fn spawn_provisioning(ctx: &HandlerContext, record: WorkspaceRecord) {
             Err(error) => {
                 let detail = error.to_string();
                 tracing::warn!(workspace_id = %record.id, "provisioning credential: {detail}");
-                if let Err(nested) = repository::set_status(
-                    &db,
-                    &record.id,
-                    WorkspaceStatus::Error,
-                    Some(&detail),
-                ) {
+                if let Err(nested) =
+                    repository::set_status(&db, &record.id, WorkspaceStatus::Error, Some(&detail))
+                {
                     tracing::warn!(workspace_id = %record.id, "cannot record credential failure: {nested:#}");
                 }
                 return;
@@ -2008,17 +2001,16 @@ fn workspace_retry_v1(
     workspace_id: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    let (record, _) = require_workspace(
-        ctx,
-        org,
-        workspace_id,
-        Access::Member(WorkspaceRole::Owner),
-    )?;
+    let (record, _) =
+        require_workspace(ctx, org, workspace_id, Access::Member(WorkspaceRole::Owner))?;
     require_local(ctx, &record)?;
     if record.status != WorkspaceStatus::Error.slug() {
         return Err(ProtocolError::new(
             ProtocolErrorCode::Conflict,
-            format!("workspace is '{}'; only a failed one is retried", record.status),
+            format!(
+                "workspace is '{}'; only a failed one is retried",
+                record.status
+            ),
         ));
     }
     repository::set_status(
@@ -2123,13 +2115,8 @@ async fn workspace_delete_v1(
 
     vault::delete_workspace_secrets(&ctx.state.db, workspace_id)
         .map_err(|e| vault_error("delete_workspace_secrets", e))?;
-    repository::set_status(
-        &ctx.state.db,
-        workspace_id,
-        WorkspaceStatus::Deleted,
-        None,
-    )
-    .map_err(|e| db_error("set_status", e))?;
+    repository::set_status(&ctx.state.db, workspace_id, WorkspaceStatus::Deleted, None)
+        .map_err(|e| db_error("set_status", e))?;
     audit(
         ctx,
         "code_studio.workspace_delete",
@@ -2273,12 +2260,8 @@ fn workspace_secret_set_v1(
     let org = require_read(ctx)?;
     // `secret_manage` is owner-only (§9.2) and gets no administrator override:
     // the vault is the one place §25.4's metadata overlay must not reach.
-    let (record, _) = require_workspace(
-        ctx,
-        org,
-        workspace_id,
-        Access::Member(WorkspaceRole::Owner),
-    )?;
+    let (record, _) =
+        require_workspace(ctx, org, workspace_id, Access::Member(WorkspaceRole::Owner))?;
     require_local(ctx, &record)?;
 
     let material = secret_material.map(str::trim).filter(|m| !m.is_empty());
@@ -2459,14 +2442,10 @@ fn agent_credential_set_v1(
             "a provider credential without material would leave the adapter unauthenticated",
         ));
     }
-    let existed = vault::get_agent_credential_record(
-        &ctx.state.db,
-        &org.org_id,
-        &node_id,
-        engine_id,
-    )
-    .map_err(|e| vault_error("get_agent_credential_record", e))?
-    .is_some();
+    let existed =
+        vault::get_agent_credential_record(&ctx.state.db, &org.org_id, &node_id, engine_id)
+            .map_err(|e| vault_error("get_agent_credential_record", e))?
+            .is_some();
     let fingerprint = vault::put_agent_credential(
         &ctx.state.db,
         &ctx.state.settings_cipher,
@@ -2478,14 +2457,12 @@ fn agent_credential_set_v1(
         &org.user_id,
     )
     .map_err(|e| vault_error("put_agent_credential", e))?;
-    let record = vault::get_agent_credential_record(
-        &ctx.state.db,
-        &org.org_id,
-        &node_id,
-        engine_id,
-    )
-    .map_err(|e| vault_error("get_agent_credential_record", e))?
-    .ok_or_else(|| ProtocolError::internal("the stored credential could not be read back"))?;
+    let record =
+        vault::get_agent_credential_record(&ctx.state.db, &org.org_id, &node_id, engine_id)
+            .map_err(|e| vault_error("get_agent_credential_record", e))?
+            .ok_or_else(|| {
+                ProtocolError::internal("the stored credential could not be read back")
+            })?;
     // The digest identifies WHICH key was stored without being able to
     // reconstruct it — the same thing the workspace-secret event records, and
     // the only way an auditor can tell a rotation from a rewrite of the same
@@ -2692,12 +2669,7 @@ fn allowlist_set_v1(
     pattern: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    require_workspace(
-        ctx,
-        org,
-        workspace_id,
-        Access::Member(WorkspaceRole::Owner),
-    )?;
+    require_workspace(ctx, org, workspace_id, Access::Member(WorkspaceRole::Owner))?;
     let capability = capability.trim();
     let parsed = Capability::from_slug(capability)
         .ok_or_else(|| ProtocolError::bad_request(format!("unknown capability '{capability}'")))?;
@@ -2740,12 +2712,7 @@ fn allowlist_remove_v1(
     pattern: &str,
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
-    require_workspace(
-        ctx,
-        org,
-        workspace_id,
-        Access::Member(WorkspaceRole::Owner),
-    )?;
+    require_workspace(ctx, org, workspace_id, Access::Member(WorkspaceRole::Owner))?;
     // Withdrawal replicates as a tombstone, or a node still holding the older
     // grant would keep executing on it.
     repository::remove_allowlist_entry(
@@ -2910,11 +2877,10 @@ async fn session_open_v1(
     };
     let session_id = new.id.clone();
     let workspace = record.clone();
-    let opened =
-        tokio::task::spawn_blocking(move || session::open_session(&workspace, role, &new))
-            .await
-            .map_err(|_| ProtocolError::internal("session open task failed"))?
-            .map_err(|e| ProtocolError::internal(format!("{e:#}")))?;
+    let opened = tokio::task::spawn_blocking(move || session::open_session(&workspace, role, &new))
+        .await
+        .map_err(|_| ProtocolError::internal("session open task failed"))?
+        .map_err(|e| ProtocolError::internal(format!("{e:#}")))?;
 
     audit(
         ctx,
@@ -3569,10 +3535,9 @@ fn gate(
 
     match pep::authorize(&ctx, cap, target) {
         Decision::Allow(profile) => Ok(Gate::Allow(profile)),
-        Decision::Deny { reason } => Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            reason,
-        )),
+        Decision::Deny { reason } => {
+            Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, reason))
+        }
         Decision::AskUser { summary, kind } => {
             let approval_id = record_approval(scope, cap, pattern, &interaction, &summary)?;
             Ok(Gate::Ask {
@@ -3611,10 +3576,9 @@ fn granted_profile(
     };
     match pep::authorize_after_decision(&ctx, cap, target) {
         Decision::Allow(profile) => Ok(profile),
-        Decision::Deny { reason } => Err(ProtocolError::new(
-            ProtocolErrorCode::PolicyDenied,
-            reason,
-        )),
+        Decision::Deny { reason } => {
+            Err(ProtocolError::new(ProtocolErrorCode::PolicyDenied, reason))
+        }
         // Reached when a permission was given but a DIFFERENT gate still holds
         // the call — a commit approved before its review was decided, for
         // instance. The PEP's own summary says which, and the one-shot is spent
@@ -4477,7 +4441,9 @@ fn file_grep_v1(
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Viewer)?;
     require_allow(gate(&scope, Capability::FsRead, &Target::None, None)?)?;
     if query.is_empty() {
-        return Err(ProtocolError::bad_request("an empty search matches nothing"));
+        return Err(ProtocolError::bad_request(
+            "an empty search matches nothing",
+        ));
     }
 
     let root = scope.root()?;
@@ -4763,14 +4729,11 @@ fn git_commit_v1(
             // a WORK review of THIS session, so it is resolved through the
             // scoped selector rather than trusted.
             let set_id = match patch_set_id {
-                Some(id) => patch::load_patch_set_for(
-                    &scope.pool,
-                    &scope.session.id,
-                    &PatchScope::Work,
-                    id,
-                )
-                .map_err(|e| ProtocolError::bad_request(format!("{e:#}")))?
-                .id,
+                Some(id) => {
+                    patch::load_patch_set_for(&scope.pool, &scope.session.id, &PatchScope::Work, id)
+                        .map_err(|e| ProtocolError::bad_request(format!("{e:#}")))?
+                        .id
+                }
                 None => accepted_patch_set_id(&scope)?,
             };
             commit_accepted_blobs(ctx, org, &scope, &branch, message, &set_id)
@@ -4863,12 +4826,7 @@ fn commit_accepted_blobs(
         &[outcome.commit_oid.clone(), outcome.tree_oid.clone()],
     )
     .map_err(|e| db_error("record_oids", e))?;
-    record_session_head(
-        &scope.pool,
-        &broker,
-        &scope.session.id,
-        &outcome.commit_oid,
-    );
+    record_session_head(&scope.pool, &broker, &scope.session.id, &outcome.commit_oid);
     patch::mark_consumed(&scope.pool, set_id, &outcome)
         .map_err(|e| db_error("mark_consumed", e))?;
     complete_op(scope, &op_id, &[outcome.commit_oid.clone()], None)?;
@@ -4986,8 +4944,9 @@ fn git_auth(ctx: &HandlerContext, scope: &Scope) -> Result<GitAuth, ProtocolErro
     let Some(secret_ref) = scope.record.secret_ref.as_deref() else {
         return Ok(GitAuth::None);
     };
-    let material = vault::get_workspace_secret(&ctx.state.db, &ctx.state.settings_cipher, secret_ref)
-        .map_err(|e| vault_error("get_workspace_secret", e))?;
+    let material =
+        vault::get_workspace_secret(&ctx.state.db, &ctx.state.settings_cipher, secret_ref)
+            .map_err(|e| vault_error("get_workspace_secret", e))?;
     append_event(
         scope,
         format!("secret:{}:{}", secret_ref, scope.session.id),
@@ -5095,7 +5054,12 @@ fn git_push_v1(
 
     match broker.push_branch(&handle, &url, &branch, &auth) {
         Ok(()) => {
-            complete_op(&scope, &op_id, &old_oid.clone().into_iter().collect::<Vec<_>>(), None)?;
+            complete_op(
+                &scope,
+                &op_id,
+                &old_oid.clone().into_iter().collect::<Vec<_>>(),
+                None,
+            )?;
             append_git_event(
                 &scope,
                 &op_id,
@@ -5634,7 +5598,11 @@ fn git_merge_finalize_v1(
         Ok(outcome) => outcome,
         Err(error) => {
             let message = format!("{error:#}");
-            fail_op(&scope, &finalize_op, ProtocolError::internal(message.clone()));
+            fail_op(
+                &scope,
+                &finalize_op,
+                ProtocolError::internal(message.clone()),
+            );
             // A moved target tip is not a failure of the merge — it is the
             // compare-and-swap doing its job, and the caller re-merges.
             let stale = message.contains("expected") || message.contains("changed");
@@ -5738,7 +5706,12 @@ fn git_merge_abandon_v1(
     let (worktree_id, _, _) = integration_state(&scope, op_id)?;
     // Dropping a held merge destroys the state a revision run would resume
     // from, so it goes through the same mandatory question as the merge itself.
-    require_allow(gate(&scope, Capability::GitMerge, &Target::None, Some(op_id))?)?;
+    require_allow(gate(
+        &scope,
+        Capability::GitMerge,
+        &Target::None,
+        Some(op_id),
+    )?)?;
 
     let broker = scope.broker()?;
     if let Err(error) = broker.remove_integration_worktree(&scope.session.id, op_id) {
@@ -6100,7 +6073,12 @@ async fn request_revision_v1(
         };
         notes.push_str("- ");
         notes.push_str(&file.path);
-        match decision.note.as_deref().map(str::trim).filter(|n| !n.is_empty()) {
+        match decision
+            .note
+            .as_deref()
+            .map(str::trim)
+            .filter(|n| !n.is_empty())
+        {
             Some(note) => {
                 notes.push_str(": ");
                 notes.push_str(note);
@@ -6509,12 +6487,7 @@ fn approval_decide_v1(
                 "INSERT INTO session_grants (session_id, capability, pattern, granted_by, \
                   created_at) VALUES (?1, ?2, ?3, ?4, datetime('now')) \
                  ON CONFLICT(session_id, capability, pattern) DO NOTHING",
-                rusqlite::params![
-                    scope.session.id,
-                    capability,
-                    target_pattern,
-                    org.user_id
-                ],
+                rusqlite::params![scope.session.id, capability, target_pattern, org.user_id],
             )
             .map_err(|e| db_error("approval_decide", anyhow::anyhow!("{e}")))?;
         }
@@ -6981,8 +6954,15 @@ async fn session_message_send_v1(
         },
     )?;
 
-    let run_id = match start_session_run(ctx, &scope, RUN_KIND_ROOT, RUN_TRIGGER_USER, message, None)
-        .await
+    let run_id = match start_session_run(
+        ctx,
+        &scope,
+        RUN_KIND_ROOT,
+        RUN_TRIGGER_USER,
+        message,
+        None,
+    )
+    .await
     {
         Ok(run_id) => run_id,
         Err(error) => {
@@ -6991,7 +6971,10 @@ async fn session_message_send_v1(
                 format!("turn:{turn_id}:start_failed"),
                 EventPayload::AgentMessage {
                     role: "system".to_string(),
-                    text: format!("the turn was recorded but no run started: {}", error.message),
+                    text: format!(
+                        "the turn was recorded but no run started: {}",
+                        error.message
+                    ),
                 },
             )?;
             return Err(error);
@@ -7187,7 +7170,9 @@ fn exec_start_v1(
     let org = require_read(ctx)?;
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Editor)?;
     if argv.is_empty() || argv[0].trim().is_empty() {
-        return Err(ProtocolError::bad_request("a command needs a program to run"));
+        return Err(ProtocolError::bad_request(
+            "a command needs a program to run",
+        ));
     }
     let (cwd_rel, target) = if cwd.is_empty() {
         (
@@ -7300,12 +7285,9 @@ fn exec_start_v1(
                     // codes, and reporting one as `0` would read as success.
                     _ => None,
                 };
-                if let Err(error) = operations::complete(
-                    &pool,
-                    &op_for_task,
-                    &[],
-                    artifact.as_deref(),
-                ) {
+                if let Err(error) =
+                    operations::complete(&pool, &op_for_task, &[], artifact.as_deref())
+                {
                     tracing::warn!("cannot close an exec operation: {error:#}");
                 }
                 let mut event = SessionEvent::new(
@@ -7455,7 +7437,12 @@ fn terminal_open_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Editor)?;
-    let granted = require_allow(gate(&scope, Capability::Terminal, &Target::None, Some("terminal"))?)?;
+    let granted = require_allow(gate(
+        &scope,
+        Capability::Terminal,
+        &Target::None,
+        Some("terminal"),
+    )?)?;
 
     let manager = sandbox_manager(&scope.record)?;
     let lease = manager
@@ -7566,10 +7553,18 @@ fn terminal_input_v1(
     // §9.4 exempts a RUNNING PROCESS from being re-authorized, not a new call:
     // typing a command into an open shell is a new call, so a lowered ceiling
     // or a revoked grant has to stop it here rather than at the next open.
-    require_allow(gate(&scope, Capability::Terminal, &Target::None, Some("terminal"))?)?;
+    require_allow(gate(
+        &scope,
+        Capability::Terminal,
+        &Target::None,
+        Some("terminal"),
+    )?)?;
     let terminals = terminal_registry(&scope.record)?;
     let handle = terminal_handle(&scope, terminal_id);
-    let before = terminals.snapshot(&handle).map_err(terminal_error)?.revision;
+    let before = terminals
+        .snapshot(&handle)
+        .map_err(terminal_error)?
+        .revision;
     terminals
         .pty_write(&handle, data.as_bytes())
         .map_err(terminal_error)?;
@@ -7599,7 +7594,12 @@ fn terminal_resize_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Editor)?;
-    require_allow(gate(&scope, Capability::Terminal, &Target::None, Some("terminal"))?)?;
+    require_allow(gate(
+        &scope,
+        Capability::Terminal,
+        &Target::None,
+        Some("terminal"),
+    )?)?;
     let terminals = terminal_registry(&scope.record)?;
     let handle = terminal_handle(&scope, terminal_id);
     terminals
@@ -7785,7 +7785,12 @@ fn patch_blob_get_v1(
 ) -> Result<MessageBody, ProtocolError> {
     let org = require_read(ctx)?;
     let scope = session_scope(ctx, org, workspace_id, session_id, WorkspaceRole::Viewer)?;
-    require_allow(gate(&scope, Capability::FsRead, &Target::None, Some(blob_sha))?)?;
+    require_allow(gate(
+        &scope,
+        Capability::FsRead,
+        &Target::None,
+        Some(blob_sha),
+    )?)?;
 
     let broker = scope.broker()?;
     let bytes = broker
@@ -7979,7 +7984,12 @@ async fn code_search_v1(
     } else {
         parse_target_path(path_prefix).1
     };
-    require_allow(gate(&scope, Capability::CodeSearch, &target, Some(path_prefix))?)?;
+    require_allow(gate(
+        &scope,
+        Capability::CodeSearch,
+        &target,
+        Some(path_prefix),
+    )?)?;
     // §14 keeps grep authoritative. A semantic answer that does not describe the
     // current head still comes back, flagged `degraded`, so the caller can fall
     // back to the file search instead of trusting a stale hit.
@@ -8065,7 +8075,9 @@ fn workspace_member_candidates_v1(
             email,
         })
         .collect();
-    Ok(cs(CodeStudioPayload::WorkspaceMemberCandidatesResponse { candidates }))
+    Ok(cs(CodeStudioPayload::WorkspaceMemberCandidatesResponse {
+        candidates,
+    }))
 }
 
 fn project_link_list_v1(
@@ -8315,8 +8327,14 @@ register_code_studio_variant!(
     "CodeStudioWorktreesListRequest",
     "tentaflow_ws_handler_cs_worktrees_list"
 );
-register_code_studio_variant!("CodeStudioFileTreeRequest", "tentaflow_ws_handler_cs_file_tree");
-register_code_studio_variant!("CodeStudioFileReadRequest", "tentaflow_ws_handler_cs_file_read");
+register_code_studio_variant!(
+    "CodeStudioFileTreeRequest",
+    "tentaflow_ws_handler_cs_file_tree"
+);
+register_code_studio_variant!(
+    "CodeStudioFileReadRequest",
+    "tentaflow_ws_handler_cs_file_read"
+);
 register_code_studio_variant!(
     "CodeStudioFileWriteRequest",
     "tentaflow_ws_handler_cs_file_write"
@@ -8337,20 +8355,35 @@ register_code_studio_variant!(
     "CodeStudioFileMkdirRequest",
     "tentaflow_ws_handler_cs_file_mkdir"
 );
-register_code_studio_variant!("CodeStudioFileGrepRequest", "tentaflow_ws_handler_cs_file_grep");
+register_code_studio_variant!(
+    "CodeStudioFileGrepRequest",
+    "tentaflow_ws_handler_cs_file_grep"
+);
 register_code_studio_variant!("CodeStudioGitLogRequest", "tentaflow_ws_handler_cs_git_log");
 register_code_studio_variant!(
     "CodeStudioGitBranchesRequest",
     "tentaflow_ws_handler_cs_git_branches"
 );
-register_code_studio_variant!("CodeStudioGitDiffRequest", "tentaflow_ws_handler_cs_git_diff");
+register_code_studio_variant!(
+    "CodeStudioGitDiffRequest",
+    "tentaflow_ws_handler_cs_git_diff"
+);
 register_code_studio_variant!(
     "CodeStudioGitCommitRequest",
     "tentaflow_ws_handler_cs_git_commit"
 );
-register_code_studio_variant!("CodeStudioGitPushRequest", "tentaflow_ws_handler_cs_git_push");
-register_code_studio_variant!("CodeStudioGitSyncRequest", "tentaflow_ws_handler_cs_git_sync");
-register_code_studio_variant!("CodeStudioGitMergeRequest", "tentaflow_ws_handler_cs_git_merge");
+register_code_studio_variant!(
+    "CodeStudioGitPushRequest",
+    "tentaflow_ws_handler_cs_git_push"
+);
+register_code_studio_variant!(
+    "CodeStudioGitSyncRequest",
+    "tentaflow_ws_handler_cs_git_sync"
+);
+register_code_studio_variant!(
+    "CodeStudioGitMergeRequest",
+    "tentaflow_ws_handler_cs_git_merge"
+);
 register_code_studio_variant!(
     "CodeStudioGitMergeFinalizeRequest",
     "tentaflow_ws_handler_cs_git_merge_finalize"
@@ -8506,7 +8539,6 @@ mod tests {
     use std::collections::HashSet;
     use tentaflow_protocol::SessionAuth;
 
-
     /// The workspace layout is derived from a process-global storage category,
     /// so every test that touches disk has to hold this.
 
@@ -8515,7 +8547,10 @@ mod tests {
         ctx: HandlerContext,
     }
 
-    fn context(state: std::sync::Arc<crate::dispatch::AppState>, org: OrgContext) -> HandlerContext {
+    fn context(
+        state: std::sync::Arc<crate::dispatch::AppState>,
+        org: OrgContext,
+    ) -> HandlerContext {
         HandlerContext {
             session: SessionAuth::UserSession {
                 user_id: [3u8; 16],
@@ -9264,7 +9299,12 @@ mod tests {
 
         let err = workspace_create_v1(
             &fx.ctx,
-            create_input("Autonomiczny", "trusted_native", "autonomous", "org_approved"),
+            create_input(
+                "Autonomiczny",
+                "trusted_native",
+                "autonomous",
+                "org_approved",
+            ),
         )
         .await
         .expect_err("must refuse");
@@ -9441,7 +9481,10 @@ mod tests {
         // depends on how the node was set up, and the server decides that, not
         // the request.
         assert!(
-            matches!(record.egress_enforcement.as_str(), "unrestricted" | "firewall"),
+            matches!(
+                record.egress_enforcement.as_str(),
+                "unrestricted" | "firewall"
+            ),
             "{}",
             record.egress_enforcement
         );
@@ -9501,7 +9544,10 @@ mod tests {
             assert!(!json.contains(TOKEN), "{json}");
             assert!(!json.contains("ghp_rotatedvalue"), "{json}");
             assert!(!json.contains("secret_material"), "{json}");
-            assert!(!json.contains("cs-secret-"), "vault handle on the wire: {json}");
+            assert!(
+                !json.contains("cs-secret-"),
+                "vault handle on the wire: {json}"
+            );
         }
 
         // The fingerprint the UI shows is a digest, never the token.
@@ -9603,14 +9649,8 @@ mod tests {
             "{refusal:#}"
         );
 
-        agent_credential_set_v1(
-            &fx.ctx,
-            "",
-            "claude-code",
-            PROVIDER_URL,
-            PROVIDER_KEY,
-        )
-        .expect("store the provider credential");
+        agent_credential_set_v1(&fx.ctx, "", "claude-code", PROVIDER_URL, PROVIDER_KEY)
+            .expect("store the provider credential");
 
         let handle = start_adapter_for_test(&fx.ctx, dir.path(), "claude-code")
             .await
@@ -9687,7 +9727,10 @@ mod tests {
             panic!("unexpected response");
         };
         assert_eq!(credentials.len(), 1, "rotation left a second row");
-        assert!(credentials[0].rotated_at.is_some(), "rotation was not stamped");
+        assert!(
+            credentials[0].rotated_at.is_some(),
+            "rotation was not stamped"
+        );
         assert_eq!(
             credentials[0].fingerprint.as_deref(),
             Some(vault::fingerprint_of(SecretKind::GitToken, "sk-ant-second").as_str())
@@ -9807,9 +9850,15 @@ mod tests {
         seed_workspace(&fx.ctx, "ws-allow", "u-owner", ExecMode::TrustedNative);
         activate(&fx.ctx, "ws-allow");
 
-        for capability in ["git_push", "git_merge", "git_merge_finalize", "secret_manage", "git_worktree"] {
-            let err = allowlist_set_v1(&fx.ctx, "ws-allow", capability, "*")
-                .expect_err("must refuse");
+        for capability in [
+            "git_push",
+            "git_merge",
+            "git_merge_finalize",
+            "secret_manage",
+            "git_worktree",
+        ] {
+            let err =
+                allowlist_set_v1(&fx.ctx, "ws-allow", capability, "*").expect_err("must refuse");
             assert_eq!(err.code, ProtocolErrorCode::BadRequest, "{capability}");
         }
 
@@ -9892,7 +9941,10 @@ mod tests {
             .iter()
             .find(|m| m.user_id == "u-admin")
             .expect("the admin is not in the member list");
-        assert_eq!(joined.added_by, "u-admin", "the owner cannot see who joined");
+        assert_eq!(
+            joined.added_by, "u-admin",
+            "the owner cannot see who joined"
+        );
         assert!(audit_actions(&fx.ctx, "ws-trail")
             .iter()
             .any(|(action, _)| action == "code_studio.admin_member_self_add"));
@@ -9977,7 +10029,8 @@ mod tests {
         let record = repository::get_workspace(&fx.ctx.state.db, workspace_id)
             .unwrap()
             .unwrap();
-        provisioning::provision(&fx.ctx.state.db, &record, &ProvisionAuth::None).expect("provision");
+        provisioning::provision(&fx.ctx.state.db, &record, &ProvisionAuth::None)
+            .expect("provision");
         let record = repository::get_workspace(&fx.ctx.state.db, workspace_id)
             .unwrap()
             .unwrap();
@@ -10053,7 +10106,11 @@ mod tests {
         assert_eq!(status, "review_required");
         assert!(commit_oid.is_none(), "the worktree was committed anyway");
         let patch_set_id = patch_set_id.expect("the gate opened no patch set");
-        assert_eq!(head_commit(&live), before, "the branch moved without a review");
+        assert_eq!(
+            head_commit(&live),
+            before,
+            "the branch moved without a review"
+        );
 
         // The review really describes the change, which is what makes it a
         // review rather than a permission prompt.
@@ -10192,7 +10249,11 @@ mod tests {
     #[test]
     fn autonomous_accepts_its_own_review_only_where_the_workspace_says_so() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-auto", AutonomyMode::Autonomous, AutonomyMode::Autonomous) else {
+        let Some(live) = live(
+            "ws-auto",
+            AutonomyMode::Autonomous,
+            AutonomyMode::Autonomous,
+        ) else {
             return;
         };
         write_file(&live, "src/main.rs", "fn main() {}\n", None);
@@ -10213,7 +10274,11 @@ mod tests {
             panic!("unexpected response");
         };
         assert_eq!(status, "review_required", "autonomous decided by itself");
-        assert_eq!(head_commit(&live), before, "the branch moved without a review");
+        assert_eq!(
+            head_commit(&live),
+            before,
+            "the branch moved without a review"
+        );
 
         // Turned on the way §9.1 stores every standing permission: a
         // workspace-level entry, written by the owner and audited.
@@ -10344,14 +10409,8 @@ mod tests {
         let MessageBody::CodeStudioBody(CodeStudioPayload::GitCommitResponse {
             patch_set_id: Some(other_set),
             ..
-        }) = git_commit_v1(
-            &live.fx.ctx,
-            &live.workspace_id,
-            &other_id,
-            "other",
-            None,
-        )
-        .expect("review")
+        }) = git_commit_v1(&live.fx.ctx, &live.workspace_id, &other_id, "other", None)
+            .expect("review")
         else {
             panic!("unexpected response");
         };
@@ -10408,7 +10467,11 @@ mod tests {
     #[test]
     fn an_upstream_is_refused_by_name_and_before_the_gate() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-upstream", AutonomyMode::AutoEdit, AutonomyMode::AutoEdit) else {
+        let Some(live) = live(
+            "ws-upstream",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::AutoEdit,
+        ) else {
             return;
         };
         let err = git_push_v1(
@@ -10689,8 +10752,7 @@ mod tests {
         )
         .expect("decide");
         let MessageBody::CodeStudioBody(CodeStudioPayload::ApprovalDecideResponse {
-            resumed,
-            ..
+            resumed, ..
         }) = answer
         else {
             panic!("unexpected response");
@@ -10700,9 +10762,7 @@ mod tests {
             Ok(crate::agents::InteractionReply::Permission(
                 crate::agents::PermissionDecision::AllowOnce,
             )) => {}
-            other => panic!(
-                "the parked run was never handed the operator's answer: {other:?}"
-            ),
+            other => panic!("the parked run was never handed the operator's answer: {other:?}"),
         }
         release();
     }
@@ -10718,8 +10778,7 @@ mod tests {
     #[test]
     fn one_decision_leaves_one_decided_event() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-one-event", AutonomyMode::AutoEdit, AutonomyMode::Normal)
-        else {
+        let Some(live) = live("ws-one-event", AutonomyMode::AutoEdit, AutonomyMode::Normal) else {
             return;
         };
         let scope = live.scope();
@@ -10783,8 +10842,11 @@ mod tests {
     #[test]
     fn adversarial_an_approval_for_one_command_grants_every_command() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-grant-scope", AutonomyMode::AutoEdit, AutonomyMode::Normal)
-        else {
+        let Some(live) = live(
+            "ws-grant-scope",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::Normal,
+        ) else {
             return;
         };
         let scope = live.scope();
@@ -10831,8 +10893,11 @@ mod tests {
     #[test]
     fn adversarial_an_editor_writes_a_workspace_wide_standing_grant() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-editor-grant", AutonomyMode::AutoEdit, AutonomyMode::Normal)
-        else {
+        let Some(live) = live(
+            "ws-editor-grant",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::Normal,
+        ) else {
             return;
         };
         // Same person, demoted to editor. The session stays theirs, so
@@ -10885,7 +10950,10 @@ mod tests {
         };
         // The session writes without asking, which is what `auto_edit` means.
         write_file(&live, "src/main.rs", "fn main() {}\n", None);
-        assert_eq!(live.scope().autonomy().expect("autonomy"), AutonomyMode::AutoEdit);
+        assert_eq!(
+            live.scope().autonomy().expect("autonomy"),
+            AutonomyMode::AutoEdit
+        );
 
         {
             let conn = live.fx.ctx.state.db.write().expect("db");
@@ -10955,8 +11023,11 @@ mod tests {
     #[test]
     fn a_session_grant_covers_the_command_it_was_given_for_and_no_other() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-session-grant", AutonomyMode::AutoEdit, AutonomyMode::Normal)
-        else {
+        let Some(live) = live(
+            "ws-session-grant",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::Normal,
+        ) else {
             return;
         };
         let scope = live.scope();
@@ -10994,14 +11065,8 @@ mod tests {
         let Some(live) = live("ws-plan", AutonomyMode::AutoEdit, AutonomyMode::Plan) else {
             return;
         };
-        let err = terminal_open_v1(
-            &live.fx.ctx,
-            &live.workspace_id,
-            &live.session_id,
-            24,
-            80,
-        )
-        .expect_err("plan mode has no terminal");
+        let err = terminal_open_v1(&live.fx.ctx, &live.workspace_id, &live.session_id, 24, 80)
+            .expect_err("plan mode has no terminal");
         assert_eq!(err.code, ProtocolErrorCode::PolicyDenied);
         assert!(err.message.contains("plan mode"), "{}", err.message);
 
@@ -11067,10 +11132,8 @@ mod tests {
         );
 
         // And the artifact the handler stores is redacted before it is written.
-        let transcript = redact::redact_text(&format!(
-            "$ {}\n",
-            redact::redact_argv(&argv).join(" ")
-        ));
+        let transcript =
+            redact::redact_text(&format!("$ {}\n", redact::redact_argv(&argv).join(" ")));
         assert!(!transcript.contains(TOKEN), "{transcript}");
         let stored = artifacts::put(
             &scope.pool,
@@ -11112,8 +11175,11 @@ mod tests {
     #[tokio::test]
     async fn a_command_narrowed_to_cow_says_its_writes_were_discarded() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-cow-truth", AutonomyMode::AutoEdit, AutonomyMode::AutoEdit)
-        else {
+        let Some(live) = live(
+            "ws-cow-truth",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::AutoEdit,
+        ) else {
             return;
         };
         write_file(&live, "scratch.txt", "keep me\n", None);
@@ -11122,9 +11188,8 @@ mod tests {
         // §9.3 — the point of the test is the profile, not the gate.
         let scope = live.scope();
         let interaction = interaction_id(&scope.session.id, Capability::Exec, "sh");
-        let approval_id =
-            record_approval(&scope, Capability::Exec, "sh", &interaction, "run 'rm'")
-                .expect("record approval");
+        let approval_id = record_approval(&scope, Capability::Exec, "sh", &interaction, "run 'rm'")
+            .expect("record approval");
         approval_decide_v1(
             &live.fx.ctx,
             &live.workspace_id,
@@ -11200,9 +11265,11 @@ mod tests {
                     requested_mount_access,
                     writes_discarded,
                     ..
-                } if *op_id == exec_id => {
-                    Some((*exit_code, requested_mount_access.clone(), *writes_discarded))
-                }
+                } if *op_id == exec_id => Some((
+                    *exit_code,
+                    requested_mount_access.clone(),
+                    *writes_discarded,
+                )),
                 _ => None,
             })
             .expect("the command has a timeline row");
@@ -11219,8 +11286,11 @@ mod tests {
     #[tokio::test]
     async fn the_output_of_a_finished_command_can_be_read_back() {
         let _guard = paths::test_data_dir_guard();
-        let Some(live) = live("ws-exec-output", AutonomyMode::AutoEdit, AutonomyMode::Normal)
-        else {
+        let Some(live) = live(
+            "ws-exec-output",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::Normal,
+        ) else {
             return;
         };
         let scope = live.scope();
@@ -11253,9 +11323,8 @@ mod tests {
             true,
         )
         .expect("exec start");
-        let MessageBody::CodeStudioBody(CodeStudioPayload::ExecStartResponse {
-            exec_id, ..
-        }) = response
+        let MessageBody::CodeStudioBody(CodeStudioPayload::ExecStartResponse { exec_id, .. }) =
+            response
         else {
             panic!("unexpected response");
         };
@@ -11283,8 +11352,7 @@ mod tests {
         };
         assert_eq!(status, "completed");
         assert!(
-            lines.iter().any(|line| line == "first")
-                && lines.iter().any(|line| line == "second"),
+            lines.iter().any(|line| line == "first") && lines.iter().any(|line| line == "second"),
             "the command's stdout is missing: {lines:?}"
         );
         assert_eq!(next_seq, lines.len() as u64);
@@ -11347,7 +11415,11 @@ mod tests {
 
         let err = index_rebuild_v1(&fx.ctx, "ws-index", "main").expect_err("must refuse");
         assert_eq!(err.code, ProtocolErrorCode::NotAvailable);
-        assert!(err.message.contains("indexing is disabled"), "{}", err.message);
+        assert!(
+            err.message.contains("indexing is disabled"),
+            "{}",
+            err.message
+        );
         release();
     }
 
@@ -11376,7 +11448,6 @@ mod tests {
         let narrowed = narrow_profile(granted, MountAccess::ReadOnly, NetworkAccess::None);
         assert_eq!(narrowed.mount, MountAccess::ReadOnly);
     }
-
 
     // =========================================================================
     // Owner-node routing (§3, §12)
@@ -11565,10 +11636,7 @@ mod tests {
         let peer = node_info(&fx.ctx, "node-b".to_string(), true);
         assert!(!peer.is_local);
         assert!(peer.supports_container);
-        assert_eq!(
-            peer.egress_enforcement,
-            EgressEnforcement::Namespace.slug()
-        );
+        assert_eq!(peer.egress_enforcement, EgressEnforcement::Namespace.slug());
         let bare = node_info(&fx.ctx, "node-c".to_string(), false);
         assert_eq!(
             bare.egress_enforcement,
@@ -11639,7 +11707,11 @@ mod tests {
         let _guard = paths::test_data_dir_guard();
         // `normal` asks before every write (§9.5) and that is covered by its own
         // test; here the write is setup, not the subject.
-        let Some(live) = live("ws-revision-mix", AutonomyMode::AutoEdit, AutonomyMode::AutoEdit) else {
+        let Some(live) = live(
+            "ws-revision-mix",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::AutoEdit,
+        ) else {
             return;
         };
         write_file(&live, "src/main.rs", "fn main() {}\n", None);
@@ -11757,7 +11829,11 @@ mod tests {
         let _guard = paths::test_data_dir_guard();
         // `normal` asks before every write (§9.5) and that is covered by its own
         // test; here the write is setup, not the subject.
-        let Some(live) = live("ws-revision-cap", AutonomyMode::AutoEdit, AutonomyMode::AutoEdit) else {
+        let Some(live) = live(
+            "ws-revision-cap",
+            AutonomyMode::AutoEdit,
+            AutonomyMode::AutoEdit,
+        ) else {
             return;
         };
         write_file(&live, "src/main.rs", "fn main() {}\n", None);
@@ -11998,7 +12074,6 @@ mod tests {
         release();
     }
 
-
     // =========================================================================
     // Registry writes and the Sync Ledger
     // =========================================================================
@@ -12040,8 +12115,7 @@ mod tests {
             ])
         ));
 
-        allowlist_remove_v1(&fx.ctx, "ws-sync-allow", "net_egress", "crates.io*")
-            .expect("remove");
+        allowlist_remove_v1(&fx.ctx, "ws-sync-allow", "net_egress", "crates.io*").expect("remove");
         let entries = read_allowlist(&fx.ctx.state.db, "ws-sync-allow").expect("list");
         assert!(
             entries.iter().all(|entry| entry.capability != "net_egress"),
@@ -12054,7 +12128,12 @@ mod tests {
     fn a_settings_change_is_captured_for_the_ledger() {
         let _guard = paths::test_data_dir_guard();
         let fx = fixture("u-owner", &[PERM_READ, PERM_ADMIN]);
-        seed_workspace(&fx.ctx, "ws-sync-settings", "u-owner", ExecMode::TrustedNative);
+        seed_workspace(
+            &fx.ctx,
+            "ws-sync-settings",
+            "u-owner",
+            ExecMode::TrustedNative,
+        );
         activate(&fx.ctx, "ws-sync-settings");
         // Creation captures too, so the assertion has to be about THIS write.
         let before = {

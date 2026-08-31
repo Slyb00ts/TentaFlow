@@ -223,7 +223,10 @@ pub fn fingerprint_of(kind: SecretKind, material: &str) -> String {
             return format!("SHA256:{}", B64_NOPAD.encode(Sha256::digest(&blob)));
         }
     }
-    format!("sha256:{}", hex::encode(Sha256::digest(material.as_bytes())))
+    format!(
+        "sha256:{}",
+        hex::encode(Sha256::digest(material.as_bytes()))
+    )
 }
 
 /// Extracts the public-key blob from an `openssh-key-v1` private key. The
@@ -234,7 +237,10 @@ fn openssh_public_blob(pem: &str) -> Option<Vec<u8>> {
     const END: &str = "-----END OPENSSH PRIVATE KEY-----";
     let start = pem.find(BEGIN)? + BEGIN.len();
     let end = pem[start..].find(END)? + start;
-    let body: String = pem[start..end].chars().filter(|c| !c.is_whitespace()).collect();
+    let body: String = pem[start..end]
+        .chars()
+        .filter(|c| !c.is_whitespace())
+        .collect();
     let raw = B64.decode(body).ok()?;
 
     let mut cursor = raw.strip_prefix(b"openssh-key-v1\0".as_slice())?;
@@ -655,7 +661,8 @@ pub fn get_agent_credential(
         provider_base_url,
         material: SecretMaterial {
             kind: SecretKind::GitToken,
-            fingerprint: fingerprint.unwrap_or_else(|| fingerprint_of(SecretKind::GitToken, &material)),
+            fingerprint: fingerprint
+                .unwrap_or_else(|| fingerprint_of(SecretKind::GitToken, &material)),
             material,
         },
     })
@@ -1078,8 +1085,14 @@ mod tests {
             "u-owner",
         )
         .expect("rotate");
-        assert_eq!(rotation.superseded_ref.as_deref(), Some(first.secret_ref.as_str()));
-        assert_eq!(handle_of(&db, "ws-1").as_deref(), Some(rotation.secret_ref.as_str()));
+        assert_eq!(
+            rotation.superseded_ref.as_deref(),
+            Some(first.secret_ref.as_str())
+        );
+        assert_eq!(
+            handle_of(&db, "ws-1").as_deref(),
+            Some(rotation.secret_ref.as_str())
+        );
         assert_ne!(rotation.fingerprint, first.fingerprint);
 
         // Not used yet: nothing may be removed.
@@ -1173,7 +1186,8 @@ mod tests {
         // Another node's row is a different credential, not this one.
         assert!(get_agent_credential(&db, &cipher, "org-1", "node-2", "codex").is_err());
 
-        let credential = get_agent_credential(&db, &cipher, "org-1", "node-1", "codex").expect("get");
+        let credential =
+            get_agent_credential(&db, &cipher, "org-1", "node-1", "codex").expect("get");
         assert_eq!(credential.material.expose(), TOKEN);
         assert_eq!(credential.provider_base_url, "https://api.example.invalid");
 

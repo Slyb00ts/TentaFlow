@@ -705,7 +705,9 @@ mod tests {
         GraphExtractNodeAdapter::new()
             .execute(
                 &node(json!({})),
-                &[chunk_input(json!({"doc_id": "file-1", "graph_enabled": false}))],
+                &[chunk_input(
+                    json!({"doc_id": "file-1", "graph_enabled": false}),
+                )],
                 &ctx,
             )
             .await
@@ -727,7 +729,9 @@ mod tests {
             .execute(
                 &node(json!({"graph_enabled": false})),
                 // meta says ON, node config says OFF -> OFF wins.
-                &[chunk_input(json!({"doc_id": "file-1", "graph_enabled": true}))],
+                &[chunk_input(
+                    json!({"doc_id": "file-1", "graph_enabled": true}),
+                )],
                 &ctx,
             )
             .await
@@ -812,7 +816,11 @@ mod tests {
         ctx.llm = llm.clone();
 
         let out = GraphExtractNodeAdapter::new()
-            .execute(&node(json!({})), &[chunk_input(json!({"doc_id": "f"}))], &ctx)
+            .execute(
+                &node(json!({})),
+                &[chunk_input(json!({"doc_id": "f"}))],
+                &ctx,
+            )
             .await
             .expect("legacy caller degrades instead of failing");
         assert!(matches!(out.payload, FlowValue::Json(_)));
@@ -823,9 +831,9 @@ mod tests {
 
     #[cfg(feature = "graph")]
     mod with_graph {
+        use super::super::extraction;
         use super::*;
         use crate::flow_engine::node_adapter::test_support::stub_graph;
-        use super::super::extraction;
 
         const ANSWER: &str = r#"```json
 {"entities":[{"name":"Albert Einstein","type":"person"},{"name":"ETH Zurich","type":"org"}],
@@ -889,7 +897,9 @@ mod tests {
             let out = GraphExtractNodeAdapter::new()
                 .execute(
                     &node(json!({"collection": "kg_active", "batch_chars": 24000})),
-                    &[chunk_input(json!({"doc_id": "file-1", "source_id": "src-1"}))],
+                    &[chunk_input(
+                        json!({"doc_id": "file-1", "source_id": "src-1"}),
+                    )],
                     &ctx,
                 )
                 .await
@@ -1046,7 +1056,10 @@ mod tests {
                 )
                 .await
                 .expect_err("no addon scope must fail");
-            assert!(err.to_string().contains("ctx.addon_id"), "unexpected: {err}");
+            assert!(
+                err.to_string().contains("ctx.addon_id"),
+                "unexpected: {err}"
+            );
         }
 
         #[test]
@@ -1112,7 +1125,10 @@ mod tests {
             let mut env = FlowEnvelope::empty();
             env.payload = FlowValue::Text("plain".into());
             let err = extraction::batches(&env, 100).expect_err("Text payload must fail");
-            assert!(err.to_string().contains("must be Json"), "unexpected: {err}");
+            assert!(
+                err.to_string().contains("must be Json"),
+                "unexpected: {err}"
+            );
         }
     }
 }

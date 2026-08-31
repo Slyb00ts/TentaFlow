@@ -434,7 +434,10 @@ mod tests {
             principal: AgentPrincipal,
         ) -> anyhow::Result<()> {
             let payload = initial.payload.as_text().unwrap_or_default().to_string();
-            self.calls.lock().unwrap().push((flow_id, payload, principal));
+            self.calls
+                .lock()
+                .unwrap()
+                .push((flow_id, payload, principal));
             let _ = self.tx.send(());
             Ok(())
         }
@@ -623,7 +626,11 @@ mod tests {
             Some("u-5"),
             "the user the key is bound to must survive"
         );
-        assert_ne!(dispatched.actor, FlowActor::system(), "unattributable actor");
+        assert_ne!(
+            dispatched.actor,
+            FlowActor::system(),
+            "unattributable actor"
+        );
         assert_eq!(dispatched.user_id.as_deref(), Some("u-5"));
         assert_eq!(dispatched.org_id.as_deref(), Some("org-1"));
         assert_eq!(dispatched.correlation_id.as_deref(), Some("corr-3"));

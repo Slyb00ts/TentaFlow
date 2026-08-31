@@ -10,22 +10,23 @@
 // over the same bytes, which is the data `mmap-read`'s on/off decision is
 // made from (PLAN §2.1).
 //
-// Review P2-11/P3-4: `scan_via_pread` now reads each batch with the same
-// readahead-buffer, single-syscall-in-the-common-case strategy the
-// production `PartitionReader::fetch_from_offset` uses (partition.rs's
-// `ReadBuf`), instead of two full `pread`s per batch (one that only reads
-// the header, then a second that re-reads the header as part of reading
-// the whole batch again). That was the unfair half of the mmap comparison:
-// `scan_via_mmap` paid neither a syscall nor an allocation, while
-// `scan_via_pread` paid for both, twice. They are still not identical
-// (mmap's zero-copy slice vs. pread's mandatory one copy into an owned
-// buffer is an inherent difference, not an artifact of the harness) — the
-// fix removes the *artifact*, not the fundamental difference the `mmap-read`
-// decision is supposed to be measured on.
+// `scan_via_pread` reads each batch with the same readahead-buffer,
+// single-syscall-in-the-common-case strategy the production
+// `PartitionReader::fetch_from_offset` uses (partition.rs's `ReadBuf`),
+// instead of two full `pread`s per batch (one that only reads the header,
+// then a second that re-reads the header as part of reading the whole
+// batch again) — that double-read would be the unfair half of the mmap
+// comparison below: `scan_via_mmap` pays neither a syscall nor an
+// allocation, so `scan_via_pread` must not pay for either twice. They are
+// still not identical (mmap's zero-copy slice vs. pread's mandatory one
+// copy into an owned buffer is an inherent difference, not an artifact of
+// the harness) — matching the read strategy removes the *artifact*, not
+// the fundamental difference the `mmap-read` decision is supposed to be
+// measured on.
 //
-// Review P3-12: each bench function gets its own dataset directory (via
-// `support::bench_dir`, keyed by function name) instead of three functions
-// sharing — and therefore racing to delete — one fixed path.
+// Each bench function gets its own dataset directory (via
+// `support::bench_dir`, keyed by function name) instead of multiple
+// functions sharing — and therefore racing to delete — one fixed path.
 
 use std::fs::File;
 use std::thread;
@@ -144,9 +145,9 @@ fn bench_seeks(c: &mut Criterion) {
 
 /// Sequential full-segment scan via the same readahead-buffer, single
 /// -syscall-in-the-common-case strategy `PartitionReader::fetch_from_offset`
-/// uses internally (review P2-11/P3-4) — a `readbuf` reused across every
-/// batch in the scan, one `pread` covering header+body for any batch that
-/// fits inside `READAHEAD_BYTES`.
+/// uses internally — a `readbuf` reused across every batch in the scan, one
+/// `pread` covering header+body for any batch that fits inside
+/// `READAHEAD_BYTES`.
 fn scan_via_pread(file: &File, seg_len: u64) -> (u64, u64) {
     let mut pos = 0u64;
     let mut records = 0u64;

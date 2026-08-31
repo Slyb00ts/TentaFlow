@@ -258,7 +258,8 @@ pub async fn start_mesh_pipeline(
             // (ROADMAP Z12, P2-1) so `trusted_nodes.environment` stays
             // current after a later `SetKind`, not just at pairing time.
             if let Some(db) = &db_pool {
-                local_node_info.environment = crate::services::environment::get_node_environment(db);
+                local_node_info.environment =
+                    crate::services::environment::get_node_environment(db);
             }
             upsert_local_peer(
                 mesh_peer_store,
@@ -480,7 +481,8 @@ pub async fn start_mesh_pipeline(
             error!("Nie udalo sie utworzyc IrohMeshManager: {}", e);
             let mut local_node_info = node_info_collector::collect_node_info(app_node_id);
             if let Some(db) = &db_pool {
-                local_node_info.environment = crate::services::environment::get_node_environment(db);
+                local_node_info.environment =
+                    crate::services::environment::get_node_environment(db);
             }
             upsert_local_peer(
                 mesh_peer_store,

@@ -68,7 +68,10 @@ pub async fn storage_admin_dispatch(
                 None,
                 "storage.migrate.request",
                 Some("settings"),
-                Some(&format!("{} -> {} (move={})", r.key, r.new_path, r.move_data)),
+                Some(&format!(
+                    "{} -> {} (move={})",
+                    r.key, r.new_path, r.move_data
+                )),
                 None,
                 Some(&ctx.state.local_node_id),
             );
@@ -100,10 +103,19 @@ macro_rules! register_storage_admin_variant {
     };
 }
 
-register_storage_admin_variant!("StorageOverviewRequest", "tentaflow_ws_handler_storage_overview");
-register_storage_admin_variant!("StorageBrowseRequest", "tentaflow_ws_handler_storage_browse");
+register_storage_admin_variant!(
+    "StorageOverviewRequest",
+    "tentaflow_ws_handler_storage_overview"
+);
+register_storage_admin_variant!(
+    "StorageBrowseRequest",
+    "tentaflow_ws_handler_storage_browse"
+);
 register_storage_admin_variant!(
     "StorageCreateDirRequest",
     "tentaflow_ws_handler_storage_create_dir"
 );
-register_storage_admin_variant!("StorageMigrateRequest", "tentaflow_ws_handler_storage_migrate");
+register_storage_admin_variant!(
+    "StorageMigrateRequest",
+    "tentaflow_ws_handler_storage_migrate"
+);

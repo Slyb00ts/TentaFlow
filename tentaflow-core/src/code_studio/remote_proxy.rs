@@ -633,7 +633,10 @@ async fn execute_owner_side_inner(
     let ctx = handler_context(&state, &verified)?;
     let response = with_remote_origin(
         assertion::digest_hex(payload_cbor),
-        crate::dispatch::code_studio::code_studio_dispatch(&MessageBody::CodeStudioBody(payload), &ctx),
+        crate::dispatch::code_studio::code_studio_dispatch(
+            &MessageBody::CodeStudioBody(payload),
+            &ctx,
+        ),
     )
     .await?;
     match response {

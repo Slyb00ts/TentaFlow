@@ -8,8 +8,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
-use crate::flow_engine::envelope::TokenUsage;
 use crate::flow_engine::dispatcher::CallProvenance;
+use crate::flow_engine::envelope::TokenUsage;
 
 #[derive(Debug, Clone)]
 pub struct EmbeddingsRequest {

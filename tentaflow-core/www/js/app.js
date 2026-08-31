@@ -64,6 +64,7 @@ import SkillsScreen from '/js/modules/skills.js';
 import AgentsScreen from '/js/modules/agents.js';
 import ProjectStudioScreen from '/js/modules/project-studio.js';
 import CodeStudioScreen from '/js/modules/code-studio.js';
+import TentaBusScreen from '/js/modules/tentabus.js';
 
 // Adapter: profile-report eksponuje statyczne `render(container, params)`,
 // podczas gdy Router oczekuje `show(params)`. Owijamy je w minimalny screen
@@ -116,6 +117,7 @@ const ADMIN_NAV = [
       { id: 'mesh', labelKey: 'nav.mesh', icon: 'network' },
       { id: 'clusters', labelKey: 'nav.clusters', icon: 'cluster' },
       { id: 'prompts', labelKey: 'nav.prompts', icon: 'prompt' },
+      { id: 'tentabus', labelKey: 'nav.tentabus', icon: 'bus' },
     ],
   },
   {
@@ -537,6 +539,7 @@ async function renderApp() {
   Router.register('projekty', ProjectStudioScreen);
   Router.register('mesh', MeshScreen);
   Router.register('clusters', ClustersScreen);
+  Router.register('tentabus', TentaBusScreen);
   Router.register('users', UsersScreen);
   Router.register('access-keys', AccessKeysScreen);
   Router.register('roles-catalog', RolesCatalogScreen);
@@ -628,21 +631,27 @@ async function refreshNavCounts() {
     }
   };
   const len = (v) => Array.isArray(v) ? v.length : (v?.length ?? 0);
-  // Wszystkie 5 zapytan przez binary WS — zero REST w refreshNavCounts.
+  // Wszystkie zapytania przez binary WS — zero REST w refreshNavCounts.
   // Handler UsersListRequest wymaga policy Admin: dla zwyklych userow
   // serwer odpowie bledem i catch zwroci null (badge nie pokaze sie).
-  const [svc, mesh, clusters, addons, users] = await Promise.all([
+  const [svc, mesh, clusters, addons, users, busStats] = await Promise.all([
     ApiBinary.list('serviceListRequest').catch(() => null),
     ApiBinary.list('meshNodeListRequest', { arrayKey: 'nodes' }).catch(() => null),
     ApiBinary.list('clusterListRequest', { arrayKey: 'clusters' }).catch(() => null),
     ApiBinary.list('addonsListRequest', { arrayKey: 'addons' }).catch(() => null),
     ApiBinary.list('usersListRequest', { arrayKey: 'users' }).catch(() => null),
+    ApiBinary.one('busStatsSnapshotRequest').catch(() => null),
   ]);
   if (svc !== null) setCount('services', len(svc));
   if (mesh !== null) setCount('mesh', len(mesh));
   if (clusters !== null) setCount('clusters', len(clusters));
   if (addons !== null) setCount('addons', len(addons));
   if (users !== null) setCount('users', len(users));
+  // TentaBus badge = real DLQ record depth (`BusStatsSnapshotWire.
+  // total_dlq_depth`, tor U task 3) — replaces the earlier "number of DLQ
+  // topics with at least one record ever filed" approximation now that the
+  // wire reports an exact count (see tentabus.js's module-doc gap #1).
+  if (busStats !== null) setCount('tentabus', busStats.totalDlqDepth);
 }
 
 // Whitelista ikon w sprite (zob. www/index.html <symbol id="i-...">). Addon

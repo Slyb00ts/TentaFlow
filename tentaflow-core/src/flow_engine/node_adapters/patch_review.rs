@@ -23,8 +23,8 @@ use serde_json::json;
 
 use crate::agents::{
     await_interaction_reply, interaction_now_ms, AgentRunManager, AgentServiceSlot,
-    InteractionKind, InteractionOutcome, InteractionRegistry, InteractionReply,
-    PendingInteraction, PermissionDecision,
+    InteractionKind, InteractionOutcome, InteractionRegistry, InteractionReply, PendingInteraction,
+    PermissionDecision,
 };
 use crate::code_studio::pep::AskKind;
 use crate::code_studio::tools::{

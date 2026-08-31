@@ -529,12 +529,16 @@ pub enum MeshCommandType {
     /// klastra Ray jako headless. Odbiorca uruchamia kontener z komenda
     /// `ray start ... && vllm serve ...` + NCCL env + flagami RDMA i zwraca
     /// `ServiceDeployDistributedResult`. Appended at END (ciborium index rule).
-    ServiceDeployDistributed { spec: DistributedDeploySpec },
+    ServiceDeployDistributed {
+        spec: DistributedDeploySpec,
+    },
     /// Teardown jednego distributed-deploymentu na TYM nodzie (head lub worker).
     /// Odbiorca zatrzymuje+usuwa kontener i wiersz serwisu nalezacy do
     /// `deployment_cluster_id`. Czysci sesje Ray (kazdy nieudany vllm brudzi
     /// sesje), wiec redeploy startuje na czysto. Appended at END.
-    ServiceStopDistributed { deployment_cluster_id: String },
+    ServiceStopDistributed {
+        deployment_cluster_id: String,
+    },
     /// Sonduje REALNA gotowosc head-a distributed-deploymentu NA TYM nodzie:
     /// czy GCS Ray nasluchuje (`ray_port`), ilu nodow widzi klaster Ray
     /// (`ray status` w kontenerze head-a — weryfikacja dolaczenia workerow,
@@ -1033,9 +1037,7 @@ pub enum MeshCommandResponsePayload {
     /// forwarded `RobotControl` against its local robot addon. A rejection
     /// (timing/permission/unknown-robot) is carried as a successful response with
     /// the encoded `RobotControlResponse::rejected(...)`. Appended at END.
-    RobotControlResult {
-        result_cbor: Vec<u8>,
-    },
+    RobotControlResult { result_cbor: Vec<u8> },
     /// Wynik `RoceProbe` — lista RoCE/RDMA interfejsow noda. Appended at END.
     RoceInterfaceList(Vec<RoceInterfaceInfo>),
     /// Wynik `ServiceDeployDistributed` — slug deployu (do streamu logow na
@@ -1062,20 +1064,14 @@ pub enum MeshCommandResponsePayload {
         error: Option<String>,
     },
     /// P0 cluster deploy: wynik `ModelPresentLocal`. Appended at END.
-    ModelPresentResult {
-        present: bool,
-    },
+    ModelPresentResult { present: bool },
     /// Serialized recordings list JSON (`Vec<RemoteRecordingItem>`) produced by
     /// the receiver for `CameraRecordingsList`. Appended at END.
-    CameraRecordingsListResult {
-        recordings_json: String,
-    },
+    CameraRecordingsListResult { recordings_json: String },
     /// Recording refs the receiver successfully streamed over ALPN_ARTIFACT for
     /// `CameraRecordingPull`. Confirms which files travelled; the bytes are not
     /// in this CBOR. Appended at END.
-    CameraRecordingPullResult {
-        pulled_refs: Vec<String>,
-    },
+    CameraRecordingPullResult { pulled_refs: Vec<String> },
     /// JSON response returned by a coding-agent bridge on the owner node.
     AgentRpcResult { result_json: String },
     /// Code Studio: outcome of a `CodeStudioOp` executed on the owner node.
@@ -1291,26 +1287,44 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlTrainCancel")
                 .field("run_id", run_id)
                 .finish(),
-            Self::AgentRpc { service_id, operation, .. } => f
+            Self::AgentRpc {
+                service_id,
+                operation,
+                ..
+            } => f
                 .debug_struct("AgentRpc")
                 .field("service_id", service_id)
                 .field("operation", operation)
                 .finish(),
-            Self::MlDatasetChunk { dataset_hash, seq, total, data_b64 } => f
+            Self::MlDatasetChunk {
+                dataset_hash,
+                seq,
+                total,
+                data_b64,
+            } => f
                 .debug_struct("MlDatasetChunk")
                 .field("hash", &&dataset_hash[..dataset_hash.len().min(12)])
                 .field("seq", seq)
                 .field("total", total)
                 .field("chunk_len", &data_b64.len())
                 .finish(),
-            Self::MlDetect { checkpoint_path, variant, threshold, image_b64, .. } => f
+            Self::MlDetect {
+                checkpoint_path,
+                variant,
+                threshold,
+                image_b64,
+                ..
+            } => f
                 .debug_struct("MlDetect")
                 .field("checkpoint", checkpoint_path)
                 .field("variant", variant)
                 .field("threshold", threshold)
                 .field("image_len", &image_b64.len())
                 .finish(),
-            Self::MlExport { export_id, spec_json } => f
+            Self::MlExport {
+                export_id,
+                spec_json,
+            } => f
                 .debug_struct("MlExport")
                 .field("export_id", export_id)
                 .field("spec_len", &spec_json.len())
@@ -1319,13 +1333,20 @@ impl std::fmt::Debug for MeshCommandType {
                 .debug_struct("MlExportStatus")
                 .field("export_id", export_id)
                 .finish(),
-            Self::MlChat { model_name, max_tokens, message } => f
+            Self::MlChat {
+                model_name,
+                max_tokens,
+                message,
+            } => f
                 .debug_struct("MlChat")
                 .field("model_name", model_name)
                 .field("max_tokens", max_tokens)
                 .field("message_len", &message.len())
                 .finish(),
-            Self::MlArtifactPushTo { src_path, target_node_id } => f
+            Self::MlArtifactPushTo {
+                src_path,
+                target_node_id,
+            } => f
                 .debug_struct("MlArtifactPushTo")
                 .field("src_path", src_path)
                 .field("target_node_id", target_node_id)
@@ -3122,8 +3143,7 @@ mod tests {
         ];
         for p in payloads {
             let bytes = crate::cbor::encode(&p).expect("encode");
-            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes)
-                .expect("decode");
+            crate::cbor::decode::<MeshCommandResponsePayload>(&bytes).expect("decode");
         }
     }
 
@@ -3309,8 +3329,7 @@ mod tests {
             operations: vec![op.clone()],
         };
         let bytes = crate::cbor::encode(&push).expect("encode push");
-        let decoded = crate::cbor::decode::<MeshSyncPushPayload>(&bytes)
-            .expect("decode push");
+        let decoded = crate::cbor::decode::<MeshSyncPushPayload>(&bytes).expect("decode push");
         assert_eq!(decoded.operations[0].op_id, op.op_id);
         assert_eq!(decoded.operations[0].node_seq, 4);
 
@@ -3319,8 +3338,7 @@ mod tests {
             operation_ids: vec![vec![7; 32]],
         };
         let bytes = crate::cbor::encode(&ack).expect("encode ack");
-        let decoded = crate::cbor::decode::<MeshSyncAckPayload>(&bytes)
-            .expect("decode ack");
+        let decoded = crate::cbor::decode::<MeshSyncAckPayload>(&bytes).expect("decode ack");
         assert_eq!(decoded.operation_ids.len(), 1);
 
         let pull = MeshSyncPullPayload {
@@ -3330,8 +3348,7 @@ mod tests {
             limit: 128,
         };
         let bytes = crate::cbor::encode(&pull).expect("encode pull");
-        let decoded = crate::cbor::decode::<MeshSyncPullPayload>(&bytes)
-            .expect("decode pull");
+        let decoded = crate::cbor::decode::<MeshSyncPullPayload>(&bytes).expect("decode pull");
         assert_eq!(decoded.from_node_seq, 2);
 
         let response = MeshSyncPullResponsePayload {
@@ -3343,8 +3360,8 @@ mod tests {
             serving_tip_node_seq: 2,
         };
         let bytes = crate::cbor::encode(&response).expect("encode response");
-        let decoded = crate::cbor::decode::<MeshSyncPullResponsePayload>(&bytes)
-            .expect("decode response");
+        let decoded =
+            crate::cbor::decode::<MeshSyncPullResponsePayload>(&bytes).expect("decode response");
         assert_eq!(decoded.operations.len(), 1);
 
         let snapshot_pull = MeshSyncSnapshotPullPayload {
@@ -3355,8 +3372,7 @@ mod tests {
             include_tail: true,
             tail_limit: 64,
         };
-        let bytes =
-            crate::cbor::encode(&snapshot_pull).expect("encode snapshot pull");
+        let bytes = crate::cbor::encode(&snapshot_pull).expect("encode snapshot pull");
         let decoded = crate::cbor::decode::<MeshSyncSnapshotPullPayload>(&bytes)
             .expect("decode snapshot pull");
         assert_eq!(decoded.snapshot_id, "snapshot-a");
@@ -3378,9 +3394,8 @@ mod tests {
             }],
         };
         let bytes = crate::cbor::encode(&snapshot_response).expect("encode snapshot response");
-        let decoded =
-            crate::cbor::decode::<MeshSyncSnapshotResponsePayload>(&bytes)
-                .expect("decode snapshot response");
+        let decoded = crate::cbor::decode::<MeshSyncSnapshotResponsePayload>(&bytes)
+            .expect("decode snapshot response");
         assert_eq!(decoded.blob_bytes, vec![4, 5, 6]);
         assert_eq!(decoded.operations_after_snapshot.len(), 1);
     }
@@ -3403,8 +3418,7 @@ mod tests {
     fn test_frame_metadata_wire_roundtrip() {
         let meta = sample_metadata();
         let bytes = crate::cbor::encode(&meta).expect("encode metadata");
-        let decoded =
-            crate::cbor::decode::<FrameMetadataWire>(&bytes).expect("decode");
+        let decoded = crate::cbor::decode::<FrameMetadataWire>(&bytes).expect("decode");
         assert_eq!(decoded.camera_id, "cam-front-door");
         assert_eq!(decoded.width, 1920);
         assert_eq!(decoded.height, 1080);
@@ -3421,10 +3435,12 @@ mod tests {
             camera_id: None,
         };
         let bytes = crate::cbor::encode(&req).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes).expect("decode");
         assert_eq!(decoded.request_id, "req-abc-001");
-        assert_eq!(decoded.raw_ref, "frame-store/cam-front-door/2026-05-15T10:00:00.123");
+        assert_eq!(
+            decoded.raw_ref,
+            "frame-store/cam-front-door/2026-05-15T10:00:00.123"
+        );
         assert_eq!(decoded.camera_id, None);
     }
 
@@ -3437,8 +3453,7 @@ mod tests {
             camera_id: Some("cam-uuid-7".into()),
         };
         let bytes = crate::cbor::encode(&req).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyRequestPayload>(&bytes).expect("decode");
         assert_eq!(decoded.request_id, "req-latest-1");
         assert_eq!(decoded.camera_id.as_deref(), Some("cam-uuid-7"));
     }
@@ -3473,8 +3488,7 @@ mod tests {
             metadata: sample_metadata(),
         };
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes).expect("decode");
         match decoded {
             FrameProxyResponsePayload::Found {
                 raw_ref,
@@ -3499,8 +3513,7 @@ mod tests {
             request_id: "req-2".into(),
         };
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes).expect("decode");
         match decoded {
             FrameProxyResponsePayload::NotFound {
                 raw_ref,
@@ -3521,8 +3534,7 @@ mod tests {
             reason: "source connector disconnected mid-fetch".into(),
         };
         let bytes = crate::cbor::encode(&resp).expect("encode");
-        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes)
-            .expect("decode");
+        let decoded = crate::cbor::decode::<FrameProxyResponsePayload>(&bytes).expect("decode");
         match decoded {
             FrameProxyResponsePayload::Unavailable {
                 raw_ref,

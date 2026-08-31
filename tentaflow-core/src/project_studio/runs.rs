@@ -638,7 +638,9 @@ pub fn my_work_rows(pool: &DbPool, user_id: &str) -> Result<Vec<(RunRecord, u32,
 #[cfg(test)]
 mod unit_tests {
     use super::*;
-    use crate::project_studio::tests::{create_case, update_case, CaseContentInput, CaseUpdateOutcome};
+    use crate::project_studio::tests::{
+        create_case, update_case, CaseContentInput, CaseUpdateOutcome,
+    };
 
     fn pool() -> DbPool {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -717,8 +719,8 @@ mod unit_tests {
             "Original title",
             r#"{"steps":[{"action":"old action","expected":"old expected"}]}"#,
         );
-        let snapshots = approved_case_snapshots(&pool, std::slice::from_ref(&case_id))
-            .expect("snapshots");
+        let snapshots =
+            approved_case_snapshots(&pool, std::slice::from_ref(&case_id)).expect("snapshots");
         let (run_id, _no) = create_run(
             &pool,
             "Run snap",

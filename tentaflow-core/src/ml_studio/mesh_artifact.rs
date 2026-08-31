@@ -565,7 +565,10 @@ pub async fn push_recording_to(
     file_path: &Path,
 ) -> anyhow::Result<()> {
     if !file_path.is_file() {
-        anyhow::bail!("nagranie do transferu nie jest plikiem: {}", file_path.display());
+        anyhow::bail!(
+            "nagranie do transferu nie jest plikiem: {}",
+            file_path.display()
+        );
     }
     let ext = file_path
         .extension()
@@ -576,9 +579,10 @@ pub async fn push_recording_to(
     let zip_path = transfer_tmp_file("rec-push")?;
     let file_for_task = file_path.to_path_buf();
     let zip_for_task = zip_path.clone();
-    let zipped = tokio::task::spawn_blocking(move || zip_file_to_file(&file_for_task, &zip_for_task))
-        .await
-        .map_err(|e| anyhow::anyhow!("zip nagrania: join: {e}"))?;
+    let zipped =
+        tokio::task::spawn_blocking(move || zip_file_to_file(&file_for_task, &zip_for_task))
+            .await
+            .map_err(|e| anyhow::anyhow!("zip nagrania: join: {e}"))?;
     let size = match zipped {
         Ok(s) => s,
         Err(e) => {

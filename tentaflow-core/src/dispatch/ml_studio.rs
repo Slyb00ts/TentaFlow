@@ -24,12 +24,12 @@ use tentaflow_protocol::{
 use super::HandlerContext;
 use crate::ml_studio::build_recog_dataset;
 use crate::ml_studio::import_recordings;
-use crate::ml_studio::project_archive;
 use crate::ml_studio::models::{
     Dataset, ModelSummary, ProjectMember, ProjectRole, ProjectSummary, ProjectType, ResourceGrant,
     TrainingRunSummary,
 };
 use crate::ml_studio::profile::{self, TableProfile};
+use crate::ml_studio::project_archive;
 use crate::ml_studio::repository;
 use crate::ml_studio::train_autogluon;
 use crate::ml_studio::train_tabular::{self, Task};
@@ -3588,12 +3588,10 @@ pub async fn ml_studio_ocr_train_start(
         "running"
     };
     Ok(MessageBody::MlStudioBody(
-        MlStudioPayload::OcrTrainStartResponse(
-            tentaflow_protocol::MlStudioOcrTrainStartResponse {
-                run_id,
-                status: start_status.to_string(),
-            },
-        ),
+        MlStudioPayload::OcrTrainStartResponse(tentaflow_protocol::MlStudioOcrTrainStartResponse {
+            run_id,
+            status: start_status.to_string(),
+        }),
     ))
 }
 
@@ -5845,7 +5843,8 @@ static ARCHIVE_UPLOADS: std::sync::OnceLock<
     std::sync::Mutex<std::collections::HashMap<String, ArchiveUpload>>,
 > = std::sync::OnceLock::new();
 
-fn archive_uploads() -> &'static std::sync::Mutex<std::collections::HashMap<String, ArchiveUpload>> {
+fn archive_uploads() -> &'static std::sync::Mutex<std::collections::HashMap<String, ArchiveUpload>>
+{
     ARCHIVE_UPLOADS.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
 }
 
@@ -5980,13 +5979,9 @@ pub fn ml_studio_project_export_start(
         include_models: payload.include_models,
         include_history: payload.include_history,
     };
-    let job_id = project_archive::spawn_export(
-        payload.project_id.clone(),
-        org.user_id.clone(),
-        opts,
-        dest,
-    )
-    .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
+    let job_id =
+        project_archive::spawn_export(payload.project_id.clone(), org.user_id.clone(), opts, dest)
+            .map_err(|e| ProtocolError::bad_request(e.to_string()))?;
     export_refs()
         .lock()
         .unwrap()
@@ -6109,7 +6104,9 @@ pub fn ml_studio_project_import_upload_chunk(
                     return Err(ProtocolError::bad_request("upload already consumed"));
                 }
                 if entry.total_chunks != payload.total_chunks {
-                    return Err(ProtocolError::bad_request("total_chunks mismatch for upload_id"));
+                    return Err(ProtocolError::bad_request(
+                        "total_chunks mismatch for upload_id",
+                    ));
                 }
                 if payload.seq == entry.next_seq {
                     if entry.received_bytes + chunk_len as u64 > MAX_ARCHIVE_UPLOAD_BYTES {
@@ -6355,12 +6352,16 @@ pub fn ml_studio_project_import_apply(
                 .target_project_id
                 .clone()
                 .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| ProtocolError::bad_request("merge mode requires target_project_id"))?;
+                .ok_or_else(|| {
+                    ProtocolError::bad_request("merge mode requires target_project_id")
+                })?;
             let dataset_id = payload
                 .target_dataset_id
                 .clone()
                 .filter(|s| !s.trim().is_empty())
-                .ok_or_else(|| ProtocolError::bad_request("merge mode requires target_dataset_id"))?;
+                .ok_or_else(|| {
+                    ProtocolError::bad_request("merge mode requires target_dataset_id")
+                })?;
             require_project_editor(&org.user_id, &project_id)?;
             project_archive::ImportMode::MergeInto {
                 project_id,
@@ -6386,7 +6387,11 @@ pub fn ml_studio_project_import_apply(
 
     // Mark consumed so the file survives for the running import, can no longer be
     // reused or cancelled, and is reaped after the consumed TTL.
-    if let Some(e) = archive_uploads().lock().unwrap().get_mut(&payload.upload_id) {
+    if let Some(e) = archive_uploads()
+        .lock()
+        .unwrap()
+        .get_mut(&payload.upload_id)
+    {
         e.consumed = true;
         e.last_touch = std::time::Instant::now();
     }
@@ -6552,7 +6557,10 @@ pub async fn ml_studio_recordings_list(
         let pool = crate::db::global_pool()
             .ok_or_else(|| ProtocolError::internal("recordings database unavailable"))?;
         let limit = payload.limit.clamp(1, 1000);
-        let camera_id = payload.camera_id.as_deref().filter(|s| !s.trim().is_empty());
+        let camera_id = payload
+            .camera_id
+            .as_deref()
+            .filter(|s| !s.trim().is_empty());
         // Wire timestamps are unix MILLISECONDS; the recordings table is SECONDS.
         let created_from = payload.date_from_ms.map(|ms| ms / 1000);
         let created_to = payload.date_to_ms.map(|ms| ms / 1000);
@@ -6647,8 +6655,7 @@ pub fn ml_studio_recog_import_recordings(
     }
     let raw = repository::get_dataset_raw(&org.user_id, &payload.dataset_id)
         .map_err(|e| ProtocolError::bad_request(format!("dataset path unavailable: {e:#}")))?;
-    let dataset_dir =
-        std::path::PathBuf::from(String::from_utf8_lossy(&raw).trim().to_string());
+    let dataset_dir = std::path::PathBuf::from(String::from_utf8_lossy(&raw).trim().to_string());
 
     // `collision`/`fps` are validated on the wire: a bad policy string fails here,
     // an out-of-range fps fails inside `spawn_import_recordings::validate_spec`.

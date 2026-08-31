@@ -14,7 +14,9 @@
 use anyhow::{anyhow, bail, Result};
 use rusqlite::{params, Connection, OptionalExtension};
 
-use super::models::{CaseListItem, CaseVersionRecord, RunCounts, RunRecord, SuiteRecord, TestCaseRecord};
+use super::models::{
+    CaseListItem, CaseVersionRecord, RunCounts, RunRecord, SuiteRecord, TestCaseRecord,
+};
 use crate::db::DbPool;
 
 /// The one predicate hiding unreviewed agent output. Append with `AND` to the
@@ -113,7 +115,10 @@ pub fn list_cases(
     }
     if !filters.search.trim().is_empty() {
         clauses.push(format!("title LIKE ?{} ESCAPE '\\'", args.len() + 1));
-        args.push(Box::new(format!("%{}%", escape_like(filters.search.trim()))));
+        args.push(Box::new(format!(
+            "%{}%",
+            escape_like(filters.search.trim())
+        )));
     }
     let where_sql = clauses.join(" AND ");
 
@@ -220,7 +225,11 @@ pub fn list_versions(pool: &DbPool, case_id: &str) -> Result<Vec<CaseVersionReco
         .map_err(Into::into)
 }
 
-pub fn get_version(pool: &DbPool, case_id: &str, version: u32) -> Result<Option<CaseVersionRecord>> {
+pub fn get_version(
+    pool: &DbPool,
+    case_id: &str,
+    version: u32,
+) -> Result<Option<CaseVersionRecord>> {
     let conn = pool.read().map_err(read_err)?;
     conn.query_row(
         "SELECT version, content_json, change_note, created_by, created_at \
@@ -458,7 +467,12 @@ pub fn restore_version(
         "UPDATE test_cases SET content_json = ?1, current_version = ?2, \
             updated_at = datetime('now') \
          WHERE case_id = ?3 AND current_version = ?4",
-        params![content, new_version as i64, case_id, expected_version as i64],
+        params![
+            content,
+            new_version as i64,
+            case_id,
+            expected_version as i64
+        ],
     )?;
     if affected == 0 {
         return Ok(CaseUpdateOutcome::Conflict);
@@ -480,10 +494,7 @@ pub fn restore_version(
 
 /// Requirement of a status transition: the minimum project role and whether a
 /// reason is mandatory (every downgrade). `None` = transition not allowed.
-pub fn transition_requirement(
-    from: &str,
-    to: &str,
-) -> Option<(super::models::ProjectRole, bool)> {
+pub fn transition_requirement(from: &str, to: &str) -> Option<(super::models::ProjectRole, bool)> {
     use super::models::ProjectRole::{Editor, Manager};
     match (from, to) {
         ("draft", "review") => Some((Editor, false)),
@@ -620,7 +631,10 @@ pub fn parse_csv(text: &str) -> (Vec<CsvRow>, Vec<(u32, String)>) {
         }
         let fields: Vec<&str> = line.split(';').collect();
         if fields.len() < 2 {
-            errors.push((line_no, "expected `title;priority;preconditions;steps;test_data;tags`".into()));
+            errors.push((
+                line_no,
+                "expected `title;priority;preconditions;steps;test_data;tags`".into(),
+            ));
             continue;
         }
         let title = fields[0].trim();
@@ -643,8 +657,7 @@ pub fn parse_csv(text: &str) -> (Vec<CsvRow>, Vec<(u32, String)>) {
         if !steps_raw.is_empty() {
             for (i, chunk) in steps_raw.split("||").enumerate() {
                 if i >= CSV_MAX_STEPS_PER_ROW {
-                    step_error =
-                        Some(format!("too many steps (max {CSV_MAX_STEPS_PER_ROW})"));
+                    step_error = Some(format!("too many steps (max {CSV_MAX_STEPS_PER_ROW})"));
                     break;
                 }
                 let (action, expected) = match chunk.split_once("=>") {
@@ -694,7 +707,13 @@ pub fn import_cases(pool: &DbPool, rows: &[CsvRow], created_by: &str) -> Result<
         tx.execute(
             "INSERT INTO test_cases (case_id, kind, title, priority, content_json, created_by) \
              VALUES (?1, 'manual', ?2, ?3, ?4, ?5)",
-            params![case_id, row.title, row.priority, row.content_json, created_by],
+            params![
+                case_id,
+                row.title,
+                row.priority,
+                row.content_json,
+                created_by
+            ],
         )?;
         tx.execute(
             "INSERT INTO test_case_versions (case_id, version, content_json, change_note, created_by) \
@@ -868,10 +887,7 @@ pub fn save_suite(
             if n == 0 {
                 bail!("suite not found");
             }
-            tx.execute(
-                "DELETE FROM suite_cases WHERE suite_id = ?1",
-                params![id],
-            )?;
+            tx.execute("DELETE FROM suite_cases WHERE suite_id = ?1", params![id])?;
             id.to_string()
         }
         None => {
@@ -912,7 +928,10 @@ pub fn delete_suite(pool: &DbPool, suite_id: &str) -> Result<bool> {
 }
 
 /// Resolves suite names for a set of ids (missing suite → absent key).
-pub fn suite_names(pool: &DbPool, suite_ids: &[String]) -> Result<std::collections::HashMap<String, String>> {
+pub fn suite_names(
+    pool: &DbPool,
+    suite_ids: &[String],
+) -> Result<std::collections::HashMap<String, String>> {
     let conn = pool.read().map_err(read_err)?;
     let mut out = std::collections::HashMap::new();
     for id in suite_ids {
@@ -964,15 +983,24 @@ mod unit_tests {
     #[test]
     fn optimistic_locking_conflicts_on_stale_version() {
         let pool = pool();
-        let case_id = create_case(&pool, &sample_input("Case A", "{\"steps\":[]}"), None, "", "u1")
-            .expect("create");
+        let case_id = create_case(
+            &pool,
+            &sample_input("Case A", "{\"steps\":[]}"),
+            None,
+            "",
+            "u1",
+        )
+        .expect("create");
 
         // Content change on the correct expected version → v2.
         let out = update_case(
             &pool,
             &case_id,
             1,
-            &sample_input("Case A", "{\"steps\":[{\"action\":\"x\",\"expected\":\"y\"}]}"),
+            &sample_input(
+                "Case A",
+                "{\"steps\":[{\"action\":\"x\",\"expected\":\"y\"}]}",
+            ),
             "edit",
             "u1",
         )
@@ -996,7 +1024,10 @@ mod unit_tests {
             &pool,
             &case_id,
             2,
-            &sample_input("Case A renamed", "{\"steps\":[{\"action\":\"x\",\"expected\":\"y\"}]}"),
+            &sample_input(
+                "Case A renamed",
+                "{\"steps\":[{\"action\":\"x\",\"expected\":\"y\"}]}",
+            ),
             "rename",
             "u1",
         )

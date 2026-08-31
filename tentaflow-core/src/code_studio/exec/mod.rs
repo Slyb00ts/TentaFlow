@@ -155,7 +155,10 @@ pub struct Activity {
 
 impl Activity {
     pub fn new() -> Self {
-        Self { last_ms: AtomicU64::new(0), origin: Instant::now() }
+        Self {
+            last_ms: AtomicU64::new(0),
+            origin: Instant::now(),
+        }
     }
 
     /// Records that the command is alive right now.
@@ -167,7 +170,9 @@ impl Activity {
     /// How long the command has been silent.
     pub fn silent_for(&self) -> Duration {
         let last = self.last_ms.load(Ordering::Relaxed);
-        self.origin.elapsed().saturating_sub(Duration::from_millis(last))
+        self.origin
+            .elapsed()
+            .saturating_sub(Duration::from_millis(last))
     }
 }
 
@@ -518,10 +523,14 @@ impl Executor {
         // on the cancellation — a command whose queue position is still ten
         // deep must not stay in this call until the queue drains.
         let Some(_permit) = self.take_permit(&cancelled) else {
-            return Ok(cancelled_before_start(req, canonical, &plan, started, started_at));
+            return Ok(cancelled_before_start(
+                req, canonical, &plan, started, started_at,
+            ));
         };
         if cancelled.load(Ordering::SeqCst) {
-            return Ok(cancelled_before_start(req, canonical, &plan, started, started_at));
+            return Ok(cancelled_before_start(
+                req, canonical, &plan, started, started_at,
+            ));
         }
 
         let mut command = std::process::Command::new(&plan.argv[0]);
@@ -1047,8 +1056,7 @@ pub fn pty_plan(target: &ExecTarget, vars: &[(String, String)], shell: &[String]
 /// the wrapper did not lead a group. Either way the guaranteed teardown is
 /// releasing the lease, which removes the container outright.
 fn kill_remote(remote: &RemoteHandle) {
-    const SCRIPT: &str =
-        r#"p=$(cat "$1" 2>/dev/null) || exit 0; kill -KILL -"$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null; exit 0"#;
+    const SCRIPT: &str = r#"p=$(cat "$1" 2>/dev/null) || exit 0; kill -KILL -"$p" 2>/dev/null || kill -KILL "$p" 2>/dev/null; exit 0"#;
     let _ = std::process::Command::new(remote.runtime.binary())
         .args([
             "exec",
@@ -1335,11 +1343,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let outcome = run(
             "e-1",
-            Program::Argv(vec![
-                "/bin/echo".into(),
-                "one two".into(),
-                "$SECRET".into(),
-            ]),
+            Program::Argv(vec!["/bin/echo".into(), "one two".into(), "$SECRET".into()]),
             dir.path(),
         );
         assert_eq!(outcome.status, ExitStatus::Code(0));
@@ -1494,7 +1498,10 @@ mod tests {
         assert_eq!(outcome.status, ExitStatus::Code(101));
         assert!(outcome.stdout.truncated);
         assert!(
-            outcome.stdout.text.contains("error[E0308]: mismatched types"),
+            outcome
+                .stdout
+                .text
+                .contains("error[E0308]: mismatched types"),
             "the compiler error was cut away: {:?}",
             outcome.stdout.text
         );
@@ -1587,7 +1594,10 @@ mod tests {
             !unix::group_alive(pgid),
             "the cancelled command left its process group running"
         );
-        assert!(executor.running_count() == 0, "the registry kept the command");
+        assert!(
+            executor.running_count() == 0,
+            "the registry kept the command"
+        );
     }
 
     #[test]
@@ -1630,7 +1640,11 @@ mod tests {
         };
         let req = ExecRequest::new(
             "e-7",
-            Program::Argv(vec!["cargo".into(), "test".into(), "--all; rm -rf /".into()]),
+            Program::Argv(vec![
+                "cargo".into(),
+                "test".into(),
+                "--all; rm -rf /".into(),
+            ]),
         );
         let plan = build_plan(&target, &req.canonical_argv(), &[], &req).unwrap();
 
@@ -1659,7 +1673,10 @@ mod tests {
             ("CARGO_HOME".to_string(), "/toolchain/ov/cargo".to_string()),
             ("HOME".to_string(), "/tmp/home".to_string()),
             // Core's own PATH: host directories that do not exist in the image.
-            ("PATH".to_string(), "/usr/local/bin:/usr/bin:/bin".to_string()),
+            (
+                "PATH".to_string(),
+                "/usr/local/bin:/usr/bin:/bin".to_string(),
+            ),
         ];
         let plan = build_plan(&target, &req.canonical_argv(), &vars, &req).unwrap();
         assert!(plan

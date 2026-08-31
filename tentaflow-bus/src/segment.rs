@@ -1,7 +1,10 @@
 // ===== File: segment.rs — append-only log file, roll policy, crash recovery =====
 //
 // PLAN.md §2.2/§2.3: one segment is one `{base_offset:020}.log` file, the
-// unit a partition rolls at 1 GiB / 1 h / 100k batches. Writes go through
+// unit a partition rolls at (configurable, `RollPolicy::default()` is
+// 256 MiB / 1 h / 100k batches — M1-R2 decision 5, down from the original
+// PLAN default of 1 GiB after M0-WYNIKI found preallocation had no
+// measurable effect under real fsync). Writes go through
 // `pwrite` (positional, no shared file cursor) so a future concurrent
 // reader on the same fd — or this same struct used from a single writer
 // thread that never seeks — cannot race a cursor. Recovery only rescans the
@@ -78,11 +81,11 @@ pub fn pwrite_all(file: &File, pos: u64, buf: &[u8]) -> std::io::Result<()> {
 }
 
 /// Best-effort file-extent preallocation to `len` bytes. Purely a
-/// performance hint (review P1-4 / decision #2): both `device_ceiling`'s
-/// prealloc variant and `Segment::create_new` call this so a growing-file
-/// journal-update cost is not baked into every fsync. Never fails the
-/// caller — an unsupported filesystem/platform just gets ordinary
-/// grow-on-write behavior, which is what every path did before this change.
+/// performance hint: both `device_ceiling`'s prealloc variant and
+/// `Segment::create_new` call this so a growing-file journal-update cost is
+/// not baked into every fsync. Never fails the caller — an unsupported
+/// filesystem/platform just gets ordinary grow-on-write behavior, which is
+/// what every path did before this change.
 #[cfg(target_os = "macos")]
 fn preallocate_file(file: &File, len: u64) -> std::io::Result<()> {
     use std::os::unix::io::AsRawFd;
@@ -140,10 +143,9 @@ fn preallocate_file(_file: &File, _len: u64) -> std::io::Result<()> {
 /// fsyncs a directory so that the directory *entry* for a file just created
 /// in it (or truncated within it) is itself durable — `File::sync_data` /
 /// `sync_all` on the file only guarantees the file's own bytes/metadata,
-/// not that the containing directory recorded the name (review P2-4: a
-/// crash right after a confirmed `fsync_batch` append could otherwise make
-/// the whole segment file disappear on reboot even though its data was
-/// flushed).
+/// not that the containing directory recorded the name — a crash right
+/// after a confirmed `fsync_batch` append could otherwise make the whole
+/// segment file disappear on reboot even though its data was flushed.
 fn fsync_dir(dir: &Path) -> Result<()> {
     File::open(dir)
         .and_then(|f| f.sync_all())
@@ -156,14 +158,32 @@ pub struct RollPolicy {
     pub max_bytes: u64,
     pub max_age: Duration,
     pub max_batches: u32,
+    /// Whether `Segment::create_new` should best-effort preallocate the new
+    /// segment file's extents up to `max_bytes` (`preallocate_file`'s doc).
+    /// Defaults to `false` (TentaBus M1-R2 decision 5, `M0-WYNIKI.md`):
+    /// benchmarking under real `fsync` found no measurable throughput
+    /// benefit from preallocation, while every low-traffic install pays its
+    /// full cost up front — a topic with 8 partitions used to reserve 8 ×
+    /// `max_bytes` on disk (8 GiB at the old 1 GiB default) on its very
+    /// first write, regardless of how much data it ever held. Left
+    /// configurable rather than removed outright: a deployment that DOES
+    /// measure a benefit on its own storage (e.g. a filesystem/device where
+    /// extent-growth journaling is the bottleneck) can still opt back in.
+    pub preallocate: bool,
 }
 
 impl Default for RollPolicy {
     fn default() -> Self {
         Self {
-            max_bytes: 1024 * 1024 * 1024,
+            // 256 MiB (down from 1 GiB): together with `preallocate: false`
+            // below, this bounds how much a single still-growing segment can
+            // grow before a crash-recovery rescan (`Segment::
+            // open_active_with_recovery`, bounded by `max_bytes`) has to
+            // walk — M1-R2 decision 5.
+            max_bytes: 256 * 1024 * 1024,
             max_age: Duration::from_secs(3600),
             max_batches: 100_000,
+            preallocate: false,
         }
     }
 }
@@ -175,6 +195,88 @@ impl Default for RollPolicy {
 pub struct RecoveredBatch {
     pub file_pos: u64,
     pub header: BatchHeader,
+}
+
+/// The result of walking a segment forward to find where a
+/// `Partition::truncate_to_offset` (PLAN-M2 §1a) cut lands: the byte length
+/// and batch count to roll the segment back to, and the resulting
+/// `log_end_offset` (the base_offset of the first dropped batch, or the
+/// segment's own end if nothing was dropped).
+#[derive(Debug, Clone, Copy)]
+pub struct TruncateBoundary {
+    pub new_len: u64,
+    pub new_batch_count: u32,
+    pub new_next_offset: u64,
+}
+
+/// Scans a segment file (`base_offset` is this segment's own, `full_len` its
+/// current on-disk length) from byte 0 to find the last batch boundary at
+/// or before `target_offset` — the largest valid `log_end_offset` that does
+/// not exceed `target_offset`. Reuses the same self-validating offset-chain
+/// and CRC walk `Segment::open_active_with_recovery` performs: batches are
+/// atomic append units, so a `target_offset` that falls *inside* a batch
+/// (rather than exactly on its boundary) discards that whole batch, never a
+/// partial one — the stop condition below is on `next_offset() >
+/// target_offset`, not `base_offset >= target_offset`, precisely to keep a
+/// straddling batch out of the retained region instead of half-keeping it.
+///
+/// A free function taking a plain `&File` (rather than a `&Segment` method)
+/// so `Partition`'s writer-thread truncate handler can call it against
+/// either the still-open active segment or a freshly reopened previously-
+/// sealed one without needing a `Segment` in both cases up front. Never
+/// fails: an I/O error or a decode failure partway through is treated the
+/// same as reaching a boundary — stop and report what was validated so
+/// far — matching `open_active_with_recovery`'s own tolerant scan.
+pub fn scan_truncate_boundary(
+    file: &File,
+    base_offset: u64,
+    full_len: u64,
+    target_offset: u64,
+) -> TruncateBoundary {
+    let mut pos: u64 = 0;
+    let mut expected_offset = base_offset;
+    let mut batch_count: u32 = 0;
+    loop {
+        if pos + BATCH_HEADER_LEN as u64 > full_len {
+            break;
+        }
+        let mut hdr_buf = [0u8; BATCH_HEADER_LEN];
+        if pread_exact(file, pos, &mut hdr_buf).is_err() {
+            break;
+        }
+        let header = match BatchHeader::decode(&hdr_buf) {
+            Ok(h) => h,
+            Err(_) => break,
+        };
+        if header.base_offset != expected_offset {
+            break;
+        }
+        let total = BATCH_HEADER_LEN as u64 + header.body_len as u64;
+        if pos + total > full_len {
+            break;
+        }
+        if header.next_offset() > target_offset {
+            // This batch (and everything after it) is past the cut —
+            // stop *before* including it, even though its own
+            // `base_offset` may still be `< target_offset`.
+            break;
+        }
+        let mut body_buf = vec![0u8; header.body_len as usize];
+        if pread_exact(file, pos + BATCH_HEADER_LEN as u64, &mut body_buf).is_err() {
+            break;
+        }
+        if crc32c::crc32c(&body_buf) != header.crc32c {
+            break;
+        }
+        expected_offset = header.next_offset();
+        batch_count += 1;
+        pos += total;
+    }
+    TruncateBoundary {
+        new_len: pos,
+        new_batch_count: batch_count,
+        new_next_offset: expected_offset,
+    }
 }
 
 /// An append-only segment file. Owned exclusively by the partition's single
@@ -211,12 +313,19 @@ impl Segment {
         self.batch_count
     }
 
+    /// The raw file handle, for `scan_truncate_boundary`'s positional
+    /// reads. Not exposed for writing through this accessor — every
+    /// mutation still goes through `Segment`'s own methods.
+    pub(crate) fn file(&self) -> &File {
+        &self.file
+    }
+
     /// Creates a brand-new, empty segment file, preallocated (best-effort)
     /// to `prealloc_bytes` — the roll policy's `max_bytes`, so the segment
     /// occupies its worst-case footprint on disk from the first write
     /// instead of growing (and paying journal/metadata update cost on every
-    /// `fsync`) one append at a time (review P1-4, decision #2). The
-    /// *logical* length (`len()`) still starts at 0 and only grows via
+    /// `fsync`) one append at a time. The *logical* length (`len()`)
+    /// still starts at 0 and only grows via
     /// `append` — preallocation never changes what a reader sees as valid
     /// data. Fails if a file already exists at that base offset — a
     /// partition never overwrites history.
@@ -254,11 +363,38 @@ impl Segment {
     /// earlier segments were rolled cleanly (fsynced, then closed) and are
     /// trusted as-is. `batch_count` is left at 0 here since roll decisions
     /// are only ever made against the active segment. Opened without write
-    /// access — sealed segments are read-only history (review P3-8).
+    /// access — sealed segments are read-only history.
     pub fn open_sealed(dir: &Path, base_offset: u64) -> Result<Self> {
         let path = log_path(dir, base_offset);
         let file = OpenOptions::new()
             .read(true)
+            .open(&path)
+            .map_err(|e| BusError::io(&path, e))?;
+        let len = file.metadata().map_err(|e| BusError::io(&path, e))?.len();
+        Ok(Self {
+            base_offset,
+            path,
+            file,
+            len,
+            batch_count: 0,
+            created_at: Instant::now(),
+        })
+    }
+
+    /// Reopens an existing segment file for read+write without scanning its
+    /// content — used only by `Partition::truncate_to_offset` (PLAN-M2
+    /// §1a) to promote a previously-sealed segment back to active once
+    /// truncation has deleted every segment that used to come after it.
+    /// Unlike `open_active_with_recovery`, the caller is responsible for
+    /// finding and applying the correct boundary itself
+    /// (`scan_truncate_boundary` + `truncate_to_boundary`) — this
+    /// constructor only opens the fd; `batch_count` is a placeholder (`0`)
+    /// until that call fixes it up.
+    pub fn reopen_for_write(dir: &Path, base_offset: u64) -> Result<Self> {
+        let path = log_path(dir, base_offset);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
             .open(&path)
             .map_err(|e| BusError::io(&path, e))?;
         let len = file.metadata().map_err(|e| BusError::io(&path, e))?.len();
@@ -281,7 +417,7 @@ impl Segment {
     /// and cheap here (segments cap at 1 GiB / 100k batches) and only runs
     /// once at startup, never on the append hot path.
     ///
-    /// Chain validation (review P1-3): the batch header's 36 non-CRC bytes
+    /// Chain validation: the batch header's 36 non-CRC bytes
     /// (including `base_offset`/`record_count`) are not themselves checksum
     /// -protected (PLAN §2.3: "crc32c nad body" only). A single corrupted
     /// bit in `base_offset` with a coincidentally-valid body CRC would
@@ -404,32 +540,57 @@ impl Segment {
 
     /// Reverts the segment's logical bookkeeping (`len`, `batch_count`) to
     /// `len`, which must be a value this segment's `len()` held at some
-    /// earlier point (i.e. the position immediately before the append being
-    /// rolled back). Used when a batch's bytes were written but a
-    /// subsequent step (an index append) failed, so the offset for that
-    /// batch was never published — the next append with the same batch
-    /// lands at exactly `len` again and physically overwrites the orphaned
-    /// bytes (review P3-16). Does not touch the file itself: the orphaned
-    /// bytes stay on disk past the new logical `len`, invisible to any
-    /// reader (which never reads past a published segment length) and
-    /// self-healing on the next crash-recovery scan even if a crash lands
-    /// in the narrow window before the retry overwrites them.
-    pub(crate) fn rollback_len(&mut self, len: u64) {
+    /// earlier point, and `batch_count` back by `batches_rolled_back`. Used
+    /// whenever bytes were physically written but a subsequent step failed
+    /// to make them durable/indexed, so the offset(s) for those bytes were
+    /// never published: a single failed index append rolls back exactly one
+    /// batch (`append_one`'s own error branches), while a group-commit fsync
+    /// failure rolls back every batch this group appended to the segment
+    /// that is *currently* active (`process_group`) in one call. Either
+    /// way, the next append lands at exactly `len` again and
+    /// physically overwrites the orphaned bytes. Does not touch the file
+    /// itself: the orphaned bytes stay on disk past the new logical `len`,
+    /// invisible to any reader (which never reads past a published segment
+    /// length) and self-healing on the next crash-recovery scan even if a
+    /// crash lands in the narrow window before the retry overwrites them.
+    ///
+    /// Invariant this exists to preserve: a batch must never be simultaneously
+    /// (a) reported to its producer as failed and (b) recoverable as valid
+    /// log content after a restart. Failing to roll back `len` here after a
+    /// reported failure is exactly how that invariant breaks — bytes stay
+    /// "published" via the segment's logical length even though the caller
+    /// was told they did not land.
+    pub(crate) fn rollback_len(&mut self, len: u64, batches_rolled_back: u32) {
         debug_assert!(len <= self.len);
         self.len = len;
-        self.batch_count = self.batch_count.saturating_sub(1);
+        self.batch_count = self.batch_count.saturating_sub(batches_rolled_back);
     }
 
     /// Truncates the file down to the segment's logical length, discarding
     /// any unwritten preallocated tail. Called when sealing a segment at
     /// roll time so a segment that never grew all the way to
     /// `RollPolicy::max_bytes` does not permanently waste that preallocated
-    /// disk space (review P1-4's prealloc mechanism, applied without
-    /// leaking its cost past the segment's own lifetime).
+    /// disk space, applied without leaking that preallocated cost past
+    /// the segment's own lifetime.
     pub fn truncate_to_len(&self) -> Result<()> {
         self.file
             .set_len(self.len)
             .map_err(|e| BusError::io(&self.path, e))
+    }
+
+    /// Physically truncates this segment's file down to `boundary.new_len`
+    /// (from `scan_truncate_boundary`), discarding every byte from the
+    /// first dropped batch onward, and fsyncs the result — a truncate is
+    /// exactly as durability-sensitive as a roll (both change what a
+    /// restart's crash recovery will see), so it is not left to the next
+    /// group's fsync policy to cover.
+    pub fn truncate_to_boundary(&mut self, boundary: &TruncateBoundary) -> Result<()> {
+        self.file
+            .set_len(boundary.new_len)
+            .map_err(|e| BusError::io(&self.path, e))?;
+        self.len = boundary.new_len;
+        self.batch_count = boundary.new_batch_count;
+        self.fsync()
     }
 
     /// `fdatasync`-equivalent durability for the segment's data — the
@@ -440,14 +601,13 @@ impl Segment {
             .map_err(|e| BusError::io(&self.path, e))
     }
 
-    /// Stronger durability barrier on macOS/iOS: `fcntl(F_FULLFSYNC)`
-    /// forces the drive itself to flush its write cache, unlike
-    /// `fsync`/`fdatasync`, which on Apple platforms only pushes data to
-    /// the drive's volatile cache (PLAN §5.3.6, decision #2; review P1-4
-    /// item 4: "sync_data() on macOS is not a durability barrier"). Falls
-    /// back to `fsync()` on every other platform and if the drive/FS
-    /// rejects the fcntl (e.g. some external/virtual disks return
-    /// `ENOTSUP`) — reported to the caller as the ordinary `fsync()`
+    /// Stronger durability barrier on macOS/iOS: `fcntl(F_FULLFSYNC)` forces
+    /// the drive itself to flush its write cache, unlike `fsync`/`fdatasync`,
+    /// which on Apple platforms only pushes data to the drive's volatile
+    /// cache — `sync_data()` alone is not a durability barrier on macOS
+    /// (PLAN §5.3.6). Falls back to `fsync()` on every other platform and if
+    /// the drive/FS rejects the fcntl (e.g. some external/virtual disks
+    /// return `ENOTSUP`) — reported to the caller as the ordinary `fsync()`
     /// result in that case rather than failing durability outright.
     #[cfg(any(target_os = "macos", target_os = "ios"))]
     pub fn fsync_full(&self) -> Result<()> {
@@ -522,6 +682,56 @@ mod tests {
         assert_eq!(pos2, batch1.len() as u64);
         assert_eq!(seg.len(), (batch1.len() + batch2.len()) as u64);
         assert_eq!(seg.batch_count(), 2);
+    }
+
+    /// `rollback_len` must be able to undo more than one batch in a single
+    /// call — the shape `process_group` needs when a group-commit fsync
+    /// fails after several jobs landed on the same active segment.
+    /// Rolling back must not touch the file itself (the orphaned bytes stay
+    /// on disk, past the new logical `len`) and a subsequent append must
+    /// land at exactly the rolled-back position, overwriting them.
+    #[test]
+    fn rollback_len_undoes_multiple_batches_and_next_append_overwrites_them() {
+        let dir = temp_dir("segment-rollback-multi");
+        let mut seg = Segment::create_new(&dir, 0, TEST_PREALLOC).unwrap();
+
+        let batch1 = build_batch(0, 3);
+        let batch2 = build_batch(3, 2);
+        let batch3 = build_batch(5, 1);
+        seg.append(&batch1).unwrap();
+        let pos_before_group = seg.len();
+        seg.append(&batch2).unwrap();
+        seg.append(&batch3).unwrap();
+        assert_eq!(seg.batch_count(), 3);
+        let len_with_all_three = seg.len();
+        assert!(len_with_all_three > pos_before_group);
+
+        // Simulate a group-commit fsync failure covering batch2 and batch3:
+        // roll back both in one call.
+        seg.rollback_len(pos_before_group, 2);
+        assert_eq!(seg.len(), pos_before_group);
+        assert_eq!(seg.batch_count(), 1);
+
+        // The physically-written bytes from batch2 are still on disk past
+        // the rolled-back logical length — `rollback_len` never touches
+        // the file itself.
+        let mut orphaned = vec![0u8; batch2.len()];
+        seg.file
+            .read_exact_at(&mut orphaned, pos_before_group)
+            .unwrap();
+        assert_eq!(orphaned, batch2.as_ref());
+
+        // ...but a retry with the same batch lands at exactly the
+        // rolled-back position and overwrites them, rather than appending
+        // past a gap.
+        let retry_pos = seg.append(&batch2).unwrap();
+        assert_eq!(retry_pos, pos_before_group);
+        assert_eq!(seg.len(), pos_before_group + batch2.len() as u64);
+        assert_eq!(seg.batch_count(), 2);
+
+        let mut readback = vec![0u8; batch2.len()];
+        seg.file.read_exact_at(&mut readback, retry_pos).unwrap();
+        assert_eq!(readback, batch2.as_ref());
     }
 
     #[test]
@@ -623,10 +833,10 @@ mod tests {
         );
     }
 
-    /// Review P1-3 / test gap #1: a header that is otherwise well-formed
-    /// (valid magic, in-bounds `body_len`, matching body CRC) but whose
-    /// `base_offset` does not continue the segment's offset chain must stop
-    /// recovery at that point rather than being accepted.
+    /// A header that is otherwise well-formed (valid magic, in-bounds
+    /// `body_len`, matching body CRC) but whose `base_offset` does not
+    /// continue the segment's offset chain must stop recovery at that point
+    /// rather than being accepted.
     #[test]
     fn recovery_stops_at_offset_chain_break() {
         let dir = temp_dir("segment-recovery-chain-break");

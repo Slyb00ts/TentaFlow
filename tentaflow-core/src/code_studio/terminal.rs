@@ -688,9 +688,7 @@ impl Vt {
                 self.index();
             }
             b'c' => self.reset(),
-            b'(' | b')' | b'*' | b'+' | b'%' | b'#' => {
-                self.state = ParserState::EscapeIntermediate
-            }
+            b'(' | b')' | b'*' | b'+' | b'%' | b'#' => self.state = ParserState::EscapeIntermediate,
             b'\\' | b'=' | b'>' => {}
             _ => {}
         }
@@ -704,7 +702,9 @@ impl Vt {
                     self.param_empty = false;
                 }
                 if let Some(last) = self.params.last_mut() {
-                    *last = last.saturating_mul(10).saturating_add(u32::from(byte - b'0'));
+                    *last = last
+                        .saturating_mul(10)
+                        .saturating_add(u32::from(byte - b'0'));
                 }
             }
             // `:` separates sub-parameters (`38:5:n`). Treating it as `;` makes
@@ -1212,9 +1212,7 @@ fn extended_color(rest: &[u32]) -> (Option<Color>, usize) {
             None => (None, 1),
         },
         Some(2) => match (rest.get(1), rest.get(2), rest.get(3)) {
-            (Some(r), Some(g), Some(b)) => {
-                (Some(Color::Rgb(*r as u8, *g as u8, *b as u8)), 4)
-            }
+            (Some(r), Some(g), Some(b)) => (Some(Color::Rgb(*r as u8, *g as u8, *b as u8)), 4),
             _ => (None, rest.len()),
         },
         _ => (None, 0),
@@ -1411,8 +1409,16 @@ impl TerminalRegistry {
             _ => interactive_shell(),
         };
         let plan = exec::pty_plan(target, &env.vars(Some("xterm-256color")), &shell);
-        let rows = if spec.rows == 0 { DEFAULT_ROWS } else { spec.rows };
-        let cols = if spec.cols == 0 { DEFAULT_COLS } else { spec.cols };
+        let rows = if spec.rows == 0 {
+            DEFAULT_ROWS
+        } else {
+            spec.rows
+        };
+        let cols = if spec.cols == 0 {
+            DEFAULT_COLS
+        } else {
+            spec.cols
+        };
 
         let child = backend::open_pty(&plan.argv, &plan.env, &plan.cwd, rows, cols)
             .map_err(|e| TerminalError::Other(anyhow!("cannot open a terminal: {e}")))?;
@@ -1479,7 +1485,11 @@ impl TerminalRegistry {
 
     /// Keystrokes. They go to the process, never to the grid: what appears on
     /// screen is whatever the program echoes back.
-    pub fn pty_write(&self, handle: &PtyHandle, bytes: &[u8]) -> std::result::Result<(), TerminalError> {
+    pub fn pty_write(
+        &self,
+        handle: &PtyHandle,
+        bytes: &[u8],
+    ) -> std::result::Result<(), TerminalError> {
         let terminal = self.get(handle)?;
         if *terminal.state.lock().unwrap_or_else(|e| e.into_inner()) != TerminalState::Running {
             return Err(TerminalError::Closed(handle.terminal_id.clone()));
@@ -1518,7 +1528,10 @@ impl TerminalRegistry {
     /// Closes a terminal: the process group is killed and reaped, the master is
     /// closed and the on-disk record removed. `Reaped` is a fact here, not a
     /// hope — the state is only set after the process is gone.
-    pub fn pty_close(&self, handle: &PtyHandle) -> std::result::Result<TerminalState, TerminalError> {
+    pub fn pty_close(
+        &self,
+        handle: &PtyHandle,
+    ) -> std::result::Result<TerminalState, TerminalError> {
         let terminal = {
             let mut terminals = self
                 .terminals
@@ -1574,7 +1587,10 @@ impl TerminalRegistry {
 
     /// The `exec` event of an open terminal, for a caller re-journalling after
     /// a reconnect.
-    pub fn exec_event(&self, handle: &PtyHandle) -> std::result::Result<TerminalExec, TerminalError> {
+    pub fn exec_event(
+        &self,
+        handle: &PtyHandle,
+    ) -> std::result::Result<TerminalExec, TerminalError> {
         Ok(self.get(handle)?.exec.clone())
     }
 
@@ -1738,8 +1754,7 @@ fn validate_id(id: &str) -> Result<()> {
 
 fn write_record(path: &Path, record: &OrphanRecord) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)
-            .map_err(|e| anyhow!("terminal record directory: {e}"))?;
+        std::fs::create_dir_all(parent).map_err(|e| anyhow!("terminal record directory: {e}"))?;
     }
     let encoded = serde_json::to_vec(record).map_err(|e| anyhow!("terminal record: {e}"))?;
     std::fs::write(path, encoded).map_err(|e| anyhow!("terminal record: {e}"))
@@ -1835,7 +1850,10 @@ mod tests {
         }
         vt.feed(stream.as_bytes());
         let all = everything(&vt);
-        assert!(!all.contains(PASTED), "the scrollback kept the token: {all}");
+        assert!(
+            !all.contains(PASTED),
+            "the scrollback kept the token: {all}"
+        );
         assert!(all.contains("line 19"), "ordinary output was lost");
     }
 
@@ -1875,7 +1893,10 @@ mod tests {
         assert!(all.contains("Compiling tentaflow-core v0.1.0"), "{all}");
         assert!(all.contains("use of undeclared crate"), "{all}");
         assert!(all.contains("--lib code_studio"), "{all}");
-        assert!(!all.contains(redact::REDACTED), "build output was shredded: {all}");
+        assert!(
+            !all.contains(redact::REDACTED),
+            "build output was shredded: {all}"
+        );
     }
 
     fn text(grid: &TerminalGrid, row: usize) -> String {
@@ -1895,7 +1916,14 @@ mod tests {
         vt.feed(b"hello");
         let grid = vt.snapshot();
         assert_eq!(text(&grid, 0), "hello");
-        assert_eq!(grid.cursor, Cursor { row: 0, col: 5, visible: true });
+        assert_eq!(
+            grid.cursor,
+            Cursor {
+                row: 0,
+                col: 5,
+                visible: true
+            }
+        );
     }
 
     #[test]
@@ -1951,7 +1979,14 @@ mod tests {
         for row in 0..3 {
             assert_eq!(text(&grid, row), "", "row {row} survived the erase");
         }
-        assert_eq!(grid.cursor, Cursor { row: 0, col: 0, visible: true });
+        assert_eq!(
+            grid.cursor,
+            Cursor {
+                row: 0,
+                col: 0,
+                visible: true
+            }
+        );
     }
 
     #[test]
@@ -1972,7 +2007,11 @@ mod tests {
         let mut no_wrap = Vt::new(3, 4);
         no_wrap.feed(b"\x1b[?7labcdef");
         let grid = no_wrap.snapshot();
-        assert_eq!(text(&grid, 0), "abcf", "the last column must be overwritten");
+        assert_eq!(
+            text(&grid, 0),
+            "abcf",
+            "the last column must be overwritten"
+        );
         assert_eq!(text(&grid, 1), "");
     }
 
@@ -2131,11 +2170,29 @@ mod tests {
     fn cursor_movement_sequences_land_where_they_say() {
         let mut vt = Vt::new(5, 10);
         vt.feed(b"\x1b[3;5H");
-        assert_eq!(vt.snapshot().cursor, Cursor { row: 2, col: 4, visible: true });
+        assert_eq!(
+            vt.snapshot().cursor,
+            Cursor {
+                row: 2,
+                col: 4,
+                visible: true
+            }
+        );
         vt.feed(b"\x1b[2A\x1b[3C");
-        assert_eq!(vt.snapshot().cursor, Cursor { row: 0, col: 7, visible: true });
+        assert_eq!(
+            vt.snapshot().cursor,
+            Cursor {
+                row: 0,
+                col: 7,
+                visible: true
+            }
+        );
         vt.feed(b"\x1b[10B");
-        assert_eq!(vt.snapshot().cursor.row, 4, "movement must clamp to the screen");
+        assert_eq!(
+            vt.snapshot().cursor.row,
+            4,
+            "movement must clamp to the screen"
+        );
     }
 
     // --- the registry, which needs a real process -------------------------
@@ -2174,12 +2231,7 @@ mod tests {
         };
         let spec = open_spec();
         let opened = registry
-            .pty_open(
-                AutonomyMode::Normal,
-                &target,
-                &env_at(dir.path()),
-                &spec,
-            )
+            .pty_open(AutonomyMode::Normal, &target, &env_at(dir.path()), &spec)
             .expect("open");
 
         // The shell start is an exec event, with argv element by element.
@@ -2282,7 +2334,9 @@ mod tests {
                 &open_spec(),
             )
             .expect("open");
-        registry.pty_resize(&opened.handle, 30, 100).expect("resize");
+        registry
+            .pty_resize(&opened.handle, 30, 100)
+            .expect("resize");
         let grid = registry.snapshot(&opened.handle).expect("snapshot");
         assert_eq!((grid.rows, grid.cols), (30, 100));
         registry.pty_close(&opened.handle).expect("close");

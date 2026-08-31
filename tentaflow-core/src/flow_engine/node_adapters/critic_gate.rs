@@ -130,8 +130,7 @@ impl NodeAdapter for CriticGateNodeAdapter {
         // Case-insensitive so a reviewer that shouts or whispers its approval is
         // still understood; the marker is matched as a substring because models
         // wrap a verdict in a sentence far more often than they emit it bare.
-        let approved = !text.is_empty()
-            && text.to_lowercase().contains(&marker.to_lowercase());
+        let approved = !text.is_empty() && text.to_lowercase().contains(&marker.to_lowercase());
 
         let mut out: FlowEnvelope = (**envelope).clone();
         out.meta
@@ -188,7 +187,9 @@ mod tests {
     }
 
     fn exits(env: &FlowEnvelope) -> Option<bool> {
-        env.meta.get(LOOP_SHOULD_EXIT_META).and_then(|v| v.as_bool())
+        env.meta
+            .get(LOOP_SHOULD_EXIT_META)
+            .and_then(|v| v.as_bool())
     }
 
     #[tokio::test]
@@ -241,7 +242,10 @@ mod tests {
         let Some(FlowValue::Json(decision)) = out.variables.get("critic_gate_decision") else {
             panic!("the gate must record WHY it decided");
         };
-        assert_eq!(decision.get("approved").and_then(|v| v.as_bool()), Some(true));
+        assert_eq!(
+            decision.get("approved").and_then(|v| v.as_bool()),
+            Some(true)
+        );
     }
 
     /// A config field left blank in the Flow Builder must fall back to the

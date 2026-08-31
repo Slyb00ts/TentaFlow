@@ -215,7 +215,13 @@ fn release(key: &str) {
 
 /// Emits one progress line on the job's log_bus channel (the ArchiveStream
 /// subscription) and mirrors it into the polled job record.
-fn emit(tx: &tokio::sync::broadcast::Sender<BusMessage>, job_id: &str, phase: &str, line: &str, pct: u32) {
+fn emit(
+    tx: &tokio::sync::broadcast::Sender<BusMessage>,
+    job_id: &str,
+    phase: &str,
+    line: &str,
+    pct: u32,
+) {
     update_job(job_id, |j| {
         j.phase = phase.to_string();
         j.progress_pct = pct;
@@ -230,7 +236,12 @@ fn emit(tx: &tokio::sync::broadcast::Sender<BusMessage>, job_id: &str, phase: &s
     }));
 }
 
-fn finish(tx: &tokio::sync::broadcast::Sender<BusMessage>, job_id: &str, status: &str, error: &str) {
+fn finish(
+    tx: &tokio::sync::broadcast::Sender<BusMessage>,
+    job_id: &str,
+    status: &str,
+    error: &str,
+) {
     update_job(job_id, |j| {
         j.status = status.to_string();
         j.error = error.to_string();
@@ -677,9 +688,9 @@ pub fn read_manifest(zip_path: &Path) -> Result<ArchiveManifest> {
     let mut archive = zip::ZipArchive::new(std::io::BufReader::new(file))
         .map_err(|e| anyhow!("plik nie jest poprawnym archiwum ZIP: {e}"))?;
     let manifest = {
-        let mut entry = archive.by_name(MANIFEST_ENTRY).map_err(|_| {
-            anyhow!("archiwum bez {MANIFEST_ENTRY} — to nie jest eksport projektu")
-        })?;
+        let mut entry = archive
+            .by_name(MANIFEST_ENTRY)
+            .map_err(|_| anyhow!("archiwum bez {MANIFEST_ENTRY} — to nie jest eksport projektu"))?;
         if entry.size() > MAX_MANIFEST_BYTES {
             bail!("manifest przekracza dopuszczalny rozmiar {MAX_MANIFEST_BYTES} B");
         }
@@ -852,8 +863,11 @@ fn safe_entry_path<R: Read>(entry: &zip::read::ZipFile<'_, R>) -> Result<Option<
 /// Extracts the whole archive into `staging`, enforcing the entry-count and
 /// byte caps and verifying every file's sha256 against the manifest.
 fn extract_all(zip_path: &Path, staging: &Path, manifest: &ArchiveManifest) -> Result<()> {
-    let expected: HashMap<&str, &FileEntry> =
-        manifest.files.iter().map(|f| (f.path.as_str(), f)).collect();
+    let expected: HashMap<&str, &FileEntry> = manifest
+        .files
+        .iter()
+        .map(|f| (f.path.as_str(), f))
+        .collect();
     let total: u64 = manifest.files.iter().map(|f| f.size).sum();
     if total > MAX_IMPORT_BYTES {
         bail!("archiwum deklaruje {total} B po rozpakowaniu — limit to {MAX_IMPORT_BYTES} B");
@@ -991,8 +1005,8 @@ fn run_import(
 ) -> Result<()> {
     let project_id = uuid::Uuid::new_v4().to_string();
     let dir = super::project_dir(&project_id);
-    let staging = crate::paths::project_studio_import_staging_dir()
-        .join(format!("unpack_{project_id}"));
+    let staging =
+        crate::paths::project_studio_import_staging_dir().join(format!("unpack_{project_id}"));
     std::fs::create_dir_all(&staging)?;
 
     let result = apply_import(job_id, tx, task, &project_id, &dir, &staging);
@@ -1050,7 +1064,10 @@ fn apply_import(
 
     emit(tx, job_id, "registering", "odtwarzanie zawartosci", 40);
     std::fs::create_dir_all(dir.join("files"))?;
-    std::fs::copy(staging.join("db").join("project.db"), dir.join("project.db"))?;
+    std::fs::copy(
+        staging.join("db").join("project.db"),
+        dir.join("project.db"),
+    )?;
     move_tree(&staging.join("files"), &dir.join("files"))?;
     if task.import_runs && task.manifest.options.include_runs {
         move_tree(&staging.join("runs"), &dir.join("runs"))?;
@@ -1334,12 +1351,7 @@ fn restore_vectors(
 
 /// Re-indexes every source from the blobs that travelled in the archive — no
 /// network access is needed, the bytes are already on disk.
-fn reindex_sources(
-    task: &ImportTask,
-    project_id: &str,
-    pool: &DbPool,
-    dir: &Path,
-) -> Vec<String> {
+fn reindex_sources(task: &ImportTask, project_id: &str, pool: &DbPool, dir: &Path) -> Vec<String> {
     let Ok(sources) = super::repository::list_sources(pool) else {
         return Vec::new();
     };
@@ -1546,10 +1558,7 @@ mod unit_tests {
 
         // Path A — identical fingerprint: the file is moved verbatim. The local
         // namespace row carries the same dimension the archive was built with.
-        let core = core_db_with_alias(
-            "jina-embeddings-v3",
-            Some((1024, "cosine", &fields, 10)),
-        );
+        let core = core_db_with_alias("jina-embeddings-v3", Some((1024, "cosine", &fields, 10)));
         let (reusable, reason) = vectors_reusable(&core, "org-t", &manifest(Some(base.clone())));
         assert!(reusable, "identical fingerprint must reuse: {reason}");
 
@@ -1565,7 +1574,10 @@ mod unit_tests {
         // every query from another space.
         let core = core_db_with_alias("jina-embeddings-v3", Some((512, "cosine", &fields, 7)));
         let (reusable, reason) = vectors_reusable(&core, "org-t", &manifest(Some(base.clone())));
-        assert!(!reusable, "a different local dimension must force a re-index");
+        assert!(
+            !reusable,
+            "a different local dimension must force a re-index"
+        );
         assert!(
             reason.contains("1024") && reason.contains("512"),
             "{reason}"
@@ -1590,8 +1602,10 @@ mod unit_tests {
 
         // An alias that does not exist locally cannot be matched.
         let conn = rusqlite::Connection::open_in_memory().expect("memory db");
-        conn.execute_batch("CREATE TABLE model_aliases (alias TEXT PRIMARY KEY, target_model TEXT NOT NULL);")
-            .expect("schema");
+        conn.execute_batch(
+            "CREATE TABLE model_aliases (alias TEXT PRIMARY KEY, target_model TEXT NOT NULL);",
+        )
+        .expect("schema");
         let core: DbPool = std::sync::Arc::new(crate::db::Db::from_connection(conn));
         let (reusable, reason) = vectors_reusable(&core, "org-t", &manifest(Some(base)));
         assert!(!reusable);
@@ -1852,7 +1866,10 @@ mod unit_tests {
             .files
             .iter()
             .any(|f| f.path == format!("files/{sha}")));
-        assert!(manifest.files.iter().any(|f| f.path == "db/user_names.json"));
+        assert!(manifest
+            .files
+            .iter()
+            .any(|f| f.path == "db/user_names.json"));
 
         // --- import as a brand-new project on the "target" node ---
         let target_id = format!("imp-{}", uuid::Uuid::new_v4());
@@ -1897,18 +1914,30 @@ mod unit_tests {
         let (pool, _) = super::super::project_db::open_pool_at(&target_dir).expect("open target");
         let conn = pool.read().expect("read");
         let case_author: String = conn
-            .query_row("SELECT created_by FROM test_cases WHERE case_id = 'c1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT created_by FROM test_cases WHERE case_id = 'c1'",
+                [],
+                |r| r.get(0),
+            )
             .expect("case");
         assert_eq!(case_author, "importer-1", "authorship is re-mapped");
         let open_assignee: String = conn
-            .query_row("SELECT assigned_to FROM tasks WHERE task_id = 't1'", [], |r| r.get(0))
+            .query_row(
+                "SELECT assigned_to FROM tasks WHERE task_id = 't1'",
+                [],
+                |r| r.get(0),
+            )
             .expect("open task");
         assert_eq!(
             open_assignee, "",
             "an open assignment to a user who cannot see the project is cleared"
         );
         let done_assignee: String = conn
-            .query_row("SELECT assigned_to FROM tasks WHERE task_id = 't2'", [], |r| r.get(0))
+            .query_row(
+                "SELECT assigned_to FROM tasks WHERE task_id = 't2'",
+                [],
+                |r| r.get(0),
+            )
             .expect("done task");
         assert_eq!(done_assignee, "obcy-2", "history keeps its assignee");
         let (secret, status): (String, String) = conn
@@ -1919,7 +1948,10 @@ mod unit_tests {
             )
             .expect("env");
         assert_eq!(secret, "");
-        assert_eq!(status, "pending", "the imported environment needs re-approval");
+        assert_eq!(
+            status, "pending",
+            "the imported environment needs re-approval"
+        );
         let links: i64 = conn
             .query_row("SELECT COUNT(*) FROM ml_links", [], |r| r.get(0))
             .expect("links");
@@ -1940,9 +1972,11 @@ mod unit_tests {
             .expect("setting")
             .expect("value");
         assert!(vectors.contains("\"reused\":false"));
-        assert!(super::super::repository::get_setting(&pool, "imported_user_display_names")
-            .expect("setting")
-            .is_some());
+        assert!(
+            super::super::repository::get_setting(&pool, "imported_user_display_names")
+                .expect("setting")
+                .is_some()
+        );
     }
 
     /// Registry fields of a manifest are validated, not copied: a template or
@@ -2011,7 +2045,12 @@ mod unit_tests {
             assert!(result.is_err(), "{label} was accepted");
         }
         assert!(
-            !staging_root.path().parent().unwrap().join("escaped.txt").exists(),
+            !staging_root
+                .path()
+                .parent()
+                .unwrap()
+                .join("escaped.txt")
+                .exists(),
             "traversal wrote outside the staging directory"
         );
     }

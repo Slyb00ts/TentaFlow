@@ -21,8 +21,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::flow_engine::envelope::{FlowEnvelope, FlowValue, NodeInput};
-use crate::flow_engine::node_adapters::output::{OUTPUT_MODE_CITATIONS, OUTPUT_MODE_META};
 use crate::flow_engine::node_adapter::{ExecutionContext, NodeAdapter, PortSpec};
+use crate::flow_engine::node_adapters::output::{OUTPUT_MODE_CITATIONS, OUTPUT_MODE_META};
 use crate::flow_engine::types::{FlowDataType, FlowNode};
 
 /// Twardy cap całkowitej liczby zakumulowanych pasaży (anti-DoS / kontrola
@@ -493,8 +493,8 @@ impl NodeAdapter for RagFinalizeNodeAdapter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::flow_engine::node_adapters::output::OUTPUT_MODE_STREAM;
     use crate::flow_engine::node_adapter::test_support::stub_ctx;
+    use crate::flow_engine::node_adapters::output::OUTPUT_MODE_STREAM;
     use serde_json::json;
     use std::sync::Arc;
 

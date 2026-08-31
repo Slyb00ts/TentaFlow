@@ -208,7 +208,10 @@ fn url_spans(raw: &str, base: usize) -> Vec<Range<usize>> {
         }
     }
 
-    if let Some(query_start) = raw[authority_end..].find('?').map(|i| authority_end + i + 1) {
+    if let Some(query_start) = raw[authority_end..]
+        .find('?')
+        .map(|i| authority_end + i + 1)
+    {
         let query_end = raw[query_start..]
             .find('#')
             .map(|i| query_start + i)
@@ -415,7 +418,8 @@ fn looks_secret(value: &str) -> bool {
     // survived one round of URL encoding (`ghp%5F…`, a signature carried as
     // `%2F`) is still the credential.
     if !value.bytes().all(|b| {
-        b.is_ascii_alphanumeric() || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-' | b'.' | b'%' | b'~')
+        b.is_ascii_alphanumeric()
+            || matches!(b, b'+' | b'/' | b'=' | b'_' | b'-' | b'.' | b'%' | b'~')
     }) {
         return false;
     }
@@ -506,9 +510,7 @@ fn authorization_re() -> &'static Regex {
 
 fn bearer_re() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
-    RE.get_or_init(|| {
-        Regex::new(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{8,})").expect("bearer regex")
-    })
+    RE.get_or_init(|| Regex::new(r"(?i)\bbearer\s+([A-Za-z0-9._~+/=-]{8,})").expect("bearer regex"))
 }
 
 /// Vendor token shapes. Each one is a credential wherever it appears, so these
@@ -707,7 +709,9 @@ mod tests {
 
     #[test]
     fn a_url_encoded_credential_is_recognised_through_its_escaping() {
-        let out = redact_text("callback=https://example.com/x?state=ok&sig=aGVsbG8%2Fd29ybGQ%2BMTIzNDU2Nzg5");
+        let out = redact_text(
+            "callback=https://example.com/x?state=ok&sig=aGVsbG8%2Fd29ybGQ%2BMTIzNDU2Nzg5",
+        );
         assert!(!out.contains("aGVsbG8%2Fd29ybGQ"), "{out}");
     }
 
@@ -727,9 +731,8 @@ mod tests {
         assert!(out.contains("$ echo done"), "output after the key was lost");
 
         // Output cut off mid-key still has no body left in it.
-        let truncated = redact_text(
-            "-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAxLbTgUq0Jb3vQnQ0\n",
-        );
+        let truncated =
+            redact_text("-----BEGIN RSA PRIVATE KEY-----\nMIIEpAIBAAKCAQEAxLbTgUq0Jb3vQnQ0\n");
         assert!(!truncated.contains("MIIEpAIBAAKCAQEA"), "{truncated}");
     }
 
@@ -764,10 +767,7 @@ mod tests {
 
         assert!(!out.contains(GITHUB_TOKEN), "{out}");
         assert!(!out.contains("AKIA1234567890ABCDEF"), "{out}");
-        assert!(
-            !out.contains(SLACK_TOKEN),
-            "{out}"
-        );
+        assert!(!out.contains(SLACK_TOKEN), "{out}");
         assert!(!out.contains("eyJhbGciOiJIUzI1NiJ9."), "{out}");
         assert!(!out.contains("aGVsbG8xMjM0NTY3ODkwYWJjZGVm"), "{out}");
         // Ordinary build output must remain readable, otherwise the audit
@@ -859,13 +859,16 @@ mod tests {
         // The terminal masks cells over `secret_spans`; `redact_text` splices
         // the marker over the same ranges. If the two ever disagree, one of the
         // sinks is unprotected.
-        let line = format!("git push https://{OPAQUE}@github.com/org/repo.git --token {GITHUB_TOKEN}");
+        let line =
+            format!("git push https://{OPAQUE}@github.com/org/repo.git --token {GITHUB_TOKEN}");
         let spans = secret_spans(&line);
         assert!(!spans.is_empty());
         for span in &spans {
             let covered = &line[span.clone()];
             assert!(
-                !covered.is_empty() && line.is_char_boundary(span.start) && line.is_char_boundary(span.end),
+                !covered.is_empty()
+                    && line.is_char_boundary(span.start)
+                    && line.is_char_boundary(span.end),
                 "span {span:?} is not a usable slice"
             );
         }

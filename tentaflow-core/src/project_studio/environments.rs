@@ -189,7 +189,9 @@ pub fn classify_target(base_url: &str, extra: &[String]) -> Result<EnvironmentTa
 /// a name that was public at save time is resolved again here.
 pub fn recheck_private(record: &EnvironmentRecord) -> Result<bool> {
     let hosts = host_allowlist_of(record);
-    Ok(classify_target(&record.base_url, &hosts)?.address.is_private)
+    Ok(classify_target(&record.base_url, &hosts)?
+        .address
+        .is_private)
 }
 
 /// Validates the extra-header object: a flat JSON object of string values,
@@ -376,7 +378,10 @@ pub fn update(
     } else if status == "approved" && class_changed {
         ("system".to_string(), String::new())
     } else {
-        (existing.decided_by.clone(), existing.approval_reason.clone())
+        (
+            existing.decided_by.clone(),
+            existing.approval_reason.clone(),
+        )
     };
     let secret_enc = match input.secret_enc {
         Some(value) => value.to_string(),
@@ -496,7 +501,10 @@ mod unit_tests {
 
         let lan = address("http://192.168.1.10:8080/", true);
         let secret = encrypt_secret(&cipher, "super-tajne").expect("encrypt");
-        assert!(secret.starts_with("enc:"), "secret must be encrypted at rest");
+        assert!(
+            secret.starts_with("enc:"),
+            "secret must be encrypted at rest"
+        );
         assert!(!secret.contains("super-tajne"));
         let status = insert(
             &pool,
@@ -537,7 +545,10 @@ mod unit_tests {
 
         let stored = get(&pool, "env-lan").expect("get").expect("row");
         assert!(stored.is_private_address);
-        assert_eq!(decrypt_secret(&cipher, &stored).expect("decrypt"), "super-tajne");
+        assert_eq!(
+            decrypt_secret(&cipher, &stored).expect("decrypt"),
+            "super-tajne"
+        );
         let public_row = get(&pool, "env-pub").expect("get").expect("row");
         assert!(public_row.secret_enc.is_empty(), "empty secret stays empty");
 
@@ -687,8 +698,8 @@ mod unit_tests {
         .expect("insert public");
         assert_eq!(status, "approved");
         let existing = get(&pool, "env-public").expect("get").expect("row");
-        let widened = classify_target("https://1.1.1.1/", &["10.0.0.5".to_string()])
-            .expect("widened");
+        let widened =
+            classify_target("https://1.1.1.1/", &["10.0.0.5".to_string()]).expect("widened");
         let status = update(
             &pool,
             &existing,

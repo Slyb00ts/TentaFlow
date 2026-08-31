@@ -1989,6 +1989,456 @@ export function encodeBrowserCaptureRequest(session_id, kind, full_page) {
 }
 
 /**
+ * @param {string} topic
+ * @returns {Uint8Array}
+ */
+export function encodeBusAclListRequest(topic) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusAclListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * `access_level` is 'allow' | 'deny' | 'clear' (see `bus.rs`'s doc).
+ * @param {string} topic
+ * @param {string} subject_type
+ * @param {string} subject_id
+ * @param {string} access_level
+ * @returns {Uint8Array}
+ */
+export function encodeBusAclSetRequest(topic, subject_type, subject_id, access_level) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(subject_type, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(subject_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ptr3 = passStringToWasm0(access_level, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len3 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusAclSetRequest(ptr0, len0, ptr1, len1, ptr2, len2, ptr3, len3);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v5 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v5;
+}
+
+/**
+ * Follow-up toru P task 5: permission introspection for the UI (one round
+ * trip on module mount).
+ * @returns {Uint8Array}
+ */
+export function encodeBusCapabilitiesRequest() {
+    const ret = wasm.encodeBusCapabilitiesRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} source_topic
+ * @param {number} partition
+ * @param {bigint} offset
+ * @returns {Uint8Array}
+ */
+export function encodeBusDlqDiscardRequest(source_topic, partition, offset) {
+    const ptr0 = passStringToWasm0(source_topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusDlqDiscardRequest(ptr0, len0, partition, offset);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} source_topic
+ * @param {bigint | null | undefined} from_offset
+ * @param {number} limit
+ * @param {string | null} [from_offsets_json]
+ * @param {number | null} [partition]
+ * @returns {Uint8Array}
+ */
+export function encodeBusDlqListRequest(source_topic, from_offset, limit, from_offsets_json, partition) {
+    const ptr0 = passStringToWasm0(source_topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(from_offsets_json) ? 0 : passStringToWasm0(from_offsets_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusDlqListRequest(ptr0, len0, !isLikeNone(from_offset), isLikeNone(from_offset) ? BigInt(0) : from_offset, limit, ptr1, len1, isLikeNone(partition) ? Number.MAX_SAFE_INTEGER : (partition) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} source_topic
+ * @param {number} max_records
+ * @returns {Uint8Array}
+ */
+export function encodeBusDlqRetryAllRequest(source_topic, max_records) {
+    const ptr0 = passStringToWasm0(source_topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusDlqRetryAllRequest(ptr0, len0, max_records);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} source_topic
+ * @param {number} partition
+ * @param {bigint} offset
+ * @returns {Uint8Array}
+ */
+export function encodeBusDlqRetryRequest(source_topic, partition, offset) {
+    const ptr0 = passStringToWasm0(source_topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusDlqRetryRequest(ptr0, len0, partition, offset);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} group
+ * @param {string} topic
+ * @returns {Uint8Array}
+ */
+export function encodeBusGroupDetailRequest(group, topic) {
+    const ptr0 = passStringToWasm0(group, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusGroupDetailRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBusGroupListRequest() {
+    const ret = wasm.encodeBusGroupListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} group
+ * @param {string} topic
+ * @returns {Uint8Array}
+ */
+export function encodeBusGroupPauseRequest(group, topic) {
+    const ptr0 = passStringToWasm0(group, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusGroupPauseRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} group
+ * @param {string} topic
+ * @returns {Uint8Array}
+ */
+export function encodeBusGroupResumeRequest(group, topic) {
+    const ptr0 = passStringToWasm0(group, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusGroupResumeRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * Admin-triggered leader transfer for one partition (M03/M06 "Przenieś
+ * lidera").
+ * @param {string} topic
+ * @param {number} partition
+ * @param {string} target_node_id
+ * @returns {Uint8Array}
+ */
+export function encodeBusLeaderTransferRequest(topic, partition, target_node_id) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(target_node_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusLeaderTransferRequest(ptr0, len0, partition, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} topic
+ * @param {bigint | null | undefined} from_offset
+ * @param {number} limit
+ * @param {string | null} [from_offsets_json]
+ * @param {number | null} [partition]
+ * @returns {Uint8Array}
+ */
+export function encodeBusMessagesBrowseRequest(topic, from_offset, limit, from_offsets_json, partition) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    var ptr1 = isLikeNone(from_offsets_json) ? 0 : passStringToWasm0(from_offsets_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusMessagesBrowseRequest(ptr0, len0, !isLikeNone(from_offset), isLikeNone(from_offset) ? BigInt(0) : from_offset, limit, ptr1, len1, isLikeNone(partition) ? Number.MAX_SAFE_INTEGER : (partition) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * `mode` is 'earliest' | 'latest' | 'explicit' | 'timestamp' (PLAN M04's
+ * reset-offset modal); `offset` is required only for 'explicit', `ts_ms`
+ * only for 'timestamp' (follow-up toru P task 4) — both ignored otherwise.
+ * @param {string} group
+ * @param {string} topic
+ * @param {number} partition
+ * @param {string} mode
+ * @param {bigint | null} [offset]
+ * @param {bigint | null} [ts_ms]
+ * @returns {Uint8Array}
+ */
+export function encodeBusOffsetResetRequest(group, topic, partition, mode, offset, ts_ms) {
+    const ptr0 = passStringToWasm0(group, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ptr2 = passStringToWasm0(mode, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len2 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusOffsetResetRequest(ptr0, len0, ptr1, len1, partition, ptr2, len2, !isLikeNone(offset), isLikeNone(offset) ? BigInt(0) : offset, !isLikeNone(ts_ms), isLikeNone(ts_ms) ? BigInt(0) : ts_ms);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v4 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v4;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBusQuotaGetRequest() {
+    const ret = wasm.encodeBusQuotaGetRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * `max_groups` is `None` to leave the org's group ceiling unchanged
+ * (follow-up toru P task 6/7 — see `QuotaSetRequest::max_groups`'s doc).
+ * @param {number} max_topics
+ * @param {number} max_partitions
+ * @param {bigint} max_bytes_total
+ * @param {number} produce_msgs_per_sec
+ * @param {bigint} produce_bytes_per_sec
+ * @param {number | null} [max_groups]
+ * @returns {Uint8Array}
+ */
+export function encodeBusQuotaSetRequest(max_topics, max_partitions, max_bytes_total, produce_msgs_per_sec, produce_bytes_per_sec, max_groups) {
+    const ret = wasm.encodeBusQuotaSetRequest(max_topics, max_partitions, max_bytes_total, produce_msgs_per_sec, produce_bytes_per_sec, isLikeNone(max_groups) ? Number.MAX_SAFE_INTEGER : (max_groups) >>> 0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * Admin-triggered replica-set change (M06 "Zmień repliki"). `partition:
+ * None` targets every partition of `topic`; `Some(n)` targets one.
+ * @param {string} topic
+ * @param {number | null | undefined} partition
+ * @param {string[]} replicas
+ * @returns {Uint8Array}
+ */
+export function encodeBusReassignRequest(topic, partition, replicas) {
+    const ptr0 = passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passArrayJsValueToWasm0(replicas, wasm.__wbindgen_malloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusReassignRequest(ptr0, len0, isLikeNone(partition) ? Number.MAX_SAFE_INTEGER : (partition) >>> 0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * `topic: None`/absent lists node cards + failovers for every topic in the
+ * caller's org; `Some(name)` narrows the per-partition role matrix (and,
+ * on a single node with no `ReplicationCoordinator` installed, the node
+ * card's role counts too) to that one topic.
+ * @param {string | null} [topic]
+ * @returns {Uint8Array}
+ */
+export function encodeBusReplicaListRequest(topic) {
+    var ptr0 = isLikeNone(topic) ? 0 : passStringToWasm0(topic, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    var len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusReplicaListRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBusStatsSnapshotRequest() {
+    const ret = wasm.encodeBusStatsSnapshotRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * `options_json` is a JSON object matching `BusTopicOptionsWire` field
+ * names (snake_case) — every field optional, absent = server default (see
+ * `bus.rs`'s module doc). Same JSON-passthrough pattern as
+ * `encodeBenchmarkSaveRequest`'s `targets_json`.
+ * @param {string} name
+ * @param {string} options_json
+ * @returns {Uint8Array}
+ */
+export function encodeBusTopicCreateRequest(name, options_json) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(options_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusTopicCreateRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
+ * @param {string} name
+ * @returns {Uint8Array}
+ */
+export function encodeBusTopicDeleteRequest(name) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusTopicDeleteRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @param {string} name
+ * @returns {Uint8Array}
+ */
+export function encodeBusTopicDetailRequest(name) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusTopicDetailRequest(ptr0, len0);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v2 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v2;
+}
+
+/**
+ * @returns {Uint8Array}
+ */
+export function encodeBusTopicListRequest() {
+    const ret = wasm.encodeBusTopicListRequest();
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v1 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v1;
+}
+
+/**
+ * @param {string} name
+ * @param {string} options_json
+ * @returns {Uint8Array}
+ */
+export function encodeBusTopicUpdateRequest(name, options_json) {
+    const ptr0 = passStringToWasm0(name, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len0 = WASM_VECTOR_LEN;
+    const ptr1 = passStringToWasm0(options_json, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+    const len1 = WASM_VECTOR_LEN;
+    const ret = wasm.encodeBusTopicUpdateRequest(ptr0, len0, ptr1, len1);
+    if (ret[3]) {
+        throw takeFromExternrefTable0(ret[2]);
+    }
+    var v3 = getArrayU8FromWasm0(ret[0], ret[1]).slice();
+    wasm.__wbindgen_free(ret[0], ret[1] * 1, 1);
+    return v3;
+}
+
+/**
  * MessageBody::CameraAdminBody(AddOnvifRequest) — bind a discovered ONVIF
  * device as a managed camera session. Credentials travel over the TLS
  * admin transport and are AES-GCM-sealed server-side before persistence.

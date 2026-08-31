@@ -307,7 +307,9 @@ mod tests {
         // allocated outside the insert transaction (invariant 2).
         let pk: Vec<String> = {
             let mut stmt = conn
-                .prepare("SELECT name FROM pragma_table_info('run_events') WHERE pk > 0 ORDER BY pk")
+                .prepare(
+                    "SELECT name FROM pragma_table_info('run_events') WHERE pk > 0 ORDER BY pk",
+                )
                 .unwrap();
             stmt.query_map([], |row| row.get::<_, String>(0))
                 .unwrap()

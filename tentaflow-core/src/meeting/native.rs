@@ -14,8 +14,8 @@ use tokio::process::{Child, Command};
 use tokio::sync::Mutex;
 use tracing::{info, warn};
 
-use super::port_pool::NativeAllocatedPorts;
 use super::container_name;
+use super::port_pool::NativeAllocatedPorts;
 
 /// Parametry startu subprocesu — analogiczne do `container::SpawnRequest`,
 /// ale z `bridge_port` (Docker tego nie potrzebuje, ma stale 9999 w kontenerze).
@@ -232,4 +232,3 @@ pub async fn cleanup_stale() -> Result<()> {
     // MeetingManager::cleanup_on_startup zostawia DB w czystym stanie sam.
     Ok(())
 }
-

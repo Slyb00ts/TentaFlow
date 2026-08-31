@@ -1047,8 +1047,8 @@ impl SessionTrust {
         .with_protocol_versions(&[&rustls::version::TLS13])
         .context("adapter TLS provider")?
         .with_no_client_auth()
-                .with_single_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())
-                .context("adapter TLS configuration")?;
+        .with_single_cert(self.leaf_chain.clone(), self.leaf_key.clone_key())
+        .context("adapter TLS configuration")?;
         // Forces HTTP/1.1, which is the protocol this adapter parses. A client
         // that negotiated h2 would be talking a framing nothing here reads.
         config.alpn_protocols = vec![b"http/1.1".to_vec()];
@@ -2227,8 +2227,14 @@ mod tests {
     /// ticket that refuses every request is not.
     #[test]
     fn an_alias_that_resolves_to_two_models_cannot_bind_a_ticket() {
-        assert_eq!(ticket_model_binding("claude-code", "sonnet"), Ok(Some("sonnet".into())));
-        assert_eq!(ticket_model_binding("claude-code", "SONNET"), Ok(Some("sonnet".into())));
+        assert_eq!(
+            ticket_model_binding("claude-code", "sonnet"),
+            Ok(Some("sonnet".into()))
+        );
+        assert_eq!(
+            ticket_model_binding("claude-code", "SONNET"),
+            Ok(Some("sonnet".into()))
+        );
         assert_eq!(
             ticket_model_binding("claude-code", "claude-sonnet-4-5-20250929"),
             Ok(None)
@@ -2605,7 +2611,12 @@ mod tests {
 
         let refusal = ensure_engine_verified(&db, "codex", EgressEnforcement::Unrestricted)
             .expect_err("unrestricted has no mechanism for the residual traffic");
-        for named in ["chatgpt.com", "api.github.com", "unrestricted", "CODEX_HOME"] {
+        for named in [
+            "chatgpt.com",
+            "api.github.com",
+            "unrestricted",
+            "CODEX_HOME",
+        ] {
             assert!(
                 refusal.reason.contains(named),
                 "the refusal must name what is missing, not merely refuse: {}",
