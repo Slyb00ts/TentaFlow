@@ -248,9 +248,12 @@ pub fn collect(
 }
 
 /// Intermediate result of `collect_bus_metrics`, before being flattened into
-/// [`ExportedMetrics`]'s `bus_*` fields.
-#[derive(Default)]
-struct BusMetricsRollup {
+/// [`ExportedMetrics`]'s `bus_*` fields. Also reused verbatim (via
+/// `pub(crate)` + `Serialize`) as the record body for the `__bus.metrics`
+/// internal topic's 1s rollup (PLAN §8.4/M4 dogfooding) — see
+/// `bus::spawn_metrics_rollup_timer`.
+#[derive(Default, serde::Serialize)]
+pub(crate) struct BusMetricsRollup {
     publish_msgs_total: u64,
     publish_bytes_total: u64,
     consume_msgs_total: u64,
@@ -283,7 +286,7 @@ struct BusMetricsRollup {
 /// call this collector has no `BusCallContext` to make, so those fields stay
 /// `0` rather than growing this exporter a privileged bypass just for a
 /// metrics endpoint.
-fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
+pub(crate) fn collect_bus_metrics(db: &DbPool) -> BusMetricsRollup {
     let Some(svc) = crate::bus::global() else {
         return BusMetricsRollup::default();
     };

@@ -25,6 +25,12 @@ use super::BusServiceError;
 /// namespace normal `create_topic` callers can never reach.
 pub const RESERVED_PREFIX: &str = "__";
 
+/// PLAN §8.4/M4: broker-owned internal topic carrying 1-second
+/// `BusMetricsRollup` snapshots — dogfooding source for a future ClickHouse
+/// sink. Created lazily by `BusService::publish_metrics_rollup` the same way
+/// `dlq::dlq_topic_name` topics are, via `create_internal_topic`.
+pub const METRICS_TOPIC_NAME: &str = "__bus.metrics";
+
 /// Longest a topic name (user or internal, `__` prefix included) may be.
 /// PLAN §7.1's regex caps a user name at 127 bytes total (1 mandatory
 /// leading char + up to 126 more); internal names share that same ceiling

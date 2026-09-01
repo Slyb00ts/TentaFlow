@@ -37,10 +37,26 @@
 // **Admin** on the source topic instead — an operator who can administer
 // `<topic>` can administer its DLQ, without a separate ACL row ever having
 // to exist for a topic name nobody edits ACLs on directly.
+//
+// SYSTEM_ACTOR rule (PLAN §8.4/M4 — `__bus.metrics` rollup): unlike DLQ
+// auto-send, which piggybacks on a real caller's own existing Consume
+// rights on a source topic, the metrics rollup timer has no human/addon
+// principal behind it at all — it is `BusService`'s own background thread.
+// `SYSTEM_ACTOR` is a bypass reserved for exactly that case: broker-internal
+// code publishing/consuming a topic under the `__` reserved prefix. It is
+// NOT reachable from any external input — every real dispatch-layer/addon
+// call builds `ctx.actor` from a validated `user_id` or `addon_id` (see
+// `dispatch/bus.rs`'s `actor: Some(org.user_id.clone())` and
+// `host_functions/bus.rs`'s `call_context`), never from free-text a caller
+// controls, so nobody can spoof this sentinel from the outside — same trust
+// boundary the `__` topic-name prefix itself already relies on
+// (`validate_user_topic_name` rejects it outright).
+pub const SYSTEM_ACTOR: &str = "__system__";
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::bus::dlq::DLQ_TOPIC_PREFIX;
+use crate::bus::topics::RESERVED_PREFIX;
 use crate::bus::{BusAction, BusCallContext, BusServiceError};
 use crate::db::repository;
 use crate::db::DbPool;
@@ -137,6 +153,9 @@ impl crate::bus::BusAuthorizer for RbacBusAuthorizer {
                 topic: topic.to_string(),
             });
         };
+        if actor == SYSTEM_ACTOR && topic.starts_with(RESERVED_PREFIX) {
+            return Ok(());
+        }
         let (acl_topic, base_action) = resolve_check(topic, action);
         let perm = required_permission(base_action);
         let has_global = PermissionMatrix::global()
@@ -283,6 +302,33 @@ mod tests {
         };
         assert!(auth
             .authorize(&c, BusAction::Consume, "orders.created")
+            .is_err());
+    }
+
+    #[test]
+    fn system_actor_bypasses_authorization_on_reserved_topic() {
+        let (_d, pool) = open_pool();
+        let auth = RbacBusAuthorizer::new(pool.clone());
+        // No membership seeded at all — the bypass must not depend on RBAC.
+        let c = ctx("org-default", SYSTEM_ACTOR);
+        assert!(auth
+            .authorize(&c, BusAction::Produce, "__bus.metrics")
+            .is_ok());
+        assert!(auth
+            .authorize(&c, BusAction::Consume, "__bus.metrics")
+            .is_ok());
+    }
+
+    #[test]
+    fn system_actor_does_not_bypass_authorization_on_normal_topic() {
+        let (_d, pool) = open_pool();
+        let auth = RbacBusAuthorizer::new(pool.clone());
+        // The bypass is scoped to `__`-reserved topics only — SYSTEM_ACTOR
+        // has no RBAC membership seeded, so a non-reserved topic must still
+        // be denied.
+        let c = ctx("org-default", SYSTEM_ACTOR);
+        assert!(auth
+            .authorize(&c, BusAction::Produce, "orders.created")
             .is_err());
     }
 

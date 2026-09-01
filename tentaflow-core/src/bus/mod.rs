@@ -3653,6 +3653,83 @@ impl BusService {
         )
     }
 
+    // ---- Metrics rollup (PLAN §8.4/M4) -------------------------------------
+
+    fn metrics_topic_options() -> topics::TopicOptions {
+        topics::TopicOptions {
+            partitions: Some(1),
+            // PLAN §7.1 default topic retention (7 days).
+            retention_ms: Some(7 * 24 * 3_600_000),
+            durability_class: Some(topics::DurabilityClass::Standard),
+            ..Default::default()
+        }
+    }
+
+    fn ensure_metrics_topic(&self, ctx: &BusCallContext) -> Result<(), BusServiceError> {
+        if topics::get_topic(&self.db, &ctx.org_id, topics::METRICS_TOPIC_NAME)?.is_some() {
+            return Ok(());
+        }
+        let env = crate::services::environment::get_node_environment(&self.db);
+        topics::create_internal_topic(
+            &self.db,
+            &ctx.org_id,
+            topics::METRICS_TOPIC_NAME,
+            Self::metrics_topic_options(),
+            env,
+            now_ms(),
+        )?;
+        Ok(())
+    }
+
+    /// Collects the node's current `BusMetricsRollup` (the same struct the
+    /// Zabbix exporter builds — `services::metrics_export::collect_bus_metrics`)
+    /// and publishes it as one record on `__bus.metrics`. Called every
+    /// `METRICS_ROLLUP_INTERVAL` by `spawn_metrics_rollup_timer`. This is
+    /// broker-owned, unattributed traffic (no human/addon caller triggered
+    /// it), so it publishes under `SYSTEM_ACTOR` — see that const's doc in
+    /// `services::bus_authorizer` for why this cannot be spoofed from any
+    /// external input path. Best-effort: any failure is logged and
+    /// swallowed rather than propagated, since this must never take down
+    /// the timer thread or block real traffic.
+    fn publish_metrics_rollup(&self) {
+        let ctx = BusCallContext {
+            org_id: crate::services::org::DEFAULT_ORG_ID.to_string(),
+            actor: Some(crate::services::bus_authorizer::SYSTEM_ACTOR.to_string()),
+            correlation_id: None,
+            origin: "bus.metrics.rollup".to_string(),
+        };
+        if let Err(e) = self.ensure_metrics_topic(&ctx) {
+            tracing::warn!("__bus.metrics: ensure topic failed: {e}");
+            return;
+        }
+        let rollup = crate::services::metrics_export::collect_bus_metrics(&self.db);
+        let payload = match serde_json::to_vec(&rollup) {
+            Ok(b) => b,
+            Err(e) => {
+                tracing::warn!("__bus.metrics: serialize rollup failed: {e}");
+                return;
+            }
+        };
+        let record = PublishRecord {
+            key: None,
+            headers: Vec::new(),
+            payload: Bytes::from(payload),
+            timestamp_ms: now_ms(),
+            schema_id: 0,
+        };
+        if let Err(e) = self.publish(
+            &ctx,
+            topics::METRICS_TOPIC_NAME,
+            PublishBatch {
+                partition: None,
+                producer: None,
+                records: vec![record],
+            },
+        ) {
+            tracing::warn!("__bus.metrics: publish failed: {e}");
+        }
+    }
+
     /// Records one failed delivery attempt for (group, topic, partition,
     /// offset). Below `max_delivery_attempts` this only returns the retry
     /// backoff the caller should honor; at/above it, a copy of `record` is
@@ -4959,6 +5036,11 @@ pub fn init(cfg: BusInitConfig) -> Result<Arc<BusService>, BusServiceError> {
     // `bus::init` starts this (never `BusService::new` directly), matching
     // every other background thread in this module.
     spawn_audit_flush_timer(Arc::clone(&service));
+    // Also unconditional infrastructure (PLAN §8.4/M4 dogfooding), same
+    // reasoning as the audit-flush timer above: `__bus.metrics` must keep
+    // rolling up regardless of whether an operator configured a retention
+    // sweep.
+    spawn_metrics_rollup_timer(Arc::clone(&service));
     Ok(service)
 }
 
@@ -5014,6 +5096,25 @@ fn spawn_background_sweeper(service: Arc<BusService>, interval: Duration) {
             );
         }
         service.flush_audit_windows();
+    });
+}
+
+/// How often `spawn_metrics_rollup_timer` publishes a fresh
+/// `BusMetricsRollup` snapshot to `__bus.metrics` (PLAN §8.4/M4: "1-second
+/// rollups").
+const METRICS_ROLLUP_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Background thread started unconditionally by `bus::init`: every
+/// `METRICS_ROLLUP_INTERVAL`, publishes one `BusMetricsRollup` snapshot to
+/// `__bus.metrics` via `BusService::publish_metrics_rollup`. Same
+/// shutdown-flag shape as `spawn_audit_flush_timer`/`spawn_background_sweeper`.
+fn spawn_metrics_rollup_timer(service: Arc<BusService>) {
+    std::thread::spawn(move || loop {
+        std::thread::sleep(METRICS_ROLLUP_INTERVAL);
+        if service.sweeper_shutdown.load(Ordering::Acquire) {
+            break;
+        }
+        service.publish_metrics_rollup();
     });
 }
 
@@ -5307,6 +5408,51 @@ mod tests {
             timestamp_ms: now_ms(),
             schema_id: 0,
         }
+    }
+
+    #[test]
+    fn publish_metrics_rollup_creates_topic_and_publishes_one_record() {
+        let (_tmp, svc) = test_service();
+        let org = crate::services::org::DEFAULT_ORG_ID;
+
+        // Topic must not exist yet — this is the lazy-create path.
+        assert!(topics::get_topic(&svc.db, org, topics::METRICS_TOPIC_NAME)
+            .unwrap()
+            .is_none());
+
+        svc.publish_metrics_rollup();
+
+        let cfg = topics::get_topic(&svc.db, org, topics::METRICS_TOPIC_NAME)
+            .unwrap()
+            .expect("__bus.metrics must be auto-created");
+        assert_eq!(cfg.partitions, 1);
+
+        let ctx = test_ctx(org);
+        let handle = svc
+            .open_consumer(
+                &ctx,
+                "metrics-test-group",
+                &[topics::METRICS_TOPIC_NAME.to_string()],
+                ConsumerConfig {
+                    commit_mode: groups::CommitMode::Explicit,
+                },
+            )
+            .unwrap();
+        let batch = handle.fetch(1024 * 1024, 50).unwrap();
+        assert_eq!(batch.records.len(), 1);
+
+        // Payload is the JSON-serialized BusMetricsRollup — assert it round-trips
+        // as an object with a couple of the expected fields, without depending
+        // on the full 16-field shape (that shape belongs to metrics_export).
+        let value: serde_json::Value = serde_json::from_slice(&batch.records[0].payload).unwrap();
+        assert!(value.get("publish_msgs_total").is_some());
+        assert!(value.get("topic_count").is_some());
+
+        // A second call republishes to the ALREADY-created topic rather than
+        // erroring — the lazy-create path must be idempotent.
+        svc.publish_metrics_rollup();
+        let batch2 = handle.fetch(1024 * 1024, 50).unwrap();
+        assert_eq!(batch2.records.len(), 1);
     }
 
     #[test]
