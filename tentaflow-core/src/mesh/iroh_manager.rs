@@ -2750,20 +2750,28 @@ impl IrohMeshManagerRef {
                 frame_type = format!("0x{:02X}", frame_type),
                 "iroh_mesh: rejected mesh frame from untrusted peer"
             );
-            let details = format!(
-                "{{\"peer\":\"{}\",\"frame_type\":\"0x{:02X}\"}}",
-                remote_hex, frame_type
-            );
-            let _ = crate::db::repository::log_audit(
-                &self.security.db,
-                None,
-                None,
-                "mesh.frame_rejected",
-                None,
-                Some(&details),
-                None,
-                Some(&remote_hex),
-            );
+            // Discovery noise (heartbeat, hello, node_info, known_peers, topology)
+            // is dropped WITHOUT an audit row. An unpaired node keeps announcing
+            // itself forever and we do not get to decide how often; auditing each
+            // frame let one LAN neighbour write 1.1M rows — 98.5% of the whole
+            // audit table — and grow the database to 6.3 GB. Anything else from
+            // an untrusted peer is a real signal and is still recorded.
+            if !crate::mesh::frame_policy::is_discovery_noise_frame(frame_type) {
+                let details = format!(
+                    "{{\"peer\":\"{}\",\"frame_type\":\"0x{:02X}\"}}",
+                    remote_hex, frame_type
+                );
+                let _ = crate::db::repository::log_audit(
+                    &self.security.db,
+                    None,
+                    None,
+                    "mesh.frame_rejected",
+                    None,
+                    Some(&details),
+                    None,
+                    Some(&remote_hex),
+                );
+            }
             return Ok(());
         }
 

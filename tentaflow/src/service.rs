@@ -17,6 +17,8 @@ use std::time::Duration;
 
 use anyhow::{anyhow, Result};
 
+use crate::receipt::InstallReceipt;
+
 /// Where the service definition lives, which decides how every later call is
 /// addressed. Detected, never guessed: the two scopes have separate unit
 /// directories and separate `systemctl` namespaces.
@@ -33,11 +35,15 @@ pub enum Manager {
 const UNIT: &str = "tentaflow.service";
 const LAUNCHD_LABEL: &str = "ai.tentaflow";
 
-/// Candidate config paths, most specific first. The installer writes
-/// `/etc/tentaflow/config.toml`; a portable or repo run keeps it next to the
-/// binary or in the working directory.
-fn config_candidates() -> Vec<PathBuf> {
-    let mut out = vec![PathBuf::from("/etc/tentaflow/config.toml")];
+/// Candidate config paths, most specific first. The receipt wins when there is
+/// one — it records the exact file the service is started with. Otherwise the
+/// installer default, then a portable or repo run next to the binary.
+fn config_candidates(receipt: Option<&InstallReceipt>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    if let Some(r) = receipt {
+        out.push(r.config.clone());
+    }
+    out.push(PathBuf::from("/etc/tentaflow/config.toml"));
     if let Ok(exe) = std::env::current_exe() {
         if let Some(dir) = exe.parent() {
             out.push(dir.join("config.toml"));
@@ -201,8 +207,8 @@ extern "C" {
 /// Resolves the dashboard base URL from the installed configuration. Falls back
 /// to the documented default port when no config file is readable — a status
 /// command must still say something useful on a half-installed machine.
-fn dashboard_url() -> (String, Option<PathBuf>) {
-    for path in config_candidates() {
+fn dashboard_url(receipt: Option<&InstallReceipt>) -> (String, Option<PathBuf>) {
+    for path in config_candidates(receipt) {
         if !path.exists() {
             continue;
         }
@@ -229,10 +235,25 @@ fn health(url: &str) -> Option<bool> {
 }
 
 pub fn status() -> Result<()> {
+    let receipt = InstallReceipt::load();
     let manager = detect();
-    let (url, config_path) = dashboard_url();
+    let (url, config_path) = dashboard_url(receipt.as_ref());
 
     println!("TentaFlow {}", env!("CARGO_PKG_VERSION"));
+    if let Some(r) = &receipt {
+        println!("  edycja:    {} ({})", r.edition, r.variant);
+        println!("  prefix:    {}", r.prefix.display());
+        if r.version != env!("CARGO_PKG_VERSION") {
+            // The running binary is not the one the installer recorded — an
+            // update that swapped files without rewriting the receipt, or a
+            // developer build shadowing the installed one in PATH.
+            println!(
+                "  UWAGA:     receipt mowi o wersji {}, a ta binarka to {}",
+                r.version,
+                env!("CARGO_PKG_VERSION")
+            );
+        }
+    }
     match manager {
         None => {
             println!("  usluga:    NIEZAREJESTROWANA (brak unitu systemd / agenta launchd)");
@@ -274,6 +295,9 @@ pub fn status() -> Result<()> {
         }
     }
 
+    if let Some(r) = &receipt {
+        println!("  dane:      {}", r.home.display());
+    }
     match config_path {
         Some(p) => println!("  config:    {}", p.display()),
         None => println!("  config:    nie znaleziono (uzyto domyslnego portu)"),

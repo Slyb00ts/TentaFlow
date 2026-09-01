@@ -20,6 +20,7 @@ use tentaflow_core::routing::Router;
 
 #[cfg(target_os = "macos")]
 mod mlx_swift_init;
+mod receipt;
 mod service;
 
 // =============================================================================

@@ -11609,6 +11609,7 @@ dependencies = [
  "parking_lot 0.12.5",
  "reqwest 0.13.3",
  "rustls",
+ "serde",
  "serde_json",
  "tentaflow-core",
  "tentaflow-protocol",
