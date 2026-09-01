@@ -1,504 +1,300 @@
 # =============================================================================
 # File:        .github/workflows/release.yml
-# Description: Builds one monolithic tentaflow binary per platform with every
-#              available GPU backend compiled in (CUDA + Vulkan + RDMA on Linux
-#              x86_64, CUDA + Vulkan on Linux aarch64 and Windows, Metal + MLX
-#              on macOS). At runtime tentaflow / llama.cpp-style ggml pick the
-#              best backend that the host actually has — same binary works on
-#              NVIDIA, CPU-only without rebuild; AMD and Intel run on Vulkan.
+# Description: Builds the release artifacts for Linux x86_64 in two editions —
+#              `full` (llama.cpp + whisper + vision on Vulkan) and `slim` (no
+#              local inference engine at all) — and publishes them on a v* tag.
+#
+#              Every number and package in here was measured, not guessed:
+#              scripts/ci-local/ reproduces this job in a container held to the
+#              runner's shape. Cold native-libs 45m30s / 450 MB, cold release
+#              build 45m / 299 MB binary / 9 GB target dir.
+#
+#              The runner is ubuntu-22.04, NOT ubuntu-latest. The glibc a binary
+#              is linked against becomes the floor for every machine that later
+#              installs it: 22.04 gives 2.35, 24.04 would demand 2.39 and lock
+#              out Debian 12 (2.36), which install.sh claims to support.
+#
+#              macOS (Metal/MLX), aarch64 and Windows are not built here yet.
+#              Their steps are in git history; they come back one at a time,
+#              each with a verified build, rather than as untested matrix rows.
 # =============================================================================
-
 name: release
 
 on:
   push:
     tags:
-      - 'v*'
+      - "v*"
   workflow_dispatch:
 
 permissions:
   contents: write
 
+env:
+  CARGO_INCREMENTAL: 0
+  CARGO_NET_RETRY: 10
+  TENTAFLOW_TARGET: x86_64-unknown-linux-gnu
+
 jobs:
-  build:
-    name: build (${{ matrix.target }})
-    runs-on: ${{ matrix.runner }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - target: x86_64-unknown-linux-gnu
-            runner: ubuntu-latest
-            features: "rdma-probe,gpu-cuda,gpu-vulkan"
-            cache_id: "linux-x64-all"
-          - target: aarch64-unknown-linux-gnu
-            runner: ubuntu-24.04-arm
-            features: "gpu-cuda,gpu-vulkan"
-            cache_id: "linux-arm64-cuda-vulkan"
-          - target: aarch64-apple-darwin
-            runner: macos-latest
-            # gpu-metal: wciaga llama-cpp-2/metal + whisper-rs/metal + inference-llamacpp.
-            # Bez tego llama.cpp nie wchodzi w binarke na Apple Silicon, a Metal
-            # jest NATYWNY backend dla tej platformy. MLX siedzi dodatkowo w
-            # cfg-target `macos` wpisie w tentaflow/Cargo.toml.
-            features: "gpu-metal"
-            cache_id: "macos-arm64-metal"
-          # Tymczasowo wylaczone — build Windows ma byc pomijany w release.
-          # - target: x86_64-pc-windows-msvc
-          #   runner: windows-latest
-          #   features: "gpu-cuda,gpu-vulkan"
-          #   cache_id: "windows-x64-cuda-vulkan"
-
-    env:
-      CARGO_INCREMENTAL: 0
-      CARGO_NET_RETRY: 10
-
+  # ---------------------------------------------------------------------------
+  # native-libs — built once, shared by every edition in the matrix. Cached on
+  # the build scripts plus the pinned llama.cpp ref, because a cold build is
+  # 45 minutes and nothing about it changes between editions.
+  # ---------------------------------------------------------------------------
+  native-libs:
+    name: native-libs (linux-x86_64)
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
         with:
           submodules: recursive
 
-      - name: Free disk space (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          # CUDA 13.2 (~8GB) + Vulkan + LLVM + cargo target przekraczaja
-          # domyslne ~14GB wolnego na C:. Kasujemy SDK ktorych nie uzywamy.
-          $before = (Get-PSDrive C).Free / 1GB
-          Write-Host ("Free before: {0:N1} GB" -f $before)
-          $paths = @(
-            "C:\Android",
-            "C:\Program Files\Android",
-            "C:\Program Files (x86)\Android",
-            "C:\hostedtoolcache\windows\Java_Temurin-Hotspot_jdk",
-            "C:\Program Files\MySQL",
-            "C:\Program Files\MongoDB",
-            "C:\Program Files\R",
-            "C:\Program Files\Google",
-            "C:\Program Files (x86)\Google",
-            "C:\Program Files\Unity Hub",
-            "C:\tools\kotlinc",
-            "C:\cabal",
-            "C:\ghcup",
-            "C:\hostedtoolcache\windows\stack",
-            "C:\hostedtoolcache\windows\Ruby",
-            "C:\SeleniumWebDrivers"
-          )
-          foreach ($p in $paths) {
-            if (Test-Path $p) {
-              Write-Host "Removing $p"
-              Remove-Item -Path $p -Recurse -Force -ErrorAction SilentlyContinue
-            }
-          }
-          $after = (Get-PSDrive C).Free / 1GB
-          Write-Host ("Free after: {0:N1} GB (freed {1:N1} GB)" -f $after, ($after - $before))
-
-      - name: Setup Rust
-        uses: dtolnay/rust-toolchain@stable
+      - name: Cache native-libs output
+        id: cache
+        uses: actions/cache@v4
         with:
-          targets: ${{ matrix.target }}
+          path: native-libs/linux-x86_64
+          # The 4.2 GB of downloaded sources live outside the repo and are NOT
+          # cached: only the 450 MB of built artifacts are, so the release job
+          # stays clear of the runner's ~14 GB disk ceiling.
+          key: native-libs-linux-x86_64-${{ hashFiles('scripts/native-libs/**', 'scripts/build-zvec.sh') }}
 
-      # ---------------------------------------------------------------------
-      # Base build tools + protoc
-      # ---------------------------------------------------------------------
-      - name: Install base tools (Linux)
-        if: runner.os == 'Linux'
+      - name: Install build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            protobuf-compiler cmake build-essential pkg-config \
-            libglib2.0-dev libgstreamer1.0-dev \
-            libgstreamer-plugins-base1.0-dev \
-            libasound2-dev \
-            libssl-dev git curl ca-certificates
+            build-essential gcc-11 g++-11 ninja-build pkg-config \
+            git curl wget ca-certificates unzip xz-utils \
+            python3 python3-pip protobuf-compiler libssl-dev
 
-      - name: Install base tools (macOS)
-        if: runner.os == 'macOS'
-        run: brew install protobuf cmake glib gstreamer gst-plugins-base pkg-config
-
-      - name: Verify Xcode (macOS — wymagane przez build.rs do zbudowania
-              libMLXBridge.dylib z Metal shaderami przez xcodebuild)
-        if: runner.os == 'macOS'
+      - name: Pin cmake into the window zvec requires
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          xcode-select -p
-          xcodebuild -version
-          # macos-latest powinien miec Xcode preinstalowane.
-          # Jezeli nie — `sudo xcode-select -s /Applications/Xcode.app/Contents/Developer`.
+          # zvec declares cmake_minimum_required(3.26) and its submodules break
+          # under cmake 4, so it needs [3.26, 4). Jammy ships 3.22 — too old —
+          # and without this the build dies half-way through instead of running.
+          pip3 install "cmake<4"
+          cmake --version
 
-      - name: Install base tools (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Install Vulkan SDK
+        if: steps.cache.outputs.cache-hit != 'true'
         run: |
-          $ErrorActionPreference = 'Stop'
-          # protoc z choco — stabilna paczka.
-          choco install -y protoc --no-progress
-          if ($LASTEXITCODE -ne 0) { throw "protoc install failed (exit $LASTEXITCODE)" }
-
-          # cmake 4.x (choco default) lamie ExternalProject VS generator
-          # compiler detection dla ggml/whisper. Pobieramy stabilne 3.31.6
-          # bezposrednio z cmake.org — choco mial 504 Gateway Timeout.
-          $cmakeVer = "3.31.6"
-          $zipUrl = "https://github.com/Kitware/CMake/releases/download/v$cmakeVer/cmake-$cmakeVer-windows-x86_64.zip"
-          $zipPath = "$env:RUNNER_TEMP\cmake.zip"
-          $extractDir = "$env:RUNNER_TEMP\cmake"
-          Write-Host "Downloading $zipUrl"
-          for ($i = 1; $i -le 3; $i++) {
-            try {
-              Invoke-WebRequest -Uri $zipUrl -OutFile $zipPath -UseBasicParsing
-              break
-            } catch {
-              if ($i -eq 3) { throw }
-              Write-Host "Download attempt $i failed, retrying..."
-              Start-Sleep -Seconds 10
-            }
-          }
-          Expand-Archive -Path $zipPath -DestinationPath $extractDir -Force
-          $cmakeBin = (Get-ChildItem "$extractDir" -Directory | Select-Object -First 1).FullName + "\bin"
-          # Prepend zeby nasz cmake bil cmake'a z runner image.
-          echo $cmakeBin >> $env:GITHUB_PATH
-          & "$cmakeBin\cmake.exe" --version
-          & "C:\ProgramData\chocolatey\bin\protoc.exe" --version
-
-      - name: Export PROTOC env
-        shell: bash
-        run: |
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            PROTOC_PATH=$(where.exe protoc 2>/dev/null | head -n1 | tr -d '\r')
-          else
-            PROTOC_PATH=$(which protoc)
-          fi
-          echo "PROTOC=$PROTOC_PATH" >> "$GITHUB_ENV"
-          "$PROTOC_PATH" --version
-
-      # ---------------------------------------------------------------------
-      # CUDA Toolkit — Linux: instalacja z oficjalnego NVIDIA apt repo,
-      # Windows: Jimver z meta-package `cuda` (unika problematycznych sub-pkg
-      # nazw ktore Jimver mapuje niepoprawnie: cublas_dev -> cuda-cublas_dev-12-6,
-      # ktory w NVIDIA repo nie istnieje).
-      # ---------------------------------------------------------------------
-      - name: Install CUDA (Linux)
-        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-cuda')
-        run: |
-          set -eux
-          if [[ "$(dpkg --print-architecture)" == "arm64" ]]; then
-            REPO_ARCH="sbsa"
-          else
-            REPO_ARCH="x86_64"
-          fi
-          wget -q "https://developer.download.nvidia.com/compute/cuda/repos/ubuntu2404/${REPO_ARCH}/cuda-keyring_1.1-1_all.deb"
-          sudo dpkg -i cuda-keyring_1.1-1_all.deb
-          sudo apt-get update
-          # Caly toolkit 12.6 (pelny stack — nvcc + cudart + cublas + curand + cusolver + ...).
-          # Ta sama wersja co Windows (Jimver v0.2.19 wspiera max 12.6.x).
-          sudo apt-get install -y cuda-toolkit-12-6
-          echo "CUDA_PATH=/usr/local/cuda-12.6" >> "$GITHUB_ENV"
-          echo "CUDACXX=/usr/local/cuda-12.6/bin/nvcc" >> "$GITHUB_ENV"
-          echo "/usr/local/cuda-12.6/bin" >> "$GITHUB_PATH"
-          echo "LD_LIBRARY_PATH=/usr/local/cuda-12.6/lib64:${LD_LIBRARY_PATH:-}" >> "$GITHUB_ENV"
-          /usr/local/cuda-12.6/bin/nvcc --version
-
-      - name: Install CUDA (Windows) via chocolatey
-        if: runner.os == 'Windows' && contains(matrix.features, 'gpu-cuda')
-        shell: pwsh
-        run: |
-          # Jimver network + local method oba pada z exit 3772776473 na Azure
-          # Windows runners (NVIDIA installer flake od strony Microsoft IO).
-          # Chocolatey wraps ten sam installer ale ze swoim retry + tmp w
-          # C:\ProgramData\chocolatey\lib (nie D:\a\TentaFlow/...).
-          $MaxAttempts = 3
-          for ($i = 1; $i -le $MaxAttempts; $i++) {
-            Write-Host "Attempt $i/$MaxAttempts - choco install cuda"
-            # Bez --version — chocolatey rebumpuje paczke co CUDA release,
-            # a wersje typu 12.6.2.561 znikaja z indexu po kolejnych bumpach.
-            # Bierzemy cokolwiek community.chocolatey.org aktualnie hostuje;
-            # ggml/llama.cpp linkuja przez CUDART 12 API (API-stable), wiec
-            # kazda 12.x (lub nowsze, 13.x) dziala.
-            choco install cuda -y --no-progress `
-              --timeout=7200 --ignore-detected-reboot
-            if ($LASTEXITCODE -eq 0) {
-              Write-Host "CUDA install OK"
-              break
-            }
-            if ($i -lt $MaxAttempts) {
-              Write-Host "Attempt failed, waiting 30s..."
-              Start-Sleep -Seconds 30
-            }
-          }
-          if ($LASTEXITCODE -ne 0) { throw "CUDA install failed after $MaxAttempts attempts" }
-          # Choco instaluje do "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.6"
-          $cudaPath = Get-ChildItem "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA" `
-            -Directory -ErrorAction SilentlyContinue | Sort-Object Name -Descending `
-            | Select-Object -First 1
-          if (-not $cudaPath) { throw "CUDA dir not found after install" }
-          # MSBuild `CUDA <X.Y>.targets` czyta CUDA_PATH_V<X>_<Y> (versioned),
-          # nie `CUDA_PATH`. Jak tego brak — CudaToolkitDir = '' → fail przy
-          # whisper-rs-sys / llama-cpp-sys-2 cmake. Installer ustawia ten var
-          # w machine scope, ale bieżąca pwsh sesja go nie widzi — eksportujemy
-          # recznie z wyciagnietej wersji folderu v13.2 -> 13_2.
-          $verTag = ($cudaPath.Name -replace '^v','') -replace '\.','_'
-          echo "CUDA_PATH=$($cudaPath.FullName)" >> $env:GITHUB_ENV
-          echo "CUDA_PATH_V$verTag=$($cudaPath.FullName)" >> $env:GITHUB_ENV
-          echo "CUDACXX=$($cudaPath.FullName)\bin\nvcc.exe" >> $env:GITHUB_ENV
-          echo "CudaToolkitDir=$($cudaPath.FullName)" >> $env:GITHUB_ENV
-          echo "$($cudaPath.FullName)\bin" >> $env:GITHUB_PATH
-          Write-Host "CUDA_PATH_V$verTag = $($cudaPath.FullName)"
-          & "$($cudaPath.FullName)\bin\nvcc.exe" --version
-
-      # ---------------------------------------------------------------------
-      # Vulkan SDK — Linux i Windows (macOS ma Metal, nie potrzebuje)
-      # ---------------------------------------------------------------------
-      - name: Install Vulkan SDK (Linux x86_64)
-        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan') && runner.arch == 'X64'
-        run: |
-          # LunarG repo ma paczki vulkan-sdk tylko dla x86_64
+          # glslc decides whether the vulkan backend exists at all: without it
+          # detect_backends() silently produces a CPU-only 'multi' variant and
+          # the artifact named gpu-vulkan is llama.cpp on the CPU.
           wget -qO- https://packages.lunarg.com/lunarg-signing-key-pub.asc \
             | sudo tee /etc/apt/trusted.gpg.d/lunarg.asc >/dev/null
           CODENAME=$(. /etc/os-release && echo "$VERSION_CODENAME")
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan.list \
             "https://packages.lunarg.com/vulkan/lunarg-vulkan-${CODENAME}.list"
           sudo apt-get update
-          # vulkan-sdk daje glslc + naglowki (potrzebne do KOMPILACJI shaderow
-          # ggml), ale nie zostawia libvulkan.so do LINKOWANIA — bez
-          # libvulkan-dev finalny link binarki pada na `-lvulkan`.
-          sudo apt-get install -y vulkan-sdk libvulkan-dev
-          vulkaninfo --summary || true
+          sudo apt-get install -y vulkan-sdk
+          glslc --version
 
-      - name: Install Vulkan (Linux aarch64)
-        if: runner.os == 'Linux' && contains(matrix.features, 'gpu-vulkan') && runner.arch == 'ARM64'
+      - name: Build native-libs
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          # The GPU variant of onnxruntime pulls CUDA/TensorRT providers and
+          # inflates lib-dynamic to ~3.3 GB for a build that has no CUDA in it.
+          ONNXRUNTIME_GPU: "0"
         run: |
-          # LunarG nie ma paczek ARM; uzywamy Ubuntu-systemowych. ggml-vulkan
-          # wymaga `glslc` (shaderc, Google) do kompilacji shaderow — to OSOBNY
-          # binarka od `glslang-tools` ktory ma tylko glslangValidator.
+          df -h /
+          time ./scripts/native-libs/build-all.sh --platform linux-x86_64
+          df -h /
+
+      - name: Verify the vulkan backend was actually built
+        run: |
+          ART=native-libs/linux-x86_64/lib-static/llama-cpp/multi/libggml-vulkan.a
+          test -f "$ART" || {
+            echo "::error::$ART missing — the vulkan backend was not built"
+            exit 1
+          }
+          ls -lh "$ART"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: native-libs-linux-x86_64
+          path: native-libs/linux-x86_64
+          retention-days: 1
+
+  # ---------------------------------------------------------------------------
+  # build — one job per edition. Both link the same native-libs.
+  # ---------------------------------------------------------------------------
+  build:
+    name: build (${{ matrix.edition }})
+    needs: native-libs
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - edition: full
+            cargo_flags: "--features gpu-vulkan"
+            # NEEDED entries that must be present, one per line.
+            expect: "libvulkan.so.1 libwhisper_tf.so libzvec_c_api.so"
+          - edition: slim
+            cargo_flags: "--no-default-features"
+            expect: "libzvec_c_api.so"
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: native-libs-linux-x86_64
+          path: native-libs/linux-x86_64
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TENTAFLOW_TARGET }}
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          # libasound2-dev: sherpa-rs links -lasound.
+          # libvulkan-dev: LunarG's vulkan-sdk ships glslc and headers but no
+          # libvulkan.so to link against, so the final link fails on -lvulkan.
           sudo apt-get install -y \
-            libvulkan-dev vulkan-tools \
-            glslc glslang-tools spirv-tools
-          vulkaninfo --summary || true
-          which glslc && glslc --version | head -2
+            build-essential cmake pkg-config protobuf-compiler \
+            libssl-dev libasound2-dev libvulkan-dev \
+            libglib2.0-dev libgstreamer1.0-dev libgstreamer-plugins-base1.0-dev \
+            clang libclang-dev git curl ca-certificates
 
-      - name: Install Vulkan SDK (Windows)
-        if: runner.os == 'Windows' && contains(matrix.features, 'gpu-vulkan')
-        shell: pwsh
+      - name: WASM toolchain
         run: |
-          # Chocolatey's vulkan-sdk package runs LunarG's silent installer,
-          # tracks the latest version (URLs change), and lands in standard
-          # C:\VulkanSDK\<ver>\ layout that FindVulkan.cmake finds via VULKAN_SDK.
-          choco install vulkan-sdk -y --no-progress
-          # Choco doesn't always export VULKAN_SDK to GITHUB_ENV — find it.
-          $sdk = Get-ChildItem C:\VulkanSDK -Directory `
-                 | Sort-Object Name -Descending | Select-Object -First 1
-          if (-not $sdk) { throw "No Vulkan SDK directory under C:\VulkanSDK after install" }
-          echo "VULKAN_SDK=$($sdk.FullName)" >> $env:GITHUB_ENV
-          echo "$($sdk.FullName)\Bin" >> $env:GITHUB_PATH
-          Write-Host "VULKAN_SDK=$($sdk.FullName)"
-          if (-not (Test-Path "$($sdk.FullName)\Include\vulkan\vulkan.h")) {
-            throw "vulkan.h missing under $($sdk.FullName)\Include\vulkan"
-          }
-          if (-not (Test-Path "$($sdk.FullName)\Lib\vulkan-1.lib")) {
-            throw "vulkan-1.lib missing under $($sdk.FullName)\Lib"
-          }
-          Write-Host "Vulkan headers + lib verified."
+          # Without these the dashboard glue (wasm_glue_bg.wasm) and every
+          # bundled addon are skipped by build.rs — with a warning, not an
+          # error, so the release would ship a dashboard that cannot load.
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
+          cargo install wasm-bindgen-cli --version 0.2.125 --locked
 
-      # ---------------------------------------------------------------------
-      # RDMA — Linux.
-      # ---------------------------------------------------------------------
-      - name: Install RDMA headers
-        if: contains(matrix.features, 'rdma-probe')
-        run: sudo apt-get install -y libibverbs-dev librdmacm-dev libnl-3-dev libnl-route-3-dev
-
-      # ---------------------------------------------------------------------
-      # Cache + build
-      # ---------------------------------------------------------------------
       - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            tentaflow/target
-            tentaflow-core/target
-          # matrix.features zawiera przecinki, a actions/cache ich nie przyjmuje.
-          # GitHub Expression language nie ma `replace()`, wiec podajemy gotowy
-          # cache_id z matrix.include (bez przecinkow, latwy do czytania).
-          key: cargo-${{ matrix.cache_id }}-${{ hashFiles('**/Cargo.lock') }}
+          key: cargo-${{ matrix.edition }}-${{ hashFiles('**/Cargo.lock') }}
 
       - name: Download Silero VAD (teams-bot native)
-        shell: bash
         run: |
-          # tentaflow/build.rs kopiuje model obok binarki jesli istnieje;
-          # bez tego bot uzywa fallback RMS (gorsza jakosc VAD).
           MODEL_DIR="tentaflow-containers/agents/native/teams-bot/models"
-          MODEL_FILE="$MODEL_DIR/silero_vad.onnx"
           mkdir -p "$MODEL_DIR"
-          if [[ ! -f "$MODEL_FILE" ]]; then
-            curl -fL "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx" \
-              -o "$MODEL_FILE" || echo "::warning::Silero VAD download failed — bot uzyje fallback RMS"
-          fi
+          curl -fL "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx" \
+            -o "$MODEL_DIR/silero_vad.onnx"
 
-      - name: Build tentaflow (all available GPU backends)
+      - name: Build
         working-directory: tentaflow
-        shell: bash
         env:
-          # .cargo/config.toml ustawia to w workspace, ale kiedy cargo startuje
-          # z tentaflow/ i GH Actions ustawi RUSTFLAGS z innych powodow, config
-          # jest ignorowany (RUSTFLAGS env wygrywa). Eksplicytnie laczymy:
-          # whisper-rs-sys + llama-cpp-sys-2 bundluja kopie ggml -> linker
-          # dostaje multiple definition dla wszystkich quantize_* funkcji.
-          # --allow-multiple-definition bierze pierwsza definicje (ta sama
-          # binarnie, wiec bez roznicy).
-          # Kazda platforma ma inny linker → inna flaga na duplicate symbols:
-          #   - Linux (GNU ld / rust-lld): --allow-multiple-definition
-          #   - macOS (Apple ld64): -ld_classic wymusza stary linker ktory
-          #     akceptuje -multiply_defined,suppress. Nowy ld64 (od Xcode 15)
-          #     nie obsluguje tej flagi — ale ld_classic dalej jest dostepny.
-          #   - Windows (link.exe / lld-link): /FORCE:MULTIPLE
-          RUSTFLAGS: >-
-            ${{
-              runner.os == 'Linux' && '-C link-arg=-Wl,--allow-multiple-definition' ||
-              runner.os == 'macOS' && '-C link-arg=-Wl,-ld_classic -C link-arg=-Wl,-multiply_defined,suppress' ||
-              runner.os == 'Windows' && '-C link-arg=/FORCE:MULTIPLE' ||
-              ''
-            }}
+          # whisper-rs-sys and llama-cpp-sys-2 each bundle a ggml copy, so the
+          # linker sees multiple definitions of every quantize_* symbol. Taking
+          # the first is safe — they are binary-identical.
+          RUSTFLAGS: "-C link-arg=-Wl,--allow-multiple-definition"
         run: |
-          # Windows tylko: CFLAGS=/FS -> cmake czyta jako CMAKE_*_FLAGS_INIT
-          # dla INNER ExternalProject vulkan-shaders-gen TryCompile (outer ma
-          # explicit flags, wiec env ignorowane). Zapobiega C1041 na vc143.pdb
-          # z rownoleglych cl.exe /MP.
-          # MSYS_NO_PATHCONV+MSYS2_ARG_CONV_EXCL: Git Bash bez tego tlumaczy
-          # `/FS` na `C:/Program Files/Git/FS` (widzi Unix-path-like arg).
-          # NIE mozna tego trzymac w env: YAML — cc-rs na macOS/Linux tez
-          # czyta CFLAGS i wali /FS do clanga/gcc (nie rozumieja tego flaga).
-          if [[ "$RUNNER_OS" == "Windows" ]]; then
-            export CFLAGS=/FS
-            export CXXFLAGS=/FS
-            export MSYS_NO_PATHCONV=1
-            export MSYS2_ARG_CONV_EXCL="*"
-          fi
-          if [[ -n "${{ matrix.features }}" ]]; then
-            cargo build --release --target ${{ matrix.target }} --features "${{ matrix.features }}"
-          else
-            cargo build --release --target ${{ matrix.target }}
-          fi
+          df -h /
+          time cargo build --release --target "$TENTAFLOW_TARGET" ${{ matrix.cargo_flags }}
+          df -h /
 
-      # ---------------------------------------------------------------------
-      # Pack artifacts
-      # ---------------------------------------------------------------------
-      - name: Stage artifacts (Unix)
-        if: runner.os != 'Windows'
-        shell: bash
+      - name: Stage archive
+        id: stage
         run: |
-          STAGE="tentaflow-${GITHUB_REF_NAME}-${{ matrix.target }}"
+          # The target directory is resolved, never hardcoded: .cargo/config.toml
+          # redirects it to target_shared and a hardcoded path silently staged
+          # nothing for months.
+          TARGET_DIR=$(cd tentaflow && cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          OUT="$TARGET_DIR/$TENTAFLOW_TARGET/release"
+          STAGE="tentaflow-${GITHUB_REF_NAME}-${TENTAFLOW_TARGET}-${{ matrix.edition }}"
           mkdir -p "$STAGE"
-          cp tentaflow/target/${{ matrix.target }}/release/tentaflow "$STAGE/"
-          cp tentaflow/config.toml "$STAGE/config.example.toml" 2>/dev/null || true
-          cp scripts/install/tentaflow.service "$STAGE/" 2>/dev/null || true
-          cp scripts/install/ai.tentaflow.plist "$STAGE/" 2>/dev/null || true
-          cp LICENSE README.md "$STAGE/" 2>/dev/null || true
 
-          # tentaflow-meeting (sidecar Teams) + Silero VAD model. Buildowane przez
-          # `tentaflow/build.rs` razem z glowna binarka. Dystrybucja: obie binarki
-          # obok siebie + model VAD obok zeby `default_vad_model_path` w config.rs
-          # je znalazl przez `current_exe()`.
-          MEETING_BIN="tentaflow/target/${{ matrix.target }}/release/tentaflow-meeting"
-          if [[ -f "$MEETING_BIN" ]]; then
-            cp "$MEETING_BIN" "$STAGE/"
-            echo "Staged tentaflow-meeting"
-          else
-            echo "::warning::brak $MEETING_BIN — teams-bot native nie bedzie dzialal"
-          fi
-          VAD_MODEL="tentaflow/target/${{ matrix.target }}/release/silero_vad.onnx"
-          if [[ -f "$VAD_MODEL" ]]; then
-            cp "$VAD_MODEL" "$STAGE/"
-            echo "Staged silero_vad.onnx"
-          fi
+          # Everything the binary needs and no package manager can provide. A
+          # missing file fails the job: shipping an archive whose binary cannot
+          # start is worse than shipping nothing.
+          require() {
+            test -f "$1" || { echo "::error::missing required artifact: $1"; exit 1; }
+            cp "$1" "$STAGE/"
+          }
+          require "$OUT/tentaflow"
+          require "native-libs/linux-x86_64/lib-dynamic/libzvec_c_api.so"
+          # pdfium is a mandatory dependency loaded at runtime (bind_to_library),
+          # not a feature — document ingest needs it in both editions.
+          require "native-libs/linux-x86_64/lib-dynamic/libpdfium.so"
+          require "scripts/install/tentaflow.service.in"
+          require "LICENSE"
+          require "README.md"
 
-          # macOS: dorzucamy Swift MLX bridge — libMLXBridge.dylib + Metal
-          # shaders bundle. Bez tego MlxSwiftEngine nie ma do czego wolac
-          # callbackow runtime (`Failed to load default metallib`) i Bielik
-          # / inne MLX modele wpadaja w fallback CPU lub wcale nie startuja.
-          if [[ "$RUNNER_OS" == "macOS" ]]; then
-            DYLIB="tentaflow/target/${{ matrix.target }}/release/libMLXBridge.dylib"
-            BUNDLE="tentaflow/target/${{ matrix.target }}/release/mlx-swift_Cmlx.bundle"
-            if [[ -f "$DYLIB" ]]; then
-              cp "$DYLIB" "$STAGE/"
-              echo "Staged libMLXBridge.dylib"
-            else
-              echo "::warning::brak $DYLIB — Swift MLX bridge nie bedzie dolaczony"
-            fi
-            if [[ -d "$BUNDLE" ]]; then
-              cp -R "$BUNDLE" "$STAGE/"
-              echo "Staged mlx-swift_Cmlx.bundle"
-            else
-              echo "::warning::brak $BUNDLE — MLX modele nie zaladuja Metal shaderow"
-            fi
+          if [ "${{ matrix.edition }}" = "full" ]; then
+            require "$OUT/libwhisper_tf.so"
+            require "$OUT/tentaflow-meeting"
+            require "$OUT/silero_vad.onnx"
+            require "native-libs/linux-x86_64/lib-dynamic/libonnxruntime.so.1.26.0"
           fi
 
           tar -czf "$STAGE.tar.gz" "$STAGE"
-          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          sha256sum "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          ls -lh "$STAGE.tar.gz"
 
-      - name: Stage artifacts (Windows)
-        if: runner.os == 'Windows'
-        shell: pwsh
+      - name: Verify the binary links what it should
         run: |
-          $stage = "tentaflow-$env:GITHUB_REF_NAME-${{ matrix.target }}"
-          New-Item -ItemType Directory -Path $stage | Out-Null
-          Copy-Item "tentaflow/target/${{ matrix.target }}/release/tentaflow.exe" "$stage/"
-          Copy-Item "tentaflow/config.toml" "$stage/config.example.toml" -ErrorAction SilentlyContinue
-          Copy-Item "LICENSE","README.md" $stage -ErrorAction SilentlyContinue
-          $meetingBin = "tentaflow/target/${{ matrix.target }}/release/tentaflow-meeting.exe"
-          if (Test-Path $meetingBin) {
-              Copy-Item $meetingBin "$stage/"
-              Write-Host "Staged tentaflow-meeting.exe"
-          } else {
-              Write-Host "::warning::brak $meetingBin — teams-bot native nie bedzie dzialal"
-          }
-          $vadModel = "tentaflow/target/${{ matrix.target }}/release/silero_vad.onnx"
-          if (Test-Path $vadModel) {
-              Copy-Item $vadModel "$stage/"
-              Write-Host "Staged silero_vad.onnx"
-          }
-          Compress-Archive -Path $stage -DestinationPath "$stage.zip"
-          Get-FileHash "$stage.zip" -Algorithm SHA256 | Format-List > "$stage.zip.sha256"
+          BIN="${{ steps.stage.outputs.stage }}/tentaflow"
+          readelf -d "$BIN" | grep NEEDED
+          for lib in ${{ matrix.expect }}; do
+            readelf -d "$BIN" | grep -q "\[$lib\]" || {
+              echo "::error::$BIN does not link $lib"
+              exit 1
+            }
+          done
+          # A CUDA link in a Vulkan build means the artifact cannot start on a
+          # machine without the NVIDIA driver — libcuda.so.1 comes from it.
+          if readelf -d "$BIN" | grep -qE "libcud(art|a)|libcublas"; then
+            echo "::error::$BIN links CUDA — this edition must not"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v4
         with:
-          name: tentaflow-${{ matrix.target }}
+          name: tentaflow-${{ matrix.edition }}
           path: |
             tentaflow-*.tar.gz
             tentaflow-*.tar.gz.sha256
-            tentaflow-*.zip
-            tentaflow-*.zip.sha256
 
   publish:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4
 
       - uses: actions/download-artifact@v4
         with:
-          path: artifacts
+          path: dist
           merge-multiple: true
 
-      - name: Copy installers into release artifacts
+      - name: Check the tag matches the crate version
         run: |
-          cp scripts/install/install.sh artifacts/install.sh
-          cp scripts/install/install.ps1 artifacts/install.ps1
+          CRATE=$(grep -m1 '^version' tentaflow/Cargo.toml | sed 's/.*"\(.*\)".*/\1/')
+          test "v$CRATE" = "$GITHUB_REF_NAME" || {
+            echo "::error::tag $GITHUB_REF_NAME does not match tentaflow/Cargo.toml version $CRATE"
+            exit 1
+          }
+
+      - name: Copy installers next to the archives
+        run: cp scripts/install/install.sh scripts/install/uninstall.sh dist/
 
       - name: Detect pre-release tag
         id: prerelease
         run: |
-          TAG="${{ github.ref_name }}"
-          if [[ "$TAG" == *-alpha* || "$TAG" == *-beta* || "$TAG" == *-rc* ]]; then
-            echo "is_prerelease=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "is_prerelease=false" >> "$GITHUB_OUTPUT"
-          fi
+          case "$GITHUB_REF_NAME" in
+            *-alpha*|*-beta*|*-rc*) echo "value=true" >> "$GITHUB_OUTPUT" ;;
+            *) echo "value=false" >> "$GITHUB_OUTPUT" ;;
+          esac
 
       - name: GitHub Release
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}
-          files: artifacts/*
+          files: dist/*
+          prerelease: ${{ steps.prerelease.outputs.value }}
           generate_release_notes: true
-          fail_on_unmatched_files: true
-          prerelease: ${{ steps.prerelease.outputs.is_prerelease == 'true' }}
