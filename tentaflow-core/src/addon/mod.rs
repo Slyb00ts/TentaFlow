@@ -2427,6 +2427,11 @@ impl AddonManager {
         // porzucone strumienie backendu przerywaja generacje.
         host_functions::llm::cleanup_addon_streams(&addon_id);
 
+        // M3b — porzucone konsumenty bus zwalniamy tak samo jak strumienie LLM:
+        // ich `bus_groups` DB row + fetch cursor musi zniknac natychmiast, nie
+        // czekac na idle-reaper (do 300s, patrz CONSUMER_IDLE_TIMEOUT).
+        host_functions::bus::cleanup_addon_consumers(&addon_id);
+
         // Lifecycle on_stop (export name from language adapter)
         let stop_export = addon_instance.language_adapter.export_on_stop();
         if let Some(on_stop) = addon_instance
