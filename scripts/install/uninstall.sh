@@ -35,6 +35,12 @@ if [ -n "$RECEIPT" ]; then
   CONFIG_DIR=$(dirname "$(read_field config)")
   DATA_DIR=$(read_field home)
   SCOPE=$(read_field service_scope)
+elif [ "$(uname -s)" = "Darwin" ]; then
+  echo "Brak receiptu — zakladam domyslny layout macOS." >&2
+  PREFIX=/usr/local/tentaflow
+  CONFIG_DIR=/usr/local/etc/tentaflow
+  DATA_DIR=/usr/local/var/tentaflow
+  SCOPE=system
 else
   echo "Brak receiptu — zakladam domyslny layout." >&2
   PREFIX=/opt/tentaflow
@@ -48,7 +54,17 @@ echo "  prefix: $PREFIX"
 echo "  config: $CONFIG_DIR"
 echo "  dane:   $DATA_DIR $([ "$PURGE" = "1" ] && echo '(ZOSTANA USUNIETE)' || echo '(zostaja)')"
 
-if command -v systemctl >/dev/null 2>&1; then
+if [ "$(uname -s)" = "Darwin" ]; then
+  # Booting the service out before deleting its plist; the other order leaves a
+  # loaded job pointing at files that no longer exist.
+  if [ "$SCOPE" = "user" ]; then
+    launchctl bootout "gui/$(id -u)/ai.tentaflow" 2>/dev/null || true
+    rm -f "$HOME/Library/LaunchAgents/ai.tentaflow.plist"
+  else
+    $SUDO launchctl bootout system/ai.tentaflow 2>/dev/null || true
+    $SUDO rm -f /Library/LaunchDaemons/ai.tentaflow.plist
+  fi
+elif command -v systemctl >/dev/null 2>&1; then
   if [ "$SCOPE" = "user" ]; then
     systemctl --user disable --now tentaflow.service 2>/dev/null || true
     rm -f "$HOME/.config/systemd/user/tentaflow.service"

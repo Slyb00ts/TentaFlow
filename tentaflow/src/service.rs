@@ -11,7 +11,7 @@
 // (`systemctl --user`) must not silently fall back to the system manager and
 // report "not installed" for a service that is running.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::time::Duration;
 
@@ -28,8 +28,30 @@ pub enum Manager {
     SystemdSystem,
     /// systemd user unit — ~/.config/systemd/user/tentaflow.service
     SystemdUser,
-    /// launchd agent — ~/Library/LaunchAgents/ai.tentaflow.plist
-    Launchd,
+    /// launchd DAEMON — /Library/LaunchDaemons/ai.tentaflow.plist. This is what
+    /// "starts with the system" means on macOS: an agent only runs once someone
+    /// logs in, which is not a server.
+    LaunchdDaemon,
+    /// launchd agent — ~/Library/LaunchAgents/ai.tentaflow.plist (user install)
+    LaunchdAgent,
+}
+
+impl Manager {
+    /// The launchd service target: `system/<label>` for a daemon, `gui/<uid>/<label>`
+    /// for a per-user agent. Every launchctl verb since Yosemite addresses one.
+    fn launchd_target(self) -> String {
+        match self {
+            Manager::LaunchdDaemon => format!("system/{LAUNCHD_LABEL}"),
+            _ => format!("gui/{}/{LAUNCHD_LABEL}", unsafe { libc_getuid() }),
+        }
+    }
+
+    fn launchd_domain(self) -> String {
+        match self {
+            Manager::LaunchdDaemon => "system".to_string(),
+            _ => format!("gui/{}", unsafe { libc_getuid() }),
+        }
+    }
 }
 
 const UNIT: &str = "tentaflow.service";
@@ -66,7 +88,11 @@ fn user_unit_path() -> Option<PathBuf> {
     )
 }
 
-fn launchd_plist_path() -> Option<PathBuf> {
+fn launchd_daemon_path() -> PathBuf {
+    PathBuf::from("/Library/LaunchDaemons").join(format!("{LAUNCHD_LABEL}.plist"))
+}
+
+fn launchd_agent_path() -> Option<PathBuf> {
     let home = std::env::var_os("HOME")?;
     Some(
         PathBuf::from(home)
@@ -75,11 +101,21 @@ fn launchd_plist_path() -> Option<PathBuf> {
     )
 }
 
+fn launchd_plist_path(manager: Manager) -> Option<PathBuf> {
+    match manager {
+        Manager::LaunchdDaemon => Some(launchd_daemon_path()),
+        _ => launchd_agent_path(),
+    }
+}
+
 /// Finds the manager that actually owns this installation.
 pub fn detect() -> Option<Manager> {
     if cfg!(target_os = "macos") {
-        if launchd_plist_path().is_some_and(|p| p.exists()) {
-            return Some(Manager::Launchd);
+        if launchd_daemon_path().exists() {
+            return Some(Manager::LaunchdDaemon);
+        }
+        if launchd_agent_path().is_some_and(|p| p.exists()) {
+            return Some(Manager::LaunchdAgent);
         }
     }
     if system_unit_path().exists() {
@@ -147,11 +183,7 @@ pub fn is_active() -> bool {
                 .map(|s| s.success())
                 .unwrap_or(false)
         }
-        Manager::Launchd => Command::new("launchctl")
-            .args(["list", LAUNCHD_LABEL])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false),
+        m => launchd_pid(m).is_some(),
     }
 }
 
@@ -164,13 +196,9 @@ pub fn start() -> Result<()> {
             }
             println!("TentaFlow uruchomiony.");
         }
-        Manager::Launchd => {
-            let plist = launchd_plist_path().ok_or_else(not_installed)?;
-            let uid = unsafe { libc_getuid() };
-            let status = Command::new("launchctl")
-                .args(["bootstrap", &format!("gui/{uid}")])
-                .arg(&plist)
-                .status()?;
+        m => {
+            let plist = launchd_plist_path(m).ok_or_else(not_installed)?;
+            let status = launchctl(m, &["bootstrap", &m.launchd_domain()], Some(&plist))?;
             if !status.success() {
                 return Err(anyhow!("launchctl bootstrap nie powiodlo sie ({status})"));
             }
@@ -189,11 +217,8 @@ pub fn stop() -> Result<()> {
             }
             println!("TentaFlow zatrzymany.");
         }
-        Manager::Launchd => {
-            let uid = unsafe { libc_getuid() };
-            let status = Command::new("launchctl")
-                .args(["bootout", &format!("gui/{uid}/{LAUNCHD_LABEL}")])
-                .status()?;
+        m => {
+            let status = launchctl(m, &["bootout", &m.launchd_target()], None)?;
             if !status.success() {
                 return Err(anyhow!("launchctl bootout nie powiodlo sie ({status})"));
             }
@@ -213,13 +238,57 @@ pub fn restart() -> Result<()> {
             println!("TentaFlow zrestartowany.");
             Ok(())
         }
-        Manager::Launchd => {
-            // launchd has no restart verb; bootout may legitimately fail when the
-            // agent is not loaded, so only the bootstrap result decides.
-            let _ = stop();
+        m => {
+            // `kickstart -k` restarts a loaded service in one call; when nothing
+            // is loaded there is nothing to kick, so fall back to a plain start.
+            let status = launchctl(m, &["kickstart", "-k", &m.launchd_target()], None)?;
+            if status.success() {
+                println!("TentaFlow zrestartowany.");
+                return Ok(());
+            }
             start()
         }
     }
+}
+
+/// Runs one launchctl verb. The system domain needs root, and a plain user
+/// invocation there fails with a bare "Operation not permitted", so the call is
+/// re-run under sudo rather than reported as a broken installation.
+fn launchctl(
+    manager: Manager,
+    args: &[&str],
+    plist: Option<&Path>,
+) -> Result<std::process::ExitStatus> {
+    let needs_root = manager == Manager::LaunchdDaemon && unsafe { libc_getuid() } != 0;
+    let mut cmd = if needs_root {
+        let mut c = Command::new("sudo");
+        c.arg("launchctl");
+        c
+    } else {
+        Command::new("launchctl")
+    };
+    cmd.args(args);
+    if let Some(p) = plist {
+        cmd.arg(p);
+    }
+    Ok(cmd.status()?)
+}
+
+/// PID of the running service, or `None` when launchd holds no running copy.
+/// `launchctl print` is the only verb that reports it for a modern service
+/// target; `list` predates domains and lies about daemons.
+fn launchd_pid(manager: Manager) -> Option<u32> {
+    let out = Command::new("launchctl")
+        .args(["print", &manager.launchd_target()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.trim().strip_prefix("pid = "))
+        .and_then(|v| v.trim().parse().ok())
 }
 
 // `getuid(2)` — launchd domains are per-uid (`gui/<uid>`) and there is no
@@ -234,9 +303,9 @@ extern "C" {
 ///
 /// These are two different URLs on purpose. The one printed is for a human, so
 /// it says `localhost`; the one probed is built from the configured bind
-/// address, because `localhost` may resolve to `::1` while the server listens
-/// on 127.0.0.1 — a machine where that happens would report a healthy service
-/// as dead (containers routinely do).
+/// address, because a bind is not always something `localhost` reaches — a
+/// server bound to a LAN address answers there and nowhere else, and a
+/// `localhost` that resolves to `::1` first misses an IPv4-only listener.
 struct Endpoint {
     display: String,
     probe: String,
@@ -323,14 +392,29 @@ pub fn status() -> Result<()> {
         None => {
             println!("  usluga:    NIEZAREJESTROWANA (brak unitu systemd / agenta launchd)");
         }
-        Some(Manager::Launchd) => {
-            let out = Command::new("launchctl")
-                .args(["print", &format!("gui/{}/{LAUNCHD_LABEL}", unsafe { libc_getuid() })])
-                .output();
-            let running = out.map(|o| o.status.success()).unwrap_or(false);
+        Some(m @ (Manager::LaunchdDaemon | Manager::LaunchdAgent)) => {
+            let scope = if m == Manager::LaunchdDaemon {
+                "launchd (daemon)"
+            } else {
+                "launchd (agent)"
+            };
+            match launchd_pid(m) {
+                Some(pid) => {
+                    println!("  usluga:    {scope}, running");
+                    println!("  PID:       {pid}");
+                }
+                None => println!("  usluga:    {scope}, niezaladowana"),
+            }
+            // RunAtLoad in the plist is the autostart; a daemon plist in
+            // /Library/LaunchDaemons is loaded by launchd at boot, an agent only
+            // after the user logs in.
             println!(
-                "  usluga:    launchd, {}",
-                if running { "zaladowana" } else { "niezaladowana" }
+                "  autostart: {}",
+                if m == Manager::LaunchdDaemon {
+                    "przy starcie systemu"
+                } else {
+                    "po zalogowaniu uzytkownika"
+                }
             );
         }
         Some(m) => {

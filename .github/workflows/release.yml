@@ -14,8 +14,9 @@
 #              installs it: 22.04 gives 2.35, 24.04 would demand 2.39 and lock
 #              out Debian 12 (2.36), which install.sh claims to support.
 #
-#              macOS (Metal/MLX), aarch64 and Windows are not built here yet.
-#              Their steps are in git history; they come back one at a time,
+#              macOS (Apple Silicon, Metal/MLX) builds in build-macos, `full`
+#              only — see that job for why there is no macOS slim. Linux aarch64
+#              and Windows are not built here yet; they come back one at a time,
 #              each with a verified build, rather than as untested matrix rows.
 # =============================================================================
 name: release
@@ -263,6 +264,124 @@ jobs:
             tentaflow-*.tar.gz.sha256
 
   # ---------------------------------------------------------------------------
+  # build-macos — Apple Silicon, `full` only.
+  #
+  # There is no macOS `slim`: tentaflow/Cargo.toml pulls tentaflow-core with the
+  # MLX features from a [target.'cfg(target_os = "macos")'] block, which applies
+  # regardless of --no-default-features, so a "slim" macOS build would ship the
+  # same MLX engines under a name that promises none. Making it real means
+  # restructuring that dependency, which is not something to do blind.
+  #
+  # Intel Macs are not built: nothing in this repo has been measured on one.
+  # ---------------------------------------------------------------------------
+  build-macos:
+    name: build (macos-full)
+    runs-on: macos-14
+    env:
+      TENTAFLOW_TARGET: aarch64-apple-darwin
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          brew install cmake ninja pkg-config glib gstreamer gst-plugins-base protobuf
+
+      - name: Metal toolchain
+        run: |
+          # Xcode 26 split the Metal compiler into a downloadable component.
+          # Without it xcodebuild produces a BROKEN mlx.metallib and every MLX
+          # model returns gibberish — with no build error. Fail loudly instead.
+          if ! xcrun --sdk macosx metal --version >/dev/null 2>&1; then
+            xcodebuild -downloadComponent MetalToolchain
+          fi
+          xcrun --sdk macosx metal --version
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: WASM toolchain
+        run: |
+          rustup target add wasm32-unknown-unknown wasm32-wasip1
+          cargo install wasm-bindgen-cli --version 0.2.125 --locked
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-macos-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build native-libs
+        run: ./scripts/native-libs/build-all.sh --platform macos-arm64
+
+      - name: Download Silero VAD (teams-bot native)
+        run: |
+          MODEL_DIR="tentaflow-containers/agents/native/teams-bot/models"
+          mkdir -p "$MODEL_DIR"
+          curl -fL "https://github.com/snakers4/silero-vad/raw/v5.1/src/silero_vad/data/silero_vad.onnx" \
+            -o "$MODEL_DIR/silero_vad.onnx"
+
+      - name: Build
+        working-directory: tentaflow
+        run: cargo build --release --target "$TENTAFLOW_TARGET" --features gpu-metal
+
+      - name: Stage archive
+        id: stage
+        run: |
+          TARGET_DIR=$(cd tentaflow && cargo metadata --format-version 1 --no-deps \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)["target_directory"])')
+          OUT="$TARGET_DIR/$TENTAFLOW_TARGET/release"
+          STAGE="tentaflow-${GITHUB_REF_NAME}-${TENTAFLOW_TARGET}-full"
+          mkdir -p "$STAGE"
+
+          require() {
+            test -e "$1" || { echo "::error::missing required artifact: $1"; exit 1; }
+            cp -R "$1" "$STAGE/"
+          }
+          require "$OUT/tentaflow"
+          require "$OUT/libzvec_c_api.dylib"
+          require "$OUT/libpdfium.dylib"
+          # MLX is the whole reason this edition exists on macOS: the bridge
+          # dylib without its metallib bundle loads and then computes garbage,
+          # so both are mandatory, not best-effort.
+          require "$OUT/libMLXBridge.dylib"
+          require "$OUT/mlx-swift_Cmlx.bundle"
+          require "$OUT/libKokoroBridge.dylib"
+          require "scripts/install/ai.tentaflow.plist.in"
+          require "LICENSE"
+          require "README.md"
+
+          tar -czf "$STAGE.tar.gz" "$STAGE"
+          shasum -a 256 "$STAGE.tar.gz" > "$STAGE.tar.gz.sha256"
+          echo "stage=$STAGE" >> "$GITHUB_OUTPUT"
+          ls -lh "$STAGE.tar.gz"
+
+      - name: Verify the binary loads what it should
+        run: |
+          BIN="${{ steps.stage.outputs.stage }}/tentaflow"
+          otool -L "$BIN"
+          file "$BIN" | grep -q arm64 || { echo "::error::not an arm64 binary"; exit 1; }
+          # The dylibs are resolved through @rpath next to the binary; a missing
+          # one only shows up at first run, which is why they are staged above.
+          for lib in libzvec_c_api.dylib libMLXBridge.dylib; do
+            otool -L "$BIN" | grep -q "$lib" || {
+              echo "::error::$BIN does not link $lib"; exit 1;
+            }
+          done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tentaflow-macos-full
+          path: |
+            tentaflow-*.tar.gz
+            tentaflow-*.tar.gz.sha256
+
+  # ---------------------------------------------------------------------------
   # verify — install the artifact the way a user will and prove the claims the
   # README makes: the service registers, autostarts, answers /health, and the
   # CLI reports it. A GitHub runner has real systemd, so this is the actual
@@ -323,7 +442,7 @@ jobs:
           test ! -e /opt/tentaflow
 
   publish:
-    needs: [build, verify]
+    needs: [build, build-macos, verify]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

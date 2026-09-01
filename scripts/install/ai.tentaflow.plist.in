@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  ai.tentaflow.plist.in — launchd template. The installer substitutes @PREFIX@,
+  @CONFIG@, @HOME@, @LOGDIR@ and the @USERNAME@ block (empty for a per-user
+  agent, which already runs as that user; launchd rejects UserName there).
+
+  Installed as a DAEMON in /Library/LaunchDaemons, because that is what "starts
+  with the system" means on macOS — a LaunchAgent waits for a login, which a
+  server cannot depend on. TENTAFLOW_HOME is set for the same reason as in the
+  systemd unit: without it the binary falls back to its own versioned install
+  directory and an update would strip the node of its data.
+-->
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>ai.tentaflow</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>@PREFIX@/current/tentaflow</string>
+    <string>--config</string>
+    <string>@CONFIG@</string>
+  </array>
+@USERNAME@
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>TENTAFLOW_HOME</key><string>@HOME@</string>
+  </dict>
+  <key>WorkingDirectory</key><string>@HOME@</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key>
+  <dict>
+    <key>SuccessfulExit</key><false/>
+    <key>Crashed</key><true/>
+  </dict>
+  <key>ProcessType</key><string>Interactive</string>
+  <key>SoftResourceLimits</key>
+  <dict>
+    <key>NumberOfFiles</key><integer>65535</integer>
+  </dict>
+  <key>StandardOutPath</key><string>@LOGDIR@/tentaflow.log</string>
+  <key>StandardErrorPath</key><string>@LOGDIR@/tentaflow.err.log</string>
+</dict>
+</plist>

@@ -105,6 +105,15 @@ The version resolver reads `/releases`, not `/releases/latest`, which hides pre-
 tag so far is `-alpha`); a pre-release sorts BELOW the same version without one, or `update`
 would offer a downgrade. A missing or mismatched checksum is fatal in both paths.
 
+macOS (Apple Silicon) installs the same way but through launchd, and the daemon
+goes to `/Library/LaunchDaemons` — a LaunchAgent waits for a login, which a server
+cannot depend on. Layout there is `/usr/local/{tentaflow,etc/tentaflow,var/tentaflow}`
+and the daemon runs as the installing user (`SUDO_USER`), because macOS has no
+service-account convention worth inventing. There is NO macOS slim edition: the MLX
+engines come from a `[target.'cfg(target_os = "macos")']` dependency block that
+`--no-default-features` does not switch off, so a slim macOS build would ship the
+same engines under a name that promises none.
+
 Local verification without burning CI: `scripts/ci-local/native-libs-in-docker.sh`,
 `build-release-in-docker.sh`, and `test-install.sh <archive> [ubuntu:22.04|debian:12|fedora:41|archlinux|all]`,
 which runs the installer under real systemd — "starts with the system" cannot be tested without

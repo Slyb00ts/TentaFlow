@@ -1,7 +1,7 @@
 #!/bin/sh
 # =============================================================================
 # File:        install.sh
-# Description: Installs TentaFlow from GitHub Releases on Linux.
+# Description: Installs TentaFlow from GitHub Releases on Linux and macOS.
 #
 # Usage:
 #   curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
@@ -11,7 +11,7 @@
 # `releases/latest` skips those — the installer would fetch itself from a stale
 # release, or fail outright on a repository that has only pre-releases.
 #
-# Layout:
+# Layout (Linux; macOS uses /usr/local/{tentaflow,etc,var} and launchd):
 #   /opt/tentaflow/versions/<ver>   binaries + our shared libraries
 #   /opt/tentaflow/current          symlink to the live version (atomic swap)
 #   /usr/local/bin/tentaflow        symlink into PATH
@@ -33,7 +33,6 @@
 set -eu
 
 REPO="Slyb00ts/TentaFlow"
-TARGET="x86_64-unknown-linux-gnu"
 VERSION="${TENTAFLOW_VERSION:-latest}"
 EDITION="${TENTAFLOW_EDITION:-}"
 BIND="${TENTAFLOW_BIND:-127.0.0.1:8090}"
@@ -43,25 +42,6 @@ WITH_DOCKER="${TENTAFLOW_WITH_DOCKER:-0}"
 SKIP_DEPS="${TENTAFLOW_SKIP_DEPS:-0}"
 ASSET_FILE="${TENTAFLOW_ASSET_FILE:-}"
 SERVICE_USER="tentaflow"
-
-if [ "$USER_INSTALL" = "1" ]; then
-  PREFIX="${TENTAFLOW_PREFIX:-$HOME/.local/share/tentaflow}"
-  CONFIG_DIR="$HOME/.config/tentaflow"
-  DATA_DIR="$HOME/.local/share/tentaflow/data"
-  BIN_DIR="$HOME/.local/bin"
-  SUDO=""
-  SERVICE_SCOPE="user"
-  SERVICE_USER="$(id -un)"
-else
-  PREFIX="${TENTAFLOW_PREFIX:-/opt/tentaflow}"
-  CONFIG_DIR="/etc/tentaflow"
-  DATA_DIR="/var/lib/tentaflow"
-  BIN_DIR="/usr/local/bin"
-  SERVICE_SCOPE="system"
-  if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
-fi
-CONFIG="$CONFIG_DIR/config.toml"
-RECEIPT="$CONFIG_DIR/install-receipt.json"
 
 if [ -t 1 ] && [ "${NO_COLOR:-0}" = "0" ]; then
   C_BOLD="$(printf '\033[1m')"; C_DIM="$(printf '\033[2m')"
@@ -76,13 +56,55 @@ ok()   { printf "%s  ok%s %s\n" "$C_GREEN" "$C_RESET" "$*"; }
 warn() { printf "%s  !!%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
 die()  { printf "%s  xx%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-[ "$(uname -s)" = "Linux" ] || die "Ten instalator obsluguje na razie tylko Linux x86_64."
-[ "$(uname -m)" = "x86_64" ] || die "Ten instalator obsluguje na razie tylko x86_64 (wykryto: $(uname -m))."
+# The target triple decides which release asset is downloaded, so an
+# unsupported combination has to fail HERE rather than after a 160 MB download
+# of an archive whose binary cannot run.
+case "$(uname -s)/$(uname -m)" in
+  Linux/x86_64)   OS=linux; TARGET="x86_64-unknown-linux-gnu" ;;
+  Darwin/arm64)   OS=macos; TARGET="aarch64-apple-darwin" ;;
+  Darwin/x86_64)  die "Intel Mac nie ma jeszcze builda — na razie budowany jest tylko Apple Silicon." ;;
+  Linux/aarch64)  die "Linux aarch64 nie ma jeszcze builda (planowany po macOS)." ;;
+  *) die "Nieobslugiwana platforma: $(uname -s) $(uname -m)." ;;
+esac
+# macOS has no /etc or /var/lib for third-party software and no system-wide
+# service account convention worth inventing here: the daemon runs as the
+# installing user, which is what a single-user machine actually wants.
+if [ "$USER_INSTALL" = "1" ]; then
+  PREFIX="${TENTAFLOW_PREFIX:-$HOME/.local/share/tentaflow}"
+  CONFIG_DIR="$HOME/.config/tentaflow"
+  DATA_DIR="$HOME/.local/share/tentaflow/data"
+  BIN_DIR="$HOME/.local/bin"
+  SUDO=""
+  SERVICE_SCOPE="user"
+  SERVICE_USER="$(id -un)"
+elif [ "$OS" = "macos" ]; then
+  PREFIX="${TENTAFLOW_PREFIX:-/usr/local/tentaflow}"
+  CONFIG_DIR="/usr/local/etc/tentaflow"
+  DATA_DIR="/usr/local/var/tentaflow"
+  BIN_DIR="/usr/local/bin"
+  SERVICE_SCOPE="system"
+  SERVICE_USER="${SUDO_USER:-$(id -un)}"
+  if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+else
+  PREFIX="${TENTAFLOW_PREFIX:-/opt/tentaflow}"
+  CONFIG_DIR="/etc/tentaflow"
+  DATA_DIR="/var/lib/tentaflow"
+  BIN_DIR="/usr/local/bin"
+  SERVICE_SCOPE="system"
+  if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+fi
+CONFIG="$CONFIG_DIR/config.toml"
+RECEIPT="$CONFIG_DIR/install-receipt.json"
+
 
 # =============================================================================
 # Package manager
 # =============================================================================
 detect_pm() {
+  if [ "$OS" = "macos" ]; then
+    command -v brew >/dev/null 2>&1 && PM=brew || PM=none
+    return
+  fi
   for pm in apt-get dnf pacman zypper; do
     if command -v "$pm" >/dev/null 2>&1; then
       case "$pm" in
@@ -103,6 +125,14 @@ pm_install() {
     dnf)    $SUDO dnf install -y --quiet "$@" ;;
     pacman) $SUDO pacman -Sy --noconfirm --needed "$@" ;;
     zypper) $SUDO zypper --non-interactive install "$@" ;;
+    # brew refuses to run as root, so a sudo'd install still installs formulae
+    # as the invoking user.
+    brew)   if [ "$(id -u)" -eq 0 ] && [ -n "${SUDO_USER:-}" ]; then
+              sudo -u "$SUDO_USER" brew install "$@"
+            else
+              brew install "$@"
+            fi ;;
+    none)   warn "Brak Homebrew — zainstaluj go (https://brew.sh) albo doloz recznie: $*"; return 1 ;;
     *)      warn "Nieznany menedzer pakietow — zainstaluj recznie: $*"; return 1 ;;
   esac
 }
@@ -116,10 +146,23 @@ pm_install() {
 # long after the service was enabled) into a refusal that names the reason.
 MIN_GLIBC=2.35
 MIN_GLIBCXX=3.4.30
+MIN_MACOS=14.0
 
 version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
 
 check_libc_floor() {
+  if [ "$OS" = "macos" ]; then
+    # The artifact is built on the macos-14 runner, so 14.0 is the deployment
+    # floor; older systems reject the binary at load time with a dyld error.
+    macver=$(sw_vers -productVersion 2>/dev/null || echo "")
+    case "$macver" in
+      [0-9]*) version_ge "$macver" "$MIN_MACOS" \
+                || die "Ten Mac ma macOS $macver, a paczka wymaga $MIN_MACOS lub nowszego." ;;
+      *) warn "Nie odczytalem wersji macOS — pomijam kontrole zgodnosci." ;;
+    esac
+    ok "Zgodnosc: macOS $macver"
+    return 0
+  fi
   glibc=$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')
   case "$glibc" in
     [0-9]*) ;;
@@ -155,10 +198,17 @@ check_libc_floor() {
 # real Vulkan one, while the integrated chip in a thin laptop is neither — and
 # unified memory means VRAM size does not separate them either.
 detect_edition() {
+  if [ "$OS" = "macos" ]; then
+    # Every Apple Silicon Mac has a usable GPU and the Metal/MLX engines are
+    # part of the full edition, so the proposal is full regardless of model.
+    GPU_DESC="Apple Silicon: $(sysctl -n machdep.cpu.brand_string 2>/dev/null || echo 'GPU Metal')"
+    PROPOSED=full
+    return
+  fi
   if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
     GPU_DESC="NVIDIA: $(nvidia-smi -L 2>/dev/null | head -1)"
     PROPOSED=full
-  elif [ -d /sys/class/drm ] && ls /sys/class/drm 2>/dev/null | grep -q '^card[0-9]'; then
+  elif [ -e /sys/class/drm/card0 ]; then
     GPU_DESC="GPU obecne (AMD/Intel — sciezka Vulkan)"
     PROPOSED=full
   else
@@ -169,6 +219,19 @@ detect_edition() {
 
 choose_edition() {
   detect_edition
+  # macOS has one edition. The MLX engines come in through a per-target
+  # dependency block that --no-default-features does not switch off, so a "slim"
+  # macOS build would ship the same engines under a name that promises none —
+  # there is no such asset, and offering the choice would be a lie.
+  if [ "$OS" = "macos" ]; then
+    case "${EDITION:-full}" in
+      full|"") EDITION=full ;;
+      slim) die "Edycja slim nie jest budowana dla macOS (silniki MLX sa wkompilowane w ten target)." ;;
+      *) die "Nieznana edycja '$EDITION' (na macOS dostepna jest tylko: full)" ;;
+    esac
+    ok "Edycja: full (Metal/MLX)"
+    return
+  fi
   if [ -n "$EDITION" ]; then
     ok "Edycja z TENTAFLOW_EDITION: $EDITION"
     return
@@ -220,12 +283,20 @@ install_runtime_deps() {
              vulkan-icd-loader || warn "Czesc pakietow sie nie zainstalowala." ;;
       zypper) pm_install gstreamer gstreamer-plugins-base gstreamer-plugins-good \
              libvulkan1 || warn "Czesc pakietow sie nie zainstalowala." ;;
+      # macOS needs no Vulkan loader (inference is Metal/MLX) — only GStreamer,
+      # which the camera pipeline links against.
+      brew) pm_install gstreamer || warn "Instalacja GStreamera przez brew nieudana." ;;
+      none) warn "Brak Homebrew — zainstaluj GStreamer recznie (brew install gstreamer)." ;;
       *) warn "Nieznany menedzer pakietow — zainstaluj GStreamer + pluginy i loader Vulkana recznie." ;;
     esac
   fi
 
   if ! command -v docker >/dev/null 2>&1; then
-    if [ "$WITH_DOCKER" = "1" ]; then
+    if [ "$WITH_DOCKER" = "1" ] && [ "$OS" = "macos" ]; then
+      # Docker Desktop is a GUI app with a licence to accept; get.docker.com is
+      # Linux-only and installing a cask silently is not our call.
+      warn "Na macOS zainstaluj Docker Desktop recznie: https://docker.com/products/docker-desktop"
+    elif [ "$WITH_DOCKER" = "1" ]; then
       log "Instaluje Docker Engine"
       curl -fsSL https://get.docker.com | $SUDO sh || warn "Instalacja Dockera nieudana."
       $SUDO systemctl enable --now docker 2>/dev/null || true
@@ -353,6 +424,12 @@ EOF
 
 create_service_user() {
   [ "$USER_INSTALL" = "1" ] && return
+  if [ "$OS" = "macos" ]; then
+    # No service account is created: the daemon runs as the installing user
+    # (SERVICE_USER), so the data directory simply has to belong to them.
+    $SUDO chown -R "$SERVICE_USER" "$DATA_DIR" "$CONFIG_DIR" 2>/dev/null || true
+    return
+  fi
   if ! id "$SERVICE_USER" >/dev/null 2>&1; then
     log "Tworze uzytkownika systemowego $SERVICE_USER"
     $SUDO useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER" \
@@ -365,8 +442,54 @@ create_service_user() {
   $SUDO chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$CONFIG_DIR" 2>/dev/null || true
 }
 
+# launchd, not systemd: on macOS a LaunchAgent waits for a login, so a server
+# that must come up with the machine is a LaunchDaemon. The per-user install
+# keeps an agent, which is exactly what its scope means.
+register_launchd() {
+  template="$PREFIX/current/ai.tentaflow.plist.in"
+  [ -f "$template" ] || die "Brak szablonu launchd w archiwum: $template"
+
+  if [ "$SERVICE_SCOPE" = "user" ]; then
+    plist="$HOME/Library/LaunchAgents/ai.tentaflow.plist"
+    logdir="$HOME/Library/Logs/TentaFlow"
+    domain="gui/$(id -u)"
+    userblock=""
+    mkdir -p "$(dirname "$plist")" "$logdir"
+  else
+    plist="/Library/LaunchDaemons/ai.tentaflow.plist"
+    logdir="/usr/local/var/log/tentaflow"
+    domain="system"
+    userblock="  <key>UserName</key><string>$SERVICE_USER</string>"
+    $SUDO mkdir -p "$(dirname "$plist")" "$logdir"
+    $SUDO chown "$SERVICE_USER" "$logdir" 2>/dev/null || true
+  fi
+
+  body=$(sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@CONFIG@|$CONFIG|g" \
+             -e "s|@HOME@|$DATA_DIR|g" -e "s|@LOGDIR@|$logdir|g" \
+             -e "s|@USERNAME@|$userblock|g" "$template")
+
+  # bootout first: bootstrap over a loaded service fails with "service already
+  # loaded", which would leave a reinstall running the OLD binary.
+  if [ "$SERVICE_SCOPE" = "user" ]; then
+    launchctl bootout "$domain/ai.tentaflow" 2>/dev/null || true
+    printf '%s\n' "$body" > "$plist"
+    launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap nieudany."
+  else
+    $SUDO launchctl bootout "$domain/ai.tentaflow" 2>/dev/null || true
+    printf '%s\n' "$body" | $SUDO tee "$plist" >/dev/null
+    $SUDO chmod 644 "$plist"
+    $SUDO chown root:wheel "$plist"
+    $SUDO launchctl bootstrap "$domain" "$plist" || die "launchctl bootstrap nieudany."
+  fi
+  ok "Usluga zarejestrowana (launchd, $SERVICE_SCOPE)"
+}
+
 register_service() {
   [ "$NO_AUTOSTART" = "1" ] && { warn "Pomijam rejestracje uslugi (TENTAFLOW_NO_AUTOSTART=1)."; return; }
+  if [ "$OS" = "macos" ]; then
+    register_launchd
+    return
+  fi
   command -v systemctl >/dev/null 2>&1 || { warn "Brak systemd — uruchom recznie: tentaflow"; return; }
 
   template="$PREFIX/current/tentaflow.service.in"
@@ -397,6 +520,13 @@ register_service() {
 }
 
 harden_platform() {
+  if [ "$OS" = "macos" ]; then
+    # An archive that ever passed through a browser or an app carries the
+    # quarantine attribute, and Gatekeeper then kills the unsigned binary and
+    # every dylib next to it with a dialog no daemon can answer.
+    $SUDO xattr -dr com.apple.quarantine "$PREFIX/current" 2>/dev/null || true
+    return
+  fi
   [ "$USER_INSTALL" = "1" ] && return
   # Fedora/RHEL: files unpacked into /opt carry no service context, and SELinux
   # can block the JIT mappings wgpu/ggml need.
@@ -412,6 +542,16 @@ harden_platform() {
 }
 
 stop_if_running() {
+  if [ "$OS" = "macos" ]; then
+    # A running daemon holds the dylibs it loaded; replacing the version
+    # directory underneath it is how you get a half-updated process.
+    if [ "$SERVICE_SCOPE" = "user" ]; then
+      launchctl bootout "gui/$(id -u)/ai.tentaflow" 2>/dev/null || true
+    else
+      $SUDO launchctl bootout system/ai.tentaflow 2>/dev/null || true
+    fi
+    return 0
+  fi
   command -v systemctl >/dev/null 2>&1 || return 0
   if [ "$SERVICE_SCOPE" = "user" ]; then
     systemctl --user is-active --quiet tentaflow.service 2>/dev/null && {
@@ -433,7 +573,14 @@ stop_if_running() {
 echo ""
 echo "${C_BOLD}Instalator TentaFlow${C_RESET}"
 detect_pm
-echo "${C_DIM}  system:  $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || uname -s) / $PM${C_RESET}"
+if [ -r /etc/os-release ]; then
+  SYSTEM_NAME=$(. /etc/os-release; echo "${PRETTY_NAME:-$(uname -s)}")
+elif [ "$OS" = "macos" ]; then
+  SYSTEM_NAME="macOS $(sw_vers -productVersion 2>/dev/null || echo '')"
+else
+  SYSTEM_NAME=$(uname -s)
+fi
+echo "${C_DIM}  system:  $SYSTEM_NAME / $PM${C_RESET}"
 echo "${C_DIM}  prefix:  $PREFIX${C_RESET}"
 echo "${C_DIM}  dane:    $DATA_DIR${C_RESET}"
 
