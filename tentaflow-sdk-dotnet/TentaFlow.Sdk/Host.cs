@@ -668,6 +668,361 @@ public sealed class LlmStream
 }
 
 // -----------------------------------------------------------------------------
+// Bus (M3b, PLAN §6.4) — batch publish + handle-based consume over TentaBus.
+//
+// "nigdy per komunikat": `Bus.Publish` always takes a batch of records (up to
+// 1000 / 8 MiB per call — the host's `PayloadKind::BusBatch`); consuming is a
+// handle+batch pattern (open once via `Bus.ConsumeOpen`, drain repeated
+// `NextBatch` calls, `Commit`, `Close`), mirroring `LlmStream`'s shape.
+//
+// Requires the addon manifest to declare "bus.publish" (for `Bus.Publish`)
+// and/or "bus.subscribe" (for the consume quartet) — both fail-closed,
+// per-topic checks the host re-verifies on every `NextBatch` call, not just
+// at `ConsumeOpen`.
+// -----------------------------------------------------------------------------
+
+/// <summary>One record to publish via <see cref="Bus.Publish"/>. Header values
+/// are raw bytes — a caller that wants a text header value encodes it itself.</summary>
+public sealed class BusRecord
+{
+    public byte[]? Key { get; init; }
+    public List<(string Name, byte[] Value)> Headers { get; init; } = new();
+    public byte[] Payload { get; init; } = System.Array.Empty<byte>();
+}
+
+/// <summary>One record returned by <see cref="BusConsumer.NextBatch"/> — carries
+/// the delivery metadata (`Topic`/`Partition`/`Offset`) needed to build the
+/// offsets later passed to <see cref="BusConsumer.Commit"/>.</summary>
+public sealed class BusConsumedRecord
+{
+    public string Topic { get; init; } = "";
+    public uint Partition { get; init; }
+    public ulong Offset { get; init; }
+    public long TimestampMs { get; init; }
+    public byte[]? Key { get; init; }
+    public List<(string Name, byte[] Value)> Headers { get; init; } = new();
+    public byte[] Payload { get; init; } = System.Array.Empty<byte>();
+}
+
+/// <summary>Batch returned by <see cref="BusConsumer.NextBatch"/>. An empty
+/// `Records` list means the long-poll window elapsed with nothing new — a
+/// normal, expected outcome, never an error; call `NextBatch` again.</summary>
+public sealed class BusConsumeBatch
+{
+    public List<BusConsumedRecord> Records { get; init; } = new();
+}
+
+public static class Bus
+{
+    /// <summary>
+    /// Publishes a batch of records to <paramref name="topic"/> in one call
+    /// (up to 1000 records / 8 MiB total, enforced by the host).
+    /// <paramref name="createIfMissing"/> mirrors the `bus_publish` flow
+    /// node's own config field. Returns the number of records actually
+    /// appended.
+    /// </summary>
+    public static uint Publish(string topic, IReadOnlyList<BusRecord> records, bool createIfMissing = false)
+    {
+        var w = new CborWriter(256 + records.Count * 64);
+        w.WriteMapHeader(createIfMissing ? 3 : 2);
+        w.WriteUInt(0);
+        w.WriteText(topic);
+        w.WriteUInt(1);
+        w.WriteArrayHeader(records.Count);
+        foreach (var r in records)
+        {
+            int fieldCount = 2 + (r.Key != null ? 1 : 0);
+            w.WriteMapHeader(fieldCount);
+            if (r.Key != null)
+            {
+                w.WriteUInt(0);
+                w.WriteBytes(r.Key);
+            }
+            w.WriteUInt(1);
+            w.WriteArrayHeader(r.Headers.Count);
+            foreach (var (name, value) in r.Headers)
+            {
+                w.WriteMapHeader(2);
+                w.WriteUInt(0);
+                w.WriteText(name);
+                w.WriteUInt(1);
+                w.WriteBytes(value);
+            }
+            w.WriteUInt(2);
+            w.WriteBytes(r.Payload);
+        }
+        if (createIfMissing)
+        {
+            w.WriteUInt(2);
+            w.WriteBool(true);
+        }
+
+        var result = HostCalls.CallInOut(HostImports.BusPublishV1, w.WrittenSpan);
+        if (result.Code != 0)
+        {
+            throw new HostCallException("bus_publish_v1", result.Code);
+        }
+        return DecodePublishOutput(result.Data);
+    }
+
+    // Wire: CBOR BusPublishOutput {0: published}.
+    internal static uint DecodePublishOutput(byte[] data)
+    {
+        var r = new CborReader(data);
+        int n = r.ReadMapHeader();
+        uint published = 0;
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            if (k == 0)
+            {
+                published = (uint)r.ReadUInt();
+            }
+            else
+            {
+                Value.Decode(r);
+            }
+        }
+        return published;
+    }
+
+    /// <summary>
+    /// Opens a consume handle for <paramref name="group"/> across
+    /// <paramref name="topics"/>. <paramref name="commitMode"/>:
+    /// `"auto_after_success"` (the default when null) | `"explicit"` |
+    /// `"at_most_once"` — same values the `bus_consume` flow node accepts.
+    /// </summary>
+    public static BusConsumer ConsumeOpen(IReadOnlyList<string> topics, string group, string? commitMode = null)
+    {
+        var w = new CborWriter(128);
+        w.WriteMapHeader(commitMode != null ? 3 : 2);
+        w.WriteUInt(0);
+        w.WriteArrayHeader(topics.Count);
+        foreach (var t in topics)
+        {
+            w.WriteText(t);
+        }
+        w.WriteUInt(1);
+        w.WriteText(group);
+        if (commitMode != null)
+        {
+            w.WriteUInt(2);
+            w.WriteText(commitMode);
+        }
+
+        var result = HostCalls.CallInOut(HostImports.BusConsumeOpenV1, w.WrittenSpan);
+        if (result.Code != 0)
+        {
+            throw new HostCallException("bus_consume_open_v1", result.Code);
+        }
+        return new BusConsumer(DecodeConsumeOpenOutput(result.Data));
+    }
+
+    // Wire: CBOR BusConsumeOpenOutput {0: consumer_id}.
+    internal static string DecodeConsumeOpenOutput(byte[] data)
+    {
+        var r = new CborReader(data);
+        int n = r.ReadMapHeader();
+        string consumerId = "";
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            if (k == 0)
+            {
+                consumerId = r.ReadText();
+            }
+            else
+            {
+                Value.Decode(r);
+            }
+        }
+        return consumerId;
+    }
+}
+
+/// <summary>
+/// Handle-based bus consumer over the CBOR batch ABI
+/// (`bus_consume_next/commit/close_v1`). The host force-closes an idle
+/// handle after 300 s of inactivity — call <see cref="Close"/> explicitly
+/// when done rather than relying on the reaper, which exists only to catch
+/// a crashed addon.
+/// </summary>
+public sealed class BusConsumer
+{
+    private readonly string _consumerId;
+    private bool _closed;
+
+    internal BusConsumer(string consumerId)
+    {
+        _consumerId = consumerId;
+    }
+
+    /// <summary>
+    /// Bounded-await poll for the next batch. `maxRecords` and `timeoutMs`
+    /// are clamped by the host (1000 records, 5000 ms). The underlying
+    /// `fetch` is byte-bounded, not record-bounded — the returned count can
+    /// run over or under `maxRecords`; never assume an exact match.
+    /// </summary>
+    public BusConsumeBatch NextBatch(uint maxRecords = 1000, uint timeoutMs = 1000)
+    {
+        var w = new CborWriter(64);
+        w.WriteMapHeader(3);
+        w.WriteUInt(0);
+        w.WriteText(_consumerId);
+        w.WriteUInt(1);
+        w.WriteUInt(maxRecords);
+        w.WriteUInt(2);
+        w.WriteUInt(timeoutMs);
+
+        var result = HostCalls.CallInOut(HostImports.BusConsumeNextV1, w.WrittenSpan);
+        if (result.Code != 0)
+        {
+            throw new HostCallException("bus_consume_next_v1", result.Code);
+        }
+        return DecodeNextBatch(result.Data);
+    }
+
+    // Wire: CBOR BusConsumeNextOutput {0: kind, 1: records}.
+    internal static BusConsumeBatch DecodeNextBatch(byte[] data)
+    {
+        var r = new CborReader(data);
+        int n = r.ReadMapHeader();
+        var records = new List<BusConsumedRecord>();
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            switch (k)
+            {
+                case 0:
+                    r.ReadText(); // "batch" | "empty" — records.Count already distinguishes them
+                    break;
+                case 1:
+                    {
+                        int m = r.ReadArrayHeader();
+                        for (int j = 0; j < m; j++)
+                        {
+                            records.Add(DecodeRecord(r));
+                        }
+                        break;
+                    }
+                default:
+                    Value.Decode(r);
+                    break;
+            }
+        }
+        return new BusConsumeBatch { Records = records };
+    }
+
+    internal static BusConsumedRecord DecodeRecord(CborReader r)
+    {
+        int n = r.ReadMapHeader();
+        string topic = "";
+        uint partition = 0;
+        ulong offset = 0;
+        long timestampMs = 0;
+        byte[]? key = null;
+        var headers = new List<(string, byte[])>();
+        byte[] payload = System.Array.Empty<byte>();
+        for (int i = 0; i < n; i++)
+        {
+            ulong k = r.ReadUInt();
+            switch (k)
+            {
+                case 0: topic = r.ReadText(); break;
+                case 1: partition = (uint)r.ReadUInt(); break;
+                case 2: offset = r.ReadUInt(); break;
+                case 3: timestampMs = r.ReadInt(); break;
+                case 4: key = r.TryReadNull() ? null : r.ReadBytes(); break;
+                case 5:
+                    {
+                        int hm = r.ReadArrayHeader();
+                        for (int j = 0; j < hm; j++)
+                        {
+                            int fn = r.ReadMapHeader();
+                            string name = "";
+                            byte[] value = System.Array.Empty<byte>();
+                            for (int f = 0; f < fn; f++)
+                            {
+                                ulong fk = r.ReadUInt();
+                                if (fk == 0) name = r.ReadText();
+                                else if (fk == 1) value = r.ReadBytes();
+                                else Value.Decode(r);
+                            }
+                            headers.Add((name, value));
+                        }
+                        break;
+                    }
+                case 6: payload = r.ReadBytes(); break;
+                default: Value.Decode(r); break;
+            }
+        }
+        return new BusConsumedRecord
+        {
+            Topic = topic,
+            Partition = partition,
+            Offset = offset,
+            TimestampMs = timestampMs,
+            Key = key,
+            Headers = headers,
+            Payload = payload,
+        };
+    }
+
+    /// <summary>
+    /// Durably advances the committed offset for each `(topic, partition,
+    /// offset)` triple. Required before <see cref="Close"/> under
+    /// `commit_mode = "explicit"` — an unfetched-past offset is silently
+    /// ignored, never rewound.
+    /// </summary>
+    public void Commit(IReadOnlyList<(string Topic, uint Partition, ulong Offset)> offsets)
+    {
+        var w = new CborWriter(64 + offsets.Count * 32);
+        w.WriteMapHeader(2);
+        w.WriteUInt(0);
+        w.WriteText(_consumerId);
+        w.WriteUInt(1);
+        w.WriteArrayHeader(offsets.Count);
+        foreach (var (topic, partition, offset) in offsets)
+        {
+            w.WriteMapHeader(3);
+            w.WriteUInt(0);
+            w.WriteText(topic);
+            w.WriteUInt(1);
+            w.WriteUInt(partition);
+            w.WriteUInt(2);
+            w.WriteUInt(offset);
+        }
+
+        var result = HostCalls.CallInOut(HostImports.BusConsumeCommitV1, w.WrittenSpan);
+        if (result.Code != 0)
+        {
+            throw new HostCallException("bus_consume_commit_v1", result.Code);
+        }
+    }
+
+    /// <summary>Drops the consumer handle. Subsequent `NextBatch`/`Commit`
+    /// calls throw `NotFound`. Idempotent — a second `Close` is a no-op.</summary>
+    public void Close()
+    {
+        if (_closed)
+        {
+            return;
+        }
+        _closed = true;
+        var w = new CborWriter(48);
+        w.WriteMapHeader(1);
+        w.WriteUInt(0);
+        w.WriteText(_consumerId);
+
+        var result = HostCalls.CallInOut(HostImports.BusConsumeCloseV1, w.WrittenSpan);
+        if (result.Code != 0 && result.Code != (int)AbiError.NotFound)
+        {
+            throw new HostCallException("bus_consume_close_v1", result.Code);
+        }
+    }
+}
+
+// -----------------------------------------------------------------------------
 // STT (speech-to-text)
 // -----------------------------------------------------------------------------
 
