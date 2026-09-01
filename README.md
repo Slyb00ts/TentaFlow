@@ -329,7 +329,55 @@ The phone's camera, depth sensor, IMU and GPS can also feed the mesh as a roamin
 
 ## Getting started
 
-### Prerequisites
+### Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+```
+
+The installer asks which edition to install, because hardware alone cannot answer it:
+the integrated GB10 in a DGX Spark is a real CUDA target and a Strix Halo a real Vulkan
+one, while the integrated chip in a thin laptop is neither — and with unified memory the
+reported VRAM does not separate them.
+
+| Edition | Contains | Catalog |
+|---------|----------|---------|
+| `full` | llama.cpp (Vulkan / Metal), whisper, vision, TTS, diarization | everything |
+| `slim` | gateway, mesh, flows, dashboard, addons, containers | cloud providers + utility infra, no local engines |
+
+`slim` is for machines whose GPU makes local inference pointless — every native library
+there is only install weight and another runtime dependency. Cloud services (OpenAI,
+Anthropic, …) stay in its catalog; only local model deployment is gone.
+
+It installs into `/opt/tentaflow/versions/<version>` behind a `current` symlink, keeps
+configuration in `/etc/tentaflow` and data in `/var/lib/tentaflow` (neither is touched by
+an update), registers a systemd unit and starts it. macOS installs a **LaunchDaemon** —
+a LaunchAgent would wait for a login, which a server cannot depend on — under
+`/usr/local/{tentaflow,etc,var}`, and is `full` only.
+
+```bash
+tentaflow status          # service state, autostart, PID, config, /health
+tentaflow start | stop | restart
+tentaflow update          # newest GitHub release, checksum-verified, atomic swap
+tentaflow update --check  # only report whether one exists
+```
+
+Installer knobs (all optional): `TENTAFLOW_EDITION=full|slim`, `TENTAFLOW_VERSION=v0.1.0`,
+`TENTAFLOW_BIND=0.0.0.0:8090`, `TENTAFLOW_USER_INSTALL=1` (no sudo, everything under
+`$HOME`, systemd `--user`), `TENTAFLOW_NO_AUTOSTART=1`, `TENTAFLOW_WITH_DOCKER=1`,
+`TENTAFLOW_SKIP_DEPS=1`.
+
+First login is **admin / admin** — change it immediately, especially if you bound to
+`0.0.0.0`. Remove everything with `uninstall.sh` (add `--purge` to delete data and
+configuration as well).
+
+**Supported:** Linux x86_64 with glibc ≥ 2.35 and GLIBCXX ≥ 3.4.30 — Ubuntu 22.04+,
+Debian 12+, Fedora, Arch/CachyOS, RHEL 10+ — and macOS 14+ on Apple Silicon. The
+installer checks this floor before it installs anything. Older systems (RHEL 9,
+Debian 11, Ubuntu 20.04) and Linux aarch64 have to build from source for now; Windows
+is packaged separately.
+
+### Prerequisites (building from source)
 
 **Ubuntu / Debian:** `sudo apt install build-essential pkg-config libssl-dev`
 **Fedora / RHEL:** `sudo dnf install gcc pkg-config openssl-devel`
@@ -358,7 +406,7 @@ cargo install wasm-bindgen-cli --version 0.2.125 --locked   # MUST match the pin
 TLS certs are generated automatically on first build (self-signed EC P-256, pure Rust via `rcgen`);
 drop your own into `certs/cert.pem` + `certs/key.pem` to override.
 
-### Build & run
+### Build from source
 
 ```bash
 cd tentaflow && cargo build --release --features gpu-cuda

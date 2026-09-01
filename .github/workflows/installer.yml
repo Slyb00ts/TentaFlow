@@ -1,0 +1,46 @@
+# =============================================================================
+# File:        .github/workflows/installer.yml
+# Description: Checks the installer on every change to it, rather than only on a
+#              tag. install.sh is 600 lines of POSIX sh that runs as root on
+#              other people's machines and is otherwise exercised only by the
+#              release workflow — far too late to learn about a typo.
+#
+#              The end-to-end install test lives in release.yml (`verify`),
+#              because it needs a built archive; this is the cheap half.
+# =============================================================================
+name: installer
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/install/**'
+      - 'scripts/ci-local/**'
+      - '.github/workflows/installer.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/install/**'
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Syntax
+        run: |
+          for f in scripts/install/install.sh scripts/install/uninstall.sh; do
+            sh -n "$f"
+          done
+          bash -n scripts/ci-local/test-install.sh
+          bash -n scripts/ci-local/check-install-templates.sh
+
+      - name: ShellCheck
+        uses: ludeeus/action-shellcheck@master
+        with:
+          scandir: './scripts/install'
+          severity: warning
+          additional_files: 'install.sh uninstall.sh'
+
+      - name: Every template placeholder is substituted
+        run: scripts/ci-local/check-install-templates.sh
