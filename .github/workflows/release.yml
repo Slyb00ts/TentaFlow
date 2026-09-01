@@ -262,8 +262,61 @@ jobs:
             tentaflow-*.tar.gz
             tentaflow-*.tar.gz.sha256
 
-  publish:
+  # ---------------------------------------------------------------------------
+  # verify — install the artifact the way a user will and prove the claims the
+  # README makes: the service registers, autostarts, answers /health, and the
+  # CLI reports it. A GitHub runner has real systemd, so this is the actual
+  # install path, not a simulation of it. It gates publish: an archive that
+  # cannot install is not a release.
+  # ---------------------------------------------------------------------------
+  verify:
+    name: verify (${{ matrix.edition }})
     needs: build
+    runs-on: ubuntu-22.04
+    strategy:
+      fail-fast: false
+      matrix:
+        edition: [full, slim]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          name: tentaflow-${{ matrix.edition }}
+          path: dist
+
+      - name: Install from the archive
+        env:
+          TENTAFLOW_EDITION: ${{ matrix.edition }}
+        run: |
+          ARCHIVE=$(ls dist/*.tar.gz)
+          sudo -E env TENTAFLOW_ASSET_FILE="$PWD/$ARCHIVE" \
+            sh scripts/install/install.sh
+
+      - name: The service must be enabled, running and answering
+        run: |
+          systemctl is-enabled tentaflow.service
+          for _ in $(seq 1 30); do
+            systemctl is-active --quiet tentaflow.service && break
+            sleep 2
+          done
+          systemctl is-active tentaflow.service
+          tentaflow status
+          test -f /etc/tentaflow/config.toml
+          test -f /etc/tentaflow/install-receipt.json
+
+      - name: Dump the journal when it did not come up
+        if: failure()
+        run: sudo journalctl -u tentaflow.service --no-pager -n 200
+
+      - name: Uninstall must leave nothing behind
+        run: |
+          sudo sh scripts/install/uninstall.sh --purge
+          ! systemctl is-enabled tentaflow.service 2>/dev/null
+          test ! -e /opt/tentaflow
+
+  publish:
+    needs: [build, verify]
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v4

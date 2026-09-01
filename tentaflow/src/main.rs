@@ -21,6 +21,7 @@ use tentaflow_core::routing::Router;
 #[cfg(target_os = "macos")]
 mod mlx_swift_init;
 mod receipt;
+mod update;
 mod service;
 
 // =============================================================================
@@ -1652,7 +1653,7 @@ fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
             println!("{}", serde_json::to_string_pretty(&caps)?);
             Ok(())
         }
-        Subcommand::Update { check, force } => run_update(*check, *force),
+        Subcommand::Update { check, force } => update::run(*check, *force),
         Subcommand::VisionWorker {
             worker_id,
             gpu,
@@ -1767,52 +1768,3 @@ fn run_init_config(
     Ok(())
 }
 
-fn run_update(check_only: bool, force: bool) -> Result<()> {
-    use axoupdater::AxoUpdater;
-
-    let mut updater = AxoUpdater::new_for("tentaflow");
-    // Zrodlo: GitHub Releases tego repo (env override w razie potrzeby).
-    updater.set_release_source(axoupdater::ReleaseSource {
-        release_type: axoupdater::ReleaseSourceType::GitHub,
-        owner: std::env::var("TENTAFLOW_REPO_OWNER").unwrap_or_else(|_| "Slyb00ts".to_string()),
-        name: std::env::var("TENTAFLOW_REPO_NAME").unwrap_or_else(|_| "TentaFlow".to_string()),
-        app_name: "tentaflow".to_string(),
-    });
-
-    info!("Sprawdzam najnowsza wersje na GitHub Releases...");
-    let outcome = if check_only {
-        match updater.is_update_needed_sync()? {
-            true => {
-                println!("Dostepna nowa wersja TentaFlow (uruchom: `tentaflow update`)");
-                Ok::<_, anyhow::Error>(())
-            }
-            false => {
-                println!("Aktualna wersja jest najnowsza.");
-                Ok(())
-            }
-        }
-    } else {
-        if force {
-            updater.always_update(true);
-        }
-        match updater.run_sync()? {
-            Some(result) => {
-                let old = result
-                    .old_version
-                    .as_ref()
-                    .map(|v| v.to_string())
-                    .unwrap_or_else(|| "?".into());
-                println!("Zaktualizowano: {} -> {}", old, result.new_version);
-                println!(
-                    "Restartuj usluge: systemctl restart tentaflow  (lub launchctl unload/load)."
-                );
-                Ok(())
-            }
-            None => {
-                println!("Brak nowej wersji do pobrania.");
-                Ok(())
-            }
-        }
-    };
-    outcome.map_err(|e| anyhow::anyhow!("Update nieudany: {}", e))
-}

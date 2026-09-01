@@ -108,6 +108,46 @@ pm_install() {
 }
 
 # =============================================================================
+# Portability floor
+# =============================================================================
+# The release is linked on Ubuntu 22.04, so the glibc and libstdc++ it was built
+# against are the floor for every machine that installs it. Checking here turns
+# an unrunnable binary ("version `GLIBCXX_3.4.30' not found" on the first start,
+# long after the service was enabled) into a refusal that names the reason.
+MIN_GLIBC=2.35
+MIN_GLIBCXX=3.4.30
+
+version_ge() { [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]; }
+
+check_libc_floor() {
+  glibc=$(ldd --version 2>/dev/null | head -1 | awk '{print $NF}')
+  case "$glibc" in
+    [0-9]*) ;;
+    *) warn "Nie udalo sie odczytac wersji glibc — pomijam kontrole zgodnosci."; return 0 ;;
+  esac
+  version_ge "$glibc" "$MIN_GLIBC" || die \
+"Ten system ma glibc $glibc, a paczka jest zbudowana pod glibc >= $MIN_GLIBC.
+   Obslugiwane: Ubuntu 22.04+, Debian 12+, Fedora 38+, RHEL 10+, Arch/CachyOS.
+   Na starszych (RHEL 9, Debian 11, Ubuntu 20.04) trzeba zbudowac ze zrodel."
+
+  # libstdc++ ships its ABI versions as symbols in the .so; the newest GLIBCXX_*
+  # it defines is what the binary can demand.
+  libcxx=$(ldconfig -p 2>/dev/null | awk '/libstdc\+\+\.so\.6/ {print $NF; exit}')
+  [ -n "$libcxx" ] && [ -r "$libcxx" ] || {
+    warn "Nie znalazlem libstdc++.so.6 — pomijam kontrole ABI C++."
+    return 0
+  }
+  # grep -ao, not strings: binutils is not installed everywhere, grep is.
+  have=$(grep -ao 'GLIBCXX_[0-9][0-9.]*' "$libcxx" 2>/dev/null \
+    | sed 's/^GLIBCXX_//; s/\.$//' | sort -V | tail -1)
+  [ -n "$have" ] || { warn "Nie odczytalem wersji GLIBCXX z $libcxx — pomijam."; return 0; }
+  version_ge "$have" "$MIN_GLIBCXX" || die \
+"Ten system ma libstdc++ z GLIBCXX_$have, a paczka wymaga GLIBCXX_$MIN_GLIBCXX.
+   Zainstaluj nowsze libstdc++ (gcc >= 12) albo zbuduj TentaFlow ze zrodel."
+  ok "Zgodnosc ABI: glibc $glibc, GLIBCXX_$have"
+}
+
+# =============================================================================
 # Which edition
 # =============================================================================
 # Hardware detection PROPOSES; the user decides. Reading the GPU is not enough:
@@ -397,6 +437,7 @@ echo "${C_DIM}  system:  $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" 
 echo "${C_DIM}  prefix:  $PREFIX${C_RESET}"
 echo "${C_DIM}  dane:    $DATA_DIR${C_RESET}"
 
+check_libc_floor
 choose_edition
 install_runtime_deps
 download_archive

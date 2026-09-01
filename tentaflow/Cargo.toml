@@ -56,10 +56,12 @@ parking_lot = "0.12"
 # per-instalacja) — ta sama wersja i te same features co w rdzeniu, wiec nie
 # dokladamy osobnego drzewa zaleznosci.
 reqwest = { version = "0.13.3", default-features = false, features = ["json", "rustls", "blocking"] }
-# Self-update — `tentaflow update` pobiera nowsza wersje z GitHub Releases
-# i podmienia biezaca binarke (external updater process — Windows nie blokuje
-# pliku w trakcie kopiowania).
-axoupdater = { version = "0.10.0", features = ["blocking"] }
+# Self-update (`tentaflow update`): weryfikacja sumy kontrolnej wydania oraz
+# rozpakowanie archiwum do nowego katalogu wersji. Te same wersje co w rdzeniu,
+# wiec nie dokladamy osobnego drzewa zaleznosci.
+sha2 = "0.11.0"
+flate2 = "1.1.9"
+tar = "0.4.46"
 
 # MLX inference — tylko na macOS. Implementacja przez Swift bridge
 # (libMLXBridge.dylib + mlx-swift_Cmlx.bundle) — patrz build.rs i

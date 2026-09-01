@@ -129,6 +129,32 @@ fn systemd_property(manager: Manager, property: &str) -> Option<String> {
     }
 }
 
+/// Whether the service is running right now. Absent manager or absent unit is
+/// "not running" rather than an error: `update` uses this only to decide
+/// whether it owes the machine a restart afterwards.
+pub fn is_active() -> bool {
+    let Some(manager) = detect() else {
+        return false;
+    };
+    match manager {
+        Manager::SystemdSystem | Manager::SystemdUser => {
+            let mut cmd = Command::new("systemctl");
+            if manager == Manager::SystemdUser {
+                cmd.arg("--user");
+            }
+            cmd.args(["is-active", "--quiet", UNIT])
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        }
+        Manager::Launchd => Command::new("launchctl")
+            .args(["list", LAUNCHD_LABEL])
+            .output()
+            .map(|o| o.status.success())
+            .unwrap_or(false),
+    }
+}
+
 pub fn start() -> Result<()> {
     match detect().ok_or_else(not_installed)? {
         m @ (Manager::SystemdSystem | Manager::SystemdUser) => {

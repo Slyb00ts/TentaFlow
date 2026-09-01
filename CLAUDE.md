@@ -79,6 +79,37 @@ analysis engine, the flow vision node, local CV and the inference batcher, and o
 first of those is camera-bound. Keeping them under the camera-gated module made every
 non-camera build fail.
 
+## Release, install and update
+
+`.github/workflows/release.yml` builds on **ubuntu-22.04**, not `ubuntu-latest`: the glibc a
+binary links against is the floor for every machine that installs it (22.04 → 2.35; 24.04 would
+demand 2.39 and lock out Debian 12). `install.sh` refuses to install below that floor
+(glibc 2.35 / GLIBCXX 3.4.30) instead of leaving an unrunnable service enabled.
+
+Three pieces share ONE contract and must change together:
+
+- asset name `tentaflow-<tag>-<target>-<edition>.tar.gz` (+ `.sha256`) — produced by
+  release.yml, consumed by `install.sh` and `tentaflow/src/update.rs`;
+- layout `<prefix>/versions/<ver>` behind a `current` symlink, swapped by rename (never
+  unlink-then-link) — an update replaces the WHOLE version directory, because the binary and
+  its bundled `libwhisper_tf.so` / `libzvec_c_api.so` are only valid together;
+- `install-receipt.json` (`receipt.rs`) — field names are the wire contract with the installer;
+  renaming one silently degrades every installed binary to the no-receipt path.
+
+The config is written by `tentaflow init-config`, never composed in shell: `NodeConfig` has
+sections without `serde(default)`, so a partial TOML fails to parse. `--bind` pins all THREE
+listeners (openai_api, quic, health_check_bind) — the health endpoint answers without auth and
+must not stay on 0.0.0.0 when the API moved to loopback.
+
+The version resolver reads `/releases`, not `/releases/latest`, which hides pre-releases (every
+tag so far is `-alpha`); a pre-release sorts BELOW the same version without one, or `update`
+would offer a downgrade. A missing or mismatched checksum is fatal in both paths.
+
+Local verification without burning CI: `scripts/ci-local/native-libs-in-docker.sh`,
+`build-release-in-docker.sh`, and `test-install.sh <archive> [ubuntu:22.04|debian:12|fedora:41|archlinux|all]`,
+which runs the installer under real systemd — "starts with the system" cannot be tested without
+it. In CI the `verify` job does the same on the runner and gates `publish`.
+
 ## Configuration
 
 `--config <toml>`. Sections: `[server]`, `[server.mtls]`, `[server.tls]`, `[protocols.quic]`,

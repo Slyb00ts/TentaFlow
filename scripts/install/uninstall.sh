@@ -12,7 +12,12 @@
 set -eu
 
 PURGE=0
-[ "${1:-}" = "--purge" ] && PURGE=1
+for arg in "$@"; do
+  case "$arg" in
+    --purge) PURGE=1 ;;
+    *) echo "nieznany argument: $arg (uzycie: uninstall.sh [--purge])" >&2; exit 2 ;;
+  esac
+done
 
 if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
 

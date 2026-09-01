@@ -76,13 +76,6 @@ impl InstallReceipt {
         None
     }
 
-    /// Binary that the installed service actually runs. Goes through the
-    /// `current` symlink, so it keeps pointing at the live version after an
-    /// update swaps the directory underneath.
-    pub fn binary(&self) -> PathBuf {
-        self.prefix.join("current").join("tentaflow")
-    }
-
     pub fn write(&self, path: &Path) -> anyhow::Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
