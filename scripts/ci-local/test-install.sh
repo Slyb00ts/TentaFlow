@@ -84,6 +84,8 @@ docker exec "$NAME" bash -c '
   ls -l /opt/tentaflow/current
   test -f /etc/tentaflow/config.toml && echo "config ok"
   test -f /etc/tentaflow/install-receipt.json && echo "receipt ok"
+  echo "--- health (asercja, nie sama linia statusu)"
+  curl -fsk https://127.0.0.1:8090/health >/dev/null && echo "health ok"
   echo "--- tentaflow status"
   tentaflow status || true
 '

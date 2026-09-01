@@ -230,10 +230,41 @@ extern "C" {
     fn libc_getuid() -> u32;
 }
 
-/// Resolves the dashboard base URL from the installed configuration. Falls back
-/// to the documented default port when no config file is readable — a status
-/// command must still say something useful on a half-installed machine.
-fn dashboard_url(receipt: Option<&InstallReceipt>) -> (String, Option<PathBuf>) {
+/// Where the dashboard is, and where to actually knock for `/health`.
+///
+/// These are two different URLs on purpose. The one printed is for a human, so
+/// it says `localhost`; the one probed is built from the configured bind
+/// address, because `localhost` may resolve to `::1` while the server listens
+/// on 127.0.0.1 — a machine where that happens would report a healthy service
+/// as dead (containers routinely do).
+struct Endpoint {
+    display: String,
+    probe: String,
+    config: Option<PathBuf>,
+}
+
+fn probe_url(bind: &str) -> String {
+    let (host, port) = match bind.rsplit_once(':') {
+        Some((h, p)) => (h.trim_matches(['[', ']']), p),
+        None => ("127.0.0.1", "8090"),
+    };
+    // A wildcard bind is not an address to connect to; loopback is.
+    let host = match host {
+        "0.0.0.0" | "" => "127.0.0.1",
+        "::" => "::1",
+        other => other,
+    };
+    if host.contains(':') {
+        format!("https://[{host}]:{port}")
+    } else {
+        format!("https://{host}:{port}")
+    }
+}
+
+/// Resolves the endpoint from the installed configuration. Falls back to the
+/// documented default port when no config file is readable — a status command
+/// must still say something useful on a half-installed machine.
+fn dashboard_url(receipt: Option<&InstallReceipt>) -> Endpoint {
     for path in config_candidates(receipt) {
         if !path.exists() {
             continue;
@@ -241,10 +272,18 @@ fn dashboard_url(receipt: Option<&InstallReceipt>) -> (String, Option<PathBuf>) 
         if let Ok(cfg) = tentaflow_core::config::NodeConfig::from_file(&path) {
             let bind = cfg.protocols.openai_api.bind.clone();
             let port = bind.rsplit(':').next().unwrap_or("8090").to_string();
-            return (format!("https://localhost:{port}"), Some(path));
+            return Endpoint {
+                display: format!("https://localhost:{port}"),
+                probe: probe_url(&bind),
+                config: Some(path),
+            };
         }
     }
-    ("https://localhost:8090".to_string(), None)
+    Endpoint {
+        display: "https://localhost:8090".to_string(),
+        probe: "https://127.0.0.1:8090".to_string(),
+        config: None,
+    }
 }
 
 /// Asks the running server whether it is healthy. `/health` is public (no auth)
@@ -263,7 +302,7 @@ fn health(url: &str) -> Option<bool> {
 pub fn status() -> Result<()> {
     let receipt = InstallReceipt::load();
     let manager = detect();
-    let (url, config_path) = dashboard_url(receipt.as_ref());
+    let endpoint = dashboard_url(receipt.as_ref());
 
     println!("TentaFlow {}", env!("CARGO_PKG_VERSION"));
     if let Some(r) = &receipt {
@@ -324,15 +363,37 @@ pub fn status() -> Result<()> {
     if let Some(r) = &receipt {
         println!("  dane:      {}", r.home.display());
     }
-    match config_path {
+    match &endpoint.config {
         Some(p) => println!("  config:    {}", p.display()),
         None => println!("  config:    nie znaleziono (uzyto domyslnego portu)"),
     }
-    println!("  dashboard: {url}");
-    match health(&url) {
+    println!("  dashboard: {}", endpoint.display);
+    match health(&endpoint.probe) {
         Some(true) => println!("  health:    OK"),
         Some(false) => println!("  health:    odpowiedz bledna (serwer wstaje albo jest niesprawny)"),
         None => println!("  health:    brak odpowiedzi"),
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::probe_url;
+
+    #[test]
+    fn adres_sondy_bierze_sie_z_bindu() {
+        assert_eq!(probe_url("127.0.0.1:8090"), "https://127.0.0.1:8090");
+        assert_eq!(probe_url("192.168.1.10:9000"), "https://192.168.1.10:9000");
+    }
+
+    #[test]
+    fn wildcard_zamienia_sie_na_loopback() {
+        assert_eq!(probe_url("0.0.0.0:8090"), "https://127.0.0.1:8090");
+        assert_eq!(probe_url("[::]:8090"), "https://[::1]:8090");
+    }
+
+    #[test]
+    fn ipv6_dostaje_nawiasy() {
+        assert_eq!(probe_url("[::1]:8090"), "https://[::1]:8090");
+    }
 }
