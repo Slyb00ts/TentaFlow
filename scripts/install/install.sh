@@ -590,10 +590,13 @@ install_runtime_deps
 download_archive
 stop_if_running
 install_files
+# Before write_config, which RUNS the freshly unpacked binary: on macOS the
+# quarantine attribute has to be gone by then or Gatekeeper kills that very
+# first invocation.
+harden_platform
 write_config
 create_service_user
 write_receipt
-harden_platform
 register_service
 
 echo ""

@@ -11,7 +11,7 @@
 #          glibc floor) differs per family and none of it is exercised by a
 #          single Ubuntu run.
 #
-# Usage: scripts/ci-local/test-install.sh <archive.tar.gz> [image|all]
+# Usage: EDITION=full|slim scripts/ci-local/test-install.sh <archive.tar.gz> [image|all]
 #        image: ubuntu:22.04 (default) | debian:12 | fedora:41 | archlinux
 # =============================================================================
 set -euo pipefail
@@ -31,7 +31,10 @@ if [ "$IMAGE" = "all" ]; then
   exit "$rc"
 fi
 
-NAME="tentaflow-install-test-$(echo "$IMAGE" | tr ':/' '--')"
+# The edition must match the archive: install.sh downloads nothing here, but it
+# writes the edition into the receipt, and `update` picks the asset from it.
+EDITION="${EDITION:-full}"
+NAME="tentaflow-install-test-$EDITION-$(echo "$IMAGE" | tr ':/' '--')"
 
 # Each family bootstraps systemd differently, and a container image ships none
 # of the tooling install.sh assumes a real machine has.
@@ -72,7 +75,7 @@ done
 docker exec "$NAME" systemctl is-system-running || true
 
 echo "[test-install] instalacja"
-docker exec -e TENTAFLOW_EDITION=full \
+docker exec -e TENTAFLOW_EDITION="$EDITION" \
             -e TENTAFLOW_ASSET_FILE=/srv/tentaflow-test/archive.tar.gz \
             "$NAME" sh /installer/install.sh
 
