@@ -354,7 +354,8 @@ fn receipt_path(receipt: &InstallReceipt) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::Version;
+    use super::*;
+    use std::fs;
 
     #[test]
     fn nowsza_wersja_wygrywa() {
@@ -377,5 +378,103 @@ mod tests {
     #[test]
     fn brakujace_czlony_sa_zerami() {
         assert_eq!(Version::parse("1.2"), Version::parse("1.2.0"));
+    }
+
+    /// Builds an archive shaped like a release asset: one top-level
+    /// `tentaflow-*` directory holding the files.
+    fn make_archive(dir: &Path, name: &str, files: &[(&str, &str)]) -> PathBuf {
+        let root = dir.join(name);
+        fs::create_dir_all(&root).unwrap();
+        for (file, content) in files {
+            fs::write(root.join(file), content).unwrap();
+        }
+        let archive = dir.join(format!("{name}.tar.gz"));
+        let out = fs::File::create(&archive).unwrap();
+        let enc = flate2::write::GzEncoder::new(out, flate2::Compression::fast());
+        let mut tar = tar::Builder::new(enc);
+        tar.append_dir_all(name, &root).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        fs::remove_dir_all(&root).unwrap();
+        archive
+    }
+
+    #[test]
+    fn rozpakowanie_zwraca_katalog_wydania() {
+        let tmp = tempfile::tempdir().unwrap();
+        let archive = make_archive(
+            tmp.path(),
+            "tentaflow-v0.0.3-alpha-x86_64-unknown-linux-gnu-full",
+            &[("tentaflow", "binarka"), ("libzvec_c_api.so", "lib")],
+        );
+        let into = tmp.path().join("out");
+        fs::create_dir_all(&into).unwrap();
+        let dir = unpack(&archive, &into).unwrap();
+        assert!(dir.join("tentaflow").is_file());
+        assert!(dir.join("libzvec_c_api.so").is_file());
+    }
+
+    #[test]
+    fn archiwum_bez_katalogu_wydania_jest_odrzucane() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stray = tmp.path().join("stray");
+        fs::create_dir_all(&stray).unwrap();
+        fs::write(stray.join("tentaflow"), "binarka").unwrap();
+        let archive = tmp.path().join("bad.tar.gz");
+        let enc = flate2::write::GzEncoder::new(
+            fs::File::create(&archive).unwrap(),
+            flate2::Compression::fast(),
+        );
+        let mut tar = tar::Builder::new(enc);
+        tar.append_dir_all("stray", &stray).unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+
+        let into = tmp.path().join("out");
+        fs::create_dir_all(&into).unwrap();
+        assert!(unpack(&archive, &into).is_err());
+    }
+
+    #[test]
+    fn suma_kontrolna_zgadza_sie_z_sha256sum() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file = tmp.path().join("plik");
+        fs::write(&file, b"tentaflow").unwrap();
+        // sha256("tentaflow") per coreutils sha256sum — the digest the release
+        // .sha256 files are made with.
+        assert_eq!(
+            sha256_of(&file).unwrap(),
+            "3c2cd2412335000ff0431dfc2d6b10627d98adf652610201f186592e8ead52bb"
+        );
+    }
+
+    #[test]
+    fn podmiana_symlinku_nigdy_nie_zostawia_pustego_current() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        let old = prefix.join("versions/0.0.1");
+        let new = prefix.join("versions/0.0.2");
+        fs::create_dir_all(&old).unwrap();
+        fs::create_dir_all(&new).unwrap();
+
+        swap_current(prefix, &old).unwrap();
+        assert_eq!(fs::read_link(prefix.join("current")).unwrap(), old);
+
+        // The second swap goes over an existing symlink, which is the case that
+        // an unlink-then-link implementation gets wrong.
+        swap_current(prefix, &new).unwrap();
+        assert_eq!(fs::read_link(prefix.join("current")).unwrap(), new);
+        assert!(!prefix.join("current.new").exists());
+    }
+
+    #[test]
+    fn przycinanie_zostawia_wskazane_wersje() {
+        let tmp = tempfile::tempdir().unwrap();
+        let prefix = tmp.path();
+        for v in ["0.0.1", "0.0.2", "0.0.3"] {
+            fs::create_dir_all(prefix.join("versions").join(v)).unwrap();
+        }
+        prune_versions(prefix, &["0.0.3", "0.0.2"]);
+        assert!(prefix.join("versions/0.0.3").exists());
+        assert!(prefix.join("versions/0.0.2").exists());
+        assert!(!prefix.join("versions/0.0.1").exists());
     }
 }
