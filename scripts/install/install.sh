@@ -1,550 +1,426 @@
-#!/usr/bin/env sh
+#!/bin/sh
 # =============================================================================
 # File:        install.sh
-# Description: Zero-touch installer for TentaFlow on Linux and macOS.
-#              Checks + installs all runtime dependencies:
-#                - Docker Engine + Buildx (BuildKit)
-#                - Python 3.10+ with venv + pip (for Python-bundle engines)
-#                - curl, tar, systemd/launchd
-#              Detects package manager (apt / dnf / pacman / zypper / brew)
-#              and installs missing pieces non-interactively. User can skip
-#              individual checks with env flags if they know what they're doing.
+# Description: Installs TentaFlow from GitHub Releases on Linux.
 #
 # Usage:
-#   curl -fsSL https://github.com/Slyb00ts/TentaFlow/releases/latest/download/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/Slyb00ts/TentaFlow/main/scripts/install/install.sh | sh
+#
+# The bootstrap URL points at the repository, not at a release asset: a tag with
+# an -alpha/-beta/-rc suffix is published as a pre-release, and GitHub's
+# `releases/latest` skips those — the installer would fetch itself from a stale
+# release, or fail outright on a repository that has only pre-releases.
+#
+# Layout:
+#   /opt/tentaflow/versions/<ver>   binaries + our shared libraries
+#   /opt/tentaflow/current          symlink to the live version (atomic swap)
+#   /usr/local/bin/tentaflow        symlink into PATH
+#   /etc/tentaflow/config.toml      configuration, never overwritten on update
+#   /etc/tentaflow/install-receipt.json  what was installed and how
+#   /var/lib/tentaflow              TENTAFLOW_HOME: data, TLS identity, SQLite
 #
 # Environment overrides:
-#   TENTAFLOW_VERSION=v0.1.0         # install a specific version instead of latest
-#   TENTAFLOW_PREFIX=/opt/tentaflow  # install prefix (default shown)
-#   TENTAFLOW_USER_INSTALL=1         # no sudo, install under ~/.local/share/tentaflow
-#   TENTAFLOW_NO_AUTOSTART=1         # skip systemd/launchd registration
-#   TENTAFLOW_SKIP_DEPS=1            # skip all dep installation (you're on your own)
-#   TENTAFLOW_SKIP_DOCKER=1          # skip Docker install check
-#   TENTAFLOW_SKIP_PYTHON=1          # skip Python install check
-#   TENTAFLOW_SKIP_VISION=1          # skip ONNX Runtime (SuperTonic TTS) install check
-#   TENTAFLOW_NO_GROUP=1             # skip adding user to docker group (Linux)
-#   TENTAFLOW_ORT_VERSION=1.24.0     # ONNX Runtime version for the tarball fallback
+#   TENTAFLOW_EDITION=full|slim      skip the interactive question
+#   TENTAFLOW_VERSION=v0.1.0         install a specific version
+#   TENTAFLOW_BIND=0.0.0.0:8090      listen address (default 127.0.0.1:8090)
+#   TENTAFLOW_PREFIX=/opt/tentaflow  install prefix
+#   TENTAFLOW_ASSET_FILE=/path.tgz   install a local archive (CI / offline)
+#   TENTAFLOW_USER_INSTALL=1         no sudo, everything under $HOME
+#   TENTAFLOW_NO_AUTOSTART=1         do not register or start the service
+#   TENTAFLOW_WITH_DOCKER=1          install Docker Engine if missing
+#   TENTAFLOW_SKIP_DEPS=1            install no system packages
 # =============================================================================
-
 set -eu
 
 REPO="Slyb00ts/TentaFlow"
+TARGET="x86_64-unknown-linux-gnu"
 VERSION="${TENTAFLOW_VERSION:-latest}"
+EDITION="${TENTAFLOW_EDITION:-}"
+BIND="${TENTAFLOW_BIND:-127.0.0.1:8090}"
 USER_INSTALL="${TENTAFLOW_USER_INSTALL:-0}"
 NO_AUTOSTART="${TENTAFLOW_NO_AUTOSTART:-0}"
+WITH_DOCKER="${TENTAFLOW_WITH_DOCKER:-0}"
 SKIP_DEPS="${TENTAFLOW_SKIP_DEPS:-0}"
-SKIP_DOCKER="${TENTAFLOW_SKIP_DOCKER:-0}"
-SKIP_PYTHON="${TENTAFLOW_SKIP_PYTHON:-0}"
-SKIP_VISION="${TENTAFLOW_SKIP_VISION:-0}"
-NO_GROUP="${TENTAFLOW_NO_GROUP:-0}"
-ORT_VERSION="${TENTAFLOW_ORT_VERSION:-1.24.0}"
-VISION_NEEDS_TARBALL=0
+ASSET_FILE="${TENTAFLOW_ASSET_FILE:-}"
+SERVICE_USER="tentaflow"
 
-# ---- Colors (opt-out if not a TTY) ----
+if [ "$USER_INSTALL" = "1" ]; then
+  PREFIX="${TENTAFLOW_PREFIX:-$HOME/.local/share/tentaflow}"
+  CONFIG_DIR="$HOME/.config/tentaflow"
+  DATA_DIR="$HOME/.local/share/tentaflow/data"
+  BIN_DIR="$HOME/.local/bin"
+  SUDO=""
+  SERVICE_SCOPE="user"
+  SERVICE_USER="$(id -un)"
+else
+  PREFIX="${TENTAFLOW_PREFIX:-/opt/tentaflow}"
+  CONFIG_DIR="/etc/tentaflow"
+  DATA_DIR="/var/lib/tentaflow"
+  BIN_DIR="/usr/local/bin"
+  SERVICE_SCOPE="system"
+  if [ "$(id -u)" -eq 0 ]; then SUDO=""; else SUDO="sudo"; fi
+fi
+CONFIG="$CONFIG_DIR/config.toml"
+RECEIPT="$CONFIG_DIR/install-receipt.json"
+
 if [ -t 1 ] && [ "${NO_COLOR:-0}" = "0" ]; then
-  C_BOLD="$(printf '\033[1m')"
-  C_DIM="$(printf '\033[2m')"
-  C_RED="$(printf '\033[0;31m')"
-  C_GREEN="$(printf '\033[0;32m')"
-  C_YELLOW="$(printf '\033[0;33m')"
-  C_BLUE="$(printf '\033[0;34m')"
+  C_BOLD="$(printf '\033[1m')"; C_DIM="$(printf '\033[2m')"
+  C_RED="$(printf '\033[0;31m')"; C_GREEN="$(printf '\033[0;32m')"
+  C_YELLOW="$(printf '\033[0;33m')"; C_BLUE="$(printf '\033[0;34m')"
   C_RESET="$(printf '\033[0m')"
 else
   C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_RESET=""
 fi
-
 log()  { printf "%s==>%s %s\n" "$C_BLUE" "$C_RESET" "$*"; }
-ok()   { printf "%s ✓%s %s\n" "$C_GREEN" "$C_RESET" "$*"; }
-warn() { printf "%s ⚠%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
-err()  { printf "%s ✗%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; }
+ok()   { printf "%s  ok%s %s\n" "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf "%s  !!%s %s\n" "$C_YELLOW" "$C_RESET" "$*" >&2; }
+die()  { printf "%s  xx%s %s\n" "$C_RED" "$C_RESET" "$*" >&2; exit 1; }
 
-# ---- Platform detection ----
-detect_target() {
-  os=$(uname -s | tr '[:upper:]' '[:lower:]')
-  arch=$(uname -m)
-  case "$os" in
-    linux)
-      case "$arch" in
-        x86_64|amd64)  echo "x86_64-unknown-linux-gnu" ;;
-        aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
-        *) echo "unsupported_arch:$arch" ;;
-      esac ;;
-    darwin)
-      case "$arch" in
-        arm64|aarch64) echo "aarch64-apple-darwin" ;;
-        x86_64)        echo "x86_64-apple-darwin" ;;
-        *) echo "unsupported_arch:$arch" ;;
-      esac ;;
-    *) echo "unsupported_os:$os" ;;
-  esac
-}
+[ "$(uname -s)" = "Linux" ] || die "Ten instalator obsluguje na razie tylko Linux x86_64."
+[ "$(uname -m)" = "x86_64" ] || die "Ten instalator obsluguje na razie tylko x86_64 (wykryto: $(uname -m))."
 
+# =============================================================================
+# Package manager
+# =============================================================================
 detect_pm() {
-  case "$(uname -s)" in
-    Darwin) echo "brew"; return ;;
-    Linux)
-      if command -v apt-get >/dev/null 2>&1; then echo "apt";
-      elif command -v dnf >/dev/null 2>&1;      then echo "dnf";
-      elif command -v pacman >/dev/null 2>&1;   then echo "pacman";
-      elif command -v zypper >/dev/null 2>&1;   then echo "zypper";
-      else echo "unknown"; fi ;;
-    *) echo "unknown" ;;
-  esac
+  for pm in apt-get dnf pacman zypper; do
+    if command -v "$pm" >/dev/null 2>&1; then
+      case "$pm" in
+        apt-get) PM=apt ;; *) PM="$pm" ;;
+      esac
+      return
+    fi
+  done
+  PM=unknown
 }
-
-TARGET=$(detect_target)
-case "$TARGET" in unsupported_*)
-  err "TentaFlow does not support $TARGET — install manually from the Releases page."
-  exit 1 ;;
-esac
-
-PM=$(detect_pm)
-
-if [ "$USER_INSTALL" = "1" ]; then
-  PREFIX="${TENTAFLOW_PREFIX:-$HOME/.local/share/tentaflow}"
-  BIN_DIR="$HOME/.local/bin"
-  SUDO=""
-else
-  PREFIX="${TENTAFLOW_PREFIX:-/opt/tentaflow}"
-  BIN_DIR="/usr/local/bin"
-  SUDO=$(command -v sudo >/dev/null 2>&1 && [ "$(id -u)" != "0" ] && echo sudo || echo "")
-fi
-
-# =============================================================================
-# Dependency management
-# =============================================================================
 
 pm_install() {
-  # Install a list of packages non-interactively with the detected PM.
-  pkgs="$*"
+  [ "$SKIP_DEPS" = "1" ] && { warn "TENTAFLOW_SKIP_DEPS=1 — pomijam: $*"; return 0; }
   case "$PM" in
     apt)
-      $SUDO DEBIAN_FRONTEND=noninteractive apt-get update -qq
-      $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs ;;
-    dnf)     $SUDO dnf install -y --quiet $pkgs ;;
-    pacman)  $SUDO pacman -Sy --noconfirm --needed $pkgs ;;
-    zypper)  $SUDO zypper --non-interactive install $pkgs ;;
-    brew)    brew install $pkgs ;;
-    *)       warn "Unknown package manager — install $pkgs manually"; return 1 ;;
+      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get update -qq
+      $SUDO env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq "$@" ;;
+    dnf)    $SUDO dnf install -y --quiet "$@" ;;
+    pacman) $SUDO pacman -Sy --noconfirm --needed "$@" ;;
+    zypper) $SUDO zypper --non-interactive install "$@" ;;
+    *)      warn "Nieznany menedzer pakietow — zainstaluj recznie: $*"; return 1 ;;
   esac
 }
 
-# ---- curl + tar (required to even fetch tentaflow) ----
-check_base_tools() {
-  missing=""
-  command -v curl >/dev/null 2>&1 || missing="$missing curl"
-  command -v tar  >/dev/null 2>&1 || missing="$missing tar"
-  if [ -n "$missing" ]; then
-    log "Installing base tools:$missing"
-    pm_install $missing || { err "Cannot install base tools — install manually:$missing"; exit 1; }
+# =============================================================================
+# Which edition
+# =============================================================================
+# Hardware detection PROPOSES; the user decides. Reading the GPU is not enough:
+# an integrated GB10 on a DGX Spark is a real CUDA target and a Strix Halo is a
+# real Vulkan one, while the integrated chip in a thin laptop is neither — and
+# unified memory means VRAM size does not separate them either.
+detect_edition() {
+  if command -v nvidia-smi >/dev/null 2>&1 && nvidia-smi -L >/dev/null 2>&1; then
+    GPU_DESC="NVIDIA: $(nvidia-smi -L 2>/dev/null | head -1)"
+    PROPOSED=full
+  elif [ -d /sys/class/drm ] && ls /sys/class/drm 2>/dev/null | grep -q '^card[0-9]'; then
+    GPU_DESC="GPU obecne (AMD/Intel — sciezka Vulkan)"
+    PROPOSED=full
+  else
+    GPU_DESC="brak GPU"
+    PROPOSED=slim
   fi
-  ok "Base tools (curl, tar) present"
 }
 
-# ---- Docker Engine + Buildx (BuildKit) ----
-check_docker() {
-  if [ "$SKIP_DOCKER" = "1" ]; then
-    warn "Docker check skipped (TENTAFLOW_SKIP_DOCKER=1). Deploys will fail until you install Docker manually."
-    return 0
+choose_edition() {
+  detect_edition
+  if [ -n "$EDITION" ]; then
+    ok "Edycja z TENTAFLOW_EDITION: $EDITION"
+    return
+  fi
+  echo ""
+  echo "  ${C_BOLD}Wykryto:${C_RESET} $GPU_DESC"
+  echo ""
+  echo "    ${C_BOLD}full${C_RESET}  llama.cpp (Vulkan), whisper, wizja, TTS  ~161 MB"
+  echo "          lokalna inferencja na GPU; potrzebuje GStreamera i Vulkana"
+  echo "    ${C_BOLD}slim${C_RESET}  sam gateway: mesh, flow, dashboard        ~60 MB"
+  echo "          bez lokalnych silnikow; katalog pokazuje uslugi chmurowe"
+  echo "          (OpenAI, Anthropic, ...) i kontenery uzytkowe"
+  echo ""
+  if [ ! -t 0 ]; then
+    EDITION="$PROPOSED"
+    warn "Brak terminala (curl | sh) — wybieram '$EDITION'. Wymus przez TENTAFLOW_EDITION=full|slim."
+    return
+  fi
+  printf "  Ktora edycje zainstalowac? [%s]: " "$PROPOSED"
+  read -r answer </dev/tty || answer=""
+  EDITION="${answer:-$PROPOSED}"
+  case "$EDITION" in
+    full|slim) ok "Edycja: $EDITION" ;;
+    *) die "Nieznana edycja '$EDITION' (dozwolone: full, slim)" ;;
+  esac
+}
+
+# =============================================================================
+# Runtime dependencies
+# =============================================================================
+install_runtime_deps() {
+  [ "$SKIP_DEPS" = "1" ] && { warn "Pomijam zaleznosci systemowe."; return; }
+
+  command -v curl >/dev/null 2>&1 || pm_install curl || die "Brak curl."
+  command -v tar  >/dev/null 2>&1 || pm_install tar  || die "Brak tar."
+
+  if [ "$EDITION" = "full" ]; then
+    # GStreamer needs its PLUGINS, not just the core library: the camera
+    # pipeline builds elements from base/good/bad. libvulkan1 is the loader the
+    # binary links against (libvulkan.so.1 in NEEDED).
+    log "Instaluje biblioteki runtime (GStreamer + pluginy, Vulkan loader)"
+    case "$PM" in
+      apt) pm_install libgstreamer1.0-0 gstreamer1.0-plugins-base \
+             gstreamer1.0-plugins-good gstreamer1.0-plugins-bad \
+             gstreamer1.0-libav libvulkan1 libgomp1 || warn "Czesc pakietow sie nie zainstalowala." ;;
+      dnf) pm_install gstreamer1 gstreamer1-plugins-base gstreamer1-plugins-good \
+             gstreamer1-plugins-bad-free vulkan-loader libgomp || warn "Czesc pakietow sie nie zainstalowala." ;;
+      pacman) pm_install gstreamer gst-plugins-base gst-plugins-good gst-plugins-bad \
+             vulkan-icd-loader || warn "Czesc pakietow sie nie zainstalowala." ;;
+      zypper) pm_install gstreamer gstreamer-plugins-base gstreamer-plugins-good \
+             libvulkan1 || warn "Czesc pakietow sie nie zainstalowala." ;;
+      *) warn "Nieznany menedzer pakietow — zainstaluj GStreamer + pluginy i loader Vulkana recznie." ;;
+    esac
   fi
 
-  if command -v docker >/dev/null 2>&1; then
-    ok "Docker present: $(docker --version 2>/dev/null || echo '?')"
-  else
-    log "Docker not found — installing"
-    case "$PM" in
-      apt)
-        # Official Docker APT repo (works on Ubuntu/Debian stable)
-        $SUDO apt-get update -qq
-        $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            ca-certificates curl gnupg lsb-release
-        $SUDO install -m 0755 -d /etc/apt/keyrings
-        DISTRO=$(. /etc/os-release; echo "$ID")
-        CODENAME=$(. /etc/os-release; echo "${VERSION_CODENAME:-$UBUNTU_CODENAME}")
-        curl -fsSL "https://download.docker.com/linux/$DISTRO/gpg" | $SUDO gpg --dearmor -o /etc/apt/keyrings/docker.gpg 2>/dev/null || true
-        $SUDO chmod a+r /etc/apt/keyrings/docker.gpg 2>/dev/null || true
-        echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/$DISTRO $CODENAME stable" \
-          | $SUDO tee /etc/apt/sources.list.d/docker.list >/dev/null
-        $SUDO apt-get update -qq
-        $SUDO DEBIAN_FRONTEND=noninteractive apt-get install -y -qq \
-            docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        ;;
-      dnf)
-        $SUDO dnf -y install dnf-plugins-core
-        $SUDO dnf config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo 2>/dev/null \
-          || $SUDO dnf-3 config-manager --add-repo https://download.docker.com/linux/fedora/docker-ce.repo
-        $SUDO dnf install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
-        ;;
-      pacman)
-        pm_install docker docker-buildx
-        ;;
-      zypper)
-        pm_install docker docker-buildx
-        ;;
-      brew)
-        warn "Docker on macOS requires Docker Desktop — download from https://docs.docker.com/desktop/install/mac-install/"
-        warn "Install it manually, then re-run this installer."
-        return 0
-        ;;
-      *)
-        err "Cannot auto-install Docker on this system. See https://docs.docker.com/engine/install/"
-        return 1 ;;
-    esac
-
-    # Linux — start service + enable
-    if command -v systemctl >/dev/null 2>&1; then
+  if ! command -v docker >/dev/null 2>&1; then
+    if [ "$WITH_DOCKER" = "1" ]; then
+      log "Instaluje Docker Engine"
+      curl -fsSL https://get.docker.com | $SUDO sh || warn "Instalacja Dockera nieudana."
       $SUDO systemctl enable --now docker 2>/dev/null || true
-    fi
-    ok "Docker installed"
-  fi
-
-  # Buildx plugin (BuildKit) — required for --mount=type=cache in our Dockerfiles.
-  if ! docker buildx version >/dev/null 2>&1; then
-    log "Docker buildx plugin missing — installing"
-    case "$PM" in
-      apt)    pm_install docker-buildx-plugin ;;
-      dnf)    pm_install docker-buildx-plugin ;;
-      pacman) pm_install docker-buildx ;;
-      zypper) pm_install docker-buildx ;;
-      brew)   warn "Install Docker Desktop — buildx is bundled" ;;
-    esac
-  fi
-  if docker buildx version >/dev/null 2>&1; then
-    ok "Docker buildx (BuildKit) present: $(docker buildx version 2>/dev/null | head -1)"
-  else
-    warn "buildx still missing — container builds będą failować z 'the --mount option requires BuildKit'"
-  fi
-
-  # Docker daemon reachability
-  if ! docker info >/dev/null 2>&1; then
-    warn "Docker daemon nie odpowiada. Spróbuj: sudo systemctl start docker  (Linux) / otwórz Docker Desktop (macOS)"
-  fi
-
-  # Add current user to docker group (Linux only, skippable)
-  if [ "$NO_GROUP" = "0" ] && [ "$(uname -s)" = "Linux" ] && [ "$USER_INSTALL" = "0" ]; then
-    if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
-      if getent group docker >/dev/null 2>&1; then
-        log "Adding $USER to 'docker' group (needed to run docker without sudo)"
-        $SUDO usermod -aG docker "$USER" || true
-        warn "Log out and back in (or 'newgrp docker') for group change to take effect."
-      fi
+    else
+      warn "Docker nie jest zainstalowany — silniki kontenerowe nie beda dostepne."
+      warn "Instalator go NIE dokłada bez zgody: uruchom ponownie z TENTAFLOW_WITH_DOCKER=1."
     fi
   fi
 }
 
-# ---- Python 3.10+ with venv + pip ----
-check_python() {
-  if [ "$SKIP_PYTHON" = "1" ]; then
-    warn "Python check skipped. Python-bundle engines (vLLM, xtts, …) will fail until Python 3.10+ z venv+pip is installed."
-    return 0
+# =============================================================================
+# Download
+# =============================================================================
+resolve_version() {
+  [ "$VERSION" != "latest" ] && return
+  log "Ustalam najnowsza wersje"
+  # /releases, not /releases/latest: the latter hides pre-releases, and every
+  # tag so far carries an -alpha suffix.
+  VERSION=$(curl -fsSL "https://api.github.com/repos/$REPO/releases?per_page=10" \
+    | grep -m1 '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
+  [ -n "$VERSION" ] || die "Nie udalo sie ustalic wersji z GitHub API (limit 60 zapytan/h na IP?)."
+  ok "Wersja: $VERSION"
+}
+
+verify_sha256() {
+  archive="$1"; sumfile="$2"
+  if command -v sha256sum >/dev/null 2>&1; then
+    ( cd "$(dirname "$archive")" && sha256sum -c "$(basename "$sumfile")" >/dev/null ) \
+      || die "Suma kontrolna sie nie zgadza — przerywam."
+  elif command -v shasum >/dev/null 2>&1; then
+    ( cd "$(dirname "$archive")" && shasum -a 256 -c "$(basename "$sumfile")" >/dev/null ) \
+      || die "Suma kontrolna sie nie zgadza — przerywam."
+  else
+    # Silently skipping verification in a `curl | sh` installer is how a
+    # tampered archive gets installed, so this is fatal rather than a warning.
+    die "Brak sha256sum i shasum — nie moge zweryfikowac archiwum."
+  fi
+  ok "Suma kontrolna OK"
+}
+
+download_archive() {
+  TMP=$(mktemp -d)
+  trap 'rm -rf "$TMP"' EXIT
+  ARCHIVE="$TMP/tentaflow.tar.gz"
+
+  if [ -n "$ASSET_FILE" ]; then
+    log "Uzywam lokalnego archiwum: $ASSET_FILE"
+    cp "$ASSET_FILE" "$ARCHIVE"
+    [ -f "$ASSET_FILE.sha256" ] && cp "$ASSET_FILE.sha256" "$ARCHIVE.sha256"
+  else
+    resolve_version
+    name="tentaflow-${VERSION}-${TARGET}-${EDITION}.tar.gz"
+    url="https://github.com/$REPO/releases/download/$VERSION/$name"
+    log "Pobieram $name"
+    curl -fL --progress-bar "$url" -o "$ARCHIVE" || die "Pobieranie nieudane: $url"
+    curl -fsSL "$url.sha256" -o "$ARCHIVE.sha256" || die "Brak pliku .sha256 dla $name."
   fi
 
-  python_cmd=""
-  for cand in python3.12 python3.11 python3.10 python3; do
-    if command -v "$cand" >/dev/null 2>&1; then
-      if "$cand" -c 'import sys; sys.exit(0 if sys.version_info >= (3,10) else 1)' 2>/dev/null; then
-        python_cmd="$cand"
-        break
-      fi
-    fi
+  # A checksum file names the archive it was made from, which is never the
+  # temp name we just wrote — rewrite the name, keep the digest.
+  if [ -f "$ARCHIVE.sha256" ]; then
+    digest=$(awk '{print $1; exit}' "$ARCHIVE.sha256")
+    printf '%s  %s\n' "$digest" "$(basename "$ARCHIVE")" > "$ARCHIVE.sha256"
+  fi
+  [ -f "$ARCHIVE.sha256" ] || die "Brak sumy kontrolnej archiwum."
+  verify_sha256 "$ARCHIVE" "$ARCHIVE.sha256"
+}
+
+# =============================================================================
+# Install
+# =============================================================================
+install_files() {
+  log "Rozpakowuje"
+  tar -xzf "$ARCHIVE" -C "$TMP"
+  inner=$(find "$TMP" -maxdepth 1 -type d -name 'tentaflow-*' | head -1)
+  [ -n "$inner" ] || die "Archiwum ma nieoczekiwana strukture."
+
+  # The version comes from the binary itself, so a local archive (CI, offline)
+  # lands in a correctly named directory without trusting the file name.
+  ver=$("$inner/tentaflow" --version 2>/dev/null | awk '{print $2}')
+  [ -n "$ver" ] || die "Nie moge odczytac wersji z binarki."
+  VERSION_DIR="$PREFIX/versions/$ver"
+
+  $SUDO mkdir -p "$PREFIX/versions" "$CONFIG_DIR" "$DATA_DIR" "$BIN_DIR"
+  $SUDO rm -rf "$VERSION_DIR"
+  $SUDO cp -r "$inner" "$VERSION_DIR"
+
+  # Atomic swap: rename over the symlink, never unlink-then-link, so a reader
+  # never sees a missing `current`.
+  $SUDO ln -sfn "$VERSION_DIR" "$PREFIX/current.new"
+  $SUDO mv -T "$PREFIX/current.new" "$PREFIX/current"
+  $SUDO ln -sfn "$PREFIX/current/tentaflow" "$BIN_DIR/tentaflow"
+  ok "Zainstalowano $ver w $VERSION_DIR"
+  INSTALLED_VERSION="$ver"
+}
+
+write_config() {
+  if [ -f "$CONFIG" ]; then
+    ok "Konfiguracja istnieje — nie ruszam: $CONFIG"
+    return
+  fi
+  log "Tworze konfiguracje ($BIND, mesh wylaczony)"
+  # The binary owns the config schema; composing TOML here would duplicate it
+  # and drift on the first change.
+  $SUDO "$PREFIX/current/tentaflow" init-config --output "$CONFIG" --bind "$BIND" --no-mesh
+}
+
+write_receipt() {
+  variant=slim
+  [ "$EDITION" = "full" ] && variant=vulkan
+  $SUDO sh -c "cat > '$RECEIPT'" <<EOF
+{
+  "version": "$INSTALLED_VERSION",
+  "edition": "$EDITION",
+  "variant": "$variant",
+  "target": "$TARGET",
+  "prefix": "$PREFIX",
+  "config": "$CONFIG",
+  "home": "$DATA_DIR",
+  "service_scope": "$SERVICE_SCOPE"
+}
+EOF
+  ok "Receipt: $RECEIPT"
+}
+
+create_service_user() {
+  [ "$USER_INSTALL" = "1" ] && return
+  if ! id "$SERVICE_USER" >/dev/null 2>&1; then
+    log "Tworze uzytkownika systemowego $SERVICE_USER"
+    $SUDO useradd --system --home-dir "$DATA_DIR" --shell /usr/sbin/nologin "$SERVICE_USER" \
+      || $SUDO useradd --system --home-dir "$DATA_DIR" --shell /sbin/nologin "$SERVICE_USER" \
+      || warn "Nie udalo sie utworzyc uzytkownika — usluga pojdzie jako root."
+  fi
+  for grp in docker video render; do
+    getent group "$grp" >/dev/null 2>&1 && $SUDO usermod -aG "$grp" "$SERVICE_USER" 2>/dev/null || true
   done
+  $SUDO chown -R "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR" "$CONFIG_DIR" 2>/dev/null || true
+}
 
-  if [ -z "$python_cmd" ]; then
-    log "Python 3.10+ not found — installing"
-    case "$PM" in
-      apt)    pm_install python3 python3-venv python3-pip ;;
-      dnf)    pm_install python3 python3-pip ;;
-      pacman) pm_install python python-pip ;;
-      zypper) pm_install python3 python3-pip ;;
-      brew)   pm_install python@3.12 ;;
-      *)      warn "Install Python 3.10+ manually with venv and pip"; return 0 ;;
-    esac
-    python_cmd=$(command -v python3.12 || command -v python3.11 || command -v python3.10 || command -v python3)
+register_service() {
+  [ "$NO_AUTOSTART" = "1" ] && { warn "Pomijam rejestracje uslugi (TENTAFLOW_NO_AUTOSTART=1)."; return; }
+  command -v systemctl >/dev/null 2>&1 || { warn "Brak systemd — uruchom recznie: tentaflow"; return; }
+
+  template="$PREFIX/current/tentaflow.service.in"
+  [ -f "$template" ] || die "Brak szablonu unitu w archiwum: $template"
+
+  unit_body=$(sed -e "s|@PREFIX@|$PREFIX|g" -e "s|@HOME@|$DATA_DIR|g" \
+                  -e "s|@CONFIG@|$CONFIG|g" -e "s|@CONFIG_DIR@|$CONFIG_DIR|g" \
+                  -e "s|@USER@|$SERVICE_USER|g" "$template")
+
+  if [ "$SERVICE_SCOPE" = "user" ]; then
+    unit_dir="$HOME/.config/systemd/user"
+    mkdir -p "$unit_dir"
+    # A user unit has no User=/Group=: it already runs as the logged-in user,
+    # and systemd refuses the directives in that scope.
+    printf '%s\n' "$unit_body" | grep -v '^User=\|^Group=' > "$unit_dir/tentaflow.service"
+    systemctl --user daemon-reload
+    systemctl --user enable --now tentaflow.service
+    # Without lingering the service stops at logout, which is not what
+    # "starts with the system" means to anyone.
+    loginctl enable-linger "$(id -un)" 2>/dev/null || warn "loginctl enable-linger nieudane — usluga zatrzyma sie po wylogowaniu."
+    ok "Usluga zarejestrowana (systemd --user)"
+  else
+    printf '%s\n' "$unit_body" | $SUDO tee /etc/systemd/system/tentaflow.service >/dev/null
+    $SUDO systemctl daemon-reload
+    $SUDO systemctl enable --now tentaflow.service
+    ok "Usluga zarejestrowana i wlaczona (systemd)"
   fi
+}
 
-  ok "Python present: $python_cmd ($($python_cmd --version 2>&1))"
-
-  # venv module
-  if ! $python_cmd -m venv --help >/dev/null 2>&1; then
-    log "python venv missing — installing"
-    case "$PM" in
-      apt) pm_install python3-venv ;;
-      *) warn "python venv not usable — Python-bundle deploys (vLLM, xtts) will fail" ;;
-    esac
+harden_platform() {
+  [ "$USER_INSTALL" = "1" ] && return
+  # Fedora/RHEL: files unpacked into /opt carry no service context, and SELinux
+  # can block the JIT mappings wgpu/ggml need.
+  if command -v restorecon >/dev/null 2>&1; then
+    $SUDO restorecon -R "$PREFIX" 2>/dev/null || true
   fi
+  if command -v firewall-cmd >/dev/null 2>&1 && [ "${BIND%%:*}" = "0.0.0.0" ]; then
+    port="${BIND##*:}"
+    log "Otwieram port $port w firewalld (bind na 0.0.0.0)"
+    $SUDO firewall-cmd --permanent --add-port="$port/tcp" >/dev/null 2>&1 || true
+    $SUDO firewall-cmd --reload >/dev/null 2>&1 || true
+  fi
+}
 
-  # pip
-  if ! $python_cmd -m pip --version >/dev/null 2>&1; then
-    log "pip missing — installing via ensurepip"
-    $python_cmd -m ensurepip --upgrade 2>/dev/null || {
-      case "$PM" in
-        apt) pm_install python3-pip ;;
-        *)   warn "pip not installable automatically — deploy z pip install nie zadziała" ;;
-      esac
+stop_if_running() {
+  command -v systemctl >/dev/null 2>&1 || return 0
+  if [ "$SERVICE_SCOPE" = "user" ]; then
+    systemctl --user is-active --quiet tentaflow.service 2>/dev/null && {
+      log "Zatrzymuje dzialajaca usluge przed podmiana"
+      systemctl --user stop tentaflow.service
+    }
+  else
+    $SUDO systemctl is-active --quiet tentaflow.service 2>/dev/null && {
+      log "Zatrzymuje dzialajaca usluge przed podmiana"
+      $SUDO systemctl stop tentaflow.service
     }
   fi
-  if $python_cmd -m pip --version >/dev/null 2>&1; then
-    ok "pip present: $($python_cmd -m pip --version 2>/dev/null | head -1)"
-  fi
-}
-
-# ---- ONNX Runtime (CPU) — SuperTonic TTS + sherpa STT ----
-# Camera-CV now runs on Burn (no onnxruntime). `ort` remains only for SuperTonic
-# TTS (CPU) in load-dynamic mode, so the CPU shared lib must be present. No CUDA
-# / cuDNN needed. Distro package preferred → official CPU prebuilt tarball.
-ort_present() {
-  [ -n "${ORT_DYLIB_PATH:-}" ] && [ -f "${ORT_DYLIB_PATH}" ] && return 0
-  for p in /usr/lib/libonnxruntime.so /usr/lib64/libonnxruntime.so \
-           /usr/local/lib/libonnxruntime.so /opt/onnxruntime/lib/libonnxruntime.so \
-           /opt/homebrew/lib/libonnxruntime.dylib /usr/local/lib/libonnxruntime.dylib; do
-    [ -f "$p" ] && return 0
-  done
-  return 1
-}
-
-check_vision_runtime() {
-  if [ "$SKIP_VISION" = "1" ]; then
-    warn "ONNX Runtime check skipped. SuperTonic TTS will be disabled until libonnxruntime is present."
-    return 0
-  fi
-
-  if ort_present; then
-    ok "ONNX Runtime present (TTS ready)"
-    return 0
-  fi
-
-  log "Installing ONNX Runtime (CPU) for SuperTonic TTS"
-  case "$PM" in
-    pacman) pm_install onnxruntime ;;
-    zypper) pm_install onnxruntime || VISION_NEEDS_TARBALL=1 ;;
-    brew)   pm_install onnxruntime ;;
-    apt|dnf|*)
-      # No reliable system package — fetch the official CPU prebuilt after extract.
-      VISION_NEEDS_TARBALL=1 ;;
-  esac
-
-  if [ "$VISION_NEEDS_TARBALL" = "0" ] && ort_present; then
-    ok "ONNX Runtime installed (TTS ready)"
-  elif [ "$VISION_NEEDS_TARBALL" = "0" ]; then
-    warn "ONNX Runtime package install did not land a shared lib — will try the prebuilt tarball"
-    VISION_NEEDS_TARBALL=1
-  fi
-}
-
-# Downloads the official onnxruntime prebuilt and drops its shared libs next to
-# the tentaflow binary (the binary probes its own dir). GPU variant when an
-# NVIDIA GPU is present; requires CUDA + cuDNN at runtime for the CUDA EP.
-install_vision_tarball() {
-  [ "$VISION_NEEDS_TARBALL" = "1" ] || return 0
-
-  ort_os=""; ort_arch=""; ort_ext="tgz"
-  case "$TARGET" in
-    x86_64-unknown-linux-gnu)  ort_os="linux";  ort_arch="x64" ;;
-    aarch64-unknown-linux-gnu) ort_os="linux";  ort_arch="aarch64" ;;
-    *) warn "No onnxruntime prebuilt for $TARGET — SuperTonic TTS disabled. Install libonnxruntime manually."; return 0 ;;
-  esac
-
-  # CPU build only — onnxruntime is used solely by SuperTonic TTS (CPU).
-  base="onnxruntime-${ort_os}-${ort_arch}-${ORT_VERSION}"
-  url="https://github.com/microsoft/onnxruntime/releases/download/v${ORT_VERSION}/${base}.${ort_ext}"
-
-  log "Downloading ONNX Runtime prebuilt: $url"
-  if ! curl -fL --progress-bar "$url" -o "$TMP/ort.tgz"; then
-    warn "ONNX Runtime download failed — SuperTonic TTS disabled. Set TENTAFLOW_ORT_VERSION or install libonnxruntime manually."
-    return 0
-  fi
-  tar -xzf "$TMP/ort.tgz" -C "$TMP"
-  ort_dir="$TMP/$base"
-  if [ ! -d "$ort_dir/lib" ]; then
-    warn "Unexpected onnxruntime archive layout — skipping TTS runtime"
-    return 0
-  fi
-  # Drop every shared lib (core + provider libs) next to the binary.
-  $SUDO sh -c "cp -P '$ort_dir/lib/'*.so* '$PREFIX/' 2>/dev/null" || true
-  if [ -f "$PREFIX/libonnxruntime.so" ]; then
-    ok "ONNX Runtime placed in $PREFIX (camera CV ready)"
-  else
-    warn "Could not place libonnxruntime.so in $PREFIX — camera CV disabled"
-  fi
+  return 0
 }
 
 # =============================================================================
-# Run dependency install
+# Run
 # =============================================================================
-
 echo ""
-echo "${C_BOLD}TentaFlow installer${C_RESET}"
-echo "${C_DIM}  target:  $TARGET${C_RESET}"
-echo "${C_DIM}  pm:      $PM${C_RESET}"
-echo "${C_DIM}  version: $VERSION${C_RESET}"
+echo "${C_BOLD}Instalator TentaFlow${C_RESET}"
+detect_pm
+echo "${C_DIM}  system:  $(. /etc/os-release 2>/dev/null && echo "$PRETTY_NAME" || uname -s) / $PM${C_RESET}"
 echo "${C_DIM}  prefix:  $PREFIX${C_RESET}"
-echo ""
+echo "${C_DIM}  dane:    $DATA_DIR${C_RESET}"
 
-if [ "$SKIP_DEPS" = "0" ]; then
-  log "Checking dependencies"
-  check_base_tools
-  check_docker
-  check_python
-  check_vision_runtime
-  echo ""
-fi
-
-# =============================================================================
-# Download + extract
-# =============================================================================
-
-mkdir -p "$PREFIX" 2>/dev/null || $SUDO mkdir -p "$PREFIX"
-$SUDO mkdir -p "$BIN_DIR"
-
-TMP=$(mktemp -d)
-trap 'rm -rf "$TMP"' EXIT
-
-if [ "$VERSION" = "latest" ]; then
-  log "Resolving latest release tag"
-  ACTUAL_TAG=$(curl -fsSL "https://api.github.com/repos/$REPO/releases/latest" \
-    | grep -m1 '"tag_name"' | sed 's/.*"\(v[^"]*\)".*/\1/')
-  if [ -z "$ACTUAL_TAG" ]; then
-    err "Cannot resolve latest version from GitHub API. Try TENTAFLOW_VERSION=v0.x.y ./install.sh"
-    exit 1
-  fi
-  VERSION="$ACTUAL_TAG"
-  ok "Latest: $VERSION"
-fi
-ASSET_URL="https://github.com/$REPO/releases/download/$VERSION/tentaflow-${VERSION}-${TARGET}.tar.gz"
-
-log "Downloading $ASSET_URL"
-curl -fL --progress-bar "$ASSET_URL" -o "$TMP/tentaflow.tar.gz"
-curl -fL "$ASSET_URL.sha256" -o "$TMP/tentaflow.tar.gz.sha256" 2>/dev/null || true
-
-if [ -s "$TMP/tentaflow.tar.gz.sha256" ]; then
-  log "Verifying SHA-256"
-  (cd "$TMP" && shasum -a 256 -c tentaflow.tar.gz.sha256 >/dev/null) || {
-    err "Checksum mismatch — aborting."
-    exit 1
-  }
-  ok "Checksum OK"
-fi
-
-log "Extracting to $PREFIX"
-tar -xzf "$TMP/tentaflow.tar.gz" -C "$TMP"
-INNER=$(ls "$TMP" | grep -E "^tentaflow-${VERSION}-" | head -1)
-$SUDO cp -r "$TMP/$INNER/." "$PREFIX/"
-$SUDO ln -sf "$PREFIX/tentaflow" "$BIN_DIR/tentaflow"
-
-if [ ! -f "$PREFIX/config.toml" ] && [ -f "$PREFIX/config.example.toml" ]; then
-  $SUDO cp "$PREFIX/config.example.toml" "$PREFIX/config.toml"
-fi
-ok "Installed to $PREFIX"
-
-# Vision runtime tarball fallback (distros without an onnxruntime package) —
-# drops the shared libs next to the binary now that $PREFIX exists.
-if [ "$SKIP_DEPS" = "0" ] && [ "$SKIP_VISION" = "0" ]; then
-  install_vision_tarball
-fi
-
-# =============================================================================
-# systemd / launchd registration
-# =============================================================================
-
-register_systemd() {
-  UNIT="/etc/systemd/system/tentaflow.service"
-  log "Registering systemd unit at $UNIT"
-  $SUDO tee "$UNIT" >/dev/null <<EOF
-[Unit]
-Description=TentaFlow API Gateway + mesh node
-After=network.target docker.service
-
-[Service]
-Type=simple
-ExecStart=$PREFIX/tentaflow --config $PREFIX/config.toml
-Restart=on-failure
-RestartSec=5
-WorkingDirectory=$PREFIX
-Environment="DOCKER_BUILDKIT=1"
-
-[Install]
-WantedBy=multi-user.target
-EOF
-  $SUDO systemctl daemon-reload
-  $SUDO systemctl enable --now tentaflow.service
-  ok "Managed by systemd. Status: systemctl status tentaflow"
-}
-
-register_launchd() {
-  PLIST="$HOME/Library/LaunchAgents/ai.tentaflow.plist"
-  mkdir -p "$(dirname "$PLIST")"
-  log "Registering launchd agent at $PLIST"
-  cat > "$PLIST" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>ai.tentaflow</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$PREFIX/tentaflow</string>
-    <string>--config</string><string>$PREFIX/config.toml</string>
-  </array>
-  <key>EnvironmentVariables</key>
-  <dict>
-    <key>DOCKER_BUILDKIT</key><string>1</string>
-  </dict>
-  <key>RunAtLoad</key><true/>
-  <key>KeepAlive</key><true/>
-  <key>StandardOutPath</key><string>$PREFIX/tentaflow.log</string>
-  <key>StandardErrorPath</key><string>$PREFIX/tentaflow.err.log</string>
-  <key>WorkingDirectory</key><string>$PREFIX</string>
-</dict>
-</plist>
-EOF
-  launchctl unload "$PLIST" 2>/dev/null || true
-  launchctl load "$PLIST"
-  ok "Managed by launchd. Status: launchctl list | grep tentaflow"
-}
-
-if [ "$NO_AUTOSTART" = "1" ]; then
-  log "Skipping auto-start (TENTAFLOW_NO_AUTOSTART=1). Run manually: $BIN_DIR/tentaflow"
-else
-  case "$TARGET" in
-    *linux*)
-      if command -v systemctl >/dev/null 2>&1; then
-        register_systemd
-      else
-        warn "systemd not found — run manually: $BIN_DIR/tentaflow"
-      fi ;;
-    *darwin*) register_launchd ;;
-  esac
-fi
-
-# =============================================================================
-# Final summary + next-step hints
-# =============================================================================
+choose_edition
+install_runtime_deps
+download_archive
+stop_if_running
+install_files
+write_config
+create_service_user
+write_receipt
+harden_platform
+register_service
 
 echo ""
-printf "%s%sInstallation complete%s\n" "$C_GREEN" "$C_BOLD" "$C_RESET"
-printf "  %sbinary:%s     $BIN_DIR/tentaflow\n" "$C_DIM" "$C_RESET"
-printf "  %sprefix:%s     $PREFIX\n" "$C_DIM" "$C_RESET"
-printf "  %sversion:%s    $VERSION\n" "$C_DIM" "$C_RESET"
-printf "  %sdashboard:%s  https://localhost:8090\n" "$C_DIM" "$C_RESET"
+printf "%s%sGotowe.%s\n" "$C_GREEN" "$C_BOLD" "$C_RESET"
+printf "  %sbinarka:%s   $BIN_DIR/tentaflow\n" "$C_DIM" "$C_RESET"
+printf "  %swersja:%s    $INSTALLED_VERSION ($EDITION)\n" "$C_DIM" "$C_RESET"
+printf "  %sdashboard:%s https://%s\n" "$C_DIM" "$C_RESET" "$BIND"
 echo ""
-
-# Post-install hints
-if [ "$(uname -s)" = "Linux" ] && [ "$NO_GROUP" = "0" ] && [ "$USER_INSTALL" = "0" ]; then
-  if ! id -nG "$USER" 2>/dev/null | grep -qw docker; then
-    warn "Dodaj się do grupy docker (jeśli nie jesteś): 'sudo usermod -aG docker \$USER' + relogin"
-  fi
+echo "  ${C_BOLD}Pierwsze logowanie: admin / admin${C_RESET} — zmien haslo zaraz po zalogowaniu."
+if [ "${BIND%%:*}" = "0.0.0.0" ]; then
+  warn "Serwer nasluchuje na wszystkich interfejsach z domyslnym haslem — zmien je TERAZ."
+  warn "Certyfikat jest self-signed; dla nazwy domenowej ustaw [server.tls].extra_sans w $CONFIG."
 fi
-
-if [ "$(uname -s)" = "Darwin" ]; then
-  if ! docker info >/dev/null 2>&1; then
-    warn "Uruchom Docker Desktop zanim zrobisz pierwszy deploy silnika."
-  fi
-fi
-
 echo ""
-echo "Next steps:"
-echo "  1. ${C_BOLD}Open dashboard:${C_RESET}      https://localhost:8090"
-echo "  2. ${C_BOLD}Deploy silnik:${C_RESET}       Services → Nowy serwis → wybierz silnik"
-echo "  3. ${C_BOLD}Ustaw auto-start:${C_RESET}    sudo systemctl enable tentaflow   (Linux)"
-echo "  4. ${C_BOLD}Logi:${C_RESET}                journalctl -u tentaflow -f         (Linux)"
+echo "  tentaflow status     stan uslugi, autostart, health"
+echo "  tentaflow stop|start zatrzymanie / uruchomienie"
+echo "  tentaflow update     aktualizacja z GitHub Releases"
 echo ""

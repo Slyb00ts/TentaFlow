@@ -76,6 +76,23 @@ enum Subcommand {
     Restart,
     /// Stan uslugi: autostart, PID, config, dashboard, health
     Status,
+    /// Zapisuje domyslna konfiguracje do wskazanego pliku i konczy. Uzywane
+    /// przez instalator: schemat configu zyje w NodeConfig, a nie w skrypcie
+    /// bash, ktory i tak nie nadazylby za zmianami sekcji.
+    InitConfig {
+        /// Docelowy plik (nadpisanie wymaga --force).
+        #[arg(long = "output", short = 'o')]
+        output: PathBuf,
+        /// Adres nasluchu HTTP/QUIC. Domyslnie zostaje to, co w NodeConfig.
+        #[arg(long = "bind")]
+        bind: Option<String>,
+        /// Wylacza mesh (enabled/mdns/dht) w zapisanym pliku.
+        #[arg(long = "no-mesh")]
+        no_mesh: bool,
+        /// Nadpisz istniejacy plik.
+        #[arg(long = "force")]
+        force: bool,
+    },
     /// Sprawdza czy jest nowsza wersja na GitHub Releases i podmienia binarke
     Update {
         /// Tylko sprawdz, nie aktualizuj
@@ -1624,6 +1641,12 @@ fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
         Subcommand::Stop => service::stop(),
         Subcommand::Restart => service::restart(),
         Subcommand::Status => service::status(),
+        Subcommand::InitConfig {
+            output,
+            bind,
+            no_mesh,
+            force,
+        } => run_init_config(output, bind.as_deref(), *no_mesh, *force),
         Subcommand::SystemCheck => {
             let caps = tentaflow_core::system_check::collect();
             println!("{}", serde_json::to_string_pretty(&caps)?);
@@ -1694,6 +1717,54 @@ fn run_vision_worker_mode(
         #[cfg(unix)]
         anyhow::bail!("this build has no vision pipeline (slim edition)")
     }
+}
+
+/// Writes the default configuration to `output`, optionally pinning the listen
+/// address and disabling mesh. The installer calls this instead of composing
+/// TOML itself: `NodeConfig` has sections without `serde(default)`, so a
+/// hand-written partial file fails to parse, and a hand-written full one would
+/// have to track every schema change made in Rust.
+fn run_init_config(
+    output: &PathBuf,
+    bind: Option<&str>,
+    no_mesh: bool,
+    force: bool,
+) -> Result<()> {
+    if output.exists() && !force {
+        return Err(anyhow::anyhow!(
+            "{} juz istnieje — uzyj --force aby nadpisac",
+            output.display()
+        ));
+    }
+
+    let mut config = tentaflow_core::config::NodeConfig::default();
+    if let Some(addr) = bind {
+        config.protocols.openai_api.bind = addr.to_string();
+        if let Some(quic) = config.protocols.quic.as_mut() {
+            quic.bind = addr.to_string();
+        }
+        // The health endpoint has its own listener; leaving it on 0.0.0.0 while
+        // the API is bound to loopback would expose the one thing that answers
+        // without auth.
+        config.monitoring.health_check_bind = addr.to_string();
+    }
+    if no_mesh {
+        if let Some(mesh) = config.mesh.as_mut() {
+            mesh.enabled = false;
+            mesh.mdns_enabled = false;
+            mesh.dht_enabled = false;
+        }
+    }
+
+    let toml_str = config
+        .to_toml_string()
+        .map_err(|e| anyhow::anyhow!("serializacja configu: {}", e))?;
+    if let Some(parent) = output.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(output, toml_str)?;
+    println!("Zapisano konfiguracje: {}", output.display());
+    Ok(())
 }
 
 fn run_update(check_only: bool, force: bool) -> Result<()> {
