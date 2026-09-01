@@ -302,7 +302,12 @@ jobs:
           done
           systemctl is-active tentaflow.service
           tentaflow status
-          # The status line is human-readable; this is the assertion.
+          # The status line is human-readable; this is the assertion. First boot
+          # generates a TLS identity and a database before the socket opens.
+          for _ in $(seq 1 60); do
+            curl -fsk https://127.0.0.1:8090/health >/dev/null 2>&1 && break
+            sleep 2
+          done
           curl -fsk https://127.0.0.1:8090/health >/dev/null
           test -f /etc/tentaflow/config.toml
           test -f /etc/tentaflow/install-receipt.json

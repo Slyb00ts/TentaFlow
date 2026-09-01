@@ -48,13 +48,16 @@ esac
 
 docker rm -f "$NAME" >/dev/null 2>&1 || true
 
+# The archive lands in /srv, not /tmp: systemd mounts a tmpfs over /tmp on
+# Fedora and Arch, which would hide the bind mount before the installer runs.
+#
 # systemd as PID 1 needs the cgroup filesystem and a private tmpfs for /run.
 docker run -d --name "$NAME" \
   --privileged --cgroupns=host \
   -v /sys/fs/cgroup:/sys/fs/cgroup:rw \
   --tmpfs /run --tmpfs /run/lock \
-  -v "$ARCHIVE:/tmp/tentaflow.tar.gz:ro" \
-  -v "$ARCHIVE.sha256:/tmp/tentaflow.tar.gz.sha256:ro" \
+  -v "$ARCHIVE:/srv/tentaflow-test/archive.tar.gz:ro" \
+  -v "$ARCHIVE.sha256:/srv/tentaflow-test/archive.tar.gz.sha256:ro" \
   -v "$REPO_ROOT/scripts/install:/installer:ro" \
   -e container=docker \
   "$IMAGE" \
@@ -70,7 +73,7 @@ docker exec "$NAME" systemctl is-system-running || true
 
 echo "[test-install] instalacja"
 docker exec -e TENTAFLOW_EDITION=full \
-            -e TENTAFLOW_ASSET_FILE=/tmp/tentaflow.tar.gz \
+            -e TENTAFLOW_ASSET_FILE=/srv/tentaflow-test/archive.tar.gz \
             "$NAME" sh /installer/install.sh
 
 echo "[test-install] weryfikacja"
@@ -85,7 +88,13 @@ docker exec "$NAME" bash -c '
   test -f /etc/tentaflow/config.toml && echo "config ok"
   test -f /etc/tentaflow/install-receipt.json && echo "receipt ok"
   echo "--- health (asercja, nie sama linia statusu)"
-  curl -fsk https://127.0.0.1:8090/health >/dev/null && echo "health ok"
+  # The service is enabled and started, but the first boot generates a TLS
+  # identity and a database before it listens — poll rather than assume.
+  for _ in $(seq 1 60); do
+    curl -fsk https://127.0.0.1:8090/health >/dev/null 2>&1 && { echo "health ok"; break; }
+    sleep 2
+  done
+  curl -fsk https://127.0.0.1:8090/health >/dev/null
   echo "--- tentaflow status"
   tentaflow status || true
 '
