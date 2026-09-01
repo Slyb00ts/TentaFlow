@@ -286,31 +286,14 @@ fn seed_user_accounts(conn: &Connection) -> Result<()> {
         conn.query_row("SELECT COUNT(*) FROM user_accounts", [], |row| row.get(0))?;
 
     if user_count == 0 {
-        // The installer generates a random password and passes it here, so a
-        // machine reached over the network never comes up with a password that
-        // is printed in every copy of the documentation. Without the variable
-        // (repo checkout, `cargo run`) the old admin/admin stays, and the login
-        // is forced to change it — that path is for a developer's laptop, and
-        // the warning says so out loud in case it is not.
-        let (password, from_env) = match std::env::var("TENTAFLOW_ADMIN_PASSWORD") {
-            Ok(p) if !p.trim().is_empty() => (p, true),
-            _ => ("admin".to_string(), false),
-        };
-        if !from_env {
-            tracing::warn!(
-                "seed: konto 'admin' zalozone z domyslnym haslem 'admin' \
-                 (wymuszona zmiana przy pierwszym logowaniu). Instalacja produkcyjna \
-                 powinna podac TENTAFLOW_ADMIN_PASSWORD."
-            );
-        }
-        let password_hash = crypto::hash_password(&password)?;
-        // A password the operator chose is not a placeholder to be replaced on
-        // first login; the generated one is shown to them once by the installer.
-        let must_change = i64::from(!from_env);
+        // Konto startowe to admin/admin z `must_change_password` — celowo, zeby
+        // pierwsze logowanie bylo mozliwe bez szukania hasla w logach, a zmiana
+        // byla wymuszona od razu po nim. Instalator ma o tym powiedziec wprost.
+        let password_hash = crypto::hash_password("admin")?;
         conn.execute(
             "INSERT INTO user_accounts (id, username, password_hash, display_name, is_admin, role, must_change_password) \
-             VALUES (?1, 'admin', ?2, 'Administrator', 1, 'admin', ?3)",
-            rusqlite::params![DEFAULT_ADMIN_ID, password_hash, must_change],
+             VALUES (?1, 'admin', ?2, 'Administrator', 1, 'admin', 1)",
+            rusqlite::params![DEFAULT_ADMIN_ID, password_hash],
         )?;
         // Dodaj admina do grupy admins. Po migracji v53 identyfikatory grup i
         // userow sa TEXT UUID, wiec wiazemy po realnych id (grupa 'admins' ma
