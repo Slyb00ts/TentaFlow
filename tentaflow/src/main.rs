@@ -783,6 +783,14 @@ async fn run_server(args: Args) -> Result<()> {
             run_manager.child_finished_subscribe(),
         );
         tracing::info!("SubagentReactor: zainstalowany (reaktywne flow on_subagent_complete)");
+
+        // TentaBus M3a (SUM/tentabus/PLAN.md §6.3/§9) — reactive flow entry
+        // for `bus_consume`. Installed the same way as `subagent_reactor`
+        // just above: process-global handle, idempotent, backed by this
+        // same `dispatcher`. Safe even if `bus::init` above failed — each
+        // subscription loop tolerates `bus::global()` being `None`.
+        tentaflow_core::bus::reactor::init_global(db.clone(), dispatcher);
+        tracing::info!("BusReactor: zainstalowany (reaktywne flow bus_consume)");
         // Harness §3.13: install the process-global pending-interaction registry
         // (ask_user questions + permission grants raised during a run).
         tentaflow_core::agents::interaction_registry_init_global(std::sync::Arc::new(

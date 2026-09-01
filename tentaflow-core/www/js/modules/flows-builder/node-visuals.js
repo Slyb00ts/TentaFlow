@@ -50,6 +50,7 @@ const TYPE_ICON = {
   spawn: 'users', await_subagents: 'clock', subagent_status: 'chart-line', interval: 'clock',
   workspace_context: 'terminal', patch_review: 'eye',
   exec_command: 'terminal', delegate_cli: 'bot',
+  bus_consume: 'bus', bus_publish: 'bus', bus_transform: 'bus',
 };
 
 const CATEGORY_ICON = {

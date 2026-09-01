@@ -968,7 +968,7 @@ fn seed_flow_node_templates(conn: &Connection) -> Result<()> {
             "Publikuje payload envelope jako jeden rekord na temat TentaBus i przepuszcza envelope bez zmian",
             r#"{"topic":"","key":"","content_type":"application/json","create_if_missing":false}"#,
             "send-horizontal",
-            r#"{"properties":{"topic":{"type":"string","title":"Temat"},"key":{"type":"string","title":"Klucz partycjonowania (CEL, opcjonalnie)","description":"Wyrażenie CEL, np. payload.id"},"headers":{"type":"object","title":"Nagłówki (CEL, opcjonalnie)"},"content_type":{"type":"string","title":"Content-Type (opcjonalnie)"},"create_if_missing":{"type":"boolean","title":"Utwórz temat, jeśli nie istnieje","default":false}},"required":["topic"],"order":["topic","key","headers","content_type","create_if_missing"]}"#,
+            r#"{"properties":{"topic":{"type":"string","title":"Temat"},"key":{"type":"string","title":"Klucz partycjonowania (CEL, opcjonalnie)","description":"Wyrażenie CEL, np. payload.id"},"content_type":{"type":"string","title":"Content-Type (opcjonalnie)"},"create_if_missing":{"type":"boolean","title":"Utwórz temat, jeśli nie istnieje","default":false}},"required":["topic"],"order":["topic","key","content_type","create_if_missing"]}"#,
         ),
         (
             "bus_transform",
