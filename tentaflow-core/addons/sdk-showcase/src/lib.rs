@@ -188,6 +188,11 @@ pub extern "C" fn on_request(
             "run_recording_lifecycle" => run_recording_lifecycle(&params),
             "run_recording_save_segment" => run_recording_save_segment(&params),
             "run_frame_url_basic" => run_frame_url_basic(&params),
+            "run_bus_publish_batch" => run_bus_publish_batch(&params),
+            "run_bus_open" => run_bus_open(&params),
+            "run_bus_next" => run_bus_next(&params),
+            "run_bus_commit" => run_bus_commit(&params),
+            "run_bus_close" => run_bus_close(&params),
             _ => json!({"ok": false, "error": format!("unknown tool: {}", tool_name)}),
         }
     };
@@ -544,6 +549,151 @@ fn run_no_write_probe(params: &Value) -> Value {
             "ok": false,
             "unexpected_abi_error": e.as_i32(),
         }),
+    }
+}
+
+// =============================================================================
+// Bus tools (M3b — bus_publish_v1 / bus_consume_open/next/commit/close_v1)
+//
+// Every tool surfaces a Permission denial the same way `run_no_write_probe`
+// does ({"ok": true, "granted": false, "abi_error": ...}) rather than
+// treating it as a hard failure — the malicious-addon security test drives
+// these tools with a deliberately-incomplete `AddonState.permissions` and
+// asserts on `granted`, not on a WASM trap.
+// =============================================================================
+
+/// Publishes `count` records of `size` bytes each to `topic` in ONE
+/// `bus_publish_v1` call — the P12 throughput gate loops calling this tool
+/// (one WASM boundary crossing per batch, matching PLAN §6.4's "nigdy per
+/// komunikat" discipline).
+fn run_bus_publish_batch(params: &Value) -> Value {
+    let Some(topic) = params.get("topic").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": "missing topic"});
+    };
+    let count = params.get("count").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+    let size = params.get("size").and_then(|v| v.as_u64()).unwrap_or(16) as usize;
+    let create_if_missing = params
+        .get("create_if_missing")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
+    let records: Vec<BusRecord> = (0..count)
+        .map(|_| BusRecord {
+            key: None,
+            headers: Vec::new(),
+            payload: vec![b'x'; size],
+        })
+        .collect();
+
+    match bus_publish(topic, &records, create_if_missing) {
+        Ok(published) => json!({"ok": true, "granted": true, "data": {"published": published}}),
+        Err(AbiError::Permission) => json!({
+            "ok": true, "granted": false, "abi_error": AbiError::Permission.as_i32(),
+        }),
+        Err(e) => json!({"ok": false, "abi_error": e.as_i32()}),
+    }
+}
+
+/// Opens a consume handle. `topics` is a JSON array of strings (falls back
+/// to a single `"topic"` field for convenience).
+fn run_bus_open(params: &Value) -> Value {
+    let topics: Vec<String> = match params.get("topics").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect(),
+        None => match params.get("topic").and_then(|v| v.as_str()) {
+            Some(t) => vec![t.to_string()],
+            None => return json!({"ok": false, "error": "missing topics/topic"}),
+        },
+    };
+    let Some(group) = params.get("group").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": "missing group"});
+    };
+    let commit_mode = params.get("commit_mode").and_then(|v| v.as_str());
+    let topic_refs: Vec<&str> = topics.iter().map(String::as_str).collect();
+
+    match bus_consume_open(&topic_refs, group, commit_mode) {
+        Ok(consumer_id) => json!({"ok": true, "granted": true, "consumer_id": consumer_id}),
+        Err(AbiError::Permission) => json!({
+            "ok": true, "granted": false, "abi_error": AbiError::Permission.as_i32(),
+        }),
+        Err(e) => json!({"ok": false, "abi_error": e.as_i32()}),
+    }
+}
+
+/// Polls one batch. Re-checks `bus.subscribe` on the host side EVERY call
+/// (PLAN §6.4's security gate) — the org-isolation/permission-revocation
+/// tests drive this tool with a `consumer_id` opened by a DIFFERENT
+/// `AddonState` (same addon_id, different permissions/org_id) to prove the
+/// host, not the addon, enforces the boundary.
+fn run_bus_next(params: &Value) -> Value {
+    let Some(consumer_id) = params.get("consumer_id").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": "missing consumer_id"});
+    };
+    let max_records = params.get("max_records").and_then(|v| v.as_u64()).unwrap_or(1000) as u32;
+    let timeout_ms = params.get("timeout_ms").and_then(|v| v.as_u64()).unwrap_or(1000) as u32;
+
+    match bus_consume_next(consumer_id, max_records, timeout_ms) {
+        Ok(records) => {
+            let items: Vec<Value> = records
+                .iter()
+                .map(|r| {
+                    json!({
+                        "topic": r.topic,
+                        "partition": r.partition,
+                        "offset": r.offset,
+                        "payload_len": r.payload.len(),
+                    })
+                })
+                .collect();
+            json!({
+                "ok": true, "granted": true,
+                "data": {"count": records.len(), "records": items},
+            })
+        }
+        Err(AbiError::Permission) => json!({
+            "ok": true, "granted": false, "abi_error": AbiError::Permission.as_i32(),
+        }),
+        Err(e) => json!({"ok": false, "abi_error": e.as_i32()}),
+    }
+}
+
+/// Commits `offsets` (JSON array of `{topic, partition, offset}`).
+fn run_bus_commit(params: &Value) -> Value {
+    let Some(consumer_id) = params.get("consumer_id").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": "missing consumer_id"});
+    };
+    let offsets: Vec<(String, u32, u64)> = match params.get("offsets").and_then(|v| v.as_array()) {
+        Some(arr) => arr
+            .iter()
+            .filter_map(|o| {
+                let topic = o.get("topic")?.as_str()?.to_string();
+                let partition = o.get("partition")?.as_u64()? as u32;
+                let offset = o.get("offset")?.as_u64()?;
+                Some((topic, partition, offset))
+            })
+            .collect(),
+        None => return json!({"ok": false, "error": "missing offsets"}),
+    };
+
+    match bus_consume_commit(consumer_id, &offsets) {
+        Ok(()) => json!({"ok": true, "granted": true}),
+        Err(AbiError::Permission) => json!({
+            "ok": true, "granted": false, "abi_error": AbiError::Permission.as_i32(),
+        }),
+        Err(e) => json!({"ok": false, "abi_error": e.as_i32()}),
+    }
+}
+
+/// Closes a consumer handle.
+fn run_bus_close(params: &Value) -> Value {
+    let Some(consumer_id) = params.get("consumer_id").and_then(|v| v.as_str()) else {
+        return json!({"ok": false, "error": "missing consumer_id"});
+    };
+    match bus_consume_close(consumer_id) {
+        Ok(()) => json!({"ok": true, "closed": true}),
+        Err(e) => json!({"ok": false, "abi_error": e.as_i32()}),
     }
 }
 

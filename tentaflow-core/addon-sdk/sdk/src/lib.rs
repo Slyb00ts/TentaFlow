@@ -2045,6 +2045,43 @@ fn call_sql_with_one_input(
     call_sql_with_one_input_capped(host_fn, a, MAX_OUT_CAP)
 }
 
+/// Single-attempt call, buffer pre-sized to the FULL cap — no
+/// start-small-then-retry. `bus_consume_next_v1` wraps `ConsumerHandle::
+/// fetch`, which advances the consumer's read cursor as a side effect of
+/// the engine read itself, before the host even attempts to encode a
+/// response. `call_sql_with_one_input_capped`'s retry pattern (safe for an
+/// idempotent call like a SQL SELECT, and never actually exercised by the
+/// other tiny-response bus control calls) would be actively dangerous here:
+/// an undersized first attempt fetches the batch (moving the cursor past
+/// it) but fails to deliver it (`OutputBufferTooSmall`); the SDK's retry
+/// then calls `bus_consume_next_v1` again, which calls `fetch` a SECOND
+/// time on a cursor already past that batch, silently losing it — the
+/// caller never sees those records. Allocating `PayloadKind::BusBatch`'s
+/// own ceiling up front makes a too-small first attempt impossible, since
+/// the host itself never writes more than that many bytes for this kind.
+fn call_bus_consume_next(
+    host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
+    a: &[u8],
+) -> Result<Vec<u8>, AbiError> {
+    let cap = MAX_OUT_CAP_BUS_BATCH;
+    let mut buffer = vec![0u8; cap];
+    let mut out_len: u32 = 0;
+    let rc = unsafe {
+        host_fn(
+            a.as_ptr() as i32,
+            a.len() as i32,
+            buffer.as_mut_ptr() as i32,
+            cap as i32,
+            &mut out_len as *mut u32 as i32,
+        )
+    };
+    if rc == 0 {
+        buffer.truncate(out_len as usize);
+        return Ok(buffer);
+    }
+    Err(AbiError::from_i32(rc))
+}
+
 fn call_sql_with_one_input_capped(
     host_fn: unsafe extern "C" fn(i32, i32, i32, i32, i32) -> i32,
     a: &[u8],
@@ -2508,6 +2545,8 @@ pub mod prelude {
         gate_check, gate_check_scoped, GateCheckResult, GateSigner,
         flow_invoke, flow_status, flow_cancel, FlowInvocation,
         service_list, node_resources_get, ServiceInfo, NodeResources, NodeGpu,
+        bus_publish, bus_consume_open, bus_consume_next, bus_consume_commit, bus_consume_close,
+        BusRecord, BusConsumedRecord,
         AbiError,
         log,
     };
@@ -3493,8 +3532,7 @@ pub fn bus_consume_next(
         max_wait_ms: timeout_ms,
     };
     let payload = encode_cbor_input(&input)?;
-    let bytes =
-        call_sql_with_one_input_capped(bus_consume_next_v1, &payload, MAX_OUT_CAP_BUS_BATCH)?;
+    let bytes = call_bus_consume_next(bus_consume_next_v1, &payload)?;
     let out: tentaflow_sdk_spec::BusConsumeNextOutput = decode_cbor(&bytes)?;
     Ok(out
         .records
