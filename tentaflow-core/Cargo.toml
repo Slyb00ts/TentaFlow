@@ -607,6 +607,13 @@ required-features = ["test-support"]
 name = "code_harness_flow_e2e"
 required-features = ["test-support"]
 
+# TentaBus M3a gate (SUM/tentabus/PLAN.md §9 P11): 100k messages through the
+# real bus_consume -> bus_transform -> bus_publish chain via bus::reactor.
+# Needs `stub_ctx` from the test-support surface.
+[[test]]
+name = "bus_flow_chain_p11_gate"
+required-features = ["test-support"]
+
 # ort-backed state classifier + plate OCR: load pool + run one forward on a real
 # model. `#[ignore]`, env-gated (`TENTAFLOW_VISION_ORT_TEST=<home dir>`) — needs
 # the ort dylib + provisioned model files (falls back to CPU EP without a GPU).

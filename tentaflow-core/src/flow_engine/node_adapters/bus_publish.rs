@@ -195,16 +195,30 @@ impl NodeAdapter for BusPublishNodeAdapter {
             producer: None,
             records: vec![record],
         };
-        let result = match svc.publish(&bctx, &topic, batch.clone()) {
-            Ok(r) => r,
-            Err(bus::BusServiceError::TopicNotFound { .. }) if create_if_missing => {
-                svc.create_topic(&bctx, &topic, crate::bus::topics::TopicOptions::default())
-                    .map_err(|e| anyhow!("bus_publish: create_if_missing failed: {e}"))?;
-                svc.publish(&bctx, &topic, batch)
-                    .map_err(|e| anyhow!("bus_publish: {e}"))?
+        // `BusService::publish` (and `create_topic`) block internally
+        // (`Partition::append_batch` uses `blocking_recv` on its own
+        // channel) — `bus::mod`'s own doc requires every async caller to go
+        // through `spawn_blocking`. `execute()` runs on the Tokio runtime via
+        // `execute_blocking`'s node scheduler, so calling either directly
+        // here panics ("cannot block the current thread from within a
+        // runtime") the moment this node actually runs — caught by the P11
+        // gate test (`tests/bus_flow_chain_p11_gate.rs`), never exercised
+        // live before it.
+        let topic_for_task = topic.clone();
+        let result = tokio::task::spawn_blocking(move || {
+            let topic = topic_for_task;
+            match svc.publish(&bctx, &topic, batch.clone()) {
+                Ok(r) => Ok(r),
+                Err(bus::BusServiceError::TopicNotFound { .. }) if create_if_missing => {
+                    svc.create_topic(&bctx, &topic, crate::bus::topics::TopicOptions::default())?;
+                    svc.publish(&bctx, &topic, batch)
+                }
+                Err(e) => Err(e),
             }
-            Err(e) => return Err(anyhow!("bus_publish: {e}")),
-        };
+        })
+        .await
+        .map_err(|e| anyhow!("bus_publish: publish task panicked: {e}"))?
+        .map_err(|e| anyhow!("bus_publish: {e}"))?;
 
         let mut out = (*input.envelope).clone();
         out.meta
