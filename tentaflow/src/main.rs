@@ -20,6 +20,7 @@ use tentaflow_core::routing::Router;
 
 #[cfg(target_os = "macos")]
 mod mlx_swift_init;
+mod service;
 
 // =============================================================================
 // Argumenty CLI
@@ -66,6 +67,14 @@ struct Args {
 
 #[derive(clap::Subcommand, Debug)]
 enum Subcommand {
+    /// Uruchamia usluge TentaFlow (systemd / launchd)
+    Start,
+    /// Zatrzymuje usluge TentaFlow
+    Stop,
+    /// Restartuje usluge TentaFlow
+    Restart,
+    /// Stan uslugi: autostart, PID, config, dashboard, health
+    Status,
     /// Sprawdza czy jest nowsza wersja na GitHub Releases i podmienia binarke
     Update {
         /// Tylko sprawdz, nie aktualizuj
@@ -1610,6 +1619,10 @@ fn log_config_summary(config: &NodeConfig, db_path: &PathBuf) {
 fn run_subcommand(cmd: &Subcommand, verbose: bool) -> Result<()> {
     setup_logging(verbose)?;
     match cmd {
+        Subcommand::Start => service::start(),
+        Subcommand::Stop => service::stop(),
+        Subcommand::Restart => service::restart(),
+        Subcommand::Status => service::status(),
         Subcommand::SystemCheck => {
             let caps = tentaflow_core::system_check::collect();
             println!("{}", serde_json::to_string_pretty(&caps)?);

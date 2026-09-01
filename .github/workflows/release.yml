@@ -109,6 +109,7 @@ jobs:
             protobuf-compiler cmake build-essential pkg-config \
             libglib2.0-dev libgstreamer1.0-dev \
             libgstreamer-plugins-base1.0-dev \
+            libasound2-dev \
             libssl-dev git curl ca-certificates
 
       - name: Install base tools (macOS)
@@ -256,7 +257,10 @@ jobs:
           sudo wget -qO /etc/apt/sources.list.d/lunarg-vulkan.list \
             "https://packages.lunarg.com/vulkan/lunarg-vulkan-${CODENAME}.list"
           sudo apt-get update
-          sudo apt-get install -y vulkan-sdk
+          # vulkan-sdk daje glslc + naglowki (potrzebne do KOMPILACJI shaderow
+          # ggml), ale nie zostawia libvulkan.so do LINKOWANIA — bez
+          # libvulkan-dev finalny link binarki pada na `-lvulkan`.
+          sudo apt-get install -y vulkan-sdk libvulkan-dev
           vulkaninfo --summary || true
 
       - name: Install Vulkan (Linux aarch64)
