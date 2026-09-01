@@ -48,7 +48,7 @@ use tentaflow_core::flow_engine::cache::CompiledFlow;
 use tentaflow_core::flow_engine::envelope::{FinishReason, FlowEnvelope, FlowValue};
 use tentaflow_core::flow_engine::executor::execute_blocking;
 use tentaflow_core::flow_engine::node_adapter::test_support::stub_ctx;
-use tentaflow_core::flow_engine::node_adapter::AdapterRegistry;
+use tentaflow_core::flow_engine::node_adapter::{AdapterRegistry, ExecutionContext};
 use tentaflow_core::flow_engine::node_adapters::{
     BusConsumeNodeAdapter, BusPublishNodeAdapter, BusTransformNodeAdapter,
 };
@@ -239,6 +239,19 @@ struct FlowRunDispatch {
     consumed: Arc<AtomicU64>,
     first_dispatch_at: Arc<Mutex<Option<Instant>>>,
     last_dispatch_finished_at: Arc<Mutex<Option<Instant>>>,
+    // Built ONCE (see `run_gate`), not per dispatch: `stub_ctx()` is a
+    // one-shot unit-test helper — it spins up a fresh in-memory SQLite
+    // connection, runs the FULL migration suite on it, and mkdirs a new
+    // scratch directory for `NamespaceManager`, every single call. Calling
+    // it per reactor cycle (as this test originally did) buries the real
+    // `bus_consume -> bus_transform -> bus_publish` cost under ~120ms of
+    // unrelated per-call migration/dir-creation overhead — confirmed via
+    // `p11_exec_timing` instrumentation showing `execute_blocking`'s own
+    // internal wall time at ~5ms while the caller's wrapper measured
+    // ~125ms. `ExecutionContext` is documented `Clone`-cheap (all fields
+    // Arc/Option/Copy) specifically for this kind of reuse — see its own
+    // doc comment in `node_adapter.rs`.
+    base_ctx: ExecutionContext,
 }
 
 #[async_trait]
@@ -260,8 +273,7 @@ impl ReactorFlowDispatch for FlowRunDispatch {
             FlowValue::Json(_) => 1,
             other => anyhow::bail!("p11 gate: unexpected seeded payload shape: {other:?}"),
         };
-        let mut ctx = stub_ctx();
-        ctx.org_id = Some(ORG_ID.to_string());
+        let ctx = self.base_ctx.clone();
         let outcome = execute_blocking(
             self.db.clone(),
             self.compiled.clone(),
@@ -359,6 +371,8 @@ async fn run_gate(total_messages: usize) {
     let consumed = Arc::new(AtomicU64::new(0));
     let first_dispatch_at = Arc::new(Mutex::new(None));
     let last_dispatch_finished_at = Arc::new(Mutex::new(None));
+    let mut base_ctx = stub_ctx();
+    base_ctx.org_id = Some(ORG_ID.to_string());
     let dispatch: Arc<dyn ReactorFlowDispatch> = Arc::new(FlowRunDispatch {
         db: db.clone(),
         compiled,
@@ -366,6 +380,7 @@ async fn run_gate(total_messages: usize) {
         consumed: consumed.clone(),
         first_dispatch_at: first_dispatch_at.clone(),
         last_dispatch_finished_at: last_dispatch_finished_at.clone(),
+        base_ctx,
     });
 
     let cancel = CancellationToken::new();
@@ -398,6 +413,12 @@ async fn run_gate(total_messages: usize) {
          {:.3}s cycle time, {msgs_per_sec:.0} msg/s \
          (PLAN §9 P11: min >= 20 000 msg/s, target >= 50 000 msg/s)",
         elapsed.as_secs_f64()
+    );
+    let (append_p99_us, fsync_p99_us) = tentaflow_core::bus::BusService::bus_engine_p99_us();
+    println!(
+        "P11 gate engine p99: append_p99_us={append_p99_us} fsync_p99_us={fsync_p99_us} \
+         (tentaflow-bus process-wide reservoirs — includes SOURCE topic's own \
+         publish_source_messages writes, not dest-topic-only)"
     );
 
     let mut seqs = {
